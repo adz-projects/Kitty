@@ -5,7 +5,11 @@
 
 use std::sync::Mutex;
 
+use serde_json::Value;
+use tokio::sync::Mutex as AsyncMutex;
+
 use crate::config::Config;
+use crate::goosed::api::AcpClient;
 use crate::lifecycle::{ManagedProcess, StackStatus};
 
 /// Root managed state, registered via `app.manage(AppState::new(..))`.
@@ -18,6 +22,12 @@ pub struct AppState {
     pub ollama: Mutex<ManagedProcess>,
     /// Last computed stack status, so the health loop only emits on change.
     pub stack_status: Mutex<StackStatus>,
+    /// The live ACP connection to goosed, lazily established on first use and
+    /// cleared on disconnect (async mutex: held across `.await`).
+    pub acp: AsyncMutex<Option<AcpClient>>,
+    /// The active session (raw `SessionInfo` JSON) handed from overlay to the
+    /// full window on "Expand" so both bind the same session.
+    pub active_session: Mutex<Option<Value>>,
 }
 
 impl AppState {
@@ -27,6 +37,8 @@ impl AppState {
             goosed: Mutex::new(GoosedHandle::default()),
             ollama: Mutex::new(ManagedProcess::default()),
             stack_status: Mutex::new(StackStatus::default()),
+            acp: AsyncMutex::new(None),
+            active_session: Mutex::new(None),
         }
     }
 }

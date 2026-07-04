@@ -6,6 +6,7 @@
 
 mod commands;
 mod config;
+mod goosed;
 mod hotkey;
 mod lifecycle;
 mod state;
@@ -60,6 +61,10 @@ pub fn run() {
             commands::open_main,
             commands::get_stack_status,
             commands::restart_goosed,
+            commands::new_session,
+            commands::send_prompt,
+            commands::set_active_session,
+            commands::get_active_session,
         ])
         .setup(move |app| {
             let handle = app.handle();

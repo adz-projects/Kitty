@@ -4,7 +4,7 @@
 
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::AppHandle;
+use tauri::{AppHandle, Emitter};
 
 use crate::windows;
 
@@ -25,8 +25,9 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
                 let _ = windows::toggle_overlay(app);
             }
             "new_session" => {
-                // Stub: a real "New Session" lands in Phase 2 (chatStore + goosed).
                 let _ = windows::show_overlay(app);
+                // Ask the overlay to start a fresh session.
+                let _ = app.emit("session://new", ());
             }
             "open_settings" => {
                 let _ = windows::open_settings(app, None);

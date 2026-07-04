@@ -1,7 +1,9 @@
 import { useEffect } from 'react';
-import { ipc } from '@/lib/ipc';
+import { ipc, onNewSessionRequest } from '@/lib/ipc';
 import { useStackStore } from '@/stores/stackStore';
+import { useChatStore } from '@/stores/chatStore';
 import { StackStatusView } from '@/components/StackStatusView';
+import { ChatView } from '@/components/chat/ChatView';
 import type { StackStatus } from '@/lib/types';
 
 const DEGRADED: StackStatus[] = ['ollama_down', 'goosed_down', 'no_model', 'provider_unreachable'];
@@ -17,24 +19,39 @@ export function App() {
       if (e.key === 'Escape') void ipc.hideOverlay();
     };
     window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
+    const unlisten = onNewSessionRequest(() => void useChatStore.getState().newSession());
+    return () => {
+      window.removeEventListener('keydown', onKey);
+      void unlisten.then((fn) => fn());
+    };
   }, [init]);
 
   const degraded = DEGRADED.includes(status);
 
+  const expand = async () => {
+    const s = useChatStore.getState();
+    if (s.sessionId) {
+      await ipc.setActiveSession({
+        session_id: s.sessionId,
+        cwd: s.cwd ?? '',
+        current_mode: s.mode ?? 'auto',
+        available_modes: s.availableModes,
+      });
+    }
+    await ipc.openMain();
+    await ipc.hideOverlay();
+  };
+
   return (
     <div className="overlay-root">
-      <div className="overlay-card">
+      <div
+        className="overlay-card"
+        style={{ display: 'flex', flexDirection: 'column', height: '100%' }}
+      >
         <div className="overlay-titlebar" data-tauri-drag-region>
           <strong>Goose</strong>
           <div style={{ display: 'flex', gap: 8 }}>
-            <button
-              onClick={async () => {
-                await ipc.openMain();
-                await ipc.hideOverlay();
-              }}
-              title="Expand to full window"
-            >
+            <button onClick={() => void expand()} title="Expand to full window">
               Expand
             </button>
             <button onClick={() => ipc.openSettings()} title="Open settings">
@@ -42,43 +59,20 @@ export function App() {
             </button>
           </div>
         </div>
-        <div className="overlay-body">
+        <div
+          className="overlay-body"
+          style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}
+        >
           {degraded ? (
             <StackStatusView status={status} />
           ) : (
             <>
               {status === 'conflict_goose_desktop' && <StackStatusView status={status} />}
-              <ComposerPlaceholder status={status} />
+              <ChatView />
             </>
           )}
         </div>
       </div>
-    </div>
-  );
-}
-
-/** Phase 2 replaces this with the real composer + streamed message list. */
-function ComposerPlaceholder({ status }: { status: StackStatus }) {
-  return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-      <textarea
-        placeholder="Ask Goose…  (chat wiring lands in Phase 2)"
-        rows={3}
-        disabled
-        style={{
-          width: '100%',
-          resize: 'none',
-          padding: 10,
-          borderRadius: 8,
-          border: '1px solid var(--border)',
-          background: 'var(--surface-2)',
-          color: 'var(--text)',
-          font: 'inherit',
-        }}
-      />
-      <span className="muted" style={{ fontSize: 12 }}>
-        Overlay shell ready. Stack status: <strong>{status.replace(/_/g, ' ')}</strong>
-      </span>
     </div>
   );
 }

@@ -35,3 +35,58 @@ export interface StackStatusPayload {
   status: StackStatus;
   detail: string | null;
 }
+
+// --- Chat / ACP (Phase 2) --- mirrors src-tauri/src/commands SessionInfo + events
+
+export interface ModeInfo {
+  id: string;
+  name: string;
+  description: string;
+}
+
+export interface SessionInfo {
+  session_id: string;
+  cwd: string;
+  current_mode: string;
+  available_modes: ModeInfo[];
+}
+
+/** Raw ACP tool-call `update` object (shape varies; read defensively).
+    Confirmed live: `tool_call` carries title + rawInput; `tool_call_update`
+    carries status + content + rawOutput; later updates may omit title/status. */
+export interface ToolCallUpdate {
+  toolCallId?: string;
+  title?: string;
+  kind?: string;
+  status?: string;
+  rawInput?: unknown;
+  rawOutput?: unknown;
+  content?: unknown;
+  [key: string]: unknown;
+}
+
+export interface TextDeltaEvent {
+  session_id: string;
+  text: string;
+}
+
+export interface ToolCallEvent {
+  session_id: string;
+  phase: 'tool_call' | 'tool_call_update';
+  update: ToolCallUpdate;
+}
+
+export interface SessionTitleEvent {
+  session_id: string;
+  title: string;
+}
+
+export interface CompleteEvent {
+  session_id: string;
+  result: { stopReason?: string; usage?: Record<string, number> };
+}
+
+export interface ChatErrorEvent {
+  session_id: string;
+  message: string;
+}
