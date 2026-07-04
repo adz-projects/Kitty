@@ -1,0 +1,18 @@
+/* Dark theme — same custom-property contract as default.css. */
+:root {
+  --bg: #18181b;
+  --surface: #27272a;
+  --surface-2: #1f1f23;
+  --text: #f4f4f5;
+  --text-muted: #a1a1aa;
+  --accent: #818cf8;
+  --accent-text: #18181b;
+  --border: #3f3f46;
+  --radius: 12px;
+  --font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+  --overlay-opacity: 1;
+  --overlay-shadow: 0 12px 40px rgba(0, 0, 0, 0.55);
+  --ok: #22c55e;
+  --warn: #f59e0b;
+  --danger: #f87171;
+}

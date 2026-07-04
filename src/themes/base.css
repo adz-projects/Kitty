@@ -1,0 +1,138 @@
+/* Structural, theme-agnostic layout. MUST NOT contain color values —
+   all colors/spacing/typography come from custom properties in theme files. */
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: transparent;
+  color: var(--text);
+  font-family: var(--font-family);
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+button {
+  font: inherit;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text);
+  border-radius: calc(var(--radius) / 2);
+  padding: 6px 12px;
+}
+
+button:hover {
+  background: var(--border);
+}
+
+button.primary {
+  background: var(--accent);
+  color: var(--accent-text);
+  border-color: var(--accent);
+}
+
+/* --- Overlay window: a floating, centered card over a transparent backdrop --- */
+.overlay-root {
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  height: 100%;
+  padding: 12px;
+}
+
+.overlay-card {
+  width: 100%;
+  max-width: 760px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--overlay-shadow);
+  overflow: hidden;
+  opacity: var(--overlay-opacity);
+}
+
+.overlay-titlebar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.overlay-body {
+  padding: 16px;
+}
+
+/* --- Full / settings / wizard windows: solid surface, full height --- */
+.window-root {
+  height: 100%;
+  background: var(--bg);
+  padding: 24px;
+  overflow: auto;
+}
+
+/* --- Stack status / degraded-state panel --- */
+.status-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 20px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+}
+
+.status-panel h2 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.status-panel .actions {
+  display: flex;
+  gap: 8px;
+}
+
+.status-dot {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  margin-right: 8px;
+}
+
+.status-dot.ok {
+  background: var(--ok);
+}
+.status-dot.warn {
+  background: var(--warn);
+}
+.status-dot.bad {
+  background: var(--danger);
+}
+
+.conflict-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border: 1px solid var(--warn);
+  border-radius: calc(var(--radius) / 2);
+  background: var(--surface-2);
+  font-size: 13px;
+}
+
+.muted {
+  color: var(--text-muted);
+}
