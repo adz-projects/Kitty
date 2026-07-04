@@ -4,6 +4,7 @@ import { useStackStore } from '@/stores/stackStore';
 import { useChatStore } from '@/stores/chatStore';
 import { StackStatusView } from '@/components/StackStatusView';
 import { ChatView } from '@/components/chat/ChatView';
+import { RecentSessions } from '@/components/sessions/RecentSessions';
 import type { StackStatus } from '@/lib/types';
 
 const DEGRADED: StackStatus[] = ['ollama_down', 'goosed_down', 'no_model', 'provider_unreachable'];
@@ -51,6 +52,7 @@ export function App() {
         <div className="overlay-titlebar" data-tauri-drag-region>
           <strong>Goose</strong>
           <div style={{ display: 'flex', gap: 8 }}>
+            <RecentSessions />
             <button onClick={() => void expand()} title="Expand to full window">
               Expand
             </button>

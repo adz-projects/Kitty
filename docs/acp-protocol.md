@@ -23,7 +23,15 @@ Goose version bump (see [VERSIONS.md](VERSIONS.md)).
    - result: `{ sessionId, modes: { currentModeId, availableModes: [{ id, name, description }] } }`
    - modes observed: `auto` (auto-approve), `approve` (ask every tool), `smart_approve`.
    - `sessionId` example: `"20260704_1"`.
-4. `session/load` `{ sessionId, cwd, mcpServers }` — resume (Phase 4).
+4. `session/load` `{ sessionId, cwd, mcpServers }` — resume. Replays the whole
+   conversation as ordered `session/update` notifications
+   (`user_message_chunk`, `agent_thought_chunk`, `tool_call`/`tool_call_update`,
+   `agent_message_chunk`), then returns `{ modes }`. (Phase 4)
+   - `session/list` → `{ sessions: [{ sessionId, cwd, title, updatedAt, _meta: { messageCount, createdAt, lastMessageAt, providerId, modelId, sessionType } }] }`.
+   - `session/delete` `{ sessionId }` (extension method).
+   - Working-dir change on an existing session is the *unstable* extension method
+     `_goose/unstable/session/working-dir/update` — we avoid it; "Set as working
+     directory" starts a new `session/new` rooted at the folder instead.
 5. `session/prompt` `{ sessionId, prompt: [ContentBlock] }`
    - streams `session/update` notifications, then result: `{ stopReason, usage: { totalTokens, inputTokens, outputTokens } }`
    - `stopReason`: `end_turn | max_tokens | max_turn_requests | refusal | cancelled`.

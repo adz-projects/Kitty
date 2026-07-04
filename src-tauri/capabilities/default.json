@@ -13,6 +13,7 @@
     "core:event:allow-listen",
     "core:event:allow-unlisten",
     "shell:allow-open",
+    "opener:default",
     "dialog:default",
     "notification:default"
   ]

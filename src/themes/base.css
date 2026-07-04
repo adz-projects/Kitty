@@ -357,3 +357,175 @@ button.primary {
   color: var(--accent);
   font-weight: 600;
 }
+
+/* --- Full window layout (Phase 4) --- */
+.main-window {
+  display: grid;
+  grid-template-columns: 260px 1fr auto;
+  height: 100%;
+  background: var(--bg);
+}
+.main-center {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  padding: 12px 16px;
+  gap: 8px;
+}
+.main-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.main-header h1 {
+  font-size: 18px;
+  margin: 0;
+}
+.main-body {
+  flex: 1;
+  min-height: 0;
+}
+
+/* --- Session list --- */
+.session-list {
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--border);
+  background: var(--surface);
+  min-height: 0;
+}
+.session-search {
+  display: flex;
+  gap: 6px;
+  padding: 10px;
+  border-bottom: 1px solid var(--border);
+}
+.session-search input {
+  flex: 1;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface-2);
+  color: var(--text);
+}
+.session-empty {
+  padding: 12px;
+}
+.session-items {
+  overflow-y: auto;
+  min-height: 0;
+}
+.session-item {
+  position: relative;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+}
+.session-item:hover {
+  background: var(--surface-2);
+}
+.session-item.active {
+  background: var(--surface-2);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+.session-title {
+  font-size: 13px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding-right: 20px;
+}
+.session-meta {
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.session-del {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  border: none;
+  background: transparent;
+  padding: 2px 4px;
+  opacity: 0;
+}
+.session-item:hover .session-del {
+  opacity: 0.7;
+}
+
+/* --- Artifacts pane --- */
+.artifacts-pane {
+  width: 280px;
+  border-left: 1px solid var(--border);
+  background: var(--surface);
+  overflow-y: auto;
+}
+.artifacts-head {
+  padding: 12px;
+  font-weight: 600;
+  border-bottom: 1px solid var(--border);
+}
+.artifact-card {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.artifact-name {
+  font-size: 13px;
+  font-weight: 600;
+}
+.artifact-path {
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.artifact-actions {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+.artifact-actions button {
+  font-size: 11px;
+  padding: 3px 6px;
+}
+
+/* --- File chips (composer) --- */
+.file-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 4px 0;
+}
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 3px 8px;
+}
+.chip-name {
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chip-action {
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 999px;
+}
+.chip-x {
+  border: none;
+  background: transparent;
+  padding: 0 2px;
+  font-size: 14px;
+  line-height: 1;
+}

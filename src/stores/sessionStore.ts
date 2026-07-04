@@ -1,20 +1,47 @@
-// Session history state. Populated in Phase 4 from goosed's session routes —
-// scaffold only for now.
+// Session history state (Phase 4), backed entirely by goosed's session routes.
 import { create } from 'zustand';
-
-export interface SessionSummary {
-  id: string;
-  title: string;
-  workingDir: string;
-  updatedAt: string;
-}
+import { ipc } from '@/lib/ipc';
+import { parseSession, type SessionSummary } from '@/lib/types';
 
 interface SessionState {
   sessions: SessionSummary[];
-  setSessions: (s: SessionSummary[]) => void;
+  loading: boolean;
+  query: string;
+  refresh: () => Promise<void>;
+  remove: (sessionId: string) => Promise<void>;
+  setQuery: (q: string) => void;
+  filtered: () => SessionSummary[];
 }
 
-export const useSessionStore = create<SessionState>((set) => ({
+export const useSessionStore = create<SessionState>((set, get) => ({
   sessions: [],
-  setSessions: (sessions) => set({ sessions }),
+  loading: false,
+  query: '',
+
+  refresh: async () => {
+    set({ loading: true });
+    try {
+      const raw = await ipc.listSessions();
+      const sessions = raw.map(parseSession).sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : -1));
+      set({ sessions });
+    } finally {
+      set({ loading: false });
+    }
+  },
+
+  remove: async (sessionId: string) => {
+    await ipc.deleteSession(sessionId);
+    set((s) => ({ sessions: s.sessions.filter((x) => x.sessionId !== sessionId) }));
+  },
+
+  setQuery: (q: string) => set({ query: q }),
+
+  filtered: () => {
+    const { sessions, query } = get();
+    const q = query.trim().toLowerCase();
+    if (!q) return sessions;
+    return sessions.filter(
+      (s) => s.title.toLowerCase().includes(q) || s.cwd.toLowerCase().includes(q)
+    );
+  },
 }));

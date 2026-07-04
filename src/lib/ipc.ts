@@ -3,12 +3,14 @@
 
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import { getCurrentWebview } from '@tauri-apps/api/webview';
 import type {
   ApprovalNeededEvent,
   ChatErrorEvent,
   CompleteEvent,
   Config,
   ModeEvent,
+  PathInfo,
   SessionInfo,
   SessionTitleEvent,
   StackStatus,
@@ -26,13 +28,20 @@ export const ipc = {
   openMain: () => invoke<void>('open_main'),
   getStackStatus: () => invoke<StackStatus>('get_stack_status'),
   restartGoosed: () => invoke<void>('restart_goosed'),
-  newSession: () => invoke<SessionInfo>('new_session'),
+  newSession: (cwd?: string) => invoke<SessionInfo>('new_session', { cwd: cwd ?? null }),
   sendPrompt: (sessionId: string, text: string) => invoke<void>('send_prompt', { sessionId, text }),
   setActiveSession: (info: SessionInfo) => invoke<void>('set_active_session', { info }),
   getActiveSession: () => invoke<SessionInfo | null>('get_active_session'),
   respondPermission: (toolCallId: string, optionId: string | null) =>
     invoke<void>('respond_permission', { toolCallId, optionId }),
   setMode: (sessionId: string, modeId: string) => invoke<void>('set_mode', { sessionId, modeId }),
+  listSessions: () => invoke<Record<string, unknown>[]>('list_sessions'),
+  loadSession: (sessionId: string, cwd: string) =>
+    invoke<SessionInfo>('load_session', { sessionId, cwd }),
+  deleteSession: (sessionId: string) => invoke<void>('delete_session', { sessionId }),
+  inspectPaths: (paths: string[]) => invoke<PathInfo[]>('inspect_paths', { paths }),
+  openPath: (path: string) => invoke<void>('open_path', { path }),
+  revealPath: (path: string) => invoke<void>('reveal_path', { path }),
 };
 
 /** Subscribe to stack status changes. Returns an unlisten fn. */
@@ -54,10 +63,19 @@ export const onComplete = (cb: (e: CompleteEvent) => void) =>
 export const onChatError = (cb: (e: ChatErrorEvent) => void) =>
   listen<ChatErrorEvent>('chat://error', (e) => cb(e.payload));
 
+export const onUserMessage = (cb: (e: TextDeltaEvent) => void) =>
+  listen<TextDeltaEvent>('chat://user-message', (e) => cb(e.payload));
 export const onApprovalNeeded = (cb: (e: ApprovalNeededEvent) => void) =>
   listen<ApprovalNeededEvent>('chat://tool-approval-needed', (e) => cb(e.payload));
 export const onMode = (cb: (e: ModeEvent) => void) =>
   listen<ModeEvent>('chat://mode', (e) => cb(e.payload));
+
+/** OS file/folder drop onto this window → absolute paths. */
+export function onFileDrop(cb: (paths: string[]) => void): Promise<UnlistenFn> {
+  return getCurrentWebview().onDragDropEvent((e) => {
+    if (e.payload.type === 'drop') cb(e.payload.paths);
+  });
+}
 
 /** Tray "New Session" → overlay starts a fresh session. */
 export const onNewSessionRequest = (cb: () => void) => listen('session://new', () => cb());

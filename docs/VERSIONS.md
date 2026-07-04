@@ -30,7 +30,11 @@ done until this file is updated and the affected code (`goosed/api.rs`,
 
 ## File-writing tool names (Phase 4 artifacts heuristic)
 
-- **Tool-name patterns treated as artifact producers:** _TBD (developer extension write/edit tools)._
+- **Tool-name patterns treated as artifact producers:** developer `text_editor`
+  tool with a write-like command; match tool title/name against
+  `text_editor | write | create | edit | str_replace`, and take the file path
+  from `rawInput.path` (also `file_path`, or `paths[]`). Heuristic — false
+  negatives are acceptable, never fabricate entries (CLAUDE.md).
 
 ## Installer URLs & hashes (Phase 7)
 

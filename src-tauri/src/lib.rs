@@ -51,6 +51,7 @@ pub fn run() {
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState::new(cfg))
         .invoke_handler(tauri::generate_handler![
@@ -68,6 +69,12 @@ pub fn run() {
             commands::get_active_session,
             commands::respond_permission,
             commands::set_mode,
+            commands::list_sessions,
+            commands::load_session,
+            commands::delete_session,
+            commands::inspect_paths,
+            commands::open_path,
+            commands::reveal_path,
         ])
         .setup(move |app| {
             let handle = app.handle();

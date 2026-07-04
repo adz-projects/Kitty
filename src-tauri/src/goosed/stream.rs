@@ -84,6 +84,15 @@ fn emit_session_update(app: &AppHandle, v: &Value) {
                 );
             }
         }
+        // Historical user turns, replayed by session/load (Phase 4).
+        "user_message_chunk" => {
+            if let Some(text) = update.pointer("/content/text").and_then(|t| t.as_str()) {
+                let _ = app.emit(
+                    "chat://user-message",
+                    json!({ "session_id": session_id, "text": text }),
+                );
+            }
+        }
         // Tool calls: forward the raw update; the frontend interprets shape.
         "tool_call" | "tool_call_update" => {
             let _ = app.emit(

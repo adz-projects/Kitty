@@ -119,3 +119,38 @@ export interface ModeEvent {
   session_id: string;
   mode: string;
 }
+
+// --- Sessions / filesystem (Phase 4) ---
+
+/** Mirrors src-tauri PathInfo. */
+export interface PathInfo {
+  path: string;
+  name: string;
+  is_dir: boolean;
+  exists: boolean;
+}
+
+/** Parsed from a raw ACP `session/list` entry. */
+export interface SessionSummary {
+  sessionId: string;
+  title: string;
+  cwd: string;
+  updatedAt: string;
+  messageCount?: number;
+  providerId?: string;
+  modelId?: string;
+}
+
+/** Parse a raw session/list object (see docs/acp-protocol.md) defensively. */
+export function parseSession(raw: Record<string, unknown>): SessionSummary {
+  const meta = (raw._meta as Record<string, unknown>) ?? {};
+  return {
+    sessionId: String(raw.sessionId ?? ''),
+    title: String(raw.title ?? 'Untitled session'),
+    cwd: String(raw.cwd ?? ''),
+    updatedAt: String(raw.updatedAt ?? ''),
+    messageCount: typeof meta.messageCount === 'number' ? meta.messageCount : undefined,
+    providerId: typeof meta.providerId === 'string' ? meta.providerId : undefined,
+    modelId: typeof meta.modelId === 'string' ? meta.modelId : undefined,
+  };
+}

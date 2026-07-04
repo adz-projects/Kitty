@@ -144,11 +144,17 @@ fn resolve_cwd(app: &AppHandle) -> String {
 }
 
 /// Start a new goosed session (ACP `session/new`). Connects the ACP client on
-/// first use.
+/// first use. An explicit `cwd` (e.g. a dropped folder) overrides the default.
 #[tauri::command]
-pub async fn new_session(app: AppHandle) -> Result<SessionInfo, String> {
+pub async fn new_session(app: AppHandle, cwd: Option<String>) -> Result<SessionInfo, String> {
     let client = api::ensure_client(&app).await?;
-    let cwd = resolve_cwd(&app);
+    let cwd = match cwd {
+        Some(c) if !c.trim().is_empty() => {
+            let _ = std::fs::create_dir_all(&c);
+            c.replace('\\', "/")
+        }
+        _ => resolve_cwd(&app),
+    };
     let result = client
         .request("session/new", json!({ "cwd": cwd, "mcpServers": [] }))
         .await?;
@@ -270,4 +276,109 @@ pub async fn set_mode(app: AppHandle, session_id: String, mode_id: String) -> Re
         )
         .await?;
     Ok(())
+}
+
+/// List past sessions (raw ACP session objects; the frontend parses them).
+#[tauri::command]
+pub async fn list_sessions(app: AppHandle) -> Result<Vec<Value>, String> {
+    let client = api::ensure_client(&app).await?;
+    let result = client.request("session/list", json!({})).await?;
+    Ok(result
+        .get("sessions")
+        .and_then(|s| s.as_array())
+        .cloned()
+        .unwrap_or_default())
+}
+
+/// Resume a session (ACP `session/load`). The conversation replays as
+/// `chat://*` events during the call; returns the session's mode info.
+#[tauri::command]
+pub async fn load_session(
+    app: AppHandle,
+    session_id: String,
+    cwd: String,
+) -> Result<SessionInfo, String> {
+    let client = api::ensure_client(&app).await?;
+    let result = client
+        .request(
+            "session/load",
+            json!({ "sessionId": session_id, "cwd": cwd, "mcpServers": [] }),
+        )
+        .await?;
+
+    let current_mode = result
+        .pointer("/modes/currentModeId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("auto")
+        .to_string();
+    let available_modes = result
+        .pointer("/modes/availableModes")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().map(parse_mode).collect())
+        .unwrap_or_default();
+
+    Ok(SessionInfo {
+        session_id,
+        cwd,
+        current_mode,
+        available_modes,
+    })
+}
+
+/// Delete a session (ACP `session/delete`).
+#[tauri::command]
+pub async fn delete_session(app: AppHandle, session_id: String) -> Result<(), String> {
+    let client = api::ensure_client(&app).await?;
+    client
+        .request("session/delete", json!({ "sessionId": session_id }))
+        .await?;
+    Ok(())
+}
+
+/// Metadata about a dropped path (file vs. folder) for composer chips.
+#[derive(Debug, Clone, Serialize)]
+pub struct PathInfo {
+    pub path: String,
+    pub name: String,
+    pub is_dir: bool,
+    pub exists: bool,
+}
+
+/// Inspect dropped paths so the composer can show file/folder chips.
+#[tauri::command]
+pub fn inspect_paths(paths: Vec<String>) -> Result<Vec<PathInfo>, String> {
+    Ok(paths
+        .into_iter()
+        .map(|p| {
+            let path = PathBuf::from(&p);
+            let meta = std::fs::metadata(&path);
+            PathInfo {
+                name: path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| p.clone()),
+                is_dir: meta.as_ref().map(|m| m.is_dir()).unwrap_or(false),
+                exists: meta.is_ok(),
+                path: p,
+            }
+        })
+        .collect())
+}
+
+/// Open a file/folder with the OS default handler (artifacts "Open").
+#[tauri::command]
+pub fn open_path(app: AppHandle, path: String) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    app.opener()
+        .open_path(&path, None::<&str>)
+        .map_err(|e| format!("could not open {path}: {e}"))
+}
+
+/// Reveal a file in its containing folder (artifacts "Show in Folder").
+#[tauri::command]
+pub fn reveal_path(app: AppHandle, path: String) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    app.opener()
+        .reveal_item_in_dir(&path)
+        .map_err(|e| format!("could not reveal {path}: {e}"))
 }

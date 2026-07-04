@@ -1,9 +1,11 @@
 import { useEffect, useRef } from 'react';
+import { onFileDrop } from '@/lib/ipc';
 import { useChatStore } from '@/stores/chatStore';
 import { MessageItem } from './MessageItem';
 import { Composer } from './Composer';
 import { ApprovalPrompt } from './ApprovalPrompt';
 import { ModeBadge } from './ModeBadge';
+import { FileChips } from './FileChips';
 
 /** The shared chat surface used by both the overlay and the full window
     (CLAUDE.md rule 5). The window wrapper supplies the surrounding chrome. */
@@ -18,6 +20,7 @@ export function ChatView() {
     send,
     newSession,
     respondApproval,
+    addDroppedPaths,
     bindEvents,
   } = useChatStore();
   const listRef = useRef<HTMLDivElement>(null);
@@ -26,16 +29,23 @@ export function ChatView() {
     bindEvents();
   }, [bindEvents]);
 
+  // File/folder drop onto this window becomes composer chips.
+  useEffect(() => {
+    const un = onFileDrop((paths) => void addDroppedPaths(paths));
+    return () => void un.then((fn) => fn());
+  }, [addDroppedPaths]);
+
   // Auto-scroll to the latest content while streaming.
   useEffect(() => {
     const el = listRef.current;
     if (el) el.scrollTop = el.scrollHeight;
   }, [messages]);
 
-  const folder = cwd ? cwd.split('/').filter(Boolean).pop() : null;
-  const lastAssistant = messages[messages.length - 1];
+  const folder = cwd ? cwd.split(/[\\/]/).filter(Boolean).pop() : null;
+  const last = messages[messages.length - 1];
   const awaitingFirstToken =
-    busy && lastAssistant?.role === 'assistant' && !lastAssistant.text && !lastAssistant.reasoning;
+    busy &&
+    (!last || last.role === 'user' || (last.role === 'assistant' && !last.text && !last.reasoning));
 
   return (
     <div className="chat">
@@ -69,6 +79,7 @@ export function ChatView() {
         />
       ))}
       {error && <div className="chat-error">{error}</div>}
+      <FileChips />
       <Composer onSend={(t) => void send(t)} disabled={busy} />
     </div>
   );

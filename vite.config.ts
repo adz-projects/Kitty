@@ -14,6 +14,8 @@ export default defineConfig({
   server: {
     port: 1420,
     strictPort: true,
+    // Never watch the Rust build output (locked .dll/.exe cause EBUSY).
+    watch: { ignored: ['**/src-tauri/**'] },
   },
   build: {
     target: 'esnext',
