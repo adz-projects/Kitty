@@ -6,6 +6,8 @@
 
 mod commands;
 mod config;
+#[cfg(windows)]
+mod copilot;
 mod goosed;
 mod hotkey;
 mod lifecycle;
@@ -89,6 +91,10 @@ pub fn run() {
             commands::list_extensions,
             commands::set_extension_enabled,
             commands::get_settings_target,
+            commands::list_themes,
+            commands::read_user_theme,
+            commands::open_themes_folder,
+            commands::read_image_data_url,
         ])
         .setup(move |app| {
             let handle = app.handle();
@@ -97,6 +103,9 @@ pub fn run() {
             if let Err(e) = hotkey::register(handle, &hotkey_accel) {
                 tracing::error!("global hotkey registration failed: {e}");
             }
+            // Low-level Copilot-key hook (Windows only).
+            #[cfg(windows)]
+            copilot::install(handle);
             // Start Ollama + goosed and the health loop in the background.
             lifecycle::start_stack(handle);
             Ok(())

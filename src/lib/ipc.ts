@@ -72,11 +72,25 @@ export const ipc = {
     invoke<void>('set_extension_enabled', { sessionId, name, enabled }),
   // Settings deep link
   getSettingsTarget: () => invoke<SettingsTarget | null>('get_settings_target'),
+  // Theming
+  listThemes: () => invoke<{ builtins: string[]; user: string[] }>('list_themes'),
+  readUserTheme: (name: string) => invoke<string>('read_user_theme', { name }),
+  openThemesFolder: () => invoke<void>('open_themes_folder'),
+  readImageDataUrl: (path: string) => invoke<string>('read_image_data_url', { path }),
 };
 
 /** Native folder picker (default context folder, etc.). Returns null if cancelled. */
 export async function pickFolder(): Promise<string | null> {
   const res = await openDialog({ directory: true, multiple: false });
+  return typeof res === 'string' ? res : null;
+}
+
+/** Native image-file picker (background image). Returns null if cancelled. */
+export async function pickImage(): Promise<string | null> {
+  const res = await openDialog({
+    multiple: false,
+    filters: [{ name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp'] }],
+  });
   return typeof res === 'string' ? res : null;
 }
 
@@ -118,6 +132,8 @@ export const onPullProgress = (cb: (e: PullProgress) => void) =>
 
 export const onSettingsNavigate = (cb: (t: SettingsTarget) => void) =>
   listen<SettingsTarget>('settings://navigate', (e) => cb(e.payload));
+
+export const onThemeChanged = (cb: () => void) => listen('theme://changed', () => cb());
 
 /** Tray "New Session" → overlay starts a fresh session. */
 export const onNewSessionRequest = (cb: () => void) => listen('session://new', () => cb());

@@ -21,6 +21,26 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
+/* Background image (Phase 6): applied to the document root so it shows behind
+   the transparent overlay card and behind opaque window content. The overlay
+   stays transparent when no image is set. */
+html[data-bg-image] {
+  background-image:
+    linear-gradient(
+      rgba(0, 0, 0, var(--bg-image-dim, 0.3)),
+      rgba(0, 0, 0, var(--bg-image-dim, 0.3))
+    ),
+    var(--bg-image, none);
+  background-size: cover;
+  background-position: center;
+  background-attachment: fixed;
+}
+html[data-bg-image] .window-root,
+html[data-bg-image] .main-window,
+html[data-bg-image] .settings-window {
+  background: transparent;
+}
+
 button {
   font: inherit;
   cursor: pointer;

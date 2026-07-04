@@ -30,8 +30,12 @@ pub struct Config {
     pub ollama_base_url: String,
     /// First-run wizard completion flag (gates the wizard in Phase 7).
     pub setup_completed: bool,
-    /// Active theme name (built-ins: `default`, `dark`); Phase 6 adds user themes.
+    /// Active theme name (built-ins `default`/`dark`, or a user `.css` filename).
     pub theme: String,
+    /// Optional background-image path applied to all windows (Phase 6).
+    pub background_image: Option<String>,
+    /// Background-image dim (0.0 = none, 1.0 = fully dark overlay).
+    pub background_dim: f32,
     /// Per-event notification preferences (surfaced in Settings in Phase 5).
     pub notifications: NotificationPrefs,
     /// Remember overlay size/position between summons (Phase 6).
@@ -66,6 +70,8 @@ impl Default for Config {
             ollama_base_url: "http://localhost:11434".to_string(),
             setup_completed: false,
             theme: "default".to_string(),
+            background_image: None,
+            background_dim: 0.3,
             notifications: NotificationPrefs::default(),
             remember_overlay_position: true,
             providers: Vec::new(),
@@ -120,6 +126,13 @@ fn config_dir() -> Result<PathBuf, ConfigError> {
 
 fn config_path() -> Result<PathBuf, ConfigError> {
     Ok(config_dir()?.join("config.json"))
+}
+
+/// `%APPDATA%/goose-overlay/themes/` (created if missing) — user `.css` themes.
+pub fn themes_dir() -> Result<PathBuf, ConfigError> {
+    let dir = config_dir()?.join("themes");
+    fs::create_dir_all(&dir)?;
+    Ok(dir)
 }
 
 /// Load config from disk, falling back to defaults if the file is missing.

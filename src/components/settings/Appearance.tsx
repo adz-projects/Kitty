@@ -1,21 +1,88 @@
+import { useEffect, useState } from 'react';
+import { ipc, pickImage } from '@/lib/ipc';
 import { useConfigDraft } from './useConfigDraft';
 
-/** Appearance: theme selection now; user CSS themes + background image land in
-    Phase 6. */
+/** Appearance: theme (built-in + user CSS), background image + dim, overlay prefs. */
 export function Appearance() {
   const { draft, update, save, saved } = useConfigDraft();
+  const [themes, setThemes] = useState<{ builtins: string[]; user: string[] }>({
+    builtins: ['default', 'dark'],
+    user: [],
+  });
+
+  const loadThemes = () => void ipc.listThemes().then(setThemes);
+  useEffect(loadThemes, []);
+
   if (!draft) return <p className="muted">Loading…</p>;
 
   return (
     <section className="settings-section">
       <h1>Appearance</h1>
+
       <label className="field">
         <span>Theme</span>
-        <select value={draft.theme} onChange={(e) => update({ theme: e.target.value })}>
-          <option value="default">Default (light)</option>
-          <option value="dark">Dark</option>
-        </select>
+        <div className="row">
+          <select value={draft.theme} onChange={(e) => update({ theme: e.target.value })}>
+            <optgroup label="Built-in">
+              {themes.builtins.map((t) => (
+                <option key={t} value={t}>
+                  {t}
+                </option>
+              ))}
+            </optgroup>
+            {themes.user.length > 0 && (
+              <optgroup label="Custom (themes folder)">
+                {themes.user.map((t) => (
+                  <option key={t} value={t}>
+                    {t}
+                  </option>
+                ))}
+              </optgroup>
+            )}
+          </select>
+          <button onClick={() => void ipc.openThemesFolder()}>Open themes folder</button>
+          <button onClick={loadThemes}>Refresh</button>
+        </div>
+        <small className="muted">
+          Drop a <code>.css</code> file of custom properties into the themes folder — see
+          themes/README.md for the contract.
+        </small>
       </label>
+
+      <label className="field">
+        <span>Background image</span>
+        <div className="row">
+          <input
+            value={draft.background_image ?? ''}
+            placeholder="(none)"
+            onChange={(e) => update({ background_image: e.target.value || null })}
+          />
+          <button
+            onClick={async () => {
+              const img = await pickImage();
+              if (img) update({ background_image: img });
+            }}
+          >
+            Choose…
+          </button>
+          {draft.background_image && (
+            <button onClick={() => update({ background_image: null })}>Clear</button>
+          )}
+        </div>
+      </label>
+
+      <label className="field">
+        <span>Background dim ({Math.round((draft.background_dim ?? 0.3) * 100)}%)</span>
+        <input
+          type="range"
+          min={0}
+          max={1}
+          step={0.05}
+          value={draft.background_dim ?? 0.3}
+          onChange={(e) => update({ background_dim: Number(e.target.value) })}
+        />
+      </label>
+
       <label className="check">
         <input
           type="checkbox"
@@ -24,10 +91,10 @@ export function Appearance() {
         />
         <span>Remember overlay size &amp; position</span>
       </label>
-      <p className="muted">Custom CSS themes and a background image arrive in Phase 6.</p>
+
       <div className="row">
         <button className="primary" onClick={() => void save()}>
-          Save
+          Save &amp; apply
         </button>
         {saved && <span className="muted">Saved.</span>}
       </div>

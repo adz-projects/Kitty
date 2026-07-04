@@ -1,10 +1,31 @@
+import { useState } from 'react';
 import { useConfigDraft } from './useConfigDraft';
 import { pickFolder } from '@/lib/ipc';
+
+/** Build a tauri-global-shortcut accelerator from a keydown event. */
+function accelerator(e: React.KeyboardEvent): string | null {
+  const mods: string[] = [];
+  if (e.ctrlKey) mods.push('Control');
+  if (e.altKey) mods.push('Alt');
+  if (e.shiftKey) mods.push('Shift');
+  if (e.metaKey) mods.push('Super');
+  const code = e.code;
+  let key: string | null = null;
+  if (/^Key[A-Z]$/.test(code)) key = code.slice(3);
+  else if (/^Digit[0-9]$/.test(code)) key = code.slice(5);
+  else if (/^F[0-9]{1,2}$/.test(code)) key = code;
+  else if (code === 'Space') key = 'Space';
+  else if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(code))
+    key = code.replace('Arrow', '');
+  if (!key || mods.length === 0) return null; // require at least one modifier
+  return [...mods, key].join('+');
+}
 
 /** General settings backed by app config. Goose-only settings (approval mode is
     per-session; see the chat mode badge) are noted where they live elsewhere. */
 export function General() {
   const { draft, update, save, saved } = useConfigDraft();
+  const [recording, setRecording] = useState(false);
   if (!draft) return <p className="muted">Loading…</p>;
 
   return (
@@ -40,9 +61,38 @@ export function General() {
 
       <label className="field">
         <span>Toggle hotkey</span>
-        <input value={draft.hotkey} onChange={(e) => update({ hotkey: e.target.value })} />
-        <small className="muted">Recording UI + Copilot key arrive in Phase 6.</small>
+        <div className="row">
+          <input
+            value={recording ? 'Press a shortcut…' : draft.hotkey}
+            readOnly={recording}
+            onChange={(e) => update({ hotkey: e.target.value })}
+            onKeyDown={(e) => {
+              if (!recording) return;
+              e.preventDefault();
+              const acc = accelerator(e);
+              if (acc) {
+                update({ hotkey: acc });
+                setRecording(false);
+              }
+            }}
+          />
+          <button onClick={() => setRecording((r) => !r)}>{recording ? 'Cancel' : 'Record'}</button>
+        </div>
+        <small className="muted">Save to apply. Takes effect immediately after saving.</small>
       </label>
+
+      <label className="check">
+        <input
+          type="checkbox"
+          checked={draft.use_copilot_key}
+          onChange={(e) => update({ use_copilot_key: e.target.checked })}
+        />
+        <span>Use the Copilot key (Win+Shift+F23) to summon the overlay</span>
+      </label>
+      <small className="muted">
+        If your Copilot key doesn&apos;t work, remap it to your hotkey with PowerToys Keyboard
+        Manager.
+      </small>
 
       <label className="field">
         <span>Auto-summarize threshold (messages)</span>

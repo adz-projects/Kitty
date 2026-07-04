@@ -40,6 +40,9 @@ pub fn set_config(
         "Could not save settings to disk.".to_string()
     })?;
 
+    // Let every window re-apply theme/background from the new config.
+    let _ = app.emit("theme://changed", ());
+
     if hotkey_changed {
         if let Err(e) = hotkey::register(&app, &config.hotkey) {
             tracing::error!("re-register hotkey failed: {e}");
@@ -77,6 +80,79 @@ pub async fn open_settings(
 #[tauri::command]
 pub fn get_settings_target(state: tauri::State<'_, AppState>) -> Result<Option<Value>, String> {
     Ok(state.settings_target.lock().unwrap().clone())
+}
+
+// ============================ Phase 6: theming ============================
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ThemeList {
+    pub builtins: Vec<String>,
+    pub user: Vec<String>,
+}
+
+/// Built-in theme names plus any user `.css` files in the themes folder.
+#[tauri::command]
+pub fn list_themes() -> Result<ThemeList, String> {
+    let dir = config::themes_dir().map_err(|e| e.to_string())?;
+    let mut user = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.to_ascii_lowercase().ends_with(".css") {
+                user.push(name);
+            }
+        }
+    }
+    user.sort();
+    Ok(ThemeList {
+        builtins: vec!["default".into(), "dark".into()],
+        user,
+    })
+}
+
+/// Read a user theme's CSS text by filename (must live in the themes folder).
+#[tauri::command]
+pub fn read_user_theme(name: String) -> Result<String, String> {
+    // Guard against path traversal — filename only.
+    if name.contains('/') || name.contains('\\') || name.contains("..") {
+        return Err("invalid theme name".into());
+    }
+    let path = config::themes_dir().map_err(|e| e.to_string())?.join(&name);
+    let text =
+        std::fs::read_to_string(&path).map_err(|e| format!("could not read theme {name}: {e}"))?;
+    // Strip a leading UTF-8 BOM, which would otherwise break the first CSS rule.
+    Ok(text.strip_prefix('\u{feff}').unwrap_or(&text).to_string())
+}
+
+/// Open the user themes folder in the file explorer.
+#[tauri::command]
+pub fn open_themes_folder(app: AppHandle) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    let dir = config::themes_dir().map_err(|e| e.to_string())?;
+    app.opener()
+        .open_path(dir.to_string_lossy().to_string(), None::<&str>)
+        .map_err(|e| e.to_string())
+}
+
+/// Read an image file as a base64 data URL (for the background image, avoiding
+/// asset-protocol scope config).
+#[tauri::command]
+pub fn read_image_data_url(path: String) -> Result<String, String> {
+    use base64::Engine;
+    let bytes = std::fs::read(&path).map_err(|e| format!("could not read image: {e}"))?;
+    let ext = std::path::Path::new(&path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("png")
+        .to_ascii_lowercase();
+    let mime = match ext.as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        _ => "image/png",
+    };
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    Ok(format!("data:{mime};base64,{b64}"))
 }
 
 /// Open the full window. Async so window creation dispatches to the main thread.

@@ -23,6 +23,8 @@ export interface Config {
   ollama_base_url: string;
   setup_completed: boolean;
   theme: string;
+  background_image: string | null;
+  background_dim: number;
   notifications: NotificationPrefs;
   remember_overlay_position: boolean;
   providers: ProviderProfile[];
