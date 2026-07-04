@@ -38,12 +38,20 @@ done until this file is updated and the affected code (`goosed/api.rs`,
 
 ## Installer URLs & hashes (Phase 7)
 
-- **Ollama Windows installer:** _TBD (URL, silent-install flag, published size/hash)._
-- **Goose installer:** _TBD._
+- **Ollama Windows installer:** `https://ollama.com/download/OllamaSetup.exe`
+  (Inno Setup; hands off to its own UI/UAC — verify a silent flag before enabling
+  unattended install). Wired in `src-tauri/src/wizard.rs`.
+- **Goose installer:** _TBD — Block's Windows installer asset URL from
+  block/goose GitHub releases. Not wired yet; the wizard tells the user to install
+  Goose Desktop and re-detect. (The dev machine already has it under
+  `%LOCALAPPDATA%\Programs\dist-windows`.)_
 
-## Starter models (Phase 7 `starter_models.ts`)
+## Starter models (Phase 7 `src/lib/starter_models.ts`)
 
-- **Curated ≤4B list:** _TBD (verify tags exist on ollama.com at implementation time)._
+- **Curated ≤4B list:** `llama3.2:1b` (~1.3GB), `llama3.2:3b` (~2GB),
+  `qwen2.5:3b` (~1.9GB), `gemma2:2b` (~1.6GB). **Re-verify these tags exist on
+  ollama.com before release** — the dev environment is future-dated (Ollama
+  0.31.1, models `gemma4`/`qwen3.5`), so newer small tags may be preferable.
 
 ## Reasoning-capable models (Phase 10 `reasoning_models.ts`)
 

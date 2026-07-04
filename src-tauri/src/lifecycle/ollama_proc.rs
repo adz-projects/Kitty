@@ -32,7 +32,7 @@ pub async fn has_any_model(client: &reqwest::Client, base_url: &str) -> bool {
 
 /// Locate the `ollama` binary: `OLLAMA_BIN` override, the default per-user
 /// install dir, then bare `ollama` on PATH.
-fn locate_ollama() -> PathBuf {
+pub fn locate_ollama() -> PathBuf {
     if let Ok(p) = std::env::var("OLLAMA_BIN") {
         let path = PathBuf::from(p);
         if path.exists() {

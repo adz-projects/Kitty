@@ -30,6 +30,8 @@ pub struct AppState {
     pub active_session: Mutex<Option<Value>>,
     /// Deep-link target for the settings window (`{ section, highlight }`).
     pub settings_target: Mutex<Option<Value>>,
+    /// Wizard launch mode (`"setup"` or `"repair"`).
+    pub wizard_mode: Mutex<Option<String>>,
 }
 
 impl AppState {
@@ -42,6 +44,7 @@ impl AppState {
             acp: AsyncMutex::new(None),
             active_session: Mutex::new(None),
             settings_target: Mutex::new(None),
+            wizard_mode: Mutex::new(None),
         }
     }
 }

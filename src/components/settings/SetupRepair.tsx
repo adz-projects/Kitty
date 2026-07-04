@@ -35,9 +35,10 @@ export function SetupRepair() {
         </button>
       </div>
       {msg && <p className="muted">{msg}</p>}
-      <p className="muted">
-        The guided first-run wizard (install Ollama/Goose, pull a starter model) arrives in Phase 7.
-      </p>
+      <div className="row">
+        <button onClick={() => void ipc.openWizard('setup')}>Run first-run wizard</button>
+        <button onClick={() => void ipc.openWizard('repair')}>Repair setup</button>
+      </div>
     </section>
   );
 }

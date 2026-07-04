@@ -745,3 +745,74 @@ button.link {
   margin: 0;
   font-size: 16px;
 }
+
+/* --- Wizard (Phase 7) --- */
+.wizard {
+  max-width: 640px;
+  margin: 0 auto;
+}
+.wizard-steps {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 20px;
+}
+.wizard-step {
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+}
+.wizard-step.active {
+  border-color: var(--accent);
+  color: var(--accent);
+  font-weight: 600;
+}
+.wizard-step.done {
+  color: var(--ok);
+  border-color: var(--ok);
+}
+.wizard-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.wizard-panel h1 {
+  margin: 0;
+  font-size: 22px;
+}
+.wizard-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: 8px;
+}
+.dep-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+}
+.starter-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.starter {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  cursor: pointer;
+  background: var(--surface);
+}
+.starter.selected {
+  border-color: var(--accent);
+  box-shadow: inset 2px 0 0 var(--accent);
+}

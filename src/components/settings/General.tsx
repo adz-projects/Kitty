@@ -1,6 +1,6 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useConfigDraft } from './useConfigDraft';
-import { pickFolder } from '@/lib/ipc';
+import { ipc, pickFolder } from '@/lib/ipc';
 
 /** Build a tauri-global-shortcut accelerator from a keydown event. */
 function accelerator(e: React.KeyboardEvent): string | null {
@@ -26,6 +26,12 @@ function accelerator(e: React.KeyboardEvent): string | null {
 export function General() {
   const { draft, update, save, saved } = useConfigDraft();
   const [recording, setRecording] = useState(false);
+  const [autostart, setAutostart] = useState(false);
+
+  useEffect(() => {
+    void ipc.getAutostart().then(setAutostart);
+  }, []);
+
   if (!draft) return <p className="muted">Loading…</p>;
 
   return (
@@ -115,6 +121,18 @@ export function General() {
           onChange={(e) => update({ strict_remote_mode: e.target.checked })}
         />
         <span>Strict mode: disable file/folder drop while a remote provider is active</span>
+      </label>
+
+      <label className="check">
+        <input
+          type="checkbox"
+          checked={autostart}
+          onChange={async (e) => {
+            await ipc.setAutostart(e.target.checked);
+            setAutostart(e.target.checked);
+          }}
+        />
+        <span>Start Goose Overlay when I sign in</span>
       </label>
 
       <p className="muted">

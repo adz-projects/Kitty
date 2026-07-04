@@ -82,6 +82,18 @@ export interface SettingsTarget {
   highlight: string | null;
 }
 
+// --- Wizard (Phase 7) ---
+export interface DepStatus {
+  installed: boolean;
+  version: string | null;
+  path: string | null;
+}
+
+export interface Detection {
+  ollama: DepStatus;
+  goose: DepStatus;
+}
+
 // Serde `rename_all = "snake_case"` on the Rust enum.
 export type StackStatus =
   | 'starting'

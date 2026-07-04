@@ -10,6 +10,7 @@ import type {
   ChatErrorEvent,
   CompleteEvent,
   Config,
+  Detection,
   EnvVar,
   ModeEvent,
   OllamaModel,
@@ -77,6 +78,14 @@ export const ipc = {
   readUserTheme: (name: string) => invoke<string>('read_user_theme', { name }),
   openThemesFolder: () => invoke<void>('open_themes_folder'),
   readImageDataUrl: (path: string) => invoke<string>('read_image_data_url', { path }),
+  // Wizard / setup
+  detectDependencies: () => invoke<Detection>('detect_dependencies'),
+  installDependency: (which: 'ollama' | 'goose') => invoke<void>('install_dependency', { which }),
+  openWizard: (mode?: 'setup' | 'repair') => invoke<void>('open_wizard', { mode: mode ?? 'setup' }),
+  getWizardMode: () => invoke<string | null>('get_wizard_mode'),
+  completeSetup: () => invoke<void>('complete_setup'),
+  getAutostart: () => invoke<boolean>('get_autostart'),
+  setAutostart: (enabled: boolean) => invoke<void>('set_autostart', { enabled }),
 };
 
 /** Native folder picker (default context folder, etc.). Returns null if cancelled. */
@@ -134,6 +143,9 @@ export const onSettingsNavigate = (cb: (t: SettingsTarget) => void) =>
   listen<SettingsTarget>('settings://navigate', (e) => cb(e.payload));
 
 export const onThemeChanged = (cb: () => void) => listen('theme://changed', () => cb());
+
+export const onWizardNavigate = (cb: (mode: string) => void) =>
+  listen<{ mode: string }>('wizard://navigate', (e) => cb(e.payload.mode));
 
 /** Tray "New Session" → overlay starts a fresh session. */
 export const onNewSessionRequest = (cb: () => void) => listen('session://new', () => cb());

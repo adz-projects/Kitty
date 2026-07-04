@@ -17,6 +17,7 @@ mod state;
 mod tray;
 mod util;
 mod windows;
+mod wizard;
 
 use tauri::RunEvent;
 
@@ -95,6 +96,13 @@ pub fn run() {
             commands::read_user_theme,
             commands::open_themes_folder,
             commands::read_image_data_url,
+            commands::detect_dependencies,
+            commands::install_dependency,
+            commands::open_wizard,
+            commands::get_wizard_mode,
+            commands::complete_setup,
+            commands::get_autostart,
+            commands::set_autostart,
         ])
         .setup(move |app| {
             let handle = app.handle();
@@ -106,6 +114,10 @@ pub fn run() {
             // Low-level Copilot-key hook (Windows only).
             #[cfg(windows)]
             copilot::install(handle);
+            // First launch: show the setup wizard instead of the (hidden) overlay.
+            if !wizard::setup_completed(handle) {
+                let _ = windows::open_wizard(handle, "setup");
+            }
             // Start Ollama + goosed and the health loop in the background.
             lifecycle::start_stack(handle);
             Ok(())

@@ -13,8 +13,6 @@ use crate::state::AppState;
 pub const OVERLAY: &str = "overlay";
 pub const MAIN: &str = "main";
 pub const SETTINGS: &str = "settings";
-/// Used by `open_wizard` once the first-run wizard is wired in Phase 7.
-#[allow(dead_code)]
 pub const WIZARD: &str = "wizard";
 
 fn url(label: &str) -> WebviewUrl {
@@ -108,10 +106,11 @@ pub fn open_settings(
     Ok(())
 }
 
-/// Open the first-run / repair wizard. Wired to the tray / degraded-state flow
-/// in Phase 7; defined now so the window set is complete.
-#[allow(dead_code)]
-pub fn open_wizard(app: &AppHandle) -> tauri::Result<()> {
+/// Open the first-run / repair wizard in the given mode (`"setup"`/`"repair"`).
+/// Stores the mode (for the window's initial read) and emits it for a live nav.
+pub fn open_wizard(app: &AppHandle, mode: &str) -> tauri::Result<()> {
+    *app.state::<AppState>().wizard_mode.lock().unwrap() = Some(mode.to_string());
+    let _ = app.emit("wizard://navigate", json!({ "mode": mode }));
     let win = ensure_window(app, WIZARD, "Goose Setup")?;
     win.show()?;
     win.set_focus()?;

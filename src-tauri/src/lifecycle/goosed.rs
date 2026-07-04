@@ -17,7 +17,7 @@ use crate::util::hidden_command;
 
 /// Locate the `goose` binary: `GOOSE_BIN` override, the Goose Desktop bundle's
 /// `resources/bin/goose.exe`, then bare `goose` on PATH.
-fn locate_goose() -> PathBuf {
+pub fn locate_goose() -> PathBuf {
     if let Ok(p) = std::env::var("GOOSE_BIN") {
         let path = PathBuf::from(p);
         if path.exists() {
