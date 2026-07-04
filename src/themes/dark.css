@@ -15,4 +15,6 @@
   --ok: #22c55e;
   --warn: #f59e0b;
   --danger: #f87171;
+  --reading-max-width: 680px;
+  --reading-line-height: 1.7;
 }

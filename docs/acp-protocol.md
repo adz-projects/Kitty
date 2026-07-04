@@ -29,6 +29,10 @@ Goose version bump (see [VERSIONS.md](VERSIONS.md)).
    `agent_message_chunk`), then returns `{ modes }`. (Phase 4)
    - `session/list` → `{ sessions: [{ sessionId, cwd, title, updatedAt, _meta: { messageCount, createdAt, lastMessageAt, providerId, modelId, sessionType } }] }`.
    - `session/delete` `{ sessionId }` (extension method).
+  - `session/fork` `{ sessionId, cwd }` → `{ sessionId: <new>, modes }` (full copy;
+    unknown params are silently ignored). Phase 9 branch = fork **then**
+    `_goose/unstable/session/conversation/truncate` `{ sessionId, truncateFrom }`
+    (keeps messages before `truncateFrom`).
    - Working-dir change on an existing session is the *unstable* extension method
      `_goose/unstable/session/working-dir/update` — we avoid it; "Set as working
      directory" starts a new `session/new` rooted at the folder instead.

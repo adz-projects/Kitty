@@ -39,8 +39,8 @@ function PlainList({
   return (
     <div className="message-list" ref={ref}>
       {messages.length === 0 && <p className="muted">{empty}</p>}
-      {messages.map((m) => (
-        <MessageItem key={m.id} message={m} />
+      {messages.map((m, i) => (
+        <MessageItem key={m.id} message={m} index={i} />
       ))}
       {typing && <span className="typing">Thinking…</span>}
     </div>
@@ -78,7 +78,7 @@ function VirtualList({ messages, typing }: { messages: Message[]; typing: boolea
               transform: `translateY(${vi.start}px)`,
             }}
           >
-            <MessageItem message={messages[vi.index]} />
+            <MessageItem message={messages[vi.index]} index={vi.index} />
           </div>
         ))}
       </div>

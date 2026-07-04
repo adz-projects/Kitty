@@ -1,7 +1,12 @@
 import { useRef, useState } from 'react';
+import { useChatStore } from '@/stores/chatStore';
+
+// Pastes larger than this (chat-only mode) collapse into a document attachment.
+const PASTE_THRESHOLD = 500;
 
 /** Message composer: Enter sends, Shift+Enter inserts a newline. While a reply
-    streams, sending is blocked and a Stop button cancels the turn. */
+    streams, sending is blocked and a Stop button cancels the turn. In chat-only
+    mode, large pastes collapse into an inlined document attachment. */
 export function Composer({
   onSend,
   onStop,
@@ -13,6 +18,8 @@ export function Composer({
 }) {
   const [text, setText] = useState('');
   const ref = useRef<HTMLTextAreaElement>(null);
+  const toolsEnabled = useChatStore((s) => s.toolsEnabled);
+  const addPastedText = useChatStore((s) => s.addPastedText);
 
   const submit = () => {
     const value = text.trim();
@@ -39,6 +46,14 @@ export function Composer({
           if (e.key === 'Enter' && !e.shiftKey) {
             e.preventDefault();
             submit();
+          }
+        }}
+        onPaste={(e) => {
+          if (toolsEnabled) return; // agentic mode keeps native paste
+          const pasted = e.clipboardData.getData('text');
+          if (pasted.length > PASTE_THRESHOLD) {
+            e.preventDefault();
+            addPastedText(pasted);
           }
         }}
       />

@@ -480,6 +480,66 @@ pub async fn load_session(
     })
 }
 
+/// Fork a session (ACP `session/fork`), optionally truncating the copy to a
+/// branch point. Powers "Branch from here" and "Regenerate" (Phase 9).
+#[tauri::command]
+pub async fn fork_session(
+    app: AppHandle,
+    session_id: String,
+    cwd: String,
+    truncate_from: Option<i64>,
+) -> Result<SessionInfo, String> {
+    let client = api::ensure_client(&app).await?;
+    let result = client
+        .request("session/fork", json!({ "sessionId": session_id, "cwd": cwd }))
+        .await?;
+    let new_id = result
+        .get("sessionId")
+        .and_then(|v| v.as_str())
+        .ok_or("fork did not return a session id")?
+        .to_string();
+
+    if let Some(n) = truncate_from {
+        let _ = client
+            .request(
+                "_goose/unstable/session/conversation/truncate",
+                json!({ "sessionId": new_id, "truncateFrom": n }),
+            )
+            .await;
+    }
+
+    let current_mode = result
+        .pointer("/modes/currentModeId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("auto")
+        .to_string();
+    let available_modes = result
+        .pointer("/modes/availableModes")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().map(parse_mode).collect())
+        .unwrap_or_default();
+    Ok(SessionInfo {
+        session_id: new_id,
+        cwd,
+        current_mode,
+        available_modes,
+    })
+}
+
+/// Read a text file for inlining into a chat-only message (Phase 9). Rejects
+/// binaries and files over the cap (default 200 KB).
+#[tauri::command]
+pub fn read_text_file(path: String, max_bytes: Option<usize>) -> Result<String, String> {
+    let cap = max_bytes.unwrap_or(200 * 1024);
+    let meta = std::fs::metadata(&path).map_err(|e| format!("could not open file: {e}"))?;
+    if meta.len() as usize > cap {
+        return Err(format!("File is too large to attach (> {} KB).", cap / 1024));
+    }
+    let bytes = std::fs::read(&path).map_err(|e| format!("could not read file: {e}"))?;
+    String::from_utf8(bytes)
+        .map_err(|_| "That looks like a binary file — only text can be attached here.".to_string())
+}
+
 /// Delete a session (ACP `session/delete`).
 #[tauri::command]
 pub async fn delete_session(app: AppHandle, session_id: String) -> Result<(), String> {

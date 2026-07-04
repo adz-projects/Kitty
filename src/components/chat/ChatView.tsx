@@ -6,9 +6,16 @@ import { Composer } from './Composer';
 import { ApprovalPrompt } from './ApprovalPrompt';
 import { ModeBadge } from './ModeBadge';
 import { FileChips } from './FileChips';
+import { AttachmentChips } from './AttachmentChips';
+
+const TIER_LABEL: Record<string, string> = {
+  personal: '🔒 private network',
+  remote: '☁ remote',
+};
 
 /** The shared chat surface used by both the overlay and the full window
-    (CLAUDE.md rule 5). The window wrapper supplies the surrounding chrome. */
+    (CLAUDE.md rule 5). In chat-only mode (tools_enabled:false) it hides the
+    agent chrome and switches to a reading-friendly column. */
 export function ChatView() {
   const {
     messages,
@@ -17,19 +24,24 @@ export function ChatView() {
     cwd,
     title,
     pendingApprovals,
+    toolsEnabled,
+    providerTier,
+    providerHost,
+    providerOffline,
     send,
     cancel,
     newSession,
     respondApproval,
     addDroppedPaths,
     bindEvents,
+    refreshProvider,
   } = useChatStore();
 
   useEffect(() => {
     bindEvents();
-  }, [bindEvents]);
+    void refreshProvider();
+  }, [bindEvents, refreshProvider]);
 
-  // File/folder drop onto this window becomes composer chips.
   useEffect(() => {
     const un = onFileDrop((paths) => void addDroppedPaths(paths));
     return () => void un.then((fn) => fn());
@@ -40,20 +52,35 @@ export function ChatView() {
   const awaitingFirstToken =
     busy &&
     (!last || last.role === 'user' || (last.role === 'assistant' && !last.text && !last.reasoning));
+  const chatOnly = !toolsEnabled;
+  const tierBadge = providerTier && TIER_LABEL[providerTier];
 
   return (
-    <div className="chat">
+    <div className={`chat${chatOnly ? ' reading' : ''}`}>
       <div className="chat-header">
         <span className="pill" title={cwd ?? undefined}>
-          📁 {folder ?? 'no session'}
+          {chatOnly ? '💬 thought partner' : `📁 ${folder ?? 'no session'}`}
         </span>
         <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-          <ModeBadge />
+          {tierBadge && (
+            <span className="status-badge" title={providerHost ?? undefined}>
+              {tierBadge}
+              {providerHost ? `: ${providerHost}` : ''}
+            </span>
+          )}
+          {!chatOnly && <ModeBadge />}
           <button onClick={() => void newSession()} title="Start a new session">
             New chat
           </button>
         </div>
       </div>
+
+      {providerOffline && (
+        <div className="conflict-banner" role="status">
+          <span className="status-dot bad" />
+          Can’t reach {providerHost ?? 'the provider'} — check Tailscale / your connection.
+        </div>
+      )}
 
       <MessageList
         messages={messages}
@@ -61,15 +88,16 @@ export function ChatView() {
         typing={awaitingFirstToken}
       />
 
-      {pendingApprovals.map((a) => (
-        <ApprovalPrompt
-          key={a.tool_call_id}
-          request={a}
-          onRespond={(tid, opt) => void respondApproval(tid, opt)}
-        />
-      ))}
+      {!chatOnly &&
+        pendingApprovals.map((a) => (
+          <ApprovalPrompt
+            key={a.tool_call_id}
+            request={a}
+            onRespond={(tid, opt) => void respondApproval(tid, opt)}
+          />
+        ))}
       {error && <div className="chat-error">{error}</div>}
-      <FileChips />
+      {chatOnly ? <AttachmentChips /> : <FileChips />}
       <Composer onSend={(t) => void send(t)} onStop={() => void cancel()} disabled={busy} />
     </div>
   );

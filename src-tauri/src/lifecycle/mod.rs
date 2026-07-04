@@ -12,6 +12,7 @@ pub mod ollama_proc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::state::AppState;
@@ -94,8 +95,55 @@ pub fn start_stack(app: &AppHandle) {
             Err(e) => tracing::warn!("goosed spawn failed: {e}"),
         }
 
-        // 3. Begin the periodic health loop.
-        spawn_health_loop(app);
+        // 3. Begin the periodic health loops.
+        spawn_health_loop(app.clone());
+        spawn_provider_health_loop(app);
+    });
+}
+
+/// Per-provider reachability for `personal`/`remote` providers (Phase 9). Pings
+/// the active provider's base URL every 15s and emits `provider://health` on
+/// change — distinct from the local stack machine, with Tailscale-friendly copy.
+pub fn spawn_provider_health_loop(app: AppHandle) {
+    use crate::config::providers::{network_tier_for, NetworkTier};
+    tauri::async_runtime::spawn(async move {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(4))
+            .build()
+            .expect("reqwest client");
+        let mut ticker = tokio::time::interval(Duration::from_secs(15));
+        let mut last_reachable: Option<bool> = None;
+        loop {
+            ticker.tick().await;
+            let active = {
+                let state = app.state::<AppState>();
+                let cfg = state.config.lock().unwrap();
+                cfg.active_provider_id
+                    .as_ref()
+                    .and_then(|id| cfg.providers.iter().find(|p| &p.id == id).cloned())
+            };
+
+            // Only track personal/remote providers; local ones use the stack loop.
+            let Some(p) = active.filter(|p| {
+                !matches!(network_tier_for(&p.base_url), NetworkTier::Local)
+            }) else {
+                if last_reachable == Some(false) {
+                    let _ = app.emit("provider://health", json!({ "reachable": true }));
+                }
+                last_reachable = None;
+                continue;
+            };
+
+            let reachable = client.get(&p.base_url).send().await.is_ok();
+            if last_reachable != Some(reachable) {
+                let host = p.base_url.split("://").last().unwrap_or(&p.base_url).to_string();
+                let _ = app.emit(
+                    "provider://health",
+                    json!({ "reachable": reachable, "host": host, "name": p.name }),
+                );
+                last_reachable = Some(reachable);
+            }
+        }
     });
 }
 

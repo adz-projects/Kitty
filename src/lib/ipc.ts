@@ -49,6 +49,9 @@ export const ipc = {
   loadSession: (sessionId: string, cwd: string) =>
     invoke<SessionInfo>('load_session', { sessionId, cwd }),
   deleteSession: (sessionId: string) => invoke<void>('delete_session', { sessionId }),
+  forkSession: (sessionId: string, cwd: string, truncateFrom: number | null) =>
+    invoke<SessionInfo>('fork_session', { sessionId, cwd, truncateFrom }),
+  readTextFile: (path: string) => invoke<string>('read_text_file', { path, maxBytes: null }),
   inspectPaths: (paths: string[]) => invoke<PathInfo[]>('inspect_paths', { paths }),
   openPath: (path: string) => invoke<void>('open_path', { path }),
   revealPath: (path: string) => invoke<void>('reveal_path', { path }),
@@ -147,6 +150,17 @@ export const onThemeChanged = (cb: () => void) => listen('theme://changed', () =
 
 export const onWizardNavigate = (cb: (mode: string) => void) =>
   listen<{ mode: string }>('wizard://navigate', (e) => cb(e.payload.mode));
+
+export interface ProviderHealth {
+  reachable: boolean;
+  host?: string;
+  name?: string;
+}
+export const onProviderHealth = (cb: (h: ProviderHealth) => void) =>
+  listen<ProviderHealth>('provider://health', (e) => cb(e.payload));
+
+/** The label of the window this webview is running in (`overlay` / `main` / …). */
+export const windowLabel = (): string => getCurrentWebview().label;
 
 /** Tray "New Session" → overlay starts a fresh session. */
 export const onNewSessionRequest = (cb: () => void) => listen('session://new', () => cb());

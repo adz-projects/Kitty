@@ -333,6 +333,56 @@ button.primary {
   font-size: 13px;
 }
 
+/* --- Message actions + chat-only reading mode (Phase 9) --- */
+.msg-actions {
+  display: flex;
+  gap: 6px;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+.msg:hover .msg-actions,
+.msg:focus-within .msg-actions {
+  opacity: 1;
+}
+.msg-actions button {
+  font-size: 11px;
+  padding: 2px 7px;
+  border-radius: 6px;
+  background: transparent;
+}
+
+/* Chat-only ("thought partner") mode: a wider, calmer reading column. */
+.chat.reading .message-list {
+  align-items: center;
+}
+.chat.reading .msg {
+  width: 100%;
+  max-width: var(--reading-max-width);
+}
+.chat.reading .markdown {
+  line-height: var(--reading-line-height);
+}
+
+.pasted-chip {
+  flex-direction: column;
+  align-items: stretch;
+}
+.pasted-chip summary {
+  cursor: pointer;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 6px;
+}
+.pasted-preview {
+  margin: 6px 0 0;
+  max-height: 140px;
+  overflow: auto;
+  font-size: 11.5px;
+  white-space: pre-wrap;
+  color: var(--text-muted);
+}
+
 /* --- Tool approval (Phase 3) --- */
 .approval {
   display: flex;
