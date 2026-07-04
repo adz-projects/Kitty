@@ -75,5 +75,18 @@ Shape: `{ sessionId, update: { sessionUpdate: <variant>, ... } }`. Variants seen
 - `session/set_mode` `{ sessionId, modeId }` → `{}`. `modeId` ∈ `auto` /
   `approve` / `smart_approve` (from `session/new` result `modes.availableModes`).
 - Live `current_mode_update` `session/update` reflects out-of-band changes.
+
+## Config surface (Phase 5)
+
+- **No clean ACP method to set the global provider/model.** Config is almost all
+  `_goose/unstable/*` extension methods; `session/set_model` changes the model
+  per session, but there is no provider-config write.
+- **Approach:** we route goosed to a provider by injecting Goose's env when we
+  spawn `goose serve` — `GOOSE_PROVIDER`, `GOOSE_MODEL`, and provider keys
+  (`OPENROUTER_API_KEY` / `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` + `OPENAI_BASE_URL`
+  / `OLLAMA_HOST`), plus `GOOSE_TEMPERATURE` / `GOOSE_CONTEXT_LIMIT`. Activating a
+  profile persists it and restarts goosed. Secrets come from the keyring.
+- **Extensions:** session-scoped `_goose/unstable/session/extensions/list|add|remove`.
+- **Sessions:** `session/list`, `session/load`, `session/delete` (all confirmed).
 - `fs/read_text_file`, `fs/write_text_file` — only if we advertise the capability
   (we set both `false` for now), so respond method-not-found otherwise.

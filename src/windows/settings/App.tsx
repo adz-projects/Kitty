@@ -1,75 +1,70 @@
 import { useEffect, useState } from 'react';
-import { useSettingsStore } from '@/stores/settingsStore';
-import type { Config } from '@/lib/types';
+import { ipc, onSettingsNavigate } from '@/lib/ipc';
+import { General } from '@/components/settings/General';
+import { Providers } from '@/components/settings/Providers';
+import { OllamaModels } from '@/components/settings/OllamaModels';
+import { Extensions } from '@/components/settings/Extensions';
+import { NotificationsSection } from '@/components/settings/NotificationsSection';
+import { Appearance } from '@/components/settings/Appearance';
+import { Advanced } from '@/components/settings/Advanced';
+import { SetupRepair } from '@/components/settings/SetupRepair';
 
-/** Minimal settings for Phase 0/1: enough to prove config round-trips and the
-    hotkey re-registers. The full sectioned IA (Providers, Ollama, Appearance,
-    Setup & Repair, deep links) lands in Phase 5. */
+const SECTIONS = [
+  { id: 'general', label: 'General' },
+  { id: 'providers', label: 'Providers' },
+  { id: 'ollama', label: 'Ollama Models' },
+  { id: 'extensions', label: 'Extensions' },
+  { id: 'notifications', label: 'Notifications' },
+  { id: 'appearance', label: 'Appearance' },
+  { id: 'advanced', label: 'Advanced' },
+  { id: 'setup', label: 'Setup & Repair' },
+] as const;
+
 export function App() {
-  const config = useSettingsStore((s) => s.config);
-  const load = useSettingsStore((s) => s.load);
-  const save = useSettingsStore((s) => s.save);
-  const [draft, setDraft] = useState<Config | null>(null);
-  const [saved, setSaved] = useState(false);
+  const [section, setSection] = useState<string>('general');
+  const [highlight, setHighlight] = useState<string | null>(null);
 
   useEffect(() => {
-    void load();
-  }, [load]);
-  useEffect(() => {
-    if (config) setDraft(config);
-  }, [config]);
-
-  if (!draft) return <div className="window-root">Loading…</div>;
-
-  const update = (patch: Partial<Config>) => {
-    setDraft({ ...draft, ...patch });
-    setSaved(false);
-  };
+    void (async () => {
+      const t = await ipc.getSettingsTarget();
+      if (t?.section) {
+        setSection(t.section);
+        setHighlight(t.highlight);
+      }
+    })();
+    const un = onSettingsNavigate((t) => {
+      setSection(t.section);
+      setHighlight(t.highlight);
+    });
+    return () => void un.then((fn) => fn());
+  }, []);
 
   return (
-    <div className="window-root">
-      <h1 style={{ fontSize: 20, marginTop: 0 }}>Settings</h1>
-      <p className="muted">General settings. More sections arrive in Phase 5.</p>
-
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 16, maxWidth: 480 }}>
-        <label style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-          <span>Toggle hotkey</span>
-          <input
-            value={draft.hotkey}
-            onChange={(e) => update({ hotkey: e.target.value })}
-            placeholder="Alt+Space"
-          />
-        </label>
-
-        <label style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-          <span>Ollama endpoint</span>
-          <input
-            value={draft.ollama_base_url}
-            onChange={(e) => update({ ollama_base_url: e.target.value })}
-          />
-        </label>
-
-        <label style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-          <span>Theme</span>
-          <select value={draft.theme} onChange={(e) => update({ theme: e.target.value })}>
-            <option value="default">Default</option>
-            <option value="dark">Dark</option>
-          </select>
-        </label>
-
-        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+    <div className="settings-window">
+      <nav className="settings-nav">
+        {SECTIONS.map((s) => (
           <button
-            className="primary"
-            onClick={async () => {
-              await save(draft);
-              setSaved(true);
+            key={s.id}
+            className={s.id === section ? 'active' : ''}
+            onClick={() => {
+              setSection(s.id);
+              setHighlight(null);
             }}
           >
-            Save
+            {s.label}
           </button>
-          {saved && <span className="muted">Saved.</span>}
-        </div>
-      </div>
+        ))}
+      </nav>
+      <main className="settings-main">
+        {section === 'general' && <General />}
+        {section === 'providers' && <Providers highlight={highlight} />}
+        {section === 'ollama' && <OllamaModels />}
+        {section === 'extensions' && <Extensions />}
+        {section === 'notifications' && <NotificationsSection />}
+        {section === 'appearance' && <Appearance />}
+        {section === 'advanced' && <Advanced />}
+        {section === 'setup' && <SetupRepair />}
+      </main>
     </div>
   );
 }

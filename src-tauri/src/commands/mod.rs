@@ -8,11 +8,12 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager};
 
-use crate::config::{self, Config};
+use crate::config::providers::{self, NetworkTier, ProviderProfile};
+use crate::config::{self, env_helper, Config};
 use crate::goosed::api;
 use crate::lifecycle::{self, StackStatus};
 use crate::state::AppState;
-use crate::{hotkey, notifications, windows};
+use crate::{hotkey, notifications, ollama, windows};
 
 /// Read the current app config.
 #[tauri::command]
@@ -60,15 +61,27 @@ pub fn hide_overlay(app: AppHandle) -> Result<(), String> {
     windows::hide_overlay(&app).map_err(|e| e.to_string())
 }
 
-/// Open settings, optionally deep-linked to a section (Phase 5 wires targets).
+/// Open settings, optionally deep-linked to a section + highlighted element.
+/// Async so window creation dispatches to the main thread (a sync command would
+/// deadlock: it holds the main thread while `build()` needs it).
 #[tauri::command]
-pub fn open_settings(app: AppHandle, section: Option<String>) -> Result<(), String> {
-    windows::open_settings(&app, section).map_err(|e| e.to_string())
+pub async fn open_settings(
+    app: AppHandle,
+    section: Option<String>,
+    highlight: Option<String>,
+) -> Result<(), String> {
+    windows::open_settings(&app, section, highlight).map_err(|e| e.to_string())
 }
 
-/// Open the full window.
+/// The settings deep-link target the window should navigate to on open.
 #[tauri::command]
-pub fn open_main(app: AppHandle) -> Result<(), String> {
+pub fn get_settings_target(state: tauri::State<'_, AppState>) -> Result<Option<Value>, String> {
+    Ok(state.settings_target.lock().unwrap().clone())
+}
+
+/// Open the full window. Async so window creation dispatches to the main thread.
+#[tauri::command]
+pub async fn open_main(app: AppHandle) -> Result<(), String> {
     windows::open_main(&app).map_err(|e| e.to_string())
 }
 
@@ -91,7 +104,12 @@ pub async fn restart_goosed(app: AppHandle) -> Result<(), String> {
         let state = app.state::<AppState>();
         *state.acp.lock().await = None;
     }
-    let handle = lifecycle::goosed::spawn().await?;
+    let env = {
+        let state = app.state::<AppState>();
+        let cfg = state.config.lock().unwrap();
+        config::providers::goosed_env(&cfg)
+    };
+    let handle = lifecycle::goosed::spawn(env).await?;
     let state = app.state::<AppState>();
     *state.goosed.lock().unwrap() = handle;
     Ok(())
@@ -381,4 +399,202 @@ pub fn reveal_path(app: AppHandle, path: String) -> Result<(), String> {
     app.opener()
         .reveal_item_in_dir(&path)
         .map_err(|e| format!("could not reveal {path}: {e}"))
+}
+
+// ============================ Phase 5: providers ============================
+
+/// A provider profile plus derived fields the UI needs.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProviderView {
+    #[serde(flatten)]
+    pub profile: ProviderProfile,
+    pub network_tier: NetworkTier,
+    pub has_secret: bool,
+    pub active: bool,
+}
+
+fn provider_views(cfg: &Config) -> Vec<ProviderView> {
+    cfg.providers
+        .iter()
+        .map(|p| ProviderView {
+            network_tier: p.network_tier(),
+            has_secret: providers::has_secret(&p.id),
+            active: cfg.active_provider_id.as_deref() == Some(&p.id),
+            profile: p.clone(),
+        })
+        .collect()
+}
+
+/// List provider profiles with derived tier / secret / active flags.
+#[tauri::command]
+pub fn list_providers(state: tauri::State<'_, AppState>) -> Result<Vec<ProviderView>, String> {
+    let cfg = state.config.lock().unwrap();
+    Ok(provider_views(&cfg))
+}
+
+/// Create or update a provider profile. `secret`, when present, is stored in the
+/// keyring only (never in config.json). Returns the saved profile (with id).
+#[tauri::command]
+pub fn upsert_provider(
+    state: tauri::State<'_, AppState>,
+    mut profile: ProviderProfile,
+    secret: Option<String>,
+) -> Result<ProviderProfile, String> {
+    if profile.id.trim().is_empty() {
+        profile.id = format!("prof_{}", chrono::Utc::now().timestamp_millis());
+    }
+    if profile.created_at.trim().is_empty() {
+        profile.created_at = chrono::Utc::now().to_rfc3339();
+    }
+    if let Some(s) = secret {
+        if !s.is_empty() {
+            providers::set_secret(&profile.id, &s)?;
+        }
+    }
+    let mut cfg = state.config.lock().unwrap();
+    match cfg.providers.iter_mut().find(|p| p.id == profile.id) {
+        Some(existing) => *existing = profile.clone(),
+        None => cfg.providers.push(profile.clone()),
+    }
+    config::save(&cfg).map_err(|e| e.to_string())?;
+    Ok(profile)
+}
+
+/// Delete a provider profile (and its keyring secret).
+#[tauri::command]
+pub fn delete_provider(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
+    providers::delete_secret(&id);
+    let mut cfg = state.config.lock().unwrap();
+    cfg.providers.retain(|p| p.id != id);
+    if cfg.active_provider_id.as_deref() == Some(&id) {
+        cfg.active_provider_id = None;
+    }
+    config::save(&cfg).map_err(|e| e.to_string())
+}
+
+/// Activate a provider profile (`None` = use goosed's own config). Persists the
+/// choice and restarts goosed so the provider env takes effect.
+#[tauri::command]
+pub async fn activate_provider(app: AppHandle, id: Option<String>) -> Result<(), String> {
+    {
+        let state = app.state::<AppState>();
+        let mut cfg = state.config.lock().unwrap();
+        if let Some(ref pid) = id {
+            if !cfg.providers.iter().any(|p| &p.id == pid) {
+                return Err("no such provider profile".into());
+            }
+        }
+        cfg.active_provider_id = id;
+        config::save(&cfg).map_err(|e| e.to_string())?;
+    }
+    restart_goosed(app).await
+}
+
+// ============================ Phase 5: Ollama ============================
+
+fn ollama_base(app: &AppHandle) -> String {
+    app.state::<AppState>()
+        .config
+        .lock()
+        .unwrap()
+        .ollama_base_url
+        .clone()
+}
+
+#[tauri::command]
+pub async fn ollama_list_models(app: AppHandle) -> Result<Vec<Value>, String> {
+    ollama::list_models(&ollama_base(&app)).await
+}
+
+#[tauri::command]
+pub async fn ollama_delete_model(app: AppHandle, model: String) -> Result<(), String> {
+    ollama::delete_model(&ollama_base(&app), &model).await
+}
+
+/// Start a model pull; returns a `pull_id` to correlate `ollama://pull-progress`
+/// events. Multiple concurrent pulls are supported.
+#[tauri::command]
+pub fn ollama_pull_model(app: AppHandle, model: String) -> Result<String, String> {
+    let pull_id = format!("pull_{}", chrono::Utc::now().timestamp_millis());
+    let base = ollama_base(&app);
+    let id = pull_id.clone();
+    tauri::async_runtime::spawn(async move {
+        ollama::pull_model(app, base, model, id).await;
+    });
+    Ok(pull_id)
+}
+
+// ============================ Phase 5: Ollama env helper ============================
+
+#[tauri::command]
+pub fn read_ollama_env() -> Result<Vec<env_helper::EnvVar>, String> {
+    Ok(env_helper::read_all())
+}
+
+#[tauri::command]
+pub fn set_ollama_env(name: String, value: Option<String>) -> Result<(), String> {
+    env_helper::set(&name, value.as_deref())
+}
+
+/// Restart Ollama if we own the process (else the user must restart it).
+#[tauri::command]
+pub async fn restart_ollama(app: AppHandle) -> Result<(), String> {
+    let base = ollama_base(&app);
+    let owned = {
+        let state = app.state::<AppState>();
+        let mut ollama = state.ollama.lock().unwrap();
+        if !ollama.owned {
+            return Err("Ollama is running as a service or was started outside this app — restart it yourself.".into());
+        }
+        ollama.kill_if_owned();
+        true
+    };
+    if owned {
+        let proc = lifecycle::ollama_proc::ensure_running(&base).await?;
+        *app.state::<AppState>().ollama.lock().unwrap() = proc;
+    }
+    Ok(())
+}
+
+// ============================ Phase 5: extensions ============================
+
+/// List the active session's extensions (ACP unstable extension method).
+#[tauri::command]
+pub async fn list_extensions(app: AppHandle, session_id: String) -> Result<Vec<Value>, String> {
+    let client = api::ensure_client(&app).await?;
+    let result = client
+        .request(
+            "_goose/unstable/session/extensions/list",
+            json!({ "sessionId": session_id }),
+        )
+        .await?;
+    Ok(result
+        .get("extensions")
+        .and_then(|e| e.as_array())
+        .cloned()
+        .unwrap_or_else(|| result.as_array().cloned().unwrap_or_default()))
+}
+
+/// Toggle a built-in extension by add/remove on the active session.
+#[tauri::command]
+pub async fn set_extension_enabled(
+    app: AppHandle,
+    session_id: String,
+    name: String,
+    enabled: bool,
+) -> Result<(), String> {
+    let client = api::ensure_client(&app).await?;
+    let (method, params) = if enabled {
+        (
+            "_goose/unstable/session/extensions/add",
+            json!({ "sessionId": session_id, "extension": { "type": "builtin", "name": name } }),
+        )
+    } else {
+        (
+            "_goose/unstable/session/extensions/remove",
+            json!({ "sessionId": session_id, "name": name }),
+        )
+    };
+    client.request(method, params).await?;
+    Ok(())
 }

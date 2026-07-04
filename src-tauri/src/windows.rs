@@ -5,7 +5,10 @@
 //! `main`/`settings`/`wizard` windows are created lazily on first use ("hidden
 //! until used") and reused thereafter.
 
-use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
+use serde_json::json;
+use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
+
+use crate::state::AppState;
 
 pub const OVERLAY: &str = "overlay";
 pub const MAIN: &str = "main";
@@ -86,9 +89,19 @@ pub fn open_main(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
-/// Open the settings window. `section`/`highlight` deep-linking lands in Phase 5;
-/// for now they are accepted and ignored so callers can already pass them.
-pub fn open_settings(app: &AppHandle, _section: Option<String>) -> tauri::Result<()> {
+/// Open the settings window, optionally deep-linked to a section (with an
+/// element to briefly highlight). The target is stored (for the window's initial
+/// read) and also emitted so an already-open window navigates.
+pub fn open_settings(
+    app: &AppHandle,
+    section: Option<String>,
+    highlight: Option<String>,
+) -> tauri::Result<()> {
+    if let Some(section) = section {
+        let target = json!({ "section": section, "highlight": highlight });
+        *app.state::<AppState>().settings_target.lock().unwrap() = Some(target.clone());
+        let _ = app.emit("settings://navigate", target);
+    }
     let win = ensure_window(app, SETTINGS, "Goose Settings")?;
     win.show()?;
     win.set_focus()?;

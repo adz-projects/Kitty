@@ -3,10 +3,15 @@
 //! change. Stores **metadata only** — never secrets (those live in the Windows
 //! Credential Manager via `keyring`, wired in Phase 5).
 
+pub mod env_helper;
+pub mod providers;
+
 use std::fs;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+
+use providers::ProviderProfile;
 
 /// The persisted application configuration.
 ///
@@ -31,6 +36,25 @@ pub struct Config {
     pub notifications: NotificationPrefs,
     /// Remember overlay size/position between summons (Phase 6).
     pub remember_overlay_position: bool,
+    /// Provider profiles (metadata only; secrets live in the keyring).
+    pub providers: Vec<ProviderProfile>,
+    /// Id of the active provider profile, if any (else goosed uses its config).
+    pub active_provider_id: Option<String>,
+    /// Disable file/folder drop while a remote-tier provider is active.
+    pub strict_remote_mode: bool,
+    /// Auto-summarize threshold (Goose setting; app-side until wired).
+    pub auto_summarize_threshold: Option<u32>,
+    /// Sampling / inference params applied to goosed via env on spawn.
+    pub model_params: ModelParams,
+}
+
+/// Model sampling / inference parameters (Advanced settings).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ModelParams {
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub context_length: Option<u32>,
 }
 
 impl Default for Config {
@@ -44,6 +68,11 @@ impl Default for Config {
             theme: "default".to_string(),
             notifications: NotificationPrefs::default(),
             remember_overlay_position: true,
+            providers: Vec::new(),
+            active_provider_id: None,
+            strict_remote_mode: false,
+            auto_summarize_threshold: None,
+            model_params: ModelParams::default(),
         }
     }
 }

@@ -58,6 +58,14 @@ export function StackStatusView({ status }: { status: StackStatus }) {
   const copy = COPY[status];
   if (!copy) return null;
 
+  // Deep-link "Fix this" to the most relevant settings section.
+  const section =
+    status === 'provider_unreachable'
+      ? 'providers'
+      : status === 'ollama_down' || status === 'no_model'
+        ? 'ollama'
+        : 'setup';
+
   return (
     <div className="status-panel" role="alert">
       <h2>
@@ -68,7 +76,7 @@ export function StackStatusView({ status }: { status: StackStatus }) {
         {copy.body}
       </p>
       <div className="actions">
-        <button className="primary" onClick={() => ipc.openSettings('setup')}>
+        <button className="primary" onClick={() => ipc.openSettings(section)}>
           Fix this
         </button>
         {copy.canRestartGoosed && (

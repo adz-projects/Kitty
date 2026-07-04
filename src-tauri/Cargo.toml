@@ -32,6 +32,9 @@ dirs = "5"
 rand = "0.8"
 tokio-tungstenite = "0.24"
 futures-util = "0.3"
+keyring = { version = "3", features = ["windows-native"] }
+winreg = "0.52"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-single-instance = "2"

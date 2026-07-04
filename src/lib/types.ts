@@ -10,6 +10,12 @@ export interface NotificationPrefs {
   stack_degraded: boolean;
 }
 
+export interface ModelParams {
+  temperature: number | null;
+  top_p: number | null;
+  context_length: number | null;
+}
+
 export interface Config {
   hotkey: string;
   use_copilot_key: boolean;
@@ -19,6 +25,59 @@ export interface Config {
   theme: string;
   notifications: NotificationPrefs;
   remember_overlay_position: boolean;
+  providers: ProviderProfile[];
+  active_provider_id: string | null;
+  strict_remote_mode: boolean;
+  auto_summarize_threshold: number | null;
+  model_params: ModelParams;
+}
+
+// --- Providers (Phase 5) ---
+export type NetworkTier = 'local' | 'personal' | 'remote';
+export type ProviderType = 'ollama' | 'openrouter' | 'anthropic' | 'openai' | 'custom_openai';
+
+export interface ProviderProfile {
+  id: string;
+  name: string;
+  provider_type: ProviderType;
+  base_url: string;
+  models: string[];
+  tools_enabled: boolean;
+  created_at: string;
+}
+
+/** ProviderProfile flattened + derived fields (mirrors Rust ProviderView). */
+export interface ProviderView extends ProviderProfile {
+  network_tier: NetworkTier;
+  has_secret: boolean;
+  active: boolean;
+}
+
+export interface OllamaModel {
+  name: string;
+  size: number;
+  modified_at: string;
+  details?: { parameter_size?: string; quantization_level?: string };
+}
+
+export interface PullProgress {
+  pull_id: string;
+  model: string;
+  status: string;
+  total?: number;
+  completed?: number;
+  done: boolean;
+  error?: string;
+}
+
+export interface EnvVar {
+  name: string;
+  value: string | null;
+}
+
+export interface SettingsTarget {
+  section: string;
+  highlight: string | null;
 }
 
 // Serde `rename_all = "snake_case"` on the Rust enum.

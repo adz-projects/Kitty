@@ -10,6 +10,7 @@ mod goosed;
 mod hotkey;
 mod lifecycle;
 mod notifications;
+mod ollama;
 mod state;
 mod tray;
 mod util;
@@ -75,6 +76,19 @@ pub fn run() {
             commands::inspect_paths,
             commands::open_path,
             commands::reveal_path,
+            commands::list_providers,
+            commands::upsert_provider,
+            commands::delete_provider,
+            commands::activate_provider,
+            commands::ollama_list_models,
+            commands::ollama_delete_model,
+            commands::ollama_pull_model,
+            commands::read_ollama_env,
+            commands::set_ollama_env,
+            commands::restart_ollama,
+            commands::list_extensions,
+            commands::set_extension_enabled,
+            commands::get_settings_target,
         ])
         .setup(move |app| {
             let handle = app.handle();

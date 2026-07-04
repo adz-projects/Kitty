@@ -28,6 +28,8 @@ pub struct AppState {
     /// The active session (raw `SessionInfo` JSON) handed from overlay to the
     /// full window on "Expand" so both bind the same session.
     pub active_session: Mutex<Option<Value>>,
+    /// Deep-link target for the settings window (`{ section, highlight }`).
+    pub settings_target: Mutex<Option<Value>>,
 }
 
 impl AppState {
@@ -39,6 +41,7 @@ impl AppState {
             stack_status: Mutex::new(StackStatus::default()),
             acp: AsyncMutex::new(None),
             active_session: Mutex::new(None),
+            settings_target: Mutex::new(None),
         }
     }
 }

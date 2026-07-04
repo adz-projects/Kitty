@@ -30,7 +30,7 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
                 let _ = app.emit("session://new", ());
             }
             "open_settings" => {
-                let _ = windows::open_settings(app, None);
+                let _ = windows::open_settings(app, None, None);
             }
             "quit" => {
                 app.exit(0);

@@ -4,15 +4,22 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
+import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import type {
   ApprovalNeededEvent,
   ChatErrorEvent,
   CompleteEvent,
   Config,
+  EnvVar,
   ModeEvent,
+  OllamaModel,
   PathInfo,
+  ProviderProfile,
+  ProviderView,
+  PullProgress,
   SessionInfo,
   SessionTitleEvent,
+  SettingsTarget,
   StackStatus,
   StackStatusPayload,
   TextDeltaEvent,
@@ -24,7 +31,8 @@ export const ipc = {
   setConfig: (config: Config) => invoke<void>('set_config', { config }),
   toggleOverlay: () => invoke<void>('toggle_overlay'),
   hideOverlay: () => invoke<void>('hide_overlay'),
-  openSettings: (section?: string) => invoke<void>('open_settings', { section: section ?? null }),
+  openSettings: (section?: string, highlight?: string) =>
+    invoke<void>('open_settings', { section: section ?? null, highlight: highlight ?? null }),
   openMain: () => invoke<void>('open_main'),
   getStackStatus: () => invoke<StackStatus>('get_stack_status'),
   restartGoosed: () => invoke<void>('restart_goosed'),
@@ -42,7 +50,35 @@ export const ipc = {
   inspectPaths: (paths: string[]) => invoke<PathInfo[]>('inspect_paths', { paths }),
   openPath: (path: string) => invoke<void>('open_path', { path }),
   revealPath: (path: string) => invoke<void>('reveal_path', { path }),
+  // Providers
+  listProviders: () => invoke<ProviderView[]>('list_providers'),
+  upsertProvider: (profile: ProviderProfile, secret: string | null) =>
+    invoke<ProviderProfile>('upsert_provider', { profile, secret }),
+  deleteProvider: (id: string) => invoke<void>('delete_provider', { id }),
+  activateProvider: (id: string | null) => invoke<void>('activate_provider', { id }),
+  // Ollama
+  ollamaListModels: () => invoke<OllamaModel[]>('ollama_list_models'),
+  ollamaDeleteModel: (model: string) => invoke<void>('ollama_delete_model', { model }),
+  ollamaPullModel: (model: string) => invoke<string>('ollama_pull_model', { model }),
+  // Ollama env helper
+  readOllamaEnv: () => invoke<EnvVar[]>('read_ollama_env'),
+  setOllamaEnv: (name: string, value: string | null) =>
+    invoke<void>('set_ollama_env', { name, value }),
+  restartOllama: () => invoke<void>('restart_ollama'),
+  // Extensions
+  listExtensions: (sessionId: string) =>
+    invoke<Record<string, unknown>[]>('list_extensions', { sessionId }),
+  setExtensionEnabled: (sessionId: string, name: string, enabled: boolean) =>
+    invoke<void>('set_extension_enabled', { sessionId, name, enabled }),
+  // Settings deep link
+  getSettingsTarget: () => invoke<SettingsTarget | null>('get_settings_target'),
 };
+
+/** Native folder picker (default context folder, etc.). Returns null if cancelled. */
+export async function pickFolder(): Promise<string | null> {
+  const res = await openDialog({ directory: true, multiple: false });
+  return typeof res === 'string' ? res : null;
+}
 
 /** Subscribe to stack status changes. Returns an unlisten fn. */
 export function onStackStatus(cb: (payload: StackStatusPayload) => void): Promise<UnlistenFn> {
@@ -76,6 +112,12 @@ export function onFileDrop(cb: (paths: string[]) => void): Promise<UnlistenFn> {
     if (e.payload.type === 'drop') cb(e.payload.paths);
   });
 }
+
+export const onPullProgress = (cb: (e: PullProgress) => void) =>
+  listen<PullProgress>('ollama://pull-progress', (e) => cb(e.payload));
+
+export const onSettingsNavigate = (cb: (t: SettingsTarget) => void) =>
+  listen<SettingsTarget>('settings://navigate', (e) => cb(e.payload));
 
 /** Tray "New Session" → overlay starts a fresh session. */
 export const onNewSessionRequest = (cb: () => void) => listen('session://new', () => cb());

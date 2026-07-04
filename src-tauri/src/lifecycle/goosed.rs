@@ -50,8 +50,9 @@ fn generate_secret() -> String {
     (0..32).map(|_| format!("{:x}", rng.gen_range(0u8..16))).collect()
 }
 
-/// Spawn `goose serve` on a free port and wait (briefly) for it to bind.
-pub async fn spawn() -> Result<GoosedHandle, String> {
+/// Spawn `goose serve` on a free port and wait (briefly) for it to bind. `env`
+/// carries provider/model overrides from the active profile (see providers.rs).
+pub async fn spawn(env: Vec<(String, String)>) -> Result<GoosedHandle, String> {
     let bin = locate_goose();
     let port = free_port().map_err(|e| format!("no free port: {e}"))?;
     let secret = generate_secret();
@@ -63,6 +64,7 @@ pub async fn spawn() -> Result<GoosedHandle, String> {
         .arg("--port")
         .arg(port.to_string())
         .env("GOOSE_SERVER__SECRET_KEY", &secret)
+        .envs(env)
         .spawn()
         .map_err(|e| format!("failed to spawn `goose serve` ({}): {e}", bin.display()))?;
 

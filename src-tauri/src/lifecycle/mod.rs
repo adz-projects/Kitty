@@ -79,8 +79,13 @@ pub fn start_stack(app: &AppHandle) {
             Err(e) => tracing::warn!("ollama ensure_running failed: {e}"),
         }
 
-        // 2. Spawn goosed (`goose serve`).
-        match goosed::spawn().await {
+        // 2. Spawn goosed (`goose serve`) with the active provider's env.
+        let env = {
+            let state = app.state::<AppState>();
+            let cfg = state.config.lock().unwrap();
+            crate::config::providers::goosed_env(&cfg)
+        };
+        match goosed::spawn(env).await {
             Ok(handle) => {
                 let state = app.state::<AppState>();
                 *state.goosed.lock().unwrap() = handle;
