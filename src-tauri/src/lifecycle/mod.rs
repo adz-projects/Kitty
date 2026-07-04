@@ -124,6 +124,15 @@ pub fn spawn_health_loop(app: AppHandle) {
                     tracing::warn!("emit stack://status failed: {e}");
                 }
                 tracing::info!("stack status -> {status:?}");
+                // Notify on entering a degraded state while the overlay is hidden.
+                if !matches!(status, StackStatus::Ok | StackStatus::Starting) {
+                    crate::notifications::notify_if_hidden(
+                        &app,
+                        crate::notifications::Event::StackDegraded,
+                        "Goose needs attention",
+                        "The local stack is degraded. Open Goose to fix it.",
+                    );
+                }
             }
         }
     });

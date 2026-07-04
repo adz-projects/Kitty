@@ -20,12 +20,16 @@ use crate::goosed::stream;
 use crate::state::AppState;
 
 pub type Pending = Arc<Mutex<HashMap<i64, oneshot::Sender<Result<Value, Value>>>>>;
+/// Deferred `session/request_permission` requests: tool-call id -> JSON-RPC id
+/// to respond to once the user approves/denies.
+pub type Perm = Arc<Mutex<HashMap<String, Value>>>;
 
 /// Cheap-to-clone handle to the live ACP connection (holds channel + shared maps).
 #[derive(Clone)]
 pub struct AcpClient {
     out: mpsc::UnboundedSender<Message>,
     pending: Pending,
+    permissions: Perm,
     next_id: Arc<AtomicI64>,
 }
 
@@ -58,9 +62,11 @@ impl AcpClient {
         });
 
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let permissions: Perm = Arc::new(Mutex::new(HashMap::new()));
         let client = AcpClient {
             out: out_tx.clone(),
             pending: pending.clone(),
+            permissions: permissions.clone(),
             next_id: Arc::new(AtomicI64::new(0)),
         };
 
@@ -70,7 +76,8 @@ impl AcpClient {
             while let Some(next) = read.next().await {
                 match next {
                     Ok(Message::Text(txt)) => {
-                        stream::handle_incoming(&app_reader, &out_reader, &pending, &txt).await;
+                        stream::handle_incoming(&app_reader, &out_reader, &pending, &permissions, &txt)
+                            .await;
                     }
                     Ok(Message::Close(_)) | Err(_) => break,
                     _ => {}
@@ -114,6 +121,18 @@ impl AcpClient {
                 Err("ACP request timed out".into())
             }
         }
+    }
+
+    /// Send a JSON-RPC *response* to a server-initiated request (used to answer
+    /// a deferred `session/request_permission`).
+    pub fn respond(&self, id: Value, result: Value) {
+        let msg = json!({ "jsonrpc": "2.0", "id": id, "result": result });
+        let _ = self.out.send(Message::Text(msg.to_string()));
+    }
+
+    /// Take a deferred permission request's JSON-RPC id by its tool-call key.
+    pub async fn take_permission(&self, key: &str) -> Option<Value> {
+        self.permissions.lock().await.remove(key)
     }
 }
 

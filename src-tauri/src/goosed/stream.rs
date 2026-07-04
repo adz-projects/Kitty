@@ -7,12 +7,14 @@ use tauri::{AppHandle, Emitter};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::goosed::api::Pending;
+use crate::goosed::api::{Pending, Perm};
+use crate::notifications;
 
 pub async fn handle_incoming(
     app: &AppHandle,
     out: &mpsc::UnboundedSender<Message>,
     pending: &Pending,
+    permissions: &Perm,
     txt: &str,
 ) {
     let v: Value = match serde_json::from_str(txt) {
@@ -28,7 +30,7 @@ pub async fn handle_incoming(
 
     match (has_id, has_method) {
         // Server -> client request (must respond).
-        (true, true) => handle_server_request(app, out, &v).await,
+        (true, true) => handle_server_request(app, out, permissions, &v).await,
         // Response to one of our requests.
         (true, false) => {
             if let Some(id) = v.get("id").and_then(|i| i.as_i64()) {
@@ -97,38 +99,78 @@ fn emit_session_update(app: &AppHandle, v: &Value) {
                 );
             }
         }
-        // usage_update / available_commands_update / current_mode_update / plan:
-        // not surfaced in Phase 2.
+        "current_mode_update" => {
+            if let Some(mode) = update.get("currentModeId").and_then(|m| m.as_str()) {
+                let _ = app.emit(
+                    "chat://mode",
+                    json!({ "session_id": session_id, "mode": mode }),
+                );
+            }
+        }
+        // usage_update / available_commands_update / plan: not surfaced yet.
         _ => {}
     }
 }
 
-/// Answer a server-initiated request. Phase 3 wires the real approval UI; for
-/// now we auto-cancel permission prompts (never sent in `auto` mode) and reject
-/// filesystem callbacks we didn't advertise support for.
-async fn handle_server_request(app: &AppHandle, out: &mpsc::UnboundedSender<Message>, v: &Value) {
+/// Answer a server-initiated request. `session/request_permission` is *deferred*:
+/// we store the JSON-RPC id keyed by the tool-call id, surface it to the UI, and
+/// respond only when the user approves/denies (see `commands::respond_permission`).
+/// Filesystem callbacks we didn't advertise support for get method-not-found.
+async fn handle_server_request(
+    app: &AppHandle,
+    out: &mpsc::UnboundedSender<Message>,
+    permissions: &Perm,
+    v: &Value,
+) {
     let id = v.get("id").cloned().unwrap_or(Value::Null);
     let method = v.get("method").and_then(|m| m.as_str()).unwrap_or("");
 
-    let response = match method {
-        "session/request_permission" => {
-            // Surface it (so Phase 3 UI can already observe), then cancel.
-            let session_id = v
-                .pointer("/params/sessionId")
-                .and_then(|s| s.as_str())
-                .unwrap_or("");
-            let _ = app.emit(
-                "chat://tool-approval-needed",
-                json!({ "session_id": session_id, "params": v.get("params") }),
-            );
-            json!({ "jsonrpc": "2.0", "id": id, "result": { "outcome": { "outcome": "cancelled" } } })
-        }
-        _ => json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "error": { "code": -32601, "message": format!("method not supported: {method}") }
-        }),
-    };
+    if method == "session/request_permission" {
+        let params = v.get("params").cloned().unwrap_or(Value::Null);
+        let session_id = params
+            .get("sessionId")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string();
+        // Key by tool-call id (falls back to the JSON-RPC id) so the UI can
+        // correlate and respond.
+        let key = params
+            .pointer("/toolCall/toolCallId")
+            .and_then(|s| s.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| id.to_string());
 
+        permissions.lock().await.insert(key.clone(), id);
+
+        let title = params
+            .pointer("/toolCall/title")
+            .and_then(|s| s.as_str())
+            .unwrap_or("a tool");
+        notifications::notify_if_hidden(
+            app,
+            notifications::Event::ApprovalNeeded,
+            "Approval needed",
+            &format!("Goose wants to run {title}"),
+        );
+        notifications::set_tray_pending(app, true);
+
+        let _ = app.emit(
+            "chat://tool-approval-needed",
+            json!({
+                "session_id": session_id,
+                "tool_call_id": key,
+                "tool_call": params.get("toolCall"),
+                "options": params.get("options"),
+            }),
+        );
+        return;
+    }
+
+    // Anything else: we don't support it (e.g. fs/* we opted out of).
+    let response = json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": { "code": -32601, "message": format!("method not supported: {method}") }
+    });
     let _ = out.send(Message::Text(response.to_string()));
 }

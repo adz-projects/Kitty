@@ -12,7 +12,7 @@ use crate::config::{self, Config};
 use crate::goosed::api;
 use crate::lifecycle::{self, StackStatus};
 use crate::state::AppState;
-use crate::{hotkey, windows};
+use crate::{hotkey, notifications, windows};
 
 /// Read the current app config.
 #[tauri::command]
@@ -210,14 +210,64 @@ pub async fn send_prompt(app: AppHandle, session_id: String, text: String) -> Re
                     "chat://complete",
                     json!({ "session_id": sid, "result": result }),
                 );
+                notifications::notify_if_hidden(
+                    &app_bg,
+                    notifications::Event::TaskComplete,
+                    "Goose finished",
+                    "Your task is complete.",
+                );
             }
             Err(message) => {
                 let _ = app_bg.emit(
                     "chat://error",
-                    json!({ "session_id": sid, "message": message }),
+                    json!({ "session_id": sid, "message": &message }),
+                );
+                notifications::notify_if_hidden(
+                    &app_bg,
+                    notifications::Event::TaskFailed,
+                    "Goose ran into a problem",
+                    &message,
                 );
             }
         }
+        // A finished turn clears any pending-approval tray state.
+        notifications::set_tray_pending(&app_bg, false);
     });
+    Ok(())
+}
+
+/// Respond to a deferred tool-approval prompt. `option_id` = the chosen ACP
+/// option (e.g. `allow_once`, `reject_once`); `None` cancels.
+#[tauri::command]
+pub async fn respond_permission(
+    app: AppHandle,
+    tool_call_id: String,
+    option_id: Option<String>,
+) -> Result<(), String> {
+    let client = api::ensure_client(&app).await?;
+    let id = client
+        .take_permission(&tool_call_id)
+        .await
+        .ok_or("that approval request is no longer pending")?;
+
+    let outcome = match option_id {
+        Some(opt) => json!({ "outcome": { "outcome": "selected", "optionId": opt } }),
+        None => json!({ "outcome": { "outcome": "cancelled" } }),
+    };
+    client.respond(id, outcome);
+    notifications::set_tray_pending(&app, false);
+    Ok(())
+}
+
+/// Switch the session's approval mode (`auto` / `approve` / `smart_approve`).
+#[tauri::command]
+pub async fn set_mode(app: AppHandle, session_id: String, mode_id: String) -> Result<(), String> {
+    let client = api::ensure_client(&app).await?;
+    client
+        .request(
+            "session/set_mode",
+            json!({ "sessionId": session_id, "modeId": mode_id }),
+        )
+        .await?;
     Ok(())
 }

@@ -4,9 +4,11 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
+  ApprovalNeededEvent,
   ChatErrorEvent,
   CompleteEvent,
   Config,
+  ModeEvent,
   SessionInfo,
   SessionTitleEvent,
   StackStatus,
@@ -28,6 +30,9 @@ export const ipc = {
   sendPrompt: (sessionId: string, text: string) => invoke<void>('send_prompt', { sessionId, text }),
   setActiveSession: (info: SessionInfo) => invoke<void>('set_active_session', { info }),
   getActiveSession: () => invoke<SessionInfo | null>('get_active_session'),
+  respondPermission: (toolCallId: string, optionId: string | null) =>
+    invoke<void>('respond_permission', { toolCallId, optionId }),
+  setMode: (sessionId: string, modeId: string) => invoke<void>('set_mode', { sessionId, modeId }),
 };
 
 /** Subscribe to stack status changes. Returns an unlisten fn. */
@@ -48,6 +53,11 @@ export const onComplete = (cb: (e: CompleteEvent) => void) =>
   listen<CompleteEvent>('chat://complete', (e) => cb(e.payload));
 export const onChatError = (cb: (e: ChatErrorEvent) => void) =>
   listen<ChatErrorEvent>('chat://error', (e) => cb(e.payload));
+
+export const onApprovalNeeded = (cb: (e: ApprovalNeededEvent) => void) =>
+  listen<ApprovalNeededEvent>('chat://tool-approval-needed', (e) => cb(e.payload));
+export const onMode = (cb: (e: ModeEvent) => void) =>
+  listen<ModeEvent>('chat://mode', (e) => cb(e.payload));
 
 /** Tray "New Session" → overlay starts a fresh session. */
 export const onNewSessionRequest = (cb: () => void) => listen('session://new', () => cb());

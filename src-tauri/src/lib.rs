@@ -9,6 +9,7 @@ mod config;
 mod goosed;
 mod hotkey;
 mod lifecycle;
+mod notifications;
 mod state;
 mod tray;
 mod util;
@@ -65,6 +66,8 @@ pub fn run() {
             commands::send_prompt,
             commands::set_active_session,
             commands::get_active_session,
+            commands::respond_permission,
+            commands::set_mode,
         ])
         .setup(move |app| {
             let handle = app.handle();

@@ -5,14 +5,16 @@
 import { create } from 'zustand';
 import {
   ipc,
+  onApprovalNeeded,
   onChatError,
   onComplete,
   onMessageDelta,
+  onMode,
   onReasoningDelta,
   onSessionTitle,
   onToolCall,
 } from '@/lib/ipc';
-import type { ModeInfo, ToolCallUpdate } from '@/lib/types';
+import type { ApprovalNeededEvent, ModeInfo, ToolCallUpdate } from '@/lib/types';
 
 export interface ToolCall {
   id: string;
@@ -38,12 +40,15 @@ interface ChatState {
   mode: string | null;
   availableModes: ModeInfo[];
   messages: Message[];
+  pendingApprovals: ApprovalNeededEvent[];
   busy: boolean;
   error: string | null;
   bindEvents: () => void;
   newSession: () => Promise<void>;
   ensureSession: () => Promise<string>;
   send: (text: string) => Promise<void>;
+  respondApproval: (toolCallId: string, optionId: string | null) => Promise<void>;
+  setMode: (modeId: string) => Promise<void>;
   adoptSession: (info: {
     session_id: string;
     cwd: string;
@@ -63,6 +68,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   mode: null,
   availableModes: [],
   messages: [],
+  pendingApprovals: [],
   busy: false,
   error: null,
 
@@ -83,9 +89,32 @@ export const useChatStore = create<ChatState>((set, get) => ({
       availableModes: info.available_modes,
       title: null,
       messages: [],
+      pendingApprovals: [],
       error: null,
       busy: false,
     });
+  },
+
+  respondApproval: async (toolCallId: string, optionId: string | null) => {
+    set((s) => ({
+      pendingApprovals: s.pendingApprovals.filter((a) => a.tool_call_id !== toolCallId),
+    }));
+    try {
+      await ipc.respondPermission(toolCallId, optionId);
+    } catch (e) {
+      set({ error: String(e) });
+    }
+  },
+
+  setMode: async (modeId: string) => {
+    const sid = get().sessionId;
+    if (!sid) return;
+    set({ mode: modeId });
+    try {
+      await ipc.setMode(sid, modeId);
+    } catch (e) {
+      set({ error: String(e) });
+    }
   },
 
   ensureSession: async () => {
@@ -180,16 +209,29 @@ export const useChatStore = create<ChatState>((set, get) => ({
       if (forActive(e.session_id)) set({ title: e.title });
     });
 
+    void onApprovalNeeded((e) => {
+      if (!forActive(e.session_id)) return;
+      set((s) =>
+        s.pendingApprovals.some((a) => a.tool_call_id === e.tool_call_id)
+          ? {}
+          : { pendingApprovals: [...s.pendingApprovals, e] }
+      );
+    });
+
+    void onMode((e) => {
+      if (forActive(e.session_id)) set({ mode: e.mode });
+    });
+
     void onComplete((e) => {
       if (!forActive(e.session_id)) return;
       patchStreaming((m) => ({ ...m, streaming: false }));
-      set({ busy: false });
+      set({ busy: false, pendingApprovals: [] });
     });
 
     void onChatError((e) => {
       if (!forActive(e.session_id)) return;
       patchStreaming((m) => ({ ...m, streaming: false }));
-      set({ busy: false, error: e.message });
+      set({ busy: false, error: e.message, pendingApprovals: [] });
     });
   },
 }));

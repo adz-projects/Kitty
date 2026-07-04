@@ -55,10 +55,17 @@ Shape: `{ sessionId, update: { sessionUpdate: <variant>, ... } }`. Variants seen
 
 ## Agent → client requests (we must respond)
 
-- `session/request_permission` `{ sessionId, toolCall, options: [{ optionId, name, kind }] }`
+- `session/request_permission` `{ sessionId, toolCall: { toolCallId, title, rawInput, kind, status }, options: [{ optionId, name, kind }] }`
   → respond `{ outcome: { outcome: "selected", optionId } }` or `{ outcome: { outcome: "cancelled" } }`.
-  Option ids observed: `allow_once`, `allow_always`, `reject_once`. Only sent in
-  `approve` / `smart_approve` modes — **Phase 3** wires the real UI; in `auto`
-  mode (default) it is never sent.
+  Options confirmed live (approve mode): `allow_always`, `allow_once`, `reject_once`,
+  `reject_always`. Only sent in `approve` / `smart_approve` modes — in `auto`
+  mode (default) it is never sent. **Phase 3** defers these (stores the JSON-RPC
+  id keyed by `toolCallId`) and responds only on the user's Approve/Deny.
+
+## Mode switching (Phase 3)
+
+- `session/set_mode` `{ sessionId, modeId }` → `{}`. `modeId` ∈ `auto` /
+  `approve` / `smart_approve` (from `session/new` result `modes.availableModes`).
+- Live `current_mode_update` `session/update` reflects out-of-band changes.
 - `fs/read_text_file`, `fs/write_text_file` — only if we advertise the capability
   (we set both `false` for now), so respond method-not-found otherwise.

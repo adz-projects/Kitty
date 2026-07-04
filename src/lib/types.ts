@@ -90,3 +90,32 @@ export interface ChatErrorEvent {
   session_id: string;
   message: string;
 }
+
+// --- Approvals / modes (Phase 3) ---
+
+export interface ApprovalOption {
+  optionId: string;
+  name: string;
+  kind: string;
+}
+
+export interface ApprovalToolCall {
+  toolCallId?: string;
+  title?: string;
+  kind?: string;
+  status?: string;
+  rawInput?: unknown;
+  [key: string]: unknown;
+}
+
+export interface ApprovalNeededEvent {
+  session_id: string;
+  tool_call_id: string;
+  tool_call: ApprovalToolCall;
+  options: ApprovalOption[];
+}
+
+export interface ModeEvent {
+  session_id: string;
+  mode: string;
+}
