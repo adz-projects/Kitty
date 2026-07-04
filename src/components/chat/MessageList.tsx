@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { MessageItem } from './MessageItem';
+import { ThinkingIndicator } from './ThinkingIndicator';
 import type { Message } from '@/stores/chatStore';
 
 // Below this many messages we render plainly (the well-tested path); beyond it
@@ -11,25 +12,38 @@ export function MessageList({
   messages,
   empty,
   typing,
+  thinkingReasoning,
 }: {
   messages: Message[];
   empty: string;
   typing: boolean;
+  thinkingReasoning: boolean;
 }) {
   if (messages.length > VIRTUALIZE_THRESHOLD) {
-    return <VirtualList messages={messages} typing={typing} />;
+    return (
+      <VirtualList messages={messages} typing={typing} thinkingReasoning={thinkingReasoning} />
+    );
   }
-  return <PlainList messages={messages} empty={empty} typing={typing} />;
+  return (
+    <PlainList
+      messages={messages}
+      empty={empty}
+      typing={typing}
+      thinkingReasoning={thinkingReasoning}
+    />
+  );
 }
 
 function PlainList({
   messages,
   empty,
   typing,
+  thinkingReasoning,
 }: {
   messages: Message[];
   empty: string;
   typing: boolean;
+  thinkingReasoning: boolean;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   useEffect(() => {
@@ -42,12 +56,20 @@ function PlainList({
       {messages.map((m, i) => (
         <MessageItem key={m.id} message={m} index={i} />
       ))}
-      {typing && <span className="typing">Thinking…</span>}
+      {typing && <ThinkingIndicator reasoning={thinkingReasoning} />}
     </div>
   );
 }
 
-function VirtualList({ messages, typing }: { messages: Message[]; typing: boolean }) {
+function VirtualList({
+  messages,
+  typing,
+  thinkingReasoning,
+}: {
+  messages: Message[];
+  typing: boolean;
+  thinkingReasoning: boolean;
+}) {
   const parentRef = useRef<HTMLDivElement>(null);
   const rv = useVirtualizer({
     count: messages.length,
@@ -82,7 +104,7 @@ function VirtualList({ messages, typing }: { messages: Message[]; typing: boolea
           </div>
         ))}
       </div>
-      {typing && <span className="typing">Thinking…</span>}
+      {typing && <ThinkingIndicator reasoning={thinkingReasoning} />}
     </div>
   );
 }

@@ -4,6 +4,7 @@ import rehypeHighlight from 'rehype-highlight';
 import 'highlight.js/styles/github.css';
 import { useChatStore, type Message } from '@/stores/chatStore';
 import { ToolCallCard } from './ToolCallCard';
+import { ReasoningPanel } from './ReasoningPanel';
 
 /** One chat message. User turns render as a plain bubble; assistant turns render
     markdown, with an optional collapsible reasoning block and tool cards. Hover
@@ -45,10 +46,11 @@ export function MessageItem({ message, index }: { message: Message; index: numbe
   return (
     <div className="msg msg-assistant">
       {message.reasoning && (
-        <details className="reasoning">
-          <summary>Reasoning</summary>
-          <div className="reasoning-body">{message.reasoning}</div>
-        </details>
+        <ReasoningPanel
+          reasoning={message.reasoning}
+          streaming={message.streaming}
+          hasAnswer={message.text.length > 0}
+        />
       )}
       {message.toolCalls.map((tc) => (
         <ToolCallCard key={tc.id} call={tc} />

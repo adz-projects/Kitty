@@ -70,11 +70,12 @@ interface ChatState {
   pendingApprovals: ApprovalNeededEvent[];
   busy: boolean;
   error: string | null;
-  // Active-provider derived state (Phase 9)
+  // Active-provider derived state (Phase 9/10)
   toolsEnabled: boolean;
   providerTier: NetworkTier | null;
   providerHost: string | null;
   providerOffline: boolean;
+  model: string | null;
   bindEvents: () => void;
   refreshProvider: () => Promise<void>;
   branch: (uiIndex: number) => Promise<void>;
@@ -143,6 +144,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   providerTier: null,
   providerHost: null,
   providerOffline: false,
+  model: null,
 
   refreshProvider: async () => {
     try {
@@ -152,9 +154,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
         toolsEnabled: active ? active.tools_enabled : true,
         providerTier: active ? active.network_tier : null,
         providerHost: active ? new URL(active.base_url).host : null,
+        model: active?.models[0] ?? null,
       });
     } catch {
-      set({ toolsEnabled: true, providerTier: null, providerHost: null });
+      set({ toolsEnabled: true, providerTier: null, providerHost: null, model: null });
     }
   },
 

@@ -53,6 +53,12 @@ done until this file is updated and the affected code (`goosed/api.rs`,
   ollama.com before release** — the dev environment is future-dated (Ollama
   0.31.1, models `gemma4`/`qwen3.5`), so newer small tags may be preferable.
 
-## Reasoning-capable models (Phase 10 `reasoning_models.ts`)
+## Reasoning-capable models (Phase 10 `src/lib/reasoning_models.ts`)
 
-- **Name patterns → supports-reasoning:** _TBD._
+- **Name patterns → supports-reasoning:** `think` (lfm2.5-thinking, *-thinking),
+  `reason`, `deepseek-r1`, `qwq`, `magistral`, OpenAI `o1/o3/o4`, bare `r1`.
+- This table only drives the *predictive* thinking indicator. The reasoning panel
+  is **content-driven** (shown whenever a model actually emits `agent_thought_chunk`),
+  so models that reason but don't match a pattern (e.g. `gemma4:e2b`, which emits
+  thoughts here) still get a panel. ACP surfaces reasoning as a distinct
+  `agent_thought_chunk` — no `<think>` tag splitting needed (see acp-protocol.md).

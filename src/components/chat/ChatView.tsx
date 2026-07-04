@@ -1,6 +1,7 @@
 import { useEffect } from 'react';
 import { onFileDrop } from '@/lib/ipc';
 import { useChatStore } from '@/stores/chatStore';
+import { supportsReasoning } from '@/lib/reasoning_models';
 import { MessageList } from './MessageList';
 import { Composer } from './Composer';
 import { ApprovalPrompt } from './ApprovalPrompt';
@@ -35,6 +36,7 @@ export function ChatView() {
     addDroppedPaths,
     bindEvents,
     refreshProvider,
+    model,
   } = useChatStore();
 
   useEffect(() => {
@@ -54,6 +56,10 @@ export function ChatView() {
     (!last || last.role === 'user' || (last.role === 'assistant' && !last.text && !last.reasoning));
   const chatOnly = !toolsEnabled;
   const tierBadge = providerTier && TIER_LABEL[providerTier];
+  // Predictive hint for the thinking indicator (the reasoning panel itself is
+  // content-driven). True if the model is known-reasoning or reasoning already began.
+  const thinkingReasoning =
+    supportsReasoning(model) || (!!last && last.role === 'assistant' && !!last.reasoning);
 
   return (
     <div className={`chat${chatOnly ? ' reading' : ''}`}>
@@ -86,6 +92,7 @@ export function ChatView() {
         messages={messages}
         empty={title ?? 'New conversation. Ask Goose anything.'}
         typing={awaitingFirstToken}
+        thinkingReasoning={thinkingReasoning}
       />
 
       {!chatOnly &&
