@@ -7,17 +7,15 @@ done until this file is updated and the affected code (`goosed/api.rs`,
 
 ## Goose
 
-- **Pinned version:** _TBD (Phase 0 — pick one released `goose`/`goosed` version; do not chase `main`)._
-- **goosed binary location(s) checked:** _TBD._
-- **Install method used for dev:** _TBD (native Windows installer vs. WSL — record which)._
-- **Vendored OpenAPI spec:** `docs/goosed-openapi.json` (generate the typed TS client from this).
-- **Verified route families** (fill in exact paths from the vendored spec):
-  - Agent lifecycle (`/agent/...`): _TBD_
-  - Streaming reply (`/reply` family): _TBD_
-  - Sessions (list / get / fork / delete / insights) (`/sessions/...`): _TBD_
-  - Config management (`/config/...`): _TBD_
-  - Tool approval confirm/deny: _TBD_
-- **Streaming/reasoning surface:** _TBD (does this version emit a distinct reasoning/thought event, or does reasoning arrive inline needing `<think>` splitting?)._
+- **Pinned version:** **1.41.0** (CLI reports `1.41.0`; bundled Desktop `version` file `41.0.0`). Dev binary already on disk — pin to this.
+- **goose binary location (dev):** `C:\Users\azolkover\AppData\Local\Programs\dist-windows\resources\bin\goose.exe` (bundled inside the installed Goose Desktop app). Also present there: `uv.exe`, `uvx.exe`. Desktop shell: `...\dist-windows\Goose.exe`.
+- **Install method used for dev:** existing Goose Desktop install (no separate install needed). Block's Goose is **not on winget** (`Pressly.Goose` is an unrelated DB-migration tool).
+- **⚠️ API surface — ACP, not legacy REST:** this version has **completed** the migration CLAUDE.md warned about. There is **no `goosed agent` command and no `/reply` REST API**. Server subcommands:
+  - `goose serve` — **ACP (Agent Client Protocol) over HTTP + WebSocket**. Default host `127.0.0.1`, **default port `3284`**. Flags: `--host`, `--port`, `--tls[/-cert-path/-key-path]`, `--platform cli|desktop`, `--with-builtin <names>`, `--allowed-origin <origin>`, `--dangerously-unauthenticated`.
+  - `goose acp` — ACP over **stdio** (`--with-builtin` only).
+  - Secret-key auth **still applies**: `GOOSE_SERVER__SECRET_KEY` (the `--dangerously-unauthenticated` flag opts out). CLAUDE.md's secret-key model holds; the *transport/protocol* changes.
+- **Consequence for the plan:** integration targets **ACP JSON-RPC** (`session/new`, `session/prompt`, streamed `session/update` notifications, permission/approval requests, session loading), **not** REST routes `/agent`,`/reply`,`/sessions`,`/config`. No `openapi.json` to vendor — vendor/pin the **ACP schema + method list** instead. Architecture (Rust owns I/O, Tauri events to frontend) is unchanged; the change is confined to `goosed/api.rs` + `goosed/stream.rs` — the isolation boundary CLAUDE.md designed for.
+- **Streaming/reasoning surface:** _TBD — determine whether ACP `session/update` surfaces a distinct reasoning/thought variant or reasoning arrives inline needing `<think>` splitting (Phase 10)._
 
 ## Ollama
 
