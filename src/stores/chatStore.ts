@@ -15,8 +15,10 @@ import {
   onSessionTitle,
   onToolCall,
   onUserMessage,
+  pickSavePath,
   windowLabel,
 } from '@/lib/ipc';
+import { buildExport, sanitizeFilename } from '@/lib/chatml';
 import type {
   ApprovalNeededEvent,
   ModeInfo,
@@ -82,6 +84,7 @@ interface ChatState {
   regenerate: (assistantIndex: number) => Promise<void>;
   addPastedText: (text: string, label?: string) => void;
   removeAttachment: (id: string) => void;
+  exportSession: (upToIndex?: number) => Promise<void>;
   newSession: (cwd?: string) => Promise<void>;
   ensureSession: () => Promise<string>;
   loadSession: (sessionId: string, cwd: string, title?: string) => Promise<void>;
@@ -305,6 +308,28 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   removeAttachment: (id: string) =>
     set((s) => ({ attachments: s.attachments.filter((a) => a.id !== id) })),
+
+  exportSession: async (upToIndex?: number) => {
+    const { messages, sessionId, cwd, title, model } = get();
+    if (messages.length === 0) return;
+    const { chatml, meta } = buildExport(
+      messages,
+      { sessionId, title, workingDir: cwd, model },
+      upToIndex
+    );
+    const base = sanitizeFilename(title ?? 'goose-session');
+    const path = await pickSavePath(`${base}.chatml`);
+    if (!path) return;
+    const metaPath = path.toLowerCase().endsWith('.chatml')
+      ? `${path.slice(0, -7)}.meta.json`
+      : `${path}.meta.json`;
+    try {
+      await ipc.writeFile(path, chatml);
+      await ipc.writeFile(metaPath, JSON.stringify(meta, null, 2));
+    } catch (e) {
+      set({ error: String(e) });
+    }
+  },
 
   branch: async (uiIndex: number) => {
     const { sessionId, cwd, title } = get();

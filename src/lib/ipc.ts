@@ -4,7 +4,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
-import { open as openDialog } from '@tauri-apps/plugin-dialog';
+import { open as openDialog, save as saveDialog } from '@tauri-apps/plugin-dialog';
 import type {
   ApprovalNeededEvent,
   ChatErrorEvent,
@@ -52,6 +52,7 @@ export const ipc = {
   forkSession: (sessionId: string, cwd: string, truncateFrom: number | null) =>
     invoke<SessionInfo>('fork_session', { sessionId, cwd, truncateFrom }),
   readTextFile: (path: string) => invoke<string>('read_text_file', { path, maxBytes: null }),
+  writeFile: (path: string, content: string) => invoke<void>('write_file', { path, content }),
   inspectPaths: (paths: string[]) => invoke<PathInfo[]>('inspect_paths', { paths }),
   openPath: (path: string) => invoke<void>('open_path', { path }),
   revealPath: (path: string) => invoke<void>('reveal_path', { path }),
@@ -105,6 +106,15 @@ export async function pickImage(): Promise<string | null> {
     filters: [{ name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp'] }],
   });
   return typeof res === 'string' ? res : null;
+}
+
+/** Native save-file dialog for the ChatML export. Returns null if cancelled. */
+export async function pickSavePath(defaultName: string): Promise<string | null> {
+  const res = await saveDialog({
+    defaultPath: defaultName,
+    filters: [{ name: 'ChatML', extensions: ['chatml'] }],
+  });
+  return res ?? null;
 }
 
 /** Subscribe to stack status changes. Returns an unlisten fn. */

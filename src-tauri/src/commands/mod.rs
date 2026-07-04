@@ -526,6 +526,13 @@ pub async fn fork_session(
     })
 }
 
+/// Write a UTF-8 text file (Phase 11 ChatML export). The path comes from the
+/// user's native save dialog.
+#[tauri::command]
+pub fn write_file(path: String, content: String) -> Result<(), String> {
+    std::fs::write(&path, content).map_err(|e| format!("could not write {path}: {e}"))
+}
+
 /// Read a text file for inlining into a chat-only message (Phase 9). Rejects
 /// binaries and files over the cap (default 200 KB).
 #[tauri::command]

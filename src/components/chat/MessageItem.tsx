@@ -12,11 +12,18 @@ import { ReasoningPanel } from './ReasoningPanel';
 export function MessageItem({ message, index }: { message: Message; index: number }) {
   const branch = useChatStore((s) => s.branch);
   const regenerate = useChatStore((s) => s.regenerate);
+  const exportSession = useChatStore((s) => s.exportSession);
 
   const actions = (
     <div className="msg-actions">
       <button title="Branch a new session from here" onClick={() => void branch(index)}>
         Branch
+      </button>
+      <button
+        title="Export the conversation up to here as ChatML"
+        onClick={() => void exportSession(index)}
+      >
+        Export from here
       </button>
       {message.role === 'assistant' && (
         <>

@@ -79,6 +79,7 @@ pub fn run() {
             commands::delete_session,
             commands::fork_session,
             commands::read_text_file,
+            commands::write_file,
             commands::inspect_paths,
             commands::open_path,
             commands::reveal_path,

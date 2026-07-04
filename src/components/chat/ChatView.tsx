@@ -37,6 +37,7 @@ export function ChatView() {
     bindEvents,
     refreshProvider,
     model,
+    exportSession,
   } = useChatStore();
 
   useEffect(() => {
@@ -75,6 +76,11 @@ export function ChatView() {
             </span>
           )}
           {!chatOnly && <ModeBadge />}
+          {messages.length > 0 && (
+            <button onClick={() => void exportSession()} title="Export this session as ChatML">
+              Export
+            </button>
+          )}
           <button onClick={() => void newSession()} title="Start a new session">
             New chat
           </button>
