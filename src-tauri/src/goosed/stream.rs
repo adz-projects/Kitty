@@ -10,6 +10,27 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::goosed::api::{Pending, Perm};
 use crate::notifications;
 
+/// Per-string cap for tool-output payloads forwarded to the webview.
+const MAX_STRING_BYTES: usize = 16 * 1024;
+
+/// Recursively cap every string in a JSON value, appending a truncation marker.
+fn cap_strings(value: &Value, cap: usize) -> Value {
+    match value {
+        Value::String(s) if s.len() > cap => {
+            let mut end = cap;
+            while !s.is_char_boundary(end) {
+                end -= 1;
+            }
+            Value::String(format!("{}…[truncated {} bytes]", &s[..end], s.len() - end))
+        }
+        Value::Array(arr) => Value::Array(arr.iter().map(|v| cap_strings(v, cap)).collect()),
+        Value::Object(map) => {
+            Value::Object(map.iter().map(|(k, v)| (k.clone(), cap_strings(v, cap))).collect())
+        }
+        other => other.clone(),
+    }
+}
+
 pub async fn handle_incoming(
     app: &AppHandle,
     out: &mpsc::UnboundedSender<Message>,
@@ -93,11 +114,14 @@ fn emit_session_update(app: &AppHandle, v: &Value) {
                 );
             }
         }
-        // Tool calls: forward the raw update; the frontend interprets shape.
+        // Tool calls: forward the update, capping huge outputs so a giant tool
+        // result can't bloat the event payload (Phase 8). Full output remains in
+        // goosed and is restored on session/load replay.
         "tool_call" | "tool_call_update" => {
+            let capped = cap_strings(update, MAX_STRING_BYTES);
             let _ = app.emit(
                 "chat://tool-call",
-                json!({ "session_id": session_id, "phase": kind, "update": update }),
+                json!({ "session_id": session_id, "phase": kind, "update": capped }),
             );
         }
         "session_info_update" => {

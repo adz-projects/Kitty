@@ -69,6 +69,7 @@ pub fn run() {
             commands::restart_goosed,
             commands::new_session,
             commands::send_prompt,
+            commands::cancel_prompt,
             commands::set_active_session,
             commands::get_active_session,
             commands::respond_permission,

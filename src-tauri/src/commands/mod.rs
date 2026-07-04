@@ -388,6 +388,15 @@ pub async fn send_prompt(app: AppHandle, session_id: String, text: String) -> Re
     Ok(())
 }
 
+/// Cancel the in-flight turn for a session (ACP `session/cancel` notification).
+/// goosed resolves the pending prompt with a `cancelled` stop reason.
+#[tauri::command]
+pub async fn cancel_prompt(app: AppHandle, session_id: String) -> Result<(), String> {
+    let client = api::ensure_client(&app).await?;
+    client.notify("session/cancel", json!({ "sessionId": session_id }));
+    Ok(())
+}
+
 /// Respond to a deferred tool-approval prompt. `option_id` = the chosen ACP
 /// option (e.g. `allow_once`, `reject_once`); `None` cancels.
 #[tauri::command]

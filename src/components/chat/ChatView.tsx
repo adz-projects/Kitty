@@ -1,7 +1,7 @@
-import { useEffect, useRef } from 'react';
+import { useEffect } from 'react';
 import { onFileDrop } from '@/lib/ipc';
 import { useChatStore } from '@/stores/chatStore';
-import { MessageItem } from './MessageItem';
+import { MessageList } from './MessageList';
 import { Composer } from './Composer';
 import { ApprovalPrompt } from './ApprovalPrompt';
 import { ModeBadge } from './ModeBadge';
@@ -18,12 +18,12 @@ export function ChatView() {
     title,
     pendingApprovals,
     send,
+    cancel,
     newSession,
     respondApproval,
     addDroppedPaths,
     bindEvents,
   } = useChatStore();
-  const listRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     bindEvents();
@@ -34,12 +34,6 @@ export function ChatView() {
     const un = onFileDrop((paths) => void addDroppedPaths(paths));
     return () => void un.then((fn) => fn());
   }, [addDroppedPaths]);
-
-  // Auto-scroll to the latest content while streaming.
-  useEffect(() => {
-    const el = listRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
-  }, [messages]);
 
   const folder = cwd ? cwd.split(/[\\/]/).filter(Boolean).pop() : null;
   const last = messages[messages.length - 1];
@@ -61,15 +55,11 @@ export function ChatView() {
         </div>
       </div>
 
-      <div className="message-list" ref={listRef}>
-        {messages.length === 0 && (
-          <p className="muted">{title ?? 'New conversation. Ask Goose anything.'}</p>
-        )}
-        {messages.map((m) => (
-          <MessageItem key={m.id} message={m} />
-        ))}
-        {awaitingFirstToken && <span className="typing">Thinking…</span>}
-      </div>
+      <MessageList
+        messages={messages}
+        empty={title ?? 'New conversation. Ask Goose anything.'}
+        typing={awaitingFirstToken}
+      />
 
       {pendingApprovals.map((a) => (
         <ApprovalPrompt
@@ -80,7 +70,7 @@ export function ChatView() {
       ))}
       {error && <div className="chat-error">{error}</div>}
       <FileChips />
-      <Composer onSend={(t) => void send(t)} disabled={busy} />
+      <Composer onSend={(t) => void send(t)} onStop={() => void cancel()} disabled={busy} />
     </div>
   );
 }

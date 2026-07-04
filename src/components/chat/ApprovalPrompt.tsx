@@ -30,6 +30,12 @@ export function ApprovalPrompt({
   const has = (id: string) => request.options?.some((o) => o.optionId === id);
   const pick = (id: string) => onRespond(request.tool_call_id, id);
 
+  // A11y (Phase 8): approving must be deliberate — block Enter so a stray Enter
+  // can't approve; a focused button still activates on Space.
+  const noEnter = (e: React.KeyboardEvent) => {
+    if (e.key === 'Enter') e.preventDefault();
+  };
+
   return (
     <div className="approval" role="alertdialog" aria-label="Tool approval required">
       <div className="approval-head">
@@ -38,15 +44,23 @@ export function ApprovalPrompt({
       {preview && <pre className="approval-cmd">{preview}</pre>}
       <div className="actions">
         {has('allow_once') && (
-          <button className="primary" onClick={() => pick('allow_once')}>
+          <button className="primary" onKeyDown={noEnter} onClick={() => pick('allow_once')}>
             Approve
           </button>
         )}
-        {has('allow_always') && <button onClick={() => pick('allow_always')}>Always allow</button>}
+        {has('allow_always') && (
+          <button onKeyDown={noEnter} onClick={() => pick('allow_always')}>
+            Always allow
+          </button>
+        )}
         {has('reject_once') ? (
-          <button onClick={() => pick('reject_once')}>Deny</button>
+          <button onKeyDown={noEnter} onClick={() => pick('reject_once')}>
+            Deny
+          </button>
         ) : (
-          <button onClick={() => onRespond(request.tool_call_id, null)}>Deny</button>
+          <button onKeyDown={noEnter} onClick={() => onRespond(request.tool_call_id, null)}>
+            Deny
+          </button>
         )}
       </div>
     </div>

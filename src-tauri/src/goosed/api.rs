@@ -130,6 +130,12 @@ impl AcpClient {
         let _ = self.out.send(Message::Text(msg.to_string()));
     }
 
+    /// Send a JSON-RPC *notification* (no id, no response) — e.g. `session/cancel`.
+    pub fn notify(&self, method: &str, params: Value) {
+        let msg = json!({ "jsonrpc": "2.0", "method": method, "params": params });
+        let _ = self.out.send(Message::Text(msg.to_string()));
+    }
+
     /// Take a deferred permission request's JSON-RPC id by its tool-call key.
     pub async fn take_permission(&self, key: &str) -> Option<Value> {
         self.permissions.lock().await.remove(key)

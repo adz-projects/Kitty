@@ -58,7 +58,9 @@ interface ChatState {
   newSession: (cwd?: string) => Promise<void>;
   ensureSession: () => Promise<string>;
   loadSession: (sessionId: string, cwd: string, title?: string) => Promise<void>;
+  reloadCurrent: () => Promise<void>;
   send: (text: string) => Promise<void>;
+  cancel: () => Promise<void>;
   respondApproval: (toolCallId: string, optionId: string | null) => Promise<void>;
   setMode: (modeId: string) => Promise<void>;
   addDroppedPaths: (paths: string[]) => Promise<void>;
@@ -162,6 +164,24 @@ export const useChatStore = create<ChatState>((set, get) => ({
     } finally {
       set((s) => ({ busy: false, messages: closeOpen(s.messages) }));
     }
+  },
+
+  cancel: async () => {
+    const sid = get().sessionId;
+    if (!sid || !get().busy) return;
+    try {
+      await ipc.cancelPrompt(sid);
+      // Optimistically release the UI; goosed can take a moment to wind down the
+      // turn on a slow model, and its later completion event is idempotent.
+      set((s) => ({ busy: false, messages: closeOpen(s.messages) }));
+    } catch (e) {
+      set({ error: String(e) });
+    }
+  },
+
+  reloadCurrent: async () => {
+    const { sessionId, cwd, title } = get();
+    if (sessionId && cwd) await get().loadSession(sessionId, cwd, title ?? undefined);
   },
 
   respondApproval: async (toolCallId: string, optionId: string | null) => {

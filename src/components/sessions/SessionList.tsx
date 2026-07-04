@@ -28,6 +28,9 @@ export function SessionList() {
           ⟳
         </button>
       </div>
+      <div className="muted" style={{ fontSize: 11, padding: '4px 10px' }}>
+        {sessions.length} session{sessions.length === 1 ? '' : 's'}
+      </div>
       {loading && sessions.length === 0 && <p className="muted session-empty">Loading…</p>}
       {!loading && sessions.length === 0 && <p className="muted session-empty">No sessions.</p>}
       <div className="session-items">

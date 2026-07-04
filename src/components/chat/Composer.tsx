@@ -1,11 +1,14 @@
 import { useRef, useState } from 'react';
 
-/** Message composer: Enter sends, Shift+Enter inserts a newline. */
+/** Message composer: Enter sends, Shift+Enter inserts a newline. While a reply
+    streams, sending is blocked and a Stop button cancels the turn. */
 export function Composer({
   onSend,
+  onStop,
   disabled,
 }: {
   onSend: (text: string) => void;
+  onStop: () => void;
   disabled: boolean;
 }) {
   const [text, setText] = useState('');
@@ -24,6 +27,7 @@ export function Composer({
       <textarea
         ref={ref}
         rows={1}
+        autoFocus
         value={text}
         placeholder="Ask Goose…"
         onChange={(e) => {
@@ -38,9 +42,15 @@ export function Composer({
           }
         }}
       />
-      <button className="primary" onClick={submit} disabled={disabled || !text.trim()}>
-        Send
-      </button>
+      {disabled ? (
+        <button onClick={onStop} title="Stop the current response">
+          Stop
+        </button>
+      ) : (
+        <button className="primary" onClick={submit} disabled={!text.trim()}>
+          Send
+        </button>
+      )}
     </div>
   );
 }

@@ -5,6 +5,7 @@
 
 import { useState } from 'react';
 import { ipc } from '@/lib/ipc';
+import { useChatStore } from '@/stores/chatStore';
 import type { StackStatus } from '@/lib/types';
 
 interface Copy {
@@ -86,6 +87,8 @@ export function StackStatusView({ status }: { status: StackStatus }) {
               setBusy(true);
               try {
                 await ipc.restartGoosed();
+                // Reconnect + rebuild the active session (resume by id).
+                await useChatStore.getState().reloadCurrent();
               } finally {
                 setBusy(false);
               }
