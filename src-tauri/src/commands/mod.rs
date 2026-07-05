@@ -613,10 +613,11 @@ pub struct FileAttachment {
 
 /// Read a dropped file for attachment to ANY provider (Round-2 item 13): UTF-8
 /// files come back as text; anything else as a base64 data URL. Binaries are no
-/// longer rejected. Capped (default 1 MB) so we don't inline huge payloads.
+/// longer rejected. Capped (default 25 MB — large enough for a typical photo)
+/// so we don't inline huge payloads.
 #[tauri::command]
 pub fn read_file_any(path: String, max_bytes: Option<usize>) -> Result<FileAttachment, String> {
-    let cap = max_bytes.unwrap_or(1024 * 1024);
+    let cap = max_bytes.unwrap_or(25 * 1024 * 1024);
     let name = std::path::Path::new(&path)
         .file_name()
         .and_then(|n| n.to_str())

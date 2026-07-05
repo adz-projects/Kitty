@@ -112,9 +112,14 @@ pub fn start_stack(app: &AppHandle) {
     });
 }
 
-/// Per-provider reachability for `personal`/`remote` providers (Phase 9). Pings
-/// the active provider's base URL every 15s and emits `provider://health` on
-/// change — distinct from the local stack machine, with Tailscale-friendly copy.
+/// Per-provider reachability for **Personal** (Tailscale-style) providers only
+/// (Round-3 item 19). Pings the active provider's base URL every 15s and emits
+/// `provider://health` on change — distinct from the local stack machine, with
+/// Tailscale-friendly copy. **Remote-tier providers are deliberately excluded**:
+/// this app never makes an inference call itself, so a speculative background
+/// GET against a Remote (usually rate-limited) cloud endpoint has no upside —
+/// unlike a Tailscale host, a cloud API doesn't meaningfully go "offline," and
+/// its real reachability surfaces naturally via a failed send instead.
 pub fn spawn_provider_health_loop(app: AppHandle) {
     use crate::config::providers::{network_tier_for, NetworkTier};
     tauri::async_runtime::spawn(async move {
@@ -134,9 +139,10 @@ pub fn spawn_provider_health_loop(app: AppHandle) {
                     .and_then(|id| cfg.providers.iter().find(|p| &p.id == id).cloned())
             };
 
-            // Only track personal/remote providers; local ones use the stack loop.
+            // Only track Personal-tier providers; local ones use the stack loop,
+            // Remote-tier ones are skipped entirely (see doc comment above).
             let Some(p) = active.filter(|p| {
-                !matches!(network_tier_for(&p.base_url), NetworkTier::Local)
+                matches!(network_tier_for(&p.base_url), NetworkTier::Personal)
             }) else {
                 if last_reachable == Some(false) {
                     let _ = app.emit("provider://health", json!({ "reachable": true }));
