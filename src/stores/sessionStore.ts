@@ -50,7 +50,8 @@ export const useSessionStore = create<SessionState>((set, get) => ({
   },
 
   remove: async (sessionId: string) => {
-    await ipc.deleteSession(sessionId);
+    const cwd = get().sessions.find((s) => s.sessionId === sessionId)?.cwd;
+    await ipc.deleteSession(sessionId, cwd);
     set((s) => ({ sessions: s.sessions.filter((x) => x.sessionId !== sessionId) }));
     // Drop any dangling folder assignment.
     if (get().assignments[sessionId]) await get().assignFolder(sessionId, null);

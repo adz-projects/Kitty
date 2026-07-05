@@ -273,31 +273,41 @@ pub struct ModeInfo {
     pub description: String,
 }
 
+/// Prefix every no-explicit-folder session's private chat folder lives under
+/// (Round-3 item 25). `delete_session` only ever removes a directory under
+/// this prefix — never a user-chosen custom working directory.
+pub const CHATS_DIR_NAME: &str = "chats";
+
+/// A fresh, unique folder for a session with no explicit context folder, under
+/// `%USERPROFILE%\Documents\Kitty\chats\<timestamp>-<short-rand>\`. Replaces
+/// both the old chat-only Downloads default and the old shared agentic
+/// `Documents/Goose` default: each such session now gets its own isolated
+/// folder instead of sharing one across sessions (Round-3 item 25 — a real,
+/// deliberate behavior change, not just a path rename).
+fn new_private_chat_folder() -> PathBuf {
+    use rand::Rng;
+    let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
+    let suffix: String = {
+        let mut rng = rand::thread_rng();
+        (0..6).map(|_| format!("{:x}", rng.gen_range(0u8..16))).collect()
+    };
+    dirs::document_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("Kitty")
+        .join(CHATS_DIR_NAME)
+        .join(format!("{ts}-{suffix}"))
+}
+
 /// The working directory a new session starts in: the configured default
-/// context folder, else `%USERPROFILE%\Documents\Goose` (created if missing).
+/// context folder, else a fresh private folder under `Documents/Kitty/chats/`
+/// (created if missing) — same fallback for both agentic and chat-only modes.
 fn resolve_cwd(app: &AppHandle) -> String {
-    let (configured, chat_only) = {
+    let configured = {
         let state = app.state::<AppState>();
         let cfg = state.config.lock().unwrap();
-        let chat_only = cfg
-            .active_provider_id
-            .as_ref()
-            .and_then(|id| cfg.providers.iter().find(|p| &p.id == id))
-            .map(|p| !p.tools_enabled)
-            .unwrap_or(false);
-        (cfg.default_context_folder.clone(), chat_only)
+        cfg.default_context_folder.clone()
     };
-    // Chat-only ("thought partner") sessions drop any artifacts into Downloads
-    // rather than the agentic context folder (Round-2 item 14c).
-    let path = if chat_only {
-        dirs::download_dir().unwrap_or_else(|| PathBuf::from("."))
-    } else {
-        configured.map(PathBuf::from).unwrap_or_else(|| {
-            dirs::document_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join("Goose")
-        })
-    };
+    let path = configured.map(PathBuf::from).unwrap_or_else(new_private_chat_folder);
     let _ = std::fs::create_dir_all(&path);
     path.to_string_lossy().replace('\\', "/")
 }
@@ -746,13 +756,32 @@ pub fn assign_session_folder(
     config::save(&cfg).map_err(|e| e.to_string())
 }
 
-/// Delete a session (ACP `session/delete`).
+/// Delete a session (ACP `session/delete`). If `cwd` sits under the private
+/// `Documents/Kitty/chats/` prefix (i.e. it was never an explicit user-chosen
+/// working directory — see `resolve_cwd`), also remove that directory. The
+/// prefix check is a hard safety gate: a custom/explicit folder is never
+/// touched (Round-3 item 25).
 #[tauri::command]
-pub async fn delete_session(app: AppHandle, session_id: String) -> Result<(), String> {
+pub async fn delete_session(
+    app: AppHandle,
+    session_id: String,
+    cwd: Option<String>,
+) -> Result<(), String> {
     let client = api::ensure_client(&app).await?;
     client
         .request("session/delete", json!({ "sessionId": session_id }))
         .await?;
+    if let Some(cwd) = cwd {
+        let chats_root = dirs::document_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("Kitty")
+            .join(CHATS_DIR_NAME);
+        let chats_root = chats_root.to_string_lossy().replace('\\', "/");
+        let cwd_norm = cwd.replace('\\', "/");
+        if cwd_norm.starts_with(&chats_root) {
+            let _ = std::fs::remove_dir_all(&cwd_norm);
+        }
+    }
     Ok(())
 }
 

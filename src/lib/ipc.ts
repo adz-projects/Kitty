@@ -51,7 +51,8 @@ export const ipc = {
   listSessions: () => invoke<Record<string, unknown>[]>('list_sessions'),
   loadSession: (sessionId: string, cwd: string) =>
     invoke<SessionInfo>('load_session', { sessionId, cwd }),
-  deleteSession: (sessionId: string) => invoke<void>('delete_session', { sessionId }),
+  deleteSession: (sessionId: string, cwd?: string) =>
+    invoke<void>('delete_session', { sessionId, cwd: cwd ?? null }),
   // Chat folders (Round-2 item 15)
   listFolders: () => invoke<FolderData>('list_folders'),
   createFolder: (name: string) => invoke<void>('create_folder', { name }),
