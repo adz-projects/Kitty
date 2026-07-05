@@ -1,13 +1,12 @@
 import { useEffect, useState } from 'react';
 import { ipc } from '@/lib/ipc';
 import type { EnvVar } from '@/lib/types';
-import { useConfigDraft } from './useConfigDraft';
 
-/** Advanced: Ollama env-var helper (HKCU\Environment) + model params. */
+/** Advanced: Ollama env-var helper (HKCU\Environment). Per-provider sampling
+    params (temperature / context length) now live in Settings → Providers. */
 export function Advanced() {
   const [envVars, setEnvVars] = useState<EnvVar[]>([]);
   const [msg, setMsg] = useState('');
-  const { draft, update, save, saved } = useConfigDraft();
 
   const load = () => void ipc.readOllamaEnv().then(setEnvVars);
   useEffect(load, []);
@@ -59,52 +58,9 @@ export function Advanced() {
         </div>
       </details>
 
-      <details>
-        <summary>
-          <strong>Model parameters</strong>
-        </summary>
-        {draft && (
-          <>
-            <label className="field">
-              <span>Temperature</span>
-              <input
-                type="number"
-                step="0.1"
-                value={draft.model_params.temperature ?? ''}
-                onChange={(e) =>
-                  update({
-                    model_params: {
-                      ...draft.model_params,
-                      temperature: e.target.value ? Number(e.target.value) : null,
-                    },
-                  })
-                }
-              />
-            </label>
-            <label className="field">
-              <span>Context length</span>
-              <input
-                type="number"
-                value={draft.model_params.context_length ?? ''}
-                onChange={(e) =>
-                  update({
-                    model_params: {
-                      ...draft.model_params,
-                      context_length: e.target.value ? Number(e.target.value) : null,
-                    },
-                  })
-                }
-              />
-            </label>
-            <div className="row">
-              <button className="primary" onClick={() => void save()}>
-                Save (applies on next Goose restart)
-              </button>
-              {saved && <span className="muted">Saved.</span>}
-            </div>
-          </>
-        )}
-      </details>
+      <p className="muted">
+        Temperature and context length are now set per provider in Settings → Providers.
+      </p>
     </section>
   );
 }

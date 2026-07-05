@@ -1,12 +1,13 @@
 import { useEffect, useState } from 'react';
 import { ipc } from '@/lib/ipc';
-import type { NetworkTier, ProviderProfile, ProviderType, ProviderView } from '@/lib/types';
-
-const TIER_BADGE: Record<NetworkTier, string> = {
-  local: '🖥 local',
-  personal: '🔒 private network',
-  remote: '☁ remote',
-};
+import type {
+  NetworkTier,
+  OllamaModel,
+  ProviderProfile,
+  ProviderType,
+  ProviderView,
+} from '@/lib/types';
+import { trustBadge } from '@/lib/provider_trust';
 
 const DEFAULT_URL: Record<ProviderType, string> = {
   ollama: 'http://localhost:11434',
@@ -16,7 +17,25 @@ const DEFAULT_URL: Record<ProviderType, string> = {
   custom_openai: '',
 };
 
-/** Client-side mirror of providers::network_tier_for (for live form preview). */
+// Context-length detents (item 28): not linearly spaced, so the slider indexes
+// into this array rather than mapping its position directly to a value.
+const CTX_DETENTS = [4096, 8192, 16384, 32768, 65536, 131072, 262144];
+const ctxLabel = (v: number) => (v % 1024 === 0 ? `${v / 1024}K` : String(v));
+function nearestCtxIndex(v: number): number {
+  let best = 0;
+  let bd = Infinity;
+  CTX_DETENTS.forEach((d, i) => {
+    const dist = Math.abs(d - v);
+    if (dist < bd) {
+      bd = dist;
+      best = i;
+    }
+  });
+  return best;
+}
+
+/** Client-side mirror of providers::network_tier_for — only used to detect
+    loopback (which is always "local"/trusted). */
 function tierOf(url: string): NetworkTier {
   const host = (url.split('://').pop() ?? '').split('/')[0].split('@').pop() ?? '';
   const h = host.split(':')[0].toLowerCase();
@@ -27,6 +46,8 @@ function tierOf(url: string): NetworkTier {
   return 'remote';
 }
 
+const isLocal = (url: string) => tierOf(url) === 'local';
+
 const blank = (): ProviderProfile => ({
   id: '',
   name: '',
@@ -34,6 +55,10 @@ const blank = (): ProviderProfile => ({
   base_url: DEFAULT_URL.openrouter,
   models: [],
   tools_enabled: true,
+  is_trusted: false,
+  temperature: null,
+  top_p: null,
+  context_length: null,
   created_at: '',
 });
 
@@ -41,7 +66,7 @@ export function Providers({ highlight }: { highlight: string | null }) {
   const [providers, setProviders] = useState<ProviderView[]>([]);
   const [editing, setEditing] = useState<ProviderProfile | null>(null);
   const [secret, setSecret] = useState('');
-  const [confirmRemote, setConfirmRemote] = useState(false);
+  const [confirmUntrusted, setConfirmUntrusted] = useState(false);
   const [handoffFor, setHandoffFor] = useState<ProviderView | null>(null);
   const [error, setError] = useState('');
 
@@ -62,7 +87,7 @@ export function Providers({ highlight }: { highlight: string | null }) {
     try {
       await ipc.upsertProvider(editing, secret || null);
       setEditing(null);
-      setConfirmRemote(false);
+      setConfirmUntrusted(false);
       setSecret('');
       await refresh();
     } catch (e) {
@@ -72,15 +97,14 @@ export function Providers({ highlight }: { highlight: string | null }) {
 
   const onSave = () => {
     if (!editing) return;
-    // Adding/editing a remote-tier profile requires an explicit acknowledgement.
-    if (tierOf(editing.base_url) === 'remote') setConfirmRemote(true);
+    // Saving a non-local provider the user hasn't marked trusted requires an
+    // explicit acknowledgement (Round-2 item 18 — was tier===remote).
+    if (!editing.is_trusted && !isLocal(editing.base_url)) setConfirmUntrusted(true);
     else void doSave();
   };
 
   const activate = async (p: ProviderView, keepContext: boolean) => {
     if (!keepContext) {
-      // Start clean: drop the handed-off session so windows begin fresh.
-      // (No dedicated clear command; overwrite with an empty active session.)
       try {
         await ipc.setActiveSession({
           session_id: '',
@@ -102,9 +126,9 @@ export function Providers({ highlight }: { highlight: string | null }) {
   };
 
   const onActivate = async (p: ProviderView) => {
-    // Context-handoff gate: switching to a remote provider with an active session
-    // forces an explicit keep/jettison choice, every time (CLAUDE.md Phase 5).
-    if (p.network_tier === 'remote') {
+    // Context-handoff gate: switching to an untrusted, non-local provider with an
+    // active session forces an explicit keep/jettison choice (Round-2 item 18).
+    if (!p.is_trusted && p.network_tier !== 'local') {
       const active = await ipc.getActiveSession();
       if (active && active.session_id) {
         setHandoffFor(p);
@@ -136,7 +160,7 @@ export function Providers({ highlight }: { highlight: string | null }) {
             <div>
               <div className="provider-name">
                 {p.name || p.provider_type}{' '}
-                <span className="status-badge">{TIER_BADGE[p.network_tier]}</span>
+                <span className="status-badge">{trustBadge(p.network_tier, p.is_trusted)}</span>
                 {!p.tools_enabled && <span className="status-badge">chat-only</span>}
                 {p.active && <span className="status-badge">active</span>}
               </div>
@@ -183,26 +207,24 @@ export function Providers({ highlight }: { highlight: string | null }) {
         />
       )}
 
-      {confirmRemote && editing && (
-        <Modal title="This is a remote provider">
+      {confirmUntrusted && editing && (
+        <Modal title="This provider isn’t marked trusted">
           <p>
-            Prompts, file contents, and tool outputs sent to this session may be transmitted to{' '}
-            <strong>
-              {tierOf(editing.base_url) === 'remote' ? new URL(editing.base_url).host : ''}
-            </strong>{' '}
-            — a third party.
+            Prompts, file contents, and tool outputs may be transmitted to{' '}
+            <strong>{hostOf(editing.base_url)}</strong> — an unverified third party. Mark it trusted
+            in the form if you control it.
           </p>
           <div className="row">
             <button className="primary" onClick={() => void doSave()}>
-              I understand
+              I understand — save anyway
             </button>
-            <button onClick={() => setConfirmRemote(false)}>Cancel</button>
+            <button onClick={() => setConfirmUntrusted(false)}>Cancel</button>
           </div>
         </Modal>
       )}
 
       {handoffFor && (
-        <Modal title="Send this conversation to a remote provider?">
+        <Modal title="Send this conversation to an untrusted provider?">
           <p>
             The active session has context that would now be sent to{' '}
             <strong>{handoffFor.base_url}</strong>.
@@ -218,6 +240,14 @@ export function Providers({ highlight }: { highlight: string | null }) {
       )}
     </section>
   );
+}
+
+function hostOf(url: string): string {
+  try {
+    return new URL(url).host;
+  } catch {
+    return url;
+  }
 }
 
 function ProviderForm({
@@ -237,6 +267,23 @@ function ProviderForm({
 }) {
   const set = (patch: Partial<ProviderProfile>) => onChange({ ...profile, ...patch });
   const needsKey = profile.provider_type !== 'ollama';
+  const local = isLocal(profile.base_url);
+  const ollamaLocal = profile.provider_type === 'ollama' && local;
+
+  // Local-Ollama: offer a dropdown of installed models instead of free text (item 19).
+  const [installed, setInstalled] = useState<OllamaModel[]>([]);
+  useEffect(() => {
+    if (!ollamaLocal) return;
+    let live = true;
+    void ipc
+      .ollamaListModels()
+      .then((m) => live && setInstalled(m))
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, [ollamaLocal]);
+
   return (
     <Modal title={profile.id ? 'Edit provider' : 'Add provider'}>
       <label className="field">
@@ -262,22 +309,44 @@ function ProviderForm({
       <label className="field">
         <span>Base URL</span>
         <input value={profile.base_url} onChange={(e) => set({ base_url: e.target.value })} />
-        <small className="muted">Tier: {TIER_BADGE[tierOf(profile.base_url)]}</small>
+        <small className="muted">{trustBadge(tierOf(profile.base_url), profile.is_trusted)}</small>
       </label>
-      <label className="field">
-        <span>Models (comma-separated)</span>
-        <input
-          value={profile.models.join(', ')}
-          onChange={(e) =>
-            set({
-              models: e.target.value
-                .split(',')
-                .map((m) => m.trim())
-                .filter(Boolean),
-            })
-          }
-        />
-      </label>
+
+      {ollamaLocal ? (
+        <label className="field">
+          <span>Model</span>
+          <select
+            value={profile.models[0] ?? ''}
+            onChange={(e) => set({ models: e.target.value ? [e.target.value] : [] })}
+          >
+            <option value="">(use Goose default)</option>
+            {installed.map((m) => (
+              <option key={m.name} value={m.name}>
+                {m.name}
+              </option>
+            ))}
+          </select>
+          {installed.length === 0 && (
+            <small className="muted">No installed models found — pull one in Ollama Models.</small>
+          )}
+        </label>
+      ) : (
+        <label className="field">
+          <span>Models (comma-separated)</span>
+          <input
+            value={profile.models.join(', ')}
+            onChange={(e) =>
+              set({
+                models: e.target.value
+                  .split(',')
+                  .map((m) => m.trim())
+                  .filter(Boolean),
+              })
+            }
+          />
+        </label>
+      )}
+
       {needsKey && (
         <label className="field">
           <span>API key {profile.id ? '(leave blank to keep)' : ''}</span>
@@ -285,14 +354,77 @@ function ProviderForm({
           <small className="muted">Stored in Windows Credential Manager, never on disk.</small>
         </label>
       )}
+
+      {!local && (
+        <label className="check">
+          <input
+            type="checkbox"
+            checked={profile.is_trusted}
+            onChange={(e) => set({ is_trusted: e.target.checked })}
+          />
+          <span>I trust this provider (🌐 — skips the untrusted-provider warning)</span>
+        </label>
+      )}
+      {local && <p className="muted">🔒 Local provider — always trusted.</p>}
+
       <label className="check">
         <input
           type="checkbox"
           checked={profile.tools_enabled}
           onChange={(e) => set({ tools_enabled: e.target.checked })}
         />
-        <span>Tools enabled (uncheck for a chat-only thought-partner provider)</span>
+        <span>Agentic tools enabled (uncheck for a chat-only thought-partner provider)</span>
       </label>
+
+      {/* Per-provider sampling params (items 27/28), vertical stack so nothing overlaps. */}
+      <div className="field param-slider">
+        <label className="check">
+          <input
+            type="checkbox"
+            checked={profile.temperature != null}
+            onChange={(e) => set({ temperature: e.target.checked ? 0.7 : null })}
+          />
+          <span>Override temperature</span>
+        </label>
+        {profile.temperature != null && (
+          <div className="row">
+            <input
+              type="range"
+              min={0}
+              max={2}
+              step={0.1}
+              value={profile.temperature}
+              onChange={(e) => set({ temperature: Number(e.target.value) })}
+            />
+            <span className="status-badge">{profile.temperature.toFixed(1)}</span>
+          </div>
+        )}
+      </div>
+
+      <div className="field param-slider">
+        <label className="check">
+          <input
+            type="checkbox"
+            checked={profile.context_length != null}
+            onChange={(e) => set({ context_length: e.target.checked ? 8192 : null })}
+          />
+          <span>Override context length</span>
+        </label>
+        {profile.context_length != null && (
+          <div className="row">
+            <input
+              type="range"
+              min={0}
+              max={CTX_DETENTS.length - 1}
+              step={1}
+              value={nearestCtxIndex(profile.context_length)}
+              onChange={(e) => set({ context_length: CTX_DETENTS[Number(e.target.value)] })}
+            />
+            <span className="status-badge">{ctxLabel(profile.context_length)}</span>
+          </div>
+        )}
+      </div>
+
       <div className="row">
         <button className="primary" onClick={onSave}>
           Save

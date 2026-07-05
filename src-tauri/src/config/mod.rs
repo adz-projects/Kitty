@@ -48,17 +48,6 @@ pub struct Config {
     pub strict_remote_mode: bool,
     /// Auto-summarize threshold (Goose setting; app-side until wired).
     pub auto_summarize_threshold: Option<u32>,
-    /// Sampling / inference params applied to goosed via env on spawn.
-    pub model_params: ModelParams,
-}
-
-/// Model sampling / inference parameters (Advanced settings).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ModelParams {
-    pub temperature: Option<f32>,
-    pub top_p: Option<f32>,
-    pub context_length: Option<u32>,
 }
 
 impl Default for Config {
@@ -78,7 +67,6 @@ impl Default for Config {
             active_provider_id: None,
             strict_remote_mode: false,
             auto_summarize_threshold: None,
-            model_params: ModelParams::default(),
         }
     }
 }

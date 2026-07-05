@@ -10,12 +10,6 @@ export interface NotificationPrefs {
   stack_degraded: boolean;
 }
 
-export interface ModelParams {
-  temperature: number | null;
-  top_p: number | null;
-  context_length: number | null;
-}
-
 export interface Config {
   hotkey: string;
   use_copilot_key: boolean;
@@ -31,7 +25,6 @@ export interface Config {
   active_provider_id: string | null;
   strict_remote_mode: boolean;
   auto_summarize_threshold: number | null;
-  model_params: ModelParams;
 }
 
 // --- Providers (Phase 5) ---
@@ -45,6 +38,10 @@ export interface ProviderProfile {
   base_url: string;
   models: string[];
   tools_enabled: boolean;
+  is_trusted: boolean;
+  temperature: number | null;
+  top_p: number | null;
+  context_length: number | null;
   created_at: string;
 }
 

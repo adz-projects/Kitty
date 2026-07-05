@@ -33,6 +33,17 @@ pub struct ProviderProfile {
     pub models: Vec<String>,
     #[serde(default = "default_true")]
     pub tools_enabled: bool,
+    /// User-declared trust (Round-2 item 18). Loopback is always trusted by tier;
+    /// this makes a non-loopback provider trusted (globe) instead of untrusted (⚠).
+    #[serde(default)]
+    pub is_trusted: bool,
+    /// Per-provider sampling params (Round-2 item 27). `None` = use Goose default.
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    #[serde(default)]
+    pub top_p: Option<f32>,
+    #[serde(default)]
+    pub context_length: Option<u32>,
     #[serde(default)]
     pub created_at: String,
 }
@@ -152,15 +163,17 @@ pub fn goosed_env(config: &Config) -> Vec<(String, String)> {
             }
             _ => {}
         }
-    }
 
-    // Model params (also applied via env; None -> leave Goose default).
-    let mp = &config.model_params;
-    if let Some(t) = mp.temperature {
-        env.push(("GOOSE_TEMPERATURE".into(), t.to_string()));
-    }
-    if let Some(c) = mp.context_length {
-        env.push(("GOOSE_CONTEXT_LIMIT".into(), c.to_string()));
+        // Per-provider sampling params (Round-2 item 27; None -> Goose default).
+        if let Some(t) = active.temperature {
+            env.push(("GOOSE_TEMPERATURE".into(), t.to_string()));
+        }
+        if let Some(c) = active.context_length {
+            env.push(("GOOSE_CONTEXT_LIMIT".into(), c.to_string()));
+        }
+        if let Some(p) = active.top_p {
+            env.push(("GOOSE_TOP_P".into(), p.to_string()));
+        }
     }
 
     env
@@ -179,5 +192,22 @@ mod tests {
         assert_eq!(network_tier_for("https://openrouter.ai/api/v1"), NetworkTier::Remote);
         // Plain LAN is treated as remote, not personal.
         assert_eq!(network_tier_for("http://192.168.1.50:11434"), NetworkTier::Remote);
+    }
+
+    #[test]
+    fn old_shape_provider_migrates_with_defaults() {
+        // A profile written before Round-2 (no is_trusted / temperature / etc.)
+        // must still deserialize, defaulting the new fields.
+        let json = r#"{
+            "id": "p1", "name": "Box", "provider_type": "ollama",
+            "base_url": "http://localhost:11434", "models": ["llama3.2:3b"],
+            "tools_enabled": true, "created_at": "2026-01-01T00:00:00Z"
+        }"#;
+        let p: ProviderProfile = serde_json::from_str(json).unwrap();
+        assert!(!p.is_trusted);
+        assert_eq!(p.temperature, None);
+        assert_eq!(p.top_p, None);
+        assert_eq!(p.context_length, None);
+        assert_eq!(p.models, vec!["llama3.2:3b"]);
     }
 }
