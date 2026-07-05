@@ -103,7 +103,7 @@ export function ChatView() {
 
       <MessageList
         messages={messages}
-        empty={title ?? 'New conversation. Ask Goose anything.'}
+        empty={title ?? 'Start a new chat.'}
         typing={awaitingFirstToken}
         thinkingReasoning={thinkingReasoning}
       />
