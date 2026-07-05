@@ -135,11 +135,12 @@ export async function pickImage(): Promise<string | null> {
   return typeof res === 'string' ? res : null;
 }
 
-/** Native save-file dialog for the ChatML export. Returns null if cancelled. */
+/** Native save-file dialog for the session export (Round-3 item 24: OpenAI
+    messages-array JSONL). Returns null if cancelled. */
 export async function pickSavePath(defaultName: string): Promise<string | null> {
   const res = await saveDialog({
     defaultPath: defaultName,
-    filters: [{ name: 'ChatML', extensions: ['chatml'] }],
+    filters: [{ name: 'JSON Lines', extensions: ['jsonl'] }],
   });
   return res ?? null;
 }

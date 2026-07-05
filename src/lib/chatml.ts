@@ -1,58 +1,26 @@
-// ChatML export (Phase 11). Produces a plain-text `.chatml` file plus a sidecar
-// `.meta.json`. Reasoning goes in <think>…</think> inside the assistant turn
-// (omitted when absent — no empty blocks); tool calls appear as a minimal inline
-// note referencing the sidecar, which holds their full detail.
+// Session export (Round-3 item 24). Produces a single-line `.jsonl` file with
+// one JSON object: `{ messages: [{role, content}, ...] }` (OpenAI SFT format —
+// Unsloth-style loaders iterate line-by-line regardless of line count).
+// Reasoning stays inline in the assistant turn as `<think>...</think>`
+// (omitted when absent); tool-call references are stripped entirely (SFT-clean
+// — no tool-call data anywhere in the export, unlike the old sidecar).
 
 import type { Message } from '@/stores/chatStore';
 
-export interface ExportMeta {
-  sessionId: string | null;
-  title: string | null;
-  workingDir: string | null;
-  model: string | null;
+export interface ChatMessage {
+  role: 'user' | 'assistant';
+  content: string;
 }
 
-interface MetaToolCall {
-  index: number;
-  turn: number;
-  name: string;
-  params: unknown;
-  result: unknown;
-}
-
-export function buildExport(messages: Message[], meta: ExportMeta, upToIndex?: number) {
+export function buildExport(messages: Message[], upToIndex?: number): ChatMessage[] {
   const slice = upToIndex != null ? messages.slice(0, upToIndex + 1) : messages;
-  const toolCalls: MetaToolCall[] = [];
-  const turns: { index: number; role: string; model: string | null }[] = [];
-  const blocks: string[] = [];
-
-  slice.forEach((m, i) => {
-    turns.push({ index: i, role: m.role, model: meta.model });
+  return slice.map((m) => {
     if (m.role === 'user') {
-      blocks.push(`<|im_start|>user\n${m.text}<|im_end|>`);
-      return;
+      return { role: 'user', content: m.text };
     }
-    let body = '';
-    for (const tc of m.toolCalls) {
-      const idx = toolCalls.length;
-      toolCalls.push({ index: idx, turn: i, name: tc.title, params: tc.input, result: tc.output });
-      body += `[tool_call: ${tc.title} → see meta.json#tool_calls[${idx}]]\n`;
-    }
-    if (m.reasoning) body += `<think>\n${m.reasoning}\n</think>\n`;
-    body += m.text;
-    blocks.push(`<|im_start|>assistant\n${body}<|im_end|>`);
+    const think = m.reasoning ? `<think>\n${m.reasoning}\n</think>\n` : '';
+    return { role: 'assistant', content: think + m.text };
   });
-
-  const metaObj = {
-    sessionId: meta.sessionId,
-    title: meta.title,
-    workingDir: meta.workingDir,
-    model: meta.model,
-    exportedAt: new Date().toISOString(),
-    turns,
-    toolCalls,
-  };
-  return { chatml: blocks.join('\n'), meta: metaObj };
 }
 
 export function sanitizeFilename(name: string): string {

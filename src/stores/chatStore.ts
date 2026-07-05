@@ -358,22 +358,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
     set((s) => ({ attachments: s.attachments.filter((a) => a.id !== id) })),
 
   exportSession: async (upToIndex?: number) => {
-    const { messages, sessionId, cwd, title, model } = get();
+    const { messages, title } = get();
     if (messages.length === 0) return;
-    const { chatml, meta } = buildExport(
-      messages,
-      { sessionId, title, workingDir: cwd, model },
-      upToIndex
-    );
+    const chatMessages = buildExport(messages, upToIndex);
     const base = sanitizeFilename(title ?? 'goose-session');
-    const path = await pickSavePath(`${base}.chatml`);
+    const path = await pickSavePath(`${base}.jsonl`);
     if (!path) return;
-    const metaPath = path.toLowerCase().endsWith('.chatml')
-      ? `${path.slice(0, -7)}.meta.json`
-      : `${path}.meta.json`;
     try {
-      await ipc.writeFile(path, chatml);
-      await ipc.writeFile(metaPath, JSON.stringify(meta, null, 2));
+      await ipc.writeFile(path, JSON.stringify({ messages: chatMessages }) + '\n');
     } catch (e) {
       set({ error: String(e) });
     }
