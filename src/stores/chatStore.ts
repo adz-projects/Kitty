@@ -420,14 +420,38 @@ export const useChatStore = create<ChatState>((set, get) => ({
     const sessionId = await get().ensureSession();
     const files = get().droppedFiles;
 
+    // Agentic-mode images go as native ACP image content blocks instead of a
+    // bare filesystem path reference (Round-3 item 17 — fixes untrusted/remote
+    // providers failing with "file not found": the model no longer has to
+    // correctly invoke a file tool on an exact path just to see the picture).
+    // Chat-only mode is unaffected here — its binary-attachment stub is a
+    // separate, lower-priority concern (no tool-invocation failure mode exists
+    // there since chat-only never calls tools).
+    const isImage = (name: string) => /\.(png|jpe?g|gif|webp|bmp)$/i.test(name);
+    const imageFiles = !chatOnly ? files.filter((f) => !f.is_dir && isImage(f.name)) : [];
+    const otherFiles = files.filter((f) => !imageFiles.includes(f));
+    let images: { mime: string; data_url: string }[] | undefined;
+    if (imageFiles.length) {
+      images = [];
+      for (const f of imageFiles) {
+        try {
+          const file = await ipc.readFileAny(f.path);
+          images.push({ mime: file.mime ?? 'image/png', data_url: file.content });
+        } catch (e) {
+          set({ error: String(e) });
+        }
+      }
+    }
+
     let promptText = trimmed;
     if (chatOnly && attachments.length) {
       // Inline document content directly (no filesystem tool in chat-only mode).
       const docs = attachments.map((a) => `--- ${a.label} ---\n${a.content}`).join('\n\n');
       promptText = `${docs}\n\n${trimmed}`.trim();
-    } else if (files.length) {
-      // Agentic: hand paths to the filesystem tools (CLAUDE.md §5).
-      const block = 'Files provided by the user:\n' + files.map((f) => `- ${f.path}`).join('\n');
+    } else if (otherFiles.length) {
+      // Agentic: hand non-image paths to the filesystem tools (CLAUDE.md §5).
+      const block =
+        'Files provided by the user:\n' + otherFiles.map((f) => `- ${f.path}`).join('\n');
       promptText = `${block}\n\n${trimmed}`;
     }
 
@@ -449,7 +473,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }));
     try {
       lastSentAt = performance.now();
-      await ipc.sendPrompt(sessionId, promptText);
+      await ipc.sendPrompt(sessionId, promptText, images);
       // Chat-only: auto-promote the *first* overlay message to the full window.
       if (chatOnly && firstMessage && windowLabel() === 'overlay') {
         const s = get();

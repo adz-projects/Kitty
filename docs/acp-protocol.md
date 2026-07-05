@@ -43,6 +43,27 @@ Goose version bump (see [VERSIONS.md](VERSIONS.md)).
 
 `ContentBlock`: `{ type: "text", text }` (also image/audio per promptCapabilities).
 
+### Image content blocks — probed shape (Round-3 Batch 8, 2026-07-05)
+
+- `initialize`'s result reports `agentCapabilities.promptCapabilities: { image: true,
+  audio: false, embeddedContext: true }` for the pinned Goose version — no
+  separate negotiation step needed before sending an image block.
+- **Confirmed working shape**: `{ type: "image", data: "<base64, no data: prefix>",
+  mimeType: "image/png" }` — camelCase `mimeType` (not `mime_type`), and `data`
+  is a top-level field (not nested under an Anthropic-style `source` object).
+  A real `session/prompt` call with this shape alongside a text block returned
+  `{ stopReason: "end_turn", usage: {...} }` successfully.
+- Rejected shapes (schema errors, not capability errors): `mime_type` (snake_case)
+  → `missing field \`mimeType\``; Anthropic-style `{ source: { type: "base64",
+  media_type, data } }` → `missing field \`data\`` (goosed wants `data` directly
+  on the block, not nested).
+- This is an agent-level capability flag (reported once at `initialize`, not
+  per-provider/model) — whether the underlying model can actually *see* the
+  image is a separate, model-specific question this app can't detect in
+  advance; sending the block and letting a non-vision model degrade to a
+  text-only-informed answer is strictly better than today's hard path-based
+  failure.
+
 ## Streaming (agent → client `session/update` notifications)
 
 Shape: `{ sessionId, update: { sessionUpdate: <variant>, ... } }`. Variants seen:

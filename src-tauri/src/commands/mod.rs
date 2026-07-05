@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -367,21 +367,46 @@ fn parse_mode(v: &Value) -> ModeInfo {
     }
 }
 
+/// An image attached to a chat turn (Round-3 item 17). `data_url` is a
+/// `data:<mime>;base64,<...>` string as produced by `read_file_any`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ImageAttachment {
+    pub mime: String,
+    pub data_url: String,
+}
+
 /// Send a user turn (ACP `session/prompt`). Returns immediately; streamed
 /// output arrives via `chat://*` events, and completion via `chat://complete`.
+/// `images`, when present, are appended as native ACP image content blocks
+/// (`{type:"image", data, mimeType}`, confirmed live — see acp-protocol.md)
+/// instead of relying on a filesystem tool to open a path — this is what fixes
+/// the "file not found" failure untrusted/remote providers hit on a bare path
+/// reference (Round-3 item 17).
 #[tauri::command]
-pub async fn send_prompt(app: AppHandle, session_id: String, text: String) -> Result<(), String> {
+pub async fn send_prompt(
+    app: AppHandle,
+    session_id: String,
+    text: String,
+    images: Option<Vec<ImageAttachment>>,
+) -> Result<(), String> {
     let client = api::ensure_client(&app).await?;
     let app_bg = app.clone();
     let sid = session_id.clone();
+    let mut prompt = vec![json!({ "type": "text", "text": text })];
+    for img in images.unwrap_or_default() {
+        // Strip a "data:<mime>;base64," prefix if present; ACP wants raw base64.
+        let data = img
+            .data_url
+            .split_once(",")
+            .map(|(_, b64)| b64)
+            .unwrap_or(&img.data_url);
+        prompt.push(json!({ "type": "image", "data": data, "mimeType": img.mime }));
+    }
     tauri::async_runtime::spawn(async move {
         let res = client
             .request(
                 "session/prompt",
-                json!({
-                    "sessionId": sid,
-                    "prompt": [{ "type": "text", "text": text }]
-                }),
+                json!({ "sessionId": sid, "prompt": prompt }),
             )
             .await;
         match res {

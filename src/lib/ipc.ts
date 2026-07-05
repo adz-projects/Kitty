@@ -40,7 +40,8 @@ export const ipc = {
   getStackStatus: () => invoke<StackStatus>('get_stack_status'),
   restartGoosed: () => invoke<void>('restart_goosed'),
   newSession: (cwd?: string) => invoke<SessionInfo>('new_session', { cwd: cwd ?? null }),
-  sendPrompt: (sessionId: string, text: string) => invoke<void>('send_prompt', { sessionId, text }),
+  sendPrompt: (sessionId: string, text: string, images?: { mime: string; data_url: string }[]) =>
+    invoke<void>('send_prompt', { sessionId, text, images: images ?? null }),
   cancelPrompt: (sessionId: string) => invoke<void>('cancel_prompt', { sessionId }),
   setActiveSession: (info: SessionInfo) => invoke<void>('set_active_session', { info }),
   getActiveSession: () => invoke<SessionInfo | null>('get_active_session'),
