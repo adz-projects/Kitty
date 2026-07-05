@@ -25,6 +25,7 @@ export interface Config {
   active_provider_id: string | null;
   strict_remote_mode: boolean;
   auto_summarize_threshold: number | null;
+  show_artifacts: boolean;
 }
 
 // --- Providers (Phase 5) ---

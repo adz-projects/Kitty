@@ -6,6 +6,7 @@ import { StackStatusView } from '@/components/StackStatusView';
 import { ChatView } from '@/components/chat/ChatView';
 import { SessionList } from '@/components/sessions/SessionList';
 import { ArtifactsPane } from '@/components/artifacts/ArtifactsPane';
+import { NewChatIcon } from '@/components/icons/NewChatIcon';
 import type { StackStatus } from '@/lib/types';
 
 const DEGRADED: StackStatus[] = ['ollama_down', 'goosed_down', 'no_model', 'provider_unreachable'];
@@ -15,6 +16,9 @@ const DEGRADED: StackStatus[] = ['ollama_down', 'goosed_down', 'no_model', 'prov
 export function App() {
   const status = useStackStore((s) => s.status);
   const init = useStackStore((s) => s.init);
+  const messages = useChatStore((s) => s.messages);
+  const exportSession = useChatStore((s) => s.exportSession);
+  const newSession = useChatStore((s) => s.newSession);
   const [showArtifacts, setShowArtifacts] = useState(true);
 
   useEffect(() => {
@@ -23,7 +27,16 @@ export function App() {
       const info = await ipc.getActiveSession();
       if (info) useChatStore.getState().adoptSession(info);
     })();
+    // Show/hide-artifacts is persisted (Round-3 item 6).
+    void ipc.getConfig().then((c) => setShowArtifacts(c.show_artifacts));
   }, [init]);
+
+  const toggleArtifacts = async () => {
+    const next = !showArtifacts;
+    setShowArtifacts(next);
+    const cfg = await ipc.getConfig();
+    await ipc.setConfig({ ...cfg, show_artifacts: next });
+  };
 
   const degraded = DEGRADED.includes(status);
 
@@ -34,10 +47,20 @@ export function App() {
         <header className="main-header">
           <h1>Kitty</h1>
           <div style={{ display: 'flex', gap: 8 }}>
-            <button onClick={() => setShowArtifacts((v) => !v)}>
+            {messages.length > 0 && (
+              <button onClick={() => void exportSession()} title="Export this session as ChatML">
+                Export
+              </button>
+            )}
+            <button onClick={() => void toggleArtifacts()}>
               {showArtifacts ? 'Hide artifacts' : 'Show artifacts'}
             </button>
-            <button onClick={() => ipc.openSettings()}>Settings</button>
+            <button onClick={() => ipc.openSettings()} title="Settings" aria-label="Settings">
+              ⚙
+            </button>
+            <button onClick={() => void newSession()} title="New chat" aria-label="New chat">
+              <NewChatIcon />
+            </button>
           </div>
         </header>
         {status === 'conflict_goose_desktop' && <StackStatusView status={status} />}

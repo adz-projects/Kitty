@@ -5,6 +5,7 @@ import { useChatStore } from '@/stores/chatStore';
 import { StackStatusView } from '@/components/StackStatusView';
 import { ChatView } from '@/components/chat/ChatView';
 import { RecentSessions } from '@/components/sessions/RecentSessions';
+import { NewChatIcon } from '@/components/icons/NewChatIcon';
 import type { StackStatus } from '@/lib/types';
 
 const DEGRADED: StackStatus[] = ['ollama_down', 'goosed_down', 'no_model', 'provider_unreachable'];
@@ -56,8 +57,22 @@ export function App() {
             <button onClick={() => void expand()} title="Expand to full window">
               Expand
             </button>
-            <button onClick={() => ipc.openSettings()} title="Open settings">
-              Settings
+            <button
+              onClick={() => void ipc.hideOverlay()}
+              title="Hide overlay"
+              aria-label="Hide overlay"
+            >
+              ✕
+            </button>
+            <button onClick={() => ipc.openSettings()} title="Settings" aria-label="Settings">
+              ⚙
+            </button>
+            <button
+              onClick={() => void useChatStore.getState().newSession()}
+              title="New chat"
+              aria-label="New chat"
+            >
+              <NewChatIcon />
             </button>
           </div>
         </div>

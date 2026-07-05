@@ -60,6 +60,8 @@ pub struct Config {
     /// Maps a goosed session id → folder name (app-side organization only).
     #[serde(default)]
     pub session_folders: HashMap<String, String>,
+    /// Whether the main window's artifacts pane is shown (Round-3 item 6).
+    pub show_artifacts: bool,
 }
 
 impl Default for Config {
@@ -81,6 +83,7 @@ impl Default for Config {
             auto_summarize_threshold: None,
             folders: Vec::new(),
             session_folders: HashMap::new(),
+            show_artifacts: true,
         }
     }
 }

@@ -22,7 +22,7 @@ export function SessionList() {
       <div className="session-search">
         <input
           value={query}
-          placeholder="Search sessions…"
+          placeholder="Search chats"
           onChange={(e) => setQuery(e.target.value)}
         />
         <button title="Refresh" onClick={() => void refresh()}>

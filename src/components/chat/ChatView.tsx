@@ -28,14 +28,12 @@ export function ChatView() {
     dismissWarning,
     send,
     cancel,
-    newSession,
     respondApproval,
     addDroppedPaths,
     setWorkingDir,
     bindEvents,
     refreshProvider,
     model,
-    exportSession,
   } = useChatStore();
 
   useEffect(() => {
@@ -62,29 +60,27 @@ export function ChatView() {
   return (
     <div className={`chat${chatOnly ? ' reading' : ''}`}>
       <div className="chat-header">
-        <button
-          className="pill"
-          title={
-            cwd ? `Working directory: ${cwd} — click to change` : 'Click to set a working directory'
-          }
-          onClick={async () => {
-            const dir = await pickFolder();
-            if (dir) await setWorkingDir(dir);
-          }}
-        >
-          {chatOnly ? '💬 thought partner' : `📁 ${folder ?? 'set folder'}`}
-        </button>
+        {chatOnly ? (
+          <span className="pill pill-static">💬 thought partner</span>
+        ) : (
+          <button
+            className="pill"
+            title={
+              cwd
+                ? `Working directory: ${cwd} — click to change`
+                : 'Click to set a working directory'
+            }
+            onClick={async () => {
+              const dir = await pickFolder();
+              if (dir) await setWorkingDir(dir);
+            }}
+          >
+            📁 {folder ?? 'set folder'}
+          </button>
+        )}
         <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
           <ProviderBadge />
           {!chatOnly && <ModeBadge />}
-          {messages.length > 0 && (
-            <button onClick={() => void exportSession()} title="Export this session as ChatML">
-              Export
-            </button>
-          )}
-          <button onClick={() => void newSession()} title="Start a new session">
-            New chat
-          </button>
         </div>
       </div>
 

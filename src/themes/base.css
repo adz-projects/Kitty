@@ -22,6 +22,10 @@ body,
 #root {
   height: 100%;
   margin: 0;
+  /* Kill the outer-document rubber-band/bounce on trackpad scroll (Round-3
+     item 1) — each independently-scrolling panel gets `contain` below so its
+     own overscroll doesn't propagate up to this window-level bounce either. */
+  overscroll-behavior: none;
 }
 
 body {
@@ -79,7 +83,7 @@ button.primary {
   align-items: flex-start;
   justify-content: center;
   height: 100%;
-  padding: 12px;
+  padding: 6px;
 }
 
 .overlay-card {
@@ -113,6 +117,7 @@ button.primary {
   background: var(--bg);
   padding: 24px;
   overflow: auto;
+  overscroll-behavior: contain;
 }
 
 /* --- Stack status / degraded-state panel --- */
@@ -188,6 +193,7 @@ button.primary {
 .message-list {
   flex: 1;
   overflow-y: auto;
+  overscroll-behavior: contain;
   display: flex;
   flex-direction: column;
   gap: 12px;
@@ -407,6 +413,15 @@ button.primary {
 .pill:hover {
   border-color: var(--accent);
   color: var(--text);
+}
+/* Non-interactive variant (Round-3 item 4 — the pill must not look/act
+   clickable in thought-partner mode). */
+.pill-static {
+  cursor: default;
+}
+.pill-static:hover {
+  border-color: var(--border);
+  color: var(--text-muted);
 }
 
 .status-badge {
@@ -675,6 +690,7 @@ button.primary {
 }
 .session-items {
   overflow-y: auto;
+  overscroll-behavior: contain;
   min-height: 0;
 }
 .session-item {
@@ -723,6 +739,7 @@ button.primary {
   border-left: 1px solid var(--border);
   background: var(--surface);
   overflow-y: auto;
+  overscroll-behavior: contain;
 }
 .artifacts-head {
   padding: 12px;
@@ -824,6 +841,7 @@ button.primary {
 }
 .settings-main {
   overflow-y: auto;
+  overscroll-behavior: contain;
   padding: 24px 28px;
 }
 .settings-section {

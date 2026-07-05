@@ -26,7 +26,7 @@ fn url(label: &str) -> WebviewUrl {
 pub fn create_overlay(app: &AppHandle) -> tauri::Result<WebviewWindow> {
     let win = WebviewWindowBuilder::new(app, OVERLAY, url(OVERLAY))
         .title("Kitty")
-        .inner_size(570.0, 480.0)
+        .inner_size(570.0, 576.0)
         .min_inner_size(360.0, 240.0)
         .decorations(false)
         .transparent(true)
@@ -62,7 +62,7 @@ fn place_overlay_bottom_right(win: &WebviewWindow) {
     }
     let outer = win
         .outer_size()
-        .unwrap_or(tauri::PhysicalSize::new(570, 480));
+        .unwrap_or(tauri::PhysicalSize::new(570, 576));
     let margin = 12i32;
     let x = rect.right - outer.width as i32 - margin;
     let y = rect.bottom - outer.height as i32 - margin;
@@ -103,22 +103,30 @@ pub fn toggle_overlay(app: &AppHandle) -> tauri::Result<()> {
     }
 }
 
-/// Lazily create (or reuse) a normal, resizable window.
-fn ensure_window(app: &AppHandle, label: &str, title: &str) -> tauri::Result<WebviewWindow> {
+/// Lazily create (or reuse) a normal, resizable window at the given initial
+/// size (only applies on first creation — an already-open window is reused
+/// as-is, matching prior behavior).
+fn ensure_window(
+    app: &AppHandle,
+    label: &str,
+    title: &str,
+    initial_size: (f64, f64),
+) -> tauri::Result<WebviewWindow> {
     if let Some(win) = app.get_webview_window(label) {
         return Ok(win);
     }
     WebviewWindowBuilder::new(app, label, url(label))
         .title(title)
-        .inner_size(1040.0, 720.0)
+        .inner_size(initial_size.0, initial_size.1)
         .min_inner_size(640.0, 420.0)
         .visible(false)
         .build()
 }
 
-/// Open the full window (Phase 2 binds it to the active session).
+/// Open the full window (Phase 2 binds it to the active session). 15% wider
+/// than the shared settings/wizard default (Round-3 item 3).
 pub fn open_main(app: &AppHandle) -> tauri::Result<()> {
-    let win = ensure_window(app, MAIN, "Kitty")?;
+    let win = ensure_window(app, MAIN, "Kitty", (1196.0, 720.0))?;
     win.show()?;
     win.set_focus()?;
     Ok(())
@@ -137,7 +145,7 @@ pub fn open_settings(
         *app.state::<AppState>().settings_target.lock().unwrap() = Some(target.clone());
         let _ = app.emit("settings://navigate", target);
     }
-    let win = ensure_window(app, SETTINGS, "Kitty Settings")?;
+    let win = ensure_window(app, SETTINGS, "Kitty Settings", (1040.0, 720.0))?;
     win.show()?;
     win.set_focus()?;
     Ok(())
@@ -148,7 +156,7 @@ pub fn open_settings(
 pub fn open_wizard(app: &AppHandle, mode: &str) -> tauri::Result<()> {
     *app.state::<AppState>().wizard_mode.lock().unwrap() = Some(mode.to_string());
     let _ = app.emit("wizard://navigate", json!({ "mode": mode }));
-    let win = ensure_window(app, WIZARD, "Kitty Setup")?;
+    let win = ensure_window(app, WIZARD, "Kitty Setup", (1040.0, 720.0))?;
     win.show()?;
     win.set_focus()?;
     Ok(())
