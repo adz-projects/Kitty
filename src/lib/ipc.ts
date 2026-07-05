@@ -13,6 +13,7 @@ import type {
   Detection,
   EnvVar,
   FileAttachment,
+  FolderData,
   ModeEvent,
   OllamaModel,
   PathInfo,
@@ -50,6 +51,14 @@ export const ipc = {
   loadSession: (sessionId: string, cwd: string) =>
     invoke<SessionInfo>('load_session', { sessionId, cwd }),
   deleteSession: (sessionId: string) => invoke<void>('delete_session', { sessionId }),
+  // Chat folders (Round-2 item 15)
+  listFolders: () => invoke<FolderData>('list_folders'),
+  createFolder: (name: string) => invoke<void>('create_folder', { name }),
+  renameFolder: (oldName: string, newName: string) =>
+    invoke<void>('rename_folder', { old: oldName, new: newName }),
+  deleteFolder: (name: string) => invoke<void>('delete_folder', { name }),
+  assignSessionFolder: (sessionId: string, folder: string | null) =>
+    invoke<void>('assign_session_folder', { sessionId, folder }),
   forkSession: (sessionId: string, cwd: string, truncateFrom: number | null) =>
     invoke<SessionInfo>('fork_session', { sessionId, cwd, truncateFrom }),
   readTextFile: (path: string) => invoke<string>('read_text_file', { path, maxBytes: null }),

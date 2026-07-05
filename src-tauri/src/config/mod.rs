@@ -6,6 +6,7 @@
 pub mod env_helper;
 pub mod providers;
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
@@ -52,6 +53,13 @@ pub struct Config {
     pub strict_remote_mode: bool,
     /// Auto-summarize threshold (Goose setting; app-side until wired).
     pub auto_summarize_threshold: Option<u32>,
+    /// User-defined chat folders (Round-2 item 15). App-side only — layered over
+    /// goosed's session list; not visible to other Goose clients.
+    #[serde(default)]
+    pub folders: Vec<String>,
+    /// Maps a goosed session id → folder name (app-side organization only).
+    #[serde(default)]
+    pub session_folders: HashMap<String, String>,
 }
 
 impl Default for Config {
@@ -71,6 +79,8 @@ impl Default for Config {
             active_provider_id: None,
             strict_remote_mode: false,
             auto_summarize_threshold: None,
+            folders: Vec::new(),
+            session_folders: HashMap::new(),
         }
     }
 }

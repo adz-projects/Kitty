@@ -1,22 +1,41 @@
 // Session history state (Phase 4), backed entirely by goosed's session routes.
+// Chat folders (Round-2 item 15) are an app-side mapping layered on top.
 import { create } from 'zustand';
 import { ipc } from '@/lib/ipc';
 import { parseSession, type SessionSummary } from '@/lib/types';
+
+export const UNCATEGORIZED = 'Uncategorized';
+
+export interface SessionGroup {
+  folder: string; // display name; UNCATEGORIZED for unassigned
+  sessions: SessionSummary[];
+}
 
 interface SessionState {
   sessions: SessionSummary[];
   loading: boolean;
   query: string;
+  folders: string[];
+  assignments: Record<string, string>;
   refresh: () => Promise<void>;
   remove: (sessionId: string) => Promise<void>;
   setQuery: (q: string) => void;
   filtered: () => SessionSummary[];
+  // Folders
+  refreshFolders: () => Promise<void>;
+  createFolder: (name: string) => Promise<void>;
+  renameFolder: (oldName: string, newName: string) => Promise<void>;
+  deleteFolder: (name: string) => Promise<void>;
+  assignFolder: (sessionId: string, folder: string | null) => Promise<void>;
+  grouped: () => SessionGroup[];
 }
 
 export const useSessionStore = create<SessionState>((set, get) => ({
   sessions: [],
   loading: false,
   query: '',
+  folders: [],
+  assignments: {},
 
   refresh: async () => {
     set({ loading: true });
@@ -24,6 +43,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       const raw = await ipc.listSessions();
       const sessions = raw.map(parseSession).sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : -1));
       set({ sessions });
+      await get().refreshFolders();
     } finally {
       set({ loading: false });
     }
@@ -32,6 +52,8 @@ export const useSessionStore = create<SessionState>((set, get) => ({
   remove: async (sessionId: string) => {
     await ipc.deleteSession(sessionId);
     set((s) => ({ sessions: s.sessions.filter((x) => x.sessionId !== sessionId) }));
+    // Drop any dangling folder assignment.
+    if (get().assignments[sessionId]) await get().assignFolder(sessionId, null);
   },
 
   setQuery: (q: string) => set({ query: q }),
@@ -43,5 +65,50 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     return sessions.filter(
       (s) => s.title.toLowerCase().includes(q) || s.cwd.toLowerCase().includes(q)
     );
+  },
+
+  refreshFolders: async () => {
+    try {
+      const data = await ipc.listFolders();
+      set({ folders: data.folders, assignments: data.assignments });
+    } catch {
+      /* leave existing folder state */
+    }
+  },
+
+  createFolder: async (name: string) => {
+    await ipc.createFolder(name);
+    await get().refreshFolders();
+  },
+  renameFolder: async (oldName: string, newName: string) => {
+    await ipc.renameFolder(oldName, newName);
+    await get().refreshFolders();
+  },
+  deleteFolder: async (name: string) => {
+    await ipc.deleteFolder(name);
+    await get().refreshFolders();
+  },
+  assignFolder: async (sessionId: string, folder: string | null) => {
+    await ipc.assignSessionFolder(sessionId, folder);
+    await get().refreshFolders();
+  },
+
+  grouped: () => {
+    const sessions = get().filtered();
+    const { folders, assignments } = get();
+    const byFolder = new Map<string, SessionSummary[]>();
+    for (const f of folders) byFolder.set(f, []);
+    for (const s of sessions) {
+      const f = assignments[s.sessionId];
+      const key = f && folders.includes(f) ? f : UNCATEGORIZED;
+      if (!byFolder.has(key)) byFolder.set(key, []);
+      byFolder.get(key)!.push(s);
+    }
+    const groups: SessionGroup[] = folders.map((f) => ({
+      folder: f,
+      sessions: byFolder.get(f) ?? [],
+    }));
+    groups.push({ folder: UNCATEGORIZED, sessions: byFolder.get(UNCATEGORIZED) ?? [] });
+    return groups;
   },
 }));

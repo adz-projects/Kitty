@@ -216,6 +216,10 @@ function FirstModel({ onBack, onNext }: { onBack: () => void; onNext: () => void
     progress?.total && progress?.completed
       ? Math.round((progress.completed / progress.total) * 100)
       : null;
+  // Installed models that aren't in the curated starter list (Round-2 item 17) —
+  // offered as ready-to-use options so the user needn't download a starter.
+  const starterTags = new Set(STARTER_MODELS.map((m) => m.tag));
+  const otherInstalled = installed.filter((name) => !starterTags.has(name));
 
   return (
     <section className="wizard-panel">
@@ -242,6 +246,27 @@ function FirstModel({ onBack, onNext }: { onBack: () => void; onNext: () => void
           </label>
         ))}
       </div>
+
+      {otherInstalled.length > 0 && (
+        <>
+          <p className="muted">Already installed on this machine:</p>
+          <div className="starter-list">
+            {otherInstalled.map((name) => (
+              <label key={name} className={`starter${selected === name ? ' selected' : ''}`}>
+                <input
+                  type="radio"
+                  name="model"
+                  checked={selected === name}
+                  onChange={() => setSelected(name)}
+                />
+                <div>
+                  <strong>{name}</strong> <span className="status-badge">installed</span>
+                </div>
+              </label>
+            ))}
+          </div>
+        </>
+      )}
 
       {progress && (
         <div className="pull-row">

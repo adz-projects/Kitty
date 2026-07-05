@@ -60,6 +60,12 @@ export interface FileAttachment {
   mime: string | null;
 }
 
+/** App-side chat-folder state (Round-2 item 15): folder list + session→folder map. */
+export interface FolderData {
+  folders: string[];
+  assignments: Record<string, string>;
+}
+
 export interface OllamaModel {
   name: string;
   size: number;
