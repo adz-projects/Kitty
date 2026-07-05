@@ -11,7 +11,7 @@ export interface NotificationPrefs {
 }
 
 export interface Config {
-  hotkey: string;
+  hotkeys: string[];
   use_copilot_key: boolean;
   default_context_folder: string | null;
   ollama_base_url: string;

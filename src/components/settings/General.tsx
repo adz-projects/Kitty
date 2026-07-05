@@ -25,7 +25,8 @@ function accelerator(e: React.KeyboardEvent): string | null {
     per-session; see the chat mode badge) are noted where they live elsewhere. */
 export function General() {
   const { draft, update, save, saved } = useConfigDraft();
-  const [recording, setRecording] = useState(false);
+  // Index of the hotkey row currently capturing a shortcut, or null.
+  const [recording, setRecording] = useState<number | null>(null);
   const [autostart, setAutostart] = useState(false);
 
   useEffect(() => {
@@ -65,27 +66,52 @@ export function General() {
         />
       </label>
 
-      <label className="field">
-        <span>Toggle hotkey</span>
-        <div className="row">
-          <input
-            value={recording ? 'Press a shortcut…' : draft.hotkey}
-            readOnly={recording}
-            onChange={(e) => update({ hotkey: e.target.value })}
-            onKeyDown={(e) => {
-              if (!recording) return;
-              e.preventDefault();
-              const acc = accelerator(e);
-              if (acc) {
-                update({ hotkey: acc });
-                setRecording(false);
+      <div className="field">
+        <span>Toggle hotkeys</span>
+        {draft.hotkeys.map((hk, i) => (
+          <div className="row" key={i}>
+            <input
+              value={recording === i ? 'Press a shortcut…' : hk}
+              readOnly={recording === i}
+              onChange={(e) =>
+                update({ hotkeys: draft.hotkeys.map((h, j) => (j === i ? e.target.value : h)) })
               }
-            }}
-          />
-          <button onClick={() => setRecording((r) => !r)}>{recording ? 'Cancel' : 'Record'}</button>
-        </div>
-        <small className="muted">Save to apply. Takes effect immediately after saving.</small>
-      </label>
+              onKeyDown={(e) => {
+                if (recording !== i) return;
+                e.preventDefault();
+                const acc = accelerator(e);
+                if (acc) {
+                  update({ hotkeys: draft.hotkeys.map((h, j) => (j === i ? acc : h)) });
+                  setRecording(null);
+                }
+              }}
+            />
+            <button onClick={() => setRecording((r) => (r === i ? null : i))}>
+              {recording === i ? 'Cancel' : 'Record'}
+            </button>
+            <button
+              onClick={() => {
+                update({ hotkeys: draft.hotkeys.filter((_, j) => j !== i) });
+                setRecording(null);
+              }}
+              disabled={draft.hotkeys.length <= 1}
+              title={draft.hotkeys.length <= 1 ? 'Keep at least one hotkey' : 'Remove'}
+            >
+              ✕
+            </button>
+          </div>
+        ))}
+        <button
+          className="link"
+          onClick={() => {
+            update({ hotkeys: [...draft.hotkeys, 'Alt+Space'] });
+            setRecording(draft.hotkeys.length);
+          }}
+        >
+          + Add another hotkey
+        </button>
+        <small className="muted">Save to apply. Any of them summons the overlay.</small>
+      </div>
 
       <label className="check">
         <input

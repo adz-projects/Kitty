@@ -108,8 +108,10 @@ export function App() {
           <label className="field">
             <span>Hotkey</span>
             <input
-              value={cfg.hotkey}
-              onChange={(e) => setCfg({ ...cfg, hotkey: e.target.value })}
+              value={cfg.hotkeys[0] ?? ''}
+              onChange={(e) =>
+                setCfg({ ...cfg, hotkeys: [e.target.value, ...cfg.hotkeys.slice(1)] })
+              }
             />
             <small className="muted">
               The Copilot key is used automatically if your keyboard has one.

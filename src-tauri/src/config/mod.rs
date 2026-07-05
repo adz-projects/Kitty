@@ -20,8 +20,12 @@ use providers::ProviderProfile;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    /// Accelerator used for the global toggle shortcut (Phase 6 adds Copilot key).
-    pub hotkey: String,
+    /// Accelerators that toggle the overlay (Round-2 item 3 — was a single
+    /// `hotkey` string; migrated in `load`). Any of them fires the toggle.
+    /// Defaults to empty (not the struct default) so `migrate_hotkeys` can tell a
+    /// pre-Round-2 config apart and seed from the legacy `hotkey` field.
+    #[serde(default = "Vec::new")]
+    pub hotkeys: Vec<String>,
     /// Whether to prefer the hardware Copilot key when observed (Phase 6).
     pub use_copilot_key: bool,
     /// Default working directory for new sessions (Phase 4). `None` until set.
@@ -53,7 +57,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            hotkey: "Alt+Space".to_string(),
+            hotkeys: vec!["Alt+Space".to_string()],
             use_copilot_key: false,
             default_context_folder: None,
             ollama_base_url: "http://localhost:11434".to_string(),
@@ -128,10 +132,25 @@ pub fn themes_dir() -> Result<PathBuf, ConfigError> {
 pub fn load() -> Result<Config, ConfigError> {
     let path = config_path()?;
     match fs::read_to_string(&path) {
-        Ok(text) => Ok(serde_json::from_str(&text)?),
+        Ok(text) => {
+            let config: Config = serde_json::from_str(&text)?;
+            Ok(migrate_hotkeys(config, &text))
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
         Err(e) => Err(e.into()),
     }
+}
+
+/// Seed `hotkeys` from the legacy singular `hotkey` field when a pre-Round-2
+/// config is loaded (Round-2 item 3). No-op once `hotkeys` is populated.
+fn migrate_hotkeys(mut config: Config, raw: &str) -> Config {
+    if config.hotkeys.is_empty() {
+        let legacy = serde_json::from_str::<serde_json::Value>(raw)
+            .ok()
+            .and_then(|v| v.get("hotkey").and_then(|h| h.as_str()).map(String::from));
+        config.hotkeys = vec![legacy.unwrap_or_else(|| "Alt+Space".to_string())];
+    }
+    config
 }
 
 /// Persist config to disk (pretty-printed for hand-inspection).
@@ -149,9 +168,27 @@ mod tests {
     #[test]
     fn defaults_are_sane() {
         let c = Config::default();
-        assert_eq!(c.hotkey, "Alt+Space");
+        assert_eq!(c.hotkeys, vec!["Alt+Space".to_string()]);
         assert!(!c.setup_completed);
         assert!(c.notifications.approval_needed);
+    }
+
+    #[test]
+    fn legacy_hotkey_migrates_to_list() {
+        // A pre-Round-2 config with a custom singular `hotkey` must carry over.
+        let raw = r#"{"hotkey":"Control+Shift+K","theme":"dark"}"#;
+        let cfg: Config = serde_json::from_str(raw).unwrap();
+        assert!(cfg.hotkeys.is_empty()); // field default is empty before migration
+        let cfg = migrate_hotkeys(cfg, raw);
+        assert_eq!(cfg.hotkeys, vec!["Control+Shift+K".to_string()]);
+    }
+
+    #[test]
+    fn missing_hotkey_migrates_to_default() {
+        let raw = r#"{"theme":"dark"}"#;
+        let cfg: Config = serde_json::from_str(raw).unwrap();
+        let cfg = migrate_hotkeys(cfg, raw);
+        assert_eq!(cfg.hotkeys, vec!["Alt+Space".to_string()]);
     }
 
     #[test]
@@ -175,6 +212,6 @@ mod tests {
         // A config written by an older build (only one field) must still load.
         let back: Config = serde_json::from_str(r#"{"theme":"dark"}"#).unwrap();
         assert_eq!(back.theme, "dark");
-        assert_eq!(back.hotkey, "Alt+Space");
+        assert_eq!(back.ollama_base_url, "http://localhost:11434");
     }
 }

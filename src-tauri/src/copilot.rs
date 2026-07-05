@@ -10,14 +10,16 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
+use sysinfo::System;
 use tauri::{AppHandle, Manager};
 use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, VK_F23, VK_LWIN, VK_RWIN, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, DispatchMessageW, GetMessageW, SetWindowsHookExW, TranslateMessage, HHOOK,
-    KBDLLHOOKSTRUCT, MSG, WH_KEYBOARD_LL, WM_KEYDOWN, WM_SYSKEYDOWN,
+    CallNextHookEx, DispatchMessageW, GetForegroundWindow, GetMessageW, GetWindowThreadProcessId,
+    SetWindowsHookExW, ShowWindow, TranslateMessage, HHOOK, KBDLLHOOKSTRUCT, MSG, SW_MINIMIZE,
+    WH_KEYBOARD_LL, WM_KEYDOWN, WM_SYSKEYDOWN,
 };
 
 use crate::config;
@@ -65,7 +67,13 @@ fn on_chord() -> bool {
         let mut cfg = state.config.lock().unwrap();
         if first && !cfg.use_copilot_key {
             cfg.use_copilot_key = true;
-            let _ = config::save(&cfg);
+            // Persist OFF the hook thread (Round-2 item 2a) so we return
+            // LRESULT(1) — the swallow — as fast as possible, minimizing any race
+            // with the OS's own handling of the chord.
+            let snapshot = cfg.clone();
+            std::thread::spawn(move || {
+                let _ = config::save(&snapshot);
+            });
         }
         cfg.use_copilot_key
     };
@@ -80,7 +88,47 @@ fn on_chord() -> bool {
             tracing::warn!("copilot toggle failed: {e}");
         }
     });
+    // Defense-in-depth (Round-2 item 2b): if the OS launched the real Copilot
+    // anyway (some firmware routes it below the hook), minimize it shortly after.
+    std::thread::spawn(dismiss_copilot_window);
     true
+}
+
+/// Best-effort: if the foreground window shortly after the chord belongs to the
+/// Windows Copilot app (`mscopilot.exe`), minimize it. Non-destructive, and a
+/// no-op when the swallow worked (the usual case). Process/window details in
+/// docs/VERSIONS.md — verify on the actual machine, don't rely on this.
+fn dismiss_copilot_window() {
+    std::thread::sleep(std::time::Duration::from_millis(350));
+    // SAFETY: reads the foreground window and its owning process id.
+    let (hwnd, pid) = unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.0.is_null() {
+            return;
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        (hwnd, pid)
+    };
+    if pid != 0 && is_copilot_process(pid) {
+        // SAFETY: minimizing a top-level window is safe and reversible.
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_MINIMIZE);
+        }
+        tracing::info!("minimized a foreground Windows Copilot window after the chord");
+    }
+}
+
+fn is_copilot_process(pid: u32) -> bool {
+    let sys = System::new_all();
+    sys.process(sysinfo::Pid::from_u32(pid))
+        .map(|p| {
+            p.name()
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .starts_with("mscopilot")
+        })
+        .unwrap_or(false)
 }
 
 /// Install the low-level keyboard hook on a dedicated thread with a message loop

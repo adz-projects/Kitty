@@ -36,7 +36,7 @@ pub fn run() {
         tracing::warn!("config load failed ({e}); using defaults");
         config::Config::default()
     });
-    let hotkey_accel = cfg.hotkey.clone();
+    let hotkeys = cfg.hotkeys.clone();
 
     let mut builder = tauri::Builder::default();
 
@@ -112,7 +112,7 @@ pub fn run() {
             let handle = app.handle();
             windows::create_overlay(handle)?;
             tray::create(handle)?;
-            if let Err(e) = hotkey::register(handle, &hotkey_accel) {
+            if let Err(e) = hotkey::register(handle, &hotkeys) {
                 tracing::error!("global hotkey registration failed: {e}");
             }
             // Low-level Copilot-key hook (Windows only).
