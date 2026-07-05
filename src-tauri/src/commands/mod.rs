@@ -275,16 +275,28 @@ pub struct ModeInfo {
 /// The working directory a new session starts in: the configured default
 /// context folder, else `%USERPROFILE%\Documents\Goose` (created if missing).
 fn resolve_cwd(app: &AppHandle) -> String {
-    let configured = {
+    let (configured, chat_only) = {
         let state = app.state::<AppState>();
         let cfg = state.config.lock().unwrap();
-        cfg.default_context_folder.clone()
+        let chat_only = cfg
+            .active_provider_id
+            .as_ref()
+            .and_then(|id| cfg.providers.iter().find(|p| &p.id == id))
+            .map(|p| !p.tools_enabled)
+            .unwrap_or(false);
+        (cfg.default_context_folder.clone(), chat_only)
     };
-    let path = configured.map(PathBuf::from).unwrap_or_else(|| {
-        dirs::document_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("Goose")
-    });
+    // Chat-only ("thought partner") sessions drop any artifacts into Downloads
+    // rather than the agentic context folder (Round-2 item 14c).
+    let path = if chat_only {
+        dirs::download_dir().unwrap_or_else(|| PathBuf::from("."))
+    } else {
+        configured.map(PathBuf::from).unwrap_or_else(|| {
+            dirs::document_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("Goose")
+        })
+    };
     let _ = std::fs::create_dir_all(&path);
     path.to_string_lossy().replace('\\', "/")
 }
@@ -310,6 +322,21 @@ pub async fn new_session(app: AppHandle, cwd: Option<String>) -> Result<SessionI
         .and_then(|v| v.as_str())
         .ok_or("goosed did not return a session id")?
         .to_string();
+
+    // Web search + artifacts should work in EVERY session regardless of the
+    // provider's chat-only flag (Round-2 item 14a). The `computercontroller`
+    // builtin is keyless and provides web search/fetch; best-effort + idempotent.
+    // (Dedicated Brave search additionally needs the mcp-brave-search extension
+    // and a BRAVE_API_KEY — see docs/acp-protocol.md.)
+    let _ = client
+        .request(
+            "_goose/unstable/session/extensions/add",
+            json!({
+                "sessionId": &session_id,
+                "extension": { "type": "builtin", "name": "computercontroller" }
+            }),
+        )
+        .await;
 
     let current_mode = result
         .pointer("/modes/currentModeId")
