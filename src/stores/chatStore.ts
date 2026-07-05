@@ -78,8 +78,12 @@ interface ChatState {
   providerTier: NetworkTier | null;
   providerHost: string | null;
   providerOffline: boolean;
+  isTrusted: boolean;
   model: string | null;
+  /// Non-blocking notice (e.g. attaching to an untrusted provider). Round-2 item 13.
+  warning: string | null;
   bindEvents: () => void;
+  dismissWarning: () => void;
   refreshProvider: () => Promise<void>;
   branch: (uiIndex: number) => Promise<void>;
   regenerate: (assistantIndex: number) => Promise<void>;
@@ -148,7 +152,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
   providerTier: null,
   providerHost: null,
   providerOffline: false,
+  isTrusted: false,
   model: null,
+  warning: null,
+
+  dismissWarning: () => set({ warning: null }),
 
   refreshProvider: async () => {
     try {
@@ -158,6 +166,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         toolsEnabled: active ? active.tools_enabled : true,
         providerTier: active ? active.network_tier : null,
         providerHost: active ? new URL(active.base_url).host : null,
+        isTrusted: active ? active.is_trusted : false,
         model: active?.models[0] ?? null,
       });
     } catch {
@@ -265,20 +274,36 @@ export const useChatStore = create<ChatState>((set, get) => ({
     if (!paths.length) return;
     try {
       const infos = await ipc.inspectPaths(paths);
-      // Chat-only (Phase 9): inline file *content* rather than sending paths
-      // (there's no filesystem tool to hand a path to). Separate code path.
+      // Untrusted-provider warning (Round-2 item 13) — non-blocking, never bans.
+      const { providerTier, isTrusted, providerHost } = get();
+      if (providerTier && providerTier !== 'local' && !isTrusted) {
+        set({
+          warning: `Attaching files will send their contents to ${providerHost ?? 'an untrusted provider'}, which you haven't marked trusted.`,
+        });
+      }
+      // Chat-only (Phase 9): inline file *content* rather than sending paths.
+      // Any file type is accepted now (item 13) — binaries can't be inlined as
+      // text, so they attach as a short descriptor instead of being rejected.
       if (!get().toolsEnabled) {
         for (const f of infos) {
           if (f.is_dir) continue;
           try {
-            const content = await ipc.readTextFile(f.path);
-            get().addPastedText(content, f.name);
+            const file = await ipc.readFileAny(f.path);
+            if (file.kind === 'text') {
+              get().addPastedText(file.content, f.name);
+            } else {
+              get().addPastedText(
+                `[Attached file "${f.name}" — ${file.mime ?? 'binary'}; contents not inlined.]`,
+                f.name
+              );
+            }
           } catch (e) {
             set({ error: String(e) });
           }
         }
         return;
       }
+      // Agentic: hand paths to the filesystem tools (works for any file type).
       set((s) => {
         const seen = new Set(s.droppedFiles.map((f) => f.path));
         return { droppedFiles: [...s.droppedFiles, ...infos.filter((f) => !seen.has(f.path))] };

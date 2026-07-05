@@ -5,6 +5,9 @@ import 'highlight.js/styles/github.css';
 import { useChatStore, type Message } from '@/stores/chatStore';
 import { ToolCallCard } from './ToolCallCard';
 import { ReasoningPanel } from './ReasoningPanel';
+import { CodeBlock } from './CodeBlock';
+
+const MARKDOWN_COMPONENTS = { pre: CodeBlock };
 
 /** One chat message. User turns render as a plain bubble; assistant turns render
     markdown, with an optional collapsible reasoning block and tool cards. Hover
@@ -64,7 +67,11 @@ export function MessageItem({ message, index }: { message: Message; index: numbe
       ))}
       {message.text && (
         <div className="bubble markdown">
-          <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]}>
+          <ReactMarkdown
+            remarkPlugins={[remarkGfm]}
+            rehypePlugins={[rehypeHighlight]}
+            components={MARKDOWN_COMPONENTS}
+          >
             {message.text}
           </ReactMarkdown>
         </div>

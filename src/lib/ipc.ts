@@ -12,6 +12,7 @@ import type {
   Config,
   Detection,
   EnvVar,
+  FileAttachment,
   ModeEvent,
   OllamaModel,
   PathInfo,
@@ -52,6 +53,7 @@ export const ipc = {
   forkSession: (sessionId: string, cwd: string, truncateFrom: number | null) =>
     invoke<SessionInfo>('fork_session', { sessionId, cwd, truncateFrom }),
   readTextFile: (path: string) => invoke<string>('read_text_file', { path, maxBytes: null }),
+  readFileAny: (path: string) => invoke<FileAttachment>('read_file_any', { path, maxBytes: null }),
   writeFile: (path: string, content: string) => invoke<void>('write_file', { path, content }),
   inspectPaths: (paths: string[]) => invoke<PathInfo[]>('inspect_paths', { paths }),
   openPath: (path: string) => invoke<void>('open_path', { path }),

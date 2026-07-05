@@ -547,6 +547,67 @@ pub fn read_text_file(path: String, max_bytes: Option<usize>) -> Result<String, 
         .map_err(|_| "That looks like a binary file — only text can be attached here.".to_string())
 }
 
+/// A file attached to a chat, classified as UTF-8 text or binary (Round-2 item 13).
+#[derive(Debug, Clone, Serialize)]
+pub struct FileAttachment {
+    pub name: String,
+    /// `"text"` or `"binary"`.
+    pub kind: String,
+    /// Text content for `text`; a `data:<mime>;base64,…` URL for `binary`.
+    pub content: String,
+    pub mime: Option<String>,
+}
+
+/// Read a dropped file for attachment to ANY provider (Round-2 item 13): UTF-8
+/// files come back as text; anything else as a base64 data URL. Binaries are no
+/// longer rejected. Capped (default 1 MB) so we don't inline huge payloads.
+#[tauri::command]
+pub fn read_file_any(path: String, max_bytes: Option<usize>) -> Result<FileAttachment, String> {
+    let cap = max_bytes.unwrap_or(1024 * 1024);
+    let name = std::path::Path::new(&path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(&path)
+        .to_string();
+    let meta = std::fs::metadata(&path).map_err(|e| format!("could not open file: {e}"))?;
+    if meta.len() as usize > cap {
+        return Err(format!("File is too large to attach (> {} KB).", cap / 1024));
+    }
+    let bytes = std::fs::read(&path).map_err(|e| format!("could not read file: {e}"))?;
+    match String::from_utf8(bytes) {
+        Ok(text) => Ok(FileAttachment {
+            name,
+            kind: "text".into(),
+            content: text,
+            mime: Some("text/plain".into()),
+        }),
+        Err(e) => {
+            use base64::Engine;
+            let bytes = e.into_bytes();
+            let ext = std::path::Path::new(&path)
+                .extension()
+                .and_then(|x| x.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let mime = match ext.as_str() {
+                "png" => "image/png",
+                "jpg" | "jpeg" => "image/jpeg",
+                "gif" => "image/gif",
+                "webp" => "image/webp",
+                "pdf" => "application/pdf",
+                _ => "application/octet-stream",
+            };
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            Ok(FileAttachment {
+                name,
+                kind: "binary".into(),
+                content: format!("data:{mime};base64,{b64}"),
+                mime: Some(mime.to_string()),
+            })
+        }
+    }
+}
+
 /// Delete a session (ACP `session/delete`).
 #[tauri::command]
 pub async fn delete_session(app: AppHandle, session_id: String) -> Result<(), String> {

@@ -1,5 +1,5 @@
 import { useEffect } from 'react';
-import { onFileDrop } from '@/lib/ipc';
+import { onFileDrop, pickFolder } from '@/lib/ipc';
 import { useChatStore } from '@/stores/chatStore';
 import { supportsReasoning } from '@/lib/reasoning_models';
 import { MessageList } from './MessageList';
@@ -24,11 +24,14 @@ export function ChatView() {
     toolsEnabled,
     providerHost,
     providerOffline,
+    warning,
+    dismissWarning,
     send,
     cancel,
     newSession,
     respondApproval,
     addDroppedPaths,
+    setWorkingDir,
     bindEvents,
     refreshProvider,
     model,
@@ -59,9 +62,18 @@ export function ChatView() {
   return (
     <div className={`chat${chatOnly ? ' reading' : ''}`}>
       <div className="chat-header">
-        <span className="pill" title={cwd ?? undefined}>
-          {chatOnly ? '💬 thought partner' : `📁 ${folder ?? 'no session'}`}
-        </span>
+        <button
+          className="pill"
+          title={
+            cwd ? `Working directory: ${cwd} — click to change` : 'Click to set a working directory'
+          }
+          onClick={async () => {
+            const dir = await pickFolder();
+            if (dir) await setWorkingDir(dir);
+          }}
+        >
+          {chatOnly ? '💬 thought partner' : `📁 ${folder ?? 'set folder'}`}
+        </button>
         <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
           <ProviderBadge />
           {!chatOnly && <ModeBadge />}
@@ -80,6 +92,16 @@ export function ChatView() {
         <div className="conflict-banner" role="status">
           <span className="status-dot bad" />
           Can’t reach {providerHost ?? 'the provider'} — check Tailscale / your connection.
+        </div>
+      )}
+
+      {warning && (
+        <div className="conflict-banner" role="status">
+          <span className="status-dot warn" />
+          <span style={{ flex: 1 }}>{warning}</span>
+          <button className="link" onClick={dismissWarning}>
+            Dismiss
+          </button>
         </div>
       )}
 

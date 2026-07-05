@@ -52,6 +52,14 @@ export interface ProviderView extends ProviderProfile {
   active: boolean;
 }
 
+/** A file attached to a chat (Round-2 item 13): UTF-8 text, or a base64 data URL. */
+export interface FileAttachment {
+  name: string;
+  kind: 'text' | 'binary';
+  content: string;
+  mime: string | null;
+}
+
 export interface OllamaModel {
   name: string;
   size: number;

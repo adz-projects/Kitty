@@ -20,9 +20,11 @@ fn url(label: &str) -> WebviewUrl {
     WebviewUrl::App(format!("src/windows/{label}/index.html").into())
 }
 
-/// Build the overlay up front, hidden. Called once from `setup`.
+/// Build the overlay up front, hidden. Called once from `setup`. Positioned once
+/// at the lower-right of the primary monitor's work area, just above the taskbar
+/// (Round-2 item 7); the user can still drag it elsewhere afterward.
 pub fn create_overlay(app: &AppHandle) -> tauri::Result<WebviewWindow> {
-    WebviewWindowBuilder::new(app, OVERLAY, url(OVERLAY))
+    let win = WebviewWindowBuilder::new(app, OVERLAY, url(OVERLAY))
         .title("Kitty")
         .inner_size(570.0, 480.0)
         .min_inner_size(360.0, 240.0)
@@ -30,10 +32,45 @@ pub fn create_overlay(app: &AppHandle) -> tauri::Result<WebviewWindow> {
         .transparent(true)
         .always_on_top(true)
         .skip_taskbar(true)
-        .center()
         .visible(false)
-        .build()
+        .build()?;
+    place_overlay_bottom_right(&win);
+    Ok(win)
 }
+
+/// Move the overlay to the lower-right of the primary monitor's *work area*
+/// (which excludes the taskbar), with a small margin. Uses physical pixels so it
+/// lands correctly regardless of DPI scaling.
+#[cfg(windows)]
+fn place_overlay_bottom_right(win: &WebviewWindow) {
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SystemParametersInfoW, SPI_GETWORKAREA, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+    };
+    let mut rect = RECT::default();
+    // SAFETY: SPI_GETWORKAREA writes the primary monitor's work rect into `rect`.
+    let ok = unsafe {
+        SystemParametersInfoW(
+            SPI_GETWORKAREA,
+            0,
+            Some(&mut rect as *mut _ as *mut core::ffi::c_void),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    };
+    if ok.is_err() {
+        return;
+    }
+    let outer = win
+        .outer_size()
+        .unwrap_or(tauri::PhysicalSize::new(570, 480));
+    let margin = 12i32;
+    let x = rect.right - outer.width as i32 - margin;
+    let y = rect.bottom - outer.height as i32 - margin;
+    let _ = win.set_position(tauri::PhysicalPosition::new(x, y));
+}
+
+#[cfg(not(windows))]
+fn place_overlay_bottom_right(_win: &WebviewWindow) {}
 
 /// Show + focus the overlay, creating it if it somehow went away.
 pub fn show_overlay(app: &AppHandle) -> tauri::Result<()> {

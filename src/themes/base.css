@@ -233,6 +233,40 @@ button.primary {
   font-family: ui-monospace, 'Cascadia Code', Consolas, monospace;
   font-size: 12.5px;
 }
+/* Fenced code block with a Copy/Download header (Round-2 item 12). */
+.code-block {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  margin: 6px 0;
+}
+.code-block-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 4px 8px 4px 10px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+}
+.code-lang {
+  font-size: 11px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.code-actions {
+  display: flex;
+  gap: 6px;
+}
+.code-actions button {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 6px;
+}
+.code-block pre {
+  margin: 0;
+  border-radius: 0;
+}
 .markdown :not(pre) > code {
   background: var(--surface-2);
   padding: 1px 5px;
@@ -368,6 +402,11 @@ button.primary {
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
+  cursor: pointer;
+}
+.pill:hover {
+  border-color: var(--accent);
+  color: var(--text);
 }
 
 .status-badge {
