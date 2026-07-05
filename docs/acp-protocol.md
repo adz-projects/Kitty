@@ -116,6 +116,15 @@ Shape: `{ sessionId, update: { sessionUpdate: <variant>, ... } }`. Variants seen
   requires a `BRAVE_API_KEY` env). The `computercontroller` builtin also provides
   general web/computer tools without a key. So "web search in every mode" either
   enables `mcp-brave-search` (needs the user's key) or leans on `computercontroller`.
+- **Custom mcp extension `server.env` shape confirmed as an array** (Round-3
+  item 14 probe): `{name, command, args: [...], env: [...]}` — a bare string
+  array (e.g. `["KEY=VALUE"]`), matching the `mcp-brave-search` example's
+  `"env": []`, not a key-value map. The shape validates and goosed attempts to
+  spawn the process; a bogus one-shot command (e.g. `echo`, or `node --version`)
+  fails at the process level (`IO error: program not found` / `process quit
+  before initialization`) rather than at JSON-schema validation — confirming the
+  shape itself is correct (a real long-running MCP stdio server is needed for a
+  full end-to-end success, not tested here).
 
 ### Recipes / skills — NOT an ACP session param (Round-2 Batch 0)
 

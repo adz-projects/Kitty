@@ -85,8 +85,22 @@ export const ipc = {
   // Extensions
   listExtensions: (sessionId: string) =>
     invoke<Record<string, unknown>[]>('list_extensions', { sessionId }),
-  setExtensionEnabled: (sessionId: string, name: string, enabled: boolean) =>
-    invoke<void>('set_extension_enabled', { sessionId, name, enabled }),
+  setExtensionEnabled: (
+    sessionId: string,
+    name: string,
+    enabled: boolean,
+    extType?: string,
+    server?: unknown
+  ) =>
+    invoke<void>('set_extension_enabled', {
+      sessionId,
+      name,
+      enabled,
+      extType: extType ?? null,
+      server: server ?? null,
+    }),
+  addExtension: (sessionId: string, name: string, command: string, args: string[], env: string[]) =>
+    invoke<void>('add_extension', { sessionId, name, command, args, env }),
   // Settings deep link
   getSettingsTarget: () => invoke<SettingsTarget | null>('get_settings_target'),
   // Theming

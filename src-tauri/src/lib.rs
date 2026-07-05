@@ -101,6 +101,7 @@ pub fn run() {
             commands::restart_ollama,
             commands::list_extensions,
             commands::set_extension_enabled,
+            commands::add_extension,
             commands::get_settings_target,
             commands::list_themes,
             commands::read_user_theme,
