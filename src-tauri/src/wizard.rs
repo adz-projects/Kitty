@@ -23,6 +23,12 @@ pub struct DepStatus {
     pub installed: bool,
     pub version: Option<String>,
     pub path: Option<String>,
+    /// Latest released version, if the GitHub Releases check succeeded
+    /// (Round-3 item 29). `None` on any lookup failure — never blocks detection.
+    pub latest_version: Option<String>,
+    /// `Some(true)` when `version` is a parseable semver strictly older than
+    /// `latest_version`; `None` if either side didn't parse or wasn't found.
+    pub is_outdated: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -43,7 +49,64 @@ fn run_version(bin: &Path) -> Option<String> {
     (!v.is_empty()).then(|| v.to_string())
 }
 
-/// Detect Ollama + Goose: presence, version, and resolved path.
+/// GitHub repos whose Releases API we check for the latest version (item 29).
+const OLLAMA_REPO: &str = "ollama/ollama";
+const GOOSE_REPO: &str = "block/goose";
+
+/// Fetch a repo's latest release tag via the GitHub Releases API. GitHub
+/// requires a `User-Agent`; failures (offline, rate-limited, etc.) return
+/// `None` and never block the rest of detection.
+async fn latest_github_release(repo: &str) -> Option<String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .user_agent("kitty-app")
+        .build()
+        .ok()?;
+    let url = format!("https://api.github.com/repos/{repo}/releases/latest");
+    let json: serde_json::Value = client.get(url).send().await.ok()?.json().await.ok()?;
+    json.get("tag_name")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim_start_matches('v').to_string())
+}
+
+/// Find the first semver-shaped token in free-form text (CLI `--version`
+/// output and GitHub tags both tend to be "mostly semver with noise around
+/// it" rather than guaranteed-clean). Loosely pads 2-component versions
+/// (`0.31` → `0.31.0`) since Ollama/Goose version strings aren't always
+/// strictly 3-component.
+fn find_semver(text: &str) -> Option<semver::Version> {
+    for word in text.split_whitespace() {
+        let w = word
+            .trim_start_matches(['v', 'V'])
+            .trim_matches(|c: char| !c.is_ascii_digit() && c != '.');
+        if let Ok(v) = semver::Version::parse(w) {
+            return Some(v);
+        }
+        let core: String = w.chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+        if core.is_empty() {
+            continue;
+        }
+        if let Ok(v) = semver::Version::parse(&core) {
+            return Some(v);
+        }
+        if core.split('.').count() == 2 {
+            if let Ok(v) = semver::Version::parse(&format!("{core}.0")) {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+/// `Some(true)` iff both sides parse as semver and `installed < latest`.
+fn is_outdated(installed: Option<&str>, latest: Option<&str>) -> Option<bool> {
+    let cur = find_semver(installed?)?;
+    let lat = find_semver(latest?)?;
+    Some(cur < lat)
+}
+
+/// Detect Ollama + Goose: presence, version, resolved path, and (best-effort)
+/// whether a newer release is available.
 pub async fn detect(base_url: &str) -> Detection {
     // Ollama: prefer the running server's version, else the binary.
     let ollama_bin = ollama_proc::locate_ollama();
@@ -71,16 +134,25 @@ pub async fn detect(base_url: &str) -> Detection {
     let goose_installed = goose_bin.exists();
     let goose_ver = goose_installed.then(|| run_version(&goose_bin)).flatten();
 
+    let (ollama_latest, goose_latest) = tokio::join!(
+        latest_github_release(OLLAMA_REPO),
+        latest_github_release(GOOSE_REPO)
+    );
+
     Detection {
         ollama: DepStatus {
             installed: ollama_installed,
+            is_outdated: is_outdated(ollama_ver.as_deref(), ollama_latest.as_deref()),
             version: ollama_ver,
             path: ollama_bin.exists().then(|| ollama_bin.display().to_string()),
+            latest_version: ollama_latest,
         },
         goose: DepStatus {
             installed: goose_installed,
+            is_outdated: is_outdated(goose_ver.as_deref(), goose_latest.as_deref()),
             version: goose_ver,
             path: goose_installed.then(|| goose_bin.display().to_string()),
+            latest_version: goose_latest,
         },
     }
 }
@@ -147,4 +219,21 @@ pub fn setup_completed(app: &AppHandle) -> bool {
         .lock()
         .unwrap()
         .setup_completed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_outdated_detects_older_installed_version() {
+        assert_eq!(is_outdated(Some("0.31.1"), Some("0.32.0")), Some(true));
+        assert_eq!(
+            is_outdated(Some("ollama version is 1.41.0"), Some("v1.41.0")),
+            Some(false)
+        );
+        assert_eq!(is_outdated(Some("0.31"), Some("0.31.0")), Some(false));
+        assert_eq!(is_outdated(None, Some("1.0.0")), None);
+        assert_eq!(is_outdated(Some("not a version"), Some("1.0.0")), None);
+    }
 }

@@ -432,6 +432,10 @@ button.primary {
   border: 1px solid var(--border);
   color: var(--text-muted);
 }
+.status-badge-warn {
+  border-color: var(--warn);
+  color: var(--warn);
+}
 
 .typing {
   display: inline-block;

@@ -99,6 +99,8 @@ export interface DepStatus {
   installed: boolean;
   version: string | null;
   path: string | null;
+  latest_version: string | null;
+  is_outdated: boolean | null;
 }
 
 export interface Detection {

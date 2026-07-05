@@ -152,6 +152,11 @@ export function App() {
   );
 }
 
+const RELEASES_URL: Record<'ollama' | 'goose', string> = {
+  ollama: 'https://github.com/ollama/ollama/releases/latest',
+  goose: 'https://github.com/block/goose/releases/latest',
+};
+
 function DepRow({
   name,
   dep,
@@ -159,7 +164,12 @@ function DepRow({
   onChanged,
 }: {
   name: string;
-  dep: { installed: boolean; version: string | null };
+  dep: {
+    installed: boolean;
+    version: string | null;
+    latest_version: string | null;
+    is_outdated: boolean | null;
+  };
   which: 'ollama' | 'goose';
   onChanged: () => void;
 }) {
@@ -172,6 +182,14 @@ function DepRow({
           <span className="status-badge">✓ {dep.version ?? 'installed'}</span>
         ) : (
           <span className="status-badge">not found</span>
+        )}
+        {dep.is_outdated && (
+          <>
+            {' '}
+            <span className="status-badge status-badge-warn">
+              Update available: {dep.latest_version}
+            </span>
+          </>
         )}
       </div>
       {!dep.installed && (
@@ -191,6 +209,9 @@ function DepRow({
         >
           {busy ? 'Launching installer…' : 'Install'}
         </button>
+      )}
+      {dep.is_outdated && (
+        <button onClick={() => void ipc.openPath(RELEASES_URL[which])}>View release</button>
       )}
     </div>
   );
