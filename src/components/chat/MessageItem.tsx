@@ -76,6 +76,15 @@ export function MessageItem({ message, index }: { message: Message; index: numbe
           </ReactMarkdown>
         </div>
       )}
+      {(message.durationMs != null || message.inputTokens != null) && (
+        <div className="muted msg-meta">
+          {message.durationMs != null && `⏱ ${(message.durationMs / 1000).toFixed(1)}s`}
+          {message.inputTokens != null &&
+            message.outputTokens != null &&
+            ` · ${message.inputTokens}→${message.outputTokens} tok`}
+          {message.providerName && ` · ${message.providerName}`}
+        </div>
+      )}
       {actions}
     </div>
   );

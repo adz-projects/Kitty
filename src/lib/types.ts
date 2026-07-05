@@ -168,7 +168,11 @@ export interface SessionTitleEvent {
 
 export interface CompleteEvent {
   session_id: string;
-  result: { stopReason?: string; usage?: Record<string, number> };
+  result: {
+    stopReason?: string;
+    /** Confirmed ACP `session/prompt` result shape (docs/acp-protocol.md). */
+    usage?: { totalTokens?: number; inputTokens?: number; outputTokens?: number };
+  };
 }
 
 export interface ChatErrorEvent {

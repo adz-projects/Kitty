@@ -45,6 +45,14 @@ export interface Message {
   streaming: boolean;
   /** Currently being appended to (internal to the assembly). */
   open: boolean;
+  // Per-response metrics (Round-3 item 2) — only set on a message that just
+  // completed via a live send() in this session; replayed/resumed messages
+  // (session/load) never go through send_prompt's completion path, so they
+  // won't have these, which is expected.
+  durationMs?: number;
+  inputTokens?: number;
+  outputTokens?: number;
+  providerName?: string;
 }
 
 export interface Artifact {
@@ -80,6 +88,8 @@ interface ChatState {
   providerOffline: boolean;
   isTrusted: boolean;
   model: string | null;
+  /** Active provider's display name, for the per-response metrics line (Round-3 item 2). */
+  providerName: string | null;
   /// Non-blocking notice (e.g. attaching to an untrusted provider). Round-2 item 13.
   warning: string | null;
   bindEvents: () => void;
@@ -110,6 +120,10 @@ interface ChatState {
 }
 
 let bound = false;
+// Timestamp of the most recent send() call, for the per-response duration
+// metric (Round-3 item 2) — module-level like `bound`/`msgSeq` below, since
+// there's only ever one in-flight prompt per active session.
+let lastSentAt: number | null = null;
 let msgSeq = 0;
 const newId = () => `m${Date.now()}_${++msgSeq}`;
 
@@ -154,6 +168,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   providerOffline: false,
   isTrusted: false,
   model: null,
+  providerName: null,
   warning: null,
 
   dismissWarning: () => set({ warning: null }),
@@ -168,9 +183,16 @@ export const useChatStore = create<ChatState>((set, get) => ({
         providerHost: active ? new URL(active.base_url).host : null,
         isTrusted: active ? active.is_trusted : false,
         model: active?.models[0] ?? null,
+        providerName: active ? active.name || active.provider_type : null,
       });
     } catch {
-      set({ toolsEnabled: true, providerTier: null, providerHost: null, model: null });
+      set({
+        toolsEnabled: true,
+        providerTier: null,
+        providerHost: null,
+        model: null,
+        providerName: null,
+      });
     }
   },
 
@@ -426,6 +448,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       error: null,
     }));
     try {
+      lastSentAt = performance.now();
       await ipc.sendPrompt(sessionId, promptText);
       // Chat-only: auto-promote the *first* overlay message to the full window.
       if (chatOnly && firstMessage && windowLabel() === 'overlay') {
@@ -556,7 +579,23 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
     void onComplete((e) => {
       if (!forActive(e.session_id)) return;
-      set((s) => ({ busy: false, pendingApprovals: [], messages: closeOpen(s.messages) }));
+      const durationMs = lastSentAt != null ? performance.now() - lastSentAt : undefined;
+      lastSentAt = null;
+      const usage = e.result.usage;
+      set((s) => {
+        const msgs = closeOpen(s.messages);
+        const lastIdx = msgs.length - 1;
+        if (lastIdx >= 0 && msgs[lastIdx].role === 'assistant') {
+          msgs[lastIdx] = {
+            ...msgs[lastIdx],
+            durationMs,
+            inputTokens: usage?.inputTokens,
+            outputTokens: usage?.outputTokens,
+            providerName: s.providerName ?? undefined,
+          };
+        }
+        return { busy: false, pendingApprovals: [], messages: msgs };
+      });
     });
     void onChatError((e) => {
       if (!forActive(e.session_id)) return;

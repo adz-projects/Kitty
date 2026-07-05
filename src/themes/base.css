@@ -456,6 +456,11 @@ button.primary {
   border-radius: 6px;
   background: transparent;
 }
+/* Per-response metrics line — duration/tokens/provider (Round-3 item 2). */
+.msg-meta {
+  font-size: 11px;
+  margin-top: 2px;
+}
 
 /* Chat-only ("thought partner") mode: a wider, calmer reading column. */
 .chat.reading .message-list {
