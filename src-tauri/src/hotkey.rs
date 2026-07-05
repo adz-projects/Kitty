@@ -27,8 +27,8 @@ pub fn register(app: &AppHandle, accelerators: &[String]) -> Result<(), String> 
         match gs.on_shortcut(shortcut, move |_app, _shortcut, event| {
             // Fire on key press only, not release, to avoid a double toggle.
             if event.state == tauri_plugin_global_shortcut::ShortcutState::Pressed {
-                if let Err(e) = windows::toggle_overlay(&handle) {
-                    tracing::warn!("toggle_overlay from hotkey failed: {e}");
+                if let Err(e) = windows::toggle_or_focus_main(&handle) {
+                    tracing::warn!("toggle_or_focus_main from hotkey failed: {e}");
                 }
             }
         }) {

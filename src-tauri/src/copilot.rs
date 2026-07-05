@@ -84,7 +84,7 @@ fn on_chord() -> bool {
     // Toggle on the main thread (window ops must not run on the hook thread).
     let app2 = app.clone();
     let _ = app.run_on_main_thread(move || {
-        if let Err(e) = crate::windows::toggle_overlay(&app2) {
+        if let Err(e) = crate::windows::toggle_or_focus_main(&app2) {
             tracing::warn!("copilot toggle failed: {e}");
         }
     });

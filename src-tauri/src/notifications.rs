@@ -2,7 +2,6 @@
 //! hidden (CLAUDE.md Phase 3). Per-event toggles come from app config.
 
 use tauri::{AppHandle, Manager};
-use tauri_plugin_notification::NotificationExt;
 
 use crate::config::NotificationPrefs;
 use crate::state::AppState;
@@ -36,6 +35,10 @@ fn overlay_visible(app: &AppHandle) -> bool {
 }
 
 /// Send a notification if the overlay is hidden and the event is enabled.
+/// Clicking the notification opens the main window (Round-3 item 27) — built
+/// via `notify-rust` directly rather than `tauri_plugin_notification`'s
+/// `.show()`, which discards the toast's activation handle and gives us no way
+/// to detect a click at all.
 pub fn notify_if_hidden(app: &AppHandle, event: Event, title: &str, body: &str) {
     if overlay_visible(app) {
         return;
@@ -48,14 +51,40 @@ pub fn notify_if_hidden(app: &AppHandle, event: Event, title: &str, body: &str) 
     if !enabled {
         return;
     }
-    if let Err(e) = app
-        .notification()
-        .builder()
-        .title(title)
-        .body(body)
-        .show()
+
+    let mut n = notify_rust::Notification::new();
+    n.summary(title).body(body).auto_icon();
+    #[cfg(windows)]
     {
-        tracing::warn!("notification failed: {e}");
+        // Only set the AUMID for the installed app — matches
+        // tauri-plugin-notification's own dev-vs-installed check, otherwise a
+        // dev build (no registered shortcut) fails to show anything at all.
+        if let Ok(exe) = tauri::utils::platform::current_exe() {
+            if let Some(dir) = exe.parent() {
+                let d = dir.display().to_string();
+                if !d.ends_with("target\\debug") && !d.ends_with("target\\release") {
+                    n.app_id(&app.config().identifier);
+                }
+            }
+        }
+    }
+
+    match n.show() {
+        Ok(handle) => {
+            let app2 = app.clone();
+            std::thread::spawn(move || {
+                let _ =
+                    handle.wait_for_response(move |response: &notify_rust::NotificationResponse| {
+                        if response.is_default_action() {
+                            let app3 = app2.clone();
+                            let _ = app2.run_on_main_thread(move || {
+                                let _ = windows::open_main(&app3);
+                            });
+                        }
+                    });
+            });
+        }
+        Err(e) => tracing::warn!("notification failed: {e}"),
     }
 }
 

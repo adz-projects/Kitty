@@ -22,7 +22,7 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
             "toggle_overlay" => {
-                let _ = windows::toggle_overlay(app);
+                let _ = windows::toggle_or_focus_main(app);
             }
             "new_session" => {
                 let _ = windows::show_overlay(app);
@@ -44,7 +44,7 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
                 ..
             } = event
             {
-                let _ = windows::toggle_overlay(tray.app_handle());
+                let _ = windows::toggle_or_focus_main(tray.app_handle());
             }
         });
 

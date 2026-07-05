@@ -174,6 +174,20 @@ pub fn toggle_overlay(app: &AppHandle) -> tauri::Result<()> {
     }
 }
 
+/// The tray-click / hotkey action (Round-3 item 28): the overlay and main
+/// window are never both active at once — if main is already open, focus it
+/// instead of also summoning the overlay; otherwise fall through to the usual
+/// overlay toggle.
+pub fn toggle_or_focus_main(app: &AppHandle) -> tauri::Result<()> {
+    if let Some(win) = app.get_webview_window(MAIN) {
+        if win.is_visible().unwrap_or(false) {
+            win.set_focus()?;
+            return Ok(());
+        }
+    }
+    toggle_overlay(app)
+}
+
 /// Lazily create (or reuse) a normal, resizable window at the given initial
 /// size (only applies on first creation — an already-open window is reused
 /// as-is, matching prior behavior).
