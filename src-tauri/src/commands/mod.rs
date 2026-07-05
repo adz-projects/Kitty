@@ -421,6 +421,7 @@ pub async fn send_prompt(
                     "Kitty finished",
                     "Your task is complete.",
                 );
+                providers::emit_health_from_send_result(&app_bg, true);
             }
             Err(message) => {
                 let _ = app_bg.emit(
@@ -433,6 +434,7 @@ pub async fn send_prompt(
                     "Kitty ran into a problem",
                     &message,
                 );
+                providers::emit_health_from_send_result(&app_bg, false);
             }
         }
         // A finished turn clears any pending-approval tray state.

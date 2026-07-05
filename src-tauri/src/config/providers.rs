@@ -4,8 +4,11 @@
 //! provider by injecting Goose's env vars when we (re)spawn `goose serve`.
 
 use serde::{Deserialize, Serialize};
+use serde_json::json;
+use tauri::{AppHandle, Emitter, Manager};
 
 use crate::config::Config;
+use crate::state::AppState;
 
 const KEYRING_SERVICE: &str = "goose-overlay";
 
@@ -71,6 +74,32 @@ pub fn active_ollama_target(config: &Config) -> Option<(String, String)> {
     }
     let model = active.models.first()?.clone();
     Some((active.base_url.clone(), model))
+}
+
+/// Reachability for Personal/Remote providers is derived from real send
+/// outcomes (Round-3 item 19, revised) rather than a speculative background
+/// ping — this app makes no inference calls of its own, so a failed/succeeded
+/// `session/prompt` is a strictly better signal than a periodic GET. Call this
+/// from `send_prompt`'s completion handler with whether that send succeeded;
+/// it's a no-op for a `Local`-tier active provider (which has nothing to be
+/// unreachable in the Tailscale/cloud sense — the local stack loop covers it).
+pub fn emit_health_from_send_result(app: &AppHandle, reachable: bool) {
+    let active = {
+        let state = app.state::<AppState>();
+        let cfg = state.config.lock().unwrap();
+        cfg.active_provider_id
+            .as_ref()
+            .and_then(|id| cfg.providers.iter().find(|p| &p.id == id).cloned())
+    };
+    let Some(p) = active.filter(|p| !matches!(network_tier_for(&p.base_url), NetworkTier::Local))
+    else {
+        return;
+    };
+    let host = host_of(&p.base_url);
+    let _ = app.emit(
+        "provider://health",
+        json!({ "reachable": reachable, "host": host, "name": p.name }),
+    );
 }
 
 /// Extract the host from a base URL and classify its network tier.
