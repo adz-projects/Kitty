@@ -95,6 +95,17 @@ pub fn start_stack(app: &AppHandle) {
             Err(e) => tracing::warn!("goosed spawn failed: {e}"),
         }
 
+        // 2b. If the active provider is a local Ollama model, warm it into memory
+        // and keep it resident (Round-2 item 5).
+        let warm = {
+            let state = app.state::<AppState>();
+            let cfg = state.config.lock().unwrap();
+            crate::config::providers::active_ollama_target(&cfg)
+        };
+        if let Some((base, model)) = warm {
+            crate::ollama::keep_alive_load(&base, &model).await;
+        }
+
         // 3. Begin the periodic health loops.
         spawn_health_loop(app.clone());
         spawn_provider_health_loop(app);

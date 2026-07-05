@@ -169,6 +169,9 @@ export interface ProviderHealth {
 export const onProviderHealth = (cb: (h: ProviderHealth) => void) =>
   listen<ProviderHealth>('provider://health', (e) => cb(e.payload));
 
+/** Fired after a provider is (de)activated + goosed respawns (Round-2 item 4). */
+export const onProviderActivated = (cb: () => void) => listen('provider://activated', () => cb());
+
 /** The label of the window this webview is running in (`overlay` / `main` / …). */
 export const windowLabel = (): string => getCurrentWebview().label;
 

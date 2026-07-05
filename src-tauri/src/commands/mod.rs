@@ -680,6 +680,13 @@ pub fn delete_provider(state: tauri::State<'_, AppState>, id: String) -> Result<
 /// choice and restarts goosed so the provider env takes effect.
 #[tauri::command]
 pub async fn activate_provider(app: AppHandle, id: Option<String>) -> Result<(), String> {
+    // Capture the previously-active Ollama model so we can evict it after the
+    // switch (Round-2 item 5) — read before we overwrite active_provider_id.
+    let prev_ollama = {
+        let state = app.state::<AppState>();
+        let cfg = state.config.lock().unwrap();
+        providers::active_ollama_target(&cfg)
+    };
     {
         let state = app.state::<AppState>();
         let mut cfg = state.config.lock().unwrap();
@@ -691,7 +698,30 @@ pub async fn activate_provider(app: AppHandle, id: Option<String>) -> Result<(),
         cfg.active_provider_id = id;
         config::save(&cfg).map_err(|e| e.to_string())?;
     }
-    restart_goosed(app).await
+    restart_goosed(app.clone()).await?;
+
+    // Tell the frontend to re-sync provider state immediately (Round-2 item 4) —
+    // without this the UI drifts until the next session create/load or health tick.
+    let _ = app.emit("provider://activated", ());
+
+    // Warm the new local Ollama model + evict the old one in the background
+    // (Round-2 item 5) — don't make the switch wait on model load.
+    let new_ollama = {
+        let state = app.state::<AppState>();
+        let cfg = state.config.lock().unwrap();
+        providers::active_ollama_target(&cfg)
+    };
+    tauri::async_runtime::spawn(async move {
+        if let Some((base, model)) = &new_ollama {
+            ollama::keep_alive_load(base, model).await;
+        }
+        if let Some((base, model)) = &prev_ollama {
+            if Some((base, model)) != new_ollama.as_ref().map(|(b, m)| (b, m)) {
+                ollama::keep_alive_release(base, model).await;
+            }
+        }
+    });
+    Ok(())
 }
 
 // ============================ Phase 5: Ollama ============================

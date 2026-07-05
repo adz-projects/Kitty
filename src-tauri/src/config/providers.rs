@@ -58,6 +58,21 @@ impl ProviderProfile {
     }
 }
 
+/// If the active provider is an Ollama profile with a chosen model, return its
+/// `(base_url, model)` — used to warm/evict the model in Ollama's memory
+/// (Round-2 item 5). `None` for non-Ollama or model-less profiles.
+pub fn active_ollama_target(config: &Config) -> Option<(String, String)> {
+    let active = config
+        .active_provider_id
+        .as_ref()
+        .and_then(|id| config.providers.iter().find(|p| &p.id == id))?;
+    if active.provider_type != "ollama" {
+        return None;
+    }
+    let model = active.models.first()?.clone();
+    Some((active.base_url.clone(), model))
+}
+
 /// Extract the host from a base URL and classify its network tier.
 pub fn network_tier_for(base_url: &str) -> NetworkTier {
     let host = host_of(base_url);

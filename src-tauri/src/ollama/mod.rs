@@ -1,7 +1,8 @@
 //! Ollama model management (Phase 5): list installed models, pull with live
-//! progress, delete. We never call generate/chat here — inference goes through
-//! goosed. Pull progress is streamed to the UI as `ollama://pull-progress`
-//! events keyed by `pull_id` (supports concurrent pulls).
+//! progress, delete. Inference goes through goosed — the one exception is the
+//! keep-alive warm/evict calls below (Round-2 item 5), which issue an empty
+//! `/api/generate` purely to pin a model in memory. Pull progress is streamed to
+//! the UI as `ollama://pull-progress` events keyed by `pull_id`.
 
 use futures_util::StreamExt;
 use serde::Serialize;
@@ -40,6 +41,31 @@ pub async fn delete_model(base_url: &str, model: &str) -> Result<(), String> {
     } else {
         Err(format!("Ollama returned {}", resp.status()))
     }
+}
+
+/// Warm a model into Ollama's memory and pin it (Round-2 item 5): `/api/generate`
+/// with an empty prompt and `keep_alive: -1` (resident until released).
+pub async fn keep_alive_load(base_url: &str, model: &str) {
+    warm(base_url, model, -1).await;
+}
+
+/// Evict a previously kept-alive model now (`keep_alive: 0`).
+pub async fn keep_alive_release(base_url: &str, model: &str) {
+    warm(base_url, model, 0).await;
+}
+
+/// Best-effort keep-alive call. Failures are ignored — this is a warm-up, not a
+/// correctness-critical path (goosed still owns real inference).
+async fn warm(base_url: &str, model: &str, keep_alive: i64) {
+    if model.is_empty() {
+        return;
+    }
+    let url = format!("{}/api/generate", base(base_url));
+    let _ = reqwest::Client::new()
+        .post(url)
+        .json(&json!({ "model": model, "prompt": "", "stream": false, "keep_alive": keep_alive }))
+        .send()
+        .await;
 }
 
 #[derive(Clone, Serialize)]

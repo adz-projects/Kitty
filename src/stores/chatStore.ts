@@ -10,6 +10,7 @@ import {
   onComplete,
   onMessageDelta,
   onMode,
+  onProviderActivated,
   onProviderHealth,
   onReasoningDelta,
   onSessionTitle,
@@ -516,6 +517,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
     void onProviderHealth((h) => {
       set({ providerOffline: !h.reachable, providerHost: h.host ?? get().providerHost });
     });
+    // Provider (de)activated → re-sync provider-derived state immediately so the
+    // UI doesn't drift until the next session or health tick (Round-2 item 4).
+    void onProviderActivated(() => void get().refreshProvider());
     void onApprovalNeeded((e) => {
       if (!forActive(e.session_id)) return;
       set((s) =>

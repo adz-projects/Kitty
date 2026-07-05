@@ -29,7 +29,7 @@ Read `goose-overlay-project-description.md` in the repo root for the full produc
 ### Ollama
 - Base URL: `http://localhost:11434` (configurable).
 - `GET /api/tags` — list installed models. `POST /api/pull` `{"model": "<name>"}` — streaming NDJSON with `status`, `total`, `completed` per layer; drive progress bars from this. `DELETE /api/delete` — remove model. `GET /api/version` — health check.
-- We never call generate/chat on Ollama — inference goes through goosed.
+- We never call generate/chat on Ollama for **inference** — that goes through goosed. The one exception (Round-2 item 5) is an *empty* `/api/generate` with `keep_alive: -1`/`0` used solely to warm/evict a model in Ollama's memory when the active provider changes (`src-tauri/src/ollama/mod.rs::keep_alive_load/release`).
 
 ## Repository layout
 

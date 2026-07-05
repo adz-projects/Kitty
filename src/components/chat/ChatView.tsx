@@ -6,13 +6,9 @@ import { MessageList } from './MessageList';
 import { Composer } from './Composer';
 import { ApprovalPrompt } from './ApprovalPrompt';
 import { ModeBadge } from './ModeBadge';
+import { ProviderBadge } from './ProviderBadge';
 import { FileChips } from './FileChips';
 import { AttachmentChips } from './AttachmentChips';
-
-const TIER_LABEL: Record<string, string> = {
-  personal: '🔒 private network',
-  remote: '☁ remote',
-};
 
 /** The shared chat surface used by both the overlay and the full window
     (CLAUDE.md rule 5). In chat-only mode (tools_enabled:false) it hides the
@@ -26,7 +22,6 @@ export function ChatView() {
     title,
     pendingApprovals,
     toolsEnabled,
-    providerTier,
     providerHost,
     providerOffline,
     send,
@@ -56,7 +51,6 @@ export function ChatView() {
     busy &&
     (!last || last.role === 'user' || (last.role === 'assistant' && !last.text && !last.reasoning));
   const chatOnly = !toolsEnabled;
-  const tierBadge = providerTier && TIER_LABEL[providerTier];
   // Predictive hint for the thinking indicator (the reasoning panel itself is
   // content-driven). True if the model is known-reasoning or reasoning already began.
   const thinkingReasoning =
@@ -69,12 +63,7 @@ export function ChatView() {
           {chatOnly ? '💬 thought partner' : `📁 ${folder ?? 'no session'}`}
         </span>
         <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-          {tierBadge && (
-            <span className="status-badge" title={providerHost ?? undefined}>
-              {tierBadge}
-              {providerHost ? `: ${providerHost}` : ''}
-            </span>
-          )}
+          <ProviderBadge />
           {!chatOnly && <ModeBadge />}
           {messages.length > 0 && (
             <button onClick={() => void exportSession()} title="Export this session as ChatML">
