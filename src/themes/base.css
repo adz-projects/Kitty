@@ -672,11 +672,12 @@ button.primary {
   font-size: 11px;
 }
 .session-row-actions {
+  position: absolute;
+  top: 8px;
+  right: 10px;
   display: flex;
   align-items: center;
   gap: 6px;
-  margin-top: 4px;
-  justify-content: flex-end;
 }
 .session-kebab {
   border: none;
