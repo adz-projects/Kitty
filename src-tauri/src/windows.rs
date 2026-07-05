@@ -24,8 +24,8 @@ fn url(label: &str) -> WebviewUrl {
 pub fn create_overlay(app: &AppHandle) -> tauri::Result<WebviewWindow> {
     WebviewWindowBuilder::new(app, OVERLAY, url(OVERLAY))
         .title("Goose")
-        .inner_size(760.0, 480.0)
-        .min_inner_size(420.0, 240.0)
+        .inner_size(570.0, 480.0)
+        .min_inner_size(360.0, 240.0)
         .decorations(false)
         .transparent(true)
         .always_on_top(true)

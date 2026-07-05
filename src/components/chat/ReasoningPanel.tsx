@@ -1,9 +1,8 @@
 import { useState } from 'react';
 
-/** Collapsible reasoning trace shown above the final answer (Phase 10). While
-    the model is still reasoning (streaming, no answer yet) it auto-expands so the
-    user can watch; once the final answer starts it auto-collapses — unless the
-    user has manually pinned it. Always re-expandable later. */
+/** Collapsible reasoning trace shown above the final answer (Phase 10). Closed
+    by default — the panel never auto-expands, even while reasoning streams; the
+    user opens it explicitly and it stays as they leave it. Always re-expandable. */
 export function ReasoningPanel({
   reasoning,
   streaming,
@@ -13,16 +12,16 @@ export function ReasoningPanel({
   streaming: boolean;
   hasAnswer: boolean;
 }) {
-  // null = follow the automatic behavior; true/false = user pinned open/closed.
+  // null = follow the default (closed); true/false = user opened/closed it.
   const [pinned, setPinned] = useState<boolean | null>(null);
-  const auto = streaming && !hasAnswer;
-  const open = pinned ?? auto;
+  const streamingReasoning = streaming && !hasAnswer;
+  const open = pinned ?? false;
 
   return (
     <div className={`reasoning${open ? ' open' : ''}`}>
       <button className="reasoning-summary" onClick={() => setPinned(!open)}>
         <span className="reasoning-caret">{open ? '▾' : '▸'}</span>
-        {auto ? 'Reasoning…' : 'Reasoning'}
+        {streamingReasoning ? 'Reasoning…' : 'Reasoning'}
       </button>
       {open && <div className="reasoning-body">{reasoning}</div>}
     </div>

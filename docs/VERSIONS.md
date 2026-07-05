@@ -28,6 +28,19 @@ done until this file is updated and the affected code (`goosed/api.rs`,
 
 - **Process name(s) to match:** _TBD (record exact names after checking the pinned release)._
 
+## Windows Copilot app (Round-2 item 2 — best-effort close after swallowing the chord)
+
+- **Appx package:** `Microsoft.Copilot`, PackageFamilyName
+  `Microsoft.Copilot_8wekyb3d8bbwe` (verified on this machine 2026-07-05).
+- **Process name(s):** `mscopilot.exe` (several instances seen); also `M365Copilot`
+  (the Microsoft 365 Copilot app — a *different* thing, don't target it).
+- **Window class:** _not yet captured_ — no Copilot window was visible during the
+  probe, so its top-level window class/title is TBD. Capture it live (e.g. with
+  `EnumWindows` + `GetClassName` while a Copilot window is open) before wiring the
+  defense-in-depth close in `copilot.rs`; the mitigation is best-effort and must
+  not block on getting this exactly right (some OEM Copilot keys are handled by
+  Windows below the `WH_KEYBOARD_LL` layer and can't be fully intercepted).
+
 ## File-writing tool names (Phase 4 artifacts heuristic)
 
 - **Tool-name patterns treated as artifact producers:** developer `text_editor`

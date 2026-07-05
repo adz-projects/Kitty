@@ -503,6 +503,10 @@ button.primary {
   display: flex;
   flex-direction: column;
   min-width: 0;
+  /* min-height:0 lets this grid item shrink to its track so only .message-list
+     scrolls — without it the grid item keeps min-height:auto (content size) and
+     the whole document scrolls instead. */
+  min-height: 0;
   padding: 12px 16px;
   gap: 8px;
 }

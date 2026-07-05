@@ -92,5 +92,41 @@ Shape: `{ sessionId, update: { sessionUpdate: <variant>, ... } }`. Variants seen
   profile persists it and restarts goosed. Secrets come from the keyring.
 - **Extensions:** session-scoped `_goose/unstable/session/extensions/list|add|remove`.
 - **Sessions:** `session/list`, `session/load`, `session/delete` (all confirmed).
+
+### Extensions — probed shapes (Round-2 Batch 0, 2026-07-05)
+
+- `_goose/unstable/session/extensions/list` `{ sessionId }` → `{ extensions: [ … ] }`.
+  Entry shape is **tagged by `type`** and differs per type:
+  - `builtin` / `platform`: `{ type, name, description, display_name, bundled, timeout? }`
+  - `mcp`: `{ type: "mcp", server: { name, command, args, env }, envKeys: [ … ], description, timeout }`
+    — **⚠ mcp entries have NO top-level `name`; the identity lives at `server.name`.**
+    This is the source of the "blank checkbox" bug (Round-2 item 23): the frontend
+    reads `e.name`, which is `undefined` for every mcp extension. Fallback must be
+    `e.name ?? e.display_name ?? e.server?.name ?? '(unnamed)'`.
+  - The list response carries **no per-entry `enabled` flag** — enable/disable state
+    is not returned here (frontend currently assumes `enabled !== false` = on).
+- `_goose/unstable/session/extensions/add` `{ sessionId, extension: <Extension> }`.
+  `<Extension>` is the same tagged enum: `type` ∈ { `builtin`, `platform`, `mcp` }
+  (NOT `stdio`/`sse`). `{ type: "builtin", name: "memory" }` succeeds. A **custom
+  stdio/HTTP server** is added as `type: "mcp"` with a `server` object
+  `{ name, command, args, env }` (mirrors the list shape). Missing `type` →
+  `missing field \`type\``; bad type → `unknown variant …, expected one of builtin, platform, mcp`.
+- **Web-search capability** (Round-2 item 14a): the bundled search extension is
+  `mcp-brave-search` (MCP: `npx -y @modelcontextprotocol/server-brave-search`,
+  requires a `BRAVE_API_KEY` env). The `computercontroller` builtin also provides
+  general web/computer tools without a key. So "web search in every mode" either
+  enables `mcp-brave-search` (needs the user's key) or leans on `computercontroller`.
+
+### Recipes / skills — NOT an ACP session param (Round-2 Batch 0)
+
+- `session/new` **silently ignores unknown fields** — probing it with `recipe` /
+  `recipePath` / `instructions` / `systemPrompt` all returned OK, but that only
+  means they were dropped, not honored. There is **no ACP method to launch a recipe**.
+- Goose recipes are **file-based YAML**, run via the CLI: `goose run --recipe
+  <name|full-path> [--params KEY=VALUE] [--sub-recipe …]`, plus `goose recipe
+  {list,validate,deeplink,open}`. `goose skills {list}` is a **separate** subcommand.
+  → Round-2 item 16 ("recipes") is **Path B** (a separate `goose run --recipe`
+  process outside the shared `goose serve`) — an architecture escalation to surface
+  to the user before building (see Round-2 plan Batch 7).
 - `fs/read_text_file`, `fs/write_text_file` — only if we advertise the capability
   (we set both `false` for now), so respond method-not-found otherwise.
