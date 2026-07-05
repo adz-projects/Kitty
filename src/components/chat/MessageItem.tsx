@@ -3,8 +3,7 @@ import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
 import 'highlight.js/styles/github.css';
 import { useChatStore, type Message } from '@/stores/chatStore';
-import { ToolCallCard } from './ToolCallCard';
-import { ReasoningPanel } from './ReasoningPanel';
+import { ThinkingBox } from './ThinkingBox';
 import { CodeBlock } from './CodeBlock';
 
 const MARKDOWN_COMPONENTS = { pre: CodeBlock };
@@ -55,16 +54,14 @@ export function MessageItem({ message, index }: { message: Message; index: numbe
 
   return (
     <div className="msg msg-assistant">
-      {message.reasoning && (
-        <ReasoningPanel
+      {(message.reasoning || message.toolCalls.length > 0) && (
+        <ThinkingBox
           reasoning={message.reasoning}
+          toolCalls={message.toolCalls}
           streaming={message.streaming}
           hasAnswer={message.text.length > 0}
         />
       )}
-      {message.toolCalls.map((tc) => (
-        <ToolCallCard key={tc.id} call={tc} />
-      ))}
       {message.text && (
         <div className="bubble markdown">
           <ReactMarkdown

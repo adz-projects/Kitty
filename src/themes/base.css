@@ -301,9 +301,20 @@ button.primary {
   border-left: 2px solid var(--border);
   padding-left: 8px;
   margin-top: 4px;
-  white-space: pre-wrap;
   max-height: 260px;
   overflow: auto;
+}
+.reasoning-text {
+  white-space: pre-wrap;
+}
+.reasoning-tools {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 6px;
+}
+.reasoning-text + .reasoning-tools {
+  margin-top: 10px;
 }
 
 /* Thinking indicator (Phase 10) */
