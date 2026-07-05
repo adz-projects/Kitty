@@ -23,7 +23,7 @@ fn url(label: &str) -> WebviewUrl {
 /// Build the overlay up front, hidden. Called once from `setup`.
 pub fn create_overlay(app: &AppHandle) -> tauri::Result<WebviewWindow> {
     WebviewWindowBuilder::new(app, OVERLAY, url(OVERLAY))
-        .title("Goose")
+        .title("Kitty")
         .inner_size(570.0, 480.0)
         .min_inner_size(360.0, 240.0)
         .decorations(false)
@@ -81,7 +81,7 @@ fn ensure_window(app: &AppHandle, label: &str, title: &str) -> tauri::Result<Web
 
 /// Open the full window (Phase 2 binds it to the active session).
 pub fn open_main(app: &AppHandle) -> tauri::Result<()> {
-    let win = ensure_window(app, MAIN, "Goose")?;
+    let win = ensure_window(app, MAIN, "Kitty")?;
     win.show()?;
     win.set_focus()?;
     Ok(())
@@ -100,7 +100,7 @@ pub fn open_settings(
         *app.state::<AppState>().settings_target.lock().unwrap() = Some(target.clone());
         let _ = app.emit("settings://navigate", target);
     }
-    let win = ensure_window(app, SETTINGS, "Goose Settings")?;
+    let win = ensure_window(app, SETTINGS, "Kitty Settings")?;
     win.show()?;
     win.set_focus()?;
     Ok(())
@@ -111,7 +111,7 @@ pub fn open_settings(
 pub fn open_wizard(app: &AppHandle, mode: &str) -> tauri::Result<()> {
     *app.state::<AppState>().wizard_mode.lock().unwrap() = Some(mode.to_string());
     let _ = app.emit("wizard://navigate", json!({ "mode": mode }));
-    let win = ensure_window(app, WIZARD, "Goose Setup")?;
+    let win = ensure_window(app, WIZARD, "Kitty Setup")?;
     win.show()?;
     win.set_focus()?;
     Ok(())

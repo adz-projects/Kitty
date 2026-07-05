@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <g fill="#111111">
+    <!-- Long tail: a low crescent sweeping from the seated rear far to the left,
+         thinning to a slightly up-curled tip. -->
+    <path d="M 330 400
+             C 300 452 190 486 104 474
+             C 58 468 52 430 92 434
+             C 96 410 118 404 140 420
+             C 200 452 286 442 322 388
+             C 336 392 340 388 330 400 Z"/>
+    <!-- Sitting body (slender teardrop) blending up into the head. -->
+    <path d="M 322 128
+             C 384 140 404 236 396 322
+             C 389 398 352 448 288 448
+             C 230 448 198 402 200 338
+             C 204 232 226 152 276 134
+             C 290 129 306 127 322 128 Z"/>
+    <!-- Head. -->
+    <circle cx="322" cy="146" r="74"/>
+    <!-- Front (left) ear. -->
+    <path d="M 266 122 L 250 44 L 324 98 Z"/>
+    <!-- Back (right) ear. -->
+    <path d="M 378 116 L 398 40 L 330 90 Z"/>
+  </g>
+</svg>

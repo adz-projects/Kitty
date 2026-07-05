@@ -132,7 +132,7 @@ export function General() {
             setAutostart(e.target.checked);
           }}
         />
-        <span>Start Goose Overlay when I sign in</span>
+        <span>Start Kitty when I sign in</span>
       </label>
 
       <p className="muted">

@@ -32,7 +32,7 @@ export function App() {
       <SessionList />
       <div className="main-center">
         <header className="main-header">
-          <h1>Goose</h1>
+          <h1>Kitty</h1>
           <div style={{ display: 'flex', gap: 8 }}>
             <button onClick={() => setShowArtifacts((v) => !v)}>
               {showArtifacts ? 'Hide artifacts' : 'Show artifacts'}

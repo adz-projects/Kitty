@@ -17,7 +17,7 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
     let menu = Menu::with_items(app, &[&toggle, &new_session, &sep, &settings, &sep, &quit])?;
 
     let mut builder = TrayIconBuilder::with_id("main-tray")
-        .tooltip("Goose Overlay")
+        .tooltip("Kitty")
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {

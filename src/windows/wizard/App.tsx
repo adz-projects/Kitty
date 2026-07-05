@@ -55,7 +55,7 @@ export function App() {
 
       {step === 0 && (
         <section className="wizard-panel">
-          <h1>{mode === 'repair' ? 'Repair setup' : 'Welcome to Goose Overlay'}</h1>
+          <h1>{mode === 'repair' ? 'Repair setup' : 'Welcome to Kitty'}</h1>
           <p className="muted">Let’s make sure Ollama and Goose are installed.</p>
           {detecting && <p>Detecting…</p>}
           {det && (
@@ -136,7 +136,7 @@ export function App() {
         <section className="wizard-panel">
           <h1>You’re all set 🎉</h1>
           <p className="muted">
-            Press your hotkey (or the Copilot key) any time to summon Goose. You can re-run this
+            Press your hotkey (or the Copilot key) any time to summon Kitty. You can re-run this
             from Settings → Setup &amp; Repair.
           </p>
           <div className="wizard-actions">

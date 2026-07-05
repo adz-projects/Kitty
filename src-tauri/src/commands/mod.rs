@@ -365,7 +365,7 @@ pub async fn send_prompt(app: AppHandle, session_id: String, text: String) -> Re
                 notifications::notify_if_hidden(
                     &app_bg,
                     notifications::Event::TaskComplete,
-                    "Goose finished",
+                    "Kitty finished",
                     "Your task is complete.",
                 );
             }
@@ -377,7 +377,7 @@ pub async fn send_prompt(app: AppHandle, session_id: String, text: String) -> Re
                 notifications::notify_if_hidden(
                     &app_bg,
                     notifications::Event::TaskFailed,
-                    "Goose ran into a problem",
+                    "Kitty ran into a problem",
                     &message,
                 );
             }

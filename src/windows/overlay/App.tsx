@@ -50,7 +50,7 @@ export function App() {
         style={{ display: 'flex', flexDirection: 'column', height: '100%' }}
       >
         <div className="overlay-titlebar" data-tauri-drag-region>
-          <strong>Goose</strong>
+          <strong>Kitty</strong>
           <div style={{ display: 'flex', gap: 8 }}>
             <RecentSessions />
             <button onClick={() => void expand()} title="Expand to full window">

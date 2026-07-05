@@ -36,7 +36,7 @@ export function Composer({
         rows={1}
         autoFocus
         value={text}
-        placeholder="Ask Goose…"
+        placeholder="Ask Kitty…"
         onChange={(e) => {
           setText(e.target.value);
           e.target.style.height = 'auto';
