@@ -5,10 +5,17 @@
 //! `main`/`settings`/`wizard` windows are created lazily on first use ("hidden
 //! until used") and reused thereafter.
 
+use std::time::Duration;
+
 use serde_json::json;
 use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 
 use crate::state::AppState;
+
+/// Slide-animation tuning (Round-3 follow-up: overlay rises from/sinks into the
+/// taskbar rather than snapping visible/hidden).
+const ANIM_STEPS: u32 = 14;
+const ANIM_STEP_MS: u64 = 12;
 
 pub const OVERLAY: &str = "overlay";
 pub const MAIN: &str = "main";
@@ -38,11 +45,11 @@ pub fn create_overlay(app: &AppHandle) -> tauri::Result<WebviewWindow> {
     Ok(win)
 }
 
-/// Move the overlay to the lower-right of the primary monitor's *work area*
-/// (which excludes the taskbar), with a small margin. Uses physical pixels so it
-/// lands correctly regardless of DPI scaling.
+/// The overlay's resting (x, y) — lower-right of the primary monitor's *work
+/// area* (which excludes the taskbar), with a small margin. Physical pixels so
+/// it lands correctly regardless of DPI scaling.
 #[cfg(windows)]
-fn place_overlay_bottom_right(win: &WebviewWindow) {
+fn overlay_target_position(win: &WebviewWindow) -> Option<(i32, i32)> {
     use windows::Win32::Foundation::RECT;
     use windows::Win32::UI::WindowsAndMessaging::{
         SystemParametersInfoW, SPI_GETWORKAREA, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
@@ -58,7 +65,7 @@ fn place_overlay_bottom_right(win: &WebviewWindow) {
         )
     };
     if ok.is_err() {
-        return;
+        return None;
     }
     let outer = win
         .outer_size()
@@ -66,11 +73,73 @@ fn place_overlay_bottom_right(win: &WebviewWindow) {
     let margin = 12i32;
     let x = rect.right - outer.width as i32 - margin;
     let y = rect.bottom - outer.height as i32 - margin;
-    let _ = win.set_position(tauri::PhysicalPosition::new(x, y));
+    Some((x, y))
 }
 
 #[cfg(not(windows))]
-fn place_overlay_bottom_right(_win: &WebviewWindow) {}
+fn overlay_target_position(_win: &WebviewWindow) -> Option<(i32, i32)> {
+    None
+}
+
+/// Position the overlay at its resting spot (used once, at creation).
+fn place_overlay_bottom_right(win: &WebviewWindow) {
+    if let Some((x, y)) = overlay_target_position(win) {
+        let _ = win.set_position(tauri::PhysicalPosition::new(x, y));
+    }
+}
+
+/// Slide the overlay up from just below the work-area's bottom edge (as if
+/// rising out of the taskbar) to its resting position, then focus it. Falls
+/// back to a plain show if the work-area geometry can't be read.
+fn animate_overlay_in(win: &WebviewWindow) {
+    let Some((x, target_y)) = overlay_target_position(win) else {
+        let _ = win.show();
+        let _ = win.set_focus();
+        return;
+    };
+    let outer = win
+        .outer_size()
+        .unwrap_or(tauri::PhysicalSize::new(570, 576));
+    let start_y = target_y + outer.height as i32;
+    let _ = win.set_position(tauri::PhysicalPosition::new(x, start_y));
+    let _ = win.show();
+    let _ = win.set_focus();
+    let win = win.clone();
+    tauri::async_runtime::spawn(async move {
+        for step in 1..=ANIM_STEPS {
+            let t = f64::from(step) / f64::from(ANIM_STEPS);
+            let y = f64::from(start_y) + (f64::from(target_y) - f64::from(start_y)) * t;
+            let _ = win.set_position(tauri::PhysicalPosition::new(x, y.round() as i32));
+            tokio::time::sleep(Duration::from_millis(ANIM_STEP_MS)).await;
+        }
+        let _ = win.set_position(tauri::PhysicalPosition::new(x, target_y));
+    });
+}
+
+/// Slide the overlay down below the work-area's bottom edge (as if sinking
+/// back into the taskbar), then hide it. Falls back to a plain hide if the
+/// work-area geometry can't be read.
+fn animate_overlay_out(win: &WebviewWindow) {
+    let Some((x, target_y)) = overlay_target_position(win) else {
+        let _ = win.hide();
+        return;
+    };
+    let outer = win
+        .outer_size()
+        .unwrap_or(tauri::PhysicalSize::new(570, 576));
+    let end_y = target_y + outer.height as i32;
+    let start_y = win.outer_position().map(|p| p.y).unwrap_or(target_y);
+    let win = win.clone();
+    tauri::async_runtime::spawn(async move {
+        for step in 1..=ANIM_STEPS {
+            let t = f64::from(step) / f64::from(ANIM_STEPS);
+            let y = f64::from(start_y) + (f64::from(end_y) - f64::from(start_y)) * t;
+            let _ = win.set_position(tauri::PhysicalPosition::new(x, y.round() as i32));
+            tokio::time::sleep(Duration::from_millis(ANIM_STEP_MS)).await;
+        }
+        let _ = win.hide();
+    });
+}
 
 /// Show + focus the overlay, creating it if it somehow went away.
 pub fn show_overlay(app: &AppHandle) -> tauri::Result<()> {
@@ -78,15 +147,14 @@ pub fn show_overlay(app: &AppHandle) -> tauri::Result<()> {
         Some(w) => w,
         None => create_overlay(app)?,
     };
-    win.show()?;
-    win.set_focus()?;
+    animate_overlay_in(&win);
     Ok(())
 }
 
 /// Hide the overlay (kept alive for instant re-summon).
 pub fn hide_overlay(app: &AppHandle) -> tauri::Result<()> {
     if let Some(win) = app.get_webview_window(OVERLAY) {
-        win.hide()?;
+        animate_overlay_out(&win);
     }
     Ok(())
 }
@@ -94,10 +162,13 @@ pub fn hide_overlay(app: &AppHandle) -> tauri::Result<()> {
 /// Toggle overlay visibility — the global-hotkey / tray action.
 pub fn toggle_overlay(app: &AppHandle) -> tauri::Result<()> {
     match app.get_webview_window(OVERLAY) {
-        Some(win) if win.is_visible().unwrap_or(false) => win.hide(),
+        Some(win) if win.is_visible().unwrap_or(false) => {
+            animate_overlay_out(&win);
+            Ok(())
+        }
         Some(win) => {
-            win.show()?;
-            win.set_focus()
+            animate_overlay_in(&win);
+            Ok(())
         }
         None => show_overlay(app),
     }

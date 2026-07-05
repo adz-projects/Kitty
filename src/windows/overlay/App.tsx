@@ -6,6 +6,7 @@ import { StackStatusView } from '@/components/StackStatusView';
 import { ChatView } from '@/components/chat/ChatView';
 import { RecentSessions } from '@/components/sessions/RecentSessions';
 import { NewChatIcon } from '@/components/icons/NewChatIcon';
+import { DoubleChevronIcon } from '@/components/icons/DoubleChevronIcon';
 import type { StackStatus } from '@/lib/types';
 
 const DEGRADED: StackStatus[] = ['ollama_down', 'goosed_down', 'no_model', 'provider_unreachable'];
@@ -54,15 +55,15 @@ export function App() {
           <strong>Kitty</strong>
           <div style={{ display: 'flex', gap: 8 }}>
             <RecentSessions />
-            <button onClick={() => void expand()} title="Expand to full window">
-              Expand
+            <button onClick={() => void expand()} title="Expand to full window" aria-label="Expand">
+              <DoubleChevronIcon direction="up" />
             </button>
             <button
               onClick={() => void ipc.hideOverlay()}
               title="Hide overlay"
               aria-label="Hide overlay"
             >
-              ✕
+              <DoubleChevronIcon direction="down" />
             </button>
             <button onClick={() => ipc.openSettings()} title="Settings" aria-label="Settings">
               ⚙
