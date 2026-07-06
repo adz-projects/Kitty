@@ -59,6 +59,26 @@ done until this file is updated and the affected code (`goosed/api.rs`,
   positive where a plain `text_editor` "view" registered as a bogus artifact.
   Heuristic still errs toward false negatives, never fabricates (CLAUDE.md).
 
+## Where files land — session cwd vs. goose's default (Round-5)
+
+- **The per-chat working directory is honored.** Kitty passes each session's cwd
+  (`Documents/Kitty/chats/<id>/`, from `resolve_cwd`) to `session/new`, and goose
+  respects it: probed live (2026-07-06) `echo %CD%` from the shell tool returned
+  the exact chat folder, and a relative-path `text_editor` write (`notes.txt`)
+  landed there. So relative writes go to the right place per chat.
+- **But the model tends to use goose's absolute default for some outputs.**
+  goose's built-in default working directory is `~/Documents/Goose`; when asked
+  to "export a docx," the model was writing to an absolute `~/Documents/Goose/…`
+  path instead of a relative one, so exports piled up there. That's a model/goose
+  behavior, not a Kitty cwd bug (the cwd is already correct).
+- **Mitigation (soft nudge):** `goosed_env()` sets `GOOSE_MOIM_MESSAGE_TEXT`
+  (consumed by goose's bundled `tom` / "Top Of Mind" platform extension, which
+  injects it into every turn) instructing the model to save files into the
+  current working directory using relative paths, not an absolute
+  `~/Documents/Goose` path. Confirmed live the model receives it (quoted the text
+  back verbatim) and chose a relative path afterward. It's a prompt-level nudge,
+  not a hard guarantee — a model can still ignore it and write elsewhere.
+
 ## Artifact writes by provider — Round-5 diagnosis
 
 - **Kitty imposes no restriction on what a provider can write.** There is no

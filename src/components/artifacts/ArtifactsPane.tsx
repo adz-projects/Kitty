@@ -5,9 +5,21 @@ import { useChatStore, type Artifact } from '@/stores/chatStore';
     derived from tool-call events (CLAUDE.md Phase 4). Persists nothing app-side. */
 export function ArtifactsPane() {
   const artifacts = useChatStore((s) => s.artifacts);
+  const clearArtifacts = useChatStore((s) => s.clearArtifacts);
   return (
     <aside className="artifacts-pane">
-      <div className="artifacts-head">Artifacts ({artifacts.length})</div>
+      <div className="artifacts-head">
+        <span>Artifacts ({artifacts.length})</span>
+        {artifacts.length > 0 && (
+          <button
+            className="link"
+            title="Clear the list (does not delete the files)"
+            onClick={clearArtifacts}
+          >
+            Clear
+          </button>
+        )}
+      </div>
       {artifacts.length === 0 ? (
         <p className="muted" style={{ fontSize: 12, padding: '4px 8px' }}>
           Files the agent creates or edits will appear here.

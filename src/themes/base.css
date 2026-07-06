@@ -810,6 +810,13 @@ button.primary {
   padding: 12px;
   font-weight: 600;
   border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.artifacts-head .link {
+  font-weight: 400;
 }
 .artifact-card {
   padding: 8px 12px;

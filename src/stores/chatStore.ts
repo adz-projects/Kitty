@@ -120,6 +120,9 @@ interface ChatState {
   warning: string | null;
   bindEvents: () => void;
   dismissWarning: () => void;
+  /** Clear the Artifacts pane list (Round-5). Only empties the derived
+      in-memory list — never touches the files on disk. */
+  clearArtifacts: () => void;
   refreshProvider: () => Promise<void>;
   branch: (uiIndex: number) => Promise<void>;
   regenerate: (assistantIndex: number) => Promise<void>;
@@ -376,6 +379,8 @@ export const useChatStore = create<ChatState>((set, get) => {
     warning: null,
 
     dismissWarning: () => set({ warning: null }),
+
+    clearArtifacts: () => set({ artifacts: [] }),
 
     refreshProvider: async () => {
       try {

@@ -234,6 +234,24 @@ pub fn goosed_env(config: &Config) -> Vec<(String, String)> {
     // Global (not per-provider) context-management strategy (Round-4 item 3).
     env.push(("GOOSE_CONTEXT_STRATEGY".into(), config.context_strategy.clone()));
 
+    // Round-5: nudge the model to save generated files into the session's own
+    // working directory (the per-chat `Documents/Kitty/chats/<id>/` folder,
+    // which goose already sets as the shell cwd) instead of writing to an
+    // absolute path like goose's built-in `~/Documents/Goose` default. Injected
+    // every turn via the bundled `tom` (Top Of Mind) platform extension's
+    // `GOOSE_MOIM_MESSAGE_TEXT` env. Relative-path writes already land in the
+    // chat folder; this is a soft nudge to make the model prefer them for
+    // documents/spreadsheets it would otherwise dump in ~/Documents/Goose.
+    env.push((
+        "GOOSE_MOIM_MESSAGE_TEXT".into(),
+        "When you create, generate, or export any file (documents, spreadsheets, scripts, \
+         data, etc.), always save it into the current working directory using a relative \
+         path such as `report.docx`. Do not write to an absolute path such as \
+         ~/Documents/Goose — the working directory is already set to the correct folder \
+         for this conversation."
+            .into(),
+    ));
+
     env
 }
 
