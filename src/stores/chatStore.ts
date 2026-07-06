@@ -505,20 +505,11 @@ export const useChatStore = create<ChatState>((set, get) => {
     },
 
     adoptSession: async (info) => {
-      clearStopGrace();
-      discardDeltas();
-      set({
-        sessionId: info.session_id,
-        cwd: info.cwd,
-        mode: info.current_mode,
-        availableModes: info.available_modes,
-        stopPhase: null,
-        abandonedSession: null,
-      });
-      await get().refreshProvider();
-      const override = await ipc.getSessionMode(info.session_id).catch(() => null);
-      set({ modeOverride: (override as 'chat' | 'agentic' | null) ?? null });
-      await ensureSafeApprovalMode();
+      // Replay the handed-off conversation (Expand / auto-promote) so the full
+      // window shows it — previously this only set the session id, leaving the
+      // window blank until the next streamed token. loadSession does the replay
+      // plus mode/provider/approval setup; goosed is the source of truth.
+      await get().loadSession(info.session_id, info.cwd);
     },
 
     handOffToMain: async () => {
@@ -620,6 +611,10 @@ export const useChatStore = create<ChatState>((set, get) => {
       } catch (e) {
         set({ error: String(e) });
       } finally {
+        // Apply any buffered replay tail before closing the open message — else
+        // a pending rAF flush lands on a closed message and spawns a spurious
+        // trailing assistant message (Round-5 coalescing interaction).
+        flushDeltas();
         set((s) => ({ busy: false, messages: closeOpen(s.messages) }));
       }
     },

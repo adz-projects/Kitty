@@ -215,6 +215,12 @@ export const onClipboardAttach = (cb: (e: ClipboardAttachEvent) => void) =>
     its session list/recents dropdown is stale. */
 export const onSessionCreated = (cb: () => void) => listen('session://created', () => cb());
 
+/** A session was handed off to the full window (Expand / auto-promote). Lets an
+    *already-open* main window re-adopt it — its mount-time getActiveSession runs
+    only once. Payload is the same shape getActiveSession returns. */
+export const onActiveSession = (cb: (info: SessionInfo) => void) =>
+  listen<SessionInfo>('session://active', (e) => cb(e.payload));
+
 /** Folder state (create/rename/delete/assign) changed in *any* window
     (Round-5) — same cross-window-staleness reason as `onSessionCreated`, but
     for the app-side chat-folder mapping the other window's sidebar renders. */

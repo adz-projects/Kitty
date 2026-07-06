@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { ipc } from '@/lib/ipc';
+import { ipc, onActiveSession } from '@/lib/ipc';
 import { useStackStore } from '@/stores/stackStore';
 import { useChatStore } from '@/stores/chatStore';
 import { StackStatusView } from '@/components/shared/StackStatusView';
@@ -25,10 +25,18 @@ export function App() {
     void init();
     void (async () => {
       const info = await ipc.getActiveSession();
-      if (info) await useChatStore.getState().adoptSession(info);
+      // A blank session id is a "start clean" marker (e.g. provider switch that
+      // jettisons context) — not something to adopt.
+      if (info?.session_id) await useChatStore.getState().adoptSession(info);
     })();
+    // A later Expand hands off a *new* session while this window is already open
+    // — re-adopt it (the mount-time getActiveSession above only runs once).
+    const un = onActiveSession((info) => {
+      if (info.session_id) void useChatStore.getState().adoptSession(info);
+    });
     // Show/hide-artifacts is persisted (Round-3 item 6).
     void ipc.getConfig().then((c) => setShowArtifacts(c.show_artifacts));
+    return () => void un.then((fn) => fn());
   }, [init]);
 
   const toggleArtifacts = async () => {

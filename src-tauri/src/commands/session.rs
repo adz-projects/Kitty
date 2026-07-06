@@ -15,9 +15,12 @@ use crate::notifications;
 use crate::state::AppState;
 
 /// Store the active session (raw JSON) so the full window can adopt it on Expand.
+/// Emits `session://active` so an *already-open* main window re-adopts the newly
+/// handed-off session (its mount-time `getActiveSession` only runs once).
 #[tauri::command]
-pub fn set_active_session(state: tauri::State<'_, AppState>, info: Value) -> Result<(), String> {
-    *state.active_session.lock().unwrap() = Some(info);
+pub fn set_active_session(app: AppHandle, info: Value) -> Result<(), String> {
+    *app.state::<AppState>().active_session.lock().unwrap() = Some(info.clone());
+    let _ = app.emit("session://active", info);
     Ok(())
 }
 
