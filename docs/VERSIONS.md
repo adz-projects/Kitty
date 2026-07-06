@@ -46,11 +46,47 @@ done until this file is updated and the affected code (`goosed/api.rs`,
 
 ## File-writing tool names (Phase 4 artifacts heuristic)
 
-- **Tool-name patterns treated as artifact producers:** developer `text_editor`
-  tool with a write-like command; match tool title/name against
-  `text_editor | write | create | edit | str_replace`, and take the file path
-  from `rawInput.path` (also `file_path`, or `paths[]`). Heuristic — false
-  negatives are acceptable, never fabricate entries (CLAUDE.md).
+- **Two qualifying signals (Round-5, broadened):** the `deriveArtifact`
+  heuristic in `chatStore.ts` now treats a tool call as an artifact producer if
+  **either** (a) its title/toolName matches a write verb
+  (`text_editor | write | create | edit | str_replace | insert | append | save |
+  export | output | generate`) **or** (b) the output path it exposes ends in a
+  recognized artifact extension (`csv/tsv/xlsx/xlsm/doc(x)/ppt(x)/md/markdown/
+  json/jsonl/yaml/py/txt/html/xml/pdf/rtf/odt/ods/odp/ipynb/sql/toml`). The path
+  still comes from `rawInput.path` (also `file_path`, or `paths[0]`). Explicit
+  reads carrying a path (`rawInput.command` ∈ `view/read/list/open/cat/show/
+  inspect/search/find/glob/grep`) are excluded — this also fixed a latent false
+  positive where a plain `text_editor` "view" registered as a bogus artifact.
+  Heuristic still errs toward false negatives, never fabricates (CLAUDE.md).
+
+## Artifact writes by provider — Round-5 diagnosis
+
+- **Kitty imposes no restriction on what a provider can write.** There is no
+  trust/tier gate on tool execution anywhere in this codebase; `is_trusted` /
+  `NetworkTier` only drive UI (badges, the untrusted-attach warning). goosed
+  executes tools; Kitty neither sandboxes nor filters them by file type.
+- **File-writing tools are always available.** Probed live (2026-07-06): a fresh
+  `session/new` already has the `developer` platform extension enabled
+  ("Write and edit files, and execute shell commands") in addition to the
+  `computercontroller` builtin Kitty force-adds. So `text_editor` (text writes)
+  and `shell` are present in every session with no extra wiring — Kitty does
+  **not** need to force-add `developer`.
+- **Text formats work and appear in the Artifacts pane** (csv, md, json, py,
+  txt, html, etc.): the model writes them via `developer`'s `text_editor`, whose
+  tool call exposes `rawInput.path`, so `deriveArtifact` detects them.
+- **Binary Office formats (xlsx/docx/pptx) are a goosed-environment concern,
+  outside Kitty's control:** `text_editor` only writes text, so the model must
+  generate these via `shell` running Python (`openpyxl` / `python-docx` /
+  `python-pptx`). If those libraries aren't present in the environment goosed's
+  shell runs in, the write fails — nothing Kitty can fix client-side. Also note
+  a shell-executed write's tool call is `{command: "..."}` with no structured
+  `path`, so even a *successful* shell-produced binary file won't surface in the
+  Artifacts pane (the pane derives entries from tool metadata, not by scanning
+  the working directory). Both are acknowledged limitations, not bugs.
+- **Chat ("thought-partner") mode auto-rejects tool calls by design:** if a
+  provider is used in chat mode (`tools_enabled:false`, or the session toggled
+  to Chat), Kitty's Round-4 tool-safety fix declines every tool call — so no
+  files get written until the session is in Agent mode. Expected behavior.
 
 ## Installer URLs & hashes (Phase 7)
 

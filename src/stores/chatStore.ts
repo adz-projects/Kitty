@@ -180,18 +180,38 @@ let lastSentModel: string | null = null;
 let msgSeq = 0;
 const newId = () => `m${Date.now()}_${++msgSeq}`;
 
-const ARTIFACT_RE = /text_editor|write|create|edit|str_replace/i;
+// A file-writing tool by name/verb. Broadened (Round-5) beyond the original
+// text_editor set to cover the write verbs other tools use.
+const ARTIFACT_RE =
+  /text_editor|write|create|edit|str_replace|insert|append|save|export|output|generate/i;
+// A recognized artifact file by extension — the second, independent signal
+// (Round-5): a tool that exposes an output path ending in one of these counts
+// as an artifact even when its name doesn't match a write verb (e.g. a
+// document/spreadsheet-producing tool). Covers the formats owners asked for
+// (csv/xlsx/docx/md/json/py) plus common neighbors.
+const ARTIFACT_EXT_RE =
+  /\.(csv|tsv|xlsx?|xlsm|docx?|pptx?|md|markdown|json|jsonl|ya?ml|py|txt|html?|xml|pdf|rtf|odt|ods|odp|ipynb|sql|toml)$/i;
+// Explicit read/inspect operations that also carry a `path` (e.g. text_editor
+// `command:"view"`) — excluded so opening/reading a file never fabricates an
+// artifact. This also fixes a latent false positive: `text_editor` matches
+// ARTIFACT_RE by name, so a plain view used to register as a (bogus) artifact.
+const READ_COMMAND_RE = /^(view|read|list|open|cat|show|inspect|search|find|glob|grep)$/i;
 
-function deriveArtifact(u: ToolCallUpdate): Artifact | null {
+export function deriveArtifact(u: ToolCallUpdate): Artifact | null {
   const meta = u as Record<string, unknown>;
   const goose = (meta._meta as { goose?: { toolCall?: { toolName?: string } } })?.goose;
   const toolName = goose?.toolCall?.toolName ?? '';
   const label = `${u.title ?? ''} ${toolName}`;
-  if (!ARTIFACT_RE.test(label)) return null;
-  const input = u.rawInput as { path?: string; file_path?: string; paths?: string[] } | undefined;
+  const input = u.rawInput as
+    { path?: string; file_path?: string; paths?: string[]; command?: string } | undefined;
   const p =
     input?.path ?? input?.file_path ?? (Array.isArray(input?.paths) ? input?.paths[0] : undefined);
   if (typeof p !== 'string' || !p) return null;
+  // Never derive an artifact from an explicit read/view of a file.
+  if (typeof input?.command === 'string' && READ_COMMAND_RE.test(input.command)) return null;
+  // Qualify on either signal: a write-like tool name/verb, or a known artifact
+  // file extension on the output path.
+  if (!ARTIFACT_RE.test(label) && !ARTIFACT_EXT_RE.test(p)) return null;
   return {
     path: p,
     name: p.split(/[\\/]/).pop() || p,
