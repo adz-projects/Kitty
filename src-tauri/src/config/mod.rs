@@ -212,10 +212,19 @@ fn migrate_hotkeys(mut config: Config, raw: &str) -> Config {
 }
 
 /// Persist config to disk (pretty-printed for hand-inspection).
+///
+/// Written atomically: serialize to a sibling temp file, then rename over the
+/// target. On Windows `fs::rename` maps to `MoveFileEx` with
+/// `MOVEFILE_REPLACE_EXISTING`, so the swap is atomic — a crash mid-write leaves
+/// either the old or the new complete file, never a truncated one. This matters
+/// because `load` treats a corrupt config as a hard error (it never silently
+/// discards user settings), so a torn write would otherwise brick startup.
 pub fn save(config: &Config) -> Result<(), ConfigError> {
     let path = config_path()?;
     let text = serde_json::to_string_pretty(config)?;
-    fs::write(&path, text)?;
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, text)?;
+    fs::rename(&tmp, &path)?;
     Ok(())
 }
 

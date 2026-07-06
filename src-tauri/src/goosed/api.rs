@@ -84,6 +84,11 @@ impl AcpClient {
                 }
             }
             tracing::warn!("ACP websocket closed");
+            // Fail any in-flight requests fast rather than letting each block for
+            // the full 300s timeout — the connection is gone, no response is coming.
+            for (_, tx) in pending.lock().await.drain() {
+                let _ = tx.send(Err(json!({ "message": "ACP connection closed" })));
+            }
             // Allow reconnect on the next command.
             *app_reader.state::<AppState>().acp.lock().await = None;
         });
