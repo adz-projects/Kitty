@@ -27,20 +27,26 @@ impl Event {
     }
 }
 
-/// True if the overlay is currently visible (so we can skip notifying).
-fn overlay_visible(app: &AppHandle) -> bool {
-    app.get_webview_window(windows::OVERLAY)
-        .and_then(|w| w.is_visible().ok())
-        .unwrap_or(false)
+/// True if either chat surface (overlay or main) is currently visible — the
+/// user can already see the response, so a toast would be redundant. Checking
+/// only the overlay was a bug: with main open (and the overlay hidden, per
+/// the Round-3 item 28 mutual-exclusivity rule) a toast fired anyway.
+fn chat_window_visible(app: &AppHandle) -> bool {
+    let visible = |label: &str| {
+        app.get_webview_window(label)
+            .and_then(|w| w.is_visible().ok())
+            .unwrap_or(false)
+    };
+    visible(windows::OVERLAY) || visible(windows::MAIN)
 }
 
-/// Send a notification if the overlay is hidden and the event is enabled.
+/// Send a notification if no chat window is visible and the event is enabled.
 /// Clicking the notification opens the main window (Round-3 item 27) — built
 /// via `notify-rust` directly rather than `tauri_plugin_notification`'s
 /// `.show()`, which discards the toast's activation handle and gives us no way
 /// to detect a click at all.
 pub fn notify_if_hidden(app: &AppHandle, event: Event, title: &str, body: &str) {
-    if overlay_visible(app) {
+    if chat_window_visible(app) {
         return;
     }
     let enabled = {
