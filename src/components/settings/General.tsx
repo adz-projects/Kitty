@@ -41,11 +41,11 @@ export function General() {
       <h1>General</h1>
 
       <label className="field">
-        <span>Default context folder</span>
+        <span>Chats folder</span>
         <div className="row">
           <input
             value={draft.default_context_folder ?? ''}
-            placeholder="%USERPROFILE%\\Documents\\Goose"
+            placeholder="%USERPROFILE%\\Documents\\Kitty"
             onChange={(e) => update({ default_context_folder: e.target.value || null })}
           />
           <button
@@ -57,6 +57,11 @@ export function General() {
             Browse…
           </button>
         </div>
+        <small className="muted">
+          Each chat gets its own working directory at{' '}
+          <code>&lt;this&gt;/chats/&lt;chat-id&gt;</code>— that&apos;s where files a model creates
+          for you are saved. Leave blank for the default, <code>~/Documents/Kitty</code>.
+        </small>
       </label>
 
       <label className="field">

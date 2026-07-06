@@ -2,7 +2,7 @@
 //! plus the mode-override and private-chat-folder helpers that only exist to
 //! support them.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -48,36 +48,40 @@ pub struct ModeInfo {
 /// this prefix — never a user-chosen custom working directory.
 pub const CHATS_DIR_NAME: &str = "chats";
 
-/// A fresh, unique folder for a session with no explicit context folder, under
-/// `%USERPROFILE%\Documents\Kitty\chats\<timestamp>-<short-rand>\`. Replaces
-/// both the old chat-only Downloads default and the old shared agentic
-/// `Documents/Goose` default: each such session now gets its own isolated
-/// folder instead of sharing one across sessions (Round-3 item 25 — a real,
-/// deliberate behavior change, not just a path rename).
-fn new_private_chat_folder() -> PathBuf {
+/// Base directory that holds every chat's own context folder. The user's choice
+/// (`default_context_folder`, set in Settings) when non-empty, else the default
+/// `~/Documents/Kitty`. Each chat then lives in `<base>/chats/<id>/`, so the
+/// setting is a *base for per-chat folders*, not one shared working directory.
+fn chats_base_dir(app: &AppHandle) -> PathBuf {
+    let configured = {
+        let state = app.state::<AppState>();
+        let cfg = state.config.lock().unwrap();
+        cfg.default_context_folder.clone()
+    };
+    configured
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| dirs::document_dir().unwrap_or_else(|| PathBuf::from(".")).join("Kitty"))
+}
+
+/// A fresh per-chat folder `<base>/chats/<timestamp>-<short-rand>/`. The
+/// `<timestamp>-<rand>` is the chat's own id — goose's session id isn't known
+/// until `session/new` returns (the cwd is passed *into* it), so a client-side
+/// id names the folder instead; `session/list.cwd` maps back to it later.
+fn new_chat_folder(base: &Path) -> PathBuf {
     use rand::Rng;
     let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
     let suffix: String = {
         let mut rng = rand::thread_rng();
         (0..6).map(|_| format!("{:x}", rng.gen_range(0u8..16))).collect()
     };
-    dirs::document_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("Kitty")
-        .join(CHATS_DIR_NAME)
-        .join(format!("{ts}-{suffix}"))
+    base.join(CHATS_DIR_NAME).join(format!("{ts}-{suffix}"))
 }
 
-/// The working directory a new session starts in: the configured default
-/// context folder, else a fresh private folder under `Documents/Kitty/chats/`
-/// (created if missing) — same fallback for both agentic and chat-only modes.
+/// The working directory a new session starts in: a fresh per-chat folder under
+/// the (configurable) chats base, created if missing. Same for both modes.
 fn resolve_cwd(app: &AppHandle) -> String {
-    let configured = {
-        let state = app.state::<AppState>();
-        let cfg = state.config.lock().unwrap();
-        cfg.default_context_folder.clone()
-    };
-    let path = configured.map(PathBuf::from).unwrap_or_else(new_private_chat_folder);
+    let path = new_chat_folder(&chats_base_dir(app));
     let _ = std::fs::create_dir_all(&path);
     path.to_string_lossy().replace('\\', "/")
 }
@@ -413,11 +417,10 @@ pub async fn delete_session(
         .request("session/delete", json!({ "sessionId": session_id }))
         .await?;
     if let Some(cwd) = cwd {
-        let chats_root = dirs::document_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("Kitty")
-            .join(CHATS_DIR_NAME);
-        let chats_root = chats_root.to_string_lossy().replace('\\', "/");
+        // Only remove a folder that sits under the chats base's `chats/` dir
+        // (a Kitty-created per-chat folder) — never a user's own directory.
+        let chats_root = chats_base_dir(&app).join(CHATS_DIR_NAME);
+        let chats_root = format!("{}/", chats_root.to_string_lossy().replace('\\', "/"));
         let cwd_norm = cwd.replace('\\', "/");
         if cwd_norm.starts_with(&chats_root) {
             let _ = std::fs::remove_dir_all(&cwd_norm);

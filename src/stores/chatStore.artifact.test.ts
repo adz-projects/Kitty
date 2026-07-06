@@ -55,4 +55,16 @@ describe('deriveArtifact', () => {
   it('ignores a tool call with no path at all', () => {
     expect(deriveArtifact(tc('web_search', { query: 'hello' }))).toBeNull();
   });
+
+  it('resolves a relative write path against the session cwd (fixes broken Open)', () => {
+    const cwd = 'C:/Users/me/Documents/Kitty/chats/abc';
+    const a = deriveArtifact(tc('write', { command: 'write', path: 'report.docx' }), cwd);
+    expect(a?.path).toBe(`${cwd}/report.docx`);
+    expect(a?.name).toBe('report.docx');
+  });
+
+  it('keeps an absolute path as-is even when a cwd is given', () => {
+    const a = deriveArtifact(tc('write', { path: 'C:/other/out.csv' }), 'C:/Users/me/chats/abc');
+    expect(a?.path).toBe('C:/other/out.csv');
+  });
 });

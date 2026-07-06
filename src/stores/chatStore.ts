@@ -223,7 +223,19 @@ const ARTIFACT_EXT_RE =
 // ARTIFACT_RE by name, so a plain view used to register as a (bogus) artifact.
 const READ_COMMAND_RE = /^(view|read|list|open|cat|show|inspect|search|find|glob|grep)$/i;
 
-export function deriveArtifact(u: ToolCallUpdate): Artifact | null {
+/** Make a tool-reported output path absolute so the Artifacts pane's Open /
+    Copy path / Show-in-folder work (Round-5): goose reports a *relative* path
+    for a write (e.g. `report.docx`), resolved against the session cwd — the
+    chat folder. Without this the artifact stored just the bare filename and
+    Open failed with "file not found". Absolute inputs (drive letter, unix
+    root, UNC) are kept as-is. */
+function absoluteArtifactPath(p: string, cwd: string | null): string {
+  const isAbsolute = /^[a-z]:[\\/]/i.test(p) || p.startsWith('/') || p.startsWith('\\\\');
+  if (isAbsolute || !cwd) return p;
+  return `${cwd.replace(/[\\/]+$/, '')}/${p.replace(/^[\\/]+/, '')}`;
+}
+
+export function deriveArtifact(u: ToolCallUpdate, cwd: string | null = null): Artifact | null {
   const meta = u as Record<string, unknown>;
   const goose = (meta._meta as { goose?: { toolCall?: { toolName?: string } } })?.goose;
   const toolName = goose?.toolCall?.toolName ?? '';
@@ -239,7 +251,7 @@ export function deriveArtifact(u: ToolCallUpdate): Artifact | null {
   // file extension on the output path.
   if (!ARTIFACT_RE.test(label) && !ARTIFACT_EXT_RE.test(p)) return null;
   return {
-    path: p,
+    path: absoluteArtifactPath(p, cwd),
     name: p.split(/[\\/]/).pop() || p,
     tool: toolName || String(u.title || 'tool'),
   };
@@ -1015,7 +1027,7 @@ export const useChatStore = create<ChatState>((set, get) => {
 
         const u: ToolCallUpdate = e.update;
         const id = String(u.toolCallId ?? '');
-        const artifact = deriveArtifact(u);
+        const artifact = deriveArtifact(u, get().cwd);
         set((s) => {
           let msgs = s.messages.slice();
           let last = msgs[msgs.length - 1];
