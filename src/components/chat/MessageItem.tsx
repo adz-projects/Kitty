@@ -5,12 +5,14 @@ import 'highlight.js/styles/github.css';
 import { useChatStore, type Message } from '@/stores/chatStore';
 import { ThinkingBox } from './ThinkingBox';
 import { CodeBlock } from './CodeBlock';
+import { MessageInfo } from './MessageInfo';
 
 const MARKDOWN_COMPONENTS = { pre: CodeBlock };
 
 /** One chat message. User turns render as a plain bubble; assistant turns render
     markdown, with an optional collapsible reasoning block and tool cards. Hover
-    actions: Branch from here, Regenerate (assistant), Copy as Markdown. */
+    actions: Branch from here, Regenerate (assistant), Copy as Markdown, and an
+    info button (assistant only) surfacing model/provider/tokens/duration. */
 export function MessageItem({ message, index }: { message: Message; index: number }) {
   const branch = useChatStore((s) => s.branch);
   const regenerate = useChatStore((s) => s.regenerate);
@@ -38,6 +40,7 @@ export function MessageItem({ message, index }: { message: Message; index: numbe
           >
             Copy
           </button>
+          <MessageInfo message={message} />
         </>
       )}
     </div>
@@ -71,15 +74,6 @@ export function MessageItem({ message, index }: { message: Message; index: numbe
           >
             {message.text}
           </ReactMarkdown>
-        </div>
-      )}
-      {(message.durationMs != null || message.inputTokens != null) && (
-        <div className="muted msg-meta">
-          {message.durationMs != null && `⏱ ${(message.durationMs / 1000).toFixed(1)}s`}
-          {message.inputTokens != null &&
-            message.outputTokens != null &&
-            ` · ${message.inputTokens}→${message.outputTokens} tok`}
-          {message.providerName && ` · ${message.providerName}`}
         </div>
       )}
       {actions}

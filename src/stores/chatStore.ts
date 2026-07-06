@@ -54,6 +54,9 @@ export interface Message {
   inputTokens?: number;
   outputTokens?: number;
   providerName?: string;
+  /** The actual model that generated this message (Round-4 info button) —
+      captured at send time, not read back from the live chat-pill state. */
+  model?: string;
 }
 
 export interface Artifact {
@@ -168,6 +171,12 @@ let bound = false;
 // metric (Round-3 item 2) — module-level like `bound`/`msgSeq` below, since
 // there's only ever one in-flight prompt per active session.
 let lastSentAt: number | null = null;
+// Provider/model actually active at the moment send() fired (Round-4 info
+// button) — captured here rather than read from live store state in
+// onComplete, since the user can switch providers while a response is still
+// streaming; that would otherwise attribute the response to the wrong model.
+let lastSentProvider: string | null = null;
+let lastSentModel: string | null = null;
 let msgSeq = 0;
 const newId = () => `m${Date.now()}_${++msgSeq}`;
 
@@ -685,6 +694,8 @@ export const useChatStore = create<ChatState>((set, get) => {
       }));
       try {
         lastSentAt = performance.now();
+        lastSentProvider = get().providerName;
+        lastSentModel = get().model;
         if (stripReasoningNow) {
           // Swap to a brand-new goosed session carrying only the reconstructed,
           // reasoning-free transcript — never the old session (which still has
@@ -869,6 +880,10 @@ export const useChatStore = create<ChatState>((set, get) => {
         if (!forActive(e.session_id)) return;
         const durationMs = lastSentAt != null ? performance.now() - lastSentAt : undefined;
         lastSentAt = null;
+        const providerName = lastSentProvider ?? undefined;
+        const model = lastSentModel ?? undefined;
+        lastSentProvider = null;
+        lastSentModel = null;
         const usage = e.result.usage;
         set((s) => {
           const msgs = closeOpen(s.messages);
@@ -879,7 +894,8 @@ export const useChatStore = create<ChatState>((set, get) => {
               durationMs,
               inputTokens: usage?.inputTokens,
               outputTokens: usage?.outputTokens,
-              providerName: s.providerName ?? undefined,
+              providerName,
+              model,
             };
           }
           return { busy: false, pendingApprovals: [], messages: msgs };

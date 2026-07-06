@@ -500,10 +500,13 @@ button.primary {
   border-radius: 6px;
   background: transparent;
 }
-/* Per-response metrics line — duration/tokens/provider (Round-3 item 2). */
-.msg-meta {
-  font-size: 11px;
-  margin-top: 2px;
+/* Per-message generation info popover (Round-4) — replaces the old
+   always-visible metrics line with a hover-revealed button + click popover,
+   consistent with Branch/Regenerate/Copy. */
+.msg-info-popover {
+  min-width: 200px;
+  font-size: 12px;
+  line-height: 1.6;
 }
 
 /* Chat-only ("thought partner") mode: a wider, calmer reading column. */
