@@ -94,6 +94,12 @@ interface ChatState {
       context resent on later turns, chat-only mode only. Remove once Goose ships
       a native hook (block/goose#7617) and thread it into goosed_env() instead. */
   stripReasoning: boolean;
+  /** Per-session chat/agentic override (Round-4 instant mode toggle). `null` =
+      follow the active provider's `tools_enabled` default — see `isChatMode`. */
+  modeOverride: 'chat' | 'agentic' | null;
+  /** Approval mode saved when flipping into chat mode, restored on flip back
+      (Round-4 tool-safety fix). `null` when not currently overridden-to-chat. */
+  savedApprovalMode: string | null;
   /// Non-blocking notice (e.g. attaching to an untrusted provider). Round-2 item 13.
   warning: string | null;
   bindEvents: () => void;
@@ -112,6 +118,11 @@ interface ChatState {
   cancel: () => Promise<void>;
   respondApproval: (toolCallId: string, optionId: string | null) => Promise<void>;
   setMode: (modeId: string) => Promise<void>;
+  /** Flip the session's chat/agentic mode (Round-4). Persists the override and
+      handles the mid-conversation safety/attachment concerns described on
+      `send()`'s strip-reasoning STOPGAP neighbor, `bindEvents`' approval
+      handler, and `addDroppedPaths` below. */
+  setModeOverride: (mode: 'chat' | 'agentic' | null) => Promise<void>;
   addDroppedPaths: (paths: string[]) => Promise<void>;
   removeDroppedPath: (path: string) => void;
   setWorkingDir: (folder: string) => Promise<void>;
@@ -120,8 +131,15 @@ interface ChatState {
     cwd: string;
     current_mode: string;
     available_modes: ModeInfo[];
-  }) => void;
+  }) => Promise<void>;
 }
+
+/** Effective chat/agentic mode for the current session: an explicit override
+    wins, otherwise follow the active provider's `tools_enabled` default.
+    Exported plain selector — usable as `useChatStore(isChatMode)` in
+    components or `isChatMode(get())` inside store actions (Round-4). */
+export const isChatMode = (s: ChatState): boolean =>
+  (s.modeOverride ?? (s.toolsEnabled ? 'agentic' : 'chat')) === 'chat';
 
 let bound = false;
 // Timestamp of the most recent send() call, for the per-response duration
@@ -153,6 +171,13 @@ function deriveArtifact(u: ToolCallUpdate): Artifact | null {
 const closeOpen = (msgs: Message[]): Message[] =>
   msgs.map((m) => (m.open ? { ...m, open: false, streaming: false } : m));
 
+/** The ACP permission options confirmed live are `allow_always`/`allow_once`/
+    `reject_once`/`reject_always` (docs/acp-protocol.md) — pick the reject
+    variant so an auto-declined tool call reads as a real decline, not a
+    cancellation. `null` (cancel) as a fallback if none match. */
+const pickRejectOption = (options: { optionId: string }[]): string | null =>
+  options.find((o) => /reject/i.test(o.optionId))?.optionId ?? null;
+
 // STOPGAP client-side workaround for stripping reasoning from resent context
 // (see the doc comment on `ProviderProfile.strip_reasoning` in providers.rs and
 // on `stripReasoning` above) — flattens prior turns into plain text using only
@@ -170,527 +195,624 @@ function buildStrippedTranscript(messages: Message[]): string {
   );
 }
 
-export const useChatStore = create<ChatState>((set, get) => ({
-  sessionId: null,
-  cwd: null,
-  title: null,
-  mode: null,
-  availableModes: [],
-  messages: [],
-  artifacts: [],
-  droppedFiles: [],
-  attachments: [],
-  pendingApprovals: [],
-  busy: false,
-  error: null,
-  toolsEnabled: true,
-  providerTier: null,
-  providerHost: null,
-  providerOffline: false,
-  isTrusted: false,
-  model: null,
-  providerName: null,
-  stripReasoning: false,
-  warning: null,
-
-  dismissWarning: () => set({ warning: null }),
-
-  refreshProvider: async () => {
+export const useChatStore = create<ChatState>((set, get) => {
+  // Force approve-mode whenever the effective mode is chat, so `auto` can
+  // never silently execute a tool call the UI hides (Round-4 tool-safety fix
+  // for the Phase-9 latent bug: goosed always has tools live even in
+  // chat-only mode). Called after every session bootstrap point
+  // (new/load/adopt) and on flip-to-chat; best-effort — a failure here isn't
+  // worth surfacing, `bindEvents`' auto-reject still catches any tool call.
+  const ensureSafeApprovalMode = async () => {
+    const sid = get().sessionId;
+    if (!sid || !isChatMode(get()) || get().mode === 'approve') return;
+    set({ mode: 'approve' });
     try {
-      const providers = await ipc.listProviders();
-      const active = providers.find((p) => p.active);
-      set({
-        toolsEnabled: active ? active.tools_enabled : true,
-        providerTier: active ? active.network_tier : null,
-        providerHost: active ? new URL(active.base_url).host : null,
-        isTrusted: active ? active.is_trusted : false,
-        model: active?.models[0] ?? null,
-        providerName: active ? active.name || active.provider_type : null,
-        stripReasoning: active ? active.strip_reasoning : false,
-      });
+      await ipc.setMode(sid, 'approve');
     } catch {
-      set({
-        toolsEnabled: true,
-        providerTier: null,
-        providerHost: null,
-        model: null,
-        providerName: null,
-        stripReasoning: false,
-      });
+      /* best-effort */
     }
-  },
+  };
 
-  adoptSession: (info) =>
-    set({
-      sessionId: info.session_id,
-      cwd: info.cwd,
-      mode: info.current_mode,
-      availableModes: info.available_modes,
-    }),
-
-  newSession: async (cwd?: string) => {
-    const info = await ipc.newSession(cwd);
-    set({
-      sessionId: info.session_id,
-      cwd: info.cwd,
-      mode: info.current_mode,
-      availableModes: info.available_modes,
-      title: null,
-      messages: [],
-      artifacts: [],
-      attachments: [],
-      pendingApprovals: [],
-      error: null,
-      busy: false,
-    });
-    await get().refreshProvider();
-  },
-
-  ensureSession: async () => {
-    const current = get().sessionId;
-    if (current) return current;
-    await get().newSession();
-    return get().sessionId!;
-  },
-
-  loadSession: async (sessionId: string, cwd: string, title?: string) => {
-    // Set the id first so replayed events (which arrive during the call) match.
-    set({
-      sessionId,
-      cwd,
-      title: title ?? null,
-      messages: [],
-      artifacts: [],
-      pendingApprovals: [],
-      error: null,
-      busy: true,
-    });
+  // Chat-mode file handling (Phase 9, reused by both `addDroppedPaths` and a
+  // mid-conversation agentic→chat flip in `setModeOverride` below): inline
+  // file *content* rather than sending paths, since chat mode never invokes
+  // filesystem tools. Binaries can't be inlined as text, so they attach as a
+  // short descriptor instead of being rejected.
+  const inlineFileAsAttachment = async (f: PathInfo) => {
+    if (f.is_dir) return;
     try {
-      const info = await ipc.loadSession(sessionId, cwd);
-      set({ mode: info.current_mode, availableModes: info.available_modes });
-      await get().refreshProvider();
-    } catch (e) {
-      set({ error: String(e) });
-    } finally {
-      set((s) => ({ busy: false, messages: closeOpen(s.messages) }));
-    }
-  },
-
-  cancel: async () => {
-    const sid = get().sessionId;
-    if (!sid || !get().busy) return;
-    try {
-      await ipc.cancelPrompt(sid);
-      // Optimistically release the UI; goosed can take a moment to wind down the
-      // turn on a slow model, and its later completion event is idempotent.
-      set((s) => ({ busy: false, messages: closeOpen(s.messages) }));
+      const file = await ipc.readFileAny(f.path);
+      if (file.kind === 'text') {
+        get().addPastedText(file.content, f.name);
+      } else {
+        get().addPastedText(
+          `[Attached file "${f.name}" — ${file.mime ?? 'binary'}; contents not inlined.]`,
+          f.name
+        );
+      }
     } catch (e) {
       set({ error: String(e) });
     }
-  },
+  };
 
-  reloadCurrent: async () => {
-    const { sessionId, cwd, title } = get();
-    if (sessionId && cwd) await get().loadSession(sessionId, cwd, title ?? undefined);
-  },
+  return {
+    sessionId: null,
+    cwd: null,
+    title: null,
+    mode: null,
+    availableModes: [],
+    messages: [],
+    artifacts: [],
+    droppedFiles: [],
+    attachments: [],
+    pendingApprovals: [],
+    busy: false,
+    error: null,
+    toolsEnabled: true,
+    providerTier: null,
+    providerHost: null,
+    providerOffline: false,
+    isTrusted: false,
+    model: null,
+    providerName: null,
+    stripReasoning: false,
+    modeOverride: null,
+    savedApprovalMode: null,
+    warning: null,
 
-  respondApproval: async (toolCallId: string, optionId: string | null) => {
-    set((s) => ({
-      pendingApprovals: s.pendingApprovals.filter((a) => a.tool_call_id !== toolCallId),
-    }));
-    try {
-      await ipc.respondPermission(toolCallId, optionId);
-    } catch (e) {
-      set({ error: String(e) });
-    }
-  },
+    dismissWarning: () => set({ warning: null }),
 
-  setMode: async (modeId: string) => {
-    const sid = get().sessionId;
-    if (!sid) return;
-    set({ mode: modeId });
-    try {
-      await ipc.setMode(sid, modeId);
-    } catch (e) {
-      set({ error: String(e) });
-    }
-  },
-
-  addDroppedPaths: async (paths: string[]) => {
-    if (!paths.length) return;
-    try {
-      const infos = await ipc.inspectPaths(paths);
-      // Untrusted-provider warning (Round-2 item 13) — non-blocking, never bans.
-      const { providerTier, isTrusted, providerHost } = get();
-      if (providerTier && providerTier !== 'local' && !isTrusted) {
+    refreshProvider: async () => {
+      try {
+        const providers = await ipc.listProviders();
+        const active = providers.find((p) => p.active);
         set({
-          warning: `Attaching files will send their contents to ${providerHost ?? 'an untrusted provider'}, which you haven't marked trusted.`,
+          toolsEnabled: active ? active.tools_enabled : true,
+          providerTier: active ? active.network_tier : null,
+          providerHost: active ? new URL(active.base_url).host : null,
+          isTrusted: active ? active.is_trusted : false,
+          model: active?.models[0] ?? null,
+          providerName: active ? active.name || active.provider_type : null,
+          stripReasoning: active ? active.strip_reasoning : false,
+        });
+      } catch {
+        set({
+          toolsEnabled: true,
+          providerTier: null,
+          providerHost: null,
+          model: null,
+          providerName: null,
+          stripReasoning: false,
         });
       }
-      // Chat-only (Phase 9): inline file *content* rather than sending paths.
-      // Any file type is accepted now (item 13) — binaries can't be inlined as
-      // text, so they attach as a short descriptor instead of being rejected.
-      if (!get().toolsEnabled) {
-        for (const f of infos) {
-          if (f.is_dir) continue;
+    },
+
+    adoptSession: async (info) => {
+      set({
+        sessionId: info.session_id,
+        cwd: info.cwd,
+        mode: info.current_mode,
+        availableModes: info.available_modes,
+      });
+      await get().refreshProvider();
+      const override = await ipc.getSessionMode(info.session_id).catch(() => null);
+      set({ modeOverride: (override as 'chat' | 'agentic' | null) ?? null });
+      await ensureSafeApprovalMode();
+    },
+
+    newSession: async (cwd?: string) => {
+      const info = await ipc.newSession(cwd);
+      set({
+        sessionId: info.session_id,
+        cwd: info.cwd,
+        mode: info.current_mode,
+        availableModes: info.available_modes,
+        title: null,
+        messages: [],
+        artifacts: [],
+        attachments: [],
+        pendingApprovals: [],
+        modeOverride: null,
+        savedApprovalMode: null,
+        error: null,
+        busy: false,
+      });
+      await get().refreshProvider();
+      await ensureSafeApprovalMode();
+    },
+
+    ensureSession: async () => {
+      const current = get().sessionId;
+      if (current) return current;
+      await get().newSession();
+      return get().sessionId!;
+    },
+
+    loadSession: async (sessionId: string, cwd: string, title?: string) => {
+      // Set the id first so replayed events (which arrive during the call) match.
+      set({
+        sessionId,
+        cwd,
+        title: title ?? null,
+        messages: [],
+        artifacts: [],
+        pendingApprovals: [],
+        modeOverride: null,
+        savedApprovalMode: null,
+        error: null,
+        busy: true,
+      });
+      try {
+        const info = await ipc.loadSession(sessionId, cwd);
+        set({ mode: info.current_mode, availableModes: info.available_modes });
+        await get().refreshProvider();
+        const override = await ipc.getSessionMode(sessionId).catch(() => null);
+        set({ modeOverride: (override as 'chat' | 'agentic' | null) ?? null });
+        await ensureSafeApprovalMode();
+      } catch (e) {
+        set({ error: String(e) });
+      } finally {
+        set((s) => ({ busy: false, messages: closeOpen(s.messages) }));
+      }
+    },
+
+    cancel: async () => {
+      const sid = get().sessionId;
+      if (!sid || !get().busy) return;
+      try {
+        await ipc.cancelPrompt(sid);
+        // Optimistically release the UI; goosed can take a moment to wind down the
+        // turn on a slow model, and its later completion event is idempotent.
+        set((s) => ({ busy: false, messages: closeOpen(s.messages) }));
+      } catch (e) {
+        set({ error: String(e) });
+      }
+    },
+
+    reloadCurrent: async () => {
+      const { sessionId, cwd, title } = get();
+      if (sessionId && cwd) await get().loadSession(sessionId, cwd, title ?? undefined);
+    },
+
+    respondApproval: async (toolCallId: string, optionId: string | null) => {
+      set((s) => ({
+        pendingApprovals: s.pendingApprovals.filter((a) => a.tool_call_id !== toolCallId),
+      }));
+      try {
+        await ipc.respondPermission(toolCallId, optionId);
+      } catch (e) {
+        set({ error: String(e) });
+      }
+    },
+
+    setMode: async (modeId: string) => {
+      const sid = get().sessionId;
+      if (!sid) return;
+      set({ mode: modeId });
+      try {
+        await ipc.setMode(sid, modeId);
+      } catch (e) {
+        set({ error: String(e) });
+      }
+    },
+
+    setModeOverride: async (mode: 'chat' | 'agentic' | null) => {
+      const sessionId = get().sessionId;
+      const wasChatMode = isChatMode(get());
+      set({ modeOverride: mode });
+      const nowChatMode = isChatMode(get());
+      if (sessionId)
+        void ipc.setSessionMode(sessionId, mode).catch((e) => set({ error: String(e) }));
+
+      if (!wasChatMode && nowChatMode) {
+        // agentic → chat: nothing should keep running/waiting on tools. Decline
+        // every pending approval, save the approval mode so flipping back can
+        // restore it, then force approve (never auto) for the rest of chat mode.
+        const approvals = get().pendingApprovals;
+        for (const a of approvals) {
+          await get().respondApproval(a.tool_call_id, pickRejectOption(a.options));
+        }
+        set({ pendingApprovals: [], savedApprovalMode: get().mode });
+        await ensureSafeApprovalMode();
+        // Any agentic-mode path references would leak into a chat-mode prompt —
+        // route them through the same inline-content path a chat-mode drop uses.
+        const files = get().droppedFiles;
+        if (files.length) {
+          set({ droppedFiles: [] });
+          for (const f of files) await inlineFileAsAttachment(f);
+        }
+      } else if (wasChatMode && !nowChatMode) {
+        // chat → agentic: history/tools are already live goosed-side; just
+        // restore whatever approval mode was in effect before the flip to chat.
+        const saved = get().savedApprovalMode;
+        if (sessionId && saved) await get().setMode(saved);
+        set({ savedApprovalMode: null });
+      }
+    },
+
+    addDroppedPaths: async (paths: string[]) => {
+      if (!paths.length) return;
+      try {
+        const infos = await ipc.inspectPaths(paths);
+        // Untrusted-provider warning (Round-2 item 13) — non-blocking, never bans.
+        const { providerTier, isTrusted, providerHost } = get();
+        if (providerTier && providerTier !== 'local' && !isTrusted) {
+          set({
+            warning: `Attaching files will send their contents to ${providerHost ?? 'an untrusted provider'}, which you haven't marked trusted.`,
+          });
+        }
+        // Chat mode (Phase 9 / Round-4 toggle): inline file *content* rather
+        // than sending paths. Any file type is accepted now (item 13).
+        if (isChatMode(get())) {
+          for (const f of infos) await inlineFileAsAttachment(f);
+          return;
+        }
+        // Agentic: hand paths to the filesystem tools (works for any file type).
+        set((s) => {
+          const seen = new Set(s.droppedFiles.map((f) => f.path));
+          return { droppedFiles: [...s.droppedFiles, ...infos.filter((f) => !seen.has(f.path))] };
+        });
+      } catch (e) {
+        set({ error: String(e) });
+      }
+    },
+
+    removeDroppedPath: (path: string) =>
+      set((s) => ({ droppedFiles: s.droppedFiles.filter((f) => f.path !== path) })),
+
+    setWorkingDir: async (folder: string) => {
+      await get().newSession(folder);
+    },
+
+    addPastedText: (text: string, label?: string) =>
+      set((s) => ({
+        attachments: [
+          ...s.attachments,
+          {
+            id: newId(),
+            label: label ?? `Pasted text — ${text.trim().split(/\s+/).length} words`,
+            content: text,
+          },
+        ],
+      })),
+
+    removeAttachment: (id: string) =>
+      set((s) => ({ attachments: s.attachments.filter((a) => a.id !== id) })),
+
+    exportSession: async (upToIndex?: number) => {
+      const { messages, title } = get();
+      if (messages.length === 0) return;
+      const chatMessages = buildExport(messages, upToIndex);
+      const base = sanitizeFilename(title ?? 'goose-session');
+      const path = await pickSavePath(`${base}.jsonl`);
+      if (!path) return;
+      try {
+        await ipc.writeFile(path, JSON.stringify({ messages: chatMessages }) + '\n');
+      } catch (e) {
+        set({ error: String(e) });
+      }
+    },
+
+    branch: async (uiIndex: number) => {
+      const { sessionId, cwd, title } = get();
+      if (!sessionId || !cwd) return;
+      try {
+        // Keep history up to and including the clicked message, diverge after.
+        const info = await ipc.forkSession(sessionId, cwd, uiIndex + 1);
+        set({ title: title ? `Branch of ${title}` : 'Branch' });
+        await get().loadSession(info.session_id, info.cwd, get().title ?? undefined);
+      } catch (e) {
+        set({ error: String(e) });
+      }
+    },
+
+    regenerate: async (assistantIndex: number) => {
+      const { sessionId, cwd, messages } = get();
+      if (!sessionId || !cwd) return;
+      // Find the user message preceding this assistant turn.
+      let userIdx = assistantIndex - 1;
+      while (userIdx >= 0 && messages[userIdx].role !== 'user') userIdx--;
+      if (userIdx < 0) return;
+      const userText = messages[userIdx].text;
+      try {
+        // Fork + truncate to just before the user turn so the original response is
+        // preserved in the parent session; then resend.
+        const info = await ipc.forkSession(sessionId, cwd, userIdx);
+        await get().loadSession(info.session_id, info.cwd, get().title ?? undefined);
+        await get().send(userText);
+      } catch (e) {
+        set({ error: String(e) });
+      }
+    },
+
+    send: async (text: string) => {
+      const trimmed = text.trim();
+      const attachments = get().attachments;
+      if ((!trimmed && attachments.length === 0) || get().busy) return;
+      const firstMessage = get().messages.length === 0;
+      const chatOnly = isChatMode(get());
+      const sessionId = await get().ensureSession();
+      const files = get().droppedFiles;
+
+      // Agentic-mode images go as native ACP image content blocks instead of a
+      // bare filesystem path reference (Round-3 item 17 — fixes untrusted/remote
+      // providers failing with "file not found": the model no longer has to
+      // correctly invoke a file tool on an exact path just to see the picture).
+      // Chat-only mode is unaffected here — its binary-attachment stub is a
+      // separate, lower-priority concern (no tool-invocation failure mode exists
+      // there since chat-only never calls tools).
+      const isImage = (name: string) => /\.(png|jpe?g|gif|webp|bmp)$/i.test(name);
+      const imageFiles = !chatOnly ? files.filter((f) => !f.is_dir && isImage(f.name)) : [];
+      const otherFiles = files.filter((f) => !imageFiles.includes(f));
+      let images: { mime: string; data_url: string }[] | undefined;
+      if (imageFiles.length) {
+        images = [];
+        for (const f of imageFiles) {
           try {
             const file = await ipc.readFileAny(f.path);
-            if (file.kind === 'text') {
-              get().addPastedText(file.content, f.name);
-            } else {
-              get().addPastedText(
-                `[Attached file "${f.name}" — ${file.mime ?? 'binary'}; contents not inlined.]`,
-                f.name
-              );
-            }
+            images.push({ mime: file.mime ?? 'image/png', data_url: file.content });
           } catch (e) {
             set({ error: String(e) });
           }
         }
-        return;
       }
-      // Agentic: hand paths to the filesystem tools (works for any file type).
-      set((s) => {
-        const seen = new Set(s.droppedFiles.map((f) => f.path));
-        return { droppedFiles: [...s.droppedFiles, ...infos.filter((f) => !seen.has(f.path))] };
-      });
-    } catch (e) {
-      set({ error: String(e) });
-    }
-  },
 
-  removeDroppedPath: (path: string) =>
-    set((s) => ({ droppedFiles: s.droppedFiles.filter((f) => f.path !== path) })),
-
-  setWorkingDir: async (folder: string) => {
-    await get().newSession(folder);
-  },
-
-  addPastedText: (text: string, label?: string) =>
-    set((s) => ({
-      attachments: [
-        ...s.attachments,
-        {
-          id: newId(),
-          label: label ?? `Pasted text — ${text.trim().split(/\s+/).length} words`,
-          content: text,
-        },
-      ],
-    })),
-
-  removeAttachment: (id: string) =>
-    set((s) => ({ attachments: s.attachments.filter((a) => a.id !== id) })),
-
-  exportSession: async (upToIndex?: number) => {
-    const { messages, title } = get();
-    if (messages.length === 0) return;
-    const chatMessages = buildExport(messages, upToIndex);
-    const base = sanitizeFilename(title ?? 'goose-session');
-    const path = await pickSavePath(`${base}.jsonl`);
-    if (!path) return;
-    try {
-      await ipc.writeFile(path, JSON.stringify({ messages: chatMessages }) + '\n');
-    } catch (e) {
-      set({ error: String(e) });
-    }
-  },
-
-  branch: async (uiIndex: number) => {
-    const { sessionId, cwd, title } = get();
-    if (!sessionId || !cwd) return;
-    try {
-      // Keep history up to and including the clicked message, diverge after.
-      const info = await ipc.forkSession(sessionId, cwd, uiIndex + 1);
-      set({ title: title ? `Branch of ${title}` : 'Branch' });
-      await get().loadSession(info.session_id, info.cwd, get().title ?? undefined);
-    } catch (e) {
-      set({ error: String(e) });
-    }
-  },
-
-  regenerate: async (assistantIndex: number) => {
-    const { sessionId, cwd, messages } = get();
-    if (!sessionId || !cwd) return;
-    // Find the user message preceding this assistant turn.
-    let userIdx = assistantIndex - 1;
-    while (userIdx >= 0 && messages[userIdx].role !== 'user') userIdx--;
-    if (userIdx < 0) return;
-    const userText = messages[userIdx].text;
-    try {
-      // Fork + truncate to just before the user turn so the original response is
-      // preserved in the parent session; then resend.
-      const info = await ipc.forkSession(sessionId, cwd, userIdx);
-      await get().loadSession(info.session_id, info.cwd, get().title ?? undefined);
-      await get().send(userText);
-    } catch (e) {
-      set({ error: String(e) });
-    }
-  },
-
-  send: async (text: string) => {
-    const trimmed = text.trim();
-    const attachments = get().attachments;
-    if ((!trimmed && attachments.length === 0) || get().busy) return;
-    const firstMessage = get().messages.length === 0;
-    const chatOnly = !get().toolsEnabled;
-    const sessionId = await get().ensureSession();
-    const files = get().droppedFiles;
-
-    // Agentic-mode images go as native ACP image content blocks instead of a
-    // bare filesystem path reference (Round-3 item 17 — fixes untrusted/remote
-    // providers failing with "file not found": the model no longer has to
-    // correctly invoke a file tool on an exact path just to see the picture).
-    // Chat-only mode is unaffected here — its binary-attachment stub is a
-    // separate, lower-priority concern (no tool-invocation failure mode exists
-    // there since chat-only never calls tools).
-    const isImage = (name: string) => /\.(png|jpe?g|gif|webp|bmp)$/i.test(name);
-    const imageFiles = !chatOnly ? files.filter((f) => !f.is_dir && isImage(f.name)) : [];
-    const otherFiles = files.filter((f) => !imageFiles.includes(f));
-    let images: { mime: string; data_url: string }[] | undefined;
-    if (imageFiles.length) {
-      images = [];
-      for (const f of imageFiles) {
-        try {
-          const file = await ipc.readFileAny(f.path);
-          images.push({ mime: file.mime ?? 'image/png', data_url: file.content });
-        } catch (e) {
-          set({ error: String(e) });
-        }
+      let promptText = trimmed;
+      if (chatOnly && attachments.length) {
+        // Inline document content directly (no filesystem tool in chat-only mode).
+        const docs = attachments.map((a) => `--- ${a.label} ---\n${a.content}`).join('\n\n');
+        promptText = `${docs}\n\n${trimmed}`.trim();
+      } else if (otherFiles.length) {
+        // Agentic: hand non-image paths to the filesystem tools (CLAUDE.md §5).
+        const block =
+          'Files provided by the user:\n' + otherFiles.map((f) => `- ${f.path}`).join('\n');
+        promptText = `${block}\n\n${trimmed}`;
       }
-    }
 
-    let promptText = trimmed;
-    if (chatOnly && attachments.length) {
-      // Inline document content directly (no filesystem tool in chat-only mode).
-      const docs = attachments.map((a) => `--- ${a.label} ---\n${a.content}`).join('\n\n');
-      promptText = `${docs}\n\n${trimmed}`.trim();
-    } else if (otherFiles.length) {
-      // Agentic: hand non-image paths to the filesystem tools (CLAUDE.md §5).
-      const block =
-        'Files provided by the user:\n' + otherFiles.map((f) => `- ${f.path}`).join('\n');
-      promptText = `${block}\n\n${trimmed}`;
-    }
-
-    // STOPGAP client-side workaround (see buildStrippedTranscript's doc comment):
-    // only engages once some prior assistant turn actually reasoned — a turn
-    // with nothing to strip shouldn't pay for a session swap. Prior turns come
-    // from local render state, since goosed's own history is exactly what we're
-    // bypassing here.
-    const priorMessages = get().messages;
-    const stripReasoningNow =
-      chatOnly &&
-      get().stripReasoning &&
-      priorMessages.some((m) => m.role === 'assistant' && m.reasoning.trim().length > 0);
-    if (stripReasoningNow) {
-      promptText = `${buildStrippedTranscript(priorMessages)}\n\nUser: ${promptText}`;
-    }
-    const cwd = get().cwd ?? undefined;
-
-    const userMsg: Message = {
-      id: newId(),
-      role: 'user',
-      text: trimmed || (attachments.length ? `(${attachments.length} document(s))` : ''),
-      reasoning: '',
-      toolCalls: [],
-      streaming: false,
-      open: false,
-    };
-    set((s) => ({
-      messages: [...s.messages, userMsg],
-      droppedFiles: [],
-      attachments: [],
-      busy: true,
-      error: null,
-    }));
-    try {
-      lastSentAt = performance.now();
+      // STOPGAP client-side workaround (see buildStrippedTranscript's doc comment):
+      // only engages once some prior assistant turn actually reasoned — a turn
+      // with nothing to strip shouldn't pay for a session swap. Prior turns come
+      // from local render state, since goosed's own history is exactly what we're
+      // bypassing here.
+      const priorMessages = get().messages;
+      const stripReasoningNow =
+        chatOnly &&
+        get().stripReasoning &&
+        priorMessages.some((m) => m.role === 'assistant' && m.reasoning.trim().length > 0);
       if (stripReasoningNow) {
-        // Swap to a brand-new goosed session carrying only the reconstructed,
-        // reasoning-free transcript — never the old session (which still has
-        // goosed's own unstripped history). `sessionId` (and `mode`) MUST be
-        // updated before `sendPrompt` fires, not after: `bindEvents()`'s stream
-        // handlers all gate on `forActive(sid)` (`get().sessionId === sid`), so
-        // deferring the swap would silently drop every event for this turn.
-        const oldSessionId = sessionId;
-        const info = await ipc.newSession(cwd);
-        set({
-          sessionId: info.session_id,
-          mode: info.current_mode,
-          availableModes: info.available_modes,
-        });
-        try {
-          await ipc.sendPrompt(info.session_id, promptText, images);
-        } catch (e) {
-          // The new session never got a real turn — drop it and restore the
-          // old (still fully intact) session rather than losing the thread.
-          // No `cwd` here: the working directory is shared with the session
-          // being restored, so skip delete_session's directory cleanup.
-          void ipc.deleteSession(info.session_id).catch(() => {});
-          set({ sessionId: oldSessionId });
-          throw e;
-        }
-        // Success: best-effort cleanup of the now-superseded old session — a
-        // failure here shouldn't surface as an error for a turn that actually
-        // succeeded. Same no-`cwd` reasoning as above (shared working dir).
-        void ipc.deleteSession(oldSessionId).catch(() => {});
-      } else {
-        await ipc.sendPrompt(sessionId, promptText, images);
+        promptText = `${buildStrippedTranscript(priorMessages)}\n\nUser: ${promptText}`;
       }
-      // Chat-only: auto-promote the *first* overlay message to the full window.
-      if (chatOnly && firstMessage && windowLabel() === 'overlay') {
-        const s = get();
-        await ipc.setActiveSession({
-          session_id: s.sessionId!,
-          cwd: s.cwd ?? '',
-          current_mode: s.mode ?? 'auto',
-          available_modes: s.availableModes,
-        });
-        await ipc.openMain();
-        await ipc.hideOverlay();
-      }
-    } catch (e) {
-      set({ busy: false, error: String(e) });
-    }
-  },
+      const cwd = get().cwd ?? undefined;
 
-  bindEvents: () => {
-    if (bound) return;
-    bound = true;
-
-    const forActive = (sid: string) => get().sessionId === sid;
-
-    // Append a text/reasoning chunk to the open message of `role`, opening a new
-    // one (and closing any prior open message) when the turn changes.
-    const appendChunk = (role: 'user' | 'assistant', field: 'text' | 'reasoning', text: string) =>
-      set((s) => {
-        const msgs = s.messages.slice();
-        const last = msgs[msgs.length - 1];
-        if (last && last.role === role && last.open) {
-          msgs[msgs.length - 1] = { ...last, [field]: last[field] + text };
-          return { messages: msgs };
-        }
-        const closed = closeOpen(msgs);
-        closed.push({
-          id: newId(),
-          role,
-          text: field === 'text' ? text : '',
-          reasoning: field === 'reasoning' ? text : '',
-          toolCalls: [],
-          streaming: role === 'assistant',
-          open: true,
-        });
-        return { messages: closed };
-      });
-
-    void onMessageDelta((e) => {
-      if (forActive(e.session_id)) appendChunk('assistant', 'text', e.text);
-    });
-    void onReasoningDelta((e) => {
-      if (forActive(e.session_id)) appendChunk('assistant', 'reasoning', e.text);
-    });
-    void onUserMessage((e) => {
-      if (forActive(e.session_id)) appendChunk('user', 'text', e.text);
-    });
-
-    void onToolCall((e) => {
-      if (!forActive(e.session_id)) return;
-      const u: ToolCallUpdate = e.update;
-      const id = String(u.toolCallId ?? '');
-      const artifact = deriveArtifact(u);
-      set((s) => {
-        let msgs = s.messages.slice();
-        let last = msgs[msgs.length - 1];
-        if (!(last && last.role === 'assistant' && last.open)) {
-          msgs = closeOpen(msgs);
-          last = {
-            id: newId(),
-            role: 'assistant',
-            text: '',
-            reasoning: '',
-            toolCalls: [],
-            streaming: true,
-            open: true,
-          };
-          msgs.push(last);
-        } else {
-          last = { ...last };
-          msgs[msgs.length - 1] = last;
-        }
-        const toolCalls = last.toolCalls.slice();
-        const existing = toolCalls.findIndex((t) => t.id === id);
-        const prev = existing >= 0 ? toolCalls[existing] : undefined;
-        const merged: ToolCall = {
-          id,
-          title: prev?.title ?? String(u.title ?? u.kind ?? 'tool'),
-          status:
-            u.status != null
-              ? String(u.status)
-              : (prev?.status ?? (e.phase === 'tool_call' ? 'pending' : 'running')),
-          input: u.rawInput ?? prev?.input,
-          output: u.rawOutput ?? u.content ?? prev?.output,
-        };
-        if (existing >= 0) toolCalls[existing] = merged;
-        else toolCalls.push(merged);
-        last.toolCalls = toolCalls;
-
-        const artifacts =
-          artifact && !s.artifacts.some((a) => a.path === artifact.path)
-            ? [...s.artifacts, artifact]
-            : s.artifacts;
-        return { messages: msgs, artifacts };
-      });
-    });
-
-    void onSessionTitle((e) => {
-      if (forActive(e.session_id)) set({ title: e.title });
-    });
-    void onMode((e) => {
-      if (forActive(e.session_id)) set({ mode: e.mode });
-    });
-
-    void onProviderHealth((h) => {
-      set({ providerOffline: !h.reachable, providerHost: h.host ?? get().providerHost });
-    });
-    // Provider (de)activated → re-sync provider-derived state immediately so the
-    // UI doesn't drift until the next session or health tick (Round-2 item 4).
-    void onProviderActivated(() => void get().refreshProvider());
-    void onApprovalNeeded((e) => {
-      if (!forActive(e.session_id)) return;
-      set((s) =>
-        s.pendingApprovals.some((a) => a.tool_call_id === e.tool_call_id)
-          ? {}
-          : { pendingApprovals: [...s.pendingApprovals, e] }
-      );
-    });
-
-    void onComplete((e) => {
-      if (!forActive(e.session_id)) return;
-      const durationMs = lastSentAt != null ? performance.now() - lastSentAt : undefined;
-      lastSentAt = null;
-      const usage = e.result.usage;
-      set((s) => {
-        const msgs = closeOpen(s.messages);
-        const lastIdx = msgs.length - 1;
-        if (lastIdx >= 0 && msgs[lastIdx].role === 'assistant') {
-          msgs[lastIdx] = {
-            ...msgs[lastIdx],
-            durationMs,
-            inputTokens: usage?.inputTokens,
-            outputTokens: usage?.outputTokens,
-            providerName: s.providerName ?? undefined,
-          };
-        }
-        return { busy: false, pendingApprovals: [], messages: msgs };
-      });
-    });
-    void onChatError((e) => {
-      if (!forActive(e.session_id)) return;
+      const userMsg: Message = {
+        id: newId(),
+        role: 'user',
+        text: trimmed || (attachments.length ? `(${attachments.length} document(s))` : ''),
+        reasoning: '',
+        toolCalls: [],
+        streaming: false,
+        open: false,
+      };
       set((s) => ({
-        busy: false,
-        error: e.message,
-        pendingApprovals: [],
-        messages: closeOpen(s.messages),
+        messages: [...s.messages, userMsg],
+        droppedFiles: [],
+        attachments: [],
+        busy: true,
+        error: null,
       }));
-    });
-  },
-}));
+      try {
+        lastSentAt = performance.now();
+        if (stripReasoningNow) {
+          // Swap to a brand-new goosed session carrying only the reconstructed,
+          // reasoning-free transcript — never the old session (which still has
+          // goosed's own unstripped history). `sessionId` (and `mode`) MUST be
+          // updated before `sendPrompt` fires, not after: `bindEvents()`'s stream
+          // handlers all gate on `forActive(sid)` (`get().sessionId === sid`), so
+          // deferring the swap would silently drop every event for this turn.
+          const oldSessionId = sessionId;
+          const oldModeOverride = get().modeOverride;
+          const info = await ipc.newSession(cwd);
+          set({
+            sessionId: info.session_id,
+            mode: info.current_mode,
+            availableModes: info.available_modes,
+          });
+          // Carry the mode override across to the new session id (it's the same
+          // conversation from the user's perspective) and force a safe approval
+          // mode on it, same as any other freshly-established chat-mode session.
+          if (oldModeOverride) {
+            void ipc.setSessionMode(info.session_id, oldModeOverride).catch(() => {});
+          }
+          await ensureSafeApprovalMode();
+          try {
+            await ipc.sendPrompt(info.session_id, promptText, images);
+          } catch (e) {
+            // The new session never got a real turn — drop it and restore the
+            // old (still fully intact) session rather than losing the thread.
+            // No `cwd` here: the working directory is shared with the session
+            // being restored, so skip delete_session's directory cleanup.
+            void ipc.deleteSession(info.session_id).catch(() => {});
+            void ipc.setSessionMode(info.session_id, null).catch(() => {});
+            set({ sessionId: oldSessionId, modeOverride: oldModeOverride });
+            throw e;
+          }
+          // Success: best-effort cleanup of the now-superseded old session and
+          // its mode-override entry — a failure here shouldn't surface as an
+          // error for a turn that actually succeeded. Same no-`cwd` reasoning as
+          // above (shared working dir).
+          void ipc.deleteSession(oldSessionId).catch(() => {});
+          void ipc.setSessionMode(oldSessionId, null).catch(() => {});
+        } else {
+          await ipc.sendPrompt(sessionId, promptText, images);
+        }
+        // Chat-only: auto-promote the *first* overlay message to the full window.
+        if (chatOnly && firstMessage && windowLabel() === 'overlay') {
+          const s = get();
+          await ipc.setActiveSession({
+            session_id: s.sessionId!,
+            cwd: s.cwd ?? '',
+            current_mode: s.mode ?? 'auto',
+            available_modes: s.availableModes,
+          });
+          await ipc.openMain();
+          await ipc.hideOverlay();
+        }
+      } catch (e) {
+        set({ busy: false, error: String(e) });
+      }
+    },
+
+    bindEvents: () => {
+      if (bound) return;
+      bound = true;
+
+      const forActive = (sid: string) => get().sessionId === sid;
+
+      // Append a text/reasoning chunk to the open message of `role`, opening a new
+      // one (and closing any prior open message) when the turn changes.
+      const appendChunk = (role: 'user' | 'assistant', field: 'text' | 'reasoning', text: string) =>
+        set((s) => {
+          const msgs = s.messages.slice();
+          const last = msgs[msgs.length - 1];
+          if (last && last.role === role && last.open) {
+            msgs[msgs.length - 1] = { ...last, [field]: last[field] + text };
+            return { messages: msgs };
+          }
+          const closed = closeOpen(msgs);
+          closed.push({
+            id: newId(),
+            role,
+            text: field === 'text' ? text : '',
+            reasoning: field === 'reasoning' ? text : '',
+            toolCalls: [],
+            streaming: role === 'assistant',
+            open: true,
+          });
+          return { messages: closed };
+        });
+
+      void onMessageDelta((e) => {
+        if (forActive(e.session_id)) appendChunk('assistant', 'text', e.text);
+      });
+      void onReasoningDelta((e) => {
+        if (forActive(e.session_id)) appendChunk('assistant', 'reasoning', e.text);
+      });
+      void onUserMessage((e) => {
+        if (forActive(e.session_id)) appendChunk('user', 'text', e.text);
+      });
+
+      void onToolCall((e) => {
+        if (!forActive(e.session_id)) return;
+        const u: ToolCallUpdate = e.update;
+        const id = String(u.toolCallId ?? '');
+        const artifact = deriveArtifact(u);
+        set((s) => {
+          let msgs = s.messages.slice();
+          let last = msgs[msgs.length - 1];
+          if (!(last && last.role === 'assistant' && last.open)) {
+            msgs = closeOpen(msgs);
+            last = {
+              id: newId(),
+              role: 'assistant',
+              text: '',
+              reasoning: '',
+              toolCalls: [],
+              streaming: true,
+              open: true,
+            };
+            msgs.push(last);
+          } else {
+            last = { ...last };
+            msgs[msgs.length - 1] = last;
+          }
+          const toolCalls = last.toolCalls.slice();
+          const existing = toolCalls.findIndex((t) => t.id === id);
+          const prev = existing >= 0 ? toolCalls[existing] : undefined;
+          const merged: ToolCall = {
+            id,
+            title: prev?.title ?? String(u.title ?? u.kind ?? 'tool'),
+            status:
+              u.status != null
+                ? String(u.status)
+                : (prev?.status ?? (e.phase === 'tool_call' ? 'pending' : 'running')),
+            input: u.rawInput ?? prev?.input,
+            output: u.rawOutput ?? u.content ?? prev?.output,
+          };
+          if (existing >= 0) toolCalls[existing] = merged;
+          else toolCalls.push(merged);
+          last.toolCalls = toolCalls;
+
+          const artifacts =
+            artifact && !s.artifacts.some((a) => a.path === artifact.path)
+              ? [...s.artifacts, artifact]
+              : s.artifacts;
+          return { messages: msgs, artifacts };
+        });
+      });
+
+      void onSessionTitle((e) => {
+        if (forActive(e.session_id)) set({ title: e.title });
+      });
+      void onMode((e) => {
+        if (forActive(e.session_id)) set({ mode: e.mode });
+      });
+
+      void onProviderHealth((h) => {
+        set({ providerOffline: !h.reachable, providerHost: h.host ?? get().providerHost });
+      });
+      // Provider (de)activated → re-sync provider-derived state immediately so the
+      // UI doesn't drift until the next session or health tick (Round-2 item 4).
+      void onProviderActivated(() => void get().refreshProvider());
+      void onApprovalNeeded((e) => {
+        if (!forActive(e.session_id)) return;
+        // Round-4 tool-safety fix: chat mode never executes tools, so a
+        // permission request there means the model tried anyway — decline it
+        // automatically instead of showing a hidden prompt the turn would hang
+        // waiting on (ChatView doesn't render ApprovalPrompt in chat mode).
+        if (isChatMode(get())) {
+          void ipc.respondPermission(e.tool_call_id, pickRejectOption(e.options)).catch(() => {});
+          set({
+            warning:
+              'Tool use is off in chat mode — the model tried to use a tool and was declined.',
+          });
+          return;
+        }
+        set((s) =>
+          s.pendingApprovals.some((a) => a.tool_call_id === e.tool_call_id)
+            ? {}
+            : { pendingApprovals: [...s.pendingApprovals, e] }
+        );
+      });
+
+      void onComplete((e) => {
+        if (!forActive(e.session_id)) return;
+        const durationMs = lastSentAt != null ? performance.now() - lastSentAt : undefined;
+        lastSentAt = null;
+        const usage = e.result.usage;
+        set((s) => {
+          const msgs = closeOpen(s.messages);
+          const lastIdx = msgs.length - 1;
+          if (lastIdx >= 0 && msgs[lastIdx].role === 'assistant') {
+            msgs[lastIdx] = {
+              ...msgs[lastIdx],
+              durationMs,
+              inputTokens: usage?.inputTokens,
+              outputTokens: usage?.outputTokens,
+              providerName: s.providerName ?? undefined,
+            };
+          }
+          return { busy: false, pendingApprovals: [], messages: msgs };
+        });
+      });
+      void onChatError((e) => {
+        if (!forActive(e.session_id)) return;
+        set((s) => ({
+          busy: false,
+          error: e.message,
+          pendingApprovals: [],
+          messages: closeOpen(s.messages),
+        }));
+      });
+    },
+  };
+});

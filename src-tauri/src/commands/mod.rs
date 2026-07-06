@@ -756,6 +756,38 @@ pub fn assign_session_folder(
     config::save(&cfg).map_err(|e| e.to_string())
 }
 
+// ===================== Round-4: instant per-session mode toggle =====================
+
+/// Get a session's persisted chat/agentic mode override, if any (`None` =
+/// follow the active provider's `tools_enabled` default).
+#[tauri::command]
+pub fn get_session_mode(
+    state: tauri::State<'_, AppState>,
+    session_id: String,
+) -> Result<Option<String>, String> {
+    let cfg = state.config.lock().unwrap();
+    Ok(cfg.session_modes.get(&session_id).cloned())
+}
+
+/// Set (or clear, via `None`) a session's mode override.
+#[tauri::command]
+pub fn set_session_mode(
+    state: tauri::State<'_, AppState>,
+    session_id: String,
+    mode: Option<String>,
+) -> Result<(), String> {
+    let mut cfg = state.config.lock().unwrap();
+    match mode {
+        Some(m) if !m.trim().is_empty() => {
+            cfg.session_modes.insert(session_id, m);
+        }
+        _ => {
+            cfg.session_modes.remove(&session_id);
+        }
+    }
+    config::save(&cfg).map_err(|e| e.to_string())
+}
+
 /// Delete a session (ACP `session/delete`). If `cwd` sits under the private
 /// `Documents/Kitty/chats/` prefix (i.e. it was never an explicit user-chosen
 /// working directory — see `resolve_cwd`), also remove that directory. The

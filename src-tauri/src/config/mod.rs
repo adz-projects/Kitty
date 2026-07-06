@@ -62,6 +62,13 @@ pub struct Config {
     pub session_folders: HashMap<String, String>,
     /// Whether the main window's artifacts pane is shown (Round-3 item 6).
     pub show_artifacts: bool,
+    /// Per-session chat/agentic mode override (Round-4 instant mode toggle).
+    /// Maps a goosed session id → `"chat"` | `"agentic"`. Absent = follow the
+    /// active provider's `tools_enabled` default. Persisted (not transient) so
+    /// resuming a flipped session doesn't silently revert its attachment/tool
+    /// semantics — mirrors `session_folders` above.
+    #[serde(default)]
+    pub session_modes: HashMap<String, String>,
 }
 
 impl Default for Config {
@@ -84,6 +91,7 @@ impl Default for Config {
             folders: Vec::new(),
             session_folders: HashMap::new(),
             show_artifacts: true,
+            session_modes: HashMap::new(),
         }
     }
 }

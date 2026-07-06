@@ -443,6 +443,26 @@ button.primary {
   border: 1px solid var(--border);
   color: var(--text-muted);
 }
+
+/* Instant chat/agentic mode toggle (Round-4). */
+.mode-toggle {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  overflow: hidden;
+}
+.mode-toggle button {
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 11px;
+  padding: 3px 8px;
+  cursor: pointer;
+}
+.mode-toggle button.active {
+  background: var(--accent);
+  color: var(--accent-text);
+}
 .status-badge-warn {
   border-color: var(--warn);
   color: var(--warn);

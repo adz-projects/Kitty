@@ -25,7 +25,7 @@ export function App() {
     void init();
     void (async () => {
       const info = await ipc.getActiveSession();
-      if (info) useChatStore.getState().adoptSession(info);
+      if (info) await useChatStore.getState().adoptSession(info);
     })();
     // Show/hide-artifacts is persisted (Round-3 item 6).
     void ipc.getConfig().then((c) => setShowArtifacts(c.show_artifacts));

@@ -86,6 +86,8 @@ pub fn run() {
             commands::rename_folder,
             commands::delete_folder,
             commands::assign_session_folder,
+            commands::get_session_mode,
+            commands::set_session_mode,
             commands::inspect_paths,
             commands::open_path,
             commands::reveal_path,

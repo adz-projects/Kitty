@@ -1,11 +1,12 @@
 import { useEffect } from 'react';
 import { onFileDrop, pickFolder } from '@/lib/ipc';
-import { useChatStore } from '@/stores/chatStore';
+import { isChatMode, useChatStore } from '@/stores/chatStore';
 import { supportsReasoning } from '@/lib/reasoning_models';
 import { MessageList } from './MessageList';
 import { Composer } from './Composer';
 import { ApprovalPrompt } from './ApprovalPrompt';
 import { ModeBadge } from './ModeBadge';
+import { ModeToggle } from './ModeToggle';
 import { ProviderBadge } from './ProviderBadge';
 import { FileChips } from './FileChips';
 import { AttachmentChips } from './AttachmentChips';
@@ -21,7 +22,6 @@ export function ChatView() {
     cwd,
     title,
     pendingApprovals,
-    toolsEnabled,
     providerHost,
     providerOffline,
     warning,
@@ -35,6 +35,7 @@ export function ChatView() {
     refreshProvider,
     model,
   } = useChatStore();
+  const chatOnly = useChatStore(isChatMode);
 
   useEffect(() => {
     bindEvents();
@@ -51,7 +52,6 @@ export function ChatView() {
   const awaitingFirstToken =
     busy &&
     (!last || last.role === 'user' || (last.role === 'assistant' && !last.text && !last.reasoning));
-  const chatOnly = !toolsEnabled;
   // Predictive hint for the thinking indicator (the reasoning panel itself is
   // content-driven). True if the model is known-reasoning or reasoning already began.
   const thinkingReasoning =
@@ -79,6 +79,7 @@ export function ChatView() {
           </button>
         )}
         <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+          <ModeToggle />
           <ProviderBadge />
           {!chatOnly && <ModeBadge />}
         </div>

@@ -1,5 +1,5 @@
 import { useRef, useState } from 'react';
-import { useChatStore } from '@/stores/chatStore';
+import { isChatMode, useChatStore } from '@/stores/chatStore';
 
 // Pastes larger than this (chat-only mode) collapse into a document attachment.
 const PASTE_THRESHOLD = 500;
@@ -18,7 +18,7 @@ export function Composer({
 }) {
   const [text, setText] = useState('');
   const ref = useRef<HTMLTextAreaElement>(null);
-  const toolsEnabled = useChatStore((s) => s.toolsEnabled);
+  const chatOnly = useChatStore(isChatMode);
   const addPastedText = useChatStore((s) => s.addPastedText);
 
   const submit = () => {
@@ -49,7 +49,7 @@ export function Composer({
           }
         }}
         onPaste={(e) => {
-          if (toolsEnabled) return; // agentic mode keeps native paste
+          if (!chatOnly) return; // agentic mode keeps native paste
           const pasted = e.clipboardData.getData('text');
           if (pasted.length > PASTE_THRESHOLD) {
             e.preventDefault();

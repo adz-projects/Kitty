@@ -61,6 +61,10 @@ export const ipc = {
   deleteFolder: (name: string) => invoke<void>('delete_folder', { name }),
   assignSessionFolder: (sessionId: string, folder: string | null) =>
     invoke<void>('assign_session_folder', { sessionId, folder }),
+  // Instant per-session mode toggle (Round-4)
+  getSessionMode: (sessionId: string) => invoke<string | null>('get_session_mode', { sessionId }),
+  setSessionMode: (sessionId: string, mode: string | null) =>
+    invoke<void>('set_session_mode', { sessionId, mode }),
   forkSession: (sessionId: string, cwd: string, truncateFrom: number | null) =>
     invoke<SessionInfo>('fork_session', { sessionId, cwd, truncateFrom }),
   readTextFile: (path: string) => invoke<string>('read_text_file', { path, maxBytes: null }),
