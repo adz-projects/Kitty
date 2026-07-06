@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { ipc } from '@/lib/ipc';
 import { useStackStore } from '@/stores/stackStore';
 import { useChatStore } from '@/stores/chatStore';
-import { StackStatusView } from '@/components/StackStatusView';
+import { StackStatusView } from '@/components/shared/StackStatusView';
 import { ChatView } from '@/components/chat/ChatView';
 import { SessionList } from '@/components/sessions/SessionList';
 import { ArtifactsPane } from '@/components/artifacts/ArtifactsPane';

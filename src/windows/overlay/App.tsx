@@ -2,7 +2,7 @@ import { useEffect } from 'react';
 import { ipc, onNewSessionRequest } from '@/lib/ipc';
 import { useStackStore } from '@/stores/stackStore';
 import { useChatStore } from '@/stores/chatStore';
-import { StackStatusView } from '@/components/StackStatusView';
+import { StackStatusView } from '@/components/shared/StackStatusView';
 import { ChatView } from '@/components/chat/ChatView';
 import { RecentSessions } from '@/components/sessions/RecentSessions';
 import { NewChatIcon } from '@/components/icons/NewChatIcon';
