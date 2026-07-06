@@ -29,9 +29,25 @@ async function themeCss(name: string): Promise<string> {
   }
 }
 
+/** Windows' own wallpaper-fit terms (Fill/Fit/Stretch/Center), mapped to CSS
+    `background-size`/`background-repeat` (Round-4 item 2). "Center" (actual
+    size, no scaling) needs `auto` + `no-repeat` since `background-size` alone
+    would otherwise default to tiling at natural size. */
+const BG_SIZE_CSS: Record<Config['background_size'], string> = {
+  cover: 'cover',
+  contain: 'contain',
+  stretch: '100% 100%',
+  center: 'auto',
+};
+
 async function applyBackground(cfg: Config) {
   const root = document.documentElement;
   root.style.setProperty('--bg-image-dim', String(cfg.background_dim ?? 0.3));
+  root.style.setProperty(
+    '--bg-position',
+    `${cfg.background_position_x ?? 50}% ${cfg.background_position_y ?? 50}%`
+  );
+  root.style.setProperty('--bg-size', BG_SIZE_CSS[cfg.background_size] ?? 'cover');
   if (cfg.background_image) {
     try {
       const url = await ipc.readImageDataUrl(cfg.background_image);

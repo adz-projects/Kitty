@@ -51,7 +51,7 @@ function PlainList({
     if (el) el.scrollTop = el.scrollHeight;
   }, [messages]);
   return (
-    <div className="message-list" ref={ref}>
+    <div className={`message-list${messages.length === 0 ? ' empty' : ''}`} ref={ref}>
       {messages.length === 0 && <p className="muted">{empty}</p>}
       {messages.map((m, i) => (
         <MessageItem key={m.id} message={m} index={i} />

@@ -166,17 +166,23 @@ export function General() {
       </small>
 
       <label className="field">
-        <span>Auto-summarize threshold (messages)</span>
-        <input
-          type="number"
-          min={0}
-          value={draft.auto_summarize_threshold ?? ''}
+        <span>When a conversation gets long</span>
+        <select
+          value={draft.context_strategy ?? 'summarize'}
           onChange={(e) =>
-            update({
-              auto_summarize_threshold: e.target.value ? Number(e.target.value) : null,
-            })
+            update({ context_strategy: e.target.value as typeof draft.context_strategy })
           }
-        />
+        >
+          <option value="summarize">Summarize the older parts</option>
+          <option value="truncate">Truncate the oldest messages</option>
+          <option value="clear">Clear it and start fresh</option>
+          <option value="prompt">Ask me each time</option>
+        </select>
+        <small className="muted">
+          Goose triggers this automatically as the conversation approaches its model&apos;s context
+          limit — this isn&apos;t a message count you set, it&apos;s which strategy Goose uses when
+          that happens.
+        </small>
       </label>
 
       <label className="check">

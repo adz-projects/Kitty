@@ -200,6 +200,11 @@ export type ClipboardAttachEvent =
 export const onClipboardAttach = (cb: (e: ClipboardAttachEvent) => void) =>
   listen<ClipboardAttachEvent>('clipboard://attach', (e) => cb(e.payload));
 
+/** A new session was created in *any* window (Round-4 item 6) — overlay and
+    main each own an independent store, so this is how one tells the other
+    its session list/recents dropdown is stale. */
+export const onSessionCreated = (cb: () => void) => listen('session://created', () => cb());
+
 export interface ProviderHealth {
   reachable: boolean;
   host?: string;

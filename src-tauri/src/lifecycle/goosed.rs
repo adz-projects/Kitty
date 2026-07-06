@@ -52,6 +52,14 @@ fn generate_secret() -> String {
 
 /// Spawn `goose serve` on a free port and wait (briefly) for it to bind. `env`
 /// carries provider/model overrides from the active profile (see providers.rs).
+///
+/// Round-4 item 4 ("provider switch sometimes very long") was diagnosed here
+/// with temporary timing instrumentation: a live provider switch consistently
+/// measured ~500-540ms total for kill+respawn+readiness, regardless of
+/// source/destination provider — this path is not the bottleneck. The
+/// reported slowness is the first real inference call to the newly-active
+/// provider (e.g. OpenRouter routing/model cold-start), which happens inside
+/// goosed's own outbound request and is outside Kitty's control to fix.
 pub async fn spawn(env: Vec<(String, String)>) -> Result<GoosedHandle, String> {
     let bin = locate_goose();
     let port = free_port().map_err(|e| format!("no free port: {e}"))?;

@@ -83,6 +83,49 @@ export function Appearance() {
         />
       </label>
 
+      <label className="field">
+        <span>Background fit</span>
+        <select
+          value={draft.background_size ?? 'cover'}
+          onChange={(e) =>
+            update({ background_size: e.target.value as typeof draft.background_size })
+          }
+        >
+          <option value="cover">Fill</option>
+          <option value="contain">Fit</option>
+          <option value="stretch">Stretch</option>
+          <option value="center">Center</option>
+        </select>
+      </label>
+
+      <label className="field">
+        <span>
+          Background position — horizontal ({Math.round(draft.background_position_x ?? 50)}%)
+        </span>
+        <input
+          type="range"
+          min={0}
+          max={100}
+          step={1}
+          value={draft.background_position_x ?? 50}
+          onChange={(e) => update({ background_position_x: Number(e.target.value) })}
+        />
+      </label>
+
+      <label className="field">
+        <span>
+          Background position — vertical ({Math.round(draft.background_position_y ?? 50)}%)
+        </span>
+        <input
+          type="range"
+          min={0}
+          max={100}
+          step={1}
+          value={draft.background_position_y ?? 50}
+          onChange={(e) => update({ background_position_y: Number(e.target.value) })}
+        />
+      </label>
+
       <label className="check">
         <input
           type="checkbox"

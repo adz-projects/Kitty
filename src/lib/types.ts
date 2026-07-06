@@ -20,12 +20,15 @@ export interface Config {
   theme: string;
   background_image: string | null;
   background_dim: number;
+  background_position_x: number;
+  background_position_y: number;
+  background_size: 'cover' | 'contain' | 'stretch' | 'center';
   notifications: NotificationPrefs;
   remember_overlay_position: boolean;
   providers: ProviderProfile[];
   active_provider_id: string | null;
   strict_remote_mode: boolean;
-  auto_summarize_threshold: number | null;
+  context_strategy: 'summarize' | 'truncate' | 'clear' | 'prompt';
   show_artifacts: boolean;
 }
 

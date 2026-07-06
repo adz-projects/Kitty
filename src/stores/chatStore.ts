@@ -147,6 +147,13 @@ interface ChatState {
     current_mode: string;
     available_modes: ModeInfo[];
   }) => Promise<void>;
+  /** Hand the current session off to the main window (the overlay's "Expand"
+      button and the chat-only first-message auto-promote both use this).
+      Resets local session state afterward so reopening the overlay lands on
+      a blank composer instead of the just-expanded conversation (Round-4
+      item 7) — no new goosed session is created here; `ensureSession()`
+      lazily makes one on the overlay's next send(). */
+  handOffToMain: () => Promise<void>;
 }
 
 /** Effective chat/agentic mode for the current session: an explicit override
@@ -314,6 +321,39 @@ export const useChatStore = create<ChatState>((set, get) => {
       const override = await ipc.getSessionMode(info.session_id).catch(() => null);
       set({ modeOverride: (override as 'chat' | 'agentic' | null) ?? null });
       await ensureSafeApprovalMode();
+    },
+
+    handOffToMain: async () => {
+      const s = get();
+      if (s.sessionId) {
+        await ipc.setActiveSession({
+          session_id: s.sessionId,
+          cwd: s.cwd ?? '',
+          current_mode: s.mode ?? 'auto',
+          available_modes: s.availableModes,
+        });
+      }
+      await ipc.openMain();
+      await ipc.hideOverlay();
+      // No new goosed session is created here — ensureSession() lazily makes
+      // one the next time this (now-blank) overlay actually sends a message.
+      set({
+        sessionId: null,
+        cwd: null,
+        title: null,
+        mode: null,
+        availableModes: [],
+        messages: [],
+        artifacts: [],
+        droppedFiles: [],
+        attachments: [],
+        pendingImages: [],
+        pendingApprovals: [],
+        modeOverride: null,
+        savedApprovalMode: null,
+        error: null,
+        busy: false,
+      });
     },
 
     newSession: async (cwd?: string) => {
@@ -690,15 +730,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         }
         // Chat-only: auto-promote the *first* overlay message to the full window.
         if (chatOnly && firstMessage && windowLabel() === 'overlay') {
-          const s = get();
-          await ipc.setActiveSession({
-            session_id: s.sessionId!,
-            cwd: s.cwd ?? '',
-            current_mode: s.mode ?? 'auto',
-            available_modes: s.availableModes,
-          });
-          await ipc.openMain();
-          await ipc.hideOverlay();
+          await get().handOffToMain();
         }
       } catch (e) {
         set({ busy: false, error: String(e) });

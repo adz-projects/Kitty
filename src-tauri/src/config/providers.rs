@@ -231,6 +231,9 @@ pub fn goosed_env(config: &Config) -> Vec<(String, String)> {
         }
     }
 
+    // Global (not per-provider) context-management strategy (Round-4 item 3).
+    env.push(("GOOSE_CONTEXT_STRATEGY".into(), config.context_strategy.clone()));
+
     env
 }
 

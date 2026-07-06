@@ -45,6 +45,16 @@ pub struct Config {
     pub background_image: Option<String>,
     /// Background-image dim (0.0 = none, 1.0 = fully dark overlay).
     pub background_dim: f32,
+    /// Background-image position, 0.0-100.0 each axis (Round-4 item 2).
+    #[serde(default = "default_bg_position")]
+    pub background_position_x: f32,
+    #[serde(default = "default_bg_position")]
+    pub background_position_y: f32,
+    /// `"cover" | "contain" | "stretch" | "center"` (Round-4 item 2) — named to
+    /// match Windows' own wallpaper-fit terminology in the UI (Fill/Fit/
+    /// Stretch/Center).
+    #[serde(default = "default_bg_size")]
+    pub background_size: String,
     /// Per-event notification preferences (surfaced in Settings in Phase 5).
     pub notifications: NotificationPrefs,
     /// Remember overlay size/position between summons (Phase 6).
@@ -55,8 +65,15 @@ pub struct Config {
     pub active_provider_id: Option<String>,
     /// Disable file/folder drop while a remote-tier provider is active.
     pub strict_remote_mode: bool,
-    /// Auto-summarize threshold (Goose setting; app-side until wired).
-    pub auto_summarize_threshold: Option<u32>,
+    /// What goosed should do when a conversation approaches its context
+    /// limit (Round-4 item 3): `"summarize" | "truncate" | "clear" | "prompt"`,
+    /// threaded into its spawn env as `GOOSE_CONTEXT_STRATEGY`. Replaces the
+    /// old `auto_summarize_threshold` message-count field, which was never
+    /// actually read anywhere — Goose's real auto-compaction triggers on
+    /// context-percentage, not a user-settable message count, so that field's
+    /// semantics never mapped to anything real.
+    #[serde(default = "default_context_strategy")]
+    pub context_strategy: String,
     /// User-defined chat folders (Round-2 item 15). App-side only — layered over
     /// goosed's session list; not visible to other Goose clients.
     #[serde(default)]
@@ -87,18 +104,33 @@ impl Default for Config {
             theme: "default".to_string(),
             background_image: None,
             background_dim: 0.3,
+            background_position_x: default_bg_position(),
+            background_position_y: default_bg_position(),
+            background_size: default_bg_size(),
             notifications: NotificationPrefs::default(),
             remember_overlay_position: true,
             providers: Vec::new(),
             active_provider_id: None,
             strict_remote_mode: false,
-            auto_summarize_threshold: None,
+            context_strategy: default_context_strategy(),
             folders: Vec::new(),
             session_folders: HashMap::new(),
             show_artifacts: true,
             session_modes: HashMap::new(),
         }
     }
+}
+
+fn default_bg_position() -> f32 {
+    50.0
+}
+
+fn default_bg_size() -> String {
+    "cover".to_string()
+}
+
+fn default_context_strategy() -> String {
+    "summarize".to_string()
 }
 
 /// Per-event notification toggles.

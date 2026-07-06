@@ -1,6 +1,7 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useSessionStore } from '@/stores/sessionStore';
 import { useChatStore } from '@/stores/chatStore';
+import { onSessionCreated } from '@/lib/ipc';
 
 /** Lightweight last-10 recent-sessions dropdown for the compact overlay. */
 export function RecentSessions() {
@@ -8,6 +9,15 @@ export function RecentSessions() {
   const refresh = useSessionStore((s) => s.refresh);
   const sessions = useSessionStore((s) => s.sessions);
   const loadSession = useChatStore((s) => s.loadSession);
+
+  useEffect(() => {
+    // Round-4 item 6: keep the list fresh even while closed, so a session
+    // created in the other window (overlay/main each own an independent
+    // store) is there the next time this dropdown opens — and updates live
+    // if it's already open.
+    const un = onSessionCreated(() => void refresh());
+    return () => void un.then((fn) => fn());
+  }, [refresh]);
 
   const toggle = () => {
     const next = !open;

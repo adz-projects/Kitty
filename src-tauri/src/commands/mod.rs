@@ -363,6 +363,11 @@ pub async fn new_session(app: AppHandle, cwd: Option<String>) -> Result<SessionI
         .map(|arr| arr.iter().map(parse_mode).collect())
         .unwrap_or_default();
 
+    // Cross-window live-update (Round-4 item 6): overlay and main each own an
+    // independent zustand store, so nothing else tells the other window's
+    // session list/recents dropdown a new session now exists.
+    let _ = app.emit("session://created", json!({ "sessionId": session_id }));
+
     Ok(SessionInfo {
         session_id,
         cwd,
@@ -586,6 +591,7 @@ pub async fn fork_session(
         .and_then(|v| v.as_array())
         .map(|arr| arr.iter().map(parse_mode).collect())
         .unwrap_or_default();
+    let _ = app.emit("session://created", json!({ "sessionId": new_id }));
     Ok(SessionInfo {
         session_id: new_id,
         cwd,

@@ -47,8 +47,12 @@ html[data-bg-image] {
       rgba(0, 0, 0, var(--bg-image-dim, 0.3))
     ),
     var(--bg-image, none);
-  background-size: cover;
-  background-position: center;
+  /* Round-4 item 2: user-configurable position/size (Settings → Appearance),
+     defaulting to the original cover/center. No repeat in any fit mode —
+     "Center" (background-size: auto) would otherwise tile. */
+  background-size: var(--bg-size, cover);
+  background-position: var(--bg-position, 50% 50%);
+  background-repeat: no-repeat;
   background-attachment: fixed;
 }
 html[data-bg-image] .window-root,
@@ -199,6 +203,11 @@ button.primary {
   gap: 12px;
   padding: 4px;
   min-height: 0;
+}
+/* Round-4 item 1: `overflow-y: auto` reserves scrollbar chrome even with
+   nothing to scroll — suppress it while the list is empty. */
+.message-list.empty {
+  overflow-y: hidden;
 }
 
 .msg {
@@ -746,6 +755,9 @@ button.primary {
   padding: 8px 12px;
   border-bottom: 1px solid var(--border);
   cursor: pointer;
+  /* Round-4 item 5: text-select on the title/meta fought with the pointer-
+     based drag tracking (Round-3 batch 4) used to reassign a session's folder. */
+  user-select: none;
 }
 .session-item:hover {
   background: var(--surface-2);

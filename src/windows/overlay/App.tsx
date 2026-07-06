@@ -31,19 +31,7 @@ export function App() {
 
   const degraded = DEGRADED.includes(status);
 
-  const expand = async () => {
-    const s = useChatStore.getState();
-    if (s.sessionId) {
-      await ipc.setActiveSession({
-        session_id: s.sessionId,
-        cwd: s.cwd ?? '',
-        current_mode: s.mode ?? 'auto',
-        available_modes: s.availableModes,
-      });
-    }
-    await ipc.openMain();
-    await ipc.hideOverlay();
-  };
+  const expand = () => useChatStore.getState().handOffToMain();
 
   return (
     <div className="overlay-root">

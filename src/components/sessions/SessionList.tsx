@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
 import { UNCATEGORIZED, useSessionStore, type SessionGroup } from '@/stores/sessionStore';
 import { useChatStore } from '@/stores/chatStore';
+import { onSessionCreated } from '@/lib/ipc';
 import { SessionKebabMenu } from './SessionKebabMenu';
 import type { SessionSummary } from '@/lib/types';
 
@@ -38,6 +39,14 @@ export function SessionList() {
 
   useEffect(() => {
     void refresh();
+  }, [refresh]);
+
+  useEffect(() => {
+    // Round-4 item 6: a session created in the *other* window (overlay/main
+    // each own an independent store) doesn't otherwise show up here until a
+    // manual refresh.
+    const un = onSessionCreated(() => void refresh());
+    return () => void un.then((fn) => fn());
   }, [refresh]);
 
   useEffect(() => {
