@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { ipc, onPullProgress } from '@/lib/ipc';
 import type { OllamaModel, PullProgress } from '@/lib/types';
 
@@ -14,7 +14,6 @@ export function OllamaModels() {
   const [pullName, setPullName] = useState('');
   const [pulls, setPulls] = useState<Record<string, PullProgress>>({});
   const [error, setError] = useState('');
-  const bound = useRef(false);
 
   const refresh = () =>
     ipc
@@ -24,23 +23,31 @@ export function OllamaModels() {
 
   useEffect(() => {
     void refresh();
-    if (!bound.current) {
-      bound.current = true;
-      void onPullProgress((p) => {
-        setPulls((cur) => ({ ...cur, [p.pull_id]: p }));
-        if (p.done) {
-          void refresh();
-          // Drop the finished bar shortly after.
-          setTimeout(() => {
-            setPulls((cur) => {
-              const next = { ...cur };
-              delete next[p.pull_id];
-              return next;
-            });
-          }, 4000);
-        }
-      });
-    }
+    // This panel is conditionally rendered (mounts/unmounts each time the user
+    // switches settings tabs), so the listener + its cleanup timers must be
+    // torn down on unmount — otherwise every revisit stacks another listener
+    // on top of the last (Stage-1 close-out fix).
+    const timers = new Set<ReturnType<typeof setTimeout>>();
+    const unlisten = onPullProgress((p) => {
+      setPulls((cur) => ({ ...cur, [p.pull_id]: p }));
+      if (p.done) {
+        void refresh();
+        // Drop the finished bar shortly after.
+        const t = setTimeout(() => {
+          timers.delete(t);
+          setPulls((cur) => {
+            const next = { ...cur };
+            delete next[p.pull_id];
+            return next;
+          });
+        }, 4000);
+        timers.add(t);
+      }
+    });
+    return () => {
+      void unlisten.then((fn) => fn());
+      timers.forEach(clearTimeout);
+    };
   }, []);
 
   const startPull = async () => {

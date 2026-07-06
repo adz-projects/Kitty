@@ -151,12 +151,17 @@ fn acp_error_message(err: &Value) -> String {
 }
 
 /// Get-or-create the shared ACP client, connecting to the running goosed.
+///
+/// Holds a single `acp` lock across the whole check-connect-set sequence
+/// (rather than re-locking around the `connect().await`) so two concurrent
+/// callers that both find no client yet can't both dial a connection —
+/// the second would otherwise silently orphan the first's socket and its
+/// background reader/writer tasks.
 pub async fn ensure_client(app: &AppHandle) -> Result<AcpClient, String> {
     let state = app.state::<AppState>();
-    {
-        if let Some(existing) = state.acp.lock().await.as_ref() {
-            return Ok(existing.clone());
-        }
+    let mut guard = state.acp.lock().await;
+    if let Some(existing) = guard.as_ref() {
+        return Ok(existing.clone());
     }
     let (port, secret) = {
         let g = state.goosed.lock().unwrap();
@@ -166,6 +171,6 @@ pub async fn ensure_client(app: &AppHandle) -> Result<AcpClient, String> {
     let secret = secret.ok_or("Goose isn’t running yet.")?;
 
     let client = AcpClient::connect(app.clone(), port, &secret).await?;
-    *state.acp.lock().await = Some(client.clone());
+    *guard = Some(client.clone());
     Ok(client)
 }

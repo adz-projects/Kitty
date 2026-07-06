@@ -5,6 +5,7 @@
 //! `main`/`settings`/`wizard` windows are created lazily on first use ("hidden
 //! until used") and reused thereafter.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde_json::json;
@@ -16,6 +17,13 @@ use crate::state::AppState;
 /// taskbar rather than snapping visible/hidden).
 const ANIM_STEPS: u32 = 14;
 const ANIM_STEP_MS: u64 = 12;
+
+/// Bumped at the start of every `animate_overlay_in`/`_out` call. A spawned
+/// tween task checks this before each position-set step and bails out early
+/// if a newer toggle has since superseded it — otherwise rapid hotkey/tray
+/// spam spawns overlapping uncancelled tasks that fight over `set_position`
+/// (Stage-1 close-out fix).
+static ANIM_GEN: AtomicU64 = AtomicU64::new(0);
 
 pub const OVERLAY: &str = "overlay";
 pub const MAIN: &str = "main";
@@ -104,15 +112,21 @@ fn animate_overlay_in(win: &WebviewWindow) {
     let _ = win.set_position(tauri::PhysicalPosition::new(x, start_y));
     let _ = win.show();
     let _ = win.set_focus();
+    let gen = ANIM_GEN.fetch_add(1, Ordering::SeqCst) + 1;
     let win = win.clone();
     tauri::async_runtime::spawn(async move {
         for step in 1..=ANIM_STEPS {
+            if ANIM_GEN.load(Ordering::SeqCst) != gen {
+                return;
+            }
             let t = f64::from(step) / f64::from(ANIM_STEPS);
             let y = f64::from(start_y) + (f64::from(target_y) - f64::from(start_y)) * t;
             let _ = win.set_position(tauri::PhysicalPosition::new(x, y.round() as i32));
             tokio::time::sleep(Duration::from_millis(ANIM_STEP_MS)).await;
         }
-        let _ = win.set_position(tauri::PhysicalPosition::new(x, target_y));
+        if ANIM_GEN.load(Ordering::SeqCst) == gen {
+            let _ = win.set_position(tauri::PhysicalPosition::new(x, target_y));
+        }
     });
 }
 
@@ -129,15 +143,21 @@ fn animate_overlay_out(win: &WebviewWindow) {
         .unwrap_or(tauri::PhysicalSize::new(570, 576));
     let end_y = target_y + outer.height as i32;
     let start_y = win.outer_position().map(|p| p.y).unwrap_or(target_y);
+    let gen = ANIM_GEN.fetch_add(1, Ordering::SeqCst) + 1;
     let win = win.clone();
     tauri::async_runtime::spawn(async move {
         for step in 1..=ANIM_STEPS {
+            if ANIM_GEN.load(Ordering::SeqCst) != gen {
+                return;
+            }
             let t = f64::from(step) / f64::from(ANIM_STEPS);
             let y = f64::from(start_y) + (f64::from(end_y) - f64::from(start_y)) * t;
             let _ = win.set_position(tauri::PhysicalPosition::new(x, y.round() as i32));
             tokio::time::sleep(Duration::from_millis(ANIM_STEP_MS)).await;
         }
-        let _ = win.hide();
+        if ANIM_GEN.load(Ordering::SeqCst) == gen {
+            let _ = win.hide();
+        }
     });
 }
 
