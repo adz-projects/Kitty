@@ -6,15 +6,20 @@ use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter};
 
-use crate::windows;
+use crate::{hotkey, windows};
 
 pub fn create(app: &AppHandle) -> tauri::Result<()> {
     let toggle = MenuItem::with_id(app, "toggle_overlay", "Toggle Overlay", true, None::<&str>)?;
     let new_session = MenuItem::with_id(app, "new_session", "New Session", true, None::<&str>)?;
+    let ask_clipboard =
+        MenuItem::with_id(app, "ask_clipboard", "Ask about clipboard", true, None::<&str>)?;
     let settings = MenuItem::with_id(app, "open_settings", "Open Settings", true, None::<&str>)?;
     let sep = PredefinedMenuItem::separator(app)?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&toggle, &new_session, &sep, &settings, &sep, &quit])?;
+    let menu = Menu::with_items(
+        app,
+        &[&toggle, &new_session, &ask_clipboard, &sep, &settings, &sep, &quit],
+    )?;
 
     let mut builder = TrayIconBuilder::with_id("main-tray")
         .tooltip("Kitty")
@@ -28,6 +33,9 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
                 let _ = windows::show_overlay(app);
                 // Ask the overlay to start a fresh session.
                 let _ = app.emit("session://new", ());
+            }
+            "ask_clipboard" => {
+                hotkey::attach_clipboard(app);
             }
             "open_settings" => {
                 let _ = windows::open_settings(app, None, None);

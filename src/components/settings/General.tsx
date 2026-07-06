@@ -27,6 +27,7 @@ export function General() {
   const { draft, update, save, saved } = useConfigDraft();
   // Index of the hotkey row currently capturing a shortcut, or null.
   const [recording, setRecording] = useState<number | null>(null);
+  const [recordingClipboard, setRecordingClipboard] = useState(false);
   const [autostart, setAutostart] = useState(false);
 
   useEffect(() => {
@@ -111,6 +112,44 @@ export function General() {
           + Add another hotkey
         </button>
         <small className="muted">Save to apply. Any of them summons the overlay.</small>
+      </div>
+
+      <div className="field">
+        <span>Clipboard hotkey</span>
+        <div className="row">
+          <input
+            value={recordingClipboard ? 'Press a shortcut…' : (draft.clipboard_hotkey ?? '')}
+            readOnly={recordingClipboard}
+            placeholder="Not set"
+            onChange={() => {}}
+            onKeyDown={(e) => {
+              if (!recordingClipboard) return;
+              e.preventDefault();
+              const acc = accelerator(e);
+              if (acc) {
+                update({ clipboard_hotkey: acc });
+                setRecordingClipboard(false);
+              }
+            }}
+          />
+          <button onClick={() => setRecordingClipboard((r) => !r)}>
+            {recordingClipboard ? 'Cancel' : 'Record'}
+          </button>
+          <button
+            onClick={() => {
+              update({ clipboard_hotkey: null });
+              setRecordingClipboard(false);
+            }}
+            disabled={!draft.clipboard_hotkey}
+            title="Clear"
+          >
+            ✕
+          </button>
+        </div>
+        <small className="muted">
+          Save to apply. Summons the overlay with the current clipboard (text or image)
+          pre-attached.
+        </small>
       </div>
 
       <label className="check">

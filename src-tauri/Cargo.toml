@@ -20,6 +20,11 @@ tauri-plugin-notification = "2"
 tauri-plugin-shell = "2"
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
+tauri-plugin-clipboard-manager = "2"
+# Encodes clipboard image RGBA into PNG for the base64 data-URL sent to the
+# frontend (Round-4 clipboard hotkey) — already pulled in transitively via
+# arboard (clipboard-manager's backend), pinned here as a direct dependency.
+image = { version = "0.25", default-features = false, features = ["png"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }

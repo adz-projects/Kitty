@@ -7,6 +7,7 @@ import {
   ipc,
   onApprovalNeeded,
   onChatError,
+  onClipboardAttach,
   onComplete,
   onMessageDelta,
   onMode,
@@ -68,6 +69,17 @@ export interface Attachment {
   content: string;
 }
 
+/** An image attached directly (not via a dropped file path) — currently just
+    the clipboard hotkey (Round-4). Sent as a native ACP image content block
+    in both modes (Round-3 item 17's mechanism isn't agentic-only; only the
+    droppedFiles-based image extraction below happens to be, since it's about
+    file drops specifically). */
+export interface PendingImage {
+  id: string;
+  mime: string;
+  data_url: string;
+}
+
 interface ChatState {
   sessionId: string | null;
   cwd: string | null;
@@ -78,6 +90,7 @@ interface ChatState {
   artifacts: Artifact[];
   droppedFiles: PathInfo[];
   attachments: Attachment[];
+  pendingImages: PendingImage[];
   pendingApprovals: ApprovalNeededEvent[];
   busy: boolean;
   error: string | null;
@@ -109,6 +122,8 @@ interface ChatState {
   regenerate: (assistantIndex: number) => Promise<void>;
   addPastedText: (text: string, label?: string) => void;
   removeAttachment: (id: string) => void;
+  addPendingImage: (mime: string, dataUrl: string) => void;
+  removePendingImage: (id: string) => void;
   exportSession: (upToIndex?: number) => Promise<void>;
   newSession: (cwd?: string) => Promise<void>;
   ensureSession: () => Promise<string>;
@@ -245,6 +260,7 @@ export const useChatStore = create<ChatState>((set, get) => {
     artifacts: [],
     droppedFiles: [],
     attachments: [],
+    pendingImages: [],
     pendingApprovals: [],
     busy: false,
     error: null,
@@ -479,6 +495,14 @@ export const useChatStore = create<ChatState>((set, get) => {
     removeAttachment: (id: string) =>
       set((s) => ({ attachments: s.attachments.filter((a) => a.id !== id) })),
 
+    addPendingImage: (mime: string, dataUrl: string) =>
+      set((s) => ({
+        pendingImages: [...s.pendingImages, { id: newId(), mime, data_url: dataUrl }],
+      })),
+
+    removePendingImage: (id: string) =>
+      set((s) => ({ pendingImages: s.pendingImages.filter((p) => p.id !== id) })),
+
     exportSession: async (upToIndex?: number) => {
       const { messages, title } = get();
       if (messages.length === 0) return;
@@ -528,7 +552,10 @@ export const useChatStore = create<ChatState>((set, get) => {
     send: async (text: string) => {
       const trimmed = text.trim();
       const attachments = get().attachments;
-      if ((!trimmed && attachments.length === 0) || get().busy) return;
+      const pendingImages = get().pendingImages;
+      if ((!trimmed && attachments.length === 0 && pendingImages.length === 0) || get().busy) {
+        return;
+      }
       const firstMessage = get().messages.length === 0;
       const chatOnly = isChatMode(get());
       const sessionId = await get().ensureSession();
@@ -555,6 +582,15 @@ export const useChatStore = create<ChatState>((set, get) => {
             set({ error: String(e) });
           }
         }
+      }
+      // Clipboard-attached images (Round-4) go through regardless of mode —
+      // unlike the droppedFiles-based extraction above, which is specifically
+      // about file *drops* and stays agentic-only.
+      if (pendingImages.length) {
+        images = [
+          ...(images ?? []),
+          ...pendingImages.map((p) => ({ mime: p.mime, data_url: p.data_url })),
+        ];
       }
 
       let promptText = trimmed;
@@ -587,7 +623,13 @@ export const useChatStore = create<ChatState>((set, get) => {
       const userMsg: Message = {
         id: newId(),
         role: 'user',
-        text: trimmed || (attachments.length ? `(${attachments.length} document(s))` : ''),
+        text:
+          trimmed ||
+          (attachments.length
+            ? `(${attachments.length} document(s))`
+            : pendingImages.length
+              ? `(${pendingImages.length} image(s))`
+              : ''),
         reasoning: '',
         toolCalls: [],
         streaming: false,
@@ -597,6 +639,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         messages: [...s.messages, userMsg],
         droppedFiles: [],
         attachments: [],
+        pendingImages: [],
         busy: true,
         error: null,
       }));
@@ -763,6 +806,12 @@ export const useChatStore = create<ChatState>((set, get) => {
       // Provider (de)activated → re-sync provider-derived state immediately so the
       // UI doesn't drift until the next session or health tick (Round-2 item 4).
       void onProviderActivated(() => void get().refreshProvider());
+      // Clipboard-to-Kitty hotkey/tray item (Round-4): the overlay is already
+      // shown by the time this fires (Rust dispatches show_overlay first).
+      void onClipboardAttach((e) => {
+        if (e.kind === 'text') get().addPastedText(e.text, 'Clipboard');
+        else get().addPendingImage(e.mime, e.data_url);
+      });
       void onApprovalNeeded((e) => {
         if (!forActive(e.session_id)) return;
         // Round-4 tool-safety fix: chat mode never executes tools, so a

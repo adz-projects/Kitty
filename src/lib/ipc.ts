@@ -193,6 +193,13 @@ export const onThemeChanged = (cb: () => void) => listen('theme://changed', () =
 export const onWizardNavigate = (cb: (mode: string) => void) =>
   listen<{ mode: string }>('wizard://navigate', (e) => cb(e.payload.mode));
 
+/** Clipboard-to-Kitty hotkey/tray item (Round-4): the overlay is already
+    shown by the time this fires; payload is whichever the clipboard held. */
+export type ClipboardAttachEvent =
+  { kind: 'text'; text: string } | { kind: 'image'; mime: string; data_url: string };
+export const onClipboardAttach = (cb: (e: ClipboardAttachEvent) => void) =>
+  listen<ClipboardAttachEvent>('clipboard://attach', (e) => cb(e.payload));
+
 export interface ProviderHealth {
   reachable: boolean;
   host?: string;

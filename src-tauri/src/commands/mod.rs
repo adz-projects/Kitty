@@ -31,7 +31,8 @@ pub fn set_config(
 ) -> Result<(), String> {
     let hotkey_changed = {
         let mut cur = state.config.lock().unwrap();
-        let changed = cur.hotkeys != config.hotkeys;
+        let changed =
+            cur.hotkeys != config.hotkeys || cur.clipboard_hotkey != config.clipboard_hotkey;
         *cur = config.clone();
         changed
     };
@@ -45,7 +46,9 @@ pub fn set_config(
     let _ = app.emit("theme://changed", ());
 
     if hotkey_changed {
-        if let Err(e) = hotkey::register(&app, &config.hotkeys) {
+        if let Err(e) =
+            hotkey::register(&app, &config.hotkeys, config.clipboard_hotkey.as_deref())
+        {
             tracing::error!("re-register hotkey failed: {e}");
             return Err("Saved, but a new hotkey could not be registered.".into());
         }

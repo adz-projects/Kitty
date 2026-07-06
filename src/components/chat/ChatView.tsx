@@ -10,6 +10,7 @@ import { ModeToggle } from './ModeToggle';
 import { ProviderBadge } from './ProviderBadge';
 import { FileChips } from './FileChips';
 import { AttachmentChips } from './AttachmentChips';
+import { ClipboardImageChips } from './ClipboardImageChips';
 
 /** The shared chat surface used by both the overlay and the full window
     (CLAUDE.md rule 5). In chat-only mode (tools_enabled:false) it hides the
@@ -119,6 +120,7 @@ export function ChatView() {
         ))}
       {error && <div className="chat-error">{error}</div>}
       {chatOnly ? <AttachmentChips /> : <FileChips />}
+      <ClipboardImageChips />
       <Composer onSend={(t) => void send(t)} onStop={() => void cancel()} disabled={busy} />
     </div>
   );

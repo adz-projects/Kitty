@@ -27,6 +27,10 @@ pub struct Config {
     /// pre-Round-2 config apart and seed from the legacy `hotkey` field.
     #[serde(default = "Vec::new")]
     pub hotkeys: Vec<String>,
+    /// Accelerator that summons the overlay with the current clipboard
+    /// pre-attached (Round-4 clipboard hotkey). `None` = not registered.
+    #[serde(default)]
+    pub clipboard_hotkey: Option<String>,
     /// Whether to prefer the hardware Copilot key when observed (Phase 6).
     pub use_copilot_key: bool,
     /// Default working directory for new sessions (Phase 4). `None` until set.
@@ -75,6 +79,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             hotkeys: vec!["Alt+Space".to_string()],
+            clipboard_hotkey: Some("Ctrl+Alt+Space".to_string()),
             use_copilot_key: false,
             default_context_folder: None,
             ollama_base_url: "http://localhost:11434".to_string(),

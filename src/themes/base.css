@@ -834,6 +834,12 @@ button.primary {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.chip-thumb {
+  width: 18px;
+  height: 18px;
+  object-fit: cover;
+  border-radius: 3px;
+}
 .chip-action {
   font-size: 11px;
   padding: 1px 6px;

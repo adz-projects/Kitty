@@ -12,6 +12,7 @@ export interface NotificationPrefs {
 
 export interface Config {
   hotkeys: string[];
+  clipboard_hotkey: string | null;
   use_copilot_key: boolean;
   default_context_folder: string | null;
   ollama_base_url: string;

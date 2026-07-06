@@ -37,6 +37,7 @@ pub fn run() {
         config::Config::default()
     });
     let hotkeys = cfg.hotkeys.clone();
+    let clipboard_hotkey = cfg.clipboard_hotkey.clone();
 
     let mut builder = tauri::Builder::default();
 
@@ -57,6 +58,7 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .manage(AppState::new(cfg))
         .invoke_handler(tauri::generate_handler![
             commands::get_config,
@@ -121,7 +123,7 @@ pub fn run() {
             let handle = app.handle();
             windows::create_overlay(handle)?;
             tray::create(handle)?;
-            if let Err(e) = hotkey::register(handle, &hotkeys) {
+            if let Err(e) = hotkey::register(handle, &hotkeys, clipboard_hotkey.as_deref()) {
                 tracing::error!("global hotkey registration failed: {e}");
             }
             // Low-level Copilot-key hook (Windows only).
