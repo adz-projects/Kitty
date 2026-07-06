@@ -375,6 +375,66 @@ export const useChatStore = create<ChatState>((set, get) => {
     }
   };
 
+  // --- Streaming-delta coalescing (Round-5 Batch 5) -------------------------
+  // A fast provider emits an `agent_message_chunk` per token; applying each one
+  // as its own `set()` re-renders the (growing) markdown message on every
+  // token, saturating the webview's single JS thread so even a click — e.g.
+  // Expand — isn't handled until the stream drains (diagnosed live: a 1500-
+  // delta burst delayed a window op ~3s vs ~4ms idle). So buffer text/reasoning
+  // deltas and apply them in one `set()` per animation frame. Ordering with
+  // non-delta events (tool cards, completion) is preserved by flushing
+  // synchronously at the start of those handlers; session resets discard the
+  // buffer so a stale turn's tail never leaks into a new one.
+  let pendingText = '';
+  let pendingReasoning = '';
+  let flushHandle: ReturnType<typeof requestAnimationFrame> | null = null;
+
+  const flushDeltas = () => {
+    if (flushHandle != null) {
+      cancelAnimationFrame(flushHandle);
+      flushHandle = null;
+    }
+    if (!pendingText && !pendingReasoning) return;
+    const t = pendingText;
+    const r = pendingReasoning;
+    pendingText = '';
+    pendingReasoning = '';
+    set((s) => {
+      const msgs = s.messages.slice();
+      const last = msgs[msgs.length - 1];
+      if (last && last.role === 'assistant' && last.open) {
+        msgs[msgs.length - 1] = { ...last, text: last.text + t, reasoning: last.reasoning + r };
+        return { messages: msgs };
+      }
+      const closed = closeOpen(msgs);
+      closed.push({
+        id: newId(),
+        role: 'assistant',
+        text: t,
+        reasoning: r,
+        toolCalls: [],
+        streaming: true,
+        open: true,
+      });
+      return { messages: closed };
+    });
+  };
+
+  const bufferDelta = (field: 'text' | 'reasoning', text: string) => {
+    if (field === 'text') pendingText += text;
+    else pendingReasoning += text;
+    if (flushHandle == null) flushHandle = requestAnimationFrame(flushDeltas);
+  };
+
+  const discardDeltas = () => {
+    if (flushHandle != null) {
+      cancelAnimationFrame(flushHandle);
+      flushHandle = null;
+    }
+    pendingText = '';
+    pendingReasoning = '';
+  };
+
   return {
     sessionId: null,
     cwd: null,
@@ -434,6 +494,7 @@ export const useChatStore = create<ChatState>((set, get) => {
 
     adoptSession: async (info) => {
       clearStopGrace();
+      discardDeltas();
       set({
         sessionId: info.session_id,
         cwd: info.cwd,
@@ -463,6 +524,7 @@ export const useChatStore = create<ChatState>((set, get) => {
       // No new goosed session is created here — ensureSession() lazily makes
       // one the next time this (now-blank) overlay actually sends a message.
       clearStopGrace();
+      discardDeltas();
       set({
         sessionId: null,
         cwd: null,
@@ -487,6 +549,7 @@ export const useChatStore = create<ChatState>((set, get) => {
     newSession: async (cwd?: string) => {
       const info = await ipc.newSession(cwd);
       clearStopGrace();
+      discardDeltas();
       set({
         sessionId: info.session_id,
         cwd: info.cwd,
@@ -520,6 +583,7 @@ export const useChatStore = create<ChatState>((set, get) => {
       // Clear any force-stop abandonment up front — otherwise reloading a
       // previously force-stopped session would drop its replay events.
       clearStopGrace();
+      discardDeltas();
       set({
         sessionId,
         cwd,
@@ -568,6 +632,7 @@ export const useChatStore = create<ChatState>((set, get) => {
 
     forceStop: () => {
       clearStopGrace();
+      discardDeltas();
       const sid = get().sessionId;
       set((s) => ({
         busy: false,
@@ -833,6 +898,7 @@ export const useChatStore = create<ChatState>((set, get) => {
       // Fresh turn: clear any leftover stop/abandon state so its events flow
       // and a prior force-stop on this session no longer suppresses them.
       clearStopGrace();
+      discardDeltas();
       set((s) => ({
         messages: [...s.messages, userMsg],
         droppedFiles: [],
@@ -932,17 +998,21 @@ export const useChatStore = create<ChatState>((set, get) => {
         });
 
       void onMessageDelta((e) => {
-        if (forActive(e.session_id)) appendChunk('assistant', 'text', e.text);
+        if (forActive(e.session_id)) bufferDelta('text', e.text);
       });
       void onReasoningDelta((e) => {
-        if (forActive(e.session_id)) appendChunk('assistant', 'reasoning', e.text);
+        if (forActive(e.session_id)) bufferDelta('reasoning', e.text);
       });
       void onUserMessage((e) => {
-        if (forActive(e.session_id)) appendChunk('user', 'text', e.text);
+        if (!forActive(e.session_id)) return;
+        flushDeltas(); // keep a replayed user turn after any buffered agent text
+        appendChunk('user', 'text', e.text);
       });
 
       void onToolCall((e) => {
         if (!forActive(e.session_id)) return;
+        flushDeltas(); // tool cards must land after the streamed text before them
+
         const u: ToolCallUpdate = e.update;
         const id = String(u.toolCallId ?? '');
         const artifact = deriveArtifact(u);
@@ -1043,6 +1113,7 @@ export const useChatStore = create<ChatState>((set, get) => {
 
       void onComplete((e) => {
         if (!forActive(e.session_id)) return;
+        flushDeltas(); // apply any buffered tail before stamping the final message
         // The turn actually ended — cancel any pending Stop→Force-Stop escalation.
         clearStopGrace();
         const durationMs = lastSentAt != null ? performance.now() - lastSentAt : undefined;
@@ -1070,6 +1141,7 @@ export const useChatStore = create<ChatState>((set, get) => {
       });
       void onChatError((e) => {
         if (!forActive(e.session_id)) return;
+        flushDeltas();
         clearStopGrace();
         set((s) => ({
           busy: false,
