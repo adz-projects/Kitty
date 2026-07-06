@@ -734,6 +734,9 @@ button.primary {
   background: var(--surface-2);
   box-shadow: inset 2px 0 0 var(--accent);
 }
+.session-item.dragging {
+  opacity: 0.5;
+}
 .session-title {
   font-size: 13px;
   font-weight: 600;
