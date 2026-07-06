@@ -123,9 +123,28 @@ pub fn spawn_health_loop(app: AppHandle) {
             .build()
             .expect("reqwest client");
         let mut ticker = tokio::time::interval(Duration::from_secs(5));
+        // The Goose Desktop conflict check enumerates processes — slow-changing
+        // and comparatively costly, so refresh it only every 12th tick (~60s)
+        // rather than every 5s (Round-5 Batch 8). Cached between refreshes.
+        let mut tick: u64 = 0;
+        let mut conflict = false;
         loop {
             ticker.tick().await;
-            let status = compute_status(&app, &client).await;
+            if tick % 12 == 0 {
+                let our_child_pid = {
+                    let state = app.state::<AppState>();
+                    let goosed = state.goosed.lock().unwrap();
+                    goosed
+                        .process
+                        .child
+                        .as_ref()
+                        .map(|c| c.id())
+                        .filter(|_| goosed.process.owned)
+                };
+                conflict = conflict::goose_desktop_running(our_child_pid);
+            }
+            tick = tick.wrapping_add(1);
+            let status = compute_status(&app, &client, conflict).await;
             let changed = {
                 let state = app.state::<AppState>();
                 let mut cur = state.stack_status.lock().unwrap();
@@ -159,18 +178,14 @@ pub fn spawn_health_loop(app: AppHandle) {
     });
 }
 
-async fn compute_status(app: &AppHandle, client: &reqwest::Client) -> StackStatus {
-    let (base, goosed_port, our_child_pid) = {
+/// `conflict` is the cached "stock Goose Desktop running" flag, refreshed on a
+/// slower cadence by the caller (Round-5 Batch 8) since it's slow-changing.
+async fn compute_status(app: &AppHandle, client: &reqwest::Client, conflict: bool) -> StackStatus {
+    let (base, goosed_port) = {
         let state = app.state::<AppState>();
         let cfg = state.config.lock().unwrap();
         let goosed = state.goosed.lock().unwrap();
-        let pid = goosed
-            .process
-            .child
-            .as_ref()
-            .map(|c| c.id())
-            .filter(|_| goosed.process.owned);
-        (cfg.ollama_base_url.clone(), goosed.port, pid)
+        (cfg.ollama_base_url.clone(), goosed.port)
     };
 
     // Degraded states take precedence over the (non-blocking) conflict warning.
@@ -184,7 +199,7 @@ async fn compute_status(app: &AppHandle, client: &reqwest::Client) -> StackStatu
     if !ollama_proc::has_any_model(client, &base).await {
         return StackStatus::NoModel;
     }
-    if conflict::goose_desktop_running(our_child_pid) {
+    if conflict {
         return StackStatus::ConflictGooseDesktop;
     }
     StackStatus::Ok
