@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 
 use serde::Serialize;
+use tauri::{AppHandle, Emitter};
 
 use crate::config;
 use crate::state::AppState;
@@ -13,6 +14,14 @@ use crate::state::AppState;
 pub struct FolderData {
     pub folders: Vec<String>,
     pub assignments: HashMap<String, String>,
+}
+
+/// Notify every window that folder state changed (Round-5): overlay and main
+/// each own an independent store, so — mirroring `session://created` — this is
+/// how a folder create/rename/delete/assign in one window tells the other its
+/// sidebar folder groups are stale. Emitted only after a successful save.
+fn emit_folders_changed(app: &AppHandle) {
+    let _ = app.emit("folders://changed", ());
 }
 
 #[tauri::command]
@@ -25,20 +34,29 @@ pub fn list_folders(state: tauri::State<'_, AppState>) -> Result<FolderData, Str
 }
 
 #[tauri::command]
-pub fn create_folder(state: tauri::State<'_, AppState>, name: String) -> Result<(), String> {
+pub fn create_folder(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    name: String,
+) -> Result<(), String> {
     let name = name.trim().to_string();
     if name.is_empty() {
         return Err("Folder name can’t be empty.".into());
     }
-    let mut cfg = state.config.lock().unwrap();
-    if !cfg.folders.iter().any(|f| f == &name) {
-        cfg.folders.push(name);
+    {
+        let mut cfg = state.config.lock().unwrap();
+        if !cfg.folders.iter().any(|f| f == &name) {
+            cfg.folders.push(name);
+        }
+        config::save(&cfg).map_err(|e| e.to_string())?;
     }
-    config::save(&cfg).map_err(|e| e.to_string())
+    emit_folders_changed(&app);
+    Ok(())
 }
 
 #[tauri::command]
 pub fn rename_folder(
+    app: AppHandle,
     state: tauri::State<'_, AppState>,
     old: String,
     new: String,
@@ -47,43 +65,60 @@ pub fn rename_folder(
     if new.is_empty() {
         return Err("Folder name can’t be empty.".into());
     }
-    let mut cfg = state.config.lock().unwrap();
-    for f in cfg.folders.iter_mut() {
-        if *f == old {
-            *f = new.clone();
+    {
+        let mut cfg = state.config.lock().unwrap();
+        for f in cfg.folders.iter_mut() {
+            if *f == old {
+                *f = new.clone();
+            }
         }
-    }
-    for v in cfg.session_folders.values_mut() {
-        if *v == old {
-            *v = new.clone();
+        for v in cfg.session_folders.values_mut() {
+            if *v == old {
+                *v = new.clone();
+            }
         }
+        config::save(&cfg).map_err(|e| e.to_string())?;
     }
-    config::save(&cfg).map_err(|e| e.to_string())
+    emit_folders_changed(&app);
+    Ok(())
 }
 
 #[tauri::command]
-pub fn delete_folder(state: tauri::State<'_, AppState>, name: String) -> Result<(), String> {
-    let mut cfg = state.config.lock().unwrap();
-    cfg.folders.retain(|f| f != &name);
-    cfg.session_folders.retain(|_, v| v != &name);
-    config::save(&cfg).map_err(|e| e.to_string())
+pub fn delete_folder(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    name: String,
+) -> Result<(), String> {
+    {
+        let mut cfg = state.config.lock().unwrap();
+        cfg.folders.retain(|f| f != &name);
+        cfg.session_folders.retain(|_, v| v != &name);
+        config::save(&cfg).map_err(|e| e.to_string())?;
+    }
+    emit_folders_changed(&app);
+    Ok(())
 }
 
 /// Assign a session to a folder, or `None` to move it back to Uncategorized.
 #[tauri::command]
 pub fn assign_session_folder(
+    app: AppHandle,
     state: tauri::State<'_, AppState>,
     session_id: String,
     folder: Option<String>,
 ) -> Result<(), String> {
-    let mut cfg = state.config.lock().unwrap();
-    match folder {
-        Some(f) if !f.trim().is_empty() => {
-            cfg.session_folders.insert(session_id, f);
+    {
+        let mut cfg = state.config.lock().unwrap();
+        match folder {
+            Some(f) if !f.trim().is_empty() => {
+                cfg.session_folders.insert(session_id, f);
+            }
+            _ => {
+                cfg.session_folders.remove(&session_id);
+            }
         }
-        _ => {
-            cfg.session_folders.remove(&session_id);
-        }
+        config::save(&cfg).map_err(|e| e.to_string())?;
     }
-    config::save(&cfg).map_err(|e| e.to_string())
+    emit_folders_changed(&app);
+    Ok(())
 }

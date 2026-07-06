@@ -1,5 +1,7 @@
 import { useRef, useState } from 'react';
 import { isChatMode, useChatStore } from '@/stores/chatStore';
+import { pickFiles } from '@/lib/ipc';
+import { UploadIcon } from '@/components/icons/UploadIcon';
 
 // Pastes larger than this (chat-only mode) collapse into a document attachment.
 const PASTE_THRESHOLD = 500;
@@ -20,6 +22,7 @@ export function Composer({
   const ref = useRef<HTMLTextAreaElement>(null);
   const chatOnly = useChatStore(isChatMode);
   const addPastedText = useChatStore((s) => s.addPastedText);
+  const addDroppedPaths = useChatStore((s) => s.addDroppedPaths);
 
   const submit = () => {
     const value = text.trim();
@@ -29,8 +32,22 @@ export function Composer({
     if (ref.current) ref.current.style.height = 'auto';
   };
 
+  // Button-triggered file attach — same pipeline as OS drag-drop (Round-5).
+  const attachFiles = async () => {
+    const paths = await pickFiles();
+    if (paths.length) await addDroppedPaths(paths);
+  };
+
   return (
     <div className="composer">
+      <button
+        className="composer-attach"
+        onClick={() => void attachFiles()}
+        title="Attach files"
+        aria-label="Attach files"
+      >
+        <UploadIcon />
+      </button>
       <textarea
         ref={ref}
         rows={1}

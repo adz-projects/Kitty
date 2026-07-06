@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
 import { UNCATEGORIZED, useSessionStore, type SessionGroup } from '@/stores/sessionStore';
 import { useChatStore } from '@/stores/chatStore';
-import { onSessionCreated } from '@/lib/ipc';
+import { onSessionCreated, onFoldersChanged } from '@/lib/ipc';
 import { SessionKebabMenu } from './SessionKebabMenu';
 import type { SessionSummary } from '@/lib/types';
 
@@ -19,8 +19,17 @@ const DRAG_THRESHOLD_PX = 6;
     the same webview. Tracking pointer position ourselves sidesteps the native
     handler entirely and works regardless of that setting. */
 export function SessionList() {
-  const { loading, query, refresh, setQuery, folders, createFolder, grouped, assignFolder } =
-    useSessionStore();
+  const {
+    loading,
+    query,
+    refresh,
+    refreshFolders,
+    setQuery,
+    folders,
+    createFolder,
+    grouped,
+    assignFolder,
+  } = useSessionStore();
   const activeId = useChatStore((s) => s.sessionId);
 
   const [dragId, setDragId] = useState<string | null>(null);
@@ -48,6 +57,14 @@ export function SessionList() {
     const un = onSessionCreated(() => void refresh());
     return () => void un.then((fn) => fn());
   }, [refresh]);
+
+  useEffect(() => {
+    // Round-5: a folder created/renamed/deleted or a session reassigned in the
+    // *other* window otherwise doesn't reach this sidebar until reload. Only
+    // the folder mapping changed, so refresh that (not the whole session list).
+    const un = onFoldersChanged(() => void refreshFolders());
+    return () => void un.then((fn) => fn());
+  }, [refreshFolders]);
 
   useEffect(() => {
     const setOverFolder = (v: string | null) => {

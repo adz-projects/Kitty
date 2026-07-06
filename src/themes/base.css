@@ -407,6 +407,18 @@ button.primary {
   font: inherit;
   max-height: 160px;
 }
+/* Icon-only attach button (Round-5) — square so it lines up with the send
+   button at the composer's bottom edge. */
+.composer-attach {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 8px;
+  color: var(--text-muted);
+}
+.composer-attach:hover {
+  color: var(--text);
+}
 
 .chat-error {
   color: var(--danger);

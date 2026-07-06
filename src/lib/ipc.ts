@@ -139,6 +139,16 @@ export async function pickImage(): Promise<string | null> {
   return typeof res === 'string' ? res : null;
 }
 
+/** Native multi-file picker for the composer's attach button (Round-5). No type
+    filter — any file can be attached, same as OS drag-drop. Returns the picked
+    absolute paths (empty if cancelled) so callers can feed them straight into
+    the existing `inspectPaths` → `addDroppedPaths` pipeline. */
+export async function pickFiles(): Promise<string[]> {
+  const res = await openDialog({ multiple: true, directory: false });
+  if (res == null) return [];
+  return Array.isArray(res) ? res : [res];
+}
+
 /** Native save-file dialog for the session export (Round-3 item 24: OpenAI
     messages-array JSONL). Returns null if cancelled. */
 export async function pickSavePath(defaultName: string): Promise<string | null> {
@@ -204,6 +214,11 @@ export const onClipboardAttach = (cb: (e: ClipboardAttachEvent) => void) =>
     main each own an independent store, so this is how one tells the other
     its session list/recents dropdown is stale. */
 export const onSessionCreated = (cb: () => void) => listen('session://created', () => cb());
+
+/** Folder state (create/rename/delete/assign) changed in *any* window
+    (Round-5) — same cross-window-staleness reason as `onSessionCreated`, but
+    for the app-side chat-folder mapping the other window's sidebar renders. */
+export const onFoldersChanged = (cb: () => void) => listen('folders://changed', () => cb());
 
 export interface ProviderHealth {
   reachable: boolean;
