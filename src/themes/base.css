@@ -407,6 +407,12 @@ button.primary {
   font: inherit;
   max-height: 160px;
 }
+/* Force-stop button (Round-5) — an assertive variant shown after the Stop
+   grace period elapses with the turn still stuck. */
+.composer .force-stop {
+  border-color: var(--danger);
+  color: var(--danger);
+}
 /* Icon-only attach button (Round-5) — square so it lines up with the send
    button at the composer's bottom edge. */
 .composer-attach {

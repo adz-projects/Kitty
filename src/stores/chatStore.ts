@@ -118,6 +118,15 @@ interface ChatState {
   savedApprovalMode: string | null;
   /// Non-blocking notice (e.g. attaching to an untrusted provider). Round-2 item 13.
   warning: string | null;
+  /** Stop/Force-Stop phase (Round-5). `null` = not stopping. `'stopping'` =
+      Stop was clicked, cancel notification sent, waiting out the grace period
+      for goosed to actually end the turn. `'forceable'` = grace elapsed with no
+      completion, so the user can Force-Stop to hard-reset. */
+  stopPhase: 'stopping' | 'forceable' | null;
+  /** Session whose in-flight turn was force-stopped (Round-5): late stream
+      events for it are ignored (see `forActive`) until the next `send()` starts
+      a fresh turn, so the UI doesn't resume "typing" after a force-stop. */
+  abandonedSession: string | null;
   bindEvents: () => void;
   dismissWarning: () => void;
   /** Clear the Artifacts pane list (Round-5). Only empties the derived
@@ -137,6 +146,10 @@ interface ChatState {
   reloadCurrent: () => Promise<void>;
   send: (text: string) => Promise<void>;
   cancel: () => Promise<void>;
+  /** Hard-reset a stuck turn the user chose to force-stop (Round-5): clears
+      `busy`, ends the in-flight message, and abandons the turn so late events
+      are ignored. Only meaningful once `stopPhase === 'forceable'`. */
+  forceStop: () => void;
   respondApproval: (toolCallId: string, optionId: string | null) => Promise<void>;
   setMode: (modeId: string) => Promise<void>;
   /** Flip the session's chat/agentic mode (Round-4). Persists the override and
@@ -180,6 +193,16 @@ let lastSentAt: number | null = null;
 // streaming; that would otherwise attribute the response to the wrong model.
 let lastSentProvider: string | null = null;
 let lastSentModel: string | null = null;
+// Grace-period timer between "Stop" and offering "Force Stop" (Round-5).
+// Module-level like the fields above — one in-flight turn per active session.
+const STOP_GRACE_MS = 12_000;
+let stopGraceTimer: ReturnType<typeof setTimeout> | null = null;
+const clearStopGrace = () => {
+  if (stopGraceTimer) {
+    clearTimeout(stopGraceTimer);
+    stopGraceTimer = null;
+  }
+};
 let msgSeq = 0;
 const newId = () => `m${Date.now()}_${++msgSeq}`;
 
@@ -377,6 +400,8 @@ export const useChatStore = create<ChatState>((set, get) => {
     modeOverride: null,
     savedApprovalMode: null,
     warning: null,
+    stopPhase: null,
+    abandonedSession: null,
 
     dismissWarning: () => set({ warning: null }),
 
@@ -408,11 +433,14 @@ export const useChatStore = create<ChatState>((set, get) => {
     },
 
     adoptSession: async (info) => {
+      clearStopGrace();
       set({
         sessionId: info.session_id,
         cwd: info.cwd,
         mode: info.current_mode,
         availableModes: info.available_modes,
+        stopPhase: null,
+        abandonedSession: null,
       });
       await get().refreshProvider();
       const override = await ipc.getSessionMode(info.session_id).catch(() => null);
@@ -434,6 +462,7 @@ export const useChatStore = create<ChatState>((set, get) => {
       await ipc.hideOverlay();
       // No new goosed session is created here — ensureSession() lazily makes
       // one the next time this (now-blank) overlay actually sends a message.
+      clearStopGrace();
       set({
         sessionId: null,
         cwd: null,
@@ -450,11 +479,14 @@ export const useChatStore = create<ChatState>((set, get) => {
         savedApprovalMode: null,
         error: null,
         busy: false,
+        stopPhase: null,
+        abandonedSession: null,
       });
     },
 
     newSession: async (cwd?: string) => {
       const info = await ipc.newSession(cwd);
+      clearStopGrace();
       set({
         sessionId: info.session_id,
         cwd: info.cwd,
@@ -469,6 +501,8 @@ export const useChatStore = create<ChatState>((set, get) => {
         savedApprovalMode: null,
         error: null,
         busy: false,
+        stopPhase: null,
+        abandonedSession: null,
       });
       await get().refreshProvider();
       await ensureSafeApprovalMode();
@@ -483,6 +517,9 @@ export const useChatStore = create<ChatState>((set, get) => {
 
     loadSession: async (sessionId: string, cwd: string, title?: string) => {
       // Set the id first so replayed events (which arrive during the call) match.
+      // Clear any force-stop abandonment up front — otherwise reloading a
+      // previously force-stopped session would drop its replay events.
+      clearStopGrace();
       set({
         sessionId,
         cwd,
@@ -494,6 +531,8 @@ export const useChatStore = create<ChatState>((set, get) => {
         savedApprovalMode: null,
         error: null,
         busy: true,
+        stopPhase: null,
+        abandonedSession: null,
       });
       try {
         const info = await ipc.loadSession(sessionId, cwd);
@@ -511,15 +550,34 @@ export const useChatStore = create<ChatState>((set, get) => {
 
     cancel: async () => {
       const sid = get().sessionId;
-      if (!sid || !get().busy) return;
-      try {
-        await ipc.cancelPrompt(sid);
-        // Optimistically release the UI; goosed can take a moment to wind down the
-        // turn on a slow model, and its later completion event is idempotent.
-        set((s) => ({ busy: false, messages: closeOpen(s.messages) }));
-      } catch (e) {
-        set({ error: String(e) });
-      }
+      if (!sid || !get().busy || get().stopPhase) return;
+      // Send the cancel notification, but DON'T optimistically release the UI
+      // (Round-5). goosed's `session/cancel` is fire-and-forget; if its call to
+      // a remote provider is genuinely hung it may never wind down. So we stay
+      // "stopping" and give goosed a grace period to actually finish. If a
+      // completion/error arrives first, onComplete/onChatError clear this. If
+      // the grace elapses, escalate to a user-clickable Force Stop.
+      set({ stopPhase: 'stopping' });
+      void ipc.cancelPrompt(sid).catch((e) => set({ error: String(e) }));
+      clearStopGrace();
+      stopGraceTimer = setTimeout(() => {
+        stopGraceTimer = null;
+        if (get().busy && get().stopPhase === 'stopping') set({ stopPhase: 'forceable' });
+      }, STOP_GRACE_MS);
+    },
+
+    forceStop: () => {
+      clearStopGrace();
+      const sid = get().sessionId;
+      set((s) => ({
+        busy: false,
+        stopPhase: null,
+        // Abandon this turn so any late stream events for it are dropped by
+        // `forActive` until the next send() starts a fresh turn.
+        abandonedSession: sid,
+        messages: closeOpen(s.messages),
+        warning: 'Stopped. Goose may still be finishing this turn in the background.',
+      }));
     },
 
     reloadCurrent: async () => {
@@ -772,6 +830,9 @@ export const useChatStore = create<ChatState>((set, get) => {
         streaming: false,
         open: false,
       };
+      // Fresh turn: clear any leftover stop/abandon state so its events flow
+      // and a prior force-stop on this session no longer suppresses them.
+      clearStopGrace();
       set((s) => ({
         messages: [...s.messages, userMsg],
         droppedFiles: [],
@@ -779,6 +840,8 @@ export const useChatStore = create<ChatState>((set, get) => {
         pendingImages: [],
         busy: true,
         error: null,
+        stopPhase: null,
+        abandonedSession: null,
       }));
       try {
         lastSentAt = performance.now();
@@ -840,7 +903,10 @@ export const useChatStore = create<ChatState>((set, get) => {
       if (bound) return;
       bound = true;
 
-      const forActive = (sid: string) => get().sessionId === sid;
+      // Events count only for the active session, and never for a turn the user
+      // force-stopped (Round-5) — that abandonment is cleared when the next
+      // send() starts a fresh turn on the session.
+      const forActive = (sid: string) => get().sessionId === sid && get().abandonedSession !== sid;
 
       // Append a text/reasoning chunk to the open message of `role`, opening a new
       // one (and closing any prior open message) when the turn changes.
@@ -977,6 +1043,8 @@ export const useChatStore = create<ChatState>((set, get) => {
 
       void onComplete((e) => {
         if (!forActive(e.session_id)) return;
+        // The turn actually ended — cancel any pending Stop→Force-Stop escalation.
+        clearStopGrace();
         const durationMs = lastSentAt != null ? performance.now() - lastSentAt : undefined;
         lastSentAt = null;
         const providerName = lastSentProvider ?? undefined;
@@ -997,13 +1065,15 @@ export const useChatStore = create<ChatState>((set, get) => {
               model,
             };
           }
-          return { busy: false, pendingApprovals: [], messages: msgs };
+          return { busy: false, stopPhase: null, pendingApprovals: [], messages: msgs };
         });
       });
       void onChatError((e) => {
         if (!forActive(e.session_id)) return;
+        clearStopGrace();
         set((s) => ({
           busy: false,
+          stopPhase: null,
           error: e.message,
           pendingApprovals: [],
           messages: closeOpen(s.messages),

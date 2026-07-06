@@ -23,6 +23,8 @@ export function Composer({
   const chatOnly = useChatStore(isChatMode);
   const addPastedText = useChatStore((s) => s.addPastedText);
   const addDroppedPaths = useChatStore((s) => s.addDroppedPaths);
+  const stopPhase = useChatStore((s) => s.stopPhase);
+  const forceStop = useChatStore((s) => s.forceStop);
 
   const submit = () => {
     const value = text.trim();
@@ -75,9 +77,23 @@ export function Composer({
         }}
       />
       {disabled ? (
-        <button onClick={onStop} title="Stop the current response">
-          Stop
-        </button>
+        stopPhase === 'forceable' ? (
+          <button
+            className="force-stop"
+            onClick={forceStop}
+            title="Force stop — reset now (Goose may still be finishing in the background)"
+          >
+            Force stop
+          </button>
+        ) : stopPhase === 'stopping' ? (
+          <button disabled title="Waiting for Goose to stop…">
+            Stopping…
+          </button>
+        ) : (
+          <button onClick={onStop} title="Stop the current response">
+            Stop
+          </button>
+        )
       ) : (
         <button className="primary" onClick={submit} disabled={!text.trim()}>
           Send
