@@ -1,26 +1,21 @@
-/** Shown while a response is streaming but no visible text has arrived yet
-    (Phase 10). Reasoning-capable models get a distinct "Thinking…" animation so
-    it's clear the model is reasoning, not just slow; others get plain typing dots. */
-export function ThinkingIndicator({ reasoning }: { reasoning: boolean }) {
-  if (reasoning) {
-    return (
-      <span className="thinking-indicator" aria-label="Thinking">
-        <span className="thinking-glyph">🧠</span> Thinking
-        <span className="thinking-dots">
-          <i />
-          <i />
-          <i />
-        </span>
-      </span>
-    );
-  }
+/** Real-terms progress while waiting for a response (Round-5 Batch 6) — replaces
+    the bare animated ellipsis. The stage is derived from existing signals (see
+    `useProgressStage`): `connecting` (sent, nothing back yet) → `thinking`
+    (reasoning streaming) → `formulating` (reasoning done / composing the answer).
+    The label text itself pulses (opacity), so it still reads as live activity
+    the way the dots did. Settles when the answer text starts rendering. */
+export type ProgressStage = 'connecting' | 'thinking' | 'formulating';
+
+const LABELS: Record<ProgressStage, string> = {
+  connecting: 'Connecting to the server',
+  thinking: 'Provider is thinking',
+  formulating: 'Formulating a response',
+};
+
+export function ThinkingIndicator({ stage }: { stage: ProgressStage }) {
   return (
-    <span className="typing" aria-label="Assistant is typing">
-      <span className="thinking-dots">
-        <i />
-        <i />
-        <i />
-      </span>
+    <span className="progress-indicator" role="status" aria-label={LABELS[stage]}>
+      <span className="progress-pulse">{LABELS[stage]}…</span>
     </span>
   );
 }

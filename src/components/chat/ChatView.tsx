@@ -3,6 +3,7 @@ import { onFileDrop, pickFolder } from '@/lib/ipc';
 import { isChatMode, useChatStore } from '@/stores/chatStore';
 import { supportsReasoning } from '@/lib/reasoning_models';
 import { MessageList } from './MessageList';
+import { useProgressStage } from './useProgressStage';
 import { Composer } from './Composer';
 import { ApprovalPrompt } from './ApprovalPrompt';
 import { ModeBadge } from './ModeBadge';
@@ -50,13 +51,15 @@ export function ChatView() {
 
   const folder = cwd ? cwd.split(/[\\/]/).filter(Boolean).pop() : null;
   const last = messages[messages.length - 1];
-  const awaitingFirstToken =
-    busy &&
-    (!last || last.role === 'user' || (last.role === 'assistant' && !last.text && !last.reasoning));
-  // Predictive hint for the thinking indicator (the reasoning panel itself is
-  // content-driven). True if the model is known-reasoning or reasoning already began.
-  const thinkingReasoning =
-    supportsReasoning(model) || (!!last && last.role === 'assistant' && !!last.reasoning);
+  const assistant = last && last.role === 'assistant' ? last : null;
+  // Real-terms progress while awaiting the answer (Round-5 Batch 6): connecting
+  // → thinking → formulating, derived from streaming signals + a client timer.
+  const progressStage = useProgressStage(
+    busy,
+    assistant?.reasoning.length ?? 0,
+    !!assistant?.text,
+    supportsReasoning(model)
+  );
 
   return (
     <div className={`chat${chatOnly ? ' reading' : ''}`}>
@@ -103,12 +106,7 @@ export function ChatView() {
         </div>
       )}
 
-      <MessageList
-        messages={messages}
-        empty={title ?? 'Start a new chat.'}
-        typing={awaitingFirstToken}
-        thinkingReasoning={thinkingReasoning}
-      />
+      <MessageList messages={messages} empty={title ?? 'Start a new chat.'} stage={progressStage} />
 
       {!chatOnly &&
         pendingApprovals.map((a) => (

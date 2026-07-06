@@ -1,7 +1,7 @@
 import { useEffect, useRef } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { MessageItem } from './MessageItem';
-import { ThinkingIndicator } from './ThinkingIndicator';
+import { ThinkingIndicator, type ProgressStage } from './ThinkingIndicator';
 import type { Message } from '@/stores/chatStore';
 
 // Below this many messages we render plainly (the well-tested path); beyond it
@@ -11,39 +11,26 @@ const VIRTUALIZE_THRESHOLD = 200;
 export function MessageList({
   messages,
   empty,
-  typing,
-  thinkingReasoning,
+  stage,
 }: {
   messages: Message[];
   empty: string;
-  typing: boolean;
-  thinkingReasoning: boolean;
+  stage: ProgressStage | null;
 }) {
   if (messages.length > VIRTUALIZE_THRESHOLD) {
-    return (
-      <VirtualList messages={messages} typing={typing} thinkingReasoning={thinkingReasoning} />
-    );
+    return <VirtualList messages={messages} stage={stage} />;
   }
-  return (
-    <PlainList
-      messages={messages}
-      empty={empty}
-      typing={typing}
-      thinkingReasoning={thinkingReasoning}
-    />
-  );
+  return <PlainList messages={messages} empty={empty} stage={stage} />;
 }
 
 function PlainList({
   messages,
   empty,
-  typing,
-  thinkingReasoning,
+  stage,
 }: {
   messages: Message[];
   empty: string;
-  typing: boolean;
-  thinkingReasoning: boolean;
+  stage: ProgressStage | null;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   useEffect(() => {
@@ -56,20 +43,12 @@ function PlainList({
       {messages.map((m, i) => (
         <MessageItem key={m.id} message={m} index={i} />
       ))}
-      {typing && <ThinkingIndicator reasoning={thinkingReasoning} />}
+      {stage && <ThinkingIndicator stage={stage} />}
     </div>
   );
 }
 
-function VirtualList({
-  messages,
-  typing,
-  thinkingReasoning,
-}: {
-  messages: Message[];
-  typing: boolean;
-  thinkingReasoning: boolean;
-}) {
+function VirtualList({ messages, stage }: { messages: Message[]; stage: ProgressStage | null }) {
   const parentRef = useRef<HTMLDivElement>(null);
   const rv = useVirtualizer({
     count: messages.length,
@@ -104,7 +83,7 @@ function VirtualList({
           </div>
         ))}
       </div>
-      {typing && <ThinkingIndicator reasoning={thinkingReasoning} />}
+      {stage && <ThinkingIndicator stage={stage} />}
     </div>
   );
 }
