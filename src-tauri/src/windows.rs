@@ -13,6 +13,11 @@ use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindo
 
 use crate::state::AppState;
 
+/// Overlay window size (physical px). One source of truth for creation and the
+/// slide-animation fallbacks (Round-5 Batch 7: height cut ~33%, from 576→386).
+const OVERLAY_W: u32 = 570;
+const OVERLAY_H: u32 = 386;
+
 /// Slide-animation tuning (Round-3 follow-up: overlay rises from/sinks into the
 /// taskbar rather than snapping visible/hidden).
 const ANIM_STEPS: u32 = 14;
@@ -41,7 +46,7 @@ fn url(label: &str) -> WebviewUrl {
 pub fn create_overlay(app: &AppHandle) -> tauri::Result<WebviewWindow> {
     let win = WebviewWindowBuilder::new(app, OVERLAY, url(OVERLAY))
         .title("Kitty")
-        .inner_size(570.0, 576.0)
+        .inner_size(f64::from(OVERLAY_W), f64::from(OVERLAY_H))
         .min_inner_size(360.0, 240.0)
         .decorations(false)
         .transparent(true)
@@ -77,7 +82,7 @@ fn overlay_target_position(win: &WebviewWindow) -> Option<(i32, i32)> {
     }
     let outer = win
         .outer_size()
-        .unwrap_or(tauri::PhysicalSize::new(570, 576));
+        .unwrap_or(tauri::PhysicalSize::new(OVERLAY_W, OVERLAY_H));
     let margin = 12i32;
     let x = rect.right - outer.width as i32 - margin;
     let y = rect.bottom - outer.height as i32 - margin;
@@ -107,7 +112,7 @@ fn animate_overlay_in(win: &WebviewWindow) {
     };
     let outer = win
         .outer_size()
-        .unwrap_or(tauri::PhysicalSize::new(570, 576));
+        .unwrap_or(tauri::PhysicalSize::new(OVERLAY_W, OVERLAY_H));
     let start_y = target_y + outer.height as i32;
     let _ = win.set_position(tauri::PhysicalPosition::new(x, start_y));
     let _ = win.show();
@@ -140,7 +145,7 @@ fn animate_overlay_out(win: &WebviewWindow) {
     };
     let outer = win
         .outer_size()
-        .unwrap_or(tauri::PhysicalSize::new(570, 576));
+        .unwrap_or(tauri::PhysicalSize::new(OVERLAY_W, OVERLAY_H));
     let end_y = target_y + outer.height as i32;
     let start_y = win.outer_position().map(|p| p.y).unwrap_or(target_y);
     let gen = ANIM_GEN.fetch_add(1, Ordering::SeqCst) + 1;
