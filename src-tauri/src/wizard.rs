@@ -50,8 +50,11 @@ fn run_version(bin: &Path) -> Option<String> {
 }
 
 /// GitHub repos whose Releases API we check for the latest version (item 29).
+/// Goose's org was renamed from `block` to `aaif-goose` after this was first
+/// pinned (Stage-1 close-out) — GitHub redirects the old path, but point at
+/// the canonical one rather than lean on that indefinitely.
 const OLLAMA_REPO: &str = "ollama/ollama";
-const GOOSE_REPO: &str = "block/goose";
+const GOOSE_REPO: &str = "aaif-goose/goose";
 
 /// Fetch a repo's latest release tag via the GitHub Releases API. GitHub
 /// requires a `User-Agent`; failures (offline, rate-limited, etc.) return
@@ -162,9 +165,20 @@ pub async fn detect(base_url: &str) -> Detection {
 pub async fn install(which: &str) -> Result<(), String> {
     let url = match which {
         "ollama" => OLLAMA_INSTALLER_URL,
-        // Goose ships a Windows installer via Block's GitHub releases; the exact
-        // asset URL is pinned in docs/VERSIONS.md once verified.
-        "goose" => return Err("Automatic Goose install isn't wired yet — install Goose Desktop from block/goose releases, then re-detect.".into()),
+        // Confirmed (Stage-1 close-out): Goose publishes no Windows .exe/.msi
+        // installer at all, only plain zip archives (see docs/VERSIONS.md) — so
+        // there's nothing here to silently download-and-run like Ollama's. The
+        // wizard UI no longer offers an "Install" button for Goose at all (it
+        // links straight to the release page instead); this arm only guards a
+        // direct/future call into this command.
+        "goose" => {
+            return Err(
+                "Goose has no automatic installer on Windows — download \
+                 goose-x86_64-pc-windows-msvc.zip from its GitHub releases and extract it, \
+                 then re-check."
+                    .into(),
+            )
+        }
         _ => return Err("unknown dependency".into()),
     };
     if !url.starts_with("https://") {

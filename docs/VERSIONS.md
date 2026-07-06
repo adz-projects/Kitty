@@ -20,13 +20,16 @@ done until this file is updated and the affected code (`goosed/api.rs`,
 
 ## Ollama
 
-- **Pinned/tested version:** _TBD._
+- **Pinned/tested version:** **0.31.1** (confirmed live via `GET /api/version` and
+  `ollama --version`, Stage-1 close-out).
 - **Binary location:** `C:\Users\azolkover\AppData\Local\Programs\Ollama\ollama.exe` (detected).
 - **Endpoints used:** `GET /api/version`, `GET /api/tags`, `POST /api/pull` (NDJSON), `DELETE /api/delete`.
 
 ## Stock Goose Desktop detection (Phase 1 `conflict.rs`)
 
-- **Process name(s) to match:** _TBD (record exact names after checking the pinned release)._
+- **Process name(s) to match:** `Goose.exe` (case-sensitive; already implemented in
+  `conflict.rs` — this entry was left marked TBD after the fact, corrected in the
+  Stage-1 close-out).
 
 ## Windows Copilot app (Round-2 item 2 — best-effort close after swallowing the chord)
 
@@ -54,10 +57,24 @@ done until this file is updated and the affected code (`goosed/api.rs`,
 - **Ollama Windows installer:** `https://ollama.com/download/OllamaSetup.exe`
   (Inno Setup; hands off to its own UI/UAC — verify a silent flag before enabling
   unattended install). Wired in `src-tauri/src/wizard.rs`.
-- **Goose installer:** _TBD — Block's Windows installer asset URL from
-  block/goose GitHub releases. Not wired yet; the wizard tells the user to install
-  Goose Desktop and re-detect. (The dev machine already has it under
-  `%LOCALAPPDATA%\Programs\dist-windows`.)_
+- **Goose installer:** _confirmed (Stage-1 close-out): there is no Windows
+  `.exe`/`.msi` installer at all_ — the [releases page](https://github.com/aaif-goose/goose/releases/latest)
+  (org renamed from `block/goose`; GitHub still redirects the old path) only
+  publishes zip archives for Windows:
+  - `goose-x86_64-pc-windows-msvc.zip` (~78 MB) — the bare CLI/`goose serve`
+    binary. **This is the one Kitty needs** — it's what `locate_goose()`
+    expects to find a `goose.exe` inside.
+  - `goose-x86_64-pc-windows-msvc-cuda.zip` — same, CUDA-enabled build.
+  - `Goose-win32-x64.zip` / `Goose-win32-x64-cuda.zip` / `Goose.zip` — the full
+    **Goose Desktop** Electron app. **Do not point users at this one** — it's
+    the separate GUI product `conflict.rs` already detects and warns about
+    (`Goose.exe` process name); auto-installing it would risk creating the
+    exact conflict Kitty is designed to flag.
+  - Since none of these are silent-installable executables, the wizard no
+    longer offers an "Install" button for Goose (it always would have thrown) —
+    it links straight to the release page with the exact asset name to grab,
+    and `install_dependency("goose")` (still reachable directly) returns a
+    message with the same guidance as a defensive fallback.
 
 ## Starter models (Phase 7 `src/lib/starter_models.ts`)
 

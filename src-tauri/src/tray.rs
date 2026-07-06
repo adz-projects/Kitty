@@ -1,6 +1,6 @@
 //! System tray icon + menu — the app's persistent visible presence.
-//! Menu: Toggle Overlay, New Session (stub until Phase 2), Open Settings, Quit.
-//! Left-click also toggles the overlay.
+//! Menu: Toggle Overlay, New Session, Ask about clipboard, Open Settings, Quit.
+//! Left-click also toggles the overlay (or focuses the main window if it's open).
 
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};

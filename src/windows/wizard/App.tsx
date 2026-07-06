@@ -154,7 +154,7 @@ export function App() {
 
 const RELEASES_URL: Record<'ollama' | 'goose', string> = {
   ollama: 'https://github.com/ollama/ollama/releases/latest',
-  goose: 'https://github.com/block/goose/releases/latest',
+  goose: 'https://github.com/aaif-goose/goose/releases/latest',
 };
 
 function DepRow({
@@ -192,7 +192,13 @@ function DepRow({
           </>
         )}
       </div>
-      {!dep.installed && (
+      {/* Goose has no Windows .exe/.msi installer — only plain zip archives
+          (confirmed via its GitHub releases). A button that calls
+          installDependency() would only ever throw; point straight at the
+          release page with instructions instead of faking automation that
+          doesn't exist. Ollama does ship a real silent-ish installer, so it
+          keeps the one-click flow. */}
+      {!dep.installed && which === 'ollama' && (
         <button
           disabled={busy}
           onClick={async () => {
@@ -209,6 +215,16 @@ function DepRow({
         >
           {busy ? 'Launching installer…' : 'Install'}
         </button>
+      )}
+      {!dep.installed && which === 'goose' && (
+        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: 4 }}>
+          <button onClick={() => void ipc.openPath(RELEASES_URL.goose)}>Get Goose ↗</button>
+          <small className="muted">
+            Download <code>goose-x86_64-pc-windows-msvc.zip</code> and extract it anywhere, then
+            re-check. (Skip the <code>Goose-win32-x64.zip</code> asset — that's the separate Goose
+            Desktop app, which Kitty warns about if it's also running.)
+          </small>
+        </div>
       )}
       {dep.is_outdated && (
         <button onClick={() => void ipc.openPath(RELEASES_URL[which])}>View release</button>
