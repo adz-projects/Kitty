@@ -90,6 +90,10 @@ interface ChatState {
   model: string | null;
   /** Active provider's display name, for the per-response metrics line (Round-3 item 2). */
   providerName: string | null;
+  /** STOPGAP client-side workaround (see `send()`) — strip reasoning from the
+      context resent on later turns, chat-only mode only. Remove once Goose ships
+      a native hook (block/goose#7617) and thread it into goosed_env() instead. */
+  stripReasoning: boolean;
   /// Non-blocking notice (e.g. attaching to an untrusted provider). Round-2 item 13.
   warning: string | null;
   bindEvents: () => void;
@@ -149,6 +153,23 @@ function deriveArtifact(u: ToolCallUpdate): Artifact | null {
 const closeOpen = (msgs: Message[]): Message[] =>
   msgs.map((m) => (m.open ? { ...m, open: false, streaming: false } : m));
 
+// STOPGAP client-side workaround for stripping reasoning from resent context
+// (see the doc comment on `ProviderProfile.strip_reasoning` in providers.rs and
+// on `stripReasoning` above) — flattens prior turns into plain text using only
+// `.text`, never `.reasoning`. Remove once Goose ships a native hook
+// (https://github.com/block/goose/issues/7617) and this whole mechanism goes
+// away in favor of an env var through goosed_env().
+function buildStrippedTranscript(messages: Message[]): string {
+  const lines = messages.map((m) =>
+    m.role === 'user' ? `User: ${m.text}` : `Assistant: ${m.text}`
+  );
+  return (
+    'Continuing the conversation below. Earlier reasoning/thinking has been omitted ' +
+    'to keep this response focused.\n\n' +
+    lines.join('\n\n')
+  );
+}
+
 export const useChatStore = create<ChatState>((set, get) => ({
   sessionId: null,
   cwd: null,
@@ -169,6 +190,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   isTrusted: false,
   model: null,
   providerName: null,
+  stripReasoning: false,
   warning: null,
 
   dismissWarning: () => set({ warning: null }),
@@ -184,6 +206,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         isTrusted: active ? active.is_trusted : false,
         model: active?.models[0] ?? null,
         providerName: active ? active.name || active.provider_type : null,
+        stripReasoning: active ? active.strip_reasoning : false,
       });
     } catch {
       set({
@@ -192,6 +215,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         providerHost: null,
         model: null,
         providerName: null,
+        stripReasoning: false,
       });
     }
   },
@@ -447,6 +471,21 @@ export const useChatStore = create<ChatState>((set, get) => ({
       promptText = `${block}\n\n${trimmed}`;
     }
 
+    // STOPGAP client-side workaround (see buildStrippedTranscript's doc comment):
+    // only engages once some prior assistant turn actually reasoned — a turn
+    // with nothing to strip shouldn't pay for a session swap. Prior turns come
+    // from local render state, since goosed's own history is exactly what we're
+    // bypassing here.
+    const priorMessages = get().messages;
+    const stripReasoningNow =
+      chatOnly &&
+      get().stripReasoning &&
+      priorMessages.some((m) => m.role === 'assistant' && m.reasoning.trim().length > 0);
+    if (stripReasoningNow) {
+      promptText = `${buildStrippedTranscript(priorMessages)}\n\nUser: ${promptText}`;
+    }
+    const cwd = get().cwd ?? undefined;
+
     const userMsg: Message = {
       id: newId(),
       role: 'user',
@@ -465,7 +504,38 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }));
     try {
       lastSentAt = performance.now();
-      await ipc.sendPrompt(sessionId, promptText, images);
+      if (stripReasoningNow) {
+        // Swap to a brand-new goosed session carrying only the reconstructed,
+        // reasoning-free transcript — never the old session (which still has
+        // goosed's own unstripped history). `sessionId` (and `mode`) MUST be
+        // updated before `sendPrompt` fires, not after: `bindEvents()`'s stream
+        // handlers all gate on `forActive(sid)` (`get().sessionId === sid`), so
+        // deferring the swap would silently drop every event for this turn.
+        const oldSessionId = sessionId;
+        const info = await ipc.newSession(cwd);
+        set({
+          sessionId: info.session_id,
+          mode: info.current_mode,
+          availableModes: info.available_modes,
+        });
+        try {
+          await ipc.sendPrompt(info.session_id, promptText, images);
+        } catch (e) {
+          // The new session never got a real turn — drop it and restore the
+          // old (still fully intact) session rather than losing the thread.
+          // No `cwd` here: the working directory is shared with the session
+          // being restored, so skip delete_session's directory cleanup.
+          void ipc.deleteSession(info.session_id).catch(() => {});
+          set({ sessionId: oldSessionId });
+          throw e;
+        }
+        // Success: best-effort cleanup of the now-superseded old session — a
+        // failure here shouldn't surface as an error for a turn that actually
+        // succeeded. Same no-`cwd` reasoning as above (shared working dir).
+        void ipc.deleteSession(oldSessionId).catch(() => {});
+      } else {
+        await ipc.sendPrompt(sessionId, promptText, images);
+      }
       // Chat-only: auto-promote the *first* overlay message to the full window.
       if (chatOnly && firstMessage && windowLabel() === 'overlay') {
         const s = get();

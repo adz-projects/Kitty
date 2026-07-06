@@ -43,6 +43,9 @@ export interface ProviderProfile {
   temperature: number | null;
   top_p: number | null;
   context_length: number | null;
+  /** STOPGAP client-side workaround (see chatStore.ts's send()) — Goose has no
+      native hook for this yet; remove once block/goose#7617 or equivalent lands. */
+  strip_reasoning: boolean;
   created_at: string;
 }
 

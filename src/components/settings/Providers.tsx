@@ -59,6 +59,7 @@ const blank = (): ProviderProfile => ({
   temperature: null,
   top_p: null,
   context_length: null,
+  strip_reasoning: false,
   created_at: '',
 });
 
@@ -374,6 +375,18 @@ function ProviderForm({
           onChange={(e) => set({ tools_enabled: e.target.checked })}
         />
         <span>Agentic tools enabled (uncheck for a chat-only thought-partner provider)</span>
+      </label>
+
+      <label className="check">
+        <input
+          type="checkbox"
+          checked={profile.strip_reasoning}
+          onChange={(e) => set({ strip_reasoning: e.target.checked })}
+        />
+        <span>
+          Strip reasoning from context sent on later turns (recommended for Gemma4-style local
+          reasoning models; chat-only providers only)
+        </span>
       </label>
 
       {/* Per-provider sampling params (items 27/28), vertical stack so nothing overlaps. */}

@@ -47,6 +47,17 @@ pub struct ProviderProfile {
     pub top_p: Option<f32>,
     #[serde(default)]
     pub context_length: Option<u32>,
+    /// Strip the model's own prior reasoning out of what gets resent as context
+    /// on later turns (chat-only mode only — see `chatStore.ts`'s `send()`).
+    /// STOPGAP (client-side workaround): Goose has no native hook for this
+    /// (confirmed: no ACP method, no env var, no config key; reasoning-in-history
+    /// handling is hardcoded per-provider in goosed's own Rust source). Remove
+    /// this field and the whole client-side session-swap path it drives once
+    /// Goose implements https://github.com/block/goose/issues/7617 or an
+    /// equivalent native mechanism, and thread it into `goosed_env()` instead,
+    /// matching `temperature`/`top_p`/`context_length` below.
+    #[serde(default)]
+    pub strip_reasoning: bool,
     #[serde(default)]
     pub created_at: String,
 }
@@ -253,5 +264,6 @@ mod tests {
         assert_eq!(p.top_p, None);
         assert_eq!(p.context_length, None);
         assert_eq!(p.models, vec!["llama3.2:3b"]);
+        assert!(!p.strip_reasoning);
     }
 }
