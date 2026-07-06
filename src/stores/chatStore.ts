@@ -229,6 +229,66 @@ const closeOpen = (msgs: Message[]): Message[] =>
 const pickRejectOption = (options: { optionId: string }[]): string | null =>
   options.find((o) => /reject/i.test(o.optionId))?.optionId ?? null;
 
+/** Pick the "allow once" variant (never `allow_always`, so approval never
+    silently persists) for auto-approving a scoped chat-mode tool call. */
+const pickAllowOption = (options: { optionId: string }[]): string | null =>
+  options.find((o) => o.optionId === 'allow_once')?.optionId ??
+  options.find((o) => /allow/i.test(o.optionId))?.optionId ??
+  null;
+
+const normPath = (p: string): string => p.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+
+/** Lexically (no fs access) decide whether `target` is inside `base`. Absolute
+    targets keep their drive/root; relative ones resolve against `base`; `.`/`..`
+    are collapsed. Case-insensitive (Windows). This backs the chat-mode "keep
+    file ops inside the chat folder" soft boundary — a lexical check is
+    proportionate since shell tools (also allowed in chat mode) aren't
+    sandboxed anyway; it hard-confines only the path-based ops Kitty can
+    actually inspect. Exported for unit testing. */
+export function pathWithinDir(base: string, target: string): boolean {
+  const b = normPath(base);
+  if (!b) return false;
+  let t = target.replace(/\\/g, '/');
+  const isAbsolute = /^[a-z]:\//i.test(t) || t.startsWith('/');
+  if (!isAbsolute) t = `${b}/${t}`;
+  const hasDrive = /^[a-z]:/i.test(t);
+  const drive = hasDrive ? t.slice(0, 2) : '';
+  const stack: string[] = [];
+  for (const seg of (hasDrive ? t.slice(2) : t).split('/')) {
+    if (seg === '' || seg === '.') continue;
+    if (seg === '..') stack.pop();
+    else stack.push(seg);
+  }
+  const resolved = normPath(`${drive}/${stack.join('/')}`);
+  return resolved === b || resolved.startsWith(`${b}/`);
+}
+
+/** Decide how to answer a tool-approval request while in chat ("thought-
+    partner") mode (Round-5, owner decision): tools are allowed, but a path-
+    based file op is confined to the session's chat folder (`cwd`). Returns the
+    ACP `optionId` to respond with, plus a `warning` to surface when a request
+    is declined for reaching outside the folder. A tool with no structured path
+    (notably `shell`, which produces docx/xlsx via Python) is allowed — a soft
+    boundary, since shell isn't sandboxed. Pure + exported for unit testing. */
+export function decideChatApproval(
+  rawInput: unknown,
+  cwd: string | null,
+  options: { optionId: string }[]
+): { optionId: string | null; warning?: string } {
+  const input = (rawInput ?? {}) as { path?: string; file_path?: string; paths?: string[] };
+  const p =
+    input.path ?? input.file_path ?? (Array.isArray(input.paths) ? input.paths[0] : undefined);
+  if (typeof p === 'string' && p !== '' && !!cwd && !pathWithinDir(cwd, p)) {
+    return {
+      optionId: pickRejectOption(options),
+      warning:
+        `Declined a file operation outside this chat's folder (${p}). In thought-partner ` +
+        `mode the model can only touch files inside the chat's own folder.`,
+    };
+  }
+  return { optionId: pickAllowOption(options) };
+}
+
 // STOPGAP client-side workaround for stripping reasoning from resent context
 // (see the doc comment on `ProviderProfile.strip_reasoning` in providers.rs and
 // on `stripReasoning` above) — flattens prior turns into plain text using only
@@ -248,11 +308,12 @@ function buildStrippedTranscript(messages: Message[]): string {
 
 export const useChatStore = create<ChatState>((set, get) => {
   // Force approve-mode whenever the effective mode is chat, so `auto` can
-  // never silently execute a tool call the UI hides (Round-4 tool-safety fix
-  // for the Phase-9 latent bug: goosed always has tools live even in
-  // chat-only mode). Called after every session bootstrap point
-  // (new/load/adopt) and on flip-to-chat; best-effort — a failure here isn't
-  // worth surfacing, `bindEvents`' auto-reject still catches any tool call.
+  // never silently execute a tool call unseen (Round-4 tool-safety fix for the
+  // Phase-9 latent bug: goosed always has tools live even in chat-only mode).
+  // In approve mode every tool call surfaces as a permission request that
+  // `bindEvents`' handler then decides (Round-5: allow, but scoped to the chat
+  // folder — see there). Called after every session bootstrap point
+  // (new/load/adopt) and on flip-to-chat; best-effort.
   const ensureSafeApprovalMode = async () => {
     const sid = get().sessionId;
     if (!sid || !isChatMode(get()) || get().mode === 'approve') return;
@@ -265,10 +326,12 @@ export const useChatStore = create<ChatState>((set, get) => {
   };
 
   // Chat-mode file handling (Phase 9, reused by both `addDroppedPaths` and a
-  // mid-conversation agentic→chat flip in `setModeOverride` below): inline
-  // file *content* rather than sending paths, since chat mode never invokes
-  // filesystem tools. Binaries can't be inlined as text, so they attach as a
-  // short descriptor instead of being rejected.
+  // mid-conversation agentic→chat flip in `setModeOverride` below): inline a
+  // *user-attached* file's content rather than sending a path, so the model
+  // sees the content directly without needing a filesystem tool to open a path
+  // outside the chat folder. (Distinct from the model's own scoped tool use,
+  // which Round-5 now permits inside the chat folder.) Binaries can't be
+  // inlined as text, so they attach as a short descriptor instead.
   const inlineFileAsAttachment = async (f: PathInfo) => {
     if (f.is_dir) return;
     try {
@@ -877,16 +940,27 @@ export const useChatStore = create<ChatState>((set, get) => {
       });
       void onApprovalNeeded((e) => {
         if (!forActive(e.session_id)) return;
-        // Round-4 tool-safety fix: chat mode never executes tools, so a
-        // permission request there means the model tried anyway — decline it
-        // automatically instead of showing a hidden prompt the turn would hang
-        // waiting on (ChatView doesn't render ApprovalPrompt in chat mode).
+        // Chat ("thought-partner") mode: tools are allowed but scoped to the
+        // session's own chat folder (Round-5, owner decision). We still force
+        // `approve` mode (ensureSafeApprovalMode) so every tool call surfaces
+        // here as a permission request we can *decide*, rather than `auto`
+        // executing it unseen. Decision: a path-based file op is auto-approved
+        // only if its target resolves inside cwd (the chat folder), and
+        // auto-rejected otherwise; a tool with no structured path — notably
+        // `shell`, which is how the model produces docx/xlsx via Python — is
+        // allowed and runs with cwd = the chat folder. Soft boundary: shell
+        // isn't sandboxed, so a command could still reach outside; the path
+        // check hard-confines the one class of ops Kitty can actually inspect.
+        // (ChatView hides ApprovalPrompt in chat mode, but ThinkingBox still
+        // renders the tool cards, so the model's tool use stays visible.)
         if (isChatMode(get())) {
-          void ipc.respondPermission(e.tool_call_id, pickRejectOption(e.options)).catch(() => {});
-          set({
-            warning:
-              'Tool use is off in chat mode — the model tried to use a tool and was declined.',
-          });
+          const { optionId, warning } = decideChatApproval(
+            e.tool_call.rawInput,
+            get().cwd,
+            e.options
+          );
+          void ipc.respondPermission(e.tool_call_id, optionId).catch(() => {});
+          if (warning) set({ warning });
           return;
         }
         set((s) =>

@@ -83,10 +83,18 @@ done until this file is updated and the affected code (`goosed/api.rs`,
   `path`, so even a *successful* shell-produced binary file won't surface in the
   Artifacts pane (the pane derives entries from tool metadata, not by scanning
   the working directory). Both are acknowledged limitations, not bugs.
-- **Chat ("thought-partner") mode auto-rejects tool calls by design:** if a
-  provider is used in chat mode (`tools_enabled:false`, or the session toggled
-  to Chat), Kitty's Round-4 tool-safety fix declines every tool call — so no
-  files get written until the session is in Agent mode. Expected behavior.
+- **Chat ("thought-partner") mode allows tools, scoped to the chat folder
+  (Round-5, owner decision — supersedes Round-4's blanket auto-reject):** chat
+  mode still forces `approve` so every tool call surfaces as a permission
+  request Kitty decides in `chatStore.ts`'s approval handler. A path-based file
+  op is auto-approved only if its target resolves inside the session's cwd (the
+  `Documents/Kitty/chats/<id>/` folder) and auto-rejected otherwise; a tool with
+  no structured path — notably `shell`, which is how docx/xlsx get produced via
+  Python — is auto-approved and runs with cwd = the chat folder. **Soft
+  boundary, not a sandbox:** shell isn't confined, so a command could still
+  reach outside the folder; the path check hard-confines only the path-based
+  ops Kitty can inspect. This is what lets a thought-partner-mode session export
+  a docx (which previously hit "Tool use is off in chat mode — declined").
 
 ## Installer URLs & hashes (Phase 7)
 
