@@ -21,6 +21,7 @@ import {
   windowLabel,
 } from '@/lib/ipc';
 import { buildExport, sanitizeFilename } from '@/lib/chatml';
+import { defaultSystemPrompt } from '@/lib/system_prompts';
 import type {
   ApprovalNeededEvent,
   ModeInfo,
@@ -110,6 +111,10 @@ interface ChatState {
       context resent on later turns, chat-only mode only. Remove once Goose ships
       a native hook (block/goose#7617) and thread it into goosed_env() instead. */
   stripReasoning: boolean;
+  /** Active provider's custom system prompt override, or `null` to use the
+      built-in mode-appropriate default (`defaultSystemPrompt`). Prepended to a
+      session's first outgoing message only — see `send()`. */
+  systemPrompt: string | null;
   /** Per-session chat/agentic override (Round-4 instant mode toggle). `null` =
       follow the active provider's `tools_enabled` default — see `isChatMode`. */
   modeOverride: 'chat' | 'agentic' | null;
@@ -486,6 +491,7 @@ export const useChatStore = create<ChatState>((set, get) => {
     model: null,
     providerName: null,
     stripReasoning: false,
+    systemPrompt: null,
     modeOverride: null,
     savedApprovalMode: null,
     warning: null,
@@ -508,6 +514,7 @@ export const useChatStore = create<ChatState>((set, get) => {
           model: active?.models[0] ?? null,
           providerName: active ? active.name || active.provider_type : null,
           stripReasoning: active ? active.strip_reasoning : false,
+          systemPrompt: active ? active.system_prompt : null,
         });
       } catch {
         set({
@@ -517,6 +524,7 @@ export const useChatStore = create<ChatState>((set, get) => {
           model: null,
           providerName: null,
           stripReasoning: false,
+          systemPrompt: null,
         });
       }
     },
@@ -901,6 +909,18 @@ export const useChatStore = create<ChatState>((set, get) => {
         priorMessages.some((m) => m.role === 'assistant' && m.reasoning.trim().length > 0);
       if (stripReasoningNow) {
         promptText = `${buildStrippedTranscript(priorMessages)}\n\nUser: ${promptText}`;
+      }
+      // Custom/default system prompt (Round-6 Feature 2), first turn of a
+      // session only — a hidden preamble on the actual outgoing prompt text,
+      // never on `userMsg.text` below (built independently from `trimmed`), so
+      // the rendered bubble shows only what the user typed. `firstMessage` was
+      // captured before the stripReasoning session-swap logic above, so a
+      // mid-conversation swap onto a fresh goosed session correctly does NOT
+      // get a second prepend — from the user's perspective it's a continuation,
+      // not a new conversation.
+      if (firstMessage) {
+        const resolvedPrompt = get().systemPrompt ?? defaultSystemPrompt(chatOnly);
+        promptText = `<system>\n${resolvedPrompt}\n</system>\n\n${promptText}`;
       }
       const cwd = get().cwd ?? undefined;
 

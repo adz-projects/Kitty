@@ -447,6 +447,24 @@ function ProviderForm({
         </span>
       </label>
 
+      <label className="field">
+        <span>Custom system prompt (optional — overrides the built-in agentic/chat default)</span>
+        <textarea
+          rows={4}
+          value={profile.system_prompt ?? ''}
+          placeholder={
+            profile.tools_enabled
+              ? 'Default: capable agentic assistant with scoped filesystem/shell tools…'
+              : 'Default: thoughtful conversational partner, no filesystem/shell assumed…'
+          }
+          onChange={(e) => set({ system_prompt: e.target.value || null })}
+        />
+        <small className="muted">
+          Sent as a hidden preamble on the first message of each new session — not visible in the
+          chat bubble.
+        </small>
+      </label>
+
       {/* Per-provider sampling params (items 27/28), vertical stack so nothing overlaps. */}
       <div className="field param-slider">
         <label className="check">

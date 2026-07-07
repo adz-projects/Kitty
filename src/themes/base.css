@@ -945,13 +945,19 @@ button.primary {
   font-weight: 600;
 }
 .field input,
-.field select {
+.field select,
+.field textarea {
   padding: 7px 9px;
   border: 1px solid var(--border);
   border-radius: 6px;
   background: var(--surface-2);
   color: var(--text);
   width: 100%;
+}
+.field textarea {
+  font-family: inherit;
+  font-size: 13px;
+  resize: vertical;
 }
 /* Per-provider param sliders (Round-2 item 28): range fills the row, value badge
    stays inline; never wraps into the Save button. */
