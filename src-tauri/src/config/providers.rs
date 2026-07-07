@@ -58,6 +58,21 @@ pub struct ProviderProfile {
     /// matching `temperature`/`top_p`/`context_length` below.
     #[serde(default)]
     pub strip_reasoning: bool,
+    /// Custom system prompt for this provider (Round-6 Feature 2). `None` =
+    /// use the built-in mode-appropriate default (see
+    /// `src/lib/system_prompts.ts`). STOPGAP-adjacent, same rationale as
+    /// `strip_reasoning` above: Goose's ACP `session/new` silently drops
+    /// unknown params like `systemPrompt`/`instructions` (live-probed,
+    /// `docs/acp-protocol.md`), and there is no `GOOSE_*` env var for this
+    /// either, so the resolved prompt is prepended client-side to a session's
+    /// first outgoing message (`chatStore.ts`'s `send()`) rather than passed
+    /// through ACP. This field is never sent as an env var — no
+    /// `goosed_env()` change needed. Revisit if Goose ever gains native
+    /// system-prompt support, or once the `.goosehints` file convention is
+    /// probe-confirmed as a cleaner alternative (see the plan doc's deferred
+    /// Batch 9).
+    #[serde(default)]
+    pub system_prompt: Option<String>,
     #[serde(default)]
     pub created_at: String,
 }
@@ -286,5 +301,6 @@ mod tests {
         assert_eq!(p.context_length, None);
         assert_eq!(p.models, vec!["llama3.2:3b"]);
         assert!(!p.strip_reasoning);
+        assert_eq!(p.system_prompt, None);
     }
 }

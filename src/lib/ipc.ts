@@ -83,6 +83,10 @@ export const ipc = {
   ollamaListModels: () => invoke<OllamaModel[]>('ollama_list_models'),
   ollamaDeleteModel: (model: string) => invoke<void>('ollama_delete_model', { model }),
   ollamaPullModel: (model: string) => invoke<string>('ollama_pull_model', { model }),
+  ollamaShowContextLength: (model: string) =>
+    invoke<number | null>('ollama_show_context_length', { model }),
+  openrouterContextLength: (model: string) =>
+    invoke<number | null>('openrouter_context_length', { model }),
   // Ollama env helper
   readOllamaEnv: () => invoke<EnvVar[]>('read_ollama_env'),
   setOllamaEnv: (name: string, value: string | null) =>

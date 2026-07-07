@@ -8,6 +8,11 @@ import type {
   ProviderView,
 } from '@/lib/types';
 import { trustBadge } from '@/lib/provider_trust';
+import {
+  ANTHROPIC_CONTEXT_TABLE,
+  CUSTOM_OPENAI_CONTEXT_TABLE,
+  lookupContextLength,
+} from '@/lib/context_length_table';
 
 const DEFAULT_URL: Record<ProviderType, string> = {
   ollama: 'http://localhost:11434',
@@ -18,13 +23,17 @@ const DEFAULT_URL: Record<ProviderType, string> = {
 };
 
 // Context-length detents (item 28): not linearly spaced, so the slider indexes
-// into this array rather than mapping its position directly to a value.
+// into this array rather than mapping its position directly to a value. When
+// auto-detection (Round-6 Feature 1) finds a real number for the selected
+// model, it's spliced in as an extra detent (see `detentsFor` below) rather
+// than snapped to the nearest static stop, so the exact real max is always
+// reachable and reads correctly on the badge.
 const CTX_DETENTS = [4096, 8192, 16384, 32768, 65536, 131072, 262144];
 const ctxLabel = (v: number) => (v % 1024 === 0 ? `${v / 1024}K` : String(v));
-function nearestCtxIndex(v: number): number {
+function nearestCtxIndex(detents: number[], v: number): number {
   let best = 0;
   let bd = Infinity;
-  CTX_DETENTS.forEach((d, i) => {
+  detents.forEach((d, i) => {
     const dist = Math.abs(d - v);
     if (dist < bd) {
       bd = dist;
@@ -32,6 +41,38 @@ function nearestCtxIndex(v: number): number {
     }
   });
   return best;
+}
+
+/** Static detents plus a live-detected value, if any and not already present. */
+function detentsFor(suggested: number | null): number[] {
+  if (suggested == null || CTX_DETENTS.includes(suggested)) return CTX_DETENTS;
+  return [...CTX_DETENTS, suggested].sort((a, b) => a - b);
+}
+
+/** Best-effort context-window suggestion for the model currently selected on
+    `profile`, per provider type (Round-6 Feature 1): Ollama/OpenRouter query
+    live; Anthropic/custom_openai use a small hardcoded table. `null` when
+    nothing is known — the field stays fully manual in that case. */
+async function suggestContextLength(profile: ProviderProfile): Promise<number | null> {
+  const model = profile.models[0];
+  if (!model) return null;
+  try {
+    switch (profile.provider_type) {
+      case 'ollama':
+        return await ipc.ollamaShowContextLength(model);
+      case 'openrouter':
+        return await ipc.openrouterContextLength(model);
+      case 'anthropic':
+        return lookupContextLength(ANTHROPIC_CONTEXT_TABLE, model);
+      case 'openai':
+      case 'custom_openai':
+        return lookupContextLength(CUSTOM_OPENAI_CONTEXT_TABLE, model);
+      default:
+        return null;
+    }
+  } catch {
+    return null;
+  }
 }
 
 /** Client-side mirror of providers::network_tier_for — only used to detect
@@ -60,6 +101,7 @@ const blank = (): ProviderProfile => ({
   top_p: null,
   context_length: null,
   strip_reasoning: false,
+  system_prompt: null,
   created_at: '',
 });
 
@@ -285,6 +327,22 @@ function ProviderForm({
     };
   }, [ollamaLocal]);
 
+  // Context-length auto-suggest (Round-6 Feature 1) — re-resolves whenever the
+  // provider type or selected model changes; never applied automatically, only
+  // offered (see the suggestion row below the slider).
+  const [suggested, setSuggested] = useState<number | null>(null);
+  const modelsKey = profile.models.join(',');
+  useEffect(() => {
+    let live = true;
+    setSuggested(null);
+    void suggestContextLength(profile).then((v) => live && setSuggested(v));
+    return () => {
+      live = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [profile.provider_type, modelsKey]);
+  const detents = detentsFor(suggested);
+
   return (
     <Modal title={profile.id ? 'Edit provider' : 'Add provider'}>
       <label className="field">
@@ -428,12 +486,20 @@ function ProviderForm({
             <input
               type="range"
               min={0}
-              max={CTX_DETENTS.length - 1}
+              max={detents.length - 1}
               step={1}
-              value={nearestCtxIndex(profile.context_length)}
-              onChange={(e) => set({ context_length: CTX_DETENTS[Number(e.target.value)] })}
+              value={nearestCtxIndex(detents, profile.context_length)}
+              onChange={(e) => set({ context_length: detents[Number(e.target.value)] })}
             />
             <span className="status-badge">{ctxLabel(profile.context_length)}</span>
+          </div>
+        )}
+        {suggested != null && suggested !== profile.context_length && (
+          <div className="row">
+            <small className="muted">Detected context: {ctxLabel(suggested)}</small>
+            <button className="link" onClick={() => set({ context_length: suggested })}>
+              Use this
+            </button>
           </div>
         )}
       </div>

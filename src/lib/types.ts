@@ -50,6 +50,11 @@ export interface ProviderProfile {
   /** STOPGAP client-side workaround (see chatStore.ts's send()) — Goose has no
       native hook for this yet; remove once block/goose#7617 or equivalent lands. */
   strip_reasoning: boolean;
+  /** Custom system prompt; `null` = use the built-in mode-appropriate default
+      (see system_prompts.ts). STOPGAP-adjacent — prepended client-side to a
+      session's first message (chatStore.ts's send()), since Goose's ACP has no
+      system-prompt param it honors. */
+  system_prompt: string | null;
   created_at: string;
 }
 
