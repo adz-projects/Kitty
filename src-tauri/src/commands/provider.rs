@@ -8,6 +8,7 @@ use crate::config;
 use crate::config::providers::{self, NetworkTier, ProviderProfile};
 use crate::config::Config;
 use crate::ollama;
+use crate::openrouter;
 use crate::state::AppState;
 
 use super::window::restart_goosed;
@@ -79,6 +80,15 @@ pub fn delete_provider(state: tauri::State<'_, AppState>, id: String) -> Result<
         cfg.active_provider_id = None;
     }
     config::save(&cfg).map_err(|e| e.to_string())
+}
+
+/// Best-effort context-length lookup for OpenRouter models, for the Providers
+/// form's auto-suggest (Round-6 Feature 1). `Ok(None)` (not `Err`) when the
+/// model isn't found in the list — this is a suggestion, not a required value.
+#[tauri::command]
+pub async fn openrouter_context_length(model: String) -> Result<Option<u32>, String> {
+    let models = openrouter::list_models().await?;
+    Ok(openrouter::context_length_for(&models, &model))
 }
 
 /// Activate a provider profile (`None` = use goosed's own config). Persists the

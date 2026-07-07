@@ -43,6 +43,29 @@ pub async fn delete_model(base_url: &str, model: &str) -> Result<(), String> {
     }
 }
 
+/// `POST /api/show` — best-effort lookup of a model's max context length, for
+/// suggesting (not forcing) `GOOSE_CONTEXT_LIMIT` (Round-6 Feature 1). The
+/// field lives under `model_info` with an architecture-specific key name
+/// (e.g. `llama.context_length`, `qwen2.context_length`, `gemma2.context_length`)
+/// rather than one fixed key, so search for any key ending in `.context_length`
+/// instead of hardcoding a family. Returns `None` on any failure (network,
+/// missing model, missing field) — this is a suggestion, never fatal.
+pub async fn show_model_context_length(base_url: &str, model: &str) -> Option<u32> {
+    let url = format!("{}/api/show", base(base_url));
+    let resp = reqwest::Client::new()
+        .post(url)
+        .json(&json!({ "model": model }))
+        .send()
+        .await
+        .ok()?;
+    let json: Value = resp.json().await.ok()?;
+    let info = json.get("model_info")?.as_object()?;
+    info.iter()
+        .find(|(k, _)| k.ends_with(".context_length"))
+        .and_then(|(_, v)| v.as_u64())
+        .map(|n| n as u32)
+}
+
 /// Warm a model into Ollama's memory and pin it (Round-2 item 5): `/api/generate`
 /// with an empty prompt and `keep_alive: -1` (resident until released).
 pub async fn keep_alive_load(base_url: &str, model: &str) {

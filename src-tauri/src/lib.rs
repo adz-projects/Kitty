@@ -13,6 +13,7 @@ mod hotkey;
 mod lifecycle;
 mod notifications;
 mod ollama;
+mod openrouter;
 mod state;
 mod tray;
 mod util;
@@ -97,8 +98,10 @@ pub fn run() {
             commands::upsert_provider,
             commands::delete_provider,
             commands::activate_provider,
+            commands::openrouter_context_length,
             commands::ollama_list_models,
             commands::ollama_delete_model,
+            commands::ollama_show_context_length,
             commands::ollama_pull_model,
             commands::read_ollama_env,
             commands::set_ollama_env,

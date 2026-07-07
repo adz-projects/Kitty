@@ -30,6 +30,14 @@ pub async fn ollama_delete_model(app: AppHandle, model: String) -> Result<(), St
     ollama::delete_model(&ollama_base(&app), &model).await
 }
 
+/// Best-effort context-length lookup for the Providers form's auto-suggest
+/// (Round-6 Feature 1). `Ok(None)` (not `Err`) on any failure — this is a
+/// suggestion, not a required value.
+#[tauri::command]
+pub async fn ollama_show_context_length(app: AppHandle, model: String) -> Result<Option<u32>, String> {
+    Ok(ollama::show_model_context_length(&ollama_base(&app), &model).await)
+}
+
 /// Start a model pull; returns a `pull_id` to correlate `ollama://pull-progress`
 /// events. Multiple concurrent pulls are supported.
 #[tauri::command]
