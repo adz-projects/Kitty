@@ -1089,6 +1089,12 @@ button.link {
   padding: 20px;
   max-width: 440px;
   width: 90%;
+  /* The provider form (temperature/context/system-prompt fields) can outgrow
+     a short settings window — cap the modal and let it scroll internally
+     rather than spilling past the window's edges. */
+  max-height: min(85vh, 640px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
   display: flex;
   flex-direction: column;
   gap: 12px;
