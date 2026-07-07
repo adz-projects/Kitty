@@ -301,6 +301,17 @@ export function pathWithinDir(base: string, target: string): boolean {
   return resolved === b || resolved.startsWith(`${b}/`);
 }
 
+/** Whether `target` sits under Goose's own internal cache directory
+    (`.../Block/goose/cache/...`, e.g. `computercontroller`'s scraped-page
+    cache). These are the tool's own working storage, not a file the model is
+    saving for the user, so they're out of scope for the chat-folder boundary
+    entirely — rejecting them just breaks the tool (e.g. web fetch) without
+    protecting anything. Lexical, matching `pathWithinDir`'s no-fs-access
+    style. Exported for unit testing. */
+export function isGooseInternalCachePath(target: string): boolean {
+  return /(^|\/)block\/goose\/cache(\/|$)/i.test(target.replace(/\\/g, '/'));
+}
+
 /** Decide how to answer a tool-approval request while in chat ("thought-
     partner") mode (Round-5, owner decision): tools are allowed, but a path-
     based file op is confined to the session's chat folder (`cwd`). Returns the
@@ -316,7 +327,13 @@ export function decideChatApproval(
   const input = (rawInput ?? {}) as { path?: string; file_path?: string; paths?: string[] };
   const p =
     input.path ?? input.file_path ?? (Array.isArray(input.paths) ? input.paths[0] : undefined);
-  if (typeof p === 'string' && p !== '' && !!cwd && !pathWithinDir(cwd, p)) {
+  if (
+    typeof p === 'string' &&
+    p !== '' &&
+    !!cwd &&
+    !pathWithinDir(cwd, p) &&
+    !isGooseInternalCachePath(p)
+  ) {
     return {
       optionId: pickRejectOption(options),
       warning:

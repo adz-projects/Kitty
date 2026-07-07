@@ -1,3 +1,4 @@
+import type { ReactNode } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
@@ -6,8 +7,28 @@ import { useChatStore, type Message } from '@/stores/chatStore';
 import { ThinkingBox } from './ThinkingBox';
 import { CodeBlock } from './CodeBlock';
 import { MessageInfo } from './MessageInfo';
+import { ipc } from '@/lib/ipc';
 
-const MARKDOWN_COMPONENTS = { pre: CodeBlock };
+/** Open markdown links with the OS default handler instead of navigating the
+    Kitty window itself — Tauri's webview otherwise treats a bare `<a href>`
+    as in-window navigation. `open_path` already opens both file paths and
+    `https://` URLs via the OS default handler (same command the wizard's
+    "View release" link uses). */
+function ExternalLink({ href, children }: { href?: string; children?: ReactNode }) {
+  return (
+    <a
+      href={href}
+      onClick={(e) => {
+        e.preventDefault();
+        if (href) void ipc.openPath(href);
+      }}
+    >
+      {children}
+    </a>
+  );
+}
+
+const MARKDOWN_COMPONENTS = { pre: CodeBlock, a: ExternalLink };
 
 /** One chat message. User turns render as a plain bubble; assistant turns render
     markdown, with an optional collapsible reasoning block and tool cards. Hover
