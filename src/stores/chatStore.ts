@@ -211,6 +211,11 @@ const clearStopGrace = () => {
 let msgSeq = 0;
 const newId = () => `m${Date.now()}_${++msgSeq}`;
 
+// Live counts backing the chat-mode tool-loop guard (see `countToolCall`
+// above) — module-level like `stopGraceTimer`, reset at the start of every
+// fresh turn in `send()`.
+let toolLoopCounts: ToolCallCounts = new Map();
+
 // A file-writing tool by name/verb. Broadened (Round-5) beyond the original
 // text_editor set to cover the write verbs other tools use.
 const ARTIFACT_RE =
@@ -316,6 +321,57 @@ export function pathWithinDir(base: string, target: string): boolean {
 export function isGooseInternalCachePath(target: string): boolean {
   return /(^|\/)block\/goose\/cache(\/|$)/i.test(target.replace(/\\/g, '/'));
 }
+
+/** Map of tool-call "signature" (see `toolCallSignature`) to how many times
+    it's been seen this turn — backs the chat-mode tool-loop guard below. */
+export type ToolCallCounts = Map<string, number>;
+
+/** Best-effort identifying string for a tool call — tool name/kind plus its
+    primary argument (URL, path, or command; falls back to the whole input).
+    Not a full hash, just enough to tell "the same call, again" apart from "a
+    different call." Exported for unit testing. */
+export function toolCallSignature(title: string, rawInput: unknown): string {
+  const input = (rawInput ?? {}) as {
+    url?: string;
+    path?: string;
+    file_path?: string;
+    paths?: string[];
+    command?: string;
+  };
+  const primary =
+    input.url ??
+    input.path ??
+    input.file_path ??
+    (Array.isArray(input.paths) ? input.paths[0] : undefined) ??
+    input.command;
+  const target = typeof primary === 'string' ? primary : JSON.stringify(input);
+  return `${title}::${target}`;
+}
+
+/** Chat-mode tool-loop guard (owner-reported bug): a model can get stuck
+    alternating between two tools against the same target (e.g. a web-fetch
+    tool and its own cache step) — each iteration a real network/disk
+    round-trip, not just wasted tokens, since goose actually executes the call
+    before this fires. Increments and returns the new count for this call's
+    signature. Pure (counts passed in/out, a fresh Map returned) so it's
+    unit-testable and resettable per turn — see `send()`, which clears the
+    live counts at the start of every fresh turn; repeating a call across
+    different turns is normal, not a loop. Exported for unit testing. */
+export function countToolCall(
+  counts: ToolCallCounts,
+  title: string,
+  rawInput: unknown
+): { count: number; counts: ToolCallCounts } {
+  const sig = toolCallSignature(title, rawInput);
+  const next = new Map(counts);
+  const count = (next.get(sig) ?? 0) + 1;
+  next.set(sig, count);
+  return { count, counts: next };
+}
+
+/** More than this many identical calls in one turn is treated as a stuck
+    loop, not legitimate repeated tool use. */
+const TOOL_LOOP_THRESHOLD = 4;
 
 /** Decide how to answer a tool-approval request while in chat ("thought-
     partner") mode (Round-5, owner decision): tools are allowed, but a path-
@@ -941,8 +997,11 @@ export const useChatStore = create<ChatState>((set, get) => {
       };
       // Fresh turn: clear any leftover stop/abandon state so its events flow
       // and a prior force-stop on this session no longer suppresses them.
+      // Also reset the tool-loop guard — a call repeating across different
+      // turns is normal, not a loop.
       clearStopGrace();
       discardDeltas();
+      toolLoopCounts = new Map();
       set((s) => ({
         messages: [...s.messages, userMsg],
         droppedFiles: [],
@@ -1139,6 +1198,23 @@ export const useChatStore = create<ChatState>((set, get) => {
         // (ChatView hides ApprovalPrompt in chat mode, but ThinkingBox still
         // renders the tool cards, so the model's tool use stays visible.)
         if (isChatMode(get())) {
+          // Tool-loop guard (owner-reported bug): a model can get stuck
+          // alternating tools (e.g. web-fetch ↔ its own cache step) against
+          // the same target — each call is real network/disk I/O, so this
+          // must be checked *before* deciding to allow it, not after.
+          const title = String(e.tool_call.title ?? e.tool_call.kind ?? 'tool');
+          const { count, counts } = countToolCall(toolLoopCounts, title, e.tool_call.rawInput);
+          toolLoopCounts = counts;
+          if (count > TOOL_LOOP_THRESHOLD) {
+            void ipc.respondPermission(e.tool_call_id, pickRejectOption(e.options)).catch(() => {});
+            set({
+              warning:
+                `Declined — "${title}" has been called ${count} times with the same target ` +
+                `this turn. The model appears stuck in a loop; try Force Stop if it doesn't ` +
+                `recover on its own.`,
+            });
+            return;
+          }
           const { optionId, warning } = decideChatApproval(
             e.tool_call.rawInput,
             get().cwd,
