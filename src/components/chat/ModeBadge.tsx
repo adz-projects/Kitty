@@ -25,11 +25,11 @@ export function ModeBadge() {
   return (
     <div style={{ position: 'relative' }}>
       <button
-        className="status-badge"
+        className="status-badge mode-status-badge"
         onClick={() => setOpen((o) => !o)}
         title="Approval mode — click to change"
       >
-        🛡 {label} ▾
+        🛡 <span className="mode-badge-label">{label}</span> ▾
       </button>
       {open && approvalModes.length > 0 && (
         <div className="mode-popover" role="menu">

@@ -511,6 +511,30 @@ button.primary {
   }
 }
 
+/* Approval-mode badge (ModeBadge) — same shrink-and-truncate treatment as the
+   provider badge above. Without a cap, its longest label ("Ask every tool")
+   is the widest fixed element in the header and is the first thing pushed
+   past the window's edge (invisible, not wrapped) once nowrap can't fit
+   everything at the overlay's narrower widths. */
+.mode-status-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 160px;
+  min-width: 0;
+}
+.mode-badge-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+@media (max-width: 700px) {
+  .mode-status-badge {
+    max-width: 60px;
+  }
+}
+
 /* Instant chat/agentic mode toggle (Round-4). */
 .mode-toggle {
   display: inline-flex;
@@ -552,6 +576,13 @@ button.primary {
   font-size: 11px;
   padding: 3px 8px;
   cursor: pointer;
+  flex-shrink: 0;
+}
+@media (max-width: 700px) {
+  .effort-dropdown {
+    max-width: 56px;
+    padding: 3px 4px;
+  }
 }
 .status-badge-warn {
   border-color: var(--warn);
