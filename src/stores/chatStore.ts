@@ -98,6 +98,17 @@ interface ChatState {
   pendingImages: PendingImage[];
   pendingApprovals: ApprovalNeededEvent[];
   busy: boolean;
+  /** True only while `loadSession` is actively replaying a resumed
+      conversation (Round-7 perf fix). The message list renders a lightweight
+      placeholder instead of the real list while this is true — a long
+      session's replay fires one `chat://*` event per historical turn/tool-call
+      with no batching, and rendering (and re-scrolling) the growing list on
+      every single one of those was the actual bottleneck, not the replay
+      itself (goosed streams the whole thing before `session/load`'s ACP
+      response even returns). `messages` still accumulates normally underneath;
+      nothing subscribes to render it until this flips back to `false`, so the
+      final render is one clean paint instead of hundreds of incremental ones. */
+  replaying: boolean;
   error: string | null;
   // Active-provider derived state (Phase 9/10)
   providerTier: NetworkTier | null;
@@ -589,6 +600,7 @@ export const useChatStore = create<ChatState>((set, get) => {
     pendingImages: [],
     pendingApprovals: [],
     busy: false,
+    replaying: false,
     error: null,
     providerTier: null,
     providerHost: null,
@@ -740,6 +752,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         savedApprovalMode: null,
         error: null,
         busy: true,
+        replaying: true,
         stopPhase: null,
         abandonedSession: null,
       });
@@ -757,7 +770,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         // a pending rAF flush lands on a closed message and spawns a spurious
         // trailing assistant message (Round-5 coalescing interaction).
         flushDeltas();
-        set((s) => ({ busy: false, messages: closeOpen(s.messages) }));
+        set((s) => ({ busy: false, replaying: false, messages: closeOpen(s.messages) }));
       }
     },
 

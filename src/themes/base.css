@@ -214,6 +214,13 @@ button.primary {
 .message-list.empty {
   overflow-y: hidden;
 }
+/* Round-7: shown instead of the real list while a resumed session is
+   replaying, so nothing renders (or re-scrolls) per historical event. */
+.message-list-loading {
+  align-items: center;
+  justify-content: center;
+  overflow-y: hidden;
+}
 
 .msg {
   display: flex;

@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react';
+import { memo, type ReactNode } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
@@ -33,8 +33,20 @@ const MARKDOWN_COMPONENTS = { pre: CodeBlock, a: ExternalLink };
 /** One chat message. User turns render as a plain bubble; assistant turns render
     markdown, with an optional collapsible reasoning block and tool cards. Hover
     actions: Branch from here, Regenerate (assistant), Copy as Markdown, and an
-    info button (assistant only) surfacing model/provider/tokens/duration. */
-export function MessageItem({ message, index }: { message: Message; index: number }) {
+    info button (assistant only) surfacing model/provider/tokens/duration.
+
+    Memoized (Round-7 perf fix): a session replay/live stream re-renders the
+    parent list on every incoming event, but only ever changes one message at
+    a time — without this, every already-rendered historical message (incl.
+    its full markdown/syntax-highlight pass) re-executed on every single
+    unrelated event too, an O(n²) cost across a long replay. */
+export const MessageItem = memo(function MessageItem({
+  message,
+  index,
+}: {
+  message: Message;
+  index: number;
+}) {
   const branch = useChatStore((s) => s.branch);
   const regenerate = useChatStore((s) => s.regenerate);
   const exportSession = useChatStore((s) => s.exportSession);
@@ -100,4 +112,4 @@ export function MessageItem({ message, index }: { message: Message; index: numbe
       {actions}
     </div>
   );
-}
+});

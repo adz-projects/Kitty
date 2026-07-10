@@ -20,6 +20,7 @@ export function ChatView() {
   const {
     messages,
     busy,
+    replaying,
     error,
     cwd,
     title,
@@ -106,7 +107,17 @@ export function ChatView() {
         </div>
       )}
 
-      <MessageList messages={messages} empty={title ?? 'Start a new chat.'} stage={progressStage} />
+      {replaying ? (
+        <div className="message-list message-list-loading">
+          <p className="muted">Loading conversation…</p>
+        </div>
+      ) : (
+        <MessageList
+          messages={messages}
+          empty={title ?? 'Start a new chat.'}
+          stage={progressStage}
+        />
+      )}
 
       {!chatOnly &&
         pendingApprovals.map((a) => (
