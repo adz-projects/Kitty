@@ -59,6 +59,15 @@ export interface Message {
   /** The actual model that generated this message (Round-4 info button) —
       captured at send time, not read back from the live chat-pill state. */
   model?: string;
+  /** Files/images attached to this turn (Round-7 fix): a snapshot taken at
+      send() time, before droppedFiles/attachments/pendingImages are cleared
+      from composer state — without this, a message with both typed text and
+      an attachment showed no trace of the attachment at all once sent. Only
+      set on a message that just completed via a live send() in this session;
+      like the metrics fields above, a replayed/resumed message won't have
+      this (goosed's stored history has no structured "what was attached"
+      metadata to reconstruct it from — a known, accepted limitation). */
+  attachedFiles?: { name: string; kind: 'file' | 'document' | 'image' }[];
 }
 
 export interface Artifact {
@@ -1054,6 +1063,19 @@ export const useChatStore = create<ChatState>((set, get) => {
       }
       const cwd = get().cwd ?? undefined;
 
+      // Snapshot what's attached to this turn before the set() below clears
+      // droppedFiles/attachments/pendingImages from composer state — otherwise
+      // there'd be no record of it on the sent message at all (Round-7 fix).
+      const attachedFiles: { name: string; kind: 'file' | 'document' | 'image' }[] = [
+        ...otherFiles.map((f) => ({ name: f.name, kind: 'file' as const })),
+        ...imageFiles.map((f) => ({ name: f.name, kind: 'image' as const })),
+        ...attachments.map((a) => ({ name: a.label, kind: 'document' as const })),
+        ...pendingImages.map((_p, i) => ({
+          name: pendingImages.length > 1 ? `Clipboard image ${i + 1}` : 'Clipboard image',
+          kind: 'image' as const,
+        })),
+      ];
+
       const userMsg: Message = {
         id: newId(),
         role: 'user',
@@ -1068,6 +1090,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         toolCalls: [],
         streaming: false,
         open: false,
+        attachedFiles: attachedFiles.length ? attachedFiles : undefined,
       };
       // Fresh turn: clear any leftover stop/abandon state so its events flow
       // and a prior force-stop on this session no longer suppresses them.

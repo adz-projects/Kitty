@@ -7,6 +7,7 @@ import { useChatStore, type Message } from '@/stores/chatStore';
 import { ThinkingBox } from './ThinkingBox';
 import { CodeBlock } from './CodeBlock';
 import { MessageInfo } from './MessageInfo';
+import { MessageAttachmentChips } from './MessageAttachmentChips';
 import { ipc } from '@/lib/ipc';
 
 /** Open markdown links with the OS default handler instead of navigating the
@@ -83,6 +84,7 @@ export const MessageItem = memo(function MessageItem({
     return (
       <div className="msg msg-user">
         <div className="bubble">{message.text}</div>
+        <MessageAttachmentChips files={message.attachedFiles} />
         {actions}
       </div>
     );
