@@ -12,6 +12,7 @@ import type {
   Config,
   Detection,
   EnvVar,
+  ExtensionDefault,
   FileAttachment,
   FolderData,
   ModeEvent,
@@ -95,25 +96,13 @@ export const ipc = {
   setOllamaEnv: (name: string, value: string | null) =>
     invoke<void>('set_ollama_env', { name, value }),
   restartOllama: () => invoke<void>('restart_ollama'),
-  // Extensions
-  listExtensions: (sessionId: string) =>
-    invoke<Record<string, unknown>[]>('list_extensions', { sessionId }),
-  setExtensionEnabled: (
-    sessionId: string,
-    name: string,
-    enabled: boolean,
-    extType?: string,
-    server?: unknown
-  ) =>
-    invoke<void>('set_extension_enabled', {
-      sessionId,
-      name,
-      enabled,
-      extType: extType ?? null,
-      server: server ?? null,
-    }),
-  addExtension: (sessionId: string, name: string, command: string, args: string[], env: string[]) =>
-    invoke<void>('add_extension', { sessionId, name, command, args, env }),
+  // Extension defaults (Round-7 Feature 4) — read/write goose's own
+  // config.yaml directly; not session-scoped.
+  listDefaultExtensions: () => invoke<ExtensionDefault[]>('list_default_extensions'),
+  setDefaultExtensionEnabled: (id: string, enabled: boolean) =>
+    invoke<void>('set_default_extension_enabled', { id, enabled }),
+  addExtension: (name: string, command: string, args: string[], env: string[]) =>
+    invoke<void>('add_extension', { name, command, args, env }),
   // Settings deep link
   getSettingsTarget: () => invoke<SettingsTarget | null>('get_settings_target'),
   // Theming

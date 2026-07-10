@@ -100,6 +100,16 @@ export interface EnvVar {
   value: string | null;
 }
 
+/** One entry in goose's own config.yaml extensions map (Round-7 Feature 4) —
+    the real "default for new chats" catalog, on or off. */
+export interface ExtensionDefault {
+  id: string;
+  enabled: boolean;
+  type: string;
+  display_name: string | null;
+  description: string | null;
+}
+
 export interface SettingsTarget {
   section: string;
   highlight: string | null;

@@ -1,85 +1,34 @@
-//! Extension (MCP/builtin) management commands for the active session.
+//! Extension default-management commands (Round-7 Feature 4) — these read and
+//! write goose's own `config.yaml` directly (see `goose_config.rs`), not any
+//! single session's live state. A change here is the actual "default
+//! extensions for new chats" surface, taking effect on the *next* new
+//! session (a session already open is unaffected, same as a provider/
+//! temperature change needing a goosed restart to apply).
 
-use serde_json::{json, Value};
-use tauri::AppHandle;
+use crate::goose_config::{self, ExtensionDefault};
 
-use crate::goosed::api;
-
-/// List the active session's extensions (ACP unstable extension method).
+/// The full extensions catalog — every extension goose knows about, on or
+/// off, unlike the old session-scoped ACP `extensions/list` (which only ever
+/// showed what was already attached to one session, giving no visibility
+/// into installed-but-inactive extensions at all).
 #[tauri::command]
-pub async fn list_extensions(app: AppHandle, session_id: String) -> Result<Vec<Value>, String> {
-    let client = api::ensure_client(&app).await?;
-    let result = client
-        .request(
-            "_goose/unstable/session/extensions/list",
-            json!({ "sessionId": session_id }),
-        )
-        .await?;
-    Ok(result
-        .get("extensions")
-        .and_then(|e| e.as_array())
-        .cloned()
-        .unwrap_or_else(|| result.as_array().cloned().unwrap_or_default()))
+pub fn list_default_extensions() -> Result<Vec<ExtensionDefault>, String> {
+    goose_config::list_extension_defaults()
 }
 
-/// Toggle an extension by add/remove on the active session. `ext_type` and
-/// `server` (only meaningful when `ext_type == "mcp"`) let re-enabling an mcp
-/// extension send the correct tagged shape instead of always assuming builtin
-/// (Round-3 item 15 — previously hardcoded `type:"builtin"`, which would send
-/// the wrong shape for a custom mcp extension being turned back on).
+/// Flip one extension's default enabled state.
 #[tauri::command]
-pub async fn set_extension_enabled(
-    app: AppHandle,
-    session_id: String,
-    name: String,
-    enabled: bool,
-    ext_type: Option<String>,
-    server: Option<Value>,
-) -> Result<(), String> {
-    let client = api::ensure_client(&app).await?;
-    let (method, params) = if enabled {
-        let ty = ext_type.as_deref().unwrap_or("builtin");
-        let extension = if ty == "mcp" {
-            json!({ "type": "mcp", "server": server.unwrap_or(json!({ "name": name })) })
-        } else {
-            json!({ "type": ty, "name": name })
-        };
-        (
-            "_goose/unstable/session/extensions/add",
-            json!({ "sessionId": session_id, "extension": extension }),
-        )
-    } else {
-        (
-            "_goose/unstable/session/extensions/remove",
-            json!({ "sessionId": session_id, "name": name }),
-        )
-    };
-    client.request(method, params).await?;
-    Ok(())
+pub fn set_default_extension_enabled(id: String, enabled: bool) -> Result<(), String> {
+    goose_config::set_extension_default_enabled(&id, enabled)
 }
 
-/// Add a custom stdio/mcp extension to the active session (Round-3 item 14).
+/// Add a brand-new custom stdio/MCP extension as a persistent default.
 #[tauri::command]
-pub async fn add_extension(
-    app: AppHandle,
-    session_id: String,
+pub fn add_extension(
     name: String,
     command: String,
     args: Vec<String>,
     env: Vec<String>,
 ) -> Result<(), String> {
-    let client = api::ensure_client(&app).await?;
-    client
-        .request(
-            "_goose/unstable/session/extensions/add",
-            json!({
-                "sessionId": session_id,
-                "extension": {
-                    "type": "mcp",
-                    "server": { "name": name, "command": command, "args": args, "env": env }
-                }
-            }),
-        )
-        .await?;
-    Ok(())
+    goose_config::add_custom_extension_default(&name, &command, &args, &env)
 }

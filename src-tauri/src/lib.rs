@@ -8,6 +8,7 @@ mod commands;
 mod config;
 #[cfg(windows)]
 mod copilot;
+mod goose_config;
 mod goosed;
 mod hotkey;
 mod lifecycle;
@@ -107,8 +108,8 @@ pub fn run() {
             commands::read_ollama_env,
             commands::set_ollama_env,
             commands::restart_ollama,
-            commands::list_extensions,
-            commands::set_extension_enabled,
+            commands::list_default_extensions,
+            commands::set_default_extension_enabled,
             commands::add_extension,
             commands::get_settings_target,
             commands::list_themes,
