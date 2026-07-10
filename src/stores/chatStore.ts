@@ -27,6 +27,7 @@ import type {
   ModeInfo,
   NetworkTier,
   PathInfo,
+  SessionInfo,
   ToolCallUpdate,
 } from '@/lib/types';
 
@@ -215,6 +216,22 @@ const newId = () => `m${Date.now()}_${++msgSeq}`;
 // above) — module-level like `stopGraceTimer`, reset at the start of every
 // fresh turn in `send()`.
 let toolLoopCounts: ToolCallCounts = new Map();
+
+// Dedupes concurrent session-creation requests (Round-7): `newSession()`
+// clears the UI optimistically before awaiting `ipc.newSession`, so a
+// concurrent `send()` (user types+sends before that await resolves) sees
+// `sessionId === null` and calls `ensureSession()` → `newSession()` again.
+// Without this, that would fire a second real `ipc.newSession` call and
+// orphan one of the two goosed sessions. Module-level like the fields above.
+let pendingNewSession: Promise<SessionInfo> | null = null;
+function getOrCreateSession(cwd?: string): Promise<SessionInfo> {
+  if (!pendingNewSession) {
+    pendingNewSession = ipc.newSession(cwd).finally(() => {
+      pendingNewSession = null;
+    });
+  }
+  return pendingNewSession;
+}
 
 // A file-writing tool by name/verb. Broadened (Round-5) beyond the original
 // text_editor set to cover the write verbs other tools use.
@@ -662,18 +679,24 @@ export const useChatStore = create<ChatState>((set, get) => {
     },
 
     newSession: async (cwd?: string) => {
-      const info = await ipc.newSession(cwd);
+      // Optimistic clear (owner: New Chat should manifest instantly, not only
+      // once the ACP round trip(s) finish) — the blank chat shows immediately;
+      // `sessionId: null` here is safe against a concurrent send() racing in
+      // (it would call ensureSession() → newSession() again, but
+      // getOrCreateSession dedupes the actual IPC call below).
       clearStopGrace();
       discardDeltas();
       set({
-        sessionId: info.session_id,
-        cwd: info.cwd,
-        mode: info.current_mode,
-        availableModes: info.available_modes,
+        sessionId: null,
+        cwd: null,
+        mode: null,
+        availableModes: [],
         title: null,
         messages: [],
         artifacts: [],
+        droppedFiles: [],
         attachments: [],
+        pendingImages: [],
         pendingApprovals: [],
         modeOverride: null,
         savedApprovalMode: null,
@@ -681,6 +704,13 @@ export const useChatStore = create<ChatState>((set, get) => {
         busy: false,
         stopPhase: null,
         abandonedSession: null,
+      });
+      const info = await getOrCreateSession(cwd);
+      set({
+        sessionId: info.session_id,
+        cwd: info.cwd,
+        mode: info.current_mode,
+        availableModes: info.available_modes,
       });
       await get().refreshProvider();
       await ensureSafeApprovalMode();

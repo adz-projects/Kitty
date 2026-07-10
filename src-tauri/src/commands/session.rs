@@ -115,16 +115,23 @@ pub async fn new_session(app: AppHandle, cwd: Option<String>) -> Result<SessionI
     // provider's chat-only flag (Round-2 item 14a). The `computercontroller`
     // builtin is keyless and provides web search/fetch; best-effort + idempotent.
     // (Dedicated Brave search additionally needs the mcp-brave-search extension
-    // and a BRAVE_API_KEY — see docs/acp-protocol.md.)
-    let _ = client
-        .request(
-            "_goose/unstable/session/extensions/add",
-            json!({
-                "sessionId": &session_id,
-                "extension": { "type": "builtin", "name": "computercontroller" }
-            }),
-        )
-        .await;
+    // and a BRAVE_API_KEY — see docs/acp-protocol.md.) Spawned rather than
+    // awaited (Round-7): its result was already discarded, so awaiting it here
+    // only added a second full ACP round trip to the critical path the
+    // frontend blocks on before `new_session` visibly manifests.
+    let seed_client = client.clone();
+    let seed_session_id = session_id.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = seed_client
+            .request(
+                "_goose/unstable/session/extensions/add",
+                json!({
+                    "sessionId": &seed_session_id,
+                    "extension": { "type": "builtin", "name": "computercontroller" }
+                }),
+            )
+            .await;
+    });
 
     let current_mode = result
         .pointer("/modes/currentModeId")
