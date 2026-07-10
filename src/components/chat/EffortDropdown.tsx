@@ -22,7 +22,7 @@ export function EffortDropdown() {
     >
       {thinkingEffort.options.map((o) => (
         <option key={o.value} value={o.value}>
-          🧠 {o.name}
+          {o.name}
         </option>
       ))}
     </select>

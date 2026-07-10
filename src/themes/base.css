@@ -197,6 +197,25 @@ button.primary {
   justify-content: space-between;
   gap: 8px;
   padding-bottom: 8px;
+  flex-wrap: nowrap;
+}
+/* The folder/thought-partner pill takes remaining space and truncates first —
+   the control group to its right (mode toggle/provider/effort/approval) holds
+   its own shrink behavior instead of the whole header wrapping to 2 lines. */
+.chat-header > .pill,
+.chat-header > .pill-static {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chat-header-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+  min-width: 0;
 }
 
 .message-list {
@@ -470,6 +489,27 @@ button.primary {
   border: 1px solid var(--border);
   color: var(--text-muted);
 }
+/* Provider/model badge (Round-2 item 9): the model name is unbounded length
+   (e.g. "Deepseek V4 Pro"), so it truncates instead of forcing the header to
+   wrap — the icon and dropdown chevron stay put either side of it. */
+.provider-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 220px;
+  min-width: 0;
+}
+.provider-badge-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+@media (max-width: 700px) {
+  .provider-badge {
+    max-width: 90px;
+  }
+}
 
 /* Instant chat/agentic mode toggle (Round-4). */
 .mode-toggle {
@@ -485,6 +525,18 @@ button.primary {
   font-size: 11px;
   padding: 3px 8px;
   cursor: pointer;
+  white-space: nowrap;
+}
+/* Text label hides below this width, leaving just the emoji, so the header
+   fits on one line in the overlay's default size — restored once there's
+   enough room (e.g. the wider main window). */
+@media (max-width: 700px) {
+  .mode-toggle-label {
+    display: none;
+  }
+  .mode-toggle button {
+    padding: 3px 6px;
+  }
 }
 .mode-toggle button.active {
   background: var(--accent);

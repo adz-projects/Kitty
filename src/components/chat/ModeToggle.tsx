@@ -15,14 +15,14 @@ export function ModeToggle() {
         title="Chat mode — no tool calls, reading-friendly layout"
         onClick={() => void setModeOverride('chat')}
       >
-        💬 Chat
+        💬 <span className="mode-toggle-label">Chat</span>
       </button>
       <button
         className={!chatMode ? 'active' : ''}
         title="Agentic mode — tools, file context, working directory"
         onClick={() => void setModeOverride('agentic')}
       >
-        🛠 Agent
+        🛠 <span className="mode-toggle-label">Agent</span>
       </button>
     </div>
   );

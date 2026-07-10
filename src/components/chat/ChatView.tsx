@@ -84,7 +84,7 @@ export function ChatView() {
             📁 {folder ?? 'set folder'}
           </button>
         )}
-        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+        <div className="chat-header-controls">
           <ModeToggle />
           <ProviderBadge />
           <EffortDropdown />

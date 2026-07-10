@@ -42,12 +42,12 @@ export function ProviderBadge() {
   return (
     <div style={{ position: 'relative' }}>
       <button
-        className="status-badge"
+        className="status-badge provider-badge"
         onClick={() => setOpen((o) => !o)}
         title="Provider — click to switch (restarts the agent)"
         disabled={busy}
       >
-        {icon} {busy ? 'switching…' : label} ▾
+        {icon} <span className="provider-badge-label">{busy ? 'switching…' : label}</span> ▾
       </button>
       {open && (
         <div className="mode-popover" role="menu">

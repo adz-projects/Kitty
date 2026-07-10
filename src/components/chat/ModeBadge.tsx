@@ -17,6 +17,10 @@ export function ModeBadge() {
 
   if (!mode) return null;
   const label = LABELS[mode] ?? mode;
+  // "chat" is a goose approval-mode value too, but the ModeToggle already owns
+  // chat/agent switching (Round-4) — offering it again here as an "approval
+  // mode" choice is redundant and confusing (owner ask).
+  const approvalModes = availableModes.filter((m) => m.id !== 'chat');
 
   return (
     <div style={{ position: 'relative' }}>
@@ -27,9 +31,9 @@ export function ModeBadge() {
       >
         🛡 {label} ▾
       </button>
-      {open && availableModes.length > 0 && (
+      {open && approvalModes.length > 0 && (
         <div className="mode-popover" role="menu">
-          {availableModes.map((m) => (
+          {approvalModes.map((m) => (
             <button
               key={m.id}
               role="menuitemradio"
