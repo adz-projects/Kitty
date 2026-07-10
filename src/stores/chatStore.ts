@@ -99,7 +99,6 @@ interface ChatState {
   busy: boolean;
   error: string | null;
   // Active-provider derived state (Phase 9/10)
-  toolsEnabled: boolean;
   providerTier: NetworkTier | null;
   providerHost: string | null;
   providerOffline: boolean;
@@ -116,7 +115,8 @@ interface ChatState {
       session's first outgoing message only — see `send()`. */
   systemPrompt: string | null;
   /** Per-session chat/agentic override (Round-4 instant mode toggle). `null` =
-      follow the active provider's `tools_enabled` default — see `isChatMode`. */
+      default to agentic (Round-7: providers no longer carry their own default —
+      see `isChatMode`). */
   modeOverride: 'chat' | 'agentic' | null;
   /** Approval mode saved when flipping into chat mode, restored on flip back
       (Round-4 tool-safety fix). `null` when not currently overridden-to-chat. */
@@ -181,11 +181,11 @@ interface ChatState {
 }
 
 /** Effective chat/agentic mode for the current session: an explicit override
-    wins, otherwise follow the active provider's `tools_enabled` default.
-    Exported plain selector — usable as `useChatStore(isChatMode)` in
-    components or `isChatMode(get())` inside store actions (Round-4). */
-export const isChatMode = (s: ChatState): boolean =>
-  (s.modeOverride ?? (s.toolsEnabled ? 'agentic' : 'chat')) === 'chat';
+    wins, otherwise agentic (Round-7: providers no longer carry a `tools_enabled`
+    default — the per-session toggle is the only mode selector now). Exported
+    plain selector — usable as `useChatStore(isChatMode)` in components or
+    `isChatMode(get())` inside store actions (Round-4). */
+export const isChatMode = (s: ChatState): boolean => (s.modeOverride ?? 'agentic') === 'chat';
 
 let bound = false;
 // Timestamp of the most recent send() call, for the per-response duration
@@ -422,6 +422,40 @@ function buildStrippedTranscript(messages: Message[]): string {
   );
 }
 
+// Both known client-side prompt-preamble wrappers (Round-6 system prompt, and
+// this STOPGAP's own reconstructed transcript, immediately above) are only
+// ever prepended to the FIRST outgoing message of a session — see `send()`'s
+// `firstMessage` gate. `userMsg.text` (the live-rendered bubble) is always
+// built independently of the wrapped `promptText`, so a *live* send never
+// shows the wrapper. But goosed stores exactly what was transmitted, wrapper
+// included — so resuming a session via `session/load` replays the raw wrapped
+// text as that turn's `user_message_chunk`, with nothing in the replay path to
+// strip it. Only the first replayed user turn of a session can ever carry a
+// wrapper; later turns pass through untouched.
+const SYSTEM_PROMPT_WRAPPER_RE = /^<system>\n[\s\S]*?\n<\/system>\n\n/;
+const TRANSCRIPT_WRAPPER_PREAMBLE =
+  'Continuing the conversation below. Earlier reasoning/thinking has been omitted ' +
+  'to keep this response focused.\n\n';
+
+/** Strip a known prompt-preamble wrapper from a replayed first user message, if
+    present — heuristic pattern matching (not perfect: a user message that
+    happens to start with `<system>...` or the exact transcript preamble text
+    would also get stripped), but this is a client-side cosmetic concern, not a
+    security boundary, so a rare false-positive is an acceptable trade for
+    hiding the wrapper on replay. Returns `text` unchanged if neither wrapper is
+    present. Exported for unit testing. */
+export function stripPromptPreamble(text: string): string {
+  const systemMatch = text.match(SYSTEM_PROMPT_WRAPPER_RE);
+  if (systemMatch) return text.slice(systemMatch[0].length);
+  if (text.startsWith(TRANSCRIPT_WRAPPER_PREAMBLE)) {
+    const rest = text.slice(TRANSCRIPT_WRAPPER_PREAMBLE.length);
+    const marker = '\n\nUser: ';
+    const idx = rest.lastIndexOf(marker);
+    if (idx >= 0) return rest.slice(idx + marker.length);
+  }
+  return text;
+}
+
 export const useChatStore = create<ChatState>((set, get) => {
   // Force approve-mode whenever the effective mode is chat, so `auto` can
   // never silently execute a tool call unseen (Round-4 tool-safety fix for the
@@ -539,7 +573,6 @@ export const useChatStore = create<ChatState>((set, get) => {
     pendingApprovals: [],
     busy: false,
     error: null,
-    toolsEnabled: true,
     providerTier: null,
     providerHost: null,
     providerOffline: false,
@@ -563,7 +596,6 @@ export const useChatStore = create<ChatState>((set, get) => {
         const providers = await ipc.listProviders();
         const active = providers.find((p) => p.active);
         set({
-          toolsEnabled: active ? active.tools_enabled : true,
           providerTier: active ? active.network_tier : null,
           providerHost: active ? new URL(active.base_url).host : null,
           isTrusted: active ? active.is_trusted : false,
@@ -574,7 +606,6 @@ export const useChatStore = create<ChatState>((set, get) => {
         });
       } catch {
         set({
-          toolsEnabled: true,
           providerTier: null,
           providerHost: null,
           model: null,
@@ -1109,7 +1140,12 @@ export const useChatStore = create<ChatState>((set, get) => {
       void onUserMessage((e) => {
         if (!forActive(e.session_id)) return;
         flushDeltas(); // keep a replayed user turn after any buffered agent text
-        appendChunk('user', 'text', e.text);
+        // Only a session's first turn could ever carry a client-side prompt
+        // preamble (system-prompt or strip-reasoning wrapper) — see
+        // stripPromptPreamble's doc comment. Strip it before it's stored in
+        // Message.text so a resumed session doesn't show it raw.
+        const isFirst = get().messages.length === 0;
+        appendChunk('user', 'text', isFirst ? stripPromptPreamble(e.text) : e.text);
       });
 
       void onToolCall((e) => {

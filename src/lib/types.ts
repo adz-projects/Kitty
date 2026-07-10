@@ -42,7 +42,6 @@ export interface ProviderProfile {
   provider_type: ProviderType;
   base_url: string;
   models: string[];
-  tools_enabled: boolean;
   is_trusted: boolean;
   temperature: number | null;
   top_p: number | null;

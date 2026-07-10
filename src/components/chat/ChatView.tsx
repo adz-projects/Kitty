@@ -14,8 +14,8 @@ import { AttachmentChips } from './AttachmentChips';
 import { ClipboardImageChips } from './ClipboardImageChips';
 
 /** The shared chat surface used by both the overlay and the full window
-    (CLAUDE.md rule 5). In chat-only mode (tools_enabled:false) it hides the
-    agent chrome and switches to a reading-friendly column. */
+    (CLAUDE.md rule 5). In chat mode (per-session `ModeToggle`, `isChatMode`) it
+    hides the agent chrome and switches to a reading-friendly column. */
 export function ChatView() {
   const {
     messages,

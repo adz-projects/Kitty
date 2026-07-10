@@ -375,7 +375,7 @@ pub async fn fork_session(
 }
 
 /// Get a session's persisted chat/agentic mode override, if any (`None` =
-/// follow the active provider's `tools_enabled` default).
+/// default to agentic).
 #[tauri::command]
 pub fn get_session_mode(
     state: tauri::State<'_, AppState>,

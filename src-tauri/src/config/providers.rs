@@ -34,8 +34,6 @@ pub struct ProviderProfile {
     pub base_url: String,
     #[serde(default)]
     pub models: Vec<String>,
-    #[serde(default = "default_true")]
-    pub tools_enabled: bool,
     /// User-declared trust (Round-2 item 18). Loopback is always trusted by tier;
     /// this makes a non-loopback provider trusted (globe) instead of untrusted (⚠).
     #[serde(default)]
@@ -75,10 +73,6 @@ pub struct ProviderProfile {
     pub system_prompt: Option<String>,
     #[serde(default)]
     pub created_at: String,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 impl ProviderProfile {
@@ -288,7 +282,10 @@ mod tests {
     #[test]
     fn old_shape_provider_migrates_with_defaults() {
         // A profile written before Round-2 (no is_trusted / temperature / etc.)
-        // must still deserialize, defaulting the new fields.
+        // must still deserialize, defaulting the new fields. Also carries the
+        // since-removed `tools_enabled` (Round-7: dropped in favor of the
+        // per-session chat/agentic toggle) to confirm a stale field is silently
+        // ignored rather than erroring.
         let json = r#"{
             "id": "p1", "name": "Box", "provider_type": "ollama",
             "base_url": "http://localhost:11434", "models": ["llama3.2:3b"],

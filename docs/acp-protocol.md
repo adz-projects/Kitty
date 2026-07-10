@@ -160,3 +160,41 @@ Shape: `{ sessionId, update: { sessionUpdate: <variant>, ... } }`. Variants seen
   to the user before building (see Round-2 plan Batch 7).
 - `fs/read_text_file`, `fs/write_text_file` — only if we advertise the capability
   (we set both `false` for now), so respond method-not-found otherwise.
+
+### Extension defaults + reasoning effort — live goose config file (Round-7 probe, 2026-07-10)
+
+- **Confirmed**: `_goose/unstable/session/extensions/list` on a *brand-new* session
+  (before any Kitty `.../add` call except the hardcoded `computercontroller`) already
+  returns every extension marked `enabled: true` in goose's own persistent
+  `config.yaml` — bundled platform extensions (`developer`, `skills`, `todo`, `tom`,
+  `chatrecall`, `summon`) *and* the user's own configured custom MCP servers
+  (`mcp-brave-search`, and any other `stdio`-type entry with `enabled: true`).
+  Extensions marked `enabled: false` in that file (confirmed: `code_execution`,
+  `extensionmanager`, `summarize`, `analyze`, `orchestrator`, `apps`,
+  `autovisualiser`, `memory`, `tutorial`, `localrag` on the probing machine) do
+  **not** appear in the list at all. So `session/new` auto-attaches whatever's
+  `enabled: true` in this file — it's the real "default extensions for new chats"
+  surface, not something session-scoped ACP calls can see beyond reflecting it.
+- **The file itself**: Windows path `%APPDATA%\Block\goose\config\config.yaml`
+  (i.e. `dirs::config_dir()` + `Block/goose/config/config.yaml`). Top-level YAML
+  map; the `extensions:` key is itself a map keyed by extension id, each entry
+  `{ enabled, type, name, description, display_name, bundled, timeout?, cmd?,
+  args?, envs?, env_keys?, cwd? }` (the `stdio`-type shape here, e.g.
+  `mcp-brave-search`/custom user extensions, differs a little from the ACP
+  `mcp`-type shape documented above — notably `cmd`/`envs`/`env_keys` instead of
+  `server: {command, env}`/`envKeys`, and `type: stdio` not `type: mcp`). This is
+  goose's own config file, shared with Goose Desktop and any other local goose
+  usage — editing it is a real cross-app surface, not something private to Kitty.
+- **`GOOSE_THINKING_EFFORT`** appears as a top-level scalar key in this same file
+  (alongside `GOOSE_MODE`, `OLLAMA_HOST`, etc. — the same naming convention as
+  `GOOSE_TEMPERATURE`/`GOOSE_TOP_P`/`GOOSE_CONTEXT_LIMIT`/`GOOSE_CONTEXT_STRATEGY`,
+  which Kitty already threads through as spawn-time env vars). Observed value on
+  the probing machine: `high`. This strongly implies it's plumbable exactly like
+  the other four — a `GOOSE_THINKING_EFFORT` env var at `goose serve` spawn time —
+  rather than needing any live per-turn ACP call.
+- A candidate ACP method `session/set_config_option` was tried directly (per
+  aaif-goose/goose PR #9711's description, "ACP thinking effort config option")
+  with `{sessionId, key: "thinking_effort", value: "high"|"off"}` — the method
+  exists (returned `Invalid params`, not method-not-found) but this exact shape is
+  wrong and wasn't chased further once the config.yaml/env-var route was confirmed
+  as the simpler, already-established-pattern mechanism.

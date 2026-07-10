@@ -135,35 +135,14 @@ fn animate_overlay_in(win: &WebviewWindow) {
     });
 }
 
-/// Slide the overlay down below the work-area's bottom edge (as if sinking
-/// back into the taskbar), then hide it. Falls back to a plain hide if the
-/// work-area geometry can't be read.
+/// Hide the overlay immediately — no slide (owner: closing should disappear,
+/// not slide; the slide-in on *show* is unaffected, still handled by
+/// `animate_overlay_in`). Still bumps `ANIM_GEN` first so a concurrent
+/// in-flight `animate_overlay_in` tween (e.g. a rapid re-toggle) cancels
+/// itself instead of fighting this immediate hide over `set_position`.
 fn animate_overlay_out(win: &WebviewWindow) {
-    let Some((x, target_y)) = overlay_target_position(win) else {
-        let _ = win.hide();
-        return;
-    };
-    let outer = win
-        .outer_size()
-        .unwrap_or(tauri::PhysicalSize::new(OVERLAY_W, OVERLAY_H));
-    let end_y = target_y + outer.height as i32;
-    let start_y = win.outer_position().map(|p| p.y).unwrap_or(target_y);
-    let gen = ANIM_GEN.fetch_add(1, Ordering::SeqCst) + 1;
-    let win = win.clone();
-    tauri::async_runtime::spawn(async move {
-        for step in 1..=ANIM_STEPS {
-            if ANIM_GEN.load(Ordering::SeqCst) != gen {
-                return;
-            }
-            let t = f64::from(step) / f64::from(ANIM_STEPS);
-            let y = f64::from(start_y) + (f64::from(end_y) - f64::from(start_y)) * t;
-            let _ = win.set_position(tauri::PhysicalPosition::new(x, y.round() as i32));
-            tokio::time::sleep(Duration::from_millis(ANIM_STEP_MS)).await;
-        }
-        if ANIM_GEN.load(Ordering::SeqCst) == gen {
-            let _ = win.hide();
-        }
-    });
+    ANIM_GEN.fetch_add(1, Ordering::SeqCst);
+    let _ = win.hide();
 }
 
 /// Show + focus the overlay, creating it if it somehow went away.

@@ -95,7 +95,6 @@ const blank = (): ProviderProfile => ({
   provider_type: 'openrouter',
   base_url: DEFAULT_URL.openrouter,
   models: [],
-  tools_enabled: true,
   is_trusted: false,
   temperature: null,
   top_p: null,
@@ -204,7 +203,6 @@ export function Providers({ highlight }: { highlight: string | null }) {
               <div className="provider-name">
                 {p.name || p.provider_type}{' '}
                 <span className="status-badge">{trustBadge(p.network_tier, p.is_trusted)}</span>
-                {!p.tools_enabled && <span className="status-badge">chat-only</span>}
                 {p.active && <span className="status-badge">active</span>}
               </div>
               <div className="muted" style={{ fontSize: 12 }}>
@@ -429,15 +427,6 @@ function ProviderForm({
       <label className="check">
         <input
           type="checkbox"
-          checked={profile.tools_enabled}
-          onChange={(e) => set({ tools_enabled: e.target.checked })}
-        />
-        <span>Agentic tools enabled (uncheck for a chat-only thought-partner provider)</span>
-      </label>
-
-      <label className="check">
-        <input
-          type="checkbox"
           checked={profile.strip_reasoning}
           onChange={(e) => set({ strip_reasoning: e.target.checked })}
         />
@@ -452,11 +441,7 @@ function ProviderForm({
         <textarea
           rows={4}
           value={profile.system_prompt ?? ''}
-          placeholder={
-            profile.tools_enabled
-              ? 'Default: capable agentic assistant with scoped filesystem/shell tools…'
-              : 'Default: thoughtful conversational partner, no filesystem/shell assumed…'
-          }
+          placeholder="Default: a built-in prompt matching the session's current chat/agent mode…"
           onChange={(e) => set({ system_prompt: e.target.value || null })}
         />
         <small className="muted">

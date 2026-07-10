@@ -1,5 +1,6 @@
 //! System tray icon + menu — the app's persistent visible presence.
-//! Menu: Toggle Overlay, New Session, Ask about clipboard, Open Settings, Quit.
+//! Menu: Toggle Overlay, Open Chat Window, New Session, Ask about clipboard,
+//! Open Settings, Quit.
 //! Left-click also toggles the overlay (or focuses the main window if it's open).
 
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
@@ -10,6 +11,9 @@ use crate::{hotkey, windows};
 
 pub fn create(app: &AppHandle) -> tauri::Result<()> {
     let toggle = MenuItem::with_id(app, "toggle_overlay", "Toggle Overlay", true, None::<&str>)?;
+    // Opens the full chat window directly — no overlay involved at all (owner
+    // ask: a way to reach the chat window without summoning the overlay first).
+    let open_main = MenuItem::with_id(app, "open_main", "Open Chat Window", true, None::<&str>)?;
     let new_session = MenuItem::with_id(app, "new_session", "New Session", true, None::<&str>)?;
     let ask_clipboard =
         MenuItem::with_id(app, "ask_clipboard", "Ask about clipboard", true, None::<&str>)?;
@@ -18,7 +22,16 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
     let menu = Menu::with_items(
         app,
-        &[&toggle, &new_session, &ask_clipboard, &sep, &settings, &sep, &quit],
+        &[
+            &toggle,
+            &open_main,
+            &new_session,
+            &ask_clipboard,
+            &sep,
+            &settings,
+            &sep,
+            &quit,
+        ],
     )?;
 
     let mut builder = TrayIconBuilder::with_id("main-tray")
@@ -28,6 +41,9 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
         .on_menu_event(|app, event| match event.id.as_ref() {
             "toggle_overlay" => {
                 let _ = windows::toggle_or_focus_main(app);
+            }
+            "open_main" => {
+                let _ = windows::open_main(app);
             }
             "new_session" => {
                 let _ = windows::show_overlay(app);
