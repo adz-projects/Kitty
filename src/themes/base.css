@@ -490,6 +490,17 @@ button.primary {
   background: var(--accent);
   color: var(--accent-text);
 }
+/* Reasoning-effort control (Round-7) — only rendered when the active model
+   supports it, so it can sit inline with the other compact header badges. */
+.effort-dropdown {
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 11px;
+  padding: 3px 8px;
+  cursor: pointer;
+}
 .status-badge-warn {
   border-color: var(--warn);
   color: var(--warn);

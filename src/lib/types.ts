@@ -147,6 +147,20 @@ export interface SessionInfo {
   cwd: string;
   current_mode: string;
   available_modes: ModeInfo[];
+  /** `null` when the active model doesn't support effort control at all (a
+      single-option "off"-only model — see `parse_thinking_effort` in
+      commands/session.rs). Live per-session control, no goosed restart. */
+  thinking_effort: ThinkingEffort | null;
+}
+
+export interface EffortOption {
+  name: string;
+  value: string;
+}
+
+export interface ThinkingEffort {
+  current_value: string;
+  options: EffortOption[];
 }
 
 /** Raw ACP tool-call `update` object (shape varies; read defensively).

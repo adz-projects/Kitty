@@ -81,6 +81,7 @@ pub fn run() {
             commands::load_session,
             commands::delete_session,
             commands::fork_session,
+            commands::set_thinking_effort,
             commands::read_text_file,
             commands::read_file_any,
             commands::write_file,

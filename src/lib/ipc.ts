@@ -26,6 +26,7 @@ import type {
   StackStatus,
   StackStatusPayload,
   TextDeltaEvent,
+  ThinkingEffort,
   ToolCallEvent,
 } from './types';
 
@@ -67,6 +68,8 @@ export const ipc = {
     invoke<void>('set_session_mode', { sessionId, mode }),
   forkSession: (sessionId: string, cwd: string, truncateFrom: number | null) =>
     invoke<SessionInfo>('fork_session', { sessionId, cwd, truncateFrom }),
+  setThinkingEffort: (sessionId: string, value: string) =>
+    invoke<ThinkingEffort | null>('set_thinking_effort', { sessionId, value }),
   readTextFile: (path: string) => invoke<string>('read_text_file', { path, maxBytes: null }),
   readFileAny: (path: string) => invoke<FileAttachment>('read_file_any', { path, maxBytes: null }),
   writeFile: (path: string, content: string) => invoke<void>('write_file', { path, content }),

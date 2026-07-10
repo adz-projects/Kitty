@@ -153,6 +153,7 @@ export function Providers({ highlight }: { highlight: string | null }) {
           cwd: '',
           current_mode: 'auto',
           available_modes: [],
+          thinking_effort: null,
         });
       } catch {
         /* non-fatal */

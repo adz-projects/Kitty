@@ -9,6 +9,7 @@ import { ApprovalPrompt } from './ApprovalPrompt';
 import { ModeBadge } from './ModeBadge';
 import { ModeToggle } from './ModeToggle';
 import { ProviderBadge } from './ProviderBadge';
+import { EffortDropdown } from './EffortDropdown';
 import { FileChips } from './FileChips';
 import { AttachmentChips } from './AttachmentChips';
 import { ClipboardImageChips } from './ClipboardImageChips';
@@ -86,6 +87,7 @@ export function ChatView() {
         <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
           <ModeToggle />
           <ProviderBadge />
+          <EffortDropdown />
           {!chatOnly && <ModeBadge />}
         </div>
       </div>

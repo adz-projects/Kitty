@@ -192,9 +192,29 @@ Shape: `{ sessionId, update: { sessionUpdate: <variant>, ... } }`. Variants seen
   the probing machine: `high`. This strongly implies it's plumbable exactly like
   the other four — a `GOOSE_THINKING_EFFORT` env var at `goose serve` spawn time —
   rather than needing any live per-turn ACP call.
-- A candidate ACP method `session/set_config_option` was tried directly (per
-  aaif-goose/goose PR #9711's description, "ACP thinking effort config option")
-  with `{sessionId, key: "thinking_effort", value: "high"|"off"}` — the method
-  exists (returned `Invalid params`, not method-not-found) but this exact shape is
-  wrong and wasn't chased further once the config.yaml/env-var route was confirmed
-  as the simpler, already-established-pattern mechanism.
+- **Confirmed live and correct (follow-up probe, same session)**: `session/new`
+  and `session/load`'s **raw** ACP result (which Kitty's `SessionInfo` currently
+  narrows down to `{sessionId, cwd, current_mode, available_modes}`, discarding
+  the rest) already includes a top-level `configOptions: [...]` array — no
+  extra round trip needed. Each entry: `{ id, name, category?, description?,
+  currentValue, options: [{name, value}], type: "select" }`. Confirmed entries
+  on the probing machine: `provider` (full provider list), `mode` (mirrors
+  `available_modes`), `model` (the active provider's installed models), and
+  **`thinking_effort`** — `{ id: "thinking_effort", category: "thought_level",
+  name: "Thinking effort", description: "Controls reasoning effort for models
+  that support extended thinking.", currentValue: "off", options: [...],
+  type: "select" }`. **Crucially, `thinking_effort.options` is model-dependent**:
+  for a model with no extended-thinking support (gemma4:e2b on this machine)
+  it's a single-entry `[{name:"off",value:"off"}]` — i.e. "only one option
+  available" *is* the signal that this model doesn't support effort control at
+  all, and the UI should hide the control in that case rather than guessing a
+  universal low/medium/high enum.
+- **Setting it**: `session/set_config_option` `{ sessionId, configId:
+  "thinking_effort", value: <one of the offered option values> }` → returns the
+  same `configOptions` array with `thinking_effort.currentValue` updated. (The
+  required field is `configId`, not `key`/`option`/`name` — confirmed via the
+  JSON-RPC error's `data.error: "missing field \`configId\`"`, which Kitty's own
+  `acp_error_message()` normally discards in favor of just `.message`; surface
+  the full error object temporarily if a similar shape-guessing problem comes up
+  again.) This is a live, per-session, no-restart call — unlike the
+  provider/temperature/model knobs, which are still spawn-time env vars.

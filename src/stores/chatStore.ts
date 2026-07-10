@@ -28,6 +28,7 @@ import type {
   NetworkTier,
   PathInfo,
   SessionInfo,
+  ThinkingEffort,
   ToolCallUpdate,
 } from '@/lib/types';
 
@@ -100,6 +101,11 @@ interface ChatState {
   title: string | null;
   mode: string | null;
   availableModes: ModeInfo[];
+  /** Reasoning-effort control for the active session (Round-7) — `null` when
+      the active model doesn't support effort control at all (a single-option
+      "off"-only model, per `parse_thinking_effort` in commands/session.rs).
+      Live, per-session, no goosed restart. */
+  thinkingEffort: ThinkingEffort | null;
   messages: Message[];
   artifacts: Artifact[];
   droppedFiles: PathInfo[];
@@ -183,6 +189,10 @@ interface ChatState {
       `send()`'s strip-reasoning STOPGAP neighbor, `bindEvents`' approval
       handler, and `addDroppedPaths` below. */
   setModeOverride: (mode: 'chat' | 'agentic' | null) => Promise<void>;
+  /** Set the active session's reasoning effort (Round-7) — live, no goosed
+      restart. No-op if there's no active session or effort control isn't
+      available for the active model. */
+  setThinkingEffort: (value: string) => Promise<void>;
   addDroppedPaths: (paths: string[]) => Promise<void>;
   removeDroppedPath: (path: string) => void;
   setWorkingDir: (folder: string) => Promise<void>;
@@ -602,6 +612,7 @@ export const useChatStore = create<ChatState>((set, get) => {
     title: null,
     mode: null,
     availableModes: [],
+    thinkingEffort: null,
     messages: [],
     artifacts: [],
     droppedFiles: [],
@@ -670,6 +681,7 @@ export const useChatStore = create<ChatState>((set, get) => {
           cwd: s.cwd ?? '',
           current_mode: s.mode ?? 'auto',
           available_modes: s.availableModes,
+          thinking_effort: s.thinkingEffort,
         });
       }
       await ipc.openMain();
@@ -684,6 +696,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         title: null,
         mode: null,
         availableModes: [],
+        thinkingEffort: null,
         messages: [],
         artifacts: [],
         droppedFiles: [],
@@ -712,6 +725,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         cwd: null,
         mode: null,
         availableModes: [],
+        thinkingEffort: null,
         title: null,
         messages: [],
         artifacts: [],
@@ -732,6 +746,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         cwd: info.cwd,
         mode: info.current_mode,
         availableModes: info.available_modes,
+        thinkingEffort: info.thinking_effort,
       });
       await get().refreshProvider();
       await ensureSafeApprovalMode();
@@ -754,6 +769,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         sessionId,
         cwd,
         title: title ?? null,
+        thinkingEffort: null,
         messages: [],
         artifacts: [],
         pendingApprovals: [],
@@ -767,7 +783,11 @@ export const useChatStore = create<ChatState>((set, get) => {
       });
       try {
         const info = await ipc.loadSession(sessionId, cwd);
-        set({ mode: info.current_mode, availableModes: info.available_modes });
+        set({
+          mode: info.current_mode,
+          availableModes: info.available_modes,
+          thinkingEffort: info.thinking_effort,
+        });
         await get().refreshProvider();
         const override = await ipc.getSessionMode(sessionId).catch(() => null);
         set({ modeOverride: (override as 'chat' | 'agentic' | null) ?? null });
@@ -874,6 +894,17 @@ export const useChatStore = create<ChatState>((set, get) => {
         const saved = get().savedApprovalMode;
         if (sessionId && saved) await get().setMode(saved);
         set({ savedApprovalMode: null });
+      }
+    },
+
+    setThinkingEffort: async (value: string) => {
+      const sessionId = get().sessionId;
+      if (!sessionId) return;
+      try {
+        const thinkingEffort = await ipc.setThinkingEffort(sessionId, value);
+        set({ thinkingEffort });
+      } catch (e) {
+        set({ error: String(e) });
       }
     },
 

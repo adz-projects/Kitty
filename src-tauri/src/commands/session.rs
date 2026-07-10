@@ -37,6 +37,9 @@ pub struct SessionInfo {
     pub cwd: String,
     pub current_mode: String,
     pub available_modes: Vec<ModeInfo>,
+    /// `None` when the active model doesn't support effort control at all —
+    /// see `parse_thinking_effort`'s doc comment (Round-7 Feature).
+    pub thinking_effort: Option<ThinkingEffort>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -44,6 +47,46 @@ pub struct ModeInfo {
     pub id: String,
     pub name: String,
     pub description: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EffortOption {
+    pub name: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThinkingEffort {
+    pub current_value: String,
+    pub options: Vec<EffortOption>,
+}
+
+/// Both `session/new` and `session/load`'s raw ACP result carry a top-level
+/// `configOptions: [...]` array (live-probed, `docs/acp-protocol.md`) with
+/// entries for `provider`/`mode`/`model`/`thinking_effort` — Kitty only needs
+/// the last one here (the others are already managed via their own
+/// mechanisms: `ProviderBadge`, `ModeToggle`/`ModeBadge`, the Providers model
+/// picker). `thinking_effort.options` is model-dependent: a model with no
+/// extended-thinking support offers just `[{name:"off",value:"off"}]` — a
+/// single option — so treat that as "no effort control for this model" and
+/// return `None` rather than a useless one-choice dropdown.
+fn parse_thinking_effort(result: &Value) -> Option<ThinkingEffort> {
+    let entry = result
+        .get("configOptions")?
+        .as_array()?
+        .iter()
+        .find(|c| c.get("id").and_then(|v| v.as_str()) == Some("thinking_effort"))?;
+    let current_value = entry.get("currentValue")?.as_str()?.to_string();
+    let options: Vec<EffortOption> = entry
+        .get("options")?
+        .as_array()?
+        .iter()
+        .filter_map(|o| serde_json::from_value(o.clone()).ok())
+        .collect();
+    if options.len() < 2 {
+        return None;
+    }
+    Some(ThinkingEffort { current_value, options })
 }
 
 /// Prefix every no-explicit-folder session's private chat folder lives under
@@ -149,11 +192,14 @@ pub async fn new_session(app: AppHandle, cwd: Option<String>) -> Result<SessionI
     // session list/recents dropdown a new session now exists.
     let _ = app.emit("session://created", json!({ "sessionId": session_id }));
 
+    let thinking_effort = parse_thinking_effort(&result);
+
     Ok(SessionInfo {
         session_id,
         cwd,
         current_mode,
         available_modes,
+        thinking_effort,
     })
 }
 
@@ -326,11 +372,14 @@ pub async fn load_session(
         .map(|arr| arr.iter().map(parse_mode).collect())
         .unwrap_or_default();
 
+    let thinking_effort = parse_thinking_effort(&result);
+
     Ok(SessionInfo {
         session_id,
         cwd,
         current_mode,
         available_modes,
+        thinking_effort,
     })
 }
 
@@ -373,12 +422,35 @@ pub async fn fork_session(
         .map(|arr| arr.iter().map(parse_mode).collect())
         .unwrap_or_default();
     let _ = app.emit("session://created", json!({ "sessionId": new_id }));
+    let thinking_effort = parse_thinking_effort(&result);
     Ok(SessionInfo {
         session_id: new_id,
         cwd,
         current_mode,
         available_modes,
+        thinking_effort,
     })
+}
+
+/// Set the active session's thinking/reasoning effort (ACP
+/// `session/set_config_option`, live-probed — `configId`, not `key`/`option`,
+/// is the required field; see docs/acp-protocol.md). Live, per-session, no
+/// goosed restart needed — unlike provider/temperature/model, which are
+/// spawn-time env vars.
+#[tauri::command]
+pub async fn set_thinking_effort(
+    app: AppHandle,
+    session_id: String,
+    value: String,
+) -> Result<Option<ThinkingEffort>, String> {
+    let client = api::ensure_client(&app).await?;
+    let result = client
+        .request(
+            "session/set_config_option",
+            json!({ "sessionId": session_id, "configId": "thinking_effort", "value": value }),
+        )
+        .await?;
+    Ok(parse_thinking_effort(&result))
 }
 
 /// Get a session's persisted chat/agentic mode override, if any (`None` =
