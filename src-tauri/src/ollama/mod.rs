@@ -9,6 +9,8 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter};
 
+use crate::util::http_client;
+
 fn base(url: &str) -> String {
     url.trim_end_matches('/').to_string()
 }
@@ -16,7 +18,9 @@ fn base(url: &str) -> String {
 /// `GET /api/tags` — raw model objects for the UI to render.
 pub async fn list_models(base_url: &str) -> Result<Vec<Value>, String> {
     let url = format!("{}/api/tags", base(base_url));
-    let resp = reqwest::get(url)
+    let resp = http_client()
+        .get(url)
+        .send()
         .await
         .map_err(|e| format!("could not reach Ollama: {e}"))?;
     let json: Value = resp.json().await.map_err(|e| e.to_string())?;
@@ -30,7 +34,7 @@ pub async fn list_models(base_url: &str) -> Result<Vec<Value>, String> {
 /// `DELETE /api/delete` — remove an installed model.
 pub async fn delete_model(base_url: &str, model: &str) -> Result<(), String> {
     let url = format!("{}/api/delete", base(base_url));
-    let resp = reqwest::Client::new()
+    let resp = http_client()
         .delete(url)
         .json(&json!({ "model": model }))
         .send()
@@ -52,7 +56,7 @@ pub async fn delete_model(base_url: &str, model: &str) -> Result<(), String> {
 /// missing model, missing field) — this is a suggestion, never fatal.
 pub async fn show_model_context_length(base_url: &str, model: &str) -> Option<u32> {
     let url = format!("{}/api/show", base(base_url));
-    let resp = reqwest::Client::new()
+    let resp = http_client()
         .post(url)
         .json(&json!({ "model": model }))
         .send()
@@ -84,7 +88,7 @@ async fn warm(base_url: &str, model: &str, keep_alive: i64) {
         return;
     }
     let url = format!("{}/api/generate", base(base_url));
-    let _ = reqwest::Client::new()
+    let _ = http_client()
         .post(url)
         .json(&json!({ "model": model, "prompt": "", "stream": false, "keep_alive": keep_alive }))
         .send()
@@ -93,8 +97,11 @@ async fn warm(base_url: &str, model: &str, keep_alive: i64) {
 
 #[derive(Clone, Serialize)]
 struct PullProgress {
-    pull_id: String,
-    model: String,
+    // `Arc<str>` so cloning per NDJSON line (one per progress tick, of which a
+    // pull can emit hundreds) is a refcount bump instead of a fresh heap
+    // allocation + copy of the id/model text on every line.
+    pull_id: std::sync::Arc<str>,
+    model: std::sync::Arc<str>,
     status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     total: Option<u64>,
@@ -107,11 +114,13 @@ struct PullProgress {
 
 /// `POST /api/pull` (streaming NDJSON). Emits `ollama://pull-progress` per line.
 pub async fn pull_model(app: AppHandle, base_url: String, model: String, pull_id: String) {
+    let pull_id: std::sync::Arc<str> = pull_id.into();
+    let model: std::sync::Arc<str> = model.into();
     let emit = |p: PullProgress| {
         let _ = app.emit("ollama://pull-progress", p);
     };
     let url = format!("{}/api/pull", base(&base_url));
-    let resp = reqwest::Client::new()
+    let resp = http_client()
         .post(url)
         .json(&json!({ "model": model, "stream": true }))
         .send()

@@ -7,22 +7,30 @@
 //! so existing `commands::<fn>` call sites (notably `lib.rs`'s
 //! `generate_handler!` list) keep working unchanged.
 
+mod adaptive_pathway;
 mod config;
 mod extensions;
 mod file;
 mod folders;
+mod logs;
 mod ollama;
 mod provider;
+mod recipes;
+mod scheduled_tasks;
 mod session;
 mod setup;
 mod window;
 
+pub use adaptive_pathway::*;
 pub use config::*;
 pub use extensions::*;
 pub use file::*;
 pub use folders::*;
+pub use logs::*;
 pub use ollama::*;
 pub use provider::*;
+pub use recipes::*;
+pub use scheduled_tasks::*;
 pub use session::*;
 pub use setup::*;
 pub use window::*;

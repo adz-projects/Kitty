@@ -4,6 +4,11 @@ import type { ExtensionDefault } from '@/lib/types';
 
 const extLabel = (e: ExtensionDefault): string => e.display_name ?? e.id;
 
+/** Managed solely by the single enable checkbox in Settings → Advanced →
+    Adaptive Pathway — showing it here too would be a confusing second
+    control over the same thing. */
+const HIDDEN_EXTENSION_IDS = new Set(['adaptive-pathway']);
+
 /** Default extensions for every new chat (Round-7 Feature 4) — reads/writes
     goose's own config.yaml directly (see src-tauri/src/goose_config.rs), the
     same file Goose Desktop's own extension settings edit. This is a genuine
@@ -22,7 +27,8 @@ export function Extensions() {
 
   const load = async () => {
     try {
-      setExts(await ipc.listDefaultExtensions());
+      const all = await ipc.listDefaultExtensions();
+      setExts(all.filter((e) => !HIDDEN_EXTENSION_IDS.has(e.id)));
     } catch (e) {
       setError(String(e));
     }
@@ -68,22 +74,18 @@ export function Extensions() {
         already open.
       </p>
       {error && <div className="chat-error">{error}</div>}
-      <div className="ext-list">
+      <div className="ext-grid">
         {exts.map((e) => (
-          <label className="check" key={e.id}>
-            <input
-              type="checkbox"
-              checked={e.enabled}
-              onChange={(ev) => void toggle(e, ev.target.checked)}
-            />
-            <span>
-              {extLabel(e)}
-              {e.description && (
-                <div className="muted" style={{ fontSize: 11 }}>
-                  {e.description}
-                </div>
-              )}
-            </span>
+          <label className="ext-card" key={e.id}>
+            <div className="ext-card-head">
+              <span className="ext-card-name">{extLabel(e)}</span>
+              <input
+                type="checkbox"
+                checked={e.enabled}
+                onChange={(ev) => void toggle(e, ev.target.checked)}
+              />
+            </div>
+            {e.description && <span className="muted ext-card-desc">{e.description}</span>}
           </label>
         ))}
         {exts.length === 0 && !error && <p className="muted">No extensions found.</p>}

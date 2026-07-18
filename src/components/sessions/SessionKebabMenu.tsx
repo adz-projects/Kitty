@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { UNCATEGORIZED, useSessionStore } from '@/stores/sessionStore';
+import { usePopoverPosition } from '@/lib/usePopoverPosition';
 
 /** Per-session ⋮ menu (Round-3 item 5) — replaces the bulky per-row folder
     `<select>` + separate delete button. Reuses the same popover pattern as
@@ -17,14 +18,20 @@ export function SessionKebabMenu({
 }) {
   const [open, setOpen] = useState(false);
   const assignFolder = useSessionStore((s) => s.assignFolder);
+  const { triggerRef, popoverRef, style } = usePopoverPosition(open, () => setOpen(false));
 
   return (
     <div style={{ position: 'relative' }} onClick={(e) => e.stopPropagation()}>
-      <button className="session-kebab" onClick={() => setOpen((o) => !o)} title="Session options">
+      <button
+        ref={triggerRef as React.Ref<HTMLButtonElement>}
+        className="session-kebab"
+        onClick={() => setOpen((o) => !o)}
+        title="Session options"
+      >
         ⋮
       </button>
       {open && (
-        <div className="mode-popover" role="menu">
+        <div ref={popoverRef} className="mode-popover" role="menu" style={style}>
           <span className="muted" style={{ fontSize: 11, padding: '4px 8px' }}>
             Move to folder
           </span>

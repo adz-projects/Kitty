@@ -15,8 +15,20 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
     // ask: a way to reach the chat window without summoning the overlay first).
     let open_main = MenuItem::with_id(app, "open_main", "Open Chat Window", true, None::<&str>)?;
     let new_session = MenuItem::with_id(app, "new_session", "New Session", true, None::<&str>)?;
-    let ask_clipboard =
-        MenuItem::with_id(app, "ask_clipboard", "Ask about clipboard", true, None::<&str>)?;
+    let ask_clipboard = MenuItem::with_id(
+        app,
+        "ask_clipboard",
+        "Ask about clipboard",
+        true,
+        None::<&str>,
+    )?;
+    let scheduled_tasks = MenuItem::with_id(
+        app,
+        "scheduled_tasks",
+        "Scheduled Tasks…",
+        true,
+        None::<&str>,
+    )?;
     let settings = MenuItem::with_id(app, "open_settings", "Open Settings", true, None::<&str>)?;
     let sep = PredefinedMenuItem::separator(app)?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
@@ -27,6 +39,7 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
             &open_main,
             &new_session,
             &ask_clipboard,
+            &scheduled_tasks,
             &sep,
             &settings,
             &sep,
@@ -52,6 +65,9 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
             }
             "ask_clipboard" => {
                 hotkey::attach_clipboard(app);
+            }
+            "scheduled_tasks" => {
+                let _ = windows::open_settings(app, Some("scheduled_tasks".to_string()), None);
             }
             "open_settings" => {
                 let _ = windows::open_settings(app, None, None);

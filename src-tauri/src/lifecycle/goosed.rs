@@ -7,17 +7,26 @@
 
 use std::net::TcpListener;
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::time::Duration;
 
 use rand::Rng;
 
-use crate::lifecycle::ManagedProcess;
 use crate::state::GoosedHandle;
-use crate::util::hidden_command;
+use crate::state::ManagedProcess;
+use crate::util::{capture_output, hidden_command};
 
-/// Locate the `goose` binary: `GOOSE_BIN` override, the Goose Desktop bundle's
-/// `resources/bin/goose.exe`, then bare `goose` on PATH.
-pub fn locate_goose() -> PathBuf {
+/// Locate the `goose` binary: a config-persisted `goose_binary_override`
+/// (set by the wizard's one-click install or its manual "point at an
+/// existing install" fallback) first, then `GOOSE_BIN` env, then the Goose
+/// Desktop bundle's `resources/bin/goose.exe`, then bare `goose` on PATH.
+pub fn locate_goose(override_path: Option<&str>) -> PathBuf {
+    if let Some(p) = override_path {
+        let path = PathBuf::from(p);
+        if path.exists() {
+            return path;
+        }
+    }
     if let Ok(p) = std::env::var("GOOSE_BIN") {
         let path = PathBuf::from(p);
         if path.exists() {
@@ -47,7 +56,9 @@ fn free_port() -> std::io::Result<u16> {
 /// 32 hex chars of randomness for `GOOSE_SERVER__SECRET_KEY`.
 fn generate_secret() -> String {
     let mut rng = rand::thread_rng();
-    (0..32).map(|_| format!("{:x}", rng.gen_range(0u8..16))).collect()
+    (0..32)
+        .map(|_| format!("{:x}", rng.gen_range(0u8..16)))
+        .collect()
 }
 
 /// Spawn `goose serve` on a free port and wait (briefly) for it to bind. `env`
@@ -60,12 +71,15 @@ fn generate_secret() -> String {
 /// reported slowness is the first real inference call to the newly-active
 /// provider (e.g. OpenRouter routing/model cold-start), which happens inside
 /// goosed's own outbound request and is outside Kitty's control to fix.
-pub async fn spawn(env: Vec<(String, String)>) -> Result<GoosedHandle, String> {
-    let bin = locate_goose();
+pub async fn spawn(
+    env: Vec<(String, String)>,
+    goose_binary_override: Option<&str>,
+) -> Result<GoosedHandle, String> {
+    let bin = locate_goose(goose_binary_override);
     let port = free_port().map_err(|e| format!("no free port: {e}"))?;
     let secret = generate_secret();
 
-    let child = hidden_command(&bin)
+    let mut child = hidden_command(&bin)
         .arg("serve")
         .arg("--host")
         .arg("127.0.0.1")
@@ -73,8 +87,11 @@ pub async fn spawn(env: Vec<(String, String)>) -> Result<GoosedHandle, String> {
         .arg(port.to_string())
         .env("GOOSE_SERVER__SECRET_KEY", &secret)
         .envs(env)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("failed to spawn `goose serve` ({}): {e}", bin.display()))?;
+    capture_output(&mut child, "goosed");
 
     // Poll for the port to accept connections (up to ~10s).
     for _ in 0..40 {

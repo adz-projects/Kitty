@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import type { ApprovalNeededEvent } from '@/lib/types';
 
 /** Extract a human-readable command/param preview from the tool call. */
@@ -28,7 +29,15 @@ export function ApprovalPrompt({
   const title = request.tool_call?.title ?? 'a tool';
   const preview = previewInput(request.tool_call?.rawInput);
   const has = (id: string) => request.options?.some((o) => o.optionId === id);
-  const pick = (id: string) => onRespond(request.tool_call_id, id);
+  // Latch on first response so a second click (before the prompt is cleared)
+  // can't send a duplicate permission decision to goosed.
+  const [submitted, setSubmitted] = useState(false);
+  const respond = (optionId: string | null) => {
+    if (submitted) return;
+    setSubmitted(true);
+    onRespond(request.tool_call_id, optionId);
+  };
+  const pick = (id: string) => respond(id);
 
   // A11y (Phase 8): approving must be deliberate — block Enter so a stray Enter
   // can't approve; a focused button still activates on Space.
@@ -44,21 +53,26 @@ export function ApprovalPrompt({
       {preview && <pre className="approval-cmd">{preview}</pre>}
       <div className="actions">
         {has('allow_once') && (
-          <button className="primary" onKeyDown={noEnter} onClick={() => pick('allow_once')}>
+          <button
+            className="primary"
+            disabled={submitted}
+            onKeyDown={noEnter}
+            onClick={() => pick('allow_once')}
+          >
             Approve
           </button>
         )}
         {has('allow_always') && (
-          <button onKeyDown={noEnter} onClick={() => pick('allow_always')}>
+          <button disabled={submitted} onKeyDown={noEnter} onClick={() => pick('allow_always')}>
             Always allow
           </button>
         )}
         {has('reject_once') ? (
-          <button onKeyDown={noEnter} onClick={() => pick('reject_once')}>
+          <button disabled={submitted} onKeyDown={noEnter} onClick={() => pick('reject_once')}>
             Deny
           </button>
         ) : (
-          <button onKeyDown={noEnter} onClick={() => onRespond(request.tool_call_id, null)}>
+          <button disabled={submitted} onKeyDown={noEnter} onClick={() => respond(null)}>
             Deny
           </button>
         )}

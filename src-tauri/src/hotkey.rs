@@ -1,6 +1,8 @@
 //! Global shortcut registration. Phase 0 wires the standard accelerator via
-//! `tauri-plugin-global-shortcut`; Phase 6 adds the low-level Copilot-key hook.
-//! Round-4 adds a second, distinct accelerator that attaches the clipboard.
+//! `tauri-plugin-global-shortcut`. Round-4 adds a second, distinct accelerator
+//! that attaches the clipboard. (The hardware Copilot-key hook that used to
+//! live alongside this was removed in the UX-simplification pass — a
+//! configurable hotkey covers the same job with far less OS-level risk.)
 
 use base64::engine::general_purpose;
 use base64::Engine as _;

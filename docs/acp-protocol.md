@@ -158,6 +158,11 @@ Shape: `{ sessionId, update: { sessionUpdate: <variant>, ... } }`. Variants seen
   → Round-2 item 16 ("recipes") is **Path B** (a separate `goose run --recipe`
   process outside the shared `goose serve`) — an architecture escalation to surface
   to the user before building (see Round-2 plan Batch 7).
+- **Resolved**: rather than take on Path B, recipes shipped as client-side-
+  interpreted templates that attach to an ordinary chat turn instead of shelling
+  out to the real CLI runner — see `docs/BACKLOG.md`'s "Recipes (resolved)" entry
+  and `chatStore.ts`'s `sendWithRecipe`. This finding above stays accurate as the
+  reason why that design was chosen over a literal `goose run --recipe` launch.
 - `fs/read_text_file`, `fs/write_text_file` — only if we advertise the capability
   (we set both `false` for now), so respond method-not-found otherwise.
 

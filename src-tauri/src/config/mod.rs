@@ -5,6 +5,9 @@
 
 pub mod env_helper;
 pub mod providers;
+pub mod recipe_yaml;
+pub mod recipes;
+pub mod scheduled_tasks;
 
 use std::collections::HashMap;
 use std::fs;
@@ -13,6 +16,8 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use providers::ProviderProfile;
+use recipes::Recipe;
+use scheduled_tasks::ScheduledTask;
 
 /// The persisted application configuration.
 ///
@@ -31,8 +36,6 @@ pub struct Config {
     /// pre-attached (Round-4 clipboard hotkey). `None` = not registered.
     #[serde(default)]
     pub clipboard_hotkey: Option<String>,
-    /// Whether to prefer the hardware Copilot key when observed (Phase 6).
-    pub use_copilot_key: bool,
     /// Default working directory for new sessions (Phase 4). `None` until set.
     pub default_context_folder: Option<String>,
     /// Ollama endpoint; the stack manager probes and (if needed) spawns it.
@@ -85,13 +88,72 @@ pub struct Config {
     pub show_artifacts: bool,
     /// Per-session chat/agentic mode override (Round-4 instant mode toggle).
     /// Maps a goosed session id → `"chat"` | `"agentic"`. Absent = default to
-    /// agentic (Round-7: providers no longer carry their own `tools_enabled`
-    /// default — the per-session toggle is now the only mode selector).
+    /// chat (owner ask, later round — providers no longer carry their own
+    /// `tools_enabled` default either; the per-session toggle is now the only
+    /// mode selector).
     /// Persisted (not transient) so resuming a flipped session doesn't
     /// silently revert its attachment/tool semantics — mirrors
     /// `session_folders` above.
     #[serde(default)]
     pub session_modes: HashMap<String, String>,
+    /// Whether Kitty should spawn/supervise the Adaptive Pathway extension's
+    /// HTTP sidecar (and register its Goose extension in lockstep — see
+    /// Settings → Advanced → Adaptive Pathway's single enable checkbox). On by
+    /// default for fresh installs; if the Python package isn't installed the
+    /// sidecar just reports `Down` (graceful degradation, no error spam).
+    #[serde(default = "default_adaptive_pathway_enabled")]
+    pub adaptive_pathway_enabled: bool,
+    /// Command used to launch the sidecar (default assumes it's on PATH).
+    #[serde(default = "default_ap_launch_command")]
+    pub adaptive_pathway_launch_command: String,
+    /// Extra arguments appended before `--db-path`/`--port` (e.g. `--config-path`).
+    #[serde(default)]
+    pub adaptive_pathway_launch_args: Vec<String>,
+    /// SQLite DB path passed to the sidecar via `--db-path`.
+    #[serde(default = "default_ap_db_path")]
+    pub adaptive_pathway_db_path: String,
+    /// Port the sidecar binds to (matches `run_server`'s own literal default).
+    #[serde(default = "default_ap_port")]
+    pub adaptive_pathway_port: u16,
+    /// Ollama model tag used for adaptive-pathway's context embeddings.
+    /// Passed to both Python processes (the sidecar and the goosed-spawned
+    /// MCP extension) via `AP_EMBED_OLLAMA_MODEL` so they can't drift apart —
+    /// cross-compatibility requires every user's vectors to live in the same
+    /// embedding space, so this is a single pinned tag, not user-configurable
+    /// per-provider.
+    #[serde(default = "default_ap_embedding_model")]
+    pub adaptive_pathway_embedding_model: String,
+    /// User-defined scheduled tasks (instructions the agent runs later,
+    /// one-shot or recurring, with or without the app open) — see
+    /// `scheduled_tasks::ScheduledTask`.
+    #[serde(default)]
+    pub scheduled_tasks: Vec<ScheduledTask>,
+    /// Absolute path to `goose.exe`, set automatically once the wizard's
+    /// one-click Goose install (download + extract the CLI zip) completes, or
+    /// manually via the wizard's "point at an existing install" fallback.
+    /// Checked first by `lifecycle::goosed::locate_goose`, before the
+    /// `GOOSE_BIN` env var / Goose Desktop bundle path / bare `goose` on PATH.
+    #[serde(default)]
+    pub goose_binary_override: Option<String>,
+    /// Whether local inference (Ollama) is in play at all for this install.
+    /// Set explicitly by the wizard's first-screen fork ("Run on this
+    /// computer" vs. "Use my own API key") and toggleable later from
+    /// Settings → Advanced. Defaults `true` so pre-existing installs (which
+    /// predate this field and already have Ollama configured) are unaffected.
+    /// When `false`: the Ollama Models settings section and the "Ollama"
+    /// provider-type option are hidden, and `start_stack`/`compute_status`
+    /// stop trying to reach Ollama at all (see
+    /// `lifecycle::ollama_proc::requires_local_ollama`).
+    #[serde(default = "default_true")]
+    pub ollama_enabled: bool,
+    /// User + built-in recipe templates (Goose recipes reinterpreted as
+    /// client-side chat-turn templates — see `recipes` module doc comment).
+    /// Seeded with the 4 built-ins two ways: `Config::default()` below contains
+    /// them (so a missing key fills from the container-level `#[serde(default)]`,
+    /// and the first-launch/corrupt-fallback paths that use `Config::default()`
+    /// directly get them too), and `migrate_recipes` in `load` re-seeds the one
+    /// case `Default` can't reach — an explicit `"recipes": []`.
+    pub recipes: Vec<Recipe>,
 }
 
 impl Default for Config {
@@ -99,7 +161,6 @@ impl Default for Config {
         Self {
             hotkeys: vec!["Alt+Space".to_string()],
             clipboard_hotkey: Some("Ctrl+Alt+Space".to_string()),
-            use_copilot_key: false,
             default_context_folder: None,
             ollama_base_url: "http://localhost:11434".to_string(),
             setup_completed: false,
@@ -119,8 +180,22 @@ impl Default for Config {
             session_folders: HashMap::new(),
             show_artifacts: true,
             session_modes: HashMap::new(),
+            adaptive_pathway_enabled: default_adaptive_pathway_enabled(),
+            adaptive_pathway_launch_command: default_ap_launch_command(),
+            adaptive_pathway_launch_args: Vec::new(),
+            adaptive_pathway_db_path: default_ap_db_path(),
+            adaptive_pathway_port: default_ap_port(),
+            adaptive_pathway_embedding_model: default_ap_embedding_model(),
+            scheduled_tasks: Vec::new(),
+            goose_binary_override: None,
+            ollama_enabled: default_true(),
+            recipes: recipes::builtin_templates(),
         }
     }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_bg_position() -> f32 {
@@ -133,6 +208,37 @@ fn default_bg_size() -> String {
 
 fn default_context_strategy() -> String {
     "summarize".to_string()
+}
+
+fn default_adaptive_pathway_enabled() -> bool {
+    true
+}
+
+fn default_ap_launch_command() -> String {
+    "adaptive-pathway-sidecar".to_string()
+}
+
+/// An absolute default, not a bare relative `./pathway.db` — the sidecar
+/// (spawned by Kitty) and the Goose MCP extension (spawned by goosed, itself
+/// spawned by Kitty) are three separate processes that can each have a
+/// different working directory, so a relative path risks each one silently
+/// resolving to a *different* file even when configured "the same." An
+/// absolute path removes that ambiguity.
+fn default_ap_db_path() -> String {
+    dirs::data_local_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("adaptive-pathway")
+        .join("pathway.db")
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+fn default_ap_port() -> u16 {
+    8700
+}
+
+fn default_ap_embedding_model() -> String {
+    "qwen3-embedding:0.6b".to_string()
 }
 
 /// Per-event notification toggles.
@@ -194,11 +300,29 @@ pub fn load() -> Result<Config, ConfigError> {
     match fs::read_to_string(&path) {
         Ok(text) => {
             let config: Config = serde_json::from_str(&text)?;
-            Ok(migrate_hotkeys(config, &text))
+            Ok(migrate_recipes(migrate_hotkeys(config, &text)))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
         Err(e) => Err(e.into()),
     }
+}
+
+/// Re-seed the built-in recipe templates if a loaded config somehow has an
+/// empty recipe list. The common cases are already covered by `Config`'s
+/// `Default` (which contains the built-ins): a config predating the feature is
+/// missing the `recipes` key entirely, so serde's container-level
+/// `#[serde(default)]` fills it from `Default` (built-ins present → this is a
+/// no-op), and first-launch/corrupt-fallback both use `Config::default()`
+/// directly without going through `load`. This only additionally handles the
+/// one gap `Default` can't: a config saved with an explicit `"recipes": []`.
+/// Built-ins are never deletable (`commands::recipes` guards this), so a
+/// populated list is never legitimately empty — re-seeding an empty one can't
+/// clobber user intent.
+fn migrate_recipes(mut config: Config) -> Config {
+    if config.recipes.is_empty() {
+        config.recipes = recipes::builtin_templates();
+    }
+    config
 }
 
 /// Seed `hotkeys` from the legacy singular `hotkey` field when a pre-Round-2
@@ -282,5 +406,76 @@ mod tests {
         let back: Config = serde_json::from_str(r#"{"theme":"dark"}"#).unwrap();
         assert_eq!(back.theme, "dark");
         assert_eq!(back.ollama_base_url, "http://localhost:11434");
+    }
+
+    #[test]
+    fn old_shape_config_migrates_adaptive_pathway_defaults() {
+        // A config predating the Adaptive Pathway integration must still load,
+        // on by default (UX-simplification decision — enabled by default for
+        // fresh/pre-existing-field configs alike), with sane
+        // launch-command/db-path/port defaults.
+        let back: Config = serde_json::from_str(r#"{"theme":"dark"}"#).unwrap();
+        assert!(back.adaptive_pathway_enabled);
+        assert_eq!(
+            back.adaptive_pathway_launch_command,
+            "adaptive-pathway-sidecar"
+        );
+        // Absolute (not a bare relative "./pathway.db" — see default_ap_db_path's
+        // doc comment for why that's load-bearing, not cosmetic).
+        assert!(back.adaptive_pathway_db_path.ends_with("pathway.db"));
+        assert!(std::path::Path::new(&back.adaptive_pathway_db_path).is_absolute());
+        assert_eq!(back.adaptive_pathway_port, 8700);
+    }
+
+    #[test]
+    fn old_shape_config_migrates_embedding_model_default() {
+        // A config predating the embedding-model requirement must still load,
+        // defaulting to the one pinned cross-compatible tag every user shares.
+        let back: Config = serde_json::from_str(r#"{"theme":"dark"}"#).unwrap();
+        assert_eq!(
+            back.adaptive_pathway_embedding_model,
+            "qwen3-embedding:0.6b"
+        );
+    }
+
+    #[test]
+    fn old_shape_config_migrates_scheduled_tasks_default() {
+        // A config predating scheduled tasks must still load with an empty list.
+        let back: Config = serde_json::from_str(r#"{"theme":"dark"}"#).unwrap();
+        assert!(back.scheduled_tasks.is_empty());
+    }
+
+    #[test]
+    fn old_shape_config_migrates_recipes_default() {
+        // A config predating recipes must still load, seeded with the 4
+        // built-in templates (unlike scheduled_tasks, which is correctly
+        // empty for everyone) — the field has no override, so container-level
+        // `#[serde(default)]` fills it from `Config::default()`.
+        let back: Config = serde_json::from_str(r#"{"theme":"dark"}"#).unwrap();
+        assert_eq!(back.recipes.len(), 4);
+        assert!(back.recipes.iter().all(|r| r.is_builtin));
+        let slugs: Vec<_> = back.recipes.iter().map(|r| r.slug.as_str()).collect();
+        assert!(slugs.contains(&"annotated_bibliography"));
+    }
+
+    #[test]
+    fn migrate_recipes_reseeds_an_explicitly_empty_list() {
+        // The one case `Default` can't reach: a config with `"recipes": []`
+        // present (so serde uses the empty array, not the default).
+        let mut cfg: Config = serde_json::from_str(r#"{"recipes":[]}"#).unwrap();
+        assert!(cfg.recipes.is_empty());
+        cfg = migrate_recipes(cfg);
+        assert_eq!(cfg.recipes.len(), 4);
+        assert!(cfg.recipes.iter().all(|r| r.is_builtin));
+    }
+
+    #[test]
+    fn old_shape_config_migrates_wizard_redesign_defaults() {
+        // A config predating the wizard redesign (goose_binary_override,
+        // ollama_enabled) must still load: no override path, and Ollama left
+        // enabled (pre-existing installs already have it configured).
+        let back: Config = serde_json::from_str(r#"{"theme":"dark"}"#).unwrap();
+        assert_eq!(back.goose_binary_override, None);
+        assert!(back.ollama_enabled);
     }
 }

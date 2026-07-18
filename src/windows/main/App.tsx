@@ -1,12 +1,15 @@
 import { useEffect, useState } from 'react';
 import { ipc, onActiveSession } from '@/lib/ipc';
 import { useStackStore } from '@/stores/stackStore';
+import { useAdaptivePathwayStore } from '@/stores/adaptivePathwayStore';
 import { useChatStore } from '@/stores/chatStore';
 import { StackStatusView } from '@/components/shared/StackStatusView';
 import { ChatView } from '@/components/chat/ChatView';
 import { SessionList } from '@/components/sessions/SessionList';
 import { ArtifactsPane } from '@/components/artifacts/ArtifactsPane';
 import { NewChatIcon } from '@/components/icons/NewChatIcon';
+import { SettingsGearIcon } from '@/components/icons/SettingsGearIcon';
+import { SchismResolutionModal } from '@/components/chat/SchismResolutionModal';
 import type { StackStatus } from '@/lib/types';
 
 const DEGRADED: StackStatus[] = ['ollama_down', 'goosed_down', 'no_model', 'provider_unreachable'];
@@ -16,6 +19,7 @@ const DEGRADED: StackStatus[] = ['ollama_down', 'goosed_down', 'no_model', 'prov
 export function App() {
   const status = useStackStore((s) => s.status);
   const init = useStackStore((s) => s.init);
+  const initAdaptivePathway = useAdaptivePathwayStore((s) => s.init);
   const messages = useChatStore((s) => s.messages);
   const exportSession = useChatStore((s) => s.exportSession);
   const newSession = useChatStore((s) => s.newSession);
@@ -23,6 +27,7 @@ export function App() {
 
   useEffect(() => {
     void init();
+    void initAdaptivePathway();
     void (async () => {
       const info = await ipc.getActiveSession();
       // A blank session id is a "start clean" marker (e.g. provider switch that
@@ -37,7 +42,7 @@ export function App() {
     // Show/hide-artifacts is persisted (Round-3 item 6).
     void ipc.getConfig().then((c) => setShowArtifacts(c.show_artifacts));
     return () => void un.then((fn) => fn());
-  }, [init]);
+  }, [init, initAdaptivePathway]);
 
   const toggleArtifacts = async () => {
     const next = !showArtifacts;
@@ -64,7 +69,7 @@ export function App() {
               {showArtifacts ? 'Hide artifacts' : 'Show artifacts'}
             </button>
             <button onClick={() => ipc.openSettings()} title="Settings" aria-label="Settings">
-              ⚙
+              <SettingsGearIcon />
             </button>
             <button onClick={() => void newSession()} title="New chat" aria-label="New chat">
               <NewChatIcon />
@@ -77,6 +82,7 @@ export function App() {
         </div>
       </div>
       {showArtifacts && !degraded && <ArtifactsPane />}
+      <SchismResolutionModal />
     </div>
   );
 }

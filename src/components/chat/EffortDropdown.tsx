@@ -9,6 +9,11 @@ import { useChatStore } from '@/stores/chatStore';
 export function EffortDropdown() {
   const thinkingEffort = useChatStore((s) => s.thinkingEffort);
   const setThinkingEffort = useChatStore((s) => s.setThinkingEffort);
+  // While a new session is being created, this still shows the *outgoing*
+  // session's value (chatStore.ts's newSession() deliberately doesn't clear
+  // it) — disable it rather than let a click try to set effort on a session
+  // id that doesn't exist yet.
+  const creatingSession = useChatStore((s) => s.creatingSession);
 
   if (!thinkingEffort) return null;
 
@@ -18,6 +23,7 @@ export function EffortDropdown() {
       title="Reasoning effort"
       aria-label="Reasoning effort"
       value={thinkingEffort.current_value}
+      disabled={creatingSession}
       onChange={(e) => void setThinkingEffort(e.target.value)}
     >
       {thinkingEffort.options.map((o) => (

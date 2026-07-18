@@ -103,7 +103,10 @@ fn parse_thinking_effort(result: &Value) -> Option<ThinkingEffort> {
     } else {
         options[0].value.clone()
     };
-    Some(ThinkingEffort { current_value, options })
+    Some(ThinkingEffort {
+        current_value,
+        options,
+    })
 }
 
 /// Prefix every no-explicit-folder session's private chat folder lives under
@@ -124,7 +127,11 @@ fn chats_base_dir(app: &AppHandle) -> PathBuf {
     configured
         .filter(|s| !s.trim().is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| dirs::document_dir().unwrap_or_else(|| PathBuf::from(".")).join("Kitty"))
+        .unwrap_or_else(|| {
+            dirs::document_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("Kitty")
+        })
 }
 
 /// A fresh per-chat folder `<base>/chats/<timestamp>-<short-rand>/`. The
@@ -136,16 +143,22 @@ fn new_chat_folder(base: &Path) -> PathBuf {
     let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
     let suffix: String = {
         let mut rng = rand::thread_rng();
-        (0..6).map(|_| format!("{:x}", rng.gen_range(0u8..16))).collect()
+        (0..6)
+            .map(|_| format!("{:x}", rng.gen_range(0u8..16)))
+            .collect()
     };
     base.join(CHATS_DIR_NAME).join(format!("{ts}-{suffix}"))
 }
 
 /// The working directory a new session starts in: a fresh per-chat folder under
 /// the (configurable) chats base, created if missing. Same for both modes.
-fn resolve_cwd(app: &AppHandle) -> String {
+/// `create_dir_all` runs on a blocking thread — this is user-triggered
+/// (every "New Session"), so a slow disk shouldn't stall the tokio worker
+/// other requests are running on.
+async fn resolve_cwd(app: &AppHandle) -> String {
     let path = new_chat_folder(&chats_base_dir(app));
-    let _ = std::fs::create_dir_all(&path);
+    let path_for_blocking = path.clone();
+    let _ = tokio::task::spawn_blocking(move || std::fs::create_dir_all(&path_for_blocking)).await;
     path.to_string_lossy().replace('\\', "/")
 }
 
@@ -156,10 +169,12 @@ pub async fn new_session(app: AppHandle, cwd: Option<String>) -> Result<SessionI
     let client = api::ensure_client(&app).await?;
     let cwd = match cwd {
         Some(c) if !c.trim().is_empty() => {
-            let _ = std::fs::create_dir_all(&c);
+            let c_for_blocking = c.clone();
+            let _ =
+                tokio::task::spawn_blocking(move || std::fs::create_dir_all(&c_for_blocking)).await;
             c.replace('\\', "/")
         }
-        _ => resolve_cwd(&app),
+        _ => resolve_cwd(&app).await,
     };
     let result = client
         .request("session/new", json!({ "cwd": cwd, "mcpServers": [] }))
@@ -220,6 +235,54 @@ pub async fn new_session(app: AppHandle, cwd: Option<String>) -> Result<SessionI
     })
 }
 
+/// Add one recipe-declared extension to a live session, best-effort — mirrors
+/// `new_session`'s own `computercontroller` add above. Real Goose recipe
+/// extension types (`stdio`/`builtin`/`platform`/`streamable_http`/`frontend`/
+/// `inline_python`) don't line up with what ACP's `extensions/add` accepts
+/// (`builtin`/`platform`/`mcp`, confirmed in `docs/acp-protocol.md`), so
+/// `stdio` maps to the ACP `mcp` shape (env resolved to literal `KEY=VALUE`
+/// strings from Kitty's own process env — never goosed's — matching the
+/// confirmed `server.env` bare-string-array shape) and `builtin`/`platform`
+/// pass straight through. The remaining three have no ACP equivalent at all —
+/// silently skipped, never a hard failure, since an extension type ACP can't
+/// represent must not break a recipe invocation.
+#[tauri::command]
+pub async fn add_recipe_extension(
+    app: AppHandle,
+    session_id: String,
+    extension: crate::config::recipes::RecipeExtension,
+) -> Result<(), String> {
+    let payload = match extension.ext_type.as_str() {
+        "builtin" => json!({ "type": "builtin", "name": extension.name }),
+        "platform" => json!({ "type": "platform", "name": extension.name }),
+        "stdio" => {
+            let env: Vec<String> = extension
+                .env_keys
+                .iter()
+                .filter_map(|k| std::env::var(k).ok().map(|v| format!("{k}={v}")))
+                .collect();
+            json!({
+                "type": "mcp",
+                "server": {
+                    "name": extension.name,
+                    "command": extension.cmd.clone().unwrap_or_default(),
+                    "args": extension.args,
+                    "env": env,
+                },
+            })
+        }
+        _ => return Ok(()),
+    };
+    let client = api::ensure_client(&app).await?;
+    let _ = client
+        .request(
+            "_goose/unstable/session/extensions/add",
+            json!({ "sessionId": session_id, "extension": payload }),
+        )
+        .await;
+    Ok(())
+}
+
 fn parse_mode(v: &Value) -> ModeInfo {
     let s = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
     ModeInfo {
@@ -252,6 +315,19 @@ pub async fn send_prompt(
     images: Option<Vec<ImageAttachment>>,
 ) -> Result<(), String> {
     let client = api::ensure_client(&app).await?;
+    // Per-provider override for how long `session/prompt` tolerates silence
+    // before giving up (Settings → Providers → Advanced) — falls back to the
+    // shared default. Resolved once up front since it's a plain config read.
+    let idle_secs = {
+        let state = app.state::<AppState>();
+        let cfg = state.config.lock().unwrap();
+        cfg.active_provider_id
+            .as_ref()
+            .and_then(|id| cfg.providers.iter().find(|p| &p.id == id))
+            .and_then(|p| p.prompt_idle_timeout_secs)
+            .map(u64::from)
+            .unwrap_or(api::DEFAULT_PROMPT_IDLE_SECS)
+    };
     let app_bg = app.clone();
     let sid = session_id.clone();
     let mut prompt = vec![json!({ "type": "text", "text": text })];
@@ -264,13 +340,35 @@ pub async fn send_prompt(
             .unwrap_or(&img.data_url);
         prompt.push(json!({ "type": "image", "data": data, "mimeType": img.mime }));
     }
+    app.state::<AppState>()
+        .in_flight_sessions
+        .lock()
+        .unwrap()
+        .insert(sid.clone());
     tauri::async_runtime::spawn(async move {
-        let res = client
-            .request(
-                "session/prompt",
-                json!({ "sessionId": sid, "prompt": prompt }),
-            )
+        let params = json!({ "sessionId": sid, "prompt": prompt });
+        let mut res = client
+            .request_session_prompt(&sid, params.clone(), idle_secs)
             .await;
+
+        // A silent, single retry — specifically for goosed's generic
+        // "Internal error" (the JSON-RPC catch-all code, confirmed via a real
+        // report: a correctly-configured custom-OpenAI provider reached over
+        // Tailscale "works most of the time" but fails intermittently with
+        // exactly this). This is goosed *responding* (not a dead connection —
+        // that surfaces as "ACP connection closed"/"ACP request cancelled",
+        // different messages, not retried here), so the local ACP link is
+        // fine; the failure is goosed's own upstream call to the remote
+        // provider hitting a transient hiccup. Resending the identical prompt
+        // once gives that upstream call a second chance before making the
+        // user manually resend or restart goosed for what's often just one
+        // bad round trip.
+        if let Err(message) = &res {
+            if message.eq_ignore_ascii_case("internal error") {
+                res = client.request_session_prompt(&sid, params, idle_secs).await;
+            }
+        }
+
         match res {
             Ok(result) => {
                 let _ = app_bg.emit(
@@ -286,6 +384,18 @@ pub async fn send_prompt(
                 providers::emit_health_from_send_result(&app_bg, true);
             }
             Err(message) => {
+                // A failed round trip is a signal the shared ACP connection
+                // may no longer be good (e.g. a plain "Invalid params" right
+                // after a provider switch, or a genuine timeout) — drop
+                // Kitty's client reference so the next attempt reconnects.
+                // No goosed restart here: the previous idle-reset timeout had
+                // a real bug (a stale activity timestamp from the *previous*
+                // turn could make a fresh send time out instantly, regardless
+                // of connection health — now fixed at the source in
+                // `request_session_prompt`), so a genuine timeout reaching
+                // here should be rare and doesn't warrant disrupting every
+                // other session sharing this goosed process.
+                *app_bg.state::<AppState>().acp.lock().await = None;
                 let _ = app_bg.emit(
                     "chat://error",
                     json!({ "session_id": sid, "message": &message }),
@@ -301,6 +411,12 @@ pub async fn send_prompt(
         }
         // A finished turn clears any pending-approval tray state.
         notifications::set_tray_pending(&app_bg, false);
+        app_bg
+            .state::<AppState>()
+            .in_flight_sessions
+            .lock()
+            .unwrap()
+            .remove(&sid);
     });
     Ok(())
 }
@@ -310,8 +426,25 @@ pub async fn send_prompt(
 #[tauri::command]
 pub async fn cancel_prompt(app: AppHandle, session_id: String) -> Result<(), String> {
     let client = api::ensure_client(&app).await?;
-    client.notify("session/cancel", json!({ "sessionId": session_id }));
+    client
+        .notify("session/cancel", json!({ "sessionId": session_id }))
+        .await;
     Ok(())
+}
+
+/// Whether `session_id` currently has a `session/prompt` in flight — checked
+/// fresh (not a client-cached snapshot) so a window adopting the session
+/// (Expand mid-stream, or just resuming one another window/process is
+/// actively driving) can correctly show "still working" instead of looking
+/// stalled just because `session/load`'s replay doesn't reliably convey an
+/// in-progress turn.
+#[tauri::command]
+pub fn is_session_busy(state: tauri::State<'_, AppState>, session_id: String) -> bool {
+    state
+        .in_flight_sessions
+        .lock()
+        .unwrap()
+        .contains(&session_id)
 }
 
 /// Respond to a deferred tool-approval prompt. `option_id` = the chosen ACP
@@ -332,7 +465,7 @@ pub async fn respond_permission(
         Some(opt) => json!({ "outcome": { "outcome": "selected", "optionId": opt } }),
         None => json!({ "outcome": { "outcome": "cancelled" } }),
     };
-    client.respond(id, outcome);
+    client.respond(id, outcome).await;
     notifications::set_tray_pending(&app, false);
     Ok(())
 }
@@ -411,7 +544,10 @@ pub async fn fork_session(
 ) -> Result<SessionInfo, String> {
     let client = api::ensure_client(&app).await?;
     let result = client
-        .request("session/fork", json!({ "sessionId": session_id, "cwd": cwd }))
+        .request(
+            "session/fork",
+            json!({ "sessionId": session_id, "cwd": cwd }),
+        )
         .await?;
     let new_id = result
         .get("sessionId")
@@ -470,8 +606,62 @@ pub async fn set_thinking_effort(
     Ok(parse_thinking_effort(&result))
 }
 
+/// Hot-rebind an *already-open* session onto the currently-active provider's
+/// model, via the same `session/set_config_option` mechanism (confirmed live,
+/// `docs/acp-protocol.md`: `configOptions` includes `provider`/`model` select
+/// entries, settable exactly like `thinking_effort` above).
+///
+/// Switching providers today only respawns goosed with new env vars —
+/// correct for a brand-new session (`GOOSE_PROVIDER`/`GOOSE_MODEL` become its
+/// default), but confirmed real bug: an *already-loaded* session keeps its
+/// own previously-bound model, so continuing to chat in the same session
+/// after switching sent the OLD provider's model id to the NEW provider
+/// ("... is not a valid model ID"). This call is best-effort and swallows its
+/// own failures — the `session/set_config_option` value format for
+/// `provider`/`model` isn't independently live-probed beyond the
+/// `thinking_effort` precedent, so if it's ever rejected, the worst case is
+/// simply no rebind (today's existing behavior), never a new visible error.
+#[tauri::command]
+pub async fn rebind_session_provider(app: AppHandle, session_id: String) {
+    let (provider_value, model_value) = {
+        let state = app.state::<AppState>();
+        let cfg = state.config.lock().unwrap();
+        let active = cfg
+            .active_provider_id
+            .as_ref()
+            .and_then(|id| cfg.providers.iter().find(|p| &p.id == id));
+        match active {
+            Some(p) => (
+                Some(providers::goose_provider_name(&p.provider_type).to_string()),
+                p.models.first().cloned(),
+            ),
+            None => (None, None),
+        }
+    };
+    let Some(provider_value) = provider_value else {
+        return;
+    };
+    let Ok(client) = api::ensure_client(&app).await else {
+        return;
+    };
+    let _ = client
+        .request(
+            "session/set_config_option",
+            json!({ "sessionId": session_id, "configId": "provider", "value": provider_value }),
+        )
+        .await;
+    if let Some(model_value) = model_value {
+        let _ = client
+            .request(
+                "session/set_config_option",
+                json!({ "sessionId": session_id, "configId": "model", "value": model_value }),
+            )
+            .await;
+    }
+}
+
 /// Get a session's persisted chat/agentic mode override, if any (`None` =
-/// default to agentic).
+/// default to chat — see `Config::session_modes`'s doc comment).
 #[tauri::command]
 pub fn get_session_mode(
     state: tauri::State<'_, AppState>,
@@ -522,8 +712,83 @@ pub async fn delete_session(
         let chats_root = format!("{}/", chats_root.to_string_lossy().replace('\\', "/"));
         let cwd_norm = cwd.replace('\\', "/");
         if cwd_norm.starts_with(&chats_root) {
-            let _ = std::fs::remove_dir_all(&cwd_norm);
+            let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&cwd_norm)).await;
         }
     }
+    // Cross-window live-update, mirroring `session://created` (Round-4 item 6)
+    // — without this, another window's sidebar/recents keeps showing this
+    // session until it happens to refresh for some other reason (confirmed
+    // real gap: `regenerate()`'s background cleanup of the superseded session
+    // it forked away from has no other way to reach a different window).
+    let _ = app.emit("session://deleted", json!({ "sessionId": session_id }));
     Ok(())
+}
+
+/// Delete every session (Settings → General "Clear all chat history" — a
+/// standalone destructive action, unrelated to provider switching). Loops
+/// `session/delete` per id since goosed has no bulk method, reusing
+/// `delete_session`'s exact "only remove a folder under the chats-root
+/// prefix" safety gate for each one's working directory. Also clears
+/// `session_folders`/`session_modes` (app-side organization that can't refer
+/// to a now-deleted session) and the active-session pointer.
+#[tauri::command]
+pub async fn clear_all_sessions(app: AppHandle) -> Result<usize, String> {
+    let client = api::ensure_client(&app).await?;
+    let sessions = {
+        let result = client.request("session/list", json!({})).await?;
+        result
+            .get("sessions")
+            .and_then(|s| s.as_array())
+            .cloned()
+            .unwrap_or_default()
+    };
+
+    let chats_root = chats_base_dir(&app).join(CHATS_DIR_NAME);
+    let chats_root = format!("{}/", chats_root.to_string_lossy().replace('\\', "/"));
+
+    let mut deleted = 0usize;
+    let mut last_err: Option<String> = None;
+    for s in &sessions {
+        let Some(sid) = s.get("sessionId").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        match client
+            .request("session/delete", json!({ "sessionId": sid }))
+            .await
+        {
+            Ok(_) => {
+                deleted += 1;
+                if let Some(cwd) = s.get("cwd").and_then(|v| v.as_str()) {
+                    let cwd_norm = cwd.replace('\\', "/");
+                    if cwd_norm.starts_with(&chats_root) {
+                        let _ =
+                            tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&cwd_norm))
+                                .await;
+                    }
+                }
+            }
+            Err(e) => last_err = Some(e), // keep going; one bad id shouldn't abort the rest
+        }
+    }
+
+    {
+        let state = app.state::<AppState>();
+        let mut cfg = state.config.lock().unwrap();
+        cfg.session_folders.clear();
+        cfg.session_modes.clear();
+        config::save(&cfg).map_err(|e| e.to_string())?;
+        *state.active_session.lock().unwrap() = None;
+    }
+    // Deliberately not re-emitting `session://active` with a null payload here
+    // — `onActiveSession`'s only consumer (`main/App.tsx`) assumes a real
+    // `SessionInfo` and dereferences `info.session_id` unconditionally, so a
+    // null payload would throw there. `session://cleared` below is what
+    // already-open windows react to instead (SessionList/chatStore both blank
+    // their own state directly, the same pattern `handOffToMain` uses).
+    let _ = app.emit("session://cleared", json!({ "deleted": deleted }));
+
+    match last_err {
+        Some(e) if deleted == 0 => Err(e),
+        _ => Ok(deleted),
+    }
 }

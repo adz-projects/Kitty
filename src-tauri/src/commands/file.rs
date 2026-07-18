@@ -41,7 +41,10 @@ pub fn read_text_file(path: String, max_bytes: Option<usize>) -> Result<String, 
     let cap = max_bytes.unwrap_or(200 * 1024);
     let meta = std::fs::metadata(&path).map_err(|e| format!("could not open file: {e}"))?;
     if meta.len() as usize > cap {
-        return Err(format!("File is too large to attach (> {} KB).", cap / 1024));
+        return Err(format!(
+            "File is too large to attach (> {} KB).",
+            cap / 1024
+        ));
     }
     let bytes = std::fs::read(&path).map_err(|e| format!("could not read file: {e}"))?;
     String::from_utf8(bytes)
@@ -73,7 +76,10 @@ pub fn read_file_any(path: String, max_bytes: Option<usize>) -> Result<FileAttac
         .to_string();
     let meta = std::fs::metadata(&path).map_err(|e| format!("could not open file: {e}"))?;
     if meta.len() as usize > cap {
-        return Err(format!("File is too large to attach (> {} KB).", cap / 1024));
+        return Err(format!(
+            "File is too large to attach (> {} KB).",
+            cap / 1024
+        ));
     }
     let bytes = std::fs::read(&path).map_err(|e| format!("could not read file: {e}"))?;
     match String::from_utf8(bytes) {
@@ -108,6 +114,57 @@ pub fn read_file_any(path: String, max_bytes: Option<usize>) -> Result<FileAttac
             })
         }
     }
+}
+
+/// Copy a file into a chat session's own working directory, so the model's
+/// own file tools can actually open it — real, observed bug fix: a file
+/// attached in thought-partner (chat-only) mode that can't be inlined as text
+/// (a `.docx`, `.pdf`, etc.) used to just get a "contents not inlined"
+/// placeholder with no real path, so the model would try — and always fail —
+/// to locate it on disk (outside the chat's own folder, which chat mode's
+/// tool-use is scoped to). Copying the real file in means the model's own
+/// document-reading tools (whatever extension provides them) can genuinely
+/// open it, since it's now inside the one folder chat mode permits.
+///
+/// Deduplicates against an existing file of the same name in `cwd` (`report
+/// (2).docx`, etc.) rather than silently overwriting — the source file is
+/// untouched either way (`fs::copy`, not a move). Returns the copied file's
+/// own name (not the full path — the model only ever needs the relative
+/// name, since it already believes `cwd` to be "here").
+#[tauri::command]
+pub fn copy_file_into_chat_folder(source_path: String, cwd: String) -> Result<String, String> {
+    let source = PathBuf::from(&source_path);
+    let file_name = source
+        .file_name()
+        .ok_or_else(|| format!("'{source_path}' has no file name"))?;
+    let stem = source
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let ext = source.extension().map(|e| e.to_string_lossy().to_string());
+
+    let dest_dir = PathBuf::from(&cwd);
+    std::fs::create_dir_all(&dest_dir)
+        .map_err(|e| format!("could not create working directory {cwd}: {e}"))?;
+
+    let mut dest = dest_dir.join(file_name);
+    let mut n = 2;
+    while dest.exists() {
+        let candidate_name = match &ext {
+            Some(e) => format!("{stem} ({n}).{e}"),
+            None => format!("{stem} ({n})"),
+        };
+        dest = dest_dir.join(candidate_name);
+        n += 1;
+    }
+
+    std::fs::copy(&source, &dest)
+        .map_err(|e| format!("could not copy {source_path} into the chat folder: {e}"))?;
+
+    Ok(dest
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| file_name.to_string_lossy().to_string()))
 }
 
 /// Metadata about a dropped path (file vs. folder) for composer chips.
@@ -156,4 +213,92 @@ pub fn reveal_path(app: AppHandle, path: String) -> Result<(), String> {
     app.opener()
         .reveal_item_in_dir(&path)
         .map_err(|e| format!("could not reveal {path}: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_subdir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("kitty_test_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn copies_file_into_cwd_and_returns_its_name() {
+        let src_dir = temp_subdir("copy_src");
+        let cwd_dir = temp_subdir("copy_cwd");
+        let src_file = src_dir.join("report.docx");
+        std::fs::write(&src_file, b"fake docx bytes").unwrap();
+
+        let name = copy_file_into_chat_folder(
+            src_file.to_string_lossy().to_string(),
+            cwd_dir.to_string_lossy().to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(name, "report.docx");
+        assert!(cwd_dir.join("report.docx").exists());
+        assert_eq!(
+            std::fs::read(cwd_dir.join("report.docx")).unwrap(),
+            b"fake docx bytes"
+        );
+        // Source untouched — a copy, not a move.
+        assert!(src_file.exists());
+    }
+
+    #[test]
+    fn dedupes_against_an_existing_file_of_the_same_name() {
+        let src_dir = temp_subdir("dedupe_src");
+        let cwd_dir = temp_subdir("dedupe_cwd");
+        let src_file = src_dir.join("notes.pdf");
+        std::fs::write(&src_file, b"first").unwrap();
+        std::fs::write(cwd_dir.join("notes.pdf"), b"already here").unwrap();
+
+        let name = copy_file_into_chat_folder(
+            src_file.to_string_lossy().to_string(),
+            cwd_dir.to_string_lossy().to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(name, "notes (2).pdf");
+        // The pre-existing file is untouched, not overwritten.
+        assert_eq!(
+            std::fs::read(cwd_dir.join("notes.pdf")).unwrap(),
+            b"already here"
+        );
+        assert_eq!(
+            std::fs::read(cwd_dir.join("notes (2).pdf")).unwrap(),
+            b"first"
+        );
+    }
+
+    #[test]
+    fn creates_the_working_directory_if_missing() {
+        let src_dir = temp_subdir("mkdir_src");
+        let cwd_dir = temp_subdir("mkdir_cwd").join("not_yet_created");
+        let src_file = src_dir.join("a.txt");
+        std::fs::write(&src_file, b"x").unwrap();
+
+        let name = copy_file_into_chat_folder(
+            src_file.to_string_lossy().to_string(),
+            cwd_dir.to_string_lossy().to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(name, "a.txt");
+        assert!(cwd_dir.join("a.txt").exists());
+    }
+
+    #[test]
+    fn errors_when_the_source_file_does_not_exist() {
+        let cwd_dir = temp_subdir("missing_src_cwd");
+        let result = copy_file_into_chat_folder(
+            "C:/definitely/does/not/exist.docx".to_string(),
+            cwd_dir.to_string_lossy().to_string(),
+        );
+        assert!(result.is_err());
+    }
 }

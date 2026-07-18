@@ -1,4 +1,5 @@
 import { useChatStore } from '@/stores/chatStore';
+import { DocumentIcon } from '@/components/icons/DocumentIcon';
 
 /** Inlined document attachments (large pastes / dropped text in chat-only mode).
     Their content is sent inline with the next message. */
@@ -11,7 +12,7 @@ export function AttachmentChips() {
       {attachments.map((a) => (
         <details className="chip pasted-chip" key={a.id}>
           <summary>
-            📝 {a.label}
+            <DocumentIcon /> {a.label}
             <button
               className="chip-x"
               title="Remove"

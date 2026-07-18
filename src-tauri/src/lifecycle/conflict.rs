@@ -17,9 +17,8 @@ const DESKTOP_PROCESS_NAME: &str = "Goose.exe";
 /// CPU cost when run on the health-loop cadence (Round-5 Batch 8; the loop now
 /// also calls this ~once/minute instead of every 5s).
 pub fn goose_desktop_running(exclude_pid: Option<u32>) -> bool {
-    let sys = System::new_with_specifics(
-        RefreshKind::new().with_processes(ProcessRefreshKind::new()),
-    );
+    let sys =
+        System::new_with_specifics(RefreshKind::new().with_processes(ProcessRefreshKind::new()));
     for (pid, process) in sys.processes() {
         let name = process.name().to_string_lossy();
         if name == DESKTOP_PROCESS_NAME && Some(pid.as_u32()) != exclude_pid {

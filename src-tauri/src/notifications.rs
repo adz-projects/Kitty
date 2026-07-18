@@ -79,15 +79,16 @@ pub fn notify_if_hidden(app: &AppHandle, event: Event, title: &str, body: &str) 
         Ok(handle) => {
             let app2 = app.clone();
             std::thread::spawn(move || {
-                let _ =
-                    handle.wait_for_response(move |response: &notify_rust::NotificationResponse| {
+                let _ = handle.wait_for_response(
+                    move |response: &notify_rust::NotificationResponse| {
                         if response.is_default_action() {
                             let app3 = app2.clone();
                             let _ = app2.run_on_main_thread(move || {
                                 let _ = windows::open_main(&app3);
                             });
                         }
-                    });
+                    },
+                );
             });
         }
         Err(e) => tracing::warn!("notification failed: {e}"),

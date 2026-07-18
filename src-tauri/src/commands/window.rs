@@ -4,8 +4,9 @@
 use tauri::{AppHandle, Manager};
 
 use crate::config;
-use crate::lifecycle::{self, StackStatus};
+use crate::lifecycle;
 use crate::state::AppState;
+use crate::state::StackStatus;
 use crate::windows;
 
 /// Show/hide the overlay from the frontend.
@@ -34,7 +35,9 @@ pub async fn open_settings(
 
 /// The settings deep-link target the window should navigate to on open.
 #[tauri::command]
-pub fn get_settings_target(state: tauri::State<'_, AppState>) -> Result<Option<serde_json::Value>, String> {
+pub fn get_settings_target(
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<serde_json::Value>, String> {
     Ok(state.settings_target.lock().unwrap().clone())
 }
 
@@ -64,12 +67,15 @@ pub async fn restart_goosed(app: AppHandle) -> Result<(), String> {
         let state = app.state::<AppState>();
         *state.acp.lock().await = None;
     }
-    let env = {
+    let (env, goose_override) = {
         let state = app.state::<AppState>();
         let cfg = state.config.lock().unwrap();
-        config::providers::goosed_env(&cfg)
+        (
+            config::providers::goosed_env(&cfg),
+            cfg.goose_binary_override.clone(),
+        )
     };
-    let handle = lifecycle::goosed::spawn(env).await?;
+    let handle = lifecycle::goosed::spawn(env, goose_override.as_deref()).await?;
     let state = app.state::<AppState>();
     *state.goosed.lock().unwrap() = handle;
     Ok(())

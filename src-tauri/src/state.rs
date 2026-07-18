@@ -3,14 +3,52 @@
 //! Holds the loaded config plus the process/health machinery populated in Phase 1
 //! (goosed + Ollama handles, generated secret/port, current stack status).
 
+use std::collections::HashSet;
 use std::sync::Mutex;
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::config::Config;
 use crate::goosed::api::AcpClient;
-use crate::lifecycle::{ManagedProcess, StackStatus};
+use crate::lifecycle::adaptive_pathway_proc::{AdaptivePathwayStatus, EmbeddingModelStatus};
+
+/// A child process we may or may not own. We only kill processes we spawned.
+#[derive(Default)]
+pub struct ManagedProcess {
+    pub child: Option<std::process::Child>,
+    /// True when we spawned it and must clean it up on exit.
+    pub owned: bool,
+}
+
+impl ManagedProcess {
+    /// Kill + reap the child, but only if we own it (never touch pre-existing
+    /// user/service processes).
+    pub fn kill_if_owned(&mut self) {
+        if self.owned {
+            if let Some(mut child) = self.child.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+}
+
+/// Machine-readable stack status driving the "Fix this" UI (CLAUDE.md rule 6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum StackStatus {
+    /// Startup, before the first health probe resolves.
+    #[default]
+    Starting,
+    Ok,
+    OllamaDown,
+    GoosedDown,
+    NoModel,
+    ProviderUnreachable,
+    ConflictGooseDesktop,
+}
 
 /// Root managed state, registered via `app.manage(AppState::new(..))`.
 pub struct AppState {
@@ -32,6 +70,25 @@ pub struct AppState {
     pub settings_target: Mutex<Option<Value>>,
     /// Wizard launch mode (`"setup"` or `"repair"`).
     pub wizard_mode: Mutex<Option<String>>,
+    /// The Adaptive Pathway sidecar process — only `Some(child)` when *we*
+    /// started it (never a pre-existing instance).
+    pub adaptive_pathway: Mutex<ManagedProcess>,
+    /// Last computed Adaptive Pathway sidecar status, kept separate from
+    /// `stack_status` since it's an optional augmentation, not a chat-blocking
+    /// dependency.
+    pub adaptive_pathway_status: Mutex<AdaptivePathwayStatus>,
+    /// Readiness of the shared `qwen3-embedding:0.6b` Ollama model — separate
+    /// from `adaptive_pathway_status` since the sidecar can be `Ok` while this
+    /// is still `Downloading`/`Missing` (hashing-fallback degradation, not an
+    /// outage). See `EmbeddingModelStatus`.
+    pub adaptive_pathway_embedding_status: Mutex<EmbeddingModelStatus>,
+    /// Session ids with a `session/prompt` currently in flight — lets a window
+    /// adopting a session (Expand mid-stream, or just resuming one another
+    /// window/process is actively driving) know a turn is still running, since
+    /// `session/load`'s replay alone doesn't reliably convey that. Checked
+    /// fresh at adoption time rather than trusting a client-captured snapshot,
+    /// since the turn can finish in the gap between handoff and adoption.
+    pub in_flight_sessions: Mutex<HashSet<String>>,
 }
 
 impl AppState {
@@ -45,6 +102,10 @@ impl AppState {
             active_session: Mutex::new(None),
             settings_target: Mutex::new(None),
             wizard_mode: Mutex::new(None),
+            adaptive_pathway: Mutex::new(ManagedProcess::default()),
+            adaptive_pathway_status: Mutex::new(AdaptivePathwayStatus::default()),
+            adaptive_pathway_embedding_status: Mutex::new(EmbeddingModelStatus::default()),
+            in_flight_sessions: Mutex::new(HashSet::new()),
         }
     }
 }

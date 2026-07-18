@@ -1,25 +1,8 @@
 import { useEffect, useState } from 'react';
 import { useConfigDraft } from './useConfigDraft';
 import { ipc, pickFolder } from '@/lib/ipc';
-
-/** Build a tauri-global-shortcut accelerator from a keydown event. */
-function accelerator(e: React.KeyboardEvent): string | null {
-  const mods: string[] = [];
-  if (e.ctrlKey) mods.push('Control');
-  if (e.altKey) mods.push('Alt');
-  if (e.shiftKey) mods.push('Shift');
-  if (e.metaKey) mods.push('Super');
-  const code = e.code;
-  let key: string | null = null;
-  if (/^Key[A-Z]$/.test(code)) key = code.slice(3);
-  else if (/^Digit[0-9]$/.test(code)) key = code.slice(5);
-  else if (/^F[0-9]{1,2}$/.test(code)) key = code;
-  else if (code === 'Space') key = 'Space';
-  else if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(code))
-    key = code.replace('Arrow', '');
-  if (!key || mods.length === 0) return null; // require at least one modifier
-  return [...mods, key].join('+');
-}
+import { accelerator } from '@/lib/accelerator';
+import { Modal } from '@/components/shared/Modal';
 
 /** General settings backed by app config. Goose-only settings (approval mode is
     per-session; see the chat mode badge) are noted where they live elsewhere. */
@@ -29,10 +12,24 @@ export function General() {
   const [recording, setRecording] = useState<number | null>(null);
   const [recordingClipboard, setRecordingClipboard] = useState(false);
   const [autostart, setAutostart] = useState(false);
+  const [confirmClear, setConfirmClear] = useState(false);
+  const [sessionCount, setSessionCount] = useState<number | null>(null);
+  const [clearing, setClearing] = useState(false);
+  const [clearError, setClearError] = useState<string | null>(null);
 
   useEffect(() => {
     void ipc.getAutostart().then(setAutostart);
   }, []);
+
+  const openConfirmClear = async () => {
+    setClearError(null);
+    setConfirmClear(true);
+    try {
+      setSessionCount((await ipc.listSessions()).length);
+    } catch {
+      setSessionCount(null);
+    }
+  };
 
   if (!draft) return <p className="muted">Loading…</p>;
 
@@ -160,48 +157,6 @@ export function General() {
       <label className="check">
         <input
           type="checkbox"
-          checked={draft.use_copilot_key}
-          onChange={(e) => update({ use_copilot_key: e.target.checked })}
-        />
-        <span>Use the Copilot key (Win+Shift+F23) to summon the overlay</span>
-      </label>
-      <small className="muted">
-        If your Copilot key doesn&apos;t work, remap it to your hotkey with PowerToys Keyboard
-        Manager.
-      </small>
-
-      <label className="field">
-        <span>When a conversation gets long</span>
-        <select
-          value={draft.context_strategy ?? 'summarize'}
-          onChange={(e) =>
-            update({ context_strategy: e.target.value as typeof draft.context_strategy })
-          }
-        >
-          <option value="summarize">Summarize the older parts</option>
-          <option value="truncate">Truncate the oldest messages</option>
-          <option value="clear">Clear it and start fresh</option>
-          <option value="prompt">Ask me each time</option>
-        </select>
-        <small className="muted">
-          Goose triggers this automatically as the conversation approaches its model&apos;s context
-          limit — this isn&apos;t a message count you set, it&apos;s which strategy Goose uses when
-          that happens.
-        </small>
-      </label>
-
-      <label className="check">
-        <input
-          type="checkbox"
-          checked={draft.strict_remote_mode}
-          onChange={(e) => update({ strict_remote_mode: e.target.checked })}
-        />
-        <span>Strict mode: disable file/folder drop while a remote provider is active</span>
-      </label>
-
-      <label className="check">
-        <input
-          type="checkbox"
           checked={autostart}
           onChange={async (e) => {
             await ipc.setAutostart(e.target.checked);
@@ -215,12 +170,53 @@ export function General() {
         Approval mode is per session — change it from the shield badge next to the composer.
       </p>
 
+      <div className="field">
+        <span>Danger zone</span>
+        <button onClick={() => void openConfirmClear()}>Clear all chat history</button>
+        <small className="muted">
+          Permanently deletes every conversation and its working-directory files.
+        </small>
+      </div>
+
       <div className="row">
         <button className="primary" onClick={() => void save()}>
           Save
         </button>
         {saved && <span className="muted">Saved.</span>}
       </div>
+
+      {confirmClear && (
+        <Modal title="Clear all chat history?">
+          <p>
+            This permanently deletes {sessionCount ?? 'all'} conversation(s) and their
+            working-directory files. This cannot be undone.
+          </p>
+          {clearError && <div className="chat-error">{clearError}</div>}
+          <div className="row">
+            <button
+              className="primary"
+              disabled={clearing}
+              onClick={async () => {
+                setClearing(true);
+                setClearError(null);
+                try {
+                  await ipc.clearAllSessions();
+                  setConfirmClear(false);
+                } catch (e) {
+                  setClearError(String(e));
+                } finally {
+                  setClearing(false);
+                }
+              }}
+            >
+              {clearing ? 'Deleting…' : 'Yes, delete everything'}
+            </button>
+            <button onClick={() => setConfirmClear(false)} disabled={clearing}>
+              Cancel
+            </button>
+          </div>
+        </Modal>
+      )}
     </section>
   );
 }

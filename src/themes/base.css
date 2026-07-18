@@ -105,15 +105,24 @@ button.primary {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  /* Round-5 Batch 7: slimmer titlebar → more room for the chat. */
-  padding: 3px 10px;
+  /* Round-5 Batch 7 slimmed this down for more chat room, but the bar's own
+     height is just its tallest button plus this padding — with the buttons
+     themselves now tightened up (see `.overlay-titlebar button`), a touch
+     more padding here reads as real margin around them instead of the
+     buttons nearly filling the whole bar. */
+  padding: 5px 10px;
   border-bottom: 1px solid var(--border);
   -webkit-user-select: none;
   user-select: none;
 }
 .overlay-titlebar button {
-  padding: 3px 8px;
+  padding: 2px 8px;
   font-size: 12px;
+  /* Buttons were inheriting the body's 1.5 line-height, which on top of the
+     padding left them nearly as tall as the titlebar itself — barely any
+     margin above/below. A tight line-height lets the icon's own size (not
+     an oversized text line box) drive the button's height instead. */
+  line-height: 1;
 }
 
 .overlay-body {
@@ -414,6 +423,27 @@ button.primary {
   gap: 8px;
   align-items: flex-end;
   padding-top: 8px;
+  position: relative;
+}
+/* Recipe invocation guidance — floats just above the composer (absolute, so
+   the flex row layout is untouched) once a `/slug` is matched, telling the
+   user what to type after the slug. The slash-command dropdown covers the
+   typing-the-slug phase; this covers the after-acceptance phase. */
+.composer-recipe-hint {
+  position: absolute;
+  bottom: calc(100% - 2px);
+  left: 0;
+  right: 0;
+  font-size: 12px;
+  line-height: 1.3;
+  color: var(--text-muted);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 8px;
+}
+.composer-recipe-hint strong {
+  color: var(--text);
 }
 .composer textarea {
   flex: 1;
@@ -425,6 +455,10 @@ button.primary {
   color: var(--text);
   font: inherit;
   max-height: 160px;
+  /* Composer.tsx's auto-grow handler switches this to `auto` only once
+     scrollHeight actually exceeds the cap above — otherwise a short message
+     shouldn't show scrollbar chrome at all. */
+  overflow-y: hidden;
 }
 /* Force-stop button (Round-5) — an assertive variant shown after the Stop
    grace period elapses with the turn still stuck. */
@@ -449,6 +483,73 @@ button.primary {
   color: var(--danger);
   font-size: 12.5px;
   padding: 4px 0;
+}
+
+/* Settings → Advanced error log. */
+.log-entries {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 320px;
+  overflow-y: auto;
+  margin: 8px 0;
+}
+.log-entry {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 12px;
+}
+.log-entry-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.log-entry-level {
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+.log-entry-error .log-entry-level {
+  color: var(--danger);
+}
+.log-entry-warn .log-entry-level {
+  color: var(--warn);
+}
+.log-entry-time,
+.log-entry-target {
+  font-size: 11px;
+}
+.log-entry-target {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.log-entry-message {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.hint-summary {
+  font-size: 12px;
+  padding: 4px 0;
+}
+
+/* Exploration-consent prompt (Adaptive Pathway changelog) — a small
+   actionable card, not a popover, since it needs to stay visible until the
+   user picks Accept/Not now. */
+.nudge-prompt {
+  margin: 6px 0;
+  padding: 8px 10px;
+  border: 1px solid var(--accent);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  font-size: 12.5px;
+}
+.nudge-prompt p {
+  margin: 0 0 6px;
 }
 
 .pill {
@@ -482,6 +583,9 @@ button.primary {
 }
 
 .status-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
   font-size: 11px;
   padding: 2px 6px;
   border-radius: 6px;
@@ -535,6 +639,27 @@ button.primary {
   }
 }
 
+/* Adaptive Pathway pause/resume toggle (Round-C) — same shrink treatment as
+   the other header badges. */
+.ap-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 110px;
+  min-width: 0;
+}
+.ap-toggle-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+@media (max-width: 700px) {
+  .ap-toggle {
+    max-width: 60px;
+  }
+}
+
 /* Instant chat/agentic mode toggle (Round-4). */
 .mode-toggle {
   display: inline-flex;
@@ -543,6 +668,9 @@ button.primary {
   overflow: hidden;
 }
 .mode-toggle button {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
   border: none;
   background: transparent;
   color: var(--text-muted);
@@ -588,6 +716,13 @@ button.primary {
   border-color: var(--warn);
   color: var(--warn);
 }
+/* Icon + plain-text note (e.g. the trust badge under a provider's base URL)
+   — same baseline-vs-icon misalignment `.status-badge` had; same fix. */
+.trust-note {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
 
 .typing {
   display: inline-block;
@@ -605,6 +740,14 @@ button.primary {
 .msg:hover .msg-actions,
 .msg:focus-within .msg-actions {
   opacity: 1;
+}
+/* Surface visibility (UX-simplification Batch 5): the first few times a
+   hint-bearing message appears, its feedback buttons stay lightly visible
+   instead of fully hover-only, so a new user actually notices them once —
+   then it settles back into the same hover-only behavior as every other
+   message action (see hintFeedbackDiscoverability.ts). */
+.msg-actions-discoverable {
+  opacity: 0.55;
 }
 .msg-actions button {
   font-size: 11px;
@@ -694,6 +837,12 @@ button.primary {
   border: 1px solid var(--border);
   border-radius: 8px;
   box-shadow: var(--overlay-shadow);
+  /* Last-resort fallback for `usePopoverPosition`'s `maxHeight`/`maxWidth`
+     clamp (a popover taller/wider than the whole viewport, an edge case) —
+     the normal case is that repositioning alone keeps it fully on-screen
+     with nothing to scroll. */
+  overflow-y: auto;
+  overflow-x: hidden;
 }
 .mode-popover button {
   border: none;
@@ -713,6 +862,114 @@ button.primary {
   border: none;
   border-top: 1px solid var(--border);
   margin: 2px 0;
+}
+
+/* Recipe slash-command dropdown (Composer) — reuses .mode-popover's shell but
+   each row is two lines (title + the primary parameter's invocation-guidance
+   description), so rows need block layout instead of .mode-popover button's
+   plain single-line text-align. */
+.recipe-popover {
+  min-width: 260px;
+  max-width: 360px;
+}
+.recipe-popover button {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  width: 100%;
+}
+.recipe-option-title {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-weight: 600;
+}
+.recipe-option-hint {
+  font-size: 12px;
+  white-space: normal;
+  line-height: 1.3;
+}
+
+/* Chat header overflow menu (UX-simplification Batch 3) — deliberately its
+   own class, not `.mode-popover`: that class's `.mode-popover button`
+   descendant rule would otherwise restyle the nested `ModeBadge`/
+   `AdaptivePathwayToggle` badge buttons it contains, which need to keep
+   their own `.status-badge` look, not become generic menu-item rows. */
+.chat-header-menu-trigger {
+  font-size: 14px;
+  line-height: 1;
+  padding: 3px 8px;
+}
+.chat-header-menu {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 8px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: var(--overlay-shadow);
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+/* Inline hint badge (Round-C): under an assistant message that used the
+   Adaptive Pathway extension's `decide` hint — always visible when hints
+   exist, not hover-gated like `.msg-actions`. */
+.hint-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin: 4px 0;
+}
+.hint-popover {
+  max-width: 280px;
+  padding: 8px;
+  gap: 8px;
+}
+.hint-popover-item {
+  font-size: 12px;
+  line-height: 1.4;
+}
+.hint-popover-item .link {
+  background: none;
+  border: none;
+  color: var(--accent);
+  cursor: pointer;
+  padding: 0;
+  font-size: 11px;
+}
+.hint-edge-detail {
+  margin-top: 4px;
+  padding-left: 8px;
+  border-left: 2px solid var(--border);
+  font-size: 11px;
+}
+
+/* Per-hint source-model badge (`standard`/`ig`/`pc`/`wildcard`) — the hint
+   text itself already bakes in the rationale ("{primitive} — {rationale}"),
+   so this badge only needs to carry which model produced the hint. */
+.hint-source-badge {
+  display: inline-block;
+  font-size: 10px;
+  line-height: 1.3;
+  padding: 1px 5px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  margin-bottom: 3px;
+}
+.hint-source-ig,
+.hint-source-pc {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.hint-source-wildcard {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-text);
 }
 
 /* --- Full window layout (Phase 4) --- */
@@ -778,10 +1035,6 @@ button.primary {
 }
 
 /* --- Chat folders (Round-2 item 15) --- */
-.folder-group > summary {
-  list-style: none;
-  cursor: pointer;
-}
 .folder-head {
   display: flex;
   align-items: center;
@@ -791,6 +1044,13 @@ button.primary {
   font-weight: 600;
   background: var(--surface-2);
   border-bottom: 1px solid var(--border);
+  cursor: pointer;
+}
+.folder-chevron {
+  color: var(--text-muted);
+  font-size: 11px;
+  width: 10px;
+  text-align: center;
 }
 .folder-name {
   flex: 1;
@@ -1006,7 +1266,9 @@ button.primary {
   border: none;
   background: transparent;
   text-align: left;
-  padding: 8px 10px;
+  /* Indented relative to the group label above (padding-left 10px) so items
+     read as nested under their group, not flush with it. */
+  padding: 8px 10px 8px 18px;
   border-radius: 6px;
 }
 .settings-nav button:hover {
@@ -1016,6 +1278,17 @@ button.primary {
   background: var(--surface-2);
   color: var(--accent);
   font-weight: 600;
+}
+.settings-nav-group-label {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--text-muted);
+  padding: 12px 10px 4px;
+}
+.settings-nav-group-label:first-child {
+  padding-top: 4px;
 }
 .settings-main {
   overflow-y: auto;
@@ -1035,6 +1308,27 @@ button.primary {
 .settings-section details summary {
   cursor: pointer;
   padding: 6px 0;
+}
+/* Manual disclosure toggle (UX-simplification Batch 2) — a plain button +
+   conditional render, not native <details>: this app's WebView2/Chromium
+   build doesn't actually hide non-open <details> content (confirmed live —
+   even a bare, class-free <details> child stayed visible while closed), so
+   visibility can't be left to native collapse + CSS. */
+.disclosure-toggle {
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  text-align: left;
+  padding: 6px 0;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+}
+.provider-advanced-body {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding-top: 6px;
 }
 .field {
   display: flex;
@@ -1139,6 +1433,36 @@ button.link {
   flex-direction: column;
   gap: 6px;
 }
+
+/* Extensions — 2-column card grid (UX-simplification Batch 1), replacing the
+   old flat checkbox list. */
+.ext-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+.ext-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+}
+.ext-card-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 8px;
+}
+.ext-card-name {
+  font-weight: 600;
+  font-size: 13px;
+}
+.ext-card-desc {
+  font-size: 11px;
+}
 .model-row {
   display: flex;
   justify-content: space-between;
@@ -1218,11 +1542,14 @@ button.link {
   margin-bottom: 20px;
 }
 .wizard-step {
+  font: inherit;
   font-size: 12px;
   padding: 4px 10px;
   border-radius: 999px;
   border: 1px solid var(--border);
+  background: transparent;
   color: var(--text-muted);
+  cursor: pointer;
 }
 .wizard-step.active {
   border-color: var(--accent);
@@ -1232,6 +1559,10 @@ button.link {
 .wizard-step.done {
   color: var(--ok);
   border-color: var(--ok);
+}
+.wizard-step:disabled {
+  cursor: default;
+  opacity: 0.6;
 }
 .wizard-panel {
   display: flex;
@@ -1275,4 +1606,67 @@ button.link {
 .starter.selected {
   border-color: var(--accent);
   box-shadow: inset 2px 0 0 var(--accent);
+}
+.path-fork {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.path-card {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  align-items: flex-start;
+  text-align: left;
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+  cursor: pointer;
+  font: inherit;
+  color: inherit;
+}
+.path-card strong {
+  font-size: 15px;
+}
+.path-card.selected {
+  border-color: var(--accent);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+.wizard-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+}
+.wizard-summary-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 13px;
+}
+.wizard-issue-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.error-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.error-detail pre {
+  margin: 0;
+  padding: 8px 10px;
+  background: var(--surface-2);
+  border-radius: 6px;
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-word;
 }

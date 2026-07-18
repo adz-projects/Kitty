@@ -34,7 +34,10 @@ pub async fn ollama_delete_model(app: AppHandle, model: String) -> Result<(), St
 /// (Round-6 Feature 1). `Ok(None)` (not `Err`) on any failure — this is a
 /// suggestion, not a required value.
 #[tauri::command]
-pub async fn ollama_show_context_length(app: AppHandle, model: String) -> Result<Option<u32>, String> {
+pub async fn ollama_show_context_length(
+    app: AppHandle,
+    model: String,
+) -> Result<Option<u32>, String> {
     Ok(ollama::show_model_context_length(&ollama_base(&app), &model).await)
 }
 
@@ -59,6 +62,33 @@ pub fn read_ollama_env() -> Result<Vec<env_helper::EnvVar>, String> {
 #[tauri::command]
 pub fn set_ollama_env(name: String, value: Option<String>) -> Result<(), String> {
     env_helper::set(&name, value.as_deref())
+}
+
+/// Ensure Ollama is reachable, spawning it if down and installed (mirrors
+/// `lifecycle::ollama_proc::ensure_running`, never kills anything). Unlike
+/// `restart_ollama` this works even when Ollama isn't a process Kitty
+/// already owns — used by Settings' "set up learning model" action and the
+/// wizard's embedding step, both of which can run before `start_stack` had
+/// any reason to start Ollama (e.g. an api-key chat provider that doesn't
+/// otherwise need it, before adaptive-pathway's own need is provisioned).
+#[tauri::command]
+pub async fn ensure_ollama_running(app: AppHandle) -> Result<(), String> {
+    let base = ollama_base(&app);
+    let already_owned_and_running = {
+        let state = app.state::<AppState>();
+        let ollama = state.ollama.lock().unwrap();
+        ollama.owned && ollama.child.is_some()
+    };
+    if already_owned_and_running {
+        // `ensure_running`'s probe-first path returns a *new*
+        // ManagedProcess{owned: false} once it's up — overwriting
+        // `state.ollama` with that here would leak the real child handle
+        // (never killed on exit). Trust the existing owned handle instead.
+        return Ok(());
+    }
+    let proc = lifecycle::ollama_proc::ensure_running(&base).await?;
+    *app.state::<AppState>().ollama.lock().unwrap() = proc;
+    Ok(())
 }
 
 /// Restart Ollama if we own the process (else the user must restart it).

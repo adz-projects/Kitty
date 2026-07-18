@@ -1,12 +1,15 @@
 import { useEffect } from 'react';
 import { ipc, onNewSessionRequest } from '@/lib/ipc';
 import { useStackStore } from '@/stores/stackStore';
+import { useAdaptivePathwayStore } from '@/stores/adaptivePathwayStore';
 import { useChatStore } from '@/stores/chatStore';
 import { StackStatusView } from '@/components/shared/StackStatusView';
 import { ChatView } from '@/components/chat/ChatView';
 import { RecentSessions } from '@/components/sessions/RecentSessions';
 import { NewChatIcon } from '@/components/icons/NewChatIcon';
 import { DoubleChevronIcon } from '@/components/icons/DoubleChevronIcon';
+import { SettingsGearIcon } from '@/components/icons/SettingsGearIcon';
+import { SchismResolutionModal } from '@/components/chat/SchismResolutionModal';
 import type { StackStatus } from '@/lib/types';
 
 const DEGRADED: StackStatus[] = ['ollama_down', 'goosed_down', 'no_model', 'provider_unreachable'];
@@ -14,9 +17,11 @@ const DEGRADED: StackStatus[] = ['ollama_down', 'goosed_down', 'no_model', 'prov
 export function App() {
   const status = useStackStore((s) => s.status);
   const init = useStackStore((s) => s.init);
+  const initAdaptivePathway = useAdaptivePathwayStore((s) => s.init);
 
   useEffect(() => {
     void init();
+    void initAdaptivePathway();
     // Escape hides the overlay when it has focus (CLAUDE.md Phase 0).
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') void ipc.hideOverlay();
@@ -27,7 +32,7 @@ export function App() {
       window.removeEventListener('keydown', onKey);
       void unlisten.then((fn) => fn());
     };
-  }, [init]);
+  }, [init, initAdaptivePathway]);
 
   const degraded = DEGRADED.includes(status);
 
@@ -54,7 +59,7 @@ export function App() {
               <DoubleChevronIcon direction="down" />
             </button>
             <button onClick={() => ipc.openSettings()} title="Settings" aria-label="Settings">
-              ⚙
+              <SettingsGearIcon />
             </button>
             <button
               onClick={() => void useChatStore.getState().newSession()}
@@ -79,6 +84,7 @@ export function App() {
           )}
         </div>
       </div>
+      <SchismResolutionModal />
     </div>
   );
 }

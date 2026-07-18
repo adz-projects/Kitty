@@ -1,5 +1,7 @@
 import { useState } from 'react';
 import { useChatStore } from '@/stores/chatStore';
+import { usePopoverPosition } from '@/lib/usePopoverPosition';
+import { ShieldIcon } from '@/components/icons/ShieldIcon';
 
 const LABELS: Record<string, string> = {
   auto: 'Auto-approve',
@@ -13,7 +15,11 @@ export function ModeBadge() {
   const mode = useChatStore((s) => s.mode);
   const availableModes = useChatStore((s) => s.availableModes);
   const setMode = useChatStore((s) => s.setMode);
+  // See EffortDropdown.tsx's comment — same "still showing the outgoing
+  // session's value" rationale.
+  const creatingSession = useChatStore((s) => s.creatingSession);
   const [open, setOpen] = useState(false);
+  const { triggerRef, popoverRef, style } = usePopoverPosition(open, () => setOpen(false));
 
   if (!mode) return null;
   const label = LABELS[mode] ?? mode;
@@ -25,14 +31,16 @@ export function ModeBadge() {
   return (
     <div style={{ position: 'relative' }}>
       <button
+        ref={triggerRef as React.Ref<HTMLButtonElement>}
         className="status-badge mode-status-badge"
+        disabled={creatingSession}
         onClick={() => setOpen((o) => !o)}
         title="Approval mode — click to change"
       >
-        🛡 <span className="mode-badge-label">{label}</span> ▾
+        <ShieldIcon /> <span className="mode-badge-label">{label}</span> ▾
       </button>
       {open && approvalModes.length > 0 && (
-        <div className="mode-popover" role="menu">
+        <div ref={popoverRef} className="mode-popover" role="menu" style={style}>
           {approvalModes.map((m) => (
             <button
               key={m.id}

@@ -91,10 +91,69 @@ pub async fn openrouter_context_length(model: String) -> Result<Option<u32>, Str
     Ok(openrouter::context_length_for(&models, &model))
 }
 
-/// Activate a provider profile (`None` = use goosed's own config). Persists the
-/// choice and restarts goosed so the provider env takes effect.
+/// Check an OpenRouter provider profile's current credit balance/usage.
+/// Reads the key from the keyring (never sent to/stored by Kitty otherwise)
+/// — errors if the profile has no stored secret or isn't an OpenRouter profile.
+#[tauri::command]
+pub async fn openrouter_credits(
+    state: tauri::State<'_, AppState>,
+    provider_id: String,
+) -> Result<serde_json::Value, String> {
+    let profile = {
+        let cfg = state.config.lock().unwrap();
+        cfg.providers
+            .iter()
+            .find(|p| p.id == provider_id)
+            .cloned()
+            .ok_or("no such provider profile")?
+    };
+    if profile.provider_type != "openrouter" {
+        return Err("not an OpenRouter profile".into());
+    }
+    let key = providers::get_secret_async(&provider_id)
+        .await
+        .ok_or("no API key stored for this profile — edit it and add one")?;
+    openrouter::get_credits(&key).await
+}
+
+/// Manual, user-triggered re-check of the active provider (the chat view's
+/// "can't reach" banner's Retry button) — reuses `test_connection` rather
+/// than reintroducing any background polling. `Ok(())` when there's no active
+/// provider (goosed's own config) — nothing for Kitty to check in that case.
+#[tauri::command]
+pub async fn test_active_provider_connection(
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let profile = {
+        let cfg = state.config.lock().unwrap();
+        cfg.active_provider_id
+            .as_ref()
+            .and_then(|id| cfg.providers.iter().find(|p| &p.id == id).cloned())
+    };
+    match profile {
+        Some(p) => providers::test_connection(&p).await,
+        None => Ok(()),
+    }
+}
+
+/// Activate a provider profile (`None` = use goosed's own config). Health-gates
+/// the switch first (a non-functioning target is rejected and the old provider
+/// stays active — see `providers::test_connection`), then persists the choice
+/// and restarts goosed so the provider env takes effect.
 #[tauri::command]
 pub async fn activate_provider(app: AppHandle, id: Option<String>) -> Result<(), String> {
+    if let Some(ref pid) = id {
+        let profile = {
+            let state = app.state::<AppState>();
+            let cfg = state.config.lock().unwrap();
+            cfg.providers.iter().find(|p| &p.id == pid).cloned()
+        };
+        let profile = profile.ok_or("no such provider profile")?;
+        providers::test_connection(&profile)
+            .await
+            .map_err(|e| format!("Can't switch to {} — {e}", profile.name))?;
+    }
+
     // Capture the previously-active Ollama model so we can evict it after the
     // switch (Round-2 item 5) — read before we overwrite active_provider_id.
     let prev_ollama = {

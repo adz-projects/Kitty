@@ -5,18 +5,20 @@ open an item here instead.
 
 ## Open
 
-- **Recipes / skills (Round-2 item 16).** Goose recipes are file-based YAML run via
-  the CLI `goose run --recipe <name|path> [--params K=V]` (confirmed by the Batch-0
-  ACP probe — `session/new` silently ignores recipe params; there is no ACP method
-  to launch a recipe). Integrating them means either a recipe-file CRUD editor in
-  Settings (read/write `.yaml`, list via `goose recipe list`, "launch" hands off to
-  Goose Desktop / copies the run command) or a new managed child-process path that
-  spawns `goose run --recipe` outside the shared `goose serve` (heavier; unconfirmed
-  whether such a run surfaces in normal `session/list` history). Deferred by owner
-  decision on 2026-07-05 ("skip recipes for now"). Goose also has a separate
-  `goose skills list` concept that was folded into "recipes" per the same decision.
-
 ## Noted for later
+
+- **Recipes (resolved).** The item below this note used to track the "recipes /
+  skills" gap left by the Round-2 `goose run --recipe`-can't-be-launched-via-ACP
+  finding. Shipped instead as client-side-interpreted templates — a recipe's
+  `instructions`/`prompt`/`extensions` attach to an ordinary chat turn (session-
+  scoped extension add + a hidden `<recipe>` preamble on the outgoing prompt,
+  `chatStore.ts`'s `sendWithRecipe`) rather than shelling out to the real CLI
+  runner. Trade-off, by design: the real runner's `response`-schema enforcement,
+  `retry`, and `sub_recipes` subagent delegation aren't reachable this way and
+  are out of scope. Management/editor: `src/components/settings/Recipes.tsx`;
+  invocation: `/slug free text` in the composer (`src/components/chat/Composer.tsx`,
+  `src/lib/recipes.ts`); data model + YAML import/export:
+  `src-tauri/src/config/{recipes,recipe_yaml}.rs`.
 
 - ChatML **import** path — Phase 11 export is one-way (`.chatml` + `.meta.json`).
   Re-import (reconstruct a session from the pair) is out of scope for v1.

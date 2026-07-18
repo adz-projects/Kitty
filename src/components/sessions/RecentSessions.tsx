@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react';
 import { useSessionStore } from '@/stores/sessionStore';
 import { useChatStore } from '@/stores/chatStore';
-import { onSessionCreated } from '@/lib/ipc';
+import { onSessionCreated, onSessionDeleted } from '@/lib/ipc';
+import { usePopoverPosition } from '@/lib/usePopoverPosition';
 
 /** Lightweight last-10 recent-sessions dropdown for the compact overlay. */
 export function RecentSessions() {
@@ -9,6 +10,7 @@ export function RecentSessions() {
   const refresh = useSessionStore((s) => s.refresh);
   const sessions = useSessionStore((s) => s.sessions);
   const loadSession = useChatStore((s) => s.loadSession);
+  const { triggerRef, popoverRef, style } = usePopoverPosition(open, () => setOpen(false));
 
   useEffect(() => {
     // Round-4 item 6: keep the list fresh even while closed, so a session
@@ -16,6 +18,13 @@ export function RecentSessions() {
     // store) is there the next time this dropdown opens — and updates live
     // if it's already open.
     const un = onSessionCreated(() => void refresh());
+    return () => void un.then((fn) => fn());
+  }, [refresh]);
+
+  useEffect(() => {
+    // A session deleted in the other window (e.g. regenerate()'s background
+    // cleanup) otherwise leaves a stale entry here until reopened.
+    const un = onSessionDeleted(() => void refresh());
     return () => void un.then((fn) => fn());
   }, [refresh]);
 
@@ -27,14 +36,19 @@ export function RecentSessions() {
 
   return (
     <div style={{ position: 'relative' }}>
-      <button onClick={toggle} title="Recent sessions">
+      <button
+        ref={triggerRef as React.Ref<HTMLButtonElement>}
+        onClick={toggle}
+        title="Recent sessions"
+      >
         Recent ▾
       </button>
       {open && (
         <div
+          ref={popoverRef}
           className="mode-popover"
           role="menu"
-          style={{ minWidth: 240, maxHeight: 320, overflow: 'auto' }}
+          style={{ minWidth: 240, ...style }}
         >
           {sessions.length === 0 && (
             <span className="muted" style={{ padding: '6px 8px' }}>
@@ -47,7 +61,7 @@ export function RecentSessions() {
               role="menuitem"
               title={s.cwd}
               onClick={() => {
-                void loadSession(s.sessionId, s.cwd, s.title);
+                void loadSession(s.sessionId, s.cwd, s.title, s.providerId, s.modelId);
                 setOpen(false);
               }}
             >

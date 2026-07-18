@@ -6,9 +6,10 @@ import type { ToolCall } from '@/stores/chatStore';
     (Round-3 item 23, replaces the separate ReasoningPanel + loose ToolCallCard
     list). Reasoning and tool calls have no shared timestamp in the streaming
     assembly, so this groups rather than truly interleaves them: reasoning
-    narrative first, then every tool call in order. Closed by default — the box
-    never auto-expands, even while streaming; the user opens it explicitly and
-    it stays as they leave it. */
+    narrative first, then every tool call in order. Per CLAUDE.md Phase 10:
+    auto-expands while reasoning is streaming (so the user can watch it), then
+    collapses once the final answer starts — unless the user has explicitly
+    pinned it open/closed, in which case their choice wins and sticks. */
 export function ThinkingBox({
   reasoning,
   toolCalls,
@@ -20,10 +21,12 @@ export function ThinkingBox({
   streaming: boolean;
   hasAnswer: boolean;
 }) {
-  // null = follow the default (closed); true/false = user opened/closed it.
+  // null = follow the default; true/false = user explicitly opened/closed it.
   const [pinned, setPinned] = useState<boolean | null>(null);
   const streamingReasoning = streaming && !hasAnswer;
-  const open = pinned ?? false;
+  // Default: open while reasoning streams, collapsed otherwise. A user's
+  // explicit toggle (`pinned`) overrides the default from then on.
+  const open = pinned ?? streamingReasoning;
 
   return (
     <div className={`reasoning${open ? ' open' : ''}`}>

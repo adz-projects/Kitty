@@ -31,6 +31,15 @@ done until this file is updated and the affected code (`goosed/api.rs`,
   `conflict.rs` — this entry was left marked TBD after the fact, corrected in the
   Stage-1 close-out).
 
+## Windows Copilot app (REMOVED — UX-simplification pass)
+
+The hardware Copilot-key hook (`copilot.rs`, the `use_copilot_key` config field,
+and the `WH_KEYBOARD_LL` chord-swallow described below) was removed by owner
+decision during the UX-simplification pass — one low-level global keyboard
+hook was judged not worth the complexity/risk versus a configurable hotkey,
+which already does the same summon job. The section below is kept for
+historical context only; none of it reflects current code.
+
 ## Windows Copilot app (Round-2 item 2 — best-effort close after swallowing the chord)
 
 - **Appx package:** `Microsoft.Copilot`, PackageFamilyName
@@ -116,29 +125,67 @@ done until this file is updated and the affected code (`goosed/api.rs`,
   ops Kitty can inspect. This is what lets a thought-partner-mode session export
   a docx (which previously hit "Tool use is off in chat mode — declined").
 
-## Installer URLs & hashes (Phase 7)
+## Installer URLs & hashes (Phase 7; Goose auto-install added in the wizard redesign)
 
 - **Ollama Windows installer:** `https://ollama.com/download/OllamaSetup.exe`
   (Inno Setup; hands off to its own UI/UAC — verify a silent flag before enabling
   unattended install). Wired in `src-tauri/src/wizard.rs`.
-- **Goose installer:** _confirmed (Stage-1 close-out): there is no Windows
-  `.exe`/`.msi` installer at all_ — the [releases page](https://github.com/aaif-goose/goose/releases/latest)
+- **Goose:** _confirmed (Stage-1 close-out): there is no Windows `.exe`/`.msi`
+  installer at all_ — the [releases page](https://github.com/aaif-goose/goose/releases/latest)
   (org renamed from `block/goose`; GitHub still redirects the old path) only
   publishes zip archives for Windows:
   - `goose-x86_64-pc-windows-msvc.zip` (~78 MB) — the bare CLI/`goose serve`
-    binary. **This is the one Kitty needs** — it's what `locate_goose()`
-    expects to find a `goose.exe` inside.
-  - `goose-x86_64-pc-windows-msvc-cuda.zip` — same, CUDA-enabled build.
+    binary. **This is the one Kitty needs and installs automatically.**
+  - `goose-x86_64-pc-windows-msvc-cuda.zip` — same, CUDA-enabled build. Not
+    used by the auto-install (the plain build is the safe default).
   - `Goose-win32-x64.zip` / `Goose-win32-x64-cuda.zip` / `Goose.zip` — the full
-    **Goose Desktop** Electron app. **Do not point users at this one** — it's
+    **Goose Desktop** Electron app. **Never auto-install this one** — it's
     the separate GUI product `conflict.rs` already detects and warns about
-    (`Goose.exe` process name); auto-installing it would risk creating the
-    exact conflict Kitty is designed to flag.
-  - Since none of these are silent-installable executables, the wizard no
-    longer offers an "Install" button for Goose (it always would have thrown) —
-    it links straight to the release page with the exact asset name to grab,
-    and `install_dependency("goose")` (still reachable directly) returns a
-    message with the same guidance as a defensive fallback.
+    (`Goose.exe` process name); installing it would create the exact conflict
+    Kitty is designed to flag.
+  - **Wizard redesign (current behavior):** since there's no installer
+    executable to silently run, `wizard::install("goose")`
+    (`src-tauri/src/wizard.rs`) instead resolves the CLI zip's real download
+    URL from the GitHub Releases API by exact asset name
+    (`GOOSE_CLI_ASSET_NAME`), downloads it, extracts it via the `zip` crate
+    into `%LOCALAPPDATA%\Kitty\goose\`, and persists the extracted
+    `goose.exe` path as `Config.goose_binary_override` — which
+    `lifecycle::goosed::locate_goose` now checks first, before the env var /
+    Goose Desktop bundle path / bare PATH fallbacks. The wizard's Detect step
+    calls this from a real "Install" button; a "I already have it" fallback
+    (native `.exe` file picker) sets the same override manually for a user
+    who's already got Goose somewhere non-standard.
+
+## Wizard redesign: local-vs-API-key fork, `ollama_enabled` (2026-07-11)
+
+- **The wizard's first screen now forks**: "Run models on this computer"
+  (existing Detect/Configure/First-model flow, Ollama+Goose auto-install) vs.
+  "Use my own API key" (new step reusing `Providers.tsx`'s save/activate
+  infra — Anthropic/OpenAI/OpenRouter/Custom, base URLs from the shared
+  `src/lib/provider_defaults.ts`). First-party API-key providers created this
+  way are marked `is_trusted: true` immediately (owner decision — no scary
+  ⚠ badge for a key the user just pasted on purpose); `custom_openai` stays
+  untrusted by default, same as adding one from Settings.
+- **`Config.ollama_enabled`** (default `true`, so pre-existing installs are
+  unaffected): set explicitly by the wizard's fork. `false` hides Settings →
+  "Ollama Models" and the "Ollama" option in Add Provider's type picker, and
+  `start_stack`/`compute_status` (`config::providers::requires_local_ollama`)
+  stop trying to reach Ollama at all. Settings → Advanced has an "Enable &
+  install Ollama" action that flips it back on and runs the same install path
+  the wizard uses.
+- **`validate_setup` command** (`src-tauri/src/commands/setup.rs`) is the
+  single source of truth for "is this setup actually ready to chat" — checks
+  the active provider has a model (and, for remote types, a stored key) plus
+  a fresh `compute_status`. Powers the wizard's Done-step summary and its
+  soft Finish-anyway gate (never a hard block), and Setup & Repair's re-check.
+- **Adaptive Pathway auto-install (near-term bridge):** the wizard now
+  attempts a best-effort `pip install adaptive-pathway[sidecar]` if the
+  console scripts aren't already resolvable (`wizard::install_adaptive_pathway`).
+  Failure is non-fatal — the extension just stays `Down`, same graceful
+  degradation as always, with a manual retry in Settings → Advanced. The
+  real, owner-specified target is bundling a standalone sidecar executable as
+  a Tauri `externalBin` sidecar (no Python dependency at all) — not yet
+  built; this pip-based path is an explicit bridge until that lands.
 
 ## Starter models (Phase 7 `src/lib/starter_models.ts`)
 

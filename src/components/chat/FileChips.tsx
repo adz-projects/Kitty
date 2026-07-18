@@ -1,4 +1,6 @@
 import { useChatStore } from '@/stores/chatStore';
+import { FolderIcon } from '@/components/icons/FolderIcon';
+import { DocumentIcon } from '@/components/icons/DocumentIcon';
 
 /** Removable chips for dropped files/folders. Folders offer "Set as working
     directory". On send, the paths are prepended to the message (see chatStore). */
@@ -13,7 +15,7 @@ export function FileChips() {
     <div className="file-chips">
       {droppedFiles.map((f) => (
         <span className="chip" key={f.path} title={f.path}>
-          <span>{f.is_dir ? '📁' : '📄'}</span>
+          <span>{f.is_dir ? <FolderIcon /> : <DocumentIcon />}</span>
           <span className="chip-name">{f.name}</span>
           {f.is_dir && (
             <button

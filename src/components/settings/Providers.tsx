@@ -1,26 +1,46 @@
 import { useEffect, useState } from 'react';
 import { ipc } from '@/lib/ipc';
+import { Modal } from '@/components/shared/Modal';
 import type {
   NetworkTier,
   OllamaModel,
+  OpenRouterCredits,
   ProviderProfile,
   ProviderType,
   ProviderView,
 } from '@/lib/types';
-import { trustBadge } from '@/lib/provider_trust';
+import { TrustBadge } from '@/lib/provider_trust';
 import {
   ANTHROPIC_CONTEXT_TABLE,
   CUSTOM_OPENAI_CONTEXT_TABLE,
   lookupContextLength,
 } from '@/lib/context_length_table';
+import { LockIcon } from '@/components/icons/LockIcon';
+import { GlobeIcon } from '@/components/icons/GlobeIcon';
+import { DEFAULT_URL } from '@/lib/provider_defaults';
 
-const DEFAULT_URL: Record<ProviderType, string> = {
-  ollama: 'http://localhost:11434',
-  openrouter: 'https://openrouter.ai/api/v1',
-  anthropic: 'https://api.anthropic.com',
-  openai: 'https://api.openai.com/v1',
-  custom_openai: '',
-};
+/** One-click quick-start presets for NPU/hybrid-NPU+GPU local inference —
+    both are just `custom_openai` profiles pointed at a well-known local
+    server, since Kitty's `custom_openai` type already handles the whole
+    request/env/trust/network-tier path generically (no backend changes
+    needed). Ports are the best-documented current defaults, but both
+    projects have shipped different defaults across versions (Foundry
+    Local: 5272 vs an older 5273; Lemonade: 13305 vs an older 8000) — the
+    help text below says so rather than presenting false confidence. */
+const LOCAL_NPU_PRESETS: { label: string; name: string; baseUrl: string; note: string }[] = [
+  {
+    label: 'Foundry Local',
+    name: 'Foundry Local',
+    baseUrl: 'http://localhost:5272/v1',
+    note: "Microsoft's vendor-neutral local server — auto-detects AMD/Intel/Qualcomm NPU, GPU, or CPU. Install: winget install Microsoft.FoundryLocal. If this port doesn't connect, run `foundry service status` to find the real one.",
+  },
+  {
+    label: 'Lemonade Server (AMD)',
+    name: 'Lemonade Server',
+    baseUrl: 'http://localhost:13305/api/v1',
+    note: "AMD's own local server — purpose-built NPU+GPU hybrid scheduling on Ryzen AI (XDNA), may outperform a generic execution-provider abstraction on that hardware specifically. If this port doesn't connect, check Lemonade's own settings for the port your installed version uses.",
+  },
+];
 
 // Context-length detents (item 28): not linearly spaced, so the slider indexes
 // into this array rather than mapping its position directly to a value. When
@@ -101,6 +121,7 @@ const blank = (): ProviderProfile => ({
   context_length: null,
   strip_reasoning: false,
   system_prompt: null,
+  prompt_idle_timeout_secs: null,
   created_at: '',
 });
 
@@ -111,6 +132,18 @@ export function Providers({ highlight }: { highlight: string | null }) {
   const [confirmUntrusted, setConfirmUntrusted] = useState(false);
   const [handoffFor, setHandoffFor] = useState<ProviderView | null>(null);
   const [error, setError] = useState('');
+  const [credits, setCredits] = useState<
+    Record<
+      string,
+      | { status: 'loading' }
+      | { status: 'error'; message: string }
+      | { status: 'ok'; data: OpenRouterCredits }
+    >
+  >({});
+  // Whether local inference is opted into at all (wizard redesign) — hides
+  // the Ollama option from the type picker when the user picked the
+  // API-key path and hasn't re-enabled it from Advanced.
+  const [ollamaEnabled, setOllamaEnabled] = useState(true);
 
   const refresh = () =>
     ipc
@@ -118,6 +151,19 @@ export function Providers({ highlight }: { highlight: string | null }) {
       .then(setProviders)
       .catch((e) => setError(String(e)));
   useEffect(() => void refresh(), []);
+  useEffect(() => {
+    void ipc.getConfig().then((c) => setOllamaEnabled(c.ollama_enabled));
+  }, []);
+
+  const checkCredits = async (id: string) => {
+    setCredits((prev) => ({ ...prev, [id]: { status: 'loading' } }));
+    try {
+      const data = await ipc.openrouterCredits(id);
+      setCredits((prev) => ({ ...prev, [id]: { status: 'ok', data } }));
+    } catch (e) {
+      setCredits((prev) => ({ ...prev, [id]: { status: 'error', message: String(e) } }));
+    }
+  };
 
   const startNew = () => {
     setEditing(blank());
@@ -203,13 +249,52 @@ export function Providers({ highlight }: { highlight: string | null }) {
             <div>
               <div className="provider-name">
                 {p.name || p.provider_type}{' '}
-                <span className="status-badge">{trustBadge(p.network_tier, p.is_trusted)}</span>
+                <span className="status-badge">
+                  <TrustBadge tier={p.network_tier} isTrusted={p.is_trusted} />
+                </span>
                 {p.active && <span className="status-badge">active</span>}
               </div>
               <div className="muted" style={{ fontSize: 12 }}>
                 {p.provider_type} · {p.base_url}
                 {p.has_secret ? ' · 🔑 key stored' : ''}
               </div>
+              {p.provider_type === 'openrouter' && p.has_secret && (
+                <div className="muted" style={{ fontSize: 12 }}>
+                  {!credits[p.id] && (
+                    <button className="link" onClick={() => void checkCredits(p.id)}>
+                      Check credits
+                    </button>
+                  )}
+                  {credits[p.id]?.status === 'loading' && 'Checking…'}
+                  {credits[p.id]?.status === 'error' && (
+                    <>
+                      {(credits[p.id] as { status: 'error'; message: string }).message}{' '}
+                      <button className="link" onClick={() => void checkCredits(p.id)}>
+                        Retry
+                      </button>
+                    </>
+                  )}
+                  {credits[p.id]?.status === 'ok' &&
+                    (() => {
+                      const d = (credits[p.id] as { status: 'ok'; data: OpenRouterCredits }).data;
+                      const remaining =
+                        d.limit_remaining != null
+                          ? `$${d.limit_remaining.toFixed(2)} remaining`
+                          : d.is_free_tier
+                            ? 'Free tier'
+                            : 'No spend limit set';
+                      return (
+                        <>
+                          {remaining} · ${d.usage.toFixed(2)} used
+                          {d.limit != null ? ` of $${d.limit.toFixed(2)}` : ''}{' '}
+                          <button className="link" onClick={() => void checkCredits(p.id)}>
+                            Refresh
+                          </button>
+                        </>
+                      );
+                    })()}
+                </div>
+              )}
             </div>
             <div className="row">
               {!p.active && <button onClick={() => void onActivate(p)}>Activate</button>}
@@ -242,6 +327,7 @@ export function Providers({ highlight }: { highlight: string | null }) {
         <ProviderForm
           profile={editing}
           secret={secret}
+          ollamaEnabled={ollamaEnabled}
           onChange={setEditing}
           onSecret={setSecret}
           onCancel={() => setEditing(null)}
@@ -295,6 +381,7 @@ function hostOf(url: string): string {
 function ProviderForm({
   profile,
   secret,
+  ollamaEnabled,
   onChange,
   onSecret,
   onCancel,
@@ -302,6 +389,7 @@ function ProviderForm({
 }: {
   profile: ProviderProfile;
   secret: string;
+  ollamaEnabled: boolean;
   onChange: (p: ProviderProfile) => void;
   onSecret: (s: string) => void;
   onCancel: () => void;
@@ -341,6 +429,7 @@ function ProviderForm({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [profile.provider_type, modelsKey]);
   const detents = detentsFor(suggested);
+  const [advancedOpen, setAdvancedOpen] = useState(false);
 
   return (
     <Modal title={profile.id ? 'Edit provider' : 'Add provider'}>
@@ -357,17 +446,41 @@ function ProviderForm({
             set({ provider_type: pt, base_url: DEFAULT_URL[pt] });
           }}
         >
-          <option value="ollama">Ollama (local)</option>
+          {ollamaEnabled && <option value="ollama">Ollama (local)</option>}
           <option value="openrouter">OpenRouter</option>
           <option value="anthropic">Anthropic</option>
           <option value="openai">OpenAI</option>
           <option value="custom_openai">Custom (OpenAI-compatible)</option>
         </select>
       </label>
+      <div className="field">
+        <span>Or quick-start a local NPU/hybrid-inference server</span>
+        <div className="row">
+          {LOCAL_NPU_PRESETS.map((preset) => (
+            <button
+              key={preset.label}
+              type="button"
+              title={preset.note}
+              onClick={() =>
+                set({ provider_type: 'custom_openai', base_url: preset.baseUrl, name: preset.name })
+              }
+            >
+              {preset.label}
+            </button>
+          ))}
+        </div>
+        <small className="muted">
+          Both fill in a `custom_openai` profile — no separate provider type needed. Ports vary by
+          installed version; hover a button for the exact caveat, and check the server's own
+          status/settings if the preset URL doesn't connect.
+        </small>
+      </div>
       <label className="field">
         <span>Base URL</span>
         <input value={profile.base_url} onChange={(e) => set({ base_url: e.target.value })} />
-        <small className="muted">{trustBadge(tierOf(profile.base_url), profile.is_trusted)}</small>
+        <small className="muted trust-note">
+          <TrustBadge tier={tierOf(profile.base_url)} isTrusted={profile.is_trusted} />
+        </small>
       </label>
 
       {ollamaLocal ? (
@@ -413,100 +526,146 @@ function ProviderForm({
         </label>
       )}
 
-      {!local && (
-        <label className="check">
-          <input
-            type="checkbox"
-            checked={profile.is_trusted}
-            onChange={(e) => set({ is_trusted: e.target.checked })}
-          />
-          <span>I trust this provider (🌐 — skips the untrusted-provider warning)</span>
-        </label>
+      {local && (
+        <p className="muted trust-note">
+          <LockIcon /> Local provider — always trusted.
+        </p>
       )}
-      {local && <p className="muted">🔒 Local provider — always trusted.</p>}
 
-      <label className="check">
-        <input
-          type="checkbox"
-          checked={profile.strip_reasoning}
-          onChange={(e) => set({ strip_reasoning: e.target.checked })}
-        />
-        <span>
-          Strip reasoning from context sent on later turns (recommended for Gemma4-style local
-          reasoning models; chat-only providers only)
-        </span>
-      </label>
+      <button
+        type="button"
+        className="disclosure-toggle"
+        onClick={() => setAdvancedOpen((o) => !o)}
+      >
+        {advancedOpen ? '▾' : '▸'} Advanced
+      </button>
+      {/* Explicit conditional render, not native <details> collapse — this
+          WebView2/Chromium build doesn't actually hide non-open <details>
+          content (confirmed live: even a bare, class-free <details> child
+          stays visible while closed), so visibility can't be left to CSS. */}
+      {advancedOpen && (
+        <div className="provider-advanced-body">
+          {!local && (
+            <label className="check">
+              <input
+                type="checkbox"
+                checked={profile.is_trusted}
+                onChange={(e) => set({ is_trusted: e.target.checked })}
+              />
+              <span>
+                I trust this provider (<GlobeIcon /> skips the untrusted-provider warning)
+              </span>
+            </label>
+          )}
 
-      <label className="field">
-        <span>Custom system prompt (optional — overrides the built-in agentic/chat default)</span>
-        <textarea
-          rows={4}
-          value={profile.system_prompt ?? ''}
-          placeholder="Default: a built-in prompt matching the session's current chat/agent mode…"
-          onChange={(e) => set({ system_prompt: e.target.value || null })}
-        />
-        <small className="muted">
-          Sent as a hidden preamble on the first message of each new session — not visible in the
-          chat bubble.
-        </small>
-      </label>
-
-      {/* Per-provider sampling params (items 27/28), vertical stack so nothing overlaps. */}
-      <div className="field param-slider">
-        <label className="check">
-          <input
-            type="checkbox"
-            checked={profile.temperature != null}
-            onChange={(e) => set({ temperature: e.target.checked ? 0.7 : null })}
-          />
-          <span>Override temperature</span>
-        </label>
-        {profile.temperature != null && (
-          <div className="row">
+          <label className="check">
             <input
-              type="range"
-              min={0}
-              max={2}
-              step={0.1}
-              value={profile.temperature}
-              onChange={(e) => set({ temperature: Number(e.target.value) })}
+              type="checkbox"
+              checked={profile.strip_reasoning}
+              onChange={(e) => set({ strip_reasoning: e.target.checked })}
             />
-            <span className="status-badge">{profile.temperature.toFixed(1)}</span>
-          </div>
-        )}
-      </div>
+            <span>
+              Strip reasoning from context sent on later turns (recommended for Gemma4-style local
+              reasoning models; chat-only providers only)
+            </span>
+          </label>
 
-      <div className="field param-slider">
-        <label className="check">
-          <input
-            type="checkbox"
-            checked={profile.context_length != null}
-            onChange={(e) => set({ context_length: e.target.checked ? 8192 : null })}
-          />
-          <span>Override context length</span>
-        </label>
-        {profile.context_length != null && (
-          <div className="row">
-            <input
-              type="range"
-              min={0}
-              max={detents.length - 1}
-              step={1}
-              value={nearestCtxIndex(detents, profile.context_length)}
-              onChange={(e) => set({ context_length: detents[Number(e.target.value)] })}
+          <label className="field">
+            <span>
+              Custom system prompt (optional — overrides the built-in agentic/chat default)
+            </span>
+            <textarea
+              rows={4}
+              value={profile.system_prompt ?? ''}
+              placeholder="Default: a built-in prompt matching the session's current chat/agent mode…"
+              onChange={(e) => set({ system_prompt: e.target.value || null })}
             />
-            <span className="status-badge">{ctxLabel(profile.context_length)}</span>
+            <small className="muted">
+              Sent as a hidden preamble on the first message of each new session — not visible in
+              the chat bubble.
+            </small>
+          </label>
+
+          <label className="field">
+            <span>Response timeout (seconds, optional — default 300)</span>
+            <input
+              type="number"
+              min={30}
+              step={30}
+              value={profile.prompt_idle_timeout_secs ?? ''}
+              placeholder="300"
+              onChange={(e) =>
+                set({
+                  prompt_idle_timeout_secs: e.target.value ? Number(e.target.value) : null,
+                })
+              }
+            />
+            <small className="muted">
+              How long Kitty waits for this provider to respond (or keep streaming) before giving
+              up. Raise this for a model that legitimately has long gaps between updates (e.g. a
+              slow Tailscale-hosted host); lower it if a long silence there usually means it&rsquo;s
+              stuck.
+            </small>
+          </label>
+
+          {/* Per-provider sampling params (items 27/28), vertical stack so nothing overlaps. */}
+          <div className="field param-slider">
+            <label className="check">
+              <input
+                type="checkbox"
+                checked={profile.temperature != null}
+                onChange={(e) => set({ temperature: e.target.checked ? 0.7 : null })}
+              />
+              <span>Override temperature</span>
+            </label>
+            {profile.temperature != null && (
+              <div className="row">
+                <input
+                  type="range"
+                  min={0}
+                  max={2}
+                  step={0.1}
+                  value={profile.temperature}
+                  onChange={(e) => set({ temperature: Number(e.target.value) })}
+                />
+                <span className="status-badge">{profile.temperature.toFixed(1)}</span>
+              </div>
+            )}
           </div>
-        )}
-        {suggested != null && suggested !== profile.context_length && (
-          <div className="row">
-            <small className="muted">Detected context: {ctxLabel(suggested)}</small>
-            <button className="link" onClick={() => set({ context_length: suggested })}>
-              Use this
-            </button>
+
+          <div className="field param-slider">
+            <label className="check">
+              <input
+                type="checkbox"
+                checked={profile.context_length != null}
+                onChange={(e) => set({ context_length: e.target.checked ? 8192 : null })}
+              />
+              <span>Override context length</span>
+            </label>
+            {profile.context_length != null && (
+              <div className="row">
+                <input
+                  type="range"
+                  min={0}
+                  max={detents.length - 1}
+                  step={1}
+                  value={nearestCtxIndex(detents, profile.context_length)}
+                  onChange={(e) => set({ context_length: detents[Number(e.target.value)] })}
+                />
+                <span className="status-badge">{ctxLabel(profile.context_length)}</span>
+              </div>
+            )}
+            {suggested != null && suggested !== profile.context_length && (
+              <div className="row">
+                <small className="muted">Detected context: {ctxLabel(suggested)}</small>
+                <button className="link" onClick={() => set({ context_length: suggested })}>
+                  Use this
+                </button>
+              </div>
+            )}
           </div>
-        )}
-      </div>
+        </div>
+      )}
 
       <div className="row">
         <button className="primary" onClick={onSave}>
@@ -515,16 +674,5 @@ function ProviderForm({
         <button onClick={onCancel}>Cancel</button>
       </div>
     </Modal>
-  );
-}
-
-function Modal({ title, children }: { title: string; children: React.ReactNode }) {
-  return (
-    <div className="modal-backdrop">
-      <div className="modal">
-        <h2>{title}</h2>
-        {children}
-      </div>
-    </div>
   );
 }

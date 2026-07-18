@@ -1,9 +1,14 @@
 import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
 import { UNCATEGORIZED, useSessionStore, type SessionGroup } from '@/stores/sessionStore';
 import { useChatStore } from '@/stores/chatStore';
-import { onSessionCreated, onFoldersChanged } from '@/lib/ipc';
+import { onSessionCreated, onSessionDeleted, onFoldersChanged, onSessionsCleared } from '@/lib/ipc';
 import { SessionKebabMenu } from './SessionKebabMenu';
 import type { SessionSummary } from '@/lib/types';
+import { FolderIcon } from '@/components/icons/FolderIcon';
+import { RefreshIcon } from '@/components/icons/RefreshIcon';
+import { PencilIcon } from '@/components/icons/PencilIcon';
+import { TrashIcon } from '@/components/icons/TrashIcon';
+import { Modal } from '@/components/shared/Modal';
 
 const DRAG_THRESHOLD_PX = 6;
 
@@ -59,6 +64,14 @@ export function SessionList() {
   }, [refresh]);
 
   useEffect(() => {
+    // A session deleted in the *other* window (e.g. regenerate()'s background
+    // cleanup of the session it forked away from) otherwise leaves a stale
+    // entry here until a manual refresh.
+    const un = onSessionDeleted(() => void refresh());
+    return () => void un.then((fn) => fn());
+  }, [refresh]);
+
+  useEffect(() => {
     // Round-5: a folder created/renamed/deleted or a session reassigned in the
     // *other* window otherwise doesn't reach this sidebar until reload. Only
     // the folder mapping changed, so refresh that (not the whole session list).
@@ -67,27 +80,55 @@ export function SessionList() {
   }, [refreshFolders]);
 
   useEffect(() => {
+    // "Clear all chat history" (Settings → General) run from any window —
+    // this sidebar must empty without a manual refresh.
+    const un = onSessionsCleared(() => void refresh());
+    return () => void un.then((fn) => fn());
+  }, [refresh]);
+
+  useEffect(() => {
     const setOverFolder = (v: string | null) => {
       dragOverFolderRef.current = v;
       setDragOverFolder(v);
     };
 
-    const onMove = (e: PointerEvent) => {
+    // `pointermove` fires 60+×/sec during a drag; `elementFromPoint` forces a
+    // hit-test and each call re-renders via `setDragOverFolder`. Coalescing
+    // into a single rAF caps that to once per frame instead of once per
+    // event, so a long session list no longer rubber-bands while dragging.
+    let raf: number | null = null;
+    let pending: { x: number; y: number } | null = null;
+
+    const processMove = () => {
+      raf = null;
+      const pos = pending;
+      pending = null;
+      if (!pos) return;
       const st = dragState.current;
       if (!st) return;
       if (!st.dragging) {
-        const dx = e.clientX - st.startX;
-        const dy = e.clientY - st.startY;
+        const dx = pos.x - st.startX;
+        const dy = pos.y - st.startY;
         if (Math.hypot(dx, dy) < DRAG_THRESHOLD_PX) return;
         st.dragging = true;
         setDragId(st.sessionId);
       }
-      const el = document.elementFromPoint(e.clientX, e.clientY);
+      const el = document.elementFromPoint(pos.x, pos.y);
       const head = el?.closest<HTMLElement>('[data-folder-target]');
       setOverFolder(head?.dataset.folderTarget ?? null);
     };
 
+    const onMove = (e: PointerEvent) => {
+      if (!dragState.current) return;
+      pending = { x: e.clientX, y: e.clientY };
+      if (raf == null) raf = requestAnimationFrame(processMove);
+    };
+
     const onUp = () => {
+      if (raf != null) {
+        cancelAnimationFrame(raf);
+        raf = null;
+      }
       const st = dragState.current;
       dragState.current = null;
       if (st?.dragging && dragOverFolderRef.current != null) {
@@ -101,6 +142,7 @@ export function SessionList() {
     window.addEventListener('pointermove', onMove);
     window.addEventListener('pointerup', onUp);
     return () => {
+      if (raf != null) cancelAnimationFrame(raf);
       window.removeEventListener('pointermove', onMove);
       window.removeEventListener('pointerup', onUp);
     };
@@ -113,6 +155,15 @@ export function SessionList() {
   const groups = grouped();
   const total = groups.reduce((n, g) => n + g.sessions.length, 0);
 
+  const [creatingFolder, setCreatingFolder] = useState(false);
+  const [newFolderName, setNewFolderName] = useState('');
+
+  const submitNewFolder = () => {
+    const name = newFolderName.trim();
+    if (name) void createFolder(name);
+    setCreatingFolder(false);
+  };
+
   return (
     <aside className="session-list">
       <div className="session-search">
@@ -122,7 +173,7 @@ export function SessionList() {
           onChange={(e) => setQuery(e.target.value)}
         />
         <button title="Refresh" onClick={() => void refresh()}>
-          ⟳
+          <RefreshIcon />
         </button>
       </div>
       <div className="session-toolbar">
@@ -132,8 +183,8 @@ export function SessionList() {
         <button
           className="link"
           onClick={() => {
-            const name = prompt('New folder name:')?.trim();
-            if (name) void createFolder(name);
+            setNewFolderName('');
+            setCreatingFolder(true);
           }}
         >
           ＋ Folder
@@ -156,6 +207,31 @@ export function SessionList() {
           onStartDrag={startDrag}
         />
       ))}
+
+      {creatingFolder && (
+        <Modal title="New folder">
+          <label className="field">
+            <span>Folder name</span>
+            <input
+              autoFocus
+              value={newFolderName}
+              onChange={(e) => setNewFolderName(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault();
+                  submitNewFolder();
+                }
+              }}
+            />
+          </label>
+          <div className="row">
+            <button className="primary" onClick={submitNewFolder}>
+              Create
+            </button>
+            <button onClick={() => setCreatingFolder(false)}>Cancel</button>
+          </div>
+        </Modal>
+      )}
     </aside>
   );
 }
@@ -178,18 +254,40 @@ function FolderGroup({
   const { renameFolder, deleteFolder } = useSessionStore();
   const isReal = group.folder !== UNCATEGORIZED;
   const folderTarget = isReal ? group.folder : '';
+  // Defaults open, matching the previous always-open behavior.
+  const [open, setOpen] = useState(true);
+  const [renaming, setRenaming] = useState(false);
+  const [renameValue, setRenameValue] = useState(group.folder);
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
+
+  const submitRename = () => {
+    const next = renameValue.trim();
+    if (next && next !== group.folder) void renameFolder(group.folder, next);
+    setRenaming(false);
+  };
+
   // Hide an empty Uncategorized bucket only when real folders exist (keeps the
   // list clean); always show real folders even when empty so they're targetable.
   if (!isReal && group.sessions.length === 0 && folders.length > 0) return null;
 
   return (
-    <details className="folder-group" open>
-      <summary
+    <div className="folder-group">
+      <div
         className={`folder-head${dragOverFolder === folderTarget && dragId ? ' folder-head-dragover' : ''}`}
         data-folder-target={folderTarget}
+        role="button"
+        tabIndex={0}
+        onClick={() => setOpen((o) => !o)}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            setOpen((o) => !o);
+          }
+        }}
       >
+        <span className="folder-chevron">{open ? '▾' : '▸'}</span>
         <span className="folder-name">
-          {isReal ? '📁' : '🗂'} {group.folder}
+          <FolderIcon variant={isReal ? 'folder' : 'tray'} /> {group.folder}
         </span>
         <span className="folder-count muted">{group.sessions.length}</span>
         {isReal && (
@@ -197,39 +295,90 @@ function FolderGroup({
             <button
               title="Rename folder"
               onClick={(e) => {
-                e.preventDefault();
-                const next = prompt('Rename folder:', group.folder)?.trim();
-                if (next && next !== group.folder) void renameFolder(group.folder, next);
+                e.stopPropagation();
+                setRenameValue(group.folder);
+                setRenaming(true);
               }}
             >
-              ✎
+              <PencilIcon />
             </button>
             <button
               title="Delete folder (sessions move to Uncategorized)"
               onClick={(e) => {
-                e.preventDefault();
-                if (confirm(`Delete folder "${group.folder}"? Its chats become Uncategorized.`)) {
-                  void deleteFolder(group.folder);
-                }
+                e.stopPropagation();
+                setConfirmingDelete(true);
               }}
             >
-              🗑
+              <TrashIcon />
             </button>
           </span>
         )}
-      </summary>
-      {group.sessions.length === 0 && <p className="muted folder-empty">Empty</p>}
-      {group.sessions.map((s) => (
-        <SessionRow
-          key={s.sessionId}
-          session={s}
-          folders={folders}
-          active={s.sessionId === activeId}
-          dragging={s.sessionId === dragId}
-          onStartDrag={onStartDrag}
-        />
-      ))}
-    </details>
+      </div>
+      {/* Explicit conditional render, not native <details> collapse — this
+          WebView2/Chromium build doesn't actually hide non-open <details>
+          content even when `open` is false (confirmed live via CDP), so
+          visibility can't be left to native collapse + CSS. Same finding as
+          Providers.tsx/AdaptivePathway.tsx/Advanced.tsx. */}
+      {open && (
+        <>
+          {group.sessions.length === 0 && <p className="muted folder-empty">Empty</p>}
+          {group.sessions.map((s) => (
+            <SessionRow
+              key={s.sessionId}
+              session={s}
+              folders={folders}
+              active={s.sessionId === activeId}
+              dragging={s.sessionId === dragId}
+              onStartDrag={onStartDrag}
+            />
+          ))}
+        </>
+      )}
+
+      {renaming && (
+        <Modal title="Rename folder">
+          <label className="field">
+            <span>Folder name</span>
+            <input
+              autoFocus
+              value={renameValue}
+              onChange={(e) => setRenameValue(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault();
+                  submitRename();
+                }
+              }}
+            />
+          </label>
+          <div className="row">
+            <button className="primary" onClick={submitRename}>
+              Rename
+            </button>
+            <button onClick={() => setRenaming(false)}>Cancel</button>
+          </div>
+        </Modal>
+      )}
+      {confirmingDelete && (
+        <Modal title="Delete this folder?">
+          <p>
+            Delete folder &quot;{group.folder}&quot;? Its chats become {UNCATEGORIZED}.
+          </p>
+          <div className="row">
+            <button
+              className="primary"
+              onClick={() => {
+                void deleteFolder(group.folder);
+                setConfirmingDelete(false);
+              }}
+            >
+              Delete
+            </button>
+            <button onClick={() => setConfirmingDelete(false)}>Cancel</button>
+          </div>
+        </Modal>
+      )}
+    </div>
   );
 }
 
@@ -249,6 +398,7 @@ function SessionRow({
   const { remove, assignments } = useSessionStore();
   const loadSession = useChatStore((st) => st.loadSession);
   const current = assignments[s.sessionId] ?? '';
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
   // Set once this row's `dragging` prop goes true (past the movement
   // threshold in the parent); suppresses the subsequent click so a completed
   // drag doesn't also resume the session. Reset on every new pointer-down.
@@ -262,7 +412,7 @@ function SessionRow({
       className={`session-item${active ? ' active' : ''}${dragging ? ' dragging' : ''}`}
       onClick={() => {
         if (didDrag.current) return;
-        void loadSession(s.sessionId, s.cwd, s.title);
+        void loadSession(s.sessionId, s.cwd, s.title, s.providerId, s.modelId);
       }}
       onPointerDown={(e) => {
         if ((e.target as HTMLElement).closest('.session-kebab, .mode-popover')) return;
@@ -282,13 +432,26 @@ function SessionRow({
           sessionId={s.sessionId}
           folders={folders}
           current={current}
-          onDelete={() => {
-            if (confirm(`Delete "${s.title}"? This cannot be undone.`)) {
-              void remove(s.sessionId);
-            }
-          }}
+          onDelete={() => setConfirmingDelete(true)}
         />
       </div>
+      {confirmingDelete && (
+        <Modal title="Delete this chat?">
+          <p>Delete &quot;{s.title}&quot;? This cannot be undone.</p>
+          <div className="row">
+            <button
+              className="primary"
+              onClick={() => {
+                void remove(s.sessionId);
+                setConfirmingDelete(false);
+              }}
+            >
+              Delete
+            </button>
+            <button onClick={() => setConfirmingDelete(false)}>Cancel</button>
+          </div>
+        </Modal>
+      )}
     </div>
   );
 }

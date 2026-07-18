@@ -32,3 +32,11 @@ pub fn add_extension(
 ) -> Result<(), String> {
     goose_config::add_custom_extension_default(&name, &command, &args, &env)
 }
+
+/// Set one literal env value on an already-registered extension's `envs:`
+/// map — for non-secret values only (see `goose_config::set_extension_env`).
+/// A no-op if the extension isn't registered yet.
+#[tauri::command]
+pub fn set_extension_env(id: String, key: String, value: String) -> Result<(), String> {
+    goose_config::set_extension_env(&id, &key, &value)
+}

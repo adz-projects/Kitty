@@ -37,8 +37,7 @@ pub fn set_config(
     let _ = app.emit("theme://changed", ());
 
     if hotkey_changed {
-        if let Err(e) =
-            hotkey::register(&app, &config.hotkeys, config.clipboard_hotkey.as_deref())
+        if let Err(e) = hotkey::register(&app, &config.hotkeys, config.clipboard_hotkey.as_deref())
         {
             tracing::error!("re-register hotkey failed: {e}");
             return Err("Saved, but a new hotkey could not be registered.".into());

@@ -1,14 +1,25 @@
-import { memo, type ReactNode } from 'react';
+import { memo, useState, type ReactNode } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
 import 'highlight.js/styles/github.css';
-import { useChatStore, type Message } from '@/stores/chatStore';
+import {
+  findHintToolCall,
+  parseHintOutput,
+  stripPromptPreamble,
+  useChatStore,
+  type Message,
+} from '@/stores/chatStore';
 import { ThinkingBox } from './ThinkingBox';
+import { PreviousAttemptBox } from './PreviousAttemptBox';
 import { CodeBlock } from './CodeBlock';
 import { MessageInfo } from './MessageInfo';
 import { MessageAttachmentChips } from './MessageAttachmentChips';
+import { HintBadge } from './HintBadge';
+import { HintFeedbackButtons } from './HintFeedbackButtons';
+import { NudgeConsentPrompt } from './NudgeConsentPrompt';
 import { ipc } from '@/lib/ipc';
+import { useHintFeedbackDiscoverable } from '@/lib/hintFeedbackDiscoverability';
 
 /** Open markdown links with the OS default handler instead of navigating the
     Kitty window itself — Tauri's webview otherwise treats a bare `<a href>`
@@ -51,29 +62,66 @@ export const MessageItem = memo(function MessageItem({
   const branch = useChatStore((s) => s.branch);
   const regenerate = useChatStore((s) => s.regenerate);
   const exportSession = useChatStore((s) => s.exportSession);
+  const sessionId = useChatStore((s) => s.sessionId);
+  const hasHint = !!parseHintOutput(findHintToolCall(message));
+  const hintDiscoverable = useHintFeedbackDiscoverable(hasHint);
+
+  // Branch/Regenerate/Export each fire a round-trip to goosed (fork/prompt/
+  // export). Latch while one is running so a double-click can't fork twice or
+  // queue a duplicate prompt — the buttons visibly disable until it settles.
+  const [busy, setBusy] = useState(false);
+  const runOnce = (fn: () => Promise<unknown>) => () => {
+    if (busy) return;
+    setBusy(true);
+    void Promise.resolve(fn()).finally(() => setBusy(false));
+  };
+
+  /** Copying a response is an implicit "this was worth keeping" signal —
+      same annotation type/plumbing as HintFeedbackButtons' explicit 👍
+      (`micro_positive`, routed to the message's first hint's edge exactly
+      like that component), just triggered by the existing Copy action
+      instead of a dedicated click. Lower intensity than the explicit 👍
+      (0.6 vs 0.8) since this is inferred, not a deliberate feedback click.
+      No-ops when the message has no `decide` hint to attribute it to. */
+  const copyMessage = () => {
+    void navigator.clipboard.writeText(message.text);
+    if (!sessionId) return;
+    const parsed = parseHintOutput(findHintToolCall(message));
+    const edgeId = parsed?.hints[0]?.edge_id;
+    if (edgeId) {
+      void ipc.adaptivePathwayRecordAnnotation(sessionId, 'micro_positive', edgeId, null, 0.6);
+    }
+  };
 
   const actions = (
-    <div className="msg-actions">
-      <button title="Branch a new session from here" onClick={() => void branch(index)}>
+    <div className={`msg-actions${hintDiscoverable ? ' msg-actions-discoverable' : ''}`}>
+      <button
+        title="Branch a new session from here"
+        disabled={busy}
+        onClick={runOnce(() => branch(index))}
+      >
         Branch
       </button>
       <button
         title="Export the conversation up to here as ChatML"
-        onClick={() => void exportSession(index)}
+        disabled={busy}
+        onClick={runOnce(() => exportSession(index))}
       >
         Export from here
       </button>
       {message.role === 'assistant' && (
         <>
-          <button title="Regenerate this response" onClick={() => void regenerate(index)}>
+          <button
+            title="Regenerate this response"
+            disabled={busy}
+            onClick={runOnce(() => regenerate(index))}
+          >
             Regenerate
           </button>
-          <button
-            title="Copy as Markdown"
-            onClick={() => void navigator.clipboard.writeText(message.text)}
-          >
+          <button title="Copy as Markdown" onClick={copyMessage}>
             Copy
           </button>
+          <HintFeedbackButtons message={message} />
           <MessageInfo message={message} />
         </>
       )}
@@ -81,11 +129,28 @@ export const MessageItem = memo(function MessageItem({
   );
 
   if (message.role === 'user') {
+    // Defensive: the live-typed bubble and the replay path both already keep
+    // this clean (see chatStore.ts's stripPromptPreamble), but stripping
+    // again here at the single render chokepoint costs nothing on already-
+    // clean text (the wrapper regexes simply won't match) and guarantees the
+    // raw <system>/transcript preamble can never surface in the chat, no
+    // matter which code path a message's text came from.
+    const displayText = index === 0 ? stripPromptPreamble(message.text) : message.text;
     return (
       <div className="msg msg-user">
-        <div className="bubble">{message.text}</div>
+        <div className="bubble">{displayText}</div>
         <MessageAttachmentChips files={message.attachedFiles} />
         {actions}
+      </div>
+    );
+  }
+
+  if (message.superseded) {
+    // A regenerated-away-from answer: collapsed, no actions — regenerating,
+    // branching, etc. don't make sense against a superseded turn.
+    return (
+      <div className="msg msg-assistant">
+        <PreviousAttemptBox message={message} />
       </div>
     );
   }
@@ -111,6 +176,8 @@ export const MessageItem = memo(function MessageItem({
           </ReactMarkdown>
         </div>
       )}
+      <HintBadge message={message} />
+      <NudgeConsentPrompt message={message} />
       {actions}
     </div>
   );

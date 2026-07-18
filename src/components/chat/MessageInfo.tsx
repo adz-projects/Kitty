@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import type { Message } from '@/stores/chatStore';
+import { usePopoverPosition } from '@/lib/usePopoverPosition';
 
 /** Hover-revealed info button (Round-4) for an assistant message: model,
     provider, tokens, and generation time. The values are captured once, at
@@ -12,6 +13,7 @@ import type { Message } from '@/stores/chatStore';
     renders nothing for them — expected, not a bug. */
 export function MessageInfo({ message }: { message: Message }) {
   const [open, setOpen] = useState(false);
+  const { triggerRef, popoverRef, style } = usePopoverPosition(open, () => setOpen(false));
   const hasData =
     message.model != null ||
     message.providerName != null ||
@@ -22,6 +24,7 @@ export function MessageInfo({ message }: { message: Message }) {
   return (
     <div style={{ position: 'relative', display: 'inline-block' }}>
       <button
+        ref={triggerRef as React.Ref<HTMLButtonElement>}
         title="Generation info"
         aria-label="Generation info"
         aria-expanded={open}
@@ -30,7 +33,12 @@ export function MessageInfo({ message }: { message: Message }) {
         ⓘ
       </button>
       {open && (
-        <div className="mode-popover msg-info-popover" role="tooltip">
+        <div
+          ref={popoverRef}
+          className="mode-popover msg-info-popover"
+          role="tooltip"
+          style={style}
+        >
           {message.model && (
             <div>
               <span className="muted">Model:</span> {message.model}
