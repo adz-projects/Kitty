@@ -7,6 +7,7 @@ import { usePopoverPosition } from '@/lib/usePopoverPosition';
 /** Lightweight last-10 recent-sessions dropdown for the compact overlay. */
 export function RecentSessions() {
   const [open, setOpen] = useState(false);
+  const [resumingId, setResumingId] = useState<string | null>(null);
   const refresh = useSessionStore((s) => s.refresh);
   const sessions = useSessionStore((s) => s.sessions);
   const loadSession = useChatStore((s) => s.loadSession);
@@ -60,12 +61,18 @@ export function RecentSessions() {
               key={s.sessionId}
               role="menuitem"
               title={s.cwd}
+              disabled={resumingId != null}
               onClick={() => {
-                void loadSession(s.sessionId, s.cwd, s.title, s.providerId, s.modelId);
-                setOpen(false);
+                setResumingId(s.sessionId);
+                void loadSession(s.sessionId, s.cwd, s.title, s.providerId, s.modelId).finally(
+                  () => {
+                    setResumingId(null);
+                    setOpen(false);
+                  }
+                );
               }}
             >
-              {s.title}
+              {resumingId === s.sessionId ? 'Resuming…' : s.title}
             </button>
           ))}
         </div>

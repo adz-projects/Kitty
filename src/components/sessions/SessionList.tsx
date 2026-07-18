@@ -158,6 +158,22 @@ export function SessionList() {
   const [creatingFolder, setCreatingFolder] = useState(false);
   const [newFolderName, setNewFolderName] = useState('');
 
+  // The input's own value updates instantly (so typing feels responsive);
+  // the store's `query` — which drives the actual re-filter/re-render of
+  // the whole (potentially long) session list — only follows 150ms after
+  // the user stops typing.
+  const [searchInput, setSearchInput] = useState(query);
+  useEffect(() => setSearchInput(query), [query]);
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const onSearchChange = (value: string) => {
+    setSearchInput(value);
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    debounceRef.current = setTimeout(() => setQuery(value), 150);
+  };
+  useEffect(() => () => {
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+  }, []);
+
   const submitNewFolder = () => {
     const name = newFolderName.trim();
     if (name) void createFolder(name);
@@ -168,9 +184,9 @@ export function SessionList() {
     <aside className="session-list">
       <div className="session-search">
         <input
-          value={query}
+          value={searchInput}
           placeholder="Search chats"
-          onChange={(e) => setQuery(e.target.value)}
+          onChange={(e) => onSearchChange(e.target.value)}
         />
         <button title="Refresh" onClick={() => void refresh()}>
           <RefreshIcon />
@@ -399,6 +415,10 @@ function SessionRow({
   const loadSession = useChatStore((st) => st.loadSession);
   const current = assignments[s.sessionId] ?? '';
   const [confirmingDelete, setConfirmingDelete] = useState(false);
+  // Resuming replays the whole conversation (session/load) before this
+  // resolves — without feedback, clicking a long-history chat looked
+  // unresponsive for however long the replay took.
+  const [resuming, setResuming] = useState(false);
   // Set once this row's `dragging` prop goes true (past the movement
   // threshold in the parent); suppresses the subsequent click so a completed
   // drag doesn't also resume the session. Reset on every new pointer-down.
@@ -409,10 +429,13 @@ function SessionRow({
 
   return (
     <div
-      className={`session-item${active ? ' active' : ''}${dragging ? ' dragging' : ''}`}
+      className={`session-item${active ? ' active' : ''}${dragging ? ' dragging' : ''}${resuming ? ' resuming' : ''}`}
       onClick={() => {
-        if (didDrag.current) return;
-        void loadSession(s.sessionId, s.cwd, s.title, s.providerId, s.modelId);
+        if (didDrag.current || resuming) return;
+        setResuming(true);
+        void loadSession(s.sessionId, s.cwd, s.title, s.providerId, s.modelId).finally(() =>
+          setResuming(false)
+        );
       }}
       onPointerDown={(e) => {
         if ((e.target as HTMLElement).closest('.session-kebab, .mode-popover')) return;
@@ -424,8 +447,8 @@ function SessionRow({
     >
       <div className="session-title">{s.title}</div>
       <div className="session-meta muted">
-        {s.cwd.split(/[\\/]/).filter(Boolean).pop() ?? s.cwd}
-        {s.modelId ? ` · ${s.modelId}` : ''}
+        {resuming ? 'Resuming…' : (s.cwd.split(/[\\/]/).filter(Boolean).pop() ?? s.cwd)}
+        {!resuming && s.modelId ? ` · ${s.modelId}` : ''}
       </div>
       <div className="session-row-actions">
         <SessionKebabMenu
