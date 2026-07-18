@@ -24,7 +24,6 @@ import {
 } from '@/lib/ipc';
 import { buildExport, sanitizeFilename } from '@/lib/chatml';
 import { defaultSystemPrompt } from '@/lib/system_prompts';
-import { tryParsePyRepr } from '@/lib/pyrepr';
 import { recipeNeedsAttention, resolveRecipe, launchableExtensions } from '@/lib/recipes';
 import { supportsImages } from '@/lib/vision_models';
 import type {
@@ -32,89 +31,45 @@ import type {
   ModeInfo,
   NetworkTier,
   PathInfo,
-  ProviderType,
-  ProviderView,
   Recipe,
   SessionInfo,
   ThinkingEffort,
   ToolCallUpdate,
 } from '@/lib/types';
 
-export interface ToolCall {
-  id: string;
-  title: string;
-  status: string;
-  input?: unknown;
-  output?: unknown;
-  /** `_meta.goose.toolCall.{toolName,extensionName}` (docs/acp-protocol.md) —
-      lets the chat surface recognize a specific extension's tool call, e.g.
-      the Adaptive Pathway extension's `decide` (Round-C). */
-  toolName?: string;
-  extensionName?: string;
-}
+import { decideChatApproval, pickRejectOption } from './chat/approvalUtils';
+import {
+  buildStrippedTranscript,
+  stripPromptPreamble,
+  stripRecipeWrapper,
+} from './chat/errorUtils';
+import {
+  countToolCall,
+  exceedsReasoningCap,
+  FORCED_ANSWER_PROMPT,
+  hasRepetitionLoop,
+  splitLeakedThinkTag,
+  TOOL_LOOP_THRESHOLD,
+  type ToolCallCounts,
+} from './chat/loopGuards';
+import {
+  closeOpen,
+  deriveArtifact,
+  extractGooseToolMeta,
+  findMatchingProvider,
+  isImageFileName,
+  isStragglerAssistantMessage,
+  userFileArtifact,
+} from './chat/messageUtils';
+import { readCachedModeInfo, writeCachedModeInfo } from './chat/modeInfoCache';
+import type { Artifact, Attachment, Message, PendingImage, ToolCall } from './chat/types';
 
-export interface Message {
-  id: string;
-  role: 'user' | 'assistant';
-  text: string;
-  reasoning: string;
-  toolCalls: ToolCall[];
-  streaming: boolean;
-  /** Currently being appended to (internal to the assembly). */
-  open: boolean;
-  // Per-response metrics (Round-3 item 2) — only set on a message that just
-  // completed via a live send() in this session; replayed/resumed messages
-  // (session/load) never go through send_prompt's completion path, so they
-  // won't have these, which is expected.
-  durationMs?: number;
-  inputTokens?: number;
-  outputTokens?: number;
-  providerName?: string;
-  /** The actual model that generated this message (Round-4 info button) —
-      captured at send time, not read back from the live chat-pill state. */
-  model?: string;
-  /** Files/images attached to this turn (Round-7 fix): a snapshot taken at
-      send() time, before droppedFiles/attachments/pendingImages are cleared
-      from composer state — without this, a message with both typed text and
-      an attachment showed no trace of the attachment at all once sent. Only
-      set on a message that just completed via a live send() in this session;
-      like the metrics fields above, a replayed/resumed message won't have
-      this (goosed's stored history has no structured "what was attached"
-      metadata to reconstruct it from — a known, accepted limitation). */
-  attachedFiles?: { name: string; kind: 'file' | 'document' | 'image' }[];
-  /** Set by `regenerate()`: this assistant turn was superseded by a
-      reconsidered answer right after it, in the same session — rendered
-      collapsed (like the thinking container) instead of as a normal bubble. */
-  superseded?: boolean;
-}
-
-export interface Artifact {
-  path: string;
-  name: string;
-  tool: string;
-  /** `'tool'` (default) for goosed tool-call-derived artifacts, `'user'` for a
-      file the user attached to a message — distinguishes the two sources in
-      the UI without changing how either is opened/revealed. */
-  source?: 'user' | 'tool';
-}
-
-/** An inlined document (large paste or dropped text file) in chat-only mode. */
-export interface Attachment {
-  id: string;
-  label: string;
-  content: string;
-}
-
-/** An image attached directly (not via a dropped file path) — currently just
-    the clipboard hotkey (Round-4). Sent as a native ACP image content block
-    in both modes (Round-3 item 17's mechanism isn't agentic-only; only the
-    droppedFiles-based image extraction below happens to be, since it's about
-    file drops specifically). */
-export interface PendingImage {
-  id: string;
-  mime: string;
-  data_url: string;
-}
+export * from './chat/approvalUtils';
+export * from './chat/errorUtils';
+export * from './chat/loopGuards';
+export * from './chat/messageUtils';
+export * from './chat/modeInfoCache';
+export * from './chat/types';
 
 interface ChatState {
   sessionId: string | null;
@@ -365,41 +320,9 @@ let msgSeq = 0;
 const newId = () => `m${Date.now()}_${++msgSeq}`;
 
 // Live counts backing the chat-mode tool-loop guard (see `countToolCall`
-// above) — module-level like `stopGraceTimer`, reset at the start of every
-// fresh turn in `send()`.
+// in ./chat/loopGuards) — module-level like `stopGraceTimer`, reset at the
+// start of every fresh turn in `send()`.
 let toolLoopCounts: ToolCallCounts = new Map();
-
-// Last-known mode/effort info per provider, cached in localStorage (shared
-// across windows — same webview origin) so a *brand-new* window's very first
-// "New Chat" can show `EffortDropdown`/`ModeBadge` immediately instead of
-// waiting on the real `session/new` round trip. `newSession()`'s existing
-// same-window carry-forward (see its doc comment) only helps the 2nd+ session
-// in a window's lifetime, since there's nothing to carry forward before any
-// session has ever been created there — this cache covers that gap. A fresh
-// session on the same provider/model will almost always report the same
-// values, so this is a reasonable optimistic seed; the real response is
-// still authoritative and overwrites it the moment it lands.
-export interface CachedModeInfo {
-  mode: string;
-  availableModes: ModeInfo[];
-  thinkingEffort: ThinkingEffort | null;
-}
-export const modeInfoCacheKey = (providerId: string) => `kitty:lastModeInfo:${providerId}`;
-export function readCachedModeInfo(providerId: string): CachedModeInfo | null {
-  try {
-    const raw = localStorage.getItem(modeInfoCacheKey(providerId));
-    return raw ? (JSON.parse(raw) as CachedModeInfo) : null;
-  } catch {
-    return null;
-  }
-}
-export function writeCachedModeInfo(providerId: string, info: CachedModeInfo) {
-  try {
-    localStorage.setItem(modeInfoCacheKey(providerId), JSON.stringify(info));
-  } catch {
-    // best-effort — a full/unavailable localStorage just means no seed next time
-  }
-}
 
 // Dedupes concurrent session-creation requests (Round-7): `newSession()`
 // clears the UI optimistically before awaiting `ipc.newSession`, so a
@@ -415,515 +338,6 @@ function getOrCreateSession(cwd?: string): Promise<SessionInfo> {
     });
   }
   return pendingNewSession;
-}
-
-// A file-writing tool by name/verb. Broadened (Round-5) beyond the original
-// text_editor set to cover the write verbs other tools use.
-const ARTIFACT_RE =
-  /text_editor|write|create|edit|str_replace|insert|append|save|export|output|generate/i;
-// A recognized artifact file by extension — the second, independent signal
-// (Round-5): a tool that exposes an output path ending in one of these counts
-// as an artifact even when its name doesn't match a write verb (e.g. a
-// document/spreadsheet-producing tool). Covers the formats owners asked for
-// (csv/xlsx/docx/md/json/py) plus common neighbors.
-const ARTIFACT_EXT_RE =
-  /\.(csv|tsv|xlsx?|xlsm|docx?|pptx?|md|markdown|json|jsonl|ya?ml|py|txt|html?|xml|pdf|rtf|odt|ods|odp|ipynb|sql|toml)$/i;
-// Explicit read/inspect operations that also carry a `path` (e.g. text_editor
-// `command:"view"`) — excluded so opening/reading a file never fabricates an
-// artifact. This also fixes a latent false positive: `text_editor` matches
-// ARTIFACT_RE by name, so a plain view used to register as a (bogus) artifact.
-const READ_COMMAND_RE = /^(view|read|list|open|cat|show|inspect|search|find|glob|grep)$/i;
-
-/** Make a tool-reported output path absolute so the Artifacts pane's Open /
-    Copy path / Show-in-folder work (Round-5): goose reports a *relative* path
-    for a write (e.g. `report.docx`), resolved against the session cwd — the
-    chat folder. Without this the artifact stored just the bare filename and
-    Open failed with "file not found". Absolute inputs (drive letter, unix
-    root, UNC) are kept as-is. */
-function absoluteArtifactPath(p: string, cwd: string | null): string {
-  const isAbsolute = /^[a-z]:[\\/]/i.test(p) || p.startsWith('/') || p.startsWith('\\\\');
-  if (isAbsolute || !cwd) return p;
-  return `${cwd.replace(/[\\/]+$/, '')}/${p.replace(/^[\\/]+/, '')}`;
-}
-
-/** `_meta.goose.toolCall.{toolName,extensionName}` (docs/acp-protocol.md) —
-    shared by `deriveArtifact` and the `onToolCall` handler's `ToolCall`
-    assembly, since both need to know which tool/extension a call belongs to. */
-export function extractGooseToolMeta(u: ToolCallUpdate): {
-  toolName?: string;
-  extensionName?: string;
-} {
-  const meta = u as Record<string, unknown>;
-  const goose = (
-    meta._meta as { goose?: { toolCall?: { toolName?: string; extensionName?: string } } }
-  )?.goose;
-  return {
-    toolName: goose?.toolCall?.toolName,
-    extensionName: goose?.toolCall?.extensionName,
-  };
-}
-
-export function deriveArtifact(u: ToolCallUpdate, cwd: string | null = null): Artifact | null {
-  const toolName = extractGooseToolMeta(u).toolName ?? '';
-  const label = `${u.title ?? ''} ${toolName}`;
-  const input = u.rawInput as
-    { path?: string; file_path?: string; paths?: string[]; command?: string } | undefined;
-  const p =
-    input?.path ?? input?.file_path ?? (Array.isArray(input?.paths) ? input?.paths[0] : undefined);
-  if (typeof p !== 'string' || !p) return null;
-  // Never derive an artifact from an explicit read/view of a file.
-  if (typeof input?.command === 'string' && READ_COMMAND_RE.test(input.command)) return null;
-  // Qualify on either signal: a write-like tool name/verb, or a known artifact
-  // file extension on the output path.
-  if (!ARTIFACT_RE.test(label) && !ARTIFACT_EXT_RE.test(p)) return null;
-  return {
-    path: absoluteArtifactPath(p, cwd),
-    name: p.split(/[\\/]/).pop() || p,
-    tool: toolName || String(u.title || 'tool'),
-    source: 'tool',
-  };
-}
-
-/** Registers a user-attached file as an artifact (distinct from
-    `deriveArtifact`'s tool-call-derived ones) — same dedup-by-path rule as the
-    `onToolCall` handler, so a file that's later also written to by a tool
-    doesn't produce a duplicate entry. */
-function userFileArtifact(path: string, name: string): Artifact {
-  return { path, name, tool: 'attached', source: 'user' };
-}
-
-/** A single suggestion from the Adaptive Pathway extension's `decide` tool
-    (Round-C). `edge_id` is the "why was this suggested" link target (a
-    passthrough fix on the extension side — its own `attribution_id` is
-    unrelated/unusable, see that repo's KNOWN_ISSUES.md). */
-export interface AdaptivePathwayHint {
-  text: string;
-  confidence: number;
-  type: string;
-  edge_id?: string;
-  /** Short explanation behind the hint (e.g. "succeeded in 41 contexts;
-      confidence 72%"), rendered under the hint badge. `null`/absent when the
-      extension has nothing to say beyond the hint text itself. */
-  rationale?: string | null;
-  /** Which model produced this hint — drives the badge style
-      (`standard` = hollow, `ig` = "info gain", `pc` = "paradigm",
-      `wildcard` = "untested angle", with a lightbulb icon). Absent on older
-      extension versions. */
-  source_model?: string;
-}
-
-interface ParsedHintOutput {
-  hints: AdaptivePathwayHint[];
-  confidence: number;
-  novelty: number;
-  /** True when the extension is offering to widen exploration for the next
-      few turns (the exploration-consent prompt). Absent/false on older
-      extension versions or when no offer is being made this turn. */
-  nudge_offered: boolean;
-}
-
-/** Mirrors `goose_provider_name` in `src-tauri/src/config/providers.rs` —
-    goosed only ever sees `custom_openai` profiles as a plain `openai`
-    provider (same client, just a different base URL), so that's the value
-    it reports back in a session's stored `providerId`. */
-function gooseProviderName(providerType: ProviderType): string {
-  return providerType === 'custom_openai' ? 'openai' : providerType;
-}
-
-/** Finds the Kitty provider profile that produced a session's stored
-    goosed-level `providerId`/`modelId` (`session/list`'s `_meta`, see
-    `SessionSummary`) — used to restore the right provider when reopening an
-    old chat. First match wins if the user has multiple profiles of the same
-    type with the same model selected; goosed's own metadata has no way to
-    disambiguate further than provider type + model id. `null` if nothing
-    currently configured matches (e.g. the profile was deleted). */
-export function findMatchingProvider(
-  providers: ProviderView[],
-  providerId: string,
-  modelId: string
-): ProviderView | null {
-  return (
-    providers.find(
-      (p) => gooseProviderName(p.provider_type) === providerId && p.models.includes(modelId)
-    ) ?? null
-  );
-}
-
-/** Finds the Adaptive Pathway extension's `decide` tool call on a message, if
-    any — hints correlate to messages "for free" this way, since `decide` is
-    just another tool call on the same streaming assistant message (no new
-    cross-message correlation scheme needed). Gated on `toolName` alone for
-    now; tighten to also require a specific `extensionName` once confirmed
-    live what Goose actually reports for this extension. */
-export function findHintToolCall(msg: Message): ToolCall | undefined {
-  return msg.toolCalls.find((t) => t.toolName === 'decide');
-}
-
-/** Parses a `decide` tool call's `output` (Python-repr text, see `pyrepr.ts`)
-    into its hints. Returns `null` on anything unexpected — a malformed or
-    still-streaming tool output should never crash message rendering. */
-export function parseHintOutput(call: ToolCall | undefined): ParsedHintOutput | null {
-  if (!call?.output) return null;
-  const parsed = tryParsePyRepr(String(call.output)) as Record<string, unknown> | null;
-  if (!parsed || !Array.isArray(parsed.hints)) return null;
-  const hints = parsed.hints.filter(
-    (h): h is AdaptivePathwayHint =>
-      typeof h === 'object' && h !== null && typeof (h as { text?: unknown }).text === 'string'
-  );
-  if (hints.length === 0) return null;
-  return {
-    hints,
-    confidence: typeof parsed.confidence === 'number' ? parsed.confidence : 0,
-    novelty: typeof parsed.novelty === 'number' ? parsed.novelty : 0,
-    nudge_offered: parsed.nudge_offered === true,
-  };
-}
-
-const closeOpen = (msgs: Message[]): Message[] =>
-  msgs.map((m) => (m.open ? { ...m, open: false, streaming: false } : m));
-
-/** True when `last` is an already-closed assistant message from the turn that
-    *just* finished, with nothing new started yet. A tool-call notification
-    and the turn's completion response travel through separate tasks
-    (goosed's reader loop resolves the completion oneshot on a different task
-    than the one that emits `chat://tool-call`/reasoning/message deltas), so
-    it's possible for `chat://complete` to reach the frontend and close the
-    message a moment before a straggling event for that same turn arrives.
-    Without this, the straggler spawned a brand-new, text-less assistant
-    message instead of joining the box already shown above the real answer.
-    Safe to fold back in: a genuinely new turn always pushes a user message
-    first (via `send()`), so `last.role` would be `'user'` by then, not
-    `'assistant'` — this can only match a true straggler. */
-export function isStragglerAssistantMessage(last: Message | undefined, turnBusy: boolean): boolean {
-  return !!last && last.role === 'assistant' && !last.open && !turnBusy;
-}
-
-/** Shared by `send()`'s dropped-file image split and `inlineFileAsAttachment`
-    (chat-only mode's attach path) — one definition so the two can't drift. */
-export function isImageFileName(name: string): boolean {
-  return /\.(png|jpe?g|gif|webp|bmp)$/i.test(name);
-}
-
-/** Rough English-text chars-per-token approximation, used only to enforce a
-    recipe's `max_reasoning_tokens` hard cap client-side (see `flushDeltas`) —
-    ACP exposes no numeric reasoning-token count to check against, only
-    effort levels, so this is the best available proxy, not an exact count. */
-const CHARS_PER_TOKEN_ESTIMATE = 4;
-
-/** Sent automatically once a reasoning-cap-triggered cancel actually
-    completes (see `pendingForcedAnswer`) — there's no way to redirect an
-    in-flight generation straight to its answer, so this asks for one on a
-    fresh turn instead of leaving the user with nothing. */
-const FORCED_ANSWER_PROMPT =
-  'Based on the work you did in your previous turn, please produce a response.';
-
-/** Pure decision function behind the recipe reasoning hard cap — separated
-    from `flushDeltas`'s zustand `get()`/`set()` plumbing so the actual
-    threshold math is unit-testable on its own, same pattern as
-    `hasRepetitionLoop`. Exported for unit testing. */
-export function exceedsReasoningCap(reasoningLength: number, maxReasoningTokens: number): boolean {
-  const approxReasoningTokens = Math.ceil(reasoningLength / CHARS_PER_TOKEN_ESTIMATE);
-  return approxReasoningTokens > maxReasoningTokens;
-}
-
-/** Detects a real, observed local-model failure mode: instead of ever
-    finishing, the model gets stuck repeating a short "planning out loud"
-    block near-verbatim dozens of times (seen with a small model looping on
-    tool-orchestration self-talk — "I'll use `decide`... I'm ready... I'll
-    start." — until some length/turn cap finally cut it off). Checked on a
-    bounded trailing window of the accumulated reasoning+text, not the whole
-    string, so it stays cheap on a long turn. A `chunkSize`+ run of text
-    recurring `minRepeats`+ times verbatim within that window is treated as a
-    loop. `chunkSize`/`minRepeats` are deliberately generous (150 chars, 8
-    repeats): a real degenerate loop repeats dozens of times, so this still
-    catches it comfortably, while a long, legitimate response's occasional
-    reused phrase/connective — confirmed real false positive at the original,
-    looser 100-char/4-repeat thresholds, specifically on long responses —
-    essentially never coincidentally repeats a 150+ char verbatim span that
-    many times. Probes are anchored only in the first half of the window so
-    there's room left for a real repeat to land. */
-export function hasRepetitionLoop(
-  text: string,
-  windowSize = 4000,
-  chunkSize = 150,
-  minRepeats = 8
-): boolean {
-  if (text.length < chunkSize * minRepeats) return false;
-  const window = text.slice(-windowSize);
-  for (let start = 0; start + chunkSize <= window.length / 2; start += chunkSize) {
-    const probe = window.slice(start, start + chunkSize);
-    if (probe.trim().length < chunkSize * 0.6) continue; // skip mostly-whitespace probes
-    let count = 0;
-    let idx = 0;
-    for (;;) {
-      const next = window.indexOf(probe, idx);
-      if (next === -1) break;
-      count++;
-      idx = next + chunkSize;
-      if (count >= minRepeats) return true;
-    }
-  }
-  return false;
-}
-
-/** Real, observed failure mode: a model that emits reasoning as literal
-    inline `<think>...</think>` tags (rather than via a distinct structured
-    API field — e.g. Gemma-family models) sometimes has its stream
-    misclassified partway through by goosed/Ollama: the *tail* of the
-    thinking — including the model's own literal closing tag — arrives as
-    ordinary message-delta content instead of reasoning-delta content, so it
-    renders in the visible answer bubble instead of the collapsible thinking
-    box (confirmed via a real captured transcript: the rendered answer
-    literally contained "(End of thought process)\n</think>" as plain text,
-    right before the real answer began). Given the message-channel `text`
-    accumulated so far, checks for a literal `</think>` marker; when present,
-    splits at the *first* occurrence — everything up to and including the tag
-    is reasoning that leaked into the wrong channel, everything after is the
-    real answer — stripping a leading `<think>` too, in case the whole thing
-    (not just the tail) leaked. Returns `null` when no leaked tag is present,
-    so callers can treat that as "nothing to do" for the (overwhelmingly
-    common) case where classification worked correctly. */
-export function splitLeakedThinkTag(text: string): { reasoning: string; text: string } | null {
-  const closeIdx = text.indexOf('</think>');
-  if (closeIdx === -1) return null;
-  let leaked = text.slice(0, closeIdx);
-  const openIdx = leaked.indexOf('<think>');
-  if (openIdx !== -1) leaked = leaked.slice(openIdx + '<think>'.length);
-  const rest = text.slice(closeIdx + '</think>'.length).replace(/^\s+/, '');
-  return { reasoning: leaked.trim(), text: rest };
-}
-
-/** The ACP permission options confirmed live are `allow_always`/`allow_once`/
-    `reject_once`/`reject_always` (docs/acp-protocol.md) — pick the reject
-    variant so an auto-declined tool call reads as a real decline, not a
-    cancellation. `null` (cancel) as a fallback if none match. */
-const pickRejectOption = (options: { optionId: string }[]): string | null =>
-  options.find((o) => /reject/i.test(o.optionId))?.optionId ?? null;
-
-/** Pick the "allow once" variant (never `allow_always`, so approval never
-    silently persists) for auto-approving a scoped chat-mode tool call. */
-const pickAllowOption = (options: { optionId: string }[]): string | null =>
-  options.find((o) => o.optionId === 'allow_once')?.optionId ??
-  options.find((o) => /allow/i.test(o.optionId))?.optionId ??
-  null;
-
-const normPath = (p: string): string => p.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
-
-/** Lexically (no fs access) decide whether `target` is inside `base`. Absolute
-    targets keep their drive/root; relative ones resolve against `base`; `.`/`..`
-    are collapsed. Case-insensitive (Windows). This backs the chat-mode "keep
-    file ops inside the chat folder" soft boundary — a lexical check is
-    proportionate since shell tools (also allowed in chat mode) aren't
-    sandboxed anyway; it hard-confines only the path-based ops Kitty can
-    actually inspect. Exported for unit testing. */
-export function pathWithinDir(base: string, target: string): boolean {
-  const b = normPath(base);
-  if (!b) return false;
-  let t = target.replace(/\\/g, '/');
-  const isAbsolute = /^[a-z]:\//i.test(t) || t.startsWith('/');
-  if (!isAbsolute) t = `${b}/${t}`;
-  const hasDrive = /^[a-z]:/i.test(t);
-  const drive = hasDrive ? t.slice(0, 2) : '';
-  const stack: string[] = [];
-  for (const seg of (hasDrive ? t.slice(2) : t).split('/')) {
-    if (seg === '' || seg === '.') continue;
-    if (seg === '..') stack.pop();
-    else stack.push(seg);
-  }
-  const resolved = normPath(`${drive}/${stack.join('/')}`);
-  return resolved === b || resolved.startsWith(`${b}/`);
-}
-
-/** Whether `target` sits under Goose's own internal cache directory
-    (`.../Block/goose/cache/...`, e.g. `computercontroller`'s scraped-page
-    cache). These are the tool's own working storage, not a file the model is
-    saving for the user, so they're out of scope for the chat-folder boundary
-    entirely — rejecting them just breaks the tool (e.g. web fetch) without
-    protecting anything. Lexical, matching `pathWithinDir`'s no-fs-access
-    style. Exported for unit testing. */
-export function isGooseInternalCachePath(target: string): boolean {
-  return /(^|\/)block\/goose\/cache(\/|$)/i.test(target.replace(/\\/g, '/'));
-}
-
-/** Map of tool-call "signature" (see `toolCallSignature`) to how many times
-    it's been seen this turn — backs the chat-mode tool-loop guard below. */
-export type ToolCallCounts = Map<string, number>;
-
-/** Best-effort identifying string for a tool call — tool name/kind plus its
-    primary argument (URL, path, or command; falls back to the whole input).
-    Not a full hash, just enough to tell "the same call, again" apart from "a
-    different call." Exported for unit testing. */
-export function toolCallSignature(title: string, rawInput: unknown): string {
-  const input = (rawInput ?? {}) as {
-    url?: string;
-    path?: string;
-    file_path?: string;
-    paths?: string[];
-    command?: string;
-  };
-  const primary =
-    input.url ??
-    input.path ??
-    input.file_path ??
-    (Array.isArray(input.paths) ? input.paths[0] : undefined) ??
-    input.command;
-  const target = typeof primary === 'string' ? primary : JSON.stringify(input);
-  return `${title}::${target}`;
-}
-
-/** Chat-mode tool-loop guard (owner-reported bug): a model can get stuck
-    alternating between two tools against the same target (e.g. a web-fetch
-    tool and its own cache step) — each iteration a real network/disk
-    round-trip, not just wasted tokens, since goose actually executes the call
-    before this fires. Increments and returns the new count for this call's
-    signature. Pure (counts passed in/out, a fresh Map returned) so it's
-    unit-testable and resettable per turn — see `send()`, which clears the
-    live counts at the start of every fresh turn; repeating a call across
-    different turns is normal, not a loop. Exported for unit testing. */
-export function countToolCall(
-  counts: ToolCallCounts,
-  title: string,
-  rawInput: unknown
-): { count: number; counts: ToolCallCounts } {
-  const sig = toolCallSignature(title, rawInput);
-  const next = new Map(counts);
-  const count = (next.get(sig) ?? 0) + 1;
-  next.set(sig, count);
-  return { count, counts: next };
-}
-
-/** More than this many identical calls in one turn is treated as a stuck
-    loop, not legitimate repeated tool use. */
-const TOOL_LOOP_THRESHOLD = 4;
-
-/** Decide how to answer a tool-approval request while in chat ("thought-
-    partner") mode (Round-5, owner decision): tools are allowed, but a path-
-    based file op is confined to the session's chat folder (`cwd`). Returns the
-    ACP `optionId` to respond with, plus a `warning` to surface when a request
-    is declined for reaching outside the folder. A tool with no structured path
-    (notably `shell`, which produces docx/xlsx via Python) is allowed — a soft
-    boundary, since shell isn't sandboxed. Pure + exported for unit testing. */
-export function decideChatApproval(
-  rawInput: unknown,
-  cwd: string | null,
-  options: { optionId: string }[]
-): { optionId: string | null; warning?: string } {
-  const input = (rawInput ?? {}) as { path?: string; file_path?: string; paths?: string[] };
-  const p =
-    input.path ?? input.file_path ?? (Array.isArray(input.paths) ? input.paths[0] : undefined);
-  if (
-    typeof p === 'string' &&
-    p !== '' &&
-    !!cwd &&
-    !pathWithinDir(cwd, p) &&
-    !isGooseInternalCachePath(p)
-  ) {
-    return {
-      optionId: pickRejectOption(options),
-      warning:
-        `Declined a file operation outside this chat's folder (${p}). In thought-partner ` +
-        `mode the model can only touch files inside the chat's own folder.`,
-    };
-  }
-  return { optionId: pickAllowOption(options) };
-}
-
-// STOPGAP client-side workaround for stripping reasoning from resent context
-// (see the doc comment on `ProviderProfile.strip_reasoning` in providers.rs and
-// on `stripReasoning` above) — flattens prior turns into plain text using only
-// `.text`, never `.reasoning`. Remove once Goose ships a native hook
-// (https://github.com/block/goose/issues/7617) and this whole mechanism goes
-// away in favor of an env var through goosed_env().
-function buildStrippedTranscript(messages: Message[]): string {
-  const lines = messages.map((m) =>
-    m.role === 'user' ? `User: ${m.text}` : `Assistant: ${m.text}`
-  );
-  return (
-    'Continuing the conversation below. Earlier reasoning/thinking has been omitted ' +
-    'to keep this response focused.\n\n' +
-    lines.join('\n\n')
-  );
-}
-
-// Both known client-side prompt-preamble wrappers (Round-6 system prompt, and
-// this STOPGAP's own reconstructed transcript, immediately above) are only
-// ever prepended to the FIRST outgoing message of a session — see `send()`'s
-// `firstMessage` gate. `userMsg.text` (the live-rendered bubble) is always
-// built independently of the wrapped `promptText`, so a *live* send never
-// shows the wrapper. But goosed stores exactly what was transmitted, wrapper
-// included — so resuming a session via `session/load` replays the raw wrapped
-// text as that turn's `user_message_chunk`, with nothing in the replay path to
-// strip it. Only the first replayed user turn of a session can ever carry a
-// wrapper; later turns pass through untouched.
-const SYSTEM_PROMPT_WRAPPER_RE = /^<system>\n[\s\S]*?\n<\/system>\n\n/;
-const TRANSCRIPT_WRAPPER_PREAMBLE =
-  'Continuing the conversation below. Earlier reasoning/thinking has been omitted ' +
-  'to keep this response focused.\n\n';
-// The hidden `<recipe>…</recipe>` + "Run the recipe above now…" wrapper
-// `sendWithRecipe` prepends. `[^>]*` tolerates any title attribute content
-// (except a literal `>`); the lazy `[\s\S]*?` stops at the first
-// `\n</recipe>`; `[^>]*\n\n` after it consumes the single-line run
-// instruction. Unlike the system/transcript wrappers (first turn only), a
-// recipe can be invoked on ANY turn, so this is stripped from every replayed
-// user message — see `stripRecipeWrapper`'s use below.
-const RECIPE_WRAPPER_RE = /^<recipe\b[^>]*>\n[\s\S]*?\n<\/recipe>\n\n[^\n]*\n\n/;
-
-/** Strip a known prompt-preamble wrapper from a replayed first user message, if
-    present — heuristic pattern matching (not perfect: a user message that
-    happens to start with `<system>...` or the exact transcript preamble text
-    would also get stripped), but this is a client-side cosmetic concern, not a
-    security boundary, so a rare false-positive is an acceptable trade for
-    hiding the wrapper on replay. Returns `text` unchanged if neither wrapper is
-    present. Exported for unit testing. */
-/** Turn a raw ACP/JSON-RPC error string into a short, plain-language summary
-    for the chat error banner — the raw text stays available via ErrorDetail's
-    "Show details" expander. Owner-reported bug: a bare "Invalid params" (or
-    similar wire-protocol text) showed up with no explanation of what
-    happened or what to do about it. Pattern-matched, not exhaustive — an
-    unrecognized error still gets a generic-but-plain fallback rather than
-    the raw string as the headline. */
-export function humanizeChatError(raw: string): string {
-  const r = raw.toLowerCase();
-  if (r.includes('timed out')) {
-    return 'The response took too long and Kitty gave up waiting. Try sending again.';
-  }
-  if (r.includes('invalid params')) {
-    return "Kitty couldn't send that message — this can happen right after switching providers or restarting Goose. Try sending again.";
-  }
-  if (
-    r.includes('connection closed') ||
-    r.includes('connection cancelled') ||
-    r.includes("isn't running") ||
-    r.includes('connect')
-  ) {
-    return 'Lost the connection to Goose. Kitty will reconnect automatically — try sending again.';
-  }
-  return 'Something went wrong sending that message.';
-}
-
-export function stripPromptPreamble(text: string): string {
-  const systemMatch = text.match(SYSTEM_PROMPT_WRAPPER_RE);
-  if (systemMatch) return text.slice(systemMatch[0].length);
-  if (text.startsWith(TRANSCRIPT_WRAPPER_PREAMBLE)) {
-    const rest = text.slice(TRANSCRIPT_WRAPPER_PREAMBLE.length);
-    const marker = '\n\nUser: ';
-    const idx = rest.lastIndexOf(marker);
-    if (idx >= 0) return rest.slice(idx + marker.length);
-  }
-  return text;
-}
-
-/** Strip the hidden `<recipe>` wrapper from a replayed user message, if
-    present. Separate from `stripPromptPreamble` because a recipe can be
-    invoked on any turn (not just the first), so this runs on every replayed
-    user message; on a recipe-invoked first turn the recipe wrapper is
-    outermost (wraps the system-prompt wrapper), so callers strip this first
-    and then apply `stripPromptPreamble`. Same acceptable false-positive
-    trade-off as the other wrappers (cosmetic, not a security boundary).
-    Exported for unit testing. */
-export function stripRecipeWrapper(text: string): string {
-  const m = text.match(RECIPE_WRAPPER_RE);
-  return m ? text.slice(m[0].length) : text;
 }
 
 export const useChatStore = create<ChatState>((set, get) => {
