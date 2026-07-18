@@ -13,6 +13,13 @@ Read `goose-overlay-project-description.md` in the repo root for the full produc
 - **State**: Zustand for UI state. No Redux.
 - **Rust crates**: `tauri`, `tauri-plugin-global-shortcut`, `tauri-plugin-notification`, `tauri-plugin-shell` (open browser), `tauri-plugin-dialog`, `tauri-plugin-single-instance`, `reqwest` (with `stream` feature), `tokio`, `serde`/`serde_json`, `keyring` (Windows Credential Manager), `windows` (Win32 APIs for the keyboard hook), `sysinfo` (process detection), `thiserror`.
 - **HTTP to goosed/Ollama**: all network calls go through the Rust side (Tauri commands + events). The webview never fetches localhost directly — this keeps the goosed secret key out of JS and avoids CORS issues.
+- **Exception, by design**: two Python packages under `plugins/` (see
+  "Internal plugins" below) ship as part of the app, frozen to standalone
+  `.exe`s via PyInstaller and bundled through Tauri's `externalBin` — this is
+  an intentional, sanctioned part of the stack, not a deviation. It does
+  **not** mean "add a Python dependency freely" — a new plugin still needs
+  the same freeze-and-bundle treatment (`docs/PLUGINS.md`), and the app
+  itself (Rust core + React frontend) stays exactly as described above.
 
 ## External APIs this app consumes
 
@@ -30,6 +37,62 @@ Read `goose-overlay-project-description.md` in the repo root for the full produc
 - Base URL: `http://localhost:11434` (configurable).
 - `GET /api/tags` — list installed models. `POST /api/pull` `{"model": "<name>"}` — streaming NDJSON with `status`, `total`, `completed` per layer; drive progress bars from this. `DELETE /api/delete` — remove model. `GET /api/version` — health check.
 - We never call generate/chat on Ollama for **inference** — that goes through goosed. The one exception (Round-2 item 5) is an *empty* `/api/generate` with `keep_alive: -1`/`0` used solely to warm/evict a model in Ollama's memory when the active provider changes (`src-tauri/src/ollama/mod.rs::keep_alive_load/release`).
+
+## Internal plugins (`plugins/`)
+
+Two Python subsystems ship as **internal plugins**: independent, tested
+Python packages maintained in this repo under `plugins/`, frozen to
+standalone Windows `.exe`s via PyInstaller and bundled through Tauri's
+`externalBin` mechanism — end users need no Python runtime. Full detail in
+`docs/PLUGINS.md`; the two current plugins:
+
+- **`adaptive-pathway`** — an HTTP sidecar (FastAPI/uvicorn) that Kitty spawns
+  and monitors directly, same supervision pattern as Ollama/goosed
+  (`lifecycle/adaptive_pathway_proc.rs`, `commands/adaptive_pathway.rs`).
+  Learns tool-selection and response-style preferences from tool-call
+  outcomes and 👍👎 feedback; surfaced in chat as hint badges and in Settings
+  as Graph Health / Domain Profiles. See `docs/ADAPTIVE_PATHWAY.md` for the
+  Rust↔sidecar HTTP contract.
+- **`replacement-mcp`** — a stdio MCP server **spawned by goosed**, not
+  Kitty — Kitty's only involvement is keeping its registration entry in
+  goose's own `config.yaml` pointed at the current install's bundled exe
+  (`goose_config::ensure_extension_registered`, `commands/replacement_mcp.rs`).
+  Context-optimized shell/file/web/document tools, designed to replace
+  Goose's built-in `developer` + `computercontroller` extensions for local,
+  small models — off by default, and enabling it in Settings → Extensions
+  only ever *offers* (never forces) disabling those two built-ins.
+
+These two integration shapes — Kitty-managed process vs. goosed-managed
+extension — are the two patterns any future internal plugin should follow;
+see `docs/PLUGINS.md` for which one fits a new plugin and why mixing them
+(e.g. adding a `ManagedProcess` for something goosed already spawns) is a bug,
+not a stylistic choice.
+
+## Other undocumented-in-this-file subsystems
+
+The phased plan below (§ Phase 0–11) is this project's original build order
+and predates several subsystems that have since shipped. **`docs/ARCHITECTURE.md`
+is the accurate, current module map** — the repository layout tree
+immediately below this section is historical/aspirational, not a live
+inventory. Subsystems built beyond the original phased plan:
+
+- **Recipes** (`config/recipes.rs`, `config/recipe_yaml.rs`,
+  `commands/recipes.rs`, `components/settings/Recipes.tsx`) — Goose recipes
+  reinterpreted as client-side chat-turn templates (not the real `goose run
+  --recipe` CLI runner): instructions/extensions/starting-prompt attached to
+  a message via `/slug` in the composer. See `chatStore.ts`'s
+  `sendWithRecipe`.
+- **Scheduled tasks** (`config/scheduled_tasks.rs`, `commands/scheduled_tasks.rs`,
+  `lifecycle/scheduler.rs`, `components/settings/ScheduledTasks.tsx`) —
+  user-authored instructions the agent runs later, one-shot or recurring,
+  with or without the app open (a 30s-tick headless loop that reuses
+  `commands::new_session`/`send_prompt` verbatim).
+- **Folder bookmarks** (`commands/folders.rs`, session→folder mapping in
+  `Config`) — app-side session organization layered on top of goosed's own
+  flat `session/list`; goosed has no concept of folders.
+- **Log capture** (`log_capture.rs`, `commands/logs.rs`) — an in-memory ring
+  buffer of `warn!`/`error!` tracing events, surfaced in Settings for
+  in-app diagnostics without needing to find a log file on disk.
 
 ## Repository layout
 

@@ -1,0 +1,45 @@
+name: Plugin tests
+
+# Runs each internal plugin's own pytest suite in isolation (see
+# plugins/README.md) — does not build or freeze anything; that's
+# plugins/build.py's job, run separately at release time.
+on:
+  push:
+    paths:
+      - "plugins/**"
+      - ".github/workflows/plugins.yml"
+  pull_request:
+    paths:
+      - "plugins/**"
+      - ".github/workflows/plugins.yml"
+
+jobs:
+  adaptive-pathway:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install
+        working-directory: plugins/adaptive-pathway
+        run: |
+          pip install -e ".[dev]"
+      - name: Test
+        working-directory: plugins/adaptive-pathway
+        run: pytest -q
+
+  replacement-mcp:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install
+        working-directory: plugins/replacement-mcp
+        run: |
+          pip install -e ".[dev]"
+      - name: Test
+        working-directory: plugins/replacement-mcp
+        run: pytest -q
