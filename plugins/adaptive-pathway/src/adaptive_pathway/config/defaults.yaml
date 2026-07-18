@@ -1,0 +1,258 @@
+db_path: "./pathway.db"
+embedding_model: "all-MiniLM-L6-v2"
+embedding_dim: 384
+
+embedding:
+  ollama_url: "http://localhost:11434"
+  ollama_model: "qwen3-embedding:0.6b"
+  timeout_s: 2
+  probe_interval_s: 60
+  cache_size: 256
+
+ensemble:
+  n_standard_models: 4
+  ig_model_enabled: true
+  pc_model_enabled: true
+  ig_weight_min: 0.15
+  ig_weight_max: 0.50
+  pc_weight: 0.15
+  bootstrap_probability: 0.8
+  noise_variance_standard: 1.0
+  noise_variance_ig: 1.0
+
+plateau_risk:
+  check_interval: 15
+  entropy_window: 50
+  entropy_stride: 25
+  entropy_risk_scale: 5.0
+  diversity_min_baseline: 5
+  novelty_history_size: 60
+  novelty_accel_scale: 10.0
+  agreement_min_std: 0.05
+  signal_weights:
+    entropy: 0.30
+    diversity: 0.25
+    novelty: 0.20
+    agreement: 0.25
+
+paradigm_challenge:
+  enabled: true
+  top_n: 5
+  label_threshold: 0.5
+  signal_weights:
+    domain_isolation: 0.35
+    confidence_gap: 0.25
+    primitive_isolation: 0.25
+    novelty_persistence: 0.15
+
+in_session:
+  enabled: true
+  max_mix_weight: 0.20
+  calls_to_max: 20
+  noise_variance: 2.0
+  buffer_size: 15
+  recency_half_life: 5
+  confidence_gate: true
+  learn_during_pause: true
+
+edge_blending:
+  enabled: true
+  min_confidence: 0.6
+  require_shared_domain: true
+  max_blends_per_call: 2
+  create_edge_on_accept: true
+
+schism:
+  min_hours_between_checks: 4
+  check_call_interval: 25
+  extended_interval: 50
+  within_agreement_threshold: 0.8
+  between_agreement_threshold: 0.4
+  agreement_drop_threshold: 0.1
+  agreement_similarity_skip: 0.9
+  stable_trend_std: 0.05
+  prediction_log_size: 25
+  min_predictions_for_check: 10
+  auto_resolve_days: 7
+  domain_split_suppression: true
+  min_faction_size: 2
+  models_to_check: [0, 1, 2, 3]
+
+novelty:
+  n_hash_tables: 3
+  hash_size: 2048
+  min_count_pessimistic: true
+  default_lambda: 0.5
+  lambda_floor: 0.05
+  ucb_multiplier: 0.15
+
+dpp:
+  default_diversity_weight: 1.0
+  max_hints: 5
+  token_budget: 200
+  epsilon: 0.0000001
+
+wildcard:
+  enabled: true
+  max_slots: 1
+  min_score_threshold: 0.15
+  pc_weight: 0.7
+  novelty_weight: 0.3
+  label: "untested angle"
+
+exploration_slot:
+  enabled: true
+  label: "least understood"
+
+thompson:
+  feature_buckets: 64
+  # Raised from 20: with only 20 arms, distinct primitives regularly hash
+  # into the same Thompson bucket (ActionBucketer's mmh3 hash mod
+  # max_action_buckets), so a reward meant for one primitive can literally
+  # land on an unrelated colliding one (misattribution). Memory impact is
+  # small — ensemble state is never persisted to disk — ~12MB total
+  # (6 models x 64 arms x 64x64 float64 A_inv matrices).
+  max_action_buckets: 64
+  collision_rate_warning: 0.15
+  utilization_warning: 0.80
+  utilization_check_interval: 50
+  hot_bucket_threshold: 0.30
+
+confidence:
+  base_step: 0.10
+  logistic_scale: 10.0
+  logistic_midpoint: 0.70
+
+cooldown:
+  provisional_successes: 3
+  provisional_sessions: 2
+  auto_named_successes: 2
+  auto_named_sessions: 1
+
+decay:
+  half_life_multiplier: 0.10
+  base_half_life_hours: 168
+  max_decay_fraction: 0.3
+
+ttl:
+  auto_enabled: true
+  permission_denied_hours: 48
+  deprecated_api_hours: 72
+  syntax_crash_hours: 24
+  # 30 days: a moderate-or-stronger `dont_do_again` suppresses the edge from
+  # hints outright (not just a lambda/confidence nudge) — a topic-level
+  # "mute this" lever the system otherwise lacked, so an explicitly-rejected
+  # topic actually stops being suggested instead of just decaying slowly.
+  user_dont_do_again_hours: 720
+  user_override_clears_ttl: true
+
+bleed:
+  default_temperature: 0.3
+  domain_match_weight: 3.0
+
+preferences:
+  centroid_min_examples: 50
+  centroid_refresh_days: 30
+  centroid_max_age_days: 60
+  embedding_confidence_threshold: 0.7
+  embedding_uncertainty_threshold: 0.3
+  behavioral_confirmation_wait_turns: 1
+  heuristic_fallback_confidence: 0.4
+  intensity_mild: 0.3
+  intensity_moderate: 0.7
+  keep_this_weight_mild: 0.40
+  keep_this_weight_moderate: 0.60
+  keep_this_weight_strong: 0.80
+  dont_do_again_weight_mild: -0.30
+  dont_do_again_weight_moderate: -0.45
+  dont_do_again_weight_strong: -0.60
+  lambda_boost_session_only: true
+  lambda_boost_plus_one_session: true
+  lambda_boost_plus_two_sessions: true
+  negative_pref_half_life_days: 45
+
+telemetry:
+  copy_event: 0.15
+  save_event: 0.20
+  immediate_followup: 0.10
+  scroll_to_end: 0.05
+  stalled_session: -0.10
+  rapid_re_edit: -0.15
+  undo_chain: -0.20
+  per_session_cap: 0.25
+
+pause:
+  learning_weight: 0.6
+  novelty_visits_weight: 1.0
+  update_centroids: false
+  suppress_conversational_detection: true
+
+curiosity_nudge:
+  enabled: true
+  entropy_threshold: 0.3
+  concentration_threshold: 0.85
+  window_turns: 50
+  max_multiplier: 1.5
+  duration_turns: 10
+  decay_rate: 0.1
+  cooldown_dismissed_days: 14
+  check_interval: 50
+  agent_mode_allowed: false
+  high_acceptance_blocked: true
+  high_acceptance_action_width: 6
+
+flow:
+  consecutive_turns_threshold: 3
+  max_pause_seconds: 30
+  novelty_lambda_reduction: 0.3
+  novelty_lambda_floor: 0.05
+  suppress_micro_annotations: true
+  suppress_conversational_detection: true
+  boost_passive_telemetry: 1.5
+
+notifications:
+  busy_calls_per_30min: 8
+  quiet_max_calls_per_15min: 5
+  flow_state_suppress: true
+  pause_suppress: true
+  dismissed_suppress: true
+  max_deferral_days: 7
+  max_deferred_queue: 5
+  critical_always_surface: true
+
+discovery:
+  primitive_call_interval: 50
+  domain_session_interval: 10
+  domain_reinference_days: 7
+  domain_override_rate_threshold: 0.20
+  max_domains: 8
+
+tiers:
+  hot_days: 7
+  hot_pin_confidence: 0.8
+  warm_days: 90
+  warm_min_confidence: 0.3
+  cold_archive_days: 180
+  cold_min_confidence: 0.2
+
+maintenance:
+  interval_hours: 24
+
+pruning:
+  schedule: "daily"
+  merge_redundant: true
+  vacuum_after_prune: true
+
+health:
+  collision_rate_warning: 0.15
+  novelty_variance_min: 0.1
+  stale_novelty_threshold: 0.05
+  stale_novelty_pct: 0.90
+  override_rate_spike: 0.40
+  override_rate_spike_sessions: 3
+  centroid_stale_days: 60
+  prediction_log_stale_ratio: 0.2
+
+mode:
+  default: "thought_partner"
+  agent_novelty_lambda_multiplier: 0.5

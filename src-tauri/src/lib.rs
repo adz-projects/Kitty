@@ -147,7 +147,6 @@ pub fn run() {
             commands::detect_dependencies,
             commands::install_dependency,
             commands::validate_setup,
-            commands::install_adaptive_pathway,
             commands::open_wizard,
             commands::get_wizard_mode,
             commands::complete_setup,
@@ -171,6 +170,9 @@ pub fn run() {
             commands::adaptive_pathway_accept_nudge,
             commands::adaptive_pathway_dismiss_nudge,
             commands::adaptive_pathway_get_session_reflection,
+            commands::get_replacement_mcp_enabled,
+            commands::set_replacement_mcp_enabled,
+            commands::disable_builtin_dev_extensions,
         ])
         .setup(move |app| {
             let handle = app.handle();
@@ -182,6 +184,14 @@ pub fn run() {
             // First launch: show the setup wizard instead of the (hidden) overlay.
             if !wizard::setup_completed(handle) {
                 let _ = windows::open_wizard(handle, "setup");
+            }
+            // Keep the replacement-mcp extension's config.yaml entry pointed at
+            // this install's bundled exe (self-heals across an update/reinstall,
+            // same rationale as Adaptive Pathway's env-var migration below).
+            // Best-effort: a fresh install's config.yaml may not have an
+            // `extensions` map yet if goose has literally never run once.
+            if let Err(e) = commands::replacement_mcp::ensure_registered() {
+                tracing::warn!("replacement-mcp registration self-heal failed: {e}");
             }
             // Start Ollama + goosed and the health loop in the background.
             lifecycle::start_stack(handle);

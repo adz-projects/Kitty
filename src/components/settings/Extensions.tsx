@@ -1,13 +1,16 @@
 import { useEffect, useState } from 'react';
 import { ipc } from '@/lib/ipc';
 import type { ExtensionDefault } from '@/lib/types';
+import { Modal } from '@/components/shared/Modal';
 
 const extLabel = (e: ExtensionDefault): string => e.display_name ?? e.id;
 
-/** Managed solely by the single enable checkbox in Settings → Advanced →
-    Adaptive Pathway — showing it here too would be a confusing second
-    control over the same thing. */
-const HIDDEN_EXTENSION_IDS = new Set(['adaptive-pathway']);
+/** `adaptive-pathway` is managed solely by the single enable checkbox in
+    Settings → Advanced → Adaptive Pathway — showing it here too would be a
+    confusing second control over the same thing. `replacement-mcp` gets its
+    own dedicated card below (with the "replace built-ins?" offer), not the
+    generic checkbox grid. */
+const HIDDEN_EXTENSION_IDS = new Set(['adaptive-pathway', 'replacement-mcp']);
 
 /** Default extensions for every new chat (Round-7 Feature 4) — reads/writes
     goose's own config.yaml directly (see src-tauri/src/goose_config.rs), the
@@ -74,6 +77,8 @@ export function Extensions() {
         already open.
       </p>
       {error && <div className="chat-error">{error}</div>}
+      <ReplacementMcpCard onBuiltinsChanged={load} />
+
       <div className="ext-grid">
         {exts.map((e) => (
           <label className="ext-card" key={e.id}>
@@ -126,5 +131,89 @@ export function Extensions() {
         </div>
       </div>
     </section>
+  );
+}
+
+/** Dedicated card for the `replacement-mcp` internal plugin (see
+    `plugins/replacement-mcp/`) — kept out of the generic checkbox grid above
+    because turning it on offers to also disable Goose's built-in
+    `developer`/`computercontroller` extensions, which it's designed to
+    replace for local/small models. That offer is always a separate, explicit
+    choice (CLAUDE.md B4) — accepting it never happens automatically. */
+function ReplacementMcpCard({ onBuiltinsChanged }: { onBuiltinsChanged: () => void }) {
+  const [enabled, setEnabled] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [showReplaceOffer, setShowReplaceOffer] = useState(false);
+
+  useEffect(() => {
+    void ipc
+      .getReplacementMcpEnabled()
+      .then(setEnabled)
+      .catch((e) => setError(String(e)));
+  }, []);
+
+  const toggle = async (next: boolean) => {
+    setBusy(true);
+    setError('');
+    try {
+      await ipc.setReplacementMcpEnabled(next);
+      setEnabled(next);
+      if (next) setShowReplaceOffer(true);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const acceptReplaceOffer = async () => {
+    try {
+      await ipc.disableBuiltinDevExtensions();
+      onBuiltinsChanged();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setShowReplaceOffer(false);
+    }
+  };
+
+  return (
+    <>
+      <label className="ext-card" style={{ marginBottom: 16 }}>
+        <div className="ext-card-head">
+          <span className="ext-card-name">Lean tools (replacement-mcp)</span>
+          <input
+            type="checkbox"
+            checked={enabled}
+            disabled={busy}
+            onChange={(ev) => void toggle(ev.target.checked)}
+          />
+        </div>
+        <span className="muted ext-card-desc">
+          Context-optimized shell/file/web/document tools, designed to replace Goose&apos;s built-in
+          Developer + Computer Controller extensions for local, small models. A goosed restart (or
+          new session) is needed for the change to take effect.
+        </span>
+      </label>
+      {error && <div className="chat-error">{error}</div>}
+
+      {showReplaceOffer && (
+        <Modal title="Replace the built-in extensions?">
+          <p>
+            Lean tools duplicates what Goose&apos;s built-in <strong>Developer</strong> and{' '}
+            <strong>Computer Controller</strong> extensions do, just with smaller, more
+            context-efficient tool descriptions. Disable those two now so the model isn&apos;t
+            choosing between duplicate tools?
+          </p>
+          <div className="row">
+            <button className="primary" onClick={() => void acceptReplaceOffer()}>
+              Disable Developer + Computer Controller
+            </button>
+            <button onClick={() => setShowReplaceOffer(false)}>Keep both</button>
+          </div>
+        </Modal>
+      )}
+    </>
   );
 }

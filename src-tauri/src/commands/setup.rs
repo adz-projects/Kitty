@@ -40,16 +40,6 @@ pub async fn install_dependency(app: AppHandle, which: String) -> Result<(), Str
     wizard::install(&app, &which).await
 }
 
-/// Best-effort install of the Adaptive Pathway sidecar package (near-term
-/// bridge — see `wizard::install_adaptive_pathway`'s doc comment for the
-/// real, bundled-sidecar target). Never treated as fatal by the wizard: a
-/// failure just means the extension stays quietly `Down`, same as if this
-/// were never called.
-#[tauri::command]
-pub async fn install_adaptive_pathway() -> Result<bool, String> {
-    wizard::install_adaptive_pathway().await
-}
-
 /// Result of `validate_setup`: whether the current setup (whichever path the
 /// wizard's fork led down) actually works, plus plain-language reasons when
 /// it doesn't. Powers the wizard's Done-step summary and its soft

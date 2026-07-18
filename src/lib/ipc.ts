@@ -209,6 +209,12 @@ export const ipc = {
     invoke<void>('add_extension', { name, command, args, env }),
   setExtensionEnv: (id: string, key: string, value: string) =>
     invoke<void>('set_extension_env', { id, key, value }),
+  // replacement-mcp (goosed-spawned stdio MCP extension — Kitty only owns its
+  // config.yaml registration, not the process; see commands/replacement_mcp.rs)
+  getReplacementMcpEnabled: () => invoke<boolean>('get_replacement_mcp_enabled'),
+  setReplacementMcpEnabled: (enabled: boolean) =>
+    invoke<void>('set_replacement_mcp_enabled', { enabled }),
+  disableBuiltinDevExtensions: () => invoke<void>('disable_builtin_dev_extensions'),
   // Settings deep link
   getSettingsTarget: () => invoke<SettingsTarget | null>('get_settings_target'),
   // Theming
@@ -220,7 +226,6 @@ export const ipc = {
   detectDependencies: () => invoke<Detection>('detect_dependencies'),
   installDependency: (which: 'ollama' | 'goose') => invoke<void>('install_dependency', { which }),
   validateSetup: () => invoke<SetupValidation>('validate_setup'),
-  installAdaptivePathway: () => invoke<boolean>('install_adaptive_pathway'),
   openWizard: (mode?: 'setup' | 'repair') => invoke<void>('open_wizard', { mode: mode ?? 'setup' }),
   getWizardMode: () => invoke<string | null>('get_wizard_mode'),
   completeSetup: () => invoke<void>('complete_setup'),

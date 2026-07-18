@@ -1,0 +1,105 @@
+# tool_prompts.yaml
+# Optimized strictly for 35B models: Uppercase warning flags, clear rules, short parameters.
+
+server_instructions: >
+  TOOLS BY CATEGORY:
+    System:     lean_shell, lean_file_editor, lean_analyze_workspace
+    Web:        lean_fallback_web_search, lean_web_scrape
+    Documents:  lean_word_manager, lean_pdf_manager, lean_excel_manager
+    State:      lean_cache_manager, lean_scratchpad
+
+  You are a context-lean local systems utility helper. Return highly compressed,
+  high-density outputs. Strip all markdown styling, verbose logs, and fluff.
+  Use scratchpad to persist facts across turns. Use todo to track multi-step plans.
+  Prefer 'terse' density for initial exploration; escalate to 'normal' or 'verbose'
+  only when you confirm you need the detail.
+
+# ---------------------------------------------------------------------------
+# Tunable thresholds — change these in one place; all tools read them at runtime
+# ---------------------------------------------------------------------------
+thresholds:
+  shell_max_lines: 100          # Lines before truncation kicks in
+  shell_keep_head: 30           # Lines to keep from the top when truncated
+  shell_keep_tail: 30           # Lines to keep from the bottom when truncated
+  file_page_size: 200           # Default lines per page in file_editor read
+  file_echo_max_words: 500      # Max words after which content is NOT echoed back
+  workspace_max_depth: 10       # Default folder traversal depth
+  workspace_max_files: 150      # Hard-stop file count for analyze_workspace
+  scrape_max_chars: 12000       # Absolute character cap for web_scrape (normal)
+  terse_char_cap: 500           # Character cap for terse density mode
+  scratchpad_max_keys: 50       # Maximum scratchpad entries
+
+# ---------------------------------------------------------------------------
+# Tool descriptions — loaded dynamically by @mcp.tool(…)
+# ---------------------------------------------------------------------------
+
+shell:
+  description: >
+    [System] Run terminal commands.
+    FORBIDDEN: interactive commands (vim, nano, less) or long-running daemons.
+    Use dry_run=True to preview destructive commands before executing.
+    Returns truncated stdout/stderr (head + tail when output is large).
+    All results prefixed with [OK], [TRUNCATED], or [ERR:CODE].
+
+file_editor:
+  description: >
+    [System] Read, write, or append plain text to a local file.
+    Use paginate logic (start_line/end_line) for large files.
+    Small writes (<500 words) echo back for confirmation.
+    density=terse|normal|verbose controls output detail.
+    All results prefixed with [OK], [TRUNCATED], or [ERR:CODE].
+
+analyze_workspace:
+  description: >
+    [System] Get directory outline. Ignores heavy folders (.git, node_modules, etc.).
+    Returns folder structure up to the configured depth (default 10).
+    density=terse|normal|verbose controls output detail.
+    If the path is a file, returns file metadata instead of erroring.
+    Aborts if file count exceeds the configured max.
+
+fallback_web_search:
+  description: >
+    [Web] Web search using DuckDuckGo.
+    If 'mcp-brave-search' is also available, prefer it for higher-quality results;
+    otherwise this tool works perfectly well on its own.
+
+web_scrape:
+  description: >
+    [Web] Scrape web article/documentation text into clean Markdown.
+    Strips cookie banners, navbars, ads, page footers.
+    density=terse|normal|verbose controls output detail.
+    If the URL points to a PDF, automatically delegates to pdf_manager.
+    Saves raw content to cache for later inspection.
+
+excel_manager:
+  description: >
+    [Documents] Inspect and edit .xlsx spreadsheets. Uses openpyxl.
+    Use 'inspect' first to get sheet metadata before reading data.
+    If sheet name is omitted, defaults to the first non-empty sheet.
+    dry_run=True previews writes without modifying the file.
+
+word_manager:
+  description: >
+    [Documents] Read or write .docx files.
+    read_outline returns only headings (H1-H3).
+    read_text returns plain paragraphs; density controls detail.
+    write_doc creates new documents or appends to existing ones,
+    producing well-formatted output with title and heading styles.
+
+pdf_manager:
+  description: >
+    [Documents] Extract text and structure from .pdf files. Uses pypdf.
+    read_outline returns the document outline/bookmarks (TOC).
+    read_text returns cleaned plain text with page markers.
+    density=terse|normal|verbose controls output detail.
+
+cache_manager:
+  description: >
+    [State] Manage cached web-scrape data.
+    list, view, delete individual cached files, or clear all.
+
+scratchpad:
+  description: >
+    [State] Persistent key-value store that survives across turns.
+    Use to remember file paths, decisions, or progress between turns.
+    set, get, delete, and list entries. Max 50 keys.

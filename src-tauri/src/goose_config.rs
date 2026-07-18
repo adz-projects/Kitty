@@ -223,9 +223,71 @@ pub fn add_custom_extension_default(
     write_raw(&doc)
 }
 
+/// Idempotently register a bundled internal-plugin stdio extension (see
+/// `plugins/README.md`): inserts a fresh, disabled-by-default entry if `id`
+/// isn't registered yet, or just refreshes its `cmd`/`args` in place if it
+/// already is. Deliberately never touches `enabled` on an existing entry —
+/// that's the user's own Settings choice, not something a routine
+/// re-registration (called on every app launch, so an update/reinstall's new
+/// binary path takes effect) should silently overwrite. Contrast with
+/// `add_custom_extension_default`, which always inserts fresh and enabled —
+/// that one backs the user-authored "add a custom extension" form, where a
+/// second call is a deliberate edit, not a self-heal.
+pub fn ensure_extension_registered(id: &str, command: &str, args: &[String]) -> Result<(), String> {
+    let mut doc = read_raw()?;
+    let exts = doc
+        .get_mut("extensions")
+        .and_then(|v| v.as_mapping_mut())
+        .ok_or("config.yaml has no extensions map")?;
+    upsert_bundled_extension_entry(exts, id, command, args)?;
+    write_raw(&doc)
+}
+
+/// Pure mapping transform behind `ensure_extension_registered`, split out so
+/// it's unit testable without touching the filesystem (same pattern as
+/// `set_env_key` above).
+fn upsert_bundled_extension_entry(
+    exts: &mut serde_norway::Mapping,
+    id: &str,
+    command: &str,
+    args: &[String],
+) -> Result<(), String> {
+    let key = YamlValue::String(id.to_string());
+    if let Some(existing) = exts.get_mut(&key) {
+        let map = existing
+            .as_mapping_mut()
+            .ok_or_else(|| format!("malformed extension entry: {id}"))?;
+        map.insert(
+            YamlValue::String("cmd".into()),
+            YamlValue::String(command.to_string()),
+        );
+        map.insert(
+            YamlValue::String("args".into()),
+            serde_norway::to_value(args).map_err(|e| e.to_string())?,
+        );
+    } else {
+        let entry = StdioExtensionEntry {
+            enabled: false,
+            ext_type: "stdio",
+            name: id,
+            description: "",
+            cmd: command,
+            args,
+            envs: serde_norway::Mapping::new(),
+            env_keys: &[],
+            timeout: 300,
+            cwd: None,
+            bundled: Some(true),
+        };
+        let value = serde_norway::to_value(&entry).map_err(|e| e.to_string())?;
+        exts.insert(key, value);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::set_env_key;
+    use super::{set_env_key, upsert_bundled_extension_entry};
     use serde_norway::Value as YamlValue;
 
     fn entry_with_envs(pairs: &[(&str, &str)]) -> serde_norway::Mapping {
@@ -291,6 +353,86 @@ mod tests {
         assert_eq!(
             get_env(&entry, "AP_EMBED_OLLAMA_MODEL"),
             Some("qwen3-embedding:0.6b")
+        );
+    }
+
+    #[test]
+    fn upsert_bundled_extension_entry_inserts_disabled_by_default() {
+        let mut exts = serde_norway::Mapping::new();
+        upsert_bundled_extension_entry(
+            &mut exts,
+            "replacement-mcp",
+            "C:/app/replacement-mcp.exe",
+            &[],
+        )
+        .unwrap();
+        let entry = exts
+            .get(YamlValue::String("replacement-mcp".into()))
+            .unwrap()
+            .as_mapping()
+            .unwrap();
+        assert_eq!(
+            entry.get(YamlValue::String("enabled".into())),
+            Some(&YamlValue::Bool(false))
+        );
+        assert_eq!(
+            entry
+                .get(YamlValue::String("cmd".into()))
+                .and_then(|v| v.as_str()),
+            Some("C:/app/replacement-mcp.exe")
+        );
+        assert_eq!(
+            entry
+                .get(YamlValue::String("type".into()))
+                .and_then(|v| v.as_str()),
+            Some("stdio")
+        );
+    }
+
+    #[test]
+    fn upsert_bundled_extension_entry_updates_cmd_without_touching_enabled() {
+        let mut exts = serde_norway::Mapping::new();
+        upsert_bundled_extension_entry(
+            &mut exts,
+            "replacement-mcp",
+            "C:/old/replacement-mcp.exe",
+            &[],
+        )
+        .unwrap();
+        // Simulate the user having enabled it via Settings.
+        {
+            let entry = exts
+                .get_mut(YamlValue::String("replacement-mcp".into()))
+                .unwrap()
+                .as_mapping_mut()
+                .unwrap();
+            entry.insert(YamlValue::String("enabled".into()), YamlValue::Bool(true));
+        }
+
+        // A second call (e.g. after a reinstall moved the exe) must update
+        // `cmd` in place without silently flipping the user's choice back off.
+        upsert_bundled_extension_entry(
+            &mut exts,
+            "replacement-mcp",
+            "C:/new/replacement-mcp.exe",
+            &[],
+        )
+        .unwrap();
+
+        let entry = exts
+            .get(YamlValue::String("replacement-mcp".into()))
+            .unwrap()
+            .as_mapping()
+            .unwrap();
+        assert_eq!(
+            entry
+                .get(YamlValue::String("cmd".into()))
+                .and_then(|v| v.as_str()),
+            Some("C:/new/replacement-mcp.exe")
+        );
+        assert_eq!(
+            entry.get(YamlValue::String("enabled".into())),
+            Some(&YamlValue::Bool(true))
         );
     }
 }

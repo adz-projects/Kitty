@@ -123,6 +123,15 @@ pub struct Config {
     /// per-provider.
     #[serde(default = "default_ap_embedding_model")]
     pub adaptive_pathway_embedding_model: String,
+    /// Whether the `replacement-mcp` extension (see `plugins/replacement-mcp/`)
+    /// is registered+enabled as a goosed stdio MCP extension. Off by default —
+    /// unlike Adaptive Pathway, this one replaces Goose's built-in `developer`/
+    /// `computercontroller` extensions, so it's opt-in rather than assumed.
+    /// Kitty never spawns/monitors this extension's process itself (goosed
+    /// does, like any other extension) — this flag only drives whether
+    /// `goose_config::ensure_extension_registered`'s entry is enabled.
+    #[serde(default)]
+    pub replacement_mcp_enabled: bool,
     /// User-defined scheduled tasks (instructions the agent runs later,
     /// one-shot or recurring, with or without the app open) — see
     /// `scheduled_tasks::ScheduledTask`.
@@ -186,6 +195,7 @@ impl Default for Config {
             adaptive_pathway_db_path: default_ap_db_path(),
             adaptive_pathway_port: default_ap_port(),
             adaptive_pathway_embedding_model: default_ap_embedding_model(),
+            replacement_mcp_enabled: false,
             scheduled_tasks: Vec::new(),
             goose_binary_override: None,
             ollama_enabled: default_true(),
@@ -214,8 +224,28 @@ fn default_adaptive_pathway_enabled() -> bool {
     true
 }
 
+/// The sidecar is bundled as a frozen `.exe` via Tauri's `externalBin`
+/// mechanism (see `plugins/build.py`, `tauri.conf.json`'s `bundle.externalBin`)
+/// and lands next to the main app executable at install time — no Python
+/// runtime on the end user's machine. Resolves that path if present; falls
+/// back to a bare PATH-relative name otherwise (dev convenience only: running
+/// via `cargo run`/`tauri dev` never copies the bundled sidecar alongside the
+/// dev binary, and a developer working on the sidecar itself can override
+/// this config field to `uv run ...` regardless of this default).
 fn default_ap_launch_command() -> String {
-    "adaptive-pathway-sidecar".to_string()
+    bundled_plugin_path("adaptive-pathway-sidecar.exe")
+        .unwrap_or_else(|| "adaptive-pathway-sidecar".to_string())
+}
+
+/// Resolves `<name>` next to the currently-running executable, if it exists.
+/// Shared by every bundled-plugin default (see also `goose_config.rs`'s
+/// replacement-mcp registration, which needs the same resolution).
+pub(crate) fn bundled_plugin_path(name: &str) -> Option<String> {
+    let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    let candidate = dir.join(name);
+    candidate
+        .exists()
+        .then(|| candidate.to_string_lossy().into_owned())
 }
 
 /// An absolute default, not a bare relative `./pathway.db` — the sidecar

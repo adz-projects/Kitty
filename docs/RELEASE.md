@@ -3,8 +3,14 @@
 ## Build
 
 ```powershell
+python plugins/build.py    # freeze the internal plugins (adaptive-pathway,
+                            # replacement-mcp) to src-tauri/binaries/ — see
+                            # plugins/README.md. Skipping this step leaves the
+                            # committed empty placeholders in place, which
+                            # `tauri build` will happily bundle without
+                            # complaint but which can't actually run.
 pnpm install
-pnpm tauri build      # release build + NSIS installer
+pnpm tauri build            # release build + NSIS installer
 ```
 
 Artifacts:
@@ -32,10 +38,15 @@ warns on first run.
    (`src/lib/starter_models.ts`) and the installer URLs in `docs/VERSIONS.md`.
 4. Update the stock Goose Desktop process name(s) in `docs/VERSIONS.md`
    (conflict detection) if the desktop app's exe changed.
+5. Re-verify the pinned Python + PyInstaller versions in `docs/VERSIONS.md`
+   still build both plugins cleanly (`python plugins/build.py`).
 
 ## Pre-release verification
 
 - `cargo clippy --all-targets` clean, `cargo test`, `pnpm lint`, `pnpm build`.
+- `python plugins/build.py` succeeded and `src-tauri/binaries/*.exe` are real
+  (non-empty) — the committed placeholders satisfy `cargo build`'s existence
+  check but produce a non-functional plugin if actually packaged.
 - Secret audit: no secret in any log line, `config.json`, or event payload
   (provider keys live in Windows Credential Manager via `keyring`; goosed's
   `X-Secret-Key` stays in Rust memory + env + the local WS `token`).

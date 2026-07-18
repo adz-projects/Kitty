@@ -304,53 +304,6 @@ fn find_goose_exe(dir: &Path) -> Option<PathBuf> {
     None
 }
 
-// --- Adaptive Pathway auto-install (near-term bridge to real packaging) ---
-//
-// Adaptive Pathway is already on by default (`adaptive_pathway_enabled` in
-// `Config`), but that only means Kitty *tries* to spawn its sidecar — if the
-// Python package was never installed on the machine, it just reports `Down`
-// (existing graceful degradation, see `lifecycle/adaptive_pathway_proc.rs`).
-// This is a best-effort, non-blocking attempt to actually install it during
-// the wizard, so that graceful-degrade path isn't the common case for a
-// brand-new user. This is explicitly a bridge: the real, owner-specified
-// target is bundling a standalone sidecar executable as a Tauri
-// `externalBin` sidecar (no Python dependency at all) — see the wizard
-// redesign plan's Batch 7 for that larger, separate-repo follow-up.
-
-/// Best-effort presence probe: does `adaptive-pathway-sidecar --help` run at
-/// all? (Argparse handles `-h`/`--help` after importing the full module tree
-/// but before starting the server, so this is a cheap, side-effect-free way
-/// to confirm the console script resolves and its imports succeed.)
-fn adaptive_pathway_installed() -> bool {
-    hidden_command(Path::new("adaptive-pathway-sidecar"))
-        .arg("--help")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-/// Install the Adaptive Pathway sidecar package if it isn't already
-/// resolvable. Returns `Ok(true)` if it's installed (already was, or just
-/// got installed), `Ok(false)`/`Err` otherwise — callers must treat any
-/// non-`Ok(true)` result as non-fatal (see module doc above): the wizard
-/// still finishes, and Settings → Advanced keeps a manual retry available.
-pub async fn install_adaptive_pathway() -> Result<bool, String> {
-    if adaptive_pathway_installed() {
-        return Ok(true);
-    }
-    let output = hidden_command(Path::new("python"))
-        .args(["-m", "pip", "install", "adaptive-pathway[sidecar]"])
-        .output()
-        .map_err(|e| format!("could not run pip (is Python installed?): {e}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "pip install failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-    Ok(adaptive_pathway_installed())
-}
-
 // --- Autostart (HKCU Run key) ---
 
 pub fn autostart_enabled() -> bool {

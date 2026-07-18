@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "replacement-mcp"
+version = "0.1.0"
+description = "Lean, context-optimized MCP tools replacing Goose's built-in developer + computer_controller extensions for local small models."
+requires-python = ">=3.11"
+dependencies = [
+    "fastmcp>=2.0",
+    "httpx>=0.27",
+    "trafilatura>=1.8",
+    "duckduckgo-search>=6.0",
+    "openpyxl>=3.1",
+    "python-docx>=1.1",
+    "pypdf>=4.0",
+    "pyyaml>=6.0",
+]
+
+[project.scripts]
+replacement-mcp = "lean_mcp:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "pytest-asyncio>=0.21"]
+
+[tool.setuptools]
+py-modules = ["lean_mcp"]
+include-package-data = true
+
+[tool.setuptools.package-data]
+"*" = ["tool_prompts.yaml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -203,3 +203,26 @@ historical context only; none of it reflects current code.
   so models that reason but don't match a pattern (e.g. `gemma4:e2b`, which emits
   thoughts here) still get a panel. ACP surfaces reasoning as a distinct
   `agent_thought_chunk` — no `<think>` tag splitting needed (see acp-protocol.md).
+
+## Internal plugins & build tooling (`plugins/`)
+
+- **Python:** 3.11 (matches the `.pyc` cache tags already present in the
+  vendored Adaptive Pathway source — re-verify against whatever interpreter
+  actually runs `plugins/build.py` at release time).
+- **PyInstaller:** installed on demand by `plugins/build.py`
+  (`pip install pyinstaller`, no version pinned yet — pin here once a
+  specific version is confirmed to freeze both plugins cleanly).
+- **Adaptive Pathway** (`plugins/adaptive-pathway/`): freezes the `sidecar`
+  extra only (fastapi/uvicorn/numpy/aiosqlite/sqlalchemy/pyyaml/mmh3) — the
+  `full` extras (onnxruntime/hdbscan/bertopic) are excluded from the frozen
+  binary since Kitty doesn't surface the clustering/topic features that need
+  them; revisit if that changes.
+- **replacement-mcp** (`plugins/replacement-mcp/`): freezes `lean_mcp.py`'s
+  `main()` — deps: fastmcp, httpx, trafilatura, duckduckgo-search, openpyxl,
+  python-docx, pypdf, pyyaml (see `plugins/replacement-mcp/pyproject.toml`).
+- Both freeze to `src-tauri/binaries/<name>-x86_64-pc-windows-msvc.exe` and
+  are declared in `src-tauri/tauri.conf.json`'s `bundle.externalBin`. The
+  committed files at that path are **empty placeholders** (satisfy Tauri's
+  build-time existence check for local `cargo build`) until
+  `python plugins/build.py` overwrites them with real frozen executables —
+  see `src-tauri/binaries/README.md`.

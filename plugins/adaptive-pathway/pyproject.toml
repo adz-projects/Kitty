@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "adaptive-pathway"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "aiosqlite>=0.19",
+    "sqlalchemy>=2.0",
+    "pyyaml>=6.0",
+    "mmh3>=4.0",
+]
+
+[project.optional-dependencies]
+goose = ["mcp[cli]>=1.2.0"]
+sidecar = ["fastapi>=0.100", "uvicorn>=0.23"]
+full = ["adaptive-pathway[goose,sidecar]", "onnxruntime>=1.15", "hdbscan>=0.8", "bertopic>=0.15"]
+all = ["adaptive-pathway[full]"]
+dev = ["pytest>=7.0", "pytest-asyncio>=0.21"]
+
+[project.scripts]
+adaptive-pathway-mcp = "adaptive_pathway.mcp_server:main"
+adaptive-pathway-sidecar = "adaptive_pathway.integrations.sidecar.__main__:main"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+adaptive_pathway = ["config/*.yaml"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
