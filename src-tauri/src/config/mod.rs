@@ -330,7 +330,9 @@ pub fn load() -> Result<Config, ConfigError> {
     match fs::read_to_string(&path) {
         Ok(text) => {
             let config: Config = serde_json::from_str(&text)?;
-            Ok(migrate_recipes(migrate_hotkeys(config, &text)))
+            Ok(migrate_ap_launch_command(migrate_recipes(migrate_hotkeys(
+                config, &text,
+            ))))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
         Err(e) => Err(e.into()),
@@ -351,6 +353,26 @@ pub fn load() -> Result<Config, ConfigError> {
 fn migrate_recipes(mut config: Config) -> Config {
     if config.recipes.is_empty() {
         config.recipes = recipes::builtin_templates();
+    }
+    config
+}
+
+/// Self-heals an existing install's `adaptive_pathway_launch_command` onto
+/// the bundled sidecar path, mirroring the AP env-var self-heal already done
+/// in `lifecycle::start_stack`. `#[serde(default = "default_ap_launch_command")]`
+/// only ever runs when the field is *absent* from the loaded JSON — a config
+/// saved before the bundled-path resolution existed already has the old bare
+/// literal `"adaptive-pathway-sidecar"` stored explicitly, so that improved
+/// default never gets a chance to apply on its own. Only migrates the exact
+/// literal the old default used to produce — a value the user (or a prior
+/// dev-mode override) deliberately set to anything else, e.g. `uv run ...`,
+/// is left untouched.
+fn migrate_ap_launch_command(mut config: Config) -> Config {
+    const OLD_BARE_DEFAULT: &str = "adaptive-pathway-sidecar";
+    if config.adaptive_pathway_launch_command == OLD_BARE_DEFAULT {
+        if let Some(bundled) = bundled_plugin_path("adaptive-pathway-sidecar.exe") {
+            config.adaptive_pathway_launch_command = bundled;
+        }
     }
     config
 }
@@ -455,6 +477,36 @@ mod tests {
         assert!(back.adaptive_pathway_db_path.ends_with("pathway.db"));
         assert!(std::path::Path::new(&back.adaptive_pathway_db_path).is_absolute());
         assert_eq!(back.adaptive_pathway_port, 8700);
+    }
+
+    #[test]
+    fn migrate_ap_launch_command_leaves_custom_override_untouched() {
+        // A deliberate dev-mode override (e.g. pointing at `uv run ...`) must
+        // never be silently overwritten by the bundled-path self-heal.
+        let mut cfg = Config::default();
+        cfg.adaptive_pathway_launch_command = "uv run adaptive-pathway-sidecar".to_string();
+        let migrated = migrate_ap_launch_command(cfg);
+        assert_eq!(
+            migrated.adaptive_pathway_launch_command,
+            "uv run adaptive-pathway-sidecar"
+        );
+    }
+
+    #[test]
+    fn migrate_ap_launch_command_is_a_noop_with_no_bundled_binary_present() {
+        // The test binary has no `adaptive-pathway-sidecar.exe` sitting next to
+        // it, so `bundled_plugin_path` finds nothing and the old bare-name
+        // literal is left as-is — this is also the realistic behavior for a
+        // `cargo run`/`tauri dev` build with no frozen binary in place yet.
+        let cfg = Config {
+            adaptive_pathway_launch_command: "adaptive-pathway-sidecar".to_string(),
+            ..Config::default()
+        };
+        let migrated = migrate_ap_launch_command(cfg);
+        assert_eq!(
+            migrated.adaptive_pathway_launch_command,
+            "adaptive-pathway-sidecar"
+        );
     }
 
     #[test]
