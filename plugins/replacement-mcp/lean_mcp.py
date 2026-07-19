@@ -176,15 +176,7 @@ def file_editor(
         resolved.parent.mkdir(parents=True, exist_ok=True)
         resolved.write_text(content or "", encoding="utf-8")
         wc = _word_count(content or "")
-        if wc <= THRESH.get("file_echo_max_words", 500):
-            return f"{PREFIX_OK}Wrote {wc} words to {resolved}:\n{content}"
-        payload = json.dumps({
-            "status": "success",
-            "bytes": resolved.stat().st_size,
-            "words": wc,
-            "path": str(resolved),
-        })
-        return f"{PREFIX_OK}{payload}"
+        return f"{PREFIX_OK}Wrote {wc} words to {resolved}:\n{content}"
 
     if action == "append":
         if not resolved.exists():

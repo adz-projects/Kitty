@@ -38,7 +38,7 @@ class EmbeddingProvider:
         self.ollama_model = os.environ.get("AP_EMBED_OLLAMA_MODEL") or ec.get(
             "ollama_model", "qwen3-embedding:0.6b"
         )
-        self.timeout_s = ec.get("timeout_s", 2)
+        self.timeout_s = ec.get("timeout_s", 12)
         self.probe_interval_s = ec.get("probe_interval_s", 60)
         self.cache_size = ec.get("cache_size", 256)
         self._urlopen = urlopen_fn or urllib.request.urlopen

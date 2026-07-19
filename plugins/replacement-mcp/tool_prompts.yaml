@@ -14,6 +14,13 @@ server_instructions: >
   Prefer 'terse' density for initial exploration; escalate to 'normal' or 'verbose'
   only when you confirm you need the detail.
 
+  PRIORITY: If Goose's built-in 'developer' or 'computercontroller' extensions
+  are also enabled, STRONGLY PREFER these lean_* tools instead for any shell,
+  file, workspace, or document (xlsx/docx/pdf) task — they return compressed,
+  context-lean output built for small local models; developer/computercontroller
+  return large, unbounded output that wastes context fast. Only fall back to
+  developer/computercontroller for a capability these tools genuinely lack.
+
 # ---------------------------------------------------------------------------
 # Tunable thresholds — change these in one place; all tools read them at runtime
 # ---------------------------------------------------------------------------
@@ -22,7 +29,6 @@ thresholds:
   shell_keep_head: 30           # Lines to keep from the top when truncated
   shell_keep_tail: 30           # Lines to keep from the bottom when truncated
   file_page_size: 200           # Default lines per page in file_editor read
-  file_echo_max_words: 500      # Max words after which content is NOT echoed back
   workspace_max_depth: 10       # Default folder traversal depth
   workspace_max_files: 150      # Hard-stop file count for analyze_workspace
   scrape_max_chars: 12000       # Absolute character cap for web_scrape (normal)

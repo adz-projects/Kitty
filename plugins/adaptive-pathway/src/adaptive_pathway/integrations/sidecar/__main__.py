@@ -2,7 +2,7 @@ import argparse
 import os
 
 from adaptive_pathway import AdaptivePathway
-from .server import run_server
+from adaptive_pathway.integrations.sidecar.server import run_server
 
 
 def main():

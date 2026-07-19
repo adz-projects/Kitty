@@ -5,7 +5,13 @@ embedding_dim: 384
 embedding:
   ollama_url: "http://localhost:11434"
   ollama_model: "qwen3-embedding:0.6b"
-  timeout_s: 2
+  # A cold Ollama model load (spinning up llama-server, fitting the model to
+  # GPU memory) can take several seconds on the very first embed() call after
+  # the stack starts — 2s was cutting that off mid-load, which Ollama logs as
+  # "client connection closed before llama-server finished loading, aborting
+  # load", and then falls back to hashing-only embeddings for a full
+  # probe_interval_s (60s) since the timeout also marks Ollama "unavailable".
+  timeout_s: 12
   probe_interval_s: 60
   cache_size: 256
 

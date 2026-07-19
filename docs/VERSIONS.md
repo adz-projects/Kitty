@@ -107,23 +107,32 @@ historical context only; none of it reflects current code.
   outside Kitty's control:** `text_editor` only writes text, so the model must
   generate these via `shell` running Python (`openpyxl` / `python-docx` /
   `python-pptx`). If those libraries aren't present in the environment goosed's
-  shell runs in, the write fails — nothing Kitty can fix client-side. Also note
-  a shell-executed write's tool call is `{command: "..."}` with no structured
-  `path`, so even a *successful* shell-produced binary file won't surface in the
-  Artifacts pane (the pane derives entries from tool metadata, not by scanning
-  the working directory). Both are acknowledged limitations, not bugs.
+  shell runs in, the write fails — nothing Kitty can fix client-side. A
+  shell-executed write's tool call is `{command: "..."}` with no structured
+  `path`, so `deriveArtifact`'s tool-metadata derivation still misses it — but
+  (Round-7 item 5) the Artifacts pane also disk-scans the session's working
+  directory (`refreshArtifactsFromDisk`/`list_directory`), so a successful
+  shell-produced binary now does surface there, just via the disk scan rather
+  than the tool-call path.
 - **Chat ("thought-partner") mode allows tools, scoped to the chat folder
-  (Round-5, owner decision — supersedes Round-4's blanket auto-reject):** chat
-  mode still forces `approve` so every tool call surfaces as a permission
-  request Kitty decides in `chatStore.ts`'s approval handler. A path-based file
-  op is auto-approved only if its target resolves inside the session's cwd (the
-  `Documents/Kitty/chats/<id>/` folder) and auto-rejected otherwise; a tool with
-  no structured path — notably `shell`, which is how docx/xlsx get produced via
-  Python — is auto-approved and runs with cwd = the chat folder. **Soft
-  boundary, not a sandbox:** shell isn't confined, so a command could still
-  reach outside the folder; the path check hard-confines only the path-based
-  ops Kitty can inspect. This is what lets a thought-partner-mode session export
-  a docx (which previously hit "Tool use is off in chat mode — declined").
+  (Round-5, owner decision — supersedes Round-4's blanket auto-reject; made
+  tri-state in Round-7 item 3):** chat mode still forces `approve` so every
+  tool call surfaces as a permission request `decideChatApproval`
+  (`stores/chat/approvalUtils.ts`) decides. It returns one of three
+  decisions — `allow`/`reject`/`prompt` — not just a boolean: a path-based file
+  op resolving inside the session's cwd (the `Documents/Kitty/chats/<id>/`
+  folder) is `allow`; one resolving outside it, or a shell command matching
+  `isSecuritySensitiveCommand` (ssh/scp/sudo/`rm -rf`/chmod/curl -o/etc.), is
+  `prompt` — queued to `pendingApprovals` for the user to decide, same as
+  agentic mode, rather than auto-rejected outright; anything else (notably most
+  `shell` calls, which is how docx/xlsx get produced via Python) is `allow` and
+  runs with cwd = the chat folder. **Soft boundary, not a sandbox:** shell isn't
+  confined, so a command could still reach outside the folder; the path check
+  and sensitive-command check only hard-confine what Kitty can actually
+  inspect. This is what lets a thought-partner-mode session export a docx
+  (which previously hit "Tool use is off in chat mode — declined") while still
+  surfacing a human decision point for genuinely risky commands instead of
+  silently running them.
 
 ## Installer URLs & hashes (Phase 7; Goose auto-install added in the wizard redesign)
 

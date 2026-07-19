@@ -14,6 +14,7 @@ except ImportError:
 import asyncio
 import logging
 import numpy as np
+from dataclasses import asdict
 from typing import Optional
 import time
 
@@ -358,6 +359,10 @@ def create_app(adaptive_pathway) -> "FastAPI":
     async def health_check():
         issues = ap.health_check()
         return {"issues": [i if isinstance(i, dict) else {"message": str(i)} for i in issues]}
+
+    @app.get("/graph_health")
+    async def graph_health():
+        return asdict(ap.get_graph_health())
 
     @app.post("/maintenance")
     async def run_maintenance():

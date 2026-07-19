@@ -112,3 +112,14 @@ def test_tool_prompts_yaml_has_description_for_every_registered_tool(tool):
 
 def test_server_instructions_present():
     assert lean_mcp.PROMPTS.get("server_instructions", "").strip() != ""
+
+
+def test_server_instructions_assert_priority_over_builtins():
+    # Kitty can only ever *offer* to disable Goose's built-in developer/
+    # computercontroller extensions, never force it (see CLAUDE.md), so both
+    # can be enabled at once — the model needs an explicit steer toward these
+    # lean_* tools or it has no signal for which to prefer.
+    instructions = lean_mcp.PROMPTS.get("server_instructions", "")
+    assert "developer" in instructions
+    assert "computercontroller" in instructions
+    assert "PRIORITY" in instructions or "PREFER" in instructions.upper()
