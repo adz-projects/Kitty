@@ -21,3 +21,13 @@ Thumbs.db
 .env
 .env.*
 !.env.example
+
+# Python plugin build artifacts (plugins/ — see docs/PLUGINS.md).
+# The frozen .exe outputs themselves are NOT ignored: src-tauri/binaries/
+# holds two intentionally-empty committed placeholders so a fresh clone can
+# `cargo check` (see src-tauri/binaries/README.md). Never commit the real
+# ~139MB PyInstaller output over them — rebuild with `python plugins/build.py`.
+__pycache__/
+*.py[cod]
+*.egg-info/
+plugins/*/build/
