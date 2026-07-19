@@ -78,6 +78,12 @@ function absoluteArtifactPath(p: string, cwd: string | null): string {
 }
 
 export function deriveArtifact(u: ToolCallUpdate, cwd: string | null = null): Artifact | null {
+  // A failed call never produced a file — without this a tool that guessed a
+  // wrong path (e.g. retrying a doc ingest with `./name.docx` after the first
+  // attempt errored) still leaves a phantom entry in the Artifacts pane,
+  // distinct-but-duplicate of the real one since the dedup check is by exact
+  // path string.
+  if (u.status === 'failed') return null;
   const toolName = extractGooseToolMeta(u).toolName ?? '';
   const label = `${u.title ?? ''} ${toolName}`;
   const input = u.rawInput as

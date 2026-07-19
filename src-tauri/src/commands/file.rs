@@ -215,6 +215,62 @@ pub fn reveal_path(app: AppHandle, path: String) -> Result<(), String> {
         .map_err(|e| format!("could not reveal {path}: {e}"))
 }
 
+/// A single file found in a `list_directory` scan (artifacts pane disk-scan).
+#[derive(Debug, Clone, Serialize)]
+pub struct FileEntry {
+    pub name: String,
+    pub path: String,
+    pub size: u64,
+    /// Unix-epoch seconds; `0` if the platform can't report `modified`.
+    pub modified: u64,
+}
+
+/// Cap on entries returned, so a huge/misused working directory can't send an
+/// unbounded payload back to the frontend.
+const LIST_DIRECTORY_MAX_ENTRIES: usize = 500;
+
+/// List files (not subdirectories) directly in `path`, for the Artifacts
+/// pane's disk-scan (Round-7 item 5) — surfaces files that landed in the chat
+/// folder without going through a tracked tool call (e.g. dropped in via
+/// Explorer). Skips hidden files (dotfiles) and directories; returns at most
+/// `LIST_DIRECTORY_MAX_ENTRIES`, newest-modified first.
+#[tauri::command]
+pub fn list_directory(path: String) -> Result<Vec<FileEntry>, String> {
+    let dir = PathBuf::from(&path);
+    let entries =
+        std::fs::read_dir(&dir).map_err(|e| format!("could not list directory {path}: {e}"))?;
+
+    let mut files: Vec<FileEntry> = entries
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') {
+                return None;
+            }
+            let meta = entry.metadata().ok()?;
+            if !meta.is_file() {
+                return None;
+            }
+            let modified = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            Some(FileEntry {
+                name,
+                path: entry.path().to_string_lossy().to_string(),
+                size: meta.len(),
+                modified,
+            })
+        })
+        .collect();
+
+    files.sort_by_key(|f| std::cmp::Reverse(f.modified));
+    files.truncate(LIST_DIRECTORY_MAX_ENTRIES);
+    Ok(files)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

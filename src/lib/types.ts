@@ -1,7 +1,8 @@
 // Shared TS types. Mirror the Rust structs by hand; keep in sync.
 // Pairs:
 //   Config / NotificationPrefs  <-> src-tauri/src/config/mod.rs
-//   StackStatus / StackStatusPayload <-> src-tauri/src/lifecycle/mod.rs
+//   StackStatus <-> src-tauri/src/state.rs; StackStatusPayload <-> src-tauri/src/lifecycle/health.rs
+//   StartupPhase <-> src-tauri/src/state.rs; StartupPhasePayload <-> src-tauri/src/lifecycle/mod.rs
 
 export interface NotificationPrefs {
   task_complete: boolean;
@@ -161,12 +162,7 @@ export interface RecipeParameter {
     `add_recipe_extension`); the rest are stored for YAML round-trip fidelity
     and silently skipped at launch. */
 export type RecipeExtensionType =
-  | 'stdio'
-  | 'builtin'
-  | 'platform'
-  | 'streamable_http'
-  | 'frontend'
-  | 'inline_python';
+  'stdio' | 'builtin' | 'platform' | 'streamable_http' | 'frontend' | 'inline_python';
 
 /** Mirrors `config::recipes::RecipeExtension`. Extra real-schema fields
     Kitty doesn't specifically interpret pass through via an index signature
@@ -310,6 +306,15 @@ export interface StackStatusPayload {
   detail: string | null;
 }
 
+// One-time startup progress, separate from StackStatus (which is a
+// steady-state health readout and has no concept of "spawning"/"warming").
+// `ready` has no further bearing on chat availability once reached.
+export type StartupPhase = 'spawning_goosed' | 'warming_model' | 'ready';
+
+export interface StartupPhasePayload {
+  phase: StartupPhase;
+}
+
 // --- Adaptive Pathway extension sidecar (kept separate from StackStatus —
 // this is an optional augmentation, not a chat-blocking dependency). ---
 export type AdaptivePathwayStatus = 'disabled' | 'starting' | 'ok' | 'down';
@@ -429,6 +434,25 @@ export interface AdaptivePathwayHealthIssue {
   component: string;
   message: string;
   details: Record<string, unknown>;
+}
+
+/** `GET /graph_health` result (Round-7 item 6) — mirrors
+    `adaptive_pathway.types.GraphHealth`, the richer companion to
+    `AdaptivePathwayHealthIssue`'s issues-only `/health` payload. The nested
+    `*_health`/`tier_distribution` blocks and `hotspot_details` entries are
+    intentionally loosely typed (`Record<string, unknown>`) — their shape is
+    Python-engine-internal and not otherwise mirrored on the Rust/TS side. */
+export interface AdaptivePathwayGraphHealth {
+  total_edges: number;
+  high_confidence_pct: number;
+  flagged_hotspots: number;
+  last_override_rate: number;
+  blocking_issues: boolean;
+  dimensionality_health: Record<string, unknown>;
+  ensemble_health: Record<string, unknown>;
+  novelty_health: Record<string, unknown>;
+  tier_distribution: Record<string, number>;
+  hotspot_details: Record<string, unknown>[];
 }
 
 /** `GET /domains` entry — Domain Profiles tab (Round-D Batch 2). */
@@ -557,6 +581,15 @@ export interface PathInfo {
   name: string;
   is_dir: boolean;
   exists: boolean;
+}
+
+/** Mirrors `commands::file::FileEntry` — one file from a `list_directory`
+    disk-scan (Artifacts pane, Round-7 item 5). */
+export interface FileEntry {
+  name: string;
+  path: string;
+  size: number;
+  modified: number;
 }
 
 /** Parsed from a raw ACP `session/list` entry. */

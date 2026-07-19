@@ -96,6 +96,13 @@ interface ChatState {
   droppedFiles: PathInfo[];
   attachments: Attachment[];
   pendingImages: PendingImage[];
+  /** Raw paths currently being inspected/read by `addDroppedPaths`, before
+      they land in `droppedFiles`/`attachments`/`pendingImages` — drives a
+      placeholder "attaching…" chip so a large file or a cold session-create
+      (chat-only mode's binary-file path needs a real session first) doesn't
+      look like nothing happened. Cleared (per-path) once that file's own
+      processing finishes, success or failure. */
+  pendingAttachments: string[];
   pendingApprovals: ApprovalNeededEvent[];
   busy: boolean;
   /** The goosed-level `providerId`/`modelId` (from `session/list`'s `_meta`,
@@ -206,6 +213,12 @@ interface ChatState {
       another app). Best-effort: a failed check just leaves the list as-is
       until the next call. */
   pruneMissingArtifacts: () => Promise<void>;
+  /** Scan `cwd` on disk and merge in any file not already tracked as an
+      artifact (e.g. dropped in via Explorer rather than written by a tool
+      call) — the tool-call-derived path above is event-driven and only ever
+      sees files a tracked tool call actually wrote. Best-effort: a failed
+      scan (missing/inaccessible directory) just leaves the list as-is. */
+  refreshArtifactsFromDisk: () => Promise<void>;
   refreshProvider: () => Promise<void>;
   branch: (uiIndex: number) => Promise<void>;
   regenerate: (assistantIndex: number) => Promise<void>;
@@ -339,6 +352,16 @@ function getOrCreateSession(cwd?: string): Promise<SessionInfo> {
   }
   return pendingNewSession;
 }
+
+// Set whenever `onSessionDeleted` tears down *this window's own* active
+// session (see that handler below). goosed briefly races on its own side
+// right after `session/delete` — the very next `session/new` on the same
+// connection can come back "resource not found" even though the new
+// session has nothing to do with the deleted one. Real, observed bug:
+// Delete-the-chat-you're-in followed by New Chat surfaced that transient
+// error to the user instead of just working on a silent retry.
+let recentOwnSessionDeleteAt = 0;
+const OWN_DELETE_RETRY_WINDOW_MS = 3000;
 
 export const useChatStore = create<ChatState>((set, get) => {
   // Force approve-mode whenever the effective mode is chat, so `auto` can
@@ -480,6 +503,18 @@ export const useChatStore = create<ChatState>((set, get) => {
     };
   };
 
+  // Some OpenAI-compatible endpoints (observed with a custom local server)
+  // re-emit the *entire* completion as one final `agent_message_chunk` after
+  // having already streamed it token-by-token, instead of a genuine
+  // incremental delta — goosed forwards whatever chunk it gets, so without
+  // this guard the message ends up with its own full text duplicated back to
+  // back. A real incremental chunk is never byte-identical to everything
+  // already accumulated, so this only ever catches that echo (guarded by a
+  // length floor so a short, coincidentally-repeated delta can't trip it).
+  const ECHO_GUARD_MIN_LEN = 24;
+  const dropEchoedChunk = (soFar: string, incoming: string) =>
+    incoming.length >= ECHO_GUARD_MIN_LEN && incoming === soFar ? '' : incoming;
+
   const flushDeltas = () => {
     if (flushHandle != null) {
       cancelAnimationFrame(flushHandle);
@@ -498,7 +533,10 @@ export const useChatStore = create<ChatState>((set, get) => {
         last.role === 'assistant' &&
         (last.open || isStragglerAssistantMessage(last, s.busy))
       ) {
-        const fixed = resolveThinkLeak(last.text + t, last.reasoning + r);
+        const fixed = resolveThinkLeak(
+          last.text + dropEchoedChunk(last.text, t),
+          last.reasoning + dropEchoedChunk(last.reasoning, r)
+        );
         msgs[msgs.length - 1] = { ...last, ...fixed };
         return { messages: msgs };
       }
@@ -609,6 +647,7 @@ export const useChatStore = create<ChatState>((set, get) => {
     droppedFiles: [],
     attachments: [],
     pendingImages: [],
+    pendingAttachments: [],
     pendingApprovals: [],
     busy: false,
     sessionProviderId: null,
@@ -650,6 +689,29 @@ export const useChatStore = create<ChatState>((set, get) => {
         set((s) => ({ artifacts: s.artifacts.filter((a) => !missing.has(a.path)) }));
       } catch {
         // best-effort — try again on the next call
+      }
+    },
+
+    refreshArtifactsFromDisk: async () => {
+      const cwd = get().cwd;
+      if (!cwd) return;
+      try {
+        const entries = await ipc.listDirectory(cwd);
+        // Compare on a normalized (forward-slash, lowercased) form — Windows
+        // paths are case-insensitive and tool-derived artifact paths can mix
+        // separators (see absoluteArtifactPath in messageUtils.ts), so raw
+        // string equality would under-dedupe against disk-scanned entries.
+        const normalize = (p: string) => p.replace(/\\/g, '/').toLowerCase();
+        set((s) => {
+          const known = new Set(s.artifacts.map((a) => normalize(a.path)));
+          const additions: Artifact[] = entries
+            .filter((e) => !known.has(normalize(e.path)))
+            .map((e) => ({ path: e.path, name: e.name, tool: 'disk', source: 'disk' as const }));
+          if (additions.length === 0) return s;
+          return { artifacts: [...s.artifacts, ...additions] };
+        });
+      } catch {
+        // best-effort — try again on the next call (e.g. cwd not yet created)
       }
     },
 
@@ -756,6 +818,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         droppedFiles: [],
         attachments: [],
         pendingImages: [],
+        pendingAttachments: [],
         pendingApprovals: [],
         modeOverride: null,
         savedApprovalMode: null,
@@ -810,6 +873,13 @@ export const useChatStore = create<ChatState>((set, get) => {
         droppedFiles: [],
         attachments: [],
         pendingImages: [],
+        // pendingAttachments intentionally NOT cleared here: ensureSession()
+        // calls newSession() mid-flight while a drop's own addDroppedPaths
+        // is still copying a file into the not-yet-created session's folder
+        // (see inlineFileAsAttachment's ensureSession() call) — clearing it
+        // here flash-hid that in-flight chip. addDroppedPaths's own `finally`
+        // already removes exactly the paths it added once that flow settles,
+        // so nothing can linger.
         pendingApprovals: [],
         modeOverride: null,
         savedApprovalMode: null,
@@ -824,17 +894,38 @@ export const useChatStore = create<ChatState>((set, get) => {
         loopSuspected: false,
         activeRecipeTurn: null,
       });
-      const info = await getOrCreateSession(cwd);
-      set({
-        sessionId: info.session_id,
-        cwd: info.cwd,
-        mode: info.current_mode,
-        availableModes: info.available_modes,
-        thinkingEffort: info.thinking_effort,
-        creatingSession: false,
-      });
-      await get().refreshProvider();
-      await ensureSafeApprovalMode();
+      try {
+        let info: SessionInfo;
+        try {
+          info = await getOrCreateSession(cwd);
+        } catch (e) {
+          // Suppress the transient "resource not found" goosed throws when
+          // New Chat lands immediately after deleting the chat that was
+          // active — silently retry once rather than showing the user an
+          // error for a race that isn't actually their new session's fault.
+          if (Date.now() - recentOwnSessionDeleteAt > OWN_DELETE_RETRY_WINDOW_MS) throw e;
+          recentOwnSessionDeleteAt = 0;
+          info = await getOrCreateSession(cwd);
+        }
+        recentOwnSessionDeleteAt = 0;
+        set({
+          sessionId: info.session_id,
+          cwd: info.cwd,
+          mode: info.current_mode,
+          availableModes: info.available_modes,
+          thinkingEffort: info.thinking_effort,
+          creatingSession: false,
+        });
+        await get().refreshProvider();
+        await ensureSafeApprovalMode();
+      } catch (e) {
+        // Real, observed bug: an uncaught failure here (e.g. goosed briefly
+        // down right after a Delete) used to leave `creatingSession: true`
+        // forever with no session id — the composer looked alive but every
+        // send silently no-opped. Surface the error and drop back to a
+        // recoverable (not "stuck loading") state instead.
+        set({ creatingSession: false, error: String(e) });
+      }
     },
 
     ensureSession: async () => {
@@ -1059,6 +1150,9 @@ export const useChatStore = create<ChatState>((set, get) => {
 
     addDroppedPaths: async (paths: string[]) => {
       if (!paths.length) return;
+      // Placeholder chips (FileChips) so a slow inspect/read/session-create
+      // isn't silently invisible — cleared in `finally` regardless of outcome.
+      set((s) => ({ pendingAttachments: [...s.pendingAttachments, ...paths] }));
       try {
         let infos = await ipc.inspectPaths(paths);
         // The active model can't see images at all — drop them here, before
@@ -1095,6 +1189,10 @@ export const useChatStore = create<ChatState>((set, get) => {
         });
       } catch (e) {
         set({ error: String(e) });
+      } finally {
+        set((s) => ({
+          pendingAttachments: s.pendingAttachments.filter((p) => !paths.includes(p)),
+        }));
       }
     },
 
@@ -1231,7 +1329,17 @@ export const useChatStore = create<ChatState>((set, get) => {
       }
       const firstMessage = get().messages.length === 0;
       const chatOnly = isChatMode(get());
-      const sessionId = await get().ensureSession();
+      let sessionId: string;
+      try {
+        sessionId = await get().ensureSession();
+      } catch (e) {
+        // Real, observed bug: an uncaught failure here (e.g. goosed down)
+        // used to throw out of send() with no user-facing error and, on a
+        // concurrent/overlapping call, could leave `busy` stuck true —
+        // reset it explicitly and surface the error instead.
+        set({ busy: false, error: String(e) });
+        return;
+      }
       const files = get().droppedFiles;
 
       // Agentic-mode images go as native ACP image content blocks instead of a
@@ -1648,6 +1756,7 @@ export const useChatStore = create<ChatState>((set, get) => {
       // next send()).
       void onSessionDeleted((sessionId) => {
         if (get().sessionId === sessionId) {
+          recentOwnSessionDeleteAt = Date.now();
           clearStopGrace();
           discardDeltas();
           set({
@@ -1662,6 +1771,7 @@ export const useChatStore = create<ChatState>((set, get) => {
             droppedFiles: [],
             attachments: [],
             pendingImages: [],
+            pendingAttachments: [],
             pendingApprovals: [],
             modeOverride: null,
             savedApprovalMode: null,
@@ -1695,6 +1805,7 @@ export const useChatStore = create<ChatState>((set, get) => {
             droppedFiles: [],
             attachments: [],
             pendingImages: [],
+            pendingAttachments: [],
             pendingApprovals: [],
             modeOverride: null,
             savedApprovalMode: null,
@@ -1747,11 +1858,22 @@ export const useChatStore = create<ChatState>((set, get) => {
             });
             return;
           }
-          const { optionId, warning } = decideChatApproval(
+          const { decision, optionId, warning } = decideChatApproval(
             e.tool_call.rawInput,
             get().cwd,
             e.options
           );
+          if (decision === 'prompt') {
+            // Ambiguous enough to need a human — queue it like agentic mode
+            // does, instead of auto-deciding (ChatView renders ApprovalPrompt
+            // for chat mode too once pendingApprovals is non-empty).
+            set((s) =>
+              s.pendingApprovals.some((a) => a.tool_call_id === e.tool_call_id)
+                ? {}
+                : { pendingApprovals: [...s.pendingApprovals, e] }
+            );
+            return;
+          }
           void ipc.respondPermission(e.tool_call_id, optionId).catch(() => {});
           if (warning) set({ warning });
           return;

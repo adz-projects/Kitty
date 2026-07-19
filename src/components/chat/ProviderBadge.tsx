@@ -4,19 +4,23 @@ import { TrustIcon } from '@/lib/provider_trust';
 import type { ProviderView } from '@/lib/types';
 import { usePopoverPosition } from '@/lib/usePopoverPosition';
 import { SettingsGearIcon } from '@/components/icons/SettingsGearIcon';
+import { useChatStore } from '@/stores/chatStore';
 
 /** Active-provider badge with a click-to-switch popover (Round-2 item 9), shown
     in both the overlay and full window. Switching calls activate_provider, which
     health-gates the target first (rejects and stays on the old provider if it
     isn't reachable/authenticated) then respawns goosed and emits
     provider://activated — the store re-syncs from that.
-    Note: switching mid-conversation restarts goosed; use "New chat" to continue. */
+    Switching mid-conversation restarts goosed and only best-effort rebinds the
+    session, so once the active session has any history the dropdown locks —
+    "New chat" is the supported way to change providers. */
 export function ProviderBadge() {
   const [providers, setProviders] = useState<ProviderView[]>([]);
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
   const [switchError, setSwitchError] = useState<string | null>(null);
   const { triggerRef, popoverRef, style } = usePopoverPosition(open, () => setOpen(false));
+  const locked = useChatStore((s) => s.messages.length > 0);
 
   const load = () =>
     ipc
@@ -58,8 +62,12 @@ export function ProviderBadge() {
         ref={triggerRef as React.Ref<HTMLButtonElement>}
         className="status-badge provider-badge"
         onClick={() => setOpen((o) => !o)}
-        title="Provider — click to switch (restarts the agent)"
-        disabled={busy}
+        title={
+          locked
+            ? "Switching providers isn't allowed mid-conversation — start a New Chat to switch"
+            : 'Provider — click to switch (restarts the agent)'
+        }
+        disabled={busy || locked}
       >
         {icon} <span className="provider-badge-label">{busy ? 'switching…' : label}</span> ▾
       </button>

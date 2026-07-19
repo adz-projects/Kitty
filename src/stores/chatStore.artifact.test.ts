@@ -8,11 +8,12 @@ import type { ToolCallUpdate } from '@/lib/types';
 
 // Build a tool-call update the way goosed sends it: toolName lives under
 // `_meta.goose.toolCall.toolName`; the path under `rawInput`.
-function tc(toolName: string, rawInput: unknown, title = ''): ToolCallUpdate {
+function tc(toolName: string, rawInput: unknown, title = '', status?: string): ToolCallUpdate {
   return {
     toolCallId: 't1',
     title,
     rawInput,
+    status,
     _meta: { goose: { toolCall: { toolName } } },
   } as ToolCallUpdate;
 }
@@ -66,5 +67,13 @@ describe('deriveArtifact', () => {
   it('keeps an absolute path as-is even when a cwd is given', () => {
     const a = deriveArtifact(tc('write', { path: 'C:/other/out.csv' }), 'C:/Users/me/chats/abc');
     expect(a?.path).toBe('C:/other/out.csv');
+  });
+
+  it('never derives an artifact from a failed tool call (no file was actually produced)', () => {
+    const a = deriveArtifact(
+      tc('rag_ingest_file', { file_path: './report.docx' }, '', 'failed'),
+      'C:/Users/me/chats/abc'
+    );
+    expect(a).toBeNull();
   });
 });

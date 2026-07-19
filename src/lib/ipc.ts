@@ -8,6 +8,7 @@ import { open as openDialog, save as saveDialog } from '@tauri-apps/plugin-dialo
 import type {
   AdaptivePathwayDomain,
   AdaptivePathwayEdge,
+  AdaptivePathwayGraphHealth,
   AdaptivePathwayHealthIssue,
   AdaptivePathwayMetrics,
   AdaptivePathwaySchismAlert,
@@ -26,6 +27,7 @@ import type {
   EnvVar,
   ExtensionDefault,
   FileAttachment,
+  FileEntry,
   FolderData,
   LogEntry,
   ModeEvent,
@@ -47,6 +49,8 @@ import type {
   SetupValidation,
   StackStatus,
   StackStatusPayload,
+  StartupPhase,
+  StartupPhasePayload,
   TextDeltaEvent,
   ThinkingEffort,
   ToolCallEvent,
@@ -61,6 +65,7 @@ export const ipc = {
     invoke<void>('open_settings', { section: section ?? null, highlight: highlight ?? null }),
   openMain: () => invoke<void>('open_main'),
   getStackStatus: () => invoke<StackStatus>('get_stack_status'),
+  getStartupPhase: () => invoke<StartupPhase>('get_startup_phase'),
   restartGoosed: () => invoke<void>('restart_goosed'),
   newSession: (cwd?: string) => invoke<SessionInfo>('new_session', { cwd: cwd ?? null }),
   sendPrompt: (sessionId: string, text: string, images?: { mime: string; data_url: string }[]) =>
@@ -136,14 +141,11 @@ export const ipc = {
   // chatStore.ts's sendWithRecipe and docs/BACKLOG.md's now-resolved entry).
   listRecipes: () => invoke<Recipe[]>('list_recipes'),
   createRecipe: (recipe: RecipeInput) => invoke<Recipe>('create_recipe', { recipe }),
-  updateRecipe: (id: string, recipe: RecipeInput) =>
-    invoke<void>('update_recipe', { id, recipe }),
+  updateRecipe: (id: string, recipe: RecipeInput) => invoke<void>('update_recipe', { id, recipe }),
   deleteRecipe: (id: string) => invoke<void>('delete_recipe', { id }),
   duplicateRecipe: (id: string) => invoke<Recipe>('duplicate_recipe', { id }),
-  importRecipeYaml: (path: string) =>
-    invoke<RecipeImportResult>('import_recipe_yaml', { path }),
-  exportRecipeYaml: (id: string, path: string) =>
-    invoke<void>('export_recipe_yaml', { id, path }),
+  importRecipeYaml: (path: string) => invoke<RecipeImportResult>('import_recipe_yaml', { path }),
+  exportRecipeYaml: (id: string, path: string) => invoke<void>('export_recipe_yaml', { id, path }),
   addRecipeExtension: (sessionId: string, extension: RecipeExtension) =>
     invoke<void>('add_recipe_extension', { sessionId, extension }),
   // Error/warning log (Settings → Advanced) — captured server-side from
@@ -177,6 +179,7 @@ export const ipc = {
   inspectPaths: (paths: string[]) => invoke<PathInfo[]>('inspect_paths', { paths }),
   openPath: (path: string) => invoke<void>('open_path', { path }),
   revealPath: (path: string) => invoke<void>('reveal_path', { path }),
+  listDirectory: (path: string) => invoke<FileEntry[]>('list_directory', { path }),
   // Providers
   listProviders: () => invoke<ProviderView[]>('list_providers'),
   upsertProvider: (profile: ProviderProfile, secret: string | null) =>
@@ -273,6 +276,8 @@ export const ipc = {
     ),
   adaptivePathwayHealth: () =>
     invoke<{ issues: AdaptivePathwayHealthIssue[] }>('adaptive_pathway_health'),
+  adaptivePathwayGraphHealth: () =>
+    invoke<AdaptivePathwayGraphHealth>('adaptive_pathway_graph_health'),
   adaptivePathwayListDomains: () =>
     invoke<AdaptivePathwayDomain[]>('adaptive_pathway_list_domains'),
   adaptivePathwayUpdateDomain: (
@@ -373,6 +378,11 @@ export async function pickRecipeSavePath(defaultName: string): Promise<string | 
 /** Subscribe to stack status changes. Returns an unlisten fn. */
 export function onStackStatus(cb: (payload: StackStatusPayload) => void): Promise<UnlistenFn> {
   return listen<StackStatusPayload>('stack://status', (e) => cb(e.payload));
+}
+
+/** Subscribe to startup-phase changes. Returns an unlisten fn. */
+export function onStartupPhase(cb: (payload: StartupPhasePayload) => void): Promise<UnlistenFn> {
+  return listen<StartupPhasePayload>('stack://startup-phase', (e) => cb(e.payload));
 }
 
 /** Adaptive Pathway sidecar status changes (kept separate from stack status —

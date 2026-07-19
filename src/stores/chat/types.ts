@@ -53,9 +53,11 @@ export interface Artifact {
   name: string;
   tool: string;
   /** `'tool'` (default) for goosed tool-call-derived artifacts, `'user'` for a
-      file the user attached to a message — distinguishes the two sources in
-      the UI without changing how either is opened/revealed. */
-  source?: 'user' | 'tool';
+      file the user attached to a message, `'disk'` for a file found in the
+      working directory that wasn't otherwise derived from a tool call or
+      attachment (e.g. dropped in via Explorer) — distinguishes the sources in
+      the UI without changing how any of them are opened/revealed. */
+  source?: 'user' | 'tool' | 'disk';
 }
 
 /** An inlined document (large paste or dropped text file) in chat-only mode. */

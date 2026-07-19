@@ -262,6 +262,15 @@ pub async fn adaptive_pathway_health(app: AppHandle) -> Result<Value, String> {
     crate::adaptive_pathway::health(&ap_base(&app)).await
 }
 
+/// Graph Health tab's richer data (edge counts, tier distribution, hotspots,
+/// override rate, …) — distinct from `adaptive_pathway_health`'s issues-only
+/// payload above.
+#[tauri::command]
+pub async fn adaptive_pathway_graph_health(app: AppHandle) -> Result<Value, String> {
+    require_ok(&app)?;
+    crate::adaptive_pathway::get_graph_health(&ap_base(&app)).await
+}
+
 /// Domain Profiles tab's list.
 #[tauri::command]
 pub async fn adaptive_pathway_list_domains(app: AppHandle) -> Result<Value, String> {

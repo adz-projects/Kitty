@@ -212,6 +212,25 @@ pub async fn health(base: &str) -> Result<Value, String> {
     resp.json::<Value>().await.map_err(|e| e.to_string())
 }
 
+/// `GET /graph_health` — the richer `GraphHealth` struct (edge counts, tier
+/// distribution, hotspots, override rate, …) behind the Graph Health tab
+/// (Round-7 item 6) — distinct from `/health`'s issues-only payload above.
+pub async fn get_graph_health(base: &str) -> Result<Value, String> {
+    let url = format!("{}/graph_health", base.trim_end_matches('/'));
+    let resp = http_client()
+        .get(url)
+        .timeout(TIMEOUT)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    // Unlike the other GET helpers above, a non-2xx here (e.g. a sidecar
+    // exe that predates this route and 404s) still parses as valid JSON
+    // (FastAPI's `{"detail": "Not Found"}`) — checked explicitly so that
+    // shape doesn't get treated as real `GraphHealth` data downstream.
+    let resp = resp.error_for_status().map_err(|e| e.to_string())?;
+    resp.json::<Value>().await.map_err(|e| e.to_string())
+}
+
 /// `GET /domains` — Domain Profiles tab's list (Round-D Batch 2).
 pub async fn list_domains(base: &str) -> Result<Value, String> {
     let url = format!("{}/domains", base.trim_end_matches('/'));

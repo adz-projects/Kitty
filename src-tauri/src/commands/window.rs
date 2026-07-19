@@ -6,7 +6,7 @@ use tauri::{AppHandle, Manager};
 use crate::config;
 use crate::lifecycle;
 use crate::state::AppState;
-use crate::state::StackStatus;
+use crate::state::{StackStatus, StartupPhase};
 use crate::windows;
 
 /// Show/hide the overlay from the frontend.
@@ -51,6 +51,14 @@ pub async fn open_main(app: AppHandle) -> Result<(), String> {
 #[tauri::command]
 pub fn get_stack_status(state: tauri::State<'_, AppState>) -> Result<StackStatus, String> {
     Ok(*state.stack_status.lock().unwrap())
+}
+
+/// One-time startup progress (frontend also listens to `stack://startup-phase`).
+/// Lets a window that attaches after `start_stack` began (e.g. a slow overlay
+/// mount) prime its initial phase instead of assuming `SpawningGoosed`.
+#[tauri::command]
+pub fn get_startup_phase(state: tauri::State<'_, AppState>) -> Result<StartupPhase, String> {
+    Ok(*state.startup_phase.lock().unwrap())
 }
 
 /// Restart the goosed child (kills our owned process, respawns). "Fix this" and

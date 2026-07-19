@@ -33,11 +33,16 @@ export function Composer({
   onStop,
   disabled,
   concluded,
+  sendBlocked,
 }: {
   onSend: (text: string) => void;
   onStop: () => void;
   disabled: boolean;
   concluded?: boolean;
+  /** Blocks submission without swapping the button to the Stop/streaming UI
+      (unlike `disabled`, which implies a response is actively streaming) —
+      used while the stack is still warming up at startup. */
+  sendBlocked?: boolean;
 }) {
   const [text, setText] = useState('');
   const ref = useRef<HTMLTextAreaElement>(null);
@@ -100,9 +105,12 @@ export function Composer({
   };
 
   // Cancel any pending resize frame on unmount.
-  useEffect(() => () => {
-    if (resizeRaf.current) cancelAnimationFrame(resizeRaf.current);
-  }, []);
+  useEffect(
+    () => () => {
+      if (resizeRaf.current) cancelAnimationFrame(resizeRaf.current);
+    },
+    []
+  );
 
   const acceptRecipe = (recipe: Recipe) => {
     const next = `/${recipe.slug} `;
@@ -115,7 +123,7 @@ export function Composer({
 
   const submit = () => {
     const value = text.trim();
-    if (!value || disabled || concluded) return;
+    if (!value || disabled || concluded || sendBlocked) return;
     const match = matchRecipeCommand(value, recipes);
     if (match) {
       void sendWithRecipe(match.recipe, match.primaryText);
@@ -248,7 +256,11 @@ export function Composer({
           </button>
         )
       ) : (
-        <button className="primary" onClick={submit} disabled={!text.trim() || concluded}>
+        <button
+          className="primary"
+          onClick={submit}
+          disabled={!text.trim() || concluded || sendBlocked}
+        >
           Send
         </button>
       )}

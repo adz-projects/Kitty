@@ -50,6 +50,24 @@ pub enum StackStatus {
     ConflictGooseDesktop,
 }
 
+/// Transient one-time startup progress, kept separate from `StackStatus`
+/// (which is a steady-state health readout re-derived every 5s and can't
+/// represent "spawning" — see `lifecycle::start_stack`). Set imperatively
+/// during `start_stack` and never touched by the health loop. `Ready` once
+/// the app has finished its one-time startup sequence, and thereafter has no
+/// further bearing on chat availability (that's `StackStatus`'s job).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum StartupPhase {
+    #[default]
+    SpawningGoosed,
+    /// Only entered when a local Ollama model needs warming (see
+    /// `config::providers::active_ollama_target`) — remote/API-key providers
+    /// skip straight from `SpawningGoosed` to `Ready`.
+    WarmingModel,
+    Ready,
+}
+
 /// Root managed state, registered via `app.manage(AppState::new(..))`.
 pub struct AppState {
     /// App configuration (persisted to `%APPDATA%/goose-overlay/config.json`).
@@ -60,6 +78,9 @@ pub struct AppState {
     pub ollama: Mutex<ManagedProcess>,
     /// Last computed stack status, so the health loop only emits on change.
     pub stack_status: Mutex<StackStatus>,
+    /// One-time startup progress (see `StartupPhase`); set by `start_stack`,
+    /// read by `get_startup_phase` for late-attaching windows.
+    pub startup_phase: Mutex<StartupPhase>,
     /// The live ACP connection to goosed, lazily established on first use and
     /// cleared on disconnect (async mutex: held across `.await`).
     pub acp: AsyncMutex<Option<AcpClient>>,
@@ -98,6 +119,7 @@ impl AppState {
             goosed: Mutex::new(GoosedHandle::default()),
             ollama: Mutex::new(ManagedProcess::default()),
             stack_status: Mutex::new(StackStatus::default()),
+            startup_phase: Mutex::new(StartupPhase::default()),
             acp: AsyncMutex::new(None),
             active_session: Mutex::new(None),
             settings_target: Mutex::new(None),

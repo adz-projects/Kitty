@@ -19,9 +19,33 @@ pub use health::{spawn_adaptive_pathway_health_loop, spawn_health_loop};
 
 use adaptive_pathway_proc::AdaptivePathwayStatus;
 
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 
-use crate::state::AppState;
+use crate::state::{AppState, StartupPhase};
+
+/// Payload for the `stack://startup-phase` event.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StartupPhasePayload {
+    pub phase: StartupPhase,
+}
+
+fn set_startup_phase(app: &AppHandle, phase: StartupPhase) {
+    let changed = {
+        let state = app.state::<AppState>();
+        let mut cur = state.startup_phase.lock().unwrap();
+        if *cur != phase {
+            *cur = phase;
+            true
+        } else {
+            false
+        }
+    };
+    if changed {
+        if let Err(e) = app.emit("stack://startup-phase", StartupPhasePayload { phase }) {
+            tracing::warn!("emit stack://startup-phase failed: {e}");
+        }
+    }
+}
 
 /// Whether Ollama must be started for the current config: either the active
 /// *chat* setup needs it (local Ollama provider), or adaptive-pathway is
@@ -60,16 +84,34 @@ pub fn start_stack(app: &AppHandle) {
             }
         }
 
-        // 2. Spawn goosed (`goose serve`) with the active provider's env.
-        let (env, goose_override) = {
+        // 2 + 2b. Spawn goosed (`goose serve`) with the active provider's env,
+        // and — if the active provider is a local Ollama model — warm it into
+        // memory (Round-2 item 5), in parallel: the two are independent I/O
+        // waits (spawning a process vs. an HTTP round trip to Ollama), so
+        // running them concurrently drops wall-clock startup from
+        // `spawn + warmup` to `max(spawn, warmup)`. Both lookups happen
+        // up front so neither async block needs to re-lock config mid-flight.
+        let (env, goose_override, warm) = {
             let state = app.state::<AppState>();
             let cfg = state.config.lock().unwrap();
             (
                 crate::config::providers::goosed_env(&cfg),
                 cfg.goose_binary_override.clone(),
+                crate::config::providers::active_ollama_target(&cfg),
             )
         };
-        match goosed::spawn(env, goose_override.as_deref()).await {
+        set_startup_phase(&app, StartupPhase::SpawningGoosed);
+        if warm.is_some() {
+            set_startup_phase(&app, StartupPhase::WarmingModel);
+        }
+        let goosed_fut = goosed::spawn(env, goose_override.as_deref());
+        let warm_fut = async {
+            if let Some((base, model)) = warm {
+                crate::ollama::keep_alive_load(&base, &model).await;
+            }
+        };
+        let (goosed_result, ()) = tokio::join!(goosed_fut, warm_fut);
+        match goosed_result {
             Ok(handle) => {
                 let state = app.state::<AppState>();
                 *state.goosed.lock().unwrap() = handle;
@@ -77,17 +119,7 @@ pub fn start_stack(app: &AppHandle) {
             }
             Err(e) => tracing::warn!("goosed spawn failed: {e}"),
         }
-
-        // 2b. If the active provider is a local Ollama model, warm it into memory
-        // and keep it resident (Round-2 item 5).
-        let warm = {
-            let state = app.state::<AppState>();
-            let cfg = state.config.lock().unwrap();
-            crate::config::providers::active_ollama_target(&cfg)
-        };
-        if let Some((base, model)) = warm {
-            crate::ollama::keep_alive_load(&base, &model).await;
-        }
+        set_startup_phase(&app, StartupPhase::Ready);
 
         // 2c. Adaptive Pathway extension sidecar (optional, off by default —
         // see `adaptive_pathway_proc`). Probe-then-spawn, same as Ollama: never
@@ -196,11 +228,31 @@ pub fn start_stack(app: &AppHandle) {
 }
 
 /// Kill child processes we spawned. Called on app exit.
+///
+/// Note: this only runs on a *graceful* exit (Tauri's `RunEvent::Exit`, wired
+/// in `lib.rs`). It does NOT run when the process is terminated directly at
+/// the OS level instead — a terminal Ctrl+C during `tauri dev`, or tauri-cli's
+/// own dev-mode hot-restart, both kill the previous run outright rather than
+/// through this event loop. `adaptive_pathway_proc::kill_stale_orphan` (run at
+/// the top of every `ensure_running`) is the recovery path for children
+/// orphaned that way — this function alone isn't sufficient on its own.
 pub fn shutdown(app: &AppHandle) {
     let state = app.state::<AppState>();
     state.goosed.lock().unwrap().process.kill_if_owned();
     state.ollama.lock().unwrap().kill_if_owned();
-    state.adaptive_pathway.lock().unwrap().kill_if_owned();
+    let mut ap = state.adaptive_pathway.lock().unwrap();
+    let ap_was_owned = ap.owned;
+    ap.kill_if_owned();
+    drop(ap);
+    if ap_was_owned {
+        let db_path = state
+            .config
+            .lock()
+            .unwrap()
+            .adaptive_pathway_db_path
+            .clone();
+        adaptive_pathway_proc::remove_pidfile(&db_path);
+    }
     tracing::info!("stack shut down (owned children killed)");
 }
 

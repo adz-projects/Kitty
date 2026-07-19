@@ -5,12 +5,17 @@ import { DocumentIcon } from '@/components/icons/DocumentIcon';
 
 const PRUNE_INTERVAL_MS = 5000;
 
-/** Collapsible right-side pane listing files the agent produced this session,
-    derived from tool-call events (CLAUDE.md Phase 4). Persists nothing app-side. */
+/** Collapsible right-side pane listing files in the chat folder this session,
+    derived from tool-call events plus a disk scan (CLAUDE.md Phase 4, Round-7
+    item 5) — the tool-call path alone misses files that land in the folder
+    without going through a tracked tool call (e.g. dropped in via Explorer).
+    Persists nothing app-side. */
 export function ArtifactsPane() {
   const artifacts = useChatStore((s) => s.artifacts);
+  const cwd = useChatStore((s) => s.cwd);
   const clearArtifacts = useChatStore((s) => s.clearArtifacts);
   const pruneMissingArtifacts = useChatStore((s) => s.pruneMissingArtifacts);
+  const refreshArtifactsFromDisk = useChatStore((s) => s.refreshArtifactsFromDisk);
 
   // A file can disappear from the chat directory either because a tool call
   // deleted it or because the user deleted it out-of-band (Explorer, another
@@ -21,6 +26,14 @@ export function ArtifactsPane() {
     const id = setInterval(() => void pruneMissingArtifacts(), PRUNE_INTERVAL_MS);
     return () => clearInterval(id);
   }, [artifacts.length, pruneMissingArtifacts]);
+
+  // Re-scan on mount and whenever the bound working directory changes (new
+  // session, resume, folder switch) — covers files already sitting in the
+  // folder before this pane ever saw a tool call for them.
+  useEffect(() => {
+    if (!cwd) return;
+    void refreshArtifactsFromDisk();
+  }, [cwd, refreshArtifactsFromDisk]);
 
   return (
     <aside className="artifacts-pane">

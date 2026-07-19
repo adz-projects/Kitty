@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { ipc, onFileDrop, pickFolder } from '@/lib/ipc';
 import { findHintToolCall, humanizeChatError, isChatMode, useChatStore } from '@/stores/chatStore';
+import { useStackStore } from '@/stores/stackStore';
 import { supportsReasoning } from '@/lib/reasoning_models';
 import type { AdaptivePathwaySessionReflection } from '@/lib/types';
 import { MessageList } from './MessageList';
@@ -14,6 +15,7 @@ import { ChatHeaderMenu } from './ChatHeaderMenu';
 import { FileChips } from './FileChips';
 import { AttachmentChips } from './AttachmentChips';
 import { ClipboardImageChips } from './ClipboardImageChips';
+import { PendingAttachmentChips } from './PendingAttachmentChips';
 import { Modal } from '@/components/shared/Modal';
 import { ErrorDetail } from '@/components/shared/ErrorDetail';
 import { ChatBubbleIcon } from '@/components/icons/ChatBubbleIcon';
@@ -52,6 +54,8 @@ export function ChatView() {
     model,
   } = useChatStore();
   const chatOnly = useChatStore(isChatMode);
+  const startupPhase = useStackStore((s) => s.startupPhase);
+  const starting = startupPhase !== 'ready';
   // Adaptive Pathway session hint-count summary (Round-C) — cheap client-side
   // derivation from already-in-memory state, no new IPC needed.
   const hintCount = useMemo(
@@ -194,7 +198,7 @@ export function ChatView() {
         />
       )}
 
-      {!chatOnly &&
+      {(!chatOnly || pendingApprovals.length > 0) &&
         pendingApprovals.map((a) => (
           <ApprovalPrompt
             key={a.tool_call_id}
@@ -248,11 +252,18 @@ export function ChatView() {
       )}
       {chatOnly ? <AttachmentChips /> : <FileChips />}
       <ClipboardImageChips />
+      <PendingAttachmentChips />
+      {starting && (
+        <p className="muted startup-phase-banner">
+          {startupPhase === 'warming_model' ? 'Warming model…' : 'Starting…'}
+        </p>
+      )}
       <Composer
         onSend={(t) => void send(t)}
         onStop={() => void cancel()}
         disabled={busy}
         concluded={sessionConcluded}
+        sendBlocked={starting}
       />
     </div>
   );

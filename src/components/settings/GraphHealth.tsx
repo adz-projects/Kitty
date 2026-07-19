@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { ipc } from '@/lib/ipc';
 import type {
   AdaptivePathwayExplorationHealth,
+  AdaptivePathwayGraphHealth,
   AdaptivePathwayHealthIssue,
   AdaptivePathwayState,
 } from '@/lib/types';
@@ -12,26 +13,38 @@ const SEVERITY_DOT: Record<string, string> = {
   error: 'bad',
 };
 
-/** Read-only Graph Health card (Round-D Batch 2) — `GET /state` + `GET
-    /health`'s issue list. No live edit surface here; this is a status view. */
+// Every AppState-backed command here goes through `require_ok` on the Rust
+// side, which rejects with exactly this message when the sidecar isn't
+// running — matched so the pane can show a specific "go enable it" prompt
+// instead of a generic error banner or an indefinite spinner.
+const SIDECAR_DOWN_MESSAGE = "Adaptive Pathway isn't running";
+
+/** Read-only Graph Health card (Round-D Batch 2, richer data added Round-7
+    item 6) — `GET /state` + `GET /health`'s issue list + `GET /graph_health`'s
+    edge/tier/hotspot detail. No live edit surface here; this is a status view. */
 export function GraphHealth() {
   const [state, setState] = useState<AdaptivePathwayState | null>(null);
   const [issues, setIssues] = useState<AdaptivePathwayHealthIssue[]>([]);
+  const [graphHealth, setGraphHealth] = useState<AdaptivePathwayGraphHealth | null>(null);
   const [explorationHealth, setExplorationHealth] =
     useState<AdaptivePathwayExplorationHealth | null>(null);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(true);
 
+  const sidecarDown = error.includes(SIDECAR_DOWN_MESSAGE);
+
   const load = async () => {
     setLoading(true);
     setError('');
     try {
-      const [s, h] = await Promise.all([
+      const [s, h, g] = await Promise.all([
         ipc.adaptivePathwayGetState(),
         ipc.adaptivePathwayHealth(),
+        ipc.adaptivePathwayGraphHealth(),
       ]);
       setState(s);
       setIssues(h.issues);
+      setGraphHealth(g);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -58,8 +71,14 @@ export function GraphHealth() {
         Insights (advanced) into how Adaptive Pathway is learning — nothing here needs action unless
         an issue shows up below.
       </p>
-      {loading && <p className="muted">Loading…</p>}
-      {error && <div className="chat-error">{error}</div>}
+      {loading && !sidecarDown && <p className="muted">Loading…</p>}
+      {sidecarDown ? (
+        <div className="chat-error">
+          Sidecar not running — enable Adaptive Pathway first (Settings → Adaptive Pathway).
+        </div>
+      ) : (
+        error && <div className="chat-error">{error}</div>
+      )}
       {state && (
         <div className="field">
           <div>
@@ -137,6 +156,65 @@ export function GraphHealth() {
               </div>
             </div>
           </div>
+        </>
+      )}
+
+      {graphHealth && (
+        <>
+          <h2>Graph</h2>
+          <div className="field">
+            <div>
+              <span className="muted">Total edges:</span> {graphHealth.total_edges}
+              <div className="muted" style={{ fontSize: 11 }}>
+                How many learned preferences it's tracking in total.
+              </div>
+            </div>
+            <div>
+              <span className="muted">High-confidence edges:</span>{' '}
+              {(graphHealth.high_confidence_pct * 100).toFixed(1)}%
+              <div className="muted" style={{ fontSize: 11 }}>
+                Share of those it's confident enough in to act on without hedging.
+              </div>
+            </div>
+            <div>
+              <span className="muted">Tier distribution:</span>{' '}
+              {Object.entries(graphHealth.tier_distribution ?? {})
+                .map(([tier, count]) => `${tier}: ${count}`)
+                .join(', ') || 'n/a'}
+              <div className="muted" style={{ fontSize: 11 }}>
+                How many edges are hot (frequently used), warm, or cold (rarely used).
+              </div>
+            </div>
+            <div>
+              <span className="muted">Last override rate:</span>{' '}
+              {(graphHealth.last_override_rate * 100).toFixed(1)}%
+              <div className="muted" style={{ fontSize: 11 }}>
+                How often you've recently overridden its suggestions.
+              </div>
+            </div>
+            <div>
+              <span className="muted">Flagged hotspots:</span> {graphHealth.flagged_hotspots}
+              <div className="muted" style={{ fontSize: 11 }}>
+                Edges it's confident in but that keep getting overridden anyway — worth a look.
+              </div>
+            </div>
+          </div>
+          {(graphHealth.hotspot_details ?? []).length > 0 && (
+            <div className="field">
+              {(graphHealth.hotspot_details ?? []).map((h, i) => (
+                <div className="row" key={i} style={{ alignItems: 'flex-start' }}>
+                  <span className="status-dot warn" />
+                  <div>
+                    <div>{String(h.primitive ?? h.edge_id ?? 'hotspot')}</div>
+                    <div className="muted" style={{ fontSize: 11 }}>
+                      confidence {Number(h.confidence ?? 0).toFixed(2)}, overridden{' '}
+                      {(Number(h.override_rate ?? 0) * 100).toFixed(0)}% of the time
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
         </>
       )}
 

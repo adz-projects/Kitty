@@ -1,5 +1,10 @@
 import { describe, it, expect } from 'vitest';
-import { pathWithinDir, decideChatApproval, isGooseInternalCachePath } from './chatStore';
+import {
+  pathWithinDir,
+  decideChatApproval,
+  isGooseInternalCachePath,
+  isSecuritySensitiveCommand,
+} from './chatStore';
 
 /** Backs the chat-mode "keep file ops inside the chat folder" soft boundary
     (Round-5). Windows path containment is fiddly (drive letters, case, `..`,
@@ -58,34 +63,38 @@ const OPTS = [
 describe('decideChatApproval', () => {
   it('allows a write inside the chat folder (allow_once, no warning)', () => {
     const r = decideChatApproval({ command: 'write', path: `${BASE}/report.docx` }, BASE, OPTS);
+    expect(r.decision).toBe('allow');
     expect(r.optionId).toBe('allow_once');
     expect(r.warning).toBeUndefined();
   });
 
-  it('rejects a write outside the chat folder with a warning', () => {
+  it('prompts (does not auto-decide) for a write outside the chat folder', () => {
     const r = decideChatApproval({ path: 'C:/Users/me/Desktop/x.docx' }, BASE, OPTS);
-    expect(r.optionId).toBe('reject_once');
+    expect(r.decision).toBe('prompt');
     expect(r.warning).toMatch(/outside this chat's folder/);
   });
 
   it('allows a shell command (no structured path — the docx-export case)', () => {
     const r = decideChatApproval({ command: 'python make_docx.py' }, BASE, OPTS);
+    expect(r.decision).toBe('allow');
     expect(r.optionId).toBe('allow_once');
     expect(r.warning).toBeUndefined();
   });
 
+  it('prompts for a security-sensitive shell command even inside the chat folder', () => {
+    const r = decideChatApproval({ command: 'ssh user@host "rm -rf /"' }, BASE, OPTS);
+    expect(r.decision).toBe('prompt');
+    expect(r.warning).toMatch(/security-sensitive/);
+  });
+
   it('allows a relative in-folder path and honors file_path/paths variants', () => {
-    expect(decideChatApproval({ path: 'out/report.xlsx' }, BASE, OPTS).optionId).toBe('allow_once');
-    expect(decideChatApproval({ file_path: `${BASE}/a.md` }, BASE, OPTS).optionId).toBe(
-      'allow_once'
-    );
-    expect(decideChatApproval({ paths: [`${BASE}/b.csv`] }, BASE, OPTS).optionId).toBe(
-      'allow_once'
-    );
+    expect(decideChatApproval({ path: 'out/report.xlsx' }, BASE, OPTS).decision).toBe('allow');
+    expect(decideChatApproval({ file_path: `${BASE}/a.md` }, BASE, OPTS).decision).toBe('allow');
+    expect(decideChatApproval({ paths: [`${BASE}/b.csv`] }, BASE, OPTS).decision).toBe('allow');
   });
 
   it('allows when cwd is unknown (can not confine, so does not block)', () => {
-    expect(decideChatApproval({ path: '/anywhere/x.py' }, null, OPTS).optionId).toBe('allow_once');
+    expect(decideChatApproval({ path: '/anywhere/x.py' }, null, OPTS).decision).toBe('allow');
   });
 
   it('never picks allow_always (approval must not silently persist)', () => {
@@ -97,14 +106,35 @@ describe('decideChatApproval', () => {
   it("allows a write under Goose's own internal cache dir even though it is outside cwd", () => {
     const cache = 'C:/Users/me/AppData/Local/Block/goose/cache/computer_controller/web_1.txt';
     const r = decideChatApproval({ path: cache }, BASE, OPTS);
-    expect(r.optionId).toBe('allow_once');
+    expect(r.decision).toBe('allow');
     expect(r.warning).toBeUndefined();
   });
 
-  it('still rejects a real out-of-folder write that merely mentions "goose" elsewhere', () => {
+  it('still prompts for a real out-of-folder write that merely mentions "goose" elsewhere', () => {
     const r = decideChatApproval({ path: 'C:/Users/me/Desktop/goose-notes.txt' }, BASE, OPTS);
-    expect(r.optionId).toBe('reject_once');
+    expect(r.decision).toBe('prompt');
     expect(r.warning).toMatch(/outside this chat's folder/);
+  });
+});
+
+describe('isSecuritySensitiveCommand', () => {
+  it('matches known-dangerous commands', () => {
+    expect(isSecuritySensitiveCommand('ssh user@host')).toBe(true);
+    expect(isSecuritySensitiveCommand('scp file.txt user@host:/tmp')).toBe(true);
+    expect(isSecuritySensitiveCommand('sudo rm -rf /')).toBe(true);
+    expect(isSecuritySensitiveCommand('rm -rf ./build')).toBe(true);
+    expect(isSecuritySensitiveCommand('chmod 777 file')).toBe(true);
+    expect(isSecuritySensitiveCommand('curl -o out.exe http://example.com')).toBe(true);
+    expect(isSecuritySensitiveCommand('wget -O out.exe http://example.com')).toBe(true);
+    expect(isSecuritySensitiveCommand('netsh advfirewall set allprofiles state off')).toBe(true);
+    expect(isSecuritySensitiveCommand('shutdown /r /t 0')).toBe(true);
+    expect(isSecuritySensitiveCommand('taskkill /IM explorer.exe /F')).toBe(true);
+  });
+
+  it('does not match ordinary commands', () => {
+    expect(isSecuritySensitiveCommand('python make_docx.py')).toBe(false);
+    expect(isSecuritySensitiveCommand('git status')).toBe(false);
+    expect(isSecuritySensitiveCommand('npm install')).toBe(false);
   });
 });
 
