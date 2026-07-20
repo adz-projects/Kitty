@@ -8,13 +8,22 @@
 # `Path(__file__).resolve().parent / "tool_prompts.yaml"`, which still works
 # inside a PyInstaller onefile bundle's extraction dir).
 
+from PyInstaller.utils.hooks import copy_metadata
+
 a = Analysis(
     ["lean_mcp.py"],
     pathex=["."],
     binaries=[],
     datas=[
         ("tool_prompts.yaml", "."),
-    ],
+    ]
+    # fastmcp 3.x resolves its own `__version__` from installed package
+    # metadata at import time (`importlib.metadata.version("fastmcp")` in
+    # fastmcp/__init__.py). PyInstaller does not bundle .dist-info
+    # directories unless asked, so without this the frozen exe dies during
+    # `import fastmcp` with PackageNotFoundError before serving a single
+    # request — and goosed just reports the extension as unavailable.
+    + copy_metadata("fastmcp"),
     # fastmcp/trafilatura/duckduckgo-search occasionally need their vendored
     # submodules named explicitly for PyInstaller's static analysis. If the
     # frozen exe fails at startup with a ModuleNotFoundError, add it here.
