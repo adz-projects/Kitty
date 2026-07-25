@@ -128,7 +128,7 @@ export function ProviderForm({
             value={profile.models[0] ?? ''}
             onChange={(e) => set({ models: e.target.value ? [e.target.value] : [] })}
           >
-            <option value="">(use Goose default)</option>
+            <option value="">(use provider default)</option>
             {installed.map((m) => (
               <option key={m.name} value={m.name}>
                 {m.name}

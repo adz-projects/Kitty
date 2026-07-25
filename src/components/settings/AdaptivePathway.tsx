@@ -23,11 +23,6 @@ const EMBEDDING_STATUS_LABEL: Record<EmbeddingModelStatus, string> = {
   missing: 'not downloaded yet',
 };
 
-/** The id/name this settings page registers the Goose extension under — must
-    match what `registerExtension` below writes, so the "already registered"
-    check finds it. */
-const EXTENSION_ID = 'adaptive-pathway';
-
 interface EnsembleWeights {
   ig_weight_min: number;
   ig_weight_max: number;
@@ -37,11 +32,11 @@ interface EnsembleWeights {
 /** Settings for the Adaptive Pathway extension — learns tool-use preferences
     and suggests hints before the model picks a tool. On by default. One
     checkbox does both halves of enabling it: spawns/supervises the HTTP
-    sidecar (a separate managed process, same as goose serve/Ollama) *and*
-    registers the Goose extension so the model can call `decide`
-    mid-conversation — previously two separate controls (UX-simplification
-    owner decision). Launch command/args/db path/port are power-user
-    knobs, tucked behind an Advanced disclosure. */
+    sidecar (a separate managed process, same as Ollama) *and* registers its
+    MCP tools with BigTiny so the model can call `decide` mid-conversation —
+    previously two separate controls (UX-simplification owner decision).
+    Launch command/args/db path/port are power-user knobs, tucked behind an
+    Advanced disclosure. */
 export function AdaptivePathway() {
   const [enabled, setEnabled] = useState(false);
   const [launchCommand, setLaunchCommand] = useState('');
@@ -60,20 +55,7 @@ export function AdaptivePathway() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [weights, setWeights] = useState<EnsembleWeights | null>(null);
-  const [extensionRegistered, setExtensionRegistered] = useState<boolean | null>(null);
   const [advancedOpen, setAdvancedOpen] = useState(false);
-
-  const checkExtension = async (): Promise<boolean> => {
-    try {
-      const exts = await ipc.listDefaultExtensions();
-      const found = exts.find((e) => e.id === EXTENSION_ID);
-      setExtensionRegistered(found ? found.enabled : false);
-      return found ? found.enabled : false;
-    } catch {
-      setExtensionRegistered(null);
-      return false;
-    }
-  };
 
   const load = async () => {
     const cfg = await ipc.getConfig();
@@ -91,7 +73,6 @@ export function AdaptivePathway() {
       .getAdaptivePathwayEmbeddingStatus()
       .then(setEmbeddingStatus)
       .catch(() => {});
-    await checkExtension();
   };
 
   useEffect(() => {
@@ -102,7 +83,6 @@ export function AdaptivePathway() {
       void un.then((fn) => fn());
       void unEmbedding.then((fn) => fn());
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
@@ -172,8 +152,10 @@ export function AdaptivePathway() {
     await ipc.setConfig({ ...cfg, ...patch });
   };
 
-  /** Turning this on/off drives both the sidecar process and the Goose
-      extension registration together — see file doc comment. */
+  /** Turning this on/off drives both the sidecar process and its BigTiny MCP
+      server registration (the `decide`/`record_outcome` tools) together —
+      the Rust command self-heals the MCP registration, so the frontend just
+      flips the flag and re-reads status. */
   const setEnabledCombined = async (next: boolean) => {
     setBusy(true);
     setError('');
@@ -181,55 +163,6 @@ export function AdaptivePathway() {
       setEnabled(next);
       await ipc.setAdaptivePathwayEnabled(next);
       await ipc.getAdaptivePathwayStatus().then(setStatus);
-
-      const alreadyEnabled = await checkExtension();
-      if (next && !alreadyEnabled) {
-        const exts = await ipc.listDefaultExtensions();
-        if (exts.some((e) => e.id === EXTENSION_ID)) {
-          await ipc.setDefaultExtensionEnabled(EXTENSION_ID, true);
-        } else {
-          // A CLI arg, not an env var: `add_extension`'s `env` parameter only
-          // ever declares env-var *names* Goose should supply values for
-          // (`env_keys` in config.yaml) — it can't carry an actual value like
-          // a real path. `--db-path` is the one mechanism confirmed to
-          // actually reach the extension process, and it's the same flag the
-          // sidecar itself takes.
-          //
-          // `AP_EMBED_OLLAMA_MODEL`/`AP_EMBED_OLLAMA_URL` *are* passed via
-          // `env_keys`, unlike `dbPath` above — because `goosed_env()`
-          // (providers.rs) already sets those same names on goosed's own
-          // process env when adaptive pathway is enabled, `env_keys` here
-          // just tells goose to forward those existing values through to
-          // this extension's child process.
-          await ipc.addExtension(
-            EXTENSION_ID,
-            'adaptive-pathway-mcp',
-            ['--db-path', dbPath],
-            ['AP_EMBED_OLLAMA_MODEL', 'AP_EMBED_OLLAMA_URL'],
-          );
-        }
-      } else if (!next && alreadyEnabled) {
-        await ipc.setDefaultExtensionEnabled(EXTENSION_ID, false);
-      }
-      if (next) {
-        // Belt-and-suspenders on top of `env_keys` above: an extension
-        // registered *before* this env var existed never picks up an
-        // `env_keys` addition (that only applies to the args passed at
-        // registration time). Writing the value directly into this
-        // extension's own `envs:` map works unconditionally for both new and
-        // pre-existing registrations — safe because a model tag/URL is not a
-        // secret (`lifecycle::start_stack` also runs this same migration on
-        // every launch, so this call mainly covers the "toggle it on mid-
-        // session" path).
-        const freshCfg = await ipc.getConfig();
-        await ipc.setExtensionEnv(
-          EXTENSION_ID,
-          'AP_EMBED_OLLAMA_MODEL',
-          freshCfg.adaptive_pathway_embedding_model
-        );
-        await ipc.setExtensionEnv(EXTENSION_ID, 'AP_EMBED_OLLAMA_URL', freshCfg.ollama_base_url);
-      }
-      await checkExtension();
     } catch (e) {
       setError(String(e));
     } finally {
@@ -283,8 +216,8 @@ export function AdaptivePathway() {
         <span>Enable Adaptive Pathway</span>
       </label>
       <small className="muted">
-        Starts the background process that learns your preferences and registers it with Goose so
-        the model can actually suggest hints. Requires{' '}
+        Starts the background process that learns your preferences and registers its tools so the
+        model can actually suggest hints. Requires{' '}
         <code>pip install adaptive-pathway[sidecar]</code> — if it isn&apos;t installed, this just
         stays &quot;Not reachable&quot; below, no error spam.
       </small>
@@ -292,11 +225,6 @@ export function AdaptivePathway() {
       <div className="row" style={{ alignItems: 'center' }}>
         <span className={`status-dot ${statusDotClass}`} />
         <span>{STATUS_LABEL[status]}</span>
-        {extensionRegistered !== null && (
-          <span className="muted">
-            · extension {extensionRegistered ? 'registered' : 'not registered'}
-          </span>
-        )}
         {status !== 'disabled' && embeddingStatus !== 'unknown' && (
           <span className="muted">· learning model {EMBEDDING_STATUS_LABEL[embeddingStatus]}</span>
         )}
@@ -361,8 +289,8 @@ export function AdaptivePathway() {
       {advancedOpen && (
         <div>
           <p className="muted">
-            Launch command, extra args, database path, and port — the sidecar and the Goose
-            extension both point at the same database path so they see the same learned data.
+            Launch command, extra args, database path, and port — the sidecar and the MCP tools
+            both point at the same database path so they see the same learned data.
           </p>
           <div className="field">
             <span>Launch command</span>

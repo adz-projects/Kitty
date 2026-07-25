@@ -49,7 +49,7 @@ pub fn spawn_scheduler_loop(app: AppHandle) {
 
 async fn fire_scheduled_task(app: &AppHandle, task: crate::config::scheduled_tasks::ScheduledTask) {
     tracing::info!("scheduled task '{}' ({}) firing", task.name, task.id);
-    match crate::commands::new_session(app.clone(), task.cwd.clone()).await {
+    match crate::commands::new_session(app.clone(), task.cwd.clone(), None).await {
         Ok(info) => {
             if let Err(e) = crate::commands::send_prompt(
                 app.clone(),

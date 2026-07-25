@@ -1,0 +1,40 @@
+# -*- mode: python ; coding: utf-8 -*-
+# PyInstaller spec for the sandboxed-Python-execution stdio MCP server. Run via
+# `plugins/build.py`, not directly — that script `pip install`s this plugin's
+# dependencies first so PyInstaller's import analysis can see them.
+
+from PyInstaller.utils.hooks import copy_metadata
+
+a = Analysis(
+    ["wasm_math_mcp.py"],
+    pathex=["."],
+    binaries=[],
+    datas=[]
+    # The `mcp` SDK resolves its own package metadata at import time in some
+    # versions — same PackageNotFoundError failure mode already fixed for
+    # `fastmcp` in replacement_mcp.spec and `mcp` in adaptive_pathway_mcp.spec.
+    + copy_metadata("mcp"),
+    hiddenimports=[
+        "mcp.server.fastmcp",
+        # numpy ships compiled extension submodules PyInstaller's static
+        # analysis can miss depending on the installed version; declared
+        # explicitly since this tool's whole value proposition is NumPy math.
+        "numpy",
+    ],
+    hookspath=[],
+    runtime_hooks=[],
+    excludes=[],
+    noarchive=False,
+)
+pyz = PYZ(a.pure)
+
+exe = EXE(
+    pyz,
+    a.scripts,
+    a.binaries,
+    a.datas,
+    [],
+    name="wasm-math-mcp",
+    console=True,
+    onefile=True,
+)

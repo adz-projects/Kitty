@@ -7,7 +7,7 @@ import { humanizeChatError } from './chatStore';
 
 describe('humanizeChatError', () => {
   it('explains a raw "Invalid params" error', () => {
-    expect(humanizeChatError('Invalid params')).toMatch(/switching providers|restarting Goose/);
+    expect(humanizeChatError('Invalid params')).toMatch(/switching providers|restarting the engine/);
   });
 
   it('explains a timeout error', () => {
@@ -27,6 +27,6 @@ describe('humanizeChatError', () => {
   });
 
   it('is case-insensitive', () => {
-    expect(humanizeChatError('INVALID PARAMS')).toMatch(/switching providers|restarting Goose/);
+    expect(humanizeChatError('INVALID PARAMS')).toMatch(/switching providers|restarting the engine/);
   });
 });

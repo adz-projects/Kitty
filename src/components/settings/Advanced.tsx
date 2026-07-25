@@ -126,26 +126,6 @@ export function Advanced() {
             {ollamaMsg && <small className="muted">{ollamaMsg}</small>}
           </div>
 
-          <label className="field">
-            <span>When a conversation gets long</span>
-            <select
-              value={draft.context_strategy ?? 'summarize'}
-              onChange={(e) =>
-                update({ context_strategy: e.target.value as typeof draft.context_strategy })
-              }
-            >
-              <option value="summarize">Summarize the older parts</option>
-              <option value="truncate">Truncate the oldest messages</option>
-              <option value="clear">Clear it and start fresh</option>
-              <option value="prompt">Ask me each time</option>
-            </select>
-            <small className="muted">
-              Goose triggers this automatically as the conversation approaches its model&apos;s
-              context limit — this isn&apos;t a message count you set, it&apos;s which strategy
-              Goose uses when that happens.
-            </small>
-          </label>
-
           <label className="check">
             <input
               type="checkbox"

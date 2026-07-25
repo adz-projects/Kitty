@@ -24,6 +24,7 @@ pub fn register(
     app: &AppHandle,
     accelerators: &[String],
     clipboard_hotkey: Option<&str>,
+    open_window_hotkey: Option<&str>,
 ) -> Result<(), String> {
     let gs = app.global_shortcut();
     let _ = gs.unregister_all();
@@ -65,6 +66,28 @@ pub fn register(
                 }
             }
             Err(_) => errors.push(format!("invalid clipboard hotkey: {accel}")),
+        }
+    }
+
+    // Always opens a brand-new chat window with its own fresh session
+    // (Feature 4/5) — never reuses/focuses an existing one, unlike the
+    // primary `accelerators` list above.
+    if let Some(accel) = open_window_hotkey {
+        match accel.parse::<Shortcut>() {
+            Ok(shortcut) => {
+                let handle = app.clone();
+                match gs.on_shortcut(shortcut, move |_app, _shortcut, event| {
+                    if event.state == tauri_plugin_global_shortcut::ShortcutState::Pressed {
+                        if let Err(e) = windows::open_new_chat_window(&handle, None) {
+                            tracing::warn!("open_new_chat_window from hotkey failed: {e}");
+                        }
+                    }
+                }) {
+                    Ok(()) => tracing::info!("registered open-new-chat-window hotkey: {accel}"),
+                    Err(e) => errors.push(format!("{accel}: {e}")),
+                }
+            }
+            Err(_) => errors.push(format!("invalid open-new-chat-window hotkey: {accel}")),
         }
     }
 

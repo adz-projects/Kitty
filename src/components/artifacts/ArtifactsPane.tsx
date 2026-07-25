@@ -3,13 +3,21 @@ import { ipc } from '@/lib/ipc';
 import { useChatStore, type Artifact } from '@/stores/chatStore';
 import { DocumentIcon } from '@/components/icons/DocumentIcon';
 
-const PRUNE_INTERVAL_MS = 5000;
+const POLL_INTERVAL_MS = 5000;
 
 /** Collapsible right-side pane listing files in the chat folder this session,
     derived from tool-call events plus a disk scan (CLAUDE.md Phase 4, Round-7
     item 5) — the tool-call path alone misses files that land in the folder
     without going through a tracked tool call (e.g. dropped in via Explorer).
-    Persists nothing app-side. */
+    Persists nothing app-side.
+
+    Polls the folder continuously (not just on mount/cwd-change) so it stays
+    live while the pane sits open: additions and deletions made outside a
+    tracked tool call (Explorer, another app, a shell the agent isn't
+    supervising) both show up within one poll tick, not just at the next
+    session switch. Runs unconditionally on `cwd`, not gated on the current
+    artifact count — an empty folder that gains its first file needs the
+    add-scan to run too, not just the prune side. */
 export function ArtifactsPane() {
   const artifacts = useChatStore((s) => s.artifacts);
   const cwd = useChatStore((s) => s.cwd);
@@ -17,23 +25,15 @@ export function ArtifactsPane() {
   const pruneMissingArtifacts = useChatStore((s) => s.pruneMissingArtifacts);
   const refreshArtifactsFromDisk = useChatStore((s) => s.refreshArtifactsFromDisk);
 
-  // A file can disappear from the chat directory either because a tool call
-  // deleted it or because the user deleted it out-of-band (Explorer, another
-  // app) — periodic existence checks catch both without needing to special-
-  // case delete-shaped tool calls.
-  useEffect(() => {
-    if (artifacts.length === 0) return;
-    const id = setInterval(() => void pruneMissingArtifacts(), PRUNE_INTERVAL_MS);
-    return () => clearInterval(id);
-  }, [artifacts.length, pruneMissingArtifacts]);
-
-  // Re-scan on mount and whenever the bound working directory changes (new
-  // session, resume, folder switch) — covers files already sitting in the
-  // folder before this pane ever saw a tool call for them.
   useEffect(() => {
     if (!cwd) return;
     void refreshArtifactsFromDisk();
-  }, [cwd, refreshArtifactsFromDisk]);
+    const id = setInterval(() => {
+      void refreshArtifactsFromDisk();
+      void pruneMissingArtifacts();
+    }, POLL_INTERVAL_MS);
+    return () => clearInterval(id);
+  }, [cwd, refreshArtifactsFromDisk, pruneMissingArtifacts]);
 
   return (
     <aside className="artifacts-pane">

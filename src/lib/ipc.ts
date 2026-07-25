@@ -25,11 +25,13 @@ import type {
   Detection,
   EmbeddingModelStatus,
   EnvVar,
-  ExtensionDefault,
   FileAttachment,
   FileEntry,
   FolderData,
   LogEntry,
+  McpServer,
+  McpServerPatch,
+  McpServerSpec,
   ModeEvent,
   OllamaModel,
   OpenRouterCredits,
@@ -64,10 +66,47 @@ export const ipc = {
   openSettings: (section?: string, highlight?: string) =>
     invoke<void>('open_settings', { section: section ?? null, highlight: highlight ?? null }),
   openMain: () => invoke<void>('open_main'),
+  /** Feature 5 — always creates a brand-new chat window (never reuses one),
+      optionally handing it a session snapshot to adopt on mount (the
+      overlay's Expand). Distinct from `setActiveSession`/`getActiveSession`
+      below, which remain in place for the unrelated provider
+      context-handoff gate (Settings -> Providers). */
+  openNewChatWindow: (handoff?: (SessionInfo & Record<string, unknown>) | null) =>
+    invoke<void>('open_new_chat_window', { handoff: handoff ?? null }),
+  /** One-shot read of *this* window's pending handoff, if Expand created it
+      with one — consumed server-side on read, so calling this twice returns
+      `null` the second time. */
+  getPendingHandoff: () =>
+    invoke<(SessionInfo & Record<string, unknown>) | null>('get_pending_handoff'),
+  /** Feature 3 — screenshot region capture. Opens the selection window over
+      a lightweight preview and resolves once the user confirms a rectangle
+      (rejects on Escape/cancel); the final image is a fresh, full-resolution
+      capture of just that region, never the preview itself. */
+  captureScreenshotRegion: () =>
+    invoke<{ mime: string; data_url: string }>('capture_screenshot_region'),
+  /** Selection window's own mount-time read of the preview to show. */
+  getScreenshotPreview: () =>
+    invoke<[string, number, number, number, number] | null>('get_screenshot_preview'),
+  reportScreenshotSelection: (x: number, y: number, width: number, height: number) =>
+    invoke<void>('report_screenshot_selection', { x, y, width, height }),
+  cancelScreenshotSelection: () => invoke<void>('cancel_screenshot_selection'),
   getStackStatus: () => invoke<StackStatus>('get_stack_status'),
   getStartupPhase: () => invoke<StartupPhase>('get_startup_phase'),
-  restartGoosed: () => invoke<void>('restart_goosed'),
-  newSession: (cwd?: string) => invoke<SessionInfo>('new_session', { cwd: cwd ?? null }),
+  restartBackend: () => invoke<void>('restart_backend'),
+  newSession: (cwd?: string, mode?: string | null) =>
+    invoke<SessionInfo>('new_session', { cwd: cwd ?? null, mode: mode ?? null }),
+  /** Tells Rust which window is now showing `sessionId` — lets a
+      notification for that session later focus this specific window
+      instead of a generic fallback. Best-effort; call after any successful
+      session establish/switch. */
+  bindWindowSession: (sessionId: string) =>
+    invoke<void>('bind_window_session', { sessionId }),
+  /** "Set as working directory" (agentic mode) — repoints an existing
+      session's cwd in place instead of forking a new session, so BigTiny's
+      directory sandbox can allow both the original chat_dir and this newly-
+      set directory at once. */
+  setSessionContextDir: (sessionId: string, cwd: string) =>
+    invoke<void>('set_session_context_dir', { sessionId, cwd }),
   sendPrompt: (sessionId: string, text: string, images?: { mime: string; data_url: string }[]) =>
     invoke<void>('send_prompt', { sessionId, text, images: images ?? null }),
   cancelPrompt: (sessionId: string) => invoke<void>('cancel_prompt', { sessionId }),
@@ -89,12 +128,20 @@ export const ipc = {
     invoke<(SessionInfo & Record<string, unknown>) | null>('get_active_session'),
   respondPermission: (toolCallId: string, optionId: string | null) =>
     invoke<void>('respond_permission', { toolCallId, optionId }),
+  /** Fires the "Approval needed" toast/tray-pending state — call only once
+      it's known a tool call genuinely needs a human (never for one about to
+      be silently auto-resolved), since BigTiny's own hitl_pause event no
+      longer triggers a notification directly. */
+  notifyApprovalNeeded: (sessionId: string, toolName: string) =>
+    invoke<void>('notify_approval_needed', { sessionId, toolName }),
   setMode: (sessionId: string, modeId: string) => invoke<void>('set_mode', { sessionId, modeId }),
   listSessions: () => invoke<Record<string, unknown>[]>('list_sessions'),
   loadSession: (sessionId: string, cwd: string) =>
     invoke<SessionInfo>('load_session', { sessionId, cwd }),
   deleteSession: (sessionId: string, cwd?: string) =>
     invoke<void>('delete_session', { sessionId, cwd: cwd ?? null }),
+  renameSession: (sessionId: string, title: string) =>
+    invoke<void>('rename_session', { sessionId, title }),
   /** Settings → General "Clear all chat history" — a standalone destructive
       action, unrelated to provider switching. Returns the number deleted. */
   clearAllSessions: () => invoke<number>('clear_all_sessions'),
@@ -203,21 +250,36 @@ export const ipc = {
     invoke<void>('set_ollama_env', { name, value }),
   restartOllama: () => invoke<void>('restart_ollama'),
   ensureOllamaRunning: () => invoke<void>('ensure_ollama_running'),
-  // Extension defaults (Round-7 Feature 4) — read/write goose's own
-  // config.yaml directly; not session-scoped.
-  listDefaultExtensions: () => invoke<ExtensionDefault[]>('list_default_extensions'),
-  setDefaultExtensionEnabled: (id: string, enabled: boolean) =>
-    invoke<void>('set_default_extension_enabled', { id, enabled }),
-  addExtension: (name: string, command: string, args: string[], env: string[]) =>
-    invoke<void>('add_extension', { name, command, args, env }),
-  setExtensionEnv: (id: string, key: string, value: string) =>
-    invoke<void>('set_extension_env', { id, key, value }),
-  // replacement-mcp (goosed-spawned stdio MCP extension — Kitty only owns its
-  // config.yaml registration, not the process; see commands/replacement_mcp.rs)
+  // MCP servers — daemon-global, live over REST (BigTiny; no restart needed
+  // to add/edit/delete/toggle).
+  listMcpServers: () => invoke<McpServer[]>('list_mcp_servers'),
+  addMcpServer: (spec: McpServerSpec) => invoke<string>('add_mcp_server', { spec }),
+  updateMcpServer: (id: string, patch: McpServerPatch) =>
+    invoke<McpServer>('update_mcp_server', { id, patch }),
+  deleteMcpServer: (id: string) => invoke<void>('delete_mcp_server', { id }),
+  setMcpServerEnabled: (id: string, enabled: boolean) =>
+    invoke<McpServer>('set_mcp_server_enabled', { id, enabled }),
+  connectMcpServer: (id: string) => invoke<void>('connect_mcp_server', { id }),
+  // Bundled "lean tools" MCP server (replaces Goose's built-in Developer +
+  // Computer Controller tools) — registration/enable state lives in Kitty's
+  // config and is self-healed into BigTiny on every startup.
   getReplacementMcpEnabled: () => invoke<boolean>('get_replacement_mcp_enabled'),
   setReplacementMcpEnabled: (enabled: boolean) =>
     invoke<void>('set_replacement_mcp_enabled', { enabled }),
-  disableBuiltinDevExtensions: () => invoke<void>('disable_builtin_dev_extensions'),
+  // Bundled sandboxed-Python/NumPy math MCP server — on by default, no
+  // credentials, same self-healing registration pattern as replacement-mcp.
+  getWasmMathMcpEnabled: () => invoke<boolean>('get_wasm_math_mcp_enabled'),
+  setWasmMathMcpEnabled: (enabled: boolean) =>
+    invoke<void>('set_wasm_math_mcp_enabled', { enabled }),
+  // Bundled Brave Search MCP server — off by default, requires an API key.
+  // Disabling always wipes the stored key server-side, so re-enabling always
+  // goes through setBraveMcpSearchApiKey, never a plain enabled toggle.
+  getBraveMcpSearchStatus: () =>
+    invoke<{ enabled: boolean; configured: boolean }>('get_brave_mcp_search_status'),
+  setBraveMcpSearchApiKey: (apiKey: string) =>
+    invoke<void>('set_brave_mcp_search_api_key', { apiKey }),
+  setBraveMcpSearchEnabled: (enabled: boolean) =>
+    invoke<void>('set_brave_mcp_search_enabled', { enabled }),
   // Settings deep link
   getSettingsTarget: () => invoke<SettingsTarget | null>('get_settings_target'),
   // Theming
@@ -227,7 +289,7 @@ export const ipc = {
   readImageDataUrl: (path: string) => invoke<string>('read_image_data_url', { path }),
   // Wizard / setup
   detectDependencies: () => invoke<Detection>('detect_dependencies'),
-  installDependency: (which: 'ollama' | 'goose') => invoke<void>('install_dependency', { which }),
+  installDependency: (which: 'ollama') => invoke<void>('install_dependency', { which }),
   validateSetup: () => invoke<SetupValidation>('validate_setup'),
   openWizard: (mode?: 'setup' | 'repair') => invoke<void>('open_wizard', { mode: mode ?? 'setup' }),
   getWizardMode: () => invoke<string | null>('get_wizard_mode'),
@@ -331,18 +393,6 @@ export async function pickFiles(): Promise<string[]> {
   return Array.isArray(res) ? res : [res];
 }
 
-/** Native `.exe` picker — the wizard's manual "point at an existing Goose
-    install" fallback next to its one-click install. Returns null if
-    cancelled. Callers persist the result via `ipc.setConfig` (no dedicated
-    Rust command needed, same as every other plain config field). */
-export async function pickExecutable(): Promise<string | null> {
-  const res = await openDialog({
-    multiple: false,
-    filters: [{ name: 'Executable', extensions: ['exe'] }],
-  });
-  return typeof res === 'string' ? res : null;
-}
-
 /** Native save-file dialog for the session export (Round-3 item 24: OpenAI
     messages-array JSONL). Returns null if cancelled. */
 export async function pickSavePath(defaultName: string): Promise<string | null> {
@@ -360,7 +410,7 @@ export async function pickSavePath(defaultName: string): Promise<string | null> 
 export async function pickRecipeYaml(): Promise<string | null> {
   const res = await openDialog({
     multiple: false,
-    filters: [{ name: 'Goose recipe', extensions: ['yaml', 'json'] }],
+    filters: [{ name: 'Recipe', extensions: ['yaml', 'json'] }],
   });
   return typeof res === 'string' ? res : null;
 }
@@ -469,6 +519,14 @@ export const onSessionDeleted = (cb: (sessionId: string) => void) =>
     only once. Payload is the same shape getActiveSession returns. */
 export const onActiveSession = (cb: (info: SessionInfo & Record<string, unknown>) => void) =>
   listen<SessionInfo & Record<string, unknown>>('session://active', (e) => cb(e.payload));
+
+/** A completion/failure notification was clicked for a session no longer bound
+    to any specific window (the window that had it switched to a different chat
+    in the meantime) — targets exactly one already-open window via `emit_to`
+    (`windows::focus_or_open_session`), asking it to reload that session rather
+    than opening a generic blank one. */
+export const onAdoptSession = (cb: (info: SessionInfo & Record<string, unknown>) => void) =>
+  listen<SessionInfo & Record<string, unknown>>('chat://adopt-session', (e) => cb(e.payload));
 
 /** Folder state (create/rename/delete/assign) changed in *any* window
     (Round-5) — same cross-window-staleness reason as `onSessionCreated`, but

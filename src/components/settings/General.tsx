@@ -4,13 +4,14 @@ import { ipc, pickFolder } from '@/lib/ipc';
 import { accelerator } from '@/lib/accelerator';
 import { Modal } from '@/components/shared/Modal';
 
-/** General settings backed by app config. Goose-only settings (approval mode is
-    per-session; see the chat mode badge) are noted where they live elsewhere. */
+/** General settings backed by app config. Approval mode is per-session (see
+    the chat mode badge) rather than living here. */
 export function General() {
   const { draft, update, save, saved } = useConfigDraft();
   // Index of the hotkey row currently capturing a shortcut, or null.
   const [recording, setRecording] = useState<number | null>(null);
   const [recordingClipboard, setRecordingClipboard] = useState(false);
+  const [recordingOpenWindow, setRecordingOpenWindow] = useState(false);
   const [autostart, setAutostart] = useState(false);
   const [confirmClear, setConfirmClear] = useState(false);
   const [sessionCount, setSessionCount] = useState<number | null>(null);
@@ -151,6 +152,44 @@ export function General() {
         <small className="muted">
           Save to apply. Summons the overlay with the current clipboard (text or image)
           pre-attached.
+        </small>
+      </div>
+
+      <div className="field">
+        <span>Open new chat window hotkey</span>
+        <div className="row">
+          <input
+            value={recordingOpenWindow ? 'Press a shortcut…' : (draft.open_window_hotkey ?? '')}
+            readOnly={recordingOpenWindow}
+            placeholder="Not set"
+            onChange={() => {}}
+            onKeyDown={(e) => {
+              if (!recordingOpenWindow) return;
+              e.preventDefault();
+              const acc = accelerator(e);
+              if (acc) {
+                update({ open_window_hotkey: acc });
+                setRecordingOpenWindow(false);
+              }
+            }}
+          />
+          <button onClick={() => setRecordingOpenWindow((r) => !r)}>
+            {recordingOpenWindow ? 'Cancel' : 'Record'}
+          </button>
+          <button
+            onClick={() => {
+              update({ open_window_hotkey: null });
+              setRecordingOpenWindow(false);
+            }}
+            disabled={!draft.open_window_hotkey}
+            title="Clear"
+          >
+            ✕
+          </button>
+        </div>
+        <small className="muted">
+          Save to apply. Always opens a brand-new chat window with a fresh session — never
+          reuses an existing one.
         </small>
       </div>
 

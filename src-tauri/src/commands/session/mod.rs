@@ -46,54 +46,6 @@ pub struct ThinkingEffort {
     pub options: Vec<EffortOption>,
 }
 
-/// Both `session/new` and `session/load`'s raw ACP result carry a top-level
-/// `configOptions: [...]` array (live-probed, `docs/acp-protocol.md`) with
-/// entries for `provider`/`mode`/`model`/`thinking_effort` — Kitty only needs
-/// the last one here (the others are already managed via their own
-/// mechanisms: `ProviderBadge`, `ModeToggle`/`ModeBadge`, the Providers model
-/// picker). goose's own option set can include `off`/`max` alongside
-/// `low`/`medium`/`high` (owner decision: only the three standard levels are
-/// worth exposing in the UI — `off` and `max` are dropped here, not just
-/// hidden client-side, so there's one source of truth for what's selectable).
-/// `thinking_effort.options` is otherwise model-dependent: a model with no
-/// extended-thinking support offers just `[{name:"off",value:"off"}]` — after
-/// dropping `off`, that's zero low/medium/high options — so treat fewer than
-/// 2 surviving options as "no effort control for this model" and return
-/// `None` rather than a useless dropdown.
-fn parse_thinking_effort(result: &Value) -> Option<ThinkingEffort> {
-    const RANK: [&str; 3] = ["low", "medium", "high"];
-    let entry = result
-        .get("configOptions")?
-        .as_array()?
-        .iter()
-        .find(|c| c.get("id").and_then(|v| v.as_str()) == Some("thinking_effort"))?;
-    let current_value = entry.get("currentValue")?.as_str()?.to_string();
-    let mut options: Vec<EffortOption> = entry
-        .get("options")?
-        .as_array()?
-        .iter()
-        .filter_map(|o| serde_json::from_value::<EffortOption>(o.clone()).ok())
-        .filter(|o| RANK.contains(&o.value.to_lowercase().as_str()))
-        .collect();
-    options.sort_by_key(|o| RANK.iter().position(|r| *r == o.value.to_lowercase()));
-    if options.len() < 2 {
-        return None;
-    }
-    // The model's actual current value may be a dropped choice (e.g. `off`,
-    // its natural resting default) — fall back to the first surviving option
-    // for display purposes only; nothing is sent to goosed until the user
-    // actually picks one via the dropdown.
-    let current_value = if options.iter().any(|o| o.value == current_value) {
-        current_value
-    } else {
-        options[0].value.clone()
-    };
-    Some(ThinkingEffort {
-        current_value,
-        options,
-    })
-}
-
 /// Prefix every no-explicit-folder session's private chat folder lives under
 /// (Round-3 item 25). `delete_session` only ever removes a directory under
 /// this prefix — never a user-chosen custom working directory.

@@ -19,6 +19,7 @@ interface SessionState {
   assignments: Record<string, string>;
   refresh: () => Promise<void>;
   remove: (sessionId: string) => Promise<void>;
+  rename: (sessionId: string, title: string) => Promise<void>;
   setQuery: (q: string) => void;
   filtered: () => SessionSummary[];
   // Folders
@@ -55,6 +56,15 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     set((s) => ({ sessions: s.sessions.filter((x) => x.sessionId !== sessionId) }));
     // Drop any dangling folder assignment.
     if (get().assignments[sessionId]) await get().assignFolder(sessionId, null);
+  },
+
+  rename: async (sessionId: string, title: string) => {
+    const trimmed = title.trim();
+    if (!trimmed) return;
+    await ipc.renameSession(sessionId, trimmed);
+    set((s) => ({
+      sessions: s.sessions.map((x) => (x.sessionId === sessionId ? { ...x, title: trimmed } : x)),
+    }));
   },
 
   setQuery: (q: string) => set({ query: q }),

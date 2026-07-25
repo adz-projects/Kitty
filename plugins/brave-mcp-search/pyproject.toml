@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "brave-mcp-search"
+version = "0.1.0"
+description = "Brave Search LLM Context API as a stdio MCP tool."
+requires-python = ">=3.11"
+dependencies = [
+    "mcp[cli]>=1.2.0",
+    "httpx>=0.27",
+]
+
+[project.scripts]
+brave-mcp-search = "brave_mcp_search:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "pytest-asyncio>=0.21"]
+
+[tool.setuptools]
+py-modules = ["brave_mcp_search"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

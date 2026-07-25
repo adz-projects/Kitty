@@ -8,7 +8,7 @@ use tauri::{AppHandle, Emitter, Manager};
 
 use super::adaptive_pathway_proc::{self, AdaptivePathwayStatus, EmbeddingModelStatus};
 use super::embedding::{ensure_embedding_model, set_embedding_status};
-use super::{conflict, goosed, ollama_proc};
+use super::ollama_proc;
 use crate::state::{AppState, StackStatus};
 
 /// Payload for the `stack://status` event.
@@ -182,38 +182,17 @@ pub fn spawn_health_loop(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         let client = crate::util::http_client();
         let mut ticker = tokio::time::interval(Duration::from_secs(5));
-        // The Goose Desktop conflict check enumerates processes — slow-changing
-        // and comparatively costly, so refresh it only every 12th tick (~60s)
-        // rather than every 5s (Round-5 Batch 8). Cached between refreshes.
-        let mut tick: u64 = 0;
-        let mut conflict = false;
         // Debounce (mirrors the Adaptive Pathway sidecar's own health-loop
         // debounce): a degraded reading must repeat on the *next* tick before
-        // it's actually stored/reported. A single missed/slow probe — e.g.
-        // the brief window during a legitimate provider-switch goosed
-        // restart — shouldn't flip the whole app into a "degraded" banner for
-        // one blip (confirmed real report: switching providers mid-chat
-        // sometimes surfaced a false "goose server is down"). Recovering to
+        // it's actually stored/reported. A single missed/slow probe (OS
+        // scheduling jitter, a momentary daemon hiccup) shouldn't flip the
+        // whole app into a "degraded" banner for one blip. Recovering to
         // `Ok` stays immediate; only degradation needs the extra
         // confirmation tick.
         let mut pending_degraded: Option<StackStatus> = None;
         loop {
             ticker.tick().await;
-            if tick % 12 == 0 {
-                let our_child_pid = {
-                    let state = app.state::<AppState>();
-                    let goosed = state.goosed.lock().unwrap();
-                    goosed
-                        .process
-                        .child
-                        .as_ref()
-                        .map(|c| c.id())
-                        .filter(|_| goosed.process.owned)
-                };
-                conflict = conflict::goose_desktop_running(our_child_pid);
-            }
-            tick = tick.wrapping_add(1);
-            let computed = compute_status(&app, &client, conflict).await;
+            let computed = compute_status(&app, &client).await;
             let status = if computed == StackStatus::Ok || pending_degraded == Some(computed) {
                 pending_degraded = None;
                 computed
@@ -245,8 +224,9 @@ pub fn spawn_health_loop(app: AppHandle) {
                     crate::notifications::notify_if_hidden(
                         &app,
                         crate::notifications::Event::StackDegraded,
-                        "Goose needs attention",
-                        "The local stack is degraded. Open Goose to fix it.",
+                        "Kitty needs attention",
+                        "The local stack is degraded. Open Kitty to fix it.",
+                        None,
                     );
                 }
             }
@@ -254,65 +234,32 @@ pub fn spawn_health_loop(app: AppHandle) {
     });
 }
 
-/// `conflict` is the cached "stock Goose Desktop running" flag, refreshed on a
-/// slower cadence by the caller (Round-5 Batch 8) since it's slow-changing.
-pub(crate) async fn compute_status(
-    app: &AppHandle,
-    client: &reqwest::Client,
-    conflict: bool,
-) -> StackStatus {
-    let (base, goosed_port, needs_ollama) = {
+pub(crate) async fn compute_status(app: &AppHandle, client: &reqwest::Client) -> StackStatus {
+    let (base, needs_ollama, bigtiny_port) = {
         let state = app.state::<AppState>();
         let cfg = state.config.lock().unwrap();
-        let goosed = state.goosed.lock().unwrap();
+        let bigtiny_port = state.bigtiny.lock().unwrap().port;
         (
             cfg.ollama_base_url.clone(),
-            goosed.port,
             cfg.ollama_enabled && ollama_proc::requires_local_ollama(&cfg),
+            bigtiny_port,
         )
     };
 
-    // Degraded states take precedence over the (non-blocking) conflict warning.
     // Ollama reachability/model checks only apply when the active setup
     // actually needs Ollama — a remote/API-key provider shouldn't misreport
     // as broken just because no local Ollama is running (wizard redesign).
     if needs_ollama && !ollama_proc::probe_version(client, &base).await {
         return StackStatus::OllamaDown;
     }
-    match goosed_port {
-        Some(port) if goosed::is_up(port).await => {
-            // A bare TCP connect only confirms the OS-level listener is still
-            // bound — not that the ACP protocol layer inside goosed is
-            // actually responding. Confirmed real gap: the ACP WebSocket
-            // closed/reconnected three times in one real session with zero
-            // degraded-banner/notification, because this was the *only*
-            // goosed check and it stayed trivially true the whole time even
-            // while the protocol layer itself was flaking. A short, capped
-            // `session/list` round trip actually exercises that layer —
-            // capped independently of `request()`'s own (much longer,
-            // 300s) internal timeout so one slow/wedged probe can't stall
-            // this loop's own 5s cadence.
-            let acp_ok = match crate::goosed::api::ensure_client(app).await {
-                Ok(client) => tokio::time::timeout(
-                    Duration::from_secs(3),
-                    client.request("session/list", serde_json::json!({})),
-                )
-                .await
-                .map(|r| r.is_ok())
-                .unwrap_or(false),
-                Err(_) => false,
-            };
-            if !acp_ok {
-                return StackStatus::GoosedDown;
-            }
-        }
-        _ => return StackStatus::GoosedDown,
+    // `/api/health` is a real protocol-level probe (the FastAPI app
+    // answering, not just a bound TCP listener).
+    match bigtiny_port {
+        Some(port) if super::bigtiny_proc::probe_health(client, port).await => {}
+        _ => return StackStatus::BackendDown,
     }
     if needs_ollama && !ollama_proc::has_any_model(client, &base).await {
         return StackStatus::NoModel;
-    }
-    if conflict {
-        return StackStatus::ConflictGooseDesktop;
     }
     StackStatus::Ok
 }

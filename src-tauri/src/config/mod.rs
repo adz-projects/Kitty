@@ -1,7 +1,7 @@
-//! App configuration: a single JSON document at
-//! `%APPDATA%/goose-overlay/config.json`, loaded at startup and written back on
-//! change. Stores **metadata only** — never secrets (those live in the Windows
-//! Credential Manager via `keyring`, wired in Phase 5).
+//! App configuration: a single JSON document at `%APPDATA%/Kitty/config.json`,
+//! loaded at startup and written back on change. Stores **metadata only** —
+//! never secrets (those live in the Windows Credential Manager via
+//! `keyring`).
 
 pub mod env_helper;
 pub mod providers;
@@ -11,7 +11,7 @@ pub mod scheduled_tasks;
 
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -36,6 +36,12 @@ pub struct Config {
     /// pre-attached (Round-4 clipboard hotkey). `None` = not registered.
     #[serde(default)]
     pub clipboard_hotkey: Option<String>,
+    /// Accelerator that always opens a brand-new chat window with a fresh
+    /// session (Feature 4/5 — multiple simultaneous chat windows). `None` =
+    /// not registered. Distinct from `hotkeys` above, which toggles the
+    /// overlay/focuses the one classic singleton main window.
+    #[serde(default)]
+    pub open_window_hotkey: Option<String>,
     /// Default working directory for new sessions (Phase 4). `None` until set.
     pub default_context_folder: Option<String>,
     /// Ollama endpoint; the stack manager probes and (if needed) spawns it.
@@ -64,19 +70,10 @@ pub struct Config {
     pub remember_overlay_position: bool,
     /// Provider profiles (metadata only; secrets live in the keyring).
     pub providers: Vec<ProviderProfile>,
-    /// Id of the active provider profile, if any (else goosed uses its config).
+    /// Id of the active provider profile, if any.
     pub active_provider_id: Option<String>,
     /// Disable file/folder drop while a remote-tier provider is active.
     pub strict_remote_mode: bool,
-    /// What goosed should do when a conversation approaches its context
-    /// limit (Round-4 item 3): `"summarize" | "truncate" | "clear" | "prompt"`,
-    /// threaded into its spawn env as `GOOSE_CONTEXT_STRATEGY`. Replaces the
-    /// old `auto_summarize_threshold` message-count field, which was never
-    /// actually read anywhere — Goose's real auto-compaction triggers on
-    /// context-percentage, not a user-settable message count, so that field's
-    /// semantics never mapped to anything real.
-    #[serde(default = "default_context_strategy")]
-    pub context_strategy: String,
     /// User-defined chat folders (Round-2 item 15). App-side only — layered over
     /// goosed's session list; not visible to other Goose clients.
     #[serde(default)]
@@ -123,27 +120,40 @@ pub struct Config {
     /// per-provider.
     #[serde(default = "default_ap_embedding_model")]
     pub adaptive_pathway_embedding_model: String,
-    /// Whether the `replacement-mcp` extension (see `plugins/replacement-mcp/`)
-    /// is registered+enabled as a goosed stdio MCP extension. Off by default —
-    /// unlike Adaptive Pathway, this one replaces Goose's built-in `developer`/
-    /// `computercontroller` extensions, so it's opt-in rather than assumed.
-    /// Kitty never spawns/monitors this extension's process itself (goosed
-    /// does, like any other extension) — this flag only drives whether
-    /// `goose_config::ensure_extension_registered`'s entry is enabled.
+    /// Whether the bundled `replacement-mcp` server (see
+    /// `plugins/replacement-mcp/`) is registered+enabled as a BigTiny MCP
+    /// server. Off by default — unlike Adaptive Pathway, this one is a
+    /// wholesale alternative tool set, so it's opt-in rather than assumed.
+    /// Kitty never spawns/monitors this process itself; BigTiny does, like
+    /// any other MCP server — this flag only drives whether
+    /// `bigtiny::mcp::ensure_builtin_servers`'s registration is enabled.
     #[serde(default)]
     pub replacement_mcp_enabled: bool,
+    /// Whether the bundled `wasm-math-mcp` server (see
+    /// `plugins/wasm-math-mcp/`) is registered+enabled as a BigTiny MCP
+    /// server. On by default — sandboxed Python/NumPy execution is safe and
+    /// broadly useful for any model, unlike `replacement_mcp`'s wholesale
+    /// tool-set swap. No credentials involved.
+    #[serde(default = "default_true")]
+    pub wasm_math_mcp_enabled: bool,
+    /// Whether the bundled `brave-mcp-search` server (see
+    /// `plugins/brave-mcp-search/`) is registered+enabled as a BigTiny MCP
+    /// server. Off by default (requires a Brave Search API key, unlike
+    /// `wasm_math_mcp_enabled`). The API key itself lives in the keyring
+    /// (`config::providers::{set_secret,get_secret_async,delete_secret}`
+    /// under the fixed id `"brave-mcp-search"`), never here — this flag only
+    /// tracks user intent. Disabling this server always deletes the stored
+    /// key (see `commands::set_brave_mcp_search_enabled`), so re-enabling it
+    /// always requires re-entering the key — deliberate, not a bug: an old
+    /// key silently reactivating without the user seeing it again would be
+    /// surprising for a server that reaches an external paid API.
+    #[serde(default)]
+    pub brave_mcp_search_enabled: bool,
     /// User-defined scheduled tasks (instructions the agent runs later,
     /// one-shot or recurring, with or without the app open) — see
     /// `scheduled_tasks::ScheduledTask`.
     #[serde(default)]
     pub scheduled_tasks: Vec<ScheduledTask>,
-    /// Absolute path to `goose.exe`, set automatically once the wizard's
-    /// one-click Goose install (download + extract the CLI zip) completes, or
-    /// manually via the wizard's "point at an existing install" fallback.
-    /// Checked first by `lifecycle::goosed::locate_goose`, before the
-    /// `GOOSE_BIN` env var / Goose Desktop bundle path / bare `goose` on PATH.
-    #[serde(default)]
-    pub goose_binary_override: Option<String>,
     /// Whether local inference (Ollama) is in play at all for this install.
     /// Set explicitly by the wizard's first-screen fork ("Run on this
     /// computer" vs. "Use my own API key") and toggleable later from
@@ -155,6 +165,22 @@ pub struct Config {
     /// `lifecycle::ollama_proc::requires_local_ollama`).
     #[serde(default = "default_true")]
     pub ollama_enabled: bool,
+    /// Command used to launch the BigTiny daemon — the bundled
+    /// `bigtiny-daemon.exe` (see `plugins/build.py`, same `externalBin`
+    /// convention as the other bundled plugins) if present, else `python`
+    /// for dev convenience (paired with `bigtiny_args`'s `-m bigtiny`
+    /// default, so `cargo tauri dev` still works from a source checkout).
+    #[serde(default = "default_bigtiny_command")]
+    pub bigtiny_command: String,
+    /// Arguments before `--port`/`--host`. Empty for the bundled exe; `["-m",
+    /// "bigtiny"]` for the dev-convenience `python` fallback above.
+    #[serde(default = "default_bigtiny_args")]
+    pub bigtiny_args: Vec<String>,
+    /// Working directory to spawn BigTiny in — the checkout that contains the
+    /// `bigtiny` package, when it isn't pip-installed into the interpreter
+    /// and the bundled exe isn't in use. `None` = inherit Kitty's own cwd.
+    #[serde(default)]
+    pub bigtiny_dir: Option<String>,
     /// User + built-in recipe templates (Goose recipes reinterpreted as
     /// client-side chat-turn templates — see `recipes` module doc comment).
     /// Seeded with the 4 built-ins two ways: `Config::default()` below contains
@@ -170,6 +196,7 @@ impl Default for Config {
         Self {
             hotkeys: vec!["Alt+Space".to_string()],
             clipboard_hotkey: Some("Ctrl+Alt+Space".to_string()),
+            open_window_hotkey: None,
             default_context_folder: None,
             ollama_base_url: "http://localhost:11434".to_string(),
             setup_completed: false,
@@ -184,7 +211,6 @@ impl Default for Config {
             providers: Vec::new(),
             active_provider_id: None,
             strict_remote_mode: false,
-            context_strategy: default_context_strategy(),
             folders: Vec::new(),
             session_folders: HashMap::new(),
             show_artifacts: true,
@@ -196,11 +222,29 @@ impl Default for Config {
             adaptive_pathway_port: default_ap_port(),
             adaptive_pathway_embedding_model: default_ap_embedding_model(),
             replacement_mcp_enabled: false,
+            wasm_math_mcp_enabled: default_true(),
+            brave_mcp_search_enabled: false,
             scheduled_tasks: Vec::new(),
-            goose_binary_override: None,
             ollama_enabled: default_true(),
+            bigtiny_command: default_bigtiny_command(),
+            bigtiny_args: default_bigtiny_args(),
+            bigtiny_dir: None,
             recipes: recipes::builtin_templates(),
         }
+    }
+}
+
+fn default_bigtiny_command() -> String {
+    bundled_plugin_path("bigtiny-daemon.exe").unwrap_or_else(|| "python".to_string())
+}
+
+/// Empty when the bundled exe was found (it needs no `-m bigtiny` — that's
+/// only how the dev-convenience bare `python` fallback locates the package).
+fn default_bigtiny_args() -> Vec<String> {
+    if bundled_plugin_path("bigtiny-daemon.exe").is_some() {
+        Vec::new()
+    } else {
+        vec!["-m".to_string(), "bigtiny".to_string()]
     }
 }
 
@@ -214,10 +258,6 @@ fn default_bg_position() -> f32 {
 
 fn default_bg_size() -> String {
     "cover".to_string()
-}
-
-fn default_context_strategy() -> String {
-    "summarize".to_string()
 }
 
 fn default_adaptive_pathway_enabled() -> bool {
@@ -238,8 +278,9 @@ fn default_ap_launch_command() -> String {
 }
 
 /// Resolves `<name>` next to the currently-running executable, if it exists.
-/// Shared by every bundled-plugin default (see also `goose_config.rs`'s
-/// replacement-mcp registration, which needs the same resolution).
+/// Shared by every bundled-plugin default (also used to resolve the
+/// replacement-mcp and adaptive-pathway-mcp exe paths for BigTiny's MCP
+/// server registration — see `bigtiny::mcp::ensure_builtin_servers`).
 pub(crate) fn bundled_plugin_path(name: &str) -> Option<String> {
     let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
     let candidate = dir.join(name);
@@ -249,11 +290,11 @@ pub(crate) fn bundled_plugin_path(name: &str) -> Option<String> {
 }
 
 /// An absolute default, not a bare relative `./pathway.db` — the sidecar
-/// (spawned by Kitty) and the Goose MCP extension (spawned by goosed, itself
-/// spawned by Kitty) are three separate processes that can each have a
-/// different working directory, so a relative path risks each one silently
-/// resolving to a *different* file even when configured "the same." An
-/// absolute path removes that ambiguity.
+/// (spawned by Kitty) and the adaptive-pathway MCP tools (spawned by
+/// BigTiny) are separate processes that can each have a different working
+/// directory, so a relative path risks each one silently resolving to a
+/// *different* file even when configured "the same." An absolute path
+/// removes that ambiguity.
 fn default_ap_db_path() -> String {
     dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -303,20 +344,67 @@ pub enum ConfigError {
     Parse(#[from] serde_json::Error),
 }
 
-/// `%APPDATA%/goose-overlay/` (created if missing).
+/// `%APPDATA%/Kitty/` (created if missing). One-time migration: if this dir
+/// has no `config.json` yet but the pre-rename `%APPDATA%/goose-overlay/`
+/// does, move the whole directory (bringing `config.json` and `themes/`
+/// along) rather than leaving the user's settings stranded under the old name.
 fn config_dir() -> Result<PathBuf, ConfigError> {
-    let dir = dirs::config_dir()
-        .ok_or(ConfigError::NoConfigDir)?
-        .join("goose-overlay");
+    let base = dirs::config_dir().ok_or(ConfigError::NoConfigDir)?;
+    let dir = base.join("Kitty");
+    if !dir.join("config.json").exists() {
+        let old_dir = base.join("goose-overlay");
+        if old_dir.exists() {
+            migrate_config_dir(&old_dir, &dir);
+        }
+    }
     fs::create_dir_all(&dir)?;
     Ok(dir)
+}
+
+/// Best-effort directory migration: a same-volume rename is instant and
+/// atomic; if that fails (cross-volume, or `new` already exists as some
+/// stray empty dir), fall back to a recursive copy-then-remove so the old
+/// files are still present in the new location and nothing is silently lost.
+fn migrate_config_dir(old: &Path, new: &Path) {
+    if fs::rename(old, new).is_ok() {
+        tracing::info!("migrated config dir {} -> {}", old.display(), new.display());
+        return;
+    }
+    if copy_dir_recursive(old, new).is_ok() {
+        let _ = fs::remove_dir_all(old);
+        tracing::info!(
+            "migrated config dir {} -> {} (copy fallback)",
+            old.display(),
+            new.display()
+        );
+    } else {
+        tracing::warn!(
+            "could not migrate config dir {} -> {}",
+            old.display(),
+            new.display()
+        );
+    }
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let dst_path = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_recursive(&entry.path(), &dst_path)?;
+        } else {
+            fs::copy(entry.path(), dst_path)?;
+        }
+    }
+    Ok(())
 }
 
 fn config_path() -> Result<PathBuf, ConfigError> {
     Ok(config_dir()?.join("config.json"))
 }
 
-/// `%APPDATA%/goose-overlay/themes/` (created if missing) — user `.css` themes.
+/// `%APPDATA%/Kitty/themes/` (created if missing) — user `.css` themes.
 pub fn themes_dir() -> Result<PathBuf, ConfigError> {
     let dir = config_dir()?.join("themes");
     fs::create_dir_all(&dir)?;
@@ -330,9 +418,9 @@ pub fn load() -> Result<Config, ConfigError> {
     match fs::read_to_string(&path) {
         Ok(text) => {
             let config: Config = serde_json::from_str(&text)?;
-            Ok(migrate_ap_launch_command(migrate_recipes(migrate_hotkeys(
-                config, &text,
-            ))))
+            Ok(migrate_bigtiny_launch_command(migrate_ap_launch_command(
+                migrate_recipes(migrate_hotkeys(config, &text)),
+            )))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
         Err(e) => Err(e.into()),
@@ -377,6 +465,24 @@ fn migrate_ap_launch_command(mut config: Config) -> Config {
     config
 }
 
+/// Self-heals an existing install's `bigtiny_command`/`bigtiny_args` from the
+/// pre-bundling dev default (`python -m bigtiny`) onto the bundled exe, once
+/// one is present — same rationale as `migrate_ap_launch_command`. Only
+/// migrates the exact pair the old default used to produce; a deliberate
+/// override (e.g. `uv run bigtiny`, or a source checkout via `bigtiny_dir`)
+/// is left untouched.
+fn migrate_bigtiny_launch_command(mut config: Config) -> Config {
+    const OLD_COMMAND: &str = "python";
+    let old_args = ["-m".to_string(), "bigtiny".to_string()];
+    if config.bigtiny_command == OLD_COMMAND && config.bigtiny_args == old_args {
+        if let Some(bundled) = bundled_plugin_path("bigtiny-daemon.exe") {
+            config.bigtiny_command = bundled;
+            config.bigtiny_args = Vec::new();
+        }
+    }
+    config
+}
+
 /// Seed `hotkeys` from the legacy singular `hotkey` field when a pre-Round-2
 /// config is loaded (Round-2 item 3). No-op once `hotkeys` is populated.
 fn migrate_hotkeys(mut config: Config, raw: &str) -> Config {
@@ -409,6 +515,56 @@ pub fn save(config: &Config) -> Result<(), ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "kitty-config-test-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        dir
+    }
+
+    #[test]
+    fn migrate_config_dir_moves_files_via_rename() {
+        let old = temp_dir("rename-old");
+        let new = temp_dir("rename-new");
+        fs::create_dir_all(&old).unwrap();
+        fs::write(old.join("config.json"), "{}").unwrap();
+        fs::create_dir_all(old.join("themes")).unwrap();
+        fs::write(old.join("themes").join("dark.css"), "body{}").unwrap();
+
+        migrate_config_dir(&old, &new);
+
+        assert!(!old.exists());
+        assert!(new.join("config.json").exists());
+        assert!(new.join("themes").join("dark.css").exists());
+        let _ = fs::remove_dir_all(&new);
+    }
+
+    #[test]
+    fn copy_dir_recursive_copies_nested_files() {
+        let old = temp_dir("copy-old");
+        let new = temp_dir("copy-new");
+        fs::create_dir_all(old.join("themes")).unwrap();
+        fs::write(old.join("config.json"), "{\"theme\":\"dark\"}").unwrap();
+        fs::write(old.join("themes").join("x.css"), "x").unwrap();
+
+        copy_dir_recursive(&old, &new).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(new.join("config.json")).unwrap(),
+            "{\"theme\":\"dark\"}"
+        );
+        assert_eq!(fs::read_to_string(new.join("themes").join("x.css")).unwrap(), "x");
+        // Source untouched — the caller decides whether to remove it.
+        assert!(old.exists());
+        let _ = fs::remove_dir_all(&old);
+        let _ = fs::remove_dir_all(&new);
+    }
 
     #[test]
     fn defaults_are_sane() {
@@ -458,6 +614,20 @@ mod tests {
         let back: Config = serde_json::from_str(r#"{"theme":"dark"}"#).unwrap();
         assert_eq!(back.theme, "dark");
         assert_eq!(back.ollama_base_url, "http://localhost:11434");
+        // Predates the second (open-new-chat-window) hotkey entirely — must
+        // default to unregistered, not error out on the missing field.
+        assert_eq!(back.open_window_hotkey, None);
+    }
+
+    #[test]
+    fn open_window_hotkey_roundtrips_through_json() {
+        let c = Config {
+            open_window_hotkey: Some("Ctrl+Alt+N".to_string()),
+            ..Config::default()
+        };
+        let text = serde_json::to_string(&c).unwrap();
+        let back: Config = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.open_window_hotkey.as_deref(), Some("Ctrl+Alt+N"));
     }
 
     #[test]
@@ -510,6 +680,33 @@ mod tests {
     }
 
     #[test]
+    fn migrate_bigtiny_launch_command_leaves_custom_override_untouched() {
+        let cfg = Config {
+            bigtiny_command: "uv".to_string(),
+            bigtiny_args: vec!["run".to_string(), "bigtiny".to_string()],
+            ..Config::default()
+        };
+        let migrated = migrate_bigtiny_launch_command(cfg);
+        assert_eq!(migrated.bigtiny_command, "uv");
+        assert_eq!(migrated.bigtiny_args, vec!["run", "bigtiny"]);
+    }
+
+    #[test]
+    fn migrate_bigtiny_launch_command_is_a_noop_with_no_bundled_binary_present() {
+        // The test binary has no `bigtiny-daemon.exe` sitting next to it, so
+        // `bundled_plugin_path` finds nothing and the old dev-default
+        // command/args pair is left as-is.
+        let cfg = Config {
+            bigtiny_command: "python".to_string(),
+            bigtiny_args: vec!["-m".to_string(), "bigtiny".to_string()],
+            ..Config::default()
+        };
+        let migrated = migrate_bigtiny_launch_command(cfg);
+        assert_eq!(migrated.bigtiny_command, "python");
+        assert_eq!(migrated.bigtiny_args, vec!["-m", "bigtiny"]);
+    }
+
+    #[test]
     fn old_shape_config_migrates_embedding_model_default() {
         // A config predating the embedding-model requirement must still load,
         // defaulting to the one pinned cross-compatible tag every user shares.
@@ -553,11 +750,10 @@ mod tests {
 
     #[test]
     fn old_shape_config_migrates_wizard_redesign_defaults() {
-        // A config predating the wizard redesign (goose_binary_override,
-        // ollama_enabled) must still load: no override path, and Ollama left
-        // enabled (pre-existing installs already have it configured).
+        // A config predating the wizard redesign (ollama_enabled) must still
+        // load, with Ollama left enabled (pre-existing installs already have
+        // it configured).
         let back: Config = serde_json::from_str(r#"{"theme":"dark"}"#).unwrap();
-        assert_eq!(back.goose_binary_override, None);
         assert!(back.ollama_enabled);
     }
 }

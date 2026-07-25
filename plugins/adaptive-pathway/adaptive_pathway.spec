@@ -32,6 +32,11 @@ a = Analysis(
         "uvicorn.protocols.websockets.auto",
         "uvicorn.lifespan",
         "uvicorn.lifespan.on",
+        # Same gap as adaptive_pathway_mcp.spec: SQLAlchemy resolves the
+        # "aiosqlite" DBAPI driver dynamically from the `sqlite+aiosqlite://`
+        # URL (storage/database.py), not via a plain top-level import, so
+        # PyInstaller's static analysis misses it without this.
+        "aiosqlite",
     ],
     hookspath=[],
     runtime_hooks=[],

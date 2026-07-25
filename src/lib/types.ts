@@ -14,6 +14,7 @@ export interface NotificationPrefs {
 export interface Config {
   hotkeys: string[];
   clipboard_hotkey: string | null;
+  open_window_hotkey: string | null;
   default_context_folder: string | null;
   ollama_base_url: string;
   setup_completed: boolean;
@@ -28,7 +29,6 @@ export interface Config {
   providers: ProviderProfile[];
   active_provider_id: string | null;
   strict_remote_mode: boolean;
-  context_strategy: 'summarize' | 'truncate' | 'clear' | 'prompt';
   show_artifacts: boolean;
   /** Whether Kitty spawns/supervises the Adaptive Pathway extension's HTTP
       sidecar (off by default — a separate Python process the user installs). */
@@ -41,9 +41,6 @@ export interface Config {
       pinned tag shared by every user regardless of chat provider, so learned
       vectors live in the same space. */
   adaptive_pathway_embedding_model: string;
-  /** Absolute path to `goose.exe`, set by the wizard's one-click install or
-      its manual "point at an existing install" fallback. */
-  goose_binary_override: string | null;
   /** Whether local inference (Ollama) is in play for this install — set by
       the wizard's first-screen fork, toggleable later from Advanced. */
   ollama_enabled: boolean;
@@ -254,14 +251,50 @@ export interface EnvVar {
   value: string | null;
 }
 
-/** One entry in goose's own config.yaml extensions map (Round-7 Feature 4) —
-    the real "default for new chats" catalog, on or off. */
-export interface ExtensionDefault {
+/** A BigTiny MCP server registration — daemon-global, live over REST (no
+    restart to add/edit/delete/toggle). `streamable_http` is the MCP spec's
+    successor to the old two-endpoint `sse` transport: a single POST endpoint,
+    response framed as plain JSON or one SSE `data:` frame. `headers` carries
+    auth for either remote transport (e.g. `{"Authorization": "Bearer ..."}`)
+    — `stdio` never uses `url`/`headers`. */
+export interface McpServer {
   id: string;
+  name: string;
+  transport: 'stdio' | 'sse' | 'streamable_http';
+  command: string | null;
+  args: string[];
+  url: string | null;
+  env: Record<string, string>;
+  headers: Record<string, string>;
   enabled: boolean;
-  type: string;
-  display_name: string | null;
-  description: string | null;
+  status: 'connected' | 'disconnected' | 'error';
+  error_message: string | null;
+}
+
+/** Input to `ipc.addMcpServer` — mirrors `McpServer` minus the server-assigned
+    id/status fields. */
+export interface McpServerSpec {
+  name: string;
+  transport: 'stdio' | 'sse' | 'streamable_http';
+  command?: string | null;
+  args?: string[];
+  url?: string | null;
+  env?: Record<string, string>;
+  headers?: Record<string, string>;
+  enabled?: boolean;
+}
+
+/** Input to `ipc.updateMcpServer` — every field optional, only what's set is
+    changed. */
+export interface McpServerPatch {
+  name?: string;
+  transport?: 'stdio' | 'sse' | 'streamable_http';
+  command?: string | null;
+  args?: string[];
+  url?: string | null;
+  env?: Record<string, string>;
+  headers?: Record<string, string>;
+  enabled?: boolean;
 }
 
 export interface SettingsTarget {
@@ -280,7 +313,6 @@ export interface DepStatus {
 
 export interface Detection {
   ollama: DepStatus;
-  goose: DepStatus;
 }
 
 /** Result of `validate_setup` — powers the wizard's Done-step summary/soft
@@ -296,10 +328,9 @@ export type StackStatus =
   | 'starting'
   | 'ok'
   | 'ollama_down'
-  | 'goosed_down'
+  | 'backend_down'
   | 'no_model'
-  | 'provider_unreachable'
-  | 'conflict_goose_desktop';
+  | 'provider_unreachable';
 
 export interface StackStatusPayload {
   status: StackStatus;
@@ -309,7 +340,7 @@ export interface StackStatusPayload {
 // One-time startup progress, separate from StackStatus (which is a
 // steady-state health readout and has no concept of "spawning"/"warming").
 // `ready` has no further bearing on chat availability once reached.
-export type StartupPhase = 'spawning_goosed' | 'warming_model' | 'ready';
+export type StartupPhase = 'spawning_backend' | 'warming_model' | 'ready';
 
 export interface StartupPhasePayload {
   phase: StartupPhase;
@@ -608,7 +639,7 @@ export function parseSession(raw: Record<string, unknown>): SessionSummary {
   const meta = (raw._meta as Record<string, unknown>) ?? {};
   return {
     sessionId: String(raw.sessionId ?? ''),
-    title: String(raw.title ?? 'Untitled session'),
+    title: String(raw.title ?? 'New Chat'),
     cwd: String(raw.cwd ?? ''),
     updatedAt: String(raw.updatedAt ?? ''),
     messageCount: typeof meta.messageCount === 'number' ? meta.messageCount : undefined,

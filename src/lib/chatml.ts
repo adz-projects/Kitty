@@ -24,7 +24,7 @@ export function buildExport(messages: Message[], upToIndex?: number): ChatMessag
 }
 
 export function sanitizeFilename(name: string): string {
-  return (name || 'goose-session')
+  return (name || 'kitty-session')
     .replace(/[\\/:*?"<>|]/g, '_')
     .trim()
     .slice(0, 80);

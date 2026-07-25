@@ -1,10 +1,12 @@
-# CLAUDE.md — Goose Overlay
+# CLAUDE.md — Kitty
 
 ## What this project is
 
-A Windows-only Tauri v2 desktop app: a hotkey-summoned floating overlay chat client for the Goose AI agent (`goosed`), backed by Ollama for local inference. It is a **client only** — all agent logic, tool execution, MCP handling, and model routing stays inside `goosed`. This app owns: window management (overlay / full window / settings / tray), the goosed+Ollama process lifecycle, configuration UI, drag-and-drop file context, session history UI, an artifacts sidepane, notifications, tool-approval UI, theming, and a first-run installer/wizard.
+A Windows-only Tauri v2 desktop app: a hotkey-summoned floating overlay chat client backed by **BigTiny** (a chat-first REST/SSE agent daemon, vendored in-tree at `plugins/bigtiny/`), with Ollama for local inference. It is a **client only** — all agent logic, tool execution, MCP handling, and model routing stays inside BigTiny. This app owns: window management (overlay / full window / settings / tray), the BigTiny+Ollama process lifecycle, configuration UI, drag-and-drop file context, session history UI, an artifacts sidepane, notifications, tool-approval UI, theming, and a first-run installer/wizard.
 
-Read `goose-overlay-project-description.md` in the repo root for the full product description. When the two conflict, the project description wins on *what* to build; this file wins on *how*.
+Read `goose-overlay-project-description.md` in the repo root for the original product description (predates the BigTiny backend swap — treat backend-specific details there as historical). When it conflicts with this file, this file wins on *how* things currently work.
+
+**Goose is not part of this app.** Kitty used to spawn `goosed` (Goose's ACP-over-WebSocket server) as its backend; that entire integration (`src-tauri/src/goosed/`, `goose_config.rs`, the ACP protocol layer, the Goose Desktop conflict check, the wizard's Goose install step) has been removed. BigTiny is the only backend, and it is fully internalized — the wizard and UI never mention it, or Goose, as a dependency. See `docs/ARCHITECTURE.md` for the current, accurate module map.
 
 ## Tech stack (do not deviate without asking)
 
@@ -12,61 +14,59 @@ Read `goose-overlay-project-description.md` in the repo root for the full produc
 - **Frontend**: React 18 + TypeScript + Vite. Plain CSS with CSS custom properties for theming — **no Tailwind, no CSS-in-JS** (theming requirement is user-droppable plain CSS).
 - **State**: Zustand for UI state. No Redux.
 - **Rust crates**: `tauri`, `tauri-plugin-global-shortcut`, `tauri-plugin-notification`, `tauri-plugin-shell` (open browser), `tauri-plugin-dialog`, `tauri-plugin-single-instance`, `reqwest` (with `stream` feature), `tokio`, `serde`/`serde_json`, `keyring` (Windows Credential Manager), `windows` (Win32 APIs for the keyboard hook), `sysinfo` (process detection), `thiserror`.
-- **HTTP to goosed/Ollama**: all network calls go through the Rust side (Tauri commands + events). The webview never fetches localhost directly — this keeps the goosed secret key out of JS and avoids CORS issues.
-- **Exception, by design**: two Python packages under `plugins/` (see
-  "Internal plugins" below) ship as part of the app, frozen to standalone
-  `.exe`s via PyInstaller and bundled through Tauri's `externalBin` — this is
-  an intentional, sanctioned part of the stack, not a deviation. It does
+- **HTTP to BigTiny/Ollama**: all network calls go through the Rust side (Tauri commands + events). The webview never fetches localhost directly — this keeps the BigTiny secret key out of JS and avoids CORS issues.
+- **Exception, by design**: Python packages under `plugins/` (see
+  "Internal plugins" below), plus the BigTiny daemon itself (vendored at
+  `plugins/bigtiny/`, same tree as everything else now), ship as part of the
+  app, frozen to standalone `.exe`s via
+  PyInstaller and bundled through Tauri's `externalBin` — this is an
+  intentional, sanctioned part of the stack, not a deviation. It does
   **not** mean "add a Python dependency freely" — a new plugin still needs
   the same freeze-and-bundle treatment (`docs/PLUGINS.md`), and the app
   itself (Rust core + React frontend) stays exactly as described above.
 
 ## External APIs this app consumes
 
-### goosed (Goose server)
-- Spawned by us as a child process: `goosed agent` (binary ships with Goose). It binds a localhost port and requires a secret key sent as a header (`X-Secret-Key`) — we generate the key, pass it via env var `GOOSE_SERVER__SECRET_KEY`, and pick a free port (pass via `GOOSE_PORT` env var). Mirror how the official Electron app spawns it (`ui/desktop/src/goosed.ts` in the block/goose repo is the reference).
-- goosed exposes an OpenAPI spec (`ui/desktop/openapi.json` in the goose repo, generated via utoipa). **Phase 0 task: vendor the openapi.json for the pinned Goose version into `/docs/goosed-openapi.json` and generate a typed TS client from it** (`@hey-api/openapi-ts`) for reference types, even though calls run through Rust.
-- Key route families (verify exact paths against the vendored spec — they drift between versions):
-  - Agent lifecycle: start/resume/stop agent (`/agent/...`)
-  - Chat: streaming reply endpoint (SSE) (`/reply` family)
-  - Sessions: list, get (with conversation), fork, delete, insights (`/sessions/...`)
-  - Config management: read/upsert config values, extension toggles (`/config/...`)
-- **Pin Goose to one released version** (record it in `/docs/VERSIONS.md`). goosed's API is migrating toward ACP-over-HTTP; do not chase main. All API-path assumptions live in one Rust module (`src-tauri/src/goosed/api.rs`) so a version bump touches one file.
+### BigTiny
+- Spawned by us as a child process (bundled `bigtiny-daemon.exe`, or `python -m bigtiny` from a source checkout for dev — see `docs/bigtiny-backend.md`). Binds a localhost port and requires a secret sent as `X-API-Key` — we generate the secret, pass it via env var `BIGTINY_SECRET`, and pick a free port. `GET /api/health` is open without auth by design, for readiness polling.
+- Plain REST + one SSE streaming endpoint (`POST /api/chat/{id}/send`). Key route families: session CRUD (`/api/chat/...`), providers (`/api/providers/...`), MCP servers (`/api/mcp/servers/...`), recipes/schedules (daemon-side, not currently used by Kitty). All BigTiny endpoint paths live in `src-tauri/src/bigtiny/` (`client.rs`, `sessions.rs`, `stream.rs`, `providers.rs`, `mcp.rs`) so a BigTiny API change touches one module.
+- BigTiny's own API.md (in its repo) is the source of truth for route shapes.
 
 ### Ollama
 - Base URL: `http://localhost:11434` (configurable).
 - `GET /api/tags` — list installed models. `POST /api/pull` `{"model": "<name>"}` — streaming NDJSON with `status`, `total`, `completed` per layer; drive progress bars from this. `DELETE /api/delete` — remove model. `GET /api/version` — health check.
-- We never call generate/chat on Ollama for **inference** — that goes through goosed. The one exception (Round-2 item 5) is an *empty* `/api/generate` with `keep_alive: -1`/`0` used solely to warm/evict a model in Ollama's memory when the active provider changes (`src-tauri/src/ollama/mod.rs::keep_alive_load/release`).
+- We never call generate/chat on Ollama for **inference** — that goes through BigTiny. The one exception is an *empty* `/api/generate` with `keep_alive: -1`/`0` used solely to warm/evict a model in Ollama's memory when the active provider changes (`src-tauri/src/ollama/mod.rs::keep_alive_load/release`).
 
 ## Internal plugins (`plugins/`)
 
-Two Python subsystems ship as **internal plugins**: independent, tested
+Python subsystems ship as **internal plugins**: independent, tested
 Python packages maintained in this repo under `plugins/`, frozen to
 standalone Windows `.exe`s via PyInstaller and bundled through Tauri's
 `externalBin` mechanism — end users need no Python runtime. Full detail in
-`docs/PLUGINS.md`; the two current plugins:
+`docs/PLUGINS.md`; the current plugins:
 
 - **`adaptive-pathway`** — an HTTP sidecar (FastAPI/uvicorn) that Kitty spawns
-  and monitors directly, same supervision pattern as Ollama/goosed
+  and monitors directly, same supervision pattern as Ollama/BigTiny
   (`lifecycle/adaptive_pathway_proc.rs`, `commands/adaptive_pathway.rs`).
   Learns tool-selection and response-style preferences from tool-call
   outcomes and 👍👎 feedback; surfaced in chat as hint badges and in Settings
   as Graph Health / Domain Profiles. See `docs/ADAPTIVE_PATHWAY.md` for the
-  Rust↔sidecar HTTP contract.
-- **`replacement-mcp`** — a stdio MCP server **spawned by goosed**, not
-  Kitty — Kitty's only involvement is keeping its registration entry in
-  goose's own `config.yaml` pointed at the current install's bundled exe
-  (`goose_config::ensure_extension_registered`, `commands/replacement_mcp.rs`).
-  Context-optimized shell/file/web/document tools, designed to replace
-  Goose's built-in `developer` + `computercontroller` extensions for local,
-  small models — off by default, and enabling it in Settings → Extensions
-  only ever *offers* (never forces) disabling those two built-ins.
+  Rust↔sidecar HTTP contract. Its `decide`/`record_outcome` MCP tools
+  (`adaptive-pathway-mcp` console script, separate frozen exe) are registered
+  as a BigTiny stdio MCP server, not spawned directly by Kitty — see below.
+- **`replacement-mcp`** — a stdio MCP server registered with **BigTiny's own
+  `/api/mcp/servers`**, not spawned directly by Kitty. Kitty's only
+  involvement is keeping the registration's command path pointed at the
+  current install's bundled exe and its `enabled` flag in sync with Settings
+  (`bigtiny::mcp::ensure_builtin_servers`, `commands/mcp_servers.rs`).
+  Context-optimized shell/file/web/document tools — off by default, toggled
+  in Settings → MCP Servers.
 
-These two integration shapes — Kitty-managed process vs. goosed-managed
-extension — are the two patterns any future internal plugin should follow;
-see `docs/PLUGINS.md` for which one fits a new plugin and why mixing them
-(e.g. adding a `ManagedProcess` for something goosed already spawns) is a bug,
-not a stylistic choice.
+Both of the above (and the BigTiny daemon itself) are frozen via
+`python plugins/build.py`; see `docs/PLUGINS.md` for the two Rust-side
+integration shapes (Kitty-managed process vs. BigTiny-managed MCP server) any
+future internal plugin should follow, and why mixing them is a bug, not a
+stylistic choice.
 
 ## Other undocumented-in-this-file subsystems
 
@@ -88,8 +88,8 @@ inventory. Subsystems built beyond the original phased plan:
   with or without the app open (a 30s-tick headless loop that reuses
   `commands::new_session`/`send_prompt` verbatim).
 - **Folder bookmarks** (`commands/folders.rs`, session→folder mapping in
-  `Config`) — app-side session organization layered on top of goosed's own
-  flat `session/list`; goosed has no concept of folders.
+  `Config`) — app-side session organization layered on top of BigTiny's own
+  flat session list; BigTiny has no concept of folders.
 - **Log capture** (`log_capture.rs`, `commands/logs.rs`) — an in-memory ring
   buffer of `warn!`/`error!` tracing events, surfaced in Settings for
   in-app diagnostics without needing to find a log file on disk.
@@ -156,24 +156,38 @@ inventory. Subsystems built beyond the original phased plan:
 
 1. **One Rust process, multiple windows.** Windows are Tauri WebviewWindows with labels `overlay`, `main`, `settings`, `wizard`. Overlay is created hidden at startup and toggled (show/hide), never destroyed — summon latency is the product.
 2. **All I/O in Rust.** Frontend calls `invoke()` via `src/lib/ipc.ts` only. Streaming data (chat tokens, tool events, pull progress) is forwarded as Tauri events: `chat://message-delta`, `chat://tool-call`, `chat://tool-approval-needed`, `chat://complete`, `chat://error`, `ollama://pull-progress`, `stack://status`. Event payloads always include `session_id` (or `pull_id`) so multiple listeners can filter.
-3. **Session state lives in goosed.** The frontend keeps only render state. Resume = fetch session with conversation from goosed and re-render. Never persist chat history app-side.
-4. **Secrets never touch JS or plaintext disk.** API keys go in Windows Credential Manager via `keyring` (service = `goose-overlay`, account = provider profile id). App config JSON stores profile metadata only (name, provider type, base URL, model list, `is_remote` flag) — never keys.
+3. **Session state lives in BigTiny.** The frontend keeps only render state. Resume = fetch session with conversation from BigTiny and re-render. Never persist chat history app-side.
+4. **Secrets never touch JS or plaintext disk.** API keys go in Windows Credential Manager via `keyring` (service = `kitty`, account = provider profile id). App config JSON stores profile metadata only (name, provider type, base URL, model list, `is_remote` flag) — never keys.
 5. **Overlay and main window share the chat implementation.** `components/chat/*` renders in both; the window entry decides chrome (compact vs. full with sidepanes). Both windows can be bound to the same active session; when both are open, they stay in sync because both consume the same Tauri events keyed by session id.
-6. **Errors are states, not toasts.** `stackStore` holds a machine-readable stack status (`ok | ollama_down | goosed_down | no_model | provider_unreachable | conflict_goose_desktop`). Chat UI renders a status panel with a "Fix this" button (opens settings deep-linked to the relevant section) whenever status != ok.
+6. **Errors are states, not toasts.** `stackStore` holds a machine-readable stack status (`ok | ollama_down | backend_down | no_model | provider_unreachable`). Chat UI renders a status panel with a "Fix this" button (opens settings deep-linked to the relevant section) whenever status != ok.
 
 ## Coding conventions
 
 - Rust: `rustfmt` defaults, `clippy` clean, `thiserror` for error enums per module; every `#[tauri::command]` returns `Result<T, String>` with user-safe messages (log details with `tracing`, don't surface internals).
 - TS: strict mode, ESLint + Prettier. No `any`. Components are function components; hooks in `src/hooks/` if shared.
 - CSS: all colors/spacing/typography via custom properties defined in theme files; `base.css` may not contain color values.
-- Commit per task, conventional commits (`feat:`, `fix:`, `chore:`). Each phase ends with a tagged commit `phase-N`.
-- Tests: Rust unit tests for config/providers/env_helper/conflict detection; a `mock-goosed` axum binary under `src-tauri/tests/mock_goosed/` that fakes the routes we use, for integration tests of stream handling. Frontend: vitest for stores and ipc wrapper.
+- Commit per task, conventional commits (`feat:`, `fix:`, `chore:`).
+- Tests: Rust unit tests for config/providers/bigtiny stream+mcp+session translation. Frontend: vitest for stores and ipc wrapper.
 
 ---
 
-# Phased implementation plan
+# Phased implementation plan (HISTORICAL — original build order, not current state)
 
-Do phases in order. Each phase must compile, run, and pass its acceptance checks before starting the next. If a goosed API path doesn't match the vendored spec, stop and fix `docs/VERSIONS.md` + `goosed/api.rs` rather than hacking around it.
+**Everything below this line describes the original goosed/ACP-based design and
+is retained only as historical record of the project's build order.** The app
+was later migrated onto BigTiny as its backend and every goosed-specific
+mechanism named below (`goosed/api.rs`, `goose serve`, ACP, Goose Desktop
+conflict detection, the wizard's Goose install step, goose's `config.yaml`
+extension registry) has been **removed from the codebase**. Do not use this
+section as a reference for how anything currently works — see
+`docs/ARCHITECTURE.md` and the sections above instead. It's kept here because
+the phase-by-phase feature scope (chat MVP, tool approvals, sessions/
+artifacts, settings, hotkey/theming, first-run wizard, hardening, chat-only
+mode, reasoning visibility, ChatML export) is still an accurate map of what
+the product does, even though the backend it's described against no longer
+exists.
+
+Do phases in order. Each phase must compile, run, and pass its acceptance checks before starting the next.
 
 ## Phase 0 — Skeleton & plumbing
 

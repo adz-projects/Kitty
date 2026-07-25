@@ -16,7 +16,7 @@ export function humanizeChatError(raw: string): string {
     return 'The response took too long and Kitty gave up waiting. Try sending again.';
   }
   if (r.includes('invalid params')) {
-    return "Kitty couldn't send that message — this can happen right after switching providers or restarting Goose. Try sending again.";
+    return "Kitty couldn't send that message — this can happen right after switching providers or restarting the engine. Try sending again.";
   }
   if (
     r.includes('connection closed') ||
@@ -24,7 +24,7 @@ export function humanizeChatError(raw: string): string {
     r.includes("isn't running") ||
     r.includes('connect')
   ) {
-    return 'Lost the connection to Goose. Kitty will reconnect automatically — try sending again.';
+    return "Lost the connection to Kitty's engine. Kitty will reconnect automatically — try sending again.";
   }
   return 'Something went wrong sending that message.';
 }

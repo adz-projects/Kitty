@@ -14,6 +14,14 @@ describe('supportsImages', () => {
     }
   });
 
+  it('recognizes Qwen3.6 as multimodal despite dropping the -VL suffix convention', () => {
+    // Confirmed live against a custom llama.cpp server's /api/tags, which
+    // reports capabilities: ["completion", "multimodal"] for this release.
+    for (const m of ['Qwen3.6-27b', '/models/Qwen3.6-27B-UD-Q5_K_XL.gguf', 'qwen3.6:27b']) {
+      expect(supportsImages(m)).toBe(true);
+    }
+  });
+
   it('carves out non-vision -mini variants of an otherwise-vision family', () => {
     expect(supportsImages('o1-mini')).toBe(false);
     expect(supportsImages('o3-mini')).toBe(false);

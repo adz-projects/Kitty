@@ -9,30 +9,30 @@
 
 mod adaptive_pathway;
 mod config;
-mod extensions;
 mod file;
 mod folders;
 mod logs;
+mod mcp_servers;
 mod ollama;
 mod provider;
 mod recipes;
-pub mod replacement_mcp;
 mod scheduled_tasks;
+mod screenshot;
 mod session;
 mod setup;
 mod window;
 
 pub use adaptive_pathway::*;
 pub use config::*;
-pub use extensions::*;
 pub use file::*;
 pub use folders::*;
 pub use logs::*;
+pub use mcp_servers::*;
 pub use ollama::*;
 pub use provider::*;
 pub use recipes::*;
-pub use replacement_mcp::*;
 pub use scheduled_tasks::*;
+pub use screenshot::*;
 pub use session::*;
 pub use setup::*;
 pub use window::*;

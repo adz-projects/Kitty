@@ -1,15 +1,15 @@
-//! Goose Overlay — Tauri v2 application entry point.
+//! Kitty — Tauri v2 application entry point.
 //!
-//! One Rust process owns four labelled windows, the goosed + Ollama process
+//! One Rust process owns four labelled windows, the BigTiny + Ollama process
 //! lifecycle, config, tray, and the global hotkey. All I/O lives here; the
 //! webview only talks to us through the commands registered below.
 
 mod adaptive_pathway;
+mod bigtiny;
 mod commands;
 mod config;
-mod goose_config;
-mod goosed;
 mod hotkey;
+mod screenshot;
 mod lifecycle;
 mod log_capture;
 mod notifications;
@@ -32,7 +32,7 @@ pub fn run() {
     // (`log_capture`) that Settings → Advanced's error log reads — same
     // filter applies to both layers via `.with(env_filter)` on the registry.
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| "goose_overlay_lib=info,warn".into());
+        .unwrap_or_else(|_| "kitty_lib=info,warn".into());
     let _ = tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer())
         .with(log_capture::CaptureLayer)
@@ -43,8 +43,13 @@ pub fn run() {
         tracing::warn!("config load failed ({e}); using defaults");
         config::Config::default()
     });
+    // One-time migration from the pre-rename `goose-overlay` keyring service
+    // (config.json itself already migrated by `config::load` -> `config_dir`).
+    let provider_ids: Vec<String> = cfg.providers.iter().map(|p| p.id.clone()).collect();
+    config::providers::migrate_secrets(&provider_ids);
     let hotkeys = cfg.hotkeys.clone();
     let clipboard_hotkey = cfg.clipboard_hotkey.clone();
+    let open_window_hotkey = cfg.open_window_hotkey.clone();
 
     let mut builder = tauri::Builder::default();
 
@@ -74,20 +79,29 @@ pub fn run() {
             commands::hide_overlay,
             commands::open_settings,
             commands::open_main,
+            commands::open_new_chat_window,
+            commands::capture_screenshot_region,
+            commands::get_screenshot_preview,
+            commands::report_screenshot_selection,
+            commands::cancel_screenshot_selection,
+            commands::get_pending_handoff,
             commands::get_stack_status,
             commands::get_startup_phase,
-            commands::restart_goosed,
+            commands::restart_backend,
             commands::new_session,
+            commands::bind_window_session,
             commands::send_prompt,
             commands::cancel_prompt,
             commands::is_session_busy,
             commands::set_active_session,
             commands::get_active_session,
             commands::respond_permission,
+            commands::notify_approval_needed,
             commands::set_mode,
             commands::list_sessions,
             commands::load_session,
             commands::delete_session,
+            commands::rename_session,
             commands::clear_all_sessions,
             commands::fork_session,
             commands::set_thinking_effort,
@@ -118,6 +132,7 @@ pub fn run() {
             commands::clear_log_entries,
             commands::get_session_mode,
             commands::set_session_mode,
+            commands::set_session_context_dir,
             commands::inspect_paths,
             commands::open_path,
             commands::reveal_path,
@@ -137,10 +152,12 @@ pub fn run() {
             commands::set_ollama_env,
             commands::restart_ollama,
             commands::ensure_ollama_running,
-            commands::list_default_extensions,
-            commands::set_default_extension_enabled,
-            commands::add_extension,
-            commands::set_extension_env,
+            commands::list_mcp_servers,
+            commands::add_mcp_server,
+            commands::update_mcp_server,
+            commands::delete_mcp_server,
+            commands::set_mcp_server_enabled,
+            commands::connect_mcp_server,
             commands::get_settings_target,
             commands::list_themes,
             commands::read_user_theme,
@@ -175,33 +192,37 @@ pub fn run() {
             commands::adaptive_pathway_get_session_reflection,
             commands::get_replacement_mcp_enabled,
             commands::set_replacement_mcp_enabled,
-            commands::disable_builtin_dev_extensions,
+            commands::get_wasm_math_mcp_enabled,
+            commands::set_wasm_math_mcp_enabled,
+            commands::get_brave_mcp_search_status,
+            commands::set_brave_mcp_search_api_key,
+            commands::set_brave_mcp_search_enabled,
         ])
         .setup(move |app| {
             let handle = app.handle();
             windows::create_overlay(handle)?;
             tray::create(handle)?;
-            if let Err(e) = hotkey::register(handle, &hotkeys, clipboard_hotkey.as_deref()) {
+            if let Err(e) = hotkey::register(
+                handle,
+                &hotkeys,
+                clipboard_hotkey.as_deref(),
+                open_window_hotkey.as_deref(),
+            ) {
                 tracing::error!("global hotkey registration failed: {e}");
             }
             // First launch: show the setup wizard instead of the (hidden) overlay.
             if !wizard::setup_completed(handle) {
                 let _ = windows::open_wizard(handle, "setup");
             }
-            // Keep the replacement-mcp extension's config.yaml entry pointed at
-            // this install's bundled exe (self-heals across an update/reinstall,
-            // same rationale as Adaptive Pathway's env-var migration below).
-            // Best-effort: a fresh install's config.yaml may not have an
-            // `extensions` map yet if goose has literally never run once.
-            if let Err(e) = commands::replacement_mcp::ensure_registered() {
-                tracing::warn!("replacement-mcp registration self-heal failed: {e}");
-            }
-            // Start Ollama + goosed and the health loop in the background.
+            // Start Ollama + BigTiny and the health loop in the background.
+            // `lifecycle::start_stack` self-heals the bundled plugins'
+            // MCP-server registrations once the daemon is up — see
+            // `bigtiny::mcp::ensure_builtin_servers`.
             lifecycle::start_stack(handle);
             Ok(())
         })
         .build(tauri::generate_context!())
-        .expect("error while building the Goose Overlay application")
+        .expect("error while building the Kitty application")
         .run(|app, event| {
             if let RunEvent::Exit = event {
                 // Kill only the children we spawned.

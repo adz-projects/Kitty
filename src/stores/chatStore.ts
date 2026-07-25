@@ -5,6 +5,7 @@
 import { create } from 'zustand';
 import {
   ipc,
+  onAdoptSession,
   onApprovalNeeded,
   onChatError,
   onClipboardAttach,
@@ -74,6 +75,17 @@ export * from './chat/types';
 interface ChatState {
   sessionId: string | null;
   cwd: string | null;
+  /** The session's original chat folder, captured once at creation/load time
+      — used (alongside `cwd`) by the agentic-mode client-side approval
+      nicety (`onApprovalNeeded`) so an in-bounds call isn't needlessly
+      queued for a human decision after "Set as working directory" has
+      diverged `cwd` away from it. This is purely a UX optimization, not a
+      security boundary (BigTiny enforces the real containment) — if a
+      resumed session had already diverged in an earlier window session,
+      this may capture the diverged `cwd` instead of the true original
+      chat_dir; the only consequence is a few more real approval prompts
+      than strictly necessary, never a security gap. */
+  chatDir: string | null;
   title: string | null;
   mode: string | null;
   availableModes: ModeInfo[];
@@ -344,9 +356,9 @@ let toolLoopCounts: ToolCallCounts = new Map();
 // Without this, that would fire a second real `ipc.newSession` call and
 // orphan one of the two goosed sessions. Module-level like the fields above.
 let pendingNewSession: Promise<SessionInfo> | null = null;
-function getOrCreateSession(cwd?: string): Promise<SessionInfo> {
+function getOrCreateSession(cwd?: string, mode?: string | null): Promise<SessionInfo> {
   if (!pendingNewSession) {
-    pendingNewSession = ipc.newSession(cwd).finally(() => {
+    pendingNewSession = ipc.newSession(cwd, mode).finally(() => {
       pendingNewSession = null;
     });
   }
@@ -637,6 +649,7 @@ export const useChatStore = create<ChatState>((set, get) => {
   return {
     sessionId: null,
     cwd: null,
+    chatDir: null,
     title: null,
     mode: null,
     availableModes: [],
@@ -785,22 +798,30 @@ export const useChatStore = create<ChatState>((set, get) => {
 
     handOffToMain: async () => {
       const s = get();
-      if (s.sessionId) {
-        await ipc.setActiveSession({
-          session_id: s.sessionId,
-          cwd: s.cwd ?? '',
-          current_mode: s.mode ?? 'auto',
-          available_modes: s.availableModes,
-          thinking_effort: s.thinkingEffort,
-          // Snapshot of live render state, for adoptSession() to apply after
-          // its replay — see that action's own comment for why this is
-          // needed (session/load's replay alone can drop an in-progress
-          // turn's partial content).
-          messages: s.messages,
-          artifacts: s.artifacts,
-        });
-      }
-      await ipc.openMain();
+      // Feature 5: Expand always opens a brand-new chat window (never
+      // re-targets an already-open one) — the handoff snapshot travels as a
+      // direct argument to that new window's creation, keyed by its own
+      // label server-side, rather than through the older global
+      // `active_session` slot (`setActiveSession`/`session://active`), which
+      // remains in place only for the unrelated provider context-handoff
+      // gate and would otherwise race every open chat window into adopting
+      // the same handoff.
+      const handoff = s.sessionId
+        ? {
+            session_id: s.sessionId,
+            cwd: s.cwd ?? '',
+            current_mode: s.mode ?? 'auto',
+            available_modes: s.availableModes,
+            thinking_effort: s.thinkingEffort,
+            // Snapshot of live render state, for adoptSession() to apply after
+            // its replay — see that action's own comment for why this is
+            // needed (session/load's replay alone can drop an in-progress
+            // turn's partial content).
+            messages: s.messages,
+            artifacts: s.artifacts,
+          }
+        : null;
+      await ipc.openNewChatWindow(handoff);
       await ipc.hideOverlay();
       // No new goosed session is created here — ensureSession() lazily makes
       // one the next time this (now-blank) overlay actually sends a message.
@@ -809,6 +830,7 @@ export const useChatStore = create<ChatState>((set, get) => {
       set({
         sessionId: null,
         cwd: null,
+        chatDir: null,
         title: null,
         mode: null,
         availableModes: [],
@@ -866,6 +888,7 @@ export const useChatStore = create<ChatState>((set, get) => {
       set({
         sessionId: null,
         cwd: null,
+        chatDir: null,
         creatingSession: true,
         title: null,
         messages: [],
@@ -897,7 +920,7 @@ export const useChatStore = create<ChatState>((set, get) => {
       try {
         let info: SessionInfo;
         try {
-          info = await getOrCreateSession(cwd);
+          info = await getOrCreateSession(cwd, get().modeOverride ?? 'chat');
         } catch (e) {
           // Suppress the transient "resource not found" goosed throws when
           // New Chat lands immediately after deleting the chat that was
@@ -905,17 +928,19 @@ export const useChatStore = create<ChatState>((set, get) => {
           // error for a race that isn't actually their new session's fault.
           if (Date.now() - recentOwnSessionDeleteAt > OWN_DELETE_RETRY_WINDOW_MS) throw e;
           recentOwnSessionDeleteAt = 0;
-          info = await getOrCreateSession(cwd);
+          info = await getOrCreateSession(cwd, get().modeOverride ?? 'chat');
         }
         recentOwnSessionDeleteAt = 0;
         set({
           sessionId: info.session_id,
           cwd: info.cwd,
+          chatDir: info.cwd,
           mode: info.current_mode,
           availableModes: info.available_modes,
           thinkingEffort: info.thinking_effort,
           creatingSession: false,
         });
+        void ipc.bindWindowSession(info.session_id).catch(() => {});
         await get().refreshProvider();
         await ensureSafeApprovalMode();
       } catch (e) {
@@ -956,9 +981,11 @@ export const useChatStore = create<ChatState>((set, get) => {
       const sameSession = prior.sessionId === sessionId;
       const resolvedProviderId = providerId ?? (sameSession ? prior.sessionProviderId : null);
       const resolvedModelId = modelId ?? (sameSession ? prior.sessionModelId : null);
+      void ipc.bindWindowSession(sessionId).catch(() => {});
       set({
         sessionId,
         cwd,
+        chatDir: cwd,
         title: title ?? null,
         thinkingEffort: null,
         messages: [],
@@ -1064,7 +1091,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         // `forActive` until the next send() starts a fresh turn.
         abandonedSession: sid,
         messages: closeOpen(s.messages),
-        warning: 'Stopped. Goose may still be finishing this turn in the background.',
+        warning: 'Stopped. Kitty may still be finishing this turn in the background.',
         loopSuspected: false,
         activeRecipeTurn: null,
         // An explicit Force Stop overrides the reasoning-cap's own automatic
@@ -1200,7 +1227,22 @@ export const useChatStore = create<ChatState>((set, get) => {
       set((s) => ({ droppedFiles: s.droppedFiles.filter((f) => f.path !== path) })),
 
     setWorkingDir: async (folder: string) => {
-      await get().newSession(folder);
+      // Agentic mode only (the folder-chip button that calls this doesn't
+      // render in chat mode at all): repoints the *current* session's cwd
+      // in place instead of forking a new session, so BigTiny's directory
+      // sandbox (bigtiny/agent/sandbox.py) can allow both the session's
+      // original chat_dir and this newly-set directory at once — forking
+      // would otherwise leave a brand-new session that never knew the
+      // original folder, defeating the whole "chat_dir + set context dir"
+      // allowance. Falls back to creating a session if somehow called with
+      // none active yet (defensive; not a reachable path from the UI today).
+      const s = get();
+      if (!s.sessionId) {
+        await get().newSession(folder);
+        return;
+      }
+      await ipc.setSessionContextDir(s.sessionId, folder);
+      set({ cwd: folder });
     },
 
     addPastedText: (text: string, label?: string) =>
@@ -1235,7 +1277,7 @@ export const useChatStore = create<ChatState>((set, get) => {
       const { messages, title } = get();
       if (messages.length === 0) return;
       const chatMessages = buildExport(messages, upToIndex);
-      const base = sanitizeFilename(title ?? 'goose-session');
+      const base = sanitizeFilename(title ?? 'kitty-session');
       const path = await pickSavePath(`${base}.jsonl`);
       if (!path) return;
       try {
@@ -1504,7 +1546,8 @@ export const useChatStore = create<ChatState>((set, get) => {
           // deferring the swap would silently drop every event for this turn.
           const oldSessionId = sessionId;
           const oldModeOverride = get().modeOverride;
-          const info = await ipc.newSession(cwd);
+          const info = await ipc.newSession(cwd, oldModeOverride ?? 'chat');
+          void ipc.bindWindowSession(info.session_id).catch(() => {});
           set({
             sessionId: info.session_id,
             mode: info.current_mode,
@@ -1727,13 +1770,11 @@ export const useChatStore = create<ChatState>((set, get) => {
       // Also clear a stale "can't reach the provider" banner — whatever failed
       // belonged to the old provider, and activate_provider itself now
       // health-gates the switch, so the newly-active one is already known-good.
-      // Reload the current session too: activating a provider always restarts
-      // goosed (a fresh process), which has no in-memory record of whatever
-      // session id this window was using — continuing to send() against it
-      // as-is produced a raw, unexplained "Invalid params"-class error from
-      // goosed. reloadCurrent() re-establishes it via session/load (the same
-      // recovery the "Restart Goose" degraded-panel button already uses) —
-      // a no-op if there's no active session yet.
+      // Reload the current session too, in case the backend needed a restart
+      // and has no in-memory record of whatever session id this window was
+      // using. reloadCurrent() re-establishes it (the same recovery the
+      // "Restart Kitty engine" degraded-panel button already uses) — a no-op
+      // if there's no active session yet.
       void onProviderActivated(() => {
         set({ providerOffline: false });
         void get().refreshProvider();
@@ -1762,6 +1803,7 @@ export const useChatStore = create<ChatState>((set, get) => {
           set({
             sessionId: null,
             cwd: null,
+            chatDir: null,
             title: null,
             mode: null,
             availableModes: [],
@@ -1785,6 +1827,14 @@ export const useChatStore = create<ChatState>((set, get) => {
           });
         }
       });
+      // A completion/failure notification was clicked for a session no window
+      // was currently bound to (the window that had it switched to a
+      // different chat before the task finished) — Rust picked exactly this
+      // window as the fallback target (`windows::focus_or_open_session`);
+      // reload the session the same way Expand's handoff does.
+      void onAdoptSession((info) => {
+        void get().adoptSession(info);
+      });
       // "Clear all chat history" (Settings → General) run from any window —
       // blank this window's chat too, if it had one open (same reset shape
       // handOffToMain uses; no new goosed session needed, ensureSession()
@@ -1796,6 +1846,7 @@ export const useChatStore = create<ChatState>((set, get) => {
           set({
             sessionId: null,
             cwd: null,
+            chatDir: null,
             title: null,
             mode: null,
             availableModes: [],
@@ -1827,62 +1878,67 @@ export const useChatStore = create<ChatState>((set, get) => {
       });
       void onApprovalNeeded((e) => {
         if (!forActive(e.session_id)) return;
-        // Chat ("thought-partner") mode: tools are allowed but scoped to the
-        // session's own chat folder (Round-5, owner decision). We still force
-        // `approve` mode (ensureSafeApprovalMode) so every tool call surfaces
-        // here as a permission request we can *decide*, rather than `auto`
-        // executing it unseen. Decision: a path-based file op is auto-approved
-        // only if its target resolves inside cwd (the chat folder), and
-        // auto-rejected otherwise; a tool with no structured path — notably
-        // `shell`, which is how the model produces docx/xlsx via Python — is
-        // allowed and runs with cwd = the chat folder. Soft boundary: shell
-        // isn't sandboxed, so a command could still reach outside; the path
-        // check hard-confines the one class of ops Kitty can actually inspect.
-        // (ChatView hides ApprovalPrompt in chat mode, but ThinkingBox still
-        // renders the tool cards, so the model's tool use stays visible.)
-        if (isChatMode(get())) {
-          // Tool-loop guard (owner-reported bug): a model can get stuck
-          // alternating tools (e.g. web-fetch ↔ its own cache step) against
-          // the same target — each call is real network/disk I/O, so this
-          // must be checked *before* deciding to allow it, not after.
-          const title = String(e.tool_call.title ?? e.tool_call.kind ?? 'tool');
-          const { count, counts } = countToolCall(toolLoopCounts, title, e.tool_call.rawInput);
-          toolLoopCounts = counts;
-          if (count > TOOL_LOOP_THRESHOLD) {
-            void ipc.respondPermission(e.tool_call_id, pickRejectOption(e.options)).catch(() => {});
-            set({
-              warning:
-                `Declined — "${title}" has been called ${count} times with the same target ` +
-                `this turn. The model appears stuck in a loop; try Force Stop if it doesn't ` +
-                `recover on its own.`,
-            });
-            return;
-          }
-          const { decision, optionId, warning } = decideChatApproval(
-            e.tool_call.rawInput,
-            get().cwd,
-            e.options
-          );
-          if (decision === 'prompt') {
-            // Ambiguous enough to need a human — queue it like agentic mode
-            // does, instead of auto-deciding (ChatView renders ApprovalPrompt
-            // for chat mode too once pendingApprovals is non-empty).
-            set((s) =>
-              s.pendingApprovals.some((a) => a.tool_call_id === e.tool_call_id)
-                ? {}
-                : { pendingApprovals: [...s.pendingApprovals, e] }
-            );
-            return;
-          }
-          void ipc.respondPermission(e.tool_call_id, optionId).catch(() => {});
-          if (warning) set({ warning });
+        // Auto-decide against the session's allowed directories in BOTH
+        // modes (Round-5, owner decision for chat mode; extended to agentic
+        // mode alongside BigTiny's own directory-sandboxing feature) — a
+        // path-based file op is auto-approved only if its target resolves
+        // inside one of `dirs`, auto-rejected otherwise; a tool with no
+        // structured path — notably `shell`, which is how the model produces
+        // docx/xlsx via Python — is allowed. This is purely a round-trip-
+        // avoidance nicety: BigTiny enforces the real containment
+        // server-side regardless (`bigtiny/agent/sandbox.py`), so a wrong
+        // guess here just costs one extra approval round-trip, never a
+        // security gap. `dirs` is the chat folder only in chat mode (cwd
+        // never diverges there — no UI path to change it) and the chat
+        // folder plus current cwd in agentic mode (which can diverge via
+        // "Set as working directory"; see `chatDir`'s own doc comment for
+        // the one known imprecision this introduces). This handler only
+        // ever fires for a call BigTiny's own HITL policy already decided
+        // needs a human (`chat://tool-approval-needed`, i.e. a real
+        // `hitl_pause`) — under the default `always_ask` policy that's every
+        // tool call, so this auto-decide pass is what keeps tool use feeling
+        // seamless in practice, in both modes now, rather than prompting
+        // for everything.
+        const s0 = get();
+        const dirs = isChatMode(s0) ? [s0.cwd] : [s0.chatDir, s0.cwd];
+        // Tool-loop guard (owner-reported bug): a model can get stuck
+        // alternating tools (e.g. web-fetch ↔ its own cache step) against
+        // the same target — each call is real network/disk I/O, so this
+        // must be checked *before* deciding to allow it, not after.
+        const title = String(e.tool_call.title ?? e.tool_call.kind ?? 'tool');
+        const { count, counts } = countToolCall(toolLoopCounts, title, e.tool_call.rawInput);
+        toolLoopCounts = counts;
+        if (count > TOOL_LOOP_THRESHOLD) {
+          void ipc.respondPermission(e.tool_call_id, pickRejectOption(e.options)).catch(() => {});
+          set({
+            warning:
+              `Declined — "${title}" has been called ${count} times with the same target ` +
+              `this turn. The model appears stuck in a loop; try Force Stop if it doesn't ` +
+              `recover on its own.`,
+          });
           return;
         }
-        set((s) =>
-          s.pendingApprovals.some((a) => a.tool_call_id === e.tool_call_id)
-            ? {}
-            : { pendingApprovals: [...s.pendingApprovals, e] }
+        const { decision, optionId, warning } = decideChatApproval(
+          e.tool_call.rawInput,
+          dirs,
+          e.options
         );
+        if (decision === 'prompt') {
+          // Ambiguous enough to need a human — queue it for the real
+          // ApprovalPrompt UI instead of auto-deciding, and only NOW (not on
+          // every hitl_pause) tell Rust to fire the "Approval needed"
+          // toast/tray-pending state — this is the one branch where a human
+          // is genuinely required.
+          void ipc.notifyApprovalNeeded(e.session_id, title).catch(() => {});
+          set((s) =>
+            s.pendingApprovals.some((a) => a.tool_call_id === e.tool_call_id)
+              ? {}
+              : { pendingApprovals: [...s.pendingApprovals, e] }
+          );
+          return;
+        }
+        void ipc.respondPermission(e.tool_call_id, optionId).catch(() => {});
+        if (warning) set({ warning });
       });
 
       void onComplete((e) => {

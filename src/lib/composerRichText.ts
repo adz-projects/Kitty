@@ -7,7 +7,7 @@
 // (serialization) stay unit-testable.
 
 /** Turns the composer's contentEditable DOM into the markdown-flavored plain
-    text actually sent to goosed/matched against recipes — headings and
+    text actually sent to the backend/matched against recipes — headings and
     bullets are visual-only inside the box; this is where they get translated
     back into the "# "/"- " syntax the model and the message-list renderer
     already understand. */

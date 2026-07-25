@@ -1,17 +1,14 @@
-//! Provider profiles (Phase 5). Profile *metadata* lives in app config; secrets
-//! live only in the Windows Credential Manager via `keyring` — never on disk in
-//! plaintext (CLAUDE.md rule 4). Activating a profile routes goosed to that
-//! provider by injecting Goose's env vars when we (re)spawn `goose serve`.
+//! Provider profiles. Profile *metadata* lives in app config; secrets live
+//! only in the Windows Credential Manager via `keyring` — never on disk in
+//! plaintext (CLAUDE.md rule 4). Activating a profile registers it with the
+//! BigTiny daemon over REST (see `bigtiny::providers::sync_active_provider`).
 
 mod connection;
-mod env;
 mod keyring;
 mod network;
 
 pub use connection::test_connection;
-pub(crate) use env::goose_provider_name;
-pub use env::goosed_env;
-pub use keyring::{delete_secret, get_secret_async, has_secret, set_secret};
+pub use keyring::{delete_secret, get_secret_async, has_secret, migrate_secrets, set_secret};
 pub use network::{network_tier_for, NetworkTier};
 
 use serde::{Deserialize, Serialize};
@@ -35,7 +32,10 @@ pub struct ProviderProfile {
     /// this makes a non-loopback provider trusted (globe) instead of untrusted (⚠).
     #[serde(default)]
     pub is_trusted: bool,
-    /// Per-provider sampling params (Round-2 item 27). `None` = use Goose default.
+    /// Per-provider sampling params (Round-2 item 27). `None` = provider/model
+    /// default (BigTiny omits the field from the completion request entirely
+    /// rather than sending an explicit default — see
+    /// `bigtiny::providers::sync_active_provider`).
     #[serde(default)]
     pub temperature: Option<f32>,
     #[serde(default)]

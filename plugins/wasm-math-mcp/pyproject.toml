@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wasm-math-mcp"
+version = "0.1.0"
+description = "Sandboxed Python execution (math/stats/NumPy) as a stdio MCP tool."
+requires-python = ">=3.11"
+dependencies = [
+    "mcp[cli]>=1.2.0",
+    "numpy>=1.24",
+]
+
+[project.scripts]
+wasm-math-mcp = "wasm_math_mcp:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "pytest-asyncio>=0.21"]
+
+[tool.setuptools]
+py-modules = ["wasm_math_mcp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

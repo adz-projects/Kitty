@@ -1,6 +1,6 @@
 //! OpenRouter's public models list (Round-6 Feature 1): used only to suggest a
 //! model's real context window in the Providers form — Kitty never calls
-//! OpenRouter for inference itself (that's goosed's job, same as every other
+//! OpenRouter for inference itself (that's BigTiny's job, same as every other
 //! provider type).
 
 use serde_json::Value;

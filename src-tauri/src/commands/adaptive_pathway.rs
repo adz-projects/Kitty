@@ -162,6 +162,10 @@ pub async fn set_adaptive_pathway_enabled(app: AppHandle, enabled: bool) -> Resu
         state.adaptive_pathway.lock().unwrap().kill_if_owned();
         *state.adaptive_pathway_status.lock().unwrap() = AdaptivePathwayStatus::Disabled;
     }
+    // Keep the BigTiny MCP-server registration for the `decide`/
+    // `record_outcome` tools in sync with the toggle above — mirrors the
+    // sidecar process start/stop we just did.
+    crate::bigtiny::mcp::ensure_builtin_servers(&app).await;
     Ok(())
 }
 

@@ -29,7 +29,7 @@ pub struct LogEntry {
     /// `"ERROR"` or `"WARN"` — nothing lower ever reaches the buffer.
     pub level: String,
     /// The tracing target (module path) the event came from, e.g.
-    /// `goose_overlay_lib::goosed::api`.
+    /// `kitty_lib::bigtiny::stream`.
     pub target: String,
     pub message: String,
 }

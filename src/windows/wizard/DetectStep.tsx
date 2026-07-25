@@ -1,12 +1,9 @@
 import { useEffect, useRef, useState } from 'react';
-import { ipc, pickExecutable } from '@/lib/ipc';
-import type { Config, DepStatus, Detection } from '@/lib/types';
+import { ipc } from '@/lib/ipc';
+import type { DepStatus, Detection } from '@/lib/types';
 import { ErrorDetail } from '@/components/shared/ErrorDetail';
 
-const RELEASES_URL: Record<'ollama' | 'goose', string> = {
-  ollama: 'https://github.com/ollama/ollama/releases/latest',
-  goose: 'https://github.com/aaif-goose/goose/releases/latest',
-};
+const OLLAMA_RELEASES_URL = 'https://github.com/ollama/ollama/releases/latest';
 
 /** How long to keep polling after handing off to an external installer
     before giving up and telling the user to re-check manually (Ollama has
@@ -14,15 +11,7 @@ const RELEASES_URL: Record<'ollama' | 'goose', string> = {
 const INSTALL_POLL_TIMEOUT_MS = 120_000;
 const INSTALL_POLL_INTERVAL_MS = 2_000;
 
-export function DetectStep({
-  cfg,
-  onBack,
-  onNext,
-}: {
-  cfg: Config;
-  onBack: () => void;
-  onNext: () => void;
-}) {
+export function DetectStep({ onBack, onNext }: { onBack: () => void; onNext: () => void }) {
   const [det, setDet] = useState<Detection | null>(null);
   const [detecting, setDetecting] = useState(false);
 
@@ -42,25 +31,13 @@ export function DetectStep({
   return (
     <section className="wizard-panel">
       <h1>Set up local models</h1>
-      <p className="muted">
-        Kitty needs two things installed: Ollama (runs the models) and Goose (Kitty's agent engine).
-        Both install with one click below.
-      </p>
+      <p className="muted">Kitty needs Ollama installed to run models locally. One click below.</p>
       {detecting && !det && <p className="muted">Checking what's already installed…</p>}
-      {det && (
-        <>
-          <DepRow name="Ollama" dep={det.ollama} which="ollama" cfg={cfg} onChanged={detect} />
-          <DepRow name="Goose" dep={det.goose} which="goose" cfg={cfg} onChanged={detect} />
-        </>
-      )}
+      {det && <DepRow dep={det.ollama} onChanged={detect} />}
       <div className="wizard-actions">
         <button onClick={onBack}>Back</button>
         <button onClick={() => void detect()}>Re-check</button>
-        <button
-          className="primary"
-          disabled={!det || !det.ollama.installed || !det.goose.installed}
-          onClick={onNext}
-        >
+        <button className="primary" disabled={!det || !det.ollama.installed} onClick={onNext}>
           Next
         </button>
       </div>
@@ -68,19 +45,7 @@ export function DetectStep({
   );
 }
 
-function DepRow({
-  name,
-  dep,
-  which,
-  cfg,
-  onChanged,
-}: {
-  name: string;
-  dep: DepStatus;
-  which: 'ollama' | 'goose';
-  cfg: Config;
-  onChanged: () => void;
-}) {
+function DepRow({ dep, onChanged }: { dep: DepStatus; onChanged: () => void }) {
   const [busy, setBusy] = useState(false);
   const [waitingForInstaller, setWaitingForInstaller] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -97,21 +62,19 @@ function DepRow({
     setBusy(true);
     setError(null);
     try {
-      await ipc.installDependency(which);
-      if (which === 'ollama') {
-        // Ollama's installer runs in its own window with no "done" signal
-        // Kitty can observe directly — poll detection instead of re-checking
-        // once immediately after the (near-instant) spawn call returns,
-        // which used to read a successful launch as a failure.
-        setWaitingForInstaller(true);
-        const deadline = Date.now() + INSTALL_POLL_TIMEOUT_MS;
-        while (Date.now() < deadline && !cancelled.current) {
-          await new Promise((r) => setTimeout(r, INSTALL_POLL_INTERVAL_MS));
-          const fresh = await ipc.detectDependencies();
-          if (fresh.ollama.installed) break;
-        }
-        setWaitingForInstaller(false);
+      await ipc.installDependency('ollama');
+      // Ollama's installer runs in its own window with no "done" signal
+      // Kitty can observe directly — poll detection instead of re-checking
+      // once immediately after the (near-instant) spawn call returns, which
+      // used to read a successful launch as a failure.
+      setWaitingForInstaller(true);
+      const deadline = Date.now() + INSTALL_POLL_TIMEOUT_MS;
+      while (Date.now() < deadline && !cancelled.current) {
+        await new Promise((r) => setTimeout(r, INSTALL_POLL_INTERVAL_MS));
+        const fresh = await ipc.detectDependencies();
+        if (fresh.ollama.installed) break;
       }
+      setWaitingForInstaller(false);
       onChanged();
     } catch (e) {
       setError(String(e));
@@ -120,18 +83,11 @@ function DepRow({
     }
   };
 
-  const pickExisting = async () => {
-    const path = await pickExecutable();
-    if (!path) return;
-    await ipc.setConfig({ ...cfg, goose_binary_override: path });
-    onChanged();
-  };
-
   return (
     <div className="dep-row" style={{ flexDirection: 'column', alignItems: 'stretch', gap: 8 }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
         <div>
-          <strong>{name}</strong>{' '}
+          <strong>Ollama</strong>{' '}
           {dep.installed ? (
             <span className="status-badge">✓ {dep.version ?? 'installed'}</span>
           ) : (
@@ -156,13 +112,8 @@ function DepRow({
                   : 'Install'}
             </button>
           )}
-          {!dep.installed && which === 'goose' && (
-            <button disabled={busy} className="link" onClick={() => void pickExisting()}>
-              I already have it
-            </button>
-          )}
           {dep.is_outdated && (
-            <button onClick={() => void ipc.openPath(RELEASES_URL[which])}>View release</button>
+            <button onClick={() => void ipc.openPath(OLLAMA_RELEASES_URL)}>View release</button>
           )}
         </div>
       </div>
@@ -174,13 +125,13 @@ function DepRow({
       )}
       {error && (
         <ErrorDetail
-          summary={`Couldn't install ${name} automatically. You can also grab it yourself.`}
+          summary="Couldn't install Ollama automatically. You can also grab it yourself."
           raw={error}
         />
       )}
       {error && (
-        <button className="link" onClick={() => void ipc.openPath(RELEASES_URL[which])}>
-          Open the {name} download page ↗
+        <button className="link" onClick={() => void ipc.openPath(OLLAMA_RELEASES_URL)}>
+          Open the Ollama download page ↗
         </button>
       )}
     </div>

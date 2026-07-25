@@ -1,17 +1,15 @@
 //! Managed application state: window-agnostic runtime data shared across commands.
 //!
-//! Holds the loaded config plus the process/health machinery populated in Phase 1
-//! (goosed + Ollama handles, generated secret/port, current stack status).
+//! Holds the loaded config plus the process/health machinery (BigTiny +
+//! Ollama handles, generated secret/port, current stack status).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::Mutex as AsyncMutex;
 
 use crate::config::Config;
-use crate::goosed::api::AcpClient;
 use crate::lifecycle::adaptive_pathway_proc::{AdaptivePathwayStatus, EmbeddingModelStatus};
 
 /// A child process we may or may not own. We only kill processes we spawned.
@@ -44,10 +42,9 @@ pub enum StackStatus {
     Starting,
     Ok,
     OllamaDown,
-    GoosedDown,
+    BackendDown,
     NoModel,
     ProviderUnreachable,
-    ConflictGooseDesktop,
 }
 
 /// Transient one-time startup progress, kept separate from `StackStatus`
@@ -60,20 +57,18 @@ pub enum StackStatus {
 #[serde(rename_all = "snake_case")]
 pub enum StartupPhase {
     #[default]
-    SpawningGoosed,
+    SpawningBackend,
     /// Only entered when a local Ollama model needs warming (see
     /// `config::providers::active_ollama_target`) — remote/API-key providers
-    /// skip straight from `SpawningGoosed` to `Ready`.
+    /// skip straight from `SpawningBackend` to `Ready`.
     WarmingModel,
     Ready,
 }
 
 /// Root managed state, registered via `app.manage(AppState::new(..))`.
 pub struct AppState {
-    /// App configuration (persisted to `%APPDATA%/goose-overlay/config.json`).
+    /// App configuration (persisted to `%APPDATA%/Kitty/config.json`).
     pub config: Mutex<Config>,
-    /// The goosed (`goose serve`) child we spawn, plus its port + secret key.
-    pub goosed: Mutex<GoosedHandle>,
     /// The Ollama process — only `Some(child)` when *we* started it.
     pub ollama: Mutex<ManagedProcess>,
     /// Last computed stack status, so the health loop only emits on change.
@@ -81,9 +76,6 @@ pub struct AppState {
     /// One-time startup progress (see `StartupPhase`); set by `start_stack`,
     /// read by `get_startup_phase` for late-attaching windows.
     pub startup_phase: Mutex<StartupPhase>,
-    /// The live ACP connection to goosed, lazily established on first use and
-    /// cleared on disconnect (async mutex: held across `.await`).
-    pub acp: AsyncMutex<Option<AcpClient>>,
     /// The active session (raw `SessionInfo` JSON) handed from overlay to the
     /// full window on "Expand" so both bind the same session.
     pub active_session: Mutex<Option<Value>>,
@@ -103,50 +95,82 @@ pub struct AppState {
     /// is still `Downloading`/`Missing` (hashing-fallback degradation, not an
     /// outage). See `EmbeddingModelStatus`.
     pub adaptive_pathway_embedding_status: Mutex<EmbeddingModelStatus>,
-    /// Session ids with a `session/prompt` currently in flight — lets a window
-    /// adopting a session (Expand mid-stream, or just resuming one another
-    /// window/process is actively driving) know a turn is still running, since
-    /// `session/load`'s replay alone doesn't reliably convey that. Checked
-    /// fresh at adoption time rather than trusting a client-captured snapshot,
-    /// since the turn can finish in the gap between handoff and adoption.
+    /// The BigTiny daemon child we spawn, plus its port + secret (sent as
+    /// `X-API-Key`).
+    pub bigtiny: Mutex<DaemonHandle>,
+    /// BigTiny pending tool approvals: action_id -> session_id. The frontend
+    /// only echoes back the tool_call_id (= the action id), but BigTiny's
+    /// `/approve` endpoint is per-session, so the session must be remembered
+    /// here between `hitl_pause` and the user's response.
+    pub bigtiny_approvals: Mutex<HashMap<String, String>>,
+    /// Session ids with a turn currently in flight — lets a window adopting a
+    /// session (Expand mid-stream, or just resuming one another window/
+    /// process is actively driving) know a turn is still running, since a
+    /// resume's replay alone doesn't reliably convey that. Checked fresh at
+    /// adoption time rather than trusting a client-captured snapshot, since
+    /// the turn can finish in the gap between handoff and adoption.
     pub in_flight_sessions: Mutex<HashSet<String>>,
+    /// Every currently-open chat window (the classic singleton `"main"` plus
+    /// any number of dynamically-allocated `chat-N` windows), label -> bound
+    /// session id (`None` until the window's own session-creation lazily
+    /// assigns one on first send, or an Expand handoff assigns it
+    /// immediately). Additive bookkeeping for multi-window support — distinct
+    /// from `active_session` above, which is older, unrelated state still
+    /// used by the provider context-handoff gate (Settings -> Providers).
+    pub chat_windows: Mutex<HashMap<String, Option<String>>>,
+    /// Monotonic counter for allocating fresh chat window labels (`chat-1`,
+    /// `chat-2`, ...). Reset every launch — labels only need to be unique
+    /// among currently-open windows, not across restarts.
+    pub next_chat_window_id: Mutex<u64>,
+    /// One-shot handoff payload for a newly-created chat window (Expand from
+    /// the overlay), keyed by that window's own label and consumed (removed)
+    /// the first time the window reads it. Targeted by label rather than
+    /// broadcast to every window, unlike `active_session`/`session://active`
+    /// — with N chat windows possibly open, a broadcast would race every one
+    /// of them into adopting the same handoff.
+    pub pending_handoffs: Mutex<HashMap<String, Value>>,
+    /// Feature 3 (screenshot capture) — the downsampled preview + virtual-
+    /// screen rect for the currently-open selection window to read once on
+    /// mount (`get_screenshot_preview`), and the channel its selection (or
+    /// cancellation) is delivered back through to the awaiting
+    /// `capture_screenshot_region` command. A single global slot, not keyed
+    /// by window label: only one screenshot capture can be visually in
+    /// flight at a time (the user can't interact with two selection
+    /// overlays at once), so there's nothing to disambiguate.
+    pub screenshot_preview: Mutex<Option<(String, i32, i32, i32, i32)>>,
+    pub screenshot_selection: Mutex<Option<tokio::sync::oneshot::Sender<Option<(i32, i32, i32, i32)>>>>,
 }
 
 impl AppState {
     pub fn new(config: Config) -> Self {
         Self {
             config: Mutex::new(config),
-            goosed: Mutex::new(GoosedHandle::default()),
             ollama: Mutex::new(ManagedProcess::default()),
             stack_status: Mutex::new(StackStatus::default()),
             startup_phase: Mutex::new(StartupPhase::default()),
-            acp: AsyncMutex::new(None),
             active_session: Mutex::new(None),
             settings_target: Mutex::new(None),
             wizard_mode: Mutex::new(None),
             adaptive_pathway: Mutex::new(ManagedProcess::default()),
             adaptive_pathway_status: Mutex::new(AdaptivePathwayStatus::default()),
             adaptive_pathway_embedding_status: Mutex::new(EmbeddingModelStatus::default()),
+            bigtiny: Mutex::new(DaemonHandle::default()),
+            bigtiny_approvals: Mutex::new(HashMap::new()),
             in_flight_sessions: Mutex::new(HashSet::new()),
+            chat_windows: Mutex::new(HashMap::new()),
+            next_chat_window_id: Mutex::new(0),
+            pending_handoffs: Mutex::new(HashMap::new()),
+            screenshot_preview: Mutex::new(None),
+            screenshot_selection: Mutex::new(None),
         }
     }
 }
 
-/// Connection details for the goosed ACP server we manage.
+/// Connection details for the BigTiny daemon we manage.
 #[derive(Default)]
-pub struct GoosedHandle {
+pub struct DaemonHandle {
     pub process: ManagedProcess,
     pub port: Option<u16>,
-    /// Sent as `X-Secret-Key` on ACP requests — consumed by `goosed/api.rs` in Phase 2.
-    #[allow(dead_code)]
+    /// Sent as `X-API-Key` on every BigTiny request.
     pub secret_key: Option<String>,
-}
-
-impl GoosedHandle {
-    /// Base URL of the local ACP endpoint, if the server has been started.
-    /// Used by the ACP client in Phase 2.
-    #[allow(dead_code)]
-    pub fn base_url(&self) -> Option<String> {
-        self.port.map(|p| format!("http://127.0.0.1:{p}"))
-    }
 }

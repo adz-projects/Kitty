@@ -131,7 +131,7 @@ export function App() {
           }}
         />
       )}
-      {current === 'detect' && <DetectStep cfg={cfg} onBack={back} onNext={nextAndMark} />}
+      {current === 'detect' && <DetectStep onBack={back} onNext={nextAndMark} />}
       {current === 'apikey' && <ApiKeyStep onBack={back} onNext={nextAndMark} />}
       {current === 'configure' && (
         <ConfigureStep

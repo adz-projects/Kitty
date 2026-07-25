@@ -9,11 +9,11 @@ import { useChatStore } from '@/stores/chatStore';
 /** Active-provider badge with a click-to-switch popover (Round-2 item 9), shown
     in both the overlay and full window. Switching calls activate_provider, which
     health-gates the target first (rejects and stays on the old provider if it
-    isn't reachable/authenticated) then respawns goosed and emits
-    provider://activated — the store re-syncs from that.
-    Switching mid-conversation restarts goosed and only best-effort rebinds the
-    session, so once the active session has any history the dropdown locks —
-    "New chat" is the supported way to change providers. */
+    isn't reachable/authenticated) then re-registers it with the backend and
+    emits provider://activated — the store re-syncs from that.
+    Switching mid-conversation only best-effort rebinds the session, so once
+    the active session has any history the dropdown locks — "New chat" is the
+    supported way to change providers. */
 export function ProviderBadge() {
   const [providers, setProviders] = useState<ProviderView[]>([]);
   const [open, setOpen] = useState(false);
@@ -34,7 +34,7 @@ export function ProviderBadge() {
   }, []);
 
   const active = providers.find((p) => p.active);
-  const label = active ? active.name || active.provider_type : 'Goose default';
+  const label = active ? active.name || active.provider_type : 'No provider';
   const icon = active ? (
     <TrustIcon tier={active.network_tier} isTrusted={active.is_trusted} />
   ) : (
@@ -86,11 +86,6 @@ export function ProviderBadge() {
               {p.name || p.provider_type}
             </button>
           ))}
-          {providers.some((p) => p.active) && (
-            <button onClick={() => void switchTo(null)}>
-              <SettingsGearIcon /> Goose default
-            </button>
-          )}
           {providers.length === 0 && <span className="muted">No providers configured</span>}
         </div>
       )}

@@ -1,5 +1,5 @@
 //! Ollama process detection + (conditional) spawning and health probes.
-//! We never call generate/chat here — inference goes through goosed. We only
+//! We never call generate/chat here — inference goes through BigTiny. We only
 //! manage the process and read `/api/version` and `/api/tags`.
 
 use std::path::PathBuf;

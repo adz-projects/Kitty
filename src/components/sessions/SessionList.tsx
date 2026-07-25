@@ -411,10 +411,23 @@ function SessionRow({
   dragging: boolean;
   onStartDrag: (sessionId: string, e: ReactPointerEvent) => void;
 }) {
-  const { remove, assignments } = useSessionStore();
+  const { remove, rename, assignments } = useSessionStore();
   const loadSession = useChatStore((st) => st.loadSession);
   const current = assignments[s.sessionId] ?? '';
   const [confirmingDelete, setConfirmingDelete] = useState(false);
+  const [renaming, setRenaming] = useState(false);
+  const [renameValue, setRenameValue] = useState(s.title);
+
+  const submitRename = () => {
+    const next = renameValue.trim();
+    if (next && next !== s.title) {
+      void rename(s.sessionId, next);
+      // Keep the active session's own title in sync (chat header, export
+      // default filename, etc.) — sessionStore only owns the list row.
+      if (active) useChatStore.setState({ title: next });
+    }
+    setRenaming(false);
+  };
   // Resuming replays the whole conversation (session/load) before this
   // resolves — without feedback, clicking a long-history chat looked
   // unresponsive for however long the replay took.
@@ -455,25 +468,65 @@ function SessionRow({
           sessionId={s.sessionId}
           folders={folders}
           current={current}
+          onRename={() => {
+            setRenameValue(s.title);
+            setRenaming(true);
+          }}
           onDelete={() => setConfirmingDelete(true)}
         />
       </div>
+      {renaming && (
+        // Nested inside this row's own onClick (which resumes the session) —
+        // without stopping propagation here, clicking anything in this modal
+        // bubbles up and also fires that resume, racing with the rename.
+        <div onClick={(e) => e.stopPropagation()}>
+          <Modal title="Rename chat">
+            <label className="field">
+              <span>Chat name</span>
+              <input
+                autoFocus
+                value={renameValue}
+                onChange={(e) => setRenameValue(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault();
+                    submitRename();
+                  }
+                }}
+              />
+            </label>
+            <div className="row">
+              <button className="primary" onClick={submitRename}>
+                Rename
+              </button>
+              <button onClick={() => setRenaming(false)}>Cancel</button>
+            </div>
+          </Modal>
+        </div>
+      )}
       {confirmingDelete && (
-        <Modal title="Delete this chat?">
-          <p>Delete &quot;{s.title}&quot;? This cannot be undone.</p>
-          <div className="row">
-            <button
-              className="primary"
-              onClick={() => {
-                void remove(s.sessionId);
-                setConfirmingDelete(false);
-              }}
-            >
-              Delete
-            </button>
-            <button onClick={() => setConfirmingDelete(false)}>Cancel</button>
-          </div>
-        </Modal>
+        // Same bubbling hazard as the rename modal above — confirmed real bug:
+        // clicking "Delete" here also bubbled into the row's onClick, which
+        // called loadSession on the session being deleted, racing the delete
+        // and landing on a blank/errored session instead of leaving whatever
+        // session the user was actually viewing untouched.
+        <div onClick={(e) => e.stopPropagation()}>
+          <Modal title="Delete this chat?">
+            <p>Delete &quot;{s.title}&quot;? This cannot be undone.</p>
+            <div className="row">
+              <button
+                className="primary"
+                onClick={() => {
+                  void remove(s.sessionId);
+                  setConfirmingDelete(false);
+                }}
+              >
+                Delete
+              </button>
+              <button onClick={() => setConfirmingDelete(false)}>Cancel</button>
+            </div>
+          </Modal>
+        </div>
       )}
     </div>
   );

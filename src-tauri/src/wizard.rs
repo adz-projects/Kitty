@@ -1,18 +1,15 @@
-//! First-run wizard + repair support (Phase 7): dependency detection, installing
+//! First-run wizard + repair support: dependency detection, installing
 //! missing dependencies via their official installers, autostart, and the
 //! setup-completed gate. Installer URLs live in docs/VERSIONS.md.
 
-use std::io::Cursor;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde::Serialize;
 use tauri::{AppHandle, Manager};
 use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE};
 use winreg::RegKey;
 
-use crate::config;
-use crate::lifecycle::{goosed, ollama_proc};
-use crate::state::AppState;
+use crate::lifecycle::ollama_proc;
 use crate::util::hidden_command;
 
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
@@ -37,27 +34,10 @@ pub struct DepStatus {
 #[derive(Debug, Clone, Serialize)]
 pub struct Detection {
     pub ollama: DepStatus,
-    pub goose: DepStatus,
 }
 
-fn run_version(bin: &Path) -> Option<String> {
-    let out = hidden_command(bin).arg("--version").output().ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let combined = if text.trim().is_empty() {
-        String::from_utf8_lossy(&out.stderr).to_string()
-    } else {
-        text.to_string()
-    };
-    let v = combined.trim();
-    (!v.is_empty()).then(|| v.to_string())
-}
-
-/// GitHub repos whose Releases API we check for the latest version (item 29).
-/// Goose's org was renamed from `block` to `aaif-goose` after this was first
-/// pinned (Stage-1 close-out) — GitHub redirects the old path, but point at
-/// the canonical one rather than lean on that indefinitely.
+/// GitHub repo whose Releases API we check for the latest version (item 29).
 const OLLAMA_REPO: &str = "ollama/ollama";
-const GOOSE_REPO: &str = "aaif-goose/goose";
 
 /// Fetch a repo's latest release tag via the GitHub Releases API. GitHub
 /// requires a `User-Agent`; failures (offline, rate-limited, etc.) return
@@ -118,11 +98,9 @@ fn is_outdated(installed: Option<&str>, latest: Option<&str>) -> Option<bool> {
     Some(cur < lat)
 }
 
-/// Detect Ollama + Goose: presence, version, resolved path, and (best-effort)
-/// whether a newer release is available. `goose_override` is the persisted
-/// `goose_binary_override` (if the wizard's install or manual-pick already
-/// resolved one) — checked before the usual env/bundle/PATH fallbacks.
-pub async fn detect(base_url: &str, goose_override: Option<&str>) -> Detection {
+/// Detect Ollama: presence, version, resolved path, and (best-effort)
+/// whether a newer release is available.
+pub async fn detect(base_url: &str) -> Detection {
     // Ollama: prefer the running server's version, else the binary.
     let ollama_bin = ollama_proc::locate_ollama();
     let url = format!("{}/api/version", base_url.trim_end_matches('/'));
@@ -141,14 +119,7 @@ pub async fn detect(base_url: &str, goose_override: Option<&str>) -> Detection {
     };
     let ollama_installed = ollama_bin.exists() || ollama_ver.is_some();
 
-    let goose_bin = goosed::locate_goose(goose_override);
-    let goose_installed = goose_bin.exists();
-    let goose_ver = goose_installed.then(|| run_version(&goose_bin)).flatten();
-
-    let (ollama_latest, goose_latest) = tokio::join!(
-        latest_github_release(OLLAMA_REPO),
-        latest_github_release(GOOSE_REPO)
-    );
+    let ollama_latest = latest_github_release(OLLAMA_REPO).await;
 
     Detection {
         ollama: DepStatus {
@@ -160,23 +131,14 @@ pub async fn detect(base_url: &str, goose_override: Option<&str>) -> Detection {
                 .then(|| ollama_bin.display().to_string()),
             latest_version: ollama_latest,
         },
-        goose: DepStatus {
-            installed: goose_installed,
-            is_outdated: is_outdated(goose_ver.as_deref(), goose_latest.as_deref()),
-            version: goose_ver,
-            path: goose_installed.then(|| goose_bin.display().to_string()),
-            latest_version: goose_latest,
-        },
     }
 }
 
-/// Download an installer/archive over HTTPS and either run it (Ollama) or
-/// extract it in place and record where (Goose). Only `https` URLs are
+/// Download an installer over HTTPS and run it. Only `https` URLs are
 /// accepted (no plain http / SSRF surface).
-pub async fn install(app: &AppHandle, which: &str) -> Result<(), String> {
+pub async fn install(_app: &AppHandle, which: &str) -> Result<(), String> {
     match which {
         "ollama" => install_ollama().await,
-        "goose" => install_goose(app).await,
         _ => Err("unknown dependency".into()),
     }
 }
@@ -204,104 +166,6 @@ async fn install_ollama() -> Result<(), String> {
         .spawn()
         .map_err(|e| format!("could not launch installer: {e}"))?;
     Ok(())
-}
-
-/// Exact Windows CLI asset name to look for in the release's asset list —
-/// deliberately not `Goose-win32-x64.zip`/`Goose.zip` (the Desktop Electron
-/// app; a different, conflicting install — see `docs/VERSIONS.md`) and not
-/// the `-cuda` variant (bigger download, GPU-specific, not needed by default).
-const GOOSE_CLI_ASSET_NAME: &str = "goose-x86_64-pc-windows-msvc.zip";
-
-/// Goose publishes no Windows `.exe`/`.msi` installer, only plain zip
-/// archives — so "install" here means: find the CLI zip's real download URL
-/// from the latest GitHub release, download it, extract it into an
-/// app-owned folder, and persist that as `goose_binary_override` so
-/// `locate_goose` finds it with no further user action.
-async fn install_goose(app: &AppHandle) -> Result<(), String> {
-    let client = crate::util::http_client();
-    let release: serde_json::Value = client
-        .get(format!(
-            "https://api.github.com/repos/{GOOSE_REPO}/releases/latest"
-        ))
-        .send()
-        .await
-        .map_err(|e| format!("could not reach GitHub releases: {e}"))?
-        .json()
-        .await
-        .map_err(|e| format!("could not read release info: {e}"))?;
-
-    let asset_url = release
-        .get("assets")
-        .and_then(|a| a.as_array())
-        .and_then(|assets| {
-            assets
-                .iter()
-                .find(|a| a.get("name").and_then(|n| n.as_str()) == Some(GOOSE_CLI_ASSET_NAME))
-        })
-        .and_then(|a| a.get("browser_download_url"))
-        .and_then(|u| u.as_str())
-        .ok_or_else(|| {
-            format!("could not find {GOOSE_CLI_ASSET_NAME} in the latest Goose release")
-        })?
-        .to_string();
-    if !asset_url.starts_with("https://") {
-        return Err("refusing non-HTTPS download URL".into());
-    }
-
-    let bytes = client
-        .get(&asset_url)
-        .send()
-        .await
-        .map_err(|e| format!("download failed: {e}"))?
-        .bytes()
-        .await
-        .map_err(|e| format!("download failed: {e}"))?;
-
-    let dest_dir = dirs::data_local_dir()
-        .ok_or("could not resolve a local app-data directory")?
-        .join("Kitty")
-        .join("goose");
-    std::fs::create_dir_all(&dest_dir)
-        .map_err(|e| format!("could not create {dest_dir:?}: {e}"))?;
-
-    let mut archive = zip::ZipArchive::new(Cursor::new(bytes.as_ref()))
-        .map_err(|e| format!("could not read the downloaded archive: {e}"))?;
-    archive
-        .extract(&dest_dir)
-        .map_err(|e| format!("could not extract the downloaded archive: {e}"))?;
-
-    let goose_exe = find_goose_exe(&dest_dir)
-        .ok_or("extracted the Goose archive but couldn't find goose.exe inside it")?;
-
-    {
-        let state = app.state::<AppState>();
-        let mut cfg = state.config.lock().unwrap();
-        cfg.goose_binary_override = Some(goose_exe.display().to_string());
-        config::save(&cfg).map_err(|e| e.to_string())?;
-    }
-    Ok(())
-}
-
-/// Walk a directory tree (a couple levels deep — zip layouts vary) looking
-/// for `goose.exe`.
-fn find_goose_exe(dir: &Path) -> Option<PathBuf> {
-    let entries = std::fs::read_dir(dir).ok()?;
-    let mut subdirs = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_file() && path.file_name().and_then(|n| n.to_str()) == Some("goose.exe") {
-            return Some(path);
-        }
-        if path.is_dir() {
-            subdirs.push(path);
-        }
-    }
-    for sub in subdirs {
-        if let Some(found) = find_goose_exe(&sub) {
-            return Some(found);
-        }
-    }
-    None
 }
 
 // --- Autostart (HKCU Run key) ---

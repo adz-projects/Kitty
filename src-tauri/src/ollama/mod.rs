@@ -1,5 +1,5 @@
-//! Ollama model management (Phase 5): list installed models, pull with live
-//! progress, delete. Inference goes through goosed — the one exception is the
+//! Ollama model management: list installed models, pull with live
+//! progress, delete. Inference goes through BigTiny — the one exception is the
 //! keep-alive warm/evict calls below (Round-2 item 5), which issue an empty
 //! `/api/generate` purely to pin a model in memory. Pull progress is streamed to
 //! the UI as `ollama://pull-progress` events keyed by `pull_id`.
@@ -48,8 +48,8 @@ pub async fn delete_model(base_url: &str, model: &str) -> Result<(), String> {
 }
 
 /// `POST /api/show` — best-effort lookup of a model's max context length, for
-/// suggesting (not forcing) `GOOSE_CONTEXT_LIMIT` (Round-6 Feature 1). The
-/// field lives under `model_info` with an architecture-specific key name
+/// suggesting (not forcing) a value for the provider form's context-length
+/// field. The field lives under `model_info` with an architecture-specific key name
 /// (e.g. `llama.context_length`, `qwen2.context_length`, `gemma2.context_length`)
 /// rather than one fixed key, so search for any key ending in `.context_length`
 /// instead of hardcoding a family. Returns `None` on any failure (network,
@@ -82,7 +82,7 @@ pub async fn keep_alive_release(base_url: &str, model: &str) {
 }
 
 /// Best-effort keep-alive call. Failures are ignored — this is a warm-up, not a
-/// correctness-critical path (goosed still owns real inference).
+/// correctness-critical path (BigTiny still owns real inference).
 async fn warm(base_url: &str, model: &str, keep_alive: i64) {
     if model.is_empty() {
         return;

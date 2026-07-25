@@ -2,7 +2,7 @@ export type WizardPath = 'local' | 'api-key';
 
 /** The wizard's first screen: local (Ollama-backed) vs. bring-your-own API
     key. Written for someone who's used Claude.ai/Copilot but has never heard
-    of Ollama or Goose — no jargon, one plain sentence per option. */
+    of Ollama — no jargon, one plain sentence per option. */
 export function PathFork({
   mode,
   selected,

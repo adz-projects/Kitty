@@ -1,5 +1,6 @@
 //! Provider profile commands: list/create/update/delete + activation (which
-//! restarts goosed and warms/evicts local Ollama models around the switch).
+//! re-registers the provider with BigTiny and warms/evicts local Ollama
+//! models around the switch).
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
@@ -10,8 +11,6 @@ use crate::config::Config;
 use crate::ollama;
 use crate::openrouter;
 use crate::state::AppState;
-
-use super::window::restart_goosed;
 
 /// A provider profile plus derived fields the UI needs.
 #[derive(Debug, Clone, Serialize)]
@@ -136,12 +135,19 @@ pub async fn test_active_provider_connection(
     }
 }
 
-/// Activate a provider profile (`None` = use goosed's own config). Health-gates
-/// the switch first (a non-functioning target is rejected and the old provider
-/// stays active — see `providers::test_connection`), then persists the choice
-/// and restarts goosed so the provider env takes effect.
+/// Activate a provider profile. BigTiny has no built-in default and errors
+/// any send with no provider registered, so `id: None` is rejected — a
+/// provider must always be active. Health-gates the switch first (a
+/// non-functioning target is rejected and the old provider stays active —
+/// see `providers::test_connection`), then persists the choice and
+/// re-registers it with BigTiny over REST (no daemon restart needed).
 #[tauri::command]
 pub async fn activate_provider(app: AppHandle, id: Option<String>) -> Result<(), String> {
+    if id.is_none() {
+        return Err(
+            "A provider must be active — add one in Settings → Providers.".to_string(),
+        );
+    }
     if let Some(ref pid) = id {
         let profile = {
             let state = app.state::<AppState>();
@@ -172,7 +178,9 @@ pub async fn activate_provider(app: AppHandle, id: Option<String>) -> Result<(),
         cfg.active_provider_id = id;
         config::save(&cfg).map_err(|e| e.to_string())?;
     }
-    restart_goosed(app.clone()).await?;
+    // BigTiny switches providers at runtime over REST — no daemon restart.
+    // Registration failure is a hard error.
+    crate::bigtiny::providers::sync_active_provider(&app).await?;
 
     // Tell the frontend to re-sync provider state immediately (Round-2 item 4) —
     // without this the UI drifts until the next session create/load or health tick.

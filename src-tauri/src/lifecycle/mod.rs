@@ -1,14 +1,13 @@
-//! Process lifecycle & health for the local stack (Ollama + goosed).
+//! Process lifecycle & health for the local stack (Ollama + BigTiny).
 //!
 //! We *own* the stack: on startup we ensure Ollama is running (spawning it only
-//! if it isn't already), then spawn `goose serve` (ACP-over-HTTP). A 5s health
-//! loop recomputes the [`crate::state::StackStatus`] and emits `stack://status`
+//! if it isn't already), then spawn the BigTiny daemon. A 5s health loop
+//! recomputes the [`crate::state::StackStatus`] and emits `stack://status`
 //! on change. On exit we kill only the children we spawned.
 
 pub mod adaptive_pathway_proc;
-pub mod conflict;
+pub mod bigtiny_proc;
 mod embedding;
-pub mod goosed;
 mod health;
 pub mod ollama_proc;
 pub mod scheduler;
@@ -84,40 +83,46 @@ pub fn start_stack(app: &AppHandle) {
             }
         }
 
-        // 2 + 2b. Spawn goosed (`goose serve`) with the active provider's env,
-        // and — if the active provider is a local Ollama model — warm it into
-        // memory (Round-2 item 5), in parallel: the two are independent I/O
-        // waits (spawning a process vs. an HTTP round trip to Ollama), so
-        // running them concurrently drops wall-clock startup from
-        // `spawn + warmup` to `max(spawn, warmup)`. Both lookups happen
-        // up front so neither async block needs to re-lock config mid-flight.
-        let (env, goose_override, warm) = {
+        // Spawn the BigTiny daemon. No provider env vars — providers are
+        // registered at runtime over REST (see
+        // `bigtiny::providers::sync_active_provider` right after spawn).
+        let (command, args, dir, warm) = {
             let state = app.state::<AppState>();
             let cfg = state.config.lock().unwrap();
             (
-                crate::config::providers::goosed_env(&cfg),
-                cfg.goose_binary_override.clone(),
+                cfg.bigtiny_command.clone(),
+                cfg.bigtiny_args.clone(),
+                cfg.bigtiny_dir.clone(),
                 crate::config::providers::active_ollama_target(&cfg),
             )
         };
-        set_startup_phase(&app, StartupPhase::SpawningGoosed);
+        set_startup_phase(&app, StartupPhase::SpawningBackend);
         if warm.is_some() {
             set_startup_phase(&app, StartupPhase::WarmingModel);
         }
-        let goosed_fut = goosed::spawn(env, goose_override.as_deref());
+        let spawn_fut = bigtiny_proc::spawn(&command, &args, dir.as_deref());
         let warm_fut = async {
             if let Some((base, model)) = warm {
                 crate::ollama::keep_alive_load(&base, &model).await;
             }
         };
-        let (goosed_result, ()) = tokio::join!(goosed_fut, warm_fut);
-        match goosed_result {
+        let (spawn_result, ()) = tokio::join!(spawn_fut, warm_fut);
+        match spawn_result {
             Ok(handle) => {
                 let state = app.state::<AppState>();
-                *state.goosed.lock().unwrap() = handle;
-                tracing::info!("goosed started");
+                *state.bigtiny.lock().unwrap() = handle;
+                tracing::info!("bigtiny started");
+                // Register the active provider so the very first send has
+                // a healthy provider to route to.
+                if let Err(e) = crate::bigtiny::providers::sync_active_provider(&app).await {
+                    tracing::warn!("bigtiny provider sync failed: {e}");
+                }
+                // Self-heal the bundled plugins' MCP-server registrations
+                // (command path across an update/reinstall, enabled state
+                // matching Settings).
+                crate::bigtiny::mcp::ensure_builtin_servers(&app).await;
             }
-            Err(e) => tracing::warn!("goosed spawn failed: {e}"),
+            Err(e) => tracing::warn!("bigtiny spawn failed: {e}"),
         }
         set_startup_phase(&app, StartupPhase::Ready);
 
@@ -179,31 +184,6 @@ pub fn start_stack(app: &AppHandle) {
                 }
             }
 
-            // Existing-install migration: an extension registered before
-            // `AP_EMBED_OLLAMA_MODEL`/`AP_EMBED_OLLAMA_URL` existed (or
-            // before the URL var was added) never picks up a new `env_keys`
-            // entry — that only takes effect at registration time, and
-            // pre-existing installs' `config.yaml` entries never get
-            // re-registered on their own. Writing the values directly into
-            // the extension's own `envs:` map is a safe, idempotent fix (a
-            // model tag/URL is not a secret) that runs on every launch, so
-            // any existing install self-heals without the user touching the
-            // Settings toggle at all.
-            if let Err(e) = crate::goose_config::set_extension_env(
-                "adaptive-pathway",
-                "AP_EMBED_OLLAMA_MODEL",
-                &ap_embedding_model,
-            ) {
-                tracing::warn!("adaptive pathway env migration (model) failed: {e}");
-            }
-            if let Err(e) = crate::goose_config::set_extension_env(
-                "adaptive-pathway",
-                "AP_EMBED_OLLAMA_URL",
-                &base,
-            ) {
-                tracing::warn!("adaptive pathway env migration (url) failed: {e}");
-            }
-
             // 2d. Runtime guarantee for the shared embedding model: if Ollama
             // is reachable but the pinned tag isn't installed yet, pull it in
             // the background (non-blocking — the wizard's own pull is only
@@ -233,12 +213,19 @@ pub fn start_stack(app: &AppHandle) {
 /// in `lib.rs`). It does NOT run when the process is terminated directly at
 /// the OS level instead — a terminal Ctrl+C during `tauri dev`, or tauri-cli's
 /// own dev-mode hot-restart, both kill the previous run outright rather than
-/// through this event loop. `adaptive_pathway_proc::kill_stale_orphan` (run at
-/// the top of every `ensure_running`) is the recovery path for children
-/// orphaned that way — this function alone isn't sufficient on its own.
+/// through this event loop. `adaptive_pathway_proc`/`bigtiny_proc`'s own
+/// `kill_stale_orphan` (run at the top of every `ensure_running`/`spawn`) is
+/// the recovery path for children orphaned that way — this function alone
+/// isn't sufficient on its own.
 pub fn shutdown(app: &AppHandle) {
     let state = app.state::<AppState>();
-    state.goosed.lock().unwrap().process.kill_if_owned();
+    let mut bigtiny = state.bigtiny.lock().unwrap();
+    let bigtiny_was_owned = bigtiny.process.owned;
+    bigtiny.process.kill_if_owned();
+    drop(bigtiny);
+    if bigtiny_was_owned {
+        bigtiny_proc::remove_pidfile();
+    }
     state.ollama.lock().unwrap().kill_if_owned();
     let mut ap = state.adaptive_pathway.lock().unwrap();
     let ap_was_owned = ap.owned;

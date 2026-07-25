@@ -24,10 +24,19 @@ Thumbs.db
 
 # Python plugin build artifacts (plugins/ — see docs/PLUGINS.md).
 # The frozen .exe outputs themselves are NOT ignored: src-tauri/binaries/
-# holds two intentionally-empty committed placeholders so a fresh clone can
+# holds intentionally-empty committed placeholders so a fresh clone can
 # `cargo check` (see src-tauri/binaries/README.md). Never commit the real
-# ~139MB PyInstaller output over them — rebuild with `python plugins/build.py`.
+# ~50-95MB PyInstaller output over them — rebuild with `python plugins/build.py`.
 __pycache__/
 *.py[cod]
 *.egg-info/
+.pytest_cache/
 plugins/*/build/
+# Local SQLite probe/scratch databases a plugin's own dev tooling can leave
+# behind (e.g. adaptive-pathway's `_probe_pathway.db-*`).
+_probe_*.db-*
+
+# Local Claude Code / OpenCode session config — machine-specific, not part
+# of the shipped project.
+.claude/
+.opencode/

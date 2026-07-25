@@ -1,8 +1,5 @@
-// Feature detection for vision-capable (image-accepting) models. ACP exposes no
-// per-model capability signal for this — `initialize`'s `agentCapabilities.
-// promptCapabilities.image` (docs/acp-protocol.md) is agent-level, reporting
-// whether Goose itself can carry an image content block at all, not whether
-// the specific active model can actually see it. So, same as
+// Feature detection for vision-capable (image-accepting) models. The backend
+// exposes no reliable per-model capability signal for this, so, same as
 // reasoning_models.ts, this is a name-pattern heuristic — re-verify on model
 // updates.
 //
@@ -40,6 +37,13 @@ const VISION_PATTERNS: RegExp[] = [
   /internvl/i,
   /phi-3\.5-vision/i,
   /phi-4.*vision/i,
+  // Qwen3.6 ships multimodal by default (confirmed via a live server's
+  // `/api/tags` reporting `capabilities: ["completion", "multimodal"]` for
+  // "Qwen3.6-27B-..."). Unlike earlier Qwen3.x releases (`qwen3:4b` etc. are
+  // still text-only, hence not matched by the generic `qwen.*-?vl` pattern
+  // above), it dropped the separate "-VL" suffix naming convention those
+  // patterns rely on, so it needs its own explicit entry.
+  /qwen3\.6/i,
 ];
 
 const NON_VISION_OVERRIDES: RegExp[] = [/o1-mini/i, /o3-mini/i];

@@ -25,6 +25,7 @@ export default defineConfig({
         main: resolve(__dirname, 'src/windows/main/index.html'),
         settings: resolve(__dirname, 'src/windows/settings/index.html'),
         wizard: resolve(__dirname, 'src/windows/wizard/index.html'),
+        'screenshot-select': resolve(__dirname, 'src/windows/screenshot-select/index.html'),
       },
     },
   },

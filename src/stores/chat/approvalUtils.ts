@@ -28,14 +28,14 @@ export function pathWithinDir(base: string, target: string): boolean {
   return resolved === b || resolved.startsWith(`${b}/`);
 }
 
-/** Whether `target` sits under Goose's own internal cache directory
-    (`.../Block/goose/cache/...`, e.g. `computercontroller`'s scraped-page
-    cache). These are the tool's own working storage, not a file the model is
-    saving for the user, so they're out of scope for the chat-folder boundary
-    entirely — rejecting them just breaks the tool (e.g. web fetch) without
-    protecting anything. Lexical, matching `pathWithinDir`'s no-fs-access
-    style. */
-export function isGooseInternalCachePath(target: string): boolean {
+/** Whether `target` sits under a tool's own internal cache directory
+    (`.../Block/goose/cache/...`, a legacy path some tools' scraped-page
+    caches still use). These are the tool's own working storage, not a file
+    the model is saving for the user, so they're out of scope for the
+    chat-folder boundary entirely — rejecting them just breaks the tool (e.g.
+    web fetch) without protecting anything. Lexical, matching
+    `pathWithinDir`'s no-fs-access style. */
+export function isInternalToolCachePath(target: string): boolean {
   return /(^|\/)block\/goose\/cache(\/|$)/i.test(target.replace(/\\/g, '/'));
 }
 
@@ -69,11 +69,15 @@ export function isSecuritySensitiveCommand(command: string): boolean {
   return SECURITY_SENSITIVE_RE.test(command);
 }
 
-/** Decide how to answer a tool-approval request while in chat ("thought-
-    partner") mode (Round-5, owner decision; tri-stated in Round-7 item 3):
-    tools are allowed, but a path-based file op is confined to the session's
-    chat folder (`cwd`), and a security-sensitive shell command always needs an
-    explicit user decision. Returns `decision`:
+/** Decide how to answer a tool-approval request (Round-5, owner decision;
+    tri-stated in Round-7 item 3; extended to agentic mode alongside the
+    directory-sandboxing feature — BigTiny is the authoritative containment
+    check there, this is purely a round-trip-avoidance nicety, never the
+    security boundary): tools are allowed, but a path-based file op is
+    confined to one of `dirs` (the session's chat folder in chat mode; chat
+    folder + current working directory in agentic mode, since "Set as
+    working directory" can diverge the two), and a security-sensitive shell
+    command always needs an explicit user decision. Returns `decision`:
       - `'allow'`: safe — respond with the allow option immediately.
       - `'reject'`: currently unused (kept for callers that want to
         auto-decline something with no ambiguity — e.g. the tool-loop guard),
@@ -85,7 +89,7 @@ export function isSecuritySensitiveCommand(command: string): boolean {
     allowed — a soft boundary, since shell isn't sandboxed beyond this check. */
 export function decideChatApproval(
   rawInput: unknown,
-  cwd: string | null,
+  dirs: (string | null)[],
   options: { optionId: string }[]
 ): { decision: 'allow' | 'reject' | 'prompt'; optionId: string | null; warning?: string } {
   const input = (rawInput ?? {}) as {
@@ -96,12 +100,13 @@ export function decideChatApproval(
   };
   const p =
     input.path ?? input.file_path ?? (Array.isArray(input.paths) ? input.paths[0] : undefined);
+  const bases = dirs.filter((d): d is string => !!d);
   if (
     typeof p === 'string' &&
     p !== '' &&
-    !!cwd &&
-    !pathWithinDir(cwd, p) &&
-    !isGooseInternalCachePath(p)
+    bases.length > 0 &&
+    !bases.some((base) => pathWithinDir(base, p)) &&
+    !isInternalToolCachePath(p)
   ) {
     return {
       decision: 'prompt',

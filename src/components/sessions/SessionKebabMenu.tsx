@@ -9,11 +9,13 @@ export function SessionKebabMenu({
   sessionId,
   folders,
   current,
+  onRename,
   onDelete,
 }: {
   sessionId: string;
   folders: string[];
   current: string;
+  onRename: () => void;
   onDelete: () => void;
 }) {
   const [open, setOpen] = useState(false);
@@ -61,6 +63,14 @@ export function SessionKebabMenu({
             </button>
           ))}
           <hr className="mode-popover-sep" />
+          <button
+            onClick={() => {
+              setOpen(false);
+              onRename();
+            }}
+          >
+            Rename
+          </button>
           <button
             onClick={() => {
               setOpen(false);

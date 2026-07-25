@@ -15,26 +15,14 @@ use crate::wizard;
 
 use super::ollama::ollama_base;
 
-/// Detect Ollama + Goose (presence, version, path).
+/// Detect Ollama (presence, version, path).
 #[tauri::command]
 pub async fn detect_dependencies(app: AppHandle) -> Result<wizard::Detection, String> {
     let base = ollama_base(&app);
-    let goose_override = {
-        let state = app.state::<AppState>();
-        let cfg = state.config.lock().unwrap();
-        cfg.goose_binary_override.clone()
-    };
-    Ok(wizard::detect(&base, goose_override.as_deref()).await)
+    Ok(wizard::detect(&base).await)
 }
 
-/// Install a dependency (`ollama` — downloads+runs its official installer;
-/// `goose` — downloads+extracts its CLI zip and records the path, since it
-/// has no installer at all). See `wizard::install`. Manually pointing at an
-/// existing `goose.exe` (the fallback next to one-click install) needs no
-/// dedicated command — the frontend picks the file via the existing
-/// `pickFiles()`/dialog-plugin pattern and writes `goose_binary_override`
-/// through the generic `get_config`/`set_config` commands, same as every
-/// other plain config field (e.g. `default_context_folder`).
+/// Install Ollama — downloads+runs its official installer. See `wizard::install`.
 #[tauri::command]
 pub async fn install_dependency(app: AppHandle, which: String) -> Result<(), String> {
     wizard::install(&app, &which).await
@@ -90,11 +78,11 @@ pub async fn validate_setup(app: AppHandle) -> Result<SetupValidation, String> {
     }
 
     let client = crate::util::http_client();
-    match lifecycle::compute_status(&app, &client, false).await {
-        StackStatus::Ok | StackStatus::ConflictGooseDesktop => {}
+    match lifecycle::compute_status(&app, &client).await {
+        StackStatus::Ok => {}
         StackStatus::Starting => issues.push("Still starting up — try again in a moment.".into()),
         StackStatus::OllamaDown => issues.push("Ollama isn't running.".into()),
-        StackStatus::GoosedDown => issues.push("Goose isn't running yet.".into()),
+        StackStatus::BackendDown => issues.push("Kitty's engine isn't running yet.".into()),
         StackStatus::NoModel => issues.push("No Ollama model is installed yet.".into()),
         StackStatus::ProviderUnreachable => {
             issues.push("Can't reach the active provider right now.".into())

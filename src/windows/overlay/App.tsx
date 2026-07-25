@@ -12,7 +12,7 @@ import { SettingsGearIcon } from '@/components/icons/SettingsGearIcon';
 import { SchismResolutionModal } from '@/components/chat/SchismResolutionModal';
 import type { StackStatus } from '@/lib/types';
 
-const DEGRADED: StackStatus[] = ['ollama_down', 'goosed_down', 'no_model', 'provider_unreachable'];
+const DEGRADED: StackStatus[] = ['ollama_down', 'backend_down', 'no_model', 'provider_unreachable'];
 
 export function App() {
   const status = useStackStore((s) => s.status);
@@ -74,14 +74,7 @@ export function App() {
           className="overlay-body"
           style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}
         >
-          {degraded ? (
-            <StackStatusView status={status} />
-          ) : (
-            <>
-              {status === 'conflict_goose_desktop' && <StackStatusView status={status} />}
-              <ChatView />
-            </>
-          )}
+          {degraded ? <StackStatusView status={status} /> : <ChatView />}
         </div>
       </div>
       <SchismResolutionModal />

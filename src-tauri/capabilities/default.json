@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Default capability applied to every Goose Overlay window.",
+  "description": "Default capability applied to every Kitty window.",
   "windows": ["*"],
   "permissions": [
     "core:default",

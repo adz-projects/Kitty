@@ -16,7 +16,7 @@ let subscribed = false;
 export const useStackStore = create<StackState>((set) => ({
   status: 'starting',
   detail: null,
-  startupPhase: 'spawning_goosed',
+  startupPhase: 'spawning_backend',
   init: async () => {
     try {
       set({ status: await ipc.getStackStatus() });

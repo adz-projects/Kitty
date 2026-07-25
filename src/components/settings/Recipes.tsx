@@ -2,7 +2,6 @@ import { useEffect, useState } from 'react';
 import { ipc, onRecipesChanged, pickRecipeSavePath, pickRecipeYaml } from '@/lib/ipc';
 import { recipeNeedsAttention } from '@/lib/recipes';
 import type {
-  ExtensionDefault,
   ParameterInputType,
   ParameterRequirement,
   Recipe,
@@ -34,7 +33,6 @@ export function Recipes() {
   const [saving, setSaving] = useState(false);
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [choosingTemplate, setChoosingTemplate] = useState(false);
-  const [extensionDefaults, setExtensionDefaults] = useState<ExtensionDefault[]>([]);
   const [customExt, setCustomExt] = useState({ name: '', command: '', args: '', envKeys: '' });
   const [importWarnings, setImportWarnings] = useState<string[]>([]);
 
@@ -48,10 +46,6 @@ export function Recipes() {
 
   useEffect(() => {
     void load();
-    void ipc
-      .listDefaultExtensions()
-      .then(setExtensionDefaults)
-      .catch(() => {});
     const un = onRecipesChanged(() => void load());
     return () => void un.then((fn) => fn());
   }, []);
@@ -170,28 +164,6 @@ export function Recipes() {
     }));
   const removeParameter = (i: number) =>
     setForm((f) => ({ ...f, parameters: f.parameters.filter((_, idx) => idx !== i) }));
-
-  const isDefaultExtensionOn = (e: ExtensionDefault) =>
-    form.extensions.some(
-      (ext) => (ext.type === 'builtin' || ext.type === 'platform') && ext.name === e.id
-    );
-  const toggleDefaultExtension = (e: ExtensionDefault, on: boolean) =>
-    setForm((f) => ({
-      ...f,
-      extensions: on
-        ? [
-            ...f.extensions,
-            {
-              type: e.type === 'platform' ? 'platform' : 'builtin',
-              name: e.id,
-              args: [],
-              env_keys: [],
-            },
-          ]
-        : f.extensions.filter(
-            (ext) => !((ext.type === 'builtin' || ext.type === 'platform') && ext.name === e.id)
-          ),
-    }));
 
   const addCustomExtension = () => {
     if (!customExt.name.trim() || !customExt.command.trim()) return;
@@ -514,21 +486,6 @@ export function Recipes() {
 
               <div className="field">
                 <span>Extensions</span>
-                <div className="ext-grid">
-                  {extensionDefaults.map((e) => (
-                    <label className="ext-card" key={e.id}>
-                      <div className="ext-card-head">
-                        <span className="ext-card-name">{e.display_name ?? e.id}</span>
-                        <input
-                          type="checkbox"
-                          checked={isDefaultExtensionOn(e)}
-                          disabled={editingBuiltin}
-                          onChange={(ev) => toggleDefaultExtension(e, ev.target.checked)}
-                        />
-                      </div>
-                    </label>
-                  ))}
-                </div>
                 {form.extensions.filter((e) => e.type === 'stdio').length > 0 && (
                   <div className="ext-list">
                     {form.extensions.map((e, i) =>
@@ -616,8 +573,8 @@ export function Recipes() {
                   stops it automatically — a hard limit, not just the usual loop-detection
                   suggestion (which is skipped for recipe turns, since some recipes — like the
                   debate moderator — legitimately produce long, structurally-repetitive output).
-                  Goose doesn't expose a per-model maximum to read here, so this defaults to a
-                  conservative {DEFAULT_MAX_REASONING_TOKENS}.
+                  There's no per-model maximum to read here, so this defaults to a conservative{' '}
+                  {DEFAULT_MAX_REASONING_TOKENS}.
                 </small>
               </div>
             </div>

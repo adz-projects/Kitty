@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { ipc } from '@/lib/ipc';
 import { useStackStore } from '@/stores/stackStore';
 
-/** Setup & Repair: restart stack components; the full first-run wizard is Phase 7. */
+/** Setup & Repair: restart stack components. */
 export function SetupRepair() {
   const status = useStackStore((s) => s.status);
   const init = useStackStore((s) => s.init);
@@ -27,8 +27,8 @@ export function SetupRepair() {
         Stack status: <strong>{status.replace(/_/g, ' ')}</strong>
       </p>
       <div className="row">
-        <button onClick={() => void act('Restarting Goose', () => ipc.restartGoosed())}>
-          Restart Goose
+        <button onClick={() => void act('Restarting Kitty engine', () => ipc.restartBackend())}>
+          Restart Kitty engine
         </button>
         <button onClick={() => void act('Restarting Ollama', () => ipc.restartOllama())}>
           Restart Ollama

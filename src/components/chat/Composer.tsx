@@ -6,7 +6,9 @@ import type { Recipe } from '@/lib/types';
 import { usePopoverPosition } from '@/lib/usePopoverPosition';
 import { useRecipeAutocomplete } from '@/lib/useRecipeAutocomplete';
 import { UploadIcon } from '@/components/icons/UploadIcon';
+import { CameraIcon } from '@/components/icons/CameraIcon';
 import { WarningIcon } from '@/components/icons/WarningIcon';
+import { supportsImages } from '@/lib/vision_models';
 
 // Pastes larger than this (chat-only mode) collapse into a document attachment.
 const PASTE_THRESHOLD = 500;
@@ -49,6 +51,8 @@ export function Composer({
   const chatOnly = useChatStore(isChatMode);
   const addPastedText = useChatStore((s) => s.addPastedText);
   const addDroppedPaths = useChatStore((s) => s.addDroppedPaths);
+  const addPendingImage = useChatStore((s) => s.addPendingImage);
+  const model = useChatStore((s) => s.model);
   const sendWithRecipe = useChatStore((s) => s.sendWithRecipe);
   const stopPhase = useChatStore((s) => s.stopPhase);
   const forceStop = useChatStore((s) => s.forceStop);
@@ -140,6 +144,28 @@ export function Composer({
     if (paths.length) await addDroppedPaths(paths);
   };
 
+  // Screenshot region capture (Feature 3): opens a full-desktop selection
+  // overlay and, once the user drags a region, attaches the resulting crop
+  // through the exact same pending-image pipeline a clipboard-pasted image
+  // already uses (`addPendingImage`) — no separate attachment type needed.
+  // Checked against the active model *before* opening the capture UI (not
+  // just relying on `addPendingImage`'s own gate) so a doomed capture never
+  // shows the full-screen overlay in the first place.
+  const captureScreenshot = async () => {
+    if (!supportsImages(model)) {
+      useChatStore.setState({
+        warning: "The active model doesn't support images — screenshot not attached.",
+      });
+      return;
+    }
+    try {
+      const { mime, data_url } = await ipc.captureScreenshotRegion();
+      addPendingImage(mime, data_url);
+    } catch {
+      // Cancelled (Escape) — nothing to surface, same as declining a file picker.
+    }
+  };
+
   return (
     <div className="composer">
       {recipeMatch && !open && (
@@ -156,6 +182,15 @@ export function Composer({
         disabled={concluded}
       >
         <UploadIcon />
+      </button>
+      <button
+        className="composer-attach"
+        onClick={() => void captureScreenshot()}
+        title="Capture a screenshot region"
+        aria-label="Capture a screenshot region"
+        disabled={concluded}
+      >
+        <CameraIcon />
       </button>
       <textarea
         disabled={concluded}
@@ -242,12 +277,12 @@ export function Composer({
           <button
             className="force-stop"
             onClick={forceStop}
-            title="Force stop — reset now (Goose may still be finishing in the background)"
+            title="Force stop — reset now (Kitty may still be finishing in the background)"
           >
             Force stop
           </button>
         ) : stopPhase === 'stopping' ? (
-          <button disabled title="Waiting for Goose to stop…">
+          <button disabled title="Waiting for Kitty to stop…">
             Stopping…
           </button>
         ) : (

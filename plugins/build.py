@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Freezes every internal plugin to a standalone Windows .exe via PyInstaller
-and drops the result into src-tauri/binaries/ with Tauri's externalBin
-target-triple naming convention, so `tauri build` bundles them automatically.
+"""Freezes every internal plugin (and the BigTiny daemon) to a standalone
+Windows .exe via PyInstaller and drops the result into src-tauri/binaries/
+with Tauri's externalBin target-triple naming convention, so `tauri build`
+bundles them automatically.
 
 Usage:
-    python plugins/build.py            # build every plugin
-    python plugins/build.py <name>...  # build only the named plugin(s)
+    python plugins/build.py            # build every target
+    python plugins/build.py <name>...  # build only the named target(s)
 
-Requires PyInstaller (`pip install pyinstaller`) and each plugin's own
+Requires PyInstaller (`pip install pyinstaller`) and each target's own
 dependencies — this script installs those for you via `pip install -e .`
 before freezing, so run it with the Python environment you want the freeze
 to use (a dedicated venv is recommended, not your system Python).
@@ -29,11 +30,47 @@ PLUGINS_DIR = Path(__file__).resolve().parent
 REPO_ROOT = PLUGINS_DIR.parent
 BINARIES_DIR = REPO_ROOT / "src-tauri" / "binaries"
 
-# name: (spec file, frozen exe name — must match pyproject.toml's console script
-# name, since that's also what the Rust side's launch-command override expects).
-PLUGINS = {
-    "adaptive-pathway": ("adaptive_pathway.spec", "adaptive-pathway-sidecar"),
-    "replacement-mcp": ("replacement_mcp.spec", "replacement-mcp"),
+# name -> { dir, spec, exe, extras }. `exe` must match pyproject.toml's
+# console script name, since that's also what the Rust side's
+# launch-command override expects. `extras` are optional-dependency-group
+# names installed alongside the base package (`pip install -e ".[extra1,extra2]"`).
+PLUGINS: dict[str, dict[str, object]] = {
+    "adaptive-pathway": {
+        "dir": PLUGINS_DIR / "adaptive-pathway",
+        "spec": "adaptive_pathway.spec",
+        "exe": "adaptive-pathway-sidecar",
+        "extras": ["sidecar"],
+    },
+    "adaptive-pathway-mcp": {
+        "dir": PLUGINS_DIR / "adaptive-pathway",
+        "spec": "adaptive_pathway_mcp.spec",
+        "exe": "adaptive-pathway-mcp",
+        "extras": ["mcp"],
+    },
+    "replacement-mcp": {
+        "dir": PLUGINS_DIR / "replacement-mcp",
+        "spec": "replacement_mcp.spec",
+        "exe": "replacement-mcp",
+        "extras": [],
+    },
+    "brave-mcp-search": {
+        "dir": PLUGINS_DIR / "brave-mcp-search",
+        "spec": "brave_mcp_search.spec",
+        "exe": "brave-mcp-search",
+        "extras": [],
+    },
+    "wasm-math-mcp": {
+        "dir": PLUGINS_DIR / "wasm-math-mcp",
+        "spec": "wasm_math_mcp.spec",
+        "exe": "wasm-math-mcp",
+        "extras": [],
+    },
+    "bigtiny": {
+        "dir": PLUGINS_DIR / "bigtiny",
+        "spec": "bigtiny_daemon.spec",
+        "exe": "bigtiny-daemon",
+        "extras": [],
+    },
 }
 
 
@@ -45,8 +82,13 @@ def run(cmd: list[str], cwd: Path) -> None:
 def build_plugin(name: str) -> None:
     if name not in PLUGINS:
         raise SystemExit(f"unknown plugin: {name} (known: {', '.join(PLUGINS)})")
-    spec_file, exe_name = PLUGINS[name]
-    plugin_dir = PLUGINS_DIR / name
+    cfg = PLUGINS[name]
+    plugin_dir: Path = cfg["dir"]  # type: ignore[assignment]
+    spec_file: str = cfg["spec"]  # type: ignore[assignment]
+    exe_name: str = cfg["exe"]  # type: ignore[assignment]
+    extras: list[str] = cfg["extras"]  # type: ignore[assignment]
+    if not plugin_dir.exists():
+        raise SystemExit(f"{plugin_dir} not found")
     if not (plugin_dir / spec_file).exists():
         raise SystemExit(f"{plugin_dir / spec_file} not found")
 
@@ -55,7 +97,8 @@ def build_plugin(name: str) -> None:
     # environment is running this script, so PyInstaller's import analysis
     # can see them. `-e` keeps this reusable during local dev without a
     # reinstall on every source edit.
-    run([sys.executable, "-m", "pip", "install", "-e", "."], cwd=plugin_dir)
+    target = f".[{','.join(extras)}]" if extras else "."
+    run([sys.executable, "-m", "pip", "install", "-e", target], cwd=plugin_dir)
     run([sys.executable, "-m", "pip", "install", "pyinstaller"], cwd=plugin_dir)
 
     run(

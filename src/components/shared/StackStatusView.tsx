@@ -1,7 +1,6 @@
 // Renders the machine-readable stack status as UI (CLAUDE.md rule 6: errors are
-// states, not toasts). Degraded states show a panel with a "Fix this" button;
-// the Goose Desktop conflict shows a non-blocking banner. `ok`/`starting` render
-// nothing. Shared by the overlay and full window.
+// states, not toasts). Degraded states show a panel with a "Fix this" button.
+// `ok`/`starting` render nothing. Shared by the overlay and full window.
 
 import { useState } from 'react';
 import { ipc } from '@/lib/ipc';
@@ -12,7 +11,7 @@ interface Copy {
   title: string;
   body: string;
   severity: 'warn' | 'bad';
-  canRestartGoosed?: boolean;
+  canRestartBackend?: boolean;
 }
 
 const COPY: Partial<Record<StackStatus, Copy>> = {
@@ -21,11 +20,11 @@ const COPY: Partial<Record<StackStatus, Copy>> = {
     body: 'The local model server is down. Open settings to start or configure Ollama.',
     severity: 'bad',
   },
-  goosed_down: {
-    title: 'Goose isn’t running',
-    body: 'The Goose agent server stopped. Restart it, or open settings to repair the setup.',
+  backend_down: {
+    title: 'Kitty’s engine isn’t running',
+    body: 'The chat engine stopped. Restart it, or open settings to repair the setup.',
     severity: 'bad',
-    canRestartGoosed: true,
+    canRestartBackend: true,
   },
   no_model: {
     title: 'No model installed',
@@ -43,18 +42,6 @@ export function StackStatusView({ status }: { status: StackStatus }) {
   const [busy, setBusy] = useState(false);
 
   if (status === 'ok' || status === 'starting') return null;
-
-  if (status === 'conflict_goose_desktop') {
-    return (
-      <div className="conflict-banner" role="status">
-        <span className="status-dot warn" />
-        <span>
-          Stock <strong>Goose Desktop</strong> is running. Two clients sharing the same Goose
-          config/sessions can behave unpredictably.
-        </span>
-      </div>
-    );
-  }
 
   const copy = COPY[status];
   if (!copy) return null;
@@ -80,13 +67,13 @@ export function StackStatusView({ status }: { status: StackStatus }) {
         <button className="primary" onClick={() => ipc.openSettings(section)}>
           Fix this
         </button>
-        {copy.canRestartGoosed && (
+        {copy.canRestartBackend && (
           <button
             disabled={busy}
             onClick={async () => {
               setBusy(true);
               try {
-                await ipc.restartGoosed();
+                await ipc.restartBackend();
                 // Reconnect + rebuild the active session (resume by id).
                 await useChatStore.getState().reloadCurrent();
               } finally {
@@ -94,7 +81,7 @@ export function StackStatusView({ status }: { status: StackStatus }) {
               }
             }}
           >
-            {busy ? 'Restarting…' : 'Restart Goose'}
+            {busy ? 'Restarting…' : 'Restart Kitty engine'}
           </button>
         )}
       </div>

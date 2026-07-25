@@ -3,7 +3,7 @@ import { ipc, onSettingsNavigate } from '@/lib/ipc';
 import { General } from '@/components/settings/General';
 import { Providers } from '@/components/settings/Providers';
 import { OllamaModels } from '@/components/settings/OllamaModels';
-import { Extensions } from '@/components/settings/Extensions';
+import { McpServers } from '@/components/settings/McpServers';
 import { NotificationsSection } from '@/components/settings/NotificationsSection';
 import { Appearance } from '@/components/settings/Appearance';
 import { Advanced } from '@/components/settings/Advanced';
@@ -18,7 +18,7 @@ const SECTION_LABELS: Record<string, string> = {
   general: 'General',
   providers: 'Providers',
   ollama: 'Ollama Models',
-  extensions: 'Extensions',
+  mcp_servers: 'MCP Servers',
   scheduled_tasks: 'Scheduled Tasks',
   recipes: 'Recipes',
   adaptive_pathway: 'Adaptive Pathway',
@@ -51,7 +51,7 @@ function buildGroups(
         'notifications',
       ],
     },
-    { label: 'Automation & extensions', sections: ['extensions', 'scheduled_tasks', 'recipes'] },
+    { label: 'Automation & extensions', sections: ['mcp_servers', 'scheduled_tasks', 'recipes'] },
     {
       label: 'Advanced',
       sections: [
@@ -119,7 +119,7 @@ export function App() {
         {section === 'general' && <General />}
         {section === 'providers' && <Providers highlight={highlight} />}
         {section === 'ollama' && ollamaEnabled && <OllamaModels />}
-        {section === 'extensions' && <Extensions />}
+        {section === 'mcp_servers' && <McpServers />}
         {section === 'scheduled_tasks' && <ScheduledTasks />}
         {section === 'recipes' && <Recipes />}
         {section === 'adaptive_pathway' && <AdaptivePathway />}

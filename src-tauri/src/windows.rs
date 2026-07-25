@@ -34,10 +34,19 @@ pub const OVERLAY: &str = "overlay";
 pub const MAIN: &str = "main";
 pub const SETTINGS: &str = "settings";
 pub const WIZARD: &str = "wizard";
+pub const SCREENSHOT_SELECT: &str = "screenshot-select";
 
 fn url(label: &str) -> WebviewUrl {
     // Path is identical in dev (vite server) and prod (dist) — see vite.config.ts.
-    WebviewUrl::App(format!("src/windows/{label}/index.html").into())
+    // A dynamically-allocated `chat-N` label (Feature 5 — multiple simultaneous
+    // chat windows) has no directory of its own; every chat window is
+    // functionally identical (full chat UI + session list + artifacts pane),
+    // so it reuses the `main` bundle instead.
+    let dir = match label {
+        OVERLAY | MAIN | SETTINGS | WIZARD | SCREENSHOT_SELECT => label,
+        _ => MAIN,
+    };
+    WebviewUrl::App(format!("src/windows/{dir}/index.html").into())
 }
 
 /// Build the overlay up front, hidden. Called once from `setup`. Positioned once
@@ -178,6 +187,109 @@ pub fn toggle_overlay(app: &AppHandle) -> tauri::Result<()> {
     }
 }
 
+/// Find the label of whichever open window is currently bound to
+/// `session_id` (`AppState.chat_windows` — kept up to date by the frontend's
+/// `bind_window_session` call whenever a window establishes or switches its
+/// active session). Used to target a notification click (and the
+/// visibility check that gates firing one at all) at the *specific* window
+/// a session lives in, instead of a fixed singleton — see
+/// `notifications.rs`.
+pub fn window_label_for_session(app: &AppHandle, session_id: &str) -> Option<String> {
+    let state = app.state::<AppState>();
+    let map = state.chat_windows.lock().unwrap();
+    map.iter()
+        .find(|(_, sid)| sid.as_deref() == Some(session_id))
+        .map(|(label, _)| label.clone())
+}
+
+/// Any currently open chat-capable window (overlay/main/a `chat-N`), for the
+/// notification-click fallback when the target session isn't bound to any
+/// specific window (`window_label_for_session` returned `None` — the window
+/// that had it moved on to a different session in the meantime). Prefers a
+/// focused window, then any merely-visible one. Deliberately does NOT treat
+/// the overlay's mere *existence* as "open" — it's created hidden at startup
+/// and lives forever (rule 1), so `app.get_webview_window(OVERLAY).is_some()`
+/// is true even when the user has never summoned it this session.
+fn any_open_chat_window(app: &AppHandle) -> Option<String> {
+    let mut candidates: Vec<String> = vec![OVERLAY.to_string(), MAIN.to_string()];
+    {
+        let state = app.state::<AppState>();
+        let map = state.chat_windows.lock().unwrap();
+        let mut labels: Vec<String> = map.keys().cloned().collect();
+        labels.sort();
+        candidates.extend(labels);
+    }
+    let is_focused = |label: &str| {
+        app.get_webview_window(label)
+            .and_then(|w| w.is_focused().ok())
+            .unwrap_or(false)
+    };
+    let is_visible = |label: &str| {
+        app.get_webview_window(label)
+            .and_then(|w| w.is_visible().ok())
+            .unwrap_or(false)
+    };
+    if let Some(l) = candidates.iter().find(|l| is_focused(l)) {
+        return Some(l.clone());
+    }
+    candidates.into_iter().find(|l| is_visible(l))
+}
+
+/// Notification-click fallback for a session no longer bound to any specific
+/// window: rather than opening a generic blank window (the confirmed bug —
+/// switching to a different chat in the same window, then clicking the
+/// completion toast for the one just switched away from, popped a brand-new
+/// blank window instead of returning to it), reload the session into
+/// whichever chat-capable window is already open, or a fresh one if none is.
+/// Reuses the exact same `chat://adopt-session` -> `adoptSession()` ->
+/// `loadSession()` path Expand's handoff already uses, so this gets a full,
+/// correct replay rather than a half-populated snapshot.
+pub async fn focus_or_open_session(app: &AppHandle, session_id: &str) {
+    let cwd = crate::bigtiny::sessions::list(app)
+        .await
+        .ok()
+        .and_then(|rows| {
+            rows.into_iter()
+                .find(|r| r.get("sessionId").and_then(|v| v.as_str()) == Some(session_id))
+        })
+        .and_then(|r| r.get("cwd").and_then(|v| v.as_str()).map(str::to_string))
+        .unwrap_or_default();
+
+    let payload = json!({
+        "session_id": session_id,
+        "cwd": cwd,
+        "current_mode": "auto",
+        "available_modes": [],
+        "thinking_effort": serde_json::Value::Null,
+    });
+
+    if let Some(label) = any_open_chat_window(app) {
+        let _ = app.emit_to(&label, "chat://adopt-session", payload);
+        show_and_focus(app, &label);
+    } else {
+        let _ = open_new_chat_window(app, Some(payload));
+    }
+}
+
+/// Show + focus an already-open window by label, animating the overlay in
+/// if that's the target (matching its usual summon behavior rather than a
+/// plain, unanimated show) — generalizes `open_main`'s show+focus to any
+/// window label, including a dynamically-allocated `chat-N` one. Returns
+/// `false` if no window with that label is currently open (caller decides
+/// the fallback).
+pub fn show_and_focus(app: &AppHandle, label: &str) -> bool {
+    let Some(win) = app.get_webview_window(label) else {
+        return false;
+    };
+    if label == OVERLAY {
+        animate_overlay_in(&win);
+    } else {
+        let _ = win.show();
+        let _ = win.set_focus();
+    }
+    true
+}
+
 /// The tray-click / hotkey action (Round-3 item 28): the overlay and main
 /// window are never both active at once — if main is already open, focus it
 /// instead of also summoning the overlay; otherwise fall through to the usual
@@ -218,6 +330,94 @@ pub fn open_main(app: &AppHandle) -> tauri::Result<()> {
     let win = ensure_window(app, MAIN, "Kitty", (1196.0, 720.0))?;
     win.show()?;
     win.set_focus()?;
+    Ok(())
+}
+
+/// Open a brand-new chat window under a freshly-allocated label (Feature 5 —
+/// multiple simultaneous chat windows, each on a different conversation).
+/// Unlike `open_main`, this is only ever called with a label the caller just
+/// allocated and has never used before, so `ensure_window`'s get-or-create
+/// always takes its "create" branch here — there is no reuse-by-label case
+/// to consider. Registers a cleanup hook so `AppState.chat_windows`/
+/// `pending_handoffs` don't leak an entry once the window closes
+/// (bookkeeping only — the underlying BigTiny session is untouched and
+/// remains resumable from history).
+fn build_chat_window(app: &AppHandle, label: &str) -> tauri::Result<WebviewWindow> {
+    let win = ensure_window(app, label, "Kitty", (1196.0, 720.0))?;
+    win.show()?;
+    win.set_focus()?;
+
+    let cleanup_app = app.clone();
+    let cleanup_label = label.to_string();
+    win.on_window_event(move |event| {
+        if matches!(event, tauri::WindowEvent::Destroyed) {
+            let state = cleanup_app.state::<AppState>();
+            state.chat_windows.lock().unwrap().remove(&cleanup_label);
+            state.pending_handoffs.lock().unwrap().remove(&cleanup_label);
+        }
+    });
+
+    Ok(win)
+}
+
+/// Create (or reuse, if somehow still around from an aborted prior capture)
+/// the screenshot region-selection window, sized and positioned via
+/// *physical* pixels to exactly cover the full virtual-desktop rect
+/// (`screenshot::virtual_screen_rect`) — spanning every monitor regardless
+/// of per-monitor DPI, so the selection window's own fractional click
+/// coordinates (its CSS-pixel width/height against the window's real
+/// on-screen extent) translate back to physical screen coordinates without
+/// needing any `devicePixelRatio` arithmetic on the frontend side. Hidden
+/// until the caller has stashed the preview in `AppState.screenshot_preview`
+/// (avoids a blank-then-populated flash).
+pub fn create_screenshot_select_window(
+    app: &AppHandle,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) -> tauri::Result<WebviewWindow> {
+    if let Some(win) = app.get_webview_window(SCREENSHOT_SELECT) {
+        let _ = win.close();
+    }
+    let win = WebviewWindowBuilder::new(app, SCREENSHOT_SELECT, url(SCREENSHOT_SELECT))
+        .title("Kitty — Select a region")
+        .decorations(false)
+        .transparent(true)
+        .always_on_top(true)
+        .skip_taskbar(true)
+        .visible(false)
+        .build()?;
+    win.set_position(tauri::PhysicalPosition::new(x, y))?;
+    win.set_size(tauri::PhysicalSize::new(width.max(1) as u32, height.max(1) as u32))?;
+    Ok(win)
+}
+
+/// Allocate a fresh label and open a brand-new chat window — always creates,
+/// never reuses an existing window (unlike `open_main`/`toggle_or_focus_main`).
+/// `handoff`, if given, is a session snapshot (the shape the overlay's Expand
+/// hands over) stashed under the new window's own label for its one-time
+/// mount-time read via `get_pending_handoff`. Plain sync function so it can
+/// be called both from the async `commands::open_new_chat_window` Tauri
+/// command (IPC from the frontend) and directly from the tray's sync
+/// menu-event handler (already on the main thread, same as `open_main`'s own
+/// direct-call pattern there) without needing two separate implementations.
+pub fn open_new_chat_window(
+    app: &AppHandle,
+    handoff: Option<serde_json::Value>,
+) -> tauri::Result<()> {
+    let label = {
+        let state = app.state::<AppState>();
+        let mut counter = state.next_chat_window_id.lock().unwrap();
+        *counter += 1;
+        let label = format!("chat-{}", *counter);
+        state.chat_windows.lock().unwrap().insert(label.clone(), None);
+        if let Some(payload) = handoff {
+            state.pending_handoffs.lock().unwrap().insert(label.clone(), payload);
+        }
+        label
+    };
+    build_chat_window(app, &label)?;
     Ok(())
 }
 

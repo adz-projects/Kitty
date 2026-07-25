@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { ipc, onActiveSession } from '@/lib/ipc';
+import { ipc } from '@/lib/ipc';
 import { useStackStore } from '@/stores/stackStore';
 import { useAdaptivePathwayStore } from '@/stores/adaptivePathwayStore';
 import { useChatStore } from '@/stores/chatStore';
@@ -12,7 +12,7 @@ import { SettingsGearIcon } from '@/components/icons/SettingsGearIcon';
 import { SchismResolutionModal } from '@/components/chat/SchismResolutionModal';
 import type { StackStatus } from '@/lib/types';
 
-const DEGRADED: StackStatus[] = ['ollama_down', 'goosed_down', 'no_model', 'provider_unreachable'];
+const DEGRADED: StackStatus[] = ['ollama_down', 'backend_down', 'no_model', 'provider_unreachable'];
 
 /** Full window: history sidebar + shared chat surface + artifacts pane. On open
     it adopts the session handed over from the overlay (Expand). */
@@ -28,20 +28,16 @@ export function App() {
   useEffect(() => {
     void init();
     void initAdaptivePathway();
+    // This window's own one-time handoff, if Expand created it with one
+    // (Feature 5: every Expand opens a brand-new window now, so there is no
+    // "already open, re-adopt a later handoff" case to also subscribe to —
+    // a fresh window only ever needs this single mount-time read).
     void (async () => {
-      const info = await ipc.getActiveSession();
-      // A blank session id is a "start clean" marker (e.g. provider switch that
-      // jettisons context) — not something to adopt.
+      const info = await ipc.getPendingHandoff();
       if (info?.session_id) await useChatStore.getState().adoptSession(info);
     })();
-    // A later Expand hands off a *new* session while this window is already open
-    // — re-adopt it (the mount-time getActiveSession above only runs once).
-    const un = onActiveSession((info) => {
-      if (info.session_id) void useChatStore.getState().adoptSession(info);
-    });
     // Show/hide-artifacts is persisted (Round-3 item 6).
     void ipc.getConfig().then((c) => setShowArtifacts(c.show_artifacts));
-    return () => void un.then((fn) => fn());
   }, [init, initAdaptivePathway]);
 
   const toggleArtifacts = async () => {
@@ -76,7 +72,6 @@ export function App() {
             </button>
           </div>
         </header>
-        {status === 'conflict_goose_desktop' && <StackStatusView status={status} />}
         <div className="main-body">
           {degraded ? <StackStatusView status={status} /> : <ChatView />}
         </div>

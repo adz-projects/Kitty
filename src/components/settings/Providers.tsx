@@ -198,12 +198,6 @@ export function Providers({ highlight }: { highlight: string | null }) {
           </div>
         ))}
       </div>
-      {providers.some((p) => p.active) && (
-        <button className="link" onClick={() => void ipc.activateProvider(null).then(refresh)}>
-          Deactivate (use Goose default config)
-        </button>
-      )}
-
       {editing && (
         <ProviderForm
           profile={editing}

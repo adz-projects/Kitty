@@ -15,9 +15,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-goose = ["mcp[cli]>=1.2.0"]
+mcp = ["mcp[cli]>=1.2.0"]
 sidecar = ["fastapi>=0.100", "uvicorn>=0.23"]
-full = ["adaptive-pathway[goose,sidecar]", "onnxruntime>=1.15", "hdbscan>=0.8", "bertopic>=0.15"]
+full = ["adaptive-pathway[mcp,sidecar]", "onnxruntime>=1.15", "hdbscan>=0.8", "bertopic>=0.15"]
 all = ["adaptive-pathway[full]"]
 dev = ["pytest>=7.0", "pytest-asyncio>=0.21"]
 

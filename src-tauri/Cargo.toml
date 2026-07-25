@@ -1,13 +1,13 @@
 [package]
-name = "goose-overlay"
+name = "kitty"
 version = "0.1.0"
-description = "Hotkey-summoned floating overlay chat client for the Goose agent"
+description = "Hotkey-summoned floating overlay chat client backed by BigTiny"
 authors = ["Adam Zolkover"]
 edition = "2021"
 rust-version = "1.77"
 
 [lib]
-name = "goose_overlay_lib"
+name = "kitty_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
@@ -27,9 +27,8 @@ tauri-plugin-clipboard-manager = "2"
 image = { version = "0.25", default-features = false, features = ["png"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# Reads/writes goose's own config.yaml (Round-7 Feature 4 — extension
-# defaults, shared with Goose Desktop and any other local goose usage) and
-# recipe .yaml import/export (Goose recipes feature). `serde_yaml` itself is
+# Recipe .yaml import/export (client-side recipe templates, portable to the
+# standalone Goose CLI's `goose run --recipe`). `serde_yaml` itself is
 # deprecated/archived upstream; `serde_norway` is a direct, actively-released,
 # API-identical continuation (same Value/Mapping/from_str/to_string surface).
 serde_norway = "0.9"
@@ -41,22 +40,24 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 sysinfo = "0.32"
 dirs = "5"
 rand = "0.8"
-tokio-tungstenite = "0.24"
 futures-util = "0.3"
 keyring = { version = "3", features = ["windows-native"] }
 winreg = "0.52"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 base64 = "0.22"
 semver = "1"
-# Extracts the Goose CLI zip archive during the wizard's one-click install
-# (Goose publishes no Windows installer, only a plain zip — see wizard.rs).
-zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
     "Win32_System_LibraryLoader",
+    # Screenshot region capture (Feature 3): BitBlt/GetDIBits desktop-DC
+    # capture — a small, well-understood API surface, so this stays a direct
+    # Win32 call like the rest of this crate's usage rather than pulling in a
+    # dedicated screen-capture crate (Kitty is Windows-only, so a
+    # cross-platform crate's abstraction buys nothing here).
+    "Win32_Graphics_Gdi",
 ] }
 # Same version tauri-plugin-notification vendors transitively. Used directly
 # (Round-3 item 27) because the plugin's own show() discards the toast

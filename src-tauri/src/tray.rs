@@ -14,6 +14,17 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
     // Opens the full chat window directly — no overlay involved at all (owner
     // ask: a way to reach the chat window without summoning the overlay first).
     let open_main = MenuItem::with_id(app, "open_main", "Open Chat Window", true, None::<&str>)?;
+    // Always creates a brand-new chat window with its own fresh session
+    // (Feature 5), unlike "Open Chat Window" above which reuses the one
+    // classic singleton window — left as-is on purpose (see `windows.rs`'s
+    // `open_new_chat_window` doc comment).
+    let new_chat_window = MenuItem::with_id(
+        app,
+        "new_chat_window",
+        "New Chat Window",
+        true,
+        None::<&str>,
+    )?;
     let new_session = MenuItem::with_id(app, "new_session", "New Session", true, None::<&str>)?;
     let ask_clipboard = MenuItem::with_id(
         app,
@@ -37,6 +48,7 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
         &[
             &toggle,
             &open_main,
+            &new_chat_window,
             &new_session,
             &ask_clipboard,
             &scheduled_tasks,
@@ -57,6 +69,9 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
             }
             "open_main" => {
                 let _ = windows::open_main(app);
+            }
+            "new_chat_window" => {
+                let _ = windows::open_new_chat_window(app, None);
             }
             "new_session" => {
                 let _ = windows::show_overlay(app);
