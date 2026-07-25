@@ -494,7 +494,10 @@ All fields are optional. Returns `{ "status": "updated" }`.
 
 ## Database
 
-The daemon uses a local SQLite database at `~/.bigtiny/bigtiny.db` (in-memory for tests).
+The daemon uses a local SQLite database at `~/.bigtiny/bigtiny.db` (in-memory for
+tests) by default. Set `BIGTINY_DATA_DIR` to relocate the whole data root (db,
+directory-sandbox cache dir, recipes) elsewhere — Kitty sets this to
+`%APPDATA%/Kitty/bigtiny/` when it spawns the daemon (`bigtiny/paths.py`).
 
 ### Tables
 

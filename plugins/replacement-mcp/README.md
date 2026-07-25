@@ -50,7 +50,7 @@ All declared via PEP 723 inline script header:
 - `fastmcp` — MCP server framework
 - `httpx` — HTTP client for scraping
 - `trafilatura` — HTML-to-Markdown extraction
-- `duckduckgo-search` — Web search fallback
+- `ddgs` — Web search fallback (successor to the renamed `duckduckgo-search`)
 - `openpyxl` — Excel read/write
 - `python-docx` — Word document read/write
 - `pypdf` — PDF text extraction

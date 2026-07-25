@@ -59,8 +59,11 @@ standalone Windows `.exe`s via PyInstaller and bundled through Tauri's
   involvement is keeping the registration's command path pointed at the
   current install's bundled exe and its `enabled` flag in sync with Settings
   (`bigtiny::mcp::ensure_builtin_servers`, `commands/mcp_servers.rs`).
-  Context-optimized shell/file/web/document tools — off by default, toggled
-  in Settings → MCP Servers.
+  Context-optimized shell/file/web/document tools — **on by default** (they're
+  what makes the small local models Kitty targets usable as agents at all),
+  toggled in Settings → MCP Servers. Installs predating that default are
+  flipped on once by `config::migrate_replacement_mcp_enabled`, which then
+  respects any later opt-out.
 
 Both of the above (and the BigTiny daemon itself) are frozen via
 `python plugins/build.py`; see `docs/PLUGINS.md` for the two Rust-side

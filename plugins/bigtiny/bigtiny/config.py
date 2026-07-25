@@ -43,6 +43,10 @@ class HITLConfig(BaseModel):
 
 
 class RecipesConfig(BaseModel):
+    # Currently unused — `RecipeEngine` is constructed with no explicit
+    # `recipes_dir` (`server/app.py`'s `lifespan()`), so its own default
+    # (`bigtiny.paths.data_dir()/recipes`) applies instead of this field.
+    # Kept in sync with that default for whenever this does get wired in.
     directory: str = "~/.bigtiny/recipes"
 
 

@@ -13,6 +13,7 @@ export function General() {
   const [recordingClipboard, setRecordingClipboard] = useState(false);
   const [recordingOpenWindow, setRecordingOpenWindow] = useState(false);
   const [autostart, setAutostart] = useState(false);
+  const [autostartError, setAutostartError] = useState<string | null>(null);
   const [confirmClear, setConfirmClear] = useState(false);
   const [sessionCount, setSessionCount] = useState<number | null>(null);
   const [clearing, setClearing] = useState(false);
@@ -197,13 +198,29 @@ export function General() {
         <input
           type="checkbox"
           checked={autostart}
-          onChange={async (e) => {
-            await ipc.setAutostart(e.target.checked);
-            setAutostart(e.target.checked);
+          onChange={(e) => {
+            // Read `checked` *before* awaiting, not after — confirmed real
+            // bug: this is a controlled input, so React restores the DOM
+            // checkbox to match `checked={autostart}` (still false) as soon
+            // as the handler yields. Reading `e.target.checked` after the
+            // IPC round-trip therefore read back the restored `false` and
+            // set state to it, so the registry key was written correctly but
+            // the checkbox snapped straight back to off — indistinguishable
+            // from "the toggle doesn't work", and a second click then wrote
+            // `false` and really did undo it.
+            const next = e.target.checked;
+            void ipc
+              .setAutostart(next)
+              .then(() => {
+                setAutostart(next);
+                setAutostartError(null);
+              })
+              .catch((err) => setAutostartError(String(err)));
           }}
         />
         <span>Start Kitty when I sign in</span>
       </label>
+      {autostartError && <div className="chat-error">{autostartError}</div>}
 
       <p className="muted">
         Approval mode is per session — change it from the shield badge next to the composer.

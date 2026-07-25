@@ -9,6 +9,7 @@ from uuid import uuid4
 import yaml
 from jinja2 import Environment, FileSystemLoader
 
+from bigtiny import paths
 from bigtiny.agent.loop import Agent
 from bigtiny.mcp.manager import MCPManager
 from bigtiny.models.mcp_server import ToolDefinition
@@ -23,10 +24,17 @@ async def _noop_callback(event: SSEEvent) -> None:
 
 
 class RecipeEngine:
-    def __init__(self, db: Database, agent: Agent, mcp: MCPManager, recipes_dir: str = "~/.bigtiny/recipes"):
+    def __init__(
+        self,
+        db: Database,
+        agent: Agent,
+        mcp: MCPManager,
+        recipes_dir: str | None = None,
+    ):
         self.db = db
         self.agent = agent
         self.mcp = mcp
+        recipes_dir = recipes_dir if recipes_dir is not None else str(Path(paths.data_dir()) / "recipes")
         self._recipes_dir = recipes_dir
         expanded = str(Path(recipes_dir).expanduser())
         self.jinja = Environment(

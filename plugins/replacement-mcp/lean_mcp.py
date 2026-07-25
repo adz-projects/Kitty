@@ -3,7 +3,7 @@
 #   "fastmcp",
 #   "httpx",
 #   "trafilatura",
-#   "duckduckgo-search",
+#   "ddgs",
 #   "openpyxl",
 #   "python-docx",
 #   "pypdf",
@@ -358,8 +358,16 @@ def analyze_workspace(
 # ===========================================================================
 @mcp.tool(name="lean_fallback_web_search", description=PROMPTS["fallback_web_search"]["description"])
 def fallback_web_search(query: str) -> str:
+    # `ddgs`, not `duckduckgo_search` — the latter was renamed and its final
+    # releases are non-functional against DuckDuckGo's current backend:
+    # confirmed real bug, every query returned zero results (surfacing as a
+    # bare "No results found for: <query>" no matter what was asked) and the
+    # occasional query that did return something got an unrelated
+    # multi-language ad page rather than search results. The import is kept
+    # lazy, and the call signature and result keys (title/href/body) are
+    # identical, so only the module name changes here.
     try:
-        from duckduckgo_search import DDGS
+        from ddgs import DDGS
         results = list(DDGS().text(query, max_results=4))
     except Exception as e:
         return error("SEARCH_FAILED", "DuckDuckGo query failed", str(e),

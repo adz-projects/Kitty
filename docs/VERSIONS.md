@@ -198,10 +198,12 @@ historical context only; none of it reflects current code.
 
 ## Starter models (Phase 7 `src/lib/starter_models.ts`)
 
-- **Curated ≤4B list:** `llama3.2:1b` (~1.3GB), `llama3.2:3b` (~2GB),
-  `qwen2.5:3b` (~1.9GB), `gemma2:2b` (~1.6GB). **Re-verify these tags exist on
-  ollama.com before release** — the dev environment is future-dated (Ollama
-  0.31.1, models `gemma4`/`qwen3.5`), so newer small tags may be preferable.
+- **Curated VRAM-tiered list** (re-verified on ollama.com, replacing the
+  earlier ≤4B `llama3.2`/`qwen2.5`/`gemma2` set now that `gemma4`/`qwen3.5`
+  are current): `gemma4:e2b` (7.2GB — 4-8GB VRAM), `qwen3.5:4b` (3.4GB — 8GB
+  VRAM), `gemma4:e4b` (9.6GB — 8GB VRAM), `qwen3.5:9b` (6.6GB — 16GB VRAM).
+  Re-verify tags/sizes again before release if enough time has passed for the
+  lineup to have moved again.
 
 ## Reasoning-capable models (Phase 10 `src/lib/reasoning_models.ts`)
 
@@ -227,8 +229,14 @@ historical context only; none of it reflects current code.
   binary since Kitty doesn't surface the clustering/topic features that need
   them; revisit if that changes.
 - **replacement-mcp** (`plugins/replacement-mcp/`): freezes `lean_mcp.py`'s
-  `main()` — deps: fastmcp, httpx, trafilatura, duckduckgo-search, openpyxl,
+  `main()` — deps: fastmcp, httpx, trafilatura, ddgs, openpyxl,
   python-docx, pypdf, pyyaml (see `plugins/replacement-mcp/pyproject.toml`).
+  The search dep is **`ddgs` (>=9.0), not `duckduckgo-search`** — the latter
+  was renamed, and its last releases (8.x) return zero results for every
+  query against DuckDuckGo's current backend, which surfaced in chat as
+  `lean_fallback_web_search` reporting "No results found" no matter what was
+  asked. Verified working on ddgs 9.11.3; the API (`DDGS().text(query,
+  max_results=…)` → `title`/`href`/`body`) is unchanged from 8.x.
 - Both freeze to `src-tauri/binaries/<name>-x86_64-pc-windows-msvc.exe` and
   are declared in `src-tauri/tauri.conf.json`'s `bundle.externalBin`. The
   committed files at that path are **empty placeholders** (satisfy Tauri's

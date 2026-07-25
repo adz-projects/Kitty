@@ -22,11 +22,12 @@ use crate::util::{capture_output, hidden_command};
 /// `adaptive_pathway_proc`'s identical safety check).
 const DAEMON_PROCESS_NAME_FRAGMENT: &str = "bigtiny-daemon";
 
-/// Kitty-owned, config-independent base dir — unlike the sidecar's pidfile
-/// (which sits next to its configurable db path), BigTiny has no
-/// Kitty-configured data directory to anchor to.
+/// BigTiny's own consolidated data root (`%APPDATA%/Kitty/bigtiny/` — see
+/// `config::bigtiny_data_dir`), the same directory `spawn` points
+/// `BIGTINY_DATA_DIR` at — mirrors the sidecar's pidfile living next to its
+/// own configurable db path, now that BigTiny has an equivalent anchor.
 fn default_pidfile_dir() -> Option<PathBuf> {
-    Some(dirs::data_local_dir()?.join("Kitty"))
+    crate::config::bigtiny_data_dir().ok()
 }
 
 fn pidfile_path(dir: &Path) -> PathBuf {
@@ -123,6 +124,14 @@ pub async fn spawn(
         .env("BIGTINY_SECRET", &secret)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // Consolidates BigTiny's db/cache-sandbox-root/recipes under
+    // %APPDATA%/Kitty/bigtiny/ instead of its own standalone `~/.bigtiny`
+    // default — see `bigtiny/paths.py::data_dir()`. Best-effort: if this
+    // can't be resolved for some reason, BigTiny just falls back to its own
+    // standalone default rather than failing to spawn at all.
+    if let Ok(data_dir) = crate::config::bigtiny_data_dir() {
+        cmd.env("BIGTINY_DATA_DIR", &data_dir);
+    }
     if let Some(dir) = dir {
         cmd.current_dir(dir);
     }

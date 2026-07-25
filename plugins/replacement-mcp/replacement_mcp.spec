@@ -24,11 +24,14 @@ a = Analysis(
     # `import fastmcp` with PackageNotFoundError before serving a single
     # request — and goosed just reports the extension as unavailable.
     + copy_metadata("fastmcp"),
-    # fastmcp/trafilatura/duckduckgo-search occasionally need their vendored
-    # submodules named explicitly for PyInstaller's static analysis. If the
-    # frozen exe fails at startup with a ModuleNotFoundError, add it here.
+    # fastmcp/trafilatura/ddgs occasionally need their vendored submodules
+    # named explicitly for PyInstaller's static analysis. If the frozen exe
+    # fails at startup with a ModuleNotFoundError, add it here. `ddgs` in
+    # particular is imported lazily inside `fallback_web_search`, so a missed
+    # import wouldn't surface until the first search rather than at startup.
     hiddenimports=[
         "fastmcp",
+        "ddgs",
     ],
     hookspath=[],
     runtime_hooks=[],

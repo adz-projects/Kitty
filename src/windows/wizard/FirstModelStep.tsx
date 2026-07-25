@@ -2,6 +2,8 @@ import { useEffect, useState } from 'react';
 import { ipc, onPullProgress } from '@/lib/ipc';
 import type { PullProgress } from '@/lib/types';
 import { STARTER_MODELS } from '@/lib/starter_models';
+import { DEFAULT_URL } from '@/lib/provider_defaults';
+import { ErrorDetail } from '@/components/shared/ErrorDetail';
 
 export function FirstModelStep({
   onBack,
@@ -15,6 +17,8 @@ export function FirstModelStep({
   const [selected, setSelected] = useState(STARTER_MODELS[0].tag);
   const [progress, setProgress] = useState<PullProgress | null>(null);
   const [installed, setInstalled] = useState<string[]>([]);
+  const [connecting, setConnecting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     void ipc.ollamaListModels().then((m) => setInstalled(m.map((x) => x.name)));
@@ -25,6 +29,46 @@ export function FirstModelStep({
     });
     return () => void un.then((fn) => fn());
   }, []);
+
+  // Unlike the API-key path (`ApiKeyStep.tsx`), pulling a model alone doesn't
+  // give Kitty anything to chat with — confirmed real bug: the wizard let you
+  // pick and download a model, then landed on "no provider configured" the
+  // first time you opened a chat, since nothing here ever created/activated
+  // an Ollama provider profile pointing at it. Reuses/updates an existing
+  // Ollama profile if one's already there (re-running the wizard via
+  // Settings → Setup & Repair) instead of accumulating duplicates.
+  const useModel = async () => {
+    setConnecting(true);
+    setError(null);
+    try {
+      const providers = await ipc.listProviders();
+      const existing = providers.find((p) => p.provider_type === 'ollama');
+      const profile = existing
+        ? { ...existing, models: [selected] }
+        : {
+            id: '',
+            name: 'Ollama',
+            provider_type: 'ollama' as const,
+            base_url: DEFAULT_URL.ollama,
+            models: [selected],
+            is_trusted: true,
+            temperature: null,
+            top_p: null,
+            context_length: null,
+            strip_reasoning: false,
+            system_prompt: null,
+            prompt_idle_timeout_secs: null,
+            created_at: '',
+          };
+      const saved = await ipc.upsertProvider(profile, null);
+      await ipc.activateProvider(saved.id);
+      onNext();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setConnecting(false);
+    }
+  };
 
   const have = installed.includes(selected);
   const pct =
@@ -100,14 +144,16 @@ export function FirstModelStep({
         </div>
       )}
 
+      {error && <ErrorDetail summary="Couldn't set that model up as a provider." raw={error} />}
+
       <div className="wizard-actions">
         <button onClick={onBack}>Back</button>
         <button className="link" onClick={onSkip}>
           Skip for now
         </button>
         {have ? (
-          <button className="primary" onClick={onNext}>
-            Use this model →
+          <button className="primary" disabled={connecting} onClick={() => void useModel()}>
+            {connecting ? 'Connecting…' : 'Use this model →'}
           </button>
         ) : (
           <button className="primary" onClick={() => void ipc.ollamaPullModel(selected)}>

@@ -13,7 +13,13 @@ use crate::lifecycle::ollama_proc;
 use crate::util::hidden_command;
 
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
-const RUN_VALUE: &str = "GooseOverlay";
+const RUN_VALUE: &str = "Kitty";
+/// Pre-rename value name. Windows shows the value name verbatim in Task
+/// Manager → Startup and in Settings → Apps → Startup, so an install that
+/// enabled autostart before the Goose Overlay → Kitty rename lists itself
+/// under the old product's name. Read as a fallback and cleaned up on the
+/// next write (see `autostart_enabled`/`set_autostart`).
+const OLD_RUN_VALUE: &str = "GooseOverlay";
 
 /// Official installer download URLs (Windows). Verify on version bumps.
 const OLLAMA_INSTALLER_URL: &str = "https://ollama.com/download/OllamaSetup.exe";
@@ -170,17 +176,28 @@ async fn install_ollama() -> Result<(), String> {
 
 // --- Autostart (HKCU Run key) ---
 
+/// True if either the current or the pre-rename value is present, so an
+/// install that enabled autostart before the rename still reads as enabled
+/// instead of silently appearing off (and then getting a duplicate entry
+/// written under the new name).
 pub fn autostart_enabled() -> bool {
-    RegKey::predef(HKEY_CURRENT_USER)
-        .open_subkey_with_flags(RUN_KEY, KEY_READ)
-        .and_then(|k| k.get_value::<String, _>(RUN_VALUE))
-        .is_ok()
+    let Ok(key) = RegKey::predef(HKEY_CURRENT_USER).open_subkey_with_flags(RUN_KEY, KEY_READ)
+    else {
+        return false;
+    };
+    key.get_value::<String, _>(RUN_VALUE).is_ok()
+        || key.get_value::<String, _>(OLD_RUN_VALUE).is_ok()
 }
 
+/// Writes (or clears) the HKCU Run entry. Always removes the pre-rename
+/// value too, so enabling migrates an old entry rather than leaving both
+/// listed in Task Manager → Startup, and disabling can't leave a stale one
+/// behind that keeps launching the app.
 pub fn set_autostart(enabled: bool) -> Result<(), String> {
     let (key, _) = RegKey::predef(HKEY_CURRENT_USER)
         .create_subkey_with_flags(RUN_KEY, KEY_READ | KEY_WRITE)
         .map_err(|e| e.to_string())?;
+    let _ = key.delete_value(OLD_RUN_VALUE);
     if enabled {
         let exe: PathBuf = std::env::current_exe().map_err(|e| e.to_string())?;
         key.set_value(RUN_VALUE, &format!("\"{}\"", exe.display()))

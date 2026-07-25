@@ -28,10 +28,15 @@ control how the daemon is spawned:
 
 - **Lifecycle** (`lifecycle/bigtiny_proc.rs`): free port + random secret per
   launch, passed as `BIGTINY_SECRET`; every request sends it back as
-  `X-API-Key`. Readiness and the 5s health loop probe `GET /api/health`
+  `X-API-Key`. Also passes `BIGTINY_DATA_DIR` (`config::bigtiny_data_dir()`)
+  pointing at `%APPDATA%/Kitty/bigtiny/` — consolidates BigTiny's own db,
+  directory-sandbox cache dir, and recipes dir there instead of its
+  standalone `~/.bigtiny` default (see `bigtiny/paths.py`); a one-time
+  migration moves an existing `~/.bigtiny` over the first time this runs
+  post-upgrade. Readiness and the 5s health loop probe `GET /api/health`
   (open without auth by design). A pidfile-based stale-orphan kill (mirrors
-  `adaptive_pathway_proc`) handles the daemon getting orphaned across a
-  `tauri dev` hot-restart.
+  `adaptive_pathway_proc`, now anchored to the same consolidated dir) handles
+  the daemon getting orphaned across a `tauri dev` hot-restart.
 - **Sessions** (`bigtiny/sessions.rs`): create/list/load/fork/delete over
   REST. `list` translates BigTiny rows into a `sessionId`/`title`/`cwd`/
   `updatedAt` shape the frontend's `parseSession` reads; `load` replays

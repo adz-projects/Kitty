@@ -468,9 +468,15 @@ function BraveMcpSearchCard() {
     }
   };
 
-  // "Configured" (a key is stored) drives the checkbox, not the raw
-  // `enabled` intent flag — the two can only disagree in the instant right
-  // after a disable, and `configured` is what's actually true right now.
+  // The server is only really on when both halves agree: the intent flag
+  // (app config) and a key actually being present (Windows Credential
+  // Manager). They live in different stores, so they *can* drift apart —
+  // confirmed real bug: archiving/resetting config.json left `enabled:
+  // false` next to a surviving credential, and the old `!configured` gate
+  // on the key form meant that state rendered an unchecked checkbox with no
+  // form and no way back on. The form is now gated on `!isOn`, so any
+  // not-fully-on state (including either half of a drift) is recoverable by
+  // just entering a key, which rewrites both halves in one step.
   const isOn = enabled && configured;
 
   return (
@@ -485,7 +491,7 @@ function BraveMcpSearchCard() {
             onChange={(ev) => {
               if (!ev.target.checked) void disable();
               // Checking it does nothing by itself — the API key form below
-              // (shown whenever !configured) is what actually turns it on.
+              // (shown whenever !isOn) is what actually turns it on.
             }}
           />
         </div>
@@ -493,7 +499,13 @@ function BraveMcpSearchCard() {
           Brave Search LLM Context API. Requires an API key — turning this off always clears the
           stored key, so turning it back on requires entering it again.
         </span>
-        {!configured && (
+        {!isOn && configured && (
+          <span className="muted ext-card-desc">
+            A saved key was found but the server is switched off. Enter a key to turn it back
+            on — this replaces the saved one.
+          </span>
+        )}
+        {!isOn && (
           <div className="row" style={{ marginTop: 8 }}>
             <input
               type="password"

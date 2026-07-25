@@ -35,14 +35,15 @@ than blocking legitimate shell use with no realistic sandboxing story.
 from __future__ import annotations
 
 import re
-from pathlib import Path
 from typing import Any
 
-# BigTiny's own app-data directory (DB, logs, recipes — same base
-# `storage.Database`'s default `db_path`/`RecipesConfig.directory` already
-# use) — always allowed regardless of mode, so internal housekeeping tools
-# never trip the sandbox.
-CACHE_DIR = str(Path("~/.bigtiny").expanduser())
+from bigtiny import paths
+
+# BigTiny's own app-data directory (DB, logs, recipes — same root
+# `storage.Database`'s default `db_path` and `recipes/engine.py`'s default
+# `recipes_dir` resolve via `bigtiny.paths.data_dir()`) — always allowed
+# regardless of mode, so internal housekeeping tools never trip the sandbox.
+CACHE_DIR = paths.data_dir()
 
 
 def _norm(path: str) -> str:

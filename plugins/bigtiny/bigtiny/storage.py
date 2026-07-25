@@ -6,6 +6,8 @@ from typing import Any
 
 import aiosqlite
 
+from bigtiny import paths
+
 
 MIGRATION_V001 = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -164,8 +166,9 @@ MIGRATIONS: dict[int, str] = {
 
 
 class Database:
-    def __init__(self, db_path: str = "~/.bigtiny/bigtiny.db"):
-        self.db_path = str(Path(db_path).expanduser())
+    def __init__(self, db_path: str | None = None):
+        resolved = db_path if db_path is not None else str(Path(paths.data_dir()) / "bigtiny.db")
+        self.db_path = str(Path(resolved).expanduser())
         self._conn: aiosqlite.Connection | None = None
 
     async def connect(self) -> None:

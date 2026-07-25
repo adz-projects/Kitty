@@ -27,6 +27,16 @@
       "binaries/brave-mcp-search",
       "binaries/wasm-math-mcp",
       "binaries/bigtiny-daemon"
-    ]
+    ],
+    "windows": {
+      "webviewInstallMode": {
+        "type": "embedBootstrapper",
+        "silent": true
+      },
+      "nsis": {
+        "installMode": "currentUser",
+        "installerHooks": "nsis-hooks.nsh"
+      }
+    }
   }
 }

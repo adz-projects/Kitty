@@ -22,10 +22,15 @@ Artifacts:
 
 ## Signing (placeholder)
 
-Code signing is **not yet configured**. Before public distribution, obtain an
-Authenticode certificate and set Tauri's `bundle.windows.certificateThumbprint`
-(or `signCommand`) so the exe + NSIS installer are signed; otherwise SmartScreen
-warns on first run.
+Code signing is **not yet configured** (a deliberate choice for now, not an
+oversight). Before public distribution, obtain an Authenticode certificate and
+set Tauri's `bundle.windows.certificateThumbprint` (or `signCommand`) so the
+exe + NSIS installer are signed; otherwise SmartScreen warns on first run.
+
+Until then, expect: installing or first-running the unsigned `...-setup.exe`
+(or the installed `kitty.exe` itself) shows Windows SmartScreen's "Windows
+protected your PC" warning. Users click **More info** → **Run anyway** to
+proceed — this is expected, not a build failure.
 
 ## Version bump
 

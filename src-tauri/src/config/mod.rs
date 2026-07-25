@@ -122,13 +122,23 @@ pub struct Config {
     pub adaptive_pathway_embedding_model: String,
     /// Whether the bundled `replacement-mcp` server (see
     /// `plugins/replacement-mcp/`) is registered+enabled as a BigTiny MCP
-    /// server. Off by default — unlike Adaptive Pathway, this one is a
-    /// wholesale alternative tool set, so it's opt-in rather than assumed.
-    /// Kitty never spawns/monitors this process itself; BigTiny does, like
-    /// any other MCP server — this flag only drives whether
-    /// `bigtiny::mcp::ensure_builtin_servers`'s registration is enabled.
-    #[serde(default)]
+    /// server. **On** by default: its context-optimized shell/file/web/document
+    /// tools are what makes the small local models Kitty targets usable at all,
+    /// so shipping it off meant a default install had no working tool set until
+    /// the user found this toggle. Kitty never spawns/monitors this process
+    /// itself; BigTiny does, like any other MCP server — this flag only drives
+    /// whether `bigtiny::mcp::ensure_builtin_servers`'s registration is enabled.
+    #[serde(default = "default_true")]
     pub replacement_mcp_enabled: bool,
+    /// One-shot marker for the `replacement_mcp_enabled` default flip above.
+    /// The field is always serialized, so an install predating the flip has a
+    /// literal `false` on disk that `#[serde(default)]` can never reach —
+    /// indistinguishable from a deliberate opt-out. This marker resolves that:
+    /// `migrate_replacement_mcp_enabled` force-enables exactly once per
+    /// install, sets this, and never touches the flag again, so a user who
+    /// turns it back off afterwards stays off.
+    #[serde(default)]
+    pub replacement_mcp_default_migrated: bool,
     /// Whether the bundled `wasm-math-mcp` server (see
     /// `plugins/wasm-math-mcp/`) is registered+enabled as a BigTiny MCP
     /// server. On by default — sandboxed Python/NumPy execution is safe and
@@ -221,7 +231,9 @@ impl Default for Config {
             adaptive_pathway_db_path: default_ap_db_path(),
             adaptive_pathway_port: default_ap_port(),
             adaptive_pathway_embedding_model: default_ap_embedding_model(),
-            replacement_mcp_enabled: false,
+            replacement_mcp_enabled: default_true(),
+            // A brand-new config needs no flip, so it starts already-migrated.
+            replacement_mcp_default_migrated: true,
             wasm_math_mcp_enabled: default_true(),
             brave_mcp_search_enabled: false,
             scheduled_tasks: Vec::new(),
@@ -294,12 +306,32 @@ pub(crate) fn bundled_plugin_path(name: &str) -> Option<String> {
 /// BigTiny) are separate processes that can each have a different working
 /// directory, so a relative path risks each one silently resolving to a
 /// *different* file even when configured "the same." An absolute path
-/// removes that ambiguity.
+/// removes that ambiguity. Consolidated under `%APPDATA%/Kitty/` rather than
+/// this field's pre-consolidation `%LOCALAPPDATA%/adaptive-pathway/` location
+/// (`old_default_ap_db_path`, which `migrate_ap_db_path` below migrates an
+/// existing install's db file away from).
 fn default_ap_db_path() -> String {
+    config_dir()
+        .map(|d| d.join("adaptive-pathway").join("pathway.db"))
+        .unwrap_or_else(|_| old_default_ap_db_path_buf())
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+/// The pre-consolidation default — kept only so `migrate_ap_db_path` can
+/// recognize a config that still has it and move the db file over; also
+/// `default_ap_db_path`'s own fallback if `%APPDATA%` can't be resolved for
+/// some reason (best-effort, never panics, matching this function's own
+/// prior fallback-to-relative-ish behavior).
+fn old_default_ap_db_path_buf() -> PathBuf {
     dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("adaptive-pathway")
         .join("pathway.db")
+}
+
+fn old_default_ap_db_path() -> String {
+    old_default_ap_db_path_buf()
         .to_string_lossy()
         .replace('\\', "/")
 }
@@ -348,13 +380,34 @@ pub enum ConfigError {
 /// has no `config.json` yet but the pre-rename `%APPDATA%/goose-overlay/`
 /// does, move the whole directory (bringing `config.json` and `themes/`
 /// along) rather than leaving the user's settings stranded under the old name.
-fn config_dir() -> Result<PathBuf, ConfigError> {
+pub(crate) fn config_dir() -> Result<PathBuf, ConfigError> {
     let base = dirs::config_dir().ok_or(ConfigError::NoConfigDir)?;
     let dir = base.join("Kitty");
     if !dir.join("config.json").exists() {
         let old_dir = base.join("goose-overlay");
         if old_dir.exists() {
-            migrate_config_dir(&old_dir, &dir);
+            migrate_dir(&old_dir, &dir);
+        }
+    }
+    fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// BigTiny's own data root (its SQLite db, the directory-sandbox's
+/// always-allowed cache dir, and its recipes dir — see `bigtiny/paths.py`'s
+/// `data_dir()`) — consolidated under `%APPDATA%/Kitty/bigtiny/` rather than
+/// BigTiny's own standalone-dev default of `~/.bigtiny`, which Kitty
+/// overrides by setting `BIGTINY_DATA_DIR` when spawning it
+/// (`lifecycle::bigtiny_proc::spawn`). One-time migration: if the new dir has
+/// no `bigtiny.db` yet but `~/.bigtiny` does, move the whole directory over.
+pub fn bigtiny_data_dir() -> Result<PathBuf, ConfigError> {
+    let dir = config_dir()?.join("bigtiny");
+    if !dir.join("bigtiny.db").exists() {
+        if let Some(home) = dirs::home_dir() {
+            let old_dir = home.join(".bigtiny");
+            if old_dir.exists() {
+                migrate_dir(&old_dir, &dir);
+            }
         }
     }
     fs::create_dir_all(&dir)?;
@@ -365,21 +418,23 @@ fn config_dir() -> Result<PathBuf, ConfigError> {
 /// atomic; if that fails (cross-volume, or `new` already exists as some
 /// stray empty dir), fall back to a recursive copy-then-remove so the old
 /// files are still present in the new location and nothing is silently lost.
-fn migrate_config_dir(old: &Path, new: &Path) {
+/// Shared by every "consolidate a scattered data dir under %APPDATA%/Kitty/"
+/// migration (config dir, BigTiny's data root, ...).
+fn migrate_dir(old: &Path, new: &Path) {
     if fs::rename(old, new).is_ok() {
-        tracing::info!("migrated config dir {} -> {}", old.display(), new.display());
+        tracing::info!("migrated data dir {} -> {}", old.display(), new.display());
         return;
     }
     if copy_dir_recursive(old, new).is_ok() {
         let _ = fs::remove_dir_all(old);
         tracing::info!(
-            "migrated config dir {} -> {} (copy fallback)",
+            "migrated data dir {} -> {} (copy fallback)",
             old.display(),
             new.display()
         );
     } else {
         tracing::warn!(
-            "could not migrate config dir {} -> {}",
+            "could not migrate data dir {} -> {}",
             old.display(),
             new.display()
         );
@@ -418,8 +473,10 @@ pub fn load() -> Result<Config, ConfigError> {
     match fs::read_to_string(&path) {
         Ok(text) => {
             let config: Config = serde_json::from_str(&text)?;
-            Ok(migrate_bigtiny_launch_command(migrate_ap_launch_command(
-                migrate_recipes(migrate_hotkeys(config, &text)),
+            Ok(migrate_replacement_mcp_enabled(migrate_ap_db_path(
+                migrate_bigtiny_launch_command(migrate_ap_launch_command(migrate_recipes(
+                    migrate_hotkeys(config, &text),
+                ))),
             )))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
@@ -445,19 +502,43 @@ fn migrate_recipes(mut config: Config) -> Config {
     config
 }
 
+/// True for a configured launch command that looks like a filesystem path
+/// (contains a path separator, so it's a specific resolved location, not a
+/// bare PATH-resolved command name like `python`/`uv`) which is either
+/// missing entirely or present-but-empty. A zero-byte file matters because
+/// that's exactly what a committed `externalBin` placeholder looks like
+/// (`src-tauri/binaries/README.md`) — a `cargo build`/`check` re-copies
+/// whatever's in `src-tauri/binaries/` into `target/debug/`, so resetting
+/// those placeholders (e.g. right before a commit) silently zeroes out a
+/// previously-working absolute dev path the config still points at. Deliberate
+/// PATH-based overrides (`uv`, `python`, no separator) are never touched here —
+/// only a specific resolved path can go stale like this.
+fn command_path_is_stale(command: &str) -> bool {
+    if !(command.contains('/') || command.contains('\\')) {
+        return false;
+    }
+    match fs::metadata(command) {
+        Ok(meta) => meta.len() == 0,
+        Err(_) => true,
+    }
+}
+
 /// Self-heals an existing install's `adaptive_pathway_launch_command` onto
 /// the bundled sidecar path, mirroring the AP env-var self-heal already done
 /// in `lifecycle::start_stack`. `#[serde(default = "default_ap_launch_command")]`
 /// only ever runs when the field is *absent* from the loaded JSON — a config
 /// saved before the bundled-path resolution existed already has the old bare
 /// literal `"adaptive-pathway-sidecar"` stored explicitly, so that improved
-/// default never gets a chance to apply on its own. Only migrates the exact
-/// literal the old default used to produce — a value the user (or a prior
-/// dev-mode override) deliberately set to anything else, e.g. `uv run ...`,
-/// is left untouched.
+/// default never gets a chance to apply on its own. Also self-heals a
+/// previously-resolved absolute path that's since gone missing or been
+/// reset to an empty placeholder (`command_path_is_stale`) — a value the
+/// user (or a prior dev-mode override) deliberately set to a bare PATH
+/// command, e.g. `uv run ...`, is left untouched either way.
 fn migrate_ap_launch_command(mut config: Config) -> Config {
     const OLD_BARE_DEFAULT: &str = "adaptive-pathway-sidecar";
-    if config.adaptive_pathway_launch_command == OLD_BARE_DEFAULT {
+    let stale = config.adaptive_pathway_launch_command == OLD_BARE_DEFAULT
+        || command_path_is_stale(&config.adaptive_pathway_launch_command);
+    if stale {
         if let Some(bundled) = bundled_plugin_path("adaptive-pathway-sidecar.exe") {
             config.adaptive_pathway_launch_command = bundled;
         }
@@ -467,14 +548,16 @@ fn migrate_ap_launch_command(mut config: Config) -> Config {
 
 /// Self-heals an existing install's `bigtiny_command`/`bigtiny_args` from the
 /// pre-bundling dev default (`python -m bigtiny`) onto the bundled exe, once
-/// one is present — same rationale as `migrate_ap_launch_command`. Only
-/// migrates the exact pair the old default used to produce; a deliberate
-/// override (e.g. `uv run bigtiny`, or a source checkout via `bigtiny_dir`)
-/// is left untouched.
+/// one is present — same rationale as `migrate_ap_launch_command`, including
+/// the same stale-absolute-path self-heal (`command_path_is_stale`). A
+/// deliberate override (e.g. `uv run bigtiny`, or a source checkout via
+/// `bigtiny_dir`) is left untouched.
 fn migrate_bigtiny_launch_command(mut config: Config) -> Config {
     const OLD_COMMAND: &str = "python";
     let old_args = ["-m".to_string(), "bigtiny".to_string()];
-    if config.bigtiny_command == OLD_COMMAND && config.bigtiny_args == old_args {
+    let stale = (config.bigtiny_command == OLD_COMMAND && config.bigtiny_args == old_args)
+        || command_path_is_stale(&config.bigtiny_command);
+    if stale {
         if let Some(bundled) = bundled_plugin_path("bigtiny-daemon.exe") {
             config.bigtiny_command = bundled;
             config.bigtiny_args = Vec::new();
@@ -483,8 +566,60 @@ fn migrate_bigtiny_launch_command(mut config: Config) -> Config {
     config
 }
 
+/// Self-heals an existing install's `adaptive_pathway_db_path` off its
+/// pre-consolidation location (`%LOCALAPPDATA%/adaptive-pathway/pathway.db`)
+/// onto the new one under `%APPDATA%/Kitty/adaptive-pathway/` — physically
+/// moves the db file if one is sitting at the old location and nothing's at
+/// the new one yet, same rename-then-copy-fallback as `migrate_dir`, then
+/// repoints the config field. Only migrates the exact literal the old
+/// default used to produce; a deliberate override (or an install that
+/// already has the new default) is left untouched. Thin wrapper around
+/// `migrate_ap_db_path_impl` so the real move logic is unit-testable against
+/// fake temp-dir paths instead of this machine's real
+/// `%LOCALAPPDATA%/adaptive-pathway/pathway.db` (which may hold real data).
+fn migrate_ap_db_path(config: Config) -> Config {
+    migrate_ap_db_path_impl(config, &old_default_ap_db_path(), &default_ap_db_path())
+}
+
+fn migrate_ap_db_path_impl(mut config: Config, old_default: &str, new_default: &str) -> Config {
+    if config.adaptive_pathway_db_path != old_default {
+        return config;
+    }
+    let old = PathBuf::from(old_default);
+    let new = PathBuf::from(new_default);
+    if old.exists() && !new.exists() {
+        if let Some(parent) = new.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if fs::rename(&old, &new).is_err() && fs::copy(&old, &new).is_ok() {
+            let _ = fs::remove_file(&old);
+        }
+    }
+    config.adaptive_pathway_db_path = new_default.to_string();
+    config
+}
+
 /// Seed `hotkeys` from the legacy singular `hotkey` field when a pre-Round-2
 /// config is loaded (Round-2 item 3). No-op once `hotkeys` is populated.
+/// One-time flip of `replacement_mcp_enabled` to its new `true` default for
+/// installs created while it defaulted to `false`. Because the field is always
+/// serialized, serde's default never applies to an existing config — the stored
+/// `false` would otherwise stick forever, leaving upgraded installs with no
+/// usable tool set. Guarded by `replacement_mcp_default_migrated` so this runs
+/// exactly once: a user who deliberately turns the server off after the flip
+/// keeps it off across every later launch.
+///
+/// Note this only mutates the in-memory config; it's persisted by the next
+/// `save`, and re-applied harmlessly on every launch until then (the flag it
+/// sets is itself part of what gets saved).
+fn migrate_replacement_mcp_enabled(mut config: Config) -> Config {
+    if !config.replacement_mcp_default_migrated {
+        config.replacement_mcp_enabled = true;
+        config.replacement_mcp_default_migrated = true;
+    }
+    config
+}
+
 fn migrate_hotkeys(mut config: Config, raw: &str) -> Config {
     if config.hotkeys.is_empty() {
         let legacy = serde_json::from_str::<serde_json::Value>(raw)
@@ -529,7 +664,7 @@ mod tests {
     }
 
     #[test]
-    fn migrate_config_dir_moves_files_via_rename() {
+    fn migrate_dir_moves_files_via_rename() {
         let old = temp_dir("rename-old");
         let new = temp_dir("rename-new");
         fs::create_dir_all(&old).unwrap();
@@ -537,7 +672,7 @@ mod tests {
         fs::create_dir_all(old.join("themes")).unwrap();
         fs::write(old.join("themes").join("dark.css"), "body{}").unwrap();
 
-        migrate_config_dir(&old, &new);
+        migrate_dir(&old, &new);
 
         assert!(!old.exists());
         assert!(new.join("config.json").exists());
@@ -707,6 +842,158 @@ mod tests {
     }
 
     #[test]
+    fn command_path_is_stale_true_for_missing_absolute_path() {
+        assert!(command_path_is_stale(
+            "C:/nonexistent/definitely/not/here/bigtiny-daemon.exe"
+        ));
+    }
+
+    #[test]
+    fn command_path_is_stale_true_for_empty_file() {
+        // Exactly what a committed externalBin placeholder looks like
+        // (src-tauri/binaries/README.md) — a real bug this session hit:
+        // resetting placeholders + `cargo check` zeroed out a previously
+        // real `target/debug/bigtiny-daemon.exe` a live config still pointed
+        // at, silently breaking BigTiny startup.
+        let dir = std::env::temp_dir().join(format!("kitty-stale-test-{}", uuid_like()));
+        fs::create_dir_all(&dir).unwrap();
+        let empty = dir.join("bigtiny-daemon.exe");
+        fs::write(&empty, []).unwrap();
+        assert!(command_path_is_stale(empty.to_str().unwrap()));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn command_path_is_stale_false_for_a_real_nonempty_file() {
+        let dir = std::env::temp_dir().join(format!("kitty-stale-test-{}", uuid_like()));
+        fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("bigtiny-daemon.exe");
+        fs::write(&real, b"not actually a PE, just non-empty").unwrap();
+        assert!(!command_path_is_stale(real.to_str().unwrap()));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn command_path_is_stale_false_for_bare_path_command_names() {
+        // No path separator -> a PATH-resolved command (`python`, `uv`), never
+        // treated as a stale resolved path even though it "doesn't exist" as
+        // a literal file in the current directory.
+        assert!(!command_path_is_stale("python"));
+        assert!(!command_path_is_stale("uv"));
+    }
+
+    #[test]
+    fn migrate_bigtiny_launch_command_without_a_bundled_sibling_leaves_stale_path_as_is() {
+        // `bundled_plugin_path` resolves next to the *test binary*, which has
+        // no `bigtiny-daemon.exe` sibling, so even a detected-as-stale path
+        // is left in place rather than cleared to nothing — matches the
+        // realistic dev-build case (no frozen binary present yet). The
+        // real-world healing path (a bundled sibling IS present) is covered
+        // by `bundled_plugin_path`'s own existence check plus
+        // `command_path_is_stale`'s tests above; faking `current_exe()`
+        // itself isn't practical from a unit test.
+        let dir = std::env::temp_dir().join(format!("kitty-stale-test-{}", uuid_like()));
+        fs::create_dir_all(&dir).unwrap();
+        let stale_daemon = dir.join("bigtiny-daemon.exe");
+        fs::write(&stale_daemon, []).unwrap(); // zero-byte, like a reset placeholder
+
+        let cfg = Config {
+            bigtiny_command: stale_daemon.to_str().unwrap().to_string(),
+            bigtiny_args: vec!["--some-flag".to_string()],
+            ..Config::default()
+        };
+        let migrated = migrate_bigtiny_launch_command(cfg);
+        assert_eq!(migrated.bigtiny_command, stale_daemon.to_str().unwrap());
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn migrate_ap_db_path_leaves_custom_override_untouched() {
+        let cfg = Config {
+            adaptive_pathway_db_path: "D:/somewhere/custom/pathway.db".to_string(),
+            ..Config::default()
+        };
+        let migrated = migrate_ap_db_path(cfg);
+        assert_eq!(
+            migrated.adaptive_pathway_db_path,
+            "D:/somewhere/custom/pathway.db"
+        );
+    }
+
+    #[test]
+    fn migrate_ap_db_path_impl_moves_the_file_when_old_exists_and_new_does_not() {
+        let dir = std::env::temp_dir().join(format!("kitty-ap-db-test-{}", uuid_like()));
+        let old = dir.join("old").join("pathway.db");
+        let new = dir.join("new").join("pathway.db");
+        fs::create_dir_all(old.parent().unwrap()).unwrap();
+        fs::write(&old, b"real learned data").unwrap();
+
+        let cfg = Config {
+            adaptive_pathway_db_path: old.to_str().unwrap().to_string(),
+            ..Config::default()
+        };
+        let migrated =
+            migrate_ap_db_path_impl(cfg, old.to_str().unwrap(), new.to_str().unwrap());
+
+        assert_eq!(migrated.adaptive_pathway_db_path, new.to_str().unwrap());
+        assert!(!old.exists());
+        assert_eq!(fs::read(&new).unwrap(), b"real learned data");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn migrate_ap_db_path_impl_repoints_even_when_no_old_file_exists() {
+        // Fresh install / already-migrated case: nothing to move, but the
+        // config field should still land on the new default rather than
+        // staying pinned to the recognized old literal.
+        let dir = std::env::temp_dir().join(format!("kitty-ap-db-test-{}", uuid_like()));
+        let old = dir.join("old").join("pathway.db");
+        let new = dir.join("new").join("pathway.db");
+
+        let cfg = Config {
+            adaptive_pathway_db_path: old.to_str().unwrap().to_string(),
+            ..Config::default()
+        };
+        let migrated =
+            migrate_ap_db_path_impl(cfg, old.to_str().unwrap(), new.to_str().unwrap());
+
+        assert_eq!(migrated.adaptive_pathway_db_path, new.to_str().unwrap());
+        assert!(!new.exists());
+    }
+
+    #[test]
+    fn migrate_ap_db_path_impl_never_overwrites_an_existing_new_file() {
+        let dir = std::env::temp_dir().join(format!("kitty-ap-db-test-{}", uuid_like()));
+        let old = dir.join("old").join("pathway.db");
+        let new = dir.join("new").join("pathway.db");
+        fs::create_dir_all(old.parent().unwrap()).unwrap();
+        fs::create_dir_all(new.parent().unwrap()).unwrap();
+        fs::write(&old, b"stale copy").unwrap();
+        fs::write(&new, b"already-migrated real data").unwrap();
+
+        let cfg = Config {
+            adaptive_pathway_db_path: old.to_str().unwrap().to_string(),
+            ..Config::default()
+        };
+        let _ = migrate_ap_db_path_impl(cfg, old.to_str().unwrap(), new.to_str().unwrap());
+
+        assert_eq!(fs::read(&new).unwrap(), b"already-migrated real data");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn uuid_like() -> String {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        format!(
+            "{}-{:?}",
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos(),
+            std::thread::current().id()
+        )
+    }
+
+    #[test]
     fn old_shape_config_migrates_embedding_model_default() {
         // A config predating the embedding-model requirement must still load,
         // defaulting to the one pinned cross-compatible tag every user shares.
@@ -746,6 +1033,40 @@ mod tests {
         cfg = migrate_recipes(cfg);
         assert_eq!(cfg.recipes.len(), 4);
         assert!(cfg.recipes.iter().all(|r| r.is_builtin));
+    }
+
+    #[test]
+    fn replacement_mcp_enables_once_for_a_config_predating_the_default_flip() {
+        // The pre-flip shape: an explicit `false` with no migration marker.
+        // Serde's new `default_true` can't reach an explicitly-present field,
+        // so only the migration gets this install a working tool set.
+        let cfg: Config =
+            serde_json::from_str(r#"{"replacement_mcp_enabled":false}"#).unwrap();
+        assert!(!cfg.replacement_mcp_enabled);
+        assert!(!cfg.replacement_mcp_default_migrated);
+
+        let migrated = migrate_replacement_mcp_enabled(cfg);
+        assert!(migrated.replacement_mcp_enabled);
+        assert!(migrated.replacement_mcp_default_migrated);
+    }
+
+    #[test]
+    fn replacement_mcp_respects_an_opt_out_made_after_the_flip() {
+        // Once the marker is set, a user turning the server back off must
+        // stick — otherwise every launch would silently re-enable it.
+        let cfg: Config = serde_json::from_str(
+            r#"{"replacement_mcp_enabled":false,"replacement_mcp_default_migrated":true}"#,
+        )
+        .unwrap();
+        let migrated = migrate_replacement_mcp_enabled(cfg);
+        assert!(!migrated.replacement_mcp_enabled);
+    }
+
+    #[test]
+    fn replacement_mcp_is_on_for_a_brand_new_config() {
+        let cfg = Config::default();
+        assert!(cfg.replacement_mcp_enabled);
+        assert!(cfg.replacement_mcp_default_migrated);
     }
 
     #[test]
