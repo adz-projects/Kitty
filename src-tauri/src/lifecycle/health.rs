@@ -190,8 +190,26 @@ pub fn spawn_health_loop(app: AppHandle) {
         // `Ok` stays immediate; only degradation needs the extra
         // confirmation tick.
         let mut pending_degraded: Option<StackStatus> = None;
+        // ~30s cadence (every 6th 5s tick), same as the Adaptive Pathway
+        // health loop's embedding-model recheck: catches the summarizer
+        // model being deleted out-of-band, or Ollama coming up after
+        // `start_stack`'s one-time `ensure_summarizer_model` call already
+        // found it unreachable.
+        let mut tick: u64 = 0;
         loop {
             ticker.tick().await;
+            if tick % 6 == 0 {
+                let (ollama_base, summarizer) = {
+                    let state = app.state::<AppState>();
+                    let cfg = state.config.lock().unwrap();
+                    (cfg.ollama_base_url.clone(), cfg.summarizer.clone())
+                };
+                if summarizer.enabled {
+                    super::ensure_summarizer_model(app.clone(), ollama_base, summarizer.model)
+                        .await;
+                }
+            }
+            tick = tick.wrapping_add(1);
             let computed = compute_status(&app, &client).await;
             let status = if computed == StackStatus::Ok || pending_degraded == Some(computed) {
                 pending_degraded = None;

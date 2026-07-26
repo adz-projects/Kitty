@@ -11,10 +11,12 @@ mod embedding;
 mod health;
 pub mod ollama_proc;
 pub mod scheduler;
+mod summarizer_model;
 
 pub(crate) use embedding::ensure_embedding_model;
 pub(crate) use health::compute_status;
 pub use health::{spawn_adaptive_pathway_health_loop, spawn_health_loop};
+pub(crate) use summarizer_model::ensure_summarizer_model;
 
 use adaptive_pathway_proc::AdaptivePathwayStatus;
 
@@ -47,14 +49,16 @@ fn set_startup_phase(app: &AppHandle, phase: StartupPhase) {
 }
 
 /// Whether Ollama must be started for the current config: either the active
-/// *chat* setup needs it (local Ollama provider), or adaptive-pathway is
-/// enabled — AP's embeddings are local-Ollama-only regardless of chat
-/// provider, so an API-key chat user still needs Ollama running purely for
-/// embeddings. Independent of `ollama_enabled` ("run local chat model" — a
-/// separate, narrower toggle) by design; extracted as a pure function so the
-/// policy is unit testable without spinning up `start_stack`'s async runtime.
+/// *chat* setup needs it (local Ollama provider), adaptive-pathway is
+/// enabled (its embeddings are local-Ollama-only regardless of chat
+/// provider), or the summarizer is enabled (its model — see
+/// `Config::summarizer` — is likewise always pulled from local Ollama,
+/// independent of the main chat provider). Independent of `ollama_enabled`
+/// ("run local chat model" — a separate, narrower toggle) by design;
+/// extracted as a pure function so the policy is unit testable without
+/// spinning up `start_stack`'s async runtime.
 pub(crate) fn stack_needs_ollama(cfg: &crate::config::Config) -> bool {
-    ollama_proc::requires_local_ollama(cfg) || cfg.adaptive_pathway_enabled
+    ollama_proc::requires_local_ollama(cfg) || cfg.adaptive_pathway_enabled || cfg.summarizer.enabled
 }
 
 /// Start the stack in the background at app startup. Non-blocking: failures
@@ -97,6 +101,18 @@ pub fn start_stack(app: &AppHandle) {
                 cfg.summarizer.clone(),
             )
         };
+
+        // Runtime guarantee for BigTiny's summarizer model (see
+        // `Config::summarizer`, e.g. `qwen3.5:0.8b`): if Ollama is reachable
+        // but the pinned tag isn't installed yet, pull it in the background
+        // — non-blocking, doesn't delay the BigTiny spawn below (BigTiny only
+        // needs the model once it actually runs a summarization pass, not to
+        // start). Progress flows through the existing `ollama://pull-progress`
+        // events (fixed pull id, see `summarizer_model::SUMMARIZER_MODEL_PULL_ID`).
+        if summarizer.enabled {
+            ensure_summarizer_model(app.clone(), base.clone(), summarizer.model.clone()).await;
+        }
+
         set_startup_phase(&app, StartupPhase::SpawningBackend);
         if warm.is_some() {
             set_startup_phase(&app, StartupPhase::WarmingModel);
@@ -297,6 +313,7 @@ mod tests {
             });
         cfg.active_provider_id = Some("p1".into());
         cfg.adaptive_pathway_enabled = false;
+        cfg.summarizer.enabled = false;
         assert!(!stack_needs_ollama(&cfg));
     }
 
@@ -307,6 +324,36 @@ mod tests {
             ..Config::default()
         };
         // No active provider -> requires_local_ollama defaults true (fresh install).
+        assert!(stack_needs_ollama(&cfg));
+    }
+
+    #[test]
+    fn needs_ollama_true_when_summarizer_enabled_even_for_api_key_provider() {
+        // Mirrors the adaptive-pathway case above: the summarizer's model
+        // always comes from local Ollama regardless of the main chat
+        // provider, so an API-key chat user still needs Ollama running
+        // purely to keep the summarizer model available.
+        let mut cfg = Config::default();
+        cfg.providers
+            .push(crate::config::providers::ProviderProfile {
+                id: "p1".into(),
+                name: "Claude".into(),
+                provider_type: "anthropic".into(),
+                base_url: "https://api.anthropic.com".into(),
+                models: vec!["claude-sonnet-5".into()],
+                is_trusted: true,
+                temperature: None,
+                top_p: None,
+                context_length: None,
+                strip_reasoning: false,
+                system_prompt: None,
+                prompt_idle_timeout_secs: None,
+                created_at: "2026-01-01T00:00:00Z".into(),
+            });
+        cfg.active_provider_id = Some("p1".into());
+        cfg.adaptive_pathway_enabled = false;
+        cfg.summarizer.enabled = true;
+        assert!(!ollama_proc::requires_local_ollama(&cfg));
         assert!(stack_needs_ollama(&cfg));
     }
 }

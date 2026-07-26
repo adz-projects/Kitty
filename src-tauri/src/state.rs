@@ -4,6 +4,7 @@
 //! Ollama handles, generated secret/port, current stack status).
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::AtomicBool;
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
@@ -95,6 +96,13 @@ pub struct AppState {
     /// is still `Downloading`/`Missing` (hashing-fallback degradation, not an
     /// outage). See `EmbeddingModelStatus`.
     pub adaptive_pathway_embedding_status: Mutex<EmbeddingModelStatus>,
+    /// Guards `lifecycle::summarizer_model::ensure_summarizer_model` against
+    /// a duplicate concurrent pull of `Config::summarizer.model` (e.g.
+    /// `qwen3.5:0.8b`) — set for the duration of a background `ollama pull`,
+    /// checked by both the one-time `start_stack` call and the periodic
+    /// health-loop self-heal so they can never race into pulling the same
+    /// tag twice at once.
+    pub summarizer_model_pulling: AtomicBool,
     /// The BigTiny daemon child we spawn, plus its port + secret (sent as
     /// `X-API-Key`).
     pub bigtiny: Mutex<DaemonHandle>,
@@ -165,6 +173,7 @@ impl AppState {
             adaptive_pathway: Mutex::new(ManagedProcess::default()),
             adaptive_pathway_status: Mutex::new(AdaptivePathwayStatus::default()),
             adaptive_pathway_embedding_status: Mutex::new(EmbeddingModelStatus::default()),
+            summarizer_model_pulling: AtomicBool::new(false),
             bigtiny: Mutex::new(DaemonHandle::default()),
             bigtiny_approvals: Mutex::new(HashMap::new()),
             in_flight_sessions: Mutex::new(HashSet::new()),
