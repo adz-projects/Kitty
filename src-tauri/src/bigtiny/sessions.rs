@@ -69,6 +69,15 @@ pub async fn update_cwd(app: &AppHandle, session_id: &str, cwd: &str) -> Result<
     Ok(())
 }
 
+/// Fetch `/api/chat/{id}/stats` — includes `compacted_through_rowid` and
+/// `memory_slots`, the fields `stream::poll_compaction_status` diffs
+/// against to detect a background compaction pass that finished after this
+/// turn's own SSE stream closed.
+pub async fn get_stats(app: &AppHandle, session_id: &str) -> Result<Value, String> {
+    let client = ensure_client(app)?;
+    client.get_json(&format!("/api/chat/{session_id}/stats")).await
+}
+
 /// List sessions, translated to the goosed raw shape the frontend parses.
 pub async fn list(app: &AppHandle) -> Result<Vec<Value>, String> {
     let client = ensure_client(app)?;

@@ -2,12 +2,20 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Literal
 from uuid import uuid4
 
 from bigtiny.config import HITLConfig
 from bigtiny.storage import Database
+
+# An approval the client never answers — disconnect, force-quit without
+# hitting /cancel — would otherwise leak its _pending/_session_pending/
+# _decisions entries forever, since nothing else ever removes them. Swept
+# on access (see `_sweep_stale`) rather than via a dedicated periodic task,
+# so the cost is amortized against the handful of calls that already touch
+# this state instead of adding new background-task overhead.
+MAX_PENDING_AGE = timedelta(hours=1)
 
 
 class PendingAction:
@@ -59,9 +67,27 @@ class HITLManager:
         self.config = config
         self._pending: dict[str, PendingAction] = {}
         self._session_pending: dict[str, list[str]] = {}
-        # action_id -> resolved decision ("allow" | "always_allow" | "reject"),
-        # consumed by the agent loop after it is woken up.
-        self._decisions: dict[str, str] = {}
+        # action_id -> (resolved decision, resolved_at). The timestamp is
+        # only for `_sweep_stale` below — `pop_decision` still hands back
+        # just the decision string to callers.
+        self._decisions: dict[str, tuple[str, datetime]] = {}
+
+    def _sweep_stale(self) -> None:
+        cutoff = datetime.utcnow() - MAX_PENDING_AGE
+        stale_pending = [aid for aid, p in self._pending.items() if p.created_at < cutoff]
+        for aid in stale_pending:
+            pending = self._pending.pop(aid, None)
+            if not pending:
+                continue
+            session_list = self._session_pending.get(pending.session_id, [])
+            if aid in session_list:
+                session_list.remove(aid)
+            if not session_list:
+                self._session_pending.pop(pending.session_id, None)
+
+        stale_decisions = [aid for aid, (_, ts) in self._decisions.items() if ts < cutoff]
+        for aid in stale_decisions:
+            self._decisions.pop(aid, None)
 
     async def check_tool_call(
         self,
@@ -111,6 +137,7 @@ class HITLManager:
         args: dict[str, Any],
         reason: str,
     ) -> HITLDecision:
+        self._sweep_stale()
         action_id = uuid4().hex
         pending = PendingAction(
             action_id=action_id,
@@ -194,7 +221,7 @@ class HITLManager:
         if not session_list:
             self._session_pending.pop(pending.session_id, None)
 
-        self._decisions[action_id] = decision
+        self._decisions[action_id] = (decision, datetime.utcnow())
 
         if decision == "reject":
             return HITLDecision(
@@ -218,7 +245,8 @@ class HITLManager:
 
     def pop_decision(self, action_id: str) -> str | None:
         """Consume the resolved decision for an action, if any."""
-        return self._decisions.pop(action_id, None)
+        entry = self._decisions.pop(action_id, None)
+        return entry[0] if entry else None
 
     def get_pending_approvals(self, session_id: str) -> list[PendingAction]:
         action_ids = self._session_pending.get(session_id, [])

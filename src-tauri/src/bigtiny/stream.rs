@@ -13,6 +13,9 @@
 //! - `llm_stop`        -> captures usage for the final `chat://complete`
 //! - `error`           -> `chat://error` at stream end
 //! - `session_status` (`is_last`) -> `chat://complete`
+//! - `compaction`      -> `chat://compaction` (background context-compaction
+//!   notice; may arrive after this turn's own `chat://complete` since
+//!   compaction runs fire-and-forget from the daemon's turn-`finally` block)
 
 use futures_util::StreamExt;
 use serde_json::{json, Value};
@@ -38,6 +41,25 @@ pub(crate) fn truncate_for_ui(s: &str) -> String {
         end -= 1;
     }
     format!("{}…[truncated {} bytes]", &s[..end], s.len() - end)
+}
+
+/// Pure: byte offset of the first `"\n\n"` frame terminator in `haystack`
+/// at or after byte offset `from`, or `None` if there isn't one yet.
+///
+/// Operates on raw bytes rather than `str::find` on a `&str` slice so the
+/// caller (`run_stream`'s buffer scan) can resume from an arbitrary byte
+/// offset without needing that offset to land on a UTF-8 char boundary —
+/// `\n` (0x0A) is single-byte ASCII, so any offset this function returns,
+/// and any offset derived from one (`+1`, `+2`), is automatically a valid
+/// char boundary, safe to slice the original `&str` at.
+pub(crate) fn find_frame_boundary(haystack: &[u8], from: usize) -> Option<usize> {
+    if from >= haystack.len() {
+        return None;
+    }
+    haystack[from..]
+        .windows(2)
+        .position(|w| w == b"\n\n")
+        .map(|rel| from + rel)
 }
 
 /// Pure: parse one SSE frame (`data: {...}`) into its JSON payload.
@@ -141,6 +163,7 @@ pub async fn send_prompt(
                     Some(&session_id),
                 );
                 providers::emit_health_from_send_result(&app_bg, true);
+                poll_compaction_status(app_bg.clone(), session_id.clone());
             }
             Ok(TurnOutcome { error: Some(message), .. }) | Err(message) => {
                 let _ = app_bg.emit(
@@ -166,6 +189,47 @@ pub async fn send_prompt(
             .remove(&session_id);
     });
     Ok(())
+}
+
+/// BigTiny's background compaction pass (`bigtiny/agent/loop.py`'s
+/// `finally` block) runs fire-and-forget *after* a turn finishes, and
+/// typically completes after this turn's own SSE stream has already
+/// closed — so its `compaction` SSE event usually has no open connection
+/// left to land on. Polling `/stats` once, after a short delay, and
+/// diffing `compacted_through_rowid` against the last value seen for this
+/// session is what actually delivers the notice to the frontend.
+fn poll_compaction_status(app: AppHandle, session_id: String) {
+    tauri::async_runtime::spawn(async move {
+        // Give the summarizer model (small and local, but still an LLM
+        // call) time to finish. Long enough to usually catch it, short
+        // enough not to matter when it doesn't — the compaction indicator
+        // is a nice-to-have, not correctness-critical, and a missed poll
+        // is simply caught by the next turn's poll instead.
+        tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+
+        let Ok(stats) = crate::bigtiny::sessions::get_stats(&app, &session_id).await else {
+            return;
+        };
+        let Some(rowid) = stats.get("compacted_through_rowid").and_then(|v| v.as_i64()) else {
+            return;
+        };
+
+        let state = app.state::<AppState>();
+        let mut watermarks = state.bigtiny_compaction_watermarks.lock().unwrap();
+        let previous = watermarks.get(&session_id).copied().unwrap_or(0);
+        if rowid > previous {
+            watermarks.insert(session_id.clone(), rowid);
+            drop(watermarks);
+            let _ = app.emit(
+                "chat://compaction",
+                json!({
+                    "session_id": session_id,
+                    "compacted_through_rowid": rowid,
+                    "memory_slots": stats.get("memory_slots"),
+                }),
+            );
+        }
+    });
 }
 
 /// Drive one send stream to completion, emitting `chat://*` events as frames
@@ -201,13 +265,29 @@ async fn run_stream(
     let mut current_tool: Option<(String, String)> = None;
 
     let mut buffer = String::new();
+    // Byte offset from which the next `find_frame_boundary` scan should
+    // resume — without this, every incoming chunk re-scanned the *entire*
+    // accumulated buffer from position 0 looking for "\n\n", even though
+    // only the newly-appended tail could contain a not-yet-seen boundary.
+    // For a large content delta arriving as many small TCP chunks (or any
+    // burst of small chunks before a frame terminator), that's repeated
+    // full-buffer linear rescans — quadratic in the worst case. Reset to 0
+    // whenever a frame is drained (the remaining buffer shifted), advanced
+    // to the end of the buffer when no boundary is found yet.
+    let mut scan_from: usize = 0;
     let mut bytes = resp.bytes_stream();
     'outer: while let Some(chunk) = bytes.next().await {
         let chunk = chunk.map_err(|e| format!("BigTiny stream failed: {e}"))?;
         buffer.push_str(&String::from_utf8_lossy(&chunk));
-        while let Some(pos) = buffer.find("\n\n") {
+        // `saturating_sub(1)` guards the one case a pure resume-point would
+        // miss: a "\n\n" boundary split exactly across the old/new chunk
+        // join, with one "\n" at the very end of the previously-scanned
+        // region and the second "\n" at the very start of the new tail.
+        while let Some(pos) = find_frame_boundary(buffer.as_bytes(), scan_from.saturating_sub(1))
+        {
             let frame = buffer[..pos].to_string();
             buffer.drain(..pos + 2);
+            scan_from = 0;
             let Some(event) = parse_sse_frame(&frame) else {
                 continue;
             };
@@ -224,6 +304,9 @@ async fn run_stream(
                 break 'outer;
             }
         }
+        // No further boundary in the buffer yet — resume the next chunk's
+        // scan from here instead of position 0.
+        scan_from = buffer.len();
     }
     Ok(outcome)
 }
@@ -377,6 +460,16 @@ fn handle_event(
                 outcome.cancelled = true;
             }
         }
+        "compaction" => {
+            // Rare in practice — the background pass usually finishes
+            // after this stream has already closed (see
+            // `poll_compaction_status`, the reliable delivery path) — but
+            // cheap to forward directly on the lucky case it's still open.
+            let _ = app.emit(
+                "chat://compaction",
+                json!({ "session_id": session_id, "content": content }),
+            );
+        }
         // model_failover / subagent_status: not surfaced yet.
         _ => {}
     }
@@ -490,6 +583,41 @@ pub async fn respond_permission(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn find_frame_boundary_finds_terminator() {
+        assert_eq!(find_frame_boundary(b"data: a\n\ndata: b\n\n", 0), Some(7));
+        assert!(find_frame_boundary(b"data: a", 0).is_none());
+    }
+
+    #[test]
+    fn find_frame_boundary_resumes_from_offset() {
+        let buf = b"data: a\n\ndata: b\n\n";
+        // Resuming from just past the first boundary finds the second one,
+        // not the first again.
+        assert_eq!(find_frame_boundary(buf, 9), Some(16));
+    }
+
+    #[test]
+    fn find_frame_boundary_catches_split_across_saturating_sub_one() {
+        // Mirrors `run_stream`'s `scan_from.saturating_sub(1)` call
+        // pattern: a "\n\n" boundary split exactly across two chunks (one
+        // "\n" already scanned, the second "\n" newly appended) must still
+        // be found when resuming from `scan_from - 1`.
+        let buf = b"data: a\n\ndata: b";
+        let scan_from = buf.len(); // as if this was the end of a prior chunk
+        let buf2 = b"data: a\n\ndata: b\n\n";
+        assert_eq!(
+            find_frame_boundary(buf2, scan_from.saturating_sub(1)),
+            Some(16)
+        );
+    }
+
+    #[test]
+    fn find_frame_boundary_handles_empty_and_out_of_range() {
+        assert!(find_frame_boundary(b"", 0).is_none());
+        assert!(find_frame_boundary(b"abc", 10).is_none());
+    }
 
     #[test]
     fn parse_sse_frame_reads_data_line() {

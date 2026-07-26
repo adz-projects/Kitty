@@ -42,6 +42,8 @@ export function ChatView() {
     retryConnection,
     warning,
     dismissWarning,
+    compactionNotice,
+    dismissCompactionNotice,
     loopSuspected,
     dismissLoopWarning,
     send,
@@ -166,6 +168,16 @@ export function ChatView() {
           <span className="status-dot warn" />
           <span style={{ flex: 1 }}>{warning}</span>
           <button className="link" onClick={dismissWarning}>
+            Dismiss
+          </button>
+        </div>
+      )}
+
+      {compactionNotice && (
+        <div className="conflict-banner" role="status">
+          <span className="status-dot ok" />
+          <span style={{ flex: 1 }}>{compactionNotice}</span>
+          <button className="link" onClick={dismissCompactionNotice}>
             Dismiss
           </button>
         </div>

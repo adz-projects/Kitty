@@ -11,7 +11,7 @@ import os
 import tempfile
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, AsyncIterator
 from uuid import uuid4
@@ -776,6 +776,58 @@ class TestMCPManager:
         assert "disabled-server" not in mcp._servers
 
     @pytest.mark.asyncio
+    async def test_client_execute_unknown_tool_returns_error_result_not_raise(self):
+        # Regression: `MCPServerClient.execute_tool` used to `raise
+        # MCPServerError` here (before entering its own try block), which
+        # `MCPManager.execute_tool` didn't catch either — an unexpected
+        # exception this deep would propagate uncaught through
+        # `Agent._run_one_tool_call` into the turn's `asyncio.gather`
+        # (not given `return_exceptions=True`), killing every concurrent
+        # tool call in the turn instead of just failing this one call.
+        client = MCPServerClient(MCPServerConfig(id="s1", name="s1", transport=TransportType.stdio))
+        client._tools = []  # tool_name won't be found
+        result = await client.execute_tool("nonexistent", {})
+        assert result.is_error
+        assert "Unknown tool" in result.content
+
+    @pytest.mark.asyncio
+    async def test_client_execute_tool_unexpected_exception_returns_error_result(self):
+        # Simulates a failure mode `_send_request` isn't explicitly written
+        # to raise (e.g. a dropped connection, or a bug in `_extract_content`)
+        # — anything beyond the two expected `TimeoutError`/`MCPServerError`
+        # cases must still come back as an error ToolResult, not propagate.
+        tool_def = ToolDefinition(name="t", description="", input_schema={}, server_id="s1")
+        client = MCPServerClient(MCPServerConfig(id="s1", name="s1", transport=TransportType.stdio))
+        client._tools = [tool_def]
+
+        async def _boom(*args, **kwargs):
+            raise RuntimeError("connection reset")
+
+        client._send_request = _boom
+        result = await client.execute_tool("t", {})
+        assert result.is_error
+        assert "failed unexpectedly" in result.content
+
+    @pytest.mark.asyncio
+    async def test_manager_execute_tool_survives_client_raising_unexpectedly(self, mcp):
+        # Defense-in-depth check on `MCPManager.execute_tool`'s own wrapper:
+        # even if some future/buggy client implementation raises instead of
+        # returning an error ToolResult, the manager-level dispatch (the
+        # actual call site `Agent._run_one_tool_call` uses) must not let
+        # that exception escape.
+        tool_def = ToolDefinition(name="boom_tool", description="", input_schema={}, server_id="s1")
+        mcp._tool_registry["boom_tool"] = tool_def
+
+        class _RaisingClient:
+            async def execute_tool(self, *args, **kwargs):
+                raise RuntimeError("simulated client bug")
+
+        mcp._servers["s1"] = _RaisingClient()
+        result = await mcp.execute_tool("boom_tool", {})
+        assert result.is_error
+        assert "failed unexpectedly" in result.content
+
+    @pytest.mark.asyncio
     async def test_connect_all_includes_enabled_by_default(self, db):
         # enabled has DEFAULT 1, so a row inserted without specifying it
         # should still be picked up by connect_all's WHERE clause.
@@ -1166,6 +1218,41 @@ class TestHITL:
         forced = hitl2.force_approval(session, "read_file", {"path": "/outside"})
         assert forced.action == "needs_approval"
 
+    @pytest.mark.asyncio
+    async def test_stale_pending_action_is_evicted(self, hitl, session):
+        # An approval the client never answers (disconnect, force-quit
+        # without /cancel) must not leak its _pending/_session_pending
+        # entries forever — the sweep in `_sweep_stale` (run opportunistically
+        # from `_create_pending`) is what reclaims it.
+        result = await hitl.check_tool_call(session, "abandoned_tool", {"a": 1})
+        pending = hitl._pending[result.pending_action_id]
+        pending.created_at = datetime.utcnow() - timedelta(hours=2)
+
+        # Triggers another sweep by creating a second (fresh) pending action.
+        await hitl.check_tool_call(session, "other_tool", {})
+
+        assert result.pending_action_id not in hitl._pending
+        assert not any(p.tool_name == "abandoned_tool" for p in hitl.get_pending_approvals(session))
+
+    @pytest.mark.asyncio
+    async def test_stale_resolved_decision_is_evicted(self, hitl, session):
+        result = await hitl.check_tool_call(session, "t", {"a": 1})
+        await hitl.record_decision(result.pending_action_id, "allow")
+        assert result.pending_action_id in hitl._decisions
+
+        # Back-date the resolution so the next sweep considers it stale.
+        decision, _ = hitl._decisions[result.pending_action_id]
+        hitl._decisions[result.pending_action_id] = (decision, datetime.utcnow() - timedelta(hours=2))
+
+        await hitl.check_tool_call(session, "trigger_sweep", {})
+        assert result.pending_action_id not in hitl._decisions
+
+    @pytest.mark.asyncio
+    async def test_recent_pending_action_survives_sweep(self, hitl, session):
+        result = await hitl.check_tool_call(session, "recent_tool", {})
+        await hitl.check_tool_call(session, "another_tool", {})
+        assert result.pending_action_id in hitl._pending
+
 
 class TestSandbox:
     """`bigtiny/agent/sandbox.py` — the authoritative, mode-dependent
@@ -1334,42 +1421,81 @@ class TestContextManager:
         contents = [m.get("content", "") for m in msgs]
         assert any("old message" in c for c in contents)
 
-    @pytest.mark.asyncio
-    async def test_compact_keeps_system_and_last_4(self, context, session):
-        msgs = [
-            {"role": "system", "content": "base"},
-            {"role": "user", "content": "u1"}, {"role": "assistant", "content": "a1"},
-            {"role": "user", "content": "u2"}, {"role": "assistant", "content": "a2"},
-            {"role": "user", "content": "u3"}, {"role": "assistant", "content": "a3"},
-        ]
-        compacted = await context._compact(session, msgs)
-        assert compacted[0]["role"] == "system"
-        assert compacted[0]["content"] == "base"
-        last4 = compacted[-4:]
-        assert last4[0]["content"] == "u2"
-        assert last4[-1]["content"] == "a3"
+    # The old in-memory, throw-away `_compact` placeholder (keep-last-4 +
+    # 300-char string truncation) was replaced by the persisted, tool-aware
+    # compaction subsystem in `bigtiny/agent/compaction.py` — see
+    # `tests/test_compaction.py` for its coverage. `_compact` no longer
+    # exists on `ContextManager`.
 
     @pytest.mark.asyncio
-    async def test_compact_summarizes_middle(self, context, session):
-        msgs = [
-            {"role": "system", "content": "base"},
-            {"role": "user", "content": "u1"}, {"role": "assistant", "content": "a1"},
-            {"role": "user", "content": "u2"}, {"role": "assistant", "content": "a2"},
-            {"role": "user", "content": "u3"}, {"role": "assistant", "content": "a3"},
+    async def test_anchor_survives_after_compaction_advances_past_it(self, context, db, session):
+        # build_messages fetches the first user message via its own cheap
+        # LIMIT-1 query rather than pulling it out of the (now-bounded)
+        # live-tail history query — this verifies that lookup still finds
+        # it and renders it as the anchor even once `compacted_through_rowid`
+        # has advanced past its rowid (simulating a completed Tier-2 pass).
+        cursor = await db.execute(
+            "INSERT INTO messages (id, session_id, role, content) VALUES (:id, :sid, 'user', :c)",
+            {"id": uuid4().hex, "sid": session, "c": "original goal: build a widget"},
+        )
+        first_rowid = cursor.lastrowid
+        await db.execute(
+            "UPDATE sessions SET compacted_through_rowid = :r WHERE id = :id",
+            {"r": first_rowid, "id": session},
+        )
+
+        msgs = await context.build_messages(session, "new msg", [])
+        anchors = [
+            m for m in msgs
+            if m["role"] == "system" and "[Original request]" in m.get("content", "")
         ]
-        compacted = await context._compact(session, msgs)
-        summaries = [m for m in compacted if "summarized" in m.get("content", "")]
-        assert len(summaries) == 1
+        assert len(anchors) == 1
+        assert "build a widget" in anchors[0]["content"]
+        # Not duplicated into the live tail as a plain user-role message.
+        assert not any(
+            m["role"] == "user" and m.get("content") == "original goal: build a widget"
+            for m in msgs
+        )
 
     @pytest.mark.asyncio
-    async def test_no_summary_when_under_limit(self, context, session):
-        msgs = [
-            {"role": "system", "content": "base"},
-            {"role": "user", "content": "u1"}, {"role": "assistant", "content": "a1"},
-        ]
-        compacted = await context._compact(session, msgs)
-        summaries = [m for m in compacted if "summarized" in m.get("content", "")]
-        assert len(summaries) == 0
+    async def test_live_tail_bounded_by_compacted_through_rowid(self, context, db, session):
+        rowids = []
+        for i in range(5):
+            role = "user" if i % 2 == 0 else "assistant"
+            cursor = await db.execute(
+                "INSERT INTO messages (id, session_id, role, content) VALUES (:id, :sid, :role, :c)",
+                {"id": uuid4().hex, "sid": session, "role": role, "c": f"msg-{i}"},
+            )
+            rowids.append(cursor.lastrowid)
+
+        # Simulate compaction having folded everything through msg-2 (index
+        # 2, the third row) into the memory summary.
+        await db.execute(
+            "UPDATE sessions SET compacted_through_rowid = :r, "
+            "memory_slots = :slots WHERE id = :id",
+            {
+                "r": rowids[2],
+                "slots": json.dumps({
+                    "new_constraints": [], "new_decisions": [], "new_completions": [],
+                    "current_state": "folded msg-0..msg-2",
+                }),
+                "id": session,
+            },
+        )
+
+        msgs = await context.build_messages(session, "new msg", [])
+        contents = [m.get("content") for m in msgs]
+        # msg-1/msg-2 are below (or at) the watermark — gone entirely, not
+        # even in masked/summarized form as a standalone message.
+        assert "msg-1" not in contents
+        assert "msg-2" not in contents
+        # msg-0 survives only via the anchor (it's the first user message).
+        assert any(
+            "msg-0" in str(c) and "[Original request]" in str(c) for c in contents
+        )
+        # msg-3/msg-4 are above the watermark — still present verbatim.
+        assert "msg-3" in contents
+        assert "msg-4" in contents
 
     @pytest.mark.asyncio
     async def test_count_tokens(self, context):
@@ -1399,12 +1525,6 @@ class TestContextManager:
         assert len(saved) == 1
         tc = json.loads(saved[0]["tool_calls"])
         assert tc[0]["id"] == "c1"
-
-    @pytest.mark.asyncio
-    async def test_compact_empty_non_system(self, context, session):
-        msgs = [{"role": "system", "content": "only system"}]
-        compacted = await context._compact(session, msgs)
-        assert len(compacted) == 1
 
 
 # =============================================================================
@@ -2065,6 +2185,52 @@ class TestScheduler:
         )
         assert row is not None
 
+    @pytest.mark.asyncio
+    async def test_execute_job_failure_marks_temp_session_failed_not_deleted(
+        self, agent, mcp, db
+    ):
+        # `execution_history.session_id` is NOT NULL + REFERENCES sessions(id)
+        # with foreign_keys=ON and no ON DELETE clause — deleting the temp
+        # session on the failure path (as the success path does) would raise
+        # a FOREIGN KEY constraint violation, since the execution_history
+        # row for this failed run still points at it. The fix marks the temp
+        # session `status='failed'` instead of deleting it, and leaves the
+        # execution_history audit row intact — this verifies both the DB
+        # stays internally consistent (no FK error escapes `_execute_job`)
+        # and the "failed" marker is applied rather than left at 'idle'.
+        engine = RecipeEngine(db, agent, mcp)
+        sched = Scheduler(db, engine)
+        job_id = uuid4().hex[:8]
+        # `schedule_jobs.recipe_id` has its own FK to `recipes(id)`, so the
+        # recipe row must exist to insert the job at all — the failure
+        # instead comes from a malformed prompt template, which
+        # `recipe_engine.execute` fails to compile (jinja2 raises at
+        # `from_string`), landing in `_execute_job`'s except branch.
+        rid = uuid4().hex[:8]
+        await db.execute(
+            "INSERT INTO recipes (id, name, prompt_template) VALUES (:id, :n, :p)",
+            {"id": rid, "n": "broken", "p": "{{ unterminated"},
+        )
+        await db.execute(
+            "INSERT INTO schedule_jobs (id, name, cron, recipe_id, parameters) "
+            "VALUES (:id, :n, :c, :rid, :p)",
+            {"id": job_id, "n": "will_fail", "c": "0 0 * * *", "rid": rid, "p": "{}"},
+        )
+
+        await sched._execute_job(job_id)  # must not raise
+
+        history = await db.fetch_one(
+            "SELECT * FROM execution_history WHERE trigger_id = :tid", {"tid": job_id}
+        )
+        assert history is not None
+        assert history["status"] == "failed"
+
+        temp_session = await db.fetch_one(
+            "SELECT * FROM sessions WHERE id = :id", {"id": history["session_id"]}
+        )
+        assert temp_session is not None
+        assert temp_session["status"] == "failed"
+
 
 # =============================================================================
 #  TEST: SUBAGENT — Step 9
@@ -2124,6 +2290,52 @@ class TestSubagent:
         mgr = SubagentManager(agent, db)
         result = await mgr.wait_for_completion("nonexistent")
         assert result is None
+
+    @pytest.mark.asyncio
+    async def test_result_is_full_joined_content_not_just_last_chunk(
+        self, router, mcp, hitl, context, db, session
+    ):
+        # Regression test: `_run_subagent` used to scan its buffered events
+        # backwards for the *last* `llm_delta` and take only that single
+        # chunk's own `.content` as the result — for any streamed reply
+        # spanning more than one delta, `subagent.result` was silently just
+        # the final fragment. Accumulating chunks into a list and joining
+        # fixes this as a side effect of removing the full-event buffer.
+        provider = MockProvider("p1")
+        provider.set_deltas([[
+            Delta(content="Hello "),
+            Delta(content="there, "),
+            Delta(content="world!"),
+            Delta(finish_reason="stop"),
+        ]])
+        router._providers["p1"] = provider
+
+        agent = Agent(router, mcp, hitl, context, db)
+        mgr = SubagentManager(agent, db)
+        sid = await mgr.spawn(session, "say hi", provider_override="p1")
+        sub = await mgr.wait_for_completion(sid, timeout=5)
+
+        assert sub is not None
+        assert sub.status == "completed"
+        assert sub.result == "Hello there, world!"
+
+    @pytest.mark.asyncio
+    async def test_completed_subagents_are_evicted_after_retention_window(
+        self, agent, db, session
+    ):
+        mgr = SubagentManager(agent, db)
+        sid = await mgr.spawn(session, "test")
+        old = await mgr.wait_for_completion(sid, timeout=5)
+        assert old is not None
+        # Back-date completion so the next spawn's sweep considers it stale
+        # (mirrors HITLManager's sweep-on-access pattern — no dedicated
+        # background task needed).
+        from bigtiny.subagent import manager as subagent_module
+        old.completed_at = datetime.utcnow() - subagent_module.SUBAGENT_RETENTION - timedelta(minutes=1)
+
+        await mgr.spawn(session, "trigger sweep")
+
+        assert mgr.get_subagent(sid) is None
 
 
 # =============================================================================

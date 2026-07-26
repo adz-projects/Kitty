@@ -109,6 +109,7 @@ pub async fn spawn(
     command: &str,
     args: &[String],
     dir: Option<&str>,
+    summarizer: &crate::config::SummarizerSettings,
 ) -> Result<DaemonHandle, String> {
     kill_stale_orphan();
 
@@ -122,6 +123,16 @@ pub async fn spawn(
         .arg("--port")
         .arg(port.to_string())
         .env("BIGTINY_SECRET", &secret)
+        // BigTiny's own env-var config surface (`BigTinyConfig`'s
+        // `env_nested_delimiter="__"`, `plugins/bigtiny/bigtiny/config.py`) —
+        // Kitty never writes a --config YAML for the daemon, so this is the
+        // only path these settings reach it by.
+        .env(
+            "BIGTINY_SUMMARIZER__ENABLED",
+            if summarizer.enabled { "true" } else { "false" },
+        )
+        .env("BIGTINY_SUMMARIZER__MODEL", &summarizer.model)
+        .env("BIGTINY_SUMMARIZER__KEEP_ALIVE", &summarizer.keep_alive)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     // Consolidates BigTiny's db/cache-sandbox-root/recipes under

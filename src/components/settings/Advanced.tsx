@@ -135,6 +135,55 @@ export function Advanced() {
             <span>Strict mode: disable file/folder drop while a remote provider is active</span>
           </label>
 
+          <div className="field">
+            <span>Background context summarization</span>
+            <p className="muted" style={{ margin: 0 }}>
+              Folds older conversation history into a running summary so long agentic sessions
+              don&apos;t run out of context. Uses a small local model via Ollama; changes need a
+              backend restart to take effect.
+            </p>
+            <label className="check">
+              <input
+                type="checkbox"
+                checked={draft.summarizer.enabled}
+                onChange={(e) =>
+                  update({ summarizer: { ...draft.summarizer, enabled: e.target.checked } })
+                }
+              />
+              <span>Enabled</span>
+            </label>
+            {draft.summarizer.enabled && (
+              <>
+                <label className="field">
+                  <span>Summarizer model (Ollama tag)</span>
+                  <input
+                    value={draft.summarizer.model}
+                    onChange={(e) =>
+                      update({ summarizer: { ...draft.summarizer, model: e.target.value } })
+                    }
+                  />
+                </label>
+                <label className="field">
+                  <span>VRAM retention (Ollama keep_alive)</span>
+                  <select
+                    value={draft.summarizer.keep_alive}
+                    onChange={(e) =>
+                      update({ summarizer: { ...draft.summarizer, keep_alive: e.target.value } })
+                    }
+                  >
+                    <option value="0">Unload immediately after each pass</option>
+                    <option value="5m">Keep loaded for 5 minutes</option>
+                    <option value="-1">Keep loaded permanently</option>
+                  </select>
+                </label>
+              </>
+            )}
+          </div>
+
+          <div className="row">
+            <button onClick={() => void ipc.restartBackend()}>Restart backend now</button>
+          </div>
+
           <div className="row">
             <button className="primary" onClick={() => void save()}>
               Save

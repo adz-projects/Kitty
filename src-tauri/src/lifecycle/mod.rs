@@ -86,7 +86,7 @@ pub fn start_stack(app: &AppHandle) {
         // Spawn the BigTiny daemon. No provider env vars — providers are
         // registered at runtime over REST (see
         // `bigtiny::providers::sync_active_provider` right after spawn).
-        let (command, args, dir, warm) = {
+        let (command, args, dir, warm, summarizer) = {
             let state = app.state::<AppState>();
             let cfg = state.config.lock().unwrap();
             (
@@ -94,13 +94,14 @@ pub fn start_stack(app: &AppHandle) {
                 cfg.bigtiny_args.clone(),
                 cfg.bigtiny_dir.clone(),
                 crate::config::providers::active_ollama_target(&cfg),
+                cfg.summarizer.clone(),
             )
         };
         set_startup_phase(&app, StartupPhase::SpawningBackend);
         if warm.is_some() {
             set_startup_phase(&app, StartupPhase::WarmingModel);
         }
-        let spawn_fut = bigtiny_proc::spawn(&command, &args, dir.as_deref());
+        let spawn_fut = bigtiny_proc::spawn(&command, &args, dir.as_deref(), &summarizer);
         let warm_fut = async {
             if let Some((base, model)) = warm {
                 crate::ollama::keep_alive_load(&base, &model).await;

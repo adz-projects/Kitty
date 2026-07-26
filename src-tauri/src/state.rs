@@ -139,6 +139,17 @@ pub struct AppState {
     /// overlays at once), so there's nothing to disambiguate.
     pub screenshot_preview: Mutex<Option<(String, i32, i32, i32, i32)>>,
     pub screenshot_selection: Mutex<Option<tokio::sync::oneshot::Sender<Option<(i32, i32, i32, i32)>>>>,
+    /// Last-seen `compacted_through_rowid` per session, from BigTiny's
+    /// `/api/chat/{id}/stats`. BigTiny's own background compaction pass
+    /// runs fire-and-forget from the *end* of a turn (see
+    /// `bigtiny/agent/loop.py`'s `finally` block) and typically finishes
+    /// after this turn's own SSE stream has already closed, so its
+    /// `compaction` SSE event usually has no open connection left to
+    /// deliver on. `stream::send_prompt` instead polls stats once, shortly
+    /// after emitting `chat://complete`, and diffs against the value
+    /// stored here to decide whether to emit `chat://compaction` — this
+    /// map is what makes that diff possible across polls.
+    pub bigtiny_compaction_watermarks: Mutex<HashMap<String, i64>>,
 }
 
 impl AppState {
@@ -162,6 +173,7 @@ impl AppState {
             pending_handoffs: Mutex::new(HashMap::new()),
             screenshot_preview: Mutex::new(None),
             screenshot_selection: Mutex::new(None),
+            bigtiny_compaction_watermarks: Mutex::new(HashMap::new()),
         }
     }
 }

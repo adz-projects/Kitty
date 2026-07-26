@@ -13,9 +13,12 @@ from bigtiny.providers.base import ToolCall
 from bigtiny.mcp.manager import MCPManager
 from bigtiny.hitl.manager import HITLManager
 from bigtiny.agent import sandbox
+from bigtiny.agent.compaction import run_compaction
 from bigtiny.agent.context_manager import ContextManager, SessionStats
+from bigtiny.config import SummarizerConfig, TokenManagementConfig
 from bigtiny.models.mcp_server import ToolDefinition
 from bigtiny.models.session import Message, MessageRole
+from bigtiny.providers.summarizer_client import SummarizerClient
 from bigtiny.server.events import SSEEvent
 
 logger = logging.getLogger(__name__)
@@ -107,6 +110,9 @@ class Agent:
         context: ContextManager,
         db: Database,
         max_concurrent_tool_calls: int = 5,
+        summarizer: SummarizerClient | None = None,
+        token_management_config: TokenManagementConfig | None = None,
+        summarizer_config: SummarizerConfig | None = None,
     ):
         self.router = router
         self.mcp = mcp
@@ -114,9 +120,16 @@ class Agent:
         self.context = context
         self.db = db
         self.max_concurrent_tool_calls = max_concurrent_tool_calls
+        self.summarizer = summarizer
+        self.token_management_config = token_management_config or TokenManagementConfig()
+        self.summarizer_config = summarizer_config or SummarizerConfig()
         self.stats = SessionStats(db)
         self._tasks: dict[str, asyncio.Task] = {}
         self._loop_history: dict[str, list[str]] = {}
+        # Background compaction passes, tracked so `shutdown()` can cancel
+        # any still in flight rather than leaving them to race a closing DB
+        # connection during process exit.
+        self._compaction_tasks: set[asyncio.Task] = set()
         # Keyed by `action_id`, not `session_id` — a single turn can have more
         # than one tool call pending approval at once (this becomes possible
         # once tool calls execute concurrently), and each needs its own,
@@ -243,7 +256,13 @@ class Agent:
                     tools_for_turn = list(tools_for_turn) + [BUDGET_TOOL]
 
                 # Stream LLM response
-                full_content = ""
+                # Accumulated as a list and joined once below rather than
+                # `full_content +=` on every delta — CPython's in-place
+                # string-append optimization isn't guaranteed once a
+                # variable is read/held across `await` points in a loop
+                # like this one, so this avoids a real (if usually small)
+                # O(n^2) risk for very long streamed responses.
+                content_chunks: list[str] = []
                 turn_tool_calls: list[ToolCall] = []
                 finish_reason: str | None = None
                 turn_usage: dict[str, int] | None = None
@@ -258,7 +277,7 @@ class Agent:
                     top_p=provider_config.get("top_p"),
                 ):
                     if delta.content:
-                        full_content += delta.content
+                        content_chunks.append(delta.content)
                         await event_callback(SSEEvent(
                             type="llm_delta",
                             content=delta.content,
@@ -340,7 +359,7 @@ class Agent:
                 # Add assistant message to context
                 assistant_msg: dict[str, Any] = {
                     "role": "assistant",
-                    "content": full_content,
+                    "content": "".join(content_chunks),
                 }
                 if turn_tool_calls:
                     assistant_msg["tool_calls"] = [
@@ -465,6 +484,77 @@ class Agent:
                 session_id=session_id,
                 is_last=True,
             ))
+            # Fired from `finally`, not from the `llm_stop` branch above:
+            # `llm_stop` only fires on the clean no-tool-calls stop path and
+            # misses error/cancel/loop-detection exits — exactly the
+            # tool-heavy runs most likely to need compaction. `finally` runs
+            # on every path. This is fire-and-forget and must never block
+            # or fail this turn's response.
+            self._schedule_compaction(session_id, event_callback, context_length_hint)
+
+    def _schedule_compaction(
+        self,
+        session_id: str,
+        event_callback: Callable[[SSEEvent], Awaitable[None]],
+        context_length_hint: int | None,
+    ) -> None:
+        if self.summarizer is None or not self.summarizer_config.enabled:
+            return
+        context_length = context_length_hint or self.token_management_config.max_context_tokens
+        task = asyncio.create_task(
+            self._run_compaction_and_notify(session_id, event_callback, context_length)
+        )
+        self._compaction_tasks.add(task)
+        task.add_done_callback(self._compaction_tasks.discard)
+
+    async def _run_compaction_and_notify(
+        self,
+        session_id: str,
+        event_callback: Callable[[SSEEvent], Awaitable[None]],
+        context_length: int,
+    ) -> None:
+        try:
+            result = await run_compaction(
+                session_id,
+                self.db,
+                self.summarizer,
+                self.token_management_config,
+                self.summarizer_config,
+                context_length,
+            )
+        except Exception:
+            logger.exception("compaction: background pass crashed for %s", session_id)
+            return
+        if result is None:
+            return
+        try:
+            await event_callback(SSEEvent(
+                type="compaction",
+                session_id=session_id,
+                content=(
+                    f"Compacted {result.messages_compacted} messages "
+                    f"({result.tokens_before} -> {result.tokens_after} tokens)"
+                ),
+            ))
+        except Exception:
+            # The turn's SSE stream may already be closed by the time a
+            # background compaction pass finishes (the client disconnected,
+            # or drained the queue and returned) — this notification is
+            # best-effort only, never worth failing the pass over.
+            logger.debug("compaction: could not emit event for %s (stream closed?)", session_id)
+
+    async def shutdown(self) -> None:
+        """Cancels any in-flight background compaction passes. Called from
+        the daemon's lifespan shutdown so a pass doesn't race the database
+        connection closing right after it.
+        """
+        for task in list(self._compaction_tasks):
+            task.cancel()
+        for task in list(self._compaction_tasks):
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
 
     async def _run_one_tool_call(
         self,

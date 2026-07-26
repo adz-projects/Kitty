@@ -101,16 +101,18 @@ pub async fn restart_backend(app: AppHandle) -> Result<(), String> {
         let state = app.state::<AppState>();
         state.bigtiny.lock().unwrap().process.kill_if_owned();
     }
-    let (command, args, dir) = {
+    let (command, args, dir, summarizer) = {
         let state = app.state::<AppState>();
         let cfg = state.config.lock().unwrap();
         (
             cfg.bigtiny_command.clone(),
             cfg.bigtiny_args.clone(),
             cfg.bigtiny_dir.clone(),
+            cfg.summarizer.clone(),
         )
     };
-    let handle = lifecycle::bigtiny_proc::spawn(&command, &args, dir.as_deref()).await?;
+    let handle =
+        lifecycle::bigtiny_proc::spawn(&command, &args, dir.as_deref(), &summarizer).await?;
     {
         let state = app.state::<AppState>();
         *state.bigtiny.lock().unwrap() = handle;

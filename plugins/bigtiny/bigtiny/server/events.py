@@ -18,6 +18,7 @@ SSEEventType = Literal[
     "subagent_status",
     "session_status",
     "session_title",
+    "compaction",
 ]
 
 

@@ -156,12 +156,51 @@ DROP TABLE mcp_servers;
 ALTER TABLE mcp_servers_new RENAME TO mcp_servers;
 """
 
+# Conversation compaction state. `messages.id` is a uuid4 hex with no
+# inherent ordering and `created_at` only has 1-second resolution (see the
+# rowid-tiebreaker comment on the history query in context_manager.py), so
+# `rowid` — SQLite's own monotonic row sequence — is the only ordering
+# compaction can key its watermark on.
+#
+# compaction_state guards against two background passes for the same
+# session running concurrently; compaction_started_at lets a pass that
+# crashed mid-run (state stuck at 'running') be reclaimed after it goes
+# stale, rather than wedging that session's compaction forever.
+MIGRATION_V006 = """
+ALTER TABLE sessions ADD COLUMN memory_slots TEXT;
+ALTER TABLE sessions ADD COLUMN compacted_through_rowid INTEGER DEFAULT 0;
+ALTER TABLE sessions ADD COLUMN compaction_state TEXT DEFAULT 'idle';
+ALTER TABLE sessions ADD COLUMN compaction_started_at TIMESTAMP;
+"""
+
+# Perf indexes, added after auditing the daemon's hot-path query patterns:
+# - `sessions(updated_at)`: `list_sessions` orders by this with no supporting
+#   index today (full scan + sort on every session-list call).
+# - `hitl_rules(tool_name)`: `_check_db_rules` filters on this on every
+#   single tool call, every turn — currently a full table scan per call.
+#
+# A `messages(session_id, rowid)` composite was considered too, for the
+# `WHERE session_id=:sid AND rowid > :through ORDER BY rowid ASC` queries in
+# context_manager.py/compaction.py — but SQLite doesn't accept the rowid
+# alias as an explicit indexed column (`CREATE INDEX ... ON t(rowid)` raises
+# "no such column: rowid"). It isn't needed anyway: `idx_messages_session`
+# already lets SQLite locate a session's rows via the index, and since a
+# plain rowid table's underlying storage is itself ordered by rowid, that
+# lookup already yields rows in rowid order for the `ORDER BY rowid ASC`
+# clause without an extra sort step.
+MIGRATION_V007 = """
+CREATE INDEX IF NOT EXISTS idx_sessions_updated_at ON sessions(updated_at);
+CREATE INDEX IF NOT EXISTS idx_hitl_rules_tool_name ON hitl_rules(tool_name);
+"""
+
 MIGRATIONS: dict[int, str] = {
     1: MIGRATION_V001,
     2: MIGRATION_V002,
     3: MIGRATION_V003,
     4: MIGRATION_V004,
     5: MIGRATION_V005,
+    6: MIGRATION_V006,
+    7: MIGRATION_V007,
 }
 
 

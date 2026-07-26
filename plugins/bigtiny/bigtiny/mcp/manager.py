@@ -348,7 +348,21 @@ class MCPServerClient:
     ) -> ToolResult:
         tool_def = next((t for t in self._tools if t.name == tool_name), None)
         if not tool_def:
-            raise MCPServerError(f"Unknown tool: {tool_name}")
+            # Returned, not raised: `execute_tool`'s documented/relied-upon
+            # contract (see `Agent._run_one_tool_call`'s docstring in
+            # loop.py, and the "tool_def not found" case in
+            # `MCPManager.execute_tool` below, which already returns rather
+            # than raises) is that it never raises — its caller's
+            # `asyncio.gather` isn't given `return_exceptions=True`, so an
+            # exception here would cancel every sibling concurrent tool
+            # call in the turn instead of just failing this one.
+            return ToolResult(
+                content=f"[Unknown tool: {tool_name}]",
+                tool_call_id=f"{tool_name}_{uuid4().hex[:8]}",
+                duration_ms=0,
+                output_size_bytes=0,
+                is_error=True,
+            )
 
         try:
             validate_tool_args(tool_def, args)
@@ -396,6 +410,25 @@ class MCPServerClient:
             duration = int((time.monotonic() - start) * 1000)
             return ToolResult(
                 content=f"[Tool '{tool_name}' error: {e}]",
+                tool_call_id=f"{tool_name}_{uuid4().hex[:8]}",
+                duration_ms=duration,
+                output_size_bytes=0,
+                is_error=True,
+            )
+        except Exception as e:
+            # Catches anything `_send_request`/`_extract_content`/
+            # `truncate_output` could raise beyond the two expected cases
+            # above (a dropped connection, a malformed MCP response
+            # tripping a bug in `_extract_content`, etc.) — without this,
+            # an unusual failure here would propagate uncaught through
+            # `MCPManager.execute_tool` and `Agent._run_one_tool_call`
+            # into the turn's `asyncio.gather` (not given
+            # `return_exceptions=True`), killing every concurrent tool
+            # call in the turn instead of just this one.
+            duration = int((time.monotonic() - start) * 1000)
+            logger.exception("Unexpected error executing tool '%s'", tool_name)
+            return ToolResult(
+                content=f"[Tool '{tool_name}' failed unexpectedly: {e}]",
                 tool_call_id=f"{tool_name}_{uuid4().hex[:8]}",
                 duration_ms=duration,
                 output_size_bytes=0,
@@ -527,11 +560,20 @@ class MCPManager:
         servers = await self.db.fetch_all(
             "SELECT * FROM mcp_servers WHERE COALESCE(enabled, 1) = 1"
         )
-        for s in servers:
+
+        async def _connect_one(server_id: str) -> None:
             try:
-                await self.connect_server(s["id"])
+                await self.connect_server(server_id)
             except Exception as e:
-                logger.warning("Failed to connect MCP server %s: %s", s["id"], e)
+                logger.warning("Failed to connect MCP server %s: %s", server_id, e)
+
+        # Connecting servers sequentially meant one slow/unreachable server
+        # (each with its own 60s `connect_server` timeout, see below) added
+        # up to 60s of daemon startup latency per bad server before the
+        # next one even began connecting. Each server already carries its
+        # own try/except (`_connect_one`), so concurrency here can't turn
+        # one server's failure into a startup-wide failure.
+        await asyncio.gather(*[_connect_one(s["id"]) for s in servers])
 
     async def list_tools(self, server_id: str | None = None) -> list[ToolDefinition]:
         if server_id:
@@ -567,7 +609,26 @@ class MCPManager:
                 is_error=True,
             )
 
-        return await client.execute_tool(tool_name, args, timeout)
+        try:
+            return await client.execute_tool(tool_name, args, timeout)
+        except Exception as e:
+            # Defense in depth: `MCPServerClient.execute_tool` is written to
+            # never raise (see its own broad except), but this dispatch
+            # point is the one thing every tool call in the daemon funnels
+            # through (`Agent._run_one_tool_call` in loop.py relies on
+            # never seeing an exception here — its caller's `asyncio.gather`
+            # isn't given `return_exceptions=True`, so one escaping
+            # exception would otherwise cancel every concurrent tool call
+            # in the turn), so it's worth not depending solely on that
+            # invariant holding inside every current and future transport.
+            logger.exception("Unexpected error dispatching tool '%s'", tool_name)
+            return ToolResult(
+                content=f"[Tool '{tool_name}' failed unexpectedly: {e}]",
+                tool_call_id=f"{tool_name}_{uuid4().hex[:8]}",
+                duration_ms=0,
+                output_size_bytes=0,
+                is_error=True,
+            )
 
     async def disconnect_server(self, server_id: str) -> None:
         client = self._servers.pop(server_id, None)

@@ -44,6 +44,17 @@ export interface Config {
   /** Whether local inference (Ollama) is in play for this install — set by
       the wizard's first-screen fork, toggleable later from Advanced. */
   ollama_enabled: boolean;
+  /** BigTiny background context-compaction settings — relayed to the daemon
+      as `BIGTINY_SUMMARIZER__*` env vars at spawn time (Rust `Config::summarizer`,
+      mirrors `bigtiny/config.py`'s `SummarizerConfig`). A daemon restart is
+      needed for a change here to take effect. */
+  summarizer: SummarizerSettings;
+}
+
+export interface SummarizerSettings {
+  enabled: boolean;
+  model: string;
+  keep_alive: string;
 }
 
 // --- Providers (Phase 5) ---
@@ -573,6 +584,23 @@ export interface CompleteEvent {
 export interface ChatErrorEvent {
   session_id: string;
   message: string;
+}
+
+/** BigTiny's background context-compaction pass completed for this session
+    (see `bigtiny/agent/compaction.py`). Delivered via a post-turn stats
+    poll (`stream::poll_compaction_status`), not pushed live — the pass
+    runs fire-and-forget after the turn's own SSE stream usually already
+    closed, so it typically lands a few seconds after `chat://complete`. */
+export interface CompactionEvent {
+  session_id: string;
+  compacted_through_rowid?: number;
+  memory_slots?: {
+    new_constraints?: string[];
+    new_decisions?: string[];
+    new_completions?: string[];
+    current_state?: string;
+  } | null;
+  content?: string;
 }
 
 // --- Approvals / modes (Phase 3) ---

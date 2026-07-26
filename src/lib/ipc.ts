@@ -20,6 +20,7 @@ import type {
   AdaptivePathwayEmbeddingStatusPayload,
   ApprovalNeededEvent,
   ChatErrorEvent,
+  CompactionEvent,
   CompleteEvent,
   Config,
   Detection,
@@ -467,6 +468,8 @@ export const onComplete = (cb: (e: CompleteEvent) => void) =>
   listen<CompleteEvent>('chat://complete', (e) => cb(e.payload));
 export const onChatError = (cb: (e: ChatErrorEvent) => void) =>
   listen<ChatErrorEvent>('chat://error', (e) => cb(e.payload));
+export const onCompaction = (cb: (e: CompactionEvent) => void) =>
+  listen<CompactionEvent>('chat://compaction', (e) => cb(e.payload));
 
 export const onUserMessage = (cb: (e: TextDeltaEvent) => void) =>
   listen<TextDeltaEvent>('chat://user-message', (e) => cb(e.payload));

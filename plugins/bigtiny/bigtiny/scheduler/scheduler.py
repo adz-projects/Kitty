@@ -108,6 +108,22 @@ class Scheduler:
                 "error_message = :err, completed_at = CURRENT_TIMESTAMP WHERE id = :id",
                 {"err": str(e), "id": exec_id},
             )
+            # Can't delete temp_sid here the way the success path does above:
+            # execution_history.session_id (NOT NULL, REFERENCES sessions(id),
+            # no ON DELETE clause) still points at it on this path — with
+            # foreign_keys=ON (storage.py's connect()), that delete would
+            # raise a FOREIGN KEY constraint failure inside this except
+            # block, which is strictly worse than leaving the row (it would
+            # mask the real failure being logged above). Mark it failed
+            # instead so it's visibly a dead marker rather than a
+            # perpetually-'idle' ghost session — genuine deletion would
+            # require either relaxing this FK to ON DELETE SET NULL/CASCADE
+            # or deleting the execution_history audit row too, both bigger
+            # changes than this fix warrants.
+            await self.db.execute(
+                "UPDATE sessions SET status = 'failed' WHERE id = :id",
+                {"id": temp_sid},
+            )
 
     async def stop(self) -> None:
         self._apscheduler.shutdown()

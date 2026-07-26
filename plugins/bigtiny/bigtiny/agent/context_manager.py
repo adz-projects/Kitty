@@ -7,17 +7,38 @@ from uuid import uuid4
 from bigtiny.config import TokenManagementConfig
 from bigtiny.storage import Database
 from bigtiny.models.mcp_server import ToolDefinition
+from bigtiny.agent.tokens import count_message_tokens, count_messages_tokens
+from bigtiny.agent.compaction import (
+    apply_tool_mask,
+    emergency_trim,
+    find_reserve_floor_rowid,
+    render_memory_block,
+)
 
 BASE_PERSONA = (
     "You are a helpful, precise AI assistant. "
     "Respond concisely and accurately."
 )
 
+# How much of the model's context window a fully-assembled prompt may
+# occupy before the synchronous emergency valve (Phase 5) kicks in.
+# Deliberately higher than compaction_threshold (the background-compaction
+# trigger) — this only fires when background compaction has genuinely
+# fallen behind (e.g. a single turn produced a huge burst of tool output),
+# not as the normal path.
+EMERGENCY_TRIM_RATIO = 0.9
+
 
 class ContextManager:
-    def __init__(self, db: Database, config: TokenManagementConfig):
+    def __init__(
+        self,
+        db: Database,
+        config: TokenManagementConfig,
+        reserve_exchanges: int = 3,
+    ):
         self.db = db
         self.config = config
+        self.reserve_exchanges = reserve_exchanges
 
     async def build_messages(
         self,
@@ -28,12 +49,15 @@ class ContextManager:
         images: list[dict[str, str]] | None = None,
         max_context_tokens_override: int | None = None,
     ) -> list[dict[str, Any]]:
-        # rowid tiebreaker: created_at has 1-second resolution, so messages
-        # written in the same second would otherwise come back in random order.
-        rows = await self.db.fetch_all(
-            "SELECT * FROM messages WHERE session_id = :sid "
-            "ORDER BY created_at ASC, rowid ASC",
-            {"sid": session_id},
+        session = await self.db.fetch_one(
+            "SELECT memory_slots, compacted_through_rowid FROM sessions WHERE id = :id",
+            {"id": session_id},
+        )
+        compacted_through = (session or {}).get("compacted_through_rowid") or 0
+        memory_slots = (
+            json.loads(session["memory_slots"])
+            if session and session.get("memory_slots")
+            else None
         )
 
         messages: list[dict[str, Any]] = []
@@ -58,24 +82,72 @@ class ContextManager:
             )
             messages.append({"role": "system", "content": "\n".join(tool_hints_lines)})
 
-        for row in rows:
-            if row["role"] == "system":
-                continue
-            # Keep the DB id so save_messages can tell persisted history
-            # apart from messages produced during this run.
-            content: Any = row["content"] or ""
-            if row.get("content_format") == "blocks" and content:
-                content = json.loads(content)
-            msg: dict[str, Any] = {
-                "id": row["id"],
-                "role": row["role"],
-                "content": content,
-            }
-            if row["tool_calls"]:
-                msg["tool_calls"] = json.loads(row["tool_calls"])
-            if row.get("tool_call_id"):
-                msg["tool_call_id"] = row["tool_call_id"]
-            messages.append(msg)
+        # Layer 4: anchor the very first user message verbatim, so the
+        # original project goal survives compaction entirely — it is never
+        # part of the compacted/masked span below, regardless of how far
+        # `compacted_through_rowid` has advanced. Only done when that
+        # message is plain text: a multimodal (blocks) first message can't
+        # be flattened into a system string without destroying its image
+        # content, so it's left in the live section below instead (rowid 1
+        # is always > compacted_through on any session that hasn't already
+        # folded it away, so nothing is lost either way).
+        #
+        # Fetched as its own cheap, indexed LIMIT-1 lookup rather than
+        # pulled out of a full-history scan — this message's row never
+        # changes once written, so there's no reason to re-fetch the whole
+        # session's history just to find it. This is what lets the Layer 6
+        # query below be bounded to the live tail instead of the full
+        # session (the previous unbounded `SELECT ... ORDER BY rowid ASC`
+        # with no `WHERE rowid > :through` meant every turn re-fetched and
+        # re-decoded the entire message history, growing without bound over
+        # a session's lifetime).
+        first_user_row = await self.db.fetch_one(
+            "SELECT rowid, content, content_format FROM messages "
+            "WHERE session_id = :sid AND role = 'user' ORDER BY rowid ASC LIMIT 1",
+            {"sid": session_id},
+        )
+        first_user_content = self._row_content(first_user_row) if first_user_row else None
+        anchor_first_user = first_user_row is not None and isinstance(first_user_content, str)
+        if anchor_first_user:
+            messages.append({
+                "role": "system",
+                "content": f"[Original request]\n{first_user_content}",
+            })
+
+        # Layer 5: consolidated memory from prior Tier-2 compaction passes.
+        memory_block = render_memory_block(memory_slots)
+        if memory_block:
+            messages.append({"role": "system", "content": memory_block})
+
+        # Layer 6: everything not yet folded into memory, Tier-1 masked.
+        # Bounded to `rowid > compacted_through` — mirrors the query
+        # `compaction.py`'s `run_compaction` already uses, so the two are
+        # now consistent instead of one being bounded and the other not.
+        first_user_rowid = first_user_row["rowid"] if anchor_first_user else None
+        live_rows = await self.db.fetch_all(
+            "SELECT rowid, * FROM messages WHERE session_id = :sid "
+            "AND role != 'system' AND rowid > :through ORDER BY rowid ASC",
+            {"sid": session_id, "through": compacted_through},
+        )
+        if first_user_rowid is not None:
+            live_rows = [r for r in live_rows if r["rowid"] != first_user_rowid]
+        # token_count is computed and persisted once at insert time
+        # (save_messages) — summing it here instead of re-running tiktoken
+        # over freshly-decoded content is what keeps this per-turn check
+        # cheap regardless of history size. Tier-1 masking only ever
+        # shrinks a message's rendered content, so a stale (pre-mask)
+        # count is a safe overestimate for the emergency-valve check below:
+        # it can only make the valve trigger slightly more eagerly, never
+        # let an over-budget prompt through.
+        live_token_sum = sum((r.get("token_count") or 0) for r in live_rows)
+        live_messages = [self._row_to_message(r) for r in live_rows]
+        reserve_floor = find_reserve_floor_rowid(live_rows, self.reserve_exchanges)
+        live_messages = apply_tool_mask(live_messages, reserve_floor, self.config)
+        # Captured before extending with the (potentially large) live tail,
+        # so the emergency-valve check below can tiktoken-count just the
+        # small, fixed system layers instead of the whole assembled prompt.
+        head = list(messages)
+        messages.extend(live_messages)
 
         if images:
             blocks: list[dict[str, Any]] = [{"type": "text", "text": new_message}]
@@ -88,50 +160,55 @@ class ContextManager:
             messages.append({"role": "user", "content": blocks})
         else:
             messages.append({"role": "user", "content": new_message})
+        tail_new_message = messages[-1]
 
-        total_tokens = self._count_tokens(messages)
         max_context_tokens = max_context_tokens_override or self.config.max_context_tokens
-        threshold = max_context_tokens * self.config.compaction_threshold
-        if total_tokens > threshold:
-            messages = await self._compact(session_id, messages)
+        emergency_cap = max_context_tokens * EMERGENCY_TRIM_RATIO
+        # Only the system layers (small, fixed) and the just-appended new
+        # message (not yet persisted, so it has no token_count row to sum)
+        # need live tiktoken counting; the potentially-large live tail uses
+        # the persisted sum above instead.
+        total_tokens = (
+            live_token_sum + self._count_tokens(head) + self._count_tokens([tail_new_message])
+        )
+        if total_tokens > emergency_cap:
+            target = max_context_tokens * self.config.compaction_target_ratio
+            # Only the live/masked tail (Layer 6) is eligible for the
+            # synchronous trim — the system layers, anchor, and memory
+            # block are small and never dropped.
+            trimmed_live = emergency_trim(live_messages, reserve_floor, target)
+            messages = head + trimmed_live + [tail_new_message]
 
         return messages
 
+    @staticmethod
+    def _row_content(row: dict[str, Any]) -> Any:
+        content: Any = row.get("content") or ""
+        if row.get("content_format") == "blocks" and content:
+            content = json.loads(content)
+        return content
+
+    def _row_to_message(self, row: dict[str, Any]) -> dict[str, Any]:
+        # Keeps the DB id (so save_messages can tell persisted history
+        # apart from messages produced during this run) and rowid (so
+        # apply_tool_mask/emergency_trim can key off it).
+        msg: dict[str, Any] = {
+            "id": row["id"],
+            "rowid": row["rowid"],
+            "role": row["role"],
+            "content": self._row_content(row),
+        }
+        if row["tool_calls"]:
+            msg["tool_calls"] = json.loads(row["tool_calls"])
+        if row.get("tool_call_id"):
+            msg["tool_call_id"] = row["tool_call_id"]
+        return msg
+
     def _count_tokens(self, messages: list[dict[str, Any]]) -> int:
-        total = 0
-        for msg in messages:
-            content = str(msg.get("content", ""))
-            total += len(content) // 4
-        return total
+        return count_messages_tokens(messages)
 
     async def count_tokens(self, messages: list[dict[str, Any]]) -> int:
         return self._count_tokens(messages)
-
-    async def _compact(
-        self,
-        session_id: str,
-        messages: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        system_msgs = [m for m in messages if m["role"] == "system"]
-        non_system = [m for m in messages if m["role"] != "system"]
-
-        kept = list(system_msgs)
-        keep_count = min(len(non_system), 4)
-        keep_messages = non_system[-keep_count:] if keep_count > 0 else []
-        to_summarize = non_system[:-keep_count] if len(non_system) > keep_count else []
-
-        if to_summarize:
-            total_text = " ".join(
-                str(m.get("content", "")) for m in to_summarize if m.get("content")
-            )
-            summary = (total_text[:300] + "...") if len(total_text) > 300 else total_text
-            kept.append({
-                "role": "system",
-                "content": f"[Previous conversation summarized: {summary}]",
-            })
-
-        kept.extend(keep_messages)
-        return kept
 
     async def save_messages(
         self,
@@ -148,11 +225,12 @@ class ContextManager:
                 content = json.dumps(content)
                 content_format = "blocks"
             tool_calls = msg.get("tool_calls")
+            token_count = count_message_tokens(msg)
             await self.db.execute(
                 "INSERT INTO messages "
                 "(id, session_id, role, content, tool_calls, tool_call_id, "
                 " content_format, token_count) "
-                "VALUES (:id, :sid, :role, :content, :tc, :tcid, :fmt, 0)",
+                "VALUES (:id, :sid, :role, :content, :tc, :tcid, :fmt, :tok)",
                 {
                     "id": msg_id,
                     "sid": session_id,
@@ -161,6 +239,7 @@ class ContextManager:
                     "tc": json.dumps(tool_calls) if tool_calls else None,
                     "tcid": msg.get("tool_call_id"),
                     "fmt": content_format,
+                    "tok": token_count,
                 },
             )
         await self.db.execute(
@@ -174,8 +253,16 @@ class SessionStats:
         self.db = db
 
     async def get_stats(self, session_id: str) -> dict[str, object]:
+        # Only `role`/`token_count` are ever read below — projecting just
+        # those (instead of `SELECT *`, which pulls every row's full
+        # content/tool_calls JSON into memory only to discard it) is what
+        # keeps this cheap on a long session. No ORDER BY needed either:
+        # the sums below are order-independent, and dropping it lets SQLite
+        # skip the sort it otherwise has to do (no index exists on
+        # `created_at` — see the perf-indexes migration's comment for why
+        # `rowid` is used for ordering elsewhere instead).
         messages = await self.db.fetch_all(
-            "SELECT * FROM messages WHERE session_id = :sid ORDER BY created_at ASC",
+            "SELECT role, token_count FROM messages WHERE session_id = :sid",
             {"sid": session_id},
         )
         session = await self.db.fetch_one(
@@ -190,9 +277,11 @@ class SessionStats:
         tokens_received = sum(
             m.get("token_count", 0) for m in messages if m["role"] == "assistant"
         )
-        current_context = sum(
-            len(str(m.get("content", ""))) // 4 for m in messages
-        )
+        # token_count is populated accurately at insert time (save_messages),
+        # so this is a straight sum rather than re-deriving from raw DB rows
+        # (whose tool_calls/content columns are already-serialized JSON
+        # strings, not the decoded objects count_message_tokens expects).
+        current_context = sum(m.get("token_count", 0) or 0 for m in messages)
 
         meta = {}
         if session and session.get("metadata"):
@@ -200,6 +289,12 @@ class SessionStats:
 
         cost_tokens = tokens_sent + tokens_received
         estimated_cost = round(cost_tokens * 0.000003, 6) if cost_tokens > 0 else 0
+
+        memory_slots = (
+            json.loads(session["memory_slots"])
+            if session and session.get("memory_slots")
+            else None
+        )
 
         return {
             "session_id": session_id,
@@ -209,6 +304,8 @@ class SessionStats:
             "current_context_tokens": current_context,
             "estimated_cost_usd": estimated_cost,
             "provider_history": meta.get("usage", []),
+            "compacted_through_rowid": (session or {}).get("compacted_through_rowid") or 0,
+            "memory_slots": memory_slots,
         }
 
     async def record_usage(

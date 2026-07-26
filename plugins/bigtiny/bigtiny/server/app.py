@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import sys
 import time
 from contextlib import asynccontextmanager
@@ -15,6 +16,7 @@ from bigtiny.mcp.manager import MCPManager
 from bigtiny.hitl.manager import HITLManager
 from bigtiny.agent.context_manager import ContextManager
 from bigtiny.agent.loop import Agent
+from bigtiny.providers.summarizer_client import SummarizerClient
 from bigtiny.recipes.engine import RecipeEngine
 from bigtiny.scheduler.scheduler import Scheduler
 from bigtiny.server.middleware import add_middleware
@@ -43,7 +45,10 @@ def loop_factory() -> asyncio.AbstractEventLoop:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    config = load_config()
+    # `--config`, if any, is relayed via this env var by __main__.py since
+    # uvicorn invokes this module as a factory string ("bigtiny.server.app:
+    # create_app") rather than passing the parsed args through directly.
+    config = load_config(os.environ.get("BIGTINY_CONFIG_PATH"))
 
     db = Database()
     await db.connect()
@@ -55,8 +60,21 @@ async def lifespan(app: FastAPI):
     await router.load_providers()
 
     hitl = HITLManager(db, config.hitl)
-    context = ContextManager(db, config.token_management)
-    agent = Agent(router, mcp, hitl, context, db, config.agent.max_concurrent_tool_calls)
+    context = ContextManager(
+        db, config.token_management, config.summarizer.reserve_exchanges
+    )
+    summarizer = SummarizerClient(config.summarizer)
+    agent = Agent(
+        router,
+        mcp,
+        hitl,
+        context,
+        db,
+        config.agent.max_concurrent_tool_calls,
+        summarizer=summarizer,
+        token_management_config=config.token_management,
+        summarizer_config=config.summarizer,
+    )
 
     recipe_engine = RecipeEngine(db, agent, mcp)
     scheduler = Scheduler(db, recipe_engine)
@@ -76,6 +94,8 @@ async def lifespan(app: FastAPI):
     yield
 
     await scheduler.stop()
+    await agent.shutdown()
+    await summarizer.aclose()
     await mcp.disconnect_all()
     await db.close()
 

@@ -9,6 +9,7 @@ import {
   onApprovalNeeded,
   onChatError,
   onClipboardAttach,
+  onCompaction,
   onComplete,
   onMessageDelta,
   onMode,
@@ -171,6 +172,11 @@ interface ChatState {
   savedApprovalMode: string | null;
   /// Non-blocking notice (e.g. attaching to an untrusted provider). Round-2 item 13.
   warning: string | null;
+  /** BigTiny folded older history into its background memory summary
+      (`chat://compaction`, from `bigtiny/agent/compaction.py`). Purely
+      informational — nothing to act on, just lets the user know context
+      isn't silently growing forever. */
+  compactionNotice: string | null;
   /** Stop/Force-Stop phase (Round-5). `null` = not stopping. `'stopping'` =
       Stop was clicked, cancel notification sent, waiting out the grace period
       for goosed to actually end the turn. `'forceable'` = grace elapsed with no
@@ -217,6 +223,7 @@ interface ChatState {
   pendingForcedAnswer: string | null;
   bindEvents: () => void;
   dismissWarning: () => void;
+  dismissCompactionNotice: () => void;
   /** Clear the Artifacts pane list (Round-5). Only empties the derived
       in-memory list — never touches the files on disk. */
   clearArtifacts: () => void;
@@ -680,6 +687,7 @@ export const useChatStore = create<ChatState>((set, get) => {
     modeOverride: null,
     savedApprovalMode: null,
     warning: null,
+    compactionNotice: null,
     stopPhase: null,
     abandonedSession: null,
     loopSuspected: false,
@@ -689,6 +697,7 @@ export const useChatStore = create<ChatState>((set, get) => {
     pendingForcedAnswer: null,
 
     dismissWarning: () => set({ warning: null }),
+    dismissCompactionNotice: () => set({ compactionNotice: null }),
 
     clearArtifacts: () => set({ artifacts: [] }),
 
@@ -2004,6 +2013,15 @@ export const useChatStore = create<ChatState>((set, get) => {
         // than a clean completion — still worth asking for an answer, since
         // the model's own prior reasoning is still available as context.
         if (forcedAnswerSession === e.session_id) void get().send(FORCED_ANSWER_PROMPT);
+      });
+      void onCompaction((e) => {
+        if (!forActive(e.session_id)) return;
+        const state = e.memory_slots?.current_state;
+        set({
+          compactionNotice: state
+            ? `Context compacted — memory updated: ${state}`
+            : 'Older context was compacted into a background summary.',
+        });
       });
     },
   };

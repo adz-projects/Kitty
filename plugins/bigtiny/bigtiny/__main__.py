@@ -32,10 +32,19 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    import os
+
     if args.secret:
         # via env so uvicorn reload/worker subprocesses inherit it
-        import os
         os.environ["BIGTINY_SECRET"] = args.secret
+
+    if args.config:
+        # `server.app:create_app` is invoked by uvicorn as a factory string
+        # rather than called directly, and its `lifespan()` builds its own
+        # config independently of this function's local `config` — passing
+        # the path via env is what makes that later load_config() call see
+        # the same --config file this process was started with.
+        os.environ["BIGTINY_CONFIG_PATH"] = args.config
 
     from bigtiny.config import load_config
     from bigtiny.logging_config import setup_logging

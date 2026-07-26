@@ -199,6 +199,37 @@ pub struct Config {
     /// directly get them too), and `migrate_recipes` in `load` re-seeds the one
     /// case `Default` can't reach — an explicit `"recipes": []`.
     pub recipes: Vec<Recipe>,
+    /// BigTiny background context-compaction settings, relayed to the daemon
+    /// as `BIGTINY_SUMMARIZER__*` env vars at spawn
+    /// (`lifecycle::bigtiny_proc::spawn`) — BigTiny only ever reads config via
+    /// env/its own `--config` YAML, never anything Kitty writes directly, so
+    /// this is the one place these settings need to exist on the Kitty side.
+    #[serde(default)]
+    pub summarizer: SummarizerSettings,
+}
+
+/// See `Config::summarizer`. Field names/defaults mirror BigTiny's own
+/// `SummarizerConfig` (`plugins/bigtiny/bigtiny/config.py`) so the two don't
+/// drift apart, but this is Kitty's independent copy — BigTiny's Python
+/// defaults still apply if the daemon is ever launched without these env
+/// vars set at all (e.g. a source checkout run directly, bypassing Kitty).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SummarizerSettings {
+    pub enabled: bool,
+    pub model: String,
+    /// Ollama `keep_alive` value: "0" unloads immediately, "5m" keeps the
+    /// summarizer resident for 5 idle minutes, "-1" pins it in VRAM.
+    pub keep_alive: String,
+}
+
+impl Default for SummarizerSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            model: "qwen3.5:0.8b".to_string(),
+            keep_alive: "5m".to_string(),
+        }
+    }
 }
 
 impl Default for Config {
@@ -242,6 +273,7 @@ impl Default for Config {
             bigtiny_args: default_bigtiny_args(),
             bigtiny_dir: None,
             recipes: recipes::builtin_templates(),
+            summarizer: SummarizerSettings::default(),
         }
     }
 }

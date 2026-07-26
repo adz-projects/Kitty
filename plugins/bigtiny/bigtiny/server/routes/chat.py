@@ -64,7 +64,12 @@ class RenameSessionRequest(BaseModel):
 @router.post("/{session_id}/send")
 async def send_message(session_id: str, body: SendMessageRequest, request: Request):
     agent: Agent = request.app.state.agent
-    queue: asyncio.Queue[SSEEvent] = asyncio.Queue()
+    # Bounded so a slow/stalled SSE consumer applies natural backpressure
+    # (the producer's `await queue.put(event)` briefly waits) instead of
+    # this queue growing without bound in memory — nothing here needs
+    # fire-and-forget semantics, and a healthy consumer never gets close to
+    # this size in normal operation.
+    queue: asyncio.Queue[SSEEvent] = asyncio.Queue(maxsize=1000)
 
     async def callback(event: SSEEvent):
         await queue.put(event)
