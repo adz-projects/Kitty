@@ -111,6 +111,28 @@ pub async fn set_wasm_math_mcp_enabled(
     Ok(())
 }
 
+/// Whether the bundled `visualizations` server is registered+enabled in
+/// BigTiny. No credentials, so a plain toggle like `wasm_math_mcp` above.
+#[tauri::command]
+pub fn get_visualizations_enabled(state: tauri::State<'_, AppState>) -> Result<bool, String> {
+    Ok(state.config.lock().unwrap().visualizations_enabled)
+}
+
+#[tauri::command]
+pub async fn set_visualizations_enabled(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    enabled: bool,
+) -> Result<(), String> {
+    {
+        let mut cfg = state.config.lock().unwrap();
+        cfg.visualizations_enabled = enabled;
+        config::save(&cfg).map_err(|e| e.to_string())?;
+    }
+    mcp::ensure_builtin_servers(&app).await;
+    Ok(())
+}
+
 /// Brave Search MCP status for Settings — `enabled` mirrors the user's
 /// toggle intent, `configured` reports whether an API key is currently
 /// stored in the keyring. The UI shows the API-key form whenever `!configured`,

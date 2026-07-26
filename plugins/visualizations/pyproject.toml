@@ -3,25 +3,22 @@ requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "wasm-math-mcp"
+name = "visualizations"
 version = "0.1.0"
-description = "Sandboxed Python execution (math/stats/NumPy) as a stdio MCP tool."
+description = "Accessible HTML tables and SVG diagrams, wrapped for iframe rendering, as a stdio MCP tool."
 requires-python = ">=3.11"
 dependencies = [
     "mcp[cli]>=1.2.0",
-    "numpy>=1.24",
-    "pandas>=2.0",
-    "scipy>=1.11",
 ]
 
 [project.scripts]
-wasm-math-mcp = "wasm_math_mcp:main"
+visualizations = "visualizations:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0", "pytest-asyncio>=0.21"]
 
 [tool.setuptools]
-py-modules = ["wasm_math_mcp"]
+py-modules = ["visualizations"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

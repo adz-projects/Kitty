@@ -5,13 +5,14 @@ import type { McpServer } from '@/lib/types';
 /** `adaptive-pathway` is managed solely by the single enable checkbox in
     Settings → Advanced → Adaptive Pathway — showing it here too would be a
     confusing second control over the same thing. `replacement-mcp`,
-    `wasm-math-mcp`, and `brave-mcp-search` each get their own dedicated card
-    below, not the generic list. */
+    `wasm-math-mcp`, `brave-mcp-search`, and `visualizations` each get their
+    own dedicated card below, not the generic list. */
 const HIDDEN_SERVER_NAMES = new Set([
   'adaptive-pathway',
   'replacement-mcp',
   'wasm-math-mcp',
   'brave-mcp-search',
+  'visualizations',
 ]);
 
 type Transport = 'stdio' | 'sse' | 'streamable_http';
@@ -214,9 +215,12 @@ export function McpServers() {
         Tools available to the agent. Changes here take effect immediately — no restart needed.
       </p>
       {error && <div className="chat-error">{error}</div>}
-      <ReplacementMcpCard />
-      <WasmMathMcpCard />
-      <BraveMcpSearchCard />
+      <div className="ext-grid" style={{ marginBottom: 16 }}>
+        <ReplacementMcpCard />
+        <WasmMathMcpCard />
+        <BraveMcpSearchCard />
+        <VisualizationsCard />
+      </div>
 
       <div className="ext-grid">
         {servers.map((s) => (
@@ -342,23 +346,21 @@ function ReplacementMcpCard() {
   };
 
   return (
-    <>
-      <label className="ext-card" style={{ marginBottom: 16 }}>
-        <div className="ext-card-head">
-          <span className="ext-card-name">Lean tools (replacement-mcp)</span>
-          <input
-            type="checkbox"
-            checked={enabled}
-            disabled={busy}
-            onChange={(ev) => void toggle(ev.target.checked)}
-          />
-        </div>
-        <span className="muted ext-card-desc">
-          Context-optimized shell/file/web/document tools for local, small models.
-        </span>
-      </label>
+    <label className="ext-card">
+      <div className="ext-card-head">
+        <span className="ext-card-name">Lean tools (replacement-mcp)</span>
+        <input
+          type="checkbox"
+          checked={enabled}
+          disabled={busy}
+          onChange={(ev) => void toggle(ev.target.checked)}
+        />
+      </div>
+      <span className="muted ext-card-desc">
+        Context-optimized shell/file/web/document tools for local, small models.
+      </span>
       {error && <div className="chat-error">{error}</div>}
-    </>
+    </label>
   );
 }
 
@@ -392,24 +394,70 @@ function WasmMathMcpCard() {
   };
 
   return (
-    <>
-      <label className="ext-card" style={{ marginBottom: 16 }}>
-        <div className="ext-card-head">
-          <span className="ext-card-name">Math (wasm-math-mcp)</span>
-          <input
-            type="checkbox"
-            checked={enabled}
-            disabled={busy}
-            onChange={(ev) => void toggle(ev.target.checked)}
-          />
-        </div>
-        <span className="muted ext-card-desc">
-          Sandboxed Python execution for exact math, stats, and NumPy — no shell, no filesystem,
-          no network access.
-        </span>
-      </label>
+    <label className="ext-card">
+      <div className="ext-card-head">
+        <span className="ext-card-name">Math (wasm-math-mcp)</span>
+        <input
+          type="checkbox"
+          checked={enabled}
+          disabled={busy}
+          onChange={(ev) => void toggle(ev.target.checked)}
+        />
+      </div>
+      <span className="muted ext-card-desc">
+        Sandboxed Python execution for exact math, stats, and NumPy — no shell, no filesystem,
+        no network access.
+      </span>
       {error && <div className="chat-error">{error}</div>}
-    </>
+    </label>
+  );
+}
+
+/** Dedicated card for the bundled `visualizations` server (see
+    `plugins/visualizations/`) — accessible HTML tables and SVG diagrams,
+    rendered in an iframe in chat (see `ToolCallCard`'s `parseIframePayload`).
+    On by default, no credentials — same shape as `WasmMathMcpCard`. */
+function VisualizationsCard() {
+  const [enabled, setEnabled] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    void ipc
+      .getVisualizationsEnabled()
+      .then(setEnabled)
+      .catch((e) => setError(String(e)));
+  }, []);
+
+  const toggle = async (next: boolean) => {
+    setBusy(true);
+    setError('');
+    try {
+      await ipc.setVisualizationsEnabled(next);
+      setEnabled(next);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <label className="ext-card">
+      <div className="ext-card-head">
+        <span className="ext-card-name">Visuals (visualizations)</span>
+        <input
+          type="checkbox"
+          checked={enabled}
+          disabled={busy}
+          onChange={(ev) => void toggle(ev.target.checked)}
+        />
+      </div>
+      <span className="muted ext-card-desc">
+        Accessible HTML tables and SVG diagrams, rendered inline in chat.
+      </span>
+      {error && <div className="chat-error">{error}</div>}
+    </label>
   );
 }
 
@@ -480,56 +528,50 @@ function BraveMcpSearchCard() {
   const isOn = enabled && configured;
 
   return (
-    <>
-      <div className="ext-card" style={{ marginBottom: 16 }}>
-        <div className="ext-card-head">
-          <span className="ext-card-name">Web search (brave-mcp-search)</span>
+    <div className="ext-card">
+      <div className="ext-card-head">
+        <span className="ext-card-name">Web search (brave-mcp-search)</span>
+        <input
+          type="checkbox"
+          checked={isOn}
+          disabled={busy}
+          onChange={(ev) => {
+            if (!ev.target.checked) void disable();
+            // Checking it does nothing by itself — the API key form below
+            // (shown whenever !isOn) is what actually turns it on.
+          }}
+        />
+      </div>
+      <span className="muted ext-card-desc">
+        Brave Search LLM Context API. Requires an API key — turning this off always clears the
+        stored key, so turning it back on requires entering it again.
+      </span>
+      {!isOn && configured && (
+        <span className="muted ext-card-desc">
+          A saved key was found but the server is switched off. Enter a key to turn it back
+          on — this replaces the saved one.
+        </span>
+      )}
+      {!isOn && (
+        <div className="row" style={{ marginTop: 8 }}>
           <input
-            type="checkbox"
-            checked={isOn}
-            disabled={busy}
-            onChange={(ev) => {
-              if (!ev.target.checked) void disable();
-              // Checking it does nothing by itself — the API key form below
-              // (shown whenever !isOn) is what actually turns it on.
+            type="password"
+            placeholder="Brave Search API key"
+            value={apiKey}
+            onChange={(e) => setApiKey(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') {
+                e.preventDefault();
+                void saveKey();
+              }
             }}
           />
+          <button className="primary" disabled={busy || !apiKey.trim()} onClick={() => void saveKey()}>
+            {busy ? 'Saving…' : 'Enable'}
+          </button>
         </div>
-        <span className="muted ext-card-desc">
-          Brave Search LLM Context API. Requires an API key — turning this off always clears the
-          stored key, so turning it back on requires entering it again.
-        </span>
-        {!isOn && configured && (
-          <span className="muted ext-card-desc">
-            A saved key was found but the server is switched off. Enter a key to turn it back
-            on — this replaces the saved one.
-          </span>
-        )}
-        {!isOn && (
-          <div className="row" style={{ marginTop: 8 }}>
-            <input
-              type="password"
-              placeholder="Brave Search API key"
-              value={apiKey}
-              onChange={(e) => setApiKey(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter') {
-                  e.preventDefault();
-                  void saveKey();
-                }
-              }}
-            />
-            <button
-              className="primary"
-              disabled={busy || !apiKey.trim()}
-              onClick={() => void saveKey()}
-            >
-              {busy ? 'Saving…' : 'Enable'}
-            </button>
-          </div>
-        )}
-      </div>
+      )}
       {error && <div className="chat-error">{error}</div>}
-    </>
+    </div>
   );
 }

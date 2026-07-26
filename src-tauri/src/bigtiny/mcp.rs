@@ -189,6 +189,7 @@ pub async fn ensure_builtin_servers(app: &AppHandle) {
         replacement_enabled,
         wasm_math_enabled,
         brave_search_enabled,
+        visualizations_enabled,
         ap_enabled,
         ap_db_path,
         ap_embedding_model,
@@ -200,6 +201,7 @@ pub async fn ensure_builtin_servers(app: &AppHandle) {
             cfg.replacement_mcp_enabled,
             cfg.wasm_math_mcp_enabled,
             cfg.brave_mcp_search_enabled,
+            cfg.visualizations_enabled,
             cfg.adaptive_pathway_enabled,
             cfg.adaptive_pathway_db_path.clone(),
             cfg.adaptive_pathway_embedding_model.clone(),
@@ -293,6 +295,24 @@ pub async fn ensure_builtin_servers(app: &AppHandle) {
             env: brave_env,
             headers: HashMap::new(),
             enabled: brave_search_enabled && !brave_api_key.is_empty(),
+        },
+    )
+    .await;
+
+    let visualizations_cmd = crate::config::bundled_plugin_path("visualizations.exe")
+        .unwrap_or_else(|| "visualizations".to_string());
+    upsert_builtin(
+        &client,
+        "visualizations",
+        &McpServerSpec {
+            name: "visualizations".to_string(),
+            transport: "stdio".to_string(),
+            command: Some(visualizations_cmd),
+            args: vec![],
+            url: None,
+            env: HashMap::new(),
+            headers: HashMap::new(),
+            enabled: visualizations_enabled,
         },
     )
     .await;

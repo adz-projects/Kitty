@@ -65,6 +65,12 @@ PLUGINS: dict[str, dict[str, object]] = {
         "exe": "wasm-math-mcp",
         "extras": [],
     },
+    "visualizations": {
+        "dir": PLUGINS_DIR / "visualizations",
+        "spec": "visualizations.spec",
+        "exe": "visualizations",
+        "extras": [],
+    },
     "bigtiny": {
         "dir": PLUGINS_DIR / "bigtiny",
         "spec": "bigtiny_daemon.spec",

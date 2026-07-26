@@ -497,6 +497,15 @@ button.primary {
   margin: 4px 0;
   font-size: 12px;
 }
+.tool-result-iframe {
+  display: block;
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  margin: 4px 0;
+  background: var(--surface);
+  transition: height 120ms ease-out;
+}
 
 .composer {
   display: flex;

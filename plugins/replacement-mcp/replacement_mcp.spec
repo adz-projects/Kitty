@@ -32,6 +32,9 @@ a = Analysis(
     hiddenimports=[
         "fastmcp",
         "ddgs",
+        # PyMuPDF's compiled extension module; PyInstaller's static analysis
+        # can miss it since it's imported as `fitz`, not `pymupdf`.
+        "fitz",
     ],
     hookspath=[],
     runtime_hooks=[],

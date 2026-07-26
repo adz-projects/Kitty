@@ -272,6 +272,12 @@ export const ipc = {
   getWasmMathMcpEnabled: () => invoke<boolean>('get_wasm_math_mcp_enabled'),
   setWasmMathMcpEnabled: (enabled: boolean) =>
     invoke<void>('set_wasm_math_mcp_enabled', { enabled }),
+  // Bundled accessible tables/SVG diagrams MCP server (renders its results in
+  // an iframe in chat) — on by default, no credentials, same self-healing
+  // registration pattern as replacement-mcp/wasm-math-mcp.
+  getVisualizationsEnabled: () => invoke<boolean>('get_visualizations_enabled'),
+  setVisualizationsEnabled: (enabled: boolean) =>
+    invoke<void>('set_visualizations_enabled', { enabled }),
   // Bundled Brave Search MCP server — off by default, requires an API key.
   // Disabling always wipes the stored key server-side, so re-enabling always
   // goes through setBraveMcpSearchApiKey, never a plain enabled toggle.

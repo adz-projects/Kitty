@@ -16,6 +16,7 @@
   nsExec::Exec 'taskkill /F /IM replacement-mcp.exe'
   nsExec::Exec 'taskkill /F /IM brave-mcp-search.exe'
   nsExec::Exec 'taskkill /F /IM wasm-math-mcp.exe'
+  nsExec::Exec 'taskkill /F /IM visualizations.exe'
 !macroend
 
 !macro NSIS_HOOK_PREINSTALL

@@ -159,6 +159,13 @@ pub struct Config {
     /// surprising for a server that reaches an external paid API.
     #[serde(default)]
     pub brave_mcp_search_enabled: bool,
+    /// Whether the bundled `visualizations` server (see
+    /// `plugins/visualizations/`) is registered+enabled as a BigTiny MCP
+    /// server. On by default — like `wasm_math_mcp_enabled`, it's a safe,
+    /// broadly useful, credential-free tool (accessible HTML tables/SVG
+    /// diagrams rendered client-side in an iframe).
+    #[serde(default = "default_true")]
+    pub visualizations_enabled: bool,
     /// User-defined scheduled tasks (instructions the agent runs later,
     /// one-shot or recurring, with or without the app open) — see
     /// `scheduled_tasks::ScheduledTask`.
@@ -267,6 +274,7 @@ impl Default for Config {
             replacement_mcp_default_migrated: true,
             wasm_math_mcp_enabled: default_true(),
             brave_mcp_search_enabled: false,
+            visualizations_enabled: default_true(),
             scheduled_tasks: Vec::new(),
             ollama_enabled: default_true(),
             bigtiny_command: default_bigtiny_command(),

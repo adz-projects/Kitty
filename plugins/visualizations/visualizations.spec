@@ -1,12 +1,12 @@
 # -*- mode: python ; coding: utf-8 -*-
-# PyInstaller spec for the sandboxed-Python-execution stdio MCP server. Run via
+# PyInstaller spec for the accessible visuals/tables stdio MCP server. Run via
 # `plugins/build.py`, not directly — that script `pip install`s this plugin's
 # dependencies first so PyInstaller's import analysis can see them.
 
 from PyInstaller.utils.hooks import copy_metadata
 
 a = Analysis(
-    ["wasm_math_mcp.py"],
+    ["visualizations.py"],
     pathex=["."],
     binaries=[],
     datas=[]
@@ -16,13 +16,6 @@ a = Analysis(
     + copy_metadata("mcp"),
     hiddenimports=[
         "mcp.server.fastmcp",
-        # numpy/pandas/scipy ship compiled extension submodules PyInstaller's
-        # static analysis can miss depending on the installed version;
-        # declared explicitly since this tool's whole value proposition is
-        # NumPy/Pandas/SciPy math.
-        "numpy",
-        "pandas",
-        "scipy",
     ],
     hookspath=[],
     runtime_hooks=[],
@@ -37,7 +30,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name="wasm-math-mcp",
+    name="visualizations",
     console=True,
     onefile=True,
 )

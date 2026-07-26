@@ -194,6 +194,8 @@ pub fn run() {
             commands::set_replacement_mcp_enabled,
             commands::get_wasm_math_mcp_enabled,
             commands::set_wasm_math_mcp_enabled,
+            commands::get_visualizations_enabled,
+            commands::set_visualizations_enabled,
             commands::get_brave_mcp_search_status,
             commands::set_brave_mcp_search_api_key,
             commands::set_brave_mcp_search_enabled,

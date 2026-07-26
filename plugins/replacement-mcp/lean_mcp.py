@@ -6,7 +6,7 @@
 #   "ddgs",
 #   "openpyxl",
 #   "python-docx",
-#   "pypdf",
+#   "pymupdf",
 #   "pyyaml"
 # ]
 # ///
@@ -14,117 +14,170 @@
 import os
 import re
 import json
+import csv
+import io
 import subprocess
 from collections import deque
 from pathlib import Path
-from typing import Literal, Optional, Any
+from typing import Literal, Optional, Any, Dict, List, Union
+from urllib.parse import urlparse
 import yaml
+import fitz  # PyMuPDF
 from fastmcp import FastMCP
+
+from docx import Document
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
 
 # ---------------------------------------------------------------------------
 # Robust YAML config loading
 # ---------------------------------------------------------------------------
 CONFIG_PATH = Path(__file__).resolve().parent / "tool_prompts.yaml"
-if not CONFIG_PATH.exists():
-    raise FileNotFoundError(
-        f"Missing required configuration file: {CONFIG_PATH}"
-    )
+if CONFIG_PATH.exists():
+    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+        CONFIG = yaml.safe_load(f)
+else:
+    CONFIG = {}
 
-with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-    CONFIG = yaml.safe_load(f)
-
-PROMPTS  = CONFIG
-THRESH   = PROMPTS.get("thresholds", {})
+PROMPTS = CONFIG
+THRESH = PROMPTS.get("thresholds", {})
 
 # ---------------------------------------------------------------------------
-# Result prefix tags
+# Standardized JSON Response Helpers & Dynamic Error Recovery Hints (Item 5)
 # ---------------------------------------------------------------------------
-PREFIX_OK        = "[OK] "
-PREFIX_TRUNCATED = "[TRUNCATED] "
+def success_response(
+    data: Any,
+    message: Optional[str] = None,
+    truncated: bool = False,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Returns a standardized JSON success response."""
+    payload: Dict[str, Any] = {
+        "status": "success",
+        "truncated": truncated,
+        "data": data,
+    }
+    if message:
+        payload["message"] = message
+    if metadata:
+        payload["metadata"] = metadata
+    return json.dumps(payload, indent=2, ensure_ascii=False)
 
-# ---------------------------------------------------------------------------
-# Consistent error-handling with recovery hints
-# ---------------------------------------------------------------------------
-def error(code: str, message: str, detail: Optional[str] = None,
-          hint: Optional[str] = None) -> str:
-    payload: dict[str, Any] = {"error": True, "code": code, "message": message}
+
+def error_response(
+    code: str,
+    message: str,
+    detail: Optional[str] = None,
+    hint: Optional[str] = None,
+) -> str:
+    """Returns a standardized JSON error response with automated recovery hints."""
+    payload: Dict[str, Any] = {
+        "status": "error",
+        "error_code": code,
+        "message": message,
+    }
     if detail:
         payload["detail"] = detail
+
+    # Item 5: Automatic recovery hints to help small models self-correct
+    if not hint:
+        if "NOT_FOUND" in code or "MISSING" in code:
+            hint = "Verify path spelling or call lean_analyze_workspace to check available files."
+        elif "CORRUPT" in code or "PARSE" in code:
+            hint = "File may be damaged or password-protected. Verify format."
+        elif "BAD_RANGE" in code or "OUT_OF_BOUNDS" in code:
+            hint = "Inspect dimensions or line counts before specifying bounds."
+        elif "TARGET_NOT_FOUND" in code:
+            hint = "Use lean_file_read first to confirm exact string formatting or line numbers."
+        elif "SEARCH" in code or "SCRAPE" in code:
+            hint = "Broaden search keywords or check domain connectivity."
+
     if hint:
         payload["hint"] = hint
-    return f"[ERR:{code}] {json.dumps(payload)}"
+    return json.dumps(payload, indent=2, ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
+# In-Tool Keyword RAG Helper (Item 3)
+# ---------------------------------------------------------------------------
+def _filter_by_query(
+    items: List[str], query: Optional[str] = None, max_results: int = 50
+) -> tuple[List[str], bool]:
+    """Filters lines or paragraphs by keyword match score."""
+    if not query or not query.strip():
+        return items[:max_results], len(items) > max_results
+
+    query_words = set(re.findall(r"\w+", query.lower()))
+    if not query_words:
+        return items[:max_results], len(items) > max_results
+
+    scored = []
+    for idx, item in enumerate(items):
+        item_words = set(re.findall(r"\w+", item.lower()))
+        score = len(query_words.intersection(item_words))
+        if score > 0:
+            scored.append((score, idx, item))
+
+    if not scored:
+        fallback = [f"[No direct matches for query '{query}'. Showing top section]"] + items[:max_results]
+        return fallback, len(items) > max_results
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    results = [item for _, _, item in scored[:max_results]]
+    return results, len(scored) > max_results
+
 
 # ---------------------------------------------------------------------------
 # Initialize MCP Server
 # ---------------------------------------------------------------------------
-mcp = FastMCP(
-    "lean-goose-mcp",
-    instructions=PROMPTS.get("server_instructions", "")
-)
+mcp = FastMCP("lean-goose-mcp", instructions=PROMPTS.get("server_instructions", ""))
 
 # ---------------------------------------------------------------------------
 # Persistent directories
 # ---------------------------------------------------------------------------
-CACHE_DIR     = Path.home() / ".cache" / "lean-goose-mcp"
-SCRATCH_FILE  = CACHE_DIR / "scratchpad.json"
+CACHE_DIR = Path.home() / ".cache" / "lean-goose-mcp"
+SCRATCH_FILE = CACHE_DIR / "scratchpad.json"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
+
 # ---------------------------------------------------------------------------
-# Helper: strip ANSI escape codes
+# Helper functions
 # ---------------------------------------------------------------------------
 def _strip_ansi(text: str) -> str:
-    return re.sub(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])', '', text)
+    return re.sub(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])", "", text)
 
-# ---------------------------------------------------------------------------
-# Helper: density-aware truncation
-# ---------------------------------------------------------------------------
-def _truncate_text(text: str, density: str, terse_max: int, normal_max: int) -> tuple[str, bool]:
-    if density == "terse" and len(text) > terse_max:
-        return text[:terse_max], True
-    if density == "normal" and len(text) > normal_max:
-        return text[:normal_max], True
-    return text, False
 
-# ---------------------------------------------------------------------------
-# Helper: count words
-# ---------------------------------------------------------------------------
-def _word_count(text: str) -> int:
-    return len(text.split())
-
-# ---------------------------------------------------------------------------
-# Helper: load scratchpad JSON
-# ---------------------------------------------------------------------------
 def _load_scratchpad() -> dict[str, str]:
     if SCRATCH_FILE.exists():
         with open(SCRATCH_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     return {}
 
-# ---------------------------------------------------------------------------
-# Helper: save scratchpad JSON
-# ---------------------------------------------------------------------------
+
 def _save_scratchpad(data: dict[str, str]) -> None:
     SCRATCH_FILE.parent.mkdir(parents=True, exist_ok=True)
     with open(SCRATCH_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
 
+
 # ===========================================================================
-# Tool A: shell
+# System Tools: shell & analyze_workspace
 # ===========================================================================
-@mcp.tool(name="lean_shell", description=PROMPTS["shell"]["description"])
+@mcp.tool(name="lean_shell")
 def shell(command: str, dry_run: bool = False) -> str:
+    """Runs a shell command and returns truncated stdout/stderr. Set dry_run=True to preview without executing."""
     if dry_run:
-        return f"{PREFIX_OK}[DRY RUN] Would execute: {command}"
+        return success_response({"command": command}, message="[DRY RUN] Command not executed.")
 
     try:
         result = subprocess.run(
             command, shell=True, capture_output=True, text=True, timeout=30
         )
     except subprocess.TimeoutExpired:
-        return error(
+        return error_response(
             "SHELL_TIMEOUT",
             "Command timed out after 30s",
-            hint="Try a faster approach, increase timeout, or break the work into smaller commands."
+            hint="Try a faster approach, increase timeout, or break work into smaller commands.",
         )
 
     max_lines = THRESH.get("shell_max_lines", 100)
@@ -135,752 +188,897 @@ def shell(command: str, dry_run: bool = False) -> str:
         stderr = _strip_ansi(result.stderr)
         lines = stderr.strip().splitlines()
         if len(lines) > keep_tail:
-            stderr = "\n".join(lines[-keep_tail:]) + f"\n... [{len(lines) - keep_tail} lines omitted from top]"
-        return (
-            f"[ERR:SHELL_NONZERO] Exit code: {result.returncode}\n"
-            f"stderr (last {keep_tail} lines):\n{stderr}\n"
-            f'hint: "Check the command syntax and file paths. Use dry_run=True to preview first."'
+            stderr = "\n".join(lines[-keep_tail:])
+        return error_response(
+            "SHELL_NONZERO",
+            f"Exit code {result.returncode}",
+            detail=stderr,
         )
 
-    output = result.stdout or ""
-    output = _strip_ansi(output)
+    output = _strip_ansi(result.stdout or "")
     lines = output.strip().splitlines()
+    truncated = len(lines) > max_lines
 
-    if len(lines) <= max_lines:
-        return f"{PREFIX_OK}{output}"
+    if truncated:
+        head = "\n".join(lines[:keep_head])
+        tail = "\n".join(lines[-keep_tail:])
+        output = f"{head}\n... [{len(lines) - keep_head - keep_tail} lines omitted] ...\n{tail}"
 
-    head = "\n".join(lines[:keep_head])
-    tail = "\n".join(lines[-keep_tail:])
-    omitted = len(lines) - keep_head - keep_tail
-    return f"{PREFIX_TRUNCATED}{head}\n... [{omitted} lines omitted] ...\n{tail}"
+    return success_response(
+        output, truncated=truncated, metadata={"returncode": result.returncode}
+    )
 
-# ===========================================================================
-# Tool B: file_editor
-# ===========================================================================
-@mcp.tool(name="lean_file_editor", description=PROMPTS["file_editor"]["description"])
-def file_editor(
-    path: str,
-    action: Literal["read", "write", "append"],
-    content: Optional[str] = None,
-    start_line: int = 1,
-    end_line: Optional[int] = None,
-    density: Literal["terse", "normal", "verbose"] = "normal",
-    dry_run: bool = False,
-) -> str:
+
+@mcp.tool(name="lean_analyze_workspace")
+def analyze_workspace(path: str = ".", max_depth: Optional[int] = None) -> str:
+    """Lists files and folders under path (or returns metadata if path is a file)."""
     resolved = Path(path).resolve()
-
-    if action == "write":
-        if dry_run:
-            wc = _word_count(content or "")
-            return f"{PREFIX_OK}[DRY RUN] Would write {wc} words to {resolved}"
-        resolved.parent.mkdir(parents=True, exist_ok=True)
-        resolved.write_text(content or "", encoding="utf-8")
-        wc = _word_count(content or "")
-        return f"{PREFIX_OK}Wrote {wc} words to {resolved}:\n{content}"
-
-    if action == "append":
-        if not resolved.exists():
-            return error("FILE_NOT_FOUND", "Path does not exist", str(resolved),
-                         hint="Check the path spelling. Use analyze_workspace to explore the directory first.")
-        if dry_run:
-            wc = _word_count(content or "")
-            return f"{PREFIX_OK}[DRY RUN] Would append {wc} words to {resolved}"
-        with open(resolved, "a", encoding="utf-8") as f:
-            f.write(content or "")
-        wc = _word_count(content or "")
-        return f"{PREFIX_OK}Appended {wc} words to {resolved}"
-
-    # action == "read"
     if not resolved.exists():
-        return error("FILE_NOT_FOUND", "Path does not exist", str(resolved),
-                     hint="Check the path spelling. Use analyze_workspace to explore the directory first.")
+        return error_response("PATH_NOT_FOUND", "Directory does not exist", str(resolved))
 
-    # Clamp start_line to a valid minimum; the upper-bound clamp (start_line >
-    # total_lines) is handled below once the line count is known.
-    if start_line < 1:
-        start_line = 1
-
-    try:
-        if density == "terse":
-            # Stream just the first 3 lines instead of reading the whole file.
-            head = []
-            with open(resolved, "r", encoding="utf-8") as f:
-                for i, line in enumerate(f):
-                    if i >= 3:
-                        break
-                    head.append(line.rstrip("\n"))
-            return f"{PREFIX_OK}" + "\n".join(head)
-
-        if density == "verbose":
-            with open(resolved, "r", encoding="utf-8") as f:
-                numbered = [f"{i}: {line.rstrip(chr(10))}" for i, line in enumerate(f, start=1)]
-            return f"{PREFIX_OK}" + "\n".join(numbered)
-
-        # normal: paginated. Stream the file once, keeping only the requested
-        # window in memory plus a bounded tail buffer (for the "start_line
-        # beyond EOF -> clamp to last page" case) instead of materializing
-        # every line of a potentially huge file.
-        page_size = THRESH.get("file_page_size", 200)
-        window_end = end_line or (start_line + page_size - 1)
-        window: list[str] = []
-        tail: deque[str] = deque(maxlen=page_size)
-        total_lines = 0
-        with open(resolved, "r", encoding="utf-8") as f:
-            for total_lines, raw_line in enumerate(f, start=1):
-                line = raw_line.rstrip("\n")
-                if start_line <= total_lines <= window_end:
-                    window.append(line)
-                tail.append(line)
-
-        if start_line > total_lines:
-            # Smarter default: clamp to the last page instead of erroring.
-            start_line = max(1, total_lines - page_size + 1)
-            page_lines = list(tail)
-            end = total_lines
-        else:
-            page_lines = window
-            end = min(window_end, total_lines)
-
-        page = "\n".join(page_lines)
-        has_more = end < total_lines
-        prefix = PREFIX_TRUNCATED if has_more else PREFIX_OK
-        result = f"{prefix}Lines {start_line}-{end} of {total_lines}\n{page}"
-        if has_more:
-            result += f"\n--- More lines available ({total_lines - end} remaining). Use start_line={end + 1} to continue. ---"
-        return result
-    except PermissionError:
-        return error("FILE_PERMISSION", "Cannot read/write path", str(resolved),
-                     hint="Check file permissions or try a different location.")
-    except Exception as e:
-        return error("FILE_PERMISSION", f"Cannot read path: {e}", str(resolved),
-                     hint="Check file permissions or try a different location.")
-
-# ===========================================================================
-# Tool C: analyze_workspace
-# ===========================================================================
-@mcp.tool(name="lean_analyze_workspace", description=PROMPTS["analyze_workspace"]["description"])
-def analyze_workspace(
-    path: str = ".",
-    max_depth: Optional[int] = None,
-    density: Literal["terse", "normal", "verbose"] = "normal",
-) -> str:
-    resolved = Path(path).resolve()
-
-    if not resolved.exists():
-        return error("PATH_NOT_FOUND", "Directory does not exist", str(resolved),
-                     hint="Check the path spelling. Start from a known location like '.' or the user's home directory.")
-
-    # If path is a file, return metadata
     if resolved.is_file():
         stat = resolved.stat()
-        from datetime import datetime
-        mtime = datetime.fromtimestamp(stat.st_mtime).isoformat()
-        return f"{PREFIX_OK}File: {resolved.name} | Size: {stat.st_size} bytes | Modified: {mtime}\nUse file_editor to read this file."
+        return success_response(
+            {
+                "type": "file",
+                "name": resolved.name,
+                "size_bytes": stat.st_size,
+                "path": str(resolved),
+            }
+        )
 
-    # Directory behavior
-    blacklist = {'.git', 'node_modules', '__pycache__', 'venv', '.venv', 'dist', 'build', '.tox', '.mypy_cache', '.pytest_cache'}
+    blacklist = {".git", "node_modules", "__pycache__", "venv", ".venv", "dist", "build", ".tox"}
     depth = max_depth if max_depth is not None else THRESH.get("workspace_max_depth", 10)
     max_files = THRESH.get("workspace_max_files", 150)
 
-    file_count = 0
-    dir_count = 0
-    tree_lines = []
+    files, dirs = [], []
     abort = False
-    depth_limited = False
 
     def walk(current: Path, current_depth: int):
-        nonlocal file_count, dir_count, abort, depth_limited
-        if abort:
-            return
-        if current_depth > depth:
+        nonlocal abort
+        if abort or current_depth > depth:
             return
         try:
             entries = sorted(current.iterdir(), key=lambda e: (e.is_file(), e.name.lower()))
         except PermissionError:
             return
 
-        indent = "  " * current_depth
         for entry in entries:
-            if entry.name in blacklist:
+            if entry.name in blacklist or abort:
                 continue
-            if abort:
-                return
+            rel_path = str(entry.relative_to(resolved))
             if entry.is_dir():
-                if density != "terse":
-                    # Terse output reports only aggregate counts plus its own
-                    # separately-computed top-level listing (below); building
-                    # tree_lines entries for it here would just be discarded.
-                    tree_lines.append(f"{indent}{entry.name}/")
-                dir_count += 1
-                if current_depth + 1 > depth:
-                    # Would exceed the depth limit; flag as truncated if the
-                    # directory actually has (non-blacklisted) children.
-                    try:
-                        if any(child.name not in blacklist for child in entry.iterdir()):
-                            depth_limited = True
-                    except PermissionError:
-                        pass
-                else:
-                    walk(entry, current_depth + 1)
+                dirs.append(rel_path)
+                walk(entry, current_depth + 1)
             else:
-                file_count += 1
-                if file_count > max_files:
+                files.append(rel_path)
+                if len(files) >= max_files:
                     abort = True
-                    tree_lines.append(f"{indent}... (file count exceeded {max_files}, stopped)")
                     return
-                if density == "verbose":
-                    stat = entry.stat()
-                    from datetime import datetime
-                    mtime = datetime.fromtimestamp(stat.st_mtime).isoformat()
-                    tree_lines.append(f"{indent}{entry.name} ({stat.st_size} bytes, {mtime})")
-                elif density != "terse":
-                    tree_lines.append(f"{indent}{entry.name}")
 
     walk(resolved, 0)
+    return success_response(
+        {"files": files, "directories": dirs},
+        truncated=abort,
+        metadata={"total_files": len(files), "total_directories": len(dirs), "root": str(resolved)},
+    )
 
-    if density == "terse":
-        return f"{PREFIX_OK}{file_count} files, {dir_count} directories in {resolved}\nTop-level: " + ", ".join(
-            e.name for e in sorted(resolved.iterdir()) if e.name not in blacklist and e.is_dir()
+
+# ===========================================================================
+# File Tools (Item 1: Split Dedicated Tools, Item 3: RAG, Item 4: Line Replacement)
+# ===========================================================================
+@mcp.tool(name="lean_file_read")
+def file_read(
+    path: str,
+    start_line: int = 1,
+    end_line: Optional[int] = None,
+    query: Optional[str] = None,
+) -> str:
+    """Reads lines from a text file with line numbers. Supports query filtering (Item 3)."""
+    resolved = Path(path).resolve()
+    if not resolved.exists():
+        return error_response("FILE_NOT_FOUND", "Path does not exist", str(resolved))
+
+    try:
+        lines = resolved.read_text(encoding="utf-8").splitlines()
+        total_lines = len(lines)
+
+        if query and query.strip():
+            # Item 3: In-tool query filtering on numbered lines
+            numbered_lines = [f"{idx}: {line}" for idx, line in enumerate(lines, start=1)]
+            filtered, truncated = _filter_by_query(numbered_lines, query)
+            return success_response(
+                "\n".join(filtered),
+                truncated=truncated,
+                metadata={"total_lines": total_lines, "filtered_by_query": query},
+            )
+
+        start_line = max(1, start_line)
+        page_size = THRESH.get("file_page_size", 200)
+        window_end = end_line or (start_line + page_size - 1)
+        actual_end = min(window_end, total_lines)
+
+        page_lines = lines[start_line - 1 : actual_end]
+        numbered_output = "\n".join(
+            f"{idx}: {line}" for idx, line in enumerate(page_lines, start=start_line)
+        )
+        has_more = actual_end < total_lines
+
+        return success_response(
+            numbered_output,
+            truncated=has_more,
+            metadata={
+                "start_line": start_line,
+                "end_line": actual_end,
+                "total_lines": total_lines,
+                "has_more": has_more,
+            },
+        )
+    except Exception as e:
+        return error_response("FILE_READ_ERROR", f"Cannot read file: {e}", str(resolved))
+
+
+@mcp.tool(name="lean_file_write")
+def file_write(path: str, content: str, dry_run: bool = False) -> str:
+    """Overwrites (or creates) a text file with the given content."""
+    resolved = Path(path).resolve()
+    if dry_run:
+        return success_response({"path": str(resolved)}, message="[DRY RUN] Would write file.")
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    resolved.write_text(content, encoding="utf-8")
+    return success_response(
+        {"path": str(resolved), "words": len(content.split())},
+        message="File written successfully.",
+    )
+
+
+@mcp.tool(name="lean_file_append")
+def file_append(path: str, content: str, dry_run: bool = False) -> str:
+    """Appends content to the end of an existing text file."""
+    resolved = Path(path).resolve()
+    if not resolved.exists():
+        return error_response("FILE_NOT_FOUND", "Path does not exist", str(resolved))
+    if dry_run:
+        return success_response({"path": str(resolved)}, message="[DRY RUN] Would append to file.")
+    with open(resolved, "a", encoding="utf-8") as f:
+        f.write(content)
+    return success_response(
+        {"path": str(resolved), "appended_words": len(content.split())},
+        message="Content appended successfully.",
+    )
+
+
+@mcp.tool(name="lean_file_replace_str")
+def file_replace_str(path: str, old_str: str, new_str: str, dry_run: bool = False) -> str:
+    """Replaces exact string occurrences in a file."""
+    resolved = Path(path).resolve()
+    if not resolved.exists():
+        return error_response("FILE_NOT_FOUND", "Path does not exist", str(resolved))
+
+    file_text = resolved.read_text(encoding="utf-8")
+    occurrences = file_text.count(old_str)
+    if occurrences == 0:
+        return error_response(
+            "TARGET_NOT_FOUND",
+            "Target string 'old_str' was not found in the file.",
         )
 
-    if density == "verbose":
-        # Verbose is full detail; only a hard file-count abort counts as truncation.
-        prefix = PREFIX_TRUNCATED if abort else PREFIX_OK
-    else:
-        # normal: also flag truncation when the tree was cut off by depth.
-        prefix = PREFIX_TRUNCATED if (abort or depth_limited) else PREFIX_OK
-    header = f"{resolved} ({file_count} files, {dir_count} directories)"
-    result = "\n".join([header] + tree_lines)
-    return f"{prefix}{result}"
+    if dry_run:
+        return success_response(
+            {"occurrences": occurrences, "path": str(resolved)},
+            message=f"[DRY RUN] Would replace {occurrences} occurrence(s).",
+        )
+
+    updated_text = file_text.replace(old_str, new_str)
+    resolved.write_text(updated_text, encoding="utf-8")
+    return success_response(
+        {"path": str(resolved), "replacements_made": occurrences},
+        message=f"Successfully replaced {occurrences} occurrence(s).",
+    )
+
+
+@mcp.tool(name="lean_file_replace_lines")
+def file_replace_lines(
+    path: str,
+    start_line: int,
+    end_line: int,
+    new_content: str,
+    dry_run: bool = False,
+) -> str:
+    """Item 4: Replaces a specific line range (1-indexed, inclusive) with new content."""
+    resolved = Path(path).resolve()
+    if not resolved.exists():
+        return error_response("FILE_NOT_FOUND", "Path does not exist", str(resolved))
+
+    lines = resolved.read_text(encoding="utf-8").splitlines()
+    total_lines = len(lines)
+
+    if start_line < 1 or start_line > total_lines or end_line < start_line:
+        return error_response(
+            "OUT_OF_BOUNDS",
+            f"Invalid line range {start_line}-{end_line} for file with {total_lines} lines.",
+        )
+
+    actual_end = min(end_line, total_lines)
+
+    if dry_run:
+        return success_response(
+            {"start_line": start_line, "end_line": actual_end, "total_lines": total_lines},
+            message="[DRY RUN] Would replace specified line range.",
+        )
+
+    new_lines = new_content.splitlines() if new_content else []
+    lines[start_line - 1 : actual_end] = new_lines
+
+    resolved.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    return success_response(
+        {
+            "path": str(resolved),
+            "replaced_range": f"{start_line}-{actual_end}",
+            "lines_removed": actual_end - start_line + 1,
+            "lines_added": len(new_lines),
+            "new_total_lines": len(lines),
+        },
+        message="Line range replaced successfully.",
+    )
+
 
 # ===========================================================================
-# Tool D: fallback_web_search
+# Web & Search Tools
 # ===========================================================================
-@mcp.tool(name="lean_fallback_web_search", description=PROMPTS["fallback_web_search"]["description"])
+@mcp.tool(name="lean_fallback_web_search")
 def fallback_web_search(query: str) -> str:
-    # `ddgs`, not `duckduckgo_search` — the latter was renamed and its final
-    # releases are non-functional against DuckDuckGo's current backend:
-    # confirmed real bug, every query returned zero results (surfacing as a
-    # bare "No results found for: <query>" no matter what was asked) and the
-    # occasional query that did return something got an unrelated
-    # multi-language ad page rather than search results. The import is kept
-    # lazy, and the call signature and result keys (title/href/body) are
-    # identical, so only the module name changes here.
+    """Searches the web via DuckDuckGo and returns title/domain/url/snippet for the top results."""
     try:
         from ddgs import DDGS
-        results = list(DDGS().text(query, max_results=4))
+        raw_results = list(DDGS().text(query, max_results=4))
     except Exception as e:
-        return error("SEARCH_FAILED", "DuckDuckGo query failed", str(e),
-                     hint="Check your internet connection or try a more specific query.")
+        return error_response("SEARCH_FAILED", "DuckDuckGo query failed", str(e))
 
-    if not results:
-        return f"{PREFIX_OK}No results found for: {query}"
+    cleaned_results = []
+    for r in raw_results:
+        clean_url = re.sub(r"\?.*$", "", r.get("href", ""))
+        domain = urlparse(clean_url).netloc
+        cleaned_results.append(
+            {
+                "title": r.get("title", ""),
+                "domain": domain,
+                "url": clean_url,
+                "snippet": r.get("body", ""),
+            }
+        )
 
-    lines = []
-    for i, r in enumerate(results, 1):
-        title = r.get("title", "")
-        href = r.get("href", "")
-        snippet = r.get("body", "")
-        # Strip tracking params from URL (basic: remove everything after ? and # that looks like tracking)
-        clean_url = re.sub(r'\?.*$', '', href)
-        lines.append(f"{i}. {title} [{clean_url}]\n{snippet}")
+    return success_response(cleaned_results, metadata={"query": query})
 
-    return f"{PREFIX_OK}" + "\n\n".join(lines)
 
-# ===========================================================================
-# Tool E: web_scrape
-# ===========================================================================
-@mcp.tool(name="lean_web_scrape", description=PROMPTS["web_scrape"]["description"])
+@mcp.tool(name="lean_web_scrape")
 def web_scrape(
     url: str,
+    query: Optional[str] = None,
     include_links: bool = False,
-    density: Literal["terse", "normal", "verbose"] = "normal",
 ) -> str:
-    # Smarter default: PDF URL → delegate to pdf_manager
+    """Scrapes clean article body. Supports optional query filtering (Item 3)."""
     if url.lower().endswith(".pdf"):
-        try:
-            response = httpx_get(url, timeout=30)
-        except Exception:
-            return error("SCRAPE_HTTP_ERROR", "Failed to download PDF", url,
-                         hint="The PDF may be behind a login wall or inaccessible.")
-
-        pdf_filename = re.sub(r'[^\w\.\-]', '_', url.split("/")[-1] or "downloaded.pdf")
-        pdf_path = CACHE_DIR / pdf_filename
-        pdf_path.write_bytes(response.content)
-        return f"{PREFIX_OK}[Delegated to pdf_manager] PDF saved to cache as {pdf_filename}. Use pdf_manager.read_text or pdf_manager.read_outline to extract content."
+        return success_response(
+            {"url": url},
+            message="URL targets a PDF document. Please use pdf_read_text directly.",
+        )
 
     try:
         import httpx
-        response = httpx.get(url, timeout=30, follow_redirects=True)
+        response = httpx.get(
+            url,
+            timeout=30,
+            follow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        )
         response.raise_for_status()
-    except httpx.HTTPStatusError as e:
-        return error("SCRAPE_HTTP_ERROR", f"HTTP {e.response.status_code}", url,
-                     hint="The page may be behind a login wall, blocked, or deleted. Try fallback_web_search to find an alternative source.")
-    except httpx.TimeoutException:
-        return error("SCRAPE_TIMEOUT", "Request timed out", url,
-                     hint="The server is slow or unreachable. Try again or use fallback_web_search for a cached/similar page.")
     except Exception as e:
-        return error("SCRAPE_HTTP_ERROR", str(e), url,
-                     hint="The page may be behind a login wall, blocked, or deleted. Try fallback_web_search to find an alternative source.")
+        return error_response("SCRAPE_HTTP_ERROR", f"Failed to fetch URL: {e}", url)
 
-    html = response.text
-
-    # Save raw HTML to cache
-    cache_filename = re.sub(r'[^\w\.\-]', '_', url.split("/")[-1] or "index.html") or "page.html"
-    cache_path = CACHE_DIR / cache_filename
-    cache_path.write_text(html, encoding="utf-8")
-
-    # Extract with trafilatura
     try:
         import trafilatura
-        extracted = trafilatura.extract(html, output_format='markdown', include_links=include_links)
+        extracted = trafilatura.extract(
+            response.text,
+            output_format="markdown",
+            favor_precision=True,
+            include_links=include_links,
+            include_images=False,
+            include_tables=True,
+        )
     except Exception:
         extracted = None
 
     if not extracted or not extracted.strip():
-        return error("SCRAPE_EMPTY", "No extractable content found", url,
-                     hint="The page may be a JavaScript SPA or behind a paywall. Try a different URL or use fallback_web_search.")
+        return error_response("SCRAPE_EMPTY", "No extractable body content found.", url)
 
-    # Collapse whitespace
-    extracted = re.sub(r'\n{3,}', '\n\n', extracted.strip())
+    if not include_links:
+        extracted = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', extracted)
 
-    terse_cap = THRESH.get("terse_char_cap", 500)
-    normal_cap = THRESH.get("scrape_max_chars", 12000)
+    paragraphs = [p.strip() for p in re.sub(r"\n{3,}", "\n\n", extracted.strip()).split("\n\n") if p.strip()]
 
-    if density == "terse" and len(extracted) > terse_cap:
-        return f"{PREFIX_TRUNCATED}{extracted[:terse_cap]}"
+    # Item 3: Query filtering on webpage paragraphs
+    if query and query.strip():
+        filtered_paras, truncated = _filter_by_query(paragraphs, query)
+        return success_response(
+            "\n\n".join(filtered_paras),
+            truncated=truncated,
+            metadata={"url": url, "filtered_by_query": query},
+        )
 
-    if density == "normal" and len(extracted) > normal_cap:
-        return f"{PREFIX_TRUNCATED}{extracted[:normal_cap]}"
+    full_text = "\n\n".join(paragraphs)
+    max_cap = THRESH.get("scrape_max_chars", 12000)
+    truncated = len(full_text) > max_cap
 
-    return f"{PREFIX_OK}{extracted}"
+    return success_response(
+        full_text[:max_cap] if truncated else full_text,
+        truncated=truncated,
+        metadata={"url": url, "char_count": len(full_text)},
+    )
 
-# ---------------------------------------------------------------------------
-# Reusable httpx_get helper used by web_scrape
-# ---------------------------------------------------------------------------
-def httpx_get(url: str, timeout: int = 30):
-    import httpx
-    return httpx.get(url, timeout=timeout, follow_redirects=True)
 
 # ===========================================================================
-# Tool F: excel_manager
+# Excel Manager Tools (Item 1: Split Dedicated Tools, Item 3: Query RAG)
 # ===========================================================================
-@mcp.tool(name="lean_excel_manager", description=PROMPTS["excel_manager"]["description"])
-def excel_manager(
-    path: str,
-    action: Literal["inspect", "read_rows", "write_rows"],
-    sheet: Optional[str] = None,
-    range_box: Optional[str] = None,
-    csv_data: Optional[str] = None,
-    dry_run: bool = False,
-) -> str:
+@mcp.tool(name="lean_excel_inspect")
+def excel_inspect(path: str) -> str:
+    """Returns sheet names, dimensions, and header row for an Excel workbook."""
     resolved = Path(path).resolve()
     if not resolved.exists():
-        return error("XLSX_NOT_FOUND", "Spreadsheet does not exist", str(resolved),
-                     hint="Check the file path and extension. Use analyze_workspace to locate .xlsx files.")
+        return error_response("XLSX_NOT_FOUND", "Spreadsheet does not exist", str(resolved))
 
     import openpyxl
+    try:
+        wb = openpyxl.load_workbook(resolved)
+        active_sheet = wb.sheetnames[0]
+        ws = wb[active_sheet]
+        first_rows = list(ws.iter_rows(max_row=1, values_only=True))
+        headers = list(first_rows[0]) if first_rows else []
+        meta = {
+            "sheet_names": wb.sheetnames,
+            "active_sheet": active_sheet,
+            "headers": headers,
+            "dimensions": ws.dimensions,
+            "max_rows": ws.max_row,
+            "max_cols": ws.max_column,
+        }
+        wb.close()
+        return success_response(meta)
+    except Exception as e:
+        return error_response("XLSX_CORRUPT", f"Cannot open workbook: {e}", str(resolved))
 
+
+@mcp.tool(name="lean_excel_read_rows")
+def excel_read_rows(
+    path: str,
+    sheet: Optional[str] = None,
+    range_box: Optional[str] = None,
+    output_format: Literal["json", "csv"] = "json",
+    query: Optional[str] = None,
+) -> str:
+    """Reads rows from an Excel file as structured JSON. Supports query filtering (Item 3)."""
+    resolved = Path(path).resolve()
+    if not resolved.exists():
+        return error_response("XLSX_NOT_FOUND", "Spreadsheet does not exist", str(resolved))
+
+    import openpyxl
     try:
         wb = openpyxl.load_workbook(resolved)
     except Exception as e:
-        return error("XLSX_NOT_FOUND", f"Cannot open workbook: {e}", str(resolved),
-                     hint="The file may be corrupted or not a valid .xlsx file.")
+        return error_response("XLSX_CORRUPT", f"Cannot open workbook: {e}", str(resolved))
 
-    # Smarter default: find first non-empty sheet
-    def _resolve_sheet():
-        if sheet:
-            if sheet not in wb.sheetnames:
-                wb.close()
-                return error("XLSX_BAD_SHEET", f"Sheet '{sheet}' not found", str(resolved),
-                             hint="Use excel_manager.inspect to see available sheet names.")
-            return sheet
-        for s in wb.sheetnames:
-            ws = wb[s]
-            if ws.max_row and ws.max_row > 0:
-                return s
-        return wb.sheetnames[0] if wb.sheetnames else None
-
-    ws_name = _resolve_sheet()
-    if isinstance(ws_name, str) and ws_name.startswith("[ERR:"):
-        return ws_name
-
-    ws = wb[ws_name] if ws_name else None
-    if ws is None:
+    ws_name = sheet or wb.sheetnames[0]
+    if ws_name not in wb.sheetnames:
         wb.close()
-        return error("XLSX_BAD_SHEET", "No sheets found", str(resolved),
-                     hint="The workbook appears to be empty.")
+        return error_response("XLSX_BAD_SHEET", f"Sheet '{ws_name}' not found", str(resolved))
 
-    if action == "inspect":
-        first_rows = list(ws.iter_rows(max_row=1))
-        headers = [cell.value for cell in first_rows[0]] if first_rows else []
-        info = (
-            f"Sheets: {wb.sheetnames}\n"
-            f"Active sheet: {ws_name}\n"
-            f"Columns: {headers}\n"
-            f"Dimensions: {ws.dimensions}\n"
-            f"Rows: {ws.max_row}, Cols: {ws.max_column}"
-        )
-        wb.close()
-        return f"{PREFIX_OK}{info}"
-
-    if action == "read_rows":
-        iter_kwargs = {"values_only": True}
-        if range_box:
-            try:
-                min_col, min_row, max_col, max_row = openpyxl.utils.cell.range_boundaries(range_box)
-            except ValueError:
-                wb.close()
-                return error("XLSX_BAD_RANGE", f"Invalid range '{range_box}'", str(resolved),
-                             hint="Use A1 notation like 'A1:D50'. Check that rows/cols exist in the sheet.")
-            if min_row > (ws.max_row or 0) or min_col > (ws.max_column or 0):
-                wb.close()
-                return error("XLSX_BAD_RANGE",
-                             f"Range '{range_box}' is out of bounds for sheet '{ws_name}' "
-                             f"({ws.max_row}x{ws.max_column})",
-                             str(resolved),
-                             hint="Use A1 notation like 'A1:D50'. Check that rows/cols exist in the sheet.")
+    ws = wb[ws_name]
+    iter_kwargs: Dict[str, Any] = {"values_only": True}
+    if range_box:
+        try:
+            min_col, min_row, max_col, max_row = openpyxl.utils.cell.range_boundaries(range_box)
             iter_kwargs.update(
                 min_row=min_row,
-                max_row=min(max_row, ws.max_row),
+                max_row=min(max_row, ws.max_row or 1),
                 min_col=min_col,
-                max_col=min(max_col, ws.max_column),
+                max_col=min(max_col, ws.max_column or 1),
             )
-        rows = []
-        for row in ws.iter_rows(**iter_kwargs):
-            rows.append(",".join(str(c) if c is not None else "" for c in row))
-        wb.close()
-        return f"{PREFIX_OK}" + "\n".join(rows)
-
-    if action == "write_rows":
-        if dry_run:
-            if csv_data:
-                row_count = len(csv_data.strip().splitlines())
-            else:
-                row_count = 0
+        except Exception as e:
             wb.close()
-            return f"{PREFIX_OK}[DRY RUN] Would write {row_count} rows to sheet '{ws_name}'"
+            return error_response("XLSX_BAD_RANGE", f"Invalid range '{range_box}': {e}", str(resolved))
 
-        if not csv_data:
-            wb.close()
-            return error("XLSX_MISSING_DATA", "No csv_data provided for write_rows", str(resolved),
-                         hint="Provide csv_data as comma-separated lines for write_rows.")
-
-        rows_written = 0
-        for line in csv_data.strip().splitlines():
-            values = [v.strip() for v in line.split(",")]
-            ws.append(values)
-            rows_written += 1
-
-        wb.save(resolved)
-        wb.close()
-        return f"{PREFIX_OK}{json.dumps({'status': 'success', 'rows_updated': rows_written})}"
-
+    raw_rows = list(ws.iter_rows(**iter_kwargs))
     wb.close()
-    return ""
+
+    if not raw_rows:
+        return success_response([])
+
+    headers = [str(c) if c is not None else f"col_{i+1}" for i, c in enumerate(raw_rows[0])]
+    dict_rows = []
+    for row in raw_rows[1:]:
+        dict_rows.append(
+            {headers[i]: row[i] if i < len(row) else None for i in range(len(headers))}
+        )
+
+    # Item 3: Query filtering on dictionary rows
+    if query and query.strip():
+        row_strings = [json.dumps(r) for r in dict_rows]
+        filtered_strs, truncated = _filter_by_query(row_strings, query)
+        filtered_dicts = []
+        for s in filtered_strs:
+            if s.startswith("{"):
+                try:
+                    filtered_dicts.append(json.loads(s))
+                except Exception:
+                    pass
+        return success_response(
+            filtered_dicts or filtered_strs,
+            truncated=truncated,
+            metadata={"filtered_by_query": query},
+        )
+
+    if output_format == "json":
+        return success_response(dict_rows)
+    else:
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(headers)
+        for r in dict_rows:
+            writer.writerow([r.get(h, "") for h in headers])
+        return success_response(output.getvalue())
+
+
+@mcp.tool(name="lean_excel_write_rows")
+def excel_write_rows(
+    path: str,
+    csv_data: str,
+    sheet: Optional[str] = None,
+    dry_run: bool = False,
+) -> str:
+    """Writes CSV-formatted rows into an Excel sheet, creating the workbook/sheet if needed."""
+    resolved = Path(path).resolve()
+    if not resolved.exists():
+        return error_response("XLSX_NOT_FOUND", "Spreadsheet does not exist", str(resolved))
+
+    import openpyxl
+    try:
+        wb = openpyxl.load_workbook(resolved)
+    except Exception as e:
+        return error_response("XLSX_CORRUPT", f"Cannot open workbook: {e}", str(resolved))
+
+    ws_name = sheet or wb.sheetnames[0]
+    if ws_name not in wb.sheetnames:
+        wb.close()
+        return error_response("XLSX_BAD_SHEET", f"Sheet '{ws_name}' not found", str(resolved))
+
+    ws = wb[ws_name]
+    reader = csv.reader(io.StringIO(csv_data.strip()))
+    parsed_rows = list(reader)
+
+    if dry_run:
+        wb.close()
+        return success_response(
+            {"rows_to_write": len(parsed_rows)}, message="[DRY RUN] Would write rows."
+        )
+
+    for row in parsed_rows:
+        ws.append(row)
+
+    wb.save(resolved)
+    wb.close()
+    return success_response(
+        {"rows_appended": len(parsed_rows), "path": str(resolved)},
+        message="Successfully appended rows.",
+    )
+
 
 # ===========================================================================
-# Tool G: word_manager
+# Word Manager Tools (Item 1: Split Dedicated Tools, Item 3: Query RAG)
 # ===========================================================================
-@mcp.tool(name="lean_word_manager", description=PROMPTS["word_manager"]["description"])
-def word_manager(
+def _set_doc_accessibility_meta(doc: Any, title: Optional[str], language: str) -> None:
+    if title:
+        doc.core_properties.title = title
+    try:
+        styles_element = doc.styles.element
+        lang_element = OxmlElement("w:lang")
+        lang_element.set(qn("w:val"), language)
+        styles_element.append(lang_element)
+    except Exception:
+        pass
+
+
+def _make_table_accessible(table: Any) -> None:
+    if not table.rows:
+        return
+    header_tr = table.rows[0]._tr.get_or_add_trPr()
+    header_tr.append(OxmlElement("w:tblHeader"))
+    for row in table.rows:
+        trPr = row._tr.get_or_add_trPr()
+        trPr.append(OxmlElement("w:cantSplit"))
+
+
+def _add_markdown_paragraph(doc: Any, text: str, style: str = "Normal") -> None:
+    p = doc.add_paragraph(style=style)
+    tokens = re.split(r"(\*\*.*?\*\*|\*.*?\*)", text)
+    for token in tokens:
+        if token.startswith("**") and token.endswith("**"):
+            run = p.add_run(token[2:-2])
+            run.bold = True
+        elif token.startswith("*") and token.endswith("*"):
+            run = p.add_run(token[1:-1])
+            run.italic = True
+        else:
+            p.add_run(token)
+
+
+def _read_docx_robust(doc: Any) -> List[Dict[str, Any]]:
+    extracted = []
+    all_p_nodes = doc.element.body.xpath(".//w:p")
+
+    for p_node in all_p_nodes:
+        text = "".join(p_node.xpath(".//w:t/text()")).strip()
+        if not text:
+            continue
+
+        heading_level = None
+        style_val = p_node.xpath("./w:pPr/w:pStyle/@w:val")
+        if style_val:
+            style_name = str(style_val[0])
+            if "Heading" in style_name or "heading" in style_name:
+                digits = re.findall(r"\d+", style_name)
+                if digits:
+                    heading_level = int(digits[0])
+
+        if heading_level is None:
+            outline_lvl = p_node.xpath("./w:pPr/w:outlineLvl/@w:val")
+            if outline_lvl:
+                heading_level = int(outline_lvl[0]) + 1
+
+        if heading_level is None:
+            is_bold = bool(p_node.xpath(".//w:rPr/w:b"))
+            font_sizes = p_node.xpath(".//w:rPr/w:sz/@w:val")
+            max_size = max([int(s) for s in font_sizes], default=22)
+
+            if is_bold and max_size >= 28:
+                heading_level = 1
+            elif is_bold and max_size >= 24:
+                heading_level = 2
+            elif is_bold and max_size >= 20:
+                heading_level = 3
+            elif is_bold and max_size >= 18:
+                heading_level = 4
+
+        extracted.append(
+            {
+                "type": "heading" if heading_level else "paragraph",
+                "level": heading_level,
+                "text": text,
+            }
+        )
+    return extracted
+
+
+@mcp.tool(name="lean_word_read_text")
+def word_read_text(path: str, query: Optional[str] = None) -> str:
+    """Reads body text from Word docx. Supports query filtering (Item 3)."""
+    resolved = Path(path).resolve()
+    if not resolved.exists():
+        return error_response("DOCX_NOT_FOUND", "Document does not exist", str(resolved))
+
+    try:
+        doc = Document(str(resolved))
+    except Exception as e:
+        return error_response("DOCX_CORRUPT", f"Cannot open docx: {e}", str(resolved))
+
+    standard_elements = []
+    try:
+        for p in doc.paragraphs:
+            if p.text.strip():
+                standard_elements.append(p.text.strip())
+    except Exception:
+        standard_elements = []
+
+    if not standard_elements:
+        robust_objs = _read_docx_robust(doc)
+        paragraphs = [el["text"] for el in robust_objs]
+        read_method = "robust_xml_fallback"
+    else:
+        paragraphs = standard_elements
+        read_method = "standard"
+
+    # Item 3: Query filtering on document paragraphs
+    if query and query.strip():
+        filtered, truncated = _filter_by_query(paragraphs, query)
+        return success_response(
+            filtered,
+            truncated=truncated,
+            metadata={"read_method": read_method, "filtered_by_query": query},
+        )
+
+    return success_response(
+        paragraphs, metadata={"read_method": read_method, "total_paragraphs": len(paragraphs)}
+    )
+
+
+@mcp.tool(name="lean_word_read_outline")
+def word_read_outline(path: str) -> str:
+    """Returns the heading structure (outline) of a Word document."""
+    resolved = Path(path).resolve()
+    if not resolved.exists():
+        return error_response("DOCX_NOT_FOUND", "Document does not exist", str(resolved))
+
+    try:
+        doc = Document(str(resolved))
+    except Exception as e:
+        return error_response("DOCX_CORRUPT", f"Cannot open docx: {e}", str(resolved))
+
+    standard_elements = []
+    try:
+        for p in doc.paragraphs:
+            if not p.text.strip():
+                continue
+            style_name = p.style.name if p.style else ""
+            level = None
+            if style_name.startswith("Heading"):
+                try:
+                    level = int(style_name.replace("Heading ", ""))
+                except ValueError:
+                    pass
+            standard_elements.append({"type": "heading" if level else "paragraph", "level": level, "text": p.text})
+    except Exception:
+        standard_elements = []
+
+    if not standard_elements:
+        elements = _read_docx_robust(doc)
+        read_method = "robust_xml_fallback"
+    else:
+        elements = standard_elements
+        read_method = "standard"
+
+    outline = [
+        {"level": el["level"], "text": el["text"]}
+        for el in elements
+        if el["type"] == "heading" and el["level"] is not None and 1 <= el["level"] <= 4
+    ]
+    return success_response(outline, metadata={"read_method": read_method})
+
+
+@mcp.tool(name="lean_word_write_doc")
+def word_write_doc(
     path: str,
-    action: Literal["read_outline", "read_text", "write_doc"],
     doc_text: Optional[str] = None,
     write_mode: Literal["create", "append"] = "create",
     title: Optional[str] = None,
-    density: Literal["terse", "normal", "verbose"] = "normal",
+    language: str = "en-US",
 ) -> str:
-    from docx import Document
-
+    """Writes or appends to a Word document with WCAG 2.2 AA accessibility structures."""
     resolved = Path(path).resolve()
-
-    def _safe_style_name(para) -> str:
-        # Some exporters (notably Google Docs) can emit paragraphs whose
-        # style ID isn't present in the document's stylesheet, which makes
-        # python-docx raise KeyError on .style.name access.
-        try:
-            return para.style.name
-        except Exception:
-            return "Normal"
-
-    if action in ("read_outline", "read_text"):
-        if not resolved.exists():
-            return error("DOCX_NOT_FOUND", "Document does not exist", str(resolved),
-                         hint="Check the file path. Use write_mode='create' to make a new document.")
-        try:
-            doc = Document(str(resolved))
-        except Exception as e:
-            return error("DOCX_CORRUPT", f"Cannot parse document: {e}", str(resolved),
-                         hint="The file may be damaged or in an unsupported format. Try opening it manually to verify.")
-
-        try:
-            if action == "read_outline":
-                lines = []
-                for para in doc.paragraphs:
-                    style_name = _safe_style_name(para)
-                    if style_name.startswith("Heading"):
-                        level = style_name.replace("Heading ", "")
-                        if level.isdigit() and 1 <= int(level) <= 3:
-                            indent = "  " * (int(level) - 1)
-                            lines.append(f"{indent}{para.text}")
-                return f"{PREFIX_OK}" + ("\n".join(lines) if lines else "No headings found.")
-
-            # read_text
-            all_text = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
-
-            if not all_text.strip():
-                return f"{PREFIX_OK}[Empty document]"
-
-            if density == "terse":
-                capped = all_text[:THRESH.get("terse_char_cap", 500)]
-                return f"{PREFIX_TRUNCATED}{capped}"
-
-            if density == "verbose":
-                numbered = "\n".join(
-                    f"{i}. [{_safe_style_name(p)}] {p.text}"
-                    for i, p in enumerate(doc.paragraphs, 1)
-                    if p.text.strip()
-                )
-                return f"{PREFIX_OK}{numbered}"
-
-            return f"{PREFIX_OK}{all_text}"
-        except Exception as e:
-            return error("DOCX_CORRUPT", f"Cannot read document contents: {e}", str(resolved),
-                         hint="The file may use unsupported formatting. Try opening it manually to verify.")
-
-    # action == "write_doc"
-    added = 0
     if write_mode == "create":
         doc = Document()
-        if title:
-            doc.add_heading(title, level=0)
-            added += 1
+        doc_title = title or resolved.stem
+        doc.add_heading(doc_title, level=0)
+        _set_doc_accessibility_meta(doc, title=doc_title, language=language)
     else:
         if not resolved.exists():
-            return error("DOCX_NOT_FOUND", "Document does not exist", str(resolved),
-                         hint="Check the file path. Use write_mode='create' to make a new document.")
-        try:
-            doc = Document(str(resolved))
-        except Exception as e:
-            return error("DOCX_CORRUPT", f"Cannot parse document: {e}", str(resolved),
-                         hint="The file may be damaged or in an unsupported format.")
+            return error_response("DOCX_NOT_FOUND", "Document does not exist", str(resolved))
+        doc = Document(str(resolved))
+        _set_doc_accessibility_meta(doc, title=title, language=language)
 
     if doc_text:
-        for line in doc_text.strip().splitlines():
-            stripped = line.strip()
-            if stripped.startswith("### "):
-                doc.add_heading(stripped[4:], level=3)
-            elif stripped.startswith("## "):
-                doc.add_heading(stripped[3:], level=2)
-            elif stripped.startswith("# "):
-                doc.add_heading(stripped[2:], level=1)
+        lines = doc_text.strip().splitlines()
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+            if not line:
+                i += 1
+                continue
+
+            if line.startswith("|") and line.endswith("|"):
+                table_lines = []
+                while i < len(lines) and lines[i].strip().startswith("|") and lines[i].strip().endswith("|"):
+                    table_lines.append(lines[i].strip())
+                    i += 1
+
+                rows_data = []
+                for tline in table_lines:
+                    if re.match(r"^\|[\s\-:\t|]+\|$", tline):
+                        continue
+                    cells = [c.strip() for c in tline.split("|")[1:-1]]
+                    rows_data.append(cells)
+
+                if rows_data:
+                    num_cols = max(len(r) for r in rows_data)
+                    table = doc.add_table(rows=len(rows_data), cols=num_cols)
+                    for r_idx, r_data in enumerate(rows_data):
+                        for c_idx, c_val in enumerate(r_data):
+                            if c_idx < num_cols:
+                                table.cell(r_idx, c_idx).text = c_val
+                    _make_table_accessible(table)
+                continue
+
+            elif line.startswith("#### "):
+                doc.add_heading(line[5:], level=4)
+            elif line.startswith("### "):
+                doc.add_heading(line[4:], level=3)
+            elif line.startswith("## "):
+                doc.add_heading(line[3:], level=2)
+            elif line.startswith("# "):
+                doc.add_heading(line[2:], level=1)
+            elif line.startswith("- ") or line.startswith("* "):
+                _add_markdown_paragraph(doc, line[2:], style="List Bullet")
+            elif re.match(r"^\d+\.\s", line):
+                item_text = re.sub(r"^\d+\.\s", "", line)
+                _add_markdown_paragraph(doc, item_text, style="List Number")
             else:
-                doc.add_paragraph(stripped)
-            added += 1
+                _add_markdown_paragraph(doc, line, style="Normal")
+
+            i += 1
 
     resolved.parent.mkdir(parents=True, exist_ok=True)
     doc.save(str(resolved))
+    return success_response(
+        {"path": str(resolved), "mode": write_mode, "language": language},
+        message="Document saved with WCAG accessibility metadata.",
+    )
 
-    payload = json.dumps({
-        "status": "success",
-        "mode": write_mode,
-        "paragraphs_written": added,
-        "path": str(resolved),
-    })
-    return f"{PREFIX_OK}{payload}"
 
 # ===========================================================================
-# Tool H: pdf_manager
+# PDF Manager Tools (Item 1: Split Dedicated Tools, Item 3: Query RAG)
 # ===========================================================================
-@mcp.tool(name="lean_pdf_manager", description=PROMPTS["pdf_manager"]["description"])
-def pdf_manager(
+@mcp.tool(name="lean_pdf_read_text")
+def pdf_read_text(
     path: str,
-    action: Literal["read_outline", "read_text"],
-    density: Literal["terse", "normal", "verbose"] = "normal",
+    start_page: int = 1,
+    end_page: Optional[int] = None,
+    query: Optional[str] = None,
 ) -> str:
+    """Reads PDF text with PyMuPDF layout analysis. Supports page ranges and query filtering (Item 3)."""
     resolved = Path(path).resolve()
     if not resolved.exists():
-        return error("PDF_NOT_FOUND", "PDF does not exist", str(resolved),
-                     hint="Check the file path. Use analyze_workspace to locate .pdf files.")
-
-    from pypdf import PdfReader
+        return error_response("PDF_NOT_FOUND", "PDF does not exist", str(resolved))
 
     try:
-        reader = PdfReader(str(resolved))
+        doc = fitz.open(str(resolved))
     except Exception as e:
-        msg = str(e).lower()
-        if "encrypted" in msg or "password" in msg:
-            return error("PDF_ENCRYPTED", "PDF is password-protected", str(resolved),
-                         hint="Ask the user for the password. This tool cannot crack passwords.")
-        return error("PDF_CORRUPT", f"Cannot parse PDF: {e}", str(resolved),
-                     hint="The file may be damaged. Try opening it manually or use a different copy.")
+        return error_response("PDF_CORRUPT", f"Cannot parse PDF: {e}", str(resolved))
 
-    if reader.is_encrypted:
-        return error("PDF_ENCRYPTED", "PDF is password-protected", str(resolved),
-                     hint="Ask the user for the password. This tool cannot crack passwords.")
+    if doc.is_encrypted:
+        return error_response("PDF_ENCRYPTED", "PDF is password protected", str(resolved))
 
-    if action == "read_outline":
-        outline = reader.outline or []
-        lines = []
+    total_pages = len(doc)
+    s_page = max(1, start_page)
+    e_page = min(total_pages, end_page) if end_page else total_pages
 
-        def _walk_outline(items, depth=0):
-            for item in items:
-                if isinstance(item, list):
-                    _walk_outline(item, depth + 1)
-                elif hasattr(item, "title") and hasattr(item, "page"):
-                    page_num = reader.pages.index(item.page) + 1 if item.page else "?"
-                    lines.append(f"{'  ' * depth}{item.title} (p. {page_num})")
-                elif hasattr(item, "title"):
-                    lines.append(f"{'  ' * depth}{item.title}")
+    extracted_pages = []
+    for pno in range(s_page - 1, e_page):
+        page = doc[pno]
+        text = page.get_text("markdown") or page.get_text()
+        extracted_pages.append(f"--- Page {pno + 1} ---\n" + text.strip())
 
-        _walk_outline(outline)
-        return f"{PREFIX_OK}" + ("\n".join(lines) if lines else "No outline/bookmarks found.")
+    doc.close()
 
-    # read_text
-    num_pages = len(reader.pages)
-    terse_cap = THRESH.get("terse_char_cap", 500)
-    normal_cap = THRESH.get("scrape_max_chars", 12000)
+    # Item 3: Query filtering on PDF page text
+    if query and query.strip():
+        filtered, truncated = _filter_by_query(extracted_pages, query)
+        return success_response(
+            filtered,
+            truncated=truncated,
+            metadata={"start_page": s_page, "end_page": e_page, "filtered_by_query": query},
+        )
 
-    all_text_parts = []
-    accumulated_chars = 0
-    capped = False
-    for i in range(num_pages):
-        if density == "terse" and i >= 3:
-            break
-        if density == "normal" and accumulated_chars > normal_cap:
-            # Already have more than enough to satisfy the cap below;
-            # skip extracting text from the remaining pages entirely.
-            capped = True
-            break
-        page_text = reader.pages[i].extract_text() or ""
-        if density == "terse" and len(page_text) > terse_cap:
-            page_text = page_text[:terse_cap]
-        part = f"--- Page {i+1} ---\n{page_text.strip()}"
-        all_text_parts.append(part)
-        accumulated_chars += len(part)
+    return success_response(
+        extracted_pages,
+        metadata={"start_page": s_page, "end_page": e_page, "total_pages": total_pages},
+    )
 
-    full_text = "\n\n".join(all_text_parts)
-    total_chars = len(full_text)
 
-    if density == "terse":
-        return f"{PREFIX_TRUNCATED}{full_text}"
-    if density == "normal" and (capped or total_chars > normal_cap):
-        return f"{PREFIX_TRUNCATED}{full_text[:normal_cap]}"
+@mcp.tool(name="lean_pdf_read_outline")
+def pdf_read_outline(path: str) -> str:
+    """Returns the table-of-contents/bookmark outline of a PDF, if it has one."""
+    resolved = Path(path).resolve()
+    if not resolved.exists():
+        return error_response("PDF_NOT_FOUND", "PDF does not exist", str(resolved))
 
-    return f"{PREFIX_OK}{full_text}"
+    try:
+        doc = fitz.open(str(resolved))
+    except Exception as e:
+        return error_response("PDF_CORRUPT", f"Cannot parse PDF: {e}", str(resolved))
+
+    if doc.is_encrypted:
+        return error_response("PDF_ENCRYPTED", "PDF is password protected", str(resolved))
+
+    toc = doc.get_toc()
+    outline = [{"level": item[0], "title": item[1], "page": item[2]} for item in toc]
+    doc.close()
+    return success_response(outline)
+
 
 # ===========================================================================
-# Tool I: cache_manager
+# Cache Manager Tools (Item 1: Split Dedicated Tools)
 # ===========================================================================
-@mcp.tool(name="lean_cache_manager", description=PROMPTS["cache_manager"]["description"])
-def cache_manager(
-    command: Literal["list", "view", "delete", "clear"],
-    filename: Optional[str] = None,
-) -> str:
-    if command == "list":
-        if not CACHE_DIR.exists():
-            return f"{PREFIX_OK}[Empty cache]"
-        entries = []
-        for f in sorted(CACHE_DIR.iterdir()):
-            if f.is_file():
-                stat = f.stat()
-                from datetime import datetime
-                mtime = datetime.fromtimestamp(stat.st_mtime).isoformat()
-                entries.append(f"{f.name:40s} {stat.st_size:>8d} bytes  {mtime}")
-        if not entries:
-            return f"{PREFIX_OK}[Empty cache]"
-        return f"{PREFIX_OK}" + "\n".join(entries)
+@mcp.tool(name="lean_cache_list")
+def cache_list() -> str:
+    """Lists files currently stored in the scratch cache directory with their sizes."""
+    if not CACHE_DIR.exists():
+        return success_response([])
+    entries = [
+        {"filename": f.name, "size_bytes": f.stat().st_size}
+        for f in sorted(CACHE_DIR.iterdir())
+        if f.is_file()
+    ]
+    return success_response(entries)
 
-    if command == "view":
-        if not filename:
-            return error("CACHE_MISS", "No filename specified",
-                         hint="Use cache_manager.list to see available cached files.")
-        cache_file = CACHE_DIR / filename
-        if not cache_file.exists():
-            return error("CACHE_MISS", f"File '{filename}' not in cache",
-                         hint="Use cache_manager.list to see available cached files.")
-        max_chars = THRESH.get("scrape_max_chars", 12000)
-        # Read one char past the cap instead of the whole file, just enough
-        # to tell whether the content needed truncating.
-        with open(cache_file, "r", encoding="utf-8") as f:
-            text = f.read(max_chars + 1)
-        if len(text) > max_chars:
-            return f"{PREFIX_TRUNCATED}{text[:max_chars]}"
-        return f"{PREFIX_OK}{text}"
 
-    if command == "delete":
-        if not filename:
-            return error("CACHE_MISS", "No filename specified",
-                         hint="Use cache_manager.list to see available cached files.")
-        cache_file = CACHE_DIR / filename
-        if not cache_file.exists():
-            return error("CACHE_MISS", f"File '{filename}' not in cache",
-                         hint="Use cache_manager.list to see available cached files.")
-        cache_file.unlink()
-        return f"{PREFIX_OK}{json.dumps({'status': 'deleted', 'filename': filename})}"
+@mcp.tool(name="lean_cache_view")
+def cache_view(filename: str) -> str:
+    """Reads the text content of a file previously stored in the scratch cache directory."""
+    file_path = CACHE_DIR / filename
+    if not file_path.exists():
+        return error_response("CACHE_MISS", f"File '{filename}' not found.")
+    text = file_path.read_text(encoding="utf-8")
+    return success_response(text)
 
-    if command == "clear":
-        if not CACHE_DIR.exists():
-            return f'{PREFIX_OK}{{"status": "cleared", "files_removed": 0}}'
-        count = 0
+
+@mcp.tool(name="lean_cache_delete")
+def cache_delete(filename: str) -> str:
+    """Deletes a single file from the scratch cache directory."""
+    file_path = CACHE_DIR / filename
+    if file_path.exists():
+        file_path.unlink()
+        return success_response({"deleted": filename})
+    return error_response("CACHE_MISS", f"File '{filename}' not found.")
+
+
+@mcp.tool(name="lean_cache_clear")
+def cache_clear() -> str:
+    """Deletes every file in the scratch cache directory and returns how many were removed."""
+    count = 0
+    if CACHE_DIR.exists():
         for f in CACHE_DIR.iterdir():
             if f.is_file():
                 f.unlink()
                 count += 1
-        return f'{PREFIX_OK}{{"status": "cleared", "files_removed": {count}}}'
+    return success_response({"files_removed": count})
 
-    return ""
 
 # ===========================================================================
-# Tool J: scratchpad
+# Scratchpad Tools (Item 1: Split Dedicated Tools)
 # ===========================================================================
-@mcp.tool(name="lean_scratchpad", description=PROMPTS["scratchpad"]["description"])
-def scratchpad(
-    command: Literal["set", "get", "delete", "list"],
-    key: Optional[str] = None,
-    value: Optional[str] = None,
-) -> str:
+@mcp.tool(name="lean_scratchpad_set")
+def scratchpad_set(key: str, value: str) -> str:
+    """Stores a key/value pair in the persistent scratchpad for recall across turns."""
     data = _load_scratchpad()
-    max_keys = THRESH.get("scratchpad_max_keys", 50)
+    data[key] = value
+    _save_scratchpad(data)
+    return success_response({"key": key}, message="Stored successfully.")
 
-    if command == "set":
-        if key is None:
-            return error("SCRATCHPAD_MISS", "No key specified",
-                         hint="Provide a key name to store the value under.")
-        if key not in data and len(data) >= max_keys:
-            return error("SCRATCHPAD_FULL", f"Max {max_keys} keys reached",
-                         hint="Use scratchpad.delete to remove unused entries, then retry.")
-        data[key] = value or ""
-        _save_scratchpad(data)
-        return f"{PREFIX_OK}Stored."
 
-    if command == "get":
-        if key is None:
-            return error("SCRATCHPAD_MISS", "No key specified",
-                         hint="Provide the key name to retrieve.")
-        if key not in data:
-            return error("SCRATCHPAD_MISS", f"No entry for '{key}'",
-                         hint="Use scratchpad.list to see all keys.")
-        return f"{PREFIX_OK}{data[key]}"
+@mcp.tool(name="lean_scratchpad_get")
+def scratchpad_get(key: str) -> str:
+    """Retrieves a previously stored scratchpad value by key."""
+    data = _load_scratchpad()
+    if key not in data:
+        return error_response("KEY_NOT_FOUND", f"Key '{key}' not in scratchpad.")
+    return success_response({"key": key, "value": data[key]})
 
-    if command == "delete":
-        if key is None:
-            return error("SCRATCHPAD_MISS", "No key specified",
-                         hint="Provide the key name to delete.")
-        if key not in data:
-            return error("SCRATCHPAD_MISS", f"No entry for '{key}'",
-                         hint="Use scratchpad.list to see all keys.")
-        del data[key]
-        _save_scratchpad(data)
-        return f"{PREFIX_OK}Deleted."
 
-    if command == "list":
-        if not data:
-            return f"{PREFIX_OK}[Empty scratchpad]"
-        return f"{PREFIX_OK}" + ", ".join(sorted(data.keys()))
+@mcp.tool(name="lean_scratchpad_delete")
+def scratchpad_delete(key: str) -> str:
+    """Deletes a key from the persistent scratchpad."""
+    data = _load_scratchpad()
+    if key not in data:
+        return error_response("KEY_NOT_FOUND", f"Key '{key}' not in scratchpad.")
+    del data[key]
+    _save_scratchpad(data)
+    return success_response({"deleted_key": key})
 
-    return ""
+
+@mcp.tool(name="lean_scratchpad_list")
+def scratchpad_list() -> str:
+    """Lists all keys currently stored in the persistent scratchpad."""
+    data = _load_scratchpad()
+    return success_response(list(data.keys()))
+
 
 # ===========================================================================
 # Entry point
