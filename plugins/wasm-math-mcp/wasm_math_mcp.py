@@ -1,54 +1,52 @@
 import ast
+import atexit
 import calendar
 import cmath
+import collections
 from collections import deque
 import contextlib
 import datetime
 import decimal
 import fractions
+import heapq
 import io
+import itertools
 import json
 import math
 import multiprocessing
+from multiprocessing.queues import Empty
 import re
 import statistics
+import threading
 import time
 import traceback
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
+import networkx as nx
 from mcp.server.fastmcp import FastMCP
 
 # Initialize FastMCP Server
-mcp = FastMCP("WASM Sandboxed Python MCP Server")
+mcp = FastMCP("Lightweight Graph & Math MCP Server")
+
+# Maximum input payload size (50 KB cap to prevent RAM exhaustion)
+MAX_CODE_LENGTH_BYTES = 50_000
+
+# F1: Maximum result JSON size before truncation (256 KB)
+MAX_RESULT_BYTES = 256_000
+
+# F4: Human-readable list of available modules/names in the sandbox
+AVAILABLE_NAMES = (
+    "math, cmath, decimal, fractions, statistics, networkx (as 'nx'), "
+    "collections, itertools, heapq, datetime, calendar, json, re, "
+    "and standard builtins (list, dict, set, str, int, float, bool, len, "
+    "sum, max, min, sorted, enumerate, zip, map, range, abs, round, "
+    "pow, divmod, reversed, format, type, isinstance, "
+    "ValueError, TypeError)"
+)
 
 # ---------------------------------------------------------------------------
-# Pre-Imported Libraries & Module-Level Safe Scope
+# Module-Level Safe Scope (Zero-Heavy-Dependency Stack)
 # ---------------------------------------------------------------------------
-try:
-    import numpy as np
-    import numpy
-    HAS_NUMPY = True
-except ImportError:
-    np = None
-    numpy = None
-    HAS_NUMPY = False
-
-try:
-    import pandas as pd
-    import pandas
-    HAS_PANDAS = True
-except ImportError:
-    pd = None
-    pandas = None
-    HAS_PANDAS = False
-
-try:
-    import scipy
-    HAS_SCIPY = True
-except ImportError:
-    scipy = None
-    HAS_SCIPY = False
-
-# Module-level SAFE_GLOBALS eliminates re-allocation overhead per invocation
 SAFE_GLOBALS: Dict[str, Any] = {
     "__builtins__": {
         "abs": abs, "all": all, "any": any, "bool": bool, "complex": complex,
@@ -60,27 +58,29 @@ SAFE_GLOBALS: Dict[str, Any] = {
         "str": str, "sum": sum, "tuple": tuple, "zip": zip,
         "isinstance": isinstance, "type": type, "ValueError": ValueError, "TypeError": TypeError,
     },
+    # Math & Precision
     "math": math,
     "cmath": cmath,
     "decimal": decimal,
     "fractions": fractions,
     "statistics": statistics,
+    # Graphs & Algorithms
+    "networkx": nx,
+    "nx": nx,
+    "collections": collections,
+    "itertools": itertools,
+    "heapq": heapq,
+    # Utilities & Parsing
     "datetime": datetime,
     "calendar": calendar,
     "json": json,
     "re": re,
 }
 
-if HAS_NUMPY:
-    SAFE_GLOBALS["numpy"] = numpy
-    SAFE_GLOBALS["np"] = np
 
-if HAS_PANDAS:
-    SAFE_GLOBALS["pandas"] = pandas
-    SAFE_GLOBALS["pd"] = pd
-
-if HAS_SCIPY:
-    SAFE_GLOBALS["scipy"] = scipy
+def _elapsed_ms(start_time: float) -> float:
+    """Helper to calculate elapsed execution time in milliseconds."""
+    return round((time.perf_counter() - start_time) * 1000, 2)
 
 
 # ---------------------------------------------------------------------------
@@ -88,9 +88,8 @@ if HAS_SCIPY:
 # ---------------------------------------------------------------------------
 class SmartStdoutBuffer(io.TextIOBase):
     """Memory-bounded stdout stream writer using a Head/Tail ring buffer strategy.
-    
-    Guarantees that stdout captured in RAM never exceeds a strict limit (default ~45 KB)
-    regardless of how many megabytes or millions of lines a script prints.
+
+    Guarantees stdout in RAM never exceeds ~45 KB regardless of script output size.
     """
 
     def __init__(self, head_limit_bytes: int = 20_000, tail_limit_bytes: int = 25_000):
@@ -98,10 +97,10 @@ class SmartStdoutBuffer(io.TextIOBase):
         self.head_limit = head_limit_bytes
         self.tail_limit = tail_limit_bytes
 
-        self.head_buf = []
+        self.head_buf: List[str] = []
         self.head_bytes = 0
 
-        self.tail_deque = deque()
+        self.tail_deque: deque = deque()
         self.tail_bytes = 0
 
         self.total_bytes = 0
@@ -112,11 +111,10 @@ class SmartStdoutBuffer(io.TextIOBase):
         if not s:
             return 0
 
-        n_bytes = len(s.encode("utf-8"))
+        n_bytes = len(s) if s.isascii() else len(s.encode("utf-8"))
         self.total_bytes += n_bytes
         self.total_lines += s.count("\n")
 
-        # Fill head buffer up to threshold
         if self.head_bytes < self.head_limit:
             needed = self.head_limit - self.head_bytes
             if n_bytes <= needed:
@@ -125,8 +123,9 @@ class SmartStdoutBuffer(io.TextIOBase):
             else:
                 head_part = s[:needed]
                 tail_part = s[needed:]
+                head_part_bytes = len(head_part) if head_part.isascii() else len(head_part.encode("utf-8"))
                 self.head_buf.append(head_part)
-                self.head_bytes += len(head_part.encode("utf-8"))
+                self.head_bytes += head_part_bytes
                 self._push_tail(tail_part)
                 self.is_truncated = True
         else:
@@ -136,19 +135,20 @@ class SmartStdoutBuffer(io.TextIOBase):
         return len(s)
 
     def _push_tail(self, s: str) -> None:
-        self.tail_deque.append(s)
-        self.tail_bytes += len(s.encode("utf-8"))
+        n_bytes = len(s) if s.isascii() else len(s.encode("utf-8"))
+        self.tail_deque.append((s, n_bytes))
+        self.tail_bytes += n_bytes
 
         while self.tail_bytes > self.tail_limit and self.tail_deque:
-            popped = self.tail_deque.popleft()
-            self.tail_bytes -= len(popped.encode("utf-8"))
+            _, popped_bytes = self.tail_deque.popleft()
+            self.tail_bytes -= popped_bytes
 
     def getvalue(self) -> str:
         if not self.is_truncated:
             return "".join(self.head_buf).strip()
 
         head_str = "".join(self.head_buf)
-        tail_str = "".join(self.tail_deque)
+        tail_str = "".join(item[0] for item in self.tail_deque)
         dropped_bytes = self.total_bytes - (self.head_bytes + self.tail_bytes)
 
         marker = (
@@ -163,24 +163,27 @@ class SmartStdoutBuffer(io.TextIOBase):
 # ---------------------------------------------------------------------------
 def _format_code_with_line_numbers(code: str) -> str:
     """Formats Python code with explicit line numbers for LLM error context."""
+    if not code:
+        return "1: <empty code>"
     lines = code.splitlines()
     width = len(str(len(lines))) if lines else 1
     return "\n".join(f"{i + 1:>{width}}: {line}" for i, line in enumerate(lines))
 
 
 def analyze_transform_ast(code: str) -> Tuple[bool, Optional[str], Optional[ast.AST]]:
-    """Single-pass AST validator and transformer.
+    """Single-pass AST validator and transformer with input payload capping."""
+    if len(code.encode("utf-8")) > MAX_CODE_LENGTH_BYTES:
+        return False, f"Security Restriction: Script length exceeds maximum cap of {MAX_CODE_LENGTH_BYTES:,} bytes.", None
 
-    Enforces import restrictions and automatically wraps trailing expressions into
-    a result variable for multi-line scripts.
-    """
     try:
         tree = ast.parse(code, mode="exec")
     except SyntaxError as e:
         error_msg = f"SyntaxError on line {e.lineno}, col {e.offset}: {e.msg}\n  Code: {e.text.strip() if e.text else ''}"
         return False, error_msg, None
 
-    banned_modules = {"os", "sys", "subprocess", "shutil", "socket", "ctypes", "pathlib"}
+    banned_modules = {
+        "os", "sys", "subprocess", "shutil", "socket", "ctypes", "pathlib", "importlib", "pickle"
+    }
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
@@ -202,27 +205,114 @@ def analyze_transform_ast(code: str) -> Tuple[bool, Optional[str], Optional[ast.
     return True, None, tree
 
 
-def _sanitize_result(obj: Any) -> Any:
-    """Recursively converts complex data structures (NumPy, Pandas, complex, set) to JSON objects."""
-    if HAS_NUMPY and isinstance(obj, (np.ndarray, np.generic)):
-        return obj.tolist()
-    if HAS_PANDAS:
-        if isinstance(obj, pandas.DataFrame):
-            return obj.to_dict(orient="records")
-        if isinstance(obj, pandas.Series):
-            return obj.to_dict()
+# ---------------------------------------------------------------------------
+# F2: Deterministic ordering + path-based cycle detection
+# ---------------------------------------------------------------------------
+def _sanitize_result(obj: Any, _seen: Optional[set] = None) -> Any:
+    """Recursively converts complex data structures to JSON-serializable primitives.
+
+    Uses a path-based cycle detector to avoid false positives on shared-but-not-circular
+    container objects. All dict keys are sorted for deterministic output. All sets are
+    converted to sorted lists.
+    """
+    if obj is None or isinstance(obj, (int, float, str, bool)):
+        return obj
+
+    if _seen is None:
+        _seen = set()
+
+    is_container = isinstance(obj, (dict, list, tuple, set, frozenset, nx.Graph))
+    if is_container:
+        obj_id = id(obj)
+        if obj_id in _seen:
+            return "<circular_reference>"
+        _seen.add(obj_id)
+
+    try:
+        return _sanitize_result_impl(obj, _seen)
+    finally:
+        if is_container:
+            _seen.discard(id(obj))
+
+
+def _sorted_keys(keys) -> list:
+    """Sort keys deterministically: strings and numbers first, then by type name."""
+    try:
+        return sorted(keys, key=lambda k: (type(k).__name__, str(k)))
+    except TypeError:
+        return list(keys)
+
+
+def _sanitize_result_impl(obj: Any, _seen: set) -> Any:
+    """Internal dispatch for _sanitize_result after cycle check."""
+    if isinstance(obj, nx.Graph):
+        nodes: List[Dict[str, Any]] = []
+        for n, d in sorted(obj.nodes(data=True), key=lambda x: str(x[0])):
+            sanitized_d = _sanitize_result(d, _seen)
+            node_dict: Dict[str, Any] = {"id": n}
+            if isinstance(sanitized_d, dict):
+                node_dict.update(sanitized_d)
+            else:
+                node_dict["data"] = sanitized_d
+            nodes.append(node_dict)
+
+        edges: List[Dict[str, Any]] = []
+        if obj.is_multigraph():
+            for u, v, k, d in sorted(obj.edges(keys=True, data=True),
+                                     key=lambda x: (str(x[0]), str(x[1]), str(x[2]))):
+                sanitized_d = _sanitize_result(d, _seen)
+                edge_dict: Dict[str, Any] = {"source": u, "target": v, "key": k}
+                if isinstance(sanitized_d, dict):
+                    edge_dict.update(sanitized_d)
+                else:
+                    edge_dict["data"] = sanitized_d
+                edges.append(edge_dict)
+        else:
+            for u, v, d in sorted(obj.edges(data=True),
+                                  key=lambda x: (str(x[0]), str(x[1]))):
+                sanitized_d = _sanitize_result(d, _seen)
+                edge_dict: Dict[str, Any] = {"source": u, "target": v}
+                if isinstance(sanitized_d, dict):
+                    edge_dict.update(sanitized_d)
+                else:
+                    edge_dict["data"] = sanitized_d
+                edges.append(edge_dict)
+
+        return {
+            "directed": obj.is_directed(),
+            "multigraph": obj.is_multigraph(),
+            "nodes": nodes,
+            "edges": edges,
+            "graph_metadata": _sanitize_result(dict(obj.graph), _seen),
+        }
+
+    if isinstance(obj, (decimal.Decimal, fractions.Fraction)):
+        return str(obj)
+
+    if isinstance(obj, bytes):
+        return obj.decode("utf-8", errors="replace")
+
+    # F2: Sorted set serialization
     if isinstance(obj, (set, frozenset)):
-        return [_sanitize_result(item) for item in obj]
+        try:
+            return sorted(_sanitize_result(item, _seen) for item in obj)
+        except TypeError:
+            return [_sanitize_result(item, _seen) for item in obj]
+
     if isinstance(obj, complex):
         return {"real": obj.real, "imag": obj.imag}
+
     if isinstance(obj, (datetime.datetime, datetime.date, datetime.time)):
         return obj.isoformat()
-    if isinstance(obj, (decimal.Decimal, fractions.Fraction)):
-        return float(obj)
+
+    # F2: Sorted dict key serialization
     if isinstance(obj, dict):
-        return {str(k): _sanitize_result(v) for k, v in obj.items()}
+        return {str(k): _sanitize_result(v, _seen)
+                for k in _sorted_keys(obj.keys())}
+
     if isinstance(obj, (list, tuple)):
-        return [_sanitize_result(item) for item in obj]
+        return [_sanitize_result(item, _seen) for item in obj]
+
     return obj
 
 
@@ -245,7 +335,7 @@ def format_actionable_error(exc: Exception, code: str) -> Dict[str, Any]:
                     line_content = code_lines[line_no - 1].strip()
                 break
 
-    error_info = {
+    error_info: Dict[str, Any] = {
         "error_type": type(exc).__name__,
         "message": str(exc),
         "line_number": line_no,
@@ -254,17 +344,22 @@ def format_actionable_error(exc: Exception, code: str) -> Dict[str, Any]:
     }
 
     if isinstance(exc, NameError):
-        error_info["hint"] = "Ensure all variables and modules are declared or passed via 'variables'."
+        error_info["hint"] = (
+            f"Name '{str(exc).split('\'')[1] if \"'\" in str(exc) else 'unknown'}' is not defined. "
+            f"Available modules and names: {AVAILABLE_NAMES}"
+        )
     elif isinstance(exc, TypeError):
-        error_info["hint"] = "Check type compatibility. Convert strings or array types explicitly."
+        error_info["hint"] = "Check type compatibility. Convert strings or complex types explicitly."
     elif isinstance(exc, ZeroDivisionError):
         error_info["hint"] = "Divisor evaluated to zero. Add a conditional check or fallback."
     elif isinstance(exc, KeyError):
-        error_info["hint"] = "Key missing in dictionary. Use dict.get(key, default) or verify keys."
+        error_info["hint"] = "Key missing in dictionary or graph node. Verify keys or node IDs."
     elif isinstance(exc, IndexError):
-        error_info["hint"] = "Index out of range. Check list or array dimensions prior to indexing."
+        error_info["hint"] = "Index out of range. Check list or deque dimensions prior to indexing."
     elif isinstance(exc, SyntaxError):
         error_info["hint"] = "Fix syntax error (check missing colons, unbalanced brackets, or indentation)."
+    elif isinstance(exc, nx.NetworkXError):
+        error_info["hint"] = "Verify NetworkX graph constraints (e.g., check for cycles in DAGs, valid paths, or existing nodes)."
     else:
         error_info["hint"] = "Review the line-numbered code and error message to correct execution logic."
 
@@ -272,120 +367,329 @@ def format_actionable_error(exc: Exception, code: str) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Subprocess Worker Execution Logic
+# Thread-per-request execution with timeout & worker recycling
 # ---------------------------------------------------------------------------
-def _worker_exec_sandboxed(code: str, variables: Dict[str, Any], queue: multiprocessing.Queue) -> None:
-    """Isolated worker target function for process sandboxing."""
+def _execute_single_request(
+    code: str,
+    variables: Dict[str, Any],
+    heartbeat_interval: float,
+) -> Dict[str, Any]:
+    """Execute one code request. Called inside a dedicated daemon thread.
+
+    F6: Heartbeat — periodically writes a progress indicator to stdout so the caller
+    knows execution is still active during long-running operations.
+    """
     start_time = time.perf_counter()
 
     is_valid, ast_error, tree = analyze_transform_ast(code)
     if not is_valid:
-        execution_time_ms = round((time.perf_counter() - start_time) * 1000, 2)
-        queue.put({
+        return {
             "status": "error",
             "result": None,
             "stdout": "",
-            "execution_time_ms": execution_time_ms,
+            "execution_time_ms": _elapsed_ms(start_time),
             "error": {
                 "error_type": "ASTValidationError",
                 "message": ast_error,
                 "code_with_line_numbers": _format_code_with_line_numbers(code),
                 "hint": "Fix syntax or remove restricted module imports before re-submitting.",
             },
-        })
-        return
+        }
 
-    execution_scope = {**SAFE_GLOBALS, **variables}
-    
-    # Use SmartStdoutBuffer to cap memory usage on heavy prints
+    execution_scope = SAFE_GLOBALS.copy()
+    if variables:
+        execution_scope.update(variables)
+
     buffer = SmartStdoutBuffer(head_limit_bytes=20_000, tail_limit_bytes=25_000)
+
+    # F6: Heartbeat thread — writes a marker to the buffer at a fixed interval
+    heartbeat_active = threading.Event()
+    heartbeat_thread = threading.Thread(
+        target=_heartbeat_loop,
+        args=(buffer, heartbeat_active, heartbeat_interval),
+        daemon=True,
+    )
     eval_result = None
 
     try:
+        heartbeat_active.set()
+        heartbeat_thread.start()
+
         with contextlib.redirect_stdout(buffer):
             compiled_code = compile(tree, filename="<ast>", mode="exec")
             exec(compiled_code, execution_scope)
 
-            if "result" in execution_scope and execution_scope["result"] is not SAFE_GLOBALS.get("result"):
+            if "result" in execution_scope:
                 eval_result = execution_scope["result"]
             elif "_last_result" in execution_scope:
                 eval_result = execution_scope["_last_result"]
 
-        sanitized_result = _sanitize_result(eval_result)
-        execution_time_ms = round((time.perf_counter() - start_time) * 1000, 2)
+        heartbeat_active.clear()
+        heartbeat_thread.join(timeout=0.5)
 
-        queue.put({
+        sanitized_result = _sanitize_result(eval_result)
+
+        # F1: Result size cap with truncation
+        result_json = json.dumps(sanitized_result, default=str)
+        result_bytes = len(result_json.encode("utf-8"))
+        result_truncated = False
+
+        if result_bytes > MAX_RESULT_BYTES:
+            result_truncated = True
+            # Keep the JSON prefix intact — truncate the inner content
+            truncated_result = _truncate_json(result_json, MAX_RESULT_BYTES)
+            sanitized_result = truncated_result
+
+        return {
             "status": "success",
             "result": sanitized_result,
             "stdout": buffer.getvalue(),
-            "execution_time_ms": execution_time_ms,
+            "execution_time_ms": _elapsed_ms(start_time),
             "error": None,
-        })
+            "result_truncated": result_truncated,
+            "result_size_bytes": result_bytes,
+        }
 
     except Exception as exc:
-        execution_time_ms = round((time.perf_counter() - start_time) * 1000, 2)
-        queue.put({
-            "status": "error",
-            "result": None,
-            "stdout": buffer.getvalue(),
-            "execution_time_ms": execution_time_ms,
-            "error": format_actionable_error(exc, code),
-        })
-
-
-def execute_sandboxed_python(
-    code: str,
-    variables: Optional[Dict[str, Any]] = None,
-    timeout: float = 5.0,
-) -> Dict[str, Any]:
-    """Executes code inside a separate process with hard CPU time enforcement."""
-    ctx = multiprocessing.get_context("spawn")
-    queue = ctx.Queue()
-    proc = ctx.Process(
-        target=_worker_exec_sandboxed,
-        args=(code, variables or {}, queue),
-    )
-
-    start_time = time.perf_counter()
-    proc.start()
-    proc.join(timeout=timeout)
-
-    # Subprocess Timeout Handling
-    if proc.is_alive():
-        proc.terminate()
-        proc.join(timeout=1.0)
-        if proc.is_alive():
-            proc.kill()
-        execution_time_ms = round((time.perf_counter() - start_time) * 1000, 2)
+        heartbeat_active.clear()
+        heartbeat_thread.join(timeout=0.5)
         return {
             "status": "error",
             "result": None,
-            "stdout": "",
-            "execution_time_ms": execution_time_ms,
-            "error": {
-                "error_type": "TimeoutError",
-                "message": f"Execution exceeded maximum allowed time limit of {timeout} seconds.",
-                "code_with_line_numbers": _format_code_with_line_numbers(code),
-                "hint": "Optimize loops, reduce dataset sizes, or remove blocking operations.",
-            },
+            "stdout": buffer.getvalue(),
+            "execution_time_ms": _elapsed_ms(start_time),
+            "error": format_actionable_error(exc, code),
         }
 
-    if not queue.empty():
-        return queue.get()
 
-    execution_time_ms = round((time.perf_counter() - start_time) * 1000, 2)
-    return {
-        "status": "error",
-        "result": None,
-        "stdout": "",
-        "execution_time_ms": execution_time_ms,
-        "error": {
-            "error_type": "SubprocessError",
-            "message": "Worker process exited unexpectedly.",
-            "code_with_line_numbers": _format_code_with_line_numbers(code),
-            "hint": "Check for memory limit exhaustion or fatal C-extension termination.",
-        },
+def _heartbeat_loop(
+    buffer: SmartStdoutBuffer,
+    active: threading.Event,
+    interval: float,
+) -> None:
+    """F6: Periodically write a heartbeat marker to stdout while execution is active."""
+    while active.wait(timeout=interval):
+        buffer.write("\n[HEARTBEAT]\n")
+
+
+def _truncate_json(json_str: str, max_bytes: int) -> Any:
+    """F1: Truncate a JSON string to stay within max_bytes while preserving structure.
+
+    Returns a dict containing the truncated result, metadata about the truncation,
+    and an explanation for the caller.
+    """
+    try:
+        full_obj = json.loads(json_str)
+    except json.JSONDecodeError:
+        full_obj = None
+
+    truncated = {
+        "_truncated": True,
+        "_message": (
+            f"Result was truncated from {len(json_str):,} bytes to {max_bytes:,} bytes "
+            f"to prevent context overflow. The full result structure is preserved below "
+            f"with nested collections capped."
+        ),
+        "_original_size_bytes": len(json_str),
+        "_data": _deep_truncate(full_obj, max_bytes - 500),
     }
+    return truncated
+
+
+def _deep_truncate(obj: Any, remaining_bytes: int, _depth: int = 0) -> Any:
+    """Recursively cap list/dict sizes until the result fits within remaining_bytes."""
+    if _depth > 20:
+        return "<max nesting depth>"
+
+    if isinstance(obj, (int, float, str, bool, type(None))):
+        return obj
+
+    if isinstance(obj, list):
+        if not obj:
+            return obj
+        for limit in [min(len(obj), 1000), 500, 250, 100, 50, 10, 5, 1]:
+            truncated = [_deep_truncate(item, remaining_bytes // limit, _depth + 1) for item in obj[:limit]]
+            test = json.dumps(truncated, default=str)
+            if len(test.encode("utf-8")) <= remaining_bytes:
+                if limit < len(obj):
+                    truncated.append(f"<... {len(obj) - limit:,} more items elided >")
+                return truncated
+        return obj[:1]
+
+    if isinstance(obj, dict):
+        if not obj:
+            return obj
+        items = list(obj.items())
+        for limit in [min(len(items), 200), 100, 50, 25, 10, 5, 1]:
+            truncated = {str(k): _deep_truncate(v, remaining_bytes // limit, _depth + 1)
+                         for k, v in items[:limit]}
+            test = json.dumps(truncated, default=str)
+            if len(test.encode("utf-8")) <= remaining_bytes:
+                if limit < len(items):
+                    truncated[f"<... {len(items) - limit:,} more keys elided >"] = None
+                return truncated
+        return {str(items[0][0]): items[0][1]}
+
+    return obj
+
+
+# ---------------------------------------------------------------------------
+# Persistent Worker & Execution Engine
+# ---------------------------------------------------------------------------
+def _worker_loop(
+    request_queue: multiprocessing.Queue,
+    response_queue: multiprocessing.Queue,
+) -> None:
+    """Persistent worker loop. Each request runs in its own daemon thread.
+
+    Timeout enforcement: If a CPU runaway thread exceeds the timeout, the worker
+    reports TimeoutError and breaks out of the loop. This causes the worker process
+    to terminate cleanly so PersistentSandboxManager can spawn a fresh worker process
+    free of zombie CPU threads.
+    """
+    while True:
+        try:
+            req = request_queue.get()
+            if req is None:
+                break
+
+            code = req["code"]
+            variables = req["variables"]
+            timeout = req["timeout"]
+            heartbeat_interval = req.get("heartbeat_interval", 1.0)
+
+            result_holder: List[Optional[Dict[str, Any]]] = [None]
+
+            def run_request() -> None:
+                result_holder[0] = _execute_single_request(
+                    code, variables, heartbeat_interval
+                )
+
+            thread = threading.Thread(target=run_request, daemon=True)
+            thread.start()
+            thread.join(timeout=timeout)
+
+            if thread.is_alive():
+                response_queue.put({
+                    "status": "error",
+                    "result": None,
+                    "stdout": "",
+                    "execution_time_ms": 0,
+                    "error": {
+                        "error_type": "TimeoutError",
+                        "message": f"Execution exceeded maximum allowed time limit of {timeout} seconds.",
+                        "code_with_line_numbers": _format_code_with_line_numbers(code),
+                        "hint": "Optimize graph traversals or loops, or simplify problem scope.",
+                    },
+                })
+                break
+            else:
+                response_queue.put(result_holder[0])
+
+        except Exception as loop_exc:
+            try:
+                response_queue.put({
+                    "status": "error",
+                    "result": None,
+                    "stdout": "",
+                    "execution_time_ms": 0,
+                    "error": {
+                        "error_type": "WorkerCrash",
+                        "message": f"Worker loop failed unexpectedly: {type(loop_exc).__name__}: {loop_exc}",
+                        "hint": "The worker process encountered an internal error. It will restart on the next request.",
+                    },
+                })
+            except Exception:
+                pass
+            break
+
+
+class PersistentSandboxManager:
+    """Manages a long-lived persistent worker process with auto-restart on failure."""
+
+    def __init__(self) -> None:
+        self.ctx = multiprocessing.get_context("spawn")
+        self.proc: Optional[multiprocessing.Process] = None
+        self.request_queue: Optional[multiprocessing.Queue] = None
+        self.response_queue: Optional[multiprocessing.Queue] = None
+
+    def _shutdown_worker(self) -> None:
+        """Send shutdown signal and cleanly terminate the worker process."""
+        if self.request_queue is not None:
+            try:
+                self.request_queue.put(None)
+            except Exception:
+                pass
+        if self.proc is not None:
+            self.proc.join(timeout=2.0)
+            if self.proc.is_alive():
+                self.proc.terminate()
+                self.proc.join(timeout=1.0)
+                if self.proc.is_alive():
+                    self.proc.kill()
+            self.proc = None
+
+    def _ensure_worker(self) -> None:
+        if self.proc is None or not self.proc.is_alive():
+            self._shutdown_worker()
+            self.request_queue = self.ctx.Queue()
+            self.response_queue = self.ctx.Queue()
+            self.proc = self.ctx.Process(
+                target=_worker_loop,
+                args=(self.request_queue, self.response_queue),
+                daemon=True,
+            )
+            self.proc.start()
+
+    def execute(
+        self,
+        code: str,
+        variables: Optional[Dict[str, Any]] = None,
+        timeout: float = 5.0,
+        heartbeat_interval: float = 1.0,
+    ) -> Dict[str, Any]:
+        self._ensure_worker()
+        start_time = time.perf_counter()
+
+        self.request_queue.put({
+            "code": code,
+            "variables": variables or {},
+            "timeout": timeout,
+            "heartbeat_interval": heartbeat_interval,
+        })
+
+        try:
+            return self.response_queue.get(timeout=timeout + 1.0)
+        except Empty:
+            self._shutdown_worker()
+            self.proc = None
+
+            return {
+                "status": "error",
+                "result": None,
+                "stdout": "",
+                "execution_time_ms": _elapsed_ms(start_time),
+                "error": {
+                    "error_type": "TimeoutError",
+                    "message": f"Execution exceeded maximum allowed time limit of {timeout} seconds.",
+                    "code_with_line_numbers": _format_code_with_line_numbers(code),
+                    "hint": "Optimize graph traversals or loops, or simplify problem scope.",
+                },
+            }
+
+
+# Singleton Sandbox Instance
+SANDBOX_MANAGER = PersistentSandboxManager()
+
+
+# ---------------------------------------------------------------------------
+# Graceful shutdown on parent process exit
+# ---------------------------------------------------------------------------
+def _shutdown_on_exit() -> None:
+    SANDBOX_MANAGER._shutdown_worker()
+
+
+atexit.register(_shutdown_on_exit)
 
 
 # ---------------------------------------------------------------------------
@@ -396,27 +700,31 @@ async def execute_math_python(
     code: str,
     variables: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """CRITICAL SYSTEM INSTRUCTION FOR COMPUTATIONAL & REASONING TASKS:
-    You MUST prioritize using this live Python execution tool as your absolute FIRST CHOICE for:
+    """CRITICAL SYSTEM INSTRUCTION FOR ANALYTICAL, MATHEMATICAL & TEXT TASKS:
+    Always run live Python code to analyze data, structure thoughts, or compute deterministic results.
+    Use this tool as your primary scratchpad for:
 
-    1. **Vector & Matrix Operations (NumPy/Pandas/SciPy):** Multi-dimensional array manipulations, dot products, matrix inversion, eigenvalues, linear algebra, vector cross products, dataframes (`numpy`, `np`, `pandas`, `pd`, `scipy`).
-    2. **Exact Math & High-Precision Arithmetic:** Trigonometry, logarithms, exponentiation, roots, factorials, complex numbers, high-precision currency, and fractions (`math`, `cmath`, `decimal`, `fractions`).
-    3. **Calendar & Date Math:** Computing business days, relative date spans, leap years, time zones, and timestamp math (`datetime`, `calendar`).
-    4. **Data Filtering & Text Matching:** Filtering, grouping, mapping, regex parsing, or aggregating JSON datasets, lists, and dicts deterministically without text truncation (`re`, `json`).
-    5. **Statistical Calculations & Forecasting:** Calculating mean, median, variance, standard deviation, linear regression trends, moving averages, or running Monte Carlo probability models (`statistics`, `numpy`, `scipy`).
-    6. **Code Verification & Self-Testing:** Validating custom logic, helper functions, or algorithms against test cases before outputting final answers to the user.
+    1. **Precise Math & Science Calculations (`math`, `cmath`, `statistics`, `fractions`):** Algebra, geometry, trigonometry, calculus approximations, physics/engineering formulas, probability distributions, matrix operations, unit conversions, and statistical analysis (mean, variance, standard deviation, regression).
+    2. **Constraint Satisfaction & Logic Puzzles (`itertools`, custom loops):** Solving puzzles, seating/shift arrangements, resource allocations, Sudoku, permutations, and rule-based backtracking.
+    3. **Advanced Date, Time & Calendar Math (`datetime`, `calendar`):** Computing business-day offsets, project deadlines, relative date spans, leap years, and timezone math.
+    4. **Financial & Precision Arithmetic (`decimal`, `fractions`):** Loan amortization schedules, multi-tier tax brackets, compound interest, currency math, and exact decimal operations without floating-point rounding errors.
+    5. **Bulk Text Cleaning & Structural Transformation (`re`, `json`):** Reformatting raw CSVs, markdown tables, or unstructured text logs without dropping lines or introducing typos.
+    6. **Text & Idea Comparison (`difflib`, `set`, `re`):** Finding common concepts across multiple documents, set intersections (`set(A) & set(B)`), extracting shared keywords, and deduplicating ideas.
+    7. **Graph Analysis & Workflow Planning (`networkx`, `nx`):** Topological sorting, finding critical path dependencies (`nx.topological_sort`), identifying bottlenecks, and verifying DAGs (`nx.is_directed_acyclic_graph`).
 
-    DO NOT estimate numbers, perform mental arithmetic, or guess date ranges in prose. Always execute Python to compute exact, deterministic results.
+    Do NOT perform mental math in prose, estimate dates, guess constraint solutions, or attempt to compare long texts purely in prose. Load text/data into 'variables' and execute Python to generate exact, deterministic outputs.
 
     Args:
-        code: Python expression or script to execute (e.g., 'pd.DataFrame(data).describe()' or 'np.dot(a, b)').
-        variables: Optional dictionary of variables or datasets (e.g., {"data": [12.5, 14.2, 11.8]}) to pre-load into the scope.
+        code: Python expression or script to execute.
+        variables: Optional dictionary of data, text payloads, or variables to pre-load into scope.
 
     Returns:
-        Structured JSON string containing 'status', 'result', 'stdout', 'execution_time_ms', and actionable 'error' details with line numbers if execution fails.
+        Structured compact JSON string containing 'status', 'result', 'stdout', 'execution_time_ms', 
+        'result_truncated' (bool), 'result_size_bytes', and actionable 'error' details with line numbers 
+        if execution fails. Long-running operations emit [HEARTBEAT] markers to stdout every second.
     """
-    output_data = execute_sandboxed_python(code, variables=variables)
-    return json.dumps(output_data, indent=2, default=str)
+    output_data = SANDBOX_MANAGER.execute(code, variables=variables)
+    return json.dumps(output_data, default=str)
 
 
 def main() -> None:
@@ -424,11 +732,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    # Required before anything else runs: execute_sandboxed_python spawns
-    # worker subprocesses via multiprocessing's "spawn" context, and on
-    # Windows a frozen PyInstaller exe re-executes this same entry point for
-    # each spawned child. Without freeze_support(), each child re-imports
-    # this module, sees __name__ == "__main__" again, and relaunches the
-    # whole MCP server instead of running the worker target.
     multiprocessing.freeze_support()
     main()

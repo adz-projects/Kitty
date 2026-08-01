@@ -243,3 +243,35 @@ historical context only; none of it reflects current code.
   build-time existence check for local `cargo build`) until
   `python plugins/build.py` overwrites them with real frozen executables —
   see `src-tauri/binaries/README.md`.
+
+## `lean_web_search` merge — `brave_mcp_search` + `lean_fallback_web_search` retired
+
+- `brave_mcp_search` (Rust, `kitty-tools`, gated on `BRAVE_API_KEY`) and
+  `lean_fallback_web_search` (Python, `kitty-docs-web`, DuckDuckGo via
+  `ddgs`) are both retired, replaced by one merged, count-tiered tool pair —
+  `lean_web_search` / `lean_web_search_read_chunk` — hosted in
+  `kitty-docs-web` (Python). The tool no longer requires the model to choose
+  an engine: `count <= 5` (default) tries Brave first if configured, falling
+  back to DuckDuckGo only on Brave failure; `6 <= count <= 10` queries both
+  engines concurrently for broader coverage; `count > 10` does the same
+  dual-engine fetch but offloads the full result set to a temp file and
+  returns a compact, deterministic keyword index (frequency-based, not LSA —
+  no ranking dependency needed at this scale) instead of full detail —
+  `lean_web_search_read_chunk` fetches full detail for chosen ids afterward.
+- **Hosting moved from Rust to Python**: DuckDuckGo has no Rust crate
+  equivalent (the alternative was hand-rolling and maintaining an HTML
+  scraper against DuckDuckGo's lite endpoint), while Brave's call is a
+  plain JSON GET — trivial to host in Python alongside `ddgs` instead. So
+  `kitty-tools` loses its network surface entirely (dropped the `reqwest`/
+  `url`/`rand` dependencies, now purely local-machine tools + viz), and
+  `src-tauri/src/bigtiny/mcp.rs`'s `BRAVE_API_KEY` env-var wiring moved from
+  the `kitty-tools` upsert block to the `kitty-docs-web` upsert block.
+- **Expected fallout, not a regression:** renaming/removing these two tool
+  names resets adaptive-pathway's learned Thompson-bandit routing state for
+  them (it hashes the literal tool-name string — see
+  `plugins/kitty-tools/tests/protocol.rs`'s header note). Both new tool
+  names start cold.
+- The new DDG path must not reproduce `lean_fallback_web_search`'s known
+  "No results found" failure mode noted above (the `ddgs` 8.x→9.x rename);
+  it's covered by fixture/mock-based tests in
+  `plugins/kitty-docs-web/tests/test_web_search.py`, never live network.

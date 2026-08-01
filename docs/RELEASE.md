@@ -5,7 +5,8 @@
 ```powershell
 python plugins/build.py    # freeze the BigTiny daemon (plugins/bigtiny/) +
                             # internal plugins (adaptive-pathway,
-                            # adaptive-pathway-mcp, replacement-mcp, etc.) to
+                            # adaptive-pathway-mcp, kitty-tools (Rust),
+                            # kitty-docs-web, wasm-math-mcp) to
                             # src-tauri/binaries/ — see plugins/README.md.
                             # Skipping this step leaves the committed empty
                             # placeholders in place, which `tauri build` will

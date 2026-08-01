@@ -261,26 +261,38 @@ export const ipc = {
   setMcpServerEnabled: (id: string, enabled: boolean) =>
     invoke<McpServer>('set_mcp_server_enabled', { id, enabled }),
   connectMcpServer: (id: string) => invoke<void>('connect_mcp_server', { id }),
-  // Bundled "lean tools" MCP server (replaces Goose's built-in Developer +
-  // Computer Controller tools) — registration/enable state lives in Kitty's
-  // config and is self-healed into BigTiny on every startup.
-  getReplacementMcpEnabled: () => invoke<boolean>('get_replacement_mcp_enabled'),
-  setReplacementMcpEnabled: (enabled: boolean) =>
-    invoke<void>('set_replacement_mcp_enabled', { enabled }),
   // Bundled sandboxed-Python/NumPy math MCP server — on by default, no
-  // credentials, same self-healing registration pattern as replacement-mcp.
+  // credentials, same self-healing registration pattern as kitty-tools.
   getWasmMathMcpEnabled: () => invoke<boolean>('get_wasm_math_mcp_enabled'),
   setWasmMathMcpEnabled: (enabled: boolean) =>
     invoke<void>('set_wasm_math_mcp_enabled', { enabled }),
-  // Bundled accessible tables/SVG diagrams MCP server (renders its results in
-  // an iframe in chat) — on by default, no credentials, same self-healing
-  // registration pattern as replacement-mcp/wasm-math-mcp.
+  // Whether the accessible tables/SVG diagrams tools are advertised by the
+  // combined kitty-tools server (renders its results in an iframe in chat) —
+  // on by default, no credentials. Toggling this alone doesn't restart a
+  // separate process; it flips an env var on kitty-tools's registration.
   getVisualizationsEnabled: () => invoke<boolean>('get_visualizations_enabled'),
   setVisualizationsEnabled: (enabled: boolean) =>
     invoke<void>('set_visualizations_enabled', { enabled }),
-  // Bundled Brave Search MCP server — off by default, requires an API key.
-  // Disabling always wipes the stored key server-side, so re-enabling always
-  // goes through setBraveMcpSearchApiKey, never a plain enabled toggle.
+  // Bundled Rust MCP server hosting shell/workspace/file/word/cache/
+  // scratchpad tools (the retired replacement-mcp's full surface), plus the
+  // 2 visualization tools gated by their own flag — on by default, no
+  // credentials, same self-healing registration pattern. Web search does
+  // NOT live here — see getKittyDocsWebEnabled/getBraveMcpSearchStatus.
+  getKittyToolsEnabled: () => invoke<boolean>('get_kitty_tools_enabled'),
+  setKittyToolsEnabled: (enabled: boolean) =>
+    invoke<void>('set_kitty_tools_enabled', { enabled }),
+  // Bundled PDF/Excel/web-scrape/web-search MCP server (Python) — the other
+  // half of the replacement-mcp split; on by default, no credentials. Hosts
+  // the merged, count-tiered lean_web_search/lean_web_search_read_chunk
+  // (DuckDuckGo always works; Brave preference controlled separately below).
+  getKittyDocsWebEnabled: () => invoke<boolean>('get_kitty_docs_web_enabled'),
+  setKittyDocsWebEnabled: (enabled: boolean) =>
+    invoke<void>('set_kitty_docs_web_enabled', { enabled }),
+  // Brave search preference on the kitty-docs-web server — off by default,
+  // requires an API key. Does not gate whether lean_web_search exists (it
+  // always does); only whether it prefers Brave over DuckDuckGo. Disabling
+  // always wipes the stored key server-side, so re-enabling always goes
+  // through setBraveMcpSearchApiKey, never a plain enabled toggle.
   getBraveMcpSearchStatus: () =>
     invoke<{ enabled: boolean; configured: boolean }>('get_brave_mcp_search_status'),
   setBraveMcpSearchApiKey: (apiKey: string) =>

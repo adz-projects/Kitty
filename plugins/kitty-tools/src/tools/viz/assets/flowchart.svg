@@ -1,0 +1,81 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 650" width="100%" height="auto" role="img" aria-label="__TITLE__">
+    <title>__TITLE__</title>
+    <desc>__DESCRIPTION__</desc>
+    __DEFS__
+
+    <rect width="100%" height="100%" class="canvas-bg"/>
+    <text x="440" y="35" class="title-text">__TITLE__</text>
+
+    <!-- CONNECTOR PATHS -->
+    <path d="M 440,100 L 440,125" class="flow-path"/>
+    <path d="M 440,170 L 440,215 A 10,10 0 0 1 430,225 L 210,225 A 10,10 0 0 0 200,235 L 200,250" class="flow-path"/>
+    <path d="M 440,215 A 10,10 0 0 0 450,225 L 670,225 A 10,10 0 0 1 680,235 L 680,250" class="flow-path"/>
+    <path d="M 200,290 L 200,335" class="flow-path"/>
+    <path d="M 680,290 L 680,330" class="flow-path"/>
+    <path d="M 680,375 L 680,415 A 10,10 0 0 1 670,425 L 550,425 A 10,10 0 0 0 540,435 L 540,450" class="flow-path"/>
+    <path d="M 680,415 A 10,10 0 0 0 690,425 L 790,425 A 10,10 0 0 1 800,435 L 800,450" class="flow-path"/>
+    <path d="M 540,490 L 540,530" class="flow-path"/>
+    <path d="M 800,490 L 800,530" class="flow-path"/>
+
+    <!-- BRANCH BADGES -->
+    <g transform="translate(315, 225)">
+        <rect x="-22" y="-11" width="44" height="22" class="tag-bg-light"/>
+        <text x="0" y="1" class="tag-text-dark">NO</text>
+    </g>
+    <g transform="translate(565, 225)">
+        <rect x="-22" y="-11" width="44" height="22" class="tag-bg-dark"/>
+        <text x="0" y="1" class="tag-text-light">YES</text>
+    </g>
+    <g transform="translate(610, 425)">
+        <rect x="-22" y="-11" width="44" height="22" class="tag-bg-light"/>
+        <text x="0" y="1" class="tag-text-dark">NO</text>
+    </g>
+    <g transform="translate(745, 425)">
+        <rect x="-22" y="-11" width="44" height="22" class="tag-bg-dark"/>
+        <text x="0" y="1" class="tag-text-light">YES</text>
+    </g>
+
+    <!-- NODES -->
+    <g transform="translate(340, 60)">
+        <rect width="200" height="40" class="node-box pill"/>
+        <text x="100" y="20" class="node-text">1. Receive API Request</text>
+    </g>
+    <g transform="translate(340, 125)">
+        <rect width="200" height="45" class="node-box decision"/>
+        <text x="100" y="12" class="badge-meta">DECISION</text>
+        <text x="100" y="27" class="node-text">2. Payload Valid?</text>
+    </g>
+    <g transform="translate(100, 250)">
+        <rect width="200" height="40" class="node-box"/>
+        <text x="100" y="20" class="node-text">3. Log Request Error</text>
+    </g>
+    <g transform="translate(100, 335)">
+        <rect width="200" height="40" class="node-box pill"/>
+        <text x="100" y="20" class="node-text">4. Return 400 Bad Request</text>
+    </g>
+    <g transform="translate(580, 250)">
+        <rect width="200" height="40" class="node-box"/>
+        <text x="100" y="20" class="node-text">5. Inspect Bearer Token</text>
+    </g>
+    <g transform="translate(580, 330)">
+        <rect width="200" height="45" class="node-box decision"/>
+        <text x="100" y="12" class="badge-meta">DECISION</text>
+        <text x="100" y="27" class="node-text">6. Token Active?</text>
+    </g>
+    <g transform="translate(450, 450)">
+        <rect width="180" height="40" class="node-box"/>
+        <text x="90" y="20" class="node-text">7. Trigger Challenge</text>
+    </g>
+    <g transform="translate(450, 530)">
+        <rect width="180" height="40" class="node-box pill"/>
+        <text x="90" y="20" class="node-text">8. Return 401 Error</text>
+    </g>
+    <g transform="translate(710, 450)">
+        <rect width="180" height="40" class="node-box"/>
+        <text x="90" y="20" class="node-text">9. Execute Controller</text>
+    </g>
+    <g transform="translate(710, 530)">
+        <rect width="180" height="40" class="node-box pill"/>
+        <text x="90" y="20" class="node-text">10. Return 200 OK</text>
+    </g>
+</svg>

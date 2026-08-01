@@ -194,4 +194,11 @@ pub struct DaemonHandle {
     pub port: Option<u16>,
     /// Sent as `X-API-Key` on every BigTiny request.
     pub secret_key: Option<String>,
+    /// Whether `spawn`'s own startup health probe ever got a response within
+    /// its bounded wait. `false` doesn't mean the daemon is dead — a Python
+    /// interpreter + FastAPI import chain (plus `connect_all()`-ing every
+    /// enabled MCP server before uvicorn even binds) can outlast that
+    /// window — but it does mean callers must not assume `/api/mcp/servers`
+    /// is reachable yet. See `lifecycle::sync_mcp_once_healthy`.
+    pub healthy: bool,
 }

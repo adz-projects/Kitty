@@ -34,6 +34,41 @@ pub async fn get_secret_async(id: &str) -> Option<String> {
         .flatten()
 }
 
+/// Same underlying read as [`get_secret_async`], but distinguishes "no entry
+/// stored" (`Ok(None)`) from "the read itself failed" (`Err`) — a transiently
+/// unavailable Windows Credential Manager looks identical to "never
+/// configured" if collapsed through `.ok()`, which is exactly what let a
+/// flaky read silently disable `brave-mcp-search` (see
+/// `bigtiny::mcp::ensure_builtin_servers`). Callers that must not treat a
+/// read failure as "delete the secret" should use this instead of
+/// [`get_secret_async`].
+pub async fn get_secret_checked(id: &str) -> Result<Option<String>, String> {
+    let owned_id = id.to_string();
+    let result = tokio::task::spawn_blocking(move || {
+        let entry = entry(&owned_id).map_err(|e| format!("keyring entry error: {e}"))?;
+        classify_read_result(entry.get_password())
+    })
+    .await;
+
+    match result {
+        Ok(inner) => inner,
+        Err(join_err) => Err(format!("keyring read task panicked: {join_err}")),
+    }
+}
+
+/// The distinction [`get_secret_checked`] exists for, pulled out as a pure
+/// function so it's unit-testable without a real OS credential store: a
+/// confirmed-absent entry is `Ok(None)` (safe to treat as "not configured"),
+/// while every other error is `Err` (must NOT be treated as "not
+/// configured" — see the doc comment on [`get_secret_checked`]).
+fn classify_read_result(result: keyring::Result<String>) -> Result<Option<String>, String> {
+    match result {
+        Ok(secret) => Ok(Some(secret)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(e) => Err(format!("keyring read error: {e}")),
+    }
+}
+
 pub fn delete_secret(id: &str) {
     if let Ok(e) = entry(id) {
         let _ = e.delete_credential();
@@ -64,5 +99,45 @@ pub fn migrate_secrets(provider_ids: &[String]) {
         if set_secret(id, &secret).is_ok() {
             let _ = old_entry.delete_credential();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_confirmed_absent_entry_classifies_as_ok_none() {
+        assert_eq!(classify_read_result(Err(keyring::Error::NoEntry)), Ok(None));
+    }
+
+    #[test]
+    fn a_successful_read_classifies_as_ok_some() {
+        assert_eq!(
+            classify_read_result(Ok("s3cr3t".to_string())),
+            Ok(Some("s3cr3t".to_string()))
+        );
+    }
+
+    /// The regression this addendum fixes: a transient platform failure
+    /// (locked/contended Credential Manager) must classify as `Err`, never
+    /// as `Ok(None)` — collapsing it to "no secret" is what let a flaky read
+    /// silently disable `brave-mcp-search`.
+    #[test]
+    fn a_platform_failure_classifies_as_err_not_ok_none() {
+        let err = keyring::Error::PlatformFailure(Box::new(std::io::Error::other(
+            "credential manager busy",
+        )));
+        let result = classify_read_result(Err(err));
+        assert!(result.is_err(), "expected Err, got {result:?}");
+    }
+
+    /// Same for the storage-locked case specifically named in the platform
+    /// docs (e.g. the store is locked) — also not "no secret configured".
+    #[test]
+    fn no_storage_access_classifies_as_err_not_ok_none() {
+        let err = keyring::Error::NoStorageAccess(Box::new(std::io::Error::other("locked")));
+        let result = classify_read_result(Err(err));
+        assert!(result.is_err(), "expected Err, got {result:?}");
     }
 }

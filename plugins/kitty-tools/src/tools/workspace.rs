@@ -1,0 +1,158 @@
+//! `lean_analyze_workspace` — Rust port of `lean_mcp.py`'s `analyze_workspace`.
+
+use std::path::Path;
+
+use crate::envelope::{error_response, success_response};
+use crate::paths::resolve;
+use serde_json::json;
+
+const WORKSPACE_MAX_DEPTH: u32 = 10;
+const WORKSPACE_MAX_FILES: usize = 150;
+
+fn blacklisted(name: &str) -> bool {
+    matches!(
+        name,
+        ".git" | "node_modules" | "__pycache__" | "venv" | ".venv" | "dist" | "build" | ".tox"
+    )
+}
+
+pub fn analyze_workspace(path: &str, max_depth: Option<u32>) -> String {
+    let resolved = resolve(path);
+    if !resolved.exists() {
+        return error_response("PATH_NOT_FOUND", "Directory does not exist", Some(&resolved.to_string_lossy()), None);
+    }
+
+    if resolved.is_file() {
+        let size = std::fs::metadata(&resolved).map(|m| m.len()).unwrap_or(0);
+        let name = resolved.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        return success_response(
+            json!({
+                "type": "file",
+                "name": name,
+                "size_bytes": size,
+                "path": resolved.to_string_lossy(),
+            }),
+            None,
+            false,
+            None,
+        );
+    }
+
+    let depth = max_depth.unwrap_or(WORKSPACE_MAX_DEPTH);
+    let mut files: Vec<String> = Vec::new();
+    let mut dirs: Vec<String> = Vec::new();
+    let mut abort = false;
+
+    walk(&resolved, &resolved, 0, depth, &mut files, &mut dirs, &mut abort);
+
+    success_response(
+        json!({"files": files, "directories": dirs}),
+        None,
+        abort,
+        Some(json!({
+            "total_files": files.len(),
+            "total_directories": dirs.len(),
+            "root": resolved.to_string_lossy(),
+        })),
+    )
+}
+
+fn walk(
+    root: &Path,
+    current: &Path,
+    current_depth: u32,
+    max_depth: u32,
+    files: &mut Vec<String>,
+    dirs: &mut Vec<String>,
+    abort: &mut bool,
+) {
+    if *abort || current_depth > max_depth {
+        return;
+    }
+
+    let mut entries: Vec<std::fs::DirEntry> = match std::fs::read_dir(current) {
+        Ok(rd) => rd.filter_map(|e| e.ok()).collect(),
+        Err(_) => return,
+    };
+
+    // Python: `sorted(current.iterdir(), key=lambda e: (e.is_file(), e.name.lower()))`
+    // — directories first (False < True), then case-insensitive name.
+    entries.sort_by_key(|e| {
+        let is_file = e.file_type().map(|t| t.is_file()).unwrap_or(false);
+        let name = e.file_name().to_string_lossy().to_lowercase();
+        (is_file, name)
+    });
+
+    for entry in entries {
+        if *abort {
+            return;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if blacklisted(&name) {
+            continue;
+        }
+        let entry_path = entry.path();
+        let rel = entry_path
+            .strip_prefix(root)
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or(name);
+
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        if is_dir {
+            dirs.push(rel);
+            walk(root, &entry_path, current_depth + 1, max_depth, files, dirs, abort);
+        } else {
+            files.push(rel);
+            if files.len() >= WORKSPACE_MAX_FILES {
+                *abort = true;
+                return;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn reports_file_metadata_for_a_single_file() {
+        let dir = std::env::temp_dir().join(format!("kt-ws-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.txt");
+        fs::write(&file, "hello").unwrap();
+
+        let s = analyze_workspace(file.to_str().unwrap(), None);
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["data"]["type"], "file");
+        assert_eq!(v["data"]["size_bytes"], 5);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn missing_path_reports_not_found() {
+        let s = analyze_workspace("C:/definitely/does/not/exist/kt", None);
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["status"], "error");
+        assert_eq!(v["error_code"], "PATH_NOT_FOUND");
+    }
+
+    #[test]
+    fn blacklisted_dirs_are_skipped() {
+        let dir = std::env::temp_dir().join(format!("kt-ws2-{}", std::process::id()));
+        let git = dir.join(".git");
+        fs::create_dir_all(&git).unwrap();
+        fs::write(git.join("config"), "x").unwrap();
+        fs::write(dir.join("keep.txt"), "x").unwrap();
+
+        let s = analyze_workspace(dir.to_str().unwrap(), None);
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        let files: Vec<String> = v["data"]["files"].as_array().unwrap().iter().map(|f| f.as_str().unwrap().to_string()).collect();
+        assert!(files.iter().any(|f| f.contains("keep.txt")));
+        assert!(!files.iter().any(|f| f.contains(".git")));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+}

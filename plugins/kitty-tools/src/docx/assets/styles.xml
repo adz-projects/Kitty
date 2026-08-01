@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:docDefaults>
+    <w:rPrDefault>
+      <w:rPr><w:sz w:val="22"/><w:szCs w:val="22"/></w:rPr>
+    </w:rPrDefault>
+  </w:docDefaults>
+  <w:style w:type="character" w:default="1" w:styleId="DefaultParagraphFont">
+    <w:name w:val="Default Paragraph Font"/>
+    <w:semiHidden/>
+    <w:unhideWhenUsed/>
+  </w:style>
+  <w:style w:type="paragraph" w:default="1" w:styleId="Normal">
+    <w:name w:val="Normal"/>
+  </w:style>
+  <w:style w:type="paragraph" w:styleId="Title">
+    <w:name w:val="Title"/>
+    <w:basedOn w:val="Normal"/>
+    <w:pPr><w:spacing w:after="300"/></w:pPr>
+    <w:rPr><w:b/><w:sz w:val="56"/><w:szCs w:val="56"/></w:rPr>
+  </w:style>
+  <w:style w:type="paragraph" w:styleId="Heading1">
+    <w:name w:val="heading 1"/>
+    <w:basedOn w:val="Normal"/>
+    <w:pPr><w:outlineLvl w:val="0"/><w:spacing w:before="240" w:after="120"/></w:pPr>
+    <w:rPr><w:b/><w:sz w:val="32"/><w:szCs w:val="32"/></w:rPr>
+  </w:style>
+  <w:style w:type="paragraph" w:styleId="Heading2">
+    <w:name w:val="heading 2"/>
+    <w:basedOn w:val="Normal"/>
+    <w:pPr><w:outlineLvl w:val="1"/><w:spacing w:before="200" w:after="100"/></w:pPr>
+    <w:rPr><w:b/><w:sz w:val="28"/><w:szCs w:val="28"/></w:rPr>
+  </w:style>
+  <w:style w:type="paragraph" w:styleId="Heading3">
+    <w:name w:val="heading 3"/>
+    <w:basedOn w:val="Normal"/>
+    <w:pPr><w:outlineLvl w:val="2"/><w:spacing w:before="160" w:after="80"/></w:pPr>
+    <w:rPr><w:b/><w:sz w:val="24"/><w:szCs w:val="24"/></w:rPr>
+  </w:style>
+  <w:style w:type="paragraph" w:styleId="Heading4">
+    <w:name w:val="heading 4"/>
+    <w:basedOn w:val="Normal"/>
+    <w:pPr><w:outlineLvl w:val="3"/><w:spacing w:before="120" w:after="60"/></w:pPr>
+    <w:rPr><w:b/><w:i/><w:sz w:val="22"/><w:szCs w:val="22"/></w:rPr>
+  </w:style>
+  <w:style w:type="paragraph" w:styleId="ListBullet">
+    <w:name w:val="List Bullet"/>
+    <w:basedOn w:val="Normal"/>
+    <w:pPr><w:ind w:left="720" w:hanging="360"/></w:pPr>
+  </w:style>
+  <w:style w:type="paragraph" w:styleId="ListNumber">
+    <w:name w:val="List Number"/>
+    <w:basedOn w:val="Normal"/>
+    <w:pPr><w:ind w:left="720" w:hanging="360"/></w:pPr>
+  </w:style>
+</w:styles>

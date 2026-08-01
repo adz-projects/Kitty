@@ -66,29 +66,6 @@ pub async fn connect_mcp_server(app: tauri::AppHandle, id: String) -> Result<(),
     mcp::connect_server(&client, &id).await
 }
 
-/// Whether the bundled `replacement-mcp` server is registered+enabled in
-/// BigTiny. Mirrors the old goosed-path flag; still stored in Kitty's own
-/// config so the toggle survives a BigTiny restart.
-#[tauri::command]
-pub fn get_replacement_mcp_enabled(state: tauri::State<'_, AppState>) -> Result<bool, String> {
-    Ok(state.config.lock().unwrap().replacement_mcp_enabled)
-}
-
-#[tauri::command]
-pub async fn set_replacement_mcp_enabled(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
-    enabled: bool,
-) -> Result<(), String> {
-    {
-        let mut cfg = state.config.lock().unwrap();
-        cfg.replacement_mcp_enabled = enabled;
-        config::save(&cfg).map_err(|e| e.to_string())?;
-    }
-    mcp::ensure_builtin_servers(&app).await;
-    Ok(())
-}
-
 /// Whether the bundled `wasm-math-mcp` server is registered+enabled in
 /// BigTiny. No credentials, so a plain toggle like `replacement_mcp` above.
 #[tauri::command]
@@ -133,6 +110,55 @@ pub async fn set_visualizations_enabled(
     Ok(())
 }
 
+/// Whether the bundled `kitty-tools` server — shell/workspace/file/word/
+/// cache/scratchpad, plus Brave search and the 2 visualization tools gated
+/// by their own flags — is registered+enabled in BigTiny. This flag alone
+/// controls whether the whole process runs; `visualizations_enabled`/
+/// `brave_mcp_search_enabled` separately control which tools it advertises
+/// once running (see `bigtiny::mcp::ensure_builtin_servers`).
+#[tauri::command]
+pub fn get_kitty_tools_enabled(state: tauri::State<'_, AppState>) -> Result<bool, String> {
+    Ok(state.config.lock().unwrap().kitty_tools_enabled)
+}
+
+#[tauri::command]
+pub async fn set_kitty_tools_enabled(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    enabled: bool,
+) -> Result<(), String> {
+    {
+        let mut cfg = state.config.lock().unwrap();
+        cfg.kitty_tools_enabled = enabled;
+        config::save(&cfg).map_err(|e| e.to_string())?;
+    }
+    mcp::ensure_builtin_servers(&app).await;
+    Ok(())
+}
+
+/// Whether the bundled `kitty-docs-web` server (PDF/Excel/web-scrape/DDG
+/// search) is registered+enabled in BigTiny. No credentials, so a plain
+/// toggle like `wasm_math_mcp` above.
+#[tauri::command]
+pub fn get_kitty_docs_web_enabled(state: tauri::State<'_, AppState>) -> Result<bool, String> {
+    Ok(state.config.lock().unwrap().kitty_docs_web_enabled)
+}
+
+#[tauri::command]
+pub async fn set_kitty_docs_web_enabled(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    enabled: bool,
+) -> Result<(), String> {
+    {
+        let mut cfg = state.config.lock().unwrap();
+        cfg.kitty_docs_web_enabled = enabled;
+        config::save(&cfg).map_err(|e| e.to_string())?;
+    }
+    mcp::ensure_builtin_servers(&app).await;
+    Ok(())
+}
+
 /// Brave Search MCP status for Settings — `enabled` mirrors the user's
 /// toggle intent, `configured` reports whether an API key is currently
 /// stored in the keyring. The UI shows the API-key form whenever `!configured`,
@@ -167,6 +193,10 @@ pub async fn set_brave_mcp_search_api_key(
     if trimmed.is_empty() {
         return Err("API key cannot be empty".to_string());
     }
+    // Confirm the key actually works before storing it — otherwise a wrong
+    // or mistyped key still renders a green "configured" checkbox and every
+    // search silently comes back AUTH_ERROR with no indication why.
+    mcp::validate_brave_api_key(trimmed).await?;
     config::providers::set_secret("brave-mcp-search", trimmed)?;
     {
         let mut cfg = state.config.lock().unwrap();

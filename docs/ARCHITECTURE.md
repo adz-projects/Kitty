@@ -26,8 +26,8 @@ lib.rs (app setup, window creation, generate_handler! list)
   │     stream.rs   POST .../send SSE consumption -> chat://* events,
   │                  + the adaptive-pathway record_outcome backstop
   │     providers.rs sync Kitty's active provider profile into BigTiny's registry
-  │     mcp.rs       MCP server CRUD + ensure_builtin_servers (replacement-mcp,
-  │                  adaptive-pathway, wasm-math-mcp, brave-mcp-search) self-heal
+  │     mcp.rs       MCP server CRUD + ensure_builtin_servers (kitty-tools,
+  │                  kitty-docs-web, adaptive-pathway, wasm-math-mcp) self-heal
   │
   ├─► config/                                (app config, %APPDATA%/Kitty/config.json)
   │     mod.rs         Config struct, load/save, bundled_plugin_path()
@@ -99,21 +99,35 @@ layer needed zero changes when the backend swapped from goosed to BigTiny.
 
 ## Plugins (`plugins/`)
 
-See `docs/PLUGINS.md` for the full pattern. Independent Python packages
-(`adaptive-pathway`, `replacement-mcp`, `wasm-math-mcp`, `brave-mcp-search`)
-plus the BigTiny daemon itself (vendored in-tree at `plugins/bigtiny/`) are
-all frozen to `.exe`s via PyInstaller and bundled through Tauri's
-`externalBin` — `python plugins/build.py` builds all six targets (`bigtiny`,
-`adaptive-pathway`, `adaptive-pathway-mcp`, `replacement-mcp`,
-`wasm-math-mcp`, `brave-mcp-search`). `adaptive-pathway`'s HTTP sidecar and
-the BigTiny daemon itself are both Kitty-managed processes (`ManagedProcess`,
-probed then spawned); `replacement-mcp`, `adaptive-pathway-mcp`,
-`wasm-math-mcp`, and `brave-mcp-search` are stdio MCP servers registered with
-BigTiny's own `/api/mcp/servers` registry (`bigtiny::mcp::ensure_builtin_servers`),
-not spawned directly by Kitty. `wasm-math-mcp` is on by default (no
-credentials); `brave-mcp-search` is off by default and needs a Brave Search
-API key, stored in the keyring rather than `config.json` — disabling it
-always deletes the stored key, so re-enabling always requires re-entering it.
+See `docs/PLUGINS.md` for the full pattern. Independent packages
+(`adaptive-pathway`, `wasm-math-mcp`, `kitty-docs-web` — Python — and
+`kitty-tools` — Rust) plus the BigTiny daemon itself (vendored in-tree at
+`plugins/bigtiny/`) are all frozen to `.exe`s (PyInstaller for the Python
+ones, plain `cargo build --release` for `kitty-tools`) and bundled through
+Tauri's `externalBin` — `python plugins/build.py` builds all six targets
+(`bigtiny`, `adaptive-pathway`, `adaptive-pathway-mcp`, `wasm-math-mcp`,
+`kitty-docs-web`, `kitty-tools`). `adaptive-pathway`'s HTTP sidecar and the
+BigTiny daemon itself are both Kitty-managed processes (`ManagedProcess`,
+probed then spawned); `kitty-tools`, `kitty-docs-web`, `adaptive-pathway-mcp`,
+and `wasm-math-mcp` are stdio MCP servers registered with BigTiny's own
+`/api/mcp/servers` registry (`bigtiny::mcp::ensure_builtin_servers`), not
+spawned directly by Kitty. `wasm-math-mcp` and `kitty-docs-web` are on by
+default (no credentials). `kitty-tools` hosts 20 tools in one process — the
+always-on shell/workspace/file/word/cache/scratchpad set (on by default,
+same rationale as the old `replacement-mcp`, which it retires and fully
+absorbs), plus 2 visualization tools gated by their own Settings toggle (an
+env var on this one process, not a separate server) — no network calls of
+its own. `kitty-docs-web` hosts 8 tools, including the merged, count-tiered
+`lean_web_search`/`lean_web_search_read_chunk` (DuckDuckGo via `ddgs`,
+always available; Brave preferred per-query when configured). Brave's
+toggle needs an API key, stored in the keyring rather than `config.json` —
+disabling it always deletes the stored key, so re-enabling always requires
+re-entering it. This tool used to be `brave_mcp_search`, hosted in
+`kitty-tools` (Rust); it moved to `kitty-docs-web` (Python) alongside
+`ddgs`, since DuckDuckGo has no Rust crate equivalent — see
+`docs/VERSIONS.md`. `brave-mcp-search` and `visualizations` (the
+formerly-separate servers) are retired along with `replacement-mcp`; their
+source stays in-tree, unbuilt, as a re-verification oracle.
 
 ## Cross-cutting: the three "who's the source of truth" boundaries
 

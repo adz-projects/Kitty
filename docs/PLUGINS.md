@@ -1,13 +1,22 @@
 # Internal plugins
 
-Kitty ships Python subsystems as **internal plugins**: independent, tested
-Python packages, frozen to standalone Windows `.exe`s at build time and
-bundled via Tauri's `externalBin` mechanism. End users need no Python, `uv`,
-or `pip` — see `plugins/README.md` for the directory layout and how to add a
-new plugin; this file covers the *pattern* in more depth. The BigTiny daemon
-itself (Kitty's chat backend, vendored in-tree at `plugins/bigtiny/`) follows
-the same freeze pipeline, even though it isn't a "plugin" in the
+Kitty ships most subsystems as **internal plugins**: independent, tested
+packages, frozen to standalone Windows `.exe`s at build time and bundled via
+Tauri's `externalBin` mechanism. End users need no Python, `uv`, `pip`, or
+Rust toolchain — see `plugins/README.md` for the directory layout and how to
+add a new plugin; this file covers the *pattern* in more depth. The BigTiny
+daemon itself (Kitty's chat backend, vendored in-tree at `plugins/bigtiny/`)
+follows the same freeze pipeline, even though it isn't a "plugin" in the
 tool-augmentation sense — see `docs/bigtiny-backend.md`.
+
+**Most plugins are Python**, frozen with PyInstaller. One, `kitty-tools`, is
+**Rust**, built with plain `cargo build --release` — this is not a deviation
+from "the exception, by design" framing (CLAUDE.md's stack section): a
+frozen Rust binary has *less* runtime surface than a frozen Python one (no
+interpreter, no onefile self-extraction latency), so it fits the same
+externalBin-bundled-plugin slot even more comfortably. `plugins/build.py`'s
+`kind: "rust"` field is the only place the two freeze pipelines diverge (see
+"The freeze pipeline" below).
 
 ## Why frozen `.exe`s, not a bundled Python runtime
 
@@ -15,11 +24,13 @@ The alternative (embed CPython + pip-install deps at first run) was
 considered and rejected: it still requires shipping and provisioning a full
 Python environment on the user's machine, just relocated — it doesn't remove
 the dependency, only hides where it lives. A frozen binary has zero runtime
-dependency on anything Python-related.
+dependency on anything Python-related. The same reasoning applies to
+`kitty-tools`'s Rust build: a `cargo build --release` output has zero runtime
+dependency on a Rust toolchain.
 
 ## The two integration shapes, and why plugins are wired differently
 
-| | `adaptive-pathway` (sidecar) | `replacement-mcp` / `adaptive-pathway-mcp` |
+| | `adaptive-pathway` (sidecar) | `kitty-tools` / `adaptive-pathway-mcp` |
 |---|---|---|
 | What it is | HTTP sidecar (FastAPI/uvicorn) | stdio MCP server |
 | Who spawns it | **Kitty** (`lifecycle/adaptive_pathway_proc.rs`) | **BigTiny** |
@@ -39,7 +50,7 @@ writing any Rust wiring:
   `ManagedProcess`/`DaemonHandle` field in `AppState`, commands for
   status/restart/enable.
 - **BigTiny-managed MCP server** (stdio MCP server): follow the
-  replacement-mcp / adaptive-pathway-mcp pattern — no lifecycle file, just an
+  kitty-tools / adaptive-pathway-mcp pattern — no lifecycle file, just an
   entry in `bigtiny::mcp::ensure_builtin_servers`'s upsert (registers/updates
   it in BigTiny's `/api/mcp/servers` by name) and a Settings toggle. BigTiny
   owns the process entirely.
@@ -48,24 +59,36 @@ writing any Rust wiring:
 
 ```
 plugins/<name>/               # bigtiny included — plugins/bigtiny/
-  pyproject.toml         # pinned deps + a [project.scripts] entry point
-  <name>.spec            # PyInstaller onefile spec (datas, hiddenimports)
+  pyproject.toml         # pinned deps + a [project.scripts] entry point (Python)
+  <name>.spec            # PyInstaller onefile spec, datas/hiddenimports (Python)
+  Cargo.toml             # standalone crate, own [[bin]] (Rust — kitty-tools only)
   src/... or *.py
   tests/
 ```
 
 `plugins/build.py`, for each target (`bigtiny`, `adaptive-pathway`,
-`adaptive-pathway-mcp`, `replacement-mcp`, `wasm-math-mcp`, `brave-mcp-search`
-— `python plugins/build.py` with no args builds all six):
-1. `pip install -e ".[extras]"` — installs the target's own pinned
-   dependencies (plus any optional-dependency-group extras the target needs,
-   e.g. adaptive-pathway's `sidecar` vs `mcp` groups) into whatever Python
-   environment is running the script.
-2. `pyinstaller <name>.spec --noconfirm` — freezes the entry point named in
-   `pyproject.toml`'s `[project.scripts]` to a onefile `.exe`.
-3. Copies the result into `src-tauri/binaries/<exe-name>-x86_64-pc-windows-msvc.exe`
-   — the exact filename Tauri's `bundle.externalBin` (in `tauri.conf.json`)
-   expects.
+`adaptive-pathway-mcp`, `wasm-math-mcp`, `kitty-docs-web` — Python — and
+`kitty-tools` — Rust; `python plugins/build.py` with no args builds all six):
+1. **Python** (`kind: "python"`, the default): `pip install -e ".[extras]"`
+   installs the target's own pinned dependencies (plus any
+   optional-dependency-group extras the target needs, e.g. adaptive-pathway's
+   `sidecar` vs `mcp` groups) into whatever Python environment is running the
+   script, then `pyinstaller <name>.spec --noconfirm` freezes the entry point
+   named in `pyproject.toml`'s `[project.scripts]` to a onefile `.exe`.
+   **Rust** (`kind: "rust"`): `cargo build --release --locked` in the
+   plugin's own standalone crate — no shared workspace with `src-tauri` (see
+   `plugins/kitty-tools/Cargo.toml`'s doc comment for why: MSRV isolation,
+   `[profile.*]` being workspace-root-only, and feature unification all argue
+   against merging it into `src-tauri`'s workspace).
+2. Both paths converge: copy the resulting exe into
+   `src-tauri/binaries/<exe-name>-x86_64-pc-windows-msvc.exe` — the exact
+   filename Tauri's `bundle.externalBin` (in `tauri.conf.json`) expects.
+
+`replacement-mcp`, `brave-mcp-search`, and `visualizations` are retired — all
+of their tools now live inside `kitty-tools` (Rust) or `kitty-docs-web`
+(Python), see `CLAUDE.md`'s "Internal plugins" section. Their source stays
+in-tree, deliberately absent from `plugins/build.py`'s `PLUGINS` dict, as the
+oracle to re-verify the ports against if a behavioral gap ever surfaces.
 
 **Tauri validates every `externalBin` entry exists on disk at build time —
 even for a plain `cargo build`, not just packaging.** That's why
@@ -98,8 +121,8 @@ PATH-relative name — a developer working on the plugin itself can point the
 relevant config field (`adaptive_pathway_launch_command`, `bigtiny_command`)
 at `uv run ...`/`python -m ...` instead, entirely independent of this
 resolution. `bigtiny::mcp::ensure_builtin_servers` uses the same resolution
-for `replacement-mcp.exe`/`adaptive-pathway-mcp.exe`/`wasm-math-mcp.exe`/
-`brave-mcp-search.exe` when registering them with BigTiny.
+for `kitty-tools.exe`/`kitty-docs-web.exe`/`adaptive-pathway-mcp.exe`/
+`wasm-math-mcp.exe` when registering them with BigTiny.
 
 ## Adding a new plugin
 

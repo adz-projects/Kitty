@@ -1,5 +1,7 @@
+import asyncio
 import json
 import os
+import random
 import re
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
@@ -120,6 +122,26 @@ def _process_item(
     }
 
 
+# ---------------------------------------------------------------------------
+# Rate-limit retry (Brave's free tier is ~1 req/s; BigTiny fires a turn's
+# tool calls concurrently, so a model issuing two searches in one turn can
+# trigger a 429 on its own with no help from the network)
+# ---------------------------------------------------------------------------
+MAX_RATE_LIMIT_RETRIES = 2
+BASE_BACKOFF_SECONDS = 1.5
+
+
+def _retry_after_seconds(response: httpx.Response) -> Optional[float]:
+    """Parses a numeric `Retry-After` header (seconds); None if absent or an HTTP-date form."""
+    value = response.headers.get("Retry-After")
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        return None
+
+
 def format_llm_context_json(data: dict) -> str:
     """Transforms Brave's grounding & sources API response into a pure JSON schema."""
     grounding = data.get("grounding", {})
@@ -223,51 +245,80 @@ async def brave_mcp_search(
 
     client = get_http_client()
 
-    try:
-        response = await client.get(url, headers=headers, params=params)
-        response.raise_for_status()
-        return format_llm_context_json(response.json())
+    for attempt in range(MAX_RATE_LIMIT_RETRIES + 1):
+        try:
+            response = await client.get(url, headers=headers, params=params)
+            response.raise_for_status()
+            try:
+                return format_llm_context_json(response.json())
+            except Exception as e:
+                # response.json() raises on a 200 body that isn't valid JSON
+                # (e.g. a WAF/edge interstitial), and format_llm_context_json
+                # can raise on an unexpected response shape. Either used to
+                # escape the tool body entirely, surfacing as an opaque
+                # protocol error instead of the structured envelope every
+                # other failure mode here returns.
+                return _error_response(
+                    "API_ERROR",
+                    "Brave Search API returned a response that could not be parsed.",
+                    detail=str(e),
+                    hint="Retry shortly; if this persists, the API's response shape may have changed.",
+                )
 
-    except httpx.HTTPStatusError as e:
-        status = e.response.status_code
-        detail = e.response.text
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code
+            detail = e.response.text
 
-        if status in (400, 422):
+            if status in (400, 422):
+                return _error_response(
+                    "INVALID_QUERY",
+                    f"Brave Search API rejected query parameters (HTTP {status}).",
+                    detail=detail,
+                    hint="Simplify query parameter 'q' or check freshness/country values.",
+                )
+            elif status in (401, 403):
+                return _error_response(
+                    "AUTH_ERROR",
+                    f"Authentication failed (HTTP {status}).",
+                    detail=detail,
+                    hint="Verify your BRAVE_API_KEY is valid and active.",
+                )
+            elif status == 429:
+                if attempt < MAX_RATE_LIMIT_RETRIES:
+                    delay = _retry_after_seconds(e.response)
+                    if delay is None:
+                        delay = BASE_BACKOFF_SECONDS * (2**attempt) + random.uniform(0, 0.5)
+                    await asyncio.sleep(delay)
+                    continue
+                return _error_response(
+                    "RATE_LIMIT",
+                    "Brave Search API rate limit exceeded (HTTP 429).",
+                    detail=detail,
+                    hint=f"Still rate-limited after {MAX_RATE_LIMIT_RETRIES} retries with backoff — pause longer before retrying search requests.",
+                )
+            else:
+                return _error_response(
+                    "API_ERROR",
+                    f"Brave Search API returned HTTP {status}.",
+                    detail=detail,
+                    hint="Check request formatting or retry shortly.",
+                )
+
+        except httpx.RequestError as e:
             return _error_response(
-                "INVALID_QUERY",
-                f"Brave Search API rejected query parameters (HTTP {status}).",
-                detail=detail,
-                hint="Simplify query parameter 'q' or check freshness/country values.",
-            )
-        elif status in (401, 403):
-            return _error_response(
-                "AUTH_ERROR",
-                f"Authentication failed (HTTP {status}).",
-                detail=detail,
-                hint="Verify your BRAVE_API_KEY is valid and active.",
-            )
-        elif status == 429:
-            return _error_response(
-                "RATE_LIMIT",
-                "Brave Search API rate limit exceeded (HTTP 429).",
-                detail=detail,
-                hint="Pause briefly before retrying search requests.",
-            )
-        else:
-            return _error_response(
-                "API_ERROR",
-                f"Brave Search API returned HTTP {status}.",
-                detail=detail,
-                hint="Check request formatting or retry shortly.",
+                "NETWORK_ERROR",
+                "Failed to communicate with Brave Search API.",
+                detail=str(e),
+                hint="Check host internet connectivity.",
             )
 
-    except httpx.RequestError as e:
-        return _error_response(
-            "NETWORK_ERROR",
-            "Failed to communicate with Brave Search API.",
-            detail=str(e),
-            hint="Check host internet connectivity.",
-        )
+    # Unreachable: every branch above either returns or, on a retryable 429,
+    # `continue`s until `attempt == MAX_RATE_LIMIT_RETRIES`, which always
+    # returns. Kept as an explicit safety net rather than relying on that.
+    return _error_response(
+        "RATE_LIMIT",
+        "Brave Search API rate limit exceeded and retries were exhausted.",
+    )
 
 
 def main() -> None:

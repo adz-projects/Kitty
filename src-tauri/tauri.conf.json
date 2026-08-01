@@ -23,10 +23,9 @@
     "externalBin": [
       "binaries/adaptive-pathway-sidecar",
       "binaries/adaptive-pathway-mcp",
-      "binaries/replacement-mcp",
-      "binaries/brave-mcp-search",
       "binaries/wasm-math-mcp",
-      "binaries/visualizations",
+      "binaries/kitty-tools",
+      "binaries/kitty-docs-web",
       "binaries/bigtiny-daemon"
     ],
     "windows": {

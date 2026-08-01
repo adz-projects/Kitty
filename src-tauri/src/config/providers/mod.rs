@@ -8,7 +8,9 @@ mod keyring;
 mod network;
 
 pub use connection::test_connection;
-pub use keyring::{delete_secret, get_secret_async, has_secret, migrate_secrets, set_secret};
+pub use keyring::{
+    delete_secret, get_secret_async, get_secret_checked, has_secret, migrate_secrets, set_secret,
+};
 pub use network::{network_tier_for, NetworkTier};
 
 use serde::{Deserialize, Serialize};

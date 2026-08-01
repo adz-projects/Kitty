@@ -1,0 +1,71 @@
+<style>
+    .mcp-table-wrapper {
+        margin: 0;
+        width: 100%;
+        overflow-x: auto;
+    }
+    table.mcp-grayscale-table {
+        width: 100%;
+        border-collapse: separate;
+        border-spacing: 0;
+        border: 1px solid #d4d4d8;
+        border-radius: 8px;
+        overflow: hidden;
+        font-size: 0.875rem;
+        color: #18181b;
+        background-color: #ffffff;
+        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.04);
+    }
+    table.mcp-grayscale-table caption {
+        font-size: 1.125rem;
+        font-weight: 700;
+        text-align: left;
+        padding: 0.75rem 0.25rem;
+        color: #09090b;
+        caption-side: top;
+    }
+    table.mcp-grayscale-table thead th {
+        background-color: #18181b;
+        color: #f4f4f5;
+        font-weight: 600;
+        text-transform: uppercase;
+        font-size: 0.75rem;
+        letter-spacing: 0.05em;
+        padding: 0.875rem 1rem;
+        border-bottom: 2px solid #09090b;
+        text-align: left;
+    }
+    table.mcp-grayscale-table th,
+    table.mcp-grayscale-table td {
+        padding: 0.75rem 1rem;
+        border-bottom: 1px solid #e4e4e7;
+        text-align: left;
+    }
+    table.mcp-grayscale-table tbody tr:nth-child(even) {
+        background-color: #fafafa;
+    }
+    table.mcp-grayscale-table tbody tr:hover {
+        background-color: #f4f4f5;
+    }
+    table.mcp-grayscale-table tbody tr:last-child td,
+    table.mcp-grayscale-table tbody tr:last-child th {
+        border-bottom: none;
+    }
+    table.mcp-grayscale-table th[scope="row"] {
+        background-color: #f4f4f5;
+        font-weight: 600;
+        color: #09090b;
+        border-right: 1px solid #e4e4e7;
+    }
+    .sr-only {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        padding: 0;
+        margin: -1px;
+        overflow: hidden;
+        clip: rect(0, 0, 0, 0);
+        white-space: nowrap;
+        border: 0;
+    }
+</style>

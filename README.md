@@ -1,36 +1,58 @@
 # Kitty
 
-A Windows-only desktop chat client: a hotkey-summoned floating overlay backed
-by **BigTiny**, a chat-first REST/SSE agent daemon vendored in this repo, with
-[Ollama](https://ollama.com) for local inference. Kitty is a **client only**
-— all agent logic, tool execution, MCP handling, and model routing live in
-BigTiny. Kitty owns window management, process lifecycle, configuration,
-file/screenshot context, session history, an artifacts sidepane,
-notifications, tool-approval UI, theming, and a first-run installer.
+A Windows desktop chat client and agentic AI assistant in a that includes a hotkey-
+summoned floating overlay. Kitty ships with a useful library of MCP-based
+tools for research, document parsing and creation, computation, and
+system-level operations, and includes **Adaptive Pathways** — a knowledge-graph
+system that learns your preferences and suggestion patterns while actively
+resisting overfitting through ensemble diversity, novelty tracking, and
+exploration incentives.
 
-Full behavioral contract and architecture live in [`CLAUDE.md`](CLAUDE.md)
-and [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — this file is a shorter
-map to get a checkout running.
+All model inference, session management, and tool orchestration runs in
+**BigTiny**, a custom Python-based REST/SSE daemon. Kitty is the
+client layer: window management, hotkeys, theming, HITL approval UI, file and
+screenshot context, provider configuration, and process lifecycle.
 
 ## What it does
 
-- **Overlay + full window**: a global hotkey slides a small always-on-top
-  chat overlay in/out; "Expand" (or a second, dedicated hotkey) opens a full
-  window with session history and an artifacts pane. Any number of full chat
-  windows can be open at once, each on an independent conversation.
-- **Two session modes**: a tool-free "thought partner" chat mode and an
-  agentic mode with filesystem/shell tool access, directory-sandboxed to the
-  session's own chat folder (plus an explicitly-set working directory in
-  agentic mode) — anything outside that requires an explicit approval, never
-  a silent allow or reject.
-- **Local-first**: Ollama models run entirely on-device; remote/personal
-  (e.g. Tailscale) providers are supported too, with a visible trust-tier
-  badge and a context handoff gate when a session with history switches to a
-  less-trusted provider.
-- **Drag-and-drop file context, screenshot region capture, session
-  history/search, an artifacts sidepane, tool-call approvals, notifications,
-  a first-run setup wizard**, and a themeable UI (drop a custom CSS file in
-  to restyle every window, no rebuild required).
+**Chat and agent modes.** A "thought partner" mode for open-ended
+conversing with access to tools, and a tool-first agentic mode with filesystem,
+shell, and MCP tool access. Chat actions are directory-sandboxed to the session's 
+chat folder; anything outside it triggers a human-in-the-loop approval prompt.
+
+**Tool library.** Bundled MCP server plugins give the agent access to:
+
+* **replacement-mcp** — shell execution, file read/write/append with pagination,
+workspace analysis, web search (DuckDuckGo), article scraping, and parsers
+for Excel, Word, and PDF documents, plus a persistent scratchpad and content
+cache.
+* **brave-mcp-search** — Brave Search LLM Context API (opt-in, requires an API key).
+* **wasm-math-mcp** — sandboxed Python/NumPy/SciPy execution for exact math,
+data filtering, and statistical computation (on by default).
+* **visualizations** — WCAG 2.2 AA compliant SVG diagrams and HTML tables.
+* **adaptive-pathway-mcp** — the `decide`/`record\_outcome` tools the model
+calls to participate in the Adaptive Pathways learning loop.
+
+**BigTiny backend.** A FastAPI/uvicorn daemon handling provider routing
+(Ollama, Anthropic, OpenAI-compatible endpoints), session persistence (SQLite),
+SSE streaming with token-budget compaction, provider failover, MCP server
+lifecycle, and a pattern-based HITL approval policy. Multiple sessions run
+concurrently, each with its own provider, model, and persona configuration.
+
+**Adaptive Pathways.** A knowledge-graph sidecar that builds a weighted graph
+of learned preference edges across domains. It uses ensemble voting, inverse
+propensity scoring, DPP-based diversity, Thompson sampling, and novelty
+penalties to keep suggestions from collapsing into local optima. The system
+surfaces ensemble "schisms" for user resolution, tracks exploration health
+metrics, supports per-domain weight tuning, and lets the model itself flag
+exploration nudges. Suggestions can be paused; learning continues at reduced
+weight.
+
+**Window chrome.** A global hotkey toggles a small always-on-top overlay; an
+expand button opens a full window with session history, an artifacts pane,
+and settings. Multiple full windows can be open simultaneously, each on an
+independent session. Drag-and-drop file context and region screenshot capture
+feed directly into the conversation.
 
 ## Repository layout
 
@@ -50,17 +72,17 @@ docs/                   Architecture, plugin, release, and backend docs
 
 ## Tech stack
 
-- **Shell**: Tauri v2 (Rust core + web frontend), Windows-only target.
-- **Frontend**: React 18 + TypeScript + Vite, plain CSS with custom
-  properties for theming (no Tailwind/CSS-in-JS). State via Zustand.
-- **Backend**: BigTiny (FastAPI/uvicorn, Python) — REST + one SSE streaming
-  endpoint, session storage in SQLite, provider routing (Ollama/Anthropic/
-  OpenAI-compatible), MCP tool-server management, HITL approval policy.
-- **Rust crates of note**: `tauri-plugin-global-shortcut`,
-  `tauri-plugin-notification`, `tauri-plugin-shell`, `tauri-plugin-dialog`,
-  `tauri-plugin-single-instance`, `reqwest`, `tokio`, `keyring` (Windows
-  Credential Manager — secrets never touch JS or plaintext disk), `windows`
-  (Win32 APIs for the keyboard hook and screen capture), `sysinfo`.
+* **Shell**: Tauri v2 (Rust core + web frontend), Windows-only target.
+* **Frontend**: React 18 + TypeScript + Vite, plain CSS with custom
+properties for theming (no Tailwind/CSS-in-JS). State via Zustand.
+* **Backend**: BigTiny (FastAPI/uvicorn, Python) — REST + one SSE streaming
+endpoint, session storage in SQLite, provider routing (Ollama/Anthropic/
+OpenAI-compatible), MCP tool-server management, HITL approval policy.
+* **Rust crates of note**: `tauri-plugin-global-shortcut`,
+`tauri-plugin-notification`, `tauri-plugin-shell`, `tauri-plugin-dialog`,
+`tauri-plugin-single-instance`, `reqwest`, `tokio`, `keyring` (Windows
+Credential Manager — secrets never touch JS or plaintext disk), `windows`
+(Win32 APIs for the keyboard hook and screen capture), `sysinfo`.
 
 ## Getting started (dev)
 
@@ -84,16 +106,16 @@ Proactor event-loop factory stdio MCP servers need).
 
 ### Commands
 
-| Command | What |
-|---|---|
-| `pnpm tauri dev` | Full-stack dev (Vite on :1420 + Rust) |
-| `pnpm build` | `tsc && vite build` |
-| `pnpm lint` | `eslint . && prettier --check .` |
-| `pnpm test` | `vitest run` |
-| `cargo clippy` (in `src-tauri/`) | Rust lint |
-| `cargo test` (in `src-tauri/`) | Rust unit tests |
-| `pytest` (in `plugins/bigtiny/`) | BigTiny's own test suite |
-| `python plugins/build.py` | Freeze BigTiny + every internal plugin to `.exe` |
+|Command|What|
+|-|-|
+|`pnpm tauri dev`|Full-stack dev (Vite on :1420 + Rust)|
+|`pnpm build`|`tsc \&\& vite build`|
+|`pnpm lint`|`eslint . \&\& prettier --check .`|
+|`pnpm test`|`vitest run`|
+|`cargo clippy` (in `src-tauri/`)|Rust lint|
+|`cargo test` (in `src-tauri/`)|Rust unit tests|
+|`pytest` (in `plugins/bigtiny/`)|BigTiny's own test suite|
+|`python plugins/build.py`|Freeze BigTiny + every internal plugin to `.exe`|
 
 ### Building a release
 
@@ -114,12 +136,13 @@ server) work.
 
 ## Documentation map
 
-- [`CLAUDE.md`](CLAUDE.md) — the authoritative spec: architectural rules,
-  coding conventions, and the full original phased build plan.
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — current, accurate module
-  map (supersedes the phase-by-phase repository layout in `CLAUDE.md`).
-- [`docs/bigtiny-backend.md`](docs/bigtiny-backend.md) — the BigTiny
-  integration contract from Kitty's side.
-- [`docs/PLUGINS.md`](docs/PLUGINS.md) / [`plugins/README.md`](plugins/README.md)
-  — the internal-plugin freeze pipeline and how to add a new one.
-- [`docs/RELEASE.md`](docs/RELEASE.md) — build/release checklist.
+* [`CLAUDE.md`](CLAUDE.md) — the authoritative spec: architectural rules,
+coding conventions, and the full original phased build plan.
+* [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — current, accurate module
+map (supersedes the phase-by-phase repository layout in `CLAUDE.md`).
+* [`docs/bigtiny-backend.md`](docs/bigtiny-backend.md) — the BigTiny
+integration contract from Kitty's side.
+* [`docs/PLUGINS.md`](docs/PLUGINS.md) / [`plugins/README.md`](plugins/README.md)
+— the internal-plugin freeze pipeline and how to add a new one.
+* [`docs/RELEASE.md`](docs/RELEASE.md) — build/release checklist.
+

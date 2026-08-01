@@ -4,15 +4,24 @@ import type { McpServer } from '@/lib/types';
 
 /** `adaptive-pathway` is managed solely by the single enable checkbox in
     Settings → Advanced → Adaptive Pathway — showing it here too would be a
-    confusing second control over the same thing. `replacement-mcp`,
-    `wasm-math-mcp`, `brave-mcp-search`, and `visualizations` each get their
-    own dedicated card below, not the generic list. */
+    confusing second control over the same thing. `wasm-math-mcp`,
+    `kitty-tools`, and `kitty-docs-web` each get their own dedicated card
+    below, not the generic list.
+
+    `replacement-mcp`, `brave-mcp-search`, and `visualizations` are retired
+    (their tools live inside `kitty-tools` now — see
+    `bigtiny::mcp::remove_retired_builtins`) but stay listed here for one
+    release as a guard, in case an older install's BigTiny DB still has a
+    stale row under one of these names before this app version's startup
+    cleanup runs. */
 const HIDDEN_SERVER_NAMES = new Set([
   'adaptive-pathway',
   'replacement-mcp',
   'wasm-math-mcp',
   'brave-mcp-search',
   'visualizations',
+  'kitty-tools',
+  'kitty-docs-web',
 ]);
 
 type Transport = 'stdio' | 'sse' | 'streamable_http';
@@ -216,10 +225,11 @@ export function McpServers() {
       </p>
       {error && <div className="chat-error">{error}</div>}
       <div className="ext-grid" style={{ marginBottom: 16 }}>
-        <ReplacementMcpCard />
         <WasmMathMcpCard />
         <BraveMcpSearchCard />
         <VisualizationsCard />
+        <KittyToolsCard />
+        <KittyDocsWebCard />
       </div>
 
       <div className="ext-grid">
@@ -317,57 +327,10 @@ export function McpServers() {
   );
 }
 
-/** Dedicated card for the bundled `replacement-mcp` server (see
-    `plugins/replacement-mcp/`) — kept out of the generic list above since
-    it's a Kitty-managed builtin, not a user-added one. */
-function ReplacementMcpCard() {
-  const [enabled, setEnabled] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState('');
-
-  useEffect(() => {
-    void ipc
-      .getReplacementMcpEnabled()
-      .then(setEnabled)
-      .catch((e) => setError(String(e)));
-  }, []);
-
-  const toggle = async (next: boolean) => {
-    setBusy(true);
-    setError('');
-    try {
-      await ipc.setReplacementMcpEnabled(next);
-      setEnabled(next);
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  return (
-    <label className="ext-card">
-      <div className="ext-card-head">
-        <span className="ext-card-name">Lean tools (replacement-mcp)</span>
-        <input
-          type="checkbox"
-          checked={enabled}
-          disabled={busy}
-          onChange={(ev) => void toggle(ev.target.checked)}
-        />
-      </div>
-      <span className="muted ext-card-desc">
-        Context-optimized shell/file/web/document tools for local, small models.
-      </span>
-      {error && <div className="chat-error">{error}</div>}
-    </label>
-  );
-}
-
 /** Dedicated card for the bundled `wasm-math-mcp` server (see
     `plugins/wasm-math-mcp/`) — sandboxed Python/NumPy execution, on by
-    default. Same shape as `ReplacementMcpCard`: no credentials, a plain
-    toggle. */
+    default. Same shape as `KittyToolsCard`'s toggle: no credentials, a plain
+    checkbox. */
 function WasmMathMcpCard() {
   const [enabled, setEnabled] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -413,10 +376,12 @@ function WasmMathMcpCard() {
   );
 }
 
-/** Dedicated card for the bundled `visualizations` server (see
-    `plugins/visualizations/`) — accessible HTML tables and SVG diagrams,
-    rendered in an iframe in chat (see `ToolCallCard`'s `parseIframePayload`).
-    On by default, no credentials — same shape as `WasmMathMcpCard`. */
+/** Dedicated card for the visualization tools — accessible HTML tables and
+    SVG diagrams, rendered in an iframe in chat (see `ToolCallCard`'s
+    `parseIframePayload`). Hosted inside the combined `kitty-tools` server
+    (see `KittyToolsCard` above); this toggle flips the `KITTY_VIZ_ENABLED`
+    env var rather than spawning its own process. On by default, no
+    credentials — same shape as `WasmMathMcpCard`. */
 function VisualizationsCard() {
   const [enabled, setEnabled] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -461,10 +426,120 @@ function VisualizationsCard() {
   );
 }
 
-/** Dedicated card for the bundled `brave-mcp-search` server (see
-    `plugins/brave-mcp-search/`) — off by default, requires a Brave Search API
-    key. Unlike every other builtin card, "enabled" and "configured" are
-    tracked separately: disabling always wipes the stored key server-side
+/** Dedicated card for the bundled `kitty-tools` server (see
+    `plugins/kitty-tools/`) — the Rust consolidation of `replacement-mcp`'s
+    18 shell/workspace/file/word/cache/scratchpad tools, plus the 2
+    visualization tools (separately gated by `VisualizationsCard` below,
+    which toggles an env var on this one process rather than spawning its
+    own). Web search does NOT live here — see `BraveMcpSearchCard`/
+    `KittyDocsWebCard` below, it moved to `kitty-docs-web`. On by default,
+    no credentials required for this toggle itself — same shape as
+    `WasmMathMcpCard`. */
+function KittyToolsCard() {
+  const [enabled, setEnabled] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    void ipc
+      .getKittyToolsEnabled()
+      .then(setEnabled)
+      .catch((e) => setError(String(e)));
+  }, []);
+
+  const toggle = async (next: boolean) => {
+    setBusy(true);
+    setError('');
+    try {
+      await ipc.setKittyToolsEnabled(next);
+      setEnabled(next);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <label className="ext-card">
+      <div className="ext-card-head">
+        <span className="ext-card-name">Lean tools (kitty-tools)</span>
+        <input
+          type="checkbox"
+          checked={enabled}
+          disabled={busy}
+          onChange={(ev) => void toggle(ev.target.checked)}
+        />
+      </div>
+      <span className="muted ext-card-desc">
+        Context-optimized shell/file/Word tools for local, small models.
+      </span>
+      {error && <div className="chat-error">{error}</div>}
+    </label>
+  );
+}
+
+/** Dedicated card for the bundled `kitty-docs-web` server (see
+    `plugins/kitty-docs-web/`) — PDF/Excel reading, web scraping, and the
+    merged `lean_web_search`/`lean_web_search_read_chunk` web search tools
+    (Brave preference controlled separately by `BraveMcpSearchCard` below;
+    DuckDuckGo always works here with no key). The other half of the
+    `replacement-mcp` split; on by default, no credentials — same shape as
+    `WasmMathMcpCard`. */
+function KittyDocsWebCard() {
+  const [enabled, setEnabled] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    void ipc
+      .getKittyDocsWebEnabled()
+      .then(setEnabled)
+      .catch((e) => setError(String(e)));
+  }, []);
+
+  const toggle = async (next: boolean) => {
+    setBusy(true);
+    setError('');
+    try {
+      await ipc.setKittyDocsWebEnabled(next);
+      setEnabled(next);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <label className="ext-card">
+      <div className="ext-card-head">
+        <span className="ext-card-name">PDF/Excel/Web (kitty-docs-web)</span>
+        <input
+          type="checkbox"
+          checked={enabled}
+          disabled={busy}
+          onChange={(ev) => void toggle(ev.target.checked)}
+        />
+      </div>
+      <span className="muted ext-card-desc">
+        Read PDFs and Excel spreadsheets, scrape web pages, and search the web.
+      </span>
+      {error && <div className="chat-error">{error}</div>}
+    </label>
+  );
+}
+
+/** Dedicated card for Brave search preference — this toggle does not spawn
+    its own process and does not gate whether `lean_web_search` exists at
+    all (it always does, via `kitty-docs-web` — see `KittyDocsWebCard`
+    above — since DuckDuckGo needs no key). It only controls whether
+    `BRAVE_API_KEY` is present on that server's env, which makes
+    `lean_web_search` prefer Brave (with automatic DuckDuckGo fallback) for
+    small requests, and query both engines together for broader ones. Off
+    by default, requires a Brave Search API key. Unlike every other builtin
+    card, "enabled" and "configured" are tracked separately: disabling
+    always wipes the stored key server-side
     (`ipc.setBraveMcpSearchEnabled(false)`), so the checkbox alone can never
     turn it back on — re-enabling always re-opens the API key form. This is
     deliberate (see `brave_mcp_search_enabled`'s doc comment in Rust
@@ -530,7 +605,7 @@ function BraveMcpSearchCard() {
   return (
     <div className="ext-card">
       <div className="ext-card-head">
-        <span className="ext-card-name">Web search (brave-mcp-search)</span>
+        <span className="ext-card-name">Web search: Brave (preferred engine)</span>
         <input
           type="checkbox"
           checked={isOn}
@@ -544,7 +619,8 @@ function BraveMcpSearchCard() {
       </div>
       <span className="muted ext-card-desc">
         Brave Search LLM Context API. Requires an API key — turning this off always clears the
-        stored key, so turning it back on requires entering it again.
+        stored key, so turning it back on requires entering it again. DuckDuckGo is always
+        available as a fallback even without this.
       </span>
       {!isOn && configured && (
         <span className="muted ext-card-desc">

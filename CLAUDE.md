@@ -15,14 +15,18 @@ Read `goose-overlay-project-description.md` in the repo root for the original pr
 - **State**: Zustand for UI state. No Redux.
 - **Rust crates**: `tauri`, `tauri-plugin-global-shortcut`, `tauri-plugin-notification`, `tauri-plugin-shell` (open browser), `tauri-plugin-dialog`, `tauri-plugin-single-instance`, `reqwest` (with `stream` feature), `tokio`, `serde`/`serde_json`, `keyring` (Windows Credential Manager), `windows` (Win32 APIs for the keyboard hook), `sysinfo` (process detection), `thiserror`.
 - **HTTP to BigTiny/Ollama**: all network calls go through the Rust side (Tauri commands + events). The webview never fetches localhost directly — this keeps the BigTiny secret key out of JS and avoids CORS issues.
-- **Exception, by design**: Python packages under `plugins/` (see
-  "Internal plugins" below), plus the BigTiny daemon itself (vendored at
+- **Exception, by design**: packages under `plugins/` (see "Internal
+  plugins" below), plus the BigTiny daemon itself (vendored at
   `plugins/bigtiny/`, same tree as everything else now), ship as part of the
-  app, frozen to standalone `.exe`s via
-  PyInstaller and bundled through Tauri's `externalBin` — this is an
-  intentional, sanctioned part of the stack, not a deviation. It does
-  **not** mean "add a Python dependency freely" — a new plugin still needs
-  the same freeze-and-bundle treatment (`docs/PLUGINS.md`), and the app
+  app, frozen to standalone `.exe`s (PyInstaller for the Python ones, plain
+  `cargo build --release` for `kitty-tools`) and bundled through Tauri's
+  `externalBin` — this is an intentional, sanctioned part of the stack, not
+  a deviation. A frozen Rust plugin is, if anything, *less* of an exception
+  than a frozen Python one (no interpreter, no onefile self-extraction
+  latency) — it just isn't a workspace member of `src-tauri` (see
+  `docs/PLUGINS.md`/`plugins/kitty-tools/Cargo.toml` for why). This does
+  **not** mean "add a dependency-heavy plugin freely" — a new plugin still
+  needs the same freeze-and-bundle treatment (`docs/PLUGINS.md`), and the app
   itself (Rust core + React frontend) stays exactly as described above.
 
 ## External APIs this app consumes
@@ -54,22 +58,38 @@ standalone Windows `.exe`s via PyInstaller and bundled through Tauri's
   Rust↔sidecar HTTP contract. Its `decide`/`record_outcome` MCP tools
   (`adaptive-pathway-mcp` console script, separate frozen exe) are registered
   as a BigTiny stdio MCP server, not spawned directly by Kitty — see below.
-- **`replacement-mcp`** — a stdio MCP server registered with **BigTiny's own
-  `/api/mcp/servers`**, not spawned directly by Kitty. Kitty's only
+- **`kitty-tools`** — a **Rust** stdio MCP server registered with **BigTiny's
+  own `/api/mcp/servers`**, not spawned directly by Kitty. Kitty's only
   involvement is keeping the registration's command path pointed at the
   current install's bundled exe and its `enabled` flag in sync with Settings
-  (`bigtiny::mcp::ensure_builtin_servers`, `commands/mcp_servers.rs`).
-  Context-optimized shell/file/web/document tools — **on by default** (they're
-  what makes the small local models Kitty targets usable as agents at all),
-  toggled in Settings → MCP Servers. Installs predating that default are
-  flipped on once by `config::migrate_replacement_mcp_enabled`, which then
-  respects any later opt-out.
+  (`bigtiny::mcp::ensure_builtin_servers`, `commands/mcp_servers.rs`). Hosts
+  20 context-optimized local-machine tools in one process — shell/workspace/
+  file/Word/cache/scratchpad (always on; this is the retired
+  `replacement-mcp`'s full surface, now hand-rolled in Rust — **on by
+  default**, since they're what makes the small local models Kitty targets
+  usable as agents at all), plus 2 accessible-table/SVG-diagram
+  visualization tools, gated by their own Settings toggle (an env var on
+  this one process, not a separate server). No network calls of its own —
+  web search moved to `kitty-docs-web` below. Toggled in Settings → MCP
+  Servers. Installs predating the `replacement-mcp` default flip are flipped
+  on once by `config::migrate_replacement_mcp_enabled` /
+  `migrate_kitty_split_enabled`, which then respect any later opt-out.
+- **`kitty-docs-web`** — a **Python** stdio MCP server, same BigTiny
+  registration pattern as `kitty-tools`. Hosts the 8 tools that need Python's
+  native deps with no adequate Rust equivalent: PDF read/outline (PyMuPDF),
+  web scrape (trafilatura), the merged `lean_web_search`/
+  `lean_web_search_read_chunk` (DuckDuckGo via `ddgs`, always available; Brave
+  preferred per-query when `BRAVE_API_KEY` is configured, with a count-tiered
+  normal/expanded/expansive mode — see `docs/VERSIONS.md`), and 3 Excel tools
+  (openpyxl). On by default, no credentials (Brave preference is a separate,
+  off-by-default toggle requiring an API key).
 
-Both of the above (and the BigTiny daemon itself) are frozen via
-`python plugins/build.py`; see `docs/PLUGINS.md` for the two Rust-side
-integration shapes (Kitty-managed process vs. BigTiny-managed MCP server) any
-future internal plugin should follow, and why mixing them is a bug, not a
-stylistic choice.
+The above (and the BigTiny daemon itself) are frozen via
+`python plugins/build.py` (Python plugins) or `cargo build --release`
+(`kitty-tools`); see `docs/PLUGINS.md` for the two Rust-side integration
+shapes (Kitty-managed process vs. BigTiny-managed MCP server) any future
+internal plugin should follow, and why mixing them is a bug, not a stylistic
+choice.
 
 ## Other undocumented-in-this-file subsystems
 

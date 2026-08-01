@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 420" width="100%" height="auto" role="img" aria-label="__TITLE__">
+    <title>__TITLE__</title>
+    <desc>__DESCRIPTION__</desc>
+    __DEFS__
+
+    <rect width="100%" height="100%" class="canvas-bg"/>
+
+    <!-- Grid Column Highlights -->
+    <rect x="170" y="10" width="170" height="400" fill="#f4f4f5" rx="4"/>
+    <rect x="530" y="10" width="170" height="400" fill="#f4f4f5" rx="4"/>
+
+    <!-- Stage Headers -->
+    <text x="255" y="35" class="node-text" style="font-weight:700;">1. Discovery</text>
+    <text x="435" y="35" class="node-text" style="font-weight:700;">2. Sign Up</text>
+    <text x="615" y="35" class="node-text" style="font-weight:700;">3. Setup</text>
+    <text x="795" y="35" class="node-text" style="font-weight:700;">4. First Success</text>
+
+    <line x1="20" y1="50" x2="900" y2="50" stroke="#d4d4d8" stroke-width="1.5"/>
+
+    <!-- Row 1: Actions -->
+    <text x="30" y="85" class="lane-header">USER ACTION</text>
+    <text x="255" y="85" class="node-text">Reads Overview</text>
+    <text x="435" y="85" class="node-text">Fills Auth Form</text>
+    <text x="615" y="85" class="node-text">Configures Keys</text>
+    <text x="795" y="85" class="node-text">Executes Query</text>
+
+    <line x1="20" y1="120" x2="900" y2="120" stroke="#e4e4e7"/>
+
+    <!-- Row 2: Sentiment Curve -->
+    <text x="30" y="180" class="lane-header">SENTIMENT</text>
+
+    <path d="M 255,160 C 320,140 370,210 435,200 C 500,190 550,220 615,210 C 680,200 730,140 795,140" class="curve-line"/>
+
+    <circle cx="255" cy="160" class="curve-dot"/>
+    <circle cx="435" cy="200" class="curve-dot"/>
+    <circle cx="615" cy="210" class="curve-dot"/>
+    <circle cx="795" cy="140" class="curve-dot"/>
+
+    <line x1="20" y1="260" x2="900" y2="260" stroke="#e4e4e7"/>
+
+    <!-- Row 3: Pain Points -->
+    <text x="30" y="320" class="lane-header">PAIN POINTS</text>
+
+    <g transform="translate(365, 300)">
+        <rect width="140" height="40" class="pain-card"/>
+        <text x="70" y="24" class="pain-text">Too many fields</text>
+    </g>
+    <g transform="translate(545, 300)">
+        <rect width="140" height="40" class="pain-card"/>
+        <text x="70" y="24" class="pain-text">Docs hard to locate</text>
+    </g>
+</svg>

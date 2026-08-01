@@ -24,17 +24,11 @@ a = Analysis(
     # `import fastmcp` with PackageNotFoundError before serving a single
     # request — and goosed just reports the extension as unavailable.
     + copy_metadata("fastmcp"),
-    # fastmcp/trafilatura/ddgs occasionally need their vendored submodules
-    # named explicitly for PyInstaller's static analysis. If the frozen exe
-    # fails at startup with a ModuleNotFoundError, add it here. `ddgs` in
-    # particular is imported lazily inside `fallback_web_search`, so a missed
-    # import wouldn't surface until the first search rather than at startup.
+    # fastmcp occasionally needs its vendored submodules named explicitly for
+    # PyInstaller's static analysis. If the frozen exe fails at startup with a
+    # ModuleNotFoundError, add it here.
     hiddenimports=[
         "fastmcp",
-        "ddgs",
-        # PyMuPDF's compiled extension module; PyInstaller's static analysis
-        # can miss it since it's imported as `fitz`, not `pymupdf`.
-        "fitz",
     ],
     hookspath=[],
     runtime_hooks=[],
