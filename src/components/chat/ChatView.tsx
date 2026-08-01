@@ -32,6 +32,7 @@ export function ChatView() {
     sessionConcluded,
     replaying,
     error,
+    errorType,
     cwd,
     title,
     sessionId,
@@ -54,6 +55,7 @@ export function ChatView() {
     bindEvents,
     refreshProvider,
     model,
+    newSession,
   } = useChatStore();
   const chatOnly = useChatStore(isChatMode);
   const startupPhase = useStackStore((s) => s.startupPhase);
@@ -220,7 +222,13 @@ export function ChatView() {
         ))}
       {error && (
         <div className="chat-error">
-          <ErrorDetail summary={humanizeChatError(error)} raw={error} />
+          <ErrorDetail
+            summary={humanizeChatError(error, errorType ?? undefined)}
+            raw={error}
+            errorType={errorType ?? undefined}
+            onNewSession={() => void newSession()}
+            onSwitchProvider={() => void ipc.openSettings('providers')}
+          />
         </div>
       )}
       {hintCount > 0 && (

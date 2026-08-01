@@ -49,12 +49,25 @@ export interface Config {
       mirrors `bigtiny/config.py`'s `SummarizerConfig`). A daemon restart is
       needed for a change here to take effect. */
   summarizer: SummarizerSettings;
+  /** BigTiny context-window/compaction budget settings — relayed as
+      `BIGTINY_TOKEN_MANAGEMENT__*` env vars at spawn time (Rust
+      `Config::token_management`, mirrors `bigtiny/config.py`'s
+      `TokenManagementConfig`). A daemon restart is needed for a change
+      here to take effect. */
+  token_management: TokenManagementSettings;
 }
 
 export interface SummarizerSettings {
   enabled: boolean;
   model: string;
   keep_alive: string;
+}
+
+export interface TokenManagementSettings {
+  max_context_tokens: number;
+  max_live_tail_tokens: number;
+  message_mask_head_lines: number;
+  message_mask_tail_lines: number;
 }
 
 // --- Providers (Phase 5) ---
@@ -578,12 +591,21 @@ export interface CompleteEvent {
     stopReason?: string;
     /** Confirmed ACP `session/prompt` result shape (docs/acp-protocol.md). */
     usage?: { totalTokens?: number; inputTokens?: number; outputTokens?: number };
+    /** BigTiny's `llm_timing` SSE event, folded in by stream.rs — metrics for
+        whichever LLM call in the turn produced the final visible text. */
+    timing?: {
+      ttfbMs?: number;
+      ttftMs?: number;
+      generationMs?: number;
+      totalTokens?: number;
+    };
   };
 }
 
 export interface ChatErrorEvent {
   session_id: string;
   message: string;
+  error_type?: string; // "context_exceeded" | "insufficient_credits" | "other"
 }
 
 /** BigTiny's background context-compaction pass completed for this session

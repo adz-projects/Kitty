@@ -19,6 +19,8 @@ SSEEventType = Literal[
     "session_status",
     "session_title",
     "compaction",
+    "provider_error",
+    "llm_timing",
 ]
 
 
@@ -37,6 +39,14 @@ class SSEEvent:
     error_code: str | None = None
     error_message: str | None = None
     recoverable: bool = True
+    error_type: str | None = None  # on provider_error: see classify_provider_error
+    # on llm_timing: see agent.loop.TimingResult / stream_with_timing
+    ttfb_ms: float | None = None
+    ttft_ms: float | None = None
+    generation_ms: float | None = None
+    provider_id: str | None = None
+    model: str | None = None
+    total_tokens: int | None = None
 
 
 def serialize_sse(event: SSEEvent) -> str:

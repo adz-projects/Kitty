@@ -27,6 +27,8 @@ class Delta(BaseModel):
     tool_calls: list[ToolCall] | None = None
     finish_reason: str | None = None
     usage: dict[str, int] | None = None  # {"input_tokens": N, "output_tokens": N}
+    # Set only alongside finish_reason="error" — see classify_provider_error.
+    error_type: str | None = None
 
 
 class Provider(ABC):

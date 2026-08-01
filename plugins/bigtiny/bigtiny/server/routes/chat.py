@@ -178,6 +178,19 @@ async def get_stats(session_id: str, request: Request):
     }
 
 
+@router.get("/{session_id}/timings")
+async def get_timings(session_id: str, request: Request):
+    """Recent per-LLM-call connection timing (TTFB/TTFT/generation time) —
+    see agent.loop.TimingResult. Last 50, most recent first."""
+    db = request.app.state.db
+    rows = await db.fetch_all(
+        "SELECT id, provider_id, model, ttfb_ms, ttft_ms, generation_ms, total_tokens, created_at "
+        "FROM llm_timings WHERE session_id = :sid ORDER BY created_at DESC LIMIT 50",
+        {"sid": session_id},
+    )
+    return [dict(r) for r in rows]
+
+
 @router.get("/")
 async def list_sessions(request: Request, limit: int = 50, offset: int = 0):
     db = request.app.state.db

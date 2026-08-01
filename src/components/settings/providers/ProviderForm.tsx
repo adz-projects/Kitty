@@ -301,6 +301,12 @@ export function ProviderForm({
                 </button>
               </div>
             )}
+            {profile.context_length != null && (
+              <small className="muted">
+                Used as BigTiny&apos;s max_context_tokens for this provider, overriding the
+                global value in Settings → Advanced.
+              </small>
+            )}
           </div>
         </div>
       )}

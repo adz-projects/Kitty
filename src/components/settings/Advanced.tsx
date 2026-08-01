@@ -20,6 +20,7 @@ export function Advanced() {
   const [msg, setMsg] = useState('');
   const { draft, update, save, saved } = useConfigDraft();
   const [envOpen, setEnvOpen] = useState(true);
+  const [tokenMgmtOpen, setTokenMgmtOpen] = useState(false);
   const [enablingOllama, setEnablingOllama] = useState(false);
   const [ollamaMsg, setOllamaMsg] = useState('');
   const [logOpen, setLogOpen] = useState(false);
@@ -176,6 +177,101 @@ export function Advanced() {
                     <option value="-1">Keep loaded permanently</option>
                   </select>
                 </label>
+              </>
+            )}
+
+            <button
+              type="button"
+              className="disclosure-toggle"
+              onClick={() => setTokenMgmtOpen((o) => !o)}
+            >
+              {tokenMgmtOpen ? '▾' : '▸'} <strong>Token management</strong>
+            </button>
+            {tokenMgmtOpen && (
+              <>
+                <label className="field">
+                  <span>Max context tokens</span>
+                  <input
+                    type="number"
+                    min={8192}
+                    step={1024}
+                    value={draft.token_management.max_context_tokens}
+                    onChange={(e) =>
+                      update({
+                        token_management: {
+                          ...draft.token_management,
+                          max_context_tokens: Number(e.target.value),
+                        },
+                      })
+                    }
+                  />
+                  <small className="muted">
+                    BigTiny&apos;s context window size. Must match your active model&apos;s
+                    capability.
+                  </small>
+                </label>
+                <label className="field">
+                  <span>Max live tail tokens</span>
+                  <input
+                    type="number"
+                    min={1024}
+                    step={1024}
+                    value={draft.token_management.max_live_tail_tokens}
+                    onChange={(e) =>
+                      update({
+                        token_management: {
+                          ...draft.token_management,
+                          max_live_tail_tokens: Number(e.target.value),
+                        },
+                      })
+                    }
+                  />
+                  <small className="muted">
+                    Per-turn budget for the live conversation tail. Lower = more aggressive
+                    compaction.
+                  </small>
+                </label>
+                <label className="field">
+                  <span>Code block head lines</span>
+                  <input
+                    type="number"
+                    min={0}
+                    max={50}
+                    value={draft.token_management.message_mask_head_lines}
+                    onChange={(e) =>
+                      update({
+                        token_management: {
+                          ...draft.token_management,
+                          message_mask_head_lines: Number(e.target.value),
+                        },
+                      })
+                    }
+                  />
+                </label>
+                <label className="field">
+                  <span>Code block tail lines</span>
+                  <input
+                    type="number"
+                    min={0}
+                    max={50}
+                    value={draft.token_management.message_mask_tail_lines}
+                    onChange={(e) =>
+                      update({
+                        token_management: {
+                          ...draft.token_management,
+                          message_mask_tail_lines: Number(e.target.value),
+                        },
+                      })
+                    }
+                  />
+                  <small className="muted">
+                    Lines kept at head/tail of code blocks in older messages. Set to 0 to disable
+                    masking.
+                  </small>
+                </label>
+                <p className="muted" style={{ margin: 0 }}>
+                  Token management changes require a backend restart.
+                </p>
               </>
             )}
           </div>

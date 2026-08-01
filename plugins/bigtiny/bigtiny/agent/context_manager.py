@@ -9,6 +9,7 @@ from bigtiny.storage import Database
 from bigtiny.models.mcp_server import ToolDefinition
 from bigtiny.agent.tokens import count_message_tokens, count_messages_tokens
 from bigtiny.agent.compaction import (
+    apply_content_mask,
     apply_tool_mask,
     emergency_trim,
     find_reserve_floor_rowid,
@@ -143,6 +144,8 @@ class ContextManager:
         live_messages = [self._row_to_message(r) for r in live_rows]
         reserve_floor = find_reserve_floor_rowid(live_rows, self.reserve_exchanges)
         live_messages = apply_tool_mask(live_messages, reserve_floor, self.config)
+        live_messages = apply_content_mask(live_messages, reserve_floor, self.config)
+        live_messages = self._enforce_live_tail_budget(live_messages, reserve_floor)
         # Captured before extending with the (potentially large) live tail,
         # so the emergency-valve check below can tiktoken-count just the
         # small, fixed system layers instead of the whole assembled prompt.
@@ -180,6 +183,33 @@ class ContextManager:
             messages = head + trimmed_live + [tail_new_message]
 
         return messages
+
+    def _enforce_live_tail_budget(
+        self, live_messages: list[dict[str, Any]], reserve_floor: int
+    ) -> list[dict[str, Any]]:
+        """Per-turn budget check for the live, uncompacted tail (Layer 6) —
+        independent of the whole-prompt compaction trigger below, since a
+        single turn's live tail can already be large before background
+        compaction gets a chance to run. Tool compaction (Phase A) is tried
+        first: cheap, deterministic, structure-preserving. Exchange-level
+        dropping (Phase B, reusing `emergency_trim`) is the last resort."""
+        budget = self.config.max_live_tail_tokens
+        if self._count_tokens(live_messages) <= budget:
+            return live_messages
+
+        # Phase A: collapse every live-tail tool message down to a bare
+        # elision marker (head=tail=0 makes apply_tool_mask's own
+        # `len(content) > head + tail` gate mask anything non-empty).
+        zero_tool_mask_cfg = self.config.model_copy(
+            update={"tool_mask_head": 0, "tool_mask_tail": 0}
+        )
+        live_messages = apply_tool_mask(live_messages, reserve_floor, zero_tool_mask_cfg)
+        if self._count_tokens(live_messages) <= budget:
+            return live_messages
+
+        # Phase B: drop whole eligible exchanges, oldest first, targeting
+        # this per-turn budget instead of the global compaction_target_ratio.
+        return emergency_trim(live_messages, reserve_floor, budget)
 
     @staticmethod
     def _row_content(row: dict[str, Any]) -> Any:

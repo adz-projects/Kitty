@@ -9,6 +9,7 @@ from typing import Any
 import keyring
 
 from bigtiny.models.provider import ProviderConfig, ProviderType, HealthStatus
+from bigtiny.network import TailscaleClient
 from bigtiny.providers.base import Provider
 from bigtiny.providers.anthropic import AnthropicProvider
 from bigtiny.providers.openai_compat import OpenAICompatibleProvider
@@ -22,8 +23,12 @@ class NoHealthyProvider(Exception):
 
 
 class ProviderRouter:
-    def __init__(self, db: Database):
+    def __init__(self, db: Database, tailscale: TailscaleClient | None = None):
         self.db = db
+        # Shared across every provider this router constructs, so peer
+        # discovery and resolved-address caching (TailscaleClient's own
+        # doc comment) happen once per daemon run, not once per provider.
+        self.tailscale = tailscale or TailscaleClient()
         self._providers: dict[str, Provider] = {}
         self._health_cache: dict[str, HealthStatus] = {}
         self._health_cache_time: dict[str, float] = {}
@@ -66,8 +71,8 @@ class ProviderRouter:
         )
 
         if config.provider_type == ProviderType.anthropic:
-            return AnthropicProvider(row["id"], config, api_key)
-        return OpenAICompatibleProvider(row["id"], config, api_key)
+            return AnthropicProvider(row["id"], config, api_key, tailscale=self.tailscale)
+        return OpenAICompatibleProvider(row["id"], config, api_key, tailscale=self.tailscale)
 
     async def _get_health(self, provider: Provider) -> HealthStatus:
         now = time.monotonic()

@@ -16,10 +16,12 @@ class FallbackConfig(BaseModel):
 
 
 class TokenManagementConfig(BaseModel):
-    max_context_tokens: int = 128000
+    # Sized for the small local models Kitty targets (a 64k window), not the
+    # 128k+ hosted-model default this used to carry.
+    max_context_tokens: int = 64000
     # High-water mark: a compaction pass is triggered once the assembled
     # prompt exceeds max_context_tokens * compaction_threshold.
-    compaction_threshold: float = 0.8
+    compaction_threshold: float = 0.6
     # Low-water mark: a triggered pass compacts enough of the candidate span
     # to bring the session back under max_context_tokens * compaction_target_ratio.
     # Having a lower target than the trigger (hysteresis) means compaction
@@ -27,7 +29,27 @@ class TokenManagementConfig(BaseModel):
     # each pass moves the watermark, which invalidates the model's KV
     # prefix cache, so fewer, bigger passes are strictly better than many
     # small ones.
-    compaction_target_ratio: float = 0.5
+    compaction_target_ratio: float = 0.4
+    # Absolute floor for the compaction trigger, independent of window size —
+    # `run_compaction` uses max(min_compaction_tokens, max_context_tokens *
+    # compaction_threshold) as its high-water mark, so a very large window
+    # still compacts by the time a session reaches this many tokens rather
+    # than deferring compaction indefinitely.
+    min_compaction_tokens: int = 16000
+    # Per-turn budget for the live, uncompacted tail (Layer 6 in
+    # context_manager.build_messages) — independent of the whole-prompt
+    # compaction trigger above, since a single turn can produce a live tail
+    # that's already large before background compaction has had a chance to
+    # run. Enforced synchronously every turn (context_manager.py), not by
+    # the background compaction pass.
+    max_live_tail_tokens: int = 24000
+    # Tier-1 deterministic content masking: code blocks inside user/assistant
+    # messages longer than head+tail lines are elided down to their head and
+    # tail once a message ages out of the live reserve window. Mirrors
+    # tool_mask_head/tail's KV-cache-stability contract (same rowid -> same
+    # masked output on every render).
+    message_mask_head_lines: int = 10
+    message_mask_tail_lines: int = 10
     # Tier-1 deterministic tool-output masking: content longer than
     # head + tail bytes is elided down to its head and tail, keeping both
     # ends since the informative part of tool output (e.g. a traceback's

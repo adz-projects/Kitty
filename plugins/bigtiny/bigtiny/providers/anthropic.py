@@ -9,15 +9,24 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 
 from bigtiny.models.provider import ProviderConfig, ModelInfo, HealthStatus
 from bigtiny.models.session import Message
+from bigtiny.network import PreferDirectTransport, TailscaleClient
 from bigtiny.providers.base import Provider, Delta, ToolCall
+from bigtiny.providers.errors import classify_provider_error
 
 
 class AnthropicProvider(Provider):
     DEFAULT_MODEL = "claude-sonnet-4-20250514"
 
-    def __init__(self, provider_id: str, config: ProviderConfig, api_key: str | None = None):
+    def __init__(
+        self,
+        provider_id: str,
+        config: ProviderConfig,
+        api_key: str | None = None,
+        tailscale: TailscaleClient | None = None,
+    ):
         super().__init__(provider_id, config)
         self.api_key = api_key
+        transport = PreferDirectTransport(tailscale) if tailscale is not None else None
         self._client = httpx.AsyncClient(
             base_url=config.base_url.rstrip("/") if config.base_url else "https://api.anthropic.com",
             timeout=httpx.Timeout(120.0, connect=5.0, read=120.0),
@@ -26,6 +35,7 @@ class AnthropicProvider(Provider):
                 "anthropic-version": "2023-06-01",
                 "content-type": "application/json",
             } if api_key else {"anthropic-version": "2023-06-01"},
+            transport=transport,
         )
 
     async def chat_completion(
@@ -66,10 +76,12 @@ class AnthropicProvider(Provider):
                     # except-branch below runs after __aexit__ has closed it,
                     # where .text raises ResponseNotRead and kills the run.
                     detail = (await response.aread()).decode("utf-8", errors="replace")
+                    classified = classify_provider_error(response.status_code, detail)
                     yield Delta(
                         role="assistant",
-                        content=f"[Anthropic error: {response.status_code} {detail[:200]}]",
+                        content=classified.user_message,
                         finish_reason="error",
+                        error_type=classified.type,
                     )
                     return
                 async for line in response.aiter_lines():
@@ -138,10 +150,12 @@ class AnthropicProvider(Provider):
             # Safety net only (the status check above handles the normal
             # case): never touch e.response.text here — on a streaming
             # response that was never read it raises ResponseNotRead.
+            classified = classify_provider_error(e.response.status_code, "")
             yield Delta(
                 role="assistant",
-                content=f"[Anthropic error: {e.response.status_code}]",
+                content=classified.user_message,
                 finish_reason="error",
+                error_type=classified.type,
             )
         except httpx.RequestError as e:
             yield Delta(

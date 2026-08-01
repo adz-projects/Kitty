@@ -10,7 +10,9 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 
 from bigtiny.models.provider import ProviderConfig, ModelInfo, HealthStatus
 from bigtiny.models.session import Message
+from bigtiny.network import PreferDirectTransport, TailscaleClient
 from bigtiny.providers.base import Provider, Delta, ToolCall
+from bigtiny.providers.errors import classify_provider_error
 
 
 ENCODING_CACHE: dict[str, tiktoken.Encoding] = {}
@@ -102,13 +104,21 @@ def _split_think_tags(delta: Delta, splitter: ThinkTagSplitter) -> Delta | None:
 class OpenAICompatibleProvider(Provider):
     DEFAULT_MODEL = "gpt-4o"
 
-    def __init__(self, provider_id: str, config: ProviderConfig, api_key: str | None = None):
+    def __init__(
+        self,
+        provider_id: str,
+        config: ProviderConfig,
+        api_key: str | None = None,
+        tailscale: TailscaleClient | None = None,
+    ):
         super().__init__(provider_id, config)
         self.api_key = api_key
+        transport = PreferDirectTransport(tailscale) if tailscale is not None else None
         self._client = httpx.AsyncClient(
             base_url=config.base_url.rstrip("/"),
             timeout=httpx.Timeout(60.0, connect=3.0, read=60.0),
             headers={"Authorization": f"Bearer {api_key}"} if api_key else {},
+            transport=transport,
         )
 
     async def chat_completion(
@@ -149,10 +159,12 @@ class OpenAICompatibleProvider(Provider):
                     # except-branch below runs after __aexit__ has closed it,
                     # where .text raises ResponseNotRead and kills the run.
                     detail = (await response.aread()).decode("utf-8", errors="replace")
+                    classified = classify_provider_error(response.status_code, detail)
                     yield Delta(
                         role="assistant",
-                        content=f"[Provider error: {response.status_code} {detail[:200]}]",
+                        content=classified.user_message,
                         finish_reason="error",
+                        error_type=classified.type,
                     )
                     return
                 async for line in response.aiter_lines():
@@ -178,10 +190,12 @@ class OpenAICompatibleProvider(Provider):
             # Safety net only (the status check above handles the normal
             # case): never touch e.response.text here — on a streaming
             # response that was never read it raises ResponseNotRead.
+            classified = classify_provider_error(e.response.status_code, "")
             yield Delta(
                 role="assistant",
-                content=f"[Provider error: {e.response.status_code}]",
+                content=classified.user_message,
                 finish_reason="error",
+                error_type=classified.type,
             )
         except httpx.RequestError as e:
             yield Delta(

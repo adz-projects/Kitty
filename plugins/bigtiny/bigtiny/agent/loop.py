@@ -5,11 +5,14 @@ import hashlib
 import json
 import logging
 import re
-from typing import Any, Awaitable, Callable
+import time
+import uuid
+from dataclasses import dataclass, field
+from typing import Any, AsyncIterator, Awaitable, Callable
 
 from bigtiny.storage import Database
 from bigtiny.providers.router import ProviderRouter, NoHealthyProvider
-from bigtiny.providers.base import ToolCall
+from bigtiny.providers.base import Delta, ToolCall
 from bigtiny.mcp.manager import MCPManager
 from bigtiny.hitl.manager import HITLManager
 from bigtiny.agent import sandbox
@@ -22,6 +25,54 @@ from bigtiny.providers.summarizer_client import SummarizerClient
 from bigtiny.server.events import SSEEvent
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class TimingResult:
+    """Per-turn LLM connection metrics, captured by `stream_with_timing`.
+    A plain mutable holder (not a return value) since the wrapper is an
+    async generator — the caller passes an instance in and reads it back
+    out once the wrapped stream is exhausted."""
+
+    ttfb_ms: float = 0.0
+    ttft_ms: float = 0.0
+    generation_ms: float = 0.0
+    total_tokens: int = field(default=0)
+
+
+async def stream_with_timing(
+    gen: AsyncIterator[Delta], timing: TimingResult
+) -> AsyncIterator[Delta]:
+    """Wraps a provider's `chat_completion` stream, capturing TTFB/TTFT/
+    generation-time milestones as deltas flow through. Instrumented once
+    here (the call site) rather than inside each provider implementation,
+    so no provider needs its own timing boilerplate.
+
+    - `ttfb_ms`: request start -> first yielded delta (connection + network
+      RTT + server pre-computation).
+    - `ttft_ms`: request start -> first delta carrying non-empty `content`.
+      A `reasoning`-only delta does NOT count — thinking tokens aren't the
+      user-visible "first token" — and neither does a `finish_reason="error"`
+      delta, whose `content` is a human-readable error message for the
+      banner, not generated text.
+    - `generation_ms`: request start -> stream exhaustion.
+    - `total_tokens`: taken from the last delta carrying `usage`.
+    """
+    t_start = time.perf_counter()
+    seen_first_byte = False
+    seen_first_token = False
+    async for delta in gen:
+        now = time.perf_counter()
+        if not seen_first_byte:
+            seen_first_byte = True
+            timing.ttfb_ms = (now - t_start) * 1000
+        if not seen_first_token and delta.content and delta.finish_reason != "error":
+            seen_first_token = True
+            timing.ttft_ms = (now - t_start) * 1000
+        if delta.usage:
+            timing.total_tokens = delta.usage.get("output_tokens", 0)
+        yield delta
+    timing.generation_ms = (time.perf_counter() - t_start) * 1000
 
 
 def _dicts_to_messages(dicts: list[dict[str, Any]]) -> list[Message]:
@@ -130,6 +181,12 @@ class Agent:
         # any still in flight rather than leaving them to race a closing DB
         # connection during process exit.
         self._compaction_tasks: set[asyncio.Task] = set()
+        # Keyed by session_id (unlike `_compaction_tasks`, which only exists
+        # so `shutdown()` can cancel everything in flight) — lets `run()`
+        # await this specific session's prior pass before assembling
+        # messages, so the live-tail query sees an up-to-date
+        # compacted_through_rowid instead of racing a pass still in flight.
+        self._session_compaction_tasks: dict[str, asyncio.Task] = {}
         # Keyed by `action_id`, not `session_id` — a single turn can have more
         # than one tool call pending approval at once (this becomes possible
         # once tool calls execute concurrently), and each needs its own,
@@ -189,6 +246,19 @@ class Agent:
             context_length_hint = (peek_provider.config.config or {}).get("context_length")
         except NoHealthyProvider:
             pass
+
+        # Await any compaction pass still running for this session before
+        # assembling messages — otherwise build_messages's live-tail query
+        # can race the pass and read a stale compacted_through_rowid. Capped
+        # at 2s: a turn must never block indefinitely on a background pass.
+        prior_compaction = self._session_compaction_tasks.get(session_id)
+        if prior_compaction is not None and not prior_compaction.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(prior_compaction), timeout=2.0)
+            except asyncio.TimeoutError:
+                pass
+            except Exception:
+                pass
 
         messages = await self.context.build_messages(
             session_id, user_message, active_tools, persona_override,
@@ -269,13 +339,32 @@ class Agent:
 
                 provider_config = provider.config.config or {}
                 provider_msgs = _dicts_to_messages(messages)
-                async for delta in provider.chat_completion(  # type: ignore[arg-type]
-                    provider_msgs,
-                    tools_for_turn,
-                    model=model_override,
-                    temperature=provider_config.get("temperature"),
-                    top_p=provider_config.get("top_p"),
+                timing = TimingResult()
+                async for delta in stream_with_timing(
+                    provider.chat_completion(  # type: ignore[arg-type]
+                        provider_msgs,
+                        tools_for_turn,
+                        model=model_override,
+                        temperature=provider_config.get("temperature"),
+                        top_p=provider_config.get("top_p"),
+                    ),
+                    timing,
                 ):
+                    if delta.finish_reason == "error":
+                        # Checked before the content branch below: a
+                        # provider-error delta's `content` is a
+                        # human-readable message meant for the error banner,
+                        # not model output — emitting it as `llm_delta` would
+                        # render it as if the assistant said it. Emit the
+                        # structured event and stop the turn here instead.
+                        done = True
+                        await event_callback(SSEEvent(
+                            type="provider_error",
+                            error_message=delta.content or "Provider error",
+                            error_type=delta.error_type,
+                            session_id=session_id,
+                        ))
+                        break
                     if delta.content:
                         content_chunks.append(delta.content)
                         await event_callback(SSEEvent(
@@ -294,10 +383,7 @@ class Agent:
                     if delta.usage:
                         turn_usage = delta.usage
                     if delta.finish_reason:
-                        if delta.finish_reason == "error":
-                            done = True
-                        else:
-                            finish_reason = delta.finish_reason
+                        finish_reason = delta.finish_reason
 
                 if turn_usage:
                     run_usage["input_tokens"] += turn_usage.get("input_tokens", 0)
@@ -309,6 +395,10 @@ class Agent:
                         provider.provider_id,
                         provider.resolve_model(model_override),
                     )
+
+                await self._emit_and_persist_timing(
+                    session_id, provider, model_override, timing, event_callback
+                )
 
                 if done:
                     break
@@ -506,6 +596,15 @@ class Agent:
         )
         self._compaction_tasks.add(task)
         task.add_done_callback(self._compaction_tasks.discard)
+        self._session_compaction_tasks[session_id] = task
+
+        def _clear_session_task(t: asyncio.Task, sid: str = session_id) -> None:
+            # Only clear if this task is still the one registered — a newer
+            # pass may already have replaced it by the time this callback runs.
+            if self._session_compaction_tasks.get(sid) is t:
+                self._session_compaction_tasks.pop(sid, None)
+
+        task.add_done_callback(_clear_session_task)
 
     async def _run_compaction_and_notify(
         self,
@@ -542,6 +641,52 @@ class Agent:
             # or drained the queue and returned) — this notification is
             # best-effort only, never worth failing the pass over.
             logger.debug("compaction: could not emit event for %s (stream closed?)", session_id)
+
+    async def _emit_and_persist_timing(
+        self,
+        session_id: str,
+        provider: Any,
+        model_override: str | None,
+        timing: TimingResult,
+        event_callback: Callable[[SSEEvent], Awaitable[None]],
+    ) -> None:
+        """Emits an `llm_timing` SSE event and best-effort persists the same
+        metrics to the `llm_timings` table. Called once per LLM call (i.e.
+        once per iteration of the turn's while-loop, matching how
+        `record_usage` above is scoped) — never worth failing the turn over,
+        so both the event emission and the DB write are swallowed on error."""
+        model = provider.resolve_model(model_override)
+        try:
+            await event_callback(SSEEvent(
+                type="llm_timing",
+                session_id=session_id,
+                ttfb_ms=timing.ttfb_ms,
+                ttft_ms=timing.ttft_ms,
+                generation_ms=timing.generation_ms,
+                provider_id=provider.provider_id,
+                model=model,
+                total_tokens=timing.total_tokens,
+            ))
+        except Exception:
+            logger.debug("timing: could not emit event for %s", session_id)
+        try:
+            await self.db.execute(
+                "INSERT INTO llm_timings "
+                "(id, session_id, provider_id, model, ttfb_ms, ttft_ms, generation_ms, total_tokens) "
+                "VALUES (:id, :sid, :pid, :model, :ttfb, :ttft, :gen, :tok)",
+                {
+                    "id": uuid.uuid4().hex,
+                    "sid": session_id,
+                    "pid": provider.provider_id,
+                    "model": model,
+                    "ttfb": timing.ttfb_ms,
+                    "ttft": timing.ttft_ms,
+                    "gen": timing.generation_ms,
+                    "tok": timing.total_tokens,
+                },
+            )
+        except Exception:
+            logger.debug("timing: could not persist row for %s", session_id)
 
     async def shutdown(self) -> None:
         """Cancels any in-flight background compaction passes. Called from

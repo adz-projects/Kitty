@@ -61,6 +61,48 @@ pub(crate) fn stack_needs_ollama(cfg: &crate::config::Config) -> bool {
     ollama_proc::requires_local_ollama(cfg) || cfg.adaptive_pathway_enabled || cfg.summarizer.enabled
 }
 
+/// Sync the bundled MCP servers now if the just-spawned daemon's own startup
+/// health probe already succeeded; otherwise wait for it in the background
+/// instead of syncing against a daemon that (per `bigtiny_proc::spawn`'s
+/// bounded wait) hasn't finished binding yet.
+///
+/// Calling `ensure_builtin_servers` unconditionally right after `spawn`
+/// used to mean: if the daemon was still mid-`connect_all()` (every enabled
+/// MCP server, including a onefile exe re-extracting under AV scanning, with
+/// a 60s per-server timeout — easily longer than `spawn`'s own 15s probe
+/// window), `list_servers` would fail once and the entire sync gave up for
+/// the rest of the session. Retrying here, off the critical path, means a
+/// slow-but-successful startup still ends with Brave/etc. registered instead
+/// of silently missing until the user finds Settings → Setup & Repair.
+pub(crate) fn sync_mcp_once_healthy(app: &AppHandle, healthy: bool, port: u16) {
+    if healthy {
+        let app = app.clone();
+        tauri::async_runtime::spawn(async move {
+            crate::bigtiny::mcp::ensure_builtin_servers(&app).await;
+        });
+        return;
+    }
+
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let client = crate::util::http_client();
+        // Bounded to a few minutes total — well past any realistic onefile
+        // self-extraction stall, but not forever: if the daemon truly never
+        // comes up, the regular 5s health loop (`spawn_health_loop`) is what
+        // surfaces the degraded `stack://status` to the user.
+        for _ in 0..120 {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            if bigtiny_proc::probe_health(&client, port).await {
+                crate::bigtiny::mcp::ensure_builtin_servers(&app).await;
+                return;
+            }
+        }
+        tracing::warn!(
+            "bigtiny never answered its health check after startup; builtin MCP servers were not synced this session"
+        );
+    });
+}
+
 /// Start the stack in the background at app startup. Non-blocking: failures
 /// surface through the health loop as a degraded status rather than crashing.
 pub fn start_stack(app: &AppHandle) {
@@ -90,7 +132,7 @@ pub fn start_stack(app: &AppHandle) {
         // Spawn the BigTiny daemon. No provider env vars — providers are
         // registered at runtime over REST (see
         // `bigtiny::providers::sync_active_provider` right after spawn).
-        let (command, args, dir, warm, summarizer) = {
+        let (command, args, dir, warm, summarizer, token_management) = {
             let state = app.state::<AppState>();
             let cfg = state.config.lock().unwrap();
             (
@@ -99,6 +141,7 @@ pub fn start_stack(app: &AppHandle) {
                 cfg.bigtiny_dir.clone(),
                 crate::config::providers::active_ollama_target(&cfg),
                 cfg.summarizer.clone(),
+                cfg.token_management.clone(),
             )
         };
 
@@ -117,7 +160,8 @@ pub fn start_stack(app: &AppHandle) {
         if warm.is_some() {
             set_startup_phase(&app, StartupPhase::WarmingModel);
         }
-        let spawn_fut = bigtiny_proc::spawn(&command, &args, dir.as_deref(), &summarizer);
+        let spawn_fut =
+            bigtiny_proc::spawn(&command, &args, dir.as_deref(), &summarizer, &token_management);
         let warm_fut = async {
             if let Some((base, model)) = warm {
                 crate::ollama::keep_alive_load(&base, &model).await;
@@ -126,9 +170,10 @@ pub fn start_stack(app: &AppHandle) {
         let (spawn_result, ()) = tokio::join!(spawn_fut, warm_fut);
         match spawn_result {
             Ok(handle) => {
+                let (healthy, port) = (handle.healthy, handle.port);
                 let state = app.state::<AppState>();
                 *state.bigtiny.lock().unwrap() = handle;
-                tracing::info!("bigtiny started");
+                tracing::info!("bigtiny started (health probe answered: {healthy})");
                 // Register the active provider so the very first send has
                 // a healthy provider to route to.
                 if let Err(e) = crate::bigtiny::providers::sync_active_provider(&app).await {
@@ -136,8 +181,13 @@ pub fn start_stack(app: &AppHandle) {
                 }
                 // Self-heal the bundled plugins' MCP-server registrations
                 // (command path across an update/reinstall, enabled state
-                // matching Settings).
-                crate::bigtiny::mcp::ensure_builtin_servers(&app).await;
+                // matching Settings) — deferred to the background if the
+                // daemon's own startup probe hasn't succeeded yet, so a slow
+                // (but eventually successful) boot doesn't give up on the
+                // sync after one failed `list_servers` call.
+                if let Some(port) = port {
+                    sync_mcp_once_healthy(&app, healthy, port);
+                }
             }
             Err(e) => tracing::warn!("bigtiny spawn failed: {e}"),
         }

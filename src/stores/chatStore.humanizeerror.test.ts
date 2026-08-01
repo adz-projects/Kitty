@@ -29,4 +29,24 @@ describe('humanizeChatError', () => {
   it('is case-insensitive', () => {
     expect(humanizeChatError('INVALID PARAMS')).toMatch(/switching providers|restarting the engine/);
   });
+
+  it('uses the structured context_exceeded message when errorType is given', () => {
+    expect(humanizeChatError('raw provider text', 'context_exceeded')).toMatch(
+      /context limit/
+    );
+  });
+
+  it('uses the structured insufficient_credits message when errorType is given', () => {
+    expect(humanizeChatError('raw provider text', 'insufficient_credits')).toMatch(
+      /credits are exhausted/
+    );
+  });
+
+  it('falls through to string matching for an unknown errorType', () => {
+    expect(humanizeChatError('ACP connection closed', 'other')).toMatch(/reconnect/i);
+  });
+
+  it('falls through to string matching with no errorType (backward compat)', () => {
+    expect(humanizeChatError('Invalid params')).toMatch(/switching providers|restarting the engine/);
+  });
 });

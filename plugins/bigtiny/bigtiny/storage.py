@@ -193,6 +193,23 @@ CREATE INDEX IF NOT EXISTS idx_sessions_updated_at ON sessions(updated_at);
 CREATE INDEX IF NOT EXISTS idx_hitl_rules_tool_name ON hitl_rules(tool_name);
 """
 
+# Per-LLM-call connection timing (TTFB/TTFT/generation time) — see
+# agent.loop.TimingResult / stream_with_timing.
+MIGRATION_V008 = """
+CREATE TABLE IF NOT EXISTS llm_timings (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    provider_id TEXT,
+    model TEXT,
+    ttfb_ms REAL,
+    ttft_ms REAL,
+    generation_ms REAL,
+    total_tokens INTEGER,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_llm_timings_session ON llm_timings(session_id);
+"""
+
 MIGRATIONS: dict[int, str] = {
     1: MIGRATION_V001,
     2: MIGRATION_V002,
@@ -201,6 +218,7 @@ MIGRATIONS: dict[int, str] = {
     5: MIGRATION_V005,
     6: MIGRATION_V006,
     7: MIGRATION_V007,
+    8: MIGRATION_V008,
 }
 
 

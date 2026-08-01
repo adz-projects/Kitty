@@ -100,8 +100,10 @@ pub(crate) fn decision_for_option(option_id: Option<&str>) -> &'static str {
 #[derive(Default)]
 struct TurnOutcome {
     error: Option<String>,
+    error_type: Option<String>,
     cancelled: bool,
     usage: Option<Value>,
+    timing: Option<Value>,
 }
 
 /// Send a user turn. Returns immediately; streamed output arrives via
@@ -144,12 +146,15 @@ pub async fn send_prompt(
     tauri::async_runtime::spawn(async move {
         let outcome = run_stream(&app_bg, &client, &session_id, &body).await;
         match outcome {
-            Ok(TurnOutcome { error: None, cancelled, usage }) => {
+            Ok(TurnOutcome { error: None, cancelled, usage, timing, .. }) => {
                 let mut result = json!({
                     "stopReason": if cancelled { "cancelled" } else { "end_turn" },
                 });
                 if let Some(usage) = usage {
                     result["usage"] = usage;
+                }
+                if let Some(timing) = timing {
+                    result["timing"] = timing;
                 }
                 let _ = app_bg.emit(
                     "chat://complete",
@@ -165,7 +170,21 @@ pub async fn send_prompt(
                 providers::emit_health_from_send_result(&app_bg, true);
                 poll_compaction_status(app_bg.clone(), session_id.clone());
             }
-            Ok(TurnOutcome { error: Some(message), .. }) | Err(message) => {
+            Ok(TurnOutcome { error: Some(message), error_type, .. }) => {
+                let _ = app_bg.emit(
+                    "chat://error",
+                    json!({ "session_id": session_id, "message": &message, "error_type": error_type }),
+                );
+                notifications::notify_if_hidden(
+                    &app_bg,
+                    notifications::Event::TaskFailed,
+                    "Kitty ran into a problem",
+                    &message,
+                    Some(&session_id),
+                );
+                providers::emit_health_from_send_result(&app_bg, false);
+            }
+            Err(message) => {
                 let _ = app_bg.emit(
                     "chat://error",
                     json!({ "session_id": session_id, "message": &message }),
@@ -446,6 +465,19 @@ fn handle_event(
                 }));
             }
         }
+        "llm_timing" => {
+            // Fired once per LLM call within the turn (a multi-step
+            // tool-calling turn makes several) — overwritten on each one, so
+            // by the time the turn completes this holds the metrics for the
+            // call that actually produced the final visible text.
+            let get_f64 = |key: &str| event.get(key).and_then(|v| v.as_f64());
+            outcome.timing = Some(json!({
+                "ttfbMs": get_f64("ttfb_ms"),
+                "ttftMs": get_f64("ttft_ms"),
+                "generationMs": get_f64("generation_ms"),
+                "totalTokens": event.get("total_tokens").and_then(|v| v.as_i64()),
+            }));
+        }
         "error" => {
             let message = event
                 .get("error_message")
@@ -454,6 +486,24 @@ fn handle_event(
                 .unwrap_or("BigTiny reported an error")
                 .to_string();
             outcome.error = Some(message);
+        }
+        "provider_error" => {
+            // Structured, classified provider error (context exceeded,
+            // insufficient credits, etc. — see `classify_provider_error` on
+            // the BigTiny side). Distinct from the generic "error" type
+            // above so `chat://error` can carry `error_type` for the
+            // frontend to render type-specific guidance.
+            let message = event
+                .get("error_message")
+                .and_then(|m| m.as_str())
+                .or(content)
+                .unwrap_or("Provider error")
+                .to_string();
+            outcome.error = Some(message);
+            outcome.error_type = event
+                .get("error_type")
+                .and_then(|t| t.as_str())
+                .map(|s| s.to_string());
         }
         "session_status" => {
             if content == Some("Cancelled") {

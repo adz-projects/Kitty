@@ -101,7 +101,7 @@ pub async fn restart_backend(app: AppHandle) -> Result<(), String> {
         let state = app.state::<AppState>();
         state.bigtiny.lock().unwrap().process.kill_if_owned();
     }
-    let (command, args, dir, summarizer) = {
+    let (command, args, dir, summarizer, token_management) = {
         let state = app.state::<AppState>();
         let cfg = state.config.lock().unwrap();
         (
@@ -109,10 +109,18 @@ pub async fn restart_backend(app: AppHandle) -> Result<(), String> {
             cfg.bigtiny_args.clone(),
             cfg.bigtiny_dir.clone(),
             cfg.summarizer.clone(),
+            cfg.token_management.clone(),
         )
     };
-    let handle =
-        lifecycle::bigtiny_proc::spawn(&command, &args, dir.as_deref(), &summarizer).await?;
+    let handle = lifecycle::bigtiny_proc::spawn(
+        &command,
+        &args,
+        dir.as_deref(),
+        &summarizer,
+        &token_management,
+    )
+    .await?;
+    let (healthy, port) = (handle.healthy, handle.port);
     {
         let state = app.state::<AppState>();
         *state.bigtiny.lock().unwrap() = handle;
@@ -120,6 +128,10 @@ pub async fn restart_backend(app: AppHandle) -> Result<(), String> {
     if let Err(e) = crate::bigtiny::providers::sync_active_provider(&app).await {
         tracing::warn!("bigtiny provider sync after restart failed: {e}");
     }
-    crate::bigtiny::mcp::ensure_builtin_servers(&app).await;
+    // See `lifecycle::sync_mcp_once_healthy`: don't give up on the MCP sync
+    // after one failed call if the daemon is just slow to finish binding.
+    if let Some(port) = port {
+        lifecycle::sync_mcp_once_healthy(&app, healthy, port);
+    }
     Ok(())
 }

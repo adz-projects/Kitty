@@ -120,14 +120,15 @@ pub struct Config {
     /// per-provider.
     #[serde(default = "default_ap_embedding_model")]
     pub adaptive_pathway_embedding_model: String,
-    /// Whether the bundled `replacement-mcp` server (see
-    /// `plugins/replacement-mcp/`) is registered+enabled as a BigTiny MCP
-    /// server. **On** by default: its context-optimized shell/file/web/document
-    /// tools are what makes the small local models Kitty targets usable at all,
-    /// so shipping it off meant a default install had no working tool set until
-    /// the user found this toggle. Kitty never spawns/monitors this process
-    /// itself; BigTiny does, like any other MCP server — this flag only drives
-    /// whether `bigtiny::mcp::ensure_builtin_servers`'s registration is enabled.
+    /// Retired: `replacement-mcp` no longer exists as its own process — all
+    /// 18 of its tools now live inside `kitty-tools` (see
+    /// `kitty_tools_enabled` below), and `plugins/replacement-mcp/lean_mcp.py`
+    /// stays in-tree, unbuilt, only as an oracle for re-verifying the Rust
+    /// port against if a behavioral gap ever surfaces. This field is kept
+    /// (not removed) purely as the source value `migrate_kitty_split_enabled`
+    /// carries forward into `kitty_tools_enabled` on an existing install's
+    /// first load after the split — removing it would break that migration
+    /// for anyone who hasn't upgraded past it yet.
     #[serde(default = "default_true")]
     pub replacement_mcp_enabled: bool,
     /// One-shot marker for the `replacement_mcp_enabled` default flip above.
@@ -146,26 +147,57 @@ pub struct Config {
     /// tool-set swap. No credentials involved.
     #[serde(default = "default_true")]
     pub wasm_math_mcp_enabled: bool,
-    /// Whether the bundled `brave-mcp-search` server (see
-    /// `plugins/brave-mcp-search/`) is registered+enabled as a BigTiny MCP
-    /// server. Off by default (requires a Brave Search API key, unlike
-    /// `wasm_math_mcp_enabled`). The API key itself lives in the keyring
+    /// Whether the `brave_mcp_search` tool is advertised by the combined
+    /// `kitty-tools` server (see `kitty_tools_enabled` below and
+    /// `plugins/kitty-tools/src/tools/search.rs`) — no longer its own
+    /// process (`brave-mcp-search` is retired). Off by default (requires a
+    /// Brave Search API key, unlike `wasm_math_mcp_enabled`). The API key
+    /// itself lives in the keyring
     /// (`config::providers::{set_secret,get_secret_async,delete_secret}`
     /// under the fixed id `"brave-mcp-search"`), never here — this flag only
-    /// tracks user intent. Disabling this server always deletes the stored
-    /// key (see `commands::set_brave_mcp_search_enabled`), so re-enabling it
-    /// always requires re-entering the key — deliberate, not a bug: an old
-    /// key silently reactivating without the user seeing it again would be
-    /// surprising for a server that reaches an external paid API.
+    /// tracks user intent, and `bigtiny::mcp::ensure_builtin_servers` turns
+    /// it (plus key presence) into kitty-tools's `BRAVE_API_KEY` env var.
+    /// Disabling always deletes the stored key (see
+    /// `commands::set_brave_mcp_search_enabled`), so re-enabling always
+    /// requires re-entering the key — deliberate, not a bug: an old key
+    /// silently reactivating without the user seeing it again would be
+    /// surprising for a tool that reaches an external paid API.
     #[serde(default)]
     pub brave_mcp_search_enabled: bool,
-    /// Whether the bundled `visualizations` server (see
-    /// `plugins/visualizations/`) is registered+enabled as a BigTiny MCP
-    /// server. On by default — like `wasm_math_mcp_enabled`, it's a safe,
-    /// broadly useful, credential-free tool (accessible HTML tables/SVG
-    /// diagrams rendered client-side in an iframe).
+    /// Whether `generate_accessible_table`/`generate_accessible_svg` are
+    /// advertised by the combined `kitty-tools` server — no longer its own
+    /// process (`visualizations` is retired). On by default — like
+    /// `wasm_math_mcp_enabled`, it's a safe, broadly useful, credential-free
+    /// tool (accessible HTML tables/SVG diagrams rendered client-side in an
+    /// iframe). Drives kitty-tools's `KITTY_VIZ_ENABLED` env var.
     #[serde(default = "default_true")]
     pub visualizations_enabled: bool,
+    /// Whether the bundled `kitty-tools` server (see `plugins/kitty-tools/`)
+    /// is registered+enabled as a BigTiny MCP server. This one Rust process
+    /// hosts all 21 tools the base rewrite plan calls for: the 18 always-on
+    /// `lean_*` tools (shell/workspace/5 file/3 word/4 cache/4 scratchpad —
+    /// `replacement-mcp`'s entire surface), plus Brave search and the 2
+    /// visualization tools, each of those two gated by their own flag above
+    /// rather than this one. These 18 used to live in `replacement-mcp`,
+    /// gated by `replacement_mcp_enabled`; on first load after the split,
+    /// `migrate_kitty_split_enabled` carries that flag's value forward so a
+    /// user who'd disabled `replacement_mcp_enabled` doesn't silently regain
+    /// this tool set, and vice versa.
+    #[serde(default = "default_true")]
+    pub kitty_tools_enabled: bool,
+    /// One-shot marker for the carry-forward migration above — same pattern
+    /// as `replacement_mcp_default_migrated`.
+    #[serde(default)]
+    pub kitty_tools_default_migrated: bool,
+    /// Whether the bundled `kitty-docs-web` server (see
+    /// `plugins/kitty-docs-web/` — PDF/Excel/web-scrape/DDG-search) is
+    /// registered+enabled as a BigTiny MCP server. Same carry-forward
+    /// migration story as `kitty_tools_enabled` above; these 7 tools also
+    /// used to live in `replacement-mcp`.
+    #[serde(default = "default_true")]
+    pub kitty_docs_web_enabled: bool,
+    #[serde(default)]
+    pub kitty_docs_web_default_migrated: bool,
     /// User-defined scheduled tasks (instructions the agent runs later,
     /// one-shot or recurring, with or without the app open) — see
     /// `scheduled_tasks::ScheduledTask`.
@@ -213,6 +245,14 @@ pub struct Config {
     /// this is the one place these settings need to exist on the Kitty side.
     #[serde(default)]
     pub summarizer: SummarizerSettings,
+    /// BigTiny context-window/compaction budget settings, relayed as
+    /// `BIGTINY_TOKEN_MANAGEMENT__*` env vars at spawn (same mechanism and
+    /// rationale as `summarizer` above). `#[serde(default)]` covers loading
+    /// a pre-existing config file that predates this field — no explicit
+    /// migration function needed, unlike the value-changing `migrate_*`
+    /// functions in `load` below.
+    #[serde(default)]
+    pub token_management: TokenManagementSettings,
 }
 
 /// See `Config::summarizer`. Field names/defaults mirror BigTiny's own
@@ -235,6 +275,31 @@ impl Default for SummarizerSettings {
             enabled: true,
             model: "qwen3.5:0.8b".to_string(),
             keep_alive: "5m".to_string(),
+        }
+    }
+}
+
+/// See `Config::token_management`. Field names/defaults mirror BigTiny's own
+/// `TokenManagementConfig` (`plugins/bigtiny/bigtiny/config.py`) so the two
+/// don't drift apart, but this is Kitty's independent copy — BigTiny's
+/// Python defaults still apply if the daemon is ever launched without these
+/// env vars set at all (e.g. a source checkout run directly, bypassing
+/// Kitty).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TokenManagementSettings {
+    pub max_context_tokens: u32,
+    pub max_live_tail_tokens: u32,
+    pub message_mask_head_lines: u32,
+    pub message_mask_tail_lines: u32,
+}
+
+impl Default for TokenManagementSettings {
+    fn default() -> Self {
+        Self {
+            max_context_tokens: 64000,
+            max_live_tail_tokens: 24000,
+            message_mask_head_lines: 10,
+            message_mask_tail_lines: 10,
         }
     }
 }
@@ -275,6 +340,13 @@ impl Default for Config {
             wasm_math_mcp_enabled: default_true(),
             brave_mcp_search_enabled: false,
             visualizations_enabled: default_true(),
+            kitty_tools_enabled: default_true(),
+            // A brand-new config needs no carry-forward, so it starts
+            // already-migrated — same reasoning as
+            // `replacement_mcp_default_migrated` above.
+            kitty_tools_default_migrated: true,
+            kitty_docs_web_enabled: default_true(),
+            kitty_docs_web_default_migrated: true,
             scheduled_tasks: Vec::new(),
             ollama_enabled: default_true(),
             bigtiny_command: default_bigtiny_command(),
@@ -282,6 +354,7 @@ impl Default for Config {
             bigtiny_dir: None,
             recipes: recipes::builtin_templates(),
             summarizer: SummarizerSettings::default(),
+            token_management: TokenManagementSettings::default(),
         }
     }
 }
@@ -513,9 +586,9 @@ pub fn load() -> Result<Config, ConfigError> {
     match fs::read_to_string(&path) {
         Ok(text) => {
             let config: Config = serde_json::from_str(&text)?;
-            Ok(migrate_replacement_mcp_enabled(migrate_ap_db_path(
-                migrate_bigtiny_launch_command(migrate_ap_launch_command(migrate_recipes(
-                    migrate_hotkeys(config, &text),
+            Ok(migrate_kitty_split_enabled(migrate_replacement_mcp_enabled(
+                migrate_ap_db_path(migrate_bigtiny_launch_command(migrate_ap_launch_command(
+                    migrate_recipes(migrate_hotkeys(config, &text)),
                 ))),
             )))
         }
@@ -656,6 +729,28 @@ fn migrate_replacement_mcp_enabled(mut config: Config) -> Config {
     if !config.replacement_mcp_default_migrated {
         config.replacement_mcp_enabled = true;
         config.replacement_mcp_default_migrated = true;
+    }
+    config
+}
+
+/// One-time carry-forward for the `kitty-tools`/`kitty-docs-web` split: the
+/// Word tools and the PDF/Excel/web/search tools both used to live in
+/// `replacement-mcp`, gated by the single `replacement_mcp_enabled` flag.
+/// Splitting them into their own servers with their own toggles must not
+/// silently change what's enabled for an existing install — an install that
+/// had `replacement_mcp_enabled: false` must land on both new flags `false`
+/// too, and one that had it `true` must land on both `true`. Runs *after*
+/// `migrate_replacement_mcp_enabled` so it reads that flag's already-settled
+/// value, not a stale pre-migration one. Guarded the same one-shot way: a
+/// user who later flips either new flag independently keeps that choice.
+fn migrate_kitty_split_enabled(mut config: Config) -> Config {
+    if !config.kitty_tools_default_migrated {
+        config.kitty_tools_enabled = config.replacement_mcp_enabled;
+        config.kitty_tools_default_migrated = true;
+    }
+    if !config.kitty_docs_web_default_migrated {
+        config.kitty_docs_web_enabled = config.replacement_mcp_enabled;
+        config.kitty_docs_web_default_migrated = true;
     }
     config
 }
@@ -1107,6 +1202,51 @@ mod tests {
         let cfg = Config::default();
         assert!(cfg.replacement_mcp_enabled);
         assert!(cfg.replacement_mcp_default_migrated);
+    }
+
+    #[test]
+    fn kitty_split_carries_forward_a_disabled_replacement_mcp() {
+        // Pre-split shape: replacement_mcp_enabled already migrated to
+        // false (a deliberate opt-out), no kitty-tools/kitty-docs-web keys
+        // at all. Both new flags must land on false too, not the container
+        // `default_true`.
+        let cfg: Config = serde_json::from_str(
+            r#"{"replacement_mcp_enabled":false,"replacement_mcp_default_migrated":true}"#,
+        )
+        .unwrap();
+        let migrated = migrate_kitty_split_enabled(migrate_replacement_mcp_enabled(cfg));
+        assert!(!migrated.kitty_tools_enabled);
+        assert!(!migrated.kitty_docs_web_enabled);
+        assert!(migrated.kitty_tools_default_migrated);
+        assert!(migrated.kitty_docs_web_default_migrated);
+    }
+
+    #[test]
+    fn kitty_split_carries_forward_an_enabled_replacement_mcp() {
+        let cfg: Config = serde_json::from_str(r#"{}"#).unwrap();
+        let migrated = migrate_kitty_split_enabled(migrate_replacement_mcp_enabled(cfg));
+        assert!(migrated.kitty_tools_enabled);
+        assert!(migrated.kitty_docs_web_enabled);
+    }
+
+    #[test]
+    fn kitty_split_respects_an_opt_out_made_after_its_own_migration() {
+        let cfg: Config = serde_json::from_str(
+            r#"{"kitty_tools_enabled":false,"kitty_tools_default_migrated":true,"kitty_docs_web_enabled":true,"kitty_docs_web_default_migrated":true}"#,
+        )
+        .unwrap();
+        let migrated = migrate_kitty_split_enabled(migrate_replacement_mcp_enabled(cfg));
+        assert!(!migrated.kitty_tools_enabled);
+        assert!(migrated.kitty_docs_web_enabled);
+    }
+
+    #[test]
+    fn kitty_split_is_on_for_a_brand_new_config() {
+        let cfg = Config::default();
+        assert!(cfg.kitty_tools_enabled);
+        assert!(cfg.kitty_docs_web_enabled);
+        assert!(cfg.kitty_tools_default_migrated);
+        assert!(cfg.kitty_docs_web_default_migrated);
     }
 
     #[test]

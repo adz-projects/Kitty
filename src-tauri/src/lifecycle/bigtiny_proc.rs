@@ -110,6 +110,7 @@ pub async fn spawn(
     args: &[String],
     dir: Option<&str>,
     summarizer: &crate::config::SummarizerSettings,
+    token_management: &crate::config::TokenManagementSettings,
 ) -> Result<DaemonHandle, String> {
     kill_stale_orphan();
 
@@ -133,6 +134,22 @@ pub async fn spawn(
         )
         .env("BIGTINY_SUMMARIZER__MODEL", &summarizer.model)
         .env("BIGTINY_SUMMARIZER__KEEP_ALIVE", &summarizer.keep_alive)
+        .env(
+            "BIGTINY_TOKEN_MANAGEMENT__MAX_CONTEXT_TOKENS",
+            token_management.max_context_tokens.to_string(),
+        )
+        .env(
+            "BIGTINY_TOKEN_MANAGEMENT__MAX_LIVE_TAIL_TOKENS",
+            token_management.max_live_tail_tokens.to_string(),
+        )
+        .env(
+            "BIGTINY_TOKEN_MANAGEMENT__MESSAGE_MASK_HEAD_LINES",
+            token_management.message_mask_head_lines.to_string(),
+        )
+        .env(
+            "BIGTINY_TOKEN_MANAGEMENT__MESSAGE_MASK_TAIL_LINES",
+            token_management.message_mask_tail_lines.to_string(),
+        )
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     // Consolidates BigTiny's db/cache-sandbox-root/recipes under
@@ -153,8 +170,10 @@ pub async fn spawn(
     capture_output(&mut child, "bigtiny");
 
     let client = crate::util::http_client();
+    let mut healthy = false;
     for _ in 0..60 {
         if probe_health(&client, port).await {
+            healthy = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
@@ -167,6 +186,7 @@ pub async fn spawn(
         },
         port: Some(port),
         secret_key: Some(secret),
+        healthy,
     })
 }
 

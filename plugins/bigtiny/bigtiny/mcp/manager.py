@@ -8,6 +8,7 @@ from typing import Any
 from uuid import uuid4
 
 import httpx
+from bigtiny.network import PreferDirectTransport, TailscaleClient
 from bigtiny.models.mcp_server import (
     MCPServerConfig,
     ToolDefinition,
@@ -28,8 +29,9 @@ class MCPServerError(Exception):
 
 
 class MCPServerClient:
-    def __init__(self, config: MCPServerConfig):
+    def __init__(self, config: MCPServerConfig, tailscale: TailscaleClient | None = None):
         self.config = config
+        self.tailscale = tailscale
         self._process: asyncio.subprocess.Process | None = None
         self._http_client: httpx.AsyncClient | None = None
         self._reader: asyncio.StreamReader | None = None
@@ -122,8 +124,9 @@ class MCPServerClient:
         self._stdio_reader_task = asyncio.create_task(self._stdio_reader_loop())
 
     async def _init_sse(self) -> None:
+        transport = PreferDirectTransport(self.tailscale) if self.tailscale is not None else None
         self._http_client = httpx.AsyncClient(
-            timeout=httpx.Timeout(30.0), headers=self.config.headers or {}
+            timeout=httpx.Timeout(30.0), headers=self.config.headers or {}, transport=transport
         )
         url = self.config.url or ""
         self._sse_endpoint = url
@@ -131,8 +134,9 @@ class MCPServerClient:
         self._listener_task = asyncio.create_task(self._sse_listener())
 
     async def _init_streamable_http(self) -> None:
+        transport = PreferDirectTransport(self.tailscale) if self.tailscale is not None else None
         self._http_client = httpx.AsyncClient(
-            timeout=httpx.Timeout(30.0), headers=self.config.headers or {}
+            timeout=httpx.Timeout(30.0), headers=self.config.headers or {}, transport=transport
         )
         self._streamable_url = self.config.url or ""
 
@@ -489,8 +493,9 @@ class MCPServerClient:
 
 
 class MCPManager:
-    def __init__(self, db: Database):
+    def __init__(self, db: Database, tailscale: TailscaleClient | None = None):
         self.db = db
+        self.tailscale = tailscale
         self._servers: dict[str, MCPServerClient] = {}
         self._tool_registry: dict[str, ToolDefinition] = {}
 
@@ -515,7 +520,7 @@ class MCPManager:
         if row.get("headers"):
             config.headers = json.loads(row["headers"])
 
-        client = MCPServerClient(config)
+        client = MCPServerClient(config, tailscale=self.tailscale)
         try:
             await asyncio.wait_for(client.initialize(), timeout=60)
         except asyncio.TimeoutError:

@@ -10,6 +10,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from bigtiny.config import load_config
+from bigtiny.network import TailscaleClient
 from bigtiny.storage import Database
 from bigtiny.providers.router import ProviderRouter
 from bigtiny.mcp.manager import MCPManager
@@ -53,10 +54,16 @@ async def lifespan(app: FastAPI):
     db = Database()
     await db.connect()
 
-    mcp = MCPManager(db)
+    # Lazy — costs nothing at startup, degrades to a silent no-op if the
+    # Tailscale daemon isn't running. Shared with MCPManager below so both
+    # providers and remote MCP servers benefit from the same peer/resolved-
+    # address cache instead of each maintaining their own.
+    tailscale = TailscaleClient()
+
+    mcp = MCPManager(db, tailscale=tailscale)
     await mcp.connect_all()
 
-    router = ProviderRouter(db)
+    router = ProviderRouter(db, tailscale=tailscale)
     await router.load_providers()
 
     hitl = HITLManager(db, config.hitl)
@@ -88,6 +95,7 @@ async def lifespan(app: FastAPI):
     app.state.scheduler = scheduler
     app.state.config = config
     app.state.startup_time = time.time()
+    app.state.tailscale = tailscale
 
     await scheduler.start()
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -172,6 +173,72 @@ def apply_tool_mask(
     return out
 
 
+_FENCE_RE = re.compile(r"```[^\n]*\n.*?\n```", re.DOTALL)
+
+
+def _mask_code_block(fence_block: str, head_lines: int, tail_lines: int) -> str:
+    """Masks one ```...``` fenced block (including its fences) down to its
+    head_lines + tail_lines, keeping the opening fence line (fence + optional
+    language tag) and the closing fence untouched. Assumes `fence_block`
+    already matched `_FENCE_RE`, so it starts with ``` and ends with ```."""
+    lines = fence_block.split("\n")
+    opening, closing = lines[0], lines[-1]
+    body = lines[1:-1]
+    if len(body) <= head_lines + tail_lines:
+        return fence_block
+    elided = len(body) - head_lines - tail_lines
+    kept = (
+        body[:head_lines]
+        + [f"[...{elided} lines elided...]"]
+        + (body[len(body) - tail_lines :] if tail_lines else [])
+    )
+    return "\n".join([opening, *kept, closing])
+
+
+def apply_content_mask(
+    messages: list[dict[str, Any]],
+    reserve_floor_rowid: int,
+    cfg: TokenManagementConfig,
+) -> list[dict[str, Any]]:
+    """Tier 1: deterministic, zero-LLM-cost masking of large fenced code
+    blocks inside `user`/`assistant` message content. Same eligibility rule
+    and KV-cache-stability contract as `apply_tool_mask` (masks only
+    messages whose rowid has aged past the reserve floor, and does so
+    identically on every subsequent render), applied to a different
+    surface: users/assistants pasting large code blocks, not tool output.
+
+    Prose outside fences and single-backtick inline code are left untouched
+    — only content between matched ```-fences is a masking candidate.
+    """
+    head, tail = cfg.message_mask_head_lines, cfg.message_mask_tail_lines
+    out: list[dict[str, Any]] = []
+    for msg in messages:
+        if (
+            msg.get("role") not in ("user", "assistant")
+            or msg.get("rowid") is None
+            or msg["rowid"] >= reserve_floor_rowid
+            or not isinstance(msg.get("content"), str)
+        ):
+            out.append(msg)
+            continue
+
+        content = msg["content"]
+        if "```" not in content:
+            out.append(msg)
+            continue
+
+        masked_content = _FENCE_RE.sub(
+            lambda m: _mask_code_block(m.group(0), head, tail), content
+        )
+        if masked_content == content:
+            out.append(msg)
+        else:
+            masked = dict(msg)
+            masked["content"] = masked_content
+            out.append(masked)
+    return out
+
+
 def group_into_exchanges(rows: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
     """Groups rows into exchanges: each exchange starts at a `role="user"`
     message and runs up to (but not including) the next one. This is a safe
@@ -304,7 +371,9 @@ async def run_compaction(
         # a threshold — the same optimization applied to the per-turn
         # emergency-valve check in context_manager.py's build_messages.
         total_tokens = sum((r.get("token_count") or 0) for r in rows)
-        high_water = context_length * token_cfg.compaction_threshold
+        high_water = max(
+            token_cfg.min_compaction_tokens, context_length * token_cfg.compaction_threshold
+        )
         if total_tokens <= high_water:
             return None
 

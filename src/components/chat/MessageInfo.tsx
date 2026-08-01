@@ -60,6 +60,25 @@ export function MessageInfo({ message }: { message: Message }) {
               {message.outputTokens} out
             </div>
           )}
+          {message.ttftMs != null && (
+            <div>
+              <span className="muted">Time to first token:</span> {(message.ttftMs / 1000).toFixed(2)}s
+            </div>
+          )}
+          {message.ttftMs != null &&
+            message.durationMs != null &&
+            message.outputTokens != null &&
+            message.outputTokens > 0 &&
+            message.durationMs > message.ttftMs && (
+              <div>
+                <span className="muted">Generation speed:</span>{' '}
+                {(
+                  (message.outputTokens / (message.durationMs - message.ttftMs)) *
+                  1000
+                ).toFixed(1)}{' '}
+                tok/s
+              </div>
+            )}
         </div>
       )}
     </div>

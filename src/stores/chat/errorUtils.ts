@@ -9,8 +9,19 @@ import type { Message } from './types';
     similar wire-protocol text) showed up with no explanation of what
     happened or what to do about it. Pattern-matched, not exhaustive — an
     unrecognized error still gets a generic-but-plain fallback rather than
-    the raw string as the headline. */
-export function humanizeChatError(raw: string): string {
+    the raw string as the headline.
+
+    `errorType`, when present, is BigTiny's own classification of a
+    `provider_error` event (see `classify_provider_error` on the backend) and
+    takes priority over the string-matching below, which exists for legacy/
+    unclassified errors (transport failures, cancellations, etc.). */
+export function humanizeChatError(raw: string, errorType?: string): string {
+  if (errorType === 'context_exceeded') {
+    return "The conversation has exceeded the model's context limit. Try starting a new session or enabling compaction to summarize older messages.";
+  }
+  if (errorType === 'insufficient_credits') {
+    return "Your API credits are exhausted. Check your provider's billing settings or switch to another provider.";
+  }
   const r = raw.toLowerCase();
   if (r.includes('timed out')) {
     return 'The response took too long and Kitty gave up waiting. Try sending again.';

@@ -29,6 +29,10 @@ export interface Message {
   durationMs?: number;
   inputTokens?: number;
   outputTokens?: number;
+  /** Time to first token, from BigTiny's `llm_timing` event — the call that
+      produced this message's final visible text. Same completeness caveat
+      as the other metrics fields: only set on a message from a live send(). */
+  ttftMs?: number;
   providerName?: string;
   /** The actual model that generated this message (Round-4 info button) —
       captured at send time, not read back from the live chat-pill state. */

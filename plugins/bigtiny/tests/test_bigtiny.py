@@ -288,7 +288,7 @@ class TestConfig:
     def test_default_config(self, config):
         assert config.server.port == 8080
         assert config.server.host == "127.0.0.1"
-        assert config.token_management.max_context_tokens == 128000
+        assert config.token_management.max_context_tokens == 64000
         assert config.hitl.default_policy == "always_ask"
         assert config.fallback.mode == "priority"
         assert config.logging.level == "info"

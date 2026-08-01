@@ -146,6 +146,12 @@ interface ChatState {
       final render is one clean paint instead of hundreds of incremental ones. */
   replaying: boolean;
   error: string | null;
+  /** Structured classification of `error`, set only by `onChatError` (a
+      BigTiny `provider_error` event) — e.g. "context_exceeded" |
+      "insufficient_credits". Kept separate from `error` rather than
+      changing its shape, since ~30 call sites set `error: String(e)` from
+      plain catch blocks and have no classification to offer. */
+  errorType: string | null;
   // Active-provider derived state (Phase 9/10)
   providerTier: NetworkTier | null;
   providerHost: string | null;
@@ -675,6 +681,7 @@ export const useChatStore = create<ChatState>((set, get) => {
     sessionConcluded: false,
     replaying: false,
     error: null,
+    errorType: null,
     providerTier: null,
     providerHost: null,
     providerOffline: false,
@@ -854,6 +861,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         modeOverride: null,
         savedApprovalMode: null,
         error: null,
+        errorType: null,
         providerOffline: false,
         busy: false,
         stopPhase: null,
@@ -916,6 +924,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         modeOverride: null,
         savedApprovalMode: null,
         error: null,
+        errorType: null,
         providerOffline: false,
         busy: false,
         sessionProviderId: null,
@@ -1003,6 +1012,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         modeOverride: null,
         savedApprovalMode: null,
         error: null,
+        errorType: null,
         providerOffline: false,
         busy: true,
         replaying: true,
@@ -1345,6 +1355,7 @@ export const useChatStore = create<ChatState>((set, get) => {
           messages: msgs,
           busy: true,
           error: null,
+          errorType: null,
           providerOffline: false,
           stopPhase: null,
           abandonedSession: null,
@@ -1527,6 +1538,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         pendingImages: [],
         busy: true,
         error: null,
+        errorType: null,
         // Optimistic clear: a stale "can't reach the provider" banner from a
         // previous failure should not persist across a fresh send attempt —
         // this is the actual fix for the "stuck until restart" bug, since
@@ -1827,6 +1839,7 @@ export const useChatStore = create<ChatState>((set, get) => {
             modeOverride: null,
             savedApprovalMode: null,
             error: null,
+            errorType: null,
             providerOffline: false,
             busy: false,
             stopPhase: null,
@@ -1870,6 +1883,7 @@ export const useChatStore = create<ChatState>((set, get) => {
             modeOverride: null,
             savedApprovalMode: null,
             error: null,
+            errorType: null,
             providerOffline: false,
             busy: false,
             stopPhase: null,
@@ -1962,6 +1976,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         lastSentProvider = null;
         lastSentModel = null;
         const usage = e.result.usage;
+        const ttftMs = e.result.timing?.ttftMs;
         // Read before the set() below clears it — see `pendingForcedAnswer`'s
         // doc comment: there's no ACP way to redirect a generation already in
         // flight to its final answer, so a reasoning-cap cancel instead waits
@@ -1978,6 +1993,7 @@ export const useChatStore = create<ChatState>((set, get) => {
               durationMs,
               inputTokens: usage?.inputTokens,
               outputTokens: usage?.outputTokens,
+              ttftMs,
               providerName,
               model,
             };
@@ -2003,6 +2019,7 @@ export const useChatStore = create<ChatState>((set, get) => {
           busy: false,
           stopPhase: null,
           error: e.message,
+          errorType: e.error_type ?? null,
           pendingApprovals: [],
           messages: closeOpen(s.messages),
           loopSuspected: false,

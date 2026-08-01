@@ -14,6 +14,7 @@ import pytest
 
 from bigtiny.agent.compaction import (
     CompactionResult,
+    apply_content_mask,
     apply_tool_mask,
     consolidate_slot_if_needed,
     emergency_trim,
@@ -23,6 +24,7 @@ from bigtiny.agent.compaction import (
     render_memory_block,
     run_compaction,
 )
+from bigtiny.agent.context_manager import ContextManager
 from bigtiny.config import SummarizerConfig, TokenManagementConfig
 from bigtiny.providers.summarizer_client import SummarizerError
 from bigtiny.storage import Database
@@ -49,8 +51,14 @@ def db():
 def token_cfg():
     return TokenManagementConfig(
         max_context_tokens=1000,
-        compaction_threshold=0.8,
-        compaction_target_ratio=0.5,
+        compaction_threshold=0.6,
+        compaction_target_ratio=0.4,
+        # Explicitly zeroed: these run_compaction tests exercise the
+        # threshold/target_ratio math against a deliberately tiny
+        # max_context_tokens, and the new global default (16000) would
+        # swamp that — the floor's own behavior has a dedicated test below.
+        min_compaction_tokens=0,
+        max_live_tail_tokens=1000,
     )
 
 
@@ -434,3 +442,164 @@ async def test_run_compaction_disabled_summarizer_is_noop(db, session_id, token_
     result = await run_compaction(session_id, db, fake, token_cfg, cfg, context_length=1000)
     assert result is None
     assert fake.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_run_compaction_min_compaction_tokens_floor_defers_a_small_window(
+    db, session_id, summarizer_cfg
+):
+    """high_water = max(min_compaction_tokens, context_length * threshold) —
+    for a small window, the threshold-derived value alone would fire early;
+    the floor raises the bar so compaction only runs once total tokens
+    actually reach min_compaction_tokens."""
+    cfg = TokenManagementConfig(
+        max_context_tokens=1000,
+        compaction_threshold=0.6,  # threshold-derived high-water = 600
+        compaction_target_ratio=0.4,
+        min_compaction_tokens=2000,  # floor is higher than the threshold value
+    )
+    await _make_session(db, session_id)
+    for i in range(10):
+        # ~1000 total tokens: above the threshold-derived 600, below the 2000 floor.
+        await _insert_message(db, session_id, "user", "u" * 200)
+        await _insert_message(db, session_id, "assistant", "a" * 200)
+
+    fake = FakeSummarizer()
+    result = await run_compaction(session_id, db, fake, cfg, summarizer_cfg, context_length=1000)
+    assert result is None
+    assert fake.calls == 0
+
+    # Push total tokens past the floor — compaction must now fire.
+    for i in range(12):
+        await _insert_message(db, session_id, "user", "u" * 200)
+        await _insert_message(db, session_id, "assistant", "a" * 200)
+    result = await run_compaction(session_id, db, fake, cfg, summarizer_cfg, context_length=1000)
+    assert result is not None
+    assert fake.calls == 1
+
+
+# ---------------------------------------------------------------------------
+# apply_content_mask: code-block masking
+# ---------------------------------------------------------------------------
+
+def _content_cfg(head: int = 2, tail: int = 2) -> TokenManagementConfig:
+    return TokenManagementConfig(message_mask_head_lines=head, message_mask_tail_lines=tail)
+
+
+def test_apply_content_mask_leaves_prose_outside_code_fences_untouched():
+    prose = "This is a long explanation. " * 20
+    rows = [{"rowid": 1, "role": "assistant", "content": prose}]
+    masked = apply_content_mask(rows, reserve_floor_rowid=5, cfg=_content_cfg())
+    assert masked[0]["content"] == prose
+
+
+def test_apply_content_mask_truncates_large_code_block_to_head_and_tail_lines():
+    body_lines = [f"line{i}" for i in range(20)]
+    content = "before\n```python\n" + "\n".join(body_lines) + "\n```\nafter"
+    rows = [{"rowid": 1, "role": "assistant", "content": content}]
+    masked = apply_content_mask(rows, reserve_floor_rowid=5, cfg=_content_cfg(head=2, tail=2))
+    out = masked[0]["content"]
+    assert "line0" in out and "line1" in out
+    assert "line18" in out and "line19" in out
+    assert "line10" not in out  # a middle line must be elided
+    assert "elided" in out
+    assert out.startswith("before\n```python")
+    assert out.endswith("```\nafter")
+
+
+def test_apply_content_mask_preserves_balanced_fences():
+    body_lines = [f"line{i}" for i in range(20)]
+    content = "```js\n" + "\n".join(body_lines) + "\n```"
+    rows = [{"rowid": 1, "role": "assistant", "content": content}]
+    masked = apply_content_mask(rows, reserve_floor_rowid=5, cfg=_content_cfg())
+    out = masked[0]["content"]
+    assert out.count("```") == 2
+    assert out.startswith("```js\n")
+    assert out.endswith("```")
+
+
+def test_apply_content_mask_skips_reserved_messages_at_or_past_reserve_floor():
+    body_lines = [f"line{i}" for i in range(20)]
+    content = "```\n" + "\n".join(body_lines) + "\n```"
+    rows = [{"rowid": 10, "role": "assistant", "content": content}]
+    masked = apply_content_mask(rows, reserve_floor_rowid=10, cfg=_content_cfg())
+    assert masked[0]["content"] == content
+
+
+def test_apply_content_mask_skips_short_blocks_under_masking_threshold():
+    content = "```\nline1\nline2\n```"
+    rows = [{"rowid": 1, "role": "assistant", "content": content}]
+    masked = apply_content_mask(rows, reserve_floor_rowid=5, cfg=_content_cfg(head=5, tail=5))
+    assert masked[0]["content"] == content
+
+
+def test_apply_content_mask_handles_multiple_code_blocks_independently():
+    body_lines = [f"line{i}" for i in range(20)]
+    block = "```\n" + "\n".join(body_lines) + "\n```"
+    content = f"first block:\n{block}\n\nsecond block:\n{block}\n"
+    rows = [{"rowid": 1, "role": "assistant", "content": content}]
+    masked = apply_content_mask(rows, reserve_floor_rowid=5, cfg=_content_cfg(head=2, tail=2))
+    out = masked[0]["content"]
+    assert out.count("elided") == 2
+    assert "first block:" in out and "second block:" in out
+
+
+def test_apply_content_mask_leaves_single_backtick_inline_code_untouched():
+    content = "Use `some_inline_code_reference()` in the body. " * 10
+    rows = [{"rowid": 1, "role": "assistant", "content": content}]
+    masked = apply_content_mask(rows, reserve_floor_rowid=5, cfg=_content_cfg())
+    assert masked[0]["content"] == content
+
+
+def test_apply_content_mask_ignores_non_user_assistant_roles():
+    body_lines = [f"line{i}" for i in range(20)]
+    content = "```\n" + "\n".join(body_lines) + "\n```"
+    rows = [{"rowid": 1, "role": "tool", "content": content, "tool_call_id": "t1"}]
+    masked = apply_content_mask(rows, reserve_floor_rowid=5, cfg=_content_cfg())
+    assert masked[0]["content"] == content
+
+
+# ---------------------------------------------------------------------------
+# Live-tail budget (ContextManager._enforce_live_tail_budget)
+# ---------------------------------------------------------------------------
+
+def test_live_tail_budget_phase_a_compresses_tool_messages_to_elision_markers():
+    cfg = TokenManagementConfig(max_live_tail_tokens=50, tool_mask_head=400, tool_mask_tail=400)
+    cm = ContextManager(db=None, config=cfg, reserve_exchanges=3)
+    live_messages = [
+        {"rowid": 1, "role": "user", "content": "do the thing"},
+        {"rowid": 2, "role": "assistant", "content": "", "tool_calls": [{"id": "t1"}]},
+        {"rowid": 3, "role": "tool", "content": "x" * 2000, "tool_call_id": "t1"},
+    ]
+    # reserve_floor above every rowid here -> everything is eligible for
+    # Phase A's zero-head/tail tool mask.
+    out = cm._enforce_live_tail_budget(live_messages, reserve_floor=100)
+    tool_msg = next(m for m in out if m["role"] == "tool")
+    assert "elided" in tool_msg["content"]
+    assert len(tool_msg["content"]) < 2000
+    # Pairing preserved — Phase A only rewrites content, never drops messages.
+    assert len(out) == 3
+
+
+def test_live_tail_budget_phase_b_drops_exchanges_when_phase_a_insufficient():
+    cfg = TokenManagementConfig(max_live_tail_tokens=1, tool_mask_head=0, tool_mask_tail=0)
+    cm = ContextManager(db=None, config=cfg, reserve_exchanges=3)
+    live_messages = [
+        {"rowid": 1, "role": "user", "content": "u" * 400},
+        {"rowid": 2, "role": "assistant", "content": "a" * 400},
+        {"rowid": 3, "role": "user", "content": "recent"},
+    ]
+    # reserve_floor=3: exchange [1,2] is eligible for dropping, [3] reserved.
+    out = cm._enforce_live_tail_budget(live_messages, reserve_floor=3)
+    rowids = {m["rowid"] for m in out if "rowid" in m}
+    assert 3 in rowids
+    assert not ({1, 2} & rowids)
+    assert any(m.get("role") == "system" and "elided" in m.get("content", "") for m in out)
+
+
+def test_live_tail_budget_noop_when_under_budget():
+    cfg = TokenManagementConfig(max_live_tail_tokens=100_000)
+    cm = ContextManager(db=None, config=cfg, reserve_exchanges=3)
+    live_messages = [{"rowid": 1, "role": "user", "content": "short"}]
+    out = cm._enforce_live_tail_budget(live_messages, reserve_floor=100)
+    assert out == live_messages
