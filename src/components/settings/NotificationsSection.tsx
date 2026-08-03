@@ -10,7 +10,7 @@ const EVENTS: { key: keyof NotificationPrefs; label: string }[] = [
 
 /** Per-event notification toggles (fired only when the overlay is hidden). */
 export function NotificationsSection() {
-  const { draft, update, save, saved } = useConfigDraft();
+  const { draft, update, save, saved, error } = useConfigDraft();
   if (!draft) return <p className="muted">Loading…</p>;
 
   return (
@@ -34,6 +34,7 @@ export function NotificationsSection() {
           Save
         </button>
         {saved && <span className="muted">Saved.</span>}
+        {error && <span className="error">Couldn't save: {error}</span>}
       </div>
     </section>
   );

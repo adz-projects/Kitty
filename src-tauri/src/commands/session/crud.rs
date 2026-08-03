@@ -231,7 +231,11 @@ pub async fn delete_session(
 /// is a direct user overwrite, and BigTiny never re-derives a title once one
 /// is set, so a manual rename sticks.
 #[tauri::command]
-pub async fn rename_session(app: AppHandle, session_id: String, title: String) -> Result<(), String> {
+pub async fn rename_session(
+    app: AppHandle,
+    session_id: String,
+    title: String,
+) -> Result<(), String> {
     crate::bigtiny::sessions::rename(&app, &session_id, &title).await
 }
 

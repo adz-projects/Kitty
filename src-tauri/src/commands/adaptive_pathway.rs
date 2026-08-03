@@ -4,9 +4,11 @@
 //! `crate::adaptive_pathway` for the plain-HTTP client functions and
 //! `crate::lifecycle::adaptive_pathway_proc` for process supervision.
 
+use serde::Serialize;
 use serde_json::Value;
 use tauri::{AppHandle, Manager};
 
+use crate::bigtiny::mcp::McpServer;
 use crate::config;
 use crate::lifecycle;
 use crate::lifecycle::adaptive_pathway_proc::{self, AdaptivePathwayStatus, EmbeddingModelStatus};
@@ -53,6 +55,46 @@ pub fn get_adaptive_pathway_embedding_status(
         .adaptive_pathway_embedding_status
         .lock()
         .unwrap())
+}
+
+/// Connection status of the `adaptive-pathway` stdio MCP server inside BigTiny
+/// — distinct from `get_adaptive_pathway_status` (which is the HTTP *sidecar*'s
+/// health). The sidecar can be up while its MCP server's tools are absent from
+/// the LLM tool list (a connect failure at registration), so this surfaces the
+/// daemon-side row's `status`/`error_message` to make that drift visible.
+/// `Ok(None)` when the row doesn't exist yet (e.g. BigTiny not yet synced).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct AdaptivePathwayMcpStatus {
+    pub status: String,
+    pub error_message: Option<String>,
+    pub tool_count: usize,
+}
+
+#[tauri::command]
+pub async fn get_adaptive_pathway_mcp_status(app: AppHandle) -> Result<Option<AdaptivePathwayMcpStatus>, String> {
+    let client = crate::bigtiny::client::ensure_client(&app)?;
+    let servers = crate::bigtiny::mcp::list_servers(&client).await?;
+    let Some(ap) = servers.into_iter().find(|s| s.name == "adaptive-pathway") else {
+        // Not yet registered (fresh start or daemon syncing) — not an error.
+        return Ok(None);
+    };
+    Ok(Some(AdaptivePathwayMcpStatus {
+        status: ap.status.clone(),
+        error_message: ap.error_message.clone(),
+        tool_count: ap_tool_count(&client, &ap).await,
+    }))
+}
+
+/// Best-effort count of tools BigTiny has registered for the AP server — the
+/// number the LLM can actually call (0 = tools missing from the tool list).
+async fn ap_tool_count(client: &crate::bigtiny::client::BigTinyClient, ap: &McpServer) -> usize {
+    client
+        .get_json(&format!("/api/mcp/servers/{}/tools", ap.id))
+        .await
+        .ok()
+        .and_then(|v| v.get("tools").and_then(|t| t.as_array()).map(|a| a.len()))
+        .unwrap_or(0)
 }
 
 /// Restart the sidecar if we own the process (else the user must restart it).

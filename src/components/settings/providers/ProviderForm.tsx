@@ -43,6 +43,7 @@ export function ProviderForm({
   useEffect(() => {
     if (!ollamaLocal) return;
     let live = true;
+    // Best-effort: a failure just leaves this dropdown empty.
     void ipc
       .ollamaListModels()
       .then((m) => live && setInstalled(m))
@@ -60,9 +61,15 @@ export function ProviderForm({
   useEffect(() => {
     let live = true;
     setSuggested(null);
-    void suggestContextLength(profile).then((v) => live && setSuggested(v));
+    // Debounced: modelsKey changes on every keystroke in the Models field, and
+    // suggestContextLength hits a live backend lookup — without this, typing
+    // one model name fires a round-trip per character.
+    const timer = setTimeout(() => {
+      void suggestContextLength(profile).then((v) => live && setSuggested(v));
+    }, 400);
     return () => {
       live = false;
+      clearTimeout(timer);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [profile.provider_type, modelsKey]);
@@ -119,6 +126,14 @@ export function ProviderForm({
         <small className="muted trust-note">
           <TrustBadge tier={tierOf(profile.base_url)} isTrusted={profile.is_trusted} />
         </small>
+        {tierOf(profile.base_url) === 'personal' && (
+          <small className="muted">
+            This is a Tailscale address, so one URL works both at home and away: BigTiny
+            automatically tries a direct LAN connection first when you&rsquo;re on the same network
+            as the server, and falls back to routing over Tailscale otherwise — no need to switch
+            URLs manually.
+          </small>
+        )}
       </label>
 
       {ollamaLocal ? (
@@ -246,6 +261,29 @@ export function ProviderForm({
             </small>
           </label>
 
+          <label className="field">
+            <span>Parallel slots (optional — for llama-server prompt-cache pinning)</span>
+            <input
+              type="number"
+              min={1}
+              step={1}
+              value={profile.parallel_slots ?? ''}
+              placeholder="Not set — no slot pinning"
+              onChange={(e) =>
+                set({
+                  parallel_slots: e.target.value ? Number(e.target.value) : null,
+                })
+              }
+            />
+            <small className="muted">
+              Must exactly match this server&rsquo;s own <code>--parallel</code>/<code>-np</code>{' '}
+              value. When set, each session is pinned to the same KV-cache slot on every turn (via{' '}
+              <code>id_slot</code>) so llama-server&rsquo;s prompt-prefix cache actually hits; a
+              mismatched number doesn&rsquo;t error, it silently thrashes the cache instead. Leave
+              unset for Ollama and anything else that doesn&rsquo;t run a multi-slot llama-server.
+            </small>
+          </label>
+
           {/* Per-provider sampling params (items 27/28), vertical stack so nothing overlaps. */}
           <div className="field param-slider">
             <label className="check">
@@ -269,6 +307,135 @@ export function ProviderForm({
                 <span className="status-badge">{profile.temperature.toFixed(1)}</span>
               </div>
             )}
+          </div>
+
+          <div className="field param-slider">
+            <label className="check">
+              <input
+                type="checkbox"
+                checked={profile.top_p != null}
+                onChange={(e) => set({ top_p: e.target.checked ? 0.8 : null })}
+              />
+              <span>Override top_p</span>
+            </label>
+            {profile.top_p != null && (
+              <div className="row">
+                <input
+                  type="range"
+                  min={0}
+                  max={1}
+                  step={0.05}
+                  value={profile.top_p}
+                  onChange={(e) => set({ top_p: Number(e.target.value) })}
+                />
+                <span className="status-badge">{profile.top_p.toFixed(2)}</span>
+              </div>
+            )}
+          </div>
+
+          <div className="field param-slider">
+            <label className="check">
+              <input
+                type="checkbox"
+                checked={profile.presence_penalty != null}
+                onChange={(e) => set({ presence_penalty: e.target.checked ? 1.0 : null })}
+              />
+              <span>Override presence penalty</span>
+            </label>
+            {profile.presence_penalty != null && (
+              <div className="row">
+                <input
+                  type="range"
+                  min={0}
+                  max={2}
+                  step={0.1}
+                  value={profile.presence_penalty}
+                  onChange={(e) => set({ presence_penalty: Number(e.target.value) })}
+                />
+                <span className="status-badge">{profile.presence_penalty.toFixed(1)}</span>
+              </div>
+            )}
+            <small className="muted">
+              Repetition control. Only applies to self-hosted (Ollama/custom) providers — leaving
+              this unset there doesn&rsquo;t mean &ldquo;off&rdquo;, it means Kitty sends a
+              repetition-safe default, since llama-server&rsquo;s own default disables repetition
+              control entirely and a quantized local model can otherwise loop the same text
+              indefinitely. Set this only to override that default. No effect on hosted providers.
+            </small>
+          </div>
+
+          {(profile.provider_type === 'ollama' || profile.provider_type === 'custom_openai') && (
+            <div className="field param-slider">
+              <label className="check">
+                <input
+                  type="checkbox"
+                  checked={profile.top_k != null}
+                  onChange={(e) => set({ top_k: e.target.checked ? 20 : null })}
+                />
+                <span>Override top_k</span>
+              </label>
+              {profile.top_k != null && (
+                <div className="row">
+                  <input
+                    type="number"
+                    min={0}
+                    step={1}
+                    value={profile.top_k}
+                    onChange={(e) => set({ top_k: Number(e.target.value) })}
+                  />
+                </div>
+              )}
+              <label className="check">
+                <input
+                  type="checkbox"
+                  checked={profile.min_p != null}
+                  onChange={(e) => set({ min_p: e.target.checked ? 0.0 : null })}
+                />
+                <span>Override min_p</span>
+              </label>
+              {profile.min_p != null && (
+                <div className="row">
+                  <input
+                    type="number"
+                    min={0}
+                    max={1}
+                    step={0.01}
+                    value={profile.min_p}
+                    onChange={(e) => set({ min_p: Number(e.target.value) })}
+                  />
+                </div>
+              )}
+              <small className="muted">
+                llama.cpp/Ollama-only sampling knobs — not part of the OpenAI or Anthropic API, so
+                these are only ever sent to a self-hosted endpoint.
+              </small>
+            </div>
+          )}
+
+          <div className="field param-slider">
+            <label className="check">
+              <input
+                type="checkbox"
+                checked={profile.max_tokens != null}
+                onChange={(e) => set({ max_tokens: e.target.checked ? 4096 : null })}
+              />
+              <span>Override max reply length (tokens)</span>
+            </label>
+            {profile.max_tokens != null && (
+              <div className="row">
+                <input
+                  type="number"
+                  min={1}
+                  step={256}
+                  value={profile.max_tokens}
+                  onChange={(e) => set({ max_tokens: Number(e.target.value) })}
+                />
+              </div>
+            )}
+            <small className="muted">
+              Hard cap on one reply. Self-hosted providers get a finite default (4096) even when
+              this is unset, so no single reply can stream forever.
+            </small>
           </div>
 
           <div className="field param-slider">
@@ -303,8 +470,8 @@ export function ProviderForm({
             )}
             {profile.context_length != null && (
               <small className="muted">
-                Used as BigTiny&apos;s max_context_tokens for this provider, overriding the
-                global value in Settings → Advanced.
+                Used as BigTiny&apos;s max_context_tokens for this provider, overriding the global
+                value in Settings → Advanced.
               </small>
             )}
           </div>

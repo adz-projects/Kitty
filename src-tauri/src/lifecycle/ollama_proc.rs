@@ -160,10 +160,16 @@ mod tests {
             is_trusted: true,
             temperature: None,
             top_p: None,
+            top_k: None,
+            min_p: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            max_tokens: None,
             context_length: None,
             strip_reasoning: false,
             system_prompt: None,
             prompt_idle_timeout_secs: None,
+            parallel_slots: None,
             created_at: String::new(),
         });
         cfg.active_provider_id = Some("p1".into());
@@ -178,10 +184,16 @@ mod tests {
             is_trusted: false,
             temperature: None,
             top_p: None,
+            top_k: None,
+            min_p: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            max_tokens: None,
             context_length: None,
             strip_reasoning: false,
             system_prompt: None,
             prompt_idle_timeout_secs: None,
+            parallel_slots: None,
             created_at: String::new(),
         });
         cfg.active_provider_id = Some("p2".into());

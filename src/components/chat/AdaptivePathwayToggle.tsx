@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { ipc } from '@/lib/ipc';
 import { useChatStore } from '@/stores/chatStore';
 import { useAdaptivePathwayStore } from '@/stores/adaptivePathwayStore';
@@ -32,6 +32,14 @@ export function AdaptivePathwayToggle() {
   const sessionId = useChatStore((s) => s.sessionId);
   const status = useAdaptivePathwayStore((s) => s.status);
   const [paused, setPaused] = useState(false);
+
+  // No server GET for per-session pause state (see comment above), but new
+  // sessions always start unpaused — reset local state whenever the session
+  // changes so a paused toggle from a previous session doesn't stick around
+  // on the next one (this component isn't remounted on New Chat, see above).
+  useEffect(() => {
+    setPaused(false);
+  }, [sessionId]);
 
   if (status !== 'ok') return null;
 

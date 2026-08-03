@@ -149,6 +149,22 @@ export function findHintToolCall(msg: Message): ToolCall | undefined {
   return msg.toolCalls.find((t) => t.toolName === 'decide');
 }
 
+/** `kitty-tools`' three visualization tools (`plugins/kitty-tools/src/tools/
+    viz/mod.rs`) render as an inline card in the message body instead of the
+    generic collapsed tool tray — see `VisualizationCard`. Matched on
+    `toolName` alone, same as `findHintToolCall`: these names are frozen
+    (adaptive-pathway's Thompson bandit buckets by literal tool-name string),
+    so this can't silently drift out of sync with a rename. */
+const VISUALIZATION_TOOL_NAMES = new Set([
+  'generate_accessible_svg',
+  'generate_accessible_table',
+  'generate_accessible_chart',
+]);
+
+export function isVisualizationToolCall(call: ToolCall): boolean {
+  return !!call.toolName && VISUALIZATION_TOOL_NAMES.has(call.toolName);
+}
+
 /** Parses a `decide` tool call's `output` (Python-repr text, see `pyrepr.ts`)
     into its hints. Returns `null` on anything unexpected — a malformed or
     still-streaming tool output should never crash message rendering. */

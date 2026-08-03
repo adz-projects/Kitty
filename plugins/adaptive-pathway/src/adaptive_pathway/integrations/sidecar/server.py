@@ -33,6 +33,71 @@ def _quiet_connection_reset_handler(loop, context):
     loop.default_exception_handler(context)
 
 
+def _hint_payload(h):
+    """Full structured hint payload (the MCP layer's job to render into text,
+    not this sidecar's): every field a client could need, in plain JSON."""
+    payload = {
+        "text": h.text,
+        "confidence": h.confidence,
+        "attribution_id": h.attribution_id,
+        "edge_id": h.edge_id,
+        "rationale": getattr(h, "rationale", None),
+        "source_model": getattr(h, "source_model", "standard"),
+    }
+    if hasattr(h, "source_primitive_a"):
+        payload["type"] = "blended"
+        payload["sources"] = [h.source_primitive_a, h.source_primitive_b]
+    else:
+        payload["type"] = "single"
+        payload["primitive"] = getattr(h, "primitive", "")
+        payload["domain"] = getattr(h, "domain", "")
+    return payload
+
+
+def _decision_payload(result):
+    """Serialize a DecisionResult to the full JSON payload /decide returns.
+
+    Deliberately richer than the old {"hints", "confidence", "novelty"} shape:
+    the sidecar is the single engine owner now, so it must hand over every
+    field a client can surface (plateau risk, in-session status, nudge state)
+    instead of each client re-deriving it from a second engine instance."""
+    payload = {
+        "hints": [_hint_payload(h) for h in result.hints],
+        "confidence": result.confidence,
+        "novelty": result.novelty,
+        "attribution_ids": result.attribution_ids,
+        "is_flow_state": result.is_flow_state,
+        "nudge_offered": result.nudge_offered,
+    }
+    if result.plateau_risk:
+        payload["plateau_risk"] = {
+            "score": result.plateau_risk.score,
+            "entropy_risk": result.plateau_risk.entropy_risk,
+            "diversity_risk": result.plateau_risk.diversity_risk,
+            "novelty_risk": result.plateau_risk.novelty_risk,
+            "agreement_risk": result.plateau_risk.agreement_risk,
+            "trend": result.plateau_risk.trend,
+            "ig_weight": result.plateau_risk.ig_weight,
+        }
+    if result.in_session:
+        payload["in_session"] = {
+            "mix_weight": result.in_session.mix_weight,
+            "call_count": result.in_session.call_count,
+            "max_weight": result.in_session.max_weight,
+            "buffer_size": result.in_session.buffer_size,
+        }
+    if result.nudge_active:
+        payload["nudge_active"] = {
+            "active": result.nudge_active.active,
+            "multiplier": result.nudge_active.multiplier,
+            "reason": result.nudge_active.reason,
+            "turns_remaining": result.nudge_active.turns_remaining,
+        }
+    if result.exploration_metrics:
+        payload["exploration_metrics"] = result.exploration_metrics
+    return payload
+
+
 def create_app(adaptive_pathway) -> "FastAPI":
     if FastAPI is None:
         raise ImportError("fastapi is required for the sidecar server")
@@ -76,6 +141,11 @@ def create_app(adaptive_pathway) -> "FastAPI":
         action_id: str
         reward: float
         context_embedding: Optional[list] = None
+        # Pre-computed base64 float32 embedding; wins over context_embedding
+        # and context if given (the MCP proxy forwards the model's raw b64
+        # string unchanged, so decoding and decode-failure accounting live in
+        # exactly one place — here, next to the engine).
+        context_embedding_b64: Optional[str] = None
         # Free-text alternative to context_embedding — embedded server-side
         # (Ollama, falling back to a deterministic hashing vectorizer).
         # Without either, every call looks identical and preferences bleed
@@ -83,12 +153,17 @@ def create_app(adaptive_pathway) -> "FastAPI":
         context: Optional[str] = None
         is_blended: bool = False
         blend_edge_ids: Optional[list] = None
+        # Machine/backstop-supplied failure classification ("crash" pins a
+        # crash TTL on the action; anything else or None never does — a
+        # negative reward alone must not be assumed to be a crash).
+        error_type: Optional[str] = None
 
     class AnnotationRequest(BaseModel):
         type: str
         edge_id: Optional[str] = None
         action_id: Optional[str] = None
         context_embedding: Optional[list] = None
+        context_embedding_b64: Optional[str] = None
         context: Optional[str] = None
         intensity: float = 0.5
 
@@ -128,12 +203,41 @@ def create_app(adaptive_pathway) -> "FastAPI":
         free-text `context` off the event loop (may hit Ollama over the
         network); zeros if neither is given — an honest "no signal" rather
         than random noise, which would inject spurious context-based
-        differentiation between calls that are genuinely context-free."""
+        differentiation between calls that are genuinely context-free.
+        A supplied embedding whose length doesn't match embedding_dim is a
+        malformed signal (row 5): counted and discarded, never used."""
         if context_embedding:
-            return np.array(context_embedding, dtype=np.float32)
+            vec = np.asarray(context_embedding, dtype=np.float32).ravel()
+            if vec.size != ap.config["embedding_dim"]:
+                ap._embed_decode_failures += 1
+                vec = None
+            if vec is not None:
+                return vec
         if context:
             return await asyncio.to_thread(ap.embed_context, context)
         return np.zeros(ap.config["embedding_dim"], dtype=np.float32)
+
+    def _decode_b64_embedding(b64_string):
+        """Decode a base64 float32 embedding. Returns (embedding_list, failed).
+
+        A malformed/undecodable payload — or one whose length doesn't match
+        embedding_dim — is counted (surfaced via embedding_info().failed_decodes)
+        and reported to the caller, which falls back to the context-text/
+        hashing path — never silently zeros, which would feed a garbage
+        vector into the learning models."""
+        if not b64_string:
+            return None, False
+        try:
+            import base64
+            raw = base64.b64decode(b64_string)
+            emb = np.frombuffer(raw, dtype=np.float32)
+            if emb.size != ap.config["embedding_dim"]:
+                ap._embed_decode_failures += 1
+                return None, True
+            return emb.tolist(), False
+        except Exception:
+            ap._embed_decode_failures += 1
+            return None, True
 
     @app.post("/session/open")
     async def session_open(req: SessionRequest):
@@ -158,33 +262,31 @@ def create_app(adaptive_pathway) -> "FastAPI":
         session_id: str = Query(...),
         context_embedding: str = Query(None),
         context: str = Query(None),
+        available_actions: str = Query(None),
     ):
         await _ensure_session(session_id)
         emb_list = None
         if context_embedding:
-            try:
-                import base64
-                emb_bytes = base64.b64decode(context_embedding)
-                emb_list = np.frombuffer(emb_bytes, dtype=np.float32).tolist()
-            except Exception:
-                emb_list = None
+            emb_list, _ = _decode_b64_embedding(context_embedding)
         emb = await _resolve_embedding(emb_list, context)
-        result = ap.decide(session_id, emb, [])
-        return {
-            "hints": [h.text for h in result.hints],
-            "confidence": result.confidence,
-            "novelty": result.novelty,
-        }
+        actions = ([a.strip() for a in available_actions.split(",") if a.strip()]
+                   if available_actions else [])
+        result = ap.decide(session_id, emb, actions)
+        return _decision_payload(result)
 
     @app.post("/outcome")
     async def record_outcome(session_id: str = Query(...), req: OutcomeRequest = None):
         if req is None:
             raise HTTPException(status_code=400, detail="Request body required")
         await _ensure_session(session_id)
-        emb = await _resolve_embedding(req.context_embedding, req.context)
+        emb_list = req.context_embedding
+        if req.context_embedding_b64:
+            emb_list, _ = _decode_b64_embedding(req.context_embedding_b64)
+        emb = await _resolve_embedding(emb_list, req.context)
         await ap.record_outcome(
             session_id, req.action_id, req.reward, emb,
             is_blended=req.is_blended, blend_edge_ids=req.blend_edge_ids,
+            error_type=req.error_type,
         )
         return {"status": "recorded"}
 
@@ -195,8 +297,11 @@ def create_app(adaptive_pathway) -> "FastAPI":
         await _ensure_session(session_id)
         ann = {"type": req.type, "edge_id": req.edge_id,
                "action_id": req.action_id, "intensity": req.intensity}
-        if req.context_embedding or req.context:
-            ann["context_embedding"] = await _resolve_embedding(req.context_embedding, req.context)
+        if req.context_embedding_b64 or req.context_embedding or req.context:
+            emb_list = req.context_embedding
+            if req.context_embedding_b64:
+                emb_list, _ = _decode_b64_embedding(req.context_embedding_b64)
+            ann["context_embedding"] = await _resolve_embedding(emb_list, req.context)
         await ap.record_annotation(session_id, ann)
         return {"status": "recorded"}
 
@@ -235,6 +340,8 @@ def create_app(adaptive_pathway) -> "FastAPI":
             "confidence": result.confidence,
             "status": result.status.value,
             "tier": result.tier,
+            "frequency": result.frequency or 0,
+            "override_rate": result.override_rate or 0.0,
         }
 
     @app.put("/edges/{edge_id}")
@@ -302,7 +409,7 @@ def create_app(adaptive_pathway) -> "FastAPI":
 
     @app.post("/domains/{domain_id}/reset")
     async def reset_domain(domain_id: str, mode: str = "soft"):
-        ok = ap.reset_domain(domain_id, mode=mode)
+        ok = await ap.reset_domain(domain_id, mode=mode)
         return {"status": "reset" if ok else "not_found"}
 
     @app.post("/graph/export")
@@ -319,7 +426,7 @@ def create_app(adaptive_pathway) -> "FastAPI":
     async def import_graph(req: ImportRequest = None):
         if req is None:
             raise HTTPException(status_code=400)
-        ok = ap.import_graph(req.data, mode=req.mode, target_domain=req.target_domain)
+        ok = await ap.import_graph(req.data, mode=req.mode, target_domain=req.target_domain)
         return {"status": "imported" if ok else "failed"}
 
     @app.get("/attribution/{attribution_id}")
@@ -387,7 +494,7 @@ def create_app(adaptive_pathway) -> "FastAPI":
 
     @app.put("/config/ensemble")
     async def update_ensemble_weights(req: EnsembleWeightsRequest):
-        result = ap.update_ensemble_weights(
+        result = await ap.update_ensemble_weights(
             ig_weight_min=req.ig_weight_min,
             ig_weight_max=req.ig_weight_max,
             pc_weight=req.pc_weight,

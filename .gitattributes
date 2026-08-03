@@ -1,0 +1,22 @@
+# Force LF line endings for text files regardless of a checkout's core.autocrlf
+# setting. Several assets (e.g. plugins/kitty-tools/src/tools/viz/assets/*.html,
+# *.svg) are embedded verbatim via include_str! into snapshot-tested tool
+# output — a CRLF/LF mismatch there breaks the snapshot comparison on any
+# fresh Windows checkout with Git's recommended core.autocrlf=true default.
+* text=auto eol=lf
+
+# Binary files: never touched by line-ending normalization.
+*.png binary
+*.ico binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.otf binary
+*.db binary
+*.sqlite binary
+*.exe binary
+*.dll binary
+*.pdb binary

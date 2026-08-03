@@ -1,4 +1,5 @@
 import numpy as np
+import time
 import yaml
 from pathlib import Path
 from src.adaptive_pathway.learning.curiosity import CuriosityNudge
@@ -145,3 +146,37 @@ def test_nudge_offer_blocked_by_agent_mode():
     nudge = CuriosityNudge(config)
     offer = nudge.offer("test", "agent")
     assert offer is None
+
+
+def test_offer_is_pending_until_accept_or_dismiss():
+    # Row 8 of 82inefficiencies.md: a pending offer must not be re-offered on
+    # every decide call (~50 calls later when the check interval rolls over).
+    config = _load_config()
+    nudge = CuriosityNudge(config)
+    first = nudge.offer("reason one", "thought_partner")
+    assert first is not None
+    second = nudge.offer("reason two", "thought_partner")
+    assert second is None
+
+    # Accepting clears the pending state and the nudge becomes active.
+    assert nudge.trigger("accepted", "thought_partner") is True
+    third = nudge.offer("reason three", "thought_partner")
+    assert third is None  # active nudge cannot re-offer
+
+    # Dismissing clears the pending state too (a fresh offer is only
+    # blocked by the dismiss cooldown until it elapses).
+    nudge.dismiss()
+    assert nudge._offered is False
+    nudge._dismissed_at = time.time() - 15 * 86400
+    fourth = nudge.offer("reason four", "thought_partner")
+    assert fourth is not None
+
+
+def test_check_and_trigger_skips_pending_offer():
+    config = _load_config()
+    nudge = CuriosityNudge(config)
+    nudge._call_counter = 49  # next call hits the interval
+    nudge.offer("pending", "thought_partner")
+    history = [f"action_{i % 2}" for i in range(100)]
+    result = nudge.check_and_trigger(history, mode="thought_partner")
+    assert result is False

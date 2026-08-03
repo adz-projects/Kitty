@@ -9,12 +9,12 @@ mod bigtiny;
 mod commands;
 mod config;
 mod hotkey;
-mod screenshot;
 mod lifecycle;
 mod log_capture;
 mod notifications;
 mod ollama;
 mod openrouter;
+mod screenshot;
 mod state;
 mod tray;
 mod util;
@@ -57,10 +57,12 @@ pub fn run() {
     #[cfg(desktop)]
     {
         builder = builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
-            // A second launch summons the first instance's overlay.
-            if let Err(e) = windows::show_overlay(app) {
-                tracing::warn!("single-instance show_overlay failed: {e}");
-            }
+            // A second launch attempt (taskbar-pinned icon, Start-menu
+            // shortcut, or double-clicking the exe again while already
+            // running) focuses/opens a chat window in the first instance —
+            // never the overlay (see `focus_or_open_chat_window`'s doc
+            // comment). The hotkey remains the overlay's own summon path.
+            windows::focus_or_open_chat_window(app);
         }));
     }
 
@@ -87,6 +89,7 @@ pub fn run() {
             commands::get_pending_handoff,
             commands::get_stack_status,
             commands::get_startup_phase,
+            commands::window_ready,
             commands::restart_backend,
             commands::new_session,
             commands::bind_window_session,
@@ -133,6 +136,7 @@ pub fn run() {
             commands::get_session_mode,
             commands::set_session_mode,
             commands::set_session_context_dir,
+            commands::set_session_persona_override,
             commands::inspect_paths,
             commands::open_path,
             commands::reveal_path,
@@ -173,6 +177,7 @@ pub fn run() {
             commands::set_autostart,
             commands::get_adaptive_pathway_status,
             commands::get_adaptive_pathway_embedding_status,
+            commands::get_adaptive_pathway_mcp_status,
             commands::restart_adaptive_pathway,
             commands::set_adaptive_pathway_enabled,
             commands::adaptive_pathway_get_edge,

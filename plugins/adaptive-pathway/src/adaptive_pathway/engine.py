@@ -3,6 +3,7 @@ import yaml
 import numpy as np
 import time
 import uuid
+from datetime import datetime
 from collections import Counter
 from pathlib import Path
 import sqlalchemy as sa
@@ -10,7 +11,8 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_upsert
 from .storage.database import (init_db, EdgeModel, NodeModel, ActionHistoryModel,
     NoveltyHistoryModel, BlendedEdgeLogModel, CoSelectionLogModel, AnnotationModel,
     DomainModel, OverrideLogModel, PassiveTelemetryModel, FeedbackCentroidModel,
-    EnsembleStateModel, EnsemblePredictionLogModel, EnsembleAgreementSnapshotModel)
+    EnsembleStateModel, EnsemblePredictionLogModel, EnsembleAgreementSnapshotModel,
+    TTLModel, AppSettingsModel)
 from .storage.tiered import TieredCache
 from .storage.vec import VectorIndex
 from .decision.ensemble import BootstrapEnsemble
@@ -24,9 +26,55 @@ from .learning.bleed import DomainBleed
 from .features import FeatureHasher, ActionBucketer
 from .types import (EdgeStatus, PrimitiveSource, EdgeInfo, SessionState,
                      SchismAlert, SchismState, DecisionResult, AnnotationType)
-from .discovery import PrimitiveDiscoverer, DomainDiscovery, CentroidManager
+from .discovery import PrimitiveDiscoverer, DomainDiscovery
 from .health import HealthChecker
 from .embeddings import EmbeddingProvider
+
+import struct
+
+
+def _pack_matrix(arr):
+    """float64 ndarray -> (rank/shape int32 prefix) + raw bytes.
+
+    Row 10 of 82inefficiencies.md: Thompson matrices used to be persisted as
+    JSON text (~40-60KB each); binary is ~16KB for a 64x64 float64 matrix
+    and needs no float->string round trip."""
+    arr = np.asarray(arr, dtype=np.float64)
+    shape_buf = struct.pack(f"=i{len(arr.shape)}i", len(arr.shape), *arr.shape)
+    return shape_buf + arr.tobytes()
+
+
+def _unpack_matrix(raw):
+    """Inverse of `_pack_matrix`; returns None on any malformed input."""
+    try:
+        rank = struct.unpack_from("=i", raw, 0)[0]
+        if not (0 < rank <= 2):
+            return None
+        shape = struct.unpack_from(f"={rank}i", raw, 4)
+        offset = 4 + 4 * rank
+        arr = np.frombuffer(raw, dtype=np.float64, offset=offset)
+        if arr.size == 0 or arr.size != int(np.prod(shape)):
+            return None
+        return arr.copy().reshape(shape)
+    except (struct.error, ValueError):
+        return None
+
+
+def _decode_state_blob(raw):
+    """Decode a persisted A_inv/b blob: binary format first, then the legacy
+    JSON-text format (databases written before the binary switch). Returns a
+    float64 ndarray, or None if the blob is unreadable."""
+    if isinstance(raw, (bytes, bytearray)):
+        arr = _unpack_matrix(raw)
+        if arr is not None:
+            return arr
+        try:
+            parsed = json.loads(bytes(raw).decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return None
+    else:
+        parsed = raw
+    return np.asarray(parsed, dtype=np.float64)
 
 class AdaptivePathway:
     def __init__(self, db_path="./pathway.db", config_path=None, **overrides):
@@ -61,11 +109,12 @@ class AdaptivePathway:
         self._attribution_log = {}
         self._novelty_lambda_boost = 0.0
         self._novelty_lambda_boost_sessions_remaining = 0
+        self._embed_decode_failures = 0
+        self._ttl_dirty: set[str] = set()
         self._primitive_discoverer = PrimitiveDiscoverer(
             self.config, self._get_edges, self._bucketer)
         self._domain_discovery = DomainDiscovery(
             self.config, self._get_edge)
-        self._centroid_manager = CentroidManager(self.config)
         self._health_checker = HealthChecker(
             self.config, self.get_state, self._get_all_edges, self._get_novelty_values,
             lambda: self._ensemble, self.list_domains, self._hasher, self._detector)
@@ -151,8 +200,19 @@ class AdaptivePathway:
                 sa.select(EdgeModel.id, NodeModel.context_embedding)
                 .join(NodeModel, EdgeModel.source_node_id == NodeModel.id)
                 .where(EdgeModel.tier.in_(["hot", "warm"])))
-            warm = [(r.id, np.frombuffer(r.context_embedding, dtype=np.float32))
-                    for r in result if r.context_embedding is not None]
+            # Row 5 of 82inefficiencies.md: a stored embedding whose byte
+            # length doesn't match embedding_dim (e.g. written by a build
+            # with a different model) must be skipped, not fed into the
+            # vector index — a mismatched vector in the DPP kernel/novelty
+            # path distorts every similarity it touches.
+            warm = []
+            for r in result:
+                if r.context_embedding is None:
+                    continue
+                emb = np.frombuffer(r.context_embedding, dtype=np.float32)
+                if emb.size != self.config["embedding_dim"]:
+                    continue
+                warm.append((r.id, emb))
             embedding_by_id = dict(warm)
             for edge in edges:
                 emb = embedding_by_id.get(edge.id)
@@ -172,6 +232,66 @@ class AdaptivePathway:
 
             self._restore_ensemble_state(await conn.execute(sa.select(EnsembleStateModel)))
 
+            # Warm-restore TTL entries so mutes survive restart (row 2).
+            ttl_rows = await conn.execute(sa.select(TTLModel))
+            ttl_entries = {}
+            for r in ttl_rows:
+                ttl_entries[r.edge_id] = {
+                    "expires_at": r.expires_at,
+                    "cause": r.cause,
+                    "set_at": r.set_at,
+                }
+            self._ttl.restore(ttl_entries)
+
+            # Warm-restore domains (row 3): DomainDiscovery._domains must
+            # survive restart so inferred domain assignments remain stable.
+            domain_rows = await conn.execute(sa.select(DomainModel))
+            domain_data = {}
+            for r in domain_rows:
+                domain_data[r.id] = {
+                    "name": r.name,
+                    "source": r.domain_source,
+                    "edge_count": r.edge_count or 0,
+                    "last_inferred": r.last_inferred,
+                    "locked": bool(r.locked),
+                    "centroid": r.centroid,
+                }
+            self._domain_discovery.from_dict(domain_data)
+
+            # Warm-restore preference detector centroids (row 15).
+            fc_rows = await conn.execute(
+                sa.select(FeedbackCentroidModel).where(
+                    FeedbackCentroidModel.id == "default"))
+            fc_row = fc_rows.first()
+            if fc_row and fc_row.example_count and fc_row.example_count > 0:
+                if fc_row.positive_centroid is not None and len(fc_row.positive_centroid) > 0:
+                    self._detector._positive_centroid = np.frombuffer(
+                        fc_row.positive_centroid, dtype=np.float64).copy()
+                if fc_row.negative_centroid is not None and len(fc_row.negative_centroid) > 0:
+                    self._detector._negative_centroid = np.frombuffer(
+                        fc_row.negative_centroid, dtype=np.float64).copy()
+                self._detector._example_count = fc_row.example_count
+                if fc_row.last_computed_at is not None:
+                    self._detector._last_computed_at = fc_row.last_computed_at.timestamp()
+
+            # Warm-restore ensemble weights from settings KV (row 13).
+            sw_rows = await conn.execute(
+                sa.select(AppSettingsModel).where(
+                    AppSettingsModel.key == "ensemble_weights"))
+            sw_row = sw_rows.first()
+            if sw_row and sw_row.value:
+                w = sw_row.value
+                if isinstance(w, dict):
+                    if "ig_weight_min" in w:
+                        self._ensemble.ig_weight_min = w["ig_weight_min"]
+                        self.config["ensemble"]["ig_weight_min"] = w["ig_weight_min"]
+                    if "ig_weight_max" in w:
+                        self._ensemble.ig_weight_max = w["ig_weight_max"]
+                        self.config["ensemble"]["ig_weight_max"] = w["ig_weight_max"]
+                    if "pc_weight" in w:
+                        self._ensemble.pc_weight = w["pc_weight"]
+                        self.config["ensemble"]["pc_weight"] = w["pc_weight"]
+
     def _restore_ensemble_state(self, rows):
         """Reload learned Thompson-sampling weights persisted by
         `_persist_ensemble_state`. Rows with a model_index/action_id/shape
@@ -189,15 +309,14 @@ class AdaptivePathway:
                 continue
             if row.A_inv is None or row.b_vector is None:
                 continue
-            try:
-                a_inv = json.loads(row.A_inv.decode("utf-8"))
-                b = json.loads(row.b_vector.decode("utf-8"))
-            except (ValueError, UnicodeDecodeError):
+            a_inv = _decode_state_blob(row.A_inv)
+            b = _decode_state_blob(row.b_vector)
+            if a_inv is None or b is None:
                 continue
-            if len(a_inv) != d or any(len(r) != d for r in a_inv) or len(b) != d:
+            if a_inv.shape != (d, d) or b.shape != (d,):
                 continue
             self._ensemble.models[row.model_index].set_state(
-                row.action_id, {"A_inv": a_inv, "b": b})
+                row.action_id, {"A_inv": a_inv.tolist(), "b": b.tolist()})
 
     def decide(self, session_id, context_embedding, available_actions):
         if not self._warm_ready:
@@ -223,6 +342,11 @@ class AdaptivePathway:
         state.last_domain_id = domain_id
 
         state.selector.set_novelty_lambda_boost(self._novelty_lambda_boost)
+        # `SessionState` has no `action_history` of its own — action history
+        # is tracked engine-wide (`self._action_history`, same list already
+        # fed to `selector.set_context` above); every `decide()` call was
+        # crashing with an AttributeError until this used the right list.
+        self._nudge.check_and_trigger(self._action_history, mode=state.mode)
         result = state.selector.select(
             session_id=session_id,
             context_embedding=context_embedding,
@@ -286,22 +410,89 @@ class AdaptivePathway:
         though `action_history`/`novelty_history` keep accumulating rows and
         make the database look like it's learning.
         """
+        rows = []
         for model_index in self._LEARNABLE_MODEL_INDICES:
             model = self._ensemble.models[model_index]
             state = model.get_state(bucket)
-            row_id = f"{model_index}:{bucket}"
-            stmt = sqlite_upsert(EnsembleStateModel).values(
-                id=row_id,
-                model_index=model_index,
-                action_id=bucket,
-                A_inv=json.dumps(state["A_inv"]).encode("utf-8"),
-                b_vector=json.dumps(state["b"]).encode("utf-8"),
-            )
-            stmt = stmt.on_conflict_do_update(
+            rows.append({
+                "id": f"{model_index}:{bucket}",
+                "model_index": model_index,
+                "action_id": bucket,
+                "A_inv": _pack_matrix(state["A_inv"]),
+                "b_vector": _pack_matrix(state["b"]),
+            })
+        if not rows:
+            return
+        stmt = sqlite_upsert(EnsembleStateModel).values(rows)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["id"],
+            set_={"A_inv": stmt.excluded.A_inv, "b_vector": stmt.excluded.b_vector},
+        )
+        await conn.execute(stmt)
+
+    async def _sync_ttl_store(self, conn):
+        """Flush dirty EdgeTTL entries to `ttl_entries` (row 2 of
+        82inefficiencies.md): a crash TTL or 30-day user_rejected mute must
+        survive a sidecar restart. Entries removed from memory are deleted
+        from the table; the store is small, so a targeted per-id sync is
+        cheap. Expired rows not re-checked in memory are pruned by
+        run_maintenance."""
+        if not self._ttl_dirty:
+            return
+        snapshot = self._ttl.snapshot()
+        dirty = self._ttl_dirty
+        self._ttl_dirty = set()
+        for edge_id in dirty:
+            entry = snapshot.get(edge_id)
+            if entry is None:
+                await conn.execute(
+                    sa.delete(TTLModel).where(TTLModel.edge_id == edge_id))
+            else:
+                stmt = sqlite_upsert(TTLModel).values(
+                    edge_id=edge_id,
+                    expires_at=entry["expires_at"],
+                    cause=entry["cause"],
+                    set_at=entry.get("set_at", entry["expires_at"]),
+                )
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=["edge_id"],
+                    set_={
+                        "expires_at": stmt.excluded.expires_at,
+                        "cause": stmt.excluded.cause,
+                        "set_at": stmt.excluded.set_at,
+                    },
+                )
+                await conn.execute(stmt)
+
+    async def _sync_domains(self, conn):
+        """Persist all DomainDiscovery domains to `domains` table (row 3).
+        Wipe+reinsert is used since the domain set is tiny (≤ max_domains=8)."""
+        await conn.execute(sa.delete(DomainModel))
+        for did, info in self._domain_discovery.to_dict().items():
+            source_val = info.get("source", "auto_named")
+            if hasattr(source_val, "value"):
+                source_val = source_val.value
+            elif not isinstance(source_val, str):
+                source_val = str(source_val)
+            await conn.execute(sqlite_upsert(DomainModel).values(
+                id=did,
+                name=info.get("name", did),
+                domain_source=source_val,
+                edge_count=int(info.get("edge_count", 0)),
+                last_inferred=info.get("last_inferred"),
+                locked=bool(info.get("locked", False)),
+                centroid=info.get("centroid"),
+            ).on_conflict_do_update(
                 index_elements=["id"],
-                set_={"A_inv": stmt.excluded.A_inv, "b_vector": stmt.excluded.b_vector},
-            )
-            await conn.execute(stmt)
+                set_={
+                    "name": sqlite_upsert(DomainModel).excluded.name,
+                    "domain_source": sqlite_upsert(DomainModel).excluded.domain_source,
+                    "edge_count": sqlite_upsert(DomainModel).excluded.edge_count,
+                    "last_inferred": sqlite_upsert(DomainModel).excluded.last_inferred,
+                    "locked": sqlite_upsert(DomainModel).excluded.locked,
+                    "centroid": sqlite_upsert(DomainModel).excluded.centroid,
+                },
+            ))
 
     def _touch_edge(self, primitive, ctx_raw, domain_id, reward):
         """In-memory upsert of the graph edge for one semantic primitive.
@@ -339,7 +530,8 @@ class AdaptivePathway:
             source=PrimitiveSource.AUTO_NAMED, frequency=1,
             created_at=now, last_accessed=now,
             embedding=(np.array(ctx_raw, dtype=np.float32).ravel().copy()
-                       if ctx_raw is not None else None),
+                       if (ctx_raw is not None and not np.allclose(ctx_raw, 0.0, atol=1e-6))
+                       else None),
         )
         self._edge_index.setdefault(bucket, []).append(edge)
         # Also into the tiered cache so `_get_edges` (the selector's hint
@@ -372,27 +564,45 @@ class AdaptivePathway:
             status=edge.status.value,
             primitive_source=edge.source.value,
             frequency=int(edge.frequency or 1),
+            tags=edge.tags or [],
+            domain_tags=edge.domain_tags or [],
+            co_selected_with=edge.co_selected_with or [],
+            override_rate=float(edge.override_rate or 0.0),
         )
-        stmt = stmt.on_conflict_do_update(
-            index_elements=["id"],
-            set_={
-                "confidence": stmt.excluded.confidence,
-                "domain_id": stmt.excluded.domain_id,
-                "status": stmt.excluded.status,
-                "frequency": stmt.excluded.frequency,
-                "last_accessed": sa.func.now(),
-            },
-        )
+        # Row 3 of 82inefficiencies.md: the update SET used to omit
+        # semantic_primitive/tier/tags/domain_tags/co_selected_with, so edge
+        # renames, tier changes and annotation labels silently reverted to
+        # their stale DB values on restart.
+        set_ = {
+            "semantic_primitive": stmt.excluded.semantic_primitive,
+            "confidence": stmt.excluded.confidence,
+            "domain_id": stmt.excluded.domain_id,
+            "tier": stmt.excluded.tier,
+            "status": stmt.excluded.status,
+            "primitive_source": stmt.excluded.primitive_source,
+            "frequency": stmt.excluded.frequency,
+            "tags": stmt.excluded.tags,
+            "domain_tags": stmt.excluded.domain_tags,
+            "co_selected_with": stmt.excluded.co_selected_with,
+            "override_rate": stmt.excluded.override_rate,
+            "last_accessed": sa.func.now(),
+        }
+        # Only back-fill the node link when this call created the node row;
+        # a later update must not null out the existing source_node_id.
+        if node_id is not None:
+            set_["source_node_id"] = stmt.excluded.source_node_id
+        stmt = stmt.on_conflict_do_update(index_elements=["id"], set_=set_)
         await conn.execute(stmt)
 
     async def record_outcome(self, session_id, action_id, reward,
                              context_embedding, is_blended=False,
-                             blend_edge_ids=None):
+                             blend_edge_ids=None, error_type=None):
         state = self._sessions.get(session_id)
         paused = state.suggestions_paused if state else False
         weight = self.config["pause"]["learning_weight"] if paused else 1.0
         ctx_raw = np.asarray(context_embedding, dtype=np.float32).ravel()
         ctx_features = np.asarray(self._hasher.hash_embedding(ctx_raw), dtype=np.float64)
+        self._health_checker.update_metrics(action_id, reward)
 
         touched_buckets = set()
         touched_edges = []
@@ -444,8 +654,9 @@ class AdaptivePathway:
         if len(self._novelty_history) > 500:
             self._novelty_history.pop(0)
 
-        if reward < -0.5 and not is_blended:
+        if error_type == "crash" and not is_blended:
             self._ttl.record_error(str(action_id), "crash")
+            self._ttl_dirty.add(str(action_id))
 
         last_hints = state.last_hints if state else []
 
@@ -490,9 +701,14 @@ class AdaptivePathway:
                     await self._persist_ensemble_state(conn, bucket)
                 for edge, created in touched_edges:
                     await self._persist_edge(conn, edge, created)
+                await self._sync_ttl_store(conn)
 
     async def record_error(self, edge_id, error_type):
         self._ttl.record_error(edge_id, error_type)
+        self._ttl_dirty.add(str(edge_id))
+        if self._engine:
+            async with self._engine.begin() as conn:
+                await self._sync_ttl_store(conn)
 
     async def run_maintenance(self):
         dc = self.config["decay"]
@@ -527,6 +743,11 @@ class AdaptivePathway:
             cold_threshold = int(time.time() - (cfg["tiers"]["cold_archive_days"] * 86400))
             cold_dt = sa.text(f"datetime({cold_threshold}, 'unixepoch')")
             await conn.execute(
+                sa.update(EdgeModel).where(
+                    sa.and_(EdgeModel.tier == "warm",
+                           EdgeModel.last_accessed < cold_dt)
+                ).values(tier="cold"))
+            await conn.execute(
                 sa.delete(EdgeModel).where(
                     sa.and_(EdgeModel.tier == "cold",
                            EdgeModel.last_accessed < cold_dt)))
@@ -537,6 +758,11 @@ class AdaptivePathway:
                 await conn.execute(
                     sa.delete(FeedbackCentroidModel).where(
                         FeedbackCentroidModel.last_computed_at < centroid_dt))
+            # Prune expired TTL entries (is_expired drops them from memory lazily).
+            await conn.execute(
+                sa.delete(TTLModel).where(
+                    TTLModel.expires_at <= datetime.utcnow().isoformat()))
+            await self._sync_domains(conn)
             await conn.execute(sa.text("PRAGMA optimize"))
 
     async def record_annotation(self, session_id, annotation, paused_replay=False):
@@ -590,6 +816,7 @@ class AdaptivePathway:
                     # TTL machinery used for tool errors, rather than
                     # relying on slow confidence decay to eventually bury it.
                     self._ttl.set_ttl(str(edge_id), "user_rejected")
+                    self._ttl_dirty.add(str(edge_id))
 
             elif annotation_type in (AnnotationType.MICRO_POSITIVE, "micro_positive"):
                 reward_weight = self._clamp_micro_reward(
@@ -655,6 +882,33 @@ class AdaptivePathway:
                     await self._persist_ensemble_state(conn, bucket)
                 if touched_edge is not None:
                     await self._persist_edge(conn, *touched_edge)
+                await self._sync_ttl_store(conn)
+                # Persist preference centroids (row 15): detector state must
+                # survive restart so "keep this"/"don't do again" preferences
+                # remain effective across sidecar launches.
+                if self._detector._example_count > 0:
+                    pos_c = None
+                    neg_c = None
+                    if self._detector._positive_centroid is not None:
+                        pos_c = np.asarray(self._detector._positive_centroid, dtype=np.float64).tobytes()
+                    if self._detector._negative_centroid is not None:
+                        neg_c = np.asarray(self._detector._negative_centroid, dtype=np.float64).tobytes()
+                    await conn.execute(sqlite_upsert(FeedbackCentroidModel).values(
+                        id="default",
+                        positive_centroid=pos_c,
+                        negative_centroid=neg_c,
+                        last_computed_at=datetime.fromtimestamp(
+                            self._detector._last_computed_at) if self._detector._last_computed_at else None,
+                        example_count=self._detector._example_count,
+                    ).on_conflict_do_update(
+                        index_elements=["id"],
+                        set_={
+                            "positive_centroid": sqlite_upsert(FeedbackCentroidModel).excluded.positive_centroid,
+                            "negative_centroid": sqlite_upsert(FeedbackCentroidModel).excluded.negative_centroid,
+                            "last_computed_at": sqlite_upsert(FeedbackCentroidModel).excluded.last_computed_at,
+                            "example_count": sqlite_upsert(FeedbackCentroidModel).excluded.example_count,
+                        },
+                    ))
 
     def embedding_info(self):
         """Which embedding backend context vectors are actually coming from.
@@ -676,6 +930,7 @@ class AdaptivePathway:
             "backend": backend,
             "model": self._embedder.ollama_model,
             "url": self._embedder.ollama_url,
+            "failed_decodes": self._embed_decode_failures,
         }
 
     def get_state(self):
@@ -746,10 +1001,26 @@ class AdaptivePathway:
         all_last_hints = []
         total_wildcard = 0
         total_uncertainty_slot = 0
+        paused_sessions = 0
         for s in self._sessions.values():
             all_last_hints.extend(s.last_hints)
             total_wildcard += s.wildcard_count
             total_uncertainty_slot += s.uncertainty_slot_count
+            if s.suggestions_paused:
+                paused_sessions += 1
+        pause_frequency = round(paused_sessions / len(self._sessions), 3) if self._sessions else 0.0
+
+        annotation_counts = {}
+        for ann in self._annotations_cache:
+            if cutoff:
+                try:
+                    ts = time.mktime(time.strptime(ann["timestamp"], "%Y-%m-%dT%H:%M:%SZ"))
+                    if ts < cutoff:
+                        continue
+                except (ValueError, OSError):
+                    pass
+            atype = ann.get("annotation_type", "unknown")
+            annotation_counts[atype] = annotation_counts.get(atype, 0) + 1
 
         return {
             "metrics": {
@@ -759,13 +1030,25 @@ class AdaptivePathway:
                 "path_success_rate": round(
                     sum(1 for e in edges if e.confidence >= 0.6) / max(len(edges), 1), 3),
                 "confidence_distribution": conf_dist,
-                "annotation_counts": {},
+                "annotation_counts": annotation_counts,
                 "novelty_distribution": {
+                    # Averaged over the actual edges' own context embeddings
+                    # (a real read of current novelty pressure), not a fixed
+                    # zero vector — the zero vector hashes to the same
+                    # count-min-sketch buckets every time, so it reported a
+                    # constant value regardless of the graph's real state.
+                    # Falls back to the old zero-vector reading only when no
+                    # edge has captured a context embedding at all yet.
                     "current_score": round(
-                        float(self._novelty.current_score(np.zeros(self.config["embedding_dim"], dtype=np.float32))), 3),
+                        float(np.mean([
+                            self._novelty.current_score(e.embedding)
+                            for e in edges if e.embedding is not None
+                        ])) if any(e.embedding is not None for e in edges) else
+                        float(self._novelty.current_score(np.zeros(self.config["embedding_dim"], dtype=np.float32))),
+                        3),
                 },
                 "domain_usage": domain_usage,
-                "pause_frequency": 0.0,
+                "pause_frequency": pause_frequency,
                 "top_overridden_edges": [
                     {"id": e.id, "primitive": e.semantic_primitive,
                      "override_rate": e.override_rate or 0.0}
@@ -862,6 +1145,7 @@ class AdaptivePathway:
             edge.status = EdgeStatus(updates["status"])
         if "ttl" in updates and updates["ttl"] is None:
             self._ttl.clear_ttl(edge_id)
+            self._ttl_dirty.add(edge_id)
         if "tags" in updates:
             edge.tags = list(updates["tags"])
         if "domain_tags" in updates:
@@ -871,6 +1155,7 @@ class AdaptivePathway:
         if self._engine:
             async with self._engine.begin() as conn:
                 await self._persist_edge(conn, edge, created=False)
+                await self._sync_ttl_store(conn)
         return True
 
     async def delete_edge(self, edge_id):
@@ -886,7 +1171,17 @@ class AdaptivePathway:
                             await conn.execute(
                                 sa.delete(EdgeModel).where(EdgeModel.id == edge_id))
                     return True
-        return True
+        # Not found in the warmed in-memory index — it may still exist as a
+        # DB-only row (never warmed, or a stale/typo'd id). Check the actual
+        # delete's rowcount instead of unconditionally reporting success, so
+        # callers (the sidecar's DELETE /edges/{id}) can distinguish a real
+        # delete from a no-op.
+        if self._engine:
+            async with self._engine.begin() as conn:
+                result = await conn.execute(
+                    sa.delete(EdgeModel).where(EdgeModel.id == edge_id))
+                return result.rowcount > 0
+        return False
 
     def list_annotations(self, annotation_type=None, domain=None, time_range=None,
                          detection_method=None, page=1, per_page=20, **kw):
@@ -959,29 +1254,39 @@ class AdaptivePathway:
                 domains[did]["edge_count"] += 1
         self._domains_cache = domains
 
-    def reset_domain(self, domain_id, mode="soft"):
+    async def reset_domain(self, domain_id, mode="soft"):
         if mode == "hard":
-            return self._hard_reset_domain(domain_id)
-        return self._soft_reset_domain(domain_id)
+            return await self._hard_reset_domain(domain_id)
+        return await self._soft_reset_domain(domain_id)
 
-    def _soft_reset_domain(self, domain_id):
+    async def _soft_reset_domain(self, domain_id):
+        touched = []
         for bucket_edges in self._edge_index.values():
             for edge in bucket_edges:
                 if edge.domain_id == domain_id:
                     edge.confidence = max(0.1, (edge.confidence or 0.5) * 0.5)
+                    touched.append(edge)
         for i in range(4):
             for aid in range(self._ensemble.n_actions):
                 self._ensemble.models[i].A_inv[aid] = (
                     self._ensemble.models[i].A_inv[aid] * 0.5 +
                     np.eye(self._ensemble.d_features) * 0.5)
+        if self._engine and touched:
+            async with self._engine.begin() as conn:
+                for bucket in set(self._bucketer.get_bucket(e.semantic_primitive) for e in touched):
+                    await self._persist_ensemble_state(conn, bucket)
+                for edge in touched:
+                    await self._persist_edge(conn, edge, created=False)
         return True
 
-    def _hard_reset_domain(self, domain_id):
+    async def _hard_reset_domain(self, domain_id):
+        touched = []
         for bucket_edges in self._edge_index.values():
             for edge in bucket_edges:
                 if edge.domain_id == domain_id:
                     edge.confidence = 0.1
                     edge.tier = "cold"
+                    touched.append(edge)
         for i in range(6):
             if i == self._ensemble.pc_model_index:
                 continue
@@ -990,6 +1295,12 @@ class AdaptivePathway:
                     self._ensemble.d_features, dtype=np.float64)
                 self._ensemble.models[i].b[aid] = np.zeros(
                     self._ensemble.d_features, dtype=np.float64)
+        if self._engine and touched:
+            async with self._engine.begin() as conn:
+                for bucket in set(self._bucketer.get_bucket(e.semantic_primitive) for e in touched):
+                    await self._persist_ensemble_state(conn, bucket)
+                for edge in touched:
+                    await self._persist_edge(conn, edge, created=False)
         return True
 
     def export_graph(self, include_annotations=False, include_ensemble_state=False,
@@ -1031,25 +1342,39 @@ class AdaptivePathway:
             }
         return result
 
-    def import_graph(self, data, mode="merge", target_domain=None):
+    async def import_graph(self, data, mode="merge", target_domain=None):
         edges = data.get("edges", [])
-        if not edges:
-            return True
         if mode == "replace_all":
             self._edge_index.clear()
             self._tiered = TieredCache(self.config, self._vec_index, self._bucketer)
+            # The in-memory index above is cleared either way, but without
+            # also clearing the DB, every old row was still sitting there —
+            # invisible until the next restart's `_warm_data` re-loaded them
+            # straight back into `_edge_index`, silently undoing the
+            # "replace all" the caller asked for. Runs even when `edges` is
+            # empty (a "clear everything, import nothing" call) — this used
+            # to bail out before even reaching this block in that case.
+            if self._engine:
+                async with self._engine.begin() as conn:
+                    await conn.execute(sa.delete(EdgeModel))
+                    await conn.execute(sa.delete(NodeModel))
+        if not edges:
+            return True
 
         existing_ids = set()
         for bucket_edges in self._edge_index.values():
             for e in bucket_edges:
                 existing_ids.add(e.id)
 
+        new_edges = []
+        merged_edges = []
         for edge_data in edges:
             eid = edge_data.get("id", str(uuid.uuid4()))
             if mode == "merge" and eid in existing_ids:
                 existing = self.get_edge(eid)
                 if existing and (edge_data.get("confidence", 0.5) > (existing.confidence or 0.5)):
                     existing.confidence = edge_data["confidence"]
+                    merged_edges.append(existing)
             else:
                 embedding = edge_data.get("embedding")
                 edge = EdgeInfo(
@@ -1069,12 +1394,29 @@ class AdaptivePathway:
                 )
                 bucket = self._bucketer.get_bucket(edge.semantic_primitive)
                 self._edge_index.setdefault(bucket, []).append(edge)
+                new_edges.append(edge)
 
         if mode == "replace_domain" and target_domain:
             for bucket_edges in self._edge_index.values():
                 for edge in bucket_edges:
                     if edge.domain_id == target_domain:
                         edge.tier = "cold"
+
+        # Persist imported edges and repopulate TieredCache (row 14:
+        # replace_all built a fresh empty TieredCache without populating it).
+        if self._engine and new_edges:
+            async with self._engine.begin() as conn:
+                for edge in new_edges:
+                    await self._persist_edge(conn, edge, created=True)
+            for edge in new_edges:
+                self._tiered.add_hot(edge)
+
+        # A merge-mode confidence bump on an *existing* edge used to be
+        # memory-only, reverting to its pre-import value on the next restart.
+        if self._engine and merged_edges:
+            async with self._engine.begin() as conn:
+                for edge in merged_edges:
+                    await self._persist_edge(conn, edge, created=False)
 
         return True
 
@@ -1174,7 +1516,7 @@ class AdaptivePathway:
         except ValueError:
             return False
 
-    def update_ensemble_weights(self, ig_weight_min=None, ig_weight_max=None, pc_weight=None):
+    async def update_ensemble_weights(self, ig_weight_min=None, ig_weight_max=None, pc_weight=None):
         new_min = ig_weight_min if ig_weight_min is not None else self._ensemble.ig_weight_min
         new_max = ig_weight_max if ig_weight_max is not None else self._ensemble.ig_weight_max
         new_pc = pc_weight if pc_weight is not None else self._ensemble.pc_weight
@@ -1194,6 +1536,20 @@ class AdaptivePathway:
         self.config["ensemble"]["ig_weight_max"] = new_max
         self._ensemble.pc_weight = new_pc
         self.config["ensemble"]["pc_weight"] = new_pc
+        # Persist to survive restart (row 13).
+        if self._engine:
+            async with self._engine.begin() as conn:
+                await conn.execute(sqlite_upsert(AppSettingsModel).values(
+                    key="ensemble_weights",
+                    value={
+                        "ig_weight_min": new_min,
+                        "ig_weight_max": new_max,
+                        "pc_weight": new_pc,
+                    },
+                ).on_conflict_do_update(
+                    index_elements=["key"],
+                    set_={"value": sqlite_upsert(AppSettingsModel).excluded.value},
+                ))
         return {
             "ig_weight_min": self._ensemble.ig_weight_min,
             "ig_weight_max": self._ensemble.ig_weight_max,

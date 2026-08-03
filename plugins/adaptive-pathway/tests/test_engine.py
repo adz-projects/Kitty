@@ -119,15 +119,21 @@ async def test_bleed_scoring():
 
 
 @pytest.mark.asyncio
-async def test_negative_reward_triggers_ttl(db_path):
+async def test_negative_reward_triggers_ttl_only_with_explicit_crash(db_path):
     ap = AdaptivePathway(db_path=db_path)
     await ap.session_open("s1")
 
     ctx = np.random.randn(384).astype(np.float32)
     ctx /= np.linalg.norm(ctx)
 
-    await ap.record_outcome("s1", "bad_action", -0.8, ctx)
-    assert ap._ttl.is_expired("bad_action") is True
+    # Row 7 of 82inefficiencies.md: a plain negative reward must NOT be
+    # assumed to be a crash (the backstop's context-free negative reward was
+    # auto-expiring every failed action for 24h).
+    await ap.record_outcome("s1", "plain_failure", -0.8, ctx)
+    assert ap._ttl.is_expired("plain_failure") is False
+
+    await ap.record_outcome("s1", "crash_failure", -0.8, ctx, error_type="crash")
+    assert ap._ttl.is_expired("crash_failure") is True
 
     await ap.session_close("s1")
 
@@ -214,7 +220,7 @@ async def test_get_state_includes_embedding_block(db_path):
     await ap.session_open("s1")
     state = ap.get_state()
     assert "embedding" in state
-    assert set(state["embedding"].keys()) == {"backend", "model", "url"}
+    assert set(state["embedding"].keys()) == {"backend", "model", "url", "failed_decodes"}
     await ap.session_close("s1")
 
 
@@ -518,8 +524,33 @@ async def test_update_edge_in_memory(db_path):
 async def test_delete_edge_moves_to_cold(db_path):
     ap = AdaptivePathway(db_path=db_path)
     await ap.session_open("s1")
-    result = await ap.delete_edge("nonexistent")
+
+    ctx = np.random.randn(384).astype(np.float32)
+    ctx /= np.linalg.norm(ctx)
+    await ap.record_outcome("s1", "action_1", 1.0, ctx)
+
+    all_edges = [e for bucket_edges in ap._edge_index.values() for e in bucket_edges]
+    assert all_edges, "record_outcome should have created an edge"
+    edge_id = all_edges[0].id
+
+    result = await ap.delete_edge(edge_id)
     assert result is True
+    assert all(
+        e.id != edge_id for bucket_edges in ap._edge_index.values() for e in bucket_edges
+    )
+
+    await ap.session_close("s1")
+
+
+@pytest.mark.asyncio
+async def test_delete_edge_nonexistent_returns_false(db_path):
+    # Regression test: `delete_edge` used to unconditionally return True even
+    # when nothing matched, so a caller (the sidecar's DELETE /edges/{id})
+    # could never distinguish a real delete from a no-op.
+    ap = AdaptivePathway(db_path=db_path)
+    await ap.session_open("s1")
+    result = await ap.delete_edge("nonexistent")
+    assert result is False
     await ap.session_close("s1")
 
 
@@ -572,9 +603,9 @@ async def test_list_domains_and_update(db_path):
 async def test_reset_domain(db_path):
     ap = AdaptivePathway(db_path=db_path)
     await ap.session_open("s1")
-    result_soft = ap.reset_domain("test_domain", mode="soft")
+    result_soft = await ap.reset_domain("test_domain", mode="soft")
     assert result_soft is True
-    result_hard = ap.reset_domain("test_domain", mode="hard")
+    result_hard = await ap.reset_domain("test_domain", mode="hard")
     assert result_hard is True
     await ap.session_close("s1")
 
@@ -589,13 +620,81 @@ async def test_export_import_graph(db_path):
     assert "domains" in exported
     assert exported["version"] == "0.1.0"
 
-    result = ap.import_graph(exported, mode="merge")
+    result = await ap.import_graph(exported, mode="merge")
     assert result is True
 
-    result_replace = ap.import_graph(exported, mode="replace_all")
+    result_replace = await ap.import_graph(exported, mode="replace_all")
     assert result_replace is True
 
     await ap.session_close("s1")
+
+
+def _edge_by_primitive(ap, primitive):
+    for bucket_edges in ap._edge_index.values():
+        for e in bucket_edges:
+            if e.semantic_primitive == primitive:
+                return e
+    return None
+
+
+@pytest.mark.asyncio
+async def test_import_graph_replace_all_clears_db_not_just_memory(db_path):
+    # Regression test: replace_all used to clear only the in-memory index —
+    # old DB rows were still there, so they silently resurrected into
+    # _edge_index the next time the engine restarted.
+    ap = AdaptivePathway(db_path=db_path)
+    await ap.session_open("s1")
+
+    ctx = np.random.randn(384).astype(np.float32)
+    ctx /= np.linalg.norm(ctx)
+    await ap.record_outcome("s1", "will_be_replaced", 1.0, ctx)
+    assert _edge_by_primitive(ap, "will_be_replaced") is not None
+
+    ok = await ap.import_graph({"edges": [{
+        "id": "survivor",
+        "semantic_primitive": "prim_survivor",
+        "confidence": 0.9,
+    }]}, mode="replace_all")
+    assert ok is True
+    assert _edge_by_primitive(ap, "will_be_replaced") is None
+    assert ap.get_edge("survivor") is not None
+
+    await ap.session_close("s1")
+
+    ap2 = AdaptivePathway(db_path=db_path)
+    await ap2.session_open("s1")
+    assert _edge_by_primitive(ap2, "will_be_replaced") is None
+    assert ap2.get_edge("survivor") is not None
+    await ap2.session_close("s1")
+
+
+@pytest.mark.asyncio
+async def test_import_graph_merge_confidence_bump_persists_across_restart(db_path):
+    # Regression test: a merge-mode confidence bump on an existing edge was
+    # memory-only and reverted to its pre-import value on the next restart.
+    ap = AdaptivePathway(db_path=db_path)
+    await ap.session_open("s1")
+
+    ctx = np.random.randn(384).astype(np.float32)
+    ctx /= np.linalg.norm(ctx)
+    await ap.record_outcome("s1", "bump_me", 1.0, ctx)
+    edge = _edge_by_primitive(ap, "bump_me")
+    assert edge is not None
+    edge.confidence = 0.1
+
+    ok = await ap.import_graph({"edges": [{
+        "id": edge.id,
+        "confidence": 0.99,
+    }]}, mode="merge")
+    assert ok is True
+    assert ap.get_edge(edge.id).confidence == 0.99
+
+    await ap.session_close("s1")
+
+    ap2 = AdaptivePathway(db_path=db_path)
+    await ap2.session_open("s1")
+    assert ap2.get_edge(edge.id).confidence == 0.99
+    await ap2.session_close("s1")
 
 
 @pytest.mark.asyncio
@@ -722,9 +821,10 @@ def test_resolve_schism_no_active_schism():
     assert ap.resolve_schism("both") is False
 
 
-def test_update_ensemble_weights_live_and_reflected_in_state():
+@pytest.mark.asyncio
+async def test_update_ensemble_weights_live_and_reflected_in_state():
     ap = AdaptivePathway()
-    result = ap.update_ensemble_weights(ig_weight_min=0.2, pc_weight=0.18)
+    result = await ap.update_ensemble_weights(ig_weight_min=0.2, pc_weight=0.18)
     assert result["ig_weight_min"] == 0.2
     assert result["pc_weight"] == 0.18
     assert result["ig_weight_max"] == ap._ensemble.ig_weight_max  # untouched field passed through
@@ -1028,7 +1128,7 @@ async def test_import_graph_round_trips_embedding(db_path):
     await ap.session_open("s1")
 
     emb = np.random.randn(384).astype(np.float32)
-    ok = ap.import_graph({
+    ok = await ap.import_graph({
         "edges": [{
             "id": "edge_with_embedding",
             "semantic_primitive": "prim_x",
@@ -1067,7 +1167,7 @@ async def test_pc_score_labels_hint_source_model(db_path):
         id="challenging_edge", semantic_primitive="challenging_primitive", confidence=0.9,
     )]
     ap._tiered.warm_from_db(ap._get_all_edges(), [])
-    ap._ensemble.models[ap._ensemble.pc_model_index].score = lambda *a, **kw: 0.9
+    ap._ensemble.models[ap._ensemble.pc_model_index].score_with_referents = lambda *a, **kw: 0.9
 
     ctx = np.random.randn(384).astype(np.float32)
     ctx /= np.linalg.norm(ctx)
@@ -1307,17 +1407,19 @@ def test_embed_context_hashing_fallback_is_available_without_ollama():
     assert not np.allclose(v, 0)
 
 
-def test_update_ensemble_weights_rejects_invalid():
+@pytest.mark.asyncio
+async def test_update_ensemble_weights_rejects_invalid():
     ap = AdaptivePathway()
-    result = ap.update_ensemble_weights(ig_weight_min=1.5)
+    result = await ap.update_ensemble_weights(ig_weight_min=1.5)
     assert "error" in result
     # Rejected update must not mutate live state.
     assert ap._ensemble.ig_weight_min != 1.5
 
 
-def test_update_ensemble_weights_rejects_overallocation():
+@pytest.mark.asyncio
+async def test_update_ensemble_weights_rejects_overallocation():
     ap = AdaptivePathway()
-    result = ap.update_ensemble_weights(ig_weight_max=0.8, pc_weight=0.5)
+    result = await ap.update_ensemble_weights(ig_weight_max=0.8, pc_weight=0.5)
     assert "error" in result
 
 

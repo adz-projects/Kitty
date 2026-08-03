@@ -28,7 +28,12 @@ export function ErrorDetail({
         {summary}
       </p>
       {errorType === 'context_exceeded' && onNewSession && (
-        <button type="button" className="link" style={{ color: 'var(--accent)' }} onClick={onNewSession}>
+        <button
+          type="button"
+          className="link"
+          style={{ color: 'var(--accent)' }}
+          onClick={onNewSession}
+        >
           New Session
         </button>
       )}

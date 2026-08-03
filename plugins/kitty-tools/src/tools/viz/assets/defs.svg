@@ -7,6 +7,21 @@
         <feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#000000" flood-opacity="0.07"/>
     </filter>
 
+    <!-- Chart series fills: patterns rather than color alone, so series stay
+         distinguishable in grayscale and for color-blind readers. -->
+    <pattern id="hatch-a" width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+        <rect width="8" height="8" fill="#f4f4f5"/>
+        <line x1="0" y1="0" x2="0" y2="8" stroke="#27272a" stroke-width="3"/>
+    </pattern>
+    <pattern id="hatch-b" width="8" height="8" patternUnits="userSpaceOnUse">
+        <rect width="8" height="8" fill="#f4f4f5"/>
+        <circle cx="4" cy="4" r="1.6" fill="#27272a"/>
+    </pattern>
+    <pattern id="hatch-c" width="8" height="8" patternUnits="userSpaceOnUse">
+        <rect width="8" height="8" fill="#f4f4f5"/>
+        <path d="M0,0 L8,8 M8,0 L0,8" stroke="#27272a" stroke-width="1.4"/>
+    </pattern>
+
     <style>
         .canvas-bg { fill: #fafafa; rx: 12px; }
         .title-text { font-family: system-ui, -apple-system, sans-serif; font-size: 18px; font-weight: 700; fill: #09090b; text-anchor: middle; }
@@ -37,5 +52,34 @@
         .curve-dot { fill: #ffffff; stroke: #18181b; stroke-width: 3px; r: 6px; }
         .pain-card { fill: #f4f4f5; stroke: #a1a1aa; stroke-width: 1px; rx: 6px; }
         .pain-text { font-family: system-ui, -apple-system, sans-serif; font-size: 10.5px; font-weight: 600; fill: #27272a; text-anchor: middle; }
+        .journey-col-shade { fill: #f4f4f5; }
+
+        /* Chart axes and grid */
+        .grid-line { stroke: #e4e4e7; stroke-width: 1px; }
+        .axis-line { stroke: #52525b; stroke-width: 1.5px; }
+        .axis-label { font-family: system-ui, -apple-system, sans-serif; font-size: 10.5px; fill: #52525b; text-anchor: middle; }
+        .axis-label-end { font-family: system-ui, -apple-system, sans-serif; font-size: 10.5px; fill: #52525b; text-anchor: end; dominant-baseline: middle; }
+        .axis-title { font-family: system-ui, -apple-system, sans-serif; font-size: 11px; font-weight: 700; fill: #27272a; text-anchor: start; }
+        .axis-title-center { font-family: system-ui, -apple-system, sans-serif; font-size: 11px; font-weight: 700; fill: #27272a; text-anchor: middle; }
+        .value-label { font-family: system-ui, -apple-system, sans-serif; font-size: 9.5px; font-weight: 700; fill: #18181b; text-anchor: middle; }
+        .value-label-start { font-family: system-ui, -apple-system, sans-serif; font-size: 9.5px; font-weight: 700; fill: #18181b; text-anchor: start; dominant-baseline: middle; }
+        .legend-swatch { stroke: #18181b; stroke-width: 1px; }
+        .legend-text { font-family: system-ui, -apple-system, sans-serif; font-size: 11px; fill: #27272a; text-anchor: start; dominant-baseline: middle; }
+
+        /* Chart series fills -- pattern, not color alone, differentiates
+           series for grayscale/color-blind readers. */
+        .bar-0 { fill: #18181b; stroke: #09090b; stroke-width: 1px; }
+        .bar-1 { fill: url(#hatch-a); stroke: #27272a; stroke-width: 1px; }
+        .bar-2 { fill: url(#hatch-b); stroke: #27272a; stroke-width: 1px; }
+        .bar-3 { fill: url(#hatch-c); stroke: #27272a; stroke-width: 1px; }
+
+        /* Line-chart series: dash pattern differentiates without relying on
+           color, same rationale as the bar fill patterns above. */
+        .series-line { fill: none; stroke: #18181b; stroke-width: 2.5px; stroke-linecap: round; stroke-linejoin: round; }
+        .series-line.dash-0 { stroke-dasharray: none; }
+        .series-line.dash-1 { stroke-dasharray: 7 4; }
+        .series-line.dash-2 { stroke-dasharray: 2 4; }
+        .series-line.dash-3 { stroke-dasharray: 9 3 2 3; }
+        .data-point { fill: #ffffff; stroke: #18181b; stroke-width: 2px; }
     </style>
 </defs>

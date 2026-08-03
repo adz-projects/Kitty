@@ -71,16 +71,22 @@ export function App() {
   const [ollamaEnabled, setOllamaEnabled] = useState(true);
 
   useEffect(() => {
-    void (async () => {
-      const t = await ipc.getSettingsTarget();
-      if (t?.section) {
+    // Register the live listener before awaiting the one-shot deep-link
+    // target, and track whether it already fired — otherwise a
+    // `settings://navigate` event that arrives while `getSettingsTarget()` is
+    // still in flight can be clobbered by that stale initial target once it
+    // finally resolves.
+    let navigated = false;
+    const un = onSettingsNavigate((t) => {
+      navigated = true;
+      setSection(t.section);
+      setHighlight(t.highlight);
+    });
+    void ipc.getSettingsTarget().then((t) => {
+      if (t?.section && !navigated) {
         setSection(t.section);
         setHighlight(t.highlight);
       }
-    })();
-    const un = onSettingsNavigate((t) => {
-      setSection(t.section);
-      setHighlight(t.highlight);
     });
     return () => void un.then((fn) => fn());
   }, []);

@@ -70,7 +70,13 @@ fn relevant_window_focused(app: &AppHandle, session_id: Option<&str>) -> bool {
 /// `notify-rust` directly rather than `tauri_plugin_notification`'s
 /// `.show()`, which discards the toast's activation handle and gives us no
 /// way to detect a click at all.
-pub fn notify_if_hidden(app: &AppHandle, event: Event, title: &str, body: &str, session_id: Option<&str>) {
+pub fn notify_if_hidden(
+    app: &AppHandle,
+    event: Event,
+    title: &str,
+    body: &str,
+    session_id: Option<&str>,
+) {
     if relevant_window_focused(app, session_id) {
         return;
     }

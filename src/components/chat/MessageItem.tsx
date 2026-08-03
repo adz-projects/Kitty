@@ -5,6 +5,7 @@ import rehypeHighlight from 'rehype-highlight';
 import 'highlight.js/styles/github.css';
 import {
   findHintToolCall,
+  isVisualizationToolCall,
   parseHintOutput,
   stripPromptPreamble,
   useChatStore,
@@ -18,6 +19,7 @@ import { MessageAttachmentChips } from './MessageAttachmentChips';
 import { HintBadge } from './HintBadge';
 import { HintFeedbackButtons } from './HintFeedbackButtons';
 import { NudgeConsentPrompt } from './NudgeConsentPrompt';
+import { VisualizationCard } from './VisualizationCard';
 import { ipc } from '@/lib/ipc';
 import { useHintFeedbackDiscoverable } from '@/lib/hintFeedbackDiscoverability';
 
@@ -155,16 +157,25 @@ export const MessageItem = memo(function MessageItem({
     );
   }
 
+  // Visualizations render as their own always-visible card, the same way a
+  // fenced code block renders inline rather than behind a click — everything
+  // else stays in the collapsed Thinking tray.
+  const vizCalls = message.toolCalls.filter(isVisualizationToolCall);
+  const otherToolCalls = message.toolCalls.filter((c) => !isVisualizationToolCall(c));
+
   return (
     <div className="msg msg-assistant">
-      {(message.reasoning || message.toolCalls.length > 0) && (
+      {(message.reasoning || otherToolCalls.length > 0) && (
         <ThinkingBox
           reasoning={message.reasoning}
-          toolCalls={message.toolCalls}
+          toolCalls={otherToolCalls}
           streaming={message.streaming}
           hasAnswer={message.text.length > 0}
         />
       )}
+      {vizCalls.map((call) => (
+        <VisualizationCard key={call.id} call={call} />
+      ))}
       {message.text && (
         <div className="bubble markdown">
           <ReactMarkdown

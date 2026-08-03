@@ -125,7 +125,10 @@ mod tests {
     #[test]
     fn returns_final_line_without_trailing_newline() {
         let mut r = Cursor::new(b"no newline at end".to_vec());
-        assert_eq!(read_lossy_line(&mut r).as_deref(), Some("no newline at end"));
+        assert_eq!(
+            read_lossy_line(&mut r).as_deref(),
+            Some("no newline at end")
+        );
         assert_eq!(read_lossy_line(&mut r), None);
     }
 

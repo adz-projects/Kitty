@@ -73,6 +73,37 @@ class BootstrapEnsemble:
         samples = [m.sample(action_id, context) for m in self.models]
         return float(np.dot(samples, weights)), samples
 
+    def base_samples(self, action_id, context):
+        # Bucket-keyed component draws (4 Thompson + IG) with their weights,
+        # excluding the paradigm-challenge term — that term is edge-dependent
+        # and must be scored per edge (see sample_edge_aware). Memoizable
+        # across edges that share an action bucket, keeping the Thompson
+        # sampling (the dominant decide() cost) single-draw per bucket.
+        ig_w = self.ig_weight
+        std_w = (1.0 - ig_w - self.pc_weight) / 4
+        weights = [std_w] * 4 + [ig_w]
+        return weights, [self.models[i].sample(action_id, context) for i in range(5)]
+
+    def sample_edge_aware(self, edge_id, action_id, context, top_n_action_ids, domain_stats, base=None, referents=None):
+        # Ensemble draw where the paradigm-challenge component scores the
+        # *real edge id* against the candidate set + domain stats. Scoring
+        # with the action bucket (a bare int) made the PC term constant
+        # across every edge sharing that bucket, so the challenge signal
+        # never influenced ranking — only the post-hoc hint label.
+        # `referents` = (referent_domains, referent_edges) precomputed once
+        # per decide call, avoiding O(edges) id-lookups per referent.
+        if base is None:
+            base = self.base_samples(action_id, context)
+        weights, samples = base
+        pc_model = self.models[5]
+        if referents is not None:
+            referent_domains, referent_edges = referents
+            pc_s = pc_model.score_with_referents(
+                edge_id, context, referent_domains, referent_edges, domain_stats)
+        else:
+            pc_s = pc_model.score(edge_id, context, top_n_action_ids, domain_stats)
+        return float(np.dot(samples, weights) + self.pc_weight * pc_s), samples + [pc_s]
+
     def max_sigma(self, action_id, context):
         # Epistemic uncertainty for a bucket: the largest posterior sigma
         # among the 4 standard Thompson models. Used to guarantee one

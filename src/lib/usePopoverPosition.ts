@@ -94,17 +94,26 @@ export function usePopoverPosition(open: boolean, onClose: () => void) {
     setStyle(next);
   }, [open]);
 
+  // Most callers pass an inline `() => setOpen(false)`, a new function
+  // identity every render — stash the latest in a ref instead of putting
+  // `onClose` in the effect's deps, so the global pointerdown listener isn't
+  // torn down and re-added on every render while the popover is open.
+  const onCloseRef = useRef(onClose);
+  useEffect(() => {
+    onCloseRef.current = onClose;
+  }, [onClose]);
+
   useEffect(() => {
     if (!open) return;
     const handlePointerDown = (e: PointerEvent) => {
       const target = e.target as Node;
       if (triggerRef.current?.contains(target)) return; // trigger's own onClick toggles it
       if (popoverRef.current?.contains(target)) return; // an item's own onClick closes it
-      onClose();
+      onCloseRef.current();
     };
     document.addEventListener('pointerdown', handlePointerDown);
     return () => document.removeEventListener('pointerdown', handlePointerDown);
-  }, [open, onClose]);
+  }, [open]);
 
   return { triggerRef, popoverRef, style };
 }

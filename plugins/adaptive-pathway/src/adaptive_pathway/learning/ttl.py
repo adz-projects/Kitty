@@ -62,3 +62,17 @@ class EdgeTTL:
             self.set_ttl(edge_id, "deprecated_api")
         elif error_type in ("syntax_error", "crash", "exception", "internal_error"):
             self.set_ttl(edge_id, "syntax_crash")
+
+    def snapshot(self):
+        """Copy of the whole TTL store (persisted via engine._sync_ttl_store).
+        Dict-of-dict so callers can't mutate the live entries."""
+        return {eid: dict(entry) for eid, entry in self._ttl_store.items()}
+
+    def restore(self, entries):
+        """Load entries previously persisted by the engine (row 2 of
+        82inefficiencies.md): a 'don't do this again' mute must survive a
+        restart. Expired entries are loaded too — `is_expired` lazily drops
+        them on first check, and run_maintenance prunes the DB rows."""
+        for edge_id, entry in entries.items():
+            if isinstance(entry, dict) and entry.get("expires_at"):
+                self._ttl_store[edge_id] = entry

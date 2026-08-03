@@ -20,10 +20,24 @@ dependencies = [
 kitty-docs-web = "kitty_docs_web:main"
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0", "pytest-asyncio>=0.21"]
+dev = ["pytest>=7.0", "pytest-asyncio>=0.21", "ruff>=0.6"]
 
 [tool.setuptools]
 py-modules = ["kitty_docs_web"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+exclude = ["build", "dist", ".build-venv"]
+
+[tool.ruff.lint]
+# pycodestyle errors + pyflakes + import sorting only — kept deliberately
+# unaggressive, matching kitty-tools' equivalent gate (cargo clippy) running
+# clean at its default lint level rather than a strict profile. Spelled out
+# explicitly rather than relying on ruff's implicit default selection, which
+# (at least as of ruff 0.16) pulls in a much broader rule set than the
+# documented E4/E7/E9/F default once any `[tool.ruff]` config is present.
+select = ["E", "F", "I"]

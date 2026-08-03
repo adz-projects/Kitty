@@ -34,6 +34,13 @@ const emptyForm = {
   url: '',
   env: '',
   apiKey: '',
+  /** Whether the server being edited already has an auth header configured
+      server-side — BigTiny redacts the real value in every response
+      (`"***"`, encrypted at rest), so this is a presence flag, not
+      something the real value could ever be read back into. Drives the
+      "🔑 key stored" placeholder and the submit-time omit-if-untouched
+      logic below, mirroring Providers.tsx's `has_secret` convention. */
+  hasStoredKey: false,
 };
 
 /** `headers` only ever carries this one convenience shape from the UI — a
@@ -47,13 +54,14 @@ function headersFromApiKey(apiKey: string): Record<string, string> | undefined {
   return trimmed ? { Authorization: `Bearer ${trimmed}` } : undefined;
 }
 
-/** Reverse of `headersFromApiKey`, for populating the form when editing an
-    existing server — only recognizes its own convention (a bare `Bearer `
-    Authorization header); anything else (a custom header set outside this
-    form) is left out of the field rather than guessed at. */
-function apiKeyFromHeaders(headers: Record<string, string>): string {
-  const auth = headers.Authorization ?? headers.authorization;
-  return auth?.startsWith('Bearer ') ? auth.slice('Bearer '.length) : '';
+/** Whether the server already has some auth header set — BigTiny redacts
+    the real value to `"***"` in every response, so this can only ever be a
+    presence check, never a real value to populate the edit field with
+    (unlike the pre-encryption behavior this replaces, which read the real
+    key back out of the response — that's no longer possible now that the
+    server never echoes it). */
+function hasApiKeyConfigured(headers: Record<string, string>): boolean {
+  return Boolean(headers.Authorization ?? headers.authorization);
 }
 
 /** Quote-aware whitespace tokenizer for the Args field — a plain `split(/\s+/)`
@@ -141,7 +149,8 @@ export function McpServers() {
       args: formatArgs(s.args),
       url: s.url ?? '',
       env: formatEnv(s.env),
-      apiKey: apiKeyFromHeaders(s.headers),
+      apiKey: '',
+      hasStoredKey: hasApiKeyConfigured(s.headers),
     });
   };
 
@@ -187,6 +196,18 @@ export function McpServers() {
     setError('');
     try {
       if (editingId) {
+        // A blank API-key field while editing means "untouched" (the real
+        // value is never read back from the server — it's redacted to
+        // "***" in every response), not "clear it" — omit `headers` from
+        // the patch entirely so BigTiny's own "field absent = don't touch"
+        // contract leaves whatever's already stored alone. Still explicitly
+        // clears headers when switching to a non-remote transport, since a
+        // stdio server has no business carrying auth headers around.
+        const headers = !isRemote
+          ? {}
+          : form.apiKey.trim()
+            ? headersFromApiKey(form.apiKey)
+            : undefined;
         await ipc.updateMcpServer(editingId, {
           name: form.name.trim(),
           transport: form.transport,
@@ -194,7 +215,7 @@ export function McpServers() {
           args: form.transport === 'stdio' ? parseArgs(form.args) : [],
           url: isRemote ? form.url.trim() : null,
           env: parseEnv(form.env),
-          headers: isRemote ? (headersFromApiKey(form.apiKey) ?? {}) : {},
+          headers,
         });
       } else {
         await ipc.addMcpServer({
@@ -302,7 +323,11 @@ export function McpServers() {
             />
             <input
               type="password"
-              placeholder="API key (optional — sent as a Bearer token)"
+              placeholder={
+                form.hasStoredKey
+                  ? '🔑 key stored — leave blank to keep, or type to replace'
+                  : 'API key (optional — sent as a Bearer token)'
+              }
               value={form.apiKey}
               onChange={(e) => setForm({ ...form, apiKey: e.target.value })}
             />
@@ -368,20 +393,20 @@ function WasmMathMcpCard() {
         />
       </div>
       <span className="muted ext-card-desc">
-        Sandboxed Python execution for exact math, stats, and NumPy — no shell, no filesystem,
-        no network access.
+        Sandboxed Python execution for exact math, stats, and NumPy — no shell, no filesystem, no
+        network access.
       </span>
       {error && <div className="chat-error">{error}</div>}
     </label>
   );
 }
 
-/** Dedicated card for the visualization tools — accessible HTML tables and
-    SVG diagrams, rendered in an iframe in chat (see `ToolCallCard`'s
-    `parseIframePayload`). Hosted inside the combined `kitty-tools` server
-    (see `KittyToolsCard` above); this toggle flips the `KITTY_VIZ_ENABLED`
-    env var rather than spawning its own process. On by default, no
-    credentials — same shape as `WasmMathMcpCard`. */
+/** Dedicated card for the visualization tools — accessible HTML tables, SVG
+    diagrams, and charts, rendered inline in chat as their own always-visible
+    card (see `VisualizationCard`). Hosted inside the combined `kitty-tools`
+    server (see `KittyToolsCard` above); this toggle flips the
+    `KITTY_VIZ_ENABLED` env var rather than spawning its own process. On by
+    default, no credentials — same shape as `WasmMathMcpCard`. */
 function VisualizationsCard() {
   const [enabled, setEnabled] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -419,7 +444,7 @@ function VisualizationsCard() {
         />
       </div>
       <span className="muted ext-card-desc">
-        Accessible HTML tables and SVG diagrams, rendered inline in chat.
+        Accessible HTML tables, SVG diagrams, and charts, rendered inline in chat.
       </span>
       {error && <div className="chat-error">{error}</div>}
     </label>
@@ -428,7 +453,7 @@ function VisualizationsCard() {
 
 /** Dedicated card for the bundled `kitty-tools` server (see
     `plugins/kitty-tools/`) — the Rust consolidation of `replacement-mcp`'s
-    18 shell/workspace/file/word/cache/scratchpad tools, plus the 2
+    18 shell/workspace/file/word/cache/scratchpad tools, plus the 3
     visualization tools (separately gated by `VisualizationsCard` below,
     which toggles an env var on this one process rather than spawning its
     own). Web search does NOT live here — see `BraveMcpSearchCard`/
@@ -619,13 +644,13 @@ function BraveMcpSearchCard() {
       </div>
       <span className="muted ext-card-desc">
         Brave Search LLM Context API. Requires an API key — turning this off always clears the
-        stored key, so turning it back on requires entering it again. DuckDuckGo is always
-        available as a fallback even without this.
+        stored key, so turning it back on requires entering it again. DuckDuckGo is always available
+        as a fallback even without this.
       </span>
       {!isOn && configured && (
         <span className="muted ext-card-desc">
-          A saved key was found but the server is switched off. Enter a key to turn it back
-          on — this replaces the saved one.
+          A saved key was found but the server is switched off. Enter a key to turn it back on —
+          this replaces the saved one.
         </span>
       )}
       {!isOn && (
@@ -642,7 +667,11 @@ function BraveMcpSearchCard() {
               }
             }}
           />
-          <button className="primary" disabled={busy || !apiKey.trim()} onClick={() => void saveKey()}>
+          <button
+            className="primary"
+            disabled={busy || !apiKey.trim()}
+            onClick={() => void saveKey()}
+          >
             {busy ? 'Saving…' : 'Enable'}
           </button>
         </div>

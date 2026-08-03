@@ -360,16 +360,37 @@ impl Default for Config {
 }
 
 fn default_bigtiny_command() -> String {
-    bundled_plugin_path("bigtiny-daemon.exe").unwrap_or_else(|| "python".to_string())
+    bundled_plugin_path("bigtiny-daemon.exe").unwrap_or_else(|| "cargo".to_string())
 }
 
-/// Empty when the bundled exe was found (it needs no `-m bigtiny` — that's
-/// only how the dev-convenience bare `python` fallback locates the package).
+/// Empty when the bundled exe was found — it needs no extra args. Otherwise,
+/// the dev-convenience fallback runs the daemon straight out of the
+/// `plugins/bigtiny_rust` source checkout via `cargo run` (this backend is
+/// pure Rust now — no Python interpreter/package involved at all), matching
+/// the old `python -m bigtiny` fallback's purpose: `cargo tauri dev` should
+/// work without requiring `plugins/build.py` to have run first.
+/// `--manifest-path` is resolved from this crate's own compile-time location
+/// (`CARGO_MANIFEST_DIR`) rather than a path relative to the process's
+/// working directory, so it's correct regardless of where `cargo tauri dev`
+/// happens to be invoked from.
 fn default_bigtiny_args() -> Vec<String> {
     if bundled_plugin_path("bigtiny-daemon.exe").is_some() {
         Vec::new()
     } else {
-        vec!["-m".to_string(), "bigtiny".to_string()]
+        let manifest_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("plugins")
+            .join("bigtiny_rust")
+            .join("Cargo.toml");
+        vec![
+            "run".to_string(),
+            "--quiet".to_string(),
+            "--manifest-path".to_string(),
+            manifest_path.to_string_lossy().into_owned(),
+            "--bin".to_string(),
+            "bigtiny-daemon".to_string(),
+            "--".to_string(),
+        ]
     }
 }
 
@@ -586,11 +607,13 @@ pub fn load() -> Result<Config, ConfigError> {
     match fs::read_to_string(&path) {
         Ok(text) => {
             let config: Config = serde_json::from_str(&text)?;
-            Ok(migrate_kitty_split_enabled(migrate_replacement_mcp_enabled(
-                migrate_ap_db_path(migrate_bigtiny_launch_command(migrate_ap_launch_command(
-                    migrate_recipes(migrate_hotkeys(config, &text)),
-                ))),
-            )))
+            Ok(migrate_kitty_split_enabled(
+                migrate_replacement_mcp_enabled(migrate_ap_db_path(
+                    migrate_bigtiny_launch_command(migrate_ap_launch_command(migrate_recipes(
+                        migrate_hotkeys(config, &text),
+                    ))),
+                )),
+            ))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
         Err(e) => Err(e.into()),
@@ -659,21 +682,53 @@ fn migrate_ap_launch_command(mut config: Config) -> Config {
     config
 }
 
-/// Self-heals an existing install's `bigtiny_command`/`bigtiny_args` from the
-/// pre-bundling dev default (`python -m bigtiny`) onto the bundled exe, once
-/// one is present — same rationale as `migrate_ap_launch_command`, including
-/// the same stale-absolute-path self-heal (`command_path_is_stale`). A
+/// Self-heals an existing install's `bigtiny_command`/`bigtiny_args` off
+/// either dev-convenience default — the original Python-era `python -m
+/// bigtiny`, or the current `cargo run --manifest-path .../bigtiny_rust
+/// ...` (see `default_bigtiny_args`) — onto the bundled exe, once one is
+/// present. Same rationale as `migrate_ap_launch_command`, including the
+/// same stale-absolute-path self-heal (`command_path_is_stale`). A
 /// deliberate override (e.g. `uv run bigtiny`, or a source checkout via
 /// `bigtiny_dir`) is left untouched.
 fn migrate_bigtiny_launch_command(mut config: Config) -> Config {
-    const OLD_COMMAND: &str = "python";
-    let old_args = ["-m".to_string(), "bigtiny".to_string()];
-    let stale = (config.bigtiny_command == OLD_COMMAND && config.bigtiny_args == old_args)
-        || command_path_is_stale(&config.bigtiny_command);
+    const OLD_PYTHON_COMMAND: &str = "python";
+    let old_python_args = ["-m".to_string(), "bigtiny".to_string()];
+    let is_cargo_dev_fallback = config.bigtiny_command == "cargo"
+        && config.bigtiny_args.iter().any(|a| a == "bigtiny-daemon");
+    let is_resolved_path =
+        config.bigtiny_command.contains('/') || config.bigtiny_command.contains('\\');
+    let bundled = bundled_plugin_path("bigtiny-daemon.exe");
+    // Tauri's `externalBin` build step stages a copy of every sidecar next
+    // to `current_exe()` on *every* build, dev included (`cargo tauri dev`
+    // is not the unbundled case it looks like — `target/debug/` ends up with
+    // its own `bigtiny-daemon.exe` alongside `kitty.exe`, copied fresh each
+    // time `src-tauri/binaries/...` changes). So a bundled sibling is nearly
+    // always `Some` in practice, and it is always the *authoritative*
+    // location once present. A resolved path that still points somewhere
+    // else — e.g. a real install's `%LOCALAPPDATA%\Kitty\bigtiny-daemon.exe`,
+    // left over in this same user's config from before a `cargo tauri dev`
+    // checkout ever existed — is exactly the case `command_path_is_stale`
+    // can't catch: that file is perfectly real and loadable, so nothing
+    // complains, it just silently keeps running whatever daemon was frozen
+    // into it (a different backend/version) instead of the one that was
+    // just rebuilt next door.
+    let points_elsewhere_than_bundled = is_resolved_path
+        && bundled
+            .as_deref()
+            .is_some_and(|b| b != config.bigtiny_command);
+    let stale = (config.bigtiny_command == OLD_PYTHON_COMMAND
+        && config.bigtiny_args == old_python_args)
+        || is_cargo_dev_fallback
+        || command_path_is_stale(&config.bigtiny_command)
+        || points_elsewhere_than_bundled
+        || (bundled.is_none() && is_resolved_path);
     if stale {
-        if let Some(bundled) = bundled_plugin_path("bigtiny-daemon.exe") {
+        if let Some(bundled) = bundled {
             config.bigtiny_command = bundled;
             config.bigtiny_args = Vec::new();
+        } else if is_resolved_path {
+            config.bigtiny_command = default_bigtiny_command();
+            config.bigtiny_args = default_bigtiny_args();
         }
     }
     config
@@ -829,7 +884,10 @@ mod tests {
             fs::read_to_string(new.join("config.json")).unwrap(),
             "{\"theme\":\"dark\"}"
         );
-        assert_eq!(fs::read_to_string(new.join("themes").join("x.css")).unwrap(), "x");
+        assert_eq!(
+            fs::read_to_string(new.join("themes").join("x.css")).unwrap(),
+            "x"
+        );
         // Source untouched — the caller decides whether to remove it.
         assert!(old.exists());
         let _ = fs::remove_dir_all(&old);
@@ -977,6 +1035,18 @@ mod tests {
     }
 
     #[test]
+    fn migrate_bigtiny_launch_command_is_a_noop_for_cargo_dev_fallback_with_no_bundled_binary() {
+        let cfg = Config {
+            bigtiny_command: "cargo".to_string(),
+            bigtiny_args: default_bigtiny_args(),
+            ..Config::default()
+        };
+        let migrated = migrate_bigtiny_launch_command(cfg);
+        assert_eq!(migrated.bigtiny_command, "cargo");
+        assert!(migrated.bigtiny_args.iter().any(|a| a == "bigtiny-daemon"));
+    }
+
+    #[test]
     fn command_path_is_stale_true_for_missing_absolute_path() {
         assert!(command_path_is_stale(
             "C:/nonexistent/definitely/not/here/bigtiny-daemon.exe"
@@ -1018,19 +1088,22 @@ mod tests {
     }
 
     #[test]
-    fn migrate_bigtiny_launch_command_without_a_bundled_sibling_leaves_stale_path_as_is() {
+    fn migrate_bigtiny_launch_command_without_a_bundled_sibling_resets_a_stale_resolved_path_to_dev_default(
+    ) {
         // `bundled_plugin_path` resolves next to the *test binary*, which has
-        // no `bigtiny-daemon.exe` sibling, so even a detected-as-stale path
-        // is left in place rather than cleared to nothing — matches the
-        // realistic dev-build case (no frozen binary present yet). The
-        // real-world healing path (a bundled sibling IS present) is covered
-        // by `bundled_plugin_path`'s own existence check plus
-        // `command_path_is_stale`'s tests above; faking `current_exe()`
-        // itself isn't practical from a unit test.
+        // no `bigtiny-daemon.exe` sibling — the realistic `cargo tauri dev`
+        // case. A resolved filesystem path in `bigtiny_command` here can
+        // only be a leftover from a previous real install (a bundled build
+        // always writes one of these; hand-configuring dev mode uses a bare
+        // PATH command instead) — even though the file itself still exists,
+        // it should be reset to the dev-convenience default rather than left
+        // in place, since that default's own `bundled_plugin_path` lookup
+        // will *also* find nothing here and correctly fall through to the
+        // `cargo run ...` fallback.
         let dir = std::env::temp_dir().join(format!("kitty-stale-test-{}", uuid_like()));
         fs::create_dir_all(&dir).unwrap();
         let stale_daemon = dir.join("bigtiny-daemon.exe");
-        fs::write(&stale_daemon, []).unwrap(); // zero-byte, like a reset placeholder
+        fs::write(&stale_daemon, b"a real, still-loadable previous build").unwrap();
 
         let cfg = Config {
             bigtiny_command: stale_daemon.to_str().unwrap().to_string(),
@@ -1038,7 +1111,8 @@ mod tests {
             ..Config::default()
         };
         let migrated = migrate_bigtiny_launch_command(cfg);
-        assert_eq!(migrated.bigtiny_command, stale_daemon.to_str().unwrap());
+        assert_eq!(migrated.bigtiny_command, "cargo");
+        assert!(migrated.bigtiny_args.iter().any(|a| a == "bigtiny-daemon"));
 
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -1068,8 +1142,7 @@ mod tests {
             adaptive_pathway_db_path: old.to_str().unwrap().to_string(),
             ..Config::default()
         };
-        let migrated =
-            migrate_ap_db_path_impl(cfg, old.to_str().unwrap(), new.to_str().unwrap());
+        let migrated = migrate_ap_db_path_impl(cfg, old.to_str().unwrap(), new.to_str().unwrap());
 
         assert_eq!(migrated.adaptive_pathway_db_path, new.to_str().unwrap());
         assert!(!old.exists());
@@ -1091,8 +1164,7 @@ mod tests {
             adaptive_pathway_db_path: old.to_str().unwrap().to_string(),
             ..Config::default()
         };
-        let migrated =
-            migrate_ap_db_path_impl(cfg, old.to_str().unwrap(), new.to_str().unwrap());
+        let migrated = migrate_ap_db_path_impl(cfg, old.to_str().unwrap(), new.to_str().unwrap());
 
         assert_eq!(migrated.adaptive_pathway_db_path, new.to_str().unwrap());
         assert!(!new.exists());
@@ -1123,7 +1195,10 @@ mod tests {
         use std::time::{SystemTime, UNIX_EPOCH};
         format!(
             "{}-{:?}",
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
             std::thread::current().id()
         )
     }
@@ -1175,8 +1250,7 @@ mod tests {
         // The pre-flip shape: an explicit `false` with no migration marker.
         // Serde's new `default_true` can't reach an explicitly-present field,
         // so only the migration gets this install a working tool set.
-        let cfg: Config =
-            serde_json::from_str(r#"{"replacement_mcp_enabled":false}"#).unwrap();
+        let cfg: Config = serde_json::from_str(r#"{"replacement_mcp_enabled":false}"#).unwrap();
         assert!(!cfg.replacement_mcp_enabled);
         assert!(!cfg.replacement_mcp_default_migrated);
 

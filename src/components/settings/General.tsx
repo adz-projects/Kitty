@@ -7,7 +7,7 @@ import { Modal } from '@/components/shared/Modal';
 /** General settings backed by app config. Approval mode is per-session (see
     the chat mode badge) rather than living here. */
 export function General() {
-  const { draft, update, save, saved } = useConfigDraft();
+  const { draft, update, save, saved, error } = useConfigDraft();
   // Index of the hotkey row currently capturing a shortcut, or null.
   const [recording, setRecording] = useState<number | null>(null);
   const [recordingClipboard, setRecordingClipboard] = useState(false);
@@ -189,8 +189,8 @@ export function General() {
           </button>
         </div>
         <small className="muted">
-          Save to apply. Always opens a brand-new chat window with a fresh session — never
-          reuses an existing one.
+          Save to apply. Always opens a brand-new chat window with a fresh session — never reuses an
+          existing one.
         </small>
       </div>
 
@@ -239,6 +239,7 @@ export function General() {
           Save
         </button>
         {saved && <span className="muted">Saved.</span>}
+        {error && <span className="error">Couldn't save: {error}</span>}
       </div>
 
       {confirmClear && (

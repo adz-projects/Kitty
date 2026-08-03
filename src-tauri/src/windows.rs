@@ -49,6 +49,45 @@ fn url(label: &str) -> WebviewUrl {
     WebviewUrl::App(format!("src/windows/{dir}/index.html").into())
 }
 
+/// Dev-only watchdog for a window's first navigation. In dev the webview loads
+/// over HTTP from the Vite dev server; if that navigation ever errors or
+/// stalls, nothing else in this file would retry it — the overlay in
+/// particular is created once at startup and only ever shown/hidden, never
+/// destroyed — so the window would stay blank for the rest of the process's
+/// life. Poll for the frontend's own `window_ready` ack (state.rs's
+/// `booted_windows`) and re-navigate if it hasn't landed within a few
+/// seconds. Compiled out of release builds: there the assets are bundled
+/// locally and there is nothing transient to retry.
+#[cfg(debug_assertions)]
+fn spawn_load_watchdog(app: &AppHandle, win: WebviewWindow, label: String) {
+    const CHECK_INTERVAL: Duration = Duration::from_secs(4);
+    const MAX_ATTEMPTS: u32 = 3;
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        for attempt in 1..=MAX_ATTEMPTS {
+            tokio::time::sleep(CHECK_INTERVAL).await;
+            let booted = app
+                .state::<AppState>()
+                .booted_windows
+                .lock()
+                .unwrap()
+                .contains(&label);
+            if booted {
+                return;
+            }
+            let Ok(current) = win.url() else { continue };
+            tracing::warn!(
+                "window '{label}' hasn't reported ready after {attempt}x{CHECK_INTERVAL:?} \
+                 (dev server hiccup?) — re-navigating to {current}"
+            );
+            if let Err(e) = win.navigate(current) {
+                tracing::warn!("watchdog re-navigate for '{label}' failed: {e}");
+            }
+        }
+        tracing::warn!("window '{label}' still not ready after {MAX_ATTEMPTS} retries, giving up");
+    });
+}
+
 /// Build the overlay up front, hidden. Called once from `setup`. Positioned once
 /// at the lower-right of the primary monitor's work area, just above the taskbar
 /// (Round-2 item 7); the user can still drag it elsewhere afterward.
@@ -64,6 +103,8 @@ pub fn create_overlay(app: &AppHandle) -> tauri::Result<WebviewWindow> {
         .visible(false)
         .build()?;
     place_overlay_bottom_right(&win);
+    #[cfg(debug_assertions)]
+    spawn_load_watchdog(app, win.clone(), OVERLAY.to_string());
     Ok(win)
 }
 
@@ -290,6 +331,47 @@ pub fn show_and_focus(app: &AppHandle, label: &str) -> bool {
     true
 }
 
+/// Taskbar-icon click behavior: a second launch attempt (double-clicking the
+/// exe again, or clicking its taskbar-pinned/Start-menu shortcut while
+/// already running) is caught by the single-instance plugin and routed here
+/// instead of spawning a new process (see `lib.rs`). Deliberately excludes
+/// the overlay entirely — unlike `any_open_chat_window`'s notification-click
+/// fallback, which treats the overlay as just another chat-capable surface,
+/// a taskbar-icon click should always resolve to the full chat-window
+/// experience (`main` or a `chat-N`): focus one if any exists (preferring an
+/// already-focused one, else the first found), otherwise open a brand-new
+/// one. Never creates or shows the overlay.
+pub fn focus_or_open_chat_window(app: &AppHandle) {
+    let mut candidates: Vec<String> = vec![MAIN.to_string()];
+    {
+        let state = app.state::<AppState>();
+        let map = state.chat_windows.lock().unwrap();
+        let mut labels: Vec<String> = map.keys().cloned().collect();
+        labels.sort();
+        candidates.extend(labels);
+    }
+    let is_focused = |label: &str| {
+        app.get_webview_window(label)
+            .and_then(|w| w.is_focused().ok())
+            .unwrap_or(false)
+    };
+    let exists = |label: &str| app.get_webview_window(label).is_some();
+
+    let target = candidates
+        .iter()
+        .find(|l| is_focused(l))
+        .or_else(|| candidates.iter().find(|l| exists(l)));
+
+    match target {
+        Some(label) => {
+            show_and_focus(app, label);
+        }
+        None => {
+            let _ = open_new_chat_window(app, None);
+        }
+    }
+}
+
 /// The tray-click / hotkey action (Round-3 item 28): the overlay and main
 /// window are never both active at once — if main is already open, focus it
 /// instead of also summoning the overlay; otherwise fall through to the usual
@@ -316,12 +398,15 @@ fn ensure_window(
     if let Some(win) = app.get_webview_window(label) {
         return Ok(win);
     }
-    WebviewWindowBuilder::new(app, label, url(label))
+    let win = WebviewWindowBuilder::new(app, label, url(label))
         .title(title)
         .inner_size(initial_size.0, initial_size.1)
         .min_inner_size(640.0, 420.0)
         .visible(false)
-        .build()
+        .build()?;
+    #[cfg(debug_assertions)]
+    spawn_load_watchdog(app, win.clone(), label.to_string());
+    Ok(win)
 }
 
 /// Open the full window (Phase 2 binds it to the active session). 15% wider
@@ -353,7 +438,11 @@ fn build_chat_window(app: &AppHandle, label: &str) -> tauri::Result<WebviewWindo
         if matches!(event, tauri::WindowEvent::Destroyed) {
             let state = cleanup_app.state::<AppState>();
             state.chat_windows.lock().unwrap().remove(&cleanup_label);
-            state.pending_handoffs.lock().unwrap().remove(&cleanup_label);
+            state
+                .pending_handoffs
+                .lock()
+                .unwrap()
+                .remove(&cleanup_label);
         }
     });
 
@@ -389,7 +478,10 @@ pub fn create_screenshot_select_window(
         .visible(false)
         .build()?;
     win.set_position(tauri::PhysicalPosition::new(x, y))?;
-    win.set_size(tauri::PhysicalSize::new(width.max(1) as u32, height.max(1) as u32))?;
+    win.set_size(tauri::PhysicalSize::new(
+        width.max(1) as u32,
+        height.max(1) as u32,
+    ))?;
     Ok(win)
 }
 
@@ -411,9 +503,17 @@ pub fn open_new_chat_window(
         let mut counter = state.next_chat_window_id.lock().unwrap();
         *counter += 1;
         let label = format!("chat-{}", *counter);
-        state.chat_windows.lock().unwrap().insert(label.clone(), None);
+        state
+            .chat_windows
+            .lock()
+            .unwrap()
+            .insert(label.clone(), None);
         if let Some(payload) = handoff {
-            state.pending_handoffs.lock().unwrap().insert(label.clone(), payload);
+            state
+                .pending_handoffs
+                .lock()
+                .unwrap()
+                .insert(label.clone(), payload);
         }
         label
     };

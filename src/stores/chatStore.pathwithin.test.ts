@@ -133,11 +133,7 @@ describe('decideChatApproval', () => {
   });
 
   it('prompts for a path outside both chat_dir and the diverged context_dir', () => {
-    const r = decideChatApproval(
-      { path: 'C:/Users/me/Desktop/x.docx' },
-      [BASE, CONTEXT_DIR],
-      OPTS
-    );
+    const r = decideChatApproval({ path: 'C:/Users/me/Desktop/x.docx' }, [BASE, CONTEXT_DIR], OPTS);
     expect(r.decision).toBe('prompt');
   });
 });
@@ -168,9 +164,7 @@ describe('isInternalToolCachePath', () => {
     expect(
       isInternalToolCachePath('C:\\Users\\me\\AppData\\Local\\Block\\goose\\cache\\x.txt')
     ).toBe(true);
-    expect(isInternalToolCachePath('c:/users/me/appdata/local/BLOCK/GOOSE/CACHE/y.txt')).toBe(
-      true
-    );
+    expect(isInternalToolCachePath('c:/users/me/appdata/local/BLOCK/GOOSE/CACHE/y.txt')).toBe(true);
   });
 
   it('does not match unrelated paths', () => {

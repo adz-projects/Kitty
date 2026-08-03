@@ -18,7 +18,20 @@ export function FirstModelStep({
   const [progress, setProgress] = useState<PullProgress | null>(null);
   const [installed, setInstalled] = useState<string[]>([]);
   const [connecting, setConnecting] = useState(false);
+  const [pulling, setPulling] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  const download = async () => {
+    setPulling(true);
+    setError(null);
+    try {
+      await ipc.ollamaPullModel(selected);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setPulling(false);
+    }
+  };
 
   useEffect(() => {
     void ipc.ollamaListModels().then((m) => setInstalled(m.map((x) => x.name)));
@@ -37,7 +50,7 @@ export function FirstModelStep({
   // an Ollama provider profile pointing at it. Reuses/updates an existing
   // Ollama profile if one's already there (re-running the wizard via
   // Settings → Setup & Repair) instead of accumulating duplicates.
-  const useModel = async () => {
+  const activateModel = async () => {
     setConnecting(true);
     setError(null);
     try {
@@ -54,10 +67,16 @@ export function FirstModelStep({
             is_trusted: true,
             temperature: null,
             top_p: null,
+            top_k: null,
+            min_p: null,
+            presence_penalty: null,
+            frequency_penalty: null,
+            max_tokens: null,
             context_length: null,
             strip_reasoning: false,
             system_prompt: null,
             prompt_idle_timeout_secs: null,
+            parallel_slots: null,
             created_at: '',
           };
       const saved = await ipc.upsertProvider(profile, null);
@@ -152,12 +171,12 @@ export function FirstModelStep({
           Skip for now
         </button>
         {have ? (
-          <button className="primary" disabled={connecting} onClick={() => void useModel()}>
+          <button className="primary" disabled={connecting} onClick={() => void activateModel()}>
             {connecting ? 'Connecting…' : 'Use this model →'}
           </button>
         ) : (
-          <button className="primary" onClick={() => void ipc.ollamaPullModel(selected)}>
-            Download
+          <button className="primary" disabled={pulling} onClick={() => void download()}>
+            {pulling ? 'Downloading…' : 'Download'}
           </button>
         )}
       </div>

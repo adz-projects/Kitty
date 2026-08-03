@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { ipc, onWizardNavigate } from '@/lib/ipc';
 import type { Config } from '@/lib/types';
 import { PathFork, type WizardPath } from './PathFork';
@@ -48,37 +48,66 @@ export function stepsForPath(
 export function App() {
   const [mode, setMode] = useState<'setup' | 'repair'>('setup');
   const [cfg, setCfg] = useState<Config | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [saveError, setSaveError] = useState<string | null>(null);
   const [path, setPath] = useState<WizardPath | null>(null);
   const [stepIndex, setStepIndex] = useState(0);
   const [completedThrough, setCompletedThrough] = useState(0);
 
+  // Mirrors `cfg` synchronously so back-to-back saveCfg calls (e.g. rapid
+  // keystrokes) each merge onto the latest patch instead of the stale `cfg`
+  // closure from whichever render they were created in.
+  const cfgRef = useRef<Config | null>(null);
+  cfgRef.current = cfg;
+  // Serializes the actual disk writes so concurrent ipc.setConfig calls can't
+  // resolve out of order and leave a stale value persisted.
+  const writeQueueRef = useRef<Promise<void>>(Promise.resolve());
+
   useEffect(() => {
-    void ipc.getWizardMode().then((m) => {
-      const repair = m === 'repair';
-      if (repair) setMode('repair');
-      void ipc.getConfig().then((c) => {
-        setCfg(c);
-        if (!repair) return;
-        // Repair mode: infer the path from what's already configured and
-        // jump straight past the "welcome" fork.
-        const active = c.providers.find((p) => p.id === c.active_provider_id);
-        const inferred: WizardPath =
-          active && active.provider_type !== 'ollama' ? 'api-key' : 'local';
-        setPath(inferred);
-        setStepIndex(1);
-        setCompletedThrough(1);
-      });
-    });
+    void ipc
+      .getWizardMode()
+      .then((m) => {
+        const repair = m === 'repair';
+        if (repair) setMode('repair');
+        return ipc.getConfig().then((c) => {
+          setCfg(c);
+          if (!repair) return;
+          // Repair mode: infer the path from what's already configured and
+          // jump straight past the "welcome" fork.
+          const active = c.providers.find((p) => p.id === c.active_provider_id);
+          const inferred: WizardPath =
+            active && active.provider_type !== 'ollama' ? 'api-key' : 'local';
+          setPath(inferred);
+          setStepIndex(1);
+          setCompletedThrough(1);
+        });
+      })
+      .catch((e) => setLoadError(String(e)));
     const un = onWizardNavigate((m) => setMode(m === 'repair' ? 'repair' : 'setup'));
     return () => void un.then((fn) => fn());
   }, []);
 
-  const saveCfg = async (patch: Partial<Config>) => {
-    if (!cfg) return;
-    const next = { ...cfg, ...patch };
+  const saveCfg = (patch: Partial<Config>) => {
+    const base = cfgRef.current;
+    if (!base) return Promise.resolve();
+    const next = { ...base, ...patch };
+    cfgRef.current = next;
     setCfg(next);
-    await ipc.setConfig(next);
+    const run = writeQueueRef.current.then(() => ipc.setConfig(next));
+    writeQueueRef.current = run.catch(() => {});
+    return run.catch((e) => {
+      setSaveError(String(e));
+      throw e;
+    });
   };
+
+  if (loadError) {
+    return (
+      <div className="window-root wizard">
+        <p className="error">Couldn't load setup: {loadError}</p>
+      </div>
+    );
+  }
 
   if (!cfg) {
     return (
@@ -100,6 +129,11 @@ export function App() {
 
   return (
     <div className="window-root wizard">
+      {saveError && (
+        <p className="error" onClick={() => setSaveError(null)}>
+          Couldn't save: {saveError}
+        </p>
+      )}
       <div className="wizard-steps">
         {steps.map((s, i) => (
           <button
@@ -126,7 +160,11 @@ export function App() {
             // local-Ollama-only regardless of chat provider) — only force it
             // off when AP won't need it either, so the toggle in Settings →
             // Advanced doesn't read as "off" while Ollama is actually running.
-            await saveCfg({ ollama_enabled: p === 'local' || cfg.adaptive_pathway_enabled });
+            try {
+              await saveCfg({ ollama_enabled: p === 'local' || cfg.adaptive_pathway_enabled });
+            } catch {
+              return; // saveError banner already shown; don't advance on a failed save
+            }
             nextAndMark();
           }}
         />

@@ -63,11 +63,11 @@ standalone Windows `.exe`s via PyInstaller and bundled through Tauri's
   involvement is keeping the registration's command path pointed at the
   current install's bundled exe and its `enabled` flag in sync with Settings
   (`bigtiny::mcp::ensure_builtin_servers`, `commands/mcp_servers.rs`). Hosts
-  20 context-optimized local-machine tools in one process — shell/workspace/
+  18 context-optimized local-machine tools in one process — shell/workspace/
   file/Word/cache/scratchpad (always on; this is the retired
   `replacement-mcp`'s full surface, now hand-rolled in Rust — **on by
   default**, since they're what makes the small local models Kitty targets
-  usable as agents at all), plus 2 accessible-table/SVG-diagram
+  usable as agents at all), plus 3 accessible-table/SVG-diagram/chart
   visualization tools, gated by their own Settings toggle (an env var on
   this one process, not a separate server). No network calls of its own —
   web search moved to `kitty-docs-web` below. Toggled in Settings → MCP

@@ -74,7 +74,24 @@ pub fn get_pending_handoff(
     window: tauri::Window,
     state: tauri::State<'_, AppState>,
 ) -> Result<Option<serde_json::Value>, String> {
-    Ok(state.pending_handoffs.lock().unwrap().remove(window.label()))
+    Ok(state
+        .pending_handoffs
+        .lock()
+        .unwrap()
+        .remove(window.label()))
+}
+
+/// Called once by every window's frontend right after mounting. Lets the
+/// dev-only load watchdog (`windows::spawn_load_watchdog`) tell a window that
+/// is still loading apart from one whose first navigation failed and will
+/// never load on its own — see `state::AppState::booted_windows`.
+#[tauri::command]
+pub fn window_ready(window: tauri::Window, state: tauri::State<'_, AppState>) {
+    state
+        .booted_windows
+        .lock()
+        .unwrap()
+        .insert(window.label().to_string());
 }
 
 /// Current stack status (frontend also listens to `stack://status`).

@@ -76,6 +76,53 @@ def test_update_increments_call_counter():
     assert ensemble.call_counter == 1
 
 
+def test_base_samples_excludes_pc_model():
+    config = _load_config()
+    ensemble = BootstrapEnsemble(config, _mock_domain, _mock_edge)
+    ctx = np.random.randn(64).astype(np.float64)
+    ctx /= np.linalg.norm(ctx)
+    weights, samples = ensemble.base_samples(0, ctx)
+    assert len(weights) == 5
+    assert len(samples) == 5
+    assert np.isclose(sum(weights) + ensemble.pc_weight, 1.0, atol=0.01)
+
+
+def test_sample_edge_aware_equals_bucket_sample_when_pc_degenerate():
+    config = _load_config()
+    ensemble = BootstrapEnsemble(config, _mock_domain, _mock_edge)
+    ctx = np.random.randn(64).astype(np.float64)
+    ctx /= np.linalg.norm(ctx)
+    base = ensemble.base_samples(0, ctx)
+    score, samples = ensemble.sample_edge_aware(0, 0, ctx, [], {}, base=base)
+    assert len(samples) == 6
+    assert samples[-1] == 0.0
+    assert np.isclose(score, float(np.dot(base[0], base[1])))
+
+
+def test_sample_edge_aware_pc_uses_edge_id_and_domain_stats():
+    config = _load_config()
+    ensemble = BootstrapEnsemble(config, _mock_domain, _mock_edge)
+
+    def edge_fn(action_id):
+        if action_id == "python:edge_1":
+            return type("E", (), {"semantic_primitive": "write_python", "co_selected_with": []})()
+        return None
+
+    ensemble.models[5]._get_edge = edge_fn
+    ctx = np.random.randn(64).astype(np.float64)
+    ctx /= np.linalg.norm(ctx)
+    base = ensemble.base_samples(0, ctx)
+    stats = {"python": {"avg_confidence": 0.3, "avg_novelty": 0.0},
+             "js": {"avg_confidence": 0.9, "avg_novelty": 0.0}}
+    score, samples = ensemble.sample_edge_aware(
+        "python:edge_1", 0, ctx, ["js:edge_2"], stats, base=base)
+    pc_s = samples[-1]
+    assert pc_s > 0.0
+    assert np.isclose(score, float(np.dot(base[0], base[1]) + ensemble.pc_weight * pc_s))
+    degenerate, _ = ensemble.sample_edge_aware("python:edge_1", 0, ctx, [], {}, base=base)
+    assert score > degenerate
+
+
 # ─── Uncertainty-guaranteed exploration slot ───────────────────────────────
 
 

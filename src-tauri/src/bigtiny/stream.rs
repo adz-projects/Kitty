@@ -8,7 +8,7 @@
 //! - `tool_start`      -> `chat://tool-call` (phase `tool_call`)
 //! - `tool_finish`     -> `chat://tool-call` (phase `tool_call_update`)
 //! - `hitl_pause`      -> `chat://tool-approval-needed` (answered later via
-//!                        `respond_permission` -> `POST .../approve`)
+//!   `respond_permission` -> `POST .../approve`)
 //! - `session_title`   -> `chat://session-title`
 //! - `llm_stop`        -> captures usage for the final `chat://complete`
 //! - `error`           -> `chat://error` at stream end
@@ -146,7 +146,13 @@ pub async fn send_prompt(
     tauri::async_runtime::spawn(async move {
         let outcome = run_stream(&app_bg, &client, &session_id, &body).await;
         match outcome {
-            Ok(TurnOutcome { error: None, cancelled, usage, timing, .. }) => {
+            Ok(TurnOutcome {
+                error: None,
+                cancelled,
+                usage,
+                timing,
+                ..
+            }) => {
                 let mut result = json!({
                     "stopReason": if cancelled { "cancelled" } else { "end_turn" },
                 });
@@ -170,7 +176,11 @@ pub async fn send_prompt(
                 providers::emit_health_from_send_result(&app_bg, true);
                 poll_compaction_status(app_bg.clone(), session_id.clone());
             }
-            Ok(TurnOutcome { error: Some(message), error_type, .. }) => {
+            Ok(TurnOutcome {
+                error: Some(message),
+                error_type,
+                ..
+            }) => {
                 let _ = app_bg.emit(
                     "chat://error",
                     json!({ "session_id": session_id, "message": &message, "error_type": error_type }),
@@ -229,7 +239,10 @@ fn poll_compaction_status(app: AppHandle, session_id: String) {
         let Ok(stats) = crate::bigtiny::sessions::get_stats(&app, &session_id).await else {
             return;
         };
-        let Some(rowid) = stats.get("compacted_through_rowid").and_then(|v| v.as_i64()) else {
+        let Some(rowid) = stats
+            .get("compacted_through_rowid")
+            .and_then(|v| v.as_i64())
+        else {
             return;
         };
 
@@ -302,15 +315,17 @@ async fn run_stream(
         // miss: a "\n\n" boundary split exactly across the old/new chunk
         // join, with one "\n" at the very end of the previously-scanned
         // region and the second "\n" at the very start of the new tail.
-        while let Some(pos) = find_frame_boundary(buffer.as_bytes(), scan_from.saturating_sub(1))
-        {
+        while let Some(pos) = find_frame_boundary(buffer.as_bytes(), scan_from.saturating_sub(1)) {
             let frame = buffer[..pos].to_string();
             buffer.drain(..pos + 2);
             scan_from = 0;
             let Some(event) = parse_sse_frame(&frame) else {
                 continue;
             };
-            let is_last = event.get("is_last").and_then(|v| v.as_bool()).unwrap_or(false);
+            let is_last = event
+                .get("is_last")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             handle_event(
                 app,
                 session_id,
@@ -341,7 +356,10 @@ fn handle_event(
 ) {
     let kind = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
     let content = event.get("content").and_then(|c| c.as_str());
-    let tool_name = event.get("tool_name").and_then(|t| t.as_str()).unwrap_or("");
+    let tool_name = event
+        .get("tool_name")
+        .and_then(|t| t.as_str())
+        .unwrap_or("");
 
     match kind {
         "llm_delta" => {
@@ -393,8 +411,8 @@ fn handle_event(
                 .get("tool_result")
                 .and_then(|r| r.as_str())
                 .unwrap_or("");
-            let reward = reward_from_tool_finish(result_text);
-            let failed = reward < 0.0;
+            let error_type = error_type_from_tool_finish(result_text);
+            let failed = error_type.is_some();
             let _ = app.emit(
                 "chat://tool-call",
                 json!({
@@ -407,7 +425,12 @@ fn handle_event(
                     },
                 }),
             );
-            maybe_record_outcome(app, session_id, &started_name, reward);
+            // End-of-turn outcome recording now lives in the BigTiny daemon
+            // (`bigtiny_rust::agent::loop_::spawn_record_outcome`) where the
+            // real context + reward source is available; the old app-layer
+            // context-free backstop was removed to avoid double-recording the
+            // same tool outcome to AP (which would skew learning rewards).
+            let _ = started_name;
         }
         "hitl_pause" => {
             let Some(action_id) = event.get("action_id").and_then(|a| a.as_str()) else {
@@ -456,13 +479,31 @@ fn handle_event(
         }
         "llm_stop" => {
             if let Some(usage) = event.get("usage").filter(|u| u.is_object()) {
-                let input = usage.get("input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
-                let output = usage.get("output_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
-                outcome.usage = Some(json!({
+                let input = usage
+                    .get("input_tokens")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                let output = usage
+                    .get("output_tokens")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                let mut result = json!({
                     "inputTokens": input,
                     "outputTokens": output,
                     "totalTokens": input + output,
-                }));
+                });
+                // Prompt-cache stats — absent entirely for providers/models
+                // that don't report them (most local/OpenAI-compat setups),
+                // as opposed to defaulting to 0 like input/output above,
+                // so the frontend can tell "no cache data" apart from "cache
+                // miss on every token".
+                if let Some(v) = usage.get("cache_read_tokens").and_then(|v| v.as_i64()) {
+                    result["cacheReadTokens"] = json!(v);
+                }
+                if let Some(v) = usage.get("cache_creation_tokens").and_then(|v| v.as_i64()) {
+                    result["cacheCreationTokens"] = json!(v);
+                }
+                outcome.usage = Some(result);
             }
         }
         "llm_timing" => {
@@ -525,72 +566,15 @@ fn handle_event(
     }
 }
 
-/// Tool names the bundled adaptive-pathway MCP server exposes (see
-/// `plugins/adaptive-pathway/src/adaptive_pathway/mcp_server.py`) — excluded
-/// from the auto-record-outcome backstop below, same rationale as the
-/// goosed path's extension-name exclusion (`goosed::stream`): recording an
-/// outcome for a call to `record_outcome` itself would be nonsensical.
-/// Unlike the goosed path, BigTiny's `tool_start`/`tool_finish` events carry
-/// no extension identifier, so the exclusion has to be by tool name instead.
-const ADAPTIVE_PATHWAY_TOOL_NAMES: &[&str] = &[
-    "decide",
-    "record_outcome",
-    "record_annotation",
-    "get_state",
-    "list_edges",
-    "get_edge",
-    "query_attribution",
-    "list_domains",
-    "toggle_suggestions",
-    "health_check",
-    "accept_nudge",
-    "session_reflection",
-    "resolve_schism",
-];
-
-/// Pure: whether a tool call should be tracked for the auto-record-outcome
-/// backstop.
-fn should_track_tool_call(tool_name: &str) -> bool {
-    !ADAPTIVE_PATHWAY_TOOL_NAMES.contains(&tool_name)
-}
-
-/// Pure: a shell-style tool result's reward — `-1.0` for anything the tool
-/// itself reported as an error, `1.0` otherwise. Unlike the goosed path,
-/// BigTiny's `ToolResult.content` is a flat string with no `exit_code`
-/// field, so a string-prefix check on the error markers BigTiny's own MCP
-/// manager writes (`bigtiny/mcp/manager.py`'s `ToolResult.content` for
-/// timeouts/errors, and MCP tool responses under `[Tool ... error]`/`Error`)
-/// is the only failure signal available.
-fn reward_from_tool_finish(result_text: &str) -> f64 {
-    let failed = result_text.starts_with("Error") || result_text.starts_with("[Tool error");
-    if failed { -1.0 } else { 1.0 }
-}
-
-/// Best-effort backstop so `record_outcome` doesn't depend on the model
-/// remembering to call it itself — mirrors the goosed path's
-/// `track_and_maybe_record_outcome`, simplified since BigTiny already hands
-/// us a paired (name, reward) at `tool_finish` instead of requiring a
-/// two-step id-keyed tracker across separate start/update events. Never
-/// surfaces errors to the user or blocks the stream reader.
-fn maybe_record_outcome(app: &AppHandle, session_id: &str, tool_name: &str, reward: f64) {
-    if !should_track_tool_call(tool_name) {
-        return;
+/// Pure: `Some("crash")` when the tool result read as an error — used only to
+/// mark the tool-call card as `failed` in the UI. (Outcome *recording* to AP
+/// now lives in the BigTiny daemon, where the real context is available.)
+fn error_type_from_tool_finish(result_text: &str) -> Option<&'static str> {
+    if result_text.starts_with("Error") || result_text.starts_with("[Tool error") {
+        Some("crash")
+    } else {
+        None
     }
-    let enabled = {
-        let state = app.state::<AppState>();
-        let cfg = state.config.lock().unwrap();
-        cfg.adaptive_pathway_enabled
-    };
-    if !enabled {
-        return;
-    }
-    let base = crate::adaptive_pathway::base_url(app);
-    let session_id = session_id.to_string();
-    let tool_name = tool_name.to_string();
-    tauri::async_runtime::spawn(async move {
-        let _ =
-            crate::adaptive_pathway::record_outcome(&base, &session_id, &tool_name, reward).await;
-    });
 }
 
 /// Cancel the in-flight turn (`POST /api/chat/{id}/cancel`); BigTiny resolves
@@ -702,30 +686,16 @@ mod tests {
     }
 
     #[test]
-    fn reward_from_tool_finish_success_on_plain_output() {
-        assert_eq!(reward_from_tool_finish("file contents here"), 1.0);
-        assert_eq!(reward_from_tool_finish(""), 1.0);
-    }
-
-    #[test]
-    fn reward_from_tool_finish_failure_on_error_prefixes() {
-        assert_eq!(reward_from_tool_finish("Error: file not found"), -1.0);
+    fn error_type_from_tool_finish_only_on_error_prefixes() {
+        assert_eq!(error_type_from_tool_finish("file contents here"), None);
+        assert_eq!(error_type_from_tool_finish(""), None);
         assert_eq!(
-            reward_from_tool_finish("[Tool error: something broke]"),
-            -1.0
+            error_type_from_tool_finish("Error: file not found"),
+            Some("crash")
         );
-    }
-
-    #[test]
-    fn should_track_tool_call_excludes_adaptive_pathway_tools() {
-        assert!(!should_track_tool_call("decide"));
-        assert!(!should_track_tool_call("record_outcome"));
-        assert!(!should_track_tool_call("resolve_schism"));
-    }
-
-    #[test]
-    fn should_track_tool_call_includes_other_tools() {
-        assert!(should_track_tool_call("shell"));
-        assert!(should_track_tool_call(""));
+        assert_eq!(
+            error_type_from_tool_finish("[Tool error: timeout]"),
+            Some("crash")
+        );
     }
 }

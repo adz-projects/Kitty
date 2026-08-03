@@ -100,7 +100,10 @@ fn parse_server(row: &Value) -> Option<McpServer> {
         id: row.get("id")?.as_str()?.to_string(),
         name: row.get("name")?.as_str()?.to_string(),
         transport: row.get("transport")?.as_str()?.to_string(),
-        command: row.get("command").and_then(|v| v.as_str()).map(String::from),
+        command: row
+            .get("command")
+            .and_then(|v| v.as_str())
+            .map(String::from),
         args,
         url: row.get("url").and_then(|v| v.as_str()).map(String::from),
         env,
@@ -221,6 +224,7 @@ pub async fn ensure_builtin_servers(app: &AppHandle) {
         ap_db_path,
         ap_embedding_model,
         ollama_base,
+        ap_port,
     ) = {
         let state = app.state::<AppState>();
         let cfg = state.config.lock().unwrap();
@@ -234,6 +238,7 @@ pub async fn ensure_builtin_servers(app: &AppHandle) {
             cfg.adaptive_pathway_db_path.clone(),
             cfg.adaptive_pathway_embedding_model.clone(),
             cfg.ollama_base_url.clone(),
+            cfg.adaptive_pathway_port,
         )
     };
 
@@ -242,6 +247,9 @@ pub async fn ensure_builtin_servers(app: &AppHandle) {
     let mut ap_env = HashMap::new();
     ap_env.insert("AP_EMBED_OLLAMA_MODEL".to_string(), ap_embedding_model);
     ap_env.insert("AP_EMBED_OLLAMA_URL".to_string(), ollama_base);
+    // The MCP server is a stateless HTTP proxy to the sidecar; it must know
+    // which port the sidecar (spawned separately by `lifecycle`) is bound to.
+    ap_env.insert("AP_SIDECAR_PORT".to_string(), ap_port.to_string());
     upsert_builtin(
         &client,
         "adaptive-pathway",
@@ -278,7 +286,7 @@ pub async fn ensure_builtin_servers(app: &AppHandle) {
 
     // `kitty-tools` hosts the local-machine tool set — 18 always-on
     // `lean_*` tools (shell/workspace/file/word/cache/scratchpad), plus the
-    // 2 visualization tools gated by `KITTY_VIZ_ENABLED` rather than
+    // 3 visualization tools gated by `KITTY_VIZ_ENABLED` rather than
     // registered as their own separate server. `enabled` alone
     // (`kitty_tools_enabled`) controls whether the whole server is
     // registered at all; `visualizations_enabled` only controls which tools
@@ -365,6 +373,17 @@ pub async fn ensure_builtin_servers(app: &AppHandle) {
             );
         }
     }
+}
+
+/// Periodic self-heal re-sync of the bundled MCP servers, run from the
+/// Adaptive Pathway health loop (on the same ~30s cadence as the embedding
+/// model recheck) — not just once at startup. Re-uses `ensure_builtin_servers`,
+/// whose `decide_sync_action` issues a `Connect` for any enabled row that
+/// isn't `connected` (a transient connect failure on boot, or a sidecar-port
+/// change after startup), so a dropped builtin server recovers by itself
+/// instead of staying dead until the app restarts. Best-effort: logs only.
+pub async fn self_heal_builtin_servers(app: &AppHandle) {
+    ensure_builtin_servers(app).await;
 }
 
 /// Number of attempts (with a short backoff between) for the `list_servers`
@@ -548,7 +567,10 @@ mod tests {
     #[test]
     fn creates_when_no_row_exists() {
         let desired = spec("brave-mcp-search", "brave-mcp-search.exe", true);
-        assert_eq!(decide_sync_action(&[], "brave-mcp-search", &desired), SyncAction::Create);
+        assert_eq!(
+            decide_sync_action(&[], "brave-mcp-search", &desired),
+            SyncAction::Create
+        );
     }
 
     #[test]
@@ -567,7 +589,12 @@ mod tests {
     /// would call this a no-op forever.
     #[test]
     fn reconnects_a_matching_but_unconnected_row_when_desired_is_enabled() {
-        let existing = vec![row("brave-mcp-search", "brave-mcp-search.exe", true, "error")];
+        let existing = vec![row(
+            "brave-mcp-search",
+            "brave-mcp-search.exe",
+            true,
+            "error",
+        )];
         let desired = spec("brave-mcp-search", "brave-mcp-search.exe", true);
         match decide_sync_action(&existing, "brave-mcp-search", &desired) {
             SyncAction::Connect { row_id } => assert_eq!(row_id, "brave-mcp-search-id"),
@@ -577,7 +604,12 @@ mod tests {
 
     #[test]
     fn does_not_reconnect_a_disconnected_row_when_desired_is_disabled() {
-        let existing = vec![row("brave-mcp-search", "brave-mcp-search.exe", false, "disconnected")];
+        let existing = vec![row(
+            "brave-mcp-search",
+            "brave-mcp-search.exe",
+            false,
+            "disconnected",
+        )];
         let desired = spec("brave-mcp-search", "brave-mcp-search.exe", false);
         assert_eq!(
             decide_sync_action(&existing, "brave-mcp-search", &desired),
@@ -587,7 +619,12 @@ mod tests {
 
     #[test]
     fn is_a_noop_when_everything_already_matches_and_is_connected() {
-        let existing = vec![row("brave-mcp-search", "brave-mcp-search.exe", true, "connected")];
+        let existing = vec![row(
+            "brave-mcp-search",
+            "brave-mcp-search.exe",
+            true,
+            "connected",
+        )];
         let desired = spec("brave-mcp-search", "brave-mcp-search.exe", true);
         assert_eq!(
             decide_sync_action(&existing, "brave-mcp-search", &desired),

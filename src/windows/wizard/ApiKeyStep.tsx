@@ -28,10 +28,16 @@ function blankApiKeyProfile(type: ProviderType): ProviderProfile {
     is_trusted: FIRST_PARTY.includes(type),
     temperature: null,
     top_p: null,
+    top_k: null,
+    min_p: null,
+    presence_penalty: null,
+    frequency_penalty: null,
+    max_tokens: null,
     context_length: null,
     strip_reasoning: false,
     system_prompt: null,
     prompt_idle_timeout_secs: null,
+    parallel_slots: null,
     created_at: '',
   };
 }
@@ -79,6 +85,7 @@ export function ApiKeyStep({ onBack, onNext }: { onBack: () => void; onNext: () 
           onChange={(e) => {
             const pt = e.target.value as ProviderType;
             setProfile(blankApiKeyProfile(pt));
+            setSecret('');
           }}
         >
           {(['anthropic', 'openai', 'openrouter', 'custom_openai'] as ProviderType[]).map((t) => (

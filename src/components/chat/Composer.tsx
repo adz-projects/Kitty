@@ -60,6 +60,8 @@ export function Composer({
   const [recipes, setRecipes] = useState<Recipe[]>([]);
   useEffect(() => {
     const load = () =>
+      // Best-effort: a failure just leaves slash-command autocomplete stale
+      // until the next onRecipesChanged event or remount.
       void ipc
         .listRecipes()
         .then(setRecipes)

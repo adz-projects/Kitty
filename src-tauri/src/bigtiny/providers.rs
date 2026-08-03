@@ -46,14 +46,43 @@ pub async fn sync_active_provider(app: &AppHandle) -> Result<Option<String>, Str
     if let Some(m) = &model {
         config["model"] = Value::String(m.clone());
     }
+    // `provider_type` above is BigTiny's wire-format column (`openai_compat`
+    // | `anthropic`, DB-constrained) — it collapses ollama/openai/openrouter/
+    // custom_openai together, so it can't tell a self-hosted endpoint apart
+    // from a hosted one. `provider_dialect` carries Kitty's original,
+    // granular `profile.provider_type` through the unconstrained `config`
+    // blob instead; BigTiny's router reads it back
+    // (`ProviderRouter::register_from_row`) to decide which providers get a
+    // repetition-safe sampling floor (`provider::sampling::defaults_for`)
+    // and which llama.cpp/Ollama-only fields (`top_k`/`min_p`) are safe to
+    // put on the wire.
+    config["provider_dialect"] = Value::String(profile.provider_type.clone());
     if let Some(t) = profile.temperature {
         config["temperature"] = json!(t);
     }
     if let Some(p) = profile.top_p {
         config["top_p"] = json!(p);
     }
+    if let Some(k) = profile.top_k {
+        config["top_k"] = json!(k);
+    }
+    if let Some(p) = profile.min_p {
+        config["min_p"] = json!(p);
+    }
+    if let Some(p) = profile.presence_penalty {
+        config["presence_penalty"] = json!(p);
+    }
+    if let Some(f) = profile.frequency_penalty {
+        config["frequency_penalty"] = json!(f);
+    }
+    if let Some(m) = profile.max_tokens {
+        config["max_tokens"] = json!(m);
+    }
     if let Some(c) = profile.context_length {
         config["context_length"] = json!(c);
+    }
+    if let Some(n) = profile.parallel_slots {
+        config["parallel_slots"] = json!(n);
     }
 
     let client = ensure_client(app)?;
@@ -62,9 +91,8 @@ pub async fn sync_active_provider(app: &AppHandle) -> Result<Option<String>, Str
         .get("providers")
         .and_then(|p| p.as_array())
         .and_then(|rows| {
-            rows.iter().find(|r| {
-                r.get("name").and_then(|n| n.as_str()) == Some(profile.name.as_str())
-            })
+            rows.iter()
+                .find(|r| r.get("name").and_then(|n| n.as_str()) == Some(profile.name.as_str()))
         })
         .and_then(|r| r.get("id").and_then(|i| i.as_str()).map(String::from));
 
@@ -72,9 +100,15 @@ pub async fn sync_active_provider(app: &AppHandle) -> Result<Option<String>, Str
         Some(id) => {
             let mut body =
                 json!({ "base_url": base_url, "config": config, "fallback_priority": 1 });
-            if let Some(key) = &api_key {
-                body["api_key"] = Value::String(key.clone());
-            }
+            // Explicit `null`, not an omitted field, when there's no key —
+            // BigTiny's `merge_config` treats an omitted `api_key` as "leave
+            // whatever's already stored alone" (needed so this same PATCH,
+            // sent on every activation, doesn't require repeating an
+            // unchanged key every time). Omitting it here for the "key was
+            // deleted from Credential Manager" case meant a removed key kept
+            // working forever server-side; `null` tells BigTiny to actually
+            // clear it.
+            body["api_key"] = api_key.as_deref().map(Value::from).unwrap_or(Value::Null);
             client
                 .patch_json(&format!("/api/providers/{id}"), &body)
                 .await?;
@@ -165,10 +199,16 @@ mod tests {
             is_trusted: true,
             temperature: None,
             top_p: None,
+            top_k: None,
+            min_p: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            max_tokens: None,
             context_length: None,
             strip_reasoning: false,
             system_prompt: None,
             prompt_idle_timeout_secs: None,
+            parallel_slots: None,
             created_at: String::new(),
         }
     }

@@ -96,16 +96,31 @@ export function Providers({ highlight }: { highlight: string | null }) {
   };
 
   const onActivate = async (p: ProviderView) => {
-    // Context-handoff gate: switching to an untrusted, non-local provider with an
-    // active session forces an explicit keep/jettison choice (Round-2 item 18).
-    if (!p.is_trusted && p.network_tier !== 'local') {
-      const active = await ipc.getActiveSession();
-      if (active && active.session_id) {
-        setHandoffFor(p);
-        return;
+    try {
+      // Context-handoff gate: switching to an untrusted, non-local provider with an
+      // active session forces an explicit keep/jettison choice (Round-2 item 18).
+      if (!p.is_trusted && p.network_tier !== 'local') {
+        const active = await ipc.getActiveSession();
+        if (active && active.session_id) {
+          setHandoffFor(p);
+          return;
+        }
       }
+    } catch (e) {
+      setError(String(e));
+      return;
     }
     void activate(p, true);
+  };
+
+  const onDelete = async (p: ProviderView) => {
+    if (!confirm(`Delete "${p.name}"?`)) return;
+    try {
+      await ipc.deleteProvider(p.id);
+      await refresh();
+    } catch (e) {
+      setError(String(e));
+    }
   };
 
   return (
@@ -187,13 +202,7 @@ export function Providers({ highlight }: { highlight: string | null }) {
               >
                 Edit
               </button>
-              <button
-                onClick={() => {
-                  if (confirm(`Delete "${p.name}"?`)) void ipc.deleteProvider(p.id).then(refresh);
-                }}
-              >
-                Delete
-              </button>
+              <button onClick={() => void onDelete(p)}>Delete</button>
             </div>
           </div>
         ))}

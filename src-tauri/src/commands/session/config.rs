@@ -48,6 +48,19 @@ pub async fn set_session_context_dir(
     crate::bigtiny::sessions::update_cwd(&app, &session_id, &cwd).await
 }
 
+/// Set a session's custom/default persona (Round-6 Feature 2, re-plumbed onto
+/// BigTiny's real `persona_override` mechanism instead of the old client-side
+/// `<system>...</system>` text-prepend hack). Called once, from `send()`'s
+/// `firstMessage` branch, before the turn's prompt goes out.
+#[tauri::command]
+pub async fn set_session_persona_override(
+    app: AppHandle,
+    session_id: String,
+    persona: String,
+) -> Result<(), String> {
+    crate::bigtiny::sessions::update_persona_override(&app, &session_id, &persona).await
+}
+
 /// Hot-rebind an *already-open* session onto the currently-active provider's
 /// model — best-effort, swallows its own failures.
 #[tauri::command]
@@ -91,7 +104,8 @@ pub async fn set_session_mode(
             }
         }
         config::save(&cfg).map_err(|e| e.to_string())?;
-        mode.filter(|m| !m.trim().is_empty()).unwrap_or_else(|| "chat".to_string())
+        mode.filter(|m| !m.trim().is_empty())
+            .unwrap_or_else(|| "chat".to_string())
     };
     if let Err(e) = crate::bigtiny::sessions::update_mode(&app, &session_id, &effective_mode).await
     {

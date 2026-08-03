@@ -146,7 +146,8 @@ pub struct AppState {
     /// flight at a time (the user can't interact with two selection
     /// overlays at once), so there's nothing to disambiguate.
     pub screenshot_preview: Mutex<Option<(String, i32, i32, i32, i32)>>,
-    pub screenshot_selection: Mutex<Option<tokio::sync::oneshot::Sender<Option<(i32, i32, i32, i32)>>>>,
+    pub screenshot_selection:
+        Mutex<Option<tokio::sync::oneshot::Sender<Option<(i32, i32, i32, i32)>>>>,
     /// Last-seen `compacted_through_rowid` per session, from BigTiny's
     /// `/api/chat/{id}/stats`. BigTiny's own background compaction pass
     /// runs fire-and-forget from the *end* of a turn (see
@@ -158,6 +159,13 @@ pub struct AppState {
     /// stored here to decide whether to emit `chat://compaction` — this
     /// map is what makes that diff possible across polls.
     pub bigtiny_compaction_watermarks: Mutex<HashMap<String, i64>>,
+    /// Window labels whose frontend has confirmed it mounted (dev-only
+    /// load watchdog, see `windows::spawn_load_watchdog`). A window's first
+    /// navigation in dev goes over HTTP to the Vite server; if that ever
+    /// errors or times out, nothing else in `windows.rs` would retry it, so
+    /// this is what lets the watchdog tell "still loading" apart from
+    /// "never going to load".
+    pub booted_windows: Mutex<HashSet<String>>,
 }
 
 impl AppState {
@@ -183,6 +191,7 @@ impl AppState {
             screenshot_preview: Mutex::new(None),
             screenshot_selection: Mutex::new(None),
             bigtiny_compaction_watermarks: Mutex::new(HashMap::new()),
+            booted_windows: Mutex::new(HashSet::new()),
         }
     }
 }

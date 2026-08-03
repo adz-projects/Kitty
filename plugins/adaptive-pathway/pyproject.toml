@@ -15,7 +15,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-mcp = ["mcp[cli]>=1.2.0"]
+# `mcp_server.py` imports `mcp.server.fastmcp.FastMCP` — removed/restructured
+# in the SDK's 2.0 release (confirmed: mcp==2.0.0 has no `fastmcp` submodule
+# under `mcp.server` at all), which silently broke every fresh PyInstaller
+# build once 2.0 became the latest release satisfying the old unpinned
+# `>=1.2.0`. Capped below 2.0 until this plugin is ported to the new API.
+mcp = ["mcp[cli]>=1.2.0,<2.0.0"]
 sidecar = ["fastapi>=0.100", "uvicorn>=0.23"]
 full = ["adaptive-pathway[mcp,sidecar]", "onnxruntime>=1.15", "hdbscan>=0.8", "bertopic>=0.15"]
 all = ["adaptive-pathway[full]"]

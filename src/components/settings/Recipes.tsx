@@ -9,6 +9,7 @@ import type {
 } from '@/lib/types';
 import { Modal } from '@/components/shared/Modal';
 import { WarningIcon } from '@/components/icons/WarningIcon';
+import { parseArgs } from './McpServers';
 import {
   ActivityRow,
   blankForm,
@@ -175,7 +176,7 @@ export function Recipes() {
           type: 'stdio',
           name: customExt.name.trim(),
           cmd: customExt.command.trim(),
-          args: customExt.args.split(/\s+/).filter(Boolean),
+          args: parseArgs(customExt.args),
           env_keys: customExt.envKeys
             .split(',')
             .map((s) => s.trim())
@@ -564,16 +565,14 @@ export function Recipes() {
                   value={form.maxReasoningTokens}
                   disabled={editingBuiltin}
                   style={{ maxWidth: 120 }}
-                  onChange={(e) =>
-                    setForm({ ...form, maxReasoningTokens: Number(e.target.value) })
-                  }
+                  onChange={(e) => setForm({ ...form, maxReasoningTokens: Number(e.target.value) })}
                 />
                 <small className="muted">
-                  If this recipe's response reasons past this many tokens (estimated), Kitty
-                  stops it automatically — a hard limit, not just the usual loop-detection
-                  suggestion (which is skipped for recipe turns, since some recipes — like the
-                  debate moderator — legitimately produce long, structurally-repetitive output).
-                  There's no per-model maximum to read here, so this defaults to a conservative{' '}
+                  If this recipe's response reasons past this many tokens (estimated), Kitty stops
+                  it automatically — a hard limit, not just the usual loop-detection suggestion
+                  (which is skipped for recipe turns, since some recipes — like the debate moderator
+                  — legitimately produce long, structurally-repetitive output). There's no per-model
+                  maximum to read here, so this defaults to a conservative{' '}
                   {DEFAULT_MAX_REASONING_TOKENS}.
                 </small>
               </div>

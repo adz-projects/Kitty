@@ -272,5 +272,95 @@ def test_state_includes_embedding_block(client):
     assert resp.status_code == 200
     body = resp.json()
     assert "embedding" in body
-    assert set(body["embedding"].keys()) == {"backend", "model", "url"}
+    assert set(body["embedding"].keys()) == {"backend", "model", "url", "failed_decodes"}
     assert body["embedding"]["backend"] == "untried"
+    assert body["embedding"]["failed_decodes"] == 0
+
+
+# ─── /decide full payload + available_actions (single-engine architecture) ─
+
+
+def test_decide_returns_full_payload(client):
+    resp = client.post("/decide", params={"session_id": "full_payload"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "hints" in body
+    assert "confidence" in body
+    assert "novelty" in body
+    assert "attribution_ids" in body
+    assert "is_flow_state" in body
+    assert "nudge_offered" in body
+
+
+def test_decide_passes_available_actions_to_engine(client):
+    import base64
+
+    fd, path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    ap = AdaptivePathway(db_path=path)
+    seen = {}
+    original_decide = ap.decide
+
+    def spying_decide(session_id, context_embedding, available_actions):
+        seen["actions"] = list(available_actions)
+        return original_decide(session_id, context_embedding, available_actions)
+
+    ap.decide = spying_decide
+    app = create_app(ap)
+    with TestClient(app) as c:
+        c.post("/decide", params={
+            "session_id": "avail_actions",
+            "available_actions": "edit, shell, write",
+        })
+    assert seen["actions"] == ["edit", "shell", "write"]
+    try:
+        os.remove(path)
+    except PermissionError:
+        pass
+
+
+def test_outcome_error_type_crash_pins_ttl(client):
+    # Row 7 of 82inefficiencies.md: a negative reward must NOT auto-set a
+    # syntax_crash TTL — only an explicit error_type="crash" signal may.
+    resp = client.post("/outcome", params={"session_id": "ttl_crash"}, json={
+        "action_id": "fragile_action",
+        "reward": -1.0,
+        "error_type": "crash",
+        "context_embedding": [0.0] * 384,
+    })
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "recorded"
+
+    fd, path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    ap = AdaptivePathway(db_path=path)
+    app = create_app(ap)
+    with TestClient(app) as c:
+        c.post("/session/open", json={"session_id": "s"})
+        c.post("/outcome", params={"session_id": "s"}, json={
+            "action_id": "plain_failure",
+            "reward": -0.8,
+            "context_embedding": [0.0] * 384,
+        })
+        c.post("/outcome", params={"session_id": "s"}, json={
+            "action_id": "crash_failure",
+            "reward": -0.8,
+            "error_type": "crash",
+            "context_embedding": [0.0] * 384,
+        })
+    assert ap._ttl.is_expired("plain_failure") is False
+    assert ap._ttl.is_expired("crash_failure") is True
+    try:
+        os.remove(path)
+    except PermissionError:
+        pass
+
+
+def test_malformed_b64_embedding_counts_failure(client):
+    resp = client.post("/decide", params={
+        "session_id": "bad_b64",
+        "context_embedding": "not-valid-base64!!!",
+    })
+    assert resp.status_code == 200
+    state = client.get("/state")
+    assert state.json()["embedding"]["failed_decodes"] == 1

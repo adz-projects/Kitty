@@ -33,6 +33,7 @@ import type {
   ModeInfo,
   NetworkTier,
   PathInfo,
+  ProviderView,
   Recipe,
   SessionInfo,
   ThinkingEffort,
@@ -244,7 +245,10 @@ interface ChatState {
       sees files a tracked tool call actually wrote. Best-effort: a failed
       scan (missing/inaccessible directory) just leaves the list as-is. */
   refreshArtifactsFromDisk: () => Promise<void>;
-  refreshProvider: () => Promise<void>;
+  /** Optionally pass an already-fetched provider list (e.g. from
+      `loadSession`, which needs one anyway) to skip a redundant
+      `listProviders` round-trip. */
+  refreshProvider: (providers?: ProviderView[]) => Promise<void>;
   branch: (uiIndex: number) => Promise<void>;
   regenerate: (assistantIndex: number) => Promise<void>;
   addPastedText: (text: string, label?: string) => void;
@@ -744,9 +748,9 @@ export const useChatStore = create<ChatState>((set, get) => {
       }
     },
 
-    refreshProvider: async () => {
+    refreshProvider: async (prefetched?: ProviderView[]) => {
       try {
-        const providers = await ipc.listProviders();
+        const providers = prefetched ?? (await ipc.listProviders());
         const active = providers.find((p) => p.active);
         set({
           providerTier: active ? active.network_tier : null,
@@ -958,6 +962,9 @@ export const useChatStore = create<ChatState>((set, get) => {
           thinkingEffort: info.thinking_effort,
           creatingSession: false,
         });
+        // Best-effort: a failure here only means a later notification for
+        // this session focuses a generic fallback window instead of this
+        // specific one — no data loss, nothing else depends on it.
         void ipc.bindWindowSession(info.session_id).catch(() => {});
         await get().refreshProvider();
         await ensureSafeApprovalMode();
@@ -999,6 +1006,7 @@ export const useChatStore = create<ChatState>((set, get) => {
       const sameSession = prior.sessionId === sessionId;
       const resolvedProviderId = providerId ?? (sameSession ? prior.sessionProviderId : null);
       const resolvedModelId = modelId ?? (sameSession ? prior.sessionModelId : null);
+      // Best-effort — see the identical bindWindowSession call above.
       void ipc.bindWindowSession(sessionId).catch(() => {});
       set({
         sessionId,
@@ -1033,13 +1041,18 @@ export const useChatStore = create<ChatState>((set, get) => {
         // profile was deleted since this chat was last used — don't touch
         // the active provider; instead mark it concluded so the composer
         // blocks new sends while still showing the history below.
+        // Fetched once and reused by refreshProvider below unless an
+        // activation below makes it stale — avoids a second listProviders
+        // round-trip in the common case.
+        const providers = await ipc.listProviders();
+        let providersStale = false;
         if (resolvedProviderId && resolvedModelId) {
-          const providers = await ipc.listProviders();
           const matched = findMatchingProvider(providers, resolvedProviderId, resolvedModelId);
           if (matched) {
             const active = providers.find((p) => p.active);
             if (!active || active.id !== matched.id) {
               await ipc.activateProvider(matched.id);
+              providersStale = true;
             }
           } else {
             set({ sessionConcluded: true });
@@ -1051,7 +1064,7 @@ export const useChatStore = create<ChatState>((set, get) => {
           availableModes: info.available_modes,
           thinkingEffort: info.thinking_effort,
         });
-        await get().refreshProvider();
+        await get().refreshProvider(providersStale ? undefined : providers);
         const override = await ipc.getSessionMode(sessionId).catch(() => null);
         set({ modeOverride: (override as 'chat' | 'agentic' | null) ?? null });
         await ensureSafeApprovalMode();
@@ -1260,8 +1273,12 @@ export const useChatStore = create<ChatState>((set, get) => {
         await get().newSession(folder);
         return;
       }
-      await ipc.setSessionContextDir(s.sessionId, folder);
-      set({ cwd: folder });
+      try {
+        await ipc.setSessionContextDir(s.sessionId, folder);
+        set({ cwd: folder });
+      } catch (e) {
+        set({ error: String(e) });
+      }
     },
 
     addPastedText: (text: string, label?: string) =>
@@ -1318,7 +1335,12 @@ export const useChatStore = create<ChatState>((set, get) => {
         // awaited *before* loadSession, which reads it straight back via
         // getSessionMode — a fire-and-forget write here would race that read.
         if (modeOverride) {
-          await ipc.setSessionMode(info.session_id, modeOverride).catch(() => {});
+          await ipc.setSessionMode(info.session_id, modeOverride).catch((e) => {
+            // Not fatal — loadSession still proceeds — but the fork silently
+            // loses its carried-forward mode override and falls back to
+            // default mode detection instead, a real behavior difference.
+            console.warn('setSessionMode failed on branch, mode override may not carry over', e);
+          });
         }
         set({ title: title ? `Branch of ${title}` : 'Branch' });
         await get().loadSession(info.session_id, info.cwd, get().title ?? undefined);
@@ -1418,15 +1440,18 @@ export const useChatStore = create<ChatState>((set, get) => {
       for (const f of [...otherFiles, ...imageFiles]) addArtifact(userFileArtifact(f.path, f.name));
       let images: { mime: string; data_url: string }[] | undefined;
       if (imageFiles.length) {
-        images = [];
-        for (const f of imageFiles) {
-          try {
-            const file = await ipc.readFileAny(f.path);
-            images.push({ mime: file.mime ?? 'image/png', data_url: file.content });
-          } catch (e) {
-            set({ error: String(e) });
-          }
-        }
+        const results = await Promise.all(
+          imageFiles.map(async (f) => {
+            try {
+              const file = await ipc.readFileAny(f.path);
+              return { mime: file.mime ?? 'image/png', data_url: file.content };
+            } catch (e) {
+              set({ error: String(e) });
+              return null;
+            }
+          })
+        );
+        images = results.filter((r): r is { mime: string; data_url: string } => r !== null);
       }
       // Clipboard-attached images (Round-4) go through regardless of mode —
       // unlike the droppedFiles-based extraction above, which is specifically
@@ -1464,24 +1489,38 @@ export const useChatStore = create<ChatState>((set, get) => {
         promptText = `${buildStrippedTranscript(priorMessages)}\n\nUser: ${promptText}`;
       }
       // Custom/default system prompt (Round-6 Feature 2), first turn of a
-      // session only — a hidden preamble on the actual outgoing prompt text,
-      // never on `userMsg.text` below (built independently from `trimmed`), so
-      // the rendered bubble shows only what the user typed. `firstMessage` was
-      // captured before the stripReasoning session-swap logic above, so a
-      // mid-conversation swap onto a fresh goosed session correctly does NOT
-      // get a second prepend — from the user's perspective it's a continuation,
-      // not a new conversation.
+      // session only — set server-side via BigTiny's real `persona_override`
+      // session-metadata field (same mechanism recipes use), rendered as a
+      // proper `role: "system"` message by ContextBuilder::build_messages.
+      // Previously this prepended a literal `<system>...</system>` block onto
+      // the outgoing *user* message text — a leftover from the pre-BigTiny
+      // Goose/ACP backend, which had no system-prompt field of its own.
+      // Embedding fake role markup inside a user turn is exactly the kind of
+      // malformed input a model whose chat template expects strict role/tag
+      // structure can derail on (observed: a llama-server-hosted model
+      // hallucinating an unrelated persona and looping). Best-effort — a
+      // failure here (e.g. BigTiny transiently unreachable) shouldn't block
+      // the turn; it just falls back to BigTiny's generic built-in persona.
+      // `firstMessage` was captured before the stripReasoning session-swap
+      // logic above, so a mid-conversation swap onto a fresh goosed session
+      // correctly does NOT get persona_override set again — from the user's
+      // perspective it's a continuation, not a new conversation.
       if (firstMessage) {
         const resolvedPrompt = get().systemPrompt ?? defaultSystemPrompt(chatOnly);
-        promptText = `<system>\n${resolvedPrompt}\n</system>\n\n${promptText}`;
+        try {
+          await ipc.setSessionPersonaOverride(sessionId, resolvedPrompt);
+        } catch (e) {
+          console.warn('setSessionPersonaOverride failed, continuing with default persona', e);
+        }
       }
-      // Recipe invocation (`sendWithRecipe`) — unlike the system-prompt preamble
-      // above, this applies on ANY turn, not just a session's first message: a
-      // recipe can be invoked at any point in a conversation, attaching to
-      // whatever's already open rather than requiring a fresh session. Placed
-      // after the system-prompt block so both can compose on a session's very
-      // first turn (recipe instructions take priority for this message, the
-      // provider's general system prompt still applies underneath).
+      // Recipe invocation (`sendWithRecipe`) — unlike the system-prompt
+      // persona above, this applies on ANY turn, not just a session's first
+      // message: a recipe can be invoked at any point in a conversation,
+      // attaching to whatever's already open rather than requiring a fresh
+      // session. The recipe wrapper is still a text preamble on `promptText`
+      // itself (not `persona_override`) because, unlike the session-level
+      // persona, it's meant to be a one-off, mandatory instruction for THIS
+      // turn only, not a persisted system message every future turn resends.
       const recipeCard = get().pendingRecipeCard;
       if (recipeCard) {
         promptText =
@@ -1568,6 +1607,7 @@ export const useChatStore = create<ChatState>((set, get) => {
           const oldSessionId = sessionId;
           const oldModeOverride = get().modeOverride;
           const info = await ipc.newSession(cwd, oldModeOverride ?? 'chat');
+          // Best-effort — see the identical bindWindowSession call above.
           void ipc.bindWindowSession(info.session_id).catch(() => {});
           set({
             sessionId: info.session_id,
@@ -1578,7 +1618,11 @@ export const useChatStore = create<ChatState>((set, get) => {
           // conversation from the user's perspective) and force a safe approval
           // mode on it, same as any other freshly-established chat-mode session.
           if (oldModeOverride) {
-            void ipc.setSessionMode(info.session_id, oldModeOverride).catch(() => {});
+            void ipc.setSessionMode(info.session_id, oldModeOverride).catch((e) => {
+              // Not fatal, but the swapped-to session loses its carried-forward
+              // mode override and falls back to default mode detection.
+              console.warn('setSessionMode failed on stripReasoning swap', e);
+            });
           }
           await ensureSafeApprovalMode();
           try {
@@ -1635,7 +1679,13 @@ export const useChatStore = create<ChatState>((set, get) => {
       // a mid-conversation invocation and a blank-chat invocation need no
       // special-casing between them.
       for (const ext of launchableExtensions(recipe.extensions)) {
-        void ipc.addRecipeExtension(sessionId, ext).catch(() => {});
+        void ipc.addRecipeExtension(sessionId, ext).catch((e) => {
+          // The model's later tool calls for this extension will surface
+          // their own "not found" errors either way, but log here too so a
+          // launch failure (vs. e.g. a genuinely missing tool) is
+          // distinguishable in dev tools.
+          console.warn(`addRecipeExtension failed for "${ext.name}"`, e);
+        });
       }
       if (isChatMode(get())) {
         // Recipes are inherently tool-using — flip to agentic so declared/
@@ -1662,6 +1712,8 @@ export const useChatStore = create<ChatState>((set, get) => {
       // the composer's slash-command matching (Recipes settings panel fetches
       // independently, same as scheduled tasks don't share a list either).
       const refreshRecipes = () =>
+        // Best-effort: a failure just leaves the slash-command list stale
+        // until the next onRecipesChanged event or window reload.
         void ipc
           .listRecipes()
           .then((recipes) => set({ recipes }))
@@ -1807,7 +1859,14 @@ export const useChatStore = create<ChatState>((set, get) => {
         // a valid model ID"). Best-effort hot-rebind before reloading, so the
         // replay reflects the corrected binding.
         const sid = get().sessionId;
-        if (sid) void ipc.rebindSessionProvider(sid).catch(() => {});
+        if (sid) {
+          void ipc.rebindSessionProvider(sid).catch((e) => {
+            // The exact failure this call exists to prevent (a stale
+            // provider/model binding on the session) can silently persist —
+            // worth knowing about even though nothing here can react to it.
+            console.warn('rebindSessionProvider failed', e);
+          });
+        }
         void get().reloadCurrent();
       });
       // A session was deleted (any window, e.g. the sidebar's kebab menu) —
@@ -1932,7 +1991,12 @@ export const useChatStore = create<ChatState>((set, get) => {
         const { count, counts } = countToolCall(toolLoopCounts, title, e.tool_call.rawInput);
         toolLoopCounts = counts;
         if (count > TOOL_LOOP_THRESHOLD) {
-          void ipc.respondPermission(e.tool_call_id, pickRejectOption(e.options)).catch(() => {});
+          void ipc.respondPermission(e.tool_call_id, pickRejectOption(e.options)).catch((err) => {
+            // If this never reaches the backend, the paused tool call has no
+            // way to resolve and the turn hangs waiting for a decision that
+            // was already made on this side.
+            console.warn('respondPermission (tool-loop reject) failed', err);
+          });
           set({
             warning:
               `Declined — "${title}" has been called ${count} times with the same target ` +
@@ -1952,7 +2016,12 @@ export const useChatStore = create<ChatState>((set, get) => {
           // every hitl_pause) tell Rust to fire the "Approval needed"
           // toast/tray-pending state — this is the one branch where a human
           // is genuinely required.
-          void ipc.notifyApprovalNeeded(e.session_id, title).catch(() => {});
+          void ipc.notifyApprovalNeeded(e.session_id, title).catch((err) => {
+            // Non-fatal — pendingApprovals below still shows the in-app
+            // ApprovalPrompt — but the OS notification/tray-pending state
+            // this exists for may not fire, so a hidden window could miss it.
+            console.warn('notifyApprovalNeeded failed', err);
+          });
           set((s) =>
             s.pendingApprovals.some((a) => a.tool_call_id === e.tool_call_id)
               ? {}
@@ -1960,7 +2029,11 @@ export const useChatStore = create<ChatState>((set, get) => {
           );
           return;
         }
-        void ipc.respondPermission(e.tool_call_id, optionId).catch(() => {});
+        void ipc.respondPermission(e.tool_call_id, optionId).catch((err) => {
+          // Same risk as the tool-loop reject case above: a paused tool call
+          // with no way to resolve hangs the turn.
+          console.warn('respondPermission (auto-decide) failed', err);
+        });
         if (warning) set({ warning });
       });
 
@@ -1993,6 +2066,8 @@ export const useChatStore = create<ChatState>((set, get) => {
               durationMs,
               inputTokens: usage?.inputTokens,
               outputTokens: usage?.outputTokens,
+              cacheReadTokens: usage?.cacheReadTokens,
+              cacheCreationTokens: usage?.cacheCreationTokens,
               ttftMs,
               providerName,
               model,

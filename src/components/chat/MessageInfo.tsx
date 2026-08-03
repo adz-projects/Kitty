@@ -2,6 +2,22 @@ import { useState } from 'react';
 import type { Message } from '@/stores/chatStore';
 import { usePopoverPosition } from '@/lib/usePopoverPosition';
 
+/** `inputTokens` is normalized (bigtiny_rust's `usage_map_from_anthropic`) to
+    always mean *total* prompt size, cache included, for every provider — so
+    the hit rate is simply the cached share of that total. `cacheReadTokens`/
+    `cacheCreationTokens` are independently optional (a turn can report one
+    without the other), so both default to 0 for the arithmetic; `inputTokens`
+    itself is only missing if the caller didn't check `hasData` first. */
+export function formatCacheHitRate(message: Message): string {
+  const read = message.cacheReadTokens ?? 0;
+  const created = message.cacheCreationTokens ?? 0;
+  const total = message.inputTokens ?? 0;
+  const pct = total > 0 ? Math.round((read / total) * 100) : 0;
+  const parts = [`${read} read`];
+  if (created > 0) parts.push(`${created} written`);
+  return `${pct}% hit rate (${parts.join(', ')} of ${total})`;
+}
+
 /** Hover-revealed info button (Round-4) for an assistant message: model,
     provider, tokens, and generation time. The values are captured once, at
     the moment the request was actually sent (see chatStore's `lastSentProvider`
@@ -60,9 +76,15 @@ export function MessageInfo({ message }: { message: Message }) {
               {message.outputTokens} out
             </div>
           )}
+          {(message.cacheReadTokens != null || message.cacheCreationTokens != null) && (
+            <div>
+              <span className="muted">Prompt cache:</span> {formatCacheHitRate(message)}
+            </div>
+          )}
           {message.ttftMs != null && (
             <div>
-              <span className="muted">Time to first token:</span> {(message.ttftMs / 1000).toFixed(2)}s
+              <span className="muted">Time to first token:</span>{' '}
+              {(message.ttftMs / 1000).toFixed(2)}s
             </div>
           )}
           {message.ttftMs != null &&
@@ -72,10 +94,7 @@ export function MessageInfo({ message }: { message: Message }) {
             message.durationMs > message.ttftMs && (
               <div>
                 <span className="muted">Generation speed:</span>{' '}
-                {(
-                  (message.outputTokens / (message.durationMs - message.ttftMs)) *
-                  1000
-                ).toFixed(1)}{' '}
+                {((message.outputTokens / (message.durationMs - message.ttftMs)) * 1000).toFixed(1)}{' '}
                 tok/s
               </div>
             )}

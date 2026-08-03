@@ -3,7 +3,13 @@ import { supportsImages } from './vision_models';
 
 describe('supportsImages', () => {
   it('recognizes common vision-capable model families', () => {
-    for (const m of ['gpt-4o', 'claude-sonnet-4-20260101', 'gemini-2.0-flash', 'llava:13b', 'qwen2-vl:7b']) {
+    for (const m of [
+      'gpt-4o',
+      'claude-sonnet-4-20260101',
+      'gemini-2.0-flash',
+      'llava:13b',
+      'qwen2-vl:7b',
+    ]) {
       expect(supportsImages(m)).toBe(true);
     }
   });

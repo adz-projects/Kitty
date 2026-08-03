@@ -18,6 +18,7 @@ import type {
   AdaptivePathwayStatus,
   AdaptivePathwayStatusPayload,
   AdaptivePathwayEmbeddingStatusPayload,
+  AdaptivePathwayMcpStatus,
   ApprovalNeededEvent,
   ChatErrorEvent,
   CompactionEvent,
@@ -100,14 +101,19 @@ export const ipc = {
       notification for that session later focus this specific window
       instead of a generic fallback. Best-effort; call after any successful
       session establish/switch. */
-  bindWindowSession: (sessionId: string) =>
-    invoke<void>('bind_window_session', { sessionId }),
+  bindWindowSession: (sessionId: string) => invoke<void>('bind_window_session', { sessionId }),
   /** "Set as working directory" (agentic mode) — repoints an existing
       session's cwd in place instead of forking a new session, so BigTiny's
       directory sandbox can allow both the original chat_dir and this newly-
       set directory at once. */
   setSessionContextDir: (sessionId: string, cwd: string) =>
     invoke<void>('set_session_context_dir', { sessionId, cwd }),
+  /** Set a session's custom/default persona server-side (BigTiny's real
+      `persona_override` mechanism — a proper `role: "system"` message),
+      replacing the old client-side `<system>...</system>` text-prepend hack.
+      Called once, before the first outgoing message of a new session. */
+  setSessionPersonaOverride: (sessionId: string, persona: string) =>
+    invoke<void>('set_session_persona_override', { sessionId, persona }),
   sendPrompt: (sessionId: string, text: string, images?: { mime: string; data_url: string }[]) =>
     invoke<void>('send_prompt', { sessionId, text, images: images ?? null }),
   cancelPrompt: (sessionId: string) => invoke<void>('cancel_prompt', { sessionId }),
@@ -279,8 +285,7 @@ export const ipc = {
   // credentials, same self-healing registration pattern. Web search does
   // NOT live here — see getKittyDocsWebEnabled/getBraveMcpSearchStatus.
   getKittyToolsEnabled: () => invoke<boolean>('get_kitty_tools_enabled'),
-  setKittyToolsEnabled: (enabled: boolean) =>
-    invoke<void>('set_kitty_tools_enabled', { enabled }),
+  setKittyToolsEnabled: (enabled: boolean) => invoke<void>('set_kitty_tools_enabled', { enabled }),
   // Bundled PDF/Excel/web-scrape/web-search MCP server (Python) — the other
   // half of the replacement-mcp split; on by default, no credentials. Hosts
   // the merged, count-tiered lean_web_search/lean_web_search_read_chunk
@@ -319,6 +324,8 @@ export const ipc = {
   getAdaptivePathwayStatus: () => invoke<AdaptivePathwayStatus>('get_adaptive_pathway_status'),
   getAdaptivePathwayEmbeddingStatus: () =>
     invoke<EmbeddingModelStatus>('get_adaptive_pathway_embedding_status'),
+  getAdaptivePathwayMcpStatus: () =>
+    invoke<AdaptivePathwayMcpStatus | null>('get_adaptive_pathway_mcp_status'),
   restartAdaptivePathway: () => invoke<void>('restart_adaptive_pathway'),
   setAdaptivePathwayEnabled: (enabled: boolean) =>
     invoke<void>('set_adaptive_pathway_enabled', { enabled }),
@@ -584,6 +591,13 @@ export const onProviderActivated = (cb: () => void) => listen('provider://activa
 
 /** The label of the window this webview is running in (`overlay` / `main` / …). */
 export const windowLabel = (): string => getCurrentWebview().label;
+
+/** Called once, right after mount, by every window's `main.tsx`. Lets the
+    Rust-side dev-only load watchdog (`windows::spawn_load_watchdog`) tell a
+    window that's still loading apart from one whose first navigation failed
+    and will never load on its own. Cheap to call in production too — nothing
+    there reads `booted_windows`, since the watchdog itself is compiled out. */
+export const windowReady = (): Promise<void> => invoke<void>('window_ready');
 
 /** Tray "New Session" → overlay starts a fresh session. */
 export const onNewSessionRequest = (cb: () => void) => listen('session://new', () => cb());

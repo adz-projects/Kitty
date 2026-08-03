@@ -1,7 +1,13 @@
 // Pure form-state helpers for the Recipes editor: slug derivation and the
 // FormState <-> Recipe/RecipeInput conversions.
 
-import type { ParameterInputType, Recipe, RecipeExtension, RecipeInput, RecipeParameter } from '@/lib/types';
+import type {
+  ParameterInputType,
+  Recipe,
+  RecipeExtension,
+  RecipeInput,
+  RecipeParameter,
+} from '@/lib/types';
 
 export const NON_PRIMARY_INPUT_TYPES: ParameterInputType[] = [
   'string',
@@ -100,7 +106,10 @@ export function formToInput(form: FormState): RecipeInput {
     prompt: form.prompt.trim() || null,
     parameters: [primaryParam, ...form.parameters],
     extensions: form.extensions,
-    max_reasoning_tokens: Math.max(1, Math.round(form.maxReasoningTokens) || DEFAULT_MAX_REASONING_TOKENS),
+    max_reasoning_tokens: Math.max(
+      1,
+      Math.round(form.maxReasoningTokens) || DEFAULT_MAX_REASONING_TOKENS
+    ),
     activities: form.activities
       .filter((a) => a.text.trim())
       .map((a) => (a.isMessage ? `message: ${a.text.trim()}` : a.text.trim())),

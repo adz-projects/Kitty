@@ -66,8 +66,15 @@ export function SessionList() {
   useEffect(() => {
     // A session deleted in the *other* window (e.g. regenerate()'s background
     // cleanup of the session it forked away from) otherwise leaves a stale
-    // entry here until a manual refresh.
-    const un = onSessionDeleted(() => void refresh());
+    // entry here until a manual refresh. Skip the refetch when it's this
+    // window's own delete — sessionStore.remove() already filtered it out of
+    // local state before this event ever arrives, so a full refresh here
+    // would just be a redundant round-trip.
+    const un = onSessionDeleted((sessionId) => {
+      if (useSessionStore.getState().sessions.some((s) => s.sessionId === sessionId)) {
+        void refresh();
+      }
+    });
     return () => void un.then((fn) => fn());
   }, [refresh]);
 
@@ -170,9 +177,12 @@ export function SessionList() {
     if (debounceRef.current) clearTimeout(debounceRef.current);
     debounceRef.current = setTimeout(() => setQuery(value), 150);
   };
-  useEffect(() => () => {
-    if (debounceRef.current) clearTimeout(debounceRef.current);
-  }, []);
+  useEffect(
+    () => () => {
+      if (debounceRef.current) clearTimeout(debounceRef.current);
+    },
+    []
+  );
 
   const submitNewFolder = () => {
     const name = newFolderName.trim();

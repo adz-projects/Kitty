@@ -28,7 +28,12 @@ export function SchismResolutionModal() {
         .then((result) => {
           if ('faction_a' in result) setAlert(result);
         })
-        .catch(() => {});
+        .catch((e) => {
+          // A real schism was just detected (the event above already fired)
+          // but this modal never shows it — the only surfacing of a
+          // detected/reviewing schism state, so worth knowing about.
+          console.warn('adaptivePathwayGetSchism failed', e);
+        });
     });
     return () => void un.then((fn) => fn());
   }, []);

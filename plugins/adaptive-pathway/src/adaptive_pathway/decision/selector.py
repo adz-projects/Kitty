@@ -156,19 +156,36 @@ class ActionSelector:
         scored = []
         # Multiple edges commonly hash to the same action bucket (bounded by
         # max_action_buckets); ctx_features is fixed for this call, so their
-        # ensemble/in-session samples are identical draws for the identical
-        # underlying (bucket, context) pair. Memoize per bucket instead of
-        # redrawing per edge — cuts Thompson-sampling calls (the dominant
-        # decide() cost) roughly in proportion to the collision rate, with
-        # no change to the sampled distribution.
+        # bucket-keyed ensemble draws (Thompson + IG) are identical samples
+        # for the identical underlying (bucket, context) pair. Memoize the
+        # base per bucket and add the per-edge paradigm-challenge term on
+        # top — cuts Thompson-sampling calls (the dominant decide() cost)
+        # roughly in proportion to the collision rate, with no change to
+        # the sampled distribution. The PC term must be edge-aware or it is
+        # constant across every edge sharing a bucket (see
+        # BootstrapEnsemble.sample_edge_aware).
+        domain_stats = self._compute_domain_stats(edges)
+        pc_top_n = self._config["paradigm_challenge"]["top_n"]
+        pc_referent_ids = [e.id for e in edges[:50]][:pc_top_n]
+        # Referents are the first `top_n` candidate edges, already in hand —
+        # resolve their domains/edges once instead of per scored edge
+        # (id-lookups cost O(edges) each).
+        pc_referent_edges = edges[:pc_top_n]
+        pc_referent_domains = {e.domain_id or e.domain or "" for e in pc_referent_edges}
+        pc_referents = (pc_referent_domains, pc_referent_edges)
         bucket_sample_cache = {}
+        pc_scores = {}
         for edge in edges[:50]:
             bucket = self._bucketer.get_bucket(edge.semantic_primitive)
             if bucket not in bucket_sample_cache:
-                ensemble_score, _raw = self._ensemble.sample(bucket, ctx_features)
+                base = self._ensemble.base_samples(bucket, ctx_features)
                 in_session_score = self._in_session.sample(bucket, ctx_features)
-                bucket_sample_cache[bucket] = (ensemble_score, in_session_score)
-            ensemble_score, in_session_score = bucket_sample_cache[bucket]
+                bucket_sample_cache[bucket] = (base, in_session_score)
+            base, in_session_score = bucket_sample_cache[bucket]
+            ensemble_score, raw_samples = self._ensemble.sample_edge_aware(
+                edge.id, bucket, ctx_features, pc_referent_ids, domain_stats,
+                base=base, referents=pc_referents)
+            pc_scores[edge.id] = raw_samples[-1]
             combined = (1.0 - self._in_session.mix_weight) * ensemble_score + self._in_session.mix_weight * in_session_score
             novelty_bonus = self._novelty.bonus(ctx_raw, lambda_override=novelty_lambda)
             ubi = self._novelty.action_bonus(edge.semantic_primitive, lambda_override=novelty_lambda)
@@ -206,12 +223,6 @@ class ActionSelector:
                 top_edges = top_edges[:top_k]
         else:
             top_edges = top_edges[:top_k]
-
-        domain_stats = self._compute_domain_stats(edges)
-        top_n_ids = [e.id for e in top_edges[:5]]
-        pc_model = self._ensemble.models[self._ensemble.pc_model_index]
-        pc_scores = {edge.id: pc_model.score(edge.id, ctx_features, top_n_ids, domain_stats)
-                     for edge in top_edges}
 
         hints = []
         for edge in top_edges:
@@ -275,7 +286,8 @@ class ActionSelector:
                          if e.id not in top_edge_ids]
             scored_wildcard = []
             for e in remaining:
-                pc_s = pc_model.score(e.id, ctx_features, top_n_ids, domain_stats)
+                pc_s = self._ensemble.models[self._ensemble.pc_model_index].score_with_referents(
+                    e.id, ctx_features, pc_referent_domains, pc_referent_edges, domain_stats)
                 emb = e.embedding if e.embedding is not None else np.zeros(self._config["embedding_dim"], dtype=np.float32)
                 nov = float(self._novelty.current_score(np.asarray(emb, dtype=np.float32).ravel()))
                 scored_wildcard.append((pc_s * self._wildcard_config.get("pc_weight", 0.7) +

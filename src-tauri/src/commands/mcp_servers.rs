@@ -176,7 +176,10 @@ pub async fn get_brave_mcp_search_status(
 ) -> Result<BraveMcpSearchStatus, String> {
     let enabled = state.config.lock().unwrap().brave_mcp_search_enabled;
     let configured = config::providers::has_secret("brave-mcp-search");
-    Ok(BraveMcpSearchStatus { enabled, configured })
+    Ok(BraveMcpSearchStatus {
+        enabled,
+        configured,
+    })
 }
 
 /// Store the Brave Search API key and enable the server in one step — the

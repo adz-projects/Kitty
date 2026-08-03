@@ -252,7 +252,7 @@ async def test_engine_reopen_preserves_graph(db_path):
     ctx /= np.linalg.norm(ctx)
 
     await ap.record_outcome("s1", "important_action", 1.0, ctx)
-    await ap.record_outcome("s1", "bad_action", -0.8, ctx)
+    await ap.record_outcome("s1", "bad_action", -0.8, ctx, error_type="crash")
 
     assert ap._ttl.is_expired("bad_action")
     assert len(ap._action_history) == 2
@@ -268,18 +268,15 @@ async def test_engine_reopen_preserves_graph(db_path):
 
 
 @pytest.mark.asyncio
-async def test_goose_e2e_smoke(db_path):
+async def test_goose_e2e_smoke(proxy_env):
     import json
     from mcp.client.session import ClientSession
     from mcp.client.stdio import stdio_client, StdioServerParameters
 
-    env = os.environ.copy()
-    env["ADAPTIVE_PATHWAY_DB"] = db_path
-
     params = StdioServerParameters(
         command=sys.executable,
         args=["-m", "adaptive_pathway.mcp_server"],
-        env=env,
+        env=proxy_env,
     )
 
     async with stdio_client(params) as (read, write):

@@ -4,9 +4,14 @@ Focused on the Track C/E fixes: query-filter pagination, tracking-param
 stripping, markdown block splitting, and char-cap block boundaries.
 """
 
+import http.server
 import json
 import sys
+import threading
 from pathlib import Path
+
+import openpyxl
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -92,11 +97,6 @@ def test_error_response_scrape_hint_is_not_search_keyword_advice():
 # Tool-level fixture tests (real files / a local HTTP server — no external
 # network)
 # ---------------------------------------------------------------------------
-import http.server
-import threading
-
-import openpyxl
-import pytest
 
 
 @pytest.fixture

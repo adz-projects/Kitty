@@ -8,10 +8,26 @@ Usage:
     python plugins/build.py            # build every target
     python plugins/build.py <name>...  # build only the named target(s)
 
-Requires PyInstaller (`pip install pyinstaller`) and each target's own
-dependencies — this script installs those for you via `pip install -e .`
-before freezing, so run it with the Python environment you want the freeze
-to use (a dedicated venv is recommended, not your system Python).
+Each Python target is built inside its own fresh venv
+(`plugins/<name>/.build-venv/`, gitignored), created from scratch on every
+run rather than reused with `pip install -e .` on top of whatever was there
+before. PyInstaller's import analysis follows *any* resolvable `import`
+statement it finds by static scanning — including ones inside
+`try/except ImportError` blocks that are never actually reached at runtime
+— so if the interpreter running this script happens to have unrelated,
+much heavier packages installed (a different project's ML stack, say),
+those can get pulled into the frozen exe even though the plugin never uses
+them. A venv containing only this one plugin's own pinned dependencies
+makes that structurally impossible: a package PyInstaller can't `import`
+during analysis is one it can't accidentally bundle. This is also why the
+old `sys.executable`-based approach's own docstring recommended "a
+dedicated venv, not your system Python" — that recommendation is now
+enforced instead of just suggested.
+
+Requires each target's own dependencies as declared in its own
+`pyproject.toml`; PyInstaller itself is installed into each venv
+automatically. `python3`/`py -3` must be resolvable on PATH to create the
+per-plugin venvs.
 
 Windows-only app, so the target triple is hardcoded to the one Kitty ships
 (see docs/VERSIONS.md).
@@ -22,6 +38,7 @@ from __future__ import annotations
 import shutil
 import subprocess
 import sys
+import venv
 from pathlib import Path
 
 TARGET_TRIPLE = "x86_64-pc-windows-msvc"
@@ -29,6 +46,7 @@ TARGET_TRIPLE = "x86_64-pc-windows-msvc"
 PLUGINS_DIR = Path(__file__).resolve().parent
 REPO_ROOT = PLUGINS_DIR.parent
 BINARIES_DIR = REPO_ROOT / "src-tauri" / "binaries"
+BUILD_VENV_DIRNAME = ".build-venv"
 
 # name -> { dir, spec, exe, extras, kind }. `exe` must match pyproject.toml's
 # console script name (Python) or Cargo.toml's [[bin]] name (Rust), since
@@ -75,11 +93,19 @@ PLUGINS: dict[str, dict[str, object]] = {
         "extras": [],
         "kind": "rust",
     },
+    # Backed by the pure-Rust rewrite (`plugins/bigtiny_rust/`), not the
+    # original Python daemon vendored at `plugins/bigtiny/` — that source
+    # tree stays in-tree, unbuilt, as the behavioral oracle the Rust port
+    # was verified against (same convention as `replacement-mcp` et al. per
+    # the module doc comment above). `exe` stays "bigtiny-daemon" so every
+    # bundling/lifecycle path that already looks for that filename
+    # (`config::default_bigtiny_command`, `lifecycle::bigtiny_proc`) needs
+    # no changes.
     "bigtiny": {
-        "dir": PLUGINS_DIR / "bigtiny",
-        "spec": "bigtiny_daemon.spec",
+        "dir": PLUGINS_DIR / "bigtiny_rust",
         "exe": "bigtiny-daemon",
         "extras": [],
+        "kind": "rust",
     },
 }
 
@@ -87,6 +113,25 @@ PLUGINS: dict[str, dict[str, object]] = {
 def run(cmd: list[str], cwd: Path) -> None:
     print(f"$ {' '.join(cmd)}  (in {cwd})")
     subprocess.run(cmd, cwd=cwd, check=True)
+
+
+def fresh_venv_python(plugin_dir: Path) -> Path:
+    """(Re)create `plugin_dir/.build-venv` from scratch and return its
+    python.exe. Always wiped and rebuilt rather than reused: the whole point
+    is that this environment only ever contains what *this* build just
+    installed into it, never anything left over from a previous plugin or
+    a previous version of this one's dependencies."""
+    venv_dir = plugin_dir / BUILD_VENV_DIRNAME
+    if venv_dir.exists():
+        shutil.rmtree(venv_dir)
+    print(f"$ python -m venv {venv_dir}")
+    # with_pip=True (default) gives us a venv-local pip to install into,
+    # isolated from whatever's on the interpreter running this script.
+    venv.create(venv_dir, with_pip=True)
+    python = venv_dir / "Scripts" / "python.exe"
+    if not python.exists():
+        raise SystemExit(f"venv creation didn't produce {python}")
+    return python
 
 
 def build_plugin(name: str) -> None:
@@ -122,17 +167,20 @@ def build_python_plugin(plugin_dir: Path, cfg: dict[str, object]) -> Path:
     if not (plugin_dir / spec_file).exists():
         raise SystemExit(f"{plugin_dir / spec_file} not found")
 
-    # Install the plugin's own pinned dependencies into whatever Python
-    # environment is running this script, so PyInstaller's import analysis
-    # can see them. `-e` keeps this reusable during local dev without a
-    # reinstall on every source edit.
+    # Build in a throwaway venv containing only this plugin's own pinned
+    # dependencies (see `fresh_venv_python`'s doc comment for why: PyInstaller
+    # bundles anything it can statically resolve an `import` for, including
+    # dead try/except-ImportError branches, so a package merely being
+    # *installed* in the build environment — even one this plugin never
+    # actually imports — is enough for it to get pulled into the frozen exe).
+    python = fresh_venv_python(plugin_dir)
     target = f".[{','.join(extras)}]" if extras else "."
-    run([sys.executable, "-m", "pip", "install", "-e", target], cwd=plugin_dir)
-    run([sys.executable, "-m", "pip", "install", "pyinstaller"], cwd=plugin_dir)
+    run([str(python), "-m", "pip", "install", "-e", target], cwd=plugin_dir)
+    run([str(python), "-m", "pip", "install", "pyinstaller"], cwd=plugin_dir)
 
     run(
         [
-            sys.executable,
+            str(python),
             "-m",
             "PyInstaller",
             spec_file,

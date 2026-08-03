@@ -116,6 +116,19 @@ pub async fn spawn(
 
     let port = free_port().map_err(|e| format!("no free port: {e}"))?;
     let secret = generate_secret();
+    // Unlike `secret` above (regenerated every launch), this must be stable
+    // across restarts or previously-encrypted rows in BigTiny's own DB
+    // become undecryptable — stored in Windows Credential Manager, not
+    // regenerated here. A Credential Manager failure is a hard error: it
+    // must never silently fall through to BigTiny's own standalone-mode key
+    // file fallback just because Kitty's own lookup failed (that fallback
+    // exists for genuinely standalone runs with no Kitty parent process,
+    // not as a safety net for this).
+    let encryption_key = tokio::task::spawn_blocking(
+        crate::config::providers::get_or_create_bigtiny_encryption_key,
+    )
+    .await
+    .map_err(|e| format!("encryption key task panicked: {e}"))??;
 
     let mut cmd = hidden_command(Path::new(command));
     cmd.args(args)
@@ -124,6 +137,7 @@ pub async fn spawn(
         .arg("--port")
         .arg(port.to_string())
         .env("BIGTINY_SECRET", &secret)
+        .env("BIGTINY_ENCRYPTION_KEY", &encryption_key)
         // BigTiny's own env-var config surface (`BigTinyConfig`'s
         // `env_nested_delimiter="__"`, `plugins/bigtiny/bigtiny/config.py`) —
         // Kitty never writes a --config YAML for the daemon, so this is the
@@ -282,7 +296,10 @@ mod tests {
     fn write_pidfile_then_read_round_trips() {
         let dir = temp_dir("roundtrip");
         write_pidfile_in(&dir, 12345);
-        assert_eq!(std::fs::read_to_string(pidfile_path(&dir)).unwrap(), "12345");
+        assert_eq!(
+            std::fs::read_to_string(pidfile_path(&dir)).unwrap(),
+            "12345"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

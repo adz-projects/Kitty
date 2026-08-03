@@ -24,8 +24,14 @@ export function RecentSessions() {
 
   useEffect(() => {
     // A session deleted in the other window (e.g. regenerate()'s background
-    // cleanup) otherwise leaves a stale entry here until reopened.
-    const un = onSessionDeleted(() => void refresh());
+    // cleanup) otherwise leaves a stale entry here until reopened. Skip the
+    // refetch when it's this window's own delete — sessionStore.remove()
+    // already filtered it out of local state before this event arrives.
+    const un = onSessionDeleted((sessionId) => {
+      if (useSessionStore.getState().sessions.some((s) => s.sessionId === sessionId)) {
+        void refresh();
+      }
+    });
     return () => void un.then((fn) => fn());
   }, [refresh]);
 

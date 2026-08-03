@@ -5,7 +5,13 @@ import {
   onAdaptivePathwayEmbeddingStatus,
   onPullProgress,
 } from '@/lib/ipc';
-import type { AdaptivePathwayStatus as ApStatus, EmbeddingModelStatus, PullProgress } from '@/lib/types';
+import type {
+  AdaptivePathwayStatus as ApStatus,
+  AdaptivePathwayMcpStatus,
+  EmbeddingModelStatus,
+  PullProgress,
+} from '@/lib/types';
+import { parseArgs, formatArgs } from './McpServers';
 
 const STATUS_LABEL: Record<ApStatus, string> = {
   disabled: 'Disabled',
@@ -56,15 +62,30 @@ export function AdaptivePathway() {
   const [error, setError] = useState('');
   const [weights, setWeights] = useState<EnsembleWeights | null>(null);
   const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [mcpStatus, setMcpStatus] = useState<AdaptivePathwayMcpStatus | null>(null);
+  const [mcpStatusError, setMcpStatusError] = useState('');
+
+  const loadMcpStatus = () =>
+    void ipc
+      .getAdaptivePathwayMcpStatus()
+      .then((s) => {
+        setMcpStatus(s);
+        setMcpStatusError('');
+      })
+      .catch((e) => setMcpStatusError(String(e)));
 
   const load = async () => {
     const cfg = await ipc.getConfig();
     setEnabled(cfg.adaptive_pathway_enabled);
     setLaunchCommand(cfg.adaptive_pathway_launch_command);
-    setLaunchArgs(cfg.adaptive_pathway_launch_args.join(' '));
+    setLaunchArgs(formatArgs(cfg.adaptive_pathway_launch_args));
     setDbPath(cfg.adaptive_pathway_db_path);
     setPort(cfg.adaptive_pathway_port);
     setEmbeddingModel(cfg.adaptive_pathway_embedding_model);
+    // Best-effort initial reads — both have a live event subscription set up
+    // right after this call returns (onAdaptivePathwayStatus/
+    // onAdaptivePathwayEmbeddingStatus below), which will catch the display
+    // up on the next real status change even if this fetch fails.
     await ipc
       .getAdaptivePathwayStatus()
       .then(setStatus)
@@ -77,6 +98,7 @@ export function AdaptivePathway() {
 
   useEffect(() => {
     void load();
+    loadMcpStatus();
     const un = onAdaptivePathwayStatus((p) => setStatus(p.status));
     const unEmbedding = onAdaptivePathwayEmbeddingStatus((p) => setEmbeddingStatus(p.status));
     return () => {
@@ -91,6 +113,8 @@ export function AdaptivePathway() {
       setEmbeddingBackend(null);
       return;
     }
+    // Best-effort: a failure just leaves the ensemble-weights/embedding-
+    // backend display blank until `status` next changes and this re-runs.
     void ipc
       .adaptivePathwayGetState()
       .then((s) => {
@@ -98,6 +122,10 @@ export function AdaptivePathway() {
         setEmbeddingBackend(s.embedding?.backend ?? null);
       })
       .catch(() => {});
+    // Refresh the MCP-tools connection state whenever the sidecar status
+    // changes — e.g. after a Restart or a settings toggle — so the "tools
+    // connected" line stays current.
+    loadMcpStatus();
   }, [status]);
 
   useEffect(() => {
@@ -105,6 +133,7 @@ export function AdaptivePathway() {
       if (p.model !== embeddingModel) return;
       setInstallProgress(p);
       if (p.done && !p.error) {
+        // Best-effort — same reasoning as the initial load() fetch above.
         void ipc
           .getAdaptivePathwayEmbeddingStatus()
           .then(setEmbeddingStatus)
@@ -230,13 +259,35 @@ export function AdaptivePathway() {
         )}
         {embeddingBackend && embeddingBackend !== 'untried' && (
           <span className="muted">
-            · {embeddingBackend === 'ollama' ? 'semantic embeddings active' : 'using fallback vectors'}
+            ·{' '}
+            {embeddingBackend === 'ollama'
+              ? 'semantic embeddings active'
+              : 'using fallback vectors'}
           </span>
         )}
         <button disabled={busy || status === 'disabled'} onClick={() => void restart()}>
           Restart
         </button>
       </div>
+      {status === 'ok' && (
+        <small className="muted">
+          {mcpStatusError ? (
+            <>Couldn&apos;t check tool registration: {mcpStatusError}</>
+          ) : mcpStatus == null ? (
+            <>Tools not registered with BigTiny yet — will appear shortly.</>
+          ) : mcpStatus.status === 'connected' ? (
+            <>
+              Tools connected: <strong>{mcpStatus.tool_count}</strong> available to the model
+              (decide, record_outcome, …).
+            </>
+          ) : (
+            <>
+              MCP server <strong>{mcpStatus.status}</strong> — tools not reaching the model.
+              {mcpStatus.error_message ? ` ${mcpStatus.error_message}` : ''}
+            </>
+          )}
+        </small>
+      )}
 
       {status !== 'disabled' && embeddingStatus === 'missing' && (
         <div className="dep-row" style={{ flexDirection: 'column', alignItems: 'stretch', gap: 8 }}>
@@ -254,7 +305,9 @@ export function AdaptivePathway() {
               <div className="pull-head">
                 <span>{installProgress.model}</span>
                 <span className="muted">
-                  {installProgress.error ? `error: ${installProgress.error}` : installProgress.status}
+                  {installProgress.error
+                    ? `error: ${installProgress.error}`
+                    : installProgress.status}
                 </span>
               </div>
               <div className="progress">
@@ -271,7 +324,9 @@ export function AdaptivePathway() {
               </div>
             </div>
           )}
-          {installError && <p className="muted">Couldn&apos;t set up automatically: {installError}</p>}
+          {installError && (
+            <p className="muted">Couldn&apos;t set up automatically: {installError}</p>
+          )}
         </div>
       )}
 
@@ -289,8 +344,8 @@ export function AdaptivePathway() {
       {advancedOpen && (
         <div>
           <p className="muted">
-            Launch command, extra args, database path, and port — the sidecar and the MCP tools
-            both point at the same database path so they see the same learned data.
+            Launch command, extra args, database path, and port — the sidecar and the MCP tools both
+            point at the same database path so they see the same learned data.
           </p>
           <div className="field">
             <span>Launch command</span>
@@ -307,7 +362,7 @@ export function AdaptivePathway() {
               onChange={(e) => setLaunchArgs(e.target.value)}
               onBlur={() =>
                 void saveField({
-                  adaptive_pathway_launch_args: launchArgs.split(/\s+/).filter(Boolean),
+                  adaptive_pathway_launch_args: parseArgs(launchArgs),
                 })
               }
             />

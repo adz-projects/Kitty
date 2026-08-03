@@ -29,7 +29,11 @@ fn session_info(session_id: String, cwd: String) -> SessionInfo {
 /// from the very first tool call, rather than leaving it unset until a
 /// later `PATCH /config` — see `update_mode`'s doc comment for why that gap
 /// would matter.
-pub async fn create(app: &AppHandle, cwd: String, mode: Option<String>) -> Result<SessionInfo, String> {
+pub async fn create(
+    app: &AppHandle,
+    cwd: String,
+    mode: Option<String>,
+) -> Result<SessionInfo, String> {
     let client = ensure_client(app)?;
     let result = client
         .post_json("/api/chat/", &json!({ "cwd": cwd, "mode": mode }))
@@ -51,7 +55,10 @@ pub async fn create(app: &AppHandle, cwd: String, mode: Option<String>) -> Resul
 pub async fn update_mode(app: &AppHandle, session_id: &str, mode: &str) -> Result<(), String> {
     let client = ensure_client(app)?;
     client
-        .patch_json(&format!("/api/chat/{session_id}/config"), &json!({ "mode": mode }))
+        .patch_json(
+            &format!("/api/chat/{session_id}/config"),
+            &json!({ "mode": mode }),
+        )
         .await?;
     Ok(())
 }
@@ -64,7 +71,36 @@ pub async fn update_mode(app: &AppHandle, session_id: &str, mode: &str) -> Resul
 pub async fn update_cwd(app: &AppHandle, session_id: &str, cwd: &str) -> Result<(), String> {
     let client = ensure_client(app)?;
     client
-        .patch_json(&format!("/api/chat/{session_id}/config"), &json!({ "cwd": cwd }))
+        .patch_json(
+            &format!("/api/chat/{session_id}/config"),
+            &json!({ "cwd": cwd }),
+        )
+        .await?;
+    Ok(())
+}
+
+/// Set a session's custom/default persona (`PATCH /api/chat/{id}/config`).
+/// BigTiny's `ContextBuilder::build_messages` reads this from session
+/// metadata and renders it as a real `role: "system"` message — the same
+/// mechanism `RecipeEngine::execute` uses for a recipe's instructions. This
+/// replaces the old client-side hack (chatStore's `send()` used to prepend a
+/// literal `<system>...</system>` block onto the first outgoing *user*
+/// message's text, a leftover from the pre-BigTiny Goose/ACP backend, which
+/// had no system-prompt field of its own) — embedding fake role markup
+/// inside a user turn is exactly the kind of malformed input a model whose
+/// chat template expects strict role/tag structure (e.g. Qwen's tool-calling
+/// template) can derail on.
+pub async fn update_persona_override(
+    app: &AppHandle,
+    session_id: &str,
+    persona: &str,
+) -> Result<(), String> {
+    let client = ensure_client(app)?;
+    client
+        .patch_json(
+            &format!("/api/chat/{session_id}/config"),
+            &json!({ "persona_override": persona }),
+        )
         .await?;
     Ok(())
 }
@@ -75,7 +111,9 @@ pub async fn update_cwd(app: &AppHandle, session_id: &str, cwd: &str) -> Result<
 /// turn's own SSE stream closed.
 pub async fn get_stats(app: &AppHandle, session_id: &str) -> Result<Value, String> {
     let client = ensure_client(app)?;
-    client.get_json(&format!("/api/chat/{session_id}/stats")).await
+    client
+        .get_json(&format!("/api/chat/{session_id}/stats"))
+        .await
 }
 
 /// List sessions, translated to the goosed raw shape the frontend parses.
@@ -141,11 +179,7 @@ pub(crate) fn extract_text(row: &Value) -> String {
 /// Resume a session: replay its history as the same `chat://*` events
 /// goosed's `session/load` produces (the store buffers/renders them during
 /// the call), then return the session info.
-pub async fn load(
-    app: &AppHandle,
-    session_id: String,
-    cwd: String,
-) -> Result<SessionInfo, String> {
+pub async fn load(app: &AppHandle, session_id: String, cwd: String) -> Result<SessionInfo, String> {
     let client = ensure_client(app)?;
     let rows = fetch_history(&client, &session_id).await?;
 
@@ -294,12 +328,11 @@ pub(crate) fn truncate_target(rows: &[Value], keep: i64) -> Option<String> {
                 bubble += 1;
                 in_assistant_run = false;
             }
-            "assistant" | "tool" => {
-                if !in_assistant_run {
-                    bubble += 1;
-                    in_assistant_run = true;
-                }
+            "assistant" | "tool" if !in_assistant_run => {
+                bubble += 1;
+                in_assistant_run = true;
             }
+            "assistant" | "tool" => {}
             _ => {} // system: attaches to the open bubble
         }
         if bubble <= keep {

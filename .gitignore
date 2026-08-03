@@ -32,6 +32,10 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 plugins/*/build/
+# Per-plugin PyInstaller build venv (plugins/build.py) — isolated so a
+# freeze only sees that plugin's own declared dependencies, not whatever
+# happens to be installed in the system/dev Python environment.
+plugins/*/.build-venv/
 # Local SQLite probe/scratch databases a plugin's own dev tooling can leave
 # behind (e.g. adaptive-pathway's `_probe_pathway.db-*`).
 _probe_*.db-*
@@ -40,3 +44,12 @@ _probe_*.db-*
 # of the shipped project.
 .claude/
 .opencode/
+
+# Retired plugins — superseded and no longer built/bundled (see
+# plugins/build.py's PLUGINS dict and its module doc comment). Kept on disk,
+# untracked, as the behavioral oracle their replacements were verified
+# against; not part of the shipped app.
+plugins/bigtiny/
+plugins/visualizations/
+plugins/brave-mcp-search/
+plugins/replacement-mcp/

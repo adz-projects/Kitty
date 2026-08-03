@@ -69,12 +69,21 @@ function DepRow({ dep, onChanged }: { dep: DepStatus; onChanged: () => void }) {
       // used to read a successful launch as a failure.
       setWaitingForInstaller(true);
       const deadline = Date.now() + INSTALL_POLL_TIMEOUT_MS;
+      let installed = false;
       while (Date.now() < deadline && !cancelled.current) {
         await new Promise((r) => setTimeout(r, INSTALL_POLL_INTERVAL_MS));
         const fresh = await ipc.detectDependencies();
-        if (fresh.ollama.installed) break;
+        if (fresh.ollama.installed) {
+          installed = true;
+          break;
+        }
       }
       setWaitingForInstaller(false);
+      if (!installed && !cancelled.current) {
+        setError(
+          "Didn't detect a finished install after 2 minutes. Finish the installer window, then click Re-check."
+        );
+      }
       onChanged();
     } catch (e) {
       setError(String(e));

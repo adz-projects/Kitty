@@ -34,6 +34,7 @@ class EdgeModel(Base):
     frequency = Column(Integer, default=0)
     created_at = Column(DateTime, server_default=sa.func.now())
     co_selected_with = Column(JSON, default=list)
+    override_rate = Column(Float, default=0.0)
 
 class DomainModel(Base):
     __tablename__ = "domains"
@@ -52,6 +53,9 @@ class DomainModel(Base):
     last_inferred = Column(DateTime, nullable=True)
     user_override = Column(JSON, nullable=True)
     locked = Column(Boolean, default=False)
+    # Normalized float32 centroid embedding used by DomainDiscovery.infer_domain
+    # (added via ALTER for databases created before this column existed).
+    centroid = Column(BLOB, nullable=True)
 
 class AnnotationModel(Base):
     __tablename__ = "annotations"
@@ -178,6 +182,32 @@ class CoSelectionLogModel(Base):
     timestamp = Column(DateTime, server_default=sa.func.now())
 
 
+class TTLModel(Base):
+    """Persisted EdgeTTL entries — a 'don't do this again'/'crash' mute must
+    survive a sidecar restart, not just the current process."""
+    __tablename__ = "ttl_entries"
+    edge_id = Column(String, primary_key=True)
+    expires_at = Column(String)
+    cause = Column(String)
+    set_at = Column(String)
+
+
+class AppSettingsModel(Base):
+    """Small settings KV store: ensemble-weight slider values and other
+    user-tunable runtime settings that must survive restarts (rows 13/2)."""
+    __tablename__ = "app_settings"
+    key = Column(String, primary_key=True)
+    value = Column(JSON, nullable=True)
+
+
+# Columns added after a table's first release; `_ensure_column` ALTERs them
+# in idempotently for databases created by older builds.
+_LATE_COLUMNS = {
+    "edges": [("override_rate", "FLOAT")],
+    "domains": [("centroid", "BLOB")],
+}
+
+
 async def init_db(db_path: str):
     engine = create_async_engine(
         f"sqlite+aiosqlite:///{db_path}",
@@ -189,4 +219,11 @@ async def init_db(db_path: str):
         await conn.execute(sa.text("PRAGMA synchronous=NORMAL"))
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        for table, columns in _LATE_COLUMNS.items():
+            result = await conn.execute(sa.text(f"PRAGMA table_info({table})"))
+            existing = {row[1] for row in result}
+            for name, ddl in columns:
+                if name not in existing:
+                    await conn.execute(
+                        sa.text(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}"))
     return engine

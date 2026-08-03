@@ -112,22 +112,24 @@ probed then spawned); `kitty-tools`, `kitty-docs-web`, `adaptive-pathway-mcp`,
 and `wasm-math-mcp` are stdio MCP servers registered with BigTiny's own
 `/api/mcp/servers` registry (`bigtiny::mcp::ensure_builtin_servers`), not
 spawned directly by Kitty. `wasm-math-mcp` and `kitty-docs-web` are on by
-default (no credentials). `kitty-tools` hosts 20 tools in one process — the
+default (no credentials). `kitty-tools` hosts 21 tools in one process — the
 always-on shell/workspace/file/word/cache/scratchpad set (on by default,
 same rationale as the old `replacement-mcp`, which it retires and fully
-absorbs), plus 2 visualization tools gated by their own Settings toggle (an
-env var on this one process, not a separate server) — no network calls of
-its own. `kitty-docs-web` hosts 8 tools, including the merged, count-tiered
-`lean_web_search`/`lean_web_search_read_chunk` (DuckDuckGo via `ddgs`,
-always available; Brave preferred per-query when configured). Brave's
-toggle needs an API key, stored in the keyring rather than `config.json` —
-disabling it always deletes the stored key, so re-enabling always requires
-re-entering it. This tool used to be `brave_mcp_search`, hosted in
-`kitty-tools` (Rust); it moved to `kitty-docs-web` (Python) alongside
-`ddgs`, since DuckDuckGo has no Rust crate equivalent — see
-`docs/VERSIONS.md`. `brave-mcp-search` and `visualizations` (the
-formerly-separate servers) are retired along with `replacement-mcp`; their
-source stays in-tree, unbuilt, as a re-verification oracle.
+absorbs), plus 3 visualization tools (accessible table, SVG diagram, chart)
+gated by their own Settings toggle (an env var on this one process, not a
+separate server) — no network calls of its own. `kitty-docs-web` hosts 8
+tools, including the merged, count-tiered `lean_web_search`/
+`lean_web_search_read_chunk` (DuckDuckGo via `ddgs`, always available; Brave
+preferred per-query when configured). Brave's toggle needs an API key,
+stored in the keyring rather than `config.json` — disabling it always
+deletes the stored key, so re-enabling always requires re-entering it. This
+tool used to be `brave_mcp_search`, hosted in `kitty-tools` (Rust); it moved
+to `kitty-docs-web` (Python) alongside `ddgs`, since DuckDuckGo has no Rust
+crate equivalent — see `docs/VERSIONS.md`. `brave-mcp-search` and
+`replacement-mcp` are retired with their source kept in-tree, unbuilt, as a
+re-verification oracle for the ports. `visualizations` is also retired, but
+its Rust rebuild deliberately diverges rather than ports it — see
+`docs/PLUGINS.md` for why its source is no longer a correctness reference.
 
 ## Cross-cutting: the three "who's the source of truth" boundaries
 

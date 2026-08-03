@@ -85,7 +85,10 @@ describe('recipeNeedsAttention', () => {
 });
 
 describe('matchRecipeCommand', () => {
-  const recipes = [recipe({ slug: 'annotated_bibliography' }), recipe({ slug: 'debate_moderator', id: 'r2' })];
+  const recipes = [
+    recipe({ slug: 'annotated_bibliography' }),
+    recipe({ slug: 'debate_moderator', id: 'r2' }),
+  ];
 
   it('returns null when the text does not start with a slash', () => {
     expect(matchRecipeCommand('annotated_bibliography find sources', recipes)).toBeNull();
@@ -115,16 +118,18 @@ describe('matchRecipeCommand', () => {
 
 describe('resolveRecipe', () => {
   it('substitutes the primary parameter from typed text and others from defaults', () => {
-    const { resolvedInstructions, resolvedPromptText } = resolveRecipe(
-      recipe(),
-      'AI in education'
-    );
+    const { resolvedInstructions, resolvedPromptText } = resolveRecipe(recipe(), 'AI in education');
     expect(resolvedInstructions).toBe('Do the thing about AI in education with style formal.');
     expect(resolvedPromptText).toBe('Please cover: AI in education');
   });
 
   it('falls back to the primary default when no text was typed', () => {
-    const r = recipe({ parameters: [param({ default: 'fallback topic' }), param({ key: 'style', requirement: 'optional', default: 'formal' })] });
+    const r = recipe({
+      parameters: [
+        param({ default: 'fallback topic' }),
+        param({ key: 'style', requirement: 'optional', default: 'formal' }),
+      ],
+    });
     const { resolvedPromptText } = resolveRecipe(r, '');
     expect(resolvedPromptText).toBe('Please cover: fallback topic');
   });

@@ -126,6 +126,32 @@ pub fn spawn_adaptive_pathway_health_loop(app: AppHandle) {
                     last_schism_state = schism_state;
                 }
             }
+            // Self-heal the bundled MCP servers (notably `adaptive-pathway`)
+            // on a slower cadence than the schism check — every ~2 minutes —
+            // so a builtin whose stdio process dropped after startup (or whose
+            // `AP_SIDECAR_PORT` became stale) reconnects on its own instead of
+            // silently losing its tools from the LLM tool list until the app
+            // restarts. `ensure_builtin_servers` issues a `Connect` for any
+            // enabled-but-not-connected row; when everything is healthy it's a
+            // couple of no-op REST reads. Gated on `up` so a dead sidecar
+            // doesn't make the MCP proxy spin uselessly.
+            if up && tick % 24 == 0 {
+                let port = app
+                    .state::<AppState>()
+                    .bigtiny
+                    .lock()
+                    .unwrap()
+                    .port;
+                if let Some(port) = port {
+                    // Only bother when the daemon (not just the sidecar) is up.
+                    if super::bigtiny_proc::probe_health(&client, port).await {
+                        let app2 = app.clone();
+                        tauri::async_runtime::spawn(async move {
+                            crate::bigtiny::mcp::self_heal_builtin_servers(&app2).await;
+                        });
+                    }
+                }
+            }
             // Same ~30s cadence as the schism check. Never overwrites
             // `Downloading` here — that state is only ever set/cleared by the
             // in-flight `ensure_embedding_model` pull task itself; this is

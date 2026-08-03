@@ -29,6 +29,12 @@ export interface Message {
   durationMs?: number;
   inputTokens?: number;
   outputTokens?: number;
+  /** Prompt-cache stats (Anthropic `cache_read_input_tokens`/
+      `cache_creation_input_tokens`, or OpenAI-style `prompt_tokens_details.
+      cached_tokens`) — absent (not 0) whenever the provider/model doesn't
+      report them, same completeness caveat as the other metrics fields. */
+  cacheReadTokens?: number;
+  cacheCreationTokens?: number;
   /** Time to first token, from BigTiny's `llm_timing` event — the call that
       produced this message's final visible text. Same completeness caveat
       as the other metrics fields: only set on a message from a live send(). */

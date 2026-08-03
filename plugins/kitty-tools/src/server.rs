@@ -14,7 +14,7 @@ use crate::envelope::{error_response, success_response};
 use crate::paths::resolve;
 use crate::query_filter::filter_by_query;
 use crate::tools;
-use crate::tools::viz::VizStep;
+use crate::tools::viz::model as viz_model;
 
 /// Paragraphs returned per page when no `limit` is given — same default as
 /// `lean_file_read`'s `file_page_size` threshold in the Python plugin this
@@ -133,29 +133,252 @@ pub struct ScratchpadKeyRequest {
     pub key: String,
 }
 
+/// Hand-written schema for `AccessibleTableRequest::rows`.
+///
+/// The field stays `Vec<Vec<serde_json::Value>>` — a cell really can be a
+/// string, a number, or a boolean, and the renderer handles all three — but
+/// schemars renders `serde_json::Value` as the *boolean* schema `true`
+/// ("anything"). That is legal JSON Schema and harmless to Ollama, but
+/// llama.cpp builds a decoding grammar from the tool list and aborts on a
+/// boolean sub-schema with `Unrecognized schema: true`, returning HTTP 400
+/// for the whole request — so a single `"items": true` here took down every
+/// message in the session, including ones that never touched this tool.
+/// Spelling the cell type out explicitly is both grammar-safe and a truer
+/// description of what belongs in a table cell than "anything" was.
+///
+/// BigTiny sanitizes boolean sub-schemas defensively as well
+/// (`agent/loop_.rs::sanitize_boolean_subschemas`), for MCP servers we don't
+/// own; this keeps the schema correct at the source for every other client.
+fn rows_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "array",
+        "minItems": 1,
+        "items": {
+            "type": "array",
+            "items": {
+                "anyOf": [
+                    { "type": "string" },
+                    { "type": "number" },
+                    { "type": "boolean" }
+                ]
+            }
+        }
+    })
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct AccessibleTableRequest {
+    /// Caption and main title of the table.
     pub title: String,
+    /// Column header strings, e.g. ["Region", "Q1", "Q2"].
+    #[schemars(length(min = 1))]
     pub headers: Vec<String>,
+    /// One array per row. Every row must have exactly as many values as
+    /// there are `headers`. The first value in each row becomes that row's
+    /// header cell, so put the row's label there.
+    #[schemars(schema_with = "rows_schema")]
     pub rows: Vec<Vec<serde_json::Value>>,
+    /// Screen-reader summary of the trend, e.g. "Sales rose in every region
+    /// except West."
     pub summary: Option<String>,
+}
+
+/// Kept flat (`{"type":"string","enum":[...]}`) rather than doc-commented per
+/// variant: schemars 1.x switches a doc-commented unit enum to
+/// `oneOf`-of-`const`, which grammar-constrained decoders (llama.cpp/Ollama)
+/// handle far less reliably than a plain string enum. All guidance on what
+/// each value means lives on the *field* that uses this type instead —
+/// `tests/schema.rs` asserts the flat form so this can't regress silently.
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum VizDiagramType {
+    SingleLane,
+    Flowchart,
+    Tree,
+    Swimlane,
+    JourneyMap,
+}
+
+impl VizDiagramType {
+    fn to_model(self) -> viz_model::DiagramType {
+        match self {
+            VizDiagramType::SingleLane => viz_model::DiagramType::SingleLane,
+            VizDiagramType::Flowchart => viz_model::DiagramType::Flowchart,
+            VizDiagramType::Tree => viz_model::DiagramType::Tree,
+            VizDiagramType::Swimlane => viz_model::DiagramType::Swimlane,
+            VizDiagramType::JourneyMap => viz_model::DiagramType::JourneyMap,
+        }
+    }
+}
+
+/// See the doc comment on `VizDiagramType` for why this has no per-variant
+/// doc comments. `#[serde(alias = "gate")]` keeps the crate's historical
+/// step-type name working for any caller still using it.
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum VizStepType {
+    Start,
+    Process,
+    #[serde(alias = "gate")]
+    Decision,
+    End,
+}
+
+impl VizStepType {
+    fn to_model(self) -> viz_model::StepType {
+        match self {
+            VizStepType::Start => viz_model::StepType::Start,
+            VizStepType::Process => viz_model::StepType::Process,
+            VizStepType::Decision => viz_model::StepType::Decision,
+            VizStepType::End => viz_model::StepType::End,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct VizStepParam {
-    pub text: Option<String>,
+    /// Short unique id for this node, e.g. "a", "check", "n3". Required for
+    /// "flowchart" and "tree" so that `next` can reference it. Ignored by
+    /// "single_lane" and "journey_map".
+    pub id: Option<String>,
+
+    /// The label drawn inside the node. Keep it under ~40 characters; longer
+    /// text wraps to at most 3 lines and then truncates. For "journey_map"
+    /// this is the stage name, e.g. "Sign Up".
+    pub text: String,
+
+    /// Node shape. "start"/"end" draw rounded pill terminators, "process"
+    /// draws a box, "decision" draws a gate shape with YES/NO branch labels
+    /// on a "flowchart". Defaults to "process". Ignored by "journey_map" and
+    /// "tree", which always draw a plain box.
     #[serde(rename = "type")]
-    pub step_type: Option<String>,
+    pub step_type: Option<VizStepType>,
+
+    /// Small caption under the label. On a "decision" node use it for the
+    /// question being asked; on a "journey_map" stage use it for what the
+    /// user does there, e.g. "Fills out the signup form".
     pub subtitle: Option<String>,
+
+    /// Which horizontal band this step belongs to, e.g. "Customer",
+    /// "Backend API". Required for "swimlane"; ignored by every other
+    /// diagram_type. Lanes are drawn top-to-bottom in first-seen order.
+    pub lane: Option<String>,
+
+    /// How the user feels at this stage, from -2 (very frustrated) to 2
+    /// (delighted). Used only by "journey_map", where it plots the sentiment
+    /// curve. Omit it on every stage to suppress the curve entirely.
+    #[schemars(range(min = -2, max = 2))]
+    pub sentiment: Option<i32>,
+
+    /// A friction point at this stage, e.g. "Too many form fields". Used only
+    /// by "journey_map"; drawn as a card in the pain-points row.
+    pub pain: Option<String>,
+
+    /// Ids of the node(s) this one flows into. Used by "flowchart" (branches
+    /// — list two ids on a "decision" node) and "tree" (children). Omit on a
+    /// terminal node. Ignored by "single_lane", "swimlane" and "journey_map",
+    /// which flow in array order instead.
+    pub next: Option<Vec<String>>,
+}
+
+impl VizStepParam {
+    fn into_model(self) -> viz_model::Step {
+        viz_model::Step {
+            id: self.id,
+            text: self.text,
+            step_type: self.step_type.map(VizStepType::to_model).unwrap_or_default(),
+            subtitle: self.subtitle,
+            lane: self.lane,
+            sentiment: self.sentiment,
+            pain: self.pain,
+            next: self.next.unwrap_or_default(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct AccessibleSvgRequest {
-    /// One of "flowchart", "single_lane", "swimlane", or "journey_map".
-    pub diagram_type: String,
+    /// Which diagram to draw, chosen by the shape of your data:
+    /// "single_lane" is a straight A -> B -> C process with no branches
+    /// (uses text/type/subtitle). "flowchart" is a process where some step
+    /// has more than one possible next step (uses id/text/type/subtitle/next
+    /// — give every step an `id` and list branch targets in `next`). "tree"
+    /// is a hierarchy like an org chart or file layout (uses id/text/next,
+    /// where `next` means "children"). "swimlane" shows who does what, steps
+    /// grouped into actor bands (uses text/lane/id/next). "journey_map"
+    /// shows stages of a user experience with feelings (uses
+    /// text/subtitle/sentiment/pain).
+    pub diagram_type: VizDiagramType,
+
+    /// Title drawn at the top of the diagram and used as the iframe title.
     pub title: String,
+
+    /// One or two sentences describing the diagram for screen-reader users.
+    /// Emitted into the SVG `<desc>`. Say what the diagram shows, not that it
+    /// is a diagram.
     pub description: String,
-    pub steps: Option<Vec<VizStepParam>>,
+
+    /// The nodes, in reading order. At least 1 (up to 40 for most
+    /// diagram_types; 24 for "swimlane"; 12 for "journey_map"). Every
+    /// diagram_type requires this — there is no built-in content.
+    #[schemars(length(min = 1))]
+    pub steps: Vec<VizStepParam>,
+}
+
+/// See the doc comment on `VizDiagramType` for why this has no per-variant
+/// doc comments.
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum VizChartType {
+    Bar,
+    HorizontalBar,
+    Line,
+    GroupedBar,
+}
+
+impl VizChartType {
+    fn to_model(self) -> viz_model::ChartType {
+        match self {
+            VizChartType::Bar => viz_model::ChartType::Bar,
+            VizChartType::HorizontalBar => viz_model::ChartType::HorizontalBar,
+            VizChartType::Line => viz_model::ChartType::Line,
+            VizChartType::GroupedBar => viz_model::ChartType::GroupedBar,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ChartSeriesParam {
+    /// Name of this data series, shown in the legend, e.g. "2024 Revenue".
+    pub name: String,
+    /// One number per entry in `categories`, in the same order. Must be
+    /// exactly the same length as `categories`.
+    pub values: Vec<f64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct AccessibleChartRequest {
+    /// "bar" (vertical bars), "horizontal_bar" (long category names), "line"
+    /// (change over an ordered sequence like months), or "grouped_bar" (2-4
+    /// series compared per category).
+    pub chart_type: VizChartType,
+    /// Title drawn above the chart and used as the iframe title.
+    pub title: String,
+    /// One or two sentences stating the takeaway for screen-reader users,
+    /// e.g. "Revenue grew each quarter, with the largest jump in Q3."
+    pub description: String,
+    /// The category axis labels, e.g. ["Q1", "Q2", "Q3", "Q4"]. 1 to 24
+    /// entries.
+    #[schemars(length(min = 1, max = 24))]
+    pub categories: Vec<String>,
+    /// One entry for a simple chart, 2-4 for a comparison. Each series must
+    /// have exactly as many `values` as there are `categories`.
+    #[schemars(length(min = 1, max = 4))]
+    pub series: Vec<ChartSeriesParam>,
+    /// Label for the category axis, e.g. "Quarter".
+    pub x_label: Option<String>,
+    /// Label for the value axis, e.g. "Revenue (USD millions)".
+    pub y_label: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -171,7 +394,7 @@ impl Default for KittyToolsServer {
 
 impl KittyToolsServer {
     /// Assembles the router from two pieces: the 18 always-on `lean_*`
-    /// local-machine tools, plus the 2 visualization tools, included only
+    /// local-machine tools, plus the 3 visualization tools, included only
     /// when `KITTY_VIZ_ENABLED=1`. Web search (`lean_web_search` /
     /// `lean_web_search_read_chunk`) lives in the Python `kitty-docs-web`
     /// process instead — see `docs/VERSIONS.md` for why the merged
@@ -427,25 +650,44 @@ impl KittyToolsServer {
 
 #[tool_router(router = viz_tool_router)]
 impl KittyToolsServer {
-    #[tool(name = "generate_accessible_table", description = "Generates a WCAG 2.2 AA compliant HTML table wrapped for iframe rendering.")]
+    #[tool(
+        name = "generate_accessible_table",
+        description = "Renders a WCAG 2.2 AA compliant HTML table inline in the chat. Use it when the individual values matter -- comparisons across more than two dimensions, or any data a reader needs to read exactly. Use generate_accessible_chart instead when the shape of the numbers is the point, not the exact values. Every row must have exactly as many values as there are headers."
+    )]
     pub fn generate_accessible_table(&self, Parameters(req): Parameters<AccessibleTableRequest>) -> String {
         guarded(move || tools::viz::generate_accessible_table(&req.title, &req.headers, &req.rows, req.summary.as_deref()))
     }
 
-    #[tool(name = "generate_accessible_svg", description = "Generates uncrowded, WCAG 2.2 AA compliant SVG diagrams wrapped for iframe rendering.")]
+    #[tool(
+        name = "generate_accessible_svg",
+        description = "Draws a process, hierarchy or user-journey diagram as an accessible SVG, rendered inline in the chat. Use this for anything with steps, actors, branches or stages -- pick diagram_type by the shape of your data (see its description). Do NOT use it for numeric data -- use generate_accessible_chart for that, or generate_accessible_table for raw values. Every node comes from `steps`; there is no built-in content. Example, a branching flowchart: {\"diagram_type\":\"flowchart\",\"title\":\"Login\",\"description\":\"How a login request is authenticated.\",\"steps\":[{\"id\":\"a\",\"text\":\"Receive request\",\"type\":\"start\",\"next\":[\"b\"]},{\"id\":\"b\",\"text\":\"Credentials valid?\",\"type\":\"decision\",\"next\":[\"c\",\"d\"]},{\"id\":\"c\",\"text\":\"Issue token\",\"type\":\"end\"},{\"id\":\"d\",\"text\":\"Return 401\",\"type\":\"end\"}]}"
+    )]
     pub fn generate_accessible_svg(&self, Parameters(req): Parameters<AccessibleSvgRequest>) -> String {
         guarded(move || {
-            let steps: Option<Vec<VizStep>> = req.steps.map(|steps| {
-                steps
-                    .into_iter()
-                    .map(|s| VizStep {
-                        text: s.text.unwrap_or_default(),
-                        step_type: s.step_type.unwrap_or_else(|| "process".to_string()),
-                        subtitle: s.subtitle,
-                    })
-                    .collect()
-            });
-            tools::viz::generate_accessible_svg(&req.diagram_type, &req.title, &req.description, steps.as_deref())
+            let diagram_type = req.diagram_type.to_model();
+            let steps: Vec<viz_model::Step> = req.steps.into_iter().map(VizStepParam::into_model).collect();
+            tools::viz::generate_accessible_svg(diagram_type, &req.title, &req.description, steps)
+        })
+    }
+
+    #[tool(
+        name = "generate_accessible_chart",
+        description = "Draws a bar or line chart from numeric data as an accessible SVG, with a hidden data table for screen readers. Use it when you have numbers per category and want to show comparison or trend; use generate_accessible_table when the exact values matter more than the shape. Every series must have one value per category. Example: {\"chart_type\":\"bar\",\"title\":\"Revenue by quarter\",\"description\":\"Revenue rose each quarter, with the largest jump in Q3.\",\"categories\":[\"Q1\",\"Q2\",\"Q3\",\"Q4\"],\"series\":[{\"name\":\"Revenue\",\"values\":[12.4,15.1,22.8,24.0]}],\"y_label\":\"USD millions\"}"
+    )]
+    pub fn generate_accessible_chart(&self, Parameters(req): Parameters<AccessibleChartRequest>) -> String {
+        guarded(move || {
+            let chart_type = req.chart_type.to_model();
+            let series: Vec<viz_model::ChartSeries> =
+                req.series.into_iter().map(|s| viz_model::ChartSeries { name: s.name, values: s.values }).collect();
+            tools::viz::generate_accessible_chart(
+                chart_type,
+                &req.title,
+                &req.description,
+                req.categories,
+                series,
+                req.x_label.as_deref(),
+                req.y_label.as_deref(),
+            )
         })
     }
 }

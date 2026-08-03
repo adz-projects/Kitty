@@ -68,9 +68,7 @@ impl BigTinyClient {
 /// Map a reqwest response to JSON, folding transport + HTTP errors into one
 /// user-safe string (the detailed body is included — BigTiny's error bodies
 /// are short JSON like `{"detail": "Session not found"}`).
-async fn json_response(
-    result: Result<reqwest::Response, reqwest::Error>,
-) -> Result<Value, String> {
+async fn json_response(result: Result<reqwest::Response, reqwest::Error>) -> Result<Value, String> {
     let resp = result.map_err(|e| format!("BigTiny request failed: {e}"))?;
     let status = resp.status();
     if !status.is_success() {

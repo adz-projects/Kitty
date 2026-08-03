@@ -275,3 +275,57 @@ historical context only; none of it reflects current code.
   "No results found" failure mode noted above (the `ddgs` 8.x→9.x rename);
   it's covered by fixture/mock-based tests in
   `plugins/kitty-docs-web/tests/test_web_search.py`, never live network.
+
+## Visualization tools rebuilt — static clipart replaced, `generate_accessible_chart` added
+
+- **Root cause fixed:** three of the four `generate_accessible_svg`
+  `diagram_type`s (`flowchart`, `swimlane`, `journey_map`) were `include_str!`
+  static `.svg` assets customized only by a `title`/`description`
+  `str::replace` — the node text (an HTTP-auth flow, an e-commerce checkout, a
+  SaaS onboarding funnel) never reflected the caller's actual input. The Rust
+  port had also dropped every per-field JSON-Schema description the Python
+  original (`plugins/visualizations/visualizations.py`) carried, leaving only
+  `diagram_type` documented. Together these meant a 27B local model could not
+  produce anything but generic output from these tools.
+- **Rebuilt as genuinely data-driven layouts** in
+  `plugins/kitty-tools/src/tools/viz/layout/`: `single_lane` (row-wrapping
+  instead of the old fixed 880px-wide viewBox, which silently clipped past
+  ~5 steps), `flowchart` (layered-DAG via longest-path-from-roots + a
+  barycenter-ish ordering sweep, branches/merges, YES/NO tags on decision
+  edges), `tree` (new `diagram_type` — Reingold-Tilford-lite), `swimlane`
+  (lanes from the caller's `lane` values), `journey_map` (bands composed
+  from whichever of `subtitle`/`sentiment`/`pain` are actually present). All
+  five share one node-sizing/wrapping engine (`layout::size_node`, backed by
+  a static Helvetica advance-width table — no embedded font — in `text.rs`)
+  so a long label wraps and the canvas grows instead of clipping.
+  `assets/{flowchart,swimlane,journey_map}.svg` were deleted.
+- **New tool: `generate_accessible_chart`** (`bar`/`horizontal_bar`/`line`/
+  `grouped_bar`), the crate's first chart capability — series differentiated
+  by fill pattern/dash style rather than color alone (grayscale/color-blind
+  accessible), with a hidden `<table class="sr-only">` alongside the SVG for
+  screen readers. Starts cold in adaptive-pathway's Thompson bandit, same
+  accepted cost as the `lean_web_search` merge above —
+  `generate_accessible_table`/`generate_accessible_svg` keep their existing
+  names and bandit state.
+- **Schema rewritten for a small model's benefit:** every field across
+  `AccessibleTableRequest`/`AccessibleSvgRequest`/`AccessibleChartRequest`
+  now carries a description; `diagram_type`/`chart_type`/step `type` are real
+  Rust enums kept intentionally **undocumented per-variant** (a doc comment
+  on an enum *variant* flips schemars 1.x from a flat
+  `{"type":"string","enum":[...]}` to `oneOf`-of-`const`, which
+  llama.cpp/Ollama grammar-constrained decoding handles far less reliably —
+  `tests/schema.rs` asserts the flat form so this can't regress silently);
+  each tool description carries a compact worked-example JSON call.
+  `steps`/`categories`/`series` are now required with no silent fallback —
+  the old `single_lane` behavior of substituting a canned "Ingest Data" demo
+  pipeline whenever `steps` was omitted is gone.
+- **Escaping**: all user text now reaches SVG/HTML only through
+  `render::svg`/`render::table`'s escaping primitives, replacing the crate's
+  prior "unescaped, bounded by the sandboxed iframe's opaque origin" policy.
+  Also fixed a real bug in the old two-step
+  `.replace("__TITLE__",t).replace("__BODY__",b)` template substitution: a
+  title containing the literal text `__BODY__` would get re-scanned and
+  spliced with the body content. `escape::render_template` does a single
+  pass over the template instead.
+- See `docs/PLUGINS.md` for why `visualizations.py` is no longer treated as
+  a correctness oracle for this rebuild.

@@ -79,6 +79,12 @@ class CuriosityNudge:
     def offer(self, reason, mode="thought_partner"):
         if not self._can_trigger(mode):
             return None
+        # Row 8 of 82inefficiencies.md: an offer is read state, not a
+        # repeating reminder. While one is pending (not yet accepted via
+        # `trigger` or dismissed), keep returning None so the same nudge
+        # isn't re-offered on every decide call.
+        if self._offered:
+            return None
         self._offered = True
         return NudgeOffer(
             multiplier=self.max_multiplier,
@@ -132,6 +138,10 @@ class CuriosityNudge:
                           high_acceptance=False):
         self._call_counter += 1
         if self._call_counter % self.check_interval != 0:
+            return False
+        # Never auto-re-trigger while an offer is still pending — the offer
+        # must persist until the user accepts or dismisses it.
+        if self._offered:
             return False
         if self.high_acceptance_blocked and high_acceptance:
             unique_actions = len(set(action_history[-self.window_turns:]))

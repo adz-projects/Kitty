@@ -58,7 +58,9 @@ fn set_startup_phase(app: &AppHandle, phase: StartupPhase) {
 /// extracted as a pure function so the policy is unit testable without
 /// spinning up `start_stack`'s async runtime.
 pub(crate) fn stack_needs_ollama(cfg: &crate::config::Config) -> bool {
-    ollama_proc::requires_local_ollama(cfg) || cfg.adaptive_pathway_enabled || cfg.summarizer.enabled
+    ollama_proc::requires_local_ollama(cfg)
+        || cfg.adaptive_pathway_enabled
+        || cfg.summarizer.enabled
 }
 
 /// Sync the bundled MCP servers now if the just-spawned daemon's own startup
@@ -160,8 +162,13 @@ pub fn start_stack(app: &AppHandle) {
         if warm.is_some() {
             set_startup_phase(&app, StartupPhase::WarmingModel);
         }
-        let spawn_fut =
-            bigtiny_proc::spawn(&command, &args, dir.as_deref(), &summarizer, &token_management);
+        let spawn_fut = bigtiny_proc::spawn(
+            &command,
+            &args,
+            dir.as_deref(),
+            &summarizer,
+            &token_management,
+        );
         let warm_fut = async {
             if let Some((base, model)) = warm {
                 crate::ollama::keep_alive_load(&base, &model).await;
@@ -330,10 +337,16 @@ mod tests {
                 is_trusted: true,
                 temperature: None,
                 top_p: None,
+                top_k: None,
+                min_p: None,
+                presence_penalty: None,
+                frequency_penalty: None,
+                max_tokens: None,
                 context_length: None,
                 strip_reasoning: false,
                 system_prompt: None,
                 prompt_idle_timeout_secs: None,
+                parallel_slots: None,
                 created_at: "2026-01-01T00:00:00Z".into(),
             });
         cfg.active_provider_id = Some("p1".into());
@@ -355,10 +368,16 @@ mod tests {
                 is_trusted: true,
                 temperature: None,
                 top_p: None,
+                top_k: None,
+                min_p: None,
+                presence_penalty: None,
+                frequency_penalty: None,
+                max_tokens: None,
                 context_length: None,
                 strip_reasoning: false,
                 system_prompt: None,
                 prompt_idle_timeout_secs: None,
+                parallel_slots: None,
                 created_at: "2026-01-01T00:00:00Z".into(),
             });
         cfg.active_provider_id = Some("p1".into());
@@ -394,10 +413,16 @@ mod tests {
                 is_trusted: true,
                 temperature: None,
                 top_p: None,
+                top_k: None,
+                min_p: None,
+                presence_penalty: None,
+                frequency_penalty: None,
+                max_tokens: None,
                 context_length: None,
                 strip_reasoning: false,
                 system_prompt: None,
                 prompt_idle_timeout_secs: None,
+                parallel_slots: None,
                 created_at: "2026-01-01T00:00:00Z".into(),
             });
         cfg.active_provider_id = Some("p1".into());

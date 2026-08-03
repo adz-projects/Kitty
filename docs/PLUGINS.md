@@ -87,8 +87,19 @@ plugins/<name>/               # bigtiny included — plugins/bigtiny/
 `replacement-mcp`, `brave-mcp-search`, and `visualizations` are retired — all
 of their tools now live inside `kitty-tools` (Rust) or `kitty-docs-web`
 (Python), see `CLAUDE.md`'s "Internal plugins" section. Their source stays
-in-tree, deliberately absent from `plugins/build.py`'s `PLUGINS` dict, as the
-oracle to re-verify the ports against if a behavioral gap ever surfaces.
+in-tree, deliberately absent from `plugins/build.py`'s `PLUGINS` dict.
+
+For `replacement-mcp` and `brave-mcp-search`, that source remains the oracle
+to re-verify the Rust/Python ports against if a behavioral gap ever surfaces.
+`visualizations` is the exception: its Rust rebuild in
+`plugins/kitty-tools/src/tools/viz/` deliberately diverges rather than
+porting it — three of the four original `diagram_type`s were static clipart
+(`.replace()`-templated `.svg` files with hard-coded node text unrelated to
+the caller's input), which the rebuild replaced with genuinely data-driven
+layout code, plus added `generate_accessible_chart` and a `tree` diagram type
+the Python version never had. Do not treat `visualizations.py` as a
+correctness reference for the diagram generators; it documents the
+pre-rebuild behavior, not an intended target.
 
 **Tauri validates every `externalBin` entry exists on disk at build time —
 even for a plain `cargo build`, not just packaging.** That's why

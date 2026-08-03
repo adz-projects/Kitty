@@ -7,9 +7,13 @@ import type { Config } from '@/lib/types';
 export function useConfigDraft() {
   const [draft, setDraft] = useState<Config | null>(null);
   const [saved, setSaved] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    void ipc.getConfig().then(setDraft);
+    ipc
+      .getConfig()
+      .then(setDraft)
+      .catch((e) => setError(String(e)));
   }, []);
 
   const update = (patch: Partial<Config>) => {
@@ -19,9 +23,14 @@ export function useConfigDraft() {
 
   const save = async () => {
     if (!draft) return;
-    await ipc.setConfig(draft);
-    setSaved(true);
+    setError(null);
+    try {
+      await ipc.setConfig(draft);
+      setSaved(true);
+    } catch (e) {
+      setError(String(e));
+    }
   };
 
-  return { draft, update, save, saved };
+  return { draft, update, save, saved, error };
 }

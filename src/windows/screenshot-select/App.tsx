@@ -45,17 +45,22 @@ export function App() {
     return () => window.removeEventListener('keydown', onKeyDown);
   }, []);
 
-  const onMouseDown = (e: React.MouseEvent) => {
+  const onPointerDown = (e: React.PointerEvent) => {
     if (e.button !== 0) return;
+    // Capture the pointer so mousemove/mouseup keep arriving on this element
+    // even if the cursor leaves the window mid-drag (alt-tab, monitor edge) —
+    // without this, a button-up outside the window is never observed and the
+    // selection rectangle sticks on screen indefinitely.
+    e.currentTarget.setPointerCapture(e.pointerId);
     setDrag({ startX: e.clientX, startY: e.clientY, curX: e.clientX, curY: e.clientY });
   };
 
-  const onMouseMove = (e: React.MouseEvent) => {
+  const onPointerMove = (e: React.PointerEvent) => {
     if (!drag) return;
     setDrag({ ...drag, curX: e.clientX, curY: e.clientY });
   };
 
-  const onMouseUp = () => {
+  const onPointerUp = () => {
     if (!drag) return;
     const container = containerRef.current;
     const left = Math.min(drag.startX, drag.curX);
@@ -78,6 +83,8 @@ export function App() {
     void ipc.reportScreenshotSelection(px, py, pw, ph);
   };
 
+  const onPointerCancel = () => setDrag(null);
+
   const selection = drag
     ? {
         left: Math.min(drag.startX, drag.curX),
@@ -90,9 +97,10 @@ export function App() {
   return (
     <div
       ref={containerRef}
-      onMouseDown={onMouseDown}
-      onMouseMove={onMouseMove}
-      onMouseUp={onMouseUp}
+      onPointerDown={onPointerDown}
+      onPointerMove={onPointerMove}
+      onPointerUp={onPointerUp}
+      onPointerCancel={onPointerCancel}
       style={{
         position: 'fixed',
         inset: 0,

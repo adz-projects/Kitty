@@ -94,36 +94,6 @@ pub async fn record_annotation(
     Ok(())
 }
 
-/// `POST /outcome?session_id=...` — the auto-record-outcome backstop (see
-/// `goosed::stream::track_and_maybe_record_outcome`): fired whenever Kitty
-/// observes a tool call complete over ACP, independent of whether the model
-/// called `record_outcome` itself. No `context` — Kitty doesn't track a
-/// per-session topic summary at the ACP-stream layer, so this degrades to
-/// the sidecar's own zero/hashing fallback; that's an acceptable trade for a
-/// best-effort backstop, not the primary (model-initiated, context-carrying)
-/// signal path.
-pub async fn record_outcome(
-    base: &str,
-    session_id: &str,
-    action_id: &str,
-    reward: f64,
-) -> Result<(), String> {
-    let url = format!("{}/outcome", base.trim_end_matches('/'));
-    let resp = http_client()
-        .post(url)
-        .query(&[("session_id", session_id)])
-        .json(&json!({
-            "action_id": action_id,
-            "reward": reward,
-        }))
-        .timeout(TIMEOUT)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-    resp.error_for_status().map_err(|e| e.to_string())?;
-    Ok(())
-}
-
 /// `POST /suggestions/toggle?session_id=...&paused=...` — the pause/resume
 /// header toggle.
 pub async fn toggle_suggestions(base: &str, session_id: &str, paused: bool) -> Result<(), String> {

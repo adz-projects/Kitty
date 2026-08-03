@@ -244,6 +244,27 @@ MAX_COUNT = 50
 KEYWORDS_PER_ITEM = 5
 MANIFEST_TITLE_MAX_CHARS = 60
 
+# Brave's `/llm/context` is a RAG grounding endpoint — its snippets are page
+# extracts (median ~4.5K chars, measured live), not search blurbs. Left
+# unbounded, a single 10-result inline search runs ~32K chars. Every result
+# also carries Brave's own short `sources[].snippet` (median ~240 chars,
+# same shape as DuckDuckGo's ~250-char `body`); that's what actually goes
+# inline. INLINE_SNIPPET_MAX_CHARS sits just above both natural medians so it
+# essentially never truncates real prose and only ever bites the oversized
+# grounding-text fallback.
+INLINE_SNIPPET_MAX_CHARS = 320
+# Hard ceiling on the serialized inline response, checked after building it —
+# exact rather than estimated, and independent of the mode/count tiers below
+# (which govern engine fan-out, not response size). If Phase 1's per-snippet
+# cap is ever insufficient — e.g. many results, or an engine shape change —
+# this is the backstop that forces a downgrade to the keyword index instead
+# of ever emitting an unbounded reply.
+INLINE_RESPONSE_MAX_CHARS = 8000
+# `lean_web_search_read_chunk` returns full, uncapped `snippet_full` text for
+# up to 5 ids — unbounded that's a plausible ~40K-char reply, the same
+# problem one level down. Stop accumulating once this is exceeded.
+READ_CHUNK_MAX_CHARS = 20000
+
 _QUERY_PREFIX_RE = re.compile(
     r"^(please\s+)?(search\s+for|find\s+me|look\s+up|what\s+is|who\s+is|where\s+is|can\s+you\s+search\s+for)\s+",
     re.IGNORECASE,
@@ -338,15 +359,71 @@ def _brave_query(
             payload = response.json()
         except Exception as e:
             raise _BraveFailure("api", f"unparseable response: {e}")
-        return _parse_brave_results(payload)
+        # Parsing is inside the _BraveFailure contract on purpose: an
+        # unexpected response shape used to escape as a raw AttributeError,
+        # which skipped the DuckDuckGo fallback in `_normal_search` and failed
+        # the whole tool. A Brave shape change must degrade to DuckDuckGo, not
+        # take web search down with it.
+        try:
+            return _parse_brave_results(payload)
+        except Exception as e:
+            raise _BraveFailure("api", f"unexpected response shape: {type(e).__name__}: {e}")
 
     raise _BraveFailure("rate_limit_exhausted", "retries exhausted")
+
+
+_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
+
+
+def _normalize_sources(raw: Any) -> Dict[str, Dict[str, Any]]:
+    """Brave's `sources` is a **dict keyed by URL** — `{url: {title, hostname,
+    age, snippet}}` — not the list of `{"url": ...}` objects this once assumed.
+    The list shape is still accepted because it's what the API docs described
+    and what a future revision could go back to; anything else yields an empty
+    map rather than raising, since sources are only ever supplementary to
+    `grounding`."""
+    if isinstance(raw, dict):
+        return {url: entry for url, entry in raw.items() if isinstance(entry, dict)}
+    if isinstance(raw, list):
+        return {s.get("url", ""): s for s in raw if isinstance(s, dict)}
+    return {}
+
+
+def _source_date(source: Dict[str, Any]) -> Optional[str]:
+    """A source's `age` is a list of the same date in several renderings —
+    e.g. `["Saturday, February 22, 2025", "2025-02-22", "526 days ago",
+    "2025-02-22T00:00:00Z"]`. Prefer the ISO one; fall back to the first
+    entry. (There is no `date` key; the old code looked for one and so every
+    Brave result came back dateless.)"""
+    age = source.get("age")
+    if isinstance(age, str):
+        return age or None
+    if isinstance(age, list):
+        candidates = [a for a in age if isinstance(a, str) and a]
+        for a in candidates:
+            if _ISO_DATE_RE.match(a):
+                return a
+        return candidates[0] if candidates else None
+    return None
+
+
+def _split_snippet(short: str, full: str) -> tuple[str, str]:
+    """Returns `(snippet, snippet_full)`. `short` is what a caller offers as
+    the inline-appropriate text (e.g. Brave's own `sources[].snippet`); `full`
+    is the uncapped text (e.g. Brave's `grounding` page extract). When `short`
+    is empty — about 1 in 9 Brave sources, measured live — fall back to a
+    truncated `full` rather than shipping an empty inline snippet."""
+    full = (full or "").strip()
+    short = (short or "").strip()
+    if not short:
+        short = full
+    return short[:INLINE_SNIPPET_MAX_CHARS], full
 
 
 def _parse_brave_results(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Extracts a flat result list from Brave's grounding/sources response shape."""
     grounding = payload.get("grounding") or {}
-    sources = {s.get("url", ""): s for s in (payload.get("sources") or [])}
+    sources = _normalize_sources(payload.get("sources"))
 
     def _clean(raw_url: str) -> tuple[str, str]:
         clean_url = _strip_tracking_params(raw_url)
@@ -358,13 +435,16 @@ def _parse_brave_results(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
         clean_url, domain = _clean(raw_url)
         source = sources.get(raw_url, {})
         snippets = entry.get("snippets") or ([entry["snippet"]] if entry.get("snippet") else [])
+        snippet_full = " ".join(snippets).strip()
+        snippet, snippet_full = _split_snippet(source.get("snippet", ""), snippet_full)
         items.append(
             {
                 "title": entry.get("title", ""),
                 "domain": domain or source.get("hostname", ""),
                 "url": clean_url,
-                "date": entry.get("age") or source.get("date"),
-                "snippet": " ".join(snippets).strip(),
+                "date": _source_date(entry) or _source_date(source),
+                "snippet": snippet,
+                "snippet_full": snippet_full,
             }
         )
 
@@ -372,26 +452,30 @@ def _parse_brave_results(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     if poi:
         raw_url = poi.get("url", "")
         clean_url, domain = _clean(raw_url)
+        snippet, snippet_full = _split_snippet(poi.get("description", ""), poi.get("description", ""))
         items.append(
             {
                 "title": poi.get("title", ""),
                 "domain": domain,
                 "url": clean_url,
                 "date": None,
-                "snippet": poi.get("description", ""),
+                "snippet": snippet,
+                "snippet_full": snippet_full,
             }
         )
 
     for entry in grounding.get("map") or []:
         raw_url = entry.get("url", "")
         clean_url, domain = _clean(raw_url)
+        snippet, snippet_full = _split_snippet(entry.get("description", ""), entry.get("description", ""))
         items.append(
             {
                 "title": entry.get("title", ""),
                 "domain": domain,
                 "url": clean_url,
                 "date": None,
-                "snippet": entry.get("description", ""),
+                "snippet": snippet,
+                "snippet_full": snippet_full,
             }
         )
 
@@ -408,13 +492,16 @@ def _ddg_query(query: str, count: int) -> List[Dict[str, Any]]:
     cleaned = []
     for r in raw_results:
         clean_url = _strip_tracking_params(r.get("href", ""))
+        body = r.get("body", "")
+        snippet, snippet_full = _split_snippet(body, body)
         cleaned.append(
             {
                 "title": r.get("title", ""),
                 "domain": urlparse(clean_url).netloc,
                 "url": clean_url,
                 "date": None,
-                "snippet": r.get("body", ""),
+                "snippet": snippet,
+                "snippet_full": snippet_full,
             }
         )
     return cleaned
@@ -439,8 +526,16 @@ def _normal_search(
                 raise
             diagnostics["brave"] = e.kind
 
+    # Same containment as the dual-engine path: a DuckDuckGo failure is
+    # recorded in diagnostics and surfaced as a structured ALL_ENGINES_FAILED
+    # response by the caller, never raised through the tool boundary.
+    try:
+        results = _ddg_query(query, count)
+    except Exception as e:
+        diagnostics["duckduckgo"] = f"failed: {type(e).__name__}: {e}"
+        return [], diagnostics
+
     diagnostics["duckduckgo"] = "ok"
-    results = _ddg_query(query, count)
     for item in results:
         item["engine"] = "duckduckgo"
     return results, diagnostics
@@ -533,17 +628,27 @@ def _build_index(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """No ranking/scoring across items — order is just merge order
     (Brave-first, then DuckDuckGo-only). `keywords` is the deterministic
     per-item descriptor; `url`/`snippet`/`date` are deferred entirely to
-    lean_web_search_read_chunk."""
+    lean_web_search_read_chunk. Keywords are mined from `snippet_full`
+    (the offload copy), not the truncated inline `snippet` — the manifest
+    should reflect everything a follow-up read_chunk would return, not just
+    the ~320 chars a caller who skips indexing would see."""
     return [
         {
             "id": r["id"],
             "title": r["title"][:MANIFEST_TITLE_MAX_CHARS],
             "domain": r["domain"],
             "engine": r["engine"],
-            "keywords": _extract_keywords(f"{r['title']} {r['snippet']}"),
+            "keywords": _extract_keywords(f"{r['title']} {r.get('snippet_full') or r['snippet']}"),
         }
         for r in results
     ]
+
+
+def _inline_view(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Projects results to the shape returned inline: drops `snippet_full`
+    (which stays offload-only) so the uncapped text can never leak into an
+    inline response by omission."""
+    return [{k: v for k, v in r.items() if k != "snippet_full"} for r in results]
 
 
 def _search_id() -> str:
@@ -591,8 +696,11 @@ def web_search(
     only as a fallback on Brave failure. count 6-10: queries Brave AND
     DuckDuckGo together for broader coverage, still returned inline.
     count>10: same broadened fetch, but the full result set is offloaded to
-    disk and a compact keyword index is returned instead of full detail —
-    follow up with lean_web_search_read_chunk for full detail on chosen ids.
+    disk and a compact keyword index is returned instead of full detail.
+    Every call — regardless of mode — returns a search_id and offloads full
+    detail to disk; a large inline reply may also be auto-downgraded to the
+    keyword index (see "downgraded_to_index" in the response metadata).
+    Follow up with lean_web_search_read_chunk for full detail on any id.
     """
     count = max(1, min(count, MAX_COUNT))
     guarded_q = _apply_query_guardrails(query)
@@ -624,40 +732,74 @@ def web_search(
         )
 
     if not results:
+        # "Nothing matched" and "every engine was broken or unreachable" are
+        # different problems with different fixes, and returning NO_RESULTS for
+        # both used to send the model off rewording a query that was never the
+        # issue. `diagnostics` is the discriminator.
+        engines_ok = [name for name, state in diagnostics.items() if state == "ok"]
+        if not engines_ok:
+            return error_response(
+                "ALL_ENGINES_FAILED",
+                "Every search engine failed; no search was actually performed.",
+                detail=json.dumps(diagnostics),
+                hint="A transient outage or rate limit. Retry once; if it persists the query "
+                "itself is not the problem.",
+            )
         return error_response(
             "NO_RESULTS",
             "No results found across the configured search engines.",
             hint="Try a broader or different query, or increase count.",
         )
 
-    if mode in ("normal", "expanded"):
-        return success_response(
-            results[:count],
-            metadata={"mode": mode, "engines": diagnostics, "query": guarded_q, "count": count},
-        )
-
+    # Ids and the offload write happen for every mode now, not just
+    # "expansive" — full detail is always one lean_web_search_read_chunk call
+    # away, so a caller never has to guess in advance whether a search is
+    # going to be "big enough" to need it.
     for idx, item in enumerate(results, start=1):
         item["id"] = idx
     search_id = _search_id()
     _write_offload(search_id, guarded_q, results)
+
+    base_metadata = {
+        "mode": mode,
+        "engines": diagnostics,
+        "search_id": search_id,
+        "query": guarded_q,
+        "count": count,
+    }
+
+    if mode in ("normal", "expanded"):
+        inline_results = _inline_view(results[:count])
+        inline_response = success_response(inline_results, metadata=base_metadata)
+        # Brave's grounding snippets can be page-extract-sized even after the
+        # per-result cap in _split_snippet (many results, or an unusually
+        # long fallback when a source has no short snippet of its own) — this
+        # is the hard backstop, independent of mode/count, that guarantees no
+        # reply leaves this function over budget.
+        if len(inline_response) <= INLINE_RESPONSE_MAX_CHARS:
+            return inline_response
+        return success_response(
+            _build_index(results[:count]),
+            metadata={
+                **base_metadata,
+                "total_results_found": len(results),
+                "downgraded_to_index": True,
+                "inline_chars": len(inline_response),
+            },
+        )
+
     manifest = _build_index(results[:count])
     return success_response(
         manifest,
-        metadata={
-            "mode": mode,
-            "engines": diagnostics,
-            "search_id": search_id,
-            "query": guarded_q,
-            "count": count,
-            "total_results_found": len(results),
-        },
+        metadata={**base_metadata, "total_results_found": len(results)},
     )
 
 
 @mcp.tool(name="lean_web_search_read_chunk")
 def web_search_read_chunk(search_id: str, ids: List[int]) -> str:
     """Fetches full url/snippet/date detail for specific result ids from a
-    prior lean_web_search expansive-mode index."""
+    prior lean_web_search call — every search returns a search_id, not just
+    the keyword-index ones."""
     if "/" in search_id or "\\" in search_id or ".." in search_id:
         return error_response(
             "SEARCH_ID_NOT_FOUND", "Invalid search_id.", hint="Call lean_web_search again."
@@ -684,19 +826,40 @@ def web_search_read_chunk(search_id: str, ids: List[int]) -> str:
     requested = ids[:5]
     truncated_ids = len(ids) > 5
     by_id = {r["id"]: r for r in stored.get("results", [])}
-    matched = [by_id[i] for i in requested if i in by_id]
+    candidates = [by_id[i] for i in requested if i in by_id]
 
-    if not matched:
+    if not candidates:
         return error_response(
             "ID_NOT_FOUND",
             "None of the requested ids exist in this search.",
-            hint="Ids come from a lean_web_search expansive-mode response; call it again if unsure.",
+            hint="Ids come from a lean_web_search response; call it again if unsure.",
         )
+
+    # `snippet_full` is the whole reason this endpoint exists — it becomes
+    # each item's `snippet` here, since a caller reading a specific result
+    # wants the full text, not the inline-sized preview. Accumulate in id
+    # order and stop before READ_CHUNK_MAX_CHARS, the same "measure the real
+    # serialized size, don't estimate" approach lean_web_search uses — 5 full
+    # Brave page extracts can otherwise be a ~40K-char reply on its own.
+    matched: List[Dict[str, Any]] = []
+    running_chars = 0
+    char_truncated = False
+    for r in candidates:
+        item = {k: v for k, v in r.items() if k != "snippet_full"}
+        item["snippet"] = r.get("snippet_full") or r["snippet"]
+        item_chars = len(json.dumps(item, ensure_ascii=False))
+        if matched and running_chars + item_chars > READ_CHUNK_MAX_CHARS:
+            char_truncated = True
+            break
+        matched.append(item)
+        running_chars += item_chars
 
     meta: Dict[str, Any] = {"search_id": search_id}
     if truncated_ids:
         meta["ids_truncated_to"] = 5
-    return success_response(matched, metadata=meta)
+    if char_truncated:
+        meta["ids_returned"] = [item["id"] for item in matched]
+    return success_response(matched, truncated=char_truncated, metadata=meta)
 
 
 # A complete, current-looking UA string. The old one ended mid-string at
@@ -806,7 +969,8 @@ def web_scrape(
             "SCRAPE_HTTP_ERROR",
             f"HTTP {status} fetching URL.",
             detail=f"{url}: {e}",
-            hint="The page may be behind a login wall, blocked, or deleted. Try lean_web_search for an alternative source.",
+            hint="The page may be behind a login wall, blocked, or deleted. Try "
+            "lean_web_search for an alternative source.",
         )
     except httpx.TimeoutException as e:
         return error_response(
@@ -834,7 +998,8 @@ def web_scrape(
         pdf_path.write_bytes(response.content)
         return success_response(
             {"cached_path": str(pdf_path), "url": url},
-            message="URL is a PDF; downloaded to cache. Use lean_pdf_read_text or lean_pdf_read_outline on the cached_path above.",
+            message="URL is a PDF; downloaded to cache. Use lean_pdf_read_text or "
+            "lean_pdf_read_outline on the cached_path above.",
         )
 
     if not (content_type.startswith("text/html") or content_type.startswith("application/xhtml")):

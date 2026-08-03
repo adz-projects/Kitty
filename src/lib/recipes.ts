@@ -69,7 +69,7 @@ export function resolveRecipe(
   const primary = primaryParameter(recipe);
   const values: Record<string, string> = {};
   for (const p of recipe.parameters) {
-    values[p.key] = p === primary ? primaryText.trim() || p.default || '' : p.default ?? '';
+    values[p.key] = p === primary ? primaryText.trim() || p.default || '' : (p.default ?? '');
   }
   const resolvedInstructions = recipe.instructions
     ? substituteTemplate(recipe.instructions, values)

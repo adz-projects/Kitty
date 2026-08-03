@@ -7,11 +7,15 @@ export function DoneStep({ path, onBack }: { path: WizardPath | null; onBack: ()
   const [validation, setValidation] = useState<SetupValidation | null>(null);
   const [checking, setChecking] = useState(true);
   const [finishing, setFinishing] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   const check = async () => {
     setChecking(true);
+    setError(null);
     try {
       setValidation(await ipc.validateSetup());
+    } catch (e) {
+      setError(String(e));
     } finally {
       setChecking(false);
     }
@@ -23,8 +27,11 @@ export function DoneStep({ path, onBack }: { path: WizardPath | null; onBack: ()
 
   const finish = async () => {
     setFinishing(true);
+    setError(null);
     try {
       await ipc.completeSetup();
+    } catch (e) {
+      setError(String(e));
     } finally {
       setFinishing(false);
     }
@@ -72,6 +79,8 @@ export function DoneStep({ path, onBack }: { path: WizardPath | null; onBack: ()
           </p>
         )}
       </div>
+
+      {error && <p className="error">{error}</p>}
 
       <div className="wizard-actions">
         <button onClick={onBack}>Back</button>

@@ -1,63 +1,145 @@
 import argparse
 import asyncio
-import sys
+import json
 import os
 from typing import Annotated
-import numpy as np
-from mcp.server.fastmcp import FastMCP, Context
+from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
 # ── MCP server ──────────────────────────────────────────────────────────
 mcp = FastMCP("adaptive-pathway")
 
-# ── Lazy engine init ────────────────────────────────────────────────────
-_ap = None
-_sessions = {}  # session_id -> opened state
-
-def _get_ap(db_path=None):
-    global _ap
-    if _ap is None:
-        from adaptive_pathway import AdaptivePathway
-        path = db_path or os.environ.get("ADAPTIVE_PATHWAY_DB", "./pathway.db")
-        _ap = AdaptivePathway(db_path=path)
-    return _ap
-
-
-async def _ensure_session(session_id=None, mode="thought_partner"):
-    global _sessions
-    ap = _get_ap()
-    sid = session_id or "default"
-    if sid not in _sessions:
-        await ap.session_open(sid, mode=mode)
-        _sessions[sid] = True
-    return sid
+# ── HTTP proxy to the sidecar ───────────────────────────────────────────
+# The sidecar process owns the single AdaptivePathway engine (and its
+# SQLite DB). This stdio MCP server is a thin stateless proxy: every tool
+# maps to one REST call. There is deliberately NO embedded engine here —
+# two processes writing the same DB last-writer-wins (the old split-brain
+# design) is what made TTL state, ensemble weights, and session bookkeeping
+# silently diverge between the two. `AP_SIDECAR_PORT` is set by Kitty when
+# it registers this server with BigTiny; defaults to the sidecar's own port.
+_SIDECAR_PORT = int(os.environ.get("AP_SIDECAR_PORT", "8700"))
+_SIDECAR_BASE = f"http://127.0.0.1:{_SIDECAR_PORT}"
+_HTTP_TIMEOUT = 10
 
 
-# ── Helper ──────────────────────────────────────────────────────────────
-def _decode_embedding(b64_string=""):
-    if not b64_string:
-        return np.zeros(384, dtype=np.float32)
+def _http(method, path, params=None, body=None, timeout=_HTTP_TIMEOUT) -> tuple[int | None, dict]:
+    import urllib.parse as up
+    import urllib.request as ur
+
+    url = _SIDECAR_BASE + path
+    if params:
+        url += "?" + up.urlencode(params, doseq=True)
+    data = None
+    headers = {}
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = ur.Request(url, data=data, headers=headers, method=method)
     try:
-        import base64
-        raw = base64.b64decode(b64_string)
-        return np.frombuffer(raw, dtype=np.float32)
-    except Exception:
-        return np.zeros(384, dtype=np.float32)
+        with ur.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            try:
+                return resp.status, json.loads(raw)
+            except Exception:
+                return resp.status, {"raw": raw}
+    except ur.HTTPError as e:
+        raw = e.read().decode("utf-8", errors="replace")
+        try:
+            return e.code, json.loads(raw)
+        except Exception:
+            return e.code, {"raw": raw}
+    except Exception as e:
+        return None, {"error": f"adaptive-pathway sidecar unreachable on {_SIDECAR_BASE}: {e}"}
 
 
-async def _resolve_embedding(context_embedding_b64="", context=""):
-    """b64 (if given) wins outright; otherwise embed free-text `context`
-    (off the event loop, since it may hit Ollama over the network); zeros
-    if neither is given. Without a real context signal here, every call
-    embeds the same constant vector, which collapses context-sensitive
-    learning (domain inference, novelty, per-domain bleed) into a
-    context-free frequency learner."""
-    if context_embedding_b64:
-        return _decode_embedding(context_embedding_b64)
-    if context:
-        return await asyncio.to_thread(_get_ap().embed_context, context)
-    return np.zeros(384, dtype=np.float32)
+async def _call(method, path, params=None, body=None) -> tuple[int | None, dict]:
+    """Sidecar call off the event loop (blocking urllib; localhost, sub-ms)."""
+    return await asyncio.to_thread(_http, method, path, params, body)
+
+
+def _error_json(data, status):
+    if isinstance(data, dict) and data.get("detail"):
+        return json.dumps({"error": data["detail"]})
+    if isinstance(data, dict) and data.get("error"):
+        return json.dumps({"error": data["error"]})
+    return json.dumps({"error": f"sidecar error (HTTP {status})"})
+
+
+# ── decide result rendering ──────────────────────────────────────────────
+
+def _decision_result_from_payload(payload):
+    """Rebuild a DecisionResult from the sidecar's /decide payload so the
+    single formatting function (`_format_result`) keeps owning the pyrepr
+    shape Kitty parses. The sidecar returns raw structured data; it never
+    renders client-facing text."""
+    from adaptive_pathway.types import (
+        BlendedHint, DecisionResult, Hint, InSessionStatus, NudgeStatus, PlateauRisk)
+
+    hints = []
+    for h in payload.get("hints", []):
+        if h.get("type") == "blended":
+            sources = h.get("sources") or ["", ""]
+            hints.append(BlendedHint(
+                text=h.get("text", ""),
+                confidence=h.get("confidence", 0.0),
+                source_primitive_a=sources[0],
+                source_primitive_b=sources[1] if len(sources) > 1 else sources[0],
+                attribution_id=h.get("attribution_id", ""),
+                edge_id=h.get("edge_id"),
+            ))
+        else:
+            hints.append(Hint(
+                text=h.get("text", ""),
+                confidence=h.get("confidence", 0.0),
+                primitive=h.get("primitive", ""),
+                domain=h.get("domain", ""),
+                attribution_id=h.get("attribution_id", ""),
+                edge_id=h.get("edge_id"),
+                rationale=h.get("rationale"),
+                source_model=h.get("source_model", "standard"),
+            ))
+
+    plateau = payload.get("plateau_risk")
+    if plateau:
+        plateau = PlateauRisk(
+            score=plateau.get("score", 0.0),
+            entropy_risk=plateau.get("entropy_risk", 0.0),
+            diversity_risk=plateau.get("diversity_risk", 0.0),
+            novelty_risk=plateau.get("novelty_risk", 0.0),
+            agreement_risk=plateau.get("agreement_risk", 0.0),
+            trend=plateau.get("trend", "stable"),
+            ig_weight=plateau.get("ig_weight", 0.0),
+        )
+    in_session = payload.get("in_session")
+    if in_session:
+        in_session = InSessionStatus(
+            mix_weight=in_session.get("mix_weight", 0.0),
+            call_count=in_session.get("call_count", 0),
+            max_weight=in_session.get("max_weight", 0.0),
+            buffer_size=in_session.get("buffer_size", 0),
+        )
+    nudge_active = payload.get("nudge_active")
+    if nudge_active:
+        nudge_active = NudgeStatus(
+            active=nudge_active.get("active", True),
+            multiplier=nudge_active.get("multiplier", 1.0),
+            reason=nudge_active.get("reason", ""),
+            turns_remaining=nudge_active.get("turns_remaining", 0),
+        )
+
+    return DecisionResult(
+        hints=hints,
+        confidence=payload.get("confidence", 0.0),
+        novelty=payload.get("novelty", 0.0),
+        attribution_ids=payload.get("attribution_ids", []),
+        is_flow_state=payload.get("is_flow_state", False),
+        plateau_risk=plateau,
+        in_session=in_session,
+        nudge_active=nudge_active,
+        nudge_offered=payload.get("nudge_offered", False),
+        exploration_metrics=payload.get("exploration_metrics"),
+    )
 
 
 def _format_result(decision_result):
@@ -150,14 +232,19 @@ async def decide(
                      "from bleeding across unrelated topics")] = "",
     context_embedding_b64: Annotated[str, Field(
         description="Pre-computed base64 float32 embedding (384 dims)")] = "",
-    ctx: Context = None,
 ) -> str:
-    """MANDATORY before every tool call AND every substantive response — not just tool calls. You MUST call this before selecting a tool OR before reasoning/drafting non-trivial output. Skipping it degrades future suggestions and wastes the learning system."""
-    sid = await _ensure_session(session_id)
-    actions = [a.strip() for a in available_actions.split(",") if a.strip()] if available_actions else []
-    emb = await _resolve_embedding(context_embedding_b64, context)
-    result = _get_ap().decide(sid, emb, actions)
-    return str(_format_result(result))
+    """MANDATORY before choosing a tool or drafting a substantive response. Returns learned tool/approach preferences."""
+    params = {"session_id": session_id}
+    if available_actions:
+        params["available_actions"] = available_actions
+    if context:
+        params["context"] = context
+    if context_embedding_b64:
+        params["context_embedding"] = context_embedding_b64
+    status, data = await _call("POST", "/decide", params=params)
+    if status != 200:
+        return _error_json(data, status)
+    return str(_format_result(_decision_result_from_payload(data)))
 
 
 @mcp.tool(annotations=_WRITES_LOCAL_STATE)
@@ -173,13 +260,32 @@ async def record_outcome(
         description="Pre-computed embedding, wins over context if both given")] = "",
     is_blended: Annotated[bool, Field(
         description="True if multi-source action")] = False,
+    blend_edge_ids: Annotated[str, Field(
+        description="Comma-separated edge ids of the sources. REQUIRED (>=2) "
+                     "when is_blended=true")] = "",
+    error_type: Annotated[str, Field(
+        description="Failure classification. 'crash' pins a crash TTL on the "
+                     "action; leave empty for ordinary outcomes")] = "",
 ) -> str:
-    """MANDATORY after every tool call AND every substantive response — not just tool calls. You MUST call this immediately after ANY tool finishes OR any non-trivial response is done. Skipping it corrupts the learning signal."""
-    sid = await _ensure_session(session_id)
-    emb = await _resolve_embedding(context_embedding_b64, context)
-    await _get_ap().record_outcome(sid, action_id, reward, emb,
-                                   is_blended=is_blended,
-                                   blend_edge_ids=[action_id] if is_blended else None)
+    """MANDATORY immediately after any tool call or substantive response. Records how it went."""
+    if is_blended:
+        ids = [i.strip() for i in blend_edge_ids.split(",") if i.strip()]
+        if len(ids) < 2:
+            return json.dumps({"error": "blend_edge_ids (>=2 comma-separated edge ids) is required when is_blended=true"})
+    else:
+        ids = []
+    body = {"action_id": action_id, "reward": reward, "is_blended": is_blended}
+    if ids:
+        body["blend_edge_ids"] = ids
+    if context:
+        body["context"] = context
+    if context_embedding_b64:
+        body["context_embedding_b64"] = context_embedding_b64
+    if error_type:
+        body["error_type"] = error_type
+    status, data = await _call("POST", "/outcome", params={"session_id": session_id}, body=body)
+    if status != 200:
+        return _error_json(data, status)
     return '{"status": "recorded"}'
 
 
@@ -198,27 +304,30 @@ async def record_annotation(
     context_embedding_b64: Annotated[str, Field(
         description="Pre-computed embedding, wins over context if both given")] = "",
 ) -> str:
-    """Record explicit user feedback. Use when user says 'keep this' or 'don't do this again'."""
-    sid = await _ensure_session(session_id)
-    emb = await _resolve_embedding(context_embedding_b64, context) if (context_embedding_b64 or context) else None
-    annotation = {
+    """Record explicit user feedback (e.g. 'keep this' / 'don't do that')."""
+    body = {
         "type": annotation_type,
         "edge_id": action_id,
         "action_id": action_id,
         "intensity": intensity,
     }
-    if emb is not None:
-        annotation["context_embedding"] = emb
-    await _get_ap().record_annotation(sid, annotation)
+    if context_embedding_b64:
+        body["context_embedding_b64"] = context_embedding_b64
+    elif context:
+        body["context"] = context
+    status, data = await _call("POST", "/annotation", params={"session_id": session_id}, body=body)
+    if status != 200:
+        return _error_json(data, status)
     return '{"status": "recorded"}'
 
 
 @mcp.tool(annotations=_READ_ONLY)
 async def get_state(session_id: SID = "default") -> str:
     """Full system snapshot: preferences, graph health, ensemble status, novelty health, domain profiles."""
-    sid = await _ensure_session(session_id)
-    state = _get_ap().get_state()
-    return str(state)
+    status, data = await _call("GET", "/state")
+    if status != 200:
+        return _error_json(data, status)
+    return str(data)
 
 
 @mcp.tool(annotations=_READ_ONLY)
@@ -230,15 +339,17 @@ async def list_edges(
     per_page: Annotated[int, Field(description="Results per page")] = 20,
 ) -> str:
     """Browse learned edges in the adaptive graph."""
-    kwargs = {"page": page, "per_page": per_page}
+    params: dict[str, str | int | float] = {"page": page, "per_page": per_page}
     if domain:
-        kwargs["domain"] = domain
+        params["domain"] = domain
     if confidence_min:
-        kwargs["confidence_min"] = confidence_min
+        params["confidence_min"] = confidence_min
     if tier:
-        kwargs["tier"] = tier
-    result = _get_ap().list_edges(**kwargs)
-    return str(result)
+        params["tier"] = tier
+    status, data = await _call("GET", "/edges", params=params)
+    if status != 200:
+        return _error_json(data, status)
+    return str(data)
 
 
 @mcp.tool(annotations=_READ_ONLY)
@@ -248,19 +359,13 @@ async def get_edge(
     """Inspect a specific learned edge in detail."""
     if not edge_id:
         return '{"error": "edge_id required"}'
-    edge = _get_ap().get_edge(edge_id)
-    if edge is None:
+    import urllib.parse as up
+    status, data = await _call("GET", f"/edges/{up.quote(edge_id, safe='')}")
+    if status == 404:
         return '{"error": "edge not found"}'
-    return str({
-        "id": edge.id,
-        "semantic_primitive": edge.semantic_primitive,
-        "domain_id": getattr(edge, "domain_id", ""),
-        "confidence": getattr(edge, "confidence", 0.5),
-        "status": edge.status.value if hasattr(edge.status, "value") else str(edge.status),
-        "tier": getattr(edge, "tier", ""),
-        "frequency": getattr(edge, "frequency", 0),
-        "override_rate": getattr(edge, "override_rate", 0.0),
-    })
+    if status != 200:
+        return _error_json(data, status)
+    return str(data)
 
 
 @mcp.tool(annotations=_READ_ONLY)
@@ -270,18 +375,21 @@ async def query_attribution(
     """Explain why a hint was suggested. Returns ensemble breakdown, IG score, PC signals, alternatives considered."""
     if not attribution_id:
         return '{"error": "attribution_id required"}'
-    raw = _get_ap().query_attribution(attribution_id)
-    if raw is None:
+    import urllib.parse as up
+    status, data = await _call("GET", f"/attribution/{up.quote(attribution_id, safe='')}")
+    if status == 404:
         return '{"error": "attribution not found"}'
+    if status != 200:
+        return _error_json(data, status)
     result = {
-        "edge_id": raw.get("edge_id"),
-        "primitive": raw.get("semantic_primitive"),
-        "ensemble_mean": raw.get("ensemble_mean", 0.0),
-        "ensemble_std": raw.get("ensemble_std", 0.0),
-        "ensemble_agree": not raw.get("ensemble_disagree", True),
-        "ig_model_score": raw.get("ig_model_score", 0.0),
-        "pc_model_score": raw.get("pc_model_score", 0.0),
-        "alternatives": raw.get("alternatives_considered", []),
+        "edge_id": data.get("edge_id"),
+        "primitive": data.get("semantic_primitive"),
+        "ensemble_mean": data.get("ensemble_mean", 0.0),
+        "ensemble_std": data.get("ensemble_std", 0.0),
+        "ensemble_agree": not data.get("ensemble_disagree", True),
+        "ig_model_score": data.get("ig_model_score", 0.0),
+        "pc_model_score": data.get("pc_model_score", 0.0),
+        "alternatives": data.get("alternatives_considered", []),
     }
     return str(result)
 
@@ -289,8 +397,10 @@ async def query_attribution(
 @mcp.tool(annotations=_READ_ONLY)
 async def list_domains() -> str:
     """List all learned domains with DPP diversity weight, novelty lambda, override rate, etc."""
-    domains = _get_ap().list_domains()
-    return str(domains)
+    status, data = await _call("GET", "/domains")
+    if status != 200:
+        return _error_json(data, status)
+    return str(data)
 
 
 @mcp.tool(annotations=_WRITES_LOCAL_STATE)
@@ -299,9 +409,13 @@ async def toggle_suggestions(
     paused: Annotated[bool, Field(description="True = pause, false = resume")] = True,
 ) -> str:
     """Pause or resume adaptive suggestions. Learning continues at reduced weight during pause."""
-    sid = await _ensure_session(session_id)
-    ok = _get_ap().toggle_suggestions(sid, paused)
-    if not ok:
+    status, data = await _call(
+        "POST", "/suggestions/toggle",
+        params={"session_id": session_id, "paused": str(paused).lower()},
+    )
+    if status != 200:
+        return _error_json(data, status)
+    if data.get("status") == "session_not_found":
         return '{"status": "error", "error": "session not found"}'
     return f'{{"status": "ok", "paused": {str(paused).lower()}}}'
 
@@ -309,27 +423,29 @@ async def toggle_suggestions(
 @mcp.tool(annotations=_READ_ONLY)
 async def health_check() -> str:
     """Run system diagnostics. Returns health across features, novelty, ensemble, graph, preferences, tier distribution."""
-    issues = _get_ap().health_check()
+    status, data = await _call("GET", "/health")
+    if status != 200:
+        return _error_json(data, status)
+    issues = data.get("issues", []) if isinstance(data, dict) else data
     return str(issues)
 
 
 @mcp.tool(annotations=_WRITES_LOCAL_STATE)
 async def accept_nudge(session_id: SID = "default") -> str:
     """Accept an exploration nudge to boost alternative approaches for the next few turns."""
-    ap = _get_ap()
-    sid = await _ensure_session(session_id)
-    state = ap._sessions.get(sid)
-    mode = state.mode if state else "thought_partner"
-    ap._nudge.trigger("User accepted exploration nudge", mode)
-    return f'{{"status": "accepted", "active": true, "multiplier": {ap._nudge.multiplier}}}'
+    status, data = await _call("POST", "/nudge/accept", params={"session_id": session_id})
+    if status != 200:
+        return _error_json(data, status)
+    return json.dumps(data)
 
 
 @mcp.tool(annotations=_READ_ONLY)
 async def session_reflection(session_id: SID = "default") -> str:
     """Session summary: acceptance metrics, top domains, untested approaches."""
-    ap = _get_ap()
-    result = ap.generate_session_reflection(session_id)
-    return str(result)
+    status, data = await _call("GET", "/session_reflection", params={"session_id": session_id})
+    if status != 200:
+        return _error_json(data, status)
+    return str(data)
 
 
 @mcp.tool(annotations=_WRITES_LOCAL_STATE)
@@ -337,17 +453,21 @@ async def resolve_schism(
     keep_faction: Annotated[str, Field(description="a | b | both")] = "both",
 ) -> str:
     """Resolve an ensemble schism. 'a' keeps faction A, 'b' keeps B, 'both' preserves both with widened variance."""
-    try:
-        from adaptive_pathway.types import SchismState
-        ap = _get_ap()
-        if ap._ensemble.schism_state == SchismState.NONE:
-            return '{"error": "no active schism"}'
-        if ap._ensemble.schism_state == SchismState.DETECTED:
-            ap._ensemble.schism_state = SchismState.REVIEWING
-        ap._ensemble.resolve(keep_faction)
+    status, data = await _call("POST", "/schism/resolve", params={"keep_faction": keep_faction})
+    if status != 200:
+        return _error_json(data, status)
+    if data.get("status") == "resolved":
         return f'{{"status": "resolved", "faction": "{keep_faction}"}}'
-    except ValueError as e:
-        return f'{{"error": "{str(e)}"}}'
+    return '{"error": "no active schism"}'
+
+
+@mcp.tool(annotations=_WRITES_LOCAL_STATE)
+async def session_close(session_id: SID = "default") -> str:
+    """Call when the session ends: flushes co-selection learning, expires in-session lambda boosts, clears per-session state."""
+    status, data = await _call("POST", "/session/close", params={"session_id": session_id})
+    if status != 200:
+        return _error_json(data, status)
+    return '{"status": "closed"}'
 
 
 # ── Prompts ─────────────────────────────────────────────────────────────
@@ -392,7 +512,9 @@ You can also:
 - Call `get_state` to see system health and learning progress.
 - Call `session_reflection` for a summary of what's been learned.
 - Call `toggle_suggestions paused=true` to pause hints temporarily.
-- Call `resolve_schism keep_faction="both"` if models have diverged."""
+- Call `resolve_schism keep_faction="both"` if models have diverged.
+- Call `session_close` at the end of the session so its learnings
+  are flushed and state is cleaned up."""
 
 
 # ── Entry point ─────────────────────────────────────────────────────────
@@ -401,10 +523,10 @@ def main():
     parser.add_argument(
         "--db-path",
         default=os.environ.get("ADAPTIVE_PATHWAY_DB", "./pathway.db"),
-        help="Path to the SQLite database (default: ./pathway.db)",
+        help="Path to the SQLite database (kept for backwards compatibility; "
+             "the sidecar owns the database in the current architecture)",
     )
-    args = parser.parse_args()
-    _get_ap(db_path=args.db_path)
+    parser.parse_args()
     mcp.run(transport="stdio")
 
 

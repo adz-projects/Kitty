@@ -83,6 +83,24 @@ export interface ProviderProfile {
   is_trusted: boolean;
   temperature: number | null;
   top_p: number | null;
+  /** llama.cpp/Ollama sampling extension, only ever sent to a self-hosted
+      (ollama/custom_openai) endpoint — no effect on hosted OpenAI-compatible
+      or Anthropic providers. */
+  top_k: number | null;
+  /** Same scoping as top_k. */
+  min_p: number | null;
+  /** Repetition control. Unlike temperature/top_p, `null` here does NOT mean
+      "send nothing" — BigTiny fills in a repetition-safe default for
+      self-hosted providers when this is unset, because llama-server's own
+      default disables repetition control entirely (this is what let a
+      quantized Qwen model stream an unbounded repetition loop). Set this to
+      override that default, not to enable a penalty that doesn't otherwise
+      exist. */
+  presence_penalty: number | null;
+  frequency_penalty: number | null;
+  /** Hard cap on one reply's length. `null` gets BigTiny's own default for
+      self-hosted providers (see presence_penalty). */
+  max_tokens: number | null;
   context_length: number | null;
   /** STOPGAP client-side workaround (see chatStore.ts's send()) — Goose has no
       native hook for this yet; remove once block/goose#7617 or equivalent lands. */
@@ -98,6 +116,14 @@ export interface ProviderProfile {
       host); lower it if a long silence there reliably means "stuck" and
       waiting 5 minutes to find out is worse than a false-positive retry. */
   prompt_idle_timeout_secs: number | null;
+  /** The `-np`/`--parallel` slot count this provider's own llama-server(-
+      compatible) endpoint was started with, when known. `null` (the
+      default) means never pin this provider's turns to a KV-cache slot —
+      correct for Ollama and any endpoint not deliberately running a
+      multi-slot llama-server. For prompt-cache determinism this must match
+      the server's actual `--parallel` value exactly; a mismatch doesn't
+      error, it just silently thrashes the KV cache instead of pinning it. */
+  parallel_slots: number | null;
   created_at: string;
 }
 
@@ -349,12 +375,7 @@ export interface SetupValidation {
 
 // Serde `rename_all = "snake_case"` on the Rust enum.
 export type StackStatus =
-  | 'starting'
-  | 'ok'
-  | 'ollama_down'
-  | 'backend_down'
-  | 'no_model'
-  | 'provider_unreachable';
+  'starting' | 'ok' | 'ollama_down' | 'backend_down' | 'no_model' | 'provider_unreachable';
 
 export interface StackStatusPayload {
   status: StackStatus;
@@ -391,6 +412,17 @@ export type EmbeddingModelStatus = 'unknown' | 'present' | 'downloading' | 'miss
 
 export interface AdaptivePathwayEmbeddingStatusPayload {
   status: EmbeddingModelStatus;
+}
+
+/** Connection state of the `adaptive-pathway` stdio MCP server inside BigTiny —
+    distinct from `AdaptivePathwayStatus` (the HTTP sidecar's health). `status`
+    is BigTiny's row field (`connected`/`error`/`disconnected`); `tool_count` is
+    how many AP tools (decide/record_outcome/…) are actually registered for the
+    LLM tool list — 0 while connected-but-broken or unregistered. */
+export interface AdaptivePathwayMcpStatus {
+  status: string;
+  error_message: string | null;
+  tool_count: number;
 }
 
 /** `GET /edges/{edge_id}` result — the "why was this suggested" detail. */
@@ -589,8 +621,16 @@ export interface CompleteEvent {
   session_id: string;
   result: {
     stopReason?: string;
-    /** Confirmed ACP `session/prompt` result shape (docs/acp-protocol.md). */
-    usage?: { totalTokens?: number; inputTokens?: number; outputTokens?: number };
+    /** Confirmed ACP `session/prompt` result shape (docs/acp-protocol.md).
+        `cacheReadTokens`/`cacheCreationTokens` are absent entirely (not 0)
+        for providers/models that don't report prompt-cache stats. */
+    usage?: {
+      totalTokens?: number;
+      inputTokens?: number;
+      outputTokens?: number;
+      cacheReadTokens?: number;
+      cacheCreationTokens?: number;
+    };
     /** BigTiny's `llm_timing` SSE event, folded in by stream.rs — metrics for
         whichever LLM call in the turn produced the final visible text. */
     timing?: {

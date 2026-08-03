@@ -20,7 +20,9 @@ import statistics
 import threading
 import time
 import traceback
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Annotated, Any, Dict, List, Optional, Tuple
+
+from pydantic import Field
 
 import networkx as nx
 from mcp.server.fastmcp import FastMCP
@@ -344,8 +346,13 @@ def format_actionable_error(exc: Exception, code: str) -> Dict[str, Any]:
     }
 
     if isinstance(exc, NameError):
+        exc_str = str(exc)
+        # Precomputed rather than inlined: a backslash-escaped quote inside
+        # an f-string expression part is a SyntaxError before Python 3.12
+        # (PEP 701), and this plugin is frozen against 3.11.
+        undefined_name = exc_str.split("'")[1] if "'" in exc_str else "unknown"
         error_info["hint"] = (
-            f"Name '{str(exc).split('\'')[1] if \"'\" in str(exc) else 'unknown'}' is not defined. "
+            f"Name '{undefined_name}' is not defined. "
             f"Available modules and names: {AVAILABLE_NAMES}"
         )
     elif isinstance(exc, TypeError):
@@ -695,10 +702,44 @@ atexit.register(_shutdown_on_exit)
 # ---------------------------------------------------------------------------
 # MCP Tool Definition
 # ---------------------------------------------------------------------------
+def _variables_json_schema(schema: Dict[str, Any]) -> None:
+    """Replace the generated schema for ``variables`` in place.
+
+    Pydantic renders ``Optional[Dict[str, Any]]`` as
+    ``{"anyOf": [{"type": "object", "additionalProperties": true}, ...]}``.
+    A bare boolean is legal JSON Schema ("anything") and Ollama ignores it,
+    but llama.cpp compiles the tool list into a decoding grammar and rejects
+    boolean sub-schemas outright -- ``Unrecognized schema: true``, HTTP 400
+    for the *whole request*, not just calls to this tool. Spelling the value
+    type out keeps the wire schema grammar-safe while leaving the runtime
+    annotation (and therefore what actually validates) exactly as permissive
+    as it was.
+    """
+    schema.clear()
+    schema.update(
+        {
+            "type": "object",
+            "additionalProperties": {
+                "anyOf": [
+                    {"type": "string"},
+                    {"type": "number"},
+                    {"type": "boolean"},
+                    {"type": "null"},
+                    {"type": "array"},
+                    {"type": "object"},
+                ]
+            },
+        }
+    )
+
+
 @mcp.tool()
 async def execute_math_python(
     code: str,
-    variables: Optional[Dict[str, Any]] = None,
+    variables: Annotated[
+        Optional[Dict[str, Any]],
+        Field(json_schema_extra=_variables_json_schema),
+    ] = None,
 ) -> str:
     """CRITICAL SYSTEM INSTRUCTION FOR ANALYTICAL, MATHEMATICAL & TEXT TASKS:
     Always run live Python code to analyze data, structure thoughts, or compute deterministic results.

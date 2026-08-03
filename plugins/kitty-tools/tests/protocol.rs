@@ -10,10 +10,11 @@
 
 use kitty_tools::server::KittyToolsServer;
 
-/// All 18 always-on tools this server exposes, sorted, plus 2 more
-/// (`generate_accessible_table`/`generate_accessible_svg`) when
-/// `KITTY_VIZ_ENABLED=1`. `lean_word_*` from the Word-only split, plus
-/// shell, workspace, 5 file tools, 4 cache tools, 4 scratchpad tools.
+/// All 18 always-on tools this server exposes, sorted, plus 3 more
+/// (`generate_accessible_table`/`generate_accessible_svg`/
+/// `generate_accessible_chart`) when `KITTY_VIZ_ENABLED=1`. `lean_word_*`
+/// from the Word-only split, plus shell, workspace, 5 file tools, 4 cache
+/// tools, 4 scratchpad tools.
 ///
 /// Web search (`brave_mcp_search`, formerly gated here on `BRAVE_API_KEY`)
 /// moved to the Python `kitty-docs-web` process as the merged, count-tiered
@@ -22,6 +23,12 @@ use kitty_tools::server::KittyToolsServer;
 /// adaptive-pathway's learned bandit state for those two old tool names —
 /// expected fallout of the merge, not a regression (see this file's header
 /// note on why tool names are load-bearing).
+///
+/// `generate_accessible_table`/`generate_accessible_svg` are the two frozen
+/// viz names; `generate_accessible_chart` is new as of the viz rebuild that
+/// replaced three static-clipart diagram types with data-driven layouts and
+/// added chart/tree support — it starts cold in the bandit, the same
+/// accepted cost as the retirement above.
 const ALWAYS_ON_TOOLS: &[&str] = &[
     "lean_analyze_workspace",
     "lean_cache_clear",
@@ -67,6 +74,7 @@ fn tool_surface_matches_env_gating() {
     let mut with_extras = always_on.clone();
     with_extras.push("generate_accessible_table".to_string());
     with_extras.push("generate_accessible_svg".to_string());
+    with_extras.push("generate_accessible_chart".to_string());
     with_extras.sort();
     assert_eq!(server.tool_names(), with_extras, "viz tools must join once KITTY_VIZ_ENABLED is set");
 

@@ -14,7 +14,8 @@ describe('parseArgs', () => {
   });
 
   it('keeps a double-quoted span with spaces as a single argument', () => {
-    const path = 'C:\\Users\\azolkover\\Documents\\Claude Code\\brave-search-mcp-server\\dist\\index.js';
+    const path =
+      'C:\\Users\\azolkover\\Documents\\Claude Code\\brave-search-mcp-server\\dist\\index.js';
     expect(parseArgs(`"${path}"`)).toEqual([path]);
   });
 

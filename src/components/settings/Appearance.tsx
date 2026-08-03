@@ -4,7 +4,7 @@ import { useConfigDraft } from './useConfigDraft';
 
 /** Appearance: theme (built-in + user CSS), background image + dim, overlay prefs. */
 export function Appearance() {
-  const { draft, update, save, saved } = useConfigDraft();
+  const { draft, update, save, saved, error } = useConfigDraft();
   const [themes, setThemes] = useState<{ builtins: string[]; user: string[] }>({
     builtins: ['default', 'dark'],
     user: [],
@@ -140,6 +140,7 @@ export function Appearance() {
           Save &amp; apply
         </button>
         {saved && <span className="muted">Saved.</span>}
+        {error && <span className="error">Couldn't save: {error}</span>}
       </div>
     </section>
   );

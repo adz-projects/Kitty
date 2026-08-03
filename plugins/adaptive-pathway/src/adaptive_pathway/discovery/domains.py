@@ -136,3 +136,32 @@ class DomainDiscovery:
 
     def clear_unassigned_pool(self):
         self._unassigned_pool = []
+
+    def to_dict(self):
+        """Serialize domain entries for persistence (row 3).
+        Numpy centroids are converted to BLOB-ready byte strings."""
+        out = {}
+        for did, info in self._domains.items():
+            entry = dict(info)
+            centroid = info.get("centroid")
+            if centroid is not None:
+                entry["centroid"] = np.asarray(centroid, dtype=np.float32).tobytes()
+            out[did] = entry
+        return out
+
+    def from_dict(self, domains):
+        """Restore domain entries from persisted data (row 3).
+        Replaces the current in-memory domain set."""
+        self._domains.clear()
+        for did, info in domains.items():
+            entry = dict(info)
+            centroid_raw = info.get("centroid")
+            if centroid_raw is not None:
+                raw = centroid_raw if isinstance(centroid_raw, (bytes, bytearray)) else centroid_raw
+                if isinstance(raw, (bytes, bytearray)) and len(raw) > 0:
+                    entry["centroid"] = np.frombuffer(raw, dtype=np.float32)
+                elif isinstance(raw, list):
+                    entry["centroid"] = np.asarray(raw, dtype=np.float32)
+                else:
+                    entry["centroid"] = None
+            self._domains[did] = entry

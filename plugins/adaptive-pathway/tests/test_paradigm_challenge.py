@@ -102,3 +102,21 @@ def test_empty_domain_stats_handled():
     pc = ParadigmChallengeModel(config, _mock_get_domain, _mock_get_edge)
     score = pc.score("action", np.ones(64), ["top1", "top2"], {})
     assert 0.0 <= score <= 1.0
+
+
+def test_score_with_referents_matches_score():
+    config = _load_config()
+    pc = ParadigmChallengeModel(config, _mock_get_domain, _mock_get_edge)
+    top_ids = ["python:action1", "js:action2", "python:action3"]
+    stats = {
+        "python": {"avg_confidence": 0.4, "avg_novelty": 0.1},
+        "js": {"avg_confidence": 0.9, "avg_novelty": 0.0},
+    }
+    referent_domains = {_mock_get_domain(a) for a in top_ids}
+    referent_edges = [_mock_get_edge(a) for a in top_ids]
+    ctx = np.ones(64)
+    for action_id in ["python:edge", "js:edge", "unknown:edge", "plain"]:
+        direct = pc.score(action_id, ctx, top_ids, stats)
+        precomputed = pc.score_with_referents(
+            action_id, ctx, referent_domains, referent_edges, stats)
+        assert np.isclose(direct, precomputed)

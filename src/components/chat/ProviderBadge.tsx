@@ -23,6 +23,8 @@ export function ProviderBadge() {
   const locked = useChatStore((s) => s.messages.length > 0);
 
   const load = () =>
+    // Best-effort: a failure just leaves the switch-provider dropdown empty
+    // until the popover is reopened.
     ipc
       .listProviders()
       .then(setProviders)

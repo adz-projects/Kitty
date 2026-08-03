@@ -43,9 +43,15 @@ pub fn list_providers(state: tauri::State<'_, AppState>) -> Result<Vec<ProviderV
 
 /// Create or update a provider profile. `secret`, when present, is stored in the
 /// keyring only (never in config.json). Returns the saved profile (with id).
+///
+/// If the edited profile is the **currently active** provider, the change is
+/// re-synced to BigTiny immediately (no restart / reactivate required) so
+/// settings like `context_length` take effect on the next chat turn. Best-effort
+/// on the daemon round-trip: the profile is already persisted, and a transient
+/// daemon problem shouldn't fail the save — rebind/activate will re-sync later.
 #[tauri::command]
-pub fn upsert_provider(
-    state: tauri::State<'_, AppState>,
+pub async fn upsert_provider(
+    app: AppHandle,
     mut profile: ProviderProfile,
     secret: Option<String>,
 ) -> Result<ProviderProfile, String> {
@@ -60,12 +66,26 @@ pub fn upsert_provider(
             providers::set_secret(&profile.id, &s)?;
         }
     }
-    let mut cfg = state.config.lock().unwrap();
-    match cfg.providers.iter_mut().find(|p| p.id == profile.id) {
-        Some(existing) => *existing = profile.clone(),
-        None => cfg.providers.push(profile.clone()),
+    let is_active;
+    {
+        let state = app.state::<AppState>();
+        let mut cfg = state.config.lock().unwrap();
+        match cfg.providers.iter_mut().find(|p| p.id == profile.id) {
+            Some(existing) => *existing = profile.clone(),
+            None => cfg.providers.push(profile.clone()),
+        }
+        config::save(&cfg).map_err(|e| e.to_string())?;
+        is_active = cfg.active_provider_id.as_deref() == Some(profile.id.as_str());
     }
-    config::save(&cfg).map_err(|e| e.to_string())?;
+
+    if is_active {
+        if let Err(e) = crate::bigtiny::providers::sync_active_provider(&app).await {
+            tracing::warn!(
+                "provider {} edited but failed to re-sync to BigTiny: {e}",
+                profile.id
+            );
+        }
+    }
     Ok(profile)
 }
 
@@ -144,14 +164,12 @@ pub async fn test_active_provider_connection(
 #[tauri::command]
 pub async fn activate_provider(app: AppHandle, id: Option<String>) -> Result<(), String> {
     if id.is_none() {
-        return Err(
-            "A provider must be active — add one in Settings → Providers.".to_string(),
-        );
+        return Err("A provider must be active — add one in Settings → Providers.".to_string());
     }
     if let Some(ref pid) = id {
         let profile = {
-            let state = app.state::<AppState>();
-            let cfg = state.config.lock().unwrap();
+        let state = app.state::<AppState>();
+        let cfg = state.config.lock().unwrap();
             cfg.providers.iter().find(|p| &p.id == pid).cloned()
         };
         let profile = profile.ok_or("no such provider profile")?;

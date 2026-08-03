@@ -90,9 +90,13 @@ export async function suggestContextLength(profile: ProviderProfile): Promise<nu
 /** Client-side mirror of providers::network_tier_for — only used to detect
     loopback (which is always "local"/trusted). */
 export function tierOf(url: string): NetworkTier {
-  const host = (url.split('://').pop() ?? '').split('/')[0].split('@').pop() ?? '';
-  const h = host.split(':')[0].toLowerCase();
-  if (!h || h === 'localhost' || h === '127.0.0.1' || h === '::1') return 'local';
+  const hostPort = (url.split('://').pop() ?? '').split('/')[0];
+  const afterAt = hostPort.split('@').pop() ?? '';
+  // IPv6 hosts stay bracketed (e.g. `[::1]`), matching Rust's `host_of` — splitting
+  // on `:` first would truncate `[::1]:11434` down to just `[`.
+  const host = afterAt.startsWith('[') ? afterAt : (afterAt.split(':')[0] ?? '');
+  const h = host.toLowerCase();
+  if (!h || h === 'localhost' || h === '127.0.0.1' || h === '::1' || h === '[::1]') return 'local';
   if (h.endsWith('.ts.net')) return 'personal';
   const o = h.split('.').map(Number);
   if (o.length === 4 && o[0] === 100 && o[1] >= 64 && o[1] <= 127) return 'personal';
@@ -110,10 +114,16 @@ export const blank = (): ProviderProfile => ({
   is_trusted: false,
   temperature: null,
   top_p: null,
+  top_k: null,
+  min_p: null,
+  presence_penalty: null,
+  frequency_penalty: null,
+  max_tokens: null,
   context_length: null,
   strip_reasoning: false,
   system_prompt: null,
   prompt_idle_timeout_secs: null,
+  parallel_slots: null,
   created_at: '',
 });
 

@@ -9,7 +9,8 @@ mod network;
 
 pub use connection::test_connection;
 pub use keyring::{
-    delete_secret, get_secret_async, get_secret_checked, has_secret, migrate_secrets, set_secret,
+    delete_secret, get_or_create_bigtiny_encryption_key, get_secret_async, get_secret_checked,
+    has_secret, migrate_secrets, set_secret,
 };
 pub use network::{network_tier_for, NetworkTier};
 
@@ -42,6 +43,31 @@ pub struct ProviderProfile {
     pub temperature: Option<f32>,
     #[serde(default)]
     pub top_p: Option<f32>,
+    /// llama.cpp/Ollama sampling extension, no equivalent on hosted
+    /// OpenAI-compatible or Anthropic endpoints. BigTiny only ever sends it
+    /// for a `provider_type` of `ollama`/`custom_openai`
+    /// (`bigtiny_rust::provider::openai_compat`), so setting it on a hosted
+    /// profile is a silent no-op rather than an error.
+    #[serde(default)]
+    pub top_k: Option<i32>,
+    /// Same scoping as `top_k`.
+    #[serde(default)]
+    pub min_p: Option<f32>,
+    /// Repetition control. `None` here does not mean "off" the way it does
+    /// for `temperature`/`top_p` — BigTiny fills in a repetition-safe
+    /// default for self-hosted providers when this is unset (see
+    /// `bigtiny_rust::provider::sampling::defaults_for`), because
+    /// llama-server's own default disables repetition control entirely.
+    /// Set this explicitly only to override that default.
+    #[serde(default)]
+    pub presence_penalty: Option<f32>,
+    #[serde(default)]
+    pub frequency_penalty: Option<f32>,
+    /// Hard cap on one reply's length. `None` gets BigTiny's own default for
+    /// self-hosted providers (see `presence_penalty`'s doc comment) — set
+    /// this to override, not to enable a cap that doesn't otherwise exist.
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
     #[serde(default)]
     pub context_length: Option<u32>,
     /// Strip the model's own prior reasoning out of what gets resent as context
@@ -78,6 +104,20 @@ pub struct ProviderProfile {
     /// "stuck" and the user would rather find out sooner than wait 5 minutes.
     #[serde(default)]
     pub prompt_idle_timeout_secs: Option<u32>,
+    /// The `-np`/`--parallel` slot count this provider's own llama-server(-
+    /// compatible) endpoint was started with, when known. `None` (the
+    /// default) means: never pin this provider's turns to a KV-cache slot —
+    /// correct for Ollama and anything not deliberately running a
+    /// multi-slot llama-server. Threaded through to BigTiny's
+    /// `ProviderConfig::parallel_slots` (`bigtiny::providers::
+    /// sync_active_provider`), which derives `id_slot` per turn from it. A
+    /// value here that doesn't match the real server's `--parallel` doesn't
+    /// error — it just silently thrashes the KV cache instead of pinning
+    /// it, so this is deliberately a plain number the user sets to match
+    /// their own server config, not something Kitty can discover on its
+    /// own.
+    #[serde(default)]
+    pub parallel_slots: Option<u32>,
     #[serde(default)]
     pub created_at: String,
 }
@@ -149,10 +189,16 @@ mod tests {
         assert!(!p.is_trusted);
         assert_eq!(p.temperature, None);
         assert_eq!(p.top_p, None);
+        assert_eq!(p.top_k, None);
+        assert_eq!(p.min_p, None);
+        assert_eq!(p.presence_penalty, None);
+        assert_eq!(p.frequency_penalty, None);
+        assert_eq!(p.max_tokens, None);
         assert_eq!(p.context_length, None);
         assert_eq!(p.models, vec!["llama3.2:3b"]);
         assert!(!p.strip_reasoning);
         assert_eq!(p.system_prompt, None);
         assert_eq!(p.prompt_idle_timeout_secs, None);
+        assert_eq!(p.parallel_slots, None);
     }
 }

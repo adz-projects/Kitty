@@ -7,7 +7,9 @@ import { humanizeChatError } from './chatStore';
 
 describe('humanizeChatError', () => {
   it('explains a raw "Invalid params" error', () => {
-    expect(humanizeChatError('Invalid params')).toMatch(/switching providers|restarting the engine/);
+    expect(humanizeChatError('Invalid params')).toMatch(
+      /switching providers|restarting the engine/
+    );
   });
 
   it('explains a timeout error', () => {
@@ -27,13 +29,13 @@ describe('humanizeChatError', () => {
   });
 
   it('is case-insensitive', () => {
-    expect(humanizeChatError('INVALID PARAMS')).toMatch(/switching providers|restarting the engine/);
+    expect(humanizeChatError('INVALID PARAMS')).toMatch(
+      /switching providers|restarting the engine/
+    );
   });
 
   it('uses the structured context_exceeded message when errorType is given', () => {
-    expect(humanizeChatError('raw provider text', 'context_exceeded')).toMatch(
-      /context limit/
-    );
+    expect(humanizeChatError('raw provider text', 'context_exceeded')).toMatch(/context limit/);
   });
 
   it('uses the structured insufficient_credits message when errorType is given', () => {
@@ -47,6 +49,8 @@ describe('humanizeChatError', () => {
   });
 
   it('falls through to string matching with no errorType (backward compat)', () => {
-    expect(humanizeChatError('Invalid params')).toMatch(/switching providers|restarting the engine/);
+    expect(humanizeChatError('Invalid params')).toMatch(
+      /switching providers|restarting the engine/
+    );
   });
 });

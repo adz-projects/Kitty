@@ -72,15 +72,25 @@ export function EmbeddingModelStep({
       await ipc.installDependency('ollama');
       setWaitingForInstaller(true);
       const deadline = Date.now() + INSTALL_POLL_TIMEOUT_MS;
+      let installed = false;
       while (Date.now() < deadline && !cancelled.current) {
         await new Promise((r) => setTimeout(r, INSTALL_POLL_INTERVAL_MS));
         const fresh = await ipc.detectDependencies();
         if (fresh.ollama.installed) {
           setDet(fresh);
+          installed = true;
           break;
         }
       }
       setWaitingForInstaller(false);
+      if (!installed) {
+        if (!cancelled.current) {
+          setError(
+            "Didn't detect a finished install after 2 minutes. Finish the installer window, then try again."
+          );
+        }
+        return;
+      }
       // Installing the binary doesn't start it — `ollamaPullModel` hits
       // Ollama's own HTTP API directly and fails outright if nothing is
       // listening yet.
@@ -92,8 +102,10 @@ export function EmbeddingModelStep({
     }
   };
 
+  const [pulling, setPulling] = useState(false);
   const startDownload = async () => {
     setError(null);
+    setPulling(true);
     try {
       // Covers "Ollama is installed but not currently running" — e.g. it was
       // installed in a previous session and never auto-started because
@@ -102,6 +114,8 @@ export function EmbeddingModelStep({
       await ipc.ollamaPullModel(model);
     } catch (e) {
       setError(String(e));
+    } finally {
+      setPulling(false);
     }
   };
 
@@ -110,8 +124,8 @@ export function EmbeddingModelStep({
       <h1>Download the shared learning model</h1>
       <p className="muted">
         Adaptive Pathway (Kitty's suggestion-learning feature) uses a small local model to
-        understand what each conversation is about. This runs on your machine via Ollama,
-        regardless of which chat provider you use — it's never sent anywhere.
+        understand what each conversation is about. This runs on your machine via Ollama, regardless
+        of which chat provider you use — it's never sent anywhere.
       </p>
 
       {!det && <p className="muted">Checking what's already installed…</p>}
@@ -177,8 +191,8 @@ export function EmbeddingModelStep({
           Skip for now
         </button>
         {det && det.ollama.installed && !have && (
-          <button className="primary" onClick={() => void startDownload()}>
-            Download
+          <button className="primary" disabled={pulling} onClick={() => void startDownload()}>
+            {pulling ? 'Downloading…' : 'Download'}
           </button>
         )}
         {det && det.ollama.installed && have && (

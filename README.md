@@ -22,14 +22,18 @@ chat folder; anything outside it triggers a human-in-the-loop approval prompt.
 
 **Tool library.** Bundled MCP server plugins give the agent access to:
 
-* **replacement-mcp** — shell execution, file read/write/append with pagination,
-workspace analysis, web search (DuckDuckGo), article scraping, and parsers
-for Excel, Word, and PDF documents, plus a persistent scratchpad and content
-cache.
-* **brave-mcp-search** — Brave Search LLM Context API (opt-in, requires an API key).
+* **kitty-tools** (Rust) — 18 always-on local-machine tools: shell execution,
+file read/write/append with pagination, workspace analysis, Word document
+read/outline/write, a persistent scratchpad, and a content cache, plus 3
+WCAG 2.2 AA compliant visualization tools (accessible tables, SVG diagrams,
+and charts), gated by their own Settings toggle.
+* **kitty-docs-web** (Python) — 8 tools needing Python-native dependencies:
+PDF read/outline, web article scraping, merged web search (DuckDuckGo always
+available, Brave preferred per-query when an API key is configured), and
+Excel read/write/format. On by default, no credentials required (Brave
+preference is a separate opt-in toggle).
 * **wasm-math-mcp** — sandboxed Python/NumPy/SciPy execution for exact math,
 data filtering, and statistical computation (on by default).
-* **visualizations** — WCAG 2.2 AA compliant SVG diagrams and HTML tables.
 * **adaptive-pathway-mcp** — the `decide`/`record\_outcome` tools the model
 calls to participate in the Adaptive Pathways learning loop.
 

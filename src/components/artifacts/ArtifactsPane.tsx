@@ -29,6 +29,9 @@ export function ArtifactsPane() {
     if (!cwd) return;
     void refreshArtifactsFromDisk();
     const id = setInterval(() => {
+      // Skip the round-trip while the window is minimized/backgrounded —
+      // nothing's watching, and it just spends IPC + disk I/O for no reason.
+      if (document.hidden) return;
       void refreshArtifactsFromDisk();
       void pruneMissingArtifacts();
     }, POLL_INTERVAL_MS);

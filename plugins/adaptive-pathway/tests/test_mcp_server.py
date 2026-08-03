@@ -1,24 +1,19 @@
 import pytest
 import os
-import tempfile
-import numpy as np
+import json
+import sys
+import subprocess
+
 from mcp.client.session import ClientSession
 from mcp.client.stdio import stdio_client, StdioServerParameters
-import subprocess
-import sys
-import time
-import json
 
 
-@pytest.fixture
-def db_path():
-    fd, path = tempfile.mkstemp(suffix=".db")
-    os.close(fd)
-    yield path
-    try:
-        os.remove(path)
-    except PermissionError:
-        pass
+def _params(proxy_env):
+    return StdioServerParameters(
+        command=sys.executable,
+        args=["-m", "adaptive_pathway.mcp_server"],
+        env=proxy_env,
+    )
 
 
 def test_mcp_server_imports():
@@ -48,7 +43,7 @@ _EXPECTED_READ_ONLY = {
 }
 _EXPECTED_WRITES_LOCAL_STATE = {
     "record_outcome", "record_annotation", "toggle_suggestions",
-    "accept_nudge", "resolve_schism",
+    "accept_nudge", "resolve_schism", "session_close",
 }
 
 
@@ -78,17 +73,8 @@ async def test_no_tool_is_marked_destructive():
 
 
 @pytest.mark.asyncio
-async def test_mcp_tool_decide(db_path):
-    env = os.environ.copy()
-    env["ADAPTIVE_PATHWAY_DB"] = db_path
-
-    params = StdioServerParameters(
-        command=sys.executable,
-        args=["-m", "adaptive_pathway.mcp_server"],
-        env=env,
-    )
-
-    async with stdio_client(params) as (read, write):
+async def test_mcp_tool_decide(proxy_env):
+    async with stdio_client(_params(proxy_env)) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
             result = await session.call_tool("decide", {
@@ -102,17 +88,8 @@ async def test_mcp_tool_decide(db_path):
 
 
 @pytest.mark.asyncio
-async def test_mcp_tool_record_outcome(db_path):
-    env = os.environ.copy()
-    env["ADAPTIVE_PATHWAY_DB"] = db_path
-
-    params = StdioServerParameters(
-        command=sys.executable,
-        args=["-m", "adaptive_pathway.mcp_server"],
-        env=env,
-    )
-
-    async with stdio_client(params) as (read, write):
+async def test_mcp_tool_record_outcome(proxy_env):
+    async with stdio_client(_params(proxy_env)) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
             result = await session.call_tool("record_outcome", {
@@ -125,17 +102,42 @@ async def test_mcp_tool_record_outcome(db_path):
 
 
 @pytest.mark.asyncio
-async def test_mcp_tool_get_state(db_path):
-    env = os.environ.copy()
-    env["ADAPTIVE_PATHWAY_DB"] = db_path
+async def test_mcp_record_outcome_blended_requires_edge_ids(proxy_env):
+    # is_blended=true without blend_edge_ids used to silently halve the
+    # reward on a self-pair — now it must error and tell the model why.
+    async with stdio_client(_params(proxy_env)) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            result = await session.call_tool("record_outcome", {
+                "session_id": "test_sess",
+                "action_id": "tool_a",
+                "reward": 1.0,
+                "is_blended": True,
+            })
+            data = json.loads(result.content[0].text)
+            assert "error" in data
+            assert "blend_edge_ids" in data["error"]
 
-    params = StdioServerParameters(
-        command=sys.executable,
-        args=["-m", "adaptive_pathway.mcp_server"],
-        env=env,
-    )
 
-    async with stdio_client(params) as (read, write):
+@pytest.mark.asyncio
+async def test_mcp_record_outcome_blended_with_edge_ids(proxy_env):
+    async with stdio_client(_params(proxy_env)) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            result = await session.call_tool("record_outcome", {
+                "session_id": "test_sess",
+                "action_id": "tool_a",
+                "reward": 1.0,
+                "is_blended": True,
+                "blend_edge_ids": "edge_x,edge_y",
+            })
+            data = json.loads(result.content[0].text)
+            assert data["status"] == "recorded"
+
+
+@pytest.mark.asyncio
+async def test_mcp_tool_get_state(proxy_env):
+    async with stdio_client(_params(proxy_env)) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
             result = await session.call_tool("get_state", {
@@ -146,17 +148,8 @@ async def test_mcp_tool_get_state(db_path):
 
 
 @pytest.mark.asyncio
-async def test_mcp_tool_list_edges(db_path):
-    env = os.environ.copy()
-    env["ADAPTIVE_PATHWAY_DB"] = db_path
-
-    params = StdioServerParameters(
-        command=sys.executable,
-        args=["-m", "adaptive_pathway.mcp_server"],
-        env=env,
-    )
-
-    async with stdio_client(params) as (read, write):
+async def test_mcp_tool_list_edges(proxy_env):
+    async with stdio_client(_params(proxy_env)) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
             result = await session.call_tool("list_edges", {
@@ -167,17 +160,8 @@ async def test_mcp_tool_list_edges(db_path):
 
 
 @pytest.mark.asyncio
-async def test_mcp_tool_get_edge(db_path):
-    env = os.environ.copy()
-    env["ADAPTIVE_PATHWAY_DB"] = db_path
-
-    params = StdioServerParameters(
-        command=sys.executable,
-        args=["-m", "adaptive_pathway.mcp_server"],
-        env=env,
-    )
-
-    async with stdio_client(params) as (read, write):
+async def test_mcp_tool_get_edge(proxy_env):
+    async with stdio_client(_params(proxy_env)) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
             result = await session.call_tool("get_edge", {
@@ -188,17 +172,8 @@ async def test_mcp_tool_get_edge(db_path):
 
 
 @pytest.mark.asyncio
-async def test_mcp_tool_health_check(db_path):
-    env = os.environ.copy()
-    env["ADAPTIVE_PATHWAY_DB"] = db_path
-
-    params = StdioServerParameters(
-        command=sys.executable,
-        args=["-m", "adaptive_pathway.mcp_server"],
-        env=env,
-    )
-
-    async with stdio_client(params) as (read, write):
+async def test_mcp_tool_health_check(proxy_env):
+    async with stdio_client(_params(proxy_env)) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
             result = await session.call_tool("health_check", {})
@@ -207,17 +182,8 @@ async def test_mcp_tool_health_check(db_path):
 
 
 @pytest.mark.asyncio
-async def test_mcp_tool_toggle_suggestions(db_path):
-    env = os.environ.copy()
-    env["ADAPTIVE_PATHWAY_DB"] = db_path
-
-    params = StdioServerParameters(
-        command=sys.executable,
-        args=["-m", "adaptive_pathway.mcp_server"],
-        env=env,
-    )
-
-    async with stdio_client(params) as (read, write):
+async def test_mcp_tool_toggle_suggestions(proxy_env):
+    async with stdio_client(_params(proxy_env)) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
             result = await session.call_tool("toggle_suggestions", {
@@ -229,17 +195,8 @@ async def test_mcp_tool_toggle_suggestions(db_path):
 
 
 @pytest.mark.asyncio
-async def test_mcp_full_learning_loop(db_path):
-    env = os.environ.copy()
-    env["ADAPTIVE_PATHWAY_DB"] = db_path
-
-    params = StdioServerParameters(
-        command=sys.executable,
-        args=["-m", "adaptive_pathway.mcp_server"],
-        env=env,
-    )
-
-    async with stdio_client(params) as (read, write):
+async def test_mcp_full_learning_loop(proxy_env):
+    async with stdio_client(_params(proxy_env)) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
 
@@ -264,17 +221,8 @@ async def test_mcp_full_learning_loop(db_path):
 
 
 @pytest.mark.asyncio
-async def test_mcp_list_domains(db_path):
-    env = os.environ.copy()
-    env["ADAPTIVE_PATHWAY_DB"] = db_path
-
-    params = StdioServerParameters(
-        command=sys.executable,
-        args=["-m", "adaptive_pathway.mcp_server"],
-        env=env,
-    )
-
-    async with stdio_client(params) as (read, write):
+async def test_mcp_list_domains(proxy_env):
+    async with stdio_client(_params(proxy_env)) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
             result = await session.call_tool("list_domains", {})
@@ -283,17 +231,8 @@ async def test_mcp_list_domains(db_path):
 
 
 @pytest.mark.asyncio
-async def test_mcp_query_attribution(db_path):
-    env = os.environ.copy()
-    env["ADAPTIVE_PATHWAY_DB"] = db_path
-
-    params = StdioServerParameters(
-        command=sys.executable,
-        args=["-m", "adaptive_pathway.mcp_server"],
-        env=env,
-    )
-
-    async with stdio_client(params) as (read, write):
+async def test_mcp_query_attribution(proxy_env):
+    async with stdio_client(_params(proxy_env)) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
             result = await session.call_tool("query_attribution", {
@@ -304,17 +243,8 @@ async def test_mcp_query_attribution(db_path):
 
 
 @pytest.mark.asyncio
-async def test_mcp_record_annotation(db_path):
-    env = os.environ.copy()
-    env["ADAPTIVE_PATHWAY_DB"] = db_path
-
-    params = StdioServerParameters(
-        command=sys.executable,
-        args=["-m", "adaptive_pathway.mcp_server"],
-        env=env,
-    )
-
-    async with stdio_client(params) as (read, write):
+async def test_mcp_record_annotation(proxy_env):
+    async with stdio_client(_params(proxy_env)) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
             result = await session.call_tool("record_annotation", {
@@ -354,15 +284,8 @@ def test_format_result_includes_edge_id():
 
 
 @pytest.mark.asyncio
-async def test_mcp_accept_nudge(db_path):
-    env = os.environ.copy()
-    env["ADAPTIVE_PATHWAY_DB"] = db_path
-    params = StdioServerParameters(
-        command=sys.executable,
-        args=["-m", "adaptive_pathway.mcp_server"],
-        env=env,
-    )
-    async with stdio_client(params) as (read, write):
+async def test_mcp_accept_nudge(proxy_env):
+    async with stdio_client(_params(proxy_env)) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
             result = await session.call_tool("accept_nudge", {
@@ -373,15 +296,8 @@ async def test_mcp_accept_nudge(db_path):
 
 
 @pytest.mark.asyncio
-async def test_mcp_session_reflection(db_path):
-    env = os.environ.copy()
-    env["ADAPTIVE_PATHWAY_DB"] = db_path
-    params = StdioServerParameters(
-        command=sys.executable,
-        args=["-m", "adaptive_pathway.mcp_server"],
-        env=env,
-    )
-    async with stdio_client(params) as (read, write):
+async def test_mcp_session_reflection(proxy_env):
+    async with stdio_client(_params(proxy_env)) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
             result = await session.call_tool("session_reflection", {
@@ -392,15 +308,8 @@ async def test_mcp_session_reflection(db_path):
 
 
 @pytest.mark.asyncio
-async def test_mcp_resolve_schism_both(db_path):
-    env = os.environ.copy()
-    env["ADAPTIVE_PATHWAY_DB"] = db_path
-    params = StdioServerParameters(
-        command=sys.executable,
-        args=["-m", "adaptive_pathway.mcp_server"],
-        env=env,
-    )
-    async with stdio_client(params) as (read, write):
+async def test_mcp_resolve_schism_both(proxy_env):
+    async with stdio_client(_params(proxy_env)) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
             result = await session.call_tool("resolve_schism", {
@@ -411,15 +320,24 @@ async def test_mcp_resolve_schism_both(db_path):
 
 
 @pytest.mark.asyncio
-async def test_mcp_decide_includes_source_model(db_path):
-    env = os.environ.copy()
-    env["ADAPTIVE_PATHWAY_DB"] = db_path
-    params = StdioServerParameters(
-        command=sys.executable,
-        args=["-m", "adaptive_pathway.mcp_server"],
-        env=env,
-    )
-    async with stdio_client(params) as (read, write):
+async def test_mcp_session_close(proxy_env):
+    async with stdio_client(_params(proxy_env)) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            await session.call_tool("decide", {
+                "session_id": "close_me",
+                "available_actions": "tool_a",
+            })
+            result = await session.call_tool("session_close", {
+                "session_id": "close_me",
+            })
+            data = json.loads(result.content[0].text)
+            assert data["status"] == "closed"
+
+
+@pytest.mark.asyncio
+async def test_mcp_decide_includes_source_model(proxy_env):
+    async with stdio_client(_params(proxy_env)) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
             result = await session.call_tool("decide", {
@@ -431,20 +349,13 @@ async def test_mcp_decide_includes_source_model(db_path):
 
 
 @pytest.mark.asyncio
-async def test_mcp_decide_accepts_context_text_param(db_path):
-    # End-to-end proof (real stdio subprocess, not just a unit test) that the
-    # new `context` param is wired correctly through the async tool wrapper's
-    # asyncio.to_thread embedding call without erroring, whether or not
+async def test_mcp_decide_accepts_context_text_param(proxy_env):
+    # End-to-end proof (real stdio subprocess → HTTP proxy → sidecar, not
+    # just a unit test) that the `context` param is wired correctly through
+    # the sidecar's async embedding call without erroring, whether or not
     # Ollama is actually reachable in this environment (falls back to the
     # hashing vectorizer either way).
-    env = os.environ.copy()
-    env["ADAPTIVE_PATHWAY_DB"] = db_path
-    params = StdioServerParameters(
-        command=sys.executable,
-        args=["-m", "adaptive_pathway.mcp_server"],
-        env=env,
-    )
-    async with stdio_client(params) as (read, write):
+    async with stdio_client(_params(proxy_env)) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
             result = await session.call_tool("decide", {
@@ -457,15 +368,8 @@ async def test_mcp_decide_accepts_context_text_param(db_path):
 
 
 @pytest.mark.asyncio
-async def test_mcp_decide_includes_exploration_metrics(db_path):
-    env = os.environ.copy()
-    env["ADAPTIVE_PATHWAY_DB"] = db_path
-    params = StdioServerParameters(
-        command=sys.executable,
-        args=["-m", "adaptive_pathway.mcp_server"],
-        env=env,
-    )
-    async with stdio_client(params) as (read, write):
+async def test_mcp_decide_includes_exploration_metrics(proxy_env):
+    async with stdio_client(_params(proxy_env)) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
             result = await session.call_tool("decide", {

@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { ipc } from '@/lib/ipc';
 import { useConfigDraft } from './useConfigDraft';
-import type { EnvVar, LogEntry } from '@/lib/types';
+import type { EnvVar, LogEntry, ProviderView } from '@/lib/types';
 
 // How often to re-fetch the error log while its disclosure is open — there's
 // no push event for new entries (kept simple, matching this being a
@@ -18,7 +18,7 @@ const LOG_POLL_MS = 5000;
 export function Advanced() {
   const [envVars, setEnvVars] = useState<EnvVar[]>([]);
   const [msg, setMsg] = useState('');
-  const { draft, update, save, saved } = useConfigDraft();
+  const { draft, update, save, saved, error: saveError } = useConfigDraft();
   const [envOpen, setEnvOpen] = useState(true);
   const [tokenMgmtOpen, setTokenMgmtOpen] = useState(false);
   const [enablingOllama, setEnablingOllama] = useState(false);
@@ -27,8 +27,26 @@ export function Advanced() {
   const [logEntries, setLogEntries] = useState<LogEntry[]>([]);
   const [logError, setLogError] = useState('');
   const logPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [providers, setProviders] = useState<ProviderView[]>([]);
 
-  const load = () => void ipc.readOllamaEnv().then(setEnvVars);
+  const loadProviders = () =>
+    void ipc
+      .listProviders()
+      .then(setProviders)
+      .catch(() => setProviders([]));
+  useEffect(loadProviders, []);
+
+  // The active provider's own `context_length` (Settings → Providers →
+  // Advanced) wins over the global `max_context_tokens` below as the per-chat
+  // budget — the global value only applies to providers with no override set.
+  const activeProvider = providers.find((p) => p.active) ?? null;
+  const providerCtxLen = activeProvider?.context_length ?? null;
+
+  const load = () =>
+    void ipc
+      .readOllamaEnv()
+      .then(setEnvVars)
+      .catch((e) => setMsg(`Couldn't read Ollama env vars: ${String(e)}`));
   useEffect(load, []);
 
   const loadLogEntries = () =>
@@ -92,9 +110,13 @@ export function Advanced() {
   };
 
   const setVar = async (name: string, value: string) => {
-    await ipc.setOllamaEnv(name, value || null);
-    setMsg(`${name} saved (restart Ollama to apply).`);
-    load();
+    try {
+      await ipc.setOllamaEnv(name, value || null);
+      setMsg(`${name} saved (restart Ollama to apply).`);
+      load();
+    } catch (e) {
+      setMsg(`Couldn't save ${name}: ${String(e)}`);
+    }
   };
 
   return (
@@ -209,6 +231,39 @@ export function Advanced() {
                     BigTiny&apos;s context window size. Must match your active model&apos;s
                     capability.
                   </small>
+                  {providerCtxLen != null ? (
+                    <p className="muted" style={{ margin: 0 }}>
+                      Active provider <strong>{activeProvider?.name ?? 'provider'}</strong>{' '}
+                      overrides this to{' '}
+                      <strong>
+                        {providerCtxLen.toLocaleString()} tokens (effective this chat)
+                      </strong>{' '}
+                      via Settings → Providers. This global value is only the fallback for providers
+                      without an override.
+                    </p>
+                  ) : (
+                    <p className="muted" style={{ margin: 0 }}>
+                      No context-length override set on the active provider — this global value is
+                      the effective per-chat budget. Set one in Settings → Providers to scope it per
+                      provider.
+                    </p>
+                  )}
+                  <div className="row">
+                    <button
+                      type="button"
+                      disabled={providerCtxLen == null}
+                      onClick={() =>
+                        update({
+                          token_management: {
+                            ...draft!.token_management,
+                            max_context_tokens: providerCtxLen!,
+                          },
+                        })
+                      }
+                    >
+                      Match active provider ({providerCtxLen?.toLocaleString() ?? '—'})
+                    </button>
+                  </div>
                 </label>
                 <label className="field">
                   <span>Max live tail tokens</span>
@@ -285,6 +340,7 @@ export function Advanced() {
               Save
             </button>
             {saved && <span className="muted">Saved.</span>}
+            {saveError && <span className="error">Couldn't save: {saveError}</span>}
           </div>
         </>
       )}

@@ -79,6 +79,31 @@ pub fn has_secret(id: &str) -> bool {
     get_secret(id).is_some()
 }
 
+/// Account name for BigTiny's at-rest encryption key — a single, fixed
+/// entry distinct from any per-provider secret (those use the profile id as
+/// the account name) and distinct from `BIGTINY_SECRET` (that one isn't in
+/// keyring at all — it's regenerated fresh in memory every launch, see
+/// `lifecycle/bigtiny_proc.rs::generate_secret`). This key must be stable
+/// across restarts (unlike `BIGTINY_SECRET`) or previously-encrypted rows
+/// in BigTiny's DB would become undecryptable.
+const BIGTINY_ENCRYPTION_KEY_ACCOUNT: &str = "bigtiny-encryption-key";
+
+/// Return the existing at-rest encryption key for BigTiny's SQLite DB
+/// (provider API keys, MCP server auth headers), generating and storing a
+/// fresh random one on first call. Blocking (real Windows Credential
+/// Manager I/O) — call via `spawn_blocking` from async contexts, same
+/// rationale as `get_secret_async`.
+pub fn get_or_create_bigtiny_encryption_key() -> Result<String, String> {
+    if let Some(existing) = get_secret(BIGTINY_ENCRYPTION_KEY_ACCOUNT) {
+        return Ok(existing);
+    }
+    let mut key_bytes = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut key_bytes);
+    let key_hex: String = key_bytes.iter().map(|b| format!("{b:02x}")).collect();
+    set_secret(BIGTINY_ENCRYPTION_KEY_ACCOUNT, &key_hex)?;
+    Ok(key_hex)
+}
+
 /// One-time migration off the pre-rename `goose-overlay` keyring service: for
 /// each given provider id, if no secret exists yet under the current `kitty`
 /// service but one exists under the old service, copy it over and remove the
@@ -105,6 +130,25 @@ pub fn migrate_secrets(provider_ids: &[String]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The one real (not pure-function) Credential Manager round-trip test
+    /// in this module — deliberately exercises the actual OS store rather
+    /// than a pure function, since this is new functionality whose real
+    /// integration with Credential Manager hasn't been verified any other
+    /// way. Cleans up after itself either way.
+    #[test]
+    fn get_or_create_bigtiny_encryption_key_is_idempotent_against_real_credential_manager() {
+        delete_secret(BIGTINY_ENCRYPTION_KEY_ACCOUNT); // clean slate
+        let first = get_or_create_bigtiny_encryption_key();
+        let second = get_or_create_bigtiny_encryption_key();
+        delete_secret(BIGTINY_ENCRYPTION_KEY_ACCOUNT); // clean up regardless of outcome
+
+        let first = first.expect("first call should succeed");
+        let second = second.expect("second call should succeed");
+        assert_eq!(first, second, "the key must be stable across calls");
+        assert_eq!(first.len(), 64, "32 bytes hex-encoded");
+        assert!(first.chars().all(|c| c.is_ascii_hexdigit()));
+    }
 
     #[test]
     fn a_confirmed_absent_entry_classifies_as_ok_none() {
