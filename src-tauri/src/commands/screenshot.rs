@@ -3,11 +3,13 @@
 //! in `screenshot.rs`'s module doc comment. The selection window is plain
 //! HTML/canvas UI; only the actual pixel capture touches Win32 APIs.
 
+use std::time::Duration;
+
 use tauri::{AppHandle, Manager, State};
 use tokio::sync::oneshot;
 
 use crate::screenshot;
-use crate::state::AppState;
+use crate::state::{AppState, ScreenshotRegion};
 use crate::windows;
 
 use super::ImageAttachment;
@@ -17,6 +19,12 @@ use super::ImageAttachment;
 /// full-resolution capture would be to ship over IPC.
 const PREVIEW_MAX_DIMENSION: u32 = 1600;
 
+/// How long `capture_screenshot_region` waits for the user's selection before
+/// giving up. The selection sender lives in `AppState.screenshot_selection`;
+/// closing the selection window without calling the cancel command never drops
+/// it, so without a bound a bare `rx.await` would hang the command forever.
+const SELECTION_WAIT: Duration = Duration::from_secs(60);
+
 /// Kick off a screenshot capture: captures a lightweight preview, opens the
 /// region-selection window over it, and awaits the user's choice (or
 /// cancellation) before doing a fresh, full-resolution, targeted capture of
@@ -24,16 +32,24 @@ const PREVIEW_MAX_DIMENSION: u32 = 1600;
 /// hand to `addPendingImage` exactly like a clipboard-pasted image.
 #[tauri::command]
 pub async fn capture_screenshot_region(app: AppHandle) -> Result<ImageAttachment, String> {
-    let (preview, x, y, w, h) = screenshot::capture_full_desktop_preview(PREVIEW_MAX_DIMENSION)?;
+    // The GDI capture is blocking — run it on a blocking thread, not a tokio
+    // worker.
+    let (preview, (x, y, w, h)) = tokio::task::spawn_blocking(move || {
+        screenshot::capture_full_desktop_preview(PREVIEW_MAX_DIMENSION)
+    })
+    .await
+    .map_err(|e| format!("screenshot capture task panicked: {e}"))??;
 
-    let (tx, rx) = oneshot::channel::<Option<(i32, i32, i32, i32)>>();
+    let (tx, rx) = oneshot::channel::<Option<ScreenshotRegion>>();
     {
         let state = app.state::<AppState>();
-        *state.screenshot_preview.lock().unwrap() = Some((preview, x, y, w, h));
+        *state.screenshot_preview.lock().unwrap() = Some((preview, (x, y, w, h)));
         *state.screenshot_selection.lock().unwrap() = Some(tx);
     }
 
-    windows::create_screenshot_select_window(&app, x, y, w, h).map_err(|e| e.to_string())?;
+    windows::create_screenshot_select_window(&app, x, y, w, h)
+        .await
+        .map_err(|e| e.to_string())?;
     if let Some(win) = app.get_webview_window(windows::SCREENSHOT_SELECT) {
         let _ = win.show();
         let _ = win.set_focus();
@@ -41,8 +57,21 @@ pub async fn capture_screenshot_region(app: AppHandle) -> Result<ImageAttachment
 
     // Cancellation (the sender dropped without ever sending, e.g. the user
     // closed the window some other way) resolves to `None` here too, same
-    // as an explicit Escape.
-    let selection = rx.await.ok().flatten();
+    // as an explicit Escape. A time-out (the selection window wasn't
+    // cancelled but also never reported) is treated the same way so the
+    // command can't hang the calling window forever.
+    let selection = match tokio::time::timeout(SELECTION_WAIT, rx).await {
+        Ok(Ok(sel)) => sel,
+        Ok(Err(_)) | Err(_) => None,
+    };
+
+    // Drop any live selection sender we did not consume — a stale sender must
+    // not hang a later capture's wait.
+    app.state::<AppState>()
+        .screenshot_selection
+        .lock()
+        .unwrap()
+        .take();
 
     if let Some(win) = app.get_webview_window(windows::SCREENSHOT_SELECT) {
         let _ = win.close();
@@ -66,7 +95,7 @@ pub async fn capture_screenshot_region(app: AppHandle) -> Result<ImageAttachment
 #[tauri::command]
 pub fn get_screenshot_preview(
     state: State<'_, AppState>,
-) -> Result<Option<(String, i32, i32, i32, i32)>, String> {
+) -> Result<Option<(String, ScreenshotRegion)>, String> {
     Ok(state.screenshot_preview.lock().unwrap().clone())
 }
 

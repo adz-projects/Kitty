@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use crate::tools::viz::layout::{draw_node, size_node, NodeVisual, SizedNode, GAP_X, GAP_Y, MIN_NODE_H};
+use crate::tools::viz::layout::{draw_node, size_node_capped, NodeVisual, SizedNode, GAP_X, GAP_Y, MAX_CONTENT_W, MAX_NODE_W, MIN_LAYER_GAP, MIN_NODE_H, MIN_NODE_W};
 use crate::tools::viz::model::{Step, StepType};
 use crate::tools::viz::render::svg::{SvgCanvas, CANVAS_MARGIN, TITLE_BAND};
 use crate::tools::viz::text;
@@ -128,12 +128,41 @@ fn draw_branch_tag(canvas: &mut SvgCanvas, cx: f32, cy: f32, label: &str, dark: 
 }
 
 pub fn render_flowchart(steps: &[Step]) -> (String, f32, f32) {
-    let sized: Vec<SizedNode> = steps.iter().map(|s| size_node(&s.text, decision_badge(s).as_deref())).collect();
     let (id_to_index, edges) = resolve_edges(steps);
     let n = steps.len();
 
     let layer = compute_layers(n, &edges);
     let layers = order_layers(n, &layer, &edges);
+
+    // Readability compression: size nodes (reducing the width cap on each
+    // iteration if needed) until the widest layer fits `MAX_CONTENT_W`.
+    let mut cap = MAX_NODE_W;
+    let mut sized: Vec<SizedNode> = steps.iter().map(|s| size_node_capped(&s.text, decision_badge(s).as_deref(), cap)).collect();
+    for _ in 0..4 {
+        let widest = layers
+            .iter()
+            .map(|nodes| nodes.iter().map(|&i| sized[i].w).sum::<f32>() + GAP_X * (nodes.len() as f32 - 1.0).max(0.0))
+            .fold(0.0_f32, f32::max);
+        if widest <= MAX_CONTENT_W {
+            break;
+        }
+        cap = (cap * (MAX_CONTENT_W - MIN_LAYER_GAP * 2.0) / widest).clamp(MIN_NODE_W, MAX_NODE_W);
+        sized = steps.iter().map(|s| size_node_capped(&s.text, decision_badge(s).as_deref(), cap)).collect();
+    }
+
+    // Per-layer gap: squeeze gaps to fit the budget before shrinking nodes
+    // further; `MIN_LAYER_GAP` is the floor past which nodes are shrunk instead.
+    let gaps: Vec<f32> = layers
+        .iter()
+        .map(|nodes| {
+            if nodes.len() <= 1 {
+                0.0
+            } else {
+                let sum = nodes.iter().map(|&i| sized[i].w).sum::<f32>();
+                ((MAX_CONTENT_W - sum) / (nodes.len() as f32 - 1.0)).clamp(MIN_LAYER_GAP, GAP_X)
+            }
+        })
+        .collect();
 
     let mut row_h = vec![MIN_NODE_H; layers.len()];
     for (l, nodes) in layers.iter().enumerate() {
@@ -146,14 +175,14 @@ pub fn render_flowchart(steps: &[Step]) -> (String, f32, f32) {
         acc += row_h[l] + GAP_Y;
     }
 
-    let layer_width = |nodes: &[usize]| -> f32 {
+    let layer_width = |nodes: &[usize], gap: f32| -> f32 {
         if nodes.is_empty() {
             0.0
         } else {
-            nodes.iter().map(|&i| sized[i].w).sum::<f32>() + GAP_X * (nodes.len() as f32 - 1.0)
+            nodes.iter().map(|&i| sized[i].w).sum::<f32>() + gap * (nodes.len() as f32 - 1.0)
         }
     };
-    let widths: Vec<f32> = layers.iter().map(|nodes| layer_width(nodes)).collect();
+    let widths: Vec<f32> = layers.iter().enumerate().map(|(l, nodes)| layer_width(nodes, gaps[l])).collect();
     let max_w = widths.iter().cloned().fold(0.0_f32, f32::max);
 
     let mut center_x = vec![0.0f32; n];
@@ -164,7 +193,7 @@ pub fn render_flowchart(steps: &[Step]) -> (String, f32, f32) {
         for &i in nodes {
             center_x[i] = x + sized[i].w / 2.0;
             top_y[i] = row_y[l] + (row_h[l] - sized[i].h) / 2.0;
-            x += sized[i].w + GAP_X;
+            x += sized[i].w + gaps[l];
         }
     }
 
@@ -190,8 +219,14 @@ pub fn render_flowchart(steps: &[Step]) -> (String, f32, f32) {
         for (branch_idx, &target) in outgoing.iter().take(2).enumerate() {
             let (x1, y1) = (center_x[i], top_y[i] + sized[i].h);
             let (x2, y2) = (center_x[target], top_y[target]);
-            let tag_x = x1 + (x2 - x1) * 0.3;
-            let tag_y = y1 + (y2 - y1) * 0.3;
+            // The edge curve is `M x1,y1 C x1,ymid x2,ymid x2,y2` with
+            // ymid=(y1+y2)/2, so at its midpoint the curve passes through
+            // exactly ((x1+x2)/2, (y1+y2)/2) -- the vertical middle of the
+            // gutter. Skip-level edges are rejected in validation, so y1..y2
+            // spans only this gutter and the tag can never sit on a node.
+            // Clamping horizontally keeps it inside the canvas.
+            let tag_x = ((x1 + x2) / 2.0).clamp(LEFT_X + 24.0, LEFT_X + max_w - 24.0);
+            let tag_y = (y1 + y2) / 2.0;
             let (label, dark) = if branch_idx == 0 { ("YES", true) } else { ("NO", false) };
             draw_branch_tag(&mut canvas, tag_x, tag_y, label, dark);
         }
@@ -270,7 +305,6 @@ fn place_subtree(node: usize, x_start: f32, children: &[Vec<usize>], subtree_w: 
 /// `AccessibleSvgRequest::diagram_type`); every node draws as a plain box
 /// regardless of what `step_type` the caller sent.
 pub fn render_tree(steps: &[Step]) -> (String, f32, f32) {
-    let sized: Vec<SizedNode> = steps.iter().map(|s| size_node(&s.text, None)).collect();
     let n = steps.len();
     let (id_to_index, _) = resolve_edges(steps);
     let children: Vec<Vec<usize>> =
@@ -279,6 +313,25 @@ pub fn render_tree(steps: &[Step]) -> (String, f32, f32) {
     let mut roots: Vec<usize> = (0..n).filter(|i| !referenced.contains(i)).collect();
     if roots.is_empty() {
         roots.push(0);
+    }
+
+    // Readability compression: shrink the node-width cap until the widest root
+    // subtree fits `MAX_CONTENT_W` (plus the inter-root spacing).
+    let mut cap = MAX_NODE_W;
+    let mut sized: Vec<SizedNode> = steps.iter().map(|s| size_node_capped(&s.text, None, cap)).collect();
+    for _ in 0..4 {
+        let mut visited = vec![false; n];
+        let mut order: Vec<usize> = Vec::with_capacity(n);
+        for &r in &roots {
+            post_order(r, &children, &mut order, &mut visited);
+        }
+        let subtree_w = subtree_widths(n, &order, &children, &sized);
+        let total: f32 = roots.iter().map(|&r| subtree_w[r]).sum::<f32>() + GAP_X * 2.0 * (roots.len() as f32 - 1.0).max(0.0);
+        if total <= MAX_CONTENT_W {
+            break;
+        }
+        cap = (cap * (MAX_CONTENT_W - 40.0) / total).clamp(MIN_NODE_W, MAX_NODE_W);
+        sized = steps.iter().map(|s| size_node_capped(&s.text, None, cap)).collect();
     }
 
     let depth = tree_depths(n, &roots, &children);

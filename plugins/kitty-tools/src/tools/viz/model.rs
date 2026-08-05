@@ -117,6 +117,12 @@ pub fn validate_diagram(diagram_type: DiagramType, title: &str, description: &st
             }
         }
 
+        // Long edges (an edge spanning two or more layers) would route their
+        // connector straight through the intermediate row's nodes — there is no
+        // collision-avoidance pass in the layout engine, so the foolproof
+        // answer is to reject them and ask for intermediate steps.
+        reject_skip_level_edges(&non_empty)?;
+
         if diagram_type == DiagramType::Tree {
             let mut parent_count: HashMap<&str, usize> = HashMap::new();
             for step in &non_empty {
@@ -202,6 +208,48 @@ pub fn validate_diagram(diagram_type: DiagramType, title: &str, description: &st
 
 fn join_backtick(fields: &[&str]) -> String {
     fields.iter().map(|f| format!("`{f}`")).collect::<Vec<_>>().join("/")
+}
+
+/// Computes each node's longest-path layer (BFS relaxation; bounded because
+/// values only ever grow up to the node count) and rejects any edge whose
+/// target is more than one layer below its source. Mirrors `compute_layers` in
+/// `layout::graph` for the same reason `compute_layers`'s Kahn loop exists:
+/// roots with no incoming edge start at layer 0; a cycle just fails to push its
+/// members deeper rather than looping forever.
+fn reject_skip_level_edges(steps: &[Step]) -> Result<(), String> {
+    let mut depth: HashMap<&str, usize> = HashMap::new();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for step in steps.iter().filter(|s| s.id.is_some()) {
+            let id = step.id.as_deref().unwrap();
+            let d = *depth.get(id).unwrap_or(&0);
+            for nxt in &step.next {
+                let nd = depth.entry(nxt.as_str()).or_insert(0);
+                if d + 1 > *nd {
+                    *nd = d + 1;
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    for step in steps.iter().filter(|s| s.id.is_some()) {
+        let id = step.id.as_deref().unwrap();
+        let ds = *depth.get(id).unwrap_or(&0);
+        for nxt in &step.next {
+            let dt = *depth.get(nxt.as_str()).unwrap_or(&0);
+            if dt > ds + 1 {
+                return Err(error_response(
+                    "VIZ_LONG_EDGE",
+                    &format!("Edge \"{id}\" → \"{nxt}\" jumps {jump} layer(s), which would route the connector straight through the intermediate row.", jump = dt - ds),
+                    None,
+                    Some("Insert intermediate steps so every `next` edge links only to the immediately following layer."),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 // ---- table validation ----

@@ -459,7 +459,12 @@ fn build_chat_window(app: &AppHandle, label: &str) -> tauri::Result<WebviewWindo
 /// needing any `devicePixelRatio` arithmetic on the frontend side. Hidden
 /// until the caller has stashed the preview in `AppState.screenshot_preview`
 /// (avoids a blank-then-populated flash).
-pub fn create_screenshot_select_window(
+///
+/// Async and awaited by its only caller (`capture_screenshot_region`): a
+/// stale window from an aborted capture is destroyed and the teardown is
+/// awaited *before* rebuilding under the same label, so the rebuild never
+/// races the old window's destruction in the window manager.
+pub async fn create_screenshot_select_window(
     app: &AppHandle,
     x: i32,
     y: i32,
@@ -467,7 +472,8 @@ pub fn create_screenshot_select_window(
     height: i32,
 ) -> tauri::Result<WebviewWindow> {
     if let Some(win) = app.get_webview_window(SCREENSHOT_SELECT) {
-        let _ = win.close();
+        let _ = win.destroy();
+        wait_for_window_gone(app, SCREENSHOT_SELECT).await;
     }
     let win = WebviewWindowBuilder::new(app, SCREENSHOT_SELECT, url(SCREENSHOT_SELECT))
         .title("Kitty — Select a region")
@@ -483,6 +489,21 @@ pub fn create_screenshot_select_window(
         height.max(1) as u32,
     ))?;
     Ok(win)
+}
+
+/// Poll until `label` is no longer registered in the window manager, bounded
+/// so a stubborn window can't hang the caller. After `destroy()` the native
+/// teardown is dispatched to the main thread; this gives it a moment to land
+/// before the caller rebuilds a window with the same label.
+async fn wait_for_window_gone(app: &AppHandle, label: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        if app.get_webview_window(label).is_none() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tracing::warn!("window '{label}' did not tear down within 5s; proceeding anyway");
 }
 
 /// Allocate a fresh label and open a brand-new chat window — always creates,

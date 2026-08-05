@@ -32,11 +32,24 @@ use scheduler::Scheduler;
 /// Everything the CLI entry point (or an embedding host, e.g. Kitty's Rust
 /// core linking this crate directly instead of spawning a subprocess) needs
 /// to hand `run()` beyond the config file itself.
+#[derive(Default)]
 pub struct RunOptions {
     pub host: String,
+    /// Port to bind. `0` asks the OS for an ephemeral port — pair this with
+    /// `ready_tx` to learn which one was actually chosen, since nothing else
+    /// reports it back.
     pub port: u16,
     pub db_path: String,
     pub secret: Option<String>,
+    /// When `true`, a `None` secret is treated as a misconfiguration and
+    /// every `/api/*` route except `/api/health` is denied, rather than
+    /// running unauthenticated. Loopback is not process-private on every
+    /// platform (notably Android, where any app holding `INTERNET` can reach
+    /// `127.0.0.1`), so an embedding host on such a platform should set this
+    /// `true` and always supply a `secret`. Desktop's CLI entry point leaves
+    /// this `false` to preserve existing single-user-localhost behavior. See
+    /// `server::middleware::AuthConfig`.
+    pub require_secret: bool,
     pub recipes_dir: std::path::PathBuf,
     /// BigTiny's app-data directory (respects `BIGTINY_DATA_DIR`) — also
     /// used as the sandbox's always-allowed "cache dir"
@@ -50,6 +63,15 @@ pub struct RunOptions {
     /// parent process — `crypto::init` falls back to a self-managed key
     /// file in `data_dir` in that case.
     pub encryption_key: Option<String>,
+    /// Signalled once the listener is bound, with the actual address (useful
+    /// with `port: 0`). An embedding host awaits this instead of pre-picking
+    /// a free port and racing `run()` to bind it first.
+    pub ready_tx: Option<tokio::sync::oneshot::Sender<std::net::SocketAddr>>,
+    /// Lets an embedding host stop the daemon without a process signal.
+    /// `run()` still also honors ctrl-c/SIGTERM (matching CLI usage) —
+    /// whichever fires first triggers the same graceful shutdown sequence.
+    /// The CLI entry point leaves this `None`.
+    pub shutdown: Option<tokio::sync::oneshot::Receiver<()>>,
 }
 
 /// Construct every subsystem and serve, mirroring
@@ -114,23 +136,38 @@ pub async fn run(config: BigTinyConfig, options: RunOptions) -> Result<(), Daemo
         config: config.clone(),
     });
 
-    let secret = Arc::new(options.secret.clone());
+    let auth = Arc::new(server::middleware::AuthConfig {
+        secret: options.secret.clone(),
+        required: options.require_secret,
+    });
     let app = routes::create_router(state)
         .layer(axum::middleware::from_fn(
             server::middleware::request_logging_middleware,
         ))
         .layer(axum::middleware::from_fn_with_state(
-            secret,
+            auth,
             server::middleware::auth_middleware,
         ))
         .layer(CatchPanicLayer::new())
-        .layer(CorsLayer::permissive());
+        // No cross-origin caller has a legitimate reason to hit this API:
+        // Kitty's own webview never fetches localhost directly (all I/O goes
+        // through the Rust host, by design — see CLAUDE.md), and an
+        // embedding host talks to it over plain HTTP, which CORS (a
+        // browser-enforced policy, not a server-side request filter) never
+        // touches. `CorsLayer::new()` allows no origins, closing off the one
+        // consumer class this could ever matter for: a page loaded in some
+        // *other* browser tab trying to reach this port.
+        .layer(CorsLayer::new());
 
     let listener = tokio::net::TcpListener::bind((options.host.as_str(), options.port)).await?;
-    tracing::info!("BigTiny listening on {}:{}", options.host, options.port);
+    let bound_addr = listener.local_addr()?;
+    tracing::info!("BigTiny listening on {bound_addr}");
+    if let Some(ready_tx) = options.ready_tx {
+        let _ = ready_tx.send(bound_addr);
+    }
 
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown_signal(options.shutdown))
         .await?;
 
     scheduler.lock().await.stop().await;
@@ -140,7 +177,20 @@ pub async fn run(config: BigTinyConfig, options: RunOptions) -> Result<(), Daemo
     Ok(())
 }
 
-async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
+/// Resolves on whichever comes first: a ctrl-c/SIGTERM (CLI usage) or the
+/// embedding host closing `RunOptions::shutdown` (in-process usage, e.g.
+/// Kitty's Rust core stopping the daemon without a process signal to send).
+async fn shutdown_signal(shutdown: Option<tokio::sync::oneshot::Receiver<()>>) {
+    match shutdown {
+        Some(rx) => {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = rx => {}
+            }
+        }
+        None => {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+    }
     tracing::info!("Shutdown signal received");
 }

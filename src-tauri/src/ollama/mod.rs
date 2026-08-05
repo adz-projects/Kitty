@@ -20,6 +20,7 @@ pub async fn list_models(base_url: &str) -> Result<Vec<Value>, String> {
     let url = format!("{}/api/tags", base(base_url));
     let resp = http_client()
         .get(url)
+        .timeout(std::time::Duration::from_secs(5))
         .send()
         .await
         .map_err(|e| format!("could not reach Ollama: {e}"))?;
@@ -37,6 +38,7 @@ pub async fn delete_model(base_url: &str, model: &str) -> Result<(), String> {
     let resp = http_client()
         .delete(url)
         .json(&json!({ "model": model }))
+        .timeout(std::time::Duration::from_secs(5))
         .send()
         .await
         .map_err(|e| format!("delete failed: {e}"))?;

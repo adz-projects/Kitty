@@ -25,6 +25,7 @@ beforeEach(() => {
   useSessionStore.setState({
     sessions: [],
     loading: false,
+    loadError: null,
     query: '',
     folders: [],
     assignments: {},
@@ -46,11 +47,12 @@ describe('sessionStore.refresh', () => {
     expect(sessions.map((s) => s.sessionId)).toEqual(['b', 'a']);
   });
 
-  it('resets loading to false even if listSessions rejects', async () => {
+  it('resets loading to false and records loadError if listSessions rejects', async () => {
     vi.mocked(ipc.listSessions).mockRejectedValue(new Error('boom'));
 
-    await expect(useSessionStore.getState().refresh()).rejects.toThrow('boom');
+    await expect(useSessionStore.getState().refresh()).resolves.toBeUndefined();
     expect(useSessionStore.getState().loading).toBe(false);
+    expect(useSessionStore.getState().loadError).toBe('boom');
   });
 });
 

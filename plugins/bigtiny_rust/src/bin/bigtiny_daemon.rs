@@ -186,11 +186,22 @@ async fn main() {
         port: args.port,
         db_path,
         secret: args.secret,
+        // Preserves the historical desktop behavior of running
+        // unauthenticated when no secret is configured — this CLI entry
+        // point is the single-user-localhost case `AuthConfig::required`
+        // exists to distinguish from. An embedding host on a platform where
+        // loopback isn't process-private should set this `true` instead.
+        require_secret: false,
         recipes_dir,
         data_dir: data_dir.to_string_lossy().into_owned(),
         // Env-only, no `--encryption-key` flag — matches `BIGTINY_SECRET`'s
         // own env-only convention (Kitty never passes secrets via argv).
         encryption_key: std::env::var("BIGTINY_ENCRYPTION_KEY").ok(),
+        // No embedding host is involved for the CLI entry point: nothing
+        // needs the bound port reported back (the `--port` flag already
+        // fixed it), and only a process signal should stop this process.
+        ready_tx: None,
+        shutdown: None,
     };
 
     if let Err(e) = bigtiny_rust::run(config, options).await {

@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -84,6 +85,28 @@ pub struct ProviderConfig {
     /// this provider.
     #[serde(default)]
     pub context_length: Option<i32>,
+    /// Per-provider "response timeout" — seconds of *idle* time allowed on an
+    /// SSE stream before the daemon treats the provider as stuck and aborts
+    /// the turn with a transient error (default 300s). Only gates on bytes
+    /// not arriving; a long, actively-streaming turn is never capped.
+    /// Mirrored out of the transport `config` JSON blob as `idle_timeout_secs`
+    /// (see `ProviderRouter::register_from_row`), and resolved to a
+    /// `Duration` by `ProviderConfig::idle_timeout` (invalid/missing → 300s).
+    #[serde(default)]
+    pub idle_timeout_secs: Option<f64>,
+}
+
+impl ProviderConfig {
+    /// Resolve the per-provider SSE idle-read timeout (see
+    /// `idle_timeout_secs`). A missing, zero, negative, or non-finite value
+    /// falls back to the 300s default so a malformed blob can never produce a
+    /// zero/instant timeout that kills otherwise-healthy turns.
+    pub fn idle_timeout(&self) -> Duration {
+        match self.idle_timeout_secs {
+            Some(s) if s.is_finite() && s > 0.0 => Duration::from_secs_f64(s),
+            _ => Duration::from_secs(300),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -180,6 +203,21 @@ impl Default for TokenManagementConfig {
     }
 }
 
+impl TokenManagementConfig {
+    /// Clamp the masking thresholds to `>= 0` at load time. A negative value
+    /// in a user-supplied YAML used to become a huge `usize` index at the
+    /// `as usize` conversion sites in `agent::compaction` (masking tool
+    /// output / fenced code blocks), panicking on an out-of-bounds slice.
+    /// Line counts can't meaningfully be negative, so clamping is the correct
+    /// normalization rather than rejecting the config.
+    pub fn sanitize(&mut self) {
+        self.message_mask_head_lines = self.message_mask_head_lines.max(0);
+        self.message_mask_tail_lines = self.message_mask_tail_lines.max(0);
+        self.tool_mask_head = self.tool_mask_head.max(0);
+        self.tool_mask_tail = self.tool_mask_tail.max(0);
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SummarizerConfig {
     #[serde(default = "default_summarizer_enabled")]
@@ -244,18 +282,44 @@ impl Default for SummarizerConfig {
 pub struct AgentConfig {
     #[serde(default = "default_max_concurrent_tool_calls")]
     pub max_concurrent_tool_calls: i32,
+    /// Seconds to keep a turn running after its SSE receiver disconnects
+    /// before cancelling it, so a client that reconnects promptly (a mobile
+    /// network handoff, an app briefly backgrounded) doesn't lose in-flight
+    /// work — while a genuinely abandoned turn still stops burning tokens
+    /// against a paid provider rather than running unobserved forever. See
+    /// `Agent::run_turn`'s disconnect watcher.
+    #[serde(default = "default_disconnect_grace_secs")]
+    pub disconnect_grace_secs: u64,
+    /// Governs what `agent::sandbox::check_containment` does when a tool
+    /// call's arguments contain *no* path candidates it recognizes (an
+    /// unrecognized key name, or a genuinely non-filesystem tool). Default
+    /// `false` preserves the historical fail-open behavior documented on
+    /// `check_containment` — appropriate for a single-user desktop, where an
+    /// escalation-to-approval on every unrecognized call would be pure
+    /// friction. Set `true` when the daemon's data root is itself the
+    /// security boundary (an app sandbox, e.g. Android) and false positives
+    /// from an incomplete `extract_candidate_paths` key list are the safer
+    /// failure mode than a silent bypass.
+    #[serde(default)]
+    pub sandbox_strict: bool,
 }
 
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             max_concurrent_tool_calls: default_max_concurrent_tool_calls(),
+            disconnect_grace_secs: default_disconnect_grace_secs(),
+            sandbox_strict: false,
         }
     }
 }
 
 fn default_max_concurrent_tool_calls() -> i32 {
     5
+}
+
+fn default_disconnect_grace_secs() -> u64 {
+    30
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -408,10 +472,14 @@ impl BigTinyConfig {
         let contents = std::fs::read_to_string(path)
             .map_err(|e| format!("Failed to read config {}: {}", path.display(), e))?;
 
-        let config: Self = serde_yaml::from_str(&contents)
-            .map_err(|e| format!("Failed to parse config {}: {}", path.display(), e))?;
+let mut config: Self = serde_yaml::from_str(&contents)
+    .map_err(|e| format!("Failed to parse config {}: {}", path.display(), e))?;
 
-        Ok(config)
+// Clamp raw user input (see `TokenManagementConfig::sanitize`) so a
+// negative masking threshold can never reach the `as usize` use sites.
+config.token_management.sanitize();
+
+Ok(config)
     }
 
     /// Merge non-default values from `other` into `self`.
@@ -503,6 +571,7 @@ server:
         let other = BigTinyConfig {
             agent: AgentConfig {
                 max_concurrent_tool_calls: 10,
+                ..Default::default()
             },
             ..Default::default()
         };
@@ -534,5 +603,43 @@ server:
         assert_eq!(cfg.providers.len(), 2);
         assert_eq!(cfg.providers[0].name, "openai");
         assert_eq!(cfg.providers[1].provider_type, "anthropic");
+    }
+
+    /// Regression: negative masking thresholds in the YAML must be clamped to
+    /// 0 at load, never flow to the `as usize` slicing sites in compaction.
+    #[test]
+    fn test_load_clamps_negative_masking_thresholds() {
+        let path = temp_yaml(
+            "token_management:\n  message_mask_head_lines: -5\n  message_mask_tail_lines: -3\n  tool_mask_head: -1\n  tool_mask_tail: -2\n",
+        );
+        let cfg = BigTinyConfig::load(&path).unwrap();
+        assert_eq!(cfg.token_management.message_mask_head_lines, 0);
+        assert_eq!(cfg.token_management.message_mask_tail_lines, 0);
+        assert_eq!(cfg.token_management.tool_mask_head, 0);
+        assert_eq!(cfg.token_management.tool_mask_tail, 0);
+    }
+
+    /// WS2: the per-provider idle-read timeout resolves from `idle_timeout_secs`.
+    #[test]
+    fn test_idle_timeout_resolution() {
+        // A valid seconds value becomes the corresponding Duration.
+        let cfg = ProviderConfig {
+            idle_timeout_secs: Some(120.0),
+            ..Default::default()
+        };
+        assert_eq!(cfg.idle_timeout(), Duration::from_secs(120));
+
+        // Missing (None) falls back to the 300s default.
+        let cfg = ProviderConfig::default();
+        assert_eq!(cfg.idle_timeout(), Duration::from_secs(300));
+
+        // Invalid values (zero, negative, non-finite) also fall back to 300s.
+        for invalid in [Some(0.0), Some(-5.0), Some(f64::NAN), Some(f64::INFINITY)] {
+            let cfg = ProviderConfig {
+                idle_timeout_secs: invalid,
+                ..Default::default()
+            };
+            assert_eq!(cfg.idle_timeout(), Duration::from_secs(300));
+        }
     }
 }

@@ -34,7 +34,6 @@ import type {
   McpServer,
   McpServerPatch,
   McpServerSpec,
-  ModeEvent,
   OllamaModel,
   OpenRouterCredits,
   PathInfo,
@@ -63,6 +62,7 @@ import type {
 export const ipc = {
   getConfig: () => invoke<Config>('get_config'),
   setConfig: (config: Config) => invoke<void>('set_config', { config }),
+  getConfigRecoveryNotice: () => invoke<string | null>('get_config_recovery_notice'),
   toggleOverlay: () => invoke<void>('toggle_overlay'),
   hideOverlay: () => invoke<void>('hide_overlay'),
   openSettings: (section?: string, highlight?: string) =>
@@ -212,6 +212,13 @@ export const ipc = {
     invoke<void>('set_session_mode', { sessionId, mode }),
   forkSession: (sessionId: string, cwd: string, truncateFrom: number | null) =>
     invoke<SessionInfo>('fork_session', { sessionId, cwd, truncateFrom }),
+  compactSession: (sessionId: string) =>
+    invoke<{
+      compacted: boolean;
+      messages_compacted?: number;
+      tokens_before?: number;
+      tokens_after?: number;
+    }>('compact_session', { sessionId }),
   setThinkingEffort: (sessionId: string, value: string) =>
     invoke<ThinkingEffort | null>('set_thinking_effort', { sessionId, value }),
   /** Best-effort: hot-rebind an already-open session onto the currently
@@ -239,7 +246,10 @@ export const ipc = {
   upsertProvider: (profile: ProviderProfile, secret: string | null) =>
     invoke<ProviderProfile>('upsert_provider', { profile, secret }),
   deleteProvider: (id: string) => invoke<void>('delete_provider', { id }),
-  activateProvider: (id: string | null) => invoke<void>('activate_provider', { id }),
+  activateProvider: (id: string | null, sessionId?: string | null) =>
+    invoke<void>('activate_provider', { id, sessionId: sessionId ?? null }),
+  setSessionProvider: (sessionId: string, providerId: string, model?: string | null) =>
+    invoke<void>('set_session_provider', { sessionId, providerId, model: model ?? null }),
   testActiveProviderConnection: () => invoke<void>('test_active_provider_connection'),
   // Ollama
   ollamaListModels: () => invoke<OllamaModel[]>('ollama_list_models'),
@@ -267,11 +277,11 @@ export const ipc = {
   setMcpServerEnabled: (id: string, enabled: boolean) =>
     invoke<McpServer>('set_mcp_server_enabled', { id, enabled }),
   connectMcpServer: (id: string) => invoke<void>('connect_mcp_server', { id }),
-  // Bundled sandboxed-Python/NumPy math MCP server — on by default, no
+  // Bundled sandboxed-WebAssembly math/Python MCP server (kitty-wasm), the
+  // Rust replacement for the retired wasm-math-mcp — on by default, no
   // credentials, same self-healing registration pattern as kitty-tools.
-  getWasmMathMcpEnabled: () => invoke<boolean>('get_wasm_math_mcp_enabled'),
-  setWasmMathMcpEnabled: (enabled: boolean) =>
-    invoke<void>('set_wasm_math_mcp_enabled', { enabled }),
+  getKittyWasmEnabled: () => invoke<boolean>('get_kitty_wasm_enabled'),
+  setKittyWasmEnabled: (enabled: boolean) => invoke<void>('set_kitty_wasm_enabled', { enabled }),
   // Whether the accessible tables/SVG diagrams tools are advertised by the
   // combined kitty-tools server (renders its results in an iframe in chat) —
   // on by default, no credentials. Toggling this alone doesn't restart a
@@ -280,20 +290,20 @@ export const ipc = {
   setVisualizationsEnabled: (enabled: boolean) =>
     invoke<void>('set_visualizations_enabled', { enabled }),
   // Bundled Rust MCP server hosting shell/workspace/file/word/cache/
-  // scratchpad tools (the retired replacement-mcp's full surface), plus the
-  // 2 visualization tools gated by their own flag — on by default, no
+  // scratchpad/Excel/PDF tools (the retired replacement-mcp's full surface),
+  // plus the visualizations gated by their own flag — on by default, no
   // credentials, same self-healing registration pattern. Web search does
-  // NOT live here — see getKittyDocsWebEnabled/getBraveMcpSearchStatus.
+  // NOT live here — see getKittyWebEnabled/getBraveMcpSearchStatus.
   getKittyToolsEnabled: () => invoke<boolean>('get_kitty_tools_enabled'),
   setKittyToolsEnabled: (enabled: boolean) => invoke<void>('set_kitty_tools_enabled', { enabled }),
-  // Bundled PDF/Excel/web-scrape/web-search MCP server (Python) — the other
-  // half of the replacement-mcp split; on by default, no credentials. Hosts
-  // the merged, count-tiered lean_web_search/lean_web_search_read_chunk
+  // Bundled Rust web search/scrape MCP server (kitty-web) — the Rust
+  // replacement for the retired Python kitty-docs-web; on by default, no
+  // credentials. Hosts the merged, count-tiered
+  // lean_web_search/lean_web_search_read_chunk and lean_web_scrape
   // (DuckDuckGo always works; Brave preference controlled separately below).
-  getKittyDocsWebEnabled: () => invoke<boolean>('get_kitty_docs_web_enabled'),
-  setKittyDocsWebEnabled: (enabled: boolean) =>
-    invoke<void>('set_kitty_docs_web_enabled', { enabled }),
-  // Brave search preference on the kitty-docs-web server — off by default,
+  getKittyWebEnabled: () => invoke<boolean>('get_kitty_web_enabled'),
+  setKittyWebEnabled: (enabled: boolean) => invoke<void>('set_kitty_web_enabled', { enabled }),
+  // Brave search preference on the kitty-web server — off by default,
   // requires an API key. Does not gate whether lean_web_search exists (it
   // always does); only whether it prefers Brave over DuckDuckGo. Disabling
   // always wipes the stored key server-side, so re-enabling always goes
@@ -500,8 +510,6 @@ export const onUserMessage = (cb: (e: TextDeltaEvent) => void) =>
   listen<TextDeltaEvent>('chat://user-message', (e) => cb(e.payload));
 export const onApprovalNeeded = (cb: (e: ApprovalNeededEvent) => void) =>
   listen<ApprovalNeededEvent>('chat://tool-approval-needed', (e) => cb(e.payload));
-export const onMode = (cb: (e: ModeEvent) => void) =>
-  listen<ModeEvent>('chat://mode', (e) => cb(e.payload));
 
 /** OS file/folder drop onto this window → absolute paths. */
 export function onFileDrop(cb: (paths: string[]) => void): Promise<UnlistenFn> {

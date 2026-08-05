@@ -27,7 +27,7 @@ lib.rs (app setup, window creation, generate_handler! list)
   │                  + the adaptive-pathway record_outcome backstop
   │     providers.rs sync Kitty's active provider profile into BigTiny's registry
   │     mcp.rs       MCP server CRUD + ensure_builtin_servers (kitty-tools,
-  │                  kitty-docs-web, adaptive-pathway, wasm-math-mcp) self-heal
+  │                  kitty-web, kitty-wasm, adaptive-pathway) self-heal
   │
   ├─► config/                                (app config, %APPDATA%/Kitty/config.json)
   │     mod.rs         Config struct, load/save, bundled_plugin_path()
@@ -100,36 +100,36 @@ layer needed zero changes when the backend swapped from goosed to BigTiny.
 ## Plugins (`plugins/`)
 
 See `docs/PLUGINS.md` for the full pattern. Independent packages
-(`adaptive-pathway`, `wasm-math-mcp`, `kitty-docs-web` — Python — and
-`kitty-tools` — Rust) plus the BigTiny daemon itself (vendored in-tree at
-`plugins/bigtiny/`) are all frozen to `.exe`s (PyInstaller for the Python
-ones, plain `cargo build --release` for `kitty-tools`) and bundled through
-Tauri's `externalBin` — `python plugins/build.py` builds all six targets
-(`bigtiny`, `adaptive-pathway`, `adaptive-pathway-mcp`, `wasm-math-mcp`,
-`kitty-docs-web`, `kitty-tools`). `adaptive-pathway`'s HTTP sidecar and the
-BigTiny daemon itself are both Kitty-managed processes (`ManagedProcess`,
-probed then spawned); `kitty-tools`, `kitty-docs-web`, `adaptive-pathway-mcp`,
-and `wasm-math-mcp` are stdio MCP servers registered with BigTiny's own
-`/api/mcp/servers` registry (`bigtiny::mcp::ensure_builtin_servers`), not
-spawned directly by Kitty. `wasm-math-mcp` and `kitty-docs-web` are on by
-default (no credentials). `kitty-tools` hosts 21 tools in one process — the
-always-on shell/workspace/file/word/cache/scratchpad set (on by default,
-same rationale as the old `replacement-mcp`, which it retires and fully
-absorbs), plus 3 visualization tools (accessible table, SVG diagram, chart)
-gated by their own Settings toggle (an env var on this one process, not a
-separate server) — no network calls of its own. `kitty-docs-web` hosts 8
-tools, including the merged, count-tiered `lean_web_search`/
-`lean_web_search_read_chunk` (DuckDuckGo via `ddgs`, always available; Brave
-preferred per-query when configured). Brave's toggle needs an API key,
-stored in the keyring rather than `config.json` — disabling it always
-deletes the stored key, so re-enabling always requires re-entering it. This
-tool used to be `brave_mcp_search`, hosted in `kitty-tools` (Rust); it moved
-to `kitty-docs-web` (Python) alongside `ddgs`, since DuckDuckGo has no Rust
-crate equivalent — see `docs/VERSIONS.md`. `brave-mcp-search` and
-`replacement-mcp` are retired with their source kept in-tree, unbuilt, as a
-re-verification oracle for the ports. `visualizations` is also retired, but
-its Rust rebuild deliberately diverges rather than ports it — see
-`docs/PLUGINS.md` for why its source is no longer a correctness reference.
+(`adaptive-pathway` — Python — and `kitty-tools`, `kitty-web`, `kitty-wasm` —
+Rust) plus the BigTiny daemon itself (`plugins/bigtiny_rust/`) are all frozen
+to `.exe`s (PyInstaller for the Python ones, plain `cargo build --release`
+for the Rust ones) and bundled through Tauri's `externalBin` —
+`python plugins/build.py` builds all six targets (`bigtiny`,
+`adaptive-pathway`, `adaptive-pathway-mcp`, `kitty-tools`, `kitty-web`,
+`kitty-wasm`). `adaptive-pathway`'s HTTP sidecar and the BigTiny daemon
+itself are both Kitty-managed processes (`ManagedProcess`, probed then
+spawned); `kitty-tools`, `kitty-web`, `kitty-wasm`, and `adaptive-pathway-mcp`
+are stdio MCP servers registered with BigTiny's own `/api/mcp/servers`
+registry (`bigtiny::mcp::ensure_builtin_servers`), not spawned directly by
+Kitty. `kitty-tools`, `kitty-web`, and `kitty-wasm` are on by default (no
+credentials). `kitty-tools` hosts 21 tools in one process — the always-on
+shell/workspace/file/word/cache/scratchpad set, plus read-only Excel/PDF
+tools, plus 4 visualization tools (accessible table, SVG diagram, chart,
+Mermaid) gated by their own Settings toggle (an env var on this one process,
+not a separate server) — no network calls of its own. `kitty-web` hosts the merged,
+count-tiered `lean_web_search`/`lean_web_search_read_chunk` and
+`lean_web_scrape` (DuckDuckGo always available; Brave preferred per-query when
+configured — Brave's toggle needs an API key stored in the keyring rather
+than `config.json`; disabling it always deletes the stored key, so
+re-enabling always requires re-entering it). `kitty-wasm` hosts the sandboxed
+WebAssembly compute tools (Python via a bundled CPython wasm guest, plus
+arbitrary WASI modules) with no network and no filesystem beyond explicit
+mounts. `replacement-mcp`, `brave-mcp-search`, `visualizations`,
+`kitty-docs-web`, and `wasm-math-mcp` are retired with their source kept
+in-tree, unbuilt, as a re-verification oracle for the ports — except
+`visualizations`, whose Rust rebuild deliberately diverges rather than ports
+it (see `docs/PLUGINS.md` for why its source is no longer a correctness
+reference).
 
 ## Cross-cutting: the three "who's the source of truth" boundaries
 

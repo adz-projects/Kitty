@@ -1,17 +1,18 @@
-import { useEffect, useState } from 'react';
+﻿import { useEffect, useState } from 'react';
 import { ipc } from '@/lib/ipc';
 import type { McpServer } from '@/lib/types';
 
 /** `adaptive-pathway` is managed solely by the single enable checkbox in
-    Settings → Advanced → Adaptive Pathway — showing it here too would be a
-    confusing second control over the same thing. `wasm-math-mcp`,
-    `kitty-tools`, and `kitty-docs-web` each get their own dedicated card
-    below, not the generic list.
+    Settings â†’ Advanced â†’ Adaptive Pathway â€” showing it here too would be a
+    confusing second control over the same thing. `kitty-wasm`,
+    `kitty-tools`, and `kitty-web` each get their own dedicated card below,
+    not the generic list.
 
-    `replacement-mcp`, `brave-mcp-search`, and `visualizations` are retired
-    (their tools live inside `kitty-tools` now — see
-    `bigtiny::mcp::remove_retired_builtins`) but stay listed here for one
-    release as a guard, in case an older install's BigTiny DB still has a
+    `replacement-mcp`, `brave-mcp-search`, `kitty-docs-web`, `wasm-math-mcp`,
+    and `visualizations` are retired (their tools now live inside
+    `kitty-tools`, `kitty-web`, and `kitty-wasm` â€” see `plugins/kitty-tools`,
+    `plugins/kitty-web`, and `plugins/kitty-wasm`) but stay listed here for
+    one release as a guard, in case an older install's BigTiny DB still has a
     stale row under one of these names before this app version's startup
     cleanup runs. */
 const HIDDEN_SERVER_NAMES = new Set([
@@ -21,6 +22,8 @@ const HIDDEN_SERVER_NAMES = new Set([
   'brave-mcp-search',
   'visualizations',
   'kitty-tools',
+  'kitty-web',
+  'kitty-wasm',
   'kitty-docs-web',
 ]);
 
@@ -35,16 +38,16 @@ const emptyForm = {
   env: '',
   apiKey: '',
   /** Whether the server being edited already has an auth header configured
-      server-side — BigTiny redacts the real value in every response
+      server-side â€” BigTiny redacts the real value in every response
       (`"***"`, encrypted at rest), so this is a presence flag, not
       something the real value could ever be read back into. Drives the
-      "🔑 key stored" placeholder and the submit-time omit-if-untouched
+      "ðŸ”‘ key stored" placeholder and the submit-time omit-if-untouched
       logic below, mirroring Providers.tsx's `has_secret` convention. */
   hasStoredKey: false,
 };
 
-/** `headers` only ever carries this one convenience shape from the UI — a
-    bearer token typed into "API key" — even though the backend field itself
+/** `headers` only ever carries this one convenience shape from the UI â€” a
+    bearer token typed into "API key" â€” even though the backend field itself
     is a generic header map (a power-user editing the raw MCP server config
     elsewhere could set something else there; this form just doesn't need
     to expose that generality). Empty input means "no auth header at all",
@@ -54,26 +57,26 @@ function headersFromApiKey(apiKey: string): Record<string, string> | undefined {
   return trimmed ? { Authorization: `Bearer ${trimmed}` } : undefined;
 }
 
-/** Whether the server already has some auth header set — BigTiny redacts
+/** Whether the server already has some auth header set â€” BigTiny redacts
     the real value to `"***"` in every response, so this can only ever be a
     presence check, never a real value to populate the edit field with
     (unlike the pre-encryption behavior this replaces, which read the real
-    key back out of the response — that's no longer possible now that the
+    key back out of the response â€” that's no longer possible now that the
     server never echoes it). */
 function hasApiKeyConfigured(headers: Record<string, string>): boolean {
   return Boolean(headers.Authorization ?? headers.authorization);
 }
 
-/** Quote-aware whitespace tokenizer for the Args field — a plain `split(/\s+/)`
+/** Quote-aware whitespace tokenizer for the Args field â€” a plain `split(/\s+/)`
     tears a single argument containing a space (e.g. any Windows path under
     "...\Documents\Claude Code\...") into two separate array elements, which
     Node/whatever interpreter then sees as two positional args instead of one
     path, and fails to start with no useful error (confirmed real report:
-    `node "...\Claude" "Code\...\index.js"` — silently exits, surfaces to the
+    `node "...\Claude" "Code\...\index.js"` â€” silently exits, surfaces to the
     user as an opaque "No response from MCP server"). A double-quoted span is
     kept as one token with the quotes stripped; unquoted text still splits on
     whitespace exactly as before, so existing single-word args are unaffected.
-    No backslash-escape support for embedded quotes — Windows paths never
+    No backslash-escape support for embedded quotes â€” Windows paths never
     contain a `"`, so it isn't needed here. */
 export function parseArgs(s: string): string[] {
   const args: string[] = [];
@@ -86,7 +89,7 @@ export function parseArgs(s: string): string[] {
 }
 
 /** Inverse of `parseArgs`, for round-tripping an existing server's `args`
-    array back into the editable text field — an arg containing whitespace
+    array back into the editable text field â€” an arg containing whitespace
     must be re-quoted, or editing-and-resaving an already-correct server
     would silently reintroduce the exact splitting bug `parseArgs` fixes. */
 export function formatArgs(args: string[]): string {
@@ -115,7 +118,7 @@ const statusLabel = (s: McpServer): string => {
   return 'Disconnected';
 };
 
-/** MCP servers — the BigTiny-backed replacement for the old goosed-path
+/** MCP servers â€” the BigTiny-backed replacement for the old goosed-path
     "Extensions" settings. Servers are daemon-global and take effect live: no
     restart to add, edit, delete, or toggle. */
 export function McpServers() {
@@ -197,8 +200,8 @@ export function McpServers() {
     try {
       if (editingId) {
         // A blank API-key field while editing means "untouched" (the real
-        // value is never read back from the server — it's redacted to
-        // "***" in every response), not "clear it" — omit `headers` from
+        // value is never read back from the server â€” it's redacted to
+        // "***" in every response), not "clear it" â€” omit `headers` from
         // the patch entirely so BigTiny's own "field absent = don't touch"
         // contract leaves whatever's already stored alone. Still explicitly
         // clears headers when switching to a non-remote transport, since a
@@ -242,15 +245,15 @@ export function McpServers() {
     <section className="settings-section">
       <h1>MCP Servers</h1>
       <p className="muted">
-        Tools available to the agent. Changes here take effect immediately — no restart needed.
+        Tools available to the agent. Changes here take effect immediately â€” no restart needed.
       </p>
       {error && <div className="chat-error">{error}</div>}
       <div className="ext-grid" style={{ marginBottom: 16 }}>
-        <WasmMathMcpCard />
+        <KittyWasmCard />
         <BraveMcpSearchCard />
         <VisualizationsCard />
         <KittyToolsCard />
-        <KittyDocsWebCard />
+        <KittyWebCard />
       </div>
 
       <div className="ext-grid">
@@ -265,7 +268,7 @@ export function McpServers() {
               />
             </div>
             <span className="muted ext-card-desc">
-              {s.transport === 'stdio' ? s.command : s.url} — {statusLabel(s)}
+              {s.transport === 'stdio' ? s.command : s.url} â€” {statusLabel(s)}
             </span>
             <div className="row" style={{ marginTop: 8 }}>
               <button onClick={() => startEdit(s)}>Edit</button>
@@ -325,8 +328,8 @@ export function McpServers() {
               type="password"
               placeholder={
                 form.hasStoredKey
-                  ? '🔑 key stored — leave blank to keep, or type to replace'
-                  : 'API key (optional — sent as a Bearer token)'
+                  ? 'ðŸ”‘ key stored â€” leave blank to keep, or type to replace'
+                  : 'API key (optional â€” sent as a Bearer token)'
               }
               value={form.apiKey}
               onChange={(e) => setForm({ ...form, apiKey: e.target.value })}
@@ -343,7 +346,7 @@ export function McpServers() {
             }
             onClick={() => void submit()}
           >
-            {busy ? 'Saving…' : editingId ? 'Save changes' : 'Add server'}
+            {busy ? 'Savingâ€¦' : editingId ? 'Save changes' : 'Add server'}
           </button>
           {editingId && <button onClick={resetForm}>Cancel</button>}
         </div>
@@ -352,18 +355,20 @@ export function McpServers() {
   );
 }
 
-/** Dedicated card for the bundled `wasm-math-mcp` server (see
-    `plugins/wasm-math-mcp/`) — sandboxed Python/NumPy execution, on by
-    default. Same shape as `KittyToolsCard`'s toggle: no credentials, a plain
-    checkbox. */
-function WasmMathMcpCard() {
+/** Dedicated card for the bundled `kitty-wasm` server (see
+    `plugins/kitty-wasm/`) â€” sandboxed WebAssembly (wasmtime + WASI) Python
+    and arbitrary-module execution, on by default, the Rust replacement for
+    the retired `wasm-math-mcp`. Same shape as `KittyToolsCard`'s toggle: no
+    credentials, a plain checkbox. Its 26 MB CPython guest is bundled with the
+    app so first use is offline. */
+function KittyWasmCard() {
   const [enabled, setEnabled] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
 
   useEffect(() => {
     void ipc
-      .getWasmMathMcpEnabled()
+      .getKittyWasmEnabled()
       .then(setEnabled)
       .catch((e) => setError(String(e)));
   }, []);
@@ -372,7 +377,7 @@ function WasmMathMcpCard() {
     setBusy(true);
     setError('');
     try {
-      await ipc.setWasmMathMcpEnabled(next);
+      await ipc.setKittyWasmEnabled(next);
       setEnabled(next);
     } catch (e) {
       setError(String(e));
@@ -384,7 +389,7 @@ function WasmMathMcpCard() {
   return (
     <label className="ext-card">
       <div className="ext-card-head">
-        <span className="ext-card-name">Math (wasm-math-mcp)</span>
+        <span className="ext-card-name">Sandboxed compute (kitty-wasm)</span>
         <input
           type="checkbox"
           checked={enabled}
@@ -393,20 +398,20 @@ function WasmMathMcpCard() {
         />
       </div>
       <span className="muted ext-card-desc">
-        Sandboxed Python execution for exact math, stats, and NumPy — no shell, no filesystem, no
-        network access.
+        Run Python (or any WASI module) in a sandboxed WebAssembly interpreter â€” no network, no
+        filesystem beyond an optional workspace.
       </span>
       {error && <div className="chat-error">{error}</div>}
     </label>
   );
 }
 
-/** Dedicated card for the visualization tools — accessible HTML tables, SVG
+/** Dedicated card for the visualization tools â€” accessible HTML tables, SVG
     diagrams, and charts, rendered inline in chat as their own always-visible
     card (see `VisualizationCard`). Hosted inside the combined `kitty-tools`
     server (see `KittyToolsCard` above); this toggle flips the
     `KITTY_VIZ_ENABLED` env var rather than spawning its own process. On by
-    default, no credentials — same shape as `WasmMathMcpCard`. */
+    default, no credentials â€” same shape as `KittyWasmCard`. */
 function VisualizationsCard() {
   const [enabled, setEnabled] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -452,14 +457,14 @@ function VisualizationsCard() {
 }
 
 /** Dedicated card for the bundled `kitty-tools` server (see
-    `plugins/kitty-tools/`) — the Rust consolidation of `replacement-mcp`'s
-    18 shell/workspace/file/word/cache/scratchpad tools, plus the 3
-    visualization tools (separately gated by `VisualizationsCard` below,
-    which toggles an env var on this one process rather than spawning its
-    own). Web search does NOT live here — see `BraveMcpSearchCard`/
-    `KittyDocsWebCard` below, it moved to `kitty-docs-web`. On by default,
-    no credentials required for this toggle itself — same shape as
-    `WasmMathMcpCard`. */
+    `plugins/kitty-tools/`) â€” the Rust consolidation of `replacement-mcp`'s
+    shell/workspace/file/word/cache/scratchpad tools, plus Excel/PDF reading
+    (ported from the retired `kitty-docs-web`), plus the 3 visualization
+    tools (separately gated by `VisualizationsCard` below, which toggles an
+    env var on this one process rather than spawning its own). Web search
+    does NOT live here â€” see `BraveMcpSearchCard`/`KittyWebCard` below, it
+    moved to `kitty-web`. On by default, no credentials required for this
+    toggle itself â€” same shape as `KittyWasmCard`. */
 function KittyToolsCard() {
   const [enabled, setEnabled] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -504,21 +509,21 @@ function KittyToolsCard() {
   );
 }
 
-/** Dedicated card for the bundled `kitty-docs-web` server (see
-    `plugins/kitty-docs-web/`) — PDF/Excel reading, web scraping, and the
-    merged `lean_web_search`/`lean_web_search_read_chunk` web search tools
-    (Brave preference controlled separately by `BraveMcpSearchCard` below;
-    DuckDuckGo always works here with no key). The other half of the
-    `replacement-mcp` split; on by default, no credentials — same shape as
-    `WasmMathMcpCard`. */
-function KittyDocsWebCard() {
+/** Dedicated card for the bundled `kitty-web` server (see
+    `plugins/kitty-web/`) â€” web scraping and the merged
+    `lean_web_search`/`lean_web_search_read_chunk` web search tools (Brave
+    preference controlled separately by `BraveMcpSearchCard` below;
+    DuckDuckGo always works here with no key). The Rust replacement for the
+    retired `kitty-docs-web` server's web half; on by default, no
+    credentials â€” same shape as `KittyWasmCard`. */
+function KittyWebCard() {
   const [enabled, setEnabled] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
 
   useEffect(() => {
     void ipc
-      .getKittyDocsWebEnabled()
+      .getKittyWebEnabled()
       .then(setEnabled)
       .catch((e) => setError(String(e)));
   }, []);
@@ -527,7 +532,7 @@ function KittyDocsWebCard() {
     setBusy(true);
     setError('');
     try {
-      await ipc.setKittyDocsWebEnabled(next);
+      await ipc.setKittyWebEnabled(next);
       setEnabled(next);
     } catch (e) {
       setError(String(e));
@@ -539,7 +544,7 @@ function KittyDocsWebCard() {
   return (
     <label className="ext-card">
       <div className="ext-card-head">
-        <span className="ext-card-name">PDF/Excel/Web (kitty-docs-web)</span>
+        <span className="ext-card-name">Web search/scrape (kitty-web)</span>
         <input
           type="checkbox"
           checked={enabled}
@@ -548,27 +553,26 @@ function KittyDocsWebCard() {
         />
       </div>
       <span className="muted ext-card-desc">
-        Read PDFs and Excel spreadsheets, scrape web pages, and search the web.
+        Search the web and scrape pages into clean text for the agent.
       </span>
       {error && <div className="chat-error">{error}</div>}
     </label>
   );
 }
 
-/** Dedicated card for Brave search preference — this toggle does not spawn
+/** Dedicated card for Brave search preference â€” this toggle does not spawn
     its own process and does not gate whether `lean_web_search` exists at
-    all (it always does, via `kitty-docs-web` — see `KittyDocsWebCard`
-    above — since DuckDuckGo needs no key). It only controls whether
-    `BRAVE_API_KEY` is present on that server's env, which makes
-    `lean_web_search` prefer Brave (with automatic DuckDuckGo fallback) for
-    small requests, and query both engines together for broader ones. Off
-    by default, requires a Brave Search API key. Unlike every other builtin
-    card, "enabled" and "configured" are tracked separately: disabling
-    always wipes the stored key server-side
-    (`ipc.setBraveMcpSearchEnabled(false)`), so the checkbox alone can never
-    turn it back on — re-enabling always re-opens the API key form. This is
-    deliberate (see `brave_mcp_search_enabled`'s doc comment in Rust
-    `config/mod.rs`), not a rough edge to smooth over. */
+    all (it always does, via `kitty-web` â€” see `KittyWebCard` above â€” since
+    DuckDuckGo needs no key). It only controls whether `BRAVE_API_KEY` is
+    present on that server's env, which makes `lean_web_search` prefer Brave
+    (with automatic DuckDuckGo fallback) for small requests, and query both
+    engines together for broader ones. Off by default, requires a Brave
+    Search API key. Unlike every other builtin card, "enabled" and
+    "configured" are tracked separately: disabling always wipes the stored
+    key server-side (`ipc.setBraveMcpSearchEnabled(false)`), so the checkbox
+    alone can never turn it back on â€” re-enabling always re-opens the API key
+    form. This is deliberate (see `brave_mcp_search_enabled`'s doc comment in
+    Rust `config/mod.rs`), not a rough edge to smooth over. */
 function BraveMcpSearchCard() {
   const [enabled, setEnabled] = useState(false);
   const [configured, setConfigured] = useState(false);
@@ -618,7 +622,7 @@ function BraveMcpSearchCard() {
 
   // The server is only really on when both halves agree: the intent flag
   // (app config) and a key actually being present (Windows Credential
-  // Manager). They live in different stores, so they *can* drift apart —
+  // Manager). They live in different stores, so they *can* drift apart â€”
   // confirmed real bug: archiving/resetting config.json left `enabled:
   // false` next to a surviving credential, and the old `!configured` gate
   // on the key form meant that state rendered an unchecked checkbox with no
@@ -637,19 +641,19 @@ function BraveMcpSearchCard() {
           disabled={busy}
           onChange={(ev) => {
             if (!ev.target.checked) void disable();
-            // Checking it does nothing by itself — the API key form below
+            // Checking it does nothing by itself â€” the API key form below
             // (shown whenever !isOn) is what actually turns it on.
           }}
         />
       </div>
       <span className="muted ext-card-desc">
-        Brave Search LLM Context API. Requires an API key — turning this off always clears the
+        Brave Search LLM Context API. Requires an API key â€” turning this off always clears the
         stored key, so turning it back on requires entering it again. DuckDuckGo is always available
         as a fallback even without this.
       </span>
       {!isOn && configured && (
         <span className="muted ext-card-desc">
-          A saved key was found but the server is switched off. Enter a key to turn it back on —
+          A saved key was found but the server is switched off. Enter a key to turn it back on â€”
           this replaces the saved one.
         </span>
       )}
@@ -672,7 +676,7 @@ function BraveMcpSearchCard() {
             disabled={busy || !apiKey.trim()}
             onClick={() => void saveKey()}
           >
-            {busy ? 'Saving…' : 'Enable'}
+            {busy ? 'Savingâ€¦' : 'Enable'}
           </button>
         </div>
       )}

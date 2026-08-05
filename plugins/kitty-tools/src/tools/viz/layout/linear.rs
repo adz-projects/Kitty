@@ -77,7 +77,7 @@ pub fn render(steps: &[Step]) -> (String, f32, f32) {
         } else {
             // Serpentine connector: loop right past the wider of the two rows'
             // content, then back down/left into the next row's first node.
-            let turn_x = (a.x + a.w).max(b.x) + 40.0;
+            let turn_x = (a.x + a.w).max(b.x) + 24.0;
             let d = format!("M {:.1},{:.1} C {:.1},{:.1} {:.1},{:.1} {:.1},{:.1}", a.x + a.w, ay, turn_x, ay, turn_x, by, b.x, by);
             let bbox = (a.x + a.w, ay.min(by), (turn_x - (a.x + a.w)).max(0.0), (ay - by).abs());
             canvas.path(&d, "flow-path", bbox);

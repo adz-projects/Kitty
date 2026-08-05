@@ -74,12 +74,25 @@ pub fn set_ollama_env(name: String, value: Option<String>) -> Result<(), String>
 #[tauri::command]
 pub async fn ensure_ollama_running(app: AppHandle) -> Result<(), String> {
     let base = ollama_base(&app);
-    let already_owned_and_running = {
+    // Don't trust the stale `child.is_some()` handle alone: a crashed Ollama
+    // leaves a dead-but-Some` Child, and the old guard treated that as "still
+    // running", permanently blocking respawn. Probe the actual process (and,
+    // when owned, reap the dead handle) before deciding.
+    let already_running = {
         let state = app.state::<AppState>();
-        let ollama = state.ollama.lock().unwrap();
-        ollama.owned && ollama.child.is_some()
+        let mut ollama = state.ollama.lock().unwrap();
+        let handle_alive = ollama
+            .child
+            .as_mut()
+            .map(|c| c.try_wait().map(|s| s.is_none()).unwrap_or(false))
+            .unwrap_or(false);
+        if !handle_alive {
+            // Clear the stale handle so `ensure_running` can respawn.
+            ollama.child = None;
+        }
+        handle_alive
     };
-    if already_owned_and_running {
+    if already_running {
         // `ensure_running`'s probe-first path returns a *new*
         // ManagedProcess{owned: false} once it's up — overwriting
         // `state.ollama` with that here would leak the real child handle

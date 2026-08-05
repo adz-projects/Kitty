@@ -22,6 +22,7 @@ use crate::models::mcp::ToolDefinition;
 use crate::provider::base::{Delta, ToolCall};
 use crate::provider::router::ProviderRouter;
 use crate::server::events::{SSEEvent, SSEEventType};
+use crate::storage::hitl_rules;
 use crate::storage::sessions;
 use crate::storage::timings;
 
@@ -137,6 +138,33 @@ fn llm_visible_tools_openai_format(tools: &[ToolDefinition]) -> Vec<Value> {
     tools_to_openai_format(&visible)
 }
 
+/// Write-capable MCP tools the model can reach for (bundled kitty-tools
+/// plugins). A write-class call whose path resolves outside the session's
+/// allowed dirs is hard-denied (see `execute_one_tool_call`), never escalated
+/// to approval. Read/analysis tools (`lean_file_read`, `lean_excel_*`,
+/// `lean_pdf_*`, `lean_analyze_workspace`, …) deliberately stay out of this —
+/// an out-of-dir *read* is still worth surfacing to the user, not silently
+/// blocked. `lean_shell` is the boundary case: only a command containing an
+/// absolute path outside the allowed set is caught (`extract_shell_paths`'s
+/// regex), so relative/cwd-relative writes pass through as before — a
+/// documented limitation of path extraction, not a hole we can close here.
+const WRITE_TOOL_NAMES: &[&str] = &[
+    "lean_file_write",
+    "lean_file_append",
+    "lean_file_replace_str",
+    "lean_file_replace_lines",
+    "lean_cache_delete",
+    "lean_cache_clear",
+    "lean_scratchpad_set",
+    "lean_scratchpad_delete",
+    "lean_shell",
+];
+
+/// True if `tool_name` is a classified write-capable tool.
+pub fn is_write_tool(tool_name: &str) -> bool {
+    WRITE_TOOL_NAMES.contains(&tool_name)
+}
+
 /// Convert ToolDefinitions to OpenAI function-calling format.
 fn tools_to_openai_format(tools: &[ToolDefinition]) -> Vec<Value> {
     tools
@@ -199,7 +227,7 @@ fn reward_from_tool_result(result: &str) -> (f64, Option<&'static str>) {
     }
 }
 
-/// Build the assistant-role message for one turn's streamed output —
+/// Pure: build the assistant-role message for one turn's streamed output —
 /// factored out so every path that needs to persist it (the normal
 /// tool-execution flow and both budget-check early-exit branches) builds
 /// the identical shape, rather than some paths building it and others
@@ -225,6 +253,28 @@ fn build_assistant_message(content_chunks: &[String], turn_tool_calls: &[ToolCal
         }
     }
     assistant_msg
+}
+
+/// Pure: synthetic `tool`-role messages for the budget-abort branch, one per
+/// tool call the model issued but never executed.
+///
+/// The assistant message persisted in that branch carries `tool_calls` with
+/// no `tool` result following them — some OpenAI-compatible backends reject a
+/// subsequent request outright (HTTP 400: "tool_calls ... must be followed by
+/// a tool role message") when the per-message pairing is violated. Emit a
+/// single error result per pending call so the protocol invariant holds *and*
+/// the model can see what it attempted was cut off.
+fn build_aborted_tool_results(tool_calls: &[ToolCall]) -> Vec<Value> {
+    tool_calls
+        .iter()
+        .map(|tc| {
+            json!({
+                "role": "tool",
+                "content": "[Tool call cancelled: the step budget was exhausted before this call could be executed.]",
+                "tool_call_id": tc.id,
+            })
+        })
+        .collect()
 }
 
 /// FNV-1a 64-bit hash, used to deterministically derive a session's pinned
@@ -266,6 +316,11 @@ const BUDGET_SYSTEM_MESSAGE: &str =
      remains, and call request_more_steps to continue.]";
 /// How many extra steps a `request_more_steps` call actually grants.
 const BUDGET_EXTENSION_STEPS: i32 = 20;
+/// Ceiling (inclusive) for a session's `max_steps` metadata value, clamped at
+/// the top of `run_tool_loop`. Prevents a pathological/negative `max_steps`
+/// from making `step >= max_steps` true on the very first iteration (ending
+/// the turn before it starts) while still bounding runaway loops.
+const MAX_STEPS_CEILING: i64 = 10_000;
 
 /// Tool names the bundled adaptive-pathway MCP server exposes (see
 /// `plugins/adaptive-pathway/src/adaptive_pathway/mcp_server.py`) — excluded
@@ -362,6 +417,9 @@ pub struct AgentLoop {
     /// though the router already tracks multiple providers by
     /// `fallback_priority` specifically to support this.
     fallback_cfg: FallbackConfig,
+    /// See `sandbox::check_containment`'s `strict` parameter and
+    /// `AgentConfig::sandbox_strict`.
+    sandbox_strict: bool,
 }
 
 impl AgentLoop {
@@ -378,6 +436,7 @@ impl AgentLoop {
         max_concurrent_tool_calls: usize,
         cache_dir: String,
         fallback_cfg: FallbackConfig,
+        sandbox_strict: bool,
     ) -> Self {
         Self {
             router,
@@ -391,6 +450,7 @@ impl AgentLoop {
             max_concurrent_tool_calls,
             cache_dir,
             fallback_cfg,
+            sandbox_strict,
         }
     }
 
@@ -590,13 +650,27 @@ impl AgentLoop {
         turn_context: &str,
         event_tx: &mpsc::UnboundedSender<SSEEvent>,
     ) {
-        let mut max_steps: i32 = metadata
+        // `max_steps` is compared as i64, not truncated to i32, and clamped
+        // to `1..=MAX_STEPS_CEILING` — the old `... as i32` truncated a huge
+        // value, and a non-positive value made `step >= max_steps` instantly
+        // true, ending the turn before any model call.
+        let mut max_steps: i64 = metadata
             .get("max_steps")
             .and_then(|v| v.as_i64())
-            .unwrap_or(50) as i32;
-        let mut step = 0;
+            .unwrap_or(50)
+            .clamp(1, MAX_STEPS_CEILING);
+        let mut step: i64 = 0;
 
         loop {
+            // Stop generating once the SSE consumer is gone — a disconnected
+            // client's stream body is dropped by axum, the receiver end is
+            // closed, and each further LLM round trip would be pure wasted
+            // work. (The `disconnect_grace_secs` watcher in `Agent::run_turn`
+            // is the backstop that aborts the whole task shortly after.)
+            if event_tx.is_closed() {
+                break;
+            }
+
             if step >= max_steps {
                 let err_msg = format!("Step limit ({max_steps}) reached.");
                 let _ = event_tx.send(SSEEvent {
@@ -634,12 +708,17 @@ impl AgentLoop {
             // Progressive budget check
             let mut in_budget_check = false;
             let mut tools_for_turn = llm_visible_tools_openai_format(active_tools);
-            let tool_call_count: i32 = messages
-                .iter()
-                .filter(|m| m.get("tool_calls").is_some() || m.get("tool_call_id").is_some())
-                .count() as i32;
 
-            if tool_call_count > 0 && tool_call_count % 20 == 0 {
+            // Fire the budget nudge at 20/40/60 *executed steps*. The old
+            // check counted messages carrying `tool_calls`/`tool_call_id`,
+            // which jumps by the number of tool calls per turn (usually > 1,
+            // often several) — so it skipped over multiples of 20 entirely
+            // and the nudge silently never fired for sessions doing any
+            // parallel tool execution. `step` is incremented exactly once per
+            // completed tool-loop iteration, so `step % 20 == 0` lands on the
+            // 20th, 40th, 60th... iteration reliably. The `step > 0` guard
+            // keeps the very first iteration (step == 0) from tripping it.
+            if step > 0 && step % 20 == 0 {
                 messages.push(json!({
                     "role": "system",
                     "content": BUDGET_SYSTEM_MESSAGE
@@ -851,6 +930,12 @@ impl AgentLoop {
                     // model would have no memory of having tried, and its
                     // output was gone from history for good.
                     messages.push(build_assistant_message(&content_chunks, &turn_tool_calls));
+                    // Those persisted `tool_calls` are never executed here, so
+                    // without results the next provider request carried
+                    // dangling tool_calls (HTTP 400 on OpenAI-compatible
+                    // endpoints) — append a synthetic error result per call so
+                    // the pairing stays valid (`build_aborted_tool_results`).
+                    messages.extend(build_aborted_tool_results(&turn_tool_calls));
                     messages.push(json!({"role": "system", "content": err}));
                     step += 1;
                     if let Err(e) = self.context.save_messages(session_id, &mut messages).await {
@@ -866,7 +951,7 @@ impl AgentLoop {
                     // Actually grant the extension the model was told it got —
                     // previously this only stripped the call, so the turn
                     // still hard-stopped at the original max_steps regardless.
-                    max_steps += BUDGET_EXTENSION_STEPS;
+                    max_steps += BUDGET_EXTENSION_STEPS as i64;
                 }
 
                 if turn_tool_calls.is_empty() {
@@ -954,6 +1039,7 @@ impl AgentLoop {
                 self.context.config(),
                 &self.summarizer_cfg,
                 context_length,
+                false,
             )
             .await;
         }
@@ -1076,7 +1162,12 @@ impl AgentLoop {
 
             if let Some(ref content) = delta.content {
                 if !content.is_empty() {
-                    content_chars += content.len();
+                    // Count characters, not bytes: the backstop threshold
+                    // (`MAX_TURN_CONTENT_CHARS`) is documented in characters,
+                    // and `content.len()` (byte count) inflated multi-byte
+                    // UTF-8 ~3x, so a legitimate long CJK/emoji reply could
+                    // be cut off early.
+                    content_chars += content.chars().count();
                     content_chunks.push(content.clone());
                     token_count += 1;
                     let _ = event_tx.send(SSEEvent {
@@ -1194,6 +1285,15 @@ impl AgentLoop {
     /// into play, and even then it force-escalates to human approval
     /// (`hitl.force_approval`) rather than denying outright — a containment
     /// failure alone should never be an unrecoverable dead end for the user.
+    ///
+    /// One deliberate exception: a *write-class* tool that resolves to a path
+    /// outside the session's allowed directories is hard-denied instead of
+    /// escalated (`is_write_tool`). The user is the security boundary, but
+    /// writes escaping the chat/`cache_dir`/temp working set are a policy
+    /// violation, not an ask-the-human question — modeling that with a prompt
+    /// would just train the model to attempt out-of-scope writes more often.
+    /// Read-class tools keep the old behavior (force-approval).
+    #[allow(clippy::too_many_arguments)]
     async fn execute_one_tool_call(
         &self,
         session_id: &str,
@@ -1211,15 +1311,43 @@ impl AgentLoop {
             ..Default::default()
         });
 
+        // Resolve the HITL decision without holding the shared mutex across
+        // `check_tool_call`'s DB rule query: `check_tool_call_with_rules` is
+        // synchronous, but the rule lookup itself is an `.await` on the pool —
+        // holding the lock across it previously serialized every concurrent
+        // tool call in a session (and could stall the loop behind a slow DB).
+        // The pool handle is cloned out under a brief lock (clone, not await),
+        // the query runs lock-free, then the decision is applied under a
+        // short-lived lock.
         let mut decision = {
-            let mut hitl = self.hitl.lock().await;
-            hitl.check_tool_call(session_id, &tool_name, &tool_args)
+            let rules = {
+                let hitl = self.hitl.lock().await;
+                hitl.pool().clone()
+            };
+            let rules = hitl_rules::list_rules_by_tool(&rules, &tool_name)
                 .await
+                .unwrap_or_default();
+            let mut hitl = self.hitl.lock().await;
+            hitl.check_tool_call_with_rules(session_id, &tool_name, &tool_args, &rules)
         };
 
         if (decision.action == "proceed" || decision.action == "always_allow")
-            && !check_containment(&tool_args, allowed_dirs)
+            && !check_containment(&tool_args, allowed_dirs, self.sandbox_strict)
         {
+            if is_write_tool(&tool_name) {
+                let err = format!(
+                    "Tool {tool_name} denied: it would write to a path outside this \
+                     session's allowed directories"
+                );
+                let _ = event_tx.send(SSEEvent {
+                    event_type: SSEEventType::ToolFinish,
+                    tool_name: Some(tool_name),
+                    tool_result: Some(err.clone()),
+                    session_id: Some(session_id.to_string()),
+                    ..Default::default()
+                });
+                return err;
+            }
             let mut hitl = self.hitl.lock().await;
             decision = hitl.force_approval(session_id, &tool_name, &tool_args);
         }
@@ -1500,6 +1628,25 @@ mod schema_sanitizer_tests {
 }
 
 #[cfg(test)]
+mod write_tool_tests {
+    use super::{is_write_tool, WRITE_TOOL_NAMES};
+
+    #[test]
+    fn classifies_every_known_write_tool() {
+        for name in WRITE_TOOL_NAMES {
+            assert!(is_write_tool(name), "{name} should be classified as a write tool");
+        }
+    }
+
+    #[test]
+    fn read_tools_are_not_write_tools() {
+        for name in ["lean_file_read", "lean_excel_inspect", "lean_pdf_read_text", "lean_analyze_workspace", "lean_web_search", "decide"] {
+            assert!(!is_write_tool(name), "{name} should NOT be a write tool");
+        }
+    }
+}
+
+#[cfg(test)]
 mod content_ceiling_tests {
     use super::{exceeds_content_ceiling, MAX_TURN_CONTENT_CHARS};
 
@@ -1560,6 +1707,52 @@ mod adaptive_pathway_hook_tests {
             reward_from_tool_result("[Tool error: timeout]"),
             (-1.0, Some("crash"))
         );
+    }
+}
+
+#[cfg(test)]
+mod budget_abort_tests {
+    use super::{build_aborted_tool_results, ToolCall};
+    use serde_json::json;
+
+    fn pending_call(id: &str, name: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            r#type: "function".into(),
+            function: json!({"name": name, "arguments": {}}),
+        }
+    }
+
+    /// The budget-abort branch persists an assistant message carrying
+    /// tool_calls that are never executed — without synthetic `tool` results,
+    /// the next provider request has dangling tool_calls (HTTP 400 on
+    /// OpenAI-compatible endpoints). `build_aborted_tool_results` must emit
+    /// exactly one error result per pending call, keyed by `tool_call_id`.
+    #[test]
+    fn one_error_result_per_pending_call_keyed_by_tool_call_id() {
+        let calls = vec![
+            pending_call("call_1", "read_file"),
+            pending_call("call_2", "shell_run"),
+        ];
+        let results = build_aborted_tool_results(&calls);
+
+        assert_eq!(results.len(), 2);
+        for (call, result) in calls.iter().zip(&results) {
+            assert_eq!(result["role"], "tool");
+            assert_eq!(result["tool_call_id"], call.id);
+            assert!(
+                result["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("cancelled"),
+                "each call should carry an explanatory error result"
+            );
+        }
+    }
+
+    #[test]
+    fn no_tool_calls_means_no_tool_results() {
+        assert!(build_aborted_tool_results(&[]).is_empty());
     }
 }
 

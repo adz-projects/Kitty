@@ -1,0 +1,47 @@
+[package]
+name = "kitty-wasm"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Sandboxed WebAssembly compute environment (wasmtime + WASI) with a CPython guest — the Rust replacement for the wasm-math-mcp Python plugin. See docs/PLUGINS.md."
+
+# Standalone package, NOT a workspace member of src-tauri — same rationale as
+# `plugins/kitty-tools/Cargo.toml` and `plugins/kitty-web/Cargo.toml`.
+
+[lib]
+name = "kitty_wasm"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kitty-wasm"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "time"] }
+rmcp = { version = "=2.2.0", features = ["server", "transport-io", "macros"] }
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+dirs = "5"
+sha2 = "0.10"
+bytes = "1"
+
+wasmtime = "38"
+wasmtime-wasi = "38"
+
+# Guest download only. Same `default-features = false` + rustls treatment as
+# every other network-touching crate in this repo — avoids dragging
+# native-tls/OpenSSL in, which is the classic Android cross-build failure.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = true
+# panic = "abort" intentionally NOT set — a panicking tool call must return a
+# structured error rather than killing the server and every subsequent call.

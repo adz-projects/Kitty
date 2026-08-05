@@ -12,6 +12,7 @@ use crate::util::http_client;
 pub async fn list_models() -> Result<Vec<Value>, String> {
     let resp = http_client()
         .get("https://openrouter.ai/api/v1/models")
+        .timeout(std::time::Duration::from_secs(10))
         .send()
         .await
         .map_err(|e| format!("could not reach OpenRouter: {e}"))?;

@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use super::base::{
     classify_provider_error, Delta, HealthStatus, ModelInfo, Provider, SamplingParams,
@@ -19,6 +20,8 @@ pub struct AnthropicProvider {
     client: reqwest::Client,
     tailscale: Arc<TailscaleClient>,
     cache: CacheConfig,
+    /// SSE idle-read timeout — see `OpenAICompatibleProvider::idle_timeout`.
+    idle_timeout: Duration,
 }
 
 impl AnthropicProvider {
@@ -30,12 +33,14 @@ impl AnthropicProvider {
         tailscale: Arc<TailscaleClient>,
         cache: CacheConfig,
     ) -> Self {
+        let idle_timeout = config.idle_timeout();
         Self {
             provider_id: provider_id.into(),
             client: reqwest::Client::new(),
             config,
             tailscale,
             cache,
+            idle_timeout,
         }
     }
 
@@ -233,7 +238,7 @@ impl Provider for AnthropicProvider {
         }
 
         let stream = resp.bytes_stream();
-        let deltas = parse_anthropic_sse(stream);
+        let deltas = parse_anthropic_sse(stream, self.idle_timeout);
         Ok(Box::pin(deltas))
     }
 
@@ -382,23 +387,34 @@ struct PendingToolCall {
     input_json: String,
 }
 
+type RawBytesStream = Pin<Box<dyn Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>>;
+
 struct AnthropicSSEStream {
-    inner: Pin<Box<dyn Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>>,
+    /// `tokio_stream::adapters::Timeout` used as an idle-read timeout — see
+    /// `parse_openai_sse` in openai_compat.rs for the rationale.
+    inner: Pin<Box<tokio_stream::adapters::Timeout<RawBytesStream>>>,
     tool_input_buf: HashMap<usize, PendingToolCall>,
     pending_tool_calls: Vec<super::base::ToolCall>,
-    buf: String,
+    /// Raw bytes between newlines, decoded to UTF-8 only at complete line
+    /// boundaries (see openai_compat.rs `buf`).
+    buf: Vec<u8>,
     pending: std::collections::VecDeque<Delta>,
     done: bool,
 }
 
 fn parse_anthropic_sse(
     stream: impl Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
+    idle_timeout: Duration,
 ) -> AnthropicSSEStream {
+    use tokio_stream::StreamExt as _;
+    let inner = Box::pin(stream)
+        as Pin<Box<dyn Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>>;
+    let inner = inner.timeout(idle_timeout);
     AnthropicSSEStream {
-        inner: Box::pin(stream),
+        inner: Box::pin(inner),
         tool_input_buf: HashMap::new(),
         pending_tool_calls: Vec::new(),
-        buf: String::new(),
+        buf: Vec::new(),
         pending: std::collections::VecDeque::new(),
         done: false,
     }
@@ -567,17 +583,38 @@ impl Stream for AnthropicSSEStream {
             }
 
             match self.inner.as_mut().poll_next(cx) {
-                Poll::Ready(Some(Ok(chunk))) => {
-                    self.buf.push_str(&String::from_utf8_lossy(&chunk));
-                    while let Some(pos) = self.buf.find('\n') {
-                        let raw: String = self.buf.drain(..=pos).collect();
-                        let trimmed = raw.trim_end_matches(['\r', '\n']);
-                        if self.process_line(trimmed) {
+                Poll::Ready(Some(Ok(Ok(chunk)))) => {
+                    self.buf.extend_from_slice(&chunk);
+                    while let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
+                        let mut raw: Vec<u8> = self.buf.drain(..=pos).collect();
+                        while matches!(raw.last(), Some(&b'\r') | Some(&b'\n')) {
+                            raw.pop();
+                        }
+                        // Decode only at complete line boundaries so a
+                        // multi-byte UTF-8 char split across TCP chunks stays
+                        // intact.
+                        let line = String::from_utf8(raw).unwrap_or_else(|e| {
+                            String::from_utf8_lossy(e.as_bytes()).into_owned()
+                        });
+                        if self.process_line(&line) {
                             self.done = true;
                         }
                     }
                 }
-                Poll::Ready(Some(Err(_))) => {
+                Poll::Ready(Some(Ok(Err(_)))) => {
+                    self.pending.push_back(Delta {
+                        role: "assistant".into(),
+                        content: None,
+                        reasoning: None,
+                        tool_calls: None,
+                        finish_reason: Some("error".into()),
+                        usage: None,
+                        error_type: Some("request".into()),
+                    });
+                    self.done = true;
+                }
+                // The idle-read timeout fired: see openai_compat.rs.
+                Poll::Ready(Some(Err(_elapsed))) => {
                     self.pending.push_back(Delta {
                         role: "assistant".into(),
                         content: None,
@@ -590,6 +627,23 @@ impl Stream for AnthropicSSEStream {
                     self.done = true;
                 }
                 Poll::Ready(None) => {
+                    // A trailing complete line with no final newline is still
+                    // a real SSE line — decode it before finishing.
+                    if !self.buf.is_empty() {
+                        let raw = std::mem::take(&mut self.buf);
+                        let line = String::from_utf8(raw).unwrap_or_else(|e| {
+                            String::from_utf8_lossy(e.as_bytes()).into_owned()
+                        });
+                        if self.process_line(&line) {
+                            self.done = true;
+                        }
+                    }
+                    // Drain any Delta the trailing line produced before
+                    // reporting end-of-stream.
+                    if !self.pending.is_empty() {
+                        self.done = true;
+                        continue;
+                    }
                     return Poll::Ready(None);
                 }
                 Poll::Pending => {
@@ -614,7 +668,7 @@ mod sse_tests {
         let inner = stream::iter(vec![Ok::<bytes::Bytes, reqwest::Error>(
             bytes::Bytes::from(chunk),
         )]);
-        let deltas: Vec<Delta> = parse_anthropic_sse(inner).collect().await;
+        let deltas: Vec<Delta> = parse_anthropic_sse(inner, Duration::from_secs(300)).collect().await;
         let contents: Vec<String> = deltas.into_iter().filter_map(|d| d.content).collect();
         assert_eq!(contents, vec!["Hi".to_string(), " there".to_string()]);
     }
@@ -627,9 +681,40 @@ mod sse_tests {
             Ok::<bytes::Bytes, reqwest::Error>(bytes::Bytes::from(chunk1)),
             Ok::<bytes::Bytes, reqwest::Error>(bytes::Bytes::from(chunk2)),
         ]);
-        let deltas: Vec<Delta> = parse_anthropic_sse(inner).collect().await;
+        let deltas: Vec<Delta> = parse_anthropic_sse(inner, Duration::from_secs(300)).collect().await;
         let contents: Vec<String> = deltas.into_iter().filter_map(|d| d.content).collect();
         assert_eq!(contents, vec!["Hello".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn multi_byte_utf8_split_across_chunks_round_trips() {
+        // The é (U+00E9 = UTF-8 0xC3 0xA9) is split across the two chunks —
+        // per-chunk `String::from_utf8_lossy` used to corrupt it.
+        let mut chunk1 =
+            b"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"caf"
+                .to_vec();
+        chunk1.push(0xC3);
+        let chunk2 = b"\xA9\"}}\n\n".to_vec();
+        let inner = stream::iter(vec![
+            Ok::<bytes::Bytes, reqwest::Error>(bytes::Bytes::from(chunk1)),
+            Ok::<bytes::Bytes, reqwest::Error>(bytes::Bytes::from(chunk2)),
+        ]);
+        let deltas: Vec<Delta> = parse_anthropic_sse(inner, Duration::from_secs(300))
+            .collect()
+            .await;
+        let contents: String = deltas.iter().filter_map(|d| d.content.clone()).collect();
+        assert_eq!(contents, "café");
+    }
+
+    #[tokio::test]
+    async fn idle_read_timeout_terminates_a_silent_stream_as_a_transient_error() {
+        let silent = stream::pending::<Result<bytes::Bytes, reqwest::Error>>();
+        let deltas: Vec<Delta> = parse_anthropic_sse(silent, Duration::from_millis(50))
+            .collect()
+            .await;
+        let last = deltas.last().expect("expected at least the error Delta");
+        assert_eq!(last.error_type.as_deref(), Some("request"));
+        assert_eq!(last.finish_reason.as_deref(), Some("error"));
     }
 
     #[tokio::test]
@@ -639,9 +724,24 @@ mod sse_tests {
         let inner = stream::iter(vec![Ok::<bytes::Bytes, reqwest::Error>(
             bytes::Bytes::from(chunk),
         )]);
-        let deltas: Vec<Delta> = parse_anthropic_sse(inner).collect().await;
+        let deltas: Vec<Delta> = parse_anthropic_sse(inner, Duration::from_secs(300)).collect().await;
         assert_eq!(deltas.len(), 1);
         assert_eq!(deltas[0].content.as_deref(), Some("Hi"));
+    }
+
+    #[tokio::test]
+    async fn trailing_complete_line_without_newline_is_still_decoded() {
+        // A final `data:` line with no trailing `\n` is still a real SSE
+        // line — it must be decoded and surfaced at end-of-stream.
+        let chunk = "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}";
+        let inner = stream::iter(vec![Ok::<bytes::Bytes, reqwest::Error>(
+            bytes::Bytes::from(chunk),
+        )]);
+        let deltas: Vec<Delta> = parse_anthropic_sse(inner, Duration::from_secs(300))
+            .collect()
+            .await;
+        let contents: Vec<String> = deltas.into_iter().filter_map(|d| d.content).collect();
+        assert_eq!(contents, vec!["Hi".to_string()]);
     }
 
     #[tokio::test]
@@ -654,7 +754,7 @@ mod sse_tests {
         let inner = stream::iter(vec![Ok::<bytes::Bytes, reqwest::Error>(
             bytes::Bytes::from(chunk),
         )]);
-        let deltas: Vec<Delta> = parse_anthropic_sse(inner).collect().await;
+        let deltas: Vec<Delta> = parse_anthropic_sse(inner, Duration::from_secs(300)).collect().await;
         let tool_calls = deltas
             .into_iter()
             .find_map(|d| d.tool_calls)
@@ -681,7 +781,7 @@ mod sse_tests {
         let inner = stream::iter(vec![Ok::<bytes::Bytes, reqwest::Error>(
             bytes::Bytes::from(chunk),
         )]);
-        let deltas: Vec<Delta> = parse_anthropic_sse(inner).collect().await;
+        let deltas: Vec<Delta> = parse_anthropic_sse(inner, Duration::from_secs(300)).collect().await;
         let usage = deltas[0]
             .usage
             .as_ref()
@@ -700,7 +800,7 @@ mod sse_tests {
         let inner = stream::iter(vec![Ok::<bytes::Bytes, reqwest::Error>(
             bytes::Bytes::from(chunk),
         )]);
-        let deltas: Vec<Delta> = parse_anthropic_sse(inner).collect().await;
+        let deltas: Vec<Delta> = parse_anthropic_sse(inner, Duration::from_secs(300)).collect().await;
         let usage = deltas[0]
             .usage
             .as_ref()

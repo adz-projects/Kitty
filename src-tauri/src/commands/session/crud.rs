@@ -1,6 +1,8 @@
 //! Session create/list/resume/fork/delete — the CRUD half of session
 //! lifecycle commands.
 
+use std::path::{Path, PathBuf};
+
 use serde::Serialize;
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager};
@@ -31,6 +33,9 @@ pub struct ModeInfo {
 /// Start a new session. An explicit `cwd` (e.g. a dropped folder) overrides
 /// the default per-chat folder. `mode` ("chat"|"agentic") seeds BigTiny's
 /// directory-sandboxing scope from creation — see `bigtiny::sessions::create`.
+/// The session is stamped with the currently-active provider/model from birth
+/// (per-session provider isolation), so a later global provider change never
+/// retroactively flips this session.
 #[tauri::command]
 pub async fn new_session(
     app: AppHandle,
@@ -46,7 +51,18 @@ pub async fn new_session(
         }
         _ => resolve_cwd(&app).await,
     };
-    crate::bigtiny::sessions::create(&app, cwd, mode).await
+    // Resolve the global default provider/model to pin onto this session.
+    let active: (Option<String>, Option<String>) = {
+        let state = app.state::<AppState>();
+        let cfg = state.config.lock().unwrap();
+        let provider = cfg
+            .active_provider_id
+            .as_deref()
+            .and_then(|id| cfg.providers.iter().find(|p| p.id == id))
+            .map(|p| (Some(p.id.clone()), p.models.first().cloned()));
+        provider.unwrap_or((None, None))
+    };
+    crate::bigtiny::sessions::create(&app, cwd, mode, active.0, active.1).await
 }
 
 /// Attach one recipe-declared extension to a live session — a no-op under
@@ -140,10 +156,118 @@ pub(crate) fn rebind_session(
     map.insert(keep_label.to_string(), Some(session_id));
 }
 
+/// Manually compact the current session's context (`/compact`). Forwards to
+/// the daemon's `POST /api/chat/{id}/compact` and returns the result
+/// `{compacted, messages_compacted, tokens_before, tokens_after}` so the UI
+/// can show what was folded.
+#[tauri::command]
+pub async fn compact_session(
+    app: AppHandle,
+    session_id: String,
+) -> Result<serde_json::Value, String> {
+    crate::bigtiny::sessions::compact(&app, &session_id).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    fn temp_chats_root(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "kitty-chats-test-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let root = dir.join("chats");
+        // Anchors the canonical root (creates it if missing, like
+        // `chat_folder_is_deletable` itself does).
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn chat_folder_is_deletable_allows_a_real_session_folder() {
+        let root = temp_chats_root("real");
+        let session = root.join("s1");
+        {
+            // The per-chat folder is created (as `resolve_cwd` would).
+            std::fs::create_dir_all(&session).unwrap();
+        }
+        assert!(chat_folder_is_deletable(&session.to_string_lossy(), &root));
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[test]
+    fn chat_folder_is_deletable_accepts_a_subdirectory_of_a_session() {
+        let root = temp_chats_root("sub");
+        let sub = root.join("s1").join("nested");
+        std::fs::create_dir_all(&sub).unwrap();
+        assert!(chat_folder_is_deletable(&sub.to_string_lossy(), &root));
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[test]
+    fn chat_folder_is_deletable_rejects_dot_dot_escape_only_a_string_check_misses() {
+        let root = temp_chats_root("escape");
+        let outside = root.parent().unwrap().join("Other");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::create_dir_all(root.join("X")).unwrap();
+
+        // "<base>/chats/X/../../Other" starts with "<base>/chats/" so the old
+        // string-prefix check passed, but it canonicalizes to a *sibling* of
+        // the chats tree — must be refused.
+        let crafted = format!("{}/X/../../Other", root.to_string_lossy().replace('\\', "/"));
+        assert!(!chat_folder_is_deletable(&crafted, &root));
+        assert!(outside.exists(), "the outside dir must survive untouched");
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[test]
+    fn chat_folder_is_deletable_distinguishes_a_chats2_sibling() {
+        // `C:\chats` vs `C:\chats2` — the component-boundary case.
+        let root = temp_chats_root("boundary");
+        let sibling = root.parent().unwrap().join("chats2");
+        std::fs::create_dir_all(sibling.join("foo")).unwrap();
+        assert!(!chat_folder_is_deletable(&sibling.join("foo").to_string_lossy(), &root));
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[test]
+    fn chat_folder_is_deletable_rejects_an_absolute_outside_path() {
+        let root = temp_chats_root("outside");
+        let elsewhere = std::env::temp_dir().join(format!(
+            "kitty-chats-elsewhere-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        assert!(!chat_folder_is_deletable(&elsewhere.to_string_lossy(), &root));
+        let _ = std::fs::remove_dir_all(&elsewhere);
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[test]
+    fn chat_folder_is_deletable_rejects_a_missing_cwd() {
+        let root = temp_chats_root("missing");
+        let ghost = root.join("never-created");
+        assert!(!chat_folder_is_deletable(&ghost.to_string_lossy(), &root));
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[test]
+    fn chat_folder_is_deletable_never_deletes_the_chats_root_itself() {
+        // "…/chats/X/.." canonicalizes to the chats root — the boundary, not
+        // strictly inside. Allowing it would nuke every chat folder at once.
+        let root = temp_chats_root("root");
+        std::fs::create_dir_all(root.join("X")).unwrap();
+        let crafted = format!("{}/X/..", root.to_string_lossy().replace('\\', "/"));
+        assert!(!chat_folder_is_deletable(&crafted, &root));
+        assert!(root.exists(), "the chats root itself must never be deletable");
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
 
     #[test]
     fn rebind_session_clears_stale_other_label() {
@@ -187,6 +311,39 @@ mod tests {
     }
 }
 
+/// True when `cwd` names a directory *strictly inside* the chats tree
+/// (`<base>/chats`). Both sides are canonicalized first, so a `cwd` like
+/// `<chats>/X/../../Other` — which passes a raw string-prefix check yet
+/// resolves outside the chats tree — is correctly rejected. A `cwd` that
+/// can't be canonicalized (doesn't exist on disk) is never deletable.
+///
+/// The comparison is component-based (`strip_prefix`), so `C:\chats` can
+/// never claim `C:\chats2\foo` as a descendant. Windows canonicalization
+/// produces the same on-disk casing on both sides, so the component match is
+/// reliable there too.
+fn chat_folder_is_deletable(cwd: &str, chats_root: &Path) -> bool {
+    let Ok(root) = canonicalize_or_create(chats_root) else {
+        return false;
+    };
+    let Ok(cwd) = std::fs::canonicalize(cwd) else {
+        return false;
+    };
+    // `strip_prefix` on canonical paths — a path that resolves to the root
+    // itself (e.g. `…/chats/X/..`) has an empty remainder and is NOT strictly
+    // inside: deleting it would take out every chat folder at once.
+    match cwd.strip_prefix(&root) {
+        Ok(rel) => !rel.as_os_str().is_empty(),
+        Err(_) => false,
+    }
+}
+
+/// `chats_root` may not exist yet (a fresh install with no sessions); give the
+/// canonicalizer a stable anchor by creating it first.
+fn canonicalize_or_create(dir: &Path) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(dir)?;
+    std::fs::canonicalize(dir)
+}
+
 /// Delete a session. If `cwd` sits under the private `Documents/Kitty/chats/`
 /// prefix (i.e. it was never an explicit user-chosen working directory — see
 /// `resolve_cwd`), also remove that directory. The prefix check is a hard
@@ -208,13 +365,18 @@ pub async fn delete_session(
         .unwrap()
         .remove(&session_id);
     if let Some(cwd) = cwd {
-        // Only remove a folder that sits under the chats base's `chats/` dir
-        // (a Kitty-created per-chat folder) — never a user's own directory.
+        // Only remove a folder that sits strictly inside the chats base's
+        // `chats/` dir (a Kitty-created per-chat folder) — never a user's own
+        // directory. Canonicalized (not a raw string prefix), so a malicious
+        // `…/chats/X/../../Other` can't redirect the delete outside the tree.
         let chats_root = chats_base_dir(&app).join(CHATS_DIR_NAME);
-        let chats_root = format!("{}/", chats_root.to_string_lossy().replace('\\', "/"));
-        let cwd_norm = cwd.replace('\\', "/");
-        if cwd_norm.starts_with(&chats_root) {
-            let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&cwd_norm)).await;
+        if chat_folder_is_deletable(&cwd, &chats_root) {
+            let cwd_for_delete = cwd.replace('\\', "/");
+            let _ =
+                tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&cwd_for_delete))
+                    .await;
+        } else {
+            tracing::warn!("refusing to delete session folder outside the chats tree: {cwd}");
         }
     }
     // Cross-window live-update, mirroring `session://created` (Round-4 item 6)
@@ -248,7 +410,6 @@ pub async fn clear_all_sessions(app: AppHandle) -> Result<usize, String> {
     let sessions = crate::bigtiny::sessions::list(&app).await?;
 
     let chats_root = chats_base_dir(&app).join(CHATS_DIR_NAME);
-    let chats_root = format!("{}/", chats_root.to_string_lossy().replace('\\', "/"));
 
     let mut deleted = 0usize;
     let mut last_err: Option<String> = None;
@@ -260,11 +421,19 @@ pub async fn clear_all_sessions(app: AppHandle) -> Result<usize, String> {
             Ok(_) => {
                 deleted += 1;
                 if let Some(cwd) = s.get("cwd").and_then(|v| v.as_str()) {
-                    let cwd_norm = cwd.replace('\\', "/");
-                    if cwd_norm.starts_with(&chats_root) {
-                        let _ =
-                            tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&cwd_norm))
-                                .await;
+                    // Same canonical, strictly-inside guard as `delete_session`
+                    // — never let a crafted cwd redirect the folder cleanup
+                    // outside the chats tree.
+                    if chat_folder_is_deletable(cwd, &chats_root) {
+                        let cwd_for_delete = cwd.replace('\\', "/");
+                        let _ = tokio::task::spawn_blocking(move || {
+                            std::fs::remove_dir_all(&cwd_for_delete)
+                        })
+                        .await;
+                    } else {
+                        tracing::warn!(
+                            "refusing to delete session folder outside the chats tree: {cwd}"
+                        );
                     }
                 }
             }

@@ -1401,8 +1401,28 @@ button.primary {
 .settings-window {
   display: grid;
   grid-template-columns: 200px 1fr;
+  grid-template-rows: auto 1fr;
   height: 100%;
   background: var(--bg);
+}
+.settings-recovery-notice {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 16px;
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--border);
+  color: var(--text);
+  font-size: 13px;
+}
+.settings-recovery-notice button {
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 13px;
 }
 .settings-nav {
   display: flex;

@@ -162,8 +162,10 @@ doc.save(r"{}")
 #[test]
 fn word_read_text_not_found_error() {
     let server = KittyToolsServer::new();
+    // Inside home (temp dir) so the home boundary passes through to the
+    // not-found error path.
     let result = parse(&server.word_read_text(Parameters(WordReadTextRequest {
-        path: "C:/definitely/does/not/exist.docx".to_string(),
+        path: tmp_path("does-not-exist.docx").to_string_lossy().to_string(),
         query: None,
         offset: None,
         limit: None,
@@ -370,7 +372,7 @@ shutil.move(tmp2, r"{path}")
 fn word_write_doc_append_to_missing_file_errors() {
     let server = KittyToolsServer::new();
     let result = parse(&server.word_write_doc(Parameters(WordWriteDocRequest {
-        path: "C:/definitely/missing.docx".to_string(),
+        path: tmp_path("does-not-exist.docx").to_string_lossy().to_string(),
         doc_text: Some("text".to_string()),
         write_mode: Some(WordWriteModeParam::Append),
         title: None,

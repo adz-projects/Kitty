@@ -14,6 +14,11 @@ export interface SessionGroup {
 interface SessionState {
   sessions: SessionSummary[];
   loading: boolean;
+  /** Last refresh failure message (WS8) — callers using `void refresh()` can
+      no longer hit an unhandled rejection from `ipc.listSessions`, and the
+      sidebar can surface why the list is stale instead of silently sitting
+      on old data. */
+  loadError: string | null;
   query: string;
   folders: string[];
   assignments: Record<string, string>;
@@ -34,17 +39,23 @@ interface SessionState {
 export const useSessionStore = create<SessionState>((set, get) => ({
   sessions: [],
   loading: false,
+  loadError: null,
   query: '',
   folders: [],
   assignments: {},
 
   refresh: async () => {
-    set({ loading: true });
+    set({ loading: true, loadError: null });
     try {
       const raw = await ipc.listSessions();
       const sessions = raw.map(parseSession).sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : -1));
       set({ sessions });
       await get().refreshFolders();
+    } catch (e) {
+      // Previously this escaped the try/finally with no catch, so a caller's
+      // `void refresh()` produced an unhandled promise rejection whenever the
+      // IPC call failed — capture the error in state instead.
+      set({ loadError: e instanceof Error ? e.message : String(e) });
     } finally {
       set({ loading: false });
     }

@@ -13,6 +13,11 @@ use serde_json::Value;
 use crate::config::Config;
 use crate::lifecycle::adaptive_pathway_proc::{AdaptivePathwayStatus, EmbeddingModelStatus};
 
+/// A physical-pixel screen rectangle `(x, y, width, height)`, shared by the
+/// screenshot preview + selection plumbing — keeps the long tuple out of the
+/// `AppState` field and command-signature types.
+pub type ScreenshotRegion = (i32, i32, i32, i32);
+
 /// A child process we may or may not own. We only kill processes we spawned.
 #[derive(Default)]
 pub struct ManagedProcess {
@@ -70,6 +75,12 @@ pub enum StartupPhase {
 pub struct AppState {
     /// App configuration (persisted to `%APPDATA%/Kitty/config.json`).
     pub config: Mutex<Config>,
+    /// One-time corrupt-config recovery marker: `Some(backup_path)` when a
+    /// `config.json` failed to parse at startup and was backed up to
+    /// `config.json.corrupt-<timestamp>` before the app fell back to
+    /// defaults. The frontend reads it once via
+    /// `get_config_recovery_notice` to show that saved settings were reset.
+    pub config_recovered: Mutex<Option<String>>,
     /// The Ollama process — only `Some(child)` when *we* started it.
     pub ollama: Mutex<ManagedProcess>,
     /// Last computed stack status, so the health loop only emits on change.
@@ -145,9 +156,8 @@ pub struct AppState {
     /// by window label: only one screenshot capture can be visually in
     /// flight at a time (the user can't interact with two selection
     /// overlays at once), so there's nothing to disambiguate.
-    pub screenshot_preview: Mutex<Option<(String, i32, i32, i32, i32)>>,
-    pub screenshot_selection:
-        Mutex<Option<tokio::sync::oneshot::Sender<Option<(i32, i32, i32, i32)>>>>,
+    pub screenshot_preview: Mutex<Option<(String, ScreenshotRegion)>>,
+    pub screenshot_selection: Mutex<Option<tokio::sync::oneshot::Sender<Option<ScreenshotRegion>>>>,
     /// Last-seen `compacted_through_rowid` per session, from BigTiny's
     /// `/api/chat/{id}/stats`. BigTiny's own background compaction pass
     /// runs fire-and-forget from the *end* of a turn (see
@@ -169,9 +179,14 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(config: Config) -> Self {
+    /// `config_recovered`: `Some(backup_path)` when the loaded config had to
+    /// be recovered from a corrupt `config.json` (see
+    /// `config::load_with_recovery`) — surfaced once to the frontend as a
+    /// recovery notice.
+    pub fn new(config: Config, config_recovered: Option<String>) -> Self {
         Self {
             config: Mutex::new(config),
+            config_recovered: Mutex::new(config_recovered),
             ollama: Mutex::new(ManagedProcess::default()),
             stack_status: Mutex::new(StackStatus::default()),
             startup_phase: Mutex::new(StartupPhase::default()),

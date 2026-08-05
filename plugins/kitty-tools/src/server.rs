@@ -11,7 +11,7 @@ use serde_json::json;
 use crate::docx;
 use crate::docx::write::WriteMode;
 use crate::envelope::{error_response, success_response};
-use crate::paths::resolve;
+use crate::paths::{path_within_home, resolve};
 use crate::query_filter::filter_by_query;
 use crate::tools;
 use crate::tools::viz::model as viz_model;
@@ -20,6 +20,22 @@ use crate::tools::viz::model as viz_model;
 /// `lean_file_read`'s `file_page_size` threshold in the Python plugin this
 /// replaces the Word tools of.
 const DEFAULT_PAGE_SIZE: u32 = 200;
+
+/// Home-directory hard boundary (defense-in-depth; the daemon is the primary
+/// gate). Word read/write authorize through the *resolved* path here —
+/// before any filesystem access.
+fn outside_home(resolved: &std::path::Path) -> Option<String> {
+    if path_within_home(resolved) {
+        None
+    } else {
+        Some(error_response(
+            "PATH_OUTSIDE_HOME",
+            "Path is outside the HOME directory",
+            Some(&resolved.to_string_lossy()),
+            Some("Only paths inside your home directory can be accessed."),
+        ))
+    }
+}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct WordReadTextRequest {
@@ -60,6 +76,50 @@ pub struct WordWriteDocRequest {
     pub title: Option<String>,
     /// BCP-47 language tag for the WCAG `w:lang` metadata (default "en-US").
     pub language: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ExcelInspectRequest {
+    /// Path to the .xlsx (or .xls/.ods) spreadsheet file.
+    pub path: String,
+}
+
+/// Docs on fields follow the `#[schemars]`-documentation rule this crate
+/// enforces for small models (see `tests/schema.rs`).
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ExcelReadRowsRequest {
+    /// Path to the .xlsx (or .xls/.ods) spreadsheet file.
+    pub path: String,
+    /// Sheet name to read; defaults to the workbook's first sheet.
+    pub sheet: Option<String>,
+    /// Excel-style cell range, e.g. "A1:C3"; defaults to the whole sheet.
+    pub range_box: Option<String>,
+    /// "json" (default, list of row objects) or "csv" (raw CSV text).
+    pub output_format: Option<String>,
+    /// Optional keyword filter over row contents.
+    pub query: Option<String>,
+    /// Row offset to start from (pagination / query continuation).
+    pub offset: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct PdfReadTextRequest {
+    /// Path to the .pdf file.
+    pub path: String,
+    /// First page to read (1-based, default 1).
+    pub start_page: Option<u32>,
+    /// Last page to read (1-based, inclusive); defaults to the last page.
+    pub end_page: Option<u32>,
+    /// Optional keyword filter over page text.
+    pub query: Option<String>,
+    /// Page offset to start from (pagination / query continuation).
+    pub offset: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct PdfReadOutlineRequest {
+    /// Path to the .pdf file.
+    pub path: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -381,6 +441,23 @@ pub struct AccessibleChartRequest {
     pub y_label: Option<String>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct AccessibleMermaidRequest {
+    /// Title drawn above the diagram and used as the iframe title.
+    pub title: String,
+    /// One or two sentences describing the diagram for screen-reader users,
+    /// e.g. "The login flow branches on whether the credentials are valid."
+    pub description: String,
+    /// The Mermaid source to render, e.g. "flowchart TD\\nA-->B". Any Mermaid
+    /// diagram type is accepted (flowchart, sequenceDiagram, classDiagram,
+    /// stateDiagram-v2, erDiagram, gantt, journey, pie, mindmap, gitGraph,
+    /// timeline, and more). Rendered client-side in a sandboxed iframe; if the
+    /// source fails to parse, the tool returns an error card with the raw
+    /// source rather than a blank frame.
+    #[schemars(length(min = 1, max = 12000))]
+    pub mermaid: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct KittyToolsServer {
     tool_router: ToolRouter<Self>,
@@ -393,20 +470,26 @@ impl Default for KittyToolsServer {
 }
 
 impl KittyToolsServer {
-    /// Assembles the router from two pieces: the 18 always-on `lean_*`
-    /// local-machine tools, plus the 3 visualization tools, included only
-    /// when `KITTY_VIZ_ENABLED=1`. Web search (`lean_web_search` /
-    /// `lean_web_search_read_chunk`) lives in the Python `kitty-docs-web`
-    /// process instead — see `docs/VERSIONS.md` for why the merged
-    /// Brave/DuckDuckGo search tool moved out of this crate. Per the base
-    /// plan: "remove tools from the router at startup rather than
-    /// registering them and failing at call time" — env is fixed for the
-    /// process lifetime and BigTiny restarts this server whenever its spec
-    /// (and therefore its env) changes, so a disabled tool is simply never
-    /// advertised rather than advertised-then-erroring, which would burn
-    /// context and invite the model to call something guaranteed to fail.
+    /// Assembles the router from three pieces: the 17 always-on `lean_*`
+    /// local-machine tools; `lean_shell`, included on every platform except
+    /// Android (see `shell_tool_router`'s doc comment); and the 3
+    /// visualization tools, included only when `KITTY_VIZ_ENABLED=1`. Web
+    /// search (`lean_web_search` / `lean_web_search_read_chunk`) lives in the
+    /// Python `kitty-docs-web` process instead — see `docs/VERSIONS.md` for
+    /// why the merged Brave/DuckDuckGo search tool moved out of this crate.
+    /// Per the base plan: "remove tools from the router at startup rather
+    /// than registering them and failing at call time" — env/platform is
+    /// fixed for the process lifetime and BigTiny restarts this server
+    /// whenever its spec (and therefore its env) changes, so a disabled tool
+    /// is simply never advertised rather than advertised-then-erroring,
+    /// which would burn context and invite the model to call something
+    /// guaranteed to fail.
     pub fn new() -> Self {
         let mut router = Self::core_tool_router();
+        #[cfg(not(target_os = "android"))]
+        {
+            router += Self::shell_tool_router();
+        }
         if std::env::var("KITTY_VIZ_ENABLED").as_deref() == Ok("1") {
             router += Self::viz_tool_router();
         }
@@ -447,6 +530,9 @@ impl KittyToolsServer {
     pub fn word_read_text(&self, Parameters(req): Parameters<WordReadTextRequest>) -> String {
         guarded(move || {
             let resolved = resolve(&req.path);
+            if let Some(err) = outside_home(&resolved) {
+                return err;
+            }
             let paragraphs = match docx::read_paragraphs(&resolved) {
                 Ok(p) => p,
                 Err(docx::DocxError::NotFound) => {
@@ -502,6 +588,9 @@ impl KittyToolsServer {
     pub fn word_read_outline(&self, Parameters(req): Parameters<WordReadOutlineRequest>) -> String {
         guarded(move || {
             let resolved = resolve(&req.path);
+            if let Some(err) = outside_home(&resolved) {
+                return err;
+            }
             let paragraphs = match docx::read_paragraphs(&resolved) {
                 Ok(p) => p,
                 Err(docx::DocxError::NotFound) => {
@@ -527,6 +616,9 @@ impl KittyToolsServer {
     pub fn word_write_doc(&self, Parameters(req): Parameters<WordWriteDocRequest>) -> String {
         guarded(move || {
             let resolved = resolve(&req.path);
+            if let Some(err) = outside_home(&resolved) {
+                return err;
+            }
             let mode = match req.write_mode {
                 Some(WordWriteModeParam::Append) => WriteMode::Append,
                 _ => WriteMode::Create,
@@ -570,9 +662,41 @@ impl KittyToolsServer {
         })
     }
 
-    #[tool(name = "lean_shell", description = "Runs a shell command and returns truncated stdout/stderr. Set dry_run=True to preview without executing.")]
-    pub async fn shell(&self, Parameters(req): Parameters<ShellRequest>) -> String {
-        tools::shell::shell(&req.command, req.dry_run.unwrap_or(false)).await
+    #[tool(name = "lean_excel_inspect", description = "Returns sheet names, dimensions, and the header row for an Excel spreadsheet (.xlsx/.xls/.ods).")]
+    pub fn excel_inspect(&self, Parameters(req): Parameters<ExcelInspectRequest>) -> String {
+        guarded(move || tools::excel::excel_inspect(&req.path))
+    }
+
+    #[tool(name = "lean_excel_read_rows", description = "Reads rows from an Excel spreadsheet (.xlsx/.xls/.ods) as structured JSON (or CSV). Supports sheet selection, a cell range, keyword query filtering, and offset pagination (default page size 500 rows).")]
+    pub fn excel_read_rows(&self, Parameters(req): Parameters<ExcelReadRowsRequest>) -> String {
+        guarded(move || {
+            tools::excel::excel_read_rows(
+                &req.path,
+                req.sheet.as_deref(),
+                req.range_box.as_deref(),
+                req.output_format.as_deref().unwrap_or("json"),
+                req.query.as_deref(),
+                req.offset.unwrap_or(0) as usize,
+            )
+        })
+    }
+
+    #[tool(name = "lean_pdf_read_text", description = "Reads text from a PDF page-by-page. Supports page ranges, keyword query filtering, and offset pagination.")]
+    pub fn pdf_read_text(&self, Parameters(req): Parameters<PdfReadTextRequest>) -> String {
+        guarded(move || {
+            tools::pdf::pdf_read_text(
+                &req.path,
+                req.start_page,
+                req.end_page,
+                req.query.as_deref(),
+                req.offset.unwrap_or(0) as usize,
+            )
+        })
+    }
+
+    #[tool(name = "lean_pdf_read_outline", description = "Returns the table-of-contents/bookmark outline of a PDF, if it has one.")]
+    pub fn pdf_read_outline(&self, Parameters(req): Parameters<PdfReadOutlineRequest>) -> String {
+        guarded(move || tools::pdf::pdf_read_outline(&req.path))
     }
 
     #[tool(name = "lean_analyze_workspace", description = "Lists files and folders under path (or returns metadata if path is a file).")]
@@ -648,6 +772,22 @@ impl KittyToolsServer {
     }
 }
 
+// Separated from `core_tool_router` (rather than just `#[cfg]`-gating the
+// method in place) so it can be dropped from the advertised tool set on
+// Android via a plain runtime condition in `KittyToolsServer::new`, matching
+// the viz router below — an app-sandbox shell backed by toybox isn't a
+// useful `lean_shell` for a model to drive, and it's the tool with the
+// widest blast radius against the daemon's path-containment check. Kept
+// compiling on every target (see `tools::shell`'s non-Windows fallback) so
+// this is a registration decision, not a build one.
+#[tool_router(router = shell_tool_router)]
+impl KittyToolsServer {
+    #[tool(name = "lean_shell", description = "Runs a shell command and returns truncated stdout/stderr. Set dry_run=True to preview without executing.")]
+    pub async fn shell(&self, Parameters(req): Parameters<ShellRequest>) -> String {
+        tools::shell::shell(&req.command, req.dry_run.unwrap_or(false)).await
+    }
+}
+
 #[tool_router(router = viz_tool_router)]
 impl KittyToolsServer {
     #[tool(
@@ -689,6 +829,14 @@ impl KittyToolsServer {
                 req.y_label.as_deref(),
             )
         })
+    }
+
+    #[tool(
+        name = "generate_accessible_mermaid",
+        description = "Renders a Mermaid diagram inline in the chat. Use it when a step/edge model is too rigid: Mermaid gives you flowcharts, sequence diagrams, class diagrams, state diagrams, ER diagrams, gantt, journey maps, pie, mindmap, gitGraph, and timeline from a single source string. Preferred over generate_accessible_svg when the caller already has Mermaid source, or needs a diagram type that steps-based layout can't express. Example: {\"title\":\"Login flow\",\"description\":\"The login flow branches on whether the credentials are valid.\",\"mermaid\":\"flowchart TD\\n  A[Receive request] --> B{Credentials valid?}\\n  B -->|Yes| C[Issue token]\\n  B -->|No| D[Return 401]\"}. Rendered client-side in a sandboxed iframe; invalid source shows the error with the raw source, never a blank frame. Note the Mermaid runtime is bundled, so each result is a few MB."
+    )]
+    pub fn generate_accessible_mermaid(&self, Parameters(req): Parameters<AccessibleMermaidRequest>) -> String {
+        guarded(move || tools::viz::mermaid::generate_accessible_mermaid(&req.mermaid, &req.title, &req.description))
     }
 }
 

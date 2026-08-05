@@ -20,6 +20,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use crate::agent::context::stats::SessionStats;
+use crate::error::StorageError;
 use crate::server::events::{serialize_sse, SSEEvent};
 use crate::storage::messages::{self, MessageRow};
 use crate::storage::sessions;
@@ -41,6 +42,15 @@ pub struct CreateSessionRequest {
     pub mode: Option<String>,
     #[serde(default)]
     pub name: Option<String>,
+    /// Pin the session to a specific provider/model from birth (per-session
+    /// provider isolation — the sandbox/loop resolve `metadata.provider` at
+    /// send time, so stamping here means the session keeps this provider even
+    /// if the global default changes later). Omitted = the session follows
+    /// whatever is globally active when it first sends.
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 pub async fn create_session(
@@ -67,6 +77,12 @@ pub async fn create_session(
     if let Some(cwd) = body.cwd.filter(|c| !c.is_empty()) {
         metadata["cwd"] = json!(cwd);
         metadata["chat_dir"] = json!(cwd);
+    }
+    if let Some(provider) = body.provider.filter(|p| !p.is_empty()) {
+        metadata["provider"] = json!(provider);
+        if let Some(model) = body.model.filter(|m| !m.is_empty()) {
+            metadata["model"] = json!(model);
+        }
     }
     if let Err(e) = sessions::update_session_config(&state.db, &id, &metadata.to_string()).await {
         tracing::warn!("failed to save initial metadata for session {id}: {e}");
@@ -156,7 +172,22 @@ pub async fn update_config(
 
     match result {
         Ok(()) => Json(json!({"ok": true})).into_response(),
-        Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => {
+            // `update_metadata_with` reports a missing session as a
+            // "Session ... not found" StorageError — that's a 404 for the
+            // client, not a server error (which would hide the real cause
+            // from a UI that treats 5xx as "daemon broken").
+            let is_missing = matches!(
+                &e,
+                StorageError::Generic(msg) if msg.contains("not found")
+            );
+            let status = if is_missing {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            err_response(status, e.to_string())
+        }
     }
 }
 
@@ -173,16 +204,15 @@ pub async fn get_history(
     Path(id): Path<String>,
     Query(query): Query<HistoryQuery>,
 ) -> Response {
-    match messages::get_messages_by_session(&state.db, &id).await {
-        Ok(mut rows) => {
-            if let Some(limit) = query.limit {
-                if rows.len() as i64 > limit {
-                    let start = rows.len() - limit as usize;
-                    rows = rows.split_off(start);
-                }
-            }
-            Json(rows).into_response()
-        }
+    // Push the limit into SQL (`get_last_messages_by_session`) instead of
+    // fetching the whole session and truncating here — a long session used
+    // to re-read every message even for tiny `limit` values.
+    let result = match query.limit {
+        Some(limit) => messages::get_last_messages_by_session(&state.db, &id, limit).await,
+        None => messages::get_messages_by_session(&state.db, &id).await,
+    };
+    match result {
+        Ok(rows) => Json(rows).into_response(),
         Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
@@ -227,16 +257,33 @@ pub async fn fork_session(
 ) -> Response {
     let body = body.map(|Json(b)| b).unwrap_or_default();
 
-    let Ok(Some(source)) = sessions::get_session(&state.db, &id).await else {
-        return err_response(StatusCode::NOT_FOUND, "session not found");
+    // Distinguish a genuinely-missing source session (404) from a DB error
+    // (500) — the old `let Ok(Some(source)) = ... else { 404 }` collapsed a
+    // real failure into a misleading "session not found".
+    let source = match sessions::get_session(&state.db, &id).await {
+        Ok(Some(s)) => s,
+        Ok(None) => return err_response(StatusCode::NOT_FOUND, "session not found"),
+        Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
     let rows = match messages::get_messages_by_session(&state.db, &id).await {
         Ok(r) => r,
         Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
 
+    // An unknown `at_message_id` used to fork the ENTIRE history (the lookup
+    // resolved to `None`, indistinguishable from "no cutoff requested") —
+    // silently producing a fork the user didn't intend. Fail loudly instead.
     let cutoff_rowid = match &body.at_message_id {
-        Some(msg_id) => rows.iter().find(|r| &r.id == msg_id).map(|r| r.rowid),
+        Some(msg_id) => match rows.iter().find(|r| &r.id == msg_id) {
+            Some(r) => Some(r.rowid),
+            None => {
+                return err_response(
+                    StatusCode::NOT_FOUND,
+                    "This chat cannot be forked — the selected message no \
+                     longer exists in this session.",
+                );
+            }
+        },
         None => None,
     };
     let kept: Vec<&MessageRow> = rows
@@ -347,6 +394,68 @@ pub async fn approve_action(
     Json(decision.to_dict()).into_response()
 }
 
+// ---- POST .../compact -------------------------------------------------------
+
+/// Manual context compaction (`/compact`): folds the session's oldest
+/// un-compacted exchanges into memory, bypassing the automatic token
+/// threshold (`run_compaction`'s `force`). Returns the `CompactionResult`
+/// so the client can report "compacted N messages / X → Y tokens", or a
+/// `{"compacted": false}` when there was nothing to fold (summarizer
+/// disabled, no messages past the watermark, or another pass already holds
+/// the compaction lock).
+pub async fn compact_session(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    let session = match sessions::get_session(&state.db, &id).await {
+        Ok(Some(s)) => s,
+        Ok(None) => return err_response(StatusCode::NOT_FOUND, "session not found"),
+        Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+
+    let metadata: Value = session
+        .metadata
+        .as_ref()
+        .and_then(|m| serde_json::from_str(m).ok())
+        .unwrap_or(json!({}));
+    let effective_provider = metadata.get("provider").and_then(|v| v.as_str());
+
+    // Mirror `run_tool_loop`'s resolution: the session's own provider wins,
+    // otherwise the router's global default, then the daemon-wide cap. A
+    // failure to resolve a provider is not fatal here — compaction's token
+    // budget only *defines* the high/low watermarks; fall back to the
+    // configured `max_context_tokens` the way the loop does.
+    let context_length = state
+        .agent
+        .router()
+        .get_provider_id(effective_provider)
+        .ok()
+        .and_then(|pid| state.agent.router().context_length(&pid))
+        .unwrap_or(state.config.token_management.max_context_tokens);
+
+    let result = crate::agent::compaction::run_compaction(
+        &state.db,
+        &id,
+        state.agent.summarizer(),
+        &state.config.token_management,
+        &state.config.summarizer,
+        context_length,
+        true,
+    )
+    .await;
+
+    match result {
+        Some(r) => Json(json!({
+            "compacted": true,
+            "messages_compacted": r.messages_compacted,
+            "tokens_before": r.tokens_before,
+            "tokens_after": r.tokens_after,
+        }))
+        .into_response(),
+        None => Json(json!({"compacted": false})).into_response(),
+    }
+}
+
 // ---- POST .../send (SSE) ---------------------------------------------------
 
 #[derive(Debug, Deserialize)]
@@ -361,13 +470,13 @@ pub async fn send_message(
     Path(id): Path<String>,
     Json(body): Json<SendMessageRequest>,
 ) -> Response {
-    if sessions::get_session(&state.db, &id)
-        .await
-        .ok()
-        .flatten()
-        .is_none()
-    {
-        return err_response(StatusCode::NOT_FOUND, "session not found");
+    // 404 only when the session genuinely doesn't exist — a DB error is a
+    // 500, not another "session not found" (the old `.ok().flatten()` mapped
+    // real failures to 404 too).
+    match sessions::get_session(&state.db, &id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return err_response(StatusCode::NOT_FOUND, "session not found"),
+        Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 
     let (tx, rx) = mpsc::unbounded_channel::<SSEEvent>();

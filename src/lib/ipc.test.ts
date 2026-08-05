@@ -81,12 +81,20 @@ describe('ipc invoke wrappers', () => {
 
   it('activateProvider calls activate_provider with the id', () => {
     void ipc.activateProvider('p1');
-    expect(invokeMock).toHaveBeenCalledWith('activate_provider', { id: 'p1' });
+    expect(invokeMock).toHaveBeenCalledWith('activate_provider', { id: 'p1', sessionId: null });
   });
 
   it('activateProvider allows a null id (deactivate)', () => {
     void ipc.activateProvider(null);
-    expect(invokeMock).toHaveBeenCalledWith('activate_provider', { id: null });
+    expect(invokeMock).toHaveBeenCalledWith('activate_provider', { id: null, sessionId: null });
+  });
+
+  it('activateProvider forwards an optional session id for per-session stamping', () => {
+    void ipc.activateProvider('p2', 'session-1');
+    expect(invokeMock).toHaveBeenCalledWith('activate_provider', {
+      id: 'p2',
+      sessionId: 'session-1',
+    });
   });
 
   it('adaptivePathwayToggleSuggestions calls the right command with sessionId and paused', () => {

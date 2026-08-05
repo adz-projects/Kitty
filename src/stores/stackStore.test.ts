@@ -66,4 +66,24 @@ describe('stackStore.init', () => {
     expect(useStackStore.getState().status).toBe('ollama_down');
     expect(useStackStore.getState().detail).toBe('not running');
   });
+
+  it('retries the subscriptions on a later init when the first attempt fails', async () => {
+    // A failed subscription must NOT leave `subscribed` set, or every later
+    // init() would silently skip attaching listeners forever.
+    onStackStatus.mockRejectedValueOnce(new Error('listener failed'));
+
+    const { useStackStore } = await import('./stackStore');
+    await useStackStore.getState().init();
+    await useStackStore.getState().init();
+
+    // First onStackStatus call (init #1) rejected before onStartupPhase ran;
+    // init #2 successfully subscribed to both.
+    expect(onStackStatus).toHaveBeenCalledTimes(2);
+    expect(onStartupPhase).toHaveBeenCalledTimes(1);
+
+    // A third init must not re-subscribe now that #2 succeeded.
+    await useStackStore.getState().init();
+    expect(onStackStatus).toHaveBeenCalledTimes(2);
+    expect(onStartupPhase).toHaveBeenCalledTimes(1);
+  });
 });

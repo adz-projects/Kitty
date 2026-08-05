@@ -9,22 +9,26 @@ use tauri::AppHandle;
 /// Read an image file as a base64 data URL (for the background image, avoiding
 /// asset-protocol scope config).
 #[tauri::command]
-pub fn read_image_data_url(path: String) -> Result<String, String> {
-    use base64::Engine;
-    let bytes = std::fs::read(&path).map_err(|e| format!("could not read image: {e}"))?;
-    let ext = std::path::Path::new(&path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("png")
-        .to_ascii_lowercase();
-    let mime = match ext.as_str() {
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        _ => "image/png",
-    };
-    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-    Ok(format!("data:{mime};base64,{b64}"))
+pub async fn read_image_data_url(path: String) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || {
+        use base64::Engine;
+        let bytes = std::fs::read(&path).map_err(|e| format!("could not read image: {e}"))?;
+        let ext = std::path::Path::new(&path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("png")
+            .to_ascii_lowercase();
+        let mime = match ext.as_str() {
+            "jpg" | "jpeg" => "image/jpeg",
+            "gif" => "image/gif",
+            "webp" => "image/webp",
+            _ => "image/png",
+        };
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        Ok(format!("data:{mime};base64,{b64}"))
+    })
+    .await
+    .map_err(|e| format!("image read task panicked: {e}"))?
 }
 
 /// Write a UTF-8 text file (Phase 11 ChatML export). The path comes from the
@@ -37,18 +41,23 @@ pub fn write_file(path: String, content: String) -> Result<(), String> {
 /// Read a text file for inlining into a chat-only message (Phase 9). Rejects
 /// binaries and files over the cap (default 200 KB).
 #[tauri::command]
-pub fn read_text_file(path: String, max_bytes: Option<usize>) -> Result<String, String> {
-    let cap = max_bytes.unwrap_or(200 * 1024);
-    let meta = std::fs::metadata(&path).map_err(|e| format!("could not open file: {e}"))?;
-    if meta.len() as usize > cap {
-        return Err(format!(
-            "File is too large to attach (> {} KB).",
-            cap / 1024
-        ));
-    }
-    let bytes = std::fs::read(&path).map_err(|e| format!("could not read file: {e}"))?;
-    String::from_utf8(bytes)
-        .map_err(|_| "That looks like a binary file — only text can be attached here.".to_string())
+pub async fn read_text_file(path: String, max_bytes: Option<usize>) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || {
+        let cap = max_bytes.unwrap_or(200 * 1024);
+        let meta = std::fs::metadata(&path).map_err(|e| format!("could not open file: {e}"))?;
+        if meta.len() as usize > cap {
+            return Err(format!(
+                "File is too large to attach (> {} KB).",
+                cap / 1024
+            ));
+        }
+        let bytes = std::fs::read(&path).map_err(|e| format!("could not read file: {e}"))?;
+        String::from_utf8(bytes).map_err(|_| {
+            "That looks like a binary file — only text can be attached here.".to_string()
+        })
+    })
+    .await
+    .map_err(|e| format!("file read task panicked: {e}"))?
 }
 
 /// A file attached to a chat, classified as UTF-8 text or binary (Round-2 item 13).
@@ -67,24 +76,34 @@ pub struct FileAttachment {
 /// longer rejected. Capped (default 25 MB — large enough for a typical photo)
 /// so we don't inline huge payloads.
 #[tauri::command]
-pub fn read_file_any(path: String, max_bytes: Option<usize>) -> Result<FileAttachment, String> {
-    let cap = max_bytes.unwrap_or(25 * 1024 * 1024);
-    let name = std::path::Path::new(&path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(&path)
-        .to_string();
-    let meta = std::fs::metadata(&path).map_err(|e| format!("could not open file: {e}"))?;
-    if meta.len() as usize > cap {
-        return Err(format!(
-            "File is too large to attach (> {} KB).",
-            cap / 1024
-        ));
-    }
-    let bytes = std::fs::read(&path).map_err(|e| format!("could not read file: {e}"))?;
+pub async fn read_file_any(path: String, max_bytes: Option<usize>) -> Result<FileAttachment, String> {
+    tokio::task::spawn_blocking(move || {
+        let cap = max_bytes.unwrap_or(25 * 1024 * 1024);
+        let name = std::path::Path::new(&path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(&path)
+            .to_string();
+        let meta = std::fs::metadata(&path).map_err(|e| format!("could not open file: {e}"))?;
+        if meta.len() as usize > cap {
+            return Err(format!(
+                "File is too large to attach (> {} KB).",
+                cap / 1024
+            ));
+        }
+        let bytes = std::fs::read(&path).map_err(|e| format!("could not read file: {e}"))?;
+        read_file_any_from_bytes(bytes, &name)
+    })
+    .await
+    .map_err(|e| format!("file read task panicked: {e}"))?
+}
+
+/// Pure half of `read_file_any`'s classification (kept small and blocking-free
+/// so the wrapping `spawn_blocking` closure stays obvious).
+fn read_file_any_from_bytes(bytes: Vec<u8>, name: &str) -> Result<FileAttachment, String> {
     match String::from_utf8(bytes) {
         Ok(text) => Ok(FileAttachment {
-            name,
+            name: name.to_string(),
             kind: "text".into(),
             content: text,
             mime: Some("text/plain".into()),
@@ -92,7 +111,7 @@ pub fn read_file_any(path: String, max_bytes: Option<usize>) -> Result<FileAttac
         Err(e) => {
             use base64::Engine;
             let bytes = e.into_bytes();
-            let ext = std::path::Path::new(&path)
+            let ext = std::path::Path::new(name)
                 .extension()
                 .and_then(|x| x.to_str())
                 .unwrap_or("")
@@ -107,7 +126,7 @@ pub fn read_file_any(path: String, max_bytes: Option<usize>) -> Result<FileAttac
             };
             let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
             Ok(FileAttachment {
-                name,
+                name: name.to_string(),
                 kind: "binary".into(),
                 content: format!("data:{mime};base64,{b64}"),
                 mime: Some(mime.to_string()),
@@ -235,40 +254,44 @@ const LIST_DIRECTORY_MAX_ENTRIES: usize = 500;
 /// Explorer). Skips hidden files (dotfiles) and directories; returns at most
 /// `LIST_DIRECTORY_MAX_ENTRIES`, newest-modified first.
 #[tauri::command]
-pub fn list_directory(path: String) -> Result<Vec<FileEntry>, String> {
-    let dir = PathBuf::from(&path);
-    let entries =
-        std::fs::read_dir(&dir).map_err(|e| format!("could not list directory {path}: {e}"))?;
+pub async fn list_directory(path: String) -> Result<Vec<FileEntry>, String> {
+    tokio::task::spawn_blocking(move || {
+        let dir = PathBuf::from(&path);
+        let entries = std::fs::read_dir(&dir)
+            .map_err(|e| format!("could not list directory {path}: {e}"))?;
 
-    let mut files: Vec<FileEntry> = entries
-        .filter_map(|entry| entry.ok())
-        .filter_map(|entry| {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with('.') {
-                return None;
-            }
-            let meta = entry.metadata().ok()?;
-            if !meta.is_file() {
-                return None;
-            }
-            let modified = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            Some(FileEntry {
-                name,
-                path: entry.path().to_string_lossy().to_string(),
-                size: meta.len(),
-                modified,
+        let mut files: Vec<FileEntry> = entries
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with('.') {
+                    return None;
+                }
+                let meta = entry.metadata().ok()?;
+                if !meta.is_file() {
+                    return None;
+                }
+                let modified = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                Some(FileEntry {
+                    name,
+                    path: entry.path().to_string_lossy().to_string(),
+                    size: meta.len(),
+                    modified,
+                })
             })
-        })
-        .collect();
+            .collect();
 
-    files.sort_by_key(|f| std::cmp::Reverse(f.modified));
-    files.truncate(LIST_DIRECTORY_MAX_ENTRIES);
-    Ok(files)
+        files.sort_by_key(|f| std::cmp::Reverse(f.modified));
+        files.truncate(LIST_DIRECTORY_MAX_ENTRIES);
+        Ok(files)
+    })
+    .await
+    .map_err(|e| format!("directory list task panicked: {e}"))?
 }
 
 #[cfg(test)]

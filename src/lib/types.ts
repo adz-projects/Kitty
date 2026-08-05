@@ -689,11 +689,6 @@ export interface ApprovalNeededEvent {
   options: ApprovalOption[];
 }
 
-export interface ModeEvent {
-  session_id: string;
-  mode: string;
-}
-
 // --- Sessions / filesystem (Phase 4) ---
 
 /** Mirrors src-tauri PathInfo. */

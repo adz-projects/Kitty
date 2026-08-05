@@ -104,6 +104,17 @@ impl SseTransport {
             .send()
             .await
             .map_err(|e| MCPServerError::Transport(e.to_string()))?;
+        // A non-2xx reply used to be parsed as a JSON response anyway — a
+        // 500/HTML error body would fail the `.json()` parse with a confusing
+        // "transport error" (or, for an HTML page that happens to start with
+        // `{`, be misread as a *successful* result). Check the status first.
+        let status_code = resp.status().as_u16();
+        if !(200..300).contains(&status_code) {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(MCPServerError::Transport(format!(
+                "MCP request '{method}' failed with HTTP {status_code}: {text}"
+            )));
+        }
         let data: Value = resp
             .json()
             .await
@@ -122,12 +133,23 @@ impl SseTransport {
 
     async fn send_notification(&self, method: &str, params: Value) -> Result<(), MCPServerError> {
         let body = json!({"jsonrpc": "2.0", "method": method, "params": params});
-        self.client
+        let resp = self
+            .client
             .post(&self.message_url)
             .json(&body)
             .send()
             .await
             .map_err(|e| MCPServerError::Transport(e.to_string()))?;
+        // Previously the response (and its status) was simply dropped, so a
+        // failed notification looked like success — the server could be
+        // rejecting every message and the client would never notice.
+        let status_code = resp.status().as_u16();
+        if !(200..300).contains(&status_code) {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(MCPServerError::Transport(format!(
+                "MCP notification '{method}' failed with HTTP {status_code}: {text}"
+            )));
+        }
         Ok(())
     }
 
@@ -176,7 +198,7 @@ impl SseTransport {
     }
 
     /// Stateless POST-only transport — nothing to tear down.
-    pub async fn shutdown(self) {}
+    pub async fn shutdown(&self) {}
 }
 
 #[cfg(test)]
@@ -201,5 +223,35 @@ mod tests {
             sse_url_to_message_url("https://sse.example.com/mcp/sse"),
             "https://sse.example.com/mcp/message"
         );
+    }
+
+    /// Regression (WS4-3): a non-2xx reply to the `initialize` request used to
+    /// be misread as success (dropped response status); it must fail `connect`.
+    #[tokio::test]
+    async fn non_success_status_fails_connect() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/message")
+            .with_status(500)
+            .with_body("boom")
+            .expect(1)
+            .create_async()
+            .await;
+
+        let result = SseTransport::connect(format!("{}/sse", server.url()), None).await;
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("expected connect to fail on a non-2xx initialize"),
+        };
+        match err {
+            MCPServerError::Transport(msg) => {
+                assert!(
+                    msg.contains("HTTP 500"),
+                    "transport error should mention the HTTP status: {msg}"
+                );
+            }
+            other => panic!("expected a Transport error, got {other:?}"),
+        }
+        mock.assert_async().await;
     }
 }

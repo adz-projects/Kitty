@@ -21,7 +21,6 @@ const POLL_INTERVAL_MS = 5000;
 export function ArtifactsPane() {
   const artifacts = useChatStore((s) => s.artifacts);
   const cwd = useChatStore((s) => s.cwd);
-  const clearArtifacts = useChatStore((s) => s.clearArtifacts);
   const pruneMissingArtifacts = useChatStore((s) => s.pruneMissingArtifacts);
   const refreshArtifactsFromDisk = useChatStore((s) => s.refreshArtifactsFromDisk);
 
@@ -42,13 +41,13 @@ export function ArtifactsPane() {
     <aside className="artifacts-pane">
       <div className="artifacts-head">
         <span>Artifacts ({artifacts.length})</span>
-        {artifacts.length > 0 && (
+        {cwd && (
           <button
             className="link"
-            title="Clear the list (does not delete the files)"
-            onClick={clearArtifacts}
+            title="Open this session's working folder in Explorer"
+            onClick={() => void ipc.openPath(cwd)}
           >
-            Clear
+            Open folder
           </button>
         )}
       </div>
@@ -79,7 +78,15 @@ function ArtifactCard({ artifact }: { artifact: Artifact }) {
       <div className="artifact-actions">
         <button onClick={() => void ipc.openPath(artifact.path)}>Open</button>
         <button onClick={() => void ipc.revealPath(artifact.path)}>Show in folder</button>
-        <button onClick={() => void navigator.clipboard.writeText(artifact.path)}>Copy path</button>
+        <button
+          onClick={() =>
+            void navigator.clipboard.writeText(artifact.path).catch(() => {
+              /* clipboard may be unavailable */
+            })
+          }
+        >
+          Copy path
+        </button>
       </div>
     </div>
   );

@@ -22,23 +22,33 @@ pub struct ProviderView {
     pub active: bool,
 }
 
-fn provider_views(cfg: &Config) -> Vec<ProviderView> {
-    cfg.providers
-        .iter()
-        .map(|p| ProviderView {
+/// Async — `has_secret` is a blocking Windows Credential Manager IPC call per
+/// profile, so this runs off the main thread and offloads each lookup through
+/// `get_secret_async` (a `list_providers` call with many profiles would
+/// otherwise block the command thread for the full round of OS dialogs).
+async fn provider_views(cfg: &Config) -> Vec<ProviderView> {
+    let mut views = Vec::with_capacity(cfg.providers.len());
+    for p in &cfg.providers {
+        let has_secret = providers::get_secret_async(&p.id).await.is_some();
+        views.push(ProviderView {
             network_tier: p.network_tier(),
-            has_secret: providers::has_secret(&p.id),
+            has_secret,
             active: cfg.active_provider_id.as_deref() == Some(&p.id),
             profile: p.clone(),
-        })
-        .collect()
+        });
+    }
+    views
 }
 
 /// List provider profiles with derived tier / secret / active flags.
 #[tauri::command]
-pub fn list_providers(state: tauri::State<'_, AppState>) -> Result<Vec<ProviderView>, String> {
-    let cfg = state.config.lock().unwrap();
-    Ok(provider_views(&cfg))
+pub async fn list_providers(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<ProviderView>, String> {
+    // Snapshot the config out of the lock — the async secret lookups below
+    // must not hold the global config Mutex across their awaited OS calls.
+    let cfg = state.config.lock().unwrap().clone();
+    Ok(provider_views(&cfg).await)
 }
 
 /// Create or update a provider profile. `secret`, when present, is stored in the
@@ -161,8 +171,17 @@ pub async fn test_active_provider_connection(
 /// non-functioning target is rejected and the old provider stays active —
 /// see `providers::test_connection`), then persists the choice and
 /// re-registers it with BigTiny over REST (no daemon restart needed).
+///
+/// `session_id` (optional) is the invoking window's *active session*: when
+/// given, only that session is stamped with the newly-active provider/model
+/// (per-session isolation). Other open windows' sessions keep theirs —
+/// provider is resolved per session at send time, not globally.
 #[tauri::command]
-pub async fn activate_provider(app: AppHandle, id: Option<String>) -> Result<(), String> {
+pub async fn activate_provider(
+    app: AppHandle,
+    id: Option<String>,
+    session_id: Option<String>,
+) -> Result<(), String> {
     if id.is_none() {
         return Err("A provider must be active — add one in Settings → Providers.".to_string());
     }
@@ -185,6 +204,7 @@ pub async fn activate_provider(app: AppHandle, id: Option<String>) -> Result<(),
         let cfg = state.config.lock().unwrap();
         providers::active_ollama_target(&cfg)
     };
+    let stamp_pid = id.clone();
     {
         let state = app.state::<AppState>();
         let mut cfg = state.config.lock().unwrap();
@@ -199,6 +219,23 @@ pub async fn activate_provider(app: AppHandle, id: Option<String>) -> Result<(),
     // BigTiny switches providers at runtime over REST — no daemon restart.
     // Registration failure is a hard error.
     crate::bigtiny::providers::sync_active_provider(&app).await?;
+
+    // Per-session stamp: apply the newly-active provider to the invoking
+    // window's own open session (if it has one), so this pick never bleeds
+    // into other windows' sessions. Resolved from the profile's first model,
+    // the same default `sync_active_provider`/`rebind_session` use.
+    if let (Some(sid), Some(pid)) = (session_id.as_deref(), stamp_pid.as_deref()) {
+        let default_model = {
+            let state = app.state::<AppState>();
+            let cfg = state.config.lock().unwrap();
+            cfg.providers
+                .iter()
+                .find(|p| p.id == pid)
+                .and_then(|p| p.models.first().cloned())
+                .unwrap_or_default()
+        };
+        crate::bigtiny::providers::set_session_provider(&app, sid, pid, &default_model).await;
+    }
 
     // Tell the frontend to re-sync provider state immediately (Round-2 item 4) —
     // without this the UI drifts until the next session create/load or health tick.
@@ -221,5 +258,27 @@ pub async fn activate_provider(app: AppHandle, id: Option<String>) -> Result<(),
             }
         }
     });
+    Ok(())
+}
+
+/// Stamp a single session with a specific provider/model (`PATCH
+/// /api/chat/{id}/config`) without touching the global active provider or
+/// any other session — the per-session isolation primitive. Used when
+/// resuming/restoring a session that should keep its own provider
+/// independent of what's currently active.
+#[tauri::command]
+pub async fn set_session_provider(
+    app: AppHandle,
+    session_id: String,
+    provider_id: String,
+    model: Option<String>,
+) -> Result<(), String> {
+    crate::bigtiny::providers::set_session_provider(
+        &app,
+        &session_id,
+        &provider_id,
+        model.as_deref().unwrap_or(""),
+    )
+    .await;
     Ok(())
 }

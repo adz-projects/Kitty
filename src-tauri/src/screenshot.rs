@@ -19,7 +19,8 @@ use base64::Engine as _;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits,
-    ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, SRCCOPY,
+    ReleaseDC, SelectObject, SetStretchBltMode, StretchBlt, BITMAPINFO, BITMAPINFOHEADER,
+    DIB_RGB_COLORS, HALFTONE, SRCCOPY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
@@ -106,6 +107,83 @@ fn capture_pixels(x: i32, y: i32, width: i32, height: i32) -> Result<Vec<u8>, St
     }
 }
 
+/// `capture_pixels`, but scales a `width × height` source rectangle down into
+/// a `target_w × target_h` bitmap via `StretchBlt` (HALFTONE for reasonable
+/// downsampling) *before* `GetDIBits`. This bounds the allocation to the
+/// target size — a huge virtual desktop (multi-monitor 4K/8K arrays) never
+/// allocates a full-resolution buffer just to shrink it.
+fn capture_pixels_scaled(
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    target_w: i32,
+    target_h: i32,
+) -> Result<Vec<u8>, String> {
+    if width <= 0 || height <= 0 || target_w <= 0 || target_h <= 0 {
+        return Err("capture region must have positive dimensions".to_string());
+    }
+    unsafe {
+        let screen_dc = GetDC(HWND(std::ptr::null_mut()));
+        if screen_dc.is_invalid() {
+            return Err("GetDC failed".to_string());
+        }
+        let mem_dc = CreateCompatibleDC(screen_dc);
+        let bitmap = CreateCompatibleBitmap(screen_dc, target_w, target_h);
+        if bitmap.is_invalid() {
+            ReleaseDC(HWND(std::ptr::null_mut()), screen_dc);
+            let _ = DeleteDC(mem_dc);
+            return Err("CreateCompatibleBitmap failed".to_string());
+        }
+        let old_obj = SelectObject(mem_dc, bitmap);
+
+        let _ = SetStretchBltMode(mem_dc, HALFTONE);
+        let blit_ok = StretchBlt(
+            mem_dc, 0, 0, target_w, target_h, screen_dc, x, y, width, height, SRCCOPY,
+        )
+        .as_bool();
+
+        let mut pixels = Vec::new();
+        if blit_ok {
+            let mut bmi = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: target_w,
+                    biHeight: -target_h, // negative = top-down DIB (matches image::RgbaImage's row order)
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: 0, // BI_RGB
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut buf = vec![0u8; (target_w as usize) * (target_h as usize) * 4];
+            let lines = GetDIBits(
+                mem_dc,
+                bitmap,
+                0,
+                target_h as u32,
+                Some(buf.as_mut_ptr() as *mut _),
+                &mut bmi,
+                DIB_RGB_COLORS,
+            );
+            if lines != 0 {
+                pixels = buf;
+            }
+        }
+
+        SelectObject(mem_dc, old_obj);
+        let _ = DeleteObject(bitmap);
+        let _ = DeleteDC(mem_dc);
+        ReleaseDC(HWND(std::ptr::null_mut()), screen_dc);
+
+        if pixels.is_empty() {
+            return Err("screen capture failed".to_string());
+        }
+        Ok(pixels)
+    }
+}
+
 /// BGRA (GDI's native order) -> RGBA data URL, reusing the exact PNG-encode
 /// pattern `hotkey.rs`'s `encode_clipboard_image` already uses for the
 /// clipboard-attach path.
@@ -133,10 +211,25 @@ fn bgra_to_png_data_url(mut pixels: Vec<u8>, width: u32, height: u32) -> Result<
 /// coordinates for the final `capture_region` call.
 pub fn capture_full_desktop_preview(
     max_dimension: u32,
-) -> Result<(String, i32, i32, i32, i32), String> {
+) -> Result<(String, crate::state::ScreenshotRegion), String> {
     let (x, y, w, h) = virtual_screen_rect();
-    let pixels = capture_pixels(x, y, w, h)?;
-    let full = image::RgbaImage::from_raw(w as u32, h as u32, {
+    if w <= 0 || h <= 0 {
+        return Err("no display detected for capture".to_string());
+    }
+    // Compute the target preview size first (the same math the old
+    // full-capture-then-resize path used), so the capture is *born* at that
+    // size rather than allocating the full virtual-desktop buffer to
+    // downsample — a huge multi-monitor desktop can't blow up memory.
+    let (pw, ph) = if w as u32 > h as u32 {
+        let scale = f64::from(max_dimension) / f64::from(w as u32);
+        (max_dimension, ((h as f64) * scale).round() as u32)
+    } else {
+        let scale = f64::from(max_dimension) / f64::from(h as u32);
+        (((w as f64) * scale).round() as u32, max_dimension)
+    };
+    let (pw, ph) = (pw.max(1), ph.max(1));
+    let pixels = capture_pixels_scaled(x, y, w, h, pw as i32, ph as i32)?;
+    let full = image::RgbaImage::from_raw(pw, ph, {
         let mut p = pixels;
         for px in p.chunks_exact_mut(4) {
             px.swap(0, 2);
@@ -145,28 +238,15 @@ pub fn capture_full_desktop_preview(
     })
     .ok_or_else(|| "captured pixel buffer size mismatch".to_string())?;
 
-    let (pw, ph) = if w as u32 > h as u32 {
-        let scale = f64::from(max_dimension) / f64::from(w as u32);
-        (max_dimension, ((h as f64) * scale).round() as u32)
-    } else {
-        let scale = f64::from(max_dimension) / f64::from(h as u32);
-        (((w as f64) * scale).round() as u32, max_dimension)
-    };
-    let preview = image::imageops::resize(
-        &full,
-        pw.max(1),
-        ph.max(1),
-        image::imageops::FilterType::Triangle,
-    );
     let mut buf = Vec::new();
-    image::DynamicImage::ImageRgba8(preview)
+    image::DynamicImage::ImageRgba8(full)
         .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
         .map_err(|e| e.to_string())?;
     let data_url = format!(
         "data:image/png;base64,{}",
         general_purpose::STANDARD.encode(&buf)
     );
-    Ok((data_url, x, y, w, h))
+    Ok((data_url, (x, y, w, h)))
 }
 
 /// Fresh, targeted, full-resolution capture of exactly the selected region

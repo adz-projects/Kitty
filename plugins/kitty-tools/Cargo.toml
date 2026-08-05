@@ -30,6 +30,19 @@ regex = "1"
 zip = { version = "8", default-features = false, features = ["deflate"] }
 quick-xml = "0.41"
 dirs = "5"
+# Read-only Excel workbook access (`lean_excel_inspect`/`lean_excel_read_rows`),
+# ported from `kitty-docs-web`'s openpyxl usage. Deliberately read-only: any
+# spreadsheet *write* goes through the existing file tools as CSV (see the
+# plan) rather than reintroducing an xlsx writer, keeping this small frozen
+# binary lean. Broader than openpyxl in one respect: calamine also reads
+# .xls/.ods, which openpyxl couldn't; the JSON envelope is unchanged.
+calamine = { version = "0.26", features = ["dates"] }
+# Pure-Rust PDF reading (`lean_pdf_read_text`/`lean_pdf_read_outline`), ported
+# from `kitty-docs-web`'s PyMuPDF usage. Text layout differs from PyMuPDF's
+# (lopdf does plain per-page text extraction, no markdown layout pass) — an
+# accepted divergence documented in docs/VERSIONS.md, same as kitty-web's
+# DDG-scrape/htmd substitutions.
+lopdf = "0.34"
 
 [profile.release]
 opt-level = "z"

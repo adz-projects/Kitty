@@ -3,7 +3,9 @@
 //! tests possible (call the plain functions in-process, no MCP transport).
 
 pub mod cache;
+pub mod excel;
 pub mod fs;
+pub mod pdf;
 pub mod scratchpad;
 pub mod shell;
 pub mod viz;

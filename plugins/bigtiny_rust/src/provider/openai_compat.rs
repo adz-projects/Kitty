@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use super::base::{
     classify_provider_error, Delta, HealthStatus, ModelInfo, Provider, SamplingParams,
@@ -18,17 +19,23 @@ pub struct OpenAICompatibleProvider {
     pub config: ProviderConfig,
     client: reqwest::Client,
     tailscale: Arc<TailscaleClient>,
+    /// SSE idle-read timeout — if no bytes arrive for this long, the stream
+    /// is terminated with a transient error (see `parse_openai_sse`). Per
+    /// provider, from the config blob's `idle_timeout_secs`, default 300s.
+    idle_timeout: Duration,
 }
 
 impl OpenAICompatibleProvider {
     pub const DEFAULT_MODEL: &'static str = "gpt-4o";
 
     pub fn new(provider_id: &str, config: ProviderConfig, tailscale: Arc<TailscaleClient>) -> Self {
+        let idle_timeout = config.idle_timeout();
         Self {
             provider_id: provider_id.into(),
             client: reqwest::Client::new(),
             config,
             tailscale,
+            idle_timeout,
         }
     }
 
@@ -45,43 +52,112 @@ impl OpenAICompatibleProvider {
         0
     }
 
-    /// Merges every `role: "system"` message into a single one at the front
-    /// of the array, preserving the relative order of everything else.
-    /// Context building layers up to 5 separate system messages (persona,
-    /// session override, writable-dir hint, anchored first message,
-    /// consolidated memory — see `agent/context/builder.rs`, plus an
-    /// occasional mid-conversation one from `emergency_trim`). Many chat
-    /// templates only special-case `messages[0]` (and sometimes `[1]`) as a
-    /// mergeable leading system turn and silently drop any system-role
-    /// message beyond that position instead of rendering it — observed on
-    /// Qwen's official ChatML/tool-calling template, whose `num_sys` never
-    /// exceeds 2. Left alone, everything past the second system layer just
-    /// vanishes from the model's context on affected backends, and the
-    /// dangling `<|im_start|>system` markup around what *does* survive can
-    /// leave the model confused about turn boundaries. Mirrors what
-    /// `AnthropicProvider::chat_completion` already does when collapsing
-    /// system messages into Anthropic's single `system` string field.
+    /// Merges the contiguous *leading* run of `role: "system"` messages into a
+    /// single one at the front of the array, leaving everything else (and its
+    /// relative order) untouched.
+    ///
+    /// Context building layers up to 5 separate system messages at the head
+    /// (persona, session override, writable-dir hint, anchored first message,
+    /// consolidated memory — see `agent/context/builder.rs`), plus an
+    /// occasional *mid-conversation* one from `emergency_trim` / the budget
+    /// loop. Many chat templates only special-case `messages[0]` (and
+    /// sometimes `[1]`) as a mergeable leading system turn and silently drop
+    /// any system-role message beyond that position instead of rendering it —
+    /// observed on Qwen's official ChatML/tool-calling template, whose
+    /// `num_sys` never exceeds 2. Merging the leading run keeps the front
+    /// block at `num_sys == 1` (within that limit) while the non-leading
+    /// system messages stay rendered.
+    ///
+    /// Only the leading run is merged: hoisting *every* system message to the
+    /// front (the old behavior) moved per-turn tail hints / mid-conversation
+    /// markers out of their in-stream position, which defeats KV-prefix
+    /// caching for backends keyed on a stable prompt head. Mirrors what
+    /// `AnthropicProvider::chat_completion` does for its single `system`
+    /// string field.
     fn merge_system_messages(messages: Vec<Value>) -> Vec<Value> {
+        let mut out = Vec::new();
+        let mut iter = messages.into_iter();
+
         let mut system_parts: Vec<String> = Vec::new();
-        let mut rest: Vec<Value> = Vec::new();
-        for msg in messages {
-            if msg["role"] == "system" {
-                if let Some(c) = msg["content"].as_str() {
-                    system_parts.push(c.to_string());
+        // Consume the contiguous leading system run only; stop at the first
+        // non-system message and keep processing the rest verbatim below.
+        loop {
+            match iter.next() {
+                Some(msg) if msg["role"] == "system" => {
+                    if let Some(c) = msg["content"].as_str() {
+                        system_parts.push(c.to_string());
+                    }
                 }
-            } else {
-                rest.push(msg);
+                Some(msg) => {
+                    out.push(msg);
+                    break;
+                }
+                None => break,
             }
         }
-        if system_parts.is_empty() {
-            return rest;
+
+        if !system_parts.is_empty() {
+            out.insert(0, serde_json::json!({
+                "role": "system",
+                "content": system_parts.join("\n\n"),
+            }));
         }
-        let mut merged = vec![serde_json::json!({
-            "role": "system",
-            "content": system_parts.join("\n\n"),
-        })];
-        merged.extend(rest);
-        merged
+        out.extend(iter);
+        out
+    }
+
+    /// Convert `tool_calls[].function.arguments` in assistant messages to the
+    /// JSON string the OpenAI-compatible wire format requires.
+    ///
+    /// Internally the agent loop carries tool-call arguments as a parsed JSON
+    /// `Value` (object) everywhere — the provider stream fragments parse the
+    /// arguments text into a `Value` (`parse_openai_sse`'s tool-call flush),
+    /// `build_assistant_message` persists it as-is, and history reloaded from
+    /// the DB has the same shape. The OpenAI/OpenRouter/Azure chat-completions
+    /// schema, however, insists `function.arguments` is a JSON **string** —
+    /// sending an object yields:
+    ///
+    /// `Invalid type for 'input[3].arguments': expected a string, but got an
+    /// object instead.` (400, `invalid_type`) — observed via OpenRouter
+    /// fanning out to Azure/OpenAI once a session has one tool-calling turn
+    /// in its history.
+    ///
+    /// This runs at send time so every message source is covered (fresh
+    /// turn, reloaded history, compaction survivors) regardless of how it
+    /// was built; already-string arguments (some backends stream a string
+    /// and our parse would have normalized them, but third-party-built
+    /// messages can arrive string-shaped) are left untouched. The Anthropic
+    /// provider is deliberately unaffected: its `convert_tool_calls` maps
+    /// `arguments` to the `input` field, which Anthropic expects as an object.
+    fn stringify_tool_call_arguments(messages: Vec<Value>) -> Vec<Value> {
+        messages
+            .into_iter()
+            .map(|mut msg| {
+                if msg["role"] != "assistant" {
+                    return msg;
+                }
+                let Some(tool_calls) = msg.get_mut("tool_calls").and_then(|v| v.as_array_mut())
+                else {
+                    return msg;
+                };
+                for tc in tool_calls.iter_mut() {
+                    let Some(args) = tc
+                        .get_mut("function")
+                        .and_then(|f| f.as_object_mut())
+                        .and_then(|f| f.get_mut("arguments"))
+                    else {
+                        continue;
+                    };
+                    if args.is_string() {
+                        continue;
+                    }
+                    *args = Value::String(serde_json::to_string(args).unwrap_or_else(
+                        |_| "{}".to_string(),
+                    ));
+                }
+                msg
+            })
+            .collect()
     }
 
     /// If `url`'s host is a Tailscale peer with a discoverable direct (LAN)
@@ -144,6 +220,10 @@ impl Provider for OpenAICompatibleProvider {
         let model = self.resolve_model(model.as_deref());
         let url = format!("{}/v1/chat/completions", self.config.base_url);
         let messages = Self::merge_system_messages(messages);
+        // History can carry tool-call arguments as objects (built this way
+        // throughout the daemon) but OpenAI-compatible backends require them
+        // as JSON strings — normalize before serializing the body.
+        let messages = Self::stringify_tool_call_arguments(messages);
 
         let mut body = serde_json::json!({
             "model": model,
@@ -214,7 +294,7 @@ impl Provider for OpenAICompatibleProvider {
 
         // Use bytes_stream from the stream feature
         let stream = resp.bytes_stream();
-        let deltas = parse_openai_sse(stream);
+        let deltas = parse_openai_sse(stream, self.idle_timeout);
         Ok(Box::pin(deltas))
     }
 
@@ -321,10 +401,20 @@ struct PendingToolCall {
     arguments: String,
 }
 
+type RawBytesStream = Pin<Box<dyn Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>>;
+
 struct OpenAISSEStream {
-    inner: Pin<Box<dyn Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>>,
+    /// `tokio_stream::adapters::Timeout` wraps the raw bytes stream: `Item =
+    /// Result<Result<Bytes, reqwest::Error>, Elapsed>` — the idle-read
+    /// timeout (per-provider `idle_timeout`) resets on every arriving chunk
+    /// and fires one `Err(Elapsed)` when nothing has arrived for that long. A
+    /// long, actively-streaming turn is never capped.
+    inner: Pin<Box<tokio_stream::adapters::Timeout<RawBytesStream>>>,
     tool_call_buf: HashMap<usize, PendingToolCall>,
-    buf: String,
+    /// Raw bytes between newlines, decoded to UTF-8 *only* at complete line
+    /// boundaries — decoding per TCP chunk (`String::from_utf8_lossy`) used to
+    /// corrupt a multi-byte UTF-8 character split across two chunks.
+    buf: Vec<u8>,
     pending: std::collections::VecDeque<Delta>,
     done: bool,
     /// The most recent non-null `finish_reason` seen on any choice. A
@@ -350,11 +440,16 @@ struct OpenAISSEStream {
 
 fn parse_openai_sse(
     stream: impl Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
+    idle_timeout: Duration,
 ) -> OpenAISSEStream {
+    use tokio_stream::StreamExt as _;
+    let inner = Box::pin(stream)
+        as Pin<Box<dyn Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>>;
+    let inner = inner.timeout(idle_timeout);
     OpenAISSEStream {
-        inner: Box::pin(stream),
+        inner: Box::pin(inner),
         tool_call_buf: HashMap::new(),
-        buf: String::new(),
+        buf: Vec::new(),
         pending: std::collections::VecDeque::new(),
         done: false,
         last_finish_reason: None,
@@ -423,6 +518,50 @@ impl OpenAISSEStream {
         };
         (text, reasoning)
     }
+    /// Flush any accumulated streamed tool calls as a single Delta. Shared by
+    /// the `[DONE]` path and the `Poll::Ready(None)` path so a stream that
+    /// ends *without* the `[DONE]` marker (some backends just close the
+    /// connection) still surfaces its complete tool calls instead of silently
+    /// dropping them.
+    fn flush_tool_call_buf(&mut self) {
+        if self.tool_call_buf.is_empty() {
+            return;
+        }
+        let tool_calls: Vec<super::base::ToolCall> = self
+            .tool_call_buf
+            .drain()
+            .map(|(_, buf)| {
+                // `function` must carry BOTH `name` and `arguments` — the
+                // agent loop reads `tc.function.get("name")` /
+                // `.get("arguments")`. The previous version set
+                // `function` to just the parsed arguments object with no
+                // `name` key at all (and never captured the streamed
+                // `function.name` fragment in the first place), so every
+                // tool call executed as an unnamed/"unknown" tool.
+                let arguments: Value = serde_json::from_str(&buf.arguments)
+                    .unwrap_or_else(|_| serde_json::json!({}));
+                let function = serde_json::json!({
+                    "name": buf.name.unwrap_or_default(),
+                    "arguments": arguments,
+                });
+                super::base::ToolCall {
+                    id: buf.id.unwrap_or_default(),
+                    r#type: buf.r#type.unwrap_or_else(|| "function".into()),
+                    function,
+                }
+            })
+            .collect();
+        self.pending.push_back(Delta {
+            role: "assistant".into(),
+            content: None,
+            reasoning: None,
+            tool_calls: Some(tool_calls),
+            finish_reason: self.last_finish_reason.take(),
+            usage: None,
+            error_type: None,
+        });
+    }
+
     /// Process one complete SSE line, pushing any resulting Delta(s) onto `pending`.
     /// Returns true if this line signalled stream completion (`[DONE]`).
     fn process_line(&mut self, line: &str) -> bool {
@@ -431,41 +570,7 @@ impl OpenAISSEStream {
         };
 
         if data == "[DONE]" {
-            if !self.tool_call_buf.is_empty() {
-                let tool_calls: Vec<super::base::ToolCall> = self
-                    .tool_call_buf
-                    .drain()
-                    .map(|(_, buf)| {
-                        // `function` must carry BOTH `name` and `arguments` — the
-                        // agent loop reads `tc.function.get("name")` /
-                        // `.get("arguments")`. The previous version set
-                        // `function` to just the parsed arguments object with no
-                        // `name` key at all (and never captured the streamed
-                        // `function.name` fragment in the first place), so every
-                        // tool call executed as an unnamed/"unknown" tool.
-                        let arguments: Value = serde_json::from_str(&buf.arguments)
-                            .unwrap_or_else(|_| serde_json::json!({}));
-                        let function = serde_json::json!({
-                            "name": buf.name.unwrap_or_default(),
-                            "arguments": arguments,
-                        });
-                        super::base::ToolCall {
-                            id: buf.id.unwrap_or_default(),
-                            r#type: buf.r#type.unwrap_or_else(|| "function".into()),
-                            function,
-                        }
-                    })
-                    .collect();
-                self.pending.push_back(Delta {
-                    role: "assistant".into(),
-                    content: None,
-                    reasoning: None,
-                    tool_calls: Some(tool_calls),
-                    finish_reason: self.last_finish_reason.take(),
-                    usage: None,
-                    error_type: None,
-                });
-            }
+            self.flush_tool_call_buf();
             return true;
         }
 
@@ -594,19 +699,44 @@ impl Stream for OpenAISSEStream {
             }
 
             match self.inner.as_mut().poll_next(cx) {
-                Poll::Ready(Some(Ok(chunk))) => {
-                    self.buf.push_str(&String::from_utf8_lossy(&chunk));
-                    while let Some(pos) = self.buf.find('\n') {
-                        let raw: String = self.buf.drain(..=pos).collect();
-                        let trimmed = raw.trim_end_matches(['\r', '\n']);
-                        if self.process_line(trimmed) {
+                Poll::Ready(Some(Ok(Ok(chunk)))) => {
+                    self.buf.extend_from_slice(&chunk);
+                    while let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
+                        let mut raw: Vec<u8> = self.buf.drain(..=pos).collect();
+                        while matches!(raw.last(), Some(&b'\r') | Some(&b'\n')) {
+                            raw.pop();
+                        }
+                        // Decode only at complete line boundaries — this is
+                        // what keeps a multi-byte UTF-8 char split across two
+                        // TCP chunks intact (see `buf`'s comment).
+                        let line = String::from_utf8(raw).unwrap_or_else(|e| {
+                            String::from_utf8_lossy(e.as_bytes()).into_owned()
+                        });
+                        if self.process_line(&line) {
                             self.done = true;
                         }
                     }
                     // Loop back: drain anything just queued, or poll inner again if
                     // this chunk had no complete `data:` line yet.
                 }
-                Poll::Ready(Some(Err(_))) => {
+                Poll::Ready(Some(Ok(Err(_)))) => {
+                    self.pending.push_back(Delta {
+                        role: "assistant".into(),
+                        content: None,
+                        reasoning: None,
+                        tool_calls: None,
+                        finish_reason: Some("error".into()),
+                        usage: None,
+                        error_type: Some("request".into()),
+                    });
+                    self.done = true;
+                }
+                // The idle-read timeout fired: no bytes arrived within
+                // `idle_timeout`. Surface it with the same transient-error
+                // shape as an ordinary stream error so `agent::loop_` treats
+                // an idle/stuck provider as a transient failure rather than
+                // hanging the turn.
+                Poll::Ready(Some(Err(_elapsed))) => {
                     self.pending.push_back(Delta {
                         role: "assistant".into(),
                         content: None,
@@ -619,6 +749,25 @@ impl Stream for OpenAISSEStream {
                     self.done = true;
                 }
                 Poll::Ready(None) => {
+                    // A trailing complete line with no final newline is still
+                    // a real SSE line — decode it before finishing.
+                    if !self.buf.is_empty() {
+                        let raw = std::mem::take(&mut self.buf);
+                        let line = String::from_utf8(raw).unwrap_or_else(|e| {
+                            String::from_utf8_lossy(e.as_bytes()).into_owned()
+                        });
+                        if self.process_line(&line) {
+                            self.done = true;
+                        }
+                    }
+                    // Flush any accumulated tool calls: some backends close
+                    // the stream without an explicit `[DONE]` marker, and
+                    // complete tool-call fragments would otherwise be lost.
+                    self.flush_tool_call_buf();
+                    if !self.pending.is_empty() {
+                        self.done = true;
+                        continue;
+                    }
                     return Poll::Ready(None);
                 }
                 Poll::Pending => {
@@ -641,7 +790,7 @@ mod sse_tests {
         let inner = stream::iter(vec![Ok::<bytes::Bytes, reqwest::Error>(
             bytes::Bytes::from(chunk),
         )]);
-        let deltas: Vec<Delta> = parse_openai_sse(inner).collect().await;
+        let deltas: Vec<Delta> = parse_openai_sse(inner, Duration::from_secs(300)).collect().await;
         let contents: Vec<String> = deltas.into_iter().filter_map(|d| d.content).collect();
         assert_eq!(contents, vec!["Hello".to_string(), " world".to_string()]);
     }
@@ -654,9 +803,73 @@ mod sse_tests {
             Ok::<bytes::Bytes, reqwest::Error>(bytes::Bytes::from(chunk1)),
             Ok::<bytes::Bytes, reqwest::Error>(bytes::Bytes::from(chunk2)),
         ]);
-        let deltas: Vec<Delta> = parse_openai_sse(inner).collect().await;
+        let deltas: Vec<Delta> = parse_openai_sse(inner, Duration::from_secs(300)).collect().await;
         let contents: Vec<String> = deltas.into_iter().filter_map(|d| d.content).collect();
         assert_eq!(contents, vec!["Hello".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn multi_byte_utf8_split_across_chunks_round_trips() {
+        // "café" — the é (U+00E9 = UTF-8 0xC3 0xA9) is split across the two
+        // chunks: chunk1 ends with the leading 0xC3 byte, chunk2 begins with
+        // 0xA9. The old per-chunk `String::from_utf8_lossy` decoded 0xC3 in
+        // isolation → replacement char, corrupting the text wherever a
+        // multi-byte char straddled a TCP chunk boundary.
+        let mut chunk1 = b"data: {\"choices\":[{\"delta\":{\"content\":\"caf".to_vec();
+        chunk1.push(0xC3);
+        let chunk2 = b"\xA9\"}}]}\n\ndata: [DONE]\n\n".to_vec();
+        let inner = stream::iter(vec![
+            Ok::<bytes::Bytes, reqwest::Error>(bytes::Bytes::from(chunk1)),
+            Ok::<bytes::Bytes, reqwest::Error>(bytes::Bytes::from(chunk2)),
+        ]);
+        let deltas: Vec<Delta> = parse_openai_sse(inner, Duration::from_secs(300))
+            .collect()
+            .await;
+        let contents: String = deltas.iter().filter_map(|d| d.content.clone()).collect();
+        assert_eq!(contents, "café");
+    }
+
+    #[tokio::test]
+    async fn complete_tool_calls_are_flushed_when_the_stream_ends_without_done() {
+        // Some backends close the connection without ever sending `[DONE]` —
+        // accumulated tool-call fragments used to be silently dropped on that
+        // path. Flush must surface the complete tool call.
+        let chunk = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"a.txt\\\"}\"}}]}}]}\n\n";
+        let inner = stream::iter(vec![Ok::<bytes::Bytes, reqwest::Error>(
+            bytes::Bytes::from(chunk),
+        )]);
+        let deltas: Vec<Delta> = parse_openai_sse(inner, Duration::from_secs(300))
+            .collect()
+            .await;
+        let tool_calls = deltas
+            .into_iter()
+            .find_map(|d| d.tool_calls)
+            .expect("expected a Delta carrying tool_calls");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id, "call_1");
+        assert_eq!(
+            tool_calls[0]
+                .function
+                .get("name")
+                .and_then(|v| v.as_str()),
+            Some("read_file")
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_read_timeout_terminates_a_silent_stream_as_a_transient_error() {
+        // A stream that never yields bytes: once `idle_timeout` elapses the
+        // wrapper fires, and we must surface the same transient-error Delta as
+        // the ordinary stream-error path (agent::loop_ treats that as a
+        // retryable failure rather than hanging the turn). A long,
+        // actively-streaming turn is never capped — only idle gaps are.
+        let silent = stream::pending::<Result<bytes::Bytes, reqwest::Error>>();
+        let deltas: Vec<Delta> = parse_openai_sse(silent, Duration::from_millis(50))
+            .collect()
+            .await;
+        let last = deltas.last().expect("expected at least the error Delta");
+        assert_eq!(last.error_type.as_deref(), Some("request"));
+        assert_eq!(last.finish_reason.as_deref(), Some("error"));
     }
 
     #[tokio::test]
@@ -665,9 +878,23 @@ mod sse_tests {
         let inner = stream::iter(vec![Ok::<bytes::Bytes, reqwest::Error>(
             bytes::Bytes::from(chunk),
         )]);
-        let deltas: Vec<Delta> = parse_openai_sse(inner).collect().await;
+        let deltas: Vec<Delta> = parse_openai_sse(inner, Duration::from_secs(300)).collect().await;
         assert_eq!(deltas.len(), 1);
         assert_eq!(deltas[0].content.as_deref(), Some("Hi"));
+    }
+
+    #[tokio::test]
+    async fn trailing_complete_line_without_newline_is_still_decoded() {
+        // A final `data:` line with no trailing `\n` is still a real SSE
+        // line — it must be decoded and surfaced at end-of-stream rather than
+        // dropped with the buffer.
+        let chunk = "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}";
+        let inner = stream::iter(vec![Ok::<bytes::Bytes, reqwest::Error>(
+            bytes::Bytes::from(chunk),
+        )]);
+        let deltas: Vec<Delta> = parse_openai_sse(inner, Duration::from_secs(300)).collect().await;
+        let contents: Vec<String> = deltas.into_iter().filter_map(|d| d.content).collect();
+        assert_eq!(contents, vec!["Hi".to_string()]);
     }
 
     #[tokio::test]
@@ -681,7 +908,7 @@ mod sse_tests {
         let inner = stream::iter(vec![Ok::<bytes::Bytes, reqwest::Error>(
             bytes::Bytes::from(chunk),
         )]);
-        let deltas: Vec<Delta> = parse_openai_sse(inner).collect().await;
+        let deltas: Vec<Delta> = parse_openai_sse(inner, Duration::from_secs(300)).collect().await;
         let tool_calls = deltas
             .into_iter()
             .find_map(|d| d.tool_calls)
@@ -715,7 +942,7 @@ mod sse_tests {
         let inner = stream::iter(vec![Ok::<bytes::Bytes, reqwest::Error>(
             bytes::Bytes::from(chunk),
         )]);
-        let deltas: Vec<Delta> = parse_openai_sse(inner).collect().await;
+        let deltas: Vec<Delta> = parse_openai_sse(inner, Duration::from_secs(300)).collect().await;
         let content: String = deltas.iter().filter_map(|d| d.content.clone()).collect();
         let reasoning: String = deltas.iter().filter_map(|d| d.reasoning.clone()).collect();
         assert_eq!(content, "answer");
@@ -733,7 +960,7 @@ mod sse_tests {
         let inner = stream::iter(vec![Ok::<bytes::Bytes, reqwest::Error>(
             bytes::Bytes::from(chunk),
         )]);
-        let deltas: Vec<Delta> = parse_openai_sse(inner).collect().await;
+        let deltas: Vec<Delta> = parse_openai_sse(inner, Duration::from_secs(300)).collect().await;
         let content: String = deltas.iter().filter_map(|d| d.content.clone()).collect();
         let reasoning: String = deltas.iter().filter_map(|d| d.reasoning.clone()).collect();
         assert_eq!(content, "answer");
@@ -746,7 +973,7 @@ mod sse_tests {
         let inner = stream::iter(vec![Ok::<bytes::Bytes, reqwest::Error>(
             bytes::Bytes::from(chunk),
         )]);
-        let deltas: Vec<Delta> = parse_openai_sse(inner).collect().await;
+        let deltas: Vec<Delta> = parse_openai_sse(inner, Duration::from_secs(300)).collect().await;
         let usage = deltas
             .iter()
             .find_map(|d| d.usage.as_ref())
@@ -767,7 +994,7 @@ mod sse_tests {
         let inner = stream::iter(vec![Ok::<bytes::Bytes, reqwest::Error>(
             bytes::Bytes::from(chunk),
         )]);
-        let deltas: Vec<Delta> = parse_openai_sse(inner).collect().await;
+        let deltas: Vec<Delta> = parse_openai_sse(inner, Duration::from_secs(300)).collect().await;
         assert!(
             deltas
                 .iter()
@@ -948,7 +1175,12 @@ mod sse_tests {
     }
 
     #[test]
-    fn merge_system_messages_joins_every_system_entry_into_one_leading_message() {
+    fn merge_system_messages_joins_only_the_leading_system_run() {
+        // Regression for the KV-prefix-cache breakage: the old code hoisted
+        // *every* system message (including `memory`, below) to the front,
+        // moving it out of its in-stream tail position. Only the contiguous
+        // leading run (persona + tool hints) may be merged; the tail system
+        // message must stay exactly where it was, unmerged.
         let messages = vec![
             serde_json::json!({"role": "system", "content": "persona"}),
             serde_json::json!({"role": "system", "content": "tool hints"}),
@@ -957,11 +1189,16 @@ mod sse_tests {
             serde_json::json!({"role": "assistant", "content": "hello"}),
         ];
         let merged = OpenAICompatibleProvider::merge_system_messages(messages);
-        assert_eq!(merged.len(), 3);
+        assert_eq!(merged.len(), 4);
+        // Leading run merged into a single front system block...
         assert_eq!(merged[0]["role"], "system");
-        assert_eq!(merged[0]["content"], "persona\n\ntool hints\n\nmemory");
+        assert_eq!(merged[0]["content"], "persona\n\ntool hints");
+        // ...everything else keeps its original position and shape.
         assert_eq!(merged[1]["role"], "user");
-        assert_eq!(merged[2]["role"], "assistant");
+        assert_eq!(merged[1]["content"], "hi");
+        assert_eq!(merged[2]["role"], "system");
+        assert_eq!(merged[2]["content"], "memory");
+        assert_eq!(merged[3]["role"], "assistant");
     }
 
     #[test]
@@ -972,6 +1209,75 @@ mod sse_tests {
         ];
         let merged = OpenAICompatibleProvider::merge_system_messages(messages.clone());
         assert_eq!(merged, messages);
+    }
+
+    #[test]
+    fn stringify_tool_call_arguments_turns_objects_into_json_strings() {
+        // The exact shape the agent loop builds and persists: arguments is a
+        // parsed JSON object. OpenAI/OpenRouter/Azure reject that with the
+        // "expected a string, but got an object" 400.
+        let messages = vec![serde_json::json!({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "arguments": {"path": "a.txt", "lines": 10}
+                }
+            }]
+        })];
+        let out = OpenAICompatibleProvider::stringify_tool_call_arguments(messages);
+        let args = out[0]["tool_calls"][0]["function"]["arguments"].clone();
+        assert!(args.is_string(), "arguments must be a string, got {args}");
+        assert_eq!(
+            serde_json::from_str::<Value>(args.as_str().unwrap()).unwrap(),
+            serde_json::json!({"path": "a.txt", "lines": 10})
+        );
+    }
+
+    #[test]
+    fn stringify_tool_call_arguments_leaves_strings_and_non_assistant_untouched() {
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "hi"}),
+            serde_json::json!({
+                "role": "assistant",
+                "content": "ok",
+                "tool_calls": [{
+                    "id": "call_2",
+                    "type": "function",
+                    "function": {"name": "t", "arguments": "{\"x\": 1}"}
+                }]
+            }),
+        ];
+        let out = OpenAICompatibleProvider::stringify_tool_call_arguments(messages);
+        // User message untouched (no tool_calls)...
+        assert!(out[0].get("tool_calls").is_none());
+        // ...and the already-string arguments are preserved verbatim.
+        assert_eq!(
+            out[1]["tool_calls"][0]["function"]["arguments"],
+            serde_json::json!("{\"x\": 1}")
+        );
+    }
+
+    #[test]
+    fn stringify_tool_call_arguments_tolerates_missing_or_malformed_arguments() {
+        let messages = vec![serde_json::json!({
+            "role": "assistant",
+            "content": "ok",
+            "tool_calls": [
+                {"id": "a", "type": "function", "function": {"name": "t"}},
+                {"id": "b", "type": "function", "function": {"name": "u", "arguments": ""}},
+            ]
+        })];
+        let out = OpenAICompatibleProvider::stringify_tool_call_arguments(messages);
+        // Missing arguments key is left absent; empty-string arguments stay a string.
+        assert!(out[0]["tool_calls"][0]["function"].get("arguments").is_none());
+        assert_eq!(
+            out[0]["tool_calls"][1]["function"]["arguments"],
+            serde_json::json!("")
+        );
     }
 
     #[tokio::test]

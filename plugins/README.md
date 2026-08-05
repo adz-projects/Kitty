@@ -15,18 +15,22 @@ in-tree at `plugins/bigtiny/`) follows the same Python freeze pipeline — see
 
 | Plugin | Language | Integration surface | Spawned by |
 |---|---|---|---|
-| `bigtiny` | Python | HTTP+SSE daemon (Kitty's chat backend) | Kitty (`src-tauri/src/lifecycle/bigtiny_proc.rs`) |
+| `bigtiny` | **Rust** (`plugins/bigtiny_rust/`) | HTTP+SSE daemon (Kitty's chat backend) | Kitty (`src-tauri/src/lifecycle/bigtiny_proc.rs`) |
 | `adaptive-pathway` | Python | HTTP sidecar (FastAPI/uvicorn, default port 8700) | Kitty (`src-tauri/src/lifecycle/adaptive_pathway_proc.rs`) |
 | `adaptive-pathway-mcp` | Python | stdio MCP server (`decide`/`record_outcome`/...) | BigTiny, registered via `src-tauri/src/bigtiny/mcp.rs` |
-| `kitty-tools` | **Rust** | stdio MCP server, 21 tools: shell/workspace/5 file/3 word/4 cache/4 scratchpad (always on) + 3 visualization tools: table/SVG diagram/chart (gated by its own env var) — no network calls | BigTiny, registered via `src-tauri/src/bigtiny/mcp.rs` — on by default |
-| `kitty-docs-web` | Python | stdio MCP server, 8 tools: 2 PDF, web scrape, 3 Excel, lean_web_search + lean_web_search_read_chunk (count-tiered: ≤5 normal Brave-with-DuckDuckGo-fallback, 6-10 queries both engines, >10 offloads to disk with a keyword index) | BigTiny, registered via `src-tauri/src/bigtiny/mcp.rs` — on by default |
-| `wasm-math-mcp` | Python | stdio MCP server (sandboxed Python/NumPy execution) | BigTiny, registered via `src-tauri/src/bigtiny/mcp.rs` — on by default |
+| `kitty-tools` | **Rust** | stdio MCP server, 21 tools: shell/workspace/5 file/3 word/4 cache/4 scratchpad (always on) + 4 visualization tools: table/SVG diagram/chart/Mermaid (gated by its own env var) — no network calls | BigTiny, registered via `src-tauri/src/bigtiny/mcp.rs` — on by default |
+| `kitty-docs-web` | Python | stdio MCP server, 8 tools: 2 PDF, web scrape, 3 Excel, lean_web_search + lean_web_search_read_chunk. **Retired** — its web tools moved to `kitty-web` and its PDF/Excel tools to `kitty-tools` (lopdf/calamine). Source kept in-tree as the behavioral oracle | — |
+| `kitty-web` | **Rust** | stdio MCP server, 3 tools: lean_web_search + lean_web_search_read_chunk (count-tiered: ≤5 normal Brave-with-DuckDuckGo-fallback, 6-10 queries both engines, >10 offloads to disk with a keyword index) + lean_web_scrape. Same tool names and response envelopes as the `kitty-docs-web` originals | BigTiny; stdio on desktop, in-process via `bigtiny_rust::mcp::builtin` where exec() isn't available |
+| `kitty-wasm` | **Rust** | stdio MCP server, 4 tools: execute_math_python / wasm_python_run (Python in a wasmtime+WASI sandbox), wasm_run_module (any WASI module), wasm_guest_status. No network, no filesystem beyond explicit mounts, runtime-enforced time/memory ceilings. Replaces the retired `wasm-math-mcp`; its CPython guest ships with the app (offline first use) | BigTiny; stdio on desktop, in-process via `bigtiny_rust::mcp::builtin` |
+| `wasm-math-mcp` | Python | **Retired** — superseded by `kitty-wasm`. Despite the name it was neither WebAssembly nor math tools: one tool (`execute_math_python`) running Python in a `multiprocessing` worker behind an AST allowlist (networkx, no NumPy). Source kept in-tree as the behavioral oracle | — |
 
-`replacement-mcp`, `brave-mcp-search`, and `visualizations` are **retired** —
-all of their tools now live inside `kitty-tools`/`kitty-docs-web` above.
+`replacement-mcp`, `brave-mcp-search`, `visualizations`, `kitty-docs-web`,
+and `wasm-math-mcp` are **retired** — all of their tools now live inside
+`kitty-tools`/`kitty-web`/`kitty-wasm` above.
 Their source stays in this directory, unbuilt (absent from `build.py`'s
-`PLUGINS` dict). `replacement-mcp`/`brave-mcp-search`'s source remains the
-oracle to re-verify those ports against if a behavioral gap ever surfaces;
+`PLUGINS` dict). `replacement-mcp`/`brave-mcp-search`/`kitty-docs-web`/
+`wasm-math-mcp`'s source remains the oracle to re-verify those ports against
+if a behavioral gap ever surfaces;
 `visualizations`' Rust rebuild deliberately diverges instead of porting it
 (three of its four diagram types were static clipart) — see
 `docs/PLUGINS.md`.

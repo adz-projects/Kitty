@@ -1,10 +1,10 @@
 <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="6" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
-        <path d="M 0 0 L 10 5 L 0 10 z" fill="#52525b"/>
+        <path d="M 0 0 L 10 5 L 0 10 z" fill="#7c7c86"/>
     </marker>
 
     <filter id="soft-shadow" x="-8%" y="-8%" width="116%" height="116%">
-        <feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#000000" flood-opacity="0.07"/>
+        <feDropShadow dx="0" dy="1" stdDeviation="2" flood-color="#000000" flood-opacity="0.05"/>
     </filter>
 
     <!-- Chart series fills: patterns rather than color alone, so series stay
@@ -23,36 +23,35 @@
     </pattern>
 
     <style>
-        .canvas-bg { fill: #fafafa; rx: 12px; }
-        .title-text { font-family: system-ui, -apple-system, sans-serif; font-size: 18px; font-weight: 700; fill: #09090b; text-anchor: middle; }
+        .canvas-bg { fill: #fbfbfc; rx: 12px; }
+        .title-text { font-family: system-ui, -apple-system, sans-serif; font-size: 18px; font-weight: 700; fill: #18181b; text-anchor: middle; }
 
         /* Node Styles */
-        .node-box { fill: #ffffff; stroke: #27272a; stroke-width: 2px; rx: 8px; filter: url(#soft-shadow); }
-        .node-box.pill { fill: #f4f4f5; stroke: #18181b; stroke-width: 2px; rx: 20px; filter: url(#soft-shadow); }
-        .node-box.decision { fill: #ffffff; stroke: #09090b; stroke-width: 2.5px; rx: 8px; filter: url(#soft-shadow); }
-        .node-triangle { fill: #f4f4f5; stroke: #27272a; stroke-width: 2px; stroke-linejoin: round; filter: url(#soft-shadow); }
+        .node-box { fill: #ffffff; stroke: #c9c9d1; stroke-width: 1.5px; rx: 10px; filter: url(#soft-shadow); }
+        .node-box.pill { fill: #f6f6f8; stroke: #b7b7c0; stroke-width: 1.5px; rx: 22px; filter: url(#soft-shadow); }
+        .node-triangle { fill: #f6f6f8; stroke: #b7b7c0; stroke-width: 1.5px; stroke-linejoin: round; filter: url(#soft-shadow); }
 
         /* Typography */
-        .node-text { font-family: system-ui, -apple-system, sans-serif; font-size: 12.5px; font-weight: 600; fill: #18181b; text-anchor: middle; dominant-baseline: middle; }
-        .badge-meta { font-family: system-ui, -apple-system, sans-serif; font-size: 8.5px; font-weight: 800; fill: #52525b; text-anchor: middle; letter-spacing: 0.6px; }
+        .node-text { font-family: system-ui, -apple-system, sans-serif; font-size: 12.5px; font-weight: 600; fill: #2a2a30; text-anchor: middle; dominant-baseline: middle; }
+        .badge-meta { font-family: system-ui, -apple-system, sans-serif; font-size: 8.5px; font-weight: 800; fill: #7c7c86; text-anchor: middle; letter-spacing: 0.6px; }
 
         /* Vectors */
-        .flow-path { stroke: #52525b; stroke-width: 2px; fill: none; marker-end: url(#arrow); stroke-linejoin: round; }
+        .flow-path { stroke: #7c7c86; stroke-width: 1.5px; fill: none; marker-end: url(#arrow); stroke-linejoin: round; }
 
         /* Badges */
-        .tag-bg-dark { fill: #18181b; stroke: #09090b; stroke-width: 1px; rx: 11px; }
-        .tag-text-light { font-family: system-ui, -apple-system, sans-serif; font-size: 10px; font-weight: 800; fill: #f4f4f5; text-anchor: middle; dominant-baseline: middle; }
-        .tag-bg-light { fill: #ffffff; stroke: #a1a1aa; stroke-width: 1.5px; rx: 11px; }
-        .tag-text-dark { font-family: system-ui, -apple-system, sans-serif; font-size: 10px; font-weight: 800; fill: #27272a; text-anchor: middle; dominant-baseline: middle; }
+        .tag-bg-dark { fill: #24242a; stroke: #18181b; stroke-width: 1px; rx: 11px; }
+        .tag-text-light { font-family: system-ui, -apple-system, sans-serif; font-size: 10px; font-weight: 800; fill: #f6f6f8; text-anchor: middle; dominant-baseline: middle; }
+        .tag-bg-light { fill: #ffffff; stroke: #b7b7c0; stroke-width: 1.25px; rx: 11px; }
+        .tag-text-dark { font-family: system-ui, -apple-system, sans-serif; font-size: 10px; font-weight: 800; fill: #24242a; text-anchor: middle; dominant-baseline: middle; }
 
         /* Swimlane & Journey Map Styles */
-        .lane-header { font-family: system-ui, -apple-system, sans-serif; font-size: 11px; font-weight: 800; fill: #52525b; letter-spacing: 0.8px; }
-        .lane-divider { stroke: #e4e4e7; stroke-width: 1px; }
-        .curve-line { fill: none; stroke: #18181b; stroke-width: 3px; stroke-linecap: round; }
-        .curve-dot { fill: #ffffff; stroke: #18181b; stroke-width: 3px; r: 6px; }
-        .pain-card { fill: #f4f4f5; stroke: #a1a1aa; stroke-width: 1px; rx: 6px; }
-        .pain-text { font-family: system-ui, -apple-system, sans-serif; font-size: 10.5px; font-weight: 600; fill: #27272a; text-anchor: middle; }
-        .journey-col-shade { fill: #f4f4f5; }
+        .lane-header { font-family: system-ui, -apple-system, sans-serif; font-size: 11px; font-weight: 800; fill: #6b6b75; letter-spacing: 0.8px; }
+        .lane-divider { stroke: #dddee3; stroke-width: 1px; }
+        .curve-line { fill: none; stroke: #24242a; stroke-width: 2.5px; stroke-linecap: round; }
+        .curve-dot { fill: #ffffff; stroke: #24242a; stroke-width: 2.5px; r: 6px; }
+        .pain-card { fill: #f6f6f8; stroke: #c9c9d1; stroke-width: 1px; rx: 6px; }
+        .pain-text { font-family: system-ui, -apple-system, sans-serif; font-size: 10.5px; font-weight: 600; fill: #2a2a30; text-anchor: middle; }
+        .journey-col-shade { fill: #f4f4f6; }
 
         /* Chart axes and grid */
         .grid-line { stroke: #e4e4e7; stroke-width: 1px; }

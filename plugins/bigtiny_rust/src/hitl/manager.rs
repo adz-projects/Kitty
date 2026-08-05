@@ -1,7 +1,9 @@
 use std::collections::HashMap;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
+use once_cell::sync::Lazy;
 use serde_json::{json, Value};
 use sqlx::SqlitePool;
 
@@ -10,6 +12,16 @@ use crate::storage::hitl_rules;
 
 /// Maximum age of a pending approval before it's swept stale.
 const MAX_PENDING_AGE: Duration = Duration::from_secs(3600);
+
+/// Compiled-regex cache for HITL rule `args_pattern`s. `match_rule` runs once
+/// per tool call, so compiling a pattern from scratch on every invocation (the
+/// old code) turned a tiny string compare into a full regex parse each time.
+/// `Regex::new` is cheap-but-not-free and callers only ever insert valid or
+/// gracefully-invalid patterns, so a small unbounded cache is fine. The mutex
+/// is held only for the map lookup/insert, never across any await.
+static REGEX_CACHE: Lazy<Mutex<HashMap<String, Option<regex::Regex>>>> = Lazy::new(|| {
+    Mutex::new(HashMap::new())
+});
 
 /// A pending tool call awaiting human approval.
 #[derive(Debug, Clone)]
@@ -111,12 +123,41 @@ impl HITLManager {
         }
     }
 
+    /// Expose the pool handle so callers can move `check_tool_call`'s DB rule
+    /// lookup out of the HITL mutex — `agent::loop_` clones it out (a brief,
+    /// non-blocking lock), runs the query *before* taking the mutex, then
+    /// hands the rows to `check_tool_call_with_rules` under a short lock.
+    pub fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
+
     /// Check whether a tool call should proceed, be rejected, or need approval.
+    ///
+    /// Convenience wrapper that resolves the DB rules itself; see
+    /// `check_tool_call_with_rules` for the lock-friendly path that takes
+    /// pre-fetched rules.
     pub async fn check_tool_call(
         &mut self,
         session_id: &str,
         tool_name: &str,
         args: &Value,
+    ) -> HITLDecision {
+        let rules =
+            hitl_rules::list_rules_by_tool(&self.pool, tool_name).await.unwrap_or_default();
+        self.check_tool_call_with_rules(session_id, tool_name, args, &rules)
+    }
+
+    /// The synchronous core of `check_tool_call`, with the DB rules already
+    /// loaded. Does no `.await` of its own, so a caller can run it under a
+    /// short-lived lock without holding that lock across a database round
+    /// trip (which previously serialized every concurrent tool call in a
+    /// session behind the shared HITL mutex).
+    pub fn check_tool_call_with_rules(
+        &mut self,
+        session_id: &str,
+        tool_name: &str,
+        args: &Value,
+        rules: &[hitl_rules::HITLRuleRow],
     ) -> HITLDecision {
         let args_str = serde_json::to_string(args).unwrap_or_default();
 
@@ -146,29 +187,27 @@ impl HITLManager {
         }
 
         // Check DB rules
-        if let Ok(rules) = hitl_rules::list_rules_by_tool(&self.pool, tool_name).await {
-            if let Some(rule) = Self::match_rule(&rules, &args_str) {
-                return match rule.decision.as_str() {
-                    "reject" => HITLDecision {
-                        action: "rejected".to_string(),
-                        reason: Some(format!(
-                            "DB rule prevents this tool call: {}",
-                            rule.args_pattern.as_deref().unwrap_or(tool_name)
-                        )),
-                        pending_action_id: None,
-                    },
-                    "allow" | "always_allow" => HITLDecision {
-                        action: "proceed".to_string(),
-                        reason: None,
-                        pending_action_id: None,
-                    },
-                    _ => HITLDecision {
-                        action: "proceed".to_string(),
-                        reason: None,
-                        pending_action_id: None,
-                    },
-                };
-            }
+        if let Some(rule) = Self::match_rule(rules, &args_str) {
+            return match rule.decision.as_str() {
+                "reject" => HITLDecision {
+                    action: "rejected".to_string(),
+                    reason: Some(format!(
+                        "DB rule prevents this tool call: {}",
+                        rule.args_pattern.as_deref().unwrap_or(tool_name)
+                    )),
+                    pending_action_id: None,
+                },
+                "allow" | "always_allow" => HITLDecision {
+                    action: "proceed".to_string(),
+                    reason: None,
+                    pending_action_id: None,
+                },
+                _ => HITLDecision {
+                    action: "proceed".to_string(),
+                    reason: None,
+                    pending_action_id: None,
+                },
+            };
         }
 
         // Apply default policy
@@ -318,25 +357,47 @@ impl HITLManager {
         rules: &[hitl_rules::HITLRuleRow],
         args_str: &str,
     ) -> Option<hitl_rules::HITLRuleRow> {
-        for rule in rules {
-            if let Some(pattern) = &rule.args_pattern {
-                match regex::Regex::new(pattern) {
-                    Ok(re) => {
-                        if re.is_match(args_str) {
-                            return Some(rule.clone());
-                        }
-                    }
-                    Err(_) => {
-                        if args_str.contains(pattern) {
-                            return Some(rule.clone());
-                        }
-                    }
-                }
-            } else {
+        // Most-specific-match-wins: a rule with a (longer) `args_pattern`
+        // beats an earlier catch-all (NULL pattern) rule for the same tool.
+        // The old loop returned the FIRST rule whose pattern matched — so an
+        // "always allow this tool, any args" row registered earlier shadowed
+        // a later `^rm ` / `^git reset --hard` reject rule. Sort by
+        // specificity so `^rm ` beats NULL regardless of insert order.
+        let mut ranked: Vec<&hitl_rules::HITLRuleRow> = rules.iter().collect();
+        ranked.sort_by_key(|r| {
+            let specificity = r.args_pattern.as_deref().map(str::len).unwrap_or(0);
+            std::cmp::Reverse(specificity)
+        });
+
+        for rule in ranked {
+            let Some(pattern) = &rule.args_pattern else {
+                // Catch-all: with the ranking above this only wins when no
+                // more-specific rule matched, which is the intended semantics.
+                return Some(rule.clone());
+            };
+
+            let cached = match Self::compiled_regex(pattern) {
+                Some(re) => re.is_match(args_str),
+                None => args_str.contains(pattern),
+            };
+            if cached {
                 return Some(rule.clone());
             }
         }
         None
+    }
+
+    /// Compile `pattern` once and reuse the result. Invalid patterns (rare;
+    /// the UI validates before insert) degrade to a substring match, same as
+    /// the legacy behavior.
+    fn compiled_regex(pattern: &str) -> Option<regex::Regex> {
+        let mut cache = REGEX_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(compiled) = cache.get(pattern) {
+            return compiled.clone();
+        }
+        let compiled = regex::Regex::new(pattern).ok();
+        cache.insert(pattern.to_string(), compiled.clone());
+        compiled
     }
 }
 
@@ -380,6 +441,57 @@ mod tests {
         assert_eq!(
             dict.get("reason").and_then(|v| v.as_str()),
             Some("Test reason")
+        );
+    }
+
+    fn rule_row(pattern: Option<&str>, decision: &str) -> hitl_rules::HITLRuleRow {
+        hitl_rules::HITLRuleRow {
+            id: 0,
+            tool_name: "tool".to_string(),
+            args_pattern: pattern.map(|s| s.to_string()),
+            decision: decision.to_string(),
+            created_at: Some(Utc::now()),
+        }
+    }
+
+    #[test]
+    fn match_rule_specific_beats_catch_all() {
+        // A catch-all registered FIRST must not shadow a later, more-specific
+        // reject rule for the same tool.
+        let rules = vec![
+            rule_row(None, "always_allow"),
+            rule_row(Some("rm -rf"), "reject"),
+            rule_row(Some("git reset --hard"), "reject"),
+        ];
+        let matched =
+            HITLManager::match_rule(&rules, r#"{"command": "rm -rf /tmp/x"}"#).unwrap();
+        assert_eq!(matched.decision, "reject");
+        assert_eq!(matched.args_pattern.as_deref(), Some("rm -rf"));
+    }
+
+    #[test]
+    fn match_rule_longest_specific_wins() {
+        let rules = vec![
+            rule_row(Some("git reset"), "reject"),
+            rule_row(Some("git reset --hard"), "always_allow"),
+        ];
+        let matched =
+            HITLManager::match_rule(&rules, r#"{"command": "git reset --hard"}"#).unwrap();
+        assert_eq!(matched.decision, "always_allow");
+    }
+
+    #[test]
+    fn match_rule_catch_all_wins_when_nothing_specific_matches() {
+        let rules = vec![rule_row(None, "reject")];
+        let matched = HITLManager::match_rule(&rules, r#"{"command": "echo hi"}"#).unwrap();
+        assert_eq!(matched.decision, "reject");
+    }
+
+    #[test]
+    fn match_rule_no_match_returns_none() {
+        let rules = vec![rule_row(Some("rm -rf"), "reject")];
+        assert!(
+            HITLManager::match_rule(&rules, r#"{"command": "echo hi"}"#).is_none()
         );
     }
 }

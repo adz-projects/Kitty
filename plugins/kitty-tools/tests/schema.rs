@@ -11,7 +11,7 @@
 //! enum picks up its own doc comment, so all per-value guidance in this
 //! crate lives on the *field* that uses the enum instead.
 
-use kitty_tools::server::{AccessibleChartRequest, AccessibleSvgRequest, AccessibleTableRequest};
+use kitty_tools::server::{AccessibleChartRequest, AccessibleMermaidRequest, AccessibleSvgRequest, AccessibleTableRequest};
 use serde_json::Value;
 
 const MIN_DESCRIPTION_LEN: usize = 30;
@@ -104,6 +104,15 @@ fn table_request_schema_is_fully_documented() {
     assert_eq!(required, vec!["title", "headers", "rows"]);
 }
 
+#[test]
+fn mermaid_request_schema_is_fully_documented() {
+    let schema = schema_value::<AccessibleMermaidRequest>();
+    assert_every_property_documented(&schema, "AccessibleMermaidRequest");
+
+    let required: Vec<&str> = schema["required"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+    assert_eq!(required, vec!["title", "description", "mermaid"]);
+}
+
 /// Walk every schema position reachable from `schema` and collect the paths
 /// of any that are a bare boolean rather than an object.
 fn boolean_subschema_paths(schema: &Value, path: &str, out: &mut Vec<String>) {
@@ -151,6 +160,7 @@ fn no_viz_schema_contains_a_boolean_subschema() {
         ("AccessibleSvgRequest", schema_value::<AccessibleSvgRequest>()),
         ("AccessibleChartRequest", schema_value::<AccessibleChartRequest>()),
         ("AccessibleTableRequest", schema_value::<AccessibleTableRequest>()),
+        ("AccessibleMermaidRequest", schema_value::<AccessibleMermaidRequest>()),
     ] {
         let mut found = Vec::new();
         boolean_subschema_paths(&schema, name, &mut found);

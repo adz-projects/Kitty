@@ -6,7 +6,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Manager};
 
 use crate::config;
-use crate::config::providers::has_secret;
+use crate::config::providers::get_secret_async;
 use crate::lifecycle;
 use crate::state::AppState;
 use crate::state::StackStatus;
@@ -71,7 +71,10 @@ pub async fn validate_setup(app: AppHandle) -> Result<SetupValidation, String> {
             if p.models.is_empty() {
                 issues.push(format!("\"{}\" doesn't have a model selected yet.", p.name));
             }
-            if p.provider_type != "ollama" && !has_secret(&p.id) {
+            // `get_secret_async` (not the blocking `has_secret`) — this is a
+            // tokio worker, and Windows Credential Manager access is
+            // synchronous OS IPC that would otherwise block it.
+            if p.provider_type != "ollama" && get_secret_async(&p.id).await.is_none() {
                 issues.push(format!("\"{}\" doesn't have an API key stored.", p.name));
             }
         }
@@ -118,12 +121,16 @@ pub fn get_wizard_mode(state: tauri::State<'_, AppState>) -> Result<Option<Strin
 /// Mark first-run setup complete, then summon the overlay.
 #[tauri::command]
 pub async fn complete_setup(app: AppHandle) -> Result<(), String> {
-    {
+    // Copy the mutated config out of the lock and release it before
+    // `save`'s synchronous disk write — holding the global config Mutex
+    // across a disk write would block every other config-reading command.
+    let updated = {
         let state = app.state::<AppState>();
         let mut cfg = state.config.lock().unwrap();
         cfg.setup_completed = true;
-        config::save(&cfg).map_err(|e| e.to_string())?;
-    }
+        cfg.clone()
+    };
+    config::save(&updated).map_err(|e| e.to_string())?;
     if let Some(win) = app.get_webview_window(windows::WIZARD) {
         let _ = win.hide();
     }

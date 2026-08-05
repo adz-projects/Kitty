@@ -218,14 +218,22 @@ export function Advanced() {
                     min={8192}
                     step={1024}
                     value={draft.token_management.max_context_tokens}
-                    onChange={(e) =>
+                    onChange={(e) => {
+                      // `Number('') === 0`, which would violate the declared
+                      // `min` and get persisted as an invalid 0 — an emptied
+                      // field keeps the previous value instead (the type here
+                      // is a non-nullable number, so there's no null to write).
+                      const raw = e.target.value;
+                      if (raw === '') return;
+                      const numeric = Number(raw);
+                      if (!Number.isFinite(numeric)) return;
                       update({
                         token_management: {
                           ...draft.token_management,
-                          max_context_tokens: Number(e.target.value),
+                          max_context_tokens: numeric,
                         },
-                      })
-                    }
+                      });
+                    }}
                   />
                   <small className="muted">
                     BigTiny&apos;s context window size. Must match your active model&apos;s
@@ -272,14 +280,20 @@ export function Advanced() {
                     min={1024}
                     step={1024}
                     value={draft.token_management.max_live_tail_tokens}
-                    onChange={(e) =>
+                    onChange={(e) => {
+                      // Same empty-field guard as max_context_tokens: don't
+                      // persist `Number('')` === 0 against the `min` of 1024.
+                      const raw = e.target.value;
+                      if (raw === '') return;
+                      const numeric = Number(raw);
+                      if (!Number.isFinite(numeric)) return;
                       update({
                         token_management: {
                           ...draft.token_management,
-                          max_live_tail_tokens: Number(e.target.value),
+                          max_live_tail_tokens: numeric,
                         },
-                      })
-                    }
+                      });
+                    }}
                   />
                   <small className="muted">
                     Per-turn budget for the live conversation tail. Lower = more aggressive

@@ -10,14 +10,16 @@
 
 use kitty_tools::server::KittyToolsServer;
 
-/// All 18 always-on tools this server exposes, sorted, plus 3 more
+/// All 22 always-on tools this server exposes, sorted, plus 4 more
 /// (`generate_accessible_table`/`generate_accessible_svg`/
-/// `generate_accessible_chart`) when `KITTY_VIZ_ENABLED=1`. `lean_word_*`
-/// from the Word-only split, plus shell, workspace, 5 file tools, 4 cache
-/// tools, 4 scratchpad tools.
+/// `generate_accessible_chart`/`generate_accessible_mermaid`) when
+/// `KITTY_VIZ_ENABLED=1`. `lean_word_*`
+/// and the Excel/PDF tools (`lean_excel_*`/`lean_pdf_*`) from the retired
+/// `kitty-docs-web`, plus shell, workspace, 5 file tools, 4 cache tools, 4
+/// scratchpad tools.
 ///
 /// Web search (`brave_mcp_search`, formerly gated here on `BRAVE_API_KEY`)
-/// moved to the Python `kitty-docs-web` process as the merged, count-tiered
+/// moved to the Rust `kitty-web` process as the merged, count-tiered
 /// `lean_web_search`/`lean_web_search_read_chunk` — see `docs/VERSIONS.md`.
 /// Along with the retirement of `lean_fallback_web_search`, this resets
 /// adaptive-pathway's learned bandit state for those two old tool names —
@@ -35,11 +37,15 @@ const ALWAYS_ON_TOOLS: &[&str] = &[
     "lean_cache_delete",
     "lean_cache_list",
     "lean_cache_view",
+    "lean_excel_inspect",
+    "lean_excel_read_rows",
     "lean_file_append",
     "lean_file_read",
     "lean_file_replace_lines",
     "lean_file_replace_str",
     "lean_file_write",
+    "lean_pdf_read_outline",
+    "lean_pdf_read_text",
     "lean_scratchpad_delete",
     "lean_scratchpad_get",
     "lean_scratchpad_list",
@@ -75,6 +81,7 @@ fn tool_surface_matches_env_gating() {
     with_extras.push("generate_accessible_table".to_string());
     with_extras.push("generate_accessible_svg".to_string());
     with_extras.push("generate_accessible_chart".to_string());
+    with_extras.push("generate_accessible_mermaid".to_string());
     with_extras.sort();
     assert_eq!(server.tool_names(), with_extras, "viz tools must join once KITTY_VIZ_ENABLED is set");
 

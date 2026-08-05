@@ -15,7 +15,11 @@ use crate::network::TailscaleClient;
 use crate::storage::providers::ProviderRow;
 
 struct ProviderEntry {
-    provider: Box<dyn Provider>,
+    /// `Arc` rather than `Box` so an awaited network call (`chat_completion`,
+    /// `discover_models`, `check_health`) can clone the handle out, drop the
+    /// DashMap guard, and only then `.await` — a `Box` can't be shared, so
+    /// the guard used to be held across the whole request.
+    provider: Arc<dyn Provider>,
     health: HealthStatus,
     health_checked_at: Instant,
     /// This provider's own `-np`/`--parallel` slot count, when set — see
@@ -86,11 +90,11 @@ impl ProviderRouter {
     pub fn register_openai(&self, provider_id: &str, config: ProviderConfig) {
         let (parallel_slots, resolved_sampling, context_length, fallback_priority) =
             Self::resolved_fields(&config);
-        let p = Box::new(OpenAICompatibleProvider::new(
+        let p: Arc<dyn Provider> = Arc::new(OpenAICompatibleProvider::new(
             provider_id,
             config,
             self.tailscale.clone(),
-        )) as Box<dyn Provider>;
+        ));
         self.providers.insert(
             provider_id.to_string(),
             ProviderEntry {
@@ -112,12 +116,12 @@ impl ProviderRouter {
     pub fn register_anthropic(&self, provider_id: &str, config: ProviderConfig) {
         let (parallel_slots, resolved_sampling, context_length, fallback_priority) =
             Self::resolved_fields(&config);
-        let p = Box::new(AnthropicProvider::new(
+        let p: Arc<dyn Provider> = Arc::new(AnthropicProvider::new(
             provider_id,
             config,
             self.tailscale.clone(),
             self.cache.clone(),
-        )) as Box<dyn Provider>;
+        ));
         self.providers.insert(
             provider_id.to_string(),
             ProviderEntry {
@@ -218,6 +222,7 @@ impl ProviderRouter {
                 .get("context_length")
                 .and_then(|v| v.as_i64())
                 .map(|v| v as i32),
+            idle_timeout_secs: config_json.get("idle_timeout_secs").and_then(|v| v.as_f64()),
         };
 
         if row.provider_type == "anthropic" {
@@ -300,15 +305,27 @@ impl ProviderRouter {
     }
 
     pub async fn check_all_health(&self) {
-        for mut entry in self.providers.iter_mut() {
-            if entry.health_checked_at.elapsed().as_secs() < HEALTH_TTL_SECS
-                && entry.health.status != "disconnected"
-            {
-                continue;
+        // Collect which providers are due first (guards dropped), then probe
+        // each one holding no shard lock — `iter_mut` used to hold each
+        // shard's write lock across `check_health().await`, blocking the whole
+        // map for the duration of every network call and stalling any
+        // concurrent `chat_completion`.
+        let due: Vec<(String, Arc<dyn Provider>)> = self
+            .providers
+            .iter()
+            .filter(|e| {
+                e.health_checked_at.elapsed().as_secs() >= HEALTH_TTL_SECS
+                    || e.health.status == "disconnected"
+            })
+            .map(|e| (e.key().clone(), e.value().provider.clone()))
+            .collect();
+
+        for (id, provider) in due {
+            let status = provider.check_health().await;
+            if let Some(mut entry) = self.providers.get_mut(&id) {
+                entry.health = status;
+                entry.health_checked_at = Instant::now();
             }
-            let status = entry.provider.check_health().await;
-            entry.health = status;
-            entry.health_checked_at = Instant::now();
         }
     }
 
@@ -330,14 +347,17 @@ impl ProviderRouter {
     /// Check and refresh health for a single provider (bypasses the TTL
     /// cache), returning the fresh status. Used by `POST /api/providers/{id}/test`.
     pub async fn check_health(&self, provider_id: &str) -> Result<HealthStatus, ProviderError> {
-        let status = {
-            let entry = self.providers.get(provider_id).ok_or_else(|| {
-                ProviderError::NoHealthyProvider {
-                    user_message: format!("Provider '{}' not found", provider_id),
-                }
-            })?;
-            entry.provider.check_health().await
-        };
+        // Clone the provider handle out and drop the guard before the await —
+        // the network call can take seconds and must not hold the shard lock.
+        let provider = self
+            .providers
+            .get(provider_id)
+            .ok_or_else(|| ProviderError::NoHealthyProvider {
+                user_message: format!("Provider '{}' not found", provider_id),
+            })?
+            .provider
+            .clone();
+        let status = provider.check_health().await;
         if let Some(mut entry) = self.providers.get_mut(provider_id) {
             entry.health = status.clone();
             entry.health_checked_at = Instant::now();
@@ -349,13 +369,15 @@ impl ProviderRouter {
         &self,
         provider_id: &str,
     ) -> Result<Vec<super::base::ModelInfo>, ProviderError> {
-        let entry =
-            self.providers
-                .get(provider_id)
-                .ok_or_else(|| ProviderError::NoHealthyProvider {
-                    user_message: format!("Provider '{}' not found", provider_id),
-                })?;
-        entry.provider.discover_models().await
+        let provider = self
+            .providers
+            .get(provider_id)
+            .ok_or_else(|| ProviderError::NoHealthyProvider {
+                user_message: format!("Provider '{}' not found", provider_id),
+            })?
+            .provider
+            .clone();
+        provider.discover_models().await
     }
 
     /// This provider's own configured `-np`/`--parallel` slot count, if set
@@ -405,14 +427,18 @@ impl ProviderRouter {
         model: Option<String>,
         id_slot: Option<i32>,
     ) -> Result<Pin<Box<dyn Stream<Item = Delta> + Send>>, ProviderError> {
-        let entry =
-            self.providers
-                .get(provider_id)
-                .ok_or_else(|| ProviderError::NoHealthyProvider {
-                    user_message: format!("Provider '{}' not found", provider_id),
-                })?;
-        entry
+        // Clone the provider's Arc out, drop the DashMap guard, then await —
+        // a chat completion can run for minutes and must never hold the shard
+        // lock (which would block health checks and other completions).
+        let provider = self
+            .providers
+            .get(provider_id)
+            .ok_or_else(|| ProviderError::NoHealthyProvider {
+                user_message: format!("Provider '{}' not found", provider_id),
+            })?
             .provider
+            .clone();
+        provider
             .chat_completion(messages, tools, sampling, model, id_slot)
             .await
     }

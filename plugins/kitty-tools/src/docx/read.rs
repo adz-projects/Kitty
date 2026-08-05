@@ -129,6 +129,13 @@ fn extract_raw_paragraphs(document_xml: &[u8]) -> Vec<RawParagraph> {
     let mut paragraph_depth: usize = 0;
     let mut in_own_ppr = false;
     let mut in_rpr = false;
+    // Only text inside a `w:t` is real paragraph content — field codes
+    // (`w:instrText`), tracked-change deletions (`w:delText`), ruby glosses
+    // (`w:rt`, whose runs still contain `w:t` elements) and inter-element
+    // whitespace all emit text events too, but a reader never sees them.
+    // This matches the Python port's `.//w:t` scan for non-ruby content.
+    let mut in_t = false;
+    let mut ruby_depth: usize = 0;
     // `mc:Fallback` content is dropped so a text box's AlternateContent
     // doesn't contribute its paragraph text twice (once via `mc:Choice`,
     // once via `mc:Fallback`) — Word/python-docx effectively prefer the
@@ -158,7 +165,19 @@ fn extract_raw_paragraphs(document_xml: &[u8]) -> Vec<RawParagraph> {
                     }
                     paragraph_depth += 1;
                 } else if current.is_some() {
-                    if local == b"pPr" && paragraph_depth == 1 {
+                    if local == b"t" {
+                        in_t = true;
+                    } else if local == b"tab" {
+                        if let Some(p) = current.as_mut() {
+                            p.text.push('\t');
+                        }
+                    } else if local == b"br" {
+                        if let Some(p) = current.as_mut() {
+                            p.text.push('\n');
+                        }
+                    } else if local == b"rt" {
+                        ruby_depth += 1;
+                    } else if local == b"pPr" && paragraph_depth == 1 {
                         in_own_ppr = true;
                     } else if in_own_ppr && local == b"pStyle" {
                         if let Some(p) = current.as_mut() {
@@ -190,7 +209,15 @@ fn extract_raw_paragraphs(document_xml: &[u8]) -> Vec<RawParagraph> {
                 }
                 let local = local_name(e.name().as_ref()).to_vec();
                 if current.is_some() {
-                    if in_own_ppr && local == b"pStyle" {
+                    if local == b"tab" {
+                        if let Some(p) = current.as_mut() {
+                            p.text.push('\t');
+                        }
+                    } else if local == b"br" {
+                        if let Some(p) = current.as_mut() {
+                            p.text.push('\n');
+                        }
+                    } else if in_own_ppr && local == b"pStyle" {
                         if let Some(p) = current.as_mut() {
                             p.style_id = attr_value(&e, b"w:val");
                         }
@@ -212,7 +239,7 @@ fn extract_raw_paragraphs(document_xml: &[u8]) -> Vec<RawParagraph> {
                 }
             }
             Ok(Event::Text(t)) => {
-                if fallback_depth.is_none() {
+                if fallback_depth.is_none() && in_t && ruby_depth == 0 {
                     if let Some(p) = current.as_mut() {
                         if let Ok(decoded) = t.decode() {
                             if let Ok(unescaped) = quick_xml::escape::unescape(&decoded) {
@@ -240,6 +267,10 @@ fn extract_raw_paragraphs(document_xml: &[u8]) -> Vec<RawParagraph> {
                             results.push(p);
                         }
                     }
+                } else if local == b"t" {
+                    in_t = false;
+                } else if local == b"rt" {
+                    ruby_depth = ruby_depth.saturating_sub(1);
                 } else if local == b"pPr" {
                     in_own_ppr = false;
                     if let Some(p) = current.as_mut() {
@@ -345,5 +376,54 @@ mod tests {
         let paras = extract_paragraphs(xml.as_bytes(), &HashMap::new());
         // Falls through to no heuristic matching -> no heading level, not a panic.
         assert_eq!(paras[0].heading_level, None);
+    }
+
+    #[test]
+    fn ignores_field_codes_and_deleted_text_events() {
+        // `w:instrText` (field codes) and `w:delText` (tracked-change
+        // deletions) emit text events that a reader never sees — only the
+        // real `w:t` content should survive extraction.
+        let xml = doc(
+            r#"<w:p><w:r><w:instrText> PAGE </w:instrText></w:r><w:r><w:t>Real</w:t></w:r><w:r><w:delText>gone</w:delText></w:r></w:p>"#,
+        );
+        let paras = extract_paragraphs(xml.as_bytes(), &HashMap::new());
+        assert_eq!(paras.len(), 1);
+        assert_eq!(paras[0].text, "Real");
+    }
+
+    #[test]
+    fn ruby_gloss_is_not_pulled_into_paragraph_text() {
+        // `<w:rt>` inside a ruby annotation should not leak its gloss into
+        // the paragraph's text; only the base `<w:t>` is content.
+        let xml = doc(
+            r#"<w:p><w:r><w:ruby><w:rubyBase><w:r><w:t>base</w:t></w:r></w:rubyBase><w:rt><w:r><w:t>gloss</w:t></w:r></w:rt></w:ruby></w:r></w:p>"#,
+        );
+        let paras = extract_paragraphs(xml.as_bytes(), &HashMap::new());
+        assert_eq!(paras.len(), 1);
+        assert_eq!(paras[0].text, "base");
+    }
+
+    #[test]
+    fn tab_and_break_inside_runs_are_materialized() {
+        // `<w:tab/>` renders as a tab and `<w:br/>` as a line break —
+        // matching python-docx's `paragraph.text`.
+        let xml = doc(r#"<w:p><w:r><w:t>a</w:t><w:tab/><w:t>b</w:t><w:br/><w:t>c</w:t></w:r></w:p>"#);
+        let paras = extract_paragraphs(xml.as_bytes(), &HashMap::new());
+        assert_eq!(paras[0].text, "a\tb\nc");
+    }
+
+    #[test]
+    fn inter_element_whitespace_is_not_paragraph_text() {
+        // Pretty-printed XML puts newlines/spaces between runs; those are not
+        // content and must not be folded into the extracted text.
+        let xml = doc(
+            r#"<w:p>
+                <w:r><w:t>Hello</w:t></w:r>
+                <w:r><w:t>World</w:t></w:r>
+            </w:p>"#,
+        );
+        let paras = extract_paragraphs(xml.as_bytes(), &HashMap::new());
+        assert_eq!(paras.len(), 1);
+        assert_eq!(paras[0].text, "HelloWorld");
     }
 }

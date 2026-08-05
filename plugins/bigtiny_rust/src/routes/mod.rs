@@ -52,6 +52,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/chat/{id}/timings", get(chat::get_timings))
         .route("/api/chat/{id}/pending", get(chat::get_pending))
         .route("/api/chat/{id}/fork", post(chat::fork_session))
+        .route("/api/chat/{id}/compact", post(chat::compact_session))
         .route("/api/chat/{id}/cancel", post(chat::cancel_session))
         .route("/api/chat/{id}/approve", post(chat::approve_action))
         .route(

@@ -7,11 +7,13 @@ pub mod tokens;
 pub mod types;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use dashmap::DashMap;
 use serde_json::Value;
 use sqlx::SqlitePool;
 use tokio::sync::{mpsc, Mutex, Notify};
+use uuid::Uuid;
 
 use crate::config::BigTinyConfig;
 use crate::hitl::manager::HITLManager;
@@ -35,7 +37,10 @@ pub struct Agent {
     mcp: Arc<MCPManager>,
     hitl: Arc<Mutex<HITLManager>>,
     hitl_notifies: Arc<DashMap<String, Arc<Notify>>>,
-    tasks: DashMap<String, tokio::task::JoinHandle<()>>,
+    /// Keyed by session id. The `Uuid` identifies *this specific turn* so the
+    /// disconnect watcher spawned in `run_turn` can never abort a later,
+    /// unrelated turn for the same session (see that method's doc comment).
+    tasks: DashMap<String, (Uuid, tokio::task::JoinHandle<()>)>,
     summarizer: Arc<SummarizerClient>,
     config: BigTinyConfig,
     /// BigTiny's app-data directory (`RunOptions::data_dir` — respects
@@ -80,6 +85,14 @@ impl Agent {
         &self.router
     }
 
+    pub fn summarizer(&self) -> &Arc<SummarizerClient> {
+        &self.summarizer
+    }
+
+    pub fn config(&self) -> &BigTinyConfig {
+        &self.config
+    }
+
     /// Construct a fresh per-turn `AgentLoop`. `AgentLoop` holds no
     /// meaningful session-scoped state of its own (session id is passed to
     /// its methods, not baked into construction) so building one per turn is
@@ -104,6 +117,7 @@ impl Agent {
             self.config.agent.max_concurrent_tool_calls.max(1) as usize,
             self.cache_dir.clone(),
             self.config.fallback.clone(),
+            self.config.agent.sandbox_strict,
         )
     }
 
@@ -131,12 +145,38 @@ impl Agent {
         tx: mpsc::UnboundedSender<SSEEvent>,
     ) -> Result<(), String> {
         let this = self.clone();
+        let turn_token = Uuid::new_v4();
 
         match self.tasks.entry(session_id.clone()) {
             dashmap::mapref::entry::Entry::Occupied(_) => Err(format!(
                 "Session {session_id} already has a turn in progress"
             )),
             dashmap::mapref::entry::Entry::Vacant(entry) => {
+                // Disconnect watcher: `tx.closed()` resolves once the SSE
+                // receiver (owned by the axum response body) is dropped —
+                // which happens both on a genuine early client disconnect
+                // *and* on ordinary end-of-stream once the loop below
+                // finishes and drops its own `tx`. We can't tell those apart
+                // from this signal alone, so instead of cancelling
+                // immediately we wait out the grace window and then only
+                // cancel if *this exact turn* (matched by `turn_token`) is
+                // still the one registered for the session — if the loop
+                // already finished naturally (or a later turn replaced this
+                // entry), `cancel_if_current` is a no-op. This is what makes
+                // a dropped mobile connection recoverable rather than an
+                // instant kill: see `AgentConfig::disconnect_grace_secs`.
+                let watch_tx = tx.clone();
+                let watcher_agent = this.clone();
+                let watcher_session_id = session_id.clone();
+                let grace = Duration::from_secs(this.config.agent.disconnect_grace_secs.max(1));
+                tokio::spawn(async move {
+                    watch_tx.closed().await;
+                    tokio::time::sleep(grace).await;
+                    watcher_agent
+                        .cancel_if_current(&watcher_session_id, turn_token)
+                        .await;
+                });
+
                 let cleanup_session_id = session_id.clone();
                 let handle = tokio::spawn(async move {
                     let mut agent_loop = this.build_loop();
@@ -149,9 +189,10 @@ impl Agent {
                             images,
                         )
                         .await;
-                    this.tasks.remove(&cleanup_session_id);
+                    this.tasks
+                        .remove_if(&cleanup_session_id, |_, (tok, _)| *tok == turn_token);
                 });
-                entry.insert(handle);
+                entry.insert((turn_token, handle));
                 Ok(())
             }
         }
@@ -177,7 +218,21 @@ impl Agent {
     /// "cancelled" event on this path (unlike a cooperative
     /// `POST /cancel`-triggered stop inside the loop itself).
     pub async fn cancel(&self, session_id: &str) {
-        if let Some((_, handle)) = self.tasks.remove(session_id) {
+        if let Some((_, (_, handle))) = self.tasks.remove(session_id) {
+            handle.abort();
+        }
+    }
+
+    /// Cancel the in-flight turn for `session_id` only if it's still the
+    /// specific turn identified by `turn_token` — used by the disconnect
+    /// watcher in `run_turn` so a stale watcher for an already-finished (or
+    /// already-replaced) turn can never abort a different, later turn. See
+    /// that method's doc comment for why this distinction matters.
+    async fn cancel_if_current(&self, session_id: &str, turn_token: Uuid) {
+        if let Some((_, (_, handle))) = self
+            .tasks
+            .remove_if(session_id, |_, (tok, _)| *tok == turn_token)
+        {
             handle.abort();
         }
     }
@@ -196,5 +251,84 @@ impl Agent {
         for id in ids {
             self.cancel(&id).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Builds a real `Agent` against an in-memory, migrated DB — cheap
+    /// enough to construct per test, and lets these tests exercise
+    /// `cancel_if_current` (a private method) directly rather than through
+    /// the full `run_turn`/HTTP/provider machinery, since the thing under
+    /// test is purely the turn-token bookkeeping in `self.tasks`, not the
+    /// agent loop itself.
+    async fn test_agent() -> Arc<Agent> {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+
+        let config = BigTinyConfig::default();
+        let router = Arc::new(ProviderRouter::new(config.cache.clone()));
+        let mcp = Arc::new(MCPManager::new(pool.clone()));
+        let hitl = Arc::new(Mutex::new(HITLManager::new(pool.clone(), config.hitl.clone())));
+        let summarizer = Arc::new(SummarizerClient::new(config.summarizer.clone()));
+        Arc::new(Agent::new(
+            pool,
+            router,
+            mcp,
+            hitl,
+            summarizer,
+            config,
+            std::env::temp_dir().to_string_lossy().into_owned(),
+        ))
+    }
+
+    /// Inserts a task that never finishes on its own, standing in for an
+    /// in-flight turn, so tests can assert on whether `cancel_if_current`
+    /// actually aborted it.
+    fn insert_fake_turn(agent: &Agent, session_id: &str) -> Uuid {
+        let token = Uuid::new_v4();
+        let handle = tokio::spawn(std::future::pending::<()>());
+        agent.tasks.insert(session_id.to_string(), (token, handle));
+        token
+    }
+
+    #[tokio::test]
+    async fn cancel_if_current_is_a_noop_for_a_stale_token() {
+        let agent = test_agent().await;
+        let real_token = insert_fake_turn(&agent, "sess-1");
+        let stale_token = Uuid::new_v4();
+
+        // Simulates the disconnect watcher for a turn that already finished
+        // (or was replaced by a later turn) firing after the fact: it must
+        // not touch whatever is currently registered for this session.
+        agent.cancel_if_current("sess-1", stale_token).await;
+
+        let entry = agent.tasks.get("sess-1").expect("entry must survive");
+        assert_eq!(entry.0, real_token);
+        assert!(!entry.1.is_finished());
+    }
+
+    #[tokio::test]
+    async fn cancel_if_current_aborts_the_matching_turn() {
+        let agent = test_agent().await;
+        let token = insert_fake_turn(&agent, "sess-1");
+
+        agent.cancel_if_current("sess-1", token).await;
+
+        assert!(agent.tasks.get("sess-1").is_none());
+    }
+
+    #[tokio::test]
+    async fn cancel_if_current_does_not_touch_other_sessions() {
+        let agent = test_agent().await;
+        let token_a = insert_fake_turn(&agent, "sess-a");
+        insert_fake_turn(&agent, "sess-b");
+
+        agent.cancel_if_current("sess-a", token_a).await;
+
+        assert!(agent.tasks.get("sess-a").is_none());
+        assert!(agent.tasks.get("sess-b").is_some());
     }
 }

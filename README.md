@@ -24,16 +24,18 @@ chat folder; anything outside it triggers a human-in-the-loop approval prompt.
 
 * **kitty-tools** (Rust) — 18 always-on local-machine tools: shell execution,
 file read/write/append with pagination, workspace analysis, Word document
-read/outline/write, a persistent scratchpad, and a content cache, plus 3
+read/outline/write, a persistent scratchpad, and a content cache, plus 4
 WCAG 2.2 AA compliant visualization tools (accessible tables, SVG diagrams,
-and charts), gated by their own Settings toggle.
-* **kitty-docs-web** (Python) — 8 tools needing Python-native dependencies:
-PDF read/outline, web article scraping, merged web search (DuckDuckGo always
-available, Brave preferred per-query when an API key is configured), and
-Excel read/write/format. On by default, no credentials required (Brave
-preference is a separate opt-in toggle).
-* **wasm-math-mcp** — sandboxed Python/NumPy/SciPy execution for exact math,
-data filtering, and statistical computation (on by default).
+charts, and Mermaid diagrams rendered client-side from a bundled runtime),
+gated by their own Settings toggle, and read-only Excel/PDF
+tools. On by default, no credentials.
+* **kitty-web** (Rust) — web article scraping and merged web search
+(DuckDuckGo always available, Brave preferred per-query when an API key is
+configured). On by default (Brave preference is a separate opt-in toggle).
+* **kitty-wasm** (Rust) — run Python (or any WASI module) in a sandboxed
+WebAssembly (wasmtime + WASI) interpreter for exact math, data filtering,
+and statistical computation. On by default, no credentials required; its
+CPython guest ships with the app so first use is offline.
 * **adaptive-pathway-mcp** — the `decide`/`record\_outcome` tools the model
 calls to participate in the Adaptive Pathways learning loop.
 
@@ -70,7 +72,7 @@ plugins/                Internal Python subsystems, frozen to standalone
   adaptive-pathway/     Tool-selection/response-style learning sidecar + MCP
   replacement-mcp/      Context-optimized shell/file/web/document MCP tools
   brave-mcp-search/     Brave Search MCP tool
-  wasm-math-mcp/        Sandboxed math execution MCP tool
+  kitty-wasm/           Sandboxed WebAssembly compute MCP tool (Rust)
 docs/                   Architecture, plugin, release, and backend docs
 ```
 

@@ -13,9 +13,27 @@ pub fn get_config(state: tauri::State<'_, AppState>) -> Result<Config, String> {
     Ok(state.config.lock().unwrap().clone())
 }
 
+/// One-time notice for the corrupt-config recovery path. Returns `None` when
+/// config loaded fine; a user-facing message (naming the backup copy) when
+/// `config.json` failed to parse at startup and settings were reset to
+/// defaults — surfaced so the frontend can tell the user their saved settings
+/// weren't silently discarded (they were backed up).
+#[tauri::command]
+pub fn get_config_recovery_notice(
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<String>, String> {
+    Ok(state.config_recovered.lock().unwrap().as_ref().map(|backup| {
+        format!(
+            "Kitty couldn't read its saved settings, so it reset them to defaults. \
+             Your original settings were backed up to \"{backup}\" — restore anything \
+             you want from there.",
+        )
+    }))
+}
+
 /// Replace + persist the app config. Re-registers the hotkey if it changed.
 #[tauri::command]
-pub fn set_config(
+pub async fn set_config(
     app: AppHandle,
     state: tauri::State<'_, AppState>,
     config: Config,
@@ -29,21 +47,37 @@ pub fn set_config(
         changed
     };
 
-    config::save(&config).map_err(|e| {
-        tracing::error!("failed to save config: {e}");
-        "Could not save settings to disk.".to_string()
-    })?;
+    // Both I/O chunks (disk save + hotkey re-register) run on a blocking
+    // thread — off the async worker, and with the config Mutex already
+    // released.
+    let config_for_save = config.clone();
+    tokio::task::spawn_blocking(move || config::save(&config_for_save))
+        .await
+        .map_err(|e| format!("save task panicked: {e}"))?
+        .map_err(|e| {
+            tracing::error!("failed to save config: {e}");
+            "Could not save settings to disk.".to_string()
+        })?;
 
     // Let every window re-apply theme/background from the new config.
     let _ = app.emit("theme://changed", ());
 
     if hotkey_changed {
-        if let Err(e) = hotkey::register(
-            &app,
-            &config.hotkeys,
-            config.clipboard_hotkey.as_deref(),
-            config.open_window_hotkey.as_deref(),
-        ) {
+        let hotkeys = config.hotkeys.clone();
+        let clipboard_hotkey = config.clipboard_hotkey.clone();
+        let open_window_hotkey = config.open_window_hotkey.clone();
+        let app2 = app.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            hotkey::register(
+                &app2,
+                &hotkeys,
+                clipboard_hotkey.as_deref(),
+                open_window_hotkey.as_deref(),
+            )
+        })
+        .await
+        .map_err(|e| format!("hotkey re-register task panicked: {e}"))?;
+        if let Err(e) = result {
             tracing::error!("re-register hotkey failed: {e}");
             return Err("Saved, but a new hotkey could not be registered.".into());
         }

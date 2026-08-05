@@ -56,12 +56,14 @@ BUILD_VENV_DIRNAME = ".build-venv"
 # defaults to `"python"` (see `build_plugin`) so every pre-existing entry is
 # unchanged; only `kitty-tools` sets it to `"rust"`.
 #
-# `replacement-mcp`, `brave-mcp-search`, and `visualizations` are retired —
-# their tools are all hosted inside `kitty-tools` now (the Rust
-# consolidation) — and deliberately absent from this dict, so
-# `python plugins/build.py` (no args) no longer builds or bundles them. Their
-# source files stay in-tree, unbuilt, as the oracle for re-verifying kitty-tools
-# against if a behavioral gap ever surfaces (see docs/PLUGINS.md).
+# `replacement-mcp`, `brave-mcp-search`, `visualizations`, `kitty-docs-web`,
+# and `wasm-math-mcp` are retired — their tools are all hosted inside
+# `kitty-tools` (Rust), `kitty-web` (Rust), and `kitty-wasm` (Rust) now (the
+# Rust consolidation) — and deliberately absent from this dict, so
+# `python plugins/build.py` (no args) no longer builds or bundles them.
+# Their source files stay in-tree, unbuilt, as the oracle for re-verifying
+# the Rust ports against if a behavioral gap ever surfaces (see
+# docs/PLUGINS.md).
 PLUGINS: dict[str, dict[str, object]] = {
     "adaptive-pathway": {
         "dir": PLUGINS_DIR / "adaptive-pathway",
@@ -75,21 +77,28 @@ PLUGINS: dict[str, dict[str, object]] = {
         "exe": "adaptive-pathway-mcp",
         "extras": ["mcp"],
     },
-    "wasm-math-mcp": {
-        "dir": PLUGINS_DIR / "wasm-math-mcp",
-        "spec": "wasm_math_mcp.spec",
-        "exe": "wasm-math-mcp",
-        "extras": [],
-    },
-    "kitty-docs-web": {
-        "dir": PLUGINS_DIR / "kitty-docs-web",
-        "spec": "kitty_docs_web.spec",
-        "exe": "kitty-docs-web",
-        "extras": [],
-    },
     "kitty-tools": {
         "dir": PLUGINS_DIR / "kitty-tools",
         "exe": "kitty-tools",
+        "extras": [],
+        "kind": "rust",
+    },
+    # The Rust replacements for `replacement-mcp`'s tool set: `kitty-tools`
+    # (local tools + Excel/PDF) and `kitty-web` (web search/scrape), plus
+    # `kitty-wasm` (which supersedes the now-retired `wasm-math-mcp` Python
+    # plugin). Each is still built and bundled as a stdio server here
+    # (desktop's hosting shape); a host that can't exec() a bundled binary
+    # links them in-process instead via `bigtiny_rust::mcp::builtin` — see
+    # docs/PLUGINS.md.
+    "kitty-web": {
+        "dir": PLUGINS_DIR / "kitty-web",
+        "exe": "kitty-web",
+        "extras": [],
+        "kind": "rust",
+    },
+    "kitty-wasm": {
+        "dir": PLUGINS_DIR / "kitty-wasm",
+        "exe": "kitty-wasm",
         "extras": [],
         "kind": "rust",
     },

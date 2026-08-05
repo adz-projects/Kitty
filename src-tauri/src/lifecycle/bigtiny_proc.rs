@@ -5,7 +5,6 @@
 //! `X-API-Key`. `/api/health` is exempt from auth on the BigTiny side, so
 //! readiness polling needs no key.
 
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -88,10 +87,17 @@ pub fn remove_pidfile() {
     }
 }
 
-/// Ask the OS for an unused localhost port by binding to :0 and reading it back.
-fn free_port() -> std::io::Result<u16> {
-    let listener = TcpListener::bind("127.0.0.1:0")?;
-    Ok(listener.local_addr()?.port())
+/// Pick an unused localhost port and hold the bound socket so it stays
+/// reserved until just before the child is spawned. The old helper bound to
+/// `:0`, read the port, then *dropped* the socket — a TOCTOU where another
+/// process could grab that port before BigTiny bound it, and Kitty's health
+/// probe would then be answered by an unrelated process on the same port.
+/// Holding the listener here keeps the port reserved for the whole (non-trivial)
+/// setup below and releases it only immediately before `cmd.spawn()`.
+fn bind_reserved_port() -> std::io::Result<(u16, std::net::TcpListener)> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    Ok((port, listener))
 }
 
 /// 32 hex chars of randomness for `BIGTINY_SECRET`.
@@ -114,7 +120,7 @@ pub async fn spawn(
 ) -> Result<DaemonHandle, String> {
     kill_stale_orphan();
 
-    let port = free_port().map_err(|e| format!("no free port: {e}"))?;
+    let (port, _reserved) = bind_reserved_port().map_err(|e| format!("no free port: {e}"))?;
     let secret = generate_secret();
     // Unlike `secret` above (regenerated every launch), this must be stable
     // across restarts or previously-encrypted rows in BigTiny's own DB
@@ -177,6 +183,10 @@ pub async fn spawn(
     if let Some(dir) = dir {
         cmd.current_dir(dir);
     }
+    // Release the reserved port now, immediately before the child binds —
+    // this is the whole point of `bind_reserved_port` (hold through setup,
+    // release at the instant of spawn).
+    drop(_reserved);
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("failed to spawn BigTiny ({command}): {e}"))?;

@@ -192,7 +192,13 @@ pub async fn connect_server(client: &BigTinyClient, id: &str) -> Result<(), Stri
 /// user-added card (since `HIDDEN_SERVER_NAMES` only hides the *current*
 /// name set). Called before any upsert so a stale row never races a fresh
 /// create under the same name.
-const RETIRED_BUILTINS: &[&str] = &["replacement-mcp", "brave-mcp-search", "visualizations"];
+const RETIRED_BUILTINS: &[&str] = &[
+    "replacement-mcp",
+    "brave-mcp-search",
+    "visualizations",
+    "kitty-docs-web",
+    "wasm-math-mcp",
+];
 
 async fn remove_retired_builtins(client: &BigTinyClient) {
     let Some(existing) = list_servers_with_retry(client, "retired-builtins-cleanup").await else {
@@ -215,11 +221,11 @@ pub async fn ensure_builtin_servers(app: &AppHandle) {
     remove_retired_builtins(&client).await;
 
     let (
-        wasm_math_enabled,
+        kitty_wasm_enabled,
         brave_search_enabled,
         visualizations_enabled,
         kitty_tools_enabled,
-        kitty_docs_web_enabled,
+        kitty_web_enabled,
         ap_enabled,
         ap_db_path,
         ap_embedding_model,
@@ -229,11 +235,11 @@ pub async fn ensure_builtin_servers(app: &AppHandle) {
         let state = app.state::<AppState>();
         let cfg = state.config.lock().unwrap();
         (
-            cfg.wasm_math_mcp_enabled,
+            cfg.kitty_wasm_enabled,
             cfg.brave_mcp_search_enabled,
             cfg.visualizations_enabled,
             cfg.kitty_tools_enabled,
-            cfg.kitty_docs_web_enabled,
+            cfg.kitty_web_enabled,
             cfg.adaptive_pathway_enabled,
             cfg.adaptive_pathway_db_path.clone(),
             cfg.adaptive_pathway_embedding_model.clone(),
@@ -266,34 +272,54 @@ pub async fn ensure_builtin_servers(app: &AppHandle) {
     )
     .await;
 
-    let wasm_math_cmd = crate::config::bundled_plugin_path("wasm-math-mcp.exe")
-        .unwrap_or_else(|| "wasm-math-mcp".to_string());
+    // `kitty-wasm` hosts the sandboxed WebAssembly compute tools
+    // (`execute_math_python` / `wasm_python_run` / `wasm_run_module` /
+    // `wasm_guest_status`) — the Rust replacement for the retired
+    // `wasm-math-mcp` Python plugin (see `plugins/kitty-wasm/` and
+    // `docs/PLUGINS.md`). The 26 MB CPython WASI guest is bundled as an app
+    // resource so first use is offline: `guest::find_python_guest` checks
+    // `KITTY_WASM_PYTHON` first, so pointing it at the bundled file
+    // short-circuits any download. Best-effort: if the resource isn't
+    // resolvable the var is left unset and the guest falls back to its normal
+    // install/download path.
+    let kitty_wasm_cmd = crate::config::bundled_plugin_path("kitty-wasm.exe")
+        .unwrap_or_else(|| "kitty-wasm".to_string());
+    let mut kitty_wasm_env = HashMap::new();
+    if let Ok(res) = app.path().resource_dir() {
+        let guest = res.join("python-3.12.0.wasm");
+        if guest.is_file() {
+            kitty_wasm_env.insert(
+                "KITTY_WASM_PYTHON".to_string(),
+                guest.to_string_lossy().into_owned(),
+            );
+        }
+    }
     upsert_builtin(
         &client,
-        "wasm-math-mcp",
+        "kitty-wasm",
         &McpServerSpec {
-            name: "wasm-math-mcp".to_string(),
+            name: "kitty-wasm".to_string(),
             transport: "stdio".to_string(),
-            command: Some(wasm_math_cmd),
+            command: Some(kitty_wasm_cmd),
             args: vec![],
             url: None,
-            env: HashMap::new(),
+            env: kitty_wasm_env,
             headers: HashMap::new(),
-            enabled: wasm_math_enabled,
+            enabled: kitty_wasm_enabled,
         },
     )
     .await;
 
     // `kitty-tools` hosts the local-machine tool set — 18 always-on
     // `lean_*` tools (shell/workspace/file/word/cache/scratchpad), plus the
-    // 3 visualization tools gated by `KITTY_VIZ_ENABLED` rather than
-    // registered as their own separate server. `enabled` alone
-    // (`kitty_tools_enabled`) controls whether the whole server is
-    // registered at all; `visualizations_enabled` only controls which tools
-    // it advertises once running — matching the "remove tools from the
-    // router at startup rather than registering them and failing at call
-    // time" design in `plugins/kitty-tools/src/server.rs`. Web search does
-    // NOT live here — see the `kitty-docs-web` block below for why.
+    // Excel/PDF tools, plus the 3 visualization tools gated by
+    // `KITTY_VIZ_ENABLED` rather than registered as their own separate
+    // server. `enabled` alone (`kitty_tools_enabled`) controls whether the
+    // whole server is registered at all; `visualizations_enabled` only
+    // controls which tools it advertises once running — matching the "remove
+    // tools from the router at startup rather than registering them and
+    // failing at call time" design in `plugins/kitty-tools/src/server.rs`.
+    // Web search does NOT live here — see the `kitty-web` block below.
     let kitty_tools_cmd = crate::config::bundled_plugin_path("kitty-tools.exe")
         .unwrap_or_else(|| "kitty-tools".to_string());
     let mut kitty_tools_env = HashMap::new();
@@ -316,20 +342,17 @@ pub async fn ensure_builtin_servers(app: &AppHandle) {
     )
     .await;
 
-    // PDF/Excel/web-scrape/web-search — the other half of the
-    // `replacement-mcp` split (see `plugins/kitty-docs-web/`). Hosts the
-    // merged, count-tiered `lean_web_search`/`lean_web_search_read_chunk`:
-    // Brave preferred (with automatic DuckDuckGo fallback) for small
-    // requests, both engines queried together for broader ones, and an
-    // offloaded/indexed mode for large ones. This tool used to live in
-    // `kitty-tools` (Rust) as `brave_mcp_search`; it moved here because
-    // DuckDuckGo's `ddgs` library has no Rust crate equivalent, while
-    // Brave's call is a plain JSON GET, trivial to host alongside `ddgs`
-    // instead — see `docs/VERSIONS.md`. `BRAVE_API_KEY` now attaches to
-    // *this* server's env map rather than `kitty-tools`'s.
-    let kitty_docs_web_cmd = crate::config::bundled_plugin_path("kitty-docs-web.exe")
-        .unwrap_or_else(|| "kitty-docs-web".to_string());
-    let mut kitty_docs_web_env = HashMap::new();
+    // `kitty-web` hosts the merged, count-tiered
+    // `lean_web_search`/`lean_web_search_read_chunk` and `lean_web_scrape` —
+    // the Rust replacement for the web half of the retired `kitty-docs-web`
+    // (see `plugins/kitty-web/` and `docs/PLUGINS.md`). Brave preferred (with
+    // automatic DuckDuckGo fallback) for small requests, both engines queried
+    // together for broader ones, and an offloaded/indexed mode for large
+    // ones. `BRAVE_API_KEY` attaches to *this* server's env map so
+    // `lean_web_search` can prefer Brave when configured.
+    let kitty_web_cmd = crate::config::bundled_plugin_path("kitty-web.exe")
+        .unwrap_or_else(|| "kitty-web".to_string());
+    let mut kitty_web_env = HashMap::new();
 
     // The API key is never read from config (see `brave_mcp_search_enabled`'s
     // doc comment) — only from the keyring, under a fixed id shared with
@@ -341,7 +364,7 @@ pub async fn ensure_builtin_servers(app: &AppHandle) {
     // Settings checkbox, which reads via a separate, later, synchronous
     // `has_secret` call) on nothing more than momentary OS contention. Only a
     // confirmed absence of the entry omits `BRAVE_API_KEY`; a read error
-    // skips the *entire* kitty-docs-web sync this pass (not just Brave)
+    // skips the *entire* kitty-web sync this pass (not just Brave)
     // rather than upserting a spec with the key silently dropped, which would
     // PATCH `env` and disable Brave preference for everyone on nothing more
     // than momentary keyring contention.
@@ -349,27 +372,27 @@ pub async fn ensure_builtin_servers(app: &AppHandle) {
         Ok(brave_api_key) => {
             let brave_api_key = brave_api_key.unwrap_or_default();
             if brave_search_enabled && !brave_api_key.is_empty() {
-                kitty_docs_web_env.insert("BRAVE_API_KEY".to_string(), brave_api_key);
+                kitty_web_env.insert("BRAVE_API_KEY".to_string(), brave_api_key);
             }
             upsert_builtin(
                 &client,
-                "kitty-docs-web",
+                "kitty-web",
                 &McpServerSpec {
-                    name: "kitty-docs-web".to_string(),
+                    name: "kitty-web".to_string(),
                     transport: "stdio".to_string(),
-                    command: Some(kitty_docs_web_cmd),
+                    command: Some(kitty_web_cmd),
                     args: vec![],
                     url: None,
-                    env: kitty_docs_web_env,
+                    env: kitty_web_env,
                     headers: HashMap::new(),
-                    enabled: kitty_docs_web_enabled,
+                    enabled: kitty_web_enabled,
                 },
             )
             .await;
         }
         Err(e) => {
             tracing::warn!(
-                "brave-mcp-search keyring read failed ({e}); skipping kitty-docs-web sync this pass to avoid disabling Brave preference on a transient error"
+                "brave-mcp-search keyring read failed ({e}); skipping kitty-web sync this pass to avoid disabling Brave preference on a transient error"
             );
         }
     }

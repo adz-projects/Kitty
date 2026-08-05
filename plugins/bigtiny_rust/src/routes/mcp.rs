@@ -147,7 +147,10 @@ pub async fn update_server(
         let args = body.get("args").map(|v| v.to_string());
         let env = body.get("env").map(|v| v.to_string());
         let headers = body.get("headers").map(encrypt_headers);
-        let _ = sqlx::query(
+        // Propagate the failure (500) rather than swallowing it — a
+        // silently-failed patch wrote nothing and the client was told the
+        // server was saved.
+        if let Err(e) = sqlx::query(
             r#"UPDATE mcp_servers SET
                command = COALESCE(?1, command),
                args = COALESCE(?2, args),
@@ -161,7 +164,10 @@ pub async fn update_server(
         .bind(&headers)
         .bind(&id)
         .execute(&state.db)
-        .await;
+        .await
+        {
+            return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+        }
     }
 
     let row = match mcp_servers::get_server(&state.db, &id).await {

@@ -21,7 +21,13 @@ pub async fn add_mcp_server(app: tauri::AppHandle, spec: McpServerSpec) -> Resul
     let client = ensure_client(&app)?;
     let id = mcp::create_server(&client, &spec).await?;
     if spec.enabled {
-        mcp::connect_server(&client, &id).await?;
+        // If the post-create auto-connect fails, roll the row back so we
+        // don't leave a half-configured, never-connected server card behind
+        // (mirrors the missing-cleanup gap in the old code).
+        if let Err(e) = mcp::connect_server(&client, &id).await {
+            let _ = mcp::delete_server(&client, &id).await;
+            return Err(e);
+        }
     }
     Ok(id)
 }
@@ -66,22 +72,24 @@ pub async fn connect_mcp_server(app: tauri::AppHandle, id: String) -> Result<(),
     mcp::connect_server(&client, &id).await
 }
 
-/// Whether the bundled `wasm-math-mcp` server is registered+enabled in
-/// BigTiny. No credentials, so a plain toggle like `replacement_mcp` above.
+/// Whether the bundled `kitty-wasm` server (sandboxed WebAssembly
+/// Python/arbitrary-module execution — the Rust replacement for the retired
+/// `wasm-math-mcp` Python plugin) is registered+enabled in BigTiny. No
+/// credentials, so a plain toggle like `replacement_mcp` above.
 #[tauri::command]
-pub fn get_wasm_math_mcp_enabled(state: tauri::State<'_, AppState>) -> Result<bool, String> {
-    Ok(state.config.lock().unwrap().wasm_math_mcp_enabled)
+pub fn get_kitty_wasm_enabled(state: tauri::State<'_, AppState>) -> Result<bool, String> {
+    Ok(state.config.lock().unwrap().kitty_wasm_enabled)
 }
 
 #[tauri::command]
-pub async fn set_wasm_math_mcp_enabled(
+pub async fn set_kitty_wasm_enabled(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     enabled: bool,
 ) -> Result<(), String> {
     {
         let mut cfg = state.config.lock().unwrap();
-        cfg.wasm_math_mcp_enabled = enabled;
+        cfg.kitty_wasm_enabled = enabled;
         config::save(&cfg).map_err(|e| e.to_string())?;
     }
     mcp::ensure_builtin_servers(&app).await;
@@ -136,23 +144,23 @@ pub async fn set_kitty_tools_enabled(
     Ok(())
 }
 
-/// Whether the bundled `kitty-docs-web` server (PDF/Excel/web-scrape/DDG
-/// search) is registered+enabled in BigTiny. No credentials, so a plain
-/// toggle like `wasm_math_mcp` above.
+/// Whether the bundled `kitty-web` web-search/web-scrape server is
+/// registered+enabled in BigTiny. No credentials, so a plain toggle like
+/// `wasm_math_mcp` above.
 #[tauri::command]
-pub fn get_kitty_docs_web_enabled(state: tauri::State<'_, AppState>) -> Result<bool, String> {
-    Ok(state.config.lock().unwrap().kitty_docs_web_enabled)
+pub fn get_kitty_web_enabled(state: tauri::State<'_, AppState>) -> Result<bool, String> {
+    Ok(state.config.lock().unwrap().kitty_web_enabled)
 }
 
 #[tauri::command]
-pub async fn set_kitty_docs_web_enabled(
+pub async fn set_kitty_web_enabled(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     enabled: bool,
 ) -> Result<(), String> {
     {
         let mut cfg = state.config.lock().unwrap();
-        cfg.kitty_docs_web_enabled = enabled;
+        cfg.kitty_web_enabled = enabled;
         config::save(&cfg).map_err(|e| e.to_string())?;
     }
     mcp::ensure_builtin_servers(&app).await;

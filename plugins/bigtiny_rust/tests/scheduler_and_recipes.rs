@@ -102,7 +102,7 @@ async fn run_job_success_completes_execution_and_deletes_temp_session() {
 }
 
 #[tokio::test]
-async fn run_job_failure_marks_execution_failed_and_keeps_temp_session_as_failed() {
+async fn run_job_failure_cleans_up_temp_session_and_execution_history() {
     let pool = test_pool().await;
     // A deliberately malformed Jinja template drives `RecipeEngine::execute`
     // into its `RecipeError::Template` path — recipes can't reference a
@@ -123,26 +123,19 @@ async fn run_job_failure_marks_execution_failed_and_keeps_temp_session_as_failed
     let scheduler = Scheduler::new(pool.clone(), engine).await.unwrap();
     scheduler.run_job("j2").await.unwrap();
 
-    let exec = sqlx::query(
-        "SELECT status, error_message, session_id FROM execution_history WHERE trigger_id = 'j2'",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    let status: String = exec.get("status");
-    let session_id: String = exec.get("session_id");
-    assert_eq!(status, "failed");
-    let error_message: Option<String> = exec.get("error_message");
-    assert!(error_message.is_some());
-
-    // The temp session was NOT deleted (would violate the FK from
-    // execution_history.session_id) — it's marked failed instead.
-    assert!(session_id.starts_with("_job_"));
-    let temp_session = sqlx::query("SELECT status FROM sessions WHERE id = ?")
-        .bind(&session_id)
-        .fetch_one(&pool)
+    // Regression (WS6-2): a failed run used to leak its `_job_*` temp session
+    // and `execution_history` row forever (marked `failed`). Now the history
+    // row is deleted first (FK-safe) and the temp session with it — the
+    // failure itself is only in the logs, nothing is left to accumulate.
+    let exec_rows = sqlx::query("SELECT id FROM execution_history WHERE trigger_id = 'j2'")
+        .fetch_all(&pool)
         .await
         .unwrap();
-    let temp_status: String = temp_session.get("status");
-    assert_eq!(temp_status, "failed");
+    assert!(exec_rows.is_empty(), "execution_history row must be cleaned up");
+
+    let temp_sessions = sqlx::query("SELECT id FROM sessions WHERE id LIKE '_job_%'")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert!(temp_sessions.is_empty(), "temp `_job_*` session must be cleaned up");
 }

@@ -1,4 +1,4 @@
-import { isValidElement, useState, type ReactNode } from 'react';
+import { isValidElement, useEffect, useRef, useState, type ReactNode } from 'react';
 
 /** Recursively pull the plain text out of a react-markdown/rehype node tree
     (the fenced code content, minus the syntax-highlight <span> wrappers). */
@@ -43,6 +43,16 @@ const EXT: Record<string, string> = {
     is unaffected (it isn't wrapped in a <pre>). */
 export function CodeBlock({ children }: { children?: ReactNode; node?: unknown }) {
   const [copied, setCopied] = useState(false);
+  const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Clear a pending "Copied" revert on unmount so it never fires across the
+  // component boundary (setState-after-unmount warning + a node sitting in
+  // the message list briefly looking copied).
+  useEffect(
+    () => () => {
+      if (copyTimerRef.current) clearTimeout(copyTimerRef.current);
+    },
+    []
+  );
   const codeEl = isValidElement(children) ? children : null;
   const className = (codeEl?.props as { className?: string } | undefined)?.className ?? '';
   const lang = /language-([\w-]+)/.exec(className)?.[1] ?? '';
@@ -52,7 +62,8 @@ export function CodeBlock({ children }: { children?: ReactNode; node?: unknown }
     try {
       await navigator.clipboard.writeText(text);
       setCopied(true);
-      setTimeout(() => setCopied(false), 1200);
+      if (copyTimerRef.current) clearTimeout(copyTimerRef.current);
+      copyTimerRef.current = setTimeout(() => setCopied(false), 1200);
     } catch {
       /* clipboard may be unavailable */
     }

@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { ipc } from '@/lib/ipc';
 import type { AdaptivePathwayEdge } from '@/lib/types';
 import { findHintToolCall, parseHintOutput, type Message } from '@/stores/chatStore';
@@ -47,6 +47,16 @@ export function HintBadge({ message }: { message: Message }) {
   const [open, setOpen] = useState(false);
   const [edgeDetail, setEdgeDetail] = useState<Record<string, EdgeDetailState>>({});
   const { triggerRef, popoverRef, style } = usePopoverPosition(open, () => setOpen(false));
+  // Cancellation guard for the async `adaptivePathwayGetEdge` fetch below, so a
+  // setState fired after this component unmounted (message list scroll-out /
+  // session switch mid-fetch) is a no-op instead of a warning/leak.
+  const cancelledRef = useRef(false);
+  useEffect(
+    () => () => {
+      cancelledRef.current = true;
+    },
+    []
+  );
 
   const call = findHintToolCall(message);
   const parsed = parseHintOutput(call);
@@ -57,9 +67,11 @@ export function HintBadge({ message }: { message: Message }) {
     setEdgeDetail((prev) => ({ ...prev, [edgeId]: { status: 'loading' } }));
     try {
       const edge = await ipc.adaptivePathwayGetEdge(edgeId);
-      setEdgeDetail((prev) => ({ ...prev, [edgeId]: { status: 'ok', edge } }));
+      if (!cancelledRef.current)
+        setEdgeDetail((prev) => ({ ...prev, [edgeId]: { status: 'ok', edge } }));
     } catch (e) {
-      setEdgeDetail((prev) => ({ ...prev, [edgeId]: { status: 'error', message: String(e) } }));
+      if (!cancelledRef.current)
+        setEdgeDetail((prev) => ({ ...prev, [edgeId]: { status: 'error', message: String(e) } }));
     }
   };
 

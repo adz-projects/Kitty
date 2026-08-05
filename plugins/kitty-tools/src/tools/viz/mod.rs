@@ -13,17 +13,25 @@
 
 pub mod escape;
 pub mod layout;
+pub mod mermaid;
 pub mod model;
 pub mod render;
 pub mod text;
 
+use crate::envelope::error_response;
 use serde_json::{json, Map, Value};
 
 const WRAPPER: &str = include_str!("assets/wrapper.html");
 const DEFS: &str = include_str!("assets/defs.svg");
 
 fn wrap_in_standalone_html(title: &str, body_content: &str) -> String {
-    escape::render_template(WRAPPER, &[("TITLE", title), ("BODY", body_content)])
+    // `TITLE` lands in the RCDATA `<title>…</title>` context, so it must be
+    // HTML-escaped (`<`, `>`, `&`; quotes are inert there) — otherwise a
+    // title like `</title><script>…` would close the element and execute.
+    // `BODY` is already-escaped SVG/HTML from the renderers and must NOT be
+    // double-escaped, so it passes through verbatim.
+    let escaped_title = escape::escape_text(title);
+    escape::render_template(WRAPPER, &[("TITLE", &escaped_title), ("BODY", body_content)])
 }
 
 fn success_payload(title: &str, html_payload: &str, warnings: &[String]) -> String {
@@ -59,6 +67,23 @@ pub fn generate_accessible_svg(diagram_type: model::DiagramType, title: &str, de
         model::DiagramType::Swimlane => layout::swimlane::render(&validated.steps),
         model::DiagramType::JourneyMap => layout::journey::render(&validated.steps),
     };
+
+    // Readability budget: layouts compress to fit, but anything still over
+    // (e.g. an un-compressible swimlane/journey past their tighter node caps)
+    // would render illegibly small when the iframe scales it to its own width —
+    // better a helpful error than an unreadable diagram.
+    let budget = match validated.diagram_type {
+        model::DiagramType::Swimlane | model::DiagramType::JourneyMap => layout::MAX_CONTENT_W_WIDE,
+        _ => layout::MAX_CONTENT_W,
+    };
+    if width > budget + layout::WIDTH_SLACK {
+        return error_response(
+            "VIZ_TOO_WIDE",
+            &format!("This diagram is {width:.0}px wide, wider than the {budget:.0}px readability budget, so it would render illegibly small in the chat."),
+            None,
+            Some("Reduce the number of steps or nodes, or split the diagram into smaller ones."),
+        );
+    }
 
     let svg = render::svg::document(DEFS, &validated.title, &validated.description, width, height, &body);
     let standalone = wrap_in_standalone_html(&validated.title, &svg);
@@ -169,5 +194,27 @@ mod tests {
         let html = v["html_payload"].as_str().unwrap();
         assert!(html.contains("evil __BODY__ literal"));
         assert!(html.contains("Alpha"), "the real body must still be present, not replaced by the title's literal token");
+    }
+
+    #[test]
+    fn title_containing_closing_tag_cannot_inject_script() {
+        // Historical XSS: the title was interpolated into the wrapper unescaped
+        // (`<title>__TITLE__</title>`), so a `</title><script>…` title escaped
+        // the element and executed — the `script-src 'unsafe-inline'` CSP made
+        // it worse. The title is now HTML-escaped before substitution.
+        let s = generate_accessible_table(
+            "</title><script>alert(1)</script>",
+            &["A".to_string()],
+            &[vec![json!(1)]],
+            None,
+        );
+        let v: Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["status"], "success");
+        let html = v["html_payload"].as_str().unwrap();
+        assert!(!html.contains("</title><script"), "title must not break out of the element: {html}");
+        assert!(
+            html.contains("&lt;/title&gt;&lt;script&gt;alert(1)&lt;/script&gt;"),
+            "title should appear HTML-escaped: {html}"
+        );
     }
 }

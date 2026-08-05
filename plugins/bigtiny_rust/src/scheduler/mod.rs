@@ -118,25 +118,63 @@ impl Scheduler {
     /// re-registers with the new cron only if the job ends up enabled.
     /// Matches Python's real mechanism (APScheduler `add_job`/remove on
     /// edit), not just a DB write.
+    ///
+    /// Ordering matters: the live cron is validated + registered *before* the
+    /// DB is persisted, so an invalid cron (which `register_cron_job` rejects
+    /// via `Job::new_async`/`inner.add`) leaves the row untouched and the old
+    /// job still firing — previously the DB was updated first, then the
+    /// register failed, leaving the row pointing at a cron that would never
+    /// fire until the next restart. `enabled=false` needs no live
+    /// registration; the old job is simply unregistered.
     pub async fn update_job(
         &mut self,
         job_id: &str,
         cron: Option<&str>,
         enabled: Option<bool>,
     ) -> Result<(), SchedulerError> {
-        schedules::update_schedule(&self.db, job_id, cron, enabled.map(|b| b as i32))
-            .await
-            .map_err(SchedulerError::from)?;
-
-        let job = schedules::get_schedule(&self.db, job_id)
+        let current = schedules::get_schedule(&self.db, job_id)
             .await
             .map_err(SchedulerError::from)?
             .ok_or_else(|| SchedulerError::NotFound(job_id.to_string()))?;
 
-        self.unregister_cron_job(job_id).await;
-        if job.enabled != 0 {
-            self.register_cron_job(job_id, &job.cron).await?;
+        let new_enabled = enabled.unwrap_or(current.enabled != 0);
+        let new_cron = cron.map(|s| s.to_string()).unwrap_or_else(|| current.cron.clone());
+
+        if new_enabled {
+            // Take the existing registration mapping out first (without
+            // touching the still-running scheduler job) so the new one can
+            // take over its key...
+            let old_uuid = self.job_uuids.remove(job_id).map(|(_, uuid)| uuid);
+            match self.register_cron_job(job_id, &new_cron).await {
+                Ok(()) => {
+                    // New job proven registerable — now it is safe to retire
+                    // the old one. Sequential `inner.add` then `inner.remove`
+                    // means there's never a gap where the job isn't firing.
+                    if let Some(old_uuid) = old_uuid {
+                        if let Err(e) = self.inner.remove(&old_uuid).await {
+                            tracing::warn!(
+                                "Failed to unregister old cron job {job_id}: {e}"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    // Register failed — restore the old mapping (the old live
+                    // job was never removed) and return, leaving DB + live
+                    // scheduler exactly as they were.
+                    if let Some(old_uuid) = old_uuid {
+                        self.job_uuids.insert(job_id.to_string(), old_uuid);
+                    }
+                    return Err(e);
+                }
+            }
+        } else {
+            self.unregister_cron_job(job_id).await;
         }
+
+        schedules::update_schedule(&self.db, job_id, cron, enabled.map(|b| b as i32))
+            .await
+            .map_err(SchedulerError::from)?;
         Ok(())
     }
 
@@ -161,11 +199,19 @@ impl Scheduler {
         enabled: bool,
     ) -> Result<String, SchedulerError> {
         let id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
-        schedules::create_schedule(&self.db, &id, name, cron, recipe_id, enabled as i32)
-            .await
-            .map_err(SchedulerError::from)?;
+        // Validate + register the live cron BEFORE persisting, so an invalid
+        // cron returns an error with no half-written DB row. Under
+        // `enabled=false` there's nothing to register.
         if enabled {
             self.register_cron_job(&id, cron).await?;
+        }
+        if let Err(e) = schedules::create_schedule(&self.db, &id, name, cron, recipe_id, enabled as i32)
+            .await
+        {
+            // Roll back the live registration — the DB insert failed, so a
+            // live job with no row would fire forever against nothing.
+            self.unregister_cron_job(&id).await;
+            return Err(SchedulerError::from(e));
         }
         Ok(id)
     }
@@ -234,21 +280,19 @@ async fn execute_job(db: &SqlitePool, engine: &RecipeEngine, job_id: &str) {
         }
         Err(e) => {
             tracing::error!("Scheduled job {job_id} failed: {e}");
-            let _ = execution::update_execution_status(
-                db,
-                &exec_id,
-                "failed",
-                None,
-                Some(&e.to_string()),
-            )
-            .await;
-            // Can't delete temp_sid here the way the success path does above:
-            // execution_history.session_id (NOT NULL, FK -> sessions, no ON
-            // DELETE clause) still points at it on this path — with
-            // foreign_keys=ON, that delete would fail with a FK constraint
-            // violation, masking the real failure just logged. Mark it
-            // failed instead, matching Python's identical workaround.
-            let _ = sessions::update_session_status(db, &temp_sid, "failed").await;
+            // Clean up the bookkeeping rows on the failure path exactly like
+            // the success path does, but in FK-safe order: the temp session
+            // can't be deleted while `execution_history.session_id` (NOT NULL,
+            // FK -> sessions, no ON DELETE clause) still points at it, so the
+            // history row goes first, then the session. Previously this path
+            // only marked the session `failed`, leaking a `_job_*` session and
+            // its `execution_history` row forever on every failed run. The
+            // failure itself is still captured in the log line above.
+            let _ = sqlx::query("DELETE FROM execution_history WHERE id = ?")
+                .bind(&exec_id)
+                .execute(db)
+                .await;
+            let _ = sessions::delete_session(db, &temp_sid).await;
         }
     }
 }

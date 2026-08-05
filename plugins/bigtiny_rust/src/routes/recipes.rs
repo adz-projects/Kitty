@@ -9,6 +9,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::{json, Value};
 
+use crate::error::RecipeError;
 use crate::storage::recipes;
 
 use super::AppState;
@@ -71,6 +72,17 @@ pub async fn execute_recipe(
     let parameters = body.map(|Json(b)| b).unwrap_or_else(|| json!({}));
     match state.recipe_engine.execute(&id, parameters).await {
         Ok(session_id) => Json(json!({"session_id": session_id})).into_response(),
-        Err(e) => err_response(StatusCode::BAD_REQUEST, e.to_string()),
+        Err(e) => {
+            // Distinguish validation/usage errors (missing recipe → 404,
+            // bad template → 400) from internal failures (storage → 500). The
+            // previous code mapped *every* engine error to 400, hiding
+            // genuine server faults as client errors.
+            let status = match &e {
+                RecipeError::NotFound(_) => StatusCode::NOT_FOUND,
+                RecipeError::Template(_) => StatusCode::BAD_REQUEST,
+                RecipeError::Storage(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            err_response(status, e.to_string())
+        }
     }
 }

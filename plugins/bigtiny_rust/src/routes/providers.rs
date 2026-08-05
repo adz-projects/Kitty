@@ -128,14 +128,20 @@ pub async fn create_provider(
 
     let config = merge_config(None, &body);
     let fallback_priority = body.get("fallback_priority").and_then(|v| v.as_i64());
-    let _ = sqlx::query(
+    if let Err(e) = sqlx::query(
         r#"UPDATE providers SET config = ?1, fallback_priority = COALESCE(?2, fallback_priority) WHERE id = ?3"#
     )
     .bind(&config)
     .bind(fallback_priority.map(|v| v as i32))
     .bind(&id)
     .execute(&state.db)
-    .await;
+    .await
+    {
+        // Was `let _ = ...` — a swallowed failure left a provider row with no
+        // config (no API key/model), then re-registered into the router as if
+        // everything had been saved.
+        return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+    }
 
     let Ok(Some(row)) = providers::get_provider(&state.db, &row.id).await else {
         return err_response(
@@ -168,11 +174,14 @@ pub async fn update_provider(
         return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
     }
     if let Some(priority) = body.get("fallback_priority").and_then(|v| v.as_i64()) {
-        let _ = sqlx::query(r#"UPDATE providers SET fallback_priority = ? WHERE id = ?"#)
+        if let Err(e) = sqlx::query(r#"UPDATE providers SET fallback_priority = ? WHERE id = ?"#)
             .bind(priority as i32)
             .bind(&id)
             .execute(&state.db)
-            .await;
+            .await
+        {
+            return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+        }
     }
 
     match providers::get_provider(&state.db, &id).await {
@@ -198,7 +207,14 @@ pub async fn delete_provider(
 
 pub async fn test_provider(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
     match state.router.check_health(&id).await {
-        Ok(status) => Json(status).into_response(),
+        // Healthy → 200 with the latency payload.
+        Ok(status) if status.status == "healthy" => Json(status).into_response(),
+        // Reachable but down → 502 Bad Gateway carrying the health payload so
+        // the UI can distinguish "provider exists but is down" (502) from
+        // "no such provider" (404 below). Previously *every* failure was
+        // reported as 404, which conflated the two.
+        Ok(status) => (StatusCode::BAD_GATEWAY, Json(status)).into_response(),
+        // The only `Err` `check_health` produces is an unknown provider id.
         Err(e) => err_response(StatusCode::NOT_FOUND, e.to_string()),
     }
 }

@@ -23,11 +23,12 @@
     "externalBin": [
       "binaries/adaptive-pathway-sidecar",
       "binaries/adaptive-pathway-mcp",
-      "binaries/wasm-math-mcp",
+      "binaries/kitty-wasm",
       "binaries/kitty-tools",
-      "binaries/kitty-docs-web",
+      "binaries/kitty-web",
       "binaries/bigtiny-daemon"
     ],
+    "resources": ["resources/python-3.12.0.wasm"],
     "windows": {
       "webviewInstallMode": {
         "type": "embedBootstrapper",

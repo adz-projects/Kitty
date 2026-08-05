@@ -182,6 +182,15 @@ static FENCE_RE: once_cell::sync::Lazy<Regex> =
     once_cell::sync::Lazy::new(|| Regex::new(r"(?s)```[^\n]*\n.*?\n```").unwrap());
 
 fn mask_code_block(fence_block: &str, head_lines: i32, tail_lines: i32) -> String {
+    // Clamp to >= 0 at the use site too (config sanitization at load in
+    // `config.rs` is the first line of defense): a negative `head_lines`/
+    // `tail_lines` used to become a huge `usize` index via `as usize`
+    // (`body[..huge..]` panics on a slice out of bounds), and each is
+    // additionally clamped to the body length so `body.len() - tail` can
+    // never underflow.
+    let head = head_lines.max(0) as usize;
+    let tail = tail_lines.max(0) as usize;
+
     let lines: Vec<&str> = fence_block.lines().collect();
     if lines.len() < 2 {
         return fence_block.to_string();
@@ -190,17 +199,20 @@ fn mask_code_block(fence_block: &str, head_lines: i32, tail_lines: i32) -> Strin
     let closing = lines[lines.len() - 1];
     let body = &lines[1..lines.len() - 1];
 
-    if body.len() <= (head_lines + tail_lines) as usize {
+    let head = head.min(body.len());
+    let tail = tail.min(body.len());
+
+    if body.len() <= (head + tail) {
         return fence_block.to_string();
     }
 
-    let elided = body.len() - (head_lines + tail_lines) as usize;
+    let elided = body.len() - (head + tail);
     let mut kept: Vec<String> = Vec::new();
-    kept.extend(body[..head_lines as usize].iter().map(|s| s.to_string()));
+    kept.extend(body[..head].iter().map(|s| s.to_string()));
     kept.push(format!("[...{elided} lines elided...]"));
-    if tail_lines > 0 {
+    if tail > 0 {
         kept.extend(
-            body[body.len() - tail_lines as usize..]
+            body[body.len() - tail..]
                 .iter()
                 .map(|s| s.to_string()),
         );
@@ -354,13 +366,22 @@ pub fn group_into_exchanges(rows: &[Value]) -> Vec<Vec<Value>> {
 }
 
 /// Returns the rowid of the first message in the reserved live tail.
+///
+/// A `reserve_exchanges <= 0` or one that covers every exchange historically
+/// fell into `&exchanges[len - reserve..]`, which is an empty slice for
+/// `reserve == 0` and panicked on `reserved[0][0]` — a `SummarizerConfig`
+/// with `reserve_exchanges: 0` (or a session with very few exchanges) could
+/// kill an otherwise-healthy compaction pass. Both degenerate cases now
+/// return the earliest rowid (nothing is excluded from folding).
 pub fn find_reserve_floor_rowid(rows: &[Value], reserve_exchanges: i32) -> i64 {
     let exchanges = group_into_exchanges(rows);
-    if exchanges.len() <= reserve_exchanges as usize {
-        return rows
-            .first()
+    let earliest = || {
+        rows.first()
             .and_then(|r| r.get("rowid").and_then(|v| v.as_i64()))
-            .unwrap_or(0);
+            .unwrap_or(0)
+    };
+    if reserve_exchanges <= 0 || exchanges.len() <= reserve_exchanges as usize {
+        return earliest();
     }
 
     let reserved = &exchanges[exchanges.len() - reserve_exchanges as usize..];
@@ -489,6 +510,12 @@ pub fn build_summarizer_prompt(existing_slots: Option<&Value>, chunk: &[Value]) 
 /// every turn) can't race on `compacted_through_rowid`/`memory_slots`;
 /// stale locks (left behind by a crashed pass) are reclaimed after
 /// `2 * summarizer_cfg.timeout_s`.
+///
+/// `force` bypasses the automatic token threshold (`total_tokens <=
+/// high_water` early-return in `run_compaction_inner`): the manual `/compact`
+/// command sets it so a short-but-live session still folds into memory, while
+/// the post-turn automatic call always passes `false` and keeps the old
+/// budget-gated behavior.
 pub async fn run_compaction(
     pool: &SqlitePool,
     session_id: &str,
@@ -496,6 +523,7 @@ pub async fn run_compaction(
     token_cfg: &TokenManagementConfig,
     summarizer_cfg: &SummarizerConfig,
     context_length: i32,
+    force: bool,
 ) -> Option<CompactionResult> {
     if !summarizer_cfg.enabled {
         return None;
@@ -514,6 +542,7 @@ pub async fn run_compaction(
         token_cfg,
         summarizer_cfg,
         context_length,
+        force,
     )
     .await;
 
@@ -532,6 +561,7 @@ async fn run_compaction_inner(
     token_cfg: &TokenManagementConfig,
     summarizer_cfg: &SummarizerConfig,
     context_length: i32,
+    force: bool,
 ) -> Option<CompactionResult> {
     let session = match sessions::get_session(pool, session_id).await.ok().flatten() {
         Some(s) => s,
@@ -606,41 +636,50 @@ async fn run_compaction_inner(
         return None;
     }
 
-    let total_tokens: i32 = rows.iter().map(|r| r.token_count.unwrap_or(0)).sum();
     let high_water = token_cfg
         .min_compaction_tokens
         .max((context_length as f64 * token_cfg.compaction_threshold) as i32);
 
-    if total_tokens <= high_water {
+    let low_water = (context_length as f64 * token_cfg.compaction_target_ratio) as i32;
+
+    // Sum only the FOLDABLE rows' tokens, not `rows.iter()` as a whole. The
+    // old `total_tokens` included the reserved live tail (never foldable) and
+    // the system rows already dropped from `values`, inflating the fold
+    // region's real size — the trigger fired earlier than the foldable
+    // region warranted and the fold loop started from that inflated total,
+    // stopping high above low-water. Base both the trigger and the fold
+    // budget on the candidate region only.
+    let token_of = |rowid: i64| -> i64 {
+        rows.iter()
+            .find(|r| r.rowid == rowid)
+            .map(|r| r.token_count.unwrap_or(0) as i64)
+            .unwrap_or(0)
+    };
+    let foldable_tokens: i64 = candidate_rows
+        .iter()
+        .filter_map(|v| v.get("rowid").and_then(|r| r.as_i64()))
+        .map(&token_of)
+        .sum();
+
+    if !force && foldable_tokens <= high_water as i64 {
         return None;
     }
 
-    let low_water = (context_length as f64 * token_cfg.compaction_target_ratio) as i32;
-
     let candidate_exchanges = group_into_exchanges(&candidate_rows);
     let mut to_fold: Vec<Value> = Vec::new();
-    let mut remaining_tokens = total_tokens;
+    let mut remaining_tokens = foldable_tokens;
 
     // Calculate per-exchange token count
     for exchange in &candidate_exchanges {
-        let exchange_tokens: i32 = exchange
+        let exchange_tokens: i64 = exchange
             .iter()
-            .map(|v| {
-                v.get("rowid")
-                    .and_then(|r| r.as_i64())
-                    .and_then(|rowid| {
-                        rows.iter()
-                            .find(|r| r.rowid == rowid)
-                            .map(|r| r.token_count.unwrap_or(0))
-                    })
-                    .unwrap_or(0)
-            })
+            .map(|v| token_of(v.get("rowid").and_then(|r| r.as_i64()).unwrap_or(0)))
             .sum();
 
         to_fold.extend(exchange.clone());
         remaining_tokens -= exchange_tokens;
 
-        if remaining_tokens <= low_water {
+        if remaining_tokens <= low_water as i64 {
             break;
         }
     }
@@ -683,24 +722,15 @@ async fn run_compaction_inner(
         return None;
     }
 
-    let tokens_after = total_tokens
-        - to_fold
-            .iter()
-            .map(|v| {
-                v.get("rowid")
-                    .and_then(|r| r.as_i64())
-                    .and_then(|rowid| {
-                        rows.iter()
-                            .find(|r| r.rowid == rowid)
-                            .map(|r| r.token_count.unwrap_or(0))
-                    })
-                    .unwrap_or(0)
-            })
-            .sum::<i32>();
+    let tokens_folded: i64 = to_fold
+        .iter()
+        .map(|v| token_of(v.get("rowid").and_then(|r| r.as_i64()).unwrap_or(0)))
+        .sum();
+    let tokens_after = (foldable_tokens - tokens_folded) as i32;
 
     Some(CompactionResult {
         messages_compacted: to_fold.len(),
-        tokens_before: total_tokens,
+        tokens_before: foldable_tokens as i32,
         tokens_after,
     })
 }
@@ -876,5 +906,47 @@ mod tests {
         ];
         let trimmed = emergency_trim(&messages, 5, 50);
         assert!(!trimmed.is_empty());
+    }
+
+    /// Regression: `reserve_exchanges == 0` used to panic on the empty
+    /// `&exchanges[len..]` slice; it must return the earliest rowid instead.
+    #[test]
+    fn test_find_reserve_floor_rowid_zero_reserve_does_not_panic() {
+        let rows = vec![
+            json!({"role": "user", "content": "1", "rowid": 10}),
+            json!({"role": "assistant", "content": "a", "rowid": 20}),
+            json!({"role": "user", "content": "2", "rowid": 30}),
+            json!({"role": "assistant", "content": "b", "rowid": 40}),
+        ];
+        assert_eq!(find_reserve_floor_rowid(&rows, 0), 10);
+        assert_eq!(find_reserve_floor_rowid(&rows, -1), 10);
+        // Reserving more exchanges than exist is also safe (earliest rowid).
+        assert_eq!(find_reserve_floor_rowid(&rows, 99), 10);
+    }
+
+    /// Regression: negative `message_mask_head_lines`/`tail_lines` became a
+    /// huge `usize` slice index and panicked; `mask_code_block` must clamp.
+    #[test]
+    fn test_mask_code_block_negative_thresholds_do_not_panic() {
+        let block = "```rust\nline1\nline2\nline3\nline4\n```";
+        for head in [-10, -1, 0] {
+            for tail in [-10, -1, 0] {
+                let masked = mask_code_block(block, head, tail);
+                assert!(
+                    masked.contains("rust"),
+                    "opening fence lost for head={head} tail={tail}: {masked}"
+                );
+                assert!(masked.contains("```"));
+            }
+        }
+    }
+
+    /// Regression: a small body with a huge (positive) tail threshold must
+    /// not underflow `body.len() - tail`.
+    #[test]
+    fn test_mask_code_block_tail_larger_than_body_is_safe() {
+        let block = "```\nabc\n```";
+        let masked = mask_code_block(block, 0, i32::MAX);
+        assert_eq!(masked, block);
     }
 }

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useConfigDraft } from './useConfigDraft';
 import { ipc, pickFolder } from '@/lib/ipc';
 import { accelerator } from '@/lib/accelerator';
@@ -18,6 +18,22 @@ export function General() {
   const [sessionCount, setSessionCount] = useState<number | null>(null);
   const [clearing, setClearing] = useState(false);
   const [clearError, setClearError] = useState<string | null>(null);
+  // Per-row hotkey inputs + the two single-row ones, so entering record mode
+  // can focus the target input — otherwise the recorded keystrokes were
+  // swallowed (nothing was focused).
+  const hotkeyRefs = useRef<(HTMLInputElement | null)[]>([]);
+  const clipboardRef = useRef<HTMLInputElement>(null);
+  const openWindowRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (recording != null) hotkeyRefs.current[recording]?.focus();
+  }, [recording]);
+  useEffect(() => {
+    if (recordingClipboard) clipboardRef.current?.focus();
+  }, [recordingClipboard]);
+  useEffect(() => {
+    if (recordingOpenWindow) openWindowRef.current?.focus();
+  }, [recordingOpenWindow]);
 
   useEffect(() => {
     void ipc.getAutostart().then(setAutostart);
@@ -76,6 +92,9 @@ export function General() {
         {draft.hotkeys.map((hk, i) => (
           <div className="row" key={i}>
             <input
+              ref={(el) => {
+                hotkeyRefs.current[i] = el;
+              }}
               value={recording === i ? 'Press a shortcut…' : hk}
               readOnly={recording === i}
               onChange={(e) =>
@@ -122,6 +141,7 @@ export function General() {
         <span>Clipboard hotkey</span>
         <div className="row">
           <input
+            ref={clipboardRef}
             value={recordingClipboard ? 'Press a shortcut…' : (draft.clipboard_hotkey ?? '')}
             readOnly={recordingClipboard}
             placeholder="Not set"
@@ -160,6 +180,7 @@ export function General() {
         <span>Open new chat window hotkey</span>
         <div className="row">
           <input
+            ref={openWindowRef}
             value={recordingOpenWindow ? 'Press a shortcut…' : (draft.open_window_hotkey ?? '')}
             readOnly={recordingOpenWindow}
             placeholder="Not set"

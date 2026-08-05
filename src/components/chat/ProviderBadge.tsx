@@ -21,6 +21,7 @@ export function ProviderBadge() {
   const [switchError, setSwitchError] = useState<string | null>(null);
   const { triggerRef, popoverRef, style } = usePopoverPosition(open, () => setOpen(false));
   const locked = useChatStore((s) => s.messages.length > 0);
+  const sessionId = useChatStore((s) => s.sessionId);
 
   const load = () =>
     // Best-effort: a failure just leaves the switch-provider dropdown empty
@@ -48,7 +49,9 @@ export function ProviderBadge() {
     setBusy(true);
     setSwitchError(null);
     try {
-      await ipc.activateProvider(id);
+      // Pass this window's active session so the stamp is per-session — other
+      // windows' open sessions keep their own provider (per-session isolation).
+      await ipc.activateProvider(id, sessionId);
     } catch (e) {
       // A real, actionable failure (e.g. the health-gate rejected the switch) —
       // surface it here instead of swallowing it silently.

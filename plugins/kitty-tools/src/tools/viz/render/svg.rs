@@ -89,6 +89,25 @@ impl SvgCanvas {
         self.body.push('\n');
     }
 
+    /// `text_line` plus a hard width backstop: when `content` is estimated
+    /// wider than `max_width`, the browser is told to squeeze the glyphs to
+    /// exactly `max_width` (`textLength` + `lengthAdjust="spacingAndGlyphs"`),
+    /// so the label physically cannot overflow its container no matter how the
+    /// user's `system-ui` font differs from the crate's metric table. When the
+    /// text already fits (measurement over-estimates by design), no attribute
+    /// is emitted and the text renders undistorted.
+    pub fn text_line_fit(&mut self, x: f32, y: f32, class: &str, content: &str, font_size: f32, max_width: f32) {
+        self.bounds.include_point(x, y);
+        let text = escape_text(content);
+        let mut tspans = format!(r#"<tspan x="{x:.1}">{text}</tspan>"#);
+        if max_width > 1.0 && crate::tools::viz::text::measure_px(content, font_size) > max_width {
+            tspans = format!(r#"<tspan x="{x:.1}" textLength="{max_width:.1}" lengthAdjust="spacingAndGlyphs">{text}</tspan>"#);
+        }
+        self.body
+            .push_str(&format!(r#"<text x="{x:.1}" y="{y:.1}" class="{class}">{tspans}</text>"#));
+        self.body.push('\n');
+    }
+
     /// Multi-line label centered on `(x, y)`, relying on the `.node-text`
     /// house style's `dominant-baseline: middle`: the first tspan is offset up
     /// by half the block height and each subsequent one steps down by
@@ -103,6 +122,34 @@ impl SvgCanvas {
         for (i, line) in lines.iter().enumerate() {
             let dy = if i == 0 { -(n - 1.0) * line_h / 2.0 } else { line_h };
             tspans.push_str(&format!(r#"<tspan x="{x:.1}" dy="{dy:.1}">{}</tspan>"#, escape_text(line)));
+        }
+        self.body.push_str(&format!(r#"<text x="{x:.1}" y="{y:.1}" class="{class}">{tspans}</text>"#));
+        self.body.push('\n');
+    }
+
+    /// Multi-line label with the same hard width backstop as `text_line_fit`:
+    /// each line whose *estimated* width exceeds `max_width` is handed to the
+    /// browser with `textLength` + `lengthAdjust="spacingAndGlyphs"` so it can
+    /// never paint wider than the container. Lines that already fit are
+    /// untouched (no glyph distortion).
+    #[allow(clippy::too_many_arguments)]
+    pub fn text_lines_fit(&mut self, x: f32, y: f32, class: &str, lines: &[String], line_h: f32, font_size: f32, max_width: f32) {
+        if lines.is_empty() {
+            return;
+        }
+        self.bounds.include_point(x, y);
+        let n = lines.len() as f32;
+        let mut tspans = String::new();
+        for (i, line) in lines.iter().enumerate() {
+            let dy = if i == 0 { -(n - 1.0) * line_h / 2.0 } else { line_h };
+            let text = escape_text(line);
+            if max_width > 1.0 && crate::tools::viz::text::measure_px(line, font_size) > max_width {
+                tspans.push_str(&format!(
+                    r#"<tspan x="{x:.1}" dy="{dy:.1}" textLength="{max_width:.1}" lengthAdjust="spacingAndGlyphs">{text}</tspan>"#
+                ));
+            } else {
+                tspans.push_str(&format!(r#"<tspan x="{x:.1}" dy="{dy:.1}">{text}</tspan>"#));
+            }
         }
         self.body.push_str(&format!(r#"<text x="{x:.1}" y="{y:.1}" class="{class}">{tspans}</text>"#));
         self.body.push('\n');
@@ -198,6 +245,36 @@ mod tests {
         let (body, _) = c.into_parts();
         assert!(!body.contains("<script>"));
         assert!(body.contains("&lt;script&gt;"));
+    }
+
+    #[test]
+    fn text_line_fit_squeezes_a_too_wide_line_but_leaves_a_fit_one_alone() {
+        let mut wide = SvgCanvas::new();
+        wide.text_line_fit(0.0, 0.0, "node-text", "A label that is far wider than the box", 12.5, 40.0);
+        let (body, _) = wide.into_parts();
+        assert!(body.contains(r#"textLength="40.0""#), "too-wide line must get the textLength backstop: {body}");
+        assert!(body.contains("lengthAdjust=\"spacingAndGlyphs\""));
+
+        let mut fits = SvgCanvas::new();
+        fits.text_line_fit(0.0, 0.0, "node-text", "Ok", 12.5, 40.0);
+        let (body, _) = fits.into_parts();
+        assert!(!body.contains("textLength"), "a fitting line must render undistorted: {body}");
+    }
+
+    #[test]
+    fn text_lines_fit_applies_the_backstop_per_line() {
+        let mut c = SvgCanvas::new();
+        c.text_lines_fit(
+            0.0,
+            0.0,
+            "node-text",
+            &["short".to_string(), "this second line is far too wide for the given budget".to_string()],
+            15.0,
+            12.5,
+            40.0,
+        );
+        let (body, _) = c.into_parts();
+        assert_eq!(body.matches("textLength").count(), 1, "only the overflowing line gets clamped: {body}");
     }
 
     #[test]

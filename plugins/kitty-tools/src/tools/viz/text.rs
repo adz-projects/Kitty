@@ -25,7 +25,7 @@ const ADVANCE_1000: [u16; 95] = [
 /// wider than the regular-weight metrics above, on top of general hinting slack —
 /// this margin biases every estimate upward, since under-estimating causes real
 /// clipping and over-estimating only wraps a little earlier than strictly needed.
-const SAFETY_MARGIN: f32 = 1.12;
+const SAFETY_MARGIN: f32 = 1.18;
 /// Latin-1 Supplement through Cyrillic/Greek/etc. (U+00A0..U+2E7F): most run
 /// close to the Latin average width at UI sizes.
 const FALLBACK_LATIN: u16 = 550;
@@ -41,6 +41,11 @@ fn char_advance_1000(c: char) -> u16 {
     } else {
         FALLBACK_WIDE
     }
+}
+
+/// Estimated rendered width of a single char at `font_size` px, in px.
+fn char_width_px(c: char, font_size: f32) -> f32 {
+    char_advance_1000(c) as f32 / 1000.0 * font_size * SAFETY_MARGIN
 }
 
 /// Estimated rendered width of `s` at `font_size` px, in px.
@@ -79,12 +84,7 @@ pub fn wrap(s: &str, max_px: f32, font_size: f32, max_lines: usize) -> Vec<Strin
                     break;
                 }
             }
-            let (fitted, rest) = hard_break_word(&word, max_px, font_size);
-            current_width = measure_px(&fitted, font_size);
-            current = fitted;
-            if !rest.is_empty() {
-                pending.push_front(rest);
-            }
+            current_width = split_wide_word(&word, max_px, font_size, &mut lines, &mut pending, max_lines, &mut current);
             continue;
         }
 
@@ -122,28 +122,42 @@ pub fn wrap(s: &str, max_px: f32, font_size: f32, max_lines: usize) -> Vec<Strin
     lines
 }
 
-/// Splits `word` at the last character boundary whose prefix still fits within
-/// `max_px`. Always includes at least one character in the fitted prefix, even if
-/// that character alone exceeds `max_px` — this guarantees forward progress
-/// instead of an infinite loop on a pathologically narrow box.
-fn hard_break_word(word: &str, max_px: f32, font_size: f32) -> (String, String) {
-    let mut fitted = String::new();
+/// Splits an over-wide unbroken word into fixed-width chunks in a single
+/// O(len) pass. The former head-recursion on the remaining token
+/// (`hard_break_word` re-measuring the rest from scratch per chunk) made
+/// wrapping a long unbroken token quadratic — an unbreakable ~1MB token
+/// degenerated into re-scanning ~1MB for every ~15-char chunk. Measuring each
+/// char's width once and cutting at the running total is linear. Full chunks
+/// go onto `lines`; the final (fitting) chunk becomes `current`. Returns the
+/// width of the final chunk, or `0.0` if a `max_lines` cutoff requeued the
+/// remainder and left `current` empty.
+fn split_wide_word(
+    word: &str,
+    max_px: f32,
+    font_size: f32,
+    lines: &mut Vec<String>,
+    pending: &mut VecDeque<String>,
+    max_lines: usize,
+    current: &mut String,
+) -> f32 {
+    let mut start_byte = 0usize;
     let mut width = 0.0_f32;
-    let mut split_at = word.len();
-
-    for (idx, c) in word.char_indices() {
-        let cw = char_advance_1000(c) as f32 / 1000.0 * font_size * SAFETY_MARGIN;
-        if width + cw > max_px && !fitted.is_empty() {
-            split_at = idx;
-            break;
+    for (byte_idx, c) in word.char_indices() {
+        let cw = char_width_px(c, font_size);
+        if width + cw > max_px && byte_idx > start_byte {
+            let chunk = &word[start_byte..byte_idx];
+            if lines.len() == max_lines {
+                pending.push_front(word[byte_idx..].to_string());
+                return 0.0;
+            }
+            lines.push(chunk.to_string());
+            start_byte = byte_idx;
+            width = 0.0;
         }
-        fitted.push(c);
         width += cw;
-        split_at = idx + c.len_utf8();
     }
-
-    let rest = word[split_at..].to_string();
-    (fitted, rest)
+    *current = word[start_byte..].to_string();
+    width
 }
 
 /// Truncates `line` character-wise from the end until `line + "…"` fits `max_px`.
@@ -225,5 +239,24 @@ mod tests {
     fn wrap_of_empty_or_whitespace_text_yields_no_lines() {
         assert!(wrap("", 200.0, 12.5, 3).is_empty());
         assert!(wrap("   ", 200.0, 12.5, 3).is_empty());
+    }
+
+    #[test]
+    fn wrap_of_long_unbroken_token_is_linear_time() {
+        // Regression: the old hard-break-and-requeue loop re-measured the
+        // remaining token from scratch per ~15-char chunk, making a long
+        // unbroken token quadratic (an ~1MB token took effectively forever).
+        // Splitting by cumulative width once must return in well under the
+        // budget with no characters lost.
+        let word = "a".repeat(1_000_000);
+        let start = std::time::Instant::now();
+        let lines = wrap(&word, 200.0, 12.5, 1_000_000);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed.as_millis() < 5000,
+            "wrap of a 1MB token took {elapsed:?} -- likely quadratic behavior"
+        );
+        let echoed: usize = lines.iter().map(String::len).sum();
+        assert!(echoed >= word.len(), "output length {echoed} < input length {}", word.len());
     }
 }

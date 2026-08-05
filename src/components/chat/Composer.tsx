@@ -54,6 +54,7 @@ export function Composer({
   const addPendingImage = useChatStore((s) => s.addPendingImage);
   const model = useChatStore((s) => s.model);
   const sendWithRecipe = useChatStore((s) => s.sendWithRecipe);
+  const compact = useChatStore((s) => s.compact);
   const stopPhase = useChatStore((s) => s.stopPhase);
   const forceStop = useChatStore((s) => s.forceStop);
 
@@ -129,7 +130,18 @@ export function Composer({
 
   const submit = () => {
     const value = text.trim();
-    if (!value || disabled || concluded || sendBlocked) return;
+    if (!value) return;
+    // Manual context compaction — a local command, not a message to the
+    // model. Runs even while a turn is in flight: the daemon's compaction
+    // compare-and-swap lock makes a concurrent pass a safe no-op
+    // (`{compacted: false}`), so there's nothing to block on here.
+    if (value === '/compact' || value.startsWith('/compact')) {
+      void compact();
+      setText('');
+      resetTextareaHeight();
+      return;
+    }
+    if (disabled || concluded || sendBlocked) return;
     const match = matchRecipeCommand(value, recipes);
     if (match) {
       void sendWithRecipe(match.recipe, match.primaryText);

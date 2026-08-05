@@ -39,10 +39,7 @@ pub fn run() {
         .with(env_filter)
         .try_init();
 
-    let cfg = config::load().unwrap_or_else(|e| {
-        tracing::warn!("config load failed ({e}); using defaults");
-        config::Config::default()
-    });
+    let (cfg, config_recovered) = config::load_with_recovery();
     // One-time migration from the pre-rename `goose-overlay` keyring service
     // (config.json itself already migrated by `config::load` -> `config_dir`).
     let provider_ids: Vec<String> = cfg.providers.iter().map(|p| p.id.clone()).collect();
@@ -73,10 +70,14 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
-        .manage(AppState::new(cfg))
+        .manage(AppState::new(
+            cfg,
+            config_recovered.map(|p| p.to_string_lossy().into_owned()),
+        ))
         .invoke_handler(tauri::generate_handler![
             commands::get_config,
             commands::set_config,
+            commands::get_config_recovery_notice,
             commands::toggle_overlay,
             commands::hide_overlay,
             commands::open_settings,
@@ -107,6 +108,7 @@ pub fn run() {
             commands::rename_session,
             commands::clear_all_sessions,
             commands::fork_session,
+            commands::compact_session,
             commands::set_thinking_effort,
             commands::rebind_session_provider,
             commands::read_text_file,
@@ -145,6 +147,7 @@ pub fn run() {
             commands::upsert_provider,
             commands::delete_provider,
             commands::activate_provider,
+            commands::set_session_provider,
             commands::test_active_provider_connection,
             commands::openrouter_context_length,
             commands::openrouter_credits,
@@ -195,14 +198,14 @@ pub fn run() {
             commands::adaptive_pathway_accept_nudge,
             commands::adaptive_pathway_dismiss_nudge,
             commands::adaptive_pathway_get_session_reflection,
-            commands::get_wasm_math_mcp_enabled,
-            commands::set_wasm_math_mcp_enabled,
+            commands::get_kitty_wasm_enabled,
+            commands::set_kitty_wasm_enabled,
             commands::get_visualizations_enabled,
             commands::set_visualizations_enabled,
             commands::get_kitty_tools_enabled,
             commands::set_kitty_tools_enabled,
-            commands::get_kitty_docs_web_enabled,
-            commands::set_kitty_docs_web_enabled,
+            commands::get_kitty_web_enabled,
+            commands::set_kitty_web_enabled,
             commands::get_brave_mcp_search_status,
             commands::set_brave_mcp_search_api_key,
             commands::set_brave_mcp_search_enabled,

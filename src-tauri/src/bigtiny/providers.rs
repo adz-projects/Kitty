@@ -156,6 +156,36 @@ pub async fn sync_active_provider(app: &AppHandle) -> Result<Option<String>, Str
     Ok(Some(id))
 }
 
+/// Per-session provider override: PATCH a single session's metadata with the
+/// given provider/model (`PATCH /api/chat/{id}/config`). Unlike
+/// `rebind_session`, this does NOT sync the global active provider or touch
+/// the BigTiny registry defaults — a session keeps the provider it was
+/// stamped with, independent of what other windows pick. This is the
+/// per-session isolation contract: providers are resolved per session at send
+/// time (`loop_.rs` reads `metadata.provider`), so every window can chat on a
+/// different provider without flipping each other's open sessions.
+/// Best-effort (swallows its own failures, same contract as `rebind_session`).
+pub async fn set_session_provider(
+    app: &AppHandle,
+    session_id: &str,
+    provider_id: &str,
+    model: &str,
+) {
+    let Ok(client) = ensure_client(app) else {
+        return;
+    };
+    let _ = client
+        .patch_json(
+            &format!("/api/chat/{session_id}/config"),
+            &json!({
+                "provider": provider_id,
+                // Empty string clears a stale override when the profile has no model.
+                "model": model,
+            }),
+        )
+        .await;
+}
+
 /// Best-effort: rebind an already-open session onto the currently-active
 /// provider/model (`PATCH /api/chat/{id}/config`) — the BigTiny equivalent of
 /// the goosed path's `session/set_config_option` hot-rebind. Swallows its own

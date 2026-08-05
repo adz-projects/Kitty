@@ -12,6 +12,19 @@ static HAS_DRIVE_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^[a-zA-Z]:").unwrap
 /// `src/bin/bigtiny_daemon.rs`) via `Agent`/`AgentLoop`, not this constant.
 pub const CACHE_DIR: &str = "~/.bigtiny";
 
+/// Directory where kitty-web's `lean_web_search` offloads full result sets
+/// (`search-<id>.json`) and `lean_web_scrape` caches downloaded PDFs. Both
+/// live under the user's home `.cache`, which is *outside* a session's
+/// chat_dir/`cache_dir`/cwd — so without an explicit allowance the model
+/// reaching for those files with a path-arg tool (`lean_file_read`) would be
+/// force-escalated to a human approval every time. These are app-owned cache
+/// dirs (Kitty's own bundled plugins wrote the files, on a predictable fixed
+/// path), so reads there are always legitimate; treat them like the data-root
+/// `cache_dir`. Both constants must stay in sync with kitty-web's
+/// `search_store_dir`/`scrape::cache_dir`.
+pub const SEARCH_OFFLOAD_DIR: &str = ".cache/kitty-search-offload";
+pub const LEAN_CACHE_DIR: &str = ".cache/lean-goose-mcp";
+
 fn norm(path: &str) -> String {
     let mut p = path.replace('\\', "/");
     while p.ends_with('/') && p.len() > 1 {
@@ -141,14 +154,21 @@ fn extract_shell_paths(command: &str) -> Vec<String> {
 }
 
 /// True if every path this tool call touches resolves inside at least one of
-/// `allowed_dirs`. Deliberately fails **open** (returns `true`) when no path
-/// candidates are found at all — this is called for every tool call, not
-/// just filesystem ones, and there's no tool-schema registry here to tell a
+/// `allowed_dirs`. There's no tool-schema registry here to tell a
 /// non-filesystem call (a calculator, a web search) apart from a filesystem
 /// call whose path arg just used a key name `extract_candidate_paths`
-/// doesn't recognize. Widen that function's key list before relying on this
-/// as a hard boundary for a new tool with unusual argument names.
-pub fn check_containment(args: &Value, allowed_dirs: &[String]) -> bool {
+/// doesn't recognize — widen that function's key list before relying on
+/// this as a hard boundary for a new tool with unusual argument names.
+///
+/// `strict` governs what happens when *no* path candidates are found at
+/// all: `false` fails **open** (returns `true`) — the desktop default (see
+/// `AgentConfig::sandbox_strict`), appropriate when an escalation on every
+/// unrecognized call would be pure friction for a single user who *is* the
+/// security boundary. `true` fails **closed** (returns `false`, forcing
+/// `loop_.rs::execute_one_tool_call`'s HITL escalation) — for a host where
+/// the daemon's own data root is the boundary, a false-positive escalation
+/// is the safer failure mode than a silent bypass.
+pub fn check_containment(args: &Value, allowed_dirs: &[String], strict: bool) -> bool {
     let mut candidates = extract_candidate_paths(args);
 
     for key in &["command", "cmd", "script"] {
@@ -163,7 +183,41 @@ pub fn check_containment(args: &Value, allowed_dirs: &[String]) -> bool {
         }
     }
 
+    if candidates.is_empty() {
+        return !strict;
+    }
+
     candidates.iter().all(|p| path_within_any(allowed_dirs, p))
+}
+
+/// Home directory for the current user — `USERPROFILE` on Windows, `HOME`
+/// elsewhere. BigTiny deliberately doesn't pull in a `dirs`-style crate just
+/// for this; these two env vars are the standard, and the paths built from
+/// them (the kitty-web cache dirs below) only need to *match* what kitty-web
+/// itself computes, which uses `dirs::home_dir()` — the same env var.
+fn home_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(std::path::PathBuf::from)
+}
+
+/// Add the permissions-free "always reachable" working set: the OS temp dir
+/// plus kitty-web's app-owned cache dirs under the user's home (search
+/// offload + downloaded-PDF cache). These are appended to the allowed set for
+/// *every* session so tools (and the model reaching for their files with a
+/// path-arg read) never hit an approval just for touching scratch storage the
+/// daemon's own bundled plugins manage.
+fn scratch_allowance() -> Vec<String> {
+    let mut dirs = Vec::new();
+    let temp = std::env::temp_dir();
+    if !temp.as_os_str().is_empty() {
+        dirs.push(temp.to_string_lossy().replace('\\', "/"));
+    }
+    if let Some(home) = home_dir() {
+        dirs.push(home.join(SEARCH_OFFLOAD_DIR).to_string_lossy().replace('\\', "/"));
+        dirs.push(home.join(LEAN_CACHE_DIR).to_string_lossy().replace('\\', "/"));
+    }
+    dirs
 }
 
 /// The effective allowed-directory set for a session.
@@ -182,6 +236,8 @@ pub fn allowed_dirs_for_session(metadata: &Value, cache_dir: &str) -> Vec<String
             }
         }
     }
+
+    dirs.extend(scratch_allowance());
 
     dirs
 }
@@ -234,7 +290,8 @@ mod tests {
             "path": "/home/user/project/src/main.rs"
         });
         let dirs = vec!["/home/user/project".to_string()];
-        assert!(check_containment(&args, &dirs));
+        assert!(check_containment(&args, &dirs, false));
+        assert!(check_containment(&args, &dirs, true));
     }
 
     #[test]
@@ -243,7 +300,8 @@ mod tests {
             "path": "/etc/passwd"
         });
         let dirs = vec!["/home/user/project".to_string()];
-        assert!(!check_containment(&args, &dirs));
+        assert!(!check_containment(&args, &dirs, false));
+        assert!(!check_containment(&args, &dirs, true));
     }
 
     #[test]
@@ -260,12 +318,48 @@ mod tests {
     }
 
     #[test]
+    fn test_allowed_dirs_include_os_temp_and_app_cache_dirs() {
+        let metadata = json!({"chat_dir": "/home/user/chat"});
+        let dirs = allowed_dirs_for_session(&metadata, "~/.bigtiny");
+
+        let temp = std::env::temp_dir().to_string_lossy().replace('\\', "/");
+        assert!(dirs.contains(&temp), "OS temp dir must be allowed, got {dirs:?}");
+
+        if let Some(home) = home_dir() {
+            let offload = home.join(SEARCH_OFFLOAD_DIR).to_string_lossy().replace('\\', "/");
+            assert!(dirs.contains(&offload), "search offload dir must be allowed");
+            let lean = home.join(LEAN_CACHE_DIR).to_string_lossy().replace('\\', "/");
+            assert!(dirs.contains(&lean), "lean cache dir must be allowed");
+        }
+    }
+
+    #[test]
+    fn test_search_offload_files_resolve_inside_allowed_dirs() {
+        // Regression: the model reaching for a search result file (written by
+        // kitty-web's lean_web_search to ~/.cache/kitty-search-offload) with a
+        // path-arg read tool must NOT trip containment -> approval.
+        let Some(home) = home_dir() else {
+            eprintln!("no home dir in this env; skipping");
+            return;
+        };
+        let offload_file = home
+            .join(SEARCH_OFFLOAD_DIR)
+            .join("search-abc123.json")
+            .to_string_lossy()
+            .replace('\\', "/");
+
+        let metadata = json!({"chat_dir": "/home/user/chat"});
+        let dirs = allowed_dirs_for_session(&metadata, "~/.bigtiny");
+        assert!(path_within_any(&dirs, &offload_file), "{offload_file} not allowed");
+    }
+
+    #[test]
     fn test_check_containment_checks_every_paths_array_element() {
         let args = json!({
             "paths": ["/home/user/project/ok.rs", "/etc/passwd"]
         });
         let dirs = vec!["/home/user/project".to_string()];
-        assert!(!check_containment(&args, &dirs));
+        assert!(!check_containment(&args, &dirs, false));
     }
 
     #[test]
@@ -279,13 +373,24 @@ mod tests {
     }
 
     #[test]
-    fn test_check_containment_no_paths() {
+    fn test_check_containment_no_paths_fails_open_by_default() {
         let args = json!({
             "operation": "calculate",
             "x": 1,
             "y": 2
         });
         let dirs = vec!["/home/user/project".to_string()];
-        assert!(check_containment(&args, &dirs));
+        assert!(check_containment(&args, &dirs, false));
+    }
+
+    #[test]
+    fn test_check_containment_no_paths_fails_closed_when_strict() {
+        let args = json!({
+            "operation": "calculate",
+            "x": 1,
+            "y": 2
+        });
+        let dirs = vec!["/home/user/project".to_string()];
+        assert!(!check_containment(&args, &dirs, true));
     }
 }

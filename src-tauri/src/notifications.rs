@@ -110,27 +110,35 @@ pub fn notify_if_hidden(
     let sid_owned = session_id.map(|s| s.to_string());
     match n.show() {
         Ok(handle) => {
+            // One dedicated worker thread services every toast's response
+            // wait (a blocking OS call). Bursts of toasts queue on it instead
+            // of spawning an unbounded number of threads.
             let app2 = app.clone();
-            std::thread::spawn(move || {
+            let label = target_label;
+            let sid = sid_owned;
+            // The boxed closure captures the platform-specific handle, so the
+            // concrete (not-reexported) handle type stays out of `ToastJob`.
+            let wait = move || {
                 let _ = handle.wait_for_response(
                     move |response: &notify_rust::NotificationResponse| {
                         if response.is_default_action() {
                             let app3 = app2.clone();
-                            let label = target_label.clone();
-                            let sid = sid_owned.clone();
+                            let label = label.clone();
+                            let sid = sid.clone();
                             let _ = app2.run_on_main_thread(move || {
-                                // Focus the specific window this notification was
-                                // about, if one is still open.
+                                // Focus the specific window this notification
+                                // was about, if one is still open.
                                 let focused = label
                                     .as_deref()
                                     .map(|l| windows::show_and_focus(&app3, l))
                                     .unwrap_or(false);
                                 if !focused {
-                                    // No window is currently bound to this session
-                                    // (e.g. the window that had it switched to a
-                                    // different chat in the meantime) — reload it
-                                    // into whichever chat window is open rather
-                                    // than opening a generic blank one.
+                                    // No window is currently bound to this
+                                    // session (e.g. the window that had it
+                                    // switched to a different chat in the
+                                    // meantime) — reload it into whichever
+                                    // chat window is open rather than opening
+                                    // a generic blank one.
                                     if let Some(sid) = sid {
                                         tauri::async_runtime::spawn(async move {
                                             windows::focus_or_open_session(&app3, &sid).await;
@@ -143,10 +151,47 @@ pub fn notify_if_hidden(
                         }
                     },
                 );
-            });
+            };
+            let job = ToastJob {
+                run: Box::new(wait),
+            };
+            if let Err(e) = toast_worker_sender().send(job) {
+                // Only fails if the worker died — the toast still shows, it
+                // just isn't click-focusable.
+                tracing::warn!("notification click worker unavailable: {e}");
+            }
         }
         Err(e) => tracing::warn!("notification failed: {e}"),
     }
+}
+
+/// A toast whose click-detection wait still needs servicing, delivered to the
+/// single notification worker (`toast_worker_sender`).
+struct ToastJob {
+    run: Box<dyn FnOnce() + Send>,
+}
+
+fn toast_worker_sender() -> std::sync::mpsc::Sender<ToastJob> {
+    use std::sync::{Mutex, OnceLock};
+    // A static rather than app state: a toast's wait can outlive the command
+    // that fired it, and notifications.rs keeps no other pre-existing state.
+    static WORKER: OnceLock<Mutex<Option<std::sync::mpsc::Sender<ToastJob>>>> = OnceLock::new();
+    let mut guard = WORKER.get_or_init(|| Mutex::new(None)).lock().unwrap();
+    if let Some(sender) = guard.as_ref() {
+        return sender.clone();
+    }
+    let (sender, receiver): (
+        std::sync::mpsc::Sender<ToastJob>,
+        std::sync::mpsc::Receiver<ToastJob>,
+    ) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        // One worker services every toast's response wait, sequentially.
+        while let Ok(job) = receiver.recv() {
+            (job.run)();
+        }
+    });
+    *guard = Some(sender.clone());
+    sender
 }
 
 /// Reflect a pending approval / running task in the tray tooltip.

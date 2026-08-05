@@ -28,10 +28,18 @@ export const useStackStore = create<StackState>((set) => ({
     } catch {
       // Backend not ready yet; the stack://startup-phase event will update us.
     }
-    if (!subscribed) {
-      subscribed = true;
+    // `subscribed` is set only after BOTH subscription awaits succeed. Setting
+    // it up front (before the awaits resolved) meant a failed subscription
+    // permanently suppressed updates on later init() calls — the flag was
+    // already true even though no listener was ever attached.
+    if (subscribed) return;
+    try {
       await onStackStatus((p) => set({ status: p.status, detail: p.detail }));
       await onStartupPhase((p) => set({ startupPhase: p.phase }));
+      subscribed = true;
+    } catch {
+      // Leave `subscribed` false so a later init() retries the subscriptions
+      // instead of silently dropping all future health/startup events.
     }
   },
 }));

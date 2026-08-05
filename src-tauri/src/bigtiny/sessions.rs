@@ -28,16 +28,27 @@ fn session_info(session_id: String, cwd: String) -> SessionInfo {
 /// verbatim) seeds BigTiny's directory-sandboxing scope for this session
 /// from the very first tool call, rather than leaving it unset until a
 /// later `PATCH /config` — see `update_mode`'s doc comment for why that gap
-/// would matter.
+/// would matter. `provider`/`model` (optional) pin this session to a specific
+/// provider from birth — per-session provider isolation: the daemon stores
+/// them in session metadata and resolves at send time, so later global
+/// provider changes never flip this session.
+#[allow(clippy::too_many_arguments)]
 pub async fn create(
     app: &AppHandle,
     cwd: String,
     mode: Option<String>,
+    provider: Option<String>,
+    model: Option<String>,
 ) -> Result<SessionInfo, String> {
     let client = ensure_client(app)?;
-    let result = client
-        .post_json("/api/chat/", &json!({ "cwd": cwd, "mode": mode }))
-        .await?;
+    let mut body = json!({ "cwd": cwd, "mode": mode });
+    if provider.is_some() {
+        body["provider"] = json!(provider);
+    }
+    if model.is_some() {
+        body["model"] = json!(model);
+    }
+    let result = client.post_json("/api/chat/", &body).await?;
     let session_id = result
         .get("session_id")
         .and_then(|v| v.as_str())
@@ -103,6 +114,19 @@ pub async fn update_persona_override(
         )
         .await?;
     Ok(())
+}
+
+/// Manual context compaction (`/compact`): `POST /api/chat/{id}/compact`
+/// forces the daemon to fold the session's oldest un-compacted exchanges
+/// into memory, bypassing the automatic token threshold. Returns the
+/// daemon's `{compacted, messages_compacted, tokens_before, tokens_after}`
+/// so the UI can report what actually happened (or `{compacted: false}` when
+/// there was nothing to fold).
+pub async fn compact(app: &AppHandle, session_id: &str) -> Result<Value, String> {
+    let client = ensure_client(app)?;
+    client
+        .post_json(&format!("/api/chat/{session_id}/compact"), &json!({}))
+        .await
 }
 
 /// Fetch `/api/chat/{id}/stats` — includes `compacted_through_rowid` and

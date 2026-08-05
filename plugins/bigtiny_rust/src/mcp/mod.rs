@@ -7,6 +7,7 @@
 //! exactly — see `sse_transport.rs` for why `rmcp`'s SSE client would not
 //! interoperate with servers built against this daemon's existing behavior.
 
+pub mod builtin;
 pub mod client;
 pub mod manager;
 pub mod sse_transport;

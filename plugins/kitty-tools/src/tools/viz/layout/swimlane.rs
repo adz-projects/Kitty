@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 
-use crate::tools::viz::layout::{draw_node, size_node, NodeVisual, GAP_X};
+use crate::tools::viz::layout::{draw_node, size_node_capped, NodeVisual, GAP_X, MAX_CONTENT_W_WIDE, MAX_NODE_W, MIN_LAYER_GAP, MIN_NODE_W};
 use crate::tools::viz::model::{Step, StepType};
 use crate::tools::viz::render::svg::{SvgCanvas, CANVAS_MARGIN, TITLE_BAND};
 use crate::tools::viz::text;
@@ -20,6 +20,11 @@ const MIN_GUTTER: f32 = 110.0;
 const LANE_HEADER_FONT_PX: f32 = 11.0;
 const BAND_PAD: f32 = 24.0;
 const MIN_BAND_H: f32 = 90.0;
+/// Reserved strip at the top of every lane band for its header text. Nodes are
+/// vertically centered in the region *below* this strip, so a tall node can
+/// never overdraw the lane name (the old behavior: `band_top+22` header vs. a
+/// 3-line node whose top edge sat at `band_top+12`).
+const LANE_HEADER_H: f32 = 26.0;
 
 fn lane_key(step: &Step) -> String {
     step.lane.as_deref().map(str::trim).filter(|s| !s.is_empty()).unwrap_or("Unassigned").to_string()
@@ -27,7 +32,6 @@ fn lane_key(step: &Step) -> String {
 
 pub fn render(steps: &[Step]) -> (String, f32, f32) {
     let n = steps.len();
-    let sized: Vec<_> = steps.iter().map(|s| size_node(&s.text, None)).collect();
 
     let mut lanes_order: Vec<String> = Vec::new();
     let mut lane_index: HashMap<String, usize> = HashMap::new();
@@ -44,10 +48,31 @@ pub fn render(steps: &[Step]) -> (String, f32, f32) {
         .map(|name| text::measure_px(&name.to_uppercase(), LANE_HEADER_FONT_PX) + BAND_PAD)
         .fold(MIN_GUTTER, f32::max);
 
+    // Readability compression: a swimlane can't wrap to extra rows without
+    // destroying lane semantics, so fit `MAX_CONTENT_W_WIDE` by tightening the
+    // inter-node gap first, then shrinking the node-width cap. Past the cap
+    // floor the centralized check in `viz/mod.rs` returns `VIZ_TOO_WIDE`.
+    let mut cap = MAX_NODE_W;
+    let mut gap = GAP_X;
+    let mut sized: Vec<_> = steps.iter().map(|s| size_node_capped(&s.text, None, cap)).collect();
+    for _ in 0..6 {
+        let total = gutter + LEFT_MARGIN + sized.iter().map(|s| s.w).sum::<f32>() + gap * (n as f32 - 1.0).max(0.0);
+        if total <= MAX_CONTENT_W_WIDE {
+            break;
+        }
+        if gap > MIN_LAYER_GAP + 1.0 {
+            gap = (gap / 2.0).max(MIN_LAYER_GAP);
+            continue;
+        }
+        let nodes_sum: f32 = sized.iter().map(|s| s.w).sum();
+        cap = (cap * (MAX_CONTENT_W_WIDE - gutter - LEFT_MARGIN - MIN_LAYER_GAP * (n as f32 - 1.0)) / nodes_sum).clamp(MIN_NODE_W, MAX_NODE_W);
+        sized = steps.iter().map(|s| size_node_capped(&s.text, None, cap)).collect();
+    }
+
     let mut band_h = vec![MIN_BAND_H; lanes_order.len()];
     for (i, step) in steps.iter().enumerate() {
         let k = lane_index[&lane_key(step)];
-        band_h[k] = band_h[k].max(sized[i].h + BAND_PAD);
+        band_h[k] = band_h[k].max(sized[i].h + BAND_PAD + LANE_HEADER_H);
     }
     let mut band_top = vec![0.0f32; lanes_order.len()];
     let mut acc = TITLE_BAND;
@@ -63,7 +88,7 @@ pub fn render(steps: &[Step]) -> (String, f32, f32) {
     let mut cursor = gutter + LEFT_MARGIN;
     for i in 0..n {
         x[i] = cursor;
-        cursor += sized[i].w + GAP_X;
+        cursor += sized[i].w + gap;
     }
 
     let mut canvas = SvgCanvas::new();
@@ -71,7 +96,11 @@ pub fn render(steps: &[Step]) -> (String, f32, f32) {
     let mut top_y = vec![0.0f32; n];
     for (i, step) in steps.iter().enumerate() {
         let k = lane_index[&lane_key(step)];
-        let center_y = band_top[k] + band_h[k] / 2.0;
+        // Center nodes in the region below the header strip so the tallest
+        // node still starts at least LANE_HEADER_H below the band top.
+        let body_top = band_top[k] + LANE_HEADER_H;
+        let body_h = band_h[k] - LANE_HEADER_H;
+        let center_y = body_top + body_h / 2.0;
         top_y[i] = center_y - sized[i].h / 2.0;
     }
 

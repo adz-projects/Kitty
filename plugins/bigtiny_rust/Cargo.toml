@@ -23,13 +23,15 @@ path = "src/bin/bigtiny_daemon.rs"
 axum = { version = "0.8", features = ["json", "macros"] }
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["io"] }
-tokio-stream = "0.1"
+# `time` enables `TimeoutStream`, used to implement the per-provider SSE
+# idle-read timeout (see `provider::openai_compat`/`anthropic`).
+tokio-stream = { version = "0.1", features = ["time"] }
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "chrono"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 tiktoken-rs = "0.6"
-reqwest = { version = "0.12", features = ["rustls-tls", "json", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
 thiserror = "2"
@@ -52,6 +54,27 @@ minijinja = "2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 aes-gcm = "0.10"
 rand = "0.8"
+# Only used for the in-process MCP transport (`mcp::client::connect_in_process`
+# via `mcp::builtin`), i.e. an exec()-restricted host that can't spawn
+# `kitty-tools`' stdio binary as a child process (see that module's doc
+# comment). This crate pins a *different* rmcp major version
+# (`kitty-tools` = 2.2.0, this crate = 0.9) — both resolve independently,
+# which is fine, since the two only ever exchange serialized JSON-RPC bytes
+# on the in-process pipe, never Rust types across the version boundary.
+#
+# Known tradeoff, accepted rather than engineered around: `kitty-tools`'
+# `[profile.release]` (opt-level="z", fat LTO — tuned for its life as a
+# small frozen exe) only takes effect when it's the crate cargo is building
+# at the workspace root. As a path dependency of this crate it inherits
+# whatever profile *this* build uses instead, same as any other dependency.
+# Not worth hoisting both crates into a shared Cargo workspace to fix — that
+# would reverse `kitty-tools/Cargo.toml`'s explicit "deliberately not a
+# workspace member" stance (MSRV isolation, `panic = "abort"` not leaking
+# from `src-tauri`), and the size/speed difference is unlikely to matter
+# once this is linked into a full app binary rather than shipped standalone.
+kitty-tools = { path = "../kitty-tools" }
+kitty-web = { path = "../kitty-web" }
+kitty-wasm = { path = "../kitty-wasm" }
 
 [dev-dependencies]
 mockito = "1"

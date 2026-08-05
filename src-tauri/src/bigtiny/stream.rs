@@ -264,6 +264,22 @@ fn poll_compaction_status(app: AppHandle, session_id: String) {
     });
 }
 
+/// The active provider profile's `prompt_idle_timeout_secs`, if any — the
+/// per-provider "Response timeout" setting. Resolved from `AppState` the same
+/// way `sessions::create`/`providers::emit_health_from_send_result` resolve
+/// the active profile (the send-time resolution also honors a session's own
+/// stamped provider on the BigTiny side; this is the app-side global fallback
+/// for the idle deadline).
+fn active_provider_idle_timeout(app: &AppHandle) -> Option<u32> {
+    let state = app.state::<AppState>();
+    let cfg = state.config.lock().unwrap();
+    cfg.active_provider_id
+        .as_ref()
+        .and_then(|id| cfg.providers.iter().find(|p| &p.id == id))
+        .and_then(|p| p.prompt_idle_timeout_secs)
+        .filter(|s| *s > 0)
+}
+
 /// Drive one send stream to completion, emitting `chat://*` events as frames
 /// arrive. Transport errors surface as `Err`; agent-level errors (BigTiny's
 /// `error` events) as `Ok` with `outcome.error` set.
@@ -274,7 +290,7 @@ async fn run_stream(
     body: &Value,
 ) -> Result<TurnOutcome, String> {
     let resp = client
-        .request(
+        .request_stream(
             reqwest::Method::POST,
             &format!("/api/chat/{session_id}/send"),
         )
@@ -307,9 +323,25 @@ async fn run_stream(
     // whenever a frame is drained (the remaining buffer shifted), advanced
     // to the end of the buffer when no boundary is found yet.
     let mut scan_from: usize = 0;
+    // Idle-only deadline on the stream: if the daemon sends no bytes for this
+    // long, the turn is wedged and we bail out (see the `Elapsed` arm). Long
+    // turns that keep streaming data are unaffected. `None` -> the active
+    // provider's `prompt_idle_timeout_secs`, or 300s when unset.
+    let idle = std::time::Duration::from_secs(u64::from(
+        active_provider_idle_timeout(app).unwrap_or(300),
+    ));
     let mut bytes = resp.bytes_stream();
-    'outer: while let Some(chunk) = bytes.next().await {
-        let chunk = chunk.map_err(|e| format!("BigTiny stream failed: {e}"))?;
+    'outer: loop {
+        let chunk = match tokio::time::timeout(idle, bytes.next()).await {
+            Ok(Some(item)) => item.map_err(|e| format!("BigTiny stream failed: {e}"))?,
+            Ok(None) => break, // daemon closed the stream cleanly
+            Err(_) => {
+                return Err(format!(
+                    "BigTiny went idle for {}s without sending data — the turn was stopped.",
+                    idle.as_secs()
+                ));
+            }
+        };
         buffer.push_str(&String::from_utf8_lossy(&chunk));
         // `saturating_sub(1)` guards the one case a pure resume-point would
         // miss: a "\n\n" boundary split exactly across the old/new chunk
@@ -595,12 +627,16 @@ pub async fn respond_permission(
     tool_call_id: String,
     option_id: Option<String>,
 ) -> Result<(), String> {
+    // Clone the session out rather than removing the entry up front: if the
+    // `/approve` POST below fails, the approval must still be pending so the
+    // caller can retry. It's only forgotten once the daemon has accepted it.
     let session_id = app
         .state::<AppState>()
         .bigtiny_approvals
         .lock()
         .unwrap()
-        .remove(&tool_call_id)
+        .get(&tool_call_id)
+        .cloned()
         .ok_or("that approval request is no longer pending")?;
     let decision = decision_for_option(option_id.as_deref());
     let client = ensure_client(app)?;
@@ -610,6 +646,11 @@ pub async fn respond_permission(
             &json!({ "action_id": tool_call_id, "decision": decision }),
         )
         .await?;
+    app.state::<AppState>()
+        .bigtiny_approvals
+        .lock()
+        .unwrap()
+        .remove(&tool_call_id);
     notifications::set_tray_pending(app, false);
     Ok(())
 }

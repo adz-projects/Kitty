@@ -26,37 +26,43 @@ import { LightbulbIcon } from '@/components/icons/LightbulbIcon';
     (CLAUDE.md rule 5). In chat mode (per-session `ModeToggle`, `isChatMode`) it
     hides the agent chrome and switches to a reading-friendly column. */
 export function ChatView() {
-  const {
-    messages,
-    busy,
-    sessionConcluded,
-    replaying,
-    error,
-    errorType,
-    cwd,
-    title,
-    sessionId,
-    pendingApprovals,
-    providerHost,
-    providerOffline,
-    checkingConnection,
-    retryConnection,
-    warning,
-    dismissWarning,
-    compactionNotice,
-    dismissCompactionNotice,
-    loopSuspected,
-    dismissLoopWarning,
-    send,
-    cancel,
-    respondApproval,
-    addDroppedPaths,
-    setWorkingDir,
-    bindEvents,
-    refreshProvider,
-    model,
-    newSession,
-  } = useChatStore();
+  // Individual slice selectors (not a whole-store `useChatStore()` call) so a
+  // change to any one field — e.g. a streamed message delta — re-renders only
+  // what consumes it, never the entire chat surface.
+  const messages = useChatStore((s) => s.messages);
+  const busy = useChatStore((s) => s.busy);
+  const sessionConcluded = useChatStore((s) => s.sessionConcluded);
+  const replaying = useChatStore((s) => s.replaying);
+  const error = useChatStore((s) => s.error);
+  const errorType = useChatStore((s) => s.errorType);
+  const cwd = useChatStore((s) => s.cwd);
+  const title = useChatStore((s) => s.title);
+  const sessionId = useChatStore((s) => s.sessionId);
+  const pendingApprovals = useChatStore((s) => s.pendingApprovals);
+  const providerHost = useChatStore((s) => s.providerHost);
+  const providerOffline = useChatStore((s) => s.providerOffline);
+  const checkingConnection = useChatStore((s) => s.checkingConnection);
+  const retryConnection = useChatStore((s) => s.retryConnection);
+  const warning = useChatStore((s) => s.warning);
+  const dismissWarning = useChatStore((s) => s.dismissWarning);
+  const compactionNotice = useChatStore((s) => s.compactionNotice);
+  const dismissCompactionNotice = useChatStore((s) => s.dismissCompactionNotice);
+  const loopSuspected = useChatStore((s) => s.loopSuspected);
+  const dismissLoopWarning = useChatStore((s) => s.dismissLoopWarning);
+  const send = useChatStore((s) => s.send);
+  const cancel = useChatStore((s) => s.cancel);
+  const respondApproval = useChatStore((s) => s.respondApproval);
+  const addDroppedPaths = useChatStore((s) => s.addDroppedPaths);
+  const setWorkingDir = useChatStore((s) => s.setWorkingDir);
+  const bindEvents = useChatStore((s) => s.bindEvents);
+  const refreshProvider = useChatStore((s) => s.refreshProvider);
+  const model = useChatStore((s) => s.model);
+  const newSession = useChatStore((s) => s.newSession);
+  const loadSession = useChatStore((s) => s.loadSession);
+  // WS8 backgrounded-turn lifecycle (a chat this window left is still running):
+  const backgroundSession = useChatStore((s) => s.backgroundSession);
+  const backgroundTurnToast = useChatStore((s) => s.backgroundTurnToast);
+  const dismissBackgroundToast = useChatStore((s) => s.dismissBackgroundToast);
   const chatOnly = useChatStore(isChatMode);
   const startupPhase = useStackStore((s) => s.startupPhase);
   const starting = startupPhase !== 'ready';
@@ -196,6 +202,46 @@ export function ChatView() {
           </button>
           <button className="link" onClick={dismissLoopWarning}>
             Keep waiting
+          </button>
+        </div>
+      )}
+
+      {backgroundSession && (
+        <div className="conflict-banner" role="status">
+          <span className="status-dot ok" />
+          <span style={{ flex: 1 }}>
+            A chat you left is still running in the background — you&apos;ll get a notification when
+            it&apos;s done.
+          </span>
+        </div>
+      )}
+      {backgroundTurnToast && (
+        <div className="conflict-banner" role="status">
+          <span className={`status-dot ${backgroundTurnToast.ok ? 'ok' : 'bad'}`} />
+          <span style={{ flex: 1 }}>
+            {backgroundTurnToast.ok
+              ? backgroundTurnToast.title
+                ? `"${backgroundTurnToast.title}" finished while you were away.`
+                : 'Your previous chat finished in the background.'
+              : backgroundTurnToast.title
+                ? `"${backgroundTurnToast.title}" failed while you were away.`
+                : 'Your previous chat failed in the background.'}
+          </span>
+          <button
+            className="link"
+            onClick={() => {
+              void loadSession(
+                backgroundTurnToast.sessionId,
+                backgroundTurnToast.cwd,
+                backgroundTurnToast.title ?? undefined
+              );
+              dismissBackgroundToast();
+            }}
+          >
+            Open chat
+          </button>
+          <button className="link" onClick={dismissBackgroundToast}>
+            Dismiss
           </button>
         </div>
       )}

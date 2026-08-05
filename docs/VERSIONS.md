@@ -327,5 +327,77 @@ historical context only; none of it reflects current code.
   title containing the literal text `__BODY__` would get re-scanned and
   spliced with the body content. `escape::render_template` does a single
   pass over the template instead.
+
+## Diagram foolproofing + `generate_accessible_mermaid`
+
+- **No-overlap guarantees** (`plugins/kitty-tools/src/tools/viz/`): a
+  `textLength`+`lengthAdjust="spacingAndGlyphs"` backstop on node labels means
+  a label can never paint wider than its box regardless of the user's font;
+  decision (triangle) nodes are sized/placed so text stays in the wide lower
+  band (no apex spill); YES/NO branch tags move into the row gutter (never on
+  a node); swimlanes reserve a lane-header gutter so tall nodes can't overdraw
+  the lane name; and flowchart/tree edges that skip a layer are rejected
+  (`VIZ_LONG_EDGE`) instead of crossing intermediate nodes.
+- **Readability budget**: every diagram must fit `MAX_CONTENT_W` (~1100px;
+  ~1500 for swimlane/journey) or it would render illegibly small when the
+  iframe scales it to fit. Layouts wrap/compress (per-layer gap + node-width
+  `size_node_capped`) to meet it; anything still over returns `VIZ_TOO_WIDE`
+  with a hint. `wrapper.html` now uses `overflow-x: auto` as a last-resort
+  safety net instead of `hidden`. `tests/viz_invariants.rs` pins the invariants.
+- **New tool: `generate_accessible_mermaid`** — renders arbitrary Mermaid DSL
+  (flowchart/sequence/class/state/ER/gantt/journey/pie/mindmap/gitGraph/…).
+  No Rust Mermaid renderer exists, so the MIT-licensed `mermaid.min.js`
+  (v10.9.1, vendored in `assets/` with `mermaid.LICENSE`) is inlined into each
+  result's HTML payload and rendered client-side in the sandboxed iframe
+  (`securityLevel: 'strict'`, source `<\/`-escaped, accessibility title/desc
+  wired through). Its contract is *guaranteed degradation, never a blank
+  frame*: server rejects empty/oversized sources (`VIZ_EMPTY_MERMAID`/
+  `VIZ_MERMAID_TOO_LARGE`), and a parse error shows the raw source in an error
+  card. **Cost**: ~3 MB per Mermaid result (the JS library rides in the
+  payload) and ~3 MB in the frozen exe. Starts cold in the bandit (new name),
+  the same accepted cost as `generate_accessible_chart`. This tool does **not**
+  promise the layout invariants above — Mermaid controls its own layout.
+- **Grayscale polish**: softened node/vector/pill/tag styling in
+  `assets/defs.svg` (thin `#c9c9d1` strokes, weaker shadow, rounder corners)
+  plus tighter `GAP_X`/`GAP_Y`, kept dark-on-light for accessibility.
+
 - See `docs/PLUGINS.md` for why `visualizations.py` is no longer treated as
   a correctness oracle for this rebuild.
+
+## kitty-docs-web retired — Excel/PDF to kitty-tools, web to kitty-web
+
+- **`kitty-docs-web` (Python) is retired.** Its three web tools
+  (`lean_web_search`/`lean_web_search_read_chunk`/`lean_web_scrape`) were
+  already served by the Rust `kitty-web` process (see the "`lean_web_search`
+  merge" section above); its PDF (PyMuPDF) and Excel (openpyxl) tools now
+  live in `kitty-tools` (Rust). The desktop server registration, its config
+  keys, commands, Settings card, `build.py` entry and `externalBin` bundling
+  are all removed; its source stays in-tree as the behavioral oracle.
+- **New `kitty-tools` tools** (always-on): `lean_excel_inspect`,
+  `lean_excel_read_rows`, `lean_pdf_read_text`, `lean_pdf_read_outline`.
+  `lean_excel_write_rows` is **deliberately dropped** — spreadsheet writes go
+  through the existing `lean_file_*` CSV tools instead of reintroducing a
+  lossy xlsx writer into the small frozen binary (see `docs/PLUGINS.md`).
+- **Deps**: `kitty-tools` gains `calamine` (Excel read, with the `dates`
+  feature for datetime cells → ISO strings) and `lopdf` (pure-Rust PDF).
+  `-openpyxl`/`-pymupdf` are no longer bundled.
+- **`BRAVE_API_KEY` owner changed**: it now attaches to the `kitty-web`
+  server's env in `bigtiny::mcp::ensure_builtin_servers` (it leaves the
+  retired kitty-docs-web block). Keyring id + `set_brave_mcp_search_*`
+  commands unchanged.
+- **Accepted divergences** (documented, same spirit as the DDG-scrape/`htmd`
+  substitutions):
+  - **PDF text layout**: `lopdf` does plain per-page `extract_text` with no
+    PyMuPDF markdown/layout pass, so text run/column order can differ from
+    the Python output. Outlines (`get_toc`) produce the same `{level, title,
+    page}` triples.
+  - **Excel reads `.xls`/`.ods` too** (broader than openpyxl), and
+    integer-valued cells serialize as JSON integers (`1`, not `1.0`) to match
+    openpyxl's Python `int`.
+  - **`kitty-web` `lean_web_scrape` honors `output_format="text"`** by
+    rendering the extracted Markdown to plain text (`scrape::markdown_to_text`),
+    instead of silently ignoring the parameter.
+- **Tool-name fallout**: `lean_excel_*`/`lean_pdf_*` are new names that seed
+  adaptive-pathway's Thompson bandit cold; no existing name was renamed
+  (adaptive-pathway hashes the literal tool-name string — see
+  `plugins/kitty-tools/tests/protocol.rs`).

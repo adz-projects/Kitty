@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use dashmap::DashMap;
@@ -24,7 +25,11 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 /// effectively global.
 pub struct MCPManager {
     pool: SqlitePool,
-    servers: DashMap<String, MCPServerClient>,
+    /// `Arc` so a tool call can clone a client handle out of the map, drop the
+    /// DashMap guard, and only then `.await` the call — holding the shard
+    /// lock across an await previously blocked every sibling tool call on the
+    /// same shard for the whole call duration.
+    servers: DashMap<String, Arc<MCPServerClient>>,
     tool_registry: DashMap<String, ToolDefinition>,
 }
 
@@ -45,12 +50,32 @@ impl MCPManager {
 
         let config = row_to_config(&row);
 
-        match tokio::time::timeout(CONNECT_TIMEOUT, MCPServerClient::connect(&config)).await {
+        // `InProcess` has no command/url `MCPServerClient::connect` could
+        // dial — `command` here is a logical name looked up in
+        // `mcp::builtin`'s registry instead. Both branches still share the
+        // same connect-timeout/status-update/evict-stale handling below, so
+        // an in-process server gets identical enable-toggle and
+        // failed-reconnect behavior to a stdio one.
+        let connect_result = if config.transport == TransportType::InProcess {
+            let name = config.command.clone().unwrap_or_default();
+            tokio::time::timeout(CONNECT_TIMEOUT, super::builtin::connect(&name, server_id.to_string())).await
+        } else {
+            tokio::time::timeout(CONNECT_TIMEOUT, MCPServerClient::connect(&config)).await
+        };
+
+        match connect_result {
             Ok(Ok(client)) => {
+                // Prune this server's previous (possibly stale) registry
+                // entries before advertising the fresh tool list — on a
+                // successful reconnect, tools the server no longer advertises
+                // used to linger in the flat registry forever, keeping dead
+                // tools callable (routing to the stale client) after a code
+                // change or server-side tool removal.
+                self.prune_registry_for(server_id);
                 for tool in client.tools() {
                     self.tool_registry.insert(tool.name.clone(), tool.clone());
                 }
-                self.servers.insert(server_id.to_string(), client);
+                self.servers.insert(server_id.to_string(), Arc::new(client));
                 let _ = mcp_servers::update_status(&self.pool, server_id, "connected", None).await;
                 Ok(())
             }
@@ -75,6 +100,15 @@ impl MCPManager {
         }
     }
 
+    /// Drop every registry entry advertising a tool for `server_id` — the
+    /// flat registry is keyed by tool *name*, so a server's tools are
+    /// identified by `ToolDefinition.server_id` rather than the key. Used on
+    /// successful (re)connect (replace the old tool set before installing the
+    /// fresh one), on failed (re)connect, and on disconnect.
+    fn prune_registry_for(&self, server_id: &str) {
+        self.tool_registry.retain(|_, t| t.server_id != server_id);
+    }
+
     /// Remove a previous (now-stale) client + its tools for `server_id`, if
     /// any — called when a (re)connect attempt fails. Without this, a failed
     /// reconnect left the last-known-good client and its tool names in
@@ -83,8 +117,14 @@ impl MCPManager {
     /// registry kept advertising tools that were no longer reachable.
     async fn evict_stale(&self, server_id: &str) {
         if let Some((_, client)) = self.servers.remove(server_id) {
-            self.tool_registry.retain(|_, t| t.server_id != server_id);
-            client.shutdown().await;
+            self.prune_registry_for(server_id);
+            // `Arc::try_unwrap` recovers ownership of the client (needed for
+            // the consuming `shutdown`); a live clone means an in-flight call
+            // still holds it, in which case the drop-on-last-strong-ref tears
+            // the handle down anyway.
+            if let Ok(client) = Arc::try_unwrap(client) {
+                client.shutdown().await;
+            }
         }
     }
 
@@ -165,7 +205,11 @@ impl MCPManager {
             );
         }
 
-        let Some(client) = self.servers.get(&tool.server_id) else {
+        // Clone the client handle (an `Arc`) out of the map and drop the
+        // DashMap guard before awaiting — the call can run for up to
+        // `DEFAULT_TOOL_TIMEOUT`, and holding the shard lock across it would
+        // block every sibling tool call sharing that shard.
+        let Some(client) = self.servers.get(&tool.server_id).map(|c| c.value().clone()) else {
             return error_result(
                 tool_name,
                 format!("[Server for tool '{tool_name}' is not connected]"),
@@ -177,8 +221,10 @@ impl MCPManager {
 
     pub async fn disconnect_server(&self, server_id: &str) {
         if let Some((_, client)) = self.servers.remove(server_id) {
-            self.tool_registry.retain(|_, t| t.server_id != server_id);
-            client.shutdown().await;
+            self.prune_registry_for(server_id);
+            if let Ok(client) = Arc::try_unwrap(client) {
+                client.shutdown().await;
+            }
         }
         let _ = mcp_servers::update_status(&self.pool, server_id, "disconnected", None).await;
     }
@@ -209,6 +255,7 @@ fn row_to_config(row: &mcp_servers::MCPServerRow) -> MCPServerConfig {
     let transport = match row.transport.as_str() {
         "stdio" => TransportType::Stdio,
         "sse" => TransportType::Sse,
+        "in_process" => TransportType::InProcess,
         _ => TransportType::StreamableHttp,
     };
     MCPServerConfig {
@@ -301,5 +348,40 @@ mod tests {
             first, second,
             "tool order must be identical across repeat calls"
         );
+    }
+
+    /// Regression (WS3-4): a successful reconnect must prune the previous
+    /// tool set for that server — tools the server no longer advertises
+    /// otherwise linger in the flat registry forever.
+    #[tokio::test]
+    async fn prune_registry_for_drops_only_that_servers_tools() {
+        let pool = test_pool().await;
+        let manager = MCPManager::new(pool);
+        for (name, server) in [
+            ("a_tool", "srv-a"),
+            ("a2_tool", "srv-a"),
+            ("b_tool", "srv-b"),
+        ] {
+            manager.tool_registry.insert(
+                name.to_string(),
+                ToolDefinition {
+                    name: name.to_string(),
+                    description: String::new(),
+                    input_schema: serde_json::json!({}),
+                    server_id: server.to_string(),
+                },
+            );
+        }
+
+        manager.prune_registry_for("srv-a");
+
+        let names: Vec<String> = manager
+            .tool_registry
+            .iter()
+            .map(|e| e.key().clone())
+            .collect();
+        assert!(!names.contains(&"a_tool".to_string()));
+        assert!(!names.contains(&"a2_tool".to_string()));
+        assert!(names.contains(&"b_tool".to_string()));
     }
 }

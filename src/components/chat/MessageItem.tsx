@@ -1,4 +1,4 @@
-import { memo, useState, type ReactNode } from 'react';
+import { memo, useEffect, useRef, useState, type ReactNode } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
@@ -85,8 +85,25 @@ export const MessageItem = memo(function MessageItem({
       instead of a dedicated click. Lower intensity than the explicit 👍
       (0.6 vs 0.8) since this is inferred, not a deliberate feedback click.
       No-ops when the message has no `decide` hint to attribute it to. */
+  const [copied, setCopied] = useState(false);
+  const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(
+    () => () => {
+      if (copyTimerRef.current) clearTimeout(copyTimerRef.current);
+    },
+    []
+  );
   const copyMessage = () => {
-    void navigator.clipboard.writeText(message.text);
+    void navigator.clipboard
+      .writeText(message.text)
+      .then(() => {
+        setCopied(true);
+        if (copyTimerRef.current) clearTimeout(copyTimerRef.current);
+        copyTimerRef.current = setTimeout(() => setCopied(false), 1200);
+      })
+      .catch(() => {
+        /* clipboard may be unavailable */
+      });
     if (!sessionId) return;
     const parsed = parseHintOutput(findHintToolCall(message));
     const edgeId = parsed?.hints[0]?.edge_id;
@@ -121,7 +138,7 @@ export const MessageItem = memo(function MessageItem({
             Regenerate
           </button>
           <button title="Copy as Markdown" onClick={copyMessage}>
-            Copy
+            {copied ? 'Copied' : 'Copy'}
           </button>
           <HintFeedbackButtons message={message} />
           <MessageInfo message={message} />

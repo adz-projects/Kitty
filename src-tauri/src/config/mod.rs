@@ -142,11 +142,29 @@ pub struct Config {
     pub replacement_mcp_default_migrated: bool,
     /// Whether the bundled `wasm-math-mcp` server (see
     /// `plugins/wasm-math-mcp/`) is registered+enabled as a BigTiny MCP
-    /// server. On by default — sandboxed Python/NumPy execution is safe and
-    /// broadly useful for any model, unlike `replacement_mcp`'s wholesale
-    /// tool-set swap. No credentials involved.
+    /// server. **Retired** — superseded by `kitty-wasm` (see
+    /// `kitty_wasm_enabled`). Kept purely as the one-shot migration source for
+    /// `migrate_kitty_wasm_enabled` so an existing install that had math
+    /// execution disabled doesn't suddenly gain it.
     #[serde(default = "default_true")]
     pub wasm_math_mcp_enabled: bool,
+    /// Whether the bundled `kitty-wasm` server (see `plugins/kitty-wasm/`) is
+    /// registered+enabled as a BigTiny MCP server — the Rust replacement for
+    /// the retired `wasm-math-mcp` Python plugin. On by default: sandboxed
+    /// WebAssembly (wasmtime + WASI) Python/arbitrary-module execution with
+    /// no network and no filesystem beyond explicit mounts is safe and
+    /// broadly useful. Its 26 MB CPython guest is bundled as an app resource
+    /// so first use is offline. On first load after the cutover,
+    /// `migrate_kitty_wasm_enabled` carries `wasm_math_mcp_enabled`'s value
+    /// forward so a user who'd disabled the old server doesn't silently
+    /// regain it.
+    #[serde(default = "default_true")]
+    pub kitty_wasm_enabled: bool,
+    /// One-shot marker for the `wasm-math-mcp` -> `kitty-wasm` cutover, so a
+    /// user who later flips `kitty_wasm_enabled` independently keeps that
+    /// choice.
+    #[serde(default)]
+    pub kitty_wasm_default_migrated: bool,
     /// Whether the `brave_mcp_search` tool is advertised by the combined
     /// `kitty-tools` server (see `kitty_tools_enabled` below and
     /// `plugins/kitty-tools/src/tools/search.rs`) — no longer its own
@@ -189,11 +207,23 @@ pub struct Config {
     /// as `replacement_mcp_default_migrated`.
     #[serde(default)]
     pub kitty_tools_default_migrated: bool,
-    /// Whether the bundled `kitty-docs-web` server (see
-    /// `plugins/kitty-docs-web/` — PDF/Excel/web-scrape/DDG-search) is
-    /// registered+enabled as a BigTiny MCP server. Same carry-forward
-    /// migration story as `kitty_tools_enabled` above; these 7 tools also
-    /// used to live in `replacement-mcp`.
+    /// Whether the bundled `kitty-web` web-search/web-scrape server (see
+    /// `plugins/kitty-web/`) is registered+enabled as a BigTiny MCP server.
+    /// This Rust process is the replacement for the web half of the retired
+    /// `kitty-docs-web` server (see `kitty_docs_web_enabled` below, kept only
+    /// as the source value of the carry-forward migration).
+    #[serde(default = "default_true")]
+    pub kitty_web_enabled: bool,
+    /// One-shot marker for the kitty-docs-web -> kitty-web carry-forward
+    /// migration below — same pattern as `kitty_tools_default_migrated`.
+    #[serde(default)]
+    pub kitty_web_default_migrated: bool,
+    /// Retired: `kitty-docs-web` no longer exists as its own process — its
+    /// web tools moved to `kitty-web` (Rust) and its PDF/Excel tools moved
+    /// to `kitty-tools` (Rust). Kept (not removed) purely as the source value
+    /// `migrate_kitty_web_enabled` carries forward into `kitty_web_enabled` on
+    /// an existing install's first load after the split — removing it would
+    /// break that migration for anyone who hasn't upgraded past it yet.
     #[serde(default = "default_true")]
     pub kitty_docs_web_enabled: bool,
     #[serde(default)]
@@ -338,6 +368,11 @@ impl Default for Config {
             // A brand-new config needs no flip, so it starts already-migrated.
             replacement_mcp_default_migrated: true,
             wasm_math_mcp_enabled: default_true(),
+            kitty_wasm_enabled: default_true(),
+            // A brand-new config needs no carry-forward, so it starts
+            // already-migrated — same reasoning as
+            // `replacement_mcp_default_migrated` above.
+            kitty_wasm_default_migrated: true,
             brave_mcp_search_enabled: false,
             visualizations_enabled: default_true(),
             kitty_tools_enabled: default_true(),
@@ -345,6 +380,8 @@ impl Default for Config {
             // already-migrated — same reasoning as
             // `replacement_mcp_default_migrated` above.
             kitty_tools_default_migrated: true,
+            kitty_web_enabled: default_true(),
+            kitty_web_default_migrated: true,
             kitty_docs_web_enabled: default_true(),
             kitty_docs_web_default_migrated: true,
             scheduled_tasks: Vec::new(),
@@ -607,16 +644,64 @@ pub fn load() -> Result<Config, ConfigError> {
     match fs::read_to_string(&path) {
         Ok(text) => {
             let config: Config = serde_json::from_str(&text)?;
-            Ok(migrate_kitty_split_enabled(
-                migrate_replacement_mcp_enabled(migrate_ap_db_path(
+            Ok(migrate_kitty_wasm_enabled(migrate_kitty_web_enabled(
+                migrate_kitty_split_enabled(migrate_replacement_mcp_enabled(migrate_ap_db_path(
                     migrate_bigtiny_launch_command(migrate_ap_launch_command(migrate_recipes(
                         migrate_hotkeys(config, &text),
                     ))),
-                )),
-            ))
+                ))),
+            )))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
         Err(e) => Err(e.into()),
+    }
+}
+
+/// Load config, and on a corrupt-file failure back the bad file up (before
+/// falling back to defaults) so a later save never silently overwrites the
+/// user's only copy. Returns the config plus `Some(backup path)` when a
+/// recovery actually happened — lib.rs stashes that in `AppState` so the
+/// frontend can show a one-time notice.
+pub fn load_with_recovery() -> (Config, Option<PathBuf>) {
+    match load() {
+        Ok(cfg) => (cfg, None),
+        Err(e) => {
+            let backup = backup_corrupt_config();
+            tracing::warn!(
+                "config load failed ({e}); backed up to {}",
+                backup
+                    .as_ref()
+                    .map(|b| b.display().to_string())
+                    .unwrap_or_else(|| "config.json (nothing to back up)".to_string())
+            );
+            (Config::default(), backup)
+        }
+    }
+}
+
+/// Best-effort backup of the current `config.json` (which failed to parse)
+/// to `config.json.corrupt-<unix_timestamp>` next to it — a same-directory
+/// rename when possible, else a copy. Never a hard failure: returns `None`
+/// when there's nothing to back up or the backup fails, and callers just
+/// fall back to defaults either way.
+pub fn backup_corrupt_config() -> Option<PathBuf> {
+    let path = config_path().ok()?;
+    backup_corrupt_config_file(&path)
+}
+
+/// Path-explicit half of [`backup_corrupt_config`], so the logic is
+/// unit-testable against temp-dir paths instead of the machine's real
+/// `%APPDATA%/Kitty/config.json`.
+pub(crate) fn backup_corrupt_config_file(path: &Path) -> Option<PathBuf> {
+    if !path.exists() {
+        return None;
+    }
+    let timestamp = chrono::Utc::now().timestamp();
+    let backup = path.with_file_name(format!("config.json.corrupt-{timestamp}"));
+    if fs::rename(path, &backup).is_ok() {
+        Some(backup)
+    } else {
+        fs::copy(path, &backup).ok().map(|_| backup)
     }
 }
 
@@ -810,6 +895,35 @@ fn migrate_kitty_split_enabled(mut config: Config) -> Config {
     config
 }
 
+/// One-time carry-forward for the `kitty-docs-web` -> `kitty-web` split: the
+/// retired `kitty-docs-web` server's `kitty_docs_web_enabled` flag is carried
+/// into `kitty_web_enabled` so an existing install that had web tools
+/// disabled doesn't suddenly gain them. Runs after `migrate_kitty_split_enabled`
+/// so it reads that flag's already-settled value. Guarded the same one-shot
+/// way: a user who later flips `kitty_web_enabled` independently keeps that
+/// choice.
+fn migrate_kitty_web_enabled(mut config: Config) -> Config {
+    if !config.kitty_web_default_migrated {
+        config.kitty_web_enabled = config.kitty_docs_web_enabled;
+        config.kitty_web_default_migrated = true;
+    }
+    config
+}
+
+/// One-time carry-forward for the `wasm-math-mcp` -> `kitty-wasm` cutover:
+/// the retired `wasm-math-mcp` server's `wasm_math_mcp_enabled` flag is
+/// carried into `kitty_wasm_enabled` so an existing install that had math
+/// execution disabled doesn't suddenly gain it. Guarded the same one-shot
+/// way as `migrate_kitty_web_enabled`: a user who later flips
+/// `kitty_wasm_enabled` independently keeps that choice.
+fn migrate_kitty_wasm_enabled(mut config: Config) -> Config {
+    if !config.kitty_wasm_default_migrated {
+        config.kitty_wasm_enabled = config.wasm_math_mcp_enabled;
+        config.kitty_wasm_default_migrated = true;
+    }
+    config
+}
+
 fn migrate_hotkeys(mut config: Config, raw: &str) -> Config {
     if config.hotkeys.is_empty() {
         let legacy = serde_json::from_str::<serde_json::Value>(raw)
@@ -981,8 +1095,10 @@ mod tests {
     fn migrate_ap_launch_command_leaves_custom_override_untouched() {
         // A deliberate dev-mode override (e.g. pointing at `uv run ...`) must
         // never be silently overwritten by the bundled-path self-heal.
-        let mut cfg = Config::default();
-        cfg.adaptive_pathway_launch_command = "uv run adaptive-pathway-sidecar".to_string();
+        let cfg = Config {
+            adaptive_pathway_launch_command: "uv run adaptive-pathway-sidecar".to_string(),
+            ..Config::default()
+        };
         let migrated = migrate_ap_launch_command(cfg);
         assert_eq!(
             migrated.adaptive_pathway_launch_command,
@@ -1324,11 +1440,96 @@ mod tests {
     }
 
     #[test]
+    fn kitty_web_carries_forward_a_disabled_docs_web_flag() {
+        // Pre-split shape: kitty-docs-web (which hosted web search) was opted
+        // out. kitty_web_enabled must land on false too, not the container
+        // `default_true`, so a user who disabled web tools doesn't suddenly
+        // gain them.
+        let cfg: Config = serde_json::from_str(
+            r#"{"kitty_docs_web_enabled":false,"kitty_docs_web_default_migrated":true}"#,
+        )
+        .unwrap();
+        let migrated = migrate_kitty_web_enabled(cfg);
+        assert!(!migrated.kitty_web_enabled);
+        assert!(migrated.kitty_web_default_migrated);
+    }
+
+    #[test]
+    fn kitty_web_is_on_for_a_brand_new_config() {
+        let cfg = Config::default();
+        assert!(cfg.kitty_web_enabled);
+        assert!(cfg.kitty_web_default_migrated);
+    }
+
+    #[test]
+    fn kitty_wasm_carries_forward_a_disabled_wasm_math_flag() {
+        // Pre-cutover shape: wasm-math-mcp (which hosted math Python) was
+        // opted out. kitty_wasm_enabled must land on false too, not the
+        // container `default_true`, so a user who disabled math execution
+        // doesn't suddenly gain it.
+        let cfg: Config = serde_json::from_str(r#"{"wasm_math_mcp_enabled":false}"#).unwrap();
+        let migrated = migrate_kitty_wasm_enabled(cfg);
+        assert!(!migrated.kitty_wasm_enabled);
+        assert!(migrated.kitty_wasm_default_migrated);
+    }
+
+    #[test]
+    fn kitty_wasm_is_on_for_a_brand_new_config() {
+        let cfg = Config::default();
+        assert!(cfg.kitty_wasm_enabled);
+        assert!(cfg.kitty_wasm_default_migrated);
+    }
+
+    #[test]
+    fn kitty_wasm_keeps_an_independent_later_choice() {
+        let cfg: Config = serde_json::from_str(
+            r#"{"wasm_math_mcp_enabled":false,"kitty_wasm_default_migrated":true}"#,
+        )
+        .unwrap();
+        let migrated = migrate_kitty_wasm_enabled(cfg);
+        // Already migrated: a user who flipped kitty_wasm_enabled on
+        // independently keeps it, regardless of the retired old flag.
+        assert!(migrated.kitty_wasm_enabled);
+    }
+
+    #[test]
     fn old_shape_config_migrates_wizard_redesign_defaults() {
         // A config predating the wizard redesign (ollama_enabled) must still
         // load, with Ollama left enabled (pre-existing installs already have
         // it configured).
         let back: Config = serde_json::from_str(r#"{"theme":"dark"}"#).unwrap();
         assert!(back.ollama_enabled);
+    }
+
+    #[test]
+    fn backup_corrupt_config_file_moves_the_bad_file_next_to_a_timed_backup() {
+        let dir = temp_dir("corrupt");
+        fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("config.json");
+        fs::write(&config, b"{ this is not valid json !!!").unwrap();
+
+        let backup = backup_corrupt_config_file(&config).expect("backup should succeed");
+
+        // The original is gone (renamed — the whole point is that a later
+        // `save` writes a fresh file, not the corrupt one) and the backup
+        // holds the exact original bytes under a `config.json.corrupt-` name.
+        assert!(!config.exists());
+        assert!(
+            backup
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("config.json.corrupt-"))
+        );
+        assert_eq!(fs::read(&backup).unwrap(), b"{ this is not valid json !!!");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn backup_corrupt_config_file_is_a_no_op_when_the_file_is_missing() {
+        let dir = temp_dir("corrupt-missing");
+        fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("config.json");
+        assert_eq!(backup_corrupt_config_file(&config), None);
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

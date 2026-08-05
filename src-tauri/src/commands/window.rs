@@ -114,10 +114,21 @@ pub fn get_startup_phase(state: tauri::State<'_, AppState>) -> Result<StartupPha
 /// BigTiny switches providers live over REST instead.
 #[tauri::command]
 pub async fn restart_backend(app: AppHandle) -> Result<(), String> {
-    {
+    // Take the old process out of the daemon handle so we can drop the
+    // `bigtiny` Mutex before killing — `kill_if_owned` blocks on
+    // `child.wait()`, and holding the lock across that would stall every
+    // other BigTiny client call. Run the wait off the async worker too.
+    let old_proc = {
         let state = app.state::<AppState>();
-        state.bigtiny.lock().unwrap().process.kill_if_owned();
-    }
+        let mut handle = state.bigtiny.lock().unwrap();
+        std::mem::take(&mut handle.process)
+    };
+    tokio::task::spawn_blocking(move || {
+        let mut proc = old_proc;
+        proc.kill_if_owned();
+    })
+    .await
+    .map_err(|e| format!("backend kill task panicked: {e}"))?;
     let (command, args, dir, summarizer, token_management) = {
         let state = app.state::<AppState>();
         let cfg = state.config.lock().unwrap();

@@ -1,0 +1,64 @@
+[package]
+name = "kitty-web"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Web search (Brave-preferred, DuckDuckGo fallback) and page scraping — the Rust replacement for kitty-docs-web's three web tools. See docs/PLUGINS.md."
+
+# Standalone package, NOT a workspace member of src-tauri — same rationale as
+# `plugins/kitty-tools/Cargo.toml` (MSRV isolation for rmcp; `[profile.*]` is
+# workspace-root-only; src-tauri's `panic = "abort"` must not leak here;
+# feature unification would otherwise leak this crate's deps into the Tauri
+# binary). Has both a `[lib]` and a `[[bin]]` so it can be hosted two ways:
+# as a stdio subprocess on desktop, or linked in-process on a host that can't
+# exec() a bundled binary (see `serve_in_process` and docs/PLUGINS.md's
+# "in-process MCP server" section).
+
+[lib]
+name = "kitty_web"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kitty-web"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "time"] }
+rmcp = { version = "=2.2.0", features = ["server", "transport-io", "macros"] }
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+regex = "1"
+dirs = "5"
+url = "2"
+rand = "0.8"
+# `default-features = false` is load-bearing, not tidiness: reqwest's default
+# `default-tls` pulls in native-tls (schannel on Windows, OpenSSL elsewhere),
+# and OpenSSL cross-compilation is the classic Android build failure. Same
+# treatment `plugins/bigtiny_rust/Cargo.toml` got. `rustls-tls` bundles
+# webpki roots, so there's no platform certificate-store integration needed —
+# the known tradeoff is that user-installed/corporate MITM CAs won't be
+# trusted.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "gzip"] }
+scraper = "0.24"
+htmd = "0.2"
+# `scraper` does not re-export `ego_tree`, but its `Html` tree is built from
+# it and `NodeId`/`NodeRef` appear in the API `scrape.rs` uses to walk and
+# re-serialize a subtree. The version must stay in lockstep with whatever
+# `scraper` itself depends on (0.24 -> ego-tree 0.10) or the two crates'
+# `NodeId` types won't unify.
+ego-tree = "0.10"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = true
+# panic = "abort" intentionally NOT set — same reasoning as kitty-tools: a
+# panicking tool call should return a structured error, not kill the server
+# process and every subsequent call in the session. `guarded()` in server.rs
+# depends on unwinding.

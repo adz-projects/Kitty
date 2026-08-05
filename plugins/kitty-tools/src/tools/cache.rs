@@ -9,11 +9,31 @@
 //! arbitrary read/delete — a real path-traversal hole, not ported forward.
 
 use crate::envelope::{error_response, success_response};
+use crate::paths::path_within_home;
 use crate::tools::cache_dir;
 use serde_json::json;
 
+/// Cap on `cache_view`'s `read_to_string` — a cached file past this is read
+/// truncated (with the `truncated` flag set) instead of materialized whole.
+const CACHE_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
 fn rejects_traversal(filename: &str) -> bool {
     filename.contains('/') || filename.contains('\\') || filename.contains("..")
+}
+
+/// Defense-in-depth home boundary on a filename already joined under the
+/// cache dir — the join is inside home by construction, but a hostile home
+/// override should not redirect reads/writes out of it.
+fn ensure_within_home(file_path: &std::path::Path) -> Option<String> {
+    if !path_within_home(file_path) {
+        return Some(error_response(
+            "PATH_OUTSIDE_HOME",
+            "Path is outside the HOME directory",
+            Some(&file_path.to_string_lossy()),
+            Some("Only paths inside your home directory can be accessed."),
+        ));
+    }
+    None
 }
 
 pub fn cache_list() -> String {
@@ -38,12 +58,39 @@ pub fn cache_list() -> String {
 }
 
 pub fn cache_view(filename: &str) -> String {
+    cache_view_in(cache_dir(), filename)
+}
+
+/// Split for testability — `cache_view` uses the process-global cache dir;
+/// the truncation test needs to plant an oversized file in a scratch dir.
+fn cache_view_in(dir: std::path::PathBuf, filename: &str) -> String {
     if rejects_traversal(filename) {
         return error_response("CACHE_INVALID_FILENAME", "Filename must not contain path separators or '..'.", None, None);
     }
-    let file_path = cache_dir().join(filename);
+    let file_path = dir.join(filename);
+    if let Some(err) = ensure_within_home(&file_path) {
+        return err;
+    }
     if !file_path.exists() {
         return error_response("CACHE_MISS", &format!("File '{filename}' not found."), None, None);
+    }
+    if std::fs::metadata(&file_path).map(|m| m.len() > CACHE_MAX_BYTES).unwrap_or(false) {
+        use std::io::Read;
+        let f = match std::fs::File::open(&file_path) {
+            Ok(f) => f,
+            Err(e) => return error_response("CACHE_READ_ERROR", &format!("Cannot read cached file: {e}"), None, None),
+        };
+        let mut buf = Vec::with_capacity(CACHE_MAX_BYTES as usize / 2);
+        if f.take(CACHE_MAX_BYTES).read_to_end(&mut buf).is_err() {
+            return error_response("CACHE_READ_ERROR", "Cannot read cached file", None, None);
+        }
+        let text = String::from_utf8_lossy(&buf);
+        return success_response(
+            json!(text),
+            Some("File was larger than the read limit and was truncated."),
+            true,
+            Some(json!({"truncated_at_bytes": CACHE_MAX_BYTES})),
+        );
     }
     match std::fs::read_to_string(&file_path) {
         Ok(text) => success_response(json!(text), None, false, None),
@@ -56,6 +103,9 @@ pub fn cache_delete(filename: &str) -> String {
         return error_response("CACHE_INVALID_FILENAME", "Filename must not contain path separators or '..'.", None, None);
     }
     let file_path = cache_dir().join(filename);
+    if let Some(err) = ensure_within_home(&file_path) {
+        return err;
+    }
     if file_path.exists() {
         if let Err(e) = std::fs::remove_file(&file_path) {
             return error_response("CACHE_DELETE_ERROR", &format!("Cannot delete cached file: {e}"), None, None);
@@ -101,5 +151,22 @@ mod tests {
         let s = cache_view("definitely-not-a-real-cached-file.txt");
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(v["error_code"], "CACHE_MISS");
+    }
+
+    #[test]
+    fn oversized_cached_file_is_read_truncated_with_flag() {
+        let dir = std::env::temp_dir().join(format!("kt-cache-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("big.txt"), "x".repeat(CACHE_MAX_BYTES as usize + 1)).unwrap();
+
+        let s = cache_view_in(dir.clone(), "big.txt");
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["status"], "success", "{s}");
+        assert_eq!(v["truncated"], true);
+        let text = v["data"].as_str().unwrap();
+        assert!(text.len() <= CACHE_MAX_BYTES as usize, "read {} bytes past the {} cap", text.len(), CACHE_MAX_BYTES);
+        assert!(v["message"].as_str().unwrap().contains("truncate"));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

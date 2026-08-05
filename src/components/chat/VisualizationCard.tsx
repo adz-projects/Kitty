@@ -51,6 +51,7 @@ const VIZ_LABELS: Record<string, string> = {
   generate_accessible_svg: 'Diagram',
   generate_accessible_table: 'Table',
   generate_accessible_chart: 'Chart',
+  generate_accessible_mermaid: 'Mermaid',
 };
 
 /** Sandboxed iframe rendering a tool-produced standalone HTML document

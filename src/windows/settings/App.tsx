@@ -69,6 +69,13 @@ export function App() {
   const [highlight, setHighlight] = useState<string | null>(null);
   const [apEnabled, setApEnabled] = useState(false);
   const [ollamaEnabled, setOllamaEnabled] = useState(true);
+  const [recoveryNotice, setRecoveryNotice] = useState<string | null>(null);
+
+  useEffect(() => {
+    void ipc.getConfigRecoveryNotice().then((msg) => {
+      if (msg) setRecoveryNotice(msg);
+    });
+  }, []);
 
   useEffect(() => {
     // Register the live listener before awaiting the one-shot deep-link
@@ -102,6 +109,14 @@ export function App() {
 
   return (
     <div className="settings-window">
+      {recoveryNotice && (
+        <div className="settings-recovery-notice" role="alert">
+          <span>{recoveryNotice}</span>
+          <button type="button" onClick={() => setRecoveryNotice(null)} aria-label="Dismiss">
+            ×
+          </button>
+        </div>
+      )}
       <nav className="settings-nav">
         {groups.map((g) => (
           <Fragment key={g.label}>

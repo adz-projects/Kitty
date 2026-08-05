@@ -77,7 +77,7 @@ You must strictly follow this 4-step loop for all tasks beyond simple single-fil
 - **Config**: `%APPDATA%/Kitty/config.json`. **Secrets**: Windows Credential Manager via `keyring` (service `kitty`), never `config.json`, never JS.
 - **Plugin integration patterns** (critical distinction, see `docs/PLUGINS.md`):
   - *Kitty-managed process* (HTTP sidecars like BigTiny itself, adaptive-pathway): Kitty spawns, monitors via `ManagedProcess`/health loop. Pattern: `lifecycle/<name>_proc.rs`.
-  - *BigTiny-managed MCP server* (stdio: `kitty-tools`, `kitty-docs-web`, `adaptive-pathway-mcp`, `wasm-math-mcp`): BigTiny spawns/owns. Kitty only upserts the registration via `bigtiny::mcp::ensure_builtin_servers`. No `ManagedProcess`.
+  - *BigTiny-managed MCP server* (stdio: `kitty-tools`, `kitty-web`, `kitty-wasm`, `adaptive-pathway-mcp`): BigTiny spawns/owns. Kitty only upserts the registration via `bigtiny::mcp::ensure_builtin_servers`. No `ManagedProcess`.
   - **Never mix** — two supervisors racing one child is a bug.
 
 ## Frontend rules

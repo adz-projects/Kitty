@@ -296,9 +296,18 @@ fn create(path: &Path, doc_text: Option<&str>, title: Option<&str>, language: &s
     // WCAG accessibility metadata (Track: reproduce, not fix, the schema
     // violation — see `_set_doc_accessibility_meta`'s doc comment below).
     let styles_xml = append_lang_to_styles_root(STYLES_TEMPLATE, language);
-    let core_xml = CORE_TEMPLATE
-        .replace("__TITLE__", &xml_escape(&doc_title))
-        .replace("__LANGUAGE__", &xml_escape(language));
+    // Single-pass token substitution (shared with the viz HTML wrapper) — the
+    // old `.replace("__TITLE__", t).replace("__LANGUAGE__", l)` chain let a
+    // title containing the literal `__LANGUAGE__` get clobbered by the
+    // language step; render_template substitutes each token exactly once and
+    // never re-scans substituted values.
+    let core_xml = crate::tools::viz::escape::render_template(
+        CORE_TEMPLATE,
+        &[
+            ("TITLE", &xml_escape(&doc_title)),
+            ("LANGUAGE", &xml_escape(language)),
+        ],
+    );
 
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -370,13 +379,30 @@ fn append(path: &Path, doc_text: Option<&str>, title: Option<&str>, language: &s
     }
     let read_file = std::fs::File::open(path).map_err(|e| DocxError::Corrupt(e.to_string()))?;
     let mut archive = ZipArchive::new(read_file).map_err(|e| DocxError::Corrupt(e.to_string()))?;
+    if archive.len() > super::MAX_DOCX_ENTRIES {
+        return Err(DocxError::Corrupt(format!(
+            "archive has too many entries ({})",
+            archive.len()
+        )));
+    }
 
     let mut parts: BTreeMap<String, Vec<u8>> = BTreeMap::new();
     for i in 0..archive.len() {
-        let mut entry = archive.by_index(i).map_err(|e| DocxError::Corrupt(e.to_string()))?;
+        let entry = archive.by_index(i).map_err(|e| DocxError::Corrupt(e.to_string()))?;
         let name = entry.name().to_string();
         let mut buf = Vec::new();
-        entry.read_to_end(&mut buf).map_err(|e| DocxError::Corrupt(e.to_string()))?;
+        // Cap decompression per part (zip-bomb hardening, same as the read
+        // path) so a single bombed entry can't exhaust memory on append.
+        entry
+            .take(super::MAX_DOCX_ENTRY_BYTES + 1)
+            .read_to_end(&mut buf)
+            .map_err(|e| DocxError::Corrupt(e.to_string()))?;
+        if buf.len() as u64 > super::MAX_DOCX_ENTRY_BYTES {
+            return Err(DocxError::Corrupt(format!(
+                "part {name} exceeds the {} byte decompressed-size cap",
+                super::MAX_DOCX_ENTRY_BYTES
+            )));
+        }
         parts.insert(name, buf);
     }
     drop(archive);
@@ -537,5 +563,21 @@ mod tests {
         let sect_idx = spliced.find("<w:sectPr").unwrap();
         let new_idx = spliced.find("NEW").unwrap();
         assert!(new_idx < sect_idx);
+    }
+
+    #[test]
+    fn title_containing_language_token_is_not_rescanned() {
+        // Historical bug: the `.replace("__TITLE__", t).replace("__LANGUAGE__", l)`
+        // chain would turn a title of "foo __LANGUAGE__ bar" into "foo en-US bar".
+        // The single-pass render_template substitutes each token once.
+        let core = crate::tools::viz::escape::render_template(
+            CORE_TEMPLATE,
+            &[
+                ("TITLE", &xml_escape("foo __LANGUAGE__ bar")),
+                ("LANGUAGE", &xml_escape("en-US")),
+            ],
+        );
+        assert!(core.contains("<dc:title>foo __LANGUAGE__ bar</dc:title>"), "{core}");
+        assert!(core.contains("<dc:language>en-US</dc:language>"), "{core}");
     }
 }

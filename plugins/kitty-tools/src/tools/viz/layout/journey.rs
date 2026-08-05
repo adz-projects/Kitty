@@ -23,7 +23,13 @@ const PAIN_BAND_H: f32 = 80.0;
 
 pub fn render(steps: &[Step]) -> (String, f32, f32) {
     let n = steps.len();
-    let col_w = steps.iter().map(|s| text::measure_px(&s.text, NODE_FONT_PX) + 24.0).fold(MIN_COL_W, f32::max);
+    // A journey can't wrap to extra rows (the horizontal axis is the stage
+    // order), so fit `MAX_CONTENT_W_WIDE` by capping the column width; stage
+    // labels wrap to two lines to survive the cap. If even `MIN_COL_W` won't
+    // fit, the centralized width check returns `VIZ_TOO_WIDE`.
+    let natural_col = steps.iter().map(|s| text::measure_px(&s.text, NODE_FONT_PX) + 24.0).fold(MIN_COL_W, f32::max);
+    let budget_col = (crate::tools::viz::layout::MAX_CONTENT_W_WIDE - LEFT_GUTTER) / n.max(1) as f32;
+    let col_w = natural_col.min(budget_col.max(MIN_COL_W));
 
     let has_action = steps.iter().any(|s| s.subtitle.as_deref().is_some_and(|t| !t.trim().is_empty()));
     let has_sentiment = steps.iter().any(|s| s.sentiment.is_some());
@@ -48,7 +54,9 @@ pub fn render(steps: &[Step]) -> (String, f32, f32) {
 
     for (i, step) in steps.iter().enumerate() {
         let cx = LEFT_GUTTER + (i as f32 + 0.5) * col_w;
-        canvas.text_line(cx, stage_top + 30.0, "node-text", &format!("{}. {}", i + 1, step.text));
+        let label = format!("{}. {}", i + 1, step.text);
+        let lines = text::wrap(&label, col_w - 12.0, NODE_FONT_PX, 2);
+        canvas.text_lines_fit(cx, stage_top + 30.0, "node-text", &lines, 15.0, NODE_FONT_PX, col_w - 12.0);
     }
 
     if has_action {

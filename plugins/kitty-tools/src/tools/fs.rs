@@ -2,17 +2,49 @@
 //! port of `lean_mcp.py`'s file tools.
 
 use crate::envelope::{error_response, success_response};
+use crate::paths::path_within_home;
 use crate::paths::resolve;
 use crate::query_filter::filter_by_query;
 use crate::text::py_splitlines;
 use serde_json::json;
 
 const FILE_PAGE_SIZE: usize = 200;
+/// Hard cap on full-file reads (`file_read`/`file_replace_str`/
+/// `file_replace_lines` all materialize the whole file). Text files larger
+/// than this are rejected up front rather than read into memory — defense
+/// against OOM on a multi-gigabyte file, not a size judgment.
+const MAX_FILE_BYTES: usize = 4 * 1024 * 1024;
+
+fn outside_home(resolved: &std::path::Path) -> bool {
+    !path_within_home(resolved)
+}
+
+/// True when the file's metadata size is past `MAX_FILE_BYTES` — the check
+/// that keeps giant files from being materialized into memory at all.
+fn file_size_exceeds(resolved: &std::path::Path) -> bool {
+    std::fs::metadata(resolved).map(|m| m.len() > MAX_FILE_BYTES as u64).unwrap_or(false)
+}
 
 pub fn file_read(path: &str, start_line: Option<i64>, end_line: Option<i64>, query: Option<&str>) -> String {
     let resolved = resolve(path);
+    if outside_home(&resolved) {
+        return error_response(
+            "PATH_OUTSIDE_HOME",
+            "Path is outside the HOME directory",
+            Some(&resolved.to_string_lossy()),
+            Some("Only paths inside your home directory can be accessed."),
+        );
+    }
     if !resolved.exists() {
         return error_response("FILE_NOT_FOUND", "Path does not exist", Some(&resolved.to_string_lossy()), None);
+    }
+    if file_size_exceeds(&resolved) {
+        return error_response(
+            "FILE_TOO_LARGE",
+            &format!("File is larger than the {} byte read limit", MAX_FILE_BYTES),
+            Some(&resolved.to_string_lossy()),
+            Some("Use lean_file_read on a smaller file, or search for it with lean_analyze_workspace first."),
+        );
     }
 
     let text = match std::fs::read_to_string(&resolved) {
@@ -64,6 +96,14 @@ pub fn file_read(path: &str, start_line: Option<i64>, end_line: Option<i64>, que
 
 pub fn file_write(path: &str, content: &str, dry_run: bool) -> String {
     let resolved = resolve(path);
+    if outside_home(&resolved) {
+        return error_response(
+            "PATH_OUTSIDE_HOME",
+            "Path is outside the HOME directory",
+            Some(&resolved.to_string_lossy()),
+            Some("Only paths inside your home directory can be accessed."),
+        );
+    }
     if dry_run {
         return success_response(json!({"path": resolved.to_string_lossy()}), Some("[DRY RUN] Would write file."), false, None);
     }
@@ -85,6 +125,14 @@ pub fn file_write(path: &str, content: &str, dry_run: bool) -> String {
 
 pub fn file_append(path: &str, content: &str, dry_run: bool) -> String {
     let resolved = resolve(path);
+    if outside_home(&resolved) {
+        return error_response(
+            "PATH_OUTSIDE_HOME",
+            "Path is outside the HOME directory",
+            Some(&resolved.to_string_lossy()),
+            Some("Only paths inside your home directory can be accessed."),
+        );
+    }
     if !resolved.exists() {
         return error_response("FILE_NOT_FOUND", "Path does not exist", Some(&resolved.to_string_lossy()), None);
     }
@@ -111,8 +159,30 @@ pub fn file_append(path: &str, content: &str, dry_run: bool) -> String {
 
 pub fn file_replace_str(path: &str, old_str: &str, new_str: &str, dry_run: bool) -> String {
     let resolved = resolve(path);
+    if outside_home(&resolved) {
+        return error_response(
+            "PATH_OUTSIDE_HOME",
+            "Path is outside the HOME directory",
+            Some(&resolved.to_string_lossy()),
+            Some("Only paths inside your home directory can be accessed."),
+        );
+    }
     if !resolved.exists() {
         return error_response("FILE_NOT_FOUND", "Path does not exist", Some(&resolved.to_string_lossy()), None);
+    }
+    // An empty `old_str` is not "zero occurrences" — `str::matches("")` counts
+    // every character boundary and `str::replace("", x)` inserts `x` between
+    // every character, which would corrupt the file. Reject before any read.
+    if old_str.is_empty() {
+        return error_response("INVALID_ARGUMENT", "old_str must not be empty.", None, Some("Provide a non-empty string to search for."));
+    }
+    if file_size_exceeds(&resolved) {
+        return error_response(
+            "FILE_TOO_LARGE",
+            &format!("File is larger than the {} byte read limit", MAX_FILE_BYTES),
+            Some(&resolved.to_string_lossy()),
+            Some("Use lean_file_replace_str on a smaller file instead."),
+        );
     }
     let file_text = match std::fs::read_to_string(&resolved) {
         Ok(t) => t,
@@ -144,8 +214,24 @@ pub fn file_replace_str(path: &str, old_str: &str, new_str: &str, dry_run: bool)
 
 pub fn file_replace_lines(path: &str, start_line: i64, end_line: i64, new_content: &str, dry_run: bool) -> String {
     let resolved = resolve(path);
+    if outside_home(&resolved) {
+        return error_response(
+            "PATH_OUTSIDE_HOME",
+            "Path is outside the HOME directory",
+            Some(&resolved.to_string_lossy()),
+            Some("Only paths inside your home directory can be accessed."),
+        );
+    }
     if !resolved.exists() {
         return error_response("FILE_NOT_FOUND", "Path does not exist", Some(&resolved.to_string_lossy()), None);
+    }
+    if file_size_exceeds(&resolved) {
+        return error_response(
+            "FILE_TOO_LARGE",
+            &format!("File is larger than the {} byte read limit", MAX_FILE_BYTES),
+            Some(&resolved.to_string_lossy()),
+            Some("Use lean_file_replace_lines on a smaller file instead."),
+        );
     }
     let text = match std::fs::read_to_string(&resolved) {
         Ok(t) => t,
@@ -259,6 +345,73 @@ mod tests {
         let s = file_append(f.to_str().unwrap(), "x", false);
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(v["error_code"], "FILE_NOT_FOUND");
+        fs::remove_dir_all(f.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn absolute_paths_outside_home_are_rejected() {
+        #[cfg(windows)]
+        let p = "C:\\Windows\\System32\\drivers\\etc\\hosts";
+        #[cfg(not(windows))]
+        let p = "/etc/passwd";
+
+        let s = file_read(p, None, None, None);
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["error_code"], "PATH_OUTSIDE_HOME");
+        assert_eq!(v["status"], "error");
+
+        let s = file_write(p, "x", false);
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["error_code"], "PATH_OUTSIDE_HOME");
+
+        let s = file_append(p, "x", false);
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["error_code"], "PATH_OUTSIDE_HOME");
+
+        let s = file_replace_str(p, "a", "b", false);
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["error_code"], "PATH_OUTSIDE_HOME");
+
+        let s = file_replace_lines(p, 1, 2, "x", false);
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["error_code"], "PATH_OUTSIDE_HOME");
+
+        // Dry-run must reject too — authorization happens before any write.
+        let s = file_write(p, "x", true);
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["error_code"], "PATH_OUTSIDE_HOME");
+    }
+
+    #[test]
+    fn empty_old_str_is_rejected_before_any_write() {
+        let f = tmp("empty");
+        file_write(f.to_str().unwrap(), "hello world", false);
+        let s = file_replace_str(f.to_str().unwrap(), "", "X", false);
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["error_code"], "INVALID_ARGUMENT");
+        // File must be untouched.
+        assert_eq!(fs::read_to_string(&f).unwrap(), "hello world");
+        fs::remove_dir_all(f.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn oversized_file_is_rejected_without_reading() {
+        let f = tmp("big");
+        let big = "x".repeat(MAX_FILE_BYTES + 1);
+        fs::write(&f, big).unwrap();
+
+        let s = file_read(f.to_str().unwrap(), None, None, None);
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["error_code"], "FILE_TOO_LARGE");
+
+        let s = file_replace_str(f.to_str().unwrap(), "x", "y", false);
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["error_code"], "FILE_TOO_LARGE");
+
+        let s = file_replace_lines(f.to_str().unwrap(), 1, 2, "z", false);
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["error_code"], "FILE_TOO_LARGE");
+
         fs::remove_dir_all(f.parent().unwrap()).ok();
     }
 }

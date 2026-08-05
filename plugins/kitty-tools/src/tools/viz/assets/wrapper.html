@@ -15,7 +15,8 @@
             background-color: #fafafa;
             font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
             color: #18181b;
-            overflow: hidden; /* Prevents internal scrollbars; parent resizes frame */
+            overflow-x: auto; /* Last-resort safety net: a diagram wider than the iframe scrolls instead of being crushed to illegibility (layouts normally fit MAX_CONTENT_W). */
+            overflow-y: hidden; /* Height is driven by the auto-resize postMessage; never show a vertical scrollbar. */
         }
         svg {
             display: block;

@@ -156,6 +156,10 @@ async fn install_ollama() -> Result<(), String> {
 
     let bytes = crate::util::http_client()
         .get(OLLAMA_INSTALLER_URL)
+        // A multi-hundred-MB installer legitimately takes a while, so the
+        // total download gets a generous cap instead of hanging forever on a
+        // stalled connection.
+        .timeout(std::time::Duration::from_secs(300))
         .send()
         .await
         .map_err(|e| format!("download failed: {e}"))?

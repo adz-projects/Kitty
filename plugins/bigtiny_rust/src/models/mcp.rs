@@ -11,6 +11,14 @@ pub enum TransportType {
     Stdio,
     Sse,
     StreamableHttp,
+    /// A server compiled into this daemon binary, connected over an
+    /// in-memory duplex pipe (`mcp::client::connect_in_process`) rather than
+    /// spawned as a child process or reached over HTTP — for hosts where
+    /// exec() of a bundled binary isn't available (Android; see that
+    /// method's doc comment). The row's `command` field holds a *logical*
+    /// name looked up in `mcp::builtin`'s registry (e.g. `"kitty-tools"`),
+    /// never an OS command — this transport has nothing to execute.
+    InProcess,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
