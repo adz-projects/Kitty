@@ -439,6 +439,7 @@ pub async fn compact_session(
         state.agent.summarizer(),
         &state.config.token_management,
         &state.config.summarizer,
+        &state.config.memory,
         context_length,
         true,
     )

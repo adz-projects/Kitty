@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { ipc } from '@/lib/ipc';
 import { useConfigDraft } from './useConfigDraft';
-import type { EnvVar, LogEntry, ProviderView } from '@/lib/types';
+import type { EnvVar, LogEntry, MemoryStats, ProviderView } from '@/lib/types';
 
 // How often to re-fetch the error log while its disclosure is open — there's
 // no push event for new entries (kept simple, matching this being a
@@ -9,6 +9,11 @@ import type { EnvVar, LogEntry, ProviderView } from '@/lib/types';
 // keeps it reasonably current without the user needing to leave and reopen
 // Settings.
 const LOG_POLL_MS = 5000;
+
+// How often to re-poll the daemon's global pre-flight memory recall counters
+// for the "% of prompts" readout below. Live-ish, not push-driven, matching
+// the log poll's simplicity.
+const MEMORY_POLL_MS = 5000;
 
 /** Advanced: Ollama env-var helper (HKCU\Environment), plus the two
     infrequently-touched General settings relocated here in the settings IA
@@ -21,13 +26,15 @@ export function Advanced() {
   const { draft, update, save, saved, error: saveError } = useConfigDraft();
   const [envOpen, setEnvOpen] = useState(true);
   const [tokenMgmtOpen, setTokenMgmtOpen] = useState(false);
-  const [enablingOllama, setEnablingOllama] = useState(false);
+  const [memoryOpen, setMemoryOpen] = useState(false);  const [enablingOllama, setEnablingOllama] = useState(false);
   const [ollamaMsg, setOllamaMsg] = useState('');
   const [logOpen, setLogOpen] = useState(false);
   const [logEntries, setLogEntries] = useState<LogEntry[]>([]);
   const [logError, setLogError] = useState('');
   const logPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [providers, setProviders] = useState<ProviderView[]>([]);
+  const [memoryStats, setMemoryStats] = useState<MemoryStats | null>(null);
+  const [memoryStatsError, setMemoryStatsError] = useState('');
 
   const loadProviders = () =>
     void ipc
@@ -71,6 +78,20 @@ export function Advanced() {
     };
   }, [logOpen]);
 
+  const loadMemoryStats = () =>
+    void ipc
+      .getMemoryStats()
+      .then(setMemoryStats)
+      .catch((e) => setMemoryStatsError(String(e)));
+
+  // Poll the daemon's global pre-flight memory recall counters while this
+  // pane is mounted, so the "% of prompts" readout stays live across turns.
+  useEffect(() => {
+    loadMemoryStats();
+    const id = setInterval(loadMemoryStats, MEMORY_POLL_MS);
+    return () => clearInterval(id);
+  }, []);
+
   const clearLog = async () => {
     try {
       await ipc.clearLogEntries();
@@ -79,7 +100,6 @@ export function Advanced() {
       setLogError(String(e));
     }
   };
-
   // Writes straight through ipc.setConfig (not update()+save(), which would
   // race — save() closes over the pre-update draft) so the flag flips
   // immediately, matching how the wizard's own saveCfg behaves.
@@ -341,6 +361,59 @@ export function Advanced() {
                 <p className="muted" style={{ margin: 0 }}>
                   Token management changes require a backend restart.
                 </p>
+              </>
+            )}
+
+            <button
+              type="button"
+              className="disclosure-toggle"
+              onClick={() => setMemoryOpen((o) => !o)}
+            >
+              {memoryOpen ? '▾' : '▸'} <strong>Pre-flight memory recall</strong>
+            </button>
+            {memoryOpen && (
+              <>
+                <p className="muted" style={{ margin: 0 }}>
+                  Semantic recall of older turns is injected into each prompt tail so long agentic
+                  sessions retain cross-turn context. Changes need a backend restart to take effect.
+                </p>
+                <label className="field">
+                  <span>Minimum bm25 relevance score</span>
+                  <input
+                    type="number"
+                    step={0.1}
+                    placeholder="-2.0 (empty = no gate)"
+                    value={draft.memory.bm25_threshold ?? ''}
+                    onChange={(e) => {
+                      // Empty string ⇔ null (gate off); anything else must be
+                      // a finite number to be worth writing.
+                      const raw = e.target.value;
+                      const numeric = raw === '' ? null : Number(raw);
+                      if (raw !== '' && !Number.isFinite(numeric)) return;
+                      update({ memory: { ...draft.memory, bm25_threshold: numeric } });
+                    }}
+                  />
+                  <small className="muted">
+                    FTS BM25 relevance scores are negative — closer to 0 is more relevant. Set a
+                    minimum (e.g. -2.0) to skip weaker matches. Leave empty to disable the gate.
+                  </small>
+                </label>
+                <div className="field">
+                  <span>Prompts with injected context</span>
+                  {memoryStatsError ? (
+                    <p className="error" style={{ margin: 0 }}>
+                      {memoryStatsError}
+                    </p>
+                  ) : memoryStats == null ? (
+                    <p className="muted" style={{ margin: 0 }}>Loading…</p>
+                  ) : (
+                    <p className="muted" style={{ margin: 0 }}>
+                      <strong>{memoryStats.injection_rate_pct.toFixed(1)}%</strong> (
+                      {memoryStats.injected_prompts} of {memoryStats.total_prompts} prompts,
+                      all sessions)
+                    </p>
+                  )}
+                </div>
               </>
             )}
           </div>

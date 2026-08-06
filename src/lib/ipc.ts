@@ -34,6 +34,7 @@ import type {
   McpServer,
   McpServerPatch,
   McpServerSpec,
+  MemoryStats,
   OllamaModel,
   OpenRouterCredits,
   PathInfo,
@@ -206,6 +207,8 @@ export const ipc = {
   // `tracing::warn!`/`error!` calls via `log_capture`'s in-memory ring buffer.
   listLogEntries: () => invoke<LogEntry[]>('list_log_entries'),
   clearLogEntries: () => invoke<void>('clear_log_entries'),
+  /** Daemon-global pre-flight memory recall telemetry (Settings → Advanced). */
+  getMemoryStats: () => invoke<MemoryStats>('get_memory_stats'),
   // Instant per-session mode toggle (Round-4)
   getSessionMode: (sessionId: string) => invoke<string | null>('get_session_mode', { sessionId }),
   setSessionMode: (sessionId: string, mode: string | null) =>

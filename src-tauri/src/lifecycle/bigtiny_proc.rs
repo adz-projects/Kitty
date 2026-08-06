@@ -117,6 +117,7 @@ pub async fn spawn(
     dir: Option<&str>,
     summarizer: &crate::config::SummarizerSettings,
     token_management: &crate::config::TokenManagementSettings,
+    memory: &crate::config::MemorySettings,
 ) -> Result<DaemonHandle, String> {
     kill_stale_orphan();
 
@@ -172,6 +173,12 @@ pub async fn spawn(
         )
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // Relay the bm25 gate only when actually set — leaving the env absent
+    // (rather than `""`) keeps `None` the daemon's truly-unset default and
+    // avoids always-present env noise.
+    if let Some(threshold) = memory.bm25_threshold {
+        cmd.env("BIGTINY_MEMORY__BM25_THRESHOLD", threshold.to_string());
+    }
     // Consolidates BigTiny's db/cache-sandbox-root/recipes under
     // %APPDATA%/Kitty/bigtiny/ instead of its own standalone `~/.bigtiny`
     // default — see `bigtiny/paths.py::data_dir()`. Best-effort: if this

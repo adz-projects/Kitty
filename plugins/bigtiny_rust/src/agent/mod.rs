@@ -1,6 +1,7 @@
 pub mod compaction;
 pub mod context;
 pub mod loop_;
+pub mod memory;
 pub mod sandbox;
 pub mod summarizer;
 pub mod tokens;
@@ -24,6 +25,7 @@ use crate::server::events::SSEEvent;
 use self::context::builder::ContextBuilder;
 use self::context::stats::SessionStats;
 use self::loop_::AgentLoop;
+use self::memory::PreflightCounters;
 use self::summarizer::SummarizerClient;
 
 /// Cross-session state the HTTP routes need: in-flight turn handles (for
@@ -43,6 +45,9 @@ pub struct Agent {
     tasks: DashMap<String, (Uuid, tokio::task::JoinHandle<()>)>,
     summarizer: Arc<SummarizerClient>,
     config: BigTinyConfig,
+    /// Daemon-wide pre-flight recall counters, shared across every per-turn
+    /// `AgentLoop` (each is built fresh). Read by `GET /api/memory/stats`.
+    preflight: Arc<PreflightCounters>,
     /// BigTiny's app-data directory (`RunOptions::data_dir` — respects
     /// `BIGTINY_DATA_DIR`), threaded into every `AgentLoop` as the sandbox's
     /// always-allowed cache dir. See `sandbox::CACHE_DIR`'s doc comment.
@@ -68,6 +73,7 @@ impl Agent {
             hitl_notifies: Arc::new(DashMap::new()),
             tasks: DashMap::new(),
             summarizer,
+            preflight: Arc::new(PreflightCounters::new()),
             config,
             cache_dir,
         }
@@ -93,6 +99,16 @@ impl Agent {
         &self.config
     }
 
+    /// (total, injected) pre-flight recall counters — backs `GET
+    /// /api/memory/stats`.
+    pub fn preflight_snapshot(&self) -> (u64, u64) {
+        self.preflight.snapshot()
+    }
+
+    pub fn preflight(&self) -> &Arc<PreflightCounters> {
+        &self.preflight
+    }
+
     /// Construct a fresh per-turn `AgentLoop`. `AgentLoop` holds no
     /// meaningful session-scoped state of its own (session id is passed to
     /// its methods, not baked into construction) so building one per turn is
@@ -114,6 +130,8 @@ impl Agent {
             stats,
             self.summarizer.clone(),
             self.config.summarizer.clone(),
+            self.config.memory.clone(),
+            self.preflight.clone(),
             self.config.agent.max_concurrent_tool_calls.max(1) as usize,
             self.cache_dir.clone(),
             self.config.fallback.clone(),

@@ -10,6 +10,8 @@ use tokio::sync::{mpsc, Mutex, Notify, Semaphore};
 use tokio::time::Instant;
 
 use crate::agent::compaction::run_compaction;
+use crate::agent::memory::{PreflightCounters, preflight_recall};
+use crate::config::MemoryConfig;
 use crate::agent::context::builder::ContextBuilder;
 use crate::agent::context::stats::SessionStats;
 use crate::agent::sandbox::{allowed_dirs_for_session, check_containment};
@@ -404,6 +406,11 @@ pub struct AgentLoop {
     stats: SessionStats,
     summarizer: Arc<SummarizerClient>,
     summarizer_cfg: SummarizerConfig,
+    /// Pre-flight recall config (enabled/bm25 gate/token budgets). Passed
+    /// through to both `preflight_recall` and post-turn `run_compaction`.
+    memory_cfg: MemoryConfig,
+    /// Shared daemon-wide recall counters (see `Agent::preflight`).
+    preflight: Arc<PreflightCounters>,
     max_concurrent_tool_calls: usize,
     /// BigTiny's own app-data directory — always allowed regardless of mode
     /// (`sandbox::allowed_dirs_for_session`'s `cache_dir` param). Threaded
@@ -433,6 +440,8 @@ impl AgentLoop {
         stats: SessionStats,
         summarizer: Arc<SummarizerClient>,
         summarizer_cfg: SummarizerConfig,
+        memory_cfg: MemoryConfig,
+        preflight: Arc<PreflightCounters>,
         max_concurrent_tool_calls: usize,
         cache_dir: String,
         fallback_cfg: FallbackConfig,
@@ -447,6 +456,8 @@ impl AgentLoop {
             stats,
             summarizer,
             summarizer_cfg,
+            memory_cfg,
+            preflight,
             max_concurrent_tool_calls,
             cache_dir,
             fallback_cfg,
@@ -552,6 +563,17 @@ impl AgentLoop {
             .adaptive_decide(session_id, user_message, &active_tools)
             .await;
 
+        // Pre-flight memory recall ("the detour"): best-effort FTS5 lookup
+        // over the session's *already-compacted* history, gated by recall
+        // intent, injected into the tail region (like `ap_hints`) so the
+        // stable head stays byte-identical. Any miss/disabled/error yields
+        // `None` → zero delta to the prompt; the counter drops are the only
+        // side effect.
+        let preflight_recalled = self
+            .preflight_recall(session_id, user_message, session.compacted_through_rowid)
+            .await;
+        let recalled = preflight_recalled.as_deref();
+
         // Build initial context
         let mut messages = match self
             .context
@@ -564,6 +586,7 @@ impl AgentLoop {
                 chat_dir,
                 cwd,
                 ap_hints.as_deref(),
+                recalled,
             )
             .await
         {
@@ -1038,6 +1061,7 @@ impl AgentLoop {
                 &self.summarizer,
                 self.context.config(),
                 &self.summarizer_cfg,
+                &self.memory_cfg,
                 context_length,
                 false,
             )
@@ -1091,6 +1115,39 @@ impl AgentLoop {
             return None;
         }
         render_decide_hints(&result.content)
+    }
+
+    /// Pre-flight memory recall hook, mirroring `adaptive_decide`'s
+    /// cache-aware tail-injection shape. Runs `agent::memory::preflight_recall`
+    /// and records the daemon-wide counters (`total`/`injected`) for the
+    /// settings readout. Any failure, disabled recall, or miss returns `None`
+    /// (zero prompt delta).
+    async fn preflight_recall(
+        &self,
+        session_id: &str,
+        user_message: &str,
+        compacted_through: i64,
+    ) -> Option<String> {
+        let pool = self.context.pool().clone();
+        let injected = match preflight_recall(
+            &pool,
+            session_id,
+            user_message,
+            compacted_through,
+            &self.memory_cfg,
+        )
+        .await
+        {
+            Ok(Some(block)) => Some(block),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!("memory preflight failed for {session_id}: {e}");
+                None
+            }
+        };
+        self.preflight
+            .record(self.memory_cfg.preflight_enabled && compacted_through > 0, injected.is_some());
+        injected
     }
 
     /// Adaptive Pathway turn-end hook: fire-and-forget `record_outcome` for one

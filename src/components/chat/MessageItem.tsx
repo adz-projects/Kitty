@@ -7,6 +7,7 @@ import {
   findHintToolCall,
   isVisualizationToolCall,
   parseHintOutput,
+  stripInternalMarkers,
   stripPromptPreamble,
   useChatStore,
   type Message,
@@ -154,7 +155,9 @@ export const MessageItem = memo(function MessageItem({
     // clean text (the wrapper regexes simply won't match) and guarantees the
     // raw <system>/transcript preamble can never surface in the chat, no
     // matter which code path a message's text came from.
-    const displayText = index === 0 ? stripPromptPreamble(message.text) : message.text;
+    const displayText = stripInternalMarkers(
+      index === 0 ? stripPromptPreamble(message.text) : message.text
+    );
     return (
       <div className="msg msg-user">
         <div className="bubble">{displayText}</div>

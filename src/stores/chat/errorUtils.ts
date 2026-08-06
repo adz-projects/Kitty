@@ -110,3 +110,34 @@ export function stripRecipeWrapper(text: string): string {
   const m = text.match(RECIPE_WRAPPER_RE);
   return m ? text.slice(m[0].length) : text;
 }
+
+// Header lines that introduce backend-injected context blocks. These are all
+// delivered as `role: "system"` on the wire and are never persisted or
+// surfaced by BigTiny, but `stripInternalMarkers` is a client-side
+// defense-in-depth net: if any ever leaks into displayed text (e.g. a model
+// echoing the prompt tail back), it must not show the marker or its block.
+const INTERNAL_MARKERS = [
+  '[Earlier context from this session]',
+  '[Adaptive Pathway hints]',
+  '[CONSOLIDATED PROJECT MEMORY]',
+];
+
+/** Strip any backend-injected context block (headed by one of the internal
+    markers above) from `text` — removes the marker header line plus every
+    line that follows it until a blank line or the next marker header, so the
+    whole injected block disappears cleanly. A no-op when no internal marker
+    is present. */
+export function stripInternalMarkers(text: string): string {
+  let out = text;
+  for (const marker of INTERNAL_MARKERS) {
+    const escaped = marker.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const re = new RegExp(`(^|\\n)[ \\t]*${escaped}[^\\n]*(?:\\n(?!\\n|\\s*\\[)[^\\n]*)*`, 'g');
+    out = out.replace(re, '$1');
+  }
+  // Collapse the blank-line trail a removed block leaves behind, and trim.
+  return out
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{2,}/g, '\n')
+    .replace(/^\n+/, '')
+    .replace(/\n+$/, '');
+}

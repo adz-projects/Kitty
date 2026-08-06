@@ -135,6 +135,7 @@ pub fn run() {
             commands::add_recipe_extension,
             commands::list_log_entries,
             commands::clear_log_entries,
+            commands::get_memory_stats,
             commands::get_session_mode,
             commands::set_session_mode,
             commands::set_session_context_dir,

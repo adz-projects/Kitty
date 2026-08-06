@@ -55,6 +55,11 @@ export interface Config {
       `TokenManagementConfig`). A daemon restart is needed for a change
       here to take effect. */
   token_management: TokenManagementSettings;
+  /** BigTiny pre-flight memory recall settings — relayed as
+      `BIGTINY_MEMORY__*` env vars at spawn time (Rust `Config::memory`,
+      mirrors `bigtiny_rust`'s `MemoryConfig`). A daemon restart is needed
+      for a change here to take effect. */
+  memory: MemorySettings;
 }
 
 export interface SummarizerSettings {
@@ -68,6 +73,25 @@ export interface TokenManagementSettings {
   max_live_tail_tokens: number;
   message_mask_head_lines: number;
   message_mask_tail_lines: number;
+}
+
+/** BigTiny pre-flight memory recall settings — relayed as
+    `BIGTINY_MEMORY__*` env vars at spawn time (Rust `Config::memory`,
+    mirrors `bigtiny_rust`'s `MemoryConfig`). A daemon restart is needed for
+    a change here to take effect. */
+export interface MemorySettings {
+  /** Minimum FTS5 bm25 relevance score for pre-flight recall (higher =
+      fewer, more relevant hits). `null` disables the gate. */
+  bm25_threshold: number | null;
+}
+
+/** Daemon-global (all-session, process-lifetime) pre-flight memory recall
+    telemetry — backs Settings > Advanced's "% of prompts with injected
+    context" readout. */
+export interface MemoryStats {
+  total_prompts: number;
+  injected_prompts: number;
+  injection_rate_pct: number;
 }
 
 // --- Providers (Phase 5) ---

@@ -13,6 +13,8 @@ pub struct BigTinyConfig {
     #[serde(default)]
     pub summarizer: SummarizerConfig,
     #[serde(default)]
+    pub memory: MemoryConfig,
+    #[serde(default)]
     pub agent: AgentConfig,
     #[serde(default)]
     pub hitl: HITLConfig,
@@ -242,7 +244,7 @@ fn default_summarizer_enabled() -> bool {
     true
 }
 fn default_summarizer_model() -> String {
-    "qwen3.5:0.8b".into()
+    "LFM2.5-1.2b".into()
 }
 fn default_summarizer_base_url() -> String {
     "http://127.0.0.1:11434".into()
@@ -274,6 +276,58 @@ impl Default for SummarizerConfig {
             timeout_s: default_summarizer_timeout_s(),
             reserve_exchanges: default_reserve_exchanges(),
             max_slot_items: default_max_slot_items(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MemoryConfig {
+    /// Master switch for the pre-flight FTS5 recall layer (the "detour").
+    /// When `false` (or the daemon hasn't seen a `BIGTINY_MEMORY__*` env
+    /// override), no recall query runs and the delivered prompt is
+    /// byte-identical to the no-memory baseline — zero delta, so prompt-prefix
+    /// caching is fully preserved when recall is off.
+    #[serde(default = "default_memory_preflight_enabled")]
+    pub preflight_enabled: bool,
+    /// BM25 relevance gate for retrieved memory. FTS5 BM25 scores are
+    /// *negative*, closer to 0.0 = more relevant. `None` (the default) means
+    /// no gate — every best match is accepted. Set to a value like `-2.0`
+    /// (accept matches with score > -2.0) once the `tracing::debug`'d scores
+    /// have been studied empirically; it is never hardcoded.
+    #[serde(default)]
+    pub bm25_threshold: Option<f64>,
+    /// Maximum number of historical exchanges to inject into the tail on a
+    /// firing recall (each exchange is one User <-> Assistant pair).
+    #[serde(default = "default_memory_preflight_results")]
+    pub preflight_results: i32,
+    /// Deterministic token budget (via tiktoken) for the `active_artifacts`
+    /// memory slot. When the merged artifacts exceed this, the *oldest* keys
+    /// are dropped until under budget — the draft's "stale-artifact demotion"
+    /// realized in code (full text remains searchable in FTS5). Never asks the
+    /// summarizer to write a degraded summary.
+    #[serde(default = "default_memory_artifacts_max_tokens")]
+    pub artifacts_max_tokens: i32,
+}
+
+fn default_memory_preflight_enabled() -> bool {
+    true
+}
+
+fn default_memory_preflight_results() -> i32 {
+    1
+}
+
+fn default_memory_artifacts_max_tokens() -> i32 {
+    1000
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            preflight_enabled: default_memory_preflight_enabled(),
+            bm25_threshold: None,
+            preflight_results: default_memory_preflight_results(),
+            artifacts_max_tokens: default_memory_artifacts_max_tokens(),
         }
     }
 }
@@ -492,6 +546,9 @@ Ok(config)
         }
         if other.summarizer != SummarizerConfig::default() {
             self.summarizer = other.summarizer.clone();
+        }
+        if other.memory != MemoryConfig::default() {
+            self.memory = other.memory.clone();
         }
         if other.agent != AgentConfig::default() {
             self.agent = other.agent.clone();

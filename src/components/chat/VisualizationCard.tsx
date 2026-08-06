@@ -96,6 +96,17 @@ function openInNewWindow(html: string) {
   setTimeout(() => URL.revokeObjectURL(url), 30_000);
 }
 
+/** A viz tool didn't hand back a parseable iframe envelope. Distinguish the
+    actionable "payload was cut off" case (truncation marker) from a harder
+    failure, so we never dump a giant raw JSON blob for what should be a
+    diagram. */
+function truncationMessage(output: unknown): string | null {
+  if (typeof output === 'string' && /…\[truncated \d+ bytes\]/.test(output)) {
+    return 'The diagram output was cut off because it was too large to pass through. Try a smaller or simpler diagram.';
+  }
+  return null;
+}
+
 /** Inline visualization result, rendered directly in the message flow the
     same way a fenced code block is: always mounted, no expand click needed.
     Distinct from `ToolCallCard` (which stays collapsed-by-default for every
@@ -103,7 +114,14 @@ function openInNewWindow(html: string) {
     for, not a debugging aside. */
 export const VisualizationCard = memo(function VisualizationCard({ call }: { call: ToolCall }) {
   const payload = useMemo(() => parseIframePayload(call.output), [call.output]);
-  const outputText = useMemo(() => (payload ? '' : stringify(call.output)), [payload, call.output]);
+  const truncMsg = useMemo(
+    () => (payload ? null : truncationMessage(call.output)),
+    [payload, call.output]
+  );
+  const outputText = useMemo(
+    () => (payload || truncMsg ? '' : stringify(call.output)),
+    [payload, truncMsg, call.output]
+  );
   const label = (call.toolName && VIZ_LABELS[call.toolName]) || call.title || 'Visualization';
   const isSettled = call.status !== 'pending' && call.status !== 'running';
 
@@ -119,7 +137,8 @@ export const VisualizationCard = memo(function VisualizationCard({ call }: { cal
       </div>
       <div className="viz-card-body">
         {payload && <ToolResultIframe payload={payload} />}
-        {!payload && outputText && (
+        {truncMsg && <div className="muted viz-truncated">{truncMsg}</div>}
+        {!payload && !truncMsg && outputText && (
           <pre className={call.status === 'failed' ? 'viz-error' : undefined}>{outputText}</pre>
         )}
         {!payload && !outputText && (

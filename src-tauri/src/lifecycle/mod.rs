@@ -134,7 +134,7 @@ pub fn start_stack(app: &AppHandle) {
         // Spawn the BigTiny daemon. No provider env vars — providers are
         // registered at runtime over REST (see
         // `bigtiny::providers::sync_active_provider` right after spawn).
-        let (command, args, dir, warm, summarizer, token_management) = {
+        let (command, args, dir, warm, summarizer, token_management, memory) = {
             let state = app.state::<AppState>();
             let cfg = state.config.lock().unwrap();
             (
@@ -144,6 +144,7 @@ pub fn start_stack(app: &AppHandle) {
                 crate::config::providers::active_ollama_target(&cfg),
                 cfg.summarizer.clone(),
                 cfg.token_management.clone(),
+                cfg.memory.clone(),
             )
         };
 
@@ -168,6 +169,7 @@ pub fn start_stack(app: &AppHandle) {
             dir.as_deref(),
             &summarizer,
             &token_management,
+            &memory,
         );
         let warm_fut = async {
             if let Some((base, model)) = warm {

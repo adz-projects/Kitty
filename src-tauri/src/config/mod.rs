@@ -283,6 +283,13 @@ pub struct Config {
     /// functions in `load` below.
     #[serde(default)]
     pub token_management: TokenManagementSettings,
+    /// See `Config::memory`. Field names mirror BigTiny's own `MemoryConfig`
+    /// (`plugins/bigtiny_rust/src/config.rs`) so the two don't drift apart.
+    /// `#[serde(default)]` covers loading a pre-existing config file that
+    /// predates this field — no explicit migration function needed, unlike
+    /// the value-changing `migrate_*` functions in `load` below.
+    #[serde(default)]
+    pub memory: MemorySettings,
 }
 
 /// See `Config::summarizer`. Field names/defaults mirror BigTiny's own
@@ -303,7 +310,7 @@ impl Default for SummarizerSettings {
     fn default() -> Self {
         Self {
             enabled: true,
-            model: "qwen3.5:0.8b".to_string(),
+            model: "LFM2.5-1.2b".to_string(),
             keep_alive: "5m".to_string(),
         }
     }
@@ -332,6 +339,18 @@ impl Default for TokenManagementSettings {
             message_mask_tail_lines: 10,
         }
     }
+}
+
+/// See `Config::memory`. Field names/defaults mirror BigTiny's own
+/// `MemoryConfig` (`plugins/bigtiny_rust/src/config.rs`) so the two don't
+/// drift apart — this is Kitty's independent copy; BigTiny's own defaults
+/// still apply if the daemon is ever launched without these env vars.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+pub struct MemorySettings {
+    /// Minimum FTS5 bm25 relevance score for pre-flight memory recall to
+    /// inject context (higher = fewer, more relevant hits). `None` disables
+    /// the threshold gate (inject whenever intent matches).
+    pub bm25_threshold: Option<f64>,
 }
 
 impl Default for Config {
@@ -392,6 +411,7 @@ impl Default for Config {
             recipes: recipes::builtin_templates(),
             summarizer: SummarizerSettings::default(),
             token_management: TokenManagementSettings::default(),
+            memory: MemorySettings::default(),
         }
     }
 }

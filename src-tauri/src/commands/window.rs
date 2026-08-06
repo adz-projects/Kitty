@@ -129,7 +129,7 @@ pub async fn restart_backend(app: AppHandle) -> Result<(), String> {
     })
     .await
     .map_err(|e| format!("backend kill task panicked: {e}"))?;
-    let (command, args, dir, summarizer, token_management) = {
+    let (command, args, dir, summarizer, token_management, memory) = {
         let state = app.state::<AppState>();
         let cfg = state.config.lock().unwrap();
         (
@@ -138,6 +138,7 @@ pub async fn restart_backend(app: AppHandle) -> Result<(), String> {
             cfg.bigtiny_dir.clone(),
             cfg.summarizer.clone(),
             cfg.token_management.clone(),
+            cfg.memory.clone(),
         )
     };
     let handle = lifecycle::bigtiny_proc::spawn(
@@ -146,6 +147,7 @@ pub async fn restart_backend(app: AppHandle) -> Result<(), String> {
         dir.as_deref(),
         &summarizer,
         &token_management,
+        &memory,
     )
     .await?;
     let (healthy, port) = (handle.healthy, handle.port);

@@ -1,6 +1,7 @@
 pub mod chat;
 pub mod health;
 pub mod mcp;
+pub mod memory;
 pub mod providers;
 pub mod recipes;
 pub mod schedules;
@@ -37,6 +38,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/api/health", get(health::check_health))
         .route("/api/status", get(health::status))
+        .route("/api/memory/stats", get(memory::stats))
         .route(
             "/api/chat/",
             get(chat::list_sessions).post(chat::create_session),

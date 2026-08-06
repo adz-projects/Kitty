@@ -137,6 +137,78 @@ pub async fn get_first_user_message(
     Ok(row)
 }
 
+/// Top FTS5 matches for `fts_query` against a session's *compacted* history
+/// (`rowid <= compacted_through`), restricted to `user`/`assistant` dialogue
+/// (raw tool output is not a useful recall target). Returns up to `limit`
+/// `(rowid, bm25_score)` pairs, best-first.
+///
+/// The BM25 relevance gate is deliberately **not** applied here: scores are
+/// returned raw so the caller can `tracing::debug!` every candidate (the
+/// empirical dataset the `bm25_threshold` tuning is meant to collect) and
+/// reject below-bar matches in code. FTS5 BM25 scores are negative, closer to
+/// 0.0 = more relevant.
+pub async fn best_compacted_matches(
+    pool: &SqlitePool,
+    session_id: &str,
+    fts_query: &str,
+    compacted_through: i64,
+    limit: i64,
+) -> Result<Vec<(i64, f64)>, StorageError> {
+    let rows = sqlx::query_as::<_, (i64, f64)>(
+        r#"SELECT m.rowid, bm25(messages_fts) AS rank
+           FROM messages_fts f
+           JOIN messages m ON f.rowid = m.rowid
+           WHERE messages_fts MATCH ?1 AND m.session_id = ?2 AND m.rowid <= ?3
+             AND m.role IN ('user', 'assistant')
+           ORDER BY rank ASC LIMIT ?4"#,
+    )
+    .bind(fts_query)
+    .bind(session_id)
+    .bind(compacted_through)
+    .bind(limit.max(0))
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// The `user` message that opens the exchange containing `rowid` (the `user`
+/// message at or before it). Used to assemble a clean recall exchange.
+pub async fn exchange_anchor(
+    pool: &SqlitePool,
+    session_id: &str,
+    rowid: i64,
+) -> Result<Option<MessageRow>, StorageError> {
+    let row = sqlx::query_as::<_, MessageRow>(
+        r#"SELECT rowid, id, session_id, role, content, tool_calls, tool_call_id, token_count, content_format, created_at
+           FROM messages WHERE session_id = ? AND role = 'user' AND rowid <= ?
+           ORDER BY rowid DESC LIMIT 1"#,
+    )
+    .bind(session_id)
+    .bind(rowid)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
+}
+
+/// The first `user` message with `rowid > start_rowid`, if any — the exclusive
+/// upper bound of the exchange starting at `start_rowid`.
+pub async fn next_user_after(
+    pool: &SqlitePool,
+    session_id: &str,
+    start_rowid: i64,
+) -> Result<Option<MessageRow>, StorageError> {
+    let row = sqlx::query_as::<_, MessageRow>(
+        r#"SELECT rowid, id, session_id, role, content, tool_calls, tool_call_id, token_count, content_format, created_at
+           FROM messages WHERE session_id = ? AND role = 'user' AND rowid > ?
+           ORDER BY rowid ASC LIMIT 1"#,
+    )
+    .bind(session_id)
+    .bind(start_rowid)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,5 +274,45 @@ mod tests {
 
         let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
         assert_eq!(ids, vec!["a", "b", "c"]);
+    }
+
+    /// Regression: an injected memory block (`role: "system"` headed by one of
+    /// the internal markers) must never be persisted by `save_messages`, even
+    /// when it rides along in the same batch as a real user message. The
+    /// frontend's `stripInternalMarkers` is a defense-in-depth net; the real
+    /// guarantee lives here — the backend drops every `system`-role message
+    /// before it reaches the `messages` table.
+    #[tokio::test]
+    async fn injected_memory_system_blocks_are_never_persisted() {
+        let pool = test_pool().await;
+        sqlx::query("INSERT INTO sessions (id, status) VALUES ('s1', 'active')")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let mut recall = msg("m1", "s1", "system");
+        recall.content = Some(
+            "[Earlier context from this session]\nuser: Keep the API key out of the summary.\n\
+             assistant: Understood.\n\n(Use the above only as background context...)\n"
+                .to_string(),
+        );
+        let mut memory = msg("m2", "s1", "system");
+        memory.content =
+            Some("[CONSOLIDATED PROJECT MEMORY]\nkey: invoice pipeline is rate-limited\n".to_string());
+        let user = msg("u1", "s1", "user");
+
+        save_messages(&pool, "s1", &[recall, memory, user]).await.unwrap();
+
+        let rows = sqlx::query_as::<_, MessageRow>(
+            "SELECT rowid, id, session_id, role, content, tool_calls, tool_call_id, token_count, content_format, created_at \
+             FROM messages WHERE session_id = 's1' ORDER BY rowid ASC",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        let persisted: Vec<(String, String)> =
+            rows.iter().map(|r| (r.id.clone(), r.role.clone())).collect();
+        assert_eq!(persisted, vec![("u1".to_string(), "user".to_string())]);
     }
 }

@@ -29,11 +29,25 @@ use crate::state::AppState;
 
 /// Same per-string cap the goosed path applies to tool outputs forwarded to
 /// the webview (`goosed::stream::MAX_STRING_BYTES`).
-const MAX_STRING_BYTES: usize = 16 * 1024;
+const MAX_STRING_BYTES: usize = 100 * 1024;
 
-/// Truncate a tool-output string for the event payload, marking the cut.
+/// True when `s` is a `kitty-tools` visualization envelope — the
+/// `{ "render_config": { "target": "iframe", … }, "html_payload": … }` shape
+/// `parseIframePayload` (frontend) needs as a *complete, valid* JSON string.
+/// These are never truncated: the payload is the diagram itself, bounded by
+/// the viz builders' source/width budgets, and slicing it mid-document
+/// corrupts the JSON, forcing the raw-`<pre>` (instead of iframe) fallback.
+fn is_iframe_payload(s: &str) -> bool {
+    s.contains("\"render_config\"")
+        && s.contains("\"html_payload\"")
+        && (s.contains("\"target\": \"iframe\"") || s.contains("\"target\":\"iframe\""))
+}
+
+/// Truncate a tool-output string for the webview event payload, marking the
+/// cut — unless it is a viz iframe envelope, which must reach the webview
+/// whole so `JSON.parse` can render it as an iframe.
 pub(crate) fn truncate_for_ui(s: &str) -> String {
-    if s.len() <= MAX_STRING_BYTES {
+    if is_iframe_payload(s) || s.len() <= MAX_STRING_BYTES {
         return s.to_string();
     }
     let mut end = MAX_STRING_BYTES;
@@ -724,6 +738,33 @@ mod tests {
         assert!(t.len() < s.len());
         assert!(t.contains("…[truncated"));
         assert_eq!(truncate_for_ui("short"), "short");
+    }
+
+    #[test]
+    fn truncate_for_ui_never_truncates_iframe_payload() {
+        // A viz envelope larger than the cap must pass through whole — its
+        // `html_payload` holds a rendered diagram, and `parseIframePayload`
+        // needs the complete JSON string to render it as an iframe.
+        let big_svg = format!("<svg>{}</svg>", "x".repeat(MAX_STRING_BYTES * 2));
+        // Pretty (spaced) serialization, as `serde_json::to_string_pretty` produces.
+        let s = format!(
+            "{{\"status\":\"success\",\"render_config\":{{\"target\": \"iframe\", \"title\": \"T\"}},\"html_payload\":\"{big_svg}\"}}"
+        );
+        let t = truncate_for_ui(&s);
+        assert_eq!(t, s);
+        assert!(!t.contains("…[truncated"));
+        // Compact serialization is also recognized.
+        let s = format!(
+            "{{\"render_config\":{{\"target\":\"iframe\"}},\"html_payload\":\"{big_svg}\"}}"
+        );
+        let t = truncate_for_ui(&s);
+        assert_eq!(t, s);
+
+        // A non-envelope long string is still capped.
+        let plain = "y".repeat(MAX_STRING_BYTES * 2);
+        let t = truncate_for_ui(&plain);
+        assert!(t.len() < plain.len());
+        assert!(t.contains("…[truncated"));
     }
 
     #[test]

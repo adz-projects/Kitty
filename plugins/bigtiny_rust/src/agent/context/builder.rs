@@ -64,6 +64,7 @@ impl ContextBuilder {
         chat_dir: Option<&str>,
         cwd: Option<&str>,
         ap_hints: Option<&str>,
+        retrieved: Option<&str>,
     ) -> Result<Vec<Value>, String> {
         let session = sessions::get_session(&self.pool, session_id)
             .await
@@ -185,12 +186,34 @@ impl ContextBuilder {
         // tail up to here) stays byte-identical for prompt-prefix caching.
         // The sidecar's decide payload carries a `hints` list already
         // rendered as plain text here; see `AgentLoop::run`'s AP wiring.
+        // Tokens of the injected tail blocks are counted so the emergency
+        // valve below doesn't undercount the real prompt by their size.
+        let mut tail_extra_tokens: i32 = 0;
         if let Some(hints) = ap_hints {
             if !hints.trim().is_empty() {
-                messages.push(json!({
+                let block = json!({
                     "role": "system",
                     "content": format!("[Adaptive Pathway hints]\n{hints}")
-                }));
+                });
+                tail_extra_tokens += count_messages_tokens(std::slice::from_ref(&block));
+                messages.push(block);
+            }
+        }
+
+        // Layer 7.5 (tail-region): pre-flight memory recall. Injected in the
+        // tail — immediately before the new user message, like AP hints — so
+        // the stable head + live tail stay byte-identical for prompt-prefix
+        // caching. `None` (preflight disabled, no recall intent, or no match)
+        // produces zero delta. The block is a `role: "system"` message, which
+        // `save_messages` never persists and the transcript never renders.
+        if let Some(retrieved) = retrieved {
+            if !retrieved.trim().is_empty() {
+                let block = json!({
+                    "role": "system",
+                    "content": retrieved
+                });
+                tail_extra_tokens += count_messages_tokens(std::slice::from_ref(&block));
+                messages.push(block);
             }
         }
 
@@ -221,7 +244,8 @@ impl ContextBuilder {
 
         let system_tokens = count_messages_tokens(&head);
         let new_msg_tokens = count_messages_tokens(std::slice::from_ref(&tail_new_message));
-        let total_tokens = live_token_sum + system_tokens + new_msg_tokens;
+        let total_tokens =
+            live_token_sum + system_tokens + new_msg_tokens + tail_extra_tokens;
 
         if total_tokens > emergency_cap {
             let target = (max_context_tokens as f64 * self.config.compaction_target_ratio) as i32;
@@ -472,6 +496,7 @@ mod tests {
                 Some("C:\\chat"),
                 Some("C:\\cwd"),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -484,6 +509,7 @@ mod tests {
                 None,
                 Some("C:\\chat"),
                 Some("C:\\cwd"),
+                None,
                 None,
             )
             .await
@@ -511,7 +537,7 @@ mod tests {
         let builder = ContextBuilder::new(pool.clone(), TokenManagementConfig::default(), 2);
 
         let messages = builder
-            .build_messages("sess-1", "hello", None, None, None, None, None, None)
+            .build_messages("sess-1", "hello", None, None, None, None, None, None, None)
             .await
             .unwrap();
 
@@ -544,7 +570,7 @@ mod tests {
         builder.save_messages("sess-1", &mut seed).await.unwrap();
 
         let none = builder
-            .build_messages("sess-1", "next", None, None, None, Some("C:\\c"), Some("C:\\w"), None)
+            .build_messages("sess-1", "next", None, None, None, Some("C:\\c"), Some("C:\\w"), None, None)
             .await
             .unwrap();
         let empty = builder
@@ -557,6 +583,7 @@ mod tests {
                 Some("C:\\c"),
                 Some("C:\\w"),
                 Some("   "),
+                None,
             )
             .await
             .unwrap();
@@ -577,6 +604,7 @@ mod tests {
                 Some("C:\\c"),
                 Some("C:\\w"),
                 Some("Use write instead of edit for new files."),
+                None,
             )
             .await
             .unwrap();

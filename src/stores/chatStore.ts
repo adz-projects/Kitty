@@ -44,6 +44,7 @@ import {
   buildStrippedTranscript,
   stripPromptPreamble,
   stripRecipeWrapper,
+  stripInternalMarkers,
 } from './chat/errorUtils';
 import {
   countToolCall,
@@ -1927,7 +1928,13 @@ export const useChatStore = create<ChatState>((set, get) => {
         // the recipe wrapper is outermost, so strip it first, then the rest.
         const isFirst = get().messages.length === 0;
         const withoutRecipe = stripRecipeWrapper(e.text);
-        appendChunk('user', 'text', isFirst ? stripPromptPreamble(withoutRecipe) : withoutRecipe);
+        appendChunk(
+          'user',
+          'text',
+          stripInternalMarkers(
+            isFirst ? stripPromptPreamble(withoutRecipe) : withoutRecipe
+          )
+        );
       });
 
       void onToolCall((e) => {

@@ -4,10 +4,10 @@
 //! (`src-tauri/src/lifecycle/bigtiny_proc.rs::spawn`) actually sets — Kitty
 //! never passes `--secret`/`--config`, it relies entirely on
 //! `BIGTINY_SECRET`, `BIGTINY_DATA_DIR`, and the `BIGTINY_SUMMARIZER__*`/
-//! `BIGTINY_TOKEN_MANAGEMENT__*` env vars (Python's pydantic-settings
-//! `env_prefix`/`env_nested_delimiter` mechanism), so those specific
-//! variables are the ones honored here — this is not a general nested-env
-//! config loader.
+//! `BIGTINY_TOKEN_MANAGEMENT__*`/`BIGTINY_MEMORY__*` env vars (Python's
+//! pydantic-settings `env_prefix`/`env_nested_delimiter` mechanism), so those
+//! specific variables are the ones honored here — this is not a general
+//! nested-env config loader.
 
 use std::path::{Path, PathBuf};
 
@@ -100,9 +100,9 @@ fn shellexpand_home(path: &str) -> PathBuf {
     }
 }
 
-/// Applies the specific `BIGTINY_SUMMARIZER__*`/`BIGTINY_TOKEN_MANAGEMENT__*`
-/// env vars Kitty's spawn code sets — see this file's module doc for why
-/// only these, not a general nested-env-var deserializer.
+/// Applies the specific `BIGTINY_SUMMARIZER__*`/`BIGTINY_TOKEN_MANAGEMENT__*`/
+/// `BIGTINY_MEMORY__*` env vars Kitty's spawn code sets — see this file's
+/// module doc for why only these, not a general nested-env-var deserializer.
 fn apply_env_overrides(config: &mut BigTinyConfig) {
     if let Ok(v) = std::env::var("BIGTINY_SUMMARIZER__ENABLED") {
         config.summarizer.enabled = v.eq_ignore_ascii_case("true") || v == "1";
@@ -136,6 +136,27 @@ fn apply_env_overrides(config: &mut BigTinyConfig) {
         .and_then(|v| v.parse().ok())
     {
         config.token_management.message_mask_tail_lines = n;
+    }
+    if let Ok(v) = std::env::var("BIGTINY_MEMORY__PREFLIGHT_ENABLED") {
+        config.memory.preflight_enabled = v.eq_ignore_ascii_case("true") || v == "1";
+    }
+    if let Some(n) = std::env::var("BIGTINY_MEMORY__BM25_THRESHOLD")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        config.memory.bm25_threshold = Some(n);
+    }
+    if let Some(n) = std::env::var("BIGTINY_MEMORY__PREFLIGHT_RESULTS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        config.memory.preflight_results = n;
+    }
+    if let Some(n) = std::env::var("BIGTINY_MEMORY__ARTIFACTS_MAX_TOKENS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        config.memory.artifacts_max_tokens = n;
     }
 }
 

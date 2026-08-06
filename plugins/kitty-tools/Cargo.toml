@@ -43,6 +43,7 @@ calamine = { version = "0.26", features = ["dates"] }
 # accepted divergence documented in docs/VERSIONS.md, same as kitty-web's
 # DDG-scrape/htmd substitutions.
 lopdf = "0.34"
+merman = { git = "https://github.com/Latias94/merman", rev = "4262b166faa7dcfcbebbf58dd6ea3e2ccc3630f7", version = "0.8.0-alpha.4", default-features = false, features = ["svg"] }
 
 [profile.release]
 opt-level = "z"

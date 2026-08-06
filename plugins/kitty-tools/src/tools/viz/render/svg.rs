@@ -6,6 +6,7 @@
 //! discipline.
 
 use crate::tools::viz::escape::{escape_attr, escape_text};
+use crate::tools::viz::text;
 
 /// Space reserved on the right/bottom of every diagram beyond the furthest
 /// content actually drawn.
@@ -14,6 +15,69 @@ pub const CANVAS_MARGIN: f32 = 20.0;
 /// `document()` draws; layout modules place their own content at or below this
 /// y-coordinate.
 pub const TITLE_BAND: f32 = 55.0;
+
+/// Font size (px) for each CSS class, mirroring `assets/defs.svg`. Used by the
+/// text primitives so they can fold their *measured* extent into `Bounds` —
+/// the old code only recorded the text anchor point, so a label wider than the
+/// box/container it sat in was invisible to the layout's width/height budget,
+/// letting text overlap the next vector. Keeping this map here (rather than
+/// threading a font-size argument through ~15 call sites) means one source of
+/// truth and no caller churn.
+pub fn class_font_px(class: &str) -> f32 {
+    match class {
+        "title-text" => 18.0,
+        "node-text" => 12.5,
+        "pain-text" => 10.5,
+        "badge-meta" => 8.5,
+        "tag-text-light" | "tag-text-dark" => 10.0,
+        "lane-header" => 11.0,
+        "axis-label" | "axis-label-end" => 10.5,
+        "axis-title" | "axis-title-center" => 11.0,
+        "value-label" | "value-label-start" => 9.5,
+        "legend-text" => 11.0,
+        _ => 12.5,
+    }
+}
+
+/// SVG `text-anchor` for each label class, mirroring `assets/defs.svg`. Most
+/// label classes are `middle`; a handful are `start` (axis titles, legend,
+/// right-aligned value labels, lane headers) or `end` (right-aligned tick
+/// labels). Used by [`include_text`] so `Bounds` records the true bottom-right
+/// corner of a label regardless of its anchor — a `start`-anchored label sits
+/// *right* of its `x`, an `end`-anchored one sits *left*, and only folding the
+/// correct edge into `Bounds` keeps a wide label from spilling past the
+/// canvas/budget (the original bug this module fixes).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TextAnchor {
+    Start,
+    Middle,
+    End,
+}
+
+fn class_text_anchor(class: &str) -> TextAnchor {
+    match class {
+        "axis-title" | "legend-text" | "value-label-start" | "lane-header" => TextAnchor::Start,
+        "axis-label-end" => TextAnchor::End,
+        _ => TextAnchor::Middle,
+    }
+}
+
+/// Include a text line's estimated occupancy in `Bounds`. `x` is the anchor
+/// (whose edge semantics depend on `class`'s `text-anchor` — see
+/// [`class_text_anchor`]), so the text spans roughly
+/// `anchor_edge ± measured/2` horizontally and `y ± font_px` vertically.
+/// `Bounds` only tracks the bottom-right corner, so we compute the label's
+/// true right edge from its anchor and fold that in.
+fn include_text(bounds: &mut Bounds, x: f32, y: f32, content: &str, font_size: f32, class: &str) {
+    let w = text::measure_px(content, font_size);
+    let half_h = font_size * 0.6;
+    let right = match class_text_anchor(class) {
+        TextAnchor::Start => x + w,
+        TextAnchor::Middle => x + w / 2.0,
+        TextAnchor::End => x,
+    };
+    bounds.include_rect(right - w, y - half_h, w, 2.0 * half_h);
+}
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Bounds {
@@ -83,7 +147,7 @@ impl SvgCanvas {
     }
 
     pub fn text_line(&mut self, x: f32, y: f32, class: &str, content: &str) {
-        self.bounds.include_point(x, y);
+        include_text(&mut self.bounds, x, y, content, class_font_px(class), class);
         self.body
             .push_str(&format!(r#"<text x="{x:.1}" y="{y:.1}" class="{class}">{}</text>"#, escape_text(content)));
         self.body.push('\n');
@@ -97,10 +161,11 @@ impl SvgCanvas {
     /// text already fits (measurement over-estimates by design), no attribute
     /// is emitted and the text renders undistorted.
     pub fn text_line_fit(&mut self, x: f32, y: f32, class: &str, content: &str, font_size: f32, max_width: f32) {
-        self.bounds.include_point(x, y);
+        let measured = text::measure_px(content, font_size);
+        include_text(&mut self.bounds, x, y, content, font_size, class);
         let text = escape_text(content);
         let mut tspans = format!(r#"<tspan x="{x:.1}">{text}</tspan>"#);
-        if max_width > 1.0 && crate::tools::viz::text::measure_px(content, font_size) > max_width {
+        if max_width > 1.0 && measured > max_width {
             tspans = format!(r#"<tspan x="{x:.1}" textLength="{max_width:.1}" lengthAdjust="spacingAndGlyphs">{text}</tspan>"#);
         }
         self.body
@@ -116,7 +181,10 @@ impl SvgCanvas {
         if lines.is_empty() {
             return;
         }
-        self.bounds.include_point(x, y);
+        let font_px = class_font_px(class);
+        for line in lines.iter() {
+            include_text(&mut self.bounds, x, y, line, font_px, class);
+        }
         let n = lines.len() as f32;
         let mut tspans = String::new();
         for (i, line) in lines.iter().enumerate() {
@@ -137,13 +205,14 @@ impl SvgCanvas {
         if lines.is_empty() {
             return;
         }
-        self.bounds.include_point(x, y);
         let n = lines.len() as f32;
         let mut tspans = String::new();
         for (i, line) in lines.iter().enumerate() {
             let dy = if i == 0 { -(n - 1.0) * line_h / 2.0 } else { line_h };
             let text = escape_text(line);
-            if max_width > 1.0 && crate::tools::viz::text::measure_px(line, font_size) > max_width {
+            let measured = text::measure_px(line, font_size);
+            include_text(&mut self.bounds, x, y, line, font_size, class);
+            if max_width > 1.0 && measured > max_width {
                 tspans.push_str(&format!(
                     r#"<tspan x="{x:.1}" dy="{dy:.1}" textLength="{max_width:.1}" lengthAdjust="spacingAndGlyphs">{text}</tspan>"#
                 ));
@@ -259,6 +328,60 @@ mod tests {
         fits.text_line_fit(0.0, 0.0, "node-text", "Ok", 12.5, 40.0);
         let (body, _) = fits.into_parts();
         assert!(!body.contains("textLength"), "a fitting line must render undistorted: {body}");
+    }
+
+    #[test]
+    fn text_line_updates_bounds_to_include_the_label_extent() {
+        // Regression: text used to track only its anchor point, so a label
+        // wider than its box was invisible to the canvas width/height budget
+        // and could spill onto the next vector. Now the measured label extent
+        // is folded into `Bounds`.
+        let mut c = SvgCanvas::new();
+        // Long label at node-text size centered at (0, 0).
+        let s = "a label that is clearly wide";
+        c.text_line(0.0, 0.0, "node-text", s);
+        let w = text::measure_px(s, class_font_px("node-text"));
+        let bounds = c.bounds();
+        assert!(
+            bounds.width() >= w / 2.0,
+            "bounds width ({:.1}) must at least reach the right edge of the label (half-width {:.1})",
+            bounds.width(),
+            w / 2.0
+        );
+        assert!(bounds.height() > 0.0, "text contributes vertical extent too");
+    }
+
+    #[test]
+    fn include_text_accounts_for_start_anchor_right_edge() {
+        // Regression (B3): a `start`-anchored label extends to the RIGHT of its
+        // `x`, so folding only `x + w/2` into `Bounds` (as if it were centered)
+        // under-reported its right edge by half — letting a `legend-text`/
+        // `axis-title` label reach past the canvas width that `Bounds` computed.
+        let s = "a start-anchored legend label";
+        let w = text::measure_px(s, class_font_px("legend-text"));
+        let mut c = SvgCanvas::new();
+        c.text_line(0.0, 0.0, "legend-text", s);
+        let bounds = c.bounds();
+        assert!(
+            bounds.width() >= w,
+            "start-anchored text's right edge ({w:.1}px from anchor) must be recorded, got {:.1}",
+            bounds.width()
+        );
+    }
+
+    #[test]
+    fn include_text_end_anchor_does_not_overextend() {
+        // An `end`-anchored label sits LEFT of its `x`; its right edge is `x`,
+        // not `x + w/2`. It must not inflate `Bounds` past `x`.
+        let s = "right-aligned tick label";
+        let mut c = SvgCanvas::new();
+        c.text_line(0.0, 0.0, "axis-label-end", s);
+        let bounds = c.bounds();
+        assert!(
+            bounds.width() <= 0.01,
+            "end-anchored text must not extend past its anchor (x=0); bounds width was {:.1}",
+            bounds.width()
+        );
     }
 
     #[test]

@@ -1,26 +1,60 @@
 //! `generate_accessible_mermaid` payload builder.
 //!
-//! Mermaid has no viable server-side Rust renderer, so the Mermaid.js runtime
-//! is vendored (see `assets/mermaid.LICENSE`) and inlined into a standalone
-//! HTML document; the sandboxed iframe parses and renders the DSL at display
-//! time. That means we inherit Mermaid's own (uncontrolled) layout quality —
-//! "foolproof" here therefore means *guaranteed degradation, never a blank
-//! frame*: the server rejects empty/oversized sources up front, and any
-//! parse/render error at display time swaps in a visible error card alongside
-//! the raw source, so a diagram is never silently lost.
+//! Mermaid is rendered **server-side** by the [Merman] Rust crate (a
+//! browserless, parity-focused reimplementation of Mermaid.js) into a static
+//! `<svg>` string, then wrapped in the same standalone HTML document as the
+//! other viz tools and played in the sandboxed iframe. No JavaScript runtime
+//! ships in the result (previously a ~2 MB vendored `mermaid.min.js` inlined
+//! per result ran `mermaid.render()` at display time).
+//!
+//! We render through Merman's **`resvg_safe`** SVG pipeline rather than its
+//! default parity pipeline. The parity output preserves Mermaid's native
+//! `foreignObject` HTML labels; the resvg-safe pipeline replaces those with
+//! plain `<text>/<rect>` SVG. That both (a) keeps the diagram free of
+//! HTML-in-SVG under the iframe's `script-src 'unsafe-inline'` CSP, and (b)
+//! produces a consistent, browser-agnostic SVG like every other viz tool (no
+//! inline `background-color` / `max-width` that would fight the wrapper's
+//! scaling and background).
+//!
+//! "Foolproof" here means *guaranteed degradation, never a blank frame*: the
+//! server rejects empty/oversized sources up front, and any Merman parse,
+//! layout, render, or missing-capability failure returns a visible error
+//! envelope instead of silently dropping the diagram.
+//!
+//! [Merman]: https://github.com/Latias94/merman
+
+use std::sync::OnceLock;
 
 use crate::envelope::error_response;
+use merman::svg::{HeadlessRenderer, SvgPipeline};
 
 use super::{success_payload, wrap_in_standalone_html};
 
-const MERMAID_JS: &str = include_str!("assets/mermaid.min.js");
 const MAX_SOURCE_CHARS: usize = 12_000;
 
-/// Embeds `s` as a JSON string literal that cannot break the surrounding inline
-/// `<script>` element: JSON-encode it, then escape `/` after `<` so the HTML
-/// parser never encounters a literal `</script>` sequence inside the string.
-fn js_string(s: &str) -> String {
-    serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into()).replace("</", "<\\/")
+/// A cached Merman renderer, built once and reused across every Mermaid tool
+/// call. Constructing a `HeadlessRenderer` (which materializes the full
+/// Mermaid engine + render environment) on every call was wasteful for a
+/// long-lived stdio server. `OnceLock` gives us a process-wide singleton; we
+/// configure it once with the resvg-safe pipeline so every result comes back
+/// through that pipeline.
+static RENDERER: OnceLock<HeadlessRenderer> = OnceLock::new();
+
+fn renderer() -> &'static HeadlessRenderer {
+    RENDERER.get_or_init(|| {
+        HeadlessRenderer::new().with_svg_pipeline(SvgPipeline::resvg_safe())
+    })
+}
+
+/// Extracts the width component of a rendered SVG's `viewBox="min-x min-y w h"`.
+/// Used to reject diagrams that exceed the readability budget (parity with the
+/// other viz tools' `VIZ_TOO_WIDE` guard).
+fn svg_viewbox_width(svg: &str) -> Option<f32> {
+    let vb = svg.split("viewBox=\"").nth(1)?.split('"').next()?;
+    let mut parts = vb.split_whitespace();
+    let _ = parts.next()?; // min-x
+    let _ = parts.next()?; // min-y
+    parts.next()?.parse().ok()
 }
 
 pub fn generate_accessible_mermaid(mermaid: &str, title: &str, description: &str) -> String {
@@ -32,81 +66,62 @@ pub fn generate_accessible_mermaid(mermaid: &str, title: &str, description: &str
             Some("Provide a non-empty Mermaid `mermaid` string, e.g. \"flowchart TD\\nA-->B\"."),
         );
     }
-    if mermaid.chars().count() > MAX_SOURCE_CHARS {
+    let source_chars = mermaid.chars().count();
+    if source_chars > MAX_SOURCE_CHARS {
         return error_response(
             "VIZ_MERMAID_TOO_LARGE",
-            &format!("The Mermaid source is {} characters; at most {MAX_SOURCE_CHARS} are allowed.", mermaid.chars().count()),
+            &format!(
+                "The Mermaid source is {source_chars} characters; at most {MAX_SOURCE_CHARS} are allowed."
+            ),
             None,
             Some("Split the diagram into smaller pieces, or simplify it."),
         );
     }
 
-    let body = build_body(mermaid, title, description);
+    let svg = match renderer().render_svg_with_pipeline_sync(mermaid, &SvgPipeline::resvg_safe()) {
+        Ok(Some(svg)) => svg,
+        Ok(None) => {
+            return error_response(
+                "VIZ_MERMAID_RENDER_FAILED",
+                "No Mermaid diagram was detected in the source.",
+                None,
+                Some("Check that the `mermaid` source starts with a recognized diagram type."),
+            );
+        }
+        Err(e) => {
+            return error_response(
+                "VIZ_MERMAID_RENDER_FAILED",
+                &format!("Mermaid could not be rendered: {e}"),
+                None,
+                Some("Check the `mermaid` source for parsing errors, or simplify the diagram."),
+            );
+        }
+    };
+
+    // Same readability guard as `generate_accessible_svg`: a diagram wider
+    // than the chat iframe shrinks below legible size once scaled to fit.
+    // Mermaid diagrams that can't be sensibly compressed use the wide budget.
+    if let Some(w) = svg_viewbox_width(&svg) {
+        let budget = super::layout::MAX_CONTENT_W_WIDE;
+        if w > budget + super::layout::WIDTH_SLACK {
+            return error_response(
+                "VIZ_TOO_WIDE",
+                &format!(
+                    "This diagram is {w:.0}px wide, wider than the {budget:.0}px readability budget, so it would render illegibly small in the chat."
+                ),
+                None,
+                Some("Reduce the number of steps or nodes, or split the diagram into smaller ones."),
+            );
+        }
+    }
+
+    let body = format!(
+        "<div style=\"padding:8px 0;\">{svg}</div>\
+         <p class=\"sr-only\">{}</p>",
+        super::escape::escape_text(description)
+    );
     let standalone = wrap_in_standalone_html(title, &body);
     success_payload(title, &standalone, &[])
-}
-
-fn build_body(source: &str, title: &str, description: &str) -> String {
-    let source_lit = js_string(source);
-    let title_lit = js_string(title);
-    let desc_lit = js_string(description);
-    format!(
-        r#"<style>
-.mermaid-error {{ background:#fafafa; border:1px solid #e4e4e7; border-radius:8px; padding:12px 14px; font-family:system-ui,sans-serif; }}
-.mermaid-error-msg {{ color:#b91c1c; font-size:12px; margin:6px 0; font-family:ui-monospace,monospace; white-space:pre-wrap; }}
-.mermaid-raw {{ background:#fff; border:1px solid #e4e4e7; border-radius:6px; padding:10px; font-size:11px; font-family:ui-monospace,monospace; white-space:pre-wrap; max-height:260px; overflow:auto; }}
-</style>
-<div id="mermaid-host" style="min-height:120px; padding:8px 0;"></div>
-<script>
-{merr}
-</script>
-<script>
-(function () {{
-  var SOURCE = {source};
-  var TITLE = {title};
-  var DESC = {desc};
-  var host = document.getElementById('mermaid-host');
-  function bump() {{ if (typeof sendHeight === 'function') sendHeight(); }}
-  if (typeof mermaid === 'undefined') {{
-    host.innerHTML = '<div class="mermaid-error"><strong>Mermaid runtime missing.</strong></div>';
-    bump();
-    return;
-  }}
-  mermaid.initialize({{
-    startOnLoad: false,
-    securityLevel: 'strict',
-    flowchart: {{ useMaxWidth: true }},
-    accessibility: {{ title: TITLE, description: DESC }}
-  }});
-  function showError(msg) {{
-    host.innerHTML = '';
-    var card = document.createElement('div');
-    card.className = 'mermaid-error';
-    var strong = document.createElement('strong');
-    strong.textContent = 'Mermaid could not render this diagram.';
-    var err = document.createElement('div');
-    err.className = 'mermaid-error-msg';
-    err.textContent = msg;
-    var pre = document.createElement('pre');
-    pre.className = 'mermaid-raw';
-    pre.textContent = SOURCE;
-    card.appendChild(strong); card.appendChild(err); card.appendChild(pre);
-    host.appendChild(card);
-    bump();
-  }}
-  mermaid.render('mermaid-graph-' + Date.now(), SOURCE).then(function (res) {{
-    host.innerHTML = res.svg;
-    bump();
-  }}).catch(function (e) {{
-    showError(String((e && e.message) || e));
-  }});
-}})();
-</script>"#,
-        merr = MERMAID_JS,
-        source = source_lit,
-        title = title_lit,
-        desc = desc_lit,
-    )
 }
 
 #[cfg(test)]
@@ -130,41 +145,55 @@ mod tests {
     }
 
     #[test]
-    fn success_payload_is_an_iframe_render() {
-        let out = generate_accessible_mermaid("flowchart TD\nA-->B", "Flow", "A goes to B");
+    fn invalid_source_is_rejected_server_side() {
+        // Prose/empty-with-no-diagram must produce an error envelope, not a
+        // (previously JS-time) blank frame.
+        let v: Value =
+            serde_json::from_str(&generate_accessible_mermaid("this is not a diagram", "T", "D"))
+                .unwrap();
+        assert_eq!(v["status"], "error");
+        assert_eq!(v["error_code"], "VIZ_MERMAID_RENDER_FAILED");
+    }
+
+    #[test]
+    fn success_payload_embeds_a_static_svg() {
+        let out = generate_accessible_mermaid(
+            "flowchart TD\nA-->B",
+            "Flow",
+            "A goes to B",
+        );
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["status"], "success");
         assert_eq!(v["render_config"]["target"], "iframe");
         let html = v["html_payload"].as_str().unwrap();
-        assert!(html.contains("mermaid.initialize"));
-        assert!(html.contains(r#"securityLevel: 'strict'"#));
-        assert!(html.contains("useMaxWidth"));
-        assert!(html.contains("mermaid-host"));
-        assert!(html.contains("mermaid-graph-"), "must call mermaid.render");
+        // Server-rendered: the SVG is baked in, no mermaid JS runtime inline.
+        assert!(html.contains("<svg"), "must embed a rendered <svg>");
+        assert!(
+            !html.contains("mermaid.initialize"),
+            "must not inline the mermaid JS runtime"
+        );
+        // resvg-safe pipeline: no HTML-in-SVG `foreignObject` labels, just
+        // plain SVG text, and no inline white background box on the root.
+        assert!(
+            !html.contains("foreignObject"),
+            "resvg-safe pipeline must not emit foreignObject HTML labels"
+        );
+        // Wrapped in our standalone document like the other viz tools.
+        assert!(html.contains("<!DOCTYPE html>"));
     }
 
     #[test]
-    fn hostile_source_cannot_break_out_of_the_inline_script() {
-        // A source containing "</script>" must be escaped (`<\/script>`) so the
-        // html_payload's inline <script> element cannot be terminated early and
-        // re-injected as markup.
-        let src = "flowchart TD\nA[\"</script><img src=x onerror=alert(1)>\"]";
-        let out = generate_accessible_mermaid(src, "T", "D");
+    fn description_is_emitted_as_screen_reader_text() {
+        let out = generate_accessible_mermaid("pie\n\"A\":1", "Pie", "A single slice.");
         let v: Value = serde_json::from_str(&out).unwrap();
         let html = v["html_payload"].as_str().unwrap();
-        // The literal sequence must not appear in a script context; it must be
-        // escaped as `<\/script>` inside the JS string.
-        assert!(html.contains("<\\/script>"), "source's `</script>` must be escaped");
-        assert!(!html.contains("</script><img"), "raw breakout sequence must not survive");
+        assert!(html.contains("A single slice."));
     }
 
     #[test]
-    fn title_and_description_are_passed_to_mermaid_accessibility() {
-        let out = generate_accessible_mermaid("pie\nshowData\n\"A\":1", "My pie", "A single-slice pie.");
-        let html: Value = serde_json::from_str(&out).unwrap();
-        let h = html["html_payload"].as_str().unwrap();
-        assert!(h.contains("accessibility"));
-        assert!(h.contains(r#""My pie""#));
-        assert!(h.contains(r#""A single-slice pie.""#));
+    fn viewbox_width_is_parsed() {
+        assert_eq!(svg_viewbox_width(r#"<svg viewBox="0 0 85 174">"#), Some(85.0));
+        assert_eq!(svg_viewbox_width(r#"<svg viewBox="10 -5 300 200">"#), Some(300.0));
+        assert_eq!(svg_viewbox_width(r#"<svg>"#), None);
     }
 }
