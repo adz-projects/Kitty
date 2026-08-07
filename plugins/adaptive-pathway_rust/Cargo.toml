@@ -37,6 +37,12 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 dashmap = "6"
 futures = "0.3"
 uuid = { version = "1", features = ["v4", "serde"] }
+# MCP server (in-process), matching kitty-tools' rmcp major. As a path dep of
+# bigtiny_rust this coexists with bigtiny_rust's own rmcp 0.9 (different
+# majors, JSON-RPC bytes only cross the in-process pipe).
+rmcp = { version = "=2.2.0", features = ["server", "transport-io", "macros"] }
+schemars = "1"
 
 [dev-dependencies]
 mockito = "1"
+tokio = { version = "1", features = ["full", "test-util"] }

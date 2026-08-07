@@ -16,6 +16,7 @@ pub mod error;
 pub mod layers;
 pub mod learn;
 pub mod maintenance;
+pub mod mcp;
 pub mod recall;
 pub mod store;
 pub mod traits;

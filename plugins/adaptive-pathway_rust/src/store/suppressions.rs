@@ -116,15 +116,20 @@ impl Db {
         // resolve: prefer session recall ids (exact/substring), else top-1
         // cosine above 0.80.
         let target: Option<crate::store::beliefs::Belief> = {
-            let by_known_id = self
-                .lookup_beliefs_in(session_recall_ids)
-                .await?;
-            match by_known_id
+            let what_lower = what.to_lowercase();
+            let by_known_id = self.lookup_beliefs_in(session_recall_ids).await?;
+            let from_known = by_known_id
                 .into_iter()
-                .find(|b| b.text.to_lowercase().contains(&what.to_lowercase()))
-            {
+                .find(|b| b.text.to_lowercase().contains(&what_lower));
+            match from_known {
                 Some(b) => Some(b),
-                None => self.best_cosine_match(what).await?,
+                None => {
+                    // global text-substring fallback, then top-1 cosine
+                    match self.lookup_by_text(&what_lower).await? {
+                        Some(b) => Some(b),
+                        None => self.best_cosine_match(what).await?,
+                    }
+                }
             }
         };
 
@@ -204,6 +209,16 @@ impl Db {
             }
         }
         Ok(out)
+    }
+
+    /// Find a belief whose text contains `what_lower` (substring match).
+    async fn lookup_by_text(&self, what_lower: &str) -> Result<Option<crate::store::beliefs::Belief>> {
+        let all = self.list_beliefs(None).await?;
+        // prefer exact/contains-match by longest shared overlap; first is fine
+        // for the forget() use-case (the model echoes a full statement).
+        Ok(all.into_iter().find(|b| {
+            b.text.to_lowercase().contains(what_lower) || what_lower.contains(&b.text.to_lowercase())
+        }))
     }
 
     /// Top-1 belief by embedding cosine to `what`'s hash-embedding, above 0.80.
