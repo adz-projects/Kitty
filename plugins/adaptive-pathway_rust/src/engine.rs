@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use dashmap::DashMap;
+use tokio::sync::Semaphore;
 
 use crate::config::Config;
 use crate::embed::provider::EmbeddingProvider;
@@ -19,6 +20,10 @@ pub struct PathwayEngine {
     /// Mirrors `conversation_state.paused` for the hot path. `None` (absent)
     /// means configured/available; a paused session maps to `Some(true)`.
     paused_override: DashMap<String, bool>,
+    /// Per-session learn lock, held for the duration of one learn pass.
+    learn_locks: DashMap<String, Arc<tokio::sync::Mutex<()>>>,
+    /// Global 1-permit semaphore around every `structured_chat`.
+    chat_slot: Arc<Semaphore>,
 }
 
 impl PathwayEngine {
@@ -30,7 +35,32 @@ impl PathwayEngine {
             cfg,
             embed,
             paused_override: DashMap::new(),
+            learn_locks: DashMap::new(),
+            chat_slot: Arc::new(Semaphore::new(1)),
         }))
+    }
+
+    /// A per-session learn lock, released when the returned guard drops.
+    pub async fn learn_lock(&self, session_id: &str) -> Result<tokio::sync::OwnedMutexGuard<()>> {
+        let guard = self
+            .learn_locks
+            .entry(session_id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())));
+        let lock = guard.clone();
+        Ok(lock.lock_owned().await)
+    }
+
+    /// Whether learning should proceed for this session (reads the pause
+    /// override map; the DB is authoritative but this is the hot-path check).
+    pub async fn learn_paused(&self, session_id: &str) -> Option<bool> {
+        self.paused_override.get(session_id).map(|p| *p)
+    }
+
+    /// Acquire the global chat permit (one structured_chat at a time).
+    /// Handle to the global semaphore, for callers that want the permit
+    /// helper.
+    pub fn chat_semaphore(&self) -> Arc<Semaphore> {
+        self.chat_slot.clone()
     }
 
     pub async fn open_in_memory(cfg: Config) -> Result<Arc<Self>> {
@@ -41,6 +71,8 @@ impl PathwayEngine {
             cfg,
             embed,
             paused_override: DashMap::new(),
+            learn_locks: DashMap::new(),
+            chat_slot: Arc::new(Semaphore::new(1)),
         }))
     }
 

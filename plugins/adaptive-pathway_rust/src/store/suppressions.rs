@@ -95,4 +95,129 @@ impl Db {
             .await?;
         Ok(res.rows_affected())
     }
+
+    /// Forget a belief by forgiving a textual description of it (the model
+    /// echoes statements, never UUIDs). Resolves `what` against the store.
+    ///
+    /// `reason == "wrong"` (default): permanent suppression + contradictions
+    /// row at `resolved_b` + tombstone so extraction can't relearn it.
+    /// `"outdated"`: 90-day suppression (may re-earn confidence).
+    /// `"private"`: hard delete belief + observations + assumption + FTS row,
+    /// plus a permanent `forget_tombstones` row keyed on text hash.
+    ///
+    /// Returns the exact statement text dropped (for the model to echo).
+    pub async fn forget_by_text(
+        &self,
+        what: &str,
+        session_recall_ids: &[String],
+        reason: SuppressReason,
+    ) -> Result<Option<String>> {
+        let now = Utc::now();
+        // resolve: prefer session recall ids (exact/substring), else top-1
+        // cosine above 0.80.
+        let target: Option<crate::store::beliefs::Belief> = {
+            let by_known_id = self
+                .lookup_beliefs_in(session_recall_ids)
+                .await?;
+            match by_known_id
+                .into_iter()
+                .find(|b| b.text.to_lowercase().contains(&what.to_lowercase()))
+            {
+                Some(b) => Some(b),
+                None => self.best_cosine_match(what).await?,
+            }
+        };
+
+        let Some(belief) = target else {
+            // Nothing resolved; still record the request as an audit event.
+            self.audit("forget", Some(&format!("unresolved: {what}"))).await.ok();
+            return Ok(None);
+        };
+
+        let text_hash = crate::belief::synthesis::text_hash(&belief.text);
+
+        match reason {
+            SuppressReason::Wrong | SuppressReason::Duplicate => {
+                self.insert_suppression(&Suppression {
+                    id: crate::store::audit::uuid_string(),
+                    belief_id: Some(belief.id.clone()),
+                    text_hash: text_hash.clone(),
+                    reason,
+                    permanent: true,
+                    expires_at: None,
+                    created_at: now,
+                })
+                .await?;
+                // tombstone so extraction can't relearn it
+                sqlx::query("INSERT OR IGNORE INTO forget_tombstones (text_hash, created_at) VALUES (?, ?)")
+                    .bind(&text_hash)
+                    .bind(now)
+                    .execute(self.pool())
+                    .await?;
+                self.audit("forget", Some(&format!("permanent: {}", belief.text))).await.ok();
+            }
+            SuppressReason::Outdated => {
+                let expires_at = now + chrono::Duration::days(90);
+                self.insert_suppression(&Suppression {
+                    id: crate::store::audit::uuid_string(),
+                    belief_id: Some(belief.id.clone()),
+                    text_hash: text_hash.clone(),
+                    reason,
+                    permanent: false,
+                    expires_at: Some(expires_at),
+                    created_at: now,
+                })
+                .await?;
+                self.audit("forget", Some(&format!("outdated(90d): {}", belief.text))).await.ok();
+            }
+            SuppressReason::Private => {
+                self.delete_belief(&belief.id).await?;
+                sqlx::query("DELETE FROM observations WHERE belief_id = ?")
+                    .bind(&belief.id)
+                    .execute(self.pool())
+                    .await?;
+                sqlx::query("DELETE FROM assumptions WHERE belief_id = ?")
+                    .bind(&belief.id)
+                    .execute(self.pool())
+                    .await?;
+                sqlx::query("INSERT OR IGNORE INTO forget_tombstones (text_hash, created_at) VALUES (?, ?)")
+                    .bind(&text_hash)
+                    .bind(now)
+                    .execute(self.pool())
+                    .await?;
+                self.audit("forget", Some(&format!("hard_delete: {}", belief.text))).await.ok();
+            }
+        }
+
+        Ok(Some(belief.text.clone()))
+    }
+
+    /// Fetch beliefs whose ids are in `ids`.
+    async fn lookup_beliefs_in(
+        &self,
+        ids: &[String],
+    ) -> Result<Vec<crate::store::beliefs::Belief>> {
+        let mut out = Vec::new();
+        for id in ids {
+            if let Some(b) = self.get_belief(id).await? {
+                out.push(b);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Top-1 belief by embedding cosine to `what`'s hash-embedding, above 0.80.
+    async fn best_cosine_match(&self, what: &str) -> Result<Option<crate::store::beliefs::Belief>> {
+        let all = self.list_beliefs(None).await?;
+        let q = crate::embed::hashing::hash_embed(what, 384);
+        let mut best: Option<(f64, crate::store::beliefs::Belief)> = None;
+        for b in all {
+            let cos = crate::vector::ops::cosine(&b.embedding, &q);
+            if cos >= 0.80
+                && best.as_ref().map(|(c, _)| cos > *c).unwrap_or(true) {
+                    best = Some((cos, b));
+                }
+        }
+        Ok(best.map(|(_, b)| b))
+    }
 }

@@ -5,13 +5,18 @@
 //! `plugins/adaptive-pathway/docs/adaptive-pathway-v2.md`.
 
 pub mod antisycophancy;
+pub mod background;
 pub mod belief;
 pub mod config;
+pub mod consolidate;
 pub mod domains;
 pub mod embed;
 pub mod engine;
 pub mod error;
 pub mod layers;
+pub mod learn;
+pub mod maintenance;
 pub mod recall;
 pub mod store;
+pub mod traits;
 pub mod vector;

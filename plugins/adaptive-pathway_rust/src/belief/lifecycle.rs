@@ -11,8 +11,9 @@ impl Db {
     /// surfaced on render; passed/failed on next direct touch; stale after
     /// 60 unresolved exchanges.
     pub async fn advance_assumption_states(&self, now_exchange: i64) -> Result<()> {
+        let _ = now_exchange;
         for a in self.list_assumptions(None).await? {
-            let next = next_state(&a, now_exchange);
+            let next = next_state(&a);
             if next != a.state {
                 self.update_assumption_state(&a.id, next, a.exchanged_since_flag + 1).await?;
             }
@@ -21,7 +22,7 @@ impl Db {
     }
 }
 
-fn next_state(a: &Assumption, now: i64) -> AssumptionState {
+fn next_state(a: &Assumption) -> AssumptionState {
     match a.state {
         AssumptionState::Scheduled | AssumptionState::Surfaced => {
             if a.exchanged_since_flag >= 60 {

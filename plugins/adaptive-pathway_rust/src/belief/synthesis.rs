@@ -1,0 +1,212 @@
+//! Merging/upserting an extracted observation into the belief store.
+//!
+//! On a new observation: embed, then route to an existing belief (cosine ≥
+//! 0.86 merge: bump support/sessions, recompute confidence, take max
+//! provenance, re-parent observations) or create a new context/conversation
+//! belief; record the observation and flag an assumption if warranted;
+//! detect engine-side contradictions. All in one transaction.
+
+use chrono::{DateTime, Utc};
+use serde_json::json;
+
+use super::super::store::beliefs::{Belief, Layer, Provenance, BeliefPatch};
+use super::super::store::Db;
+use crate::error::Result;
+use crate::belief;
+
+/// Cosine above which an observation routes into an existing belief (merge)
+/// rather than starting a new one.
+pub const MERGE_COSINE: f64 = 0.86;
+
+/// Route and record a single new observation. Called within one transaction.
+#[allow(clippy::too_many_arguments)]
+pub async fn route_observation(
+    db: &Db,
+    statement: &str,
+    embedding: &[f32],
+    provenance: Provenance,
+    layer: Layer,
+    domain: Option<&str>,
+    evidence: Option<&str>,
+    contradicts: Option<&str>,
+    session_id: Option<String>,
+    now: DateTime<Utc>,
+) -> Result<()> {
+    // Guard against relearning a forgotten/suppressed statement (text-hash).
+    let text_hash = text_hash(statement);
+    if db.has_permanent_tombstone(&text_hash).await? {
+        return Ok(());
+    }
+
+    // Find best merge candidate in the same (or any) layer.
+    let candidates = db.list_beliefs(Some(layer)).await?;
+    let mut best: Option<(String, f64)> = None;
+    for b in candidates.iter() {
+        let cos = crate::vector::ops::cosine(&b.embedding, embedding);
+        if cos >= MERGE_COSINE
+            && best.as_ref().map(|(_, c)| cos > *c).unwrap_or(true) {
+                best = Some((b.id.clone(), cos));
+            }
+    }
+
+    let id = crate::store::audit::uuid_string();
+
+    if let Some((target_id, _cos)) = &best {
+        let target = db.get_belief(target_id.as_str()).await?.unwrap_or_else(|| {
+            // shouldn't happen; create a fallback belief
+            fallback_belief(&id, statement, embedding, provenance, layer, domain, now)
+        });
+        // Merge: bump support/sessions, recompute confidence, take max
+        // provenance ranking, re-parent this observation onto target.
+        let new_conf = merge_confidence(target.confidence, provenance);
+        let new_prov = max_provenance(target.provenance, provenance);
+        db.update_belief(
+            &target.id,
+            &BeliefPatch {
+                confidence: Some(new_conf),
+                support_count: Some(target.support_count + 1),
+                distinct_sessions: Some(target.distinct_sessions + if session_id.is_some() { 1 } else { 0 }),
+                last_confirmed_at: Some(now),
+                ..Default::default()
+            },
+            now,
+        )
+        .await?;
+        db.insert_observation(&crate::store::observations::Observation {
+            id,
+            belief_id: Some(target.id),
+            session_id: session_id.clone(),
+            statement: statement.to_string(),
+            provenance: new_prov.as_str().to_string(),
+            layer: layer.as_str().to_string(),
+            domain: domain.map(|s| s.to_string()),
+            evidence: evidence.map(|s| s.to_string()),
+            contradicts: contradicts.map(|s| s.to_string()),
+            created_at: now,
+        })
+        .await?;
+    } else {
+        // Create a new belief.
+        let b = fallback_belief(&id, statement, embedding, provenance, layer, domain, now);
+        db.insert_belief(&b).await?;
+        db.insert_observation(&crate::store::observations::Observation {
+            id: crate::store::audit::uuid_string(),
+            belief_id: Some(id),
+            session_id: session_id.clone(),
+            statement: statement.to_string(),
+            provenance: provenance.as_str().to_string(),
+            layer: layer.as_str().to_string(),
+            domain: domain.map(|s| s.to_string()),
+            evidence: evidence.map(|s| s.to_string()),
+            contradicts: contradicts.map(|s| s.to_string()),
+            created_at: now,
+        })
+        .await?;
+    }
+
+    // Detection: model-reported contradiction via the `contradicts` field.
+    // The field carries a *statement* the model says the new observation
+    // contradicts; best-effort resolve it to a belief id and record an open
+    // contradiction. Never fatal.
+    if let Some(other_stmt) = contradicts {
+        let current_id = best.as_ref().map(|(i, _)| i.clone()).unwrap_or_default();
+        let resolved = db
+            .best_text_match(other_stmt)
+            .await
+            .unwrap_or_default();
+        if let Some(other_id) = resolved {
+            if other_id != current_id {
+                let _ = db
+                    .insert_contradiction(&crate::store::contradictions::Contradiction {
+                        id: crate::store::audit::uuid_string(),
+                        belief_a: current_id,
+                        belief_b: other_id,
+                        status: "open".into(),
+                        resolved_b: None,
+                        reason: Some("model_reported".into()),
+                        created_at: now,
+                        resolved_at: None,
+                    })
+                    .await;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn fallback_belief(
+    id: &str,
+    statement: &str,
+    embedding: &[f32],
+    provenance: Provenance,
+    layer: Layer,
+    domain: Option<&str>,
+    now: DateTime<Utc>,
+) -> Belief {
+    Belief {
+        id: id.to_string(),
+        text: statement.to_string(),
+        embedding: embedding.to_vec(),
+        confidence: belief::provenance::initial_confidence(provenance),
+        provenance,
+        layer,
+        tested: false,
+        domain: domain.map(|s| s.to_string()),
+        tier: "conversation".into(),
+        support_count: 1,
+        distinct_sessions: 1,
+        contradict_count: 0,
+        pinned: false,
+        last_confirmed_at: Some(now),
+        consolidated_at: None,
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+/// Recompute confidence on a merge. Multiplicative toward the bound with a
+/// modest step for a supportive observation.
+pub fn merge_confidence(existing: f64, provenance: Provenance) -> f64 {
+    let step = belief::provenance::reinforcement_step(
+        if provenance == Provenance::Correction {
+            belief::EvidenceKind::Correction
+        } else {
+            belief::EvidenceKind::SupportiveObservation
+        },
+    );
+    belief::provenance::reinforce_toward(existing, true, step)
+}
+
+/// Higher provenance wins (correction > direct_statement > controlled_test >
+/// inferred_pattern > single_observation).
+pub fn max_provenance(a: Provenance, b: Provenance) -> Provenance {
+    use Provenance::*;
+    let rank = |p: Provenance| match p {
+        Correction => 5,
+        DirectStatement => 4,
+        ControlledTest => 3,
+        InferredPattern => 2,
+        SingleObservation => 1,
+    };
+    if rank(b) > rank(a) {
+        b
+    } else {
+        a
+    }
+}
+
+/// Deterministic text hash (mmh3 over the statement), used for tombstones and
+/// suppression keys.
+pub fn text_hash(text: &str) -> String {
+    format!("{:x}", crate::embed::hashing::mmh3_32(text.as_bytes(), 0))
+}
+
+/// Tell the model-tool pair about a fresh observation (JSON export helper).
+pub fn observation_json(statement: &str, layer: &str, confidence: f64) -> serde_json::Value {
+    json!({
+        "statement": statement,
+        "layer": layer,
+        "confidence": confidence,
+    })
+}

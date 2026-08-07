@@ -95,6 +95,7 @@ pub struct Belief {
     pub updated_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Default)]
 pub struct BeliefPatch {
     pub confidence: Option<f64>,
     pub tested: Option<bool>,
@@ -200,6 +201,22 @@ impl Db {
     /// All beliefs with embeddings loaded, for in-memory vector search.
     pub async fn load_embeddings(&self, layer: Option<Layer>) -> Result<Vec<Belief>> {
         self.list_beliefs(layer).await
+    }
+
+    /// Best belief-id match to `what` by embedding cosine, above 0.80
+    /// (top-1). Used to resolve a textual `contradicts` reference.
+    pub async fn best_text_match(&self, what: &str) -> Result<Option<String>> {
+        let all = self.list_beliefs(None).await?;
+        let q = crate::embed::hashing::hash_embed(what, 384);
+        let mut best: Option<(f64, String)> = None;
+        for b in all {
+            let cos = crate::vector::ops::cosine(&b.embedding, &q);
+            if cos >= 0.80
+                && best.as_ref().map(|(c, _)| cos > *c).unwrap_or(true) {
+                    best = Some((cos, b.id));
+                }
+        }
+        Ok(best.map(|(_, id)| id))
     }
 }
 

@@ -14,6 +14,8 @@ pub enum PathwayError {
     Recall(String),
     #[error("extraction error: {0}")]
     Extract(String),
+    #[error("host daemon db error: {0}")]
+    Host(String),
     #[error("model error: {0}")]
     Model(String),
     #[error("io error: {0}")]

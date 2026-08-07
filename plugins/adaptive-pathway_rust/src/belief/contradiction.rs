@@ -12,7 +12,7 @@ pub const CONTRADICT_HIGH: f64 = 0.93;
 
 /// Does this cosine fall in the contradiction band?
 pub fn in_contradiction_band(cos: f64) -> bool {
-    cos >= CONTRADICT_LOW && cos <= CONTRADICT_HIGH
+    (CONTRADICT_LOW..=CONTRADICT_HIGH).contains(&cos)
 }
 
 /// Does this cosine imply the two should merge instead (> 0.93)?

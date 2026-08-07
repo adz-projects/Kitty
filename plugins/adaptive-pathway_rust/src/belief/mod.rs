@@ -1,4 +1,7 @@
+pub mod contradiction;
+pub mod lifecycle;
 pub mod provenance;
+pub mod synthesis;
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
