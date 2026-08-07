@@ -3,6 +3,24 @@
 version = 4
 
 [[package]]
+name = "adaptive-pathway"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "dashmap",
+ "futures",
+ "rand 0.8.7",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror 2.0.19",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "addr2line"
 version = "0.25.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -272,6 +290,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 name = "bigtiny_rust"
 version = "0.1.0"
 dependencies = [
+ "adaptive-pathway",
  "aes-gcm",
  "async-trait",
  "axum",

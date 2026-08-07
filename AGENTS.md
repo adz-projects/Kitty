@@ -62,22 +62,23 @@ You must strictly follow this 4-step loop for all tasks beyond simple single-fil
 | `pnpm test` | root | `vitest run` |
 | `cargo clippy` | `src-tauri/` | Rust lint |
 | `cargo test` | `src-tauri/` | Rust unit tests |
-| `pytest` | `plugins/bigtiny/` | BigTiny tests |
-| `python plugins/build.py` | root | Freeze all 6 plugins to `.exe` |
+| `cargo test`, `cargo clippy` | `plugins/bigtiny_rust/` (and each Rust plugin dir) | Backend/plugin Rust tests |
+| `python plugins/build.py` | root | Freeze all 6 targets to `.exe` |
 
-**Dev prerequisite**: `pip install -e plugins/bigtiny` (one-time, installs BigTiny's Python deps). In dev, Kitty launches BigTiny via `python -m bigtiny` — the module entry point is required (installs the Windows Proactor event-loop factory stdio MCP servers need).
+**Dev prerequisite**: none beyond the normal Rust/Node toolchains. BigTiny is now **pure Rust** (`plugins/bigtiny_rust/`). In dev Kitty runs it via `cargo run --manifest-path plugins/bigtiny_rust/Cargo.toml --bin bigtiny-daemon` (see `config::default_bigtiny_args`), so `pnpm tauri dev` works before `plugins/build.py` has ever run. The old Python-daemon flow and its `pip install -e plugins/bigtiny` prerequisite are gone.
 
 **Release build order**: `python plugins/build.py` then `pnpm tauri build`. The freeze script overwrites placeholder `.exe`s in `src-tauri/binaries/` with real executables. Packaging with placeholders produces a non-functional app.
 
 ## Architecture at a glance
 
 - **Windows-only Tauri v2** app. Rust core (`src-tauri/`) + React 18/TS/Vite frontend (`src/`).
-- **5 windows**: `overlay`, `main`, `settings`, `wizard`, `screenshot-select`. Vite is a multipage build — see `vite.config.ts` rollup inputs. Each window has its own `index.html` under `src/windows/<label>/`.
-- **Backend**: BigTiny daemon (`plugins/bigtiny/`), vendored in-tree, frozen to `bigtiny-daemon.exe`. All chat/tool/MCP logic lives there. This app is the client layer.
+- **6 windows**: `overlay`, `main`, `settings`, `wizard`, `screenshot-select`. Vite is a multipage build — see `vite.config.ts` rollup inputs (single `WINDOWS` array mirrors `windows.rs::url()`). Each window has its own `index.html` under `src/windows/<label>/`.
+- **Backend**: BigTiny daemon. Pure Rust, source at `plugins/bigtiny_rust/`, frozen to `bigtiny-daemon.exe`. All chat/tool/MCP logic lives there — this app is the client layer. `plugins/bigtiny/` is the *retired* Python-original daemon, kept in-tree unbuilt as a behavioral oracle.
 - **Config**: `%APPDATA%/Kitty/config.json`. **Secrets**: Windows Credential Manager via `keyring` (service `kitty`), never `config.json`, never JS.
 - **Plugin integration patterns** (critical distinction, see `docs/PLUGINS.md`):
-  - *Kitty-managed process* (HTTP sidecars like BigTiny itself, adaptive-pathway): Kitty spawns, monitors via `ManagedProcess`/health loop. Pattern: `lifecycle/<name>_proc.rs`.
-  - *BigTiny-managed MCP server* (stdio: `kitty-tools`, `kitty-web`, `kitty-wasm`, `adaptive-pathway-mcp`): BigTiny spawns/owns. Kitty only upserts the registration via `bigtiny::mcp::ensure_builtin_servers`. No `ManagedProcess`.
+  - *Kitty-managed process* (HTTP sidecars): Kitty spawns, monitors via `ManagedProcess`/health loop. Pattern: `lifecycle/<name>_proc.rs`. Holds: BigTiny daemon (`bigtiny_proc.rs`) + adaptive-pathway sidecar (`adaptive_pathway_proc.rs`).
+  - *BigTiny-managed MCP server* (stdio: `kitty-tools`, `kitty-web`, `kitty-wasm`; plus `adaptive-pathway-mcp`): BigTiny spawns/owns. Kitty only upserts the registration via `bigtiny::mcp::ensure_builtin_servers`. No `ManagedProcess`.
+  - *In-process MCP server* (`bigtiny_rust`, non-desktop hosts that can't `exec()`): the server links in as a library over an in-memory pipe — see `mcp::builtin` in `plugins/bigtiny_rust/` (`docs/PLUGINS.md`).
   - **Never mix** — two supervisors racing one child is a bug.
 
 ## Frontend rules
@@ -93,7 +94,7 @@ You must strictly follow this 4-step loop for all tasks beyond simple single-fil
 
 - Every `#[tauri::command]` returns `Result<T, String>` with user-safe messages. Log details with `tracing`, don't surface internals.
 - `thiserror` for error enums per module.
-- `kitty-tools` (`plugins/kitty-tools/`) is a **standalone Rust crate**, NOT a workspace member of `src-tauri` (MSRV isolation, profile config reasons — see its `Cargo.toml` doc comment).
+- The Rust plugins (`plugins/bigtiny_rust/`, `plugins/kitty-tools/`, `plugins/kitty-web/`, `plugins/kitty-wasm/`) are **standalone crates**, NOT workspace members of `src-tauri` (MSRV isolation, workspace-root-only `[profile.*]`, feature-unification reasons — see their `Cargo.toml` doc comments / `docs/PLUGINS.md`). `bigtiny_rust` depends on `kitty-tools` as a path dep purely for the in-process MCP server.
 
 ## Gotchas
 

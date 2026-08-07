@@ -1,0 +1,42 @@
+[package]
+name = "adaptive-pathway"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Behavioral memory engine: models who the user is and how the assistant should adapt. Rust rewrite of plugins/adaptive-pathway, linked in-process into the BigTiny daemon. See docs/adaptive-pathway-v2.md."
+
+# Standalone package, NOT a workspace member of src-tauri -- same rationale as
+# plugins/kitty-tools/Cargo.toml (MSRV isolation, `panic = "abort"` in
+# src-tauri must not leak here, feature unification would otherwise pollute
+# the Tauri binary). No [profile.release] block here: as a path dep of
+# bigtiny_rust it would be ignored dead config.
+
+[lib]
+name = "adaptive_pathway"
+path = "src/lib.rs"
+
+# Unshipped dev tool: recall/extract/dump/consolidate/serve-stdio. Deliberately
+# NOT in plugins/build.py or externalBin -- pays for itself when tuning the
+# extraction prompt.
+[[bin]]
+name = "adaptive-pathway-devtool"
+path = "src/bin/devtool.rs"
+
+[dependencies]
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "chrono"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+tracing = "0.1"
+thiserror = "2"
+chrono = { version = "0.4", features = ["serde"] }
+async-trait = "0.1"
+rand = "0.8"
+# mmh3-compatible 32-bit hashing
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+dashmap = "6"
+futures = "0.3"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+mockito = "1"

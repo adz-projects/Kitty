@@ -75,6 +75,10 @@ rand = "0.8"
 kitty-tools = { path = "../kitty-tools" }
 kitty-web = { path = "../kitty-web" }
 kitty-wasm = { path = "../kitty-wasm" }
+# Behavioral memory engine, linked in-process (see docs/adaptive-pathway-v2.md).
+# Path dep so its crate is built with this crate's profile; it must stay
+# sqlx = "0.8" to keep a single libsqlite3-sys across this workspace.
+adaptive-pathway = { path = "../adaptive-pathway_rust" }
 
 [dev-dependencies]
 mockito = "1"
