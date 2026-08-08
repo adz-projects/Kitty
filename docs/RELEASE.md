@@ -3,10 +3,7 @@
 ## Build
 
 ```powershell
-python plugins/build.py    # freeze the BigTiny daemon (plugins/bigtiny_rust/) +
-                            # internal plugins (adaptive-pathway,
-                            # adaptive-pathway-mcp, kitty-tools (Rust),
-                            # kitty-web (Rust), kitty-wasm (Rust)) to
+python plugins/build.py     # build the four bundled binaries into
                             # src-tauri/binaries/ — see plugins/README.md.
                             # Skipping this step leaves the committed empty
                             # placeholders in place, which `tauri build` will
@@ -15,6 +12,15 @@ python plugins/build.py    # freeze the BigTiny daemon (plugins/bigtiny_rust/) +
 pnpm install
 pnpm tauri build            # release build + NSIS installer
 ```
+
+All four targets are now Rust (`cargo build --release`, no PyInstaller and no
+Python runtime involved): `bigtiny` (the daemon, which statically links the
+behavioral-memory engine at `plugins/adaptive-pathway_rust/`), `kitty-tools`,
+`kitty-web`, and `kitty-wasm`. The Python `adaptive-pathway` sidecar and its
+`adaptive-pathway-mcp` proxy are retired and no longer built or bundled.
+
+`plugins/build.py` still drives it, purely because it owns the
+target-triple naming convention `externalBin` expects.
 
 Artifacts:
 
@@ -39,8 +45,10 @@ proceed — this is expected, not a build failure.
    (and `src-tauri/Cargo.toml`) — keep them in sync.
 2. Re-verify the curated starter model tags on ollama.com
    (`src/lib/starter_models.ts`) and the Ollama installer URL in `docs/VERSIONS.md`.
-3. Re-verify the pinned Python + PyInstaller versions in `docs/VERSIONS.md`
-   still build all four `plugins/build.py` targets cleanly.
+3. Re-verify all four `plugins/build.py` targets still build cleanly. (The
+   pinned Python + PyInstaller versions in `docs/VERSIONS.md` no longer gate
+   this — every target is Rust now — but `plugins/build.py` itself is still a
+   Python script and needs an interpreter on PATH.)
 4. If BigTiny's own API surface changed, re-check the route shapes assumed
    in `src-tauri/src/bigtiny/` (`client.rs`, `sessions.rs`, `stream.rs`,
    `providers.rs`, `mcp.rs`) against BigTiny's current API.md.

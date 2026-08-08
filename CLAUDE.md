@@ -43,21 +43,31 @@ Read `goose-overlay-project-description.md` in the repo root for the original pr
 
 ## Internal plugins (`plugins/`)
 
-Python subsystems ship as **internal plugins**: independent, tested
-Python packages maintained in this repo under `plugins/`, frozen to
-standalone Windows `.exe`s via PyInstaller and bundled through Tauri's
-`externalBin` mechanism — end users need no Python runtime. Full detail in
+Subsystems ship as **internal plugins**: independent, tested packages
+maintained in this repo under `plugins/`, built to standalone Windows
+`.exe`s and bundled through Tauri's `externalBin` mechanism — end users need
+no runtime of any kind. **As of 0.5.0 every bundled binary is Rust**
+(`cargo build --release`); the PyInstaller freeze path still exists in
+`plugins/build.py` but no current target uses it. Full detail in
 `docs/PLUGINS.md`; the current plugins:
 
-- **`adaptive-pathway`** — an HTTP sidecar (FastAPI/uvicorn) that Kitty spawns
-  and monitors directly, same supervision pattern as Ollama/BigTiny
-  (`lifecycle/adaptive_pathway_proc.rs`, `commands/adaptive_pathway.rs`).
-  Learns tool-selection and response-style preferences from tool-call
-  outcomes and 👍👎 feedback; surfaced in chat as hint badges and in Settings
-  as Graph Health / Domain Profiles. See `docs/ADAPTIVE_PATHWAY.md` for the
-  Rust↔sidecar HTTP contract. Its `decide`/`record_outcome` MCP tools
-  (`adaptive-pathway-mcp` console script, separate frozen exe) are registered
-  as a BigTiny stdio MCP server, not spawned directly by Kitty — see below.
+- **`adaptive-pathway_rust`** — the behavioral-memory engine, and *not* a
+  bundled binary of its own: it's a path dependency statically linked into
+  the BigTiny daemon, so recall runs as an in-process call on the agent
+  loop's hot path rather than an HTTP hop. Extracts durable beliefs about
+  the user from conversation, decays and consolidates them across sessions,
+  and injects a DPP-selected handful per turn — framed as working
+  assumptions to check the request against, never a profile to conform to
+  (see `docs/VERSIONS.md`'s recall-framing contract). Surfaced in Settings as
+  the belief browser / Graph Health / Domain Profiles, and per-session
+  incognito in the chat header. Its `record`/`forget` write tools are
+  exposed to the model through BigTiny's in-process MCP registry
+  (`bigtiny_rust::mcp::builtin`), which is what lets the model drop a belief
+  it's told is wrong.
+
+  The Python `adaptive-pathway` HTTP sidecar and its `adaptive-pathway-mcp`
+  stdio proxy that preceded this are **retired** — no longer built, bundled,
+  spawned, or supervised.
 - **`kitty-tools`** — a **Rust** stdio MCP server registered with **BigTiny's
   own `/api/mcp/servers`**, not spawned directly by Kitty. Kitty's only
   involvement is keeping the registration's command path pointed at the

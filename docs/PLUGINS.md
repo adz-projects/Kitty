@@ -9,14 +9,21 @@ daemon itself (Kitty's chat backend, vendored in-tree at `plugins/bigtiny/`)
 follows the same freeze pipeline, even though it isn't a "plugin" in the
 tool-augmentation sense — see `docs/bigtiny-backend.md`.
 
-**Most plugins are Python**, frozen with PyInstaller. Three (`kitty-tools`,
-`kitty-web`, `kitty-wasm`) are **Rust**, built with plain `cargo build --release`
-— this is not a deviation from "the exception, by design" framing (CLAUDE.md's
+**As of 0.5.0 every bundled binary is Rust**, built with plain
+`cargo build --release` — `kitty-tools`, `kitty-web`, `kitty-wasm`, and the
+`bigtiny` daemon (which statically links the behavioral-memory engine at
+`plugins/adaptive-pathway_rust/`). No PyInstaller step and no Python runtime
+is involved in a release build any more; `plugins/build.py` remains only
+because it owns the target-triple naming convention `externalBin` expects.
+
+This is not a deviation from "the exception, by design" framing (CLAUDE.md's
 stack section): a frozen Rust binary has *less* runtime surface than a frozen
 Python one (no interpreter, no onefile self-extraction latency), so it fits the
-same externalBin-bundled-plugin slot even more comfortably. `plugins/build.py`'s
-`kind: "rust"` field is the only place the two freeze pipelines diverge (see
-"The freeze pipeline" below).
+same externalBin-bundled-plugin slot even more comfortably. The Python freeze
+pipeline described below is retained because it still documents how the
+retired plugins were built, and `plugins/build.py`'s `kind` field still
+supports `"python"` should a future plugin need it — but no current target
+uses it.
 
 ## Why frozen `.exe`s, not a bundled Python runtime
 
@@ -30,13 +37,21 @@ dependency on a Rust toolchain.
 
 ## The two integration shapes, and why plugins are wired differently
 
-| | `adaptive-pathway` (sidecar) | `kitty-tools` / `adaptive-pathway-mcp` |
+| | HTTP sidecar (no current example — see note) | `kitty-tools` / `kitty-web` / `kitty-wasm` |
 |---|---|---|
 | What it is | HTTP sidecar (FastAPI/uvicorn) | stdio MCP server |
 | Who spawns it | **Kitty** (`lifecycle/adaptive_pathway_proc.rs`) | **BigTiny** |
 | Who monitors it | Kitty (health loop, `ManagedProcess`) | BigTiny (its own `/api/mcp/servers` status) |
 | Registered via | Config field + Kitty's own process spawn | `bigtiny::mcp::ensure_builtin_servers` (upserts BigTiny's `/api/mcp/servers`) |
-| Rust wiring | `lifecycle/adaptive_pathway_proc.rs`, `commands/adaptive_pathway.rs`, `adaptive_pathway/mod.rs` (HTTP client) | `bigtiny/mcp.rs`, `commands/mcp_servers.rs` — no lifecycle file, no `ManagedProcess` |
+| Rust wiring | `lifecycle/<name>_proc.rs`, `commands/<name>.rs`, an HTTP client module | `bigtiny/mcp.rs`, `commands/mcp_servers.rs` — no lifecycle file, no `ManagedProcess` |
+
+> **Note (0.5.0):** the Kitty-managed-sidecar column has no current occupant.
+> Its only example was the Python `adaptive-pathway` sidecar, retired once the
+> behavioral-memory engine moved in-process into the BigTiny daemon. The
+> BigTiny daemon itself is still Kitty-managed (`lifecycle/bigtiny_proc.rs`),
+> so the pattern is live — just not for any *plugin*. The column is kept
+> because the "two supervisors racing to own one child" hazard below is the
+> reason the split exists, and that hazard outlives any one example.
 
 **This split is deliberate, not incidental.** A plugin that BigTiny itself
 spawns (any stdio MCP server) should *never* also get a Kitty-side
@@ -45,12 +60,12 @@ one child process. Decide which category a new plugin falls into before
 writing any Rust wiring:
 
 - **Kitty-managed process** (HTTP sidecar, background daemon Kitty talks to
-  directly): follow the Adaptive Pathway sidecar / BigTiny daemon pattern — a
+  directly): follow the BigTiny daemon pattern (`lifecycle/bigtiny_proc.rs`) — a
   `lifecycle/<name>_proc.rs` with `spawn`/`ensure_running` + `probe_health`, a
   `ManagedProcess`/`DaemonHandle` field in `AppState`, commands for
   status/restart/enable.
 - **BigTiny-managed MCP server** (stdio MCP server): follow the
-  kitty-tools / adaptive-pathway-mcp pattern — no lifecycle file, just an
+  kitty-tools / kitty-web / kitty-wasm pattern — no lifecycle file, just an
   entry in `bigtiny::mcp::ensure_builtin_servers`'s upsert (registers/updates
   it in BigTiny's `/api/mcp/servers` by name) and a Settings toggle. BigTiny
   owns the process entirely.
@@ -176,8 +191,8 @@ plugins/<name>/               # bigtiny included — plugins/bigtiny/
   tests/
 ```
 
-`plugins/build.py`, for each target (`bigtiny`, `adaptive-pathway`,
-`adaptive-pathway-mcp` — Python — and
+`plugins/build.py`, for each target (`bigtiny`, `kitty-tools`, `kitty-web`,
+`kitty-wasm` — all Rust as of 0.5.0; historically also Python targets, and
 `kitty-tools`, `kitty-web`, `kitty-wasm` — Rust; `python plugins/build.py`
 with no args builds all six):
 1. **Python** (`kind: "python"`, the default): `pip install -e ".[extras]"`
@@ -264,7 +279,7 @@ PATH-relative name — a developer working on the plugin itself can point the
 relevant config field (`adaptive_pathway_launch_command`, `bigtiny_command`)
 at `uv run ...`/`python -m ...` instead, entirely independent of this
 resolution. `bigtiny::mcp::ensure_builtin_servers` uses the same resolution
-for `kitty-tools.exe`/`kitty-web.exe`/`kitty-wasm.exe`/`adaptive-pathway-mcp.exe`
+for `kitty-tools.exe`/`kitty-web.exe`/`kitty-wasm.exe`
 when registering them with BigTiny.
 
 ## Adding a new plugin
