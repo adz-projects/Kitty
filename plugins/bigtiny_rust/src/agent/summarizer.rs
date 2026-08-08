@@ -5,6 +5,23 @@ use serde_json::{json, Value};
 use crate::config::SummarizerConfig;
 use crate::error::SummarizerError;
 
+/// `adaptive_pathway::StructuredChat` impl over the shared summarizer client
+/// (LFM2.5-like 0.6/0.8b model) — the engine's learned `structured_chat`
+/// extraction. This is the trait-inversion seam that lets adaptive_pathway
+/// depend on a plain interface while bigtiny_rust provides the real client.
+#[async_trait::async_trait]
+impl adaptive_pathway::traits::StructuredChat for SummarizerClient {
+    async fn structured_chat(
+        &self,
+        messages: Vec<Value>,
+        schema: &Value,
+    ) -> Result<Value, String> {
+        self.structured_chat(messages, schema)
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+
 /// Talks to Ollama's *native* `/api/chat` endpoint (not the OpenAI-compatible
 /// `/v1/chat/completions` path providers use) with a JSON-schema-constrained
 /// `format` field, for the compaction summarizer's structured memory-slot

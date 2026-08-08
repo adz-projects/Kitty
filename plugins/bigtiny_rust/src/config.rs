@@ -30,6 +30,43 @@ pub struct BigTinyConfig {
     pub providers: Vec<ProviderConfig>,
     #[serde(default)]
     pub cache: CacheConfig,
+    #[serde(default)]
+    pub pathway: PathwayConfig,
+}
+
+/// Behavioral-memory engine config (`adaptive_pathway`). Empty/minimal keys
+/// disable the pathway engine (the default), so the in-process `"pathway"`
+/// MCP server is only wired when a host opts in.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PathwayConfig {
+    #[serde(default = "default_pathway_enabled")]
+    pub enabled: bool,
+    /// Filename (relative to `data_dir`) of the fresh `pathway.db`.
+    #[serde(default = "default_pathway_db_name")]
+    pub db_name: String,
+    /// Learn cadence: run the turn-end extract pass every N exchanges.
+    #[serde(default = "default_pathway_learn_every_n")]
+    pub learn_every_n: u32,
+}
+
+impl Default for PathwayConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_pathway_enabled(),
+            db_name: default_pathway_db_name(),
+            learn_every_n: default_pathway_learn_every_n(),
+        }
+    }
+}
+
+fn default_pathway_enabled() -> bool {
+    false
+}
+fn default_pathway_db_name() -> String {
+    "pathway.db".to_string()
+}
+fn default_pathway_learn_every_n() -> u32 {
+    4
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -573,6 +610,9 @@ Ok(config)
         }
         if other.cache != CacheConfig::default() {
             self.cache = other.cache.clone();
+        }
+        if other.pathway != PathwayConfig::default() {
+            self.pathway = other.pathway.clone();
         }
     }
 }

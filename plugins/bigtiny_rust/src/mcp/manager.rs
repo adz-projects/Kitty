@@ -58,7 +58,8 @@ impl MCPManager {
         // failed-reconnect behavior to a stdio one.
         let connect_result = if config.transport == TransportType::InProcess {
             let name = config.command.clone().unwrap_or_default();
-            tokio::time::timeout(CONNECT_TIMEOUT, super::builtin::connect(&name, server_id.to_string())).await
+            tokio::time::timeout(CONNECT_TIMEOUT, super::builtin::connect(&name, server_id.to_string()))
+            .await
         } else {
             tokio::time::timeout(CONNECT_TIMEOUT, MCPServerClient::connect(&config)).await
         };

@@ -17,7 +17,7 @@ use crate::agent::context::stats::SessionStats;
 use crate::agent::sandbox::{allowed_dirs_for_session, check_containment};
 use crate::agent::summarizer::SummarizerClient;
 use crate::agent::types::TimingResult;
-use crate::config::{FallbackConfig, SummarizerConfig};
+use crate::config::{FallbackConfig, PathwayConfig, SummarizerConfig};
 use crate::hitl::manager::HITLManager;
 use crate::mcp::MCPManager;
 use crate::models::mcp::ToolDefinition;
@@ -116,30 +116,19 @@ fn sanitize_boolean_subschemas(schema: &mut Value) {
     }
 }
 
-/// `decide`/`record_outcome` are called automatically by the daemon itself —
-/// `adaptive_decide` once before every turn, `spawn_record_outcome` once per
-/// executed tool call (see both below) — so they must NOT also be offered to
-/// the model as choosable tools: a model-issued call on top of the automatic
-/// ones would waste a tool-call round and, for `record_outcome`, write a
-/// second, model-judged outcome alongside the mechanical one. Every other AP
-/// tool (`get_state`, `list_edges`, `toggle_suggestions`, etc.) stays a
-/// legitimate model-invocable introspection/control tool and is unaffected.
-const AUTO_INVOKED_AP_TOOL_NAMES: &[&str] = &["decide", "record_outcome"];
-
-/// Convert ToolDefinitions to OpenAI function-calling format, excluding the
-/// tools in `AUTO_INVOKED_AP_TOOL_NAMES`. Callers that need the *unfiltered*
-/// tool list (gating whether AP is connected at all, building `decide`'s own
-/// `available_actions`) must keep using `active_tools` directly — only the
-/// array actually sent to the provider goes through this filter.
-fn llm_visible_tools_openai_format(tools: &[ToolDefinition]) -> Vec<Value> {
-    let visible: Vec<ToolDefinition> = tools
-        .iter()
-        .filter(|t| !AUTO_INVOKED_AP_TOOL_NAMES.contains(&t.name.as_str()))
-        .cloned()
-        .collect();
-    tools_to_openai_format(&visible)
-}
-
+/// AP recall/record are handled automatically and in-process by the daemon
+/// itself — `pathway_recall` before every turn and a coalesced turn-end
+/// observation pass (both below) — so nothing is auto-invoked as a model
+/// tool; the in-process `pathway` server's `record`/`forget` tools stay
+/// legitimate model-invocable introspection/control tools and are sent to
+/// the provider like any other. There used to be an
+/// `llm_visible_tools_openai_format` wrapper here that filtered
+/// `active_tools` against an `AUTO_INVOKED_AP_TOOL_NAMES` list before
+/// formatting -- with that list permanently empty (nothing is auto-invoked
+/// anymore), the wrapper was a no-op that still cloned and re-collected the
+/// full tool list every single turn. Callers now call
+/// `tools_to_openai_format` directly.
+///
 /// Write-capable MCP tools the model can reach for (bundled kitty-tools
 /// plugins). A write-class call whose path resolves outside the session's
 /// allowed dirs is hard-denied (see `execute_one_tool_call`), never escalated
@@ -191,42 +180,6 @@ fn tools_to_openai_format(tools: &[ToolDefinition]) -> Vec<Value> {
             })
         })
         .collect()
-}
-
-/// Pure: render `decide`'s Python-repr payload (see `crate::pyrepr`) into a
-/// compact, model-facing hint block for tail-region injection, or `None` when
-/// there are no usable hints. A malformed/unexpected payload is treated as "no
-/// hints" (never a failure) — consistent with the frontend's `tryParsePyRepr`.
-fn render_decide_hints(payload: &str) -> Option<String> {
-    let parsed = crate::pyrepr::try_parse(payload)?;
-    let hints = parsed.get("hints")?.as_array()?;
-    let mut lines: Vec<String> = Vec::new();
-    for h in hints.iter().filter_map(|h| h.as_object()) {
-        if let Some(text) = h.get("text").and_then(|t| t.as_str()) {
-            let text = text.trim();
-            if !text.is_empty() {
-                lines.push(format!("- {text}"));
-            }
-        }
-    }
-    if lines.is_empty() {
-        None
-    } else {
-        Some(lines.join("\n"))
-    }
-}
-
-/// Pure: derive a reward + optional `error_type` from a tool's returned result
-/// text, mirroring the app layer's `stream.rs` predictors (`error_type` is
-/// `Some("crash")` when the tool reported an error — the only signal the
-/// sidecar pins a crash TTL on). Any other content rewards 1.0 (success); a
-/// reported error rewards -1.0 with the crash classification.
-fn reward_from_tool_result(result: &str) -> (f64, Option<&'static str>) {
-    if result.starts_with("Error") || result.starts_with("[Tool error") {
-        (-1.0, Some("crash"))
-    } else {
-        (1.0, None)
-    }
 }
 
 /// Pure: build the assistant-role message for one turn's streamed output —
@@ -324,32 +277,10 @@ const BUDGET_EXTENSION_STEPS: i32 = 20;
 /// the turn before it starts) while still bounding runaway loops.
 const MAX_STEPS_CEILING: i64 = 10_000;
 
-/// Tool names the bundled adaptive-pathway MCP server exposes (see
-/// `plugins/adaptive-pathway/src/adaptive_pathway/mcp_server.py`) — excluded
-/// from the daemon's own turn-end `record_outcome` calls (recording an outcome
-/// for `decide`/`record_outcome` itself would be nonsensical), and excluded
-/// from the tool list handed to `decide` so AP never "chooses" its own tools.
-const ADAPTIVE_PATHWAY_TOOL_NAMES: &[&str] = &[
-    "decide",
-    "record_outcome",
-    "record_annotation",
-    "get_state",
-    "list_edges",
-    "get_edge",
-    "query_attribution",
-    "list_domains",
-    "toggle_suggestions",
-    "health_check",
-    "accept_nudge",
-    "session_reflection",
-    "resolve_schism",
-    "session_close",
-];
-
-/// How many characters of the user message are passed to `decide`/`record`
-/// calls as `context`. Must match AP's own guidance that `context` be a short
-/// task summary; a full message would dominate the embedding and blur domains.
-const AP_CONTEXT_MAX_CHARS: usize = 300;
+/// Best-effort budget for embedding the current user message at turn-start
+/// recall. Bounds the latency tax of query grounding — a timeout degrades to
+/// empty-vector (weight-only, still-capped) selection rather than a failure.
+const AP_RECALL_EMBED_BUDGET_MS: u64 = 1500;
 
 /// Ceiling on how long a paused tool call waits for `/approve` before it's
 /// treated as denied. Matches `hitl::manager::MAX_PENDING_AGE` — the same
@@ -427,6 +358,10 @@ pub struct AgentLoop {
     /// See `sandbox::check_containment`'s `strict` parameter and
     /// `AgentConfig::sandbox_strict`.
     sandbox_strict: bool,
+    /// Behavioral-memory engine. `None` when disabled.
+    pathway: Option<Arc<adaptive_pathway::engine::PathwayEngine>>,
+    /// Pathway learning cadence (`learn_every_n` exchanges).
+    pathway_cfg: PathwayConfig,
 }
 
 impl AgentLoop {
@@ -446,6 +381,8 @@ impl AgentLoop {
         cache_dir: String,
         fallback_cfg: FallbackConfig,
         sandbox_strict: bool,
+        pathway: Option<Arc<adaptive_pathway::engine::PathwayEngine>>,
+        pathway_cfg: PathwayConfig,
     ) -> Self {
         Self {
             router,
@@ -462,6 +399,8 @@ impl AgentLoop {
             cache_dir,
             fallback_cfg,
             sandbox_strict,
+            pathway,
+            pathway_cfg,
         }
     }
 
@@ -551,16 +490,16 @@ impl AgentLoop {
             .ok()
             .and_then(|pid| self.router.context_length(&pid));
 
-        // Adaptive Pathway turn-start hook: call `decide` so the model sees
-        // learned tool/approach preferences *before* picking tools this turn.
+        // Adaptive Pathway turn-start hook: in-process recall so the model
+        // sees learned behavioral beliefs *before* picking tools this turn.
         // Cache-aware by construction: the returned hints are injected into
         // the tail region (right before the new user message) via
         // `build_messages`'s `ap_hints` param — never into the stable head —
-        // and a disabled/unreachable AP (or a turn where `decide` returns
-        // nothing) produces `None`, i.e. zero delta to the prompt (the
-        // byte-identity regression test in `context/builder.rs` guards this).
+        // and a disabled engine (or a turn with no beliefs) produces `None`,
+        // i.e. zero delta to the prompt (the byte-identity regression test in
+        // `context/builder.rs` guards this).
         let ap_hints = self
-            .adaptive_decide(session_id, user_message, &active_tools)
+            .pathway_recall(session_id, user_message, &active_tools)
             .await;
 
         // Pre-flight memory recall ("the detour"): best-effort FTS5 lookup
@@ -641,7 +580,6 @@ impl AgentLoop {
             messages,
             &metadata,
             &active_tools,
-            user_message,
             event_tx,
         )
         .await;
@@ -670,7 +608,6 @@ impl AgentLoop {
         mut messages: Vec<Value>,
         metadata: &Value,
         active_tools: &[ToolDefinition],
-        turn_context: &str,
         event_tx: &mpsc::UnboundedSender<SSEEvent>,
     ) {
         // `max_steps` is compared as i64, not truncated to i32, and clamped
@@ -730,7 +667,7 @@ impl AgentLoop {
 
             // Progressive budget check
             let mut in_budget_check = false;
-            let mut tools_for_turn = llm_visible_tools_openai_format(active_tools);
+            let mut tools_for_turn = tools_to_openai_format(active_tools);
 
             // Fire the budget nudge at 20/40/60 *executed steps*. The old
             // check counted messages carrying `tool_calls`/`tool_call_id`,
@@ -1018,19 +955,6 @@ impl AgentLoop {
                 .await;
 
             for (tc, result) in turn_tool_calls.iter().zip(tool_results) {
-                let tool_name = tc
-                    .function
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown");
-                // Adaptive Pathway turn-end hook: record each executed
-                // (non-AP) tool's outcome back to the sidecar with real
-                // context — the learning signal the model-driven path and the
-                // old context-free app-layer backstop both under-deliver. This
-                // runs fire-and-forget (spawned) so it never slows the agent
-                // loop, and never touches the prompt, so it can't perturb
-                // prompt-prefix caching.
-                self.spawn_record_outcome(session_id, tool_name, &result, turn_context);
                 messages.push(json!({
                     "role": "tool",
                     "content": result,
@@ -1067,57 +991,101 @@ impl AgentLoop {
             )
             .await;
         }
+
+        // Turn-end Adaptive Pathway pass (runs once per turn, fire-and-forget):
+        // every `learn_every_n` exchanges, run the LLM extraction learn pass
+        // over the session's unlearned tail. `extract_and_record` re-checks
+        // the per-session learn lock, pause state, and its forward-only
+        // watermark, so the redundant outer guards stay light. Doesn't block
+        // the turn or perturb prompt caching.
+        //
+        // This used to also synthesize a belief directly from each
+        // successful tool call ("User got positive result from {tool}:
+        // {context}") -- removed. That's a fact about a *tool*, not the
+        // user, which is exactly what the extraction prompt explicitly
+        // instructs the LLM extractor never to record; hard-coding the same
+        // violation on this separate path undermined it regardless of what
+        // the prompt said, and surfaced tool-usage trivia in `[What I know
+        // about you]` as if it were a personality trait.
+        let engine = self.pathway.clone();
+        let learn_every_n = self.pathway_cfg.learn_every_n;
+        let host_pool = pool.clone();
+        let chat = self.summarizer.clone();
+        let learn_session_id = session_id.to_string();
+        tokio::spawn(async move {
+            let Some(engine) = engine else { return };
+            if engine.is_paused(&learn_session_id).await.unwrap_or(false) {
+                return;
+            }
+            // Bump `pathway.db`'s own per-session exchange counter --
+            // `PathwayEngine::recall`'s `[Where I'm unsure]` cadence gate
+            // reads this same `conversation_state.exchange_count` field
+            // (`unsure_due`, every 12 exchanges), and nothing anywhere else
+            // in the daemon incremented it: that section could never
+            // actually fire. Reusing the returned count for the learn
+            // cadence below also replaces what used to be a separate
+            // `COUNT(*) FROM messages` query issued every single turn
+            // (against the host db, not even the pathway one) purely to
+            // recompute a number `pathway.db` already tracks incrementally.
+            let exchange_count = engine.db.bump_exchange(&learn_session_id).await.unwrap_or(0);
+            // The MAX(rowid) guard below is redundant with
+            // `extract_and_record`'s watermark, so we skip re-deriving it here.
+            if exchange_count % learn_every_n as i64 == 0 {
+                let max_rowid: i64 = sqlx::query_scalar(
+                    "SELECT MAX(rowid) FROM messages WHERE session_id = ?",
+                )
+                .bind(&learn_session_id)
+                .fetch_one(&host_pool)
+                .await
+                .unwrap_or(0);
+                if max_rowid > 0 {
+                    let _ = adaptive_pathway::learn::extract_and_record(
+                        &engine,
+                        &host_pool,
+                        chat.as_ref(),
+                        adaptive_pathway::learn::LearnRequest {
+                            session_id: &learn_session_id,
+                            through_rowid: max_rowid,
+                            given_chunk: None,
+                        },
+                        adaptive_pathway::learn::LearnTrigger::TurnEnd,
+                    )
+                    .await;
+                }
+            }
+        });
     }
 
-    /// Adaptive Pathway turn-start hook: `decide` which tools/approaches the
-    /// model should prefer this turn, formatted as a compact hint block for
-    /// tail-region injection.
-    ///
-    /// Cache-aware by design: the result is ONLY ever passed to
-    /// `ContextBuilder::build_messages`'s `ap_hints` param (injected in the
-    /// live-tail region, never the head), and any failure / no-hints / AP-not-
-    /// connected yields `None` → zero delta to the prompt, so the stable
-    /// prefix stays byte-identical turn over turn for KV-prefix caching.
-    ///
-    /// Gating: AP is considered available iff its `decide` tool is currently
-    /// registered with the MCP manager (i.e. the `adaptive-pathway` server is
-    /// connected). If AP is disabled in Settings, Kitty never registers it, so
-    /// this is a no-op with no extra config plumbing.
-    async fn adaptive_decide(
+    /// Adaptive Pathway turn-start hook: in-process recall against the
+    /// `PathwayEngine`. Replaces the old MCP-based `decide` call. Delegates
+    /// to `PathwayEngine::recall`, which selects ≤6 beliefs via DPP grounded
+    /// in the current user query (capped at `MAX_CANDIDATES` so cost stays
+    /// bounded as the store grows), filters suppressed beliefs, routes by
+    /// inferred domain, and renders the full `[What I know about you]` +
+    /// `[Worth testing this turn]` + `[Where I'm unsure]` + `[Check
+    /// yourself]` block within the token budget. Wrapped in the same
+    /// timeout budget the embed step alone used to get — now bounding the
+    /// whole call (embed + several small DB reads), since a cold/down
+    /// Ollama or a slow query must degrade to `None` (zero prompt delta)
+    /// rather than stall the turn. Returns `None` when the engine is
+    /// absent, paused, has nothing to say, or the budget is exceeded.
+    async fn pathway_recall(
         &self,
         session_id: &str,
         user_message: &str,
-        active_tools: &[ToolDefinition],
+        _active_tools: &[ToolDefinition],
     ) -> Option<String> {
-        if !active_tools.iter().any(|t| t.name == "decide") {
-            return None;
-        }
-        let available_actions: Vec<&str> = active_tools
-            .iter()
-            .map(|t| t.name.as_str())
-            .filter(|n| !ADAPTIVE_PATHWAY_TOOL_NAMES.contains(n))
-            .collect();
-        let context: String = user_message.chars().take(AP_CONTEXT_MAX_CHARS).collect();
-        let args = json!({
-            "session_id": session_id,
-            "available_actions": available_actions.join(","),
-            "context": context,
-        });
-        // Short timeout so a slow/stuck sidecar can't delay the turn's start —
-        // a hint is best-effort, never a latency tax on every message.
-        let result = tokio::time::timeout(
-            Duration::from_secs(3),
-            self.mcp.execute_tool("decide", &args, None),
+        let engine = self.pathway.as_ref()?;
+        tokio::time::timeout(
+            Duration::from_millis(AP_RECALL_EMBED_BUDGET_MS),
+            engine.recall(session_id, user_message),
         )
         .await
-        .ok()?;
-        if result.is_error {
-            return None;
-        }
-        render_decide_hints(&result.content)
+        .ok()
+        .flatten()
     }
 
-    /// Pre-flight memory recall hook, mirroring `adaptive_decide`'s
+    /// Pre-flight memory recall hook, mirroring `pathway_recall`'s
     /// cache-aware tail-injection shape. Runs `agent::memory::preflight_recall`
     /// and records the daemon-wide counters (`total`/`injected`) for the
     /// settings readout. Any failure, disabled recall, or miss returns `None`
@@ -1148,44 +1116,6 @@ impl AgentLoop {
         self.preflight
             .record(self.memory_cfg.preflight_enabled && compacted_through > 0, injected.is_some());
         injected
-    }
-
-    /// Adaptive Pathway turn-end hook: fire-and-forget `record_outcome` for one
-    /// executed tool, with the real result text as the reward signal and the
-    /// user message as context (so learning stays domain-scoped). Spawned so it
-    /// never blocks the agent loop; never touches the prompt.
-    fn spawn_record_outcome(&self, session_id: &str, tool_name: &str, result: &str, context: &str) {
-        if ADAPTIVE_PATHWAY_TOOL_NAMES.contains(&tool_name) {
-            return;
-        }
-        // Only bother when `record_outcome` is actually registered (AP
-        // connected) — mirror `adaptive_decide`'s gate without a second
-        // `list_tools` round-trip per call: presence of `decide` in the
-        // registry implies the server is up.
-        if !self.mcp.has_tool("record_outcome") {
-            return;
-        }
-        let (reward, error_type) = reward_from_tool_result(result);
-        let mcp = self.mcp.clone();
-        let session_id = session_id.to_string();
-        let tool_name = tool_name.to_string();
-        let context: String = context.chars().take(AP_CONTEXT_MAX_CHARS).collect();
-        tokio::spawn(async move {
-            let mut args = json!({
-                "session_id": session_id,
-                "action_id": tool_name,
-                "reward": reward,
-                "context": context,
-            });
-            if let Some(et) = error_type {
-                args["error_type"] = json!(et);
-            }
-            let _ = tokio::time::timeout(
-                Duration::from_secs(3),
-                mcp.execute_tool("record_outcome", &args, None),
-            )
-            .await;
-        });
     }
 
     async fn process_stream(
@@ -1542,7 +1472,7 @@ mod fnv1a64_tests {
 
 #[cfg(test)]
 mod schema_sanitizer_tests {
-    use super::{llm_visible_tools_openai_format, sanitize_boolean_subschemas, tools_to_openai_format};
+    use super::{sanitize_boolean_subschemas, tools_to_openai_format};
     use crate::models::mcp::ToolDefinition;
     use serde_json::json;
 
@@ -1552,15 +1482,6 @@ mod schema_sanitizer_tests {
             description: "d".into(),
             input_schema,
             server_id: "s".into(),
-        }
-    }
-
-    fn named_tool(name: &str) -> ToolDefinition {
-        ToolDefinition {
-            name: name.into(),
-            description: "d".into(),
-            input_schema: json!({ "type": "object", "properties": {} }),
-            server_id: "adaptive-pathway".into(),
         }
     }
 
@@ -1663,25 +1584,6 @@ mod schema_sanitizer_tests {
         );
     }
 
-    /// `decide`/`record_outcome` are called automatically by the daemon
-    /// itself (`adaptive_decide`/`spawn_record_outcome`) — they must never
-    /// also reach the model as choosable tools, or a model-issued call would
-    /// duplicate the automatic one. Every other AP tool stays visible.
-    #[test]
-    fn llm_visible_tools_hides_only_decide_and_record_outcome() {
-        let tools = vec![
-            named_tool("decide"),
-            named_tool("record_outcome"),
-            named_tool("get_state"),
-            named_tool("shell_run"),
-        ];
-        let out = llm_visible_tools_openai_format(&tools);
-        let names: Vec<&str> = out
-            .iter()
-            .map(|t| t["function"]["name"].as_str().unwrap())
-            .collect();
-        assert_eq!(names, vec!["get_state", "shell_run"]);
-    }
 }
 
 #[cfg(test)]
@@ -1720,50 +1622,6 @@ mod content_ceiling_tests {
     #[test]
     fn one_char_over_the_ceiling_trips_it() {
         assert!(exceeds_content_ceiling(MAX_TURN_CONTENT_CHARS + 1));
-    }
-}
-
-#[cfg(test)]
-mod adaptive_pathway_hook_tests {
-    use super::{reward_from_tool_result, render_decide_hints};
-
-    #[test]
-    fn decide_hints_renders_text_from_real_payload() {
-        let payload = "{'hints': [{'text': \"don't do this\", 'confidence': 0.8, 'type': 'single'}, {'text': 'use write for new files', 'confidence': 0.5, 'type': 'single'}], 'confidence': 0.6, 'novelty': 0.1, 'is_flow_state': false}";
-        let out = render_decide_hints(payload);
-        assert!(out.is_some());
-        let text = out.unwrap();
-        assert!(text.contains("don't do this"), "{text}");
-        assert!(text.contains("use write for new files"), "{text}");
-    }
-
-    #[test]
-    fn decide_hints_none_on_empty_or_malformed_payload() {
-        assert!(render_decide_hints("{'hints': []}").is_none());
-        assert!(render_decide_hints("not python").is_none());
-        assert!(render_decide_hints("").is_none());
-    }
-
-    #[test]
-    fn decide_hints_normalizes_and_drops_blank_entries() {
-        let payload = "{'hints': [{'text': '  '}, {'text': 'use edit'}], 'confidence': 0.0}";
-        let out = render_decide_hints(payload).unwrap();
-        assert!(!out.contains("  "));
-        assert!(out.contains("use edit"));
-    }
-
-    #[test]
-    fn reward_is_positive_for_plain_output_and_negative_for_error_prefixes() {
-        assert_eq!(reward_from_tool_result("file contents here"), (1.0, None));
-        assert_eq!(reward_from_tool_result(""), (1.0, None));
-        assert_eq!(
-            reward_from_tool_result("Error: file not found"),
-            (-1.0, Some("crash"))
-        );
-        assert_eq!(
-            reward_from_tool_result("[Tool error: timeout]"),
-            (-1.0, Some("crash"))
-        );
     }
 }
 

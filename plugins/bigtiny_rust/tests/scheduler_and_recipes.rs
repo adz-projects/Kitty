@@ -44,6 +44,8 @@ async fn build_engine(pool: &SqlitePool) -> Arc<RecipeEngine> {
         summarizer,
         config,
         std::env::temp_dir().to_string_lossy().into_owned(),
+        None,
+        None,
     ));
     Arc::new(RecipeEngine::new(
         pool.clone(),

@@ -158,6 +158,21 @@ fn apply_env_overrides(config: &mut BigTinyConfig) {
     {
         config.memory.artifacts_max_tokens = n;
     }
+    // `PathwayConfig::enabled` defaults to `false` and, unlike every other
+    // config section above, previously had NO env override at all. Since
+    // Kitty (like every host) never passes a `--config` YAML, that made the
+    // in-process behavioral-memory engine permanently dead in every real
+    // deployment regardless of anything the host does -- this is the actual
+    // toggle a host needs to opt in, mirroring `BIGTINY_SUMMARIZER__*`.
+    if let Ok(v) = std::env::var("BIGTINY_PATHWAY__ENABLED") {
+        config.pathway.enabled = v.eq_ignore_ascii_case("true") || v == "1";
+    }
+    if let Some(n) = std::env::var("BIGTINY_PATHWAY__LEARN_EVERY_N")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        config.pathway.learn_every_n = n;
+    }
 }
 
 #[tokio::main]

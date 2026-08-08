@@ -22,6 +22,8 @@ use crate::mcp::MCPManager;
 use crate::provider::router::ProviderRouter;
 use crate::server::events::SSEEvent;
 
+type PathwayEngine = adaptive_pathway::engine::PathwayEngine;
+
 use self::context::builder::ContextBuilder;
 use self::context::stats::SessionStats;
 use self::loop_::AgentLoop;
@@ -52,6 +54,12 @@ pub struct Agent {
     /// `BIGTINY_DATA_DIR`), threaded into every `AgentLoop` as the sandbox's
     /// always-allowed cache dir. See `sandbox::CACHE_DIR`'s doc comment.
     cache_dir: String,
+    /// Behavioral-memory engine. `None` when disabled.
+    pathway: Option<Arc<PathwayEngine>>,
+    /// Abort channel for the pathway background task. Set by `lib.rs::run()`
+    /// after spawning `adaptive_pathway::background::run()`; signalled during
+    /// `Agent::shutdown()` before cancelling in-flight turns.
+    pathway_shutdown: Option<tokio::sync::watch::Sender<bool>>,
 }
 
 impl Agent {
@@ -64,6 +72,8 @@ impl Agent {
         summarizer: Arc<SummarizerClient>,
         config: BigTinyConfig,
         cache_dir: String,
+        pathway: Option<Arc<PathwayEngine>>,
+        pathway_shutdown: Option<tokio::sync::watch::Sender<bool>>,
     ) -> Self {
         Self {
             db,
@@ -76,6 +86,8 @@ impl Agent {
             preflight: Arc::new(PreflightCounters::new()),
             config,
             cache_dir,
+            pathway,
+            pathway_shutdown,
         }
     }
 
@@ -136,6 +148,8 @@ impl Agent {
             self.cache_dir.clone(),
             self.config.fallback.clone(),
             self.config.agent.sandbox_strict,
+            self.pathway.clone(),
+            self.config.pathway.clone(),
         )
     }
 
@@ -265,6 +279,11 @@ impl Agent {
 
     /// Cancel every in-flight turn — called during daemon shutdown.
     pub async fn shutdown(&self) {
+        // Abort the pathway background task first, so it stops touching the DB
+        // before we cancel turns (which may still read pathway beliefs).
+        if let Some(tx) = &self.pathway_shutdown {
+            let _ = tx.send(true);
+        }
         let ids: Vec<String> = self.tasks.iter().map(|e| e.key().clone()).collect();
         for id in ids {
             self.cancel(&id).await;
@@ -299,6 +318,8 @@ mod tests {
             summarizer,
             config,
             std::env::temp_dir().to_string_lossy().into_owned(),
+            None,
+            None,
         ))
     }
 

@@ -7,7 +7,6 @@ pub mod mcp;
 pub mod models;
 pub mod network;
 pub mod provider;
-pub mod pyrepr;
 pub mod recipes;
 pub mod routes;
 pub mod scheduler;
@@ -90,6 +89,33 @@ pub async fn run(config: BigTinyConfig, options: RunOptions) -> Result<(), Daemo
     let db = storage::Database::connect(&options.db_path).await?;
     let pool = db.pool().clone();
 
+    // Behavioral-memory engine. `None` when disabled — the in-process
+    // `"pathway"` MCP server is then simply not constructed (configured off,
+    // not "race lost").
+    let pathway_engine: Option<Arc<adaptive_pathway::engine::PathwayEngine>> = if config
+        .pathway
+        .enabled
+    {
+        let db_path = std::path::Path::new(&options.data_dir).join(&config.pathway.db_name);
+        match adaptive_pathway::engine::PathwayEngine::open(
+            &db_path.to_string_lossy(),
+            adaptive_pathway::config::Config::default(),
+        )
+        .await
+        {
+            Ok(e) => Some(e),
+            Err(err) => {
+                tracing::warn!(
+                    "pathway engine failed to open at {}: {err}",
+                    db_path.display()
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let mcp = Arc::new(MCPManager::new(pool.clone()));
     mcp.connect_all().await; // isolated per-server failure, matches Python's connect_all
 
@@ -101,6 +127,20 @@ pub async fn run(config: BigTinyConfig, options: RunOptions) -> Result<(), Daemo
         config.hitl.clone(),
     )));
     let summarizer = Arc::new(SummarizerClient::new(config.summarizer.clone()));
+
+    // Pathway background learning loop: idle sweep + maintenance, aborted
+    // before agent shutdown. Only spawned when the engine is available.
+    let (pathway_shutdown_tx, pathway_shutdown_rx) = tokio::sync::watch::channel(false);
+    let pathway_shutdown = pathway_engine.as_ref().map(|engine| {
+        let engine = engine.clone();
+        let host_pool = pool.clone();
+        let chat = summarizer.clone();
+        tokio::spawn(async move {
+            adaptive_pathway::background::run(engine, host_pool, chat, pathway_shutdown_rx).await;
+        });
+        pathway_shutdown_tx
+    });
+
     let agent = Arc::new(Agent::new(
         pool.clone(),
         router.clone(),
@@ -109,6 +149,8 @@ pub async fn run(config: BigTinyConfig, options: RunOptions) -> Result<(), Daemo
         summarizer,
         config.clone(),
         options.data_dir.clone(),
+        pathway_engine.clone(),
+        pathway_shutdown,
     ));
 
     let recipe_engine = Arc::new(RecipeEngine::new(
@@ -134,6 +176,7 @@ pub async fn run(config: BigTinyConfig, options: RunOptions) -> Result<(), Daemo
         recipe_engine,
         scheduler: scheduler.clone(),
         config: config.clone(),
+        pathway: pathway_engine.clone(),
     });
 
     let auth = Arc::new(server::middleware::AuthConfig {

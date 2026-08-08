@@ -2,6 +2,7 @@ pub mod chat;
 pub mod health;
 pub mod mcp;
 pub mod memory;
+pub mod pathway;
 pub mod providers;
 pub mod recipes;
 pub mod schedules;
@@ -27,6 +28,8 @@ pub struct AppState {
     pub recipe_engine: Arc<RecipeEngine>,
     pub scheduler: Arc<tokio::sync::Mutex<Scheduler>>,
     pub config: BigTinyConfig,
+    /// Behavioral-memory engine. `None` when disabled.
+    pub pathway: Option<Arc<adaptive_pathway::engine::PathwayEngine>>,
 }
 
 /// Builds the full route table. Paths/methods mirror
@@ -39,6 +42,13 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/health", get(health::check_health))
         .route("/api/status", get(health::status))
         .route("/api/memory/stats", get(memory::stats))
+        .route("/api/pathway/beliefs", get(pathway::list_beliefs))
+        .route("/api/pathway/beliefs/{id}", delete(pathway::delete_belief))
+        .route("/api/pathway/stats", get(pathway::stats))
+        .route(
+            "/api/pathway/sessions/{id}/pause",
+            patch(pathway::set_paused),
+        )
         .route(
             "/api/chat/",
             get(chat::list_sessions).post(chat::create_session),

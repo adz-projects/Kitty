@@ -12,12 +12,15 @@ dependencies = [
  "futures",
  "rand 0.8.7",
  "reqwest",
+ "rmcp 2.2.0",
+ "schemars",
  "serde",
  "serde_json",
  "sqlx",
  "thiserror 2.0.19",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

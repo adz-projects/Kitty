@@ -21,6 +21,12 @@ use super::client::MCPServerClient;
 /// Connects `name`'s in-process server under `server_id`, or an error if
 /// `name` isn't a registered built-in — the in-process equivalent of a
 /// stdio config pointing at a binary that doesn't exist on disk.
+///
+/// Note: adaptive-pathway is *not* wired here — its recall/record/learn paths
+/// run in-process directly against the `PathwayEngine` (see
+/// `agent::loop_`'s `pathway_recall`/turn-end pass), and the desktop host
+/// registers `adaptive-pathway` as a stdio external binary instead. There is
+/// deliberately no in-process `pathway` MCP server.
 pub async fn connect(name: &str, server_id: String) -> Result<MCPServerClient, MCPServerError> {
     match name {
         "kitty-tools" => {

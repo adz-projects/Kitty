@@ -20,6 +20,12 @@ use sqlx::SqlitePool;
 use tower::ServiceExt;
 
 async fn test_state() -> Arc<AppState> {
+    test_state_with_pathway(None).await
+}
+
+async fn test_state_with_pathway(
+    pathway: Option<Arc<adaptive_pathway::engine::PathwayEngine>>,
+) -> Arc<AppState> {
     let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
     sqlx::query("PRAGMA foreign_keys = ON")
         .execute(&pool)
@@ -43,6 +49,8 @@ async fn test_state() -> Arc<AppState> {
         summarizer,
         config.clone(),
         std::env::temp_dir().to_string_lossy().into_owned(),
+        None,
+        None,
     ));
 
     let recipe_engine = Arc::new(RecipeEngine::new(
@@ -65,6 +73,7 @@ async fn test_state() -> Arc<AppState> {
         recipe_engine,
         scheduler,
         config,
+        pathway,
     })
 }
 
@@ -741,4 +750,165 @@ async fn mcp_server_header_value_is_encrypted_at_rest_and_never_echoed_over_http
         bigtiny_rust::crypto::decrypt(stored_headers_json["Authorization"].as_str().unwrap()),
         plaintext_key
     );
+}
+
+#[tokio::test]
+async fn pathway_routes_are_disabled_gracefully_with_no_engine() {
+    let state = test_state().await; // pathway: None
+    let app = create_router(state);
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/api/pathway/beliefs")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    // Disabled pathway responds 200 with a soft `{"error": ...}` body (not a
+    // 5xx), matching `memory::stats`'s "never fail the daemon" shape.
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    let body = body_json(resp).await;
+    assert!(body.get("error").is_some());
+}
+
+#[tokio::test]
+async fn pathway_beliefs_list_and_delete_round_trip() {
+    let engine = adaptive_pathway::engine::PathwayEngine::open_in_memory(
+        adaptive_pathway::config::Config::default(),
+    )
+    .await
+    .unwrap();
+
+    // Seed one belief directly through the engine's store.
+    let now = chrono::Utc::now();
+    engine
+        .db
+        .insert_belief(&adaptive_pathway::store::beliefs::Belief {
+            id: "b1".into(),
+            text: "The user prefers terse code comments.".into(),
+            embedding: vec![1.0, 0.0],
+            confidence: 0.7,
+            provenance: adaptive_pathway::store::beliefs::Provenance::DirectStatement,
+            layer: adaptive_pathway::store::beliefs::Layer::Context,
+            tested: true,
+            domain: None,
+            tier: "context".into(),
+            support_count: 1,
+            distinct_sessions: 1,
+            contradict_count: 0,
+            pinned: false,
+            last_confirmed_at: Some(now),
+            consolidated_at: None,
+            created_at: now,
+            updated_at: now,
+            session_id: None,
+        })
+        .await
+        .unwrap();
+
+    let state = test_state_with_pathway(Some(engine)).await;
+    let app = create_router(state);
+
+    let list_resp = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/api/pathway/beliefs")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(list_resp.status(), axum::http::StatusCode::OK);
+    let list_body = body_json(list_resp).await;
+    assert_eq!(list_body["count"], 1);
+    assert_eq!(list_body["beliefs"][0]["id"], "b1");
+
+    let delete_resp = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("DELETE")
+                .uri("/api/pathway/beliefs/b1")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(delete_resp.status(), axum::http::StatusCode::OK);
+    let delete_body = body_json(delete_resp).await;
+    assert_eq!(delete_body["dropped"], "The user prefers terse code comments.");
+
+    // A permanent ("wrong") suppression doesn't hard-delete the row, but the
+    // belief browser's list should reflect it as gone -- listing every
+    // belief regardless of suppression isn't what the browser wants, so this
+    // documents the current (pre-#7) behavior: `list_beliefs` has no
+    // suppression filter yet, matching issue #11's still-open status.
+    let relist_resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/api/pathway/beliefs")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let relist_body = body_json(relist_resp).await;
+    assert_eq!(
+        relist_body["count"], 1,
+        "list_beliefs has no suppression filter yet (issue #11) -- the suppressed belief still lists"
+    );
+}
+
+#[tokio::test]
+async fn pathway_delete_unknown_id_returns_soft_error() {
+    let engine = adaptive_pathway::engine::PathwayEngine::open_in_memory(
+        adaptive_pathway::config::Config::default(),
+    )
+    .await
+    .unwrap();
+    let state = test_state_with_pathway(Some(engine)).await;
+    let app = create_router(state);
+
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("DELETE")
+                .uri("/api/pathway/beliefs/does-not-exist")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    let body = body_json(resp).await;
+    assert!(body.get("error").is_some());
+}
+
+#[tokio::test]
+async fn pathway_set_paused_round_trip() {
+    let engine = adaptive_pathway::engine::PathwayEngine::open_in_memory(
+        adaptive_pathway::config::Config::default(),
+    )
+    .await
+    .unwrap();
+    let state = test_state_with_pathway(Some(engine)).await;
+    let app = create_router(state);
+
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("PATCH")
+                .uri("/api/pathway/sessions/s1/pause")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(json!({"paused": true}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["session_id"], "s1");
+    assert_eq!(body["paused"], true);
 }
