@@ -26,6 +26,10 @@ pub struct RecordRequest {
     pub provenance: String,
     /// Optional domain hint (e.g. "coding", "writing").
     pub domain_hint: Option<String>,
+    /// Host-injected, never model-supplied -- see `session_scope`.
+    #[serde(default)]
+    #[schemars(skip)]
+    pub session_id: Option<String>,
 }
 
 fn default_provenance() -> String {
@@ -49,6 +53,10 @@ pub struct ForgetRequest {
     /// Why it should be forgotten.
     #[serde(default)]
     pub reason: ForgetKind,
+    /// Host-injected, never model-supplied -- see `session_scope`.
+    #[serde(default)]
+    #[schemars(skip)]
+    pub session_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -64,6 +72,24 @@ impl PathwayServer {
             tool_router: Self::core_tool_router(),
             engine,
             session_id,
+        }
+    }
+
+    /// The session a tool call is acting on: the host-injected id when the
+    /// server is shared across sessions (the daemon's in-process connection,
+    /// constructed with an empty `session_id`), otherwise the one this
+    /// instance was constructed with (`devtool serve-stdio`, tests).
+    ///
+    /// An MCP connection outlives any one session and BigTiny streams
+    /// sessions concurrently, so binding a session at construction cannot be
+    /// correct for the shared case, and a shared mutable "current session"
+    /// cell would race. `agent::loop_`'s dispatch site injects the id into
+    /// the tool arguments instead, where the executing session is
+    /// unambiguous.
+    fn session_scope<'a>(&'a self, injected: Option<&'a str>) -> &'a str {
+        match injected {
+            Some(s) if !s.is_empty() => s,
+            _ => &self.session_id,
         }
     }
 
@@ -101,7 +127,8 @@ impl PathwayServer {
         if obs.is_empty() {
             return json!({"status": "ok", "message": "empty_observation"}).to_string();
         }
-        if self.engine.is_paused(&self.session_id).await.unwrap_or(false) {
+        let session_id = self.session_scope(req.session_id.as_deref());
+        if self.engine.is_paused(session_id).await.unwrap_or(false) {
             return json!({"status": "ok", "message": "memory is paused"}).to_string();
         }
         let layer = Layer::Context;
@@ -117,12 +144,16 @@ impl PathwayServer {
             &self.engine.db,
             &obs,
             &embedding,
+            &self.engine.cfg.embedding.ollama_model,
             provenance,
             layer,
             req.domain_hint.as_deref(),
             None,
             None,
-            Some(self.session_id.clone()),
+            Some(session_id.to_string()),
+            // No batch: a single model-initiated `record` has no co-occurring
+            // siblings by construction, unlike an `extract_and_record` pass.
+            None,
             chrono::Utc::now(),
         )
         .await;
@@ -148,10 +179,11 @@ impl PathwayServer {
             ForgetKind::Outdated => SuppressReason::Outdated,
             ForgetKind::Private => SuppressReason::Private,
         };
+        let session_id = self.session_scope(req.session_id.as_deref());
         let recall_ids = self
             .engine
             .db
-            .get_state(&self.session_id)
+            .get_state(session_id)
             .await
             .ok()
             .flatten()

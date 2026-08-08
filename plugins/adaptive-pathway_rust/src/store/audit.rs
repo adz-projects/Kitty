@@ -68,6 +68,30 @@ impl Db {
         self.set_setting(Self::GLOBAL_EXCHANGE_KEY, &next.to_string()).await?;
         Ok(next)
     }
+
+    // ---- embedding-model fingerprint ----
+    //
+    // Detects a configured embedding-model change across a restart. This
+    // does NOT itself touch any belief row -- it only records what the
+    // *current* model is; `store::beliefs::list_recall_candidates`'s
+    // `embedding_model = ?` filter and `background::reembed_stale_beliefs`
+    // are what actually act on a mismatch. Called once per `PathwayEngine`
+    // construction (`open`/`open_in_memory`), not per-recall -- this is a
+    // once-per-process check, not a hot-path one.
+
+    const CURRENT_EMBEDDING_MODEL_KEY: &str = "current_embedding_model";
+
+    /// Record `configured_model` as current. Returns `true` if this is a
+    /// genuine change (or first run) worth logging -- callers should not
+    /// treat `false` as an error, just "nothing to do."
+    pub async fn sync_embedding_model_fingerprint(&self, configured_model: &str) -> Result<bool> {
+        let previous = self.get_setting(Self::CURRENT_EMBEDDING_MODEL_KEY).await?;
+        if previous.as_deref() == Some(configured_model) {
+            return Ok(false);
+        }
+        self.set_setting(Self::CURRENT_EMBEDDING_MODEL_KEY, configured_model).await?;
+        Ok(true)
+    }
 }
 
 pub fn uuid_string() -> String {

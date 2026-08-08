@@ -197,6 +197,21 @@ pub async fn extract_and_record<S: StructuredChat>(
     // entries were skipped.
     let mut outcome = LearnOutcome::default();
 
+    // One batch id shared by every observation this pass produces. These came
+    // out of a single stretch of conversation and are jointly meaningful --
+    // co-occurring constraints on one problem, typically semantically distant
+    // from each other and so invisible to the cosine graph recall otherwise
+    // relies on. Recording the relation lets `select_for_turn` pull siblings
+    // in behind an anchor belief (see migration 006 and
+    // `vector::spread::diffuse_activation`'s co-occurrence adjacency).
+    //
+    // Allocated unconditionally rather than only when this pass yields more
+    // than one observation: a singleton batch simply contributes no edges
+    // (the sibling self-join requires two *distinct* belief ids sharing a
+    // batch), so there's nothing to guard against and one code path is
+    // cheaper to keep correct than two.
+    let batch_id = crate::store::audit::uuid_string();
+
     for obs in &observations {
         let statement = obs.get("statement").and_then(|s| s.as_str()).unwrap_or("").to_string();
         if statement.trim().is_empty() {
@@ -227,12 +242,14 @@ pub async fn extract_and_record<S: StructuredChat>(
             db,
             &statement,
             &embedding,
+            &engine.cfg.embedding.ollama_model,
             provenance,
             layer,
             domain.as_deref(),
             evidence.as_deref(),
             contradicts.as_deref(),
             Some(req.session_id.to_string()),
+            Some(batch_id.as_str()),
             now,
         )
         .await?;

@@ -9,8 +9,28 @@
 use super::ops;
 
 /// Build the DPP kernel M = W·S·W. Returns an n×n row-major matrix.
+/// Normalizes `embeddings` first — callers who already have a normalized
+/// copy on hand (e.g. `recall::select_beliefs_relevant`, which also needs
+/// one for spreading-activation's cosine graph) should call
+/// `build_dpp_kernel_from_normalized` directly instead, to avoid cloning +
+/// renormalizing the same embeddings twice per recall.
 pub fn build_dpp_kernel(
     embeddings: &[Vec<f32>],
+    scores: &[f64],
+    diversity_weight: f64,
+) -> Vec<Vec<f64>> {
+    let mut normed: Vec<Vec<f32>> = embeddings.to_vec();
+    for e in normed.iter_mut() {
+        ops::normalize_in_place(e);
+    }
+    build_dpp_kernel_from_normalized(&normed, scores, diversity_weight)
+}
+
+/// Same as `build_dpp_kernel`, but `normed_embeddings` must already be unit
+/// length (a zero vector stays zero, matching `ops::normalize_in_place`'s
+/// convention). Skips the normalization pass entirely.
+pub fn build_dpp_kernel_from_normalized(
+    normed_embeddings: &[Vec<f32>],
     scores: &[f64],
     diversity_weight: f64,
 ) -> Vec<Vec<f64>> {
@@ -18,17 +38,8 @@ pub fn build_dpp_kernel(
     if n == 0 {
         return vec![];
     }
-    // Normalize embeddings.
-    let mut normed: Vec<Vec<f32>> = embeddings.to_vec();
-    for e in normed.iter_mut() {
-        let nrm = ops::norm(e);
-        let nrm = if nrm < 1e-12 { 1.0 } else { nrm };
-        for x in e.iter_mut() {
-            *x /= nrm;
-        }
-    }
     // S = cosine similarity between normalized embeddings
-    let s = similarity_matrix(&normed);
+    let s = similarity_matrix(normed_embeddings);
     // M = W·S·W, W = diag(scores * diversity_weight)
     let mut kernel = vec![vec![0.0; n]; n];
     for i in 0..n {

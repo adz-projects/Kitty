@@ -25,6 +25,7 @@ fn sample_belief(dim: usize) -> Belief {
         created_at: Utc::now(),
         updated_at: Utc::now(),
         session_id: None,
+        embedding_model: adaptive_pathway::config::DEFAULT_EMBEDDING_MODEL.into(),
     }
 }
 
@@ -60,6 +61,7 @@ const EXPECTED_INDEXES: &[&str] = &[
     "idx_beliefs_domain",
     "idx_beliefs_tested",
     "idx_beliefs_session",
+    "idx_beliefs_embedding_model",
     "idx_observations_session",
     "idx_assumptions_state",
     "idx_suppressions_hash",

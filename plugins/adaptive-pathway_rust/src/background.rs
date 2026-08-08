@@ -21,6 +21,11 @@ pub const TICK_INTERVAL_SECS: u64 = 60;
 /// absence shouldn't fire dozens of constrained-decode requests at once).
 pub const IDLE_SWEEP_BATCH: usize = 3;
 
+/// Max beliefs re-embedded per tick (see `reembed_stale_beliefs`) -- each is
+/// a real `/api/embeddings` round-trip to Ollama, so this is bounded the
+/// same way `IDLE_SWEEP_BATCH` bounds extraction calls.
+pub const EMBEDDING_MIGRATION_BATCH: i64 = 25;
+
 /// Run the background loop until `shutdown_rx` fires. Errors are logged, not
 /// fatal -- each tick is best-effort.
 pub async fn run<S: StructuredChat>(
@@ -83,11 +88,50 @@ pub async fn idle_sweep<S: StructuredChat>(
             .await;
         }
         let _ = crate::consolidate::consolidate_session(&engine.db, session_id).await;
+        // The session is being closed out -- drop its trajectory-embedding
+        // state (see `PathwayEngine::forget_trajectory`) so that map stays
+        // bounded by concurrently-active sessions, not every session ever
+        // seen.
+        engine.forget_trajectory(session_id);
     }
     // Periodic maintenance (cheap; runs each sweep).
     let _ = crate::maintenance::run_maintenance(&engine.db).await;
     // Bound the per-session learn-lock map's growth (see
     // `PathwayEngine::prune_idle_learn_locks`) -- cheap, safe every tick.
     engine.prune_idle_learn_locks();
+    // Batch re-embed any beliefs still tagged with a stale embedding model
+    // (see `migrations/005_belief_embedding_model.sql`). Best-effort and
+    // logged-not-fatal like everything else in this sweep.
+    if let Err(e) = reembed_stale_beliefs(engine).await {
+        tracing::warn!("embedding-model re-embed pass failed: {e}");
+    }
+    Ok(())
+}
+
+/// Re-embed up to `EMBEDDING_MIGRATION_BATCH` beliefs whose `embedding_model`
+/// doesn't match the currently configured model (a belief row's own column
+/// value *is* the re-embedding queue -- see
+/// `store::beliefs::list_stale_embedding_beliefs`). Skips the whole pass if
+/// Ollama isn't reachable this tick, rather than letting individual
+/// `embed()` calls silently fall back to the lexical hashing embedder and
+/// get tagged as `current_model` anyway -- that would mix two incompatible
+/// embedding spaces under one label, exactly the class of bug this
+/// migration exists to prevent. Deliberately does not touch `updated_at`/
+/// `last_confirmed_at` (see `Db::update_embedding`'s doc comment).
+pub async fn reembed_stale_beliefs(engine: &PathwayEngine) -> Result<()> {
+    let current_model = engine.cfg.embedding.ollama_model.clone();
+    let stale = engine.db.list_stale_embedding_beliefs(&current_model, EMBEDDING_MIGRATION_BATCH).await?;
+    if stale.is_empty() {
+        return Ok(());
+    }
+    if !engine.embed.probe_ollama().await {
+        return Ok(());
+    }
+    for belief in &stale {
+        let embedding = engine.embed.embed(&belief.text).await;
+        if let Err(e) = engine.db.update_embedding(&belief.id, &embedding, &current_model).await {
+            tracing::warn!(belief_id = %belief.id, "re-embedding failed to persist: {e}");
+        }
+    }
     Ok(())
 }

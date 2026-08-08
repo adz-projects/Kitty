@@ -73,7 +73,7 @@ async fn recall(engine: &PathwayEngine, domain: Option<&str>) {
             return;
         }
     };
-    let mut sel = select_beliefs(&all, domain);
+    let mut sel = select_beliefs(&all, domain, &engine.cfg);
     let block = render_knows(&mut sel);
     println!("{}", if block.is_empty() { "(no beliefs)" } else { &block });
 }

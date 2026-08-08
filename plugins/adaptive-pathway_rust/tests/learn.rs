@@ -207,6 +207,7 @@ async fn promotion_each_gate_blocks_independently() {
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
         session_id: None,
+        embedding_model: Config::default().embedding.ollama_model,
     };
 
     // pass when all four gates hold

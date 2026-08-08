@@ -145,6 +145,7 @@ mod tests {
             created_at: now - chrono::Duration::days(confirmed_days_ago),
             updated_at: now - chrono::Duration::days(confirmed_days_ago),
             session_id: None,
+            embedding_model: crate::config::DEFAULT_EMBEDDING_MODEL.into(),
         }
     }
 

@@ -82,6 +82,28 @@ pub fn normalize_in_place(a: &mut [f32]) {
     }
 }
 
+/// Momentum-extrapolate `current` forward along its trajectory from
+/// `previous`: `current + momentum·(current − previous)`, renormalized.
+/// The cheap, non-ML stand-in for a trained predictive (JEPA-style) recall
+/// model — see `config::TrajectoryConfig`'s doc comment. Falls back to
+/// returning `current` unchanged (well-formed, since it's already whatever
+/// shape the caller gave it) on a length mismatch between `current` and
+/// `previous` — e.g. a session whose embedding model changed mid-flight —
+/// rather than computing a meaningless cross-space delta.
+pub fn extrapolate(current: &[f32], previous: &[f32], momentum: f64) -> Vec<f32> {
+    if current.len() != previous.len() {
+        return current.to_vec();
+    }
+    let momentum = momentum as f32;
+    let mut predicted: Vec<f32> = current
+        .iter()
+        .zip(previous.iter())
+        .map(|(&c, &p)| c + momentum * (c - p))
+        .collect();
+    normalize_in_place(&mut predicted);
+    predicted
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -105,6 +127,43 @@ mod tests {
         assert_eq!(cosine(&[0.0, 0.0], &[1.0, 0.0]), 0.0);
         assert!((cosine(&[1.0, 0.0], &[1.0, 0.0]) - 1.0).abs() < 1e-6);
         assert!((cosine(&[1.0, 0.0], &[-1.0, 0.0]).abs() - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn extrapolate_continues_the_trajectory_past_current() {
+        // Moving from [1,0] to [0,1] (a 90-degree turn); extrapolating with
+        // momentum should land further along that same turn than `current`
+        // alone, i.e. cosine(current, predicted) < cosine(current, current)
+        // and the predicted direction leans away from `previous`.
+        let previous = vec![1.0_f32, 0.0];
+        let current = vec![0.0_f32, 1.0];
+        let predicted = extrapolate(&current, &previous, 0.5);
+        // predicted = current + 0.5*(current-previous) = [-0.5, 1.5], normalized
+        let expected_dir = {
+            let mut v = vec![-0.5_f32, 1.5];
+            normalize_in_place(&mut v);
+            v
+        };
+        for (p, e) in predicted.iter().zip(expected_dir.iter()) {
+            assert!((p - e).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn extrapolate_zero_momentum_is_current_normalized() {
+        let previous = vec![1.0_f32, 0.0];
+        let current = vec![0.6_f32, 0.8]; // already unit length
+        let predicted = extrapolate(&current, &previous, 0.0);
+        for (p, c) in predicted.iter().zip(current.iter()) {
+            assert!((p - c).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn extrapolate_mismatched_dims_falls_back_to_current() {
+        let previous = vec![1.0_f32, 0.0, 0.0];
+        let current = vec![0.0_f32, 1.0];
+        assert_eq!(extrapolate(&current, &previous, 0.5), current);
     }
 
     #[test]

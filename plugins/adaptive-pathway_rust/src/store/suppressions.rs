@@ -395,6 +395,7 @@ mod tests {
             created_at: now,
             updated_at: now,
             session_id: None,
+            embedding_model: crate::config::DEFAULT_EMBEDDING_MODEL.into(),
         })
         .await
         .unwrap();
@@ -431,6 +432,7 @@ mod tests {
             created_at: now,
             updated_at: now,
             session_id: None,
+            embedding_model: crate::config::DEFAULT_EMBEDDING_MODEL.into(),
         })
         .await
         .unwrap();

@@ -30,18 +30,20 @@ pub async fn route_observation(
     db: &Db,
     statement: &str,
     embedding: &[f32],
+    embedding_model: &str,
     provenance: Provenance,
     layer: Layer,
     domain: Option<&str>,
     evidence: Option<&str>,
     contradicts: Option<&str>,
     session_id: Option<String>,
+    batch_id: Option<&str>,
     now: DateTime<Utc>,
 ) -> Result<()> {
     db.run_in_transaction(move || {
         route_observation_inner(
-            db, statement, embedding, provenance, layer, domain, evidence, contradicts,
-            session_id, now,
+            db, statement, embedding, embedding_model, provenance, layer, domain, evidence,
+            contradicts, session_id, batch_id, now,
         )
     })
     .await
@@ -52,12 +54,14 @@ async fn route_observation_inner(
     db: &Db,
     statement: &str,
     embedding: &[f32],
+    embedding_model: &str,
     provenance: Provenance,
     layer: Layer,
     domain: Option<&str>,
     evidence: Option<&str>,
     contradicts: Option<&str>,
     session_id: Option<String>,
+    batch_id: Option<&str>,
     now: DateTime<Utc>,
 ) -> Result<()> {
     // Guard against relearning a forgotten/suppressed statement (text-hash).
@@ -71,11 +75,18 @@ async fn route_observation_inner(
     // never pull in another session's still-fast-decaying conversational
     // memory, so that search is narrowed to this session specifically.
     // Context/identity beliefs are cross-session by design and use the
-    // unscoped list.
-    let candidates = match (layer, session_id.as_deref()) {
+    // unscoped list. Also excludes any candidate still tagged with a stale
+    // `embedding_model` -- `embedding` was just computed under
+    // `embedding_model` (the current one), so comparing it against a
+    // stale-space candidate via cosine would be the same meaningless
+    // cross-space comparison `list_recall_candidates` guards against.
+    let candidates: Vec<_> = match (layer, session_id.as_deref()) {
         (Layer::Conversation, Some(sid)) => db.list_conversation_beliefs_for_session(sid).await?,
         _ => db.list_beliefs(Some(layer)).await?,
-    };
+    }
+    .into_iter()
+    .filter(|b| b.embedding_model == embedding_model)
+    .collect();
     let mut best: Option<(String, f64)> = None;
     for b in candidates.iter() {
         let cos = crate::vector::ops::cosine(&b.embedding, embedding);
@@ -90,7 +101,7 @@ async fn route_observation_inner(
     if let Some((target_id, _cos)) = &best {
         let target = db.get_belief(target_id.as_str()).await?.unwrap_or_else(|| {
             // shouldn't happen; create a fallback belief
-            fallback_belief(&id, statement, embedding, provenance, layer, domain, session_id.as_deref(), now)
+            fallback_belief(&id, statement, embedding, embedding_model, provenance, layer, domain, session_id.as_deref(), now)
         });
         // Merge: bump support/sessions, recompute confidence, take max
         // provenance ranking, re-parent this observation onto target.
@@ -133,6 +144,7 @@ async fn route_observation_inner(
             evidence: evidence.map(|s| s.to_string()),
             contradicts: contradicts.map(|s| s.to_string()),
             created_at: now,
+            batch_id: batch_id.map(|s| s.to_string()),
         })
         .await?;
 
@@ -152,7 +164,7 @@ async fn route_observation_inner(
         }
     } else {
         // Create a new belief.
-        let b = fallback_belief(&id, statement, embedding, provenance, layer, domain, session_id.as_deref(), now);
+        let b = fallback_belief(&id, statement, embedding, embedding_model, provenance, layer, domain, session_id.as_deref(), now);
         db.insert_belief(&b).await?;
         // A brand-new belief's initial confidence never clears the 0.55
         // flag threshold while untested (the highest untested initial
@@ -173,6 +185,7 @@ async fn route_observation_inner(
             evidence: evidence.map(|s| s.to_string()),
             contradicts: contradicts.map(|s| s.to_string()),
             created_at: now,
+            batch_id: batch_id.map(|s| s.to_string()),
         })
         .await?;
     }
@@ -213,6 +226,7 @@ fn fallback_belief(
     id: &str,
     statement: &str,
     embedding: &[f32],
+    embedding_model: &str,
     provenance: Provenance,
     layer: Layer,
     domain: Option<&str>,
@@ -223,6 +237,7 @@ fn fallback_belief(
         id: id.to_string(),
         text: statement.to_string(),
         embedding: embedding.to_vec(),
+        embedding_model: embedding_model.to_string(),
         confidence: belief::provenance::initial_confidence(provenance),
         provenance,
         layer,

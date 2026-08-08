@@ -18,7 +18,7 @@ pub struct RecallBlock {
 }
 
 /// A single selected belief with its computed effective weight, used for the
-/// `[What I know about you]` block (≤6 beliefs, DPP-selected).
+/// `[Working assumptions about you]` block (≤6 beliefs, DPP-selected).
 #[derive(Debug, Clone)]
 pub struct SelectedBelief {
     pub belief: Belief,

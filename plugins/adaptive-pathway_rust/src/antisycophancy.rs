@@ -38,13 +38,19 @@ pub fn lexical_correction(text: &str) -> bool {
 /// The `[Check yourself]` curiosity nudge, with a 14-day dismissal cooldown.
 /// Returns None when the cooldown hasn't elapsed or the platform isn't
 /// detected.
+///
+/// Returns the *bare* sentence -- the `[Check yourself]` label is applied by
+/// `render_block`, same as the other three sections. It used to be baked in
+/// here, which made this the one section `render_block` pushed raw and made
+/// it unusable in `recall::render_reflection_block`, where a bracketed label
+/// inside a `<think>` turn would read as injected scaffolding.
 pub fn check_yourself(had_plateau: bool, last_dismissed_days_ago: i64) -> Option<String> {
     if !had_plateau || last_dismissed_days_ago < 14 {
         return None;
     }
     Some(
-        "[Check yourself]: it's been a while since I challenged an assumption of mine. \
-         Is there anything I've been taking for granted about you that isn't true?"
+        "It's been a while since I challenged an assumption of mine. Is there anything \
+         I've been taking for granted about this person that isn't true?"
             .to_string(),
     )
 }
@@ -65,7 +71,7 @@ pub fn render_block(
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
     if !knows.is_empty() {
-        parts.push(format!("[What I know about you]\n{knows}"));
+        parts.push(format!("[Working assumptions about you]\n{knows}"));
     }
     if let Some(w) = worth_testing {
         if !w.is_empty() {
@@ -78,7 +84,9 @@ pub fn render_block(
         }
     }
     if let Some(c) = check {
-        parts.push(c);
+        if !c.is_empty() {
+            parts.push(format!("[Check yourself]\n{c}"));
+        }
     }
     if parts.is_empty() {
         return String::new();

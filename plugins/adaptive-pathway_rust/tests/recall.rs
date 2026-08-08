@@ -34,6 +34,7 @@ fn belief(id: &str, text: &str, conf: f64, tested: bool, layer: Layer, domain: O
         created_at: Utc::now(),
         updated_at: Utc::now(),
         session_id: None,
+        embedding_model: Config::default().embedding.ollama_model,
     }
 }
 
@@ -88,7 +89,7 @@ async fn seed_thirty_selects_under_cap() {
     let all = engine.db.list_beliefs(None).await.unwrap();
     assert_eq!(all.len(), 30);
 
-    let sel = select_beliefs(&all, Some("coding"));
+    let sel = select_beliefs(&all, Some("coding"), &Config::default());
     assert!(sel.len() <= recall_cap());
     assert!(!sel.is_empty());
 }
@@ -99,7 +100,7 @@ async fn recall_respects_max_beliefs() {
     seed(&engine, 384).await;
     let all = engine.db.list_beliefs(None).await.unwrap();
     for _ in 0..10 {
-        let sel = select_beliefs(&all, Some("coding"));
+        let sel = select_beliefs(&all, Some("coding"), &Config::default());
         assert!(sel.len() <= 6);
     }
 }
@@ -111,7 +112,7 @@ async fn whole_block_render_is_byte_stable() {
     let all = engine.db.list_beliefs(None).await.unwrap();
 
     let render = |all: &[Belief], domain: &str| -> String {
-        let mut sel = select_beliefs(all, Some(domain));
+        let mut sel = select_beliefs(all, Some(domain), &Config::default());
         render_knows(&mut sel)
     };
 

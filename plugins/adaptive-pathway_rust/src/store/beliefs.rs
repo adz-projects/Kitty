@@ -110,6 +110,11 @@ pub struct Belief {
     /// `Identity` beliefs, which are cross-session by design -- consolidation
     /// clears this when a belief is promoted out of the conversation layer.
     pub session_id: Option<String>,
+    /// The embedding model that produced `embedding`. Empty string is the
+    /// "needs re-embedding" sentinel (pre-migration rows, or a genuine
+    /// mismatch against the currently configured model) -- see
+    /// `list_recall_candidates`'s filter and `Db::update_embedding`.
+    pub embedding_model: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -138,8 +143,9 @@ impl Db {
         sqlx::query(
             "INSERT INTO beliefs (id, text, embedding, confidence, provenance, layer, tested, \
              domain, tier, support_count, distinct_sessions, contradict_count, pinned, \
-             last_confirmed_at, consolidated_at, created_at, updated_at, session_id) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             last_confirmed_at, consolidated_at, created_at, updated_at, session_id, \
+             embedding_model) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&b.id)
         .bind(&b.text)
@@ -159,9 +165,53 @@ impl Db {
         .bind(b.created_at)
         .bind(b.updated_at)
         .bind(&b.session_id)
+        .bind(&b.embedding_model)
         .execute(self.pool())
         .await?;
         Ok(())
+    }
+
+    /// Overwrite a belief's embedding after a re-embedding pass (embedding-
+    /// model change). Deliberately does **not** touch `updated_at` or
+    /// `last_confirmed_at` -- re-embedding isn't a reconfirmation event, and
+    /// touching either would corrupt `effective_weight`'s recency-decay math
+    /// the same way a stray `updated_at` write on an unrelated field once
+    /// did elsewhere in this crate. Only `embedding`/`embedding_model` move.
+    pub async fn update_embedding(&self, id: &str, embedding: &[f32], model: &str) -> Result<()> {
+        sqlx::query("UPDATE beliefs SET embedding = ?, embedding_model = ? WHERE id = ?")
+            .bind(encode_embedding(embedding))
+            .bind(model)
+            .bind(id)
+            .execute(self.pool())
+            .await?;
+        Ok(())
+    }
+
+    /// Up to `limit` beliefs whose `embedding_model` doesn't match
+    /// `current_model` -- the re-embedding queue a belief row's own column
+    /// value *is*, no separate "migration pending" flag needed. Ordered by
+    /// `updated_at` ascending (oldest-touched first) purely for deterministic
+    /// batch ordering across ticks, not because recency matters here.
+    pub async fn list_stale_embedding_beliefs(&self, current_model: &str, limit: i64) -> Result<Vec<Belief>> {
+        let rows = sqlx::query_as::<_, BeliefRow>(
+            "SELECT * FROM beliefs WHERE embedding_model != ? ORDER BY updated_at ASC LIMIT ?",
+        )
+        .bind(current_model)
+        .bind(limit)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows.into_iter().map(map_belief).collect())
+    }
+
+    /// Count of beliefs still awaiting re-embedding against `current_model`
+    /// -- surfaced through `/api/pathway/stats` for the Settings belief-
+    /// health view.
+    pub async fn count_stale_embedding_beliefs(&self, current_model: &str) -> Result<i64> {
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM beliefs WHERE embedding_model != ?")
+            .bind(current_model)
+            .fetch_one(self.pool())
+            .await?;
+        Ok(count)
     }
 
     /// Apply a partial update. Most fields use `COALESCE(?, col)` ("`None`
@@ -269,13 +319,25 @@ impl Db {
     /// everything" for "read the most recently touched/reinforced subset" --
     /// recency is already how `effective_weight` biases selection, so this
     /// is consistent with, not a departure from, the existing ranking.
-    pub async fn list_recall_candidates(&self, session_id: &str) -> Result<Vec<Belief>> {
+    /// `current_model` scopes candidates to beliefs already embedded under
+    /// the currently configured model -- a belief mid-re-embedding (its
+    /// `embedding_model` still tags the old model) is excluded rather than
+    /// having its stale-space embedding compared against a fresh query
+    /// embedding via cosine, which would be a meaningless comparison. See
+    /// `migrations/005_belief_embedding_model.sql` and
+    /// `background::reembed_stale_beliefs`. False negatives here (a belief
+    /// briefly unavailable for recall while its re-embed is pending) are
+    /// fine, matching this crate's existing "never fabricate, prefer a gap"
+    /// stance elsewhere (e.g. `domains::infer_query_domain`).
+    pub async fn list_recall_candidates(&self, session_id: &str, current_model: &str) -> Result<Vec<Belief>> {
         const RECALL_CANDIDATE_ROW_LIMIT: i64 = 500;
         let rows = sqlx::query_as::<_, BeliefRow>(
-            "SELECT * FROM beliefs WHERE layer != 'conversation' OR session_id = ? \
+            "SELECT * FROM beliefs WHERE (layer != 'conversation' OR session_id = ?) \
+             AND embedding_model = ? \
              ORDER BY updated_at DESC LIMIT ?",
         )
         .bind(session_id)
+        .bind(current_model)
         .bind(RECALL_CANDIDATE_ROW_LIMIT)
         .fetch_all(self.pool())
         .await?;
@@ -340,6 +402,7 @@ struct BeliefRow {
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
     session_id: Option<String>,
+    embedding_model: String,
 }
 
 impl sqlx::FromRow<'_, sqlx::sqlite::SqliteRow> for BeliefRow {
@@ -364,6 +427,7 @@ impl sqlx::FromRow<'_, sqlx::sqlite::SqliteRow> for BeliefRow {
             created_at: row.try_get("created_at")?,
             updated_at: row.try_get("updated_at")?,
             session_id: row.try_get("session_id")?,
+            embedding_model: row.try_get("embedding_model")?,
         })
     }
 }
@@ -394,6 +458,7 @@ fn map_belief(r: BeliefRow) -> Belief {
         created_at: r.created_at,
         updated_at: r.updated_at,
         session_id: r.session_id,
+        embedding_model: r.embedding_model,
     }
 }
 
@@ -421,6 +486,7 @@ mod tests {
             created_at: updated_at,
             updated_at,
             session_id: None,
+            embedding_model: crate::config::DEFAULT_EMBEDDING_MODEL.into(),
         }
     }
 
@@ -435,7 +501,10 @@ mod tests {
             db.insert_belief(&b).await.unwrap();
         }
 
-        let candidates = db.list_recall_candidates("s1").await.unwrap();
+        let candidates = db
+            .list_recall_candidates("s1", crate::config::DEFAULT_EMBEDDING_MODEL)
+            .await
+            .unwrap();
         assert_eq!(candidates.len(), 500, "must cap at the row limit, not return every belief");
         // Newest-first: the 10 oldest (b0..b9) must have been dropped.
         let ids: std::collections::HashSet<&str> = candidates.iter().map(|b| b.id.as_str()).collect();
