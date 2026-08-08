@@ -111,6 +111,7 @@ fn generate_secret() -> String {
 /// Spawn the BigTiny daemon and wait (up to ~15s — a Python interpreter +
 /// FastAPI import chain is slower to first-bind than a native binary) for its
 /// health endpoint to answer.
+#[allow(clippy::too_many_arguments)]
 pub async fn spawn(
     command: &str,
     args: &[String],
@@ -118,6 +119,9 @@ pub async fn spawn(
     summarizer: &crate::config::SummarizerSettings,
     token_management: &crate::config::TokenManagementSettings,
     memory: &crate::config::MemorySettings,
+    pathway_enabled: bool,
+    pathway_embedding_model: &str,
+    ollama_base_url: &str,
 ) -> Result<DaemonHandle, String> {
     kill_stale_orphan();
 
@@ -171,6 +175,23 @@ pub async fn spawn(
             "BIGTINY_TOKEN_MANAGEMENT__MESSAGE_MASK_TAIL_LINES",
             token_management.message_mask_tail_lines.to_string(),
         )
+        // `PathwayConfig::enabled` defaults to `false` inside BigTiny and
+        // (unlike every other config section) previously had no env
+        // override at all — passing a `--config` YAML is the only other way
+        // to reach it, which Kitty never does. Without this, the in-process
+        // behavioral-memory engine can never actually turn on, regardless
+        // of anything else. `AP_EMBED_OLLAMA_MODEL`/`AP_EMBED_OLLAMA_URL`
+        // are the same two env vars the old sidecar process read (see the
+        // now-retired `EmbeddingProvider` in the Python plugin) — the
+        // in-process engine's `EmbeddingProvider::new` still reads them from
+        // its own process env, and since it's linked into BigTiny now,
+        // "its own process env" means BigTiny's.
+        .env(
+            "BIGTINY_PATHWAY__ENABLED",
+            if pathway_enabled { "true" } else { "false" },
+        )
+        .env("AP_EMBED_OLLAMA_MODEL", pathway_embedding_model)
+        .env("AP_EMBED_OLLAMA_URL", ollama_base_url)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     // Relay the bm25 gate only when actually set — leaving the env absent

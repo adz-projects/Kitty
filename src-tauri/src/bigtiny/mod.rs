@@ -11,6 +11,7 @@
 
 pub mod client;
 pub mod mcp;
+pub mod pathway;
 pub mod providers;
 pub mod sessions;
 pub mod stream;

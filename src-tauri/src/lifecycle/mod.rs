@@ -134,7 +134,18 @@ pub fn start_stack(app: &AppHandle) {
         // Spawn the BigTiny daemon. No provider env vars — providers are
         // registered at runtime over REST (see
         // `bigtiny::providers::sync_active_provider` right after spawn).
-        let (command, args, dir, warm, summarizer, token_management, memory) = {
+        let (
+            command,
+            args,
+            dir,
+            warm,
+            summarizer,
+            token_management,
+            memory,
+            pathway_enabled,
+            pathway_embedding_model,
+            ollama_base_url,
+        ) = {
             let state = app.state::<AppState>();
             let cfg = state.config.lock().unwrap();
             (
@@ -145,6 +156,9 @@ pub fn start_stack(app: &AppHandle) {
                 cfg.summarizer.clone(),
                 cfg.token_management.clone(),
                 cfg.memory.clone(),
+                cfg.adaptive_pathway_enabled,
+                cfg.adaptive_pathway_embedding_model.clone(),
+                cfg.ollama_base_url.clone(),
             )
         };
 
@@ -170,6 +184,9 @@ pub fn start_stack(app: &AppHandle) {
             &summarizer,
             &token_management,
             &memory,
+            pathway_enabled,
+            &pathway_embedding_model,
+            &ollama_base_url,
         );
         let warm_fut = async {
             if let Some((base, model)) = warm {

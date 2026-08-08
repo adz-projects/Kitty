@@ -198,6 +198,15 @@ const RETIRED_BUILTINS: &[&str] = &[
     "visualizations",
     "kitty-docs-web",
     "wasm-math-mcp",
+    // The old stdio `adaptive-pathway` row (a proxy to the now-retired
+    // Python sidecar) — superseded by the in-process `"pathway"` server
+    // registered below. `decide_sync_action` doesn't diff `transport`, so a
+    // PATCH-in-place from the old spec would silently leave `transport:
+    // "stdio"` on a row whose `command` no longer names a real executable;
+    // retiring the name and creating fresh under `"pathway"` sidesteps that
+    // entirely rather than relying on the transport-diff fix below for a
+    // migration it wasn't really designed for.
+    "adaptive-pathway",
 ];
 
 async fn remove_retired_builtins(client: &BigTinyClient) {
@@ -226,11 +235,7 @@ pub async fn ensure_builtin_servers(app: &AppHandle) {
         visualizations_enabled,
         kitty_tools_enabled,
         kitty_web_enabled,
-        ap_enabled,
-        ap_db_path,
-        ap_embedding_model,
-        ollama_base,
-        ap_port,
+        pathway_enabled,
     ) = {
         let state = app.state::<AppState>();
         let cfg = state.config.lock().unwrap();
@@ -241,33 +246,36 @@ pub async fn ensure_builtin_servers(app: &AppHandle) {
             cfg.kitty_tools_enabled,
             cfg.kitty_web_enabled,
             cfg.adaptive_pathway_enabled,
-            cfg.adaptive_pathway_db_path.clone(),
-            cfg.adaptive_pathway_embedding_model.clone(),
-            cfg.ollama_base_url.clone(),
-            cfg.adaptive_pathway_port,
         )
     };
 
-    let ap_cmd = crate::config::bundled_plugin_path("adaptive-pathway-mcp.exe")
-        .unwrap_or_else(|| "adaptive-pathway-mcp".to_string());
-    let mut ap_env = HashMap::new();
-    ap_env.insert("AP_EMBED_OLLAMA_MODEL".to_string(), ap_embedding_model);
-    ap_env.insert("AP_EMBED_OLLAMA_URL".to_string(), ollama_base);
-    // The MCP server is a stateless HTTP proxy to the sidecar; it must know
-    // which port the sidecar (spawned separately by `lifecycle`) is bound to.
-    ap_env.insert("AP_SIDECAR_PORT".to_string(), ap_port.to_string());
+    // The behavioral-memory engine is linked directly into the BigTiny
+    // daemon (`plugins/adaptive-pathway_rust`), not spawned as a separate
+    // process — `command` here is a *logical name* `builtin::connect`
+    // switches on (`plugins/bigtiny_rust/src/mcp/builtin.rs`), not an
+    // executable path, and `transport: "in_process"` is what tells
+    // `mcp::manager` to route through that in-process constructor
+    // (`tokio::io::duplex`) instead of spawning a stdio child. No env map:
+    // the engine reads `AP_EMBED_OLLAMA_MODEL`/`AP_EMBED_OLLAMA_URL` from
+    // BigTiny's own process environment (set at daemon spawn time in
+    // `lifecycle::bigtiny_proc::spawn`), since there's no separate child
+    // process to hand a per-server env to anymore. `enabled` here only
+    // controls whether the model can *call* `record`/`forget` as tools —
+    // recall and the automatic turn-end/compaction learning passes run
+    // regardless, gated instead by `BIGTINY_PATHWAY__ENABLED` (also set at
+    // daemon spawn, from the same `adaptive_pathway_enabled` config field).
     upsert_builtin(
         &client,
-        "adaptive-pathway",
+        "pathway",
         &McpServerSpec {
-            name: "adaptive-pathway".to_string(),
-            transport: "stdio".to_string(),
-            command: Some(ap_cmd),
-            args: vec!["--db-path".to_string(), ap_db_path],
+            name: "pathway".to_string(),
+            transport: "in_process".to_string(),
+            command: Some("pathway".to_string()),
+            args: vec![],
             url: None,
-            env: ap_env,
+            env: HashMap::new(),
             headers: HashMap::new(),
-            enabled: ap_enabled,
+            enabled: pathway_enabled,
         },
     )
     .await;
@@ -462,7 +470,18 @@ fn decide_sync_action(existing: &[McpServer], name: &str, desired: &McpServerSpe
     let changed = row.command.as_deref() != desired.command.as_deref()
         || row.args != desired.args
         || row.env != desired.env
-        || row.enabled != desired.enabled;
+        || row.enabled != desired.enabled
+        // A row's transport (stdio vs. in_process vs. sse/streamable_http)
+        // must be diffed too — previously it wasn't, so a spec whose
+        // `command` also happened to change (e.g. a migration re-pointing
+        // the same name at a new transport) would PATCH the command/args/
+        // env/enabled fields while silently leaving the *old* transport in
+        // place, since the patch below never set it either. `RETIRED_BUILTINS`
+        // is the actual migration path for the one place this mattered
+        // (the old `adaptive-pathway` stdio row), but a builtin ever
+        // changing transport again without a name change should self-heal
+        // here rather than repeat that gap.
+        || row.transport != desired.transport;
 
     if changed {
         SyncAction::Patch {
@@ -472,6 +491,7 @@ fn decide_sync_action(existing: &[McpServer], name: &str, desired: &McpServerSpe
                 args: Some(desired.args.clone()),
                 env: Some(desired.env.clone()),
                 enabled: Some(desired.enabled),
+                transport: Some(desired.transport.clone()),
                 ..Default::default()
             }),
         }
@@ -638,6 +658,35 @@ mod tests {
             decide_sync_action(&existing, "brave-mcp-search", &desired),
             SyncAction::Noop
         );
+    }
+
+    #[test]
+    fn patches_when_only_transport_differs() {
+        // A row that matches `desired` in command/args/env/enabled but was
+        // registered under a different transport (e.g. a pre-existing
+        // `adaptive-pathway` row migrated to a differently-shaped spec)
+        // must still be diffed as changed -- and the patch must actually
+        // carry the new transport, not just trigger without applying it.
+        // `row()` defaults to `transport: "stdio"`, which is exactly the
+        // old shape being migrated away from here.
+        let existing_row = row("pathway", "pathway", true, "connected");
+        let desired = McpServerSpec {
+            name: "pathway".to_string(),
+            transport: "in_process".to_string(),
+            command: Some("pathway".to_string()),
+            args: vec![],
+            url: None,
+            env: HashMap::new(),
+            headers: HashMap::new(),
+            enabled: true,
+        };
+        match decide_sync_action(&[existing_row], "pathway", &desired) {
+            SyncAction::Patch { row_id, patch } => {
+                assert_eq!(row_id, "pathway-id");
+                assert_eq!(patch.transport.as_deref(), Some("in_process"));
+            }
+            other => panic!("expected Patch, got {other:?}"),
+        }
     }
 
     #[test]
