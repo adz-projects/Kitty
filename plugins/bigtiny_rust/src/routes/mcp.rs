@@ -28,9 +28,20 @@ fn err_response(status: StatusCode, message: impl Into<String>) -> Response {
 /// power-user editing the raw config elsewhere could put a credential in
 /// any header name. Non-string values pass through unchanged (not a
 /// documented shape, but not this function's job to reject).
+///
+/// `headers` goes through the same double-encode unwrap as `args`/`env`
+/// (see `normalize_json_field`) first: a client that sends an
+/// already-stringified JSON object here previously fell straight into the
+/// `as_object()` `None` branch below and got stored as a JSON-string-of-a-
+/// JSON-string, silently dropping the header map (including any auth
+/// header) at connect time.
 fn encrypt_headers(headers: &Value) -> String {
-    let Some(obj) = headers.as_object() else {
-        return headers.to_string();
+    let normalized: Value = match headers {
+        Value::String(s) => serde_json::from_str::<Value>(s).unwrap_or_else(|_| headers.clone()),
+        other => other.clone(),
+    };
+    let Some(obj) = normalized.as_object() else {
+        return normalized.to_string();
     };
     let encrypted: serde_json::Map<String, Value> = obj
         .iter()
@@ -106,10 +117,6 @@ pub async fn create_server(
     };
 
     let id = uuid::Uuid::new_v4().to_string();
-    if let Err(e) = mcp_servers::create_server(&state.db, &id, name, transport).await {
-        return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
-    }
-
     let command = body.get("command").and_then(|v| v.as_str());
     let url = body.get("url").and_then(|v| v.as_str());
     let args = body.get("args").map(normalize_json_field);
@@ -120,19 +127,39 @@ pub async fn create_server(
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
 
-    if let Err(e) = sqlx::query(
-        r#"UPDATE mcp_servers SET command = ?1, args = ?2, url = ?3, env = ?4, headers = ?5, enabled = ?6 WHERE id = ?7"#,
-    )
-    .bind(command)
-    .bind(&args)
-    .bind(url)
-    .bind(&env)
-    .bind(&headers)
-    .bind(enabled as i32)
-    .bind(&id)
-    .execute(&state.db)
-    .await
-    {
+    // INSERT + connection-config UPDATE, atomically — these used to be two
+    // independent statements against the pool; a failure in the second
+    // (e.g. a bad `headers` value) left a half-created row (name/transport
+    // only, no connection config) with no rollback.
+    let mut conn = match state.db.acquire().await {
+        Ok(c) => c,
+        Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+    let result = async {
+        let mut tx = conn.begin_with("BEGIN IMMEDIATE").await?;
+        sqlx::query(r#"INSERT INTO mcp_servers (id, name, transport) VALUES (?, ?, ?)"#)
+            .bind(&id)
+            .bind(name)
+            .bind(transport)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            r#"UPDATE mcp_servers SET command = ?1, args = ?2, url = ?3, env = ?4, headers = ?5, enabled = ?6 WHERE id = ?7"#,
+        )
+        .bind(command)
+        .bind(&args)
+        .bind(url)
+        .bind(&env)
+        .bind(&headers)
+        .bind(enabled as i32)
+        .bind(&id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok::<(), sqlx::Error>(())
+    }
+    .await;
+    if let Err(e) = result {
         return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
     }
 
@@ -268,4 +295,41 @@ pub async fn connect_server(
 pub async fn list_tools(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
     let tools = state.mcp.list_tools(Some(&id));
     Json(json!({"tools": tools})).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression (88bugs #68): a `headers` value sent as an already-
+    /// stringified JSON object (the exact "client stringifies twice" shape
+    /// `normalize_json_field`'s doc comment describes for `args`/`env`) must
+    /// be unwrapped, not stored as a JSON-string-of-a-JSON-string. Before the
+    /// fix, `encrypt_headers` only handled `Value::Object`, so this shape hit
+    /// `as_object() == None` and fell straight into the `to_string()`
+    /// passthrough, silently dropping the header map (including any auth
+    /// header) at connect time.
+    #[test]
+    fn encrypt_headers_unwraps_double_encoded_string() {
+        let double_encoded = Value::String(r#"{"Authorization":"Bearer secret"}"#.to_string());
+        let stored = encrypt_headers(&double_encoded);
+        let parsed: Value = serde_json::from_str(&stored)
+            .expect("stored headers must be a parseable JSON object, not a re-stringified string");
+        let obj = parsed.as_object().expect("stored headers must decode to an object");
+        let encrypted_auth = obj
+            .get("Authorization")
+            .and_then(|v| v.as_str())
+            .expect("Authorization header must survive normalization");
+        assert_eq!(crypto::decrypt(encrypted_auth), "Bearer secret");
+    }
+
+    /// The plain (already-an-object) shape must keep working exactly as before.
+    #[test]
+    fn encrypt_headers_still_handles_plain_object() {
+        let plain = json!({"X-Api-Key": "abc123"});
+        let stored = encrypt_headers(&plain);
+        let parsed: Value = serde_json::from_str(&stored).unwrap();
+        let encrypted = parsed["X-Api-Key"].as_str().unwrap();
+        assert_eq!(crypto::decrypt(encrypted), "abc123");
+    }
 }

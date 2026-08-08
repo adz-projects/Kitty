@@ -64,7 +64,7 @@ const BG_SIZE_CSS: Record<Config['background_size'], string> = {
   center: 'auto',
 };
 
-async function applyBackground(cfg: Config) {
+async function applyBackground(cfg: Config, gen: number) {
   const root = document.documentElement;
   root.style.setProperty('--bg-image-dim', String(cfg.background_dim ?? 0.3));
   root.style.setProperty(
@@ -84,6 +84,9 @@ async function applyBackground(cfg: Config) {
     }
     try {
       const url = await ipc.readImageDataUrl(cfg.background_image);
+      // A newer applyFromConfig() may have started (and even finished) while
+      // this file read was in flight — don't let a stale wallpaper clobber it.
+      if (gen !== themeApplyGen) return;
       lastBgImagePath = cfg.background_image;
       lastBgImageUrl = url;
       root.style.setProperty('--bg-image', `url("${url}")`);
@@ -93,6 +96,7 @@ async function applyBackground(cfg: Config) {
       /* fall through to clear */
     }
   }
+  if (gen !== themeApplyGen) return;
   root.style.removeProperty('--bg-image');
   root.removeAttribute('data-bg-image');
   // Wallpaper was cleared — drop the cache so a later re-set re-reads.
@@ -106,8 +110,12 @@ async function applyFromConfig() {
   // A newer applyFromConfig() started while we were waiting — drop this
   // stale result so an older config can't clobber the newer one on the DOM.
   if (gen !== themeApplyGen) return;
-  ensureStyle('app-theme').textContent = await themeCss(cfg.theme);
-  await applyBackground(cfg);
+  const css = await themeCss(cfg.theme);
+  // themeCss may itself await an IPC round-trip (readUserTheme) — re-check
+  // before writing, otherwise a slow stale call can still win the DOM write.
+  if (gen !== themeApplyGen) return;
+  ensureStyle('app-theme').textContent = css;
+  await applyBackground(cfg, gen);
 }
 
 /** Apply the configured theme/background and keep it in sync with changes. */

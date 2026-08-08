@@ -135,7 +135,11 @@ pub async fn reembed_stale_beliefs(engine: &PathwayEngine) -> Result<()> {
         // worse than leaving the stale-tagged row to be retried. The
         // batch-level `probe_ollama()` above only guarantees Ollama is up, not
         // that every call stays semantic.
-        let (embedding, semantic) = engine.embed.embed_with_space(&belief.text).await;
+        // Bypass the cache: `probe_ollama()` just confirmed Ollama is up, but
+        // if this belief's text is still cache-resident from before the
+        // outage, a cache-checking call would keep returning that stale
+        // hash-fallback vector forever instead of actually retrying now.
+        let (embedding, semantic) = engine.embed.embed_fresh_with_space(&belief.text).await;
         if !semantic {
             tracing::warn!(
                 belief_id = %belief.id,

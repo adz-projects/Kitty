@@ -128,10 +128,16 @@ pub fn word_tokens(text: &str) -> Vec<&str> {
     out
 }
 
-/// Small LRU cache keyed on the exact text.
+/// Small LRU cache keyed on the exact text. Stores the `semantic` flag
+/// alongside each vector (true = Ollama, false = hash fallback) so a cache
+/// hit can report the space that actually produced it, instead of a
+/// hardcoded guess — a hash-fallback vector cached during an Ollama outage
+/// must still read back as non-semantic once Ollama recovers, or callers
+/// like `reembed_stale_beliefs` that trust the reported space either mistag
+/// it as semantic or perpetually skip a belief that's actually re-embeddable.
 pub struct EmbedCache {
     cap: usize,
-    map: std::collections::HashMap<String, Vec<f32>>,
+    map: std::collections::HashMap<String, (Vec<f32>, bool)>,
     order: VecDeque<String>,
 }
 
@@ -144,15 +150,15 @@ impl EmbedCache {
         }
     }
 
-    pub fn get(&self, text: &str) -> Option<&Vec<f32>> {
+    pub fn get(&self, text: &str) -> Option<&(Vec<f32>, bool)> {
         self.map.get(text)
     }
 
-    pub fn put(&mut self, text: String, vec: Vec<f32>) {
+    pub fn put(&mut self, text: String, vec: Vec<f32>, semantic: bool) {
         if self.map.contains_key(&text) {
             self.order.retain(|t| *t != text);
         }
-        self.map.insert(text.clone(), vec);
+        self.map.insert(text.clone(), (vec, semantic));
         self.order.push_back(text);
         while self.order.len() > self.cap {
             if let Some(oldest) = self.order.pop_front() {
@@ -219,7 +225,7 @@ mod tests {
     fn cache_respects_cap_and_evicts_lru() {
         let mut c = EmbedCache::new(3);
         for i in 0..5 {
-            c.put(format!("context {i}"), vec![i as f32]);
+            c.put(format!("context {i}"), vec![i as f32], true);
         }
         assert_eq!(c.len(), 3);
         // "context 5" was added last; so was 3,4; earlier ones evicted
@@ -230,11 +236,11 @@ mod tests {
     #[test]
     fn cache_reorders_on_put() {
         let mut c = EmbedCache::new(2);
-        c.put("a".into(), vec![1.0]);
-        c.put("b".into(), vec![2.0]);
-        c.put("a".into(), vec![1.0]);
+        c.put("a".into(), vec![1.0], true);
+        c.put("b".into(), vec![2.0], true);
+        c.put("a".into(), vec![1.0], true);
         // order now b, a -> adding c evicts b
-        c.put("c".into(), vec![3.0]);
+        c.put("c".into(), vec![3.0], true);
         assert!(c.get("a").is_some());
         assert!(c.get("b").is_none());
     }

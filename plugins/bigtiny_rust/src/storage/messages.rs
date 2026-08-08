@@ -139,12 +139,16 @@ pub async fn get_last_messages_by_session(
     session_id: &str,
     limit: i64,
 ) -> Result<Vec<MessageRow>, StorageError> {
+    // `limit <= 0` (including exactly 0, e.g. `?limit=0`) means "no limit" per
+    // the doc above — SQLite itself only treats a NEGATIVE LIMIT that way,
+    // so 0 must be normalized to -1 or it silently returns zero rows.
+    let effective_limit = if limit <= 0 { -1 } else { limit };
     let mut rows = sqlx::query_as::<_, MessageRow>(
         r#"SELECT rowid, id, session_id, role, content, tool_calls, tool_call_id, token_count, content_format, created_at
            FROM messages WHERE session_id = ? ORDER BY rowid DESC LIMIT ?"#
     )
     .bind(session_id)
-    .bind(limit)
+    .bind(effective_limit)
     .fetch_all(pool)
     .await?;
     rows.reverse();
@@ -318,6 +322,35 @@ mod tests {
 
         let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
         assert_eq!(ids, vec!["a", "b", "c"]);
+    }
+
+    /// Regression (88bugs #82): `limit == 0` must mean "no limit" per this
+    /// function's own doc comment, not "zero rows" — a client hitting
+    /// `GET /api/chat/{id}/history?limit=0` previously got an empty result
+    /// even though `limit <= 0` was documented as unbounded.
+    #[tokio::test]
+    async fn zero_limit_means_no_limit() {
+        let pool = test_pool().await;
+        sqlx::query("INSERT INTO sessions (id, status) VALUES ('s1', 'active')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        save_messages(
+            &pool,
+            "s1",
+            &[msg("a", "s1", "user"), msg("b", "s1", "assistant"), msg("c", "s1", "user")],
+        )
+        .await
+        .unwrap();
+
+        let rows = get_last_messages_by_session(&pool, "s1", 0).await.unwrap();
+        let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "b", "c"]);
+
+        // A genuinely bounded limit still works.
+        let rows = get_last_messages_by_session(&pool, "s1", 2).await.unwrap();
+        let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["b", "c"]);
     }
 
     /// Regression: an injected memory block (`role: "system"` headed by one of

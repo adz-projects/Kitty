@@ -1367,6 +1367,27 @@ impl AgentLoop {
             ..Default::default()
         });
 
+        // The provider stream substitutes `{"__error": "..."}` for arguments
+        // it couldn't parse (truncated/malformed streamed JSON) rather than
+        // silently defaulting to `{}` — see `openai_compat.rs`/`anthropic.rs`
+        // `flush_tool_call_buf`. That sentinel must short-circuit here,
+        // BEFORE HITL/containment/execution: passing it through to the real
+        // tool runs it with a garbage args object (e.g. `read_file(path:
+        // undefined)`), and whether that "coincidentally" fails depends on
+        // the tool's own schema validation, not on anything this loop
+        // enforces. Fail the call outright and surface why.
+        if let Some(msg) = tool_args.get("__error").and_then(|v| v.as_str()) {
+            let err = format!("Tool {tool_name} call failed: {msg}");
+            let _ = event_tx.send(SSEEvent {
+                event_type: SSEEventType::ToolFinish,
+                tool_name: Some(tool_name),
+                tool_result: Some(err.clone()),
+                session_id: Some(session_id.to_string()),
+                ..Default::default()
+            });
+            return err;
+        }
+
         // Resolve the HITL decision without holding the shared mutex across
         // `check_tool_call`'s DB rule query: `check_tool_call_with_rules` is
         // synchronous, but the rule lookup itself is an `.await` on the pool —

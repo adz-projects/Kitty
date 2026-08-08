@@ -143,6 +143,19 @@ Legend for **Status**: `open` = not yet verified; `verified` = confirmed real bu
 
 **Verification rule applied throughout:** every finding was re-derived from the actual source (correcting for a terminal/chat display artifact that rendered the real `</thinking>` tag as " response" — see A-3). Fixes are in the file; the checklist below records disposition.
 
+### Re-audit (2026-08-08, second pass)
+
+Every "fixed"/"verified"/"won't fix"/"not a bug" disposition below was independently re-derived against the current source a second time. Six were found to be **misrepresented** — the claimed fix was incomplete or the underlying defect was still reachable — and have now been genuinely closed, with regression tests and full test-suite + clippy/tsc/eslint verification:
+
+- **#21** (`src/lib/theme.ts`) — the generation guard was only checked once, right after the first `await`; the two subsequent awaits (`themeCss`, `applyBackground`) could still let a stale, slower `applyFromConfig()` call clobber a newer one's theme/background. Now re-checked after every await that precedes a DOM write. New test: `src/lib/theme.test.ts`.
+- **#62** (`plugins/bigtiny_rust/src/provider/{openai_compat,anthropic}.rs`) — malformed streamed tool-call arguments were still executed against the real tool (with `{"__error": ...}` in place of `{}`); the `error_type` field meant to intercept this was never read anywhere. `execute_one_tool_call` (`agent/loop_.rs`) now short-circuits on the `__error` sentinel before HITL/containment/execution.
+- **#68** (`plugins/bigtiny_rust/src/routes/mcp.rs`) — `args`/`env` were unwrapped via `normalize_json_field` for the double-stringified-JSON case, but `headers` (the field most likely to carry an auth token) was not, and silently corrupted on that input. `encrypt_headers` now normalizes the same way. New tests in `routes/mcp.rs`.
+- **#82** (`plugins/bigtiny_rust/src/storage/messages.rs`) — the doc comment claimed `limit <= 0` means "no limit", but the code only relied on SQLite's negative-`LIMIT` behavior, so `limit == 0` (e.g. `?limit=0`) still returned zero rows. `get_last_messages_by_session` now normalizes `limit <= 0` to `-1`. New test: `zero_limit_means_no_limit`.
+- **#86** (`plugins/bigtiny_rust/src/routes/mcp.rs`) — `update_server` was correctly wrapped in a `BEGIN IMMEDIATE` transaction, but `create_server`'s INSERT + connection-config UPDATE were still two independent, non-transactional statements — a failure in the second left a half-created server row. Both statements now share one transaction.
+- **#90** (`plugins/adaptive-pathway_rust/src/embed/{hashing,provider}.rs`, `background.rs`) — the fix for #89 (correct semantic/hash tagging) was real, but a cache hit always reported `semantic=false`, so `reembed_stale_beliefs` could perpetually skip a belief whose text was still cache-resident from a prior outage, even after Ollama recovered. `EmbedCache` now stores the space alongside each vector, and `reembed_stale_beliefs` uses a new cache-bypassing `embed_fresh_with_space` for its retry. New tests in `embed/provider.rs`.
+
+All other dispositions (100/106) were confirmed accurate on re-check. See the item-by-item notes below for what "fixed" originally meant; the six above are the only entries whose disposition changed as a result of this pass.
+
 ### A. Frontend — core store / lib
 1. **fixed** — `ensureSession` now throws when session creation fails (`chatStore.ts`).
 2. **fixed** — added `trackToolAlternation`/`toolCallTarget`; catches alternating-tools loops (`loopGuards.ts`, wired in `chatStore.ts`).
