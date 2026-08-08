@@ -9,7 +9,8 @@ inference binary.
 Status: **PLAN — approved. Not yet implemented. Execution order in §10.**
 
 - Scope-at-a-glance: desktop keeps full local chat + AP + stdio MCP; Android is
-  **cloud-chat only** with a packed single local summarizer model.
+  **cloud-chat only** with a packed single local summarizer model, **and still
+  runs AP** — in-process inside the daemon, hash-space embeddings only.
 - This document is the spec an LLM/coder executes against. Each phase lists the
   concrete targets, files, config shape, and acceptance criteria.
 
@@ -22,11 +23,11 @@ Status: **PLAN — approved. Not yet implemented. Execution order in §10.**
 | D1 | **In-process llama.cpp, day 1, both OSes.** `bigtiny_rust` links `llama_cpp`. No Ollama anywhere: chat, compaction, and desktop embeddings all go through the daemon. | §2, §4 |
 | D2 | **Model is pinned per chat.** Locked in at chat creation; changes only on **new chats**. No mid-stream swap, ever. | §4.1 |
 | D3 | **Scheduled tasks default to the summarizer model**; per-task override in Settings. | §7 |
-| D4 | **Embeddings on desktop only.** AP calls new `POST /api/embeddings`; `AP_EMBED_OLLAMA_URL` re-points to the daemon port. | §3.1 |
+| D4 | **Embeddings on desktop only.** AP calls new `POST /api/embeddings`; `AP_EMBED_OLLAMA_URL` re-points to the daemon port. On Android, AP's pipeline runs with its **built-in hash-space embeddings** (`HASH_EMBED_MODEL` fallback) — no embed model, no `/api/embeddings` call. | §3.1 |
 | D5 | **In-app model downloads** from **HuggingFace** and the **Ollama registry** (manifest → blob → reassembled GGUF). Range+resume+sha256. | §5 |
 | D6 | **Exposed llama.cpp engine knobs** + **Quick Presets** (Precise/Balanced/Creative). | §6 |
 | D7 | **No proactive disk quota.** Only a low-free-space warning; manual delete. **Hard refusal when `free_space < model_size × 1.5`**. | §5 |
-| D8 | Adaptive-Pathway **desktop-only**; MCP tool servers: **stdio sidecar on Windows**, **`in_process` on Android**; Android omits AP entirely. | §2 |
+| D8 | Adaptive-Pathway runs **on both OSes, in-process inside the BigTiny daemon** (linked crate, MCP `in_process` "pathway" server — never a separate process). Windows: daemon is a Kitty-managed sidecar; Android: daemon is in-process. Android runs the *full* AP engine (recall/surface/consolidate) with hash-space embeddings (D4); MCP tool servers: **stdio sidecar on Windows**, **`in_process` on Android**. | §2 |
 | D9 | Frontend = 2 windows (`overlay` + `hub`); settings/wizard fold in-page. Android = same hub, mobile-rendered. | §8 |
 | D10 | **Model card** (size/RAM/VRAM/backend/one-tap new-chat default) + **"Recommended for this device" badge** computed from the fit function. | §6.3 |
 | D11 | Load-time param changes schedule an **automatic engine restart**: after the current LLM generation completes, or immediately if nothing is generating. Sessions show a non-blocking "restarting" chip. | §6.4 |
@@ -49,8 +50,8 @@ Status: **PLAN — approved. Not yet implemented. Execution order in §10.**
 
 | Platform | Chat | Summarizer | Embeddings | MCP tool servers | AP |
 |----------|------|-----------|------------|------------------|----|
-| Windows | Local (llama) **and** cloud providers | Local (llama) → session-model fallback | Local (via daemon endpoint) | stdio sidecars | ✓ |
-| Android | **Cloud providers only** | Local (llama) → session-model fallback | — (not present) | `in_process` builtins | — |
+| Windows | Local (llama) **and** cloud providers | Local (llama) → session-model fallback | Local (via daemon endpoint) | stdio sidecars | ✓ (in-process in daemon, semantic embeddings) |
+| Android | **Cloud providers only** | Local (llama) → session-model fallback | — | `in_process` builtins | ✓ (in-process in daemon, hash-space embeddings) |
 
 ### 2.2 Local model policy per platform (D18)
 - **Android**: exactly **one resident local model** — the summarizer (default
@@ -61,6 +62,23 @@ Status: **PLAN — approved. Not yet implemented. Execution order in §10.**
 - **Windows:** 2 resident slots — `chat` and `summarizer/embeddings`. Chat slot
   only loads when a chat pins a local model (D2); otherwise chat talks to cloud
   providers and the slots stay only on the summarizer model.
+
+### 2.3 Adaptive-Pathway process model (D8)
+
+AP is never a standalone process on either OS — it is the **linked-in
+`adaptive_pathway` crate** inside the BigTiny daemon, served as the `in_process`
+"pathway" MCP row (`ensure_builtin_servers` in src-tauri) and direct
+`PathwayEngine` calls.
+
+- **Windows:** the daemon itself is a Kitty-managed sidecar
+  (`lifecycle/bigtiny_proc.rs`); AP lives inside it. Semantic embeddings come
+  from `POST /api/embeddings` (daemon engine).
+- **Android:** the daemon is in-process (Android can't `exec()` a sidecar), so
+  AP is naturally in-process too — **no code change separates the Android build
+  from Windows** on the AP side; the only functional difference is hash-space
+  embeddings (D4) since no embed model is loaded. Feature parity: recall,
+  surfaced-assumption ordering, consolidation, PIP (confirm/sub/uncertain),
+  suppression — identical behavior, just the vector space backing them differs.
 
 ---
 
@@ -75,7 +93,7 @@ Lives **inside the daemon** (both OS). Entry points from `bigtiny_rust` crate.
 | `engine.rs` | `LocalEngine` wrapper over the `llama_cpp` crate. Builds the model/context from `LocalEngineConfig`: `n_ctx`, `n_batch`, `n_threads`, `cache_type_k/v`, FlashAttention (derived, D19). |
 | `manager.rs` | Resident slot manager (§4.1). `load/unload/status`, hot-swap-queuing. |
 | `provider.rs` | `LocalProvider: Provider` (base chat trait) — streaming + reasoning, text **and** compaction. |
-| `embeddings.rs` | `LocalEmbed` → **desktop-only** endpoint `POST /api/embeddings` (D4). |
+| `embeddings.rs` | `LocalEmbed` → **desktop-only** endpoint `POST /api/embeddings` (D4). Android's AP uses the crate's built-in hash-space embeddings instead — no endpoint, no model. |
 | `summarizer.rs` | Summarizer chain (§4.3). Grammar-constrained JSON decode. |
 | `health.rs` | `/api/health` fields (`local` state, `model_backend`, `reload_required`, `restart_pending`) + `/api/local/models/status`. |
 
@@ -365,7 +383,9 @@ All under `Settings → Local models`, shared component on both OS.
     explicit `System.loadLibrary` in `gen/android` Kotlin **before** the Rust
     runtime initializes.
 - **Acceptance:** `cargo build --target aarch64-linux-android` for `bigtiny_rust`
-  with llama + wasmtime + sqlx; a `lfm2.5…q4_k_m.gguf` load via `llama_cpp` returns
+  with llama + wasmtime + sqlx **+ `adaptive-pathway` (path dep, `in_process`
+  MCP row — no separate AP artifact)**; a `lfm2.5…q4_k_m.gguf` load via
+  `llama_cpp` returns
   tokens; **app boots on an API 26–34 emulator AND one physical arm64 device with
   zero `UnsatisfiedLinkError`/`dlopen` failures**; `readelf -d`/`nm -u` on the
   produced `.so` confirms no unresolved external symbols. Fallback decision
@@ -373,7 +393,9 @@ All under `Settings → Local models`, shared component on both OS.
 
 ### Phase 2 — Daemon engine (Windows first)
 - **Acceptance:** `cargo test` + `cargo clippy` clean; chat through `LocalEngine`;
-  compaction through `LocalEngine`; `/api/embeddings` round-trip via AP; secrets
+  compaction through `LocalEngine`; `/api/embeddings` round-trip via AP (Windows);
+  AP engine (recall/consolidate/surface) testable in-process **without**
+  `/api/embeddings` (hash-space path, which Android will use); secrets
   through the keyring path; Ollama removed from the whole tree (grep `ollama`).
 - Files: §3 + deletion of `src-tauri/ollama/`, `commands/ollama.rs`,
   `lifecycle/ollama_proc.rs`, `lifecycle/summarizer_model.rs`,
@@ -414,13 +436,19 @@ All under `Settings → Local models`, shared component on both OS.
   FGS + visible notification, a `ConnectivityManager.NetworkCallback` for
   Wi-Fi↔Cellular handoff, and byte-offset resume (§5.2) — a multi-GB GGUF pull
   survives Deep Doze and network changes without corruption.
+- **In-process AP (D8):** the daemon's `PathwayEngine` runs end-to-end on Android
+  — recall woven into turn processing, assumption surfacing, consolidation — all
+  with hash-space embeddings; no `externalBin`, no separate process, no
+  Ollama-URL config to resolve.
 - Accept: build+install on device; summarizer cloud fallback fires; wizard grants
   perms; OEM battery restart resumes; **a model download interrupted by airplane
-  mode resumes from the same byte after reconnect**.
+  mode resumes from the same byte after reconnect**; **AP recall/surface/consolidate
+  verified on-device (hash-space) and on desktop**.
 
 ### Phase 8 — Packaging
 - `plugins/build.py` must NOT freeze Rust sidecars for Android. `externalBin`
-  removed for Android; daemon + kitty-* linked in. Signed AAB + Windows installer.
+  removed for Android; daemon + kitty-* linked in (AP comes along inside the
+  daemon crate — no separate artifact). Signed AAB + Windows installer.
 - `AGENTS.md` commands gain an `android` lane; scrub OLLAMA references in `docs/`.
 
 ---
@@ -445,6 +473,11 @@ All under `Settings → Local models`, shared component on both OS.
   and Wi-Fi↔Cellular transitions** may stall long GGUF pulls → `START_STICKY` +
   persisted queue + byte-offset resume on reconnect (§5.2/§7).
 - The narrow cloud exception (D12) is deliberate; keep it scoped to compaction.
+- **AP on Android uses hash-space embeddings (D8/D4):** semantic recall quality
+  is lower than Windows until a local embed model is added — acceptable for the
+  cloud-chat-only Android path; the pipeline (recall/surface/consolidate) is
+  identical and shares code, so a future embedder slot lifts Android AP without
+  a rewrite.
 - **Windows multi-window RAM:** two concurrent chat windows pin two potentially
   different local models → two chat slots + summarizer resident. Weights are
   shared when models match; the chat-pool evicts the **idle** slot first if RAM is
