@@ -157,10 +157,14 @@ impl PathwayServer {
             .flatten()
             .map(|s| s.last_recall_ids)
             .unwrap_or_default();
+        // A real embedding (not the lexical hashing fallback) so the cosine
+        // fallback for a paraphrase compares against the same vector space
+        // the stored beliefs were embedded in.
+        let embedding = self.engine.embed.embed(&what).await;
         let res = self
             .engine
             .db
-            .forget_by_text(&what, &recall_ids, reason)
+            .forget_by_text(&what, &embedding, &recall_ids, reason)
             .await;
         match res {
             Ok(Some(dropped)) => {

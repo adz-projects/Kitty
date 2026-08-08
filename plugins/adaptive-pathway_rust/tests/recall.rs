@@ -33,6 +33,7 @@ fn belief(id: &str, text: &str, conf: f64, tested: bool, layer: Layer, domain: O
         consolidated_at: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
+        session_id: None,
     }
 }
 

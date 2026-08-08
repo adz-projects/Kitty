@@ -77,6 +77,23 @@ pub fn effective_weight(
     w
 }
 
+/// Remove beliefs whose text-hash is actively suppressed. `effective_weight`
+/// itself has no DB access and can't check this per-belief, so filtering
+/// happens upstream, before any scoring -- matching the comment in
+/// `effective_weight` that says suppression "is handled upstream by
+/// filtering" (it previously wasn't handled anywhere at all). Suppression is
+/// looked up by text-hash, not id, since a belief re-created with the same
+/// text after a merge would otherwise slip back past an id-keyed check.
+pub fn filter_suppressed(
+    beliefs: Vec<Belief>,
+    suppressed_hashes: &std::collections::HashSet<String>,
+) -> Vec<Belief> {
+    beliefs
+        .into_iter()
+        .filter(|b| !suppressed_hashes.contains(&crate::belief::synthesis::text_hash(&b.text)))
+        .collect()
+}
+
 /// Provenance-to-initial-confidence mapping and the reinforcement step sizes,
 /// ported from `embeddings/decision` semantics; see `provenance.rs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

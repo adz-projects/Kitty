@@ -6,7 +6,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::Utc;
 use sqlx::SqlitePool;
 use tokio::sync::watch;
 
@@ -55,12 +54,13 @@ pub async fn idle_sweep<S: StructuredChat>(
     host_pool: &SqlitePool,
     chat: &S,
 ) -> Result<()> {
-    let now = Utc::now();
-    let idle_cutoff = now - chrono::Duration::minutes(15);
-    let active_cutoff = now - chrono::Duration::minutes(30);
-
-    // Query 2 (host seam): idle + stale-active session ids.
-    let ids = crate::learn::host::idle_session_ids(host_pool, idle_cutoff, active_cutoff).await?;
+    // Query 2 (host seam): idle + stale-active session ids. Cutoffs are
+    // computed in SQL against `bigtiny.db`'s own clock/format -- see the
+    // doc comment on `idle_session_ids` for why a Rust-side `chrono` cutoff
+    // bound as a query parameter doesn't compare correctly against it.
+    const IDLE_MINUTES: i64 = 15;
+    const ACTIVE_MINUTES: i64 = 30;
+    let ids = crate::learn::host::idle_session_ids(host_pool, IDLE_MINUTES, ACTIVE_MINUTES).await?;
     for session_id in ids.iter().take(IDLE_SWEEP_BATCH) {
         // Skip paused sessions.
         if engine.is_paused(session_id).await.unwrap_or(false) {
@@ -86,5 +86,8 @@ pub async fn idle_sweep<S: StructuredChat>(
     }
     // Periodic maintenance (cheap; runs each sweep).
     let _ = crate::maintenance::run_maintenance(&engine.db).await;
+    // Bound the per-session learn-lock map's growth (see
+    // `PathwayEngine::prune_idle_learn_locks`) -- cheap, safe every tick.
+    engine.prune_idle_learn_locks();
     Ok(())
 }

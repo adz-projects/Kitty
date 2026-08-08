@@ -35,23 +35,53 @@ pub struct Assumption {
     pub text: String,
     pub confidence: f64,
     pub state: AssumptionState,
-    pub exchanged_since_flag: i64,
+    /// The global exchange counter's value when this was flagged (a fixed
+    /// anchor, never re-stamped) -- see `Db::global_exchange_count`. Elapsed
+    /// exchanges are computed live as `current - flagged_at_exchange`.
+    pub flagged_at_exchange: i64,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+fn row_to_assumption(row: &sqlx::sqlite::SqliteRow) -> sqlx::Result<Assumption> {
+    let id: String = row.try_get("id")?;
+    let belief_id: Option<String> = row.try_get("belief_id")?;
+    let text: String = row.try_get("text")?;
+    let confidence: f64 = row.try_get("confidence")?;
+    let state: String = row.try_get("state")?;
+    let flagged_at_exchange: i64 = row.try_get("flagged_at_exchange")?;
+    let created_at: DateTime<Utc> = row.try_get("created_at")?;
+    let updated_at: DateTime<Utc> = row.try_get("updated_at")?;
+    Ok(Assumption {
+        id,
+        belief_id,
+        text,
+        confidence,
+        state: match state.as_str() {
+            "surfaced" => AssumptionState::Surfaced,
+            "passed" => AssumptionState::Passed,
+            "failed" => AssumptionState::Failed,
+            "stale" => AssumptionState::Stale,
+            _ => AssumptionState::Scheduled,
+        },
+        flagged_at_exchange,
+        created_at,
+        updated_at,
+    })
 }
 
 impl Db {
     pub async fn insert_assumption(&self, a: &Assumption) -> Result<()> {
         sqlx::query(
             "INSERT INTO assumptions (id, belief_id, text, confidence, state, \
-             exchanged_since_flag, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+             flagged_at_exchange, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&a.id)
         .bind(&a.belief_id)
         .bind(&a.text)
         .bind(a.confidence)
         .bind(a.state.as_str())
-        .bind(a.exchanged_since_flag)
+        .bind(a.flagged_at_exchange)
         .bind(a.created_at)
         .bind(a.updated_at)
         .execute(self.pool())
@@ -68,46 +98,31 @@ impl Db {
         } else {
             sqlx::query("SELECT * FROM assumptions").fetch_all(self.pool()).await?
         };
-        let mut out = Vec::new();
-        for row in rows {
-            let id: String = row.try_get("id")?;
-            let belief_id: Option<String> = row.try_get("belief_id")?;
-            let text: String = row.try_get("text")?;
-            let confidence: f64 = row.try_get("confidence")?;
-            let state: String = row.try_get("state")?;
-            let exchanged_since_flag: i64 = row.try_get("exchanged_since_flag")?;
-            let created_at: DateTime<Utc> = row.try_get("created_at")?;
-            let updated_at: DateTime<Utc> = row.try_get("updated_at")?;
-            out.push(Assumption {
-                id,
-                belief_id,
-                text,
-                confidence,
-                state: match state.as_str() {
-                    "surfaced" => AssumptionState::Surfaced,
-                    "passed" => AssumptionState::Passed,
-                    "failed" => AssumptionState::Failed,
-                    "stale" => AssumptionState::Stale,
-                    _ => AssumptionState::Scheduled,
-                },
-                exchanged_since_flag,
-                created_at,
-                updated_at,
-            });
-        }
-        Ok(out)
+        rows.iter().map(row_to_assumption).collect::<sqlx::Result<Vec<_>>>().map_err(Into::into)
     }
 
-    pub async fn update_assumption_state(&self, id: &str, state: AssumptionState, exchanged: i64) -> Result<()> {
-        sqlx::query(
-            "UPDATE assumptions SET state = ?, exchanged_since_flag = ?, updated_at = ? WHERE id = ?",
+    /// Only `scheduled` + `surfaced` assumptions -- the two "still live,
+    /// worth checking" states -- ordered oldest-flagged first so the
+    /// longest-untested assumption surfaces before newer ones.
+    pub async fn list_live_assumptions(&self) -> Result<Vec<Assumption>> {
+        let rows = sqlx::query(
+            "SELECT * FROM assumptions WHERE state IN ('scheduled', 'surfaced') \
+             ORDER BY flagged_at_exchange ASC",
         )
-        .bind(state.as_str())
-        .bind(exchanged)
-        .bind(Utc::now())
-        .bind(id)
-        .execute(self.pool())
+        .fetch_all(self.pool())
         .await?;
+        rows.iter().map(row_to_assumption).collect::<sqlx::Result<Vec<_>>>().map_err(Into::into)
+    }
+
+    /// Advance an assumption's state without touching its anchor
+    /// (`flagged_at_exchange` is fixed at flag time, never re-stamped).
+    pub async fn set_assumption_state(&self, id: &str, state: AssumptionState) -> Result<()> {
+        sqlx::query("UPDATE assumptions SET state = ?, updated_at = ? WHERE id = ?")
+            .bind(state.as_str())
+            .bind(Utc::now())
+            .bind(id)
+            .execute(self.pool())
+            .await?;
         Ok(())
     }
 
@@ -116,34 +131,31 @@ impl Db {
             .bind(id)
             .fetch_optional(self.pool())
             .await?;
-        match row {
-            None => Ok(None),
-            Some(row) => {
-                let id: String = row.try_get("id")?;
-                let belief_id: Option<String> = row.try_get("belief_id")?;
-                let text: String = row.try_get("text")?;
-                let confidence: f64 = row.try_get("confidence")?;
-                let state: String = row.try_get("state")?;
-                let exchanged_since_flag: i64 = row.try_get("exchanged_since_flag")?;
-                let created_at: DateTime<Utc> = row.try_get("created_at")?;
-                let updated_at: DateTime<Utc> = row.try_get("updated_at")?;
-                Ok(Some(Assumption {
-                    id,
-                    belief_id,
-                    text,
-                    confidence,
-                    state: match state.as_str() {
-                        "surfaced" => AssumptionState::Surfaced,
-                        "passed" => AssumptionState::Passed,
-                        "failed" => AssumptionState::Failed,
-                        "stale" => AssumptionState::Stale,
-                        _ => AssumptionState::Scheduled,
-                    },
-                    exchanged_since_flag,
-                    created_at,
-                    updated_at,
-                }))
-            }
-        }
+        row.as_ref().map(row_to_assumption).transpose().map_err(Into::into)
+    }
+
+    /// The (first) assumption row tracking `belief_id`, if any. Used to
+    /// avoid inserting duplicate assumption rows for the same belief across
+    /// repeated flagging/re-evaluation passes, and to resolve an assumption
+    /// when new evidence touches its belief.
+    pub async fn get_assumption_for_belief(&self, belief_id: &str) -> Result<Option<Assumption>> {
+        let row = sqlx::query("SELECT * FROM assumptions WHERE belief_id = ? LIMIT 1")
+            .bind(belief_id)
+            .fetch_optional(self.pool())
+            .await?;
+        row.as_ref().map(row_to_assumption).transpose().map_err(Into::into)
+    }
+
+    /// Only a `scheduled`/`surfaced` (i.e. still-live) assumption tracking
+    /// `belief_id`, if any -- used by resolution paths that should only act
+    /// on a *pending* assumption, not one already passed/failed/stale.
+    pub async fn get_live_assumption_for_belief(&self, belief_id: &str) -> Result<Option<Assumption>> {
+        let row = sqlx::query(
+            "SELECT * FROM assumptions WHERE belief_id = ? AND state IN ('scheduled', 'surfaced') LIMIT 1",
+        )
+        .bind(belief_id)
+        .fetch_optional(self.pool())
+        .await?;
+        row.as_ref().map(row_to_assumption).transpose().map_err(Into::into)
     }
 }

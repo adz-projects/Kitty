@@ -24,23 +24,32 @@ pub fn extraction_schema() -> Value {
                 "items": {
                     "type": "object",
                     "properties": {
-                        "statement": {"type": "string"},
+                        "statement": {"type": "string", "description": "One behavioral fact about the USER, third person, present tense: 'User prefers ...', 'User is working on ...'. Never about the assistant. Never about code or files."},
                         "provenance": {"type": "string", "enum": [
                             "direct_statement", "controlled_test", "inferred_pattern", "single_observation"
                         ]},
                         "layer": {"type": "string", "enum": ["context", "conversation"]},
-                        "domain": {"type": "string"},
-                        "evidence": {"type": "string"},
-                        "contradicts": {"type": "string"}
+                        "domain": {"type": "string", "description": "Short topic label such as 'coding', 'writing', 'cooking'. Empty string if not topic-specific."},
+                        "evidence": {"type": "string", "description": "A short quote from the exchanges that supports this."},
+                        "contradicts": {"type": "string", "description": "If this conflicts with a line in KNOWN BELIEFS, that line's exact text. Empty string otherwise."}
                     },
-                    "required": ["statement", "provenance", "layer"]
+                    // Every field required, with empty-string sentinels rather
+                    // than nullable/optional ones: llama.cpp's grammar-
+                    // constrained decoding is far more reliable against a
+                    // *total* grammar at 1.2B-scale models -- a partial
+                    // `required` list (as this previously was, missing
+                    // domain/evidence/contradicts) lets the grammar treat
+                    // those three as optional, which is exactly the case
+                    // where small models most often emit a truncated or
+                    // malformed object.
+                    "required": ["statement", "provenance", "layer", "domain", "evidence", "contradicts"]
                 }
             },
             "corrections": {
                 "type": "array",
-                "items": {"type": "string"}
+                "items": {"type": "string", "description": "Exact text of a KNOWN BELIEF the user explicitly denied or overrode."}
             },
-            "tone": {"type": "string"},
+            "tone": {"type": "string", "description": "The user's tone in these exchanges, one or two words."},
             "open_topics": {
                 "type": "array",
                 "items": {"type": "string"}
@@ -115,10 +124,8 @@ pub async fn extract_and_record<S: StructuredChat>(
     trigger: LearnTrigger,
 ) -> Result<LearnOutcome> {
     let _acquired = engine.learn_lock(req.session_id).await?;
-    if let Some(paused) = engine.learn_paused(req.session_id).await {
-        if paused {
-            return Ok(LearnOutcome::default());
-        }
+    if engine.learn_paused(req.session_id).await? {
+        return Ok(LearnOutcome::default());
     }
 
     let db = &engine.db;
@@ -126,6 +133,14 @@ pub async fn extract_and_record<S: StructuredChat>(
     if req.through_rowid <= watermark {
         return Ok(LearnOutcome::default());
     }
+
+    // Bump the global exchange counter -- the clock assumption scheduling
+    // runs against (`Db::global_exchange_count`, `belief::lifecycle`). Once
+    // per genuine learn pass (past the pause/lock/watermark guards above),
+    // matching the plan's "exchanges_at_flag = <global exchange counter>"
+    // framing: ~20 *learn-worthy* exchanges, not calendar time or raw turn
+    // count. Best-effort -- a failed bump must never fail the learn pass.
+    let _ = db.bump_global_exchange().await;
 
     // Build the chunk: use the given one, else read rows (watermark, through]
     // from the host db, dropping role='system', tool-masking, truncating.
@@ -142,15 +157,30 @@ pub async fn extract_and_record<S: StructuredChat>(
     // Render KNOWN BELIEFS (top 20 by effective weight).
     let known = render_known_beliefs(db).await?;
 
-    let _permit = engine.chat_semaphore().acquire_owned().await.map_err(
-        |_| PathwayError::Internal("semaphore closed".into()),
-    )?;
-
+    // The permit is scoped to exactly this call -- it used to be bound at
+    // function level, which meant it stayed held through every subsequent
+    // per-observation embed call and DB write below (potentially several
+    // seconds of unrelated work), blocking every *other* session's learn
+    // pass from even starting its own `structured_chat` call for that whole
+    // window. The semaphore exists to keep concurrent constrained-decode
+    // requests off Ollama, not to serialize embedding/DB work too.
+    //
+    // A defensive timeout (independent of whatever timeout the concrete
+    // `StructuredChat` implementation may or may not have internally --
+    // this trait is also implemented by test mocks with none) guards
+    // against a hung call holding the permit, and therefore every other
+    // session's learn pass, forever.
+    const STRUCTURED_CHAT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
     let prompt = build_extraction_prompt(&known, &chunk);
-    let parsed = chat
-        .structured_chat(prompt, &extraction_schema())
-        .await
-        .map_err(PathwayError::Extract)?;
+    let parsed = {
+        let _permit = engine.chat_semaphore().acquire_owned().await.map_err(
+            |_| PathwayError::Internal("semaphore closed".into()),
+        )?;
+        tokio::time::timeout(STRUCTURED_CHAT_TIMEOUT, chat.structured_chat(prompt, &extraction_schema()))
+            .await
+            .map_err(|_| PathwayError::Extract("structured_chat timed out".into()))?
+            .map_err(PathwayError::Extract)?
+    };
 
     // Truncate to 5 observations IN RUST (hard cap).
     let observations = parsed
@@ -160,15 +190,19 @@ pub async fn extract_and_record<S: StructuredChat>(
         .unwrap_or_default();
     let observations: Vec<Value> = observations.into_iter().take(5).collect();
 
-    // Process observations -> beliefs in one transaction.
-    let obs_count = observations.len();
-    let mut outcome = LearnOutcome { observations: obs_count, ..Default::default() };
+    // Process observations -> beliefs in one transaction. Counted as they're
+    // actually processed below, not from the raw parsed length -- an
+    // empty-statement entry is skipped (`continue`, never routed to a
+    // belief), so counting before that filter over-reported by however many
+    // entries were skipped.
+    let mut outcome = LearnOutcome::default();
 
     for obs in &observations {
         let statement = obs.get("statement").and_then(|s| s.as_str()).unwrap_or("").to_string();
         if statement.trim().is_empty() {
             continue;
         }
+        outcome.observations += 1;
         let provenance = Provenance::parse(
             obs.get("provenance").and_then(|p| p.as_str()).unwrap_or("single_observation"),
         );
@@ -177,9 +211,15 @@ pub async fn extract_and_record<S: StructuredChat>(
             Some("context") => Layer::Context,
             _ => Layer::Conversation,
         };
-        let domain = obs.get("domain").and_then(|d| d.as_str()).map(|s| s.to_string());
-        let evidence = obs.get("evidence").and_then(|e| e.as_str()).map(|s| s.to_string());
-        let contradicts = obs.get("contradicts").and_then(|c| c.as_str()).map(|s| s.to_string());
+        // Required-with-empty-string-sentinel fields (see extraction_schema's
+        // doc comment) -- normalize "" to None so "the model had nothing to
+        // say for this field" and "the model said something" stay distinct
+        // downstream (an empty-string domain would otherwise behave like a
+        // real, if useless, domain tag).
+        let non_empty = |s: Option<&str>| s.filter(|s| !s.is_empty()).map(str::to_string);
+        let domain = non_empty(obs.get("domain").and_then(|d| d.as_str()));
+        let evidence = non_empty(obs.get("evidence").and_then(|e| e.as_str()));
+        let contradicts = non_empty(obs.get("contradicts").and_then(|c| c.as_str()));
 
         let embedding = engine.embed.embed(&statement).await;
         let now = chrono::Utc::now();
@@ -206,8 +246,15 @@ pub async fn extract_and_record<S: StructuredChat>(
         .unwrap_or_default();
     for c in corrections {
         if let Some(text) = c.as_str() {
+            // `forget_by_text`'s cosine fallback needs a real embedding in
+            // the same space as the stored beliefs -- the exact/substring
+            // resolution steps ahead of it don't need one, but a correction
+            // that doesn't textually match anything (the model paraphrased
+            // the KNOWN BELIEFS line rather than quoting it) would
+            // otherwise silently fail to resolve.
+            let embedding = engine.embed.embed(text).await;
             if db
-                .forget_by_text(text, &[], crate::store::suppressions::SuppressReason::Wrong)
+                .forget_by_text(text, &embedding, &[], crate::store::suppressions::SuppressReason::Wrong)
                 .await
                 .is_ok()
             {

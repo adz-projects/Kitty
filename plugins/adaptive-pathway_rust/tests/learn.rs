@@ -206,6 +206,7 @@ async fn promotion_each_gate_blocks_independently() {
         consolidated_at: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
+        session_id: None,
     };
 
     // pass when all four gates hold
@@ -256,5 +257,82 @@ async fn paused_session_learn_is_skipped() {
     .await
     .unwrap();
     assert_eq!(outcome.observations, 0);
+    assert!(engine.db.list_beliefs(None).await.unwrap().is_empty());
+}
+
+/// Regression for issue #8 (the global exchange counter never advanced --
+/// no caller ever invoked `bump_global_exchange`, so assumption scheduling
+/// could never leave `Scheduled`, meaning `[Worth testing this turn]` could
+/// never actually surface): each genuine learn pass bumps the counter.
+#[tokio::test]
+async fn extract_and_record_bumps_the_global_exchange_counter() {
+    let engine = PathwayEngine::open_in_memory(Config::default()).await.unwrap();
+    let host = host_pool().await;
+    let chat = chat_one();
+
+    assert_eq!(engine.db.global_exchange_count().await.unwrap(), 0);
+
+    let r1 = insert_message(&host, "s1", "user", "one").await;
+    learn::extract_and_record(
+        &engine,
+        &host,
+        &chat,
+        LearnRequest { session_id: "s1", through_rowid: r1, given_chunk: None },
+        LearnTrigger::TurnEnd,
+    )
+    .await
+    .unwrap();
+    assert_eq!(engine.db.global_exchange_count().await.unwrap(), 1);
+
+    let r2 = insert_message(&host, "s1", "user", "two").await;
+    learn::extract_and_record(
+        &engine,
+        &host,
+        &chat,
+        LearnRequest { session_id: "s1", through_rowid: r2, given_chunk: None },
+        LearnTrigger::TurnEnd,
+    )
+    .await
+    .unwrap();
+    assert_eq!(engine.db.global_exchange_count().await.unwrap(), 2);
+
+    // A pass that's skipped by the watermark guard (nothing new to learn)
+    // must NOT bump the counter -- only genuine learn passes count.
+    learn::extract_and_record(
+        &engine,
+        &host,
+        &chat,
+        LearnRequest { session_id: "s1", through_rowid: r2, given_chunk: None },
+        LearnTrigger::TurnEnd,
+    )
+    .await
+    .unwrap();
+    assert_eq!(engine.db.global_exchange_count().await.unwrap(), 2, "a skipped (already-learned) pass must not bump the counter");
+}
+
+/// Regression for issue #6: after a daemon restart, `PathwayEngine`'s
+/// in-memory `paused_override` map starts empty regardless of what's
+/// persisted -- `db.set_paused` (bypassing `engine.set_paused`, which also
+/// populates the in-memory map) reproduces exactly that post-restart state:
+/// the DB says paused, the in-memory override knows nothing about it. The
+/// learn path must still honor the DB-persisted pause.
+#[tokio::test]
+async fn learn_honors_a_db_only_pause_with_no_in_memory_override() {
+    let engine = PathwayEngine::open_in_memory(Config::default()).await.unwrap();
+    engine.db.set_paused("s1", true).await.unwrap();
+
+    let host = host_pool().await;
+    let rowid = insert_message(&host, "s1", "user", "something").await;
+    let chat = chat_one();
+    let outcome = learn::extract_and_record(
+        &engine,
+        &host,
+        &chat,
+        LearnRequest { session_id: "s1", through_rowid: rowid, given_chunk: None },
+        LearnTrigger::TurnEnd,
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome.observations, 0, "a DB-only pause (no in-memory override) must still be honored");
     assert!(engine.db.list_beliefs(None).await.unwrap().is_empty());
 }

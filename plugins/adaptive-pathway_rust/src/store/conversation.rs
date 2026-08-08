@@ -59,7 +59,17 @@ impl Db {
         Ok(())
     }
 
+    /// Unlike every other mutator in this file, this previously skipped
+    /// `ensure_state` -- a plain `UPDATE ... WHERE session_id = ?` against a
+    /// session with no `conversation_state` row yet (e.g. incognito toggled
+    /// before any recall/learn call has implicitly created one) silently
+    /// affected zero rows, so the pause was never actually persisted. The
+    /// in-memory override in `PathwayEngine::set_paused` masked this for the
+    /// rest of that process's lifetime, which is exactly why it went
+    /// unnoticed: the bug only becomes visible after a restart, when the
+    /// override is gone and the DB turns out to have never recorded it.
     pub async fn set_paused(&self, session_id: &str, paused: bool) -> Result<()> {
+        self.ensure_state(session_id).await?;
         sqlx::query(
             "UPDATE conversation_state SET paused = ?, updated_at = ? WHERE session_id = ?",
         )
@@ -136,5 +146,28 @@ impl Db {
         .execute(self.pool())
         .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::store::Db;
+
+    #[tokio::test]
+    async fn set_paused_persists_even_with_no_prior_state_row() {
+        let db = Db::open_in_memory().await.unwrap();
+        // No `ensure_state`/`is_paused`/`bump_exchange` call first -- this
+        // session has never touched `conversation_state` before.
+        db.set_paused("fresh-session", true).await.unwrap();
+        assert!(db.is_paused("fresh-session").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn set_paused_then_unset_round_trips() {
+        let db = Db::open_in_memory().await.unwrap();
+        db.set_paused("s1", true).await.unwrap();
+        assert!(db.is_paused("s1").await.unwrap());
+        db.set_paused("s1", false).await.unwrap();
+        assert!(!db.is_paused("s1").await.unwrap());
     }
 }

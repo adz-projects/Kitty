@@ -49,7 +49,18 @@ pub fn norm(a: &[f32]) -> f32 {
 
 /// Cosine similarity between two vectors. Zero-vector (or either zero-norm)
 /// returns 0.0, matching the Python guard that skips near-zero queries.
+/// Mismatched dimensions also return 0.0 (treated as unrelated) rather than
+/// silently comparing whatever prefix `dot`'s `zip` happens to line up --
+/// `a`/`b` typically come from independently-stored embeddings (a query
+/// embedding against a persisted belief embedding), and a dimension
+/// mismatch (a corrupted BLOB, or a belief embedded under a since-changed
+/// `embedding_dim`/model) would otherwise silently divide a partial dot
+/// product by the *full* norms of both vectors -- a number that looks like
+/// a valid similarity score but measures nothing real.
 pub fn cosine(a: &[f32], b: &[f32]) -> f64 {
+    if a.len() != b.len() {
+        return 0.0;
+    }
     let na = norm(a);
     let nb = norm(b);
     if na < 1e-12 || nb < 1e-12 {
@@ -94,5 +105,15 @@ mod tests {
         assert_eq!(cosine(&[0.0, 0.0], &[1.0, 0.0]), 0.0);
         assert!((cosine(&[1.0, 0.0], &[1.0, 0.0]) - 1.0).abs() < 1e-6);
         assert!((cosine(&[1.0, 0.0], &[-1.0, 0.0]).abs() - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cosine_mismatched_dimensions_is_unrelated_not_a_partial_match() {
+        // Without the length guard, `dot`'s zip would silently compare only
+        // the first 2 components against the full 3-component norm of `b`,
+        // producing a nonzero "similarity" for two vectors that don't even
+        // live in the same space.
+        assert_eq!(cosine(&[1.0, 0.0], &[1.0, 0.0, 0.0]), 0.0);
+        assert_eq!(cosine(&[1.0, 0.0, 0.0], &[1.0, 0.0]), 0.0);
     }
 }

@@ -24,6 +24,7 @@ fn sample_belief(dim: usize) -> Belief {
         consolidated_at: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
+        session_id: None,
     }
 }
 
@@ -58,6 +59,7 @@ const EXPECTED_INDEXES: &[&str] = &[
     "idx_beliefs_layer",
     "idx_beliefs_domain",
     "idx_beliefs_tested",
+    "idx_beliefs_session",
     "idx_observations_session",
     "idx_assumptions_state",
     "idx_suppressions_hash",
