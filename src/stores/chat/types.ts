@@ -88,35 +88,6 @@ export interface PendingImage {
   data_url: string;
 }
 
-/** A single suggestion from the Adaptive Pathway extension's `decide` tool
-    (Round-C). `edge_id` is the "why was this suggested" link target (a
-    passthrough fix on the extension side — its own `attribution_id` is
-    unrelated/unusable, see that repo's KNOWN_ISSUES.md). */
-export interface AdaptivePathwayHint {
-  text: string;
-  confidence: number;
-  type: string;
-  edge_id?: string;
-  /** Short explanation behind the hint (e.g. "succeeded in 41 contexts;
-      confidence 72%"), rendered under the hint badge. `null`/absent when the
-      extension has nothing to say beyond the hint text itself. */
-  rationale?: string | null;
-  /** Which model produced this hint — drives the badge style
-      (`standard` = hollow, `ig` = "info gain", `pc` = "paradigm",
-      `wildcard` = "untested angle", with a lightbulb icon). Absent on older
-      extension versions. */
-  source_model?: string;
-}
-
-export interface ParsedHintOutput {
-  hints: AdaptivePathwayHint[];
-  confidence: number;
-  novelty: number;
-  /** True when the extension is offering to widen exploration for the next
-      few turns (the exploration-consent prompt). Absent/false on older
-      extension versions or when no offer is being made this turn. */
-  nudge_offered: boolean;
-}
 
 // Last-known mode/effort info per provider, cached in localStorage (shared
 // across windows — same webview origin) so a *brand-new* window's very first

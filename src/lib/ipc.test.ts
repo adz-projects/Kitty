@@ -22,7 +22,9 @@ vi.mock('@tauri-apps/plugin-dialog', () => ({
   save: vi.fn(),
 }));
 
-const { ipc, onStackStatus, onAdaptivePathwayStatus, onMessageDelta } = await import('./ipc');
+const { ipc, onStackStatus, onAdaptivePathwayEmbeddingStatus, onMessageDelta } = await import(
+  './ipc'
+);
 
 beforeEach(() => {
   invokeMock.mockClear();
@@ -97,9 +99,9 @@ describe('ipc invoke wrappers', () => {
     });
   });
 
-  it('adaptivePathwayToggleSuggestions calls the right command with sessionId and paused', () => {
-    void ipc.adaptivePathwayToggleSuggestions('s1', true);
-    expect(invokeMock).toHaveBeenCalledWith('adaptive_pathway_toggle_suggestions', {
+  it('setPathwaySessionPaused calls the right command with sessionId and paused', () => {
+    void ipc.setPathwaySessionPaused('s1', true);
+    expect(invokeMock).toHaveBeenCalledWith('set_pathway_session_paused', {
       sessionId: 's1',
       paused: true,
     });
@@ -122,10 +124,13 @@ describe('ipc event subscription wrappers', () => {
     expect(cb).toHaveBeenCalledWith({ status: 'ok' });
   });
 
-  it('onAdaptivePathwayStatus subscribes to the adaptive_pathway://status event', async () => {
+  it('onAdaptivePathwayEmbeddingStatus subscribes to the adaptive_pathway://embedding_status event', async () => {
     const cb = vi.fn();
-    await onAdaptivePathwayStatus(cb);
-    expect(listenMock).toHaveBeenCalledWith('adaptive_pathway://status', expect.any(Function));
+    await onAdaptivePathwayEmbeddingStatus(cb);
+    expect(listenMock).toHaveBeenCalledWith(
+      'adaptive_pathway://embedding_status',
+      expect.any(Function)
+    );
   });
 
   it('onMessageDelta subscribes to chat://message-delta and unwraps the payload', async () => {

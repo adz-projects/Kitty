@@ -1,27 +1,11 @@
 import { useEffect, useState } from 'react';
-import {
-  ipc,
-  onAdaptivePathwayStatus,
-  onAdaptivePathwayEmbeddingStatus,
-  onPullProgress,
-} from '@/lib/ipc';
-import type {
-  AdaptivePathwayStatus as ApStatus,
-  AdaptivePathwayMcpStatus,
-  EmbeddingModelStatus,
-  PullProgress,
-} from '@/lib/types';
-import { parseArgs, formatArgs } from './McpServers';
+import { ipc, onAdaptivePathwayEmbeddingStatus, onPullProgress } from '@/lib/ipc';
+import type { AdaptivePathwayMcpStatus, EmbeddingModelStatus, PullProgress } from '@/lib/types';
+import { BeliefBrowser } from './BeliefBrowser';
 
-const STATUS_LABEL: Record<ApStatus, string> = {
-  disabled: 'Disabled',
-  starting: 'Starting…',
-  ok: 'Running',
-  down: 'Not reachable',
-};
-
-/** Separate from `STATUS_LABEL` above: the sidecar can be `ok` while this is
-    `downloading`/`missing` — degraded to the hashing fallback, not an outage. */
+/** Separate from the enable checkbox: the pathway engine can be enabled and
+    its MCP tools connected while this is `downloading`/`missing` — degrades
+    to the lexical-hashing fallback, not an outage. */
 const EMBEDDING_STATUS_LABEL: Record<EmbeddingModelStatus, string> = {
   unknown: '',
   present: 'ready',
@@ -29,39 +13,23 @@ const EMBEDDING_STATUS_LABEL: Record<EmbeddingModelStatus, string> = {
   missing: 'not downloaded yet',
 };
 
-interface EnsembleWeights {
-  ig_weight_min: number;
-  ig_weight_max: number;
-  pc_weight: number;
-}
-
-/** Settings for the Adaptive Pathway extension — learns tool-use preferences
-    and suggests hints before the model picks a tool. On by default. One
-    checkbox does both halves of enabling it: spawns/supervises the HTTP
-    sidecar (a separate managed process, same as Ollama) *and* registers its
-    MCP tools with BigTiny so the model can call `decide` mid-conversation —
-    previously two separate controls (UX-simplification owner decision).
-    Launch command/args/db path/port are power-user knobs, tucked behind an
-    Advanced disclosure. */
+/** Settings for the pathway (behavioral-memory) engine — learns what the
+    user cares about and how they like to be talked to, from ordinary
+    conversation, and surfaces it back as a per-turn recall block or (for
+    reasoning-capable models on providers that support it) a seeded
+    `<think>` reflection. Runs in-process inside the BigTiny daemon (see
+    `plugins/adaptive-pathway_rust`) — there's no separate sidecar process
+    to manage anymore, just the one enable checkbox, which the daemon
+    restart under `set_adaptive_pathway_enabled` handles internally. */
 export function AdaptivePathway() {
   const [enabled, setEnabled] = useState(false);
-  const [launchCommand, setLaunchCommand] = useState('');
-  const [launchArgs, setLaunchArgs] = useState('');
-  const [dbPath, setDbPath] = useState('');
-  const [port, setPort] = useState(8700);
-  const [status, setStatus] = useState<ApStatus>('disabled');
   const [embeddingStatus, setEmbeddingStatus] = useState<EmbeddingModelStatus>('unknown');
   const [embeddingModel, setEmbeddingModel] = useState('');
-  const [embeddingBackend, setEmbeddingBackend] = useState<'ollama' | 'hashing' | 'untried' | null>(
-    null
-  );
   const [installBusy, setInstallBusy] = useState(false);
   const [installError, setInstallError] = useState('');
   const [installProgress, setInstallProgress] = useState<PullProgress | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
-  const [weights, setWeights] = useState<EnsembleWeights | null>(null);
-  const [advancedOpen, setAdvancedOpen] = useState(false);
   const [mcpStatus, setMcpStatus] = useState<AdaptivePathwayMcpStatus | null>(null);
   const [mcpStatusError, setMcpStatusError] = useState('');
 
@@ -77,77 +45,29 @@ export function AdaptivePathway() {
   const load = async () => {
     const cfg = await ipc.getConfig();
     setEnabled(cfg.adaptive_pathway_enabled);
-    setLaunchCommand(cfg.adaptive_pathway_launch_command);
-    setLaunchArgs(formatArgs(cfg.adaptive_pathway_launch_args));
-    setDbPath(cfg.adaptive_pathway_db_path);
-    setPort(cfg.adaptive_pathway_port);
     setEmbeddingModel(cfg.adaptive_pathway_embedding_model);
-    // Best-effort initial reads — both have a live event subscription set up
-    // right after this call returns (onAdaptivePathwayStatus/
-    // onAdaptivePathwayEmbeddingStatus below), which will catch the display
-    // up on the next real status change even if this fetch fails.
-    await ipc
-      .getAdaptivePathwayStatus()
-      .then(setStatus)
-      .catch(() => {});
-    await ipc
-      .getAdaptivePathwayEmbeddingStatus()
-      .then(setEmbeddingStatus)
-      .catch(() => {});
+    loadMcpStatus();
   };
 
   useEffect(() => {
     void load();
-    loadMcpStatus();
-    const un = onAdaptivePathwayStatus((p) => setStatus(p.status));
     const unEmbedding = onAdaptivePathwayEmbeddingStatus((p) => setEmbeddingStatus(p.status));
-    return () => {
-      void un.then((fn) => fn());
-      void unEmbedding.then((fn) => fn());
-    };
+    return () => void unEmbedding.then((fn) => fn());
   }, []);
-
-  useEffect(() => {
-    if (status !== 'ok') {
-      setWeights(null);
-      setEmbeddingBackend(null);
-      return;
-    }
-    // Best-effort: a failure just leaves the ensemble-weights/embedding-
-    // backend display blank until `status` next changes and this re-runs.
-    void ipc
-      .adaptivePathwayGetState()
-      .then((s) => {
-        setWeights(s.ensemble_weights);
-        setEmbeddingBackend(s.embedding?.backend ?? null);
-      })
-      .catch(() => {});
-    // Refresh the MCP-tools connection state whenever the sidecar status
-    // changes — e.g. after a Restart or a settings toggle — so the "tools
-    // connected" line stays current.
-    loadMcpStatus();
-  }, [status]);
 
   useEffect(() => {
     const un = onPullProgress((p) => {
       if (p.model !== embeddingModel) return;
       setInstallProgress(p);
-      if (p.done && !p.error) {
-        // Best-effort — same reasoning as the initial load() fetch above.
-        void ipc
-          .getAdaptivePathwayEmbeddingStatus()
-          .then(setEmbeddingStatus)
-          .catch(() => {});
-      }
     });
     return () => void un.then((fn) => fn());
   }, [embeddingModel]);
 
-  /** Settings' own "set up the learning model" action (Gap 2): checks
-      Ollama, installs it if missing, ensures it's running, then pulls the
-      pinned tag — same building blocks as `EmbeddingModelStep` in the
-      wizard, just reachable after setup too (e.g. the user skipped it, or
-      deleted the model later with `ollama rm`). */
+  /** Settings' own "set up the learning model" action: checks Ollama,
+      installs it if missing, ensures it's running, then pulls the pinned
+      tag — same building blocks as `EmbeddingModelStep` in the wizard, just
+      reachable after setup too (e.g. the user skipped it, or deleted the
+      model later with `ollama rm`). */
   const installEmbeddingModel = async () => {
     setInstallBusy(true);
     setInstallError('');
@@ -171,67 +91,31 @@ export function AdaptivePathway() {
     }
   };
 
-  const saveField = async (patch: {
-    adaptive_pathway_launch_command?: string;
-    adaptive_pathway_launch_args?: string[];
-    adaptive_pathway_db_path?: string;
-    adaptive_pathway_port?: number;
-  }) => {
-    const cfg = await ipc.getConfig();
-    await ipc.setConfig({ ...cfg, ...patch });
-  };
-
-  /** Turning this on/off drives both the sidecar process and its BigTiny MCP
-      server registration (the `decide`/`record_outcome` tools) together —
-      the Rust command self-heals the MCP registration, so the frontend just
-      flips the flag and re-reads status. */
+  /** Flips the config flag; the Rust command restarts BigTiny (which is
+      what actually starts/stops the in-process engine — it's linked into
+      that process, there's nothing separate to spawn) and self-heals the
+      MCP registration, so the frontend just flips the flag and re-reads
+      status once it settles. */
   const setEnabledCombined = async (next: boolean) => {
     setBusy(true);
     setError('');
     try {
       setEnabled(next);
       await ipc.setAdaptivePathwayEnabled(next);
-      await ipc.getAdaptivePathwayStatus().then(setStatus);
+      loadMcpStatus();
     } catch (e) {
       setError(String(e));
     } finally {
       setBusy(false);
     }
   };
-
-  const restart = async () => {
-    setBusy(true);
-    setError('');
-    try {
-      await ipc.restartAdaptivePathway();
-      await ipc.getAdaptivePathwayStatus().then(setStatus);
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const commitWeights = async (next: EnsembleWeights) => {
-    try {
-      const result = await ipc.adaptivePathwayUpdateEnsembleWeights(
-        next.ig_weight_min,
-        next.ig_weight_max,
-        next.pc_weight
-      );
-      setWeights(result);
-    } catch (e) {
-      setError(String(e));
-    }
-  };
-
-  const statusDotClass = status === 'ok' ? 'ok' : status === 'down' ? 'bad' : 'warn';
 
   return (
     <section className="settings-section">
       <h1>Adaptive Pathway</h1>
       <p className="muted">
-        Learns your tool-use preferences and suggests hints before the model picks a tool.
+        Learns what you care about and how you like to be talked to from ordinary conversation, and
+        quietly adapts — never as a fact stated about you, always something you can correct.
       </p>
       {error && <div className="chat-error">{error}</div>}
 
@@ -245,40 +129,19 @@ export function AdaptivePathway() {
         <span>Enable Adaptive Pathway</span>
       </label>
       <small className="muted">
-        Starts the background process that learns your preferences and registers its tools so the
-        model can actually suggest hints. Requires{' '}
-        <code>pip install adaptive-pathway[sidecar]</code> — if it isn&apos;t installed, this just
-        stays &quot;Not reachable&quot; below, no error spam.
+        Runs in-process inside Kitty&apos;s local engine — restarting it applies this change.
       </small>
 
-      <div className="row" style={{ alignItems: 'center' }}>
-        <span className={`status-dot ${statusDotClass}`} />
-        <span>{STATUS_LABEL[status]}</span>
-        {status !== 'disabled' && embeddingStatus !== 'unknown' && (
-          <span className="muted">· learning model {EMBEDDING_STATUS_LABEL[embeddingStatus]}</span>
-        )}
-        {embeddingBackend && embeddingBackend !== 'untried' && (
-          <span className="muted">
-            ·{' '}
-            {embeddingBackend === 'ollama'
-              ? 'semantic embeddings active'
-              : 'using fallback vectors'}
-          </span>
-        )}
-        <button disabled={busy || status === 'disabled'} onClick={() => void restart()}>
-          Restart
-        </button>
-      </div>
-      {status === 'ok' && (
-        <small className="muted">
+      {enabled && (
+        <small className="muted" style={{ display: 'block', marginTop: 8 }}>
           {mcpStatusError ? (
             <>Couldn&apos;t check tool registration: {mcpStatusError}</>
           ) : mcpStatus == null ? (
             <>Tools not registered with BigTiny yet — will appear shortly.</>
           ) : mcpStatus.status === 'connected' ? (
             <>
-              Tools connected: <strong>{mcpStatus.tool_count}</strong> available to the model
-              (decide, record_outcome, …).
+              Connected: <strong>{mcpStatus.tool_count}</strong> tool
+              {mcpStatus.tool_count === 1 ? '' : 's'} available to the model (record, forget).
             </>
           ) : (
             <>
@@ -289,12 +152,12 @@ export function AdaptivePathway() {
         </small>
       )}
 
-      {status !== 'disabled' && embeddingStatus === 'missing' && (
+      {enabled && embeddingStatus === 'missing' && (
         <div className="dep-row" style={{ flexDirection: 'column', alignItems: 'stretch', gap: 8 }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
             <span className="muted">
-              The shared learning model ({embeddingModel}) isn&apos;t downloaded yet — suggestions
-              still work, just with less precision.
+              The shared learning model ({embeddingModel}) isn&apos;t downloaded yet — memory still
+              works, just with less precise recall (a lexical fallback instead of real embeddings).
             </span>
             <button disabled={installBusy} onClick={() => void installEmbeddingModel()}>
               {installBusy ? 'Setting up…' : 'Set up learning model'}
@@ -305,9 +168,7 @@ export function AdaptivePathway() {
               <div className="pull-head">
                 <span>{installProgress.model}</span>
                 <span className="muted">
-                  {installProgress.error
-                    ? `error: ${installProgress.error}`
-                    : installProgress.status}
+                  {installProgress.error ? `error: ${installProgress.error}` : installProgress.status}
                 </span>
               </div>
               <div className="progress">
@@ -324,144 +185,19 @@ export function AdaptivePathway() {
               </div>
             </div>
           )}
-          {installError && (
-            <p className="muted">Couldn&apos;t set up automatically: {installError}</p>
-          )}
+          {installError && <p className="muted">Couldn&apos;t set up automatically: {installError}</p>}
         </div>
       )}
-
-      <button
-        type="button"
-        className="disclosure-toggle"
-        onClick={() => setAdvancedOpen((o) => !o)}
-      >
-        {advancedOpen ? '▾' : '▸'} Advanced
-      </button>
-      {/* Explicit conditional render, not native <details> collapse — this
-          WebView2/Chromium build doesn't actually hide non-open <details>
-          content (confirmed live via Providers.tsx's identical disclosure),
-          so visibility can't be left to CSS. */}
-      {advancedOpen && (
-        <div>
-          <p className="muted">
-            Launch command, extra args, database path, and port — the sidecar and the MCP tools both
-            point at the same database path so they see the same learned data.
-          </p>
-          <div className="field">
-            <span>Launch command</span>
-            <input
-              value={launchCommand}
-              onChange={(e) => setLaunchCommand(e.target.value)}
-              onBlur={() => void saveField({ adaptive_pathway_launch_command: launchCommand })}
-            />
-          </div>
-          <div className="field">
-            <span>Extra launch args (space-separated, e.g. --config-path)</span>
-            <input
-              value={launchArgs}
-              onChange={(e) => setLaunchArgs(e.target.value)}
-              onBlur={() =>
-                void saveField({
-                  adaptive_pathway_launch_args: parseArgs(launchArgs),
-                })
-              }
-            />
-          </div>
-          <div className="field">
-            <span>Database path</span>
-            <input
-              value={dbPath}
-              onChange={(e) => setDbPath(e.target.value)}
-              onBlur={() => void saveField({ adaptive_pathway_db_path: dbPath })}
-            />
-          </div>
-          <div className="field">
-            <span>Port</span>
-            <input
-              type="number"
-              value={port}
-              onChange={(e) => setPort(Number(e.target.value))}
-              onBlur={() => void saveField({ adaptive_pathway_port: port })}
-            />
-          </div>
-        </div>
+      {enabled && embeddingStatus !== 'unknown' && embeddingStatus !== 'missing' && (
+        <small className="muted" style={{ display: 'block' }}>
+          Learning model {EMBEDDING_STATUS_LABEL[embeddingStatus]}.
+        </small>
       )}
 
-      <h2>Insights (advanced)</h2>
-      <p className="muted">
-        Live, per-process tuning — no restart needed. These shift how much weight two of the
-        extension&apos;s models get when blending a suggestion; leave them alone unless you have a
-        specific reason to adjust.
-      </p>
-      {!weights && <p className="muted">Enable Adaptive Pathway to configure these.</p>}
-      {weights && (
+      {enabled && (
         <>
-          <div className="field param-slider">
-            <span>
-              IG weight floor — the Information-Gain model&apos;s minimum influence, even in
-              familiar territory
-            </span>
-            <small className="muted">
-              Keeps Kitty exploring a little, even when it&apos;s confident.
-            </small>
-            <div className="row">
-              <input
-                type="range"
-                min={0}
-                max={0.3}
-                step={0.01}
-                value={weights.ig_weight_min}
-                onChange={(e) => setWeights({ ...weights, ig_weight_min: Number(e.target.value) })}
-                onMouseUp={() => void commitWeights(weights)}
-                onTouchEnd={() => void commitWeights(weights)}
-              />
-              <span className="status-badge">{weights.ig_weight_min.toFixed(2)}</span>
-            </div>
-          </div>
-          <div className="field param-slider">
-            <span>
-              IG weight ceiling — the Information-Gain model&apos;s maximum influence, when plateau
-              risk is highest
-            </span>
-            <small className="muted">
-              Caps how far Kitty leans into exploring when it&apos;s unsure what to suggest.
-            </small>
-            <div className="row">
-              <input
-                type="range"
-                min={0.3}
-                max={0.7}
-                step={0.01}
-                value={weights.ig_weight_max}
-                onChange={(e) => setWeights({ ...weights, ig_weight_max: Number(e.target.value) })}
-                onMouseUp={() => void commitWeights(weights)}
-                onTouchEnd={() => void commitWeights(weights)}
-              />
-              <span className="status-badge">{weights.ig_weight_max.toFixed(2)}</span>
-            </div>
-          </div>
-          <div className="field param-slider">
-            <span>
-              Paradigm Challenge weight — raise to strengthen the bias counterweight against
-              tunnel-visioned suggestions
-            </span>
-            <small className="muted">
-              Keeps Kitty from getting stuck suggesting the same kind of thing.
-            </small>
-            <div className="row">
-              <input
-                type="range"
-                min={0}
-                max={0.25}
-                step={0.01}
-                value={weights.pc_weight}
-                onChange={(e) => setWeights({ ...weights, pc_weight: Number(e.target.value) })}
-                onMouseUp={() => void commitWeights(weights)}
-                onTouchEnd={() => void commitWeights(weights)}
-              />
-              <span className="status-badge">{weights.pc_weight.toFixed(2)}</span>
-            </div>
-          </div>
+          <h2>What it remembers</h2>
+          <BeliefBrowser />
         </>
       )}
     </section>

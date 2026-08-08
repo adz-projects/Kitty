@@ -6,27 +6,16 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { open as openDialog, save as saveDialog } from '@tauri-apps/plugin-dialog';
 import type {
-  AdaptivePathwayDomain,
-  AdaptivePathwayEdge,
-  AdaptivePathwayGraphHealth,
-  AdaptivePathwayHealthIssue,
-  AdaptivePathwayMetrics,
-  AdaptivePathwaySchismAlert,
-  AdaptivePathwaySessionReflection,
-  AdaptivePathwaySchismPayload,
-  AdaptivePathwayState,
-  AdaptivePathwayStatus,
-  AdaptivePathwayStatusPayload,
   AdaptivePathwayEmbeddingStatusPayload,
   AdaptivePathwayMcpStatus,
   PathwayBelief,
+  PathwayStats,
   ApprovalNeededEvent,
   ChatErrorEvent,
   CompactionEvent,
   CompleteEvent,
   Config,
   Detection,
-  EmbeddingModelStatus,
   EnvVar,
   FileAttachment,
   FileEntry,
@@ -342,8 +331,8 @@ export const ipc = {
     invoke<void>('set_adaptive_pathway_enabled', { enabled }),
   /** Every belief currently held (Settings belief browser). */
   getPathwayBeliefs: () => invoke<{ beliefs: PathwayBelief[]; count: number }>('get_pathway_beliefs'),
-  /** Belief counts by layer. */
-  getPathwayStats: () => invoke<{ total: number; by_layer: Record<string, number> }>('get_pathway_stats'),
+  /** Belief counts by layer, plus embedding-migration progress. */
+  getPathwayStats: () => invoke<PathwayStats>('get_pathway_stats'),
   /** Belief browser's delete action — suppresses + tombstones, not a bare row delete. */
   deletePathwayBelief: (beliefId: string) =>
     invoke<{ id: string; dropped?: string; error?: string }>('delete_pathway_belief', { beliefId }),
@@ -352,81 +341,6 @@ export const ipc = {
     invoke<{ session_id: string; paused: boolean }>('set_pathway_session_paused', {
       sessionId,
       paused,
-    }),
-  // --- Everything below this line calls Rust commands that no longer
-  // exist (the tool-selection-era sidecar they backed has been replaced by
-  // the behavioral-memory engine above, whose route/command surface is much
-  // smaller — see `plugins/adaptive-pathway_rust/src/routes.rs`). Kept only
-  // so the still-unmigrated Settings components below referencing them
-  // continue to type-check; every call will fail at runtime with a
-  // command-not-found error until those components are rewritten against
-  // the belief-based surface above. Do not add new callers of these. ---
-  getAdaptivePathwayStatus: () => invoke<AdaptivePathwayStatus>('get_adaptive_pathway_status'),
-  getAdaptivePathwayEmbeddingStatus: () =>
-    invoke<EmbeddingModelStatus>('get_adaptive_pathway_embedding_status'),
-  restartAdaptivePathway: () => invoke<void>('restart_adaptive_pathway'),
-  adaptivePathwayGetEdge: (edgeId: string) =>
-    invoke<AdaptivePathwayEdge>('adaptive_pathway_get_edge', { edgeId }),
-  adaptivePathwayGetState: () => invoke<AdaptivePathwayState>('adaptive_pathway_get_state'),
-  adaptivePathwayGetMetrics: () => invoke<AdaptivePathwayMetrics>('adaptive_pathway_get_metrics'),
-  adaptivePathwayRecordAnnotation: (
-    sessionId: string,
-    annotationType: string,
-    edgeId: string | null,
-    actionId: string | null,
-    intensity: number
-  ) =>
-    invoke<void>('adaptive_pathway_record_annotation', {
-      sessionId,
-      annotationType,
-      edgeId,
-      actionId,
-      intensity,
-    }),
-  adaptivePathwayToggleSuggestions: (sessionId: string, paused: boolean) =>
-    invoke<void>('adaptive_pathway_toggle_suggestions', { sessionId, paused }),
-  adaptivePathwayGetSchism: () =>
-    invoke<AdaptivePathwaySchismAlert | { state: 'none' }>('adaptive_pathway_get_schism'),
-  adaptivePathwayResolveSchism: (keepFaction: 'a' | 'b' | 'both') =>
-    invoke<{ status: string }>('adaptive_pathway_resolve_schism', { keepFaction }),
-  adaptivePathwayUpdateEnsembleWeights: (
-    igWeightMin: number | null,
-    igWeightMax: number | null,
-    pcWeight: number | null
-  ) =>
-    invoke<{ ig_weight_min: number; ig_weight_max: number; pc_weight: number }>(
-      'adaptive_pathway_update_ensemble_weights',
-      { igWeightMin, igWeightMax, pcWeight }
-    ),
-  adaptivePathwayHealth: () =>
-    invoke<{ issues: AdaptivePathwayHealthIssue[] }>('adaptive_pathway_health'),
-  adaptivePathwayGraphHealth: () =>
-    invoke<AdaptivePathwayGraphHealth>('adaptive_pathway_graph_health'),
-  adaptivePathwayListDomains: () =>
-    invoke<AdaptivePathwayDomain[]>('adaptive_pathway_list_domains'),
-  adaptivePathwayUpdateDomain: (
-    domainId: string,
-    name: string | null,
-    dppDiversityWeight: number | null,
-    noveltyLambda: number | null,
-    locked: boolean | null
-  ) =>
-    invoke<AdaptivePathwayDomain>('adaptive_pathway_update_domain', {
-      domainId,
-      name,
-      dppDiversityWeight,
-      noveltyLambda,
-      locked,
-    }),
-  adaptivePathwayAcceptNudge: (sessionId: string) =>
-    invoke<{ status: string; active: boolean; multiplier: number }>(
-      'adaptive_pathway_accept_nudge',
-      { sessionId }
-    ),
-  adaptivePathwayDismissNudge: () => invoke<void>('adaptive_pathway_dismiss_nudge'),
-  adaptivePathwayGetSessionReflection: (sessionId: string) =>
-    invoke<AdaptivePathwaySessionReflection>('adaptive_pathway_get_session_reflection', {
-      sessionId,
     }),
 };
 
@@ -497,24 +411,14 @@ export function onStartupPhase(cb: (payload: StartupPhasePayload) => void): Prom
   return listen<StartupPhasePayload>('stack://startup-phase', (e) => cb(e.payload));
 }
 
-/** Adaptive Pathway sidecar status changes (kept separate from stack status —
-    an optional augmentation, not a chat-blocking dependency). */
-export const onAdaptivePathwayStatus = (cb: (payload: AdaptivePathwayStatusPayload) => void) =>
-  listen<AdaptivePathwayStatusPayload>('adaptive_pathway://status', (e) => cb(e.payload));
-
-/** Embedding-model readiness changes (downloading/present/missing) — separate
-    from the sidecar status above; see `EmbeddingModelStatus`. */
+/** Embedding-model readiness changes (downloading/present/missing) for the
+    pathway engine's shared embedding model — see `EmbeddingModelStatus`. */
 export const onAdaptivePathwayEmbeddingStatus = (
   cb: (payload: AdaptivePathwayEmbeddingStatusPayload) => void
 ) =>
   listen<AdaptivePathwayEmbeddingStatusPayload>('adaptive_pathway://embedding_status', (e) =>
     cb(e.payload)
   );
-
-/** Fires only when `schism_state` flips into `detected`/`reviewing` — drives
-    the Schism Resolution modal without needing Settings open. */
-export const onAdaptivePathwaySchism = (cb: (payload: AdaptivePathwaySchismPayload) => void) =>
-  listen<AdaptivePathwaySchismPayload>('adaptive_pathway://schism', (e) => cb(e.payload));
 
 // --- Chat event subscriptions (Phase 2) ---
 export const onMessageDelta = (cb: (e: TextDeltaEvent) => void) =>

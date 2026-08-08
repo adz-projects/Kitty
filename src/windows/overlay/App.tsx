@@ -9,7 +9,6 @@ import { RecentSessions } from '@/components/sessions/RecentSessions';
 import { NewChatIcon } from '@/components/icons/NewChatIcon';
 import { DoubleChevronIcon } from '@/components/icons/DoubleChevronIcon';
 import { SettingsGearIcon } from '@/components/icons/SettingsGearIcon';
-import { SchismResolutionModal } from '@/components/chat/SchismResolutionModal';
 import type { StackStatus } from '@/lib/types';
 
 const DEGRADED: StackStatus[] = ['ollama_down', 'backend_down', 'no_model', 'provider_unreachable'];
@@ -77,7 +76,6 @@ export function App() {
           {degraded ? <StackStatusView status={status} /> : <ChatView />}
         </div>
       </div>
-      <SchismResolutionModal />
     </div>
   );
 }

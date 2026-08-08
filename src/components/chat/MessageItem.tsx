@@ -4,9 +4,7 @@ import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
 import 'highlight.js/styles/github.css';
 import {
-  findHintToolCall,
   isVisualizationToolCall,
-  parseHintOutput,
   stripInternalMarkers,
   stripPromptPreamble,
   useChatStore,
@@ -17,12 +15,8 @@ import { PreviousAttemptBox } from './PreviousAttemptBox';
 import { CodeBlock } from './CodeBlock';
 import { MessageInfo } from './MessageInfo';
 import { MessageAttachmentChips } from './MessageAttachmentChips';
-import { HintBadge } from './HintBadge';
-import { HintFeedbackButtons } from './HintFeedbackButtons';
-import { NudgeConsentPrompt } from './NudgeConsentPrompt';
 import { VisualizationCard } from './VisualizationCard';
 import { ipc } from '@/lib/ipc';
-import { useHintFeedbackDiscoverable } from '@/lib/hintFeedbackDiscoverability';
 
 /** Open markdown links with the OS default handler instead of navigating the
     Kitty window itself — Tauri's webview otherwise treats a bare `<a href>`
@@ -65,9 +59,6 @@ export const MessageItem = memo(function MessageItem({
   const branch = useChatStore((s) => s.branch);
   const regenerate = useChatStore((s) => s.regenerate);
   const exportSession = useChatStore((s) => s.exportSession);
-  const sessionId = useChatStore((s) => s.sessionId);
-  const hasHint = !!parseHintOutput(findHintToolCall(message));
-  const hintDiscoverable = useHintFeedbackDiscoverable(hasHint);
 
   // Branch/Regenerate/Export each fire a round-trip to goosed (fork/prompt/
   // export). Latch while one is running so a double-click can't fork twice or
@@ -79,13 +70,6 @@ export const MessageItem = memo(function MessageItem({
     void Promise.resolve(fn()).finally(() => setBusy(false));
   };
 
-  /** Copying a response is an implicit "this was worth keeping" signal —
-      same annotation type/plumbing as HintFeedbackButtons' explicit 👍
-      (`micro_positive`, routed to the message's first hint's edge exactly
-      like that component), just triggered by the existing Copy action
-      instead of a dedicated click. Lower intensity than the explicit 👍
-      (0.6 vs 0.8) since this is inferred, not a deliberate feedback click.
-      No-ops when the message has no `decide` hint to attribute it to. */
   const [copied, setCopied] = useState(false);
   const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(
@@ -105,16 +89,10 @@ export const MessageItem = memo(function MessageItem({
       .catch(() => {
         /* clipboard may be unavailable */
       });
-    if (!sessionId) return;
-    const parsed = parseHintOutput(findHintToolCall(message));
-    const edgeId = parsed?.hints[0]?.edge_id;
-    if (edgeId) {
-      void ipc.adaptivePathwayRecordAnnotation(sessionId, 'micro_positive', edgeId, null, 0.6);
-    }
   };
 
   const actions = (
-    <div className={`msg-actions${hintDiscoverable ? ' msg-actions-discoverable' : ''}`}>
+    <div className="msg-actions">
       <button
         title="Branch a new session from here"
         disabled={busy}
@@ -141,7 +119,6 @@ export const MessageItem = memo(function MessageItem({
           <button title="Copy as Markdown" onClick={copyMessage}>
             {copied ? 'Copied' : 'Copy'}
           </button>
-          <HintFeedbackButtons message={message} />
           <MessageInfo message={message} />
         </>
       )}
@@ -207,8 +184,6 @@ export const MessageItem = memo(function MessageItem({
           </ReactMarkdown>
         </div>
       )}
-      <HintBadge message={message} />
-      <NudgeConsentPrompt message={message} />
       {actions}
     </div>
   );

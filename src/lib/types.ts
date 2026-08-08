@@ -30,14 +30,10 @@ export interface Config {
   active_provider_id: string | null;
   strict_remote_mode: boolean;
   show_artifacts: boolean;
-  /** Whether Kitty spawns/supervises the Adaptive Pathway extension's HTTP
-      sidecar (off by default — a separate Python process the user installs). */
+  /** Whether the in-process behavioral-memory (pathway) engine, linked
+      directly into the BigTiny daemon, is active for this install. */
   adaptive_pathway_enabled: boolean;
-  adaptive_pathway_launch_command: string;
-  adaptive_pathway_launch_args: string[];
-  adaptive_pathway_db_path: string;
-  adaptive_pathway_port: number;
-  /** Ollama model tag used for adaptive-pathway's context embeddings — one
+  /** Ollama model tag used for the pathway engine's belief embeddings — one
       pinned tag shared by every user regardless of chat provider, so learned
       vectors live in the same space. */
   adaptive_pathway_embedding_model: string;
@@ -415,34 +411,26 @@ export interface StartupPhasePayload {
   phase: StartupPhase;
 }
 
-// --- Adaptive Pathway extension sidecar (kept separate from StackStatus —
-// this is an optional augmentation, not a chat-blocking dependency). ---
-export type AdaptivePathwayStatus = 'disabled' | 'starting' | 'ok' | 'down';
+// --- Behavioral-memory (pathway) engine — in-process inside BigTiny, see
+// `plugins/adaptive-pathway_rust` and `plugins/bigtiny_rust/src/routes/pathway.rs`. ---
 
-export interface AdaptivePathwayStatusPayload {
-  status: AdaptivePathwayStatus;
-}
-
-/** Only emitted when `schism_state` flips into `detected`/`reviewing`. */
-export interface AdaptivePathwaySchismPayload {
-  state: string;
-}
-
-/** Readiness of the shared `qwen3-embedding:0.6b` Ollama model. Separate from
-    `AdaptivePathwayStatus`: the sidecar can be `ok` (reachable, serving hints)
-    while this is `downloading`/`missing` — degrades to the hashing fallback
-    rather than reading as an outage. */
+/** Readiness of the shared `qwen3-embedding:0.6b` Ollama model the pathway
+    engine uses for belief embeddings — `downloading`/`missing` degrades
+    gracefully to the engine's lexical-hashing fallback rather than reading
+    as an outage. Mirrors `src-tauri/src/lifecycle/embedding.rs`. Queried
+    only via the `adaptive_pathway://embedding_status` event (no on-demand
+    getter command exists) — see `onAdaptivePathwayEmbeddingStatus`. */
 export type EmbeddingModelStatus = 'unknown' | 'present' | 'downloading' | 'missing';
 
 export interface AdaptivePathwayEmbeddingStatusPayload {
   status: EmbeddingModelStatus;
 }
 
-/** Connection state of the `adaptive-pathway` stdio MCP server inside BigTiny —
-    distinct from `AdaptivePathwayStatus` (the HTTP sidecar's health). `status`
-    is BigTiny's row field (`connected`/`error`/`disconnected`); `tool_count` is
-    how many AP tools (decide/record_outcome/…) are actually registered for the
-    LLM tool list — 0 while connected-but-broken or unregistered. */
+/** Connection state of the `pathway` in-process MCP server inside BigTiny.
+    `status` is BigTiny's row field (`connected`/`error`/`disconnected`);
+    `tool_count` is how many pathway tools (`record`/`forget`) are actually
+    registered for the LLM tool list — 0 while connected-but-broken or
+    unregistered. */
 export interface AdaptivePathwayMcpStatus {
   status: string;
   error_message: string | null;
@@ -464,137 +452,19 @@ export interface PathwayBelief {
   pinned: boolean;
 }
 
-/** `GET /edges/{edge_id}` result — the "why was this suggested" detail. */
-export interface AdaptivePathwayEdge {
-  id: string;
-  semantic_primitive: string;
-  domain_id: string;
-  confidence: number;
-  status: string;
-  tier: string;
-}
-
-/** `GET /schism` result when a schism is active (`{state:"none"}` otherwise). */
-export interface AdaptivePathwaySchismAlert {
-  state: string;
-  faction_a: number[];
-  faction_b: number[];
-  within_a: number;
-  within_b: number;
-  between: number;
-  faction_a_models: number;
-  faction_b_models: number;
-  detected_at: string | null;
-}
-
-export interface AdaptivePathwayEnsembleWeights {
-  ig_weight_min: number;
-  ig_weight_max: number;
-  pc_weight: number;
-}
-
-/** `GET /state` result — loosely typed (only the keys Kitty's UI actually
-    reads are named; the rest pass through as unknown). */
-/** Which embedding backend context vectors are actually coming from right
-    now — distinct from `EmbeddingModelStatus` (whether the tag is installed
-    in Ollama): this reflects whether the sidecar's `EmbeddingProvider` has
-    actually succeeded against it. `'untried'` means no `decide`/
-    `record_outcome`/`record_annotation` call carrying a `context` has fired
-    yet this process lifetime. */
-export interface AdaptivePathwayEmbeddingInfo {
-  backend: 'ollama' | 'hashing' | 'untried';
-  model: string;
-  url: string;
-}
-
-export interface AdaptivePathwayState {
-  schism_state: string;
-  ensemble_weights: AdaptivePathwayEnsembleWeights;
-  warm_ready: boolean;
-  feature_utilization: number;
-  feature_collision_rate: number;
-  plateau_risk_score: number;
-  domain_count: number;
-  embedding: AdaptivePathwayEmbeddingInfo;
-  [key: string]: unknown;
-}
-
-/** `metrics.exploration_health` — how much of the hint mix is coming from
-    the exploration models vs. the standard path. `user_exploration_score` is
-    intentionally not read by any UI (extension docs mark it internal-only). */
-export interface AdaptivePathwayExplorationHealth {
-  ig_pc_hint_ratio: number;
-  action_entropy_50w: number;
-  unique_primitives_active: number;
-  wildcard_slot_used: number;
-  user_exploration_score: number;
-}
-
-/** `GET /metrics` result — loosely typed like `AdaptivePathwayState`; Graph
-    Health only reads `metrics.exploration_health` today. */
-export interface AdaptivePathwayMetrics {
-  metrics: {
-    exploration_health: AdaptivePathwayExplorationHealth;
-    [key: string]: unknown;
+/** `GET /api/pathway/stats` result — belief counts by layer plus
+    embedding-model-migration progress (see
+    `migrations/005_belief_embedding_model.sql` and
+    `background::reembed_stale_beliefs` in `adaptive-pathway_rust`). */
+export interface PathwayStats {
+  total: number;
+  by_layer: Record<string, number>;
+  embedding_migration: {
+    /** Beliefs still tagged with a stale embedding model, awaiting the
+        background re-embed pass. */
+    pending: number;
+    current_model: string;
   };
-}
-
-/** `GET /session_reflection?session_id=...` result — the "see the roads not
-    taken?" session-footer link. `top_domains` is `[domain, count]` pairs
-    (Python's `Counter.most_common()`, serialized as JSON arrays). Note the
-    field is `acceptance_score`, not `acceptance_rate` — the extension's own
-    changelog names it differently from what the engine actually returns. */
-export interface AdaptivePathwaySessionReflection {
-  session_id: string;
-  top_domains: [string, number][];
-  acceptance_score: number;
-  unchosen_novel_edges: number;
-  reflection: string;
-  has_untested: boolean;
-  exploration_health: AdaptivePathwayExplorationHealth;
-}
-
-/** `GET /health` result — Graph Health tab (Round-D Batch 2). */
-export interface AdaptivePathwayHealthIssue {
-  severity: string;
-  component: string;
-  message: string;
-  details: Record<string, unknown>;
-}
-
-/** `GET /graph_health` result (Round-7 item 6) — mirrors
-    `adaptive_pathway.types.GraphHealth`, the richer companion to
-    `AdaptivePathwayHealthIssue`'s issues-only `/health` payload. The nested
-    `*_health`/`tier_distribution` blocks and `hotspot_details` entries are
-    intentionally loosely typed (`Record<string, unknown>`) — their shape is
-    Python-engine-internal and not otherwise mirrored on the Rust/TS side. */
-export interface AdaptivePathwayGraphHealth {
-  total_edges: number;
-  high_confidence_pct: number;
-  flagged_hotspots: number;
-  last_override_rate: number;
-  blocking_issues: boolean;
-  dimensionality_health: Record<string, unknown>;
-  ensemble_health: Record<string, unknown>;
-  novelty_health: Record<string, unknown>;
-  tier_distribution: Record<string, number>;
-  hotspot_details: Record<string, unknown>[];
-}
-
-/** `GET /domains` entry — Domain Profiles tab (Round-D Batch 2). */
-export interface AdaptivePathwayDomain {
-  id: string;
-  name: string;
-  source: string;
-  dpp_diversity_weight: number;
-  novelty_lambda: number;
-  revision_rate: number;
-  acceptance_rate: number;
-  sessions: number;
-  edge_count: number;
-  override_rate: number;
-  last_inferred: string | null;
-  locked: boolean;
 }
 
 // --- Chat / ACP (Phase 2) --- mirrors src-tauri/src/commands SessionInfo + events

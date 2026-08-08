@@ -1,142 +1,78 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { ipc } from '@/lib/ipc';
-import type { AdaptivePathwayDomain } from '@/lib/types';
-import { Modal } from '@/components/shared/Modal';
-import { LockIcon } from '@/components/icons/LockIcon';
+import type { PathwayBelief } from '@/lib/types';
 
-/** Domain Profiles tab (Round-D Batch 2) — `GET /domains` + `PUT
-    /domains/{id}`, the one admin tab with real, complete backend support
-    beyond the ensemble-weight sliders already on the main settings page. */
+interface DomainSummary {
+  domain: string;
+  count: number;
+  tested: number;
+  avgConfidence: number;
+}
+
+const UNTAGGED = '(no domain)';
+
+function summarize(beliefs: PathwayBelief[]): DomainSummary[] {
+  const byDomain = new Map<string, PathwayBelief[]>();
+  for (const b of beliefs) {
+    const key = b.domain ?? UNTAGGED;
+    const list = byDomain.get(key);
+    if (list) list.push(b);
+    else byDomain.set(key, [b]);
+  }
+  return Array.from(byDomain.entries())
+    .map(([domain, list]) => ({
+      domain,
+      count: list.length,
+      tested: list.filter((b) => b.tested).length,
+      avgConfidence: list.reduce((sum, b) => sum + b.confidence, 0) / list.length,
+    }))
+    .sort((a, b) => b.count - a.count);
+}
+
+/** Read-only belief-count-by-domain breakdown — replaces the old per-domain
+    DPP-diversity-weight/novelty-lambda editor, which doesn't have an
+    equivalent in the belief model: diversity weight (`DppConfig`) and
+    diffusion tuning are global engine config now, not tunable per domain.
+    Domains themselves are inferred at recall time from whichever existing
+    belief a query most resembles (`domains::infer_query_domain` in
+    `adaptive-pathway_rust`) — there's no separate domains table to edit. */
 export function DomainProfiles() {
-  const [domains, setDomains] = useState<AdaptivePathwayDomain[]>([]);
+  const [beliefs, setBeliefs] = useState<PathwayBelief[] | null>(null);
   const [error, setError] = useState('');
-  const [editing, setEditing] = useState<AdaptivePathwayDomain | null>(null);
-  const [form, setForm] = useState({ name: '', dpp: 1, lambda: 0.5, locked: false });
-  const [saving, setSaving] = useState(false);
 
-  const load = async () => {
-    try {
-      setDomains(await ipc.adaptivePathwayListDomains());
-    } catch (e) {
-      setError(String(e));
-    }
-  };
+  useEffect(() => {
+    void ipc
+      .getPathwayBeliefs()
+      .then((r) => setBeliefs(r.beliefs))
+      .catch((e) => setError(String(e)));
+  }, []);
 
-  useEffect(() => void load(), []);
-
-  const openEdit = (d: AdaptivePathwayDomain) => {
-    setEditing(d);
-    setForm({
-      name: d.name,
-      dpp: d.dpp_diversity_weight,
-      lambda: d.novelty_lambda,
-      locked: d.locked,
-    });
-  };
-
-  const save = async () => {
-    if (!editing) return;
-    setSaving(true);
-    try {
-      await ipc.adaptivePathwayUpdateDomain(
-        editing.id,
-        form.name,
-        form.dpp,
-        form.lambda,
-        form.locked
-      );
-      setEditing(null);
-      await load();
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setSaving(false);
-    }
-  };
+  const domains = useMemo(() => summarize(beliefs ?? []), [beliefs]);
 
   return (
     <section className="settings-section">
       <h1>Domain Profiles</h1>
       <p className="muted">
-        Kitty groups what it learns by topic area — a "domain" — so preferences from one kind of
-        work don't bleed into another.
+        What Kitty has learned, grouped by topic area — so preferences from one kind of work don&apos;t
+        bleed into another. Domains are inferred automatically as beliefs form; there&apos;s nothing to
+        configure here.
       </p>
       {error && <div className="chat-error">{error}</div>}
-      {domains.length === 0 && !error && <p className="muted">No domains learned yet.</p>}
+      {beliefs == null && !error && <p className="muted">Loading…</p>}
+      {beliefs != null && domains.length === 0 && <p className="muted">No domains learned yet.</p>}
       <div className="ext-list">
         {domains.map((d) => (
-          <div className="row" key={d.id} style={{ alignItems: 'center' }}>
+          <div className="row" key={d.domain} style={{ alignItems: 'center' }}>
             <div style={{ flex: 1 }}>
-              <div>
-                {d.name} {d.locked && <LockIcon />}
-              </div>
+              <div>{d.domain}</div>
               <div className="muted" style={{ fontSize: 11 }}>
-                DPP {d.dpp_diversity_weight.toFixed(2)} · λ {d.novelty_lambda.toFixed(2)} ·{' '}
-                {d.edge_count} edges · {d.sessions} sessions · override rate{' '}
-                {(d.override_rate * 100).toFixed(0)}%
+                {d.count} belief{d.count === 1 ? '' : 's'} · {d.tested} tested · average confidence{' '}
+                {Math.round(d.avgConfidence * 100)}%
               </div>
             </div>
-            <button onClick={() => openEdit(d)}>Edit</button>
           </div>
         ))}
       </div>
-
-      {editing && (
-        <Modal title={`Edit domain: ${editing.id}`}>
-          <div className="field">
-            <span>Name</span>
-            <input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} />
-          </div>
-          <div className="field param-slider">
-            <span>DPP diversity weight</span>
-            <small className="muted">
-              Higher = more variety in what gets suggested for this domain.
-            </small>
-            <div className="row">
-              <input
-                type="range"
-                min={0}
-                max={2}
-                step={0.05}
-                value={form.dpp}
-                onChange={(e) => setForm({ ...form, dpp: Number(e.target.value) })}
-              />
-              <span className="status-badge">{form.dpp.toFixed(2)}</span>
-            </div>
-          </div>
-          <div className="field param-slider">
-            <span>Novelty lambda</span>
-            <small className="muted">
-              Higher = more willing to try something untested instead of the safe choice.
-            </small>
-            <div className="row">
-              <input
-                type="range"
-                min={0}
-                max={1}
-                step={0.05}
-                value={form.lambda}
-                onChange={(e) => setForm({ ...form, lambda: Number(e.target.value) })}
-              />
-              <span className="status-badge">{form.lambda.toFixed(2)}</span>
-            </div>
-          </div>
-          <label className="check">
-            <input
-              type="checkbox"
-              checked={form.locked}
-              onChange={(e) => setForm({ ...form, locked: e.target.checked })}
-            />
-            <span>Lock (prevent weekly re-inference from overwriting these values)</span>
-          </label>
-          <div className="row">
-            <button className="primary" disabled={saving} onClick={() => void save()}>
-              {saving ? 'Saving…' : 'Save'}
-            </button>
-            <button onClick={() => setEditing(null)}>Cancel</button>
-          </div>
-        </Modal>
-      )}
     </section>
   );
 }

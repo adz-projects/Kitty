@@ -2,9 +2,8 @@
 // tool calls, and matching a resumed session's stored provider/model back to
 // a currently-configured Kitty provider profile.
 
-import { tryParsePyRepr } from '@/lib/pyrepr';
 import type { ProviderType, ProviderView, ToolCallUpdate } from '@/lib/types';
-import type { AdaptivePathwayHint, Artifact, Message, ParsedHintOutput, ToolCall } from './types';
+import type { Artifact, Message, ToolCall } from './types';
 
 export const closeOpen = (msgs: Message[]): Message[] =>
   msgs.map((m) => (m.open ? { ...m, open: false, streaming: false } : m));
@@ -139,22 +138,11 @@ export function findMatchingProvider(
   );
 }
 
-/** Finds the Adaptive Pathway extension's `decide` tool call on a message, if
-    any — hints correlate to messages "for free" this way, since `decide` is
-    just another tool call on the same streaming assistant message (no new
-    cross-message correlation scheme needed). Gated on `toolName` alone for
-    now; tighten to also require a specific `extensionName` once confirmed
-    live what Goose actually reports for this extension. */
-export function findHintToolCall(msg: Message): ToolCall | undefined {
-  return msg.toolCalls.find((t) => t.toolName === 'decide');
-}
-
 /** `kitty-tools`' three visualization tools (`plugins/kitty-tools/src/tools/
     viz/mod.rs`) render as an inline card in the message body instead of the
     generic collapsed tool tray — see `VisualizationCard`. Matched on
-    `toolName` alone, same as `findHintToolCall`: these names are frozen
-    (adaptive-pathway's Thompson bandit buckets by literal tool-name string),
-    so this can't silently drift out of sync with a rename. */
+    `toolName` alone; these names are frozen console-script-style tool
+    identifiers, so this can't silently drift out of sync with a rename. */
 const VISUALIZATION_TOOL_NAMES = new Set([
   'generate_accessible_svg',
   'generate_accessible_table',
@@ -163,24 +151,4 @@ const VISUALIZATION_TOOL_NAMES = new Set([
 
 export function isVisualizationToolCall(call: ToolCall): boolean {
   return !!call.toolName && VISUALIZATION_TOOL_NAMES.has(call.toolName);
-}
-
-/** Parses a `decide` tool call's `output` (Python-repr text, see `pyrepr.ts`)
-    into its hints. Returns `null` on anything unexpected — a malformed or
-    still-streaming tool output should never crash message rendering. */
-export function parseHintOutput(call: ToolCall | undefined): ParsedHintOutput | null {
-  if (!call?.output) return null;
-  const parsed = tryParsePyRepr(String(call.output)) as Record<string, unknown> | null;
-  if (!parsed || !Array.isArray(parsed.hints)) return null;
-  const hints = parsed.hints.filter(
-    (h): h is AdaptivePathwayHint =>
-      typeof h === 'object' && h !== null && typeof (h as { text?: unknown }).text === 'string'
-  );
-  if (hints.length === 0) return null;
-  return {
-    hints,
-    confidence: typeof parsed.confidence === 'number' ? parsed.confidence : 0,
-    novelty: typeof parsed.novelty === 'number' ? parsed.novelty : 0,
-    nudge_offered: parsed.nudge_offered === true,
-  };
 }

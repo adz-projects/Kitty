@@ -1,34 +1,27 @@
 import { create } from 'zustand';
-import { ipc, onAdaptivePathwayStatus } from '@/lib/ipc';
-import type { AdaptivePathwayStatus } from '@/lib/types';
+import { ipc } from '@/lib/ipc';
 
 interface AdaptivePathwayState {
-  status: AdaptivePathwayStatus;
-  /** Prime from the current status, then subscribe to changes. Idempotent —
-      mirrors `stackStore.ts`'s exact pattern. The Adaptive Pathway toggle
-      used to keep this in its own component-local state, which reset to the
-      `'disabled'` default every time `ChatView` unmounted (e.g. the
-      stack-status degraded/recovered swap in `main/App.tsx`/`overlay/App.tsx`),
-      making the button flicker even though the sidecar itself never went
-      down. Living in a store with a module-level "subscribed once" guard
-      means the status (and its live event subscription) survives any number
-      of `ChatView` mount/unmount cycles within a window's lifetime. */
+  /** Whether the pathway (behavioral-memory) engine's in-process MCP server
+      is actually connected and has tools registered — gates whether
+      `AdaptivePathwayToggle` renders at all. Unlike the retired sidecar's
+      status, there's no live-update event for this, so it's re-queried on
+      each `init()` call (component mount) rather than subscribed to once —
+      a single local Tauri command is cheap enough that re-checking on every
+      `ChatView` mount (e.g. the stack-status degraded/recovered swap in
+      `main/App.tsx`/`overlay/App.tsx`) is not worth avoiding. */
+  available: boolean;
   init: () => Promise<void>;
 }
 
-let subscribed = false;
-
 export const useAdaptivePathwayStore = create<AdaptivePathwayState>((set) => ({
-  status: 'disabled',
+  available: false,
   init: async () => {
     try {
-      set({ status: await ipc.getAdaptivePathwayStatus() });
+      const status = await ipc.getAdaptivePathwayMcpStatus();
+      set({ available: (status?.tool_count ?? 0) > 0 });
     } catch {
-      // Backend not ready yet; the health-loop event will update us.
-    }
-    if (!subscribed) {
-      subscribed = true;
-      await onAdaptivePathwayStatus((p) => set({ status: p.status }));
+      set({ available: false });
     }
   },
 }));

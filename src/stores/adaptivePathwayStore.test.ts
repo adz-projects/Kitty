@@ -1,52 +1,62 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-// Same module-level "subscribed once" guard as stackStore.ts — reset modules
-// per test for a true cold start rather than leaking subscription state.
-const getAdaptivePathwayStatus = vi.fn();
-const onAdaptivePathwayStatus = vi.fn();
+const getAdaptivePathwayMcpStatus = vi.fn();
 
 vi.mock('@/lib/ipc', () => ({
-  ipc: { getAdaptivePathwayStatus },
-  onAdaptivePathwayStatus: (...args: unknown[]) => onAdaptivePathwayStatus(...args),
+  ipc: { getAdaptivePathwayMcpStatus },
 }));
 
 beforeEach(() => {
   vi.resetModules();
-  getAdaptivePathwayStatus.mockReset().mockResolvedValue('ok');
-  onAdaptivePathwayStatus.mockReset().mockResolvedValue(() => {});
+  getAdaptivePathwayMcpStatus.mockReset();
 });
 
 describe('adaptivePathwayStore.init', () => {
-  it('primes status from ipc', async () => {
+  it('is available when the pathway MCP server has registered tools', async () => {
+    getAdaptivePathwayMcpStatus.mockResolvedValue({
+      status: 'connected',
+      error_message: null,
+      tool_count: 2,
+    });
     const { useAdaptivePathwayStore } = await import('./adaptivePathwayStore');
     await useAdaptivePathwayStore.getState().init();
-    expect(useAdaptivePathwayStore.getState().status).toBe('ok');
+    expect(useAdaptivePathwayStore.getState().available).toBe(true);
   });
 
-  it('subscribes to status updates exactly once across repeated init calls', async () => {
+  it('is unavailable when the server is connected but has zero tools', async () => {
+    getAdaptivePathwayMcpStatus.mockResolvedValue({
+      status: 'connected',
+      error_message: null,
+      tool_count: 0,
+    });
     const { useAdaptivePathwayStore } = await import('./adaptivePathwayStore');
     await useAdaptivePathwayStore.getState().init();
-    await useAdaptivePathwayStore.getState().init();
-
-    expect(onAdaptivePathwayStatus).toHaveBeenCalledTimes(1);
+    expect(useAdaptivePathwayStore.getState().available).toBe(false);
   });
 
-  it('leaves status at the disabled default when the backend is not ready yet', async () => {
-    getAdaptivePathwayStatus.mockRejectedValue(new Error('not ready'));
+  it('is unavailable when the status call returns null (engine disabled)', async () => {
+    getAdaptivePathwayMcpStatus.mockResolvedValue(null);
+    const { useAdaptivePathwayStore } = await import('./adaptivePathwayStore');
+    await useAdaptivePathwayStore.getState().init();
+    expect(useAdaptivePathwayStore.getState().available).toBe(false);
+  });
 
+  it('leaves availability false when the backend call rejects', async () => {
+    getAdaptivePathwayMcpStatus.mockRejectedValue(new Error('not ready'));
     const { useAdaptivePathwayStore } = await import('./adaptivePathwayStore');
     await expect(useAdaptivePathwayStore.getState().init()).resolves.toBeUndefined();
-
-    expect(useAdaptivePathwayStore.getState().status).toBe('disabled');
+    expect(useAdaptivePathwayStore.getState().available).toBe(false);
   });
 
-  it('applies status updates delivered via the subscription callback', async () => {
+  it('re-queries on every call rather than caching (no subscribe-once guard)', async () => {
+    getAdaptivePathwayMcpStatus.mockResolvedValue({
+      status: 'connected',
+      error_message: null,
+      tool_count: 2,
+    });
     const { useAdaptivePathwayStore } = await import('./adaptivePathwayStore');
     await useAdaptivePathwayStore.getState().init();
-
-    const handler = onAdaptivePathwayStatus.mock.calls[0][0] as (p: { status: string }) => void;
-    handler({ status: 'down' });
-
-    expect(useAdaptivePathwayStore.getState().status).toBe('down');
+    await useAdaptivePathwayStore.getState().init();
+    expect(getAdaptivePathwayMcpStatus).toHaveBeenCalledTimes(2);
   });
 });

@@ -1,9 +1,8 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect } from 'react';
 import { ipc, onFileDrop, pickFolder } from '@/lib/ipc';
-import { findHintToolCall, humanizeChatError, isChatMode, useChatStore } from '@/stores/chatStore';
+import { humanizeChatError, isChatMode, useChatStore } from '@/stores/chatStore';
 import { useStackStore } from '@/stores/stackStore';
 import { supportsReasoning } from '@/lib/reasoning_models';
-import type { AdaptivePathwaySessionReflection } from '@/lib/types';
 import { MessageList } from './MessageList';
 import { useProgressStage } from './useProgressStage';
 import { Composer } from './Composer';
@@ -16,11 +15,9 @@ import { FileChips } from './FileChips';
 import { AttachmentChips } from './AttachmentChips';
 import { ClipboardImageChips } from './ClipboardImageChips';
 import { PendingAttachmentChips } from './PendingAttachmentChips';
-import { Modal } from '@/components/shared/Modal';
 import { ErrorDetail } from '@/components/shared/ErrorDetail';
 import { ChatBubbleIcon } from '@/components/icons/ChatBubbleIcon';
 import { FolderIcon } from '@/components/icons/FolderIcon';
-import { LightbulbIcon } from '@/components/icons/LightbulbIcon';
 
 /** The shared chat surface used by both the overlay and the full window
     (CLAUDE.md rule 5). In chat mode (per-session `ModeToggle`, `isChatMode`) it
@@ -37,7 +34,6 @@ export function ChatView() {
   const errorType = useChatStore((s) => s.errorType);
   const cwd = useChatStore((s) => s.cwd);
   const title = useChatStore((s) => s.title);
-  const sessionId = useChatStore((s) => s.sessionId);
   const pendingApprovals = useChatStore((s) => s.pendingApprovals);
   const providerHost = useChatStore((s) => s.providerHost);
   const providerOffline = useChatStore((s) => s.providerOffline);
@@ -66,41 +62,6 @@ export function ChatView() {
   const chatOnly = useChatStore(isChatMode);
   const startupPhase = useStackStore((s) => s.startupPhase);
   const starting = startupPhase !== 'ready';
-  // Adaptive Pathway session hint-count summary (Round-C) — cheap client-side
-  // derivation from already-in-memory state, no new IPC needed.
-  const hintCount = useMemo(
-    () => messages.reduce((n, m) => (findHintToolCall(m) ? n + 1 : n), 0),
-    [messages]
-  );
-
-  // Session reflection (Adaptive Pathway changelog) — refetched only when a
-  // new hint appears, not on every render, since it's just for the "see the
-  // roads not taken?" link's visibility + the modal's content.
-  const [reflection, setReflection] = useState<AdaptivePathwaySessionReflection | null>(null);
-  const [showReflection, setShowReflection] = useState(false);
-  // Clear the reflection UI the moment the active session changes, so a prior
-  // session's summary can't linger — either as a stale modal that pops open on
-  // its own, or (if the new session's refetch below fails) as the wrong
-  // session's "roads not taken?" data.
-  useEffect(() => {
-    setReflection(null);
-    setShowReflection(false);
-  }, [sessionId]);
-  useEffect(() => {
-    if (!sessionId || hintCount === 0) return;
-    let cancelled = false;
-    void ipc
-      .adaptivePathwayGetSessionReflection(sessionId)
-      .then((r) => {
-        if (!cancelled) setReflection(r);
-      })
-      .catch(() => {
-        if (!cancelled) setReflection(null);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [sessionId, hintCount]);
 
   useEffect(() => {
     bindEvents();
@@ -276,45 +237,6 @@ export function ChatView() {
             onSwitchProvider={() => void ipc.openSettings('providers')}
           />
         </div>
-      )}
-      {hintCount > 0 && (
-        <div className="hint-summary muted">
-          <LightbulbIcon /> {hintCount} suggestion{hintCount > 1 ? 's' : ''} this session
-          {reflection?.has_untested && (
-            <>
-              {' · '}
-              <button className="link" onClick={() => setShowReflection(true)}>
-                see the roads not taken?
-              </button>
-            </>
-          )}
-        </div>
-      )}
-      {showReflection && reflection && (
-        <Modal title="Session reflection">
-          <p>{reflection.reflection}</p>
-          <p>
-            <span className="muted">Acceptance score:</span>{' '}
-            {(reflection.acceptance_score * 100).toFixed(0)}%
-          </p>
-          {reflection.top_domains.length > 0 && (
-            <p>
-              <span className="muted">
-                Top topic areas{' '}
-                <span title="A domain is a topic area Kitty tracks preferences for separately, like coding vs. writing.">
-                  (?)
-                </span>
-                :
-              </span>{' '}
-              {reflection.top_domains.map(([domain, count]) => `${domain} (${count})`).join(', ')}
-            </p>
-          )}
-          <p>
-            <span className="muted">Untested approaches available:</span>{' '}
-            {reflection.unchosen_novel_edges}
-          </p>
-          <button onClick={() => setShowReflection(false)}>Close</button>
-        </Modal>
       )}
       {chatOnly ? <AttachmentChips /> : <FileChips />}
       <ClipboardImageChips />

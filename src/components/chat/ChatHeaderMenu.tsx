@@ -10,14 +10,14 @@ import { AdaptivePathwayToggle } from './AdaptivePathwayToggle';
     always-visible header row. Both keep their exact existing behavior
     unchanged; this is just a new container around them, one click away. */
 export function ChatHeaderMenu({ chatOnly }: { chatOnly: boolean }) {
-  const apOk = useAdaptivePathwayStore((s) => s.status === 'ok');
+  const apAvailable = useAdaptivePathwayStore((s) => s.available);
   const [open, setOpen] = useState(false);
   const { triggerRef, popoverRef, style } = usePopoverPosition(open, () => setOpen(false));
 
   // Nothing to show — chat mode hides approval-mode switching (ModeToggle
   // already owns chat/agent, same as ChatView's prior `!chatOnly` gate) and
-  // Adaptive Pathway isn't reachable either.
-  if (chatOnly && !apOk) return null;
+  // the pathway engine isn't available either.
+  if (chatOnly && !apAvailable) return null;
 
   return (
     <div style={{ position: 'relative' }}>
