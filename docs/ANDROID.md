@@ -13,6 +13,32 @@ Status: **PLAN — approved. Not yet implemented. Execution order in §10.**
   runs AP** — in-process inside the daemon, hash-space embeddings only.
 - This document is the spec an LLM/coder executes against. Each phase lists the
   concrete targets, files, config shape, and acceptance criteria.
+- `docs/ANDROID-PLAN.md` is the companion **execution** plan (toolchain
+  bootstrap, per-gate commands, verified environment facts). This file is the
+  *spec*; that file is the *order of operations*. Keep them in sync.
+
+### Finalization pass (2026-08-08)
+
+This spec was re-derived against the current codebase before execution. What
+changed:
+
+- **The in-process MCP mechanism already exists** and already hosts
+  `kitty-tools`, `kitty-web`, `kitty-wasm` **and** `pathway` — not just AP.
+  D8/§2.1/§2.3 previously read as if this were open design work. Corrected in
+  §2.3, with the real files cited. Android's remaining work here is
+  cross-compiling those path-deps plus a per-platform registration flip.
+- **Four decisions added (D22–D25)** covering gaps the spec never addressed:
+  target/SDK levels, desktop-only `src-tauri` subsystems that must be
+  `cfg`-gated (one of which, `winreg`, is a literal first-build breaker
+  today), the `keyring` Android backend's JNI-init requirement, and the
+  Android loopback-security posture.
+- **New §2.4** documents the Android tool surface (what already degrades
+  gracefully, what needs scoping).
+- **Phase 1, 2, 7, 8 acceptance criteria extended**; §11 reconciled with D1
+  and given the two new risk classes.
+
+D1–D21 are unchanged and un-renumbered — existing references (including in
+`ANDROID-PLAN.md`) stay valid.
 
 ---
 
@@ -20,14 +46,14 @@ Status: **PLAN — approved. Not yet implemented. Execution order in §10.**
 
 | # | Decision | Where it lands |
 |---|----------|----------------|
-| D1 | **In-process llama.cpp, day 1, both OSes.** `bigtiny_rust` links `llama_cpp`. No Ollama anywhere: chat, compaction, and desktop embeddings all go through the daemon. | §2, §4 |
+| D1 | **In-process llama.cpp, day 1, both OSes.** `bigtiny_rust` links a Rust llama.cpp binding — **`llama_cpp` throughout this doc is a placeholder for whichever crate Phase 1 pins** (`llama-cpp-2` and the `llama-cpp-2rs` fork are both candidates; §11). The `LocalEngine` boundary (§3.1) is what makes that swappable. No Ollama anywhere: chat, compaction, and desktop embeddings all go through the daemon. | §2, §4, §11 |
 | D2 | **Model is pinned per chat.** Locked in at chat creation; changes only on **new chats**. No mid-stream swap, ever. | §4.1 |
 | D3 | **Scheduled tasks default to the summarizer model**; per-task override in Settings. | §7 |
 | D4 | **Embeddings on desktop only.** AP calls new `POST /api/embeddings`; `AP_EMBED_OLLAMA_URL` re-points to the daemon port. On Android, AP's pipeline runs with its **built-in hash-space embeddings** (`HASH_EMBED_MODEL` fallback) — no embed model, no `/api/embeddings` call. | §3.1 |
 | D5 | **In-app model downloads** from **HuggingFace** and the **Ollama registry** (manifest → blob → reassembled GGUF). Range+resume+sha256. | §5 |
 | D6 | **Exposed llama.cpp engine knobs** + **Quick Presets** (Precise/Balanced/Creative). | §6 |
 | D7 | **No proactive disk quota.** Only a low-free-space warning; manual delete. **Hard refusal when `free_space < model_size × 1.5`**. | §5 |
-| D8 | Adaptive-Pathway runs **on both OSes, in-process inside the BigTiny daemon** (linked crate, MCP `in_process` "pathway" server — never a separate process). Windows: daemon is a Kitty-managed sidecar; Android: daemon is in-process. Android runs the *full* AP engine (recall/surface/consolidate) with hash-space embeddings (D4); MCP tool servers: **stdio sidecar on Windows**, **`in_process` on Android**. | §2 |
+| D8 | Adaptive-Pathway runs **on both OSes, in-process inside the BigTiny daemon** (linked crate, MCP `in_process` "pathway" server — never a separate process). Windows: daemon is a Kitty-managed sidecar; Android: daemon is in-process. Android runs the *full* AP engine (recall/surface/consolidate) with hash-space embeddings (D4); MCP tool servers: **stdio sidecar on Windows**, **`in_process` on Android** — the `in_process` transport and all four servers already exist (§2.3); Android needs cross-compilation and a registration flip, not new machinery. | §2, §2.3 |
 | D9 | Frontend = 2 windows (`overlay` + `hub`); settings/wizard fold in-page. Android = same hub, mobile-rendered. | §8 |
 | D10 | **Model card** (size/RAM/VRAM/backend/one-tap new-chat default) + **"Recommended for this device" badge** computed from the fit function. | §6.3 |
 | D11 | Load-time param changes schedule an **automatic engine restart**: after the current LLM generation completes, or immediately if nothing is generating. Sessions show a non-blocking "restarting" chip. | §6.4 |
@@ -41,6 +67,10 @@ Status: **PLAN — approved. Not yet implemented. Execution order in §10.**
 | D19 | **`flash_attn` auto-detected** at engine init; never a user toggle (read-only card diagnostic `"off"`/"on (<backend>)"). | §3.3 |
 | D20 | **`auto`/`-1` select backend**: `select_backend()` returns `Cuda|Vulkan|Cpu`; fit/badge/VRAM math uses the *selected* backend's VRAM bank. | §3.3 |
 | D21 | **Windows multi-window is preserved**: two (or more) hub windows may be open at once, each with its **own independent session and its own pinned model**. Android stays single-window. | §8.1, §4.2 |
+| D22 | **`aarch64-linux-android` is the only shipped v1 ABI** (no armeabi-v7a, no x86_64 — emulator testing is a dev convenience, not a release target). **minSdk 26, targetSdk 34.** The exact NDK version is **pinned in Phase 1a from `cargo tauri android init`'s own requirement** and recorded back here — not guessed now. | §10 P1; `ANDROID-PLAN.md` P1a |
+| D23 | **Desktop-only `src-tauri` subsystems are `cfg`-gated, not ported.** Tray, global-shortcut hotkey, autostart, and `notify-rust` get `#[cfg(desktop)]`/`#[cfg(windows)]`. **`winreg` is in the plain `[dependencies]` block today and will break the very first Android build** — it must move under `[target.'cfg(windows)'.dependencies]`. No autostart equivalent ships on Android v1. | §2.5; `ANDROID-PLAN.md` P1a |
+| D24 | **Android secrets use the `keyring` crate's Android/Keystore backend**, not a hand-rolled store — but it needs its own Cargo feature **plus JNI `JavaVM`/`Context` init wiring** at startup. Treated as its own spike inside Phase 7, not an assumed-trivial feature flip. | §10 P7 |
+| D25 | **Android hardens the daemon's HTTP surface: `require_secret: true`, always.** Loopback is **not** process-private on Android — any app holding `INTERNET` can reach `127.0.0.1`. Also relax escalation-to-approval where the app sandbox *is* the security boundary. Both already flagged in code comments; neither had a decision until now. | §2.6, §10 P7 |
 
 ---
 
@@ -50,8 +80,11 @@ Status: **PLAN — approved. Not yet implemented. Execution order in §10.**
 
 | Platform | Chat | Summarizer | Embeddings | MCP tool servers | AP |
 |----------|------|-----------|------------|------------------|----|
-| Windows | Local (llama) **and** cloud providers | Local (llama) → session-model fallback | Local (via daemon endpoint) | stdio sidecars | ✓ (in-process in daemon, semantic embeddings) |
-| Android | **Cloud providers only** | Local (llama) → session-model fallback | — | `in_process` builtins | ✓ (in-process in daemon, hash-space embeddings) |
+| Windows | Local (llama) **and** cloud providers | Local (llama) → session-model fallback | Local (via daemon endpoint) | stdio sidecars (bundled `.exe`s) | ✓ (in-process in daemon, semantic embeddings) |
+| Android | **Cloud providers only** | Local (llama) → session-model fallback | — | **the same crates, `in_process`** (§2.3) | ✓ (in-process in daemon, hash-space embeddings) |
+
+The MCP-tool-server column is the only row entry that needs new *wiring* rather
+than new *code* — see §2.3.
 
 ### 2.2 Local model policy per platform (D18)
 - **Android**: exactly **one resident local model** — the summarizer (default
@@ -63,22 +96,115 @@ Status: **PLAN — approved. Not yet implemented. Execution order in §10.**
   only loads when a chat pins a local model (D2); otherwise chat talks to cloud
   providers and the slots stay only on the summarizer model.
 
-### 2.3 Adaptive-Pathway process model (D8)
+### 2.3 In-process MCP + Adaptive-Pathway process model (D8)
 
-AP is never a standalone process on either OS — it is the **linked-in
-`adaptive_pathway` crate** inside the BigTiny daemon, served as the `in_process`
-"pathway" MCP row (`ensure_builtin_servers` in src-tauri) and direct
-`PathwayEngine` calls.
+**This mechanism already exists and is already used by four servers.** It is not
+work this plan has to invent — the plan only has to *cross-compile* and
+*register* it differently. Concretely, in `plugins/bigtiny_rust/`:
+
+| Piece | File | What it does |
+|---|---|---|
+| `TransportType::InProcess` | `src/models/mcp.rs` | A fourth transport beside `Stdio`/`Sse`/`StreamableHttp`. Its DB row's `command` holds a **logical name** (`"kitty-tools"`, `"pathway"`, …), not an executable path. |
+| `connect_in_process` | `src/mcp/client.rs` | Opens a `tokio::io::duplex` pipe, spawns the server future on one end, hands the other to `rmcp`'s client. `rmcp` is generic over `AsyncRead + AsyncWrite`, so a duplex stream is indistinguishable from a child's stdio. |
+| `mcp::builtin::connect` | `src/mcp/builtin.rs` | Maps logical name → `serve_in_process` on the linked crate. `BUILTIN_SERVERS` lists them; the test `every_advertised_builtin_actually_connects` asserts every advertised name has a live match arm. |
+| `serve_in_process` | each crate's `src/lib.rs` | `kitty-tools`, `kitty-web`, `kitty-wasm`, `adaptive-pathway` each expose a `[lib]` target wrapping the same server their `main.rs` serves over stdio. |
+
+All four are already `{ path = ... }` dependencies of `bigtiny_rust`. `docs/PLUGINS.md`
+("A third shape: in-process MCP server") is the canonical write-up.
+
+**So the Android delta is narrow:**
+
+1. Cross-compile the linked crates for `aarch64-linux-android` (Phase 1).
+2. In `src-tauri/src/bigtiny/mcp.rs::ensure_builtin_servers`, register
+   `kitty-tools`/`kitty-web`/`kitty-wasm` with `transport: "in_process"` and the
+   logical name as `command`, instead of `transport: "stdio"` + a bundled exe
+   path — **exactly how `"pathway"` is already registered there today.** Gate on
+   platform; the desktop path is unchanged.
+
+There is no third option to weigh: Android 10+ blocks `exec()` of anything in an
+app-writable directory, which is *why* `InProcess` was built in the first place
+(see the rationale comments in `models/mcp.rs` and `mcp/client.rs`).
+
+**AP specifically** is never a standalone process on either OS — it's the linked
+`adaptive_pathway` crate, reached both through the `in_process` `"pathway"` MCP
+row and through direct `PathwayEngine` calls.
 
 - **Windows:** the daemon itself is a Kitty-managed sidecar
   (`lifecycle/bigtiny_proc.rs`); AP lives inside it. Semantic embeddings come
   from `POST /api/embeddings` (daemon engine).
-- **Android:** the daemon is in-process (Android can't `exec()` a sidecar), so
-  AP is naturally in-process too — **no code change separates the Android build
-  from Windows** on the AP side; the only functional difference is hash-space
-  embeddings (D4) since no embed model is loaded. Feature parity: recall,
-  surfaced-assumption ordering, consolidation, PIP (confirm/sub/uncertain),
-  suppression — identical behavior, just the vector space backing them differs.
+- **Android:** the daemon is in-process, so AP is naturally in-process too —
+  **no code change separates the Android build from Windows** on the AP side;
+  the only functional difference is hash-space embeddings (D4) since no embed
+  model is loaded. Feature parity: recall, surfaced-assumption ordering,
+  consolidation, PIP (confirm/sub/uncertain), suppression — identical behavior,
+  just the vector space backing them differs.
+
+### 2.4 Android tool surface
+
+`kitty-tools` ships **22 always-on tools on desktop, 21 on Android** (`lean_shell`
+is compiled out there), plus 3 viz tools behind `KITTY_VIZ_ENABLED`. The pinned
+list lives in `plugins/kitty-tools/tests/protocol.rs::ALWAYS_ON_TOOLS`. Most need
+nothing; the notes that matter:
+
+- **`lean_shell` is already excluded on Android** —
+  `#[cfg(not(target_os = "android"))]` in `plugins/kitty-tools/src/server.rs`,
+  with the rationale in-place ("an app-sandbox shell backed by toybox isn't a
+  useful `lean_shell` for a model to drive"). Nothing to do; don't re-add it.
+  **But `ALWAYS_ON_TOOLS` in the test is *not* gated**, so
+  `tool_surface_matches_env_gating` asserts a 22-tool surface unconditionally and
+  will fail the moment that suite is run for an Android target. Gate the
+  constant's `lean_shell` entry to match the server — a one-line fix, but a
+  confusing failure if it's hit cold.
+- **`lean_analyze_workspace` needs scoping.** It walks an arbitrary path, which
+  on Android's scoped storage only usefully covers the app's own sandbox or a
+  SAF-granted tree. Scope it to the app data dir on Android rather than letting
+  it silently return almost nothing for a path the model picked.
+- The file/Word/Excel/PDF/cache/scratchpad tools take explicit caller-supplied
+  paths and work as-is once pointed at app-private storage — the same way they
+  take an arbitrary Windows path today.
+
+This is graceful degradation, not a blocker, and it is **not** a reason to
+reintroduce a Python runtime: `kitty-docs-web` is retired, and its PDF/Excel/web
+tools were reimplemented natively in Rust (`lopdf`, `calamine`, `scraper`+`htmd`)
+precisely so no interpreter is needed. See §10 Phase 1 on `kitty-wasm`/wasmtime.
+
+### 2.5 Desktop-only subsystems to gate (D23)
+
+These are compiled unconditionally today and must be `cfg`-gated before the
+Android target can build. `tauri-plugin-single-instance` is **already** correctly
+gated (`Cargo.toml` target table + `#[cfg(desktop)]` in `lib.rs`) — use it as the
+pattern.
+
+| Subsystem | Where | Action |
+|---|---|---|
+| `winreg` (autostart, HKCU Run key) | `src-tauri/Cargo.toml` plain `[dependencies]`; `wizard.rs` | **Move to `[target.'cfg(windows)'.dependencies]`** and `cfg(windows)`-gate `autostart_enabled`/`set_autostart` + their command registrations in `lib.rs`. **This one is a hard build breaker** — `winreg` does not compile off-Windows at all. |
+| Tray | `tray.rs`; `tauri = { features = ["tray-icon"] }`; `lib.rs` setup | `#[cfg(desktop)]` the `tray::create` call; scope the feature to the desktop target. |
+| Global-shortcut hotkey | `hotkey.rs`; `tauri-plugin-global-shortcut` | `#[cfg(desktop)]`. (The raw `WH_KEYBOARD_LL` Copilot-key hook is **already gone** — only the plugin remains.) Android has no OS-wide hotkey; the overlay-summon concept doesn't exist there (D9). |
+| `notify-rust` | `src-tauri/Cargo.toml` plain `[dependencies]` | Desktop toast crate, Android-compileability unverified. Gate it; Android notifications go through the already-present `tauri-plugin-notification`. |
+| `keyring` (`windows-native` feature only) | `config/providers/` | See D24 — Android backend + JNI init, Phase 7. |
+| Overlay window creation | `windows.rs::create_overlay`, called unconditionally in `lib.rs` setup | A borderless always-on-top window over *other apps* has no Android equivalent without `SYSTEM_ALERT_WINDOW`. Gate creation; Android boots straight into the hub (D9, §8.2). |
+
+### 2.6 Android security posture (D25)
+
+Two requirements, both already flagged in code comments but previously absent
+from this plan:
+
+- **`RunOptions::require_secret = true` on Android, always, with a generated
+  secret.** The flag already exists (`plugins/bigtiny_rust/src/lib.rs`, threaded
+  into the auth middleware's `required`); `src/server/middleware.rs` already says
+  an embedding host on such a platform "should set this `true`". Nothing to
+  build — just set it, and make sure a secret is actually generated and passed.
+  Loopback is not process-private on Android: *any* installed app holding
+  `INTERNET` can reach `127.0.0.1:<daemon port>`. On desktop the open
+  `/api/health` readiness probe is fine; on Android an unauthenticated daemon
+  means every other app on the device can drive the agent, read sessions, and
+  invoke tools. This fails **silently** (nothing errors, nothing logs) if
+  missed — hence the explicit Phase 7 acceptance criterion.
+- **Relax escalation-to-approval where the sandbox is the boundary.**
+  `plugins/bigtiny_rust/src/config.rs` already carries the note that the
+  always-escalate-unrecognized-call check should be relaxed when "the daemon's
+  data root is itself the security boundary (an app sandbox, e.g. Android)".
+  Apply it for the Android build.
 
 ---
 
@@ -371,8 +497,20 @@ All under `Settings → Local models`, shared component on both OS.
 
 ### Phase 1 — Cross-compile spike + Android toolchain bounds
 - **Goal:** prove `llama_cpp` + `wasmtime` + `sqlx` cross-compile for
-  `aarch64-linux-android`; pin `llama_cpp`; confirm arch `lfm2` loads; verify
-  `-1` behaves as "all layers" across packaged backends.
+  `aarch64-linux-android`; pin the llama.cpp binding crate (D1); confirm arch
+  `lfm2` loads; verify `-1` behaves as "all layers" across packaged backends.
+- **Prerequisite:** the D23 gating in §2.5 must land *first* — `winreg` alone
+  will fail the build before any of the interesting native deps are even
+  reached. `ANDROID-PLAN.md` Phase 1a carries this as a pre-flight checklist.
+- **Why `wasmtime` is on this list** (previously unstated): it backs
+  `kitty-wasm`, the fourth in-process MCP builtin (§2.3), which hosts the
+  sandboxed code-execution tools (`wasm_python_run` et al.) via a pinned CPython
+  3.12 WASI guest. It is **not** a Python-hosting layer for the retired
+  `kitty-docs-web` — those tools are native Rust now (§2.4).
+- **Also cross-compile `kitty-tools` and `kitty-web`** — they are `bigtiny_rust`
+  path-deps too (§2.3). Both are pure Rust with no native-toolchain risk, so
+  they should be uneventful; they're named here so "the daemon builds" actually
+  means all four linked crates build.
 - **Toolchain/linkage constraints (Android):** the NDK+CMake result must be
   **statically linked** into the single Rust cdylib shipped in the APK —
   `ANDROID_STL=c++_static`, `libgcc`/`libunwind`/`libatomic` resolved statically,
@@ -383,13 +521,14 @@ All under `Settings → Local models`, shared component on both OS.
     explicit `System.loadLibrary` in `gen/android` Kotlin **before** the Rust
     runtime initializes.
 - **Acceptance:** `cargo build --target aarch64-linux-android` for `bigtiny_rust`
-  with llama + wasmtime + sqlx **+ `adaptive-pathway` (path dep, `in_process`
-  MCP row — no separate AP artifact)**; a `lfm2.5…q4_k_m.gguf` load via
-  `llama_cpp` returns
-  tokens; **app boots on an API 26–34 emulator AND one physical arm64 device with
-  zero `UnsatisfiedLinkError`/`dlopen` failures**; `readelf -d`/`nm -u` on the
-  produced `.so` confirms no unresolved external symbols. Fallback decision
-  tombstones in `docs/ANDROID.md` if `lfm2` fails.
+  with llama + wasmtime + sqlx **+ all four linked path-dep crates
+  (`adaptive-pathway`, `kitty-tools`, `kitty-web`, `kitty-wasm`) — no separate
+  artifact for any of them**; a `lfm2.5…q4_k_m.gguf` load via the pinned binding
+  returns tokens; **app boots on an API 26–34 emulator AND one physical arm64
+  device with zero `UnsatisfiedLinkError`/`dlopen` failures**; `readelf -d`/`nm -u`
+  on the produced `.so` confirms no unresolved external symbols. Record the pinned
+  NDK version back into D22. Fallback decision tombstones in `docs/ANDROID.md` if
+  `lfm2` fails.
 
 ### Phase 2 — Daemon engine (Windows first)
 - **Acceptance:** `cargo test` + `cargo clippy` clean; chat through `LocalEngine`;
@@ -400,6 +539,16 @@ All under `Settings → Local models`, shared component on both OS.
 - Files: §3 + deletion of `src-tauri/ollama/`, `commands/ollama.rs`,
   `lifecycle/ollama_proc.rs`, `lifecycle/summarizer_model.rs`,
   `config/env_helper.rs`, `state.ollama`, `providers::active_ollama_target`.
+- **Existing-install migration.** `ProviderProfile.provider_type` is an untyped
+  `String` (confirmed by the existing `old_shape_provider_migrates_with_defaults`
+  test), so a saved `"ollama"` profile keeps deserializing fine after removal —
+  **no crash, but no function either**: it silently becomes an unreachable
+  provider once `active_ollama_target` and the sidecar are gone. Per CLAUDE.md
+  rule 6 ("errors are states, not toasts"), surface it as an explicit *removed
+  provider* state in Settings → Providers with a delete/replace action, rather
+  than leaving a dead row the user has to figure out. **Acceptance:** loading a
+  pre-migration `config.json` containing a `provider_type: "ollama"` profile
+  produces that visible state and never a hard error.
 
 ### Phase 3 — Downloader
 - **Acceptance:** `download_model` (HF + Ollama registry) tests: resume-after-
@@ -432,6 +581,15 @@ All under `Settings → Local models`, shared component on both OS.
 - `KittyForegroundService` (`dataSync`, `START_STICKY`, POST_NOTIFICATIONS grant
   [wizard §8.3]), `SecretStore` (Keystore backend for provider keys/HF token),
   GGUF first-use path, no local chat picker, backward-compat.
+- **`SecretStore` = `keyring`'s Android backend (D24), not a bespoke store** —
+  its own Cargo feature **plus** JNI `JavaVM`/`Context` init wiring from Tauri's
+  Android runtime before any `keyring::Entry` call. Budget this as a spike: the
+  existing `migrate_secrets`/`get_or_create_bigtiny_encryption_key` helpers
+  assume a single backend shape and will need the init to have already run.
+- **Daemon hardening (D25, §2.6):** `require_secret: true` with a generated
+  secret; relaxed escalation-to-approval for the sandboxed data root.
+- **Tool surface:** apply §2.4's `lean_analyze_workspace` scoping;
+  `lean_shell` is already excluded, leave it that way.
 - **Download-while-backgrounded (doze + network):** service exposes a dataSync
   FGS + visible notification, a `ConnectivityManager.NetworkCallback` for
   Wi-Fi↔Cellular handoff, and byte-offset resume (§5.2) — a multi-GB GGUF pull
@@ -443,21 +601,49 @@ All under `Settings → Local models`, shared component on both OS.
 - Accept: build+install on device; summarizer cloud fallback fires; wizard grants
   perms; OEM battery restart resumes; **a model download interrupted by airplane
   mode resumes from the same byte after reconnect**; **AP recall/surface/consolidate
-  verified on-device (hash-space) and on desktop**.
+  verified on-device (hash-space) and on desktop**; **a second app on the device
+  cannot reach the daemon's `/api/*` without the secret** (D25 — verify with a
+  plain `curl` from an adb shell, which is the same unprivileged position any
+  other installed app is in).
 
 ### Phase 8 — Packaging
 - `plugins/build.py` must NOT freeze Rust sidecars for Android. `externalBin`
   removed for Android; daemon + kitty-* linked in (AP comes along inside the
   daemon crate — no separate artifact). Signed AAB + Windows installer.
 - `AGENTS.md` commands gain an `android` lane; scrub OLLAMA references in `docs/`.
+- **Update `CLAUDE.md`'s framing.** Its opening line and tech-stack section
+  currently say "Windows-only Tauri v2 desktop app" / "Windows-only target",
+  which stays *accurate* right up until this phase — so it is deliberately
+  **not** touched earlier. Once Android ships, rewrite those to the dual-target
+  reality (and the Ollama references, already stale after Phase 2). Same
+  treatment `goose-overlay-project-description.md` got when the backend swapped:
+  supersede it, don't quietly leave it wrong.
 
 ---
 
 ## 11. Risks / notes
 
-- `llama_cpp`+`wasmtime`+`sqlx` on aarch64 (Phase 1 gate). `llama-cpp-2rs`
-  (crates.io fork) stays a *decision*, not a blocker — the `LocalEngine` boundary
-  isolates a backend swap.
+- The llama.cpp binding + `wasmtime` + `sqlx` on aarch64 (Phase 1 gate). Which
+  binding crate (`llama-cpp-2`, the `llama-cpp-2rs` fork, …) stays a *decision*
+  made in Phase 1, not a blocker — the `LocalEngine` boundary isolates a backend
+  swap, which is exactly why D1 names no specific crate.
+- **`winreg` breaks the first Android build before anything interesting runs**
+  (D23/§2.5). It sits in the plain `[dependencies]` block while the `windows`
+  crate already gets a `cfg(windows)` target table — an easy thing to miss, and
+  the resulting failure looks like a toolchain problem rather than a one-line
+  manifest fix. Same class of risk for `notify-rust`, `tray-icon`, and
+  `tauri-plugin-global-shortcut`, none of which are gated today.
+- **The Android loopback exposure fails silently** (D25/§2.6). If
+  `require_secret` isn't set, nothing errors, nothing logs, and every test still
+  passes — the daemon is simply reachable by every other app on the device.
+  There's no natural moment it would be noticed, which is why it's an explicit
+  Phase 7 acceptance check rather than a note.
+- **Already de-risked — don't re-litigate:** `reqwest` is configured
+  `default-features = false, features = ["rustls-tls", …]` across the workspace,
+  with no `native-tls`/`openssl`/`openssl-sys` anywhere in `bigtiny_rust`'s
+  lockfile. That sidesteps cross-compiling OpenSSL for `aarch64-linux-android`
+  entirely. Keep it that way; a well-meaning switch to `native-tls` would
+  reintroduce a real Phase 1 blocker.
 - **NDK C++/libatomic linkage is a Phase 1 hard gate:** static `c++_static` +
   statically linked `libgcc`/`libunwind`/`libatomic`, `LLAMA_OPENMP=OFF` on
   Android, single cdylib, no leaked JNI `.so` — otherwise `UnsatisfiedLinkError`
