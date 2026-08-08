@@ -51,18 +51,14 @@ pub struct SetupValidation {
 pub async fn validate_setup(app: AppHandle) -> Result<SetupValidation, String> {
     let mut issues = Vec::new();
 
-    let (active_provider, ap_enabled, ap_port) = {
+    let (active_provider, ap_enabled) = {
         let state = app.state::<AppState>();
         let cfg = state.config.lock().unwrap();
         let active = cfg
             .active_provider_id
             .as_ref()
             .and_then(|id| cfg.providers.iter().find(|p| &p.id == id).cloned());
-        (
-            active,
-            cfg.adaptive_pathway_enabled,
-            cfg.adaptive_pathway_port,
-        )
+        (active, cfg.adaptive_pathway_enabled)
     };
 
     match &active_provider {
@@ -81,7 +77,8 @@ pub async fn validate_setup(app: AppHandle) -> Result<SetupValidation, String> {
     }
 
     let client = crate::util::http_client();
-    match lifecycle::compute_status(&app, &client).await {
+    let status = lifecycle::compute_status(&app, &client).await;
+    match status {
         StackStatus::Ok => {}
         StackStatus::Starting => issues.push("Still starting up — try again in a moment.".into()),
         StackStatus::OllamaDown => issues.push("Ollama isn't running.".into()),
@@ -92,12 +89,12 @@ pub async fn validate_setup(app: AppHandle) -> Result<SetupValidation, String> {
         }
     }
 
-    let adaptive_pathway_ok = ap_enabled
-        && crate::lifecycle::adaptive_pathway_proc::probe_health(
-            &client,
-            &format!("http://127.0.0.1:{ap_port}"),
-        )
-        .await;
+    // The pathway engine runs in-process inside BigTiny now — there's no
+    // separate sidecar to probe. "Ok" just means enabled and the daemon
+    // itself is reachable; unlike chat readiness, this doesn't care about
+    // Ollama/model/provider status (the pathway engine doesn't depend on
+    // any of those).
+    let adaptive_pathway_ok = ap_enabled && status != StackStatus::BackendDown;
 
     Ok(SetupValidation {
         ready: issues.is_empty(),

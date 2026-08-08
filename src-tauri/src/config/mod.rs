@@ -93,31 +93,18 @@ pub struct Config {
     /// `session_folders` above.
     #[serde(default)]
     pub session_modes: HashMap<String, String>,
-    /// Whether Kitty should spawn/supervise the Adaptive Pathway extension's
-    /// HTTP sidecar (and register its Goose extension in lockstep — see
-    /// Settings → Advanced → Adaptive Pathway's single enable checkbox). On by
-    /// default for fresh installs; if the Python package isn't installed the
-    /// sidecar just reports `Down` (graceful degradation, no error spam).
+    /// Whether the in-process behavioral-memory (pathway) engine, linked
+    /// directly into the BigTiny daemon, is active for this install. On by
+    /// default for fresh installs. Also gates whether Ollama must run at all
+    /// (see `lifecycle::stack_needs_ollama`) — the engine's embeddings are
+    /// always local-Ollama, regardless of the active chat provider.
     #[serde(default = "default_adaptive_pathway_enabled")]
     pub adaptive_pathway_enabled: bool,
-    /// Command used to launch the sidecar (default assumes it's on PATH).
-    #[serde(default = "default_ap_launch_command")]
-    pub adaptive_pathway_launch_command: String,
-    /// Extra arguments appended before `--db-path`/`--port` (e.g. `--config-path`).
-    #[serde(default)]
-    pub adaptive_pathway_launch_args: Vec<String>,
-    /// SQLite DB path passed to the sidecar via `--db-path`.
-    #[serde(default = "default_ap_db_path")]
-    pub adaptive_pathway_db_path: String,
-    /// Port the sidecar binds to (matches `run_server`'s own literal default).
-    #[serde(default = "default_ap_port")]
-    pub adaptive_pathway_port: u16,
-    /// Ollama model tag used for adaptive-pathway's context embeddings.
-    /// Passed to both Python processes (the sidecar and the goosed-spawned
-    /// MCP extension) via `AP_EMBED_OLLAMA_MODEL` so they can't drift apart —
-    /// cross-compatibility requires every user's vectors to live in the same
-    /// embedding space, so this is a single pinned tag, not user-configurable
-    /// per-provider.
+    /// Ollama model tag used for the pathway engine's belief embeddings.
+    /// Passed to the BigTiny daemon via `AP_EMBED_OLLAMA_MODEL` (see
+    /// `lifecycle::bigtiny_proc::spawn`) so the daemon's `EmbeddingProvider`
+    /// and Kitty's own embedding-model-presence checks (Settings, the health
+    /// loop) stay pointed at the same tag.
     #[serde(default = "default_ap_embedding_model")]
     pub adaptive_pathway_embedding_model: String,
     /// Retired: `replacement-mcp` no longer exists as its own process — all
@@ -378,10 +365,6 @@ impl Default for Config {
             show_artifacts: true,
             session_modes: HashMap::new(),
             adaptive_pathway_enabled: default_adaptive_pathway_enabled(),
-            adaptive_pathway_launch_command: default_ap_launch_command(),
-            adaptive_pathway_launch_args: Vec::new(),
-            adaptive_pathway_db_path: default_ap_db_path(),
-            adaptive_pathway_port: default_ap_port(),
             adaptive_pathway_embedding_model: default_ap_embedding_model(),
             replacement_mcp_enabled: default_true(),
             // A brand-new config needs no flip, so it starts already-migrated.
@@ -467,68 +450,16 @@ fn default_adaptive_pathway_enabled() -> bool {
     true
 }
 
-/// The sidecar is bundled as a frozen `.exe` via Tauri's `externalBin`
-/// mechanism (see `plugins/build.py`, `tauri.conf.json`'s `bundle.externalBin`)
-/// and lands next to the main app executable at install time — no Python
-/// runtime on the end user's machine. Resolves that path if present; falls
-/// back to a bare PATH-relative name otherwise (dev convenience only: running
-/// via `cargo run`/`tauri dev` never copies the bundled sidecar alongside the
-/// dev binary, and a developer working on the sidecar itself can override
-/// this config field to `uv run ...` regardless of this default).
-fn default_ap_launch_command() -> String {
-    bundled_plugin_path("adaptive-pathway-sidecar.exe")
-        .unwrap_or_else(|| "adaptive-pathway-sidecar".to_string())
-}
-
 /// Resolves `<name>` next to the currently-running executable, if it exists.
-/// Shared by every bundled-plugin default (also used to resolve the
-/// replacement-mcp and adaptive-pathway-mcp exe paths for BigTiny's MCP
-/// server registration — see `bigtiny::mcp::ensure_builtin_servers`).
+/// Shared by every bundled-plugin default (e.g. `kitty-tools`/`kitty-web`
+/// exe paths for BigTiny's MCP server registration — see
+/// `bigtiny::mcp::ensure_builtin_servers`).
 pub(crate) fn bundled_plugin_path(name: &str) -> Option<String> {
     let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
     let candidate = dir.join(name);
     candidate
         .exists()
         .then(|| candidate.to_string_lossy().into_owned())
-}
-
-/// An absolute default, not a bare relative `./pathway.db` — the sidecar
-/// (spawned by Kitty) and the adaptive-pathway MCP tools (spawned by
-/// BigTiny) are separate processes that can each have a different working
-/// directory, so a relative path risks each one silently resolving to a
-/// *different* file even when configured "the same." An absolute path
-/// removes that ambiguity. Consolidated under `%APPDATA%/Kitty/` rather than
-/// this field's pre-consolidation `%LOCALAPPDATA%/adaptive-pathway/` location
-/// (`old_default_ap_db_path`, which `migrate_ap_db_path` below migrates an
-/// existing install's db file away from).
-fn default_ap_db_path() -> String {
-    config_dir()
-        .map(|d| d.join("adaptive-pathway").join("pathway.db"))
-        .unwrap_or_else(|_| old_default_ap_db_path_buf())
-        .to_string_lossy()
-        .replace('\\', "/")
-}
-
-/// The pre-consolidation default — kept only so `migrate_ap_db_path` can
-/// recognize a config that still has it and move the db file over; also
-/// `default_ap_db_path`'s own fallback if `%APPDATA%` can't be resolved for
-/// some reason (best-effort, never panics, matching this function's own
-/// prior fallback-to-relative-ish behavior).
-fn old_default_ap_db_path_buf() -> PathBuf {
-    dirs::data_local_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("adaptive-pathway")
-        .join("pathway.db")
-}
-
-fn old_default_ap_db_path() -> String {
-    old_default_ap_db_path_buf()
-        .to_string_lossy()
-        .replace('\\', "/")
-}
-
-fn default_ap_port() -> u16 {
-    8700
 }
 
 fn default_ap_embedding_model() -> String {
@@ -665,11 +596,11 @@ pub fn load() -> Result<Config, ConfigError> {
         Ok(text) => {
             let config: Config = serde_json::from_str(&text)?;
             Ok(migrate_kitty_wasm_enabled(migrate_kitty_web_enabled(
-                migrate_kitty_split_enabled(migrate_replacement_mcp_enabled(migrate_ap_db_path(
-                    migrate_bigtiny_launch_command(migrate_ap_launch_command(migrate_recipes(
-                        migrate_hotkeys(config, &text),
+                migrate_kitty_split_enabled(migrate_replacement_mcp_enabled(
+                    migrate_bigtiny_launch_command(migrate_recipes(migrate_hotkeys(
+                        config, &text,
                     ))),
-                ))),
+                )),
             )))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
@@ -764,37 +695,13 @@ fn command_path_is_stale(command: &str) -> bool {
     }
 }
 
-/// Self-heals an existing install's `adaptive_pathway_launch_command` onto
-/// the bundled sidecar path, mirroring the AP env-var self-heal already done
-/// in `lifecycle::start_stack`. `#[serde(default = "default_ap_launch_command")]`
-/// only ever runs when the field is *absent* from the loaded JSON — a config
-/// saved before the bundled-path resolution existed already has the old bare
-/// literal `"adaptive-pathway-sidecar"` stored explicitly, so that improved
-/// default never gets a chance to apply on its own. Also self-heals a
-/// previously-resolved absolute path that's since gone missing or been
-/// reset to an empty placeholder (`command_path_is_stale`) — a value the
-/// user (or a prior dev-mode override) deliberately set to a bare PATH
-/// command, e.g. `uv run ...`, is left untouched either way.
-fn migrate_ap_launch_command(mut config: Config) -> Config {
-    const OLD_BARE_DEFAULT: &str = "adaptive-pathway-sidecar";
-    let stale = config.adaptive_pathway_launch_command == OLD_BARE_DEFAULT
-        || command_path_is_stale(&config.adaptive_pathway_launch_command);
-    if stale {
-        if let Some(bundled) = bundled_plugin_path("adaptive-pathway-sidecar.exe") {
-            config.adaptive_pathway_launch_command = bundled;
-        }
-    }
-    config
-}
-
 /// Self-heals an existing install's `bigtiny_command`/`bigtiny_args` off
 /// either dev-convenience default — the original Python-era `python -m
 /// bigtiny`, or the current `cargo run --manifest-path .../bigtiny_rust
 /// ...` (see `default_bigtiny_args`) — onto the bundled exe, once one is
-/// present. Same rationale as `migrate_ap_launch_command`, including the
-/// same stale-absolute-path self-heal (`command_path_is_stale`). A
-/// deliberate override (e.g. `uv run bigtiny`, or a source checkout via
-/// `bigtiny_dir`) is left untouched.
+/// present, including a stale-absolute-path self-heal
+/// (`command_path_is_stale`). A deliberate override (e.g. `uv run bigtiny`,
+/// or a source checkout via `bigtiny_dir`) is left untouched.
 fn migrate_bigtiny_launch_command(mut config: Config) -> Config {
     const OLD_PYTHON_COMMAND: &str = "python";
     let old_python_args = ["-m".to_string(), "bigtiny".to_string()];
@@ -836,39 +743,6 @@ fn migrate_bigtiny_launch_command(mut config: Config) -> Config {
             config.bigtiny_args = default_bigtiny_args();
         }
     }
-    config
-}
-
-/// Self-heals an existing install's `adaptive_pathway_db_path` off its
-/// pre-consolidation location (`%LOCALAPPDATA%/adaptive-pathway/pathway.db`)
-/// onto the new one under `%APPDATA%/Kitty/adaptive-pathway/` — physically
-/// moves the db file if one is sitting at the old location and nothing's at
-/// the new one yet, same rename-then-copy-fallback as `migrate_dir`, then
-/// repoints the config field. Only migrates the exact literal the old
-/// default used to produce; a deliberate override (or an install that
-/// already has the new default) is left untouched. Thin wrapper around
-/// `migrate_ap_db_path_impl` so the real move logic is unit-testable against
-/// fake temp-dir paths instead of this machine's real
-/// `%LOCALAPPDATA%/adaptive-pathway/pathway.db` (which may hold real data).
-fn migrate_ap_db_path(config: Config) -> Config {
-    migrate_ap_db_path_impl(config, &old_default_ap_db_path(), &default_ap_db_path())
-}
-
-fn migrate_ap_db_path_impl(mut config: Config, old_default: &str, new_default: &str) -> Config {
-    if config.adaptive_pathway_db_path != old_default {
-        return config;
-    }
-    let old = PathBuf::from(old_default);
-    let new = PathBuf::from(new_default);
-    if old.exists() && !new.exists() {
-        if let Some(parent) = new.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        if fs::rename(&old, &new).is_err() && fs::copy(&old, &new).is_ok() {
-            let _ = fs::remove_file(&old);
-        }
-    }
-    config.adaptive_pathway_db_path = new_default.to_string();
     config
 }
 
@@ -1094,53 +968,11 @@ mod tests {
 
     #[test]
     fn old_shape_config_migrates_adaptive_pathway_defaults() {
-        // A config predating the Adaptive Pathway integration must still load,
-        // on by default (UX-simplification decision — enabled by default for
-        // fresh/pre-existing-field configs alike), with sane
-        // launch-command/db-path/port defaults.
+        // A config predating the pathway engine's `adaptive_pathway_enabled`
+        // field must still load, on by default (UX-simplification decision —
+        // enabled by default for fresh/pre-existing-field configs alike).
         let back: Config = serde_json::from_str(r#"{"theme":"dark"}"#).unwrap();
         assert!(back.adaptive_pathway_enabled);
-        assert_eq!(
-            back.adaptive_pathway_launch_command,
-            "adaptive-pathway-sidecar"
-        );
-        // Absolute (not a bare relative "./pathway.db" — see default_ap_db_path's
-        // doc comment for why that's load-bearing, not cosmetic).
-        assert!(back.adaptive_pathway_db_path.ends_with("pathway.db"));
-        assert!(std::path::Path::new(&back.adaptive_pathway_db_path).is_absolute());
-        assert_eq!(back.adaptive_pathway_port, 8700);
-    }
-
-    #[test]
-    fn migrate_ap_launch_command_leaves_custom_override_untouched() {
-        // A deliberate dev-mode override (e.g. pointing at `uv run ...`) must
-        // never be silently overwritten by the bundled-path self-heal.
-        let cfg = Config {
-            adaptive_pathway_launch_command: "uv run adaptive-pathway-sidecar".to_string(),
-            ..Config::default()
-        };
-        let migrated = migrate_ap_launch_command(cfg);
-        assert_eq!(
-            migrated.adaptive_pathway_launch_command,
-            "uv run adaptive-pathway-sidecar"
-        );
-    }
-
-    #[test]
-    fn migrate_ap_launch_command_is_a_noop_with_no_bundled_binary_present() {
-        // The test binary has no `adaptive-pathway-sidecar.exe` sitting next to
-        // it, so `bundled_plugin_path` finds nothing and the old bare-name
-        // literal is left as-is — this is also the realistic behavior for a
-        // `cargo run`/`tauri dev` build with no frozen binary in place yet.
-        let cfg = Config {
-            adaptive_pathway_launch_command: "adaptive-pathway-sidecar".to_string(),
-            ..Config::default()
-        };
-        let migrated = migrate_ap_launch_command(cfg);
-        assert_eq!(
-            migrated.adaptive_pathway_launch_command,
-            "adaptive-pathway-sidecar"
-        );
     }
 
     #[test]
@@ -1249,80 +1081,6 @@ mod tests {
         let migrated = migrate_bigtiny_launch_command(cfg);
         assert_eq!(migrated.bigtiny_command, "cargo");
         assert!(migrated.bigtiny_args.iter().any(|a| a == "bigtiny-daemon"));
-
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn migrate_ap_db_path_leaves_custom_override_untouched() {
-        let cfg = Config {
-            adaptive_pathway_db_path: "D:/somewhere/custom/pathway.db".to_string(),
-            ..Config::default()
-        };
-        let migrated = migrate_ap_db_path(cfg);
-        assert_eq!(
-            migrated.adaptive_pathway_db_path,
-            "D:/somewhere/custom/pathway.db"
-        );
-    }
-
-    #[test]
-    fn migrate_ap_db_path_impl_moves_the_file_when_old_exists_and_new_does_not() {
-        let dir = std::env::temp_dir().join(format!("kitty-ap-db-test-{}", uuid_like()));
-        let old = dir.join("old").join("pathway.db");
-        let new = dir.join("new").join("pathway.db");
-        fs::create_dir_all(old.parent().unwrap()).unwrap();
-        fs::write(&old, b"real learned data").unwrap();
-
-        let cfg = Config {
-            adaptive_pathway_db_path: old.to_str().unwrap().to_string(),
-            ..Config::default()
-        };
-        let migrated = migrate_ap_db_path_impl(cfg, old.to_str().unwrap(), new.to_str().unwrap());
-
-        assert_eq!(migrated.adaptive_pathway_db_path, new.to_str().unwrap());
-        assert!(!old.exists());
-        assert_eq!(fs::read(&new).unwrap(), b"real learned data");
-
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn migrate_ap_db_path_impl_repoints_even_when_no_old_file_exists() {
-        // Fresh install / already-migrated case: nothing to move, but the
-        // config field should still land on the new default rather than
-        // staying pinned to the recognized old literal.
-        let dir = std::env::temp_dir().join(format!("kitty-ap-db-test-{}", uuid_like()));
-        let old = dir.join("old").join("pathway.db");
-        let new = dir.join("new").join("pathway.db");
-
-        let cfg = Config {
-            adaptive_pathway_db_path: old.to_str().unwrap().to_string(),
-            ..Config::default()
-        };
-        let migrated = migrate_ap_db_path_impl(cfg, old.to_str().unwrap(), new.to_str().unwrap());
-
-        assert_eq!(migrated.adaptive_pathway_db_path, new.to_str().unwrap());
-        assert!(!new.exists());
-    }
-
-    #[test]
-    fn migrate_ap_db_path_impl_never_overwrites_an_existing_new_file() {
-        let dir = std::env::temp_dir().join(format!("kitty-ap-db-test-{}", uuid_like()));
-        let old = dir.join("old").join("pathway.db");
-        let new = dir.join("new").join("pathway.db");
-        fs::create_dir_all(old.parent().unwrap()).unwrap();
-        fs::create_dir_all(new.parent().unwrap()).unwrap();
-        fs::write(&old, b"stale copy").unwrap();
-        fs::write(&new, b"already-migrated real data").unwrap();
-
-        let cfg = Config {
-            adaptive_pathway_db_path: old.to_str().unwrap().to_string(),
-            ..Config::default()
-        };
-        let _ = migrate_ap_db_path_impl(cfg, old.to_str().unwrap(), new.to_str().unwrap());
-
-        assert_eq!(fs::read(&new).unwrap(), b"already-migrated real data");
 
         fs::remove_dir_all(&dir).unwrap();
     }

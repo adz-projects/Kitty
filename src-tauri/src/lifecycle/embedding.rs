@@ -1,17 +1,37 @@
-//! Shared embedding-model convergence: makes sure the pinned Ollama tag
-//! Adaptive Pathway depends on is present, pulling it in the background if
-//! not. Called at `start_stack` and again periodically by the AP health loop
-//! (`lifecycle::health`) so a model deleted out-of-band, or Ollama coming up
-//! late, self-heals without the user touching Settings.
+//! Shared embedding-model convergence: makes sure the pinned Ollama tag the
+//! in-process pathway engine depends on is present, pulling it in the
+//! background if not. Called at `start_stack` and again periodically by
+//! `lifecycle::health::spawn_health_loop` so a model deleted out-of-band, or
+//! Ollama coming up late, self-heals without the user touching Settings.
 
 use tauri::{AppHandle, Emitter, Manager};
 
-use super::adaptive_pathway_proc::EmbeddingModelStatus;
 use super::ollama_proc;
 use crate::state::AppState;
 
+/// Readiness of the shared embedding model (`qwen3-embedding:0.6b` by
+/// default) that gives the pathway engine real context vectors instead of
+/// its lexical-hashing fallback. Never touches `StackStatus` (chat
+/// readiness stays independent) — the engine degrades gracefully to hashing
+/// embeddings rather than this reading as an outage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum EmbeddingModelStatus {
+    /// Not yet checked (e.g. the pathway engine disabled, or Ollama unreachable).
+    #[default]
+    Unknown,
+    /// The pinned tag is installed and ready.
+    Present,
+    /// A background `ollama pull` is in flight (progress via the existing
+    /// `ollama://pull-progress` events, keyed by `pull_id`).
+    Downloading,
+    /// Checked and not installed; no pull currently running (e.g. Ollama is
+    /// down, or the pull attempt failed).
+    Missing,
+}
+
 /// Payload for the `adaptive_pathway://embedding_status` event — only
-/// emitted on change (mirrors `adaptive_pathway://status`).
+/// emitted on change.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct AdaptivePathwayEmbeddingStatusPayload {
     pub status: EmbeddingModelStatus,

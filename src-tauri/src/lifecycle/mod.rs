@@ -5,9 +5,8 @@
 //! recomputes the [`crate::state::StackStatus`] and emits `stack://status`
 //! on change. On exit we kill only the children we spawned.
 
-pub mod adaptive_pathway_proc;
 pub mod bigtiny_proc;
-mod embedding;
+pub(crate) mod embedding;
 mod health;
 pub mod ollama_proc;
 pub mod scheduler;
@@ -15,10 +14,8 @@ mod summarizer_model;
 
 pub(crate) use embedding::ensure_embedding_model;
 pub(crate) use health::compute_status;
-pub use health::{spawn_adaptive_pathway_health_loop, spawn_health_loop};
+pub use health::spawn_health_loop;
 pub(crate) use summarizer_model::ensure_summarizer_model;
-
-use adaptive_pathway_proc::AdaptivePathwayStatus;
 
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -219,73 +216,21 @@ pub fn start_stack(app: &AppHandle) {
         }
         set_startup_phase(&app, StartupPhase::Ready);
 
-        // 2c. Adaptive Pathway extension sidecar (optional, off by default —
-        // see `adaptive_pathway_proc`). Probe-then-spawn, same as Ollama: never
-        // touch a pre-existing instance.
-        let (
-            ap_enabled,
-            ap_launch_command,
-            ap_launch_args,
-            ap_db_path,
-            ap_port,
-            ap_embedding_model,
-        ) = {
+        // Runtime guarantee for the pathway engine's shared embedding model:
+        // if Ollama is reachable but the pinned tag isn't installed yet, pull
+        // it in the background (non-blocking — the wizard's own pull is only
+        // best-effort, so this is what actually guarantees convergence on
+        // every launch, not just first run). Progress flows through the
+        // existing `ollama://pull-progress` events plus the
+        // `adaptive_pathway://embedding_status` event. Gated on the pathway
+        // engine being enabled — no point checking/pulling otherwise.
+        let (ap_enabled, ap_embedding_model) = {
             let state = app.state::<AppState>();
             let cfg = state.config.lock().unwrap();
-            (
-                cfg.adaptive_pathway_enabled,
-                cfg.adaptive_pathway_launch_command.clone(),
-                cfg.adaptive_pathway_launch_args.clone(),
-                cfg.adaptive_pathway_db_path.clone(),
-                cfg.adaptive_pathway_port,
-                cfg.adaptive_pathway_embedding_model.clone(),
-            )
+            (cfg.adaptive_pathway_enabled, cfg.adaptive_pathway_embedding_model.clone())
         };
         if ap_enabled {
-            *app.state::<AppState>()
-                .adaptive_pathway_status
-                .lock()
-                .unwrap() = AdaptivePathwayStatus::Starting;
-            match adaptive_pathway_proc::ensure_running(
-                &ap_launch_command,
-                &ap_launch_args,
-                &ap_db_path,
-                ap_port,
-                &ap_embedding_model,
-                &base,
-            )
-            .await
-            {
-                Ok(proc) => {
-                    let base = format!("http://127.0.0.1:{ap_port}");
-                    let client = crate::util::http_client();
-                    let up = adaptive_pathway_proc::probe_health(&client, &base).await;
-                    let state = app.state::<AppState>();
-                    *state.adaptive_pathway.lock().unwrap() = proc;
-                    *state.adaptive_pathway_status.lock().unwrap() = if up {
-                        AdaptivePathwayStatus::Ok
-                    } else {
-                        AdaptivePathwayStatus::Down
-                    };
-                }
-                Err(e) => {
-                    tracing::warn!("adaptive pathway sidecar ensure_running failed: {e}");
-                    *app.state::<AppState>()
-                        .adaptive_pathway_status
-                        .lock()
-                        .unwrap() = AdaptivePathwayStatus::Down;
-                }
-            }
-
-            // 2d. Runtime guarantee for the shared embedding model: if Ollama
-            // is reachable but the pinned tag isn't installed yet, pull it in
-            // the background (non-blocking — the wizard's own pull is only
-            // best-effort, so this is what actually guarantees convergence on
-            // every launch, not just first run). Progress flows through the
-            // existing `ollama://pull-progress` events (fixed `pull_id` below
-            // so a Settings UI can subscribe to it deterministically) plus the
-            // new `adaptive_pathway://embedding_status` event.
-            ensure_embedding_model(app.clone(), base.clone(), ap_embedding_model.clone()).await;
+            ensure_embedding_model(app.clone(), base.clone(), ap_embedding_model).await;
         }
 
         // 3. Begin the local stack's health loop. Per-provider (Personal/Remote)
@@ -295,7 +240,6 @@ pub fn start_stack(app: &AppHandle) {
         // inference calls of its own and a background ping had no upside a failed
         // send doesn't already give us.
         spawn_health_loop(app.clone());
-        spawn_adaptive_pathway_health_loop(app.clone());
         scheduler::spawn_scheduler_loop(app.clone());
     });
 }
@@ -306,10 +250,9 @@ pub fn start_stack(app: &AppHandle) {
 /// in `lib.rs`). It does NOT run when the process is terminated directly at
 /// the OS level instead — a terminal Ctrl+C during `tauri dev`, or tauri-cli's
 /// own dev-mode hot-restart, both kill the previous run outright rather than
-/// through this event loop. `adaptive_pathway_proc`/`bigtiny_proc`'s own
-/// `kill_stale_orphan` (run at the top of every `ensure_running`/`spawn`) is
-/// the recovery path for children orphaned that way — this function alone
-/// isn't sufficient on its own.
+/// through this event loop. `bigtiny_proc`'s own `kill_stale_orphan` (run at
+/// the top of every `spawn`) is the recovery path for children orphaned that
+/// way — this function alone isn't sufficient on its own.
 pub fn shutdown(app: &AppHandle) {
     let state = app.state::<AppState>();
     let mut bigtiny = state.bigtiny.lock().unwrap();
@@ -320,19 +263,6 @@ pub fn shutdown(app: &AppHandle) {
         bigtiny_proc::remove_pidfile();
     }
     state.ollama.lock().unwrap().kill_if_owned();
-    let mut ap = state.adaptive_pathway.lock().unwrap();
-    let ap_was_owned = ap.owned;
-    ap.kill_if_owned();
-    drop(ap);
-    if ap_was_owned {
-        let db_path = state
-            .config
-            .lock()
-            .unwrap()
-            .adaptive_pathway_db_path
-            .clone();
-        adaptive_pathway_proc::remove_pidfile(&db_path);
-    }
     tracing::info!("stack shut down (owned children killed)");
 }
 

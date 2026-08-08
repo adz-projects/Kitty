@@ -4,7 +4,6 @@
 //! lifecycle, config, tray, and the global hotkey. All I/O lives here; the
 //! webview only talks to us through the commands registered below.
 
-mod adaptive_pathway;
 mod bigtiny;
 mod commands;
 mod config;

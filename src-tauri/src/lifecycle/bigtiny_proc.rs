@@ -17,8 +17,9 @@ use crate::state::ManagedProcess;
 use crate::util::{capture_output, hidden_command};
 
 /// Name fragment of the frozen daemon exe's process — used only to confirm a
-/// pidfile's PID still looks like our own daemon before killing it (mirrors
-/// `adaptive_pathway_proc`'s identical safety check).
+/// pidfile's PID still looks like our own daemon before killing it (a
+/// recycled PID could otherwise belong to an unrelated process started
+/// later).
 const DAEMON_PROCESS_NAME_FRAGMENT: &str = "bigtiny-daemon";
 
 /// BigTiny's own consolidated data root (`%APPDATA%/Kitty/bigtiny/` — see
@@ -34,12 +35,11 @@ fn pidfile_path(dir: &Path) -> PathBuf {
 }
 
 /// Kills a stale orphan from a *previous* run of this app, if the pidfile
-/// names one that's still alive — same rationale as
-/// `adaptive_pathway_proc::kill_stale_orphan`: a graceful-exit-only cleanup
-/// path leaves this process orphaned across a `tauri dev` hot-restart or a
-/// terminal Ctrl+C, which then locks the frozen exe file against the next
-/// build. A normal launch only ever calls `spawn` once, so finding a pidfile
-/// here always means "leftover from a run that already ended."
+/// names one that's still alive: a graceful-exit-only cleanup path leaves
+/// this process orphaned across a `tauri dev` hot-restart or a terminal
+/// Ctrl+C, which then locks the frozen exe file against the next build. A
+/// normal launch only ever calls `spawn` once, so finding a pidfile here
+/// always means "leftover from a run that already ended."
 fn kill_stale_orphan_in(dir: &Path) {
     let path = pidfile_path(dir);
     let Ok(contents) = std::fs::read_to_string(&path) else {

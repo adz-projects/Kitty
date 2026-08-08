@@ -61,22 +61,15 @@ BUILD_VENV_DIRNAME = ".build-venv"
 # `kitty-tools` (Rust), `kitty-web` (Rust), and `kitty-wasm` (Rust) now (the
 # Rust consolidation) — and deliberately absent from this dict, so
 # `python plugins/build.py` (no args) no longer builds or bundles them.
+# `adaptive-pathway` (the HTTP sidecar) and `adaptive-pathway-mcp` (its stdio
+# MCP proxy) are retired the same way — the behavioral-memory engine now
+# runs in-process inside `bigtiny` (`plugins/adaptive-pathway_rust`, a path
+# dependency of `plugins/bigtiny_rust`, built as part of the `bigtiny`
+# target below, not a standalone binary of its own).
 # Their source files stay in-tree, unbuilt, as the oracle for re-verifying
 # the Rust ports against if a behavioral gap ever surfaces (see
 # docs/PLUGINS.md).
 PLUGINS: dict[str, dict[str, object]] = {
-    "adaptive-pathway": {
-        "dir": PLUGINS_DIR / "adaptive-pathway",
-        "spec": "adaptive_pathway.spec",
-        "exe": "adaptive-pathway-sidecar",
-        "extras": ["sidecar"],
-    },
-    "adaptive-pathway-mcp": {
-        "dir": PLUGINS_DIR / "adaptive-pathway",
-        "spec": "adaptive_pathway_mcp.spec",
-        "exe": "adaptive-pathway-mcp",
-        "extras": ["mcp"],
-    },
     "kitty-tools": {
         "dir": PLUGINS_DIR / "kitty-tools",
         "exe": "kitty-tools",

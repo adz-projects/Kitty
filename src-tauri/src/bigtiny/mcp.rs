@@ -264,6 +264,14 @@ pub async fn ensure_builtin_servers(app: &AppHandle) {
     // recall and the automatic turn-end/compaction learning passes run
     // regardless, gated instead by `BIGTINY_PATHWAY__ENABLED` (also set at
     // daemon spawn, from the same `adaptive_pathway_enabled` config field).
+    //
+    // This row was dead for a while: `builtin::connect` had no `"pathway"`
+    // arm and its doc comment asserted none should exist, so the row
+    // resolved to `unknown in-process server: pathway` and the model could
+    // never correct a belief it knew was wrong. Both sides are wired now,
+    // and `builtin.rs`'s `every_advertised_builtin_actually_connects` guards
+    // the pairing — but they are still two files that have to agree, so
+    // change them together.
     upsert_builtin(
         &client,
         "pathway",

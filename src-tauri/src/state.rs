@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::config::Config;
-use crate::lifecycle::adaptive_pathway_proc::{AdaptivePathwayStatus, EmbeddingModelStatus};
+use crate::lifecycle::embedding::EmbeddingModelStatus;
 
 /// A physical-pixel screen rectangle `(x, y, width, height)`, shared by the
 /// screenshot preview + selection plumbing — keeps the long tuple out of the
@@ -95,17 +95,10 @@ pub struct AppState {
     pub settings_target: Mutex<Option<Value>>,
     /// Wizard launch mode (`"setup"` or `"repair"`).
     pub wizard_mode: Mutex<Option<String>>,
-    /// The Adaptive Pathway sidecar process — only `Some(child)` when *we*
-    /// started it (never a pre-existing instance).
-    pub adaptive_pathway: Mutex<ManagedProcess>,
-    /// Last computed Adaptive Pathway sidecar status, kept separate from
-    /// `stack_status` since it's an optional augmentation, not a chat-blocking
-    /// dependency.
-    pub adaptive_pathway_status: Mutex<AdaptivePathwayStatus>,
-    /// Readiness of the shared `qwen3-embedding:0.6b` Ollama model — separate
-    /// from `adaptive_pathway_status` since the sidecar can be `Ok` while this
-    /// is still `Downloading`/`Missing` (hashing-fallback degradation, not an
-    /// outage). See `EmbeddingModelStatus`.
+    /// Readiness of the shared `qwen3-embedding:0.6b` Ollama model the
+    /// in-process pathway engine uses — `Downloading`/`Missing` degrades
+    /// gracefully to the engine's hashing fallback, not an outage. See
+    /// `EmbeddingModelStatus`.
     pub adaptive_pathway_embedding_status: Mutex<EmbeddingModelStatus>,
     /// Guards `lifecycle::summarizer_model::ensure_summarizer_model` against
     /// a duplicate concurrent pull of `Config::summarizer.model` (e.g.
@@ -193,8 +186,6 @@ impl AppState {
             active_session: Mutex::new(None),
             settings_target: Mutex::new(None),
             wizard_mode: Mutex::new(None),
-            adaptive_pathway: Mutex::new(ManagedProcess::default()),
-            adaptive_pathway_status: Mutex::new(AdaptivePathwayStatus::default()),
             adaptive_pathway_embedding_status: Mutex::new(EmbeddingModelStatus::default()),
             summarizer_model_pulling: AtomicBool::new(false),
             bigtiny: Mutex::new(DaemonHandle::default()),
