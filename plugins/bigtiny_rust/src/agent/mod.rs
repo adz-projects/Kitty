@@ -2,6 +2,7 @@ pub mod compaction;
 pub mod context;
 pub mod loop_;
 pub mod memory;
+pub mod reasoning_models;
 pub mod sandbox;
 pub mod summarizer;
 pub mod tokens;
@@ -307,7 +308,7 @@ mod tests {
 
         let config = BigTinyConfig::default();
         let router = Arc::new(ProviderRouter::new(config.cache.clone()));
-        let mcp = Arc::new(MCPManager::new(pool.clone()));
+        let mcp = Arc::new(MCPManager::new(pool.clone(), None));
         let hitl = Arc::new(Mutex::new(HITLManager::new(pool.clone(), config.hitl.clone())));
         let summarizer = Arc::new(SummarizerClient::new(config.summarizer.clone()));
         Arc::new(Agent::new(

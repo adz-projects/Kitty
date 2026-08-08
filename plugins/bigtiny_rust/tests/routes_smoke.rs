@@ -35,7 +35,7 @@ async fn test_state_with_pathway(
 
     let config = BigTinyConfig::default();
     let router = Arc::new(ProviderRouter::new(config.cache.clone()));
-    let mcp = Arc::new(MCPManager::new(pool.clone()));
+    let mcp = Arc::new(MCPManager::new(pool.clone(), None));
     let hitl = Arc::new(tokio::sync::Mutex::new(HITLManager::new(
         pool.clone(),
         config.hitl.clone(),
@@ -803,6 +803,7 @@ async fn pathway_beliefs_list_and_delete_round_trip() {
             created_at: now,
             updated_at: now,
             session_id: None,
+            embedding_model: adaptive_pathway::config::Config::default().embedding.ollama_model,
         })
         .await
         .unwrap();

@@ -116,7 +116,7 @@ pub async fn run(config: BigTinyConfig, options: RunOptions) -> Result<(), Daemo
         None
     };
 
-    let mcp = Arc::new(MCPManager::new(pool.clone()));
+    let mcp = Arc::new(MCPManager::new(pool.clone(), pathway_engine.clone()));
     mcp.connect_all().await; // isolated per-server failure, matches Python's connect_all
 
     let router = Arc::new(ProviderRouter::new(config.cache.clone()));

@@ -209,6 +209,16 @@ impl Provider for OpenAICompatibleProvider {
         Self::DEFAULT_MODEL.into()
     }
 
+    /// Unlike Anthropic, whether a trailing partial assistant message
+    /// actually continues generation (rather than erroring, or the server
+    /// just starting a fresh turn and ignoring it) depends on the specific
+    /// OpenAI-compatible server/chat-template combination and isn't part of
+    /// the spec -- see `ProviderConfig::experimental_prefill`'s doc comment.
+    /// Explicit per-provider opt-in only; never assumed.
+    fn supports_assistant_prefill(&self) -> bool {
+        self.config.experimental_prefill
+    }
+
     async fn chat_completion(
         &self,
         messages: Vec<Value>,

@@ -133,6 +133,20 @@ pub struct ProviderConfig {
     /// `Duration` by `ProviderConfig::idle_timeout` (invalid/missing → 300s).
     #[serde(default)]
     pub idle_timeout_secs: Option<f64>,
+    /// Opt-in for `Provider::supports_assistant_prefill` on an
+    /// OpenAI-compatible endpoint (Ollama or otherwise). Unlike Anthropic's
+    /// documented native trailing-assistant-message continuation, whether an
+    /// OpenAI-compatible server actually continues generation from a
+    /// trailing partial assistant message (rather than erroring or just
+    /// starting a fresh turn) depends on the specific server/chat-template
+    /// combination and is NOT part of the OpenAI chat-completions spec —
+    /// default `false` until a user has verified it against their own
+    /// deployment. Mirrors this project's existing pattern of an explicit
+    /// opt-in for provider behavior we can't verify ourselves (e.g. the
+    /// `remote`-tier "I understand" warning). See
+    /// `agent::loop_::pathway_recall`'s thought-seeding gate.
+    #[serde(default)]
+    pub experimental_prefill: bool,
 }
 
 impl ProviderConfig {

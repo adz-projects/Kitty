@@ -223,6 +223,12 @@ impl ProviderRouter {
                 .and_then(|v| v.as_i64())
                 .map(|v| v as i32),
             idle_timeout_secs: config_json.get("idle_timeout_secs").and_then(|v| v.as_f64()),
+            // See `ProviderConfig::experimental_prefill`'s doc comment --
+            // an explicit user opt-in, off by default.
+            experimental_prefill: config_json
+                .get("experimental_prefill")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
         };
 
         if row.provider_type == "anthropic" {
@@ -415,6 +421,15 @@ impl ProviderRouter {
         } else {
             "unknown".to_string()
         }
+    }
+
+    /// See `Provider::supports_assistant_prefill`. `false` for an unknown
+    /// provider id -- the safe default, same as the trait's own.
+    pub fn supports_assistant_prefill(&self, provider_id: &str) -> bool {
+        self.providers
+            .get(provider_id)
+            .map(|e| e.provider.supports_assistant_prefill())
+            .unwrap_or(false)
     }
 
     /// Call chat_completion on a specific provider.

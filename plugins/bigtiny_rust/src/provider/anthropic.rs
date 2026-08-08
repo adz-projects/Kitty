@@ -151,6 +151,14 @@ impl Provider for AnthropicProvider {
         Self::DEFAULT_MODEL.into()
     }
 
+    /// Anthropic's Messages API natively treats a trailing `role:
+    /// "assistant"` message as a prefill to continue generation from --
+    /// documented protocol behavior, not a guess, so this is unconditional
+    /// (no config opt-in needed, unlike `OpenAICompatibleProvider`).
+    fn supports_assistant_prefill(&self) -> bool {
+        true
+    }
+
     async fn chat_completion(
         &self,
         messages: Vec<Value>,

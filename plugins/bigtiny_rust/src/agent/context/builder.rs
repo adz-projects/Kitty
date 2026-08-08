@@ -65,6 +65,7 @@ impl ContextBuilder {
         cwd: Option<&str>,
         ap_hints: Option<&str>,
         retrieved: Option<&str>,
+        thought_seed: Option<&str>,
     ) -> Result<Vec<Value>, String> {
         let session = sessions::get_session(&self.pool, session_id)
             .await
@@ -180,12 +181,16 @@ impl ContextBuilder {
         let head = messages.clone();
         messages.extend(live_messages);
 
-        // Layer 7 (tail-region): Adaptive Pathway per-turn hints. Placed
+        // Layer 7 (tail-region): behavioral-memory recall block. Placed
         // immediately before the new user message — inside the region that
         // changes every turn regardless — so the shared prefix (head + live
         // tail up to here) stays byte-identical for prompt-prefix caching.
-        // The sidecar's decide payload carries a `hints` list already
-        // rendered as plain text here; see `AgentLoop::run`'s AP wiring.
+        // Injected verbatim: the engine's `antisycophancy::render_block`
+        // already emits its own `[Working assumptions about you]` /
+        // `[Worth testing this turn]` / `[Where I'm unsure]` /
+        // `[Check yourself]` headers and closing footer. This used to wrap
+        // it in a second `[Adaptive Pathway hints]` header, which both named
+        // a retired subsystem and gave the block two nested labels.
         // Tokens of the injected tail blocks are counted so the emergency
         // valve below doesn't undercount the real prompt by their size.
         let mut tail_extra_tokens: i32 = 0;
@@ -193,7 +198,7 @@ impl ContextBuilder {
             if !hints.trim().is_empty() {
                 let block = json!({
                     "role": "system",
-                    "content": format!("[Adaptive Pathway hints]\n{hints}")
+                    "content": hints
                 });
                 tail_extra_tokens += count_messages_tokens(std::slice::from_ref(&block));
                 messages.push(block);
@@ -235,7 +240,36 @@ impl ContextBuilder {
             }));
         }
 
-        let tail_new_message = messages.last().cloned().unwrap_or_default();
+        // Layer 8 (tail-region): thought-seeded episodic recall, appended
+        // AFTER the new user message as a trailing partial `assistant` turn
+        // -- a structurally different insertion point from `ap_hints`/
+        // `retrieved` above (which land BEFORE the user message as
+        // system-role blocks). Only ever populated when the caller has
+        // already confirmed the active provider/model combination honors a
+        // trailing assistant-role prefill (`Provider::supports_assistant_prefill`
+        // + `reasoning_models::supports_reasoning` -- see
+        // `AgentLoop::pathway_recall`); this function doesn't know or care
+        // why, it just appends what it's given. `None`/empty produces zero
+        // delta, same contract as `ap_hints`/`retrieved`. Mutually exclusive
+        // with the `retrieved` system block in practice (the caller picks
+        // one path per turn), but nothing here enforces that -- it's a
+        // caller-side policy, not a structural one.
+        let mut seeded = false;
+        if let Some(seed) = thought_seed {
+            if !seed.trim().is_empty() {
+                messages.push(json!({
+                    "role": "assistant",
+                    "content": format!("<think>\n{seed}\n")
+                }));
+                seeded = true;
+            }
+        }
+
+        // The tail region the emergency-trim rebuild below must preserve
+        // verbatim: the new user message, plus the thought-seed turn if one
+        // was appended.
+        let tail_start = if seeded { 2 } else { 1 };
+        let tail_messages: Vec<Value> = messages[messages.len() - tail_start..].to_vec();
 
         // Emergency valve check
         let max_context_tokens =
@@ -243,15 +277,15 @@ impl ContextBuilder {
         let emergency_cap = (max_context_tokens as f64 * EMERGENCY_TRIM_RATIO) as i32;
 
         let system_tokens = count_messages_tokens(&head);
-        let new_msg_tokens = count_messages_tokens(std::slice::from_ref(&tail_new_message));
+        let new_msg_tokens = count_messages_tokens(&tail_messages);
         let total_tokens =
             live_token_sum + system_tokens + new_msg_tokens + tail_extra_tokens;
 
         if total_tokens > emergency_cap {
             let target = (max_context_tokens as f64 * self.config.compaction_target_ratio) as i32;
-            let live_messages = &messages[head.len()..messages.len() - 1];
+            let live_messages = &messages[head.len()..messages.len() - tail_start];
             let trimmed_live = emergency_trim(live_messages, reserve_floor, target);
-            messages = [head, trimmed_live, vec![tail_new_message]].concat();
+            messages = [head, trimmed_live, tail_messages].concat();
         }
 
         Ok(messages)
@@ -497,6 +531,7 @@ mod tests {
                 Some("C:\\cwd"),
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -511,6 +546,7 @@ mod tests {
                 Some("C:\\cwd"),
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -520,6 +556,76 @@ mod tests {
             serde_json::to_string(&second).unwrap(),
             "build_messages must be byte-identical across calls with identical input"
         );
+    }
+
+    /// Companion to the byte-identity test above, for `thought_seed`: `None`
+    /// must be byte-identical to the no-seed baseline (zero prompt delta,
+    /// same contract as `ap_hints`/`retrieved`), and `Some` must change only
+    /// the trailing region — every message up to and including the new user
+    /// message stays byte-identical, with exactly one trailing `assistant`
+    /// message appended after it.
+    #[tokio::test]
+    async fn build_messages_thought_seed_only_changes_the_trailing_region() {
+        let pool = test_pool().await;
+        sessions::create_session(&pool, "sess-1", "Test")
+            .await
+            .unwrap();
+        let builder = ContextBuilder::new(pool.clone(), TokenManagementConfig::default(), 2);
+        let mut seed = vec![json!({"role": "user", "content": "hello"})];
+        builder.save_messages("sess-1", &mut seed).await.unwrap();
+
+        let baseline = builder
+            .build_messages(
+                "sess-1", "next", None, None, None, Some("C:\\c"), Some("C:\\w"), None, None, None,
+            )
+            .await
+            .unwrap();
+        let with_empty_seed = builder
+            .build_messages(
+                "sess-1", "next", None, None, None, Some("C:\\c"), Some("C:\\w"), None, None, Some("   "),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_string(&baseline).unwrap(),
+            serde_json::to_string(&with_empty_seed).unwrap(),
+            "empty/None thought_seed must not change the prompt"
+        );
+
+        let with_seed = builder
+            .build_messages(
+                "sess-1",
+                "next",
+                None,
+                None,
+                None,
+                Some("C:\\c"),
+                Some("C:\\w"),
+                None,
+                None,
+                Some("The user prefers terse answers."),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(with_seed.len(), baseline.len() + 1, "seeding must add exactly one trailing message");
+        // Every message up to and including the user message is untouched.
+        assert_eq!(
+            serde_json::to_string(&with_seed[..baseline.len()]).unwrap(),
+            serde_json::to_string(&baseline).unwrap(),
+            "thought_seed must never alter anything before the trailing seed message"
+        );
+        let last = with_seed.last().unwrap();
+        assert_eq!(last.get("role").and_then(|r| r.as_str()), Some("assistant"));
+        assert!(
+            last.get("content")
+                .and_then(|c| c.as_str())
+                .map(|c| c.contains("The user prefers terse answers.") && c.starts_with("<think>"))
+                .unwrap_or(false)
+        );
+        // The user message must still be the second-to-last, unchanged.
+        let user_msg = &with_seed[with_seed.len() - 2];
+        assert_eq!(user_msg.get("role").and_then(|r| r.as_str()), Some("user"));
     }
 
     /// Guard against reviving the removed "Layer 3" tool-hints system
@@ -537,7 +643,7 @@ mod tests {
         let builder = ContextBuilder::new(pool.clone(), TokenManagementConfig::default(), 2);
 
         let messages = builder
-            .build_messages("sess-1", "hello", None, None, None, None, None, None, None)
+            .build_messages("sess-1", "hello", None, None, None, None, None, None, None, None)
             .await
             .unwrap();
 
@@ -570,7 +676,7 @@ mod tests {
         builder.save_messages("sess-1", &mut seed).await.unwrap();
 
         let none = builder
-            .build_messages("sess-1", "next", None, None, None, Some("C:\\c"), Some("C:\\w"), None, None)
+            .build_messages("sess-1", "next", None, None, None, Some("C:\\c"), Some("C:\\w"), None, None, None)
             .await
             .unwrap();
         let empty = builder
@@ -583,6 +689,7 @@ mod tests {
                 Some("C:\\c"),
                 Some("C:\\w"),
                 Some("   "),
+                None,
                 None,
             )
             .await
@@ -605,6 +712,7 @@ mod tests {
                 Some("C:\\w"),
                 Some("Use write instead of edit for new files."),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -619,11 +727,23 @@ mod tests {
                 m.get("role").and_then(|r| r.as_str()) == Some("system")
                     && m.get("content")
                         .and_then(|c| c.as_str())
-                        .map(|c| c.contains("Adaptive Pathway hints"))
+                        .map(|c| c.contains("Use write instead of edit for new files."))
                         .unwrap_or(false)
             })
             .count();
         assert_eq!(hints_system, 1, "exactly one AP hint system message");
+        // Injected verbatim. The engine's `antisycophancy::render_block`
+        // already emits its own section headers and footer; this used to add
+        // a second `[Adaptive Pathway hints]` wrapper on top, naming a
+        // retired subsystem and giving the block two nested labels.
+        assert!(
+            !with_hints.iter().any(|m| m
+                .get("content")
+                .and_then(|c| c.as_str())
+                .map(|c| c.contains("Adaptive Pathway hints"))
+                .unwrap_or(false)),
+            "the recall block must be injected verbatim, not re-wrapped"
+        );
         // The hint message must sit immediately before the last (user) message.
         let last = with_hints.last().unwrap();
         assert_eq!(
@@ -636,7 +756,7 @@ mod tests {
             second_last
                 .get("content")
                 .and_then(|c| c.as_str())
-                .map(|c| c.contains("Adaptive Pathway hints"))
+                .map(|c| c.contains("Use write instead of edit for new files."))
                 .unwrap_or(false),
             "hints must be in the tail (second-to-last), not the head"
         );

@@ -14,6 +14,7 @@ use crate::agent::memory::{PreflightCounters, preflight_recall};
 use crate::config::MemoryConfig;
 use crate::agent::context::builder::ContextBuilder;
 use crate::agent::context::stats::SessionStats;
+use crate::agent::reasoning_models;
 use crate::agent::sandbox::{allowed_dirs_for_session, check_containment};
 use crate::agent::summarizer::SummarizerClient;
 use crate::agent::types::TimingResult;
@@ -483,24 +484,30 @@ impl AgentLoop {
         // hint for context assembly, not the point where an unresolvable
         // provider should abort the turn — `run_tool_loop`'s own
         // `get_provider_id` call does that properly a few lines of control flow
-        // later.
-        let context_tokens_override = self
-            .router
-            .get_provider_id(effective_provider.as_deref())
-            .ok()
-            .and_then(|pid| self.router.context_length(&pid));
+        // later. Resolved once and reused by the pathway-recall path-pick
+        // below, which also needs to know which provider/model is active.
+        let resolved_provider_id = self.router.get_provider_id(effective_provider.as_deref()).ok();
+        let context_tokens_override = resolved_provider_id
+            .as_deref()
+            .and_then(|pid| self.router.context_length(pid));
 
         // Adaptive Pathway turn-start hook: in-process recall so the model
         // sees learned behavioral beliefs *before* picking tools this turn.
-        // Cache-aware by construction: the returned hints are injected into
-        // the tail region (right before the new user message) via
-        // `build_messages`'s `ap_hints` param — never into the stable head —
-        // and a disabled engine (or a turn with no beliefs) produces `None`,
-        // i.e. zero delta to the prompt (the byte-identity regression test in
-        // `context/builder.rs` guards this).
-        let ap_hints = self
-            .pathway_recall(session_id, user_message, &active_tools)
-            .await;
+        // Cache-aware by construction: exactly one of `ap_hints`/`thought_seed`
+        // is ever `Some` (see `pathway_recall`'s doc comment) and each is
+        // injected into the tail region — `ap_hints` right before the new
+        // user message, `thought_seed` right after it — never into the
+        // stable head, and a disabled engine (or a turn with no beliefs)
+        // produces `(None, None)`, i.e. zero delta to the prompt (the
+        // byte-identity regression test in `context/builder.rs` guards
+        // this).
+        let (ap_hints, thought_seed) = match &resolved_provider_id {
+            Some(pid) => {
+                let model = self.router.resolve_model(pid, model_override);
+                self.pathway_recall(session_id, user_message, pid, &model).await
+            }
+            None => (None, None),
+        };
 
         // Pre-flight memory recall ("the detour"): best-effort FTS5 lookup
         // over the session's *already-compacted* history, gated by recall
@@ -526,6 +533,7 @@ impl AgentLoop {
                 cwd,
                 ap_hints.as_deref(),
                 recalled,
+                thought_seed.as_deref(),
             )
             .await
         {
@@ -1061,7 +1069,7 @@ impl AgentLoop {
     /// to `PathwayEngine::recall`, which selects ≤6 beliefs via DPP grounded
     /// in the current user query (capped at `MAX_CANDIDATES` so cost stays
     /// bounded as the store grows), filters suppressed beliefs, routes by
-    /// inferred domain, and renders the full `[What I know about you]` +
+    /// inferred domain, and renders the full `[Working assumptions about you]` +
     /// `[Worth testing this turn]` + `[Where I'm unsure]` + `[Check
     /// yourself]` block within the token budget. Wrapped in the same
     /// timeout budget the embed step alone used to get — now bounding the
@@ -1069,20 +1077,51 @@ impl AgentLoop {
     /// Ollama or a slow query must degrade to `None` (zero prompt delta)
     /// rather than stall the turn. Returns `None` when the engine is
     /// absent, paused, has nothing to say, or the budget is exceeded.
+    /// Decide the pathway-recall path for this turn and produce its
+    /// rendered text as `(ap_hints, thought_seed)` — **at most one is ever
+    /// `Some`**. Picks `recall_thought_seed` (a trailing assistant `<think>`
+    /// prefill — see `context::builder::build_messages`'s `thought_seed`
+    /// param) only when both hold: the resolved provider has confirmed it
+    /// honors a trailing assistant-role prefill
+    /// (`Provider::supports_assistant_prefill` — protocol-native for
+    /// Anthropic, an explicit user opt-in for everything else, never
+    /// assumed), and the resolved model's name matches the reasoning-model
+    /// heuristic (`reasoning_models::supports_reasoning` — seeding a
+    /// `<think>` block into a model with no real thinking phase would leak
+    /// the seed's raw framing into the visible answer). Otherwise falls back
+    /// to today's `recall` → `ap_hints` system-block path. Both `None` on a
+    /// disabled engine, timeout, or no match — zero prompt delta either way.
     async fn pathway_recall(
         &self,
         session_id: &str,
         user_message: &str,
-        _active_tools: &[ToolDefinition],
-    ) -> Option<String> {
-        let engine = self.pathway.as_ref()?;
-        tokio::time::timeout(
-            Duration::from_millis(AP_RECALL_EMBED_BUDGET_MS),
-            engine.recall(session_id, user_message),
-        )
-        .await
-        .ok()
-        .flatten()
+        provider_id: &str,
+        model: &str,
+    ) -> (Option<String>, Option<String>) {
+        let Some(engine) = self.pathway.as_ref() else {
+            return (None, None);
+        };
+        let seed_eligible =
+            self.router.supports_assistant_prefill(provider_id) && reasoning_models::supports_reasoning(model);
+        if seed_eligible {
+            let seed = tokio::time::timeout(
+                Duration::from_millis(AP_RECALL_EMBED_BUDGET_MS),
+                engine.recall_thought_seed(session_id, user_message),
+            )
+            .await
+            .ok()
+            .flatten();
+            (None, seed)
+        } else {
+            let hints = tokio::time::timeout(
+                Duration::from_millis(AP_RECALL_EMBED_BUDGET_MS),
+                engine.recall(session_id, user_message),
+            )
+            .await
+            .ok()
+            .flatten();
+            (hints, None)
+        }
     }
 
     /// Pre-flight memory recall hook, mirroring `pathway_recall`'s
@@ -1427,6 +1466,24 @@ impl AgentLoop {
         }
 
         let _permit = semaphore.acquire_owned().await;
+
+        // The pathway MCP server's `record`/`forget` need to know which
+        // session they're acting on, but an in-process MCP connection is
+        // daemon-lifetime while sessions rotate and stream concurrently --
+        // so the server cannot hold a single "current session" without
+        // racing. Inject it here instead, where the executing session is
+        // unambiguous. `session_id` is hidden from the tool's advertised
+        // schema (`#[schemars(skip)]`), so the model never sees or supplies
+        // it; this is the only writer.
+        let tool_args = if crate::mcp::builtin::PATHWAY_TOOLS.contains(&tool_name.as_str()) {
+            let mut args = tool_args.clone();
+            if let Some(obj) = args.as_object_mut() {
+                obj.insert("session_id".to_string(), json!(session_id));
+            }
+            args
+        } else {
+            tool_args
+        };
         let result = self.mcp.execute_tool(&tool_name, &tool_args, None).await;
 
         let output = if result.is_error {

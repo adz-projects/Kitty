@@ -99,6 +99,19 @@ pub trait Provider: Send + Sync {
 
     /// Check provider health.
     async fn check_health(&self) -> HealthStatus;
+
+    /// Whether this provider's wire protocol tolerates a trailing partial
+    /// `role: "assistant"` message as the last entry in `messages` and
+    /// continues generation from it, rather than erroring or starting a
+    /// fresh turn. Gates thought-seeding (`agent::loop_::pathway_recall`) --
+    /// seeding a `<think>` prefill into a provider that doesn't actually
+    /// honor it would either be silently ignored (wasted context) or, worse,
+    /// leak the raw seed framing into the visible answer. Default `false`;
+    /// override only where verified or explicitly opted into (see each
+    /// implementor).
+    fn supports_assistant_prefill(&self) -> bool {
+        false
+    }
 }
 
 /// Classify an HTTP error into a structured provider error.

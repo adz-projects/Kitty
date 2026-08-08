@@ -43,7 +43,7 @@ async fn setup_pool_with_server() -> (SqlitePool, String) {
 #[tokio::test]
 async fn execute_tool_success_roundtrip() {
     let (pool, server_id) = setup_pool_with_server().await;
-    let manager = MCPManager::new(pool);
+    let manager = MCPManager::new(pool, None);
     manager
         .connect_server(&server_id)
         .await
@@ -59,7 +59,7 @@ async fn execute_tool_success_roundtrip() {
 #[tokio::test]
 async fn execute_tool_unknown_tool_never_errors() {
     let (pool, server_id) = setup_pool_with_server().await;
-    let manager = MCPManager::new(pool);
+    let manager = MCPManager::new(pool, None);
     manager
         .connect_server(&server_id)
         .await
@@ -75,7 +75,7 @@ async fn execute_tool_unknown_tool_never_errors() {
 #[tokio::test]
 async fn execute_tool_bad_args_never_errors() {
     let (pool, server_id) = setup_pool_with_server().await;
-    let manager = MCPManager::new(pool);
+    let manager = MCPManager::new(pool, None);
     manager
         .connect_server(&server_id)
         .await
@@ -89,7 +89,7 @@ async fn execute_tool_bad_args_never_errors() {
 #[tokio::test]
 async fn execute_tool_timeout_never_errors() {
     let (pool, server_id) = setup_pool_with_server().await;
-    let manager = MCPManager::new(pool);
+    let manager = MCPManager::new(pool, None);
     manager
         .connect_server(&server_id)
         .await
@@ -109,7 +109,7 @@ async fn execute_tool_timeout_never_errors() {
 #[tokio::test]
 async fn execute_tool_crashed_subprocess_never_errors() {
     let (pool, server_id) = setup_pool_with_server().await;
-    let manager = MCPManager::new(pool);
+    let manager = MCPManager::new(pool, None);
     manager
         .connect_server(&server_id)
         .await

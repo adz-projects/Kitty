@@ -49,7 +49,13 @@ pub async fn list_beliefs(State(state): State<Arc<AppState>>) -> Json<Value> {
     }
 }
 
-/// GET /api/pathway/stats — belief counts by layer + suppression counts.
+/// GET /api/pathway/stats — belief counts by layer + suppression counts +
+/// embedding-migration progress (`embedding_migration`: how many beliefs
+/// are still tagged with a stale embedding model, and what the current one
+/// is — see `migrations/005_belief_embedding_model.sql` and
+/// `background::reembed_stale_beliefs` in `adaptive-pathway_rust`). Reuses
+/// the `beliefs` list already loaded for `by_layer` rather than issuing a
+/// second `COUNT(*)` query for the pending count.
 pub async fn stats(State(state): State<Arc<AppState>>) -> Json<Value> {
     let engine = match engine(&state) {
         Ok(e) => e,
@@ -57,10 +63,22 @@ pub async fn stats(State(state): State<Arc<AppState>>) -> Json<Value> {
     };
     let beliefs = engine.db.list_beliefs(None).await.unwrap_or_default();
     let mut by_layer: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let current_model = &engine.cfg.embedding.ollama_model;
+    let mut pending_reembed = 0usize;
     for b in &beliefs {
         *by_layer.entry(b.layer.as_str().to_string()).or_insert(0) += 1;
+        if &b.embedding_model != current_model {
+            pending_reembed += 1;
+        }
     }
-    Json(json!({ "total": beliefs.len(), "by_layer": by_layer }))
+    Json(json!({
+        "total": beliefs.len(),
+        "by_layer": by_layer,
+        "embedding_migration": {
+            "pending": pending_reembed,
+            "current_model": current_model,
+        },
+    }))
 }
 
 /// DELETE /api/pathway/beliefs/{id} — the Settings belief browser's delete

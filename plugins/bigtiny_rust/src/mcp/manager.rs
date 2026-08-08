@@ -25,6 +25,11 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 /// effectively global.
 pub struct MCPManager {
     pool: SqlitePool,
+    /// Handle to the behavioral-memory engine, needed only to construct the
+    /// `pathway` in-process server (`builtin::connect`). `None` whenever
+    /// pathway is configured off, in which case connecting that server
+    /// returns a clean error instead of half-succeeding.
+    pathway: Option<Arc<adaptive_pathway::engine::PathwayEngine>>,
     /// `Arc` so a tool call can clone a client handle out of the map, drop the
     /// DashMap guard, and only then `.await` the call — holding the shard
     /// lock across an await previously blocked every sibling tool call on the
@@ -34,9 +39,13 @@ pub struct MCPManager {
 }
 
 impl MCPManager {
-    pub fn new(pool: SqlitePool) -> Self {
+    pub fn new(
+        pool: SqlitePool,
+        pathway: Option<Arc<adaptive_pathway::engine::PathwayEngine>>,
+    ) -> Self {
         Self {
             pool,
+            pathway,
             servers: DashMap::new(),
             tool_registry: DashMap::new(),
         }
@@ -58,7 +67,10 @@ impl MCPManager {
         // failed-reconnect behavior to a stdio one.
         let connect_result = if config.transport == TransportType::InProcess {
             let name = config.command.clone().unwrap_or_default();
-            tokio::time::timeout(CONNECT_TIMEOUT, super::builtin::connect(&name, server_id.to_string()))
+            tokio::time::timeout(
+                CONNECT_TIMEOUT,
+                super::builtin::connect(&name, server_id.to_string(), self.pathway.clone()),
+            )
             .await
         } else {
             tokio::time::timeout(CONNECT_TIMEOUT, MCPServerClient::connect(&config)).await
@@ -327,7 +339,7 @@ mod tests {
     #[tokio::test]
     async fn list_tools_is_sorted_and_stable_across_calls() {
         let pool = test_pool().await;
-        let manager = MCPManager::new(pool);
+        let manager = MCPManager::new(pool, None);
         // Insert in deliberately shuffled order.
         for name in ["zebra", "alpha", "mike"] {
             manager.tool_registry.insert(name.to_string(), tool(name));
@@ -357,7 +369,7 @@ mod tests {
     #[tokio::test]
     async fn prune_registry_for_drops_only_that_servers_tools() {
         let pool = test_pool().await;
-        let manager = MCPManager::new(pool);
+        let manager = MCPManager::new(pool, None);
         for (name, server) in [
             ("a_tool", "srv-a"),
             ("a2_tool", "srv-a"),

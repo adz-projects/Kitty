@@ -30,7 +30,7 @@ async fn test_pool() -> SqlitePool {
 async fn build_engine(pool: &SqlitePool) -> Arc<RecipeEngine> {
     let config = BigTinyConfig::default();
     let router = Arc::new(ProviderRouter::new(config.cache.clone()));
-    let mcp = Arc::new(MCPManager::new(pool.clone()));
+    let mcp = Arc::new(MCPManager::new(pool.clone(), None));
     let hitl = Arc::new(tokio::sync::Mutex::new(HITLManager::new(
         pool.clone(),
         config.hitl.clone(),
