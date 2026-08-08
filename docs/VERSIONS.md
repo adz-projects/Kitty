@@ -214,6 +214,57 @@ historical context only; none of it reflects current code.
   so models that reason but don't match a pattern (e.g. `gemma4:e2b`, which emits
   thoughts here) still get a panel. ACP surfaces reasoning as a distinct
   `agent_thought_chunk` — no `<think>` tag splitting needed (see acp-protocol.md).
+- **Rust port**: `plugins/bigtiny_rust/src/agent/reasoning_models.rs`, same pattern
+  table, same "re-verify on model updates" caveat. Two independent copies (this file
+  is the frontend's) is an accepted duplication-drift risk — see that module's doc
+  comment.
+
+## Thought-seeding assistant-prefill support (adaptive-pathway behavioral memory)
+
+- `Provider::supports_assistant_prefill` (`plugins/bigtiny_rust/src/provider/base.rs`)
+  gates whether the pathway engine's per-turn recall is seeded as a trailing
+  `<think>` assistant-turn prefill (`PathwayEngine::recall_thought_seed`) instead of
+  the default `[Working assumptions about you]` system-block injection.
+- **Anthropic**: `true` unconditionally — the Messages API's trailing-assistant-
+  message continuation is documented, protocol-native behavior, not something that
+  needs per-deployment verification.
+- **OpenAI-compatible (Ollama, OpenRouter, custom endpoints)**: `false` by default,
+  gated behind `ProviderConfig::experimental_prefill` (an explicit per-provider
+  opt-in, same pattern as the `remote`-tier "I understand" warning). Whether a
+  trailing partial assistant message actually continues generation — versus
+  erroring, or the server silently starting a fresh turn and ignoring it — depends
+  on the specific server/chat-template combination and is **not** part of the
+  OpenAI chat-completions spec. **Not yet verified against the pinned Ollama
+  version** (see the top of this file) for any model. Before flipping this default
+  on for Ollama: pull a reasoning-capable model (e.g. a `-thinking` variant),
+  enable `experimental_prefill` for that provider, start a session, and confirm in
+  the transcript that the seeded `<think>` content is actually continued from
+  (not echoed back, not answered as a fresh user turn, and no raw `<think>` tag
+  leaking into the visible reply) — then record the verified model/version
+  combination here.
+
+## Behavioral-memory recall framing (adaptive-pathway)
+
+Both render paths — the `[Working assumptions about you]` system block
+(`antisycophancy::render_block`, what local Ollama actually sees) and the
+`<think>` thought seed (`recall::render_reflection_block`, Anthropic-only
+today per the section above) — deliberately frame recalled beliefs as a
+*provisional prior to test the current request against*, never as a profile
+to conform to. This is a behavioral contract, not styling:
+
+- The seed template previously ended "I'll let that inform my tone without
+  stating it outright" — a conformity instruction — and rendered only the
+  fact list, dropping `[Worth testing this turn]` / `[Where I'm unsure]` /
+  `[Check yourself]`. That made the seeded path strictly *more* sycophantic
+  than the block it replaces. `PathwayEngine::turn_signals` is now shared by
+  both paths so they cannot diverge on which signals they carry.
+- `tests/recall_engine.rs::neither_render_path_tells_the_model_to_conform`
+  and `::the_thought_seed_carries_the_same_signals_as_the_system_block` fail
+  the build if either property regresses.
+- Section header strings are load-bearing:
+  `recall::truncation_order()` drops sections by `starts_with` on them.
+  Renaming a header without updating that list silently disables the
+  350-token truncation path.
 
 ## Internal plugins & build tooling (`plugins/`)
 
