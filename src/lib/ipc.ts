@@ -19,6 +19,7 @@ import type {
   AdaptivePathwayStatusPayload,
   AdaptivePathwayEmbeddingStatusPayload,
   AdaptivePathwayMcpStatus,
+  PathwayBelief,
   ApprovalNeededEvent,
   ChatErrorEvent,
   CompactionEvent,
@@ -333,15 +334,37 @@ export const ipc = {
   completeSetup: () => invoke<void>('complete_setup'),
   getAutostart: () => invoke<boolean>('get_autostart'),
   setAutostart: (enabled: boolean) => invoke<void>('set_autostart', { enabled }),
-  // Adaptive Pathway extension sidecar
+  // Behavioral-memory engine (`plugins/adaptive-pathway_rust`, linked
+  // in-process into BigTiny — see `src-tauri/src/commands/adaptive_pathway.rs`).
+  getAdaptivePathwayMcpStatus: () =>
+    invoke<AdaptivePathwayMcpStatus | null>('get_adaptive_pathway_mcp_status'),
+  setAdaptivePathwayEnabled: (enabled: boolean) =>
+    invoke<void>('set_adaptive_pathway_enabled', { enabled }),
+  /** Every belief currently held (Settings belief browser). */
+  getPathwayBeliefs: () => invoke<{ beliefs: PathwayBelief[]; count: number }>('get_pathway_beliefs'),
+  /** Belief counts by layer. */
+  getPathwayStats: () => invoke<{ total: number; by_layer: Record<string, number> }>('get_pathway_stats'),
+  /** Belief browser's delete action — suppresses + tombstones, not a bare row delete. */
+  deletePathwayBelief: (beliefId: string) =>
+    invoke<{ id: string; dropped?: string; error?: string }>('delete_pathway_belief', { beliefId }),
+  /** The incognito toggle for one session. */
+  setPathwaySessionPaused: (sessionId: string, paused: boolean) =>
+    invoke<{ session_id: string; paused: boolean }>('set_pathway_session_paused', {
+      sessionId,
+      paused,
+    }),
+  // --- Everything below this line calls Rust commands that no longer
+  // exist (the tool-selection-era sidecar they backed has been replaced by
+  // the behavioral-memory engine above, whose route/command surface is much
+  // smaller — see `plugins/adaptive-pathway_rust/src/routes.rs`). Kept only
+  // so the still-unmigrated Settings components below referencing them
+  // continue to type-check; every call will fail at runtime with a
+  // command-not-found error until those components are rewritten against
+  // the belief-based surface above. Do not add new callers of these. ---
   getAdaptivePathwayStatus: () => invoke<AdaptivePathwayStatus>('get_adaptive_pathway_status'),
   getAdaptivePathwayEmbeddingStatus: () =>
     invoke<EmbeddingModelStatus>('get_adaptive_pathway_embedding_status'),
-  getAdaptivePathwayMcpStatus: () =>
-    invoke<AdaptivePathwayMcpStatus | null>('get_adaptive_pathway_mcp_status'),
   restartAdaptivePathway: () => invoke<void>('restart_adaptive_pathway'),
-  setAdaptivePathwayEnabled: (enabled: boolean) =>
-    invoke<void>('set_adaptive_pathway_enabled', { enabled }),
   adaptivePathwayGetEdge: (edgeId: string) =>
     invoke<AdaptivePathwayEdge>('adaptive_pathway_get_edge', { edgeId }),
   adaptivePathwayGetState: () => invoke<AdaptivePathwayState>('adaptive_pathway_get_state'),

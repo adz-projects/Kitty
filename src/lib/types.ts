@@ -449,6 +449,21 @@ export interface AdaptivePathwayMcpStatus {
   tool_count: number;
 }
 
+/** A single behavioral-memory belief, as returned by `GET /api/pathway/beliefs`
+    (`plugins/bigtiny_rust/src/routes/pathway.rs::list_beliefs`). */
+export interface PathwayBelief {
+  id: string;
+  text: string;
+  layer: 'identity' | 'context' | 'conversation';
+  confidence: number;
+  tested: boolean;
+  domain: string | null;
+  support_count: number;
+  distinct_sessions: number;
+  contradict_count: number;
+  pinned: boolean;
+}
+
 /** `GET /edges/{edge_id}` result — the "why was this suggested" detail. */
 export interface AdaptivePathwayEdge {
   id: string;

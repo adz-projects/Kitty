@@ -16,6 +16,11 @@ import type { McpServer } from '@/lib/types';
     stale row under one of these names before this app version's startup
     cleanup runs. */
 const HIDDEN_SERVER_NAMES = new Set([
+  // The behavioral-memory engine's in-process MCP server (superseded the
+  // stdio 'adaptive-pathway' name below, which is now in the daemon's
+  // RETIRED_BUILTINS cleanup list — kept here too for the same one-release
+  // guard as everything else in this set).
+  'pathway',
   'adaptive-pathway',
   'replacement-mcp',
   'wasm-math-mcp',
