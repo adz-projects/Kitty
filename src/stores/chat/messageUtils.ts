@@ -122,10 +122,14 @@ function gooseProviderName(providerType: ProviderType): string {
 /** Finds the Kitty provider profile that produced a session's stored
     goosed-level `providerId`/`modelId` (`session/list`'s `_meta`, see
     `SessionSummary`) — used to restore the right provider when reopening an
-    old chat. First match wins if the user has multiple profiles of the same
-    type with the same model selected; goosed's own metadata has no way to
-    disambiguate further than provider type + model id. `null` if nothing
-    currently configured matches (e.g. the profile was deleted). */
+    old chat. Matches against BOTH representations the backend may have stored:
+    Kitty profile id (what this app's own `set_session_provider` writes into
+    the session metadata) and the goosed-level provider name (`gooseProviderName`)
+    that a session stamped by a different caller would carry. First match wins
+    if the user has multiple profiles of the same type with the same model
+    selected; goosed's own metadata has no way to disambiguate further than
+    provider type + model id. `null` if nothing currently configured matches
+    (e.g. the profile was deleted). */
 export function findMatchingProvider(
   providers: ProviderView[],
   providerId: string,
@@ -133,7 +137,9 @@ export function findMatchingProvider(
 ): ProviderView | null {
   return (
     providers.find(
-      (p) => gooseProviderName(p.provider_type) === providerId && p.models.includes(modelId)
+      (p) =>
+        (p.id === providerId || gooseProviderName(p.provider_type) === providerId) &&
+        p.models.includes(modelId)
     ) ?? null
   );
 }

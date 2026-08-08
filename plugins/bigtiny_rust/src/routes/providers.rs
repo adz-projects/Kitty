@@ -12,6 +12,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::{json, Value};
+use sqlx::Connection;
 
 use crate::crypto;
 use crate::storage::providers;
@@ -128,18 +129,35 @@ pub async fn create_provider(
 
     let config = merge_config(None, &body);
     let fallback_priority = body.get("fallback_priority").and_then(|v| v.as_i64());
-    if let Err(e) = sqlx::query(
-        r#"UPDATE providers SET config = ?1, fallback_priority = COALESCE(?2, fallback_priority) WHERE id = ?3"#
-    )
-    .bind(&config)
-    .bind(fallback_priority.map(|v| v as i32))
-    .bind(&id)
-    .execute(&state.db)
-    .await
-    {
+    // INSERT + config-UPDATE together, atomically: a create that failed on the
+    // second statement used to leave a half-created provider row with no
+    // config (and no cleanup) before returning 500.
+    let mut conn = match state.db.acquire().await {
+        Ok(c) => c,
+        Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+    let result = async {
+        let mut tx = conn.begin_with("BEGIN IMMEDIATE").await?;
+        sqlx::query(
+            r#"UPDATE providers SET config = ?1, fallback_priority = COALESCE(?2, fallback_priority) WHERE id = ?3"#,
+        )
+        .bind(&config)
+        .bind(fallback_priority.map(|v| v as i32))
+        .bind(&id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok::<(), sqlx::Error>(())
+    }
+    .await;
+    if let Err(e) = result {
         // Was `let _ = ...` — a swallowed failure left a provider row with no
         // config (no API key/model), then re-registered into the router as if
         // everything had been saved.
+        let _ = sqlx::query("DELETE FROM providers WHERE id = ?")
+            .bind(&id)
+            .execute(&state.db)
+            .await;
         return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
     }
 
@@ -168,20 +186,37 @@ pub async fn update_provider(
     let name = body.get("name").and_then(|v| v.as_str());
     let base_url = body.get("base_url").and_then(|v| v.as_str());
     let config = merge_config(existing.config.as_deref(), &body);
+    let priority = body.get("fallback_priority").and_then(|v| v.as_i64());
 
-    if let Err(e) = providers::update_provider(&state.db, &id, name, base_url, Some(&config)).await
-    {
-        return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
-    }
-    if let Some(priority) = body.get("fallback_priority").and_then(|v| v.as_i64()) {
-        if let Err(e) = sqlx::query(r#"UPDATE providers SET fallback_priority = ? WHERE id = ?"#)
-            .bind(priority as i32)
-            .bind(&id)
-            .execute(&state.db)
-            .await
-        {
-            return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+    // UPDATE name/base_url/config + fallback_priority together, atomically —
+    // two independent statements used to risk a partial patch (first write
+    // landing, second failing → 500 with the server half-updated).
+    let mut conn = match state.db.acquire().await {
+        Ok(c) => c,
+        Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+    let result = async {
+        let mut tx = conn.begin_with("BEGIN IMMEDIATE").await?;
+        if let Some(priority) = priority {
+            sqlx::query(r#"UPDATE providers SET fallback_priority = ? WHERE id = ?"#)
+                .bind(priority as i32)
+                .bind(&id)
+                .execute(&mut *tx)
+                .await?;
         }
+        sqlx::query(r#"UPDATE providers SET name = COALESCE(?1, name), base_url = COALESCE(?2, base_url), config = COALESCE(?3, config), updated_at = CURRENT_TIMESTAMP WHERE id = ?4"#)
+            .bind(name)
+            .bind(base_url)
+            .bind(&config)
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok::<(), sqlx::Error>(())
+    }
+    .await;
+    if let Err(e) = result {
+        return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
     }
 
     match providers::get_provider(&state.db, &id).await {

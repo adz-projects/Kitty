@@ -139,12 +139,18 @@ impl PathwayServer {
             "single_observation" => Provenance::SingleObservation,
             _ => Provenance::InferredPattern,
         };
-        let embedding = self.engine.embed.embed(&obs).await;
+        let (embedding, semantic) = self.engine.embed.embed_with_space(&obs).await;
+        // Tag with the embedding space actually used (see learn/mod.rs).
+        let embedding_model = if semantic {
+            self.engine.cfg.embedding.ollama_model.as_str()
+        } else {
+            crate::config::HASH_EMBED_MODEL
+        };
         let res = crate::belief::synthesis::route_observation(
             &self.engine.db,
             &obs,
             &embedding,
-            &self.engine.cfg.embedding.ollama_model,
+            embedding_model,
             provenance,
             layer,
             req.domain_hint.as_deref(),

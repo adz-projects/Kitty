@@ -12,6 +12,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::{json, Value};
+use sqlx::Connection;
 
 use crate::crypto;
 use crate::storage::mcp_servers;
@@ -72,6 +73,27 @@ pub async fn list_servers(State(state): State<Arc<AppState>>) -> Response {
     }
 }
 
+/// Normalize a JSON field like `args`/`env` before persisting it as a string
+/// column. The values are later decoded at connect time via
+/// `serde_json::from_str::<Vec<String>>`/`<Value>` — so a client that sends
+/// the field as an ALREADY-stringified JSON string (the natural shape when
+/// editing raw config, or a client that stringifies twice) must be unwrapped
+/// once, or the stored value is a JSON string *containing* a JSON string,
+/// which fails to parse into the expected array at connect and gets silently
+/// dropped (args/env/headers gone — for `headers`, potentially the auth
+/// header). Arrays/objects pass through as-is; an unparseable plain string is
+/// kept verbatim (same as the old behavior).
+fn normalize_json_field(v: &Value) -> String {
+    match v {
+        Value::Array(_) | Value::Object(_) => v.to_string(),
+        Value::String(s) => match serde_json::from_str::<Value>(s) {
+            Ok(Value::Array(_)) | Ok(Value::Object(_)) => s.clone(),
+            _ => v.to_string(),
+        },
+        _ => v.to_string(),
+    }
+}
+
 pub async fn create_server(
     State(state): State<Arc<AppState>>,
     Json(body): Json<Value>,
@@ -90,8 +112,8 @@ pub async fn create_server(
 
     let command = body.get("command").and_then(|v| v.as_str());
     let url = body.get("url").and_then(|v| v.as_str());
-    let args = body.get("args").map(|v| v.to_string());
-    let env = body.get("env").map(|v| v.to_string());
+    let args = body.get("args").map(normalize_json_field);
+    let env = body.get("env").map(normalize_json_field);
     let headers = body.get("headers").map(encrypt_headers);
     let enabled = body
         .get("enabled")
@@ -130,44 +152,64 @@ pub async fn update_server(
         .and_then(|v| v.as_bool())
         .map(|b| b as i32);
 
-    if let Err(e) = mcp_servers::update_server(&state.db, &id, name, transport, url, enabled).await
-    {
-        return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
-    }
+    let command = body.get("command").and_then(|v| v.as_str());
+    let args = body.get("args").map(normalize_json_field);
+    let env = body.get("env").map(normalize_json_field);
+    let headers = body.get("headers").map(encrypt_headers);
+    let patch_all =
+        command.is_some() || args.is_some() || env.is_some() || headers.is_some();
 
-    // command/args/env/headers aren't covered by `update_server`'s COALESCE
-    // set — patch them directly, only touching fields actually present in
-    // the request body (an absent field keeps its current value).
-    if body.get("command").is_some()
-        || body.get("args").is_some()
-        || body.get("env").is_some()
-        || body.get("headers").is_some()
-    {
-        let command = body.get("command").and_then(|v| v.as_str());
-        let args = body.get("args").map(|v| v.to_string());
-        let env = body.get("env").map(|v| v.to_string());
-        let headers = body.get("headers").map(encrypt_headers);
-        // Propagate the failure (500) rather than swallowing it — a
-        // silently-failed patch wrote nothing and the client was told the
-        // server was saved.
-        if let Err(e) = sqlx::query(
+    // name/transport/url/enabled + command/args/env/headers, together,
+    // atomically — two independent statements used to let a second-statement
+    // failure (bad header value etc.) land a partial patch and then 500 with
+    // the server half-updated.
+    let mut conn = match state.db.acquire().await {
+        Ok(c) => c,
+        Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+    let result = async {
+        let mut tx = conn.begin_with("BEGIN IMMEDIATE").await?;
+        sqlx::query(
             r#"UPDATE mcp_servers SET
-               command = COALESCE(?1, command),
-               args = COALESCE(?2, args),
-               env = COALESCE(?3, env),
-               headers = COALESCE(?4, headers)
+               name = COALESCE(?1, name),
+               transport = COALESCE(?2, transport),
+               url = COALESCE(?3, url),
+               enabled = COALESCE(?4, enabled)
                WHERE id = ?5"#,
         )
-        .bind(command)
-        .bind(&args)
-        .bind(&env)
-        .bind(&headers)
+        .bind(name)
+        .bind(transport)
+        .bind(url)
+        .bind(enabled)
         .bind(&id)
-        .execute(&state.db)
-        .await
-        {
-            return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+        .execute(&mut *tx)
+        .await?;
+        if patch_all {
+            // command/args/env/headers aren't covered by the COALESCE set —
+            // patch them only when actually present in the request body (an
+            // absent field keeps its current value).
+            sqlx::query(
+                r#"UPDATE mcp_servers SET
+                   command = COALESCE(?1, command),
+                   args = COALESCE(?2, args),
+                   env = COALESCE(?3, env),
+                   headers = COALESCE(?4, headers)
+                   WHERE id = ?5"#,
+            )
+            .bind(command)
+            .bind(&args)
+            .bind(&env)
+            .bind(&headers)
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
         }
+        tx.commit().await?;
+        Ok::<(), sqlx::Error>(())
+    }
+    .await;
+    if let Err(e) = result {
+        return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
     }
 
     let row = match mcp_servers::get_server(&state.db, &id).await {

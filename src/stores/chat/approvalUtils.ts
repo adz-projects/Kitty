@@ -48,10 +48,17 @@ export const pickRejectOption = (options: { optionId: string }[]): string | null
 
 /** Pick the "allow once" variant (never `allow_always`, so approval never
     silently persists) for auto-approving a scoped chat-mode tool call. */
-export const pickAllowOption = (options: { optionId: string }[]): string | null =>
-  options.find((o) => o.optionId === 'allow_once')?.optionId ??
-  options.find((o) => /allow/i.test(o.optionId))?.optionId ??
-  null;
+export const pickAllowOption = (options: { optionId: string }[]): string | null => {
+  const exact = options.find((o) => o.optionId === 'allow_once');
+  if (exact) return exact.optionId;
+  // Fallback for providers whose options don't include `allow_once`: still
+  // never `allow_always` (that would persist the approval silently, defeating
+  // the safety rationale) — only a bare `allow`/`allow_once`-style non-`always`
+  // option is acceptable. No safe option → null (cancel) rather than persist.
+  return (
+    options.find((o) => /allow/i.test(o.optionId) && !/always/i.test(o.optionId))?.optionId ?? null
+  );
+};
 
 // Commands whose blast radius (remote access, destructive filesystem/network
 // changes, privilege escalation) is high enough that "auto-allow because it's

@@ -67,7 +67,11 @@ export function RecentSessions() {
               key={s.sessionId}
               role="menuitem"
               title={s.cwd}
-              disabled={resumingId != null}
+              // Locked only while THAT row's resume is in flight — otherwise a
+              // single long replay (a big session's session/load is the
+              // slowest path in the app) disables every row and holds the
+              // dropdown open for seconds, blocking navigation.
+              disabled={resumingId === s.sessionId}
               onClick={() => {
                 setResumingId(s.sessionId);
                 void loadSession(s.sessionId, s.cwd, s.title, s.providerId, s.modelId).finally(

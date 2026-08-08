@@ -132,6 +132,17 @@ export function ScheduledTasks() {
               kind: 'recurring',
               interval_secs: form.intervalAmount * UNIT_SECONDS[form.intervalUnit],
             };
+      if (form.kind === 'one_shot') {
+        // The datetime-local input is user-editable and can be cleared to ''
+        // — new Date('') is Invalid Date and .toISOString() throws a
+        // RangeError that would surface as a terse generic save failure.
+        // Validate with a precise message instead.
+        const when = new Date(form.oneShotAt);
+        if (Number.isNaN(when.getTime())) {
+          setError('Pick a date/time for the one-shot task.');
+          return;
+        }
+      }
       const nextFire =
         form.kind === 'one_shot'
           ? new Date(form.oneShotAt).toISOString()

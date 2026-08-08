@@ -30,9 +30,18 @@ impl OpenAICompatibleProvider {
 
     pub fn new(provider_id: &str, config: ProviderConfig, tailscale: Arc<TailscaleClient>) -> Self {
         let idle_timeout = config.idle_timeout();
+        let client = reqwest::Client::builder()
+            // Bound the TCP/TLS setup phase so a provider that accepts the
+            // connection but stalls before sending response headers can't
+            // block `chat_completion` forever. This does NOT bound the SSE
+            // body (a healthy long stream would trip a whole-request timeout
+            // — that's the per-chunk `idle_timeout`'s job instead).
+            .connect_timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap_or_default();
         Self {
             provider_id: provider_id.into(),
-            client: reqwest::Client::new(),
+            client,
             config,
             tailscale,
             idle_timeout,
@@ -257,8 +266,13 @@ impl Provider for OpenAICompatibleProvider {
         if let Some(f) = sampling.frequency_penalty {
             body["frequency_penalty"] = f.into();
         }
+        // Clamp max_tokens to a sane range (mirror of anthropic.rs): a
+        // configured 0/negative or absurd value produces an opaque provider
+        // 400 on the turn.
         if let Some(m) = sampling.max_tokens {
-            body["max_tokens"] = m.into();
+            if (1..=65536).contains(&m) {
+                body["max_tokens"] = m.into();
+            }
         }
         // top_k/min_p are llama.cpp/Ollama extensions to the OpenAI-compatible
         // wire format, not part of the spec — a hosted OpenAI-compatible
@@ -537,6 +551,12 @@ impl OpenAISSEStream {
         if self.tool_call_buf.is_empty() {
             return;
         }
+        let bad: Vec<String> = self
+            .tool_call_buf
+            .iter()
+            .filter(|(_, buf)| serde_json::from_str::<Value>(&buf.arguments).is_err())
+            .map(|(_, buf)| buf.name.clone().unwrap_or_else(|| "<unnamed>".into()))
+            .collect();
         let tool_calls: Vec<super::base::ToolCall> = self
             .tool_call_buf
             .drain()
@@ -548,8 +568,23 @@ impl OpenAISSEStream {
                 // `name` key at all (and never captured the streamed
                 // `function.name` fragment in the first place), so every
                 // tool call executed as an unnamed/"unknown" tool.
-                let arguments: Value = serde_json::from_str(&buf.arguments)
-                    .unwrap_or_else(|_| serde_json::json!({}));
+                //
+                // Malformed (truncated/incomplete) arguments must NOT be
+                // silently replaced with `{}` — that executes the tool with
+                // empty args (a `read_file` becomes `read_file(path:
+                // undefined)`), corrupting user-visible effects. Emit an
+                // error delta so the agent loop surfaces a failed call
+                // instead.
+                let arguments: Value = match serde_json::from_str(&buf.arguments) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(
+                            "tool call {:?} had unparseable streamed arguments: {e}",
+                            buf.name
+                        );
+                        serde_json::json!({ "__error": format!("malformed tool arguments: {e}") })
+                    }
+                };
                 let function = serde_json::json!({
                     "name": buf.name.unwrap_or_default(),
                     "arguments": arguments,
@@ -561,6 +596,24 @@ impl OpenAISSEStream {
                 }
             })
             .collect();
+        // Only emit extra error deltas when there was an actual parse failure —
+        // the well-formed calls still flow as normal tool_calls below.
+        if !bad.is_empty() {
+            self.pending.push_back(Delta {
+                role: "assistant".into(),
+                content: None,
+                reasoning: None,
+                tool_calls: None,
+                finish_reason: None,
+                usage: None,
+                error_type: Some(
+                    format!(
+                        "malformed streamed tool arguments for: {}",
+                        bad.join(", ")
+                    ),
+                ),
+            });
+        }
         self.pending.push_back(Delta {
             role: "assistant".into(),
             content: None,
@@ -575,7 +628,12 @@ impl OpenAISSEStream {
     /// Process one complete SSE line, pushing any resulting Delta(s) onto `pending`.
     /// Returns true if this line signalled stream completion (`[DONE]`).
     fn process_line(&mut self, line: &str) -> bool {
-        let Some(data) = line.strip_prefix("data: ") else {
+        // Per the SSE spec the colon may be followed by zero-or-more spaces —
+        // many llama.cpp-era servers emit `data:{...}` with no space, and a
+        // strict `data: ` would silently drop those lines (including a
+        // lost `[DONE]`, hanging the turn until the idle timeout).
+        let trimmed = line.trim_start();
+        let Some(data) = trimmed.strip_prefix("data:").map(|d| d.trim_start()) else {
             return false;
         };
 
@@ -586,7 +644,14 @@ impl OpenAISSEStream {
 
         let json: Value = match serde_json::from_str(data) {
             Ok(j) => j,
-            Err(_) => return false,
+            Err(e) => {
+                // Previously dropped silently — a malformed chunk (truncated
+                // JSON, non-JSON interleave) then produced no signal at all
+                // and the turn ran on until the idle timeout. Log it so the
+                // failure is visible in daemon logs.
+                tracing::debug!("dropped malformed SSE data line: {e}: {data}");
+                return false;
+            }
         };
 
         // Standard OpenAI-compatible endpoints send `usage` and the final

@@ -1,5 +1,10 @@
 import { describe, it, expect } from 'vitest';
-import { toolCallSignature, countToolCall, type ToolCallCounts } from './chatStore';
+import {
+  countToolCall,
+  toolCallSignature,
+  trackToolAlternation,
+  type ToolCallCounts,
+} from './chatStore';
 
 /** Backs the chat-mode tool-loop guard (owner-reported bug: a model got stuck
     alternating web_scrape/cache tool calls against the same target, each a
@@ -73,5 +78,51 @@ describe('countToolCall', () => {
     counts = countToolCall(counts, 'web_scrape', { url: 'https://a.com' }).counts;
     const r = countToolCall(counts, 'web_scrape', { url: 'https://different.com' });
     expect(r.count).toBe(1);
+  });
+});
+
+describe('trackToolAlternation', () => {
+  it('detects a sustained two-tool alternation against the same target', () => {
+    let st = new Map<string, { lastTitle: string | null; flips: number }>();
+    // A→B→A→B→A: each consecutive title change bumps flips.
+    st = trackToolAlternation(st, 'web_scrape', { url: 'https://a.com' }).state;
+    expect(trackToolAlternation(st, 'cache', { url: 'https://a.com' }).flips).toBe(1);
+    st = trackToolAlternation(st, 'cache', { url: 'https://a.com' }).state;
+    const r = trackToolAlternation(st, 'web_scrape', { url: 'https://a.com' });
+    expect(r.flips).toBe(2);
+  });
+
+  it('sets flips back to 0 when the same tool repeats on a target', () => {
+    let st = new Map<string, { lastTitle: string | null; flips: number }>();
+    st = trackToolAlternation(st, 'web_scrape', { url: 'https://a.com' }).state;
+    st = trackToolAlternation(st, 'cache', { url: 'https://a.com' }).state;
+    st = trackToolAlternation(st, 'cache', { url: 'https://a.com' }).state;
+    expect(trackToolAlternation(st, 'cache', { url: 'https://a.com' }).flips).toBe(0);
+  });
+
+  it('keys alternation by target, not by tool', () => {
+    let st = new Map<string, { lastTitle: string | null; flips: number }>();
+    st = trackToolAlternation(st, 'tool_a', { url: 'https://a.com' }).state;
+    st = trackToolAlternation(st, 'tool_b', { url: 'https://a.com' }).state;
+    // Different target starts its own sequence — this is the shared-key
+    // behavior the loop guard relies on (bounces on a.com don't count
+    // against b.com).
+    const r = trackToolAlternation(st, 'tool_b', { url: 'https://b.com' });
+    expect(r.flips).toBe(0);
+  });
+
+  it('returns 0 and unchanged state when no target can be extracted', () => {
+    const st = new Map<string, { lastTitle: string | null; flips: number }>();
+    const r = trackToolAlternation(st, 'mystery', { foo: 'bar' });
+    expect(r.flips).toBe(0);
+    expect(r.state.size).toBe(0);
+  });
+
+  it('does not mutate the input state (pure)', () => {
+    const st = new Map<string, { lastTitle: string | null; flips: number }>([
+      ['https://a.com', { lastTitle: 'cache', flips: 3 }],
+    ]);
+    trackToolAlternation(st, 'web_scrape', { url: 'https://a.com' });
+    expect(st.get('https://a.com')).toEqual({ lastTitle: 'cache', flips: 3 });
   });
 });

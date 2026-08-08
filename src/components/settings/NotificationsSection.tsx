@@ -12,6 +12,10 @@ const EVENTS: { key: keyof NotificationPrefs; label: string }[] = [
 export function NotificationsSection() {
   const { draft, update, save, saved, error } = useConfigDraft();
   if (!draft) return <p className="muted">Loading…</p>;
+  // A loaded config predating the notifications field (or hand-edited to
+  // drop it) would otherwise crash this section with "cannot read property
+  // of undefined" — default the object instead.
+  const notifications = draft.notifications ?? {};
 
   return (
     <section className="settings-section">
@@ -21,9 +25,9 @@ export function NotificationsSection() {
         <label className="check" key={e.key}>
           <input
             type="checkbox"
-            checked={draft.notifications[e.key]}
+            checked={notifications[e.key] ?? false}
             onChange={(ev) =>
-              update({ notifications: { ...draft.notifications, [e.key]: ev.target.checked } })
+              update({ notifications: { ...notifications, [e.key]: ev.target.checked } })
             }
           />
           <span>{e.label}</span>

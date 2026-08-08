@@ -20,6 +20,11 @@ function stringify(v: unknown): string {
     match this exact shape falls back to plain text below. */
 interface IframeRenderPayload {
   title?: string;
+  /** The iframe `sandbox` token list is FIXED here, not taken from the tool
+      payload — a crafted or buggy tool could otherwise pass `allow-scripts
+      allow-same-origin` (treating the srcDoc as same-origin with the app) or
+      `allow-top-navigation` (steering the whole window). `allow-scripts` alone
+      keeps the visualization's own JS working while it stays fully opaque. */
   sandbox: string;
   html: string;
 }
@@ -42,7 +47,7 @@ function parseIframePayload(output: unknown): IframeRenderPayload | null {
   if (typeof html !== 'string' || !html.trim()) return null;
   return {
     title: typeof rc.title === 'string' ? rc.title : undefined,
-    sandbox: typeof rc.sandbox === 'string' ? rc.sandbox : 'allow-scripts',
+    sandbox: 'allow-scripts',
     html,
   };
 }
@@ -88,12 +93,32 @@ function ToolResultIframe({ payload }: { payload: IframeRenderPayload }) {
   );
 }
 
+// Pending blob-URL revokes from `openInNewWindow`, tracked so they can be
+// cancelled at teardown (multiple visualization cards → several 30s timers
+// would otherwise outlive the window).
+const revokeTimers = new Set<ReturnType<typeof setTimeout>>();
+const revokeLater = (url: string) => {
+  const id = setTimeout(() => {
+    revokeTimers.delete(id);
+    URL.revokeObjectURL(url);
+  }, 30_000);
+  revokeTimers.add(id);
+};
+if (typeof window !== 'undefined') {
+  window.addEventListener('beforeunload', () => {
+    revokeTimers.forEach((id) => {
+      clearTimeout(id);
+      revokeTimers.delete(id);
+    });
+  });
+}
+
 function openInNewWindow(html: string) {
   const url = URL.createObjectURL(new Blob([html], { type: 'text/html' }));
   window.open(url, '_blank');
   // Revoked after a delay rather than immediately — the new tab needs the
   // blob to still resolve when it actually loads the URL.
-  setTimeout(() => URL.revokeObjectURL(url), 30_000);
+  revokeLater(url);
 }
 
 /** A viz tool didn't hand back a parseable iframe envelope. Distinguish the

@@ -231,6 +231,17 @@ fn default_ollama_url() -> String {
 /// literal string.
 pub const DEFAULT_EMBEDDING_MODEL: &str = "qwen3-embedding:0.6b";
 
+/// Sentry label for vectors produced by the LEXICAL signed-hash fallback
+/// embedder (Ollama unavailable/erroring). This space is incompatible with
+/// the semantic embedder's — cosine across the two means nothing — so a
+/// hash-space belief MUST be tagged with this instead of the configured
+/// Ollama model, or it lands in the same recall/merge pool as genuine
+/// semantic embeddings and compares garbage forever. Because
+/// `list_recall_candidates` filters by the configured model, a correctly-
+/// tagged hash-space belief simply won't be recalled — the safe outcome for
+/// a vector we can't meaningfully compare.
+pub const HASH_EMBED_MODEL: &str = "__lexical_hash__";
+
 fn default_ollama_model() -> String {
     DEFAULT_EMBEDDING_MODEL.into()
 }

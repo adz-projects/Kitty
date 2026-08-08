@@ -22,6 +22,23 @@ export function useRecipeAutocomplete(text: string, recipes: Recipe[]) {
     setSelectedIndex(0);
   }, [query]);
 
+  // Clamp when the live recipe list shrinks under an active query (recipes
+  // refresh across windows via `recipes://changed`) — otherwise a stale,
+  // out-of-range index makes the composer's Enter/Tab accept silently miss
+  // (`matches[selectedIndex]` is undefined) and submit the raw `/slug`.
+  useEffect(() => {
+    if (!matches.length) setSelectedIndex(0);
+    else setSelectedIndex((i) => Math.min(i, matches.length - 1));
+  }, [matches.length]);
+
+  // A dismissal is only for the *current* spell of the query — once the user
+  // clears back to `/` (query becomes empty), the next identical re-type is a
+  // fresh attempt and must be able to open again (previously it stayed
+  // suppressed forever, since the re-typed query equals the dismissed one).
+  useEffect(() => {
+    if (query === '') setDismissedQuery(null);
+  }, [query]);
+
   const open = isComposingSlug && matches.length > 0 && query !== dismissedQuery;
   const dismiss = () => setDismissedQuery(query);
 

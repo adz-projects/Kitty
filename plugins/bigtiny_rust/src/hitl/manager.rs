@@ -274,15 +274,28 @@ impl HITLManager {
     }
 
     /// Record a human decision for a pending action.
-    pub async fn record_decision(&mut self, action_id: &str, decision: &str) -> HITLDecision {
+    /// Record a user's decision, mutating only in-memory state (the `/approve`
+    /// route holds the shared mutex around this call — never a DB `.await`
+    /// under that lock, otherwise every concurrent tool call's HITL check
+    /// serializes behind a storage round-trip). Returns the decision plus the
+    /// `always_allow` rule to persist, so the caller can perform that one
+    /// async side-effect OUTSIDE the lock.
+    pub fn record_decision(
+        &mut self,
+        action_id: &str,
+        decision: &str,
+    ) -> (HITLDecision, Option<String>) {
         let pending = match self.pending.remove(action_id) {
             Some(p) => p,
             None => {
-                return HITLDecision {
-                    action: "rejected".to_string(),
-                    reason: Some(format!("No pending action found: {}", action_id)),
-                    pending_action_id: None,
-                };
+                return (
+                    HITLDecision {
+                        action: "rejected".to_string(),
+                        reason: Some(format!("No pending action found: {}", action_id)),
+                        pending_action_id: None,
+                    },
+                    None,
+                );
             }
         };
 
@@ -299,29 +312,40 @@ impl HITLManager {
         );
 
         match decision {
-            "reject" => HITLDecision {
-                action: "rejected".to_string(),
-                reason: Some(format!("User rejected tool call '{}'", pending.tool_name)),
-                pending_action_id: None,
-            },
-            "always_allow" => {
-                if let Err(e) =
-                    hitl_rules::upsert_rule(&self.pool, &pending.tool_name, None, "always_allow")
-                        .await
-                {
-                    tracing::error!("Failed to insert always_allow rule: {}", e);
-                }
+            "reject" => (
+                HITLDecision {
+                    action: "rejected".to_string(),
+                    reason: Some(format!("User rejected tool call '{}'", pending.tool_name)),
+                    pending_action_id: None,
+                },
+                None,
+            ),
+            "always_allow" => (
                 HITLDecision {
                     action: "always_allow".to_string(),
                     reason: None,
                     pending_action_id: None,
-                }
-            }
-            _ => HITLDecision {
-                action: "proceed".to_string(),
-                reason: None,
-                pending_action_id: None,
-            },
+                },
+                Some(pending.tool_name),
+            ),
+            _ => (
+                HITLDecision {
+                    action: "proceed".to_string(),
+                    reason: None,
+                    pending_action_id: None,
+                },
+                None,
+            ),
+        }
+    }
+
+    /// Persist an `always_allow` rule for `tool_name` — the DB half of a
+    /// recorded `always_allow` decision, run by the caller AFTER releasing
+    /// the shared mutex (see `record_decision`).
+    pub async fn persist_allow_rule(&self, tool_name: &str) {
+        if let Err(e) = hitl_rules::upsert_rule(&self.pool, tool_name, None, "always_allow").await
+        {
+            tracing::error!("Failed to insert always_allow rule: {}", e);
         }
     }
 

@@ -172,9 +172,21 @@ impl Scheduler {
             self.unregister_cron_job(job_id).await;
         }
 
-        schedules::update_schedule(&self.db, job_id, cron, enabled.map(|b| b as i32))
+        // Persist last. The live cron was already re-registered above (to
+        // validate it); if the DB write now fails, roll that live change back
+        // so DB and the running scheduler don't diverge — the row still
+        // advertises the OLD cron while a NEW live job would otherwise keep
+        // firing against it until restart (mirror of add_job's rollback).
+        if let Err(e) = schedules::update_schedule(&self.db, job_id, cron, enabled.map(|b| b as i32))
             .await
-            .map_err(SchedulerError::from)?;
+        {
+            // Revert the live registration to match the still-persisted row.
+            self.unregister_cron_job(job_id).await;
+            if new_enabled {
+                let _ = self.register_cron_job(job_id, &current.cron).await;
+            }
+            return Err(SchedulerError::from(e));
+        }
         Ok(())
     }
 
@@ -216,15 +228,20 @@ impl Scheduler {
         Ok(id)
     }
 
-    /// Manually trigger a job right now (`POST .../run_now`), bypassing its
-    /// cron schedule entirely.
-    pub async fn run_job(&self, job_id: &str) -> Result<(), SchedulerError> {
+    /// Execute one scheduled job: temp session + `execution_history`
+    /// bookkeeping, then the recipe run, using this scheduler's own DB +
+    /// engine handles. Returns `false` (not an error) when the job is
+    /// genuinely missing, so a caller can distinguish 404 from a real
+    /// storage failure (500). Used by `tests/scheduler_and_recipes.rs`.
+    pub async fn run_job(&self, job_id: &str) -> Result<bool, SchedulerError> {
         let job = schedules::get_schedule(&self.db, job_id)
             .await
-            .map_err(SchedulerError::from)?
-            .ok_or_else(|| SchedulerError::NotFound(job_id.to_string()))?;
+            .map_err(SchedulerError::from)?;
+        let Some(job) = job else {
+            return Ok(false);
+        };
         execute_job(&self.db, &self.engine, &job.id).await;
-        Ok(())
+        Ok(true)
     }
 
     pub async fn stop(&mut self) {
@@ -236,28 +253,37 @@ impl Scheduler {
 }
 
 /// Execute one scheduled job: temp session + `execution_history` bookkeeping,
-/// then the recipe run. Ported exactly from Python's `_execute_job`,
+/// then the recipe run. `pub(crate)` so the `run_now` route can execute a job
+/// using its own `db`/`recipe_engine` handles WITHOUT holding the scheduler
+/// mutex — running a multi-minute recipe turn while holding it serialized
+/// every other `POST/PATCH/DELETE /api/schedules*` call behind the one job.
+/// Ported exactly from Python's `_execute_job`,
 /// including the asymmetry between the success and failure paths — see the
 /// comment below for why the failure path can't just delete the temp
 /// session the way the success path does.
-async fn execute_job(db: &SqlitePool, engine: &RecipeEngine, job_id: &str) {
+pub(crate) async fn execute_job(db: &SqlitePool, engine: &RecipeEngine, job_id: &str) {
     let Ok(Some(job)) = schedules::get_schedule(db, job_id).await else {
+        // A DB error here used to be invisible — log it so a schedule that
+        // silently stopped firing isn't indistinguishable from a dead daemon.
+        tracing::error!("scheduled job {job_id}: failed to load schedule row from db");
         return;
     };
 
     let exec_id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
     let temp_sid = format!("_job_{exec_id}");
-    if sessions::create_session(db, &temp_sid, &format!("scheduled:{job_id}"))
-        .await
-        .is_err()
-    {
+    if let Err(e) = sessions::create_session(db, &temp_sid, &format!("scheduled:{job_id}")).await {
+        // Previously `is_err() { return }` — a create failure (e.g. a rare
+        // exec_id collision on the PK) silently dropped the whole tick with
+        // no trace.
+        tracing::error!("scheduled job {job_id}: failed to create temp session: {e}");
         return;
     }
     let _ = sessions::update_session_status(db, &temp_sid, "idle").await;
-    if execution::insert_execution(db, &exec_id, &temp_sid, "schedule", Some(job_id))
+    if let Err(e) = execution::insert_execution(db, &exec_id, &temp_sid, "schedule", Some(job_id))
         .await
-        .is_err()
     {
+        tracing::error!("scheduled job {job_id}: failed to insert execution row: {e}");
+        let _ = sessions::delete_session(db, &temp_sid).await;
         return;
     }
 
@@ -269,13 +295,22 @@ async fn execute_job(db: &SqlitePool, engine: &RecipeEngine, job_id: &str) {
 
     match engine.execute(&job.recipe_id, parameters).await {
         Ok(session_id) => {
-            let _ = sqlx::query(
+            if let Err(e) = sqlx::query(
                 "UPDATE execution_history SET status = 'completed', session_id = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?",
             )
             .bind(&session_id)
             .bind(&exec_id)
             .execute(db)
-            .await;
+            .await
+            {
+                // A failed completion-update leaves the execution_history row
+                // `running` forever — previously silent. Still clean up the
+                // temp session (removing it is safe: it isn't referenced by
+                // any history row that matters now), but tell the operator.
+                tracing::error!(
+                    "scheduled job {job_id}: failed to mark execution {exec_id} completed: {e}"
+                );
+            }
             let _ = sessions::delete_session(db, &temp_sid).await;
         }
         Err(e) => {
@@ -283,7 +318,7 @@ async fn execute_job(db: &SqlitePool, engine: &RecipeEngine, job_id: &str) {
             // Clean up the bookkeeping rows on the failure path exactly like
             // the success path does, but in FK-safe order: the temp session
             // can't be deleted while `execution_history.session_id` (NOT NULL,
-            // FK -> sessions, no ON DELETE clause) still points at it, so the
+            // FK -> sessions) still points at it, so the
             // history row goes first, then the session. Previously this path
             // only marked the session `failed`, leaking a `_job_*` session and
             // its `execution_history` row forever on every failed run. The

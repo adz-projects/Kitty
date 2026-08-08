@@ -80,11 +80,25 @@ impl Db {
 fn next_state(a: &Assumption, current_exchange: i64) -> AssumptionState {
     let elapsed = (current_exchange - a.flagged_at_exchange).max(0);
     match a.state {
-        AssumptionState::Scheduled | AssumptionState::Surfaced => {
+        AssumptionState::Scheduled => {
+            // Surface BEFORE the stale check: if a single tick jumps a
+            // Scheduled assumption past BOTH thresholds (rapid-chat session
+            // between two 60s background passes), the old ordering sent it
+            // straight to Stale — it was never `Surfaced`, so the
+            // `[Worth testing this turn]` prompt never rendered and the
+            // "don't test the same thing every turn" cadence had nothing to
+            // key off. Surfacing first guarantees the prompt shows at least
+            // once; the NEXT tick (state == Surfaced, elapsed still >= 60)
+            // then deprioritizes it via the stale branch below.
+            if elapsed >= SCHEDULE_AFTER_EXCHANGES {
+                AssumptionState::Surfaced
+            } else {
+                a.state
+            }
+        }
+        AssumptionState::Surfaced => {
             if elapsed >= STALE_AFTER_EXCHANGES {
                 AssumptionState::Stale
-            } else if elapsed >= SCHEDULE_AFTER_EXCHANGES {
-                AssumptionState::Surfaced
             } else {
                 a.state
             }

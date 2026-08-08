@@ -9,9 +9,12 @@ import type { Recipe, RecipeExtension, RecipeParameter } from './types';
 /** Replaces every `{{ key }}` occurrence with `values[key]` (or '' if
     missing) — a hand-rolled substitution matching the real Goose recipe
     schema's Jinja-style templating, without pulling in a template engine for
-    one trivial replace. */
+    one trivial replace. The key class is widened past `\w` to `[\w.-]` so
+    hyphenated/dotted parameter keys in the wild (`{{ user-input }}`,
+    `{{ ref.pdf }}`) actually resolve instead of leaking the literal `{{ ... }}`
+    into the model-visible prompt. */
 export function substituteTemplate(text: string, values: Record<string, string>): string {
-  return text.replace(/\{\{\s*(\w+)\s*\}\}/g, (_match, key: string) => values[key] ?? '');
+  return text.replace(/\{\{\s*([\w.-]+)\s*\}\}/g, (_match, key: string) => values[key] ?? '');
 }
 
 /** The one parameter (if any) whose value comes from whatever the user typed

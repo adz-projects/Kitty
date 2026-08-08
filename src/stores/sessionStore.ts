@@ -48,7 +48,13 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     set({ loading: true, loadError: null });
     try {
       const raw = await ipc.listSessions();
-      const sessions = raw.map(parseSession).sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : -1));
+      // Verbatim string compare of the backend's naive `"YYYY-MM-DD HH:MM:SS"`
+      // timestamps, newest first. Must return 0 for equal values — a comparator
+      // that only ever returns ±1 gives equal timestamps an arbitrary,
+      // engine-dependent order that can shuffle between refreshes.
+      const sessions = raw
+        .map(parseSession)
+        .sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : a.updatedAt > b.updatedAt ? -1 : 0));
       set({ sessions });
       await get().refreshFolders();
     } catch (e) {
@@ -63,9 +69,19 @@ export const useSessionStore = create<SessionState>((set, get) => ({
 
   remove: async (sessionId: string) => {
     const cwd = get().sessions.find((s) => s.sessionId === sessionId)?.cwd;
-    await ipc.deleteSession(sessionId, cwd);
+    try {
+      await ipc.deleteSession(sessionId, cwd);
+    } catch (e) {
+      // Same treatment as refresh: a failed delete must not leave a silent
+      // unhandled rejection AND a stale row pretending the session is gone —
+      // surface the failure so the sidebar keeps the row and can show why.
+      set({ loadError: e instanceof Error ? e.message : String(e) });
+      return;
+    }
     set((s) => ({ sessions: s.sessions.filter((x) => x.sessionId !== sessionId) }));
-    // Drop any dangling folder assignment.
+    // Drop any dangling folder assignment. Best-effort: a stale cross-window
+    // `assignments` map could skip this, but the delete already succeeded so
+    // surfacing a folder-cleanup failure is worse than leaving the mapping.
     if (get().assignments[sessionId]) await get().assignFolder(sessionId, null);
   },
 

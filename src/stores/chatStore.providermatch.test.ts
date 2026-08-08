@@ -57,7 +57,7 @@ describe('findMatchingProvider', () => {
     expect(findMatchingProvider([], 'openrouter', 'deepseek/deepseek-v4-pro')).toBeNull();
   });
 
-  it('maps custom_openai profiles to goosed\'s "openai" providerId', () => {
+  it('matches custom_openai profiles to goosed\'s "openai" providerId', () => {
     // Mirrors `goose_provider_name` in providers.rs: goosed's own session
     // metadata has no `custom_openai` concept — it only ever reports
     // "openai", since that's the underlying client Kitty routes through.
@@ -76,5 +76,19 @@ describe('findMatchingProvider', () => {
     const b = profile({ id: 'p2' });
     const match = findMatchingProvider([a, b], 'openrouter', 'deepseek/deepseek-v4-pro');
     expect(match?.id).toBe('p1');
+  });
+
+  it('matches on the Kitty profile id stored in session metadata', () => {
+    // BigTiny stores the Kitty profile id in session metadata via
+    // `set_session_provider`; `_meta.providerId` then carries that id rather
+    // than a goosed type name, so findMatchingProvider must also match on it.
+    const p = profile({ id: 'provider-abc', provider_type: 'openrouter' });
+    const match = findMatchingProvider([p], 'provider-abc', 'deepseek/deepseek-v4-pro');
+    expect(match?.id).toBe('provider-abc');
+  });
+
+  it('returns null when the stored profile id matches no profile', () => {
+    const p = profile({ id: 'provider-abc', provider_type: 'openrouter' });
+    expect(findMatchingProvider([p], 'provider-xyz', 'deepseek/deepseek-v4-pro')).toBeNull();
   });
 });

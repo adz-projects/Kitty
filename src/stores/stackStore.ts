@@ -11,7 +11,18 @@ interface StackState {
   init: () => Promise<void>;
 }
 
-let subscribed = false;
+// Per-channel bind state so the two `init()` subscription paths can't leak or
+// double-bind: `subscribed` guards "already successfully bound", `pending`
+// dedupes concurrent in-flight binds (two StrictMode/concurrent init() calls
+// would otherwise BOTH pass the `subscribed` check before either await
+// resolves and attach duplicate listeners), and a failed bind stays pending-
+// cleared so a later init() retries that channel without re-bounding the
+// already-successful one.
+const bound: { status: boolean; startupPhase: boolean } = { status: false, startupPhase: false };
+const pending: { status: Promise<void> | null; startupPhase: Promise<void> | null } = {
+  status: null,
+  startupPhase: null,
+};
 
 export const useStackStore = create<StackState>((set) => ({
   status: 'starting',
@@ -28,18 +39,33 @@ export const useStackStore = create<StackState>((set) => ({
     } catch {
       // Backend not ready yet; the stack://startup-phase event will update us.
     }
-    // `subscribed` is set only after BOTH subscription awaits succeed. Setting
-    // it up front (before the awaits resolved) meant a failed subscription
-    // permanently suppressed updates on later init() calls — the flag was
-    // already true even though no listener was ever attached.
-    if (subscribed) return;
-    try {
-      await onStackStatus((p) => set({ status: p.status, detail: p.detail }));
-      await onStartupPhase((p) => set({ startupPhase: p.phase }));
-      subscribed = true;
-    } catch {
-      // Leave `subscribed` false so a later init() retries the subscriptions
-      // instead of silently dropping all future health/startup events.
+    if (!bound.status && !pending.status) {
+      pending.status = onStackStatus((p) => set({ status: p.status, detail: p.detail }))
+        .then(() => {
+          bound.status = true;
+        })
+        .catch(() => {
+          // Leave `bound.status` false so a later init() retries this channel.
+        })
+        .finally(() => {
+          pending.status = null;
+        });
     }
+    if (!bound.startupPhase && !pending.startupPhase) {
+      pending.startupPhase = onStartupPhase((p) => set({ startupPhase: p.phase }))
+        .then(() => {
+          bound.startupPhase = true;
+        })
+        .catch(() => {
+          // Leave `bound.startupPhase` false so a later init() retries it.
+        })
+        .finally(() => {
+          pending.startupPhase = null;
+        });
+    }
+    // Await any just-started binds so concurrent init() callers don't race
+    // ahead of the flag flips; already-bound/pending calls short-circuit.
+    await pending.status;
+    await pending.startupPhase;
   },
 }));

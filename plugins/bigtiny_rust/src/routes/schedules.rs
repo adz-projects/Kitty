@@ -12,12 +12,25 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::{json, Value};
 
+use crate::error::SchedulerError;
 use crate::storage::schedules;
 
 use super::AppState;
 
 fn err_response(status: StatusCode, message: impl Into<String>) -> Response {
     (status, Json(json!({"error": message.into()}))).into_response()
+}
+
+/// Map a `SchedulerError` to the right HTTP status — a genuinely-missing
+/// schedule is a 404; cron-validation and storage failures are 500s (the old
+/// code mapped every update/delete error to 500, hiding a real missing-job
+/// delete as "daemon broken", and every run_now error to 404, hiding a real
+/// storage failure as "not found").
+fn scheduler_status(e: SchedulerError) -> (StatusCode, String) {
+    match &e {
+        SchedulerError::NotFound(_) => (StatusCode::NOT_FOUND, e.to_string()),
+        _ => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
 }
 
 pub async fn list_schedules(State(state): State<Arc<AppState>>) -> Response {
@@ -49,7 +62,10 @@ pub async fn create_schedule(
     let mut scheduler = state.scheduler.lock().await;
     match scheduler.add_job(name, cron, recipe_id, enabled).await {
         Ok(id) => Json(json!({"id": id})).into_response(),
-        Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => {
+            let (status, msg) = scheduler_status(e);
+            err_response(status, msg)
+        }
     }
 }
 
@@ -63,7 +79,10 @@ pub async fn update_schedule(
     let mut scheduler = state.scheduler.lock().await;
     match scheduler.update_job(&id, cron, enabled).await {
         Ok(()) => Json(json!({"ok": true})).into_response(),
-        Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => {
+            let (status, msg) = scheduler_status(e);
+            err_response(status, msg)
+        }
     }
 }
 
@@ -74,14 +93,27 @@ pub async fn delete_schedule(
     let mut scheduler = state.scheduler.lock().await;
     match scheduler.remove_job(&id).await {
         Ok(_) => Json(json!({"ok": true})).into_response(),
-        Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => {
+            let (status, msg) = scheduler_status(e);
+            err_response(status, msg)
+        }
     }
 }
 
 pub async fn run_now(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
-    let scheduler = state.scheduler.lock().await;
-    match scheduler.run_job(&id).await {
-        Ok(()) => Json(json!({"ok": true})).into_response(),
-        Err(e) => err_response(StatusCode::NOT_FOUND, e.to_string()),
+    // Run the job WITHOUT the scheduler mutex: it's a potentially multi-minute
+    // recipe turn that only needs DB + recipe engine — holding the lock across
+    // it would serialize every other `POST/PATCH/DELETE /api/schedules*` (and
+    // other run_nows) behind this one job for its whole run.
+    let exists = schedules::get_schedule(&state.db, &id).await;
+    match exists {
+        Ok(Some(_)) => {
+            crate::scheduler::execute_job(&state.db, &state.recipe_engine, &id).await;
+            Json(json!({"ok": true})).into_response()
+        }
+        // NotFound for a missing job; 500 for a real storage failure — the
+        // old code collapsed both to 404.
+        Ok(None) => err_response(StatusCode::NOT_FOUND, "schedule not found"),
+        Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }

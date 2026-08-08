@@ -128,7 +128,21 @@ pub async fn reembed_stale_beliefs(engine: &PathwayEngine) -> Result<()> {
         return Ok(());
     }
     for belief in &stale {
-        let embedding = engine.embed.embed(&belief.text).await;
+        // If the embedder falls back to the lexical hash vectorizer mid-batch
+        // (a per-item timeout right after the probe succeeded), do NOT persist
+        // that hash-space vector tagged as `current_model` — overwriting a
+        // real semantic embedding with a garbage-space vector permanently is
+        // worse than leaving the stale-tagged row to be retried. The
+        // batch-level `probe_ollama()` above only guarantees Ollama is up, not
+        // that every call stays semantic.
+        let (embedding, semantic) = engine.embed.embed_with_space(&belief.text).await;
+        if !semantic {
+            tracing::warn!(
+                belief_id = %belief.id,
+                "skipped re-embed: embedder fell back to lexical space"
+            );
+            continue;
+        }
         if let Err(e) = engine.db.update_embedding(&belief.id, &embedding, &current_model).await {
             tracing::warn!(belief_id = %belief.id, "re-embedding failed to persist: {e}");
         }

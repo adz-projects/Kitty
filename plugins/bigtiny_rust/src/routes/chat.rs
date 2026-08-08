@@ -221,7 +221,14 @@ pub async fn get_stats(State(state): State<Arc<AppState>>, Path(id): Path<String
     let stats = SessionStats::new(state.db.clone());
     match stats.get_stats(&id).await {
         Ok(v) => Json(v).into_response(),
-        Err(e) => err_response(StatusCode::NOT_FOUND, e),
+        // A genuinely-missing session is a 404; anything else (SQL error,
+        // pool failure) is a real 500 — collapsing both into 404 hid real
+        // infrastructure problems as "session not found" (mirror of the
+        // fork_session handler's status split below).
+        Err(e) if e.contains("not found") => {
+            err_response(StatusCode::NOT_FOUND, e)
+        }
+        Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, e),
     }
 }
 
@@ -386,11 +393,18 @@ pub async fn approve_action(
     Path(_id): Path<String>,
     Json(body): Json<ApproveRequest>,
 ) -> Response {
-    let decision = {
+    // `record_decision` is synchronous now (the DB rule-upsert was split out
+    // of it) — the shared hitl mutex is held only for the in-memory mutation,
+    // never across a storage round-trip, so a single approval can't serialize
+    // every concurrent tool call's HITL check behind a DB write.
+    let (decision, rule_to_persist) = {
         let mut hitl = state.agent.hitl().lock().await;
-        hitl.record_decision(&body.action_id, &body.decision).await
+        hitl.record_decision(&body.action_id, &body.decision)
     };
     state.agent.resolve_approval(&body.action_id);
+    if let Some(tool_name) = rule_to_persist {
+        state.agent.hitl().lock().await.persist_allow_rule(&tool_name).await;
+    }
     Json(decision.to_dict()).into_response()
 }
 

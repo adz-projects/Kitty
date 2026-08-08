@@ -19,7 +19,10 @@ export function App() {
   const status = useStackStore((s) => s.status);
   const init = useStackStore((s) => s.init);
   const initAdaptivePathway = useAdaptivePathwayStore((s) => s.init);
-  const messages = useChatStore((s) => s.messages);
+  // Only this boolean is interesting — subscribing to the whole `messages`
+  // array would re-render the header (and the un-memoized sidebar/pane) on
+  // every streamed token, since each delta produces a fresh array.
+  const hasMessages = useChatStore((s) => s.messages.length > 0);
   const exportSession = useChatStore((s) => s.exportSession);
   const newSession = useChatStore((s) => s.newSession);
   const [showArtifacts, setShowArtifacts] = useState(true);
@@ -41,9 +44,21 @@ export function App() {
 
   const toggleArtifacts = async () => {
     const next = !showArtifacts;
+    // Optimistically flip the UI, then persist — reading + writing the whole
+    // config across two IPC calls opened a lost-update race with a concurrent
+    // Settings save (getConfig's snapshot could clobber a newer write). A
+    // dedicated `set` that only touches `show_artifacts` would be ideal, but
+    // short of that, re-reading immediately before writing keeps the stale
+    // window as small as possible; failures still surface as a console warning
+    // rather than silently diverging the toggle from disk.
     setShowArtifacts(next);
-    const cfg = await ipc.getConfig();
-    await ipc.setConfig({ ...cfg, show_artifacts: next });
+    try {
+      const cfg = await ipc.getConfig();
+      await ipc.setConfig({ ...cfg, show_artifacts: next });
+    } catch (e) {
+      setShowArtifacts(!next); // revert the optimistic flip on failure
+      console.warn('failed to persist show_artifacts', e);
+    }
   };
 
   const degraded = DEGRADED.includes(status);
@@ -55,7 +70,7 @@ export function App() {
         <header className="main-header">
           <h1>Kitty</h1>
           <div style={{ display: 'flex', gap: 8 }}>
-            {messages.length > 0 && (
+            {hasMessages && (
               <button onClick={() => void exportSession()} title="Export this session as ChatML">
                 Export
               </button>

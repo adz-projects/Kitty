@@ -551,16 +551,26 @@ impl AgentLoop {
             }
         };
 
-        // Derive and set session title
-        let title = derive_title(user_message);
-        if !title.is_empty() {
-            let _ = sessions::update_session_name(&pool, session_id, &title).await;
-            let _ = event_tx.send(SSEEvent {
-                event_type: SSEEventType::SessionTitle,
-                content: Some(title.clone()),
-                session_id: Some(session_id.to_string()),
-                ..Default::default()
-            });
+        // Derive and set session title — ONLY when the session isn't already
+        // named. A user-renamed chat (Rename in the sidebar) must survive
+        // later turns; blindly re-deriving + overwriting on every send
+        // clobbers that and re-emits a redundant SessionTitle event each turn.
+        // The rename path always stores the current name (never null), so
+        // this gate is "first-ever derivation" without extra state.
+        if let Ok(Some(row)) = sessions::get_session(&pool, session_id).await {
+            let already_named = row.name.as_deref().is_some_and(|n| !n.is_empty());
+            if !already_named {
+                let title = derive_title(user_message);
+                if !title.is_empty() {
+                    let _ = sessions::update_session_name(&pool, session_id, &title).await;
+                    let _ = event_tx.send(SSEEvent {
+                        event_type: SSEEventType::SessionTitle,
+                        content: Some(title.clone()),
+                        session_id: Some(session_id.to_string()),
+                        ..Default::default()
+                    });
+                }
+            }
         }
 
         // Save initial user message
@@ -823,8 +833,11 @@ impl AgentLoop {
                     .stats
                     .record_usage(
                         session_id,
-                        input_tokens as i32,
-                        output_tokens as i32,
+                        // Saturating casts, not `as i32`: a provider reporting a
+                        // token count over i32::MAX would otherwise wrap negative
+                        // and record garbage in the cost estimate.
+                        i32::try_from(input_tokens).unwrap_or(i32::MAX),
+                        i32::try_from(output_tokens).unwrap_or(i32::MAX),
                         &provider_id,
                         &provider_model,
                     )
@@ -919,7 +932,12 @@ impl AgentLoop {
                     // Actually grant the extension the model was told it got —
                     // previously this only stripped the call, so the turn
                     // still hard-stopped at the original max_steps regardless.
-                    max_steps += BUDGET_EXTENSION_STEPS as i64;
+                    // Re-clamp to the ceiling on EVERY grant: the ceiling is
+                    // only applied to the initial value above, so an
+                    // unbounded chain of `request_more_steps` calls would
+                    // otherwise push `max_steps` past it, defeating the
+                    // spend guard entirely.
+                    max_steps = (max_steps + BUDGET_EXTENSION_STEPS as i64).min(MAX_STEPS_CEILING);
                 }
 
                 if turn_tool_calls.is_empty() {
@@ -1016,7 +1034,13 @@ impl AgentLoop {
         // the prompt said, and surfaced tool-usage trivia in `[What I know
         // about you]` as if it were a personality trait.
         let engine = self.pathway.clone();
-        let learn_every_n = self.pathway_cfg.learn_every_n;
+        // `learn_every_n` is a user-editable u32 (`PathwayConfig::learn_every_n`).
+        // A 0 (or negative-after-cast) value would make `%` below divide by
+        // zero — a guaranteed panic inside this spawned task on the very
+        // first turn — and what the cadence was *meant* to mean ("never
+        // learn") is at any rate not "learn on every turn". Clamp to the
+        // default cadence.
+        let learn_every_n = self.pathway_cfg.learn_every_n.max(1);
         let host_pool = pool.clone();
         let chat = self.summarizer.clone();
         let learn_session_id = session_id.to_string();
@@ -1035,7 +1059,13 @@ impl AgentLoop {
             // `COUNT(*) FROM messages` query issued every single turn
             // (against the host db, not even the pathway one) purely to
             // recompute a number `pathway.db` already tracks incrementally.
-            let exchange_count = engine.db.bump_exchange(&learn_session_id).await.unwrap_or(0);
+            // On a DB error, skip this turn's learn pass entirely rather than
+            // falling back to 0 — `0 % N == 0` would otherwise make the
+            // cadence gate "learn on every turn", and the bump's failure is
+            // in no way a signal to alter cadence.
+            let Ok(exchange_count) = engine.db.bump_exchange(&learn_session_id).await else {
+                return;
+            };
             // The MAX(rowid) guard below is redundant with
             // `extract_and_record`'s watermark, so we skip re-deriving it here.
             if exchange_count % learn_every_n as i64 == 0 {
@@ -1357,23 +1387,32 @@ impl AgentLoop {
             hitl.check_tool_call_with_rules(session_id, &tool_name, &tool_args, &rules)
         };
 
+        // Hard-deny a *write-class* tool that resolves to a path outside the
+        // session's allowed directories — checked unconditionally, BEFORE any
+        // HITL decision branch, so an out-of-scope write can't slip through
+        // when HITL decides `needs_approval` (the common `always_ask` case
+        // previously reached the approval path, letting a user approve a
+        // write that escapes chat_dir/current dir despite the module docs
+        // declaring such writes "hard-denied ... not escalated"). This is a
+        // policy violation, not an ask-the-human question.
+        if is_write_tool(&tool_name) && !check_containment(&tool_args, allowed_dirs, self.sandbox_strict) {
+            let err = format!(
+                "Tool {tool_name} denied: it would write to a path outside this \
+                 session's allowed directories"
+            );
+            let _ = event_tx.send(SSEEvent {
+                event_type: SSEEventType::ToolFinish,
+                tool_name: Some(tool_name),
+                tool_result: Some(err.clone()),
+                session_id: Some(session_id.to_string()),
+                ..Default::default()
+            });
+            return err;
+        }
+
         if (decision.action == "proceed" || decision.action == "always_allow")
             && !check_containment(&tool_args, allowed_dirs, self.sandbox_strict)
         {
-            if is_write_tool(&tool_name) {
-                let err = format!(
-                    "Tool {tool_name} denied: it would write to a path outside this \
-                     session's allowed directories"
-                );
-                let _ = event_tx.send(SSEEvent {
-                    event_type: SSEEventType::ToolFinish,
-                    tool_name: Some(tool_name),
-                    tool_result: Some(err.clone()),
-                    session_id: Some(session_id.to_string()),
-                    ..Default::default()
-                });
-                return err;
-            }
             let mut hitl = self.hitl.lock().await;
             decision = hitl.force_approval(session_id, &tool_name, &tool_args);
         }

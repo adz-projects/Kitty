@@ -26,12 +26,14 @@ export function Advanced() {
   const { draft, update, save, saved, error: saveError } = useConfigDraft();
   const [envOpen, setEnvOpen] = useState(true);
   const [tokenMgmtOpen, setTokenMgmtOpen] = useState(false);
-  const [memoryOpen, setMemoryOpen] = useState(false);  const [enablingOllama, setEnablingOllama] = useState(false);
+  const [memoryOpen, setMemoryOpen] = useState(false);
+  const [enablingOllama, setEnablingOllama] = useState(false);
   const [ollamaMsg, setOllamaMsg] = useState('');
   const [logOpen, setLogOpen] = useState(false);
   const [logEntries, setLogEntries] = useState<LogEntry[]>([]);
   const [logError, setLogError] = useState('');
   const logPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const memoryPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [providers, setProviders] = useState<ProviderView[]>([]);
   const [memoryStats, setMemoryStats] = useState<MemoryStats | null>(null);
   const [memoryStatsError, setMemoryStatsError] = useState('');
@@ -84,13 +86,25 @@ export function Advanced() {
       .then(setMemoryStats)
       .catch((e) => setMemoryStatsError(String(e)));
 
-  // Poll the daemon's global pre-flight memory recall counters while this
-  // pane is mounted, so the "% of prompts" readout stays live across turns.
+  // Poll the daemon's global pre-flight memory recall counters only while the
+  // disclosure is open, so the "% of prompts" readout stays live — same
+  // no-point-fetching-what-people-can't-see rationale as the log poll above
+  // (the stats are only consumed while `memoryOpen`, so an unconditional
+  // interval would hammer the daemon + re-render this section every 5s even
+  // with the panel collapsed).
   useEffect(() => {
+    if (!memoryOpen) {
+      if (memoryPollRef.current) clearInterval(memoryPollRef.current);
+      memoryPollRef.current = null;
+      return;
+    }
     loadMemoryStats();
-    const id = setInterval(loadMemoryStats, MEMORY_POLL_MS);
-    return () => clearInterval(id);
-  }, []);
+    memoryPollRef.current = setInterval(loadMemoryStats, MEMORY_POLL_MS);
+    return () => {
+      if (memoryPollRef.current) clearInterval(memoryPollRef.current);
+      memoryPollRef.current = null;
+    };
+  }, [memoryOpen]);
 
   const clearLog = async () => {
     try {
@@ -405,12 +419,14 @@ export function Advanced() {
                       {memoryStatsError}
                     </p>
                   ) : memoryStats == null ? (
-                    <p className="muted" style={{ margin: 0 }}>Loading…</p>
+                    <p className="muted" style={{ margin: 0 }}>
+                      Loading…
+                    </p>
                   ) : (
                     <p className="muted" style={{ margin: 0 }}>
                       <strong>{memoryStats.injection_rate_pct.toFixed(1)}%</strong> (
-                      {memoryStats.injected_prompts} of {memoryStats.total_prompts} prompts,
-                      all sessions)
+                      {memoryStats.injected_prompts} of {memoryStats.total_prompts} prompts, all
+                      sessions)
                     </p>
                   )}
                 </div>

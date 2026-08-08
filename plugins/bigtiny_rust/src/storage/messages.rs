@@ -6,6 +6,38 @@ use std::collections::HashSet;
 
 use crate::error::StorageError;
 
+/// Token/count aggregates for a session's `messages` table, computed in SQL
+/// (no full-table materialization — the old `get_stats` caller re-read *every*
+/// row on each poll of the stats route, which grew linearly with session
+/// length).
+#[derive(Debug, Clone, FromRow)]
+pub struct MessageAggregates {
+    pub count: i64,
+    pub user_system_tokens: i64,
+    pub assistant_tokens: i64,
+    pub all_tokens: i64,
+}
+
+pub async fn session_message_aggregates(
+    pool: &SqlitePool,
+    session_id: &str,
+) -> Result<MessageAggregates, StorageError> {
+    let row = sqlx::query_as::<_, MessageAggregates>(
+        r#"SELECT
+               COUNT(*) AS count,
+               COALESCE(SUM(CASE WHEN role IN ('user', 'system') THEN token_count ELSE 0 END), 0)
+                 AS user_system_tokens,
+               COALESCE(SUM(CASE WHEN role = 'assistant' THEN token_count ELSE 0 END), 0)
+                 AS assistant_tokens,
+               COALESCE(SUM(token_count), 0) AS all_tokens
+           FROM messages WHERE session_id = ?"#,
+    )
+    .bind(session_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(row)
+}
+
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct MessageRow {
     pub rowid: i64,
@@ -48,8 +80,17 @@ pub async fn save_messages(
     };
 
     let mut tx = pool.begin().await?;
+    // Track ids inserted DURING this batch so two messages in the SAME save
+    // sharing an id don't both pass the DB check and then abort the whole
+    // transaction with a UNIQUE violation — the doc-comment promises batch-
+    // level dedupe, but the SQL lookup above only covers already-persisted
+    // rows, not in-flight duplicates within this batch.
+    let mut inserted_this_batch: HashSet<String> = HashSet::new();
     for msg in messages {
-        if !existing_ids.contains(&msg.id) && msg.role != "system" {
+        if existing_ids.contains(&msg.id) || inserted_this_batch.contains(&msg.id) {
+            continue;
+        }
+        if msg.role != "system" {
             sqlx::query(
                 r#"INSERT INTO messages (id, session_id, role, content, tool_calls, tool_call_id, token_count, content_format)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)"#
@@ -64,6 +105,7 @@ pub async fn save_messages(
             .bind(&msg.content_format)
             .execute(&mut *tx)
             .await?;
+            inserted_this_batch.insert(msg.id.clone());
         }
     }
     tx.commit().await?;
@@ -88,8 +130,10 @@ pub async fn get_messages_by_session(
 /// order, by pushing `LIMIT` into SQL (`ORDER BY rowid DESC LIMIT ?` then
 /// reversed) — the previous `GET /api/chat/{id}/history` used to fetch the
 /// *entire* session and truncate client-side, which re-read every message
-/// even for tiny `limit` values. A `limit <= 0` is treated as "no limit"
-/// (SQLite's own `LIMIT` semantics), matching the old truncate behavior.
+/// even for tiny `limit` values. A `limit <= 0` is treated as "no limit" —
+/// pass the value through unchanged, since SQLite treats a NEGATIVE limit as
+/// "no limit"; the old `.max(0)` turned `<= 0` into `LIMIT 0`, which returns
+/// ZERO rows (the exact opposite of the documented contract).
 pub async fn get_last_messages_by_session(
     pool: &SqlitePool,
     session_id: &str,
@@ -100,7 +144,7 @@ pub async fn get_last_messages_by_session(
            FROM messages WHERE session_id = ? ORDER BY rowid DESC LIMIT ?"#
     )
     .bind(session_id)
-    .bind(limit.max(0))
+    .bind(limit)
     .fetch_all(pool)
     .await?;
     rows.reverse();

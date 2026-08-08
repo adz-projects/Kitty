@@ -118,6 +118,53 @@ export function toolCallSignature(title: string, rawInput: unknown): string {
   return `${title}::${target}`;
 }
 
+/** The `target` half of a tool call's signature (URL/path/command), without
+    the tool title. Used by the alternation detector below — two *different*
+    tools against the *same* target need a shared key to recognize an
+    alternating loop. */
+export function toolCallTarget(rawInput: unknown): string | null {
+  const input = (rawInput ?? {}) as {
+    url?: string;
+    path?: string;
+    file_path?: string;
+    paths?: string[];
+    command?: string;
+  };
+  const primary =
+    input.url ??
+    input.path ??
+    input.file_path ??
+    (Array.isArray(input.paths) ? input.paths[0] : undefined) ??
+    input.command;
+  return typeof primary === 'string' ? primary : null;
+}
+
+/** Alternation-tracking state for the tool-loop guard. Keyed by target so two
+    different tools against the same target share one counter. */
+export type ToolAlternationState = Map<string, { lastTitle: string | null; flips: number }>;
+
+/** Pure updater behind the *alternating*-tools half of the tool-loop guard.
+    The per-signature count in `countToolCall` alone can't catch a model that
+    bounces between two tools (web-fetch ↔ its own caching step) on the same
+    target — each tool's own count stays below the threshold forever. This
+    instead tracks consecutive tool-title *changes* for each target; a
+    sustained A→B→A→B… sequence keeps incrementing `flips` against the shared
+    target key, so the guard can flag it. A repeated same-tool call leaves
+    `flips` at 0 and is left to the per-signature counter. */
+export function trackToolAlternation(
+  state: ToolAlternationState,
+  title: string,
+  rawInput: unknown
+): { flips: number; state: ToolAlternationState } {
+  const target = toolCallTarget(rawInput);
+  if (!target) return { flips: 0, state };
+  const next = new Map(state);
+  const cur = next.get(target) ?? { lastTitle: null, flips: 0 };
+  const flips = cur.lastTitle !== null && cur.lastTitle !== title ? cur.flips + 1 : 0;
+  next.set(target, { lastTitle: title, flips });
+  return { flips, state: next };
+}
+
 /** Chat-mode tool-loop guard (owner-reported bug): a model can get stuck
     alternating between two tools against the same target (e.g. a web-fetch
     tool and its own cache step) — each iteration a real network/disk

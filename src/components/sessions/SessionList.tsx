@@ -24,17 +24,19 @@ const DRAG_THRESHOLD_PX = 6;
     the same webview. Tracking pointer position ourselves sidesteps the native
     handler entirely and works regardless of that setting. */
 export function SessionList() {
-  const {
-    loading,
-    query,
-    refresh,
-    refreshFolders,
-    setQuery,
-    folders,
-    createFolder,
-    grouped,
-    assignFolder,
-  } = useSessionStore();
+  // Narrow slices, not the whole store: a whole-store subscription re-renders
+  // this entire (potentially long) sidebar whenever ANY slice changes — e.g.
+  // the 150ms-debounced `setQuery` on a keystroke, or a single session being
+  // reassigned — even though nothing on screen necessarily moved.
+  const loading = useSessionStore((s) => s.loading);
+  const query = useSessionStore((s) => s.query);
+  const folders = useSessionStore((s) => s.folders);
+  const refresh = useSessionStore((s) => s.refresh);
+  const refreshFolders = useSessionStore((s) => s.refreshFolders);
+  const setQuery = useSessionStore((s) => s.setQuery);
+  const createFolder = useSessionStore((s) => s.createFolder);
+  const grouped = useSessionStore((s) => s.grouped);
+  const assignFolder = useSessionStore((s) => s.assignFolder);
   const activeId = useChatStore((s) => s.sessionId);
 
   const [dragId, setDragId] = useState<string | null>(null);
@@ -277,7 +279,8 @@ function FolderGroup({
   dragId: string | null;
   onStartDrag: (sessionId: string, e: ReactPointerEvent) => void;
 }) {
-  const { renameFolder, deleteFolder } = useSessionStore();
+  const renameFolder = useSessionStore((s) => s.renameFolder);
+  const deleteFolder = useSessionStore((s) => s.deleteFolder);
   const isReal = group.folder !== UNCATEGORIZED;
   const folderTarget = isReal ? group.folder : '';
   // Defaults open, matching the previous always-open behavior.
@@ -421,9 +424,12 @@ function SessionRow({
   dragging: boolean;
   onStartDrag: (sessionId: string, e: ReactPointerEvent) => void;
 }) {
-  const { remove, rename, assignments } = useSessionStore();
+  const remove = useSessionStore((s) => s.remove);
+  const rename = useSessionStore((s) => s.rename);
+  // Only this row's assignment — subscribing to the whole `assignments` map
+  // (or the whole store) re-renders every row when any other session moves.
+  const current = useSessionStore((state) => state.assignments[s.sessionId] ?? '');
   const loadSession = useChatStore((st) => st.loadSession);
-  const current = assignments[s.sessionId] ?? '';
   const [confirmingDelete, setConfirmingDelete] = useState(false);
   const [renaming, setRenaming] = useState(false);
   const [renameValue, setRenameValue] = useState(s.title);

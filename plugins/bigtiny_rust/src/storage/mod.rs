@@ -254,7 +254,7 @@ mod tests {
             CREATE TABLE mcp_servers (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
-                transport TEXT NOT NULL CHECK(transport IN ('stdio', 'sse')),
+                transport TEXT NOT NULL CHECK(transport IN ('stdio', 'sse', 'streamable_http', 'in_process')),
                 command TEXT,
                 args TEXT,
                 sse_url TEXT,
@@ -469,6 +469,63 @@ mod tests {
             .await
             .unwrap();
         assert!(gone.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_delete_session_cascades_execution_history() {
+        // Migration 012 added ON DELETE CASCADE to `execution_history.session_id`
+        // — deleting a session that has execution-history rows used to raise
+        // SQLITE_CONSTRAINT_FOREIGNKEY (500 on DELETE /api/chat/{id}).
+        let pool = get_test_pool().await;
+        sessions::create_session(&pool, "cascade-s", "Cascade Test")
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO execution_history (id, session_id, trigger_type, status) \
+             VALUES ('e1', 'cascade-s', 'manual', 'completed')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sessions::delete_session(&pool, "cascade-s").await.unwrap();
+
+        let leftover: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM execution_history WHERE id = 'e1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(leftover, 0);
+    }
+
+    #[tokio::test]
+    async fn test_delete_recipe_cascades_schedule_jobs() {
+        // Migration 012 added ON DELETE CASCADE to `schedule_jobs.recipe_id` —
+        // deleting a still-referenced recipe used to 500.
+        let pool = get_test_pool().await;
+        sqlx::query("INSERT INTO recipes (id, name, prompt_template, max_steps) VALUES ('r-cascade', 'R', 'p', 10)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO schedule_jobs (id, name, cron, recipe_id, enabled) \
+             VALUES ('s-cascade', 'job', '0 9 * * *', 'r-cascade', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query("DELETE FROM recipes WHERE id = 'r-cascade'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let leftover: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM schedule_jobs WHERE id = 's-cascade'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(leftover, 0);
     }
 
     #[tokio::test]

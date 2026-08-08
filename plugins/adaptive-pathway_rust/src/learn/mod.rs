@@ -236,13 +236,22 @@ pub async fn extract_and_record<S: StructuredChat>(
         let evidence = non_empty(obs.get("evidence").and_then(|e| e.as_str()));
         let contradicts = non_empty(obs.get("contradicts").and_then(|c| c.as_str()));
 
-        let embedding = engine.embed.embed(&statement).await;
+        let (embedding, semantic) = engine.embed.embed_with_space(&statement).await;
         let now = chrono::Utc::now();
+        // Tag with the embedding space ACTUALLY used — a lexical hash-fallback
+        // vector must not be labeled as the semantic model (it would join the
+        // same recall/merge pool as real embeddings and compare garbage, and
+        // never be flagged stale by `list_stale_embedding_beliefs`).
+        let embedding_model = if semantic {
+            engine.cfg.embedding.ollama_model.as_str()
+        } else {
+            crate::config::HASH_EMBED_MODEL
+        };
         crate::belief::synthesis::route_observation(
             db,
             &statement,
             &embedding,
-            &engine.cfg.embedding.ollama_model,
+            embedding_model,
             provenance,
             layer,
             domain.as_deref(),

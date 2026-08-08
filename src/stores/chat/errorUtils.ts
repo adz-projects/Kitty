@@ -128,6 +128,10 @@ const INTERNAL_MARKERS = [
     whole injected block disappears cleanly. A no-op when no internal marker
     is present. */
 export function stripInternalMarkers(text: string): string {
+  // No marker present? Skip the whole regex sweep and, crucially, the
+  // trailing whitespace-collapse — that trimming would otherwise eat
+  // intentional leading line breaks from plain user messages on every replay.
+  if (!INTERNAL_MARKERS.some((m) => text.includes(m))) return text;
   let out = text;
   for (const marker of INTERNAL_MARKERS) {
     const escaped = marker.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');

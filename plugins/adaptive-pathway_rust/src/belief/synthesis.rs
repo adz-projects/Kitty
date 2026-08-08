@@ -107,17 +107,27 @@ async fn route_observation_inner(
         // provenance ranking, re-parent this observation onto target.
         let new_conf = merge_confidence(target.confidence, provenance);
         let new_prov = max_provenance(target.provenance, provenance);
-        let session_is_new = match &session_id {
-            Some(sid) => target.session_id.as_deref() != Some(sid.as_str()),
+        let target_id = target.id.clone();
+        // Session-identity comes from the observations table, not the
+        // belief's own `session_id` column — that column is always `None` on
+        // cross-session Context/Identity targets, so the old
+        // `target.session_id != Some(sid)` check treated EVERY merge as a new
+        // session, letting one chatty session inflate `distinct_sessions` past
+        // the `>= 2` promotion gate on its own. Bump the monotonic stored
+        // counter only when this session isn't already represented among the
+        // target's observations.
+        let session_already_contributed = match session_id.as_deref() {
+            Some(sid) => db.has_session_observation(&target.id, sid).await?,
             None => false,
         };
-        let target_id = target.id.clone();
+        let distinct_sessions =
+            target.distinct_sessions + if session_already_contributed { 0 } else { 1 };
         db.update_belief(
             &target.id,
             &BeliefPatch {
                 confidence: Some(new_conf),
                 support_count: Some(target.support_count + 1),
-                distinct_sessions: Some(target.distinct_sessions + if session_is_new { 1 } else { 0 }),
+                distinct_sessions: Some(distinct_sessions),
                 // The merged-in evidence's provenance is carried onto the
                 // belief itself (not just the observation row) -- otherwise
                 // a belief formed as `single_observation` that later gets

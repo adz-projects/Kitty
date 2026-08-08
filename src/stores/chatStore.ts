@@ -53,6 +53,8 @@ import {
   hasRepetitionLoop,
   splitLeakedThinkTag,
   TOOL_LOOP_THRESHOLD,
+  trackToolAlternation,
+  type ToolAlternationState,
   type ToolCallCounts,
 } from './chat/loopGuards';
 import {
@@ -391,6 +393,9 @@ const newId = () => `m${Date.now()}_${++msgSeq}`;
 // in ./chat/loopGuards) — module-level like `stopGraceTimer`, reset at the
 // start of every fresh turn in `send()`.
 let toolLoopCounts: ToolCallCounts = new Map();
+// Alternation state for the same guard (see `trackToolAlternation`) — reset
+// alongside `toolLoopCounts` at every fresh turn.
+let toolAlternation: ToolAlternationState = new Map();
 
 // Synchronous in-flight guard for turn submission (Round-WS8): `busy` is
 // committed only after several awaits (ensureSession, image reads, …), so a
@@ -737,7 +742,8 @@ export const useChatStore = create<ChatState>((set, get) => {
       // drops through the exact same native-image-block mechanism, just via
       // `pendingImages` below rather than this `droppedFiles`-derived list).
       const imageFiles = files.filter((f) => !f.is_dir && isImageFileName(f.name));
-      const otherFiles = files.filter((f) => !imageFiles.includes(f));
+      const imageSet = new Set(imageFiles);
+      const otherFiles = files.filter((f) => !imageSet.has(f));
       for (const f of [...otherFiles, ...imageFiles]) addArtifact(userFileArtifact(f.path, f.name));
       let images: { mime: string; data_url: string }[] | undefined;
       if (imageFiles.length) {
@@ -863,6 +869,16 @@ export const useChatStore = create<ChatState>((set, get) => {
         streaming: false,
         open: false,
         attachedFiles: attachedFiles.length ? attachedFiles : undefined,
+        // Retain the actual turn-transmitted payload so regenerate() can
+        // reproduce the same inputs (images as data URLs, inlined docs) —
+        // see Message.regeneratePayload.
+        regeneratePayload:
+          images?.length || attachments.length
+            ? {
+                images,
+                documents: attachments.map((a) => ({ label: a.label, content: a.content })),
+              }
+            : undefined,
       };
       // Fresh turn: clear any leftover stop/abandon state so its events flow
       // and a prior force-stop on this session no longer suppresses them.
@@ -871,6 +887,7 @@ export const useChatStore = create<ChatState>((set, get) => {
       clearStopGrace();
       discardDeltas();
       toolLoopCounts = new Map();
+      toolAlternation = new Map();
       set((s) => ({
         messages: [...s.messages, userMsg],
         droppedFiles: [],
@@ -906,6 +923,9 @@ export const useChatStore = create<ChatState>((set, get) => {
         // deferring the swap would silently drop every event for this turn.
         const oldSessionId = sessionId;
         const oldModeOverride = get().modeOverride;
+        const oldMode = get().mode;
+        const oldAvailableModes = get().availableModes;
+        const oldThinkingEffort = get().thinkingEffort;
         const info = await ipc.newSession(cwd, oldModeOverride ?? 'chat');
         // Best-effort — see the identical bindWindowSession call above.
         void ipc.bindWindowSession(info.session_id).catch(() => {});
@@ -935,7 +955,18 @@ export const useChatStore = create<ChatState>((set, get) => {
           // being restored, so skip delete_session's directory cleanup.
           void ipc.deleteSession(info.session_id).catch(() => {});
           void ipc.setSessionMode(info.session_id, null).catch(() => {});
-          set({ sessionId: oldSessionId, modeOverride: oldModeOverride });
+          set({
+            sessionId: oldSessionId,
+            modeOverride: oldModeOverride,
+            // Restore the full set of session-derived mode/effort fields —
+            // `mode`/`availableModes`/`thinkingEffort` were overwritten with
+            // the failed session's values by the swap set above, and leaving
+            // them pointing at a deleted session shows the restored (old)
+            // session with mismatched mode/effort state.
+            mode: oldMode,
+            availableModes: oldAvailableModes,
+            thinkingEffort: oldThinkingEffort,
+          });
           throw e;
         }
         // Success: best-effort cleanup of the now-superseded old session and
@@ -1118,6 +1149,9 @@ export const useChatStore = create<ChatState>((set, get) => {
       // window shows it — previously this only set the session id, leaving the
       // window blank until the next streamed token. loadSession does the replay
       // plus mode/provider/approval setup; goosed is the source of truth.
+      // Capture the pre-replay epoch so the snapshot below can detect a New
+      // Chat / session switch that landed during the replay await.
+      const epoch = get().sessionEpoch;
       await get().loadSession(info.session_id, info.cwd);
       // If handed off mid-turn, overwrite whatever the replay produced with
       // the overlay's own accurate render-state snapshot — session/load's
@@ -1128,7 +1162,7 @@ export const useChatStore = create<ChatState>((set, get) => {
       // further live deltas for this session (still arriving, since goosed
       // keeps generating) append to it normally instead of spawning a
       // duplicate.
-      if (info.messages) {
+      if (info.messages && epoch === get().sessionEpoch) {
         set({ messages: info.messages, artifacts: info.artifacts ?? [] });
       }
     },
@@ -1179,6 +1213,12 @@ export const useChatStore = create<ChatState>((set, get) => {
         pendingImages: [],
         pendingAttachments: [],
         pendingApprovals: [],
+        // Any backgrounded-turn indicator/toast that predates this handoff
+        // belongs to a session this blank overlay no longer displays — clear
+        // them so the stale "still running" indicator / completion toast can't
+        // linger on a blank chat.
+        backgroundSession: null,
+        backgroundTurnToast: null,
         modeOverride: null,
         savedApprovalMode: null,
         error: null,
@@ -1223,6 +1263,12 @@ export const useChatStore = create<ChatState>((set, get) => {
       // (which captured the previous epoch) will see the mismatch in its
       // finally and skip applying its stale replay state to this new chat.
       const epoch = get().sessionEpoch + 1;
+      // Capture the outgoing mode override BEFORE the optimistic clear below —
+      // the clear (naturally) nulls `modeOverride`, so reading it after set()
+      // would always fall back to 'chat' and the value could never matter.
+      // Carrying it forward to the new session mirrors the stripReasoning
+      // swap's behavior (same conversation from the user's perspective).
+      const outgoingModeOverride = get().modeOverride;
       // Optimistic clear (owner: New Chat should manifest instantly, not only
       // once the ACP round trip(s) finish) — the blank chat shows immediately;
       // `sessionId: null` here is safe against a concurrent send() racing in
@@ -1282,7 +1328,7 @@ export const useChatStore = create<ChatState>((set, get) => {
       try {
         let info: SessionInfo;
         try {
-          info = await getOrCreateSession(cwd, get().modeOverride ?? 'chat');
+          info = await getOrCreateSession(cwd, outgoingModeOverride ?? 'chat');
         } catch (e) {
           // Suppress the transient "resource not found" goosed throws when
           // New Chat lands immediately after deleting the chat that was
@@ -1290,7 +1336,7 @@ export const useChatStore = create<ChatState>((set, get) => {
           // error for a race that isn't actually their new session's fault.
           if (Date.now() - recentOwnSessionDeleteAt > OWN_DELETE_RETRY_WINDOW_MS) throw e;
           recentOwnSessionDeleteAt = 0;
-          info = await getOrCreateSession(cwd, get().modeOverride ?? 'chat');
+          info = await getOrCreateSession(cwd, outgoingModeOverride ?? 'chat');
         }
         recentOwnSessionDeleteAt = 0;
         set({
@@ -1322,7 +1368,16 @@ export const useChatStore = create<ChatState>((set, get) => {
       const current = get().sessionId;
       if (current) return current;
       await get().newSession();
-      return get().sessionId!;
+      // `newSession()` reports failures via the store's `error` field rather
+      // than rethrowing (any session-create callers treat it as recoverable),
+      // so it is still the caller's job to detect a failed creation here —
+      // the non-null assertion would otherwise lie and hand a `null` session
+      // id to callers that assume a real one (e.g. `doSend`'s downstream IPC).
+      const created = get().sessionId;
+      if (!created) {
+        throw new Error(get().error ?? 'Failed to create a new session');
+      }
+      return created;
     },
 
     loadSession: async (
@@ -1445,14 +1500,22 @@ export const useChatStore = create<ChatState>((set, get) => {
           // last message when it's the in-progress assistant turn so further
           // streamed deltas append to it instead of spawning a duplicate bubble.
           const stillBusy = await ipc.isSessionBusy(sessionId).catch(() => false);
-          set((s) => {
-            const msgs = closeOpen(s.messages);
-            if (stillBusy) {
-              const last = msgs[msgs.length - 1];
-              if (last?.role === 'assistant') msgs[msgs.length - 1] = { ...last, open: true };
-            }
-            return { busy: stillBusy, replaying: false, messages: msgs };
-          });
+          // Re-check the epoch *after* the await above: a New Chat / session
+          // switch could have landed during the `isSessionBusy` round-trip
+          // (its UI cost is hidden while replay's placeholder is up), in which
+          // case this finally must NOT clobber the newer session's state with
+          // this stale replay's busy/messages — same guard the epoch check at
+          // the top of this block provides, but covering the awaited gap too.
+          if (epoch === get().sessionEpoch) {
+            set((s) => {
+              const msgs = closeOpen(s.messages);
+              if (stillBusy) {
+                const last = msgs[msgs.length - 1];
+                if (last?.role === 'assistant') msgs[msgs.length - 1] = { ...last, open: true };
+              }
+              return { busy: stillBusy, replaying: false, messages: msgs };
+            });
+          }
         }
       }
     },
@@ -1508,6 +1571,11 @@ export const useChatStore = create<ChatState>((set, get) => {
     },
 
     respondApproval: async (toolCallId: string, optionId: string | null) => {
+      // Guard against a double-click/double-call on the same approved tool —
+      // once a decision for this id has been issued (and its entry removed),
+      // a second `ipc.respondPermission` for the same id would be a spurious
+      // re-decision against a call that's already resolved.
+      if (!get().pendingApprovals.some((a) => a.tool_call_id === toolCallId)) return;
       try {
         await ipc.respondPermission(toolCallId, optionId);
         // Remove the approval from the pending queue only on SUCCESS — dropping
@@ -1581,7 +1649,16 @@ export const useChatStore = create<ChatState>((set, get) => {
       if (!paths.length) return;
       // Placeholder chips (FileChips) so a slow inspect/read/session-create
       // isn't silently invisible — cleared in `finally` regardless of outcome.
-      set((s) => ({ pendingAttachments: [...s.pendingAttachments, ...paths] }));
+      // Dedupe against already-pending paths: dropping the same file twice
+      // before the first pass finishes would otherwise render two chips with
+      // the identical `key={path}` (React key collision) and double-process
+      // the file.
+      set((s) => {
+        const pending = new Set(s.pendingAttachments);
+        return {
+          pendingAttachments: [...s.pendingAttachments, ...paths.filter((p) => !pending.has(p))],
+        };
+      });
       try {
         let infos = await ipc.inspectPaths(paths);
         // The active model can't see images at all — drop them here, before
@@ -1619,8 +1696,9 @@ export const useChatStore = create<ChatState>((set, get) => {
       } catch (e) {
         set({ error: String(e) });
       } finally {
+        const droppedPathSet = new Set(paths);
         set((s) => ({
-          pendingAttachments: s.pendingAttachments.filter((p) => !paths.includes(p)),
+          pendingAttachments: s.pendingAttachments.filter((p) => !droppedPathSet.has(p)),
         }));
       }
     },
@@ -1743,6 +1821,7 @@ export const useChatStore = create<ChatState>((set, get) => {
       clearStopGrace();
       discardDeltas();
       toolLoopCounts = new Map();
+      toolAlternation = new Map();
       set((s) => {
         const msgs = s.messages.slice();
         msgs[assistantIndex] = { ...msgs[assistantIndex], superseded: true };
@@ -1767,7 +1846,20 @@ export const useChatStore = create<ChatState>((set, get) => {
         // user bubble — the collapsed box above already makes clear what's
         // being reconsidered.
         const promptText = `${userText}\n\n(Please reconsider your previous answer above and provide an improved response.)`;
-        await ipc.sendPrompt(sessionId, promptText);
+        // Reproduce the original turn's payload (images + inlined documents)
+        // so the reconsidered answer sees the same inputs — previously only
+        // the text was re-sent and a turn that had a clipboard image or an
+        // attached document got re-asked without it. The dropped-file list
+        // isn't recoverable here (paths are cleared on send), but images
+        // (sent as native content blocks) and inlined doc text are.
+        const payload = messages[userIdx].regeneratePayload;
+        await ipc.sendPrompt(
+          sessionId,
+          payload?.documents?.length
+            ? `${payload.documents.map((d) => `--- ${d.label} ---\n${d.content}`).join('\n\n')}\n\n${promptText}`
+            : promptText,
+          payload?.images?.length ? payload.images : undefined
+        );
       } catch (e) {
         set({ busy: false, error: String(e) });
       }
@@ -1931,9 +2023,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         appendChunk(
           'user',
           'text',
-          stripInternalMarkers(
-            isFirst ? stripPromptPreamble(withoutRecipe) : withoutRecipe
-          )
+          stripInternalMarkers(isFirst ? stripPromptPreamble(withoutRecipe) : withoutRecipe)
         );
       });
 
@@ -1942,7 +2032,15 @@ export const useChatStore = create<ChatState>((set, get) => {
         flushDeltas(); // tool cards must land after the streamed text before them
 
         const u: ToolCallUpdate = e.update;
-        const id = String(u.toolCallId ?? '');
+        // The ACP tool-call id is authoritative when present; fall back to a
+        // stable per-call signature (tool + input) when a backend omits it —
+        // otherwise every id-less call would read as `''` and ALL of them
+        // would merge onto the single `toolCalls[0]` slot, overwriting each
+        // other's title/status/output.
+        const id =
+          String(u.toolCallId ?? '').trim() !== ''
+            ? String(u.toolCallId)
+            : `#${String(u.title ?? u.kind ?? 'tool')}:${JSON.stringify(u.rawInput ?? {})}`;
         const artifact = deriveArtifact(u, get().cwd);
         set((s) => {
           let msgs = s.messages.slice();
@@ -2140,7 +2238,13 @@ export const useChatStore = create<ChatState>((set, get) => {
         const title = String(e.tool_call.title ?? e.tool_call.kind ?? 'tool');
         const { count, counts } = countToolCall(toolLoopCounts, title, e.tool_call.rawInput);
         toolLoopCounts = counts;
-        if (count > TOOL_LOOP_THRESHOLD) {
+        const { flips, state: alternation } = trackToolAlternation(
+          toolAlternation,
+          title,
+          e.tool_call.rawInput
+        );
+        toolAlternation = alternation;
+        if (count > TOOL_LOOP_THRESHOLD || flips > TOOL_LOOP_THRESHOLD) {
           void ipc.respondPermission(e.tool_call_id, pickRejectOption(e.options)).catch((err) => {
             // If this never reaches the backend, the paused tool call has no
             // way to resolve and the turn hangs waiting for a decision that
@@ -2150,7 +2254,8 @@ export const useChatStore = create<ChatState>((set, get) => {
           set({
             warning:
               `Declined — "${title}" has been called ${count} times with the same target ` +
-              `this turn. The model appears stuck in a loop; try Force Stop if it doesn't ` +
+              `this turn${flips > TOOL_LOOP_THRESHOLD ? ' (or is alternating tools against it)' : ''}. ` +
+              `The model appears stuck in a loop; try Force Stop if it doesn't ` +
               `recover on its own.`,
           });
           return;

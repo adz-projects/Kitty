@@ -20,14 +20,38 @@ function ensureStyle(id: string): HTMLStyleElement {
   return el;
 }
 
+// Last-successfully-loaded user theme CSS, keyed by theme name — a transient
+// read failure on a *valid* theme name falls back to the previously-loaded
+// content for that name instead of silently wrenching the user to `default`.
+const userThemeCache = new Map<string, string>();
+
 async function themeCss(name: string): Promise<string> {
   if (BUILTIN[name]) return BUILTIN[name];
   try {
-    return await ipc.readUserTheme(name);
-  } catch {
+    const css = await ipc.readUserTheme(name);
+    userThemeCache.set(name, css);
+    return css;
+  } catch (e) {
+    const cached = userThemeCache.get(name);
+    if (cached !== undefined) return cached;
+    // Unknown/missing theme (renamed/deleted user file) — default is the
+    // only sane content, but log so the silent swap isn't invisible.
+    console.warn(`theme "${name}" could not be read; falling back to default`, e);
     return BUILTIN.default;
   }
 }
+
+// Monotonic apply-generation guard: `applyFromConfig` is fully async (two IPC
+// round-trips), and rapid theme://changed events can overlap — the OLDER
+// request may resolve LAST and clobber the newer config onto the DOM. Each
+// call stamps itself; a result whose generation is no longer current is
+// dropped instead of applied.
+let themeApplyGen = 0;
+
+// Last image path we already re-encoded, so a pure THEME switch (same
+// wallpaper configured) doesn't re-read + re-base64 the whole file.
+let lastBgImagePath: string | null = null;
+let lastBgImageUrl: string | null = null;
 
 /** Windows' own wallpaper-fit terms (Fill/Fit/Stretch/Center), mapped to CSS
     `background-size`/`background-repeat` (Round-4 item 2). "Center" (actual
@@ -49,8 +73,19 @@ async function applyBackground(cfg: Config) {
   );
   root.style.setProperty('--bg-size', BG_SIZE_CSS[cfg.background_size] ?? 'cover');
   if (cfg.background_image) {
+    // Skip the full-file re-read when only the theme changed (same wallpaper
+    // still configured) — the data URL is unchanged, so a redundant IPC
+    // round-trip + base64 encode per theme://changed event is pure waste.
+    const cachedUrl = lastBgImagePath === cfg.background_image ? lastBgImageUrl : null;
+    if (cachedUrl) {
+      root.style.setProperty('--bg-image', `url("${cachedUrl}")`);
+      root.setAttribute('data-bg-image', '');
+      return;
+    }
     try {
       const url = await ipc.readImageDataUrl(cfg.background_image);
+      lastBgImagePath = cfg.background_image;
+      lastBgImageUrl = url;
       root.style.setProperty('--bg-image', `url("${url}")`);
       root.setAttribute('data-bg-image', '');
       return;
@@ -60,10 +95,17 @@ async function applyBackground(cfg: Config) {
   }
   root.style.removeProperty('--bg-image');
   root.removeAttribute('data-bg-image');
+  // Wallpaper was cleared — drop the cache so a later re-set re-reads.
+  lastBgImagePath = null;
+  lastBgImageUrl = null;
 }
 
 async function applyFromConfig() {
+  const gen = ++themeApplyGen;
   const cfg = await ipc.getConfig();
+  // A newer applyFromConfig() started while we were waiting — drop this
+  // stale result so an older config can't clobber the newer one on the DOM.
+  if (gen !== themeApplyGen) return;
   ensureStyle('app-theme').textContent = await themeCss(cfg.theme);
   await applyBackground(cfg);
 }

@@ -14,6 +14,38 @@ export function accelerator(e: React.KeyboardEvent): string | null {
   else if (code === 'Space') key = 'Space';
   else if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(code))
     key = code.replace('Arrow', '');
+  else if (/^Numpad[0-9]$/.test(code))
+    key = code.slice(6); // Numpad0–9
+  else if (
+    [
+      'Backquote',
+      'Minus',
+      'Equal',
+      'BracketLeft',
+      'BracketRight',
+      'Backslash',
+      'Semicolon',
+      'Quote',
+      'Comma',
+      'Period',
+      'Slash',
+      'Backspace',
+      'Delete',
+      'Insert',
+      'Tab',
+      'Home',
+      'End',
+      'PageUp',
+      'PageDown',
+      'NumpadAdd',
+      'NumpadSubtract',
+      'NumpadMultiply',
+      'NumpadDivide',
+      'NumpadDecimal',
+      'NumpadEnter',
+    ].includes(code)
+  )
+    key = code;
   if (!key || mods.length === 0) return null; // require at least one modifier
   return [...mods, key].join('+');
 }

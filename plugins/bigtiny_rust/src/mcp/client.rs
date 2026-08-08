@@ -181,12 +181,21 @@ impl MCPServerClient {
         );
         if let Some(headers) = config.headers.as_ref().and_then(|v| v.as_object()) {
             for (k, v) in headers {
-                if let (Ok(name), Some(val)) = (
-                    reqwest::header::HeaderName::from_bytes(k.as_bytes()),
-                    v.as_str(),
-                ) {
-                    if let Ok(val) = val.parse() {
+                // Silently dropping an invalid header (bad name, non-Latin-1
+                // value) means the server connects with NO auth at all — the
+                // user sees "connected" while every call 401s, or worse the
+                // server accepts the unauthenticated session. Log loudly.
+                let name = reqwest::header::HeaderName::from_bytes(k.as_bytes());
+                let val = v.as_str().and_then(|s| s.parse().ok());
+                match (name, val) {
+                    (Ok(name), Some(val)) => {
                         header_map.insert(name, val);
+                    }
+                    _ => {
+                        tracing::warn!(
+                            "dropping invalid configured header {k:?} for MCP server {:?}",
+                            config.name
+                        );
                     }
                 }
             }
@@ -215,14 +224,27 @@ impl MCPServerClient {
                 .await
                 .map_err(|e| MCPServerError::Transport(e.to_string()))?
                 .into_iter()
-                .map(|t| ToolDefinition {
-                    name: t.name.to_string(),
-                    description: t.description.map(|d| d.to_string()).unwrap_or_default(),
-                    input_schema: serde_json::to_value(&*t.input_schema)
-                        .unwrap_or_else(|_| serde_json::json!({})),
-                    server_id: self.server_id.clone(),
+                .map(|t| {
+                    // A failed schema serialization previously registered the
+                    // tool with an empty `{}` schema — and an empty schema
+                    // makes `validate_tool_args` fail OPEN, so the tool became
+                    // callable with arbitrary arguments, bypassing the schema
+                    // validation the server advertised. Fail the connect
+                    // instead of silently weakening that.
+                    let input_schema = serde_json::to_value(&*t.input_schema).map_err(|e| {
+                        MCPServerError::Generic(format!(
+                            "tool {:?} input_schema not serializable: {e}",
+                            t.name
+                        ))
+                    })?;
+                    Ok(ToolDefinition {
+                        name: t.name.to_string(),
+                        description: t.description.map(|d| d.to_string()).unwrap_or_default(),
+                        input_schema,
+                        server_id: self.server_id.clone(),
+                    })
                 })
-                .collect(),
+                .collect::<Result<Vec<_>, MCPServerError>>()?,
             ClientHandle::Sse(sse) => sse.list_tools(&self.server_id).await?,
         };
         Ok(())

@@ -152,13 +152,21 @@ pub async fn list(app: &AppHandle) -> Result<Vec<Value>, String> {
 }
 
 /// Pure: one BigTiny session row -> a goosed-style `session/list` object
-/// (`parseSession` in the frontend reads exactly these keys).
+/// (`parseSession` in the frontend reads exactly these keys). `_meta`
+/// populates `SessionSummary.providerId`/`modelId` from the session's stored
+/// metadata (`provider`/`model` — written by `set_session_provider`/
+/// `rebind_session`'s `PATCH /config`), so the frontend's provider-restore
+/// path (`chatStore.loadSession` → `findMatchingProvider`) has something to
+/// match against; without this those fields were always `undefined` and the
+/// whole restore was dead. Backwards compatible: `_meta` is additive.
 pub(crate) fn translate_session_row(row: &Value) -> Value {
     let metadata: Value = row
         .get("metadata")
         .and_then(|m| m.as_str())
         .and_then(|s| serde_json::from_str(s).ok())
         .unwrap_or(Value::Null);
+    let provider_id = metadata.get("provider").and_then(|v| v.as_str());
+    let model_id = metadata.get("model").and_then(|v| v.as_str());
     json!({
         "sessionId": row.get("id").and_then(|v| v.as_str()).unwrap_or(""),
         // BigTiny leaves `name` unset until the first turn completes (it
@@ -169,6 +177,10 @@ pub(crate) fn translate_session_row(row: &Value) -> Value {
         "title": row.get("name").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or("New Chat"),
         "cwd": metadata.get("cwd").and_then(|v| v.as_str()).unwrap_or(""),
         "updatedAt": row.get("updated_at").and_then(|v| v.as_str()).unwrap_or(""),
+        "_meta": {
+            "providerId": provider_id.unwrap_or(""),
+            "modelId": model_id.unwrap_or(""),
+        },
     })
 }
 

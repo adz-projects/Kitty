@@ -12,9 +12,14 @@ export function formatCacheHitRate(message: Message): string {
   const read = message.cacheReadTokens ?? 0;
   const created = message.cacheCreationTokens ?? 0;
   const total = message.inputTokens ?? 0;
-  const pct = total > 0 ? Math.round((read / total) * 100) : 0;
   const parts = [`${read} read`];
   if (created > 0) parts.push(`${created} written`);
+  // `inputTokens` can legitimately be missing while cache tokens are present
+  // (a partial provider report) — a "of 0" denominator is meaningless and
+  // misleading ("0% hit rate (… of 0)"), so say n/a instead of fabricating a
+  // percentage for a total we don't actually have.
+  if (!(total > 0)) return `${parts.join(', ')} (n/a total)`;
+  const pct = Math.round((read / total) * 100);
   return `${pct}% hit rate (${parts.join(', ')} of ${total})`;
 }
 

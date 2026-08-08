@@ -326,8 +326,20 @@ impl ProviderRouter {
             .map(|e| (e.key().clone(), e.value().provider.clone()))
             .collect();
 
-        for (id, provider) in due {
-            let status = provider.check_health().await;
+        // Probe all due providers CONCURRENTLY — probing serially let a single
+        // stalled endpoint (up to its own timeout, often 30s+) gate the rest,
+        // and `GET /api/status` calls this synchronously on every request, so
+        // a daemon restart (all providers "disconnected" → all due) could
+        // block the first status poll for N×timeout seconds.
+        let results: Vec<(String, HealthStatus)> = futures::future::join_all(
+            due.into_iter().map(|(id, provider)| async move {
+                let status = provider.check_health().await;
+                (id, status)
+            }),
+        )
+        .await;
+
+        for (id, status) in results {
             if let Some(mut entry) = self.providers.get_mut(&id) {
                 entry.health = status;
                 entry.health_checked_at = Instant::now();

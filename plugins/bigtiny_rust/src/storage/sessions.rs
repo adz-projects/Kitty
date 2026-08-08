@@ -1,7 +1,7 @@
 use chrono::DateTime;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use sqlx::{FromRow, SqlitePool};
+use sqlx::{Connection, FromRow, SqlitePool};
 
 use crate::error::StorageError;
 
@@ -147,6 +147,14 @@ pub async fn update_session_config(
 /// interleaving and one silently clobbering the other's just-written change
 /// with its own stale read. `mutate` receives the current metadata
 /// (`{}` if unset/unparseable) and returns the value to persist.
+///
+/// Uses an explicit `BEGIN IMMEDIATE` (acquired on a freshly-checked-out
+/// connection) rather than the pool's default *deferred* `BEGIN`: a deferred
+/// transaction takes its write lock only at the first UPDATE, so two
+/// concurrent callers can both read the same snapshot and both later
+/// overwrite each other — the very lost-update this function exists to
+/// prevent. `BEGIN IMMEDIATE` grabs the write lock up front, serializing the
+/// read-modify-write.
 pub async fn update_metadata_with<F>(
     pool: &SqlitePool,
     session_id: &str,
@@ -155,7 +163,8 @@ pub async fn update_metadata_with<F>(
 where
     F: FnOnce(serde_json::Value) -> serde_json::Value,
 {
-    let mut tx = pool.begin().await?;
+    let mut conn = pool.acquire().await?;
+    let mut tx = conn.begin_with("BEGIN IMMEDIATE").await?;
 
     let row: Option<(Option<String>,)> =
         sqlx::query_as(r#"SELECT metadata FROM sessions WHERE id = ?"#)

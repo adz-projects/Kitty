@@ -84,14 +84,19 @@ impl Db {
     /// Text hashes of every currently-active suppression (permanent, or
     /// not-yet-expired). One query, used to filter a candidate belief list
     /// before scoring (`belief::filter_suppressed`) rather than one query
-    /// per belief.
+    /// per belief. Predicate MUST match `is_text_suppressed`'s: a
+    /// non-permanent row with `expires_at IS NULL` is active in both (the
+    /// two queries used to disagree — `expires_at IS NULL` counted as
+    /// suppressed in one path and excluded in the other — so a legacy/hand-
+    /// written row behaved as suppressed for recall but not for the single-
+    /// text check).
     pub async fn active_suppressed_text_hashes(
         &self,
         now: DateTime<Utc>,
     ) -> Result<std::collections::HashSet<String>> {
         let rows: Vec<(String,)> = sqlx::query_as(
             "SELECT DISTINCT text_hash FROM suppressions \
-             WHERE permanent = 1 OR (expires_at IS NOT NULL AND expires_at > ?)",
+             WHERE permanent = 1 OR (expires_at IS NULL OR expires_at > ?)",
         )
         .bind(now)
         .fetch_all(self.pool())

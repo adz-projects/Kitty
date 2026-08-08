@@ -17,12 +17,22 @@ export function EffortDropdown() {
 
   if (!thinkingEffort) return null;
 
+  // Guard against a `current_value` that isn't among the current `options`
+  // (options can shrink after a model/profile change): React renders a select
+  // with NO selected option when the value doesn't match any option, showing
+  // a blank box and making the first click silently select whatever the
+  // browser defaults to. Fall back to the first option as the display value
+  // (the store keeps the true backend value untouched).
+  const currentValue = thinkingEffort.options.some((o) => o.value === thinkingEffort.current_value)
+    ? thinkingEffort.current_value
+    : (thinkingEffort.options[0]?.value ?? '');
+
   return (
     <select
       className="effort-dropdown"
       title="Reasoning effort"
       aria-label="Reasoning effort"
-      value={thinkingEffort.current_value}
+      value={currentValue}
       disabled={creatingSession}
       onChange={(e) => void setThinkingEffort(e.target.value)}
     >

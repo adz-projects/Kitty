@@ -43,7 +43,7 @@ pub async fn get_recent_timings(
 ) -> Result<Vec<TimingRow>, StorageError> {
     let rows = sqlx::query_as::<_, TimingRow>(
         r#"SELECT id, session_id, provider_id, model, ttfb_ms, ttft_ms, generation_ms, total_tokens, created_at
-           FROM llm_timings WHERE session_id = ? ORDER BY created_at DESC LIMIT ?"#
+           FROM llm_timings WHERE session_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?"#
     )
     .bind(session_id)
     .bind(limit)

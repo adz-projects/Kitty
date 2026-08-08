@@ -34,9 +34,17 @@ impl AnthropicProvider {
         cache: CacheConfig,
     ) -> Self {
         let idle_timeout = config.idle_timeout();
+        let client = reqwest::Client::builder()
+            // Same rationale as openai_compat.rs: bound the TCP/TLS setup
+            // phase (a stalled-before-headers provider must not block
+            // `chat_completion` forever) without imposing a whole-request
+            // timeout on long SSE bodies.
+            .connect_timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap_or_default();
         Self {
             provider_id: provider_id.into(),
-            client: reqwest::Client::new(),
+            client,
             config,
             tailscale,
             cache,
@@ -87,7 +95,11 @@ impl AnthropicProvider {
                 if let Some(content) = msg["content"].as_str() {
                     block["content"] = content.into();
                 } else {
-                    block["content"] = Value::Null;
+                    // Anthropic's API rejects `content: null` on a
+                    // `tool_result` block (400 on the turn) — a tool message
+                    // whose content is missing/null/non-string must become
+                    // an empty string, never null, or every such turn dies.
+                    block["content"] = "".into();
                 }
                 tool_accumulator.push(block);
             } else {
@@ -114,17 +126,26 @@ impl AnthropicProvider {
 
     fn convert_tool_calls(msg: &Value) -> Value {
         if let Some(calls) = msg["tool_calls"].as_array() {
-            let content: Vec<Value> = calls
-                .iter()
-                .map(|tc| {
-                    serde_json::json!({
-                        "type": "tool_use",
-                        "id": tc["id"].as_str().unwrap_or(""),
-                        "name": tc["function"]["name"].as_str().unwrap_or(""),
-                        "input": tc["function"]["arguments"].clone(),
-                    })
+            let mut content: Vec<Value> = Vec::with_capacity(calls.len() + 1);
+            // An assistant message can carry BOTH a text block and tool calls
+            // (Anthropic natively allows text before `tool_use` in one
+            // message, and some backends stream a short preamble then call
+            // tools). Rebuilding content with only the `tool_use` blocks
+            // silently dropped that text from the wire body AND from what
+            // gets persisted as history.
+            if let Some(text) = msg["content"].as_str() {
+                if !text.is_empty() {
+                    content.push(serde_json::json!({ "type": "text", "text": text }));
+                }
+            }
+            content.extend(calls.iter().map(|tc| {
+                serde_json::json!({
+                    "type": "tool_use",
+                    "id": tc["id"].as_str().unwrap_or(""),
+                    "name": tc["function"]["name"].as_str().unwrap_or(""),
+                    "input": tc["function"]["arguments"].clone(),
                 })
-                .collect();
+            }));
             serde_json::json!({
                 "role": "assistant",
                 "content": content,
@@ -177,10 +198,20 @@ impl Provider for AnthropicProvider {
 
         let grouped = Self::group_tool_results(&non_system);
 
+        // Clamp max_tokens to a sane range before it hits the wire: a
+        // configured 0/negative (or a huge over-limit value) is answered with
+        // an opaque provider 400 instead of running. Anthropic requires a
+        // positive integer; the model's own documented cap isn't known here,
+        // so bound it to the same range the daemon budgets context to
+        // (64k covers every current Anthropic model's max output).
+        let max_tokens = sampling
+            .max_tokens
+            .and_then(|v| (1..=65536).contains(&v).then_some(v))
+            .unwrap_or(4096);
         let mut body = serde_json::json!({
             "model": model,
             "messages": grouped,
-            "max_tokens": sampling.max_tokens.unwrap_or(4096),
+            "max_tokens": max_tokens,
             "stream": true,
         });
 
@@ -435,12 +466,21 @@ impl AnthropicSSEStream {
         if line.starts_with("event: ") {
             return false;
         }
-        let Some(data) = line.strip_prefix("data: ") else {
+        // SSE spec: the colon may be followed by zero-or-more spaces — accept
+        // `data:{...}` with no space (mirror of openai_compat.rs).
+        let trimmed = line.trim_start();
+        let Some(data) = trimmed.strip_prefix("data:").map(|d| d.trim_start()) else {
             return false;
         };
         let json: Value = match serde_json::from_str(data) {
             Ok(j) => j,
-            Err(_) => return false,
+            Err(e) => {
+                // Log instead of silently swallowing — a malformed chunk was
+                // previously invisible, and the turn ran on until the idle
+                // timeout (mirror of openai_compat.rs).
+                tracing::debug!("dropped malformed Anthropic SSE data line: {e}: {data}");
+                return false;
+            }
         };
         let event_type = json["type"].as_str().unwrap_or("");
 
@@ -530,11 +570,26 @@ impl AnthropicSSEStream {
                     // `.get("arguments")`. Previously `function` was set to
                     // just the parsed input object with no `name` key at
                     // all, so every tool call executed nameless/"unknown".
+                    //
+                    // Non-empty-but-unparseable arguments must NOT be
+                    // silently replaced with `{}` (which executes the tool
+                    // with empty args); empty input is legitimate (a
+                    // no-argument tool), so only that case maps to `{}`.
                     let arguments: Value = if entry.input_json.is_empty() {
                         serde_json::json!({})
                     } else {
-                        serde_json::from_str(&entry.input_json)
-                            .unwrap_or_else(|_| serde_json::json!({}))
+                        match serde_json::from_str(&entry.input_json) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                tracing::warn!(
+                                    "tool call {:?} had unparseable streamed input: {e}",
+                                    entry.name
+                                );
+                                serde_json::json!({
+                                    "__error": format!("malformed tool input: {e}")
+                                })
+                            }
+                        }
                     };
                     let function = serde_json::json!({
                         "name": entry.name.unwrap_or_default(),
@@ -645,6 +700,25 @@ impl Stream for AnthropicSSEStream {
                         if self.process_line(&line) {
                             self.done = true;
                         }
+                    }
+                    // A truncated/abrupt backend may end the stream after
+                    // `content_block_stop` (all tool inputs fully buffered)
+                    // but *before* `message_delta`/`message_stop` — without
+                    // this drain the completed tool calls would be silently
+                    // dropped from the turn. Emit them as a final Delta (same
+                    // shape `message_delta` would have produced).
+                    if !self.pending_tool_calls.is_empty() {
+                        let tool_calls: Vec<super::base::ToolCall> =
+                            self.pending_tool_calls.drain(..).collect();
+                        self.pending.push_back(Delta {
+                            role: "assistant".into(),
+                            content: None,
+                            reasoning: None,
+                            tool_calls: Some(tool_calls),
+                            finish_reason: None,
+                            usage: None,
+                            error_type: None,
+                        });
                     }
                     // Drain any Delta the trailing line produced before
                     // reporting end-of-stream.

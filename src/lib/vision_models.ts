@@ -46,7 +46,7 @@ const VISION_PATTERNS: RegExp[] = [
   /qwen3\.6/i,
 ];
 
-const NON_VISION_OVERRIDES: RegExp[] = [/o1-mini/i, /o3-mini/i];
+const NON_VISION_OVERRIDES: RegExp[] = [/o1-mini/i, /o3-mini/i, /o4-mini/i];
 
 /** True if the model name suggests it accepts image content blocks. */
 export function supportsImages(model: string | null | undefined): boolean {

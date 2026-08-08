@@ -84,20 +84,27 @@ async fn consolidate_session_inner(db: &Db, session_id: &str) -> Result<()> {
                 let new_conf = crate::belief::synthesis::merge_confidence(c.confidence, b.provenance);
                 let new_prov = crate::belief::synthesis::max_provenance(c.provenance, b.provenance);
                 // b came from THIS session (we loaded it via
-                // list_conversation_beliefs_for_session), so merging it in
-                // always contributes evidence from `session_id`; only count
-                // it as a *new* distinct session for `c` if `c` wasn't
-                // already attributed to this session.
-                let session_is_new = c.session_id.as_deref() != Some(session_id);
+                // list_conversation_beliefs_for_session), and its observations
+                // are about to be re-parented onto `c`. Session-identity is
+                // checked via the observations table — the old
+                // `c.session_id != Some(session_id)` delta read a column
+                // that's always `None` on cross-session Context targets, so a
+                // single chatty session could keep inflating distinct_sessions
+                // past the `>= 2` promotion gate on its own. Bump the
+                // monotonic stored counter only when THIS session isn't
+                // already represented among c's observations.
+                let session_already_contributed =
+                    db.has_session_observation(&c.id, session_id).await?;
+                let distinct_sessions = c.distinct_sessions
+                    + if session_already_contributed { 0 } else { 1 };
                 let new_support = c.support_count + b.support_count;
-                let new_sessions = if session_is_new { c.distinct_sessions + 1 } else { c.distinct_sessions };
                 let new_tested = c.tested || new_prov.is_tested();
                 db.update_belief(
                     &c.id,
                     &BeliefPatch {
                         confidence: Some(new_conf),
                         support_count: Some(new_support),
-                        distinct_sessions: Some(new_sessions),
+                        distinct_sessions: Some(distinct_sessions),
                         // Carried onto the belief itself, not just the
                         // observation row -- see the matching comment in
                         // `synthesis::route_observation`.
@@ -114,7 +121,7 @@ async fn consolidate_session_inner(db: &Db, session_id: &str) -> Result<()> {
                 // on this update instead of overwriting it with stale data.
                 c.confidence = new_conf;
                 c.support_count = new_support;
-                c.distinct_sessions = new_sessions;
+                c.distinct_sessions = distinct_sessions;
                 c.provenance = new_prov;
                 c.tested = new_tested;
                 c.last_confirmed_at = Some(now);

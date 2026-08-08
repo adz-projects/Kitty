@@ -31,7 +31,12 @@ describe('formatCacheHitRate', () => {
     expect(s).toMatch(/^0% hit rate/);
   });
 
-  it('does not divide by zero when inputTokens is missing', () => {
-    expect(formatCacheHitRate(msg({ cacheReadTokens: 0 }))).toMatch(/^0% hit rate/);
+  it('does not fabricate a "of 0" hit rate when inputTokens is missing', () => {
+    // Cache tokens can be reported without inputTokens (partial provider
+    // report) — a "0% hit rate (… of 0)" line is meaningless, say n/a.
+    const s = formatCacheHitRate(msg({ cacheReadTokens: 0 }));
+    expect(s).not.toMatch(/0%/);
+    expect(s).toMatch(/n\/a/);
+    expect(formatCacheHitRate(msg({ cacheReadTokens: 540 }))).toMatch(/540 read \(n\/a total\)/);
   });
 });

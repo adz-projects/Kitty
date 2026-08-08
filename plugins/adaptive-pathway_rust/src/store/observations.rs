@@ -122,6 +122,21 @@ impl Db {
             .await?;
         Ok(res.rows_affected())
     }
+
+    /// Whether a belief already has at least one observation from `session_id`
+    /// — used when re-parenting a session's conversation belief onto a
+    /// cross-session target (`consolidate.rs`) so the target's distinct-session
+    /// count is only bumped once per contributing session.
+    pub async fn has_session_observation(&self, belief_id: &str, session_id: &str) -> Result<bool> {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM observations WHERE belief_id = ? AND session_id = ?",
+        )
+        .bind(belief_id)
+        .bind(session_id)
+        .fetch_one(self.pool())
+        .await?;
+        Ok(n > 0)
+    }
 }
 
 fn map_observations(rows: Vec<sqlx::sqlite::SqliteRow>) -> Vec<Observation> {

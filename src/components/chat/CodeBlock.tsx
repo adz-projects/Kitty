@@ -76,7 +76,11 @@ export function CodeBlock({ children }: { children?: ReactNode; node?: unknown }
     a.href = url;
     a.download = `snippet.${ext}`;
     a.click();
-    URL.revokeObjectURL(url);
+    // Defer the revoke instead of doing it synchronously: Chromium fetches
+    // the blob URL asynchronously from the click, so an immediate revoke can
+    // intermittently kill the download before it starts (same reason
+    // VisualizationCard's openInNewWindow defers its revoke).
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
   };
 
   return (

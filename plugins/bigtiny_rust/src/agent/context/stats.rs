@@ -16,7 +16,11 @@ impl SessionStats {
 
     /// Get statistics for a session.
     pub async fn get_stats(&self, session_id: &str) -> Result<serde_json::Value, String> {
-        let messages_list = messages::get_messages_by_session(&self.pool, session_id)
+        // Compute the token sums in SQL — the previous version re-read EVERY
+        // message row in the session on every poll of the stats route, which
+        // grew linearly with session length (10k messages → 10k full rows per
+        // dashboard refresh).
+        let agg = messages::session_message_aggregates(&self.pool, session_id)
             .await
             .map_err(|e| format!("Failed to fetch messages: {}", e))?;
 
@@ -25,22 +29,9 @@ impl SessionStats {
             .map_err(|e| format!("Failed to fetch session: {}", e))?
             .ok_or_else(|| format!("Session {} not found", session_id))?;
 
-        let tokens_sent: i32 = messages_list
-            .iter()
-            .filter(|m| m.role == "user" || m.role == "system")
-            .map(|m| m.token_count.unwrap_or(0))
-            .sum();
-
-        let tokens_received: i32 = messages_list
-            .iter()
-            .filter(|m| m.role == "assistant")
-            .map(|m| m.token_count.unwrap_or(0))
-            .sum();
-
-        let current_context: i32 = messages_list
-            .iter()
-            .map(|m| m.token_count.unwrap_or(0))
-            .sum();
+        let tokens_sent = agg.user_system_tokens;
+        let tokens_received = agg.assistant_tokens;
+        let current_context = agg.all_tokens;
 
         let meta: serde_json::Value = session
             .metadata
@@ -62,7 +53,7 @@ impl SessionStats {
 
         Ok(json!({
             "session_id": session_id,
-            "message_count": messages_list.len(),
+            "message_count": agg.count,
             "tokens_sent": tokens_sent,
             "tokens_received": tokens_received,
             "current_context_tokens": current_context,
