@@ -277,9 +277,9 @@ Lives **inside the daemon** (both OS). Entry points from `bigtiny_rust` crate.
 | File | Responsibility |
 |---|---|
 | `engine.rs` | `LocalEngine` wrapper over the `llama_cpp` crate. Builds the model/context from `LocalEngineConfig`: `n_ctx`, `n_batch`, `n_threads`, `cache_type_k/v`, FlashAttention (derived, D19). |
-| `manager.rs` | Resident slot manager (§4.1). `load/unload/status`, hot-swap-queuing. |
+| `manager.rs` | Resident slot manager (§4.1). `load/unload/status` + pressure eviction. **Hot-swap queuing is not implemented** — Phase 4.5 (§6.4) is where it becomes true. |
 | `provider.rs` | `LocalProvider: Provider` (base chat trait) — streaming + reasoning, text **and** compaction. |
-| `embeddings.rs` | `LocalEmbed` → **desktop-only** endpoint `POST /api/embeddings` (D4). Android's AP uses the crate's built-in hash-space embeddings instead — no endpoint, no model. |
+| `embeddings.rs` | `LocalEmbed`, on **both** platforms (D4 revised). Two entrances to one model: `POST /api/embeddings` for out-of-process callers, and `pathway_embed.rs`'s `SemanticEmbedder` for adaptive-pathway, which is linked into this binary and must not call its own socket. Hash-space remains the fallback when no embed GGUF is configured. |
 | `summarizer.rs` | Summarizer chain (§4.3). Grammar-constrained JSON decode. |
 | `health.rs` | `/api/health` fields (`local` state, `model_backend`, `reload_required`, `restart_pending`) + `/api/local/models/status`. |
 
@@ -287,15 +287,32 @@ Lives **inside the daemon** (both OS). Entry points from `bigtiny_rust` crate.
 
 ```
 [local]
-enabled = true
-default_model = "LFM2.5-1.2B q4_K_M"      # GGUF id, §9
-n_ctx = 4096                                # desktop; Android default 2048
-n_gpu_layers = "auto"                       # auto | -1 | 0 | N  (D20)
-backend = "auto"                            # auto | cuda | vulkan | cpu
+enabled = false            # flipped on by the host when a GGUF is present
+model_path = ""            # absolute path, resolved host-side (§5)
+embed_model_path = ""
+embed_pooling = "last"     # last | mean | cls  (§9.2)
+n_ctx = 4096
+embed_n_ctx = 512
 n_batch = 512
-cache_type_k = "f16"                        # f16 | q8_0 | q4_0
+n_threads = 0              # 0 = let llama.cpp pick
+n_gpu_layers = -1          # -1 = all layers; 0 = CPU-only
+cache_type_k = "f16"       # f16 | q8_0 | q4_0  — NOT YET APPLIED, see below
 cache_type_v = "f16"
 ```
+This is the real `LocalEngineConfig`, not the sketch it replaced: paths rather
+than a `default_model` id (the daemon has no idea where a host keeps models,
+so Kitty resolves and passes absolute paths), `n_gpu_layers` as an `i32`
+rather than the string `"auto"`, and no `backend` key yet — D20's selection
+lands in Phase 4.
+
+**Every key is reachable only through `BIGTINY_LOCAL__<KEY>` env vars.** No
+host passes `--config`, so `bin/bigtiny_daemon.rs::apply_env_overrides` and
+`src-tauri/src/lifecycle/bigtiny_proc.rs::spawn` are two halves of one
+contract and must change together.
+
+**Known gap:** `cache_type_k`/`cache_type_v` are accepted and ignored —
+`engine.rs::base_params` never applies them. Phase 4 either wires them up or
+deletes them; shipping a setting that does nothing is worse than either.
 `SummarizerConfig`:
 ```
 [summarizer]
@@ -321,19 +338,23 @@ cache_type_v = "f16"
    - `Cpu` → `0` (no GPU budget).
 5. Fail-safe: on backend OOM at load, retry with `ngl` halved; at `0` → CPU.
 
-#### Fit formula (autodetect/badge/card/RAM-warning — one shared function)
+#### Fit formula — **superseded, do not implement**
 
-`required ≈ (file_size × resident_layer_fraction) + KV(n_ctx, cache_type) + scratch(n_batch, n_ctx)`
+This section specified a hand-rolled
+`(file_size x resident_layer_fraction) + KV + scratch, x1.18` estimate. Don't
+build it: `llama-cpp-2` v0.1.154 already exposes both halves upstream, and an
+estimate that disagrees with the loader is worse than no estimate.
 
-- `file_size` = on-disk GGUF bytes; `resident_layer_fraction = n_gpu_layers / n_layers`.
-- `KV` is the KV-cache budget for the chosen `n_ctx` + `cache_type_k/v`.
-- `scratch` = llama.cpp compute buffers for the given `n_batch` + `n_ctx` (CUDA
-  scratch grows with both — a `file_size + KV` estimate alone **undercounts** on
-  GPU offload).
-- Multiply the total by **×1.18 (≈ +15–20% safety margin)** before comparing
-  against free VRAM/RAM. This budget, not the raw file size, drives the
-  "Recommended for this device" badge (§6.3), VRAM autodetect, and the
-  low-RAM warning — preventing CUDA OOM on edge GPUs with high-context models.
+- `list_llama_ggml_backend_devices()` — per-device name, backend, type and
+  **`memory_free`/`memory_total`**. That is D20 step 1 and the VRAM figure for
+  the card and the "Recommended for this device" badge, from the same record,
+  so they can never disagree.
+- `fit_params()` (feature `common`, already enabled) — llama.cpp's own
+  optimal-`n_gpu_layers` solver. Two constraints: it requires `n_gpu_layers`
+  left at its `-1` default, so `engine.rs`'s `with_n_gpu_layers` guard becomes
+  an either/or; and it is **not thread-safe** (it mutates global llama logger
+  state), so it belongs behind the same `OnceLock`/mutex discipline as backend
+  init. `n_ctx = 0` means "let fit choose".
 
 Windows builds `llama_cpp` with `cuda`+`vulkan` features; Android builds CPU-only
 (no Vulkan in v1; the same hook re-enables later).
@@ -420,18 +441,11 @@ events for progress.
 
 - **HuggingFace**: `GET https://huggingface.co/{repo}/resolve/{rev}/{file}`; sha256
   from HF API.
-- **Ollama registry**: `GET https://registry.ollama.ai/v2/{ns}/{name}/manifests/{tag}`;
-  fetch blobs in order, concatenate → `.gguf`.
-  - **Per-layer validation:** before streaming each blob, check `Content-Type`
-    **and** gzip magic bytes (`0x1f 0x8b`). Some manifests / registry versions
-    serve **gzip-compressed layers**
-    (`application/vnd.ollama.image.layer.v1.tar+gzip` or plain gzip) — when
-    detected, decode through a **streaming `flate2` GzDecoder** into `.part`
-    instead of copying raw bytes.
-  - **Digest rule:** Ollama layer digests may be computed over the compressed
-    stream. Verify the digest of each blob as actually stored (compressed); the
-    final sha256 gate runs over the **decoded, concatenated `.gguf`** at
-    finalize. Mismatch anywhere → treat as a download error (delete → retry once).
+- ~~**Ollama registry**~~ — **out of scope.** Cut with managed Ollama: the
+  manifest walk, blob concatenation, gzip-layer sniffing and
+  compressed-vs-decoded digest rules were the larger half of this section, and
+  every model in §9 is on HuggingFace. Re-add only if a wanted model is
+  registry-only.
 - Low-free-space **warning** (~<2 GB free) in the Settings UI.
 - Queue + cancellation; on Android, downloads run under the **foreground service**.
 - **Android GC, doze & network handoff:** the FGS runs with `dataSync` type and a
@@ -734,35 +748,68 @@ One diagnostic hazard remains, worth fixing regardless: `Delta::error_type` is
 `generate_blocking` now also `tracing::error!`s and emits the message as
 `content` so it can't vanish. Separately, a session pinned to an
 **unregistered** provider still hangs rather than erroring.
-- **2b acceptance:** AP verified against the daemon endpoint *before* deletion;
-  `grep -ri ollama` shows only the intentionally-retained dialect surface; the
-  rewritten `stack_needs_ollama` tests pass.
-- Files: §3 + deletion of `src-tauri/ollama/`, `commands/ollama.rs`,
-  `lifecycle/ollama_proc.rs`, `lifecycle/summarizer_model.rs`,
-  `config/env_helper.rs`, `state.ollama`, `providers::active_ollama_target`.
-  **Rewrite rather than edit:** `lifecycle/mod.rs` (`start_stack` step 1 + the
-  three-way `stack_needs_ollama` rule — real product logic, and its 4 tests get
-  rewritten to assert the new rule, not deleted) and `lifecycle/embedding.rs`
-  (~70 of 104 lines are Ollama-pull-shaped).
-- **Existing-install migration.** `ProviderProfile.provider_type` is an untyped
-  `String` (confirmed by the existing `old_shape_provider_migrates_with_defaults`
-  test), so a saved `"ollama"` profile keeps deserializing fine after removal —
-  **no crash, but no function either**: it silently becomes an unreachable
-  provider once `active_ollama_target` and the sidecar are gone. Per CLAUDE.md
-  rule 6 ("errors are states, not toasts"), surface it as an explicit *removed
-  provider* state in Settings → Providers with a delete/replace action, rather
-  than leaving a dead row the user has to figure out. **Acceptance:** loading a
-  pre-migration `config.json` containing a `provider_type: "ollama"` profile
-  produces that visible state and never a hard error.
+#### 2b + 3 status (2026-08-09) — **DONE**
 
-### Phase 3 — Downloader
-- **Acceptance:** `download_model` (HF + Ollama registry) tests: resume-after-
-  kill, sha256-mismatch retry-then-fail, atomic rename, 1.5× refuse gate, a
-  **gzip-compressed Ollama layer** fixture (decodes via flate2; content-digest
-  vs decoded-GGUF verification), and an Android **byte-offset resume on
-  connectivity drop** test.
+Landed as one branch, so the first-run wizard was never without a local path.
+
+| | |
+|---|---|
+| AP embeddings | **In-process**, not over HTTP. See the correction below. |
+| Managed Ollama | Gone: ~700 LOC of process/pull/env plumbing deleted. |
+| `provider_type: "ollama"` | Kept and working, as a *remote* endpoint. Pinned by `a_legacy_ollama_profile_still_routes_after_managed_ollama_was_removed`. |
+| Downloader | HuggingFace only, resumable, sha256-verified. Ollama registry cut. |
+| Settings → Local Models | Replaces the Ollama tab. |
+| Wizard | fork → download → configure → memory model → done. No "Detect" step. |
+| `local` provider type | **New.** Makes the engine selectable; without it the downloaded model had nothing to load it. |
+| Shipped daemon | Built `--features local-engine`. **+3.1 MB**, not the +50–100 MB assumed. |
+
+**The spec was wrong about the AP re-point.** It said to flip
+`AP_EMBED_OLLAMA_URL` at the daemon's own `/api/embeddings`. That is the
+daemon issuing an HTTP request to its own listener — a socket round-trip and a
+second copy of every vector to reach a slot manager one struct field away,
+which also has to satisfy the API-key middleware D25 makes mandatory on
+Android. Instead `adaptive_pathway::embed::SemanticEmbedder` is a host-supplied
+hook, implemented over the shared `SlotManager`. The HTTP route stays for
+out-of-process callers and for anyone pointing at a real Ollama.
+
+**The space tag is load-bearing.** `cfg.embedding.ollama_model` is compared,
+not displayed: `list_recall_candidates` filters on it and
+`sync_embedding_model_fingerprint` diffs it against disk. It is now derived
+from the GGUF filename (`local:<stem>`), so swapping weights correctly marks
+old beliefs stale for `reembed_stale_beliefs` rather than silently comparing
+vectors across two incompatible spaces.
+
+**Config migration.** `summarizer.model` and `adaptive_pathway_embedding_model`
+held Ollama tags and now hold GGUF ids. `migrate_model_tags_to_gguf` rewrites
+only the exact tags Kitty itself wrote — a hand-typed value may name a model
+the user fetched themselves. Without it both engine slots would go silently
+unconfigured on every existing install.
+
+**Two bugs fixed in passing**, neither related to the local engine: every SSE
+response deadlocked at end-of-turn (`agent::run_turn`'s disconnect watcher
+held a sender the response body was waiting on), and prompt prefill ignored
+`n_batch`.
+
+### Phase 3 — Downloader — **DONE** (landed with 2b, above)
+- **HuggingFace only.** The Ollama-registry source (manifest walk, blob
+  concat, gzip layers, compressed-vs-decoded digest rules) was cut with
+  managed Ollama — every model in §9 resolves through an HF `resolve` URL, and
+  `flate2` is not a dependency.
+- **Acceptance, met offline:** resume-after-kill, sha256-mismatch
+  retry-then-fail, atomic rename, 1.5× refuse gate — plus two the spec didn't
+  ask for and the implementation needed: a `.part` whose `.meta` sidecar names
+  a different source is discarded rather than resumed, and a `.part` with no
+  sidecar is discarded. Resuming across either boundary burns a full download
+  before failing the checksum, with nothing pointing at why.
+- **Still owed (Phase 7):** the Android byte-offset-resume-on-connectivity-drop
+  test, which needs the foreground service to exist first.
 
 ### Phase 4 — Settings
+- Also inherited from Phase 3: **enable the `vulkan` cargo feature** for the
+  Windows target (not `cuda`). Vulkan needs the Vulkan SDK on PATH for
+  `glslc` — add it to `docs/PLUGINS.md`'s prerequisites next to libclang and
+  Ninja, since a missing `glslc` fails in the same "looks like a crate bug"
+  way those two do.
 - Knobs/presets/model card/badge/health; **auto-restart scheduling** (§6.4);
   backend-aware hiding. Acceptance: settings round-trip via `commands/` + UI;
   **restart applies immediately when idle, and only after the in-flight

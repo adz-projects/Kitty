@@ -108,6 +108,17 @@ PLUGINS: dict[str, dict[str, object]] = {
         "exe": "bigtiny-daemon",
         "extras": [],
         "kind": "rust",
+        # The in-process llama.cpp engine (docs/ANDROID.md Phase 2a/2b).
+        # Without it the shipped daemon can't serve local chat, compaction or
+        # embeddings -- and since Phase 2b there is no Ollama process to fall
+        # back to, so this is no longer optional.
+        #
+        # Measured cost: +3.1 MB (77.6 vs 74.4 MB), not the +50-100 MB
+        # originally assumed -- statically linked CPU-only llama.cpp is much
+        # cheaper than it sounds. The real cost is build time: the first
+        # build compiles llama.cpp from source (several minutes) and needs
+        # cmake, Ninja and libclang on PATH. See docs/PLUGINS.md.
+        "features": ["local-engine"],
     },
 }
 
@@ -149,7 +160,8 @@ def build_plugin(name: str) -> None:
     print(f"\n=== {name} ({kind}) ===")
 
     if kind == "rust":
-        built_exe = build_rust_plugin(plugin_dir, exe_name)
+        features: list[str] = cfg.get("features", [])  # type: ignore[assignment]
+        built_exe = build_rust_plugin(plugin_dir, exe_name, features)
     else:
         built_exe = build_python_plugin(plugin_dir, cfg)
 
@@ -198,10 +210,13 @@ def build_python_plugin(plugin_dir: Path, cfg: dict[str, object]) -> Path:
     return plugin_dir / "dist" / f"{exe_name}.exe"
 
 
-def build_rust_plugin(plugin_dir: Path, exe_name: str) -> Path:
+def build_rust_plugin(plugin_dir: Path, exe_name: str, features: list[str]) -> Path:
     if not (plugin_dir / "Cargo.toml").exists():
         raise SystemExit(f"{plugin_dir / 'Cargo.toml'} not found")
-    run(["cargo", "build", "--release", "--locked"], cwd=plugin_dir)
+    cmd = ["cargo", "build", "--release", "--locked"]
+    if features:
+        cmd += ["--features", ",".join(features)]
+    run(cmd, cwd=plugin_dir)
     return plugin_dir / "target" / "release" / f"{exe_name}.exe"
 
 
