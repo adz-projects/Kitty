@@ -278,18 +278,22 @@ pub struct Config {
     pub memory: MemorySettings,
 }
 
-/// See `Config::summarizer`. Field names/defaults mirror BigTiny's own
-/// `SummarizerConfig` (`plugins/bigtiny/bigtiny/config.py`) so the two don't
-/// drift apart, but this is Kitty's independent copy — BigTiny's Python
-/// defaults still apply if the daemon is ever launched without these env
-/// vars set at all (e.g. a source checkout run directly, bypassing Kitty).
+/// See `Config::summarizer`. `enabled` mirrors BigTiny's own
+/// `SummarizerConfig.enabled` (relayed via `BIGTINY_SUMMARIZER__ENABLED`),
+/// but `model` is Kitty-side only, and does something different than it used
+/// to: it's the GGUF id `lifecycle::bigtiny_proc::spawn` resolves into
+/// `BIGTINY_LOCAL__MODEL_PATH` (docs/ANDROID.md §4.1) — the daemon's own
+/// `SummarizerConfig` no longer has a `model` field at all, since the local
+/// summarizer gets its model from `[local]`, not `[summarizer]`.
+///
+/// `keep_alive` is gone. It was an Ollama-native `keep_alive` value
+/// ("0"/"5m"/"-1") for the now-deleted Ollama-only `SummarizerClient`; the
+/// in-process engine's residency is the slot manager's job, and nothing here
+/// maps to it.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SummarizerSettings {
     pub enabled: bool,
     pub model: String,
-    /// Ollama `keep_alive` value: "0" unloads immediately, "5m" keeps the
-    /// summarizer resident for 5 idle minutes, "-1" pins it in VRAM.
-    pub keep_alive: String,
 }
 
 impl Default for SummarizerSettings {
@@ -297,7 +301,6 @@ impl Default for SummarizerSettings {
         Self {
             enabled: true,
             model: DEFAULT_SUMMARIZER_GGUF.to_string(),
-            keep_alive: "5m".to_string(),
         }
     }
 }

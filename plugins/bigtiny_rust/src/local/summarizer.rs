@@ -1,8 +1,9 @@
 //! Local structured-output summarizer (docs/ANDROID.md §3.1, §4.3, D12).
 //!
-//! Implements the same [`StructuredChat`] seam the HTTP `SummarizerClient`
-//! does, so compaction and adaptive-pathway's learned extraction don't care
-//! which one is wired in.
+//! Implements the same [`StructuredChat`] seam `agent::summarizer_chain`'s
+//! provider-router fallback does, so compaction and adaptive-pathway's
+//! learned extraction don't care which one actually served a given call —
+//! see that module for how the two are chained (local first, always).
 //!
 //! **Why there is no GBNF grammar here, despite §4.3 calling for one.**
 //!
@@ -178,46 +179,11 @@ fn generate_to_string(
     Ok(out)
 }
 
-/// Pull the first JSON object out of a response.
-///
-/// Needed even with the grammar for the *unconstrained* refill step, where a
-/// small model will happily wrap its JSON in prose or a ```json fence.
-pub(crate) fn extract_json(raw: &str) -> Option<Value> {
-    if let Ok(v) = serde_json::from_str::<Value>(raw.trim()) {
-        return Some(v);
-    }
-    let start = raw.find('{')?;
-    // Scan for the matching close rather than taking the last `}` in the
-    // string, which would swallow trailing prose containing a brace.
-    let bytes = raw.as_bytes();
-    let mut depth = 0usize;
-    let mut in_str = false;
-    let mut escaped = false;
-    for (i, &b) in bytes.iter().enumerate().skip(start) {
-        if in_str {
-            if escaped {
-                escaped = false;
-            } else if b == b'\\' {
-                escaped = true;
-            } else if b == b'"' {
-                in_str = false;
-            }
-            continue;
-        }
-        match b {
-            b'"' => in_str = true,
-            b'{' => depth += 1,
-            b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return serde_json::from_str(&raw[start..=i]).ok();
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
+// `extract_json` moved to `agent::json_extract` — the provider-router
+// fallback in `agent::summarizer_chain` needs the identical scan and isn't
+// gated behind this module's `local-engine` feature, so it can't import from
+// here.
+use crate::agent::json_extract::extract_json;
 
 fn validates(value: &Value, schema: &Value) -> bool {
     // An unusable schema shouldn't reject a good answer — treat it as "no
@@ -293,41 +259,8 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    #[test]
-    fn extracts_bare_json() {
-        let v = extract_json(r#"{"a":1}"#).unwrap();
-        assert_eq!(v["a"], 1);
-    }
-
-    /// The unconstrained refill step is where this matters: small models wrap
-    /// JSON in prose or a fenced block.
-    #[test]
-    fn extracts_json_from_prose_and_fences() {
-        let v = extract_json("Sure! ```json\n{\"a\": 2}\n``` hope that helps").unwrap();
-        assert_eq!(v["a"], 2);
-    }
-
-    /// Taking the *last* `}` would swallow trailing prose; the scanner must
-    /// stop at the matching brace.
-    #[test]
-    fn stops_at_the_matching_brace_not_the_last_one() {
-        let v = extract_json(r#"{"a":1} and then some } noise"#).unwrap();
-        assert_eq!(v, json!({"a": 1}));
-    }
-
-    /// A brace inside a string must not be counted as nesting.
-    #[test]
-    fn braces_inside_strings_do_not_confuse_the_scanner() {
-        let v = extract_json(r#"prefix {"a":"}{", "b":2} suffix"#).unwrap();
-        assert_eq!(v["b"], 2);
-        assert_eq!(v["a"], "}{");
-    }
-
-    #[test]
-    fn returns_none_when_there_is_no_json() {
-        assert!(extract_json("no json here").is_none());
-        assert!(extract_json("{unclosed").is_none());
-    }
+    // `extract_json`'s own tests now live with the function, in
+    // `agent::json_extract` — not duplicated here.
 
     #[test]
     fn schema_validation_accepts_and_rejects() {

@@ -714,7 +714,7 @@ comparison.
 | `POST /api/embeddings` | **Working end-to-end through the daemon.** 1024-dim, unit-norm, semantically ordered (0.7325 vs 0.2936), deterministic, 400 on a bad request. |
 | `register_local` at startup | Done. Registers under id `"local"`; a session pins it via `POST /api/chat/`'s `provider` field, so no DB row is needed (the `provider_type` CHECK would block one). |
 | **Chat through the agent loop** | **Working end-to-end.** 15/15 harness checks pass; ~18 tok/s generating on CPU with LFM2.5-1.2B-Q4_K_M. |
-| `LocalSummarizer` wiring | Not wired; `run_compaction` is hard-typed to `&SummarizerClient`. |
+| `LocalSummarizer` wiring | **Done (Phase 4.1).** `agent::summarizer_chain::SummarizerChain`: local first, then `fallback = "session_model"` through the same `ProviderRouter` every chat turn uses — no Ollama-specific client anywhere in the chain. The old Ollama-native `SummarizerClient`/`SummarizerError` are deleted outright, not deprecated. |
 
 **First A/B (2026-08-09, Windows CPU).** In-process llama.cpp **18.4 tok/s**
 generating vs Ollama **18.1 tok/s** — parity, which is the expected result

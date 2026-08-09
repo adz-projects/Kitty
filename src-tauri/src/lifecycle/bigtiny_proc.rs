@@ -156,8 +156,10 @@ pub async fn spawn(
             "BIGTINY_SUMMARIZER__ENABLED",
             if summarizer.enabled { "true" } else { "false" },
         )
-        .env("BIGTINY_SUMMARIZER__MODEL", &summarizer.model)
-        .env("BIGTINY_SUMMARIZER__KEEP_ALIVE", &summarizer.keep_alive)
+        // No `MODEL`/`KEEP_ALIVE` any more: those named an Ollama tag and an
+        // Ollama-native keep-alive value for the retired `SummarizerClient`.
+        // The local summarizer's model comes from `BIGTINY_LOCAL__MODEL_PATH`
+        // below instead (see docs/ANDROID.md §10 Phase 4.1).
         .env(
             "BIGTINY_TOKEN_MANAGEMENT__MAX_CONTEXT_TOKENS",
             token_management.max_context_tokens.to_string(),

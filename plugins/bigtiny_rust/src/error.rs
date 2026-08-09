@@ -105,21 +105,6 @@ pub enum ProviderError {
 }
 
 #[derive(Error, Debug)]
-pub enum SummarizerError {
-    #[error("request failed: {0}")]
-    Request(String),
-
-    #[error("http {status}: {body}")]
-    Http { status: u16, body: String },
-
-    #[error("empty or missing response content")]
-    EmptyContent,
-
-    #[error("invalid json in response: {0}")]
-    InvalidJson(String),
-}
-
-#[derive(Error, Debug)]
 pub enum AgentError {
     #[error("context error: {0}")]
     Context(String),

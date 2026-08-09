@@ -16,7 +16,7 @@ use crate::agent::context::builder::ContextBuilder;
 use crate::agent::context::stats::SessionStats;
 use crate::agent::reasoning_models;
 use crate::agent::sandbox::{allowed_dirs_for_session, check_containment};
-use crate::agent::summarizer::SummarizerClient;
+use crate::agent::summarizer_chain::SummarizerChain;
 use crate::agent::types::TimingResult;
 use crate::config::{FallbackConfig, PathwayConfig, SummarizerConfig};
 use crate::hitl::manager::HITLManager;
@@ -336,7 +336,7 @@ pub struct AgentLoop {
     hitl_notifies: Arc<DashMap<String, Arc<Notify>>>,
     context: ContextBuilder,
     stats: SessionStats,
-    summarizer: Arc<SummarizerClient>,
+    summarizer: Arc<SummarizerChain>,
     summarizer_cfg: SummarizerConfig,
     /// Pre-flight recall config (enabled/bm25 gate/token budgets). Passed
     /// through to both `preflight_recall` and post-turn `run_compaction`.
@@ -374,7 +374,7 @@ impl AgentLoop {
         hitl_notifies: Arc<DashMap<String, Arc<Notify>>>,
         context: ContextBuilder,
         stats: SessionStats,
-        summarizer: Arc<SummarizerClient>,
+        summarizer: Arc<SummarizerChain>,
         summarizer_cfg: SummarizerConfig,
         memory_cfg: MemoryConfig,
         preflight: Arc<PreflightCounters>,
@@ -1009,6 +1009,8 @@ impl AgentLoop {
                 pool,
                 session_id,
                 &self.summarizer,
+                Some(&provider_id),
+                Some(provider_model.clone()),
                 self.context.config(),
                 &self.summarizer_cfg,
                 &self.memory_cfg,

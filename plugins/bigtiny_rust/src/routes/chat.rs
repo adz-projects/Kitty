@@ -439,18 +439,25 @@ pub async fn compact_session(
     // failure to resolve a provider is not fatal here — compaction's token
     // budget only *defines* the high/low watermarks; fall back to the
     // configured `max_context_tokens` the way the loop does.
-    let context_length = state
-        .agent
-        .router()
-        .get_provider_id(effective_provider)
-        .ok()
-        .and_then(|pid| state.agent.router().context_length(&pid))
+    let resolved_provider_id = state.agent.router().get_provider_id(effective_provider).ok();
+    let context_length = resolved_provider_id
+        .as_deref()
+        .and_then(|pid| state.agent.router().context_length(pid))
         .unwrap_or(state.config.token_management.max_context_tokens);
 
+    // `provider_id` is `None` when nothing resolved (no session provider, no
+    // default registered) — `run_compaction` still attempts the local
+    // summarizer in that case, and only needs a provider for the
+    // session-model fallback leg.
+    let model = resolved_provider_id
+        .as_deref()
+        .map(|pid| state.agent.router().resolve_model(pid, None));
     let result = crate::agent::compaction::run_compaction(
         &state.db,
         &id,
         state.agent.summarizer(),
+        resolved_provider_id.as_deref(),
+        model,
         &state.config.token_management,
         &state.config.summarizer,
         &state.config.memory,

@@ -107,11 +107,13 @@ fn apply_env_overrides(config: &mut BigTinyConfig) {
     if let Ok(v) = std::env::var("BIGTINY_SUMMARIZER__ENABLED") {
         config.summarizer.enabled = v.eq_ignore_ascii_case("true") || v == "1";
     }
-    if let Ok(v) = std::env::var("BIGTINY_SUMMARIZER__MODEL") {
-        config.summarizer.model = v;
-    }
-    if let Ok(v) = std::env::var("BIGTINY_SUMMARIZER__KEEP_ALIVE") {
-        config.summarizer.keep_alive = v;
+    // `MODEL`/`KEEP_ALIVE` are gone: those named an Ollama tag and an
+    // Ollama-native `keep_alive` value for the now-deleted Ollama-only
+    // `SummarizerClient`. The local summarizer's model comes from
+    // `BIGTINY_LOCAL__MODEL_PATH` instead, and residency is the slot
+    // manager's job, not a per-call keep-alive knob.
+    if let Ok(v) = std::env::var("BIGTINY_SUMMARIZER__FALLBACK") {
+        config.summarizer.fallback = v;
     }
     if let Some(n) = std::env::var("BIGTINY_TOKEN_MANAGEMENT__MAX_CONTEXT_TOKENS")
         .ok()

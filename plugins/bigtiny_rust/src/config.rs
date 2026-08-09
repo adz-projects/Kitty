@@ -361,12 +361,15 @@ impl TokenManagementConfig {
 pub struct SummarizerConfig {
     #[serde(default = "default_summarizer_enabled")]
     pub enabled: bool,
-    #[serde(default = "default_summarizer_model")]
-    pub model: String,
-    #[serde(default = "default_summarizer_base_url")]
-    pub base_url: String,
-    #[serde(default = "default_summarizer_keep_alive")]
-    pub keep_alive: String,
+    /// `"session_model"` (default) — on a local-summarizer miss, fall back to
+    /// whatever provider the caller resolves (the session's own pinned
+    /// provider for compaction; the router's current default for
+    /// adaptive-pathway's sessionless learn passes). `"off"` skips straight
+    /// to an explicit error. See `agent::summarizer_chain` — there is no
+    /// third option and never an Ollama-specific one; the fallback goes
+    /// through the same `ProviderRouter` every chat turn uses.
+    #[serde(default = "default_summarizer_fallback")]
+    pub fallback: String,
     #[serde(default = "default_summarizer_temperature")]
     pub temperature: f64,
     #[serde(default = "default_summarizer_timeout_s")]
@@ -380,14 +383,8 @@ pub struct SummarizerConfig {
 fn default_summarizer_enabled() -> bool {
     true
 }
-fn default_summarizer_model() -> String {
-    "LFM2.5-1.2b".into()
-}
-fn default_summarizer_base_url() -> String {
-    "http://127.0.0.1:11434".into()
-}
-fn default_summarizer_keep_alive() -> String {
-    "5m".into()
+fn default_summarizer_fallback() -> String {
+    "session_model".into()
 }
 fn default_summarizer_temperature() -> f64 {
     0.1
@@ -406,9 +403,7 @@ impl Default for SummarizerConfig {
     fn default() -> Self {
         Self {
             enabled: default_summarizer_enabled(),
-            model: default_summarizer_model(),
-            base_url: default_summarizer_base_url(),
-            keep_alive: default_summarizer_keep_alive(),
+            fallback: default_summarizer_fallback(),
             temperature: default_summarizer_temperature(),
             timeout_s: default_summarizer_timeout_s(),
             reserve_exchanges: default_reserve_exchanges(),

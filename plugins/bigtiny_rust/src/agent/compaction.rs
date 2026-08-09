@@ -5,7 +5,7 @@ use serde_json::Map;
 use serde_json::{json, Value};
 use sqlx::SqlitePool;
 
-use crate::agent::summarizer::SummarizerClient;
+use crate::agent::summarizer_chain::SummarizerChain;
 use crate::agent::tokens::{count_messages_tokens, count_text_tokens};
 use crate::config::{MemoryConfig, SummarizerConfig, TokenManagementConfig};
 use crate::storage::sessions;
@@ -747,7 +747,9 @@ pub fn build_summarizer_prompt(existing_slots: Option<&Value>, chunk: &[Value]) 
 pub async fn run_compaction(
     pool: &SqlitePool,
     session_id: &str,
-    summarizer: &SummarizerClient,
+    summarizer: &SummarizerChain,
+    provider_id: Option<&str>,
+    provider_model: Option<String>,
     token_cfg: &TokenManagementConfig,
     summarizer_cfg: &SummarizerConfig,
     memory_cfg: &MemoryConfig,
@@ -768,6 +770,8 @@ pub async fn run_compaction(
         pool,
         session_id,
         summarizer,
+        provider_id,
+        provider_model,
         token_cfg,
         summarizer_cfg,
         memory_cfg,
@@ -788,7 +792,9 @@ pub async fn run_compaction(
 async fn run_compaction_inner(
     pool: &SqlitePool,
     session_id: &str,
-    summarizer: &SummarizerClient,
+    summarizer: &SummarizerChain,
+    provider_id: Option<&str>,
+    provider_model: Option<String>,
     token_cfg: &TokenManagementConfig,
     summarizer_cfg: &SummarizerConfig,
     memory_cfg: &MemoryConfig,
@@ -925,14 +931,13 @@ async fn run_compaction_inner(
     let prompt = build_summarizer_prompt(existing_slots.as_ref(), &masked);
 
     let new_slots = match summarizer
-        .structured_chat(prompt, &MEMORY_SLOTS_SCHEMA)
+        .structured_chat_for_session(provider_id, provider_model, prompt, &MEMORY_SLOTS_SCHEMA)
         .await
     {
         Ok(slots) => slots,
         Err(e) => {
             // Never fail the turn or corrupt state on a bad summarizer pass —
-            // just skip this compaction attempt, matching Python's
-            // `except SummarizerError` handling.
+            // just skip this compaction attempt.
             tracing::warn!("compaction: summarizer call failed for session {session_id}: {e}");
             return None;
         }

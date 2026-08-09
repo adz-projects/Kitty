@@ -1,10 +1,11 @@
 pub mod compaction;
 pub mod context;
+pub(crate) mod json_extract;
 pub mod loop_;
 pub mod memory;
 pub mod reasoning_models;
 pub mod sandbox;
-pub mod summarizer;
+pub mod summarizer_chain;
 pub mod tokens;
 pub mod types;
 
@@ -29,7 +30,7 @@ use self::context::builder::ContextBuilder;
 use self::context::stats::SessionStats;
 use self::loop_::AgentLoop;
 use self::memory::PreflightCounters;
-use self::summarizer::SummarizerClient;
+use self::summarizer_chain::SummarizerChain;
 
 /// Cross-session state the HTTP routes need: in-flight turn handles (for
 /// `/cancel`), and the HITL pause/resume map (for `/approve`) — the pieces
@@ -46,7 +47,7 @@ pub struct Agent {
     /// disconnect watcher spawned in `run_turn` can never abort a later,
     /// unrelated turn for the same session (see that method's doc comment).
     tasks: DashMap<String, (Uuid, tokio::task::JoinHandle<()>)>,
-    summarizer: Arc<SummarizerClient>,
+    summarizer: Arc<SummarizerChain>,
     config: BigTinyConfig,
     /// Daemon-wide pre-flight recall counters, shared across every per-turn
     /// `AgentLoop` (each is built fresh). Read by `GET /api/memory/stats`.
@@ -70,7 +71,7 @@ impl Agent {
         router: Arc<ProviderRouter>,
         mcp: Arc<MCPManager>,
         hitl: Arc<Mutex<HITLManager>>,
-        summarizer: Arc<SummarizerClient>,
+        summarizer: Arc<SummarizerChain>,
         config: BigTinyConfig,
         cache_dir: String,
         pathway: Option<Arc<PathwayEngine>>,
@@ -104,7 +105,7 @@ impl Agent {
         &self.router
     }
 
-    pub fn summarizer(&self) -> &Arc<SummarizerClient> {
+    pub fn summarizer(&self) -> &Arc<SummarizerChain> {
         &self.summarizer
     }
 
@@ -325,7 +326,10 @@ mod tests {
         let router = Arc::new(ProviderRouter::new(config.cache.clone()));
         let mcp = Arc::new(MCPManager::new(pool.clone(), None));
         let hitl = Arc::new(Mutex::new(HITLManager::new(pool.clone(), config.hitl.clone())));
-        let summarizer = Arc::new(SummarizerClient::new(config.summarizer.clone()));
+        #[cfg(feature = "local-engine")]
+        let summarizer = Arc::new(SummarizerChain::new(None, router.clone(), config.summarizer.clone()));
+        #[cfg(not(feature = "local-engine"))]
+        let summarizer = Arc::new(SummarizerChain::new(router.clone(), config.summarizer.clone()));
         Arc::new(Agent::new(
             pool,
             router,

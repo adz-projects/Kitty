@@ -31,7 +31,7 @@ pub const LOCAL_PROVIDER_ID: &str = "local";
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::cors::CorsLayer;
 
-use agent::summarizer::SummarizerClient;
+use agent::summarizer_chain::SummarizerChain;
 use agent::Agent;
 use config::BigTinyConfig;
 use error::DaemonError;
@@ -199,7 +199,27 @@ pub async fn run(config: BigTinyConfig, options: RunOptions) -> Result<(), Daemo
         pool.clone(),
         config.hitl.clone(),
     )));
-    let summarizer = Arc::new(SummarizerClient::new(config.summarizer.clone()));
+
+    // §4.3's chain, first leg: the in-process engine, when one is configured.
+    // Shares `local_slots` with chat and `/api/embeddings` — a summarization
+    // pass reuses the already-resident chat model rather than loading a
+    // second copy, when the two happen to be the same GGUF (§4.1).
+    #[cfg(feature = "local-engine")]
+    let local_summarizer = config.local.enabled.then(|| {
+        Arc::new(local::LocalSummarizer::new(
+            config.local.clone(),
+            config.summarizer.clone(),
+            local_slots.clone(),
+        ))
+    });
+    #[cfg(feature = "local-engine")]
+    let summarizer = Arc::new(SummarizerChain::new(
+        local_summarizer,
+        router.clone(),
+        config.summarizer.clone(),
+    ));
+    #[cfg(not(feature = "local-engine"))]
+    let summarizer = Arc::new(SummarizerChain::new(router.clone(), config.summarizer.clone()));
 
     // Pathway background learning loop: idle sweep + maintenance, aborted
     // before agent shutdown. Only spawned when the engine is available.

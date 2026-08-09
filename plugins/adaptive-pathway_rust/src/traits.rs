@@ -1,9 +1,11 @@
 //! Trait that inverts the AP→daemon dependency. `adaptive_pathway` defines a
 //! `StructuredChat` abstraction for "give me a JSON-schema-constrained chat
-//! completion"; the daemon implements it over its `SummarizerClient`. This
-//! lets the engine depend on a plain interface instead of a concrete daemon
-//! type, resolving the circular dependency (orphan rule permits: foreign
-//! trait + local type inside bigtiny_rust).
+//! completion"; the daemon implements it over its `SummarizerChain` (local
+//! llama.cpp first, then whatever chat provider is actually configured — see
+//! `bigtiny_rust::agent::summarizer_chain`). This lets the engine depend on a
+//! plain interface instead of a concrete daemon type, resolving the circular
+//! dependency (orphan rule permits: foreign trait + local type inside
+//! bigtiny_rust).
 
 use async_trait::async_trait;
 use serde_json::Value;

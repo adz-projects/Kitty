@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use bigtiny_rust::agent::summarizer::SummarizerClient;
+use bigtiny_rust::agent::summarizer_chain::SummarizerChain;
 use bigtiny_rust::agent::Agent;
 use bigtiny_rust::config::BigTinyConfig;
 use bigtiny_rust::hitl::manager::HITLManager;
@@ -53,7 +53,10 @@ async fn test_state_inner(
         pool.clone(),
         config.hitl.clone(),
     )));
-    let summarizer = Arc::new(SummarizerClient::new(config.summarizer.clone()));
+    #[cfg(feature = "local-engine")]
+    let summarizer = Arc::new(SummarizerChain::new(None, router.clone(), config.summarizer.clone()));
+    #[cfg(not(feature = "local-engine"))]
+    let summarizer = Arc::new(SummarizerChain::new(router.clone(), config.summarizer.clone()));
     let agent = Arc::new(Agent::new(
         pool.clone(),
         router.clone(),

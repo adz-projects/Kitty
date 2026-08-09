@@ -6,7 +6,8 @@ assistant should adapt. It owns its own `pathway.db`, does semantic recall and
 learning in-process, and exposes only two model-chosen write tools over MCP
 (`record` / `forget`). The dependency direction is inverted: the crate depends
 only on the `StructuredChat` trait, which the daemon implements over its
-`SummarizerClient` LLM client.
+`SummarizerChain` — local llama.cpp first, falling back to whatever chat
+provider the router resolves (never a hardcoded HTTP client).
 
 ---
 
@@ -152,7 +153,7 @@ its behavioral-memory engine. The engine inverts the expected dependency: it
 does not know about LLM providers, routers, or the session scheduler. It
 depends only on `traits::StructuredChat`, a two-method JSON-schema-constrained
 completion interface, and the daemon implements that trait over its
-`SummarizerClient`. This one seam lets the same engine run under tests
+`SummarizerChain`. This one seam lets the same engine run under tests
 (`MockChat`), under the daemon, and under any future host. Everything durable
 lives in the engine's own `pathway.db` — a separate SQLite file with its own
 migration chain (WAL, `foreign_keys`, `busy_timeout`), sharing a directory with
