@@ -140,6 +140,48 @@ impl ProviderRouter {
         );
     }
 
+    /// Register the in-process llama.cpp engine as a provider
+    /// (docs/ANDROID.md §3.1, §4.2).
+    ///
+    /// Takes a [`ProviderConfig`] like its siblings so sampling resolution and
+    /// fallback priority behave identically — but the `base_url`/`api_key`
+    /// fields are unused, since nothing is over the wire. Sampling resolves
+    /// against the `custom_openai` dialect: that's the self-hosted profile in
+    /// `sampling::defaults_for`, which enables the `top_k`/`min_p` knobs
+    /// llama.cpp actually supports (hosted OpenAI endpoints reject them).
+    #[cfg(feature = "local-engine")]
+    pub fn register_local(
+        &self,
+        provider_id: &str,
+        mut config: ProviderConfig,
+        local: crate::config::LocalEngineConfig,
+        slots: crate::local::SlotManager,
+    ) {
+        if config.provider_type.is_empty() {
+            config.provider_type = "custom_openai".into();
+        }
+        let (parallel_slots, resolved_sampling, context_length, fallback_priority) =
+            Self::resolved_fields(&config);
+        let p: Arc<dyn Provider> =
+            Arc::new(crate::local::LocalProvider::new(provider_id, local, slots));
+        self.providers.insert(
+            provider_id.to_string(),
+            ProviderEntry {
+                provider: p,
+                health: HealthStatus {
+                    status: "disconnected".into(),
+                    latency_ms: None,
+                    error: None,
+                },
+                health_checked_at: Instant::now(),
+                parallel_slots,
+                sampling: resolved_sampling,
+                context_length,
+                fallback_priority,
+            },
+        );
+    }
+
     pub fn unregister(&self, provider_id: &str) {
         self.providers.remove(provider_id);
     }
@@ -712,6 +754,30 @@ mod tests {
         assert_eq!(
             router.get_provider_id(Some("deleted-long-ago")).unwrap(),
             "active"
+        );
+    }
+
+    /// The local provider must be selectable through the same registry as
+    /// every other provider — that's the whole point of implementing the
+    /// trait rather than special-casing it in the agent loop.
+    #[cfg(feature = "local-engine")]
+    #[test]
+    fn a_registered_local_provider_is_selectable_and_gets_self_hosted_sampling() {
+        let r = ProviderRouter::default();
+        r.register_local(
+            "local",
+            ProviderConfig::default(),
+            crate::config::LocalEngineConfig::default(),
+            crate::local::SlotManager::new(),
+        );
+        assert_eq!(r.get_provider_id(Some("local")).unwrap(), "local");
+        // `custom_openai` defaults enable the llama.cpp-only knobs; a hosted
+        // dialect would leave them None and silently disable repetition
+        // control on a small quantized model.
+        let s = r.sampling("local");
+        assert!(
+            s.top_k.is_some() && s.min_p.is_some(),
+            "expected self-hosted sampling defaults, got {s:?}"
         );
     }
 
