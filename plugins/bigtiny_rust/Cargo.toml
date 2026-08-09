@@ -19,7 +19,34 @@ path = "tests/bin/fake_mcp_server.rs"
 name = "bigtiny-daemon"
 path = "src/bin/bigtiny_daemon.rs"
 
+# Phase 1 linkage probe. `required-features` keeps `cargo build/clippy
+# --all-targets` working without the (expensive, cmake-driven) local-engine
+# feature — without it, the default all-targets sweep would try to compile
+# this example and fail on the missing `llama_cpp_2` crate.
+[[example]]
+name = "local_engine_spike"
+required-features = ["local-engine"]
+
+[features]
+# In-process llama.cpp engine (docs/ANDROID.md D1, §3). Opt-in because
+# `llama-cpp-sys-2` builds llama.cpp from source via cmake — a multi-minute
+# first build that ordinary daemon work shouldn't pay for.
+local-engine = ["dep:llama-cpp-2"]
+
 [dependencies]
+# llama.cpp bindings. `default-features = false` is load-bearing: the crate's
+# default set is ["openmp", "android-shared-stdcxx", "common"], and BOTH of the
+# first two are wrong for us — docs/ANDROID.md §11 requires OpenMP off on
+# Android (libgomp is a missing-symbol hazard on varied OEM devices) and a
+# STATIC libc++ so the APK ships one self-contained cdylib with nothing to
+# dlopen. Per-target feature sets below.
+#
+# Note this supersedes D1's `llama_cpp` placeholder: that crate was last
+# released 2024-04-29 and is abandoned. `llama-cpp-2` (utilityai/llama-cpp-rs)
+# is actively released and carries first-class Android features.
+llama-cpp-2 = { version = "0.1.154", default-features = false, features = [
+    "common",
+], optional = true }
 axum = { version = "0.8", features = ["json", "macros"] }
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["io"] }
@@ -80,7 +107,29 @@ kitty-wasm = { path = "../kitty-wasm" }
 # sqlx = "0.8" to keep a single libsqlite3-sys across this workspace.
 adaptive-pathway = { path = "../adaptive-pathway_rust" }
 
+# Android: static libc++ so the APK ships a single self-contained cdylib with
+# no helper `.so` to dlopen (docs/ANDROID.md §11, D22). OpenMP stays OFF — it
+# is deliberately absent from this feature list, not merely unlisted.
+[target.'cfg(target_os = "android")'.dependencies]
+llama-cpp-2 = { version = "0.1.154", default-features = false, features = [
+    "common",
+    "android-static-stdcxx",
+    "static-stdcxx",
+], optional = true }
+
+# Windows: CPU-only for now. `cuda`/`vulkan` are cargo features on this crate,
+# and the CUDA toolkit (~3 GB) is deliberately deferred to Phase 2's desktop
+# GPU work — the Phase 1 gate doesn't need a GPU backend to prove linkage.
+# See docs/ANDROID.md D20 for the backend-selection design this feeds.
+[target.'cfg(windows)'.dependencies]
+llama-cpp-2 = { version = "0.1.154", default-features = false, features = [
+    "common",
+], optional = true }
+
 [dev-dependencies]
+# `LlamaModel::token_to_piece` takes an `encoding_rs::Decoder` so a multi-byte
+# codepoint split across two tokens still renders. Example-only.
+encoding_rs = "0.8"
 mockito = "1"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"

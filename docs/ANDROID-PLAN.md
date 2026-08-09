@@ -129,32 +129,73 @@ well under the ~10–15 GB budget.
 
 ---
 
-## Phase 1 — Cross-compile spike (gate; highest risk)
+## Phase 1 — Cross-compile spike — **1-compile PASSED (2026-08-08)**
 
-- Add `wasmtime` + the llama.cpp binding (feature-gated) + Android build profile to
-  `bigtiny_rust`. **`wasmtime` is needed because it backs `kitty-wasm`**, the fourth
-  in-process MCP builtin (sandboxed code-execution tools over a pinned CPython 3.12
-  WASI guest) — not because anything hosts Python tooling; `kitty-docs-web` is retired
-  and its PDF/Excel/web tools are native Rust now.
-- `cargo build --target aarch64-linux-android` for llama + wasmtime + sqlx **and all
-  four linked path-dep crates** (`adaptive-pathway`, `kitty-tools`, `kitty-web`,
-  `kitty-wasm`). The latter two are pure Rust and should be uneventful — they're named
-  so "the daemon builds" means every linked crate builds.
-- NDK linkage per `ANDROID.md` §11: `ANDROID_STL=c++_static`, static
-  `libgcc`/`libunwind`/`libatomic`, **`LLAMA_OPENMP=OFF`**, single cdylib, no leaked
-  JNI `.so` (if one leaks, `System.loadLibrary` in `gen/android` Kotlin before Rust init).
-- Confirm `lfm2.5…q4_k_m.gguf` loads via `llama_cpp` and mints tokens; confirm `-1` =
-  "all layers" across CUDA/Vulkan/CPU on the Windows host (validates D20 shape for both
-  platforms).
+**Windows:** `llama-cpp-2` 0.1.154 pinned, builds in ~4m25s, loads
+`LFM2.5-1.2B-Instruct-Q4_K_M.gguf` (arch `lfm2`) and generates coherent text.
+Probe lives at `plugins/bigtiny_rust/examples/local_engine_spike.rs`, behind
+`required-features = ["local-engine"]` so it can't break `--all-targets`.
+
+**Android:** `cargo ndk -t arm64-v8a --platform 26 build --lib --features
+local-engine` succeeds in 3m22s. Verified `EM_AARCH64` via the NDK's
+`llvm-readobj`. Every linked crate produces an arm64 rlib — including
+**`wasmtime` (122 MB)** and **`kitty-wasm` (83 MB)**, so the planned
+"drop kitty-wasm on Android" contingency is **not needed**, plus
+`llama-cpp-sys-2` (247 MB), `kitty-tools`, `kitty-web`, `adaptive-pathway`.
+`libsqlite3-sys` cross-compiles as well.
+
+**Not proven, don't claim it:** this is a *compile*, not a *link*.
+`bigtiny_rust` is an rlib, so `nm -u` has nothing to inspect — the
+no-unresolved-externals criterion needs Phase 7's in-process cdylib.
+
+**Extra build prerequisites, neither previously documented** — both from
+`llama-cpp-sys-2`:
+- **CMake** (already installed in 1a) — builds llama.cpp from source.
+- **libclang**, for `bindgen`. **Nothing on a stock Windows dev box has one** —
+  not the NDK, not Visual Studio. `winget install LLVM.LLVM` is the clean fix
+  but **needs elevation**; if the UAC prompt is declined the install aborts
+  with `0x800704c7`. Non-elevated fallback used here: extract `libclang.dll`
+  from the PyPI `libclang` wheel and point `LIBCLANG_PATH` at it. Either way
+  the variable must be set for both the host and Android builds.
+
+- `wasmtime` comes in via `kitty-wasm` (a path dep), so the one Android build
+  exercises it too. **It backs `kitty-wasm`**, the fourth in-process MCP
+  builtin (sandboxed code-execution over a pinned CPython 3.12 WASI guest) —
+  not Python tooling; `kitty-docs-web` is retired and its PDF/Excel/web tools
+  are native Rust now.
+- `cargo ndk -t arm64-v8a --platform 26 build --lib --features local-engine`
+  covers llama + wasmtime + sqlx **and all four linked path-dep crates**
+  (`adaptive-pathway`, `kitty-tools`, `kitty-web`, `kitty-wasm`).
+- NDK linkage: **expressed as cargo features, not cmake vars** (see
+  `ANDROID.md` §11) — `android-static-stdcxx` + `static-stdcxx`, OpenMP left
+  un-enabled, and `default-features = false` is mandatory because the crate's
+  default set turns OpenMP on and picks *shared* libc++. Still verify: single
+  cdylib, no leaked JNI `.so` (if one leaks, `System.loadLibrary` in
+  `gen/android` Kotlin before Rust init).
+- ~~Confirm the GGUF loads and mints tokens~~ — **done.** arch `lfm2`, 16
+  layers, `n_embd` 2048, vocab 65,536, `n_ctx_train` **128,000** (§9 said 32k;
+  corrected). Flash Attention auto-enabled at load, which is D19's
+  autodetect behaving as designed. **Gotcha for `LocalProvider`:** a bare
+  prompt makes this instruct model emit EOS immediately — zero tokens, which
+  looks exactly like a broken build. Must go through
+  `chat_template` + `apply_chat_template` and tokenize `AddBos::Never`.
+- `-1` = "all layers" across CUDA/Vulkan/CPU is **not** validated — Windows is
+  CPU-only for now (`cuda`/`vulkan` are cargo features; the toolkit is
+  deferred). D20's runtime-vs-compile-time backend selection stays open into
+  Phase 2a.
 - Windows host-side: **Vulkan runtime** (usually present) + **CUDA toolkit (~3 GB)**
   deferred to Phase 2 real GPU testing — not needed for the compile gate.
-- **Gate acceptance:** boots on the physical arm64 device with zero
-  `UnsatisfiedLinkError`/`dlopen` failures; `readelf -d`/`nm -u` on the produced `.so`
-  shows no unresolved external symbols. Tombstone the `ANDROID.md` §9 fallback decision
-  (`qwen3` / llama version) if `lfm2` fails.
+- **Gate acceptance, split (per the Phase 1 decision):**
+  - **1-compile:** cross-compiles clean for `aarch64-linux-android` with
+    `local-engine`; `readelf -d`/`nm -u` on the produced `.so` shows no
+    unresolved external symbols and no leaked JNI `.so`; model loads and
+    generates on Windows. ← the runway check.
+  - **1-device:** boots on the physical arm64 device with zero
+    `UnsatisfiedLinkError`/`dlopen` failures. Deferred until a device is
+    attached; NDK linkage problems only surface here.
 
-> **Do not start Phase ≥2 coding until Phases 1a + 1 are green.** The whole local-engine
-> story depends on the cross-compile gate.
+> **Do not start Phase ≥2 coding until 1a + 1-compile are green.** 1-device may
+> trail, but treat any 2a work done before it as provisional.
 
 ---
 

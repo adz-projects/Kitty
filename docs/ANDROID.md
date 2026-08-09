@@ -49,10 +49,25 @@ D1–D21 are unchanged and un-renumbered — existing references (including in
   originally listed** — `screenshot.rs` and `config/env_helper.rs` were both
   unlisted hard breakers, and the overlay builder needed the *functions*
   gated, not just their call site.
-- **Phase 1 — next**, and still the make-or-break gate: no llama.cpp binding
-  or `wasmtime` is a dependency yet.
-- No device is attached yet (`adb devices` is empty) — needed for Phase 1's
-  on-device acceptance, not for the compile gate.
+- **Phase 1 (1-compile) — PASSED 2026-08-08.** The make-or-break gate is
+  cleared. `llama-cpp-2` 0.1.154 pinned behind an opt-in `local-engine`
+  feature; loads `lfm2` and generates coherent text on Windows; and
+  `cargo ndk -t arm64-v8a --platform 26 build --lib --features local-engine`
+  succeeds in 3m22s, emitting genuine `EM_AARCH64` objects
+  (`libggml{,-cpu,-base}.a`). **`wasmtime` cross-compiles too** (122 MB rlib,
+  with `kitty-wasm` at 83 MB) — the "drop kitty-wasm on Android" contingency
+  is **not** needed. All four linked path-deps build for the target.
+  §11 records the four toolchain traps this surfaced.
+- **Still open from Phase 1:**
+  - **1-device** — no device attached (`adb devices` empty). NDK linkage
+    problems only surface at `dlopen` time, so this remains a real gap.
+  - **`nm -u` / "no unresolved externals" cannot yet be checked.**
+    `bigtiny_rust` builds as an rlib, so there is no link step. A truthful
+    check needs the daemon linked into a cdylib, which is Phase 7's in-process
+    work. Not counted as met.
+  - **D20 backend selection unvalidated** — Windows is CPU-only for now
+    (`cuda`/`vulkan` are cargo features; toolkit deferred), so `-1` = "all
+    layers" across backends is untested.
 
 ---
 
@@ -60,7 +75,7 @@ D1–D21 are unchanged and un-renumbered — existing references (including in
 
 | # | Decision | Where it lands |
 |---|----------|----------------|
-| D1 | **In-process llama.cpp, day 1, both OSes.** `bigtiny_rust` links a Rust llama.cpp binding — **`llama_cpp` throughout this doc is a placeholder for whichever crate Phase 1 pins** (`llama-cpp-2` and the `llama-cpp-2rs` fork are both candidates; §11). The `LocalEngine` boundary (§3.1) is what makes that swappable. No Ollama anywhere: chat, compaction, and desktop embeddings all go through the daemon. | §2, §4, §11 |
+| D1 | **In-process llama.cpp, day 1, both OSes.** `bigtiny_rust` links **`llama-cpp-2` (`utilityai/llama-cpp-rs`), pinned at 0.1.154** — chosen in Phase 1 and validated end-to-end. The `llama_cpp` crate this doc used to name as a placeholder is **abandoned** (last release 2024-04-29). The `LocalEngine` boundary (§3.1) keeps the binding swappable. Chat, compaction, and desktop embeddings all go through the daemon; Kitty manages no inference process of its own (see §10 Phase 2 for what "no Ollama" does and doesn't mean). | §2, §4, §11 |
 | D2 | **Model is pinned per chat.** Locked in at chat creation; changes only on **new chats**. No mid-stream swap, ever. | §4.1 |
 | D3 | **Scheduled tasks default to the summarizer model**; per-task override in Settings. | §7 |
 | D4 | **Embeddings on desktop only.** AP calls new `POST /api/embeddings`; `AP_EMBED_OLLAMA_URL` re-points to the daemon port. On Android, AP's pipeline runs with its **built-in hash-space embeddings** (`HASH_EMBED_MODEL` fallback) — no embed model, no `/api/embeddings` call. | §3.1 |
@@ -510,11 +525,23 @@ All under `Settings → Local models`, shared component on both OS.
 
 ## 9. Default model
 
-- `LiquidAI/LFM2.5-1.2B-Instruct-GGUF` → file `lfm2.5-1.2b-instruct-q4_k_m.gguf`
-  (~731 MB, arch `lfm2`, native 32k ctx, ~950 MB min memory).
+- `LiquidAI/LFM2.5-1.2B-Instruct-GGUF` → file
+  **`LFM2.5-1.2B-Instruct-Q4_K_M.gguf`** — note the case; HuggingFace resolve
+  URLs are case-sensitive and the all-lowercase name this doc used to give
+  404s.
+- **Verified in Phase 1** against `llama-cpp-2` 0.1.154: arch `lfm2` loads and
+  generates. Measured from the GGUF, superseding this section's earlier
+  estimates: **730,895,168 bytes** on disk, 16 layers, `n_embd` 2048, vocab
+  65,536, and **`n_ctx_train` = 128,000** (not 32k). CPU compute buffer at
+  `n_ctx` 2048 was ~142 MiB.
   - Baseline sampling = the Precise preset.
-- **Fallback model = Qwen3-1.2B q4_K_M** (used only if `lfm2` fails to load in
-  the pinned `llama_cpp` version; see Phase 1).
+  - **It is instruct-tuned and needs its chat template.** A bare prompt makes
+    it emit EOS immediately — zero tokens, which looks exactly like a broken
+    build. `LocalProvider` must go through `LlamaModel::chat_template` +
+    `apply_chat_template` and tokenize with `AddBos::Never` (the template
+    already carries the BOS/turn markers).
+- **Fallback model = Qwen3-1.2B q4_K_M** — not needed; `lfm2` works. Kept as
+  the documented escape hatch only.
 - GGUF cache lives in app-local dir (Android backup-excluded).
 
 ---
@@ -549,22 +576,59 @@ All under `Settings → Local models`, shared component on both OS.
 - **Acceptance:** `cargo build --target aarch64-linux-android` for `bigtiny_rust`
   with llama + wasmtime + sqlx **+ all four linked path-dep crates
   (`adaptive-pathway`, `kitty-tools`, `kitty-web`, `kitty-wasm`) — no separate
-  artifact for any of them**; a `lfm2.5…q4_k_m.gguf` load via the pinned binding
+  artifact for any of them**; a `LFM2.5-1.2B-Instruct-Q4_K_M.gguf` load via the pinned binding
   returns tokens; **app boots on an API 26–34 emulator AND one physical arm64
   device with zero `UnsatisfiedLinkError`/`dlopen` failures**; `readelf -d`/`nm -u`
   on the produced `.so` confirms no unresolved external symbols. Record the pinned
   NDK version back into D22. Fallback decision tombstones in `docs/ANDROID.md` if
   `lfm2` fails.
 
-### Phase 2 — Daemon engine (Windows first)
-- **Acceptance:** `cargo test` + `cargo clippy` clean; chat through `LocalEngine`;
-  compaction through `LocalEngine`; `/api/embeddings` round-trip via AP (Windows);
-  AP engine (recall/consolidate/surface) testable in-process **without**
-  `/api/embeddings` (hash-space path, which Android will use); secrets
-  through the keyring path; Ollama removed from the whole tree (grep `ollama`).
+### Phase 2 — Daemon engine (Windows first) — **SPLIT into 2a / 2b**
+
+Phase 2 as originally written bundled "add the local engine" with "delete
+Ollama". Those are separable and are now sequenced, so there is always a
+working state to fall back to:
+
+**Phase 2a — add the engine alongside Ollama (nothing breaks).** Build §3's
+`bigtiny_rust/src/local/` (engine/manager/provider/embeddings/summarizer/
+health), the `[local]`/`[summarizer]` config, `select_backend()` (D20), the
+§3.3 fit formula, and the **new `POST /api/embeddings` route** — deliberately
+response-compatible with Ollama's (`{model,prompt}` → `{embedding:[…]}`) so
+2b's re-point stays a one-line change. Ollama is untouched; `StackStatus`
+*gains* a variant rather than losing one. Independently shippable, and the
+point at which the local engine can be compared against Ollama on real
+hardware before anything is deleted.
+
+**Phase 2b — retire *managed* Ollama.** Only after 2a is green, and in this
+order: flip adaptive-pathway's `AP_EMBED_OLLAMA_URL` to the daemon
+(`lifecycle/bigtiny_proc.rs`), confirm recall still works, *then* delete.
+
+> **Scope of "no Ollama" (decided).** It means **Kitty manages no inference
+> process** — no spawned `ollama serve`, no pull API, no `ollama://pull-progress`,
+> no HKCU env editor, no keep-alive warm/evict, no wizard install steps, no
+> Ollama settings tab. It does **not** mean forbidding Ollama as an endpoint:
+> `provider_type: 'ollama'` stays selectable in `ProviderForm`, along with its
+> `provider/sampling.rs` defaults arm and the `top_k`/`min_p` wire gate, so
+> pointing at an Ollama server you run yourself keeps working. The daemon
+> already collapses every OpenAI-compatible dialect into `openai_compat`, so
+> this costs essentially nothing.
+
+- **2a acceptance:** `cargo test` + `cargo clippy` clean; a chat turn served by
+  `LocalProvider`; compaction served by the local summarizer returning
+  schema-valid JSON; `/api/embeddings` round-trips at the configured dim; AP
+  (recall/consolidate/surface) still testable in-process **without**
+  `/api/embeddings` (the hash-space path Android uses); **Ollama paths still
+  work unchanged**.
+- **2b acceptance:** AP verified against the daemon endpoint *before* deletion;
+  `grep -ri ollama` shows only the intentionally-retained dialect surface; the
+  rewritten `stack_needs_ollama` tests pass.
 - Files: §3 + deletion of `src-tauri/ollama/`, `commands/ollama.rs`,
   `lifecycle/ollama_proc.rs`, `lifecycle/summarizer_model.rs`,
   `config/env_helper.rs`, `state.ollama`, `providers::active_ollama_target`.
+  **Rewrite rather than edit:** `lifecycle/mod.rs` (`start_stack` step 1 + the
+  three-way `stack_needs_ollama` rule — real product logic, and its 4 tests get
+  rewritten to assert the new rule, not deleted) and `lifecycle/embedding.rs`
+  (~70 of 104 lines are Ollama-pull-shaped).
 - **Existing-install migration.** `ProviderProfile.provider_type` is an untyped
   `String` (confirmed by the existing `old_shape_provider_migrates_with_defaults`
   test), so a saved `"ollama"` profile keeps deserializing fine after removal —
@@ -649,10 +713,42 @@ All under `Settings → Local models`, shared component on both OS.
 
 ## 11. Risks / notes
 
-- The llama.cpp binding + `wasmtime` + `sqlx` on aarch64 (Phase 1 gate). Which
-  binding crate (`llama-cpp-2`, the `llama-cpp-2rs` fork, …) stays a *decision*
-  made in Phase 1, not a blocker — the `LocalEngine` boundary isolates a backend
-  swap, which is exactly why D1 names no specific crate.
+- ~~Which binding crate~~ — **settled in Phase 1: `llama-cpp-2` 0.1.154.** It
+  builds, links, loads `lfm2`, and generates on Windows. The `LocalEngine`
+  boundary still isolates a future swap.
+- **Build prerequisites this doc never mentioned**, all discovered the hard way
+  in Phase 1, all required by `llama-cpp-sys-2`, and every one of them fails
+  in a way that reads like a broken crate rather than a missing tool:
+  - **CMake** — configures and builds llama.cpp from source. First Windows
+    build ~4.5 min; incremental is cheap. Budget for it in CI.
+  - **libclang**, for `bindgen`. **Nothing on a stock Windows dev box has
+    one** — not the NDK, not Visual Studio. `winget install LLVM.LLVM` is the
+    clean fix but needs elevation; set `LIBCLANG_PATH` if you source it
+    another way. Failure mode: a bindgen panic.
+  - **Ninja**, for Android only — and this one is a real trap.
+    `llama-cpp-sys-2`'s `build.rs` sets `CMAKE_TOOLCHAIN_FILE`, `ANDROID_ABI`,
+    `ANDROID_PLATFORM` and `ANDROID_STL` correctly, but **never sets a cmake
+    generator**. On Windows the `cmake` crate then defaults to Visual
+    Studio/MSBuild, which tries to build llama.cpp for **x64 MSVC** and dies
+    on `VCTargetsPath`/`MSB1009`. Set **`CMAKE_GENERATOR=Ninja`**.
+  - **NDK env var names.** `build.rs` reads `ANDROID_NDK`, `ANDROID_NDK_ROOT`,
+    `NDK_ROOT`, or `CARGO_NDK_ANDROID_NDK` — **not `ANDROID_NDK_HOME`**, which
+    is what cargo-ndk and most guides tell you to set. There's an
+    `ANDROID_HOME/ndk/*` fallback, so it often works by luck; set the explicit
+    names rather than relying on it.
+  - **Stale cmake caches are sticky.** After a failed configure, the crate
+    logs `CMake project was already configured. Skipping configuration step.`
+    and reuses the *wrong* generator forever. Fixing the env is not enough —
+    delete `target/<triple>/*/build/llama-cpp-sys-2-*/` before retrying.
+- **§11's cmake-variable framing is superseded by cargo features.** With
+  `llama-cpp-2` you do *not* set `ANDROID_STL`/`LLAMA_OPENMP` by hand:
+  - `ANDROID_STL=c++_static` → the **`android-static-stdcxx`** +
+    **`static-stdcxx`** features.
+  - `LLAMA_OPENMP=OFF` → simply **do not enable the `openmp` feature**.
+  - **`default-features = false` is mandatory**, and is the whole reason: the
+    crate's default set is `["openmp", "android-shared-stdcxx", "common"]`,
+    which is wrong for us on both counts (OpenMP on, and *shared* libc++ —
+    the opposite of the single-self-contained-cdylib rule below).
 - ~~`winreg` breaks the first Android build~~ — **resolved 2026-08-08** along
   with the rest of D23/§2.5. Worth remembering the shape of it, though: the
   failure presented as a toolchain problem and was a one-line manifest fix, and
