@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { ipc } from '@/lib/ipc';
 import { useConfigDraft } from './useConfigDraft';
-import type { EnvVar, LogEntry, MemoryStats, ProviderView } from '@/lib/types';
+import type { LogEntry, MemoryStats, ProviderView } from '@/lib/types';
 
 // How often to re-fetch the error log while its disclosure is open — there's
 // no push event for new entries (kept simple, matching this being a
@@ -15,20 +15,19 @@ const LOG_POLL_MS = 5000;
 // the log poll's simplicity.
 const MEMORY_POLL_MS = 5000;
 
-/** Advanced: Ollama env-var helper (HKCU\Environment), plus the two
-    infrequently-touched General settings relocated here in the settings IA
-    overhaul (context strategy, strict remote mode) — trimmed off General to
-    keep that page to the essentials. Per-provider sampling params
-    (temperature / context length) live in Settings → Providers. */
+/** Advanced: the infrequently-touched General settings relocated here in the
+    settings IA overhaul (context strategy, strict remote mode) — trimmed off
+    General to keep that page to the essentials. Per-provider sampling params
+    (temperature / context length) live in Settings → Providers; local models
+    live in Settings → Local Models.
+
+    The Ollama env-var helper (HKCU\Environment) that used to live here went
+    with managed Ollama: those variables configured a process Kitty no longer
+    runs. */
 export function Advanced() {
-  const [envVars, setEnvVars] = useState<EnvVar[]>([]);
-  const [msg, setMsg] = useState('');
   const { draft, update, save, saved, error: saveError } = useConfigDraft();
-  const [envOpen, setEnvOpen] = useState(true);
   const [tokenMgmtOpen, setTokenMgmtOpen] = useState(false);
   const [memoryOpen, setMemoryOpen] = useState(false);
-  const [enablingOllama, setEnablingOllama] = useState(false);
-  const [ollamaMsg, setOllamaMsg] = useState('');
   const [logOpen, setLogOpen] = useState(false);
   const [logEntries, setLogEntries] = useState<LogEntry[]>([]);
   const [logError, setLogError] = useState('');
@@ -50,13 +49,6 @@ export function Advanced() {
   // budget — the global value only applies to providers with no override set.
   const activeProvider = providers.find((p) => p.active) ?? null;
   const providerCtxLen = activeProvider?.context_length ?? null;
-
-  const load = () =>
-    void ipc
-      .readOllamaEnv()
-      .then(setEnvVars)
-      .catch((e) => setMsg(`Couldn't read Ollama env vars: ${String(e)}`));
-  useEffect(load, []);
 
   const loadLogEntries = () =>
     void ipc
@@ -115,74 +107,12 @@ export function Advanced() {
     }
   };
   // Writes straight through ipc.setConfig (not update()+save(), which would
-  // race — save() closes over the pre-update draft) so the flag flips
-  // immediately, matching how the wizard's own saveCfg behaves.
-  const applyOllamaEnabled = async (enabled: boolean) => {
-    if (!draft) return;
-    const next = { ...draft, ollama_enabled: enabled };
-    await ipc.setConfig(next);
-    update({ ollama_enabled: enabled });
-  };
-
-  const enableAndInstallOllama = async () => {
-    setEnablingOllama(true);
-    setOllamaMsg('');
-    try {
-      const det = await ipc.detectDependencies();
-      if (!det.ollama.installed) {
-        await ipc.installDependency('ollama');
-        setOllamaMsg('Installer launched — finish that window, then check back here.');
-      } else {
-        setOllamaMsg('Ollama is already installed.');
-      }
-      await applyOllamaEnabled(true);
-    } catch (e) {
-      setOllamaMsg(String(e));
-    } finally {
-      setEnablingOllama(false);
-    }
-  };
-
-  const setVar = async (name: string, value: string) => {
-    try {
-      await ipc.setOllamaEnv(name, value || null);
-      setMsg(`${name} saved (restart Ollama to apply).`);
-      load();
-    } catch (e) {
-      setMsg(`Couldn't save ${name}: ${String(e)}`);
-    }
-  };
-
   return (
     <section className="settings-section">
       <h1>Advanced</h1>
 
       {draft && (
         <>
-          <div className="field">
-            <span>Local inference</span>
-            {draft.ollama_enabled ? (
-              <>
-                <p className="muted" style={{ margin: 0 }}>
-                  On — see Settings → Ollama Models to manage installed models.
-                </p>
-                <button className="link" onClick={() => void applyOllamaEnabled(false)}>
-                  Turn off local inference
-                </button>
-              </>
-            ) : (
-              <>
-                <p className="muted" style={{ margin: 0 }}>
-                  Off — you picked an API key during setup. You can turn this on any time.
-                </p>
-                <button disabled={enablingOllama} onClick={() => void enableAndInstallOllama()}>
-                  {enablingOllama ? 'Working…' : 'Enable & install Ollama'}
-                </button>
-              </>
-            )}
-            {ollamaMsg && <small className="muted">{ollamaMsg}</small>}
-          </div>
-
           <label className="check">
             <input
               type="checkbox"
@@ -446,49 +376,6 @@ export function Advanced() {
             {saveError && <span className="error">Couldn't save: {saveError}</span>}
           </div>
         </>
-      )}
-
-      <button type="button" className="disclosure-toggle" onClick={() => setEnvOpen((o) => !o)}>
-        {envOpen ? '▾' : '▸'} <strong>Ollama environment variables</strong>
-      </button>
-      {/* Explicit conditional render, not native <details> collapse — this
-          WebView2/Chromium build doesn't actually hide non-open <details>
-          content, so visibility can't be left to CSS (see Providers.tsx's
-          equivalent comment for the full finding). */}
-      {envOpen && (
-        <div>
-          <p className="muted">
-            Stored in your user environment (HKCU). A running Ollama must be restarted to pick up
-            changes.
-          </p>
-          {envVars.map((v) => (
-            <label className="field" key={v.name}>
-              <span>{v.name}</span>
-              <div className="row">
-                <input
-                  defaultValue={v.value ?? ''}
-                  placeholder="(unset)"
-                  onBlur={(e) => void setVar(v.name, e.target.value)}
-                />
-              </div>
-            </label>
-          ))}
-          <div className="row">
-            <button
-              onClick={async () => {
-                try {
-                  await ipc.restartOllama();
-                  setMsg('Ollama restarted.');
-                } catch (e) {
-                  setMsg(String(e));
-                }
-              }}
-            >
-              Restart Ollama now
-            </button>
-            {msg && <span className="muted">{msg}</span>}
-          </div>
-        </div>
       )}
 
       <p className="muted">

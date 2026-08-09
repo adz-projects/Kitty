@@ -92,7 +92,12 @@ export interface MemoryStats {
 
 // --- Providers (Phase 5) ---
 export type NetworkTier = 'local' | 'personal' | 'remote';
-export type ProviderType = 'ollama' | 'openrouter' | 'anthropic' | 'openai' | 'custom_openai';
+/** `local` is the in-process engine (docs/ANDROID.md §3) — no endpoint, no
+    key. `ollama` means a server the *user* runs; Kitty stopped managing one
+    in Phase 2b but kept the dialect, since the daemon gives it a dedicated
+    sampling profile and `top_k`/`min_p` wire support. */
+export type ProviderType =
+  'local' | 'ollama' | 'openrouter' | 'anthropic' | 'openai' | 'custom_openai';
 
 export interface ProviderProfile {
   id: string;
@@ -196,11 +201,22 @@ export interface ScheduledTask {
   enabled: boolean;
 }
 
-export interface OllamaModel {
-  name: string;
-  size: number;
-  modified_at: string;
-  details?: { parameter_size?: string; quantization_level?: string };
+/** A GGUF on disk. Mirrors `models::InstalledModel` + `commands::LocalModel`. */
+export interface LocalModel {
+  id: string;
+  file: string;
+  path: string;
+  size_bytes: number;
+  info?: GgufInfo | null;
+}
+
+/** Partial GGUF header — every field optional because the reader stops at
+    what the model card needs and reports nothing it couldn't parse. */
+export interface GgufInfo {
+  architecture?: string | null;
+  context_length?: number | null;
+  embedding_length?: number | null;
+  quantization?: string | null;
 }
 
 /** Mirrors `config::recipes::ParameterInputType`. */
@@ -306,19 +322,15 @@ export interface LogEntry {
   message: string;
 }
 
-export interface PullProgress {
-  pull_id: string;
+/** One `models://progress` event. Keyed by `download_id` so several
+    concurrent downloads stay distinguishable. */
+export interface DownloadProgress {
+  download_id: string;
   model: string;
-  status: string;
+  received: number;
   total?: number;
-  completed?: number;
   done: boolean;
   error?: string;
-}
-
-export interface EnvVar {
-  name: string;
-  value: string | null;
 }
 
 /** A BigTiny MCP server registration — daemon-global, live over REST (no
@@ -372,19 +384,7 @@ export interface SettingsTarget {
   highlight: string | null;
 }
 
-// --- Wizard (Phase 7) ---
-export interface DepStatus {
-  installed: boolean;
-  version: string | null;
-  path: string | null;
-  latest_version: string | null;
-  is_outdated: boolean | null;
-}
-
-export interface Detection {
-  ollama: DepStatus;
-}
-
+// --- Wizard ---
 /** Result of `validate_setup` — powers the wizard's Done-step summary/soft
     Finish gate and Setup & Repair's lighter re-check. */
 export interface SetupValidation {
@@ -395,7 +395,7 @@ export interface SetupValidation {
 
 // Serde `rename_all = "snake_case"` on the Rust enum.
 export type StackStatus =
-  'starting' | 'ok' | 'ollama_down' | 'backend_down' | 'no_model' | 'provider_unreachable';
+  'starting' | 'ok' | 'backend_down' | 'local_model_missing' | 'provider_unreachable';
 
 export interface StackStatusPayload {
   status: StackStatus;

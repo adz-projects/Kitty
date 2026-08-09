@@ -2,14 +2,14 @@ import { useEffect, useRef, useState } from 'react';
 import { ipc, onWizardNavigate } from '@/lib/ipc';
 import type { Config } from '@/lib/types';
 import { PathFork, type WizardPath } from './PathFork';
-import { DetectStep } from './DetectStep';
 import { ApiKeyStep } from './ApiKeyStep';
 import { ConfigureStep } from './ConfigureStep';
-import { FirstModelStep } from './FirstModelStep';
-import { EmbeddingModelStep } from './EmbeddingModelStep';
+import { ModelDownloadStep } from './ModelDownloadStep';
 import { DoneStep } from './DoneStep';
+import { DEFAULT_URL } from '@/lib/provider_defaults';
+import { defaultFor } from '@/lib/curated_models';
 
-type StepId = 'path' | 'detect' | 'apikey' | 'configure' | 'model' | 'embedding' | 'done';
+type StepId = 'path' | 'apikey' | 'configure' | 'model' | 'embedding' | 'done';
 
 export function stepsForPath(
   path: WizardPath | null,
@@ -17,8 +17,9 @@ export function stepsForPath(
 ): { id: StepId; label: string }[] {
   const start = { id: 'path' as const, label: 'Get started' };
   const done = { id: 'done' as const, label: 'Done' };
-  // Shown on BOTH paths when adaptive-pathway is enabled — its embeddings are
-  // local-Ollama-only regardless of chat provider (see EmbeddingModelStep).
+  // Shown on BOTH paths when adaptive-pathway is enabled — its embeddings run
+  // on the in-process engine regardless of which provider serves chat, so an
+  // API-key user needs this model too.
   const embedding = adaptivePathwayEnabled
     ? [{ id: 'embedding' as const, label: 'Learning model' }]
     : [];
@@ -33,9 +34,8 @@ export function stepsForPath(
   }
   return [
     start,
-    { id: 'detect', label: 'Detect' },
-    { id: 'configure', label: 'Configure' },
     { id: 'model', label: 'First model' },
+    { id: 'configure', label: 'Configure' },
     ...embedding,
     done,
   ];
@@ -76,7 +76,7 @@ export function App() {
           // jump straight past the "welcome" fork.
           const active = c.providers.find((p) => p.id === c.active_provider_id);
           const inferred: WizardPath =
-            active && active.provider_type !== 'ollama' ? 'api-key' : 'local';
+            active && active.provider_type !== 'local' ? 'api-key' : 'local';
           setPath(inferred);
           setStepIndex(1);
           setCompletedThrough(1);
@@ -86,6 +86,38 @@ export function App() {
     const un = onWizardNavigate((m) => setMode(m === 'repair' ? 'repair' : 'setup'));
     return () => void un.then((fn) => fn());
   }, []);
+
+  /** Create (once) and activate a provider profile bound to the in-process
+      engine, so the model just downloaded is actually the one chat uses.
+      The daemon registers this engine under a fixed id with no DB row of its
+      own — Kitty's profile exists purely so the rest of the app's
+      provider/model plumbing has something to point at. */
+  const adoptLocalModel = async () => {
+    const model = defaultFor('chat');
+    const base = cfgRef.current;
+    if (!model || !base) return;
+    const existing = base.providers.find((p) => p.provider_type === 'local');
+    try {
+      const saved = await ipc.upsertProvider(
+        {
+          ...(existing ?? {
+            id: '',
+            name: 'On this device',
+            provider_type: 'local',
+            base_url: DEFAULT_URL.local,
+            is_trusted: true,
+            strip_reasoning: false,
+            created_at: '',
+          }),
+          models: [model.file.replace(/\.gguf$/i, '')],
+        } as Parameters<typeof ipc.upsertProvider>[0],
+        null
+      );
+      await ipc.activateProvider(saved.id);
+    } catch (e) {
+      setSaveError(String(e));
+    }
+  };
 
   const saveCfg = (patch: Partial<Config>) => {
     const base = cfgRef.current;
@@ -152,39 +184,44 @@ export function App() {
         <PathFork
           mode={mode}
           selected={path}
-          onSelect={async (p) => {
+          onSelect={(p) => {
             if (p !== path) setCompletedThrough(0);
             setPath(p);
-            // Ollama is still required on the api-key path when
-            // adaptive-pathway is enabled (its embeddings are
-            // local-Ollama-only regardless of chat provider) — only force it
-            // off when AP won't need it either, so the toggle in Settings →
-            // Advanced doesn't read as "off" while Ollama is actually running.
-            try {
-              await saveCfg({ ollama_enabled: p === 'local' || cfg.adaptive_pathway_enabled });
-            } catch {
-              return; // saveError banner already shown; don't advance on a failed save
-            }
             nextAndMark();
           }}
         />
       )}
-      {current === 'detect' && <DetectStep onBack={back} onNext={nextAndMark} />}
       {current === 'apikey' && <ApiKeyStep onBack={back} onNext={nextAndMark} />}
       {current === 'configure' && (
         <ConfigureStep
           cfg={cfg}
           saveCfg={saveCfg}
-          showOllamaEndpoint={path === 'local'}
+          showOllamaEndpoint={false}
           onBack={back}
           onNext={nextAndMark}
         />
       )}
       {current === 'model' && (
-        <FirstModelStep onBack={back} onNext={nextAndMark} onSkip={nextAndMark} />
+        <ModelDownloadStep
+          role="chat"
+          title="Download a model"
+          blurb="Kitty runs this model itself — nothing else to install, and it works offline."
+          skipNote="You can skip and add an API key later, but chat won't work until one or the other is set up."
+          onBack={back}
+          onNext={() => void adoptLocalModel().then(nextAndMark)}
+          onSkip={nextAndMark}
+        />
       )}
       {current === 'embedding' && (
-        <EmbeddingModelStep cfg={cfg} onBack={back} onNext={nextAndMark} onSkip={nextAndMark} />
+        <ModelDownloadStep
+          role="embedding"
+          title="Memory model"
+          blurb="Lets Kitty remember how you work across sessions with real semantic recall."
+          skipNote="Optional — without it, memory falls back to keyword matching."
+          onBack={back}
+          onNext={nextAndMark}
+          onSkip={nextAndMark}
+        />
       )}
       {current === 'done' && <DoneStep path={path} onBack={back} />}
     </div>

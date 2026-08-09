@@ -30,9 +30,6 @@ export function SetupRepair() {
         <button onClick={() => void act('Restarting Kitty engine', () => ipc.restartBackend())}>
           Restart Kitty engine
         </button>
-        <button onClick={() => void act('Restarting Ollama', () => ipc.restartOllama())}>
-          Restart Ollama
-        </button>
       </div>
       {msg && <p className="muted">{msg}</p>}
       <div className="row">

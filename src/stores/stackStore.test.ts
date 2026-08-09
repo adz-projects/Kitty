@@ -61,9 +61,9 @@ describe('stackStore.init', () => {
       status: string;
       detail: string | null;
     }) => void;
-    handler({ status: 'ollama_down', detail: 'not running' });
+    handler({ status: 'local_model_missing', detail: 'not running' });
 
-    expect(useStackStore.getState().status).toBe('ollama_down');
+    expect(useStackStore.getState().status).toBe('local_model_missing');
     expect(useStackStore.getState().detail).toBe('not running');
   });
 

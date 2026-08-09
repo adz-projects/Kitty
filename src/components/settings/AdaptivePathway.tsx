@@ -1,6 +1,11 @@
 import { useEffect, useState } from 'react';
-import { ipc, onAdaptivePathwayEmbeddingStatus, onPullProgress } from '@/lib/ipc';
-import type { AdaptivePathwayMcpStatus, EmbeddingModelStatus, PullProgress } from '@/lib/types';
+import { ipc, onAdaptivePathwayEmbeddingStatus, onModelProgress } from '@/lib/ipc';
+import type { AdaptivePathwayMcpStatus, DownloadProgress, EmbeddingModelStatus } from '@/lib/types';
+import { defaultFor } from '@/lib/curated_models';
+
+/** Fixed id so the progress subscription can be registered before the
+    download starts (unlike a user-initiated one, which gets a fresh id). */
+const EMBEDDING_DOWNLOAD_ID = 'adaptive-pathway-embedding-model';
 import { BeliefBrowser } from './BeliefBrowser';
 
 /** Separate from the enable checkbox: the pathway engine can be enabled and
@@ -27,7 +32,7 @@ export function AdaptivePathway() {
   const [embeddingModel, setEmbeddingModel] = useState('');
   const [installBusy, setInstallBusy] = useState(false);
   const [installError, setInstallError] = useState('');
-  const [installProgress, setInstallProgress] = useState<PullProgress | null>(null);
+  const [installProgress, setInstallProgress] = useState<DownloadProgress | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [mcpStatus, setMcpStatus] = useState<AdaptivePathwayMcpStatus | null>(null);
@@ -53,37 +58,31 @@ export function AdaptivePathway() {
     void load();
     const unEmbedding = onAdaptivePathwayEmbeddingStatus((p) => setEmbeddingStatus(p.status));
     return () => void unEmbedding.then((fn) => fn());
+    // Mount-only by design: `load` is a fresh closure every render, so
+    // depending on it would re-run this on each one — re-reading config and
+    // re-registering the listener. Nothing it captures changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
-    const un = onPullProgress((p) => {
-      if (p.model !== embeddingModel) return;
+    const un = onModelProgress((p) => {
+      if (p.download_id !== EMBEDDING_DOWNLOAD_ID) return;
       setInstallProgress(p);
     });
     return () => void un.then((fn) => fn());
-  }, [embeddingModel]);
+  }, []);
 
-  /** Settings' own "set up the learning model" action: checks Ollama,
-      installs it if missing, ensures it's running, then pulls the pinned
-      tag — same building blocks as `EmbeddingModelStep` in the wizard, just
-      reachable after setup too (e.g. the user skipped it, or deleted the
-      model later with `ollama rm`). */
+  /** Settings' own "set up the learning model" action — the same download the
+      wizard offers, reachable after setup too (the user skipped it, or
+      deleted the file later). A fixed download id lets the subscription above
+      be registered before the download starts. */
   const installEmbeddingModel = async () => {
     setInstallBusy(true);
     setInstallError('');
     try {
-      const det = await ipc.detectDependencies();
-      if (!det.ollama.installed) {
-        await ipc.installDependency('ollama');
-        const deadline = Date.now() + 120_000;
-        while (Date.now() < deadline) {
-          await new Promise((r) => setTimeout(r, 2_000));
-          const fresh = await ipc.detectDependencies();
-          if (fresh.ollama.installed) break;
-        }
-      }
-      await ipc.ensureOllamaRunning();
-      await ipc.ollamaPullModel(embeddingModel);
+      const model = defaultFor('embedding');
+      if (!model) throw new Error('no embedding model is configured');
+      await ipc.downloadModel(model.repo, model.file, undefined, EMBEDDING_DOWNLOAD_ID);
     } catch (e) {
       setInstallError(String(e));
     } finally {
@@ -168,7 +167,11 @@ export function AdaptivePathway() {
               <div className="pull-head">
                 <span>{installProgress.model}</span>
                 <span className="muted">
-                  {installProgress.error ? `error: ${installProgress.error}` : installProgress.status}
+                  {installProgress.error
+                    ? `error: ${installProgress.error}`
+                    : installProgress.done
+                      ? 'done'
+                      : 'downloading'}
                 </span>
               </div>
               <div className="progress">
@@ -177,15 +180,17 @@ export function AdaptivePathway() {
                   style={{
                     width: installProgress.done
                       ? '100%'
-                      : installProgress.total && installProgress.completed
-                        ? `${Math.round((installProgress.completed / installProgress.total) * 100)}%`
+                      : installProgress.total
+                        ? `${Math.round((installProgress.received / installProgress.total) * 100)}%`
                         : '30%',
                   }}
                 />
               </div>
             </div>
           )}
-          {installError && <p className="muted">Couldn&apos;t set up automatically: {installError}</p>}
+          {installError && (
+            <p className="muted">Couldn&apos;t set up automatically: {installError}</p>
+          )}
         </div>
       )}
       {enabled && embeddingStatus !== 'unknown' && embeddingStatus !== 'missing' && (

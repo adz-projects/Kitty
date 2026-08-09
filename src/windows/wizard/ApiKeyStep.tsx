@@ -9,7 +9,8 @@ const TYPE_LABEL: Record<ProviderType, string> = {
   openai: 'OpenAI (ChatGPT)',
   openrouter: 'OpenRouter',
   custom_openai: 'Custom (OpenAI-compatible)',
-  ollama: 'Ollama',
+  ollama: 'Ollama (self-hosted)',
+  local: 'On this device',
 };
 
 // First-party types get the trusted (globe) badge immediately — a newcomer

@@ -27,6 +27,12 @@ pub(crate) fn bigtiny_provider_target(profile: &ProviderProfile) -> (String, Str
 /// Ensure Kitty's active provider profile exists (and is current) in
 /// BigTiny's registry; returns the BigTiny provider id, or `None` when no
 /// profile is active. Matched by profile name — BigTiny assigns its own ids.
+/// Provider id the daemon registers its in-process engine under. Fixed, and
+/// deliberately not a DB row: `providers.provider_type` is CHECK-constrained
+/// to `('openai_compat','anthropic')`, and the engine is neither. Sessions pin
+/// it by sending this exact string as `provider`.
+pub const LOCAL_PROVIDER_ID: &str = "local";
+
 pub async fn sync_active_provider(app: &AppHandle) -> Result<Option<String>, String> {
     let profile = {
         let state = app.state::<AppState>();
@@ -38,6 +44,16 @@ pub async fn sync_active_provider(app: &AppHandle) -> Result<Option<String>, Str
     let Some(profile) = profile else {
         return Ok(None);
     };
+
+    // The in-process engine needs no registration: the daemon registered it
+    // at startup from `[local]`, under a fixed id, with no row to create or
+    // key to store. Everything below is about the HTTP registry, so short-
+    // circuit before any of it.
+    if profile.provider_type == "local" {
+        let client = ensure_client(app)?;
+        demote_others(&client, LOCAL_PROVIDER_ID).await;
+        return Ok(Some(LOCAL_PROVIDER_ID.to_string()));
+    }
 
     let (provider_type, base_url) = bigtiny_provider_target(&profile);
     let api_key = get_secret_async(&profile.id).await;
@@ -134,26 +150,36 @@ pub async fn sync_active_provider(app: &AppHandle) -> Result<Option<String>, Str
         }
     };
 
-    // Every profile Kitty has ever activated stays registered in BigTiny (a
-    // feature — instant switching), but the router picks by priority, so the
-    // active one must be unambiguous: demote everything else.
-    if let Some(rows) = existing.get("providers").and_then(|p| p.as_array()) {
-        for row in rows {
-            let Some(other_id) = row.get("id").and_then(|i| i.as_str()) else {
-                continue;
-            };
-            let priority = row.get("fallback_priority").and_then(|p| p.as_i64());
-            if other_id != id && priority != Some(100) {
-                let _ = client
-                    .patch_json(
-                        &format!("/api/providers/{other_id}"),
-                        &json!({ "fallback_priority": 100 }),
-                    )
-                    .await;
-            }
+    demote_others(&client, &id).await;
+    Ok(Some(id))
+}
+
+/// Every profile Kitty has ever activated stays registered in BigTiny (a
+/// feature — instant switching), but the router picks by priority, so the
+/// active one must be unambiguous: demote everything else.
+///
+/// Best-effort per row: one unreachable provider shouldn't abort the rest.
+async fn demote_others(client: &super::client::BigTinyClient, active_id: &str) {
+    let Ok(existing) = client.get_json("/api/providers").await else {
+        return;
+    };
+    let Some(rows) = existing.get("providers").and_then(|p| p.as_array()) else {
+        return;
+    };
+    for row in rows {
+        let Some(other_id) = row.get("id").and_then(|i| i.as_str()) else {
+            continue;
+        };
+        let priority = row.get("fallback_priority").and_then(|p| p.as_i64());
+        if other_id != active_id && priority != Some(100) {
+            let _ = client
+                .patch_json(
+                    &format!("/api/providers/{other_id}"),
+                    &json!({ "fallback_priority": 100 }),
+                )
+                .await;
         }
     }
-    Ok(Some(id))
 }
 
 /// Per-session provider override: PATCH a single session's metadata with the

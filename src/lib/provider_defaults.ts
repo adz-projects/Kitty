@@ -4,6 +4,8 @@ import type { ProviderType } from './types';
     "Add Provider" form and the wizard's API-key step, so both read the same
     source of truth. */
 export const DEFAULT_URL: Record<ProviderType, string> = {
+  // The in-process engine has no URL; the field is hidden for it.
+  local: '',
   ollama: 'http://localhost:11434',
   openrouter: 'https://openrouter.ai/api/v1',
   anthropic: 'https://api.anthropic.com',

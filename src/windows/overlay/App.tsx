@@ -11,7 +11,7 @@ import { DoubleChevronIcon } from '@/components/icons/DoubleChevronIcon';
 import { SettingsGearIcon } from '@/components/icons/SettingsGearIcon';
 import type { StackStatus } from '@/lib/types';
 
-const DEGRADED: StackStatus[] = ['ollama_down', 'backend_down', 'no_model', 'provider_unreachable'];
+const DEGRADED: StackStatus[] = ['backend_down', 'local_model_missing', 'provider_unreachable'];
 
 export function App() {
   const status = useStackStore((s) => s.status);

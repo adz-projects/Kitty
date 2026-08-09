@@ -62,16 +62,17 @@ export function detentsFor(suggested: number | null): number[] {
 }
 
 /** Best-effort context-window suggestion for the model currently selected on
-    `profile`, per provider type (Round-6 Feature 1): Ollama/OpenRouter query
-    live; Anthropic/custom_openai use a small hardcoded table. `null` when
-    nothing is known — the field stays fully manual in that case. */
+    `profile`, per provider type (Round-6 Feature 1): OpenRouter queries live;
+    Anthropic/custom_openai use a small hardcoded table. `null` when nothing is
+    known — the field stays fully manual in that case, which is now also what
+    an Ollama profile gets: the live lookup went with managed Ollama, and
+    probing an arbitrary self-hosted server from here isn't worth a round trip
+    the user can shortcut by typing the number. */
 export async function suggestContextLength(profile: ProviderProfile): Promise<number | null> {
   const model = profile.models[0];
   if (!model) return null;
   try {
     switch (profile.provider_type) {
-      case 'ollama':
-        return await ipc.ollamaShowContextLength(model);
       case 'openrouter':
         return await ipc.openrouterContextLength(model);
       case 'anthropic':

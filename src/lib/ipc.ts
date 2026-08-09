@@ -15,8 +15,6 @@ import type {
   CompactionEvent,
   CompleteEvent,
   Config,
-  Detection,
-  EnvVar,
   FileAttachment,
   FileEntry,
   FolderData,
@@ -25,12 +23,12 @@ import type {
   McpServerPatch,
   McpServerSpec,
   MemoryStats,
-  OllamaModel,
+  LocalModel,
   OpenRouterCredits,
   PathInfo,
   ProviderProfile,
   ProviderView,
-  PullProgress,
+  DownloadProgress,
   Recipe,
   RecipeExtension,
   RecipeImportResult,
@@ -244,22 +242,21 @@ export const ipc = {
   setSessionProvider: (sessionId: string, providerId: string, model?: string | null) =>
     invoke<void>('set_session_provider', { sessionId, providerId, model: model ?? null }),
   testActiveProviderConnection: () => invoke<void>('test_active_provider_connection'),
-  // Ollama
-  ollamaListModels: () => invoke<OllamaModel[]>('ollama_list_models'),
-  ollamaDeleteModel: (model: string) => invoke<void>('ollama_delete_model', { model }),
-  ollamaPullModel: (model: string) => invoke<string>('ollama_pull_model', { model }),
-  ollamaShowContextLength: (model: string) =>
-    invoke<number | null>('ollama_show_context_length', { model }),
+  // Local models (GGUFs on disk)
+  listLocalModels: () => invoke<LocalModel[]>('list_local_models'),
+  getModelsDiskFree: () => invoke<number | null>('get_models_disk_free'),
+  deleteLocalModel: (id: string) => invoke<void>('delete_local_model', { id }),
+  downloadModel: (repo: string, file: string, rev?: string, downloadId?: string) =>
+    invoke<string>('download_model', {
+      repo,
+      file,
+      rev: rev ?? null,
+      downloadId: downloadId ?? null,
+    }),
   openrouterContextLength: (model: string) =>
     invoke<number | null>('openrouter_context_length', { model }),
   openrouterCredits: (providerId: string) =>
     invoke<OpenRouterCredits>('openrouter_credits', { providerId }),
-  // Ollama env helper
-  readOllamaEnv: () => invoke<EnvVar[]>('read_ollama_env'),
-  setOllamaEnv: (name: string, value: string | null) =>
-    invoke<void>('set_ollama_env', { name, value }),
-  restartOllama: () => invoke<void>('restart_ollama'),
-  ensureOllamaRunning: () => invoke<void>('ensure_ollama_running'),
   // MCP servers — daemon-global, live over REST (BigTiny; no restart needed
   // to add/edit/delete/toggle).
   listMcpServers: () => invoke<McpServer[]>('list_mcp_servers'),
@@ -315,8 +312,6 @@ export const ipc = {
   openThemesFolder: () => invoke<void>('open_themes_folder'),
   readImageDataUrl: (path: string) => invoke<string>('read_image_data_url', { path }),
   // Wizard / setup
-  detectDependencies: () => invoke<Detection>('detect_dependencies'),
-  installDependency: (which: 'ollama') => invoke<void>('install_dependency', { which }),
   validateSetup: () => invoke<SetupValidation>('validate_setup'),
   openWizard: (mode?: 'setup' | 'repair') => invoke<void>('open_wizard', { mode: mode ?? 'setup' }),
   getWizardMode: () => invoke<string | null>('get_wizard_mode'),
@@ -330,7 +325,8 @@ export const ipc = {
   setAdaptivePathwayEnabled: (enabled: boolean) =>
     invoke<void>('set_adaptive_pathway_enabled', { enabled }),
   /** Every belief currently held (Settings belief browser). */
-  getPathwayBeliefs: () => invoke<{ beliefs: PathwayBelief[]; count: number }>('get_pathway_beliefs'),
+  getPathwayBeliefs: () =>
+    invoke<{ beliefs: PathwayBelief[]; count: number }>('get_pathway_beliefs'),
   /** Belief counts by layer, plus embedding-migration progress. */
   getPathwayStats: () => invoke<PathwayStats>('get_pathway_stats'),
   /** Belief browser's delete action — suppresses + tombstones, not a bare row delete. */
@@ -448,8 +444,10 @@ export function onFileDrop(cb: (paths: string[]) => void): Promise<UnlistenFn> {
   });
 }
 
-export const onPullProgress = (cb: (e: PullProgress) => void) =>
-  listen<PullProgress>('ollama://pull-progress', (e) => cb(e.payload));
+export const onModelProgress = (cb: (e: DownloadProgress) => void) =>
+  listen<DownloadProgress>('models://progress', (e) => cb(e.payload));
+
+export const onModelsChanged = (cb: () => void) => listen('models://changed', () => cb());
 
 export const onSettingsNavigate = (cb: (t: SettingsTarget) => void) =>
   listen<SettingsTarget>('settings://navigate', (e) => cb(e.payload));

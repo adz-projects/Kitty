@@ -1,7 +1,6 @@
 import { useEffect, useState } from 'react';
-import { ipc } from '@/lib/ipc';
 import { Modal } from '@/components/shared/Modal';
-import type { OllamaModel, ProviderProfile, ProviderType } from '@/lib/types';
+import type { ProviderProfile, ProviderType } from '@/lib/types';
 import { TrustBadge } from '@/lib/provider_trust';
 import { LockIcon } from '@/components/icons/LockIcon';
 import { GlobeIcon } from '@/components/icons/GlobeIcon';
@@ -19,7 +18,6 @@ import {
 export function ProviderForm({
   profile,
   secret,
-  ollamaEnabled,
   onChange,
   onSecret,
   onCancel,
@@ -27,31 +25,17 @@ export function ProviderForm({
 }: {
   profile: ProviderProfile;
   secret: string;
-  ollamaEnabled: boolean;
   onChange: (p: ProviderProfile) => void;
   onSecret: (s: string) => void;
   onCancel: () => void;
   onSave: () => void;
 }) {
   const set = (patch: Partial<ProviderProfile>) => onChange({ ...profile, ...patch });
-  const needsKey = profile.provider_type !== 'ollama';
   const local = isLocal(profile.base_url);
-  const ollamaLocal = profile.provider_type === 'ollama' && local;
-
-  // Local-Ollama: offer a dropdown of installed models instead of free text (item 19).
-  const [installed, setInstalled] = useState<OllamaModel[]>([]);
-  useEffect(() => {
-    if (!ollamaLocal) return;
-    let live = true;
-    // Best-effort: a failure just leaves this dropdown empty.
-    void ipc
-      .ollamaListModels()
-      .then((m) => live && setInstalled(m))
-      .catch(() => {});
-    return () => {
-      live = false;
-    };
-  }, [ollamaLocal]);
+  // Neither the in-process engine nor an Ollama server takes an API key —
+  // for Ollama that's a property of the server, and stays true now that the
+  // user runs it rather than Kitty.
+  const needsKey = profile.provider_type !== 'ollama' && profile.provider_type !== 'local';
 
   // Context-length auto-suggest (Round-6 Feature 1) — re-resolves whenever the
   // provider type or selected model changes; never applied automatically, only
@@ -91,7 +75,11 @@ export function ProviderForm({
             set({ provider_type: pt, base_url: DEFAULT_URL[pt] });
           }}
         >
-          {ollamaEnabled && <option value="ollama">Ollama (local)</option>}
+          <option value="local">On this device</option>
+          {/* Kitty no longer runs Ollama, but pointing at one you run
+              yourself is fully supported — the daemon keeps a dedicated
+              sampling profile and top_k/min_p wire support for it. */}
+          <option value="ollama">Ollama (self-hosted)</option>
           <option value="openrouter">OpenRouter</option>
           <option value="anthropic">Anthropic</option>
           <option value="openai">OpenAI</option>
@@ -136,40 +124,20 @@ export function ProviderForm({
         )}
       </label>
 
-      {ollamaLocal ? (
-        <label className="field">
-          <span>Model</span>
-          <select
-            value={profile.models[0] ?? ''}
-            onChange={(e) => set({ models: e.target.value ? [e.target.value] : [] })}
-          >
-            <option value="">(use provider default)</option>
-            {installed.map((m) => (
-              <option key={m.name} value={m.name}>
-                {m.name}
-              </option>
-            ))}
-          </select>
-          {installed.length === 0 && (
-            <small className="muted">No installed models found — pull one in Ollama Models.</small>
-          )}
-        </label>
-      ) : (
-        <label className="field">
-          <span>Models (comma-separated)</span>
-          <input
-            value={profile.models.join(', ')}
-            onChange={(e) =>
-              set({
-                models: e.target.value
-                  .split(',')
-                  .map((m) => m.trim())
-                  .filter(Boolean),
-              })
-            }
-          />
-        </label>
-      )}
+      <label className="field">
+        <span>Models (comma-separated)</span>
+        <input
+          value={profile.models.join(', ')}
+          onChange={(e) =>
+            set({
+              models: e.target.value
+                .split(',')
+                .map((m) => m.trim())
+                .filter(Boolean),
+            })
+          }
+        />
+      </label>
 
       {needsKey && (
         <label className="field">

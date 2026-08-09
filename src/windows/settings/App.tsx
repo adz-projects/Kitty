@@ -2,7 +2,7 @@ import { Fragment, useEffect, useState } from 'react';
 import { ipc, onSettingsNavigate } from '@/lib/ipc';
 import { General } from '@/components/settings/General';
 import { Providers } from '@/components/settings/Providers';
-import { OllamaModels } from '@/components/settings/OllamaModels';
+import { LocalModels } from '@/components/settings/LocalModels';
 import { McpServers } from '@/components/settings/McpServers';
 import { NotificationsSection } from '@/components/settings/NotificationsSection';
 import { Appearance } from '@/components/settings/Appearance';
@@ -17,7 +17,7 @@ import { Recipes } from '@/components/settings/Recipes';
 const SECTION_LABELS: Record<string, string> = {
   general: 'General',
   providers: 'Providers',
-  ollama: 'Ollama Models',
+  local_models: 'Local Models',
   mcp_servers: 'MCP Servers',
   scheduled_tasks: 'Scheduled Tasks',
   recipes: 'Recipes',
@@ -32,24 +32,14 @@ const SECTION_LABELS: Record<string, string> = {
 
 /** Three groups, in nav order (settings IA overhaul). Graph Health / Domain
     Profiles only appear once Adaptive Pathway is actually enabled — no point
-    showing tabs for a feature that's off. "Ollama Models" only appears when
-    local inference is opted into (wizard redesign — a user who picked the
-    API-key path has nothing to manage there; they can turn it back on from
-    Advanced). */
-function buildGroups(
-  apEnabled: boolean,
-  ollamaEnabled: boolean
-): { label: string; sections: string[] }[] {
+    showing tabs for a feature that's off. Local Models is always present:
+    even an API-key user needs an embedding model for the memory engine, and
+    it's where a "no model downloaded" status deep-links to. */
+function buildGroups(apEnabled: boolean): { label: string; sections: string[] }[] {
   return [
     {
       label: 'Essentials',
-      sections: [
-        'general',
-        'providers',
-        ...(ollamaEnabled ? ['ollama'] : []),
-        'appearance',
-        'notifications',
-      ],
+      sections: ['general', 'providers', 'local_models', 'appearance', 'notifications'],
     },
     { label: 'Automation & extensions', sections: ['mcp_servers', 'scheduled_tasks', 'recipes'] },
     {
@@ -68,7 +58,6 @@ export function App() {
   const [section, setSection] = useState<string>('general');
   const [highlight, setHighlight] = useState<string | null>(null);
   const [apEnabled, setApEnabled] = useState(false);
-  const [ollamaEnabled, setOllamaEnabled] = useState(true);
   const [recoveryNotice, setRecoveryNotice] = useState<string | null>(null);
 
   useEffect(() => {
@@ -101,11 +90,10 @@ export function App() {
   useEffect(() => {
     void ipc.getConfig().then((c) => {
       setApEnabled(c.adaptive_pathway_enabled);
-      setOllamaEnabled(c.ollama_enabled);
     });
   }, [section]);
 
-  const groups = buildGroups(apEnabled, ollamaEnabled);
+  const groups = buildGroups(apEnabled);
 
   return (
     <div className="settings-window">
@@ -139,7 +127,7 @@ export function App() {
       <main className="settings-main">
         {section === 'general' && <General />}
         {section === 'providers' && <Providers highlight={highlight} />}
-        {section === 'ollama' && ollamaEnabled && <OllamaModels />}
+        {section === 'local_models' && <LocalModels />}
         {section === 'mcp_servers' && <McpServers />}
         {section === 'scheduled_tasks' && <ScheduledTasks />}
         {section === 'recipes' && <Recipes />}

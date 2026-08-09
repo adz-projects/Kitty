@@ -15,20 +15,15 @@ interface Copy {
 }
 
 const COPY: Partial<Record<StackStatus, Copy>> = {
-  ollama_down: {
-    title: 'Ollama isn’t responding',
-    body: 'The local model server is down. Open settings to start or configure Ollama.',
-    severity: 'bad',
-  },
   backend_down: {
     title: 'Kitty’s engine isn’t running',
     body: 'The chat engine stopped. Restart it, or open settings to repair the setup.',
     severity: 'bad',
     canRestartBackend: true,
   },
-  no_model: {
-    title: 'No model installed',
-    body: 'Ollama has no models yet. Open settings to pull one before you start chatting.',
+  local_model_missing: {
+    title: 'No model downloaded',
+    body: 'Kitty needs a local model to run. Open settings to download one — it takes a minute.',
     severity: 'bad',
   },
   provider_unreachable: {
@@ -50,8 +45,8 @@ export function StackStatusView({ status }: { status: StackStatus }) {
   const section =
     status === 'provider_unreachable'
       ? 'providers'
-      : status === 'ollama_down' || status === 'no_model'
-        ? 'ollama'
+      : status === 'local_model_missing'
+        ? 'local_models'
         : 'setup';
 
   return (

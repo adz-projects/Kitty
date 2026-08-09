@@ -11,7 +11,7 @@ import { NewChatIcon } from '@/components/icons/NewChatIcon';
 import { SettingsGearIcon } from '@/components/icons/SettingsGearIcon';
 import type { StackStatus } from '@/lib/types';
 
-const DEGRADED: StackStatus[] = ['ollama_down', 'backend_down', 'no_model', 'provider_unreachable'];
+const DEGRADED: StackStatus[] = ['backend_down', 'local_model_missing', 'provider_unreachable'];
 
 /** Full window: history sidebar + shared chat surface + artifacts pane. On open
     it adopts the session handed over from the overlay (Expand). */

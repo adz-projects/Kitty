@@ -24,7 +24,6 @@ export function Providers({ highlight }: { highlight: string | null }) {
   // Whether local inference is opted into at all (wizard redesign) — hides
   // the Ollama option from the type picker when the user picked the
   // API-key path and hasn't re-enabled it from Advanced.
-  const [ollamaEnabled, setOllamaEnabled] = useState(true);
 
   const refresh = () =>
     ipc
@@ -32,10 +31,6 @@ export function Providers({ highlight }: { highlight: string | null }) {
       .then(setProviders)
       .catch((e) => setError(String(e)));
   useEffect(() => void refresh(), []);
-  useEffect(() => {
-    void ipc.getConfig().then((c) => setOllamaEnabled(c.ollama_enabled));
-  }, []);
-
   const checkCredits = async (id: string) => {
     setCredits((prev) => ({ ...prev, [id]: { status: 'loading' } }));
     try {
@@ -135,7 +130,9 @@ export function Providers({ highlight }: { highlight: string | null }) {
 
       <div className="provider-list">
         {providers.length === 0 && (
-          <p className="muted">No profiles yet. Local Ollama is used by default.</p>
+          <p className="muted">
+            No profiles yet. Add one, or use a local model from Settings &rarr; Local Models.
+          </p>
         )}
         {providers.map((p) => (
           <div
@@ -211,7 +208,6 @@ export function Providers({ highlight }: { highlight: string | null }) {
         <ProviderForm
           profile={editing}
           secret={secret}
-          ollamaEnabled={ollamaEnabled}
           onChange={setEditing}
           onSecret={setSecret}
           onCancel={() => setEditing(null)}
