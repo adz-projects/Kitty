@@ -157,14 +157,24 @@ export const ipc = {
     name: string,
     prompt: string,
     cwd: string | null,
+    modelId: string | null,
     schedule: Schedule,
     nextFire: string
-  ) => invoke<ScheduledTask>('create_scheduled_task', { name, prompt, cwd, schedule, nextFire }),
+  ) =>
+    invoke<ScheduledTask>('create_scheduled_task', {
+      name,
+      prompt,
+      cwd,
+      modelId,
+      schedule,
+      nextFire,
+    }),
   updateScheduledTask: (
     id: string,
     name: string,
     prompt: string,
     cwd: string | null,
+    modelId: string | null,
     schedule: Schedule,
     nextFire: string,
     enabled: boolean
@@ -174,6 +184,7 @@ export const ipc = {
       name,
       prompt,
       cwd,
+      modelId,
       schedule,
       nextFire,
       enabled,

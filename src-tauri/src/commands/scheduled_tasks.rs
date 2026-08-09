@@ -22,6 +22,7 @@ pub fn list_scheduled_tasks(
     Ok(cfg.scheduled_tasks.clone())
 }
 
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub fn create_scheduled_task(
     app: AppHandle,
@@ -29,6 +30,7 @@ pub fn create_scheduled_task(
     name: String,
     prompt: String,
     cwd: Option<String>,
+    model_id: Option<String>,
     schedule: Schedule,
     next_fire: DateTime<Local>,
 ) -> Result<ScheduledTask, String> {
@@ -45,6 +47,9 @@ pub fn create_scheduled_task(
         name,
         prompt,
         cwd,
+        // Empty string from an unset UI picker means "no override", not a
+        // model literally named "".
+        model_id: model_id.filter(|m| !m.trim().is_empty()),
         schedule,
         next_fire,
         enabled: true,
@@ -67,6 +72,7 @@ pub fn update_scheduled_task(
     name: String,
     prompt: String,
     cwd: Option<String>,
+    model_id: Option<String>,
     schedule: Schedule,
     next_fire: DateTime<Local>,
     enabled: bool,
@@ -89,6 +95,7 @@ pub fn update_scheduled_task(
         task.name = name;
         task.prompt = prompt;
         task.cwd = cwd;
+        task.model_id = model_id.filter(|m| !m.trim().is_empty());
         task.schedule = schedule;
         task.next_fire = next_fire;
         task.enabled = enabled;

@@ -221,6 +221,9 @@ export interface ScheduledTask {
   name: string;
   prompt: string;
   cwd: string | null;
+  /** Model this task runs on, overriding the active provider's default
+      (D3). `null` = use whatever is active when it fires. */
+  model_id: string | null;
   schedule: Schedule;
   next_fire: string;
   enabled: boolean;

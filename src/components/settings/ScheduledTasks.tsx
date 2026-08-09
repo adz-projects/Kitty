@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { ipc, onScheduledTasksChanged, pickFolder } from '@/lib/ipc';
-import type { Schedule, ScheduledTask } from '@/lib/types';
+import type { LocalModel, Schedule, ScheduledTask } from '@/lib/types';
 import { Modal } from '@/components/shared/Modal';
 
 export type IntervalUnit = 'minutes' | 'hours' | 'days';
@@ -39,6 +39,8 @@ interface FormState {
   name: string;
   prompt: string;
   cwd: string;
+  /** Empty = no override, run on whatever provider is active at fire time. */
+  modelId: string;
   kind: 'one_shot' | 'recurring';
   oneShotAt: string; // datetime-local value
   intervalAmount: number;
@@ -52,6 +54,7 @@ function blankForm(): FormState {
     name: '',
     prompt: '',
     cwd: '',
+    modelId: '',
     kind: 'one_shot',
     oneShotAt: toDatetimeLocalValue(in5min.toISOString()),
     intervalAmount: 1,
@@ -69,6 +72,7 @@ function formFromTask(task: ScheduledTask): FormState {
     name: task.name,
     prompt: task.prompt,
     cwd: task.cwd ?? '',
+    modelId: task.model_id ?? '',
     kind: task.schedule.kind,
     oneShotAt: toDatetimeLocalValue(task.next_fire),
     intervalAmount: amount,
@@ -89,6 +93,7 @@ export function ScheduledTasks() {
   const [editing, setEditing] = useState<ScheduledTask | 'new' | null>(null);
   const [form, setForm] = useState<FormState>(blankForm());
   const [saving, setSaving] = useState(false);
+  const [models, setModels] = useState<LocalModel[]>([]);
 
   const load = async () => {
     try {
@@ -100,6 +105,12 @@ export function ScheduledTasks() {
 
   useEffect(() => {
     void load();
+    // Best-effort: an empty list just means the picker offers only "whatever
+    // is active", which is the pre-override behaviour anyway.
+    void ipc
+      .listLocalModels()
+      .then(setModels)
+      .catch(() => {});
     const un = onScheduledTasksChanged(() => void load());
     return () => void un.then((fn) => fn());
   }, []);
@@ -125,6 +136,7 @@ export function ScheduledTasks() {
     setError('');
     try {
       const cwd = form.cwd.trim() || null;
+      const modelId = form.modelId.trim() || null;
       const schedule: Schedule =
         form.kind === 'one_shot'
           ? { kind: 'one_shot' }
@@ -151,13 +163,14 @@ export function ScheduledTasks() {
             ).toISOString();
 
       if (editing === 'new') {
-        await ipc.createScheduledTask(name, prompt, cwd, schedule, nextFire);
+        await ipc.createScheduledTask(name, prompt, cwd, modelId, schedule, nextFire);
       } else if (editing) {
         await ipc.updateScheduledTask(
           editing.id,
           name,
           prompt,
           cwd,
+          modelId,
           schedule,
           nextFire,
           form.enabled
@@ -253,6 +266,24 @@ export function ScheduledTasks() {
                 Browse…
               </button>
             </div>
+          </div>
+          <div className="field">
+            <span>Model (optional)</span>
+            <select
+              value={form.modelId}
+              onChange={(e) => setForm({ ...form, modelId: e.target.value })}
+            >
+              <option value="">Whatever is active when it runs</option>
+              {models.map((m) => (
+                <option key={m.id} value={m.id}>
+                  {m.id}
+                </option>
+              ))}
+            </select>
+            <small className="muted">
+              Pin a downloaded model so this task always runs on it, even if you switch providers
+              later.
+            </small>
           </div>
           <div className="field">
             <span>Schedule</span>

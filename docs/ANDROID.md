@@ -830,7 +830,19 @@ held a sender the response body was waiting on), and prompt prefill ignored
   generation completes when busy** (verified with a long-running stream); no
   silent load-param failures.
 
-### Phase 5 — Scheduled tasks overrides
+### Phase 5 — Scheduled tasks overrides — **DONE**
+- `ScheduledTask.model_id: Option<String>` (`#[serde(default)]`, so tasks
+  written before it still load meaning "use whatever is active" — the
+  behaviour they had). A *model* id, not a provider id: a provider id would go
+  stale the moment a profile is deleted and recreated.
+- Applied in `lifecycle::scheduler::fire_scheduled_task` via the existing
+  `set_session_provider`, *before* the prompt is sent so the first turn runs
+  on it. Deliberately not passed to `new_session`: `POST /api/chat/` only
+  honours `model` when `provider` is sent alongside it (`routes/chat.rs`), and
+  an override names a model while the provider is whichever is active at fire
+  time — the `PATCH` path pairs them correctly.
+- Picker in `ScheduledTasks.tsx`, listing downloaded GGUFs with "whatever is
+  active when it runs" as the default.
 
 ### Phase 6a — Desktop hub (land green)
 - Wrap existing window components into `hub`; Vite intake change; routes;

@@ -51,6 +51,39 @@ async fn fire_scheduled_task(app: &AppHandle, task: crate::config::scheduled_tas
     tracing::info!("scheduled task '{}' ({}) firing", task.name, task.id);
     match crate::commands::new_session(app.clone(), task.cwd.clone(), None).await {
         Ok(info) => {
+            // Stamp the task's model override (D3) onto the session *before*
+            // sending, so the very first turn runs on it.
+            //
+            // Applied as a separate `PATCH` rather than passed to
+            // `new_session`: `POST /api/chat/` only honours `model` when
+            // `provider` is sent with it (`routes/chat.rs`), and a task
+            // override names a model, not a provider — the provider is
+            // whichever one is active at fire time. Going through
+            // `set_session_provider` pairs the two correctly and reuses a
+            // command that already exists.
+            if let Some(model) = task.model_id.as_deref().filter(|m| !m.is_empty()) {
+                let active_provider = {
+                    let state = app.state::<AppState>();
+                    let cfg = state.config.lock().unwrap();
+                    cfg.active_provider_id.clone()
+                };
+                match active_provider {
+                    Some(provider_id) => {
+                        crate::bigtiny::providers::set_session_provider(
+                            app,
+                            &info.session_id,
+                            &provider_id,
+                            model,
+                        )
+                        .await;
+                    }
+                    None => tracing::warn!(
+                        "scheduled task '{}' wants model '{model}' but no provider is active; \
+                         running on the session default",
+                        task.id
+                    ),
+                }
+            }
             if let Err(e) = crate::commands::send_prompt(
                 app.clone(),
                 info.session_id,

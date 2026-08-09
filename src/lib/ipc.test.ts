@@ -179,6 +179,51 @@ describe('ipc event subscription wrappers', () => {
     });
   });
 
+  // Positional args, so an inserted parameter silently shifts every later
+  // one — `modelId` landing where `schedule` was would be a runtime type
+  // error deep in Rust, not a compile error here.
+  it('createScheduledTask passes modelId in the right slot', () => {
+    void ipc.createScheduledTask(
+      'Nightly',
+      'summarise',
+      '/tmp',
+      'LFM2.5-1.2B-Instruct-Q4_K_M',
+      { kind: 'one_shot' },
+      '2026-01-01T00:00:00Z'
+    );
+    expect(invokeMock).toHaveBeenCalledWith('create_scheduled_task', {
+      name: 'Nightly',
+      prompt: 'summarise',
+      cwd: '/tmp',
+      modelId: 'LFM2.5-1.2B-Instruct-Q4_K_M',
+      schedule: { kind: 'one_shot' },
+      nextFire: '2026-01-01T00:00:00Z',
+    });
+  });
+
+  it('updateScheduledTask passes a null modelId as "no override"', () => {
+    void ipc.updateScheduledTask(
+      't1',
+      'Nightly',
+      'summarise',
+      null,
+      null,
+      { kind: 'recurring', interval_secs: 3600 },
+      '2026-01-01T00:00:00Z',
+      true
+    );
+    expect(invokeMock).toHaveBeenCalledWith('update_scheduled_task', {
+      id: 't1',
+      name: 'Nightly',
+      prompt: 'summarise',
+      cwd: null,
+      modelId: null,
+      schedule: { kind: 'recurring', interval_secs: 3600 },
+      nextFire: '2026-01-01T00:00:00Z',
+      enabled: true,
+    });
+  });
+
   it('getEngineRestartState calls get_engine_restart_state', () => {
     void ipc.getEngineRestartState();
     expect(invokeMock).toHaveBeenCalledWith('get_engine_restart_state');
