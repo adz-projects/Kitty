@@ -138,7 +138,6 @@ pub async fn restart_backend(app: AppHandle) -> Result<(), String> {
         memory,
         pathway_enabled,
         pathway_embedding_model,
-        ollama_base_url,
     ) = {
         let state = app.state::<AppState>();
         let cfg = state.config.lock().unwrap();
@@ -151,7 +150,6 @@ pub async fn restart_backend(app: AppHandle) -> Result<(), String> {
             cfg.memory.clone(),
             cfg.adaptive_pathway_enabled,
             cfg.adaptive_pathway_embedding_model.clone(),
-            cfg.ollama_base_url.clone(),
         )
     };
     let handle = lifecycle::bigtiny_proc::spawn(
@@ -163,7 +161,6 @@ pub async fn restart_backend(app: AppHandle) -> Result<(), String> {
         &memory,
         pathway_enabled,
         &pathway_embedding_model,
-        &ollama_base_url,
     )
     .await?;
     let (healthy, port) = (handle.healthy, handle.port);

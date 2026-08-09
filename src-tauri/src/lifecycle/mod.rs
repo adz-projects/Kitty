@@ -1,21 +1,22 @@
-//! Process lifecycle & health for the local stack (Ollama + BigTiny).
+//! Process lifecycle & health for the local stack.
 //!
-//! We *own* the stack: on startup we ensure Ollama is running (spawning it only
-//! if it isn't already), then spawn the BigTiny daemon. A 5s health loop
-//! recomputes the [`crate::state::StackStatus`] and emits `stack://status`
-//! on change. On exit we kill only the children we spawned.
+//! We *own* the stack: on startup we spawn the BigTiny daemon, which hosts the
+//! in-process inference engine. A 5s health loop recomputes the
+//! [`crate::state::StackStatus`] and emits `stack://status` on change. On exit
+//! we kill only the children we spawned.
+//!
+//! There is exactly one child now. Kitty used to also spawn and supervise
+//! `ollama serve`; that ended when the engine moved in-process (docs/ANDROID.md
+//! Phase 2b). An Ollama server the *user* runs is still a perfectly good
+//! provider endpoint — Kitty just doesn't manage its lifecycle.
 
 pub mod bigtiny_proc;
 pub(crate) mod embedding;
 mod health;
-pub mod ollama_proc;
 pub mod scheduler;
-mod summarizer_model;
 
-pub(crate) use embedding::ensure_embedding_model;
 pub(crate) use health::compute_status;
 pub use health::spawn_health_loop;
-pub(crate) use summarizer_model::ensure_summarizer_model;
 
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -45,19 +46,35 @@ fn set_startup_phase(app: &AppHandle, phase: StartupPhase) {
     }
 }
 
-/// Whether Ollama must be started for the current config: either the active
-/// *chat* setup needs it (local Ollama provider), adaptive-pathway is
-/// enabled (its embeddings are local-Ollama-only regardless of chat
-/// provider), or the summarizer is enabled (its model — see
-/// `Config::summarizer` — is likewise always pulled from local Ollama,
-/// independent of the main chat provider). Independent of `ollama_enabled`
-/// ("run local chat model" — a separate, narrower toggle) by design;
-/// extracted as a pure function so the policy is unit testable without
-/// spinning up `start_stack`'s async runtime.
-pub(crate) fn stack_needs_ollama(cfg: &crate::config::Config) -> bool {
-    ollama_proc::requires_local_ollama(cfg)
-        || cfg.adaptive_pathway_enabled
-        || cfg.summarizer.enabled
+/// Whether the current config needs a local GGUF on disk: either the active
+/// *chat* setup is local, adaptive-pathway is enabled (its embeddings run on
+/// the in-process engine regardless of which provider serves chat — an
+/// API-key chat user still needs an embedding model), or the summarizer is
+/// enabled (likewise local, independent of the main chat provider).
+///
+/// Successor to `stack_needs_ollama`. The policy is unchanged — what changed
+/// is that "needs it" no longer implies spawning anything, only that a model
+/// file has to exist. Kept as a pure function so it stays unit testable
+/// without `start_stack`'s async runtime.
+pub(crate) fn stack_needs_local_model(cfg: &crate::config::Config) -> bool {
+    requires_local_chat_model(cfg) || cfg.adaptive_pathway_enabled || cfg.summarizer.enabled
+}
+
+/// True when chat itself runs locally: no provider is active yet (fresh
+/// install, which defaults to local), or the active profile is a local one.
+///
+/// A profile pointed at an Ollama server the *user* runs is remote as far as
+/// Kitty is concerned — it needs no model of ours — so `"ollama"` counts as
+/// remote here even though it didn't under managed Ollama.
+fn requires_local_chat_model(cfg: &crate::config::Config) -> bool {
+    match cfg
+        .active_provider_id
+        .as_ref()
+        .and_then(|id| cfg.providers.iter().find(|p| &p.id == id))
+    {
+        Some(p) => p.provider_type == "local",
+        None => true,
+    }
 }
 
 /// Sync the bundled MCP servers now if the just-spawned daemon's own startup
@@ -107,27 +124,6 @@ pub(crate) fn sync_mcp_once_healthy(app: &AppHandle, healthy: bool, port: u16) {
 pub fn start_stack(app: &AppHandle) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
-        // 1. Ensure Ollama is reachable (spawn it only if down and installed).
-        // Needed either when the active *chat* setup requires it (local
-        // Ollama provider), or whenever adaptive-pathway is enabled — AP's
-        // embeddings are local-Ollama-only regardless of chat provider (an
-        // API-key chat user still needs Ollama for embeddings), so its need
-        // is independent of the `ollama_enabled` "run local chat model" flag.
-        let (base, needs_ollama) = {
-            let state = app.state::<AppState>();
-            let cfg = state.config.lock().unwrap();
-            (cfg.ollama_base_url.clone(), stack_needs_ollama(&cfg))
-        };
-        if needs_ollama {
-            match ollama_proc::ensure_running(&base).await {
-                Ok(proc) => {
-                    let state = app.state::<AppState>();
-                    *state.ollama.lock().unwrap() = proc;
-                }
-                Err(e) => tracing::warn!("ollama ensure_running failed: {e}"),
-            }
-        }
-
         // Spawn the BigTiny daemon. No provider env vars — providers are
         // registered at runtime over REST (see
         // `bigtiny::providers::sync_active_provider` right after spawn).
@@ -135,13 +131,11 @@ pub fn start_stack(app: &AppHandle) {
             command,
             args,
             dir,
-            warm,
             summarizer,
             token_management,
             memory,
             pathway_enabled,
             pathway_embedding_model,
-            ollama_base_url,
         ) = {
             let state = app.state::<AppState>();
             let cfg = state.config.lock().unwrap();
@@ -149,32 +143,16 @@ pub fn start_stack(app: &AppHandle) {
                 cfg.bigtiny_command.clone(),
                 cfg.bigtiny_args.clone(),
                 cfg.bigtiny_dir.clone(),
-                crate::config::providers::active_ollama_target(&cfg),
                 cfg.summarizer.clone(),
                 cfg.token_management.clone(),
                 cfg.memory.clone(),
                 cfg.adaptive_pathway_enabled,
                 cfg.adaptive_pathway_embedding_model.clone(),
-                cfg.ollama_base_url.clone(),
             )
         };
 
-        // Runtime guarantee for BigTiny's summarizer model (see
-        // `Config::summarizer`, e.g. `qwen3.5:0.8b`): if Ollama is reachable
-        // but the pinned tag isn't installed yet, pull it in the background
-        // — non-blocking, doesn't delay the BigTiny spawn below (BigTiny only
-        // needs the model once it actually runs a summarization pass, not to
-        // start). Progress flows through the existing `ollama://pull-progress`
-        // events (fixed pull id, see `summarizer_model::SUMMARIZER_MODEL_PULL_ID`).
-        if summarizer.enabled {
-            ensure_summarizer_model(app.clone(), base.clone(), summarizer.model.clone()).await;
-        }
-
         set_startup_phase(&app, StartupPhase::SpawningBackend);
-        if warm.is_some() {
-            set_startup_phase(&app, StartupPhase::WarmingModel);
-        }
-        let spawn_fut = bigtiny_proc::spawn(
+        let spawn_result = bigtiny_proc::spawn(
             &command,
             &args,
             dir.as_deref(),
@@ -183,14 +161,8 @@ pub fn start_stack(app: &AppHandle) {
             &memory,
             pathway_enabled,
             &pathway_embedding_model,
-            &ollama_base_url,
-        );
-        let warm_fut = async {
-            if let Some((base, model)) = warm {
-                crate::ollama::keep_alive_load(&base, &model).await;
-            }
-        };
-        let (spawn_result, ()) = tokio::join!(spawn_fut, warm_fut);
+        )
+        .await;
         match spawn_result {
             Ok(handle) => {
                 let (healthy, port) = (handle.healthy, handle.port);
@@ -216,21 +188,17 @@ pub fn start_stack(app: &AppHandle) {
         }
         set_startup_phase(&app, StartupPhase::Ready);
 
-        // Runtime guarantee for the pathway engine's shared embedding model:
-        // if Ollama is reachable but the pinned tag isn't installed yet, pull
-        // it in the background (non-blocking — the wizard's own pull is only
-        // best-effort, so this is what actually guarantees convergence on
-        // every launch, not just first run). Progress flows through the
-        // existing `ollama://pull-progress` events plus the
-        // `adaptive_pathway://embedding_status` event. Gated on the pathway
-        // engine being enabled — no point checking/pulling otherwise.
+        // Report whether the pathway engine's embedding GGUF is on disk, so
+        // Settings can say so immediately rather than waiting up to 30s for
+        // the health loop's first check. Reporting only: a missing model is
+        // never downloaded behind the user's back.
         let (ap_enabled, ap_embedding_model) = {
             let state = app.state::<AppState>();
             let cfg = state.config.lock().unwrap();
             (cfg.adaptive_pathway_enabled, cfg.adaptive_pathway_embedding_model.clone())
         };
         if ap_enabled {
-            ensure_embedding_model(app.clone(), base.clone(), ap_embedding_model).await;
+            embedding::refresh_embedding_status(&app, &ap_embedding_model);
         }
 
         // 3. Begin the local stack's health loop. Per-provider (Personal/Remote)
@@ -262,122 +230,102 @@ pub fn shutdown(app: &AppHandle) {
     if bigtiny_was_owned {
         bigtiny_proc::remove_pidfile();
     }
-    state.ollama.lock().unwrap().kill_if_owned();
     tracing::info!("stack shut down (owned children killed)");
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ollama_proc, stack_needs_ollama};
+    use super::{requires_local_chat_model, stack_needs_local_model};
+    use crate::config::providers::ProviderProfile;
     use crate::config::Config;
 
-    #[test]
-    fn needs_ollama_true_when_adaptive_pathway_enabled_even_for_api_key_provider() {
-        // The key policy flip: an API-key chat user (e.g. Anthropic/OpenRouter)
-        // still needs Ollama running, purely for adaptive-pathway's embeddings.
+    /// A config with one active provider of `provider_type`. Every other
+    /// field is an unconfigured default — `ProviderProfile` has no `Default`,
+    /// and inlining this literal four times was most of the old test module.
+    fn cfg_with_active(provider_type: &str) -> Config {
         let mut cfg = Config::default();
-        cfg.providers
-            .push(crate::config::providers::ProviderProfile {
-                id: "p1".into(),
-                name: "Claude".into(),
-                provider_type: "anthropic".into(),
-                base_url: "https://api.anthropic.com".into(),
-                models: vec!["claude-sonnet-5".into()],
-                is_trusted: true,
-                temperature: None,
-                top_p: None,
-                top_k: None,
-                min_p: None,
-                presence_penalty: None,
-                frequency_penalty: None,
-                max_tokens: None,
-                context_length: None,
-                strip_reasoning: false,
-                system_prompt: None,
-                prompt_idle_timeout_secs: None,
-                parallel_slots: None,
-                created_at: "2026-01-01T00:00:00Z".into(),
-            });
-        cfg.active_provider_id = Some("p1".into());
-        cfg.adaptive_pathway_enabled = true;
-        assert!(!ollama_proc::requires_local_ollama(&cfg));
-        assert!(stack_needs_ollama(&cfg));
-    }
-
-    #[test]
-    fn needs_ollama_false_when_api_key_provider_and_adaptive_pathway_disabled() {
-        let mut cfg = Config::default();
-        cfg.providers
-            .push(crate::config::providers::ProviderProfile {
-                id: "p1".into(),
-                name: "Claude".into(),
-                provider_type: "anthropic".into(),
-                base_url: "https://api.anthropic.com".into(),
-                models: vec!["claude-sonnet-5".into()],
-                is_trusted: true,
-                temperature: None,
-                top_p: None,
-                top_k: None,
-                min_p: None,
-                presence_penalty: None,
-                frequency_penalty: None,
-                max_tokens: None,
-                context_length: None,
-                strip_reasoning: false,
-                system_prompt: None,
-                prompt_idle_timeout_secs: None,
-                parallel_slots: None,
-                created_at: "2026-01-01T00:00:00Z".into(),
-            });
+        cfg.providers.push(ProviderProfile {
+            id: "p1".into(),
+            name: "test".into(),
+            provider_type: provider_type.into(),
+            base_url: "https://example.invalid".into(),
+            models: vec!["some-model".into()],
+            is_trusted: true,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            min_p: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            max_tokens: None,
+            context_length: None,
+            strip_reasoning: false,
+            system_prompt: None,
+            prompt_idle_timeout_secs: None,
+            parallel_slots: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+        });
         cfg.active_provider_id = Some("p1".into());
         cfg.adaptive_pathway_enabled = false;
         cfg.summarizer.enabled = false;
-        assert!(!stack_needs_ollama(&cfg));
+        cfg
+    }
+
+    /// The policy that survived retiring managed Ollama: an API-key chat user
+    /// still needs a local model, because adaptive-pathway's embeddings run
+    /// locally no matter who serves chat. This was the most load-bearing of
+    /// the original four assertions and it is unchanged in substance — only
+    /// what "needs it" implies changed (a file on disk, not a process).
+    #[test]
+    fn a_local_model_is_needed_for_pathway_even_with_an_api_key_provider() {
+        let mut cfg = cfg_with_active("anthropic");
+        cfg.adaptive_pathway_enabled = true;
+        assert!(!requires_local_chat_model(&cfg));
+        assert!(stack_needs_local_model(&cfg));
+    }
+
+    /// Same shape for the summarizer, which is also local regardless of the
+    /// chat provider.
+    #[test]
+    fn a_local_model_is_needed_for_the_summarizer_even_with_an_api_key_provider() {
+        let mut cfg = cfg_with_active("anthropic");
+        cfg.summarizer.enabled = true;
+        assert!(!requires_local_chat_model(&cfg));
+        assert!(stack_needs_local_model(&cfg));
     }
 
     #[test]
-    fn needs_ollama_true_for_local_ollama_chat_provider_regardless_of_adaptive_pathway() {
+    fn no_local_model_is_needed_for_a_pure_api_key_setup() {
+        let cfg = cfg_with_active("anthropic");
+        assert!(!stack_needs_local_model(&cfg));
+    }
+
+    /// A fresh install has no active provider and defaults to local.
+    #[test]
+    fn a_fresh_install_needs_a_local_model() {
         let cfg = Config {
             adaptive_pathway_enabled: false,
             ..Config::default()
         };
-        // No active provider -> requires_local_ollama defaults true (fresh install).
-        assert!(stack_needs_ollama(&cfg));
+        assert!(requires_local_chat_model(&cfg));
+        assert!(stack_needs_local_model(&cfg));
     }
 
     #[test]
-    fn needs_ollama_true_when_summarizer_enabled_even_for_api_key_provider() {
-        // Mirrors the adaptive-pathway case above: the summarizer's model
-        // always comes from local Ollama regardless of the main chat
-        // provider, so an API-key chat user still needs Ollama running
-        // purely to keep the summarizer model available.
-        let mut cfg = Config::default();
-        cfg.providers
-            .push(crate::config::providers::ProviderProfile {
-                id: "p1".into(),
-                name: "Claude".into(),
-                provider_type: "anthropic".into(),
-                base_url: "https://api.anthropic.com".into(),
-                models: vec!["claude-sonnet-5".into()],
-                is_trusted: true,
-                temperature: None,
-                top_p: None,
-                top_k: None,
-                min_p: None,
-                presence_penalty: None,
-                frequency_penalty: None,
-                max_tokens: None,
-                context_length: None,
-                strip_reasoning: false,
-                system_prompt: None,
-                prompt_idle_timeout_secs: None,
-                parallel_slots: None,
-                created_at: "2026-01-01T00:00:00Z".into(),
-            });
-        cfg.active_provider_id = Some("p1".into());
-        cfg.adaptive_pathway_enabled = false;
-        cfg.summarizer.enabled = true;
-        assert!(!ollama_proc::requires_local_ollama(&cfg));
-        assert!(stack_needs_ollama(&cfg));
+    fn a_local_chat_provider_needs_a_local_model() {
+        let cfg = cfg_with_active("local");
+        assert!(requires_local_chat_model(&cfg));
+        assert!(stack_needs_local_model(&cfg));
+    }
+
+    /// **Changed behaviour, deliberately.** Under managed Ollama an `ollama`
+    /// profile meant "the server we run for you", so it required a local
+    /// model. It now means "a server you run yourself" — remote as far as
+    /// Kitty is concerned, needing nothing of ours on disk.
+    #[test]
+    fn an_ollama_profile_is_now_treated_as_remote() {
+        let cfg = cfg_with_active("ollama");
+        assert!(!requires_local_chat_model(&cfg));
+        assert!(!stack_needs_local_model(&cfg));
     }
 }

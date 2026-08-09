@@ -3,11 +3,6 @@
 //! never secrets (those live in the Windows Credential Manager via
 //! `keyring`).
 
-// HKCU\Environment reader/writer for the OLLAMA_* vars — `winreg`, so
-// Windows-only (docs/ANDROID.md §2.5). Phase 2 deletes this module outright
-// along with the rest of the Ollama integration.
-#[cfg(windows)]
-pub mod env_helper;
 pub mod providers;
 pub mod recipe_yaml;
 pub mod recipes;
@@ -301,7 +296,7 @@ impl Default for SummarizerSettings {
     fn default() -> Self {
         Self {
             enabled: true,
-            model: "LFM2.5-1.2b".to_string(),
+            model: DEFAULT_SUMMARIZER_GGUF.to_string(),
             keep_alive: "5m".to_string(),
         }
     }
@@ -467,8 +462,19 @@ pub(crate) fn bundled_plugin_path(name: &str) -> Option<String> {
 }
 
 fn default_ap_embedding_model() -> String {
-    "qwen3-embedding:0.6b".to_string()
+    DEFAULT_EMBEDDING_GGUF.to_string()
 }
+
+/// GGUF ids (file stems) of the two models the local engine uses by default,
+/// matching docs/ANDROID.md §9. Ids rather than Ollama tags since Phase 2b:
+/// these name a file in `models_dir()`, resolved by `crate::models::resolve`.
+pub const DEFAULT_EMBEDDING_GGUF: &str = "Qwen3-Embedding-0.6B-q4_k_m";
+pub const DEFAULT_SUMMARIZER_GGUF: &str = "LFM2.5-1.2B-Instruct-Q4_K_M";
+
+/// Ollama tags these two settings held before Phase 2b, carried forward by
+/// `migrate_model_tags_to_gguf`.
+const LEGACY_EMBEDDING_TAG: &str = "qwen3-embedding:0.6b";
+const LEGACY_SUMMARIZER_TAGS: [&str; 2] = ["LFM2.5-1.2b", "qwen3.5:0.8b"];
 
 /// Per-event notification toggles.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -592,6 +598,19 @@ pub fn themes_dir() -> Result<PathBuf, ConfigError> {
     Ok(dir)
 }
 
+/// `%LOCALAPPDATA%/Kitty/models/` (created if missing) — downloaded GGUFs.
+///
+/// **The only path here that isn't under `%APPDATA%`**, deliberately: a
+/// roaming profile syncs, and these files are hundreds of megabytes to
+/// several gigabytes each. `dirs::data_local_dir()` is the non-roaming
+/// equivalent, and matches where `tools/local_engine_lab.py` already looks.
+pub fn models_dir() -> Result<PathBuf, ConfigError> {
+    let base = dirs::data_local_dir().ok_or(ConfigError::NoConfigDir)?;
+    let dir = base.join("Kitty").join("models");
+    fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
 /// Load config from disk, falling back to defaults if the file is missing.
 /// A corrupt file is a hard error so we never silently discard user settings.
 pub fn load() -> Result<Config, ConfigError> {
@@ -599,12 +618,14 @@ pub fn load() -> Result<Config, ConfigError> {
     match fs::read_to_string(&path) {
         Ok(text) => {
             let config: Config = serde_json::from_str(&text)?;
-            Ok(migrate_kitty_wasm_enabled(migrate_kitty_web_enabled(
-                migrate_kitty_split_enabled(migrate_replacement_mcp_enabled(
-                    migrate_bigtiny_launch_command(migrate_recipes(migrate_hotkeys(
-                        config, &text,
-                    ))),
-                )),
+            Ok(migrate_model_tags_to_gguf(migrate_kitty_wasm_enabled(
+                migrate_kitty_web_enabled(
+                    migrate_kitty_split_enabled(migrate_replacement_mcp_enabled(
+                        migrate_bigtiny_launch_command(migrate_recipes(migrate_hotkeys(
+                            config, &text,
+                        ))),
+                    )),
+                ),
             )))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
@@ -814,6 +835,26 @@ fn migrate_kitty_web_enabled(mut config: Config) -> Config {
 /// execution disabled doesn't suddenly gain it. Guarded the same one-shot
 /// way as `migrate_kitty_web_enabled`: a user who later flips
 /// `kitty_wasm_enabled` independently keeps that choice.
+/// Phase 2b: `summarizer.model` and `adaptive_pathway_embedding_model` used
+/// to hold Ollama tags (`qwen3-embedding:0.6b`), and now hold GGUF ids naming
+/// a file in `models_dir()`. A saved tag would resolve to nothing, silently
+/// leaving both engine slots unconfigured — chat falling back to the active
+/// provider and beliefs dropping to lexical hashing, with no error anywhere
+/// to explain it. Rewrite the known tags to their GGUF equivalents.
+///
+/// Only the exact tags Kitty itself ever wrote are touched. Anything a user
+/// typed by hand is left alone: it may well name a GGUF they downloaded
+/// themselves, and guessing would be worse than leaving it.
+fn migrate_model_tags_to_gguf(mut config: Config) -> Config {
+    if config.adaptive_pathway_embedding_model == LEGACY_EMBEDDING_TAG {
+        config.adaptive_pathway_embedding_model = DEFAULT_EMBEDDING_GGUF.to_string();
+    }
+    if LEGACY_SUMMARIZER_TAGS.contains(&config.summarizer.model.as_str()) {
+        config.summarizer.model = DEFAULT_SUMMARIZER_GGUF.to_string();
+    }
+    config
+}
+
 fn migrate_kitty_wasm_enabled(mut config: Config) -> Config {
     if !config.kitty_wasm_default_migrated {
         config.kitty_wasm_enabled = config.wasm_math_mcp_enabled;
@@ -1104,12 +1145,10 @@ mod tests {
     #[test]
     fn old_shape_config_migrates_embedding_model_default() {
         // A config predating the embedding-model requirement must still load,
-        // defaulting to the one pinned cross-compatible tag every user shares.
+        // defaulting to the one pinned cross-compatible model every user
+        // shares — a GGUF id since Phase 2b, not an Ollama tag.
         let back: Config = serde_json::from_str(r#"{"theme":"dark"}"#).unwrap();
-        assert_eq!(
-            back.adaptive_pathway_embedding_model,
-            "qwen3-embedding:0.6b"
-        );
+        assert_eq!(back.adaptive_pathway_embedding_model, DEFAULT_EMBEDDING_GGUF);
     }
 
     #[test]

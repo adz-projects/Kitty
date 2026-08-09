@@ -173,6 +173,62 @@ fn apply_env_overrides(config: &mut BigTinyConfig) {
     {
         config.pathway.learn_every_n = n;
     }
+    // The in-process llama.cpp engine (docs/ANDROID.md §3.2). Same reasoning
+    // as `BIGTINY_PATHWAY__ENABLED` above: no host passes `--config`, so
+    // without these the engine can only ever be off. Kitty's
+    // `lifecycle/bigtiny_proc.rs::spawn` is the other half of this contract
+    // and must stay in lockstep.
+    //
+    // Paths, not model names: the daemon has no idea where a host keeps its
+    // models, and resolving on this side would duplicate that knowledge.
+    if let Ok(v) = std::env::var("BIGTINY_LOCAL__ENABLED") {
+        config.local.enabled = v.eq_ignore_ascii_case("true") || v == "1";
+    }
+    if let Ok(v) = std::env::var("BIGTINY_LOCAL__MODEL_PATH") {
+        config.local.model_path = v;
+    }
+    if let Ok(v) = std::env::var("BIGTINY_LOCAL__EMBED_MODEL_PATH") {
+        config.local.embed_model_path = v;
+    }
+    if let Ok(v) = std::env::var("BIGTINY_LOCAL__EMBED_POOLING") {
+        config.local.embed_pooling = v;
+    }
+    if let Some(n) = std::env::var("BIGTINY_LOCAL__N_CTX")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        config.local.n_ctx = n;
+    }
+    if let Some(n) = std::env::var("BIGTINY_LOCAL__EMBED_N_CTX")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        config.local.embed_n_ctx = n;
+    }
+    if let Some(n) = std::env::var("BIGTINY_LOCAL__N_BATCH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        config.local.n_batch = n;
+    }
+    if let Some(n) = std::env::var("BIGTINY_LOCAL__N_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        config.local.n_threads = n;
+    }
+    if let Some(n) = std::env::var("BIGTINY_LOCAL__N_GPU_LAYERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        config.local.n_gpu_layers = n;
+    }
+    if let Ok(v) = std::env::var("BIGTINY_LOCAL__CACHE_TYPE_K") {
+        config.local.cache_type_k = v;
+    }
+    if let Ok(v) = std::env::var("BIGTINY_LOCAL__CACHE_TYPE_V") {
+        config.local.cache_type_v = v;
+    }
 }
 
 #[tokio::main]

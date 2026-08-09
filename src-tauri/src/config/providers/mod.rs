@@ -18,7 +18,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tauri::{AppHandle, Emitter, Manager};
 
-use crate::config::Config;
 use crate::state::AppState;
 
 /// A named provider profile.
@@ -126,21 +125,6 @@ impl ProviderProfile {
     pub fn network_tier(&self) -> NetworkTier {
         network_tier_for(&self.base_url)
     }
-}
-
-/// If the active provider is an Ollama profile with a chosen model, return its
-/// `(base_url, model)` — used to warm/evict the model in Ollama's memory
-/// (Round-2 item 5). `None` for non-Ollama or model-less profiles.
-pub fn active_ollama_target(config: &Config) -> Option<(String, String)> {
-    let active = config
-        .active_provider_id
-        .as_ref()
-        .and_then(|id| config.providers.iter().find(|p| &p.id == id))?;
-    if active.provider_type != "ollama" {
-        return None;
-    }
-    let model = active.models.first()?.clone();
-    Some((active.base_url.clone(), model))
 }
 
 /// Reachability for Personal/Remote providers is derived from real send

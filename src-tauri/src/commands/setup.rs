@@ -1,6 +1,5 @@
 //! First-run wizard + Setup & Repair commands. Named `setup` (not `wizard`) to
-//! avoid colliding with the top-level `crate::wizard` detection/install module
-//! this file wraps.
+//! avoid colliding with the top-level `crate::wizard` module this file wraps.
 
 use serde::Serialize;
 use tauri::{AppHandle, Manager};
@@ -11,32 +10,9 @@ use crate::lifecycle;
 use crate::state::AppState;
 use crate::state::StackStatus;
 use crate::windows;
+// Only the autostart commands below use it, and those are Windows-only.
+#[cfg(windows)]
 use crate::wizard;
-
-/// The configured Ollama endpoint. Read inline rather than imported from the
-/// Ollama command module — that module is going away with managed Ollama, and
-/// this is a plain config read, not part of its surface.
-fn ollama_base(app: &AppHandle) -> String {
-    app.state::<AppState>()
-        .config
-        .lock()
-        .unwrap()
-        .ollama_base_url
-        .clone()
-}
-
-/// Detect Ollama (presence, version, path).
-#[tauri::command]
-pub async fn detect_dependencies(app: AppHandle) -> Result<wizard::Detection, String> {
-    let base = ollama_base(&app);
-    Ok(wizard::detect(&base).await)
-}
-
-/// Install Ollama — downloads+runs its official installer. See `wizard::install`.
-#[tauri::command]
-pub async fn install_dependency(app: AppHandle, which: String) -> Result<(), String> {
-    wizard::install(&app, &which).await
-}
 
 /// Result of `validate_setup`: whether the current setup (whichever path the
 /// wizard's fork led down) actually works, plus plain-language reasons when
@@ -54,8 +30,8 @@ pub struct SetupValidation {
 
 /// Check whether the active provider + stack are actually ready to chat:
 /// a model is selected (and, for a remote provider, a key is stored), and
-/// the stack itself (goosed, plus Ollama when the active path needs it)
-/// reports healthy. Used by the wizard's Done step and by Settings → Setup &
+/// the stack itself (the daemon, plus a local model when the active path
+/// needs one) reports healthy. Used by the wizard's Done step and by Settings → Setup &
 /// Repair's lighter re-check — both just want a yes/no plus why not.
 #[tauri::command]
 pub async fn validate_setup(app: AppHandle) -> Result<SetupValidation, String> {
@@ -91,9 +67,10 @@ pub async fn validate_setup(app: AppHandle) -> Result<SetupValidation, String> {
     match status {
         StackStatus::Ok => {}
         StackStatus::Starting => issues.push("Still starting up — try again in a moment.".into()),
-        StackStatus::OllamaDown => issues.push("Ollama isn't running.".into()),
         StackStatus::BackendDown => issues.push("Kitty's engine isn't running yet.".into()),
-        StackStatus::NoModel => issues.push("No Ollama model is installed yet.".into()),
+        StackStatus::LocalModelMissing => {
+            issues.push("No local model is downloaded yet.".into())
+        }
         StackStatus::ProviderUnreachable => {
             issues.push("Can't reach the active provider right now.".into())
         }
@@ -102,8 +79,8 @@ pub async fn validate_setup(app: AppHandle) -> Result<SetupValidation, String> {
     // The pathway engine runs in-process inside BigTiny now — there's no
     // separate sidecar to probe. "Ok" just means enabled and the daemon
     // itself is reachable; unlike chat readiness, this doesn't care about
-    // Ollama/model/provider status (the pathway engine doesn't depend on
-    // any of those).
+    // model/provider status (a missing embedding model lowers recall quality,
+    // it doesn't stop the engine).
     let adaptive_pathway_ok = ap_enabled && status != StackStatus::BackendDown;
 
     Ok(SetupValidation {

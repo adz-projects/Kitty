@@ -1,10 +1,9 @@
 //! Managed application state: window-agnostic runtime data shared across commands.
 //!
-//! Holds the loaded config plus the process/health machinery (BigTiny +
-//! Ollama handles, generated secret/port, current stack status).
+//! Holds the loaded config plus the process/health machinery (the BigTiny
+//! daemon handle, generated secret/port, current stack status).
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::AtomicBool;
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
@@ -47,9 +46,12 @@ pub enum StackStatus {
     #[default]
     Starting,
     Ok,
-    OllamaDown,
     BackendDown,
-    NoModel,
+    /// The active setup wants a local model and none is installed. Replaces
+    /// the old `OllamaDown`/`NoModel` pair: with no managed inference process
+    /// there is nothing to be "down", so the only local failure left is a
+    /// missing GGUF — which Settings → Local Models can actually fix.
+    LocalModelMissing,
     ProviderUnreachable,
 }
 
@@ -64,10 +66,6 @@ pub enum StackStatus {
 pub enum StartupPhase {
     #[default]
     SpawningBackend,
-    /// Only entered when a local Ollama model needs warming (see
-    /// `config::providers::active_ollama_target`) — remote/API-key providers
-    /// skip straight from `SpawningBackend` to `Ready`.
-    WarmingModel,
     Ready,
 }
 
@@ -81,8 +79,6 @@ pub struct AppState {
     /// defaults. The frontend reads it once via
     /// `get_config_recovery_notice` to show that saved settings were reset.
     pub config_recovered: Mutex<Option<String>>,
-    /// The Ollama process — only `Some(child)` when *we* started it.
-    pub ollama: Mutex<ManagedProcess>,
     /// Last computed stack status, so the health loop only emits on change.
     pub stack_status: Mutex<StackStatus>,
     /// One-time startup progress (see `StartupPhase`); set by `start_stack`,
@@ -95,18 +91,10 @@ pub struct AppState {
     pub settings_target: Mutex<Option<Value>>,
     /// Wizard launch mode (`"setup"` or `"repair"`).
     pub wizard_mode: Mutex<Option<String>>,
-    /// Readiness of the shared `qwen3-embedding:0.6b` Ollama model the
-    /// in-process pathway engine uses — `Downloading`/`Missing` degrades
-    /// gracefully to the engine's hashing fallback, not an outage. See
-    /// `EmbeddingModelStatus`.
+    /// Readiness of the embedding GGUF the in-process pathway engine uses —
+    /// `Downloading`/`Missing` degrades gracefully to the engine's hashing
+    /// fallback, not an outage. See `EmbeddingModelStatus`.
     pub adaptive_pathway_embedding_status: Mutex<EmbeddingModelStatus>,
-    /// Guards `lifecycle::summarizer_model::ensure_summarizer_model` against
-    /// a duplicate concurrent pull of `Config::summarizer.model` (e.g.
-    /// `qwen3.5:0.8b`) — set for the duration of a background `ollama pull`,
-    /// checked by both the one-time `start_stack` call and the periodic
-    /// health-loop self-heal so they can never race into pulling the same
-    /// tag twice at once.
-    pub summarizer_model_pulling: AtomicBool,
     /// The BigTiny daemon child we spawn, plus its port + secret (sent as
     /// `X-API-Key`).
     pub bigtiny: Mutex<DaemonHandle>,
@@ -185,14 +173,12 @@ impl AppState {
         Self {
             config: Mutex::new(config),
             config_recovered: Mutex::new(config_recovered),
-            ollama: Mutex::new(ManagedProcess::default()),
             stack_status: Mutex::new(StackStatus::default()),
             startup_phase: Mutex::new(StartupPhase::default()),
             active_session: Mutex::new(None),
             settings_target: Mutex::new(None),
             wizard_mode: Mutex::new(None),
             adaptive_pathway_embedding_status: Mutex::new(EmbeddingModelStatus::default()),
-            summarizer_model_pulling: AtomicBool::new(false),
             bigtiny: Mutex::new(DaemonHandle::default()),
             bigtiny_approvals: Mutex::new(HashMap::new()),
             in_flight_sessions: Mutex::new(HashSet::new()),

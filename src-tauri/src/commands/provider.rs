@@ -8,7 +8,6 @@ use tauri::{AppHandle, Emitter, Manager};
 use crate::config;
 use crate::config::providers::{self, NetworkTier, ProviderProfile};
 use crate::config::Config;
-use crate::ollama;
 use crate::openrouter;
 use crate::state::AppState;
 
@@ -197,13 +196,6 @@ pub async fn activate_provider(
             .map_err(|e| format!("Can't switch to {} — {e}", profile.name))?;
     }
 
-    // Capture the previously-active Ollama model so we can evict it after the
-    // switch (Round-2 item 5) — read before we overwrite active_provider_id.
-    let prev_ollama = {
-        let state = app.state::<AppState>();
-        let cfg = state.config.lock().unwrap();
-        providers::active_ollama_target(&cfg)
-    };
     let stamp_pid = id.clone();
     {
         let state = app.state::<AppState>();
@@ -241,23 +233,9 @@ pub async fn activate_provider(
     // without this the UI drifts until the next session create/load or health tick.
     let _ = app.emit("provider://activated", ());
 
-    // Warm the new local Ollama model + evict the old one in the background
-    // (Round-2 item 5) — don't make the switch wait on model load.
-    let new_ollama = {
-        let state = app.state::<AppState>();
-        let cfg = state.config.lock().unwrap();
-        providers::active_ollama_target(&cfg)
-    };
-    tauri::async_runtime::spawn(async move {
-        if let Some((base, model)) = &new_ollama {
-            ollama::keep_alive_load(base, model).await;
-        }
-        if let Some((base, model)) = &prev_ollama {
-            if Some((base, model)) != new_ollama.as_ref().map(|(b, m)| (b, m)) {
-                ollama::keep_alive_release(base, model).await;
-            }
-        }
-    });
+    // No warm/evict step any more: that existed to keep an Ollama-resident
+    // model hot across a provider switch. The in-process engine's slot manager
+    // owns residency now, and a remote endpoint's memory isn't ours to manage.
     Ok(())
 }
 

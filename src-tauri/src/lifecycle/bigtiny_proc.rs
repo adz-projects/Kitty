@@ -121,7 +121,6 @@ pub async fn spawn(
     memory: &crate::config::MemorySettings,
     pathway_enabled: bool,
     pathway_embedding_model: &str,
-    ollama_base_url: &str,
 ) -> Result<DaemonHandle, String> {
     kill_stale_orphan();
 
@@ -180,20 +179,44 @@ pub async fn spawn(
         // override at all — passing a `--config` YAML is the only other way
         // to reach it, which Kitty never does. Without this, the in-process
         // behavioral-memory engine can never actually turn on, regardless
-        // of anything else. `AP_EMBED_OLLAMA_MODEL`/`AP_EMBED_OLLAMA_URL`
-        // are the same two env vars the old sidecar process read (see the
-        // now-retired `EmbeddingProvider` in the Python plugin) — the
-        // in-process engine's `EmbeddingProvider::new` still reads them from
-        // its own process env, and since it's linked into BigTiny now,
-        // "its own process env" means BigTiny's.
+        // of anything else.
         .env(
             "BIGTINY_PATHWAY__ENABLED",
             if pathway_enabled { "true" } else { "false" },
         )
-        .env("AP_EMBED_OLLAMA_MODEL", pathway_embedding_model)
-        .env("AP_EMBED_OLLAMA_URL", ollama_base_url)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // The in-process llama.cpp engine (docs/ANDROID.md §3). `--config` is
+    // never passed, so env is the only channel these reach the daemon by —
+    // `bin/bigtiny_daemon.rs::apply_env_overrides` is the other half of this
+    // and must stay in lockstep.
+    //
+    // Paths are resolved here rather than in the daemon so the daemon never
+    // needs to know where Kitty keeps models. An unresolvable name yields an
+    // empty value, which the daemon reads as "that slot is unconfigured" —
+    // chat falls back to the active provider, embeddings to lexical hashing.
+    // Both are degradations, neither is an error.
+    let chat_gguf = crate::models::resolve(&summarizer.model)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let embed_gguf = crate::models::resolve(pathway_embedding_model)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let local_enabled = !chat_gguf.is_empty() || !embed_gguf.is_empty();
+    cmd.env(
+        "BIGTINY_LOCAL__ENABLED",
+        if local_enabled { "true" } else { "false" },
+    )
+    .env("BIGTINY_LOCAL__MODEL_PATH", &chat_gguf)
+    .env("BIGTINY_LOCAL__EMBED_MODEL_PATH", &embed_gguf);
+    if !local_enabled {
+        tracing::info!(
+            summarizer_model = %summarizer.model,
+            embedding_model = %pathway_embedding_model,
+            "no local GGUF found for either slot; the local engine stays off"
+        );
+    }
+
     // Relay the bm25 gate only when actually set — leaving the env absent
     // (rather than `""`) keeps `None` the daemon's truly-unset default and
     // avoids always-present env noise.

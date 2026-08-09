@@ -14,8 +14,8 @@ mod config;
 mod hotkey;
 mod lifecycle;
 mod log_capture;
+mod models;
 mod notifications;
-mod ollama;
 mod openrouter;
 // Raw Win32 GDI desktop capture (BitBlt/GetDIBits) — the `windows` crate is a
 // `cfg(windows)`-only dependency, so this module cannot compile elsewhere.
@@ -178,16 +178,6 @@ pub fn run() {
             commands::test_active_provider_connection,
             commands::openrouter_context_length,
             commands::openrouter_credits,
-            commands::ollama_list_models,
-            commands::ollama_delete_model,
-            commands::ollama_show_context_length,
-            commands::ollama_pull_model,
-            #[cfg(windows)]
-            commands::read_ollama_env,
-            #[cfg(windows)]
-            commands::set_ollama_env,
-            commands::restart_ollama,
-            commands::ensure_ollama_running,
             commands::list_mcp_servers,
             commands::add_mcp_server,
             commands::update_mcp_server,
@@ -199,8 +189,6 @@ pub fn run() {
             commands::read_user_theme,
             commands::open_themes_folder,
             commands::read_image_data_url,
-            commands::detect_dependencies,
-            commands::install_dependency,
             commands::validate_setup,
             commands::open_wizard,
             commands::get_wizard_mode,

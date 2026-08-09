@@ -3,13 +3,12 @@
 //! refresh (neither is specific to any one feature, so both live here
 //! rather than as a separate loop).
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 
-use super::embedding::{ensure_embedding_model, set_embedding_status, EmbeddingModelStatus};
-use super::ollama_proc;
+use super::embedding::{refresh_embedding_status, set_embedding_status, EmbeddingModelStatus};
 use crate::state::{AppState, StackStatus};
 
 /// Payload for the `stack://status` event.
@@ -32,41 +31,27 @@ pub fn spawn_health_loop(app: AppHandle) {
         // `Ok` stays immediate; only degradation needs the extra
         // confirmation tick.
         let mut pending_degraded: Option<StackStatus> = None;
-        // ~30s cadence (every 6th 5s tick): catches the summarizer model
-        // being deleted out-of-band, or Ollama coming up after
-        // `start_stack`'s one-time `ensure_summarizer_model` call already
-        // found it unreachable. The pathway embedding-model recheck below
-        // shares this cadence for the same reason.
+        // ~30s cadence (every 6th 5s tick): catches the pathway embedding
+        // model being deleted out-of-band.
         let mut tick: u64 = 0;
-        // Throttles the embedding auto-retry pull below: at most once per 10
-        // minutes, so a sustained failure (Ollama installed but broken, no
-        // disk space, no network) doesn't spam pull attempts forever.
-        let mut last_pull_attempt: Option<Instant> = None;
         loop {
             ticker.tick().await;
             if tick % 6 == 0 {
-                let (ollama_base, summarizer) = {
-                    let state = app.state::<AppState>();
-                    let cfg = state.config.lock().unwrap();
-                    (cfg.ollama_base_url.clone(), cfg.summarizer.clone())
-                };
-                if summarizer.enabled {
-                    super::ensure_summarizer_model(app.clone(), ollama_base, summarizer.model)
-                        .await;
-                }
-
                 // Pathway embedding-model presence refresh. Never overwrites
-                // `Downloading`: that state is only ever
-                // set/cleared by the in-flight `ensure_embedding_model` pull
-                // task itself; this is purely a periodic Present/Missing
-                // refresh (catches a model deleted out-of-band, or Ollama
-                // coming back up later).
-                let (pathway_enabled, ollama_base, embedding_model) = {
+                // `Downloading`: that state belongs to an in-flight download
+                // task; this is purely a periodic Present/Missing refresh.
+                //
+                // There is no auto-retry loop any more. The old one existed
+                // because the model arrived via `ollama pull`, which could
+                // fail transiently and needed re-attempting on a throttle.
+                // A GGUF is either on disk or it isn't — re-checking a
+                // filesystem path is the whole job, and downloading is now an
+                // explicit user action in Settings → Local Models.
+                let (pathway_enabled, embedding_model) = {
                     let state = app.state::<AppState>();
                     let cfg = state.config.lock().unwrap();
                     (
                         cfg.adaptive_pathway_enabled,
-                        cfg.ollama_base_url.clone(),
                         cfg.adaptive_pathway_embedding_model.clone(),
                     )
                 };
@@ -79,32 +64,7 @@ pub fn spawn_health_loop(app: AppHandle) {
                         status == EmbeddingModelStatus::Downloading
                     };
                     if !currently_downloading {
-                        let ollama_up = ollama_proc::probe_version(&client, &ollama_base).await;
-                        let present = ollama_up
-                            && ollama_proc::has_model_tag(&client, &ollama_base, &embedding_model)
-                                .await;
-                        set_embedding_status(
-                            &app,
-                            if present {
-                                EmbeddingModelStatus::Present
-                            } else {
-                                EmbeddingModelStatus::Missing
-                            },
-                        );
-                        // Auto-retry: closes the "Ollama was down/missing the
-                        // model at launch, came up later" hole — without
-                        // this, the pull only ever fires once, at
-                        // `start_stack` time.
-                        if ollama_up && !present {
-                            let should_retry = last_pull_attempt
-                                .map(|t| t.elapsed() >= Duration::from_secs(600))
-                                .unwrap_or(true);
-                            if should_retry {
-                                last_pull_attempt = Some(Instant::now());
-                                ensure_embedding_model(app.clone(), ollama_base, embedding_model)
-                                    .await;
-                            }
-                        }
+                        refresh_embedding_status(&app, &embedding_model);
                     }
                 }
             }
@@ -172,31 +132,25 @@ pub fn spawn_health_loop(app: AppHandle) {
 }
 
 pub(crate) async fn compute_status(app: &AppHandle, client: &reqwest::Client) -> StackStatus {
-    let (base, needs_ollama, bigtiny_port) = {
+    let (needs_local_model, bigtiny_port) = {
         let state = app.state::<AppState>();
         let cfg = state.config.lock().unwrap();
         let bigtiny_port = state.bigtiny.lock().unwrap().port;
-        (
-            cfg.ollama_base_url.clone(),
-            cfg.ollama_enabled && ollama_proc::requires_local_ollama(&cfg),
-            bigtiny_port,
-        )
+        (super::stack_needs_local_model(&cfg), bigtiny_port)
     };
 
-    // Ollama reachability/model checks only apply when the active setup
-    // actually needs Ollama — a remote/API-key provider shouldn't misreport
-    // as broken just because no local Ollama is running (wizard redesign).
-    if needs_ollama && !ollama_proc::probe_version(client, &base).await {
-        return StackStatus::OllamaDown;
-    }
-    // `/api/health` is a real protocol-level probe (the FastAPI app
-    // answering, not just a bound TCP listener).
+    // `/api/health` is a real protocol-level probe (the daemon answering, not
+    // just a bound TCP listener). Checked first: without the backend, whether
+    // a model file exists is moot.
     match bigtiny_port {
         Some(port) if super::bigtiny_proc::probe_health(client, port).await => {}
         _ => return StackStatus::BackendDown,
     }
-    if needs_ollama && !ollama_proc::has_any_model(client, &base).await {
-        return StackStatus::NoModel;
+    // Only applies when the active setup actually needs a local model — a
+    // remote/API-key provider shouldn't misreport as broken just because no
+    // GGUF has been downloaded.
+    if needs_local_model && crate::models::installed().is_empty() {
+        return StackStatus::LocalModelMissing;
     }
     StackStatus::Ok
 }
