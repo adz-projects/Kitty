@@ -185,4 +185,36 @@ mod tests {
         assert_eq!(p.prompt_idle_timeout_secs, None);
         assert_eq!(p.parallel_slots, None);
     }
+
+    /// Phase 2b acceptance: an `ollama` profile saved while Kitty still
+    /// managed an Ollama process must keep working afterwards, as a *remote*
+    /// endpoint pointed at a server the user runs.
+    ///
+    /// The risk isn't deserialization — `provider_type` is an untyped
+    /// `String`, so it was never going to fail to load. It's that the row
+    /// becomes decorative: still listed, no longer routable. These assertions
+    /// pin the two things that keep it live, both of which are easy to delete
+    /// by accident while removing "the Ollama code": the profile still
+    /// reaches BigTiny as an `openai_compat` provider, and its granular type
+    /// still rides along as `provider_dialect`, which is the *only* channel
+    /// telling the daemon to apply the self-hosted sampling floor and put
+    /// `top_k`/`min_p` on the wire.
+    #[test]
+    fn a_legacy_ollama_profile_still_routes_after_managed_ollama_was_removed() {
+        let json = r#"{
+            "id": "p1", "name": "My Ollama", "provider_type": "ollama",
+            "base_url": "http://192.168.1.50:11434", "models": ["qwen3.5:4b"],
+            "created_at": "2026-01-01T00:00:00Z"
+        }"#;
+        let p: ProviderProfile = serde_json::from_str(json).unwrap();
+        assert_eq!(p.provider_type, "ollama");
+
+        let (wire_type, base) = crate::bigtiny::providers::bigtiny_provider_target(&p);
+        assert_eq!(wire_type, "openai_compat");
+        assert_eq!(base, "http://192.168.1.50:11434");
+
+        // Not "local": a server the user runs needs nothing of ours on disk,
+        // so it must not make the app report a missing local model.
+        assert_ne!(p.provider_type, "local");
+    }
 }
