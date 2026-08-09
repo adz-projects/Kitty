@@ -119,6 +119,7 @@ pub async fn spawn(
     summarizer: &crate::config::SummarizerSettings,
     token_management: &crate::config::TokenManagementSettings,
     memory: &crate::config::MemorySettings,
+    local: &crate::config::LocalModelSettings,
     pathway_enabled: bool,
     pathway_embedding_model: &str,
 ) -> Result<DaemonHandle, String> {
@@ -210,7 +211,20 @@ pub async fn spawn(
         if local_enabled { "true" } else { "false" },
     )
     .env("BIGTINY_LOCAL__MODEL_PATH", &chat_gguf)
-    .env("BIGTINY_LOCAL__EMBED_MODEL_PATH", &embed_gguf);
+    .env("BIGTINY_LOCAL__EMBED_MODEL_PATH", &embed_gguf)
+    // The engine's tunable knobs (docs/ANDROID.md §3.2/§6.1) — always sent,
+    // not just when a model is present, so a model added later (e.g. the
+    // daemon self-heals `LocalModelMissing` without a restart in between)
+    // starts with the user's chosen settings rather than the daemon's own
+    // hardcoded defaults.
+    .env("BIGTINY_LOCAL__N_CTX", local.n_ctx.to_string())
+    .env("BIGTINY_LOCAL__EMBED_N_CTX", local.embed_n_ctx.to_string())
+    .env("BIGTINY_LOCAL__N_BATCH", local.n_batch.to_string())
+    .env("BIGTINY_LOCAL__N_THREADS", local.n_threads.to_string())
+    .env("BIGTINY_LOCAL__N_GPU_LAYERS", local.n_gpu_layers.to_string())
+    .env("BIGTINY_LOCAL__EMBED_POOLING", &local.embed_pooling)
+    .env("BIGTINY_LOCAL__CACHE_TYPE_K", &local.cache_type_k)
+    .env("BIGTINY_LOCAL__CACHE_TYPE_V", &local.cache_type_v);
     if !local_enabled {
         tracing::info!(
             summarizer_model = %summarizer.model,

@@ -276,6 +276,85 @@ pub struct Config {
     /// the value-changing `migrate_*` functions in `load` below.
     #[serde(default)]
     pub memory: MemorySettings,
+    /// The local llama.cpp engine's tunable knobs (docs/ANDROID.md §3.2, §6.1)
+    /// — relayed as `BIGTINY_LOCAL__*` env vars at spawn, same mechanism as
+    /// `summarizer`/`token_management`/`memory` above. Model *paths* are
+    /// resolved separately in `bigtiny_proc::spawn` from `summarizer.model` /
+    /// `adaptive_pathway_embedding_model` (GGUF ids, not paths) — this struct
+    /// is everything else `LocalEngineConfig` accepts. `#[serde(default)]`
+    /// covers a pre-existing config file; no migration needed, this is a new
+    /// field with no prior value to carry forward.
+    #[serde(default)]
+    pub local: LocalModelSettings,
+}
+
+/// See `Config::local`. Field names and defaults mirror BigTiny's own
+/// `LocalEngineConfig` (`plugins/bigtiny_rust/src/config.rs`) exactly, so the
+/// two structs can't drift apart silently — a field renamed on one side and
+/// not the other would otherwise fail only at runtime, as an env var the
+/// daemon never reads.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LocalModelSettings {
+    #[serde(default = "default_local_n_ctx")]
+    pub n_ctx: u32,
+    #[serde(default = "default_local_embed_n_ctx")]
+    pub embed_n_ctx: u32,
+    #[serde(default = "default_local_n_batch")]
+    pub n_batch: u32,
+    /// `0` = let llama.cpp pick from the host's core count.
+    #[serde(default)]
+    pub n_threads: i32,
+    /// `-1` = all layers. `select_backend` (D20, Phase 4.3) gives this real
+    /// meaning beyond "on/off"; until then it's passed through as-is.
+    #[serde(default = "default_local_n_gpu_layers")]
+    pub n_gpu_layers: i32,
+    /// `"last"` | `"mean"` | `"cls"` — belongs with the embed model pin, not
+    /// the engine, but lives here rather than a fourth place since Kitty has
+    /// nowhere else that's specifically "embedding settings."
+    #[serde(default = "default_local_embed_pooling")]
+    pub embed_pooling: String,
+    /// `"f16"` (default, always safe) | `"q8_0"` | `"q4_0"` | `"q4_1"` |
+    /// `"q5_0"` | `"q5_1"`. An advanced knob — see
+    /// `bigtiny_rust::local::engine::parse_kv_cache_type`'s doc comment for
+    /// why a non-default value's safety on a given backend isn't guaranteed.
+    #[serde(default = "default_local_cache_type")]
+    pub cache_type_k: String,
+    #[serde(default = "default_local_cache_type")]
+    pub cache_type_v: String,
+}
+
+fn default_local_n_ctx() -> u32 {
+    4096
+}
+fn default_local_embed_n_ctx() -> u32 {
+    512
+}
+fn default_local_n_batch() -> u32 {
+    512
+}
+fn default_local_n_gpu_layers() -> i32 {
+    -1
+}
+fn default_local_embed_pooling() -> String {
+    "last".to_string()
+}
+fn default_local_cache_type() -> String {
+    "f16".to_string()
+}
+
+impl Default for LocalModelSettings {
+    fn default() -> Self {
+        Self {
+            n_ctx: default_local_n_ctx(),
+            embed_n_ctx: default_local_embed_n_ctx(),
+            n_batch: default_local_n_batch(),
+            n_threads: 0,
+            n_gpu_layers: default_local_n_gpu_layers(),
+            embed_pooling: default_local_embed_pooling(),
+            cache_type_k: default_local_cache_type(),
+            cache_type_v: default_local_cache_type(),
+        }
+    }
 }
 
 /// See `Config::summarizer`. `enabled` mirrors BigTiny's own
@@ -397,6 +476,7 @@ impl Default for Config {
             summarizer: SummarizerSettings::default(),
             token_management: TokenManagementSettings::default(),
             memory: MemorySettings::default(),
+            local: LocalModelSettings::default(),
         }
     }
 }
@@ -1143,6 +1223,21 @@ mod tests {
                 .as_nanos(),
             std::thread::current().id()
         )
+    }
+
+    /// A config predating `[local]` must still load, defaulting every knob to
+    /// the value `LocalEngineConfig` on the daemon side itself defaults to —
+    /// the whole point of the two structs mirroring each other is that
+    /// "unset on the Kitty side" and "unset on the daemon side" mean the same
+    /// thing, so the daemon never receives a value the user didn't choose.
+    #[test]
+    fn old_shape_config_defaults_local_settings() {
+        let back: Config = serde_json::from_str(r#"{"theme":"dark"}"#).unwrap();
+        assert_eq!(back.local, LocalModelSettings::default());
+        assert_eq!(back.local.n_ctx, 4096);
+        assert_eq!(back.local.n_gpu_layers, -1);
+        assert_eq!(back.local.cache_type_k, "f16");
+        assert_eq!(back.local.cache_type_v, "f16");
     }
 
     #[test]

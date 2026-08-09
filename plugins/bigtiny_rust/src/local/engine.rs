@@ -11,7 +11,7 @@ use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use llama_cpp_2::context::params::{LlamaContextParams, LlamaPoolingType};
+use llama_cpp_2::context::params::{KvCacheType, LlamaContextParams, LlamaPoolingType};
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::LlamaModel;
@@ -74,6 +74,36 @@ impl EmbedPooling {
             Self::Last => LlamaPoolingType::Last,
             Self::Mean => LlamaPoolingType::Mean,
             Self::Cls => LlamaPoolingType::Cls,
+        }
+    }
+}
+
+/// Parse `LocalEngineConfig::cache_type_k`/`_v` — `"f16"` (default), or a
+/// quantised type (`"q8_0"`, `"q4_0"`, `"q4_1"`, `"q5_0"`, `"q5_1"`) to trade
+/// KV-cache memory for a small quality/speed cost on long contexts.
+///
+/// Unknown values fall back to `F16` with a warning rather than erroring —
+/// same reasoning as `EmbedPooling::parse`: a typo in an advanced setting
+/// shouldn't take the daemon down, and `F16` is the always-safe choice.
+///
+/// **Deliberately does not touch flash attention.** Quantised KV cache needs
+/// it on some backends, but `LlamaContextParams::default()`'s `AUTO` policy
+/// (which nothing here overrides) already asks llama.cpp to decide that per
+/// backend — matching D19 ("auto-detected, never a user toggle"). Setting a
+/// non-`f16` type is consequently an advanced, deliberate choice whose safety
+/// on a given backend is upstream's to determine, not this function's.
+fn parse_kv_cache_type(s: &str) -> KvCacheType {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "f16" | "" => KvCacheType::F16,
+        "f32" => KvCacheType::F32,
+        "q8_0" => KvCacheType::Q8_0,
+        "q4_0" => KvCacheType::Q4_0,
+        "q4_1" => KvCacheType::Q4_1,
+        "q5_0" => KvCacheType::Q5_0,
+        "q5_1" => KvCacheType::Q5_1,
+        other => {
+            tracing::warn!("unknown cache_type {other:?}; defaulting to f16");
+            KvCacheType::F16
         }
     }
 }
@@ -165,7 +195,9 @@ impl LocalEngine {
     fn base_params(&self, n_ctx: u32) -> LlamaContextParams {
         let mut p = LlamaContextParams::default()
             .with_n_ctx(NonZeroU32::new(n_ctx))
-            .with_n_batch(self.cfg.n_batch);
+            .with_n_batch(self.cfg.n_batch)
+            .with_type_k(parse_kv_cache_type(&self.cfg.cache_type_k))
+            .with_type_v(parse_kv_cache_type(&self.cfg.cache_type_v));
         if self.cfg.n_threads > 0 {
             p = p
                 .with_n_threads(self.cfg.n_threads)
@@ -242,5 +274,39 @@ mod tests {
             matches!(err, LocalEngineError::ModelNotFound(_)),
             "expected ModelNotFound, got {err:?}"
         );
+    }
+
+    /// Regression: `cache_type_k`/`_v` used to be accepted config fields that
+    /// `base_params` never applied — the setting had no effect at all. This
+    /// pins the parse side; `base_params` applying it is covered by the fact
+    /// that a wrong parse here would make every context construction request
+    /// the wrong type.
+    #[test]
+    fn cache_type_parses_the_documented_values_case_insensitively() {
+        assert_eq!(parse_kv_cache_type("f16"), KvCacheType::F16);
+        assert_eq!(parse_kv_cache_type("Q8_0"), KvCacheType::Q8_0);
+        assert_eq!(parse_kv_cache_type(" q4_0 "), KvCacheType::Q4_0);
+        assert_eq!(parse_kv_cache_type("Q4_1"), KvCacheType::Q4_1);
+        assert_eq!(parse_kv_cache_type("q5_0"), KvCacheType::Q5_0);
+        assert_eq!(parse_kv_cache_type("q5_1"), KvCacheType::Q5_1);
+    }
+
+    /// An unknown/empty cache type must not be fatal — same reasoning as
+    /// pooling above — and must land on `F16`, the type every backend
+    /// supports unconditionally.
+    #[test]
+    fn unknown_cache_type_falls_back_to_f16() {
+        assert_eq!(parse_kv_cache_type("bogus"), KvCacheType::F16);
+        assert_eq!(parse_kv_cache_type(""), KvCacheType::F16);
+    }
+
+    /// `LocalEngineConfig::default()`'s `cache_type_k`/`_v` ("f16") must
+    /// round-trip through the parser to `F16` — the one combination every
+    /// existing install and every test GGUF actually exercises.
+    #[test]
+    fn the_default_config_parses_to_f16_for_both_slots() {
+        let cfg = LocalEngineConfig::default();
+        assert_eq!(parse_kv_cache_type(&cfg.cache_type_k), KvCacheType::F16);
+        assert_eq!(parse_kv_cache_type(&cfg.cache_type_v), KvCacheType::F16);
     }
 }

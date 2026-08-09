@@ -134,6 +134,7 @@ pub fn start_stack(app: &AppHandle) {
             summarizer,
             token_management,
             memory,
+            local,
             pathway_enabled,
             pathway_embedding_model,
         ) = {
@@ -146,6 +147,7 @@ pub fn start_stack(app: &AppHandle) {
                 cfg.summarizer.clone(),
                 cfg.token_management.clone(),
                 cfg.memory.clone(),
+                cfg.local.clone(),
                 cfg.adaptive_pathway_enabled,
                 cfg.adaptive_pathway_embedding_model.clone(),
             )
@@ -159,6 +161,7 @@ pub fn start_stack(app: &AppHandle) {
             &summarizer,
             &token_management,
             &memory,
+            &local,
             pathway_enabled,
             &pathway_embedding_model,
         )

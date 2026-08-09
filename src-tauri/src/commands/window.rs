@@ -136,6 +136,7 @@ pub async fn restart_backend(app: AppHandle) -> Result<(), String> {
         summarizer,
         token_management,
         memory,
+        local,
         pathway_enabled,
         pathway_embedding_model,
     ) = {
@@ -148,6 +149,7 @@ pub async fn restart_backend(app: AppHandle) -> Result<(), String> {
             cfg.summarizer.clone(),
             cfg.token_management.clone(),
             cfg.memory.clone(),
+            cfg.local.clone(),
             cfg.adaptive_pathway_enabled,
             cfg.adaptive_pathway_embedding_model.clone(),
         )
@@ -159,6 +161,7 @@ pub async fn restart_backend(app: AppHandle) -> Result<(), String> {
         &summarizer,
         &token_management,
         &memory,
+        &local,
         pathway_enabled,
         &pathway_embedding_model,
     )
