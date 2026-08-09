@@ -1,4 +1,5 @@
 pub mod chat;
+pub mod embeddings;
 pub mod health;
 pub mod mcp;
 pub mod memory;
@@ -30,6 +31,12 @@ pub struct AppState {
     pub config: BigTinyConfig,
     /// Behavioral-memory engine. `None` when disabled.
     pub pathway: Option<Arc<adaptive_pathway::engine::PathwayEngine>>,
+    /// Resident local-model slots (docs/ANDROID.md §4.1). Cheap to construct
+    /// and empty until something asks for a model, so it is unconditional
+    /// rather than an `Option` — "no local engine configured" is reported by
+    /// the slot itself, which keeps the error specific.
+    #[cfg(feature = "local-engine")]
+    pub local_slots: crate::local::SlotManager,
 }
 
 /// Builds the full route table. Paths/methods mirror
@@ -42,6 +49,8 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/health", get(health::check_health))
         .route("/api/status", get(health::status))
         .route("/api/memory/stats", get(memory::stats))
+        // Ollama-compatible on purpose — see routes/embeddings.rs.
+        .route("/api/embeddings", post(embeddings::embed))
         .route("/api/pathway/beliefs", get(pathway::list_beliefs))
         .route("/api/pathway/beliefs/{id}", delete(pathway::delete_belief))
         .route("/api/pathway/stats", get(pathway::stats))

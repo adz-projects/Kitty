@@ -23,8 +23,22 @@ async fn test_state() -> Arc<AppState> {
     test_state_with_pathway(None).await
 }
 
+/// Same as [`test_state`] but with a caller-supplied config, for routes whose
+/// behaviour is gated on a config flag (e.g. `[local].enabled`).
+#[allow(dead_code)]
+async fn test_state_with_config(config: BigTinyConfig) -> Arc<AppState> {
+    test_state_inner(None, config).await
+}
+
 async fn test_state_with_pathway(
     pathway: Option<Arc<adaptive_pathway::engine::PathwayEngine>>,
+) -> Arc<AppState> {
+    test_state_inner(pathway, BigTinyConfig::default()).await
+}
+
+async fn test_state_inner(
+    pathway: Option<Arc<adaptive_pathway::engine::PathwayEngine>>,
+    config: BigTinyConfig,
 ) -> Arc<AppState> {
     let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
     sqlx::query("PRAGMA foreign_keys = ON")
@@ -33,7 +47,6 @@ async fn test_state_with_pathway(
         .unwrap();
     sqlx::migrate!("./migrations").run(&pool).await.unwrap();
 
-    let config = BigTinyConfig::default();
     let router = Arc::new(ProviderRouter::new(config.cache.clone()));
     let mcp = Arc::new(MCPManager::new(pool.clone(), None));
     let hitl = Arc::new(tokio::sync::Mutex::new(HITLManager::new(
@@ -74,6 +87,8 @@ async fn test_state_with_pathway(
         scheduler,
         config,
         pathway,
+        #[cfg(feature = "local-engine")]
+        local_slots: bigtiny_rust::local::SlotManager::new(),
     })
 }
 
@@ -770,6 +785,122 @@ async fn pathway_routes_are_disabled_gracefully_with_no_engine() {
     assert_eq!(resp.status(), axum::http::StatusCode::OK);
     let body = body_json(resp).await;
     assert!(body.get("error").is_some());
+}
+
+/// `/api/embeddings` must exist on every build so the wire contract is
+/// stable — a 404 would be indistinguishable from a wrong URL, and Phase 2b
+/// re-points adaptive-pathway at exactly this path. With `[local].enabled`
+/// false (the default) it reports 503 + an explanation rather than pretending
+/// to work.
+#[tokio::test]
+async fn embeddings_route_exists_and_explains_itself_when_disabled() {
+    let state = test_state().await;
+    let app = create_router(state);
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/api/embeddings")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(r#"{"prompt":"hello"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        "disabled local engine should be 503, not 404 or 500"
+    );
+    let body = body_json(resp).await;
+    assert!(
+        body.get("error").is_some(),
+        "a 503 must say why: {body:?}"
+    );
+}
+
+/// A malformed request is the caller's fault, not the engine's, and must be
+/// distinguishable from "engine unavailable" — but only once the engine is
+/// actually enabled, since the disabled check short-circuits first.
+#[cfg(feature = "local-engine")]
+#[tokio::test]
+async fn embeddings_route_rejects_a_missing_prompt_as_a_bad_request() {
+    let cfg = BigTinyConfig {
+        local: bigtiny_rust::config::LocalEngineConfig {
+            enabled: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let app = create_router(test_state_with_config(cfg).await);
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/api/embeddings")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(r#"{"model":"x"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+}
+
+/// End-to-end through the real route with a real GGUF, when one is available.
+///
+/// Opt-in via `KITTY_TEST_EMBED_GGUF=<path>` rather than skipped-by-default
+/// magic: the model is ~376 MB and not in the repo, so CI can't run this, but
+/// it is the only test that proves the wire contract Phase 2b depends on
+/// (`{prompt}` → `{embedding:[...]}`) actually holds against the engine.
+#[cfg(feature = "local-engine")]
+#[tokio::test]
+async fn embeddings_route_returns_a_real_vector_when_a_model_is_available() {
+    let Ok(path) = std::env::var("KITTY_TEST_EMBED_GGUF") else {
+        eprintln!("skipping: set KITTY_TEST_EMBED_GGUF to a GGUF path to run");
+        return;
+    };
+    let cfg = BigTinyConfig {
+        local: bigtiny_rust::config::LocalEngineConfig {
+            enabled: true,
+            embed_model_path: path,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let app = create_router(test_state_with_config(cfg).await);
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/api/embeddings")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    r#"{"model":"embed","prompt":"the cat sat on the mat"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    let body = body_json(resp).await;
+    let v = body
+        .get("embedding")
+        .and_then(|v| v.as_array())
+        .expect("response must carry an `embedding` array — Ollama's shape");
+    assert!(v.len() > 100, "expected a real vector, got {} dims", v.len());
+    // Guard the failure mode a shape check would miss: a backend that returns
+    // a correctly-sized block of zeros/NaNs looks fine here but destroys
+    // adaptive-pathway recall.
+    let floats: Vec<f64> = v.iter().filter_map(|x| x.as_f64()).collect();
+    assert_eq!(floats.len(), v.len(), "all entries must be numbers");
+    assert!(floats.iter().all(|x| x.is_finite()), "no NaN/inf allowed");
+    assert!(
+        floats.iter().any(|x| x.abs() > 1e-6),
+        "all-zero embedding is not a usable vector"
+    );
+    let norm: f64 = floats.iter().map(|x| x * x).sum::<f64>().sqrt();
+    assert!((norm - 1.0).abs() < 1e-3, "expected L2-normalised, got {norm}");
 }
 
 #[tokio::test]

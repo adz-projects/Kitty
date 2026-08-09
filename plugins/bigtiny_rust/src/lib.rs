@@ -181,6 +181,10 @@ pub async fn run(config: BigTinyConfig, options: RunOptions) -> Result<(), Daemo
         scheduler: scheduler.clone(),
         config: config.clone(),
         pathway: pathway_engine.clone(),
+        // Starts empty; models load lazily on first use so daemon startup
+        // never blocks on a multi-hundred-MB read.
+        #[cfg(feature = "local-engine")]
+        local_slots: local::SlotManager::new(),
     });
 
     let auth = Arc::new(server::middleware::AuthConfig {
