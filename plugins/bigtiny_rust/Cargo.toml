@@ -27,6 +27,10 @@ path = "src/bin/bigtiny_daemon.rs"
 name = "local_engine_spike"
 required-features = ["local-engine"]
 
+[[example]]
+name = "local_embed_spike"
+required-features = ["local-engine"]
+
 [features]
 # In-process llama.cpp engine (docs/ANDROID.md D1, §3). Opt-in because
 # `llama-cpp-sys-2` builds llama.cpp from source via cmake — a multi-minute

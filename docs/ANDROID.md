@@ -78,11 +78,11 @@ D1–D21 are unchanged and un-renumbered — existing references (including in
 | D1 | **In-process llama.cpp, day 1, both OSes.** `bigtiny_rust` links **`llama-cpp-2` (`utilityai/llama-cpp-rs`), pinned at 0.1.154** — chosen in Phase 1 and validated end-to-end. The `llama_cpp` crate this doc used to name as a placeholder is **abandoned** (last release 2024-04-29). The `LocalEngine` boundary (§3.1) keeps the binding swappable. Chat, compaction, and desktop embeddings all go through the daemon; Kitty manages no inference process of its own (see §10 Phase 2 for what "no Ollama" does and doesn't mean). | §2, §4, §11 |
 | D2 | **Model is pinned per chat.** Locked in at chat creation; changes only on **new chats**. No mid-stream swap, ever. | §4.1 |
 | D3 | **Scheduled tasks default to the summarizer model**; per-task override in Settings. | §7 |
-| D4 | **Embeddings on desktop only.** AP calls new `POST /api/embeddings`; `AP_EMBED_OLLAMA_URL` re-points to the daemon port. On Android, AP's pipeline runs with its **built-in hash-space embeddings** (`HASH_EMBED_MODEL` fallback) — no embed model, no `/api/embeddings` call. | §3.1 |
+| D4 | **REVISED 2026-08-09 — semantic embeddings on BOTH platforms, one shared model.** `Qwen3-Embedding-0.6B` (q4_k_m GGUF, 376 MB, 1024-dim) runs through the same in-process engine on Windows *and* Android. AP calls the new `POST /api/embeddings`; `AP_EMBED_OLLAMA_URL` re-points to the daemon port. The hash-space vectorizer (`HASH_EMBED_MODEL`) is demoted to a **fallback** — used before the model is downloaded, or if it fails to load — not the Android norm. *Supersedes the original "desktop only / Android is hash-space" decision; §11's recall-quality-gap risk is retired with it.* | §3.1, §9 |
 | D5 | **In-app model downloads** from **HuggingFace** and the **Ollama registry** (manifest → blob → reassembled GGUF). Range+resume+sha256. | §5 |
 | D6 | **Exposed llama.cpp engine knobs** + **Quick Presets** (Precise/Balanced/Creative). | §6 |
 | D7 | **No proactive disk quota.** Only a low-free-space warning; manual delete. **Hard refusal when `free_space < model_size × 1.5`**. | §5 |
-| D8 | Adaptive-Pathway runs **on both OSes, in-process inside the BigTiny daemon** (linked crate, MCP `in_process` "pathway" server — never a separate process). Windows: daemon is a Kitty-managed sidecar; Android: daemon is in-process. Android runs the *full* AP engine (recall/surface/consolidate) with hash-space embeddings (D4); MCP tool servers: **stdio sidecar on Windows**, **`in_process` on Android** — the `in_process` transport and all four servers already exist (§2.3); Android needs cross-compilation and a registration flip, not new machinery. | §2, §2.3 |
+| D8 | Adaptive-Pathway runs **on both OSes, in-process inside the BigTiny daemon** (linked crate, MCP `in_process` "pathway" server — never a separate process). Windows: daemon is a Kitty-managed sidecar; Android: daemon is in-process. Android runs the *full* AP engine (recall/surface/consolidate) **with the same semantic embeddings as desktop** (D4, revised — no longer hash-space); MCP tool servers: **stdio sidecar on Windows**, **`in_process` on Android** — the `in_process` transport and all four servers already exist (§2.3); Android needs cross-compilation and a registration flip, not new machinery. | §2, §2.3 |
 | D9 | Frontend = 2 windows (`overlay` + `hub`); settings/wizard fold in-page. Android = same hub, mobile-rendered. | §8 |
 | D10 | **Model card** (size/RAM/VRAM/backend/one-tap new-chat default) + **"Recommended for this device" badge** computed from the fit function. | §6.3 |
 | D11 | Load-time param changes schedule an **automatic engine restart**: after the current LLM generation completes, or immediately if nothing is generating. Sessions show a non-blocking "restarting" chip. | §6.4 |
@@ -92,7 +92,7 @@ D1–D21 are unchanged and un-renumbered — existing references (including in
 | D15 | **Shared design tokens** consumed by both render paths; **dark/light follows the OS** (manual override allowed). | §8.4 |
 | D16 | **Safe-area tokens** (`--safe-*`): real `env()` on Android, `0` on desktop. | §8.4 |
 | D17 | **Font parity**: Android accessibility font scale and Windows zoom both drive one shared `--font-scale`/rem ramp; **full px→rem sweep of `base.css`**. | §8.4 |
-| D18 | **Android = cloud-chat only.** Local engine on Android runs **solely the summarizer**. No local chat, no local model picker, no per-chat local choice. One resident local model. | §2.2, §4.2 |
+| D18 | **Android = cloud-chat only.** No local *chat*, no local model picker, no per-chat local choice. **Amended by D4's revision:** the local engine on Android now runs **two** models, not one — the summarizer *and* the embedder (~1.1 GB of GGUFs between them). Still no chat slot. | §2.2, §4.1, §4.2 |
 | D19 | **`flash_attn` auto-detected** at engine init; never a user toggle (read-only card diagnostic `"off"`/"on (<backend>)"). | §3.3 |
 | D20 | **`auto`/`-1` select backend**: `select_backend()` returns `Cuda|Vulkan|Cpu`; fit/badge/VRAM math uses the *selected* backend's VRAM bank. | §3.3 |
 | D21 | **Windows multi-window is preserved**: two (or more) hub windows may be open at once, each with its **own independent session and its own pinned model**. Android stays single-window. | §8.1, §4.2 |
@@ -110,20 +110,29 @@ D1–D21 are unchanged and un-renumbered — existing references (including in
 | Platform | Chat | Summarizer | Embeddings | MCP tool servers | AP |
 |----------|------|-----------|------------|------------------|----|
 | Windows | Local (llama) **and** cloud providers | Local (llama) → session-model fallback | Local (via daemon endpoint) | stdio sidecars (bundled `.exe`s) | ✓ (in-process in daemon, semantic embeddings) |
-| Android | **Cloud providers only** | Local (llama) → session-model fallback | — | **the same crates, `in_process`** (§2.3) | ✓ (in-process in daemon, hash-space embeddings) |
+| Android | **Cloud providers only** | Local (llama) → session-model fallback | **Local — same model, same endpoint** (D4 revised) | **the same crates, `in_process`** (§2.3) | ✓ (in-process in daemon, **semantic** embeddings) |
+
+Since D4's revision the two platforms differ in exactly one place — whether
+*chat* can run locally. Summarization, embeddings, and AP are now identical
+code on identical models.
 
 The MCP-tool-server column is the only row entry that needs new *wiring* rather
 than new *code* — see §2.3.
 
-### 2.2 Local model policy per platform (D18)
-- **Android**: exactly **one resident local model** — the summarizer (default
-  `LFM2.5-1.2B`). Chat never loads a local model, so there are no per-chat swaps
-  (keeps the 1-slot RAM floor and warm-cache benefits). The default GGUF is
-  **downloaded on first use** (not bundled in the APK); until it exists, the
-  summarizer falls back to the session model per D12.
-- **Windows:** 2 resident slots — `chat` and `summarizer/embeddings`. Chat slot
-  only loads when a chat pins a local model (D2); otherwise chat talks to cloud
-  providers and the slots stay only on the summarizer model.
+### 2.2 Local model policy per platform (D18, as amended by D4's revision)
+- **Android**: **two** resident local models — the summarizer (`LFM2.5-1.2B`,
+  730 MB) and the embedder (`Qwen3-Embedding-0.6B` q4_k_m, 376 MB). Chat never
+  loads a local model, so there are still no per-chat swaps. Both GGUFs are
+  **downloaded on first use** (not bundled in the APK). Until each exists, its
+  consumer degrades rather than fails: the summarizer falls back to the session
+  model (D12), and AP falls back to hash-space embeddings (D4).
+  - **This raises the Android RAM floor** — ~1.1 GB of weights plus KV/scratch,
+    where the original plan budgeted for one model. The embedder is small and
+    short-context (512 is plenty for a belief), so it is the cheaper of the two
+    to keep resident; if a device can only hold one, evict per §4.1.
+- **Windows:** 2 resident slots — `chat` and `summarizer`/`embeddings`. Chat
+  slot only loads when a chat pins a local model (D2); otherwise chat talks to
+  cloud providers and the slots stay on the summarizer + embedder.
 
 ### 2.3 In-process MCP + Adaptive-Pathway process model (D8)
 
@@ -327,13 +336,24 @@ Windows builds `llama_cpp` with `cuda`+`vulkan` features; Android builds CPU-onl
 
 | OS | Slots | Content | Eviction |
 |----|-------|---------|----------|
-| Windows | chat pool + 1 summarizer | chat pool: **one slot per active local-chat window** (D21); summarizer/embeddings shared | idle slot only |
-| Android | 1 | summarizer | (no competitor) |
+| Windows | chat pool + summarizer + embedder | chat pool: **one slot per active local-chat window** (D21) | idle slot only |
+| Android | 2 | summarizer + embedder | embedder first under pressure (see below) |
+
+**Embedder slot (D4 revised).** It is a separate slot from the summarizer, not
+a share of it — different model, different `n_ctx` (512 is ample for a belief),
+and `LlamaContextParams::with_embeddings(true)` is a context-construction flag,
+so one context cannot serve both roles. It is also the cheapest thing to evict:
+376 MB, short context, and AP already degrades gracefully to hash-space when it
+is absent (D4). Under memory pressure on Android, **evict the embedder before
+the summarizer** — a missed summarization blocks compaction, a missed embedding
+just lowers recall quality for those beliefs until they are re-embedded by the
+existing `reembed_stale_beliefs` pass.
 
 - A session pins its model at creation (D2). A new session requesting a missing
   model **adds a chat-slot on demand** (Windows) or **queues behind any busy slot**
-  (Android's summarizer-only case); frontend shows **"Model loading…"** in the
-  new-chat composer until ready. In-flight streams are **never aborted**.
+  (Android, where only the summarizer and embedder compete); frontend shows
+  **"Model loading…"** in the new-chat composer until ready. In-flight streams
+  are **never aborted**.
 - **Windows multi-window (D21):** two hub windows may run **concurrently**, each
   with its own pinned (possibly different) model. Each gets its own chat slot from
   the pool; slots with identical model weights share the loaded tensors (only one
@@ -523,7 +543,9 @@ All under `Settings → Local models`, shared component on both OS.
 
 ---
 
-## 9. Default model
+## 9. Default models
+
+### 9.1 Summarizer
 
 - `LiquidAI/LFM2.5-1.2B-Instruct-GGUF` → file
   **`LFM2.5-1.2B-Instruct-Q4_K_M.gguf`** — note the case; HuggingFace resolve
@@ -542,6 +564,41 @@ All under `Settings → Local models`, shared component on both OS.
     already carries the BOS/turn markers).
 - **Fallback model = Qwen3-1.2B q4_K_M** — not needed; `lfm2` works. Kept as
   the documented escape hatch only.
+
+### 9.2 Embedder (D4 revised — both platforms)
+
+- **`Qwen3-Embedding-0.6B`, q4_k_m GGUF — validated.** 394,704,832 bytes
+  (376 MiB), **1024-dim**, `n_ctx_train` 32,768, 28 layers. One model on
+  Windows and Android, so beliefs embedded on one platform stay comparable on
+  the other.
+  - `sha256 = c608745221a03d45ee7328aab5ae180ef5db54c9a47eda43ef05f73156ba824b`
+    — pin this in the Phase 3 downloader.
+  - Measured separation on a related/unrelated pair: **cos 0.73 vs 0.29**. The
+    probe (`examples/local_embed_spike.rs`) asserts that ordering, not just the
+    vector shape — a backend returning well-formed constant vectors would pass
+    a dim check while silently destroying AP recall.
+- **Pooling must be set explicitly, per model.** llama.cpp defaults to
+  `LlamaPoolingType::None`, which yields *no* sequence embedding —
+  `embeddings_seq_ith` then fails with `NonePoolType`. Qwen3-Embedding is a
+  causal-LM-derived embedder and needs **`Last`**. A BERT-style embedder (bge,
+  gte, nomic) would need `Mean`/`Cls` instead, so this is a property of the
+  model pin, not a constant in the engine — `embeddings.rs` must carry it
+  alongside the model id. (It fails loudly, which is the good case.)
+- **Source caveat, worth knowing:** Qwen's *official* GGUF repo
+  (`Qwen/Qwen3-Embedding-0.6B-GGUF`) publishes **only `Q8_0` (609 MB)** — no
+  smaller quant. The 376 MB q4_k_m comes from the community repo
+  `Mungert/Qwen3-Embedding-0.6B-GGUF`. Since this is a bundled default rather
+  than a user-chosen model, **pin its sha256** in the Phase 3 downloader (D5
+  already verifies sha256) so provenance is a fixed artifact rather than
+  standing trust in an uploader. If that repo ever disappears, official `Q8_0`
+  is the drop-in fallback at +233 MB.
+- The base `Qwen/Qwen3-Embedding-0.6B` repo is safetensors only, and
+  `mlx-community/...-4bit-DWQ` is **MLX format — Apple-Silicon only, not
+  loadable by llama.cpp**. Neither is usable here.
+- Dimension mismatch is a non-issue: adaptive-pathway already projects to its
+  configured `embedding_dim` (`embed/project.rs`), and changing embedder
+  triggers the existing `sync_embedding_model_fingerprint` → re-embed
+  migration rather than silently mixing spaces.
 - GGUF cache lives in app-local dir (Android backup-excluded).
 
 ---
@@ -781,11 +838,17 @@ order: flip adaptive-pathway's `AP_EMBED_OLLAMA_URL` to the daemon
   and Wi-Fi↔Cellular transitions** may stall long GGUF pulls → `START_STICKY` +
   persisted queue + byte-offset resume on reconnect (§5.2/§7).
 - The narrow cloud exception (D12) is deliberate; keep it scoped to compaction.
-- **AP on Android uses hash-space embeddings (D8/D4):** semantic recall quality
-  is lower than Windows until a local embed model is added — acceptable for the
-  cloud-chat-only Android path; the pipeline (recall/surface/consolidate) is
-  identical and shares code, so a future embedder slot lifts Android AP without
-  a rewrite.
+- ~~AP on Android uses hash-space embeddings, so recall quality lags Windows~~
+  — **retired by D4's revision.** Both platforms now run the same
+  `Qwen3-Embedding-0.6B`, so there is no quality gap and no cross-platform
+  vector-space split. The trade moved rather than vanished: Android now carries
+  **~1.1 GB of resident model weights** instead of one model, which is the new
+  thing to watch on low-RAM devices (§2.2, §4.1's eviction order).
+- **Hash-space is still reachable and still matters** — it's the pre-download
+  and load-failure fallback (D4). Beliefs written in that space are tagged
+  `HASH_EMBED_MODEL` and picked up later by `reembed_stale_beliefs`, so a
+  first-run device that embeds before the GGUF lands self-heals. That machinery
+  already exists and was hardened in the 88bugs re-audit (#89/#90).
 - **Windows multi-window RAM:** two concurrent chat windows pin two potentially
   different local models → two chat slots + summarizer resident. Weights are
   shared when models match; the chat-pool evicts the **idle** slot first if RAM is
