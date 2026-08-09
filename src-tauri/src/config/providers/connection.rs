@@ -2,10 +2,46 @@
 
 use std::time::Duration;
 
-use crate::lifecycle::ollama_proc;
-
 use super::keyring::get_secret_async;
 use super::ProviderProfile;
+
+/// One timeout for every probe here. Long enough for a cold remote endpoint,
+/// short enough that "Retry connection check" doesn't feel hung.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// `GET /api/version` — treat any successful HTTP response as "up".
+///
+/// Lives here rather than in a shared Ollama module because this is now the
+/// *only* Ollama probe Kitty performs: the app no longer manages an Ollama
+/// process, it just lets you point a provider profile at one you run yourself.
+async fn probe_version(client: &reqwest::Client, base_url: &str) -> bool {
+    let url = format!("{}/api/version", base_url.trim_end_matches('/'));
+    client.get(url).timeout(PROBE_TIMEOUT).send().await.is_ok()
+}
+
+/// `GET /api/tags` — true if the exact `tag` is installed on that server.
+async fn has_model_tag(client: &reqwest::Client, base_url: &str, tag: &str) -> bool {
+    let url = format!("{}/api/tags", base_url.trim_end_matches('/'));
+    match client.get(url).timeout(PROBE_TIMEOUT).send().await {
+        Ok(resp) => match resp.json::<serde_json::Value>().await {
+            Ok(json) => tags_response_has_tag(&json, tag),
+            Err(_) => false,
+        },
+        Err(_) => false,
+    }
+}
+
+/// Pure matching logic behind `has_model_tag`, split out so it's unit
+/// testable without standing up a live (or mocked) Ollama server.
+fn tags_response_has_tag(json: &serde_json::Value, tag: &str) -> bool {
+    json.get("models")
+        .and_then(|m| m.as_array())
+        .map(|a| {
+            a.iter()
+                .any(|m| m.get("name").and_then(|n| n.as_str()) == Some(tag))
+        })
+        .unwrap_or(false)
+}
 
 /// Lightweight, on-demand connectivity+auth probe for a provider profile —
 /// never used for a background poll (that was deliberately removed, see
@@ -17,11 +53,11 @@ pub async fn test_connection(profile: &ProviderProfile) -> Result<(), String> {
     match profile.provider_type.as_str() {
         "ollama" => {
             let client = crate::util::http_client();
-            if !ollama_proc::probe_version(&client, &profile.base_url).await {
+            if !probe_version(&client, &profile.base_url).await {
                 return Err(format!("couldn't reach Ollama at {}", profile.base_url));
             }
             if let Some(model) = profile.models.first() {
-                if !ollama_proc::has_model_tag(&client, &profile.base_url, model).await {
+                if !has_model_tag(&client, &profile.base_url, model).await {
                     return Err(format!(
                         "Ollama is reachable, but \"{model}\" isn't installed"
                     ));
@@ -271,5 +307,47 @@ mod tests {
             result,
             Err("no API key stored for this profile — edit it and add one".to_string())
         );
+    }
+
+    /// The tag match is exact, not a prefix: `qwen3-embedding:0.6b` and
+    /// `:4b` are different models in different latent spaces, and treating
+    /// one as the other would silently mix them. Moved here from
+    /// `lifecycle/ollama_proc.rs` when managed Ollama was retired — the logic
+    /// still guards the one Ollama probe Kitty kept.
+    #[test]
+    fn tags_response_has_tag_matches_exact_name() {
+        let body = serde_json::json!({
+            "models": [
+                {"name": "llama3.2:3b"},
+                {"name": "qwen3-embedding:0.6b"},
+            ]
+        });
+        assert!(tags_response_has_tag(&body, "qwen3-embedding:0.6b"));
+    }
+
+    #[test]
+    fn tags_response_has_tag_rejects_different_size_tag() {
+        let body = serde_json::json!({ "models": [{"name": "qwen3-embedding:4b"}] });
+        assert!(!tags_response_has_tag(&body, "qwen3-embedding:0.6b"));
+    }
+
+    #[test]
+    fn tags_response_has_tag_false_when_absent() {
+        let body = serde_json::json!({ "models": [{"name": "llama3.2:3b"}] });
+        assert!(!tags_response_has_tag(&body, "qwen3-embedding:0.6b"));
+    }
+
+    #[test]
+    fn tags_response_has_tag_false_on_empty_models() {
+        let body = serde_json::json!({ "models": [] });
+        assert!(!tags_response_has_tag(&body, "qwen3-embedding:0.6b"));
+    }
+
+    /// A server that answers with something other than Ollama's shape must
+    /// read as "tag absent", not panic.
+    #[test]
+    fn tags_response_has_tag_false_on_malformed_response() {
+        let body = serde_json::json!({ "unexpected": "shape" });
+        assert!(!tags_response_has_tag(&body, "qwen3-embedding:0.6b"));
     }
 }

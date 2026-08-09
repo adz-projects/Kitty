@@ -13,7 +13,17 @@ use crate::state::StackStatus;
 use crate::windows;
 use crate::wizard;
 
-use super::ollama::ollama_base;
+/// The configured Ollama endpoint. Read inline rather than imported from the
+/// Ollama command module — that module is going away with managed Ollama, and
+/// this is a plain config read, not part of its surface.
+fn ollama_base(app: &AppHandle) -> String {
+    app.state::<AppState>()
+        .config
+        .lock()
+        .unwrap()
+        .ollama_base_url
+        .clone()
+}
 
 /// Detect Ollama (presence, version, path).
 #[tauri::command]
