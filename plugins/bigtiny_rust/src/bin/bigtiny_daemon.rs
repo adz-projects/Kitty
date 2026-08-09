@@ -225,6 +225,9 @@ fn apply_env_overrides(config: &mut BigTinyConfig) {
     {
         config.local.n_gpu_layers = n;
     }
+    if let Ok(v) = std::env::var("BIGTINY_LOCAL__BACKEND") {
+        config.local.backend = v;
+    }
     if let Ok(v) = std::env::var("BIGTINY_LOCAL__CACHE_TYPE_K") {
         config.local.cache_type_k = v;
     }

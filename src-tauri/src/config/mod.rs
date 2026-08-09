@@ -304,10 +304,15 @@ pub struct LocalModelSettings {
     /// `0` = let llama.cpp pick from the host's core count.
     #[serde(default)]
     pub n_threads: i32,
-    /// `-1` = all layers. `select_backend` (D20, Phase 4.3) gives this real
-    /// meaning beyond "on/off"; until then it's passed through as-is.
+    /// `-1` = all layers to the selected backend; `0` is CPU-only.
     #[serde(default = "default_local_n_gpu_layers")]
     pub n_gpu_layers: i32,
+    /// `"auto"` (default) | `"cuda"` | `"vulkan"` | `"cpu"` — see
+    /// `bigtiny_rust::local::backend`. Only `"cpu"` and `"auto"` do anything
+    /// on current builds: no GPU cargo feature is enabled yet, so the device
+    /// registry reports CPU only and the other two fall back to it.
+    #[serde(default = "default_local_backend")]
+    pub backend: String,
     /// `"last"` | `"mean"` | `"cls"` — belongs with the embed model pin, not
     /// the engine, but lives here rather than a fourth place since Kitty has
     /// nowhere else that's specifically "embedding settings."
@@ -338,6 +343,9 @@ fn default_local_n_gpu_layers() -> i32 {
 fn default_local_embed_pooling() -> String {
     "last".to_string()
 }
+fn default_local_backend() -> String {
+    "auto".to_string()
+}
 fn default_local_cache_type() -> String {
     "f16".to_string()
 }
@@ -350,6 +358,7 @@ impl Default for LocalModelSettings {
             n_batch: default_local_n_batch(),
             n_threads: 0,
             n_gpu_layers: default_local_n_gpu_layers(),
+            backend: default_local_backend(),
             embed_pooling: default_local_embed_pooling(),
             cache_type_k: default_local_cache_type(),
             cache_type_v: default_local_cache_type(),

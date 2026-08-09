@@ -130,6 +130,8 @@ pub struct LocalEngine {
     backend: Arc<LlamaBackend>,
     path: PathBuf,
     cfg: LocalEngineConfig,
+    /// Which compute backend this model was loaded onto (D20).
+    selected_backend: super::backend::SelectedBackend,
 }
 
 impl LocalEngine {
@@ -141,13 +143,27 @@ impl LocalEngine {
         }
         let backend = shared_backend()?;
 
+        // D20: pick the compute backend from llama.cpp's own device registry
+        // before deciding how many layers to offload. `select_backend`
+        // resolves `"auto"`/`"cuda"`/`"vulkan"`/`"cpu"` against what's
+        // actually enumerated, falling back to CPU rather than failing.
+        let selected = super::backend::select_backend(&cfg.backend);
+
         let mut params = LlamaModelParams::default();
-        // `n_gpu_layers < 0` means "all layers" to llama.cpp; pass it through
-        // rather than trying to compute a layer count we don't have yet (the
-        // model isn't loaded). D20's richer backend selection layers on top.
-        if cfg.n_gpu_layers >= 0 {
+        if selected.kind() == super::backend::BackendKind::Cpu {
+            // Force 0 rather than leaving `-1` ("all layers"): with no GPU
+            // selected there is nowhere to offload to, and being explicit
+            // keeps the intent legible in a crash log. This is also the
+            // branch every current build takes — no GPU cargo feature is
+            // enabled yet (see `Cargo.toml`).
+            params = params.with_n_gpu_layers(0);
+        } else if cfg.n_gpu_layers >= 0 {
             params = params.with_n_gpu_layers(cfg.n_gpu_layers as u32);
         }
+        // `n_gpu_layers < 0` on a GPU backend is left at llama.cpp's own `-1`
+        // default, which means "all layers" — and is also the one value
+        // `LlamaModelParams::fit_params` requires be untouched, so this stays
+        // the shape that can adopt it later (see `backend.rs`'s module doc).
 
         let model = LlamaModel::load_from_file(&backend, path, &params).map_err(|source| {
             LocalEngineError::Load {
@@ -161,6 +177,8 @@ impl LocalEngine {
             layers = model.n_layer(),
             n_embd = model.n_embd(),
             n_ctx_train = model.n_ctx_train(),
+            compute_backend = %selected.backend,
+            device = selected.device.as_deref().unwrap_or("cpu"),
             "local model loaded"
         );
 
@@ -169,7 +187,16 @@ impl LocalEngine {
             backend,
             path: path.to_path_buf(),
             cfg: cfg.clone(),
+            selected_backend: selected,
         })
+    }
+
+    /// The backend this model was actually loaded onto — for the Settings
+    /// model card's "Backend now" row and VRAM figure. Recorded at load time
+    /// rather than re-queried, so the card reports what the resident model is
+    /// really using, not what a fresh selection would pick now.
+    pub fn selected_backend(&self) -> &super::backend::SelectedBackend {
+        &self.selected_backend
     }
 
     pub fn path(&self) -> &Path {

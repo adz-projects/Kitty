@@ -805,11 +805,25 @@ held a sender the response body was waiting on), and prompt prefill ignored
   test, which needs the foreground service to exist first.
 
 ### Phase 4 — Settings
-- Also inherited from Phase 3: **enable the `vulkan` cargo feature** for the
-  Windows target (not `cuda`). Vulkan needs the Vulkan SDK on PATH for
-  `glslc` — add it to `docs/PLUGINS.md`'s prerequisites next to libclang and
-  Ninja, since a missing `glslc` fails in the same "looks like a crate bug"
-  way those two do.
+- **4.3 shipped selection, not GPU.** `src/local/backend.rs` implements D20's
+  device query, ranking (CUDA > Vulkan > CPU), explicit pinning, VRAM
+  reporting and CPU fallback over llama.cpp's own registry — 10 unit tests,
+  none needing a GPU, since the policy is testable against a synthetic device
+  list. `LocalEngine::load` uses it and records the result for the model card.
+  Two deliberate omissions, both blocked on hardware/toolchain rather than
+  design:
+  - **The `vulkan` cargo feature stays off.** The Vulkan SDK isn't installed
+    here, and enabling the feature without it breaks the build rather than
+    adding a backend. It's a one-line change in
+    `plugins/bigtiny_rust/Cargo.toml` once the SDK is present; the selection
+    code needs nothing further.
+  - **`fit_params` is not wired.** llama.cpp's own optimal-`n_gpu_layers`
+    solver requires `n_gpu_layers` left at `-1`, co-decides model *and*
+    context params in a single call (this crate builds them separately), and
+    is explicitly not thread-safe. CPU-only it resolves to "0 layers
+    offloaded" every time — so wiring it now would add an unvalidated,
+    globally-mutating call to every model load in exchange for nothing. The
+    load path deliberately preserves the untouched-`-1` shape it will need.
 - Knobs/presets/model card/badge/health; **auto-restart scheduling** (§6.4);
   backend-aware hiding. Acceptance: settings round-trip via `commands/` + UI;
   **restart applies immediately when idle, and only after the in-flight
@@ -902,6 +916,10 @@ held a sender the response body was waiting on), and prompt prefill ignored
     logs `CMake project was already configured. Skipping configuration step.`
     and reuses the *wrong* generator forever. Fixing the env is not enough —
     delete `target/<triple>/*/build/llama-cpp-sys-2-*/` before retrying.
+  - **Vulkan SDK**, for the `vulkan` cargo feature only (`glslc`, to compile
+    the shaders). Same failure shape as libclang: a cmake-step error that
+    reads like a crate bug. **Not installed on this machine**, which is why
+    Phase 4.3 shipped backend selection without enabling the feature.
 - **§11's cmake-variable framing is superseded by cargo features.** With
   `llama-cpp-2` you do *not* set `ANDROID_STL`/`LLAMA_OPENMP` by hand:
   - `ANDROID_STL=c++_static` → the **`android-static-stdcxx`** +

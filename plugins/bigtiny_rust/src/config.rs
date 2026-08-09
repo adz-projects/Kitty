@@ -74,9 +74,15 @@ pub struct LocalEngineConfig {
     /// `0` = let llama.cpp pick from the host's core count.
     #[serde(default)]
     pub n_threads: i32,
-    /// `-1`/`auto` semantics live in `select_backend` (D20); `0` is CPU-only.
+    /// `-1` = all layers to the selected backend; `0` is CPU-only.
     #[serde(default = "default_local_n_gpu_layers")]
     pub n_gpu_layers: i32,
+    /// Which compute backend to use: `"auto"` (default) | `"cuda"` |
+    /// `"vulkan"` | `"cpu"`. See `local::backend::select_from` — an explicit
+    /// backend that isn't present falls back to CPU rather than failing the
+    /// load, and an unrecognised value behaves as `"auto"`.
+    #[serde(default = "default_local_backend")]
+    pub backend: String,
     #[serde(default = "default_local_cache_type")]
     pub cache_type_k: String,
     #[serde(default = "default_local_cache_type")]
@@ -98,6 +104,9 @@ fn default_local_n_batch() -> u32 {
 fn default_local_n_gpu_layers() -> i32 {
     -1
 }
+fn default_local_backend() -> String {
+    "auto".into()
+}
 fn default_local_cache_type() -> String {
     "f16".into()
 }
@@ -114,6 +123,7 @@ impl Default for LocalEngineConfig {
             n_batch: default_local_n_batch(),
             n_threads: 0,
             n_gpu_layers: default_local_n_gpu_layers(),
+            backend: default_local_backend(),
             cache_type_k: default_local_cache_type(),
             cache_type_v: default_local_cache_type(),
         }

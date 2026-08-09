@@ -124,10 +124,17 @@ llama-cpp-2 = { version = "0.1.154", default-features = false, features = [
     "static-stdcxx",
 ], optional = true }
 
-# Windows: CPU-only for now. `cuda`/`vulkan` are cargo features on this crate,
-# and the CUDA toolkit (~3 GB) is deliberately deferred to Phase 2's desktop
-# GPU work — the Phase 1 gate doesn't need a GPU backend to prove linkage.
-# See docs/ANDROID.md D20 for the backend-selection design this feeds.
+# Windows: **still CPU-only.** The backend-*selection* half of D20 shipped in
+# Phase 4.3 (`src/local/backend.rs`) and correctly reports CPU here, but no GPU
+# cargo feature is enabled, so the ggml device registry only ever enumerates a
+# CPU device.
+#
+# To turn on Vulkan, add `"vulkan"` to the feature list below — **and install
+# the Vulkan SDK first**, because `llama-cpp-sys-2` shells out to `glslc` to
+# compile the shaders. Without it the build fails inside the cmake step with a
+# message that reads like a crate bug rather than a missing tool, exactly like
+# the libclang and Ninja prerequisites in docs/ANDROID.md §11. CUDA (`"cuda"`)
+# additionally wants the ~3 GB toolkit and stays deferred.
 [target.'cfg(windows)'.dependencies]
 llama-cpp-2 = { version = "0.1.154", default-features = false, features = [
     "common",

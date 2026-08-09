@@ -14,6 +14,7 @@
 //! - [`manager`] — resident slot manager; who is loaded, and swapping.
 //! - `provider` / `embeddings` / `summarizer` — consumers built on those.
 
+pub mod backend;
 pub mod embeddings;
 pub mod engine;
 pub mod manager;
@@ -21,6 +22,7 @@ pub mod pathway_embed;
 pub mod provider;
 pub mod summarizer;
 
+pub use backend::{select_backend, BackendKind, SelectedBackend};
 pub use engine::{EmbedPooling, LocalEngine, LocalEngineError};
 pub use manager::{SlotKind, SlotManager, SlotStatus};
 pub use pathway_embed::LocalPathwayEmbedder;

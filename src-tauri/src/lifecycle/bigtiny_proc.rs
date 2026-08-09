@@ -222,6 +222,7 @@ pub async fn spawn(
     .env("BIGTINY_LOCAL__N_BATCH", local.n_batch.to_string())
     .env("BIGTINY_LOCAL__N_THREADS", local.n_threads.to_string())
     .env("BIGTINY_LOCAL__N_GPU_LAYERS", local.n_gpu_layers.to_string())
+    .env("BIGTINY_LOCAL__BACKEND", &local.backend)
     .env("BIGTINY_LOCAL__EMBED_POOLING", &local.embed_pooling)
     .env("BIGTINY_LOCAL__CACHE_TYPE_K", &local.cache_type_k)
     .env("BIGTINY_LOCAL__CACHE_TYPE_V", &local.cache_type_v);
