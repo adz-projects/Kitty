@@ -8,6 +8,9 @@
 //! testable — the `#[tauri::command]` wrappers in `commands/models.rs` do the
 //! event emitting.
 
+pub mod download;
+pub mod gguf;
+
 use std::path::{Path, PathBuf};
 
 /// A GGUF present in the models directory.

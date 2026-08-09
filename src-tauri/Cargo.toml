@@ -37,6 +37,9 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 sysinfo = "0.32"
+# GGUF download verification (docs/ANDROID.md §5.2). Same pin the daemon uses.
+sha2 = "0.10"
+bytes = "1"
 dirs = "5"
 rand = "0.8"
 futures-util = "0.3"

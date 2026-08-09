@@ -2116,6 +2116,7 @@ name = "kitty"
 version = "0.5.0"
 dependencies = [
  "base64 0.22.1",
+ "bytes",
  "chrono",
  "dirs 5.0.1",
  "futures-util",
@@ -2129,6 +2130,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_norway",
+ "sha2",
  "sysinfo",
  "tauri",
  "tauri-build",
