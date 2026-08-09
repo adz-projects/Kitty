@@ -187,23 +187,37 @@ impl Agent {
             dashmap::mapref::entry::Entry::Vacant(entry) => {
                 // Disconnect watcher: `tx.closed()` resolves once the SSE
                 // receiver (owned by the axum response body) is dropped —
-                // which happens both on a genuine early client disconnect
-                // *and* on ordinary end-of-stream once the loop below
-                // finishes and drops its own `tx`. We can't tell those apart
-                // from this signal alone, so instead of cancelling
-                // immediately we wait out the grace window and then only
-                // cancel if *this exact turn* (matched by `turn_token`) is
-                // still the one registered for the session — if the loop
-                // already finished naturally (or a later turn replaced this
-                // entry), `cancel_if_current` is a no-op. This is what makes
-                // a dropped mobile connection recoverable rather than an
-                // instant kill: see `AgentConfig::disconnect_grace_secs`.
+                // i.e. when the client hangs up. We don't cancel immediately:
+                // we wait out the grace window and then only cancel if *this
+                // exact turn* (matched by `turn_token`) is still the one
+                // registered for the session. This is what makes a dropped
+                // mobile connection recoverable rather than an instant kill:
+                // see `AgentConfig::disconnect_grace_secs`.
+                //
+                // The watcher must also stop when the turn simply *finishes*,
+                // hence `turn_done`. Without it this deadlocked every SSE
+                // response: the watcher held a live `tx` clone, so the channel
+                // never closed, so the response body never ended, so the
+                // receiver was never dropped, so `closed()` never resolved.
+                // A client reading to EOF (rather than stopping at `llm_stop`)
+                // would hang forever, and every turn leaked a task.
                 let watch_tx = tx.clone();
                 let watcher_agent = this.clone();
                 let watcher_session_id = session_id.clone();
                 let grace = Duration::from_secs(this.config.agent.disconnect_grace_secs.max(1));
+                let (turn_done, turn_done_rx) = tokio::sync::oneshot::channel::<()>();
                 tokio::spawn(async move {
-                    watch_tx.closed().await;
+                    tokio::select! {
+                        _ = watch_tx.closed() => {}
+                        // Resolves (as `Err`) when the turn task drops its end,
+                        // whether it completed or panicked. Either way there is
+                        // nothing left to cancel.
+                        _ = turn_done_rx => return,
+                    }
+                    // Release the last non-loop sender before sleeping, so a
+                    // turn that ends during the grace window can still close
+                    // its stream.
+                    drop(watch_tx);
                     tokio::time::sleep(grace).await;
                     watcher_agent
                         .cancel_if_current(&watcher_session_id, turn_token)
@@ -222,6 +236,7 @@ impl Agent {
                             images,
                         )
                         .await;
+                    drop(turn_done);
                     this.tasks
                         .remove_if(&cleanup_session_id, |_, (tok, _)| *tok == turn_token);
                 });
@@ -370,5 +385,38 @@ mod tests {
 
         assert!(agent.tasks.get("sess-a").is_none());
         assert!(agent.tasks.get("sess-b").is_some());
+    }
+
+    /// The SSE channel must close once the turn is over.
+    ///
+    /// It used to deadlock: the disconnect watcher held a `tx` clone until the
+    /// *receiver* was dropped, but axum only drops the receiver when the
+    /// response body ends, which only happens when every sender is gone. Any
+    /// client reading to end-of-stream — rather than stopping the moment it
+    /// sees `llm_stop` — hung forever, and each turn leaked a watcher task.
+    ///
+    /// The turn itself fails immediately here (no such session, no providers
+    /// registered); that's fine, since what's under test is channel teardown,
+    /// which must hold regardless of how the turn ended.
+    #[tokio::test]
+    async fn the_event_channel_closes_when_the_turn_ends() {
+        let agent = test_agent().await;
+        let (tx, mut rx) = mpsc::unbounded_channel::<SSEEvent>();
+        agent
+            .run_turn("no-such-session".into(), "hi".into(), None, None, tx)
+            .expect("first turn for a session is always accepted");
+
+        // Drain to the end. `recv()` returning `None` *is* the assertion:
+        // before the fix this future never resolved.
+        // Generous: the real figure is well under a millisecond, so 10s only
+        // ever trips on the deadlock this guards against.
+        let drained = tokio::time::timeout(Duration::from_secs(10), async {
+            while rx.recv().await.is_some() {}
+        })
+        .await;
+        assert!(
+            drained.is_ok(),
+            "the SSE channel never closed — the disconnect watcher is holding a sender"
+        );
     }
 }

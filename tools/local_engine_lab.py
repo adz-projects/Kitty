@@ -402,17 +402,20 @@ def check_chat(base: str, rep: Report, sse_timeout: float = 180.0) -> dict | Non
                 text += ev["content"]
             elif kind in ("error", "provider_error"):
                 err = ev.get("content") or ev.get("error") or str(ev)
+            # Stop at the terminal event rather than reading to EOF. This is
+            # what a real client does (Kitty included), and it keeps the
+            # harness honest about latency: the daemon may legitimately hold
+            # the connection open after the turn for a follow-up turn on the
+            # same stream.
+            if kind in ("llm_stop", "error", "provider_error") or ev.get("is_last"):
+                break
     except TimeoutError:
-        # KNOWN OPEN BUG (see docs/ANDROID.md §10 Phase 2a): the provider
-        # itself terminates correctly in isolation, but a turn driven through
-        # the full agent loop never completes — `process_stream` waits on a
-        # stream that appears to have ended. Embeddings are unaffected.
         rep.add(FAIL, "stream a turn", f"no terminal event within {sse_timeout:.0f}s")
         rep.add(
             INFO,
-            "known issue",
-            "chat via the agent loop hangs; the provider works standalone "
-            "(cargo test local::provider). Re-run with --keep and read daemon.log.",
+            "hint",
+            "re-run with --keep and read daemon.log; "
+            "`local generation: done` means the engine finished and the stall is downstream.",
         )
         return None
     except Exception as e:  # noqa: BLE001 - surface transport failures as a check
@@ -449,9 +452,24 @@ def check_chat(base: str, rep: Report, sse_timeout: float = 180.0) -> dict | Non
     else:
         rep.check("reported token count", out_tokens > 0, str(out_tokens))
 
+    # Wall-clock throughput folds in the model load (first request off disk),
+    # so also report the daemon's own generation-only figure. The latter is the
+    # number to compare against another engine; the former is what a user feels
+    # on a cold start.
+    gen_ms = (timing or {}).get("generation_ms")
     tps = out_tokens / total if total > 0 else 0.0
-    rep.add(INFO, "throughput", f"TTFT {ttft:.2f}s, {tps:.1f} tok/s, {total:.2f}s total")
-    return {"ttft": ttft, "tok_s": tps, "total": total, "text": text.strip()}
+    gen_tps = (out_tokens / (gen_ms / 1000.0)) if gen_ms else None
+    detail = f"TTFT {ttft:.2f}s, {tps:.1f} tok/s wall, {total:.2f}s total"
+    if gen_tps:
+        detail += f"  |  {gen_tps:.1f} tok/s generating ({gen_ms / 1000.0:.2f}s)"
+    rep.add(INFO, "throughput", detail)
+    return {
+        "ttft": ttft,
+        "tok_s": tps,
+        "gen_tok_s": gen_tps,
+        "total": total,
+        "text": text.strip(),
+    }
 
 
 # --------------------------------------------------------------------------
@@ -494,8 +512,22 @@ def check_ollama_ab(rep: Report, local: dict | None, model: str | None, chat_ggu
             f"Pull the same model for a fair test.",
         )
 
+    # Warm the model first. Ollama loads on demand, and a cold load is tens of
+    # seconds to minutes — timing it as "time to first token" would report a
+    # disk read as an engine characteristic.
+    print("  warming Ollama (cold model load is not part of the measurement)...")
+    warm_status, _ = http_json(
+        f"{OLLAMA_BASE}/api/chat",
+        {"model": model, "messages": [{"role": "user", "content": "hi"}],
+         "stream": False, "options": {"num_predict": 1}},
+        timeout=600.0,
+    )
+    if warm_status != 200:
+        rep.add(SKIP, "Ollama comparison", f"warmup failed (HTTP {warm_status})")
+        return
+
     t0 = time.perf_counter()
-    ttft, text, tokens = None, "", 0
+    ttft, text, tokens, eval_ns, thinking_chars = None, "", 0, 0, 0
     try:
         data = json.dumps(
             {"model": model, "messages": [{"role": "user", "content": CHAT_PROMPT}], "stream": True}
@@ -509,25 +541,61 @@ def check_ollama_ab(rep: Report, local: dict | None, model: str | None, chat_ggu
                 if not s:
                     continue
                 obj = json.loads(s)
-                piece = (obj.get("message") or {}).get("content", "")
-                if piece and ttft is None:
+                msg = obj.get("message") or {}
+                piece = msg.get("content", "")
+                # A reasoning model streams its scratchpad in `thinking`, not
+                # `content`. Counting only `content` reported the time to the
+                # first *answer* token as TTFT — 200s+ on a model that thought
+                # first — which reads as a stall rather than as reasoning.
+                think = msg.get("thinking") or ""
+                if think:
+                    thinking_chars += len(think)
+                if (piece or think) and ttft is None:
                     ttft = time.perf_counter() - t0
                 text += piece
                 if obj.get("done"):
                     tokens = obj.get("eval_count") or 0
+                    eval_ns = obj.get("eval_duration") or 0
     except Exception as e:  # noqa: BLE001
         rep.add(SKIP, "Ollama comparison", f"{type(e).__name__}: {e}")
         return
     total = time.perf_counter() - t0
     tokens = tokens or max(1, len(text) // 4)
     o_tps = tokens / total if total else 0.0
+    # Ollama reports its own generation time; prefer it, for the same reason we
+    # prefer the daemon's `generation_ms` on our side.
+    o_gen_tps = (tokens / (eval_ns / 1e9)) if eval_ns else None
 
-    rep.add(INFO, f"ollama ({model})", f"TTFT {ttft or 0:.2f}s, {o_tps:.1f} tok/s")
+    detail = f"TTFT {ttft or 0:.2f}s, {o_tps:.1f} tok/s wall"
+    if o_gen_tps:
+        detail += f"  |  {o_gen_tps:.1f} tok/s generating"
+    rep.add(INFO, f"ollama ({model})", detail)
+    if thinking_chars:
+        # Most of `eval_count` was then scratchpad, not answer. Throughput is
+        # still comparable; total latency very much is not.
+        rep.add(
+            INFO,
+            "note",
+            f"{model} is a reasoning model - it emitted {thinking_chars} chars of "
+            f"hidden thinking ({tokens} tokens total) before answering, so its "
+            f"end-to-end latency is not comparable to a non-reasoning model.",
+        )
     if local:
-        rep.add(INFO, "local engine", f"TTFT {local['ttft'] or 0:.2f}s, {local['tok_s']:.1f} tok/s")
-        faster = "local" if local["tok_s"] > o_tps else "ollama"
-        ratio = max(local["tok_s"], o_tps) / max(1e-9, min(local["tok_s"], o_tps))
-        rep.add(INFO, "verdict", f"{faster} is {ratio:.2f}x faster on throughput")
+        l_detail = f"TTFT {local['ttft'] or 0:.2f}s, {local['tok_s']:.1f} tok/s wall"
+        if local.get("gen_tok_s"):
+            l_detail += f"  |  {local['gen_tok_s']:.1f} tok/s generating"
+        rep.add(INFO, "local engine", l_detail)
+
+        # Compare generating-only throughput when both sides reported it —
+        # that's engine against engine. Wall-clock includes our cold model
+        # load (Ollama's was warmed away above), so it would flatter Ollama.
+        l_rate, o_rate = local.get("gen_tok_s"), o_gen_tps
+        basis = "generating"
+        if not (l_rate and o_rate):
+            l_rate, o_rate, basis = local["tok_s"], o_tps, "wall-clock"
+        faster = "local" if l_rate > o_rate else "ollama"
+        ratio = max(l_rate, o_rate) / max(1e-9, min(l_rate, o_rate))
+        rep.add(INFO, "verdict", f"{faster} is {ratio:.2f}x faster ({basis} throughput)")
         print()
         print(f"      local : {local['text'][:200]}")
         print(f"      ollama: {text.strip()[:200]}")

@@ -236,21 +236,44 @@ fn generate_blocking(
         ));
     }
 
-    let mut batch = LlamaBatch::new(tokens.len().max(512), 1);
-    let last = tokens.len() as i32 - 1;
-    for (i, token) in (0i32..).zip(tokens.iter().copied()) {
-        if let Err(e) = batch.add(token, i, &[0], i == last) {
-            return emit_err(format!("batch add failed: {e}"));
+    // Prefill in `n_batch`-sized chunks. Submitting the whole prompt in one
+    // batch works only while it fits: llama.cpp rejects (and on some builds
+    // aborts on) a batch larger than the context's `n_batch`, and an agent
+    // turn's prompt — system prompt plus history — is routinely several times
+    // the 512-token default. Chunking is the normal way to prefill, not a
+    // workaround.
+    let prompt_tokens = tokens.len() as i32;
+    let n_batch = (ctx.n_batch() as usize).max(1);
+    let mut batch = LlamaBatch::new(n_batch.min(tokens.len()).max(1), 1);
+    let last = tokens.len() - 1;
+    tracing::debug!(
+        prompt_tokens,
+        n_batch,
+        n_ctx,
+        max_new,
+        "local generation: prefill starting"
+    );
+    for (chunk_start, chunk) in tokens.chunks(n_batch).enumerate().map(|(i, c)| (i * n_batch, c)) {
+        batch.clear();
+        for (offset, token) in chunk.iter().copied().enumerate() {
+            let pos = chunk_start + offset;
+            // Logits are only needed for the very last prompt token — that's
+            // the one the first sample reads.
+            if let Err(e) = batch.add(token, pos as i32, &[0], pos == last) {
+                return emit_err(format!("batch add failed: {e}"));
+            }
+        }
+        if let Err(e) = ctx.decode(&mut batch) {
+            return emit_err(format!("prompt decode failed: {e}"));
         }
     }
-    let prompt_tokens = tokens.len() as i32;
-    if let Err(e) = ctx.decode(&mut batch) {
-        return emit_err(format!("prompt decode failed: {e}"));
-    }
+    tracing::debug!(prompt_tokens, "local generation: prefill done");
 
     let mut sampler = build_sampler(&sampling);
     let mut decoder = encoding_rs::UTF_8.new_decoder();
-    let mut n_cur = batch.n_tokens();
+    // Absolute position of the next token — the whole prompt, not just the
+    // final prefill chunk.
+    let mut n_cur = prompt_tokens;
     let mut produced = 0i32;
     let mut finish = "stop";
 
@@ -296,6 +319,7 @@ fn generate_blocking(
     if produced >= max_new {
         finish = "length";
     }
+    tracing::debug!(produced, finish, "local generation: done");
 
     let mut usage = std::collections::HashMap::new();
     usage.insert("prompt_tokens".to_string(), prompt_tokens);

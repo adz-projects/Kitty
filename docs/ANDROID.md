@@ -696,28 +696,44 @@ comparison.
 
 | | State |
 |---|---|
-| `LocalEngine`, `SlotManager` | Done, 261 lib tests. |
+| `LocalEngine`, `SlotManager` | Done, 262 lib tests. |
 | `POST /api/embeddings` | **Working end-to-end through the daemon.** 1024-dim, unit-norm, semantically ordered (0.7325 vs 0.2936), deterministic, 400 on a bad request. |
 | `register_local` at startup | Done. Registers under id `"local"`; a session pins it via `POST /api/chat/`'s `provider` field, so no DB row is needed (the `provider_type` CHECK would block one). |
-| `LocalProvider` in isolation | Working — generates text via the trait (`cargo test --features local-engine local::provider`). |
-| **Chat through the agent loop** | **OPEN BUG — hangs.** See below. |
+| **Chat through the agent loop** | **Working end-to-end.** 15/15 harness checks pass; ~18 tok/s generating on CPU with LFM2.5-1.2B-Q4_K_M. |
 | `LocalSummarizer` wiring | Not wired; `run_compaction` is hard-typed to `&SummarizerClient`. |
 
-**Open bug: a turn pinned to `provider: "local"` never completes.**
-The daemon loads the model, creates a generation context, and destroys it —
-then `agent::loop_::process_stream` blocks forever waiting on a stream that
-should already have ended. Every daemon thread sits in Wait with flat CPU, so
-it is a deadlock/lost-wakeup, not slow inference. Notably the *same provider
-works standalone*, so the fault is in the interaction with the agent loop, not
-in generation.
+**First A/B (2026-08-09, Windows CPU).** In-process llama.cpp **18.4 tok/s**
+generating vs Ollama **18.1 tok/s** — parity, which is the expected result
+given Ollama is llama.cpp behind an HTTP server, and is the answer Phase 2b
+needed. Caveat recorded by the harness itself: the two were serving *different
+models* (LFM2.5-1.2B-Q4_K_M vs `qwen3.5:0.8b`), so this compares stacks, not
+purely engines. Compare *generating* throughput, not wall-clock: our figure
+includes a cold GGUF load the harness warms away on Ollama's side.
 
-Two things make it hard to see, both worth fixing regardless:
-- `Delta::error_type` is **never read** by `process_stream` (the dead field
-  from the 88bugs re-audit, #62), so a provider-side failure signalled that way
-  produces silence. `LocalProvider::generate_blocking` now also `tracing::error!`s
-  and emits the message as `content` so it can't vanish.
-- A session pinned to an **unregistered** provider hangs rather than erroring —
-  same symptom, different cause. Worth an explicit error in the loop.
+**Two bugs closed getting there**, both of which predate the local engine and
+affect every provider:
+
+1. **Every SSE response deadlocked at end-of-turn** (`agent::run_turn`). The
+   disconnect watcher held a clone of the event sender until the *receiver* was
+   dropped — but axum only drops the receiver when the response body ends, and
+   the body only ends when every sender is gone. Circular: a client reading to
+   EOF hung forever, and each turn leaked a watcher task. It went unnoticed
+   because Kitty's frontend stops at `llm_stop` and hangs up, which breaks the
+   cycle from the outside. The watcher now also races a `turn_done` oneshot.
+   Regression test: `agent::tests::the_event_channel_closes_when_the_turn_ends`
+   (verified to fail against the old code).
+2. **Prompt prefill ignored `n_batch`** (`local::provider::generate_blocking`).
+   The whole prompt went in as one `LlamaBatch`, which works only while it fits
+   under the context's `n_batch` (512 by default) — an agent turn's prompt is
+   routinely several times that. Now chunked, with `n_cur` tracking the
+   absolute position rather than the last chunk's length.
+
+One diagnostic hazard remains, worth fixing regardless: `Delta::error_type` is
+**never read** by `process_stream` (the dead field from the 88bugs re-audit,
+#62), so a provider-side failure signalled only that way produces silence.
+`generate_blocking` now also `tracing::error!`s and emits the message as
+`content` so it can't vanish. Separately, a session pinned to an
+**unregistered** provider still hangs rather than erroring.
 - **2b acceptance:** AP verified against the daemon endpoint *before* deletion;
   `grep -ri ollama` shows only the intentionally-retained dialect surface; the
   rewritten `stack_needs_ollama` tests pass.
