@@ -19,6 +19,15 @@ pub mod storage;
 
 use std::sync::Arc;
 
+/// Provider id the in-process engine registers under.
+///
+/// Public because it's part of the wire contract, not an internal detail: a
+/// client pins a session to the local engine by sending this exact string as
+/// `provider` to `POST /api/chat/`. `tools/local_engine_lab.py` hard-codes the
+/// same value.
+#[cfg(feature = "local-engine")]
+pub const LOCAL_PROVIDER_ID: &str = "local";
+
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::cors::CorsLayer;
 
@@ -123,8 +132,39 @@ pub async fn run(config: BigTinyConfig, options: RunOptions) -> Result<(), Daemo
     let mcp = Arc::new(MCPManager::new(pool.clone(), pathway_engine.clone()));
     mcp.connect_all().await; // isolated per-server failure, matches Python's connect_all
 
+    // Constructed before the router so both it and `AppState` share ONE set of
+    // resident models — otherwise `/api/embeddings` and the chat path would
+    // each load their own copy of the same GGUF.
+    #[cfg(feature = "local-engine")]
+    let local_slots = local::SlotManager::new();
+
     let router = Arc::new(ProviderRouter::new(config.cache.clone()));
     router.load_providers(&pool).await?;
+
+    // In-process llama.cpp engine (docs/ANDROID.md §3, D1). Registered under
+    // the fixed id `"local"`, which a session pins at birth via
+    // `POST /api/chat/`'s `provider` field — no DB row is involved, which is
+    // just as well since `provider_type` is CHECK-constrained to
+    // `('openai_compat','anthropic')`.
+    #[cfg(feature = "local-engine")]
+    if config.local.enabled {
+        router.register_local(
+            LOCAL_PROVIDER_ID,
+            crate::config::ProviderConfig::default(),
+            config.local.clone(),
+            local_slots.clone(),
+        );
+        tracing::info!(
+            provider_id = LOCAL_PROVIDER_ID,
+            model = %config.local.model_path,
+            embed_model = %config.local.embed_model_path,
+            "local engine registered"
+        );
+    } else {
+        // Say so explicitly. A silently-absent provider is indistinguishable
+        // from a broken one at the point the request fails.
+        tracing::info!("local engine not registered ([local].enabled = false)");
+    }
 
     let hitl = Arc::new(tokio::sync::Mutex::new(HITLManager::new(
         pool.clone(),
@@ -181,10 +221,12 @@ pub async fn run(config: BigTinyConfig, options: RunOptions) -> Result<(), Daemo
         scheduler: scheduler.clone(),
         config: config.clone(),
         pathway: pathway_engine.clone(),
+        // Shared with the registered `LocalProvider` above (not a fresh one),
+        // so a model loaded for chat is reused for embeddings and vice versa.
         // Starts empty; models load lazily on first use so daemon startup
         // never blocks on a multi-hundred-MB read.
         #[cfg(feature = "local-engine")]
-        local_slots: local::SlotManager::new(),
+        local_slots,
     });
 
     let auth = Arc::new(server::middleware::AuthConfig {

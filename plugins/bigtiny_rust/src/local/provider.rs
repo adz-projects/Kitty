@@ -189,9 +189,17 @@ fn generate_blocking(
     use llama_cpp_2::model::AddBos;
 
     let emit_err = |msg: String| {
+        // Log as well as emit. `Delta::error_type` is **not read** by
+        // `agent::loop_::process_stream` (a known dead field — see the 88bugs
+        // re-audit, #62), so a failure signalled only that way is invisible:
+        // the turn just produces nothing. Until that's wired up, the log is
+        // the only place this surfaces.
+        tracing::error!("local generation failed: {msg}");
         let _ = tx.send(Delta {
             role: "assistant".into(),
-            content: None,
+            // Surface it as content too, so the user sees *something* rather
+            // than an empty reply.
+            content: Some(format!("[local engine error: {msg}]")),
             reasoning: None,
             tool_calls: None,
             finish_reason: Some("error".into()),

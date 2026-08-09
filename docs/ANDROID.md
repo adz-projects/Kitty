@@ -686,6 +686,38 @@ order: flip adaptive-pathway's `AP_EMBED_OLLAMA_URL` to the daemon
   (recall/consolidate/surface) still testable in-process **without**
   `/api/embeddings` (the hash-space path Android uses); **Ollama paths still
   work unchanged**.
+
+#### 2a status (2026-08-09)
+
+Exercise any of this with `python tools/local_engine_lab.py --build` — it
+builds the daemon with `--features local-engine`, spawns it against a
+throwaway data dir, runs the battery and tears down. `--ab` adds an Ollama
+comparison.
+
+| | State |
+|---|---|
+| `LocalEngine`, `SlotManager` | Done, 261 lib tests. |
+| `POST /api/embeddings` | **Working end-to-end through the daemon.** 1024-dim, unit-norm, semantically ordered (0.7325 vs 0.2936), deterministic, 400 on a bad request. |
+| `register_local` at startup | Done. Registers under id `"local"`; a session pins it via `POST /api/chat/`'s `provider` field, so no DB row is needed (the `provider_type` CHECK would block one). |
+| `LocalProvider` in isolation | Working — generates text via the trait (`cargo test --features local-engine local::provider`). |
+| **Chat through the agent loop** | **OPEN BUG — hangs.** See below. |
+| `LocalSummarizer` wiring | Not wired; `run_compaction` is hard-typed to `&SummarizerClient`. |
+
+**Open bug: a turn pinned to `provider: "local"` never completes.**
+The daemon loads the model, creates a generation context, and destroys it —
+then `agent::loop_::process_stream` blocks forever waiting on a stream that
+should already have ended. Every daemon thread sits in Wait with flat CPU, so
+it is a deadlock/lost-wakeup, not slow inference. Notably the *same provider
+works standalone*, so the fault is in the interaction with the agent loop, not
+in generation.
+
+Two things make it hard to see, both worth fixing regardless:
+- `Delta::error_type` is **never read** by `process_stream` (the dead field
+  from the 88bugs re-audit, #62), so a provider-side failure signalled that way
+  produces silence. `LocalProvider::generate_blocking` now also `tracing::error!`s
+  and emits the message as `content` so it can't vanish.
+- A session pinned to an **unregistered** provider hangs rather than erroring —
+  same symptom, different cause. Worth an explicit error in the loop.
 - **2b acceptance:** AP verified against the daemon endpoint *before* deletion;
   `grep -ri ollama` shows only the intentionally-retained dialect surface; the
   rewritten `stack_needs_ollama` tests pass.
