@@ -124,7 +124,7 @@ pub async fn reembed_stale_beliefs(engine: &PathwayEngine) -> Result<()> {
     if stale.is_empty() {
         return Ok(());
     }
-    if !engine.embed.probe_ollama().await {
+    if !engine.embed.probe_semantic().await {
         return Ok(());
     }
     for belief in &stale {
@@ -133,9 +133,9 @@ pub async fn reembed_stale_beliefs(engine: &PathwayEngine) -> Result<()> {
         // that hash-space vector tagged as `current_model` — overwriting a
         // real semantic embedding with a garbage-space vector permanently is
         // worse than leaving the stale-tagged row to be retried. The
-        // batch-level `probe_ollama()` above only guarantees Ollama is up, not
+        // batch-level `probe_semantic()` above only guarantees Ollama is up, not
         // that every call stays semantic.
-        // Bypass the cache: `probe_ollama()` just confirmed Ollama is up, but
+        // Bypass the cache: `probe_semantic()` just confirmed Ollama is up, but
         // if this belief's text is still cache-resident from before the
         // outage, a cache-checking call would keep returning that stale
         // hash-fallback vector forever instead of actually retrying now.

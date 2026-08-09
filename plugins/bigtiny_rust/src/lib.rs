@@ -102,6 +102,12 @@ pub async fn run(config: BigTinyConfig, options: RunOptions) -> Result<(), Daemo
     let db = storage::Database::connect(&options.db_path).await?;
     let pool = db.pool().clone();
 
+    // Constructed before both the pathway engine and the router so all three
+    // share ONE set of resident models — otherwise chat, `/api/embeddings` and
+    // adaptive-pathway would each load their own copy of the same GGUF.
+    #[cfg(feature = "local-engine")]
+    let local_slots = local::SlotManager::new();
+
     // Behavioral-memory engine. `None` when disabled — the in-process
     // `"pathway"` MCP server is then simply not constructed (configured off,
     // not "race lost").
@@ -110,9 +116,38 @@ pub async fn run(config: BigTinyConfig, options: RunOptions) -> Result<(), Daemo
         .enabled
     {
         let db_path = std::path::Path::new(&options.data_dir).join(&config.pathway.db_name);
-        match adaptive_pathway::engine::PathwayEngine::open(
+
+        // Embeddings run in-process when the local engine can serve them —
+        // no HTTP hop to our own listener. `space_tag` must move in lockstep
+        // with the weights (see its doc comment): it is what tells
+        // `reembed_stale_beliefs` that beliefs embedded by a previous model
+        // need migrating.
+        #[cfg(feature = "local-engine")]
+        let (embedder, ap_config) = {
+            let mut ap_config = adaptive_pathway::config::Config::default();
+            let e = local::pathway_embed::embedder_for(&local_slots, &config.local);
+            if e.is_some() {
+                ap_config.embedding.ollama_model =
+                    local::LocalPathwayEmbedder::space_tag(&config.local.embed_model_path);
+                tracing::info!(
+                    space = %ap_config.embedding.ollama_model,
+                    "adaptive-pathway embeddings served in-process by the local engine"
+                );
+            }
+            (e, ap_config)
+        };
+        // Without the engine compiled in, AP keeps its own behaviour: HTTP to
+        // a configured Ollama, else lexical hashing.
+        #[cfg(not(feature = "local-engine"))]
+        let (embedder, ap_config): (
+            Option<Arc<dyn adaptive_pathway::embed::SemanticEmbedder>>,
+            _,
+        ) = (None, adaptive_pathway::config::Config::default());
+
+        match adaptive_pathway::engine::PathwayEngine::open_with_embedder(
             &db_path.to_string_lossy(),
-            adaptive_pathway::config::Config::default(),
+            ap_config,
+            embedder,
         )
         .await
         {
@@ -131,12 +166,6 @@ pub async fn run(config: BigTinyConfig, options: RunOptions) -> Result<(), Daemo
 
     let mcp = Arc::new(MCPManager::new(pool.clone(), pathway_engine.clone()));
     mcp.connect_all().await; // isolated per-server failure, matches Python's connect_all
-
-    // Constructed before the router so both it and `AppState` share ONE set of
-    // resident models — otherwise `/api/embeddings` and the chat path would
-    // each load their own copy of the same GGUF.
-    #[cfg(feature = "local-engine")]
-    let local_slots = local::SlotManager::new();
 
     let router = Arc::new(ProviderRouter::new(config.cache.clone()));
     router.load_providers(&pool).await?;

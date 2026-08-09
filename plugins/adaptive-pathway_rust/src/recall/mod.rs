@@ -290,7 +290,7 @@ pub const RECALL_MAX_TOKENS: usize = 350;
 /// for exactly this kind of cross-crate need, but a token *count* isn't
 /// worth that ceremony for a soft budget check).
 fn estimate_tokens(s: &str) -> usize {
-    (s.chars().count() + 3) / 4
+    s.chars().count().div_ceil(4)
 }
 
 /// Enforce the recall token budget by dropping whole sections in

@@ -46,6 +46,25 @@ pub struct PathwayEngine {
 
 impl PathwayEngine {
     pub async fn open(path: &str, cfg: Config) -> Result<Arc<Self>> {
+        Self::open_with_embedder(path, cfg, None).await
+    }
+
+    /// Open with a host-supplied in-process semantic embedder (BigTiny hands
+    /// in its own llama.cpp embedder here; see
+    /// [`crate::embed::SemanticEmbedder`]). `None` is [`Self::open`].
+    ///
+    /// **`cfg.embedding.ollama_model` is the vector space's identity**, not
+    /// just a label: `list_recall_candidates` filters on it, and
+    /// `sync_embedding_model_fingerprint` below compares it against what's on
+    /// disk. A host swapping the embedder MUST also change that string, or
+    /// vectors from two different models silently share one pool. Changing it
+    /// marks existing beliefs stale, which `background::reembed_stale_beliefs`
+    /// then migrates.
+    pub async fn open_with_embedder(
+        path: &str,
+        cfg: Config,
+        embedder: Option<Arc<dyn crate::embed::SemanticEmbedder>>,
+    ) -> Result<Arc<Self>> {
         let db = Db::open(path).await?;
         if db.sync_embedding_model_fingerprint(&cfg.embedding.ollama_model).await.unwrap_or(false) {
             tracing::info!(
@@ -53,7 +72,7 @@ impl PathwayEngine {
                 "embedding model changed (or first run) -- stale beliefs will be re-embedded in the background"
             );
         }
-        let embed = EmbeddingProvider::new(cfg.clone());
+        let embed = EmbeddingProvider::with_embedder(cfg.clone(), embedder);
         Ok(Arc::new(Self {
             db,
             cfg,

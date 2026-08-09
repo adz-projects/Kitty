@@ -165,7 +165,7 @@ pub fn encode_embedding(v: &[f32]) -> Vec<u8> {
 /// misleading partial match) -- this just logs so a genuinely corrupt row is
 /// visible instead of silently returning a truncated vector.
 pub fn decode_embedding(bytes: &[u8]) -> Vec<f32> {
-    if !bytes.is_empty() && bytes.len() % 4 != 0 {
+    if !bytes.is_empty() && !bytes.len().is_multiple_of(4) {
         tracing::warn!(
             "decode_embedding: {} bytes is not a multiple of 4 -- BLOB is corrupt or not an f32 vector; \
              decoding the {} complete f32s found and dropping the trailing {} byte(s)",

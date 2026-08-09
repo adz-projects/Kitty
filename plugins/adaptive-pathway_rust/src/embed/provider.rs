@@ -1,15 +1,42 @@
 //! `EmbeddingProvider`: turns arbitrary context text into a fixed-dimension
-//! vector. Tries Ollama's /api/embeddings first (semantic), falling back to
-//! the deterministic signed-hashing vectorizer (lexical) when Ollama is
-//! unavailable or errors. Ported from `embeddings.py::EmbeddingProvider`.
+//! vector. Tries a *semantic* embedder first, falling back to the
+//! deterministic signed-hashing vectorizer (lexical) when that is unavailable
+//! or errors. Ported from `embeddings.py::EmbeddingProvider`.
+//!
+//! There are two semantic backends:
+//!
+//! - **In-process** ([`SemanticEmbedder`], injected by the host). This is what
+//!   BigTiny uses: the engine is linked into the same binary, so going out
+//!   over HTTP to reach it would mean the daemon calling its own socket. See
+//!   docs/ANDROID.md §10 Phase 2b.
+//! - **Ollama over HTTP**, the original path, kept for anyone pointing at a
+//!   real Ollama server (`AP_EMBED_OLLAMA_URL`).
+//!
+//! Both go through [`EmbeddingProvider::embed_semantic`], so the availability
+//! circuit-breaker, dimension projection and cache behave identically whether
+//! the failure was a dead socket or a model that wouldn't load.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+use async_trait::async_trait;
 
 use crate::config::Config;
 
 use super::hashing::{hash_embed, EmbedCache};
 use super::project::project;
+
+/// A host-supplied semantic embedder, called in-process instead of over HTTP.
+///
+/// Returns `None` for any failure — an unloadable model, a decode error, an
+/// empty result. The provider treats that exactly like an unreachable Ollama:
+/// trip the circuit-breaker and fall back to lexical hashing.
+#[async_trait]
+pub trait SemanticEmbedder: Send + Sync {
+    /// Embed `text`, returning the model's native-width vector. The caller
+    /// projects it to the configured dimension — don't do that here.
+    async fn embed(&self, text: &str) -> Option<Vec<f32>>;
+}
 
 pub struct EmbeddingProvider {
     dim: usize,
@@ -18,6 +45,8 @@ pub struct EmbeddingProvider {
     timeout: Duration,
     probe_interval: Duration,
     client: reqwest::Client,
+    /// When set, replaces the HTTP path entirely.
+    embedder: Option<Arc<dyn SemanticEmbedder>>,
     state: Arc<Mutex<ProviderState>>,
 }
 
@@ -29,6 +58,12 @@ struct ProviderState {
 
 impl EmbeddingProvider {
     pub fn new(cfg: Config) -> Self {
+        Self::with_embedder(cfg, None)
+    }
+
+    /// Construct with a host-supplied in-process embedder. `None` keeps the
+    /// HTTP-to-Ollama behaviour.
+    pub fn with_embedder(cfg: Config, embedder: Option<Arc<dyn SemanticEmbedder>>) -> Self {
         let ollama_url = std::env::var("AP_EMBED_OLLAMA_URL")
             .unwrap_or_else(|_| cfg.embedding.ollama_url.clone());
         let ollama_model = std::env::var("AP_EMBED_OLLAMA_MODEL")
@@ -40,6 +75,7 @@ impl EmbeddingProvider {
             timeout: Duration::from_secs(cfg.embedding.timeout_s),
             probe_interval: Duration::from_secs(cfg.embedding.probe_interval_s),
             client: reqwest::Client::new(),
+            embedder,
             state: Arc::new(Mutex::new(ProviderState {
                 available: None,
                 last_probe: Instant::now() - Duration::from_secs(3600),
@@ -53,10 +89,10 @@ impl EmbeddingProvider {
     }
 
     /// Embed `text`, returning the vector plus whether it was produced by the
-    /// semantic Ollama embedder (`true`) or the lexical signed-hash fallback
+    /// semantic embedder (`true`) or the lexical signed-hash fallback
     /// (`false`). Callers that persist embeddings (learn/background/mcp) MUST
     /// tag the stored `embedding_model` with the space actually used — tagging
-    /// a hash-space vector as the configured Ollama model puts it in the same
+    /// a hash-space vector as the configured semantic model puts it in the same
     /// pool as genuine semantic embeddings, and cosine across the two spaces
     /// is meaningless (beliefs get merged/re-called/cross-compared forever).
     pub async fn embed_with_space(&self, text: &str) -> (Vec<f32>, bool) {
@@ -67,7 +103,7 @@ impl EmbeddingProvider {
         if let Some((v, semantic)) = self.state.lock().unwrap().cache.get(t).cloned() {
             return (v, semantic);
         }
-        let (vec, semantic) = match self.embed_ollama(t).await {
+        let (vec, semantic) = match self.embed_semantic(t).await {
             Some(v) => (v, true),
             None => (hash_embed(t, self.dim), false),
         };
@@ -81,7 +117,7 @@ impl EmbeddingProvider {
 
     /// Like `embed_with_space`, but bypasses the cache entirely (both read
     /// and write-through of a fresh result). Used by re-embed passes that
-    /// have just confirmed Ollama is reachable (`probe_ollama`) and need a
+    /// have just confirmed the semantic embedder is up (`probe_semantic`) and need a
     /// genuine retry attempt for `text` — a cache hit here would otherwise
     /// keep returning a hash-fallback vector cached during a *prior* outage
     /// forever, since nothing else ever invalidates or expires that entry,
@@ -92,7 +128,7 @@ impl EmbeddingProvider {
         if t.is_empty() {
             return (vec![0.0; self.dim], false);
         }
-        let (vec, semantic) = match self.embed_ollama(t).await {
+        let (vec, semantic) = match self.embed_semantic(t).await {
             Some(v) => (v, true),
             None => (hash_embed(t, self.dim), false),
         };
@@ -107,7 +143,11 @@ impl EmbeddingProvider {
         (vec, semantic)
     }
 
-    async fn embed_ollama(&self, text: &str) -> Option<Vec<f32>> {
+    /// The one semantic path: circuit-breaker, backend dispatch, projection,
+    /// availability bookkeeping. Both callers of the semantic embedder go
+    /// through here so an in-process failure and a dead Ollama are handled
+    /// identically.
+    async fn embed_semantic(&self, text: &str) -> Option<Vec<f32>> {
         {
             let st = self.state.lock().unwrap();
             match st.available {
@@ -115,6 +155,25 @@ impl EmbeddingProvider {
                 _ => {}
             }
         }
+        let raw = match &self.embedder {
+            Some(e) => e.embed(text).await,
+            None => self.fetch_ollama(text).await,
+        };
+        match raw {
+            Some(v) if !v.is_empty() => {
+                self.mark_available();
+                Some(project(&v, self.dim))
+            }
+            _ => {
+                self.mark_unavailable();
+                None
+            }
+        }
+    }
+
+    /// Raw HTTP fetch — no projection, no availability marking; that's
+    /// [`Self::embed_semantic`]'s job.
+    async fn fetch_ollama(&self, text: &str) -> Option<Vec<f32>> {
         let payload = serde_json::json!({
             "model": self.ollama_model,
             "prompt": text,
@@ -125,16 +184,8 @@ impl EmbeddingProvider {
             .ok()?
             .ok()?;
         let data: serde_json::Value = resp.json().await.ok()?;
-        let raw: Vec<f32> = data
-            .get("embedding")
-            .and_then(|e| serde_json::from_value(e.clone()).ok())
-            .unwrap_or_default();
-        if raw.is_empty() {
-            self.mark_unavailable();
-            return None;
-        }
-        self.mark_available();
-        Some(project(&raw, self.dim))
+        data.get("embedding")
+            .and_then(|e| serde_json::from_value::<Vec<f32>>(e.clone()).ok())
     }
 
     fn mark_available(&self) {
@@ -149,14 +200,15 @@ impl EmbeddingProvider {
         st.last_probe = Instant::now();
     }
 
-    /// Force a fresh availability probe; returns whether Ollama answered.
-    pub async fn probe_ollama(&self) -> bool {
+    /// Force a fresh availability probe; returns whether the semantic embedder
+    /// answered — whichever backend is configured.
+    pub async fn probe_semantic(&self) -> bool {
         {
             let mut st = self.state.lock().unwrap();
             st.available = None;
             st.last_probe = Instant::now() - Duration::from_secs(3600);
         }
-        self.embed_ollama("probe").await.is_some()
+        self.embed_semantic("probe").await.is_some()
     }
 
     pub fn cache_len(&self) -> usize {
@@ -177,6 +229,65 @@ mod tests {
             ..Default::default()
         };
         EmbeddingProvider::new(cfg)
+    }
+
+    /// An injected embedder must replace the HTTP path outright — not race it,
+    /// not fall back to it. The mock server here is registered with
+    /// `expect(0)`: if the provider ever reaches for HTTP while an in-process
+    /// embedder is present, that assertion fails. This is the property the
+    /// whole in-process swap rests on (docs/ANDROID.md §10 Phase 2b): the
+    /// daemon must never call its own socket to embed.
+    #[tokio::test]
+    async fn an_injected_embedder_replaces_the_http_path() {
+        struct Fixed(Vec<f32>);
+        #[async_trait]
+        impl SemanticEmbedder for Fixed {
+            async fn embed(&self, _text: &str) -> Option<Vec<f32>> {
+                Some(self.0.clone())
+            }
+        }
+
+        let mut server = mockito::Server::new_async().await;
+        let never = server
+            .mock("POST", "/api/embeddings")
+            .expect(0)
+            .create_async()
+            .await;
+
+        let cfg = Config {
+            embedding: crate::config::EmbeddingConfig {
+                ollama_url: server.url(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let provider =
+            EmbeddingProvider::with_embedder(cfg, Some(Arc::new(Fixed(vec![0.1, 0.2, 0.3]))));
+
+        let (v, semantic) = provider.embed_with_space("hello world").await;
+        assert!(semantic, "an in-process embedder produces the semantic space");
+        assert!(v.iter().any(|x| *x != 0.0), "got a zero vector");
+        assert!(provider.probe_semantic().await);
+        never.assert_async().await;
+    }
+
+    /// A failing in-process embedder must degrade exactly like an unreachable
+    /// Ollama: lexical hash space, tagged non-semantic. A model that won't
+    /// load must lower recall quality, never take the turn down.
+    #[tokio::test]
+    async fn a_failing_injected_embedder_falls_back_to_hash_space() {
+        struct Broken;
+        #[async_trait]
+        impl SemanticEmbedder for Broken {
+            async fn embed(&self, _text: &str) -> Option<Vec<f32>> {
+                None
+            }
+        }
+        let provider = EmbeddingProvider::with_embedder(Config::default(), Some(Arc::new(Broken)));
+        let (v, semantic) = provider.embed_with_space("hello world").await;
+        assert!(!semantic);
+        assert_eq!(v.len(), Config::default().embedding_dim);
+        assert!(!provider.probe_semantic().await);
     }
 
     /// Regression (88bugs #90): a cache hit must report the space that
@@ -259,9 +370,9 @@ mod tests {
         // `reembed_stale_beliefs` always probes before re-embedding —
         // mirror that here, since it's what actually clears the
         // `available == Some(false)` + probe-interval gate that would
-        // otherwise short-circuit `embed_ollama` before it ever reaches the
+        // otherwise short-circuit `embed_semantic` before it ever reaches the
         // network, independent of the cache.
-        assert!(provider.probe_ollama().await, "the probe must see the recovered endpoint");
+        assert!(provider.probe_semantic().await, "the probe must see the recovered endpoint");
         let hits_after_probe = hits.load(std::sync::atomic::Ordering::SeqCst);
 
         // The fresh/bypass path must ignore that cache entry and actually

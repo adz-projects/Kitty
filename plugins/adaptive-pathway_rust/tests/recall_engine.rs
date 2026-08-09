@@ -255,7 +255,7 @@ async fn recall_stays_under_the_token_budget_with_many_beliefs() {
             .unwrap();
     }
     let block = engine.recall("s1", "").await.unwrap();
-    let approx_tokens = (block.chars().count() + 3) / 4;
+    let approx_tokens = block.chars().count().div_ceil(4);
     assert!(
         approx_tokens <= adaptive_pathway::recall::RECALL_MAX_TOKENS,
         "recall block ({approx_tokens} est. tokens) exceeded the {}-token budget",

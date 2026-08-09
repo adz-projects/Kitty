@@ -17,10 +17,12 @@
 pub mod embeddings;
 pub mod engine;
 pub mod manager;
+pub mod pathway_embed;
 pub mod provider;
 pub mod summarizer;
 
 pub use engine::{EmbedPooling, LocalEngine, LocalEngineError};
 pub use manager::{SlotKind, SlotManager, SlotStatus};
+pub use pathway_embed::LocalPathwayEmbedder;
 pub use provider::LocalProvider;
 pub use summarizer::LocalSummarizer;
