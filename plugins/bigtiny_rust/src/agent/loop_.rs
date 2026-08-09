@@ -637,6 +637,12 @@ impl AgentLoop {
             .and_then(|v| v.as_i64())
             .unwrap_or(50)
             .clamp(1, MAX_STEPS_CEILING);
+        // Resolved once per turn rather than per attempt: an unknown name
+        // yields `None` (no preset), never someone else's settings.
+        let preset = metadata
+            .get("sampling_preset")
+            .and_then(|v| v.as_str())
+            .and_then(crate::provider::presets::resolve);
         let mut step: i64 = 0;
 
         loop {
@@ -745,7 +751,15 @@ impl AgentLoop {
                 // hosted one gets none — see `provider::sampling`), so it
                 // must be re-resolved against whichever provider fallback
                 // has landed on for this attempt, not cached from the first.
-                let sampling = self.router.sampling(&provider_id);
+                //
+                // A session's `sampling_preset` (§6.2/D6) merges *over* that
+                // floor, so a preset overrides only what it names and the
+                // per-dialect floor still fills the rest.
+                let provider_sampling = self.router.sampling(&provider_id);
+                let sampling = match preset.as_ref() {
+                    Some(p) => crate::provider::sampling::merge(p, &provider_sampling),
+                    None => provider_sampling,
+                };
                 match self
                     .router
                     .chat_completion(

@@ -115,6 +115,7 @@ pub fn run() {
             commands::cancel_screenshot_selection,
             commands::get_pending_handoff,
             commands::get_stack_status,
+            commands::get_engine_restart_state,
             commands::get_startup_phase,
             commands::window_ready,
             commands::restart_backend,

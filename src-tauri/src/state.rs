@@ -81,6 +81,10 @@ pub struct AppState {
     pub config_recovered: Mutex<Option<String>>,
     /// Last computed stack status, so the health loop only emits on change.
     pub stack_status: Mutex<StackStatus>,
+    /// Whether a load-time engine setting changed since the daemon spawned,
+    /// and whether applying it is waiting on an in-flight generation
+    /// (docs/ANDROID.md §6.4). See `lifecycle::engine_restart`.
+    pub engine_restart: Mutex<crate::lifecycle::engine_restart::EngineRestartState>,
     /// One-time startup progress (see `StartupPhase`); set by `start_stack`,
     /// read by `get_startup_phase` for late-attaching windows.
     pub startup_phase: Mutex<StartupPhase>,
@@ -174,6 +178,7 @@ impl AppState {
             config: Mutex::new(config),
             config_recovered: Mutex::new(config_recovered),
             stack_status: Mutex::new(StackStatus::default()),
+            engine_restart: Mutex::new(Default::default()),
             startup_phase: Mutex::new(StartupPhase::default()),
             active_session: Mutex::new(None),
             settings_target: Mutex::new(None),

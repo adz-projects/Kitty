@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { ipc, onModelProgress, onModelsChanged } from '@/lib/ipc';
 import { CURATED_MODELS } from '@/lib/curated_models';
+import { LocalEngineSettings } from './LocalEngineSettings';
 import type { DownloadProgress, LocalModel } from '@/lib/types';
 
 /** Bytes as a short human string. Exported for testing — the repo has no
@@ -187,6 +188,8 @@ export function LocalModels() {
           );
         })}
       </div>
+
+      <LocalEngineSettings />
     </div>
   );
 }

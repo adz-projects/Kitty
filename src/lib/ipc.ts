@@ -29,6 +29,7 @@ import type {
   ProviderProfile,
   ProviderView,
   DownloadProgress,
+  EngineRestartState,
   Recipe,
   RecipeExtension,
   RecipeImportResult,
@@ -245,6 +246,7 @@ export const ipc = {
   // Local models (GGUFs on disk)
   listLocalModels: () => invoke<LocalModel[]>('list_local_models'),
   getModelsDiskFree: () => invoke<number | null>('get_models_disk_free'),
+  getEngineRestartState: () => invoke<EngineRestartState>('get_engine_restart_state'),
   deleteLocalModel: (id: string) => invoke<void>('delete_local_model', { id }),
   downloadModel: (repo: string, file: string, rev?: string, downloadId?: string) =>
     invoke<string>('download_model', {
@@ -448,6 +450,9 @@ export const onModelProgress = (cb: (e: DownloadProgress) => void) =>
   listen<DownloadProgress>('models://progress', (e) => cb(e.payload));
 
 export const onModelsChanged = (cb: () => void) => listen('models://changed', () => cb());
+
+export const onEngineRestartState = (cb: (e: EngineRestartState) => void) =>
+  listen<EngineRestartState>('engine://restart-state', (e) => cb(e.payload));
 
 export const onSettingsNavigate = (cb: (t: SettingsTarget) => void) =>
   listen<SettingsTarget>('settings://navigate', (e) => cb(e.payload));

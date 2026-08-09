@@ -11,6 +11,7 @@
 //! provider endpoint — Kitty just doesn't manage its lifecycle.
 
 pub mod bigtiny_proc;
+pub mod engine_restart;
 pub(crate) mod embedding;
 mod health;
 pub mod scheduler;

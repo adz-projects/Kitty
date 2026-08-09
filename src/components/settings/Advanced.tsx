@@ -140,30 +140,11 @@ export function Advanced() {
               <span>Enabled</span>
             </label>
             {draft.summarizer.enabled && (
-              <>
-                <label className="field">
-                  <span>Summarizer model (Ollama tag)</span>
-                  <input
-                    value={draft.summarizer.model}
-                    onChange={(e) =>
-                      update({ summarizer: { ...draft.summarizer, model: e.target.value } })
-                    }
-                  />
-                </label>
-                <label className="field">
-                  <span>VRAM retention (Ollama keep_alive)</span>
-                  <select
-                    value={draft.summarizer.keep_alive}
-                    onChange={(e) =>
-                      update({ summarizer: { ...draft.summarizer, keep_alive: e.target.value } })
-                    }
-                  >
-                    <option value="0">Unload immediately after each pass</option>
-                    <option value="5m">Keep loaded for 5 minutes</option>
-                    <option value="-1">Keep loaded permanently</option>
-                  </select>
-                </label>
-              </>
+              <p className="muted">
+                Which model does the summarising is set in Settings &rarr; Local Models. The
+                Ollama-only retention control that used to live here went with the Ollama client it
+                configured &mdash; residency is the engine&apos;s own business now.
+              </p>
             )}
 
             <button

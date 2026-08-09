@@ -41,13 +41,17 @@ pub async fn set_config(
 ) -> Result<(), String> {
     // Consumed only by the desktop-only re-registration below.
     #[cfg_attr(not(desktop), allow(unused_variables))]
-    let hotkey_changed = {
+    let (hotkey_changed, engine_changed) = {
         let mut cur = state.config.lock().unwrap();
-        let changed = cur.hotkeys != config.hotkeys
+        let hotkey_changed = cur.hotkeys != config.hotkeys
             || cur.clipboard_hotkey != config.clipboard_hotkey
             || cur.open_window_hotkey != config.open_window_hotkey;
+        // Compared against the *previous* config, before it's overwritten —
+        // every `[local]` knob only reaches the daemon at spawn, so a change
+        // needs a restart to take effect (docs/ANDROID.md §6.4).
+        let engine_changed = crate::lifecycle::engine_restart::needs_restart(&cur, &config);
         *cur = config.clone();
-        changed
+        (hotkey_changed, engine_changed)
     };
 
     // Both I/O chunks (disk save + hotkey re-register) run on a blocking
@@ -64,6 +68,14 @@ pub async fn set_config(
 
     // Let every window re-apply theme/background from the new config.
     let _ = app.emit("theme://changed", ());
+
+    // Restart the daemon if a load-time engine setting moved — immediately
+    // when idle, queued behind an in-flight generation otherwise. Deliberately
+    // after the disk save: a restart that races the save would reload the old
+    // values.
+    if engine_changed {
+        crate::lifecycle::engine_restart::schedule(&app);
+    }
 
     // `set_config` itself stays available on every platform — only the
     // re-registration is desktop-only, since Android has no OS-wide shortcut

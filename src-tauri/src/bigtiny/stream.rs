@@ -230,6 +230,9 @@ pub async fn send_prompt(
             .lock()
             .unwrap()
             .remove(&session_id);
+        // A restart queued behind this turn (§6.4) can now go ahead. No-op
+        // unless one is actually outstanding.
+        crate::lifecycle::engine_restart::apply_if_pending(&app_bg);
     });
     Ok(())
 }

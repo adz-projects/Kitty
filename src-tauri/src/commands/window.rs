@@ -100,6 +100,16 @@ pub fn get_stack_status(state: tauri::State<'_, AppState>) -> Result<StackStatus
     Ok(*state.stack_status.lock().unwrap())
 }
 
+/// Whether a load-time engine setting is waiting on a daemon restart
+/// (frontend also listens to `engine://restart-state`). Lets a settings
+/// window that opened after the change primed its own chip.
+#[tauri::command]
+pub fn get_engine_restart_state(
+    app: tauri::AppHandle,
+) -> Result<crate::lifecycle::engine_restart::EngineRestartState, String> {
+    Ok(crate::lifecycle::engine_restart::current(&app))
+}
+
 /// One-time startup progress (frontend also listens to `stack://startup-phase`).
 /// Lets a window that attaches after `start_stack` began (e.g. a slow overlay
 /// mount) prime its initial phase instead of assuming `SpawningGoosed`.

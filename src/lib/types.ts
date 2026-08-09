@@ -56,12 +56,37 @@ export interface Config {
       mirrors `bigtiny_rust`'s `MemoryConfig`). A daemon restart is needed
       for a change here to take effect. */
   memory: MemorySettings;
+  /** Local engine knobs — see `LocalModelSettings`. */
+  local: LocalModelSettings;
 }
 
 export interface SummarizerSettings {
   enabled: boolean;
+  /** GGUF id (not an Ollama tag since Phase 2b) — resolved into
+      `BIGTINY_LOCAL__MODEL_PATH` at spawn. `keep_alive` is gone with the
+      Ollama-native summarizer client it configured. */
   model: string;
-  keep_alive: string;
+}
+
+/** The local engine's tunable knobs (docs/ANDROID.md §3.2/§6.1). Mirrors
+    Rust `Config::local` / `LocalModelSettings`, which in turn mirrors the
+    daemon's `LocalEngineConfig`. Every field is load-time: changing one
+    restarts the daemon (§6.4). */
+export interface LocalModelSettings {
+  n_ctx: number;
+  embed_n_ctx: number;
+  n_batch: number;
+  /** `0` = let llama.cpp pick from the host's core count. */
+  n_threads: number;
+  /** `-1` = all layers to the selected backend; `0` is CPU-only. */
+  n_gpu_layers: number;
+  /** `auto` | `cuda` | `vulkan` | `cpu`. */
+  backend: string;
+  /** `last` | `mean` | `cls`. */
+  embed_pooling: string;
+  /** `f16` | `q8_0` | `q4_0` | `q4_1` | `q5_0` | `q5_1`. */
+  cache_type_k: string;
+  cache_type_v: string;
 }
 
 export interface TokenManagementSettings {
@@ -320,6 +345,15 @@ export interface LogEntry {
   level: string;
   target: string;
   message: string;
+}
+
+/** Whether a load-time engine setting is waiting on a daemon restart
+    (docs/ANDROID.md §6.4). Mirrors `lifecycle::engine_restart::EngineRestartState`. */
+export interface EngineRestartState {
+  /** A setting changed and the running daemon no longer matches the config. */
+  reload_required: boolean;
+  /** The restart is queued behind an in-flight generation. */
+  restart_pending: boolean;
 }
 
 /** One `models://progress` event. Keyed by `download_id` so several

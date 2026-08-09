@@ -22,9 +22,15 @@ vi.mock('@tauri-apps/plugin-dialog', () => ({
   save: vi.fn(),
 }));
 
-const { ipc, onStackStatus, onAdaptivePathwayEmbeddingStatus, onMessageDelta } = await import(
-  './ipc'
-);
+const {
+  ipc,
+  onStackStatus,
+  onAdaptivePathwayEmbeddingStatus,
+  onMessageDelta,
+  onModelProgress,
+  onModelsChanged,
+  onEngineRestartState,
+} = await import('./ipc');
 
 beforeEach(() => {
   invokeMock.mockClear();
@@ -133,6 +139,51 @@ describe('ipc event subscription wrappers', () => {
     );
   });
 
+  it('listLocalModels calls list_local_models with no args', () => {
+    void ipc.listLocalModels();
+    expect(invokeMock).toHaveBeenCalledWith('list_local_models');
+  });
+
+  it('getModelsDiskFree calls get_models_disk_free', () => {
+    void ipc.getModelsDiskFree();
+    expect(invokeMock).toHaveBeenCalledWith('get_models_disk_free');
+  });
+
+  it('deleteLocalModel passes the model id', () => {
+    void ipc.deleteLocalModel('LFM2.5-1.2B-Instruct-Q4_K_M');
+    expect(invokeMock).toHaveBeenCalledWith('delete_local_model', {
+      id: 'LFM2.5-1.2B-Instruct-Q4_K_M',
+    });
+  });
+
+  // The optional args must go over the wire as explicit `null`, not be
+  // omitted: the Rust side takes `Option<String>`, and Tauri maps a missing
+  // key to a deserialization error rather than `None`.
+  it('downloadModel sends explicit nulls for the optional rev and id', () => {
+    void ipc.downloadModel('acme/models', 'm.gguf');
+    expect(invokeMock).toHaveBeenCalledWith('download_model', {
+      repo: 'acme/models',
+      file: 'm.gguf',
+      rev: null,
+      downloadId: null,
+    });
+  });
+
+  it('downloadModel forwards a pre-agreed download id when given one', () => {
+    void ipc.downloadModel('acme/models', 'm.gguf', 'main', 'fixed-id');
+    expect(invokeMock).toHaveBeenCalledWith('download_model', {
+      repo: 'acme/models',
+      file: 'm.gguf',
+      rev: 'main',
+      downloadId: 'fixed-id',
+    });
+  });
+
+  it('getEngineRestartState calls get_engine_restart_state', () => {
+    void ipc.getEngineRestartState();
+    expect(invokeMock).toHaveBeenCalledWith('get_engine_restart_state');
+  });
+
   it('onMessageDelta subscribes to chat://message-delta and unwraps the payload', async () => {
     const cb = vi.fn();
     await onMessageDelta(cb);
@@ -141,5 +192,32 @@ describe('ipc event subscription wrappers', () => {
     const handler = listenMock.mock.calls[0][1] as (e: { payload: unknown }) => void;
     handler({ payload: { text: 'hi' } });
     expect(cb).toHaveBeenCalledWith({ text: 'hi' });
+  });
+
+  it('onModelProgress subscribes to models://progress and unwraps the payload', async () => {
+    const cb = vi.fn();
+    await onModelProgress(cb);
+    expect(listenMock).toHaveBeenCalledWith('models://progress', expect.any(Function));
+
+    const handler = listenMock.mock.calls[0][1] as (e: { payload: unknown }) => void;
+    handler({ payload: { download_id: 'd1', model: 'm.gguf', received: 1, done: false } });
+    expect(cb).toHaveBeenCalledWith({
+      download_id: 'd1',
+      model: 'm.gguf',
+      received: 1,
+      done: false,
+    });
+  });
+
+  it('onModelsChanged subscribes to models://changed', async () => {
+    const cb = vi.fn();
+    await onModelsChanged(cb);
+    expect(listenMock).toHaveBeenCalledWith('models://changed', expect.any(Function));
+  });
+
+  it('onEngineRestartState subscribes to engine://restart-state', async () => {
+    const cb = vi.fn();
+    await onEngineRestartState(cb);
+    expect(listenMock).toHaveBeenCalledWith('engine://restart-state', expect.any(Function));
   });
 });
