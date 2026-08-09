@@ -91,6 +91,13 @@ fn spawn_load_watchdog(app: &AppHandle, win: WebviewWindow, label: String) {
 /// Build the overlay up front, hidden. Called once from `setup`. Positioned once
 /// at the lower-right of the primary monitor's work area, just above the taskbar
 /// (Round-2 item 7); the user can still drag it elsewhere afterward.
+///
+/// Desktop-only: a borderless, always-on-top window floating over *other apps*
+/// has no Android equivalent (it would need `SYSTEM_ALERT_WINDOW`, which Tauri's
+/// mobile shell doesn't expose), and `decorations`/`always_on_top`/`skip_taskbar`
+/// aren't even on the mobile `WebviewWindowBuilder`. Android boots straight into
+/// the hub instead — docs/ANDROID.md D9/D23, §8.2.
+#[cfg(desktop)]
 pub fn create_overlay(app: &AppHandle) -> tauri::Result<WebviewWindow> {
     let win = WebviewWindowBuilder::new(app, OVERLAY, url(OVERLAY))
         .title("Kitty")
@@ -145,6 +152,7 @@ fn overlay_target_position(_win: &WebviewWindow) -> Option<(i32, i32)> {
 }
 
 /// Position the overlay at its resting spot (used once, at creation).
+#[cfg(desktop)]
 fn place_overlay_bottom_right(win: &WebviewWindow) {
     if let Some((x, y)) = overlay_target_position(win) {
         let _ = win.set_position(tauri::PhysicalPosition::new(x, y));
@@ -196,12 +204,22 @@ fn animate_overlay_out(win: &WebviewWindow) {
 }
 
 /// Show + focus the overlay, creating it if it somehow went away.
+///
+/// Desktop-only (see `create_overlay`). On Android the overlay concept does
+/// not exist, so this is a no-op rather than an error — callers like
+/// `complete_setup` shouldn't have to branch on platform just to finish.
+#[cfg(desktop)]
 pub fn show_overlay(app: &AppHandle) -> tauri::Result<()> {
     let win = match app.get_webview_window(OVERLAY) {
         Some(w) => w,
         None => create_overlay(app)?,
     };
     animate_overlay_in(&win);
+    Ok(())
+}
+
+#[cfg(not(desktop))]
+pub fn show_overlay(_app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
@@ -251,6 +269,12 @@ pub fn window_label_for_session(app: &AppHandle, session_id: &str) -> Option<Str
 /// the overlay's mere *existence* as "open" — it's created hidden at startup
 /// and lives forever (rule 1), so `app.get_webview_window(OVERLAY).is_some()`
 /// is true even when the user has never summoned it this session.
+// The chat-window focus/routing helpers below are reached today only from
+// desktop surfaces (tray, global hotkey, single-instance, notification
+// clicks). They're live code, not dead — Android simply has no caller for
+// them until Phase 6b gives the hub its own routing (docs/ANDROID.md §8.2),
+// so they're marked per-function rather than blanket-allowed.
+#[cfg_attr(not(desktop), allow(dead_code))]
 fn any_open_chat_window(app: &AppHandle) -> Option<String> {
     let mut candidates: Vec<String> = vec![OVERLAY.to_string(), MAIN.to_string()];
     {
@@ -285,6 +309,7 @@ fn any_open_chat_window(app: &AppHandle) -> Option<String> {
 /// Reuses the exact same `chat://adopt-session` -> `adoptSession()` ->
 /// `loadSession()` path Expand's handoff already uses, so this gets a full,
 /// correct replay rather than a half-populated snapshot.
+#[cfg_attr(not(desktop), allow(dead_code))]
 pub async fn focus_or_open_session(app: &AppHandle, session_id: &str) {
     let cwd = crate::bigtiny::sessions::list(app)
         .await
@@ -318,6 +343,7 @@ pub async fn focus_or_open_session(app: &AppHandle, session_id: &str) {
 /// window label, including a dynamically-allocated `chat-N` one. Returns
 /// `false` if no window with that label is currently open (caller decides
 /// the fallback).
+#[cfg_attr(not(desktop), allow(dead_code))]
 pub fn show_and_focus(app: &AppHandle, label: &str) -> bool {
     let Some(win) = app.get_webview_window(label) else {
         return false;
@@ -341,6 +367,7 @@ pub fn show_and_focus(app: &AppHandle, label: &str) -> bool {
 /// experience (`main` or a `chat-N`): focus one if any exists (preferring an
 /// already-focused one, else the first found), otherwise open a brand-new
 /// one. Never creates or shows the overlay.
+#[cfg_attr(not(desktop), allow(dead_code))]
 pub fn focus_or_open_chat_window(app: &AppHandle) {
     let mut candidates: Vec<String> = vec![MAIN.to_string()];
     {
@@ -376,6 +403,7 @@ pub fn focus_or_open_chat_window(app: &AppHandle) {
 /// window are never both active at once — if main is already open, focus it
 /// instead of also summoning the overlay; otherwise fall through to the usual
 /// overlay toggle.
+#[cfg_attr(not(desktop), allow(dead_code))]
 pub fn toggle_or_focus_main(app: &AppHandle) -> tauri::Result<()> {
     if let Some(win) = app.get_webview_window(MAIN) {
         if win.is_visible().unwrap_or(false) {
@@ -464,6 +492,9 @@ fn build_chat_window(app: &AppHandle, label: &str) -> tauri::Result<WebviewWindo
 /// stale window from an aborted capture is destroyed and the teardown is
 /// awaited *before* rebuilding under the same label, so the rebuild never
 /// races the old window's destruction in the window manager.
+/// Windows-only, like the Win32 GDI capture it serves (`crate::screenshot`);
+/// its only caller, `commands::screenshot`, is gated the same way.
+#[cfg(windows)]
 pub async fn create_screenshot_select_window(
     app: &AppHandle,
     x: i32,
@@ -495,6 +526,7 @@ pub async fn create_screenshot_select_window(
 /// so a stubborn window can't hang the caller. After `destroy()` the native
 /// teardown is dispatched to the main thread; this gives it a moment to land
 /// before the caller rebuilds a window with the same label.
+#[cfg(windows)]
 async fn wait_for_window_gone(app: &AppHandle, label: &str) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while tokio::time::Instant::now() < deadline {

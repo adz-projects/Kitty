@@ -7,14 +7,22 @@
 mod bigtiny;
 mod commands;
 mod config;
+// Global hotkeys and the tray both exist only on desktop: Android has no
+// OS-wide shortcut registration and `tauri::tray` is itself gated on
+// `all(desktop, feature = "tray-icon")`. See docs/ANDROID.md D23/§2.5.
+#[cfg(desktop)]
 mod hotkey;
 mod lifecycle;
 mod log_capture;
 mod notifications;
 mod ollama;
 mod openrouter;
+// Raw Win32 GDI desktop capture (BitBlt/GetDIBits) — the `windows` crate is a
+// `cfg(windows)`-only dependency, so this module cannot compile elsewhere.
+#[cfg(windows)]
 mod screenshot;
 mod state;
+#[cfg(desktop)]
 mod tray;
 mod util;
 mod windows;
@@ -43,10 +51,18 @@ pub fn run() {
     // (config.json itself already migrated by `config::load` -> `config_dir`).
     let provider_ids: Vec<String> = cfg.providers.iter().map(|p| p.id.clone()).collect();
     config::providers::migrate_secrets(&provider_ids);
+    // Only read on desktop — `hotkey::register` is the sole consumer, and the
+    // config fields themselves stay in the struct on every platform so a
+    // config.json round-trips unchanged between them.
+    #[cfg(desktop)]
     let hotkeys = cfg.hotkeys.clone();
+    #[cfg(desktop)]
     let clipboard_hotkey = cfg.clipboard_hotkey.clone();
+    #[cfg(desktop)]
     let open_window_hotkey = cfg.open_window_hotkey.clone();
 
+    // `mut` is only needed by the desktop-only plugin blocks below.
+    #[cfg_attr(not(desktop), allow(unused_mut))]
     let mut builder = tauri::Builder::default();
 
     // Single-instance MUST be the first plugin registered (Tauri guidance).
@@ -62,8 +78,15 @@ pub fn run() {
         }));
     }
 
+    // Lifted out of the chain below rather than attributed inline: a `#[cfg]`
+    // on a single `.plugin(..)` call in a method chain isn't valid, so this
+    // follows the same re-assignment shape as single-instance above.
+    #[cfg(desktop)]
+    {
+        builder = builder.plugin(tauri_plugin_global_shortcut::Builder::new().build());
+    }
+
     builder
-        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_opener::init())
@@ -82,9 +105,13 @@ pub fn run() {
             commands::open_settings,
             commands::open_main,
             commands::open_new_chat_window,
+            #[cfg(windows)]
             commands::capture_screenshot_region,
+            #[cfg(windows)]
             commands::get_screenshot_preview,
+            #[cfg(windows)]
             commands::report_screenshot_selection,
+            #[cfg(windows)]
             commands::cancel_screenshot_selection,
             commands::get_pending_handoff,
             commands::get_stack_status,
@@ -155,7 +182,9 @@ pub fn run() {
             commands::ollama_delete_model,
             commands::ollama_show_context_length,
             commands::ollama_pull_model,
+            #[cfg(windows)]
             commands::read_ollama_env,
+            #[cfg(windows)]
             commands::set_ollama_env,
             commands::restart_ollama,
             commands::ensure_ollama_running,
@@ -176,7 +205,9 @@ pub fn run() {
             commands::open_wizard,
             commands::get_wizard_mode,
             commands::complete_setup,
+            #[cfg(windows)]
             commands::get_autostart,
+            #[cfg(windows)]
             commands::set_autostart,
             commands::get_adaptive_pathway_mcp_status,
             commands::set_adaptive_pathway_enabled,
@@ -198,15 +229,22 @@ pub fn run() {
         ])
         .setup(move |app| {
             let handle = app.handle();
-            windows::create_overlay(handle)?;
-            tray::create(handle)?;
-            if let Err(e) = hotkey::register(
-                handle,
-                &hotkeys,
-                clipboard_hotkey.as_deref(),
-                open_window_hotkey.as_deref(),
-            ) {
-                tracing::error!("global hotkey registration failed: {e}");
+            // Overlay + tray + global hotkey are the desktop summon path.
+            // Android has no always-on-top-over-other-apps window, no tray,
+            // and no OS-wide shortcut — it boots straight into the hub
+            // (docs/ANDROID.md D9/D23, §8.2).
+            #[cfg(desktop)]
+            {
+                windows::create_overlay(handle)?;
+                tray::create(handle)?;
+                if let Err(e) = hotkey::register(
+                    handle,
+                    &hotkeys,
+                    clipboard_hotkey.as_deref(),
+                    open_window_hotkey.as_deref(),
+                ) {
+                    tracing::error!("global hotkey registration failed: {e}");
+                }
             }
             // First launch: show the setup wizard instead of the (hidden) overlay.
             if !wizard::setup_completed(handle) {

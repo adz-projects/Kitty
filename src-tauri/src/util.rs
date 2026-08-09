@@ -47,6 +47,8 @@ pub fn http_client() -> reqwest::Client {
 
 /// Build a [`Command`] that does not flash a console window on Windows.
 pub fn hidden_command(program: &Path) -> Command {
+    // `mut` is only needed by the Windows arm below.
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut cmd = Command::new(program);
     #[cfg(windows)]
     {

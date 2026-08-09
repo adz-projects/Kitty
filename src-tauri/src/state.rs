@@ -149,7 +149,12 @@ pub struct AppState {
     /// by window label: only one screenshot capture can be visually in
     /// flight at a time (the user can't interact with two selection
     /// overlays at once), so there's nothing to disambiguate.
+    /// Written only by the Win32 GDI capture path (`crate::screenshot`), so
+    /// unread on non-Windows targets — the field stays so `AppState` has one
+    /// shape everywhere.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub screenshot_preview: Mutex<Option<(String, ScreenshotRegion)>>,
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub screenshot_selection: Mutex<Option<tokio::sync::oneshot::Sender<Option<ScreenshotRegion>>>>,
     /// Last-seen `compacted_through_rowid` per session, from BigTiny's
     /// `/api/chat/{id}/stats`. BigTiny's own background compaction pass

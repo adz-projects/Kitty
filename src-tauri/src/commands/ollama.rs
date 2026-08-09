@@ -4,6 +4,7 @@
 use serde_json::Value;
 use tauri::{AppHandle, Manager};
 
+#[cfg(windows)]
 use crate::config::env_helper;
 use crate::lifecycle;
 use crate::ollama;
@@ -54,11 +55,15 @@ pub fn ollama_pull_model(app: AppHandle, model: String) -> Result<String, String
     Ok(pull_id)
 }
 
+// The OLLAMA_* env vars live in HKCU\Environment, so these two are Windows
+// only (docs/ANDROID.md §2.5); `lib.rs` gates their handler entries to match.
+#[cfg(windows)]
 #[tauri::command]
 pub fn read_ollama_env() -> Result<Vec<env_helper::EnvVar>, String> {
     Ok(env_helper::read_all())
 }
 
+#[cfg(windows)]
 #[tauri::command]
 pub fn set_ollama_env(name: String, value: Option<String>) -> Result<(), String> {
     env_helper::set(&name, value.as_deref())

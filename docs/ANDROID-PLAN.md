@@ -20,11 +20,11 @@ the current repo state. Do the phases in order — Phases 1a/1 are the hard upst
   `kitty-tools`, `kitty-web`, `kitty-wasm`, **and** `pathway`, all as linked path-deps
   with `serve_in_process` entry points (`ANDROID.md` §2.3 has the file map). Phases 1/7/8
   scope accordingly: **cross-compile + re-register**, not build-from-scratch.
-- **Desktop-only deps are not gated yet** and will break the first Android build —
-  `winreg` most immediately (plain `[dependencies]`, doesn't compile off-Windows),
-  plus `tray-icon`, `tauri-plugin-global-shortcut`, `notify-rust`, `keyring`
-  (`windows-native` feature only). `tauri-plugin-single-instance` **is** already
-  correctly gated — copy that pattern. See Phase 1a pre-flight below.
+- ~~Desktop-only deps are not gated yet~~ — **done 2026-08-08.** `src-tauri`
+  cross-compiles clean for `aarch64-linux-android` (zero warnings), desktop
+  unregressed. Full record in `ANDROID.md` §2.5. `keyring` was left as-is: it
+  compiles via keyring 3.x's mock fallback, which is a *silent secret-loss*
+  problem for Phase 7 (D24), not a build one.
 - `reqwest` is already on `rustls-tls` workspace-wide (no `native-tls`/`openssl` in
   the lockfile) — the OpenSSL cross-compile problem is **already avoided**. Don't
   undo it.
@@ -63,50 +63,69 @@ since been committed. Re-verify rather than redo:
 
 ---
 
-## Phase 1a — Android dev environment bootstrap (CLI)
+## Phase 1a — Android dev environment bootstrap (CLI) — **DONE (2026-08-08)**
 
-Ordered steps (winget + rustup + sdkmanager):
+What actually worked (the original steps 2–3 were wrong — recorded so a rebuild
+on another machine doesn't repeat the detour):
 
-1. **JDK 17** — `winget install Microsoft.OpenJDK.17`; set `JAVA_HOME`.
-2. **Android cmdline-tools** — `winget install Google.AndroidSDK` (or fetch
-   `commandlinetools-win-*.zip`); set `ANDROID_HOME` + `ANDROID_SDK_ROOT`; run
-   `sdkmanager --licenses`.
-3. **SDK components** — `sdkmanager --install "platform-tools" "platforms;android-34"
-   "build-tools;34.0.0" "ndk;27.*"`. Pin the NDK version `cargo tauri android init`
-   actually wants.
-4. **CMake** — `winget install Kitware.CMake` (native `llama_cpp`/ggml NDK CMake builds).
+1. **JDK 17** — `winget install --id Microsoft.OpenJDK.17 --exact --silent`.
+   Lands at `C:\Program Files\Microsoft\jdk-17.0.20.8-hotspot`; set `JAVA_HOME`.
+2. **Android CLI** — `winget install --id Google.AndroidCLI --exact --silent`.
+   **`Google.AndroidSDK` does not exist as a winget package.** What this
+   installs is Google's *newer unified* `android` CLI, not the classic
+   `cmdline-tools`/`sdkmanager` — so there is **no `sdkmanager --licenses`
+   step** (it writes `Sdk\licenses` itself on first install). It bootstraps
+   the SDK at `%LOCALAPPDATA%\Android\Sdk` on first run.
+3. **SDK components** — `android sdk install <pkg>`, where package IDs are
+   **slash-separated**, not the classic `;` form, and a bare `ndk` is rejected:
+   ```
+   android sdk install platform-tools
+   android sdk install platforms/android-34 build-tools/34.0.0
+   android sdk install ndk/27.2.12479018
+   ```
+   Two gotchas: `android sdk list` only lists *installed* packages (the
+   available set lives in the protobuf blobs under `Sdk\.sdk\objects`), and the
+   CLI **exits 9 even on success** — verify by checking the directories, not
+   the exit code.
+4. **CMake** — `winget install --id Kitware.CMake --exact --silent`.
 5. **Rust android target + cargo-ndk** — `rustup target add aarch64-linux-android`;
-   `cargo install cargo-ndk`. Set `ANDROID_NDK_HOME`.
-6. **adb + device wiring** — `platform-tools` brings `adb`; enable **USB debugging** on
-   the device; `adb devices` lists it.
-7. **`src-tauri` Android-buildability pre-flight** — do this **before** step 8, or
-   step 8 fails on a manifest problem that looks like a toolchain problem. Each item
-   is `ANDROID.md` D23/§2.5:
-   - **`winreg` → `[target.'cfg(windows)'.dependencies]`** (currently plain
-     `[dependencies]`; does not compile off-Windows *at all*, so this is the first
-     thing that breaks). `cfg(windows)`-gate `wizard.rs`'s `autostart_enabled`/
-     `set_autostart` and their `lib.rs` command registrations along with it.
-   - **`#[cfg(desktop)]`** the `tray::create` call and scope the `tauri`
-     `tray-icon` feature to desktop.
-   - **`#[cfg(desktop)]`** `hotkey::register` + `tauri-plugin-global-shortcut`.
-   - **Gate `notify-rust`**; route Android notifications through the
-     already-present `tauri-plugin-notification`.
-   - **`#[cfg(desktop)]`** `windows.rs::create_overlay`'s call site (no
-     always-on-top-over-other-apps window on Android).
-   - **Check `keyring`** — the `windows-native`-only feature set won't serve
-     Android; full backend swap is Phase 7/D24, but confirm now whether it even
-     *compiles* for the target as pinned.
-   - Copy the gating pattern from `tauri-plugin-single-instance`, which is already
-     done correctly (`Cargo.toml` target table + `#[cfg(desktop)]` in `lib.rs`).
-8. **Toolchain self-test** — `cargo ndk -t arm64-v8a build` on a trivial crate exits 0;
-   `pnpm tauri android init` succeeds; `cargo tauri android build --target aarch64`
-   reaches APK packaging.
+   `cargo install cargo-ndk` (got 4.1.2).
+6. **Env vars** (user scope): `JAVA_HOME`, `ANDROID_HOME`, `ANDROID_SDK_ROOT`,
+   `ANDROID_NDK_HOME`, `NDK_HOME`; `Sdk\platform-tools` appended to `PATH`.
+7. **adb + device wiring** — `adb` works; **no device attached yet**. Enable USB
+   debugging and confirm `adb devices` before Phase 1's on-device acceptance.
+8. **`src-tauri` Android-buildability pre-flight** — **done**; the full record
+   of what was gated is `ANDROID.md` §2.5. Three things worth carrying forward:
+   - The list in the original plan was **incomplete**. `screenshot.rs` (a whole
+     ungated Win32 GDI module) and `config/env_helper.rs` (a second `winreg`
+     consumer) were the two biggest breakers and neither was listed.
+   - `notify-rust` was **already** correctly gated in `Cargo.toml`; only its
+     call site needed splitting. The Android arm over
+     `tauri-plugin-notification` had to be *written* — the plugin was
+     registered but never called from Rust.
+   - `create_overlay`/`show_overlay` needed the **functions** gated, not just
+     the call site: `decorations`/`always_on_top`/`skip_taskbar` don't exist on
+     the mobile `WebviewWindowBuilder`.
+9. **Build-script blocker** — `tauri-build` resolves `externalBin` by target
+   triple and fails on `binaries/kitty-wasm-aarch64-linux-android` *before any
+   Rust compiles*. Fixed with a new **`src-tauri/tauri.android.conf.json`**
+   clearing `externalBin`/`resources` for Android. Note `"targets": ["aab"]` is
+   **not** a valid `BundleTarget` — omit the key entirely.
+10. **Toolchain self-test** — `cargo ndk -t arm64-v8a --platform 26 check` on
+    `src-tauri` is clean. Note cargo-ndk 4.x uses `--platform` for the API
+    level; `-p` is cargo's *package* flag and produces a confusing panic.
+    Still to do when Phase 1 needs it: `pnpm tauri android init` (generates
+    `gen/android`) and a real APK/AAB packaging run.
 
-**Acceptance (1a):** `adb get-state` == `device`; cargo-ndk builds to arm64; Tauri
-Android build completes; **`cargo check --target aarch64-linux-android` on `src-tauri`
-gets past dependency resolution and linking** (the step-7 gating actually took).
-Record the NDK version `tauri android init` demanded back into `ANDROID.md` D22.
-Budget ~10–15 GB disk.
+**Acceptance (1a):** **met**, except the device. `cargo ndk … check` clean;
+cargo-ndk builds to arm64; JDK/CMake/adb/NDK all respond; NDK version recorded
+in `ANDROID.md` D22. **`adb get-state` still has no device** — plug in the arm64
+device and enable USB debugging before Phase 1's on-device acceptance. Disk used
+well under the ~10–15 GB budget.
+
+> **Aside worth knowing:** a `cargo-ndk` panic dumps the *entire* process
+> environment into its report, secrets included. Don't paste one into a public
+> issue without scrubbing.
 
 ---
 
@@ -312,13 +331,16 @@ builds; commands table updated; `CLAUDE.md` no longer describes a Windows-only a
 
 ## Per-gate commands
 
+Set `ANDROID_NDK_HOME` first; use `cargo ndk` rather than a bare
+`--target aarch64-linux-android`, or `ring`'s build script can't find the NDK
+clang and fails before anything of ours compiles.
+
 ```
 git status                                                     # Phase 0 re-verify (baseline already committed)
 cargo test && cargo clippy                                     # src-tauri + bigtiny_rust + adaptive-pathway_rust
-cargo check --target aarch64-linux-android --manifest-path src-tauri/Cargo.toml              # 1a step-7 gating check
-adb devices                                                    # 1a wiring check
-cargo ndk -t arm64-v8a build --manifest-path plugins/bigtiny_rust/Cargo.toml
-cargo build --target aarch64-linux-android --manifest-path plugins/bigtiny_rust/Cargo.toml   # Phase 1 gate
+cargo ndk -t arm64-v8a --platform 26 check                     # in src-tauri/ — the 1a gating check (clean)
+adb devices                                                    # 1a wiring check (no device yet)
+cargo ndk -t arm64-v8a --platform 26 build --manifest-path plugins/bigtiny_rust/Cargo.toml   # Phase 1 gate
 pnpm test && pnpm lint                                         # after each frontend phase
 ```
 
@@ -327,11 +349,11 @@ pnpm test && pnpm lint                                         # after each fron
 - **Phase 1 (llama binding + wasmtime + sqlx on aarch64, NDK static linkage) is the
   make-or-break gate** — validate a working cdylib before any UI work.
 - **wasmtime** is not currently a dependency; must be added (feature-gated) for the spike.
-- **`winreg` breaks the build before any of that is reached** — it's in the plain
-  `[dependencies]` block and doesn't compile off-Windows. Handled by the Phase 1a
-  step-7 pre-flight; called out here because the failure reads like a broken NDK
-  setup rather than a one-line manifest fix. Same class: `tray-icon`,
-  `tauri-plugin-global-shortcut`, `notify-rust`, `keyring`.
+- ~~`winreg` breaks the build before any of that is reached~~ — **resolved**
+  with the rest of the Phase 1a pre-flight. The lesson that generalizes: two of
+  the worst breakers weren't on the checklist at all, and the failures read like
+  toolchain problems. When Phase 2 and Phase 6b touch this surface, grep for the
+  *second* consumer of anything platform-specific.
 - **The Android loopback exposure fails silently** — no error, no log, all tests still
   green, daemon simply reachable by every other app on the device. Nothing surfaces it
   naturally, which is why it's an explicit Phase 7 acceptance check.

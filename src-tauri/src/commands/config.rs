@@ -4,6 +4,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 
 use crate::config::{self, Config};
+#[cfg(desktop)]
 use crate::hotkey;
 use crate::state::AppState;
 
@@ -38,6 +39,8 @@ pub async fn set_config(
     state: tauri::State<'_, AppState>,
     config: Config,
 ) -> Result<(), String> {
+    // Consumed only by the desktop-only re-registration below.
+    #[cfg_attr(not(desktop), allow(unused_variables))]
     let hotkey_changed = {
         let mut cur = state.config.lock().unwrap();
         let changed = cur.hotkeys != config.hotkeys
@@ -62,6 +65,11 @@ pub async fn set_config(
     // Let every window re-apply theme/background from the new config.
     let _ = app.emit("theme://changed", ());
 
+    // `set_config` itself stays available on every platform — only the
+    // re-registration is desktop-only, since Android has no OS-wide shortcut
+    // to register (docs/ANDROID.md D23). The hotkey config fields still
+    // round-trip so a config.json moves between platforms unchanged.
+    #[cfg(desktop)]
     if hotkey_changed {
         let hotkeys = config.hotkeys.clone();
         let clipboard_hotkey = config.clipboard_hotkey.clone();

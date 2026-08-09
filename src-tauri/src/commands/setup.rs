@@ -134,11 +134,16 @@ pub async fn complete_setup(app: AppHandle) -> Result<(), String> {
     windows::show_overlay(&app).map_err(|e| e.to_string())
 }
 
+// Autostart is the HKCU Run key — Windows-only, with no Android v1
+// equivalent (docs/ANDROID.md D23). `lib.rs` gates the handler entries to
+// match; the Settings → General toggle is hidden on Android in Phase 6b.
+#[cfg(windows)]
 #[tauri::command]
 pub fn get_autostart() -> Result<bool, String> {
     Ok(wizard::autostart_enabled())
 }
 
+#[cfg(windows)]
 #[tauri::command]
 pub fn set_autostart(enabled: bool) -> Result<(), String> {
     wizard::set_autostart(enabled)

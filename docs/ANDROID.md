@@ -40,6 +40,20 @@ changed:
 D1–D21 are unchanged and un-renumbered — existing references (including in
 `ANDROID-PLAN.md`) stay valid.
 
+### Execution status (2026-08-08)
+
+- **Phase 0 — done.** Baseline committed and green.
+- **Phase 1a — done.** Toolchain installed and verified (D22 records the pinned
+  versions). `src-tauri` cross-compiles clean for `aarch64-linux-android`;
+  §2.5 is the record of what that took, and it was **more than this doc
+  originally listed** — `screenshot.rs` and `config/env_helper.rs` were both
+  unlisted hard breakers, and the overlay builder needed the *functions*
+  gated, not just their call site.
+- **Phase 1 — next**, and still the make-or-break gate: no llama.cpp binding
+  or `wasmtime` is a dependency yet.
+- No device is attached yet (`adb devices` is empty) — needed for Phase 1's
+  on-device acceptance, not for the compile gate.
+
 ---
 
 ## 1. Decisions (definitive register)
@@ -67,9 +81,9 @@ D1–D21 are unchanged and un-renumbered — existing references (including in
 | D19 | **`flash_attn` auto-detected** at engine init; never a user toggle (read-only card diagnostic `"off"`/"on (<backend>)"). | §3.3 |
 | D20 | **`auto`/`-1` select backend**: `select_backend()` returns `Cuda|Vulkan|Cpu`; fit/badge/VRAM math uses the *selected* backend's VRAM bank. | §3.3 |
 | D21 | **Windows multi-window is preserved**: two (or more) hub windows may be open at once, each with its **own independent session and its own pinned model**. Android stays single-window. | §8.1, §4.2 |
-| D22 | **`aarch64-linux-android` is the only shipped v1 ABI** (no armeabi-v7a, no x86_64 — emulator testing is a dev convenience, not a release target). **minSdk 26, targetSdk 34.** The exact NDK version is **pinned in Phase 1a from `cargo tauri android init`'s own requirement** and recorded back here — not guessed now. | §10 P1; `ANDROID-PLAN.md` P1a |
+| D22 | **`aarch64-linux-android` is the only shipped v1 ABI** (no armeabi-v7a, no x86_64 — emulator testing is a dev convenience, not a release target). **minSdk 26, targetSdk 34.** **NDK pinned: `27.2.12479018` (r27c)**, SDK `platforms/android-34` + `build-tools/34.0.0`, JDK 17, installed and verified 2026-08-08. | §10 P1; `ANDROID-PLAN.md` P1a |
 | D23 | **Desktop-only `src-tauri` subsystems are `cfg`-gated, not ported.** Tray, global-shortcut hotkey, autostart, and `notify-rust` get `#[cfg(desktop)]`/`#[cfg(windows)]`. **`winreg` is in the plain `[dependencies]` block today and will break the very first Android build** — it must move under `[target.'cfg(windows)'.dependencies]`. No autostart equivalent ships on Android v1. | §2.5; `ANDROID-PLAN.md` P1a |
-| D24 | **Android secrets use the `keyring` crate's Android/Keystore backend**, not a hand-rolled store — but it needs its own Cargo feature **plus JNI `JavaVM`/`Context` init wiring** at startup. Treated as its own spike inside Phase 7, not an assumed-trivial feature flip. | §10 P7 |
+| D24 | **Android secrets use the `keyring` crate's Android/Keystore backend**, not a hand-rolled store — its own Cargo feature **plus JNI `JavaVM`/`Context` init wiring** at startup. Its own spike inside Phase 7, not an assumed-trivial feature flip. **This is a silent-data-loss risk, not a build error:** with only `windows-native` enabled, keyring 3.x hits its catch-all `pub use mock as default` on Android and compiles fine — provider API keys appear to save, then vanish on relaunch. Nothing fails loudly. Phase 7 must not ship without it. | §10 P7 |
 | D25 | **Android hardens the daemon's HTTP surface: `require_secret: true`, always.** Loopback is **not** process-private on Android — any app holding `INTERNET` can reach `127.0.0.1`. Also relax escalation-to-approval where the app sandbox *is* the security boundary. Both already flagged in code comments; neither had a decision until now. | §2.6, §10 P7 |
 
 ---
@@ -168,21 +182,33 @@ reintroduce a Python runtime: `kitty-docs-web` is retired, and its PDF/Excel/web
 tools were reimplemented natively in Rust (`lopdf`, `calamine`, `scraper`+`htmd`)
 precisely so no interpreter is needed. See §10 Phase 1 on `kitty-wasm`/wasmtime.
 
-### 2.5 Desktop-only subsystems to gate (D23)
+### 2.5 Desktop-only subsystems to gate (D23) — **DONE**
 
-These are compiled unconditionally today and must be `cfg`-gated before the
-Android target can build. `tauri-plugin-single-instance` is **already** correctly
-gated (`Cargo.toml` target table + `#[cfg(desktop)]` in `lib.rs`) — use it as the
-pattern.
+**Landed 2026-08-08.** `cargo ndk -t arm64-v8a --platform 26 check` on
+`src-tauri` is clean (zero errors, zero warnings), with desktop unregressed
+(138 tests, clippy clean, full `cargo build`). Recorded here as the map of what
+was gated and why, since Phase 2 and Phase 6b both touch this surface again.
 
-| Subsystem | Where | Action |
+`tauri-plugin-single-instance` was **already** correctly gated (`Cargo.toml`
+target table + `#[cfg(desktop)]` in `lib.rs`) and was used as the pattern
+throughout.
+
+| Subsystem | Where | What was done |
 |---|---|---|
-| `winreg` (autostart, HKCU Run key) | `src-tauri/Cargo.toml` plain `[dependencies]`; `wizard.rs` | **Move to `[target.'cfg(windows)'.dependencies]`** and `cfg(windows)`-gate `autostart_enabled`/`set_autostart` + their command registrations in `lib.rs`. **This one is a hard build breaker** — `winreg` does not compile off-Windows at all. |
-| Tray | `tray.rs`; `tauri = { features = ["tray-icon"] }`; `lib.rs` setup | `#[cfg(desktop)]` the `tray::create` call; scope the feature to the desktop target. |
-| Global-shortcut hotkey | `hotkey.rs`; `tauri-plugin-global-shortcut` | `#[cfg(desktop)]`. (The raw `WH_KEYBOARD_LL` Copilot-key hook is **already gone** — only the plugin remains.) Android has no OS-wide hotkey; the overlay-summon concept doesn't exist there (D9). |
-| `notify-rust` | `src-tauri/Cargo.toml` plain `[dependencies]` | Desktop toast crate, Android-compileability unverified. Gate it; Android notifications go through the already-present `tauri-plugin-notification`. |
-| `keyring` (`windows-native` feature only) | `config/providers/` | See D24 — Android backend + JNI init, Phase 7. |
-| Overlay window creation | `windows.rs::create_overlay`, called unconditionally in `lib.rs` setup | A borderless always-on-top window over *other apps* has no Android equivalent without `SYSTEM_ALERT_WINDOW`. Gate creation; Android boots straight into the hub (D9, §8.2). |
+| `winreg` (autostart + Ollama env helper) | `Cargo.toml`; `wizard.rs`; **`config/env_helper.rs`** | Moved to `[target.'cfg(windows)'.dependencies]`; `cfg(windows)` on the autostart fns/consts/imports, `commands/setup.rs`'s two commands, `config/mod.rs`'s `env_helper` decl, `commands/ollama.rs`'s two env commands, and all four handler entries. **Two consumers, not one** — gating `wizard.rs` alone leaves the build broken. |
+| **`screenshot.rs`** | `lib.rs`, `commands/mod.rs`, `commands/screenshot.rs`, `windows.rs::create_screenshot_select_window` + `wait_for_window_gone` | `#[cfg(windows)]` throughout. An entire ungated Win32 GDI module importing `windows::Win32::*` — a `cfg(windows)`-only dep. **The single biggest breaker, and originally unlisted here.** |
+| Tray | `tray.rs`; `lib.rs` setup; **`notifications.rs::set_tray_pending`** | `#[cfg(desktop)] mod tray` + gated `tray::create` call. `set_tray_pending` keeps its signature (5 callers in `bigtiny/stream.rs` and `commands/session/prompt.rs`) with only its body gated — `tray_by_id` is itself `cfg(all(desktop, feature = "tray-icon"))`. The `tray-icon` feature is left on: gating the *module* is what matters. |
+| Global-shortcut hotkey | `hotkey.rs`; `lib.rs` setup **and `commands/config.rs`** | Dep moved to the `cfg(not(any(android, ios)))` table; `#[cfg(desktop)] mod hotkey`; the plugin registration lifted out of the builder method chain into a `#[cfg(desktop)]` block (an inline `#[cfg]` mid-chain isn't valid). **`set_config` is a second `hotkey::register` call site** and must stay available on Android, so only its re-registration block is gated. |
+| `notify-rust` | `notifications.rs` | **Already** in `[target.'cfg(windows)'.dependencies]` — the earlier claim that it sat in plain `[dependencies]` was wrong; only the call site needed work. `notify_if_hidden` keeps its signature and shared preamble, then delegates to a `#[cfg(windows)]` `notify-rust` arm (click-to-focus, `ToastJob` worker) or a **new** `#[cfg(not(windows))]` arm over `tauri-plugin-notification` — which was registered but had never been called from Rust. |
+| Overlay window | `windows.rs::create_overlay` / `show_overlay`; `lib.rs` setup | `#[cfg(desktop)]` on the functions themselves, **not just the call site**: `decorations`/`always_on_top`/`skip_taskbar` are absent from the mobile `WebviewWindowBuilder`, so the body genuinely does not compile. `show_overlay` gets a `#[cfg(not(desktop))]` no-op arm so `complete_setup` needn't branch. |
+| `keyring` (`windows-native` only) | `config/providers/` | **Left alone — it compiles** (see D24's mock fallback). Phase 7. |
+| `externalBin` sidecars | `tauri.conf.json` → new **`tauri.android.conf.json`** | Tauri resolves sidecars by target triple, so the build demanded `binaries/kitty-*-aarch64-linux-android` and failed *in the build script*, before any Rust. A platform config override clears `externalBin`/`resources` for Android. Expected to be revisited in Phase 8; this is the minimum that unblocks compiling. |
+
+Also swept up: `#[cfg_attr(not(desktop), allow(dead_code))]` on the chat-window
+routing helpers (`show_and_focus`, `focus_or_open_session`,
+`focus_or_open_chat_window`, `toggle_or_focus_main`, `any_open_chat_window`) —
+live code with no Android caller *yet*, marked per-function rather than
+blanket-allowed so Phase 6b can find them.
 
 ### 2.6 Android security posture (D25)
 
@@ -499,9 +525,9 @@ All under `Settings → Local models`, shared component on both OS.
 - **Goal:** prove `llama_cpp` + `wasmtime` + `sqlx` cross-compile for
   `aarch64-linux-android`; pin the llama.cpp binding crate (D1); confirm arch
   `lfm2` loads; verify `-1` behaves as "all layers" across packaged backends.
-- **Prerequisite:** the D23 gating in §2.5 must land *first* — `winreg` alone
-  will fail the build before any of the interesting native deps are even
-  reached. `ANDROID-PLAN.md` Phase 1a carries this as a pre-flight checklist.
+- **Prerequisite: DONE.** The D23 gating (§2.5) landed 2026-08-08 and
+  `src-tauri` now cross-compiles clean for `aarch64-linux-android`. The
+  toolchain (D22) is installed. Phase 1 starts from a working runway.
 - **Why `wasmtime` is on this list** (previously unstated): it backs
   `kitty-wasm`, the fourth in-process MCP builtin (§2.3), which hosts the
   sandboxed code-execution tools (`wasm_python_run` et al.) via a pinned CPython
@@ -627,12 +653,12 @@ All under `Settings → Local models`, shared component on both OS.
   binding crate (`llama-cpp-2`, the `llama-cpp-2rs` fork, …) stays a *decision*
   made in Phase 1, not a blocker — the `LocalEngine` boundary isolates a backend
   swap, which is exactly why D1 names no specific crate.
-- **`winreg` breaks the first Android build before anything interesting runs**
-  (D23/§2.5). It sits in the plain `[dependencies]` block while the `windows`
-  crate already gets a `cfg(windows)` target table — an easy thing to miss, and
-  the resulting failure looks like a toolchain problem rather than a one-line
-  manifest fix. Same class of risk for `notify-rust`, `tray-icon`, and
-  `tauri-plugin-global-shortcut`, none of which are gated today.
+- ~~`winreg` breaks the first Android build~~ — **resolved 2026-08-08** along
+  with the rest of D23/§2.5. Worth remembering the shape of it, though: the
+  failure presented as a toolchain problem and was a one-line manifest fix, and
+  the two biggest offenders (`screenshot.rs`, `config/env_helper.rs`) weren't in
+  the original list at all. Expect the same when Phase 2 and Phase 6b touch this
+  surface: grep for the *second* consumer.
 - **The Android loopback exposure fails silently** (D25/§2.6). If
   `require_secret` isn't set, nothing errors, nothing logs, and every test still
   passes — the daemon is simply reachable by every other app on the device.

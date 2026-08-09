@@ -89,19 +89,23 @@ pub fn notify_if_hidden(
         return;
     }
 
+    emit_notification(app, title, body, session_id);
+}
+
+/// Windows: `notify-rust` directly, so we keep the toast activation handle and
+/// can focus the right window on click (see `notify_if_hidden`'s doc comment).
+#[cfg(windows)]
+fn emit_notification(app: &AppHandle, title: &str, body: &str, session_id: Option<&str>) {
     let mut n = notify_rust::Notification::new();
     n.summary(title).body(body).auto_icon();
-    #[cfg(windows)]
-    {
-        // Only set the AUMID for the installed app — matches
-        // tauri-plugin-notification's own dev-vs-installed check, otherwise a
-        // dev build (no registered shortcut) fails to show anything at all.
-        if let Ok(exe) = tauri::utils::platform::current_exe() {
-            if let Some(dir) = exe.parent() {
-                let d = dir.display().to_string();
-                if !d.ends_with("target\\debug") && !d.ends_with("target\\release") {
-                    n.app_id(&app.config().identifier);
-                }
+    // Only set the AUMID for the installed app — matches
+    // tauri-plugin-notification's own dev-vs-installed check, otherwise a
+    // dev build (no registered shortcut) fails to show anything at all.
+    if let Ok(exe) = tauri::utils::platform::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let d = dir.display().to_string();
+            if !d.ends_with("target\\debug") && !d.ends_with("target\\release") {
+                n.app_id(&app.config().identifier);
             }
         }
     }
@@ -165,12 +169,35 @@ pub fn notify_if_hidden(
     }
 }
 
+/// Non-Windows (Android): `tauri-plugin-notification`, which is already
+/// registered but was previously never called from Rust. `notify-rust` is a
+/// `cfg(windows)`-only dependency and its click-to-focus machinery
+/// (activation handle + blocking wait + worker thread) has no counterpart
+/// here — the plugin's `show()` discards the handle, which is exactly why
+/// Windows doesn't use it. So this arm posts the toast and stops there;
+/// tapping it just opens the app, which is the platform norm anyway.
+#[cfg(not(windows))]
+fn emit_notification(app: &AppHandle, title: &str, body: &str, _session_id: Option<&str>) {
+    use tauri_plugin_notification::NotificationExt;
+    if let Err(e) = app
+        .notification()
+        .builder()
+        .title(title)
+        .body(body)
+        .show()
+    {
+        tracing::warn!("notification failed: {e}");
+    }
+}
+
 /// A toast whose click-detection wait still needs servicing, delivered to the
 /// single notification worker (`toast_worker_sender`).
+#[cfg(windows)]
 struct ToastJob {
     run: Box<dyn FnOnce() + Send>,
 }
 
+#[cfg(windows)]
 fn toast_worker_sender() -> std::sync::mpsc::Sender<ToastJob> {
     use std::sync::{Mutex, OnceLock};
     // A static rather than app state: a toast's wait can outlive the command
@@ -195,7 +222,14 @@ fn toast_worker_sender() -> std::sync::mpsc::Sender<ToastJob> {
 }
 
 /// Reflect a pending approval / running task in the tray tooltip.
+///
+/// Only the *body* is gated, not the signature: `tray_by_id` is itself
+/// `cfg(all(desktop, feature = "tray-icon"))` in Tauri, but this has five
+/// callers across `bigtiny/stream.rs` and `commands/session/prompt.rs` that
+/// shouldn't each have to know that. On Android it's a no-op — there is no
+/// tray to reflect state into (docs/ANDROID.md D23/§2.5).
 pub fn set_tray_pending(app: &AppHandle, pending: bool) {
+    #[cfg(desktop)]
     if let Some(tray) = app.tray_by_id("main-tray") {
         let tip = if pending {
             "Kitty — approval needed"
@@ -204,4 +238,6 @@ pub fn set_tray_pending(app: &AppHandle, pending: bool) {
         };
         let _ = tray.set_tooltip(Some(tip));
     }
+    #[cfg(not(desktop))]
+    let _ = (app, pending);
 }

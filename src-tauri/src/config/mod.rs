@@ -3,6 +3,10 @@
 //! never secrets (those live in the Windows Credential Manager via
 //! `keyring`).
 
+// HKCU\Environment reader/writer for the OLLAMA_* vars — `winreg`, so
+// Windows-only (docs/ANDROID.md §2.5). Phase 2 deletes this module outright
+// along with the rest of the Ollama integration.
+#[cfg(windows)]
 pub mod env_helper;
 pub mod providers;
 pub mod recipe_yaml;

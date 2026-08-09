@@ -18,6 +18,8 @@ mod ollama;
 mod provider;
 mod recipes;
 mod scheduled_tasks;
+// Win32 GDI desktop capture — see `crate::screenshot` (docs/ANDROID.md §2.5).
+#[cfg(windows)]
 mod screenshot;
 mod session;
 mod setup;
@@ -34,6 +36,7 @@ pub use ollama::*;
 pub use provider::*;
 pub use recipes::*;
 pub use scheduled_tasks::*;
+#[cfg(windows)]
 pub use screenshot::*;
 pub use session::*;
 pub use setup::*;
