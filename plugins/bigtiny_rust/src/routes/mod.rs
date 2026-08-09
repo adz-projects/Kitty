@@ -1,6 +1,7 @@
 pub mod chat;
 pub mod embeddings;
 pub mod health;
+pub mod local;
 pub mod mcp;
 pub mod memory;
 pub mod pathway;
@@ -48,6 +49,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/api/health", get(health::check_health))
         .route("/api/status", get(health::status))
+        .route("/api/local/models/status", get(local::models_status))
         .route("/api/memory/stats", get(memory::stats))
         // Ollama-compatible on purpose — see routes/embeddings.rs.
         .route("/api/embeddings", post(embeddings::embed))

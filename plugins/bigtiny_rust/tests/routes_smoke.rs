@@ -119,6 +119,63 @@ async fn router_constructs_without_panicking_and_health_is_open() {
     assert_eq!(body["status"], "ok");
 }
 
+/// `/api/health` is the one unauthenticated route, so its new `local` block
+/// must stay coarse: enabled / backend name / a resident-slot count, and
+/// nothing that would leak a filesystem path or a device description to an
+/// unauthenticated caller.
+#[tokio::test]
+async fn health_reports_a_coarse_local_block_and_leaks_no_paths() {
+    let state = test_state().await;
+    let app = create_router(state);
+
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/api/health")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = body_json(response).await;
+    let local = &body["local"];
+    assert!(local.is_object(), "health must carry a `local` block, got {body}");
+    assert!(local["enabled"].is_boolean());
+    assert!(local["backend"].is_string());
+    assert!(local["slots_loaded"].is_number());
+
+    let rendered = local.to_string();
+    for leaked in ["model_path", "devices", "description", ".gguf"] {
+        assert!(
+            !rendered.contains(leaked),
+            "the unauthenticated health block must not expose {leaked:?}: {rendered}"
+        );
+    }
+}
+
+/// The detail route exists on every build, feature or not — a 404 here would
+/// be indistinguishable from a wrong URL, which is the same reasoning
+/// `/api/embeddings` uses.
+#[tokio::test]
+async fn local_models_status_answers_on_every_build() {
+    let state = test_state().await;
+    let app = create_router(state);
+
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/api/local/models/status")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let body = body_json(response).await;
+    assert!(body["enabled"].is_boolean());
+    assert!(body["slots"].is_array(), "got {body}");
+}
+
 #[tokio::test]
 async fn create_list_and_fetch_session_roundtrip() {
     let state = test_state().await;

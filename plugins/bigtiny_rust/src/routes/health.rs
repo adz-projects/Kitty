@@ -7,8 +7,16 @@ use serde_json::{json, Value};
 use super::AppState;
 
 /// `GET /api/health` — open, no auth, used by Kitty for readiness polling.
-pub async fn check_health() -> Json<Value> {
-    Json(json!({"status": "ok"}))
+///
+/// The `local` block is deliberately coarse (enabled / backend name / how
+/// many slots are resident). This route is the one exempt from auth, so it
+/// must not leak model paths or device descriptions; `/api/local/models/status`
+/// carries the detail.
+pub async fn check_health(State(state): State<Arc<AppState>>) -> Json<Value> {
+    Json(json!({
+        "status": "ok",
+        "local": super::local::health_summary(&state),
+    }))
 }
 
 /// `GET /api/status` — provider health + a coarse daemon status summary.

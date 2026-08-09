@@ -53,6 +53,11 @@ pub struct SlotStatus {
     /// Present once loaded; lets a caller detect an embedding-width change
     /// without loading the model itself.
     pub n_embd: Option<i32>,
+    /// Which compute backend this slot's model is *actually* resident on
+    /// (D20). `None` while unloaded — reporting the backend a fresh selection
+    /// would pick would be a different claim than "what this model is running
+    /// on", and the model card asks the latter.
+    pub backend: Option<super::backend::SelectedBackend>,
     /// Why the slot is empty, when it is. `None` while loaded.
     pub error: Option<String>,
 }
@@ -164,6 +169,7 @@ impl SlotManager {
                         .map(|e| e.path().display().to_string())
                         .or_else(|| (!configured.is_empty()).then(|| configured.to_string())),
                     n_embd: engine.map(|e| e.n_embd()),
+                    backend: engine.map(|e| e.selected_backend().clone()),
                     error: inner.errors.get(&kind).cloned(),
                 }
             })
