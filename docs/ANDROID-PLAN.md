@@ -144,9 +144,30 @@ local-engine` succeeds in 3m22s. Verified `EM_AARCH64` via the NDK's
 `llama-cpp-sys-2` (247 MB), `kitty-tools`, `kitty-web`, `adaptive-pathway`.
 `libsqlite3-sys` cross-compiles as well.
 
-**Not proven, don't claim it:** this is a *compile*, not a *link*.
-`bigtiny_rust` is an rlib, so `nm -u` has nothing to inspect — the
-no-unresolved-externals criterion needs Phase 7's in-process cdylib.
+**1-device: PASSED** on a Pixel 10 Pro (arm64-v8a, Android 16 / API 36).
+Cross-compiling the spikes as ARM64 *executables* also ran the linker, which
+closed the criterion that looked deferred while only an rlib existed:
+
+```
+NEEDED  libdl.so, libm.so, libc.so      # and nothing else
+```
+
+No `libc++_shared.so` — `static-stdcxx` did its job, so the artifact is
+self-contained with nothing to `dlopen`. All 168 undefined symbols are bionic
+libc. On device: summarizer produced **byte-identical output to Windows** in
+**3.4 s wall** (including the 730 MB model load); embedder returned 1024-dim
+vectors with cos 0.74 / 0.29.
+
+Reproduce:
+```
+adb push target/aarch64-linux-android/debug/examples/local_engine_spike /data/local/tmp/kitty/
+adb push <model>.gguf /data/local/tmp/kitty/
+adb shell "cd /data/local/tmp/kitty && chmod 755 local_engine_spike && ./local_engine_spike <model>.gguf"
+```
+(`/data/local/tmp` is the one adb-writable location that permits exec.)
+
+**Still to re-check later:** this is an executable link. Phase 7's in-process
+**cdylib** is a different one — run the same `readelf -d` check on it.
 
 **Extra build prerequisites, neither previously documented** — both from
 `llama-cpp-sys-2`:

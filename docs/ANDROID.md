@@ -58,16 +58,26 @@ D1–D21 are unchanged and un-renumbered — existing references (including in
   with `kitty-wasm` at 83 MB) — the "drop kitty-wasm on Android" contingency
   is **not** needed. All four linked path-deps build for the target.
   §11 records the four toolchain traps this surfaced.
+- **Phase 1 (1-device) — PASSED 2026-08-09** on a **Pixel 10 Pro (arm64-v8a,
+  Android 16 / API 36)**. Both spikes were cross-compiled as native ARM64
+  binaries, pushed to `/data/local/tmp`, and run:
+  - Summarizer produced **byte-identical output to Windows**, in **3.4 s wall**
+    including the full 730 MB model load. On-device summarization is viable.
+  - Embedder returned 1024-dim vectors, cos 0.7425 / 0.2922 (Windows: 0.7325 /
+    0.2936 — SIMD-path variance, not a behavioural difference).
+  - **`nm -u` criterion now genuinely met.** Building the examples *did* run
+    the linker, so this is no longer deferred: the ELF's only `NEEDED` entries
+    are `libdl.so`, `libm.so`, `libc.so`. **No `libc++_shared.so`** — the
+    `static-stdcxx` feature works, confirming §11's single-self-contained-
+    artifact rule. All 168 undefined symbols are bionic libc, resolved by the
+    platform. Zero `UnsatisfiedLinkError`/`dlopen` failures.
 - **Still open from Phase 1:**
-  - **1-device** — no device attached (`adb devices` empty). NDK linkage
-    problems only surface at `dlopen` time, so this remains a real gap.
-  - **`nm -u` / "no unresolved externals" cannot yet be checked.**
-    `bigtiny_rust` builds as an rlib, so there is no link step. A truthful
-    check needs the daemon linked into a cdylib, which is Phase 7's in-process
-    work. Not counted as met.
   - **D20 backend selection unvalidated** — Windows is CPU-only for now
     (`cuda`/`vulkan` are cargo features; toolkit deferred), so `-1` = "all
     layers" across backends is untested.
+  - The link evidence above is from an *executable*. The Phase 7 in-process
+    **cdylib** is a different link, and should be re-checked the same way when
+    it exists.
 
 ---
 
