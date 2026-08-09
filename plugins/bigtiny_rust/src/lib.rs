@@ -3,6 +3,10 @@ pub mod config;
 pub mod crypto;
 pub mod error;
 pub mod hitl;
+/// In-process llama.cpp engine (docs/ANDROID.md §3). Feature-gated: see
+/// `Cargo.toml`'s `local-engine`.
+#[cfg(feature = "local-engine")]
+pub mod local;
 pub mod mcp;
 pub mod models;
 pub mod network;

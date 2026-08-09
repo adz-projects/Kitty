@@ -32,6 +32,92 @@ pub struct BigTinyConfig {
     pub cache: CacheConfig,
     #[serde(default)]
     pub pathway: PathwayConfig,
+    #[serde(default)]
+    pub local: LocalEngineConfig,
+}
+
+/// In-process llama.cpp engine (docs/ANDROID.md §3.2, D1).
+///
+/// Present in the config on every build so a config file round-trips
+/// identically whether or not the `local-engine` feature is compiled in;
+/// `enabled` is what actually gates the engine at runtime.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LocalEngineConfig {
+    /// Off by default: the engine loads GGUFs that may not be downloaded yet,
+    /// and every existing deployment expects the current provider behaviour.
+    #[serde(default)]
+    pub enabled: bool,
+    /// GGUF path for the summarizer / general local model. Empty = not
+    /// configured, which the manager reports rather than guessing a path.
+    #[serde(default)]
+    pub model_path: String,
+    /// GGUF path for the embedder (docs/ANDROID.md §9.2). Separate slot from
+    /// the summarizer — different model and, critically, a different context
+    /// (embeddings are a context-construction flag, so one context cannot
+    /// serve both roles).
+    #[serde(default)]
+    pub embed_model_path: String,
+    /// Pooling for the embedder, as a lowercase string (`last`, `mean`,
+    /// `cls`). Belongs with the model pin, not the engine: Qwen3-Embedding is
+    /// causal-LM-derived and needs `last`, while a BERT-style embedder needs
+    /// `mean`/`cls`. llama.cpp's own default is *none*, which silently yields
+    /// no sequence embedding at all.
+    #[serde(default = "default_embed_pooling")]
+    pub embed_pooling: String,
+    #[serde(default = "default_local_n_ctx")]
+    pub n_ctx: u32,
+    /// Embedders need far less context than a chat model; a belief is short.
+    #[serde(default = "default_local_embed_n_ctx")]
+    pub embed_n_ctx: u32,
+    #[serde(default = "default_local_n_batch")]
+    pub n_batch: u32,
+    /// `0` = let llama.cpp pick from the host's core count.
+    #[serde(default)]
+    pub n_threads: i32,
+    /// `-1`/`auto` semantics live in `select_backend` (D20); `0` is CPU-only.
+    #[serde(default = "default_local_n_gpu_layers")]
+    pub n_gpu_layers: i32,
+    #[serde(default = "default_local_cache_type")]
+    pub cache_type_k: String,
+    #[serde(default = "default_local_cache_type")]
+    pub cache_type_v: String,
+}
+
+fn default_embed_pooling() -> String {
+    "last".into()
+}
+fn default_local_n_ctx() -> u32 {
+    4096
+}
+fn default_local_embed_n_ctx() -> u32 {
+    512
+}
+fn default_local_n_batch() -> u32 {
+    512
+}
+fn default_local_n_gpu_layers() -> i32 {
+    -1
+}
+fn default_local_cache_type() -> String {
+    "f16".into()
+}
+
+impl Default for LocalEngineConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model_path: String::new(),
+            embed_model_path: String::new(),
+            embed_pooling: default_embed_pooling(),
+            n_ctx: default_local_n_ctx(),
+            embed_n_ctx: default_local_embed_n_ctx(),
+            n_batch: default_local_n_batch(),
+            n_threads: 0,
+            n_gpu_layers: default_local_n_gpu_layers(),
+            cache_type_k: default_local_cache_type(),
+            cache_type_v: default_local_cache_type(),
+        }
+    }
 }
 
 /// Behavioral-memory engine config (`adaptive_pathway`). Empty/minimal keys
