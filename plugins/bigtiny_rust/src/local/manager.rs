@@ -58,6 +58,16 @@ pub struct SlotStatus {
     /// would pick would be a different claim than "what this model is running
     /// on", and the model card asks the latter.
     pub backend: Option<super::backend::SelectedBackend>,
+    /// Layers actually offloaded. Worth reporting separately from `backend`
+    /// because "Automatic" can legitimately resolve to a *partial* offload —
+    /// a GPU-backed slot with 12 of 16 layers resident is neither "on the
+    /// GPU" nor "on the CPU", and the model card should not have to guess.
+    pub n_gpu_layers: Option<i32>,
+    /// Context size this slot's generation contexts are actually built with,
+    /// after automatic fitting and the `n_ctx_train` clamp. This is the number
+    /// the user's `n_ctx` setting resolved to, which is not always the number
+    /// they chose.
+    pub n_ctx: Option<u32>,
     /// Why the slot is empty, when it is. `None` while loaded.
     pub error: Option<String>,
 }
@@ -170,6 +180,8 @@ impl SlotManager {
                         .or_else(|| (!configured.is_empty()).then(|| configured.to_string())),
                     n_embd: engine.map(|e| e.n_embd()),
                     backend: engine.map(|e| e.selected_backend().clone()),
+                    n_gpu_layers: engine.map(|e| e.n_gpu_layers()),
+                    n_ctx: engine.map(|e| e.effective_n_ctx()),
                     error: inner.errors.get(&kind).cloned(),
                 }
             })

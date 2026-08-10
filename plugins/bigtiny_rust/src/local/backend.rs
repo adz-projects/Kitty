@@ -12,16 +12,14 @@
 //! implemented and shouldn't be: `memory_free`/`memory_total` here are
 //! measured, not estimated.
 //!
-//! **`fit_params` is deliberately not wired yet.** llama.cpp's own
-//! optimal-`n_gpu_layers` solver (`LlamaModelParams::fit_params`, feature
-//! `common`) is the right long-term answer for GPU offload, but it requires
-//! `n_gpu_layers` left at its `-1` default, co-decides model *and* context
-//! params in one call (which this crate builds separately — see
-//! [`super::engine`]'s `base_params`), and is explicitly not thread-safe. On a
-//! CPU-only build it would resolve to "0 layers offloaded" every time, so
-//! wiring it now would mean adding an unvalidated, globally-mutating call to
-//! every model load in exchange for nothing. It lands with the first GPU
-//! backend, where it can actually be tested.
+//! **Selection is only half of D20.** Once a device is chosen, how much of the
+//! model to put on it is llama.cpp's own solver's job —
+//! [`super::engine`]'s `fit_to_device`, wrapping `LlamaModelParams::fit_params`.
+//! The two halves are deliberately separate: this module answers "which
+//! device", using only enumeration, and is testable with synthetic device
+//! lists on any machine; fitting answers "how much fits", needs the real GGUF
+//! and a real driver, and is not thread-safe. Keeping them apart is what lets
+//! the entire selection policy below be unit-tested without a GPU.
 
 use llama_cpp_2::{
     list_llama_ggml_backend_devices, LlamaBackendDevice, LlamaBackendDeviceType,
@@ -59,6 +57,17 @@ pub struct SelectedBackend {
     /// would make the card's VRAM row lie.
     pub memory_free: u64,
     pub memory_total: u64,
+    /// Free memory this load can actually draw on, **including system RAM when
+    /// the selected device is the CPU**.
+    ///
+    /// Deliberately a third field rather than a reinterpretation of
+    /// `memory_free`. The two answer different questions and disagree exactly
+    /// where it matters: the model card asks "how much VRAM does this device
+    /// have", where the honest CPU answer is *none*; context sizing asks "how
+    /// much memory may I spend", where the honest CPU answer is system RAM and
+    /// reporting zero would leave every CPU-only machine — which is every
+    /// Android device (D18) — with no basis to size a context on.
+    pub usable_memory: u64,
 }
 
 impl SelectedBackend {
@@ -70,31 +79,51 @@ impl SelectedBackend {
         }
     }
 
-    fn cpu() -> Self {
+    /// `devices` is the enumerated list, used only to find the CPU device's
+    /// free system RAM for [`Self::usable_memory`]. `0` when the registry
+    /// reports no CPU device, which callers treat as "no basis to estimate".
+    fn cpu(devices: &[LlamaBackendDevice]) -> Self {
+        let usable_memory = devices
+            .iter()
+            .find(|d| matches!(d.device_type, LlamaBackendDeviceType::Cpu))
+            .map_or(0, |d| d.memory_free as u64);
         Self {
             backend: BackendKind::Cpu.as_str().to_string(),
             device: None,
             device_index: None,
             memory_free: 0,
             memory_total: 0,
+            usable_memory,
         }
     }
 }
 
-/// Rank a device: CUDA beats Vulkan beats everything else (D20 step 2).
-/// `None` for anything that isn't a usable accelerator.
-fn gpu_rank(d: &LlamaBackendDevice) -> Option<u8> {
-    if !matches!(
-        d.device_type,
-        LlamaBackendDeviceType::Gpu | LlamaBackendDeviceType::IntegratedGpu
-    ) {
-        return None;
-    }
-    match d.backend.to_ascii_lowercase().as_str() {
-        b if b.contains("cuda") => Some(0),
-        b if b.contains("vulkan") => Some(1),
-        _ => None,
-    }
+/// Rank a device, lower is better. `None` for anything that isn't a usable
+/// accelerator.
+///
+/// Two keys, in order:
+///
+/// 1. **Backend** — CUDA beats Vulkan (D20 step 2).
+/// 2. **Discrete beats integrated.** This one is not cosmetic. An integrated
+///    GPU's "memory" *is* system RAM, so it reports far more free than a
+///    discrete card almost every time — a measured example: an Intel UHD iGPU
+///    advertising 7,389 MiB free next to a GTX 1650 Ti with 3,561 MiB of real
+///    VRAM. Ranking on free memory alone therefore picks the *slower* device
+///    on essentially every laptop that has both. The free-memory comparison
+///    below is only meaningful between devices of the same kind, which is
+///    exactly where this key confines it.
+fn gpu_rank(d: &LlamaBackendDevice) -> Option<(u8, u8)> {
+    let kind = match d.device_type {
+        LlamaBackendDeviceType::Gpu => 0,
+        LlamaBackendDeviceType::IntegratedGpu => 1,
+        _ => return None,
+    };
+    let backend = match d.backend.to_ascii_lowercase().as_str() {
+        b if b.contains("cuda") => 0,
+        b if b.contains("vulkan") => 1,
+        _ => return None,
+    };
+    Some((backend, kind))
 }
 
 fn kind_of(d: &LlamaBackendDevice) -> BackendKind {
@@ -117,7 +146,7 @@ fn kind_of(d: &LlamaBackendDevice) -> BackendKind {
 pub fn select_from(devices: &[LlamaBackendDevice], preference: &str) -> SelectedBackend {
     let pref = preference.trim().to_ascii_lowercase();
     if pref == "cpu" {
-        return SelectedBackend::cpu();
+        return SelectedBackend::cpu(devices);
     }
 
     let chosen = if pref == "cuda" || pref == "vulkan" {
@@ -128,9 +157,13 @@ pub fn select_from(devices: &[LlamaBackendDevice], preference: &str) -> Selected
         };
         let found = devices
             .iter()
-            .filter(|d| gpu_rank(d).is_some() && kind_of(d) == want)
-            // Most free VRAM wins among equals.
-            .max_by_key(|d| d.memory_free);
+            .filter_map(|d| gpu_rank(d).map(|r| (r, d)))
+            .filter(|(_, d)| kind_of(d) == want)
+            // Same ordering as `auto` within the pinned backend: discrete
+            // before integrated, then most free memory. Pinning "vulkan" on a
+            // laptop must not mean "the iGPU, because it claims more RAM".
+            .min_by_key(|(rank, d)| (*rank, usize::MAX - d.memory_free))
+            .map(|(_, d)| d);
         if found.is_none() {
             tracing::warn!(
                 "backend {pref:?} was requested but no such device is available; using CPU"
@@ -141,24 +174,33 @@ pub fn select_from(devices: &[LlamaBackendDevice], preference: &str) -> Selected
         devices
             .iter()
             .filter_map(|d| gpu_rank(d).map(|r| (r, d)))
-            // Rank first (CUDA over Vulkan), then most free VRAM.
+            // Rank first (CUDA over Vulkan, discrete over integrated), then
+            // most free memory among genuine equals.
             .min_by_key(|(rank, d)| (*rank, usize::MAX - d.memory_free))
             .map(|(_, d)| d)
     };
 
     match chosen {
-        Some(d) => SelectedBackend {
-            backend: kind_of(d).as_str().to_string(),
-            device: Some(if d.description.is_empty() {
-                d.name.clone()
-            } else {
-                d.description.clone()
-            }),
-            device_index: Some(d.index),
-            memory_free: d.memory_free as u64,
-            memory_total: d.memory_total as u64,
-        },
-        None => SelectedBackend::cpu(),
+        Some(d) => describe(d),
+        None => SelectedBackend::cpu(devices),
+    }
+}
+
+/// A device record as a [`SelectedBackend`]. On a GPU the sizing budget and
+/// the displayed free VRAM are the same number — the distinction only bites on
+/// CPU, which goes through [`SelectedBackend::cpu`] instead.
+fn describe(d: &LlamaBackendDevice) -> SelectedBackend {
+    SelectedBackend {
+        backend: kind_of(d).as_str().to_string(),
+        device: Some(if d.description.is_empty() {
+            d.name.clone()
+        } else {
+            d.description.clone()
+        }),
+        device_index: Some(d.index),
+        memory_free: d.memory_free as u64,
+        memory_total: d.memory_total as u64,
+        usable_memory: d.memory_free as u64,
     }
 }
 
@@ -177,20 +219,7 @@ pub fn select_backend(preference: &str) -> SelectedBackend {
 /// diagnostics. Unfiltered on purpose: showing a CPU-only machine an empty
 /// list is less informative than showing it the CPU entry ggml reports.
 pub fn available_devices() -> Vec<SelectedBackend> {
-    list_llama_ggml_backend_devices()
-        .iter()
-        .map(|d| SelectedBackend {
-            backend: kind_of(d).as_str().to_string(),
-            device: Some(if d.description.is_empty() {
-                d.name.clone()
-            } else {
-                d.description.clone()
-            }),
-            device_index: Some(d.index),
-            memory_free: d.memory_free as u64,
-            memory_total: d.memory_total as u64,
-        })
-        .collect()
+    list_llama_ggml_backend_devices().iter().map(describe).collect()
 }
 
 #[cfg(test)]
@@ -222,12 +251,12 @@ mod tests {
         dev(i, "Vulkan", "AMD Radeon RX 7900", LlamaBackendDeviceType::Gpu, free)
     }
     fn cpu_dev() -> LlamaBackendDevice {
-        dev(9, "CPU", "", LlamaBackendDeviceType::Cpu, 0)
+        dev(9, "CPU", "", LlamaBackendDeviceType::Cpu, 16_000)
     }
 
-    /// The CPU-only case — which is every build today, since no GPU cargo
-    /// feature is enabled. Must report CPU with a zeroed VRAM budget, not a
-    /// borrowed system-RAM figure that would make the model card lie.
+    /// A machine with no usable accelerator must report CPU with a zeroed
+    /// VRAM budget, not a borrowed system-RAM figure that would make the
+    /// model card lie.
     #[test]
     fn a_machine_with_no_gpu_selects_cpu_and_reports_no_vram() {
         let s = select_from(&[cpu_dev()], "auto");
@@ -235,6 +264,37 @@ mod tests {
         assert_eq!(s.device, None);
         assert_eq!(s.memory_total, 0);
         assert_eq!(s.memory_free, 0);
+    }
+
+    /// The CPU's zeroed VRAM is a *display* decision, not an absence of
+    /// memory. Context sizing has to see the real system RAM or every
+    /// CPU-only machine — which is every Android device — would fall back to
+    /// a flat default with no basis.
+    #[test]
+    fn a_cpu_selection_still_reports_system_ram_for_sizing() {
+        let cpu = dev(9, "CPU", "", LlamaBackendDeviceType::Cpu, 16_000);
+        for pref in ["auto", "cpu"] {
+            let s = select_from(std::slice::from_ref(&cpu), pref);
+            assert_eq!(s.memory_free, 0, "{pref}: no VRAM row on CPU");
+            assert_eq!(s.usable_memory, 16_000, "{pref}: but a real sizing budget");
+        }
+    }
+
+    /// ...and when the registry reports no CPU device at all, the budget is
+    /// zero rather than a guess. `estimate_n_ctx` treats that as "no basis"
+    /// and falls back, which is the honest outcome.
+    #[test]
+    fn an_empty_registry_leaves_no_sizing_budget() {
+        assert_eq!(select_from(&[], "auto").usable_memory, 0);
+    }
+
+    /// On a GPU the two figures answer the same question, and a card that
+    /// reports free VRAM must not somehow have a zero sizing budget.
+    #[test]
+    fn a_gpu_selection_sizes_against_its_own_free_vram() {
+        let s = select_from(&[cuda(0, 8_000), cpu_dev()], "auto");
+        assert_eq!(s.usable_memory, s.memory_free);
+        assert_eq!(s.usable_memory, 8_000);
     }
 
     #[test]
@@ -306,6 +366,55 @@ mod tests {
             2_000,
         );
         assert_eq!(select_from(&[igpu], "auto").kind(), BackendKind::Vulkan);
+    }
+
+    /// Regression, from a real machine. An integrated GPU's memory *is* system
+    /// RAM, so it advertises more free than a discrete card nearly always —
+    /// here an Intel UHD iGPU claiming 7,389 MiB against a GTX 1650 Ti's 3,561
+    /// MiB of actual VRAM. Ranking on free memory alone picked the iGPU, which
+    /// is much the slower of the two for inference. Discrete must win the
+    /// comparison outright, with free memory only breaking ties between
+    /// same-kind devices.
+    #[test]
+    fn a_discrete_gpu_beats_an_integrated_one_that_claims_more_memory() {
+        let igpu = dev(
+            0,
+            "Vulkan",
+            "Intel(R) UHD Graphics",
+            LlamaBackendDeviceType::IntegratedGpu,
+            7_389,
+        );
+        let discrete = dev(
+            1,
+            "Vulkan",
+            "NVIDIA GeForce GTX 1650 Ti",
+            LlamaBackendDeviceType::Gpu,
+            3_561,
+        );
+        for pref in ["auto", "vulkan"] {
+            let s = select_from(&[igpu.clone(), discrete.clone(), cpu_dev()], pref);
+            assert_eq!(
+                s.device.as_deref(),
+                Some("NVIDIA GeForce GTX 1650 Ti"),
+                "{pref} picked the integrated GPU over the discrete one"
+            );
+        }
+    }
+
+    /// The discrete-over-integrated key must not outrank the *backend* key: a
+    /// CUDA device is still preferred over a Vulkan one even when the Vulkan
+    /// device is discrete and the CUDA one is not.
+    #[test]
+    fn the_backend_ranking_still_outranks_the_device_kind() {
+        let cuda_igpu = dev(
+            0,
+            "CUDA",
+            "Integrated CUDA",
+            LlamaBackendDeviceType::IntegratedGpu,
+            2_000,
+        );
+        let s = select_from(&[cuda_igpu, vulkan(1, 24_000)], "auto");
+        assert_eq!(s.kind(), BackendKind::Cuda);
     }
 
     /// A backend ggml reports that we have no ranking for (e.g. SYCL, Metal,

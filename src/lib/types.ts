@@ -238,6 +238,55 @@ export interface LocalModel {
   info?: GgufInfo | null;
 }
 
+/** One compute device, or the one a load settled on. Mirrors
+    `bigtiny_rust::local::backend::SelectedBackend`. `memory_free`/`_total` are
+    both `0` on CPU — there is no separate VRAM budget to report, and
+    substituting system RAM would make the card lie. */
+export interface SelectedBackend {
+  backend: string;
+  device?: string | null;
+  device_index?: number | null;
+  memory_free: number;
+  memory_total: number;
+  /** Free memory automatic context sizing may spend, **including system RAM
+      when the device is the CPU**. Distinct from `memory_free` on purpose:
+      that one is the VRAM row and is `0` on CPU, because claiming a CPU has
+      VRAM would be a lie; this one is a sizing budget, where system RAM is
+      the real constraint. */
+  usable_memory: number;
+}
+
+/** One engine slot. Mirrors `bigtiny_rust::local::manager::SlotStatus`.
+
+    `n_gpu_layers` and `n_ctx` are what the load *resolved to*, which is not
+    always what was configured: both can come from llama.cpp's `fit_params`
+    sizing the model against measured device memory. */
+export interface LocalSlotStatus {
+  kind: string;
+  loaded: boolean;
+  model_path?: string | null;
+  n_embd?: number | null;
+  backend?: SelectedBackend | null;
+  n_gpu_layers?: number | null;
+  n_ctx?: number | null;
+  error?: string | null;
+}
+
+/** The daemon's `GET /api/local/models/status`, as passed through by
+    `commands::get_local_engine_status`.
+
+    `backend_selected` is what a load would pick *now*; a slot's own `backend`
+    is what its resident model is actually on. They differ after a settings
+    change that hasn't been applied by a restart yet, which is why both are
+    reported rather than one standing in for the other. */
+export interface LocalEngineStatus {
+  enabled: boolean;
+  backend_preference: string;
+  backend_selected?: SelectedBackend | null;
+  devices: SelectedBackend[];
+  slots: LocalSlotStatus[];
+}
+
 /** Partial GGUF header — every field optional because the reader stops at
     what the model card needs and reports nothing it couldn't parse. */
 export interface GgufInfo {

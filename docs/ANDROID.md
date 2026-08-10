@@ -72,9 +72,9 @@ D1–D21 are unchanged and un-renumbered — existing references (including in
     artifact rule. All 168 undefined symbols are bionic libc, resolved by the
     platform. Zero `UnsatisfiedLinkError`/`dlopen` failures.
 - **Still open from Phase 1:**
-  - **D20 backend selection unvalidated** — Windows is CPU-only for now
-    (`cuda`/`vulkan` are cargo features; toolkit deferred), so `-1` = "all
-    layers" across backends is untested.
+  - ~~**D20 backend selection unvalidated**~~ — **closed.** Vulkan is enabled
+    on Windows and validated end to end on a GTX 1650 Ti: 17/17 LFM2.5 layers
+    offloaded, `fit_params` driving the choice. See §3.3.
   - The link evidence above is from an *executable*. The Phase 7 in-process
     **cdylib** is a different link, and should be re-checked the same way when
     it exists.
@@ -329,14 +329,26 @@ deletes them; shipping a setting that does nothing is worse than either.
 `select_backend()` runs once at first engine use:
 
 1. Query llama.cpp's ggml backend registry (no `nvidia-smi`, no subprocesses).
-2. Return `Cuda` if a CUDA device is enumerated and compiled-in; else `Vulkan` if
-   a Vulkan device exists; else `Cpu`.
-3. `n_gpu_layers=-1`/`auto` → **all layers to the selected GPU backend**.
-4. VRAM read for the fit/badge math uses the **selected backend's** memory bank:
-   - `Cuda` → DXGI `IDXGIAdapter3::QueryVideoMemoryInfo(SEGMENT_LOCAL)`.
-   - `Vulkan` → `vkGetPhysicalDeviceMemoryProperties` device-local heap.
-   - `Cpu` → `0` (no GPU budget).
-5. Fail-safe: on backend OOM at load, retry with `ngl` halved; at `0` → CPU.
+2. Rank devices on two keys, in order — **implemented in
+   `local::backend::gpu_rank`**:
+   1. backend: CUDA over Vulkan;
+   2. **discrete over integrated**, then most free memory among genuine
+      equals.
+   Key 2 is not cosmetic and was added after measurement. An integrated GPU's
+   memory *is* system RAM, so it advertises more free than a discrete card
+   nearly always: on the dev laptop an Intel UHD iGPU reported **7,389 MiB
+   free** next to a GTX 1650 Ti's **3,561 MiB** of real VRAM, and ranking on
+   free memory alone picked the iGPU — much the slower of the two. Free memory
+   is only a meaningful comparison *within* a device kind.
+3. `n_gpu_layers=-1`/`auto` → hand the decision to `fit_params` (below). A
+   non-negative value pins that many layers and skips fitting entirely.
+4. VRAM for the card and the "Recommended for this device" badge comes from the
+   same `memory_free`/`memory_total` on the device record the loader will use,
+   so the two can never disagree. CPU reports `0`/`0` and the UI renders no
+   budget rather than substituting system RAM.
+5. An explicitly pinned backend that isn't present **falls back to CPU rather
+   than erroring** — a machine that lost its GPU should degrade to slow, not to
+   broken.
 
 #### Fit formula — **superseded, do not implement**
 
@@ -346,18 +358,32 @@ build it: `llama-cpp-2` v0.1.154 already exposes both halves upstream, and an
 estimate that disagrees with the loader is worse than no estimate.
 
 - `list_llama_ggml_backend_devices()` — per-device name, backend, type and
-  **`memory_free`/`memory_total`**. That is D20 step 1 and the VRAM figure for
-  the card and the "Recommended for this device" badge, from the same record,
-  so they can never disagree.
-- `fit_params()` (feature `common`, already enabled) — llama.cpp's own
-  optimal-`n_gpu_layers` solver. Two constraints: it requires `n_gpu_layers`
-  left at its `-1` default, so `engine.rs`'s `with_n_gpu_layers` guard becomes
-  an either/or; and it is **not thread-safe** (it mutates global llama logger
-  state), so it belongs behind the same `OnceLock`/mutex discipline as backend
-  init. `n_ctx = 0` means "let fit choose".
+  **`memory_free`/`memory_total`**. That is D20 step 1, in
+  `local::backend`.
+- `fit_params()` — llama.cpp's own optimal-`n_gpu_layers` solver, wired in
+  `local::engine::fit_to_device`. Three things learned wiring it:
+  - It requires `n_gpu_layers` left at its `-1` default — it only writes fields
+    still holding their default, so calling `with_n_gpu_layers` first makes it
+    a silent no-op for the one field it exists to decide. `load` therefore
+    branches three ways, and the fitting branch is the one that sets nothing.
+  - It is **not thread-safe** (it mutates global llama logger state), so it
+    runs under its own mutex.
+  - **A returned `n_ctx` of `0` means "no opinion", not a size.** Fitting only
+    rewrites `n_ctx` when it needs to shrink the context; otherwise it hands
+    back the `0` it was given. Measured on a GTX 1650 Ti where all 17 layers
+    fit. Passing that through reaches llama.cpp as "use the full
+    `n_ctx_train`" — 128k on LFM2.5 — which is the opposite of a memory-aware
+    choice, so it is normalised to `None` and falls back to 4096.
 
-Windows builds `llama_cpp` with `cuda`+`vulkan` features; Android builds CPU-only
-(no Vulkan in v1; the same hook re-enables later).
+  Likewise `n_gpu_layers` legitimately stays at `-1` after a successful fit
+  when everything fits; that is "all layers", not a missing value, and the
+  status payload and model card both render it as such.
+
+**Windows builds with `vulkan`** (`cuda` stays off — Vulkan covers NVIDIA, AMD
+and Intel from one build, including the integrated GPUs that are the only
+accelerator on most laptops, where CUDA covers one vendor and adds a ~3 GB
+toolkit). Verified end to end on a GTX 1650 Ti: all 17 LFM2.5 layers offloaded.
+Android stays CPU-only for v1; `local::backend` needs no change to enable it.
 
 ---
 
@@ -805,25 +831,25 @@ held a sender the response body was waiting on), and prompt prefill ignored
   test, which needs the foreground service to exist first.
 
 ### Phase 4 — Settings
-- **4.3 shipped selection, not GPU.** `src/local/backend.rs` implements D20's
-  device query, ranking (CUDA > Vulkan > CPU), explicit pinning, VRAM
-  reporting and CPU fallback over llama.cpp's own registry — 10 unit tests,
-  none needing a GPU, since the policy is testable against a synthetic device
-  list. `LocalEngine::load` uses it and records the result for the model card.
-  Two deliberate omissions, both blocked on hardware/toolchain rather than
-  design:
-  - **The `vulkan` cargo feature stays off.** The Vulkan SDK isn't installed
-    here, and enabling the feature without it breaks the build rather than
-    adding a backend. It's a one-line change in
-    `plugins/bigtiny_rust/Cargo.toml` once the SDK is present; the selection
-    code needs nothing further.
-  - **`fit_params` is not wired.** llama.cpp's own optimal-`n_gpu_layers`
-    solver requires `n_gpu_layers` left at `-1`, co-decides model *and*
-    context params in a single call (this crate builds them separately), and
-    is explicitly not thread-safe. CPU-only it resolves to "0 layers
-    offloaded" every time — so wiring it now would add an unvalidated,
-    globally-mutating call to every model load in exchange for nothing. The
-    load path deliberately preserves the untouched-`-1` shape it will need.
+- **4.3 GPU is live.** `src/local/backend.rs` implements D20's device query,
+  ranking, explicit pinning, VRAM reporting and CPU fallback over llama.cpp's
+  own registry — 12 unit tests, none needing a GPU, since the policy is
+  testable against a synthetic device list. `src/local/engine.rs`'s
+  `fit_to_device` implements the fit half. Validated on a GTX 1650 Ti with
+  the `vulkan` cargo feature on: 17/17 LFM2.5 layers offloaded.
+
+  Three findings the design didn't anticipate, all in §3.3:
+  - **Discrete must outrank integrated**, ahead of free memory. An iGPU
+    reports system RAM as its budget and so nearly always claims more than a
+    discrete card — 7,389 MiB vs 3,561 MiB on the dev laptop — and the
+    original ranking picked the slower device.
+  - **A fitted `n_ctx` of `0` means "no opinion"**, not a size, and must not
+    reach llama.cpp (it reads it as the full 128k `n_ctx_train`).
+  - **`n_gpu_layers` stays at `-1` after a successful fit** when everything
+    fits. That is "all layers", not a missing value.
+
+  Enabling `vulkan` also turned up two Windows build traps (nested-project
+  cmake generator, and `MAX_PATH`) — both recorded in §11.
 - Knobs/presets/model card/badge/health; **auto-restart scheduling** (§6.4);
   backend-aware hiding. Acceptance: settings round-trip via `commands/` + UI;
   **restart applies immediately when idle, and only after the in-flight
@@ -928,10 +954,26 @@ held a sender the response body was waiting on), and prompt prefill ignored
     logs `CMake project was already configured. Skipping configuration step.`
     and reuses the *wrong* generator forever. Fixing the env is not enough —
     delete `target/<triple>/*/build/llama-cpp-sys-2-*/` before retrying.
-  - **Vulkan SDK**, for the `vulkan` cargo feature only (`glslc`, to compile
-    the shaders). Same failure shape as libclang: a cmake-step error that
-    reads like a crate bug. **Not installed on this machine**, which is why
-    Phase 4.3 shipped backend selection without enabling the feature.
+  - **Vulkan SDK**, required by the `vulkan` cargo feature (`glslc`, to
+    compile the shaders). `winget install KhronosGroup.VulkanSDK`. Same
+    failure shape as libclang: a cmake-step error that reads like a crate bug.
+    Enabling it brought two *further* traps, both Windows-only and both
+    fatal-on-first-build:
+    - **`CMAKE_GENERATOR=Ninja` is mandatory here too**, not just for Android.
+      The Vulkan shader generator is a nested `ExternalProject` that runs its
+      own cmake configure and inherits only the environment, not the outer
+      generator's toolset. Under the default Visual Studio generator that
+      nested configure reports `No CMAKE_C_COMPILER could be found` and the
+      build dies with `The system cannot find the batch label specified -
+      VCEnd`. Build from a vcvars64 shell so `cl.exe` is on `PATH`.
+    - **`MAX_PATH`.** That nested project's try-compile scratch directory adds
+      ~140 characters, which pushes past 260 under any moderately deep repo
+      root (`.../OneDrive/Documents/Coding Projects/Kitty/Kitty/...` is
+      enough). `cl.exe` still enforces `MAX_PATH` even with the OS's
+      `LongPathsEnabled=1`, and fails with `Cannot open source file:
+      ...testCCompiler.c: No such file or directory` — which reads like a
+      cmake bug, not a path-length limit. Set `CARGO_TARGET_DIR` to something
+      short (`C:\kt`).
 - **§11's cmake-variable framing is superseded by cargo features.** With
   `llama-cpp-2` you do *not* set `ANDROID_STL`/`LLAMA_OPENMP` by hand:
   - `ANDROID_STL=c++_static` → the **`android-static-stdcxx`** +

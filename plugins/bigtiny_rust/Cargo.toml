@@ -31,6 +31,10 @@ required-features = ["local-engine"]
 name = "local_embed_spike"
 required-features = ["local-engine"]
 
+[[example]]
+name = "backend_probe"
+required-features = ["local-engine"]
+
 [features]
 # In-process llama.cpp engine (docs/ANDROID.md D1, §3). Opt-in because
 # `llama-cpp-sys-2` builds llama.cpp from source via cmake — a multi-minute
@@ -124,20 +128,26 @@ llama-cpp-2 = { version = "0.1.154", default-features = false, features = [
     "static-stdcxx",
 ], optional = true }
 
-# Windows: **still CPU-only.** The backend-*selection* half of D20 shipped in
-# Phase 4.3 (`src/local/backend.rs`) and correctly reports CPU here, but no GPU
-# cargo feature is enabled, so the ggml device registry only ever enumerates a
-# CPU device.
+# Windows: **Vulkan on** (D20). Chosen over CUDA because it covers NVIDIA, AMD
+# and Intel from one build — including the integrated GPUs that are the only
+# accelerator on most laptops — where CUDA would cover one vendor and add a
+# ~3 GB toolkit to the build prerequisites. `cuda` stays available as a feature
+# for anyone who wants it; `local::backend` already ranks it above Vulkan, so
+# turning it on needs no code change.
 #
-# To turn on Vulkan, add `"vulkan"` to the feature list below — **and install
-# the Vulkan SDK first**, because `llama-cpp-sys-2` shells out to `glslc` to
-# compile the shaders. Without it the build fails inside the cmake step with a
-# message that reads like a crate bug rather than a missing tool, exactly like
-# the libclang and Ninja prerequisites in docs/ANDROID.md §11. CUDA (`"cuda"`)
-# additionally wants the ~3 GB toolkit and stays deferred.
+# **Requires the Vulkan SDK** — `llama-cpp-sys-2` shells out to `glslc` to
+# compile the shaders, and without it the build dies inside the cmake step with
+# a message that reads like a crate bug rather than a missing tool, exactly like
+# the libclang and Ninja prerequisites in docs/ANDROID.md §11.
+# `winget install KhronosGroup.VulkanSDK` is the clean fix.
+#
+# Enabling this only widens what the ggml device registry *enumerates*; which
+# device a load actually uses is still `local::backend::select_backend`'s
+# decision, and a machine with no Vulkan-capable GPU keeps getting CPU.
 [target.'cfg(windows)'.dependencies]
 llama-cpp-2 = { version = "0.1.154", default-features = false, features = [
     "common",
+    "vulkan",
 ], optional = true }
 
 [dev-dependencies]

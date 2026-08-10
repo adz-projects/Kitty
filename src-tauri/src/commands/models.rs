@@ -37,6 +37,34 @@ pub struct LocalModel {
     pub info: Option<gguf::GgufInfo>,
 }
 
+/// What the daemon's engine is actually doing right now — which backend and
+/// device it picked, and per slot how many layers and how much context that
+/// resolved to.
+///
+/// Passed through as an opaque `Value` rather than re-declared as a Rust
+/// struct. This is a read-only display payload with no app-side logic hanging
+/// off it, and mirroring `SlotStatus`/`SelectedBackend` here would create a
+/// third copy of a shape that already exists in the daemon and in
+/// `src/lib/types.ts` — one that could drift without anything failing to
+/// compile.
+///
+/// `Ok(None)` rather than an error when the daemon isn't up yet: Settings can
+/// legitimately be open before the stack is ready, and "not running" is a
+/// state to render, not a failure to report.
+#[tauri::command]
+pub async fn get_local_engine_status(app: AppHandle) -> Result<Option<serde_json::Value>, String> {
+    let Ok(client) = crate::bigtiny::client::ensure_client(&app) else {
+        return Ok(None);
+    };
+    match client.get_json("/api/local/models/status").await {
+        Ok(v) => Ok(Some(v)),
+        Err(e) => {
+            tracing::debug!("local engine status unavailable: {e}");
+            Ok(None)
+        }
+    }
+}
+
 #[tauri::command]
 pub fn list_local_models() -> Result<Vec<LocalModel>, String> {
     Ok(crate::models::installed()

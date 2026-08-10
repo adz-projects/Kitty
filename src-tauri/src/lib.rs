@@ -180,6 +180,7 @@ pub fn run() {
             commands::openrouter_context_length,
             commands::openrouter_credits,
             commands::list_local_models,
+            commands::get_local_engine_status,
             commands::get_models_disk_free,
             commands::delete_local_model,
             commands::download_model,

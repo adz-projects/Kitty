@@ -23,6 +23,7 @@ import type {
   McpServerPatch,
   McpServerSpec,
   MemoryStats,
+  LocalEngineStatus,
   LocalModel,
   OpenRouterCredits,
   PathInfo,
@@ -256,6 +257,9 @@ export const ipc = {
   testActiveProviderConnection: () => invoke<void>('test_active_provider_connection'),
   // Local models (GGUFs on disk)
   listLocalModels: () => invoke<LocalModel[]>('list_local_models'),
+  /** `null` when the daemon isn't up — Settings can be open before the stack
+      is ready, and that's a state to render, not an error to raise. */
+  getLocalEngineStatus: () => invoke<LocalEngineStatus | null>('get_local_engine_status'),
   getModelsDiskFree: () => invoke<number | null>('get_models_disk_free'),
   getEngineRestartState: () => invoke<EngineRestartState>('get_engine_restart_state'),
   deleteLocalModel: (id: string) => invoke<void>('delete_local_model', { id }),

@@ -144,6 +144,11 @@ describe('ipc event subscription wrappers', () => {
     expect(invokeMock).toHaveBeenCalledWith('list_local_models');
   });
 
+  it('getLocalEngineStatus calls get_local_engine_status with no args', () => {
+    void ipc.getLocalEngineStatus();
+    expect(invokeMock).toHaveBeenCalledWith('get_local_engine_status');
+  });
+
   it('getModelsDiskFree calls get_models_disk_free', () => {
     void ipc.getModelsDiskFree();
     expect(invokeMock).toHaveBeenCalledWith('get_models_disk_free');
