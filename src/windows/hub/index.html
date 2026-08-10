@@ -2,11 +2,17 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- `viewport-fit=cover` is what makes `env(safe-area-inset-*)` resolve to
+         anything on Android; without it the insets are always 0 and the UI
+         hides under the notch and gesture bar. No effect on desktop. -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <title>Kitty</title>
   </head>
   <body>
-    <div id="root"></div>
+    <!-- `hub-root` makes the column layout (routes + mobile tab bar) a static
+         fact of this page rather than something CSS has to infer with `:has()`,
+         which older Android WebViews don't support. -->
+    <div id="root" class="hub-root"></div>
     <script type="module" src="./main.tsx"></script>
   </body>
 </html>

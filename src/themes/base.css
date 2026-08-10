@@ -1,6 +1,64 @@
 /* Structural, theme-agnostic layout. MUST NOT contain color values —
    all colors/spacing/typography come from custom properties in theme files. */
 
+:root {
+  /* --- Type ramp (docs/ANDROID.md §8.4) ---------------------------------
+     Every font-size in this file goes through one of these, and every one is
+     in `rem`, so `--font-scale` below moves the whole UI at once. Before this
+     the file held ~68 hardcoded px sizes, which meant Android's system
+     font-scale and Windows' zoom had nothing to pull on.
+
+     The two "-plus" steps are not decoration: 11.5px and 12.5px are in real
+     use (8 rules for 12.5 alone), and collapsing them into their neighbours
+     would silently restyle the app. A rem sweep should change *what scales*,
+     not what things look like — merging them is a design decision for its own
+     commit. */
+  --fs-2xs: 0.625rem; /* 10px  */
+  --fs-xs: 0.6875rem; /* 11px  */
+  --fs-xs-plus: 0.71875rem; /* 11.5px */
+  --fs-sm: 0.75rem; /* 12px  */
+  --fs-sm-plus: 0.78125rem; /* 12.5px */
+  --fs-md: 0.8125rem; /* 13px  */
+  --fs-base: 0.875rem; /* 14px  */
+  --fs-lg: 0.9375rem; /* 15px  */
+  --fs-xl: 1rem; /* 16px  */
+  --fs-2xl: 1.125rem; /* 18px  */
+  --fs-3xl: 1.25rem; /* 20px  */
+  --fs-4xl: 1.375rem; /* 22px  */
+
+  /* One knob both platforms write into: Android's system font-scale and the
+     desktop zoom control (D17). Consumed by the `html` rule below, so it
+     reaches every `rem` above. */
+  --font-scale: 1;
+
+  /* Safe-area insets (D15). Zero everywhere by default; only the Android
+     shell overrides them from `env(safe-area-inset-*)`, so desktop layout
+     reads the same tokens and gets nothing. Defining them here rather than
+     per-platform is what lets a single stylesheet serve both. */
+  --safe-top: 0px;
+  --safe-right: 0px;
+  --safe-bottom: 0px;
+  --safe-left: 0px;
+}
+
+/* `rem` is relative to this, so it is the single multiplication point for
+   `--font-scale`. 16px is the browser default it replaces, chosen so an
+   unscaled build renders byte-identically to the pre-sweep px values. */
+html {
+  font-size: calc(16px * var(--font-scale));
+}
+
+/* Android reports its insets through `env()`, which only resolves on a page
+   with `viewport-fit=cover`. Gated on the platform attribute rather than a
+   media query: a desktop window can be any size, and a narrow one is still
+   not a device with a notch. */
+:root[data-platform='android'] {
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-right: env(safe-area-inset-right, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-left: env(safe-area-inset-left, 0px);
+}
+
 * {
   box-sizing: border-box;
 }
@@ -32,7 +90,7 @@ body {
   background: transparent;
   color: var(--text);
   font-family: var(--font-family);
-  font-size: 14px;
+  font-size: var(--fs-base);
   line-height: 1.5;
   -webkit-font-smoothing: antialiased;
 }
@@ -117,7 +175,7 @@ button.primary {
 }
 .overlay-titlebar button {
   padding: 2px 8px;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   /* Buttons were inheriting the body's 1.5 line-height, which on top of the
      padding left them nearly as tall as the titlebar itself — barely any
      margin above/below. A tight line-height lets the icon's own size (not
@@ -151,7 +209,7 @@ button.primary {
 
 .status-panel h2 {
   margin: 0;
-  font-size: 16px;
+  font-size: var(--fs-xl);
 }
 
 .status-panel .actions {
@@ -185,7 +243,7 @@ button.primary {
   border: 1px solid var(--warn);
   border-radius: calc(var(--radius) / 2);
   background: var(--surface-2);
-  font-size: 13px;
+  font-size: var(--fs-md);
 }
 
 .muted {
@@ -286,7 +344,7 @@ button.primary {
 }
 .markdown code {
   font-family: ui-monospace, 'Cascadia Code', Consolas, monospace;
-  font-size: 12.5px;
+  font-size: var(--fs-sm-plus);
 }
 /* Fenced code block with a Copy/Download header (Round-2 item 12). */
 .code-block {
@@ -310,7 +368,7 @@ button.primary {
   z-index: 2;
 }
 .code-lang {
-  font-size: 11px;
+  font-size: var(--fs-xs);
   color: var(--text-muted);
   text-transform: uppercase;
   letter-spacing: 0.04em;
@@ -320,7 +378,7 @@ button.primary {
   gap: 6px;
 }
 .code-actions button {
-  font-size: 11px;
+  font-size: var(--fs-xs);
   padding: 2px 8px;
   border-radius: 6px;
 }
@@ -394,7 +452,7 @@ button.primary {
   border-collapse: collapse;
   width: 100%;
   margin: 6px 0;
-  font-size: 12.5px;
+  font-size: var(--fs-sm-plus);
 }
 .markdown th,
 .markdown td {
@@ -415,7 +473,7 @@ button.primary {
 }
 
 .reasoning {
-  font-size: 12.5px;
+  font-size: var(--fs-sm-plus);
   color: var(--text-muted);
 }
 .reasoning-summary {
@@ -426,7 +484,7 @@ button.primary {
   display: inline-flex;
   gap: 6px;
   align-items: center;
-  font-size: 12px;
+  font-size: var(--fs-sm);
 }
 .reasoning-caret {
   display: inline-block;
@@ -458,7 +516,7 @@ button.primary {
   display: inline-flex;
   align-items: center;
   color: var(--text-muted);
-  font-size: 13px;
+  font-size: var(--fs-md);
 }
 .progress-pulse {
   animation: progress-pulse 1.4s ease-in-out infinite;
@@ -483,7 +541,7 @@ button.primary {
   border: 1px solid var(--border);
   border-radius: 8px;
   background: var(--surface-2);
-  font-size: 12.5px;
+  font-size: var(--fs-sm-plus);
 }
 .tool-card summary {
   padding: 6px 10px;
@@ -501,7 +559,7 @@ button.primary {
   border-radius: 6px;
   overflow: auto;
   margin: 4px 0;
-  font-size: 12px;
+  font-size: var(--fs-sm);
 }
 .tool-result-iframe {
   display: block;
@@ -543,14 +601,14 @@ button.primary {
   padding: 8px;
   border-radius: 6px;
   overflow: auto;
-  font-size: 12px;
+  font-size: var(--fs-sm);
 }
 .viz-card-body pre.viz-error {
   color: var(--danger);
   border: 1px solid var(--border);
 }
 .viz-loading {
-  font-size: 12.5px;
+  font-size: var(--fs-sm-plus);
   padding: 4px 2px;
 }
 
@@ -570,7 +628,7 @@ button.primary {
   bottom: calc(100% - 2px);
   left: 0;
   right: 0;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   line-height: 1.3;
   color: var(--text-muted);
   background: var(--surface);
@@ -617,7 +675,7 @@ button.primary {
 
 .chat-error {
   color: var(--danger);
-  font-size: 12.5px;
+  font-size: var(--fs-sm-plus);
   padding: 4px 0;
 }
 
@@ -637,7 +695,7 @@ button.primary {
   padding: 6px 8px;
   border: 1px solid var(--border);
   border-radius: 6px;
-  font-size: 12px;
+  font-size: var(--fs-sm);
 }
 .log-entry-head {
   display: flex;
@@ -656,7 +714,7 @@ button.primary {
 }
 .log-entry-time,
 .log-entry-target {
-  font-size: 11px;
+  font-size: var(--fs-xs);
 }
 .log-entry-target {
   overflow: hidden;
@@ -669,7 +727,7 @@ button.primary {
 }
 
 .hint-summary {
-  font-size: 12px;
+  font-size: var(--fs-sm);
   padding: 4px 0;
 }
 
@@ -682,7 +740,7 @@ button.primary {
   border: 1px solid var(--accent);
   border-radius: var(--radius);
   background: var(--surface-2);
-  font-size: 12.5px;
+  font-size: var(--fs-sm-plus);
 }
 .nudge-prompt p {
   margin: 0 0 6px;
@@ -692,7 +750,7 @@ button.primary {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--text-muted);
   background: var(--surface-2);
   border: 1px solid var(--border);
@@ -722,7 +780,7 @@ button.primary {
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  font-size: 11px;
+  font-size: var(--fs-xs);
   padding: 2px 6px;
   border-radius: 6px;
   background: var(--surface);
@@ -814,7 +872,7 @@ button.primary {
   border: none;
   background: transparent;
   color: var(--text-muted);
-  font-size: 11px;
+  font-size: var(--fs-xs);
   padding: 3px 8px;
   cursor: pointer;
   white-space: nowrap;
@@ -841,7 +899,7 @@ button.primary {
   border-radius: 999px;
   background: var(--surface-2);
   color: var(--text);
-  font-size: 11px;
+  font-size: var(--fs-xs);
   padding: 3px 8px;
   cursor: pointer;
   flex-shrink: 0;
@@ -867,7 +925,7 @@ button.primary {
 .typing {
   display: inline-block;
   color: var(--text-muted);
-  font-size: 13px;
+  font-size: var(--fs-md);
 }
 
 /* --- Message actions + chat-only reading mode (Phase 9) --- */
@@ -890,7 +948,7 @@ button.primary {
   opacity: 0.55;
 }
 .msg-actions button {
-  font-size: 11px;
+  font-size: var(--fs-xs);
   padding: 2px 7px;
   border-radius: 6px;
   background: transparent;
@@ -900,7 +958,7 @@ button.primary {
    consistent with Branch/Regenerate/Copy. */
 .msg-info-popover {
   min-width: 200px;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   line-height: 1.6;
 }
 
@@ -941,7 +999,7 @@ button.primary {
   margin: 6px 0 0;
   max-height: 140px;
   overflow: auto;
-  font-size: 11.5px;
+  font-size: var(--fs-xs-plus);
   white-space: pre-wrap;
   color: var(--text-muted);
 }
@@ -964,7 +1022,7 @@ button.primary {
   border-radius: 6px;
   overflow: auto;
   font-family: ui-monospace, 'Cascadia Code', Consolas, monospace;
-  font-size: 12.5px;
+  font-size: var(--fs-sm-plus);
 }
 .approval .actions {
   display: flex;
@@ -1036,7 +1094,7 @@ button.primary {
   font-weight: 600;
 }
 .recipe-option-hint {
-  font-size: 12px;
+  font-size: var(--fs-sm);
   white-space: normal;
   line-height: 1.3;
 }
@@ -1047,7 +1105,7 @@ button.primary {
    `AdaptivePathwayToggle` badge buttons it contains, which need to keep
    their own `.status-badge` look, not become generic menu-item rows. */
 .chat-header-menu-trigger {
-  font-size: 14px;
+  font-size: var(--fs-base);
   line-height: 1;
   padding: 3px 8px;
 }
@@ -1080,7 +1138,7 @@ button.primary {
   gap: 8px;
 }
 .hint-popover-item {
-  font-size: 12px;
+  font-size: var(--fs-sm);
   line-height: 1.4;
 }
 .hint-popover-item .link {
@@ -1089,13 +1147,13 @@ button.primary {
   color: var(--accent);
   cursor: pointer;
   padding: 0;
-  font-size: 11px;
+  font-size: var(--fs-xs);
 }
 .hint-edge-detail {
   margin-top: 4px;
   padding-left: 8px;
   border-left: 2px solid var(--border);
-  font-size: 11px;
+  font-size: var(--fs-xs);
 }
 
 /* Per-hint source-model badge (`standard`/`ig`/`pc`/`wildcard`) — the hint
@@ -1103,7 +1161,7 @@ button.primary {
    so this badge only needs to carry which model produced the hint. */
 .hint-source-badge {
   display: inline-block;
-  font-size: 10px;
+  font-size: var(--fs-2xs);
   line-height: 1.3;
   padding: 1px 5px;
   border-radius: 4px;
@@ -1123,17 +1181,45 @@ button.primary {
 }
 
 /* --- Full window layout (Phase 4) --- */
+/* --- Mobile shell (docs/ANDROID.md §8.2) --------------------------------
+   The tab bar is always rendered and hidden here, rather than conditionally
+   mounted in JS: one component tree across both targets is the whole point of
+   the hub, and a narrow desktop window then behaves the same way a phone does
+   instead of taking a path only phones exercise. */
+.mobile-tabs {
+  display: none;
+}
+
+.sessions-route {
+  height: 100%;
+  overflow: hidden;
+  background: var(--bg);
+}
+
+/* The hub is a column: the active route takes the remaining height and the
+   tab bar sits under it (and collapses to nothing on desktop, where it is
+   `display: none`, leaving the route the full height exactly as before).
+   `min-height: 0` lets the route shrink to its track so only the message list
+   scrolls, not the document. */
+.hub-root {
+  display: flex;
+  flex-direction: column;
+}
+.hub-root > .hub-route,
+.hub-root > .sessions-route,
+.hub-root > .settings-window,
+.hub-root > .window-root {
+  flex: 1;
+  min-height: 0;
+}
+
 /* One hub route's container. Chat is kept mounted and toggled with `hidden`
    rather than unmounted, so scroll position and composer drafts survive a trip
-   to Settings — `display: contents` lets `.main-window`'s grid still be the
-   layout root, as it was when chat owned the whole window.
+   to Settings.
 
-   The `[hidden]` rule is load-bearing: any `display` here would otherwise beat
-   the UA stylesheet's `display: none` for the attribute, and the chat route
-   would render underneath every other route. */
-.hub-route {
-  display: contents;
-}
+   The `[hidden]` rule is load-bearing: the `display` above would otherwise
+   beat the UA stylesheet's `display: none` for the attribute, and the chat
+   route would render underneath every other route. */
 .hub-route[hidden] {
   display: none;
 }
@@ -1161,7 +1247,7 @@ button.primary {
   justify-content: space-between;
 }
 .main-header h1 {
-  font-size: 18px;
+  font-size: var(--fs-2xl);
   margin: 0;
 }
 .main-body {
@@ -1205,7 +1291,7 @@ button.primary {
   align-items: center;
   gap: 6px;
   padding: 5px 10px;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   font-weight: 600;
   background: var(--surface-2);
   border-bottom: 1px solid var(--border);
@@ -1213,7 +1299,7 @@ button.primary {
 }
 .folder-chevron {
   color: var(--text-muted);
-  font-size: 11px;
+  font-size: var(--fs-xs);
   width: 10px;
   text-align: center;
 }
@@ -1224,7 +1310,7 @@ button.primary {
   white-space: nowrap;
 }
 .folder-count {
-  font-size: 11px;
+  font-size: var(--fs-xs);
   font-weight: 400;
 }
 .folder-actions {
@@ -1239,7 +1325,7 @@ button.primary {
   border: none;
   background: transparent;
   padding: 0 4px;
-  font-size: 12px;
+  font-size: var(--fs-sm);
 }
 /* Drop target affordance while dragging a session row over a folder header
    (Round-3 item 5). */
@@ -1249,7 +1335,7 @@ button.primary {
 }
 .folder-empty {
   padding: 6px 12px;
-  font-size: 11px;
+  font-size: var(--fs-xs);
 }
 .session-row-actions {
   position: absolute;
@@ -1263,7 +1349,7 @@ button.primary {
   border: none;
   background: transparent;
   padding: 1px 6px;
-  font-size: 13px;
+  font-size: var(--fs-md);
   color: var(--text-muted);
   border-radius: 5px;
   opacity: 0;
@@ -1310,7 +1396,7 @@ button.primary {
   opacity: 0.5;
 }
 .session-title {
-  font-size: 13px;
+  font-size: var(--fs-md);
   font-weight: 600;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1318,7 +1404,7 @@ button.primary {
   padding-right: 20px;
 }
 .session-meta {
-  font-size: 11px;
+  font-size: var(--fs-xs);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1351,11 +1437,11 @@ button.primary {
   gap: 4px;
 }
 .artifact-name {
-  font-size: 13px;
+  font-size: var(--fs-md);
   font-weight: 600;
 }
 .artifact-path {
-  font-size: 11px;
+  font-size: var(--fs-xs);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1366,7 +1452,7 @@ button.primary {
   flex-wrap: wrap;
 }
 .artifact-actions button {
-  font-size: 11px;
+  font-size: var(--fs-xs);
   padding: 3px 6px;
 }
 
@@ -1381,7 +1467,7 @@ button.primary {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   background: var(--surface-2);
   border: 1px solid var(--border);
   border-radius: 999px;
@@ -1400,7 +1486,7 @@ button.primary {
   border-radius: 3px;
 }
 .chip-action {
-  font-size: 11px;
+  font-size: var(--fs-xs);
   padding: 1px 6px;
   border-radius: 999px;
 }
@@ -1408,7 +1494,7 @@ button.primary {
   border: none;
   background: transparent;
   padding: 0 2px;
-  font-size: 14px;
+  font-size: var(--fs-base);
   line-height: 1;
 }
 
@@ -1430,14 +1516,14 @@ button.primary {
   background: var(--surface-2);
   border-bottom: 1px solid var(--border);
   color: var(--text);
-  font-size: 13px;
+  font-size: var(--fs-md);
 }
 .settings-recovery-notice button {
   border: none;
   background: transparent;
   color: var(--text-muted);
   cursor: pointer;
-  font-size: 13px;
+  font-size: var(--fs-md);
 }
 .settings-nav {
   display: flex;
@@ -1477,7 +1563,7 @@ button.primary {
   font-weight: 600;
 }
 .settings-nav-group-label {
-  font-size: 11px;
+  font-size: var(--fs-xs);
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.03em;
@@ -1499,7 +1585,7 @@ button.primary {
   max-width: 560px;
 }
 .settings-section h1 {
-  font-size: 20px;
+  font-size: var(--fs-3xl);
   margin: 0;
 }
 .settings-section details summary {
@@ -1518,7 +1604,7 @@ button.primary {
   text-align: left;
   padding: 6px 0;
   cursor: pointer;
-  font-size: 13px;
+  font-size: var(--fs-md);
   font-weight: 600;
 }
 .provider-advanced-body {
@@ -1533,7 +1619,7 @@ button.primary {
   gap: 4px;
 }
 .field > span {
-  font-size: 13px;
+  font-size: var(--fs-md);
   font-weight: 600;
 }
 .field input,
@@ -1548,7 +1634,7 @@ button.primary {
 }
 .field textarea {
   font-family: inherit;
-  font-size: 13px;
+  font-size: var(--fs-md);
   resize: vertical;
 }
 /* Per-provider param sliders (Round-2 item 28): range fills the row, value badge
@@ -1571,7 +1657,7 @@ button.primary {
   display: flex;
   gap: 8px;
   align-items: center;
-  font-size: 13px;
+  font-size: var(--fs-md);
 }
 .check input {
   width: auto;
@@ -1655,10 +1741,10 @@ button.link {
 }
 .ext-card-name {
   font-weight: 600;
-  font-size: 13px;
+  font-size: var(--fs-md);
 }
 .ext-card-desc {
-  font-size: 11px;
+  font-size: var(--fs-xs);
 }
 .model-row {
   display: flex;
@@ -1680,7 +1766,7 @@ button.link {
 .pull-head {
   display: flex;
   justify-content: space-between;
-  font-size: 12px;
+  font-size: var(--fs-sm);
 }
 .progress {
   height: 8px;
@@ -1724,7 +1810,7 @@ button.link {
 }
 .modal h2 {
   margin: 0;
-  font-size: 16px;
+  font-size: var(--fs-xl);
 }
 
 /* --- Wizard (Phase 7) --- */
@@ -1740,7 +1826,7 @@ button.link {
 }
 .wizard-step {
   font: inherit;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   padding: 4px 10px;
   border-radius: 999px;
   border: 1px solid var(--border);
@@ -1768,7 +1854,7 @@ button.link {
 }
 .wizard-panel h1 {
   margin: 0;
-  font-size: 22px;
+  font-size: var(--fs-4xl);
 }
 .wizard-actions {
   display: flex;
@@ -1824,7 +1910,7 @@ button.link {
   color: inherit;
 }
 .path-card strong {
-  font-size: 15px;
+  font-size: var(--fs-lg);
 }
 .path-card.selected {
   border-color: var(--accent);
@@ -1843,7 +1929,7 @@ button.link {
   display: flex;
   justify-content: space-between;
   gap: 12px;
-  font-size: 13px;
+  font-size: var(--fs-md);
 }
 .wizard-issue-list {
   display: flex;
@@ -1863,7 +1949,80 @@ button.link {
   padding: 8px 10px;
   background: var(--surface-2);
   border-radius: 6px;
-  font-size: 11px;
+  font-size: var(--fs-xs);
   white-space: pre-wrap;
   word-break: break-word;
+}
+
+/* --- Mobile breakpoint (docs/ANDROID.md §8.2) --------------------------
+   Deliberately the last block in this file. Every override below is the
+   same specificity as the desktop rule it replaces, so source order is
+   what decides — placing it earlier silently loses. That is not
+   hypothetical: the first cut of this sat above `.main-window` and left
+   the phone layout with a 260px track for a sidebar that was already
+   `display: none`, squeezing chat into 115px of a 375px screen. */
+@media (max-width: 480px) {
+  /* The desktop chat layout is a three-column grid (history | chat |
+     artifacts). On a phone only the middle column fits; the history lives
+     behind the "Chats" tab and artifacts are dropped rather than crushed. */
+  .main-window {
+    grid-template-columns: 1fr;
+  }
+  .main-window > .session-list,
+  .main-window > .artifacts-pane {
+    display: none;
+  }
+
+  /* Settings is a two-column grid on desktop; stack it and let the nav scroll
+     horizontally above the content. */
+  .settings-window {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto auto 1fr;
+  }
+  .settings-nav {
+    flex-direction: row;
+    overflow-x: auto;
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+  }
+  .settings-nav-group-label {
+    display: none;
+  }
+  .settings-nav button {
+    white-space: nowrap;
+  }
+
+  .mobile-tabs {
+    display: grid;
+    grid-auto-flow: column;
+    grid-auto-columns: 1fr;
+    border-top: 1px solid var(--border);
+    background: var(--surface);
+    /* Sits above the gesture bar rather than under it. */
+    padding-bottom: var(--safe-bottom);
+  }
+  .mobile-tabs button {
+    border: none;
+    border-radius: 0;
+    background: transparent;
+    /* 44px is the smallest reliably-tappable target; the tab bar is the one
+       control a user hits constantly, so it does not get to be smaller. */
+    min-height: 44px;
+    font-size: var(--fs-sm);
+  }
+  .mobile-tabs button.active {
+    color: var(--accent);
+  }
+
+  /* The window itself must clear the notch and the rounded corners. Applied
+     to the roots rather than to `body` so the tab bar's own
+     `padding-bottom` isn't doubled up. */
+  .main-window,
+  .settings-window,
+  .sessions-route,
+  .window-root {
+    padding-top: var(--safe-top);
+    padding-left: var(--safe-left);
+    padding-right: var(--safe-right);
+  }
 }

@@ -13,8 +13,8 @@ beforeEach(() => {
 /** `route://goto` payloads cross the IPC boundary as untyped JSON, so this is
     the only place a Rust/TS disagreement about route names can be caught. */
 describe('parseRouteTarget', () => {
-  it('accepts the three routes the hub knows', () => {
-    for (const view of ['chat', 'settings', 'wizard'] as const) {
+  it('accepts every route the hub knows', () => {
+    for (const view of ['chat', 'sessions', 'settings', 'wizard'] as const) {
       expect(parseRouteTarget({ view })?.view).toBe(view);
     }
   });
@@ -35,8 +35,10 @@ describe('parseRouteTarget', () => {
   /// stale window after an update. Staying put is recoverable; navigating to
   /// a route with no component renders a blank window with no way back.
   it('rejects anything it cannot render rather than navigating blind', () => {
-    expect(parseRouteTarget({ view: 'sessions' })).toBeNull();
+    // The overlay and the region picker are separate windows, not routes —
+    // navigating a hub to either would blank it.
     expect(parseRouteTarget({ view: 'overlay' })).toBeNull();
+    expect(parseRouteTarget({ view: 'screenshot-select' })).toBeNull();
     expect(parseRouteTarget({})).toBeNull();
     expect(parseRouteTarget(null)).toBeNull();
     expect(parseRouteTarget('settings')).toBeNull();

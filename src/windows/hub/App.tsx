@@ -1,6 +1,8 @@
 import { useEffect } from 'react';
 import { useRouteStore } from '@/stores/routeStore';
 import { ChatWorkspace } from '@/components/hub/ChatWorkspace';
+import { MobileTabBar } from '@/components/hub/MobileTabBar';
+import { SessionList } from '@/components/sessions/SessionList';
 import { SettingsView } from '@/components/settings/SettingsView';
 import { WizardView } from '@/components/wizard/WizardView';
 
@@ -30,8 +32,18 @@ export function App() {
       <div hidden={view !== 'chat'} className="hub-route">
         <ChatWorkspace />
       </div>
+      {/* `sessions` is the mobile-only home for the list that lives in the
+          chat sidebar on desktop. Reachable there too if something routes to
+          it, rather than rendering nothing — an unreachable-by-design route
+          that renders blank is a worse failure than a redundant one. */}
+      {view === 'sessions' && (
+        <div className="sessions-route">
+          <SessionList />
+        </div>
+      )}
       {view === 'settings' && <SettingsView />}
       {view === 'wizard' && <WizardView />}
+      <MobileTabBar />
     </>
   );
 }

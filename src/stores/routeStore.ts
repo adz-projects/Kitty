@@ -27,7 +27,18 @@ import { onRouteGoto, ipc } from '@/lib/ipc';
  * decorationless, transparent, always-on-top window sized to a specific
  * monitor's bounds. §8.1's note about folding the picker into the hub does not
  * survive contact with what that window actually is. */
-export type HubView = 'chat' | 'settings' | 'wizard';
+export type HubView = 'chat' | 'sessions' | 'settings' | 'wizard';
+
+/** Routes the Android tab bar exposes (§8.2). Chat and Settings are shared
+    with desktop; `sessions` exists because the desktop sidebar has nowhere to
+    live on a phone. Setup is deliberately absent — the wizard is reached by
+    finishing first run or from Settings, never as a tab someone can wander
+    into mid-conversation. */
+export const MOBILE_TABS: { view: HubView; label: string }[] = [
+  { view: 'chat', label: 'Chat' },
+  { view: 'sessions', label: 'Chats' },
+  { view: 'settings', label: 'Settings' },
+];
 
 export interface RouteState {
   view: HubView;
@@ -56,7 +67,9 @@ export function parseRouteTarget(payload: unknown): { view: HubView; opts: Route
   if (!payload || typeof payload !== 'object') return null;
   const p = payload as Record<string, unknown>;
   const view = p.view;
-  if (view !== 'chat' && view !== 'settings' && view !== 'wizard') return null;
+  if (view !== 'chat' && view !== 'sessions' && view !== 'settings' && view !== 'wizard') {
+    return null;
+  }
   return {
     view,
     opts: {

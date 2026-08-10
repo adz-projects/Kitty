@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { ipc, pickImage } from '@/lib/ipc';
+import { SYSTEM_THEME } from '@/lib/theme';
 import { useConfigDraft } from './useConfigDraft';
 
 /** Appearance: theme (built-in + user CSS), background image + dim, overlay prefs. */
@@ -23,6 +24,9 @@ export function Appearance() {
         <span>Theme</span>
         <div className="row">
           <select value={draft.theme} onChange={(e) => update({ theme: e.target.value })}>
+            {/* Outside the built-in group because it isn't a stylesheet — it
+                resolves to `default` or `dark` from the OS preference (D16). */}
+            <option value={SYSTEM_THEME}>Match system</option>
             <optgroup label="Built-in">
               {themes.builtins.map((t) => (
                 <option key={t} value={t}>

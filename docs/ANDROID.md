@@ -590,9 +590,30 @@ All under `Settings → Local models`, shared component on both OS.
   `DoneStep` navigates on finish (`complete_setup` used to hide the wizard
   window).
 
-### 8.2 Android shell (Phase 6b)
-- Same `<HubApp>`; bottom tabs (**Chat / Models / Settings**), share intent,
-  embed/back; CSS `<480px` + safe-area. `ipc.ts` add `navTo(view)`, `shareText`.
+### 8.2 Android shell (Phase 6b) — **web layer done; native pieces are Phase 7**
+- Same `<HubApp>`; bottom tabs, CSS `<480px` + safe-area.
+- **Tabs are Chat / Chats / Settings**, not "Models". Models is a *section*
+  inside Settings (`local_models`), and promoting it to a peer of the whole of
+  Settings would have made it the only settings page reachable without opening
+  Settings. The session list needed the slot more: it is a sidebar on desktop
+  and has nowhere to live on a phone, which is why `sessions` became a route
+  here rather than in 6a.
+- The tab bar renders on every platform and is hidden by CSS above 480px,
+  rather than branched on in JS — one component tree is the point of the hub,
+  and a narrow desktop window then behaves the way a phone does instead of
+  exercising a path only phones reach.
+- `src/lib/platform.ts` stamps `data-platform` on `<html>` *before first
+  paint*, from the user-agent rather than an IPC call: safe-area insets and
+  the mobile shell are gated on it, and an await would flash the desktop
+  layout on a phone.
+- **`navTo(view)` did not need to be an IPC call.** Routing is client-side in
+  `routeStore`; the only navigation Rust initiates is `open_settings` /
+  `open_wizard`, which already emit `route://goto`. Adding a command that
+  round-tripped to Rust only to come back would be strictly worse.
+- **`shareText` and the incoming share intent are deferred to Phase 7.** Both
+  need a JNI bridge and a manifest `intent-filter`; neither is a web-layer
+  concern, and stubbing them here would have meant a command that silently
+  does nothing on the only platform that has the feature.
 - No local-model composer on Android (D18): the tab shows the single summarizer
   card (read-only) + cloud providers for chat.
 
@@ -602,16 +623,33 @@ All under `Settings → Local models`, shared component on both OS.
   - Android: **permissions step** (POST_NOTIFICATIONS, foreground service) — only
     platform divergence.
 
-### 8.4 Tokens / theme / safe-area / fonts (D15–D17) — Phase 6b
-- Extend `src/themes/` contract with a **semantic token ramp** (spacing/type/status)
-  + `--safe-top/right/bottom/left`.
-- `system` theme mode = `default` under `prefers-color-scheme: light`, `dark`
-  under `dark`. Manual themes unchanged.
-- Safe-area: `viewport-fit=cover` + `env(safe-area-inset-*)` **only** on Android;
-  desktop reads the same tokens at `0`.
-- **`--font-scale` at `:root`**, consumed via `rem` — Android font-scale and
-  Windows zoom both write into it → shared breakpoints.
-- **Full px→rem sweep of `base.css`** (~110 hardcoded font sizes) in one pass.
+### 8.4 Tokens / theme / safe-area / fonts (D15–D17) — **DONE**
+- Type ramp `--fs-2xs` … `--fs-4xl` in `base.css`'s `:root`, all in `rem`.
+  **68 px font-sizes swept, not ~110** — that estimate counted every
+  `font-size` including ones already inherited.
+  - The ramp keeps two half-steps (`--fs-xs-plus` = 11.5px, `--fs-sm-plus` =
+    12.5px) because both are in real use, 12.5 in eight rules. Collapsing them
+    into neighbours would have silently restyled the app; a rem sweep should
+    change *what scales*, not what things look like. Merging them is a design
+    decision for its own commit.
+  - Spacing and radii stay in px on purpose. Scaling padding with the font
+    would move the layout under the user when they only asked for bigger text.
+- `system` theme mode (D16) resolves to `default`/`dark` from
+  `prefers-color-scheme` — not a third stylesheet, so user themes are
+  untouched. Follows the OS live via a `matchMedia` listener, and the
+  synchronous anti-flash injection now picks the dark built-in for a dark-mode
+  user instead of always flashing white.
+- Safe-area: `viewport-fit=cover` on the hub page (without it `env()` resolves
+  to 0 and the UI hides under the notch) plus `--safe-*` tokens that are `0`
+  everywhere and only overridden under `[data-platform='android']`. Gated on
+  the platform attribute, not a width media query — a narrow desktop window is
+  still not a device with a notch.
+- **`--font-scale` at `:root`**, consumed by `html { font-size: calc(16px *
+  var(--font-scale)) }`, so it reaches every `rem`. 16px is the browser default
+  it replaces, which makes an unscaled build render identically to the
+  pre-sweep px values. No UI writes to it yet — Android WebView already applies
+  the system font scale itself, so the desktop zoom control is the first real
+  consumer and lands with whoever needs it.
 
 ---
 
@@ -906,9 +944,26 @@ held a sender the response body was waiting on), and prompt prefill ignored
   two pinned models generating concurrently; a "Fix this" deep link from a
   degraded overlay; first-run wizard through to chat.
 
-### Phase 6b — Android shell + tokens + scale
-- Mobile shell, tokens/theme `system`, safe-area, full px→rem sweep.
-- **Appearance-parity** screenshot check: overlay + hub on both OS.
+### Phase 6b — Android shell + tokens + scale — **web layer done**
+- Mobile shell, tokens/theme `system`, safe-area, px→rem sweep: all landed.
+  See §8.2/§8.4 for the four places the plan changed (tab set, `navTo`,
+  `shareText`, the sweep's real size).
+- **Deferred to Phase 7, correctly:** `shareText` and the incoming share
+  intent. Both are JNI + manifest work, not web-layer work.
+- **Breakpoint verified in a real engine at 375x812 and 1280x800**, by serving
+  `base.css` and measuring computed styles. It caught a bug that no test would
+  have: the mobile block was authored *above* the desktop rules it overrides,
+  and since every override is the same specificity, source order won — the
+  phone layout kept a 260px grid track for a sidebar that was already
+  `display: none`, squeezing chat into 115px of a 375px screen. The block is
+  now last in the file, with a comment saying why it has to be.
+  - Confirmed at 375px: single-column chat at full width, sidebar and
+    artifacts hidden, 3-up tab bar pinned to the bottom at 44px, no horizontal
+    overflow. At 1280px: `260px 740px 280px` and no tab bar — unchanged.
+- **Still owed:** on-device rendering. The above used a desktop browser at a
+  phone viewport, which exercises the CSS but not the WebView, real safe-area
+  insets (`env()` resolved to 0 with no notch to report), or system font
+  scale.
 
 ### Phase 7 — Android native
 - `KittyForegroundService` (`dataSync`, `START_STICKY`, POST_NOTIFICATIONS grant

@@ -6,9 +6,30 @@
 import defaultCss from '@/themes/default.css?raw';
 import darkCss from '@/themes/dark.css?raw';
 import { ipc, onThemeChanged } from './ipc';
+import { applyPlatformAttribute } from './platform';
 import type { Config } from './types';
 
 const BUILTIN: Record<string, string> = { default: defaultCss, dark: darkCss };
+
+/** `theme: "system"` follows the OS (D16): `default` under
+    `prefers-color-scheme: light`, `dark` under dark. Not a third stylesheet —
+    it resolves to one of the two built-ins, so a user theme keeps behaving
+    exactly as before and only this one reserved name is special. */
+export const SYSTEM_THEME = 'system';
+
+/** Resolve a configured theme name against an OS colour-scheme preference.
+    Pure, so the mapping is testable without a media-query environment. */
+export function resolveThemeName(configured: string, prefersDark: boolean): string {
+  return configured === SYSTEM_THEME ? (prefersDark ? 'dark' : 'default') : configured;
+}
+
+function prefersDark(): boolean {
+  return (
+    typeof window !== 'undefined' &&
+    typeof window.matchMedia === 'function' &&
+    window.matchMedia('(prefers-color-scheme: dark)').matches
+  );
+}
 
 function ensureStyle(id: string): HTMLStyleElement {
   let el = document.getElementById(id) as HTMLStyleElement | null;
@@ -110,7 +131,7 @@ async function applyFromConfig() {
   // A newer applyFromConfig() started while we were waiting — drop this
   // stale result so an older config can't clobber the newer one on the DOM.
   if (gen !== themeApplyGen) return;
-  const css = await themeCss(cfg.theme);
+  const css = await themeCss(resolveThemeName(cfg.theme, prefersDark()));
   // themeCss may itself await an IPC round-trip (readUserTheme) — re-check
   // before writing, otherwise a slow stale call can still win the DOM write.
   if (gen !== themeApplyGen) return;
@@ -120,9 +141,22 @@ async function applyFromConfig() {
 
 /** Apply the configured theme/background and keep it in sync with changes. */
 export function initTheme() {
-  // Inject the default synchronously to avoid an unstyled flash, then apply
-  // the real configured theme.
-  ensureStyle('app-theme').textContent = BUILTIN.default;
+  // Stamp the platform before anything paints — safe-area insets and the
+  // mobile shell are gated on it, and doing this after an await would flash
+  // the desktop layout on a phone.
+  applyPlatformAttribute();
+  // Inject a synchronously-resolved built-in to avoid an unstyled flash. Uses
+  // the OS preference rather than always `default`, so a dark-mode user on
+  // `theme: "system"` doesn't get a white flash before the config loads.
+  ensureStyle('app-theme').textContent = prefersDark() ? BUILTIN.dark : BUILTIN.default;
   void applyFromConfig();
   void onThemeChanged(() => void applyFromConfig());
+  // Follow the OS while `theme: "system"` is active. `applyFromConfig`
+  // re-reads the config and re-resolves, so this is a no-op for a user on a
+  // pinned theme — no need to check which mode is set here.
+  if (typeof window !== 'undefined' && typeof window.matchMedia === 'function') {
+    window
+      .matchMedia('(prefers-color-scheme: dark)')
+      .addEventListener('change', () => void applyFromConfig());
+  }
 }
