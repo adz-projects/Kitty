@@ -965,7 +965,35 @@ held a sender the response body was waiting on), and prompt prefill ignored
   insets (`env()` resolved to 0 with no notch to report), or system font
   scale.
 
-### Phase 7 — Android native
+### Phase 7 — Android native — **IN PROGRESS (scaffold up, app launches)**
+
+**Done:** `tauri android init` run; a debug APK builds, installs, and starts
+`MainActivity` on a Pixel 10 Pro (Android 16 / API 36 / arm64-v8a / 16 GB).
+Two real bugs fixed on the way, neither reachable from `cargo check` (see
+commit `abe9ac9`):
+- `run()` had no `#[tauri::mobile_entry_point]`, so the `.so` exported **zero**
+  dynamic symbols and the app died on launch with `UnsatisfiedLinkError`.
+- The `.so` linked at 4 KB pages; Android 16 raised
+  `PageSizeMismatchDialog`. Fixed with `max-page-size=16384` link args.
+
+**Toolchain notes for whoever picks this up:**
+- Prereqs installed this session: OpenJDK 21 (`Microsoft.OpenJDK.21`),
+  `tauri-cli` 2.11.4. SDK already had platform-34, build-tools 34, NDK 27.2;
+  Gradle self-provisioned what compileSdk 36 needed, and `cmdline-tools` was
+  never required.
+- **`cargo tauri android build` needs Windows Developer Mode**, because it
+  symlinks the `.so` into `jniLibs`. Enabling it is not enough for an
+  already-running shell — `SeCreateSymbolicLinkPrivilege` is granted at logon,
+  so the terminal must be restarted. Workaround that needs neither: build the
+  lib, copy it to `app/src/main/jniLibs/arm64-v8a/`, then
+  `gradlew assembleArm64Debug -x app:rustBuildArm64Debug`.
+- `src-tauri/gen/` is gitignored, so the generated project is not tracked.
+  Whether it should be is a Phase 8 call.
+- `tauri.android.conf.json` already zeroed `externalBin`/`resources` back in
+  Phase 1a — the sidecar problem §2.3 describes was solved before this phase.
+
+**Not started:** everything below.
+
 - `KittyForegroundService` (`dataSync`, `START_STICKY`, POST_NOTIFICATIONS grant
   [wizard §8.3]), `SecretStore` (Keystore backend for provider keys/HF token),
   GGUF first-use path, no local chat picker, backward-compat.
