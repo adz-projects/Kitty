@@ -91,10 +91,16 @@ pub struct AppState {
     /// The active session (raw `SessionInfo` JSON) handed from overlay to the
     /// full window on "Expand" so both bind the same session.
     pub active_session: Mutex<Option<Value>>,
-    /// Deep-link target for the settings window (`{ section, highlight }`).
-    pub settings_target: Mutex<Option<Value>>,
-    /// Wizard launch mode (`"setup"` or `"repair"`).
-    pub wizard_mode: Mutex<Option<String>>,
+    /// Pending `route://goto` target per hub window label — the payload a hub
+    /// reads once at mount (`get_route_target`) when it was created by the
+    /// same call that routed it, and so wasn't listening for the event yet.
+    ///
+    /// Keyed by label rather than global because D21 allows several hubs at
+    /// once and each has its own route; a single shared target would make
+    /// "open Settings" send every open window there. Replaces the old
+    /// `settings_target` + `wizard_mode` pair, which were per-*window-kind*
+    /// back when Settings and the wizard were windows of their own.
+    pub route_targets: Mutex<HashMap<String, Value>>,
     /// Readiness of the embedding GGUF the in-process pathway engine uses —
     /// `Downloading`/`Missing` degrades gracefully to the engine's hashing
     /// fallback, not an outage. See `EmbeddingModelStatus`.
@@ -181,8 +187,7 @@ impl AppState {
             engine_restart: Mutex::new(Default::default()),
             startup_phase: Mutex::new(StartupPhase::default()),
             active_session: Mutex::new(None),
-            settings_target: Mutex::new(None),
-            wizard_mode: Mutex::new(None),
+            route_targets: Mutex::new(HashMap::new()),
             adaptive_pathway_embedding_status: Mutex::new(EmbeddingModelStatus::default()),
             bigtiny: Mutex::new(DaemonHandle::default()),
             bigtiny_approvals: Mutex::new(HashMap::new()),

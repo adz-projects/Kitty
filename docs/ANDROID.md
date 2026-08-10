@@ -554,19 +554,41 @@ All under `Settings → Local models`, shared component on both OS.
 
 ## 8. Frontend
 
-### 8.1 Windows build (Phase 6a)
-- Vite multi-page: `['overlay','hub']` (remove windows `settings`,`wizard`,
-  `screenshot-select` for new desktop; `screenshot-select` folded into hub as an
-  in-window route).
-- New `src/windows/hub/` → `<HubApp>` routing `chat | sessions | settings | wizard`
-  via a tiny zustand `routeStore`.
+### 8.1 Windows build (Phase 6a) — **DONE**
+- Vite multi-page: **`['overlay','hub','screenshot-select']`**. The `main`,
+  `settings` and `wizard` window labels are gone; `main` became `hub`, the
+  other two became routes inside it.
+  - **`screenshot-select` stays a window**, contrary to this section's original
+    claim that it folds into the hub as an in-window route. It cannot: it is a
+    decorationless, transparent, always-on-top window positioned and sized to a
+    specific monitor's bounds (`windows.rs::create_screenshot_select_window`).
+    That is the same reason the overlay isn't a route.
+- `src/windows/hub/App.tsx` routes `chat | settings | wizard` via
+  `src/stores/routeStore.ts`. **No `sessions` route on desktop** — the session
+  list is a sidebar inside the chat route, and adding a variant nothing
+  navigates to would just be an unrenderable state. It arrives in 6b, where the
+  mobile tab bar actually needs it.
+- **Routing away from chat is safe, and this is what the whole restructure
+  rests on.** `chatStore.bindEvents` subscribes to `chat://*` once per window,
+  in the store rather than in a component, so a reply started in the chat route
+  keeps streaming while the user is in Settings. The chat route is additionally
+  kept mounted (toggled with `hidden`) so scroll position and composer drafts
+  survive the trip, which store state alone would not preserve.
 - Model choice lives **only** in the new-chat composer (D2).
-- **Multi-window (D21):** the hub window may be instantiated **more than once** —
-  each instance is an independent viewer with its **own session and its own pinned
-  model**. `open_new_chat_window`/`open_main` create a new hub instance instead of
-  reusing an existing one when a distinct session is requested. `route://goto`
-  emits + `focus_or_open` target a specific instance; `get_settings_target`
-  returns a route payload.
+- **Multi-window (D21):** already existed before this phase — `windows.rs`
+  allocates `chat-N` labels off the same bundle, each with its own session.
+  What 6a added is that the *route* is per-window too: `route_to` picks one
+  live hub (preferring the focused one), stores the target under **that
+  label**, and uses `emit_to` rather than a broadcast. A global target or a
+  broadcast `emit` would send every open hub to Settings at once.
+- `settings_target` + `wizard_mode` (per-window-kind, from when Settings and
+  the wizard were windows) collapse into one `route_targets: HashMap<label,
+  Value>`. `get_route_target` **consumes on read**, or a reload would bounce
+  the window back to Settings long after the user left.
+- Two things that were the window manager's job became the frontend's, because
+  a route has no chrome to close: Settings grew a "Back to chat" control, and
+  `DoneStep` navigates on finish (`complete_setup` used to hide the wizard
+  window).
 
 ### 8.2 Android shell (Phase 6b)
 - Same `<HubApp>`; bottom tabs (**Chat / Models / Settings**), share intent,
@@ -870,12 +892,19 @@ held a sender the response body was waiting on), and prompt prefill ignored
 - Picker in `ScheduledTasks.tsx`, listing downloaded GGUFs with "whatever is
   active when it runs" as the default.
 
-### Phase 6a — Desktop hub (land green)
-- Wrap existing window components into `hub`; Vite intake change; routes;
-  **multi-instance hub (D21)**. Acceptance: overlay + hub behave pre-restructure;
-  regression via `pnpm test`; **two hub windows open with two different sessions
-  and two different pinned models generate concurrently** (each with its own chat
-  slot).
+### Phase 6a — Desktop hub — **DONE**
+- Window components folded into `hub`; Vite intake down to three entries;
+  `routeStore`; per-window route targeting. Full detail in §8.1, including the
+  two places the original plan didn't survive contact with the code
+  (`screenshot-select` can't be a route; `sessions` has nothing to route to on
+  desktop yet).
+- **Multi-instance (D21) was already there** — `chat-N` labels predate this
+  phase. 6a made the *route* per-instance to match.
+- Automated: `tsc`/`eslint`/`vitest` (249) and `cargo test`/`clippy` green;
+  `routeStore.test.ts` covers payload parsing and deep-link retention.
+- **Still owed — manual, not yet run:** two hub windows on two sessions with
+  two pinned models generating concurrently; a "Fix this" deep link from a
+  degraded overlay; first-run wizard through to chat.
 
 ### Phase 6b — Android shell + tokens + scale
 - Mobile shell, tokens/theme `system`, safe-area, full px→rem sweep.

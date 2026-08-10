@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { stepsForPath } from './App';
+import { stepsForPath } from './WizardView';
 
 /** The embedding-model step must appear on BOTH wizard paths when
     adaptive-pathway is enabled (it needs Ollama purely for embeddings,

@@ -1,6 +1,6 @@
 //! Kitty — Tauri v2 application entry point.
 //!
-//! One Rust process owns four labelled windows, the BigTiny + Ollama process
+//! One Rust process owns the overlay, the hub window(s), the BigTiny
 //! lifecycle, config, tray, and the global hotkey. All I/O lives here; the
 //! webview only talks to us through the commands registered below.
 
@@ -190,14 +190,13 @@ pub fn run() {
             commands::delete_mcp_server,
             commands::set_mcp_server_enabled,
             commands::connect_mcp_server,
-            commands::get_settings_target,
+            commands::get_route_target,
             commands::list_themes,
             commands::read_user_theme,
             commands::open_themes_folder,
             commands::read_image_data_url,
             commands::validate_setup,
             commands::open_wizard,
-            commands::get_wizard_mode,
             commands::complete_setup,
             #[cfg(windows)]
             commands::get_autostart,

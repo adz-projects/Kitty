@@ -6,8 +6,14 @@ import { resolve } from 'node:path';
 // Paths are kept identical between dev (vite server) and prod (dist) so the
 // Rust side can load `windows/<label>/index.html` uniformly (see windows.rs).
 
-// One source of truth for the five window entries — mirrors windows.rs::url().
-const WINDOWS = ['overlay', 'main', 'settings', 'wizard', 'screenshot-select'] as const;
+// One source of truth for the window entries — mirrors windows.rs::url().
+//
+// Three, not five: `settings` and `wizard` became routes inside `hub`
+// (docs/ANDROID.md §8.1), which is also what the Android shell mounts.
+// `screenshot-select` stays its own entry despite §8.1 suggesting otherwise —
+// it needs a decorationless, transparent, always-on-top window sized to one
+// monitor, which a route inside a normal window cannot be.
+const WINDOWS = ['overlay', 'hub', 'screenshot-select'] as const;
 const entryHtml = (w: string) => `src/windows/${w}/index.html`;
 
 export default defineConfig({

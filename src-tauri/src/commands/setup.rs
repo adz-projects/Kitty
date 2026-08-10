@@ -96,11 +96,6 @@ pub async fn open_wizard(app: AppHandle, mode: Option<String>) -> Result<(), Str
     windows::open_wizard(&app, mode.as_deref().unwrap_or("setup")).map_err(|e| e.to_string())
 }
 
-/// The wizard launch mode the window should read on open.
-#[tauri::command]
-pub fn get_wizard_mode(state: tauri::State<'_, AppState>) -> Result<Option<String>, String> {
-    Ok(state.wizard_mode.lock().unwrap().clone())
-}
 
 /// Mark first-run setup complete, then summon the overlay.
 #[tauri::command]
@@ -115,9 +110,9 @@ pub async fn complete_setup(app: AppHandle) -> Result<(), String> {
         cfg.clone()
     };
     config::save(&updated).map_err(|e| e.to_string())?;
-    if let Some(win) = app.get_webview_window(windows::WIZARD) {
-        let _ = win.hide();
-    }
+    // The wizard is a hub route now, not a window to hide — the frontend
+    // routes itself back to chat when this resolves. Summoning the overlay
+    // stays: it's how first run hands the user their first prompt.
     windows::show_overlay(&app).map_err(|e| e.to_string())
 }
 

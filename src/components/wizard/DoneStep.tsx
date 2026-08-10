@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { ipc } from '@/lib/ipc';
+import { useRouteStore } from '@/stores/routeStore';
 import type { SetupValidation } from '@/lib/types';
 import type { WizardPath } from './PathFork';
 
@@ -30,6 +31,10 @@ export function DoneStep({ path, onBack }: { path: WizardPath | null; onBack: ()
     setError(null);
     try {
       await ipc.completeSetup();
+      // The wizard is a route now, not a window Rust can hide, so finishing
+      // has to navigate. Without this the hub sits on a completed wizard with
+      // no way out but the browser-less equivalent of a back button.
+      useRouteStore.getState().goto('chat');
     } catch (e) {
       setError(String(e));
     } finally {

@@ -465,11 +465,6 @@ export interface McpServerPatch {
   enabled?: boolean;
 }
 
-export interface SettingsTarget {
-  section: string;
-  highlight: string | null;
-}
-
 // --- Wizard ---
 /** Result of `validate_setup` — powers the wizard's Done-step summary/soft
     Finish gate and Setup & Repair's lighter re-check. */

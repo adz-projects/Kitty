@@ -1,5 +1,6 @@
 import { Fragment, useEffect, useState } from 'react';
-import { ipc, onSettingsNavigate } from '@/lib/ipc';
+import { ipc } from '@/lib/ipc';
+import { useRouteStore } from '@/stores/routeStore';
 import { General } from '@/components/settings/General';
 import { Providers } from '@/components/settings/Providers';
 import { LocalModels } from '@/components/settings/LocalModels';
@@ -54,9 +55,17 @@ function buildGroups(apEnabled: boolean): { label: string; sections: string[] }[
   ];
 }
 
-export function App() {
-  const [section, setSection] = useState<string>('general');
-  const [highlight, setHighlight] = useState<string | null>(null);
+export function SettingsView() {
+  // Deep-link target comes from the route, not from this component's own IPC:
+  // `routeStore` owns both the `route://goto` subscription and the one-shot
+  // initial read, so a "Fix this" button that opens Settings and a tab switch
+  // that lands on it go through exactly one path. Local `section` state layers
+  // the user's own clicks on top of whatever the route asked for.
+  const routedSection = useRouteStore((s) => s.settingsSection);
+  const routedHighlight = useRouteStore((s) => s.settingsHighlight);
+  const goto = useRouteStore((s) => s.goto);
+  const [section, setSection] = useState<string>(routedSection ?? 'general');
+  const [highlight, setHighlight] = useState<string | null>(routedHighlight);
   const [apEnabled, setApEnabled] = useState(false);
   const [recoveryNotice, setRecoveryNotice] = useState<string | null>(null);
 
@@ -66,26 +75,13 @@ export function App() {
     });
   }, []);
 
+  // Follow later deep links. Guarded on a non-null section so a plain
+  // "open Settings" doesn't yank the user off whichever tab they just picked.
   useEffect(() => {
-    // Register the live listener before awaiting the one-shot deep-link
-    // target, and track whether it already fired — otherwise a
-    // `settings://navigate` event that arrives while `getSettingsTarget()` is
-    // still in flight can be clobbered by that stale initial target once it
-    // finally resolves.
-    let navigated = false;
-    const un = onSettingsNavigate((t) => {
-      navigated = true;
-      setSection(t.section);
-      setHighlight(t.highlight);
-    });
-    void ipc.getSettingsTarget().then((t) => {
-      if (t?.section && !navigated) {
-        setSection(t.section);
-        setHighlight(t.highlight);
-      }
-    });
-    return () => void un.then((fn) => fn());
-  }, []);
+    if (!routedSection) return;
+    setSection(routedSection);
+    setHighlight(routedHighlight);
+  }, [routedSection, routedHighlight]);
 
   useEffect(() => {
     void ipc.getConfig().then((c) => {
@@ -106,6 +102,12 @@ export function App() {
         </div>
       )}
       <nav className="settings-nav">
+        {/* Settings used to be its own window, so closing it was the window
+            chrome's job. As a route it needs its own way out, or the user is
+            stranded with no path back to their conversation. */}
+        <button className="settings-nav-back" onClick={() => goto('chat')}>
+          ‹ Back to chat
+        </button>
         {groups.map((g) => (
           <Fragment key={g.label}>
             <div className="settings-nav-group-label">{g.label}</div>

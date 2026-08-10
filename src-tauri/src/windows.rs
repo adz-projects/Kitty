@@ -1,9 +1,16 @@
-//! Window management. One Rust process owns four labelled webview windows.
+//! Window management. One Rust process, three kinds of webview window.
 //!
-//! The `overlay` is created hidden at startup and only ever shown/hidden — never
-//! destroyed — because summon latency is the product (CLAUDE.md rule 1). The
-//! `main`/`settings`/`wizard` windows are created lazily on first use ("hidden
-//! until used") and reused thereafter.
+//! - `overlay` — created hidden at startup and only ever shown/hidden, never
+//!   destroyed, because summon latency is the product (CLAUDE.md rule 1).
+//! - `hub` (and `chat-N`) — the primary window, created lazily on first use
+//!   and reused. It routes internally between chat, settings and setup
+//!   (docs/ANDROID.md §8.1), which is why there is no longer a `settings` or
+//!   `wizard` label: `open_settings`/`open_wizard` now focus a hub and emit
+//!   `route://goto` at it.
+//! - `screenshot-select` — a transient, transparent, always-on-top region
+//!   picker sized to one monitor. Despite §8.1, this one *cannot* be a hub
+//!   route: it needs its own decorationless fullscreen surface, for the same
+//!   reason the overlay does.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -31,20 +38,28 @@ const ANIM_STEP_MS: u64 = 12;
 static ANIM_GEN: AtomicU64 = AtomicU64::new(0);
 
 pub const OVERLAY: &str = "overlay";
-pub const MAIN: &str = "main";
-pub const SETTINGS: &str = "settings";
-pub const WIZARD: &str = "wizard";
+
+/// The primary window (docs/ANDROID.md §8.1). One window that routes between
+/// chat, settings and setup, where there used to be three separate labels —
+/// `main`, `settings` and `wizard`. Folding them together is what lets the
+/// Android shell reuse the identical component tree behind bottom tabs
+/// (§8.2) rather than growing a second UI.
+///
+/// Settings and setup are reached by emitting `route://goto` at a hub, not by
+/// opening a window. With several hubs open at once (D21) a single shared
+/// Settings window would have been ambiguous about which one's session it was
+/// configuring; as a route, the answer is always "the one you clicked in".
+pub const HUB: &str = "hub";
 pub const SCREENSHOT_SELECT: &str = "screenshot-select";
 
 fn url(label: &str) -> WebviewUrl {
     // Path is identical in dev (vite server) and prod (dist) — see vite.config.ts.
-    // A dynamically-allocated `chat-N` label (Feature 5 — multiple simultaneous
-    // chat windows) has no directory of its own; every chat window is
-    // functionally identical (full chat UI + session list + artifacts pane),
-    // so it reuses the `main` bundle instead.
+    // A dynamically-allocated `chat-N` label (D21 — multiple simultaneous hub
+    // windows) has no directory of its own; every hub is functionally
+    // identical, so it reuses the `hub` bundle instead.
     let dir = match label {
-        OVERLAY | MAIN | SETTINGS | WIZARD | SCREENSHOT_SELECT => label,
-        _ => MAIN,
+        OVERLAY | SCREENSHOT_SELECT => label,
+        _ => HUB,
     };
     WebviewUrl::App(format!("src/windows/{dir}/index.html").into())
 }
@@ -276,7 +291,7 @@ pub fn window_label_for_session(app: &AppHandle, session_id: &str) -> Option<Str
 // so they're marked per-function rather than blanket-allowed.
 #[cfg_attr(not(desktop), allow(dead_code))]
 fn any_open_chat_window(app: &AppHandle) -> Option<String> {
-    let mut candidates: Vec<String> = vec![OVERLAY.to_string(), MAIN.to_string()];
+    let mut candidates: Vec<String> = vec![OVERLAY.to_string(), HUB.to_string()];
     {
         let state = app.state::<AppState>();
         let map = state.chat_windows.lock().unwrap();
@@ -369,7 +384,7 @@ pub fn show_and_focus(app: &AppHandle, label: &str) -> bool {
 /// one. Never creates or shows the overlay.
 #[cfg_attr(not(desktop), allow(dead_code))]
 pub fn focus_or_open_chat_window(app: &AppHandle) {
-    let mut candidates: Vec<String> = vec![MAIN.to_string()];
+    let mut candidates: Vec<String> = vec![HUB.to_string()];
     {
         let state = app.state::<AppState>();
         let map = state.chat_windows.lock().unwrap();
@@ -405,7 +420,7 @@ pub fn focus_or_open_chat_window(app: &AppHandle) {
 /// overlay toggle.
 #[cfg_attr(not(desktop), allow(dead_code))]
 pub fn toggle_or_focus_main(app: &AppHandle) -> tauri::Result<()> {
-    if let Some(win) = app.get_webview_window(MAIN) {
+    if let Some(win) = app.get_webview_window(HUB) {
         if win.is_visible().unwrap_or(false) {
             win.set_focus()?;
             return Ok(());
@@ -440,7 +455,7 @@ fn ensure_window(
 /// Open the full window (Phase 2 binds it to the active session). 15% wider
 /// than the shared settings/wizard default (Round-3 item 3).
 pub fn open_main(app: &AppHandle) -> tauri::Result<()> {
-    let win = ensure_window(app, MAIN, "Kitty", (1196.0, 720.0))?;
+    let win = ensure_window(app, HUB, "Kitty", (1196.0, 720.0))?;
     win.show()?;
     win.set_focus()?;
     Ok(())
@@ -574,32 +589,74 @@ pub fn open_new_chat_window(
     Ok(())
 }
 
-/// Open the settings window, optionally deep-linked to a section (with an
-/// element to briefly highlight). The target is stored (for the window's initial
-/// read) and also emitted so an already-open window navigates.
-pub fn open_settings(
-    app: &AppHandle,
-    section: Option<String>,
-    highlight: Option<String>,
-) -> tauri::Result<()> {
-    if let Some(section) = section {
-        let target = json!({ "section": section, "highlight": highlight });
-        *app.state::<AppState>().settings_target.lock().unwrap() = Some(target.clone());
-        let _ = app.emit("settings://navigate", target);
+/// Focus a hub window (opening one if none exists) and route it to `view`.
+///
+/// The target is both stored and emitted, and both are needed: a hub that
+/// already exists navigates on the event, while one created by this call
+/// isn't listening yet and reads the stored target once at mount
+/// (`get_route_target`). Storing it under the specific label rather than
+/// globally is what keeps D21's multiple hubs from all jumping to Settings
+/// when one of them is asked to.
+fn route_to(app: &AppHandle, target: serde_json::Value) -> tauri::Result<()> {
+    let label = existing_chat_window(app).unwrap_or_else(|| HUB.to_string());
+    {
+        let state = app.state::<AppState>();
+        state
+            .route_targets
+            .lock()
+            .unwrap()
+            .insert(label.clone(), target.clone());
     }
-    let win = ensure_window(app, SETTINGS, "Kitty Settings", (1040.0, 720.0))?;
+    // Addressed to the one window, not broadcast: `emit_to` is the difference
+    // between "open Settings here" and "open Settings everywhere".
+    let _ = app.emit_to(label.as_str(), "route://goto", target);
+    let win = ensure_window(app, &label, "Kitty", (1196.0, 720.0))?;
     win.show()?;
     win.set_focus()?;
     Ok(())
 }
 
-/// Open the first-run / repair wizard in the given mode (`"setup"`/`"repair"`).
-/// Stores the mode (for the window's initial read) and emits it for a live nav.
+/// A hub-capable window that already exists, preferring a focused one. `None`
+/// when only the overlay is around, in which case the caller creates `HUB`.
+fn existing_chat_window(app: &AppHandle) -> Option<String> {
+    let mut candidates: Vec<String> = vec![HUB.to_string()];
+    {
+        let state = app.state::<AppState>();
+        let map = state.chat_windows.lock().unwrap();
+        let mut labels: Vec<String> = map.keys().cloned().collect();
+        labels.sort();
+        candidates.extend(labels);
+    }
+    let alive: Vec<String> = candidates
+        .into_iter()
+        .filter(|l| app.get_webview_window(l).is_some())
+        .collect();
+    alive
+        .iter()
+        .find(|l| {
+            app.get_webview_window(l)
+                .and_then(|w| w.is_focused().ok())
+                .unwrap_or(false)
+        })
+        .cloned()
+        .or_else(|| alive.first().cloned())
+}
+
+/// Open Settings, optionally deep-linked to a section (with an element to
+/// briefly highlight). A route within a hub, not a window of its own — see
+/// [`HUB`].
+pub fn open_settings(
+    app: &AppHandle,
+    section: Option<String>,
+    highlight: Option<String>,
+) -> tauri::Result<()> {
+    route_to(
+        app,
+        json!({ "view": "settings", "section": section, "highlight": highlight }),
+    )
+}
+
+/// Open the first-run / repair flow in the given mode (`"setup"`/`"repair"`).
 pub fn open_wizard(app: &AppHandle, mode: &str) -> tauri::Result<()> {
-    *app.state::<AppState>().wizard_mode.lock().unwrap() = Some(mode.to_string());
-    let _ = app.emit("wizard://navigate", json!({ "mode": mode }));
-    let win = ensure_window(app, WIZARD, "Kitty Setup", (1040.0, 720.0))?;
-    win.show()?;
-    win.set_focus()?;
-    Ok(())
+    route_to(app, json!({ "view": "wizard", "mode": mode }))
 }

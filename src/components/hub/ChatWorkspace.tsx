@@ -3,6 +3,7 @@ import { ipc } from '@/lib/ipc';
 import { useStackStore } from '@/stores/stackStore';
 import { useAdaptivePathwayStore } from '@/stores/adaptivePathwayStore';
 import { useChatStore } from '@/stores/chatStore';
+import { useRouteStore } from '@/stores/routeStore';
 import { StackStatusView } from '@/components/shared/StackStatusView';
 import { ChatView } from '@/components/chat/ChatView';
 import { SessionList } from '@/components/sessions/SessionList';
@@ -15,7 +16,7 @@ const DEGRADED: StackStatus[] = ['backend_down', 'local_model_missing', 'provide
 
 /** Full window: history sidebar + shared chat surface + artifacts pane. On open
     it adopts the session handed over from the overlay (Expand). */
-export function App() {
+export function ChatWorkspace() {
   const status = useStackStore((s) => s.status);
   const init = useStackStore((s) => s.init);
   const initAdaptivePathway = useAdaptivePathwayStore((s) => s.init);
@@ -25,6 +26,7 @@ export function App() {
   const hasMessages = useChatStore((s) => s.messages.length > 0);
   const exportSession = useChatStore((s) => s.exportSession);
   const newSession = useChatStore((s) => s.newSession);
+  const goto = useRouteStore((s) => s.goto);
   const [showArtifacts, setShowArtifacts] = useState(true);
 
   useEffect(() => {
@@ -78,7 +80,11 @@ export function App() {
             <button onClick={() => void toggleArtifacts()}>
               {showArtifacts ? 'Hide artifacts' : 'Show artifacts'}
             </button>
-            <button onClick={() => ipc.openSettings()} title="Settings" aria-label="Settings">
+            {/* Routes within this hub instead of opening a window. With
+                multiple hubs open (D21) a shared Settings window would have
+                been ambiguous about which one's session it was configuring;
+                as a route the answer is always "this one". */}
+            <button onClick={() => goto('settings')} title="Settings" aria-label="Settings">
               <SettingsGearIcon />
             </button>
             <button onClick={() => void newSession()} title="New chat" aria-label="New chat">

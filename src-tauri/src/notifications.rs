@@ -40,7 +40,7 @@ fn chat_window_focused(app: &AppHandle) -> bool {
             .and_then(|w| w.is_focused().ok())
             .unwrap_or(false)
     };
-    focused(windows::OVERLAY) || focused(windows::MAIN)
+    focused(windows::OVERLAY) || focused(windows::HUB)
 }
 
 /// Whether the window relevant to `session_id` (if any is currently bound to

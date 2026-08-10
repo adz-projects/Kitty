@@ -32,12 +32,18 @@ pub async fn open_settings(
     windows::open_settings(&app, section, highlight).map_err(|e| e.to_string())
 }
 
-/// The settings deep-link target the window should navigate to on open.
+/// The `route://goto` target this hub should navigate to on mount, if the
+/// call that created it also routed it somewhere.
+///
+/// **Consumed on read.** A hub asks once at mount; leaving the target in place
+/// would send the window back to Settings on every reload (and, in dev, on
+/// every hot restart) long after the user had navigated away.
 #[tauri::command]
-pub fn get_settings_target(
+pub fn get_route_target(
+    window: tauri::Window,
     state: tauri::State<'_, AppState>,
 ) -> Result<Option<serde_json::Value>, String> {
-    Ok(state.settings_target.lock().unwrap().clone())
+    Ok(state.route_targets.lock().unwrap().remove(window.label()))
 }
 
 /// Open the full window. Async so window creation dispatches to the main thread.

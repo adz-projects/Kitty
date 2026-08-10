@@ -39,7 +39,6 @@ import type {
   ScheduledTask,
   SessionInfo,
   SessionTitleEvent,
-  SettingsTarget,
   SetupValidation,
   StackStatus,
   StackStatusPayload,
@@ -321,8 +320,10 @@ export const ipc = {
     invoke<void>('set_brave_mcp_search_api_key', { apiKey }),
   setBraveMcpSearchEnabled: (enabled: boolean) =>
     invoke<void>('set_brave_mcp_search_enabled', { enabled }),
-  // Settings deep link
-  getSettingsTarget: () => invoke<SettingsTarget | null>('get_settings_target'),
+  /** The `route://goto` target this hub should navigate to on mount, if the
+      call that created it also routed it somewhere. Consumed on read — see
+      `commands::get_route_target`. */
+  getRouteTarget: () => invoke<unknown>('get_route_target'),
   // Theming
   listThemes: () => invoke<{ builtins: string[]; user: string[] }>('list_themes'),
   readUserTheme: (name: string) => invoke<string>('read_user_theme', { name }),
@@ -331,7 +332,6 @@ export const ipc = {
   // Wizard / setup
   validateSetup: () => invoke<SetupValidation>('validate_setup'),
   openWizard: (mode?: 'setup' | 'repair') => invoke<void>('open_wizard', { mode: mode ?? 'setup' }),
-  getWizardMode: () => invoke<string | null>('get_wizard_mode'),
   completeSetup: () => invoke<void>('complete_setup'),
   getAutostart: () => invoke<boolean>('get_autostart'),
   setAutostart: (enabled: boolean) => invoke<void>('set_autostart', { enabled }),
@@ -469,13 +469,14 @@ export const onModelsChanged = (cb: () => void) => listen('models://changed', ()
 export const onEngineRestartState = (cb: (e: EngineRestartState) => void) =>
   listen<EngineRestartState>('engine://restart-state', (e) => cb(e.payload));
 
-export const onSettingsNavigate = (cb: (t: SettingsTarget) => void) =>
-  listen<SettingsTarget>('settings://navigate', (e) => cb(e.payload));
+/** Hub navigation (docs/ANDROID.md §8.1). Replaces the old
+    `settings://navigate` and `wizard://navigate` events, which existed to
+    steer two windows that are now routes. Emitted with `emit_to` at one
+    window, so a payload arriving here is addressed to *this* hub. */
+export const onRouteGoto = (cb: (payload: unknown) => void) =>
+  listen<unknown>('route://goto', (e) => cb(e.payload));
 
 export const onThemeChanged = (cb: () => void) => listen('theme://changed', () => cb());
-
-export const onWizardNavigate = (cb: (mode: string) => void) =>
-  listen<{ mode: string }>('wizard://navigate', (e) => cb(e.payload.mode));
 
 /** Clipboard-to-Kitty hotkey/tray item (Round-4): the overlay is already
     shown by the time this fires; payload is whichever the clipboard held. */

@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
-import { ipc, onWizardNavigate } from '@/lib/ipc';
+import { ipc } from '@/lib/ipc';
+import { useRouteStore } from '@/stores/routeStore';
 import type { Config } from '@/lib/types';
 import { PathFork, type WizardPath } from './PathFork';
 import { ApiKeyStep } from './ApiKeyStep';
@@ -45,8 +46,11 @@ export function stepsForPath(
     local-vs-API-key; the rest of the flow adapts to whichever the user
     picked. Repair mode pre-selects the path from the current config and
     skips straight past the fork. */
-export function App() {
-  const [mode, setMode] = useState<'setup' | 'repair'>('setup');
+export function WizardView() {
+  // Mode rides on the route (`routeStore` owns the `route://goto`
+  // subscription), so opening Setup & Repair and being deep-linked into repair
+  // mode are the same mechanism.
+  const mode = useRouteStore((s) => s.wizardMode);
   const [cfg, setCfg] = useState<Config | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
@@ -63,29 +67,25 @@ export function App() {
   // resolve out of order and leave a stale value persisted.
   const writeQueueRef = useRef<Promise<void>>(Promise.resolve());
 
+  // Keyed on `mode` so entering repair from an already-open wizard re-runs the
+  // path inference rather than leaving the user on the setup fork.
   useEffect(() => {
     void ipc
-      .getWizardMode()
-      .then((m) => {
-        const repair = m === 'repair';
-        if (repair) setMode('repair');
-        return ipc.getConfig().then((c) => {
-          setCfg(c);
-          if (!repair) return;
-          // Repair mode: infer the path from what's already configured and
-          // jump straight past the "welcome" fork.
-          const active = c.providers.find((p) => p.id === c.active_provider_id);
-          const inferred: WizardPath =
-            active && active.provider_type !== 'local' ? 'api-key' : 'local';
-          setPath(inferred);
-          setStepIndex(1);
-          setCompletedThrough(1);
-        });
+      .getConfig()
+      .then((c) => {
+        setCfg(c);
+        if (mode !== 'repair') return;
+        // Repair mode: infer the path from what's already configured and
+        // jump straight past the "welcome" fork.
+        const active = c.providers.find((p) => p.id === c.active_provider_id);
+        const inferred: WizardPath =
+          active && active.provider_type !== 'local' ? 'api-key' : 'local';
+        setPath(inferred);
+        setStepIndex(1);
+        setCompletedThrough(1);
       })
       .catch((e) => setLoadError(String(e)));
-    const un = onWizardNavigate((m) => setMode(m === 'repair' ? 'repair' : 'setup'));
-    return () => void un.then((fn) => fn());
-  }, []);
+  }, [mode]);
 
   /** Create (once) and activate a provider profile bound to the in-process
       engine, so the model just downloaded is actually the one chat uses.
