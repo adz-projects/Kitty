@@ -1,0 +1,29 @@
+# 16 KB page alignment for Android (docs/ANDROID.md §11).
+#
+# Android 15 introduced devices with a 16 KB memory page size, and Android 16
+# actively flags apps that aren't ready for it: launching a 4 KB-aligned build
+# on a Pixel running Android 16 raises `AppWarnings: Showing
+# PageSizeMismatchDialog`, and on a device *in* 16 KB mode the `.so` fails to
+# load outright.
+#
+# NDK 27's linker still defaults to 4 KB (`max-page-size=0x1000`); r28 changed
+# the default, so this flag becomes redundant — harmless, but removable — once
+# the NDK pin moves. Verify with:
+#
+#   llvm-readelf -l libkitty_lib.so | awk '/LOAD/{getline; print $NF}'
+#
+# which must print 0x4000, not 0x1000.
+#
+# Applied per-target so desktop builds are untouched.
+
+[target.aarch64-linux-android]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
+
+[target.armv7-linux-androideabi]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
+
+[target.x86_64-linux-android]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
+
+[target.i686-linux-android]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]

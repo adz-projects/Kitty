@@ -33,6 +33,16 @@ use tracing_subscriber::prelude::*;
 
 use state::AppState;
 
+/// On Android this is the JNI entry point, not just a function `main` calls.
+///
+/// `mobile_entry_point` generates `Java_<package>_Rust_create`, which
+/// `WryActivity.onCreate` invokes through `System.loadLibrary`. Without it the
+/// `.so` builds and loads fine and then the app dies instantly with
+/// `UnsatisfiedLinkError: No implementation found for void
+/// com.kitty.app.Rust.create()` — a failure that reads like a packaging
+/// problem rather than a missing attribute. Desktop is unaffected: the `cfg`
+/// is false there and `main` calls this directly.
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Structured logs to stderr (unchanged); RUST_LOG overrides the default
     // filter. Also captures WARN/ERROR events into an in-memory ring buffer
