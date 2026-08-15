@@ -124,6 +124,30 @@ pub fn apply_if_pending(app: &AppHandle) {
 
     let app2 = app.clone();
     tauri::async_runtime::spawn(async move {
+        // Re-check immediately before killing: the in-flight read above and
+        // the actual restart are separated by a task hop, and a prompt that
+        // started in that gap would otherwise have its daemon killed
+        // mid-turn — exactly what §6.4 exists to prevent. If a session went
+        // in flight meanwhile, put the flags back; its completion re-drives
+        // `apply_if_pending`.
+        let busy_now = {
+            let s = app2.state::<AppState>();
+            let in_flight = s.in_flight_sessions.lock().unwrap();
+            !in_flight.is_empty()
+        };
+        if busy_now {
+            tracing::info!(
+                "engine restart re-queued: a generation went in flight while the restart was being scheduled"
+            );
+            emit(
+                &app2,
+                EngineRestartState {
+                    reload_required: true,
+                    restart_pending: true,
+                },
+            );
+            return;
+        }
         tracing::info!("restarting the daemon to apply changed engine settings");
         if let Err(e) = crate::commands::restart_backend(app2.clone()).await {
             tracing::warn!("engine restart failed: {e}");

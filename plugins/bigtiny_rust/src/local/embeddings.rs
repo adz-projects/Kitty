@@ -38,15 +38,33 @@ pub fn embed_one(
     let mut ctx = engine.embedding_context(pooling)?;
     let model = engine.model();
 
-    let tokens = model
+    let mut tokens = model
         .str_to_token(trimmed, AddBos::Always)
         .map_err(|e| LocalEngineError::Inference(format!("tokenize failed: {e}")))?;
     if tokens.is_empty() {
         return Ok(vec![0.0; engine.n_embd().max(0) as usize]);
     }
 
+    // A pooled embedding needs the whole sequence in one batch, so this can't
+    // be chunked the way generation prefill is — instead cap the input to what
+    // the embedding context's batch can hold. Submitting more than `n_batch`
+    // tokens makes llama.cpp *abort the process* (`GGML_ASSERT(n_tokens_all <=
+    // cparams.n_batch)`), which would take the whole daemon down; truncating an
+    // over-long belief snippet is a benign degradation by comparison. The cap
+    // is also `<= embed_n_ctx`, so it never exceeds the context either.
+    let cap = (ctx.n_batch() as usize).max(1);
+    if tokens.len() > cap {
+        tracing::debug!(
+            tokens = tokens.len(),
+            cap,
+            "embedding input exceeds the embed context batch; truncating"
+        );
+        tokens.truncate(cap);
+    }
+
     let mut batch = LlamaBatch::new(tokens.len(), 1);
     for (i, token) in (0i32..).zip(tokens) {
+        // Pooled embeddings need logits on every token, not just the last.
         batch
             .add(token, i, &[0], true)
             .map_err(|e| LocalEngineError::Inference(format!("batch add failed: {e}")))?;

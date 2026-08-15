@@ -22,7 +22,7 @@ use crate::config::BigTinyConfig;
 use crate::hitl::manager::HITLManager;
 use crate::mcp::MCPManager;
 use crate::provider::router::ProviderRouter;
-use crate::server::events::SSEEvent;
+use crate::server::events::{SSEEvent, SSEEventType};
 
 type PathwayEngine = adaptive_pathway::engine::PathwayEngine;
 
@@ -46,7 +46,10 @@ pub struct Agent {
     /// Keyed by session id. The `Uuid` identifies *this specific turn* so the
     /// disconnect watcher spawned in `run_turn` can never abort a later,
     /// unrelated turn for the same session (see that method's doc comment).
-    tasks: DashMap<String, (Uuid, tokio::task::JoinHandle<()>)>,
+    /// The sender clone lets `cancel()` emit the terminal `Cancelled`
+    /// session-status frame before aborting the turn; it is dropped with the
+    /// entry, so the stream still closes exactly when the turn ends.
+    tasks: DashMap<String, (Uuid, tokio::task::JoinHandle<()>, mpsc::UnboundedSender<SSEEvent>)>,
     summarizer: Arc<SummarizerChain>,
     config: BigTinyConfig,
     /// Daemon-wide pre-flight recall counters, shared across every per-turn
@@ -62,6 +65,27 @@ pub struct Agent {
     /// after spawning `adaptive_pathway::background::run()`; signalled during
     /// `Agent::shutdown()` before cancelling in-flight turns.
     pathway_shutdown: Option<tokio::sync::watch::Sender<bool>>,
+    /// Sessions already warned about a pinned-provider mismatch (see
+    /// `AgentLoop::provider_mismatch_warned`) — daemon-lifetime, since each
+    /// `AgentLoop` is rebuilt per turn.
+    provider_mismatch_warned: Arc<DashMap<String, ()>>,
+}
+
+/// Removes the turn's `tasks` entry when the turn task ends — normally *or*
+/// by panic. Lives inside the spawned task; tokio catches a panic at the
+/// task boundary, so unwinding drops this guard and the cleanup still runs.
+struct TurnCleanup {
+    agent: Arc<Agent>,
+    session_id: String,
+    turn_token: Uuid,
+}
+
+impl Drop for TurnCleanup {
+    fn drop(&mut self) {
+        self.agent
+            .tasks
+            .remove_if(&self.session_id, |_, (tok, _, _)| *tok == self.turn_token);
+    }
 }
 
 impl Agent {
@@ -90,6 +114,7 @@ impl Agent {
             cache_dir,
             pathway,
             pathway_shutdown,
+            provider_mismatch_warned: Arc::new(DashMap::new()),
         }
     }
 
@@ -152,6 +177,7 @@ impl Agent {
             self.config.agent.sandbox_strict,
             self.pathway.clone(),
             self.config.pathway.clone(),
+            self.provider_mismatch_warned.clone(),
         )
     }
 
@@ -180,6 +206,13 @@ impl Agent {
     ) -> Result<(), String> {
         let this = self.clone();
         let turn_token = Uuid::new_v4();
+
+        // A finished-but-never-removed entry (only possible if something
+        // outside the turn task's drop guard went wrong) must not wedge the
+        // session into a permanent "turn in progress" — treat it as
+        // replaceable. Atomic under the shard lock via `remove_if`.
+        self.tasks
+            .remove_if(&session_id, |_, (_, handle, _)| handle.is_finished());
 
         match self.tasks.entry(session_id.clone()) {
             dashmap::mapref::entry::Entry::Occupied(_) => Err(format!(
@@ -226,7 +259,19 @@ impl Agent {
                 });
 
                 let cleanup_session_id = session_id.clone();
+                let cancel_tx = tx.clone();
                 let handle = tokio::spawn(async move {
+                    // Drop-guard cleanup: if `run()` panics, everything after
+                    // it in this task used to be skipped — leaking the
+                    // `tasks` entry and wedging the session into a permanent
+                    // "turn in progress". The guard removes the entry on
+                    // unwind too (tokio catches the panic at the task
+                    // boundary and reports it via the JoinHandle).
+                    let _cleanup = TurnCleanup {
+                        agent: this.clone(),
+                        session_id: cleanup_session_id,
+                        turn_token,
+                    };
                     let mut agent_loop = this.build_loop();
                     agent_loop
                         .run(
@@ -238,10 +283,8 @@ impl Agent {
                         )
                         .await;
                     drop(turn_done);
-                    this.tasks
-                        .remove_if(&cleanup_session_id, |_, (tok, _)| *tok == turn_token);
                 });
-                entry.insert((turn_token, handle));
+                entry.insert((turn_token, handle, cancel_tx));
                 Ok(())
             }
         }
@@ -251,25 +294,74 @@ impl Agent {
     /// spawning — used by `RecipeEngine::execute`/the scheduler, which
     /// (like Python's `await self.agent.run(...)`) need the session fully
     /// populated before they return, not a fire-and-forget stream. SSE
-    /// events are discarded (no receiver reads them), matching Python's
-    /// `_noop_callback` default.
-    pub async fn run_turn_and_wait(self: &Arc<Self>, session_id: &str, user_message: &str) {
-        let (tx, _rx) = mpsc::unbounded_channel::<SSEEvent>();
+    /// events are drained by a watcher (no other receiver reads them),
+    /// matching Python's `_noop_callback` default.
+    ///
+    /// Returns the turn's outcome, derived from the terminal frame: a
+    /// terminal `Error` event is `Err(message)`, anything else (the
+    /// `SessionStatus "idle"` success frame, or the channel closing without
+    /// a terminal frame) is `Ok(())`. Without this the scheduler recorded
+    /// provider-failed runs as `'completed'` in `execution_history`.
+    pub async fn run_turn_and_wait(
+        self: &Arc<Self>,
+        session_id: &str,
+        user_message: &str,
+    ) -> Result<(), String> {
+        let (tx, mut rx) = mpsc::unbounded_channel::<SSEEvent>();
+        // `is_last` is only set on terminal frames (Error / SessionStatus) —
+        // `LlmStop` mid-turn carries the default `false`.
+        let watcher = tokio::spawn(async move {
+            let mut failure: Option<String> = None;
+            while let Some(ev) = rx.recv().await {
+                if ev.is_last {
+                    if ev.event_type == SSEEventType::Error {
+                        failure = Some(
+                            ev.error_message
+                                .clone()
+                                .or(ev.content.clone())
+                                .unwrap_or_else(|| "turn failed".to_string()),
+                        );
+                    }
+                    break;
+                }
+            }
+            failure
+        });
         let mut agent_loop = self.build_loop();
         agent_loop
             .run(session_id, user_message, tx, None, None)
             .await;
+        match watcher.await {
+            Ok(Some(msg)) => Err(msg),
+            _ => Ok(()),
+        }
     }
 
-    /// Abort the in-flight turn for `session_id`, if any. The aborted task's
-    /// SSE sender is simply dropped — the route holding the receiver end sees
-    /// the stream end and closes the response; there is no explicit
-    /// "cancelled" event on this path (unlike a cooperative
-    /// `POST /cancel`-triggered stop inside the loop itself).
+    /// Abort the in-flight turn for `session_id`, if any. Emits the terminal
+    /// `Cancelled` session-status frame *before* aborting: Kitty's stream
+    /// layer (`src-tauri/src/bigtiny/stream.rs`) matches
+    /// `session_status == "Cancelled"` to report `stopReason: "cancelled"` —
+    /// without this frame every user cancel was indistinguishable from a
+    /// normal `end_turn`. After the frame, the aborted task's sender (and
+    /// this clone) drop, so the route's stream ends right behind it.
     pub async fn cancel(&self, session_id: &str) {
-        if let Some((_, (_, handle))) = self.tasks.remove(session_id) {
+        if let Some((_, (_, handle, tx))) = self.tasks.remove(session_id) {
+            Self::emit_cancelled(&tx, session_id);
             handle.abort();
         }
+    }
+
+    /// The terminal frame for a cancelled turn. A send failure is expected
+    /// and harmless — the disconnect watcher (`cancel_if_current`) fires
+    /// precisely when the receiver is already gone.
+    fn emit_cancelled(tx: &mpsc::UnboundedSender<SSEEvent>, session_id: &str) {
+        let _ = tx.send(SSEEvent {
+            event_type: SSEEventType::SessionStatus,
+            session_id: Some(session_id.to_string()),
+            content: Some("Cancelled".into()),
+            is_last: true,
+            ..Default::default()
+        });
     }
 
     /// Cancel the in-flight turn for `session_id` only if it's still the
@@ -278,10 +370,11 @@ impl Agent {
     /// already-replaced) turn can never abort a different, later turn. See
     /// that method's doc comment for why this distinction matters.
     async fn cancel_if_current(&self, session_id: &str, turn_token: Uuid) {
-        if let Some((_, (_, handle))) = self
+        if let Some((_, (_, handle, tx))) = self
             .tasks
-            .remove_if(session_id, |_, (tok, _)| *tok == turn_token)
+            .remove_if(session_id, |_, (tok, _, _)| *tok == turn_token)
         {
+            Self::emit_cancelled(&tx, session_id);
             handle.abort();
         }
     }
@@ -345,18 +438,23 @@ mod tests {
 
     /// Inserts a task that never finishes on its own, standing in for an
     /// in-flight turn, so tests can assert on whether `cancel_if_current`
-    /// actually aborted it.
-    fn insert_fake_turn(agent: &Agent, session_id: &str) -> Uuid {
+    /// actually aborted it. Returns the turn token and the channel receiver
+    /// (kept alive by the caller so sends don't error for the wrong reason).
+    fn insert_fake_turn(
+        agent: &Agent,
+        session_id: &str,
+    ) -> (Uuid, mpsc::UnboundedReceiver<SSEEvent>) {
         let token = Uuid::new_v4();
         let handle = tokio::spawn(std::future::pending::<()>());
-        agent.tasks.insert(session_id.to_string(), (token, handle));
-        token
+        let (tx, rx) = mpsc::unbounded_channel::<SSEEvent>();
+        agent.tasks.insert(session_id.to_string(), (token, handle, tx));
+        (token, rx)
     }
 
     #[tokio::test]
     async fn cancel_if_current_is_a_noop_for_a_stale_token() {
         let agent = test_agent().await;
-        let real_token = insert_fake_turn(&agent, "sess-1");
+        let (real_token, _rx) = insert_fake_turn(&agent, "sess-1");
         let stale_token = Uuid::new_v4();
 
         // Simulates the disconnect watcher for a turn that already finished
@@ -372,7 +470,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_if_current_aborts_the_matching_turn() {
         let agent = test_agent().await;
-        let token = insert_fake_turn(&agent, "sess-1");
+        let (token, _rx) = insert_fake_turn(&agent, "sess-1");
 
         agent.cancel_if_current("sess-1", token).await;
 
@@ -382,13 +480,97 @@ mod tests {
     #[tokio::test]
     async fn cancel_if_current_does_not_touch_other_sessions() {
         let agent = test_agent().await;
-        let token_a = insert_fake_turn(&agent, "sess-a");
-        insert_fake_turn(&agent, "sess-b");
+        let (token_a, _rx_a) = insert_fake_turn(&agent, "sess-a");
+        let (_token_b, _rx_b) = insert_fake_turn(&agent, "sess-b");
 
         agent.cancel_if_current("sess-a", token_a).await;
 
         assert!(agent.tasks.get("sess-a").is_none());
         assert!(agent.tasks.get("sess-b").is_some());
+    }
+
+    /// Regression: the `/cancel` path used to abort the turn task and drop
+    /// the SSE sender without ever emitting a cancelled status, so Kitty's
+    /// stream layer (which matches `session_status == "Cancelled"`) reported
+    /// every user cancel as `stopReason: "end_turn"`. The terminal
+    /// `Cancelled` frame must arrive before the stream closes.
+    #[tokio::test]
+    async fn cancel_emits_a_terminal_cancelled_frame_before_closing() {
+        let agent = test_agent().await;
+        let (_token, mut rx) = insert_fake_turn(&agent, "sess-1");
+
+        agent.cancel("sess-1").await;
+
+        let frame = rx.recv().await.expect("a Cancelled frame must be sent");
+        assert_eq!(frame.event_type, SSEEventType::SessionStatus);
+        assert_eq!(frame.content.as_deref(), Some("Cancelled"));
+        assert!(frame.is_last, "the Cancelled frame is the terminal one");
+        assert_eq!(frame.session_id.as_deref(), Some("sess-1"));
+        // ...and the stream closes right behind it (every sender dropped).
+        assert!(rx.recv().await.is_none());
+    }
+
+    /// Regression: a panic in `agent_loop.run()` used to skip the
+    /// `tasks.remove_if` cleanup, permanently wedging the session as "turn
+    /// in progress". The drop guard must remove the entry even when the turn
+    /// task ends abnormally (verified here by dropping the guard directly —
+    /// the same thing unwinding does).
+    #[tokio::test]
+    async fn turn_cleanup_guard_removes_the_entry_on_drop() {
+        let agent = test_agent().await;
+        let (token, _rx) = insert_fake_turn(&agent, "sess-1");
+
+        {
+            let _guard = TurnCleanup {
+                agent: agent.clone(),
+                session_id: "sess-1".to_string(),
+                turn_token: token,
+            };
+            // guard dropped here — the panic path in the turn task
+        }
+
+        assert!(agent.tasks.get("sess-1").is_none());
+    }
+
+    /// A guard for a *stale* token must not remove a newer turn's entry.
+    #[tokio::test]
+    async fn turn_cleanup_guard_ignores_a_replaced_entry() {
+        let agent = test_agent().await;
+        let (new_token, _rx) = insert_fake_turn(&agent, "sess-1");
+
+        drop(TurnCleanup {
+            agent: agent.clone(),
+            session_id: "sess-1".to_string(),
+            turn_token: Uuid::new_v4(), // stale token, not the registered one
+        });
+
+        let entry = agent.tasks.get("sess-1").expect("entry must survive");
+        assert_eq!(entry.0, new_token);
+    }
+
+    /// A finished-but-unremoved entry must not block the next turn forever —
+    /// `run_turn` treats it as replaceable.
+    #[tokio::test]
+    async fn run_turn_replaces_a_finished_entry() {
+        let agent = test_agent().await;
+        let token = Uuid::new_v4();
+        let (tx, _rx) = mpsc::unbounded_channel::<SSEEvent>();
+        agent.tasks.insert(
+            "no-such-session".to_string(),
+            (token, tokio::spawn(async {}), tx),
+        );
+        // Let the runtime run the empty task to completion.
+        for _ in 0..100 {
+            if agent.tasks.get("no-such-session").unwrap().1.is_finished() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(agent.tasks.get("no-such-session").unwrap().1.is_finished());
+
+        let (tx2, _rx2) = mpsc::unbounded_channel::<SSEEvent>();
+        let result = agent.run_turn("no-such-session".into(), "hi".into(), None, None, tx2);
+        assert!(result.is_ok(), "a finished entry must be replaceable: {result:?}");
     }
 
     /// The SSE channel must close once the turn is over.

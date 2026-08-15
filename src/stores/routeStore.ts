@@ -36,7 +36,9 @@ export type HubView = 'chat' | 'sessions' | 'settings' | 'wizard';
     into mid-conversation. */
 export const MOBILE_TABS: { view: HubView; label: string }[] = [
   { view: 'chat', label: 'Chat' },
-  { view: 'sessions', label: 'Chats' },
+  // "Saved Chats", not "Chats" — next to a tab literally called "Chat", the
+  // bare plural reads as the same place.
+  { view: 'sessions', label: 'Saved Chats' },
   { view: 'settings', label: 'Settings' },
 ];
 

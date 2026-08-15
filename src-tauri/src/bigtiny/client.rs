@@ -16,6 +16,15 @@ use crate::state::AppState;
 /// deadline instead, so long, actively-streaming turns are unaffected.
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Upper bound for the few non-stream calls that legitimately run *minutes*,
+/// not seconds: `POST /compact` (the daemon synchronously runs a full LLM
+/// summarization — slower still on a cold local-model load) and
+/// `GET …/history?limit=10000` (a giant resume payload on session reload).
+/// Long enough for a slow summarizer, but still bounded — a wedged daemon
+/// must not hang a caller forever either (the same reason the 10s default
+/// exists at all).
+const LONG_REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
+
 /// Cheap-to-clone handle to the running BigTiny daemon.
 #[derive(Clone)]
 pub struct BigTinyClient {
@@ -53,6 +62,15 @@ impl BigTinyClient {
         self.base_request(method, path)
     }
 
+    /// Like [`Self::request`], but with [`LONG_REQUEST_TIMEOUT`] — for
+    /// non-stream calls whose *normal* duration is minutes, not seconds
+    /// (manual compaction, large history fetches). Not an unbounded wait:
+    /// the daemon is still localhost and a truly wedged call must fail
+    /// eventually.
+    pub fn request_long(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
+        self.base_request(method, path).timeout(LONG_REQUEST_TIMEOUT)
+    }
+
     fn base_request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
         let mut req = self.http.request(method, format!("{}{path}", self.base));
         if let Some(secret) = &self.secret {
@@ -65,9 +83,25 @@ impl BigTinyClient {
         json_response(self.request(reqwest::Method::GET, path).send().await).await
     }
 
+    /// [`get_json`] through [`Self::request_long`], for the slow calls.
+    pub async fn get_json_long(&self, path: &str) -> Result<Value, String> {
+        json_response(self.request_long(reqwest::Method::GET, path).send().await).await
+    }
+
     pub async fn post_json(&self, path: &str, body: &Value) -> Result<Value, String> {
         json_response(
             self.request(reqwest::Method::POST, path)
+                .json(body)
+                .send()
+                .await,
+        )
+        .await
+    }
+
+    /// [`post_json`] through [`Self::request_long`], for the slow calls.
+    pub async fn post_json_long(&self, path: &str, body: &Value) -> Result<Value, String> {
+        json_response(
+            self.request_long(reqwest::Method::POST, path)
                 .json(body)
                 .send()
                 .await,

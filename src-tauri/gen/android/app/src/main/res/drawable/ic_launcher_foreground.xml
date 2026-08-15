@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Adaptive-icon foreground: the Kitty mark, traced from
+  `src-tauri/icons/kitty-source.svg` (the same source the Windows .ico and the
+  in-app `KittyIcon` component come from, so the three cannot drift).
+
+  A vector rather than the `mipmap-*/ic_launcher_foreground.png` set that
+  `tauri icon` generates, for one reason that matters: those PNGs draw the cat
+  edge-to-edge across the full 108dp canvas, but a launcher masks an adaptive
+  icon down to roughly the central 72dp and may scale further still for
+  animation. The generated foreground therefore loses both ear tips and the
+  end of the tail on a real device. Here the artwork is scaled into the ~66dp
+  safe zone instead, and being a vector it also costs ~1 KB rather than five
+  PNG densities.
+
+  Transform: the source artwork is in a 512x512 box whose ink actually spans
+  x 52..404, y 40..486 (the nominal box has slack on the left and top). That
+  446-unit tall bounding box is scaled by 0.148 to 66dp and its centre
+  (228, 263) is translated onto the canvas centre (54, 54). A group transform
+  with the default 0,0 pivot maps p -> p * scale + translate, which is exactly
+  that. Change the paths and you must re-derive these numbers.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <group
+        android:scaleX="0.148"
+        android:scaleY="0.148"
+        android:translateX="20.26"
+        android:translateY="15.08">
+        <!-- Tail: a low crescent sweeping from the seated rear to the left. -->
+        <path
+            android:fillColor="#111111"
+            android:pathData="M330,400C300,452 190,486 104,474C58,468 52,430 92,434C96,410 118,404 140,420C200,452 286,442 322,388C336,392 340,388 330,400Z" />
+        <!-- Sitting body, blending up into the head. -->
+        <path
+            android:fillColor="#111111"
+            android:pathData="M322,128C384,140 404,236 396,322C389,398 352,448 288,448C230,448 198,402 200,338C204,232 226,152 276,134C290,129 306,127 322,128Z" />
+        <!-- Head. A circle, written as two arcs: <vector> has no <circle>. -->
+        <path
+            android:fillColor="#111111"
+            android:pathData="M248,146a74,74 0 1,0 148,0a74,74 0 1,0 -148,0Z" />
+        <!-- Ears. -->
+        <path
+            android:fillColor="#111111"
+            android:pathData="M266,122L250,44L324,98Z" />
+        <path
+            android:fillColor="#111111"
+            android:pathData="M378,116L398,40L330,90Z" />
+    </group>
+</vector>

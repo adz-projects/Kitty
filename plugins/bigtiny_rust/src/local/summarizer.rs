@@ -128,15 +128,30 @@ fn generate_to_string(
     }
     let budget = MAX_TOKENS.min(room);
 
-    let mut batch = LlamaBatch::new(tokens.len().max(512), 1);
-    let last = tokens.len() as i32 - 1;
-    for (i, t) in (0i32..).zip(tokens.iter().copied()) {
-        batch
-            .add(t, i, &[0], i == last)
-            .map_err(|e| format!("batch add failed: {e}"))?;
+    // Prefill in `n_batch`-sized chunks. Submitting the whole prompt in one
+    // batch works only while it fits: llama.cpp rejects (and on some builds
+    // *aborts the process* on) a batch larger than the context's `n_batch`,
+    // and a summarization prompt (existing memory slots plus a history chunk)
+    // is routinely several times the 512-token default. This mirrors the chat
+    // provider's prefill (`local::provider`); the two hand-rolled copies are
+    // why S1 flags extracting a shared helper.
+    let prompt_len = tokens.len() as i32;
+    let n_batch = (ctx.n_batch() as usize).max(1);
+    let mut batch = LlamaBatch::new(n_batch.min(tokens.len()).max(1), 1);
+    let last = tokens.len() - 1;
+    for (chunk_start, chunk) in tokens.chunks(n_batch).enumerate().map(|(i, c)| (i * n_batch, c)) {
+        batch.clear();
+        for (offset, token) in chunk.iter().copied().enumerate() {
+            let pos = chunk_start + offset;
+            // Logits are only needed for the final prompt token — the one the
+            // first sample below reads.
+            batch
+                .add(token, pos as i32, &[0], pos == last)
+                .map_err(|e| format!("batch add failed: {e}"))?;
+        }
+        ctx.decode(&mut batch)
+            .map_err(|e| format!("prompt decode failed: {e}"))?;
     }
-    ctx.decode(&mut batch)
-        .map_err(|e| format!("prompt decode failed: {e}"))?;
 
     let mut stages = Vec::new();
     if temperature <= 0.0 {
@@ -149,10 +164,12 @@ fn generate_to_string(
 
     let mut decoder = encoding_rs::UTF_8.new_decoder();
     let mut out = String::new();
-    // `n_cur` is the KV-cache position, which happens to advance in lockstep
-    // with the step count — it starts *after* the prompt, hence the zip
-    // rather than a bare range.
-    for (n_cur, _step) in (batch.n_tokens()..).zip(0..budget) {
+    // `n_cur` is the KV-cache position; it starts *after* the whole prompt
+    // (`prompt_len`), not `batch.n_tokens()` — after chunked prefill `batch`
+    // holds only the final chunk. The first sample still reads the last
+    // prompt token's logits, which is `batch.n_tokens() - 1` (that token sits
+    // at the end of the final prefill chunk still in `batch`).
+    for (n_cur, _step) in (prompt_len..).zip(0..budget) {
         let token = sampler.sample(&ctx, batch.n_tokens() - 1);
         sampler.accept(token);
         if model.is_eog_token(token) {

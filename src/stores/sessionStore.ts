@@ -69,6 +69,9 @@ export const useSessionStore = create<SessionState>((set, get) => ({
 
   remove: async (sessionId: string) => {
     const cwd = get().sessions.find((s) => s.sessionId === sessionId)?.cwd;
+    // Clear any previous failure first, so a retry that succeeds doesn't leave
+    // the old message sitting above a list that's now correct.
+    set({ loadError: null });
     try {
       await ipc.deleteSession(sessionId, cwd);
     } catch (e) {
@@ -88,7 +91,16 @@ export const useSessionStore = create<SessionState>((set, get) => ({
   rename: async (sessionId: string, title: string) => {
     const trimmed = title.trim();
     if (!trimmed) return;
-    await ipc.renameSession(sessionId, trimmed);
+    // Same treatment as refresh/remove: callers fire these via `void`, so an
+    // uncaught IPC failure is a silent unhandled rejection — surface it in
+    // `loadError` (rendered above the list) instead.
+    set({ loadError: null });
+    try {
+      await ipc.renameSession(sessionId, trimmed);
+    } catch (e) {
+      set({ loadError: e instanceof Error ? e.message : String(e) });
+      return;
+    }
     set((s) => ({
       sessions: s.sessions.map((x) => (x.sessionId === sessionId ? { ...x, title: trimmed } : x)),
     }));
@@ -115,19 +127,43 @@ export const useSessionStore = create<SessionState>((set, get) => ({
   },
 
   createFolder: async (name: string) => {
-    await ipc.createFolder(name);
+    set({ loadError: null });
+    try {
+      await ipc.createFolder(name);
+    } catch (e) {
+      set({ loadError: e instanceof Error ? e.message : String(e) });
+      return;
+    }
     await get().refreshFolders();
   },
   renameFolder: async (oldName: string, newName: string) => {
-    await ipc.renameFolder(oldName, newName);
+    set({ loadError: null });
+    try {
+      await ipc.renameFolder(oldName, newName);
+    } catch (e) {
+      set({ loadError: e instanceof Error ? e.message : String(e) });
+      return;
+    }
     await get().refreshFolders();
   },
   deleteFolder: async (name: string) => {
-    await ipc.deleteFolder(name);
+    set({ loadError: null });
+    try {
+      await ipc.deleteFolder(name);
+    } catch (e) {
+      set({ loadError: e instanceof Error ? e.message : String(e) });
+      return;
+    }
     await get().refreshFolders();
   },
   assignFolder: async (sessionId: string, folder: string | null) => {
-    await ipc.assignSessionFolder(sessionId, folder);
+    set({ loadError: null });
+    try {
+      await ipc.assignSessionFolder(sessionId, folder);
+    } catch (e) {
+      set({ loadError: e instanceof Error ? e.message : String(e) });
+      return;
+    }
     await get().refreshFolders();
   },
 

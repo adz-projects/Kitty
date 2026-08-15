@@ -103,6 +103,10 @@ export function AdaptivePathway() {
       await ipc.setAdaptivePathwayEnabled(next);
       loadMcpStatus();
     } catch (e) {
+      // Revert the optimistic flip — the config flag never changed, so the
+      // checkbox must not claim otherwise (same pattern as
+      // AdaptivePathwayToggle's paused toggle).
+      setEnabled(!next);
       setError(String(e));
     } finally {
       setBusy(false);

@@ -770,11 +770,19 @@ async fn brave_query(
                 tokio::time::sleep(Duration::from_secs_f64(delay)).await;
                 continue;
             }
-            let body = response.text().await.unwrap_or_default();
+            let body = read_error_body(response).await;
             return Err(BraveFailure::RateLimitExhausted(body));
         }
 
-        let body = response.text().await.unwrap_or_default();
+        let body = match crate::scrape::read_body_capped(response, crate::scrape::SCRAPE_MAX_BODY_BYTES).await {
+            Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+            Err(crate::scrape::BodyReadError::TooLarge) => {
+                return Err(BraveFailure::Api("response body exceeded the download cap".into()));
+            }
+            Err(crate::scrape::BodyReadError::Network(e)) => {
+                return Err(BraveFailure::Network(e.to_string()));
+            }
+        };
         if status.as_u16() == 400 || status.as_u16() == 422 {
             return Err(BraveFailure::InvalidQuery(body));
         }
@@ -791,6 +799,19 @@ async fn brave_query(
     }
 
     Err(BraveFailure::RateLimitExhausted("retries exhausted".into()))
+}
+
+/// Reads an error/status body (rate-limit, auth, API-error details) with
+/// the same hard cap as real payloads — an error response is still a
+/// model-influenced byte stream (audit #112). Oversize bodies degrade to a
+/// placeholder rather than a failure, since the status code already carries
+/// the outcome.
+async fn read_error_body(response: reqwest::Response) -> String {
+    match crate::scrape::read_body_capped(response, crate::scrape::SCRAPE_MAX_BODY_BYTES).await {
+        Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+        Err(crate::scrape::BodyReadError::TooLarge) => "[body exceeded the download cap]".to_string(),
+        Err(crate::scrape::BodyReadError::Network(_)) => String::new(),
+    }
 }
 
 /// Single-shot DuckDuckGo search, no retry — matching the Python original's
@@ -811,7 +832,13 @@ async fn ddg_query(query: &str, count: usize) -> Result<Vec<SearchItem>, String>
     if !response.status().is_success() {
         return Err(format!("HTTP {}", response.status()));
     }
-    let html = response.text().await.map_err(|e| e.to_string())?;
+    let html = match crate::scrape::read_body_capped(response, crate::scrape::SCRAPE_MAX_BODY_BYTES).await {
+        Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+        Err(crate::scrape::BodyReadError::TooLarge) => {
+            return Err("response body exceeded the download cap".to_string());
+        }
+        Err(crate::scrape::BodyReadError::Network(e)) => return Err(e.to_string()),
+    };
     Ok(parse_ddg_html(&html, capped))
 }
 

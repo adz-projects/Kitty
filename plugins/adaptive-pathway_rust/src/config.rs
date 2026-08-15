@@ -213,8 +213,35 @@ impl Default for Config {
 
 impl Config {
     pub fn from_json(s: &str) -> crate::error::Result<Self> {
-        serde_json::from_str(s)
-            .map_err(|e| crate::error::PathwayError::Config(e.to_string()))
+        let cfg: Self = serde_json::from_str(s)
+            .map_err(|e| crate::error::PathwayError::Config(e.to_string()))?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// Rejects values the math downstream cannot survive (audit #122):
+    /// `embedding_dim = 0` panics `hash_embed`/`project` (`rem_euclid(0)`,
+    /// `i % dim`) and `novelty.hash_size = 0` panics the count-min sketch
+    /// the same way — both on the in-process recall path, where a panic is
+    /// a daemon crash, not a tool error. Better to refuse the config at
+    /// load with a message that names the key.
+    pub fn validate(&self) -> crate::error::Result<()> {
+        if self.embedding_dim == 0 {
+            return Err(crate::error::PathwayError::Config(
+                "embedding_dim must be >= 1".into(),
+            ));
+        }
+        if self.novelty.hash_size == 0 {
+            return Err(crate::error::PathwayError::Config(
+                "novelty.hash_size must be >= 1".into(),
+            ));
+        }
+        if self.novelty.n_hash_tables == 0 {
+            return Err(crate::error::PathwayError::Config(
+                "novelty.n_hash_tables must be >= 1".into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -305,4 +332,33 @@ fn default_trajectory_enabled() -> bool {
 }
 fn default_trajectory_momentum() -> f64 {
     0.35
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_json_rejects_zero_embedding_dim() {
+        // Audit #122: `embedding_dim = 0` panicked `hash_embed`/`project`
+        // (`rem_euclid(0)`, `i % dim`) on the in-process recall path.
+        let err = Config::from_json(r#"{"embedding_dim": 0}"#).unwrap_err();
+        assert!(err.to_string().contains("embedding_dim"), "{err}");
+    }
+
+    #[test]
+    fn from_json_rejects_zero_novelty_dims() {
+        let err = Config::from_json(r#"{"novelty": {"hash_size": 0}}"#).unwrap_err();
+        assert!(err.to_string().contains("hash_size"), "{err}");
+        let err = Config::from_json(r#"{"novelty": {"n_hash_tables": 0}}"#).unwrap_err();
+        assert!(err.to_string().contains("n_hash_tables"), "{err}");
+    }
+
+    #[test]
+    fn from_json_accepts_defaults_and_valid_values() {
+        assert!(Config::from_json("{}").is_ok());
+        let cfg = Config::from_json(r#"{"embedding_dim": 768, "novelty": {"hash_size": 1024}}"#).unwrap();
+        assert_eq!(cfg.embedding_dim, 768);
+        assert_eq!(cfg.novelty.hash_size, 1024);
+    }
 }

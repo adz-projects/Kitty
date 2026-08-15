@@ -191,6 +191,38 @@ mod tests {
     }
 
     #[test]
+    fn hostile_labels_cannot_inject_markup() {
+        // Audit #132: the rendered SVG is interpolated verbatim into the
+        // standalone wrapper, whose CSP allows inline scripts inside an
+        // `allow-scripts` iframe — so a label that breaks out as live markup
+        // would execute. The render pipeline must escape label text (or the
+        // source must be rejected outright).
+        let mut rendered = 0;
+        for source in [
+            "flowchart TD\nA[\"<script>alert(1)</script>\"]-->B",
+            "flowchart TD\nA[\"<img src=x onerror=alert(1)>\"]-->B",
+            "flowchart TD\nA[\"</title><script>alert(1)</script>\"]-->B",
+        ] {
+            let out = generate_accessible_mermaid(source, "T", "D");
+            let v: Value = serde_json::from_str(&out).unwrap();
+            if v["status"] == "error" {
+                continue; // rejected outright is also safe
+            }
+            rendered += 1;
+            let html = v["html_payload"].as_str().unwrap();
+            assert!(
+                !html.contains("<script>alert(1)</script>"),
+                "label script tag survived verbatim: {html}"
+            );
+            assert!(!html.contains("onerror"), "event handler survived: {html}");
+            assert!(!html.contains("<img"), "raw img tag survived: {html}");
+        }
+        // The test is meaningless if every source happened to fail rendering
+        // — at least one hostile label must reach the SVG pipeline.
+        assert!(rendered > 0, "no hostile label was actually rendered");
+    }
+
+    #[test]
     fn viewbox_width_is_parsed() {
         assert_eq!(svg_viewbox_width(r#"<svg viewBox="0 0 85 174">"#), Some(85.0));
         assert_eq!(svg_viewbox_width(r#"<svg viewBox="10 -5 300 200">"#), Some(300.0));

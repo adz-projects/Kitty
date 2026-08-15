@@ -66,8 +66,15 @@ pub fn file_read(path: &str, start_line: Option<i64>, end_line: Option<i64>, que
         );
     }
 
+    // Line numbers are 1-based; anything below 1 is not a line number.
+    // `end_line < 1` used to wrap through `as usize` into ~2^64 (silently
+    // reading to EOF), and `start_line = i64::MAX` overflowed the window add
+    // (audit #123) — both are clamped/saturated here instead.
     let start_line = start_line.unwrap_or(1).max(1) as usize;
-    let window_end = end_line.map(|e| e as usize).unwrap_or(start_line + FILE_PAGE_SIZE - 1);
+    let window_end = end_line
+        .filter(|e| *e >= 1)
+        .and_then(|e| usize::try_from(e).ok())
+        .unwrap_or_else(|| start_line.saturating_add(FILE_PAGE_SIZE - 1));
     let actual_end = window_end.min(total_lines);
 
     let page: Vec<String> = if start_line <= actual_end && start_line <= total_lines {
@@ -265,9 +272,15 @@ pub fn file_replace_lines(path: &str, start_line: i64, end_line: i64, new_conten
     let removed = actual_end - start_idx + 1;
     lines.splice(start_idx - 1..actual_end, new_lines.iter().cloned());
 
-    let mut out = lines.join("\n");
-    if !lines.is_empty() {
-        out.push('\n');
+    // Preserve the file's own EOL style and trailing-newline state (audit
+    // #128): joining with "\n" used to convert CRLF files to LF and force a
+    // trailing newline onto files that didn't have one — a whole-file
+    // mangling for a two-line edit.
+    let eol = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let had_trailing_newline = text.ends_with('\n') || text.ends_with('\r');
+    let mut out = lines.join(eol);
+    if had_trailing_newline && !lines.is_empty() {
+        out.push_str(eol);
     }
     if let Err(e) = std::fs::write(&resolved, out) {
         return error_response("FILE_WRITE_ERROR", &format!("Cannot write file: {e}"), None, None);
@@ -335,7 +348,58 @@ mod tests {
         file_write(f.to_str().unwrap(), "a\nb\nc\nd", false);
         file_replace_lines(f.to_str().unwrap(), 2, 3, "X\nY\nZ", false);
         let text = fs::read_to_string(&f).unwrap();
-        assert_eq!(text, "a\nX\nY\nZ\nd\n");
+        // The source file had no trailing newline, so the rewrite must not
+        // grow one (audit #128).
+        assert_eq!(text, "a\nX\nY\nZ\nd");
+        fs::remove_dir_all(f.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn replace_lines_preserves_crlf_and_trailing_newline_state() {
+        // CRLF + trailing newline: both preserved (audit #128 — the old
+        // join("\n") converted the whole file to LF).
+        let f = tmp("crlf");
+        fs::write(&f, "a\r\nb\r\nc\r\n").unwrap();
+        file_replace_lines(f.to_str().unwrap(), 2, 2, "X", false);
+        assert_eq!(fs::read_to_string(&f).unwrap(), "a\r\nX\r\nc\r\n");
+        fs::remove_dir_all(f.parent().unwrap()).ok();
+
+        // LF with trailing newline: preserved too.
+        let f = tmp("lf-trail");
+        fs::write(&f, "a\nb\n").unwrap();
+        file_replace_lines(f.to_str().unwrap(), 1, 1, "X", false);
+        assert_eq!(fs::read_to_string(&f).unwrap(), "X\nb\n");
+        fs::remove_dir_all(f.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn read_with_extreme_line_numbers_does_not_wrap_or_panic() {
+        // Audit #123: `end_line = -1` wrapped through `as usize` to ~2^64
+        // (silently reading to EOF); `start_line = i64::MAX` overflowed the
+        // window add. Both must behave sanely now.
+        let f = tmp("extreme");
+        file_write(f.to_str().unwrap(), "one\ntwo\nthree", false);
+
+        // end_line < 1 is not a line number: treated as "no end given",
+        // i.e. the default window from start_line.
+        let s = file_read(f.to_str().unwrap(), Some(2), Some(-1), None);
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["status"], "success");
+        assert_eq!(v["metadata"]["start_line"], 2);
+        assert_eq!(v["metadata"]["end_line"], 3);
+        assert!(v["data"].as_str().unwrap().contains("2: two"));
+
+        // A start past EOF yields an empty page, not an overflow.
+        let s = file_read(f.to_str().unwrap(), Some(i64::MAX), None, None);
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["status"], "success");
+        assert_eq!(v["data"].as_str().unwrap(), "");
+        assert_eq!(v["metadata"]["total_lines"], 3);
+
+        let s = file_read(f.to_str().unwrap(), Some(1), Some(i64::MAX), None);
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["metadata"]["end_line"], 3);
+
         fs::remove_dir_all(f.parent().unwrap()).ok();
     }
 

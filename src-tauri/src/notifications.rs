@@ -114,14 +114,21 @@ fn emit_notification(app: &AppHandle, title: &str, body: &str, session_id: Optio
     let sid_owned = session_id.map(|s| s.to_string());
     match n.show() {
         Ok(handle) => {
-            // One dedicated worker thread services every toast's response
-            // wait (a blocking OS call). Bursts of toasts queue on it instead
-            // of spawning an unbounded number of threads.
+            // One thread per toast's response wait. `wait_for_response`
+            // blocks until the toast is clicked or dismissed, and
+            // notify-rust 4.x offers no timeout/try variant of it (it parks
+            // on a channel `recv()`), so the previous single shared worker
+            // could be stalled indefinitely by one unclicked toast — every
+            // later toast's click-focus handling queued behind it and
+            // starved. A parked wait now strands only its own thread; in
+            // practice these threads are short-lived (Windows fires
+            // Dismissed when a toast times out into the Action Center), and
+            // `MAX_CLICK_TRACKER_THREADS` caps the pathological pile-up.
             let app2 = app.clone();
             let label = target_label;
             let sid = sid_owned;
             // The boxed closure captures the platform-specific handle, so the
-            // concrete (not-reexported) handle type stays out of `ToastJob`.
+            // concrete (not-reexported) handle type stays local to this fn.
             let wait = move || {
                 let _ = handle.wait_for_response(
                     move |response: &notify_rust::NotificationResponse| {
@@ -156,14 +163,7 @@ fn emit_notification(app: &AppHandle, title: &str, body: &str, session_id: Optio
                     },
                 );
             };
-            let job = ToastJob {
-                run: Box::new(wait),
-            };
-            if let Err(e) = toast_worker_sender().send(job) {
-                // Only fails if the worker died — the toast still shows, it
-                // just isn't click-focusable.
-                tracing::warn!("notification click worker unavailable: {e}");
-            }
+            spawn_click_tracker(wait);
         }
         Err(e) => tracing::warn!("notification failed: {e}"),
     }
@@ -176,7 +176,16 @@ fn emit_notification(app: &AppHandle, title: &str, body: &str, session_id: Optio
 /// here — the plugin's `show()` discards the handle, which is exactly why
 /// Windows doesn't use it. So this arm posts the toast and stops there;
 /// tapping it just opens the app, which is the platform norm anyway.
-#[cfg(not(windows))]
+/// Android posts nothing for now: the plugin that would do it is not
+/// registered there because its `onNewIntent` handler force-closes the app
+/// (see `lib.rs`). Silent rather than an error — a missing toast is a
+/// degradation, and every caller here is already best-effort.
+#[cfg(target_os = "android")]
+fn emit_notification(_app: &AppHandle, title: &str, _body: &str, _session_id: Option<&str>) {
+    tracing::debug!(title, "notification suppressed: no notification backend on Android yet");
+}
+
+#[cfg(all(not(windows), not(target_os = "android")))]
 fn emit_notification(app: &AppHandle, title: &str, body: &str, _session_id: Option<&str>) {
     use tauri_plugin_notification::NotificationExt;
     if let Err(e) = app
@@ -190,35 +199,41 @@ fn emit_notification(app: &AppHandle, title: &str, body: &str, _session_id: Opti
     }
 }
 
-/// A toast whose click-detection wait still needs servicing, delivered to the
-/// single notification worker (`toast_worker_sender`).
+/// Upper bound on simultaneously-live click-tracking threads. Each live
+/// toast parks one thread in `wait_for_response` until the toast is answered
+/// or dismissed (notify-rust has no timeout variant of that call — see the
+/// note at the spawn site in `emit_notification`), so an unclicked toast
+/// only ever strands its *own* thread, never a shared queue. The cap bounds
+/// total thread residency when toasts pile up unanswered; past it a toast
+/// still displays, it just isn't click-focusable.
 #[cfg(windows)]
-struct ToastJob {
-    run: Box<dyn FnOnce() + Send>,
-}
+const MAX_CLICK_TRACKER_THREADS: usize = 16;
 
 #[cfg(windows)]
-fn toast_worker_sender() -> std::sync::mpsc::Sender<ToastJob> {
-    use std::sync::{Mutex, OnceLock};
-    // A static rather than app state: a toast's wait can outlive the command
-    // that fired it, and notifications.rs keeps no other pre-existing state.
-    static WORKER: OnceLock<Mutex<Option<std::sync::mpsc::Sender<ToastJob>>>> = OnceLock::new();
-    let mut guard = WORKER.get_or_init(|| Mutex::new(None)).lock().unwrap();
-    if let Some(sender) = guard.as_ref() {
-        return sender.clone();
+static LIVE_CLICK_TRACKERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Run `wait` (one toast's response wait) on its own short-lived thread,
+/// subject to [`MAX_CLICK_TRACKER_THREADS`]. Best-effort: when the cap is
+/// reached the toast still shows — it just doesn't focus a window on click.
+#[cfg(windows)]
+fn spawn_click_tracker(wait: impl FnOnce() + Send + 'static) {
+    use std::sync::atomic::Ordering;
+    let admitted = LIVE_CLICK_TRACKERS
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+            (n < MAX_CLICK_TRACKER_THREADS).then_some(n + 1)
+        })
+        .is_ok();
+    if !admitted {
+        tracing::warn!(
+            "too many unclicked toasts already awaiting a click ({MAX_CLICK_TRACKER_THREADS}); \
+             this toast will show without click-to-focus"
+        );
+        return;
     }
-    let (sender, receiver): (
-        std::sync::mpsc::Sender<ToastJob>,
-        std::sync::mpsc::Receiver<ToastJob>,
-    ) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        // One worker services every toast's response wait, sequentially.
-        while let Ok(job) = receiver.recv() {
-            (job.run)();
-        }
+        wait();
+        LIVE_CLICK_TRACKERS.fetch_sub(1, Ordering::SeqCst);
     });
-    *guard = Some(sender.clone());
-    sender
 }
 
 /// Reflect a pending approval / running task in the tray tooltip.

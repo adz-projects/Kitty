@@ -80,13 +80,22 @@ fn to_public_json(row: &providers::ProviderRow) -> Value {
     let mut json = serde_json::to_value(row).unwrap_or_else(|_| json!({}));
     let mut has_api_key = false;
     if let Some(config_str) = row.config.as_deref() {
-        if let Ok(mut config_val) = serde_json::from_str::<Value>(config_str) {
-            if let Some(obj) = config_val.as_object_mut() {
-                if let Some(Value::String(key)) = obj.remove("api_key") {
-                    has_api_key = !key.is_empty();
+        match serde_json::from_str::<Value>(config_str) {
+            Ok(mut config_val) => {
+                if let Some(obj) = config_val.as_object_mut() {
+                    if let Some(Value::String(key)) = obj.remove("api_key") {
+                        has_api_key = !key.is_empty();
+                    }
                 }
+                json["config"] = Value::String(config_val.to_string());
             }
-            json["config"] = Value::String(config_val.to_string());
+            // An unparseable blob (e.g. a legacy plaintext `api_key` sitting
+            // where JSON should be) must NOT be echoed verbatim — redaction
+            // only happens on a successful parse, so substitute an empty
+            // object and report no key rather than leak the raw contents.
+            Err(_) => {
+                json["config"] = Value::String("{}".to_string());
+            }
         }
     }
     if let Some(obj) = json.as_object_mut() {
@@ -120,24 +129,39 @@ pub async fn create_provider(
         );
     };
 
-    let id = uuid::Uuid::new_v4().to_string();
-    let row = match providers::create_provider(&state.db, &id, name, provider_type, base_url).await
-    {
-        Ok(r) => r,
-        Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-    };
+    // A client may pin the row's id (Kitty passes its own provider-profile id
+    // so the session `metadata.provider` stamp resolves against this registry —
+    // otherwise the daemon-generated UUID never matches the client's id and the
+    // session silently falls back to another provider). Absent = generate one.
+    let id = body
+        .get("id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
     let config = merge_config(None, &body);
     let fallback_priority = body.get("fallback_priority").and_then(|v| v.as_i64());
-    // INSERT + config-UPDATE together, atomically: a create that failed on the
-    // second statement used to leave a half-created provider row with no
-    // config (and no cleanup) before returning 500.
+    // INSERT + config-UPDATE together in one `BEGIN IMMEDIATE` transaction
+    // (the same shape as `mcp::create_server`): the INSERT used to commit on
+    // its own first, so a failed config write left a config-less row visible
+    // to health checks, with only a `let _ =`-swallowed compensating DELETE
+    // for cleanup.
     let mut conn = match state.db.acquire().await {
         Ok(c) => c,
         Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
     let result = async {
         let mut tx = conn.begin_with("BEGIN IMMEDIATE").await?;
+        sqlx::query(
+            r#"INSERT INTO providers (id, name, provider_type, base_url) VALUES (?, ?, ?, ?)"#,
+        )
+        .bind(&id)
+        .bind(name)
+        .bind(provider_type)
+        .bind(base_url)
+        .execute(&mut *tx)
+        .await?;
         sqlx::query(
             r#"UPDATE providers SET config = ?1, fallback_priority = COALESCE(?2, fallback_priority) WHERE id = ?3"#,
         )
@@ -151,21 +175,30 @@ pub async fn create_provider(
     }
     .await;
     if let Err(e) = result {
-        // Was `let _ = ...` — a swallowed failure left a provider row with no
-        // config (no API key/model), then re-registered into the router as if
-        // everything had been saved.
-        let _ = sqlx::query("DELETE FROM providers WHERE id = ?")
-            .bind(&id)
-            .execute(&state.db)
-            .await;
+        // A pinned-id create that names an already-taken id is the caller's
+        // conflict, not a server fault — Kitty does GET-then-POST from
+        // `sync_active_provider`, which races itself into exactly this, and a
+        // raw UNIQUE-constraint 500 reads as "daemon broken" when it isn't.
+        if let sqlx::Error::Database(db_err) = &e {
+            if db_err.is_unique_violation() {
+                return err_response(
+                    StatusCode::CONFLICT,
+                    format!("provider id already exists: {id}"),
+                );
+            }
+        }
         return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
     }
 
-    let Ok(Some(row)) = providers::get_provider(&state.db, &row.id).await else {
-        return err_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "failed to reload provider after create",
-        );
+    let row = match providers::get_provider(&state.db, &id).await {
+        Ok(Some(row)) => row,
+        Ok(None) => {
+            return err_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to reload provider after create",
+            )
+        }
+        Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
     state.router.register_from_row(&row);
 
@@ -233,9 +266,14 @@ pub async fn delete_provider(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Response {
-    state.router.unregister(&id);
+    // Delete the row FIRST, unregister from the router only on success — the
+    // old order (unregister, then delete) left the router and the DB
+    // diverged until restart when the delete failed.
     match providers::delete_provider(&state.db, &id).await {
-        Ok(_) => Json(json!({"ok": true})).into_response(),
+        Ok(_) => {
+            state.router.unregister(&id);
+            Json(json!({"ok": true})).into_response()
+        }
         Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
@@ -298,5 +336,29 @@ mod tests {
         let merged: Value = serde_json::from_str(&merge_config(Some(&existing), &body)).unwrap();
         assert!(merged.get("api_key").is_none());
         assert_eq!(merged["model"], "gpt-4o");
+    }
+
+    /// Regression (815bugs #105): a provider row whose stored `config` blob
+    /// doesn't parse as JSON (e.g. a legacy plaintext key) must not be echoed
+    /// back verbatim — redaction only runs on a successful parse, so the raw
+    /// blob used to leak straight into the HTTP response.
+    #[test]
+    fn to_public_json_substitutes_an_empty_object_for_an_unparseable_config() {
+        let row = providers::ProviderRow {
+            id: "p1".into(),
+            name: "legacy".into(),
+            provider_type: "openai_compat".into(),
+            base_url: "http://127.0.0.1:1".into(),
+            fallback_priority: 1,
+            config: Some("sk-plaintext-not-json".into()),
+            status: "disconnected".into(),
+            error_message: None,
+            created_at: None,
+            updated_at: None,
+        };
+        let public = to_public_json(&row);
+        assert_eq!(public["config"], json!("{}"));
+        assert_eq!(public["has_api_key"], false);
+        assert!(!public.to_string().contains("sk-plaintext-not-json"));
     }
 }

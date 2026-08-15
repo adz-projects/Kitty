@@ -24,7 +24,10 @@ export function ApprovalPrompt({
   onRespond,
 }: {
   request: ApprovalNeededEvent;
-  onRespond: (toolCallId: string, optionId: string | null) => void;
+  /** Resolves false when the decision never reached the backend — the prompt
+      then unlatches so the user can retry (the store keeps the entry queued
+      on failure, so the turn isn't silently hung behind a dead prompt). */
+  onRespond: (toolCallId: string, optionId: string | null) => Promise<boolean>;
 }) {
   const title = request.tool_call?.title ?? 'a tool';
   const preview = previewInput(request.tool_call?.rawInput);
@@ -35,7 +38,9 @@ export function ApprovalPrompt({
   const respond = (optionId: string | null) => {
     if (submitted) return;
     setSubmitted(true);
-    onRespond(request.tool_call_id, optionId);
+    void onRespond(request.tool_call_id, optionId).then((ok) => {
+      if (!ok) setSubmitted(false);
+    });
   };
   const pick = (id: string) => respond(id);
 

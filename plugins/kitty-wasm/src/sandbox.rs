@@ -346,7 +346,15 @@ pub fn load_module_cached(path: &Path, cache_dir: &Path) -> Result<Module> {
         if let Ok(serialized) = module.serialize() {
             // Write-then-rename so a concurrent reader never sees a partial
             // file (two tool calls can race to warm the same cache entry).
-            let tmp = cached.with_extension(format!("cwasm.tmp{}", std::process::id()));
+            // The tmp name takes a per-process counter on top of the pid
+            // (audit #127): pid alone collided for concurrent *in-process*
+            // compiles of the same module, which could interleave writes
+            // into one tmp file before the rename.
+            let tmp = cached.with_extension(format!(
+                "cwasm.tmp{}-{}",
+                std::process::id(),
+                TMP_NAME_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
             if std::fs::write(&tmp, &serialized).is_ok() && std::fs::rename(&tmp, &cached).is_err()
             {
                 let _ = std::fs::remove_file(&tmp);
@@ -356,6 +364,10 @@ pub fn load_module_cached(path: &Path, cache_dir: &Path) -> Result<Module> {
 
     Ok(module)
 }
+
+/// Per-process sequence for compile-cache tmp names — see
+/// `load_module_cached`.
+static TMP_NAME_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(test)]
 mod tests {

@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { createPortal } from 'react-dom';
 import type { Message } from '@/stores/chatStore';
 import { usePopoverPosition } from '@/lib/usePopoverPosition';
 
@@ -53,58 +54,69 @@ export function MessageInfo({ message }: { message: Message }) {
       >
         ⓘ
       </button>
-      {open && (
-        <div
-          ref={popoverRef}
-          className="mode-popover msg-info-popover"
-          role="tooltip"
-          style={style}
-        >
-          {message.model && (
-            <div>
-              <span className="muted">Model:</span> {message.model}
-            </div>
-          )}
-          {message.providerName && (
-            <div>
-              <span className="muted">Provider:</span> {message.providerName}
-            </div>
-          )}
-          {message.durationMs != null && (
-            <div>
-              <span className="muted">Time:</span> {(message.durationMs / 1000).toFixed(1)}s
-            </div>
-          )}
-          {message.inputTokens != null && message.outputTokens != null && (
-            <div>
-              <span className="muted">Tokens:</span> {message.inputTokens} in →{' '}
-              {message.outputTokens} out
-            </div>
-          )}
-          {(message.cacheReadTokens != null || message.cacheCreationTokens != null) && (
-            <div>
-              <span className="muted">Prompt cache:</span> {formatCacheHitRate(message)}
-            </div>
-          )}
-          {message.ttftMs != null && (
-            <div>
-              <span className="muted">Time to first token:</span>{' '}
-              {(message.ttftMs / 1000).toFixed(2)}s
-            </div>
-          )}
-          {message.ttftMs != null &&
-            message.durationMs != null &&
-            message.outputTokens != null &&
-            message.outputTokens > 0 &&
-            message.durationMs > message.ttftMs && (
+      {open &&
+        // Portaled to document.body: inside the virtualized message list each
+        // row carries a `transform` (translateY), which becomes the containing
+        // block for `position: fixed` descendants — the popover's
+        // viewport-relative coordinates would resolve against the ROW instead,
+        // landing it off-screen past the virtualization threshold. The portal
+        // escapes the transformed ancestor entirely; usePopoverPosition's
+        // outside-click handling still works since it refs the portaled node.
+        createPortal(
+          <div
+            ref={popoverRef}
+            className="mode-popover msg-info-popover"
+            role="tooltip"
+            style={style}
+          >
+            {message.model && (
               <div>
-                <span className="muted">Generation speed:</span>{' '}
-                {((message.outputTokens / (message.durationMs - message.ttftMs)) * 1000).toFixed(1)}{' '}
-                tok/s
+                <span className="muted">Model:</span> {message.model}
               </div>
             )}
-        </div>
-      )}
+            {message.providerName && (
+              <div>
+                <span className="muted">Provider:</span> {message.providerName}
+              </div>
+            )}
+            {message.durationMs != null && (
+              <div>
+                <span className="muted">Time:</span> {(message.durationMs / 1000).toFixed(1)}s
+              </div>
+            )}
+            {message.inputTokens != null && message.outputTokens != null && (
+              <div>
+                <span className="muted">Tokens:</span> {message.inputTokens} in →{' '}
+                {message.outputTokens} out
+              </div>
+            )}
+            {(message.cacheReadTokens != null || message.cacheCreationTokens != null) && (
+              <div>
+                <span className="muted">Prompt cache:</span> {formatCacheHitRate(message)}
+              </div>
+            )}
+            {message.ttftMs != null && (
+              <div>
+                <span className="muted">Time to first token:</span>{' '}
+                {(message.ttftMs / 1000).toFixed(2)}s
+              </div>
+            )}
+            {message.ttftMs != null &&
+              message.durationMs != null &&
+              message.outputTokens != null &&
+              message.outputTokens > 0 &&
+              message.durationMs > message.ttftMs && (
+                <div>
+                  <span className="muted">Generation speed:</span>{' '}
+                  {((message.outputTokens / (message.durationMs - message.ttftMs)) * 1000).toFixed(
+                    1
+                  )}{' '}
+                  tok/s
+                </div>
+              )}
+          </div>,
+          document.body
+        )}
     </div>
   );
 }

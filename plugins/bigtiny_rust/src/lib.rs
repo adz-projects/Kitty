@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod config;
 pub mod crypto;
+pub mod env_contract;
 pub mod error;
 pub mod hitl;
 /// In-process llama.cpp engine (docs/ANDROID.md §3). Feature-gated: see
@@ -179,7 +180,19 @@ pub async fn run(config: BigTinyConfig, options: RunOptions) -> Result<(), Daemo
     if config.local.enabled {
         router.register_local(
             LOCAL_PROVIDER_ID,
-            crate::config::ProviderConfig::default(),
+            crate::config::ProviderConfig {
+                // Budget against the engine's context size, not the
+                // daemon-wide `token_management.max_context_tokens` (64k)
+                // that a `None` here falls back to — the engine's real
+                // context defaults to 4096, so compaction never fired before
+                // the context hard-failed. The resolved (fitted/estimated)
+                // value only exists once a model is resident; this is the
+                // static resolution the engine itself bottoms out at.
+                context_length: Some(
+                    local::engine::registration_n_ctx(&config.local) as i32,
+                ),
+                ..Default::default()
+            },
             config.local.clone(),
             local_slots.clone(),
         );
@@ -308,10 +321,51 @@ pub async fn run(config: BigTinyConfig, options: RunOptions) -> Result<(), Daemo
         let _ = ready_tx.send(bound_addr);
     }
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(options.shutdown))
-        .await?;
+    // Cap on the post-signal HTTP drain: graceful shutdown waits for
+    // in-flight connections, and a hung agent turn must not block SIGTERM
+    // indefinitely (until now the drain completed BEFORE `agent.shutdown()`
+    // aborted turns — a hung turn held the drain open forever, and the
+    // supervisor's kill -9 was the only way out).
+    const SHUTDOWN_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+    let (signal_tx, signal_rx) = tokio::sync::oneshot::channel::<()>();
+    let serve = axum::serve(listener, app).with_graceful_shutdown(async move {
+        shutdown_signal(options.shutdown).await;
+        let _ = signal_tx.send(());
+    });
+    // `WithGracefulShutdown` is only `IntoFuture` (and the trait isn't in
+    // the 2021 prelude), so wrap it to get a future we can pin and select
+    // on.
+    let server = async move { serve.await };
+    tokio::pin!(server);
+
+    tokio::select! {
+        res = &mut server => res?,
+        _ = signal_rx => {
+            // Signal received; the HTTP drain is now in progress. Tear the
+            // subsystems down CONCURRENTLY with it rather than after it —
+            // aborting in-flight turns is also what lets their SSE
+            // connections close, so this shortens the drain instead of
+            // competing with it.
+            scheduler.lock().await.stop().await;
+            agent.shutdown().await;
+            mcp.disconnect_all().await;
+            match tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, &mut server).await {
+                // The drain finished inside the cap — propagate a serve
+                // error the way the original `await?` did.
+                Ok(res) => res?,
+                Err(_) => {
+                    tracing::warn!(
+                        "graceful HTTP drain exceeded {SHUTDOWN_DRAIN_TIMEOUT:?}; forcing shutdown"
+                    );
+                }
+            }
+            return Ok(());
+        }
+    }
+
+    // The server drained on its own (no in-flight connections when the
+    // signal landed) — the subsystems still need their teardown.
     scheduler.lock().await.stop().await;
     agent.shutdown().await;
     mcp.disconnect_all().await;

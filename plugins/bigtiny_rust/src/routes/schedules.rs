@@ -22,13 +22,15 @@ fn err_response(status: StatusCode, message: impl Into<String>) -> Response {
 }
 
 /// Map a `SchedulerError` to the right HTTP status — a genuinely-missing
-/// schedule is a 404; cron-validation and storage failures are 500s (the old
-/// code mapped every update/delete error to 500, hiding a real missing-job
-/// delete as "daemon broken", and every run_now error to 404, hiding a real
-/// storage failure as "not found").
+/// schedule is a 404; a cron-validation failure is the caller's bad input
+/// (400, not a 500 that reads as "daemon broken"); storage failures are
+/// 500s (the old code mapped every update/delete error to 500, hiding a
+/// real missing-job delete as "daemon broken", and every run_now error to
+/// 404, hiding a real storage failure as "not found").
 fn scheduler_status(e: SchedulerError) -> (StatusCode, String) {
     match &e {
         SchedulerError::NotFound(_) => (StatusCode::NOT_FOUND, e.to_string()),
+        SchedulerError::Cron(_) => (StatusCode::BAD_REQUEST, e.to_string()),
         _ => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }

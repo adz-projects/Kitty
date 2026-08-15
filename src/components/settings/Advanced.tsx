@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
 import { ipc } from '@/lib/ipc';
+import { isAndroid } from '@/lib/platform';
 import { useConfigDraft } from './useConfigDraft';
+import { ClearChatHistory } from './ClearChatHistory';
 import type { LogEntry, MemoryStats, ProviderView } from '@/lib/types';
 
 // How often to re-fetch the error log while its disclosure is open — there's
@@ -379,8 +381,14 @@ export function Advanced() {
             <p className="muted">No warnings or errors recorded.</p>
           )}
           <div className="log-entries">
-            {logEntries.map((entry, i) => (
-              <div className={`log-entry log-entry-${entry.level.toLowerCase()}`} key={i}>
+            {logEntries.map((entry) => (
+              <div
+                className={`log-entry log-entry-${entry.level.toLowerCase()}`}
+                // Stable identity, not the array index: this list is
+                // re-fetched every 5s while open, and index keys reshuffle
+                // row state/DOM whenever a new entry lands at the top.
+                key={`${entry.timestamp}:${entry.target}:${entry.message}`}
+              >
                 <span className="log-entry-head">
                   <span className="log-entry-level">{entry.level}</span>
                   <span className="muted log-entry-time">
@@ -400,6 +408,10 @@ export function Advanced() {
           </div>
         </div>
       )}
+
+      {/* On Android there is no Settings → General, so the "Clear all chat
+          history" danger zone lives here instead. Desktop keeps it in General. */}
+      {isAndroid() && <ClearChatHistory />}
     </section>
   );
 }

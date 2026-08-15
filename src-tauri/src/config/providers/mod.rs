@@ -4,13 +4,14 @@
 //! BigTiny daemon over REST (see `bigtiny::providers::sync_active_provider`).
 
 mod connection;
+pub mod endpoint;
 mod keyring;
 mod network;
 
 pub use connection::test_connection;
 pub use keyring::{
     delete_secret, get_or_create_bigtiny_encryption_key, get_secret_async, get_secret_checked,
-    has_secret, migrate_secrets, set_secret,
+    migrate_secrets, set_secret_async,
 };
 pub use network::{network_tier_for, NetworkTier};
 
@@ -80,6 +81,20 @@ pub struct ProviderProfile {
     /// matching `temperature`/`top_p`/`context_length` below.
     #[serde(default)]
     pub strip_reasoning: bool,
+    /// Manual override: this provider's models accept image content blocks.
+    ///
+    /// Vision support is otherwise detected from the model *name*
+    /// (`src/lib/vision_models.ts`), which is deliberately conservative — an
+    /// unrecognized name is treated as text-only. That is the right default
+    /// when the cost of guessing wrong is a failed turn, but it means a
+    /// self-hosted or oddly-named vision model has no way to be recognized,
+    /// and the UI hides its image affordances with no recourse. This flag is
+    /// that recourse: it only ever *widens* what's allowed (it ORs with
+    /// detection), so ticking it for a text-only model is a user's own
+    /// mistake to make, and leaving it off never blocks a model the patterns
+    /// already know about.
+    #[serde(default)]
+    pub supports_vision: bool,
     /// Custom system prompt for this provider (Round-6 Feature 2). `None` =
     /// use the built-in mode-appropriate default (see
     /// `src/lib/system_prompts.ts`). STOPGAP-adjacent, same rationale as
@@ -181,6 +196,7 @@ mod tests {
         assert_eq!(p.context_length, None);
         assert_eq!(p.models, vec!["llama3.2:3b"]);
         assert!(!p.strip_reasoning);
+        assert!(!p.supports_vision);
         assert_eq!(p.system_prompt, None);
         assert_eq!(p.prompt_idle_timeout_secs, None);
         assert_eq!(p.parallel_slots, None);

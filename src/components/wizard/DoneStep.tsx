@@ -53,7 +53,7 @@ export function DoneStep({ path, onBack }: { path: WizardPath | null; onBack: ()
       <div className="wizard-summary">
         <div className="wizard-summary-row">
           <span className="muted">Running</span>
-          <span>{path === 'api-key' ? 'Your own API key' : 'Local models on this computer'}</span>
+          <span>{path === 'api-key' ? 'Your own API key' : 'Local models on this device'}</span>
         </div>
         {checking && (
           <p className="muted" style={{ margin: 0 }}>

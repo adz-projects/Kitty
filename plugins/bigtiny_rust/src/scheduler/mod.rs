@@ -181,8 +181,12 @@ impl Scheduler {
             .await
         {
             // Revert the live registration to match the still-persisted row.
+            // Only re-register when the job was previously ENABLED — the old
+            // code keyed this on `new_enabled`, so a failed enable of a
+            // previously-disabled job left a live cron firing a row that
+            // still says `enabled = 0`.
             self.unregister_cron_job(job_id).await;
-            if new_enabled {
+            if current.enabled != 0 {
                 let _ = self.register_cron_job(job_id, &current.cron).await;
             }
             return Err(SchedulerError::from(e));
@@ -210,7 +214,21 @@ impl Scheduler {
         recipe_id: &str,
         enabled: bool,
     ) -> Result<String, SchedulerError> {
-        let id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
+        // Full UUIDs, not the old 8-char truncation: at 8 hex chars a
+        // collision was realistic, and a colliding id would overwrite the
+        // existing job's live registration mapping in `register_cron_job`
+        // (and then unregister THAT job on rollback). The existence check
+        // below is the belt-and-suspenders half of the same fix.
+        let id = uuid::Uuid::new_v4().to_string();
+        if schedules::get_schedule(&self.db, &id)
+            .await
+            .map_err(SchedulerError::from)?
+            .is_some()
+        {
+            return Err(SchedulerError::Cron(format!(
+                "schedule id collision, retry: {id}"
+            )));
+        }
         // Validate + register the live cron BEFORE persisting, so an invalid
         // cron returns an error with no half-written DB row. Under
         // `enabled=false` there's nothing to register.
@@ -269,7 +287,18 @@ pub(crate) async fn execute_job(db: &SqlitePool, engine: &RecipeEngine, job_id: 
         return;
     };
 
-    let exec_id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
+    // Never run a job whose row says `enabled = 0`. The live cron is
+    // (un)registered to match the row, but the two can diverge (an
+    // unregister that only partially failed, a rollback window in
+    // `update_job`) — and a disabled job must not run regardless of what
+    // fired. This also covers `run_now`: a manual trigger of a disabled
+    // schedule is a no-op rather than a surprise run.
+    if job.enabled == 0 {
+        tracing::debug!("scheduled job {job_id}: skipping, schedule is disabled");
+        return;
+    }
+
+    let exec_id = uuid::Uuid::new_v4().simple().to_string();
     let temp_sid = format!("_job_{exec_id}");
     if let Err(e) = sessions::create_session(db, &temp_sid, &format!("scheduled:{job_id}")).await {
         // Previously `is_err() { return }` — a create failure (e.g. a rare
@@ -315,19 +344,24 @@ pub(crate) async fn execute_job(db: &SqlitePool, engine: &RecipeEngine, job_id: 
         }
         Err(e) => {
             tracing::error!("Scheduled job {job_id} failed: {e}");
-            // Clean up the bookkeeping rows on the failure path exactly like
-            // the success path does, but in FK-safe order: the temp session
-            // can't be deleted while `execution_history.session_id` (NOT NULL,
-            // FK -> sessions) still points at it, so the
-            // history row goes first, then the session. Previously this path
-            // only marked the session `failed`, leaking a `_job_*` session and
-            // its `execution_history` row forever on every failed run. The
-            // failure itself is still captured in the log line above.
-            let _ = sqlx::query("DELETE FROM execution_history WHERE id = ?")
-                .bind(&exec_id)
-                .execute(db)
-                .await;
-            let _ = sessions::delete_session(db, &temp_sid).await;
+            // Record the failure on the execution row (audit trail) rather
+            // than deleting it: with `run_turn_and_wait` now propagating the
+            // turn outcome, this arm also fires for provider-failed turns,
+            // and those must be visible as `failed` — previously every such
+            // run was misrecorded as `completed`. The row keeps pointing at
+            // the temp session, so the session stays as its FK anchor.
+            if let Err(e2) = sqlx::query(
+                "UPDATE execution_history SET status = 'failed', error_message = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?",
+            )
+            .bind(e.to_string())
+            .bind(&exec_id)
+            .execute(db)
+            .await
+            {
+                tracing::error!(
+                    "scheduled job {job_id}: failed to mark execution {exec_id} failed: {e2}"
+                );
+            }
         }
     }
 }

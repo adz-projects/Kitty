@@ -272,6 +272,14 @@ pub async fn extract_and_record<S: StructuredChat>(
         .unwrap_or_default();
     for c in corrections {
         if let Some(text) = c.as_str() {
+            // Skip empty/whitespace corrections (audit #116): every
+            // text-resolution step downstream of here matches on `contains`,
+            // and `""` is a substring of *every* belief — a junk `[""]`
+            // correction would otherwise tombstone the first belief in the
+            // table.
+            if text.trim().is_empty() {
+                continue;
+            }
             // `forget_by_text`'s cosine fallback needs a real embedding in
             // the same space as the stored beliefs -- the exact/substring
             // resolution steps ahead of it don't need one, but a correction
@@ -318,9 +326,23 @@ async fn render_known_beliefs(db: &Db) -> Result<String> {
     let lines: Vec<String> = scored
         .iter()
         .take(20)
-        .map(|(_, b)| format!("- [{}] {}", b.layer.as_str(), b.text))
+        .map(|(_, b)| format!("- [{}] {}", b.layer.as_str(), cap_belief_line(&b.text)))
         .collect();
     Ok(lines.join("\n"))
+}
+
+/// Cap on a single belief's rendered length in the KNOWN BELIEFS block
+/// (audit #131): belief text is never length-capped at write time, so 20
+/// pathologically long texts would otherwise be inlined whole into every
+/// extraction prompt.
+const KNOWN_BELIEF_LINE_MAX_CHARS: usize = 300;
+
+fn cap_belief_line(text: &str) -> String {
+    if text.chars().count() <= KNOWN_BELIEF_LINE_MAX_CHARS {
+        return text.to_string();
+    }
+    let kept: String = text.chars().take(KNOWN_BELIEF_LINE_MAX_CHARS).collect();
+    format!("{kept}…")
 }
 
 /// Helper to keep embeddings off the BLOB write path in tests etc.
@@ -329,3 +351,22 @@ pub fn blob(embedding: &[f32]) -> Vec<u8> {
 }
 
 pub mod host;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn belief_lines_are_capped_for_the_prompt() {
+        // Audit #131: belief text is never length-capped at write time, so
+        // the KNOWN BELIEFS block caps each rendered line instead of
+        // inlining pathologically long texts whole.
+        let long = "x".repeat(1000);
+        let capped = cap_belief_line(&long);
+        assert_eq!(capped.chars().count(), KNOWN_BELIEF_LINE_MAX_CHARS + 1); // + the ellipsis
+        assert!(capped.ends_with('…'));
+
+        let short = "short belief";
+        assert_eq!(cap_belief_line(short), short);
+    }
+}

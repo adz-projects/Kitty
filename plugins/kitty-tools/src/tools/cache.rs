@@ -17,8 +17,24 @@ use serde_json::json;
 /// truncated (with the `truncated` flag set) instead of materialized whole.
 const CACHE_MAX_BYTES: u64 = 4 * 1024 * 1024;
 
+/// Windows device basenames (compared case-insensitively, up to the first
+/// dot): joining `NUL` or `CON.txt` under the cache dir opens the *device*,
+/// not a file inside it (audit #126).
+const WINDOWS_RESERVED_STEMS: [&str; 22] = [
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+    "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
 fn rejects_traversal(filename: &str) -> bool {
-    filename.contains('/') || filename.contains('\\') || filename.contains("..")
+    // `:` is rejected too: on NTFS `file.txt:stream` names an alternate data
+    // stream, which would read/write outside the plain cache file (audit
+    // #126).
+    filename.contains('/')
+        || filename.contains('\\')
+        || filename.contains("..")
+        || filename.contains(':')
+        || WINDOWS_RESERVED_STEMS
+            .contains(&filename.split('.').next().unwrap_or("").to_uppercase().as_str())
 }
 
 /// Defense-in-depth home boundary on a filename already joined under the
@@ -144,6 +160,21 @@ mod tests {
         let s = cache_delete("..\\..\\windows\\system32\\drivers\\etc\\hosts");
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(v["error_code"], "CACHE_INVALID_FILENAME");
+    }
+
+    #[test]
+    fn ads_and_device_names_are_rejected() {
+        // Audit #126: `file.txt:stream` is an NTFS alternate data stream and
+        // `NUL`/`CON.txt` are devices, not files inside the cache dir.
+        for bad in ["notes.txt:secret", "C:", "NUL", "nul.txt", "CON", "COM1", "lpt9.log"] {
+            let s = cache_view(bad);
+            let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+            assert_eq!(v["error_code"], "CACHE_INVALID_FILENAME", "{bad} must be rejected");
+        }
+        // Lookalikes are still fine.
+        assert!(!rejects_traversal("console.log"));
+        assert!(!rejects_traversal("null-values.txt"));
+        assert!(!rejects_traversal("report-final.txt"));
     }
 
     #[test]

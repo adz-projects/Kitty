@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+  <!-- The vector, not the `tauri icon`-generated mipmap PNG set: those have no
+       safe-zone inset and the launcher's mask clips the ears and tail. See the
+       comment in `drawable/ic_launcher_foreground.xml`. -->
+  <background android:drawable="@color/ic_launcher_background"/>
+  <foreground android:drawable="@drawable/ic_launcher_foreground"/>
+  <!-- Themed icons (Android 13+). A flat silhouette is exactly what the
+       monochrome layer wants, so it is the same artwork — the system recolours
+       it to the user's wallpaper palette and ignores our fill. -->
+  <monochrome android:drawable="@drawable/ic_launcher_foreground"/>
+</adaptive-icon>

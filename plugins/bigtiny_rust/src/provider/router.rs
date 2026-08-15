@@ -76,6 +76,9 @@ impl ProviderRouter {
             presence_penalty: config.presence_penalty,
             frequency_penalty: config.frequency_penalty,
             max_tokens: config.max_tokens,
+            // Effort is a per-turn request applied by the agent loop, never a
+            // provider-config default — there's nothing to resolve here.
+            effort: None,
         };
         let resolved_sampling =
             sampling::resolve(&config.provider_type, &config.model, &configured);
@@ -328,6 +331,14 @@ impl ProviderRouter {
             if self.providers.contains_key(id) {
                 return Ok(id.to_string());
             }
+            // A session pinned to a provider that isn't registered — fall
+            // through to the health-sorted fallback below, but say so. Silent
+            // here is what let a bad provider stamp run every turn on a
+            // *different* engine (e.g. the in-process `local`) with no signal.
+            tracing::warn!(
+                pinned_provider = id,
+                "session's pinned provider is not registered; falling back to another provider"
+            );
         }
 
         let mut candidates: Vec<(bool, i32, String)> = self
@@ -484,6 +495,17 @@ impl ProviderRouter {
             .get(provider_id)
             .map(|e| e.provider.supports_assistant_prefill())
             .unwrap_or(false)
+    }
+
+    /// See `Provider::supports_tools`. `true` for an unknown provider id,
+    /// matching the trait default — assuming a provider *can* take tools is
+    /// the recoverable guess (it errors visibly); assuming it can't would
+    /// silently strip them from a provider that works fine.
+    pub fn supports_tools(&self, provider_id: &str) -> bool {
+        self.providers
+            .get(provider_id)
+            .map(|e| e.provider.supports_tools())
+            .unwrap_or(true)
     }
 
     /// Call chat_completion on a specific provider.

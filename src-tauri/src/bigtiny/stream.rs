@@ -61,11 +61,10 @@ pub(crate) fn truncate_for_ui(s: &str) -> String {
 /// at or after byte offset `from`, or `None` if there isn't one yet.
 ///
 /// Operates on raw bytes rather than `str::find` on a `&str` slice so the
-/// caller (`run_stream`'s buffer scan) can resume from an arbitrary byte
-/// offset without needing that offset to land on a UTF-8 char boundary —
-/// `\n` (0x0A) is single-byte ASCII, so any offset this function returns,
-/// and any offset derived from one (`+1`, `+2`), is automatically a valid
-/// char boundary, safe to slice the original `&str` at.
+/// caller (`drain_complete_frames`) can resume from an arbitrary byte offset
+/// without needing that offset to land on a UTF-8 char boundary — `\n`
+/// (0x0A) is single-byte ASCII and never appears inside a multi-byte UTF-8
+/// sequence, so a boundary found here always splits *between* characters.
 pub(crate) fn find_frame_boundary(haystack: &[u8], from: usize) -> Option<usize> {
     if from >= haystack.len() {
         return None;
@@ -74,6 +73,40 @@ pub(crate) fn find_frame_boundary(haystack: &[u8], from: usize) -> Option<usize>
         .windows(2)
         .position(|w| w == b"\n\n")
         .map(|rel| from + rel)
+}
+
+/// Drain every complete `\n\n`-terminated SSE frame currently in `buffer`,
+/// decoding each as UTF-8. `scan_from` carries the scan's resume offset
+/// between calls (see `run_stream`): without it, every incoming chunk would
+/// re-scan the entire accumulated buffer from position 0 — quadratic in the
+/// worst case of a large delta arriving as many small TCP chunks.
+///
+/// Decoding happens only once a frame is *complete* — never per TCP chunk —
+/// so a multi-byte character split across chunks is decoded after all its
+/// bytes have arrived, instead of being mangled per-chunk by
+/// `from_utf8_lossy` into U+FFFD replacement characters the JSON parser then
+/// silently rejected (dropping the whole frame). A complete frame that still
+/// isn't valid UTF-8 is a daemon bug: drop it with a loud warning rather
+/// than lossy-decoding; its `\n\n` has already been consumed, so the stream
+/// continues cleanly from the next frame.
+pub(crate) fn drain_complete_frames(buffer: &mut Vec<u8>, scan_from: &mut usize) -> Vec<String> {
+    let mut frames = Vec::new();
+    // `saturating_sub(1)` guards the one case a pure resume-point would
+    // miss: a "\n\n" boundary split exactly across the old/new chunk join,
+    // with one "\n" at the very end of the previously-scanned region and
+    // the second "\n" at the very start of the new tail.
+    while let Some(pos) = find_frame_boundary(buffer, scan_from.saturating_sub(1)) {
+        let frame_bytes: Vec<u8> = buffer.drain(..pos + 2).collect();
+        *scan_from = 0;
+        match std::str::from_utf8(&frame_bytes[..frame_bytes.len() - 2]) {
+            Ok(frame) => frames.push(frame.to_string()),
+            Err(e) => tracing::warn!("dropping a non-UTF-8 SSE frame ({e})"),
+        }
+    }
+    // No further boundary in the buffer yet — resume the next chunk's scan
+    // from here instead of position 0.
+    *scan_from = buffer.len();
+    frames
 }
 
 /// Pure: parse one SSE frame (`data: {...}`) into its JSON payload.
@@ -329,16 +362,10 @@ async fn run_stream(
     let mut tool_seq: u64 = 0;
     let mut current_tool: Option<(String, String)> = None;
 
-    let mut buffer = String::new();
-    // Byte offset from which the next `find_frame_boundary` scan should
-    // resume — without this, every incoming chunk re-scanned the *entire*
-    // accumulated buffer from position 0 looking for "\n\n", even though
-    // only the newly-appended tail could contain a not-yet-seen boundary.
-    // For a large content delta arriving as many small TCP chunks (or any
-    // burst of small chunks before a frame terminator), that's repeated
-    // full-buffer linear rescans — quadratic in the worst case. Reset to 0
-    // whenever a frame is drained (the remaining buffer shifted), advanced
-    // to the end of the buffer when no boundary is found yet.
+    // Raw-byte accumulation buffer: frames are decoded only once complete
+    // (`drain_complete_frames`), so a multi-byte UTF-8 character split
+    // across two TCP chunks survives intact.
+    let mut buffer: Vec<u8> = Vec::new();
     let mut scan_from: usize = 0;
     // Idle-only deadline on the stream: if the daemon sends no bytes for this
     // long, the turn is wedged and we bail out (see the `Elapsed` arm). Long
@@ -359,15 +386,8 @@ async fn run_stream(
                 ));
             }
         };
-        buffer.push_str(&String::from_utf8_lossy(&chunk));
-        // `saturating_sub(1)` guards the one case a pure resume-point would
-        // miss: a "\n\n" boundary split exactly across the old/new chunk
-        // join, with one "\n" at the very end of the previously-scanned
-        // region and the second "\n" at the very start of the new tail.
-        while let Some(pos) = find_frame_boundary(buffer.as_bytes(), scan_from.saturating_sub(1)) {
-            let frame = buffer[..pos].to_string();
-            buffer.drain(..pos + 2);
-            scan_from = 0;
+        buffer.extend_from_slice(&chunk);
+        for frame in drain_complete_frames(&mut buffer, &mut scan_from) {
             let Some(event) = parse_sse_frame(&frame) else {
                 continue;
             };
@@ -387,9 +407,6 @@ async fn run_stream(
                 break 'outer;
             }
         }
-        // No further boundary in the buffer yet — resume the next chunk's
-        // scan from here instead of position 0.
-        scan_from = buffer.len();
     }
     Ok(outcome)
 }
@@ -716,6 +733,63 @@ mod tests {
         let v = parse_sse_frame("data: {\"type\":\"llm_delta\",\"content\":\"hi\"}").unwrap();
         assert_eq!(v["type"], "llm_delta");
         assert_eq!(v["content"], "hi");
+    }
+
+    /// Regression (815bugs #4): a multi-byte UTF-8 character split across two
+    /// TCP chunks must not be corrupted. The old code lossy-decoded each
+    /// chunk independently, turning the split character into two U+FFFD
+    /// replacement characters — serde_json then rejected the frame and the
+    /// event was silently dropped.
+    #[test]
+    fn drain_complete_frames_decodes_a_multibyte_char_split_across_chunks() {
+        let payload = "data: {\"type\":\"llm_delta\",\"content\":\"café\"}\n\n";
+        let bytes = payload.as_bytes();
+        // Split inside the two-byte 'é' (0xC3 0xA9).
+        let split = bytes
+            .windows(2)
+            .position(|w| w == [0xC3, 0xA9])
+            .expect("test payload must contain é")
+            + 1;
+        let mut buffer: Vec<u8> = Vec::new();
+        let mut scan_from = 0usize;
+
+        buffer.extend_from_slice(&bytes[..split]);
+        assert!(
+            drain_complete_frames(&mut buffer, &mut scan_from).is_empty(),
+            "no frame is complete until the terminator arrives"
+        );
+
+        buffer.extend_from_slice(&bytes[split..]);
+        let frames = drain_complete_frames(&mut buffer, &mut scan_from);
+        assert_eq!(frames.len(), 1);
+        let parsed = parse_sse_frame(&frames[0]).expect("frame must stay valid JSON");
+        assert_eq!(parsed["content"], "café");
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn drain_complete_frames_handles_multiple_frames_and_a_partial_tail() {
+        let mut buffer = b"data: a\n\ndata: b\n\ndata: par".to_vec();
+        let mut scan_from = 0usize;
+        let frames = drain_complete_frames(&mut buffer, &mut scan_from);
+        assert_eq!(frames, vec!["data: a", "data: b"]);
+        assert_eq!(buffer, b"data: par");
+        // The tail becomes a frame once its terminator arrives in a later chunk.
+        buffer.extend_from_slice(b"tial\n\n");
+        let frames = drain_complete_frames(&mut buffer, &mut scan_from);
+        assert_eq!(frames, vec!["data: partial"]);
+    }
+
+    #[test]
+    fn drain_complete_frames_drops_a_non_utf8_frame_but_keeps_later_ones() {
+        // A daemon bug smuggling raw bytes into one frame must not poison the
+        // rest of the stream: that frame is dropped (with a warning), and the
+        // next frame still parses.
+        let mut buffer = b"data: \xff\xfe bad\n\ndata: {\"type\":\"llm_delta\"}\n\n".to_vec();
+        let mut scan_from = 0usize;
+        let frames = drain_complete_frames(&mut buffer, &mut scan_from);
+        assert_eq!(frames, vec!["data: {\"type\":\"llm_delta\"}"]);
+        assert!(buffer.is_empty());
     }
 
     #[test]

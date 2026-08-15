@@ -54,11 +54,10 @@ describe('mode info cache', () => {
     }
   });
 
-  it('round-trips mode/availableModes/thinkingEffort for a provider id', () => {
+  it('round-trips mode/availableModes for a provider id', () => {
     const info = {
       mode: 'auto',
       availableModes: [{ id: 'auto', name: 'Auto', description: 'test' }],
-      thinkingEffort: { current: 'medium', options: [{ id: 'low', name: 'Low' }] } as never,
     };
     writeCachedModeInfo('provider-1', info);
     expect(readCachedModeInfo('provider-1')).toEqual(info);
@@ -69,8 +68,8 @@ describe('mode info cache', () => {
   });
 
   it('keys entries per provider id — does not leak across providers', () => {
-    writeCachedModeInfo('provider-a', { mode: 'auto', availableModes: [], thinkingEffort: null });
-    writeCachedModeInfo('provider-b', { mode: 'manual', availableModes: [], thinkingEffort: null });
+    writeCachedModeInfo('provider-a', { mode: 'auto', availableModes: [] });
+    writeCachedModeInfo('provider-b', { mode: 'manual', availableModes: [] });
     expect(readCachedModeInfo('provider-a')?.mode).toBe('auto');
     expect(readCachedModeInfo('provider-b')?.mode).toBe('manual');
   });
@@ -81,8 +80,8 @@ describe('mode info cache', () => {
   });
 
   it('a later write for the same provider id overwrites the earlier one', () => {
-    writeCachedModeInfo('provider-1', { mode: 'auto', availableModes: [], thinkingEffort: null });
-    writeCachedModeInfo('provider-1', { mode: 'manual', availableModes: [], thinkingEffort: null });
+    writeCachedModeInfo('provider-1', { mode: 'auto', availableModes: [] });
+    writeCachedModeInfo('provider-1', { mode: 'manual', availableModes: [] });
     expect(readCachedModeInfo('provider-1')?.mode).toBe('manual');
   });
 
@@ -101,7 +100,7 @@ describe('mode info cache', () => {
       writable: true,
     });
     expect(() =>
-      writeCachedModeInfo('provider-1', { mode: 'auto', availableModes: [], thinkingEffort: null })
+      writeCachedModeInfo('provider-1', { mode: 'auto', availableModes: [] })
     ).not.toThrow();
     expect(readCachedModeInfo('provider-1')).toBeNull();
   });

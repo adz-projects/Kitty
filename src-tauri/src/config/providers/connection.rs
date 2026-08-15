@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 
+use super::endpoint;
 use super::keyring::get_secret_async;
 use super::ProviderProfile;
 
@@ -110,19 +111,30 @@ pub async fn test_connection(profile: &ProviderProfile) -> Result<(), String> {
         }
         "openai" | "custom_openai" => {
             let client = crate::util::http_client();
-            let url = format!("{}/models", profile.base_url.trim_end_matches('/'));
-            let mut req = client.get(url).timeout(Duration::from_secs(10));
-            if let Some(key) = get_secret_async(&profile.id).await {
-                req = req.bearer_auth(key);
+            let key = get_secret_async(&profile.id).await;
+            // A schemeless entry fans out to https-then-http, so a LAN box
+            // typed as `host:port` works without the user knowing which one
+            // it speaks. See `endpoint::candidates`.
+            let urls = endpoint::candidates(&profile.base_url);
+            let mut attempts: Vec<(String, String)> = Vec::new();
+            for base in urls {
+                let url = format!("{base}/models");
+                let mut req = client.get(url).timeout(Duration::from_secs(10));
+                if let Some(key) = key.clone() {
+                    req = req.bearer_auth(key);
+                }
+                match req.send().await {
+                    // A reachable endpoint that rejects us is a *different*
+                    // problem from an unreachable one, and trying the other
+                    // scheme won't fix a bad key — report it and stop.
+                    Ok(resp) if !resp.status().is_success() => {
+                        return Err(format!("{base} returned {}", resp.status()));
+                    }
+                    Ok(_) => return Ok(()),
+                    Err(e) => attempts.push((base, endpoint::humanize(&e))),
+                }
             }
-            let resp = req
-                .send()
-                .await
-                .map_err(|e| format!("could not reach {}: {e}", profile.base_url))?;
-            if !resp.status().is_success() {
-                return Err(format!("{} returned {}", profile.base_url, resp.status()));
-            }
-            Ok(())
+            Err(endpoint::unreachable_message(&attempts))
         }
         other => Err(format!("unknown provider type: {other}")),
     }
@@ -157,6 +169,7 @@ mod tests {
             max_tokens: None,
             context_length: None,
             strip_reasoning: false,
+            supports_vision: false,
             system_prompt: None,
             prompt_idle_timeout_secs: None,
             parallel_slots: None,

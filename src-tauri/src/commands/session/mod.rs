@@ -55,20 +55,52 @@ pub const CHATS_DIR_NAME: &str = "chats";
 /// (`default_context_folder`, set in Settings) when non-empty, else the default
 /// `~/Documents/Kitty`. Each chat then lives in `<base>/chats/<id>/`, so the
 /// setting is a *base for per-chat folders*, not one shared working directory.
+///
+/// **Android:** there is no user-facing Documents directory (`dirs::document_dir()`
+/// returns `None`) and the process's working directory is the read-only `/`, so
+/// the old `PathBuf::from(".")` fallback produced a relative `./Kitty/chats/…`
+/// that failed on `create_dir_all` with `Read-only file system (os error 30)`.
+/// Fall back to the app-private writable base (`config::config_dir()`,
+/// `/data/user/0/<pkg>/files/Kitty`) instead — the same base every other Kitty
+/// path already uses on Android. The desktop default (`~/Documents/Kitty`) is
+/// unchanged; only the *unresolvable* case now lands somewhere writable rather
+/// than on a relative path.
 fn chats_base_dir(app: &AppHandle) -> PathBuf {
     let configured = {
         let state = app.state::<AppState>();
         let cfg = state.config.lock().unwrap();
         cfg.default_context_folder.clone()
     };
-    configured
-        .filter(|s| !s.trim().is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            dirs::document_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join("Kitty")
-        })
+    if let Some(dir) = configured.filter(|s| !s.trim().is_empty()) {
+        return PathBuf::from(dir);
+    }
+    // No explicit folder chosen. Prefer the user-visible Documents dir on
+    // desktop; on Android (and any host where `dirs` can't answer) use the
+    // app-private writable base rather than a relative path against a
+    // read-only cwd.
+    if let Some(docs) = dirs::document_dir() {
+        return docs.join("Kitty");
+    }
+    crate::config::config_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+/// True when `cwd` is a Kitty-managed private per-chat folder under
+/// `<base>/chats/` — i.e. no explicit working directory was chosen. The chat
+/// UI renders this as the "thought partner" state (no folder pill, no project
+/// folder). A normalized string-prefix check rather than canonicalization: it
+/// must give a stable answer for a session whose folder may not currently
+/// exist on disk, and both sides derive from Kitty's own normalized output
+/// (`resolve_cwd`/`chats_base_dir`), so their casing already agrees.
+pub fn is_default_folder(app: &AppHandle, cwd: &str) -> bool {
+    let root = chats_base_dir(app).join(CHATS_DIR_NAME);
+    let root = root.to_string_lossy().replace('\\', "/");
+    let root = root.trim_end_matches('/');
+    let cwd = cwd.replace('\\', "/");
+    let cwd = cwd.trim_end_matches('/');
+    // Strictly inside `<root>/…`, never the root itself.
+    cwd.strip_prefix(root)
+        .map(|rel| rel.starts_with('/'))
+        .unwrap_or(false)
 }
 
 /// A fresh per-chat folder `<base>/chats/<timestamp>-<short-rand>/`. The
@@ -91,10 +123,15 @@ fn new_chat_folder(base: &Path) -> PathBuf {
 /// the (configurable) chats base, created if missing. Same for both modes.
 /// `create_dir_all` runs on a blocking thread — this is user-triggered
 /// (every "New Session"), so a slow disk shouldn't stall the tokio worker
-/// other requests are running on.
-async fn resolve_cwd(app: &AppHandle) -> String {
+/// other requests are running on. A mkdir failure is *propagated*, not
+/// swallowed: a session created against a folder that doesn't exist is worse
+/// than no session (815bugs #22).
+async fn resolve_cwd(app: &AppHandle) -> Result<String, String> {
     let path = new_chat_folder(&chats_base_dir(app));
     let path_for_blocking = path.clone();
-    let _ = tokio::task::spawn_blocking(move || std::fs::create_dir_all(&path_for_blocking)).await;
-    path.to_string_lossy().replace('\\', "/")
+    tokio::task::spawn_blocking(move || std::fs::create_dir_all(&path_for_blocking))
+        .await
+        .map_err(|e| format!("chat folder creation task panicked: {e}"))?
+        .map_err(|e| format!("could not create the chat folder {}: {e}", path.display()))?;
+    Ok(path.to_string_lossy().replace('\\', "/"))
 }

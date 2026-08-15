@@ -53,7 +53,9 @@ export function buildStrippedTranscript(messages: Message[]): string {
   return (
     'Continuing the conversation below. Earlier reasoning/thinking has been omitted ' +
     'to keep this response focused.\n\n' +
-    lines.join('\n\n')
+    lines.join('\n\n') +
+    '\n\n' +
+    TRANSCRIPT_SENTINEL
   );
 }
 
@@ -71,6 +73,13 @@ const SYSTEM_PROMPT_WRAPPER_RE = /^<system>\n[\s\S]*?\n<\/system>\n\n/;
 const TRANSCRIPT_WRAPPER_PREAMBLE =
   'Continuing the conversation below. Earlier reasoning/thinking has been omitted ' +
   'to keep this response focused.\n\n';
+// Closing line of every transcript `buildStrippedTranscript` produces. The
+// send-time wrapper is exactly `<transcript>\n\n<sentinel>\n\nUser: <text>`,
+// so the replay strip anchors on this exact suffix boundary — a bare
+// `lastIndexOf('\n\nUser: ')` could match inside the user's OWN message
+// (e.g. a pasted chat log) and eat its head. Model-sensible text, not a
+// control sequence, since it rides along in the prompt the model sees.
+const TRANSCRIPT_SENTINEL = '[End of earlier conversation]';
 // The hidden `<recipe>…</recipe>` + "Run the recipe above now…" wrapper
 // `sendWithRecipe` prepends. `[^>]*` tolerates any title attribute content
 // (except a literal `>`); the lazy `[\s\S]*?` stops at the first
@@ -92,6 +101,17 @@ export function stripPromptPreamble(text: string): string {
   if (systemMatch) return text.slice(systemMatch[0].length);
   if (text.startsWith(TRANSCRIPT_WRAPPER_PREAMBLE)) {
     const rest = text.slice(TRANSCRIPT_WRAPPER_PREAMBLE.length);
+    // Exact send-time boundary first (see TRANSCRIPT_SENTINEL): only the
+    // wrapper's own trailing `<sentinel>\n\nUser: ` is unambiguous — anything
+    // after it is the user's message verbatim, even if it contains further
+    // "\n\nUser: " sequences of its own.
+    const anchor = `${TRANSCRIPT_SENTINEL}\n\nUser: `;
+    const anchored = rest.lastIndexOf(anchor);
+    if (anchored >= 0) return rest.slice(anchored + anchor.length);
+    // Legacy fallback for sessions persisted before the sentinel existed:
+    // keep the old last-marker heuristic (imperfect — a user message
+    // containing the literal marker loses its head — but those transcripts
+    // carry no better boundary to anchor on).
     const marker = '\n\nUser: ';
     const idx = rest.lastIndexOf(marker);
     if (idx >= 0) return rest.slice(idx + marker.length);

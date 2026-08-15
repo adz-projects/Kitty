@@ -172,7 +172,7 @@ where
             .fetch_optional(&mut *tx)
             .await?;
     let Some((metadata_str,)) = row else {
-        return Err(StorageError::Generic(format!(
+        return Err(StorageError::NotFound(format!(
             "Session {} not found",
             session_id
         )));

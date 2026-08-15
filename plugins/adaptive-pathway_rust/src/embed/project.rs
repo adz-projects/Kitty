@@ -4,6 +4,12 @@
 //! than truncating keeps information from every source dimension.
 
 pub fn project(raw: &[f32], dim: usize) -> Vec<f32> {
+    // `dim == 0` would panic at `i % dim` below — return the empty vector
+    // instead (audit #122; config validation rejects it at load, this keeps
+    // the function total regardless).
+    if dim == 0 {
+        return Vec::new();
+    }
     let mut out = vec![0.0f32; dim];
     if raw.len() == dim {
         out.copy_from_slice(raw);
@@ -58,5 +64,11 @@ mod tests {
         assert!((n - 1.0).abs() < 1e-4);
         // ratio preserved: p[0]/p[1] == 1/2
         assert!((p[0] / p[1] - 0.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn zero_dim_returns_empty_instead_of_panicking() {
+        // Audit #122: `i % dim` panicked on a zero dim.
+        assert_eq!(project(&[1.0, 2.0], 0), Vec::<f32>::new());
     }
 }

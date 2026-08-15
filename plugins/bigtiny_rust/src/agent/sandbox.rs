@@ -30,7 +30,16 @@ fn norm(path: &str) -> String {
     while p.ends_with('/') && p.len() > 1 {
         p.pop();
     }
-    p.to_lowercase()
+    // Case-fold only where the filesystem itself is case-insensitive.
+    // Lowercasing unconditionally was fail-OPEN on case-sensitive hosts
+    // (Android/Linux): `/home/User/x` and `/home/user/x` are different
+    // directories there, but compared equal after folding — a path outside
+    // the allowed set could pass containment by differing only in case.
+    if cfg!(windows) {
+        p.to_lowercase()
+    } else {
+        p
+    }
 }
 
 /// True if `target` lexically resolves inside at least one of `bases`.
@@ -135,6 +144,15 @@ pub fn extract_candidate_paths(args: &Value) -> Vec<String> {
     found
 }
 
+/// `scheme://...` tokens in a shell command. Stripped before path
+/// extraction: the drive-letter alternative in the extraction regex
+/// otherwise matches the `s://` tail of `https://…` (and the `//host`
+/// remnant matches the relative-path alternative), so a write-class command
+/// containing an absolute URL (`curl https://…`, `git clone https://…`) was
+/// hard-denied with no approval path. URLs are not filesystem paths.
+static URL_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r#"[A-Za-z][A-Za-z0-9+.-]*://[^\s"']+"#).unwrap());
+
 /// Best-effort extraction of literal filesystem paths from a shell command string.
 fn extract_shell_paths(command: &str) -> Vec<String> {
     let re = Regex::new(
@@ -142,7 +160,8 @@ fn extract_shell_paths(command: &str) -> Vec<String> {
     )
     .unwrap();
 
-    re.captures_iter(command)
+    let scrubbed = URL_RE.replace_all(command, " ");
+    re.captures_iter(&scrubbed)
         .filter_map(|caps| {
             caps.iter()
                 .skip(1)
@@ -392,5 +411,58 @@ mod tests {
         });
         let dirs = vec!["/home/user/project".to_string()];
         assert!(!check_containment(&args, &dirs, true));
+    }
+
+    /// Regression: the shell-path regex matched the `s://` tail of
+    /// `https://…` as a drive-letter path (and `//host` as a relative one),
+    /// so a write-class shell command containing an absolute URL was
+    /// hard-denied with no approval path. URLs must be stripped before path
+    /// extraction.
+    #[test]
+    fn test_extract_shell_paths_ignores_absolute_urls() {
+        assert!(extract_shell_paths("curl https://example.com").is_empty());
+        assert!(
+            extract_shell_paths("git clone https://github.com/org/repo.git").is_empty()
+        );
+        assert!(extract_shell_paths("curl -X POST 'https://api.example.com/v1' -d '{}'").is_empty());
+    }
+
+    /// Real Windows paths in a command must still be extracted — including
+    /// alongside a URL in the same command.
+    #[test]
+    fn test_extract_shell_paths_still_finds_real_paths() {
+        let paths = extract_shell_paths(r"curl -o C:\Users\x\out.txt https://example.com");
+        assert_eq!(paths, vec!["C:\\Users\\x\\out.txt".to_string()]);
+
+        let paths = extract_shell_paths(r#"type "C:\Users\x\file.txt""#);
+        assert_eq!(paths, vec!["C:\\Users\\x\\file.txt".to_string()]);
+    }
+
+    /// The containment-level view of the URL fix: `curl https://…` produces
+    /// no path candidates at all, so the desktop (non-strict) default fails
+    /// open instead of hard-denying.
+    #[test]
+    fn test_check_containment_url_only_shell_command_is_not_denied() {
+        let args = json!({"command": "curl https://example.com"});
+        let dirs = vec!["C:\\chat".to_string()];
+        assert!(check_containment(&args, &dirs, false));
+    }
+
+    /// `norm` case-folds only on Windows, where the filesystem itself is
+    /// case-insensitive.
+    #[cfg(windows)]
+    #[test]
+    fn test_norm_lowercases_on_windows() {
+        assert_eq!(norm("C:\\Users\\Foo\\"), "c:/users/foo");
+    }
+
+    /// On case-sensitive hosts (Android/Linux) folding case made two
+    /// different directories compare equal — fail-open containment.
+    #[cfg(not(windows))]
+    #[test]
+    fn test_norm_preserves_case_on_case_sensitive_hosts() {
+        assert_eq!(norm("/home/User/Project/"), "/home/User/Project");
+        let bases = vec!["/home/User/project".to_string()];
+        assert!(!path_within_any(&bases, "/home/user/project/evil"));
     }
 }

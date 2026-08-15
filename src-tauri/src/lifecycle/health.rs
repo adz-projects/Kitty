@@ -24,13 +24,13 @@ pub fn spawn_health_loop(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         let client = crate::util::http_client();
         let mut ticker = tokio::time::interval(Duration::from_secs(5));
-        // Debounce: a degraded reading must repeat on the *next* tick before
-        // it's actually stored/reported. A single missed/slow probe (OS
-        // scheduling jitter, a momentary daemon hiccup) shouldn't flip the
-        // whole app into a "degraded" banner for one blip. Recovering to
+        // Debounce: a degraded reading must appear on two *consecutive* ticks
+        // before it's actually stored/reported. A single missed/slow probe
+        // (OS scheduling jitter, a momentary daemon hiccup) shouldn't flip
+        // the whole app into a "degraded" banner for one blip. Recovering to
         // `Ok` stays immediate; only degradation needs the extra
-        // confirmation tick.
-        let mut pending_degraded: Option<StackStatus> = None;
+        // confirmation tick. See `debounce_status`.
+        let mut degraded_streak: u32 = 0;
         // ~30s cadence (every 6th 5s tick): catches the pathway embedding
         // model being deleted out-of-band.
         let mut tick: u64 = 0;
@@ -77,7 +77,7 @@ pub fn spawn_health_loop(app: AppHandle) {
             // a couple of no-op REST reads. Unconditional on the pathway
             // feature. Gated only on the daemon itself being reachable, so a down
             // BigTiny doesn't make the MCP proxy spin uselessly.
-            if tick % 24 == 0 {
+            if self_heal_due(tick) {
                 let port = app.state::<AppState>().bigtiny.lock().unwrap().port;
                 if let Some(port) = port {
                     if super::bigtiny_proc::probe_health(&client, port).await {
@@ -90,11 +90,7 @@ pub fn spawn_health_loop(app: AppHandle) {
             }
             tick = tick.wrapping_add(1);
             let computed = compute_status(&app, &client).await;
-            let status = if computed == StackStatus::Ok || pending_degraded == Some(computed) {
-                pending_degraded = None;
-                computed
-            } else {
-                pending_degraded = Some(computed);
+            let Some(status) = debounce_status(&mut degraded_streak, computed) else {
                 continue;
             };
             let changed = {
@@ -153,4 +149,78 @@ pub(crate) async fn compute_status(app: &AppHandle, client: &reqwest::Client) ->
         return StackStatus::LocalModelMissing;
     }
     StackStatus::Ok
+}
+
+/// Debounce gate for the health loop: publish a degradation only after two
+/// *consecutive* non-Ok readings — of any flavor. The old rule required the
+/// *identical* degraded status twice in a row, so a stack flapping between
+/// two different degradations (e.g. `BackendDown` ↔ `LocalModelMissing`)
+/// never published anything at all. Recovering to `Ok` publishes immediately
+/// and resets the streak.
+fn debounce_status(non_ok_streak: &mut u32, computed: StackStatus) -> Option<StackStatus> {
+    if computed == StackStatus::Ok {
+        *non_ok_streak = 0;
+        return Some(computed);
+    }
+    *non_ok_streak += 1;
+    if *non_ok_streak >= 2 {
+        *non_ok_streak = 0;
+        Some(computed)
+    } else {
+        None
+    }
+}
+
+/// `tick 0` is deliberately excluded: `tokio::time::interval` completes its
+/// first tick *immediately*, which used to run the MCP self-heal's
+/// `ensure_builtin_servers` at startup in a race with
+/// `sync_mcp_once_healthy`'s own pass — both list-then-create the builtin
+/// rows, and `mcp_servers.name` has no UNIQUE constraint, so the race left
+/// permanent duplicates. The first self-heal now runs at ~2 minutes
+/// (`tick == 24`). `ensure_builtin_servers` is additionally Mutex-serialized
+/// as defense in depth (see `bigtiny::mcp`); keep both.
+fn self_heal_due(tick: u64) -> bool {
+    tick > 0 && tick % 24 == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debounce_publishes_ok_immediately_and_resets_the_streak() {
+        let mut streak = 0;
+        assert_eq!(debounce_status(&mut streak, StackStatus::Ok), Some(StackStatus::Ok));
+        assert_eq!(streak, 0);
+    }
+
+    #[test]
+    fn debounce_holds_a_single_degraded_blip() {
+        let mut streak = 0;
+        assert_eq!(debounce_status(&mut streak, StackStatus::BackendDown), None);
+        // One blip followed by a recovery: nothing degraded was ever published.
+        assert_eq!(debounce_status(&mut streak, StackStatus::Ok), Some(StackStatus::Ok));
+        assert_eq!(streak, 0);
+    }
+
+    /// Regression (815bugs #17): the old identical-twice rule never published
+    /// a stack flapping between two *different* degraded states.
+    #[test]
+    fn debounce_publishes_on_the_second_consecutive_non_ok_even_when_it_differs() {
+        let mut streak = 0;
+        assert_eq!(debounce_status(&mut streak, StackStatus::BackendDown), None);
+        assert_eq!(
+            debounce_status(&mut streak, StackStatus::LocalModelMissing),
+            Some(StackStatus::LocalModelMissing)
+        );
+        assert_eq!(streak, 0, "the streak resets once published");
+    }
+
+    #[test]
+    fn self_heal_never_runs_on_tick_zero() {
+        assert!(!self_heal_due(0));
+        assert!(!self_heal_due(23));
+        assert!(self_heal_due(24));
+        assert!(self_heal_due(48));
+    }
 }

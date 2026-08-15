@@ -32,10 +32,16 @@ pub async fn read_image_data_url(path: String) -> Result<String, String> {
 }
 
 /// Write a UTF-8 text file (Phase 11 ChatML export). The path comes from the
-/// user's native save dialog.
+/// user's native save dialog. Async + `spawn_blocking`: a sync command runs
+/// on the main thread, and a large transcript write has no business
+/// stalling the UI.
 #[tauri::command]
-pub fn write_file(path: String, content: String) -> Result<(), String> {
-    std::fs::write(&path, content).map_err(|e| format!("could not write {path}: {e}"))
+pub async fn write_file(path: String, content: String) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        std::fs::write(&path, content).map_err(|e| format!("could not write {path}: {e}"))
+    })
+    .await
+    .map_err(|e| format!("file write task panicked: {e}"))?
 }
 
 /// Read a text file for inlining into a chat-only message (Phase 9). Rejects
@@ -135,6 +141,12 @@ fn read_file_any_from_bytes(bytes: Vec<u8>, name: &str) -> Result<FileAttachment
     }
 }
 
+/// Upper bound for [`copy_file_into_chat_folder`]: big enough for any real
+/// document/photo/recording someone attaches, small enough that a
+/// pathological pick can't spend minutes duplicating gigabytes into the
+/// chat folder while the user waits.
+const COPY_INTO_CHAT_FOLDER_MAX_BYTES: u64 = 512 * 1024 * 1024;
+
 /// Copy a file into a chat session's own working directory, so the model's
 /// own file tools can actually open it — real, observed bug fix: a file
 /// attached in thought-partner (chat-only) mode that can't be inlined as text
@@ -150,9 +162,22 @@ fn read_file_any_from_bytes(bytes: Vec<u8>, name: &str) -> Result<FileAttachment
 /// untouched either way (`fs::copy`, not a move). Returns the copied file's
 /// own name (not the full path — the model only ever needs the relative
 /// name, since it already believes `cwd` to be "here").
+///
+/// Async + `spawn_blocking` (same pattern as `read_file_any`): a sync
+/// command runs on the main thread, and an unbounded copy of a large
+/// attachment froze the UI. Capped at [`COPY_INTO_CHAT_FOLDER_MAX_BYTES`].
 #[tauri::command]
-pub fn copy_file_into_chat_folder(source_path: String, cwd: String) -> Result<String, String> {
-    let source = PathBuf::from(&source_path);
+pub async fn copy_file_into_chat_folder(source_path: String, cwd: String) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || copy_file_into_chat_folder_blocking(&source_path, &cwd))
+        .await
+        .map_err(|e| format!("file copy task panicked: {e}"))?
+}
+
+/// Blocking half of [`copy_file_into_chat_folder`], split out so the
+/// `spawn_blocking` wrapper stays trivial and the logic stays unit-testable
+/// without a runtime.
+fn copy_file_into_chat_folder_blocking(source_path: &str, cwd: &str) -> Result<String, String> {
+    let source = PathBuf::from(source_path);
     let file_name = source
         .file_name()
         .ok_or_else(|| format!("'{source_path}' has no file name"))?;
@@ -162,7 +187,15 @@ pub fn copy_file_into_chat_folder(source_path: String, cwd: String) -> Result<St
         .unwrap_or_default();
     let ext = source.extension().map(|e| e.to_string_lossy().to_string());
 
-    let dest_dir = PathBuf::from(&cwd);
+    let meta = std::fs::metadata(&source).map_err(|e| format!("could not open {source_path}: {e}"))?;
+    if meta.len() > COPY_INTO_CHAT_FOLDER_MAX_BYTES {
+        return Err(format!(
+            "File is too large to attach (> {} MB).",
+            COPY_INTO_CHAT_FOLDER_MAX_BYTES / (1024 * 1024)
+        ));
+    }
+
+    let dest_dir = PathBuf::from(cwd);
     std::fs::create_dir_all(&dest_dir)
         .map_err(|e| format!("could not create working directory {cwd}: {e}"))?;
 
@@ -196,24 +229,30 @@ pub struct PathInfo {
 }
 
 /// Inspect dropped paths so the composer can show file/folder chips.
+/// Async + `spawn_blocking`: each entry is a disk `metadata` call, and a
+/// sync command runs on the main thread.
 #[tauri::command]
-pub fn inspect_paths(paths: Vec<String>) -> Result<Vec<PathInfo>, String> {
-    Ok(paths
-        .into_iter()
-        .map(|p| {
-            let path = PathBuf::from(&p);
-            let meta = std::fs::metadata(&path);
-            PathInfo {
-                name: path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| p.clone()),
-                is_dir: meta.as_ref().map(|m| m.is_dir()).unwrap_or(false),
-                exists: meta.is_ok(),
-                path: p,
-            }
-        })
-        .collect())
+pub async fn inspect_paths(paths: Vec<String>) -> Result<Vec<PathInfo>, String> {
+    tokio::task::spawn_blocking(move || {
+        paths
+            .into_iter()
+            .map(|p| {
+                let path = PathBuf::from(&p);
+                let meta = std::fs::metadata(&path);
+                PathInfo {
+                    name: path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| p.clone()),
+                    is_dir: meta.as_ref().map(|m| m.is_dir()).unwrap_or(false),
+                    exists: meta.is_ok(),
+                    path: p,
+                }
+            })
+            .collect::<Vec<PathInfo>>()
+    })
+    .await
+    .map_err(|e| format!("path inspection task panicked: {e}"))
 }
 
 /// Open a file/folder with the OS default handler (artifacts "Open").
@@ -232,6 +271,72 @@ pub fn reveal_path(app: AppHandle, path: String) -> Result<(), String> {
     app.opener()
         .reveal_item_in_dir(&path)
         .map_err(|e| format!("could not reveal {path}: {e}"))
+}
+
+/// Save a copy of an artifact wherever the user chooses ("Download").
+///
+/// This exists for Android, where the chat folder lives inside the app's
+/// private data directory: `open_path` / `reveal_path` are useless there
+/// because no other app — including the system Files app — can see into it,
+/// so a file the model wrote would otherwise be trapped. The save dialog maps
+/// to `ACTION_CREATE_DOCUMENT`, which hands back a `content://` URI the user
+/// picked (typically Downloads), granting write access to that one document
+/// without the app holding any storage permission.
+///
+/// Returns `Ok(false)` when the user dismissed the dialog — a cancel is a
+/// normal outcome, not an error the UI should report.
+#[tauri::command]
+pub async fn download_file(app: AppHandle, path: String) -> Result<bool, String> {
+    use tauri_plugin_dialog::DialogExt;
+
+    let source = PathBuf::from(&path);
+    let name = source
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .ok_or_else(|| format!("{path} has no file name"))?;
+
+    // The dialog is callback-based on every platform; bridge it to async so
+    // the command can await the choice and report the copy's outcome.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .set_file_name(&name)
+        .save_file(move |chosen| {
+            let _ = tx.send(chosen);
+        });
+    let Some(target) = rx.await.map_err(|_| "the save dialog closed unexpectedly")? else {
+        return Ok(false);
+    };
+
+    #[cfg(target_os = "android")]
+    {
+        // A `content://` URI is not a filesystem path, so it can't be
+        // `fs::copy`d — the fs plugin resolves it through the Android
+        // ContentResolver and hands back a real file descriptor.
+        use std::io::Write;
+        use tauri_plugin_fs::{FsExt, OpenOptions};
+
+        let bytes = std::fs::read(&source).map_err(|e| format!("could not read {name}: {e}"))?;
+        let mut opts = OpenOptions::new();
+        opts.write(true).truncate(true);
+        let mut out = app
+            .fs()
+            .open(target, opts.clone())
+            .map_err(|e| format!("could not open the chosen location: {e}"))?;
+        out.write_all(&bytes)
+            .map_err(|e| format!("could not save {name}: {e}"))?;
+        out.flush()
+            .map_err(|e| format!("could not save {name}: {e}"))?;
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let dest = target
+            .into_path()
+            .map_err(|e| format!("could not resolve the chosen location: {e}"))?;
+        std::fs::copy(&source, &dest).map_err(|e| format!("could not save {name}: {e}"))?;
+    }
+
+    Ok(true)
 }
 
 /// A single file found in a `list_directory` scan (artifacts pane disk-scan).
@@ -312,9 +417,9 @@ mod tests {
         let src_file = src_dir.join("report.docx");
         std::fs::write(&src_file, b"fake docx bytes").unwrap();
 
-        let name = copy_file_into_chat_folder(
-            src_file.to_string_lossy().to_string(),
-            cwd_dir.to_string_lossy().to_string(),
+        let name = copy_file_into_chat_folder_blocking(
+            &src_file.to_string_lossy(),
+            &cwd_dir.to_string_lossy(),
         )
         .unwrap();
 
@@ -336,9 +441,9 @@ mod tests {
         std::fs::write(&src_file, b"first").unwrap();
         std::fs::write(cwd_dir.join("notes.pdf"), b"already here").unwrap();
 
-        let name = copy_file_into_chat_folder(
-            src_file.to_string_lossy().to_string(),
-            cwd_dir.to_string_lossy().to_string(),
+        let name = copy_file_into_chat_folder_blocking(
+            &src_file.to_string_lossy(),
+            &cwd_dir.to_string_lossy(),
         )
         .unwrap();
 
@@ -361,9 +466,9 @@ mod tests {
         let src_file = src_dir.join("a.txt");
         std::fs::write(&src_file, b"x").unwrap();
 
-        let name = copy_file_into_chat_folder(
-            src_file.to_string_lossy().to_string(),
-            cwd_dir.to_string_lossy().to_string(),
+        let name = copy_file_into_chat_folder_blocking(
+            &src_file.to_string_lossy(),
+            &cwd_dir.to_string_lossy(),
         )
         .unwrap();
 
@@ -374,10 +479,38 @@ mod tests {
     #[test]
     fn errors_when_the_source_file_does_not_exist() {
         let cwd_dir = temp_subdir("missing_src_cwd");
-        let result = copy_file_into_chat_folder(
-            "C:/definitely/does/not/exist.docx".to_string(),
-            cwd_dir.to_string_lossy().to_string(),
+        let result = copy_file_into_chat_folder_blocking(
+            "C:/definitely/does/not/exist.docx",
+            &cwd_dir.to_string_lossy(),
         );
         assert!(result.is_err());
+    }
+
+    /// Regression (815bugs #8): an oversized attachment must be refused with
+    /// a user-safe error *before* any copying happens — a sync command used
+    /// to run an unbounded copy on the main thread.
+    #[test]
+    fn rejects_a_source_over_the_size_cap_without_copying() {
+        let src_dir = temp_subdir("cap_src");
+        let cwd_dir = temp_subdir("cap_cwd");
+        let src_file = src_dir.join("huge.bin");
+        {
+            let f = std::fs::File::create(&src_file).unwrap();
+            // Sparse extension: no real bytes are written, but metadata
+            // reports the full length — exactly what the cap check reads.
+            f.set_len(COPY_INTO_CHAT_FOLDER_MAX_BYTES + 1).unwrap();
+        }
+
+        let err = copy_file_into_chat_folder_blocking(
+            &src_file.to_string_lossy(),
+            &cwd_dir.to_string_lossy(),
+        )
+        .unwrap_err();
+
+        assert!(err.contains("too large"), "unexpected error: {err}");
+        assert!(
+            std::fs::read_dir(&cwd_dir).unwrap().next().is_none(),
+            "nothing may be copied into the chat folder"
+        );
     }
 }

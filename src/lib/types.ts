@@ -16,7 +16,6 @@ export interface Config {
   clipboard_hotkey: string | null;
   open_window_hotkey: string | null;
   default_context_folder: string | null;
-  ollama_base_url: string;
   setup_completed: boolean;
   theme: string;
   background_image: string | null;
@@ -155,6 +154,9 @@ export interface ProviderProfile {
   /** STOPGAP client-side workaround (see chatStore.ts's send()) — Goose has no
       native hook for this yet; remove once block/goose#7617 or equivalent lands. */
   strip_reasoning: boolean;
+  /** Manual override that widens image support beyond name-based detection
+      (see `vision_models.ts` and the Rust field's doc comment). */
+  supports_vision: boolean;
   /** Custom system prompt; `null` = use the built-in mode-appropriate default
       (see system_prompts.ts). STOPGAP-adjacent — prepended client-side to a
       session's first message (chatStore.ts's send()), since Goose's ACP has no
@@ -565,6 +567,11 @@ export interface SessionInfo {
       single-option "off"-only model — see `parse_thinking_effort` in
       commands/session.rs). Live per-session control, no goosed restart. */
   thinking_effort: ThinkingEffort | null;
+  /** True when `cwd` is a private per-chat folder (no explicit working
+      directory chosen) — the chat header renders this as "thought partner"
+      rather than a folder pill. Mirrors `SessionInfo.is_default_folder` in
+      commands/session/crud.rs. */
+  is_default_folder: boolean;
 }
 
 export interface EffortOption {

@@ -31,6 +31,9 @@ pub fn resolve(name: &str) -> Option<SamplingParams> {
             presence_penalty: Some(0.05),
             frequency_penalty: Some(0.0),
             max_tokens: None,
+            // A preset is about creativity, not reasoning — effort is set by
+            // the loop from the session's own thinking-effort choice.
+            effort: None,
         }),
         "balanced" => Some(SamplingParams {
             temperature: Some(0.6),
@@ -40,6 +43,9 @@ pub fn resolve(name: &str) -> Option<SamplingParams> {
             presence_penalty: Some(0.05),
             frequency_penalty: Some(0.0),
             max_tokens: None,
+            // A preset is about creativity, not reasoning — effort is set by
+            // the loop from the session's own thinking-effort choice.
+            effort: None,
         }),
         "creative" => Some(SamplingParams {
             temperature: Some(1.0),
@@ -51,6 +57,9 @@ pub fn resolve(name: &str) -> Option<SamplingParams> {
             presence_penalty: Some(0.1),
             frequency_penalty: Some(0.0),
             max_tokens: None,
+            // A preset is about creativity, not reasoning — effort is set by
+            // the loop from the session's own thinking-effort choice.
+            effort: None,
         }),
         _ => None,
     }

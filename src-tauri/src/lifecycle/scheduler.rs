@@ -49,7 +49,7 @@ pub fn spawn_scheduler_loop(app: AppHandle) {
 
 async fn fire_scheduled_task(app: &AppHandle, task: crate::config::scheduled_tasks::ScheduledTask) {
     tracing::info!("scheduled task '{}' ({}) firing", task.name, task.id);
-    match crate::commands::new_session(app.clone(), task.cwd.clone(), None).await {
+    let sent = match crate::commands::new_session(app.clone(), task.cwd.clone()).await {
         Ok(info) => {
             // Stamp the task's model override (D3) onto the session *before*
             // sending, so the very first turn runs on it.
@@ -84,7 +84,7 @@ async fn fire_scheduled_task(app: &AppHandle, task: crate::config::scheduled_tas
                     ),
                 }
             }
-            if let Err(e) = crate::commands::send_prompt(
+            match crate::commands::send_prompt(
                 app.clone(),
                 info.session_id,
                 task.prompt.clone(),
@@ -92,7 +92,11 @@ async fn fire_scheduled_task(app: &AppHandle, task: crate::config::scheduled_tas
             )
             .await
             {
-                tracing::warn!("scheduled task '{}' failed to send: {e}", task.id);
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::warn!("scheduled task '{}' failed to send: {e}", task.id);
+                    false
+                }
             }
         }
         Err(e) => {
@@ -100,9 +104,24 @@ async fn fire_scheduled_task(app: &AppHandle, task: crate::config::scheduled_tas
                 "scheduled task '{}' failed to start a session: {e}",
                 task.id
             );
+            false
         }
+    };
+    if sent {
+        advance_scheduled_task(app, &task.id);
+    } else {
+        // Deliberately *not* advanced: leaving `next_fire` past-due makes the
+        // next 30s tick retry the task — a send failure here is transient by
+        // assumption (the daemon being down/restarting), and the old
+        // unconditional advance silently disabled a one-shot that never
+        // actually ran. The miss policy above ("advance forward from now, no
+        // backfill") still applies to *successful* fires, so a retried task
+        // runs once, not once per missed interval.
+        tracing::warn!(
+            "scheduled task '{}' was not delivered; it stays past-due and the next tick will retry it",
+            task.id
+        );
     }
-    advance_scheduled_task(app, &task.id);
 }
 
 fn advance_scheduled_task(app: &AppHandle, task_id: &str) {

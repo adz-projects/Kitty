@@ -21,6 +21,9 @@ pub struct SessionInfo {
     pub available_modes: Vec<ModeInfo>,
     /// `None` when the active model doesn't support effort control at all.
     pub thinking_effort: Option<ThinkingEffort>,
+    /// True when `cwd` is a private per-chat folder (no explicit working
+    /// directory chosen) — the chat header renders this as "thought partner".
+    pub is_default_folder: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -31,25 +34,21 @@ pub struct ModeInfo {
 }
 
 /// Start a new session. An explicit `cwd` (e.g. a dropped folder) overrides
-/// the default per-chat folder. `mode` ("chat"|"agentic") seeds BigTiny's
-/// directory-sandboxing scope from creation — see `bigtiny::sessions::create`.
-/// The session is stamped with the currently-active provider/model from birth
+/// the default per-chat folder. The session is stamped with the currently-active provider/model from birth
 /// (per-session provider isolation), so a later global provider change never
 /// retroactively flips this session.
 #[tauri::command]
-pub async fn new_session(
-    app: AppHandle,
-    cwd: Option<String>,
-    mode: Option<String>,
-) -> Result<SessionInfo, String> {
+pub async fn new_session(app: AppHandle, cwd: Option<String>) -> Result<SessionInfo, String> {
     let cwd = match cwd {
         Some(c) if !c.trim().is_empty() => {
             let c_for_blocking = c.clone();
-            let _ =
-                tokio::task::spawn_blocking(move || std::fs::create_dir_all(&c_for_blocking)).await;
+            tokio::task::spawn_blocking(move || std::fs::create_dir_all(&c_for_blocking))
+                .await
+                .map_err(|e| format!("working-directory creation task panicked: {e}"))?
+                .map_err(|e| format!("could not create the working directory {c}: {e}"))?;
             c.replace('\\', "/")
         }
-        _ => resolve_cwd(&app).await,
+        _ => resolve_cwd(&app).await?,
     };
     // Resolve the global default provider/model to pin onto this session.
     let active: (Option<String>, Option<String>) = {
@@ -62,7 +61,7 @@ pub async fn new_session(
             .map(|p| (Some(p.id.clone()), p.models.first().cloned()));
         provider.unwrap_or((None, None))
     };
-    crate::bigtiny::sessions::create(&app, cwd, mode, active.0, active.1).await
+    crate::bigtiny::sessions::create(&app, cwd, active.0, active.1).await
 }
 
 /// Attach one recipe-declared extension to a live session — a no-op under
@@ -403,8 +402,8 @@ pub async fn rename_session(
 
 /// Delete every session (Settings → General "Clear all chat history" — a
 /// standalone destructive action, unrelated to provider switching). Also
-/// clears `session_folders`/`session_modes` (app-side organization that can't
-/// refer to a now-deleted session) and the active-session pointer.
+/// clears `session_folders` (app-side organization that can't refer to a
+/// now-deleted session) and the active-session pointer.
 #[tauri::command]
 pub async fn clear_all_sessions(app: AppHandle) -> Result<usize, String> {
     let sessions = crate::bigtiny::sessions::list(&app).await?;
@@ -445,7 +444,6 @@ pub async fn clear_all_sessions(app: AppHandle) -> Result<usize, String> {
         let state = app.state::<AppState>();
         let mut cfg = state.config.lock().unwrap();
         cfg.session_folders.clear();
-        cfg.session_modes.clear();
         config::save(&cfg).map_err(|e| e.to_string())?;
         *state.active_session.lock().unwrap() = None;
     }

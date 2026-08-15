@@ -38,6 +38,12 @@ pub enum StorageError {
     #[error("migration error: {0}")]
     Migration(#[from] sqlx::migrate::MigrateError),
 
+    /// A looked-up row does not exist — lets HTTP layers map to 404 by
+    /// variant instead of substring-matching the message (which flipped
+    /// 404/500 the moment the wording changed).
+    #[error("not found: {0}")]
+    NotFound(String),
+
     #[error("storage error: {0}")]
     Generic(String),
 }
@@ -129,6 +135,9 @@ pub enum RecipeError {
 
     #[error("storage error: {0}")]
     Storage(#[from] StorageError),
+
+    #[error("turn failed: {0}")]
+    TurnFailed(String),
 }
 
 #[derive(Error, Debug)]

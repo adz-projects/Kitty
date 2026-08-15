@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { isChatMode, useChatStore } from '@/stores/chatStore';
+import { useChatStore } from '@/stores/chatStore';
 import { ipc, onRecipesChanged, pickFiles } from '@/lib/ipc';
 import { matchRecipeCommand, primaryParameter, recipeNeedsAttention } from '@/lib/recipes';
 import type { Recipe } from '@/lib/types';
@@ -7,8 +7,9 @@ import { usePopoverPosition } from '@/lib/usePopoverPosition';
 import { useRecipeAutocomplete } from '@/lib/useRecipeAutocomplete';
 import { UploadIcon } from '@/components/icons/UploadIcon';
 import { CameraIcon } from '@/components/icons/CameraIcon';
+import { isAndroid } from '@/lib/platform';
 import { WarningIcon } from '@/components/icons/WarningIcon';
-import { supportsImages } from '@/lib/vision_models';
+import { modelAcceptsImages } from '@/lib/vision_models';
 
 // Pastes larger than this (chat-only mode) collapse into a document attachment.
 const PASTE_THRESHOLD = 500;
@@ -48,11 +49,12 @@ export function Composer({
 }) {
   const [text, setText] = useState('');
   const ref = useRef<HTMLTextAreaElement>(null);
-  const chatOnly = useChatStore(isChatMode);
   const addPastedText = useChatStore((s) => s.addPastedText);
   const addDroppedPaths = useChatStore((s) => s.addDroppedPaths);
   const addPendingImage = useChatStore((s) => s.addPendingImage);
   const model = useChatStore((s) => s.model);
+  const providerSupportsVision = useChatStore((s) => s.providerSupportsVision);
+  const canAttachImages = modelAcceptsImages(model, providerSupportsVision);
   const sendWithRecipe = useChatStore((s) => s.sendWithRecipe);
   const compact = useChatStore((s) => s.compact);
   const stopPhase = useChatStore((s) => s.stopPhase);
@@ -169,12 +171,6 @@ export function Composer({
   // just relying on `addPendingImage`'s own gate) so a doomed capture never
   // shows the full-screen overlay in the first place.
   const captureScreenshot = async () => {
-    if (!supportsImages(model)) {
-      useChatStore.setState({
-        warning: "The active model doesn't support images — screenshot not attached.",
-      });
-      return;
-    }
     try {
       const { mime, data_url } = await ipc.captureScreenshotRegion();
       addPendingImage(mime, data_url);
@@ -200,15 +196,26 @@ export function Composer({
       >
         <UploadIcon />
       </button>
-      <button
-        className="composer-attach"
-        onClick={() => void captureScreenshot()}
-        title="Capture a screenshot region"
-        aria-label="Capture a screenshot region"
-        disabled={concluded}
-      >
-        <CameraIcon />
-      </button>
+      {/* Region capture is a Win32 GDI screen grab driven by a
+          transparent always-on-top selection window — `commands::screenshot`
+          is `#[cfg(windows)]` and the window it needs cannot exist on
+          Android, so the button could only ever fail.
+          Also hidden when the active model can't see images: the button used
+          to be always-on and answer a click with "the active model doesn't
+          support images", which is a worse way to say the same thing than not
+          offering it. `canAttachImages` honors the provider's manual override,
+          so a vision model the name patterns don't recognize still gets it. */}
+      {!isAndroid() && canAttachImages && (
+        <button
+          className="composer-attach"
+          onClick={() => void captureScreenshot()}
+          title="Capture a screenshot region"
+          aria-label="Capture a screenshot region"
+          disabled={concluded}
+        >
+          <CameraIcon />
+        </button>
+      )}
       <textarea
         disabled={concluded}
         ref={(el: HTMLTextAreaElement | null) => {
@@ -246,6 +253,10 @@ export function Composer({
             }
             if (e.key === 'Escape') {
               e.preventDefault();
+              // Keep this Escape from bubbling to the overlay window's own
+              // keydown handler, which hides the whole overlay — dismissing
+              // just the dropdown must not take the window with it.
+              e.stopPropagation();
               dismiss();
               return;
             }
@@ -261,7 +272,6 @@ export function Composer({
           }
         }}
         onPaste={(e) => {
-          if (!chatOnly) return; // agentic mode keeps native paste
           const pasted = e.clipboardData.getData('text');
           if (pasted.length > PASTE_THRESHOLD) {
             e.preventDefault();

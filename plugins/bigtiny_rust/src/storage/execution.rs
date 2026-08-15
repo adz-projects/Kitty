@@ -66,12 +66,18 @@ pub async fn update_execution_status(
 pub async fn get_executions_for_recipe(
     pool: &SqlitePool,
     recipe_id: &str,
+    limit: i64,
 ) -> Result<Vec<ExecutionRow>, StorageError> {
+    // `LIMIT` pushed into SQL (and `trigger_id` indexed by migration 014) —
+    // `execution_history` only ever grows, so an unbounded
+    // `WHERE trigger_id = ?` was a full table scan materializing every
+    // historical run on each call.
     let rows = sqlx::query_as::<_, ExecutionRow>(
         r#"SELECT id, session_id, trigger_type, trigger_id, status, started_at, completed_at, result_summary, error_message
-           FROM execution_history WHERE trigger_id = ? ORDER BY started_at DESC"#
+           FROM execution_history WHERE trigger_id = ? ORDER BY started_at DESC LIMIT ?"#
     )
     .bind(recipe_id)
+    .bind(limit.max(0))
     .fetch_all(pool)
     .await?;
     Ok(rows)

@@ -227,8 +227,12 @@ pub async fn preflight_recall(
     let mut all_rows: Vec<MessageRow> = Vec::new();
     for (rowid, score) in candidates {
         // Apply the gate in code so the score above is always observable.
+        // FTS5 bm25: MORE NEGATIVE = BETTER match, so the threshold keeps
+        // `score <= t` and rejects everything above it. (The old `score <= t`
+        // reject did exactly the opposite — kept the worst matches, dropped
+        // the best.)
         if let Some(t) = cfg.bm25_threshold {
-            if score <= t {
+            if score > t {
                 continue;
             }
         }
@@ -426,8 +430,12 @@ mod tests {
         );
     }
 
+    /// Direction-pinning test for the bm25 gate: FTS5 bm25 scores are
+    /// negative and MORE NEGATIVE = MORE RELEVANT, so the gate keeps
+    /// `score <= t`. The old comparison was inverted (`score <= t` *rejected*),
+    /// which kept the worst matches and dropped the best.
     #[tokio::test]
-    async fn preflight_rejects_below_bar_bm25() {
+    async fn preflight_bm25_threshold_keeps_best_matches_and_rejects_worse_ones() {
         let pool = test_pool().await;
         crate::storage::sessions::create_session(&pool, "s1", "Test")
             .await
@@ -443,7 +451,9 @@ mod tests {
         )
         .await;
 
-        // An impossible-to-satisfy gate (all scores are negative) must yield None.
+        // t = 0.0 keeps every real match: all bm25 scores are negative, so
+        // `score <= 0.0` is always true — the gate is a no-op and the
+        // exchange must be injected.
         let cfg = MemoryConfig {
             bm25_threshold: Some(0.0),
             ..Default::default()
@@ -452,8 +462,22 @@ mod tests {
             preflight_recall(&pool, "s1", "what was the decoherence rate", 2, &cfg)
                 .await
                 .unwrap()
+                .is_some(),
+            "score <= 0.0 must PASS the gate (negative scores are the good ones)"
+        );
+
+        // An impossibly-strict negative threshold rejects everything:
+        // `score <= -1e9` is never true for a real match.
+        let cfg = MemoryConfig {
+            bm25_threshold: Some(-1e9),
+            ..Default::default()
+        };
+        assert!(
+            preflight_recall(&pool, "s1", "what was the decoherence rate", 2, &cfg)
+                .await
+                .unwrap()
                 .is_none(),
-            "score <= 0.0 must be rejected by the threshold gate"
+            "scores above the threshold must be rejected"
         );
     }
 

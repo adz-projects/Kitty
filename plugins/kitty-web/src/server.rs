@@ -102,16 +102,38 @@ impl KittyWebServer {
 fn guarded(f: impl FnOnce() -> String) -> String {
     match catch_unwind(AssertUnwindSafe(f)) {
         Ok(s) => s,
-        Err(_) => error_response(
-            "INTERNAL_PANIC",
-            "An internal error occurred while processing this request.",
-            None,
-            Some(
-                "Retry with a different input; if this persists, the input may be malformed \
-                 in a way this tool doesn't yet handle.",
-            ),
-        ),
+        Err(_) => panic_envelope(),
     }
+}
+
+fn panic_envelope() -> String {
+    error_response(
+        "INTERNAL_PANIC",
+        "An internal error occurred while processing this request.",
+        None,
+        Some(
+            "Retry with a different input; if this persists, the input may be malformed \
+             in a way this tool doesn't yet handle.",
+        ),
+    )
+}
+
+/// The async analogue of `guarded` for the network-bound tools (audit #132):
+/// a panic anywhere in the future — including inside an `.await`ed extraction
+/// pipeline — becomes the same structured `INTERNAL_PANIC` envelope instead
+/// of unwinding the rmcp task. `catch_unwind` can't wrap a future directly,
+/// so each poll is guarded individually; a panicked poll resolves the whole
+/// future to the envelope.
+async fn guarded_async<F>(fut: F) -> String
+where
+    F: std::future::Future<Output = String>,
+{
+    let mut fut = std::pin::pin!(fut);
+    std::future::poll_fn(|cx| match catch_unwind(AssertUnwindSafe(|| fut.as_mut().poll(cx))) {
+        Ok(poll) => poll,
+        Err(_) => std::task::Poll::Ready(panic_envelope()),
+    })
+    .await
 }
 
 #[tool_router(router = web_tool_router)]
@@ -121,13 +143,13 @@ impl KittyWebServer {
         description = "Searches the web. count<=5 (default): Brave if configured, DuckDuckGo only as a fallback on Brave failure. count 6-10: queries Brave AND DuckDuckGo together for broader coverage, still returned inline. count>10: same broadened fetch, but the full result set is offloaded to disk and a compact keyword index is returned instead of full detail. Every call returns a search_id; a large inline reply may be auto-downgraded to the keyword index (see \"downgraded_to_index\" in the response metadata). Follow up with lean_web_search_read_chunk for full detail on any id."
     )]
     pub async fn web_search(&self, Parameters(req): Parameters<WebSearchRequest>) -> String {
-        search::web_search(
+        guarded_async(search::web_search(
             &req.query,
             req.count.unwrap_or(5) as usize,
             req.search_lang.as_deref().unwrap_or("en"),
             req.freshness.as_deref(),
             req.country.as_deref().unwrap_or("US"),
-        )
+        ))
         .await
     }
 
@@ -147,7 +169,7 @@ impl KittyWebServer {
         description = "Scrapes a URL into clean Markdown (or plain text) for an LLM to read. offset and the response's metadata.next_offset page through long pages by markdown block, without severing a table or heading mid-cut. A PDF URL is downloaded to the cache and its local path is returned — use lean_pdf_read_text or lean_pdf_read_outline on that path next. favor_precision=True favors precision over recall; the default favors recall, since documentation/API-reference pages often lose sidebars and short definition blocks under the precision-favoring mode."
     )]
     pub async fn web_scrape(&self, Parameters(req): Parameters<WebScrapeRequest>) -> String {
-        scrape::web_scrape(
+        guarded_async(scrape::web_scrape(
             &req.url,
             req.query.as_deref(),
             req.output_format.as_deref().unwrap_or("markdown"),
@@ -155,7 +177,7 @@ impl KittyWebServer {
             req.max_chars.map(|c| c as usize),
             req.include_links.unwrap_or(false),
             req.favor_precision.unwrap_or(false),
-        )
+        ))
         .await
     }
 }
@@ -192,5 +214,17 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["status"], "error");
         assert_eq!(v["error_code"], "INTERNAL_PANIC");
+    }
+
+    #[tokio::test]
+    async fn guarded_async_converts_a_panicking_future_into_a_structured_error() {
+        let out = guarded_async(async { panic!("boom") }).await;
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["status"], "error");
+        assert_eq!(v["error_code"], "INTERNAL_PANIC");
+
+        // A non-panicking future passes through untouched.
+        let out = guarded_async(async { "fine".to_string() }).await;
+        assert_eq!(out, "fine");
     }
 }

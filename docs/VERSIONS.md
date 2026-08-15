@@ -18,12 +18,22 @@ done until this file is updated and the affected code (`goosed/api.rs`,
 - **Streaming/reasoning surface:** ACP `session/update` **does** surface a distinct reasoning variant — `agent_thought_chunk` (separate from `agent_message_chunk`). Phase 10 renders it directly; no `<think>` splitting needed.
 - **Full ACP method/transport reference:** [acp-protocol.md](acp-protocol.md) (confirmed live 2026-07-04). Transport = WebSocket `ws://127.0.0.1:<port>/acp?token=<secret>`; readiness = `GET /status` + `X-Secret-Key`.
 
-## Ollama
+## Ollama — **HISTORICAL, no longer a dependency**
 
-- **Pinned/tested version:** **0.31.1** (confirmed live via `GET /api/version` and
-  `ollama --version`, Stage-1 close-out).
-- **Binary location:** `C:\Users\azolkover\AppData\Local\Programs\Ollama\ollama.exe` (detected).
-- **Endpoints used:** `GET /api/version`, `GET /api/tags`, `POST /api/pull` (NDJSON), `DELETE /api/delete`.
+Kitty managed an Ollama process through Phase 2a. Phase 2b removed it
+entirely: there is no detection, no install, no spawn, no supervision, and no
+`/api/pull`. Local inference is llama.cpp linked into the BigTiny daemon, and
+models arrive through the HuggingFace downloader (`src-tauri/src/models/`).
+
+What survives is one thing only: `provider_type: "ollama"` as a **remote**
+endpoint dialect, for a server the user runs themselves. That dialect surface
+is `provider/sampling.rs`, `openai_compat.rs`'s `top_k`/`min_p` wire gate,
+`bigtiny/providers.rs`'s `provider_dialect`, and `ProviderForm`'s matching
+fields — not a process lifecycle. Do not re-add one.
+
+Retained for the record: the version this was verified against was **0.31.1**
+(`GET /api/version`), and the endpoints used were `GET /api/version`,
+`GET /api/tags`, `POST /api/pull` (NDJSON), `DELETE /api/delete`.
 
 ## Stock Goose Desktop detection (Phase 1 `conflict.rs`)
 
@@ -136,9 +146,10 @@ historical context only; none of it reflects current code.
 
 ## Installer URLs & hashes (Phase 7; Goose auto-install added in the wizard redesign)
 
-- **Ollama Windows installer:** `https://ollama.com/download/OllamaSetup.exe`
-  (Inno Setup; hands off to its own UI/UAC — verify a silent flag before enabling
-  unattended install). Wired in `src-tauri/src/wizard.rs`.
+- **Ollama Windows installer:** ~~`https://ollama.com/download/OllamaSetup.exe`~~
+  — **dead.** The wizard no longer installs or detects Ollama (Phase 2b); the
+  local path is now "download a GGUF from HuggingFace" and the code that
+  fetched this URL is gone from `src-tauri/src/wizard.rs`.
 - **Goose:** _confirmed (Stage-1 close-out): there is no Windows `.exe`/`.msi`
   installer at all_ — the [releases page](https://github.com/aaif-goose/goose/releases/latest)
   (org renamed from `block/goose`; GitHub still redirects the old path) only

@@ -1,6 +1,13 @@
-import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type PointerEvent as ReactPointerEvent,
+} from 'react';
 import { UNCATEGORIZED, useSessionStore, type SessionGroup } from '@/stores/sessionStore';
 import { useChatStore } from '@/stores/chatStore';
+import { useRouteStore } from '@/stores/routeStore';
 import { onSessionCreated, onSessionDeleted, onFoldersChanged, onSessionsCleared } from '@/lib/ipc';
 import { SessionKebabMenu } from './SessionKebabMenu';
 import type { SessionSummary } from '@/lib/types';
@@ -29,6 +36,7 @@ export function SessionList() {
   // the 150ms-debounced `setQuery` on a keystroke, or a single session being
   // reassigned — even though nothing on screen necessarily moved.
   const loading = useSessionStore((s) => s.loading);
+  const loadError = useSessionStore((s) => s.loadError);
   const query = useSessionStore((s) => s.query);
   const folders = useSessionStore((s) => s.folders);
   const refresh = useSessionStore((s) => s.refresh);
@@ -37,6 +45,13 @@ export function SessionList() {
   const createFolder = useSessionStore((s) => s.createFolder);
   const grouped = useSessionStore((s) => s.grouped);
   const assignFolder = useSessionStore((s) => s.assignFolder);
+  // `grouped` is a stable function reference, so subscribing to it alone
+  // never re-renders this list — `grouped()` *reads* `sessions`/`assignments`
+  // out of the store, and these two subscriptions are what make a rename,
+  // delete, or cross-window folder move actually show up (a rename used to
+  // leave the old title on screen; a delete could ghost its row).
+  const sessions = useSessionStore((s) => s.sessions);
+  const assignments = useSessionStore((s) => s.assignments);
   const activeId = useChatStore((s) => s.sessionId);
 
   const [dragId, setDragId] = useState<string | null>(null);
@@ -161,7 +176,15 @@ export function SessionList() {
     dragState.current = { sessionId, startX: e.clientX, startY: e.clientY, dragging: false };
   };
 
-  const groups = grouped();
+  const groups = useMemo(
+    () => grouped(),
+    // `grouped()` derives from all four of these store slices (via `filtered`
+    // + the folder map) — recompute only when one of them actually changes.
+    // The linter calls them unnecessary because it can't see through the
+    // stable `grouped` function reference; they are the entire point.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [grouped, sessions, assignments, folders, query]
+  );
   const total = groups.reduce((n, g) => n + g.sessions.length, 0);
 
   const [creatingFolder, setCreatingFolder] = useState(false);
@@ -218,6 +241,19 @@ export function SessionList() {
           ＋ Folder
         </button>
       </div>
+
+      {/* `loadError` covers both a failed refresh and a failed delete. It was
+          being set by the store and rendered by nobody, which is what made a
+          delete that the backend rejected look like it had silently done
+          nothing — the row simply stayed put with no explanation. */}
+      {loadError && (
+        <p className="session-empty error" role="alert">
+          {loadError}{' '}
+          <button className="link" onClick={() => void refresh()}>
+            Retry
+          </button>
+        </p>
+      )}
 
       {loading && total === 0 && <p className="muted session-empty">Loading…</p>}
       {!loading && total === 0 && folders.length === 0 && (
@@ -430,6 +466,7 @@ function SessionRow({
   // (or the whole store) re-renders every row when any other session moves.
   const current = useSessionStore((state) => state.assignments[s.sessionId] ?? '');
   const loadSession = useChatStore((st) => st.loadSession);
+  const goto = useRouteStore((st) => st.goto);
   const [confirmingDelete, setConfirmingDelete] = useState(false);
   const [renaming, setRenaming] = useState(false);
   const [renameValue, setRenameValue] = useState(s.title);
@@ -462,6 +499,12 @@ function SessionRow({
       onClick={() => {
         if (didDrag.current || resuming) return;
         setResuming(true);
+        // Route to the chat view as well as loading it. On desktop this list
+        // sits beside the conversation and the route is already 'chat', so
+        // this is a no-op; on Android the list *is* its own tab ("Saved
+        // Chats"), and loading a session without switching tabs left the user
+        // staring at the list wondering whether the tap registered.
+        goto('chat');
         void loadSession(s.sessionId, s.cwd, s.title, s.providerId, s.modelId).finally(() =>
           setResuming(false)
         );

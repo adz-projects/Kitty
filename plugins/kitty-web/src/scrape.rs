@@ -17,6 +17,24 @@ use crate::query_filter::filter_by_query;
 
 pub const SCRAPE_MAX_CHARS_DEFAULT: usize = 12000;
 
+/// Hard cap on a downloaded response body, HTML or PDF (audit #112): a
+/// hostile or broken endpoint streaming gigabytes must not be buffered whole
+/// into memory. 32 MiB is far above any real documentation page, and above
+/// the PDF size `lean_pdf_read_text` accepts anyway.
+pub const SCRAPE_MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
+
+/// Redirect hops followed before giving up — mirrors reqwest's built-in
+/// default (10), which the custom SSRF redirect policy replaces (a custom
+/// policy does not inherit the cap).
+const MAX_REDIRECTS: usize = 10;
+
+/// Windows device basenames (compared case-insensitively, up to the first
+/// dot): a file whose stem is one of these is not a file at all on Windows.
+const WINDOWS_RESERVED_STEMS: [&str; 22] = [
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+    "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
 /// A complete, current-looking UA string. The Python original's note applies
 /// verbatim: a truncated UA ending at `AppleWebKit/537.36` with no
 /// `(KHTML, like Gecko) Chrome/... Safari/...` tail is a shape several WAFs
@@ -284,72 +302,92 @@ fn collect_subtree(el: scraper::ElementRef, out: &mut std::collections::HashSet<
     }
 }
 
+/// Hard cap on element nesting depth serialized (audit #113). Real pages
+/// nest a few dozen levels at most; past this the subtree is clipped rather
+/// than letting a hostile DOM balloon the output — or, with the old
+/// recursive walk, the call stack.
+const MAX_SERIALIZE_DEPTH: usize = 1_000;
+
 /// Re-serializes an element's subtree, skipping excluded nodes. Attributes
 /// are preserved for the tags `htmd` needs them on (`a[href]`, `img[alt]`),
 /// which is why this can't just be a text dump.
+///
+/// Iterative, with an explicit work stack: the recursive `serialize_node`
+/// this replaces overflowed the call stack (an uncatchable process abort)
+/// on a ~10k-deep DOM.
 fn serialize_without(
     root: scraper::ElementRef,
     excluded: &std::collections::HashSet<ego_tree::NodeId>,
 ) -> String {
-    let mut out = String::new();
-    serialize_node(*root, excluded, &mut out);
-    out
-}
-
-fn serialize_node(
-    node: ego_tree::NodeRef<scraper::Node>,
-    excluded: &std::collections::HashSet<ego_tree::NodeId>,
-    out: &mut String,
-) {
-    if excluded.contains(&node.id()) {
-        return;
+    enum Frame<'a> {
+        Enter(ego_tree::NodeRef<'a, scraper::Node>, usize),
+        Close(String),
     }
-    match node.value() {
-        scraper::Node::Text(t) => {
-            // Escaping matters: raw `<` in text would otherwise re-parse as
-            // markup on htmd's side.
-            for ch in t.chars() {
-                match ch {
-                    '<' => out.push_str("&lt;"),
-                    '>' => out.push_str("&gt;"),
-                    '&' => out.push_str("&amp;"),
-                    c => out.push(c),
+
+    let mut out = String::new();
+    let mut stack: Vec<Frame> = vec![Frame::Enter(*root, 0)];
+    while let Some(frame) = stack.pop() {
+        match frame {
+            Frame::Enter(node, depth) => {
+                if excluded.contains(&node.id()) {
+                    continue;
                 }
-            }
-        }
-        scraper::Node::Element(el) => {
-            let name = el.name();
-            out.push('<');
-            out.push_str(name);
-            for (attr, value) in el.attrs() {
-                if matches!(attr, "href" | "src" | "alt" | "title") {
-                    out.push(' ');
-                    out.push_str(attr);
-                    out.push_str("=\"");
-                    for ch in value.chars() {
-                        match ch {
-                            '"' => out.push_str("&quot;"),
-                            '&' => out.push_str("&amp;"),
-                            c => out.push(c),
+                match node.value() {
+                    scraper::Node::Text(t) => {
+                        // Escaping matters: raw `<` in text would otherwise
+                        // re-parse as markup on htmd's side.
+                        for ch in t.chars() {
+                            match ch {
+                                '<' => out.push_str("&lt;"),
+                                '>' => out.push_str("&gt;"),
+                                '&' => out.push_str("&amp;"),
+                                c => out.push(c),
+                            }
                         }
                     }
-                    out.push('"');
+                    scraper::Node::Element(el) => {
+                        let name = el.name();
+                        out.push('<');
+                        out.push_str(name);
+                        for (attr, value) in el.attrs() {
+                            if matches!(attr, "href" | "src" | "alt" | "title") {
+                                out.push(' ');
+                                out.push_str(attr);
+                                out.push_str("=\"");
+                                for ch in value.chars() {
+                                    match ch {
+                                        '"' => out.push_str("&quot;"),
+                                        '&' => out.push_str("&amp;"),
+                                        c => out.push(c),
+                                    }
+                                }
+                                out.push('"');
+                            }
+                        }
+                        out.push('>');
+                        stack.push(Frame::Close(name.to_string()));
+                        if depth < MAX_SERIALIZE_DEPTH {
+                            // Reversed so children serialize in document order.
+                            let children: Vec<_> = node.children().collect();
+                            stack.extend(children.into_iter().rev().map(|c| Frame::Enter(c, depth + 1)));
+                        }
+                    }
+                    _ => {
+                        if depth < MAX_SERIALIZE_DEPTH {
+                            let children: Vec<_> = node.children().collect();
+                            stack.extend(children.into_iter().rev().map(|c| Frame::Enter(c, depth + 1)));
+                        }
+                    }
                 }
             }
-            out.push('>');
-            for child in node.children() {
-                serialize_node(child, excluded, out);
-            }
-            out.push_str("</");
-            out.push_str(name);
-            out.push('>');
-        }
-        _ => {
-            for child in node.children() {
-                serialize_node(child, excluded, out);
+            Frame::Close(name) => {
+                out.push_str("</");
+                out.push_str(&name);
+                out.push('>');
             }
         }
     }
+    out
 }
 
 fn extract_metadata(document: &scraper::Html) -> PageMeta {
@@ -392,6 +430,13 @@ fn pdf_filename_for(stripped_url: &str) -> String {
     if !name.to_lowercase().ends_with(".pdf") {
         name.push_str(".pdf");
     }
+    // Windows reserved device names (audit #125): `CON.pdf` is the console,
+    // not a file, and writing it fails with a confusing error. Windows
+    // reserves the stem up to the first dot, so that is the segment checked.
+    let first_segment = name.split('.').next().unwrap_or("");
+    if WINDOWS_RESERVED_STEMS.contains(&first_segment.to_uppercase().as_str()) {
+        name = format!("{first_segment}_{}", &name[first_segment.len()..]);
+    }
     name
 }
 
@@ -404,6 +449,55 @@ fn cache_dir() -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join(".cache")
         .join("lean-goose-mcp")
+}
+
+/// Why a response-body read failed: the stream crossed the byte cap, or the
+/// transport did.
+#[derive(Debug)]
+pub enum BodyReadError {
+    TooLarge,
+    Network(reqwest::Error),
+}
+
+/// Reads a response body with a hard byte ceiling (audit #112): a
+/// `Content-Length` pre-check rejects obvious oversize up front, and the
+/// streaming accumulation caps the actual bytes — a lied-about or missing
+/// header can't sneak a huge body past. `chunk()` rather than
+/// `bytes_stream()` so this builds without reqwest's `stream` feature.
+pub async fn read_body_capped(mut response: reqwest::Response, cap: usize) -> Result<Vec<u8>, BodyReadError> {
+    if let Some(len) = response.content_length() {
+        if len > cap as u64 {
+            return Err(BodyReadError::TooLarge);
+        }
+    }
+    let mut buf = Vec::new();
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                if buf.len() + chunk.len() > cap {
+                    return Err(BodyReadError::TooLarge);
+                }
+                buf.extend_from_slice(&chunk);
+            }
+            Ok(None) => break,
+            Err(e) => return Err(BodyReadError::Network(e)),
+        }
+    }
+    Ok(buf)
+}
+
+/// The `SCRAPE_BLOCKED_URL` verdict, shared by the initial-URL rejection and
+/// a redirect-hop rejection (audit #109).
+fn ssrf_blocked(reason: &str) -> String {
+    error_response(
+        "SCRAPE_BLOCKED_URL",
+        "The URL was rejected by the scraper's fetch policy.",
+        Some(reason),
+        Some(
+            "Only public http/https URLs can be scraped — no loopback, private, link-local, \
+             or reserved addresses, and no non-http(s) schemes.",
+        ),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -420,9 +514,53 @@ pub async fn web_scrape(
     let stripped_url = stripped_url.split('#').next().unwrap_or(stripped_url);
     let looks_like_pdf = stripped_url.to_lowercase().ends_with(".pdf");
 
+    // SSRF guard (audit #109): the URL is model-supplied, so the scheme and
+    // the host's resolved IPs are validated before any request goes out, and
+    // again on every redirect hop via the custom policy below.
+    // `spawn_blocking` keeps the blocking DNS lookup off the reactor.
+    let parsed_url = match url::Url::parse(url) {
+        Ok(u) => u,
+        Err(e) => {
+            return error_response(
+                "SCRAPE_NETWORK_ERROR",
+                "Failed to communicate with the server.",
+                Some(&format!("invalid URL: {e}")),
+                Some("Check the URL's spelling and scheme."),
+            );
+        }
+    };
+    let check_target = parsed_url.clone();
+    match tokio::task::spawn_blocking(move || crate::ssrf::check_url(&check_target)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(reason)) => return ssrf_blocked(&reason),
+        Err(e) => {
+            return error_response(
+                "SCRAPE_NETWORK_ERROR",
+                "Failed to validate the URL.",
+                Some(&e.to_string()),
+                Some("Retry the request."),
+            );
+        }
+    }
+
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .connect_timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            // A custom policy does not inherit reqwest's 10-hop cap, so the
+            // limit is re-imposed here (mirroring `Policy::limited(10)`).
+            if attempt.previous().len() > MAX_REDIRECTS {
+                return attempt.error("too many redirects".to_string());
+            }
+            // Every hop is re-validated: a public page must not be able to
+            // 302 the fetch to an internal address. The DNS lookup inside
+            // `check_url` is blocking — unavoidable in this sync callback,
+            // and bounded by the hop cap.
+            match crate::ssrf::check_url(attempt.url()) {
+                Ok(()) => attempt.follow(),
+                Err(reason) => attempt.error(reason),
+            }
+        }))
         .build()
     {
         Ok(c) => c,
@@ -449,6 +587,11 @@ pub async fn web_scrape(
     {
         Ok(r) => r,
         Err(e) => {
+            if e.is_redirect() {
+                // The custom policy rejected a redirect target (or the hop
+                // cap fired): same verdict shape as a blocked initial URL.
+                return ssrf_blocked(&e.to_string());
+            }
             if e.is_timeout() {
                 return error_response(
                     "SCRAPE_TIMEOUT",
@@ -494,9 +637,17 @@ pub async fn web_scrape(
     let is_pdf = looks_like_pdf || content_type == "application/pdf";
 
     if is_pdf {
-        let bytes = match response.bytes().await {
+        let bytes = match read_body_capped(response, SCRAPE_MAX_BODY_BYTES).await {
             Ok(b) => b,
-            Err(e) => {
+            Err(BodyReadError::TooLarge) => {
+                return error_response(
+                    "SCRAPE_TOO_LARGE",
+                    &format!("The response body exceeded the {} MiB download cap.", SCRAPE_MAX_BODY_BYTES / (1024 * 1024)),
+                    Some(url),
+                    Some("Download the file directly and read it with lean_pdf_read_text instead."),
+                );
+            }
+            Err(BodyReadError::Network(e)) => {
                 return error_response(
                     "SCRAPE_NETWORK_ERROR",
                     "Failed to download the PDF body.",
@@ -544,9 +695,17 @@ pub async fn web_scrape(
         );
     }
 
-    let html = match response.text().await {
-        Ok(t) => t,
-        Err(e) => {
+    let html = match read_body_capped(response, SCRAPE_MAX_BODY_BYTES).await {
+        Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+        Err(BodyReadError::TooLarge) => {
+            return error_response(
+                "SCRAPE_TOO_LARGE",
+                &format!("The response body exceeded the {} MiB download cap.", SCRAPE_MAX_BODY_BYTES / (1024 * 1024)),
+                Some(url),
+                Some("Fetch a smaller page, or page through a lighter endpoint."),
+            );
+        }
+        Err(BodyReadError::Network(e)) => {
             return error_response(
                 "SCRAPE_NETWORK_ERROR",
                 "Failed to read the response body.",
@@ -556,18 +715,34 @@ pub async fn web_scrape(
         }
     };
 
-    render_scrape_result(
-        &html,
-        url,
-        &final_url,
-        &content_type,
-        query,
-        output_format,
-        offset,
-        max_chars,
-        include_links,
-        favor_precision,
-    )
+    // Extraction/serialization is CPU-bound DOM work — keep it off the
+    // reactor (audit #113). Owned copies cross the thread boundary.
+    let (url_owned, query_owned, format_owned) =
+        (url.to_string(), query.map(str::to_string), output_format.to_string());
+    let rendered = tokio::task::spawn_blocking(move || {
+        render_scrape_result(
+            &html,
+            &url_owned,
+            &final_url,
+            &content_type,
+            query_owned.as_deref(),
+            &format_owned,
+            offset,
+            max_chars,
+            include_links,
+            favor_precision,
+        )
+    })
+    .await;
+    match rendered {
+        Ok(s) => s,
+        Err(e) => error_response(
+            "INTERNAL_PANIC",
+            "An internal error occurred while processing this request.",
+            Some(&e.to_string()),
+            Some("Retry with a different URL; if this persists, the page's markup may be hitting a parser edge case."),
+        ),
+    }
 }
 
 /// The pure half of `web_scrape`: everything after the HTTP response body is
@@ -872,6 +1047,79 @@ mod tests {
         assert_eq!(pdf_filename_for("https://e.com/docs/my report.pdf"), "my_report.pdf");
         assert_eq!(pdf_filename_for("https://e.com/paper"), "paper.pdf");
         assert_eq!(pdf_filename_for("https://e.com/"), "downloaded.pdf");
+    }
+
+    #[test]
+    fn pdf_filename_suffixes_windows_reserved_stems() {
+        // `CON.pdf`/`NUL.pdf`/`COM1.pdf` are device names on Windows, not
+        // files — the stem must be suffixed (audit #125).
+        assert_eq!(pdf_filename_for("https://e.com/CON"), "CON_.pdf");
+        assert_eq!(pdf_filename_for("https://e.com/con.pdf"), "con_.pdf");
+        assert_eq!(pdf_filename_for("https://e.com/NUL.pdf"), "NUL_.pdf");
+        assert_eq!(pdf_filename_for("https://e.com/COM1.pdf"), "COM1_.pdf");
+        assert_eq!(pdf_filename_for("https://e.com/lpt9.pdf"), "lpt9_.pdf");
+        // Merely starting with a reserved stem is fine.
+        assert_eq!(pdf_filename_for("https://e.com/CONSOLE.pdf"), "CONSOLE.pdf");
+        assert_eq!(pdf_filename_for("https://e.com/contact.pdf"), "contact.pdf");
+    }
+
+    #[test]
+    fn deep_dom_does_not_overflow_the_stack() {
+        // ~20k nested elements: the recursive serializer this replaced
+        // aborted the process on input like this (audit #113). Shallow
+        // content must still extract; content past the depth cap is clipped.
+        let mut html = String::from("<html><body><article><p>shallow text</p>");
+        for _ in 0..20_000 {
+            html.push_str("<div>");
+        }
+        html.push_str("deep needle");
+        for _ in 0..20_000 {
+            html.push_str("</div>");
+        }
+        html.push_str("</article></body></html>");
+
+        let (md, _) = extract_markdown(&html, false, false).expect("must return, not abort");
+        assert!(md.contains("shallow text"), "shallow content lost: {md}");
+        assert!(!md.contains("deep needle"), "content past the depth cap must be clipped");
+    }
+
+    #[tokio::test]
+    async fn read_body_capped_rejects_oversized_bodies() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // One-shot loopback HTTP server (hermetic; no external network).
+        async fn serve_once(body: Vec<u8>, with_content_length: bool) -> String {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut req = [0u8; 4096];
+                let _ = sock.read(&mut req).await;
+                let head = if with_content_length {
+                    format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len())
+                } else {
+                    "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".to_string()
+                };
+                sock.write_all(head.as_bytes()).await.unwrap();
+                sock.write_all(&body).await.unwrap();
+            });
+            format!("http://{addr}/")
+        }
+
+        // Content-Length pre-check path.
+        let url = serve_once(vec![b'x'; 64 * 1024], true).await;
+        let resp = reqwest::Client::new().get(url).send().await.unwrap();
+        assert!(matches!(read_body_capped(resp, 1024).await, Err(BodyReadError::TooLarge)));
+
+        // Streaming path: no Content-Length header to pre-check.
+        let url = serve_once(vec![b'x'; 64 * 1024], false).await;
+        let resp = reqwest::Client::new().get(url).send().await.unwrap();
+        assert!(matches!(read_body_capped(resp, 1024).await, Err(BodyReadError::TooLarge)));
+
+        // A small body passes through whole.
+        let url = serve_once(b"hello body".to_vec(), true).await;
+        let resp = reqwest::Client::new().get(url).send().await.unwrap();
+        assert_eq!(read_body_capped(resp, 1024).await.unwrap(), b"hello body");
     }
 
     #[test]

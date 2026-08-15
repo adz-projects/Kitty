@@ -121,11 +121,24 @@ adaptive-pathway = { path = "../adaptive-pathway_rust" }
 # Android: static libc++ so the APK ships a single self-contained cdylib with
 # no helper `.so` to dlopen (docs/ANDROID.md §11, D22). OpenMP stays OFF — it
 # is deliberately absent from this feature list, not merely unlisted.
+#
+# **Vulkan on (ADDENDUM 3).** Without a GPU backend the support models
+# (summarizer + embedder) ran on all CPU cores, which cooked the phone and
+# starved the WebView. Vulkan is a system library on Android API 24+
+# (`libvulkan.so`), and `llama-cpp-sys-2` compiles the compute shaders to
+# SPIR-V at build time with host `glslc` (from the Vulkan SDK, same tool the
+# Windows build already needs) — so this only adds a *build-host* prerequisite,
+# not a device one. It only widens what the ggml device registry enumerates;
+# `local::backend::select_backend` still decides, and a device whose Vulkan
+# driver can't run the shaders falls back to CPU (now thread-capped, see
+# `local/engine.rs`). If the arm64 build can't find `glslc`, it dies in the
+# cmake step like the Ninja/libclang traps in docs/ANDROID.md §11.
 [target.'cfg(target_os = "android")'.dependencies]
 llama-cpp-2 = { version = "0.1.154", default-features = false, features = [
     "common",
     "android-static-stdcxx",
     "static-stdcxx",
+    "vulkan",
 ], optional = true }
 
 # Windows: **Vulkan on** (D20). Chosen over CUDA because it covers NVIDIA, AMD

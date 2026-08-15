@@ -72,8 +72,12 @@ export const MessageItem = memo(function MessageItem({
 
   const [copied, setCopied] = useState(false);
   const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Virtual-list rows unmount mid-write all the time (scrolling recycles
+  // them) — the clipboard promise resolving after that must not setState.
+  const mountedRef = useRef(true);
   useEffect(
     () => () => {
+      mountedRef.current = false;
       if (copyTimerRef.current) clearTimeout(copyTimerRef.current);
     },
     []
@@ -82,6 +86,7 @@ export const MessageItem = memo(function MessageItem({
     void navigator.clipboard
       .writeText(message.text)
       .then(() => {
+        if (!mountedRef.current) return;
         setCopied(true);
         if (copyTimerRef.current) clearTimeout(copyTimerRef.current);
         copyTimerRef.current = setTimeout(() => setCopied(false), 1200);

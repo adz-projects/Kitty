@@ -47,9 +47,15 @@ pub async fn capture_screenshot_region(app: AppHandle) -> Result<ImageAttachment
         *state.screenshot_selection.lock().unwrap() = Some(tx);
     }
 
-    windows::create_screenshot_select_window(&app, x, y, w, h)
-        .await
-        .map_err(|e| e.to_string())?;
+    if let Err(e) = windows::create_screenshot_select_window(&app, x, y, w, h).await {
+        // A failed window build must not leak the MB-scale base64 preview or
+        // the orphaned selection sender in AppState — the next capture's
+        // state would be polluted by both.
+        let state = app.state::<AppState>();
+        *state.screenshot_preview.lock().unwrap() = None;
+        *state.screenshot_selection.lock().unwrap() = None;
+        return Err(e.to_string());
+    }
     if let Some(win) = app.get_webview_window(windows::SCREENSHOT_SELECT) {
         let _ = win.show();
         let _ = win.set_focus();
@@ -82,7 +88,12 @@ pub async fn capture_screenshot_region(app: AppHandle) -> Result<ImageAttachment
     }
 
     let (sx, sy, sw, sh) = selection.ok_or_else(|| "Screenshot capture cancelled".to_string())?;
-    let data_url = screenshot::capture_region(sx, sy, sw, sh)?;
+    // Full-resolution BitBlt + PNG encode — the same blocking-GDI class as
+    // the preview capture at the top of this function, so it gets the same
+    // `spawn_blocking` treatment rather than parking an async runtime worker.
+    let data_url = tokio::task::spawn_blocking(move || screenshot::capture_region(sx, sy, sw, sh))
+        .await
+        .map_err(|e| format!("screenshot capture task panicked: {e}"))??;
     Ok(ImageAttachment {
         mime: "image/png".to_string(),
         data_url,

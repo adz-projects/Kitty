@@ -127,16 +127,23 @@ async function applyBackground(cfg: Config, gen: number) {
 
 async function applyFromConfig() {
   const gen = ++themeApplyGen;
-  const cfg = await ipc.getConfig();
-  // A newer applyFromConfig() started while we were waiting — drop this
-  // stale result so an older config can't clobber the newer one on the DOM.
-  if (gen !== themeApplyGen) return;
-  const css = await themeCss(resolveThemeName(cfg.theme, prefersDark()));
-  // themeCss may itself await an IPC round-trip (readUserTheme) — re-check
-  // before writing, otherwise a slow stale call can still win the DOM write.
-  if (gen !== themeApplyGen) return;
-  ensureStyle('app-theme').textContent = css;
-  await applyBackground(cfg, gen);
+  try {
+    const cfg = await ipc.getConfig();
+    // A newer applyFromConfig() started while we were waiting — drop this
+    // stale result so an older config can't clobber the newer one on the DOM.
+    if (gen !== themeApplyGen) return;
+    const css = await themeCss(resolveThemeName(cfg.theme, prefersDark()));
+    // themeCss may itself await an IPC round-trip (readUserTheme) — re-check
+    // before writing, otherwise a slow stale call can still win the DOM write.
+    if (gen !== themeApplyGen) return;
+    ensureStyle('app-theme').textContent = css;
+    await applyBackground(cfg, gen);
+  } catch {
+    // Backend down / IPC failure — keep whatever theme is already applied
+    // (initTheme's synchronously-injected built-in). Caught here, once, so
+    // the `void applyFromConfig()` call sites can't produce an unhandled
+    // rejection; the next theme://changed event retries anyway.
+  }
 }
 
 /** Apply the configured theme/background and keep it in sync with changes. */

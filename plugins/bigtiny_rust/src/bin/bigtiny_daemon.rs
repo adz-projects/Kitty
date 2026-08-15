@@ -1,17 +1,17 @@
 //! CLI entry point for the BigTiny daemon. Parses the same `--host`/`--port`/
-//! `--config`/`--secret` flags `plugins/bigtiny/bigtiny/__main__.py` does,
-//! and honors the same `BIGTINY_*` environment variables Kitty's spawn code
-//! (`src-tauri/src/lifecycle/bigtiny_proc.rs::spawn`) actually sets — Kitty
-//! never passes `--secret`/`--config`, it relies entirely on
-//! `BIGTINY_SECRET`, `BIGTINY_DATA_DIR`, and the `BIGTINY_SUMMARIZER__*`/
-//! `BIGTINY_TOKEN_MANAGEMENT__*`/`BIGTINY_MEMORY__*` env vars (Python's
-//! pydantic-settings `env_prefix`/`env_nested_delimiter` mechanism), so those
-//! specific variables are the ones honored here — this is not a general
-//! nested-env config loader.
+//! `--config`/`--secret` flags `plugins/bigtiny/bigtiny/__main__.py` does.
+//!
+//! The `BIGTINY_*` environment contract this honors lives in
+//! [`bigtiny_rust::env_contract`], not here — it has a second caller, the
+//! embedded host Kitty uses on Android where there is no separate executable
+//! to spawn (D8, §2.3). This file is now only argument parsing and the
+//! process-lifetime concerns (tokio runtime, ctrl-c) that a library caller
+//! supplies for itself.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use bigtiny_rust::config::BigTinyConfig;
+use bigtiny_rust::env_contract::{apply_env_overrides, resolve_data_dir, shellexpand_home};
 use bigtiny_rust::RunOptions;
 
 struct Args {
@@ -39,9 +39,21 @@ fn parse_args() -> Args {
             }
             "--port" => {
                 i += 1;
-                if let Some(v) = argv.get(i) {
-                    if let Ok(p) = v.parse() {
-                        port = p;
+                match argv.get(i) {
+                    // An unparsable port used to be silently ignored, binding
+                    // 8080 while the user (or a supervisor script) believes
+                    // the daemon is elsewhere — "Kitty can't reach backend"
+                    // with no hint why. Fail loudly at startup instead.
+                    Some(v) => match v.parse() {
+                        Ok(p) => port = p,
+                        Err(_) => {
+                            eprintln!("Invalid --port value {v:?}: expected an integer 0-65535");
+                            std::process::exit(2);
+                        }
+                    },
+                    None => {
+                        eprintln!("--port requires a value");
+                        std::process::exit(2);
                     }
                 }
             }
@@ -74,167 +86,6 @@ fn parse_args() -> Args {
     }
 }
 
-/// `BIGTINY_DATA_DIR` env var, or `~/.bigtiny` — matches
-/// `plugins/bigtiny/bigtiny/paths.py::data_dir()` exactly, since Kitty's
-/// `bigtiny_proc.rs::spawn` points this at `%APPDATA%/Kitty/bigtiny/`.
-fn resolve_data_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("BIGTINY_DATA_DIR") {
-        return PathBuf::from(dir);
-    }
-    dirs_home().join(".bigtiny")
-}
-
-fn dirs_home() -> PathBuf {
-    std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-}
-
-/// Expand a leading `~/` in a config-supplied path against the resolved
-/// home directory, matching Python's `Path(...).expanduser()`.
-fn shellexpand_home(path: &str) -> PathBuf {
-    match path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")) {
-        Some(rest) => dirs_home().join(rest),
-        None => PathBuf::from(path),
-    }
-}
-
-/// Applies the specific `BIGTINY_SUMMARIZER__*`/`BIGTINY_TOKEN_MANAGEMENT__*`/
-/// `BIGTINY_MEMORY__*` env vars Kitty's spawn code sets — see this file's
-/// module doc for why only these, not a general nested-env-var deserializer.
-fn apply_env_overrides(config: &mut BigTinyConfig) {
-    if let Ok(v) = std::env::var("BIGTINY_SUMMARIZER__ENABLED") {
-        config.summarizer.enabled = v.eq_ignore_ascii_case("true") || v == "1";
-    }
-    // `MODEL`/`KEEP_ALIVE` are gone: those named an Ollama tag and an
-    // Ollama-native `keep_alive` value for the now-deleted Ollama-only
-    // `SummarizerClient`. The local summarizer's model comes from
-    // `BIGTINY_LOCAL__MODEL_PATH` instead, and residency is the slot
-    // manager's job, not a per-call keep-alive knob.
-    if let Ok(v) = std::env::var("BIGTINY_SUMMARIZER__FALLBACK") {
-        config.summarizer.fallback = v;
-    }
-    if let Some(n) = std::env::var("BIGTINY_TOKEN_MANAGEMENT__MAX_CONTEXT_TOKENS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-    {
-        config.token_management.max_context_tokens = n;
-    }
-    if let Some(n) = std::env::var("BIGTINY_TOKEN_MANAGEMENT__MAX_LIVE_TAIL_TOKENS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-    {
-        config.token_management.max_live_tail_tokens = n;
-    }
-    if let Some(n) = std::env::var("BIGTINY_TOKEN_MANAGEMENT__MESSAGE_MASK_HEAD_LINES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-    {
-        config.token_management.message_mask_head_lines = n;
-    }
-    if let Some(n) = std::env::var("BIGTINY_TOKEN_MANAGEMENT__MESSAGE_MASK_TAIL_LINES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-    {
-        config.token_management.message_mask_tail_lines = n;
-    }
-    if let Ok(v) = std::env::var("BIGTINY_MEMORY__PREFLIGHT_ENABLED") {
-        config.memory.preflight_enabled = v.eq_ignore_ascii_case("true") || v == "1";
-    }
-    if let Some(n) = std::env::var("BIGTINY_MEMORY__BM25_THRESHOLD")
-        .ok()
-        .and_then(|v| v.parse().ok())
-    {
-        config.memory.bm25_threshold = Some(n);
-    }
-    if let Some(n) = std::env::var("BIGTINY_MEMORY__PREFLIGHT_RESULTS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-    {
-        config.memory.preflight_results = n;
-    }
-    if let Some(n) = std::env::var("BIGTINY_MEMORY__ARTIFACTS_MAX_TOKENS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-    {
-        config.memory.artifacts_max_tokens = n;
-    }
-    // `PathwayConfig::enabled` defaults to `false` and, unlike every other
-    // config section above, previously had NO env override at all. Since
-    // Kitty (like every host) never passes a `--config` YAML, that made the
-    // in-process behavioral-memory engine permanently dead in every real
-    // deployment regardless of anything the host does -- this is the actual
-    // toggle a host needs to opt in, mirroring `BIGTINY_SUMMARIZER__*`.
-    if let Ok(v) = std::env::var("BIGTINY_PATHWAY__ENABLED") {
-        config.pathway.enabled = v.eq_ignore_ascii_case("true") || v == "1";
-    }
-    if let Some(n) = std::env::var("BIGTINY_PATHWAY__LEARN_EVERY_N")
-        .ok()
-        .and_then(|v| v.parse().ok())
-    {
-        config.pathway.learn_every_n = n;
-    }
-    // The in-process llama.cpp engine (docs/ANDROID.md §3.2). Same reasoning
-    // as `BIGTINY_PATHWAY__ENABLED` above: no host passes `--config`, so
-    // without these the engine can only ever be off. Kitty's
-    // `lifecycle/bigtiny_proc.rs::spawn` is the other half of this contract
-    // and must stay in lockstep.
-    //
-    // Paths, not model names: the daemon has no idea where a host keeps its
-    // models, and resolving on this side would duplicate that knowledge.
-    if let Ok(v) = std::env::var("BIGTINY_LOCAL__ENABLED") {
-        config.local.enabled = v.eq_ignore_ascii_case("true") || v == "1";
-    }
-    if let Ok(v) = std::env::var("BIGTINY_LOCAL__MODEL_PATH") {
-        config.local.model_path = v;
-    }
-    if let Ok(v) = std::env::var("BIGTINY_LOCAL__EMBED_MODEL_PATH") {
-        config.local.embed_model_path = v;
-    }
-    if let Ok(v) = std::env::var("BIGTINY_LOCAL__EMBED_POOLING") {
-        config.local.embed_pooling = v;
-    }
-    if let Some(n) = std::env::var("BIGTINY_LOCAL__N_CTX")
-        .ok()
-        .and_then(|v| v.parse().ok())
-    {
-        config.local.n_ctx = n;
-    }
-    if let Some(n) = std::env::var("BIGTINY_LOCAL__EMBED_N_CTX")
-        .ok()
-        .and_then(|v| v.parse().ok())
-    {
-        config.local.embed_n_ctx = n;
-    }
-    if let Some(n) = std::env::var("BIGTINY_LOCAL__N_BATCH")
-        .ok()
-        .and_then(|v| v.parse().ok())
-    {
-        config.local.n_batch = n;
-    }
-    if let Some(n) = std::env::var("BIGTINY_LOCAL__N_THREADS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-    {
-        config.local.n_threads = n;
-    }
-    if let Some(n) = std::env::var("BIGTINY_LOCAL__N_GPU_LAYERS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-    {
-        config.local.n_gpu_layers = n;
-    }
-    if let Ok(v) = std::env::var("BIGTINY_LOCAL__BACKEND") {
-        config.local.backend = v;
-    }
-    if let Ok(v) = std::env::var("BIGTINY_LOCAL__CACHE_TYPE_K") {
-        config.local.cache_type_k = v;
-    }
-    if let Ok(v) = std::env::var("BIGTINY_LOCAL__CACHE_TYPE_V") {
-        config.local.cache_type_v = v;
-    }
-}
 
 #[tokio::main]
 async fn main() {

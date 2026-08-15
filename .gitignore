@@ -8,7 +8,12 @@ dist-ssr/
 # Rust / Tauri
 src-tauri/target/
 target/
-src-tauri/gen/
+# `gen/schemas` is regenerated from `capabilities/` on every build.
+# `gen/android` is NOT: it is the Android project, and it carries hand-made
+# edits (the manifest's `windowSoftInputMode`, and Phase 8's signing config)
+# that must survive a clone. Its own `gen/android/.gitignore` keeps the 12 GB
+# of build output out.
+src-tauri/gen/schemas/
 
 # Editor / OS
 .DS_Store

@@ -204,7 +204,13 @@ impl RecipeEngine {
             }
         }
 
-        self.agent.run_turn_and_wait(&session_id, &prompt).await;
+        // Propagate the turn's outcome: `run_turn_and_wait` reports a
+        // terminal `Error` frame as `Err`, so a provider-failed run surfaces
+        // here instead of being recorded as a successful execution.
+        self.agent
+            .run_turn_and_wait(&session_id, &prompt)
+            .await
+            .map_err(RecipeError::TurnFailed)?;
 
         Ok(session_id)
     }

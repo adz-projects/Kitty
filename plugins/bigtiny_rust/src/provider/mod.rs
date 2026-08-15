@@ -4,6 +4,7 @@ pub mod openai_compat;
 pub mod router;
 pub mod presets;
 pub mod sampling;
+pub mod tag_split;
 
 pub use base::classify_provider_error;
 pub use base::{Delta, Provider, ToolCall, ToolCallChunk};

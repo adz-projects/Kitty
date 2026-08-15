@@ -1,7 +1,7 @@
 use chrono::DateTime;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use sqlx::{FromRow, SqlitePool};
+use sqlx::{Connection, FromRow, SqlitePool};
 
 use crate::error::StorageError;
 
@@ -54,7 +54,15 @@ pub async fn upsert_rule(
     args_pattern: Option<&str>,
     decision: &str,
 ) -> Result<(), StorageError> {
-    let mut tx = pool.begin().await?;
+    // `BEGIN IMMEDIATE`, not the pool's default deferred `BEGIN` (same
+    // reasoning as `sessions::update_metadata_with`): the check-then-act
+    // below reads before it writes, and under a deferred transaction two
+    // concurrent same-key upserts can each read "no row" on their own
+    // snapshot and then both try to INSERT — the loser dies with
+    // `SQLITE_BUSY_SNAPSHOT`, surfacing as a spurious 500 on an approval
+    // click. Grabbing the write lock up front serializes the pair instead.
+    let mut conn = pool.acquire().await?;
+    let mut tx = conn.begin_with("BEGIN IMMEDIATE").await?;
 
     let existing: Option<i64> = sqlx::query_scalar(
         r#"SELECT id FROM hitl_rules WHERE tool_name = ?1 AND args_pattern IS ?2"#,

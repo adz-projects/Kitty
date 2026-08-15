@@ -183,7 +183,11 @@ pub async fn get_brave_mcp_search_status(
     state: tauri::State<'_, AppState>,
 ) -> Result<BraveMcpSearchStatus, String> {
     let enabled = state.config.lock().unwrap().brave_mcp_search_enabled;
-    let configured = config::providers::has_secret("brave-mcp-search");
+    // Async read: `has_secret` is blocking Windows Credential Manager IPC,
+    // which must not run on a tokio worker (see `get_secret_async`).
+    let configured = config::providers::get_secret_async("brave-mcp-search")
+        .await
+        .is_some();
     Ok(BraveMcpSearchStatus {
         enabled,
         configured,
@@ -208,7 +212,7 @@ pub async fn set_brave_mcp_search_api_key(
     // or mistyped key still renders a green "configured" checkbox and every
     // search silently comes back AUTH_ERROR with no indication why.
     mcp::validate_brave_api_key(trimmed).await?;
-    config::providers::set_secret("brave-mcp-search", trimmed)?;
+    config::providers::set_secret_async("brave-mcp-search", trimmed).await?;
     {
         let mut cfg = state.config.lock().unwrap();
         cfg.brave_mcp_search_enabled = true;

@@ -91,12 +91,15 @@ impl HITLManager {
 
     /// Remove stale pending actions and decisions.
     fn sweep_stale(&mut self) {
-        let cutoff = Instant::now() - MAX_PENDING_AGE;
-
+        // Per-entry `elapsed()` compare, not `Instant::now() - MAX_PENDING_AGE`:
+        // `Instant` is boot-relative, so the subtraction panics outright on a
+        // host with uptime < 1h (and `checked_sub(..).unwrap_or_else(Instant::now)`
+        // would instead sweep *every* entry in that window). `elapsed()` is
+        // saturating and never panics.
         let stale_pending: Vec<String> = self
             .pending
             .iter()
-            .filter(|(_, p)| p.created_at < cutoff)
+            .filter(|(_, p)| p.created_at.elapsed() > MAX_PENDING_AGE)
             .map(|(k, _)| k.clone())
             .collect();
 
@@ -114,7 +117,7 @@ impl HITLManager {
         let stale_decisions: Vec<String> = self
             .decisions
             .iter()
-            .filter(|(_, (_, ts))| *ts < cutoff)
+            .filter(|(_, (_, ts))| ts.elapsed() > MAX_PENDING_AGE)
             .map(|(k, _)| k.clone())
             .collect();
 
@@ -328,10 +331,23 @@ impl HITLManager {
                 },
                 Some(pending.tool_name),
             ),
-            _ => (
+            "allow" | "proceed" => (
                 HITLDecision {
                     action: "proceed".to_string(),
                     reason: None,
+                    pending_action_id: None,
+                },
+                None,
+            ),
+            // An unrecognized decision string must fail CLOSED — the old
+            // catch-all mapped it to "proceed", silently approving the call.
+            other => (
+                HITLDecision {
+                    action: "rejected".to_string(),
+                    reason: Some(format!(
+                        "Unknown decision '{other}' — expected one of \
+                         allow/proceed/always_allow/reject"
+                    )),
                     pending_action_id: None,
                 },
                 None,
@@ -375,6 +391,24 @@ impl HITLManager {
                 self.pending.remove(&aid);
             }
         }
+    }
+
+    /// Remove a single pending action plus any decision already recorded for
+    /// it. Used when a paused tool call's approval wait *times out*: the
+    /// pending record must not linger for `sweep_stale` to find an hour
+    /// later (the pending-approvals API would show an approval no waiter
+    /// will ever honor), and a decision racing in after the timeout must not
+    /// resolve a call that has already failed closed.
+    pub fn remove_pending(&mut self, action_id: &str) {
+        if let Some(pending) = self.pending.remove(action_id) {
+            if let Some(session_list) = self.session_pending.get_mut(&pending.session_id) {
+                session_list.retain(|id| id != action_id);
+                if session_list.is_empty() {
+                    self.session_pending.remove(&pending.session_id);
+                }
+            }
+        }
+        self.decisions.remove(action_id);
     }
 
     fn match_rule(
@@ -517,5 +551,118 @@ mod tests {
         assert!(
             HITLManager::match_rule(&rules, r#"{"command": "echo hi"}"#).is_none()
         );
+    }
+
+    async fn test_manager() -> HITLManager {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        HITLManager::new(pool, HITLConfig::default())
+    }
+
+    fn pending_at(action_id: &str, session_id: &str, created_at: Instant) -> PendingAction {
+        PendingAction {
+            action_id: action_id.to_string(),
+            session_id: session_id.to_string(),
+            tool_name: "tool".to_string(),
+            tool_args: json!({}),
+            created_at,
+            created_at_utc: Utc::now(),
+        }
+    }
+
+    /// Regression: `sweep_stale` computed its cutoff as
+    /// `Instant::now() - MAX_PENDING_AGE`, which panics on any host whose
+    /// uptime is under an hour (`Instant` is boot-relative). The per-entry
+    /// `elapsed()` compare must never panic, must keep fresh entries, and
+    /// must still sweep genuinely old ones.
+    #[tokio::test]
+    async fn sweep_stale_never_panics_and_keeps_fresh_entries() {
+        let mut mgr = test_manager().await;
+        // Fresh entry — must survive.
+        mgr.pending.insert(
+            "fresh".into(),
+            pending_at("fresh", "sess-1", Instant::now()),
+        );
+        // An entry whose timestamp is "in the future" relative to now (the
+        // shape the boot-relative edge effectively takes) — `elapsed()`
+        // saturates to 0, so it must survive without panicking.
+        mgr.pending.insert(
+            "future".into(),
+            pending_at("future", "sess-1", Instant::now() + Duration::from_secs(60)),
+        );
+        mgr.session_pending
+            .insert("sess-1".into(), vec!["fresh".into(), "future".into()]);
+
+        // A genuinely old entry — only constructible when the host has
+        // enough uptime to subtract from; skip that half of the assertion
+        // otherwise (exactly the environment that used to panic).
+        let old = Instant::now().checked_sub(Duration::from_secs(7200));
+        if let Some(old_instant) = old {
+            mgr.pending
+                .insert("old".into(), pending_at("old", "sess-1", old_instant));
+            mgr.session_pending
+                .get_mut("sess-1")
+                .unwrap()
+                .push("old".into());
+        }
+
+        mgr.sweep_stale();
+
+        assert!(mgr.pending.contains_key("fresh"));
+        assert!(mgr.pending.contains_key("future"));
+        if old.is_some() {
+            assert!(!mgr.pending.contains_key("old"));
+        }
+    }
+
+    /// Regression: an unrecognized decision string used to fall through the
+    /// catch-all to "proceed" — silently approving the tool call. It must
+    /// fail closed instead.
+    #[tokio::test]
+    async fn record_decision_rejects_an_unknown_decision_string() {
+        let mut mgr = test_manager().await;
+        let decision = mgr.create_pending("sess-1", "tool", &json!({}), "test");
+        let action_id = decision.pending_action_id.unwrap();
+
+        let (outcome, rule) = mgr.record_decision(&action_id, "definitely-not-a-decision");
+        assert_eq!(outcome.action, "rejected");
+        assert!(
+            outcome
+                .reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("Unknown decision"),
+            "reason should name the bad input, got {:?}",
+            outcome.reason
+        );
+        assert!(rule.is_none());
+
+        // The explicit approvals still map the way the route relies on.
+        let decision = mgr.create_pending("sess-1", "tool", &json!({}), "test");
+        let action_id = decision.pending_action_id.unwrap();
+        let (outcome, _) = mgr.record_decision(&action_id, "allow");
+        assert_eq!(outcome.action, "proceed");
+
+        let decision = mgr.create_pending("sess-1", "tool", &json!({}), "test");
+        let action_id = decision.pending_action_id.unwrap();
+        let (outcome, rule) = mgr.record_decision(&action_id, "always_allow");
+        assert_eq!(outcome.action, "always_allow");
+        assert_eq!(rule.as_deref(), Some("tool"));
+    }
+
+    /// `remove_pending` backs the approval-timeout path in `agent::loop_`:
+    /// the pending record and any racing decision must both be gone.
+    #[tokio::test]
+    async fn remove_pending_clears_the_record_and_any_racing_decision() {
+        let mut mgr = test_manager().await;
+        let decision = mgr.create_pending("sess-1", "tool", &json!({}), "test");
+        let action_id = decision.pending_action_id.unwrap();
+        // A decision that raced in just before the timeout fired.
+        mgr.decisions
+            .insert(action_id.clone(), ("allow".to_string(), Instant::now()));
+
+        mgr.remove_pending(&action_id);
+
+        assert!(mgr.get_pending_approvals("sess-1").is_empty());
+        assert!(mgr.pop_decision(&action_id).is_none());
     }
 }

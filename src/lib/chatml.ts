@@ -14,13 +14,18 @@ export interface ChatMessage {
 
 export function buildExport(messages: Message[], upToIndex?: number): ChatMessage[] {
   const slice = upToIndex != null ? messages.slice(0, upToIndex + 1) : messages;
-  return slice.map((m) => {
-    if (m.role === 'user') {
-      return { role: 'user', content: m.text };
-    }
-    const think = m.reasoning ? `<think>\n${m.reasoning}\n</think>\n` : '';
-    return { role: 'assistant', content: think + m.text };
-  });
+  // Skip superseded turns (a regenerated-away-from answer, kept collapsed in
+  // the UI) — exporting both the rejected answer and its replacement produces
+  // a corrupted transcript with two assistant turns for one user turn.
+  return slice
+    .filter((m) => !m.superseded)
+    .map((m) => {
+      if (m.role === 'user') {
+        return { role: 'user', content: m.text };
+      }
+      const think = m.reasoning ? `<think>\n${m.reasoning}\n</think>\n` : '';
+      return { role: 'assistant', content: think + m.text };
+    });
 }
 
 export function sanitizeFilename(name: string): string {

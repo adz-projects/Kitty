@@ -29,6 +29,27 @@ use crate::config::LocalEngineConfig;
 /// the machine can hold.
 const AUTO_N_CTX_FALLBACK: u32 = 4096;
 
+/// The context size to advertise for the local provider *before any model is
+/// loaded* — at provider-registration time and in `discover_models` while
+/// the slot is still cold. The pinned `n_ctx` when one is configured, or
+/// [`AUTO_N_CTX_FALLBACK`] when `n_ctx` is `0` ("automatic"), which is the
+/// same value the automatic path bottoms out at when neither fitting nor
+/// estimation can produce a number.
+///
+/// The real (fitted/estimated, `n_ctx_train`-clamped) resolution only exists
+/// once a model is resident — see [`LocalEngine::effective_n_ctx`], which
+/// `discover_models` prefers when the slot is loaded. Advertising nothing
+/// instead made the agent budget against the daemon-wide 64k default while
+/// the engine's real context was 4k, so compaction never fired before the
+/// context hard-failed; advertising the literal `0` sentinel was no better.
+pub fn registration_n_ctx(cfg: &LocalEngineConfig) -> u32 {
+    if cfg.n_ctx > 0 {
+        cfg.n_ctx
+    } else {
+        AUTO_N_CTX_FALLBACK
+    }
+}
+
 /// Fraction of the device's free memory the KV cache may claim when sizing an
 /// automatic context.
 ///
@@ -281,11 +302,13 @@ pub fn shared_backend() -> Result<Arc<LlamaBackend>, LocalEngineError> {
 ///
 /// # Preconditions
 ///
-/// `params` must be untouched `LlamaModelParams::default()` — `fit_params`
-/// only writes fields still holding their default, so a prior
+/// `params` must not have any field `fit_params` decides already set —
+/// `fit_params` only writes fields still holding their default, so a prior
 /// `with_n_gpu_layers` would silently make the call a no-op for the one field
-/// it exists to decide. [`LocalEngine::load`] enforces this by only reaching
-/// here on the branch that has set nothing.
+/// it exists to decide. A device pin (`with_devices`) is fine and expected:
+/// it constrains *which* device fit sizes for, not the `n_gpu_layers`/`n_ctx`
+/// it chooses. [`LocalEngine::load`] enforces this by only reaching here on
+/// the branch that has set nothing else.
 fn fit_to_device(
     path: &Path,
     params: Pin<&mut LlamaModelParams>,
@@ -408,6 +431,19 @@ impl LocalEngine {
         let selected = super::backend::select_backend(&cfg.backend);
 
         let on_cpu = selected.kind() == super::backend::BackendKind::Cpu;
+        // NOTE (815bugs #94, reverted): we deliberately do NOT pin the load to
+        // `selected.device_index` via `LlamaModelParams::with_devices`. The
+        // index is still recorded on `SelectedBackend` and used for the model
+        // card / VRAM sizing, but applying it to the load params hangs the
+        // tensor load indefinitely on at least one real multi-GPU Vulkan setup
+        // (Intel UHD + discrete NVIDIA): the load never reaches `load_tensors`,
+        // the daemon never becomes healthy, and Kitty reports `backend_down`.
+        // Letting llama.cpp keep its own default device selection is the
+        // known-good behavior. The only cost is a cosmetic mismatch when the UI
+        // labels the load device — far better than a daemon that won't start.
+        // Do not re-add `with_devices` here without validating a discrete-GPU
+        // Vulkan load on real hardware.
+        //
         // Three-way, and the ordering matters: `fit_params` may only run on
         // params where nothing has been set (see `fit_to_device`), so the
         // fitting branch must be the one that touches nothing.
@@ -500,12 +536,33 @@ impl LocalEngine {
             .with_n_batch(self.cfg.n_batch)
             .with_type_k(parse_kv_cache_type(&self.cfg.cache_type_k))
             .with_type_v(parse_kv_cache_type(&self.cfg.cache_type_v));
-        if self.cfg.n_threads > 0 {
-            p = p
-                .with_n_threads(self.cfg.n_threads)
-                .with_n_threads_batch(self.cfg.n_threads);
+        if let Some(t) = self.resolve_n_threads() {
+            p = p.with_n_threads(t).with_n_threads_batch(t);
         }
         p
+    }
+
+    /// Threads for compute contexts. An explicit `n_threads` (> 0) is honored
+    /// verbatim. Auto (`0`) leaves llama.cpp to pick — all cores — which is fine
+    /// on a desktop but on Android pegs every core and thermally throttles the
+    /// SoC, which is *slower* than using fewer plus it cooks the phone
+    /// (ADDENDUM 3). So auto is capped on Android; elsewhere it stays `None` and
+    /// llama.cpp keeps its own default.
+    fn resolve_n_threads(&self) -> Option<i32> {
+        if self.cfg.n_threads > 0 {
+            return Some(self.cfg.n_threads);
+        }
+        #[cfg(target_os = "android")]
+        {
+            let avail = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4);
+            Some(avail.min(4) as i32)
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            None
+        }
     }
 
     /// The model geometry that determines KV-cache cost per token.
@@ -682,6 +739,31 @@ mod tests {
         // choice. Fitting leaves a non-zero `n_ctx` alone, and estimating is
         // only ever consulted for the automatic sentinel.
         assert_eq!(resolve_n_ctx(8192, Some(4096), Some(2048), 128_000), 8192);
+    }
+
+    /// 815bugs #83: the value advertised at provider registration (before the
+    /// lazy first load) must never be `None` (budgets against the 64k
+    /// daemon-wide default) nor the literal `0` "automatic" sentinel — a
+    /// pinned size advertises itself, and automatic advertises the same
+    /// fallback the engine bottoms out at.
+    #[test]
+    fn registration_n_ctx_never_advertises_zero_or_nothing() {
+        let pinned = LocalEngineConfig {
+            n_ctx: 8192,
+            ..Default::default()
+        };
+        assert_eq!(registration_n_ctx(&pinned), 8192);
+
+        let automatic = LocalEngineConfig {
+            n_ctx: 0,
+            ..Default::default()
+        };
+        assert_eq!(registration_n_ctx(&automatic), AUTO_N_CTX_FALLBACK);
+        assert_ne!(registration_n_ctx(&automatic), 0);
+
+        // The crate default (4096, pinned) advertises exactly what the
+        // engine will use — the case the bug report was about.
+        assert_eq!(registration_n_ctx(&LocalEngineConfig::default()), 4096);
     }
 
     /// `n_ctx = 0` is the "automatic" sentinel, resolved from three sources in

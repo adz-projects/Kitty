@@ -108,6 +108,39 @@ pub fn write_meta(dir: &Path, file: &str, spec: &DownloadSpec) -> std::io::Resul
     std::fs::write(meta_path(dir, file), meta_line(spec))
 }
 
+/// What to do with an existing `.part` fragment given the status the server
+/// answered the GET with.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ResumePlan {
+    /// Append the body to the fragment: either a fresh download, or a
+    /// properly honored `Range` request (206).
+    Append,
+    /// The server answered a ranged request with something other than 206 —
+    /// in practice 200, meaning it ignored `Range` entirely and is about to
+    /// send the *full* body. Appending that after the existing fragment
+    /// would corrupt the file (a full body glued onto the first N bytes),
+    /// so the fragment must be discarded and the download restarted from
+    /// byte 0.
+    DiscardFragment,
+}
+
+/// Decide the fate of the `.part` fragment. `resume_from` is the fragment's
+/// current length — `0` means no `Range` header was sent, so any 2xx is a
+/// plain full download. Anything non-2xx is a transport failure.
+pub fn plan_resume(
+    url: &str,
+    status: reqwest::StatusCode,
+    resume_from: u64,
+) -> Result<ResumePlan, DownloadError> {
+    if !status.is_success() {
+        return Err(DownloadError::Transport(format!("{url} returned {status}")));
+    }
+    if resume_from > 0 && status != reqwest::StatusCode::PARTIAL_CONTENT {
+        return Ok(ResumePlan::DiscardFragment);
+    }
+    Ok(ResumePlan::Append)
+}
+
 /// Free bytes on the volume holding `dir`.
 ///
 /// `None` when the volume can't be identified — treated as "don't block",
@@ -238,6 +271,75 @@ pub async fn head_metadata(client: &reqwest::Client, spec: &DownloadSpec) -> (Op
     (size, sha)
 }
 
+/// How many consecutive *unproductive* transport failures to absorb before
+/// giving up. Productive ones (bytes advanced since the last failure) don't
+/// count — see [`RetryBudget`].
+const MAX_STALLED_RETRIES: u32 = 8;
+
+/// The retry policy for a long download that has to survive a network it does
+/// not control: a phone moving between Wi-Fi and cellular, through a tunnel,
+/// off a flaky AP.
+///
+/// The rule that matters is that the budget is spent on *stalls*, not on
+/// failures. A multi-gigabyte GGUF over cellular can legitimately drop a
+/// dozen times and still finish, so counting raw failures would abandon a
+/// download that was working. Counting only failures that made no progress
+/// distinguishes "the connection is bad" (keep going, the `.part` file grows
+/// each time) from "this is not going to work" (same byte offset, over and
+/// over).
+///
+/// Pulled out of `commands::models::run_download` as a value type purely so it
+/// can be tested: everything in `commands/` needs an `AppHandle` and a live
+/// network, and this is the part that would break silently.
+#[derive(Debug)]
+pub struct RetryBudget {
+    stalled: u32,
+    last_offset: u64,
+    max_stalled: u32,
+}
+
+/// What [`RetryBudget::record_failure`] decided.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RetryDecision {
+    /// Try again after this long.
+    RetryAfter(std::time::Duration),
+    /// Out of budget — the download made no progress across
+    /// `max_stalled` consecutive attempts.
+    GiveUp,
+}
+
+impl RetryBudget {
+    /// `start_offset` is how many bytes were already on disk when the download
+    /// began, so a resumed download doesn't count its inherited progress as
+    /// forward motion on the first failure.
+    pub fn new(start_offset: u64) -> Self {
+        Self {
+            stalled: 0,
+            last_offset: start_offset,
+            max_stalled: MAX_STALLED_RETRIES,
+        }
+    }
+
+    /// Record a transport failure at `offset` (the current `.part` length).
+    pub fn record_failure(&mut self, offset: u64) -> RetryDecision {
+        if offset > self.last_offset {
+            self.stalled = 0;
+            self.last_offset = offset;
+        } else {
+            self.stalled += 1;
+            if self.stalled > self.max_stalled {
+                return RetryDecision::GiveUp;
+            }
+        }
+        // Exponential, capped at 32s: long enough not to hammer a network
+        // that is genuinely down, short enough to stay well inside the
+        // foreground service's lifetime.
+        RetryDecision::RetryAfter(std::time::Duration::from_secs(
+            2u64.pow(self.stalled.min(5)),
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,6 +370,30 @@ mod tests {
             ..spec()
         };
         assert!(s.url().contains("/resolve/main/"), "an empty rev means main");
+    }
+
+    /// Regression (815bugs #5): a resumed download that gets a 200 (server
+    /// ignored `Range`) must discard the fragment and restart — appending the
+    /// full body after the existing bytes used to corrupt the GGUF.
+    #[test]
+    fn plan_resume_requires_206_for_a_ranged_request() {
+        use reqwest::StatusCode;
+        let url = "https://example.invalid/m.gguf";
+        // Fresh download: any 2xx appends (there is no fragment).
+        assert_eq!(plan_resume(url, StatusCode::OK, 0).ok(), Some(ResumePlan::Append));
+        // Honored Range: 206 appends after the fragment.
+        assert_eq!(
+            plan_resume(url, StatusCode::PARTIAL_CONTENT, 42).ok(),
+            Some(ResumePlan::Append)
+        );
+        // Ignored Range: 200 means a full body is coming — restart, never append.
+        assert_eq!(
+            plan_resume(url, StatusCode::OK, 42).ok(),
+            Some(ResumePlan::DiscardFragment)
+        );
+        // Non-2xx is a transport failure either way.
+        assert!(plan_resume(url, StatusCode::RANGE_NOT_SATISFIABLE, 42).is_err());
+        assert!(plan_resume(url, StatusCode::NOT_FOUND, 0).is_err());
     }
 
     #[tokio::test]
@@ -382,5 +508,89 @@ mod tests {
         // A tiny one always passes, and an unknown size never blocks.
         assert!(check_space(dir.path(), Some(1024)).is_ok());
         assert!(check_space(dir.path(), None).is_ok());
+    }
+
+    /// The whole point of the budget: a download that keeps advancing can
+    /// drop as many times as the network wants it to. This is the Wi-Fi-to-
+    /// cellular case, and a naive failure counter would abandon it.
+    #[test]
+    fn progress_between_failures_refills_the_budget() {
+        let mut budget = RetryBudget::new(0);
+        let mut offset = 0u64;
+        for _ in 0..50 {
+            offset += 10_000_000;
+            assert!(
+                matches!(
+                    budget.record_failure(offset),
+                    RetryDecision::RetryAfter(_)
+                ),
+                "a failure that followed real progress must never give up"
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_failures_at_the_same_offset_eventually_give_up() {
+        let mut budget = RetryBudget::new(0);
+        // First failure came after 500 bytes of real progress, so it is not a
+        // stall — the download then wedges at that offset.
+        assert!(matches!(
+            budget.record_failure(500),
+            RetryDecision::RetryAfter(_)
+        ));
+        for i in 0..MAX_STALLED_RETRIES {
+            assert!(
+                matches!(budget.record_failure(500), RetryDecision::RetryAfter(_)),
+                "attempt {i} should still be within budget"
+            );
+        }
+        assert_eq!(budget.record_failure(500), RetryDecision::GiveUp);
+    }
+
+    /// A resumed download starts with bytes already on disk. Those are not
+    /// progress *this* run made, so the first failure at that same offset has
+    /// to count as a stall — otherwise every resume silently gets one free
+    /// retry it did not earn.
+    #[test]
+    fn inherited_bytes_do_not_count_as_progress() {
+        let mut budget = RetryBudget::new(1_000);
+        for _ in 0..MAX_STALLED_RETRIES {
+            assert!(matches!(
+                budget.record_failure(1_000),
+                RetryDecision::RetryAfter(_)
+            ));
+        }
+        assert_eq!(budget.record_failure(1_000), RetryDecision::GiveUp);
+    }
+
+    /// Backoff grows with consecutive stalls and then stops, so a long-dead
+    /// network doesn't push the retry interval past the foreground service's
+    /// lifetime.
+    #[test]
+    fn backoff_grows_then_caps() {
+        let mut budget = RetryBudget::new(0);
+        let mut seen = Vec::new();
+        for _ in 0..MAX_STALLED_RETRIES {
+            match budget.record_failure(0) {
+                RetryDecision::RetryAfter(d) => seen.push(d.as_secs()),
+                RetryDecision::GiveUp => panic!("gave up inside the budget"),
+            }
+        }
+        assert_eq!(seen, vec![2, 4, 8, 16, 32, 32, 32, 32]);
+    }
+
+    /// Progress resets the backoff too, not just the counter — the next drop
+    /// after a good stretch should retry promptly rather than inherit a
+    /// 32-second wait from earlier trouble.
+    #[test]
+    fn progress_resets_the_backoff_as_well_as_the_counter() {
+        let mut budget = RetryBudget::new(0);
+        for _ in 0..4 {
+            let _ = budget.record_failure(0);
+        }
+        assert_eq!(
+            budget.record_failure(9_999),
+            RetryDecision::RetryAfter(std::time::Duration::from_secs(1))
+        );
     }
 }

@@ -85,6 +85,12 @@ fn hash_token(tok: &str, seed: i32) -> i64 {
 /// Deterministic signed-hashing projection to `dim` dims. Returns a
 /// unit-norm vector (or zeros for empty input).
 pub fn hash_embed(text: &str, dim: usize) -> Vec<f32> {
+    // `dim == 0` would panic at `rem_euclid(0)` below — return the empty
+    // vector instead (audit #122; config validation rejects it at load,
+    // this keeps the function total regardless).
+    if dim == 0 {
+        return Vec::new();
+    }
     let mut vec = vec![0.0f32; dim];
     let lower = text.to_lowercase();
     for tok in word_tokens(&lower) {
@@ -219,6 +225,12 @@ mod tests {
     fn empty_or_whitespace_is_zeros() {
         assert_eq!(hash_embed("", 384), vec![0.0; 384]);
         assert_eq!(hash_embed("   ", 384), vec![0.0; 384]);
+    }
+
+    #[test]
+    fn zero_dim_returns_empty_instead_of_panicking() {
+        // Audit #122: `rem_euclid(0)` panicked on a zero dim.
+        assert_eq!(hash_embed("some text", 0), Vec::<f32>::new());
     }
 
     #[test]

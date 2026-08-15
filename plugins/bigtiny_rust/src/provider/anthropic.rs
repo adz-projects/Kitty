@@ -8,21 +8,75 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use super::base::{
-    classify_provider_error, Delta, HealthStatus, ModelInfo, Provider, SamplingParams,
+    classify_provider_error, Delta, Effort, HealthStatus, ModelInfo, Provider, SamplingParams,
 };
 use crate::config::{CacheConfig, ProviderConfig};
 use crate::error::ProviderError;
 use crate::network::{maybe_direct_url, TailscaleClient};
 
+/// Resolve Anthropic's `max_tokens` and optional extended-thinking budget for
+/// one turn — pure, so the three live-400 constraints it encodes are testable
+/// without an API key:
+///
+/// 1. `budget_tokens >= 1024` (Anthropic's floor).
+/// 2. `budget_tokens` strictly below `max_tokens` — which defaults to 4096, so
+///    a naive medium/high budget under that cap is an instant 400.
+/// 3. No thinking on a turn that carries tools, until signed thinking blocks
+///    round-trip across tool steps (a flagged follow-up).
+///
+/// Returns `(max_tokens, thinking_budget)`. A `None` budget means "no thinking
+/// block this turn"; the caller logs why.
+fn anthropic_thinking(
+    effort: Option<Effort>,
+    explicit_max: Option<i32>,
+    has_tools: bool,
+) -> (i32, Option<i32>) {
+    let max = explicit_max.unwrap_or(4096);
+    let base = match effort {
+        Some(Effort::Low) => 4096,
+        Some(Effort::Medium) => 16384,
+        Some(Effort::High) => 32768,
+        // Off / None: no thinking, keep whatever max_tokens was resolved.
+        _ => return (max, None),
+    };
+    if has_tools {
+        return (max, None);
+    }
+    match explicit_max {
+        // No cap was set: give the answer 4096 tokens of headroom *above* the
+        // thinking budget, bounded to Anthropic's output ceiling.
+        None => ((base + 4096).min(65536), Some(base)),
+        // A cap was set: the budget must leave >=1024 tokens for the answer.
+        Some(cap) => {
+            let budget = base.min(cap - 1024);
+            if budget >= 1024 {
+                (cap, Some(budget))
+            } else {
+                (cap, None)
+            }
+        }
+    }
+}
+
 pub struct AnthropicProvider {
     pub provider_id: String,
     pub config: ProviderConfig,
     client: reqwest::Client,
+    /// Dedicated client for the Tailscale direct-address attempt — bounds
+    /// ONLY the connect phase (`network::DIRECT_CONNECT_TIMEOUT`), never the
+    /// SSE body. See `OpenAICompatibleProvider::direct_client`; the old
+    /// request-level `.timeout(DIRECT_CONNECT_TIMEOUT)` killed every direct
+    /// stream at 3s.
+    direct_client: reqwest::Client,
     tailscale: Arc<TailscaleClient>,
     cache: CacheConfig,
     /// SSE idle-read timeout — see `OpenAICompatibleProvider::idle_timeout`.
     idle_timeout: Duration,
 }
+
+/// Bounds time-to-response-headers on a chat completion — see
+/// `openai_compat::RESPONSE_HEADERS_TIMEOUT`.
+const RESPONSE_HEADERS_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl AnthropicProvider {
     pub const DEFAULT_MODEL: &'static str = "claude-sonnet-4-20250514";
@@ -42,9 +96,14 @@ impl AnthropicProvider {
             .connect_timeout(std::time::Duration::from_secs(30))
             .build()
             .unwrap_or_default();
+        let direct_client = reqwest::Client::builder()
+            .connect_timeout(crate::network::DIRECT_CONNECT_TIMEOUT)
+            .build()
+            .unwrap_or_default();
         Self {
             provider_id: provider_id.into(),
             client,
+            direct_client,
             config,
             tailscale,
             cache,
@@ -61,11 +120,10 @@ impl AnthropicProvider {
     ) -> Result<reqwest::Response, reqwest::Error> {
         if let Some(direct_url) = maybe_direct_url(&self.tailscale, url).await {
             let direct = self
-                .client
+                .direct_client
                 .post(&direct_url)
                 .header("x-api-key", &self.config.api_key)
                 .header("anthropic-version", "2023-06-01")
-                .timeout(crate::network::DIRECT_CONNECT_TIMEOUT)
                 .json(body)
                 .send()
                 .await;
@@ -122,6 +180,52 @@ impl AnthropicProvider {
         }
 
         result
+    }
+
+    /// One OpenAI-shaped tool definition
+    /// (`{"type":"function","function":{name,description,parameters}}`) in
+    /// Anthropic's shape (`{name, description, input_schema}`).
+    ///
+    /// The agent loop formats tools once, in OpenAI shape, for every provider
+    /// (`tools_to_openai_format`) — and this was previously assigned straight
+    /// onto the wire body, so Anthropic rejected the whole request the moment
+    /// any MCP server was connected. Converting here rather than in the loop
+    /// keeps the wire format the provider's own business (as
+    /// `convert_tool_calls` / `group_tool_results` already do) and covers the
+    /// synthetic budget tool, which the loop inlines in OpenAI shape at its
+    /// own call site and would otherwise need converting twice.
+    ///
+    /// Returns `None` for a definition with no usable name — that would 400
+    /// the entire request, and losing one tool beats losing the turn.
+    fn tool_to_anthropic(tool: &Value) -> Option<Value> {
+        // Idempotent: something already in Anthropic shape passes through.
+        if tool.get("input_schema").is_some_and(|s| s.is_object()) {
+            return Some(tool.clone());
+        }
+        let f = tool.get("function").unwrap_or(tool);
+        let name = f.get("name").and_then(|n| n.as_str()).unwrap_or("").trim();
+        if name.is_empty() {
+            tracing::warn!("dropping a tool with no name from the Anthropic request");
+            return None;
+        }
+        let mut schema = match f.get("parameters") {
+            Some(p) if p.is_object() => p.clone(),
+            _ => serde_json::json!({ "type": "object", "properties": {} }),
+        };
+        // Anthropic requires a top-level `type` on the schema; some MCP
+        // servers omit it and rely on the object-ness being implied.
+        if let Some(obj) = schema.as_object_mut() {
+            obj.entry("type").or_insert_with(|| "object".into());
+        }
+        Some(serde_json::json!({
+            "name": name,
+            "description": f.get("description").and_then(|d| d.as_str()).unwrap_or(""),
+            "input_schema": schema,
+        }))
+    }
+
+    fn tools_to_anthropic(tools: &[Value]) -> Vec<Value> {
+        tools.iter().filter_map(Self::tool_to_anthropic).collect()
     }
 
     fn convert_tool_calls(msg: &Value) -> Value {
@@ -204,16 +308,51 @@ impl Provider for AnthropicProvider {
         // positive integer; the model's own documented cap isn't known here,
         // so bound it to the same range the daemon budgets context to
         // (64k covers every current Anthropic model's max output).
-        let max_tokens = sampling
+        let explicit_max = sampling
             .max_tokens
-            .and_then(|v| (1..=65536).contains(&v).then_some(v))
-            .unwrap_or(4096);
+            .and_then(|v| (1..=65536).contains(&v).then_some(v));
+        // Extended thinking is entangled with max_tokens (the budget must sit
+        // strictly below it), forbids temperature/top_p while on, and — until
+        // we persist *signed* thinking blocks across tool round-trips — can't
+        // ride a turn that carries tools without 400ing the next request. All
+        // of that arithmetic is pure and lives in `anthropic_thinking`.
+        let has_tools = tools.as_ref().is_some_and(|t| !t.is_empty());
+        let (max_tokens, thinking_budget) =
+            anthropic_thinking(sampling.effort, explicit_max, has_tools);
+        if thinking_budget.is_none()
+            && matches!(
+                sampling.effort,
+                Some(Effort::Low | Effort::Medium | Effort::High)
+            )
+        {
+            // Effort was asked for but produced no thinking block — say why,
+            // once, rather than silently ignoring it.
+            if has_tools {
+                tracing::info!(
+                    provider_id = %self.provider_id,
+                    "extended thinking suppressed: this turn carries tools (signed \
+                     thinking-block round-trips are a follow-up)"
+                );
+            } else {
+                tracing::info!(
+                    provider_id = %self.provider_id,
+                    "extended thinking suppressed: no room for a >=1024 budget under \
+                     the configured max_tokens"
+                );
+            }
+        }
         let mut body = serde_json::json!({
             "model": model,
             "messages": grouped,
             "max_tokens": max_tokens,
             "stream": true,
         });
+        if let Some(budget) = thinking_budget {
+            body["thinking"] = serde_json::json!({
+                "type": "enabled",
+                "budget_tokens": budget,
+            });
+        }
 
         if !system.is_empty() {
             // Context building layers up to 5 separate system messages
@@ -243,32 +382,63 @@ impl Provider for AnthropicProvider {
                 Value::String(joined)
             };
         }
-        if let Some(t) = sampling.temperature {
-            body["temperature"] = t.into();
-        }
-        // Anthropic's Messages API takes temperature XOR top_p; sending both
-        // is a 400. Prefer temperature when a caller (unusually) sets both.
-        if sampling.temperature.is_none() {
-            if let Some(p) = sampling.top_p {
-                body["top_p"] = p.into();
+        // Extended thinking forbids both `temperature` and `top_p` — sending
+        // either alongside a `thinking` block is a 400. Only set them when
+        // thinking is off.
+        if thinking_budget.is_none() {
+            if let Some(t) = sampling.temperature {
+                body["temperature"] = t.into();
+            }
+            // Anthropic's Messages API takes temperature XOR top_p; sending
+            // both is a 400. Prefer temperature when a caller (unusually) sets
+            // both.
+            if sampling.temperature.is_none() {
+                if let Some(p) = sampling.top_p {
+                    body["top_p"] = p.into();
+                }
+            }
+            // Anthropic supports `top_k` alongside the other sampling knobs
+            // (same extended-thinking incompatibility, hence inside this
+            // gate) — a configured value used to be silently dropped.
+            if let Some(k) = sampling.top_k {
+                body["top_k"] = k.into();
             }
         }
         if let Some(t) = tools {
-            body["tools"] = t.into();
+            // Converted, not passed through — see `tool_to_anthropic`. An
+            // empty result means every definition was unusable; omit the key
+            // entirely rather than sending `"tools": []`.
+            let converted = Self::tools_to_anthropic(&t);
+            if !converted.is_empty() {
+                body["tools"] = Value::Array(converted);
+            }
         }
         // `id_slot` is a llama.cpp/vLLM-only field (`parallel_slots`, self-hosted
         // providers only, see openai_compat.rs's dialect gate) — Anthropic's
         // real API has no such field, so it's never written onto this wire body.
         let _ = id_slot;
 
-        let resp = self
-            .send_preferring_direct(&url, &body)
-            .await
-            .map_err(|e| ProviderError::Request {
-                user_message: format!("Failed to connect to Anthropic: {}", e),
-                raw_message: e.to_string(),
-                http_status: 0,
-            })?;
+        // Bound time-to-response-headers (see RESPONSE_HEADERS_TIMEOUT);
+        // `send().await` resolves once headers arrive, so the SSE body
+        // streaming behind them is never capped by this.
+        let resp = tokio::time::timeout(
+            RESPONSE_HEADERS_TIMEOUT,
+            self.send_preferring_direct(&url, &body),
+        )
+        .await
+        .map_err(|_| ProviderError::Request {
+            user_message: format!(
+                "Anthropic sent no response headers within {}s",
+                RESPONSE_HEADERS_TIMEOUT.as_secs()
+            ),
+            raw_message: "timed out waiting for response headers".into(),
+            http_status: 0,
+        })?
+        .map_err(|e| ProviderError::Request {
+            user_message: format!("Failed to connect to Anthropic: {}", e),
+            raw_message: e.to_string(),
+            http_status: 0,
+        })?;
 
         let status_code = resp.status().as_u16();
         if !resp.status().is_success() {
@@ -287,6 +457,9 @@ impl Provider for AnthropicProvider {
             .client
             .get(&url)
             .header("x-api-key", &self.config.api_key)
+            // Same per-request bound as `check_health` — a stalled provider
+            // must not hang model discovery forever.
+            .timeout(std::time::Duration::from_secs(5))
             .send()
             .await
             .map_err(|e| ProviderError::Request {
@@ -737,6 +910,72 @@ impl Stream for AnthropicSSEStream {
 }
 
 #[cfg(test)]
+mod thinking_tests {
+    use super::*;
+
+    #[test]
+    fn no_effort_leaves_max_tokens_and_adds_no_thinking() {
+        assert_eq!(anthropic_thinking(None, None, false), (4096, None));
+        assert_eq!(anthropic_thinking(Some(Effort::Off), None, false), (4096, None));
+        // An explicit cap is preserved untouched.
+        assert_eq!(anthropic_thinking(None, Some(8192), false), (8192, None));
+    }
+
+    #[test]
+    fn tools_suppress_thinking_even_when_asked() {
+        // The trap: a high effort on a tool-carrying turn must NOT emit a
+        // thinking block (it would 400 the next request).
+        assert_eq!(
+            anthropic_thinking(Some(Effort::High), None, true),
+            (4096, None)
+        );
+    }
+
+    #[test]
+    fn without_an_explicit_cap_the_answer_gets_headroom_above_the_budget() {
+        // Low: budget 4096, max = 4096 + 4096 = 8192 (budget strictly below).
+        assert_eq!(
+            anthropic_thinking(Some(Effort::Low), None, false),
+            (8192, Some(4096))
+        );
+        // High: budget 32768, max = 36864.
+        assert_eq!(
+            anthropic_thinking(Some(Effort::High), None, false),
+            (36864, Some(32768))
+        );
+    }
+
+    #[test]
+    fn medium_effort_does_not_400_under_the_default_max_tokens() {
+        // The most likely bug in the cluster: default max_tokens is 4096, and a
+        // medium budget of 16384 is >= it. Because no explicit cap was set,
+        // max_tokens is raised to fit rather than the budget colliding with it.
+        let (max, budget) = anthropic_thinking(Some(Effort::Medium), None, false);
+        assert!(budget.unwrap() < max, "budget must stay strictly below max_tokens");
+        assert_eq!((max, budget), (16384 + 4096, Some(16384)));
+    }
+
+    #[test]
+    fn an_explicit_cap_clamps_the_budget_below_it() {
+        // cap 8192, high base 32768 → budget clamped to 8192-1024 = 7168.
+        assert_eq!(
+            anthropic_thinking(Some(Effort::High), Some(8192), false),
+            (8192, Some(7168))
+        );
+    }
+
+    #[test]
+    fn a_cap_too_small_for_a_1024_budget_drops_thinking() {
+        // cap 1500 → budget would be min(base, 476) = 476 < 1024 → no thinking,
+        // and the cap is left as the user set it.
+        assert_eq!(
+            anthropic_thinking(Some(Effort::Low), Some(1500), false),
+            (1500, None)
+        );
+    }
+}
+
+#[cfg(test)]
 mod sse_tests {
     use super::*;
     use futures::{stream, StreamExt};
@@ -969,5 +1208,105 @@ mod sse_tests {
         let _: Vec<Delta> = stream.collect().await;
 
         mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn top_k_is_written_to_the_request_body() {
+        // Regression: a configured `top_k` was silently dropped even though
+        // Anthropic's Messages API supports it alongside temperature.
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/v1/messages")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "top_k": 40,
+                "temperature": 0.7,
+            })))
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body("data: {\"type\":\"message_stop\"}\n\n")
+            .create_async()
+            .await;
+
+        let provider = AnthropicProvider::new(
+            "test",
+            ProviderConfig {
+                base_url: server.url(),
+                ..Default::default()
+            },
+            Arc::new(TailscaleClient::new()),
+            CacheConfig::default(),
+        );
+        let messages = vec![serde_json::json!({"role": "user", "content": "hi"})];
+        let sampling = SamplingParams {
+            temperature: Some(0.7),
+            top_k: Some(40),
+            ..Default::default()
+        };
+        let stream = provider
+            .chat_completion(messages, None, sampling, None, None)
+            .await
+            .unwrap();
+        let _: Vec<Delta> = stream.collect().await;
+
+        mock.assert_async().await;
+    }
+
+    #[test]
+    fn converts_openai_tool_definitions_to_anthropic_shape() {
+        // The regression this guards: the agent loop hands every provider
+        // OpenAI-shaped tools, and this one used to write them onto the wire
+        // body untouched, which 400s the whole request.
+        let openai = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read a file",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "path": { "type": "string" } },
+                    "required": ["path"]
+                }
+            }
+        });
+        let out = AnthropicProvider::tool_to_anthropic(&openai).expect("converted");
+        assert_eq!(out["name"], "read_file");
+        assert_eq!(out["description"], "Read a file");
+        assert_eq!(out["input_schema"]["properties"]["path"]["type"], "string");
+        assert!(out.get("function").is_none() && out.get("parameters").is_none());
+    }
+
+    #[test]
+    fn tool_conversion_is_idempotent_and_fills_a_missing_schema() {
+        let already = serde_json::json!({
+            "name": "t", "description": "d",
+            "input_schema": { "type": "object", "properties": {} }
+        });
+        assert_eq!(
+            AnthropicProvider::tool_to_anthropic(&already).unwrap(),
+            already
+        );
+
+        // No `parameters` at all, and a schema that omits the top-level
+        // `type` Anthropic requires — both must come out valid.
+        let bare = serde_json::json!({ "function": { "name": "noargs" } });
+        let out = AnthropicProvider::tool_to_anthropic(&bare).unwrap();
+        assert_eq!(out["input_schema"]["type"], "object");
+
+        let untyped = serde_json::json!({
+            "function": { "name": "u", "parameters": { "properties": {} } }
+        });
+        let out = AnthropicProvider::tool_to_anthropic(&untyped).unwrap();
+        assert_eq!(out["input_schema"]["type"], "object");
+    }
+
+    #[test]
+    fn a_nameless_tool_is_dropped_rather_than_failing_the_request() {
+        let nameless = serde_json::json!({ "function": { "description": "no name" } });
+        assert!(AnthropicProvider::tool_to_anthropic(&nameless).is_none());
+
+        let good = serde_json::json!({ "function": { "name": "ok" } });
+        let converted = AnthropicProvider::tools_to_anthropic(&[nameless, good]);
+        assert_eq!(converted.len(), 1, "the usable tool survives");
+        assert_eq!(converted[0]["name"], "ok");
     }
 }

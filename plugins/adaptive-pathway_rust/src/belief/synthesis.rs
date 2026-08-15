@@ -98,6 +98,13 @@ async fn route_observation_inner(
 
     let id = crate::store::audit::uuid_string();
 
+    // The observation's own side of a `contradicts` row: the merge target
+    // when it merges, otherwise the belief about to be created below (the
+    // old `unwrap_or_default` recorded `belief_a = ""` on the create branch
+    // — audit #118). Computed here because `id` is moved into the
+    // belief/observation rows in both branches.
+    let current_id = best.as_ref().map(|(i, _)| i.clone()).unwrap_or_else(|| id.clone());
+
     if let Some((target_id, _cos)) = &best {
         let target = db.get_belief(target_id.as_str()).await?.unwrap_or_else(|| {
             // shouldn't happen; create a fallback belief
@@ -205,7 +212,6 @@ async fn route_observation_inner(
     // contradicts; best-effort resolve it to a belief id and record an open
     // contradiction. Never fatal.
     if let Some(other_stmt) = contradicts {
-        let current_id = best.as_ref().map(|(i, _)| i.clone()).unwrap_or_default();
         let resolved = db
             .best_text_match(other_stmt)
             .await
@@ -317,4 +323,77 @@ pub fn observation_json(statement: &str, layer: &str, confidence: f64) -> serde_
         "layer": layer,
         "confidence": confidence,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn belief(id: &str, text: &str, embedding: Vec<f32>) -> Belief {
+        let now = Utc::now();
+        Belief {
+            id: id.into(),
+            text: text.into(),
+            embedding,
+            confidence: 0.7,
+            provenance: Provenance::DirectStatement,
+            layer: Layer::Context,
+            tested: true,
+            domain: None,
+            tier: "context".into(),
+            support_count: 1,
+            distinct_sessions: 1,
+            contradict_count: 0,
+            pinned: false,
+            last_confirmed_at: Some(now),
+            consolidated_at: None,
+            created_at: now,
+            updated_at: now,
+            session_id: None,
+            embedding_model: crate::config::DEFAULT_EMBEDDING_MODEL.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn new_belief_contradiction_records_the_created_id_not_empty() {
+        // Audit #118: when the observation created a *new* belief, the
+        // contradiction row's `belief_a` was `""` (`unwrap_or_default` on
+        // the absent merge target) instead of the created belief's id.
+        let db = crate::store::Db::open_in_memory().await.unwrap();
+        db.insert_belief(&belief("b-tea", "User likes tea", vec![1.0, 0.0]))
+            .await
+            .unwrap();
+
+        // Cosine 0 against "User likes tea" — far enough to create a new
+        // belief — and the model marks it as contradicting the tea belief.
+        route_observation(
+            &db,
+            "User likes black coffee",
+            &[0.0, 1.0],
+            crate::config::DEFAULT_EMBEDDING_MODEL,
+            Provenance::DirectStatement,
+            Layer::Context,
+            None,
+            None,
+            Some("User likes tea"),
+            Some("s1".to_string()),
+            None,
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+
+        let open = db.list_open().await.unwrap();
+        assert_eq!(open.len(), 1, "expected one recorded contradiction: {open:?}");
+        let c = &open[0];
+        let created = db
+            .list_beliefs(None)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|b| b.id != "b-tea")
+            .expect("the observation must have created a second belief");
+        assert_eq!(c.belief_a, created.id, "belief_a must be the created belief, not empty");
+        assert_eq!(c.belief_b, "b-tea");
+    }
 }

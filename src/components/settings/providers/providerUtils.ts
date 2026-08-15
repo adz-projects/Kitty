@@ -80,6 +80,16 @@ export async function suggestContextLength(profile: ProviderProfile): Promise<nu
       case 'openai':
       case 'custom_openai':
         return lookupContextLength(CUSTOM_OPENAI_CONTEXT_TABLE, model);
+      case 'local': {
+        // The GGUF header already carries the trained context window, parsed at
+        // download time — no probe, just find the installed model and read it.
+        const models = await ipc.listLocalModels();
+        const m = models.find((x) => x.id === model || x.file === model);
+        return m?.info?.context_length ?? null;
+      }
+      case 'ollama':
+        // A remote Ollama the user runs themselves — ask it directly.
+        return await ipc.ollamaContextLength(profile.base_url, model);
       default:
         return null;
     }
@@ -122,6 +132,7 @@ export const blank = (): ProviderProfile => ({
   max_tokens: null,
   context_length: null,
   strip_reasoning: false,
+  supports_vision: false,
   system_prompt: null,
   prompt_idle_timeout_secs: null,
   parallel_slots: null,

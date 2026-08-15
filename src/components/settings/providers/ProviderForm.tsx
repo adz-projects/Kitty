@@ -56,7 +56,7 @@ export function ProviderForm({
       clearTimeout(timer);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [profile.provider_type, modelsKey]);
+  }, [profile.provider_type, profile.base_url, modelsKey]);
   const detents = detentsFor(suggested);
   const [advancedOpen, setAdvancedOpen] = useState(false);
 
@@ -188,6 +188,20 @@ export function ProviderForm({
             <span>
               Strip reasoning from context sent on later turns (recommended for Gemma4-style local
               reasoning models; chat-only providers only)
+            </span>
+          </label>
+
+          <label className="check">
+            <input
+              type="checkbox"
+              checked={profile.supports_vision}
+              onChange={(e) => set({ supports_vision: e.target.checked })}
+            />
+            <span>
+              This provider&apos;s models accept images — tick this if Kitty hides the screenshot
+              and image-attach buttons for a model that does support them. Kitty recognizes the
+              common vision models by name; this is the override for the ones it can&apos;t know
+              about, such as a self-hosted or renamed model.
             </span>
           </label>
 
@@ -349,7 +363,7 @@ export function ProviderForm({
                     min={0}
                     step={1}
                     value={profile.top_k}
-                    onChange={(e) => set({ top_k: Number(e.target.value) })}
+                    onChange={(e) => set({ top_k: e.target.value ? Number(e.target.value) : null })}
                   />
                 </div>
               )}
@@ -369,7 +383,7 @@ export function ProviderForm({
                     max={1}
                     step={0.01}
                     value={profile.min_p}
-                    onChange={(e) => set({ min_p: Number(e.target.value) })}
+                    onChange={(e) => set({ min_p: e.target.value ? Number(e.target.value) : null })}
                   />
                 </div>
               )}
@@ -396,7 +410,9 @@ export function ProviderForm({
                   min={1}
                   step={256}
                   value={profile.max_tokens}
-                  onChange={(e) => set({ max_tokens: Number(e.target.value) })}
+                  onChange={(e) =>
+                    set({ max_tokens: e.target.value ? Number(e.target.value) : null })
+                  }
                 />
               </div>
             )}

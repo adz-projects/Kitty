@@ -269,8 +269,7 @@ button.primary {
 /* The folder/thought-partner pill takes remaining space and truncates first —
    the control group to its right (mode toggle/provider/effort/approval) holds
    its own shrink behavior instead of the whole header wrapping to 2 lines. */
-.chat-header > .pill,
-.chat-header > .pill-static {
+.chat-header > .pill {
   flex: 1 1 auto;
   min-width: 0;
   overflow: hidden;
@@ -766,14 +765,43 @@ button.primary {
   border-color: var(--accent);
   color: var(--text);
 }
-/* Non-interactive variant (Round-3 item 4 — the pill must not look/act
-   clickable in thought-partner mode). */
-.pill-static {
-  cursor: default;
+
+/* Working-folder pill with an inline "return to thought partner" reset (R6):
+   a container that keeps the pill shell but lets its two child buttons carry
+   the padding, so the folder name truncates and the × stays put beside it. */
+.pill-folder {
+  padding: 0;
+  gap: 0;
 }
-.pill-static:hover {
-  border-color: var(--border);
+.pill-folder .pill-body {
+  border: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  padding: 3px 4px 3px 10px;
+  border-radius: 999px 0 0 999px;
+  cursor: pointer;
+}
+.pill-folder .pill-reset {
+  border: none;
+  background: transparent;
   color: var(--text-muted);
+  font-size: var(--fs-base);
+  line-height: 1;
+  padding: 3px 9px 3px 3px;
+  border-radius: 0 999px 999px 0;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.pill-folder .pill-reset:hover {
+  color: var(--text);
 }
 
 .status-badge {
@@ -858,40 +886,6 @@ button.primary {
   }
 }
 
-/* Instant chat/agentic mode toggle (Round-4). */
-.mode-toggle {
-  display: inline-flex;
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  overflow: hidden;
-}
-.mode-toggle button {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  border: none;
-  background: transparent;
-  color: var(--text-muted);
-  font-size: var(--fs-xs);
-  padding: 3px 8px;
-  cursor: pointer;
-  white-space: nowrap;
-}
-/* Text label hides below this width, leaving just the emoji, so the header
-   fits on one line in the overlay's default size — restored once there's
-   enough room (e.g. the wider main window). */
-@media (max-width: 700px) {
-  .mode-toggle-label {
-    display: none;
-  }
-  .mode-toggle button {
-    padding: 3px 6px;
-  }
-}
-.mode-toggle button.active {
-  background: var(--accent);
-  color: var(--accent-text);
-}
 /* Reasoning-effort control (Round-7) — only rendered when the active model
    supports it, so it can sit inline with the other compact header badges. */
 .effort-dropdown {
@@ -962,17 +956,6 @@ button.primary {
   line-height: 1.6;
 }
 
-/* Chat-only ("thought partner") mode: a wider, calmer reading column. */
-.chat.reading .message-list {
-  align-items: center;
-}
-.chat.reading .msg {
-  width: 100%;
-  max-width: var(--reading-max-width);
-}
-.chat.reading .markdown {
-  line-height: var(--reading-line-height);
-}
 
 .pasted-chip {
   flex-direction: column;
@@ -1205,6 +1188,30 @@ button.primary {
   display: flex;
   flex-direction: column;
 }
+
+/* Android's soft keyboard shrinks the *visual* viewport without resizing the
+   layout, so `lib/viewport.ts` measures it and the app pins itself to the
+   visible rectangle. Without this the browser scrolls the window to follow
+   the caret and carries the header off the top of the screen — the layout
+   never compresses, it just slides.
+
+   Scoped to the platform attribute rather than `:has()` — that selector is
+   unsupported on older Android WebViews, and this must not change desktop
+   layout at all.
+
+   `#root` is in the selector for specificity, not for targeting: the
+   `html, body, #root { height: 100% }` rule above carries an ID, which beats
+   an attribute+class selector. Without it the pin applied but the height did
+   not, so the box stayed full-height and the composer overflowed below the
+   keyboard while the header finally stayed put — half-fixed and more
+   confusing than the original bug. */
+[data-platform='android'] #root.hub-root {
+  position: fixed;
+  top: var(--app-top, 0);
+  left: 0;
+  right: 0;
+  height: var(--app-h, 100%);
+}
 .hub-root > .hub-route,
 .hub-root > .sessions-route,
 .hub-root > .settings-window,
@@ -1249,6 +1256,17 @@ button.primary {
 .main-header h1 {
   font-size: var(--fs-2xl);
   margin: 0;
+}
+/* The mark sits left of the wordmark on desktop and replaces it on Android
+   (where the row is too narrow for both). A block-level h1 would put the 24px
+   glyph on its own baseline and misalign it against the buttons either side,
+   so it becomes a flex box that centres its own children. The gap only has
+   anything to separate when the word is present. */
+.main-header h1.app-mark {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 8px;
 }
 .main-body {
   flex: 1;
@@ -1545,16 +1563,27 @@ button.primary {
 .settings-nav button:hover {
   background: var(--surface-2);
 }
-/* Settings is a hub route now, not a window with its own close button, so it
-   needs a visible way back to chat. Two classes deep to outrank
-   `.settings-nav button` above, which would otherwise strip the divider —
+/* The Kitty mark at the top of the settings nav, which doubles as "back to
+   chat". Two classes deep to outrank `.settings-nav button` above, which
+   would otherwise impose that rule's left-indent and text alignment —
    specificity rather than `!important`, so a theme can still override it. */
-.settings-nav .settings-nav-back {
+.settings-nav .settings-nav-home {
+  display: flex;
+  align-items: center;
+  /* Was centred and `flex-start`-aligned when this was an icon on its own.
+     With a label it is a full-width row like every other nav entry, so it
+     starts at the left edge and stretches — otherwise the text hangs off a
+     button sized to the glyph. */
+  justify-content: flex-start;
+  align-self: stretch;
+  gap: 8px;
+  padding: 8px;
   margin-bottom: 6px;
-  padding: 6px 10px 10px;
-  border-bottom: 1px solid var(--border);
-  border-radius: 0;
   color: var(--text-muted);
+}
+.settings-nav .settings-nav-home:hover {
+  color: var(--text);
+  background: var(--surface-2);
 }
 
 .settings-nav button.active {
@@ -1960,17 +1989,91 @@ button.link {
    what decides — placing it earlier silently loses. That is not
    hypothetical: the first cut of this sat above `.main-window` and left
    the phone layout with a 260px track for a sidebar that was already
-   `display: none`, squeezing chat into 115px of a 375px screen. */
-@media (max-width: 480px) {
+   `display: none`, squeezing chat into 115px of a 375px screen.
+
+   **600px, not 480.** Measured on a Pixel 10 Pro: `window.innerWidth` is
+   **485** CSS px (1080 physical / 2.225 dpr), so a 480px cutoff missed a
+   current flagship entirely — the tab bar stayed `display: none` and the
+   safe-area padding never applied, leaving content under the notch. 480 was
+   picked from convention rather than from a device.
+
+   600 is Android's own "compact" width class, which is exactly the
+   "this is a phone-shaped window" question being asked here. It does mean a
+   desktop hub window narrowed below 600px gets the mobile shell — intended,
+   and the same reasoning as rendering the tab bar on every platform: at that
+   width the three-column layout is unusable anyway. */
+@media (max-width: 600px) {
+  :root {
+    /* 44px tap target + whatever the gesture bar claims. */
+    --mobile-tabs-h: calc(44px + var(--safe-bottom));
+  }
+
   /* The desktop chat layout is a three-column grid (history | chat |
      artifacts). On a phone only the middle column fits; the history lives
      behind the "Chats" tab and artifacts are dropped rather than crushed. */
   .main-window {
     grid-template-columns: 1fr;
   }
-  .main-window > .session-list,
-  .main-window > .artifacts-pane {
+  .main-window > .session-list {
     display: none;
+  }
+
+  /* One header row, not two: the chat's own controls (model picker, effort,
+     overflow) are hoisted up here by `ChatWorkspace`, so this row now carries
+     mark | controls | artifacts+new-chat. `space-between` was written for two
+     children and would strand the controls in the middle, so switch to an
+     explicit gap and let the controls group absorb the slack. */
+  .main-header {
+    justify-content: flex-start;
+    gap: 6px;
+  }
+  .main-header .chat-header-controls {
+    flex: 1;
+    /* Without this a long provider name refuses to shrink below its content
+       width and shoves "New chat" off the right edge. */
+    min-width: 0;
+  }
+  .main-header .provider-badge {
+    min-width: 0;
+  }
+  .main-header .provider-badge-label {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  /* Artifacts stay reachable on a phone — files the model wrote are the
+     whole point of the pane, and there is no file manager to fall back on.
+     It can't be a third column at this width, so "Show artifacts" opens it
+     as a sheet over the conversation instead. Only rendered at all when
+     toggled on (`ChatWorkspace`), so this is purely presentation.
+
+     Fixed rather than a second grid row: as a row it would halve an already
+     short conversation, and the pane scrolls independently anyway. Inset to
+     clear the notch at the top and the tab bar at the bottom, so it never
+     covers the way out of itself. */
+  .artifacts-close {
+    margin-left: auto;
+    padding: 2px 8px;
+    line-height: 1;
+  }
+
+  .main-window > .artifacts-pane {
+    /* Absolute, not fixed: `.hub-root` is itself fixed to the visible rect
+       while the keyboard is open, and a fixed child would anchor to the
+       layout viewport instead and drift out of the visible area. */
+    position: absolute;
+    top: var(--safe-top);
+    right: 0;
+    bottom: var(--mobile-tabs-h);
+    left: 0;
+    z-index: 20;
+    width: auto;
+    border-left: none;
+    border-top: 1px solid var(--border);
+    background: var(--surface);
+    overflow-y: auto;
+    overscroll-behavior: contain;
   }
 
   /* Settings is a two-column grid on desktop; stack it and let the nav scroll
@@ -1994,6 +2097,8 @@ button.link {
 
   .mobile-tabs {
     display: grid;
+    /* Height the artifacts sheet subtracts so it stops above the bar rather
+       than under it. Kept in one place so the two cannot drift. */
     grid-auto-flow: column;
     grid-auto-columns: 1fr;
     border-top: 1px solid var(--border);
@@ -2014,15 +2119,26 @@ button.link {
     color: var(--accent);
   }
 
-  /* The window itself must clear the notch and the rounded corners. Applied
-     to the roots rather than to `body` so the tab bar's own
-     `padding-bottom` isn't doubled up. */
+  /* Clear the notch and the rounded corners. Applied to the route roots
+     rather than to `body` so the tab bar's own `padding-bottom` isn't
+     doubled up.
+
+     Split in two because the bases differ: the grid containers have no
+     padding of their own, while `.window-root` already carries 24px. Giving
+     that one a bare `padding-top: var(--safe-top)` would *replace* its
+     padding and leave the wizard's content flush against both screen edges,
+     so it adds instead. Measured insets on a Pixel 10 Pro: 78px top, 24px
+     bottom. */
   .main-window,
   .settings-window,
-  .sessions-route,
-  .window-root {
+  .sessions-route {
     padding-top: var(--safe-top);
     padding-left: var(--safe-left);
     padding-right: var(--safe-right);
+  }
+  .window-root {
+    padding-top: calc(24px + var(--safe-top));
+    padding-left: calc(24px + var(--safe-left));
+    padding-right: calc(24px + var(--safe-right));
   }
 }

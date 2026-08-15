@@ -43,8 +43,13 @@ pub struct Config {
     pub open_window_hotkey: Option<String>,
     /// Default working directory for new sessions (Phase 4). `None` until set.
     pub default_context_folder: Option<String>,
-    /// Ollama endpoint; the stack manager probes and (if needed) spawns it.
-    pub ollama_base_url: String,
+    // No `ollama_base_url` here on purpose. It survived the managed-Ollama
+    // retirement (Phase 2b) as a settings field with no reader anywhere —
+    // Kitty spawns no inference process, and a remote-Ollama provider profile
+    // carries its own `base_url`. Struct-level `#[serde(default)]` and the
+    // absence of `deny_unknown_fields` mean an existing config.json still
+    // carrying the key loads fine; the key is simply ignored and drops out on
+    // the next save.
     /// First-run wizard completion flag (gates the wizard in Phase 7).
     pub setup_completed: bool,
     /// Active theme name (built-ins `default`/`dark`, or a user `.css` filename).
@@ -92,6 +97,14 @@ pub struct Config {
     /// `session_folders` above.
     #[serde(default)]
     pub session_modes: HashMap<String, String>,
+    /// Per-session reasoning-effort choice (item: thinking effort). Maps a
+    /// session id → the wire value (`"off"`/`"low"`/`"medium"`/`"high"`) last
+    /// chosen for it. Persisted so resuming a session keeps its effort;
+    /// re-derived against the *active provider's* capability each time it's
+    /// read (see `bigtiny::effort`), so a session that later points at a
+    /// provider with no effort control just stops offering the dropdown.
+    #[serde(default)]
+    pub session_efforts: HashMap<String, String>,
     /// Whether the in-process behavioral-memory (pathway) engine, linked
     /// directly into the BigTiny daemon, is active for this install. On by
     /// default for fresh installs. Also gates whether Ollama must run at all
@@ -437,7 +450,6 @@ impl Default for Config {
             clipboard_hotkey: Some("Ctrl+Alt+Space".to_string()),
             open_window_hotkey: None,
             default_context_folder: None,
-            ollama_base_url: "http://localhost:11434".to_string(),
             setup_completed: false,
             theme: "default".to_string(),
             background_image: None,
@@ -454,6 +466,7 @@ impl Default for Config {
             session_folders: HashMap::new(),
             show_artifacts: true,
             session_modes: HashMap::new(),
+            session_efforts: HashMap::new(),
             adaptive_pathway_enabled: default_adaptive_pathway_enabled(),
             adaptive_pathway_embedding_model: default_ap_embedding_model(),
             replacement_mcp_enabled: default_true(),
@@ -560,12 +573,20 @@ fn default_ap_embedding_model() -> String {
 /// GGUF ids (file stems) of the two models the local engine uses by default,
 /// matching docs/ANDROID.md §9. Ids rather than Ollama tags since Phase 2b:
 /// these name a file in `models_dir()`, resolved by `crate::models::resolve`.
-pub const DEFAULT_EMBEDDING_GGUF: &str = "Qwen3-Embedding-0.6B-q4_k_m";
+pub const DEFAULT_EMBEDDING_GGUF: &str = "Qwen3-Embedding-0.6B-Q8_0";
 pub const DEFAULT_SUMMARIZER_GGUF: &str = "LFM2.5-1.2B-Instruct-Q4_K_M";
 
 /// Ollama tags these two settings held before Phase 2b, carried forward by
 /// `migrate_model_tags_to_gguf`.
 const LEGACY_EMBEDDING_TAG: &str = "qwen3-embedding:0.6b";
+/// The q4_k_m id this briefly pointed at. **Qwen never published a q4 for
+/// this model** — the official repo has only `Q8_0` and `f16` — so any config
+/// carrying this name references a file that cannot be downloaded, and every
+/// embedding load would fail with "model not found" forever. Migrated, not
+/// merely re-defaulted: `adaptive_pathway_embedding_model` is a persisted
+/// field, so an existing install keeps the dead name unless something
+/// rewrites it.
+const UNAVAILABLE_EMBEDDING_GGUF: &str = "Qwen3-Embedding-0.6B-q4_k_m";
 const LEGACY_SUMMARIZER_TAGS: [&str; 2] = ["LFM2.5-1.2b", "qwen3.5:0.8b"];
 
 /// Per-event notification toggles.
@@ -604,8 +625,46 @@ pub enum ConfigError {
 /// has no `config.json` yet but the pre-rename `%APPDATA%/goose-overlay/`
 /// does, move the whole directory (bringing `config.json` and `themes/`
 /// along) rather than leaving the user's settings stranded under the old name.
+/// Where the app may write, when the platform can't be asked with `dirs`.
+///
+/// **Android has no XDG or Known-Folder equivalent**, so `dirs::config_dir()`
+/// and `dirs::data_local_dir()` both return `None` there and every path
+/// derived from them fails. Observed on a Pixel 10 as two cascading errors:
+/// `config load failed (could not resolve the app config directory)`, then
+/// the daemon falling all the way back to a relative `./.bigtiny` and dying
+/// on `Read-only file system` — because the process's cwd on Android is `/`.
+///
+/// The real answer comes from the Android `Context`
+/// (`/data/user/0/<package>/files`), which only Tauri's `PathResolver` can
+/// produce. It is stashed here at startup so the rest of this module keeps
+/// its `AppHandle`-free signatures — threading a handle through every path
+/// helper would touch far more code than the one platform needs.
+static APP_DIRS: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Install the platform-resolved app directory. Call once, as early in
+/// startup as an `AppHandle` exists; ignored if already set.
+///
+/// Android-only, because it is the only platform that needs it: `dirs`
+/// answers everywhere else, so on desktop `APP_DIRS` stays unset and every
+/// path below resolves exactly as it did before. Gated rather than
+/// `allow(dead_code)`d so a future desktop caller is a compile error to think
+/// about, not a silent override of the platform's own conventions.
+#[cfg(target_os = "android")]
+pub fn init_app_dir(dir: PathBuf) {
+    let _ = APP_DIRS.set(dir);
+}
+
+/// The base directory app data lives under. Prefers whatever
+/// [`init_app_dir`] was given, then the platform's own config dir.
+fn app_base_dir() -> Result<PathBuf, ConfigError> {
+    if let Some(dir) = APP_DIRS.get() {
+        return Ok(dir.clone());
+    }
+    dirs::config_dir().ok_or(ConfigError::NoConfigDir)
+}
+
 pub(crate) fn config_dir() -> Result<PathBuf, ConfigError> {
-    let base = dirs::config_dir().ok_or(ConfigError::NoConfigDir)?;
+    let base = app_base_dir()?;
     let dir = base.join("Kitty");
     if !dir.join("config.json").exists() {
         let old_dir = base.join("goose-overlay");
@@ -697,7 +756,13 @@ pub fn themes_dir() -> Result<PathBuf, ConfigError> {
 /// several gigabytes each. `dirs::data_local_dir()` is the non-roaming
 /// equivalent, and matches where `tools/local_engine_lab.py` already looks.
 pub fn models_dir() -> Result<PathBuf, ConfigError> {
-    let base = dirs::data_local_dir().ok_or(ConfigError::NoConfigDir)?;
+    // On Android there is no roaming/local split to respect — app storage is
+    // app storage — so this falls through to the same base as everything
+    // else rather than failing on a `dirs` call that answers `None` there.
+    let base = match APP_DIRS.get() {
+        Some(dir) => dir.clone(),
+        None => dirs::data_local_dir().ok_or(ConfigError::NoConfigDir)?,
+    };
     let dir = base.join("Kitty").join("models");
     fs::create_dir_all(&dir)?;
     Ok(dir)
@@ -733,6 +798,19 @@ pub fn load() -> Result<Config, ConfigError> {
 pub fn load_with_recovery() -> (Config, Option<PathBuf>) {
     match load() {
         Ok(cfg) => (cfg, None),
+        // Not a recovery case, and saying so matters. On Android this is the
+        // *expected* result of the first call: `lib.rs` loads once before
+        // Tauri exists, and `APP_DIRS` can only be filled in from `setup`
+        // (see `init_app_dir`), which reloads. Routing that through the
+        // corrupt-file path logged a WARN about backing up a config that was
+        // never read, on every single launch — noise that would camouflage
+        // the real thing. It is also wrong everywhere else: if the directory
+        // cannot be resolved there is no file, so there is nothing to be
+        // corrupt and nothing to back up.
+        Err(ConfigError::NoConfigDir) => {
+            tracing::debug!("config directory not resolvable yet; using defaults for now");
+            (Config::default(), None)
+        }
         Err(e) => {
             let backup = backup_corrupt_config();
             tracing::warn!(
@@ -938,7 +1016,9 @@ fn migrate_kitty_web_enabled(mut config: Config) -> Config {
 /// typed by hand is left alone: it may well name a GGUF they downloaded
 /// themselves, and guessing would be worse than leaving it.
 fn migrate_model_tags_to_gguf(mut config: Config) -> Config {
-    if config.adaptive_pathway_embedding_model == LEGACY_EMBEDDING_TAG {
+    if config.adaptive_pathway_embedding_model == LEGACY_EMBEDDING_TAG
+        || config.adaptive_pathway_embedding_model == UNAVAILABLE_EMBEDDING_GGUF
+    {
         config.adaptive_pathway_embedding_model = DEFAULT_EMBEDDING_GGUF.to_string();
     }
     if LEGACY_SUMMARIZER_TAGS.contains(&config.summarizer.model.as_str()) {
@@ -1086,7 +1166,7 @@ mod tests {
         // A config written by an older build (only one field) must still load.
         let back: Config = serde_json::from_str(r#"{"theme":"dark"}"#).unwrap();
         assert_eq!(back.theme, "dark");
-        assert_eq!(back.ollama_base_url, "http://localhost:11434");
+        assert_eq!(back.default_context_folder, None);
         // Predates the second (open-new-chat-window) hotkey entirely — must
         // default to unregistered, not error out on the missing field.
         assert_eq!(back.open_window_hotkey, None);
@@ -1256,6 +1336,37 @@ mod tests {
         // shares — a GGUF id since Phase 2b, not an Ollama tag.
         let back: Config = serde_json::from_str(r#"{"theme":"dark"}"#).unwrap();
         assert_eq!(back.adaptive_pathway_embedding_model, DEFAULT_EMBEDDING_GGUF);
+    }
+
+    /// The embedding pin briefly named `Qwen3-Embedding-0.6B-q4_k_m`, which
+    /// Qwen never published — the official repo has only `Q8_0` and `f16`,
+    /// so that filename 404s on Hugging Face. Because the field is
+    /// persisted, changing the default alone would leave every existing
+    /// install pointed at a file it can never download, and semantic recall
+    /// silently stuck on the hash-space fallback forever.
+    #[test]
+    fn a_config_pinned_to_the_nonexistent_q4_embedding_is_repointed() {
+        let stale = Config {
+            adaptive_pathway_embedding_model: UNAVAILABLE_EMBEDDING_GGUF.to_string(),
+            ..Config::default()
+        };
+        let migrated = migrate_model_tags_to_gguf(stale);
+        assert_eq!(
+            migrated.adaptive_pathway_embedding_model,
+            DEFAULT_EMBEDDING_GGUF
+        );
+    }
+
+    /// A user who deliberately chose some other embedder must keep it — the
+    /// migration repoints exactly the two dead names, not anything unfamiliar.
+    #[test]
+    fn a_deliberately_chosen_embedding_model_survives_the_migration() {
+        let chosen = Config {
+            adaptive_pathway_embedding_model: "my-own-embedder".to_string(),
+            ..Config::default()
+        };
+        let migrated = migrate_model_tags_to_gguf(chosen);
+        assert_eq!(migrated.adaptive_pathway_embedding_model, "my-own-embedder");
     }
 
     #[test]

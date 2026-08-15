@@ -1,12 +1,10 @@
 //! Per-session configuration: approval mode, thinking effort, provider
 //! rebinding, and the chat/agentic mode override.
 
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
 
-use crate::config;
+use super::{resolve_cwd, SessionInfo, ThinkingEffort};
 use crate::state::AppState;
-
-use super::ThinkingEffort;
 
 /// Switch the session's approval mode. BigTiny has no ACP-style modes
 /// handshake — HITL policy is enforced daemon-side and `new_session`
@@ -18,18 +16,37 @@ pub async fn set_mode(_app: AppHandle, session_id: String, mode_id: String) -> R
     Ok(())
 }
 
-/// Set the active session's thinking/reasoning effort. BigTiny sessions
-/// advertise no effort control (`thinking_effort: None` from `new_session`),
-/// so the UI never shows the dropdown; answering `None` keeps a stale caller
-/// harmless.
+/// Set the active session's thinking/reasoning effort. Persists the choice
+/// (so a resumed session keeps it), PATCHes it into the daemon session's
+/// metadata for the agent loop to translate per dialect next turn, then
+/// returns the effort recomputed against the active provider — which also
+/// drops a value the current provider doesn't offer. `Ok(None)` when the
+/// active provider has no effort control (the UI then hides the dropdown).
 #[tauri::command]
 pub async fn set_thinking_effort(
-    _app: AppHandle,
+    app: AppHandle,
     session_id: String,
     value: String,
 ) -> Result<Option<ThinkingEffort>, String> {
-    let _ = (&session_id, &value);
-    Ok(None)
+    {
+        let state = app.state::<AppState>();
+        let mut cfg = state.config.lock().unwrap();
+        cfg.session_efforts.insert(session_id.clone(), value.clone());
+        crate::config::save(&cfg).map_err(|e| e.to_string())?;
+    }
+    crate::bigtiny::sessions::update_thinking_effort(&app, &session_id, &value).await?;
+    Ok(crate::bigtiny::effort::thinking_effort_for(&app, &session_id))
+}
+
+/// Read the effort control for a session, recomputed against the active
+/// provider. The frontend calls this when the provider or model changes
+/// mid-session so the dropdown appears/disappears/re-scopes without a reload.
+#[tauri::command]
+pub async fn get_thinking_effort(
+    app: AppHandle,
+    session_id: String,
+) -> Result<Option<ThinkingEffort>, String> {
+    Ok(crate::bigtiny::effort::thinking_effort_for(&app, &session_id))
 }
 
 /// "Set as working directory" (agentic mode only) — repoints the session's
@@ -46,6 +63,20 @@ pub async fn set_session_context_dir(
     cwd: String,
 ) -> Result<(), String> {
     crate::bigtiny::sessions::update_cwd(&app, &session_id, &cwd).await
+}
+
+/// "Return to thought partner" — repoint the session back to a fresh private
+/// per-chat folder (the default, no-project state). The inverse of
+/// `set_session_context_dir`: it hands the session a new `<base>/chats/…`
+/// directory so `is_default_folder` becomes true again, and returns the
+/// refreshed `SessionInfo` for the chat header to re-render from.
+#[tauri::command]
+pub async fn reset_session_context_dir(
+    app: AppHandle,
+    session_id: String,
+) -> Result<SessionInfo, String> {
+    let cwd = resolve_cwd(&app).await?;
+    crate::bigtiny::sessions::reset_cwd(&app, &session_id, cwd).await
 }
 
 /// Set a session's custom/default persona (Round-6 Feature 2, re-plumbed onto
@@ -68,48 +99,3 @@ pub async fn rebind_session_provider(app: AppHandle, session_id: String) {
     crate::bigtiny::providers::rebind_session(&app, &session_id).await;
 }
 
-/// Get a session's persisted chat/agentic mode override, if any (`None` =
-/// default to chat — see `Config::session_modes`'s doc comment).
-#[tauri::command]
-pub fn get_session_mode(
-    state: tauri::State<'_, AppState>,
-    session_id: String,
-) -> Result<Option<String>, String> {
-    let cfg = state.config.lock().unwrap();
-    Ok(cfg.session_modes.get(&session_id).cloned())
-}
-
-/// Set (or clear, via `None`) a session's mode override. Also pushes the new
-/// mode to BigTiny (`bigtiny::sessions::update_mode`) so its
-/// directory-sandboxing scope (`bigtiny/agent/sandbox.py`) stays in sync —
-/// this is what makes flipping `ModeToggle` mid-session actually take effect
-/// server-side, not just in Kitty's own `config.json`. Clearing the override
-/// (`None`/empty) falls back to chat mode, matching `isChatMode`'s own
-/// `modeOverride ?? 'chat'` default.
-#[tauri::command]
-pub async fn set_session_mode(
-    app: AppHandle,
-    state: tauri::State<'_, AppState>,
-    session_id: String,
-    mode: Option<String>,
-) -> Result<(), String> {
-    let effective_mode = {
-        let mut cfg = state.config.lock().unwrap();
-        match &mode {
-            Some(m) if !m.trim().is_empty() => {
-                cfg.session_modes.insert(session_id.clone(), m.clone());
-            }
-            _ => {
-                cfg.session_modes.remove(&session_id);
-            }
-        }
-        config::save(&cfg).map_err(|e| e.to_string())?;
-        mode.filter(|m| !m.trim().is_empty())
-            .unwrap_or_else(|| "chat".to_string())
-    };
-    if let Err(e) = crate::bigtiny::sessions::update_mode(&app, &session_id, &effective_mode).await
-    {
-        tracing::warn!("bigtiny mode sync failed for session {session_id}: {e}");
-    }
-    Ok(())
-}

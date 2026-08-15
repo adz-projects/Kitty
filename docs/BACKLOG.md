@@ -25,7 +25,10 @@ open an item here instead.
 - Per-turn provider/model in the export: we only track the session's current
   model in render state, so every turn is tagged with it. Capture true per-turn
   model if goosed later exposes it in `session/load` replay metadata.
-- Cross-platform support (Windows-only for v1 per project description §11).
+- ~~Cross-platform support (Windows-only for v1 per project description §11).~~
+  **Partly done:** Android shipped (`docs/ANDROID.md`, Phases 1–8). macOS and
+  Linux are still out of scope — the overlay's Copilot-key hook, the screenshot
+  capture path and the `keyring` store are all Win32.
 
 - **Composer live markdown auto-formatting (shelved, code retained).** A
   contentEditable composer that converted `* `/`# `-`###### ` into live bullets
@@ -44,3 +47,15 @@ open an item here instead.
   2. `Range.deleteContents()` empties a text node *in place* when both boundaries
      fall inside it, rather than removing the node — so `childNodes.length === 0`
      misses the "block is now empty" case; test `textContent === ''` instead.
+
+- **Ship the CPython WASI guest on Android (Phase 8 finding).** `kitty-wasm`
+  is an in-process MCP builtin on Android, but its 26 MB `python-3.12.0.wasm`
+  guest is not bundled: `app.path().resource_dir()` there is an asset URI, not
+  a filesystem path, so `bigtiny::mcp`'s `is_file()` probe fails, the
+  `KITTY_WASM_PYTHON` override is left unset, and `execute_math_python` /
+  `wasm_python_run` fall back to downloading the guest on first use. A stale
+  copy *was* being packaged (11 MB compressed of the AAB) and was removed —
+  packaging it as an asset achieves nothing without an
+  extract-to-app-storage-on-first-run step, since wasmtime needs a real path.
+  Fix is that extraction step plus pointing the env var at it; until then the
+  behaviour is a first-use download, which is graceful but not offline.

@@ -73,6 +73,12 @@ pub fn extract_content_from_rmcp(content: &[rmcp::model::Content]) -> String {
 /// Python's `validate_tool_args` — a no-op if the schema is empty/absent, and
 /// fails open (treats as valid) if the schema itself is malformed, matching
 /// Python's lenient behavior rather than rejecting the call outright.
+///
+/// The malformed-schema branch must NOT use `jsonschema::validate`: it
+/// *panics* on a schema it can't compile, unwinding the whole turn task.
+/// Compile via `validator_for` and fail open on a compile error — the real
+/// gate is the connect-time compile check in `mcp::client::refresh_tools`,
+/// which refuses to register such a tool in the first place.
 pub fn validate_tool_args(tool: &ToolDefinition, args: &Value) -> Result<(), String> {
     let is_empty_schema = match &tool.input_schema {
         Value::Null => true,
@@ -82,7 +88,11 @@ pub fn validate_tool_args(tool: &ToolDefinition, args: &Value) -> Result<(), Str
     if is_empty_schema {
         return Ok(());
     }
-    match jsonschema::validate(&tool.input_schema, args) {
+    let validator = match jsonschema::validator_for(&tool.input_schema) {
+        Ok(v) => v,
+        Err(_) => return Ok(()),
+    };
+    match validator.validate(args) {
         Ok(()) => Ok(()),
         Err(e) => {
             let path = e.instance_path.to_string();
@@ -156,5 +166,20 @@ mod tests {
         };
         assert!(validate_tool_args(&tool, &json!({})).is_err());
         assert!(validate_tool_args(&tool, &json!({"path": "/tmp"})).is_ok());
+    }
+
+    /// Regression: `jsonschema::validate` *panics* on a schema it can't
+    /// compile (e.g. `"type": 123`), unwinding the whole turn task. The call
+    /// path must fail open instead — the connect-time compile check in
+    /// `mcp::client::refresh_tools` is the real gate.
+    #[test]
+    fn validate_tool_args_fails_open_without_panicking_on_an_uncompilable_schema() {
+        let tool = ToolDefinition {
+            name: "t".into(),
+            description: "".into(),
+            input_schema: json!({"type": 123}),
+            server_id: "s".into(),
+        };
+        assert!(validate_tool_args(&tool, &json!({"anything": 1})).is_ok());
     }
 }

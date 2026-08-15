@@ -1,6 +1,6 @@
 [package]
 name = "kitty"
-version = "0.5.0"
+version = "0.6.0"
 description = "Hotkey-summoned floating overlay chat client backed by BigTiny"
 authors = ["Adam Zolkover"]
 edition = "2021"
@@ -43,12 +43,6 @@ bytes = "1"
 dirs = "5"
 rand = "0.8"
 futures-util = "0.3"
-# NOTE (Android/D24): only the `windows-native` store is enabled, so on
-# aarch64-linux-android keyring 3.x falls through to its catch-all
-# `pub use mock as default` — it COMPILES, but silently becomes an in-memory
-# mock, i.e. provider API keys appear to save and then vanish on relaunch.
-# That is a Phase 7 blocker for shipping, not a build blocker; see D24.
-keyring = { version = "3", features = ["windows-native"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 base64 = "0.22"
 semver = "1"
@@ -76,10 +70,40 @@ notify-rust = "4.18"
 winreg = "0.52"
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+# Desktop-only, and that is now enforced rather than assumed. keyring 3.x has
+# apple-native / linux-native / windows-native backends and **nothing for
+# Android**: on that target it silently falls through to its catch-all
+# `pub use mock as default`, an in-memory HashMap. It compiled, it looked like
+# it worked, and every provider API key vanished on relaunch (D24). Android's
+# store is `src/android/secrets.rs` over the AndroidKeyStore; having the crate
+# out of that target's graph entirely is what stops the mock coming back.
+keyring = { version = "3", features = ["windows-native"] }
 tauri-plugin-single-instance = "2"
 # No OS-wide hotkey concept on mobile; the overlay-summon path this drives is
 # desktop-only (docs/ANDROID.md D9/D23).
 tauri-plugin-global-shortcut = "2"
+
+# Android links the daemon in rather than spawning it (D8, §2.1/§2.3).
+#
+# Not a portability nicety — a requirement. Android 10+ refuses to `exec()`
+# anything in an app-writable directory, which is why `externalBin` is empty
+# in `tauri.android.conf.json` and why there is no `bigtiny-daemon` binary to
+# spawn on this platform. Without this dependency the app has no backend at
+# all: no chat, no MCP, no memory.
+#
+# Desktop deliberately does NOT take this dependency. There the daemon stays a
+# separate supervised process, which keeps a daemon crash survivable
+# (`lifecycle::bigtiny_proc` restarts it) instead of taking the UI down with
+# it. Linking it on both platforms would trade that away for nothing.
+#
+# `local-engine` is on: the summarizer and the embedder both run in-process on
+# Android (D4 revised, D18), so the engine has to come along.
+[target.'cfg(target_os = "android")'.dependencies]
+bigtiny_rust = { path = "../plugins/bigtiny_rust", features = ["local-engine"] }
+# Resolves the `content://` URI the save dialog returns into a writable file
+# descriptor (`commands::download_file`). Rust-side only — see the plugin
+# registration in `lib.rs` for why the webview gains nothing from this.
+tauri-plugin-fs = "2"
 
 [dev-dependencies]
 mockito = "1"

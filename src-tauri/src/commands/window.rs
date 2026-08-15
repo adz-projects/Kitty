@@ -1,8 +1,11 @@
 //! Window-lifecycle and backend-process commands: overlay/settings/main show,
 //! stack status, and the BigTiny restart used by "Fix this" + provider switches.
 
-use tauri::{AppHandle, Manager};
+use tauri::AppHandle;
+#[cfg(not(target_os = "android"))]
+use tauri::Manager;
 
+#[cfg(not(target_os = "android"))]
 use crate::lifecycle;
 use crate::state::AppState;
 use crate::state::{StackStatus, StartupPhase};
@@ -128,72 +131,94 @@ pub fn get_startup_phase(state: tauri::State<'_, AppState>) -> Result<StartupPha
 /// the active provider registration). "Fix this" and the degraded-state
 /// panel call this; `activate_provider` used to call it after switching, but
 /// BigTiny switches providers live over REST instead.
+///
+/// Android: the daemon is hosted **in-process** (`lifecycle::bigtiny_embedded`)
+/// and that host carries no restart handle — there is no child to kill, no
+/// `exec()`able exe (Android 10+ refuses to execute anything in app-writable
+/// storage), and the daemon's lifetime is the app's own. A setting that
+/// reaches here has already been persisted, so it applies on next launch.
+/// Returning `Ok` — rather than an exec-unsupported error — keeps
+/// `set_adaptive_pathway_enabled` from failing *after* persisting its toggle,
+/// and keeps `engine_restart` from re-arming `reload_required` into an
+/// endless doomed respawn loop.
 #[tauri::command]
 pub async fn restart_backend(app: AppHandle) -> Result<(), String> {
-    // Take the old process out of the daemon handle so we can drop the
-    // `bigtiny` Mutex before killing — `kill_if_owned` blocks on
-    // `child.wait()`, and holding the lock across that would stall every
-    // other BigTiny client call. Run the wait off the async worker too.
-    let old_proc = {
-        let state = app.state::<AppState>();
-        let mut handle = state.bigtiny.lock().unwrap();
-        std::mem::take(&mut handle.process)
-    };
-    tokio::task::spawn_blocking(move || {
-        let mut proc = old_proc;
-        proc.kill_if_owned();
-    })
-    .await
-    .map_err(|e| format!("backend kill task panicked: {e}"))?;
-    let (
-        command,
-        args,
-        dir,
-        summarizer,
-        token_management,
-        memory,
-        local,
-        pathway_enabled,
-        pathway_embedding_model,
-    ) = {
-        let state = app.state::<AppState>();
-        let cfg = state.config.lock().unwrap();
-        (
-            cfg.bigtiny_command.clone(),
-            cfg.bigtiny_args.clone(),
-            cfg.bigtiny_dir.clone(),
-            cfg.summarizer.clone(),
-            cfg.token_management.clone(),
-            cfg.memory.clone(),
-            cfg.local.clone(),
-            cfg.adaptive_pathway_enabled,
-            cfg.adaptive_pathway_embedding_model.clone(),
-        )
-    };
-    let handle = lifecycle::bigtiny_proc::spawn(
-        &command,
-        &args,
-        dir.as_deref(),
-        &summarizer,
-        &token_management,
-        &memory,
-        &local,
-        pathway_enabled,
-        &pathway_embedding_model,
-    )
-    .await?;
-    let (healthy, port) = (handle.healthy, handle.port);
+    #[cfg(target_os = "android")]
     {
-        let state = app.state::<AppState>();
-        *state.bigtiny.lock().unwrap() = handle;
+        let _ = &app;
+        tracing::info!(
+            "restart_backend on Android: the daemon is hosted in-process and cannot be \
+             restarted; the change applies on next launch"
+        );
+        Ok(())
     }
-    if let Err(e) = crate::bigtiny::providers::sync_active_provider(&app).await {
-        tracing::warn!("bigtiny provider sync after restart failed: {e}");
+    #[cfg(not(target_os = "android"))]
+    {
+        // Take the old process out of the daemon handle so we can drop the
+        // `bigtiny` Mutex before killing — `kill_if_owned` blocks on
+        // `child.wait()`, and holding the lock across that would stall every
+        // other BigTiny client call. Run the wait off the async worker too.
+        let old_proc = {
+            let state = app.state::<AppState>();
+            let mut handle = state.bigtiny.lock().unwrap();
+            std::mem::take(&mut handle.process)
+        };
+        tokio::task::spawn_blocking(move || {
+            let mut proc = old_proc;
+            proc.kill_if_owned();
+        })
+        .await
+        .map_err(|e| format!("backend kill task panicked: {e}"))?;
+        let (
+            command,
+            args,
+            dir,
+            summarizer,
+            token_management,
+            memory,
+            local,
+            pathway_enabled,
+            pathway_embedding_model,
+        ) = {
+            let state = app.state::<AppState>();
+            let cfg = state.config.lock().unwrap();
+            (
+                cfg.bigtiny_command.clone(),
+                cfg.bigtiny_args.clone(),
+                cfg.bigtiny_dir.clone(),
+                cfg.summarizer.clone(),
+                cfg.token_management.clone(),
+                cfg.memory.clone(),
+                cfg.local.clone(),
+                cfg.adaptive_pathway_enabled,
+                cfg.adaptive_pathway_embedding_model.clone(),
+            )
+        };
+        let handle = lifecycle::bigtiny_proc::spawn(
+            &command,
+            &args,
+            dir.as_deref(),
+            &summarizer,
+            &token_management,
+            &memory,
+            &local,
+            pathway_enabled,
+            &pathway_embedding_model,
+        )
+        .await?;
+        let (healthy, port) = (handle.healthy, handle.port);
+        {
+            let state = app.state::<AppState>();
+            *state.bigtiny.lock().unwrap() = handle;
+        }
+        if let Err(e) = crate::bigtiny::providers::sync_active_provider(&app).await {
+            tracing::warn!("bigtiny provider sync after restart failed: {e}");
+        }
+        // See `lifecycle::sync_mcp_once_healthy`: don't give up on the MCP sync
+        // after one failed call if the daemon is just slow to finish binding.
+        if let Some(port) = port {
+            lifecycle::sync_mcp_once_healthy(&app, healthy, port);
+        }
+        Ok(())
     }
-    // See `lifecycle::sync_mcp_once_healthy`: don't give up on the MCP sync
-    // after one failed call if the daemon is just slow to finish binding.
-    if let Some(port) = port {
-        lifecycle::sync_mcp_once_healthy(&app, healthy, port);
-    }
-    Ok(())
 }

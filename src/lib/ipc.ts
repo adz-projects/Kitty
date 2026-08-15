@@ -85,8 +85,7 @@ export const ipc = {
   getStackStatus: () => invoke<StackStatus>('get_stack_status'),
   getStartupPhase: () => invoke<StartupPhase>('get_startup_phase'),
   restartBackend: () => invoke<void>('restart_backend'),
-  newSession: (cwd?: string, mode?: string | null) =>
-    invoke<SessionInfo>('new_session', { cwd: cwd ?? null, mode: mode ?? null }),
+  newSession: (cwd?: string) => invoke<SessionInfo>('new_session', { cwd: cwd ?? null }),
   /** Tells Rust which window is now showing `sessionId` — lets a
       notification for that session later focus this specific window
       instead of a generic fallback. Best-effort; call after any successful
@@ -98,6 +97,11 @@ export const ipc = {
       set directory at once. */
   setSessionContextDir: (sessionId: string, cwd: string) =>
     invoke<void>('set_session_context_dir', { sessionId, cwd }),
+  /** "Return to thought partner" — repoint the session back to a fresh private
+      per-chat folder (the default, no-project state). Returns the refreshed
+      SessionInfo (with `is_default_folder: true`). */
+  resetSessionContextDir: (sessionId: string) =>
+    invoke<SessionInfo>('reset_session_context_dir', { sessionId }),
   /** Set a session's custom/default persona server-side (BigTiny's real
       `persona_override` mechanism — a proper `role: "system"` message),
       replacing the old client-side `<system>...</system>` text-prepend hack.
@@ -210,9 +214,6 @@ export const ipc = {
   /** Daemon-global pre-flight memory recall telemetry (Settings → Advanced). */
   getMemoryStats: () => invoke<MemoryStats>('get_memory_stats'),
   // Instant per-session mode toggle (Round-4)
-  getSessionMode: (sessionId: string) => invoke<string | null>('get_session_mode', { sessionId }),
-  setSessionMode: (sessionId: string, mode: string | null) =>
-    invoke<void>('set_session_mode', { sessionId, mode }),
   forkSession: (sessionId: string, cwd: string, truncateFrom: number | null) =>
     invoke<SessionInfo>('fork_session', { sessionId, cwd, truncateFrom }),
   compactSession: (sessionId: string) =>
@@ -224,6 +225,11 @@ export const ipc = {
     }>('compact_session', { sessionId }),
   setThinkingEffort: (sessionId: string, value: string) =>
     invoke<ThinkingEffort | null>('set_thinking_effort', { sessionId, value }),
+  /** Re-derive a session's effort control against the active provider — the
+      dropdown appears/disappears/re-scopes when the provider or model changes
+      mid-session, without a reload. `null` when the provider has no control. */
+  getThinkingEffort: (sessionId: string) =>
+    invoke<ThinkingEffort | null>('get_thinking_effort', { sessionId }),
   /** Best-effort: hot-rebind an already-open session onto the currently
       active provider's model after a provider switch (fixes a stale model id
       otherwise sent to the newly-active provider). Never throws — the
@@ -243,6 +249,9 @@ export const ipc = {
   inspectPaths: (paths: string[]) => invoke<PathInfo[]>('inspect_paths', { paths }),
   openPath: (path: string) => invoke<void>('open_path', { path }),
   revealPath: (path: string) => invoke<void>('reveal_path', { path }),
+  /** Save a copy of a file wherever the user picks. Resolves `false` if they
+      cancelled the dialog. */
+  downloadFile: (path: string) => invoke<boolean>('download_file', { path }),
   listDirectory: (path: string) => invoke<FileEntry[]>('list_directory', { path }),
   // Providers
   listProviders: () => invoke<ProviderView[]>('list_providers'),
@@ -271,6 +280,10 @@ export const ipc = {
     }),
   openrouterContextLength: (model: string) =>
     invoke<number | null>('openrouter_context_length', { model }),
+  /** Live `/api/show` lookup against a remote Ollama server. `null` when the
+      server doesn't report it — the field stays manually editable. */
+  ollamaContextLength: (baseUrl: string, model: string) =>
+    invoke<number | null>('ollama_context_length', { baseUrl, model }),
   openrouterCredits: (providerId: string) =>
     invoke<OpenRouterCredits>('openrouter_credits', { providerId }),
   // MCP servers — daemon-global, live over REST (BigTiny; no restart needed

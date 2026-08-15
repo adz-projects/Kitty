@@ -2,7 +2,11 @@
 
 ## What this project is
 
-A Windows-only Tauri v2 desktop app: a hotkey-summoned floating overlay chat client backed by **BigTiny** (a chat-first REST/SSE agent daemon, vendored in-tree at `plugins/bigtiny/`), with Ollama for local inference. It is a **client only** — all agent logic, tool execution, MCP handling, and model routing stays inside BigTiny. This app owns: window management (overlay / full window / settings / tray), the BigTiny+Ollama process lifecycle, configuration UI, drag-and-drop file context, session history UI, an artifacts sidepane, notifications, tool-approval UI, theming, and a first-run installer/wizard.
+A Tauri v2 app on **two targets — Windows and Android** — backed by **BigTiny** (a chat-first REST/SSE agent daemon, now a pure-Rust crate at `plugins/bigtiny_rust/`). On Windows it is a hotkey-summoned floating overlay chat client; on Android it is a single routed window with a bottom tab bar. It is a **client only** — all agent logic, tool execution, MCP handling, and model routing stays inside BigTiny. This app owns: window management (overlay / hub / tray), the BigTiny lifecycle, configuration UI, drag-and-drop file context, session history UI, an artifacts sidepane, notifications, tool-approval UI, theming, and a first-run wizard.
+
+**Local inference is llama.cpp linked into the daemon, not Ollama.** Kitty manages no inference process of any kind: Phase 2b deleted the entire managed-Ollama surface, and models are acquired from HuggingFace by `src-tauri/src/models/`. `provider_type: "ollama"` survives only as a *remote* endpoint dialect for a server the user runs themselves. Read Ollama references below as historical.
+
+**The two targets differ in hosting, not in code.** Desktop spawns `bigtiny-daemon.exe` as a child process and bundles the MCP servers as `externalBin` sidecars. Android links the same daemon in and hosts it in-process (`lifecycle/bigtiny_embedded.rs`) with `transport: "in_process"` MCP servers, because Android 10+ refuses to `exec()` a binary in app-writable storage. Both sit behind the same HTTP boundary, so nothing above `lifecycle/` knows the difference. `docs/ANDROID.md` is the plan of record for that work and `docs/RELEASE.md` has both packaging lanes.
 
 Read `goose-overlay-project-description.md` in the repo root for the original product description (predates the BigTiny backend swap — treat backend-specific details there as historical). When it conflicts with this file, this file wins on *how* things currently work.
 
@@ -10,7 +14,7 @@ Read `goose-overlay-project-description.md` in the repo root for the original pr
 
 ## Tech stack (do not deviate without asking)
 
-- **Shell**: Tauri v2, Windows-only target. Rust backend ("core"), web frontend.
+- **Shell**: Tauri v2, targeting Windows (`nsis`) and Android (`aarch64-linux-android`, AAB). Rust backend ("core"), web frontend.
 - **Frontend**: React 18 + TypeScript + Vite. Plain CSS with CSS custom properties for theming — **no Tailwind, no CSS-in-JS** (theming requirement is user-droppable plain CSS).
 - **State**: Zustand for UI state. No Redux.
 - **Rust crates**: `tauri`, `tauri-plugin-global-shortcut`, `tauri-plugin-notification`, `tauri-plugin-shell` (open browser), `tauri-plugin-dialog`, `tauri-plugin-single-instance`, `reqwest` (with `stream` feature), `tokio`, `serde`/`serde_json`, `keyring` (Windows Credential Manager), `windows` (Win32 APIs for the keyboard hook), `sysinfo` (process detection), `thiserror`.
@@ -187,12 +191,13 @@ inventory. Subsystems built beyond the original phased plan:
 
 ## Core architectural rules
 
-1. **One Rust process, multiple windows.** Windows are Tauri WebviewWindows with labels `overlay`, `main`, `settings`, `wizard`. Overlay is created hidden at startup and toggled (show/hide), never destroyed — summon latency is the product.
-2. **All I/O in Rust.** Frontend calls `invoke()` via `src/lib/ipc.ts` only. Streaming data (chat tokens, tool events, pull progress) is forwarded as Tauri events: `chat://message-delta`, `chat://tool-call`, `chat://tool-approval-needed`, `chat://complete`, `chat://error`, `ollama://pull-progress`, `stack://status`. Event payloads always include `session_id` (or `pull_id`) so multiple listeners can filter.
+1. **One Rust process, multiple windows.** Windows are Tauri WebviewWindows. `hub` is the routed window — chat, saved chats, settings and the wizard are views inside it (`routeStore`), not four separate labels — and multiple hubs can be open at once (`chat-N`). `overlay` and `screenshot-select` are desktop-only; the overlay is created hidden at startup and toggled (show/hide), never destroyed, because summon latency is the product. Android runs exactly one hub and nothing else.
+2. **All I/O in Rust.** Frontend calls `invoke()` via `src/lib/ipc.ts` only. Streaming data (chat tokens, tool events, download progress) is forwarded as Tauri events: `chat://message-delta`, `chat://tool-call`, `chat://tool-approval-needed`, `chat://complete`, `chat://error`, `models://progress`, `stack://status`. Event payloads always include `session_id` (or `download_id`) so multiple listeners can filter.
 3. **Session state lives in BigTiny.** The frontend keeps only render state. Resume = fetch session with conversation from BigTiny and re-render. Never persist chat history app-side.
-4. **Secrets never touch JS or plaintext disk.** API keys go in Windows Credential Manager via `keyring` (service = `kitty`, account = provider profile id). App config JSON stores profile metadata only (name, provider type, base URL, model list, `is_remote` flag) — never keys.
-5. **Overlay and main window share the chat implementation.** `components/chat/*` renders in both; the window entry decides chrome (compact vs. full with sidepanes). Both windows can be bound to the same active session; when both are open, they stay in sync because both consume the same Tauri events keyed by session id.
-6. **Errors are states, not toasts.** `stackStore` holds a machine-readable stack status (`ok | ollama_down | backend_down | no_model | provider_unreachable`). Chat UI renders a status panel with a "Fix this" button (opens settings deep-linked to the relevant section) whenever status != ok.
+4. **Secrets never touch JS or plaintext disk.** API keys go in Windows Credential Manager via `keyring` (service = `kitty`, account = provider profile id). App config JSON stores profile metadata only (name, provider type, base URL, model list, `is_remote` flag) — never keys. Android uses a different store for the same contract: `keyring` has no Android backend at all (it silently degrades to an in-memory mock, which is what made D24 a silent-data-loss bug), so secrets there are AES-256-GCM sealed under a non-exportable AndroidKeyStore key — `gen/android/.../SecretStore.kt` behind `src/android/secrets.rs`, dispatched from `config::providers::keyring`. `keyring` is excluded from the Android dependency graph so the mock cannot come back.
+5. **Overlay and hub share the chat implementation.** `components/chat/*` renders in both; the window entry decides chrome (compact vs. full with sidepanes). Both can be bound to the same active session and stay in sync, because both consume the same Tauri events keyed by session id. The same components render on Android — platform differences are `isAndroid()` gates and the mobile CSS breakpoint, never a forked component tree.
+6. **There is no chat/agent mode.** A per-session "thought partner" vs. "agentic" toggle (Phase 9 below) used to hide the tool chrome, pick a different system prompt, force approval mode, and fork the drop/paste handling. It's gone. What a session can do is now a property of its *provider*, not a switch the user sets: a provider that can't call tools simply never gets any in its request. Two behaviors the chat side did better are now unconditional — a long paste collapses into a chip, and a dropped file is inlined as content whenever the provider has no filesystem tools to open a path with (`chatStore`'s `providerHasTools`).
+7. **Errors are states, not toasts.** `stackStore` holds a machine-readable stack status (`starting | ok | backend_down | local_model_missing | provider_unreachable`). Chat UI renders a status panel with a "Fix this" button (opens settings deep-linked to the relevant section) whenever status != ok.
 
 ## Coding conventions
 
@@ -340,6 +345,13 @@ Scope:
 Acceptance: 30-minute soak with repeated summon/dismiss during active streams shows no leaks/orphans; a 500+ message session scrolls smoothly; secret audit passes.
 
 ## Phase 9 — Thought-partner (chat-only) mode
+
+**REMOVED.** The chat/agentic distinction this phase introduced was taken out
+again — see core rule 6. Everything below is the original plan, kept for the
+record; `tools_enabled` no longer exists on a provider profile either (it was
+dropped earlier, in favor of the per-session toggle that has now also gone).
+The parts that survive are per-message branching, regenerate, copy-as-markdown,
+the pasted-document chip, and the per-provider connectivity state.
 
 Adds support for a second kind of provider: a personal, tool-free LLM (e.g. a self-hosted model reached over Tailscale) used for critique, planning, and discussion rather than agentic work. Builds on the `network_tier` and `tools_enabled` fields added to the provider profile in Phase 5.
 

@@ -1,5 +1,7 @@
 import { useEffect } from 'react';
 import { useRouteStore } from '@/stores/routeStore';
+import { isAndroid } from '@/lib/platform';
+import { trackViewportHeight } from '@/lib/viewport';
 import { ChatWorkspace } from '@/components/hub/ChatWorkspace';
 import { MobileTabBar } from '@/components/hub/MobileTabBar';
 import { SessionList } from '@/components/sessions/SessionList';
@@ -26,6 +28,14 @@ export function App() {
   useEffect(() => {
     void init();
   }, [init]);
+
+  // Android only: the soft keyboard shrinks the *visual* viewport without
+  // resizing the layout, so the app has to follow it by hand. See
+  // `lib/viewport.ts`. Desktop windows resize properly and need nothing.
+  useEffect(() => {
+    if (!isAndroid()) return;
+    return trackViewportHeight();
+  }, []);
 
   return (
     <>

@@ -54,3 +54,18 @@ export function supportsImages(model: string | null | undefined): boolean {
   if (NON_VISION_OVERRIDES.some((re) => re.test(model))) return false;
   return VISION_PATTERNS.some((re) => re.test(model));
 }
+
+/** Detection OR the provider profile's manual `supports_vision` override.
+ *
+ * Use this, not `supportsImages`, anywhere a decision is made about what the
+ * *user* may attach. The patterns above cannot know a self-hosted or
+ * unconventionally-named vision model, and defaulting those to "no" (correct
+ * as a default) would otherwise leave no way to say so. The override only
+ * widens — it can enable image affordances for a model the patterns miss, and
+ * never disables them for one they recognize. */
+export function modelAcceptsImages(
+  model: string | null | undefined,
+  providerOverride: boolean
+): boolean {
+  return providerOverride || supportsImages(model);
+}

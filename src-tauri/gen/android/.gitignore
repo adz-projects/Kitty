@@ -1,0 +1,28 @@
+*.iml
+.gradle
+/local.properties
+/.idea/caches
+/.idea/libraries
+/.idea/modules.xml
+/.idea/workspace.xml
+/.idea/navEditor.xml
+/.idea/assetWizardSettings.xml
+.DS_Store
+build
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+key.properties
+keystore.properties
+
+/.tauri
+/tauri.settings.gradle
+
+# The Rust cdylib, staged here by `cargo ndk -o` / `tauri android build`.
+# Build output, ~190 MB per ABI, and regenerated on every build.
+app/src/main/jniLibs/
+
+# `resources` from `tauri.conf.json`, copied in by the build. The originals
+# live in `src-tauri/resources/`; this is a 26 MB duplicate of one of them.
+app/src/main/assets/resources/

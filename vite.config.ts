@@ -14,6 +14,11 @@ import { resolve } from 'node:path';
 // it needs a decorationless, transparent, always-on-top window sized to one
 // monitor, which a route inside a normal window cannot be.
 const WINDOWS = ['overlay', 'hub', 'screenshot-select'] as const;
+
+/** Set by `cargo tauri android dev` to the address it configured the device
+    to load from. Absent for desktop dev, which is what keeps the server on
+    loopback there. */
+const TAURI_DEV_HOST = process.env.TAURI_DEV_HOST;
 const entryHtml = (w: string) => `src/windows/${w}/index.html`;
 
 export default defineConfig({
@@ -23,8 +28,22 @@ export default defineConfig({
     alias: { '@': resolve(__dirname, 'src') },
   },
   server: {
+    // Mobile dev needs the server reachable from the *phone*, not just from
+    // this machine. `cargo tauri android dev` sets `TAURI_DEV_HOST` to the
+    // LAN address it told the device to use and then waits for something to
+    // answer there; bound to localhost (the default) it waits forever.
+    //
+    // Only set when that variable is present, so a plain `pnpm dev` on
+    // desktop keeps binding loopback and does not put the dev server on the
+    // local network as a side effect.
+    host: TAURI_DEV_HOST || false,
     port: 1420,
     strictPort: true,
+    // HMR needs an explicit host for the same reason — the websocket URL the
+    // client dials is otherwise `localhost`, which on the phone is the phone.
+    hmr: TAURI_DEV_HOST
+      ? { protocol: 'ws', host: TAURI_DEV_HOST, port: 1421 }
+      : undefined,
     // Vite's watcher excludes only node_modules/.git/outDir by default, so
     // everything else under the repo root is watched. `plugins/` holds ~76k
     // gitignored build artifacts (two Rust `target/` trees, four Python

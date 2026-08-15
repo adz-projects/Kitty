@@ -4,6 +4,8 @@
 //! lifecycle, config, tray, and the global hotkey. All I/O lives here; the
 //! webview only talks to us through the commands registered below.
 
+#[cfg(target_os = "android")]
+mod android;
 mod bigtiny;
 mod commands;
 mod config;
@@ -50,8 +52,18 @@ pub fn run() {
     // filter applies to both layers via `.with(env_filter)` on the registry.
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| "kitty_lib=info,warn".into());
+    // Android discards a process's stdout, so the `fmt` layer's default writer
+    // is a black hole there — including for the messages explaining why
+    // startup failed. Route it to logcat instead (`adb logcat -s Kitty:V`).
+    // See `android::logcat`.
+    #[cfg(target_os = "android")]
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .with_ansi(false)
+        .with_writer(android::logcat::MakeLogcatWriter);
+    #[cfg(not(target_os = "android"))]
+    let fmt_layer = tracing_subscriber::fmt::layer();
     let _ = tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer())
+        .with(fmt_layer)
         .with(log_capture::CaptureLayer)
         .with(env_filter)
         .try_init();
@@ -96,8 +108,40 @@ pub fn run() {
         builder = builder.plugin(tauri_plugin_global_shortcut::Builder::new().build());
     }
 
+    // `tauri-plugin-notification` is desktop-only, and not by preference —
+    // its Android side crashes the app. `NotificationPlugin.onIntent` reads a
+    // `lateinit manager` that only `load()` initialises, and `load()` only
+    // runs once something invokes the plugin from JS. Nothing here does
+    // (notifications are posted from Rust, and Android's own Settings owns
+    // the toggles), so `manager` stays uninitialised and **every**
+    // `onNewIntent` throws `UninitializedPropertyAccessException` and kills
+    // the process. With `launchMode="singleTask"` that means tapping the
+    // launcher icon while Kitty is running force-closes it. Reproduced on
+    // 2.3.3, which is the latest published version — there is no upgrade to
+    // take. Revisit when Phase 7 adds the foreground service, which posts its
+    // own notification from Kotlin and doesn't need this plugin.
+    #[cfg(not(target_os = "android"))]
+    {
+        builder = builder.plugin(tauri_plugin_notification::init());
+    }
+
+    // Android only, and used only from Rust (`commands::download_file`): the
+    // save dialog returns a `content://` URI, and this plugin is what resolves
+    // one to a writable file descriptor via the ContentResolver. Its JS
+    // commands are registered but unreachable — `capabilities/default.json`
+    // grants none of them, so the webview gains no filesystem access from
+    // this. Desktop writes the chosen path directly and needs nothing.
+    #[cfg(target_os = "android")]
+    {
+        builder = builder.plugin(tauri_plugin_fs::init());
+        // Must come before anything reads a secret — provider registration in
+        // `start_stack` does, and this is what backs `keyring::get_secret` on
+        // Android. Registered here rather than in `setup` so the plugin's own
+        // `setup` runs in the builder's ordering guarantee.
+        builder = builder.plugin(android::init());
+    }
+
     builder
-        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
@@ -147,6 +191,7 @@ pub fn run() {
             commands::fork_session,
             commands::compact_session,
             commands::set_thinking_effort,
+            commands::get_thinking_effort,
             commands::rebind_session_provider,
             commands::read_text_file,
             commands::read_file_any,
@@ -173,13 +218,13 @@ pub fn run() {
             commands::list_log_entries,
             commands::clear_log_entries,
             commands::get_memory_stats,
-            commands::get_session_mode,
-            commands::set_session_mode,
             commands::set_session_context_dir,
+            commands::reset_session_context_dir,
             commands::set_session_persona_override,
             commands::inspect_paths,
             commands::open_path,
             commands::reveal_path,
+            commands::download_file,
             commands::list_directory,
             commands::list_providers,
             commands::upsert_provider,
@@ -188,6 +233,7 @@ pub fn run() {
             commands::set_session_provider,
             commands::test_active_provider_connection,
             commands::openrouter_context_length,
+            commands::ollama_context_length,
             commands::openrouter_credits,
             commands::list_local_models,
             commands::get_local_engine_status,
@@ -232,6 +278,31 @@ pub fn run() {
         ])
         .setup(move |app| {
             let handle = app.handle();
+            // Android's app directories can only come from the Android
+            // `Context`, which means they are not knowable until here —
+            // `run()` above already tried to load config and failed with
+            // "could not resolve the app config directory". Install the real
+            // base and re-load, so the rest of startup sees the user's
+            // settings rather than defaults.
+            //
+            // Desktop resolves its paths with `dirs` before the app is even
+            // built, so none of this runs there.
+            #[cfg(target_os = "android")]
+            {
+                use tauri::Manager as _;
+                match handle.path().app_data_dir() {
+                    Ok(dir) => {
+                        config::init_app_dir(dir);
+                        let (reloaded, _) = config::load_with_recovery();
+                        *handle.state::<AppState>().config.lock().unwrap() = reloaded;
+                    }
+                    Err(e) => {
+                        // Nothing below can write: config, the daemon's DB,
+                        // and downloaded models all hang off this.
+                        tracing::error!("could not resolve the Android app data dir: {e}");
+                    }
+                }
+            }
             // Overlay + tray + global hotkey are the desktop summon path.
             // Android has no always-on-top-over-other-apps window, no tray,
             // and no OS-wide shortcut — it boots straight into the hub
@@ -252,6 +323,20 @@ pub fn run() {
             // First launch: show the setup wizard instead of the (hidden) overlay.
             if !wizard::setup_completed(handle) {
                 let _ = windows::open_wizard(handle, "setup");
+            } else if cfg!(target_os = "android") {
+                // ...and every launch after that, on Android, open the hub.
+                //
+                // Nothing else would. `create_overlay` is desktop-only, and
+                // the hub is otherwise only created by the wizard above or by
+                // the tray/hotkey/single-instance paths — all desktop. So a
+                // completed first run left Android with a live process, a
+                // healthy daemon, and **no window at all**: a black screen,
+                // with logs that look entirely fine because every subsystem
+                // really did start. §8.2's "Android boots straight into the
+                // hub" was a statement of intent that nothing implemented.
+                if let Err(e) = windows::open_main(handle) {
+                    tracing::error!("could not open the hub window: {e}");
+                }
             }
             // Start Ollama + BigTiny and the health loop in the background.
             // `lifecycle::start_stack` self-heals the bundled plugins'

@@ -33,6 +33,13 @@ pub fn host_of(base_url: &str) -> String {
     // Strip an optional userinfo@ and a :port (ignore IPv6 brackets for simplicity).
     let after_at = host_port.rsplit('@').next().unwrap_or(host_port);
     if after_at.starts_with('[') {
+        // Bracketed IPv6: the host ends at the closing `]` — anything after
+        // it is `:port` and must not ride along, or `http://[::1]:11434`
+        // yields `"[::1]:11434"`, which fails the loopback compare in
+        // `network_tier_for` and misclassifies a loopback daemon as Remote.
+        if let Some(end) = after_at.find(']') {
+            return after_at[..=end].to_string();
+        }
         return after_at.to_string();
     }
     after_at.split(':').next().unwrap_or(after_at).to_string()
@@ -73,6 +80,23 @@ mod tests {
         // Plain LAN is treated as remote, not personal.
         assert_eq!(
             network_tier_for("http://192.168.1.50:11434"),
+            NetworkTier::Remote
+        );
+    }
+
+    /// Regression (815bugs #10): a bracketed IPv6 host used to keep its
+    /// `:port`, so `http://[::1]:11434` — exactly how a local IPv6 Ollama /
+    /// llama-server URL is written — was misclassified Remote.
+    #[test]
+    fn bracketed_ipv6_host_drops_the_port() {
+        assert_eq!(host_of("http://[::1]:11434"), "[::1]");
+        assert_eq!(host_of("http://[2001:db8::10]:8080/v1"), "[2001:db8::10]");
+        assert_eq!(
+            network_tier_for("http://[::1]:11434"),
+            NetworkTier::Local
+        );
+        assert_eq!(
+            network_tier_for("http://[2001:db8::10]:8080"),
             NetworkTier::Remote
         );
     }

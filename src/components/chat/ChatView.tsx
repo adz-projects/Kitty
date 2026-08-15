@@ -1,27 +1,31 @@
 import { useEffect } from 'react';
 import { ipc, onFileDrop, pickFolder } from '@/lib/ipc';
-import { humanizeChatError, isChatMode, useChatStore } from '@/stores/chatStore';
+import { humanizeChatError, useChatStore } from '@/stores/chatStore';
 import { useStackStore } from '@/stores/stackStore';
 import { supportsReasoning } from '@/lib/reasoning_models';
 import { MessageList } from './MessageList';
 import { useProgressStage } from './useProgressStage';
 import { Composer } from './Composer';
 import { ApprovalPrompt } from './ApprovalPrompt';
-import { ModeToggle } from './ModeToggle';
-import { ProviderBadge } from './ProviderBadge';
-import { EffortDropdown } from './EffortDropdown';
-import { ChatHeaderMenu } from './ChatHeaderMenu';
+import { isAndroid } from '@/lib/platform';
+import { ChatHeaderControls } from './ChatHeaderControls';
 import { FileChips } from './FileChips';
 import { AttachmentChips } from './AttachmentChips';
 import { ClipboardImageChips } from './ClipboardImageChips';
 import { PendingAttachmentChips } from './PendingAttachmentChips';
 import { ErrorDetail } from '@/components/shared/ErrorDetail';
-import { ChatBubbleIcon } from '@/components/icons/ChatBubbleIcon';
 import { FolderIcon } from '@/components/icons/FolderIcon';
 
 /** The shared chat surface used by both the overlay and the full window
-    (CLAUDE.md rule 5). In chat mode (per-session `ModeToggle`, `isChatMode`) it
-    hides the agent chrome and switches to a reading-friendly column. */
+    (CLAUDE.md rule 5).
+    There used to be a per-session chat/agentic mode here that hid the agent
+    chrome and switched to a reading-friendly column. It's gone: the split cost
+    a toggle, a dead "thought partner" pill, two system prompts and a fork in
+    the drop/paste handling, all to express a distinction the daemon barely
+    honored (it only ever widened the sandbox to include `cwd`). The two things
+    the chat side did better — collapsing a long paste into a chip, and inlining
+    a dropped file's *content* rather than its path — are now simply how the
+    composer behaves. */
 export function ChatView() {
   // Individual slice selectors (not a whole-store `useChatStore()` call) so a
   // change to any one field — e.g. a streamed message delta — re-renders only
@@ -50,6 +54,8 @@ export function ChatView() {
   const respondApproval = useChatStore((s) => s.respondApproval);
   const addDroppedPaths = useChatStore((s) => s.addDroppedPaths);
   const setWorkingDir = useChatStore((s) => s.setWorkingDir);
+  const resetWorkingDir = useChatStore((s) => s.resetWorkingDir);
+  const isDefaultFolder = useChatStore((s) => s.isDefaultFolder);
   const bindEvents = useChatStore((s) => s.bindEvents);
   const refreshProvider = useChatStore((s) => s.refreshProvider);
   const model = useChatStore((s) => s.model);
@@ -59,7 +65,6 @@ export function ChatView() {
   const backgroundSession = useChatStore((s) => s.backgroundSession);
   const backgroundTurnToast = useChatStore((s) => s.backgroundTurnToast);
   const dismissBackgroundToast = useChatStore((s) => s.dismissBackgroundToast);
-  const chatOnly = useChatStore(isChatMode);
   const startupPhase = useStackStore((s) => s.startupPhase);
   const starting = startupPhase !== 'ready';
 
@@ -86,35 +91,54 @@ export function ChatView() {
   );
 
   return (
-    <div className={`chat${chatOnly ? ' reading' : ''}`}>
-      <div className="chat-header">
-        {chatOnly ? (
-          <span className="pill pill-static">
-            <ChatBubbleIcon /> thought partner
-          </span>
-        ) : (
-          <button
-            className="pill"
-            title={
-              cwd
-                ? `Working directory: ${cwd} — click to change`
-                : 'Click to set a working directory'
-            }
-            onClick={async () => {
-              const dir = await pickFolder();
-              if (dir) await setWorkingDir(dir);
-            }}
-          >
-            <FolderIcon /> {folder ?? 'set folder'}
-          </button>
-        )}
-        <div className="chat-header-controls">
-          <ModeToggle />
-          <ProviderBadge />
-          <EffortDropdown />
-          <ChatHeaderMenu chatOnly={chatOnly} />
+    <div className="chat">
+      {/* Android has no chat header at all: the folder pill points at a
+          filesystem the user cannot browse, and the controls are hoisted into
+          the window header by `ChatWorkspace` rather than costing a second
+          header row on a phone-height screen. */}
+      {!isAndroid() && (
+        <div className="chat-header">
+          {isDefaultFolder ? (
+            // No project folder chosen — the "thought partner" state. No folder
+            // icon; clicking the pill opens the picker to attach a working dir.
+            <button
+              className="pill"
+              title="Thinking space — click to set a working directory"
+              onClick={async () => {
+                const dir = await pickFolder();
+                if (dir) await setWorkingDir(dir);
+              }}
+            >
+              thought partner
+            </button>
+          ) : (
+            // A working folder is set: show it, plus an inline reset control
+            // that returns the session to the default "thought partner" state
+            // without opening the picker.
+            <span className="pill pill-folder">
+              <button
+                className="pill-body"
+                title={`Working directory: ${cwd} — click to change`}
+                onClick={async () => {
+                  const dir = await pickFolder();
+                  if (dir) await setWorkingDir(dir);
+                }}
+              >
+                <FolderIcon /> {folder ?? 'set folder'}
+              </button>
+              <button
+                className="pill-reset"
+                title="Return to thought partner (clear the working folder)"
+                aria-label="Return to thought partner"
+                onClick={() => void resetWorkingDir()}
+              >
+                ×
+              </button>
+            </span>
+          )}
+          <ChatHeaderControls />
         </div>
-      </div>
+      )}
 
       {providerOffline && (
         <div className="conflict-banner" role="status">
@@ -219,14 +243,9 @@ export function ChatView() {
         />
       )}
 
-      {(!chatOnly || pendingApprovals.length > 0) &&
-        pendingApprovals.map((a) => (
-          <ApprovalPrompt
-            key={a.tool_call_id}
-            request={a}
-            onRespond={(tid, opt) => void respondApproval(tid, opt)}
-          />
-        ))}
+      {pendingApprovals.map((a) => (
+        <ApprovalPrompt key={a.tool_call_id} request={a} onRespond={respondApproval} />
+      ))}
       {error && (
         <div className="chat-error">
           <ErrorDetail
@@ -238,7 +257,8 @@ export function ChatView() {
           />
         </div>
       )}
-      {chatOnly ? <AttachmentChips /> : <FileChips />}
+      <AttachmentChips />
+      <FileChips />
       <ClipboardImageChips />
       <PendingAttachmentChips />
       {starting && (

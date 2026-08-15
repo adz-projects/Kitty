@@ -247,6 +247,23 @@ impl MCPServerClient {
                 .collect::<Result<Vec<_>, MCPServerError>>()?,
             ClientHandle::Sse(sse) => sse.list_tools(&self.server_id).await?,
         };
+        // Compile-check every advertised schema at connect: the call path
+        // (`mcp::tools::validate_tool_args`) goes through `jsonschema`, which
+        // *panics* on a schema it can't compile — unwinding the whole turn
+        // task. Fail the connect instead, the same treatment the
+        // un-serializable case above already gets, so an uncompilable schema
+        // can never reach a tool call.
+        for t in &self.tools {
+            if t.input_schema.is_null() {
+                continue;
+            }
+            jsonschema::validator_for(&t.input_schema).map_err(|e| {
+                MCPServerError::Generic(format!(
+                    "tool {:?} input_schema is not a valid JSON Schema: {e}",
+                    t.name
+                ))
+            })?;
+        }
         Ok(())
     }
 
@@ -484,5 +501,76 @@ mod in_process_tests {
             .await;
 
         assert!(result.is_error);
+    }
+
+    /// A server advertising a schema `jsonschema` can't compile (`"type":
+    /// 123`). Regression: the schema used to be checked only for
+    /// *serializability* at connect, then `jsonschema::validate` panicked on
+    /// it at call time, unwinding the turn task. The connect must fail
+    /// instead, like the un-serializable case.
+    async fn fake_server_bad_schema(stream: tokio::io::DuplexStream) {
+        let (read_half, mut write_half) = tokio::io::split(stream);
+        let mut lines = BufReader::new(read_half).lines();
+
+        while let Ok(Some(line)) = lines.next_line().await {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let msg: Value = match serde_json::from_str(&line) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let method = msg.get("method").and_then(|v| v.as_str()).unwrap_or("");
+            let id = msg.get("id").cloned();
+
+            let response = match method {
+                "initialize" => id.map(|id| {
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "protocolVersion": "2024-11-05",
+                            "capabilities": {},
+                            "serverInfo": {"name": "fake-bad-schema-server", "version": "0.1.0"}
+                        }
+                    })
+                }),
+                "notifications/initialized" => None,
+                "tools/list" => id.map(|id| {
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "tools": [{
+                                "name": "broken_tool",
+                                "description": "Advertises an uncompilable schema",
+                                "inputSchema": {"type": 123}
+                            }]
+                        }
+                    })
+                }),
+                _ => None,
+            };
+
+            if let Some(response) = response {
+                let mut out = serde_json::to_vec(&response).unwrap();
+                out.push(b'\n');
+                if write_half.write_all(&out).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_fails_on_an_uncompilable_advertised_schema() {
+        let result =
+            MCPServerClient::connect_in_process("bad-schema".to_string(), fake_server_bad_schema)
+                .await;
+        let err = result.err().expect("connect must fail on an uncompilable schema");
+        assert!(
+            err.to_string().contains("not a valid JSON Schema"),
+            "error should name the schema problem, got: {err}"
+        );
     }
 }

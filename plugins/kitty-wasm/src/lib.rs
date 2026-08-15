@@ -19,11 +19,13 @@
 //! - [`sandbox`] — the wasmtime engine, capability policy, and module cache
 //! - [`capture`] — memory-bounded stdout/stderr (the `SmartStdoutBuffer` port)
 //! - [`guest`] — resolving/verifying/installing the pinned CPython guest
+//! - [`paths`] — home-directory containment for the `workspace` mount
 //! - [`python`] — the Python harness and its response envelope
 //! - [`server`] — the MCP tool surface
 
 pub mod capture;
 pub mod guest;
+pub mod paths;
 pub mod python;
 pub mod sandbox;
 pub mod server;

@@ -326,22 +326,37 @@ fn any_open_chat_window(app: &AppHandle) -> Option<String> {
 /// correct replay rather than a half-populated snapshot.
 #[cfg_attr(not(desktop), allow(dead_code))]
 pub async fn focus_or_open_session(app: &AppHandle, session_id: &str) {
-    let cwd = crate::bigtiny::sessions::list(app)
+    let cwd = match crate::bigtiny::sessions::list(app)
         .await
         .ok()
-        .and_then(|rows| {
-            rows.into_iter()
-                .find(|r| r.get("sessionId").and_then(|v| v.as_str()) == Some(session_id))
-        })
-        .and_then(|r| r.get("cwd").and_then(|v| v.as_str()).map(str::to_string))
-        .unwrap_or_default();
+        .and_then(|rows| find_cwd(rows, session_id))
+    {
+        Some(cwd) => cwd,
+        None => {
+            // `sessions::list` is capped at the 200 most recent sessions —
+            // an older chat silently falls off that window and used to
+            // resolve to `cwd: ""`. Ask once more with a much larger window
+            // before settling for the default.
+            crate::bigtiny::sessions::list_with_limit(app, 10_000)
+                .await
+                .ok()
+                .and_then(|rows| find_cwd(rows, session_id))
+                .unwrap_or_default()
+        }
+    };
 
+    // Derive the effort control for the active provider so the re-adopted
+    // session shows (or hides) the dropdown correctly, rather than the old
+    // hardcoded null that always hid it.
+    let thinking_effort = crate::bigtiny::effort::thinking_effort_for(app, session_id);
+    let is_default_folder = crate::commands::is_default_folder(app, &cwd);
     let payload = json!({
         "session_id": session_id,
         "cwd": cwd,
-        "current_mode": "auto",
+        "current_mode": "approve",
         "available_modes": [],
-        "thinking_effort": serde_json::Value::Null,
+        "thinking_effort": thinking_effort,
+        "is_default_folder": is_default_folder,
     });
 
     if let Some(label) = any_open_chat_window(app) {
@@ -350,6 +365,16 @@ pub async fn focus_or_open_session(app: &AppHandle, session_id: &str) {
     } else {
         let _ = open_new_chat_window(app, Some(payload));
     }
+}
+
+/// Pull the stored `cwd` for `session_id` out of a session-list payload.
+/// Pure so the find-vs-miss decision (which `focus_or_open_session` retries
+/// once with a larger listing window) stays unit-testable.
+#[cfg_attr(not(desktop), allow(dead_code))]
+fn find_cwd(rows: Vec<serde_json::Value>, session_id: &str) -> Option<String> {
+    rows.into_iter()
+        .find(|r| r.get("sessionId").and_then(|v| v.as_str()) == Some(session_id))
+        .and_then(|r| r.get("cwd").and_then(|v| v.as_str()).map(str::to_string))
 }
 
 /// Show + focus an already-open window by label, animating the overlay in
@@ -585,7 +610,16 @@ pub fn open_new_chat_window(
         }
         label
     };
-    build_chat_window(app, &label)?;
+    if let Err(e) = build_chat_window(app, &label) {
+        // A failed build must not leak the label (and its handoff slot) into
+        // the bookkeeping maps — `any_open_chat_window`/`focus_or_open_chat_window`
+        // would otherwise route to a window that doesn't exist for the rest
+        // of the process's life.
+        let state = app.state::<AppState>();
+        state.chat_windows.lock().unwrap().remove(&label);
+        state.pending_handoffs.lock().unwrap().remove(&label);
+        return Err(e);
+    }
     Ok(())
 }
 
@@ -659,4 +693,32 @@ pub fn open_settings(
 /// Open the first-run / repair flow in the given mode (`"setup"`/`"repair"`).
 pub fn open_wizard(app: &AppHandle, mode: &str) -> tauri::Result<()> {
     route_to(app, json!({ "view": "wizard", "mode": mode }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::find_cwd;
+    use serde_json::json;
+
+    #[test]
+    fn find_cwd_matches_the_session_and_reads_its_cwd() {
+        let rows = vec![
+            json!({"sessionId": "a", "cwd": "C:/x"}),
+            json!({"sessionId": "b", "cwd": "C:/y"}),
+        ];
+        assert_eq!(find_cwd(rows, "b"), Some("C:/y".to_string()));
+    }
+
+    #[test]
+    fn find_cwd_returns_none_when_the_session_is_outside_the_window() {
+        // The miss case `focus_or_open_session` retries with a larger limit.
+        let rows = vec![json!({"sessionId": "a", "cwd": "C:/x"})];
+        assert_eq!(find_cwd(rows, "older-session"), None);
+    }
+
+    #[test]
+    fn find_cwd_returns_none_when_the_row_has_no_cwd() {
+        let rows = vec![json!({"sessionId": "a"})];
+        assert_eq!(find_cwd(rows, "a"), None);
+    }
 }

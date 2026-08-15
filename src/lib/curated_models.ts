@@ -32,10 +32,17 @@ export const CURATED_MODELS: CuratedModel[] = [
   },
   {
     repo: 'Qwen/Qwen3-Embedding-0.6B-GGUF',
-    file: 'Qwen3-Embedding-0.6B-q4_k_m.gguf',
+    // Q8_0, not q4_k_m. **Qwen never published a q4 for this model** — the
+    // official repo has exactly two GGUFs, `Q8_0` and `f16`, so the q4_k_m
+    // filename this used to name 404'd and the embedding download could
+    // never have succeeded. Q8_0 over f16 because f16 is ~1.2 GB for no
+    // recall benefit; going *below* Q8 on an embedder is the trade that
+    // actually costs retrieval quality, which is the only reason this model
+    // is here.
+    file: 'Qwen3-Embedding-0.6B-Q8_0.gguf',
     label: 'Qwen3 Embedding · 0.6B',
     blurb: 'Gives the memory engine real semantic recall instead of keyword matching.',
-    size_gb: 0.38,
+    size_gb: 0.64,
     role: 'embedding',
   },
 ];

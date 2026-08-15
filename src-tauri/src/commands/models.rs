@@ -134,6 +134,10 @@ async fn run_download(app: AppHandle, mut spec: DownloadSpec, id: String) {
     let id: Arc<str> = Arc::from(id.as_str());
     let model: Arc<str> = Arc::from(spec.file.as_str());
     let emit = |received: u64, total: Option<u64>, done: bool, error: Option<String>| {
+        // Android only: the same numbers also drive the foreground-service
+        // notification, which is what keeps the process (and its network)
+        // alive once the user switches away. Free on desktop.
+        foreground::progress(&model, received, total);
         let _ = app.emit(
             "models://progress",
             DownloadProgress {
@@ -159,6 +163,11 @@ async fn run_download(app: AppHandle, mut spec: DownloadSpec, id: String) {
         return fail(download::DownloadError::AlreadyInstalled(spec.file.clone()).to_string());
     }
 
+    // Held for the rest of this function; its `Drop` stops the service, so
+    // every exit path below — including the early `return fail(..)`s — tears
+    // it down without needing to remember to.
+    let _foreground = foreground::Session::start(&model);
+
     let client = crate::util::http_client();
     let (size, sha) = download::head_metadata(&client, &spec).await;
     spec.expected_size = size;
@@ -168,27 +177,160 @@ async fn run_download(app: AppHandle, mut spec: DownloadSpec, id: String) {
         return fail(e.to_string());
     }
 
-    // One retry, and only for a checksum mismatch: `verify_and_finalize` has
+    // Two different retries, for two different failures.
+    //
+    // A **checksum mismatch** gets exactly one: `verify_and_finalize` has
     // deleted the `.part` by then, so the retry is a clean full download
-    // rather than a resume of the same corrupt bytes. Transport errors are
-    // not retried here — the `.part` survives, so the user re-invoking picks
-    // up where it stopped.
-    for attempt in 0..2 {
+    // rather than a resume of the same corrupt bytes. Twice in a row means
+    // something is wrong that trying again will not fix.
+    //
+    // A **transport error** goes to `RetryBudget`, and this is the
+    // Wi-Fi-to-cellular handoff story (docs/ANDROID.md Phase 7). The socket
+    // dies on handoff no matter what we observe, so rather than watch for
+    // network changes with a `ConnectivityManager.NetworkCallback`, we just
+    // resume: the `.part` survives, `resume_offset` reads its length, and the
+    // next attempt sends `Range: bytes=<len>-`. One mechanism covers the
+    // handoff, a tunnel, and a flaky AP. The budget is spent on *stalls*
+    // rather than failures, so a download that keeps advancing between drops
+    // runs as long as it needs to — see `RetryBudget`, which is where that
+    // rule is tested.
+    let mut checksum_retried = false;
+    let mut budget = download::RetryBudget::new(download::resume_offset(&dir, &spec.file, &spec));
+
+    loop {
         match attempt_download(&client, &dir, &spec, &emit).await {
             Ok(path) => {
                 tracing::info!(path = %path.display(), "model downloaded");
-                emit(spec.expected_size.unwrap_or(0), spec.expected_size, true, None);
+                emit(
+                    spec.expected_size.unwrap_or(0),
+                    spec.expected_size,
+                    true,
+                    None,
+                );
                 let _ = app.emit("models://changed", ());
                 refresh_embedding_status(&app);
                 return;
             }
-            Err(download::DownloadError::ChecksumMismatch { expected, actual }) if attempt == 0 => {
+            Err(download::DownloadError::ChecksumMismatch { expected, actual })
+                if !checksum_retried =>
+            {
+                checksum_retried = true;
                 tracing::warn!(
                     model = %spec.file,
                     "checksum mismatch (expected {expected}, got {actual}); retrying once"
                 );
             }
+            Err(download::DownloadError::Transport(msg)) => {
+                let offset = download::resume_offset(&dir, &spec.file, &spec);
+                match budget.record_failure(offset) {
+                    download::RetryDecision::GiveUp => {
+                        return fail(format!(
+                            "download kept failing without making progress: {msg}"
+                        ));
+                    }
+                    download::RetryDecision::RetryAfter(backoff) => {
+                        tracing::warn!(
+                            model = %spec.file,
+                            "transport error at byte {offset} ({msg}); resuming in {}s",
+                            backoff.as_secs()
+                        );
+                        tokio::time::sleep(backoff).await;
+                    }
+                }
+            }
             Err(e) => return fail(e.to_string()),
+        }
+    }
+}
+
+/// The Android download foreground service, and nothing at all on desktop.
+///
+/// Wrapped rather than called directly so `run_download` reads the same on
+/// both platforms — the `cfg` lives here, once, instead of at four call sites.
+mod foreground {
+    #[cfg(target_os = "android")]
+    use std::sync::atomic::Ordering;
+
+    /// Whether a session is currently open. Guards `progress` so a stray
+    /// progress event (an early failure that reports before the session
+    /// starts) can't start a service nothing will ever stop.
+    #[cfg(target_os = "android")]
+    static ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// Starts the service on construction, stops it on drop — so every exit
+    /// path out of `run_download`, including the early failures, tears it
+    /// down without anyone having to remember to.
+    pub struct Session;
+
+    impl Session {
+        #[allow(unused_variables)]
+        pub fn start(model: &str) -> Self {
+            #[cfg(target_os = "android")]
+            {
+                // Asked for here, at the first download, rather than at
+                // startup: a notification prompt before the user has done
+                // anything needing one is the kind everybody dismisses.
+                crate::android::download_service::request_notification_permission();
+                crate::android::download_service::start_or_update(
+                    &format!("Downloading {model}"),
+                    0,
+                    0,
+                );
+                ACTIVE.store(true, Ordering::SeqCst);
+            }
+            Session
+        }
+    }
+
+    impl Drop for Session {
+        fn drop(&mut self) {
+            #[cfg(target_os = "android")]
+            {
+                ACTIVE.store(false, Ordering::SeqCst);
+                crate::android::download_service::stop();
+            }
+        }
+    }
+
+    /// Milliseconds between notification updates.
+    ///
+    /// `run_download`'s own event throttle is one megabyte, which on a 2 GB
+    /// model is ~2000 updates — far more than a notification can usefully
+    /// show, and each one is a cross-language round-trip plus an intent. Two
+    /// seconds is faster than anyone reads a progress bar and cheap enough to
+    /// ignore.
+    #[cfg(target_os = "android")]
+    const NOTICE_INTERVAL_MS: u64 = 2000;
+    #[cfg(target_os = "android")]
+    static LAST_NOTICE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    #[allow(unused_variables)]
+    pub fn progress(model: &str, received: u64, total: Option<u64>) {
+        #[cfg(target_os = "android")]
+        {
+            if !ACTIVE.load(Ordering::SeqCst) {
+                return;
+            }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let last = LAST_NOTICE_MS.load(Ordering::Relaxed);
+            if now.saturating_sub(last) < NOTICE_INTERVAL_MS {
+                return;
+            }
+            LAST_NOTICE_MS.store(now, Ordering::Relaxed);
+
+            // Off the async worker: `run_mobile_plugin` is a synchronous
+            // round-trip into the JVM, and this is called from inside the
+            // download's own future. Fire-and-forget is fine here — the
+            // notification is a display, and at one update every two seconds
+            // a reordered pair would be invisible even if it happened.
+            let title = format!("Downloading {model}");
+            let total = total.unwrap_or(0);
+            tauri::async_runtime::spawn_blocking(move || {
+                crate::android::download_service::start_or_update(&title, received, total);
+            });
         }
     }
 }
@@ -199,10 +341,11 @@ async fn attempt_download(
     spec: &DownloadSpec,
     emit: &(impl Fn(u64, Option<u64>, bool, Option<String>) + Sync),
 ) -> Result<PathBuf, download::DownloadError> {
-    let resume_from = download::resume_offset(dir, &spec.file, spec);
+    let mut resume_from = download::resume_offset(dir, &spec.file, spec);
     download::write_meta(dir, &spec.file, spec)?;
 
-    let mut req = client.get(spec.url());
+    let url = spec.url();
+    let mut req = client.get(&url);
     if resume_from > 0 {
         req = req.header("Range", format!("bytes={resume_from}-"));
     }
@@ -210,12 +353,25 @@ async fn attempt_download(
         .send()
         .await
         .map_err(|e| download::DownloadError::Transport(e.to_string()))?;
-    if !resp.status().is_success() {
-        return Err(download::DownloadError::Transport(format!(
-            "{} returned {}",
-            spec.url(),
-            resp.status()
-        )));
+    match download::plan_resume(&url, resp.status(), resume_from)? {
+        download::ResumePlan::Append => {}
+        download::ResumePlan::DiscardFragment => {
+            // The server ignored our `Range` header and is about to send the
+            // full body — appending it after the existing fragment would
+            // corrupt the file. Start over from byte 0 instead.
+            tracing::warn!(
+                model = %spec.file,
+                "server answered a ranged request with {}; discarding the {resume_from}-byte fragment and restarting from scratch",
+                resp.status()
+            );
+            let part = download::part_path(dir, &spec.file);
+            match std::fs::remove_file(&part) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+            resume_from = 0;
+        }
     }
 
     let total = spec

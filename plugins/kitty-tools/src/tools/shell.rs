@@ -15,7 +15,10 @@
 //! - The child is spawned with `kill_on_drop(true)`, so when the
 //!   `tokio::time::timeout` fires and the child future is dropped, tokio
 //!   kills the process instead of leaking it (Python's `subprocess.run` with
-//!   `timeout=` kills on expiry).
+//!   `timeout=` kills on expiry). On timeout the whole process **tree** is
+//!   additionally killed (`taskkill /T /F` on Windows) — `kill_on_drop`
+//!   alone reaps only the direct `cmd.exe`, orphaning any grandchildren it
+//!   spawned (audit #117).
 //! - stdout/stderr are streamed through a bounded capture
 //!   (`SHELL_MAX_CAPTURE_BYTES`) rather than fully buffered by
 //!   `wait_with_output`, so a command spewing hundreds of MB can't blow RAM
@@ -134,9 +137,10 @@ async fn shell_impl(command: &str, dry_run: bool, timeout: Duration) -> (String,
     std_cmd.stderr(Stdio::piped());
     std_cmd.stdin(Stdio::null());
 
-    // `kill_on_drop(true)` is the timeout guard: dropping the child future
-    // (as `tokio::time::timeout` does on expiry) kills the process, so no
-    // orphaned shell is left running.
+    // `kill_on_drop(true)` is the last-resort guard: any early return or
+    // dropped future kills the process, so no orphaned shell is left
+    // running. The timeout path kills the process *tree* explicitly (see
+    // the `Err` arm below) before this backstop is needed.
     let mut child = match tokio::process::Command::from(std_cmd).kill_on_drop(true).spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -149,19 +153,21 @@ async fn shell_impl(command: &str, dry_run: bool, timeout: Duration) -> (String,
 
     // Read both pipes to (bounded) EOF *concurrently* — draining them
     // sequentially can deadlock when one pipe fills while the child blocks
-    // writing to the other.
+    // writing to the other. The child itself is deliberately NOT part of
+    // this future: on timeout it must still be owned below so the tree kill
+    // lands on a live root (see the `Err` arm).
     let capture = async {
-        let (out, err) = tokio::join!(
+        tokio::join!(
             read_bounded(stdout, SHELL_MAX_CAPTURE_BYTES),
             read_bounded(stderr, SHELL_MAX_CAPTURE_BYTES),
-        );
-        let status = child.wait().await;
-        (status, out, err)
+        )
     };
 
     match tokio::time::timeout(timeout, capture).await {
-        Ok((wait_result, (out_bytes, out_truncated), (err_bytes, err_truncated))) => {
-            let status = match wait_result {
+        Ok(((out_bytes, out_truncated), (err_bytes, err_truncated))) => {
+            // Both pipes hit EOF, so the child has exited (no grandchild
+            // holds a write end); `wait` just collects the status.
+            let status = match child.wait().await {
                 Ok(s) => s,
                 Err(e) => {
                     return (
@@ -177,16 +183,56 @@ async fn shell_impl(command: &str, dry_run: bool, timeout: Duration) -> (String,
             };
             (finish(output, out_truncated || err_truncated), pid)
         }
-        Err(_) => (
-            error_response(
-                "SHELL_TIMEOUT",
-                "Command timed out after 30s",
-                None,
-                Some("Try a faster approach, increase timeout, or break work into smaller commands."),
-            ),
-            pid,
-        ),
+        Err(_) => {
+            // `kill_on_drop` reaps only the direct `cmd.exe`; take down the
+            // whole tree so grandchildren don't outlive the timeout (audit
+            // #117). This runs *before* the child is dropped, while the root
+            // is still alive for `taskkill /T` to walk from.
+            if let Some(pid) = pid {
+                kill_process_tree(pid).await;
+            }
+            // Reap (bounded, so a failed kill can never hang the tool);
+            // `kill_on_drop` remains the backstop beyond that.
+            let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+            (
+                error_response(
+                    "SHELL_TIMEOUT",
+                    "Command timed out after 30s",
+                    None,
+                    Some("Try a faster approach, increase timeout, or break work into smaller commands."),
+                ),
+                pid,
+            )
+        }
     }
+}
+
+/// Kills the process tree rooted at `pid`, best-effort. On Windows this is
+/// `taskkill /T /F` (`/T` walks the child tree, `/F` forces); errors are
+/// ignored because the pid may already be gone — `kill_on_drop` races us
+/// here, and `taskkill /T` on a dead root kills nothing, which is the one
+/// grandchild-orphan case this does not cover (a Job Object would; noted
+/// for the record, not worth the extra `windows-sys` dependency today).
+#[cfg(windows)]
+async fn kill_process_tree(pid: u32) {
+    let mut cmd = std::process::Command::new("taskkill");
+    cmd.args(["/PID", &pid.to_string(), "/T", "/F"]);
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::null());
+    cmd.stdin(Stdio::null());
+    let _ = tokio::process::Command::from(cmd).status().await;
+}
+
+/// Non-Windows fallback: the child is `/bin/sh -c`, which typically `exec`s
+/// simple commands — so `kill_on_drop` already reaps the real process, and
+/// there is no detached grandchild tree in the common case. A true tree
+/// kill would need the child in its own process group (`setsid` at spawn)
+/// followed by a group `kill`; not set up today, so this is documented
+/// rather than half-done.
+#[cfg(not(windows))]
+async fn kill_process_tree(pid: u32) {
+    let _ = pid;
 }
 
 fn finish(output: std::process::Output, capture_truncated: bool) -> String {
@@ -282,6 +328,41 @@ mod tests {
         // Give the kill a moment to land, then assert the process is gone.
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(!pid_alive(pid), "child process {pid} still alive after timeout");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn timeout_kills_the_whole_process_tree() {
+        // Audit #117: `kill_on_drop` reaps only the direct `cmd.exe`; a
+        // grandchild it spawned (here `ping`, which `cmd /c` waits on) used
+        // to be orphaned and keep running past the timeout. The timeout path
+        // now `taskkill /T /F`s the whole tree.
+        let before = ping_pids();
+        let (response, pid) = shell_impl("ping -n 99999 127.0.0.1 > nul", false, Duration::from_millis(300)).await;
+        let v: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(v["error_code"], "SHELL_TIMEOUT", "{v}");
+        assert!(pid.is_some());
+
+        // Give the tree kill a moment to land, then assert no *new* ping
+        // survived (pre-existing ones, if any, are not ours to judge).
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let leaked: Vec<u32> = ping_pids().into_iter().filter(|p| !before.contains(p)).collect();
+        assert!(leaked.is_empty(), "grandchild ping process(es) leaked past the timeout: {leaked:?}");
+    }
+
+    #[cfg(windows)]
+    fn ping_pids() -> Vec<u32> {
+        let out = std::process::Command::new("tasklist")
+            .args(["/FI", "IMAGENAME eq ping.exe", "/FO", "CSV", "/NH"])
+            .output();
+        match out {
+            Ok(o) => String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .filter_map(|l| l.split(',').nth(1))
+                .filter_map(|f| f.trim_matches('"').parse::<u32>().ok())
+                .collect(),
+            Err(_) => Vec::new(),
+        }
     }
 
     #[tokio::test]

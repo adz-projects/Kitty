@@ -11,6 +11,7 @@ pub mod schedules;
 
 use std::sync::Arc;
 
+use axum::extract::DefaultBodyLimit;
 use axum::routing::{delete, get, patch, post};
 use axum::Router;
 
@@ -20,6 +21,13 @@ use crate::mcp::MCPManager;
 use crate::provider::router::ProviderRouter;
 use crate::recipes::engine::RecipeEngine;
 use crate::scheduler::Scheduler;
+
+/// Request-body ceiling for every route. axum's default is 2 MiB, which a
+/// chat send carrying base64 screenshots blows straight past
+/// (`Json<SendMessageRequest>` → 413): a full-res PNG is 5–15 MB and
+/// base64 inflates by ~4/3, and a send can carry several. 64 MiB leaves
+/// generous headroom without making the limit meaningless.
+const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 
 /// Shared state handed to every route handler.
 pub struct AppState {
@@ -113,5 +121,9 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             patch(schedules::update_schedule).delete(schedules::delete_schedule),
         )
         .route("/api/schedules/{id}/run_now", post(schedules::run_now))
+        // Applied here rather than in `lib.rs::run()`'s middleware stack so
+        // every consumer of `create_router` (including the route smoke
+        // tests) gets the same ceiling.
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
 }

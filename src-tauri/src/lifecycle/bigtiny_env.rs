@@ -1,0 +1,286 @@
+//! Kitty's half of the `BIGTINY_*` environment contract.
+//!
+//! Kitty never writes a `--config` YAML for the daemon, so this is the *only*
+//! channel these settings reach it by. The daemon's half is
+//! `bigtiny_rust::env_contract::apply_env_overrides`; the two must stay in
+//! lockstep, and a variable set here that isn't read there (or vice versa) is
+//! silently ignored rather than reported.
+//!
+//! **Built as pairs rather than applied to a `Command`, because there are two
+//! hosts.** Desktop spawns the daemon and passes these as child-process env
+//! (`bigtiny_proc::spawn`). Android links the daemon in and has no child to
+//! configure, so it sets the same pairs on its *own* process before calling
+//! `bigtiny_rust::run` (`bigtiny_embedded::start`). Returning data keeps one
+//! definition serving both; two copies of a ~40-variable list would drift on
+//! the first change and fail as a silently-unapplied setting.
+
+/// Every `BIGTINY_*` variable the daemon should see, in a stable order.
+///
+/// `secret` and `encryption_key` are separate parameters rather than config
+/// fields because they have different lifetimes and sources: the secret is
+/// regenerated every launch, while the encryption key is stable across
+/// restarts (rotating it would make previously-encrypted rows in BigTiny's
+/// own DB undecryptable).
+#[allow(clippy::too_many_arguments)]
+pub fn daemon_env(
+    secret: &str,
+    encryption_key: &str,
+    summarizer: &crate::config::SummarizerSettings,
+    token_management: &crate::config::TokenManagementSettings,
+    memory: &crate::config::MemorySettings,
+    local: &crate::config::LocalModelSettings,
+    pathway_enabled: bool,
+    pathway_embedding_model: &str,
+) -> Vec<(String, String)> {
+    let b = |v: bool| if v { "true" } else { "false" }.to_string();
+    let mut env: Vec<(String, String)> = vec![
+        ("BIGTINY_SECRET".into(), secret.to_string()),
+        ("BIGTINY_ENCRYPTION_KEY".into(), encryption_key.to_string()),
+        (
+            "BIGTINY_SUMMARIZER__ENABLED".into(),
+            b(summarizer.enabled),
+        ),
+        (
+            "BIGTINY_TOKEN_MANAGEMENT__MAX_CONTEXT_TOKENS".into(),
+            token_management.max_context_tokens.to_string(),
+        ),
+        (
+            "BIGTINY_TOKEN_MANAGEMENT__MAX_LIVE_TAIL_TOKENS".into(),
+            token_management.max_live_tail_tokens.to_string(),
+        ),
+        (
+            "BIGTINY_TOKEN_MANAGEMENT__MESSAGE_MASK_HEAD_LINES".into(),
+            token_management.message_mask_head_lines.to_string(),
+        ),
+        (
+            "BIGTINY_TOKEN_MANAGEMENT__MESSAGE_MASK_TAIL_LINES".into(),
+            token_management.message_mask_tail_lines.to_string(),
+        ),
+        // `PathwayConfig::enabled` defaults to `false` inside BigTiny and
+        // (unlike every other section) has no other override path, so without
+        // this the behavioral-memory engine can never turn on at all.
+        ("BIGTINY_PATHWAY__ENABLED".into(), b(pathway_enabled)),
+    ];
+
+    // Model paths are resolved here rather than in the daemon, so the daemon
+    // never needs to know where Kitty keeps models. An unresolvable name
+    // yields an empty value, which the daemon reads as "that slot is
+    // unconfigured" — chat falls back to the active provider, embeddings to
+    // lexical hashing. Both are degradations, neither is an error.
+    // Android: never load a local chat/summarizer GGUF. Chat is always remote
+    // there (D18), so the chat slot's only use was the summarizer — and running
+    // a 1–2B model on the phone CPU during compaction cooked the SoC and
+    // starved the WebView (ADDENDUM 3). Leaving this empty makes
+    // `SummarizerChain` fall back to the session's remote provider for
+    // summarization; the embedder below may still load locally (on GPU where
+    // Vulkan is available). Desktop is unchanged — it can run chat locally, so
+    // its summarizer model resolves as before.
+    #[cfg(target_os = "android")]
+    let chat_gguf = String::new();
+    #[cfg(not(target_os = "android"))]
+    let chat_gguf = crate::models::resolve(&summarizer.model)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let embed_gguf = crate::models::resolve(pathway_embedding_model)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let local_enabled = !chat_gguf.is_empty() || !embed_gguf.is_empty();
+    if !local_enabled {
+        tracing::info!(
+            summarizer_model = %summarizer.model,
+            embedding_model = %pathway_embedding_model,
+            "no local GGUF found for either slot; the local engine stays off"
+        );
+    }
+
+    env.extend([
+        ("BIGTINY_LOCAL__ENABLED".to_string(), b(local_enabled)),
+        ("BIGTINY_LOCAL__MODEL_PATH".to_string(), chat_gguf),
+        ("BIGTINY_LOCAL__EMBED_MODEL_PATH".to_string(), embed_gguf),
+        // The knobs are always sent, not just when a model is present, so a
+        // model added later (the daemon can self-heal `LocalModelMissing`
+        // without a restart in between) starts with the user's chosen
+        // settings rather than the daemon's hardcoded defaults.
+        ("BIGTINY_LOCAL__N_CTX".to_string(), local.n_ctx.to_string()),
+        (
+            "BIGTINY_LOCAL__EMBED_N_CTX".to_string(),
+            local.embed_n_ctx.to_string(),
+        ),
+        (
+            "BIGTINY_LOCAL__N_BATCH".to_string(),
+            local.n_batch.to_string(),
+        ),
+        (
+            "BIGTINY_LOCAL__N_THREADS".to_string(),
+            local.n_threads.to_string(),
+        ),
+        (
+            "BIGTINY_LOCAL__N_GPU_LAYERS".to_string(),
+            local.n_gpu_layers.to_string(),
+        ),
+        ("BIGTINY_LOCAL__BACKEND".to_string(), local.backend.clone()),
+        (
+            "BIGTINY_LOCAL__EMBED_POOLING".to_string(),
+            local.embed_pooling.clone(),
+        ),
+        (
+            "BIGTINY_LOCAL__CACHE_TYPE_K".to_string(),
+            local.cache_type_k.clone(),
+        ),
+        (
+            "BIGTINY_LOCAL__CACHE_TYPE_V".to_string(),
+            local.cache_type_v.clone(),
+        ),
+    ]);
+
+    // Set only when configured. Leaving the variable absent (rather than
+    // `""`) is what keeps `None` the daemon's genuinely-unset default.
+    if let Some(threshold) = memory.bm25_threshold {
+        env.push((
+            "BIGTINY_MEMORY__BM25_THRESHOLD".to_string(),
+            threshold.to_string(),
+        ));
+    }
+    // Consolidates BigTiny's db / cache-sandbox-root / recipes under Kitty's
+    // own data dir instead of its standalone `~/.bigtiny` default.
+    // Best-effort: if this can't be resolved the daemon just uses that
+    // default rather than failing to start.
+    if let Ok(data_dir) = crate::config::bigtiny_data_dir() {
+        env.push((
+            "BIGTINY_DATA_DIR".to_string(),
+            data_dir.to_string_lossy().into_owned(),
+        ));
+    }
+
+    env
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A model name nothing will ever resolve. `daemon_env` calls
+    /// `models::resolve`, which reads the *real* models directory — so a test
+    /// using the default summarizer model passes or fails depending on
+    /// whether the developer happens to have that GGUF downloaded. Naming a
+    /// model that cannot exist is what makes these deterministic.
+    const NO_SUCH_MODEL: &str = "test-model-that-is-never-installed";
+
+    fn settings() -> (
+        crate::config::SummarizerSettings,
+        crate::config::TokenManagementSettings,
+        crate::config::MemorySettings,
+        crate::config::LocalModelSettings,
+    ) {
+        (
+            crate::config::SummarizerSettings {
+                model: NO_SUCH_MODEL.to_string(),
+                ..Default::default()
+            },
+            crate::config::TokenManagementSettings::default(),
+            crate::config::MemorySettings::default(),
+            crate::config::LocalModelSettings::default(),
+        )
+    }
+
+    fn env_of(pairs: &[(String, String)], key: &str) -> Option<String> {
+        pairs
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.clone())
+    }
+
+    /// The secret and the encryption key are the two values that must reach
+    /// the daemon or nothing works: no auth, and no decryptable provider
+    /// keys.
+    #[test]
+    fn the_credentials_are_always_present() {
+        let (s, t, m, l) = settings();
+        let e = daemon_env("sec", "enc", &s, &t, &m, &l, false, "");
+        assert_eq!(env_of(&e, "BIGTINY_SECRET").as_deref(), Some("sec"));
+        assert_eq!(env_of(&e, "BIGTINY_ENCRYPTION_KEY").as_deref(), Some("enc"));
+    }
+
+    /// Booleans go over as `true`/`false`, which is one of the two forms
+    /// `apply_env_overrides` accepts. Rust's `Display` for `bool` happens to
+    /// agree, but relying on that coincidence is how `1`/`0` sneaks in later.
+    #[test]
+    fn booleans_use_the_word_form_the_daemon_parses() {
+        let (s, t, m, l) = settings();
+        let on = daemon_env("", "", &s, &t, &m, &l, true, "");
+        let off = daemon_env("", "", &s, &t, &m, &l, false, "");
+        assert_eq!(env_of(&on, "BIGTINY_PATHWAY__ENABLED").as_deref(), Some("true"));
+        assert_eq!(
+            env_of(&off, "BIGTINY_PATHWAY__ENABLED").as_deref(),
+            Some("false")
+        );
+    }
+
+    /// An unresolvable model name must produce an empty value, not a missing
+    /// variable and not a bogus path — the daemon reads empty as "slot
+    /// unconfigured" and degrades, which is the intended behaviour.
+    #[test]
+    fn an_unresolvable_model_leaves_the_slot_empty_and_the_engine_off() {
+        let (s, t, m, l) = settings();
+        let e = daemon_env("", "", &s, &t, &m, &l, false, NO_SUCH_MODEL);
+        assert_eq!(
+            env_of(&e, "BIGTINY_LOCAL__EMBED_MODEL_PATH").as_deref(),
+            Some("")
+        );
+        assert_eq!(
+            env_of(&e, "BIGTINY_LOCAL__ENABLED").as_deref(),
+            Some("false")
+        );
+    }
+
+    /// The engine knobs ship even with no model resident, so a model
+    /// downloaded later starts on the user's settings rather than the
+    /// daemon's defaults.
+    #[test]
+    fn the_engine_knobs_are_sent_even_with_no_model() {
+        let (s, t, m, l) = settings();
+        let e = daemon_env("", "", &s, &t, &m, &l, false, NO_SUCH_MODEL);
+        assert_eq!(env_of(&e, "BIGTINY_LOCAL__ENABLED").as_deref(), Some("false"));
+        for key in [
+            "BIGTINY_LOCAL__N_CTX",
+            "BIGTINY_LOCAL__N_BATCH",
+            "BIGTINY_LOCAL__BACKEND",
+            "BIGTINY_LOCAL__CACHE_TYPE_K",
+            "BIGTINY_LOCAL__CACHE_TYPE_V",
+        ] {
+            assert!(env_of(&e, key).is_some(), "{key} should always be sent");
+        }
+    }
+
+    /// An unset bm25 threshold must be *absent*, not empty: the daemon parses
+    /// this one, and `""` would fail the parse and leave the default in place
+    /// by accident rather than by design.
+    #[test]
+    fn an_unset_bm25_threshold_is_omitted_rather_than_blank() {
+        let (s, t, mut m, l) = settings();
+        m.bm25_threshold = None;
+        let e = daemon_env("", "", &s, &t, &m, &l, false, "");
+        assert!(env_of(&e, "BIGTINY_MEMORY__BM25_THRESHOLD").is_none());
+
+        m.bm25_threshold = Some(1.5);
+        let e = daemon_env("", "", &s, &t, &m, &l, false, "");
+        assert_eq!(
+            env_of(&e, "BIGTINY_MEMORY__BM25_THRESHOLD").as_deref(),
+            Some("1.5")
+        );
+    }
+
+    /// No duplicate keys. `Command::envs` would silently take the last, and
+    /// `set_var` likewise — a duplicate would make the effective value depend
+    /// on ordering nobody is looking at.
+    #[test]
+    fn no_key_is_emitted_twice() {
+        let (s, t, m, l) = settings();
+        let e = daemon_env("", "", &s, &t, &m, &l, true, "");
+        let mut keys: Vec<&str> = e.iter().map(|(k, _)| k.as_str()).collect();
+        let before = keys.len();
+        keys.sort_unstable();
+        keys.dedup();
+        assert_eq!(before, keys.len(), "duplicate key in the daemon env");
+    }
+}

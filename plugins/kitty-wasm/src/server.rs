@@ -122,22 +122,48 @@ fn clamp_timeout(requested: Option<u64>) -> Duration {
     )
 }
 
+/// Validates the optional `workspace` argument before it is mounted
+/// read-write into the guest at `/work` (audit #111): it must be an existing
+/// directory **inside the user's home directory** — previously any host
+/// directory (`C:\`, `C:\Windows\System32`, …) could be mounted RW for
+/// model-written guest code to read and modify. `Err` is the tool's JSON
+/// error string, ready to return.
+fn validate_workspace(workspace: Option<&String>) -> Result<Option<std::path::PathBuf>, String> {
+    let Some(ws) = workspace else {
+        return Ok(None);
+    };
+    let dir = std::path::PathBuf::from(ws);
+    if !dir.is_dir() {
+        return Err(error_json(
+            "WorkspaceNotFound",
+            &format!("workspace is not an existing directory: {}", dir.display()),
+        ));
+    }
+    if !crate::paths::path_within_home(&dir) {
+        return Err(error_json(
+            "WorkspaceOutsideHome",
+            &format!(
+                "workspace must be inside your home directory: {}",
+                dir.display()
+            ),
+        ));
+    }
+    Ok(Some(dir))
+}
+
 /// Shared by both Python tool names.
 async fn execute_python(req: ExecutePythonRequest) -> String {
+    // Cheap input validation before the (potentially downloading) guest
+    // resolution: a bad workspace must not trigger a ~26 MB install.
+    let workspace = match validate_workspace(req.workspace.as_ref()) {
+        Ok(w) => w,
+        Err(e) => return e,
+    };
+
     let guest_path = match guest::ensure_python_guest(req.install.unwrap_or(false)).await {
         Ok(p) => p,
         Err(e) => return error_json("GuestUnavailable", &format!("{e:#}")),
     };
-
-    let workspace = req.workspace.map(std::path::PathBuf::from);
-    if let Some(dir) = &workspace {
-        if !dir.is_dir() {
-            return error_json(
-                "WorkspaceNotFound",
-                &format!("workspace is not an existing directory: {}", dir.display()),
-            );
-        }
-    }
 
     let variables = req.variables.unwrap_or_default();
     let timeout = clamp_timeout(req.timeout_s);
@@ -212,14 +238,11 @@ impl KittyWasmServer {
             };
 
             let mut mounts = Vec::new();
-            if let Some(workspace) = &req.workspace {
-                let dir = std::path::PathBuf::from(workspace);
-                if !dir.is_dir() {
-                    return error_json(
-                        "WorkspaceNotFound",
-                        &format!("workspace is not an existing directory: {workspace}"),
-                    );
-                }
+            let workspace = match validate_workspace(req.workspace.as_ref()) {
+                Ok(w) => w,
+                Err(e) => return e,
+            };
+            if let Some(dir) = workspace {
                 mounts.push(Mount::writable(dir, "/work"));
             }
 
@@ -362,6 +385,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_module_rejects_a_workspace_outside_home() {
+        // Audit #111: any existing host dir used to be mounted read-write
+        // into the guest; workspaces are now contained to the user's home.
+        let dir = tempfile::tempdir().unwrap();
+        let wat = dir.path().join("m.wat");
+        std::fs::write(&wat, "(module (func (export \"_start\")))").unwrap();
+
+        #[cfg(windows)]
+        let outside = "C:\\Windows\\System32".to_string();
+        #[cfg(not(windows))]
+        let outside = "/etc".to_string();
+
+        let server = KittyWasmServer::new();
+        let out = server
+            .wasm_run_module(Parameters(RunModuleRequest {
+                module_path: wat.to_string_lossy().into_owned(),
+                args: None,
+                workspace: Some(outside),
+                timeout_s: None,
+                fuel: None,
+            }))
+            .await;
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["error"]["error_type"], "WorkspaceOutsideHome");
+    }
+
+    #[tokio::test]
+    async fn execute_python_rejects_a_workspace_outside_home() {
+        // Same containment on the Python path — and it must fire *before*
+        // guest resolution (no ~26 MB install for a rejected call).
+        #[cfg(windows)]
+        let outside = "C:\\Windows\\System32".to_string();
+        #[cfg(not(windows))]
+        let outside = "/etc".to_string();
+
+        let out = execute_python(ExecutePythonRequest {
+            code: "result = 1".into(),
+            variables: None,
+            timeout_s: None,
+            workspace: Some(outside),
+            install: Some(false),
+        })
+        .await;
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["error"]["error_type"], "WorkspaceOutsideHome");
+    }
+
+    #[tokio::test]
     async fn run_module_executes_a_real_module_end_to_end() {
         let dir = tempfile::tempdir().unwrap();
         let wat = dir.path().join("m.wat");
@@ -381,16 +452,22 @@ mod tests {
         )
         .unwrap();
 
+        // The workspace must be inside home (audit #111's containment); a
+        // bare tempdir is not on every platform (e.g. /tmp on Linux).
+        let work = crate::paths::home_dir().join(format!("kitty-wasm-test-{}", std::process::id()));
+        std::fs::create_dir_all(&work).unwrap();
+
         let server = KittyWasmServer::new();
         let out = server
             .wasm_run_module(Parameters(RunModuleRequest {
                 module_path: wat.to_string_lossy().into_owned(),
                 args: None,
-                workspace: Some(dir.path().to_string_lossy().into_owned()),
+                workspace: Some(work.to_string_lossy().into_owned()),
                 timeout_s: Some(10),
                 fuel: None,
             }))
             .await;
+        let _ = std::fs::remove_dir_all(&work);
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["status"], "success", "{v}");
         assert_eq!(v["outcome"], "exited");

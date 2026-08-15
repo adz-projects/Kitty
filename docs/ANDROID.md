@@ -88,7 +88,7 @@ D1–D21 are unchanged and un-renumbered — existing references (including in
 | D1 | **In-process llama.cpp, day 1, both OSes.** `bigtiny_rust` links **`llama-cpp-2` (`utilityai/llama-cpp-rs`), pinned at 0.1.154** — chosen in Phase 1 and validated end-to-end. The `llama_cpp` crate this doc used to name as a placeholder is **abandoned** (last release 2024-04-29). The `LocalEngine` boundary (§3.1) keeps the binding swappable. Chat, compaction, and desktop embeddings all go through the daemon; Kitty manages no inference process of its own (see §10 Phase 2 for what "no Ollama" does and doesn't mean). | §2, §4, §11 |
 | D2 | **Model is pinned per chat.** Locked in at chat creation; changes only on **new chats**. No mid-stream swap, ever. | §4.1 |
 | D3 | **Scheduled tasks default to the summarizer model**; per-task override in Settings. | §7 |
-| D4 | **REVISED 2026-08-09 — semantic embeddings on BOTH platforms, one shared model.** `Qwen3-Embedding-0.6B` (q4_k_m GGUF, 376 MB, 1024-dim) runs through the same in-process engine on Windows *and* Android. AP calls the new `POST /api/embeddings`; `AP_EMBED_OLLAMA_URL` re-points to the daemon port. The hash-space vectorizer (`HASH_EMBED_MODEL`) is demoted to a **fallback** — used before the model is downloaded, or if it fails to load — not the Android norm. *Supersedes the original "desktop only / Android is hash-space" decision; §11's recall-quality-gap risk is retired with it.* | §3.1, §9 |
+| D4 | **REVISED 2026-08-09 — semantic embeddings on BOTH platforms, one shared model.** `Qwen3-Embedding-0.6B` (official `Q8_0` GGUF, 609 MB, 1024-dim) runs through the same in-process engine on Windows *and* Android. AP calls the new `POST /api/embeddings`; `AP_EMBED_OLLAMA_URL` re-points to the daemon port. The hash-space vectorizer (`HASH_EMBED_MODEL`) is demoted to a **fallback** — used before the model is downloaded, or if it fails to load — not the Android norm. *Supersedes the original "desktop only / Android is hash-space" decision; §11's recall-quality-gap risk is retired with it.* | §3.1, §9 |
 | D5 | **In-app model downloads** from **HuggingFace** and the **Ollama registry** (manifest → blob → reassembled GGUF). Range+resume+sha256. | §5 |
 | D6 | **Exposed llama.cpp engine knobs** + **Quick Presets** (Precise/Balanced/Creative). | §6 |
 | D7 | **No proactive disk quota.** Only a low-free-space warning; manual delete. **Hard refusal when `free_space < model_size × 1.5`**. | §5 |
@@ -108,7 +108,7 @@ D1–D21 are unchanged and un-renumbered — existing references (including in
 | D21 | **Windows multi-window is preserved**: two (or more) hub windows may be open at once, each with its **own independent session and its own pinned model**. Android stays single-window. | §8.1, §4.2 |
 | D22 | **`aarch64-linux-android` is the only shipped v1 ABI** (no armeabi-v7a, no x86_64 — emulator testing is a dev convenience, not a release target). **minSdk 26, targetSdk 34.** **NDK pinned: `27.2.12479018` (r27c)**, SDK `platforms/android-34` + `build-tools/34.0.0`, JDK 17, installed and verified 2026-08-08. | §10 P1; `ANDROID-PLAN.md` P1a |
 | D23 | **Desktop-only `src-tauri` subsystems are `cfg`-gated, not ported.** Tray, global-shortcut hotkey, autostart, and `notify-rust` get `#[cfg(desktop)]`/`#[cfg(windows)]`. **`winreg` is in the plain `[dependencies]` block today and will break the very first Android build** — it must move under `[target.'cfg(windows)'.dependencies]`. No autostart equivalent ships on Android v1. | §2.5; `ANDROID-PLAN.md` P1a |
-| D24 | **Android secrets use the `keyring` crate's Android/Keystore backend**, not a hand-rolled store — its own Cargo feature **plus JNI `JavaVM`/`Context` init wiring** at startup. Its own spike inside Phase 7, not an assumed-trivial feature flip. **This is a silent-data-loss risk, not a build error:** with only `windows-native` enabled, keyring 3.x hits its catch-all `pub use mock as default` on Android and compiles fine — provider API keys appear to save, then vanish on relaunch. Nothing fails loudly. Phase 7 must not ship without it. | §10 P7 |
+| D24 | ~~**Android secrets use the `keyring` crate's Android/Keystore backend**, not a hand-rolled store — its own Cargo feature plus JNI init wiring.~~ **Revised and closed 2026-08-11: there is no such backend.** keyring 3.6.3's feature list is `apple-native` / `linux-native` / `windows-native` and nothing else, so the premise of this decision was simply wrong — there was no feature to enable. The diagnosis was right, though, and worth keeping: with only `windows-native`, keyring hits its catch-all `pub use mock as default` on Android and compiles fine, so provider API keys appeared to save and vanished on relaunch with nothing failing loudly. **Actual fix:** `gen/android/.../SecretStore.kt` (AES-256-GCM under a non-exportable AndroidKeyStore key, sealed blobs in private SharedPreferences) behind `src/android/secrets.rs`, dispatched from `config::providers::keyring`. `keyring` is now confined to the non-Android target table so the mock cannot return. | §10 P7 |
 | D25 | **Android hardens the daemon's HTTP surface: `require_secret: true`, always.** Loopback is **not** process-private on Android — any app holding `INTERNET` can reach `127.0.0.1`. Also relax escalation-to-approval where the app sandbox *is* the security boundary. Both already flagged in code comments; neither had a decision until now. | §2.6, §10 P7 |
 
 ---
@@ -131,7 +131,7 @@ than new *code* — see §2.3.
 
 ### 2.2 Local model policy per platform (D18, as amended by D4's revision)
 - **Android**: **two** resident local models — the summarizer (`LFM2.5-1.2B`,
-  730 MB) and the embedder (`Qwen3-Embedding-0.6B` q4_k_m, 376 MB). Chat never
+  730 MB) and the embedder (`Qwen3-Embedding-0.6B` `Q8_0`, 609 MB). Chat never
   loads a local model, so there are still no per-chat swaps. Both GGUFs are
   **downloaded on first use** (not bundled in the APK). Until each exists, its
   consumer degrades rather than fails: the summarizer falls back to the session
@@ -235,7 +235,7 @@ throughout.
 | Global-shortcut hotkey | `hotkey.rs`; `lib.rs` setup **and `commands/config.rs`** | Dep moved to the `cfg(not(any(android, ios)))` table; `#[cfg(desktop)] mod hotkey`; the plugin registration lifted out of the builder method chain into a `#[cfg(desktop)]` block (an inline `#[cfg]` mid-chain isn't valid). **`set_config` is a second `hotkey::register` call site** and must stay available on Android, so only its re-registration block is gated. |
 | `notify-rust` | `notifications.rs` | **Already** in `[target.'cfg(windows)'.dependencies]` — the earlier claim that it sat in plain `[dependencies]` was wrong; only the call site needed work. `notify_if_hidden` keeps its signature and shared preamble, then delegates to a `#[cfg(windows)]` `notify-rust` arm (click-to-focus, `ToastJob` worker) or a **new** `#[cfg(not(windows))]` arm over `tauri-plugin-notification` — which was registered but had never been called from Rust. |
 | Overlay window | `windows.rs::create_overlay` / `show_overlay`; `lib.rs` setup | `#[cfg(desktop)]` on the functions themselves, **not just the call site**: `decorations`/`always_on_top`/`skip_taskbar` are absent from the mobile `WebviewWindowBuilder`, so the body genuinely does not compile. `show_overlay` gets a `#[cfg(not(desktop))]` no-op arm so `complete_setup` needn't branch. |
-| `keyring` (`windows-native` only) | `config/providers/` | **Left alone — it compiles** (see D24's mock fallback). Phase 7. |
+| `keyring` (`windows-native` only) | `config/providers/` | ~~Left alone — it compiles.~~ **Done in Phase 7:** moved to the `cfg(not(android))` target table and replaced on Android by the Keystore-backed store (D24). Leaving it compiling was the whole problem — see D24. |
 | `externalBin` sidecars | `tauri.conf.json` → new **`tauri.android.conf.json`** | Tauri resolves sidecars by target triple, so the build demanded `binaries/kitty-*-aarch64-linux-android` and failed *in the build script*, before any Rust. A platform config override clears `externalBin`/`resources` for Android. Expected to be revisited in Phase 8; this is the minimum that unblocks compiling. |
 
 Also swept up: `#[cfg_attr(not(desktop), allow(dead_code))]` on the chat-window
@@ -677,12 +677,25 @@ All under `Settings → Local models`, shared component on both OS.
 
 ### 9.2 Embedder (D4 revised — both platforms)
 
-- **`Qwen3-Embedding-0.6B`, q4_k_m GGUF — validated.** 394,704,832 bytes
-  (376 MiB), **1024-dim**, `n_ctx_train` 32,768, 28 layers. One model on
-  Windows and Android, so beliefs embedded on one platform stay comparable on
-  the other.
-  - `sha256 = c608745221a03d45ee7328aab5ae180ef5db54c9a47eda43ef05f73156ba824b`
-    — pin this in the Phase 3 downloader.
+- **`Qwen3-Embedding-0.6B` — shipped as official `Q8_0`.**
+  `Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf`,
+  **639,150,592 bytes** (609 MiB). **1024-dim**, `n_ctx_train` 32,768, 28
+  layers. One model on Windows and Android, so beliefs embedded on one
+  platform stay comparable on the other.
+  - **The q4_k_m this used to name was never shippable, and the bug was the
+    *pairing*.** Phase 1 validated a 376 MiB q4_k_m from the community repo
+    `Mungert/Qwen3-Embedding-0.6B-GGUF`, but `curated_models.ts` pinned that
+    *filename* against the **official Qwen** repo — which publishes only
+    `Q8_0` and `f16`. Every embedding download 404'd, and nothing noticed
+    because the failure degrades silently to hash-space recall (D4) rather
+    than erroring. Verified against the live HF API, not inferred.
+  - Resolved toward the official repo rather than the community one: this is
+    a bundled default, so provenance shouldn't rest on a single uploader, and
+    +233 MB is a fair price. Going below Q8 on an *embedder* is also the trade
+    that costs retrieval quality, which is the only reason the model is here.
+  - `config::UNAVAILABLE_EMBEDDING_GGUF` migrates installs already carrying
+    the dead q4 id — the field is persisted, so changing the default alone
+    would strand them on a file that cannot be downloaded.
   - Measured separation on a related/unrelated pair: **cos 0.73 vs 0.29**. The
     probe (`examples/local_embed_spike.rs`) asserts that ordering, not just the
     vector shape — a backend returning well-formed constant vectors would pass
@@ -694,14 +707,10 @@ All under `Settings → Local models`, shared component on both OS.
   gte, nomic) would need `Mean`/`Cls` instead, so this is a property of the
   model pin, not a constant in the engine — `embeddings.rs` must carry it
   alongside the model id. (It fails loudly, which is the good case.)
-- **Source caveat, worth knowing:** Qwen's *official* GGUF repo
-  (`Qwen/Qwen3-Embedding-0.6B-GGUF`) publishes **only `Q8_0` (609 MB)** — no
-  smaller quant. The 376 MB q4_k_m comes from the community repo
-  `Mungert/Qwen3-Embedding-0.6B-GGUF`. Since this is a bundled default rather
-  than a user-chosen model, **pin its sha256** in the Phase 3 downloader (D5
-  already verifies sha256) so provenance is a fixed artifact rather than
-  standing trust in an uploader. If that repo ever disappears, official `Q8_0`
-  is the drop-in fallback at +233 MB.
+- **Source, settled:** Qwen's official GGUF repo publishes exactly two files,
+  `Q8_0` and `f16` — no smaller quant, and the community q4_k_m this section
+  used to recommend is what produced the 404 above. `Q8_0` is now the pin.
+  `f16` is ~1.2 GB for no recall benefit.
 - The base `Qwen/Qwen3-Embedding-0.6B` repo is safetensors only, and
   `mlx-community/...-4bit-DWQ` is **MLX format — Apple-Silicon only, not
   loadable by llama.cpp**. Neither is usable here.
@@ -992,24 +1001,42 @@ commit `abe9ac9`):
 - `tauri.android.conf.json` already zeroed `externalBin`/`resources` back in
   Phase 1a — the sidecar problem §2.3 describes was solved before this phase.
 
+**Landed 2026-08-11** — the two release blockers, both via one Tauri Android
+plugin (`KittyPlugin`, in the app Gradle module rather than a separate library:
+it is one app's glue, and `find_class` resolves it through the activity's
+classloader either way). Rust side: `src-tauri/src/android/`.
+
+- **`SecretStore` (D24).** Not keyring's Android backend — **there isn't one**;
+  see the revised D24. `SecretStore.kt` seals values with AES-256-GCM under a
+  non-exportable AndroidKeyStore key and stores the blobs in private
+  SharedPreferences (`commit`, not `apply` — a secret still in the prefs cache
+  when the process dies is the bug being fixed). `config::providers::keyring`
+  dispatches per platform, and the absent-vs-unreadable distinction that
+  `classify_read_result` protects is preserved across the boundary: Kotlin
+  resolves `{found: false}` for absent and *rejects* for unreadable.
+  `keyring` is out of the Android dependency graph entirely, so the mock
+  cannot silently return.
+- **Download-while-backgrounded.** `DownloadService` — `dataSync` foreground
+  service, `START_STICKY`, low-importance progress notification, POST_
+  NOTIFICATIONS requested at the first download rather than at startup, and a
+  6-hour-capped partial wake lock (capped so a missed `stop` expires instead of
+  draining the battery until reboot). A RAII `foreground::Session` in
+  `commands::models` starts it and stops it on drop, so every early-return
+  failure path tears it down.
+  **No `ConnectivityManager.NetworkCallback`**, contrary to the original plan:
+  the socket dies on a Wi-Fi↔cellular handoff whatever we observe, and the
+  downloader already resumes from the `.part` offset with a `Range` header — so
+  a bounded, *progress-aware* retry loop (budget resets whenever bytes
+  advanced) covers the handoff, a tunnel, and a flaky AP with one mechanism
+  instead of three.
+
 **Not started:** everything below.
 
-- `KittyForegroundService` (`dataSync`, `START_STICKY`, POST_NOTIFICATIONS grant
-  [wizard §8.3]), `SecretStore` (Keystore backend for provider keys/HF token),
-  GGUF first-use path, no local chat picker, backward-compat.
-- **`SecretStore` = `keyring`'s Android backend (D24), not a bespoke store** —
-  its own Cargo feature **plus** JNI `JavaVM`/`Context` init wiring from Tauri's
-  Android runtime before any `keyring::Entry` call. Budget this as a spike: the
-  existing `migrate_secrets`/`get_or_create_bigtiny_encryption_key` helpers
-  assume a single backend shape and will need the init to have already run.
+- GGUF first-use path, no local chat picker, backward-compat.
 - **Daemon hardening (D25, §2.6):** `require_secret: true` with a generated
   secret; relaxed escalation-to-approval for the sandboxed data root.
 - **Tool surface:** apply §2.4's `lean_analyze_workspace` scoping;
   `lean_shell` is already excluded, leave it that way.
-- **Download-while-backgrounded (doze + network):** service exposes a dataSync
-  FGS + visible notification, a `ConnectivityManager.NetworkCallback` for
-  Wi-Fi↔Cellular handoff, and byte-offset resume (§5.2) — a multi-GB GGUF pull
-  survives Deep Doze and network changes without corruption.
 - **In-process AP (D8):** the daemon's `PathwayEngine` runs end-to-end on Android
   — recall woven into turn processing, assumption surfacing, consolidation — all
   with hash-space embeddings; no `externalBin`, no separate process, no
@@ -1022,18 +1049,45 @@ commit `abe9ac9`):
   plain `curl` from an adb shell, which is the same unprivileged position any
   other installed app is in).
 
-### Phase 8 — Packaging
-- `plugins/build.py` must NOT freeze Rust sidecars for Android. `externalBin`
-  removed for Android; daemon + kitty-* linked in (AP comes along inside the
-  daemon crate — no separate artifact). Signed AAB + Windows installer.
-- `AGENTS.md` commands gain an `android` lane; scrub OLLAMA references in `docs/`.
-- **Update `CLAUDE.md`'s framing.** Its opening line and tech-stack section
-  currently say "Windows-only Tauri v2 desktop app" / "Windows-only target",
-  which stays *accurate* right up until this phase — so it is deliberately
-  **not** touched earlier. Once Android ships, rewrite those to the dual-target
-  reality (and the Ollama references, already stale after Phase 2). Same
-  treatment `goose-overlay-project-description.md` got when the backend swapped:
-  supersede it, don't quietly leave it wrong.
+### Phase 8 — Packaging — **DONE**
+
+**Landed 2026-08-11.**
+
+- **No Android sidecars, structurally.** `plugins/build.py` was already
+  Windows-triple-only and produces `.exe`s; its docstring now says *why* that
+  is correct rather than incidental, and says not to add an Android triple.
+  `tauri.android.conf.json` clears `bundle.externalBin`/`resources` (done in
+  Phase 1a, kept). The daemon is linked in and hosted in-process; `kitty-tools`
+  / `kitty-web` / `kitty-wasm` register with `transport: "in_process"`; the
+  behavioral-memory engine comes along inside the daemon crate.
+- **Signing.** `app/build.gradle.kts` reads a gitignored
+  `gen/android/keystore.properties` and applies it to the release variant.
+  **The key is deliberately not in this repo** — absent the file, the release
+  variant builds *unsigned*, which still verifies the lane and which Play
+  rejects, so nothing ships by accident. Creation steps in `docs/RELEASE.md`.
+- **`minSdk` 24 → 26.** The native library is compiled against the API 26
+  sysroot (`cargo ndk --platform 26`), so on 24/25 the APK installs and then
+  dies at `System.loadLibrary`. Declaring 26 converts a runtime crash into
+  Play refusing the install.
+- **`src-tauri/gen/android/` is now tracked** (`gen/schemas/` still ignored).
+  It is not regenerable: it carries the manifest's `windowSoftInputMode`, the
+  `minSdk` bump and the signing config. Its own `.gitignore` excludes the build
+  tree, the staged cdylib, and the 26 MB wasm resource copy.
+- **Docs.** `AGENTS.md` gained an Android lane (including the trap that
+  `cargo check --target aarch64-linux-android` is *not* a substitute for
+  `cargo ndk`, because it skips `llama-cpp-sys-2`'s build script entirely and
+  passes on code that does not build). `docs/RELEASE.md` split into Windows and
+  Android sections with the full toolchain env. `CLAUDE.md`, `README.md` and
+  `docs/ARCHITECTURE.md` rewritten off "Windows-only" and off Ollama;
+  `docs/VERSIONS.md`'s Ollama section and installer URL marked historical;
+  `docs/ADAPTIVE_PATHWAY.md` banner-superseded (it documents the retired Python
+  sidecar and its `AP_EMBED_OLLAMA_*` config).
+
+Both former release blockers — D24's keyring mock and the missing download
+foreground service — were closed on the same day, in Phase 7 above. What is
+left is smaller: the CPython WASI guest still downloads on first use
+(`docs/BACKLOG.md`), and the Phase 7 "not started" list still has the daemon
+hardening and tool-surface scoping items.
 
 ---
 

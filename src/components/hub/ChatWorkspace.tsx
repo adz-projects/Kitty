@@ -4,12 +4,15 @@ import { useStackStore } from '@/stores/stackStore';
 import { useAdaptivePathwayStore } from '@/stores/adaptivePathwayStore';
 import { useChatStore } from '@/stores/chatStore';
 import { useRouteStore } from '@/stores/routeStore';
+import { isAndroid } from '@/lib/platform';
 import { StackStatusView } from '@/components/shared/StackStatusView';
 import { ChatView } from '@/components/chat/ChatView';
 import { SessionList } from '@/components/sessions/SessionList';
 import { ArtifactsPane } from '@/components/artifacts/ArtifactsPane';
+import { ChatHeaderControls } from '@/components/chat/ChatHeaderControls';
 import { NewChatIcon } from '@/components/icons/NewChatIcon';
 import { SettingsGearIcon } from '@/components/icons/SettingsGearIcon';
+import { KittyIcon } from '@/components/icons/KittyIcon';
 import type { StackStatus } from '@/lib/types';
 
 const DEGRADED: StackStatus[] = ['backend_down', 'local_model_missing', 'provider_unreachable'];
@@ -32,16 +35,32 @@ export function ChatWorkspace() {
   useEffect(() => {
     void init();
     void initAdaptivePathway();
+    let mounted = true;
     // This window's own one-time handoff, if Expand created it with one
     // (Feature 5: every Expand opens a brand-new window now, so there is no
     // "already open, re-adopt a later handoff" case to also subscribe to —
     // a fresh window only ever needs this single mount-time read).
     void (async () => {
-      const info = await ipc.getPendingHandoff();
-      if (info?.session_id) await useChatStore.getState().adoptSession(info);
+      try {
+        const info = await ipc.getPendingHandoff();
+        if (mounted && info?.session_id) await useChatStore.getState().adoptSession(info);
+      } catch {
+        // No handoff (or backend briefly unreachable) — a plain chat window.
+      }
     })();
     // Show/hide-artifacts is persisted (Round-3 item 6).
-    void ipc.getConfig().then((c) => setShowArtifacts(c.show_artifacts));
+    void ipc
+      .getConfig()
+      .then((c) => {
+        if (mounted) setShowArtifacts(c.show_artifacts);
+      })
+      .catch(() => {
+        // Keep the default (shown); the header toggle still works for this
+        // window's lifetime even if the config read failed.
+      });
+    return () => {
+      mounted = false;
+    };
   }, [init, initAdaptivePathway]);
 
   const toggleArtifacts = async () => {
@@ -64,15 +83,31 @@ export function ChatWorkspace() {
   };
 
   const degraded = DEGRADED.includes(status);
+  const android = isAndroid();
 
   return (
     <div className="main-window">
       <SessionList />
       <div className="main-center">
         <header className="main-header">
-          <h1>Kitty</h1>
+          {/* The mark always; the word only where there's room for it. On
+              Android the header is one row that also carries the model picker,
+              so the six characters of "Kitty" are the cheapest thing to give
+              up. `KittyIcon` fills with `currentColor`, so it inherits `--text`
+              and flips light-on-dark / dark-on-light with the theme for free.
+              `app-mark` is needed on both now — a block `h1` misaligns the
+              glyph against the neighbouring buttons (see base.css). */}
+          <h1 className="app-mark">
+            <KittyIcon size={24} />
+            {!android && 'Kitty'}
+          </h1>
+          {android && <ChatHeaderControls />}
           <div style={{ display: 'flex', gap: 8 }}>
-            {hasMessages && (
+            {/* Export is desktop-only: on a phone the header is one crowded row
+                and ChatML export is a workstation-shaped action (you're pulling
+                a transcript into another file). Android keeps New chat + the
+                artifacts toggle. */}
+            {!android && hasMessages && (
               <button onClick={() => void exportSession()} title="Export this session as ChatML">
                 Export
               </button>
@@ -80,13 +115,16 @@ export function ChatWorkspace() {
             <button onClick={() => void toggleArtifacts()}>
               {showArtifacts ? 'Hide artifacts' : 'Show artifacts'}
             </button>
-            {/* Routes within this hub instead of opening a window. With
-                multiple hubs open (D21) a shared Settings window would have
-                been ambiguous about which one's session it was configuring;
-                as a route the answer is always "this one". */}
-            <button onClick={() => goto('settings')} title="Settings" aria-label="Settings">
-              <SettingsGearIcon />
-            </button>
+            {/* Routes within this hub rather than opening a window: with
+                multiple hubs open (D21) a shared Settings window would be
+                ambiguous about which one's session it configures.
+                Desktop-only — Android reaches Settings from the tab bar, so a
+                second entry point here is clutter in an already narrow row. */}
+            {!android && (
+              <button onClick={() => goto('settings')} title="Settings" aria-label="Settings">
+                <SettingsGearIcon />
+              </button>
+            )}
             <button onClick={() => void newSession()} title="New chat" aria-label="New chat">
               <NewChatIcon />
             </button>
@@ -96,7 +134,9 @@ export function ChatWorkspace() {
           {degraded ? <StackStatusView status={status} /> : <ChatView />}
         </div>
       </div>
-      {showArtifacts && !degraded && <ArtifactsPane />}
+      {showArtifacts && !degraded && (
+        <ArtifactsPane onClose={android ? () => void toggleArtifacts() : undefined} />
+      )}
     </div>
   );
 }

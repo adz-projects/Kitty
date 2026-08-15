@@ -33,6 +33,10 @@ pub fn defaults_for(provider_type: &str, _model: &str) -> SamplingParams {
             presence_penalty: Some(1.0),
             frequency_penalty: None,
             max_tokens: Some(8192),
+            // Effort is a per-turn request set by the loop, never a provider
+            // floor — a self-hosted endpoint has no reasoning-effort parameter
+            // at all, so there is nothing to default here.
+            effort: None,
         }
     } else {
         SamplingParams::default()
@@ -50,6 +54,10 @@ pub fn merge(configured: &SamplingParams, defaults: &SamplingParams) -> Sampling
         presence_penalty: configured.presence_penalty.or(defaults.presence_penalty),
         frequency_penalty: configured.frequency_penalty.or(defaults.frequency_penalty),
         max_tokens: configured.max_tokens.or(defaults.max_tokens),
+        // Neither presets nor floors ever set effort (the loop applies it after
+        // this merge), so this `or` is only ever `None.or(None)` — carried
+        // through for completeness rather than to combine two levels.
+        effort: configured.effort.or(defaults.effort),
     }
 }
 

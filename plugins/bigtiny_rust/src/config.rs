@@ -87,6 +87,15 @@ pub struct LocalEngineConfig {
     pub cache_type_k: String,
     #[serde(default = "default_local_cache_type")]
     pub cache_type_v: String,
+    /// Whether the in-process engine offers tool calling. On by default: the
+    /// small models this engine targets are only useful as agents at all
+    /// because Kitty's local tools are on by default (CLAUDE.md), and a
+    /// grammar constrains any call the model does emit to a real tool with a
+    /// schema-valid argument object — so the old "a plausible-looking wrong
+    /// call is worse than none" reasoning no longer holds. Off falls back to
+    /// the prior text-only behaviour.
+    #[serde(default = "default_local_tool_calls")]
+    pub tool_calls: bool,
 }
 
 fn default_embed_pooling() -> String {
@@ -107,6 +116,9 @@ fn default_local_n_gpu_layers() -> i32 {
 fn default_local_backend() -> String {
     "auto".into()
 }
+fn default_local_tool_calls() -> bool {
+    true
+}
 fn default_local_cache_type() -> String {
     "f16".into()
 }
@@ -126,6 +138,7 @@ impl Default for LocalEngineConfig {
             backend: default_local_backend(),
             cache_type_k: default_local_cache_type(),
             cache_type_v: default_local_cache_type(),
+            tool_calls: default_local_tool_calls(),
         }
     }
 }
@@ -432,9 +445,9 @@ pub struct MemoryConfig {
     #[serde(default = "default_memory_preflight_enabled")]
     pub preflight_enabled: bool,
     /// BM25 relevance gate for retrieved memory. FTS5 BM25 scores are
-    /// *negative*, closer to 0.0 = more relevant. `None` (the default) means
+    /// *negative*, more negative = more relevant. `None` (the default) means
     /// no gate — every best match is accepted. Set to a value like `-2.0`
-    /// (accept matches with score > -2.0) once the `tracing::debug`'d scores
+    /// (accept matches with score <= -2.0) once the `tracing::debug`'d scores
     /// have been studied empirically; it is never hardcoded.
     #[serde(default)]
     pub bm25_threshold: Option<f64>,

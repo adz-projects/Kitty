@@ -191,10 +191,12 @@ plugins/<name>/               # bigtiny included — plugins/bigtiny/
   tests/
 ```
 
-`plugins/build.py`, for each target (`bigtiny`, `kitty-tools`, `kitty-web`,
-`kitty-wasm` — all Rust as of 0.5.0; historically also Python targets, and
-`kitty-tools`, `kitty-web`, `kitty-wasm` — Rust; `python plugins/build.py`
-with no args builds all six):
+`plugins/build.py` is the **desktop lane only** — it hardcodes the Windows
+target triple and emits `.exe`s, because `externalBin` sidecars are a desktop
+hosting shape and Android has none by design (see §"In-process MCP servers"
+below). For each of its four targets (`bigtiny`, `kitty-tools`, `kitty-web`,
+`kitty-wasm` — all Rust as of 0.5.0; `python plugins/build.py` with no args
+builds all four):
 1. **Python** (`kind: "python"`, the default): `pip install -e ".[extras]"`
    installs the target's own pinned dependencies (plus any
    optional-dependency-group extras the target needs, e.g. adaptive-pathway's

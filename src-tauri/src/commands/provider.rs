@@ -72,7 +72,9 @@ pub async fn upsert_provider(
     }
     if let Some(s) = secret {
         if !s.is_empty() {
-            providers::set_secret(&profile.id, &s)?;
+            // Async write: `set_secret` is blocking Windows Credential
+            // Manager IPC, which must not run on a tokio worker.
+            providers::set_secret_async(&profile.id, &s).await?;
         }
     }
     let is_active;
@@ -98,9 +100,16 @@ pub async fn upsert_provider(
     Ok(profile)
 }
 
-/// Delete a provider profile (and its keyring secret).
+/// Delete a provider profile (and its stored secret).
+///
+/// `async` for a platform reason, not a performance one: a *synchronous*
+/// `#[tauri::command]` runs on the main thread, and on Android the secret
+/// store is reached by posting to the main looper and waiting for the reply
+/// (`android::secrets`). A sync command touching a secret therefore deadlocks
+/// the app. Everything else that reads or writes one is already async; this
+/// was the last sync holdout.
 #[tauri::command]
-pub fn delete_provider(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
+pub async fn delete_provider(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
     providers::delete_secret(&id);
     let mut cfg = state.config.lock().unwrap();
     cfg.providers.retain(|p| p.id != id);
@@ -117,6 +126,44 @@ pub fn delete_provider(state: tauri::State<'_, AppState>, id: String) -> Result<
 pub async fn openrouter_context_length(model: String) -> Result<Option<u32>, String> {
     let models = openrouter::list_models().await?;
     Ok(openrouter::context_length_for(&models, &model))
+}
+
+/// Best-effort context-length lookup for a **remote** Ollama server, via
+/// `POST /api/show`. The Ollama case lost its live lookup when managed Ollama
+/// was retired (commit `8c5fbef`); this restores it for the endpoint the user
+/// runs themselves. `Ok(None)` (never `Err` on a shape we don't recognize)
+/// keeps the field manually editable — this only ever *suggests* a value.
+#[tauri::command]
+pub async fn ollama_context_length(
+    base_url: String,
+    model: String,
+) -> Result<Option<u32>, String> {
+    let url = format!("{}/api/show", base_url.trim_end_matches('/'));
+    let resp = crate::util::http_client()
+        .post(url)
+        .json(&serde_json::json!({ "model": model }))
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|e| format!("could not reach Ollama: {e}"))?;
+    let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    Ok(context_length_from_show(&json))
+}
+
+/// Pull `<arch>.context_length` out of an Ollama `/api/show` `model_info`
+/// block. The architecture prefix varies per model (`llama.`, `qwen2.`,
+/// `gemma3.`, …), so match on the `.context_length` suffix rather than
+/// hardcoding a family. Split out pure so it's unit-testable without a live
+/// server, mirroring `providers::connection::tags_response_has_tag`.
+fn context_length_from_show(json: &serde_json::Value) -> Option<u32> {
+    json.get("model_info")
+        .and_then(|m| m.as_object())
+        .and_then(|obj| {
+            obj.iter()
+                .find(|(k, _)| k.ends_with(".context_length"))
+                .and_then(|(_, v)| v.as_u64())
+        })
+        .and_then(|n| u32::try_from(n).ok())
 }
 
 /// Check an OpenRouter provider profile's current credit balance/usage.
@@ -259,4 +306,51 @@ pub async fn set_session_provider(
     )
     .await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn context_length_from_show_reads_the_arch_prefixed_key() {
+        let body = json!({
+            "model_info": {
+                "general.architecture": "llama",
+                "llama.context_length": 131072,
+                "llama.embedding_length": 4096
+            }
+        });
+        assert_eq!(context_length_from_show(&body), Some(131072));
+    }
+
+    #[test]
+    fn context_length_from_show_handles_a_different_family_prefix() {
+        // The prefix is the model's architecture, not always "llama".
+        let body = json!({ "model_info": { "qwen2.context_length": 32768 } });
+        assert_eq!(context_length_from_show(&body), Some(32768));
+    }
+
+    #[test]
+    fn context_length_from_show_none_when_field_absent() {
+        let body = json!({ "model_info": { "general.architecture": "llama" } });
+        assert_eq!(context_length_from_show(&body), None);
+    }
+
+    #[test]
+    fn context_length_from_show_none_on_unexpected_shape() {
+        // A server answering with something other than Ollama's shape must
+        // read as "unknown", not panic.
+        let body = json!({ "unexpected": "shape" });
+        assert_eq!(context_length_from_show(&body), None);
+    }
+
+    #[test]
+    fn context_length_from_show_none_when_value_overflows_u32() {
+        // Implausible, but a garbage huge number must degrade to "unknown"
+        // rather than wrapping to a small one.
+        let body = json!({ "model_info": { "llama.context_length": 5_000_000_000u64 } });
+        assert_eq!(context_length_from_show(&body), None);
+    }
 }

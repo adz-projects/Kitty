@@ -41,7 +41,7 @@ pub async fn set_config(
 ) -> Result<(), String> {
     // Consumed only by the desktop-only re-registration below.
     #[cfg_attr(not(desktop), allow(unused_variables))]
-    let (hotkey_changed, engine_changed) = {
+    let (previous, hotkey_changed, engine_changed) = {
         let mut cur = state.config.lock().unwrap();
         let hotkey_changed = cur.hotkeys != config.hotkeys
             || cur.clipboard_hotkey != config.clipboard_hotkey
@@ -50,21 +50,26 @@ pub async fn set_config(
         // every `[local]` knob only reaches the daemon at spawn, so a change
         // needs a restart to take effect (docs/ANDROID.md §6.4).
         let engine_changed = crate::lifecycle::engine_restart::needs_restart(&cur, &config);
-        *cur = config.clone();
-        (hotkey_changed, engine_changed)
+        let previous = std::mem::replace(&mut *cur, config.clone());
+        (previous, hotkey_changed, engine_changed)
     };
 
     // Both I/O chunks (disk save + hotkey re-register) run on a blocking
     // thread — off the async worker, and with the config Mutex already
     // released.
     let config_for_save = config.clone();
-    tokio::task::spawn_blocking(move || config::save(&config_for_save))
+    let save_result = tokio::task::spawn_blocking(move || config::save(&config_for_save))
         .await
-        .map_err(|e| format!("save task panicked: {e}"))?
-        .map_err(|e| {
-            tracing::error!("failed to save config: {e}");
-            "Could not save settings to disk.".to_string()
-        })?;
+        .map_err(|e| format!("save task panicked: {e}"))?;
+    if let Err(e) = save_result {
+        // Roll the in-memory swap back: the app must keep running on the
+        // config that's actually on disk. A failed save that leaves the two
+        // diverged means the user keeps editing settings that vanish on the
+        // next launch, with no error pointing at why.
+        tracing::error!("failed to save config: {e}");
+        *state.config.lock().unwrap() = previous;
+        return Err("Could not save settings to disk.".to_string());
+    }
 
     // Let every window re-apply theme/background from the new config.
     let _ = app.emit("theme://changed", ());

@@ -36,6 +36,7 @@ function blankApiKeyProfile(type: ProviderType): ProviderProfile {
     max_tokens: null,
     context_length: null,
     strip_reasoning: false,
+    supports_vision: false,
     system_prompt: null,
     prompt_idle_timeout_secs: null,
     parallel_slots: null,
@@ -75,7 +76,7 @@ export function ApiKeyStep({ onBack, onNext }: { onBack: () => void; onNext: () 
     <section className="wizard-panel">
       <h1>Connect your provider</h1>
       <p className="muted">
-        Paste an API key from an account you already have. Kitty stores it securely on this computer
+        Paste an API key from an account you already have. Kitty stores it securely on this device
         and never sends it anywhere except that provider.
       </p>
 

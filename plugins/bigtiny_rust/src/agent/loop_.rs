@@ -363,6 +363,13 @@ pub struct AgentLoop {
     pathway: Option<Arc<adaptive_pathway::engine::PathwayEngine>>,
     /// Pathway learning cadence (`learn_every_n` exchanges).
     pathway_cfg: PathwayConfig,
+    /// Sessions already warned about a pinned-provider mismatch (the
+    /// `ModelFailover` notice at step 0). Shared with the daemon-lifetime
+    /// `Agent` — this loop is rebuilt per turn, so the memory of "we already
+    /// told the user" must outlive it. An entry is removed the moment the
+    /// pinned provider resolves again, so a *new* mismatch appearance
+    /// re-warns.
+    provider_mismatch_warned: Arc<DashMap<String, ()>>,
 }
 
 impl AgentLoop {
@@ -384,6 +391,7 @@ impl AgentLoop {
         sandbox_strict: bool,
         pathway: Option<Arc<adaptive_pathway::engine::PathwayEngine>>,
         pathway_cfg: PathwayConfig,
+        provider_mismatch_warned: Arc<DashMap<String, ()>>,
     ) -> Self {
         Self {
             router,
@@ -402,6 +410,7 @@ impl AgentLoop {
             sandbox_strict,
             pathway,
             pathway_cfg,
+            provider_mismatch_warned,
         }
     }
 
@@ -551,6 +560,16 @@ impl AgentLoop {
             }
         };
 
+        // The thought-seed is an ephemeral prefill for the provider's eyes
+        // only — never transcript content. `build_messages` appended it as
+        // the trailing assistant message; strip it back off BEFORE the first
+        // persistence below, or the literal `<think>` seed lands in saved
+        // chats (and the next turn's request would carry two adjacent
+        // assistant messages — a 400 on Anthropic). `run_tool_loop` gets it
+        // separately and appends it to the outgoing provider request only.
+        let thought_seed_msg =
+            crate::agent::context::builder::strip_trailing_thought_seed(&mut messages);
+
         // Derive and set session title — ONLY when the session isn't already
         // named. A user-renamed chat (Rename in the sidebar) must survive
         // later turns; blindly re-deriving + overwriting on every send
@@ -599,6 +618,7 @@ impl AgentLoop {
             &metadata,
             &active_tools,
             event_tx,
+            thought_seed_msg,
         )
         .await;
 
@@ -627,6 +647,7 @@ impl AgentLoop {
         metadata: &Value,
         active_tools: &[ToolDefinition],
         event_tx: &mpsc::UnboundedSender<SSEEvent>,
+        thought_seed_msg: Option<Value>,
     ) {
         // `max_steps` is compared as i64, not truncated to i32, and clamped
         // to `1..=MAX_STEPS_CEILING` — the old `... as i32` truncated a huge
@@ -643,7 +664,19 @@ impl AgentLoop {
             .get("sampling_preset")
             .and_then(|v| v.as_str())
             .and_then(crate::provider::presets::resolve);
+        // Requested reasoning effort for this session — translated per dialect
+        // at each provider's wire boundary, ignored by dialects that have no
+        // such parameter. Resolved once per turn like `preset`.
+        let effort = metadata
+            .get("thinking_effort")
+            .and_then(|v| v.as_str())
+            .and_then(crate::provider::base::Effort::from_wire);
         let mut step: i64 = 0;
+        // The provider/model the last completed model call actually used
+        // (fallback can switch mid-turn) — remembered for the ONCE-per-turn
+        // post-turn compaction pass below.
+        let mut last_provider_id: Option<String> = None;
+        let mut last_provider_model: Option<String> = None;
 
         loop {
             // Stop generating once the SSE consumer is gone — a disconnected
@@ -687,6 +720,61 @@ impl AgentLoop {
                     });
                     return;
                 }
+            };
+
+            // The session pinned a provider that isn't registered, so the
+            // router fell back to a different one. Tell the user once per
+            // mismatch *appearance* (tracked daemon-side, since this loop is
+            // rebuilt per turn) rather than silently running the whole
+            // conversation on an engine they didn't choose — this is what
+            // hid a bad provider stamp behind a working-looking chat on the
+            // local engine. The entry clears the moment the pinned provider
+            // resolves again, so a later re-occurrence re-warns.
+            if step == 0 {
+                match effective_provider.as_deref() {
+                    Some(pinned) if pinned != provider_id => {
+                        if self
+                            .provider_mismatch_warned
+                            .insert(session_id.to_string(), ())
+                            .is_none()
+                        {
+                            let _ = event_tx.send(SSEEvent {
+                                event_type: SSEEventType::ModelFailover,
+                                content: Some(format!(
+                                    "The provider this chat was set to ('{pinned}') isn't available — using '{provider_id}' instead. Re-pick the provider in settings if this isn't what you want."
+                                )),
+                                session_id: Some(session_id.to_string()),
+                                ..Default::default()
+                            });
+                        }
+                    }
+                    _ => {
+                        self.provider_mismatch_warned.remove(session_id);
+                    }
+                }
+            }
+
+            // A provider that can't take tools gets none — and the user is
+            // told once per turn, rather than the old arrangement where the
+            // provider silently dropped them behind a daemon-side `warn!` and
+            // the session just looked like a model that refused to act.
+            let provider_takes_tools = self.router.supports_tools(&provider_id);
+            if !provider_takes_tools && !active_tools.is_empty() {
+                let _ = event_tx.send(SSEEvent {
+                    event_type: SSEEventType::ModelFailover,
+                    content: Some(format!(
+                        "Provider '{}' can't call tools — this turn runs without the {} tool(s) that are connected.",
+                        provider_id,
+                        active_tools.len()
+                    )),
+                    session_id: Some(session_id.to_string()),
+                    ..Default::default()
+                });
+            }
+            let active_tools: &[ToolDefinition] = if provider_takes_tools {
+                active_tools
+            } else {
+                &[]
             };
 
             // Progressive budget check
@@ -756,15 +844,33 @@ impl AgentLoop {
                 // floor, so a preset overrides only what it names and the
                 // per-dialect floor still fills the rest.
                 let provider_sampling = self.router.sampling(&provider_id);
-                let sampling = match preset.as_ref() {
+                let mut sampling = match preset.as_ref() {
                     Some(p) => crate::provider::sampling::merge(p, &provider_sampling),
                     None => provider_sampling,
+                };
+                // Applied after the preset/floor merge — effort is a level to
+                // translate per dialect, not a knob to merge, and neither
+                // presets nor floors carry one to combine it with.
+                sampling.effort = effort;
+                // The ephemeral thought-seed prefill rides the FIRST provider
+                // request only: it primes the model's reply to the new user
+                // message; later iterations continue from real tool results.
+                // It is deliberately NOT in `messages` (so it can never be
+                // persisted into the transcript) — appended to the outgoing
+                // clone here instead.
+                let outgoing = match &thought_seed_msg {
+                    Some(seed) if step == 0 => {
+                        let mut o = messages.clone();
+                        o.push(seed.clone());
+                        o
+                    }
+                    _ => messages.clone(),
                 };
                 match self
                     .router
                     .chat_completion(
                         &provider_id,
-                        messages.clone(),
+                        outgoing,
                         Some(tools_for_turn.clone()),
                         sampling,
                         Some(provider_model.clone()),
@@ -814,6 +920,9 @@ impl AgentLoop {
 
             let (content_chunks, mut turn_tool_calls, finish_reason, turn_usage, timing) =
                 self.process_stream(stream, event_tx).await;
+
+            last_provider_id = Some(provider_id.clone());
+            last_provider_model = Some(provider_model.clone());
 
             if finish_reason.as_deref() == Some("content_ceiling_exceeded") {
                 let _ = event_tx.send(SSEEvent {
@@ -1005,33 +1114,43 @@ impl AgentLoop {
                 tracing::warn!("failed to save messages for session {session_id}: {e}");
             }
             step += 1;
+        }
 
-            // Compaction check. NOTE: was previously hardcoded to context
-            // length 8192 regardless of the configured model — that looked
-            // like a leftover stub value rather than a deliberate choice, so
-            // this now passes the real configured max context length. The
-            // provider's own `context_length` (Settings → Providers →
-            // Advanced) wins when set — the UI has claimed this override
-            // took effect since it shipped, but nothing ever read it; fall
-            // back to the daemon-wide `token_management.max_context_tokens`
-            // otherwise.
+        // Post-turn compaction check — ONCE per turn, fire-and-forget. This
+        // used to be awaited inline on EVERY tool-loop iteration: O(steps ×
+        // history) DB reads plus a full summarizer stall between tool steps,
+        // against its own doc contract ("compaction fires fire-and-forget
+        // after every turn"). The CAS compaction lock inside
+        // `run_compaction` is the overlap guard if passes for the same
+        // session ever race. The provider's own `context_length` (Settings →
+        // Providers → Advanced) wins when set; fall back to the daemon-wide
+        // `token_management.max_context_tokens` otherwise.
+        if let Some(pid) = last_provider_id {
             let context_length = self
                 .router
-                .context_length(&provider_id)
+                .context_length(&pid)
                 .unwrap_or(self.context.config().max_context_tokens);
-            let _ = run_compaction(
-                pool,
-                session_id,
-                &self.summarizer,
-                Some(&provider_id),
-                Some(provider_model.clone()),
-                self.context.config(),
-                &self.summarizer_cfg,
-                &self.memory_cfg,
-                context_length,
-                false,
-            )
-            .await;
+            let pool = pool.clone();
+            let session_id = session_id.to_string();
+            let summarizer = self.summarizer.clone();
+            let token_cfg = self.context.config().clone();
+            let summarizer_cfg = self.summarizer_cfg.clone();
+            let memory_cfg = self.memory_cfg.clone();
+            tokio::spawn(async move {
+                let _ = run_compaction(
+                    &pool,
+                    &session_id,
+                    &summarizer,
+                    Some(pid.as_str()),
+                    last_provider_model,
+                    &token_cfg,
+                    &summarizer_cfg,
+                    &memory_cfg,
+                    context_length,
+                    false,
+                )
+                .await;
+            });
         }
 
         // Turn-end Adaptive Pathway pass (runs once per turn, fire-and-forget):
@@ -1250,6 +1369,21 @@ impl AgentLoop {
                 }
             }
 
+            if let Some(ref reasoning) = delta.reasoning {
+                if !reasoning.is_empty() {
+                    // Reasoning counts toward the same ceiling as content —
+                    // a thinking-loop stream is exactly the unbounded-output
+                    // case `MAX_TURN_CONTENT_CHARS` exists to catch, and
+                    // hosted providers get no max_tokens floor.
+                    content_chars += reasoning.chars().count();
+                    let _ = event_tx.send(SSEEvent {
+                        event_type: SSEEventType::ReasoningDelta,
+                        content: Some(reasoning.clone()),
+                        ..Default::default()
+                    });
+                }
+            }
+
             // Backstop against a genuinely unbounded reply — see
             // `MAX_TURN_CONTENT_CHARS`'s doc comment. Dropping `stream`
             // (falling out of this loop without polling it again) cancels
@@ -1258,16 +1392,6 @@ impl AgentLoop {
             if exceeds_content_ceiling(content_chars) {
                 finish_reason = Some("content_ceiling_exceeded".to_string());
                 break;
-            }
-
-            if let Some(ref reasoning) = delta.reasoning {
-                if !reasoning.is_empty() {
-                    let _ = event_tx.send(SSEEvent {
-                        event_type: SSEEventType::ReasoningDelta,
-                        content: Some(reasoning.clone()),
-                        ..Default::default()
-                    });
-                }
             }
 
             if let Some(ref tcs) = delta.tool_calls {
@@ -1307,7 +1431,9 @@ impl AgentLoop {
             .as_ref()
             .and_then(|u| u.get("output_tokens"))
             .and_then(|v| v.as_i64())
-            .map(|v| v as i32)
+            // Saturating cast, not `as i32` (which wraps an absurd reported
+            // usage value negative) — same pattern as `record_usage` above.
+            .map(|v| i32::try_from(v).unwrap_or(i32::MAX))
             .unwrap_or(token_count);
 
         (content_chunks, tool_calls, finish_reason, usage, timing)
@@ -1404,6 +1530,34 @@ impl AgentLoop {
             return err;
         }
 
+        // Hard-deny a *write-class* tool that resolves to a path outside the
+        // session's allowed directories — checked unconditionally, BEFORE the
+        // HITL decision below. It only needs tool_name/args/allowed_dirs,
+        // and running it first means an out-of-scope write can neither slip
+        // through when HITL would decide `needs_approval` (the common
+        // `always_ask` case previously reached the approval path, letting a
+        // user approve a write that escapes chat_dir/current dir despite the
+        // module docs declaring such writes "hard-denied ... not
+        // escalated"), nor leave a phantom pending action behind:
+        // `check_tool_call_with_rules`'s `always_ask` side effect REGISTERS
+        // a pending action, which a post-hoc deny then orphaned in the
+        // pending-approvals API for ~1h with no HitlPause ever emitted. This
+        // is a policy violation, not an ask-the-human question.
+        if is_write_tool(&tool_name) && !check_containment(&tool_args, allowed_dirs, self.sandbox_strict) {
+            let err = format!(
+                "Tool {tool_name} denied: it would write to a path outside this \
+                 session's allowed directories"
+            );
+            let _ = event_tx.send(SSEEvent {
+                event_type: SSEEventType::ToolFinish,
+                tool_name: Some(tool_name),
+                tool_result: Some(err.clone()),
+                session_id: Some(session_id.to_string()),
+                ..Default::default()
+            });
+            return err;
+        }
+
         // Resolve the HITL decision without holding the shared mutex across
         // `check_tool_call`'s DB rule query: `check_tool_call_with_rules` is
         // synchronous, but the rule lookup itself is an `.await` on the pool —
@@ -1423,29 +1577,6 @@ impl AgentLoop {
             let mut hitl = self.hitl.lock().await;
             hitl.check_tool_call_with_rules(session_id, &tool_name, &tool_args, &rules)
         };
-
-        // Hard-deny a *write-class* tool that resolves to a path outside the
-        // session's allowed directories — checked unconditionally, BEFORE any
-        // HITL decision branch, so an out-of-scope write can't slip through
-        // when HITL decides `needs_approval` (the common `always_ask` case
-        // previously reached the approval path, letting a user approve a
-        // write that escapes chat_dir/current dir despite the module docs
-        // declaring such writes "hard-denied ... not escalated"). This is a
-        // policy violation, not an ask-the-human question.
-        if is_write_tool(&tool_name) && !check_containment(&tool_args, allowed_dirs, self.sandbox_strict) {
-            let err = format!(
-                "Tool {tool_name} denied: it would write to a path outside this \
-                 session's allowed directories"
-            );
-            let _ = event_tx.send(SSEEvent {
-                event_type: SSEEventType::ToolFinish,
-                tool_name: Some(tool_name),
-                tool_result: Some(err.clone()),
-                session_id: Some(session_id.to_string()),
-                ..Default::default()
-            });
-            return err;
-        }
 
         if (decision.action == "proceed" || decision.action == "always_allow")
             && !check_containment(&tool_args, allowed_dirs, self.sandbox_strict)
@@ -1507,9 +1638,13 @@ impl AgentLoop {
             self.hitl_notifies.remove(&action_id);
 
             let resolved = if timed_out {
-                // Leave the pending-action record itself alone (other tool
-                // calls in the same turn may have their own concurrent
-                // pending approvals) — `sweep_stale` reaps it later.
+                // Remove the pending record AND any decision that raced in
+                // after the timeout: the pending-approvals API would
+                // otherwise show an approval no waiter will ever honor for
+                // ~1h (until `sweep_stale` reaps it), and a late decision
+                // must not resolve a call that has already failed closed.
+                let mut hitl = self.hitl.lock().await;
+                hitl.remove_pending(&action_id);
                 None
             } else {
                 let mut hitl = self.hitl.lock().await;
@@ -1801,6 +1936,137 @@ mod budget_abort_tests {
     #[test]
     fn no_tool_calls_means_no_tool_results() {
         assert!(build_aborted_tool_results(&[]).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod containment_order_tests {
+    use super::*;
+    use crate::agent::context::builder::ContextBuilder;
+    use crate::agent::context::stats::SessionStats;
+    use crate::agent::summarizer_chain::SummarizerChain;
+    use crate::config::BigTinyConfig;
+    use crate::mcp::MCPManager;
+
+    /// Builds a real `AgentLoop` against an in-memory, migrated DB (same
+    /// shape as `agent::mod::tests::test_agent`), so the full
+    /// sandbox→HITL→execution ordering in `execute_one_tool_call` runs for
+    /// real. Default HITL policy is `always_ask` — exactly the configuration
+    /// that registered phantom pending actions before the fix.
+    async fn test_loop() -> (AgentLoop, Arc<Mutex<HITLManager>>) {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+
+        let config = BigTinyConfig::default();
+        let router = Arc::new(ProviderRouter::new(config.cache.clone()));
+        let mcp = Arc::new(MCPManager::new(pool.clone(), None));
+        let hitl = Arc::new(Mutex::new(HITLManager::new(pool.clone(), config.hitl.clone())));
+        #[cfg(feature = "local-engine")]
+        let summarizer = Arc::new(SummarizerChain::new(None, router.clone(), config.summarizer.clone()));
+        #[cfg(not(feature = "local-engine"))]
+        let summarizer = Arc::new(SummarizerChain::new(router.clone(), config.summarizer.clone()));
+        let context = ContextBuilder::new(
+            pool.clone(),
+            config.token_management.clone(),
+            config.summarizer.reserve_exchanges,
+        );
+        let stats = SessionStats::new(pool.clone());
+        let agent_loop = AgentLoop::new(
+            router,
+            hitl.clone(),
+            mcp,
+            Arc::new(DashMap::new()),
+            context,
+            stats,
+            summarizer,
+            config.summarizer.clone(),
+            config.memory.clone(),
+            Arc::new(PreflightCounters::new()),
+            4,
+            std::env::temp_dir().to_string_lossy().into_owned(),
+            config.fallback.clone(),
+            false,
+            None,
+            config.pathway.clone(),
+            Arc::new(DashMap::new()),
+        );
+        (agent_loop, hitl)
+    }
+
+    /// Regression: the write-class containment hard-deny used to run AFTER
+    /// `check_tool_call_with_rules`, whose `always_ask` side effect had
+    /// already registered a pending action — the call was then denied
+    /// without a HitlPause, leaving a phantom entry in the
+    /// pending-approvals API for ~1h. The containment check now runs first,
+    /// so no pending action is ever created for a denied write.
+    #[tokio::test]
+    async fn write_tool_containment_deny_creates_no_pending_action() {
+        let (agent_loop, hitl) = test_loop().await;
+        let (tx, _rx) = mpsc::unbounded_channel::<SSEEvent>();
+        let result = agent_loop
+            .execute_one_tool_call(
+                "sess-1",
+                "lean_file_write".to_string(),
+                json!({"path": "/etc/evil.txt", "content": "x"}),
+                &["/allowed".to_string()],
+                Arc::new(Semaphore::new(1)),
+                &tx,
+            )
+            .await;
+        assert!(
+            result.contains("denied"),
+            "the out-of-dir write is hard-denied: {result}"
+        );
+        assert!(
+            hitl.lock().await.get_pending_approvals("sess-1").is_empty(),
+            "no phantom pending action may be registered"
+        );
+    }
+
+    /// The mirror case: an in-dir write still reaches the HITL layer
+    /// (always_ask → a real pending action with a HitlPause event).
+    #[tokio::test]
+    async fn write_tool_inside_allowed_dirs_still_goes_through_hitl() {
+        let (agent_loop, hitl) = test_loop().await;
+        let (tx, mut rx) = mpsc::unbounded_channel::<SSEEvent>();
+        let agent_loop = Arc::new(agent_loop);
+        let al = agent_loop.clone();
+        let handle = tokio::spawn(async move {
+                al.execute_one_tool_call(
+                    "sess-1",
+                    "lean_file_write".to_string(),
+                    json!({"path": "/allowed/ok.txt", "content": "x"}),
+                    &["/allowed".to_string()],
+                    Arc::new(Semaphore::new(1)),
+                    &tx,
+                )
+                .await
+        });
+        // Wait for the HitlPause, then approve via the manager directly.
+        let mut action_id = None;
+        while let Some(ev) = rx.recv().await {
+            if ev.event_type == SSEEventType::HitlPause {
+                action_id = ev.action_id;
+                break;
+            }
+        }
+        let action_id = action_id.expect("a HitlPause with an action_id must arrive");
+        {
+            let mut hitl = hitl.lock().await;
+            hitl.record_decision(&action_id, "allow");
+        }
+        // Wake the paused call the way `Agent::resolve_approval` would.
+        if let Some((_, notify)) = agent_loop.hitl_notifies.remove(&action_id) {
+            notify.notify_one();
+        }
+        let result = handle.await.unwrap();
+        // The tool itself doesn't exist (no MCP servers registered), but the
+        // call must have gotten PAST the HITL gate — an "unknown tool"
+        // execution error, not a denial.
+        assert!(
+            !result.contains("denied"),
+            "an approved in-dir write must not be denied: {result}"
+        );
     }
 }
 

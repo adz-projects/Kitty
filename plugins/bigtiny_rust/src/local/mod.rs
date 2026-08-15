@@ -21,6 +21,7 @@ pub mod manager;
 pub mod pathway_embed;
 pub mod provider;
 pub mod summarizer;
+pub mod tools;
 
 pub use backend::{select_backend, BackendKind, SelectedBackend};
 pub use engine::{EmbedPooling, LocalEngine, LocalEngineError};

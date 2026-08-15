@@ -29,8 +29,18 @@ Requires each target's own dependencies as declared in its own
 automatically. `python3`/`py -3` must be resolvable on PATH to create the
 per-plugin venvs.
 
-Windows-only app, so the target triple is hardcoded to the one Kitty ships
-(see docs/VERSIONS.md).
+**This script is the desktop lane only, and deliberately so.** The target
+triple is hardcoded to Windows and every output is an `.exe`, because
+`externalBin` sidecars are a desktop hosting shape: Android 10+ refuses to
+`exec()` a binary in app-writable storage, so there is nothing for a frozen
+per-plugin executable to be on that platform. The Android build instead links
+the same code in-process — the daemon via `bigtiny_rust::run`
+(`src-tauri/src/lifecycle/bigtiny_embedded.rs`) and the MCP servers via
+`bigtiny_rust::mcp::builtin` with `transport: "in_process"` — and
+`tauri.android.conf.json` clears `bundle.externalBin` so `tauri build` never
+goes looking for `*-aarch64-linux-android` artifacts that by design do not
+exist. Do not add an Android triple here; if you find yourself wanting one,
+the plugin needs an in-process entry point instead (docs/PLUGINS.md).
 """
 
 from __future__ import annotations

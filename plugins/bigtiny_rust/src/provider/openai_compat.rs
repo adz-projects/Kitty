@@ -8,22 +8,62 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use super::base::{
-    classify_provider_error, Delta, HealthStatus, ModelInfo, Provider, SamplingParams,
+    classify_provider_error, Delta, Effort, HealthStatus, ModelInfo, Provider, SamplingParams,
 };
 use crate::config::ProviderConfig;
+use super::tag_split::TagSplitter;
 use crate::error::ProviderError;
 use crate::network::{maybe_direct_url, TailscaleClient};
+
+/// OpenAI's `reasoning_effort` string for an effort level. `None` for `Off`:
+/// the o-series can't be told *not* to reason, so the only faithful encoding
+/// of "off" is to omit the field entirely and take the model's default.
+fn openai_reasoning_effort(e: Effort) -> Option<&'static str> {
+    match e {
+        Effort::Off => None,
+        Effort::Low => Some("low"),
+        Effort::Medium => Some("medium"),
+        Effort::High => Some("high"),
+    }
+}
+
+/// OpenRouter's nested `reasoning` object for an effort level. OpenRouter is
+/// the one dialect here that can switch reasoning off explicitly.
+fn openrouter_reasoning(e: Effort) -> Value {
+    match e {
+        Effort::Off => serde_json::json!({ "enabled": false }),
+        Effort::Low => serde_json::json!({ "effort": "low" }),
+        Effort::Medium => serde_json::json!({ "effort": "medium" }),
+        Effort::High => serde_json::json!({ "effort": "high" }),
+    }
+}
 
 pub struct OpenAICompatibleProvider {
     pub provider_id: String,
     pub config: ProviderConfig,
     client: reqwest::Client,
+    /// Dedicated client for the Tailscale direct-address attempt. It bounds
+    /// ONLY the connect phase (`network::DIRECT_CONNECT_TIMEOUT`) so an
+    /// unreachable LAN address falls back to the tunnel quickly — crucially
+    /// WITHOUT a reqwest request-level timeout, which also covers the
+    /// response body: the old `.timeout(DIRECT_CONNECT_TIMEOUT)` on the
+    /// request killed every direct SSE stream at 3s, before the fallback
+    /// could ever matter. A stalled body on this client is bounded by the
+    /// SSE idle-read timeout instead (`idle_timeout`).
+    direct_client: reqwest::Client,
     tailscale: Arc<TailscaleClient>,
     /// SSE idle-read timeout — if no bytes arrive for this long, the stream
     /// is terminated with a transient error (see `parse_openai_sse`). Per
     /// provider, from the config blob's `idle_timeout_secs`, default 300s.
     idle_timeout: Duration,
 }
+
+/// Bounds time-to-response-headers on a chat completion. `connect_timeout`
+/// only covers TCP/TLS setup — a provider that accepts the connection but
+/// stalls before sending response headers would otherwise hold the turn
+/// (and the fallback loop) forever. The SSE *body* is never capped by this;
+/// that's the per-chunk `idle_timeout`'s job.
+const RESPONSE_HEADERS_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl OpenAICompatibleProvider {
     pub const DEFAULT_MODEL: &'static str = "gpt-4o";
@@ -39,27 +79,20 @@ impl OpenAICompatibleProvider {
             .connect_timeout(std::time::Duration::from_secs(30))
             .build()
             .unwrap_or_default();
+        let direct_client = reqwest::Client::builder()
+            .connect_timeout(crate::network::DIRECT_CONNECT_TIMEOUT)
+            .build()
+            .unwrap_or_default();
         Self {
             provider_id: provider_id.into(),
             client,
+            direct_client,
             config,
             tailscale,
             idle_timeout,
         }
     }
 
-    /// Length of the longest suffix of `s` that is also a proper prefix of
-    /// `tag` — used to detect "the tail of this fragment might be the start
-    /// of a tag that continues in the next SSE chunk".
-    fn longest_tag_prefix_suffix(s: &str, tag: &str) -> usize {
-        let max = tag.len().saturating_sub(1).min(s.len());
-        for len in (1..=max).rev() {
-            if s.ends_with(&tag[..len]) {
-                return len;
-            }
-        }
-        0
-    }
 
     /// Merges the contiguous *leading* run of `role: "system"` messages into a
     /// single one at the front of the array, leaving everything else (and its
@@ -170,11 +203,12 @@ impl OpenAICompatibleProvider {
     }
 
     /// If `url`'s host is a Tailscale peer with a discoverable direct (LAN)
-    /// address, tries that address first (bounded by
-    /// `network::DIRECT_CONNECT_TIMEOUT`) and falls back to the original
-    /// (tunneled) URL on any error. A no-op — single request, original URL —
-    /// for every other host (localhost, non-Tailscale, or no direct address
-    /// known). Mirrors Python's `PreferDirectTransport`.
+    /// address, tries that address first (connect phase bounded by
+    /// `network::DIRECT_CONNECT_TIMEOUT` via `direct_client`) and falls back
+    /// to the original (tunneled) URL on any error. A no-op — single
+    /// request, original URL — for every other host (localhost,
+    /// non-Tailscale, or no direct address known). Mirrors Python's
+    /// `PreferDirectTransport`.
     async fn send_preferring_direct(
         &self,
         url: &str,
@@ -182,10 +216,9 @@ impl OpenAICompatibleProvider {
     ) -> Result<reqwest::Response, reqwest::Error> {
         if let Some(direct_url) = maybe_direct_url(&self.tailscale, url).await {
             let direct = self
-                .client
+                .direct_client
                 .post(&direct_url)
                 .header("Authorization", format!("Bearer {}", self.config.api_key))
-                .timeout(crate::network::DIRECT_CONNECT_TIMEOUT)
                 .json(body)
                 .send()
                 .await;
@@ -291,24 +324,79 @@ impl Provider for OpenAICompatibleProvider {
                 body["min_p"] = p.into();
             }
         }
+        // Reasoning effort — dialect-specific. OpenAI takes a flat
+        // `reasoning_effort` string (with no way to switch reasoning *off* on
+        // an o-series model — "Off" there just means "send nothing"), while
+        // OpenRouter takes a nested `reasoning` object (and *can* disable it).
+        // A self-hosted OpenAI-compatible server (llama.cpp `llama-server`,
+        // Ollama) honors neither of those; the portable control there is the
+        // chat template's `enable_thinking` kwarg (Qwen3 et al.), so effort
+        // collapses to on/off and rides `chat_template_kwargs`. `local` (the
+        // in-process engine) still has no equivalent and writes nothing.
+        if let Some(e) = sampling.effort {
+            match self.config.provider_type.as_str() {
+                "openai" => {
+                    if let Some(s) = openai_reasoning_effort(e) {
+                        body["reasoning_effort"] = s.into();
+                    }
+                }
+                "openrouter" => {
+                    body["reasoning"] = openrouter_reasoning(e);
+                }
+                "custom_openai" | "ollama" => {
+                    // Off → disable thinking; any positive level → enable it.
+                    // Merge into any existing chat_template_kwargs rather than
+                    // clobbering it.
+                    let enable = !matches!(e, Effort::Off);
+                    let kwargs = body
+                        .get_mut("chat_template_kwargs")
+                        .and_then(|v| v.as_object_mut());
+                    if let Some(obj) = kwargs {
+                        obj.insert("enable_thinking".into(), enable.into());
+                    } else {
+                        body["chat_template_kwargs"] =
+                            serde_json::json!({ "enable_thinking": enable });
+                    }
+                }
+                _ => {}
+            }
+        }
         if let Some(slot) = id_slot {
             body["id_slot"] = slot.into();
         }
 
+        // Never log the request body itself: it embeds the full conversation
+        // (system prompt, history, tool output) at debug level. A shape
+        // summary is enough to correlate a request in the logs.
         tracing::debug!(
             provider_id = %self.provider_id,
-            body = %body,
-            "chat_completion request body"
+            model = %model,
+            messages = body["messages"].as_array().map(|m| m.len()).unwrap_or(0),
+            tools = body["tools"].as_array().map(|t| t.len()).unwrap_or(0),
+            "chat_completion request"
         );
 
-        let resp = self
-            .send_preferring_direct(&url, &body)
-            .await
-            .map_err(|e| ProviderError::Request {
-                user_message: format!("Failed to connect to provider: {}", e),
-                raw_message: e.to_string(),
-                http_status: 0,
-            })?;
+        // Bound time-to-response-headers (see RESPONSE_HEADERS_TIMEOUT);
+        // `send().await` resolves as soon as headers arrive, so this never
+        // caps the SSE body streaming behind them.
+        let resp = tokio::time::timeout(
+            RESPONSE_HEADERS_TIMEOUT,
+            self.send_preferring_direct(&url, &body),
+        )
+        .await
+        .map_err(|_| ProviderError::Request {
+            user_message: format!(
+                "Provider sent no response headers within {}s",
+                RESPONSE_HEADERS_TIMEOUT.as_secs()
+            ),
+            raw_message: "timed out waiting for response headers".into(),
+            http_status: 0,
+        })?
+        .map_err(|e| ProviderError::Request {
+            user_message: format!("Failed to connect to provider: {}", e),
+            raw_message: e.to_string(),
+            http_status: 0,
+        })?;
 
         let status_code = resp.status().as_u16();
         if !resp.status().is_success() {
@@ -328,6 +416,9 @@ impl Provider for OpenAICompatibleProvider {
             .client
             .get(&url)
             .header("Authorization", format!("Bearer {}", self.config.api_key))
+            // Same per-request bound as `check_health` — a stalled provider
+            // must not hang model discovery forever.
+            .timeout(std::time::Duration::from_secs(5))
             .send()
             .await
             .map_err(|e| ProviderError::Request {
@@ -450,16 +541,10 @@ struct OpenAISSEStream {
     /// was otherwise silently dropped instead of surfacing on the `[DONE]`
     /// tool-calls flush.
     last_finish_reason: Option<String>,
-    /// Whether the last fragment left us mid-`<think>...</think>` block —
-    /// carried across `process_line` calls (i.e. across SSE chunks), since a
-    /// single reasoning block routinely spans many deltas. Resetting this
-    /// per-fragment (the old behavior) meant every fragment after the first
-    /// one containing `<think>` was treated as plain output.
-    in_thinking: bool,
-    /// Trailing text held back from the previous fragment because it could
-    /// be the start of a `<think>`/`</think>` tag split across a chunk
-    /// boundary — prepended to the next fragment before re-scanning.
-    pending_tag_prefix: String,
+    /// Carries `<think>`/`</think>` state across `process_line` calls (i.e.
+    /// across SSE chunks), since a single reasoning block routinely spans
+    /// many deltas.
+    thinking: TagSplitter,
 }
 
 fn parse_openai_sse(
@@ -477,70 +562,22 @@ fn parse_openai_sse(
         pending: std::collections::VecDeque::new(),
         done: false,
         last_finish_reason: None,
-        in_thinking: false,
-        pending_tag_prefix: String::new(),
+        thinking: TagSplitter::thinking(),
     }
 }
 
 impl OpenAISSEStream {
-    /// Split `<think>...</think>` thinking tags out of one content fragment.
-    /// A single `str::find` scan per tag occurrence (not a re-clone-and-scan
-    /// per character), and `in_thinking`/`pending_tag_prefix` on `self` carry
-    /// state across fragments so a tag spanning multiple SSE deltas — the
-    /// normal case — is still recognized as one tag.
+    /// Split `<think>...</think>` out of one content fragment. The
+    /// cross-fragment bookkeeping lives in `TagSplitter` — a tag spanning
+    /// several SSE deltas is the normal case, not the exception.
     fn split_thinking_tags(&mut self, content: &str) -> (String, Option<String>) {
-        const OPEN_TAG: &str = "<think>";
-        const CLOSE_TAG: &str = "</think>";
-
-        let combined = if self.pending_tag_prefix.is_empty() {
-            content.to_string()
-        } else {
-            let mut s = std::mem::take(&mut self.pending_tag_prefix);
-            s.push_str(content);
-            s
-        };
-
-        let mut text = String::new();
-        let mut thinking = String::new();
-        let mut rest: &str = &combined;
-
-        loop {
-            let needle = if self.in_thinking {
-                CLOSE_TAG
-            } else {
-                OPEN_TAG
-            };
-            match rest.find(needle) {
-                Some(idx) => {
-                    let (before, after) = rest.split_at(idx);
-                    if self.in_thinking {
-                        thinking.push_str(before);
-                    } else {
-                        text.push_str(before);
-                    }
-                    self.in_thinking = !self.in_thinking;
-                    rest = &after[needle.len()..];
-                }
-                None => {
-                    let hold = OpenAICompatibleProvider::longest_tag_prefix_suffix(rest, needle);
-                    let (keep, hold_str) = rest.split_at(rest.len() - hold);
-                    if self.in_thinking {
-                        thinking.push_str(keep);
-                    } else {
-                        text.push_str(keep);
-                    }
-                    self.pending_tag_prefix = hold_str.to_string();
-                    break;
-                }
-            }
-        }
-
-        let reasoning = if thinking.is_empty() {
+        let split = self.thinking.feed(content);
+        let reasoning = if split.inside.is_empty() {
             None
         } else {
-            Some(thinking)
+            Some(split.inside)
         };
-        (text, reasoning)
+        (split.outside, reasoning)
     }
     /// Flush any accumulated streamed tool calls as a single Delta. Shared by
     /// the `[DONE]` path and the `Poll::Ready(None)` path so a stream that
@@ -551,15 +588,24 @@ impl OpenAISSEStream {
         if self.tool_call_buf.is_empty() {
             return;
         }
-        let bad: Vec<String> = self
-            .tool_call_buf
+        // HashMap iteration order is nondeterministic — sort by the streamed
+        // `index` so tool calls execute and transcribe in the order the model
+        // emitted them, not in hash order.
+        let mut entries: Vec<(usize, PendingToolCall)> = self.tool_call_buf.drain().collect();
+        entries.sort_by_key(|(idx, _)| *idx);
+        let bad: Vec<String> = entries
             .iter()
-            .filter(|(_, buf)| serde_json::from_str::<Value>(&buf.arguments).is_err())
+            .filter(|(_, buf)| {
+                // Empty accumulated arguments are legitimate (a zero-arg tool
+                // streams no fragments) — only NON-empty unparseable text is
+                // malformed.
+                !buf.arguments.is_empty()
+                    && serde_json::from_str::<Value>(&buf.arguments).is_err()
+            })
             .map(|(_, buf)| buf.name.clone().unwrap_or_else(|| "<unnamed>".into()))
             .collect();
-        let tool_calls: Vec<super::base::ToolCall> = self
-            .tool_call_buf
-            .drain()
+        let tool_calls: Vec<super::base::ToolCall> = entries
+            .into_iter()
             .map(|(_, buf)| {
                 // `function` must carry BOTH `name` and `arguments` — the
                 // agent loop reads `tc.function.get("name")` /
@@ -574,15 +620,22 @@ impl OpenAISSEStream {
                 // empty args (a `read_file` becomes `read_file(path:
                 // undefined)`), corrupting user-visible effects. Emit an
                 // error delta so the agent loop surfaces a failed call
-                // instead.
-                let arguments: Value = match serde_json::from_str(&buf.arguments) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        tracing::warn!(
-                            "tool call {:?} had unparseable streamed arguments: {e}",
-                            buf.name
-                        );
-                        serde_json::json!({ "__error": format!("malformed tool arguments: {e}") })
+                // instead. EMPTY accumulated arguments are the opposite
+                // case: a zero-argument tool streams no `arguments`
+                // fragments at all, so `""` legitimately means `{}` (the
+                // Anthropic parser already treats it that way).
+                let arguments: Value = if buf.arguments.is_empty() {
+                    serde_json::json!({})
+                } else {
+                    match serde_json::from_str(&buf.arguments) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::warn!(
+                                "tool call {:?} had unparseable streamed arguments: {e}",
+                                buf.name
+                            );
+                            serde_json::json!({ "__error": format!("malformed tool arguments: {e}") })
+                        }
                     }
                 };
                 let function = serde_json::json!({
@@ -835,6 +888,28 @@ impl Stream for OpenAISSEStream {
                             self.done = true;
                         }
                     }
+                    // Release any held-back partial `<think>` tag as literal
+                    // text — the entire reason `TagSplitter::flush` exists.
+                    // A stream ending in a dangling `<thi` used to drop those
+                    // bytes silently. Inside a think span the tail is
+                    // reasoning; outside, ordinary content.
+                    let think_tail = self.thinking.flush();
+                    if !think_tail.is_empty() {
+                        let (content, reasoning) = if self.thinking.is_inside() {
+                            (None, Some(think_tail))
+                        } else {
+                            (Some(think_tail), None)
+                        };
+                        self.pending.push_back(Delta {
+                            role: "assistant".into(),
+                            content,
+                            reasoning,
+                            tool_calls: None,
+                            finish_reason: None,
+                            usage: None,
+                            error_type: None,
+                        });
+                    }
                     // Flush any accumulated tool calls: some backends close
                     // the stream without an explicit `[DONE]` marker, and
                     // complete tool-call fragments would otherwise be lost.
@@ -850,6 +925,32 @@ impl Stream for OpenAISSEStream {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod effort_tests {
+    use super::*;
+
+    #[test]
+    fn openai_maps_levels_and_omits_off() {
+        assert_eq!(openai_reasoning_effort(Effort::Low), Some("low"));
+        assert_eq!(openai_reasoning_effort(Effort::Medium), Some("medium"));
+        assert_eq!(openai_reasoning_effort(Effort::High), Some("high"));
+        // No way to disable o-series reasoning — "off" is encoded as omission.
+        assert_eq!(openai_reasoning_effort(Effort::Off), None);
+    }
+
+    #[test]
+    fn openrouter_uses_a_nested_object_and_can_disable() {
+        assert_eq!(
+            openrouter_reasoning(Effort::Off),
+            serde_json::json!({ "enabled": false })
+        );
+        assert_eq!(
+            openrouter_reasoning(Effort::High),
+            serde_json::json!({ "effort": "high" })
+        );
     }
 }
 
@@ -1002,6 +1103,78 @@ mod sse_tests {
                 .and_then(|v| v.as_str()),
             Some("a.txt")
         );
+    }
+
+    /// Regression: a zero-argument tool streams NO `arguments` fragments at
+    /// all, leaving the accumulated string empty. `""` used to hit the JSON
+    /// parse error path and surface as the `__error` sentinel — but empty
+    /// arguments legitimately mean `{}` (the Anthropic parser already treats
+    /// them that way).
+    #[tokio::test]
+    async fn zero_argument_tool_call_flushes_as_empty_object_not_error() {
+        let chunk = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"list_files\"}}]}}]}\n\n\
+                     data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n\
+                     data: [DONE]\n\n";
+        let inner = stream::iter(vec![Ok::<bytes::Bytes, reqwest::Error>(
+            bytes::Bytes::from(chunk),
+        )]);
+        let deltas: Vec<Delta> = parse_openai_sse(inner, Duration::from_secs(300)).collect().await;
+        assert!(
+            deltas.iter().all(|d| d.error_type.is_none()),
+            "no error delta for a legitimate zero-arg call: {deltas:?}"
+        );
+        let tool_calls = deltas
+            .into_iter()
+            .find_map(|d| d.tool_calls)
+            .expect("expected a Delta carrying tool_calls");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(
+            tool_calls[0].function.get("arguments"),
+            Some(&serde_json::json!({})),
+            "empty streamed arguments must become an empty object"
+        );
+    }
+
+    /// Regression: `tool_call_buf` is a HashMap, and draining it emitted
+    /// tool calls in nondeterministic hash order — scrambling the
+    /// transcript/execution sequence. They must come out sorted by the
+    /// streamed `index`, regardless of fragment arrival order.
+    #[tokio::test]
+    async fn tool_calls_flush_sorted_by_index_not_arrival_order() {
+        // Fragments for index 2 arrive before index 0; the flush must still
+        // order the calls 0, 1, 2.
+        let chunk = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":2,\"id\":\"call_c\",\"type\":\"function\",\"function\":{\"name\":\"third\",\"arguments\":\"{}\"}}]}}]}\n\n\
+                     data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"type\":\"function\",\"function\":{\"name\":\"first\",\"arguments\":\"{}\"}}]}}]}\n\n\
+                     data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_b\",\"type\":\"function\",\"function\":{\"name\":\"second\",\"arguments\":\"{}\"}}]}}]}\n\n\
+                     data: [DONE]\n\n";
+        let inner = stream::iter(vec![Ok::<bytes::Bytes, reqwest::Error>(
+            bytes::Bytes::from(chunk),
+        )]);
+        let deltas: Vec<Delta> = parse_openai_sse(inner, Duration::from_secs(300)).collect().await;
+        let tool_calls = deltas
+            .into_iter()
+            .find_map(|d| d.tool_calls)
+            .expect("expected a Delta carrying tool_calls");
+        let names: Vec<&str> = tool_calls
+            .iter()
+            .filter_map(|tc| tc.function.get("name").and_then(|v| v.as_str()))
+            .collect();
+        assert_eq!(names, vec!["first", "second", "third"]);
+    }
+
+    /// Regression: `OpenAISSEStream` never called `TagSplitter::flush` at
+    /// end-of-stream, so a stream ending in a dangling partial tag (`<th`)
+    /// dropped those bytes silently. The tail must surface as a final
+    /// content delta.
+    #[tokio::test]
+    async fn dangling_partial_think_tag_is_flushed_at_end_of_stream() {
+        let chunk = "data: {\"choices\":[{\"delta\":{\"content\":\"tail<th\"}}]}\n\n";
+        let inner = stream::iter(vec![Ok::<bytes::Bytes, reqwest::Error>(
+            bytes::Bytes::from(chunk),
+        )]);
+        let deltas: Vec<Delta> = parse_openai_sse(inner, Duration::from_secs(300)).collect().await;
+        let content: String = deltas.iter().filter_map(|d| d.content.clone()).collect();
+        assert_eq!(content, "tail<th", "the held-back partial tag must be flushed");
     }
 
     #[tokio::test]
@@ -1209,6 +1382,66 @@ mod sse_tests {
         let _: Vec<Delta> = stream.collect().await;
 
         direct_mock.assert_async().await;
+    }
+
+    /// Regression for the request-level `.timeout(DIRECT_CONNECT_TIMEOUT)`
+    /// on the direct attempt: a reqwest timeout covers the whole response
+    /// body, so every direct/Tailscale SSE stream died at 3s and the
+    /// fallback never got to matter. The direct attempt must bound only the
+    /// connect phase; a slow-but-healthy body streaming PAST
+    /// `DIRECT_CONNECT_TIMEOUT` must complete.
+    ///
+    /// Uses a raw TCP fake rather than mockito, which can't delay mid-body.
+    #[tokio::test]
+    async fn send_preferring_direct_does_not_cap_the_sse_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            // Read the request head (headers + start of body is fine — we
+            // never validate it).
+            let mut buf = vec![0u8; 8192];
+            let _ = sock.read(&mut buf).await;
+            let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n";
+            sock.write_all(head.as_bytes()).await.unwrap();
+            let chunk = |data: &str| format!("{:x}\r\n{}\r\n", data.len(), data);
+            sock.write_all(
+                chunk("data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n").as_bytes(),
+            )
+            .await
+            .unwrap();
+            sock.flush().await.unwrap();
+            // Longer than DIRECT_CONNECT_TIMEOUT (3s): the old request-level
+            // timeout killed the stream right here.
+            tokio::time::sleep(Duration::from_millis(3400)).await;
+            sock.write_all(chunk("data: [DONE]\n\n").as_bytes())
+                .await
+                .unwrap();
+            sock.write_all(b"0\r\n\r\n").await.unwrap();
+        });
+
+        let tailscale = Arc::new(TailscaleClient::new());
+        tailscale.seed_resolved_for_test("100.64.1.2", Some("127.0.0.1".to_string()));
+        let provider = OpenAICompatibleProvider::new(
+            "test",
+            crate::config::ProviderConfig {
+                // Host is a "Tailscale" address so the direct path engages;
+                // the seeded direct address points at the fake above.
+                base_url: format!("http://100.64.1.2:{port}"),
+                ..Default::default()
+            },
+            tailscale,
+        );
+        let messages = vec![serde_json::json!({"role": "user", "content": "hi"})];
+        let stream = provider
+            .chat_completion(messages, None, SamplingParams::default(), None, None)
+            .await
+            .unwrap();
+        let deltas: Vec<Delta> = stream.collect().await;
+        let contents: String = deltas.iter().filter_map(|d| d.content.clone()).collect();
+        assert_eq!(contents, "Hi", "the body must stream past the old 3s cap");
     }
 
     /// A plain, non-Tailscale `base_url` (the common case — everyone not

@@ -23,9 +23,28 @@ const PDF_MAX_PAGES: u32 = 100;
 /// Per-page text cap — an attack/malformed page can otherwise yield an
 /// effectively unbounded extracted string.
 const PDF_MAX_PAGE_CHARS: usize = 50_000;
+/// Hard cap on the PDF file size, checked before `lopdf::Document::load`
+/// (audit #120): `load` reads the whole file into memory, so a giant file
+/// must be rejected at the door. Same pattern as `fs.rs`'s `MAX_FILE_BYTES`.
+const PDF_MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
 fn open(path: &Path) -> Result<lopdf::Document, lopdf::Error> {
     lopdf::Document::load(path)
+}
+
+/// True when the file's metadata size is past `PDF_MAX_FILE_BYTES` — the
+/// check that keeps giant PDFs from being loaded into memory at all.
+fn file_size_exceeds(resolved: &Path) -> bool {
+    std::fs::metadata(resolved).map(|m| m.len() > PDF_MAX_FILE_BYTES).unwrap_or(false)
+}
+
+fn too_large(resolved: &Path) -> String {
+    error_response(
+        "PDF_TOO_LARGE",
+        &format!("File is larger than the {} byte read limit", PDF_MAX_FILE_BYTES),
+        Some(&resolved.to_string_lossy()),
+        Some("Split the PDF, or read a page range from a smaller copy."),
+    )
 }
 
 /// Home boundary shared by both PDF tools — defense-in-depth before any
@@ -67,6 +86,9 @@ pub fn pdf_read_text(
     }
     if !resolved.exists() {
         return error_response("PDF_NOT_FOUND", "PDF does not exist", Some(&resolved.to_string_lossy()), None);
+    }
+    if file_size_exceeds(&resolved) {
+        return too_large(&resolved);
     }
 
     let doc = match open(&resolved) {
@@ -137,6 +159,9 @@ pub fn pdf_read_outline(path: &str) -> String {
     if !resolved.exists() {
         return error_response("PDF_NOT_FOUND", "PDF does not exist", Some(&resolved.to_string_lossy()), None);
     }
+    if file_size_exceeds(&resolved) {
+        return too_large(&resolved);
+    }
 
     let doc = match open(&resolved) {
         Ok(d) => d,
@@ -204,5 +229,26 @@ mod tests {
         let s = "abcde";
         assert_eq!(truncate_chars(s, 3), "abc…");
         assert_eq!(truncate_chars(s, 5), "abcde");
+    }
+
+    #[test]
+    fn oversized_pdf_is_rejected_before_loading() {
+        // Audit #120: `Document::load` reads the whole file into memory; the
+        // size gate must fire first (a 64 MiB write exercises the metadata
+        // check without a valid PDF ever being parsed).
+        let dir = std::env::temp_dir().join(format!("kt-pdf-big-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("big.pdf");
+        std::fs::write(&f, vec![b'x'; (PDF_MAX_FILE_BYTES + 1) as usize]).unwrap();
+
+        let out = pdf_read_text(f.to_str().unwrap(), None, None, None, 0);
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["error_code"], "PDF_TOO_LARGE");
+
+        let out = pdf_read_outline(f.to_str().unwrap());
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["error_code"], "PDF_TOO_LARGE");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

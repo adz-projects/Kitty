@@ -46,9 +46,13 @@ export function CodeBlock({ children }: { children?: ReactNode; node?: unknown }
   const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Clear a pending "Copied" revert on unmount so it never fires across the
   // component boundary (setState-after-unmount warning + a node sitting in
-  // the message list briefly looking copied).
+  // the message list briefly looking copied). The mounted flag covers the
+  // clipboard promise itself resolving after unmount — virtual-list rows
+  // (and their code blocks) are recycled mid-write all the time.
+  const mountedRef = useRef(true);
   useEffect(
     () => () => {
+      mountedRef.current = false;
       if (copyTimerRef.current) clearTimeout(copyTimerRef.current);
     },
     []
@@ -61,6 +65,7 @@ export function CodeBlock({ children }: { children?: ReactNode; node?: unknown }
   const copy = async () => {
     try {
       await navigator.clipboard.writeText(text);
+      if (!mountedRef.current) return;
       setCopied(true);
       if (copyTimerRef.current) clearTimeout(copyTimerRef.current);
       copyTimerRef.current = setTimeout(() => setCopied(false), 1200);

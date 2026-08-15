@@ -3,6 +3,8 @@ import { ipc } from '@/lib/ipc';
 import { useRouteStore } from '@/stores/routeStore';
 import type { Config } from '@/lib/types';
 import { PathFork, type WizardPath } from './PathFork';
+import { SupportModelsStep } from './SupportModelsStep';
+import { isAndroid } from '@/lib/platform';
 import { ApiKeyStep } from './ApiKeyStep';
 import { ConfigureStep } from './ConfigureStep';
 import { ModelDownloadStep } from './ModelDownloadStep';
@@ -10,7 +12,25 @@ import { DoneStep } from './DoneStep';
 import { DEFAULT_URL } from '@/lib/provider_defaults';
 import { defaultFor } from '@/lib/curated_models';
 
-type StepId = 'path' | 'apikey' | 'configure' | 'model' | 'embedding' | 'done';
+type StepId = 'path' | 'apikey' | 'configure' | 'model' | 'embedding' | 'support' | 'done';
+
+/** Android's fixed sequence, with no path fork (docs/ANDROID.md §8.3).
+ *
+ * The desktop fork asks "run models on this computer, or use your own API
+ * key?" — a question with only one real answer on a phone, since Android
+ * never runs chat locally (D18). Offering it would invite the user down a
+ * path that does not exist. What a phone actually needs is both things in
+ * order: the support models Kitty runs itself, then a provider for chat.
+ *
+ * `configure` is dropped too: it sets a default context folder and a global
+ * hotkey, neither of which Android has. */
+export function androidSteps(): { id: StepId; label: string }[] {
+  return [
+    { id: 'support', label: 'Kitty’s models' },
+    { id: 'apikey', label: 'Connect a provider' },
+    { id: 'done', label: 'Done' },
+  ];
+}
 
 export function stepsForPath(
   path: WizardPath | null,
@@ -42,10 +62,14 @@ export function stepsForPath(
   ];
 }
 
-/** First-run wizard (also Settings → Setup & Repair). First screen forks
-    local-vs-API-key; the rest of the flow adapts to whichever the user
-    picked. Repair mode pre-selects the path from the current config and
-    skips straight past the fork. */
+/** First-run wizard (also Settings → Setup & Repair).
+ *
+ * Desktop forks local-vs-API-key on the first screen and adapts the rest of
+ * the flow to the choice. **Android has no fork** — see `androidSteps` — it
+ * downloads Kitty's own support models, then connects a provider.
+ *
+ * Repair mode pre-selects the path from the current config and skips
+ * straight past the fork. */
 export function WizardView() {
   // Mode rides on the route (`routeStore` owns the `route://goto`
   // subscription), so opening Setup & Repair and being deep-linked into repair
@@ -107,6 +131,7 @@ export function WizardView() {
             base_url: DEFAULT_URL.local,
             is_trusted: true,
             strip_reasoning: false,
+            supports_vision: false,
             created_at: '',
           }),
           models: [model.file.replace(/\.gguf$/i, '')],
@@ -149,7 +174,8 @@ export function WizardView() {
     );
   }
 
-  const steps = stepsForPath(path, cfg.adaptive_pathway_enabled);
+  // Android gets a fixed two-step flow; desktop keeps the fork.
+  const steps = isAndroid() ? androidSteps() : stepsForPath(path, cfg.adaptive_pathway_enabled);
   const current = steps[stepIndex]?.id ?? 'path';
 
   const next = () => setStepIndex((i) => Math.min(i + 1, steps.length - 1));
@@ -180,6 +206,7 @@ export function WizardView() {
         ))}
       </div>
 
+      {current === 'support' && <SupportModelsStep onNext={nextAndMark} onSkip={nextAndMark} />}
       {current === 'path' && (
         <PathFork
           mode={mode}
@@ -193,13 +220,7 @@ export function WizardView() {
       )}
       {current === 'apikey' && <ApiKeyStep onBack={back} onNext={nextAndMark} />}
       {current === 'configure' && (
-        <ConfigureStep
-          cfg={cfg}
-          saveCfg={saveCfg}
-          showOllamaEndpoint={false}
-          onBack={back}
-          onNext={nextAndMark}
-        />
+        <ConfigureStep cfg={cfg} saveCfg={saveCfg} onBack={back} onNext={nextAndMark} />
       )}
       {current === 'model' && (
         <ModelDownloadStep

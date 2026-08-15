@@ -48,11 +48,23 @@ impl Database {
                 .create_if_missing(true)
         };
 
+        // `foreign_keys` is a *per-connection* pragma, so the previous
+        // `PRAGMA foreign_keys = ON` run via `execute(&pool)` only ever
+        // reached whichever single connection the pool handed out — it was
+        // never what actually kept 012's `ON DELETE CASCADE` working. What
+        // does is sqlx's own default, which registers the pragma on every
+        // connection it opens (`SqliteConnectOptions::default`). Stating it
+        // here is redundant with that default but load-bearing as
+        // documentation: the cascade delete depends on it, and a future
+        // options rewrite that drops it would break session deletion in a way
+        // that only shows up at runtime.
+        //
+        // `journal_mode = WAL` stays a one-shot below: it is a persistent
+        // database-level property, not a per-connection one.
+        let options = options.foreign_keys(true);
+
         let pool = SqlitePool::connect_with(options).await?;
         sqlx::query("PRAGMA journal_mode = WAL")
-            .execute(&pool)
-            .await?;
-        sqlx::query("PRAGMA foreign_keys = ON")
             .execute(&pool)
             .await?;
         bootstrap_legacy_python_schema(&pool).await?;
@@ -499,6 +511,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_update_indexed_message_reindexes() {
+        // Migration 013, update half. `messages_fts_au_del` used the same
+        // invalid fts5 `'delete'` command as the delete trigger, so editing an
+        // indexed message raised instead of reindexing.
+        let pool = get_test_pool().await;
+        sessions::create_session(&pool, "fts-u", "FTS Update")
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO messages (id, session_id, role, content) \
+             VALUES ('m-u', 'fts-u', 'user', 'before')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query("UPDATE messages SET content = 'after' WHERE id = 'm-u'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // The index followed the edit rather than keeping the stale text.
+        let hits: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'after'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(hits, 1);
+        let stale: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'before'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(stale, 0);
+    }
+
+    #[tokio::test]
+    async fn test_delete_session_with_system_messages() {
+        // Migration 013. Two stacked defects, either of which fails the whole
+        // cascaded DELETE:
+        //
+        //  - the removal triggers used fts5's `'delete'` command, which is
+        //    only valid for external-content/contentless tables — and
+        //    `messages_fts` is an ordinary one. So deleting any *indexed*
+        //    message raised, which is most real conversations.
+        //  - `messages_fts_ad` also lacked the `WHEN role != 'system' AND
+        //    content IS NOT NULL` guard its insert sibling has.
+        //
+        // This session carries all three row shapes at once: indexed, system,
+        // and NULL-content.
+        let pool = get_test_pool().await;
+        sessions::create_session(&pool, "fts-s", "FTS Test")
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO messages (id, session_id, role, content) VALUES \
+             ('m-sys', 'fts-s', 'system', 'you are a helpful assistant'), \
+             ('m-usr', 'fts-s', 'user', 'hello'), \
+             ('m-null', 'fts-s', 'assistant', NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let deleted = sessions::delete_session(&pool, "fts-s").await.unwrap();
+        assert_eq!(deleted, 1);
+
+        let leftover: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE session_id = 'fts-s'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(leftover, 0);
+
+        // The indexed row is gone from the FTS table too — the guard must not
+        // have been widened into "never delete anything from the index".
+        let indexed: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM messages_fts WHERE session_id = 'fts-s'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(indexed, 0);
+    }
+
+    #[tokio::test]
     async fn test_delete_recipe_cascades_schedule_jobs() {
         // Migration 012 added ON DELETE CASCADE to `schedule_jobs.recipe_id` —
         // deleting a still-referenced recipe used to 500.
@@ -793,7 +891,7 @@ mod tests {
             .await
             .unwrap();
 
-        let execs = execution::get_executions_for_recipe(&pool, "sch1")
+        let execs = execution::get_executions_for_recipe(&pool, "sch1", 100)
             .await
             .unwrap();
         assert_eq!(execs.len(), 1);
@@ -803,7 +901,7 @@ mod tests {
         execution::update_execution_status(&pool, "exec1", "completed", Some("All done"), None)
             .await
             .unwrap();
-        let execs = execution::get_executions_for_recipe(&pool, "sch1")
+        let execs = execution::get_executions_for_recipe(&pool, "sch1", 100)
             .await
             .unwrap();
         assert_eq!(execs[0].status, "completed");
@@ -889,4 +987,6 @@ mod tests {
         assert_eq!(recent[0].id, "tim1");
         assert!((recent[0].ttfb_ms.unwrap() - 120.5).abs() < f64::EPSILON);
     }
+
+
 }

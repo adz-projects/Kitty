@@ -12,6 +12,50 @@ use tauri::{AppHandle, Manager};
 use crate::bigtiny::client::{ensure_client, BigTinyClient};
 use crate::state::AppState;
 
+/// How a bundled MCP server is reached on this platform (docs/ANDROID.md
+/// §2.3, D8).
+///
+/// Desktop spawns a bundled `.exe` over stdio. Android **cannot**: Android
+/// 10+ refuses to `exec()` anything in an app-writable directory, which is
+/// why the `InProcess` transport exists at all. There the daemon links the
+/// same crate and `command` carries a *logical name* that
+/// `bigtiny_rust::mcp::builtin::connect` switches on, not a path — the shape
+/// `"pathway"` has always used.
+///
+/// Returns `(transport, command)`. `logical` must match an entry in
+/// `bigtiny_rust::mcp::builtin::BUILTIN_SERVERS`, which the daemon-side test
+/// `every_advertised_builtin_actually_connects` pins.
+fn bundled_transport(logical: &str, exe: &str) -> (String, String) {
+    if cfg!(target_os = "android") {
+        ("in_process".to_string(), logical.to_string())
+    } else {
+        let path =
+            crate::config::bundled_plugin_path(exe).unwrap_or_else(|| logical.to_string());
+        ("stdio".to_string(), path)
+    }
+}
+
+/// Hand a setting to an in-process MCP server.
+///
+/// `builtin::connect` takes no env map — a linked server reads the *daemon's*
+/// process environment, which on Android is our own. So a value that travels
+/// in `McpServerSpec::env` on desktop has to be set here instead, or it
+/// silently never arrives.
+///
+/// Returns the env map to attach to the spec: populated on desktop (where a
+/// child process needs it), empty on Android (where it would be ignored).
+#[allow(unused_variables)]
+fn server_env(pairs: Vec<(String, String)>) -> HashMap<String, String> {
+    if cfg!(target_os = "android") {
+        for (key, value) in pairs {
+            std::env::set_var(key, value);
+        }
+        HashMap::new()
+    } else {
+        pairs.into_iter().collect()
+    }
+}
+
 /// A BigTiny MCP server row, with the JSON-string `args`/`env` columns
 /// parsed into structured data for the frontend.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -222,7 +266,17 @@ async fn remove_retired_builtins(client: &BigTinyClient) {
     }
 }
 
+/// Several triggers can run `ensure_builtin_servers` concurrently — the
+/// startup `sync_mcp_once_healthy`, the health loop's periodic self-heal,
+/// and user Settings toggles. Each pass is list-then-create per builtin row,
+/// and the daemon's `mcp_servers.name` column has no UNIQUE constraint, so
+/// two racing passes can both observe "no row" and both create → permanent
+/// duplicate builtin servers. Serialize the passes process-wide; each is a
+/// few quick localhost REST calls, so queueing behind one is cheap.
+static ENSURE_BUILTIN_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 pub async fn ensure_builtin_servers(app: &AppHandle) {
+    let _guard = ENSURE_BUILTIN_MUTEX.lock().await;
     let Ok(client) = ensure_client(app) else {
         return;
     };
@@ -298,24 +352,31 @@ pub async fn ensure_builtin_servers(app: &AppHandle) {
     // short-circuits any download. Best-effort: if the resource isn't
     // resolvable the var is left unset and the guest falls back to its normal
     // install/download path.
-    let kitty_wasm_cmd = crate::config::bundled_plugin_path("kitty-wasm.exe")
-        .unwrap_or_else(|| "kitty-wasm".to_string());
-    let mut kitty_wasm_env = HashMap::new();
+    //
+    // Android is exactly that fallback case, deliberately: `resource_dir()`
+    // there is an asset URI, not a filesystem path, so `is_file()` is false
+    // and the guest is not shipped. Packaging it as an asset would add 11 MB
+    // compressed to the AAB for a file nothing could open without an
+    // extract-to-app-storage step that does not exist yet — so the Python
+    // tool downloads on first use instead. See docs/BACKLOG.md.
+    let (kitty_wasm_transport, kitty_wasm_cmd) = bundled_transport("kitty-wasm", "kitty-wasm.exe");
+    let mut kitty_wasm_pairs = Vec::new();
     if let Ok(res) = app.path().resource_dir() {
         let guest = res.join("python-3.12.0.wasm");
         if guest.is_file() {
-            kitty_wasm_env.insert(
+            kitty_wasm_pairs.push((
                 "KITTY_WASM_PYTHON".to_string(),
                 guest.to_string_lossy().into_owned(),
-            );
+            ));
         }
     }
+    let kitty_wasm_env = server_env(kitty_wasm_pairs);
     upsert_builtin(
         &client,
         "kitty-wasm",
         &McpServerSpec {
             name: "kitty-wasm".to_string(),
-            transport: "stdio".to_string(),
+            transport: kitty_wasm_transport,
             command: Some(kitty_wasm_cmd),
             args: vec![],
             url: None,
@@ -336,18 +397,19 @@ pub async fn ensure_builtin_servers(app: &AppHandle) {
     // tools from the router at startup rather than registering them and
     // failing at call time" design in `plugins/kitty-tools/src/server.rs`.
     // Web search does NOT live here — see the `kitty-web` block below.
-    let kitty_tools_cmd = crate::config::bundled_plugin_path("kitty-tools.exe")
-        .unwrap_or_else(|| "kitty-tools".to_string());
-    let mut kitty_tools_env = HashMap::new();
+    let (kitty_tools_transport, kitty_tools_cmd) =
+        bundled_transport("kitty-tools", "kitty-tools.exe");
+    let mut kitty_tools_pairs = Vec::new();
     if visualizations_enabled {
-        kitty_tools_env.insert("KITTY_VIZ_ENABLED".to_string(), "1".to_string());
+        kitty_tools_pairs.push(("KITTY_VIZ_ENABLED".to_string(), "1".to_string()));
     }
+    let kitty_tools_env = server_env(kitty_tools_pairs);
     upsert_builtin(
         &client,
         "kitty-tools",
         &McpServerSpec {
             name: "kitty-tools".to_string(),
-            transport: "stdio".to_string(),
+            transport: kitty_tools_transport,
             command: Some(kitty_tools_cmd),
             args: vec![],
             url: None,
@@ -366,9 +428,8 @@ pub async fn ensure_builtin_servers(app: &AppHandle) {
     // together for broader ones, and an offloaded/indexed mode for large
     // ones. `BRAVE_API_KEY` attaches to *this* server's env map so
     // `lean_web_search` can prefer Brave when configured.
-    let kitty_web_cmd = crate::config::bundled_plugin_path("kitty-web.exe")
-        .unwrap_or_else(|| "kitty-web".to_string());
-    let mut kitty_web_env = HashMap::new();
+    let (kitty_web_transport, kitty_web_cmd) = bundled_transport("kitty-web", "kitty-web.exe");
+    let mut kitty_web_pairs = Vec::new();
 
     // The API key is never read from config (see `brave_mcp_search_enabled`'s
     // doc comment) — only from the keyring, under a fixed id shared with
@@ -388,14 +449,15 @@ pub async fn ensure_builtin_servers(app: &AppHandle) {
         Ok(brave_api_key) => {
             let brave_api_key = brave_api_key.unwrap_or_default();
             if brave_search_enabled && !brave_api_key.is_empty() {
-                kitty_web_env.insert("BRAVE_API_KEY".to_string(), brave_api_key);
+                kitty_web_pairs.push(("BRAVE_API_KEY".to_string(), brave_api_key));
             }
+            let kitty_web_env = server_env(kitty_web_pairs);
             upsert_builtin(
                 &client,
                 "kitty-web",
                 &McpServerSpec {
                     name: "kitty-web".to_string(),
-                    transport: "stdio".to_string(),
+                    transport: kitty_web_transport,
                     command: Some(kitty_web_cmd),
                     args: vec![],
                     url: None,

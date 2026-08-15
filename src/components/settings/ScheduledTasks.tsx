@@ -137,12 +137,20 @@ export function ScheduledTasks() {
     try {
       const cwd = form.cwd.trim() || null;
       const modelId = form.modelId.trim() || null;
+      // The backend deserializes `interval_secs` as a u64: a fractional
+      // amount (1.1 minutes → 66.000…01) is rejected with a cryptic serde
+      // error, and anything under a minute is more heat than light for a
+      // background agent task — round to whole seconds and clamp at 60.
+      const intervalSecs = Math.max(
+        60,
+        Math.round(form.intervalAmount * UNIT_SECONDS[form.intervalUnit])
+      );
       const schedule: Schedule =
         form.kind === 'one_shot'
           ? { kind: 'one_shot' }
           : {
               kind: 'recurring',
-              interval_secs: form.intervalAmount * UNIT_SECONDS[form.intervalUnit],
+              interval_secs: intervalSecs,
             };
       if (form.kind === 'one_shot') {
         // The datetime-local input is user-editable and can be cleared to ''
@@ -158,9 +166,7 @@ export function ScheduledTasks() {
       const nextFire =
         form.kind === 'one_shot'
           ? new Date(form.oneShotAt).toISOString()
-          : new Date(
-              Date.now() + form.intervalAmount * UNIT_SECONDS[form.intervalUnit] * 1000
-            ).toISOString();
+          : new Date(Date.now() + intervalSecs * 1000).toISOString();
 
       if (editing === 'new') {
         await ipc.createScheduledTask(name, prompt, cwd, modelId, schedule, nextFire);
@@ -324,6 +330,7 @@ export function ScheduledTasks() {
                 <input
                   type="number"
                   min={1}
+                  step={1}
                   value={form.intervalAmount}
                   onChange={(e) =>
                     setForm({ ...form, intervalAmount: Math.max(1, Number(e.target.value)) })

@@ -17,11 +17,28 @@ use crate::state::AppState;
 /// `config/providers/env.rs`).
 pub(crate) fn bigtiny_provider_target(profile: &ProviderProfile) -> (String, String) {
     if profile.provider_type == "anthropic" {
-        return ("anthropic".to_string(), profile.base_url.clone());
+        return ("anthropic".to_string(), normalize_scheme(&profile.base_url));
     }
-    let base = profile.base_url.trim_end_matches('/');
+    let base = normalize_scheme(&profile.base_url);
+    let base = base.trim_end_matches('/');
     let base = base.strip_suffix("/v1").unwrap_or(base);
     ("openai_compat".to_string(), base.to_string())
+}
+
+/// Prepend `http://` to a scheme-less base URL. Kitty's own connection probe
+/// tolerates a bare `host:port` by fanning out https-then-http
+/// (`config/providers/endpoint::candidates`), but the daemon's HTTP client
+/// gets one URL and can't build a request from a scheme-less authority — a
+/// self-hosted `192.168.1.199:8081` would silently never connect. `http` (not
+/// `https`) for a bare host:port: these are LAN/self-hosted endpoints; a user
+/// wanting TLS types `https://` explicitly.
+fn normalize_scheme(base_url: &str) -> String {
+    let trimmed = base_url.trim();
+    if trimmed.contains("://") {
+        trimmed.to_string()
+    } else {
+        format!("http://{trimmed}")
+    }
 }
 
 /// Ensure Kitty's active provider profile exists (and is current) in
@@ -103,17 +120,38 @@ pub async fn sync_active_provider(app: &AppHandle) -> Result<Option<String>, Str
 
     let client = ensure_client(app)?;
     let existing = client.get_json("/api/providers").await?;
-    let found: Option<String> = existing
-        .get("providers")
-        .and_then(|p| p.as_array())
-        .and_then(|rows| {
+    let rows = existing.get("providers").and_then(|p| p.as_array());
+    // Match by the Kitty profile id — the daemon now stores its provider row
+    // under exactly this id (see `create_provider`'s optional `id`), so the
+    // session's `metadata.provider` stamp (also the profile id) resolves here
+    // instead of missing the registry and falling back to another provider.
+    let found: bool = rows
+        .map(|rows| {
             rows.iter()
-                .find(|r| r.get("name").and_then(|n| n.as_str()) == Some(profile.name.as_str()))
+                .any(|r| r.get("id").and_then(|i| i.as_str()) == Some(profile.id.as_str()))
         })
-        .and_then(|r| r.get("id").and_then(|i| i.as_str()).map(String::from));
+        .unwrap_or(false);
+    // Legacy rows created before id-unification carry a daemon-generated UUID
+    // but the same name — delete them so the router isn't left with a stale,
+    // demoted duplicate the session id can never reach.
+    if !found {
+        if let Some(rows) = rows {
+            for r in rows {
+                let same_name =
+                    r.get("name").and_then(|n| n.as_str()) == Some(profile.name.as_str());
+                let other_id = r.get("id").and_then(|i| i.as_str());
+                if same_name && other_id != Some(profile.id.as_str()) {
+                    if let Some(stale) = other_id {
+                        let _ = client.delete(&format!("/api/providers/{stale}")).await;
+                    }
+                }
+            }
+        }
+    }
 
-    let id = match found {
-        Some(id) => {
+    let id = if found {
+        {
+            let id = profile.id.clone();
             let mut body =
                 json!({ "base_url": base_url, "config": config, "fallback_priority": 1 });
             // Explicit `null`, not an omitted field, when there's no key —
@@ -130,24 +168,26 @@ pub async fn sync_active_provider(app: &AppHandle) -> Result<Option<String>, Str
                 .await?;
             id
         }
-        None => {
-            let mut body = json!({
-                "name": profile.name,
-                "provider_type": provider_type,
-                "base_url": base_url,
-                "fallback_priority": 1,
-                "config": config,
-            });
-            if let Some(key) = &api_key {
-                body["api_key"] = Value::String(key.clone());
-            }
-            let created = client.post_json("/api/providers", &body).await?;
-            created
-                .get("id")
-                .and_then(|i| i.as_str())
-                .ok_or("BigTiny did not return a provider id")?
-                .to_string()
+    } else {
+        // Pin the daemon row's id to the Kitty profile id so the session
+        // provider stamp resolves against it (see `create_provider`).
+        let mut body = json!({
+            "id": profile.id,
+            "name": profile.name,
+            "provider_type": provider_type,
+            "base_url": base_url,
+            "fallback_priority": 1,
+            "config": config,
+        });
+        if let Some(key) = &api_key {
+            body["api_key"] = Value::String(key.clone());
         }
+        let created = client.post_json("/api/providers", &body).await?;
+        created
+            .get("id")
+            .and_then(|i| i.as_str())
+            .ok_or("BigTiny did not return a provider id")?
+            .to_string()
     };
 
     demote_others(&client, &id).await;
@@ -262,6 +302,7 @@ mod tests {
             max_tokens: None,
             context_length: None,
             strip_reasoning: false,
+            supports_vision: false,
             system_prompt: None,
             prompt_idle_timeout_secs: None,
             parallel_slots: None,
@@ -289,5 +330,25 @@ mod tests {
         let (t, url) = bigtiny_provider_target(&profile("ollama", "http://localhost:11434"));
         assert_eq!(t, "openai_compat");
         assert_eq!(url, "http://localhost:11434");
+    }
+
+    #[test]
+    fn scheme_less_base_url_gets_http_prepended() {
+        let (t, url) = bigtiny_provider_target(&profile("custom_openai", "192.168.1.199:8081"));
+        assert_eq!(t, "openai_compat");
+        assert_eq!(url, "http://192.168.1.199:8081");
+    }
+
+    #[test]
+    fn explicit_https_scheme_is_preserved() {
+        let (_, url) = bigtiny_provider_target(&profile("custom_openai", "https://box.ts.net:8081"));
+        assert_eq!(url, "https://box.ts.net:8081");
+    }
+
+    #[test]
+    fn scheme_less_anthropic_gets_http_prepended() {
+        let (t, url) = bigtiny_provider_target(&profile("anthropic", "api.anthropic.com"));
+        assert_eq!(t, "anthropic");
+        assert_eq!(url, "http://api.anthropic.com");
     }
 }

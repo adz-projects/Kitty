@@ -6,13 +6,11 @@ import { accelerator } from '@/lib/accelerator';
 export function ConfigureStep({
   cfg,
   saveCfg,
-  showOllamaEndpoint,
   onBack,
   onNext,
 }: {
   cfg: Config;
   saveCfg: (patch: Partial<Config>) => Promise<void>;
-  showOllamaEndpoint: boolean;
   onBack: () => void;
   onNext: () => void;
 }) {
@@ -43,17 +41,6 @@ export function ConfigureStep({
         </button>
         <small className="muted">Press this any time to open Kitty from anywhere.</small>
       </label>
-
-      {showOllamaEndpoint && (
-        <label className="field">
-          <span>Ollama address</span>
-          <input
-            value={cfg.ollama_base_url}
-            onChange={(e) => void saveCfg({ ollama_base_url: e.target.value })}
-          />
-          <small className="muted">Leave this alone unless Ollama runs somewhere unusual.</small>
-        </label>
-      )}
 
       <label className="field">
         <span>Where should Kitty save files it creates for you?</span>

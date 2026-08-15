@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { ipc, onModelProgress, onModelsChanged } from '@/lib/ipc';
 import { CURATED_MODELS } from '@/lib/curated_models';
 import { LocalEngineSettings } from './LocalEngineSettings';
+import { isAndroid } from '@/lib/platform';
 import type { DownloadProgress, LocalModel } from '@/lib/types';
 
 /** Bytes as a short human string. Exported for testing — the repo has no
@@ -94,10 +95,13 @@ export function LocalModels() {
 
   return (
     <div className="settings-section">
-      <h1>Local Models</h1>
+      {/* The nav entry already says which section this is, and on Android it
+          says something different ("Support Models"), so repeating a
+          hardcoded title here would contradict it. */}
       <p className="muted">
-        Models run inside Kitty — no separate server to install or keep running. Downloads come from
-        Hugging Face.
+        {isAndroid()
+          ? 'Kitty runs these itself, in the background — they summarise long conversations and power memory. Chat runs through the provider you connect. Downloads come from Hugging Face.'
+          : 'Models run inside Kitty — no separate server to install or keep running. Downloads come from Hugging Face.'}
       </p>
 
       {error && <div className="chat-error">{error}</div>}

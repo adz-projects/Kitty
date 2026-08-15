@@ -289,6 +289,20 @@ impl Db {
         Ok(rows.into_iter().map(map_belief).collect())
     }
 
+    /// The `limit` most-recently-touched beliefs across all layers. Backs
+    /// `store::contradictions::run_contradiction_pass`, whose O(n²) pairwise
+    /// scan must be bounded the same way `list_recall_candidates` bounds the
+    /// recall hot path (audit #131).
+    pub async fn list_recent_beliefs(&self, limit: i64) -> Result<Vec<Belief>> {
+        let rows = sqlx::query_as::<_, BeliefRow>(
+            "SELECT * FROM beliefs ORDER BY updated_at DESC LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows.into_iter().map(map_belief).collect())
+    }
+
     /// Conversation-layer beliefs owned by exactly this session. Used by
     /// consolidation, which must never touch another session's still-fast-
     /// decaying conversation memory.
@@ -371,6 +385,10 @@ impl Db {
     /// matching genuinely is the right tool, using a real embedding supplied
     /// by the caller.
     pub async fn best_text_match(&self, what: &str) -> Result<Option<String>> {
+        // An empty needle contains-matches every belief (audit #116).
+        if what.trim().is_empty() {
+            return Ok(None);
+        }
         let what_lower = what.to_lowercase();
         let all = self.list_beliefs(None).await?;
         Ok(all
@@ -510,5 +528,17 @@ mod tests {
         let ids: std::collections::HashSet<&str> = candidates.iter().map(|b| b.id.as_str()).collect();
         assert!(!ids.contains("b0"), "the oldest belief must be dropped once over the cap");
         assert!(ids.contains("b509"), "the newest belief must survive the cap");
+    }
+
+    #[tokio::test]
+    async fn best_text_match_ignores_an_empty_needle() {
+        // Audit #116: `contains("")` is true for every belief, so an empty
+        // needle resolved to the first row in the table.
+        let db = crate::store::Db::open_in_memory().await.unwrap();
+        db.insert_belief(&belief("b1", Utc::now())).await.unwrap();
+        assert_eq!(db.best_text_match("").await.unwrap(), None);
+        assert_eq!(db.best_text_match("   ").await.unwrap(), None);
+        // A real needle still resolves.
+        assert_eq!(db.best_text_match("belief b1").await.unwrap().as_deref(), Some("b1"));
     }
 }

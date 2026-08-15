@@ -13,15 +13,13 @@ save a file, use a relative path inside the working directory rather than an abs
 elsewhere. Be direct about assumptions and uncertainty rather than glossing over them, and
 prefer verifiable action (running a command, reading a file, writing output) over speculation.`;
 
-export const CHAT_SYSTEM_PROMPT = `You are a thoughtful conversational partner in a chat-only
-("thought partner") session. Don't assume you have reliable filesystem or shell access, and
-don't instruct the user to run a command as though you already ran it yourself — if a tool
-call doesn't actually succeed, say so. Focus on reasoning, explanation, and drafting directly
-in your reply text. Treat any document content the user has shared as already provided to you
-inline, not as something you need to go fetch.`;
-
-/** Picks the built-in default for the given mode. Overridden per-provider by
-    `ProviderProfile.system_prompt` when set. */
-export function defaultSystemPrompt(chatOnly: boolean): string {
-  return chatOnly ? CHAT_SYSTEM_PROMPT : AGENTIC_SYSTEM_PROMPT;
+/** The built-in default. Overridden per-provider by
+    `ProviderProfile.system_prompt` when set.
+    There used to be a second, chat-only prompt selected by the per-session
+    chat/agentic toggle. That toggle is gone, and with it the reason to tell
+    the model it might not have tools: whether it does is now the provider's
+    property, not a mode the user set, and a provider that can't call tools
+    simply never gets any in its request. */
+export function defaultSystemPrompt(): string {
+  return AGENTIC_SYSTEM_PROMPT;
 }

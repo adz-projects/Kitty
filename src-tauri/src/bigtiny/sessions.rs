@@ -11,15 +11,20 @@ use crate::bigtiny::client::{ensure_client, BigTinyClient};
 use crate::commands::{ModeInfo, SessionInfo};
 
 /// BigTiny has no ACP-style modes handshake — HITL policy lives server-side
-/// and the chat/agentic override is client-side either way. A fixed
-/// `SessionInfo` keeps the frontend's shape expectations satisfied.
-fn session_info(session_id: String, cwd: String) -> SessionInfo {
+/// and the chat/agentic override is client-side either way. The one live field
+/// is `thinking_effort`, derived from the active provider's capability so the
+/// dropdown appears only where the provider actually accepts an effort control
+/// (see `bigtiny::effort`); everything else is fixed.
+fn session_info(app: &AppHandle, session_id: String, cwd: String) -> SessionInfo {
+    let thinking_effort = crate::bigtiny::effort::thinking_effort_for(app, &session_id);
+    let is_default_folder = crate::commands::is_default_folder(app, &cwd);
     SessionInfo {
         session_id,
         cwd,
         current_mode: "approve".to_string(),
         available_modes: Vec::<ModeInfo>::new(),
-        thinking_effort: None,
+        thinking_effort,
+        is_default_folder,
     }
 }
 
@@ -36,12 +41,15 @@ fn session_info(session_id: String, cwd: String) -> SessionInfo {
 pub async fn create(
     app: &AppHandle,
     cwd: String,
-    mode: Option<String>,
     provider: Option<String>,
     model: Option<String>,
 ) -> Result<SessionInfo, String> {
     let client = ensure_client(app)?;
-    let mut body = json!({ "cwd": cwd, "mode": mode });
+    // Always "agentic". The daemon's only use of `mode` is whether to add the
+    // session's `cwd` to the sandbox's allowed set, and Kitty no longer has a
+    // chat/agentic distinction to withhold it for — a session's own working
+    // directory is the one place it should always be able to reach.
+    let mut body = json!({ "cwd": cwd, "mode": "agentic" });
     if provider.is_some() {
         body["provider"] = json!(provider);
     }
@@ -55,24 +63,9 @@ pub async fn create(
         .ok_or("BigTiny did not return a session id")?
         .to_string();
     let _ = app.emit("session://created", json!({ "sessionId": session_id }));
-    Ok(session_info(session_id, cwd))
+    Ok(session_info(app, session_id, cwd))
 }
 
-/// Update a session's chat/agentic mode after creation (`PATCH
-/// /api/chat/{id}/config`) — called whenever the user flips `ModeToggle`.
-/// Without this, a session created in chat mode and later switched to
-/// agentic would keep BigTiny's directory-sandboxing scoped to chat mode's
-/// narrower allowance until the next full session recreation.
-pub async fn update_mode(app: &AppHandle, session_id: &str, mode: &str) -> Result<(), String> {
-    let client = ensure_client(app)?;
-    client
-        .patch_json(
-            &format!("/api/chat/{session_id}/config"),
-            &json!({ "mode": mode }),
-        )
-        .await?;
-    Ok(())
-}
 
 /// Repoint a session's *current* working directory ("Set as working
 /// directory", agentic mode only) — mutates the session in place rather
@@ -88,6 +81,19 @@ pub async fn update_cwd(app: &AppHandle, session_id: &str, cwd: &str) -> Result<
         )
         .await?;
     Ok(())
+}
+
+/// Repoint a session back to a private per-chat folder ("return to thought
+/// partner") and return the refreshed `SessionInfo` (so the caller sees the
+/// new cwd and `is_default_folder: true`). `cwd` is a fresh per-chat folder
+/// from `resolve_cwd`; this only PATCHes the session and rebuilds the info.
+pub async fn reset_cwd(
+    app: &AppHandle,
+    session_id: &str,
+    cwd: String,
+) -> Result<SessionInfo, String> {
+    update_cwd(app, session_id, &cwd).await?;
+    Ok(session_info(app, session_id.to_string(), cwd))
 }
 
 /// Set a session's custom/default persona (`PATCH /api/chat/{id}/config`).
@@ -116,16 +122,41 @@ pub async fn update_persona_override(
     Ok(())
 }
 
+/// Hand a session's reasoning-effort choice to the daemon
+/// (`PATCH /api/chat/{id}/config`, shallow-merged into metadata). The agent
+/// loop reads `thinking_effort` beside `sampling_preset` and translates it per
+/// provider dialect at send time — exactly the same transport `sampling_preset`
+/// already uses, so no new route is involved.
+pub async fn update_thinking_effort(
+    app: &AppHandle,
+    session_id: &str,
+    value: &str,
+) -> Result<(), String> {
+    let client = ensure_client(app)?;
+    client
+        .patch_json(
+            &format!("/api/chat/{session_id}/config"),
+            &json!({ "thinking_effort": value }),
+        )
+        .await?;
+    Ok(())
+}
+
 /// Manual context compaction (`/compact`): `POST /api/chat/{id}/compact`
 /// forces the daemon to fold the session's oldest un-compacted exchanges
 /// into memory, bypassing the automatic token threshold. Returns the
 /// daemon's `{compacted, messages_compacted, tokens_before, tokens_after}`
 /// so the UI can report what actually happened (or `{compacted: false}` when
 /// there was nothing to fold).
+///
+/// Goes through the long-timeout request variant: the daemon answers this
+/// POST only *after* running a full LLM summarization — minutes on a cold
+/// local-model load, which used to blow straight through the 10s default
+/// (the client gave up while the daemon kept working).
 pub async fn compact(app: &AppHandle, session_id: &str) -> Result<Value, String> {
     let client = ensure_client(app)?;
     client
-        .post_json(&format!("/api/chat/{session_id}/compact"), &json!({}))
+        .post_json_long(&format!("/api/chat/{session_id}/compact"), &json!({}))
         .await
 }
 
@@ -141,9 +172,17 @@ pub async fn get_stats(app: &AppHandle, session_id: &str) -> Result<Value, Strin
 }
 
 /// List sessions, translated to the goosed raw shape the frontend parses.
+/// Capped at the 200 most recent — the sidebar's usable window.
 pub async fn list(app: &AppHandle) -> Result<Vec<Value>, String> {
+    list_with_limit(app, 200).await
+}
+
+/// [`list`] with an explicit daemon-side `limit`, for callers resolving one
+/// specific session that may be older than the default 200-session window
+/// (`windows::focus_or_open_session`'s cwd lookup retries through this).
+pub async fn list_with_limit(app: &AppHandle, limit: u32) -> Result<Vec<Value>, String> {
     let client = ensure_client(app)?;
-    let result = client.get_json("/api/chat/?limit=200").await?;
+    let result = client.get_json(&format!("/api/chat/?limit={limit}")).await?;
     Ok(result
         .get("sessions")
         .and_then(|s| s.as_array())
@@ -185,9 +224,13 @@ pub(crate) fn translate_session_row(row: &Value) -> Value {
 }
 
 /// Full message history for a session, oldest-first.
+///
+/// Long-timeout variant: `limit=10000` can mean a multi-megabyte payload on
+/// a long-lived session, and the 10s default used to make resuming one fail
+/// client-side while the daemon was still serializing.
 async fn fetch_history(client: &BigTinyClient, session_id: &str) -> Result<Vec<Value>, String> {
     let result = client
-        .get_json(&format!("/api/chat/{session_id}/history?limit=10000"))
+        .get_json_long(&format!("/api/chat/{session_id}/history?limit=10000"))
         .await?;
     result
         .as_array()
@@ -270,7 +313,7 @@ pub async fn load(app: &AppHandle, session_id: String, cwd: String) -> Result<Se
         }
     }
 
-    Ok(session_info(session_id, cwd))
+    Ok(session_info(app, session_id, cwd))
 }
 
 /// Pure: an assistant row's stored `tool_calls` JSON -> replayable
@@ -319,7 +362,7 @@ pub async fn fork(
     let at_message_id = match truncate_from {
         Some(keep) => {
             let rows = fetch_history(&client, &session_id).await?;
-            truncate_target(&rows, keep)
+            truncate_target(&rows, keep)?
         }
         None => None,
     };
@@ -336,7 +379,7 @@ pub async fn fork(
         .ok_or("BigTiny fork did not return a session id")?
         .to_string();
     let _ = app.emit("session://created", json!({ "sessionId": new_id }));
-    Ok(session_info(new_id, cwd))
+    Ok(session_info(app, new_id, cwd))
 }
 
 /// Pure: map "keep the first `keep` UI bubbles" onto the id of the last
@@ -347,11 +390,19 @@ pub async fn fork(
 /// opens a new user bubble; a contiguous run of `assistant`/`tool` rows after
 /// it is ONE assistant bubble (deltas and tool cards append to the open
 /// message until the next user turn); `system` rows are invisible and attach
-/// to whatever bubble is open. Returns `None` when `keep` covers the whole
-/// history (fork copies everything).
-pub(crate) fn truncate_target(rows: &[Value], keep: i64) -> Option<String> {
+/// to whatever bubble is open. Returns `Ok(None)` when `keep` covers the
+/// whole history (fork copies everything).
+///
+/// `keep <= 0` is an **error**, not "copy everything": the daemon's fork has
+/// no empty-copy form (`at_message_id` keeps every row up to and including
+/// the cutoff, so any real message id keeps at least that message), and
+/// mapping 0 to `None` used to silently duplicate the entire history.
+pub(crate) fn truncate_target(rows: &[Value], keep: i64) -> Result<Option<String>, String> {
     if keep <= 0 {
-        return None;
+        return Err(
+            "branching needs at least one message kept — pick a message to branch from, or fork the whole chat"
+                .into(),
+        );
     }
     let mut bubble: i64 = 0;
     let mut in_assistant_run = false;
@@ -381,9 +432,9 @@ pub(crate) fn truncate_target(rows: &[Value], keep: i64) -> Option<String> {
         }
     }
     if truncated {
-        last_kept_id
+        Ok(last_kept_id)
     } else {
-        None // keep >= total bubbles: copy the whole history
+        Ok(None) // keep >= total bubbles: copy the whole history
     }
 }
 
@@ -480,12 +531,12 @@ mod tests {
             row("m5", "assistant"),
         ];
         // keep 2 bubbles = first user turn + its whole assistant run
-        assert_eq!(truncate_target(&rows, 2), Some("m3".to_string()));
+        assert_eq!(truncate_target(&rows, 2), Ok(Some("m3".to_string())));
         // keep 1 bubble = just the first user message
-        assert_eq!(truncate_target(&rows, 1), Some("m0".to_string()));
+        assert_eq!(truncate_target(&rows, 1), Ok(Some("m0".to_string())));
         // keep everything -> no truncation marker
-        assert_eq!(truncate_target(&rows, 4), None);
-        assert_eq!(truncate_target(&rows, 99), None);
+        assert_eq!(truncate_target(&rows, 4), Ok(None));
+        assert_eq!(truncate_target(&rows, 99), Ok(None));
     }
 
     #[test]
@@ -497,6 +548,17 @@ mod tests {
             row("m3", "user"),
         ];
         // keep 2 = user + assistant run; the interleaved system row rides along
-        assert_eq!(truncate_target(&rows, 2), Some("m2".to_string()));
+        assert_eq!(truncate_target(&rows, 2), Ok(Some("m2".to_string())));
+    }
+
+    /// Regression (815bugs #23): `keep <= 0` used to map to `None` — "copy
+    /// the entire history" — so forking with a bubble count of 0 silently
+    /// duplicated everything. The daemon has no empty-fork form, so this is
+    /// an explicit error now.
+    #[test]
+    fn truncate_rejects_zero_and_negative_instead_of_full_copying() {
+        let rows = vec![row("m0", "user"), row("m1", "assistant")];
+        assert!(truncate_target(&rows, 0).is_err());
+        assert!(truncate_target(&rows, -3).is_err());
     }
 }

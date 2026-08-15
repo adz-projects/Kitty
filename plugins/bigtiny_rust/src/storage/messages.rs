@@ -96,7 +96,12 @@ pub async fn save_messages(
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)"#
             )
             .bind(&msg.id)
-            .bind(&msg.session_id)
+            // Bind the *function parameter*, not `msg.session_id`: the dedupe
+            // lookup above is scoped to `session_id`, so a row carrying a
+            // different session_id would both escape dedupe and land in the
+            // wrong session. The parameter is where the caller said this
+            // batch belongs.
+            .bind(session_id)
             .bind(&msg.role)
             .bind(&msg.content)
             .bind(&msg.tool_calls)
@@ -193,8 +198,9 @@ pub async fn get_first_user_message(
 /// The BM25 relevance gate is deliberately **not** applied here: scores are
 /// returned raw so the caller can `tracing::debug!` every candidate (the
 /// empirical dataset the `bm25_threshold` tuning is meant to collect) and
-/// reject below-bar matches in code. FTS5 BM25 scores are negative, closer to
-/// 0.0 = more relevant.
+/// reject below-bar matches in code. FTS5 BM25 scores are negative, and MORE
+/// NEGATIVE = MORE relevant (best matches sort first under `ORDER BY rank
+/// ASC`) — the gate keeps `score <= t`, never the reverse.
 pub async fn best_compacted_matches(
     pool: &SqlitePool,
     session_id: &str,

@@ -432,10 +432,13 @@ async fn cancel_on_an_idle_session_is_a_no_op_and_marks_it_idle() {
 }
 
 #[tokio::test]
-async fn approve_with_an_unknown_action_id_is_rejected_not_a_server_error() {
+async fn approve_for_an_action_not_pending_on_this_session_is_a_404() {
     let state = test_state().await;
     let app = create_router(state);
 
+    // The action id isn't pending for the path session (here: at all), and
+    // the route must reject that as a 404 — never resolve another session's
+    // pending action, and never a 500 (815bugs #103).
     let resp = app
         .oneshot(
             axum::http::Request::builder()
@@ -449,9 +452,7 @@ async fn approve_with_an_unknown_action_id_is_rejected_not_a_server_error() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), axum::http::StatusCode::OK);
-    let decision = body_json(resp).await;
-    assert_eq!(decision["action"], "rejected");
+    assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
@@ -547,7 +548,7 @@ async fn fork_remaps_the_compaction_boundary_to_the_new_sessions_own_rowids() {
 #[tokio::test]
 async fn create_recipe_then_execute_it_creates_a_session() {
     let state = test_state().await;
-    let app = create_router(state);
+    let app = create_router(state.clone());
 
     let create_resp = app
         .clone()
@@ -580,9 +581,22 @@ async fn create_recipe_then_execute_it_creates_a_session() {
         )
         .await
         .unwrap();
-    assert_eq!(exec_resp.status(), axum::http::StatusCode::OK);
-    let executed = body_json(exec_resp).await;
-    assert!(executed["session_id"].as_str().is_some());
+    // 815bugs #91: with no healthy providers the turn fails, and that
+    // outcome is now propagated — the route answers 500 instead of the old
+    // swallow-and-200. The recipe's session row is still created (it holds
+    // the failed run's trail), which is what this test originally pinned.
+    assert_eq!(
+        exec_resp.status(),
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+    );
+    let err = body_json(exec_resp).await;
+    assert!(err["error"].as_str().unwrap().contains("turn failed"));
+    let sessions: Vec<String> = sqlx::query_scalar("SELECT id FROM sessions WHERE name = ?")
+        .bind("smoke test recipe")
+        .fetch_all(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(sessions.len(), 1, "recipe session row must still be created");
 }
 
 #[tokio::test]
@@ -609,9 +623,10 @@ async fn create_schedule_then_run_now_executes_its_recipe() {
         .unwrap()
         .to_string();
 
-    // `enabled: false` skips live cron registration (no need to get a valid
-    // cron expression right for this test) while still exercising storage +
-    // `run_now`, which doesn't check the enabled flag.
+    // `enabled: true` so `execute_job`'s disabled-guard lets the run
+    // through (a disabled schedule is never executed, not even via
+    // `run_now`). The scheduler itself is never started in this harness, so
+    // the registered cron never fires on its own.
     let schedule_resp = app
         .clone()
         .oneshot(
@@ -624,7 +639,7 @@ async fn create_schedule_then_run_now_executes_its_recipe() {
                         "name": "nightly",
                         "cron": "0 0 * * *",
                         "recipe_id": recipe_id,
-                        "enabled": false
+                        "enabled": true
                     })
                     .to_string(),
                 ))
@@ -1103,4 +1118,99 @@ async fn pathway_set_paused_round_trip() {
     let body = body_json(resp).await;
     assert_eq!(body["session_id"], "s1");
     assert_eq!(body["paused"], true);
+}
+
+/// Regression (815bugs #82): axum's default `DefaultBodyLimit` is 2 MiB,
+/// which a chat send carrying base64 screenshots blows past — the router
+/// must raise the ceiling (and still enforce one).
+#[tokio::test]
+async fn bodies_past_the_default_2mib_cap_are_accepted_up_to_the_ceiling() {
+    let state = test_state().await;
+    let app = create_router(state);
+
+    // ~3 MiB of JSON — over axum's 2 MiB default, under the 64 MiB ceiling.
+    let big = "x".repeat(3 * 1024 * 1024);
+    let resp = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/api/chat/")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    json!({"name": big}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        axum::http::StatusCode::OK,
+        "a >2 MiB send must not be rejected with 413"
+    );
+
+    // The ceiling itself still holds: over 64 MiB is a 413.
+    let huge = "x".repeat(65 * 1024 * 1024);
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/api/chat/")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    json!({"name": huge}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+/// Regression (815bugs #84): a pinned-id `POST /api/providers` that names an
+/// already-taken id must be a 409, not a raw UNIQUE-constraint 500 — Kitty's
+/// GET-then-POST `sync_active_provider` races itself into exactly this.
+#[tokio::test]
+async fn create_provider_with_a_pinned_id_conflicts_cleanly_on_a_second_post() {
+    let state = test_state().await;
+    let app = create_router(state);
+
+    let make_body = || {
+        axum::body::Body::from(
+            json!({
+                "id": "pinned-provider-id",
+                "name": "test-provider",
+                "provider_type": "openai_compat",
+                "base_url": "http://127.0.0.1:1"
+            })
+            .to_string(),
+        )
+    };
+    let first = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/api/providers")
+                .header("content-type", "application/json")
+                .body(make_body())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.status(), axum::http::StatusCode::OK);
+
+    let second = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/api/providers")
+                .header("content-type", "application/json")
+                .body(make_body())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.status(), axum::http::StatusCode::CONFLICT);
 }

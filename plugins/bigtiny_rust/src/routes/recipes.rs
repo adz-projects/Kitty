@@ -74,13 +74,16 @@ pub async fn execute_recipe(
         Ok(session_id) => Json(json!({"session_id": session_id})).into_response(),
         Err(e) => {
             // Distinguish validation/usage errors (missing recipe → 404,
-            // bad template → 400) from internal failures (storage → 500). The
-            // previous code mapped *every* engine error to 400, hiding
-            // genuine server faults as client errors.
+            // bad template → 400) from internal failures (storage → 500,
+            // provider-failed turn → 500). The previous code mapped *every*
+            // engine error to 400, hiding genuine server faults as client
+            // errors.
             let status = match &e {
                 RecipeError::NotFound(_) => StatusCode::NOT_FOUND,
                 RecipeError::Template(_) => StatusCode::BAD_REQUEST,
-                RecipeError::Storage(_) => StatusCode::INTERNAL_SERVER_ERROR,
+                RecipeError::Storage(_) | RecipeError::TurnFailed(_) => {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                }
             };
             err_response(status, e.to_string())
         }

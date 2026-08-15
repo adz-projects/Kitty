@@ -1,5 +1,20 @@
 # Adaptive Pathway — Rust ↔ sidecar HTTP contract
 
+> **SUPERSEDED — historical.** Everything below describes the Python HTTP
+> sidecar, which is **retired**: no longer built, bundled, spawned or
+> supervised. The behavioral-memory engine is now
+> `plugins/adaptive-pathway_rust/`, a path dependency statically linked into
+> the BigTiny daemon, so recall is an in-process call on the agent loop rather
+> than an HTTP hop. Kitty reaches it through the daemon
+> (`src-tauri/src/bigtiny/pathway.rs`), not a socket of its own, and
+> embeddings come from the daemon's own local engine via the `SemanticEmbedder`
+> trait — there is no `AP_EMBED_OLLAMA_*` configuration and no Ollama
+> anywhere in this path. `src-tauri/src/adaptive_pathway/` and
+> `lifecycle/adaptive_pathway_proc.rs` are both deleted.
+>
+> Kept as the record of the contract the Rust port was verified against; see
+> `docs/PLUGINS.md` and `CLAUDE.md` for how it actually works now.
+
 `plugins/adaptive-pathway/` ships a FastAPI/uvicorn HTTP sidecar
 (`src/adaptive_pathway/integrations/sidecar/server.py`) that Kitty spawns and
 monitors directly (`src-tauri/src/lifecycle/adaptive_pathway_proc.rs`) —

@@ -235,7 +235,12 @@ fn render_body(doc_text: &str) -> String {
                 .iter()
                 .filter(|l| !is_table_separator(l))
                 .map(|l| {
-                    let inner = &l[1..l.len() - 1];
+                    // A bare "|" line passes the starts/ends-with-`|` gate
+                    // above but has no interior: `&l[1..l.len() - 1]` would
+                    // slice `[1..0]` and panic (audit #114). Python's
+                    // forgiving `line[1:-1]` yields "" here, which splits to
+                    // a single empty cell — mirrored.
+                    let inner = if l.len() >= 2 { &l[1..l.len() - 1] } else { "" };
                     inner.split('|').map(|c| c.trim().to_string()).collect()
                 })
                 .collect();
@@ -481,7 +486,12 @@ fn set_or_insert_title(core_xml: &str, title: &str) -> String {
     static TITLE_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     let re = TITLE_RE.get_or_init(|| Regex::new(r"(?s)<dc:title>.*?</dc:title>").unwrap());
     if re.is_match(core_xml) {
-        re.replace(core_xml, format!("<dc:title>{escaped}</dc:title>").as_str())
+        // `NoExpand`, not a plain replacement string: `Regex::replace`
+        // `$`-expands its replacement, so a title containing `$` (e.g.
+        // "Price is $5") would be mangled into capture-group references
+        // (audit #115).
+        let replacement = format!("<dc:title>{escaped}</dc:title>");
+        re.replace(core_xml, regex::NoExpand(replacement.as_str()))
             .to_string()
     } else if let Some(idx) = core_xml.rfind("</cp:coreProperties>") {
         let mut out = String::with_capacity(core_xml.len() + escaped.len() + 32);
@@ -547,6 +557,28 @@ mod tests {
         assert!(body.contains(">a<"));
         assert!(body.contains(">1<"));
         assert!(!body.contains("---"));
+    }
+
+    #[test]
+    fn bare_pipe_line_does_not_panic() {
+        // Audit #114: a lone "|" passed the table gate and panicked slicing
+        // `[1..0]`. It now renders as one empty cell, mirroring Python's
+        // forgiving `line[1:-1]`.
+        let body = render_body("|");
+        assert!(body.contains("<w:tbl>"), "a pipe-gated line still renders as a table: {body}");
+    }
+
+    #[test]
+    fn title_with_dollar_signs_is_not_mangled_by_regex_replacement() {
+        // Audit #115: `Regex::replace` `$`-expands the replacement string, so
+        // "Price is $5" lost the `$5` (a bogus capture reference). NoExpand
+        // inserts the title verbatim.
+        let core = "<cp:coreProperties><dc:title>old</dc:title></cp:coreProperties>";
+        let out = set_or_insert_title(core, "Price is $5 and $1 and $$ and ${name}");
+        assert!(
+            out.contains("<dc:title>Price is $5 and $1 and $$ and ${name}</dc:title>"),
+            "title must survive verbatim: {out}"
+        );
     }
 
     #[test]

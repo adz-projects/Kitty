@@ -76,6 +76,7 @@ export function Providers({ highlight }: { highlight: string | null }) {
           current_mode: 'auto',
           available_modes: [],
           thinking_effort: null,
+          is_default_folder: true,
         });
       } catch {
         /* non-fatal */

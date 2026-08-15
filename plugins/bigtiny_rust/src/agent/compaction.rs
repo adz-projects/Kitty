@@ -459,8 +459,11 @@ pub fn apply_tool_mask(
     reserve_floor_rowid: i64,
     cfg: &TokenManagementConfig,
 ) -> Vec<Value> {
-    let head = cfg.tool_mask_head as usize;
-    let tail = cfg.tool_mask_tail as usize;
+    // Same `.max(0)` clamps `mask_code_block` has: a negative config value
+    // (possible via env overrides) becomes a huge `usize` via `as usize`,
+    // panicking the slice arithmetic below.
+    let head = cfg.tool_mask_head.max(0) as usize;
+    let tail = cfg.tool_mask_tail.max(0) as usize;
     let mut out = Vec::new();
 
     for msg in messages {
@@ -683,6 +686,55 @@ const SUMMARIZER_INSTRUCTIONS: &str =
      current_task_state to the immediate focus/next-step as of the end of the \
      new chunk. Respond with JSON matching the given schema only.";
 
+/// Render a message `content` value as plain prompt text. Text blocks pass
+/// through; every non-text block (base64 image payloads, etc.) collapses
+/// into a single `[N image(s) attached]` placeholder so structured content
+/// never inlines megabytes of base64 into a prompt.
+pub fn render_content_as_text(content: &Value) -> String {
+    match content {
+        Value::String(s) => s.clone(),
+        Value::Array(blocks) => render_blocks_as_text(blocks),
+        other => other.to_string(),
+    }
+}
+
+/// The stored-row form of `render_content_as_text`: `content_format ==
+/// "blocks"` rows carry their block array as a JSON *string* (see
+/// `context::builder::save_messages`); anything else is plain text already.
+/// An unparseable blocks payload passes through unchanged rather than
+/// dropping content.
+pub fn stored_content_as_text(content: &str, content_format: Option<&str>) -> String {
+    if content_format == Some("blocks") {
+        if let Ok(Value::Array(blocks)) = serde_json::from_str::<Value>(content) {
+            return render_blocks_as_text(&blocks);
+        }
+    }
+    content.to_string()
+}
+
+fn render_blocks_as_text(blocks: &[Value]) -> String {
+    let mut texts: Vec<&str> = Vec::new();
+    let mut images = 0usize;
+    for block in blocks {
+        match block.get("type").and_then(|t| t.as_str()) {
+            Some("text") => {
+                if let Some(t) = block.get("text").and_then(|t| t.as_str()) {
+                    texts.push(t);
+                }
+            }
+            _ => images += 1,
+        }
+    }
+    let mut out = texts.join("\n");
+    if images > 0 {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&format!("[{images} image(s) attached]"));
+    }
+    out
+}
+
 /// Build the prompt for the summarizer to extract memory from a chunk.
 pub fn build_summarizer_prompt(existing_slots: Option<&Value>, chunk: &[Value]) -> Vec<Value> {
     let existing_block = existing_slots
@@ -695,16 +747,9 @@ pub fn build_summarizer_prompt(existing_slots: Option<&Value>, chunk: &[Value]) 
             .get("role")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
-        let content_str = msg
-            .get("content")
-            .map(|v| {
-                if v.is_string() {
-                    v.as_str().unwrap().to_string()
-                } else {
-                    v.to_string()
-                }
-            })
-            .unwrap_or_default();
+        // Blocks content (image attachments) collapses to a placeholder —
+        // never inline base64 payloads into the summarizer prompt.
+        let content_str = msg.get("content").map(render_content_as_text).unwrap_or_default();
 
         let content_with_tools = if let Some(tc) = msg.get("tool_calls") {
             format!("{content_str} [tool_calls: {}]", tc)
@@ -835,7 +880,13 @@ async fn run_compaction_inner(
         msg.insert("rowid".to_string(), json!(row.rowid));
         msg.insert("role".to_string(), json!(row.role));
         if let Some(ref c) = row.content {
-            msg.insert("content".to_string(), json!(c));
+            // `blocks` rows (image attachments) store base64 payloads —
+            // collapse them to a placeholder or the summarizer prompt
+            // inherits megabytes of base64 (billed at 256 tokens/image).
+            msg.insert(
+                "content".to_string(),
+                json!(stored_content_as_text(c, row.content_format.as_deref())),
+            );
         }
         if let Some(ref tc) = row.tool_calls {
             if let Ok(parsed) = serde_json::from_str(tc) {
@@ -1273,5 +1324,70 @@ mod tests {
         let block = "```\nabc\n```";
         let masked = mask_code_block(block, 0, i32::MAX);
         assert_eq!(masked, block);
+    }
+
+    /// Regression: negative `tool_mask_head`/`tool_mask_tail` (reachable via
+    /// env overrides, which bypass config sanitization) became huge `usize`
+    /// values via `as usize` — `apply_tool_mask` must clamp like
+    /// `mask_code_block` does.
+    #[test]
+    fn test_apply_tool_mask_negative_thresholds_do_not_panic() {
+        let messages = vec![json!({
+            "role": "tool",
+            "content": "x".repeat(1000),
+            "rowid": 1
+        })];
+        let cfg = TokenManagementConfig {
+            tool_mask_head: -5,
+            tool_mask_tail: -5,
+            ..Default::default()
+        };
+        let masked = apply_tool_mask(&messages, 100, &cfg);
+        assert_eq!(masked.len(), 1);
+    }
+
+    /// Regression: blocks content (image attachments) used to be stringified
+    /// into the summarizer prompt verbatim — megabytes of base64 per image.
+    /// Non-text blocks must collapse to a `[N image(s) attached]`
+    /// placeholder in both the array and stored-string forms.
+    #[test]
+    fn test_build_summarizer_prompt_collapses_image_blocks() {
+        let base64_payload = "QUJD".repeat(1000);
+        let chunk = vec![json!({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "describe this"},
+                {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{base64_payload}")}},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+            ]
+        })];
+        let prompt = build_summarizer_prompt(None, &chunk);
+        let text = prompt[1]["content"].as_str().unwrap();
+        assert!(text.contains("describe this"));
+        assert!(text.contains("[2 image(s) attached]"));
+        assert!(
+            !text.contains(&base64_payload[..64]),
+            "no base64 in the summarizer prompt"
+        );
+    }
+
+    #[test]
+    fn test_stored_content_as_text_handles_blocks_rows() {
+        let stored = serde_json::to_string(&json!([
+            {"type": "text", "text": "look"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,QUJD"}},
+        ]))
+        .unwrap();
+        assert_eq!(
+            stored_content_as_text(&stored, Some("blocks")),
+            "look\n[1 image(s) attached]"
+        );
+        // Plain text rows pass through untouched, as does an unparseable
+        // blocks payload (never drop content).
+        assert_eq!(stored_content_as_text("hello", Some("text")), "hello");
+        assert_eq!(
+            stored_content_as_text("not json", Some("blocks")),
+            "not json"
+        );
     }
 }

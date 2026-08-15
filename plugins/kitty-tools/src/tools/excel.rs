@@ -27,6 +27,33 @@ use crate::paths::{path_within_home, resolve};
 /// this per page are exposed via `next_offset`, never dumped unbounded.
 pub const EXCEL_MAX_ROWS_DEFAULT: usize = 500;
 
+/// Hard cap on the workbook file size, checked before calamine parses it
+/// (audit #119): calamine materializes the used range in memory, so a giant
+/// (or zip-bombed) workbook must be rejected at the door rather than
+/// discovered by the OOM killer. Same pattern as `fs.rs`'s `MAX_FILE_BYTES`.
+const EXCEL_MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Cap on rows scanned by the query path (audit #119): that path serializes
+/// every surviving row to a JSON string for the keyword filter, so an
+/// unbounded scan accumulates the whole sheet as strings. Past the cap the
+/// scan stops and the response is marked truncated.
+const EXCEL_MAX_QUERY_SCAN_ROWS: usize = 100_000;
+
+/// True when the file's metadata size is past `EXCEL_MAX_FILE_BYTES` — the
+/// check that keeps giant workbooks from being parsed into memory at all.
+fn file_size_exceeds(resolved: &Path) -> bool {
+    std::fs::metadata(resolved).map(|m| m.len() > EXCEL_MAX_FILE_BYTES).unwrap_or(false)
+}
+
+fn too_large(resolved: &Path) -> String {
+    error_response(
+        "XLSX_TOO_LARGE",
+        &format!("File is larger than the {} byte read limit", EXCEL_MAX_FILE_BYTES),
+        Some(&resolved.to_string_lossy()),
+        Some("Split the workbook, or export the needed sheet/range to CSV and use lean_file_read."),
+    )
+}
+
 /// Home boundary shared by both Excel tools — defense-in-depth before any
 /// filesystem access (the daemon is the primary gate).
 fn outside_home(resolved: &Path) -> Option<String> {
@@ -119,13 +146,16 @@ fn col_letter_to_num(s: &str) -> Option<u32> {
         if !c.is_ascii_alphabetic() {
             return None;
         }
-        col = col * 26 + ((c as u8) - b'A' + 1) as u64;
+        // Checked arithmetic, bailing as soon as the value can no longer fit
+        // the `u32` this returns (audit #129): a long letter run (~14+
+        // letters) used to overflow the `u64` accumulator mid-loop and
+        // silently wrap to a wrong column.
+        col = col.checked_mul(26)?.checked_add(((c as u8) - b'A' + 1) as u64)?;
+        if col > u32::MAX as u64 {
+            return None;
+        }
     }
-    if col > u32::MAX as u64 {
-        None
-    } else {
-        Some(col as u32)
-    }
+    Some(col as u32)
 }
 
 /// Parses `openpyxl.utils.cell.range_boundaries`-style input ("A1:C3", or a
@@ -173,6 +203,9 @@ pub fn excel_inspect(path: &str) -> String {
     }
     if !resolved.exists() {
         return error_response("XLSX_NOT_FOUND", "Spreadsheet does not exist", Some(&resolved.to_string_lossy()), None);
+    }
+    if file_size_exceeds(&resolved) {
+        return too_large(&resolved);
     }
 
     let mut wb = match open(&resolved) {
@@ -255,6 +288,9 @@ pub fn excel_read_rows(
     if !resolved.exists() {
         return error_response("XLSX_NOT_FOUND", "Spreadsheet does not exist", Some(&resolved.to_string_lossy()), None);
     }
+    if file_size_exceeds(&resolved) {
+        return too_large(&resolved);
+    }
 
     let mut wb = match open(&resolved) {
         Ok(wb) => wb,
@@ -310,12 +346,20 @@ pub fn excel_read_rows(
 
     // Query path: keyword-search every surviving data row, but only
     // JSON-build the matched page — a million-row sheet is scanned as
-    // strings without ever holding the whole sheet as Value objects.
+    // strings without ever holding the whole sheet as Value objects. The
+    // scan itself is capped at EXCEL_MAX_QUERY_SCAN_ROWS (audit #119):
+    // beyond that the accumulated strings are the memory problem, and the
+    // response says so via the truncated flag + metadata note.
     if let Some(q) = query.filter(|q| !q.trim().is_empty()) {
         let mut headers: Vec<String> = Vec::new();
         let mut serialized: Vec<String> = Vec::new();
         let mut survivor = 0usize;
+        let mut scan_capped = false;
         for (row_idx, row) in range.rows().enumerate() {
+            if survivor >= EXCEL_MAX_QUERY_SCAN_ROWS {
+                scan_capped = true;
+                break;
+            }
             if let Some(clipped) = clip_row(row, range_start, row_idx, window) {
                 if survivor == 0 {
                     headers = build_headers(&clipped);
@@ -342,12 +386,18 @@ pub fn excel_read_rows(
         if let Some(next) = result.next_offset {
             meta.insert("next_offset".into(), json!(next));
         }
+        if scan_capped {
+            meta.insert(
+                "scan_capped_at_row".into(),
+                json!(EXCEL_MAX_QUERY_SCAN_ROWS),
+            );
+        }
         let data = if filtered.is_empty() {
             Value::Array(result.items.into_iter().map(Value::String).collect())
         } else {
             Value::Array(filtered)
         };
-        return success_response(data, message.as_deref(), result.truncated, Some(Value::Object(meta)));
+        return success_response(data, message.as_deref(), result.truncated || scan_capped, Some(Value::Object(meta)));
     }
 
     // No-query path: materialize only the header row and the page window,
@@ -488,14 +538,25 @@ fn cell_to_csv(v: &Value) -> String {
 }
 
 /// Minimal RFC-4180-ish CSV field quoting, close to Python's `csv.writer`.
+///
+/// Formula-injection guard (audit #124): a field beginning with `=`, `+`,
+/// `-` or `@` is a live formula when the CSV is opened in Excel — and this
+/// tool's documented workflow is exactly that (write/read spreadsheets the
+/// model hands off). Prefixing with `'` neutralizes it the way Excel's own
+/// cell entry does.
 fn csv_line(fields: &[String]) -> String {
     fields
         .iter()
         .map(|f| {
-            if f.contains(',') || f.contains('"') || f.contains('\n') || f.contains('\r') {
-                format!("\"{}\"", f.replace('"', "\"\""))
+            let guarded = if f.starts_with(['=', '+', '-', '@']) {
+                format!("'{f}")
             } else {
                 f.clone()
+            };
+            if guarded.contains(',') || guarded.contains('"') || guarded.contains('\n') || guarded.contains('\r') {
+                format!("\"{}\"", guarded.replace('"', "\"\""))
+            } else {
+                guarded
             }
         })
         .collect::<Vec<_>>()
@@ -514,6 +575,52 @@ mod tests {
         assert_eq!(col_letter_to_num("A"), Some(1));
         assert_eq!(col_letter_to_num("AA"), Some(27));
         assert_eq!(col_letter_to_num("ZZ"), Some(702));
+    }
+
+    #[test]
+    fn col_letter_to_num_rejects_overflowing_letter_runs() {
+        // Audit #129: ~14+ letters overflowed the u64 accumulator mid-loop
+        // and wrapped to a wrong column instead of failing.
+        assert_eq!(col_letter_to_num("XFD"), Some(16384)); // real max column
+        assert_eq!(col_letter_to_num("FXSHRXW"), Some(2147483647)); // still fits u32
+        assert_eq!(col_letter_to_num("FXSHRXWX"), None); // 5.5e10 > u32::MAX
+        assert_eq!(col_letter_to_num("ZZZZZZZ"), None); // ~8.3e9 > u32::MAX
+        // Very long runs bail before the arithmetic can wrap.
+        assert_eq!(col_letter_to_num("ZZZZZZZZZZZZZZ"), None);
+    }
+
+    #[test]
+    fn csv_line_neutralizes_formula_injection() {
+        // Audit #124: cells starting with =, +, -, @ are live formulas when
+        // the CSV is opened in Excel; they must be quote-prefixed.
+        assert_eq!(csv_line(&["=1+1".to_string()]), "'=1+1");
+        assert_eq!(csv_line(&["+SUM(A1:A2)".to_string()]), "'+SUM(A1:A2)");
+        assert_eq!(csv_line(&["-5".to_string()]), "'-5");
+        assert_eq!(csv_line(&["@mention".to_string()]), "'@mention");
+        // Ordinary text and interior operators are untouched.
+        assert_eq!(csv_line(&["a=b".to_string()]), "a=b");
+        assert_eq!(csv_line(&["plain".to_string(), "x".to_string()]), "plain,x");
+        // The guard composes with quoting.
+        assert_eq!(csv_line(&["=x,y".to_string()]), "\"'=x,y\"");
+    }
+
+    #[test]
+    fn oversized_workbook_is_rejected_before_parsing() {
+        let dir = std::env::temp_dir().join(format!("kt-xlsx-big-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("big.xlsx");
+        // Sparse in name only: the gate reads metadata size, not contents.
+        std::fs::write(&f, vec![b'x'; (EXCEL_MAX_FILE_BYTES + 1) as usize]).unwrap();
+
+        let s = excel_inspect(f.to_str().unwrap());
+        let v: Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["error_code"], "XLSX_TOO_LARGE");
+
+        let s = excel_read_rows(f.to_str().unwrap(), None, None, "json", None, 0);
+        let v: Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["error_code"], "XLSX_TOO_LARGE");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

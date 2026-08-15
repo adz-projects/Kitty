@@ -41,6 +41,13 @@ use crate::sandbox::{self, Mount, Outcome, RunRequest};
 pub const MAX_CODE_LENGTH_BYTES: usize = 50_000;
 /// Cap on the serialized `result` value, matching `MAX_RESULT_BYTES`.
 pub const MAX_RESULT_BYTES: usize = 256_000;
+/// Hard cap on the `result.json` envelope file the host reads back (audit
+/// #121). The guest caps the result itself at `MAX_RESULT_BYTES`, but the
+/// guest is the adversarial half of this boundary: a buggy or hostile guest
+/// could fill `/kitty-out` with gigabytes, and an uncapped `read_to_string`
+/// would happily buffer all of it on the host. Well above any legitimate
+/// envelope (capped result + preview + error fields).
+const RESULT_FILE_MAX_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Where the harness writes its envelope, inside the guest. Referenced by
 /// the harness source below (as a literal, since that's Python) and pinned by
@@ -163,6 +170,34 @@ fn truncate_result(value: Value) -> (Value, bool, usize) {
     )
 }
 
+/// Reads the guest's `result.json` envelope with a hard byte ceiling (audit
+/// #121). `Ok(None)` covers "no parseable envelope" (missing file, unreadable,
+/// or invalid JSON) — the caller's missing-envelope path. `Err` is the one
+/// case that must not be collapsed into that path: the file exists but
+/// overflowed the cap, which gets its own `ResultTooLarge` verdict.
+fn read_result_envelope(path: &std::path::Path) -> Result<Option<Value>, String> {
+    use std::io::Read;
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return Ok(None),
+    };
+    let mut buf = Vec::new();
+    if file
+        .take(RESULT_FILE_MAX_BYTES + 1)
+        .read_to_end(&mut buf)
+        .is_err()
+    {
+        return Ok(None);
+    }
+    if buf.len() as u64 > RESULT_FILE_MAX_BYTES {
+        return Err(format!(
+            "result.json exceeded the {} byte host read cap",
+            RESULT_FILE_MAX_BYTES
+        ));
+    }
+    Ok(serde_json::from_slice::<Value>(&buf).ok())
+}
+
 /// Runs `code` in the sandboxed CPython guest.
 ///
 /// `guest_path` must already be resolved (see `guest::ensure_python_guest`);
@@ -236,9 +271,25 @@ pub fn run_python(
     let stderr = output.stderr.contents();
     let elapsed_ms = output.duration.as_millis() as u64;
 
-    let envelope = std::fs::read_to_string(out_dir.join("result.json"))
-        .ok()
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
+    let envelope = match read_result_envelope(&out_dir.join("result.json")) {
+        Ok(env) => env,
+        Err(too_large) => {
+            // An oversized envelope is not "the guest died before
+            // reporting" — it reported too much. Distinct error type so the
+            // caller can tell the difference (audit #121).
+            return Ok(json!({
+                "status": "error",
+                "result": null,
+                "stdout": stdout,
+                "stderr": stderr,
+                "execution_time_ms": elapsed_ms,
+                "error": {"error_type": "ResultTooLarge", "message": too_large},
+                "result_truncated": false,
+                "result_size_bytes": 0,
+                "outcome": output.outcome.label(),
+            }));
+        }
+    };
 
     // A missing envelope means the guest died before the harness could report
     // — timeout, trap, or a hard `os._exit`. Those are exactly the cases the
@@ -441,5 +492,27 @@ mod tests {
             a.path().to_path_buf()
         };
         assert!(!path.exists(), "scratch dir outlived its guard");
+    }
+
+    #[test]
+    fn result_envelope_read_is_byte_capped() {
+        // Audit #121: the host used to `read_to_string` the guest-written
+        // file with no cap — a guest filling `/kitty-out` would OOM the host.
+        let dir = tempdir().unwrap();
+        let small = dir.path().join("small.json");
+        std::fs::write(&small, r#"{"status":"success","result":1}"#).unwrap();
+        let v = read_result_envelope(&small).unwrap().expect("parses");
+        assert_eq!(v["result"], json!(1));
+
+        let big = dir.path().join("big.json");
+        std::fs::write(&big, vec![b'x'; (RESULT_FILE_MAX_BYTES + 1) as usize]).unwrap();
+        let err = read_result_envelope(&big).unwrap_err();
+        assert!(err.contains("cap"), "{err}");
+
+        // Missing/corrupt files stay on the ordinary `None` path.
+        assert_eq!(read_result_envelope(&dir.path().join("missing.json")).unwrap(), None);
+        let corrupt = dir.path().join("corrupt.json");
+        std::fs::write(&corrupt, b"not json").unwrap();
+        assert_eq!(read_result_envelope(&corrupt).unwrap(), None);
     }
 }

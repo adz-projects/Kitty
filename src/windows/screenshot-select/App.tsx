@@ -32,17 +32,28 @@ export function App() {
   const containerRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    void ipc.getScreenshotPreview().then((data) => {
-      if (!data) return;
-      const [url, x, y, w, h] = data;
-      setPreview(url);
-      setRect({ x, y, w, h });
-    });
+    let mounted = true;
+    void ipc
+      .getScreenshotPreview()
+      .then((data) => {
+        if (!data || !mounted) return;
+        const [url, x, y, w, h] = data;
+        setPreview(url);
+        setRect({ x, y, w, h });
+      })
+      .catch(() => {
+        // Preview unavailable (e.g. the capture was cancelled before this
+        // window finished loading) — the selection overlay still works
+        // against the plain dimmed background.
+      });
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') void ipc.cancelScreenshotSelection();
     };
     window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
+    return () => {
+      mounted = false;
+      window.removeEventListener('keydown', onKeyDown);
+    };
   }, []);
 
   const onPointerDown = (e: React.PointerEvent) => {

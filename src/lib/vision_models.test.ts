@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { supportsImages } from './vision_models';
+import { supportsImages, modelAcceptsImages } from './vision_models';
 
 describe('supportsImages', () => {
   it('recognizes common vision-capable model families', () => {
@@ -38,5 +38,27 @@ describe('supportsImages', () => {
     expect(supportsImages(null)).toBe(false);
     expect(supportsImages(undefined)).toBe(false);
     expect(supportsImages('')).toBe(false);
+  });
+});
+
+describe('modelAcceptsImages', () => {
+  it("lets the provider override rescue a vision model the patterns don't know", () => {
+    // The case the override exists for: a self-hosted or renamed vision model.
+    expect(supportsImages('my-finetune-v2')).toBe(false);
+    expect(modelAcceptsImages('my-finetune-v2', true)).toBe(true);
+  });
+
+  it('only ever widens — an off override never hides a recognized vision model', () => {
+    expect(modelAcceptsImages('gpt-4o', false)).toBe(true);
+    expect(modelAcceptsImages('gpt-4o', true)).toBe(true);
+  });
+
+  it('stays false for a text-only model with no override', () => {
+    expect(modelAcceptsImages('llama3.2:3b', false)).toBe(false);
+  });
+
+  it('honors the override even with no model selected', () => {
+    expect(modelAcceptsImages(null, true)).toBe(true);
+    expect(modelAcceptsImages(null, false)).toBe(false);
   });
 });

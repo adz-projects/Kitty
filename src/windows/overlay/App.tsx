@@ -1,4 +1,4 @@
-import { useEffect } from 'react';
+import { useEffect, useRef } from 'react';
 import { ipc, onNewSessionRequest } from '@/lib/ipc';
 import { useStackStore } from '@/stores/stackStore';
 import { useAdaptivePathwayStore } from '@/stores/adaptivePathwayStore';
@@ -35,7 +35,20 @@ export function App() {
 
   const degraded = DEGRADED.includes(status);
 
-  const expand = () => useChatStore.getState().handOffToMain();
+  // Latched: handOffToMain opens a brand-new chat window every time — a
+  // double-click (or click while the first open is still in flight) must not
+  // spawn two windows both adopting the same session.
+  const expandInFlight = useRef(false);
+  const expand = () => {
+    if (expandInFlight.current) return;
+    expandInFlight.current = true;
+    void useChatStore
+      .getState()
+      .handOffToMain()
+      .finally(() => {
+        expandInFlight.current = false;
+      });
+  };
 
   return (
     <div className="overlay-root">
@@ -47,7 +60,7 @@ export function App() {
           <strong>Kitty</strong>
           <div style={{ display: 'flex', gap: 8 }}>
             <RecentSessions />
-            <button onClick={() => void expand()} title="Expand to full window" aria-label="Expand">
+            <button onClick={expand} title="Expand to full window" aria-label="Expand">
               <DoubleChevronIcon direction="up" />
             </button>
             <button

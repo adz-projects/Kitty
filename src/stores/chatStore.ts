@@ -15,7 +15,6 @@ import {
   onProviderActivated,
   onProviderHealth,
   onReasoningDelta,
-  onRecipesChanged,
   onSessionDeleted,
   onSessionsCleared,
   onSessionTitle,
@@ -26,7 +25,7 @@ import {
 import { buildExport, sanitizeFilename } from '@/lib/chatml';
 import { defaultSystemPrompt } from '@/lib/system_prompts';
 import { recipeNeedsAttention, resolveRecipe, launchableExtensions } from '@/lib/recipes';
-import { supportsImages } from '@/lib/vision_models';
+import { modelAcceptsImages } from '@/lib/vision_models';
 import type {
   ApprovalNeededEvent,
   ModeInfo,
@@ -79,6 +78,11 @@ export * from './chat/types';
 interface ChatState {
   sessionId: string | null;
   cwd: string | null;
+  /** True when `cwd` is a private per-chat folder (no explicit working
+      directory chosen). The chat header renders this as "thought partner"
+      rather than a folder pill. Derived server-side (`SessionInfo`), refreshed
+      on create/load/setWorkingDir/reset. */
+  isDefaultFolder: boolean;
   /** Monotonic session-switch counter (WS8): bumped at the START of every
       session-changing action (newSession/loadSession), so an in-flight
       `loadSession` replay that finishes after the user already moved on to a
@@ -191,16 +195,20 @@ interface ChatState {
       context resent on later turns, chat-only mode only. Remove once Goose ships
       a native hook (block/goose#7617) and thread it into goosed_env() instead. */
   stripReasoning: boolean;
+  /** The active provider profile's manual "accepts images" override. Widens
+      `supportsImages`'s name-based detection; see `modelAcceptsImages`. */
+  providerSupportsVision: boolean;
+  /** Whether the active provider can call tools at all — drives how a dropped
+      file is handed over (path vs. inlined content).
+      Derived client-side from the provider type because the daemon exposes no
+      capability route for it. The in-process llama.cpp engine is the only
+      provider that can't: `LocalProvider::chat_completion` drops any tools it
+      is given. Delete this derivation, not the field, once that changes. */
+  providerHasTools: boolean;
   /** Active provider's custom system prompt override, or `null` to use the
       built-in mode-appropriate default (`defaultSystemPrompt`). Prepended to a
       session's first outgoing message only — see `send()`. */
   systemPrompt: string | null;
-  /** Per-session chat/agentic override (Round-4 instant mode toggle). `null` =
-      default to chat (owner ask — see `isChatMode`). */
-  modeOverride: 'chat' | 'agentic' | null;
-  /** Approval mode saved when flipping into chat mode, restored on flip back
-      (Round-4 tool-safety fix). `null` when not currently overridden-to-chat. */
-  savedApprovalMode: string | null;
   /// Non-blocking notice (e.g. attaching to an untrusted provider). Round-2 item 13.
   warning: string | null;
   /** BigTiny folded older history into its background memory summary
@@ -222,10 +230,6 @@ interface ChatState {
       cancel (the user decides). Reset when a fresh turn starts or the turn
       ends. */
   loopSuspected: boolean;
-  /** Recipe templates (Goose recipes reinterpreted as client-side templates —
-      see `sendWithRecipe`) — kept fresh via `bindEvents`'s `onRecipesChanged`
-      subscription, read by the composer's slash-command matching. */
-  recipes: Recipe[];
   /** Set by `sendWithRecipe`, consumed exactly once by `send()`'s prompt
       construction (any turn, not just a session's first message — a recipe
       can be invoked at any point in a conversation). `null` the rest of the
@@ -316,13 +320,11 @@ interface ChatState {
       starts. Does not itself cancel anything; only `cancel()`/`forceStop()`
       do that, and only when the user actually chooses to. */
   dismissLoopWarning: () => void;
-  respondApproval: (toolCallId: string, optionId: string | null) => Promise<void>;
+  /** Resolve a pending tool approval. Returns whether the decision actually
+      reached the backend — a false return means the entry is still queued
+      and the caller (ApprovalPrompt) should unlatch so the user can retry. */
+  respondApproval: (toolCallId: string, optionId: string | null) => Promise<boolean>;
   setMode: (modeId: string) => Promise<void>;
-  /** Flip the session's chat/agentic mode (Round-4). Persists the override and
-      handles the mid-conversation safety/attachment concerns described on
-      `send()`'s strip-reasoning STOPGAP neighbor, `bindEvents`' approval
-      handler, and `addDroppedPaths` below. */
-  setModeOverride: (mode: 'chat' | 'agentic' | null) => Promise<void>;
   /** Set the active session's reasoning effort (Round-7) — live, no goosed
       restart. No-op if there's no active session or effort control isn't
       available for the active model. */
@@ -330,6 +332,9 @@ interface ChatState {
   addDroppedPaths: (paths: string[]) => Promise<void>;
   removeDroppedPath: (path: string) => void;
   setWorkingDir: (folder: string) => Promise<void>;
+  /** "Return to thought partner" — repoint the session back to a private
+      per-chat folder (the default state), clearing the chosen working folder. */
+  resetWorkingDir: () => Promise<void>;
   adoptSession: (info: {
     session_id: string;
     cwd: string;
@@ -354,16 +359,6 @@ interface ChatState {
       success. */
   retryConnection: () => Promise<void>;
 }
-
-/** Effective chat/agentic mode for the current session: an explicit override
-    wins, otherwise agentic (Round-7: providers no longer carry a `tools_enabled`
-    default — the per-session toggle is the only mode selector now). Exported
-    plain selector — usable as `useChatStore(isChatMode)` in components or
-    `isChatMode(get())` inside store actions (Round-4). */
-// `null` (no explicit per-session override) defaults to chat mode (owner
-// ask) — a new session starts as a reading-friendly thought partner unless
-// the user explicitly flips it to agentic via ModeToggle.
-export const isChatMode = (s: ChatState): boolean => (s.modeOverride ?? 'chat') === 'chat';
 
 let bound = false;
 // Timestamp of the most recent send() call, for the per-response duration
@@ -414,9 +409,9 @@ let sendInFlight = false;
 // Without this, that would fire a second real `ipc.newSession` call and
 // orphan one of the two goosed sessions. Module-level like the fields above.
 let pendingNewSession: Promise<SessionInfo> | null = null;
-function getOrCreateSession(cwd?: string, mode?: string | null): Promise<SessionInfo> {
+function getOrCreateSession(cwd?: string): Promise<SessionInfo> {
   if (!pendingNewSession) {
-    pendingNewSession = ipc.newSession(cwd, mode).finally(() => {
+    pendingNewSession = ipc.newSession(cwd).finally(() => {
       pendingNewSession = null;
     });
   }
@@ -434,30 +429,11 @@ let recentOwnSessionDeleteAt = 0;
 const OWN_DELETE_RETRY_WINDOW_MS = 3000;
 
 export const useChatStore = create<ChatState>((set, get) => {
-  // Force approve-mode whenever the effective mode is chat, so `auto` can
-  // never silently execute a tool call unseen (Round-4 tool-safety fix for the
-  // Phase-9 latent bug: goosed always has tools live even in chat-only mode).
-  // In approve mode every tool call surfaces as a permission request that
-  // `bindEvents`' handler then decides (Round-5: allow, but scoped to the chat
-  // folder — see there). Called after every session bootstrap point
-  // (new/load/adopt) and on flip-to-chat; best-effort.
-  const ensureSafeApprovalMode = async () => {
-    const sid = get().sessionId;
-    if (!sid || !isChatMode(get()) || get().mode === 'approve') return;
-    set({ mode: 'approve' });
-    try {
-      await ipc.setMode(sid, 'approve');
-    } catch {
-      /* best-effort */
-    }
-  };
-
-  // Chat-mode file handling (Phase 9, reused by both `addDroppedPaths` and a
-  // mid-conversation agentic→chat flip in `setModeOverride` below): inline a
-  // *user-attached* file's content rather than sending a path, so the model
-  // sees the content directly without needing a filesystem tool to open a path
-  // outside the chat folder. (Distinct from the model's own scoped tool use,
-  // which Round-5 now permits inside the chat folder.)
+  // Inline a *user-attached* file's content rather than sending a path, so a
+  // provider with no filesystem tools can still see it (see
+  // `addDroppedPaths`, which decides which handoff a drop gets). Distinct
+  // from the model's own scoped tool use, which is permitted inside the chat
+  // folder.
   //
   // Real, observed bug this fixes: images used to fall into the same "binary,
   // can't inline as text" bucket as any other non-UTF8 file, landing as a
@@ -644,12 +620,21 @@ export const useChatStore = create<ChatState>((set, get) => {
     const s = get();
     if (!s.loopSuspected && !s.activeRecipeTurn) {
       const last = s.messages[s.messages.length - 1];
+      // Slice BEFORE joining: hasRepetitionLoop only inspects a trailing
+      // window (4000 chars by default) of whatever it's handed, so joining
+      // the entire (potentially 50–200KB) reasoning+text on every rAF flush
+      // just to discard all but the tail was per-frame megabyte-scale string
+      // churn. The +1 keeps the '\n' join marker inside the preserved span,
+      // so the checked window is byte-identical to joining first.
+      const LOOP_CHECK_WINDOW = 4000;
       if (
         s.busy &&
         !s.replaying &&
         last?.role === 'assistant' &&
         last.open &&
-        hasRepetitionLoop(last.reasoning + '\n' + last.text)
+        hasRepetitionLoop(
+          last.reasoning.slice(-LOOP_CHECK_WINDOW - 1) + '\n' + last.text.slice(-LOOP_CHECK_WINDOW)
+        )
       ) {
         set({ loopSuspected: true });
       }
@@ -711,14 +696,30 @@ export const useChatStore = create<ChatState>((set, get) => {
   // the prompt was actually handed to the backend (the caller's guard-abort
   // rollback depends on it: if we aborted before submission, side effects like
   // a recipe's agentic flip should be undone; if we submitted, don't).
-  const doSend = async (text: string): Promise<boolean> => {
+  //
+  // `snapshot` lets a caller that runs its own ensureSession() first
+  // (sendWithRecipe) hand over the composer state it captured BEFORE that
+  // call — newSession()'s optimistic clear wipes droppedFiles/attachments/
+  // pendingImages, so reading them only after a lazy session-create would
+  // silently drop the first message's files.
+  const doSend = async (
+    text: string,
+    snapshot?: {
+      droppedFiles: PathInfo[];
+      attachments: Attachment[];
+      pendingImages: PendingImage[];
+    }
+  ): Promise<boolean> => {
     const trimmed = text;
-    const attachments = get().attachments;
-    const pendingImages = get().pendingImages;
+    // Captured before ANY await — see the note above. This is also what makes
+    // a plain send() on a blank chat keep its dropped files: ensureSession()
+    // → newSession() clears these very fields optimistically below.
+    const attachments = snapshot?.attachments ?? get().attachments;
+    const pendingImages = snapshot?.pendingImages ?? get().pendingImages;
+    const files = snapshot?.droppedFiles ?? get().droppedFiles;
     let submitted = false;
     try {
       const firstMessage = get().messages.length === 0;
-      const chatOnly = isChatMode(get());
       let sessionId: string;
       try {
         sessionId = await get().ensureSession();
@@ -730,7 +731,11 @@ export const useChatStore = create<ChatState>((set, get) => {
         set({ busy: false, error: String(e) });
         return false;
       }
-      const files = get().droppedFiles;
+      // Session-identity re-check across the creation await: a New Chat /
+      // session switch that landed while ensureSession() was in flight must
+      // not have this prompt prepared (and later sent) against the session
+      // it was started for — abort cleanly instead.
+      if (get().sessionId !== sessionId) return false;
 
       // Agentic-mode images go as native ACP image content blocks instead of a
       // bare filesystem path reference (Round-3 item 17 — fixes untrusted/remote
@@ -770,16 +775,22 @@ export const useChatStore = create<ChatState>((set, get) => {
         ];
       }
 
+      // Inlined content and path references are no longer mutually exclusive.
+      // Which one a drop produced is decided per-provider in
+      // `addDroppedPaths`, and a pasted document can add an attachment to a
+      // turn that also carries dropped paths — so both blocks are emitted when
+      // both exist, rather than the attachment branch shadowing the paths.
       let promptText = trimmed;
-      if (chatOnly && attachments.length) {
-        // Inline document content directly (no filesystem tool in chat-only mode).
-        const docs = attachments.map((a) => `--- ${a.label} ---\n${a.content}`).join('\n\n');
-        promptText = `${docs}\n\n${trimmed}`.trim();
-      } else if (otherFiles.length) {
-        // Agentic: hand non-image paths to the filesystem tools (CLAUDE.md §5).
+      if (otherFiles.length) {
+        // Hand non-image paths to the filesystem tools (CLAUDE.md §5).
         const block =
           'Files provided by the user:\n' + otherFiles.map((f) => `- ${f.path}`).join('\n');
-        promptText = `${block}\n\n${trimmed}`;
+        promptText = `${block}\n\n${promptText}`;
+      }
+      if (attachments.length) {
+        // Inlined content — the model has it directly, no tool call needed.
+        const docs = attachments.map((a) => `--- ${a.label} ---\n${a.content}`).join('\n\n');
+        promptText = `${docs}\n\n${promptText}`.trim();
       }
 
       // STOPGAP client-side workaround (see buildStrippedTranscript's doc comment):
@@ -789,7 +800,6 @@ export const useChatStore = create<ChatState>((set, get) => {
       // bypassing here.
       const priorMessages = get().messages;
       const stripReasoningNow =
-        chatOnly &&
         get().stripReasoning &&
         priorMessages.some((m) => m.role === 'assistant' && m.reasoning.trim().length > 0);
       if (stripReasoningNow) {
@@ -813,7 +823,7 @@ export const useChatStore = create<ChatState>((set, get) => {
       // correctly does NOT get persona_override set again — from the user's
       // perspective it's a continuation, not a new conversation.
       if (firstMessage) {
-        const resolvedPrompt = get().systemPrompt ?? defaultSystemPrompt(chatOnly);
+        const resolvedPrompt = get().systemPrompt ?? defaultSystemPrompt();
         try {
           await ipc.setSessionPersonaOverride(sessionId, resolvedPrompt);
         } catch (e) {
@@ -880,6 +890,13 @@ export const useChatStore = create<ChatState>((set, get) => {
               }
             : undefined,
       };
+      // Second identity re-check, covering the image-read / persona-override
+      // awaits above: committing the user bubble + `busy: true` here after a
+      // New Chat landed mid-preparation would append to the NEW session's
+      // blank list and leave its busy flag stuck on a turn whose events all
+      // belong to the abandoned session. Aborting means the typed text is
+      // lost — the lesser evil, and the user explicitly moved on.
+      if (get().sessionId !== sessionId) return false;
       // Fresh turn: clear any leftover stop/abandon state so its events flow
       // and a prior force-stop on this session no longer suppresses them.
       // Also reset the tool-loop guard — a call repeating across different
@@ -922,11 +939,17 @@ export const useChatStore = create<ChatState>((set, get) => {
         // handlers all gate on `forActive(sid)` (`get().sessionId === sid`), so
         // deferring the swap would silently drop every event for this turn.
         const oldSessionId = sessionId;
-        const oldModeOverride = get().modeOverride;
         const oldMode = get().mode;
         const oldAvailableModes = get().availableModes;
         const oldThinkingEffort = get().thinkingEffort;
-        const info = await ipc.newSession(cwd, oldModeOverride ?? 'chat');
+        const info = await ipc.newSession(cwd);
+        // A New Chat / session switch could have landed while the swap
+        // session was being created — applying the swap now would clobber it.
+        // The just-created swap session never got a turn: drop it and abort.
+        if (get().sessionId !== oldSessionId) {
+          void ipc.deleteSession(info.session_id).catch(() => {});
+          return false;
+        }
         // Best-effort — see the identical bindWindowSession call above.
         void ipc.bindWindowSession(info.session_id).catch(() => {});
         set({
@@ -934,17 +957,6 @@ export const useChatStore = create<ChatState>((set, get) => {
           mode: info.current_mode,
           availableModes: info.available_modes,
         });
-        // Carry the mode override across to the new session id (it's the same
-        // conversation from the user's perspective) and force a safe approval
-        // mode on it, same as any other freshly-established chat-mode session.
-        if (oldModeOverride) {
-          void ipc.setSessionMode(info.session_id, oldModeOverride).catch((e) => {
-            // Not fatal, but the swapped-to session loses its carried-forward
-            // mode override and falls back to default mode detection.
-            console.warn('setSessionMode failed on stripReasoning swap', e);
-          });
-        }
-        await ensureSafeApprovalMode();
         submitted = true;
         try {
           await ipc.sendPrompt(info.session_id, promptText, images);
@@ -954,10 +966,8 @@ export const useChatStore = create<ChatState>((set, get) => {
           // No `cwd` here: the working directory is shared with the session
           // being restored, so skip delete_session's directory cleanup.
           void ipc.deleteSession(info.session_id).catch(() => {});
-          void ipc.setSessionMode(info.session_id, null).catch(() => {});
           set({
             sessionId: oldSessionId,
-            modeOverride: oldModeOverride,
             // Restore the full set of session-derived mode/effort fields —
             // `mode`/`availableModes`/`thinkingEffort` were overwritten with
             // the failed session's values by the swap set above, and leaving
@@ -969,16 +979,10 @@ export const useChatStore = create<ChatState>((set, get) => {
           });
           throw e;
         }
-        // Success: best-effort cleanup of the now-superseded old session and
-        // its mode-override entry — a failure here shouldn't surface as an
-        // error for a turn that actually succeeded. Same no-`cwd` reasoning as
-        // above (shared working dir).
+        // Success: best-effort cleanup of the now-superseded old session — a
+        // failure here shouldn't surface as an error for a turn that actually
+        // succeeded. Same no-`cwd` reasoning as above (shared working dir).
         void ipc.deleteSession(oldSessionId).catch(() => {});
-        void ipc.setSessionMode(oldSessionId, null).catch(() => {});
-        // Chat-only sessions stay in the overlay — no auto-promote to the full
-        // window (owner decision: the overlay is a fully capable chat surface
-        // on its own; "Expand" remains available for anyone who wants the
-        // bigger window, but it's never forced).
       } else {
         submitted = true;
         await ipc.sendPrompt(sessionId, promptText, images);
@@ -993,6 +997,7 @@ export const useChatStore = create<ChatState>((set, get) => {
   return {
     sessionId: null,
     cwd: null,
+    isDefaultFolder: true,
     sessionEpoch: 0,
     backgroundSession: null,
     backgroundTurnToast: null,
@@ -1024,15 +1029,14 @@ export const useChatStore = create<ChatState>((set, get) => {
     model: null,
     providerName: null,
     stripReasoning: false,
+    providerSupportsVision: false,
+    providerHasTools: true,
     systemPrompt: null,
-    modeOverride: null,
-    savedApprovalMode: null,
     warning: null,
     compactionNotice: null,
     stopPhase: null,
     abandonedSession: null,
     loopSuspected: false,
-    recipes: [],
     pendingRecipeCard: null,
     activeRecipeTurn: null,
     pendingForcedAnswer: null,
@@ -1096,36 +1100,65 @@ export const useChatStore = create<ChatState>((set, get) => {
       try {
         const providers = prefetched ?? (await ipc.listProviders());
         const active = providers.find((p) => p.active);
+        // Defensive parse: a provider with a blank/unparseable `base_url`
+        // (the local provider ships `''`) made `new URL` throw here, dropping
+        // the ENTIRE derivation into the failure shape below (model: null,
+        // providerHasTools: true, providerSupportsVision: false) even though
+        // `listProviders` succeeded — one malformed field must only cost its
+        // own value, not the rest.
+        let activeHost: string | null = null;
+        if (active) {
+          try {
+            activeHost = new URL(active.base_url).host;
+          } catch {
+            activeHost = null;
+          }
+        }
         set({
           providerTier: active ? active.network_tier : null,
-          providerHost: active ? new URL(active.base_url).host : null,
+          providerHost: active ? activeHost : null,
           isTrusted: active ? active.is_trusted : false,
           model: active?.models[0] ?? null,
           providerName: active ? active.name || active.provider_type : null,
           stripReasoning: active ? active.strip_reasoning : false,
+          providerSupportsVision: active ? active.supports_vision : false,
+          providerHasTools: active ? active.provider_type !== 'local' : true,
           systemPrompt: active ? active.system_prompt : null,
         });
         if (active) {
           const cur = get();
           if (cur.sessionId === null && cur.mode === null) {
-            // No session has ever existed in this window yet — seed from the
-            // last-known values for this provider so the dropdowns don't start
-            // blank (see the cache's doc comment above).
+            // No session has ever existed in this window yet — seed mode from
+            // the last-known values for this provider so the badge doesn't
+            // start blank (see the cache's doc comment). Effort isn't cached
+            // (it's provider-dependent) so it stays hidden until a session
+            // exists to derive it against.
             const cached = readCachedModeInfo(active.id);
             if (cached) {
               set({
                 mode: cached.mode,
                 availableModes: cached.availableModes,
-                thinkingEffort: cached.thinkingEffort,
               });
             }
-          } else if (cur.sessionId !== null && cur.mode !== null) {
-            // A real session's values are live — refresh the cache for next time.
-            writeCachedModeInfo(active.id, {
-              mode: cur.mode,
-              availableModes: cur.availableModes,
-              thinkingEffort: cur.thinkingEffort,
-            });
+          } else if (cur.sessionId !== null) {
+            // A live session: the provider or model may have just changed, so
+            // re-derive the effort control against the now-active provider —
+            // this is what makes the dropdown appear/disappear/re-scope on a
+            // mid-session provider switch (e.g. Claude → local) without a
+            // reload. Best-effort: a failure leaves the current value alone.
+            try {
+              const thinkingEffort = await ipc.getThinkingEffort(cur.sessionId);
+              set({ thinkingEffort });
+            } catch {
+              // keep whatever's showing
+            }
+            if (cur.mode !== null) {
+              // Refresh the mode cache for next time (effort excluded — see above).
+              writeCachedModeInfo(active.id, {
+                mode: cur.mode,
+                availableModes: cur.availableModes,
+              });
+            }
           }
         }
       } catch {
@@ -1139,6 +1172,8 @@ export const useChatStore = create<ChatState>((set, get) => {
           model: null,
           providerName: null,
           stripReasoning: false,
+          providerSupportsVision: false,
+          providerHasTools: true,
           systemPrompt: null,
         });
       }
@@ -1149,9 +1184,6 @@ export const useChatStore = create<ChatState>((set, get) => {
       // window shows it — previously this only set the session id, leaving the
       // window blank until the next streamed token. loadSession does the replay
       // plus mode/provider/approval setup; goosed is the source of truth.
-      // Capture the pre-replay epoch so the snapshot below can detect a New
-      // Chat / session switch that landed during the replay await.
-      const epoch = get().sessionEpoch;
       await get().loadSession(info.session_id, info.cwd);
       // If handed off mid-turn, overwrite whatever the replay produced with
       // the overlay's own accurate render-state snapshot — session/load's
@@ -1162,7 +1194,13 @@ export const useChatStore = create<ChatState>((set, get) => {
       // further live deltas for this session (still arriving, since goosed
       // keeps generating) append to it normally instead of spawning a
       // duplicate.
-      if (info.messages && epoch === get().sessionEpoch) {
+      //
+      // Gate on session IDENTITY, not the epoch: loadSession itself bumps
+      // `sessionEpoch`, so an epoch captured before it can never match after
+      // it — the snapshot was silently never applied. A New Chat / session
+      // switch that landed during the replay await still skips the snapshot,
+      // because it leaves this window bound to a different (or no) session.
+      if (info.messages && get().sessionId === info.session_id) {
         set({ messages: info.messages, artifacts: info.artifacts ?? [] });
       }
     },
@@ -1184,6 +1222,7 @@ export const useChatStore = create<ChatState>((set, get) => {
             current_mode: s.mode ?? 'auto',
             available_modes: s.availableModes,
             thinking_effort: s.thinkingEffort,
+            is_default_folder: s.isDefaultFolder,
             // Snapshot of live render state, for adoptSession() to apply after
             // its replay — see that action's own comment for why this is
             // needed (session/load's replay alone can drop an in-progress
@@ -1192,20 +1231,38 @@ export const useChatStore = create<ChatState>((set, get) => {
             artifacts: s.artifacts,
           }
         : null;
-      await ipc.openNewChatWindow(handoff);
-      await ipc.hideOverlay();
+      // A rejected window-open/hide pair used to escape as an unhandled
+      // rejection and leave the overlay showing the just-handed-off session
+      // with a dead Stop button — surface it instead and keep local state
+      // (the handoff didn't happen, so nothing here should reset).
+      try {
+        await ipc.openNewChatWindow(handoff);
+        await ipc.hideOverlay();
+      } catch (e) {
+        set({ error: String(e) });
+        return;
+      }
       // No new goosed session is created here — ensureSession() lazily makes
       // one the next time this (now-blank) overlay actually sends a message.
       clearStopGrace();
       discardDeltas();
       set({
         sessionId: null,
+        // Bump the epoch like every other session-changing action: an
+        // in-flight loadSession replay for the handed-off session must not
+        // land its completion set on this now-blank overlay.
+        sessionEpoch: get().sessionEpoch + 1,
         cwd: null,
         chatDir: null,
         title: null,
         mode: null,
         availableModes: [],
         thinkingEffort: null,
+        isDefaultFolder: true,
+        sessionProviderId: null,
+        sessionModelId: null,
+        sessionConcluded: false,
+        replaying: false,
         messages: [],
         artifacts: [],
         droppedFiles: [],
@@ -1219,16 +1276,17 @@ export const useChatStore = create<ChatState>((set, get) => {
         // linger on a blank chat.
         backgroundSession: null,
         backgroundTurnToast: null,
-        modeOverride: null,
-        savedApprovalMode: null,
         error: null,
         errorType: null,
         providerOffline: false,
         busy: false,
+        warning: null,
+        compactionNotice: null,
         stopPhase: null,
         abandonedSession: null,
         loopSuspected: false,
         activeRecipeTurn: null,
+        pendingForcedAnswer: null,
       });
     },
 
@@ -1263,12 +1321,6 @@ export const useChatStore = create<ChatState>((set, get) => {
       // (which captured the previous epoch) will see the mismatch in its
       // finally and skip applying its stale replay state to this new chat.
       const epoch = get().sessionEpoch + 1;
-      // Capture the outgoing mode override BEFORE the optimistic clear below —
-      // the clear (naturally) nulls `modeOverride`, so reading it after set()
-      // would always fall back to 'chat' and the value could never matter.
-      // Carrying it forward to the new session mirrors the stripReasoning
-      // swap's behavior (same conversation from the user's perspective).
-      const outgoingModeOverride = get().modeOverride;
       // Optimistic clear (owner: New Chat should manifest instantly, not only
       // once the ACP round trip(s) finish) — the blank chat shows immediately;
       // `sessionId: null` here is safe against a concurrent send() racing in
@@ -1296,6 +1348,11 @@ export const useChatStore = create<ChatState>((set, get) => {
         replaying: false,
         cwd: null,
         chatDir: null,
+        // Blank-chat default until the real `session/new` response lands with
+        // the actual value — leaving the outgoing session's folder pill on a
+        // fresh chat would show (and offer a no-op reset for) a folder this
+        // new session never had.
+        isDefaultFolder: true,
         creatingSession: true,
         title: null,
         messages: [],
@@ -1311,8 +1368,6 @@ export const useChatStore = create<ChatState>((set, get) => {
         // already removes exactly the paths it added once that flow settles,
         // so nothing can linger.
         pendingApprovals: [],
-        modeOverride: null,
-        savedApprovalMode: null,
         error: null,
         errorType: null,
         providerOffline: false,
@@ -1320,15 +1375,18 @@ export const useChatStore = create<ChatState>((set, get) => {
         sessionProviderId: null,
         sessionModelId: null,
         sessionConcluded: false,
+        warning: null,
+        compactionNotice: null,
         stopPhase: null,
         abandonedSession: null,
         loopSuspected: false,
         activeRecipeTurn: null,
+        pendingForcedAnswer: null,
       });
       try {
         let info: SessionInfo;
         try {
-          info = await getOrCreateSession(cwd, outgoingModeOverride ?? 'chat');
+          info = await getOrCreateSession(cwd);
         } catch (e) {
           // Suppress the transient "resource not found" goosed throws when
           // New Chat lands immediately after deleting the chat that was
@@ -1336,12 +1394,23 @@ export const useChatStore = create<ChatState>((set, get) => {
           // error for a race that isn't actually their new session's fault.
           if (Date.now() - recentOwnSessionDeleteAt > OWN_DELETE_RETRY_WINDOW_MS) throw e;
           recentOwnSessionDeleteAt = 0;
-          info = await getOrCreateSession(cwd, outgoingModeOverride ?? 'chat');
+          info = await getOrCreateSession(cwd);
         }
         recentOwnSessionDeleteAt = 0;
+        // Epoch re-check: a loadSession (or a second New Chat) that started
+        // while this create was in flight bumped the epoch — applying this
+        // late-arriving result would clobber that newer session's id/cwd/mode
+        // while leaving its messages in place. `creatingSession` is still
+        // ours to clear either way: nobody else resets it, and a stale skip
+        // would otherwise pin the composer in its non-interactive state.
+        if (epoch !== get().sessionEpoch) {
+          set({ creatingSession: false });
+          return;
+        }
         set({
           sessionId: info.session_id,
           cwd: info.cwd,
+          isDefaultFolder: info.is_default_folder,
           chatDir: info.cwd,
           mode: info.current_mode,
           availableModes: info.available_modes,
@@ -1353,14 +1422,18 @@ export const useChatStore = create<ChatState>((set, get) => {
         // specific one — no data loss, nothing else depends on it.
         void ipc.bindWindowSession(info.session_id).catch(() => {});
         await get().refreshProvider();
-        await ensureSafeApprovalMode();
       } catch (e) {
         // Real, observed bug: an uncaught failure here (e.g. goosed briefly
         // down right after a Delete) used to leave `creatingSession: true`
         // forever with no session id — the composer looked alive but every
         // send silently no-opped. Surface the error and drop back to a
-        // recoverable (not "stuck loading") state instead.
-        set({ creatingSession: false, error: String(e) });
+        // recoverable (not "stuck loading") state instead. The error text
+        // itself is epoch-gated: a newer session action owns the banner now.
+        if (epoch === get().sessionEpoch) {
+          set({ creatingSession: false, error: String(e) });
+        } else {
+          set({ creatingSession: false });
+        }
       }
     },
 
@@ -1434,8 +1507,6 @@ export const useChatStore = create<ChatState>((set, get) => {
         messages: [],
         artifacts: [],
         pendingApprovals: [],
-        modeOverride: null,
-        savedApprovalMode: null,
         error: null,
         errorType: null,
         providerOffline: false,
@@ -1444,10 +1515,13 @@ export const useChatStore = create<ChatState>((set, get) => {
         sessionProviderId: resolvedProviderId,
         sessionModelId: resolvedModelId,
         sessionConcluded: false,
+        warning: null,
+        compactionNotice: null,
         stopPhase: null,
         abandonedSession: null,
         loopSuspected: false,
         activeRecipeTurn: null,
+        pendingForcedAnswer: null,
       });
       try {
         // Restore the provider this session was last used with, if it's
@@ -1460,26 +1534,30 @@ export const useChatStore = create<ChatState>((set, get) => {
         // instead mark it concluded so the composer blocks new sends while
         // still showing the history below.
         const providers = await ipc.listProviders();
+        // Every post-await set below re-checks the epoch: a New Chat / newer
+        // loadSession that started during an await must not have this stale
+        // load's mode/effort/concluded clobber its state (the finally block
+        // was already guarded this way; the mid-try sets were not).
+        if (epoch !== get().sessionEpoch) return;
         if (resolvedProviderId && resolvedModelId) {
           const matched = findMatchingProvider(providers, resolvedProviderId, resolvedModelId);
           if (matched) {
             await ipc.setSessionProvider(sessionId, matched.id, resolvedModelId);
-          } else {
+          } else if (epoch === get().sessionEpoch) {
             set({ sessionConcluded: true });
           }
         }
         const info = await ipc.loadSession(sessionId, cwd);
+        if (epoch !== get().sessionEpoch) return;
         set({
           mode: info.current_mode,
           availableModes: info.available_modes,
           thinkingEffort: info.thinking_effort,
+          isDefaultFolder: info.is_default_folder,
         });
         await get().refreshProvider(undefined);
-        const override = await ipc.getSessionMode(sessionId).catch(() => null);
-        set({ modeOverride: (override as 'chat' | 'agentic' | null) ?? null });
-        await ensureSafeApprovalMode();
       } catch (e) {
-        set({ error: String(e) });
+        if (epoch === get().sessionEpoch) set({ error: String(e) });
       } finally {
         // WS8: if the user already moved on to a different session (New Chat
         // or another loadSession) while this replay was in flight, the captured
@@ -1575,7 +1653,7 @@ export const useChatStore = create<ChatState>((set, get) => {
       // once a decision for this id has been issued (and its entry removed),
       // a second `ipc.respondPermission` for the same id would be a spurious
       // re-decision against a call that's already resolved.
-      if (!get().pendingApprovals.some((a) => a.tool_call_id === toolCallId)) return;
+      if (!get().pendingApprovals.some((a) => a.tool_call_id === toolCallId)) return false;
       try {
         await ipc.respondPermission(toolCallId, optionId);
         // Remove the approval from the pending queue only on SUCCESS — dropping
@@ -1584,53 +1662,29 @@ export const useChatStore = create<ChatState>((set, get) => {
         set((s) => ({
           pendingApprovals: s.pendingApprovals.filter((a) => a.tool_call_id !== toolCallId),
         }));
+        return true;
       } catch (e) {
         set({ error: String(e) });
+        // Reported to the caller (ApprovalPrompt) so it can unlatch its
+        // `submitted` state — otherwise a failed respond leaves the prompt
+        // rendered but unclickable with the turn hung server-side.
+        return false;
       }
     },
 
     setMode: async (modeId: string) => {
       const sid = get().sessionId;
       if (!sid) return;
+      const prev = get().mode;
       set({ mode: modeId });
       try {
         await ipc.setMode(sid, modeId);
       } catch (e) {
+        // Roll back the optimistic flip — the badge was showing a mode the
+        // session never actually entered. Guarded so a mode/session change
+        // that landed after this call isn't clobbered by the revert.
+        if (get().sessionId === sid && get().mode === modeId) set({ mode: prev });
         set({ error: String(e) });
-      }
-    },
-
-    setModeOverride: async (mode: 'chat' | 'agentic' | null) => {
-      const sessionId = get().sessionId;
-      const wasChatMode = isChatMode(get());
-      set({ modeOverride: mode });
-      const nowChatMode = isChatMode(get());
-      if (sessionId)
-        void ipc.setSessionMode(sessionId, mode).catch((e) => set({ error: String(e) }));
-
-      if (!wasChatMode && nowChatMode) {
-        // agentic → chat: nothing should keep running/waiting on tools. Decline
-        // every pending approval, save the approval mode so flipping back can
-        // restore it, then force approve (never auto) for the rest of chat mode.
-        const approvals = get().pendingApprovals;
-        for (const a of approvals) {
-          await get().respondApproval(a.tool_call_id, pickRejectOption(a.options));
-        }
-        set({ pendingApprovals: [], savedApprovalMode: get().mode });
-        await ensureSafeApprovalMode();
-        // Any agentic-mode path references would leak into a chat-mode prompt —
-        // route them through the same inline-content path a chat-mode drop uses.
-        const files = get().droppedFiles;
-        if (files.length) {
-          set({ droppedFiles: [] });
-          for (const f of files) await inlineFileAsAttachment(f);
-        }
-      } else if (wasChatMode && !nowChatMode) {
-        // chat → agentic: history/tools are already live goosed-side; just
-        // restore whatever approval mode was in effect before the flip to chat.
-        const saved = get().savedApprovalMode;
-        if (sessionId && saved) await get().setMode(saved);
-        set({ savedApprovalMode: null });
       }
     },
 
@@ -1665,7 +1719,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         // they ever reach droppedFiles/inlineFileAsAttachment, rather than
         // sending a picture a text-only model will just fail (or silently
         // ignore) on. Non-image files in the same drop still go through.
-        if (!supportsImages(get().model)) {
+        if (!modelAcceptsImages(get().model, get().providerSupportsVision)) {
           const rejected = infos.filter((f) => !f.is_dir && isImageFileName(f.name));
           if (rejected.length) {
             infos = infos.filter((f) => !rejected.includes(f));
@@ -1682,13 +1736,20 @@ export const useChatStore = create<ChatState>((set, get) => {
             warning: `Attaching files will send their contents to ${providerHost ?? 'an untrusted provider'}, which you haven't marked trusted.`,
           });
         }
-        // Chat mode (Phase 9 / Round-4 toggle): inline file *content* rather
-        // than sending paths. Any file type is accepted now (item 13).
-        if (isChatMode(get())) {
+        // Which of the two handoffs a drop gets is now decided by what the
+        // provider can actually do, not by a mode the user had to set.
+        //
+        // Handing over a *path* is the better deal whenever it's possible: the
+        // model reads only what it needs, and a 200MB CSV costs no context.
+        // But it is worse than useless against a provider with no filesystem
+        // tools — the model gets a path it can never open. So a toolless
+        // provider inlines the file's content instead, which is the only
+        // handoff that can work there.
+        if (!get().providerHasTools) {
           for (const f of infos) await inlineFileAsAttachment(f);
           return;
         }
-        // Agentic: hand paths to the filesystem tools (works for any file type).
+        // Hand paths to the filesystem tools (works for any file type).
         set((s) => {
           const seen = new Set(s.droppedFiles.map((f) => f.path));
           return { droppedFiles: [...s.droppedFiles, ...infos.filter((f) => !seen.has(f.path))] };
@@ -1721,9 +1782,30 @@ export const useChatStore = create<ChatState>((set, get) => {
         await get().newSession(folder);
         return;
       }
+      const sid = s.sessionId;
       try {
-        await ipc.setSessionContextDir(s.sessionId, folder);
-        set({ cwd: folder });
+        await ipc.setSessionContextDir(sid, folder);
+        // A session switch that landed mid-await must not have the OLD
+        // session's folder stamped onto the new one.
+        if (get().sessionId !== sid) return;
+        set({ cwd: folder, isDefaultFolder: false });
+      } catch (e) {
+        set({ error: String(e) });
+      }
+    },
+
+    resetWorkingDir: async () => {
+      // "Return to thought partner": repoint the session back to a fresh
+      // private per-chat folder (the default state). No-op if there's no
+      // session yet or it's already in the default state.
+      const s = get();
+      if (!s.sessionId || s.isDefaultFolder) return;
+      const sid = s.sessionId;
+      try {
+        const info = await ipc.resetSessionContextDir(sid);
+        // Same mid-await session-switch guard as setWorkingDir above.
+        if (get().sessionId !== sid) return;
+        set({ cwd: info.cwd, chatDir: info.cwd, isDefaultFolder: info.is_default_folder });
       } catch (e) {
         set({ error: String(e) });
       }
@@ -1745,7 +1827,7 @@ export const useChatStore = create<ChatState>((set, get) => {
       set((s) => ({ attachments: s.attachments.filter((a) => a.id !== id) })),
 
     addPendingImage: (mime: string, dataUrl: string) => {
-      if (!supportsImages(get().model)) {
+      if (!modelAcceptsImages(get().model, get().providerSupportsVision)) {
         set({ warning: "The active model doesn't support images — the image wasn't attached." });
         return;
       }
@@ -1772,24 +1854,11 @@ export const useChatStore = create<ChatState>((set, get) => {
     },
 
     branch: async (uiIndex: number) => {
-      const { sessionId, cwd, title, modeOverride } = get();
+      const { sessionId, cwd, title } = get();
       if (!sessionId || !cwd) return;
       try {
         // Keep history up to and including the clicked message, diverge after.
         const info = await ipc.forkSession(sessionId, cwd, uiIndex + 1);
-        // A fork is a brand-new session id with no persisted mode override of
-        // its own — carry the current one forward (same conversation from the
-        // user's perspective), mirroring send()'s stripReasoning swap. Must be
-        // awaited *before* loadSession, which reads it straight back via
-        // getSessionMode — a fire-and-forget write here would race that read.
-        if (modeOverride) {
-          await ipc.setSessionMode(info.session_id, modeOverride).catch((e) => {
-            // Not fatal — loadSession still proceeds — but the fork silently
-            // loses its carried-forward mode override and falls back to
-            // default mode detection instead, a real behavior difference.
-            console.warn('setSessionMode failed on branch, mode override may not carry over', e);
-          });
-        }
         set({ title: title ? `Branch of ${title}` : 'Branch' });
         await get().loadSession(info.session_id, info.cwd, get().title ?? undefined);
       } catch (e) {
@@ -1861,7 +1930,17 @@ export const useChatStore = create<ChatState>((set, get) => {
           payload?.images?.length ? payload.images : undefined
         );
       } catch (e) {
-        set({ busy: false, error: String(e) });
+        // The reconsidered turn never started — un-collapse the original
+        // answer, or it stays hidden behind "Previous attempt" with no
+        // replacement and no way back. Identity-checked: a session reset
+        // during the await may have replaced the list entirely.
+        set((s) => {
+          const msgs = s.messages.slice();
+          if (msgs[assistantIndex]?.id === target.id) {
+            msgs[assistantIndex] = { ...msgs[assistantIndex], superseded: false };
+          }
+          return { messages: msgs, busy: false, error: String(e) };
+        });
       }
     },
 
@@ -1914,10 +1993,29 @@ export const useChatStore = create<ChatState>((set, get) => {
       const promptToSend = resolvedPromptText.trim() || `Run the "${recipe.title}" recipe.`;
       sendInFlight = true;
       try {
-        const sessionId = await get().ensureSession(); // current session if one
-        // exists, else lazily creates one — the exact call send() itself makes;
-        // a mid-conversation invocation and a blank-chat invocation need no
-        // special-casing between them.
+        // Captured BEFORE ensureSession(): when this invocation lazily creates
+        // the session, newSession()'s optimistic clear wipes the composer's
+        // droppedFiles/attachments/pendingImages — reading them only inside
+        // doSend (after that clear) silently dropped a recipe-invocation's
+        // pasted attachments and dropped files.
+        const snapshot = {
+          droppedFiles: get().droppedFiles,
+          attachments: get().attachments,
+          pendingImages: get().pendingImages,
+        };
+        let sessionId: string;
+        try {
+          sessionId = await get().ensureSession(); // current session if one
+          // exists, else lazily creates one — the exact call send() itself makes;
+          // a mid-conversation invocation and a blank-chat invocation need no
+          // special-casing between them.
+        } catch (e) {
+          // Same treatment as doSend's own ensureSession failure — without a
+          // catch here this escaped as an unhandled rejection at the `void`
+          // call site in the composer.
+          set({ error: String(e) });
+          return;
+        }
         for (const ext of launchableExtensions(recipe.extensions)) {
           void ipc.addRecipeExtension(sessionId, ext).catch((e) => {
             // The model's later tool calls for this extension will surface
@@ -1927,15 +2025,6 @@ export const useChatStore = create<ChatState>((set, get) => {
             console.warn(`addRecipeExtension failed for "${ext.name}"`, e);
           });
         }
-        let flippedToAgentic = false;
-        if (isChatMode(get())) {
-          // Recipes are inherently tool-using — flip to agentic so declared/
-          // default extensions can actually execute, reusing the existing
-          // chat<->agentic flip verbatim (it already handles approval-mode
-          // save/restore and pending-approval cleanup correctly).
-          await get().setModeOverride('agentic');
-          flippedToAgentic = true;
-        }
         set({
           pendingRecipeCard: {
             title: recipe.title,
@@ -1943,14 +2032,13 @@ export const useChatStore = create<ChatState>((set, get) => {
             maxReasoningTokens: recipe.max_reasoning_tokens,
           },
         });
-        const submitted = await doSend(promptToSend);
+        const submitted = await doSend(promptToSend, snapshot);
         if (!submitted) {
           // The turn never actually started (session creation failed or the
           // send aborted) — undo the side effects this recipe already applied
           // so they don't leak into a later unrelated message: drop the
-          // pending card and flip back out of agentic if we flipped in.
+          // pending card.
           set({ pendingRecipeCard: null });
-          if (flippedToAgentic) void get().setModeOverride('chat');
         }
       } finally {
         sendInFlight = false;
@@ -1960,19 +2048,6 @@ export const useChatStore = create<ChatState>((set, get) => {
     bindEvents: () => {
       if (bound) return;
       bound = true;
-
-      // Recipe list — fetched once, kept fresh via the changed-event. Read by
-      // the composer's slash-command matching (Recipes settings panel fetches
-      // independently, same as scheduled tasks don't share a list either).
-      const refreshRecipes = () =>
-        // Best-effort: a failure just leaves the slash-command list stale
-        // until the next onRecipesChanged event or window reload.
-        void ipc
-          .listRecipes()
-          .then((recipes) => set({ recipes }))
-          .catch(() => {});
-      refreshRecipes();
-      void onRecipesChanged(refreshRecipes);
 
       // Events count only for the active session, and never for a turn the user
       // force-stopped (Round-5) — that abandonment is cleared when the next
@@ -2136,6 +2211,11 @@ export const useChatStore = create<ChatState>((set, get) => {
             mode: null,
             availableModes: [],
             thinkingEffort: null,
+            isDefaultFolder: true,
+            sessionProviderId: null,
+            sessionModelId: null,
+            sessionConcluded: false,
+            replaying: false,
             messages: [],
             artifacts: [],
             droppedFiles: [],
@@ -2143,16 +2223,17 @@ export const useChatStore = create<ChatState>((set, get) => {
             pendingImages: [],
             pendingAttachments: [],
             pendingApprovals: [],
-            modeOverride: null,
-            savedApprovalMode: null,
             error: null,
             errorType: null,
             providerOffline: false,
             busy: false,
+            warning: null,
+            compactionNotice: null,
             stopPhase: null,
             abandonedSession: null,
             loopSuspected: false,
             activeRecipeTurn: null,
+            pendingForcedAnswer: null,
           });
         }
       });
@@ -2180,6 +2261,11 @@ export const useChatStore = create<ChatState>((set, get) => {
             mode: null,
             availableModes: [],
             thinkingEffort: null,
+            isDefaultFolder: true,
+            sessionProviderId: null,
+            sessionModelId: null,
+            sessionConcluded: false,
+            replaying: false,
             messages: [],
             artifacts: [],
             droppedFiles: [],
@@ -2187,16 +2273,17 @@ export const useChatStore = create<ChatState>((set, get) => {
             pendingImages: [],
             pendingAttachments: [],
             pendingApprovals: [],
-            modeOverride: null,
-            savedApprovalMode: null,
             error: null,
             errorType: null,
             providerOffline: false,
             busy: false,
+            warning: null,
+            compactionNotice: null,
             stopPhase: null,
             abandonedSession: null,
             loopSuspected: false,
             activeRecipeTurn: null,
+            pendingForcedAnswer: null,
           });
         }
       });
@@ -2230,7 +2317,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         // seamless in practice, in both modes now, rather than prompting
         // for everything.
         const s0 = get();
-        const dirs = isChatMode(s0) ? [s0.cwd] : [s0.chatDir, s0.cwd];
+        const dirs = [s0.chatDir, s0.cwd];
         // Tool-loop guard (owner-reported bug): a model can get stuck
         // alternating tools (e.g. web-fetch ↔ its own cache step) against
         // the same target — each call is real network/disk I/O, so this

@@ -35,6 +35,7 @@ const COPY: Partial<Record<StackStatus, Copy>> = {
 
 export function StackStatusView({ status }: { status: StackStatus }) {
   const [busy, setBusy] = useState(false);
+  const [restartError, setRestartError] = useState<string | null>(null);
 
   if (status === 'ok' || status === 'starting') return null;
 
@@ -58,6 +59,11 @@ export function StackStatusView({ status }: { status: StackStatus }) {
       <p className="muted" style={{ margin: 0 }}>
         {copy.body}
       </p>
+      {restartError && (
+        <p className="error" style={{ margin: 0 }} role="alert">
+          Restart failed: {restartError}
+        </p>
+      )}
       <div className="actions">
         <button className="primary" onClick={() => ipc.openSettings(section)}>
           Fix this
@@ -67,10 +73,15 @@ export function StackStatusView({ status }: { status: StackStatus }) {
             disabled={busy}
             onClick={async () => {
               setBusy(true);
+              setRestartError(null);
               try {
                 await ipc.restartBackend();
                 // Reconnect + rebuild the active session (resume by id).
                 await useChatStore.getState().reloadCurrent();
+              } catch (e) {
+                // Previously escaped the onClick uncaught — the button just
+                // re-enabled with no sign anything went wrong.
+                setRestartError(String(e));
               } finally {
                 setBusy(false);
               }

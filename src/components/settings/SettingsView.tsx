@@ -1,6 +1,8 @@
 import { Fragment, useEffect, useState } from 'react';
 import { ipc } from '@/lib/ipc';
 import { useRouteStore } from '@/stores/routeStore';
+import { isAndroid } from '@/lib/platform';
+import { KittyIcon } from '@/components/icons/KittyIcon';
 import { General } from '@/components/settings/General';
 import { Providers } from '@/components/settings/Providers';
 import { LocalModels } from '@/components/settings/LocalModels';
@@ -15,21 +17,27 @@ import { DomainProfiles } from '@/components/settings/DomainProfiles';
 import { ScheduledTasks } from '@/components/settings/ScheduledTasks';
 import { Recipes } from '@/components/settings/Recipes';
 
-const SECTION_LABELS: Record<string, string> = {
-  general: 'General',
-  providers: 'Providers',
-  local_models: 'Local Models',
-  mcp_servers: 'MCP Servers',
-  scheduled_tasks: 'Scheduled Tasks',
-  recipes: 'Recipes',
-  adaptive_pathway: 'Adaptive Pathway',
-  ap_graph_health: 'Graph Health',
-  ap_domains: 'Domain Profiles',
-  notifications: 'Notifications',
-  appearance: 'Appearance',
-  advanced: 'Advanced',
-  setup: 'Setup & Repair',
-};
+/** Android calls it "Support Models" because that is all it can be there:
+    chat never runs locally (D18), so the only GGUFs on a phone are the
+    summarizer and the embedder. Desktop keeps "Local Models" — it *can* run
+    chat locally, and calling a chat model a support model would be wrong. */
+function sectionLabels(): Record<string, string> {
+  return {
+    general: 'General',
+    providers: 'Providers',
+    local_models: isAndroid() ? 'Support Models' : 'Local Models',
+    mcp_servers: 'MCP Servers',
+    scheduled_tasks: 'Scheduled Tasks',
+    recipes: 'Recipes',
+    adaptive_pathway: 'Adaptive Pathway',
+    ap_graph_health: 'Graph Health',
+    ap_domains: 'Domain Profiles',
+    notifications: 'Notifications',
+    appearance: 'Appearance',
+    advanced: 'Advanced',
+    setup: 'Setup & Repair',
+  };
+}
 
 /** Three groups, in nav order (settings IA overhaul). Graph Health / Domain
     Profiles only appear once Adaptive Pathway is actually enabled — no point
@@ -40,7 +48,20 @@ function buildGroups(apEnabled: boolean): { label: string; sections: string[] }[
   return [
     {
       label: 'Essentials',
-      sections: ['general', 'providers', 'local_models', 'appearance', 'notifications'],
+      // Notifications are the OS's job on Android: the system Settings app
+      // owns per-channel control there, and a second in-app copy would be a
+      // set of toggles that the OS can silently override.
+      sections: [
+        // General is desktop-only: on Android everything in it is either
+        // desktop-only (hotkeys/clipboard/autostart) or relocated — the chats
+        // folder defaults to app-private storage, and "Clear all chat history"
+        // moves to Advanced. Rendering an almost-empty General is just clutter.
+        ...(isAndroid() ? [] : ['general']),
+        'providers',
+        'local_models',
+        'appearance',
+        ...(isAndroid() ? [] : ['notifications']),
+      ],
     },
     { label: 'Automation & extensions', sections: ['mcp_servers', 'scheduled_tasks', 'recipes'] },
     {
@@ -64,7 +85,11 @@ export function SettingsView() {
   const routedSection = useRouteStore((s) => s.settingsSection);
   const routedHighlight = useRouteStore((s) => s.settingsHighlight);
   const goto = useRouteStore((s) => s.goto);
-  const [section, setSection] = useState<string>(routedSection ?? 'general');
+  // General doesn't exist on Android (removed above), so it can't be the
+  // default landing section there — start on Providers instead.
+  const [section, setSection] = useState<string>(
+    routedSection ?? (isAndroid() ? 'providers' : 'general'),
+  );
   const [highlight, setHighlight] = useState<string | null>(routedHighlight);
   const [apEnabled, setApEnabled] = useState(false);
   const [recoveryNotice, setRecoveryNotice] = useState<string | null>(null);
@@ -90,6 +115,7 @@ export function SettingsView() {
   }, [section]);
 
   const groups = buildGroups(apEnabled);
+  const labels = sectionLabels();
 
   return (
     <div className="settings-window">
@@ -102,11 +128,26 @@ export function SettingsView() {
         </div>
       )}
       <nav className="settings-nav">
-        {/* Settings used to be its own window, so closing it was the window
-            chrome's job. As a route it needs its own way out, or the user is
-            stranded with no path back to their conversation. */}
-        <button className="settings-nav-back" onClick={() => goto('chat')}>
-          ‹ Back to chat
+        {/* The mark doubles as the way out. Settings used to be its own
+            window, so closing it was the window chrome's job; as a route it
+            still needs an escape hatch or a desktop user is stranded with no
+            path back to their conversation (Android has the tab bar, desktop
+            has nothing else).
+            This carried the logo alone for a while, on the theory that
+            click-the-logo-to-go-home is a convention strong enough not to need
+            labelling. It isn't here: the logo is also just the app's mark at
+            the top of a nav, which reads as decoration rather than a control,
+            and the only hint otherwise was a tooltip you had to hover to find.
+            The label is desktop-only because Android navigates by tab bar and
+            never renders this nav as an escape hatch. */}
+        <button
+          className="settings-nav-home"
+          onClick={() => goto('chat')}
+          title="Back to chat"
+          aria-label="Back to chat"
+        >
+          <KittyIcon />
+          {!isAndroid() && <span>Return to chat</span>}
         </button>
         {groups.map((g) => (
           <Fragment key={g.label}>
@@ -120,7 +161,7 @@ export function SettingsView() {
                   setHighlight(null);
                 }}
               >
-                {SECTION_LABELS[id]}
+                {labels[id]}
               </button>
             ))}
           </Fragment>

@@ -10,7 +10,8 @@
 
 use kitty_tools::server::KittyToolsServer;
 
-/// All 22 always-on tools this server exposes, sorted, plus 4 more
+/// All 22 always-on tools this server exposes, sorted (**21 on Android**,
+/// where `lean_shell` is compiled out), plus 4 more
 /// (`generate_accessible_table`/`generate_accessible_svg`/
 /// `generate_accessible_chart`/`generate_accessible_mermaid`) when
 /// `KITTY_VIZ_ENABLED=1`. `lean_word_*`
@@ -50,6 +51,13 @@ const ALWAYS_ON_TOOLS: &[&str] = &[
     "lean_scratchpad_get",
     "lean_scratchpad_list",
     "lean_scratchpad_set",
+    // Compiled out on Android — `server.rs` gates the registration with the
+    // same `cfg`, because an app-sandbox shell backed by toybox isn't a
+    // useful `lean_shell` for a model to drive. The gate has to be repeated
+    // here or this list asserts a surface the server never advertises there,
+    // and the suite fails on a target it has nothing to say about
+    // (docs/ANDROID.md §2.4).
+    #[cfg(not(target_os = "android"))]
     "lean_shell",
     "lean_word_read_outline",
     "lean_word_read_text",

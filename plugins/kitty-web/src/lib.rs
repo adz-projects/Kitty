@@ -17,6 +17,7 @@ pub mod query_filter;
 pub mod scrape;
 pub mod search;
 pub mod server;
+pub mod ssrf;
 
 use rmcp::ServiceExt;
 use tokio::io::{AsyncRead, AsyncWrite};

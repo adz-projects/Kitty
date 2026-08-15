@@ -148,6 +148,14 @@ impl Db {
         session_recall_ids: &[String],
         reason: SuppressReason,
     ) -> Result<Option<String>> {
+        // An empty/whitespace needle matches *every* belief under the
+        // substring resolution below (`""` is a substring of everything) —
+        // refuse it up front rather than tombstoning an arbitrary belief
+        // (audit #116).
+        if what.trim().is_empty() {
+            self.audit("forget", Some("unresolved: <empty>")).await.ok();
+            return Ok(None);
+        }
         let now = Utc::now();
         // resolve: prefer session recall ids (exact/substring), else
         // global text-substring, else top-1 semantic cosine above 0.80.
@@ -285,6 +293,10 @@ impl Db {
 
     /// Find a belief whose text contains `what_lower` (substring match).
     async fn lookup_by_text(&self, what_lower: &str) -> Result<Option<crate::store::beliefs::Belief>> {
+        // An empty needle contains-matches every belief (audit #116).
+        if what_lower.trim().is_empty() {
+            return Ok(None);
+        }
         let all = self.list_beliefs(None).await?;
         // prefer exact/contains-match by longest shared overlap; first is fine
         // for the forget() use-case (the model echoes a full statement).
@@ -452,6 +464,51 @@ mod tests {
         let db = Db::open_in_memory().await.unwrap();
         let dropped = db.forget_belief_by_id("nonexistent", SuppressReason::Wrong).await.unwrap();
         assert_eq!(dropped, None);
+    }
+
+    #[tokio::test]
+    async fn forget_by_text_with_an_empty_needle_tombstones_nothing() {
+        // Audit #116: an empty correction reached `lookup_by_text`, whose
+        // `contains("")` matched the first belief in the table — a junk
+        // `[""]` correction tombstoned an arbitrary belief.
+        let db = Db::open_in_memory().await.unwrap();
+        let now = Utc::now();
+        db.insert_belief(&crate::store::beliefs::Belief {
+            id: "b1".into(),
+            text: "The user prefers dark mode.".into(),
+            embedding: vec![1.0, 0.0],
+            confidence: 0.7,
+            provenance: crate::store::beliefs::Provenance::DirectStatement,
+            layer: crate::store::beliefs::Layer::Context,
+            tested: true,
+            domain: None,
+            tier: "context".into(),
+            support_count: 1,
+            distinct_sessions: 1,
+            contradict_count: 0,
+            pinned: false,
+            last_confirmed_at: Some(now),
+            consolidated_at: None,
+            created_at: now,
+            updated_at: now,
+            session_id: None,
+            embedding_model: crate::config::DEFAULT_EMBEDDING_MODEL.into(),
+        })
+        .await
+        .unwrap();
+
+        let dropped = db.forget_by_text("", &[], &[], SuppressReason::Wrong).await.unwrap();
+        assert_eq!(dropped, None);
+        let dropped = db.forget_by_text("   ", &[], &[], SuppressReason::Wrong).await.unwrap();
+        assert_eq!(dropped, None);
+
+        // The belief must be untouched: no suppression, no tombstone.
+        let text_hash = crate::belief::synthesis::text_hash("The user prefers dark mode.");
+        assert!(!db.is_text_suppressed(&text_hash, Utc::now()).await.unwrap());
+
+        // And a real forget still resolves it.
+        let dropped = db.forget_by_text("dark mode", &[], &[], SuppressReason::Wrong).await.unwrap();
+        assert_eq!(dropped.as_deref(), Some("The user prefers dark mode."));
     }
 
     #[tokio::test]

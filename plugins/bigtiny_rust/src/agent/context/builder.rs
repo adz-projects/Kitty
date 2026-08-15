@@ -3,7 +3,7 @@ use sqlx::SqlitePool;
 
 use crate::agent::compaction::{
     apply_content_mask, apply_tool_mask, emergency_trim, find_reserve_floor_rowid,
-    render_memory_block,
+    render_memory_block, stored_content_as_text,
 };
 use crate::agent::tokens::count_messages_tokens;
 use crate::config::TokenManagementConfig;
@@ -141,9 +141,19 @@ impl ContextBuilder {
 
         let _anchor_first_user = first_user_row.is_some();
         if let Some(row) = &first_user_row {
+            // A first message with image attachments stores `content` as a
+            // blocks JSON array full of base64 payloads — inlining it here
+            // would put megabytes of base64 into the permanent system head
+            // of EVERY turn. Collapse non-text blocks to a placeholder.
             messages.push(json!({
                 "role": "system",
-                "content": format!("[Original request]\n{}", row.content.as_deref().unwrap_or(""))
+                "content": format!(
+                    "[Original request]\n{}",
+                    stored_content_as_text(
+                        row.content.as_deref().unwrap_or(""),
+                        row.content_format.as_deref()
+                    )
+                )
             }));
         }
 
@@ -169,14 +179,18 @@ impl ContextBuilder {
             live_rows.retain(|r| r.rowid != fur.rowid);
         }
 
-        let live_token_sum: i32 = live_rows.iter().map(|r| r.token_count.unwrap_or(0)).sum();
-
         let live_messages: Vec<Value> = live_rows.iter().map(row_to_message).collect();
 
         let reserve_floor = find_reserve_floor_rowid(&live_messages, self.reserve_exchanges);
         let live_messages = apply_tool_mask(&live_messages, reserve_floor, &self.config);
         let live_messages = apply_content_mask(&live_messages, reserve_floor, &self.config);
         let live_messages = self.enforce_live_tail_budget(&live_messages, reserve_floor);
+
+        // Computed from the FINAL live messages (post-masking, post-budget),
+        // not the raw rows: the emergency valve below compares this against
+        // the cap, and the pre-masking sum could trip the destructive trim
+        // when the tail was already under budget.
+        let live_token_sum: i32 = count_messages_tokens(&live_messages);
 
         let head = messages.clone();
         messages.extend(live_messages);
@@ -409,9 +423,38 @@ impl ContextBuilder {
     }
 }
 
+/// Strip a trailing thought-seed prefill off `messages`, returning it.
+///
+/// `build_messages` appends the `thought_seed` as a trailing `assistant`
+/// message (an ephemeral `<think>` prefill for the provider's eyes only —
+/// see Layer 8 above). It is NOT transcript content: persisted, the literal
+/// `<think>` seed lands in saved chats, and the next turn's request would
+/// carry two adjacent assistant messages (a 400 on Anthropic). The caller
+/// (`agent::loop_::run_inner`) strips it before the first `save_messages`
+/// and hands it to the tool loop separately, which appends it to the
+/// outgoing provider request only.
+///
+/// Matches on the exact shape `build_messages` produces — a trailing
+/// `assistant` message with no DB `id` whose content is a `<think>` block —
+/// so a genuinely persisted trailing assistant message is never touched.
+pub fn strip_trailing_thought_seed(messages: &mut Vec<Value>) -> Option<Value> {
+    let is_seed = messages.last().is_some_and(|m| {
+        m.get("role").and_then(|r| r.as_str()) == Some("assistant")
+            && m.get("id").is_none()
+            && m
+                .get("content")
+                .and_then(|c| c.as_str())
+                .is_some_and(|c| c.starts_with("<think>\n"))
+    });
+    if is_seed {
+        messages.pop()
+    } else {
+        None
+    }
+}
+
 /// Convert a DB row to a message Value.
-fn row_to_message(row: &crate::storage::messages::MessageRow) -> Value {
-    let mut msg = serde_json::Map::new();
+fn row_to_message(row: &crate::storage::messages::MessageRow) -> Value {    let mut msg = serde_json::Map::new();
     msg.insert("id".to_string(), json!(row.id));
     msg.insert("rowid".to_string(), json!(row.rowid));
     msg.insert("role".to_string(), json!(row.role));
@@ -787,5 +830,122 @@ mod tests {
         let msg = row_to_message(&row);
         assert_eq!(msg.get("role").and_then(|r| r.as_str()), Some("user"));
         assert_eq!(msg.get("content").and_then(|c| c.as_str()), Some("Hello"));
+    }
+
+    /// Regression: when the first user message has images, its stored
+    /// `content` is a blocks JSON array full of base64 payloads — and that
+    /// raw JSON used to be inlined into the `[Original request]` anchor,
+    /// i.e. into the permanent system head of every turn. Non-text blocks
+    /// must collapse to a `[N image(s) attached]` placeholder.
+    #[tokio::test]
+    async fn build_messages_anchor_collapses_image_blocks_to_a_placeholder() {
+        let pool = test_pool().await;
+        sessions::create_session(&pool, "sess-1", "Test")
+            .await
+            .unwrap();
+        let builder = ContextBuilder::new(pool.clone(), TokenManagementConfig::default(), 2);
+
+        let base64_payload = "QUJD".repeat(1000); // ~4KB of stand-in base64
+        let mut seed = vec![json!({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "what is in this picture?"},
+                {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{base64_payload}")}},
+            ]
+        })];
+        builder.save_messages("sess-1", &mut seed).await.unwrap();
+
+        let messages = builder
+            .build_messages("sess-1", "next", None, None, None, None, None, None, None, None)
+            .await
+            .unwrap();
+
+        let anchor = messages
+            .iter()
+            .find(|m| {
+                m.get("content")
+                    .and_then(|c| c.as_str())
+                    .map(|c| c.contains("[Original request]"))
+                    .unwrap_or(false)
+            })
+            .expect("the anchor system message must exist");
+        let anchor_text = anchor["content"].as_str().unwrap();
+        assert!(
+            anchor_text.contains("what is in this picture?"),
+            "the text block survives: {anchor_text:?}"
+        );
+        assert!(
+            anchor_text.contains("[1 image(s) attached]"),
+            "the image collapses to a placeholder: {anchor_text:?}"
+        );
+        assert!(
+            !anchor_text.contains(&base64_payload[..64]),
+            "no base64 in the permanent system head"
+        );
+    }
+
+    /// Regression: the thought-seed prefill (a trailing `<think>` assistant
+    /// message with no id) used to be persisted into the transcript by
+    /// `save_messages`. `strip_trailing_thought_seed` must remove exactly
+    /// that message — and only that message — before persistence.
+    #[tokio::test]
+    async fn thought_seed_is_stripped_before_persistence() {
+        let pool = test_pool().await;
+        sessions::create_session(&pool, "sess-1", "Test")
+            .await
+            .unwrap();
+        let builder = ContextBuilder::new(pool.clone(), TokenManagementConfig::default(), 2);
+        let mut seed = vec![json!({"role": "user", "content": "hello"})];
+        builder.save_messages("sess-1", &mut seed).await.unwrap();
+
+        let mut messages = builder
+            .build_messages(
+                "sess-1", "next", None, None, None, None, None, None, None,
+                Some("The user prefers terse answers."),
+            )
+            .await
+            .unwrap();
+
+        let stripped = strip_trailing_thought_seed(&mut messages)
+            .expect("the seed message must be stripped");
+        assert_eq!(stripped["role"], "assistant");
+        assert!(
+            stripped["content"]
+                .as_str()
+                .unwrap()
+                .contains("The user prefers terse answers.")
+        );
+        // The user message is now last again.
+        assert_eq!(
+            messages.last().unwrap().get("role").and_then(|r| r.as_str()),
+            Some("user")
+        );
+
+        // Persisting the stripped vec must not write any `<think>` content.
+        builder.save_messages("sess-1", &mut messages).await.unwrap();
+        let rows = messages::get_messages_by_session(&pool, "sess-1")
+            .await
+            .unwrap();
+        assert!(
+            rows.iter().all(|r| {
+                r.content
+                    .as_deref()
+                    .map(|c| !c.contains("<think>"))
+                    .unwrap_or(true)
+            }),
+            "no persisted row may contain the thought seed: {rows:?}"
+        );
+    }
+
+    /// A trailing assistant message that is NOT a thought seed (a real,
+    /// already-persisted reply — it has an `id`) must never be stripped.
+    #[test]
+    fn strip_trailing_thought_seed_leaves_real_assistant_messages() {
+        let mut messages = vec![
+            json!({"role": "user", "content": "hi"}),
+            json!({"id": "m-1", "role": "assistant", "content": "<think>\nreal reply"}),
+        ];
+        assert!(strip_trailing_thought_seed(&mut messages).is_none());
+        assert_eq!(messages.len(), 2);
     }
 }

@@ -10,6 +10,11 @@
 //! Phase 2b). An Ollama server the *user* runs is still a perfectly good
 //! provider endpoint — Kitty just doesn't manage its lifecycle.
 
+// Android hosts the daemon in-process; desktop spawns it. Both go through
+// the same `BIGTINY_*` pairs in `bigtiny_env`, so the two hosts cannot drift.
+#[cfg(target_os = "android")]
+pub mod bigtiny_embedded;
+pub mod bigtiny_env;
 pub mod bigtiny_proc;
 pub mod engine_restart;
 pub(crate) mod embedding;
@@ -155,6 +160,25 @@ pub fn start_stack(app: &AppHandle) {
         };
 
         set_startup_phase(&app, StartupPhase::SpawningBackend);
+        // Android links the daemon in and starts it here; desktop spawns the
+        // bundled executable. Both produce the same `DaemonHandle`, so
+        // everything below this point is platform-agnostic (docs/ANDROID.md
+        // D8, §2.3).
+        #[cfg(target_os = "android")]
+        let spawn_result = {
+            // The spawn-only inputs have no meaning without a child process.
+            let _ = (&command, &args, &dir);
+            bigtiny_embedded::start(
+                &summarizer,
+                &token_management,
+                &memory,
+                &local,
+                pathway_enabled,
+                &pathway_embedding_model,
+            )
+            .await
+        };
+        #[cfg(not(target_os = "android"))]
         let spawn_result = bigtiny_proc::spawn(
             &command,
             &args,
@@ -264,6 +288,7 @@ mod tests {
             max_tokens: None,
             context_length: None,
             strip_reasoning: false,
+            supports_vision: false,
             system_prompt: None,
             prompt_idle_timeout_secs: None,
             parallel_slots: None,

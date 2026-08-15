@@ -1,17 +1,21 @@
 # Kitty
 
-A Windows desktop chat client and agentic AI assistant in a that includes a hotkey-
-summoned floating overlay. Kitty ships with a useful library of MCP-based
-tools for research, document parsing and creation, computation, and
+A chat client and agentic AI assistant for **Windows and Android**. On Windows
+it includes a hotkey-summoned floating overlay; on Android it is a single
+routed window with a bottom tab bar. Kitty ships with a useful library of
+MCP-based tools for research, document parsing and creation, computation, and
 system-level operations, and includes **Adaptive Pathways** — a knowledge-graph
 system that learns your preferences and suggestion patterns while actively
 resisting overfitting through ensemble diversity, novelty tracking, and
 exploration incentives.
 
 All model inference, session management, and tool orchestration runs in
-**BigTiny**, a custom Python-based REST/SSE daemon. Kitty is the
-client layer: window management, hotkeys, theming, HITL approval UI, file and
-screenshot context, provider configuration, and process lifecycle.
+**BigTiny**, a custom Rust REST/SSE daemon with llama.cpp linked in for local
+inference. Kitty is the client layer: window management, hotkeys, theming, HITL
+approval UI, file and screenshot context, provider configuration, and process
+lifecycle. On Windows the daemon is a child process; on Android the same code
+is hosted in-process, because Android will not execute a bundled binary out of
+app storage.
 
 ## What it does
 
@@ -36,11 +40,14 @@ configured). On by default (Brave preference is a separate opt-in toggle).
 WebAssembly (wasmtime + WASI) interpreter for exact math, data filtering,
 and statistical computation. On by default, no credentials required; its
 CPython guest ships with the app so first use is offline.
-* **adaptive-pathway-mcp** — the `decide`/`record\_outcome` tools the model
-calls to participate in the Adaptive Pathways learning loop.
+* **adaptive-pathway** — the `record`/`forget` tools the model calls to
+participate in the Adaptive Pathways learning loop. Not a separate server:
+the engine is linked into the daemon and its tools are registered in-process,
+so recall happens on the agent loop rather than over a socket.
 
-**BigTiny backend.** A FastAPI/uvicorn daemon handling provider routing
-(Ollama, Anthropic, OpenAI-compatible endpoints), session persistence (SQLite),
+**BigTiny backend.** A Rust daemon handling provider routing (Anthropic,
+OpenAI-compatible endpoints, and self-hosted servers including Ollama),
+local inference via llama.cpp, session persistence (SQLite),
 SSE streaming with token-budget compaction, provider failover, MCP server
 lifecycle, and a pattern-based HITL approval policy. Multiple sessions run
 concurrently, each with its own provider, model, and persona configuration.
@@ -78,12 +85,14 @@ docs/                   Architecture, plugin, release, and backend docs
 
 ## Tech stack
 
-* **Shell**: Tauri v2 (Rust core + web frontend), Windows-only target.
+* **Shell**: Tauri v2 (Rust core + web frontend), targeting Windows and Android.
 * **Frontend**: React 18 + TypeScript + Vite, plain CSS with custom
-properties for theming (no Tailwind/CSS-in-JS). State via Zustand.
-* **Backend**: BigTiny (FastAPI/uvicorn, Python) — REST + one SSE streaming
-endpoint, session storage in SQLite, provider routing (Ollama/Anthropic/
-OpenAI-compatible), MCP tool-server management, HITL approval policy.
+properties for theming (no Tailwind/CSS-in-JS). State via Zustand. One
+component tree across both platforms.
+* **Backend**: BigTiny (Rust) — REST + one SSE streaming endpoint, session
+storage in SQLite, provider routing (Anthropic/OpenAI-compatible/self-hosted),
+in-process llama.cpp for local models, MCP tool-server management, HITL
+approval policy.
 * **Rust crates of note**: `tauri-plugin-global-shortcut`,
 `tauri-plugin-notification`, `tauri-plugin-shell`, `tauri-plugin-dialog`,
 `tauri-plugin-single-instance`, `reqwest`, `tokio`, `keyring` (Windows

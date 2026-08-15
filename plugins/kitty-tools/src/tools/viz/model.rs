@@ -210,17 +210,23 @@ fn join_backtick(fields: &[&str]) -> String {
     fields.iter().map(|f| format!("`{f}`")).collect::<Vec<_>>().join("/")
 }
 
-/// Computes each node's longest-path layer (BFS relaxation; bounded because
-/// values only ever grow up to the node count) and rejects any edge whose
-/// target is more than one layer below its source. Mirrors `compute_layers` in
-/// `layout::graph` for the same reason `compute_layers`'s Kahn loop exists:
-/// roots with no incoming edge start at layer 0; a cycle just fails to push its
-/// members deeper rather than looping forever.
+/// Computes each node's longest-path layer (Bellman-Ford-style relaxation)
+/// and rejects any edge whose target is more than one layer below its
+/// source. Mirrors `compute_layers` in `layout::graph` for the same reason
+/// `compute_layers`'s Kahn loop exists: roots with no incoming edge start at
+/// layer 0.
+///
+/// The relaxation is **bounded to `steps.len()` passes**: a DAG's longest
+/// path has at most N-1 edges, so a DAG always converges within N passes.
+/// A pass that still changes values after that bound proves a cycle exists
+/// (each pass keeps pushing the cycle's members deeper forever — the old
+/// unbounded loop hung the tool on `a → b → a`), and the cycle is rejected
+/// rather than looped on.
 fn reject_skip_level_edges(steps: &[Step]) -> Result<(), String> {
     let mut depth: HashMap<&str, usize> = HashMap::new();
-    let mut changed = true;
-    while changed {
-        changed = false;
+    let mut converged = false;
+    for _pass in 0..steps.len() {
+        let mut changed = false;
         for step in steps.iter().filter(|s| s.id.is_some()) {
             let id = step.id.as_deref().unwrap();
             let d = *depth.get(id).unwrap_or(&0);
@@ -232,6 +238,18 @@ fn reject_skip_level_edges(steps: &[Step]) -> Result<(), String> {
                 }
             }
         }
+        if !changed {
+            converged = true;
+            break;
+        }
+    }
+    if !converged {
+        return Err(error_response(
+            "VIZ_BAD_EDGE_REF",
+            "The `next` edges contain a cycle, so no layer assignment exists.",
+            None,
+            Some("Remove the edge that loops back to an earlier step; a flowchart's `next` edges must form a DAG."),
+        ));
     }
 
     for step in steps.iter().filter(|s| s.id.is_some()) {
@@ -364,6 +382,27 @@ mod tests {
         let err = validate_diagram(DiagramType::Flowchart, "T", "D", steps).unwrap_err();
         assert!(err.contains("VIZ_BAD_EDGE_REF"));
         assert!(err.contains("\"hint\""));
+    }
+
+    #[test]
+    fn rejects_a_cycle_instead_of_hanging() {
+        // Audit #110: a 2-node cycle (a → b → a) sent the layer-relaxation
+        // loop into an infinite loop — each pass kept pushing the cycle's
+        // depths higher. The loop is now bounded and the cycle rejected
+        // through the validation entry point (not just at render).
+        let steps = vec![
+            Step { id: Some("a".into()), text: "A".into(), next: vec!["b".into()], ..Default::default() },
+            Step { id: Some("b".into()), text: "B".into(), next: vec!["a".into()], ..Default::default() },
+        ];
+        let err = validate_diagram(DiagramType::Flowchart, "T", "D", steps).unwrap_err();
+        assert!(err.contains("VIZ_BAD_EDGE_REF"), "got: {err}");
+        assert!(err.contains("cycle"), "the message should name the problem: {err}");
+        assert!(err.contains("\"hint\""));
+
+        // A self-loop is the one-node form of the same bug.
+        let steps = vec![Step { id: Some("a".into()), text: "A".into(), next: vec!["a".into()], ..Default::default() }];
+        let err = validate_diagram(DiagramType::Flowchart, "T", "D", steps).unwrap_err();
+        assert!(err.contains("VIZ_BAD_EDGE_REF"), "got: {err}");
     }
 
     #[test]

@@ -123,11 +123,43 @@ const statusLabel = (s: McpServer): string => {
   return 'Disconnected';
 };
 
+/** Health line for a bundled server whose card otherwise only exposes an
+    on/off toggle. Previously the bundled servers were hidden from the generic
+    list *and* showed no status anywhere, so a `kitty-tools` that failed to
+    spawn (a wrong bundled exe path, say) was completely invisible — the model
+    just silently got no tools. This surfaces the same status + "Error: …" row
+    + Retry button the generic cards have, without making the row editable.
+    Renders nothing while connected (the toggle already says "on") or when the
+    server isn't registered at all. */
+function BuiltinHealth({
+  health,
+  onRetry,
+}: {
+  health?: McpServer;
+  onRetry: (s: McpServer) => void | Promise<void>;
+}) {
+  if (!health || health.status === 'connected') return null;
+  return (
+    <div className="row" style={{ marginTop: 8, alignItems: 'center' }}>
+      <span className="chat-error" style={{ margin: 0 }}>
+        {statusLabel(health)}
+      </span>
+      {health.enabled && (
+        <button onClick={() => void onRetry(health)}>Retry connect</button>
+      )}
+    </div>
+  );
+}
+
 /** MCP servers â€” the BigTiny-backed replacement for the old goosed-path
     "Extensions" settings. Servers are daemon-global and take effect live: no
     restart to add, edit, delete, or toggle. */
 export function McpServers() {
   const [servers, setServers] = useState<McpServer[]>([]);
+  // The full list, unfiltered — the bundled servers are hidden from the
+  // generic list (each has its own card) but their live rows still drive the
+  // health line on those cards, so we keep them rather than discard them.
+  const [allServers, setAllServers] = useState<McpServer[]>([]);
   const [error, setError] = useState('');
   const [form, setForm] = useState(emptyForm);
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -136,12 +168,19 @@ export function McpServers() {
   const load = async () => {
     try {
       const all = await ipc.listMcpServers();
+      setAllServers(all);
       setServers(all.filter((s) => !HIDDEN_SERVER_NAMES.has(s.name)));
     } catch (e) {
       setError(String(e));
     }
   };
   useEffect(() => void load(), []);
+
+  /** The live row for a bundled server, matched by name — `undefined` if the
+      daemon hasn't registered it (older/newer builds carry different bundled
+      names), in which case the card shows no health line rather than a false
+      "disconnected". */
+  const healthOf = (name: string) => allServers.find((s) => s.name === name);
 
   const resetForm = () => {
     setForm(emptyForm);
@@ -254,11 +293,11 @@ export function McpServers() {
       </p>
       {error && <div className="chat-error">{error}</div>}
       <div className="ext-grid" style={{ marginBottom: 16 }}>
-        <KittyWasmCard />
+        <KittyWasmCard health={healthOf('kitty-wasm')} onRetry={retry} />
         <BraveMcpSearchCard />
         <VisualizationsCard />
-        <KittyToolsCard />
-        <KittyWebCard />
+        <KittyToolsCard health={healthOf('kitty-tools')} onRetry={retry} />
+        <KittyWebCard health={healthOf('kitty-web')} onRetry={retry} />
       </div>
 
       <div className="ext-grid">
@@ -366,7 +405,13 @@ export function McpServers() {
     the retired `wasm-math-mcp`. Same shape as `KittyToolsCard`'s toggle: no
     credentials, a plain checkbox. Its 26 MB CPython guest is bundled with the
     app so first use is offline. */
-function KittyWasmCard() {
+function KittyWasmCard({
+  health,
+  onRetry,
+}: {
+  health?: McpServer;
+  onRetry: (s: McpServer) => void | Promise<void>;
+}) {
   const [enabled, setEnabled] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
@@ -406,6 +451,7 @@ function KittyWasmCard() {
         Run Python (or any WASI module) in a sandboxed WebAssembly interpreter â€” no network, no
         filesystem beyond an optional workspace.
       </span>
+      <BuiltinHealth health={health} onRetry={onRetry} />
       {error && <div className="chat-error">{error}</div>}
     </label>
   );
@@ -470,7 +516,13 @@ function VisualizationsCard() {
     does NOT live here â€” see `BraveMcpSearchCard`/`KittyWebCard` below, it
     moved to `kitty-web`. On by default, no credentials required for this
     toggle itself â€” same shape as `KittyWasmCard`. */
-function KittyToolsCard() {
+function KittyToolsCard({
+  health,
+  onRetry,
+}: {
+  health?: McpServer;
+  onRetry: (s: McpServer) => void | Promise<void>;
+}) {
   const [enabled, setEnabled] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
@@ -509,6 +561,7 @@ function KittyToolsCard() {
       <span className="muted ext-card-desc">
         Context-optimized shell/file/Word tools for local, small models.
       </span>
+      <BuiltinHealth health={health} onRetry={onRetry} />
       {error && <div className="chat-error">{error}</div>}
     </label>
   );
@@ -521,7 +574,13 @@ function KittyToolsCard() {
     DuckDuckGo always works here with no key). The Rust replacement for the
     retired `kitty-docs-web` server's web half; on by default, no
     credentials â€” same shape as `KittyWasmCard`. */
-function KittyWebCard() {
+function KittyWebCard({
+  health,
+  onRetry,
+}: {
+  health?: McpServer;
+  onRetry: (s: McpServer) => void | Promise<void>;
+}) {
   const [enabled, setEnabled] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
@@ -560,6 +619,7 @@ function KittyWebCard() {
       <span className="muted ext-card-desc">
         Search the web and scrape pages into clean text for the agent.
       </span>
+      <BuiltinHealth health={health} onRetry={onRetry} />
       {error && <div className="chat-error">{error}</div>}
     </label>
   );

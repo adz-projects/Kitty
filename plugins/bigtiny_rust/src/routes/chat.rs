@@ -103,8 +103,12 @@ pub async fn list_sessions(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ListQuery>,
 ) -> Response {
-    let limit = query.limit.unwrap_or(50);
-    let offset = query.offset.unwrap_or(0);
+    // Bound the page: SQLite treats a NEGATIVE LIMIT as "no limit", so
+    // `?limit=-1` used to read out the entire sessions table. The lower
+    // bound stays 0 (not 1) because `?limit=0` meaning "empty page, real
+    // `total`" is pinned by the route smoke tests.
+    let limit = query.limit.unwrap_or(50).clamp(0, 500);
+    let offset = query.offset.unwrap_or(0).max(0);
     match sessions::list_sessions_page(&state.db, limit, offset).await {
         Ok((rows, total)) => Json(json!({"sessions": rows, "total": total})).into_response(),
         Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
@@ -135,6 +139,11 @@ pub async fn delete_session(
 ) -> Response {
     state.agent.cancel(&id).await;
     match sessions::delete_session(&state.db, &id).await {
+        // `delete_session` returns the affected row count, and discarding it
+        // meant a DELETE that matched nothing still answered `{"ok": true}` —
+        // the client dropped the row from its list and the session reappeared
+        // on the next refresh. A miss is a 404, not a success.
+        Ok(0) => err_response(StatusCode::NOT_FOUND, format!("no such session: {id}")),
         Ok(_) => Json(json!({"ok": true})).into_response(),
         Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
@@ -173,18 +182,14 @@ pub async fn update_config(
     match result {
         Ok(()) => Json(json!({"ok": true})).into_response(),
         Err(e) => {
-            // `update_metadata_with` reports a missing session as a
-            // "Session ... not found" StorageError — that's a 404 for the
-            // client, not a server error (which would hide the real cause
-            // from a UI that treats 5xx as "daemon broken").
-            let is_missing = matches!(
-                &e,
-                StorageError::Generic(msg) if msg.contains("not found")
-            );
-            let status = if is_missing {
-                StatusCode::NOT_FOUND
-            } else {
-                StatusCode::INTERNAL_SERVER_ERROR
+            // `update_metadata_with` reports a missing session as
+            // `StorageError::NotFound` — that's a 404 for the client, not a
+            // server error (which would hide the real cause from a UI that
+            // treats 5xx as "daemon broken"). Match the variant, not the
+            // message wording.
+            let status = match &e {
+                StorageError::NotFound(_) => StatusCode::NOT_FOUND,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
             };
             err_response(status, e.to_string())
         }
@@ -224,7 +229,10 @@ pub async fn get_stats(State(state): State<Arc<AppState>>, Path(id): Path<String
         // A genuinely-missing session is a 404; anything else (SQL error,
         // pool failure) is a real 500 — collapsing both into 404 hid real
         // infrastructure problems as "session not found" (mirror of the
-        // fork_session handler's status split below).
+        // fork_session handler's status split below). This stays a substring
+        // match (unlike `update_config`'s `StorageError::NotFound` variant)
+        // because `SessionStats::get_stats` is agent-side and returns a
+        // plain `String` error — there is no variant to match on here.
         Err(e) if e.contains("not found") => {
             err_response(StatusCode::NOT_FOUND, e)
         }
@@ -341,10 +349,20 @@ pub async fn fork_session(
                 new_compacted_through_rowid = Some(result.last_insert_rowid());
             }
             Ok(_) => {}
-            Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+            Err(e) => {
+                // Roll back the copy AND remove the session row created
+                // above — a mid-loop failure used to return 500 while
+                // leaving an orphaned zero-message session behind (the
+                // session row and its metadata commit before this loop).
+                let _ = tx.rollback().await;
+                let _ = sessions::delete_session(&state.db, &new_id).await;
+                return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+            }
         }
     }
     if let Err(e) = tx.commit().await {
+        // Same orphan cleanup for a failed commit.
+        let _ = sessions::delete_session(&state.db, &new_id).await;
         return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
     }
 
@@ -390,9 +408,28 @@ pub struct ApproveRequest {
 
 pub async fn approve_action(
     State(state): State<Arc<AppState>>,
-    Path(_id): Path<String>,
+    Path(id): Path<String>,
     Json(body): Json<ApproveRequest>,
 ) -> Response {
+    // The path session id is part of the approval's scope: pending actions
+    // are per-session, and `record_decision` resolves by action id alone —
+    // so a POST to `/chat/{A}/approve` used to resolve an action pending on
+    // session B. Verify the action is actually pending *for this session*
+    // first. The HITL manager exposes no way to distinguish "pending for
+    // another session" from "no such action" without iterating its private
+    // map, so both are the same 404 here (either way, this session has no
+    // such pending action).
+    {
+        let hitl = state.agent.hitl().lock().await;
+        let pending = hitl.get_pending_approvals(&id);
+        if !pending.iter().any(|p| p.action_id == body.action_id) {
+            return err_response(
+                StatusCode::NOT_FOUND,
+                format!("no pending action {} for session {id}", body.action_id),
+            );
+        }
+    }
+
     // `record_decision` is synchronous now (the DB rule-upsert was split out
     // of it) — the shared hitl mutex is held only for the in-memory mutation,
     // never across a storage round-trip, so a single approval can't serialize
