@@ -900,8 +900,10 @@ button.primary {
 }
 @media (max-width: 700px) {
   .effort-dropdown {
-    max-width: 56px;
-    padding: 3px 4px;
+    /* No max-width cap: a hard 56px clipped the option text (e.g. "Medium",
+       "Thinking off"). A native <select> already sizes to its widest option,
+       which for the effort levels is narrow enough for the header row. */
+    padding: 3px 6px;
   }
 }
 .status-badge-warn {

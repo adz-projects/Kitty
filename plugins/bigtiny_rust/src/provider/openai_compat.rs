@@ -148,6 +148,37 @@ impl OpenAICompatibleProvider {
         out
     }
 
+    /// Move *every* system message (not just the leading run) into a single
+    /// leading system block, preserving order, and keep all non-system messages
+    /// in their relative order. For chat templates that require the system
+    /// message to be first (llama-server's Qwen3, some Ollama templates), which
+    /// raise on a tail/mid-stream system message. Unlike `merge_system_messages`
+    /// (leading-run only, KV-cache-preserving) this sacrifices the tail
+    /// placement of injected recall to satisfy the template — correctness over
+    /// prefix-cache reuse, and only for the self-hosted dialects that need it.
+    fn hoist_all_system_messages(messages: Vec<Value>) -> Vec<Value> {
+        let mut system_parts: Vec<String> = Vec::new();
+        let mut rest: Vec<Value> = Vec::new();
+        for msg in messages {
+            if msg["role"] == "system" {
+                if let Some(c) = msg["content"].as_str() {
+                    system_parts.push(c.to_string());
+                }
+            } else {
+                rest.push(msg);
+            }
+        }
+        let mut out = Vec::new();
+        if !system_parts.is_empty() {
+            out.push(serde_json::json!({
+                "role": "system",
+                "content": system_parts.join("\n\n"),
+            }));
+        }
+        out.extend(rest);
+        out
+    }
+
     /// Convert `tool_calls[].function.arguments` in assistant messages to the
     /// JSON string the OpenAI-compatible wire format requires.
     ///
@@ -271,7 +302,23 @@ impl Provider for OpenAICompatibleProvider {
     ) -> Result<Pin<Box<dyn Stream<Item = Delta> + Send>>, ProviderError> {
         let model = self.resolve_model(model.as_deref());
         let url = format!("{}/v1/chat/completions", self.config.base_url);
-        let messages = Self::merge_system_messages(messages);
+        // Self-hosted chat templates (llama.cpp `llama-server`'s Qwen3, some
+        // Ollama templates) raise "System message must be at the beginning of
+        // conversation" on any system message that isn't first — but the
+        // context builder injects memory/recall as system blocks in the *tail*
+        // (kept there for KV-prefix caching on providers that tolerate it, and
+        // surfaced after a stop+followup once recall has content). Hoist every
+        // system message to a single leading block for these dialects; hosted
+        // OpenAI/OpenRouter tolerate mid-stream system messages, so they keep
+        // the cache-preserving leading-run-only merge.
+        let messages = if matches!(
+            self.config.provider_type.as_str(),
+            "ollama" | "custom_openai"
+        ) {
+            Self::hoist_all_system_messages(messages)
+        } else {
+            Self::merge_system_messages(messages)
+        };
         // History can carry tool-call arguments as objects (built this way
         // throughout the daemon) but OpenAI-compatible backends require them
         // as JSON strings — normalize before serializing the body.
@@ -344,9 +391,18 @@ impl Provider for OpenAICompatibleProvider {
                     body["reasoning"] = openrouter_reasoning(e);
                 }
                 "custom_openai" | "ollama" => {
-                    // Off → disable thinking; any positive level → enable it.
-                    // Merge into any existing chat_template_kwargs rather than
-                    // clobbering it.
+                    // A self-hosted server exposes reasoning two ways and
+                    // different builds honor different ones, so send both and
+                    // let the server use whichever it understands:
+                    //   * `chat_template_kwargs.enable_thinking` — Qwen3 et al.
+                    //     (a boolean on/off toggle baked into the chat template).
+                    //   * `reasoning_effort` — gpt-oss and recent llama-server
+                    //     builds, which grade the effort low/medium/high.
+                    // Off → thinking disabled and no effort field; any graded
+                    // level → thinking enabled *and* the matching effort string,
+                    // so the dropdown's Low/Medium/High are meaningful on a
+                    // server that supports graded effort and still just "on" on
+                    // one that only has the boolean toggle.
                     let enable = !matches!(e, Effort::Off);
                     let kwargs = body
                         .get_mut("chat_template_kwargs")
@@ -356,6 +412,9 @@ impl Provider for OpenAICompatibleProvider {
                     } else {
                         body["chat_template_kwargs"] =
                             serde_json::json!({ "enable_thinking": enable });
+                    }
+                    if let Some(s) = openai_reasoning_effort(e) {
+                        body["reasoning_effort"] = s.into();
                     }
                 }
                 _ => {}
@@ -1517,6 +1576,30 @@ mod sse_tests {
         ];
         let merged = OpenAICompatibleProvider::merge_system_messages(messages.clone());
         assert_eq!(merged, messages);
+    }
+
+    #[test]
+    fn hoist_all_system_messages_moves_tail_system_to_a_single_leading_block() {
+        // A self-hosted chat template (Qwen3) raises unless every system
+        // message is first. The tail `memory` block that `merge_system_messages`
+        // deliberately leaves in place must instead be hoisted and merged into
+        // the leading system block for these dialects.
+        let messages = vec![
+            serde_json::json!({"role": "system", "content": "persona"}),
+            serde_json::json!({"role": "system", "content": "tool hints"}),
+            serde_json::json!({"role": "user", "content": "hi"}),
+            serde_json::json!({"role": "system", "content": "memory"}),
+            serde_json::json!({"role": "assistant", "content": "hello"}),
+        ];
+        let out = OpenAICompatibleProvider::hoist_all_system_messages(messages);
+        // One leading system block carrying every system part, in order.
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0]["role"], "system");
+        assert_eq!(out[0]["content"], "persona\n\ntool hints\n\nmemory");
+        // No further system messages survive mid-stream.
+        assert_eq!(out[1]["role"], "user");
+        assert_eq!(out[2]["role"], "assistant");
+        assert!(out[1..].iter().all(|m| m["role"] != "system"));
     }
 
     #[test]

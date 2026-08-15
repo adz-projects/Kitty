@@ -248,12 +248,16 @@ pub fn allowed_dirs_for_session(metadata: &Value, cache_dir: &str) -> Vec<String
     }
     dirs.push(cache_dir.to_string());
 
-    if let Some(mode) = metadata.get("mode").and_then(|v| v.as_str()) {
-        if mode == "agentic" {
-            if let Some(cwd) = metadata.get("cwd").and_then(|v| v.as_str()) {
-                dirs.push(cwd.to_string());
-            }
-        }
+    // The session's working directory is always writable. This used to be
+    // gated on `metadata.mode == "agentic"`, but the chat/agent mode was
+    // removed (H1) — with no mode stamped, that gate silently stopped allowing
+    // the cwd at all, so a model's file tools could no longer create artifacts
+    // in the chat folder. Allowing cwd unconditionally is the widening H1
+    // intended ("cwd is always allowed"); the folder is the session's own
+    // private per-chat directory (or a folder the user explicitly chose), so
+    // writing there is exactly what tool calls are for.
+    if let Some(cwd) = metadata.get("cwd").and_then(|v| v.as_str()) {
+        dirs.push(cwd.to_string());
     }
 
     dirs.extend(scratch_allowance());
@@ -325,15 +329,20 @@ mod tests {
 
     #[test]
     fn test_allowed_dirs_for_session() {
+        // No `mode` in metadata (the chat/agent mode was removed) — the cwd
+        // must still be allowed so tool calls can write artifacts into the
+        // chat folder.
         let metadata = json!({
             "chat_dir": "/home/user/chat",
-            "mode": "agentic",
             "cwd": "/home/user/work"
         });
         let dirs = allowed_dirs_for_session(&metadata, "~/.bigtiny");
         assert!(dirs.contains(&"/home/user/chat".to_string()));
         assert!(dirs.contains(&"~/.bigtiny".to_string()));
-        assert!(dirs.contains(&"/home/user/work".to_string()));
+        assert!(
+            dirs.contains(&"/home/user/work".to_string()),
+            "cwd must be writable regardless of mode, got {dirs:?}"
+        );
     }
 
     #[test]

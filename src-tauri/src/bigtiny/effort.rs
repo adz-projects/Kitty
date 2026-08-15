@@ -33,10 +33,11 @@ pub enum EffortDialect {
     /// Anthropic: an extended-thinking token budget, also disable-able.
     AnthropicThinking,
     /// A self-hosted OpenAI-compatible server (llama.cpp `llama-server`,
-    /// Ollama) running a reasoning-capable model. These honor neither OpenAI's
-    /// `reasoning_effort` nor OpenRouter's `reasoning` object; the portable
-    /// control is the chat template's `enable_thinking` kwarg (Qwen3 et al.),
-    /// so it's a simple on/off toggle rather than graded levels.
+    /// Ollama) running a reasoning-capable model. The daemon sends both the
+    /// chat template's `enable_thinking` kwarg (Qwen3 et al., a boolean toggle)
+    /// and a `reasoning_effort` string, so graded Off/Low/Medium/High levels are
+    /// meaningful on a build that honors effort (gpt-oss, recent llama-server)
+    /// and collapse to on/off on one that only has the template toggle.
     LlamaServerThinking,
 }
 
@@ -74,19 +75,19 @@ pub fn effort_options(dialect: EffortDialect) -> Vec<EffortOption> {
         EffortDialect::OpenAiReasoningEffort => {
             vec![opt("Low", "low"), opt("Medium", "medium"), opt("High", "high")]
         }
-        EffortDialect::OpenRouterReasoning | EffortDialect::AnthropicThinking => vec![
+        // Self-hosted gets the same graded set as OpenRouter/Anthropic: the
+        // daemon translates each level into `enable_thinking` (on for any
+        // non-Off level) plus a `reasoning_effort` string, so Low/Medium/High
+        // are distinct on servers that honor effort and all read as "thinking
+        // on" on ones that only have the boolean template toggle.
+        EffortDialect::OpenRouterReasoning
+        | EffortDialect::AnthropicThinking
+        | EffortDialect::LlamaServerThinking => vec![
             opt("Off", "off"),
             opt("Low", "low"),
             opt("Medium", "medium"),
             opt("High", "high"),
         ],
-        // On/Off only — a chat-template toggle, not graded levels. "On" rides
-        // the wire value "high" so the daemon's existing `Effort::from_wire`
-        // maps it to a positive level (→ `enable_thinking: true`); "off" maps
-        // to `Effort::Off` (→ `enable_thinking: false`).
-        EffortDialect::LlamaServerThinking => {
-            vec![opt("Thinking off", "off"), opt("Thinking on", "high")]
-        }
     }
 }
 
@@ -251,7 +252,7 @@ mod tests {
     }
 
     #[test]
-    fn self_hosted_reasoning_models_get_an_on_off_thinking_toggle() {
+    fn self_hosted_reasoning_models_get_a_thinking_effort_control() {
         for pt in ["ollama", "custom_openai"] {
             // The user's exact model, plus other common self-hosted reasoners.
             assert_eq!(
@@ -288,13 +289,14 @@ mod tests {
     }
 
     #[test]
-    fn self_hosted_toggle_is_off_plus_on_as_high() {
+    fn self_hosted_gets_graded_off_low_medium_high() {
         let opts = effort_options(EffortDialect::LlamaServerThinking);
-        assert_eq!(opts.len(), 2);
+        assert_eq!(opts.len(), 4);
         assert_eq!(opts[0].value, "off");
-        // "On" rides "high" so the daemon's Effort::from_wire maps it to a
-        // positive level → enable_thinking: true.
-        assert_eq!(opts[1].value, "high");
+        assert_eq!(opts[1].value, "low");
+        assert_eq!(opts[2].value, "medium");
+        assert_eq!(opts[3].value, "high");
+        // Default thinks (the model's resting behavior) at the top level.
         assert_eq!(default_value(EffortDialect::LlamaServerThinking), "high");
     }
 }

@@ -122,17 +122,33 @@ adaptive-pathway = { path = "../adaptive-pathway_rust" }
 # no helper `.so` to dlopen (docs/ANDROID.md §11, D22). OpenMP stays OFF — it
 # is deliberately absent from this feature list, not merely unlisted.
 #
-# **Vulkan on (ADDENDUM 3).** Without a GPU backend the support models
-# (summarizer + embedder) ran on all CPU cores, which cooked the phone and
-# starved the WebView. Vulkan is a system library on Android API 24+
-# (`libvulkan.so`), and `llama-cpp-sys-2` compiles the compute shaders to
-# SPIR-V at build time with host `glslc` (from the Vulkan SDK, same tool the
-# Windows build already needs) — so this only adds a *build-host* prerequisite,
-# not a device one. It only widens what the ggml device registry enumerates;
-# `local::backend::select_backend` still decides, and a device whose Vulkan
-# driver can't run the shaders falls back to CPU (now thread-capped, see
-# `local/engine.rs`). If the arm64 build can't find `glslc`, it dies in the
-# cmake step like the Ninja/libclang traps in docs/ANDROID.md §11.
+# **Vulkan ON for arm64 (ADDENDUM 3).** Without a GPU backend the support
+# models (summarizer + embedder) ran on all CPU cores and cooked the phone.
+# Vulkan is a system library on Android API 24+ (`libvulkan.so`), and it works
+# on real hardware — verified on a Pixel 10 Pro (Tensor G5 / PowerVR D-Series),
+# whose driver the ggml Vulkan backend enumerates with KHR_coopmat.
+#
+# Building it from a **Windows host** needs a specific env (all read by
+# `llama-cpp-sys-2`'s build.rs and forwarded to cmake):
+#   * `VULKAN_INCLUDE_DIR` = `<VulkanSDK>/Include` — the NDK ships only the C
+#     Vulkan headers; ggml-vulkan is C++ and needs `vulkan/vulkan.hpp`.
+#   * `SPIRV_HEADERS_DIR` = `<VulkanSDK>/Lib/cmake/SPIRV-Headers` (holds
+#     `SPIRV-HeadersConfig.cmake`); the SDK's `Include` also has
+#     `spirv/unified1/spirv.hpp`.
+#   * `VULKAN_GLSLC` = `<VulkanSDK>/Bin/glslc.exe` — build.rs's PATH search for
+#     `glslc` omits the `.exe` suffix, so it never finds it on Windows without
+#     this.
+#   * **Build from an MSVC shell (`vcvars64.bat`), not a bare one.** ggml-vulkan
+#     cross-compiling builds a `vulkan-shaders-gen` *host* tool and auto-detects
+#     the host compiler as `cl` → `gcc` → `clang`. With no `cl` on PATH it falls
+#     to Git's stub MinGW `gcc`, whose link then fails
+#     (`lld: error: unable to find library -lkernel32/-lmingw32…`). Putting
+#     MSVC `cl.exe` first fixes it; the NDK toolchain still cross-compiles the
+#     Android target. See docs/RELEASE.md for the full recipe.
+#
+# The feature only widens what the ggml device registry enumerates;
+# `local::backend::select_backend` still decides, and a device with no working
+# Vulkan driver falls back to CPU (thread-capped, `local/engine.rs`).
 [target.'cfg(target_os = "android")'.dependencies]
 llama-cpp-2 = { version = "0.1.154", default-features = false, features = [
     "common",

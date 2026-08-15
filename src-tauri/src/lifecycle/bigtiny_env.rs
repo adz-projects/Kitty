@@ -67,17 +67,6 @@ pub fn daemon_env(
     // yields an empty value, which the daemon reads as "that slot is
     // unconfigured" — chat falls back to the active provider, embeddings to
     // lexical hashing. Both are degradations, neither is an error.
-    // Android: never load a local chat/summarizer GGUF. Chat is always remote
-    // there (D18), so the chat slot's only use was the summarizer — and running
-    // a 1–2B model on the phone CPU during compaction cooked the SoC and
-    // starved the WebView (ADDENDUM 3). Leaving this empty makes
-    // `SummarizerChain` fall back to the session's remote provider for
-    // summarization; the embedder below may still load locally (on GPU where
-    // Vulkan is available). Desktop is unchanged — it can run chat locally, so
-    // its summarizer model resolves as before.
-    #[cfg(target_os = "android")]
-    let chat_gguf = String::new();
-    #[cfg(not(target_os = "android"))]
     let chat_gguf = crate::models::resolve(&summarizer.model)
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();

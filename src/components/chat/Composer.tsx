@@ -266,7 +266,12 @@ export function Composer({
               return;
             }
           }
-          if (e.key === 'Enter' && !e.shiftKey) {
+          // Enter sends on desktop (Shift+Enter for a newline). On Android the
+          // on-screen keyboard's Return key should start a new paragraph like
+          // any other text field — there's no Shift chord on a touch keyboard —
+          // so Enter falls through to the textarea's default newline and the
+          // Send button is the only way to submit.
+          if (!isAndroid() && e.key === 'Enter' && !e.shiftKey) {
             e.preventDefault();
             submit();
           }

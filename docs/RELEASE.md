@@ -97,6 +97,20 @@ $env:NDK_HOME          = $ndk
 $env:LIBCLANG_PATH     = "$env:LOCALAPPDATA\kitty-buildtools\libclang"
 $env:CMAKE_GENERATOR   = "Ninja"   # else cmake picks MSBuild and builds x64
 $env:CARGO_TARGET_DIR  = "C:\kt"   # cl.exe hits MAX_PATH from the repo path
+# --- Vulkan GPU backend on Android (ADDENDUM 3) ---
+# The arm64 build enables llama.cpp's `vulkan` feature. From a Windows host it
+# needs the Vulkan SDK's C++ headers + SPIRV-Headers + glslc, AND it must be run
+# from an MSVC shell so the host `vulkan-shaders-gen` sub-build finds `cl.exe`
+# (a bare shell falls to Git's MinGW gcc, which fails to link). Run the whole
+# `pnpm tauri android build` from inside `vcvars64.bat`:
+$vk = "C:\VulkanSDK\1.4.357.0"
+$env:VULKAN_INCLUDE_DIR       = "$vk\Include"
+$env:SPIRV_HEADERS_DIR        = "$vk\Lib\cmake\SPIRV-Headers"
+$env:SPIRV_HEADERS_INCLUDE_DIR= "$vk\Include"
+$env:VULKAN_GLSLC             = "$vk\Bin\glslc.exe"   # PATH search omits `.exe`
+# then, in a shell that has called:
+#   & "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+# so `cl.exe` is first on PATH for the host shaders-gen tool.
 ```
 
 `cmake` and `ninja` must be on `PATH`. After a *failed* configure, delete
