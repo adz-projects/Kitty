@@ -46,14 +46,16 @@ struct SecretResult {
     value: Option<String>,
 }
 
-/// Empty resolve payload. `run_mobile_plugin` always deserializes something,
-/// and the Kotlin `invoke.resolve()` sends `{}`.
-#[derive(Deserialize)]
-struct Empty {}
-
+// The Kotlin `invoke.resolve()` (no argument) resolves the call with a JSON
+// `null`, NOT `{}` — deserializing that into a struct fails with
+// "invalid type: null, expected struct …", which surfaced as
+// "could not store secret: failed to deserialize response: invalid type: null".
+// `serde_json::Value` accepts `null` (and anything else the JVM side might send
+// later), so the void commands here type their response as `Value` and ignore
+// it. Do NOT swap this back to a unit struct.
 pub fn set(account: &str, value: &str) -> Result<(), String> {
     handle()?
-        .run_mobile_plugin::<Empty>(
+        .run_mobile_plugin::<serde_json::Value>(
             "setSecret",
             SecretArgs {
                 account,
@@ -81,7 +83,7 @@ pub fn get(account: &str) -> Result<Option<String>, String> {
 
 pub fn delete(account: &str) {
     let Ok(h) = handle() else { return };
-    if let Err(e) = h.run_mobile_plugin::<Empty>(
+    if let Err(e) = h.run_mobile_plugin::<serde_json::Value>(
         "deleteSecret",
         SecretArgs {
             account,

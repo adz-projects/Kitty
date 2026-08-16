@@ -51,15 +51,14 @@ pub fn effort_dialect(provider_type: &str, model: &str) -> Option<EffortDialect>
             Some(EffortDialect::OpenRouterReasoning)
         }
         // A self-hosted OpenAI-compatible endpoint (a llama-server or Ollama
-        // the user runs) with a reasoning-capable model gets an on/off thinking
-        // toggle wired to the chat template's `enable_thinking` kwarg. A plain
-        // chat model on the same endpoint still gets nothing.
-        "custom_openai" | "ollama" if self_hosted_takes_thinking(model) => {
-            Some(EffortDialect::LlamaServerThinking)
-        }
-        // `local` (the in-process engine) has no such control, and any
-        // self-hosted endpoint serving a non-reasoning model falls here too —
-        // the case the whole "hidden otherwise" behavior exists for.
+        // the user runs). Unlike the hosted dialects, we don't guess from the
+        // model *name* whether it reasons — we ask the endpoint (and, failing
+        // that, HuggingFace) for the model's own effort levels and hide the
+        // control when neither yields any (see `ensure_effort_levels_cached` /
+        // `thinking_effort_for`). So every self-hosted endpoint takes this
+        // dialect; discovery decides whether the dropdown actually shows.
+        "custom_openai" | "ollama" => Some(EffortDialect::LlamaServerThinking),
+        // `local` (the in-process engine) has no such control.
         _ => None,
     }
 }
@@ -118,17 +117,213 @@ pub fn thinking_effort_for(app: &AppHandle, session_id: &str) -> Option<Thinking
     let profile = cfg.providers.iter().find(|p| p.id == active_id)?;
     let model = profile.models.first().map(String::as_str).unwrap_or("");
     let dialect = effort_dialect(&profile.provider_type, model)?;
-    let options = effort_options(dialect);
+
+    // The self-hosted dialect's levels are the *model's own* — discovered from
+    // its chat template (see `probe_effort_levels`) and cached per provider.
+    // "Only the model's levels" (no synthetic Off); empty/unprobed → hide.
+    let (options, default) = match dialect {
+        EffortDialect::LlamaServerThinking => {
+            let cache = state.effort_levels.lock().unwrap();
+            let levels = cache.get(&effort_cache_key(active_id, model))?;
+            if levels.is_empty() {
+                return None;
+            }
+            let opts: Vec<EffortOption> = levels
+                .iter()
+                .map(|l| EffortOption {
+                    name: pretty_level(l),
+                    value: l.clone(),
+                })
+                .collect();
+            // The template's own default is its first (highest) level
+            // (`reasoning_effort|default('xhigh')`), so lead with that.
+            let default = opts.first().map(|o| o.value.clone()).unwrap_or_default();
+            (opts, default)
+        }
+        _ => (effort_options(dialect), default_value(dialect).to_string()),
+    };
+
     let current_value = cfg
         .session_efforts
         .get(session_id)
         .filter(|v| options.iter().any(|o| &o.value == *v))
         .cloned()
-        .unwrap_or_else(|| default_value(dialect).to_string());
+        .unwrap_or(default);
     Some(ThinkingEffort {
         current_value,
         options,
     })
+}
+
+/// A human label for a raw effort level. Known levels get a friendly name; an
+/// unrecognized one is title-cased so a novel model level still reads sanely.
+fn pretty_level(level: &str) -> String {
+    match level {
+        "xhigh" => "Extra high".to_string(),
+        "high" => "High".to_string(),
+        "medium" => "Medium".to_string(),
+        "low" => "Low".to_string(),
+        "minimal" => "Minimal".to_string(),
+        other => {
+            let mut c = other.chars();
+            match c.next() {
+                Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                None => other.to_string(),
+            }
+        }
+    }
+}
+
+/// Pull the ordered reasoning-effort levels out of a chat template that guards
+/// them, e.g. Qwen3's
+/// `{%- if resolved_reasoning_effort not in ('xhigh', 'medium', 'low') %}`.
+/// Returns the levels in template order (highest first), or `None` if the
+/// template has no such guard (i.e. the model has no graded effort control).
+///
+/// Deliberately hand-parsed rather than regex to avoid pulling a regex
+/// dependency into this crate for one pattern.
+fn extract_effort_levels(template: &str) -> Option<Vec<String>> {
+    let anchor = template.find("reasoning_effort")?;
+    let after = &template[anchor..];
+    let not_in = after.find("not in")?;
+    let rest = &after[not_in..];
+    let open = rest.find('(')?;
+    let close = rest[open..].find(')')? + open;
+    let inside = &rest[open + 1..close];
+    // Extract single- or double-quoted tokens in order.
+    let mut levels = Vec::new();
+    let mut chars = inside.char_indices().peekable();
+    while let Some((_, ch)) = chars.next() {
+        if ch == '\'' || ch == '"' {
+            let quote = ch;
+            let mut token = String::new();
+            for (_, c) in chars.by_ref() {
+                if c == quote {
+                    break;
+                }
+                token.push(c);
+            }
+            let token = token.trim().to_ascii_lowercase();
+            if !token.is_empty() && !levels.contains(&token) {
+                levels.push(token);
+            }
+        }
+    }
+    if levels.is_empty() {
+        None
+    } else {
+        Some(levels)
+    }
+}
+
+/// Cache key for discovered effort levels: keyed by provider **and** model, so
+/// switching the model on a provider re-probes rather than showing another
+/// model's levels.
+fn effort_cache_key(provider_id: &str, model: &str) -> String {
+    format!("{provider_id}\u{0}{model}")
+}
+
+/// Normalize a provider base URL to an origin we can hang `/props` off: add a
+/// scheme if the user typed a bare `host:port`, and drop a trailing slash.
+fn normalize_base(base_url: &str) -> String {
+    let b = base_url.trim().trim_end_matches('/');
+    if b.contains("://") {
+        b.to_string()
+    } else {
+        format!("http://{b}")
+    }
+}
+
+/// Discover a self-hosted model's reasoning-effort levels, in priority order:
+///   1. **the endpoint** — `GET {base}/props`, read `chat_template`, extract the
+///      levels its guard names (the real source: it's what the server enforces);
+///   2. **HuggingFace** — when `model` is an `owner/repo`, its
+///      `tokenizer_config.json` `chat_template`, same extraction;
+///   3. otherwise `None`, which hides the dropdown.
+/// Best-effort throughout: any network/parse failure falls through to the next
+/// source, then to `None`.
+async fn probe_effort_levels(
+    base_url: &str,
+    model: &str,
+    api_key: Option<&str>,
+) -> Option<Vec<String>> {
+    let client = crate::util::http_client();
+
+    // 1. The endpoint's own chat template.
+    let props_url = format!("{}/props", normalize_base(base_url));
+    let mut req = client.get(&props_url);
+    if let Some(key) = api_key.filter(|k| !k.is_empty()) {
+        req = req.bearer_auth(key);
+    }
+    if let Ok(resp) = req.send().await {
+        if let Ok(v) = resp.json::<serde_json::Value>().await {
+            if let Some(tmpl) = v.get("chat_template").and_then(|t| t.as_str()) {
+                if let Some(levels) = extract_effort_levels(tmpl) {
+                    tracing::debug!(?levels, "effort levels from endpoint /props");
+                    return Some(levels);
+                }
+            }
+        }
+    }
+
+    // 2. HuggingFace, only when the model id is a plausible `owner/repo` (not a
+    //    local gguf path or a bare name).
+    if model.split('/').count() == 2 && !model.contains(' ') && !model.starts_with('/') {
+        let hf_url = format!(
+            "https://huggingface.co/{model}/resolve/main/tokenizer_config.json"
+        );
+        if let Ok(resp) = client.get(&hf_url).send().await {
+            if let Ok(v) = resp.json::<serde_json::Value>().await {
+                if let Some(tmpl) = v.get("chat_template").and_then(|t| t.as_str()) {
+                    if let Some(levels) = extract_effort_levels(tmpl) {
+                        tracing::debug!(?levels, "effort levels from HuggingFace");
+                        return Some(levels);
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Populate `AppState::effort_levels` for the active provider if it's a
+/// self-hosted reasoning endpoint and hasn't been probed for this
+/// provider+model yet. Called from the effort commands before
+/// [`thinking_effort_for`] reads the cache. Cheap after the first probe (the
+/// result, including "none found", is memoized).
+pub async fn ensure_effort_levels_cached(app: &AppHandle) {
+    let (key, base_url, model, provider_id) = {
+        let state = app.state::<crate::state::AppState>();
+        let cfg = state.config.lock().unwrap();
+        let Some(active_id) = cfg.active_provider_id.clone() else {
+            return;
+        };
+        let Some(profile) = cfg.providers.iter().find(|p| p.id == active_id) else {
+            return;
+        };
+        let model = profile.models.first().cloned().unwrap_or_default();
+        if !matches!(
+            effort_dialect(&profile.provider_type, &model),
+            Some(EffortDialect::LlamaServerThinking)
+        ) {
+            return;
+        }
+        let key = effort_cache_key(&active_id, &model);
+        if state.effort_levels.lock().unwrap().contains_key(&key) {
+            return; // already probed
+        }
+        (key, profile.base_url.clone(), model, active_id)
+    };
+
+    let api_key = crate::config::providers::get_secret_async(&provider_id).await;
+    // Empty vec is a real answer ("probed, none found" → hide) and is cached so
+    // we don't re-probe a server that has no graded effort every dropdown read.
+    let levels = probe_effort_levels(&base_url, &model, api_key.as_deref())
+        .await
+        .unwrap_or_default();
+    let state = app.state::<crate::state::AppState>();
+    state.effort_levels.lock().unwrap().insert(key, levels);
 }
 
 /// `claude-*` minus the families that predate extended thinking. A denylist so
@@ -186,22 +381,6 @@ fn openrouter_takes_effort(model: &str) -> bool {
         || bare.contains("glm-4")
 }
 
-/// Reasoning-capable model families that a self-hosted OpenAI-compatible server
-/// commonly runs. Unlike `openrouter_takes_effort`, this does **not** require a
-/// `thinking` suffix — a self-hosted Qwen3 id is usually just `qwen3-30b` /
-/// `Qwen3.8-27b`, and thinking is a template toggle, not a separate model.
-/// Extend freely: a false negative just hides the toggle for that model.
-fn self_hosted_takes_thinking(model: &str) -> bool {
-    let m = model.to_ascii_lowercase();
-    let bare = m.rsplit('/').next().unwrap_or(&m);
-    bare.contains("qwen3")
-        || bare.contains("qwq")
-        || bare.contains("deepseek-r1")
-        || bare.contains("glm-4")
-        || bare.contains("magistral")
-        || bare.contains("gpt-oss")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,24 +431,47 @@ mod tests {
     }
 
     #[test]
-    fn self_hosted_reasoning_models_get_a_thinking_effort_control() {
+    fn every_self_hosted_endpoint_takes_the_dialect_visibility_is_discovery_driven() {
+        // The dialect no longer guesses from the model *name* — every
+        // self-hosted endpoint takes it, and runtime discovery
+        // (`extract_effort_levels` / the cache) decides whether the dropdown
+        // shows. So even a plain chat model resolves to the dialect here; it
+        // just yields no levels at probe time and is hidden then.
         for pt in ["ollama", "custom_openai"] {
-            // The user's exact model, plus other common self-hosted reasoners.
-            assert_eq!(
-                effort_dialect(pt, "Qwen3.8-27b"),
-                Some(EffortDialect::LlamaServerThinking)
-            );
-            assert_eq!(
-                effort_dialect(pt, "qwen3-30b"),
-                Some(EffortDialect::LlamaServerThinking)
-            );
-            assert_eq!(
-                effort_dialect(pt, "deepseek-r1-distill-qwen-7b"),
-                Some(EffortDialect::LlamaServerThinking)
-            );
-            // A plain chat model on the same endpoint still gets nothing.
-            assert!(effort_dialect(pt, "llama-3.3-70b-instruct").is_none());
+            for model in ["Qwen3.8-27b", "qwen3-30b", "llama-3.3-70b-instruct", ""] {
+                assert_eq!(
+                    effort_dialect(pt, model),
+                    Some(EffortDialect::LlamaServerThinking),
+                    "{pt}/{model}"
+                );
+            }
         }
+    }
+
+    /// The real Qwen3.8-27B guard, verbatim from the user's llama-server
+    /// `/props` chat template — levels come back in template order, highest
+    /// first, and deduplicated/lowercased.
+    #[test]
+    fn extract_levels_from_the_qwen3_template_guard() {
+        let tmpl = "{%- set x = reasoning_effort|default('xhigh') %}\n\
+                    {%- if resolved_reasoning_effort not in ('xhigh', 'medium', 'low') %}\n\
+                    {{- raise_exception('...') }}";
+        assert_eq!(
+            extract_effort_levels(tmpl),
+            Some(vec!["xhigh".into(), "medium".into(), "low".into()])
+        );
+    }
+
+    #[test]
+    fn a_template_with_no_effort_guard_yields_none() {
+        assert_eq!(extract_effort_levels("{{ messages[0].content }}"), None);
+    }
+
+    #[test]
+    fn pretty_level_names_are_readable() {
+        assert_eq!(pretty_level("xhigh"), "Extra high");
+        assert_eq!(pretty_level("medium"), "Medium");
+        assert_eq!(pretty_level("ultra"), "Ultra"); // unknown → title-cased
     }
 
     #[test]

@@ -172,6 +172,13 @@ pub struct AppState {
     /// this is what lets the watchdog tell "still loading" apart from
     /// "never going to load".
     pub booted_windows: Mutex<HashSet<String>>,
+    /// Reasoning-effort levels discovered per provider id for self-hosted
+    /// endpoints (`bigtiny::effort`). A provider's levels come from its own
+    /// model's chat template (queried once from the server's `/props`, or
+    /// HuggingFace), so they're cached here rather than re-probed on every
+    /// dropdown read. An empty vec means "probed, none found" → hide the
+    /// dropdown; a missing key means "not probed yet".
+    pub effort_levels: Mutex<HashMap<String, Vec<String>>>,
 }
 
 impl AppState {
@@ -199,6 +206,7 @@ impl AppState {
             screenshot_selection: Mutex::new(None),
             bigtiny_compaction_watermarks: Mutex::new(HashMap::new()),
             booted_windows: Mutex::new(HashSet::new()),
+            effort_levels: Mutex::new(HashMap::new()),
         }
     }
 }

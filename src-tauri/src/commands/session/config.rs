@@ -35,6 +35,7 @@ pub async fn set_thinking_effort(
         crate::config::save(&cfg).map_err(|e| e.to_string())?;
     }
     crate::bigtiny::sessions::update_thinking_effort(&app, &session_id, &value).await?;
+    crate::bigtiny::effort::ensure_effort_levels_cached(&app).await;
     Ok(crate::bigtiny::effort::thinking_effort_for(&app, &session_id))
 }
 
@@ -46,6 +47,9 @@ pub async fn get_thinking_effort(
     app: AppHandle,
     session_id: String,
 ) -> Result<Option<ThinkingEffort>, String> {
+    // Discover a self-hosted model's own effort levels (once per provider+model)
+    // before reading — the sync read below then reflects them.
+    crate::bigtiny::effort::ensure_effort_levels_cached(&app).await;
     Ok(crate::bigtiny::effort::thinking_effort_for(&app, &session_id))
 }
 

@@ -52,6 +52,24 @@ pub const OVERLAY: &str = "overlay";
 pub const HUB: &str = "hub";
 pub const SCREENSHOT_SELECT: &str = "screenshot-select";
 
+/// `WebviewWindow::set_focus()` is unimplemented on Tauri's Android backend and
+/// logs "set_focus is not yet implemented on android" every time — meaningless
+/// there anyway, since Android runs a single always-focused fullscreen window.
+/// This behaves exactly like `set_focus()` on desktop and is a silent no-op on
+/// Android, so the hub path (`build_chat_window`/`route_to`/`open_main`) stops
+/// spamming that warning.
+fn focus_window(win: &WebviewWindow) -> tauri::Result<()> {
+    #[cfg(not(target_os = "android"))]
+    {
+        win.set_focus()
+    }
+    #[cfg(target_os = "android")]
+    {
+        let _ = win;
+        Ok(())
+    }
+}
+
 fn url(label: &str) -> WebviewUrl {
     // Path is identical in dev (vite server) and prod (dist) — see vite.config.ts.
     // A dynamically-allocated `chat-N` label (D21 — multiple simultaneous hub
@@ -392,7 +410,7 @@ pub fn show_and_focus(app: &AppHandle, label: &str) -> bool {
         animate_overlay_in(&win);
     } else {
         let _ = win.show();
-        let _ = win.set_focus();
+        let _ = focus_window(&win);
     }
     true
 }
@@ -447,7 +465,7 @@ pub fn focus_or_open_chat_window(app: &AppHandle) {
 pub fn toggle_or_focus_main(app: &AppHandle) -> tauri::Result<()> {
     if let Some(win) = app.get_webview_window(HUB) {
         if win.is_visible().unwrap_or(false) {
-            win.set_focus()?;
+            focus_window(&win)?;
             return Ok(());
         }
     }
@@ -482,7 +500,7 @@ fn ensure_window(
 pub fn open_main(app: &AppHandle) -> tauri::Result<()> {
     let win = ensure_window(app, HUB, "Kitty", (1196.0, 720.0))?;
     win.show()?;
-    win.set_focus()?;
+    focus_window(&win)?;
     Ok(())
 }
 
@@ -498,7 +516,7 @@ pub fn open_main(app: &AppHandle) -> tauri::Result<()> {
 fn build_chat_window(app: &AppHandle, label: &str) -> tauri::Result<WebviewWindow> {
     let win = ensure_window(app, label, "Kitty", (1196.0, 720.0))?;
     win.show()?;
-    win.set_focus()?;
+    focus_window(&win)?;
 
     let cleanup_app = app.clone();
     let cleanup_label = label.to_string();
@@ -646,7 +664,7 @@ fn route_to(app: &AppHandle, target: serde_json::Value) -> tauri::Result<()> {
     let _ = app.emit_to(label.as_str(), "route://goto", target);
     let win = ensure_window(app, &label, "Kitty", (1196.0, 720.0))?;
     win.show()?;
-    win.set_focus()?;
+    focus_window(&win)?;
     Ok(())
 }
 

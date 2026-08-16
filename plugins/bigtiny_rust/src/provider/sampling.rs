@@ -56,8 +56,10 @@ pub fn merge(configured: &SamplingParams, defaults: &SamplingParams) -> Sampling
         max_tokens: configured.max_tokens.or(defaults.max_tokens),
         // Neither presets nor floors ever set effort (the loop applies it after
         // this merge), so this `or` is only ever `None.or(None)` — carried
-        // through for completeness rather than to combine two levels.
-        effort: configured.effort.or(defaults.effort),
+        // through for completeness rather than to combine two levels. `Effort`
+        // is no longer `Copy` (it can carry a model-specific level string), so
+        // clone out of the shared references.
+        effort: configured.effort.clone().or_else(|| defaults.effort.clone()),
     }
 }
 

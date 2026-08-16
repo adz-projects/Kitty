@@ -850,8 +850,10 @@ impl AgentLoop {
                 };
                 // Applied after the preset/floor merge — effort is a level to
                 // translate per dialect, not a knob to merge, and neither
-                // presets nor floors carry one to combine it with.
-                sampling.effort = effort;
+                // presets nor floors carry one to combine it with. Cloned
+                // because this runs once per tool-loop iteration and `Effort` is
+                // no longer `Copy` (it can carry a model-specific level string).
+                sampling.effort = effort.clone();
                 // The ephemeral thought-seed prefill rides the FIRST provider
                 // request only: it primes the model's reply to the new user
                 // message; later iterations continue from real tool results.

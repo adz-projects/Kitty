@@ -27,7 +27,7 @@ use crate::network::{maybe_direct_url, TailscaleClient};
 /// Returns `(max_tokens, thinking_budget)`. A `None` budget means "no thinking
 /// block this turn"; the caller logs why.
 fn anthropic_thinking(
-    effort: Option<Effort>,
+    effort: Option<&Effort>,
     explicit_max: Option<i32>,
     has_tools: bool,
 ) -> (i32, Option<i32>) {
@@ -35,7 +35,9 @@ fn anthropic_thinking(
     let base = match effort {
         Some(Effort::Low) => 4096,
         Some(Effort::Medium) => 16384,
-        Some(Effort::High) => 32768,
+        // High or a model-specific `Custom` level (Anthropic never actually
+        // receives one, but clamp defensively): the top budget.
+        Some(Effort::High) | Some(Effort::Custom(_)) => 32768,
         // Off / None: no thinking, keep whatever max_tokens was resolved.
         _ => return (max, None),
     };
@@ -318,7 +320,7 @@ impl Provider for AnthropicProvider {
         // of that arithmetic is pure and lives in `anthropic_thinking`.
         let has_tools = tools.as_ref().is_some_and(|t| !t.is_empty());
         let (max_tokens, thinking_budget) =
-            anthropic_thinking(sampling.effort, explicit_max, has_tools);
+            anthropic_thinking(sampling.effort.as_ref(), explicit_max, has_tools);
         if thinking_budget.is_none()
             && matches!(
                 sampling.effort,
@@ -916,7 +918,7 @@ mod thinking_tests {
     #[test]
     fn no_effort_leaves_max_tokens_and_adds_no_thinking() {
         assert_eq!(anthropic_thinking(None, None, false), (4096, None));
-        assert_eq!(anthropic_thinking(Some(Effort::Off), None, false), (4096, None));
+        assert_eq!(anthropic_thinking(Some(&Effort::Off), None, false), (4096, None));
         // An explicit cap is preserved untouched.
         assert_eq!(anthropic_thinking(None, Some(8192), false), (8192, None));
     }
@@ -926,7 +928,7 @@ mod thinking_tests {
         // The trap: a high effort on a tool-carrying turn must NOT emit a
         // thinking block (it would 400 the next request).
         assert_eq!(
-            anthropic_thinking(Some(Effort::High), None, true),
+            anthropic_thinking(Some(&Effort::High), None, true),
             (4096, None)
         );
     }
@@ -935,12 +937,12 @@ mod thinking_tests {
     fn without_an_explicit_cap_the_answer_gets_headroom_above_the_budget() {
         // Low: budget 4096, max = 4096 + 4096 = 8192 (budget strictly below).
         assert_eq!(
-            anthropic_thinking(Some(Effort::Low), None, false),
+            anthropic_thinking(Some(&Effort::Low), None, false),
             (8192, Some(4096))
         );
         // High: budget 32768, max = 36864.
         assert_eq!(
-            anthropic_thinking(Some(Effort::High), None, false),
+            anthropic_thinking(Some(&Effort::High), None, false),
             (36864, Some(32768))
         );
     }
@@ -950,7 +952,7 @@ mod thinking_tests {
         // The most likely bug in the cluster: default max_tokens is 4096, and a
         // medium budget of 16384 is >= it. Because no explicit cap was set,
         // max_tokens is raised to fit rather than the budget colliding with it.
-        let (max, budget) = anthropic_thinking(Some(Effort::Medium), None, false);
+        let (max, budget) = anthropic_thinking(Some(&Effort::Medium), None, false);
         assert!(budget.unwrap() < max, "budget must stay strictly below max_tokens");
         assert_eq!((max, budget), (16384 + 4096, Some(16384)));
     }
@@ -959,7 +961,7 @@ mod thinking_tests {
     fn an_explicit_cap_clamps_the_budget_below_it() {
         // cap 8192, high base 32768 → budget clamped to 8192-1024 = 7168.
         assert_eq!(
-            anthropic_thinking(Some(Effort::High), Some(8192), false),
+            anthropic_thinking(Some(&Effort::High), Some(8192), false),
             (8192, Some(7168))
         );
     }
@@ -969,7 +971,7 @@ mod thinking_tests {
         // cap 1500 → budget would be min(base, 476) = 476 < 1024 → no thinking,
         // and the cap is left as the user set it.
         assert_eq!(
-            anthropic_thinking(Some(Effort::Low), Some(1500), false),
+            anthropic_thinking(Some(&Effort::Low), Some(1500), false),
             (1500, None)
         );
     }

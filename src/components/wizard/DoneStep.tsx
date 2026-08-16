@@ -2,9 +2,9 @@ import { useEffect, useState } from 'react';
 import { ipc } from '@/lib/ipc';
 import { useRouteStore } from '@/stores/routeStore';
 import type { SetupValidation } from '@/lib/types';
-import type { WizardPath } from './PathFork';
+import { isAndroid } from '@/lib/platform';
 
-export function DoneStep({ path, onBack }: { path: WizardPath | null; onBack: () => void }) {
+export function DoneStep({ onBack }: { onBack: () => void }) {
   const [validation, setValidation] = useState<SetupValidation | null>(null);
   const [checking, setChecking] = useState(true);
   const [finishing, setFinishing] = useState(false);
@@ -52,8 +52,15 @@ export function DoneStep({ path, onBack }: { path: WizardPath | null; onBack: ()
 
       <div className="wizard-summary">
         <div className="wizard-summary-row">
-          <span className="muted">Running</span>
-          <span>{path === 'api-key' ? 'Your own API key' : 'Local models on this device'}</span>
+          <span className="muted">Chat</span>
+          <span>Your own API key</span>
+        </div>
+        <div className="wizard-summary-row">
+          <span className="muted">On this device</span>
+          <span>
+            Memory{!isAndroid() && ' (and summarization)'} via Kitty's own local model
+            {!isAndroid() && 's'}
+          </span>
         </div>
         {checking && (
           <p className="muted" style={{ margin: 0 }}>

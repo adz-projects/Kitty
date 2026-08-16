@@ -25,9 +25,6 @@ struct NoticeArgs<'a> {
 }
 
 #[derive(Deserialize)]
-struct Empty {}
-
-#[derive(Deserialize)]
 struct Granted {
     #[serde(default)]
     granted: bool,
@@ -59,7 +56,7 @@ pub fn request_notification_permission() -> bool {
 /// indeterminate bar rather than inventing a percentage.
 pub fn start_or_update(title: &str, received: u64, total: u64) {
     let Ok(h) = handle() else { return };
-    if let Err(e) = h.run_mobile_plugin::<Empty>(
+    if let Err(e) = h.run_mobile_plugin::<serde_json::Value>(
         "startDownloadNotice",
         NoticeArgs {
             title,
@@ -73,7 +70,7 @@ pub fn start_or_update(title: &str, received: u64, total: u64) {
 
 pub fn stop() {
     let Ok(h) = handle() else { return };
-    if let Err(e) = h.run_mobile_plugin::<Empty>("stopDownloadNotice", ()) {
+    if let Err(e) = h.run_mobile_plugin::<serde_json::Value>("stopDownloadNotice", ()) {
         tracing::debug!("could not stop the download foreground service: {e}");
     }
 }

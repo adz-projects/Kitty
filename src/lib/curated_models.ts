@@ -32,7 +32,19 @@ export interface CuratedModel {
    * when this is set.
    */
   gated?: boolean;
+  /**
+   * Only usable on desktop. The generative summarizer runs via LiteRT-LM on
+   * Windows only — Android offloads compaction to the remote chat model, so no
+   * generative model runs on the phone. Such models must not be offered for
+   * download on Android (Settings or the wizard).
+   */
+  desktopOnly?: boolean;
 }
+
+/** Curated models offered on the current platform — drops desktop-only models
+    (the Windows LiteRT-LM summarizer) on Android. */
+export const curatedModelsFor = (android: boolean): CuratedModel[] =>
+  CURATED_MODELS.filter((m) => !(android && m.desktopOnly));
 
 export const CURATED_MODELS: CuratedModel[] = [
   {
@@ -42,6 +54,7 @@ export const CURATED_MODELS: CuratedModel[] = [
     blurb: 'Windows only. Runs compaction and summarising locally on the desktop.',
     size_gb: 2.59,
     role: 'chat',
+    desktopOnly: true, // Android offloads compaction to the remote chat model.
   },
   {
     // EmbeddingGemma ships only `.tflite` variants (+ `sentencepiece.model`).

@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { ipc, onModelProgress, onModelsChanged } from '@/lib/ipc';
-import { CURATED_MODELS } from '@/lib/curated_models';
+import { curatedModelsFor } from '@/lib/curated_models';
 import { isAndroid } from '@/lib/platform';
 import type { DownloadProgress, LocalModel } from '@/lib/types';
 
@@ -184,7 +184,7 @@ export function LocalModels() {
 
       <h2>Available</h2>
       <div className="model-list">
-        {CURATED_MODELS.map((c) => {
+        {curatedModelsFor(isAndroid()).map((c) => {
           const have = installed.has(c.file.toLowerCase());
           const busy = active.some((p) => p.model === c.file && !p.done);
           return (

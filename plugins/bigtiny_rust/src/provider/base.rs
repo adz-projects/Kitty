@@ -84,7 +84,7 @@ pub struct SamplingParams {
 
 /// A requested reasoning-effort level, provider-agnostic. Mapped to each
 /// provider's own dialect at the wire boundary (see `SamplingParams::effort`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effort {
     /// Explicitly ask the model *not* to spend reasoning tokens. Expressible
     /// on OpenRouter (`{"enabled": false}`) and by omission on Anthropic;
@@ -93,19 +93,51 @@ pub enum Effort {
     Low,
     Medium,
     High,
+    /// A model-declared level that isn't one of the standard three — e.g.
+    /// Qwen3's `xhigh`, discovered from a self-hosted server's chat template
+    /// (see Kitty's `bigtiny::effort`). Forwarded verbatim to the self-hosted
+    /// wire path; the hosted dialects (OpenAI/OpenRouter/Anthropic), which only
+    /// understand low/medium/high, clamp it to their highest level.
+    Custom(String),
 }
 
 impl Effort {
     /// Parse the wire string Kitty persists in session config
-    /// (`thinking_effort`). Unknown/empty → `None`, i.e. "no effort requested",
-    /// never a silent default to some level.
+    /// (`thinking_effort`). Empty → `None` ("no effort requested"); `off` →
+    /// `Off`; the three standard levels map to their variants; anything else is
+    /// a model-specific level carried through as `Custom` (Kitty only ever sends
+    /// a level it actually discovered for the active model).
     pub fn from_wire(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
+            "" => None,
             "off" => Some(Effort::Off),
             "low" => Some(Effort::Low),
             "medium" => Some(Effort::Medium),
             "high" => Some(Effort::High),
-            _ => None,
+            other => Some(Effort::Custom(other.to_string())),
+        }
+    }
+
+    /// The raw level string for the self-hosted wire path (the chat template's
+    /// `reasoning_effort` kwarg), or `None` for `Off`.
+    pub fn wire_level(&self) -> Option<&str> {
+        match self {
+            Effort::Off => None,
+            Effort::Low => Some("low"),
+            Effort::Medium => Some("medium"),
+            Effort::High => Some("high"),
+            Effort::Custom(s) => Some(s.as_str()),
+        }
+    }
+
+    /// Clamp to one of the three levels the hosted OpenAI/OpenRouter dialects
+    /// accept. `None` for `Off`; a `Custom` level (e.g. `xhigh`) maps to `high`.
+    pub fn hosted_level(&self) -> Option<&'static str> {
+        match self {
+            Effort::Off => None,
+            Effort::Low => Some("low"),
+            Effort::Medium => Some("medium"),
+            Effort::High | Effort::Custom(_) => Some("high"),
         }
     }
 }

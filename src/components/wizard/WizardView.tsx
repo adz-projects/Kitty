@@ -2,25 +2,20 @@ import { useEffect, useRef, useState } from 'react';
 import { ipc } from '@/lib/ipc';
 import { useRouteStore } from '@/stores/routeStore';
 import type { Config } from '@/lib/types';
-import { PathFork, type WizardPath } from './PathFork';
 import { SupportModelsStep } from './SupportModelsStep';
 import { isAndroid } from '@/lib/platform';
 import { ApiKeyStep } from './ApiKeyStep';
 import { ConfigureStep } from './ConfigureStep';
 import { ModelDownloadStep } from './ModelDownloadStep';
 import { DoneStep } from './DoneStep';
-import { DEFAULT_URL } from '@/lib/provider_defaults';
-import { defaultFor } from '@/lib/curated_models';
 
-type StepId = 'path' | 'apikey' | 'configure' | 'model' | 'embedding' | 'support' | 'done';
+type StepId = 'apikey' | 'configure' | 'embedding' | 'support' | 'done';
 
 /** Android's fixed sequence, with no path fork (docs/ANDROID.md §8.3).
  *
- * The desktop fork asks "run models on this computer, or use your own API
- * key?" — a question with only one real answer on a phone, since Android
- * never runs chat locally (D18). Offering it would invite the user down a
- * path that does not exist. What a phone actually needs is both things in
- * order: the support models Kitty runs itself, then a provider for chat.
+ * Android never runs chat locally (D18): what a phone actually needs is both
+ * things in order — the memory model Kitty runs itself, then a provider for
+ * chat.
  *
  * `configure` is dropped too: it sets a default context folder and a global
  * hotkey, neither of which Android has. */
@@ -32,44 +27,35 @@ export function androidSteps(): { id: StepId; label: string }[] {
   ];
 }
 
-export function stepsForPath(
-  path: WizardPath | null,
-  adaptivePathwayEnabled: boolean
-): { id: StepId; label: string }[] {
-  const start = { id: 'path' as const, label: 'Get started' };
-  const done = { id: 'done' as const, label: 'Done' };
-  // Shown on BOTH paths when adaptive-pathway is enabled — its embeddings run
-  // on the in-process engine regardless of which provider serves chat, so an
-  // API-key user needs this model too.
+/** Desktop's fixed sequence.
+ *
+ * There used to be a first-screen fork ("run models on this computer, or use
+ * your own API key?"), because Kitty could run chat entirely in-process via
+ * llama.cpp. That local-chat engine is gone — replaced by LiteRT, which does
+ * only embeddings (and, on Windows, compaction summarization), never chat —
+ * so "on this computer" was never a real answer for chat and offering it sent
+ * a newcomer down a dead path (a "local" provider Kitty can no longer serve).
+ * Every install needs a provider, so the wizard just asks for one. */
+export function desktopSteps(adaptivePathwayEnabled: boolean): { id: StepId; label: string }[] {
+  // Its embeddings run on the in-process LiteRT engine regardless of which
+  // provider serves chat, so this is offered unconditionally when the pathway
+  // engine is on — not gated on how the user connects for chat.
   const embedding = adaptivePathwayEnabled
     ? [{ id: 'embedding' as const, label: 'Learning model' }]
     : [];
-  if (path === 'api-key') {
-    return [
-      start,
-      { id: 'apikey', label: 'Connect' },
-      { id: 'configure', label: 'Configure' },
-      ...embedding,
-      done,
-    ];
-  }
   return [
-    start,
-    { id: 'model', label: 'First model' },
+    { id: 'apikey', label: 'Connect' },
     { id: 'configure', label: 'Configure' },
     ...embedding,
-    done,
+    { id: 'done', label: 'Done' },
   ];
 }
 
 /** First-run wizard (also Settings → Setup & Repair).
  *
- * Desktop forks local-vs-API-key on the first screen and adapts the rest of
- * the flow to the choice. **Android has no fork** — see `androidSteps` — it
- * downloads Kitty's own support models, then connects a provider.
- *
- * Repair mode pre-selects the path from the current config and skips
- * straight past the fork. */
+ * Desktop and Android both run a single fixed sequence now — see
+ * `desktopSteps`/`androidSteps` for why there's no local-vs-API-key fork on
+ * either platform. */
 export function WizardView() {
   // Mode rides on the route (`routeStore` owns the `route://goto`
   // subscription), so opening Setup & Repair and being deep-linked into repair
@@ -78,7 +64,6 @@ export function WizardView() {
   const [cfg, setCfg] = useState<Config | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
-  const [path, setPath] = useState<WizardPath | null>(null);
   const [stepIndex, setStepIndex] = useState(0);
   const [completedThrough, setCompletedThrough] = useState(0);
 
@@ -91,58 +76,12 @@ export function WizardView() {
   // resolve out of order and leave a stale value persisted.
   const writeQueueRef = useRef<Promise<void>>(Promise.resolve());
 
-  // Keyed on `mode` so entering repair from an already-open wizard re-runs the
-  // path inference rather than leaving the user on the setup fork.
   useEffect(() => {
     void ipc
       .getConfig()
-      .then((c) => {
-        setCfg(c);
-        if (mode !== 'repair') return;
-        // Repair mode: infer the path from what's already configured and
-        // jump straight past the "welcome" fork.
-        const active = c.providers.find((p) => p.id === c.active_provider_id);
-        const inferred: WizardPath =
-          active && active.provider_type !== 'local' ? 'api-key' : 'local';
-        setPath(inferred);
-        setStepIndex(1);
-        setCompletedThrough(1);
-      })
+      .then(setCfg)
       .catch((e) => setLoadError(String(e)));
   }, [mode]);
-
-  /** Create (once) and activate a provider profile bound to the in-process
-      engine, so the model just downloaded is actually the one chat uses.
-      The daemon registers this engine under a fixed id with no DB row of its
-      own — Kitty's profile exists purely so the rest of the app's
-      provider/model plumbing has something to point at. */
-  const adoptLocalModel = async () => {
-    const model = defaultFor('chat');
-    const base = cfgRef.current;
-    if (!model || !base) return;
-    const existing = base.providers.find((p) => p.provider_type === 'local');
-    try {
-      const saved = await ipc.upsertProvider(
-        {
-          ...(existing ?? {
-            id: '',
-            name: 'On this device',
-            provider_type: 'local',
-            base_url: DEFAULT_URL.local,
-            is_trusted: true,
-            strip_reasoning: false,
-            supports_vision: false,
-            created_at: '',
-          }),
-          models: [model.file.replace(/\.gguf$/i, '')],
-        } as Parameters<typeof ipc.upsertProvider>[0],
-        null
-      );
-      await ipc.activateProvider(saved.id);
-    } catch (e) {
-      setSaveError(String(e));
-    }
-  };
 
   const saveCfg = (patch: Partial<Config>) => {
     const base = cfgRef.current;
@@ -174,9 +113,8 @@ export function WizardView() {
     );
   }
 
-  // Android gets a fixed two-step flow; desktop keeps the fork.
-  const steps = isAndroid() ? androidSteps() : stepsForPath(path, cfg.adaptive_pathway_enabled);
-  const current = steps[stepIndex]?.id ?? 'path';
+  const steps = isAndroid() ? androidSteps() : desktopSteps(cfg.adaptive_pathway_enabled);
+  const current = steps[stepIndex]?.id ?? steps[0]?.id;
 
   const next = () => setStepIndex((i) => Math.min(i + 1, steps.length - 1));
   const nextAndMark = () => {
@@ -207,31 +145,9 @@ export function WizardView() {
       </div>
 
       {current === 'support' && <SupportModelsStep onNext={nextAndMark} onSkip={nextAndMark} />}
-      {current === 'path' && (
-        <PathFork
-          mode={mode}
-          selected={path}
-          onSelect={(p) => {
-            if (p !== path) setCompletedThrough(0);
-            setPath(p);
-            nextAndMark();
-          }}
-        />
-      )}
       {current === 'apikey' && <ApiKeyStep onBack={back} onNext={nextAndMark} />}
       {current === 'configure' && (
         <ConfigureStep cfg={cfg} saveCfg={saveCfg} onBack={back} onNext={nextAndMark} />
-      )}
-      {current === 'model' && (
-        <ModelDownloadStep
-          role="chat"
-          title="Download a model"
-          blurb="Kitty runs this model itself — nothing else to install, and it works offline."
-          skipNote="You can skip and add an API key later, but chat won't work until one or the other is set up."
-          onBack={back}
-          onNext={() => void adoptLocalModel().then(nextAndMark)}
-          onSkip={nextAndMark}
-        />
       )}
       {current === 'embedding' && (
         <ModelDownloadStep
@@ -244,7 +160,7 @@ export function WizardView() {
           onSkip={nextAndMark}
         />
       )}
-      {current === 'done' && <DoneStep path={path} onBack={back} />}
+      {current === 'done' && <DoneStep onBack={back} />}
     </div>
   );
 }
