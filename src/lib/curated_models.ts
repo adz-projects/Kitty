@@ -1,49 +1,60 @@
-// Curated GGUFs offered in the first-run wizard and Settings → Local Models.
+// Curated models offered in the first-run wizard and Settings → Local Models.
 //
-// Successor to `starter_models.ts`, which listed Ollama tags. These name a
-// Hugging Face repo and file, since Kitty downloads the weights itself now.
-// Repos and filenames are case-sensitive and verified against huggingface.co
-// at the time of writing — record changes in docs/ANDROID.md §9.
+// As of the LiteRT migration these are **LiteRT** artifacts, not GGUFs: Kitty's
+// local engine is LiteRT (see the repo plan "Replace llama.cpp with LiteRT").
+//   • embedding — EmbeddingGemma `.tflite` (both platforms; the shared vector
+//     space for adaptive-pathway memory).
+//   • chat — the generative summarizer `.litertlm`, run by LiteRT-LM on
+//     Windows only (Android offloads compaction to the remote chat model, so it
+//     downloads only the embedding model).
 //
-// Deliberately short. Every extra entry is another multi-gigabyte decision to
-// put in front of someone on their first run, and the two roles Kitty actually
-// needs filled are chat and embeddings.
+// Repos/filenames are case-sensitive and verified against huggingface.co at the
+// time of writing — record changes in docs/ANDROID.md §9.
+//
+// The Gemma `tokenizer.json` the embedder needs is **bundled as an app
+// resource**, not downloaded here (the LiteRT repo ships only
+// `sentencepiece.model`; the canonical `tokenizer.json` is converted/bundled at
+// build time). See docs/RELEASE.md.
 
 export interface CuratedModel {
   /** Hugging Face repo, `owner/name`. */
   repo: string;
-  /** Exact filename in that repo, including `.gguf`. */
+  /** Exact filename in that repo (`.tflite` or `.litertlm`). */
   file: string;
   label: string;
   blurb: string;
   size_gb: number;
   /** What this model is for — the wizard offers one of each. */
   role: 'chat' | 'embedding';
+  /**
+   * Repo is gated under a license (e.g. Gemma) and needs an accepted license +
+   * an HF access token to download. The wizard/downloader prompts for a token
+   * when this is set.
+   */
+  gated?: boolean;
 }
 
 export const CURATED_MODELS: CuratedModel[] = [
   {
-    repo: 'LiquidAI/LFM2.5-1.2B-Instruct-GGUF',
-    file: 'LFM2.5-1.2B-Instruct-Q4_K_M.gguf',
-    label: 'LFM2.5 · 1.2B Instruct',
-    blurb: 'The default. Fast on CPU, and what compaction and summarising use.',
-    size_gb: 0.73,
+    repo: 'litert-community/gemma-4-E2B-it-litert-lm',
+    file: 'gemma-4-E2B-it.litertlm',
+    label: 'Gemma 4 · E2B Instruct (LiteRT-LM)',
+    blurb: 'Windows only. Runs compaction and summarising locally on the desktop.',
+    size_gb: 2.59,
     role: 'chat',
   },
   {
-    repo: 'Qwen/Qwen3-Embedding-0.6B-GGUF',
-    // Q8_0, not q4_k_m. **Qwen never published a q4 for this model** — the
-    // official repo has exactly two GGUFs, `Q8_0` and `f16`, so the q4_k_m
-    // filename this used to name 404'd and the embedding download could
-    // never have succeeded. Q8_0 over f16 because f16 is ~1.2 GB for no
-    // recall benefit; going *below* Q8 on an embedder is the trade that
-    // actually costs retrieval quality, which is the only reason this model
-    // is here.
-    file: 'Qwen3-Embedding-0.6B-Q8_0.gguf',
-    label: 'Qwen3 Embedding · 0.6B',
+    // EmbeddingGemma ships only `.tflite` variants (+ `sentencepiece.model`).
+    // The generic `seq256` mixed-precision build runs on CPU on any device; a
+    // per-SoC NPU variant (e.g. `...google.tensor_g5.tflite`) is an
+    // optimisation layered on later.
+    repo: 'litert-community/embeddinggemma-300m',
+    file: 'embeddinggemma-300M_seq256_mixed-precision.tflite',
+    label: 'EmbeddingGemma · 300M',
     blurb: 'Gives the memory engine real semantic recall instead of keyword matching.',
-    size_gb: 0.64,
+    size_gb: 0.18,
     role: 'embedding',
+    gated: true, // Gemma license: needs an accepted license + HF token.
   },
 ];
 

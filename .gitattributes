@@ -4,7 +4,6 @@
 # output — a CRLF/LF mismatch there breaks the snapshot comparison on any
 # fresh Windows checkout with Git's recommended core.autocrlf=true default.
 * text=auto eol=lf
-
 # Binary files: never touched by line-ending normalization.
 *.png binary
 *.ico binary
@@ -20,3 +19,7 @@
 *.exe binary
 *.dll binary
 *.pdb binary
+src-tauri/binaries/*.exe filter=lfs diff=lfs merge=lfs -text
+src-tauri/resources/*.dll filter=lfs diff=lfs merge=lfs -text
+src-tauri/resources/tokenizer.json filter=lfs diff=lfs merge=lfs -text
+src-tauri/resources/*.wasm filter=lfs diff=lfs merge=lfs -text

@@ -573,8 +573,11 @@ fn default_ap_embedding_model() -> String {
 /// GGUF ids (file stems) of the two models the local engine uses by default,
 /// matching docs/ANDROID.md §9. Ids rather than Ollama tags since Phase 2b:
 /// these name a file in `models_dir()`, resolved by `crate::models::resolve`.
-pub const DEFAULT_EMBEDDING_GGUF: &str = "Qwen3-Embedding-0.6B-Q8_0";
-pub const DEFAULT_SUMMARIZER_GGUF: &str = "LFM2.5-1.2B-Instruct-Q4_K_M";
+// LiteRT migration: these now name LiteRT artifacts (`.tflite` embedder,
+// `.litertlm` generative summarizer), not GGUFs. Names kept for churn reasons;
+// the values match `src/lib/curated_models.ts` and what `bigtiny_env` resolves.
+pub const DEFAULT_EMBEDDING_GGUF: &str = "embeddinggemma-300M_seq256_mixed-precision.tflite";
+pub const DEFAULT_SUMMARIZER_GGUF: &str = "gemma-4-E2B-it.litertlm";
 
 /// Ollama tags these two settings held before Phase 2b, carried forward by
 /// `migrate_model_tags_to_gguf`.
@@ -1016,12 +1019,24 @@ fn migrate_kitty_web_enabled(mut config: Config) -> Config {
 /// typed by hand is left alone: it may well name a GGUF they downloaded
 /// themselves, and guessing would be worse than leaving it.
 fn migrate_model_tags_to_gguf(mut config: Config) -> Config {
-    if config.adaptive_pathway_embedding_model == LEGACY_EMBEDDING_TAG
-        || config.adaptive_pathway_embedding_model == UNAVAILABLE_EMBEDDING_GGUF
+    // LiteRT migration: GGUFs are gone. Any Ollama tag, the old GGUF defaults,
+    // or any lingering `.gguf` id must move to the LiteRT defaults, or the slot
+    // resolves to nothing and silently degrades. A `.gguf` value can no longer
+    // name anything the engine can load, so the earlier "leave hand-typed values
+    // alone" caveat no longer applies to GGUF ids.
+    let emb = &config.adaptive_pathway_embedding_model;
+    if emb == LEGACY_EMBEDDING_TAG
+        || emb == UNAVAILABLE_EMBEDDING_GGUF
+        || emb.ends_with(".gguf")
+        || emb == "Qwen3-Embedding-0.6B-Q8_0"
     {
         config.adaptive_pathway_embedding_model = DEFAULT_EMBEDDING_GGUF.to_string();
     }
-    if LEGACY_SUMMARIZER_TAGS.contains(&config.summarizer.model.as_str()) {
+    let sum = config.summarizer.model.as_str();
+    if LEGACY_SUMMARIZER_TAGS.contains(&sum)
+        || sum.ends_with(".gguf")
+        || sum == "LFM2.5-1.2B-Instruct-Q4_K_M"
+    {
         config.summarizer.model = DEFAULT_SUMMARIZER_GGUF.to_string();
     }
     config

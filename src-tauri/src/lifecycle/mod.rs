@@ -160,14 +160,41 @@ pub fn start_stack(app: &AppHandle) {
         };
 
         set_startup_phase(&app, StartupPhase::SpawningBackend);
+
+        // Bundled LiteRT resources (Gemma `tokenizer.json` + the runtime DLLs)
+        // ship as app resources — see `tauri.conf.json` `bundle.resources` and
+        // docs/RELEASE.md. On Windows `resource_dir()` is the flat directory they
+        // land in; we hand the daemon the tokenizer's absolute path and put that
+        // directory on the daemon's PATH so `libLiteRt.dll` (loaded by bare name)
+        // and its dependents resolve. On Android `resource_dir()` is an asset
+        // URI, not a filesystem path, so `is_file()` is false and the tokenizer
+        // falls back to the models dir inside `daemon_env` (the `.so` comes from
+        // the APK `jniLibs`, not from here).
+        let (tokenizer_path, litert_lib_dir) = {
+            use tauri::Manager;
+            match app.path().resource_dir() {
+                Ok(res) => {
+                    let tok = res.join("tokenizer.json");
+                    let tok = if tok.is_file() {
+                        tok.to_string_lossy().into_owned()
+                    } else {
+                        String::new()
+                    };
+                    (tok, res.to_string_lossy().into_owned())
+                }
+                Err(_) => (String::new(), String::new()),
+            }
+        };
+
         // Android links the daemon in and starts it here; desktop spawns the
         // bundled executable. Both produce the same `DaemonHandle`, so
         // everything below this point is platform-agnostic (docs/ANDROID.md
         // D8, §2.3).
         #[cfg(target_os = "android")]
         let spawn_result = {
-            // The spawn-only inputs have no meaning without a child process.
-            let _ = (&command, &args, &dir);
+            // The spawn-only inputs have no meaning without a child process, and
+            // Android finds `libLiteRt.so` in the APK `jniLibs`, not via PATH.
+            let _ = (&command, &args, &dir, &litert_lib_dir);
             bigtiny_embedded::start(
                 &summarizer,
                 &token_management,
@@ -175,6 +202,7 @@ pub fn start_stack(app: &AppHandle) {
                 &local,
                 pathway_enabled,
                 &pathway_embedding_model,
+                &tokenizer_path,
             )
             .await
         };
@@ -189,6 +217,8 @@ pub fn start_stack(app: &AppHandle) {
             &local,
             pathway_enabled,
             &pathway_embedding_model,
+            &tokenizer_path,
+            Some(litert_lib_dir.as_str()),
         )
         .await;
         match spawn_result {

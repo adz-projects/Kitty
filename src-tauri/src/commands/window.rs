@@ -194,6 +194,23 @@ pub async fn restart_backend(app: AppHandle) -> Result<(), String> {
                 cfg.adaptive_pathway_embedding_model.clone(),
             )
         };
+        // Same bundled-LiteRT resolution as `lifecycle::start_stack` (tokenizer
+        // path + the dir to put on the daemon's PATH for its DLLs).
+        let (tokenizer_path, litert_lib_dir) = {
+            use tauri::Manager;
+            match app.path().resource_dir() {
+                Ok(res) => {
+                    let tok = res.join("tokenizer.json");
+                    let tok = if tok.is_file() {
+                        tok.to_string_lossy().into_owned()
+                    } else {
+                        String::new()
+                    };
+                    (tok, res.to_string_lossy().into_owned())
+                }
+                Err(_) => (String::new(), String::new()),
+            }
+        };
         let handle = lifecycle::bigtiny_proc::spawn(
             &command,
             &args,
@@ -204,6 +221,8 @@ pub async fn restart_backend(app: AppHandle) -> Result<(), String> {
             &local,
             pathway_enabled,
             &pathway_embedding_model,
+            &tokenizer_path,
+            Some(litert_lib_dir.as_str()),
         )
         .await?;
         let (healthy, port) = (handle.healthy, handle.port);

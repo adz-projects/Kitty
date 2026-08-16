@@ -33,6 +33,61 @@ Artifacts:
 - `src-tauri/target/release/kitty.exe`
 - `src-tauri/target/release/bundle/nsis/Kitty_<version>_x64-setup.exe`
 
+### LiteRT runtime (the Windows daemon's local engine)
+
+The Windows daemon is built with `--features litert-engine` (embeddings +
+generative compaction summarization; there is **no llama.cpp** anymore — that
+whole cmake/Vulkan/glslc build surface is gone). Building and shipping it needs
+two things beyond the ordinary `cargo build`:
+
+1. **Build the daemon with the feature** (its `build.rs` auto-copies
+   `litert-lm.if.lib` → `litert-lm.lib`, so no manual link step):
+
+   ```powershell
+   cd plugins/bigtiny_rust
+   cargo build --release --features litert-engine --bin bigtiny-daemon
+   # → target/release/bigtiny-daemon.exe (~76 MB), then copy to
+   #   src-tauri/binaries/bigtiny-daemon-x86_64-pc-windows-msvc.exe
+   ```
+
+2. **Bundle the LiteRT native DLLs + the Gemma tokenizer beside the daemon.**
+   `litert-lm-rust`'s `download-native` fetches these into the crate's build
+   output (`$CARGO_TARGET_DIR/release/`); collect the **six** DLLs:
+
+   - `libLiteRt.dll`
+   - `libLiteRtWebGpuAccelerator.dll`
+   - `libLiteRtTopKWebGpuSampler.dll`
+   - `libwebgpu_dawn.dll`
+   - `libGemmaModelConstraintProvider.dll`
+   - `litert-lm.dll`
+
+   These must land in the **same directory as `bigtiny-daemon.exe`** at
+   runtime, because the daemon loads `libLiteRt.dll` by bare name
+   (`Library::from_path("libLiteRt.dll")`, resolved by the OS from the loading
+   process's own directory) and that DLL pulls in the other five. Tauri's
+   `externalBin` places the daemon in the install root and `resource_dir()`
+   resolves to that same directory on Windows, so bundling the DLLs via
+   `bundle.resources` co-locates them with the daemon. Add them to
+   `src-tauri/tauri.conf.json` `bundle.resources` (stage the files under, e.g.,
+   `src-tauri/resources/litert/` and reference that glob) — `tauri build` errors
+   on a missing resource path, so the files must be present before you add the
+   entry.
+
+   The **Gemma `tokenizer.json`** the embedder needs is likewise bundled as a
+   resource (the `litert-community` repo ships only `sentencepiece.model`; the
+   canonical `tokenizer.json` comes from the gated `google/embeddinggemma-300m`
+   and is converted/vendored once, offline — it is **not** downloaded at
+   runtime). `lifecycle/bigtiny_env.rs` resolves it via `resource_dir()` and
+   passes `BIGTINY_LITERT__TOKENIZER_PATH`.
+
+> **Binary shipping is an open decision.** The daemon (76 MB) + six DLLs
+> (~78 MB) + tokenizer.json (~33 MB) exceed GitHub's 100 MB non-LFS file limit
+> in aggregate and individually push the repo large. Either migrate
+> `src-tauri/binaries/` + the LiteRT resources to **Git LFS**, or keep them out
+> of git and stage them from a release asset before `tauri build`. Decide this
+> before the next tagged release; the committed daemon binary is a placeholder
+> either way (see `src-tauri/binaries/README.md`).
+
 ### Signing (placeholder)
 
 Code signing is **not yet configured** (a deliberate choice for now, not an
@@ -49,10 +104,11 @@ proceed — this is expected, not a build failure.
 
 1. Bump `version` in `package.json` **and** `src-tauri/tauri.conf.json`
    (and `src-tauri/Cargo.toml`) — keep them in sync.
-2. Re-verify the curated GGUF repos/revisions in `src/lib/curated_models.ts`
-   still resolve on HuggingFace, including the support models the Android
-   wizard downloads (summarizer + embedding). A renamed or re-quantized repo
-   turns first run into a dead end.
+2. Re-verify the curated **LiteRT** repos/filenames in
+   `src/lib/curated_models.ts` still resolve on HuggingFace: EmbeddingGemma
+   `.tflite` (gated — needs an accepted Gemma license + HF token) on both
+   platforms, and `gemma-4-E2B-it.litertlm` for the Windows summarizer. A
+   renamed repo or a moved license gate turns first run into a dead end.
    Also bump `tauri.android.versionCode` — Play rejects a re-used one.
 3. Re-verify all four `plugins/build.py` targets still build cleanly. (The
    pinned Python + PyInstaller versions in `docs/VERSIONS.md` no longer gate
@@ -82,41 +138,39 @@ proceed — this is expected, not a build failure.
 
 ### Toolchain
 
-Everything in `docs/ANDROID.md` §11 is required, and every one of these fails
-in a way that reads like a broken crate rather than a missing tool. Set them in
-the shell you build from:
+The Android build is now **much lighter than the llama.cpp era**: the local
+engine is LiteRT (`litert-embed` feature — embeddings only; no generative model
+runs on the phone), which is pure `libloading` + pure-Rust `tokenizers` with
+**no native build at all**. That removes every cmake / Ninja / Vulkan SDK /
+`glslc` / SPIRV-Headers / MSVC-shell requirement the old llama.cpp cross-compile
+carried. The `libLiteRt.so` comes from the Google Maven AAR, not a source build
+(see below). What remains:
 
 ```powershell
 $ndk = "$env:LOCALAPPDATA\Android\Sdk\ndk\27.2.12479018"
 $env:ANDROID_HOME      = "$env:LOCALAPPDATA\Android\Sdk"
 $env:ANDROID_NDK_HOME  = $ndk
-# llama-cpp-sys-2's build.rs reads these three, NOT ANDROID_NDK_HOME:
-$env:ANDROID_NDK       = $ndk
-$env:ANDROID_NDK_ROOT  = $ndk
-$env:NDK_HOME          = $ndk
-$env:LIBCLANG_PATH     = "$env:LOCALAPPDATA\kitty-buildtools\libclang"
-$env:CMAKE_GENERATOR   = "Ninja"   # else cmake picks MSBuild and builds x64
-$env:CARGO_TARGET_DIR  = "C:\kt"   # cl.exe hits MAX_PATH from the repo path
-# --- Vulkan GPU backend on Android (ADDENDUM 3) ---
-# The arm64 build enables llama.cpp's `vulkan` feature. From a Windows host it
-# needs the Vulkan SDK's C++ headers + SPIRV-Headers + glslc, AND it must be run
-# from an MSVC shell so the host `vulkan-shaders-gen` sub-build finds `cl.exe`
-# (a bare shell falls to Git's MinGW gcc, which fails to link). Run the whole
-# `pnpm tauri android build` from inside `vcvars64.bat`:
-$vk = "C:\VulkanSDK\1.4.357.0"
-$env:VULKAN_INCLUDE_DIR       = "$vk\Include"
-$env:SPIRV_HEADERS_DIR        = "$vk\Lib\cmake\SPIRV-Headers"
-$env:SPIRV_HEADERS_INCLUDE_DIR= "$vk\Include"
-$env:VULKAN_GLSLC             = "$vk\Bin\glslc.exe"   # PATH search omits `.exe`
-# then, in a shell that has called:
-#   & "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
-# so `cl.exe` is first on PATH for the host shaders-gen tool.
+$env:CARGO_TARGET_DIR  = "C:\kt-android"   # keep the Rust build off the long repo path
 ```
 
-`cmake` and `ninja` must be on `PATH`. After a *failed* configure, delete
-`$env:CARGO_TARGET_DIR\<triple>\*\build\llama-cpp-sys-2-*\` before retrying —
-the crate logs "already configured, skipping" and reuses the wrong generator
-forever otherwise.
+`cargo-ndk` (`cargo install cargo-ndk`) is required to cross-compile the Rust
+cdylib for `aarch64-linux-android`. `cmake`/`ninja`/the Vulkan SDK are **no
+longer needed** for the Kitty build.
+
+**LiteRT `libLiteRt.so` (Android).** `app/build.gradle.kts` consumes the Google
+Maven AAR `com.google.ai.edge.litert:litert:2.1.4` as a **file-only**
+configuration (`litertAar`, `isTransitive = false`) and a `Copy` task
+(`extractLiteRtJni`, wired to `preBuild`) unzips `jni/**/libLiteRt.so` into a
+generated `jniLibs` dir that the `main` source set includes. AGP then merges it
+into the APK like our own `libkitty_lib.so`, and the Rust embedder loads it by
+name at runtime. The AAR is **not** put on the compile classpath
+(`implementation`): its Kotlin API metadata (2.3.0) is incompatible with the
+project's Kotlin 1.9 and breaks the Kotlin compile — we only want the `.so`.
+
+The Gemma `tokenizer.json` is bundled the same way it is on Windows (an app
+resource, converted offline from `sentencepiece.model`); Android has no
+generative summarizer, so no `.litertlm` and none of the Windows DLLs ship in
+the AAB.
 
 ### Build
 

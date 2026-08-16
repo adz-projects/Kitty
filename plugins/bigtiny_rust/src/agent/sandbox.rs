@@ -260,6 +260,25 @@ pub fn allowed_dirs_for_session(metadata: &Value, cache_dir: &str) -> Vec<String
         dirs.push(cwd.to_string());
     }
 
+    // Files the user explicitly attached to a turn (drag-and-drop / paste). Each
+    // is an absolute path that is, by construction, outside the session's
+    // chat_dir/cwd — so without this it would force a HITL approval every time
+    // the model reached for it, which is exactly the friction users hit ("models
+    // can't find attached files without approval"). The user handing us the file
+    // *is* the authorization; an exact file path added here allows reading that
+    // one file (`path_within_any`'s `resolved == base` case) without widening to
+    // its directory. Accumulated in metadata by `run_inner`, so an attachment
+    // stays reachable on later turns too.
+    if let Some(paths) = metadata.get("attached_paths").and_then(|v| v.as_array()) {
+        for p in paths {
+            if let Some(s) = p.as_str() {
+                if !s.is_empty() {
+                    dirs.push(s.to_string());
+                }
+            }
+        }
+    }
+
     dirs.extend(scratch_allowance());
 
     dirs

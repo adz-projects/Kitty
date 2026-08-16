@@ -172,7 +172,24 @@ pub async fn update_config(
     let result = sessions::update_metadata_with(&state.db, &id, move |mut merged| {
         if let Some(obj) = merged.as_object_mut() {
             for (k, v) in &patch_obj {
-                obj.insert(k.clone(), v.clone());
+                // `attached_paths` accumulates rather than replaces: each turn's
+                // drag-and-drop attachments are added to the session's
+                // approval-free read set (see `sandbox::allowed_dirs_for_session`),
+                // and a later turn attaching a *different* file must not silently
+                // revoke access to an earlier one. Union + dedup, order-stable.
+                if k == "attached_paths" {
+                    let existing = obj.get(k).and_then(|e| e.as_array()).cloned().unwrap_or_default();
+                    let incoming = v.as_array().cloned().unwrap_or_default();
+                    let mut merged_paths: Vec<Value> = existing;
+                    for item in incoming {
+                        if !merged_paths.contains(&item) {
+                            merged_paths.push(item);
+                        }
+                    }
+                    obj.insert(k.clone(), Value::Array(merged_paths));
+                } else {
+                    obj.insert(k.clone(), v.clone());
+                }
             }
         }
         merged

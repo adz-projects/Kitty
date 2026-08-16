@@ -122,6 +122,8 @@ pub async fn spawn(
     local: &crate::config::LocalModelSettings,
     pathway_enabled: bool,
     pathway_embedding_model: &str,
+    tokenizer_path: &str,
+    litert_lib_dir: Option<&str>,
 ) -> Result<DaemonHandle, String> {
     kill_stale_orphan();
 
@@ -159,9 +161,19 @@ pub async fn spawn(
             local,
             pathway_enabled,
             pathway_embedding_model,
+            tokenizer_path,
         ))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // Put the bundled LiteRT DLLs on the child's PATH so `libLiteRt.dll` (loaded
+    // by bare name) and the five dependents it pulls in resolve regardless of
+    // exactly where Tauri placed the resources relative to the daemon exe.
+    // Prepend so our copy wins over any stray system one.
+    if let Some(lib_dir) = litert_lib_dir.filter(|d| !d.is_empty()) {
+        let existing = std::env::var("PATH").unwrap_or_default();
+        let sep = if cfg!(windows) { ";" } else { ":" };
+        cmd.env("PATH", format!("{lib_dir}{sep}{existing}"));
+    }
     if let Some(dir) = dir {
         cmd.current_dir(dir);
     }

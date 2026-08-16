@@ -89,6 +89,7 @@ async fn fire_scheduled_task(app: &AppHandle, task: crate::config::scheduled_tas
                 info.session_id,
                 task.prompt.clone(),
                 None,
+                None,
             )
             .await
             {

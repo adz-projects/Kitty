@@ -17,14 +17,20 @@ pub struct ImageAttachment {
 
 /// Send a user turn. Returns immediately; streamed output arrives via
 /// `chat://*` events, and completion via `chat://complete`.
+///
+/// `attached_paths` are absolute paths of files the user attached to this turn
+/// (drag-and-drop / paste). They're registered as the session's approval-free
+/// read set so the model can open them directly — see
+/// `bigtiny::stream::send_prompt`.
 #[tauri::command]
 pub async fn send_prompt(
     app: AppHandle,
     session_id: String,
     text: String,
     images: Option<Vec<ImageAttachment>>,
+    attached_paths: Option<Vec<String>>,
 ) -> Result<(), String> {
-    crate::bigtiny::stream::send_prompt(app, session_id, text, images).await
+    crate::bigtiny::stream::send_prompt(app, session_id, text, images, attached_paths).await
 }
 
 /// Cancel the in-flight turn for a session.

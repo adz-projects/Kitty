@@ -1,9 +1,8 @@
 //! Pull the first JSON object out of a free-text model response.
 //!
-//! Not gated behind `local-engine`: both the local summarizer *and* the
-//! provider-router fallback in [`super::summarizer_chain`] need it, and only
-//! the former is feature-gated. Moved out of `local::summarizer` (its
-//! original home) rather than duplicated, so the two never drift.
+//! Unconditional (not feature-gated): both the LiteRT-LM local summarizer *and*
+//! the provider-router fallback in [`super::summarizer_chain`] need it, and only
+//! the former is feature-gated. It lives here, shared, so the two never drift.
 
 use serde_json::Value;
 

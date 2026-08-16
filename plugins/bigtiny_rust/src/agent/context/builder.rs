@@ -242,7 +242,7 @@ impl ContextBuilder {
                 "type": "text",
                 "text": new_message
             })];
-            blocks.extend(imgs.to_vec());
+            blocks.extend(imgs.iter().map(normalize_image_block));
             messages.push(json!({
                 "role": "user",
                 "content": blocks
@@ -420,6 +420,41 @@ impl ContextBuilder {
 
         // Phase B: drop whole eligible exchanges
         emergency_trim(live_messages, reserve_floor, budget)
+    }
+}
+
+/// Normalize one inbound image block into the OpenAI content-part shape every
+/// downstream consumer already assumes (`{"type":"image_url","image_url":{"url":
+/// "data:<mime>;base64,<data>"}}` — the shape compaction's block collapse and
+/// the anchor placeholder both match on).
+///
+/// Kitty sends images to `/send` as `{"data":"<raw base64>","mime_type":"<mime>"}`
+/// (see `src-tauri/.../bigtiny/stream.rs`) — a compact wire shape with **no
+/// `type` key**. Appending that verbatim to a `content` array is what makes a
+/// strict OpenAI-compatible endpoint (e.g. DashScope/Qwen) 400 with "if content
+/// is list. item must be dict and key[type] should in dict", and it only bit
+/// the *first* turn because every later turn rebuilt content from the stored
+/// (already-normalized) blocks. A block that already carries a `type` (an
+/// already-normalized `image_url`, or any future shape) is passed through
+/// untouched.
+fn normalize_image_block(block: &Value) -> Value {
+    if block.get("type").is_some() {
+        return block.clone();
+    }
+    match (
+        block.get("data").and_then(|v| v.as_str()),
+        block.get("mime_type").and_then(|v| v.as_str()),
+    ) {
+        (Some(data), mime) => {
+            let mime = mime.unwrap_or("image/png");
+            json!({
+                "type": "image_url",
+                "image_url": { "url": format!("data:{mime};base64,{data}") }
+            })
+        }
+        // Unrecognized shape: leave it as-is rather than dropping the user's
+        // attachment silently — a provider error is at least visible.
+        _ => block.clone(),
     }
 }
 
@@ -947,5 +982,24 @@ mod tests {
         ];
         assert!(strip_trailing_thought_seed(&mut messages).is_none());
         assert_eq!(messages.len(), 2);
+    }
+
+    /// Regression: Kitty's `{data, mime_type}` image wire shape (no `type` key)
+    /// must become an OpenAI `image_url` content part, or a strict endpoint
+    /// (DashScope/Qwen) 400s on the first turn with "item must be dict and
+    /// key[type] should in dict".
+    #[test]
+    fn image_blocks_are_normalized_to_openai_image_url_parts() {
+        let out = normalize_image_block(&json!({"data": "QUJD", "mime_type": "image/jpeg"}));
+        assert_eq!(out["type"], "image_url");
+        assert_eq!(out["image_url"]["url"], "data:image/jpeg;base64,QUJD");
+
+        // Missing mime falls back to png rather than producing a typeless block.
+        let out = normalize_image_block(&json!({"data": "QUJD"}));
+        assert_eq!(out["image_url"]["url"], "data:image/png;base64,QUJD");
+
+        // An already-normalized block (has `type`) is passed through untouched.
+        let already = json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,ZZ"}});
+        assert_eq!(normalize_image_block(&already), already);
     }
 }

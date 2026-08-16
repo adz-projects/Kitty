@@ -781,6 +781,12 @@ export const useChatStore = create<ChatState>((set, get) => {
       // turn that also carries dropped paths — so both blocks are emitted when
       // both exist, rather than the attachment branch shadowing the paths.
       let promptText = trimmed;
+      // Absolute paths of non-image attachments. Sent alongside the turn so the
+      // daemon adds them to the session's approval-free read set — the model can
+      // then open an attached file directly instead of hitting a sandbox
+      // approval for a path outside its workspace (images go inline, not by
+      // path, so they're excluded here).
+      const attachedPaths = otherFiles.length ? otherFiles.map((f) => f.path) : undefined;
       if (otherFiles.length) {
         // Hand non-image paths to the filesystem tools (CLAUDE.md §5).
         const block =
@@ -959,7 +965,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         });
         submitted = true;
         try {
-          await ipc.sendPrompt(info.session_id, promptText, images);
+          await ipc.sendPrompt(info.session_id, promptText, images, attachedPaths);
         } catch (e) {
           // The new session never got a real turn — drop it and restore the
           // old (still fully intact) session rather than losing the thread.
@@ -985,7 +991,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         void ipc.deleteSession(oldSessionId).catch(() => {});
       } else {
         submitted = true;
-        await ipc.sendPrompt(sessionId, promptText, images);
+        await ipc.sendPrompt(sessionId, promptText, images, attachedPaths);
       }
       return submitted;
     } catch (e) {

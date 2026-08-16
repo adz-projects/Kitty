@@ -40,12 +40,6 @@ pub struct AppState {
     pub config: BigTinyConfig,
     /// Behavioral-memory engine. `None` when disabled.
     pub pathway: Option<Arc<adaptive_pathway::engine::PathwayEngine>>,
-    /// Resident local-model slots (docs/ANDROID.md §4.1). Cheap to construct
-    /// and empty until something asks for a model, so it is unconditional
-    /// rather than an `Option` — "no local engine configured" is reported by
-    /// the slot itself, which keeps the error specific.
-    #[cfg(feature = "local-engine")]
-    pub local_slots: crate::local::SlotManager,
 }
 
 /// Builds the full route table. Paths/methods mirror

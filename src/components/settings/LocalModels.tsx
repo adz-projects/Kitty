@@ -1,7 +1,6 @@
 import { useEffect, useState } from 'react';
 import { ipc, onModelProgress, onModelsChanged } from '@/lib/ipc';
 import { CURATED_MODELS } from '@/lib/curated_models';
-import { LocalEngineSettings } from './LocalEngineSettings';
 import { isAndroid } from '@/lib/platform';
 import type { DownloadProgress, LocalModel } from '@/lib/types';
 
@@ -28,6 +27,9 @@ export function LocalModels() {
   const [downloads, setDownloads] = useState<Record<string, DownloadProgress>>({});
   const [free, setFree] = useState<number | null>(null);
   const [error, setError] = useState('');
+  // Per-file HuggingFace tokens for gated repos, held in memory only for this
+  // render — never persisted, never sent anywhere but the download request.
+  const [tokens, setTokens] = useState<Record<string, string>>({});
 
   const refresh = () => {
     void ipc
@@ -72,10 +74,22 @@ export function LocalModels() {
 
   const installed = new Set(models.map((m) => m.file.toLowerCase()));
 
-  const start = async (repo: string, file: string) => {
+  const start = async (repo: string, file: string, gated?: boolean) => {
     setError('');
     try {
-      await ipc.downloadModel(repo, file);
+      await ipc.downloadModel(
+        repo,
+        file,
+        undefined,
+        undefined,
+        gated ? tokens[file]?.trim() || undefined : undefined,
+      );
+      // Drop the token now the request is away.
+      setTokens((cur) => {
+        const next = { ...cur };
+        delete next[file];
+        return next;
+      });
     } catch (e) {
       setError(String(e));
     }
@@ -174,26 +188,49 @@ export function LocalModels() {
           const have = installed.has(c.file.toLowerCase());
           const busy = active.some((p) => p.model === c.file && !p.done);
           return (
-            <div key={c.file} className="model-row">
-              <div>
-                <div className="model-name">{c.label}</div>
-                <div className="muted">
-                  {c.blurb} · {c.size_gb} GB
+            <div key={c.file} className="model-item">
+              <div className="model-row">
+                <div>
+                  <div className="model-name">{c.label}</div>
+                  <div className="muted">
+                    {c.blurb} · {c.size_gb} GB
+                  </div>
                 </div>
+                <button
+                  disabled={have || busy}
+                  onClick={() => void start(c.repo, c.file, c.gated)}
+                  className={have ? undefined : 'primary'}
+                >
+                  {have ? 'Installed' : busy ? 'Downloading…' : 'Download'}
+                </button>
               </div>
-              <button
-                disabled={have || busy}
-                onClick={() => void start(c.repo, c.file)}
-                className={have ? undefined : 'primary'}
-              >
-                {have ? 'Installed' : busy ? 'Downloading…' : 'Download'}
-              </button>
+              {c.gated && !have && (
+                <div className="gated-token">
+                  <label className="muted" htmlFor={`hf-token-${c.file}`}>
+                    Gemma-licensed: accept it on the{' '}
+                    <a href={`https://huggingface.co/${c.repo}`} target="_blank" rel="noreferrer">
+                      model page
+                    </a>{' '}
+                    and paste a HuggingFace token (read scope). Used only for this download, never
+                    stored.
+                  </label>
+                  <input
+                    id={`hf-token-${c.file}`}
+                    type="password"
+                    autoComplete="off"
+                    placeholder="hf_…"
+                    value={tokens[c.file] ?? ''}
+                    disabled={busy}
+                    onChange={(e) =>
+                      setTokens((cur) => ({ ...cur, [c.file]: e.target.value }))
+                    }
+                  />
+                </div>
+              )}
             </div>
           );
         })}
       </div>
-
-      <LocalEngineSettings />
     </div>
   );
 }

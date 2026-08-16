@@ -161,8 +161,34 @@ pub async fn send_prompt(
     session_id: String,
     text: String,
     images: Option<Vec<ImageAttachment>>,
+    attached_paths: Option<Vec<String>>,
 ) -> Result<(), String> {
     let client = ensure_client(&app)?;
+
+    // Register any drag-and-drop / pasted file paths as this session's
+    // approval-free read set BEFORE the turn streams, so the model can open an
+    // attachment directly instead of tripping a sandbox HITL approval every time
+    // (the daemon unions these into `metadata.attached_paths`, which
+    // `sandbox::allowed_dirs_for_session` honours). Awaited before the SSE call
+    // so the allowance is in place when the tool loop computes allowed_dirs.
+    let paths: Vec<String> = attached_paths
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|p| !p.trim().is_empty())
+        .collect();
+    if !paths.is_empty() {
+        if let Err(e) = client
+            .patch_json(
+                &format!("/api/chat/{session_id}/config"),
+                &json!({ "attached_paths": paths }),
+            )
+            .await
+        {
+            // Non-fatal: the attachment path is still named in the prompt text,
+            // so at worst the model hits the old approval flow for it.
+            tracing::warn!("failed to register attached paths for {session_id}: {e}");
+        }
+    }
 
     let image_blocks: Vec<Value> = images
         .unwrap_or_default()

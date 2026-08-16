@@ -1961,10 +1961,7 @@ mod containment_order_tests {
         let router = Arc::new(ProviderRouter::new(config.cache.clone()));
         let mcp = Arc::new(MCPManager::new(pool.clone(), None));
         let hitl = Arc::new(Mutex::new(HITLManager::new(pool.clone(), config.hitl.clone())));
-        #[cfg(feature = "local-engine")]
         let summarizer = Arc::new(SummarizerChain::new(None, router.clone(), config.summarizer.clone()));
-        #[cfg(not(feature = "local-engine"))]
-        let summarizer = Arc::new(SummarizerChain::new(router.clone(), config.summarizer.clone()));
         let context = ContextBuilder::new(
             pool.clone(),
             config.token_management.clone(),

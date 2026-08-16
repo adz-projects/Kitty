@@ -31,6 +31,11 @@ pub fn daemon_env(
     local: &crate::config::LocalModelSettings,
     pathway_enabled: bool,
     pathway_embedding_model: &str,
+    // Absolute path to the bundled Gemma `tokenizer.json`, resolved by the
+    // caller from `resource_dir()` (it ships as an app resource, not in the
+    // models dir). Empty falls back to `models::resolve("tokenizer.json")` so a
+    // dev run that dropped the file into the models dir still works.
+    tokenizer_path: &str,
 ) -> Vec<(String, String)> {
     let b = |v: bool| if v { "true" } else { "false" }.to_string();
     let mut env: Vec<(String, String)> = vec![
@@ -67,58 +72,60 @@ pub fn daemon_env(
     // yields an empty value, which the daemon reads as "that slot is
     // unconfigured" — chat falls back to the active provider, embeddings to
     // lexical hashing. Both are degradations, neither is an error.
-    let chat_gguf = crate::models::resolve(&summarizer.model)
+    // LiteRT engine paths (successor to the llama.cpp `BIGTINY_LOCAL__*` block).
+    // Resolved host-side because the daemon has no idea where Kitty keeps
+    // models. `summarizer.model` now names the generative `.litertlm`;
+    // `pathway_embedding_model` names the EmbeddingGemma `.tflite`; the Gemma
+    // `tokenizer.json` is a bundled resource placed in the models dir. An empty
+    // value means that slot is unconfigured, which the daemon degrades on
+    // (embeddings -> lexical hashing, summarizer -> remote session model) rather
+    // than failing to start. The llama-only knobs (`n_ctx`, `n_gpu_layers`,
+    // `backend`, cache types) are no longer sent — LiteRT has no equivalent.
+    let embed_tflite = crate::models::resolve(pathway_embedding_model)
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let embed_gguf = crate::models::resolve(pathway_embedding_model)
+    // Prefer the caller-resolved bundled resource path; fall back to the models
+    // dir for a dev run without the packaged resource.
+    let tokenizer = if !tokenizer_path.trim().is_empty() {
+        tokenizer_path.to_string()
+    } else {
+        crate::models::resolve("tokenizer.json")
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    };
+    let summarizer_litertlm = crate::models::resolve(&summarizer.model)
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let local_enabled = !chat_gguf.is_empty() || !embed_gguf.is_empty();
-    if !local_enabled {
+    // Bare filename: loaded via `Library::from_path`, which dlopen/LoadLibrary
+    // resolves through the OS search path — the APK `jniLibs` dir on Android and
+    // the daemon's own directory on Windows, where each is bundled.
+    let lib_name = if cfg!(target_os = "android") {
+        "libLiteRt.so"
+    } else {
+        "libLiteRt.dll"
+    };
+    // The engine needs both the model and its tokenizer to embed at all.
+    let litert_enabled = !embed_tflite.is_empty() && !tokenizer.is_empty();
+    let _ = local; // llama.cpp engine knobs are retired; kept in the signature
+                   // for now so callers are unchanged during the transition.
+    if !litert_enabled {
         tracing::info!(
-            summarizer_model = %summarizer.model,
             embedding_model = %pathway_embedding_model,
-            "no local GGUF found for either slot; the local engine stays off"
+            "EmbeddingGemma tflite or tokenizer.json not found; LiteRT engine stays off"
         );
     }
 
     env.extend([
-        ("BIGTINY_LOCAL__ENABLED".to_string(), b(local_enabled)),
-        ("BIGTINY_LOCAL__MODEL_PATH".to_string(), chat_gguf),
-        ("BIGTINY_LOCAL__EMBED_MODEL_PATH".to_string(), embed_gguf),
-        // The knobs are always sent, not just when a model is present, so a
-        // model added later (the daemon can self-heal `LocalModelMissing`
-        // without a restart in between) starts with the user's chosen
-        // settings rather than the daemon's hardcoded defaults.
-        ("BIGTINY_LOCAL__N_CTX".to_string(), local.n_ctx.to_string()),
+        ("BIGTINY_LITERT__ENABLED".to_string(), b(litert_enabled)),
+        ("BIGTINY_LITERT__LIB_PATH".to_string(), lib_name.to_string()),
         (
-            "BIGTINY_LOCAL__EMBED_N_CTX".to_string(),
-            local.embed_n_ctx.to_string(),
+            "BIGTINY_LITERT__EMBED_MODEL_PATH".to_string(),
+            embed_tflite,
         ),
+        ("BIGTINY_LITERT__TOKENIZER_PATH".to_string(), tokenizer),
         (
-            "BIGTINY_LOCAL__N_BATCH".to_string(),
-            local.n_batch.to_string(),
-        ),
-        (
-            "BIGTINY_LOCAL__N_THREADS".to_string(),
-            local.n_threads.to_string(),
-        ),
-        (
-            "BIGTINY_LOCAL__N_GPU_LAYERS".to_string(),
-            local.n_gpu_layers.to_string(),
-        ),
-        ("BIGTINY_LOCAL__BACKEND".to_string(), local.backend.clone()),
-        (
-            "BIGTINY_LOCAL__EMBED_POOLING".to_string(),
-            local.embed_pooling.clone(),
-        ),
-        (
-            "BIGTINY_LOCAL__CACHE_TYPE_K".to_string(),
-            local.cache_type_k.clone(),
-        ),
-        (
-            "BIGTINY_LOCAL__CACHE_TYPE_V".to_string(),
-            local.cache_type_v.clone(),
+            "BIGTINY_LITERT__SUMMARIZER_MODEL_PATH".to_string(),
+            summarizer_litertlm,
         ),
     ]);
 
@@ -185,7 +192,7 @@ mod tests {
     #[test]
     fn the_credentials_are_always_present() {
         let (s, t, m, l) = settings();
-        let e = daemon_env("sec", "enc", &s, &t, &m, &l, false, "");
+        let e = daemon_env("sec", "enc", &s, &t, &m, &l, false, "", "");
         assert_eq!(env_of(&e, "BIGTINY_SECRET").as_deref(), Some("sec"));
         assert_eq!(env_of(&e, "BIGTINY_ENCRYPTION_KEY").as_deref(), Some("enc"));
     }
@@ -196,8 +203,8 @@ mod tests {
     #[test]
     fn booleans_use_the_word_form_the_daemon_parses() {
         let (s, t, m, l) = settings();
-        let on = daemon_env("", "", &s, &t, &m, &l, true, "");
-        let off = daemon_env("", "", &s, &t, &m, &l, false, "");
+        let on = daemon_env("", "", &s, &t, &m, &l, true, "", "");
+        let off = daemon_env("", "", &s, &t, &m, &l, false, "", "");
         assert_eq!(env_of(&on, "BIGTINY_PATHWAY__ENABLED").as_deref(), Some("true"));
         assert_eq!(
             env_of(&off, "BIGTINY_PATHWAY__ENABLED").as_deref(),
@@ -205,37 +212,40 @@ mod tests {
         );
     }
 
-    /// An unresolvable model name must produce an empty value, not a missing
-    /// variable and not a bogus path — the daemon reads empty as "slot
-    /// unconfigured" and degrades, which is the intended behaviour.
+    /// An unresolvable embedding model must leave the LiteRT slot empty and the
+    /// engine off — the daemon reads empty as "slot unconfigured" and degrades
+    /// (embeddings fall back to lexical hashing), which is the intended
+    /// behaviour.
     #[test]
     fn an_unresolvable_model_leaves_the_slot_empty_and_the_engine_off() {
         let (s, t, m, l) = settings();
-        let e = daemon_env("", "", &s, &t, &m, &l, false, NO_SUCH_MODEL);
+        let e = daemon_env("", "", &s, &t, &m, &l, false, NO_SUCH_MODEL, "");
         assert_eq!(
-            env_of(&e, "BIGTINY_LOCAL__EMBED_MODEL_PATH").as_deref(),
+            env_of(&e, "BIGTINY_LITERT__EMBED_MODEL_PATH").as_deref(),
             Some("")
         );
         assert_eq!(
-            env_of(&e, "BIGTINY_LOCAL__ENABLED").as_deref(),
+            env_of(&e, "BIGTINY_LITERT__ENABLED").as_deref(),
             Some("false")
         );
     }
 
-    /// The engine knobs ship even with no model resident, so a model
-    /// downloaded later starts on the user's settings rather than the
-    /// daemon's defaults.
+    /// The LiteRT path variables are always sent (even with nothing resolvable),
+    /// so a model downloaded later is picked up without the daemon falling back
+    /// to its own hardcoded defaults. The `LIB_PATH` bare name is always set.
     #[test]
-    fn the_engine_knobs_are_sent_even_with_no_model() {
+    fn the_litert_paths_are_sent_even_with_no_model() {
         let (s, t, m, l) = settings();
-        let e = daemon_env("", "", &s, &t, &m, &l, false, NO_SUCH_MODEL);
-        assert_eq!(env_of(&e, "BIGTINY_LOCAL__ENABLED").as_deref(), Some("false"));
+        let e = daemon_env("", "", &s, &t, &m, &l, false, NO_SUCH_MODEL, "");
+        assert_eq!(
+            env_of(&e, "BIGTINY_LITERT__ENABLED").as_deref(),
+            Some("false")
+        );
         for key in [
-            "BIGTINY_LOCAL__N_CTX",
-            "BIGTINY_LOCAL__N_BATCH",
-            "BIGTINY_LOCAL__BACKEND",
-            "BIGTINY_LOCAL__CACHE_TYPE_K",
-            "BIGTINY_LOCAL__CACHE_TYPE_V",
+            "BIGTINY_LITERT__LIB_PATH",
+            "BIGTINY_LITERT__EMBED_MODEL_PATH",
+            "BIGTINY_LITERT__TOKENIZER_PATH",
+            "BIGTINY_LITERT__SUMMARIZER_MODEL_PATH",
         ] {
             assert!(env_of(&e, key).is_some(), "{key} should always be sent");
         }
@@ -248,11 +258,11 @@ mod tests {
     fn an_unset_bm25_threshold_is_omitted_rather_than_blank() {
         let (s, t, mut m, l) = settings();
         m.bm25_threshold = None;
-        let e = daemon_env("", "", &s, &t, &m, &l, false, "");
+        let e = daemon_env("", "", &s, &t, &m, &l, false, "", "");
         assert!(env_of(&e, "BIGTINY_MEMORY__BM25_THRESHOLD").is_none());
 
         m.bm25_threshold = Some(1.5);
-        let e = daemon_env("", "", &s, &t, &m, &l, false, "");
+        let e = daemon_env("", "", &s, &t, &m, &l, false, "", "");
         assert_eq!(
             env_of(&e, "BIGTINY_MEMORY__BM25_THRESHOLD").as_deref(),
             Some("1.5")
@@ -265,7 +275,7 @@ mod tests {
     #[test]
     fn no_key_is_emitted_twice() {
         let (s, t, m, l) = settings();
-        let e = daemon_env("", "", &s, &t, &m, &l, true, "");
+        let e = daemon_env("", "", &s, &t, &m, &l, true, "", "");
         let mut keys: Vec<&str> = e.iter().map(|(k, _)| k.as_str()).collect();
         let before = keys.len();
         keys.sort_unstable();

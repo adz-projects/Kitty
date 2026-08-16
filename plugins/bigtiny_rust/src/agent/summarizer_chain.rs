@@ -9,9 +9,10 @@
 //!
 //! §4.3's chain, as actually implemented:
 //!
-//! 1. **Local summarizer** (`local::LocalSummarizer`, feature `local-engine`)
-//!    — in-process llama.cpp, grammar-free JSON extraction (see that module's
-//!    doc comment for why). Tried first when configured and enabled.
+//! 1. **Local summarizer** (`litert::LiteRtSummarizer`, Windows-only, feature
+//!    `litert-engine`) — in-process LiteRT-LM generative model, grammar-free
+//!    JSON extraction. Tried first when configured and enabled. (Android has no
+//!    local summarizer at all — it goes straight to leg 2.)
 //! 2. **`fallback = "session_model"`** (the default) — routes through the
 //!    *same* [`ProviderRouter`] every chat turn uses, so whatever the user has
 //!    configured (local, self-hosted, or a cloud key) serves the fallback too.
@@ -45,49 +46,36 @@ use crate::provider::sampling;
 use super::json_extract::extract_json;
 
 pub struct SummarizerChain {
-    #[cfg(feature = "local-engine")]
-    local: Option<Arc<crate::local::LocalSummarizer>>,
+    /// In-process local summarizer, when one is configured — the LiteRT-LM
+    /// engine (`litert::LiteRtSummarizer`, Windows only). Implements
+    /// [`StructuredChat`], so the chain is engine-agnostic. `None` = go straight
+    /// to the router fallback (always the case on Android).
+    local: Option<Arc<dyn StructuredChat + Send + Sync>>,
     router: Arc<ProviderRouter>,
     cfg: SummarizerConfig,
 }
 
 impl SummarizerChain {
-    #[cfg(feature = "local-engine")]
     pub fn new(
-        local: Option<Arc<crate::local::LocalSummarizer>>,
+        local: Option<Arc<dyn StructuredChat + Send + Sync>>,
         router: Arc<ProviderRouter>,
         cfg: SummarizerConfig,
     ) -> Self {
         Self { local, router, cfg }
     }
 
-    #[cfg(not(feature = "local-engine"))]
-    pub fn new(router: Arc<ProviderRouter>, cfg: SummarizerConfig) -> Self {
-        Self { router, cfg }
-    }
-
-    /// Try the local engine, if one is configured and enabled. `None` means
-    /// "not available or it failed" — either way the caller should move on to
-    /// the next leg, not treat it as the chain's final answer.
+    /// Try the local engine, if one is configured. `None` means "not available
+    /// or it failed" — either way the caller moves on to the next leg. An
+    /// unavailable/unconfigured engine returns `Err` from `structured_chat`,
+    /// which is handled here identically to a genuine failure.
     async fn try_local(&self, messages: &[Value], schema: &Value) -> Option<Value> {
-        #[cfg(feature = "local-engine")]
-        {
-            let local = self.local.as_ref()?;
-            if !local.is_available() {
-                return None;
+        let local = self.local.as_ref()?;
+        match local.structured_chat(messages.to_vec(), schema).await {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::debug!("local summarizer unavailable/failed, falling back: {e}");
+                None
             }
-            match local.structured_chat(messages.to_vec(), schema).await {
-                Ok(v) => Some(v),
-                Err(e) => {
-                    tracing::warn!("local summarizer failed, falling back: {e}");
-                    None
-                }
-            }
-        }
-        #[cfg(not(feature = "local-engine"))]
-        {
-            let _ = (messages, schema);
-            None
         }
     }
 
@@ -164,9 +152,7 @@ impl SummarizerChain {
 
 /// Drain a chat-completion stream into its text. Any content is success —
 /// providers that only ever signal failure via `error_type` (the 88bugs #62
-/// dead field, still not read by the agent loop) still surface here, because
-/// `LocalProvider` also emits the message as content precisely so it isn't
-/// lost.
+/// dead field, still not read by the agent loop) still surface here as content.
 async fn collect_text(
     mut stream: std::pin::Pin<Box<dyn futures::Stream<Item = crate::provider::base::Delta> + Send>>,
 ) -> Result<String, String> {
@@ -221,14 +207,7 @@ mod tests {
     }
 
     fn chain(router: Arc<ProviderRouter>, fallback: &str) -> SummarizerChain {
-        #[cfg(feature = "local-engine")]
-        {
-            SummarizerChain::new(None, router, cfg(fallback))
-        }
-        #[cfg(not(feature = "local-engine"))]
-        {
-            SummarizerChain::new(router, cfg(fallback))
-        }
+        SummarizerChain::new(None, router, cfg(fallback))
     }
 
     /// With no local summarizer and `fallback: "off"`, both entry points must

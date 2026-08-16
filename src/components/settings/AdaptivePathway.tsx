@@ -33,6 +33,9 @@ export function AdaptivePathway() {
   const [installBusy, setInstallBusy] = useState(false);
   const [installError, setInstallError] = useState('');
   const [installProgress, setInstallProgress] = useState<DownloadProgress | null>(null);
+  // HuggingFace token for the gated EmbeddingGemma repo. In-memory only for
+  // this render; never persisted, never sent anywhere but the download request.
+  const [token, setToken] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [mcpStatus, setMcpStatus] = useState<AdaptivePathwayMcpStatus | null>(null);
@@ -82,7 +85,14 @@ export function AdaptivePathway() {
     try {
       const model = defaultFor('embedding');
       if (!model) throw new Error('no embedding model is configured');
-      await ipc.downloadModel(model.repo, model.file, undefined, EMBEDDING_DOWNLOAD_ID);
+      await ipc.downloadModel(
+        model.repo,
+        model.file,
+        undefined,
+        EMBEDDING_DOWNLOAD_ID,
+        model.gated ? token.trim() || undefined : undefined,
+      );
+      setToken(''); // done with it — drop it from memory
     } catch (e) {
       setInstallError(String(e));
     } finally {
@@ -166,6 +176,31 @@ export function AdaptivePathway() {
               {installBusy ? 'Setting up…' : 'Set up learning model'}
             </button>
           </div>
+          {defaultFor('embedding')?.gated && (
+            <div className="gated-token">
+              <label className="muted" htmlFor="hf-token-embedding">
+                Gemma-licensed: accept the license on the{' '}
+                <a
+                  href={`https://huggingface.co/${defaultFor('embedding')?.repo ?? ''}`}
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  model page
+                </a>{' '}
+                and paste a HuggingFace access token (read scope). Used only for this download,
+                never stored.
+              </label>
+              <input
+                id="hf-token-embedding"
+                type="password"
+                autoComplete="off"
+                placeholder="hf_…"
+                value={token}
+                disabled={installBusy}
+                onChange={(e) => setToken(e.target.value)}
+              />
+            </div>
+          )}
           {installProgress && (
             <div className="pull-row">
               <div className="pull-head">

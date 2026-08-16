@@ -118,17 +118,19 @@ PLUGINS: dict[str, dict[str, object]] = {
         "exe": "bigtiny-daemon",
         "extras": [],
         "kind": "rust",
-        # The in-process llama.cpp engine (docs/ANDROID.md Phase 2a/2b).
-        # Without it the shipped daemon can't serve local chat, compaction or
-        # embeddings -- and since Phase 2b there is no Ollama process to fall
-        # back to, so this is no longer optional.
+        # The in-process **LiteRT** engine (the llama.cpp `local-engine` it
+        # replaced is gone). `litert-engine` gives the Windows daemon both local
+        # roles: LiteRT embeddings for adaptive-pathway memory AND generative
+        # compaction summarization via LiteRT-LM (`gemma-4-E2B-it.litertlm`).
+        # There is no local *chat* — chat always routes to a remote provider.
         #
-        # Measured cost: +3.1 MB (77.6 vs 74.4 MB), not the +50-100 MB
-        # originally assumed -- statically linked CPU-only llama.cpp is much
-        # cheaper than it sounds. The real cost is build time: the first
-        # build compiles llama.cpp from source (several minutes) and needs
-        # cmake, Ninja and libclang on PATH. See docs/PLUGINS.md.
-        "features": ["local-engine"],
+        # Unlike the old llama.cpp path there is **no native source build**:
+        # `edgefirst-tflite` is pure `libloading` and `litert-lm-rust` downloads
+        # prebuilt DLLs (its `build.rs` copies `litert-lm.if.lib` ->
+        # `litert-lm.lib`). No cmake / Ninja / Vulkan SDK needed. The six LiteRT
+        # DLLs + the Gemma `tokenizer.json` must be bundled beside the daemon —
+        # see docs/RELEASE.md "LiteRT runtime".
+        "features": ["litert-engine"],
     },
 }
 

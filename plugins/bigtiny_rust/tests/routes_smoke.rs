@@ -53,10 +53,7 @@ async fn test_state_inner(
         pool.clone(),
         config.hitl.clone(),
     )));
-    #[cfg(feature = "local-engine")]
     let summarizer = Arc::new(SummarizerChain::new(None, router.clone(), config.summarizer.clone()));
-    #[cfg(not(feature = "local-engine"))]
-    let summarizer = Arc::new(SummarizerChain::new(router.clone(), config.summarizer.clone()));
     let agent = Arc::new(Agent::new(
         pool.clone(),
         router.clone(),
@@ -90,8 +87,6 @@ async fn test_state_inner(
         scheduler,
         config,
         pathway,
-        #[cfg(feature = "local-engine")]
-        local_slots: bigtiny_rust::local::SlotManager::new(),
     })
 }
 
@@ -894,88 +889,24 @@ async fn embeddings_route_exists_and_explains_itself_when_disabled() {
     );
 }
 
-/// A malformed request is the caller's fault, not the engine's, and must be
-/// distinguishable from "engine unavailable" — but only once the engine is
-/// actually enabled, since the disabled check short-circuits first.
-#[cfg(feature = "local-engine")]
+/// The embeddings route no longer has an HTTP-served engine behind it (LiteRT
+/// embeds in-process), so it now answers a stable 503 rather than a 404. Older
+/// external callers should still get a clear "not served here" answer.
 #[tokio::test]
-async fn embeddings_route_rejects_a_missing_prompt_as_a_bad_request() {
-    let cfg = BigTinyConfig {
-        local: bigtiny_rust::config::LocalEngineConfig {
-            enabled: true,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    let app = create_router(test_state_with_config(cfg).await);
+async fn embeddings_route_reports_no_http_engine() {
+    let app = create_router(test_state().await);
     let resp = app
         .oneshot(
             axum::http::Request::builder()
                 .method("POST")
                 .uri("/api/embeddings")
                 .header("content-type", "application/json")
-                .body(axum::body::Body::from(r#"{"model":"x"}"#))
+                .body(axum::body::Body::from(r#"{"model":"x","prompt":"hi"}"#))
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
-}
-
-/// End-to-end through the real route with a real GGUF, when one is available.
-///
-/// Opt-in via `KITTY_TEST_EMBED_GGUF=<path>` rather than skipped-by-default
-/// magic: the model is ~376 MB and not in the repo, so CI can't run this, but
-/// it is the only test that proves the wire contract Phase 2b depends on
-/// (`{prompt}` → `{embedding:[...]}`) actually holds against the engine.
-#[cfg(feature = "local-engine")]
-#[tokio::test]
-async fn embeddings_route_returns_a_real_vector_when_a_model_is_available() {
-    let Ok(path) = std::env::var("KITTY_TEST_EMBED_GGUF") else {
-        eprintln!("skipping: set KITTY_TEST_EMBED_GGUF to a GGUF path to run");
-        return;
-    };
-    let cfg = BigTinyConfig {
-        local: bigtiny_rust::config::LocalEngineConfig {
-            enabled: true,
-            embed_model_path: path,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    let app = create_router(test_state_with_config(cfg).await);
-    let resp = app
-        .oneshot(
-            axum::http::Request::builder()
-                .method("POST")
-                .uri("/api/embeddings")
-                .header("content-type", "application/json")
-                .body(axum::body::Body::from(
-                    r#"{"model":"embed","prompt":"the cat sat on the mat"}"#,
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), axum::http::StatusCode::OK);
-    let body = body_json(resp).await;
-    let v = body
-        .get("embedding")
-        .and_then(|v| v.as_array())
-        .expect("response must carry an `embedding` array — Ollama's shape");
-    assert!(v.len() > 100, "expected a real vector, got {} dims", v.len());
-    // Guard the failure mode a shape check would miss: a backend that returns
-    // a correctly-sized block of zeros/NaNs looks fine here but destroys
-    // adaptive-pathway recall.
-    let floats: Vec<f64> = v.iter().filter_map(|x| x.as_f64()).collect();
-    assert_eq!(floats.len(), v.len(), "all entries must be numbers");
-    assert!(floats.iter().all(|x| x.is_finite()), "no NaN/inf allowed");
-    assert!(
-        floats.iter().any(|x| x.abs() > 1e-6),
-        "all-zero embedding is not a usable vector"
-    );
-    let norm: f64 = floats.iter().map(|x| x * x).sum::<f64>().sqrt();
-    assert!((norm - 1.0).abs() < 1e-3, "expected L2-normalised, got {norm}");
+    assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
 }
 
 #[tokio::test]

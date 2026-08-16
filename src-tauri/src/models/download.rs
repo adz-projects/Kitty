@@ -242,13 +242,35 @@ pub fn verify_and_finalize(
     Ok(dest)
 }
 
+/// A HuggingFace access token for a gated repo (e.g. the Gemma-licensed
+/// EmbeddingGemma). Deliberately **not** a field on [`DownloadSpec`]: that
+/// struct derives `Debug` and its `url()` is persisted to the `.part.meta`
+/// sidecar, and a secret must never ride along into a log line or onto disk.
+/// It is threaded as a bare argument, used only to set one request header, and
+/// dropped when the download ends. `authorize` is the single choke point that
+/// applies it, so there is exactly one place the header is added.
+pub fn authorize(req: reqwest::RequestBuilder, token: Option<&str>) -> reqwest::RequestBuilder {
+    match token.map(str::trim).filter(|t| !t.is_empty()) {
+        Some(t) => req.bearer_auth(t),
+        None => req,
+    }
+}
+
 /// Ask HuggingFace for a file's size and sha256 without downloading it.
 ///
 /// Best-effort: any failure yields `(None, None)` and the download proceeds
 /// unverified with no space gate, because a metadata endpoint being down is
 /// not a reason to refuse a download the user asked for.
-pub async fn head_metadata(client: &reqwest::Client, spec: &DownloadSpec) -> (Option<u64>, Option<String>) {
-    let Ok(resp) = client.get(spec.url()).header("Range", "bytes=0-0").send().await else {
+pub async fn head_metadata(
+    client: &reqwest::Client,
+    spec: &DownloadSpec,
+    token: Option<&str>,
+) -> (Option<u64>, Option<String>) {
+    let Ok(resp) = authorize(client.get(spec.url()), token)
+        .header("Range", "bytes=0-0")
+        .send()
+        .await
+    else {
         return (None, None);
     };
     // HF returns the true length in `x-linked-size` and the LFS sha256 in

@@ -100,6 +100,11 @@ pub fn delete_local_model(app: AppHandle, id: String) -> Result<(), String> {
 ///
 /// `download_id` lets a caller pre-agree an id (the wizard and the pathway
 /// embedding model both do, so they can subscribe before starting).
+///
+/// `token` is an optional HuggingFace access token for a gated repo (the
+/// Gemma-licensed EmbeddingGemma). It is used only to authorize this download's
+/// HTTP requests and is never persisted, logged, or written to the `.meta`
+/// sidecar — see [`download::authorize`].
 #[tauri::command]
 pub fn download_model(
     app: AppHandle,
@@ -107,6 +112,7 @@ pub fn download_model(
     file: String,
     rev: Option<String>,
     download_id: Option<String>,
+    token: Option<String>,
 ) -> Result<String, String> {
     let id = download_id
         .unwrap_or_else(|| format!("dl_{}", chrono::Utc::now().timestamp_millis()));
@@ -119,7 +125,7 @@ pub fn download_model(
     };
     let id_for_task = id.clone();
     tauri::async_runtime::spawn(async move {
-        run_download(app, spec, id_for_task).await;
+        run_download(app, spec, id_for_task, token).await;
     });
     Ok(id)
 }
@@ -130,7 +136,8 @@ pub fn download_model(
 /// Returns nothing: a download is fire-and-forget from the caller's point of
 /// view, and every outcome — including every failure — is an event, so a UI
 /// that subscribed before starting can't miss one.
-async fn run_download(app: AppHandle, mut spec: DownloadSpec, id: String) {
+async fn run_download(app: AppHandle, mut spec: DownloadSpec, id: String, token: Option<String>) {
+    let token = token.as_deref();
     let id: Arc<str> = Arc::from(id.as_str());
     let model: Arc<str> = Arc::from(spec.file.as_str());
     let emit = |received: u64, total: Option<u64>, done: bool, error: Option<String>| {
@@ -169,7 +176,7 @@ async fn run_download(app: AppHandle, mut spec: DownloadSpec, id: String) {
     let _foreground = foreground::Session::start(&model);
 
     let client = crate::util::http_client();
-    let (size, sha) = download::head_metadata(&client, &spec).await;
+    let (size, sha) = download::head_metadata(&client, &spec, token).await;
     spec.expected_size = size;
     spec.sha256 = sha;
 
@@ -198,7 +205,7 @@ async fn run_download(app: AppHandle, mut spec: DownloadSpec, id: String) {
     let mut budget = download::RetryBudget::new(download::resume_offset(&dir, &spec.file, &spec));
 
     loop {
-        match attempt_download(&client, &dir, &spec, &emit).await {
+        match attempt_download(&client, &dir, &spec, token, &emit).await {
             Ok(path) => {
                 tracing::info!(path = %path.display(), "model downloaded");
                 emit(
@@ -339,13 +346,14 @@ async fn attempt_download(
     client: &reqwest::Client,
     dir: &std::path::Path,
     spec: &DownloadSpec,
+    token: Option<&str>,
     emit: &(impl Fn(u64, Option<u64>, bool, Option<String>) + Sync),
 ) -> Result<PathBuf, download::DownloadError> {
     let mut resume_from = download::resume_offset(dir, &spec.file, spec);
     download::write_meta(dir, &spec.file, spec)?;
 
     let url = spec.url();
-    let mut req = client.get(&url);
+    let mut req = download::authorize(client.get(&url), token);
     if resume_from > 0 {
         req = req.header("Range", format!("bytes={resume_from}-"));
     }

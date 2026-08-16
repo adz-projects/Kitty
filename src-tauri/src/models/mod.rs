@@ -41,10 +41,16 @@ pub fn installed_in(dir: &Path) -> Vec<InstalledModel> {
             if !path.is_file() {
                 return None;
             }
-            if !path
-                .extension()
-                .is_some_and(|x| x.eq_ignore_ascii_case("gguf"))
-            {
+            // Recognised local-model artifacts. `.gguf` is legacy (llama.cpp,
+            // being retired); `.tflite`/`.litertlm`/`.task` are the LiteRT
+            // engine's; `.json` covers the bundled Gemma `tokenizer.json` the
+            // embedder resolves by filename. `.part`/`.part.meta` fall through.
+            let ok = path.extension().is_some_and(|x| {
+                ["gguf", "tflite", "litertlm", "task", "json"]
+                    .iter()
+                    .any(|e| x.eq_ignore_ascii_case(e))
+            });
+            if !ok {
                 return None;
             }
             Some(InstalledModel {

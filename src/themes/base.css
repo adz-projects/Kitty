@@ -1789,6 +1789,29 @@ button.link {
 .model-name {
   font-weight: 600;
 }
+/* A curated model plus its (optional) gated-license token field, stacked. */
+.model-item {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+/* Transient HuggingFace-token entry for a Gemma-licensed model. Never
+   persisted — see the components that render it. */
+.gated-token {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+}
+.gated-token label {
+  font-size: var(--fs-xs);
+}
+.gated-token input {
+  width: 100%;
+}
 .pull-row {
   display: flex;
   flex-direction: column;

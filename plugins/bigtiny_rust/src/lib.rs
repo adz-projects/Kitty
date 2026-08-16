@@ -4,10 +4,8 @@ pub mod crypto;
 pub mod env_contract;
 pub mod error;
 pub mod hitl;
-/// In-process llama.cpp engine (docs/ANDROID.md §3). Feature-gated: see
-/// `Cargo.toml`'s `local-engine`.
-#[cfg(feature = "local-engine")]
-pub mod local;
+#[cfg(feature = "litert-embed")]
+pub mod litert;
 pub mod mcp;
 pub mod models;
 pub mod network;
@@ -19,15 +17,6 @@ pub mod server;
 pub mod storage;
 
 use std::sync::Arc;
-
-/// Provider id the in-process engine registers under.
-///
-/// Public because it's part of the wire contract, not an internal detail: a
-/// client pins a session to the local engine by sending this exact string as
-/// `provider` to `POST /api/chat/`. `tools/local_engine_lab.py` hard-codes the
-/// same value.
-#[cfg(feature = "local-engine")]
-pub const LOCAL_PROVIDER_ID: &str = "local";
 
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::cors::CorsLayer;
@@ -103,12 +92,6 @@ pub async fn run(config: BigTinyConfig, options: RunOptions) -> Result<(), Daemo
     let db = storage::Database::connect(&options.db_path).await?;
     let pool = db.pool().clone();
 
-    // Constructed before both the pathway engine and the router so all three
-    // share ONE set of resident models — otherwise chat, `/api/embeddings` and
-    // adaptive-pathway would each load their own copy of the same GGUF.
-    #[cfg(feature = "local-engine")]
-    let local_slots = local::SlotManager::new();
-
     // Behavioral-memory engine. `None` when disabled — the in-process
     // `"pathway"` MCP server is then simply not constructed (configured off,
     // not "race lost").
@@ -118,32 +101,33 @@ pub async fn run(config: BigTinyConfig, options: RunOptions) -> Result<(), Daemo
     {
         let db_path = std::path::Path::new(&options.data_dir).join(&config.pathway.db_name);
 
-        // Embeddings run in-process when the local engine can serve them —
-        // no HTTP hop to our own listener. `space_tag` must move in lockstep
-        // with the weights (see its doc comment): it is what tells
-        // `reembed_stale_beliefs` that beliefs embedded by a previous model
-        // need migrating.
-        #[cfg(feature = "local-engine")]
-        let (embedder, ap_config) = {
-            let mut ap_config = adaptive_pathway::config::Config::default();
-            let e = local::pathway_embed::embedder_for(&local_slots, &config.local);
-            if e.is_some() {
-                ap_config.embedding.ollama_model =
-                    local::LocalPathwayEmbedder::space_tag(&config.local.embed_model_path);
-                tracing::info!(
-                    space = %ap_config.embedding.ollama_model,
-                    "adaptive-pathway embeddings served in-process by the local engine"
-                );
-            }
-            (e, ap_config)
-        };
-        // Without the engine compiled in, AP keeps its own behaviour: HTTP to
-        // a configured Ollama, else lexical hashing.
-        #[cfg(not(feature = "local-engine"))]
-        let (embedder, ap_config): (
-            Option<Arc<dyn adaptive_pathway::embed::SemanticEmbedder>>,
-            _,
-        ) = (None, adaptive_pathway::config::Config::default());
+        // Embeddings run in-process (no HTTP hop to our own listener) via the
+        // LiteRT engine (EmbeddingGemma); when it isn't configured, AP keeps its
+        // own behaviour (HTTP Ollama / lexical hashing). The space tag
+        // (`ap_config.embedding.ollama_model`) must move in lockstep with the
+        // weights so `reembed_stale_beliefs` migrates beliefs on a model change.
+        #[allow(unused_mut)]
+        let mut ap_config = adaptive_pathway::config::Config::default();
+        #[allow(unused_mut)]
+        let mut embedder: Option<Arc<dyn adaptive_pathway::embed::SemanticEmbedder>> = None;
+
+        #[cfg(feature = "litert-embed")]
+        if config.litert.enabled && !config.litert.embed_model_path.trim().is_empty() {
+            let stem = std::path::Path::new(&config.litert.embed_model_path)
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "unknown".into());
+            ap_config.embedding.ollama_model = format!("litert:{stem}");
+            embedder = Some(Arc::new(litert::LiteRtEmbedder::spawn(
+                config.litert.lib_path.clone(),
+                config.litert.embed_model_path.clone(),
+                config.litert.tokenizer_path.clone(),
+            )));
+            tracing::info!(
+                space = %ap_config.embedding.ollama_model,
+                "adaptive-pathway embeddings served in-process by LiteRT"
+            );
+        }
 
         match adaptive_pathway::engine::PathwayEngine::open_with_embedder(
             &db_path.to_string_lossy(),
@@ -171,68 +155,38 @@ pub async fn run(config: BigTinyConfig, options: RunOptions) -> Result<(), Daemo
     let router = Arc::new(ProviderRouter::new(config.cache.clone()));
     router.load_providers(&pool).await?;
 
-    // In-process llama.cpp engine (docs/ANDROID.md §3, D1). Registered under
-    // the fixed id `"local"`, which a session pins at birth via
-    // `POST /api/chat/`'s `provider` field — no DB row is involved, which is
-    // just as well since `provider_type` is CHECK-constrained to
-    // `('openai_compat','anthropic')`.
-    #[cfg(feature = "local-engine")]
-    if config.local.enabled {
-        router.register_local(
-            LOCAL_PROVIDER_ID,
-            crate::config::ProviderConfig {
-                // Budget against the engine's context size, not the
-                // daemon-wide `token_management.max_context_tokens` (64k)
-                // that a `None` here falls back to — the engine's real
-                // context defaults to 4096, so compaction never fired before
-                // the context hard-failed. The resolved (fitted/estimated)
-                // value only exists once a model is resident; this is the
-                // static resolution the engine itself bottoms out at.
-                context_length: Some(
-                    local::engine::registration_n_ctx(&config.local) as i32,
-                ),
-                ..Default::default()
-            },
-            config.local.clone(),
-            local_slots.clone(),
-        );
-        tracing::info!(
-            provider_id = LOCAL_PROVIDER_ID,
-            model = %config.local.model_path,
-            embed_model = %config.local.embed_model_path,
-            "local engine registered"
-        );
-    } else {
-        // Say so explicitly. A silently-absent provider is indistinguishable
-        // from a broken one at the point the request fails.
-        tracing::info!("local engine not registered ([local].enabled = false)");
-    }
+    // No in-process *chat* engine: local chat is not a product use case (the
+    // retired llama.cpp `local` provider is gone). Chat always routes to a
+    // configured remote provider; the only local roles are LiteRT embeddings
+    // (above) and, on Windows, LiteRT-LM compaction summarization (below).
 
     let hitl = Arc::new(tokio::sync::Mutex::new(HITLManager::new(
         pool.clone(),
         config.hitl.clone(),
     )));
 
-    // §4.3's chain, first leg: the in-process engine, when one is configured.
-    // Shares `local_slots` with chat and `/api/embeddings` — a summarization
-    // pass reuses the already-resident chat model rather than loading a
-    // second copy, when the two happen to be the same GGUF (§4.1).
-    #[cfg(feature = "local-engine")]
-    let local_summarizer = config.local.enabled.then(|| {
-        Arc::new(local::LocalSummarizer::new(
-            config.local.clone(),
-            config.summarizer.clone(),
-            local_slots.clone(),
-        ))
-    });
-    #[cfg(feature = "local-engine")]
+    // §4.3's chain, first leg: the in-process summarizer, when one is
+    // configured. LiteRT-LM (Windows-only generative) is the only local leg;
+    // `None` = the chain goes straight to the session/router model (Android's
+    // path — no generative model on the phone).
+    #[allow(unused_mut)]
+    let mut local_summarizer: Option<
+        Arc<dyn adaptive_pathway::traits::StructuredChat + Send + Sync>,
+    > = None;
+
+    #[cfg(all(windows, feature = "litert-engine"))]
+    if config.litert.enabled && !config.litert.summarizer_model_path.trim().is_empty() {
+        let s = litert::LiteRtSummarizer::spawn(config.litert.summarizer_model_path.clone());
+        if s.is_available() {
+            local_summarizer = Some(Arc::new(s));
+        }
+    }
+
     let summarizer = Arc::new(SummarizerChain::new(
         local_summarizer,
         router.clone(),
         config.summarizer.clone(),
     ));
-    #[cfg(not(feature = "local-engine"))]
-    let summarizer = Arc::new(SummarizerChain::new(router.clone(), config.summarizer.clone()));
 
     // Pathway background learning loop: idle sweep + maintenance, aborted
     // before agent shutdown. Only spawned when the engine is available.
@@ -283,12 +237,6 @@ pub async fn run(config: BigTinyConfig, options: RunOptions) -> Result<(), Daemo
         scheduler: scheduler.clone(),
         config: config.clone(),
         pathway: pathway_engine.clone(),
-        // Shared with the registered `LocalProvider` above (not a fresh one),
-        // so a model loaded for chat is reused for embeddings and vice versa.
-        // Starts empty; models load lazily on first use so daemon startup
-        // never blocks on a multi-hundred-MB read.
-        #[cfg(feature = "local-engine")]
-        local_slots,
     });
 
     let auth = Arc::new(server::middleware::AuthConfig {

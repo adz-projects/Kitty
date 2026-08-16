@@ -108,8 +108,18 @@ export const ipc = {
       Called once, before the first outgoing message of a new session. */
   setSessionPersonaOverride: (sessionId: string, persona: string) =>
     invoke<void>('set_session_persona_override', { sessionId, persona }),
-  sendPrompt: (sessionId: string, text: string, images?: { mime: string; data_url: string }[]) =>
-    invoke<void>('send_prompt', { sessionId, text, images: images ?? null }),
+  sendPrompt: (
+    sessionId: string,
+    text: string,
+    images?: { mime: string; data_url: string }[],
+    attachedPaths?: string[],
+  ) =>
+    invoke<void>('send_prompt', {
+      sessionId,
+      text,
+      images: images ?? null,
+      attachedPaths: attachedPaths ?? null,
+    }),
   cancelPrompt: (sessionId: string) => invoke<void>('cancel_prompt', { sessionId }),
   /** Fresh (not client-cached) check of whether `session/prompt` is currently
       in flight for this session — used when adopting a session (Expand
@@ -271,12 +281,16 @@ export const ipc = {
   getModelsDiskFree: () => invoke<number | null>('get_models_disk_free'),
   getEngineRestartState: () => invoke<EngineRestartState>('get_engine_restart_state'),
   deleteLocalModel: (id: string) => invoke<void>('delete_local_model', { id }),
-  downloadModel: (repo: string, file: string, rev?: string, downloadId?: string) =>
+  /** `token` is an optional HuggingFace access token for a gated repo (the
+      Gemma-licensed EmbeddingGemma). It is forwarded for this one download and
+      never stored — the Rust side keeps it out of logs and the resume sidecar. */
+  downloadModel: (repo: string, file: string, rev?: string, downloadId?: string, token?: string) =>
     invoke<string>('download_model', {
       repo,
       file,
       rev: rev ?? null,
       downloadId: downloadId ?? null,
+      token: token ?? null,
     }),
   openrouterContextLength: (model: string) =>
     invoke<number | null>('openrouter_context_length', { model }),

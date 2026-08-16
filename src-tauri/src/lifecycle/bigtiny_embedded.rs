@@ -40,6 +40,7 @@ pub async fn start(
     local: &crate::config::LocalModelSettings,
     pathway_enabled: bool,
     pathway_embedding_model: &str,
+    tokenizer_path: &str,
 ) -> Result<DaemonHandle, String> {
     let secret = crate::lifecycle::bigtiny_proc::generate_secret();
     let encryption_key = tokio::task::spawn_blocking(
@@ -65,6 +66,7 @@ pub async fn start(
         local,
         pathway_enabled,
         pathway_embedding_model,
+        tokenizer_path,
     ) {
         std::env::set_var(key, value);
     }

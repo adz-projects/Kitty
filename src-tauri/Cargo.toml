@@ -1,6 +1,6 @@
 [package]
 name = "kitty"
-version = "0.6.0"
+version = "0.7.0"
 description = "Hotkey-summoned floating overlay chat client backed by BigTiny"
 authors = ["Adam Zolkover"]
 edition = "2021"
@@ -96,10 +96,13 @@ tauri-plugin-global-shortcut = "2"
 # (`lifecycle::bigtiny_proc` restarts it) instead of taking the UI down with
 # it. Linking it on both platforms would trade that away for nothing.
 #
-# `local-engine` is on: the summarizer and the embedder both run in-process on
-# Android (D4 revised, D18), so the engine has to come along.
+# `litert-embed` is on (replacing the old llama.cpp `local-engine`): embeddings
+# run in-process via LiteRT (EmbeddingGemma `.tflite` + the AAR `libLiteRt.so`);
+# compaction/summarization offloads to the remote chat model, so no generative
+# model — and no cmake/Vulkan/NDK native build — runs on the phone. `litert-embed`
+# is pure `libloading` + pure-Rust `tokenizers`, which cross-compiles clean.
 [target.'cfg(target_os = "android")'.dependencies]
-bigtiny_rust = { path = "../plugins/bigtiny_rust", features = ["local-engine"] }
+bigtiny_rust = { path = "../plugins/bigtiny_rust", features = ["litert-embed"] }
 # Resolves the `content://` URI the save dialog returns into a writable file
 # descriptor (`commands::download_file`). Rust-side only — see the plugin
 # registration in `lib.rs` for why the webview gains nothing from this.

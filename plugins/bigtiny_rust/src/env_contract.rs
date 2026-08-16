@@ -119,70 +119,29 @@ pub fn apply_env_overrides(config: &mut BigTinyConfig) {
     {
         config.pathway.learn_every_n = n;
     }
-    // The in-process llama.cpp engine (docs/ANDROID.md §3.2). Same reasoning
-    // as `BIGTINY_PATHWAY__ENABLED` above: no host passes `--config`, so
-    // without these the engine can only ever be off. Kitty's
-    // `lifecycle/bigtiny_proc.rs::spawn` is the other half of this contract
-    // and must stay in lockstep.
+    // The in-process **LiteRT** engine (docs plan "Replace llama.cpp with
+    // LiteRT"). Same reasoning as `BIGTINY_PATHWAY__ENABLED` above: no host
+    // passes `--config`, so without these the engine can only ever be off.
+    // Kitty's `lifecycle/bigtiny_env.rs` is the other half of this contract and
+    // must stay in lockstep.
     //
     // Paths, not model names: the daemon has no idea where a host keeps its
-    // models, and resolving on this side would duplicate that knowledge.
-    if let Ok(v) = std::env::var("BIGTINY_LOCAL__ENABLED") {
-        config.local.enabled = v.eq_ignore_ascii_case("true") || v == "1";
+    // models, and resolving on this side would duplicate that knowledge. (The
+    // retired llama.cpp engine's `BIGTINY_LOCAL__*` block lived here.)
+    if let Ok(v) = std::env::var("BIGTINY_LITERT__ENABLED") {
+        config.litert.enabled = v.eq_ignore_ascii_case("true") || v == "1";
     }
-    if let Ok(v) = std::env::var("BIGTINY_LOCAL__MODEL_PATH") {
-        config.local.model_path = v;
+    if let Ok(v) = std::env::var("BIGTINY_LITERT__LIB_PATH") {
+        config.litert.lib_path = v;
     }
-    if let Ok(v) = std::env::var("BIGTINY_LOCAL__EMBED_MODEL_PATH") {
-        config.local.embed_model_path = v;
+    if let Ok(v) = std::env::var("BIGTINY_LITERT__EMBED_MODEL_PATH") {
+        config.litert.embed_model_path = v;
     }
-    if let Ok(v) = std::env::var("BIGTINY_LOCAL__EMBED_POOLING") {
-        config.local.embed_pooling = v;
+    if let Ok(v) = std::env::var("BIGTINY_LITERT__TOKENIZER_PATH") {
+        config.litert.tokenizer_path = v;
     }
-    if let Some(n) = std::env::var("BIGTINY_LOCAL__N_CTX")
-        .ok()
-        .and_then(|v| v.parse().ok())
-    {
-        config.local.n_ctx = n;
-    }
-    if let Some(n) = std::env::var("BIGTINY_LOCAL__EMBED_N_CTX")
-        .ok()
-        .and_then(|v| v.parse().ok())
-    {
-        config.local.embed_n_ctx = n;
-    }
-    if let Some(n) = std::env::var("BIGTINY_LOCAL__N_BATCH")
-        .ok()
-        .and_then(|v| v.parse().ok())
-    {
-        config.local.n_batch = n;
-    }
-    if let Some(n) = std::env::var("BIGTINY_LOCAL__N_THREADS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-    {
-        config.local.n_threads = n;
-    }
-    if let Some(n) = std::env::var("BIGTINY_LOCAL__N_GPU_LAYERS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-    {
-        config.local.n_gpu_layers = n;
-    }
-    if let Ok(v) = std::env::var("BIGTINY_LOCAL__BACKEND") {
-        config.local.backend = v;
-    }
-    if let Ok(v) = std::env::var("BIGTINY_LOCAL__CACHE_TYPE_K") {
-        config.local.cache_type_k = v;
-    }
-    if let Ok(v) = std::env::var("BIGTINY_LOCAL__CACHE_TYPE_V") {
-        config.local.cache_type_v = v;
-    }
-    if let Ok(v) = std::env::var("BIGTINY_LOCAL__TOOL_CALLS") {
-        // Same lenient `true`/`1` (case-insensitive) parse as every other
-        // boolean in this contract — a strict `bool::from_str` here silently
-        // ignored `=1` and `=FALSE`, unlike its neighbors.
-        config.local.tool_calls = v.eq_ignore_ascii_case("true") || v == "1";
+    if let Ok(v) = std::env::var("BIGTINY_LITERT__SUMMARIZER_MODEL_PATH") {
+        config.litert.summarizer_model_path = v;
     }
 
     // Env overrides write the same fields `BigTinyConfig::load` sanitizes,
@@ -203,24 +162,25 @@ mod tests {
         // 815bugs #98: overrides bypassed `TokenManagementConfig::sanitize()`.
         std::env::set_var("BIGTINY_TOKEN_MANAGEMENT__MESSAGE_MASK_HEAD_LINES", "-5");
         std::env::set_var("BIGTINY_TOKEN_MANAGEMENT__MESSAGE_MASK_TAIL_LINES", "-3");
-        // 815bugs #99: `=1` (and `=FALSE`) were silently ignored by the
-        // strict bool parse every neighbor doesn't use.
-        std::env::set_var("BIGTINY_LOCAL__TOOL_CALLS", "1");
+        // 815bugs #99: `=1` (and `=FALSE`) were silently ignored by the strict
+        // bool parse every neighbor doesn't use. Exercised here on the LiteRT
+        // enable flag (the retired `BIGTINY_LOCAL__TOOL_CALLS` used to cover it).
+        std::env::set_var("BIGTINY_LITERT__ENABLED", "1");
 
         let mut config = BigTinyConfig::default();
         apply_env_overrides(&mut config);
 
         assert_eq!(config.token_management.message_mask_head_lines, 0);
         assert_eq!(config.token_management.message_mask_tail_lines, 0);
-        assert!(config.local.tool_calls);
+        assert!(config.litert.enabled);
 
-        std::env::set_var("BIGTINY_LOCAL__TOOL_CALLS", "FALSE");
+        std::env::set_var("BIGTINY_LITERT__ENABLED", "FALSE");
         let mut config = BigTinyConfig::default();
         apply_env_overrides(&mut config);
-        assert!(!config.local.tool_calls, "=FALSE must mean false, not be ignored");
+        assert!(!config.litert.enabled, "=FALSE must mean false, not be ignored");
 
         std::env::remove_var("BIGTINY_TOKEN_MANAGEMENT__MESSAGE_MASK_HEAD_LINES");
         std::env::remove_var("BIGTINY_TOKEN_MANAGEMENT__MESSAGE_MASK_TAIL_LINES");
-        std::env::remove_var("BIGTINY_LOCAL__TOOL_CALLS");
+        std::env::remove_var("BIGTINY_LITERT__ENABLED");
     }
 }

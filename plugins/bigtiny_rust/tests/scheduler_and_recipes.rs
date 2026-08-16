@@ -57,10 +57,7 @@ async fn build_engine_inner(pool: &SqlitePool, provider_base_url: Option<&str>) 
         pool.clone(),
         config.hitl.clone(),
     )));
-    #[cfg(feature = "local-engine")]
     let summarizer = Arc::new(SummarizerChain::new(None, router.clone(), config.summarizer.clone()));
-    #[cfg(not(feature = "local-engine"))]
-    let summarizer = Arc::new(SummarizerChain::new(router.clone(), config.summarizer.clone()));
     let agent = Arc::new(Agent::new(
         pool.clone(),
         router,

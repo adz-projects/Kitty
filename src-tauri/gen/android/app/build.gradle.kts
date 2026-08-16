@@ -28,6 +28,25 @@ val keystoreProperties = Properties().apply {
 }
 val hasReleaseKeystore = keystoreProperties.getProperty("storeFile") != null
 
+// A file-only configuration for the LiteRT AAR: resolved just so we can unzip
+// its native `libLiteRt.so` into `jniLibs`, never added to the compile
+// classpath (its Kotlin API metadata is too new for this project's compiler).
+// `isTransitive = false` keeps it to the single AAR file.
+val litertAar: Configuration by configurations.creating { isTransitive = false }
+
+// Unpack `jni/<abi>/libLiteRt*.so` from the AAR into a generated jniLibs dir
+// that the `main` source set includes (wired in `android { sourceSets }` below).
+// AGP then merges these into the APK exactly like our own `libkitty_lib.so`, and
+// the Rust side loads `libLiteRt.so` by name at runtime.
+val extractLiteRtJni by tasks.registering(Copy::class) {
+    from(zipTree(litertAar.singleFile)) {
+        include("jni/**/libLiteRt.so", "jni/**/libLiteRtClGlAccelerator.so")
+        eachFile { path = path.removePrefix("jni/") }
+        includeEmptyDirs = false
+    }
+    into(layout.buildDirectory.dir("litert-jni"))
+}
+
 android {
     compileSdk = 36
     namespace = "com.kitty.app"
@@ -84,13 +103,25 @@ android {
     buildFeatures {
         buildConfig = true
     }
+    // Pick up the LiteRT `.so` extracted from the AAR (see `extractLiteRtJni`).
+    sourceSets["main"].jniLibs.srcDir(layout.buildDirectory.dir("litert-jni"))
 }
+
+// The extraction must run before AGP merges jniLibs. `preBuild` is early enough
+// and variant-agnostic.
+tasks.named("preBuild") { dependsOn(extractLiteRtJni) }
 
 rust {
     rootDirRel = "../../../"
 }
 
 dependencies {
+    // LiteRT runtime, native `.so` ONLY — see the `litertAar` extraction below.
+    // We deliberately do NOT put the AAR on the compile classpath
+    // (`implementation`): its bundled Kotlin API is compiled with Kotlin
+    // metadata 2.3.0, incompatible with this project's 1.9, and breaks the
+    // Kotlin compile. The Rust embedder only needs `libLiteRt.so` at runtime.
+    add("litertAar", "com.google.ai.edge.litert:litert:2.1.4@aar")
     implementation("androidx.webkit:webkit:1.14.0")
     implementation("androidx.appcompat:appcompat:1.7.1")
     implementation("androidx.activity:activity-ktx:1.10.1")
