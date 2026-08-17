@@ -102,14 +102,14 @@ export function ChatView() {
             // No project folder chosen — the "thought partner" state. No folder
             // icon; clicking the pill opens the picker to attach a working dir.
             <button
-              className="pill"
+              className="pill pill-thought-partner"
               title="Thinking space — click to set a working directory"
               onClick={async () => {
                 const dir = await pickFolder();
                 if (dir) await setWorkingDir(dir);
               }}
             >
-              thought partner
+              Thought Partner
             </button>
           ) : (
             // A working folder is set: show it, plus an inline reset control
@@ -247,15 +247,13 @@ export function ChatView() {
         <ApprovalPrompt key={a.tool_call_id} request={a} onRespond={respondApproval} />
       ))}
       {error && (
-        <div className="chat-error">
-          <ErrorDetail
-            summary={humanizeChatError(error, errorType ?? undefined)}
-            raw={error}
-            errorType={errorType ?? undefined}
-            onNewSession={() => void newSession()}
-            onSwitchProvider={() => void ipc.openSettings('providers')}
-          />
-        </div>
+        <ErrorDetail
+          summary={humanizeChatError(error, errorType ?? undefined)}
+          raw={error}
+          errorType={errorType ?? undefined}
+          onNewSession={() => void newSession()}
+          onOpenProviderSettings={() => void ipc.openSettings('providers')}
+        />
       )}
       <AttachmentChips />
       <FileChips />
@@ -264,6 +262,21 @@ export function ChatView() {
       {starting && (
         <p className="muted startup-phase-banner">
           {startupPhase === 'warming_model' ? 'Warming model…' : 'Starting…'}
+        </p>
+      )}
+      {/* Distinct from the disabled composer's own "Chat concluded."
+          placeholder (release-fixes item 28) — that's easy to miss as a "why
+          can't I type" signal on its own, especially scrolled past a long
+          conversation. Shown regardless of whether an error card above also
+          explains *why* (e.g. context_exceeded) — this confirms the current
+          *state* right next to the input the user is looking at. */}
+      {sessionConcluded && (
+        <p className="chat-concluded-banner muted">
+          This chat has ended.{' '}
+          <button type="button" className="link" onClick={() => void newSession()}>
+            Start a new chat
+          </button>{' '}
+          to continue.
         </p>
       )}
       <Composer

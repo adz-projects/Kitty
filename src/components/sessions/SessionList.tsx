@@ -8,8 +8,19 @@ import {
 import { UNCATEGORIZED, useSessionStore, type SessionGroup } from '@/stores/sessionStore';
 import { useChatStore } from '@/stores/chatStore';
 import { useRouteStore } from '@/stores/routeStore';
-import { onSessionCreated, onSessionDeleted, onFoldersChanged, onSessionsCleared } from '@/lib/ipc';
+import {
+  ipc,
+  pickFolder,
+  onSessionCreated,
+  onSessionDeleted,
+  onFoldersChanged,
+  onSessionsCleared,
+  onSessionTitle,
+} from '@/lib/ipc';
+import { isAndroid } from '@/lib/platform';
+import { buildExport, sanitizeFilename } from '@/lib/chatml';
 import { SessionKebabMenu } from './SessionKebabMenu';
+import { SessionSelectionBar } from './SessionSelectionBar';
 import type { SessionSummary } from '@/lib/types';
 import { FolderIcon } from '@/components/icons/FolderIcon';
 import { RefreshIcon } from '@/components/icons/RefreshIcon';
@@ -18,6 +29,10 @@ import { TrashIcon } from '@/components/icons/TrashIcon';
 import { Modal } from '@/components/shared/Modal';
 
 const DRAG_THRESHOLD_PX = 6;
+// How long a touch must be held, without moving past DRAG_THRESHOLD_PX,
+// before it's treated as "enter bulk-select" rather than "start a drag" or
+// "just a tap" (Android only — see `startDrag`).
+const LONG_PRESS_MS = 500;
 
 /** Left sidebar in the full window: searchable history from goosed, organized
     into app-side folders (Round-2 item 15). Click a session to resume; use each
@@ -45,6 +60,7 @@ export function SessionList() {
   const createFolder = useSessionStore((s) => s.createFolder);
   const grouped = useSessionStore((s) => s.grouped);
   const assignFolder = useSessionStore((s) => s.assignFolder);
+  const applyTitle = useSessionStore((s) => s.applyTitle);
   // `grouped` is a stable function reference, so subscribing to it alone
   // never re-renders this list — `grouped()` *reads* `sessions`/`assignments`
   // out of the store, and these two subscriptions are what make a rename,
@@ -65,8 +81,119 @@ export function SessionList() {
     startX: number;
     startY: number;
     dragging: boolean;
+    // Android only: the long-press timer fired for this touch. Doesn't commit
+    // to anything by itself — see `onUp` — so a long-press-then-drag still
+    // reassigns the folder same as a plain drag would, instead of the long
+    // press always winning and blocking the drag from ever starting.
+    longPressFired: boolean;
   } | null>(null);
   const dragOverFolderRef = useRef<string | null>(null);
+
+  // Bulk selection (Android only — release-fixes items 8-10): long-press a
+  // row to enter, tap toggles while active. Lives here rather than per-row
+  // so the bottom action bar can see the whole set.
+  const [selectionMode, setSelectionMode] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [selectionBusy, setSelectionBusy] = useState(false);
+  const [selectionError, setSelectionError] = useState<string | null>(null);
+  const longPressTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const cancelLongPress = () => {
+    if (longPressTimer.current) {
+      clearTimeout(longPressTimer.current);
+      longPressTimer.current = null;
+    }
+  };
+
+  const toggleSelected = (sessionId: string) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(sessionId)) next.delete(sessionId);
+      else next.add(sessionId);
+      return next;
+    });
+  };
+
+  const exitSelectionMode = () => {
+    setSelectionMode(false);
+    setSelectedIds(new Set());
+    setSelectionError(null);
+  };
+
+  const deleteSelected = async () => {
+    setSelectionBusy(true);
+    setSelectionError(null);
+    try {
+      const remove = useSessionStore.getState().remove;
+      for (const id of selectedIds) await remove(id);
+      // `remove` surfaces its own failures via `loadError` on the store but
+      // doesn't throw — a partial failure still leaves this loop's remaining
+      // ids attempted, matching per-row delete's own best-effort shape.
+      exitSelectionMode();
+    } catch (e) {
+      setSelectionError(String(e));
+    } finally {
+      setSelectionBusy(false);
+    }
+  };
+
+  /** Bulk "Export from here"-equivalent for the sidebar: reuses
+      `chatStore.loadSession` (the same fetch a normal resume uses — there is
+      no lighter-weight "just give me the messages" endpoint, since BigTiny's
+      session load replays the whole conversation as a stream of Tauri
+      events, not a single return value) to pull each selected session's
+      messages one at a time, exports each through the same
+      `buildExport`/`sanitizeFilename` "Export from here" already uses
+      per-message, and writes one `.jsonl` per session into a single chosen
+      folder. Whatever session this window had open before the export
+      started is reloaded afterward so a bulk export from the Saved Chats
+      tab doesn't leave the Chat tab silently pointed at the last-exported
+      session instead of what the user actually had open. */
+  const exportSelected = async () => {
+    const dir = await pickFolder();
+    if (!dir) return;
+    setSelectionBusy(true);
+    setSelectionError(null);
+    const chat = useChatStore.getState();
+    const restore =
+      chat.sessionId != null
+        ? {
+            sessionId: chat.sessionId,
+            cwd: chat.cwd ?? '',
+            title: chat.title ?? undefined,
+            providerId: chat.sessionProviderId ?? undefined,
+            modelId: chat.sessionModelId ?? undefined,
+          }
+        : null;
+    const usedNames = new Set<string>();
+    try {
+      for (const id of selectedIds) {
+        const summary = sessions.find((s) => s.sessionId === id);
+        if (!summary) continue;
+        await useChatStore
+          .getState()
+          .loadSession(summary.sessionId, summary.cwd, summary.title, summary.providerId, summary.modelId);
+        const { messages, title } = useChatStore.getState();
+        const chatMessages = buildExport(messages);
+        let base = sanitizeFilename(title ?? summary.title);
+        if (usedNames.has(base)) base = `${base}-${id.slice(0, 8)}`;
+        usedNames.add(base);
+        await ipc.writeFile(`${dir}/${base}.jsonl`, JSON.stringify({ messages: chatMessages }) + '\n');
+      }
+      exitSelectionMode();
+    } catch (e) {
+      setSelectionError(String(e));
+    } finally {
+      if (restore) {
+        await useChatStore
+          .getState()
+          .loadSession(restore.sessionId, restore.cwd, restore.title, restore.providerId, restore.modelId);
+      }
+      setSelectionBusy(false);
+    }
+  };
+
+  useEffect(() => () => cancelLongPress(), []);
 
   useEffect(() => {
     void refresh();
@@ -111,6 +238,16 @@ export function SessionList() {
   }, [refresh]);
 
   useEffect(() => {
+    // release-fixes item 12: BigTiny auto-derives a title after the first
+    // full turn and emits chat://session-title, which chatStore already
+    // consumed for the active window's own header — this sidebar had no
+    // listener at all, so the row kept showing "New Chat" until something
+    // else (a manual reload) triggered a full refresh.
+    const un = onSessionTitle((e) => applyTitle(e.session_id, e.title));
+    return () => void un.then((fn) => fn());
+  }, [applyTitle]);
+
+  useEffect(() => {
     const setOverFolder = (v: string | null) => {
       dragOverFolderRef.current = v;
       setDragOverFolder(v);
@@ -134,6 +271,10 @@ export function SessionList() {
         const dx = pos.x - st.startX;
         const dy = pos.y - st.startY;
         if (Math.hypot(dx, dy) < DRAG_THRESHOLD_PX) return;
+        // Real movement — this is a drag, not a long-press. Whichever
+        // pending long-press timer was armed for this pointer-down no longer
+        // applies.
+        cancelLongPress();
         st.dragging = true;
         setDragId(st.sessionId);
       }
@@ -153,11 +294,23 @@ export function SessionList() {
         cancelAnimationFrame(raf);
         raf = null;
       }
+      // A release before the long-press timer fires is just a tap (or the
+      // start of a real drag, already cancelled above) — either way, the
+      // pending long-press callback must not fire late.
+      cancelLongPress();
       const st = dragState.current;
       dragState.current = null;
       if (st?.dragging && dragOverFolderRef.current != null) {
         const target = dragOverFolderRef.current;
         void assignFolder(st.sessionId, target === '' ? null : target);
+      } else if (st?.longPressFired && !st.dragging) {
+        // Long press fired and the finger lifted without ever moving past
+        // the drag threshold — that's bulk-select's entry gesture. If it
+        // HAD moved, the branch above already ran instead (see `startDrag`'s
+        // comment: the threshold check in `processMove` doesn't care why a
+        // long press did or didn't already fire).
+        setSelectionMode(true);
+        setSelectedIds(new Set([st.sessionId]));
       }
       setDragId(null);
       setOverFolder(null);
@@ -173,7 +326,35 @@ export function SessionList() {
   }, [assignFolder]);
 
   const startDrag = (sessionId: string, e: ReactPointerEvent) => {
-    dragState.current = { sessionId, startX: e.clientX, startY: e.clientY, dragging: false };
+    dragState.current = {
+      sessionId,
+      startX: e.clientX,
+      startY: e.clientY,
+      dragging: false,
+      longPressFired: false,
+    };
+    // Long-press-to-select (Android only): armed alongside the existing drag
+    // detection, not instead of it. Firing only *marks* the touch
+    // (`longPressFired`) rather than committing to selection mode outright —
+    // `processMove`'s threshold check (unchanged, still measured from the
+    // original touch-down point) keeps running underneath it, so a
+    // long-press-then-drag still starts a real drag exactly like an
+    // immediate one would; only a long-press followed by lifting the finger
+    // with no drag becomes "enter bulk-select" (decided in `onUp`). This is
+    // also just how touch dragging has to work in practice: holding still
+    // is what tells a touchscreen apart from a scroll gesture, so long-press
+    // is the natural "pick this row up" gesture, not a rival to dragging.
+    // Not armed while already in selection mode — every tap there should
+    // toggle immediately, not require another long-press.
+    if (isAndroid() && !selectionMode) {
+      cancelLongPress();
+      longPressTimer.current = setTimeout(() => {
+        longPressTimer.current = null;
+        if (dragState.current?.sessionId === sessionId && !dragState.current.dragging) {
+          dragState.current.longPressFired = true;
+        }
+      }, LONG_PRESS_MS);
+    }
   };
 
   const groups = useMemo(
@@ -228,7 +409,7 @@ export function SessionList() {
         </button>
       </div>
       <div className="session-toolbar">
-        <span className="muted" style={{ fontSize: 11 }}>
+        <span className="muted" style={{ fontSize: 13 }}>
           {total} session{total === 1 ? '' : 's'}
         </span>
         <button
@@ -269,11 +450,25 @@ export function SessionList() {
           dragOverFolder={dragOverFolder}
           dragId={dragId}
           onStartDrag={startDrag}
+          selectionMode={selectionMode}
+          selectedIds={selectedIds}
+          onToggleSelected={toggleSelected}
         />
       ))}
 
+      {selectionMode && (
+        <SessionSelectionBar
+          count={selectedIds.size}
+          busy={selectionBusy}
+          error={selectionError}
+          onDelete={() => void deleteSelected()}
+          onExport={() => void exportSelected()}
+          onCancel={exitSelectionMode}
+        />
+      )}
+
       {creatingFolder && (
-        <Modal title="New folder">
+        <Modal title="New folder" onClose={() => setCreatingFolder(false)}>
           <label className="field">
             <span>Folder name</span>
             <input
@@ -307,6 +502,9 @@ function FolderGroup({
   dragOverFolder,
   dragId,
   onStartDrag,
+  selectionMode,
+  selectedIds,
+  onToggleSelected,
 }: {
   group: SessionGroup;
   folders: string[];
@@ -314,6 +512,9 @@ function FolderGroup({
   dragOverFolder: string | null;
   dragId: string | null;
   onStartDrag: (sessionId: string, e: ReactPointerEvent) => void;
+  selectionMode: boolean;
+  selectedIds: Set<string>;
+  onToggleSelected: (sessionId: string) => void;
 }) {
   const renameFolder = useSessionStore((s) => s.renameFolder);
   const deleteFolder = useSessionStore((s) => s.deleteFolder);
@@ -395,13 +596,16 @@ function FolderGroup({
               active={s.sessionId === activeId}
               dragging={s.sessionId === dragId}
               onStartDrag={onStartDrag}
+              selectionMode={selectionMode}
+              selected={selectedIds.has(s.sessionId)}
+              onToggleSelected={onToggleSelected}
             />
           ))}
         </>
       )}
 
       {renaming && (
-        <Modal title="Rename folder">
+        <Modal title="Rename folder" onClose={() => setRenaming(false)}>
           <label className="field">
             <span>Folder name</span>
             <input
@@ -425,7 +629,7 @@ function FolderGroup({
         </Modal>
       )}
       {confirmingDelete && (
-        <Modal title="Delete this folder?">
+        <Modal title="Delete this folder?" onClose={() => setConfirmingDelete(false)}>
           <p>
             Delete folder &quot;{group.folder}&quot;? Its chats become {UNCATEGORIZED}.
           </p>
@@ -453,12 +657,18 @@ function SessionRow({
   active,
   dragging,
   onStartDrag,
+  selectionMode,
+  selected,
+  onToggleSelected,
 }: {
   session: SessionSummary;
   folders: string[];
   active: boolean;
   dragging: boolean;
   onStartDrag: (sessionId: string, e: ReactPointerEvent) => void;
+  selectionMode: boolean;
+  selected: boolean;
+  onToggleSelected: (sessionId: string) => void;
 }) {
   const remove = useSessionStore((s) => s.remove);
   const rename = useSessionStore((s) => s.rename);
@@ -495,9 +705,17 @@ function SessionRow({
 
   return (
     <div
-      className={`session-item${active ? ' active' : ''}${dragging ? ' dragging' : ''}${resuming ? ' resuming' : ''}`}
+      className={`session-item${active ? ' active' : ''}${dragging ? ' dragging' : ''}${resuming ? ' resuming' : ''}${selectionMode ? ' selectable' : ''}${selected ? ' selected' : ''}`}
       onClick={() => {
-        if (didDrag.current || resuming) return;
+        if (didDrag.current) return;
+        // In bulk-select mode every tap toggles rather than opening the chat
+        // — that's what the long-press that got here in the first place is
+        // for.
+        if (selectionMode) {
+          onToggleSelected(s.sessionId);
+          return;
+        }
+        if (resuming) return;
         setResuming(true);
         // Route to the chat view as well as loading it. On desktop this list
         // sits beside the conversation and the route is already 'chat', so
@@ -517,29 +735,47 @@ function SessionRow({
       role="button"
       tabIndex={0}
     >
+      {selectionMode && (
+        <input
+          type="checkbox"
+          className="session-select-check"
+          checked={selected}
+          readOnly
+          // The row's own onClick already toggles — this exists to show
+          // selection state visually, not as a second independent control
+          // (a direct click on it would otherwise double-toggle via bubbling).
+          onClick={(e) => e.stopPropagation()}
+        />
+      )}
       <div className="session-title">{s.title}</div>
       <div className="session-meta muted">
         {resuming ? 'Resuming…' : (s.cwd.split(/[\\/]/).filter(Boolean).pop() ?? s.cwd)}
         {!resuming && s.modelId ? ` · ${s.modelId}` : ''}
       </div>
-      <div className="session-row-actions">
-        <SessionKebabMenu
-          sessionId={s.sessionId}
-          folders={folders}
-          current={current}
-          onRename={() => {
-            setRenameValue(s.title);
-            setRenaming(true);
-          }}
-          onDelete={() => setConfirmingDelete(true)}
-        />
-      </div>
+      {/* Kebab menu (rename, move to folder) is desktop-only on Android
+          (release-fixes item 9) — long-press bulk-select + the bottom action
+          bar is the only way to delete a chat there now, and rename/move
+          were dropped rather than finding them a new home. */}
+      {!isAndroid() && (
+        <div className="session-row-actions">
+          <SessionKebabMenu
+            sessionId={s.sessionId}
+            folders={folders}
+            current={current}
+            onRename={() => {
+              setRenameValue(s.title);
+              setRenaming(true);
+            }}
+            onDelete={() => setConfirmingDelete(true)}
+          />
+        </div>
+      )}
       {renaming && (
         // Nested inside this row's own onClick (which resumes the session) —
         // without stopping propagation here, clicking anything in this modal
         // bubbles up and also fires that resume, racing with the rename.
         <div onClick={(e) => e.stopPropagation()}>
-          <Modal title="Rename chat">
+          <Modal title="Rename chat" onClose={() => setRenaming(false)}>
             <label className="field">
               <span>Chat name</span>
               <input
@@ -570,7 +806,7 @@ function SessionRow({
         // and landing on a blank/errored session instead of leaving whatever
         // session the user was actually viewing untouched.
         <div onClick={(e) => e.stopPropagation()}>
-          <Modal title="Delete this chat?">
+          <Modal title="Delete this chat?" onClose={() => setConfirmingDelete(false)}>
             <p>Delete &quot;{s.title}&quot;? This cannot be undone.</p>
             <div className="row">
               <button

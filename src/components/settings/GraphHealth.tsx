@@ -3,16 +3,27 @@ import { ipc } from '@/lib/ipc';
 import type { PathwayBelief, PathwayStats } from '@/lib/types';
 
 const SUPPORT_BUCKETS: [string, (n: number) => boolean][] = [
-  ['1 (single observation)', (n) => n === 1],
-  ['2–4', (n) => n >= 2 && n <= 4],
-  ['5+', (n) => n >= 5],
+  ['Mentioned once', (n) => n === 1],
+  ['Mentioned a few times (2–4)', (n) => n >= 2 && n <= 4],
+  ['Mentioned often (5+)', (n) => n >= 5],
 ];
 
-/** Belief-health view for the pathway (behavioral-memory) engine — replaces
-    the old ensemble/edge/schism-era Graph Health card, which had no
-    equivalent in the belief model. No live edit surface here (that's the
-    belief browser under Settings → Adaptive Pathway); this is a status
-    view sourced from `GET /api/pathway/stats` + `GET /api/pathway/beliefs`. */
+/** Friendly names for the belief layers in `stats.by_layer` — a plain
+    `Record<string, number>` on the wire, so this falls back to the raw key
+    for anything not in the known set rather than dropping it silently. */
+const LAYER_LABEL: Record<string, string> = {
+  identity: 'about you',
+  context: 'about your current situation',
+  conversation: 'from this conversation',
+};
+
+/** Belief-health view for the pathway (behavioral-memory) engine, rolled
+    into Adaptive Pathway as a section (release-fixes item 23) rather than
+    its own nav tab — a stats readout on its own didn't need a full page,
+    and its old copy ("by-layer breakdown", "contradicted count") assumed
+    more familiarity with the engine's internals than a settings page
+    should. Sourced from `GET /api/pathway/stats` + `GET /api/pathway/beliefs`;
+    no live edit surface here — that's the belief table above. */
 export function GraphHealth() {
   const [stats, setStats] = useState<PathwayStats | null>(null);
   const [beliefs, setBeliefs] = useState<PathwayBelief[]>([]);
@@ -43,11 +54,10 @@ export function GraphHealth() {
     : 0;
 
   return (
-    <section className="settings-section">
-      <h1>Graph Health</h1>
+    <>
+      <h2>Health</h2>
       <p className="muted">
-        Insights (advanced) into what the pathway engine has learned — nothing here needs action
-        unless the re-indexing count below stays nonzero for a while.
+        A quick look at what Kitty has learned. Nothing here needs your attention.
       </p>
       {loading && <p className="muted">Loading…</p>}
       {error && <div className="chat-error">{error}</div>}
@@ -55,23 +65,24 @@ export function GraphHealth() {
       {stats && (
         <div className="field">
           <div>
-            <span className="muted">Total beliefs:</span> {stats.total}
-          </div>
-          <div>
-            <span className="muted">By layer:</span>{' '}
-            {Object.entries(stats.by_layer)
-              .map(([layer, count]) => `${layer}: ${count}`)
-              .join(', ') || 'n/a'}
+            Kitty has learned <strong>{stats.total}</strong> thing{stats.total === 1 ? '' : 's'}{' '}
+            about you
+            {Object.keys(stats.by_layer).length > 0 && (
+              <>
+                {' '}
+                &mdash;{' '}
+                {Object.entries(stats.by_layer)
+                  .map(([layer, count]) => `${count} ${LAYER_LABEL[layer] ?? layer}`)
+                  .join(', ')}
+              </>
+            )}
+            .
           </div>
           {stats.embedding_migration.pending > 0 && (
-            <div>
-              <span className="muted">Re-indexing:</span> {stats.embedding_migration.pending} belief
-              {stats.embedding_migration.pending === 1 ? '' : 's'} still being re-embedded for{' '}
-              {stats.embedding_migration.current_model} after an embedding-model change.
-              <div className="muted" style={{ fontSize: 11 }}>
-                Happens automatically in the background — no action needed, this just tells you it's
-                in progress.
-              </div>
+            <div className="muted">
+              Double-checking {stats.embedding_migration.pending} belief
+              {stats.embedding_migration.pending === 1 ? '' : 's'} after an update — happens
+              automatically in the background, no action needed.
             </div>
           )}
         </div>
@@ -79,35 +90,36 @@ export function GraphHealth() {
 
       {beliefs.length > 0 && (
         <>
-          <h2>Confidence</h2>
+          <h3>How sure Kitty is</h3>
           <div className="field">
             <div>
-              <span className="muted">Tested vs. untested:</span> {tested} tested,{' '}
-              {beliefs.length - tested} untested
-              <div className="muted" style={{ fontSize: 11 }}>
-                Untested beliefs are discounted in recall until confirmed.
+              <strong>{tested}</strong> confirmed, <strong>{beliefs.length - tested}</strong> not
+              yet confirmed
+              <div className="muted">
+                Unconfirmed beliefs count less until you or the conversation confirms them.
               </div>
             </div>
             <div>
-              <span className="muted">Average confidence:</span> {(avgConfidence * 100).toFixed(0)}%
+              <strong>{(avgConfidence * 100).toFixed(0)}%</strong> average confidence
             </div>
             <div>
-              <span className="muted">Pinned:</span> {pinned}
+              <strong>{pinned}</strong> marked to always keep in mind
             </div>
-            <div>
-              <span className="muted">Contradicted:</span> {contradicted}
-              <div className="muted" style={{ fontSize: 11 }}>
-                Beliefs with at least one open contradiction — never silently resolved, just
-                down-weighted until you settle it.
+            {contradicted > 0 && (
+              <div>
+                <strong>{contradicted}</strong> conflict with something learned since
+                <div className="muted">
+                  Not resolved automatically — down-weighted until you settle it.
+                </div>
               </div>
-            </div>
+            )}
           </div>
 
-          <h2>Support</h2>
+          <h3>How often each was mentioned</h3>
           <div className="field">
             {SUPPORT_BUCKETS.map(([label, test]) => (
               <div key={label}>
-                <span className="muted">{label}:</span> {beliefs.filter((b) => test(b.support_count)).length}
+                <strong>{beliefs.filter((b) => test(b.support_count)).length}</strong> {label}
               </div>
             ))}
           </div>
@@ -115,6 +127,6 @@ export function GraphHealth() {
       )}
 
       <button onClick={() => void load()}>Refresh</button>
-    </section>
+    </>
   );
 }

@@ -1105,7 +1105,23 @@ export const useChatStore = create<ChatState>((set, get) => {
     refreshProvider: async (prefetched?: ProviderView[]) => {
       try {
         const providers = prefetched ?? (await ipc.listProviders());
-        const active = providers.find((p) => p.active);
+        // `provider://activated` is a broadcast (every open window's store
+        // calls this on any window's switch), and `p.active` is a single
+        // global flag — deriving "this window's provider" from it directly
+        // was the cross-window bleed bug (window A's badge/model flipped
+        // whenever window B switched providers). A window with a live
+        // session has its own per-session stamp (sessionProviderId, set by
+        // loadSession from the session's own metadata and kept current by
+        // activateProvider's session-scoped PATCH) — resolve against that
+        // first, falling back to the global flag only pre-session, which is
+        // exactly when the switcher is unlocked and this global default is
+        // what a brand-new session will actually start on.
+        const cur0 = get();
+        const active =
+          cur0.sessionId !== null && cur0.sessionProviderId
+            ? (providers.find((p) => p.id === cur0.sessionProviderId) ??
+              providers.find((p) => p.active))
+            : providers.find((p) => p.active);
         // Defensive parse: a provider with a blank/unparseable `base_url`
         // (the local provider ships `''`) made `new URL` throw here, dropping
         // the ENTIRE derivation into the failure shape below (model: null,
@@ -2464,6 +2480,14 @@ export const useChatStore = create<ChatState>((set, get) => {
           loopSuspected: false,
           activeRecipeTurn: null,
           pendingForcedAnswer: null,
+          // Only context_exceeded is unrecoverable *for this session* — the
+          // other classified types (insufficient_credits, auth_failed,
+          // network_unreachable) are all "fix something, then resend in the
+          // same session" situations, and an unclassified error might well
+          // be transient. Context genuinely won't fit regardless of what the
+          // user fixes, so that's the one case "start a new chat" is the
+          // actual next step rather than "try again" (release-fixes item 28).
+          sessionConcluded: s.sessionConcluded || e.error_type === 'context_exceeded',
         }));
         // Cancelling due to the reasoning cap can surface as an error rather
         // than a clean completion — still worth asking for an answer, since

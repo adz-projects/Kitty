@@ -71,7 +71,7 @@ export function ArtifactsPane({ onClose }: { onClose?: () => void } = {}) {
         )}
       </div>
       {artifacts.length === 0 ? (
-        <p className="muted" style={{ fontSize: 12, padding: '4px 8px' }}>
+        <p className="muted" style={{ fontSize: 14, padding: '4px 8px' }}>
           Files the agent creates or edits will appear here.
         </p>
       ) : (
@@ -132,7 +132,7 @@ function ArtifactCard({ artifact, android }: { artifact: Artifact; android: bool
         )}
       </div>
       {error && (
-        <p className="muted" style={{ fontSize: 12 }} role="alert">
+        <p className="muted" style={{ fontSize: 14 }} role="alert">
           {error}
         </p>
       )}

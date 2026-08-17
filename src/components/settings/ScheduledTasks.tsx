@@ -227,7 +227,7 @@ export function ScheduledTasks() {
             </label>
             <div style={{ flex: 1 }}>
               <div>{t.name}</div>
-              <div className="muted" style={{ fontSize: 11 }}>
+              <div className="muted" style={{ fontSize: 13 }}>
                 {scheduleSummary(t)}
               </div>
             </div>
@@ -241,7 +241,10 @@ export function ScheduledTasks() {
       </button>
 
       {editing && (
-        <Modal title={editing === 'new' ? 'New scheduled task' : `Edit: ${editing.name}`}>
+        <Modal
+          title={editing === 'new' ? 'New scheduled task' : `Edit: ${editing.name}`}
+          onClose={() => setEditing(null)}
+        >
           <div className="field">
             <span>Name</span>
             <input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} />

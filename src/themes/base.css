@@ -13,18 +13,21 @@
      would silently restyle the app. A rem sweep should change *what scales*,
      not what things look like — merging them is a design decision for its own
      commit. */
-  --fs-2xs: 0.625rem; /* 10px  */
-  --fs-xs: 0.6875rem; /* 11px  */
-  --fs-xs-plus: 0.71875rem; /* 11.5px */
-  --fs-sm: 0.75rem; /* 12px  */
-  --fs-sm-plus: 0.78125rem; /* 12.5px */
-  --fs-md: 0.8125rem; /* 13px  */
-  --fs-base: 0.875rem; /* 14px  */
-  --fs-lg: 0.9375rem; /* 15px  */
-  --fs-xl: 1rem; /* 16px  */
-  --fs-2xl: 1.125rem; /* 18px  */
-  --fs-3xl: 1.25rem; /* 20px  */
-  --fs-4xl: 1.375rem; /* 22px  */
+  /* release-fixes item 11: whole ramp shifted +2px (additive, not a scale —
+     preserves the existing proportions between steps instead of exaggerating
+     them). */
+  --fs-2xs: 0.75rem; /* 12px  */
+  --fs-xs: 0.8125rem; /* 13px  */
+  --fs-xs-plus: 0.84375rem; /* 13.5px */
+  --fs-sm: 0.875rem; /* 14px  */
+  --fs-sm-plus: 0.90625rem; /* 14.5px */
+  --fs-md: 0.9375rem; /* 15px  */
+  --fs-base: 1rem; /* 16px  */
+  --fs-lg: 1.0625rem; /* 17px  */
+  --fs-xl: 1.125rem; /* 18px  */
+  --fs-2xl: 1.25rem; /* 20px  */
+  --fs-3xl: 1.375rem; /* 22px  */
+  --fs-4xl: 1.5rem; /* 24px  */
 
   /* One knob both platforms write into: Android's system font-scale and the
      desktop zoom control (D17). Consumed by the `html` rule below, so it
@@ -93,30 +96,6 @@ body {
   font-size: var(--fs-base);
   line-height: 1.5;
   -webkit-font-smoothing: antialiased;
-}
-
-/* Background image (Phase 6): applied to the document root so it shows behind
-   the transparent overlay card and behind opaque window content. The overlay
-   stays transparent when no image is set. */
-html[data-bg-image] {
-  background-image:
-    linear-gradient(
-      rgba(0, 0, 0, var(--bg-image-dim, 0.3)),
-      rgba(0, 0, 0, var(--bg-image-dim, 0.3))
-    ),
-    var(--bg-image, none);
-  /* Round-4 item 2: user-configurable position/size (Settings → Appearance),
-     defaulting to the original cover/center. No repeat in any fit mode —
-     "Center" (background-size: auto) would otherwise tile. */
-  background-size: var(--bg-size, cover);
-  background-position: var(--bg-position, 50% 50%);
-  background-repeat: no-repeat;
-  background-attachment: fixed;
-}
-html[data-bg-image] .window-root,
-html[data-bg-image] .main-window,
-html[data-bg-image] .settings-window {
-  background: transparent;
 }
 
 button {
@@ -678,6 +657,59 @@ button.primary {
   padding: 4px 0;
 }
 
+/* Chat error card (release-fixes item 27) — a calm, bordered surface card
+   (icon + headline + body + action row) replacing raw --danger-colored text,
+   modeled on the "usage limit reached" style of card rather than an alarm
+   banner. Shared by the chat error banner and the wizard's API-key step. */
+.chat-error-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  margin: 8px 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-2);
+}
+.chat-error-card-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--warn);
+}
+.chat-error-card-title {
+  font-size: var(--fs-md);
+  font-weight: 600;
+  color: var(--text);
+}
+.chat-error-card-body {
+  margin: 0;
+  font-size: var(--fs-sm-plus);
+  color: var(--text-muted);
+}
+.chat-error-card-actions {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.chat-error-card pre {
+  margin: 0;
+  font-size: var(--fs-xs);
+  color: var(--text-muted);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 160px;
+  overflow-y: auto;
+}
+/* Session-ended banner (release-fixes item 28) — plain, not alarming (a
+   concluded chat isn't necessarily an error state), but still an explicit
+   line next to the composer rather than relying on its placeholder alone. */
+.chat-concluded-banner {
+  margin: 4px 0;
+  font-size: var(--fs-sm-plus);
+}
+
 /* Settings → Advanced error log. */
 .log-entries {
   display: flex;
@@ -769,6 +801,13 @@ button.primary {
 /* Working-folder pill with an inline "return to thought partner" reset (R6):
    a container that keeps the pill shell but lets its two child buttons carry
    the padding, so the folder name truncates and the × stays put beside it. */
+/* One character-width of extra breathing room before the label (release-fixes
+   item 25) — scoped to this pill only, not the base .pill rule, so the
+   folder pill next to it doesn't also shift. */
+.pill-thought-partner {
+  margin-left: 0.6em;
+}
+
 .pill-folder {
   padding: 0;
   gap: 0;
@@ -1415,6 +1454,42 @@ button.primary {
 .session-item.dragging {
   opacity: 0.5;
 }
+/* Bulk selection (Android, release-fixes items 8-10). */
+.session-item.selectable {
+  padding-left: 34px;
+}
+.session-item.selected {
+  background: var(--surface-2);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+.session-select-check {
+  position: absolute;
+  left: 10px;
+  top: 12px;
+  margin: 0;
+}
+/* Sticks to the bottom of .session-list's own scroll area (it's a flex
+   column child there, not a separate overlay) — sits above .mobile-tabs
+   since that's a sibling of .sessions-route, not nested inside this list. */
+.session-selection-bar {
+  position: sticky;
+  bottom: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 12px;
+  border-top: 1px solid var(--border);
+  background: var(--surface);
+}
+/* Close + count grouped on the left, Export/Delete grouped on the right —
+   the count text grows to absorb the gap instead of spreading all four
+   items evenly across the row. */
+.session-selection-bar > .row > .muted {
+  flex: 1;
+}
+.session-selection-bar .chat-error {
+  padding: 0;
+}
 .session-title {
   font-size: var(--fs-md);
   font-weight: 600;
@@ -1668,6 +1743,46 @@ button.primary {
   font-size: var(--fs-md);
   resize: vertical;
 }
+/* Settings → General hotkeys table (release-fixes item 2). */
+/* Generic settings-page table (release-fixes items 2/22) — shared by the
+   General → Hotkeys table and the Adaptive Pathway → belief browser table;
+   each adds its own modifier class for anything more specific. */
+.settings-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+.settings-table th,
+.settings-table td {
+  text-align: left;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+  font-size: var(--fs-md);
+  vertical-align: top;
+}
+.settings-table th {
+  color: var(--text-muted);
+  font-weight: 600;
+  font-size: var(--fs-sm);
+}
+.hotkey-table td:first-child {
+  white-space: nowrap;
+}
+.hotkey-table input {
+  padding: 7px 9px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface-2);
+  color: var(--text);
+  width: 100%;
+  min-width: 140px;
+}
+.belief-table td:first-child {
+  max-width: 360px;
+}
+.belief-table .belief-contradicted {
+  color: var(--danger);
+}
+
 /* Per-provider param sliders (Round-2 item 28): range fills the row, value badge
    stays inline; never wraps into the Save button. */
 .param-slider .row {
@@ -1754,6 +1869,13 @@ button.link {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 10px;
+}
+/* MCP Servers (release-fixes item 19): one column reads easier than two once
+   each card's description is a full sentence rather than a fragment — scoped
+   to a modifier rather than changing .ext-grid itself, which Recipes.tsx's
+   template picker still wants at two columns. */
+.ext-grid-1col {
+  grid-template-columns: 1fr;
 }
 .ext-card {
   display: flex;
@@ -2059,12 +2181,23 @@ button.link {
     min-width: 0;
   }
   .main-header .provider-badge {
+    /* Wider than the generic 700px-breakpoint cap (90px) — that one has to
+       leave room for the overlay's narrower widths too, but this row is
+       Android's whole header and can afford more before the model name
+       (e.g. "Deepseek V4 Pro") turns into an unreadable ellipsis. */
+    max-width: 150px;
     min-width: 0;
   }
   .main-header .provider-badge-label {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  /* Model/effort boxes were noticeably smaller than the neighboring "Show
+     artifacts"/"New chat" buttons (which inherit --fs-base) — match them. */
+  .main-header .provider-badge,
+  .main-header .effort-dropdown {
+    font-size: var(--fs-base);
   }
 
   /* Artifacts stay reachable on a phone — files the model wrote are the

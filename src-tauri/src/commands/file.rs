@@ -1,35 +1,10 @@
 //! File I/O and path-inspection commands: ChatML export writes, text/binary
-//! attachment reads, background-image reads, and dropped-path metadata.
+//! attachment reads, and dropped-path metadata.
 
 use std::path::PathBuf;
 
 use serde::Serialize;
 use tauri::AppHandle;
-
-/// Read an image file as a base64 data URL (for the background image, avoiding
-/// asset-protocol scope config).
-#[tauri::command]
-pub async fn read_image_data_url(path: String) -> Result<String, String> {
-    tokio::task::spawn_blocking(move || {
-        use base64::Engine;
-        let bytes = std::fs::read(&path).map_err(|e| format!("could not read image: {e}"))?;
-        let ext = std::path::Path::new(&path)
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("png")
-            .to_ascii_lowercase();
-        let mime = match ext.as_str() {
-            "jpg" | "jpeg" => "image/jpeg",
-            "gif" => "image/gif",
-            "webp" => "image/webp",
-            _ => "image/png",
-        };
-        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-        Ok(format!("data:{mime};base64,{b64}"))
-    })
-    .await
-    .map_err(|e| format!("image read task panicked: {e}"))?
-}
 
 /// Write a UTF-8 text file (Phase 11 ChatML export). The path comes from the
 /// user's native save dialog. Async + `spawn_blocking`: a sync command runs

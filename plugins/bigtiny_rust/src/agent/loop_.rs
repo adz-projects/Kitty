@@ -301,27 +301,276 @@ fn strip_prompt_wrappers(text: &str) -> String {
     re_system.replace(&text, "").to_string()
 }
 
+/// Strip leading `--- <label> ---\n<content>` attachment/paste blocks (see
+/// `chatStore.ts`'s inlined-attachment prompt building — a dropped file or a
+/// long paste becomes exactly this marker followed by its content, before
+/// whatever the user actually typed) from the front of a message before
+/// deriving a title from it. Without this, the *label* — a filename like
+/// `lec11-remediated.pdf`, or `Pasted text — 83 words` — became the title
+/// verbatim, dashes included: it describes how the content arrived, not
+/// what the message is about, so it's a bad title even stripped of the
+/// dashes; the fix is to skip past it and use whatever real text follows,
+/// not just deverticked-decorate it.
+///
+/// Blocks are `\n\n`-joined (matching `chatStore.ts`), so each leading block
+/// whose first line matches the marker pattern is skipped in turn, stopping
+/// at the first block that isn't one — i.e. the user's own typed text, if
+/// any. An attachment-only message (nothing typed) reduces to an empty
+/// string, same as any other message with nothing left to title from —
+/// `derive_title`'s existing empty check already leaves the session
+/// unnamed rather than write a blank/junk title.
+fn strip_leading_attachment_markers(text: &str) -> String {
+    let marker = regex::Regex::new(r"^--- .+ ---$").unwrap();
+    let mut rest = text;
+    loop {
+        let trimmed = rest.trim_start();
+        let first_line = trimmed.split('\n').next().unwrap_or("");
+        if !marker.is_match(first_line) {
+            return trimmed.to_string();
+        }
+        match trimmed.find("\n\n") {
+            Some(idx) => rest = &trimmed[idx + 2..],
+            None => return String::new(),
+        }
+    }
+}
+
 /// Derive a session title from the first user message.
 fn derive_title(text: &str) -> String {
     let text = strip_prompt_wrappers(text);
+    let text = strip_leading_attachment_markers(&text);
     let stripped = text.trim();
     if stripped.is_empty() {
         return String::new();
     }
-    let first_line = stripped.lines().next().unwrap_or("").trim().to_string();
-    // Truncate by *char* count, not byte length — `first_line[..60]` panics
-    // ("byte index is not a char boundary") whenever a multi-byte UTF-8
-    // character (CJK, emoji, etc.) straddles byte offset 60, which silently
-    // kills the whole spawned turn task the moment a session's first
-    // message is non-ASCII and long enough.
-    if first_line.chars().count() > 60 {
-        let truncated: String = first_line.chars().take(60).collect();
+    let first_line = stripped.lines().next().unwrap_or("").trim();
+    truncate_title(first_line)
+}
+
+/// Cap a title at 60 characters, breaking on a word boundary where possible.
+/// Shared by `derive_title` (the naive first-line fallback) and
+/// `sanitize_title` (the summarizer-derived title, release-fixes item 12) —
+/// both need the exact same limit and shouldn't drift apart.
+///
+/// Truncates by *char* count, not byte length — `s[..60]` panics ("byte
+/// index is not a char boundary") whenever a multi-byte UTF-8 character
+/// (CJK, emoji, etc.) straddles byte offset 60, which would otherwise
+/// silently kill the whole spawned turn/title task the moment a title is
+/// non-ASCII and long enough.
+fn truncate_title(s: &str) -> String {
+    if s.chars().count() > 60 {
+        let truncated: String = s.chars().take(60).collect();
         match truncated.rsplit_once(' ') {
             Some((before, _)) => format!("{}…", before),
             None => format!("{}…", truncated),
         }
     } else {
-        first_line
+        s.to_string()
+    }
+}
+
+/// Post-turn, summarizer-derived title (release-fixes item 12) — the
+/// primary path now; `derive_title` above is the last-resort fallback for
+/// when every summarizer leg fails or produces nothing usable. Runs
+/// detached in its own spawned task after the turn has already completed
+/// (see the call site in `run_tool_loop`), so it re-fetches the session's
+/// own persisted messages rather than reusing anything off the caller's
+/// stack.
+async fn derive_and_set_title(
+    pool: &SqlitePool,
+    session_id: &str,
+    summarizer: &SummarizerChain,
+    provider_id: Option<&str>,
+    model: Option<String>,
+    event_tx: &mpsc::UnboundedSender<SSEEvent>,
+) {
+    let Ok(Some(row)) = sessions::get_session(pool, session_id).await else {
+        return;
+    };
+    if row.name.as_deref().is_some_and(|n| !n.is_empty()) {
+        return; // named by something else (e.g. a rename) while this was queued
+    }
+
+    let title = match summarizer_title(pool, session_id, summarizer, provider_id, model).await {
+        Some(t) => t,
+        None => {
+            // Every summarizer leg failed — fall back to the same naive
+            // first-line derivation the send-time path used to do,
+            // sourced from the session's own persisted first message
+            // rather than a caller-supplied string (this runs detached,
+            // long after the original `user_message` argument existed).
+            match crate::storage::messages::get_first_user_message(pool, session_id).await {
+                Ok(Some(m)) => derive_title(&m.content.unwrap_or_default()),
+                _ => return,
+            }
+        }
+    };
+    if title.is_empty() {
+        return;
+    }
+    let _ = sessions::update_session_name(pool, session_id, &title).await;
+    let _ = event_tx.send(SSEEvent {
+        event_type: SSEEventType::SessionTitle,
+        content: Some(title.clone()),
+        session_id: Some(session_id.to_string()),
+        ..Default::default()
+    });
+}
+
+/// Ask the summarizer chain for a short (3-6 word) title from this
+/// session's recent messages. `None` on any failure — no messages yet,
+/// every summarizer leg erroring, or a response with no usable `title`
+/// field — so the caller falls back to the naive derivation instead of
+/// surfacing an error anywhere a user could see it.
+async fn summarizer_title(
+    pool: &SqlitePool,
+    session_id: &str,
+    summarizer: &SummarizerChain,
+    provider_id: Option<&str>,
+    model: Option<String>,
+) -> Option<String> {
+    let rows = crate::storage::messages::get_last_messages_by_session(pool, session_id, 8)
+        .await
+        .ok()?;
+    let mut convo: Vec<Value> = rows
+        .into_iter()
+        .filter(|m| matches!(m.role.as_str(), "user" | "assistant"))
+        .filter_map(|m| {
+            let content = m.content?;
+            if content.trim().is_empty() {
+                return None;
+            }
+            Some(json!({ "role": m.role, "content": content }))
+        })
+        .collect();
+    if convo.is_empty() {
+        return None;
+    }
+    let mut prompt = vec![json!({
+        "role": "user",
+        "content": "Read the conversation below and suggest a short, specific, descriptive \
+                     title for it — 3 to 6 words, no surrounding quotes, no trailing \
+                     punctuation. Describe what the conversation is actually about, not how \
+                     any file or pasted text arrived."
+    })];
+    prompt.append(&mut convo);
+
+    let schema = json!({
+        "type": "object",
+        "properties": { "title": { "type": "string" } },
+        "required": ["title"],
+    });
+
+    let result = summarizer
+        .structured_chat_for_session(provider_id, model, prompt, &schema)
+        .await
+        .ok()?;
+    let title = result.get("title")?.as_str()?.trim();
+    if title.is_empty() {
+        return None;
+    }
+    Some(sanitize_title(title))
+}
+
+/// Strip surrounding quotes a model sometimes wraps the title in despite the
+/// schema, collapse internal whitespace, and cap length the same way the
+/// naive fallback does.
+fn sanitize_title(raw: &str) -> String {
+    let trimmed = raw.trim().trim_matches(|c| c == '"' || c == '\'').trim();
+    let collapsed = trimmed.split_whitespace().collect::<Vec<_>>().join(" ");
+    truncate_title(&collapsed)
+}
+
+#[cfg(test)]
+mod derive_title_tests {
+    use super::{derive_title, sanitize_title, strip_leading_attachment_markers, truncate_title};
+
+    #[test]
+    fn sanitize_title_strips_surrounding_quotes() {
+        assert_eq!(
+            sanitize_title("\"Debugging a login redirect loop\""),
+            "Debugging a login redirect loop"
+        );
+        assert_eq!(
+            sanitize_title("'Planning a trip to Japan'"),
+            "Planning a trip to Japan"
+        );
+    }
+
+    #[test]
+    fn sanitize_title_collapses_internal_whitespace() {
+        assert_eq!(
+            sanitize_title("Fixing   a   flaky\ntest"),
+            "Fixing a flaky test"
+        );
+    }
+
+    #[test]
+    fn truncate_title_leaves_a_short_title_untouched() {
+        assert_eq!(truncate_title("Short title"), "Short title");
+    }
+
+    #[test]
+    fn truncate_title_breaks_on_a_word_boundary_past_60_chars() {
+        let long = "a".repeat(55) + " overflow-word-that-pushes-past-the-limit";
+        let out = truncate_title(&long);
+        assert!(out.ends_with('…'));
+        assert!(out.chars().count() <= 61); // 60 chars + the ellipsis
+        assert!(!out.contains("overflow-word"));
+    }
+
+    #[test]
+    fn truncate_title_is_char_safe_on_multi_byte_text() {
+        // A CJK-heavy title straddling the 60-char cut point must not panic
+        // ("byte index is not a char boundary" — the exact bug this
+        // char-count-based truncation avoids).
+        let long = "文".repeat(80);
+        let out = truncate_title(&long);
+        assert!(out.chars().count() <= 61);
+    }
+
+    #[test]
+    fn strips_a_single_dropped_file_marker_with_nothing_typed() {
+        let msg = "--- lec11-remediated.pdf ---\nfull file contents here";
+        assert_eq!(strip_leading_attachment_markers(msg), "");
+        // Nothing left to title from — derive_title must not surface the
+        // raw marker (the exact bug reported: a title of literally
+        // "--- lec11-remediated.pdf ---").
+        assert_eq!(derive_title(msg), "");
+    }
+
+    #[test]
+    fn strips_a_pasted_text_marker_with_nothing_typed() {
+        let msg = "--- Pasted text — 83 words ---\nsome pasted content";
+        assert_eq!(derive_title(msg), "");
+    }
+
+    #[test]
+    fn keeps_the_users_own_text_after_a_marker_block() {
+        let msg = "--- lec11-remediated.pdf ---\nfull file contents\n\nSummarize this for me";
+        assert_eq!(derive_title(msg), "Summarize this for me");
+    }
+
+    #[test]
+    fn skips_multiple_leading_marker_blocks() {
+        let msg =
+            "--- a.txt ---\ncontent a\n\n--- b.txt ---\ncontent b\n\nWhat do these have in common?";
+        assert_eq!(derive_title(msg), "What do these have in common?");
+    }
+
+    #[test]
+    fn a_message_with_no_markers_is_unaffected() {
+        let msg = "How do I center a div?";
+        assert_eq!(derive_title(msg), "How do I center a div?");
+    }
+
+    #[test]
+    fn a_line_that_merely_starts_with_dashes_is_not_treated_as_a_marker() {
+        // Only a *whole line* matching `--- ... ---` counts — a message that
+        // happens to start with "---" for some other reason (a markdown
+        // horizontal rule, a code fence) must not be swallowed.
+        let msg = "--- this is not a marker\nbecause it has no closing dashes";
+        assert_eq!(derive_title(msg), "--- this is not a marker");
     }
 }
 
@@ -570,27 +819,11 @@ impl AgentLoop {
         let thought_seed_msg =
             crate::agent::context::builder::strip_trailing_thought_seed(&mut messages);
 
-        // Derive and set session title — ONLY when the session isn't already
-        // named. A user-renamed chat (Rename in the sidebar) must survive
-        // later turns; blindly re-deriving + overwriting on every send
-        // clobbers that and re-emits a redundant SessionTitle event each turn.
-        // The rename path always stores the current name (never null), so
-        // this gate is "first-ever derivation" without extra state.
-        if let Ok(Some(row)) = sessions::get_session(&pool, session_id).await {
-            let already_named = row.name.as_deref().is_some_and(|n| !n.is_empty());
-            if !already_named {
-                let title = derive_title(user_message);
-                if !title.is_empty() {
-                    let _ = sessions::update_session_name(&pool, session_id, &title).await;
-                    let _ = event_tx.send(SSEEvent {
-                        event_type: SSEEventType::SessionTitle,
-                        content: Some(title.clone()),
-                        session_id: Some(session_id.to_string()),
-                        ..Default::default()
-                    });
-                }
-            }
-        }
+        // Session title derivation (release-fixes item 12) moved to
+        // `derive_and_set_title`, fired post-turn from `run_tool_loop` once
+        // there's an actual exchange for the summarizer to work from,
+        // instead of here at send time off just the raw first message. Same
+        // "only when not already named" gate, re-checked there.
 
         // Save initial user message
         if let Err(e) = self.context.save_messages(session_id, &mut messages).await {
@@ -883,9 +1116,23 @@ impl AgentLoop {
                     Ok(s) => break s,
                     Err(e) => {
                         if attempt >= max_attempts {
+                            // release-fixes item 27: `wire_type_tag` is `Some`
+                            // for the classified cases the frontend can give
+                            // real guidance on (context/credits/auth/network)
+                            // — those go out as the distinct `provider_error`
+                            // event so `error_type` actually reaches it,
+                            // instead of the generic untagged `error` every
+                            // chat_completion failure used to collapse into
+                            // regardless of what was actually wrong.
+                            let tag = e.wire_type_tag();
                             let _ = event_tx.send(SSEEvent {
-                                event_type: SSEEventType::Error,
+                                event_type: if tag.is_some() {
+                                    SSEEventType::ProviderError
+                                } else {
+                                    SSEEventType::Error
+                                },
                                 error_message: Some(format!("{}", e)),
+                                error_type: tag.map(String::from),
                                 session_id: Some(session_id.to_string()),
                                 is_last: true,
                                 ..Default::default()
@@ -1118,6 +1365,13 @@ impl AgentLoop {
             step += 1;
         }
 
+        // Cloned before the compaction block below moves `last_provider_id`/
+        // `last_provider_model` — the title-derivation pass further down
+        // needs its own copies of whichever provider/model actually handled
+        // this turn.
+        let title_provider_id = last_provider_id.clone();
+        let title_provider_model = last_provider_model.clone();
+
         // Post-turn compaction check — ONCE per turn, fire-and-forget. This
         // used to be awaited inline on EVERY tool-loop iteration: O(steps ×
         // history) DB reads plus a full summarizer stall between tool steps,
@@ -1150,6 +1404,32 @@ impl AgentLoop {
                     &memory_cfg,
                     context_length,
                     false,
+                )
+                .await;
+            });
+        }
+
+        // Post-turn title derivation (release-fixes item 12) — ONCE, only
+        // for a session that isn't already named (re-checked here, not just
+        // at send time: this deliberately fires after the turn completes,
+        // not when the user sends their first message, so the summarizer
+        // has an actual exchange to work from rather than just the raw
+        // first message). Fire-and-forget like the two passes above — a
+        // slow or failed title call must never hold up the turn's own
+        // completion event.
+        {
+            let pool = pool.clone();
+            let session_id = session_id.to_string();
+            let summarizer = self.summarizer.clone();
+            let event_tx = event_tx.clone();
+            tokio::spawn(async move {
+                derive_and_set_title(
+                    &pool,
+                    &session_id,
+                    &summarizer,
+                    title_provider_id.as_deref(),
+                    title_provider_model,
+                    &event_tx,
                 )
                 .await;
             });

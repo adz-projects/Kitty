@@ -108,7 +108,10 @@ describe('chatStore send in-flight guard', () => {
     await Promise.all([p1, p2]);
 
     expect(ipc.sendPrompt).toHaveBeenCalledTimes(1);
-    expect(ipc.sendPrompt).toHaveBeenCalledWith('s1', 'hello', undefined);
+    // ipc.sendPrompt(sessionId, text, images?, attachedPaths?) — both are
+    // undefined here since this test attaches neither images nor dropped
+    // files.
+    expect(ipc.sendPrompt).toHaveBeenCalledWith('s1', 'hello', undefined, undefined);
   });
 
   it('releases the guard so a subsequent turn can send after the first settles', async () => {

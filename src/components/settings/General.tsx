@@ -3,28 +3,25 @@ import { useConfigDraft } from './useConfigDraft';
 import { isAndroid } from '@/lib/platform';
 import { ipc, pickFolder } from '@/lib/ipc';
 import { accelerator } from '@/lib/accelerator';
-import { ClearChatHistory } from './ClearChatHistory';
 
 /** General settings backed by app config. Approval mode is per-session (see
     the chat mode badge) rather than living here. */
 export function General() {
   const { draft, update, save, saved, error } = useConfigDraft();
-  // Index of the hotkey row currently capturing a shortcut, or null.
-  const [recording, setRecording] = useState<number | null>(null);
+  const [recordingToggle, setRecordingToggle] = useState(false);
   const [recordingClipboard, setRecordingClipboard] = useState(false);
   const [recordingOpenWindow, setRecordingOpenWindow] = useState(false);
   const [autostart, setAutostart] = useState(false);
   const [autostartError, setAutostartError] = useState<string | null>(null);
-  // Per-row hotkey inputs + the two single-row ones, so entering record mode
-  // can focus the target input — otherwise the recorded keystrokes were
-  // swallowed (nothing was focused).
-  const hotkeyRefs = useRef<(HTMLInputElement | null)[]>([]);
+  // One ref per row, so entering record mode can focus the target input —
+  // otherwise the recorded keystrokes were swallowed (nothing was focused).
+  const toggleRef = useRef<HTMLInputElement>(null);
   const clipboardRef = useRef<HTMLInputElement>(null);
   const openWindowRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    if (recording != null) hotkeyRefs.current[recording]?.focus();
-  }, [recording]);
+    if (recordingToggle) toggleRef.current?.focus();
+  }, [recordingToggle]);
   useEffect(() => {
     if (recordingClipboard) clipboardRef.current?.focus();
   }, [recordingClipboard]);
@@ -78,131 +75,129 @@ export function General() {
       {!isAndroid() && (
         <>
           <div className="field">
-            <span>Toggle hotkeys</span>
-            {draft.hotkeys.map((hk, i) => (
-              <div className="row" key={i}>
-                <input
-                  ref={(el) => {
-                    hotkeyRefs.current[i] = el;
-                  }}
-                  value={recording === i ? 'Press a shortcut…' : hk}
-                  readOnly={recording === i}
-                  onChange={(e) =>
-                    update({ hotkeys: draft.hotkeys.map((h, j) => (j === i ? e.target.value : h)) })
-                  }
-                  onKeyDown={(e) => {
-                    if (recording !== i) return;
-                    e.preventDefault();
-                    const acc = accelerator(e);
-                    if (acc) {
-                      update({ hotkeys: draft.hotkeys.map((h, j) => (j === i ? acc : h)) });
-                      setRecording(null);
-                    }
-                  }}
-                />
-                <button onClick={() => setRecording((r) => (r === i ? null : i))}>
-                  {recording === i ? 'Cancel' : 'Record'}
-                </button>
-                <button
-                  onClick={() => {
-                    update({ hotkeys: draft.hotkeys.filter((_, j) => j !== i) });
-                    setRecording(null);
-                  }}
-                  disabled={draft.hotkeys.length <= 1}
-                  title={draft.hotkeys.length <= 1 ? 'Keep at least one hotkey' : 'Remove'}
-                >
-                  ✕
-                </button>
-              </div>
-            ))}
-            <button
-              className="link"
-              onClick={() => {
-                update({ hotkeys: [...draft.hotkeys, 'Alt+Space'] });
-                setRecording(draft.hotkeys.length);
-              }}
-            >
-              + Add another hotkey
-            </button>
-            <small className="muted">Save to apply. Any of them summons the overlay.</small>
-          </div>
-
-          <div className="field">
-            <span>Clipboard hotkey</span>
-            <div className="row">
-              <input
-                ref={clipboardRef}
-                value={recordingClipboard ? 'Press a shortcut…' : (draft.clipboard_hotkey ?? '')}
-                readOnly={recordingClipboard}
-                placeholder="Not set"
-                onChange={() => {}}
-                onKeyDown={(e) => {
-                  if (!recordingClipboard) return;
-                  e.preventDefault();
-                  const acc = accelerator(e);
-                  if (acc) {
-                    update({ clipboard_hotkey: acc });
-                    setRecordingClipboard(false);
-                  }
-                }}
-              />
-              <button onClick={() => setRecordingClipboard((r) => !r)}>
-                {recordingClipboard ? 'Cancel' : 'Record'}
-              </button>
-              <button
-                onClick={() => {
-                  update({ clipboard_hotkey: null });
-                  setRecordingClipboard(false);
-                }}
-                disabled={!draft.clipboard_hotkey}
-                title="Clear"
-              >
-                ✕
-              </button>
-            </div>
+            <span>Hotkeys</span>
             <small className="muted">
-              Save to apply. Summons the overlay with the current clipboard (text or image)
-              pre-attached.
+              Save to apply. The toggle hotkey summons the overlay; the others are optional.
             </small>
-          </div>
-
-          <div className="field">
-            <span>Open new chat window hotkey</span>
-            <div className="row">
-              <input
-                ref={openWindowRef}
-                value={recordingOpenWindow ? 'Press a shortcut…' : (draft.open_window_hotkey ?? '')}
-                readOnly={recordingOpenWindow}
-                placeholder="Not set"
-                onChange={() => {}}
-                onKeyDown={(e) => {
-                  if (!recordingOpenWindow) return;
-                  e.preventDefault();
-                  const acc = accelerator(e);
-                  if (acc) {
-                    update({ open_window_hotkey: acc });
-                    setRecordingOpenWindow(false);
-                  }
-                }}
-              />
-              <button onClick={() => setRecordingOpenWindow((r) => !r)}>
-                {recordingOpenWindow ? 'Cancel' : 'Record'}
-              </button>
-              <button
-                onClick={() => {
-                  update({ open_window_hotkey: null });
-                  setRecordingOpenWindow(false);
-                }}
-                disabled={!draft.open_window_hotkey}
-                title="Clear"
-              >
-                ✕
-              </button>
-            </div>
-            <small className="muted">
-              Save to apply. Always opens a brand-new chat window with a fresh session — never
-              reuses an existing one.
-            </small>
+            <table className="settings-table hotkey-table">
+              <thead>
+                <tr>
+                  <th>Action</th>
+                  <th>Hotkey</th>
+                  <th />
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>Toggle overlay</td>
+                  <td>
+                    <input
+                      ref={toggleRef}
+                      value={recordingToggle ? 'Press a shortcut…' : (draft.hotkeys[0] ?? '')}
+                      readOnly={recordingToggle}
+                      placeholder="Not set"
+                      onChange={() => {}}
+                      onKeyDown={(e) => {
+                        if (!recordingToggle) return;
+                        e.preventDefault();
+                        const acc = accelerator(e);
+                        if (acc) {
+                          update({ hotkeys: [acc] });
+                          setRecordingToggle(false);
+                        }
+                      }}
+                    />
+                  </td>
+                  <td>
+                    <div className="row">
+                      <button onClick={() => setRecordingToggle((r) => !r)}>
+                        {recordingToggle ? 'Cancel' : 'Record'}
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+                <tr>
+                  <td>Clipboard</td>
+                  <td>
+                    <input
+                      ref={clipboardRef}
+                      value={
+                        recordingClipboard ? 'Press a shortcut…' : (draft.clipboard_hotkey ?? '')
+                      }
+                      readOnly={recordingClipboard}
+                      placeholder="Not set"
+                      onChange={() => {}}
+                      onKeyDown={(e) => {
+                        if (!recordingClipboard) return;
+                        e.preventDefault();
+                        const acc = accelerator(e);
+                        if (acc) {
+                          update({ clipboard_hotkey: acc });
+                          setRecordingClipboard(false);
+                        }
+                      }}
+                    />
+                  </td>
+                  <td>
+                    <div className="row">
+                      <button onClick={() => setRecordingClipboard((r) => !r)}>
+                        {recordingClipboard ? 'Cancel' : 'Record'}
+                      </button>
+                      <button
+                        onClick={() => {
+                          update({ clipboard_hotkey: null });
+                          setRecordingClipboard(false);
+                        }}
+                        disabled={!draft.clipboard_hotkey}
+                        title="Clear"
+                      >
+                        ✕
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+                <tr>
+                  <td>Open new chat window</td>
+                  <td>
+                    <input
+                      ref={openWindowRef}
+                      value={
+                        recordingOpenWindow ? 'Press a shortcut…' : (draft.open_window_hotkey ?? '')
+                      }
+                      readOnly={recordingOpenWindow}
+                      placeholder="Not set"
+                      onChange={() => {}}
+                      onKeyDown={(e) => {
+                        if (!recordingOpenWindow) return;
+                        e.preventDefault();
+                        const acc = accelerator(e);
+                        if (acc) {
+                          update({ open_window_hotkey: acc });
+                          setRecordingOpenWindow(false);
+                        }
+                      }}
+                    />
+                  </td>
+                  <td>
+                    <div className="row">
+                      <button onClick={() => setRecordingOpenWindow((r) => !r)}>
+                        {recordingOpenWindow ? 'Cancel' : 'Record'}
+                      </button>
+                      <button
+                        onClick={() => {
+                          update({ open_window_hotkey: null });
+                          setRecordingOpenWindow(false);
+                        }}
+                        disabled={!draft.open_window_hotkey}
+                        title="Clear"
+                      >
+                        ✕
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
           </div>
 
           <label className="check">
@@ -238,8 +233,6 @@ export function General() {
       <p className="muted">
         Approval mode is per session — change it from the shield badge next to the composer.
       </p>
-
-      <ClearChatHistory />
 
       <div className="row">
         <button className="primary" onClick={() => void save()}>

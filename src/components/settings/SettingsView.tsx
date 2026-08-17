@@ -5,46 +5,38 @@ import { isAndroid } from '@/lib/platform';
 import { KittyIcon } from '@/components/icons/KittyIcon';
 import { General } from '@/components/settings/General';
 import { Providers } from '@/components/settings/Providers';
-import { LocalModels } from '@/components/settings/LocalModels';
+import { HelperModels } from '@/components/settings/HelperModels';
 import { McpServers } from '@/components/settings/McpServers';
 import { NotificationsSection } from '@/components/settings/NotificationsSection';
 import { Appearance } from '@/components/settings/Appearance';
 import { Advanced } from '@/components/settings/Advanced';
-import { SetupRepair } from '@/components/settings/SetupRepair';
 import { AdaptivePathway } from '@/components/settings/AdaptivePathway';
-import { GraphHealth } from '@/components/settings/GraphHealth';
-import { DomainProfiles } from '@/components/settings/DomainProfiles';
 import { ScheduledTasks } from '@/components/settings/ScheduledTasks';
 import { Recipes } from '@/components/settings/Recipes';
 
-/** Android calls it "Support Models" because that is all it can be there:
-    chat never runs locally (D18), so the only GGUFs on a phone are the
-    summarizer and the embedder. Desktop keeps "Local Models" — it *can* run
-    chat locally, and calling a chat model a support model would be wrong. */
 function sectionLabels(): Record<string, string> {
   return {
     general: 'General',
     providers: 'Providers',
-    local_models: isAndroid() ? 'Support Models' : 'Local Models',
+    local_models: 'Helper Models',
     mcp_servers: 'MCP Servers',
     scheduled_tasks: 'Scheduled Tasks',
     recipes: 'Recipes',
     adaptive_pathway: 'Adaptive Pathway',
-    ap_graph_health: 'Graph Health',
-    ap_domains: 'Domain Profiles',
     notifications: 'Notifications',
     appearance: 'Appearance',
     advanced: 'Advanced',
-    setup: 'Setup & Repair',
   };
 }
 
-/** Three groups, in nav order (settings IA overhaul). Graph Health / Domain
-    Profiles only appear once Adaptive Pathway is actually enabled — no point
-    showing tabs for a feature that's off. Local Models is always present:
-    even an API-key user needs an embedding model for the memory engine, and
-    it's where a "no model downloaded" status deep-links to. */
-function buildGroups(apEnabled: boolean): { label: string; sections: string[] }[] {
+/** Three groups, in nav order (settings IA overhaul). Graph Health and Domain
+    Profiles are no longer separate tabs (release-fixes items 23/24): Graph
+    Health rolled into Adaptive Pathway as a section, Domain Profiles is
+    hidden entirely (nothing to configure there — see DomainProfiles.tsx's
+    own doc comment). Local Models is always present: even an API-key user
+    needs an embedding model for the memory engine, and it's where a "no
+    model downloaded" status deep-links to. */
+function buildGroups(): { label: string; sections: string[] }[] {
   return [
     {
       label: 'Essentials',
@@ -64,15 +56,7 @@ function buildGroups(apEnabled: boolean): { label: string; sections: string[] }[
       ],
     },
     { label: 'Automation & extensions', sections: ['mcp_servers', 'scheduled_tasks', 'recipes'] },
-    {
-      label: 'Advanced',
-      sections: [
-        'advanced',
-        'setup',
-        'adaptive_pathway',
-        ...(apEnabled ? ['ap_graph_health', 'ap_domains'] : []),
-      ],
-    },
+    { label: 'Advanced', sections: ['advanced', 'adaptive_pathway'] },
   ];
 }
 
@@ -91,7 +75,6 @@ export function SettingsView() {
     routedSection ?? (isAndroid() ? 'providers' : 'general'),
   );
   const [highlight, setHighlight] = useState<string | null>(routedHighlight);
-  const [apEnabled, setApEnabled] = useState(false);
   const [recoveryNotice, setRecoveryNotice] = useState<string | null>(null);
 
   useEffect(() => {
@@ -108,13 +91,7 @@ export function SettingsView() {
     setHighlight(routedHighlight);
   }, [routedSection, routedHighlight]);
 
-  useEffect(() => {
-    void ipc.getConfig().then((c) => {
-      setApEnabled(c.adaptive_pathway_enabled);
-    });
-  }, [section]);
-
-  const groups = buildGroups(apEnabled);
+  const groups = buildGroups();
   const labels = sectionLabels();
 
   return (
@@ -170,17 +147,14 @@ export function SettingsView() {
       <main className="settings-main">
         {section === 'general' && <General />}
         {section === 'providers' && <Providers highlight={highlight} />}
-        {section === 'local_models' && <LocalModels />}
+        {section === 'local_models' && <HelperModels />}
         {section === 'mcp_servers' && <McpServers />}
         {section === 'scheduled_tasks' && <ScheduledTasks />}
         {section === 'recipes' && <Recipes />}
         {section === 'adaptive_pathway' && <AdaptivePathway />}
-        {section === 'ap_graph_health' && <GraphHealth />}
-        {section === 'ap_domains' && <DomainProfiles />}
         {section === 'notifications' && <NotificationsSection />}
         {section === 'appearance' && <Appearance />}
         {section === 'advanced' && <Advanced />}
-        {section === 'setup' && <SetupRepair />}
       </main>
     </div>
   );

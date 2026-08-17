@@ -166,6 +166,94 @@ fn context_length_from_show(json: &serde_json::Value) -> Option<u32> {
         .and_then(|n| u32::try_from(n).ok())
 }
 
+/// Best-effort context-length lookup for a `custom_openai` server (release-
+/// fixes item 15) — unlike Ollama there's no one API every such server
+/// implements, so this tries two shapes in order and returns `Ok(None)`
+/// (never `Err`) the moment neither one is recognized, keeping the field
+/// manually editable exactly like the Ollama/OpenRouter suggestions above:
+///
+/// 1. `GET /props` — llama.cpp server's own endpoint; several field names
+///    have been used across versions (`n_ctx`, `n_ctx_train`,
+///    `default_generation_settings.n_ctx`), so all three are tried.
+/// 2. `GET /v1/models` — the OpenAI-compatible listing. Real OpenAI carries
+///    no context-length field, but several self-hosted servers (LM Studio
+///    and others) add a non-standard `context_length` per entry in `data`.
+#[tauri::command]
+pub async fn custom_openai_context_length(
+    base_url: String,
+    model: String,
+) -> Result<Option<u32>, String> {
+    let base = base_url.trim_end_matches('/');
+    let client = crate::util::http_client();
+
+    if let Ok(resp) = client
+        .get(format!("{base}/props"))
+        .timeout(std::time::Duration::from_secs(8))
+        .send()
+        .await
+    {
+        if let Ok(json) = resp.json::<serde_json::Value>().await {
+            if let Some(n) = context_length_from_props(&json) {
+                return Ok(Some(n));
+            }
+        }
+    }
+
+    if let Ok(resp) = client
+        .get(format!("{base}/v1/models"))
+        .timeout(std::time::Duration::from_secs(8))
+        .send()
+        .await
+    {
+        if let Ok(json) = resp.json::<serde_json::Value>().await {
+            if let Some(n) = context_length_from_models_list(&json, &model) {
+                return Ok(Some(n));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+fn context_length_from_props(json: &serde_json::Value) -> Option<u32> {
+    for path in [
+        &["n_ctx"][..],
+        &["n_ctx_train"][..],
+        &["default_generation_settings", "n_ctx"][..],
+    ] {
+        let mut cur = json;
+        let mut ok = true;
+        for key in path {
+            match cur.get(key) {
+                Some(v) => cur = v,
+                None => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if ok {
+            if let Some(n) = cur.as_u64().and_then(|n| u32::try_from(n).ok()) {
+                return Some(n);
+            }
+        }
+    }
+    None
+}
+
+fn context_length_from_models_list(json: &serde_json::Value, model: &str) -> Option<u32> {
+    json.get("data")?.as_array()?.iter().find_map(|entry| {
+        let id = entry.get("id").and_then(|v| v.as_str())?;
+        if id != model {
+            return None;
+        }
+        entry
+            .get("context_length")
+            .and_then(|v| v.as_u64())
+            .and_then(|n| u32::try_from(n).ok())
+    })
+}
+
 /// Check an OpenRouter provider profile's current credit balance/usage.
 /// Reads the key from the keyring (never sent to/stored by Kitty otherwise)
 /// — errors if the profile has no stored secret or isn't an OpenRouter profile.

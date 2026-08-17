@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
 import { ipc } from '@/lib/ipc';
-import { isAndroid } from '@/lib/platform';
 import { useConfigDraft } from './useConfigDraft';
 import { ClearChatHistory } from './ClearChatHistory';
+import { useStackStore } from '@/stores/stackStore';
 import type { LogEntry, MemoryStats, ProviderView } from '@/lib/types';
 
 // How often to re-fetch the error log while its disclosure is open — there's
@@ -38,6 +38,22 @@ export function Advanced() {
   const [providers, setProviders] = useState<ProviderView[]>([]);
   const [memoryStats, setMemoryStats] = useState<MemoryStats | null>(null);
   const [memoryStatsError, setMemoryStatsError] = useState('');
+
+  // Setup & Repair (merged in — release-fixes item 21): no reason for a
+  // one-line stack status plus three buttons to be its own nav tab.
+  const stackStatus = useStackStore((s) => s.status);
+  const initStack = useStackStore((s) => s.init);
+  const [repairMsg, setRepairMsg] = useState('');
+  useEffect(() => void initStack(), [initStack]);
+  const runRepairAction = async (label: string, fn: () => Promise<void>) => {
+    setRepairMsg(`${label}…`);
+    try {
+      await fn();
+      setRepairMsg(`${label} — done.`);
+    } catch (e) {
+      setRepairMsg(String(e));
+    }
+  };
 
   const loadProviders = () =>
     void ipc
@@ -128,8 +144,7 @@ export function Advanced() {
             <span>Background context summarization</span>
             <p className="muted" style={{ margin: 0 }}>
               Folds older conversation history into a running summary so long agentic sessions
-              don&apos;t run out of context. Uses a small local model via Ollama; changes need a
-              backend restart to take effect.
+              don&apos;t run out of context. Uses a small local model.
             </p>
             <label className="check">
               <input
@@ -285,9 +300,6 @@ export function Advanced() {
                     masking.
                   </small>
                 </label>
-                <p className="muted" style={{ margin: 0 }}>
-                  Token management changes require a backend restart.
-                </p>
               </>
             )}
 
@@ -302,7 +314,7 @@ export function Advanced() {
               <>
                 <p className="muted" style={{ margin: 0 }}>
                   Semantic recall of older turns is injected into each prompt tail so long agentic
-                  sessions retain cross-turn context. Changes need a backend restart to take effect.
+                  sessions retain cross-turn context.
                 </p>
                 <label className="field">
                   <span>Minimum bm25 relevance score</span>
@@ -347,13 +359,41 @@ export function Advanced() {
             )}
           </div>
 
-          <div className="row">
-            <button onClick={() => void ipc.restartBackend()}>Restart backend now</button>
+          <div className="field">
+            <span>Setup &amp; Repair</span>
+            <p className="muted" style={{ margin: 0 }}>
+              Stack status: <strong>{stackStatus.replace(/_/g, ' ')}</strong>
+            </p>
+            <div className="row">
+              <button
+                onClick={() =>
+                  void runRepairAction('Restarting Kitty engine', () => ipc.restartBackend())
+                }
+              >
+                Restart backend now
+              </button>
+              <button onClick={() => void ipc.openWizard('setup')}>Run first-run wizard</button>
+              <button onClick={() => void ipc.openWizard('repair')}>Repair setup</button>
+            </div>
+            {repairMsg && <p className="muted">{repairMsg}</p>}
           </div>
 
           <div className="row">
-            <button className="primary" onClick={() => void save()}>
-              Save
+            <button
+              className="primary"
+              onClick={() => {
+                void (async () => {
+                  // Every setting on this page needs a backend restart to
+                  // take effect anyway (see the notes throughout) — folding
+                  // it into Save means there's one action to remember instead
+                  // of two, while "Restart backend now" above stays for a
+                  // restart-with-no-changes case.
+                  await save();
+                  await ipc.restartBackend();
+                })();
+              }}
+            >
+              Save &amp; restart
             </button>
             {saved && <span className="muted">Saved.</span>}
             {saveError && <span className="error">Couldn't save: {saveError}</span>}
@@ -409,9 +449,7 @@ export function Advanced() {
         </div>
       )}
 
-      {/* On Android there is no Settings → General, so the "Clear all chat
-          history" danger zone lives here instead. Desktop keeps it in General. */}
-      {isAndroid() && <ClearChatHistory />}
+      <ClearChatHistory />
     </section>
   );
 }

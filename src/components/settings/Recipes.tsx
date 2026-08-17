@@ -214,7 +214,7 @@ export function Recipes() {
 
       {builtinRecipes.length > 0 && (
         <>
-          <h2 style={{ fontSize: 13, marginTop: 12 }}>Built-in templates</h2>
+          <h2 style={{ fontSize: 15, marginTop: 12 }}>Built-in templates</h2>
           <div className="ext-list">
             {builtinRecipes.map((r) => (
               <div className="row" key={r.id} style={{ alignItems: 'center' }}>
@@ -222,11 +222,11 @@ export function Recipes() {
                   <div>
                     /{r.slug} — {r.title}
                   </div>
-                  <div className="muted" style={{ fontSize: 11 }}>
+                  <div className="muted" style={{ fontSize: 13 }}>
                     {r.description}
                   </div>
                 </div>
-                <span className="muted" style={{ fontSize: 11 }}>
+                <span className="muted" style={{ fontSize: 13 }}>
                   Built-in
                 </span>
                 <button onClick={() => void duplicate(r)}>Duplicate as new recipe</button>
@@ -236,7 +236,7 @@ export function Recipes() {
         </>
       )}
 
-      <h2 style={{ fontSize: 13, marginTop: 12 }}>Your recipes</h2>
+      <h2 style={{ fontSize: 15, marginTop: 12 }}>Your recipes</h2>
       {userRecipes.length === 0 && !error && <p className="muted">No custom recipes yet.</p>}
       <div className="ext-list">
         {userRecipes.map((r) => {
@@ -252,7 +252,7 @@ export function Recipes() {
                   )}
                   /{r.slug} — {r.title}
                 </div>
-                <div className="muted" style={{ fontSize: 11 }}>
+                <div className="muted" style={{ fontSize: 13 }}>
                   {r.description}
                 </div>
               </div>
@@ -272,7 +272,7 @@ export function Recipes() {
       </div>
 
       {choosingTemplate && (
-        <Modal title="New recipe">
+        <Modal title="New recipe" onClose={() => setChoosingTemplate(false)}>
           <p className="muted">Start from a template, or start blank.</p>
           <div className="ext-grid">
             {builtinRecipes.map((r) => (
@@ -313,6 +313,7 @@ export function Recipes() {
                 ? 'New recipe'
                 : `Edit: ${editing.title}`
           }
+          onClose={() => setEditing(null)}
         >
           {importWarnings.length > 0 && (
             <div className="chat-error" role="alert">

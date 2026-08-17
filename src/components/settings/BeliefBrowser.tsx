@@ -64,36 +64,48 @@ export function BeliefBrowser() {
         value={filter}
         onChange={(e) => setFilter(e.target.value)}
       />
-      <ul className="belief-list">
-        {visible.map((b) => (
-          <li key={b.id} className="belief-row">
-            <div className="belief-row-main">
-              <span className="belief-text">{b.text}</span>
-              <div className="belief-row-meta muted">
-                <span>{LAYER_LABEL[b.layer]}</span>
-                <span>{Math.round(b.confidence * 100)}% confidence</span>
-                <span>{b.tested ? 'tested' : 'untested'}</span>
-                {b.domain && <span>{b.domain}</span>}
-                {b.pinned && <span>pinned</span>}
+      <table className="settings-table belief-table">
+        <thead>
+          <tr>
+            <th>Belief</th>
+            <th>Layer</th>
+            <th>Confidence</th>
+            <th>Status</th>
+            <th>Support</th>
+            <th />
+          </tr>
+        </thead>
+        <tbody>
+          {visible.map((b) => (
+            <tr key={b.id}>
+              <td>{b.text}</td>
+              <td>{LAYER_LABEL[b.layer]}</td>
+              <td>{Math.round(b.confidence * 100)}%</td>
+              <td>
+                {b.tested ? 'Tested' : 'Untested'}
+                {b.domain && <div className="muted">{b.domain}</div>}
+                {b.pinned && <div className="muted">Pinned</div>}
                 {b.contradict_count > 0 && (
-                  <span className="belief-contradicted">contradicted ×{b.contradict_count}</span>
+                  <div className="belief-contradicted">Contradicted ×{b.contradict_count}</div>
                 )}
-                <span>
-                  seen {b.support_count}× across {b.distinct_sessions} session
-                  {b.distinct_sessions === 1 ? '' : 's'}
-                </span>
-              </div>
-            </div>
-            <button
-              disabled={deletingId === b.id}
-              onClick={() => void remove(b.id)}
-              title="This wasn't right — forget it"
-            >
-              {deletingId === b.id ? 'Removing…' : 'Forget'}
-            </button>
-          </li>
-        ))}
-      </ul>
+              </td>
+              <td>
+                Seen {b.support_count}× across {b.distinct_sessions} session
+                {b.distinct_sessions === 1 ? '' : 's'}
+              </td>
+              <td>
+                <button
+                  disabled={deletingId === b.id}
+                  onClick={() => void remove(b.id)}
+                  title="This wasn't right — forget it"
+                >
+                  {deletingId === b.id ? 'Removing…' : 'Forget'}
+                </button>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
     </div>
   );
 }

@@ -34,7 +34,7 @@ export function SessionKebabMenu({
       </button>
       {open && (
         <div ref={popoverRef} className="mode-popover" role="menu" style={style}>
-          <span className="muted" style={{ fontSize: 11, padding: '4px 8px' }}>
+          <span className="muted" style={{ fontSize: 13, padding: '4px 8px' }}>
             Move to folder
           </span>
           <button

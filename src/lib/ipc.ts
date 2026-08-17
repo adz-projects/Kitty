@@ -298,6 +298,11 @@ export const ipc = {
       server doesn't report it — the field stays manually editable. */
   ollamaContextLength: (baseUrl: string, model: string) =>
     invoke<number | null>('ollama_context_length', { baseUrl, model }),
+  /** Best-effort `/props` then `/v1/models` lookup against a custom_openai
+      server (release-fixes item 15). `null` when neither shape is
+      recognized — the field stays manually editable. */
+  customOpenaiContextLength: (baseUrl: string, model: string) =>
+    invoke<number | null>('custom_openai_context_length', { baseUrl, model }),
   openrouterCredits: (providerId: string) =>
     invoke<OpenRouterCredits>('openrouter_credits', { providerId }),
   // MCP servers — daemon-global, live over REST (BigTiny; no restart needed
@@ -355,7 +360,6 @@ export const ipc = {
   listThemes: () => invoke<{ builtins: string[]; user: string[] }>('list_themes'),
   readUserTheme: (name: string) => invoke<string>('read_user_theme', { name }),
   openThemesFolder: () => invoke<void>('open_themes_folder'),
-  readImageDataUrl: (path: string) => invoke<string>('read_image_data_url', { path }),
   // Wizard / setup
   validateSetup: () => invoke<SetupValidation>('validate_setup'),
   openWizard: (mode?: 'setup' | 'repair') => invoke<void>('open_wizard', { mode: mode ?? 'setup' }),
@@ -387,15 +391,6 @@ export const ipc = {
 /** Native folder picker (default context folder, etc.). Returns null if cancelled. */
 export async function pickFolder(): Promise<string | null> {
   const res = await openDialog({ directory: true, multiple: false });
-  return typeof res === 'string' ? res : null;
-}
-
-/** Native image-file picker (background image). Returns null if cancelled. */
-export async function pickImage(): Promise<string | null> {
-  const res = await openDialog({
-    multiple: false,
-    filters: [{ name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp'] }],
-  });
   return typeof res === 'string' ? res : null;
 }
 

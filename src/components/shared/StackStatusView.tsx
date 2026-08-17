@@ -42,13 +42,15 @@ export function StackStatusView({ status }: { status: StackStatus }) {
   const copy = COPY[status];
   if (!copy) return null;
 
-  // Deep-link "Fix this" to the most relevant settings section.
+  // Deep-link "Fix this" to the most relevant settings section. Setup &
+  // Repair merged into Advanced (release-fixes item 21) — it's no longer a
+  // separate tab to land on.
   const section =
     status === 'provider_unreachable'
       ? 'providers'
       : status === 'local_model_missing'
         ? 'local_models'
-        : 'setup';
+        : 'advanced';
 
   return (
     <div className="status-panel" role="alert">

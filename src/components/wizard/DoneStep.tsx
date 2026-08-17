@@ -85,7 +85,7 @@ export function DoneStep({ onBack }: { onBack: () => void }) {
           </>
         )}
         {validation && (
-          <p className="muted" style={{ margin: 0, fontSize: 12 }}>
+          <p className="muted" style={{ margin: 0, fontSize: 14 }}>
             Adaptive Pathway (learns your preferences over time):{' '}
             {validation.adaptive_pathway_ok ? 'ready' : 'not running yet — see Settings → Advanced'}
           </p>

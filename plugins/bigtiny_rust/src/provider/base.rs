@@ -221,6 +221,18 @@ fn sanitize_body_for_user(body: &str) -> String {
 pub fn classify_provider_error(status_code: u16, body: &str) -> ProviderError {
     let lower = body.to_lowercase();
 
+    // Checked by status code, not keyword-matched — 401/403 is unambiguous
+    // where it's available (release-fixes item 27; `status_code` is 0 for
+    // the handful of call sites with no real HTTP response to classify,
+    // e.g. `discover_models`, so this never misfires there).
+    if status_code == 401 || status_code == 403 {
+        return ProviderError::AuthFailed {
+            user_message: "Authentication failed. Check the API key for this provider.".into(),
+            raw_message: body.into(),
+            http_status: status_code as i32,
+        };
+    }
+
     if lower.contains("insufficient_quota")
         || lower.contains("billing")
         || lower.contains("quota")
@@ -281,6 +293,45 @@ mod tests {
             ProviderError::Other { .. } => {}
             other => panic!("Expected Other, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_classify_auth_failed_on_401_and_403() {
+        for status in [401u16, 403] {
+            let err = classify_provider_error(status, "unauthorized");
+            match err {
+                ProviderError::AuthFailed { http_status, .. } => {
+                    assert_eq!(http_status, status as i32)
+                }
+                other => panic!("Expected AuthFailed for {status}, got {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn wire_type_tag_covers_the_frontend_actionable_variants() {
+        assert_eq!(
+            classify_provider_error(402, "credit").wire_type_tag(),
+            Some("insufficient_credits")
+        );
+        assert_eq!(
+            classify_provider_error(400, "context_length_exceeded").wire_type_tag(),
+            Some("context_exceeded")
+        );
+        assert_eq!(
+            classify_provider_error(401, "unauthorized").wire_type_tag(),
+            Some("auth_failed")
+        );
+        assert_eq!(classify_provider_error(500, "boom").wire_type_tag(), None);
+        assert_eq!(
+            ProviderError::Request {
+                user_message: "x".into(),
+                raw_message: "x".into(),
+                http_status: 0,
+            }
+            .wire_type_tag(),
+            Some("network_unreachable")
+        );
     }
 
     /// A huge provider error body must not land verbatim in the user-facing

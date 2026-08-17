@@ -18,11 +18,6 @@ export interface Config {
   default_context_folder: string | null;
   setup_completed: boolean;
   theme: string;
-  background_image: string | null;
-  background_dim: number;
-  background_position_x: number;
-  background_position_y: number;
-  background_size: 'cover' | 'contain' | 'stretch' | 'center';
   notifications: NotificationPrefs;
   remember_overlay_position: boolean;
   providers: ProviderProfile[];

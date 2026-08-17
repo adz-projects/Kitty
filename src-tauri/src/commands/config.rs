@@ -131,7 +131,7 @@ pub fn list_themes() -> Result<ThemeList, String> {
     }
     user.sort();
     Ok(ThemeList {
-        builtins: vec!["default".into(), "dark".into()],
+        builtins: vec!["light".into(), "dark".into()],
         user,
     })
 }

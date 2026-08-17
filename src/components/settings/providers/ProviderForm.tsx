@@ -5,15 +5,7 @@ import { TrustBadge } from '@/lib/provider_trust';
 import { LockIcon } from '@/components/icons/LockIcon';
 import { GlobeIcon } from '@/components/icons/GlobeIcon';
 import { DEFAULT_URL } from '@/lib/provider_defaults';
-import {
-  ctxLabel,
-  detentsFor,
-  isLocal,
-  LOCAL_NPU_PRESETS,
-  nearestCtxIndex,
-  suggestContextLength,
-  tierOf,
-} from './providerUtils';
+import { ctxLabel, detentsFor, isLocal, nearestCtxIndex, suggestContextLength, tierOf } from './providerUtils';
 
 export function ProviderForm({
   profile,
@@ -61,7 +53,7 @@ export function ProviderForm({
   const [advancedOpen, setAdvancedOpen] = useState(false);
 
   return (
-    <Modal title={profile.id ? 'Edit provider' : 'Add provider'}>
+    <Modal title={profile.id ? 'Edit provider' : 'Add provider'} onClose={onCancel}>
       <label className="field">
         <span>Name</span>
         <input value={profile.name} onChange={(e) => set({ name: e.target.value })} />
@@ -76,53 +68,37 @@ export function ProviderForm({
           }}
         >
           <option value="local">On this device</option>
-          {/* Kitty no longer runs Ollama, but pointing at one you run
-              yourself is fully supported — the daemon keeps a dedicated
-              sampling profile and top_k/min_p wire support for it. */}
-          <option value="ollama">Ollama (self-hosted)</option>
           <option value="openrouter">OpenRouter</option>
           <option value="anthropic">Anthropic</option>
           <option value="openai">OpenAI</option>
           <option value="custom_openai">Custom (OpenAI-compatible)</option>
+          {/* Not offered for new providers — Kitty no longer runs Ollama
+              itself — but an existing ollama-type profile (pointing at a
+              server the user runs) stays fully editable, so its own type
+              must still appear as an option or the select would silently
+              show a different type as "selected" while saving. */}
+          {profile.provider_type === 'ollama' && (
+            <option value="ollama">Ollama (self-hosted)</option>
+          )}
         </select>
       </label>
-      <div className="field">
-        <span>Or quick-start a local NPU/hybrid-inference server</span>
-        <div className="row">
-          {LOCAL_NPU_PRESETS.map((preset) => (
-            <button
-              key={preset.label}
-              type="button"
-              title={preset.note}
-              onClick={() =>
-                set({ provider_type: 'custom_openai', base_url: preset.baseUrl, name: preset.name })
-              }
-            >
-              {preset.label}
-            </button>
-          ))}
-        </div>
-        <small className="muted">
-          Both fill in a `custom_openai` profile — no separate provider type needed. Ports vary by
-          installed version; hover a button for the exact caveat, and check the server's own
-          status/settings if the preset URL doesn't connect.
-        </small>
-      </div>
-      <label className="field">
-        <span>Base URL</span>
-        <input value={profile.base_url} onChange={(e) => set({ base_url: e.target.value })} />
-        <small className="muted trust-note">
-          <TrustBadge tier={tierOf(profile.base_url)} isTrusted={profile.is_trusted} />
-        </small>
-        {tierOf(profile.base_url) === 'personal' && (
-          <small className="muted">
-            This is a Tailscale address, so one URL works both at home and away: BigTiny
-            automatically tries a direct LAN connection first when you&rsquo;re on the same network
-            as the server, and falls back to routing over Tailscale otherwise — no need to switch
-            URLs manually.
+      {profile.provider_type !== 'anthropic' && profile.provider_type !== 'openai' && (
+        <label className="field">
+          <span>Base URL</span>
+          <input value={profile.base_url} onChange={(e) => set({ base_url: e.target.value })} />
+          <small className="muted trust-note">
+            <TrustBadge tier={tierOf(profile.base_url)} isTrusted={profile.is_trusted} />
           </small>
-        )}
-      </label>
+          {tierOf(profile.base_url) === 'personal' && (
+            <small className="muted">
+              This is a Tailscale address, so one URL works both at home and away: BigTiny
+              automatically tries a direct LAN connection first when you&rsquo;re on the same
+              network as the server, and falls back to routing over Tailscale otherwise — no need
+              to switch URLs manually.
+            </small>
+          )}
+        </label>
+      )}
 
       <label className="field">
         <span>Models (comma-separated)</span>
@@ -186,8 +162,8 @@ export function ProviderForm({
               onChange={(e) => set({ strip_reasoning: e.target.checked })}
             />
             <span>
-              Strip reasoning from context sent on later turns (recommended for Gemma4-style local
-              reasoning models; chat-only providers only)
+              Strip reasoning from context on later turns (recommended for Gemma-style local
+              reasoning models, chat-only providers only)
             </span>
           </label>
 
@@ -198,10 +174,8 @@ export function ProviderForm({
               onChange={(e) => set({ supports_vision: e.target.checked })}
             />
             <span>
-              This provider&apos;s models accept images — tick this if Kitty hides the screenshot
-              and image-attach buttons for a model that does support them. Kitty recognizes the
-              common vision models by name; this is the override for the ones it can&apos;t know
-              about, such as a self-hosted or renamed model.
+              This provider&apos;s models accept images — override for vision models Kitty
+              doesn&apos;t recognize by name (e.g. self-hosted or renamed).
             </span>
           </label>
 
@@ -236,10 +210,8 @@ export function ProviderForm({
               }
             />
             <small className="muted">
-              How long Kitty waits for this provider to respond (or keep streaming) before giving
-              up. Raise this for a model that legitimately has long gaps between updates (e.g. a
-              slow Tailscale-hosted host); lower it if a long silence there usually means it&rsquo;s
-              stuck.
+              How long Kitty waits before giving up on a reply. Raise it for slow or
+              Tailscale-hosted models; lower it if a stall usually means it&rsquo;s stuck.
             </small>
           </label>
 
@@ -258,11 +230,9 @@ export function ProviderForm({
               }
             />
             <small className="muted">
-              Must exactly match this server&rsquo;s own <code>--parallel</code>/<code>-np</code>{' '}
-              value. When set, each session is pinned to the same KV-cache slot on every turn (via{' '}
-              <code>id_slot</code>) so llama-server&rsquo;s prompt-prefix cache actually hits; a
-              mismatched number doesn&rsquo;t error, it silently thrashes the cache instead. Leave
-              unset for Ollama and anything else that doesn&rsquo;t run a multi-slot llama-server.
+              Must exactly match this llama-server&rsquo;s own <code>--parallel</code>/
+              <code>-np</code> value — pins each session to one KV-cache slot so the prompt cache
+              actually hits. Leave unset for Ollama or anything else.
             </small>
           </label>
 
@@ -338,11 +308,8 @@ export function ProviderForm({
               </div>
             )}
             <small className="muted">
-              Repetition control. Only applies to self-hosted (Ollama/custom) providers — leaving
-              this unset there doesn&rsquo;t mean &ldquo;off&rdquo;, it means Kitty sends a
-              repetition-safe default, since llama-server&rsquo;s own default disables repetition
-              control entirely and a quantized local model can otherwise loop the same text
-              indefinitely. Set this only to override that default. No effect on hosted providers.
+              Repetition control, self-hosted providers only. Unset still applies a safe default —
+              llama-server&rsquo;s own default allows endless loops — set this only to override it.
             </small>
           </div>
 
@@ -399,7 +366,7 @@ export function ProviderForm({
               <input
                 type="checkbox"
                 checked={profile.max_tokens != null}
-                onChange={(e) => set({ max_tokens: e.target.checked ? 4096 : null })}
+                onChange={(e) => set({ max_tokens: e.target.checked ? 8192 : null })}
               />
               <span>Override max reply length (tokens)</span>
             </label>
@@ -417,7 +384,7 @@ export function ProviderForm({
               </div>
             )}
             <small className="muted">
-              Hard cap on one reply. Self-hosted providers get a finite default (4096) even when
+              Hard cap on one reply. Self-hosted providers get a finite default (8192) even when
               this is unset, so no single reply can stream forever.
             </small>
           </div>

@@ -292,15 +292,15 @@ export function McpServers() {
         Tools available to the agent. Changes here take effect immediately â€” no restart needed.
       </p>
       {error && <div className="chat-error">{error}</div>}
-      <div className="ext-grid" style={{ marginBottom: 16 }}>
+      <div className="ext-grid ext-grid-1col" style={{ marginBottom: 16 }}>
         <KittyWasmCard health={healthOf('kitty-wasm')} onRetry={retry} />
-        <BraveMcpSearchCard />
-        <VisualizationsCard />
         <KittyToolsCard health={healthOf('kitty-tools')} onRetry={retry} />
+        <VisualizationsCard />
         <KittyWebCard health={healthOf('kitty-web')} onRetry={retry} />
+        <BraveMcpSearchCard />
       </div>
 
-      <div className="ext-grid">
+      <div className="ext-grid ext-grid-1col">
         {servers.map((s) => (
           <div className="ext-card" key={s.id}>
             <div className="ext-card-head">
@@ -439,7 +439,7 @@ function KittyWasmCard({
   return (
     <label className="ext-card">
       <div className="ext-card-head">
-        <span className="ext-card-name">Sandboxed compute (kitty-wasm)</span>
+        <span className="ext-card-name">Python Sandbox</span>
         <input
           type="checkbox"
           checked={enabled}
@@ -448,8 +448,7 @@ function KittyWasmCard({
         />
       </div>
       <span className="muted ext-card-desc">
-        Run Python (or any WASI module) in a sandboxed WebAssembly interpreter â€” no network, no
-        filesystem beyond an optional workspace.
+        Lets the agent run Python code in an isolated sandbox with no network access.
       </span>
       <BuiltinHealth health={health} onRetry={onRetry} />
       {error && <div className="chat-error">{error}</div>}
@@ -491,7 +490,7 @@ function VisualizationsCard() {
   return (
     <label className="ext-card">
       <div className="ext-card-head">
-        <span className="ext-card-name">Visuals (visualizations)</span>
+        <span className="ext-card-name">Create Visualizations</span>
         <input
           type="checkbox"
           checked={enabled}
@@ -500,7 +499,7 @@ function VisualizationsCard() {
         />
       </div>
       <span className="muted ext-card-desc">
-        Accessible HTML tables, SVG diagrams, and charts, rendered inline in chat.
+        Lets the agent draw tables, diagrams, and charts inline in the conversation.
       </span>
       {error && <div className="chat-error">{error}</div>}
     </label>
@@ -550,7 +549,7 @@ function KittyToolsCard({
   return (
     <label className="ext-card">
       <div className="ext-card-head">
-        <span className="ext-card-name">Lean tools (kitty-tools)</span>
+        <span className="ext-card-name">Read and Write Files</span>
         <input
           type="checkbox"
           checked={enabled}
@@ -559,7 +558,8 @@ function KittyToolsCard({
         />
       </div>
       <span className="muted ext-card-desc">
-        Context-optimized shell/file/Word tools for local, small models.
+        Lets the agent read, edit, and run things on your machine — files, shell commands, Word
+        docs.
       </span>
       <BuiltinHealth health={health} onRetry={onRetry} />
       {error && <div className="chat-error">{error}</div>}
@@ -608,7 +608,7 @@ function KittyWebCard({
   return (
     <label className="ext-card">
       <div className="ext-card-head">
-        <span className="ext-card-name">Web search/scrape (kitty-web)</span>
+        <span className="ext-card-name">Search the Web</span>
         <input
           type="checkbox"
           checked={enabled}
@@ -617,7 +617,7 @@ function KittyWebCard({
         />
       </div>
       <span className="muted ext-card-desc">
-        Search the web and scrape pages into clean text for the agent.
+        Lets the agent search the web and read pages, via DuckDuckGo (no key needed).
       </span>
       <BuiltinHealth health={health} onRetry={onRetry} />
       {error && <div className="chat-error">{error}</div>}
@@ -699,7 +699,7 @@ function BraveMcpSearchCard() {
   return (
     <div className="ext-card">
       <div className="ext-card-head">
-        <span className="ext-card-name">Web search: Brave (preferred engine)</span>
+        <span className="ext-card-name">Search with Brave</span>
         <input
           type="checkbox"
           checked={isOn}
@@ -712,9 +712,7 @@ function BraveMcpSearchCard() {
         />
       </div>
       <span className="muted ext-card-desc">
-        Brave Search LLM Context API. Requires an API key â€” turning this off always clears the
-        stored key, so turning it back on requires entering it again. DuckDuckGo is always available
-        as a fallback even without this.
+        Prefers Brave over DuckDuckGo for web search, using your own Brave Search API key.
       </span>
       {!isOn && configured && (
         <span className="muted ext-card-desc">

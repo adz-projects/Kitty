@@ -22,6 +22,7 @@ export function ProviderBadge() {
   const { triggerRef, popoverRef, style } = usePopoverPosition(open, () => setOpen(false));
   const locked = useChatStore((s) => s.messages.length > 0);
   const sessionId = useChatStore((s) => s.sessionId);
+  const sessionProviderId = useChatStore((s) => s.sessionProviderId);
 
   const load = () =>
     // Best-effort: a failure just leaves the switch-provider dropdown empty
@@ -36,7 +37,16 @@ export function ProviderBadge() {
     return () => void un.then((fn) => fn());
   }, []);
 
-  const active = providers.find((p) => p.active);
+  // Same resolution as chatStore.refreshProvider (release-fixes item 1): a
+  // window with a live session shows *that session's* stamped provider, not
+  // the global `p.active` flag other windows' switches also flip — otherwise
+  // switching providers in one window visibly bled into every other open
+  // window's badge.
+  const active =
+    sessionId !== null && sessionProviderId
+      ? (providers.find((p) => p.id === sessionProviderId) ?? providers.find((p) => p.active))
+      : providers.find((p) => p.active);
+  const activeId = active?.id;
   const label = active ? active.name || active.provider_type : 'No provider';
   const icon = active ? (
     <TrustIcon tier={active.network_tier} isTrusted={active.is_trusted} />
@@ -82,8 +92,8 @@ export function ProviderBadge() {
             <button
               key={p.id}
               role="menuitemradio"
-              aria-checked={p.active}
-              className={p.active ? 'active' : ''}
+              aria-checked={p.id === activeId}
+              className={p.id === activeId ? 'active' : ''}
               title={p.base_url}
               onClick={() => void switchTo(p.id)}
             >

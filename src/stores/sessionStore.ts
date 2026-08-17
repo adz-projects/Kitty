@@ -25,6 +25,11 @@ interface SessionState {
   refresh: () => Promise<void>;
   remove: (sessionId: string) => Promise<void>;
   rename: (sessionId: string, title: string) => Promise<void>;
+  /** Patches one session's title in local state only — for `chat://
+      session-title` (BigTiny's own auto-derived title, arriving after the
+      first turn), which has no IPC round-trip of its own to await; `rename`
+      is the user-initiated equivalent that does. */
+  applyTitle: (sessionId: string, title: string) => void;
   setQuery: (q: string) => void;
   filtered: () => SessionSummary[];
   // Folders
@@ -103,6 +108,12 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     }
     set((s) => ({
       sessions: s.sessions.map((x) => (x.sessionId === sessionId ? { ...x, title: trimmed } : x)),
+    }));
+  },
+
+  applyTitle: (sessionId: string, title: string) => {
+    set((s) => ({
+      sessions: s.sessions.map((x) => (x.sessionId === sessionId ? { ...x, title } : x)),
     }));
   },
 

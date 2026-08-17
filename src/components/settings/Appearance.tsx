@@ -1,15 +1,15 @@
 import { useEffect, useState } from 'react';
-import { ipc, pickImage } from '@/lib/ipc';
+import { ipc } from '@/lib/ipc';
 import { SYSTEM_THEME } from '@/lib/theme';
 import { useConfigDraft } from './useConfigDraft';
 import { isAndroid } from '@/lib/platform';
 
-/** Appearance: theme (built-in + user CSS), and — desktop only — background
-    image + dim and overlay prefs. */
+/** Appearance: theme (built-in + user CSS), and — desktop only — the
+    "remember overlay size & position" toggle. */
 export function Appearance() {
   const { draft, update, save, saved, error } = useConfigDraft();
   const [themes, setThemes] = useState<{ builtins: string[]; user: string[] }>({
-    builtins: ['default', 'dark'],
+    builtins: ['light', 'dark'],
     user: [],
   });
 
@@ -27,7 +27,7 @@ export function Appearance() {
         <div className="row">
           <select value={draft.theme} onChange={(e) => update({ theme: e.target.value })}>
             {/* Outside the built-in group because it isn't a stylesheet — it
-                resolves to `default` or `dark` from the OS preference (D16). */}
+                resolves to `light` or `dark` from the OS preference (D16). */}
             <option value={SYSTEM_THEME}>Match system</option>
             <optgroup label="Built-in">
               {themes.builtins.map((t) => (
@@ -55,99 +55,17 @@ export function Appearance() {
         </small>
       </label>
 
-      {/* Desktop-only. The wallpaper is picked from a filesystem path and
-          drawn behind a translucent overlay window; Android has neither an
-          arbitrary path to point at nor an overlay to see through. The
-          overlay size/position toggle goes with it for the same reason —
-          there is no overlay on Android to remember anything about. */}
+      {/* Desktop-only — there is no overlay window on Android to remember
+          anything about. */}
       {!isAndroid() && (
-        <>
-          <label className="field">
-            <span>Background image</span>
-            <div className="row">
-              <input
-                value={draft.background_image ?? ''}
-                placeholder="(none)"
-                onChange={(e) => update({ background_image: e.target.value || null })}
-              />
-              <button
-                onClick={async () => {
-                  const img = await pickImage();
-                  if (img) update({ background_image: img });
-                }}
-              >
-                Choose…
-              </button>
-              {draft.background_image && (
-                <button onClick={() => update({ background_image: null })}>Clear</button>
-              )}
-            </div>
-          </label>
-
-          <label className="field">
-            <span>Background dim ({Math.round((draft.background_dim ?? 0.3) * 100)}%)</span>
-            <input
-              type="range"
-              min={0}
-              max={1}
-              step={0.05}
-              value={draft.background_dim ?? 0.3}
-              onChange={(e) => update({ background_dim: Number(e.target.value) })}
-            />
-          </label>
-
-          <label className="field">
-            <span>Background fit</span>
-            <select
-              value={draft.background_size ?? 'cover'}
-              onChange={(e) =>
-                update({ background_size: e.target.value as typeof draft.background_size })
-              }
-            >
-              <option value="cover">Fill</option>
-              <option value="contain">Fit</option>
-              <option value="stretch">Stretch</option>
-              <option value="center">Center</option>
-            </select>
-          </label>
-
-          <label className="field">
-            <span>
-              Background position — horizontal ({Math.round(draft.background_position_x ?? 50)}%)
-            </span>
-            <input
-              type="range"
-              min={0}
-              max={100}
-              step={1}
-              value={draft.background_position_x ?? 50}
-              onChange={(e) => update({ background_position_x: Number(e.target.value) })}
-            />
-          </label>
-
-          <label className="field">
-            <span>
-              Background position — vertical ({Math.round(draft.background_position_y ?? 50)}%)
-            </span>
-            <input
-              type="range"
-              min={0}
-              max={100}
-              step={1}
-              value={draft.background_position_y ?? 50}
-              onChange={(e) => update({ background_position_y: Number(e.target.value) })}
-            />
-          </label>
-
-          <label className="check">
-            <input
-              type="checkbox"
-              checked={draft.remember_overlay_position}
-              onChange={(e) => update({ remember_overlay_position: e.target.checked })}
-            />
-            <span>Remember overlay size &amp; position</span>
-          </label>
-        </>
+        <label className="check">
+          <input
+            type="checkbox"
+            checked={draft.remember_overlay_position}
+            onChange={(e) => update({ remember_overlay_position: e.target.checked })}
+          />
+          <span>Remember overlay size &amp; position</span>
+        </label>
       )}
 
       <div className="row">

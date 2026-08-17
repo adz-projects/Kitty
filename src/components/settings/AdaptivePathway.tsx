@@ -7,6 +7,7 @@ import { defaultFor } from '@/lib/curated_models';
     download starts (unlike a user-initiated one, which gets a fresh id). */
 const EMBEDDING_DOWNLOAD_ID = 'adaptive-pathway-embedding-model';
 import { BeliefBrowser } from './BeliefBrowser';
+import { GraphHealth } from './GraphHealth';
 
 /** Separate from the enable checkbox: the pathway engine can be enabled and
     its MCP tools connected while this is `downloading`/`missing` — degrades
@@ -242,6 +243,7 @@ export function AdaptivePathway() {
         <>
           <h2>What it remembers</h2>
           <BeliefBrowser />
+          <GraphHealth />
         </>
       )}
     </section>

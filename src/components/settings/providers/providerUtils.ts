@@ -11,36 +11,16 @@ import {
 import { DEFAULT_URL } from '@/lib/provider_defaults';
 import type { NetworkTier, ProviderProfile } from '@/lib/types';
 
-/** One-click quick-start presets for NPU/hybrid-NPU+GPU local inference —
-    both are just `custom_openai` profiles pointed at a well-known local
-    server, since Kitty's `custom_openai` type already handles the whole
-    request/env/trust/network-tier path generically (no backend changes
-    needed). Ports are the best-documented current defaults, but both
-    projects have shipped different defaults across versions (Foundry
-    Local: 5272 vs an older 5273; Lemonade: 13305 vs an older 8000) — the
-    help text below says so rather than presenting false confidence. */
-export const LOCAL_NPU_PRESETS: { label: string; name: string; baseUrl: string; note: string }[] = [
-  {
-    label: 'Foundry Local',
-    name: 'Foundry Local',
-    baseUrl: 'http://localhost:5272/v1',
-    note: "Microsoft's vendor-neutral local server — auto-detects AMD/Intel/Qualcomm NPU, GPU, or CPU. Install: winget install Microsoft.FoundryLocal. If this port doesn't connect, run `foundry service status` to find the real one.",
-  },
-  {
-    label: 'Lemonade Server (AMD)',
-    name: 'Lemonade Server',
-    baseUrl: 'http://localhost:13305/api/v1',
-    note: "AMD's own local server — purpose-built NPU+GPU hybrid scheduling on Ryzen AI (XDNA), may outperform a generic execution-provider abstraction on that hardware specifically. If this port doesn't connect, check Lemonade's own settings for the port your installed version uses.",
-  },
-];
-
 // Context-length detents (item 28): not linearly spaced, so the slider indexes
 // into this array rather than mapping its position directly to a value. When
 // auto-detection (Round-6 Feature 1) finds a real number for the selected
 // model, it's spliced in as an extra detent (see `detentsFor` below) rather
 // than snapped to the nearest static stop, so the exact real max is always
 // reachable and reads correctly on the badge.
-export const CTX_DETENTS = [4096, 8192, 16384, 32768, 65536, 131072, 262144];
+export const CTX_DETENTS = [
+  4096, 8192, 12288, 16384, 24576, 32768, 49152, 65536, 98304, 131072, 196608, 262144, 393216,
+  524288, 786432, 1048576,
+];
 export const ctxLabel = (v: number) => (v % 1024 === 0 ? `${v / 1024}K` : String(v));
 export function nearestCtxIndex(detents: number[], v: number): number {
   let best = 0;
@@ -78,8 +58,14 @@ export async function suggestContextLength(profile: ProviderProfile): Promise<nu
       case 'anthropic':
         return lookupContextLength(ANTHROPIC_CONTEXT_TABLE, model);
       case 'openai':
-      case 'custom_openai':
         return lookupContextLength(CUSTOM_OPENAI_CONTEXT_TABLE, model);
+      case 'custom_openai': {
+        // Try a live lookup against the server itself first (many self-hosted
+        // OpenAI-compatible servers expose it via /props or /v1/models); fall
+        // back to the same hardcoded table OpenAI uses when that comes up empty.
+        const live = await ipc.customOpenaiContextLength(profile.base_url, model);
+        return live ?? lookupContextLength(CUSTOM_OPENAI_CONTEXT_TABLE, model);
+      }
       case 'local': {
         // The GGUF header already carries the trained context window, parsed at
         // download time — no probe, just find the installed model and read it.

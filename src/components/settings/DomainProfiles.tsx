@@ -35,7 +35,12 @@ function summarize(beliefs: PathwayBelief[]): DomainSummary[] {
     diffusion tuning are global engine config now, not tunable per domain.
     Domains themselves are inferred at recall time from whichever existing
     belief a query most resembles (`domains::infer_query_domain` in
-    `adaptive-pathway_rust`) — there's no separate domains table to edit. */
+    `adaptive-pathway_rust`) — there's no separate domains table to edit.
+
+    Hidden from the Settings nav (release-fixes item 24) since there was
+    genuinely nothing here to configure — "What it remembers" in Adaptive
+    Pathway covers the same beliefs more usefully. Left in place, just
+    unreferenced, rather than deleted. */
 export function DomainProfiles() {
   const [beliefs, setBeliefs] = useState<PathwayBelief[] | null>(null);
   const [error, setError] = useState('');
@@ -65,7 +70,7 @@ export function DomainProfiles() {
           <div className="row" key={d.domain} style={{ alignItems: 'center' }}>
             <div style={{ flex: 1 }}>
               <div>{d.domain}</div>
-              <div className="muted" style={{ fontSize: 11 }}>
+              <div className="muted" style={{ fontSize: 13 }}>
                 {d.count} belief{d.count === 1 ? '' : 's'} · {d.tested} tested · average confidence{' '}
                 {Math.round(d.avgConfidence * 100)}%
               </div>

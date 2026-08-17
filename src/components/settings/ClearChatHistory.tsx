@@ -33,7 +33,10 @@ export function ClearChatHistory() {
       </div>
 
       {confirmClear && (
-        <Modal title="Clear all chat history?">
+        <Modal
+          title="Clear all chat history?"
+          onClose={() => !clearing && setConfirmClear(false)}
+        >
           <p>
             This permanently deletes {sessionCount ?? 'all'} conversation(s) and their
             working-directory files. This cannot be undone.

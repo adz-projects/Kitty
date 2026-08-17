@@ -2,7 +2,7 @@
 
 A theme is **one CSS file** that sets custom properties on `:root`. `base.css`
 (structural, color-free) consumes them. Built-in themes live here
-(`default.css`, `dark.css`); user themes are `.css` files dropped into
+(`light.css`, `dark.css`); user themes are `.css` files dropped into
 `%APPDATA%/goose-overlay/themes/`, which then appear in Settings → Appearance and
 apply at runtime with no rebuild.
 

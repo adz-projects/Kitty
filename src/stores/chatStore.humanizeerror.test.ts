@@ -44,6 +44,16 @@ describe('humanizeChatError', () => {
     );
   });
 
+  it('uses the structured auth_failed message when errorType is given', () => {
+    expect(humanizeChatError('raw provider text', 'auth_failed')).toMatch(/api key/i);
+  });
+
+  it('uses the structured network_unreachable message when errorType is given', () => {
+    expect(humanizeChatError('raw provider text', 'network_unreachable')).toMatch(
+      /couldn't reach/i
+    );
+  });
+
   it('falls through to string matching for an unknown errorType', () => {
     expect(humanizeChatError('ACP connection closed', 'other')).toMatch(/reconnect/i);
   });

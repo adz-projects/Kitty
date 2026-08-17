@@ -52,22 +52,15 @@ pub struct Config {
     // the next save.
     /// First-run wizard completion flag (gates the wizard in Phase 7).
     pub setup_completed: bool,
-    /// Active theme name (built-ins `default`/`dark`, or a user `.css` filename).
+    /// Active theme name (built-ins `light`/`dark`, or a user `.css` filename).
+    /// `"default"` is also accepted on load as `light`'s pre-rename id — see
+    /// `migrate_theme_default_to_light`.
     pub theme: String,
-    /// Optional background-image path applied to all windows (Phase 6).
-    pub background_image: Option<String>,
-    /// Background-image dim (0.0 = none, 1.0 = fully dark overlay).
-    pub background_dim: f32,
-    /// Background-image position, 0.0-100.0 each axis (Round-4 item 2).
-    #[serde(default = "default_bg_position")]
-    pub background_position_x: f32,
-    #[serde(default = "default_bg_position")]
-    pub background_position_y: f32,
-    /// `"cover" | "contain" | "stretch" | "center"` (Round-4 item 2) — named to
-    /// match Windows' own wallpaper-fit terminology in the UI (Fill/Fit/
-    /// Stretch/Center).
-    #[serde(default = "default_bg_size")]
-    pub background_size: String,
+    // Background-image machinery (path/dim/fit/position) removed
+    // (release-fixes item 18) — same drop-silently-on-next-save story as
+    // `ollama_base_url` above: no `deny_unknown_fields`, so an existing
+    // config.json still carrying these keys loads fine and they're simply
+    // ignored.
     /// Per-event notification preferences (surfaced in Settings in Phase 5).
     pub notifications: NotificationPrefs,
     /// Remember overlay size/position between summons (Phase 6).
@@ -451,12 +444,7 @@ impl Default for Config {
             open_window_hotkey: None,
             default_context_folder: None,
             setup_completed: false,
-            theme: "default".to_string(),
-            background_image: None,
-            background_dim: 0.3,
-            background_position_x: default_bg_position(),
-            background_position_y: default_bg_position(),
-            background_size: default_bg_size(),
+            theme: "light".to_string(),
             notifications: NotificationPrefs::default(),
             remember_overlay_position: true,
             providers: Vec::new(),
@@ -540,14 +528,6 @@ fn default_bigtiny_args() -> Vec<String> {
 
 fn default_true() -> bool {
     true
-}
-
-fn default_bg_position() -> f32 {
-    50.0
-}
-
-fn default_bg_size() -> String {
-    "cover".to_string()
 }
 
 fn default_adaptive_pathway_enabled() -> bool {
@@ -778,14 +758,14 @@ pub fn load() -> Result<Config, ConfigError> {
     match fs::read_to_string(&path) {
         Ok(text) => {
             let config: Config = serde_json::from_str(&text)?;
-            Ok(migrate_model_tags_to_gguf(migrate_kitty_wasm_enabled(
-                migrate_kitty_web_enabled(
+            Ok(migrate_theme_default_to_light(migrate_model_tags_to_gguf(
+                migrate_kitty_wasm_enabled(migrate_kitty_web_enabled(
                     migrate_kitty_split_enabled(migrate_replacement_mcp_enabled(
                         migrate_bigtiny_launch_command(migrate_recipes(migrate_hotkeys(
                             config, &text,
                         ))),
                     )),
-                ),
+                )),
             )))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
@@ -1050,6 +1030,19 @@ fn migrate_kitty_wasm_enabled(mut config: Config) -> Config {
     config
 }
 
+/// release-fixes item 18: the built-in `"default"` theme was renamed
+/// `"light"` for a clearer name next to `"dark"`. Normalize an existing
+/// config.json's old id in memory rather than forcing an immediate write —
+/// the value naturally becomes `"light"` on disk the next time anything
+/// calls `save` (Settings → Appearance's own Save, or any other section's),
+/// matching how `migrate_hotkeys` above handles its own one-time reshape.
+fn migrate_theme_default_to_light(mut config: Config) -> Config {
+    if config.theme == "default" {
+        config.theme = "light".to_string();
+    }
+    config
+}
+
 fn migrate_hotkeys(mut config: Config, raw: &str) -> Config {
     if config.hotkeys.is_empty() {
         let legacy = serde_json::from_str::<serde_json::Value>(raw)
@@ -1158,6 +1151,26 @@ mod tests {
         let cfg: Config = serde_json::from_str(raw).unwrap();
         let cfg = migrate_hotkeys(cfg, raw);
         assert_eq!(cfg.hotkeys, vec!["Alt+Space".to_string()]);
+    }
+
+    #[test]
+    fn theme_default_migrates_to_light() {
+        let raw = r#"{"theme":"default"}"#;
+        let cfg: Config = serde_json::from_str(raw).unwrap();
+        let cfg = migrate_theme_default_to_light(cfg);
+        assert_eq!(cfg.theme, "light");
+    }
+
+    #[test]
+    fn theme_other_than_default_is_left_alone() {
+        for theme in ["dark", "light", "my-custom-theme"] {
+            let cfg = Config {
+                theme: theme.to_string(),
+                ..Config::default()
+            };
+            let cfg = migrate_theme_default_to_light(cfg);
+            assert_eq!(cfg.theme, theme);
+        }
     }
 
     #[test]

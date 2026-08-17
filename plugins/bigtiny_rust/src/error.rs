@@ -92,6 +92,16 @@ pub enum ProviderError {
         http_status: i32,
     },
 
+    /// A 401/403 from the provider — the API key is missing, wrong, or
+    /// revoked. Distinct from `Other` so the frontend can say "check your
+    /// API key" instead of a generic error (release-fixes item 27).
+    #[error("authentication failed: {user_message}")]
+    AuthFailed {
+        user_message: String,
+        raw_message: String,
+        http_status: i32,
+    },
+
     #[error("provider error: {user_message}")]
     Other {
         user_message: String,
@@ -108,6 +118,34 @@ pub enum ProviderError {
 
     #[error("no healthy provider: {user_message}")]
     NoHealthyProvider { user_message: String },
+}
+
+impl ProviderError {
+    /// Wire tag for the SSE `provider_error` event (release-fixes item 27) —
+    /// `Some` only for variants specific enough that the frontend can offer
+    /// real guidance (a friendly message + an action button) rather than a
+    /// generic "something went wrong". `None` for everything else, which
+    /// stays on the existing generic error path unchanged.
+    ///
+    /// `Request` covers every connect/timeout failure across both provider
+    /// implementations (see `anthropic.rs`/`openai_compat.rs` — constructed
+    /// directly, never through `classify_provider_error`, since there's no
+    /// HTTP response to classify) — that's exactly "can't reach the
+    /// provider", tagged `network_unreachable` here.
+    pub fn wire_type_tag(&self) -> Option<&'static str> {
+        match self {
+            ProviderError::InsufficientCredits { .. } => Some("insufficient_credits"),
+            ProviderError::ContextExceeded { .. } => Some("context_exceeded"),
+            ProviderError::AuthFailed { .. } => Some("auth_failed"),
+            ProviderError::Request { .. } => Some("network_unreachable"),
+            ProviderError::Http(_)
+            | ProviderError::SseParse(_)
+            | ProviderError::NotImplemented(_)
+            | ProviderError::Classification { .. }
+            | ProviderError::Other { .. }
+            | ProviderError::NoHealthyProvider { .. } => None,
+        }
+    }
 }
 
 #[derive(Error, Debug)]

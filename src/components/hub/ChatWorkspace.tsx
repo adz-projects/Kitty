@@ -113,7 +113,7 @@ export function ChatWorkspace() {
               </button>
             )}
             <button onClick={() => void toggleArtifacts()}>
-              {showArtifacts ? 'Hide artifacts' : 'Show artifacts'}
+              {showArtifacts ? 'Hide' : 'Artifacts'}
             </button>
             {/* Routes within this hub rather than opening a window: with
                 multiple hubs open (D21) a shared Settings window would be

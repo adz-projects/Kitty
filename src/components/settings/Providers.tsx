@@ -146,14 +146,21 @@ export function Providers({ highlight }: { highlight: string | null }) {
                 <span className="status-badge">
                   <TrustBadge tier={p.network_tier} isTrusted={p.is_trusted} />
                 </span>
-                {p.active && <span className="status-badge">active</span>}
+                {p.active && (
+                  <span
+                    className="status-badge"
+                    title="Used for brand-new chats — an already-open session keeps whatever provider it's already on, unaffected by this"
+                  >
+                    default for new sessions
+                  </span>
+                )}
               </div>
-              <div className="muted" style={{ fontSize: 12 }}>
+              <div className="muted" style={{ fontSize: 14 }}>
                 {p.provider_type} · {p.base_url}
                 {p.has_secret ? ' · 🔑 key stored' : ''}
               </div>
               {p.provider_type === 'openrouter' && p.has_secret && (
-                <div className="muted" style={{ fontSize: 12 }}>
+                <div className="muted" style={{ fontSize: 14 }}>
                   {!credits[p.id] && (
                     <button className="link" onClick={() => void checkCredits(p.id)}>
                       Check credits
@@ -191,7 +198,14 @@ export function Providers({ highlight }: { highlight: string | null }) {
               )}
             </div>
             <div className="row">
-              {!p.active && <button onClick={() => void onActivate(p)}>Activate</button>}
+              {!p.active && (
+                <button
+                  onClick={() => void onActivate(p)}
+                  title="Sets the default for brand-new chats — doesn't change any chat you already have open"
+                >
+                  Set as default
+                </button>
+              )}
               <button
                 onClick={() => {
                   setEditing({ ...p });
@@ -217,7 +231,7 @@ export function Providers({ highlight }: { highlight: string | null }) {
       )}
 
       {confirmUntrusted && editing && (
-        <Modal title="This provider isn’t marked trusted">
+        <Modal title="This provider isn’t marked trusted" onClose={() => setConfirmUntrusted(false)}>
           <p>
             Prompts, file contents, and tool outputs may be transmitted to{' '}
             <strong>{hostOf(editing.base_url)}</strong> — an unverified third party. Mark it trusted
@@ -233,7 +247,10 @@ export function Providers({ highlight }: { highlight: string | null }) {
       )}
 
       {handoffFor && (
-        <Modal title="Send this conversation to an untrusted provider?">
+        <Modal
+          title="Send this conversation to an untrusted provider?"
+          onClose={() => setHandoffFor(null)}
+        >
           <p>
             The active session has context that would now be sent to{' '}
             <strong>{handoffFor.base_url}</strong>.

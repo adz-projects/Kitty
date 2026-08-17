@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { ipc, onModelProgress, onModelsChanged } from '@/lib/ipc';
 import { curatedModelsFor } from '@/lib/curated_models';
 import { isAndroid } from '@/lib/platform';
+import { TrashIcon } from '@/components/icons/TrashIcon';
 import type { DownloadProgress, LocalModel } from '@/lib/types';
 
 /** Bytes as a short human string. Exported for testing — the repo has no
@@ -22,7 +23,7 @@ export function downloadPercent(p: DownloadProgress): number | null {
 }
 
 /** Local GGUF management: what's installed, download with progress, delete. */
-export function LocalModels() {
+export function HelperModels() {
   const [models, setModels] = useState<LocalModel[]>([]);
   const [downloads, setDownloads] = useState<Record<string, DownloadProgress>>({});
   const [free, setFree] = useState<number | null>(null);
@@ -72,7 +73,16 @@ export function LocalModels() {
     };
   }, []);
 
-  const installed = new Set(models.map((m) => m.file.toLowerCase()));
+  // One list, not two: a curated entry's row shows whichever state applies —
+  // its Download button just reads "Installed" once it's on disk, so the
+  // installed/available split repeated the same information twice.
+  const installedByFile = new Map(models.map((m) => [m.file.toLowerCase(), m]));
+  const curated = curatedModelsFor(isAndroid());
+  const curatedFiles = new Set(curated.map((c) => c.file.toLowerCase()));
+  // Defensive: a model on disk that no longer matches anything in the
+  // curated catalog (e.g. after a future catalog change) still needs a way
+  // to be deleted, so it gets its own row rather than silently disappearing.
+  const uncuratedInstalled = models.filter((m) => !curatedFiles.has(m.file.toLowerCase()));
 
   const start = async (repo: string, file: string, gated?: boolean) => {
     setError('');
@@ -109,9 +119,10 @@ export function LocalModels() {
 
   return (
     <div className="settings-section">
-      {/* The nav entry already says which section this is, and on Android it
-          says something different ("Support Models"), so repeating a
-          hardcoded title here would contradict it. */}
+      {/* The nav entry already says which section this is ("Helper Models" on
+          both platforms), so no hardcoded title is repeated here — only the
+          body copy still differs, since what these models actually do for
+          you differs by platform (D18: chat never runs locally on Android). */}
       <p className="muted">
         {isAndroid()
           ? 'Kitty runs these itself, in the background — they summarise long conversations and power memory. Chat runs through the provider you connect. Downloads come from Hugging Face.'
@@ -160,32 +171,10 @@ export function LocalModels() {
         </div>
       )}
 
-      <h2>Installed</h2>
-      {models.length === 0 ? (
-        <p className="muted">No models yet. Pick one below to get started.</p>
-      ) : (
-        <div className="model-list">
-          {models.map((m) => (
-            <div key={m.id} className="model-row">
-              <div>
-                <div className="model-name">{m.id}</div>
-                <div className="muted">
-                  {humanBytes(m.size_bytes)}
-                  {m.info?.quantization && ` · ${m.info.quantization}`}
-                  {m.info?.context_length &&
-                    ` · ${Math.round(m.info.context_length / 1024)}k context`}
-                </div>
-              </div>
-              <button onClick={() => void remove(m)}>Delete</button>
-            </div>
-          ))}
-        </div>
-      )}
-
-      <h2>Available</h2>
+      <h2>Models</h2>
       <div className="model-list">
-        {curatedModelsFor(isAndroid()).map((c) => {
-          const have = installed.has(c.file.toLowerCase());
+        {curated.map((c) => {
+          const have = installedByFile.get(c.file.toLowerCase());
           const busy = active.some((p) => p.model === c.file && !p.done);
           return (
             <div key={c.file} className="model-item">
@@ -193,16 +182,38 @@ export function LocalModels() {
                 <div>
                   <div className="model-name">{c.label}</div>
                   <div className="muted">
-                    {c.blurb} · {c.size_gb} GB
+                    {have ? (
+                      <>
+                        {humanBytes(have.size_bytes)}
+                        {have.info?.quantization && ` · ${have.info.quantization}`}
+                        {have.info?.context_length &&
+                          ` · ${Math.round(have.info.context_length / 1024)}k context`}
+                      </>
+                    ) : (
+                      <>
+                        {c.blurb} · {c.size_gb} GB
+                      </>
+                    )}
                   </div>
                 </div>
-                <button
-                  disabled={have || busy}
-                  onClick={() => void start(c.repo, c.file, c.gated)}
-                  className={have ? undefined : 'primary'}
-                >
-                  {have ? 'Installed' : busy ? 'Downloading…' : 'Download'}
-                </button>
+                <div className="row">
+                  <button
+                    disabled={!!have || busy}
+                    onClick={() => void start(c.repo, c.file, c.gated)}
+                    className={have ? undefined : 'primary'}
+                  >
+                    {have ? 'Installed' : busy ? 'Downloading…' : 'Download'}
+                  </button>
+                  {have && (
+                    <button
+                      onClick={() => void remove(have)}
+                      title="Delete"
+                      aria-label={`Delete ${c.label}`}
+                    >
+                      <TrashIcon />
+                    </button>
+                  )}
+                </div>
               </div>
               {c.gated && !have && (
                 <div className="gated-token">
@@ -230,6 +241,21 @@ export function LocalModels() {
             </div>
           );
         })}
+        {uncuratedInstalled.map((m) => (
+          <div key={m.id} className="model-row">
+            <div>
+              <div className="model-name">{m.id}</div>
+              <div className="muted">
+                {humanBytes(m.size_bytes)}
+                {m.info?.quantization && ` · ${m.info.quantization}`}
+                {m.info?.context_length && ` · ${Math.round(m.info.context_length / 1024)}k context`}
+              </div>
+            </div>
+            <button onClick={() => void remove(m)} title="Delete" aria-label={`Delete ${m.id}`}>
+              <TrashIcon />
+            </button>
+          </div>
+        ))}
       </div>
     </div>
   );

@@ -22,6 +22,12 @@ export function humanizeChatError(raw: string, errorType?: string): string {
   if (errorType === 'insufficient_credits') {
     return "Your API credits are exhausted. Check your provider's billing settings or switch to another provider.";
   }
+  if (errorType === 'auth_failed') {
+    return "This provider rejected the API key. Check it in Settings — it may be wrong, expired, or revoked.";
+  }
+  if (errorType === 'network_unreachable') {
+    return "Kitty couldn't reach this provider. Check your connection (or the provider's own status) and try sending again.";
+  }
   const r = raw.toLowerCase();
   if (r.includes('timed out')) {
     return 'The response took too long and Kitty gave up waiting. Try sending again.';
