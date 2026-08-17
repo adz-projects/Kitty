@@ -17,7 +17,11 @@ export function SessionSelectionBar({
   busy: boolean;
   error: string | null;
   onDelete: () => void;
-  onExport: () => void;
+  /** Undefined hides the button entirely — bulk export doesn't actually
+      work on Android yet (writeFile there can't resolve a plain folder +
+      filename path the way desktop does), so it's hidden rather than
+      shipped broken until that's fixed. */
+  onExport?: () => void;
   onCancel: () => void;
 }) {
   return (
@@ -27,14 +31,16 @@ export function SessionSelectionBar({
           ✕
         </button>
         <span className="muted">{count} selected</span>
-        <button
-          onClick={onExport}
-          disabled={busy || count === 0}
-          title="Export selected chats"
-          aria-label="Export selected chats"
-        >
-          <ExportIcon />
-        </button>
+        {onExport && (
+          <button
+            onClick={onExport}
+            disabled={busy || count === 0}
+            title="Export selected chats"
+            aria-label="Export selected chats"
+          >
+            <ExportIcon />
+          </button>
+        )}
         <button
           onClick={onDelete}
           disabled={busy || count === 0}

@@ -46,8 +46,15 @@ export function Appearance() {
               </optgroup>
             )}
           </select>
-          <button onClick={() => void ipc.openThemesFolder()}>Open themes folder</button>
-          <button onClick={loadThemes}>Refresh</button>
+          {/* Both act on the themes folder — Android has no accessible
+              filesystem to drop a custom theme .css into in the first
+              place, so neither button does anything useful there. */}
+          {!isAndroid() && (
+            <>
+              <button onClick={() => void ipc.openThemesFolder()}>Open themes folder</button>
+              <button onClick={loadThemes}>Refresh</button>
+            </>
+          )}
         </div>
         <small className="muted">
           Drop a <code>.css</code> file of custom properties into the themes folder — see

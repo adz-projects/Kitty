@@ -367,6 +367,10 @@ export function SessionList() {
     [grouped, sessions, assignments, folders, query]
   );
   const total = groups.reduce((n, g) => n + g.sessions.length, 0);
+  // Folders are foregone on Android for now (no "+ Folder"/"Uncategorized"
+  // chrome) — same underlying sessions, just flattened back out of the
+  // groups `grouped()` already computed rather than a second derivation.
+  const flatSessions = useMemo(() => groups.flatMap((g) => g.sessions), [groups]);
 
   const [creatingFolder, setCreatingFolder] = useState(false);
   const [newFolderName, setNewFolderName] = useState('');
@@ -412,15 +416,18 @@ export function SessionList() {
         <span className="muted" style={{ fontSize: 13 }}>
           {total} session{total === 1 ? '' : 's'}
         </span>
-        <button
-          className="link"
-          onClick={() => {
-            setNewFolderName('');
-            setCreatingFolder(true);
-          }}
-        >
-          ＋ Folder
-        </button>
+        {/* Folders foregone on Android for now — no way to create one there. */}
+        {!isAndroid() && (
+          <button
+            className="link"
+            onClick={() => {
+              setNewFolderName('');
+              setCreatingFolder(true);
+            }}
+          >
+            ＋ Folder
+          </button>
+        )}
       </div>
 
       {/* `loadError` covers both a failed refresh and a failed delete. It was
@@ -437,24 +444,43 @@ export function SessionList() {
       )}
 
       {loading && total === 0 && <p className="muted session-empty">Loading…</p>}
-      {!loading && total === 0 && folders.length === 0 && (
+      {/* On desktop, an existing-but-empty folder still renders its own
+          (empty) header via FolderGroup below, so this only announces "no
+          sessions" when there's truly nothing, including no folders, to
+          show. Android never renders folder headers at all, so `total === 0`
+          alone is the right check there regardless of `folders.length`. */}
+      {!loading && total === 0 && (isAndroid() || folders.length === 0) && (
         <p className="muted session-empty">No sessions.</p>
       )}
 
-      {groups.map((g) => (
-        <FolderGroup
-          key={g.folder}
-          group={g}
-          folders={folders}
-          activeId={activeId}
-          dragOverFolder={dragOverFolder}
-          dragId={dragId}
-          onStartDrag={startDrag}
-          selectionMode={selectionMode}
-          selectedIds={selectedIds}
-          onToggleSelected={toggleSelected}
-        />
-      ))}
+      {isAndroid()
+        ? flatSessions.map((s) => (
+            <SessionRow
+              key={s.sessionId}
+              session={s}
+              folders={folders}
+              active={s.sessionId === activeId}
+              dragging={s.sessionId === dragId}
+              onStartDrag={startDrag}
+              selectionMode={selectionMode}
+              selected={selectedIds.has(s.sessionId)}
+              onToggleSelected={toggleSelected}
+            />
+          ))
+        : groups.map((g) => (
+            <FolderGroup
+              key={g.folder}
+              group={g}
+              folders={folders}
+              activeId={activeId}
+              dragOverFolder={dragOverFolder}
+              dragId={dragId}
+              onStartDrag={startDrag}
+              selectionMode={selectionMode}
+              selectedIds={selectedIds}
+              onToggleSelected={toggleSelected}
+            />
+          ))}
 
       {selectionMode && (
         <SessionSelectionBar
@@ -462,7 +488,9 @@ export function SessionList() {
           busy={selectionBusy}
           error={selectionError}
           onDelete={() => void deleteSelected()}
-          onExport={() => void exportSelected()}
+          // Hidden on Android for now — see SessionSelectionBar's doc
+          // comment on `onExport`.
+          onExport={isAndroid() ? undefined : () => void exportSelected()}
           onCancel={exitSelectionMode}
         />
       )}
