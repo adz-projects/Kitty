@@ -14,6 +14,52 @@
 //! definition serving both; two copies of a ~40-variable list would drift on
 //! the first change and fail as a silently-unapplied setting.
 
+/// Locate the bundled LiteRT resources (Gemma `tokenizer.json` + the runtime
+/// DLLs) and return `(tokenizer_path, litert_lib_dir)`.
+///
+/// **The nuance that broke 0.7.0/0.7.1's first cut of this**: Tauri's
+/// `resource_dir()` on Windows resolves to the **executable's own directory**,
+/// not an `<exe_dir>/resources` subfolder — see
+/// `tauri_utils::platform::resource_dir_from`, which special-cases
+/// `cfg!(target_os = "windows")` to just return `exe_dir`. But
+/// `bundle.resources` entries in `tauri.conf.json` are declared as
+/// `"resources/libLiteRt.dll"` etc. (matching this repo's `src-tauri/resources/`
+/// source layout), and NSIS preserves that relative path, so the files
+/// actually land at `<exe_dir>/resources/*.dll` on disk. Joining a **bare**
+/// filename onto `resource_dir()` therefore looked in `<exe_dir>` itself —
+/// once removed from where the DLLs really are — silently found nothing, and
+/// the daemon shipped with no tokenizer and a `PATH` entry pointing at the
+/// wrong directory, hence the "litert-lm.dll was not found" popup even though
+/// the DLL was sitting right there in `resources/`.
+///
+/// The fix is to join the **same relative path this crate declared in
+/// `bundle.resources`** (`"resources"`), not a bare filename — mirroring what
+/// `app.path().resolve("resources/…", BaseDirectory::Resource)` would do.
+///
+/// On Android, `resource_dir()` returns a `asset://` URI, not a filesystem
+/// path, so `is_file()` is false and the tokenizer path comes back empty
+/// (`daemon_env` then falls back to the models dir — the `.so` there comes
+/// from the APK `jniLibs`, not from here).
+pub fn locate_litert_resources(app: &tauri::AppHandle) -> (String, String) {
+    use tauri::Manager;
+    match app.path().resource_dir() {
+        Ok(exe_or_resource_dir) => {
+            // See the doc comment above: on Windows this is the exe's own
+            // directory, and the bundled resources actually live one level
+            // down, at the same relative path they were declared with.
+            let res = exe_or_resource_dir.join("resources");
+            let tok = res.join("tokenizer.json");
+            let tok = if tok.is_file() {
+                tok.to_string_lossy().into_owned()
+            } else {
+                String::new()
+            };
+            (tok, res.to_string_lossy().into_owned())
+        }
+        Err(_) => (String::new(), String::new()),
+    }
+}
+
 /// Every `BIGTINY_*` variable the daemon should see, in a stable order.
 ///
 /// `secret` and `encryption_key` are separate parameters rather than config

@@ -161,30 +161,11 @@ pub fn start_stack(app: &AppHandle) {
 
         set_startup_phase(&app, StartupPhase::SpawningBackend);
 
-        // Bundled LiteRT resources (Gemma `tokenizer.json` + the runtime DLLs)
-        // ship as app resources — see `tauri.conf.json` `bundle.resources` and
-        // docs/RELEASE.md. On Windows `resource_dir()` is the flat directory they
-        // land in; we hand the daemon the tokenizer's absolute path and put that
-        // directory on the daemon's PATH so `libLiteRt.dll` (loaded by bare name)
-        // and its dependents resolve. On Android `resource_dir()` is an asset
-        // URI, not a filesystem path, so `is_file()` is false and the tokenizer
-        // falls back to the models dir inside `daemon_env` (the `.so` comes from
-        // the APK `jniLibs`, not from here).
-        let (tokenizer_path, litert_lib_dir) = {
-            use tauri::Manager;
-            match app.path().resource_dir() {
-                Ok(res) => {
-                    let tok = res.join("tokenizer.json");
-                    let tok = if tok.is_file() {
-                        tok.to_string_lossy().into_owned()
-                    } else {
-                        String::new()
-                    };
-                    (tok, res.to_string_lossy().into_owned())
-                }
-                Err(_) => (String::new(), String::new()),
-            }
-        };
+        // Bundled LiteRT resources (Gemma `tokenizer.json` + the runtime DLLs) —
+        // see `bigtiny_env::locate_litert_resources`'s doc comment for the
+        // Windows `resource_dir()` nuance this must account for.
+        let (tokenizer_path, litert_lib_dir) =
+            crate::lifecycle::bigtiny_env::locate_litert_resources(&app);
 
         // Android links the daemon in and starts it here; desktop spawns the
         // bundled executable. Both produce the same `DaemonHandle`, so
