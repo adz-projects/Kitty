@@ -109,7 +109,12 @@ pub async fn test_connection(profile: &ProviderProfile) -> Result<(), String> {
             }
             Ok(())
         }
-        "openai" | "custom_openai" => {
+        // Fireworks/QwenCloud/DeepInfra are all plain OpenAI-compatible
+        // hosted endpoints — same `/models` probe as openai/custom_openai,
+        // no dialect-specific handling needed (see bigtiny/providers.rs's
+        // `bigtiny_provider_target`, which already maps all three to the
+        // `openai_compat` wire dialect via its catch-all else-branch).
+        "openai" | "custom_openai" | "fireworks" | "qwen_cloud" | "deepinfra" => {
             let client = crate::util::http_client();
             let key = get_secret_async(&profile.id).await;
             // A schemeless entry fans out to https-then-http, so a LAN box
@@ -288,6 +293,53 @@ mod tests {
             .await;
 
         let p = profile(&unconfigured_id(), "custom_openai", &server.url(), vec![]);
+        let result = test_connection(&p).await;
+        assert_eq!(result, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn fireworks_reachable_with_no_key_stored_is_ok() {
+        // Same shape as `custom_openai_reachable_with_no_key_stored_is_ok` —
+        // Fireworks/QwenCloud/DeepInfra all fell through to the
+        // `other => Err(...)` catch-all before this dialect was added to
+        // the shared `"openai" | "custom_openai" | ...` arm; this is the
+        // regression guard for that.
+        let mut server = mockito::Server::new_async().await;
+        let _models = server
+            .mock("GET", "/models")
+            .with_status(200)
+            .create_async()
+            .await;
+
+        let p = profile(&unconfigured_id(), "fireworks", &server.url(), vec![]);
+        let result = test_connection(&p).await;
+        assert_eq!(result, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn qwen_cloud_reachable_with_no_key_stored_is_ok() {
+        let mut server = mockito::Server::new_async().await;
+        let _models = server
+            .mock("GET", "/models")
+            .with_status(200)
+            .create_async()
+            .await;
+
+        let p = profile(&unconfigured_id(), "qwen_cloud", &server.url(), vec![]);
+        let result = test_connection(&p).await;
+        assert_eq!(result, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn deepinfra_reachable_with_no_key_stored_is_ok() {
+        let mut server = mockito::Server::new_async().await;
+        let _models = server
+            .mock("GET", "/models")
+            .with_status(200)
+            .create_async()
+            .await;
+
+        let p = profile(&unconfigured_id(), "deepinfra", &server.url(), vec![]);
         let result = test_connection(&p).await;
         assert_eq!(result, Ok(()));
     }

@@ -9,7 +9,27 @@ import {
   lookupContextLength,
 } from '@/lib/context_length_table';
 import { DEFAULT_URL } from '@/lib/provider_defaults';
-import type { NetworkTier, ProviderProfile } from '@/lib/types';
+import type { NetworkTier, ProviderProfile, ProviderType } from '@/lib/types';
+
+/** Provider types that keep the original free-text base-URL/models form
+    (provider-add redesign): `local` has nothing to validate a key against,
+    `custom_openai` is a hand-configured endpoint that may not even
+    implement `/v1/models`, and `ollama` takes no API key at all. Every
+    other type gets the key-validate-then-pick-one-model flow. */
+export const LEGACY_FORM_TYPES: ProviderType[] = ['local', 'custom_openai', 'ollama'];
+
+export function usesModelPicker(providerType: ProviderType): boolean {
+  return !LEGACY_FORM_TYPES.includes(providerType);
+}
+
+/** The actual mechanism enforcing "exactly one model" for the new-flow
+    types — legacy-form types keep whatever gating existed before (none
+    beyond the fields already required, i.e. always savable from this
+    check's point of view). */
+export function canSaveProvider(providerType: ProviderType, models: string[]): boolean {
+  if (!usesModelPicker(providerType)) return true;
+  return models.length === 1 && Boolean(models[0]?.trim());
+}
 
 // Context-length detents (item 28): not linearly spaced, so the slider indexes
 // into this array rather than mapping its position directly to a value. When

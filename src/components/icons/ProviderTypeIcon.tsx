@@ -63,6 +63,46 @@ export function ProviderTypeIcon({ type }: { type: ProviderType }) {
           <circle cx="5" cy="11" r="0.6" fill="currentColor" />
         </svg>
       );
+    case 'fireworks':
+      // Simple flame — abstracted, not the real mark.
+      return (
+        <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+          <path
+            d="M8 2c1 2-1.5 2.7-1.5 4.6C6.5 5.8 5.4 5.2 5.4 5.2 4 6.5 3.5 8 3.5 9.4a4.5 4.5 0 0 0 9 0c0-2-1.2-3.4-2.3-4.6.2 1-.5 1.6-1 1.6C8.6 5 8.6 3 8 2Z"
+            fill="currentColor"
+          />
+        </svg>
+      );
+    case 'qwen_cloud':
+      // Cloud outline — a hosted, cloud-run endpoint.
+      return (
+        <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+          <path
+            d="M5 11.5a3 3 0 0 1-.5-5.96 3.5 3.5 0 0 1 6.7-1.2A3 3 0 0 1 11.5 11.5H5Z"
+            stroke="currentColor"
+            strokeWidth="1.2"
+            strokeLinejoin="round"
+          />
+        </svg>
+      );
+    case 'deepinfra':
+      // Stacked layers — infrastructure the vendor runs underneath the API.
+      return (
+        <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+          <path
+            d="m8 2.5 5.5 3L8 8.5 2.5 5.5 8 2.5Z"
+            stroke="currentColor"
+            strokeWidth="1.1"
+            strokeLinejoin="round"
+          />
+          <path
+            d="m2.5 8 5.5 3 5.5-3M2.5 10.5 8 13.5l5.5-3"
+            stroke="currentColor"
+            strokeWidth="1.1"
+            strokeLinejoin="round"
+          />
+        </svg>
+      );
     case 'local':
     default:
       // Chip/device — runs in-process on this machine.
@@ -84,6 +124,9 @@ const TYPE_LABEL: Record<ProviderType, string> = {
   anthropic: 'Anthropic',
   openai: 'OpenAI',
   openrouter: 'OpenRouter',
+  fireworks: 'Fireworks',
+  qwen_cloud: 'QwenCloud',
+  deepinfra: 'DeepInfra',
   custom_openai: 'Custom (OpenAI-compatible)',
   ollama: 'Ollama (self-hosted)',
   local: 'On this device',

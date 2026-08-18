@@ -1946,6 +1946,67 @@ button.link {
   white-space: nowrap;
 }
 
+/* Model picker (provider-add redesign) — filter chips, search, and a
+   single-select scrollable list, shown once a key validates. */
+.model-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.model-picker-filters button {
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text-muted);
+  border-radius: 999px;
+  padding: 4px 10px;
+  font-size: var(--fs-sm);
+  cursor: pointer;
+}
+.model-picker-filters button.active {
+  background: var(--surface-2);
+  color: var(--accent);
+  border-color: var(--accent);
+  font-weight: 600;
+}
+.model-picker-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 260px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 4px;
+}
+/* `.provider-row` (Settings → Providers) gives the base layout/active-state
+   look; this modifier turns it into a clickable, keyboard-focusable option
+   — it's a <button>, not a <div>, so it needs its own reset for text
+   alignment and full width. */
+.model-picker-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  width: 100%;
+  text-align: left;
+  cursor: pointer;
+}
+.model-picker-row:hover {
+  background: var(--surface-2);
+}
+.model-picker-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.model-picker-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+  font-size: var(--fs-sm);
+}
+
 /* Ollama */
 .model-list,
 .ext-list {

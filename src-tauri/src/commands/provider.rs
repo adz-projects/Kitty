@@ -9,6 +9,7 @@ use crate::config;
 use crate::config::providers::{self, NetworkTier, ProviderProfile};
 use crate::config::Config;
 use crate::openrouter;
+use crate::openrouter::catalog;
 use crate::state::AppState;
 
 /// A provider profile plus derived fields the UI needs.
@@ -277,6 +278,232 @@ pub async fn openrouter_credits(
         .await
         .ok_or("no API key stored for this profile — edit it and add one")?;
     openrouter::get_credits(&key).await
+}
+
+/// One selectable row in the provider-add model picker (mirrors TS
+/// `ModelPickerEntry`, `src/lib/types.ts`). `matched: false` means the id
+/// came straight from the vendor's own key-validation response (the key
+/// really does grant access to it) but didn't cross-reference against the
+/// cached OpenRouter catalog — every ranking field is `None` in that case,
+/// never fabricated.
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelPickerEntry {
+    pub id: String,
+    pub name: String,
+    pub cost_tier: Option<catalog::CostTier>,
+    pub capability_score: Option<f64>,
+    pub price_rank: Option<f64>,
+    pub created: Option<i64>,
+    pub context_length: Option<u32>,
+    pub matched: bool,
+}
+
+/// Validate an in-progress (unsaved) provider profile's API key and return
+/// its available models, ranked/cost-tagged where possible. Never touches
+/// the keyring — the profile doesn't exist yet, so `secret` is the raw,
+/// unsaved form value, and it's never logged.
+#[tauri::command]
+pub async fn discover_provider_models(
+    state: tauri::State<'_, AppState>,
+    provider_type: String,
+    base_url: String,
+    secret: String,
+) -> Result<Vec<ModelPickerEntry>, String> {
+    discover_models_internal(&state, &provider_type, &base_url, &secret).await
+}
+
+/// Same as `discover_provider_models`, but for an already-saved profile
+/// whose key the user left blank while editing ("leave blank to keep",
+/// `ProviderForm.tsx`) — reads `provider_type`/`base_url` from the saved
+/// profile and the secret from the keyring instead of taking them as params.
+#[tauri::command]
+pub async fn discover_provider_models_for_saved(
+    state: tauri::State<'_, AppState>,
+    provider_id: String,
+) -> Result<Vec<ModelPickerEntry>, String> {
+    let (provider_type, base_url) = {
+        let cfg = state.config.lock().unwrap();
+        let p = cfg
+            .providers
+            .iter()
+            .find(|p| p.id == provider_id)
+            .ok_or("no such provider profile")?;
+        (p.provider_type.clone(), p.base_url.clone())
+    };
+    let secret = providers::get_secret_async(&provider_id)
+        .await
+        .ok_or("no API key stored for this profile — edit it and add one")?;
+    discover_models_internal(&state, &provider_type, &base_url, &secret).await
+}
+
+/// Shared per-provider-type dispatch behind both commands above. Always
+/// starts by refreshing the OpenRouter catalog cache if it's stale — this
+/// (opening Add/Edit Provider) is what keeps the catalog from going stale
+/// over a long-running session, not a background timer.
+async fn discover_models_internal(
+    state: &AppState,
+    provider_type: &str,
+    base_url: &str,
+    secret: &str,
+) -> Result<Vec<ModelPickerEntry>, String> {
+    catalog::ensure_catalog_fresh(state).await;
+    let catalog_entries: Vec<catalog::OpenRouterCatalogEntry> = state
+        .openrouter_catalog
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|c| c.entries.clone())
+        .unwrap_or_default();
+
+    match provider_type {
+        "openrouter" => {
+            // The credits endpoint is the validation step — the catalog
+            // itself needs no key at all, so this is purely "does this key
+            // work", not a second data source.
+            openrouter::get_credits(secret).await?;
+            Ok(catalog_entries
+                .iter()
+                .map(|e| ModelPickerEntry {
+                    id: e.id.clone(),
+                    name: e.name.clone(),
+                    cost_tier: e.cost_tier,
+                    capability_score: e.intelligence_index,
+                    price_rank: e.price_rank,
+                    created: e.created,
+                    context_length: e.context_length,
+                    matched: true,
+                })
+                .collect())
+        }
+        "anthropic" => {
+            let client = crate::util::http_client();
+            let url = format!("{}/v1/models", base_url.trim_end_matches('/'));
+            let resp = client
+                .get(url)
+                .header("x-api-key", secret)
+                .header("anthropic-version", "2023-06-01")
+                .timeout(std::time::Duration::from_secs(15))
+                .send()
+                .await
+                .map_err(|e| format!("could not reach Anthropic: {e}"))?;
+            if !resp.status().is_success() {
+                return Err(classify_key_error(resp.status(), "Anthropic"));
+            }
+            let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+            Ok(merge_with_catalog(
+                parse_anthropic_models(&json),
+                &catalog_entries,
+            ))
+        }
+        "openai" | "fireworks" | "qwen_cloud" | "deepinfra" => {
+            let client = crate::util::http_client();
+            let url = format!("{}/models", base_url.trim_end_matches('/'));
+            let resp = client
+                .get(url)
+                .bearer_auth(secret)
+                .timeout(std::time::Duration::from_secs(15))
+                .send()
+                .await
+                .map_err(|e| format!("could not reach the provider: {e}"))?;
+            if !resp.status().is_success() {
+                return Err(classify_key_error(resp.status(), "The provider"));
+            }
+            let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+            Ok(merge_with_catalog(
+                parse_openai_compat_models(&json),
+                &catalog_entries,
+            ))
+        }
+        other => Err(format!("model discovery isn't available for \"{other}\"")),
+    }
+}
+
+fn classify_key_error(status: reqwest::StatusCode, who: &str) -> String {
+    if status.as_u16() == 401 || status.as_u16() == 403 {
+        format!("{who} rejected that API key — check it and try again.")
+    } else {
+        format!("{who} returned {status}")
+    }
+}
+
+/// `(id, display_name, created_unix)` per model. Anthropic's own timestamp
+/// field is `created_at` (RFC3339), not a unix int — parsed opportunistically
+/// so an unmatched Anthropic model can still sort under "Newest".
+fn parse_anthropic_models(json: &serde_json::Value) -> Vec<(String, Option<String>, Option<i64>)> {
+    json.get("data")
+        .and_then(|d| d.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| {
+                    let id = m.get("id").and_then(|v| v.as_str())?.to_string();
+                    let name = m
+                        .get("display_name")
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
+                    let created = m
+                        .get("created_at")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                        .map(|dt| dt.timestamp());
+                    Some((id, name, created))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `(id, None, created_unix)` per model — the standard OpenAI-compatible
+/// `/models` shape has no human-readable name field, only `id`/`created`/
+/// `owned_by`.
+fn parse_openai_compat_models(
+    json: &serde_json::Value,
+) -> Vec<(String, Option<String>, Option<i64>)> {
+    json.get("data")
+        .and_then(|d| d.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| {
+                    let id = m.get("id").and_then(|v| v.as_str())?.to_string();
+                    let created = m.get("created").and_then(|v| v.as_i64());
+                    Some((id, None, created))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Cross-reference each raw `(id, name?, created?)` against the cached
+/// OpenRouter catalog. A model with no match still appears — `matched:
+/// false`, ranking fields all `None` — never hidden, never fabricated. The
+/// vendor's own name/created (when given) always wins over the catalog's.
+fn merge_with_catalog(
+    raw: Vec<(String, Option<String>, Option<i64>)>,
+    catalog_entries: &[catalog::OpenRouterCatalogEntry],
+) -> Vec<ModelPickerEntry> {
+    raw.into_iter()
+        .map(|(id, name_opt, created_opt)| match catalog::match_in_catalog(&id, catalog_entries) {
+            Some(e) => ModelPickerEntry {
+                name: name_opt.unwrap_or_else(|| e.name.clone()),
+                cost_tier: e.cost_tier,
+                capability_score: e.intelligence_index,
+                price_rank: e.price_rank,
+                created: created_opt.or(e.created),
+                context_length: e.context_length,
+                matched: true,
+                id,
+            },
+            None => ModelPickerEntry {
+                name: name_opt.unwrap_or_else(|| id.clone()),
+                cost_tier: None,
+                capability_score: None,
+                price_rank: None,
+                created: created_opt,
+                context_length: None,
+                matched: false,
+                id,
+            },
+        })
+        .collect()
 }
 
 /// Manual, user-triggered re-check of the active provider (the chat view's

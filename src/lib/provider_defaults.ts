@@ -13,6 +13,11 @@ export const DEFAULT_URL: Record<ProviderType, string> = {
   openrouter: 'https://openrouter.ai/api/v1',
   anthropic: 'https://api.anthropic.com',
   openai: 'https://api.openai.com/v1',
+  fireworks: 'https://api.fireworks.ai/inference/v1',
+  deepinfra: 'https://api.deepinfra.com/v1/openai',
+  // Alibaba DashScope's international OpenAI-compatible endpoint (not the
+  // mainland-China host, which needs a different account/key entirely).
+  qwen_cloud: 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1',
   custom_openai: '',
 };
 

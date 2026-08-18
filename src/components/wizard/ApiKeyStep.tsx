@@ -11,6 +11,12 @@ const TYPE_LABEL: Record<ProviderType, string> = {
   custom_openai: 'Custom (OpenAI-compatible)',
   ollama: 'Ollama (self-hosted)',
   local: 'On this device',
+  // Not offered in this wizard's own <select> below (kept to the original 4
+  // first-run options) — these labels exist only so this Record<ProviderType,
+  // …> stays exhaustive now that Settings → Providers offers more types.
+  fireworks: 'Fireworks',
+  qwen_cloud: 'QwenCloud',
+  deepinfra: 'DeepInfra',
 };
 
 // First-party types get the trusted (globe) badge immediately — a newcomer

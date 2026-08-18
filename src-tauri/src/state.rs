@@ -179,6 +179,15 @@ pub struct AppState {
     /// dropdown read. An empty vec means "probed, none found" → hide the
     /// dropdown; a missing key means "not probed yet".
     pub effort_levels: Mutex<HashMap<String, Vec<String>>>,
+    /// Cached OpenRouter model catalog (provider-add redesign) — the
+    /// universal cost/capability/age ranking source the model picker uses
+    /// for every provider type, not just OpenRouter. Loaded from disk
+    /// synchronously at startup for a warm cold-start, refreshed lazily by
+    /// `openrouter::catalog::ensure_catalog_fresh` whenever it's actually
+    /// consulted (opening Add/Edit Provider) and more than 6h old — no
+    /// background timer. `None` only until the very first disk-cache load
+    /// or fetch completes.
+    pub openrouter_catalog: crate::openrouter::catalog::CatalogSlot,
 }
 
 impl AppState {
@@ -207,6 +216,7 @@ impl AppState {
             bigtiny_compaction_watermarks: Mutex::new(HashMap::new()),
             booted_windows: Mutex::new(HashSet::new()),
             effort_levels: Mutex::new(HashMap::new()),
+            openrouter_catalog: Mutex::new(None),
         }
     }
 }

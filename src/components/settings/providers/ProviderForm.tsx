@@ -1,11 +1,22 @@
 import { useEffect, useState } from 'react';
 import { Modal } from '@/components/shared/Modal';
-import type { ProviderProfile, ProviderType } from '@/lib/types';
+import type { ModelPickerEntry, ProviderProfile, ProviderType } from '@/lib/types';
 import { TrustBadge } from '@/lib/provider_trust';
 import { LockIcon } from '@/components/icons/LockIcon';
 import { GlobeIcon } from '@/components/icons/GlobeIcon';
 import { DEFAULT_URL } from '@/lib/provider_defaults';
-import { ctxLabel, detentsFor, isLocal, nearestCtxIndex, suggestContextLength, tierOf } from './providerUtils';
+import { ipc } from '@/lib/ipc';
+import { ModelPicker } from './ModelPicker';
+import {
+  canSaveProvider,
+  ctxLabel,
+  detentsFor,
+  isLocal,
+  nearestCtxIndex,
+  suggestContextLength,
+  tierOf,
+  usesModelPicker,
+} from './providerUtils';
 
 export function ProviderForm({
   profile,
@@ -52,6 +63,48 @@ export function ProviderForm({
   const detents = detentsFor(suggested);
   const [advancedOpen, setAdvancedOpen] = useState(false);
 
+  // Provider-add redesign: key-validate-then-pick-one-model flow for every
+  // type except local/custom_openai/ollama, which keep the original
+  // base-URL + free-text-models form untouched.
+  const showModelPicker = usesModelPicker(profile.provider_type);
+  const [modelOptions, setModelOptions] = useState<ModelPickerEntry[] | null>(null);
+  const [validating, setValidating] = useState(false);
+  const [validateError, setValidateError] = useState<string | null>(null);
+
+  // Switching type or editing the key invalidates whatever list was already
+  // loaded — it belonged to a different key/endpoint and would silently go
+  // stale otherwise.
+  useEffect(() => {
+    setModelOptions(null);
+    setValidateError(null);
+  }, [profile.provider_type, secret]);
+
+  // A blank secret is only checkable when editing an already-saved profile
+  // (falls back to the keyring-backed variant below) — a brand-new profile
+  // has nothing to validate yet.
+  const canCheckKey = secret.trim().length > 0 || Boolean(profile.id);
+
+  const checkKey = async () => {
+    setValidating(true);
+    setValidateError(null);
+    try {
+      const result =
+        profile.id && !secret.trim()
+          ? await ipc.discoverProviderModelsForSaved(profile.id)
+          : await ipc.discoverProviderModels(profile.provider_type, profile.base_url, secret);
+      setModelOptions(result);
+    } catch (e) {
+      setModelOptions(null);
+      setValidateError(String(e));
+    } finally {
+      setValidating(false);
+    }
+  };
+
+  // Save stays disabled until the picker has a selection, for the new-flow
+  // types (see `canSaveProvider`'s own doc comment).
+  const canSave = canSaveProvider(profile.provider_type, profile.models);
+
   return (
     <Modal title={profile.id ? 'Edit provider' : 'Add provider'} onClose={onCancel}>
       <label className="field">
@@ -71,6 +124,9 @@ export function ProviderForm({
           <option value="openrouter">OpenRouter</option>
           <option value="anthropic">Anthropic</option>
           <option value="openai">OpenAI</option>
+          <option value="fireworks">Fireworks</option>
+          <option value="qwen_cloud">QwenCloud</option>
+          <option value="deepinfra">DeepInfra</option>
           <option value="custom_openai">Custom (OpenAI-compatible)</option>
           {/* Not offered for new providers — Kitty no longer runs Ollama
               itself — but an existing ollama-type profile (pointing at a
@@ -100,22 +156,59 @@ export function ProviderForm({
         </label>
       )}
 
-      <label className="field">
-        <span>Models (comma-separated)</span>
-        <input
-          value={profile.models.join(', ')}
-          onChange={(e) =>
-            set({
-              models: e.target.value
-                .split(',')
-                .map((m) => m.trim())
-                .filter(Boolean),
-            })
-          }
-        />
-      </label>
+      {showModelPicker ? (
+        <>
+          <label className="field">
+            <span>API key {profile.id ? '(leave blank to keep)' : ''}</span>
+            <input type="password" value={secret} onChange={(e) => onSecret(e.target.value)} />
+            <small className="muted">Stored in Windows Credential Manager, never on disk.</small>
+          </label>
+          <div className="field">
+            <span>Model</span>
+            <div className="row">
+              <button
+                type="button"
+                onClick={() => void checkKey()}
+                disabled={!canCheckKey || validating}
+              >
+                {validating ? 'Checking…' : 'Check key & load models'}
+              </button>
+            </div>
+            {validateError && (
+              <small className="chat-error" role="alert">
+                {validateError}
+              </small>
+            )}
+            {modelOptions && (
+              <ModelPicker
+                models={modelOptions}
+                value={profile.models[0] ?? null}
+                onChange={(id) => set({ models: [id] })}
+              />
+            )}
+            {!modelOptions && !validateError && !validating && (
+              <small className="muted">Check your key to see available models.</small>
+            )}
+          </div>
+        </>
+      ) : (
+        <label className="field">
+          <span>Models (comma-separated)</span>
+          <input
+            value={profile.models.join(', ')}
+            onChange={(e) =>
+              set({
+                models: e.target.value
+                  .split(',')
+                  .map((m) => m.trim())
+                  .filter(Boolean),
+              })
+            }
+          />
+        </label>
+      )}
 
-      {needsKey && (
+      {!showModelPicker && needsKey && (
         <label className="field">
           <span>API key {profile.id ? '(leave blank to keep)' : ''}</span>
           <input type="password" value={secret} onChange={(e) => onSecret(e.target.value)} />
@@ -127,6 +220,22 @@ export function ProviderForm({
         <p className="muted trust-note">
           <LockIcon /> Local provider — always trusted.
         </p>
+      )}
+
+      {/* Moved above Advanced (release-fixes-2) — trust is a decision worth
+          seeing up front, not buried in a collapsed section; copy shortened
+          to drop the mechanism explanation. */}
+      {!local && (
+        <label className="check">
+          <input
+            type="checkbox"
+            checked={profile.is_trusted}
+            onChange={(e) => set({ is_trusted: e.target.checked })}
+          />
+          <span>
+            <GlobeIcon /> I trust this provider
+          </span>
+        </label>
       )}
 
       <button
@@ -142,19 +251,6 @@ export function ProviderForm({
           stays visible while closed), so visibility can't be left to CSS. */}
       {advancedOpen && (
         <div className="provider-advanced-body">
-          {!local && (
-            <label className="check">
-              <input
-                type="checkbox"
-                checked={profile.is_trusted}
-                onChange={(e) => set({ is_trusted: e.target.checked })}
-              />
-              <span>
-                I trust this provider (<GlobeIcon /> skips the untrusted-provider warning)
-              </span>
-            </label>
-          )}
-
           <label className="check">
             <input
               type="checkbox"
@@ -430,7 +526,7 @@ export function ProviderForm({
       )}
 
       <div className="row">
-        <button className="primary" onClick={onSave}>
+        <button className="primary" onClick={onSave} disabled={!canSave}>
           Save
         </button>
         <button onClick={onCancel}>Cancel</button>

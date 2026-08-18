@@ -25,6 +25,7 @@ import type {
   MemoryStats,
   LocalEngineStatus,
   LocalModel,
+  ModelPickerEntry,
   OpenRouterCredits,
   PathInfo,
   ProviderProfile,
@@ -305,6 +306,16 @@ export const ipc = {
     invoke<number | null>('custom_openai_context_length', { baseUrl, model }),
   openrouterCredits: (providerId: string) =>
     invoke<OpenRouterCredits>('openrouter_credits', { providerId }),
+  /** Validate an in-progress (unsaved) provider's API key and list its
+      available models, ranked/cost-tagged against the cached OpenRouter
+      catalog where possible. Never touches the keyring — `secret` is the
+      raw, unsaved form value. */
+  discoverProviderModels: (providerType: string, baseUrl: string, secret: string) =>
+    invoke<ModelPickerEntry[]>('discover_provider_models', { providerType, baseUrl, secret }),
+  /** Same, but for an already-saved profile whose key field was left blank
+      ("leave blank to keep") — reads the secret from the keyring instead. */
+  discoverProviderModelsForSaved: (providerId: string) =>
+    invoke<ModelPickerEntry[]>('discover_provider_models_for_saved', { providerId }),
   // MCP servers — daemon-global, live over REST (BigTiny; no restart needed
   // to add/edit/delete/toggle).
   listMcpServers: () => invoke<McpServer[]>('list_mcp_servers'),

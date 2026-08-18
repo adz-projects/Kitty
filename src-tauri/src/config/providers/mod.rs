@@ -26,7 +26,13 @@ use crate::state::AppState;
 pub struct ProviderProfile {
     pub id: String,
     pub name: String,
-    /// `ollama` | `openrouter` | `anthropic` | `openai` | `custom_openai`.
+    /// `ollama` | `openrouter` | `anthropic` | `openai` | `fireworks` |
+    /// `qwen_cloud` | `deepinfra` | `custom_openai` | `local`. A plain
+    /// string, not an enum — a new hosted OpenAI-compatible dialect (like
+    /// the 3 above) needs no type change here, just new match arms wherever
+    /// behavior actually differs (see `config/providers/connection.rs`'s
+    /// `test_connection` and `bigtiny/providers.rs`'s
+    /// `bigtiny_provider_target`).
     pub provider_type: String,
     pub base_url: String,
     #[serde(default)]

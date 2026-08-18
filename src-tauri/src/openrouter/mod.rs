@@ -1,7 +1,11 @@
-//! OpenRouter's public models list (Round-6 Feature 1): used only to suggest a
-//! model's real context window in the Providers form — Kitty never calls
-//! OpenRouter for inference itself (that's BigTiny's job, same as every other
-//! provider type).
+//! OpenRouter's public models list (Round-6 Feature 1): used to suggest a
+//! model's real context window in the Providers form, and — since the
+//! provider-add redesign — as the cached universal cost/capability/age
+//! ranking source for the model picker across every provider type (see
+//! `catalog`). Kitty never calls OpenRouter for inference itself (that's
+//! BigTiny's job, same as every other provider type).
+
+pub mod catalog;
 
 use serde_json::Value;
 

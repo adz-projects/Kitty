@@ -116,7 +116,15 @@ export type NetworkTier = 'local' | 'personal' | 'remote';
     in Phase 2b but kept the dialect, since the daemon gives it a dedicated
     sampling profile and `top_k`/`min_p` wire support. */
 export type ProviderType =
-  'local' | 'ollama' | 'openrouter' | 'anthropic' | 'openai' | 'custom_openai';
+  | 'local'
+  | 'ollama'
+  | 'openrouter'
+  | 'anthropic'
+  | 'openai'
+  | 'fireworks'
+  | 'qwen_cloud'
+  | 'deepinfra'
+  | 'custom_openai';
 
 export interface ProviderProfile {
   id: string;
@@ -191,6 +199,28 @@ export interface OpenRouterCredits {
   usage: number;
   is_free_tier: boolean;
   [key: string]: unknown;
+}
+
+/** Simplified cost badge shown in the model picker instead of a raw
+    $/M-token number — bucketed by percentile against the live OpenRouter
+    catalog (mirrors Rust `CostTier`), not a fixed dollar table. */
+export type CostTier = 'premium' | 'moderate' | 'economy';
+
+/** One selectable row in the provider-add model picker (mirrors Rust
+    `ModelPickerEntry`, `src-tauri/src/commands/provider.rs`). `matched:
+    false` means this model came straight from the vendor's own /v1/models
+    (the key really does grant access to it) but didn't cross-reference
+    against the cached OpenRouter catalog — cost/capability/age are all
+    `null` in that case, never fabricated. */
+export interface ModelPickerEntry {
+  id: string;
+  name: string;
+  cost_tier: CostTier | null;
+  capability_score: number | null;
+  price_rank: number | null;
+  created: number | null;
+  context_length: number | null;
+  matched: boolean;
 }
 
 /** A file attached to a chat (Round-2 item 13): UTF-8 text, or a base64 data URL. */

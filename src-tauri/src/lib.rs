@@ -236,6 +236,8 @@ pub fn run() {
             commands::ollama_context_length,
             commands::custom_openai_context_length,
             commands::openrouter_credits,
+            commands::discover_provider_models,
+            commands::discover_provider_models_for_saved,
             commands::list_local_models,
             commands::get_local_engine_status,
             commands::get_models_disk_free,

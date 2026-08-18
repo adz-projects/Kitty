@@ -125,9 +125,40 @@ pub(crate) fn sync_mcp_once_healthy(app: &AppHandle, healthy: bool, port: u16) {
     });
 }
 
+/// Warm the OpenRouter model catalog cache (provider-add redesign) at
+/// startup: load the disk copy synchronously — fast, a few hundred KB — so
+/// it's available to the very first Add/Edit Provider click even before
+/// this task's own network fetch lands, then refresh it in the background.
+/// Independent of the BigTiny daemon spawn below; runs concurrently with
+/// it, not blocking or blocked by it. Failure is silent (logged only) — see
+/// `openrouter::catalog::ensure_catalog_fresh`'s doc comment on why a
+/// failed fetch never surfaces to the user.
+fn warm_openrouter_catalog(app: &AppHandle) {
+    {
+        let state = app.state::<AppState>();
+        if let Some(disk) = crate::openrouter::catalog::load_disk_cache() {
+            *state.openrouter_catalog.lock().unwrap() = Some(disk);
+        }
+    }
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        match crate::openrouter::catalog::fetch_catalog(None).await {
+            Ok(fresh) => {
+                let _ = crate::openrouter::catalog::save_disk_cache(&fresh);
+                let state = app.state::<AppState>();
+                *state.openrouter_catalog.lock().unwrap() = Some(fresh);
+            }
+            Err(e) => {
+                tracing::warn!("OpenRouter catalog startup fetch failed: {e}");
+            }
+        }
+    });
+}
+
 /// Start the stack in the background at app startup. Non-blocking: failures
 /// surface through the health loop as a degraded status rather than crashing.
 pub fn start_stack(app: &AppHandle) {
+    warm_openrouter_catalog(app);
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         // Spawn the BigTiny daemon. No provider env vars — providers are
