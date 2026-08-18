@@ -2398,6 +2398,17 @@ button.link {
     border-right: none;
     border-bottom: 1px solid var(--border);
   }
+  /* `.settings-main`'s base rule pins it to `grid-row: 2` for the desktop
+     2-row template (notice / nav+content) — this 3-row mobile template
+     (notice / nav / content) needs it one row further down, or it lands in
+     the same cell as `.settings-nav` above: both stack in row 2, `.settings-main`
+     painted over the nav (later in DOM), and row 3's `1fr` track sits empty.
+     That's the exact regression reported: the horizontal tab row effectively
+     disappears under the content, and whatever's left reads like a broken
+     sidebar rather than top tabs. */
+  .settings-main {
+    grid-row: 3;
+  }
   .settings-nav-group-label {
     display: none;
   }
