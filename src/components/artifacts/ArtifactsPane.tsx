@@ -4,6 +4,8 @@ import { isAndroid } from '@/lib/platform';
 import { useChatStore, type Artifact } from '@/stores/chatStore';
 import { useRouteStore } from '@/stores/routeStore';
 import { DocumentIcon } from '@/components/icons/DocumentIcon';
+import { FolderIcon } from '@/components/icons/FolderIcon';
+import type { FileEntry } from '@/lib/types';
 
 const POLL_INTERVAL_MS = 5000;
 
@@ -26,6 +28,7 @@ const POLL_INTERVAL_MS = 5000;
     obscured, so it passes nothing and no close button appears. */
 export function ArtifactsPane({ onClose }: { onClose?: () => void } = {}) {
   const artifacts = useChatStore((s) => s.artifacts);
+  const subfolders = useChatStore((s) => s.subfolders);
   const cwd = useChatStore((s) => s.cwd);
   const pruneMissingArtifacts = useChatStore((s) => s.pruneMissingArtifacts);
   const refreshArtifactsFromDisk = useChatStore((s) => s.refreshArtifactsFromDisk);
@@ -70,7 +73,19 @@ export function ArtifactsPane({ onClose }: { onClose?: () => void } = {}) {
           </button>
         )}
       </div>
-      {artifacts.length === 0 ? (
+      {/* Subfolders (release-fixes-2): listed, not traversed — the only
+          action is opening them in Explorer, same as the "Open folder"
+          button above but scoped to the subfolder. Android-gated for the
+          same reason as that button: the chat folder is app-private there,
+          so there's no Explorer-equivalent to open a subfolder in. */}
+      {!android && subfolders.length > 0 && (
+        <div className="artifacts-list artifacts-subfolders">
+          {subfolders.map((f) => (
+            <SubfolderRow key={f.path} folder={f} />
+          ))}
+        </div>
+      )}
+      {artifacts.length === 0 && subfolders.length === 0 ? (
         <p className="muted" style={{ fontSize: 14, padding: '4px 8px' }}>
           Files the agent creates or edits will appear here.
         </p>
@@ -82,6 +97,19 @@ export function ArtifactsPane({ onClose }: { onClose?: () => void } = {}) {
         </div>
       )}
     </aside>
+  );
+}
+
+function SubfolderRow({ folder }: { folder: FileEntry }) {
+  return (
+    <div className="artifact-card artifact-card-folder">
+      <div className="artifact-name" title={folder.path}>
+        <FolderIcon /> {folder.name}
+      </div>
+      <div className="artifact-actions">
+        <button onClick={() => void ipc.openPath(folder.path)}>Open in Explorer</button>
+      </div>
+    </div>
   );
 }
 

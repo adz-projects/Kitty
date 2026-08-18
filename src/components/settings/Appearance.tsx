@@ -56,10 +56,15 @@ export function Appearance() {
             </>
           )}
         </div>
-        <small className="muted">
-          Drop a <code>.css</code> file of custom properties into the themes folder — see
-          themes/README.md for the contract.
-        </small>
+        {/* Android has no accessible themes folder to drop a .css file into
+            (see the button-hiding comment above), so this hint would just be
+            confusing there. */}
+        {!isAndroid() && (
+          <small className="muted">
+            Drop a <code>.css</code> file of custom properties into the themes folder — see
+            themes/README.md for the contract.
+          </small>
+        )}
       </label>
 
       {/* Desktop-only — there is no overlay window on Android to remember

@@ -28,6 +28,7 @@ import { recipeNeedsAttention, resolveRecipe, launchableExtensions } from '@/lib
 import { modelAcceptsImages } from '@/lib/vision_models';
 import type {
   ApprovalNeededEvent,
+  FileEntry,
   ModeInfo,
   NetworkTier,
   PathInfo,
@@ -135,6 +136,13 @@ interface ChatState {
   creatingSession: boolean;
   messages: Message[];
   artifacts: Artifact[];
+  /** Direct subdirectories of `cwd` (release-fixes-2) — shown in the
+      Artifacts pane as "open in Explorer" rows, not traversed into. Purely
+      disk-derived (unlike `artifacts`, never populated from tool-call
+      events or carried across a window handoff), so it's fine for this to
+      lag a `refreshArtifactsFromDisk` poll tick behind a session switch
+      rather than being threaded through every reset site `artifacts` is. */
+  subfolders: FileEntry[];
   droppedFiles: PathInfo[];
   attachments: Attachment[];
   pendingImages: PendingImage[];
@@ -1015,6 +1023,7 @@ export const useChatStore = create<ChatState>((set, get) => {
     creatingSession: false,
     messages: [],
     artifacts: [],
+    subfolders: [],
     droppedFiles: [],
     attachments: [],
     pendingImages: [],
@@ -1084,6 +1093,11 @@ export const useChatStore = create<ChatState>((set, get) => {
       if (!cwd) return;
       try {
         const entries = await ipc.listDirectory(cwd);
+        // Subfolders (release-fixes-2) are a separate, purely disk-derived
+        // list — never mixed into `artifacts` (which also carries tool-call
+        // provenance) and just replaced wholesale each poll, unlike the
+        // dedupe-and-append below.
+        set({ subfolders: entries.filter((e) => e.is_dir) });
         // Compare on a normalized (forward-slash, lowercased) form — Windows
         // paths are case-insensitive and tool-derived artifact paths can mix
         // separators (see absoluteArtifactPath in messageUtils.ts), so raw
@@ -1092,7 +1106,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         set((s) => {
           const known = new Set(s.artifacts.map((a) => normalize(a.path)));
           const additions: Artifact[] = entries
-            .filter((e) => !known.has(normalize(e.path)))
+            .filter((e) => !e.is_dir && !known.has(normalize(e.path)))
             .map((e) => ({ path: e.path, name: e.name, tool: 'disk', source: 'disk' as const }));
           if (additions.length === 0) return s;
           return { artifacts: [...s.artifacts, ...additions] };

@@ -691,13 +691,15 @@ export interface PathInfo {
   exists: boolean;
 }
 
-/** Mirrors `commands::file::FileEntry` — one file from a `list_directory`
-    disk-scan (Artifacts pane, Round-7 item 5). */
+/** Mirrors `commands::file::FileEntry` — one file (or, as of release-fixes-2,
+    subfolder) from a `list_directory` disk-scan (Artifacts pane, Round-7
+    item 5). */
 export interface FileEntry {
   name: string;
   path: string;
   size: number;
   modified: number;
+  is_dir: boolean;
 }
 
 /** Parsed from a raw ACP `session/list` entry. */

@@ -13,6 +13,7 @@ import { ChatHeaderControls } from '@/components/chat/ChatHeaderControls';
 import { NewChatIcon } from '@/components/icons/NewChatIcon';
 import { SettingsGearIcon } from '@/components/icons/SettingsGearIcon';
 import { KittyIcon } from '@/components/icons/KittyIcon';
+import { ExportIcon } from '@/components/icons/ExportIcon';
 import type { StackStatus } from '@/lib/types';
 
 const DEGRADED: StackStatus[] = ['backend_down', 'local_model_missing', 'provider_unreachable'];
@@ -108,12 +109,19 @@ export function ChatWorkspace() {
                 a transcript into another file). Android keeps New chat + the
                 artifacts toggle. */}
             {!android && hasMessages && (
-              <button onClick={() => void exportSession()} title="Export this session as ChatML">
-                Export
+              <button
+                onClick={() => void exportSession()}
+                title="Export this session as ChatML"
+                aria-label="Export this session as ChatML"
+              >
+                <ExportIcon />
               </button>
             )}
             <button onClick={() => void toggleArtifacts()}>
-              {showArtifacts ? 'Hide' : 'Artifacts'}
+              {/* Windows has room to spell it out; Android's header is one
+                  crowded row shared with the model picker, so it keeps the
+                  terser "Hide"/"Artifacts" wording. */}
+              {android ? (showArtifacts ? 'Hide' : 'Artifacts') : showArtifacts ? 'Hide Artifacts' : 'Show Artifacts'}
             </button>
             {/* Routes within this hub rather than opening a window: with
                 multiple hubs open (D21) a shared Settings window would be

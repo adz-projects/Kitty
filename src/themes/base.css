@@ -1,6 +1,24 @@
 /* Structural, theme-agnostic layout. MUST NOT contain color values —
    all colors/spacing/typography come from custom properties in theme files. */
 
+/* Self-hosted Montserrat (OFL-licensed), bundled so the app renders it
+   offline with no runtime fetch to Google Fonts — consistent with the rest
+   of the app never phoning out for UI chrome. One variable-weight woff2
+   (Latin/Latin-ext subset only, ~37KB) covers the whole 100–900 range the
+   UI actually uses; declared here (not in light.css/dark.css) because those
+   are injected as raw text into a <style> tag at runtime (see lib/theme.ts)
+   and wouldn't get their relative url() rewritten by Vite's asset pipeline —
+   base.css is a real static import, so this one does. Themes only set
+   `--font-family`; this is the face that name resolves to. */
+@font-face {
+  font-family: 'Montserrat';
+  src: url('../assets/fonts/Montserrat-Variable.woff2') format('woff2-variations'),
+    url('../assets/fonts/Montserrat-Variable.woff2') format('woff2');
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+
 :root {
   /* --- Type ramp (docs/ANDROID.md §8.4) ---------------------------------
      Every font-size in this file goes through one of these, and every one is
@@ -42,6 +60,26 @@
   --safe-right: 0px;
   --safe-bottom: 0px;
   --safe-left: 0px;
+}
+
+/* Windows-only: whole type ramp shifted -1px from the shared tokens above.
+   Android keeps the larger ramp (touch targets, one-row headers already
+   budgeted for it) — this only affects desktop, gated on `data-platform`
+   like the safe-area override below. Additive, same as the +2px sweep this
+   overrides, to preserve proportions between steps. */
+:root[data-platform='desktop'] {
+  --fs-2xs: 0.6875rem; /* 11px */
+  --fs-xs: 0.75rem; /* 12px */
+  --fs-xs-plus: 0.78125rem; /* 12.5px */
+  --fs-sm: 0.8125rem; /* 13px */
+  --fs-sm-plus: 0.84375rem; /* 13.5px */
+  --fs-md: 0.875rem; /* 14px */
+  --fs-base: 0.9375rem; /* 15px */
+  --fs-lg: 1rem; /* 16px */
+  --fs-xl: 1.0625rem; /* 17px */
+  --fs-2xl: 1.1875rem; /* 19px */
+  --fs-3xl: 1.3125rem; /* 21px */
+  --fs-4xl: 1.4375rem; /* 23px */
 }
 
 /* `rem` is relative to this, so it is the single multiplication point for
@@ -1550,6 +1588,17 @@ button.primary {
   font-size: var(--fs-xs);
   padding: 3px 6px;
 }
+/* Subfolder rows (release-fixes-2): listed above the file cards, muted
+   slightly relative to them since there's nothing to preview/open
+   in-app — the folder icon plus the one "Open in Explorer" action already
+   say everything the row can offer. */
+.artifacts-subfolders {
+  border-bottom: 2px solid var(--border);
+}
+.artifact-card-folder .artifact-name {
+  color: var(--text-muted);
+  font-weight: 500;
+}
 
 /* --- File chips (composer) --- */
 .file-chips {
@@ -1621,12 +1670,22 @@ button.primary {
   font-size: var(--fs-md);
 }
 .settings-nav {
+  /* Explicit row placement, not just column: without it this and
+     `.settings-main` both auto-place into row 1 (the `auto`-sized row meant
+     for `.settings-recovery-notice`), so the nav only ever grew to its own
+     content height and left the `1fr` row empty — the sidebar visibly
+     stopped partway down instead of reaching the bottom of the window. Row 1
+     naturally collapses to 0 when the notice isn't rendered, so this is safe
+     either way. */
+  grid-row: 2;
   display: flex;
   flex-direction: column;
   border-right: 1px solid var(--border);
   background: var(--surface);
   padding: 8px;
   gap: 2px;
+  min-height: 0;
+  overflow-y: auto;
 }
 .settings-nav button {
   border: none;
@@ -1680,9 +1739,12 @@ button.primary {
   padding-top: 4px;
 }
 .settings-main {
+  /* See `.settings-nav`'s comment — same row-placement fix, same reason. */
+  grid-row: 2;
   overflow-y: auto;
   overscroll-behavior: contain;
   padding: 24px 28px;
+  min-height: 0;
 }
 .settings-section {
   display: flex;
@@ -1847,12 +1909,41 @@ button.link {
     outline: 2px solid var(--accent);
   }
 }
+.provider-row-info {
+  /* Lets the name/url text truncate with ellipsis instead of wrapping —
+     a flex child's default min-width is `auto` (its content size), which
+     silently defeats `text-overflow` further down without this. */
+  min-width: 0;
+  flex: 1;
+}
 .provider-name {
   font-weight: 600;
   display: flex;
   gap: 6px;
   align-items: center;
-  flex-wrap: wrap;
+  /* Was `wrap` — badges (trust/key/default) are icon-only now (release-fixes-2:
+     "use icons rather than words so each card stays on one line"), so there's
+     no more multi-word content to force a wrap; keep everything on one row and
+     let the name itself truncate instead. */
+  flex-wrap: nowrap;
+  min-width: 0;
+}
+.provider-name-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.provider-type-icon {
+  display: inline-flex;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+.provider-url-line {
+  font-size: var(--fs-sm);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* Ollama */

@@ -314,7 +314,8 @@ pub async fn download_file(app: AppHandle, path: String) -> Result<bool, String>
     Ok(true)
 }
 
-/// A single file found in a `list_directory` scan (artifacts pane disk-scan).
+/// A single file (or, as of release-fixes-2, subfolder) found in a
+/// `list_directory` scan (artifacts pane disk-scan).
 #[derive(Debug, Clone, Serialize)]
 pub struct FileEntry {
     pub name: String,
@@ -322,17 +323,28 @@ pub struct FileEntry {
     pub size: u64,
     /// Unix-epoch seconds; `0` if the platform can't report `modified`.
     pub modified: u64,
+    /// `true` for a direct subdirectory of the scanned folder. The Artifacts
+    /// pane shows these as a distinct "open in Explorer" row, not a file
+    /// card — Kitty doesn't traverse into them, just surfaces that they
+    /// exist (release-fixes-2: "show subfolders in Artifacts — just a way
+    /// to open them in explorer, no traversing them").
+    pub is_dir: bool,
 }
 
 /// Cap on entries returned, so a huge/misused working directory can't send an
 /// unbounded payload back to the frontend.
 const LIST_DIRECTORY_MAX_ENTRIES: usize = 500;
 
-/// List files (not subdirectories) directly in `path`, for the Artifacts
-/// pane's disk-scan (Round-7 item 5) — surfaces files that landed in the chat
-/// folder without going through a tracked tool call (e.g. dropped in via
-/// Explorer). Skips hidden files (dotfiles) and directories; returns at most
-/// `LIST_DIRECTORY_MAX_ENTRIES`, newest-modified first.
+/// List files and direct subdirectories in `path`, for the Artifacts pane's
+/// disk-scan (Round-7 item 5; subfolders added in release-fixes-2) —
+/// surfaces files (and folders) that landed in the chat folder without going
+/// through a tracked tool call (e.g. dropped in via Explorer). Skips hidden
+/// entries (dotfiles/dot-directories); does not recurse into
+/// subdirectories — only their own name/path is reported, not their
+/// contents. Returns at most `LIST_DIRECTORY_MAX_ENTRIES` combined, newest
+/// files first, with subdirectories always sorted after files (`is_dir` is a
+/// coarser sort key than `modified`, so subfolders don't jostle position in
+/// the list as their contents change).
 #[tauri::command]
 pub async fn list_directory(path: String) -> Result<Vec<FileEntry>, String> {
     tokio::task::spawn_blocking(move || {
@@ -348,8 +360,8 @@ pub async fn list_directory(path: String) -> Result<Vec<FileEntry>, String> {
                     return None;
                 }
                 let meta = entry.metadata().ok()?;
-                if !meta.is_file() {
-                    return None;
+                if !meta.is_file() && !meta.is_dir() {
+                    return None; // symlinks/special files — not modeled here
                 }
                 let modified = meta
                     .modified()
@@ -362,11 +374,12 @@ pub async fn list_directory(path: String) -> Result<Vec<FileEntry>, String> {
                     path: entry.path().to_string_lossy().to_string(),
                     size: meta.len(),
                     modified,
+                    is_dir: meta.is_dir(),
                 })
             })
             .collect();
 
-        files.sort_by_key(|f| std::cmp::Reverse(f.modified));
+        files.sort_by_key(|f| (f.is_dir, std::cmp::Reverse(f.modified)));
         files.truncate(LIST_DIRECTORY_MAX_ENTRIES);
         Ok(files)
     })

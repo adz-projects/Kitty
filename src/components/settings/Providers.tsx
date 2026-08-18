@@ -2,7 +2,9 @@ import { useEffect, useState } from 'react';
 import { ipc } from '@/lib/ipc';
 import { Modal } from '@/components/shared/Modal';
 import type { OpenRouterCredits, ProviderProfile, ProviderView } from '@/lib/types';
-import { TrustBadge } from '@/lib/provider_trust';
+import { TrustIcon, trustKind } from '@/lib/provider_trust';
+import { ProviderTypeIcon, providerTypeLabel } from '@/components/icons/ProviderTypeIcon';
+import { StarIcon } from '@/components/icons/StarIcon';
 import { ProviderForm } from './providers/ProviderForm';
 import { blank, hostOf, isLocal } from './providers/providerUtils';
 
@@ -140,25 +142,33 @@ export function Providers({ highlight }: { highlight: string | null }) {
             key={p.id}
             className={`provider-row${p.id === highlight ? ' highlight' : ''}${p.active ? ' active' : ''}`}
           >
-            <div>
+            <div className="provider-row-info">
               <div className="provider-name">
-                {p.name || p.provider_type}{' '}
-                <span className="status-badge">
-                  <TrustBadge tier={p.network_tier} isTrusted={p.is_trusted} />
+                <span
+                  className="provider-type-icon"
+                  title={providerTypeLabel(p.provider_type)}
+                  aria-label={providerTypeLabel(p.provider_type)}
+                >
+                  <ProviderTypeIcon type={p.provider_type} />
                 </span>
+                <span className="provider-name-text">{p.name || providerTypeLabel(p.provider_type)}</span>
+                <span
+                  title={`${trustKind(p.network_tier, p.is_trusted)} — ${hostOf(p.base_url)}`}
+                  aria-label={trustKind(p.network_tier, p.is_trusted)}
+                >
+                  <TrustIcon tier={p.network_tier} isTrusted={p.is_trusted} />
+                </span>
+                {p.has_secret && <span title="API key stored">🔑</span>}
                 {p.active && (
                   <span
-                    className="status-badge"
-                    title="Used for brand-new chats — an already-open session keeps whatever provider it's already on, unaffected by this"
+                    title="Default for new chats — an already-open session keeps whatever provider it's already on, unaffected by this"
+                    aria-label="Default for new sessions"
                   >
-                    default for new sessions
+                    <StarIcon />
                   </span>
                 )}
               </div>
-              <div className="muted" style={{ fontSize: 14 }}>
-                {p.provider_type} · {p.base_url}
-                {p.has_secret ? ' · 🔑 key stored' : ''}
-              </div>
+              <div className="muted provider-url-line">{p.base_url}</div>
               {p.provider_type === 'openrouter' && p.has_secret && (
                 <div className="muted" style={{ fontSize: 14 }}>
                   {!credits[p.id] && (

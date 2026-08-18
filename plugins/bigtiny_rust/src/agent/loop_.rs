@@ -437,6 +437,20 @@ async fn summarizer_title(
         .filter(|m| matches!(m.role.as_str(), "user" | "assistant"))
         .filter_map(|m| {
             let content = m.content?;
+            // Strip the same leading `--- <label> ---` attachment/paste
+            // markers `derive_title`'s naive fallback strips (see its doc
+            // comment) — a small/weak model given raw marker text as the
+            // most prominent thing in the prompt will happily parrot it
+            // back as the "title" despite being told not to (confirmed real
+            // report: a title of literally "--- Pasted text --- 130
+            // words."). Stripping before the model ever sees it is the
+            // actual fix; `sanitize_title` below is only a second line of
+            // defense for whatever slips past that.
+            let content = if m.role == "user" {
+                strip_leading_attachment_markers(&strip_prompt_wrappers(&content))
+            } else {
+                content
+            };
             if content.trim().is_empty() {
                 return None;
             }
@@ -477,6 +491,11 @@ async fn summarizer_title(
 /// naive fallback does.
 fn sanitize_title(raw: &str) -> String {
     let trimmed = raw.trim().trim_matches(|c| c == '"' || c == '\'').trim();
+    // Second line of defense: `summarizer_title` now strips attachment
+    // markers before the model ever sees them, but this still catches a
+    // model that echoes one back anyway (or any other input path that
+    // reaches `sanitize_title` without going through that stripping).
+    let trimmed = strip_leading_attachment_markers(trimmed);
     let collapsed = trimmed.split_whitespace().collect::<Vec<_>>().join(" ");
     truncate_title(&collapsed)
 }
@@ -571,6 +590,20 @@ mod derive_title_tests {
         // horizontal rule, a code fence) must not be swallowed.
         let msg = "--- this is not a marker\nbecause it has no closing dashes";
         assert_eq!(derive_title(msg), "--- this is not a marker");
+    }
+
+    #[test]
+    fn sanitize_title_strips_a_marker_the_model_echoed_back() {
+        // Defense-in-depth (release-fixes-2): the primary fix is that
+        // `summarizer_title` now strips markers from the model's *input*
+        // (see its own doc comment), so this only needs to cover a model
+        // that still echoes the exact marker line back verbatim as its
+        // whole answer (the reported bug: a title of literally "--- Pasted
+        // text --- 130 words."). A title response has no realistic reason
+        // to carry the `\n\n`-separated block structure `derive_title`'s
+        // fallback strips real message content against, so this is
+        // deliberately narrower than that path.
+        assert_eq!(sanitize_title("--- Pasted text — 130 words ---"), "");
     }
 }
 
