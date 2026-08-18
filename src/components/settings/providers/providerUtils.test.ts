@@ -13,7 +13,6 @@ describe('usesModelPicker', () => {
     expect(usesModelPicker('anthropic')).toBe(true);
     expect(usesModelPicker('openai')).toBe(true);
     expect(usesModelPicker('fireworks')).toBe(true);
-    expect(usesModelPicker('qwen_cloud')).toBe(true);
     expect(usesModelPicker('deepinfra')).toBe(true);
   });
 });

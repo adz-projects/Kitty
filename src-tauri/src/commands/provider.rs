@@ -395,7 +395,7 @@ async fn discover_models_internal(
                 &catalog_entries,
             ))
         }
-        "openai" | "fireworks" | "qwen_cloud" | "deepinfra" => {
+        "openai" | "fireworks" | "deepinfra" => {
             let client = crate::util::http_client();
             let url = format!("{}/models", base_url.trim_end_matches('/'));
             let resp = client

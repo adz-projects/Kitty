@@ -5,9 +5,10 @@ import type { ProviderType } from './types';
     source of truth. */
 export const DEFAULT_URL: Record<ProviderType, string> = {
   // The in-process engine has no URL — ProviderForm still shows the field for
-  // it (only anthropic/openai hide it, since those are fixed well-known
-  // endpoints), so this stays an empty, editable default rather than a value
-  // that would look meaningful.
+  // it (only local/ollama/custom_openai do; every model-picker-flow type
+  // hides it — see `usesModelPicker` — since those are fixed, well-known
+  // endpoints the user never needs to see), so this stays an empty,
+  // editable default rather than a value that would look meaningful.
   local: '',
   ollama: 'http://localhost:11434',
   openrouter: 'https://openrouter.ai/api/v1',
@@ -15,9 +16,6 @@ export const DEFAULT_URL: Record<ProviderType, string> = {
   openai: 'https://api.openai.com/v1',
   fireworks: 'https://api.fireworks.ai/inference/v1',
   deepinfra: 'https://api.deepinfra.com/v1/openai',
-  // Alibaba DashScope's international OpenAI-compatible endpoint (not the
-  // mainland-China host, which needs a different account/key entirely).
-  qwen_cloud: 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1',
   custom_openai: '',
 };
 

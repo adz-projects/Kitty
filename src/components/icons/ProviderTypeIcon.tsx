@@ -73,18 +73,6 @@ export function ProviderTypeIcon({ type }: { type: ProviderType }) {
           />
         </svg>
       );
-    case 'qwen_cloud':
-      // Cloud outline — a hosted, cloud-run endpoint.
-      return (
-        <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-          <path
-            d="M5 11.5a3 3 0 0 1-.5-5.96 3.5 3.5 0 0 1 6.7-1.2A3 3 0 0 1 11.5 11.5H5Z"
-            stroke="currentColor"
-            strokeWidth="1.2"
-            strokeLinejoin="round"
-          />
-        </svg>
-      );
     case 'deepinfra':
       // Stacked layers — infrastructure the vendor runs underneath the API.
       return (
@@ -125,7 +113,6 @@ const TYPE_LABEL: Record<ProviderType, string> = {
   openai: 'OpenAI',
   openrouter: 'OpenRouter',
   fireworks: 'Fireworks',
-  qwen_cloud: 'QwenCloud',
   deepinfra: 'DeepInfra',
   custom_openai: 'Custom (OpenAI-compatible)',
   ollama: 'Ollama (self-hosted)',

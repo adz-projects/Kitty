@@ -125,7 +125,6 @@ export function ProviderForm({
           <option value="anthropic">Anthropic</option>
           <option value="openai">OpenAI</option>
           <option value="fireworks">Fireworks</option>
-          <option value="qwen_cloud">QwenCloud</option>
           <option value="deepinfra">DeepInfra</option>
           <option value="custom_openai">Custom (OpenAI-compatible)</option>
           {/* Not offered for new providers — Kitty no longer runs Ollama
@@ -138,7 +137,12 @@ export function ProviderForm({
           )}
         </select>
       </label>
-      {profile.provider_type !== 'anthropic' && profile.provider_type !== 'openai' && (
+      {/* Hidden for every model-picker-flow type (release-fixes-2: "no need
+          to show the base URLs for OpenRouter or any of the new
+          providers") — they're all fixed, well-known endpoints the user
+          never needs to see or edit. Still shown for local/ollama/
+          custom_openai, which genuinely need an editable endpoint. */}
+      {!showModelPicker && (
         <label className="field">
           <span>Base URL</span>
           <input value={profile.base_url} onChange={(e) => set({ base_url: e.target.value })} />

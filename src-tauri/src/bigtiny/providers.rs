@@ -352,10 +352,9 @@ mod tests {
         assert_eq!(url, "http://api.anthropic.com");
     }
 
-    // Fireworks/QwenCloud/DeepInfra (provider-add redesign) — none of these
-    // need their own match arm here, since the else-branch already covers
-    // anything that isn't "anthropic"; these just pin that down as a
-    // regression guard.
+    // Fireworks/DeepInfra (provider-add redesign) — neither needs its own
+    // match arm here, since the else-branch already covers anything that
+    // isn't "anthropic"; these just pin that down as a regression guard.
     #[test]
     fn fireworks_maps_to_openai_compat() {
         let (t, url) = bigtiny_provider_target(&profile(
@@ -364,16 +363,6 @@ mod tests {
         ));
         assert_eq!(t, "openai_compat");
         assert_eq!(url, "https://api.fireworks.ai/inference");
-    }
-
-    #[test]
-    fn qwen_cloud_maps_to_openai_compat() {
-        let (t, url) = bigtiny_provider_target(&profile(
-            "qwen_cloud",
-            "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
-        ));
-        assert_eq!(t, "openai_compat");
-        assert_eq!(url, "https://dashscope-intl.aliyuncs.com/compatible-mode");
     }
 
     #[test]

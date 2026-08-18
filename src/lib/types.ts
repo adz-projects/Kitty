@@ -122,7 +122,6 @@ export type ProviderType =
   | 'anthropic'
   | 'openai'
   | 'fireworks'
-  | 'qwen_cloud'
   | 'deepinfra'
   | 'custom_openai';
 

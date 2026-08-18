@@ -15,7 +15,6 @@ const TYPE_LABEL: Record<ProviderType, string> = {
   // first-run options) — these labels exist only so this Record<ProviderType,
   // …> stays exhaustive now that Settings → Providers offers more types.
   fireworks: 'Fireworks',
-  qwen_cloud: 'QwenCloud',
   deepinfra: 'DeepInfra',
 };
 

@@ -225,7 +225,7 @@ pub fn save_disk_cache(catalog: &OpenRouterCatalog) -> Result<(), String> {
 /// - keep only the segment after the last `/` (Fireworks'
 ///   `accounts/fireworks/models/qwen3-235b-a22b-instruct`, DeepInfra's
 ///   `Qwen/Qwen3-235B-A22B` both collapse to their bare model name; a no-op
-///   for QwenCloud's already-flat `qwen-max`)
+///   for an id that's already flat, e.g. `qwen-max`)
 /// - lowercase
 /// - strip a trailing `-YYYYMMDD`/`-YYYYMM`-shaped date suffix (Anthropic's
 ///   dated snapshot ids, e.g. `claude-sonnet-5-20260101`)
@@ -390,7 +390,7 @@ mod tests {
     }
 
     #[test]
-    fn normalize_leaves_flat_qwen_cloud_id_unchanged() {
+    fn normalize_leaves_an_already_flat_id_unchanged() {
         assert_eq!(normalize_model_id("qwen-max"), "qwen-max");
     }
 
