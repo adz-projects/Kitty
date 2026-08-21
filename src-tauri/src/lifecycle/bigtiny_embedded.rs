@@ -43,10 +43,26 @@ pub async fn start(
     tokenizer_path: &str,
 ) -> Result<DaemonHandle, String> {
     let secret = crate::lifecycle::bigtiny_proc::generate_secret();
-    let encryption_key = tokio::task::spawn_blocking(
-        crate::config::providers::get_or_create_bigtiny_encryption_key,
+    // Bounded, because this is a JNI round trip into AndroidKeyStore
+    // (`gen/android/.../SecretStore.kt`, via `src/android/secrets.rs`) and a
+    // keystore that never answers would otherwise hang the whole startup
+    // sequence with no upper bound. That is not hypothetical: hardware-backed
+    // keystores can block on first use while the TEE initializes, and app
+    // startup is exactly when that happens. Ten seconds is far longer than a
+    // working keystore takes and far shorter than a user's patience.
+    const KEYSTORE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    let encryption_key = tokio::time::timeout(
+        KEYSTORE_TIMEOUT,
+        tokio::task::spawn_blocking(crate::config::providers::get_or_create_bigtiny_encryption_key),
     )
     .await
+    .map_err(|_| {
+        format!(
+            "the Android keystore did not answer within {}s; \
+             provider keys cannot be decrypted without it",
+            KEYSTORE_TIMEOUT.as_secs()
+        )
+    })?
     .map_err(|e| format!("encryption key task panicked: {e}"))??;
 
     // Same variables the desktop host passes as child-process env. Here they

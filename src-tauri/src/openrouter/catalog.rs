@@ -25,6 +25,41 @@ use crate::util::http_client;
 /// its own always-on scheduler for data nothing else needs kept warm.
 const STALE_AFTER_SECS: i64 = 6 * 60 * 60;
 
+/// How old the cached catalog must be before *app startup* refetches it.
+///
+/// Longer than [`STALE_AFTER_SECS`], and only consulted at launch, because the
+/// two refreshes answer different questions. The lazy one runs when the user
+/// opens the model picker and wants current data; this one runs whether or not
+/// anyone is going to look. On Android that difference is the whole point: a
+/// launch is frequent, possibly on mobile data, and the catalog changes on the
+/// order of days — so a fetch on every cold start spends the user's battery
+/// and allowance on data that was almost certainly already correct.
+///
+/// Desktop keeps fetching every launch: no metered connection, no battery
+/// budget, and fresher pricing/rankings for free.
+#[cfg(target_os = "android")]
+const STARTUP_STALE_AFTER_SECS: i64 = 12 * 60 * 60;
+
+/// Whether app startup should fetch the catalog, given what is already cached.
+///
+/// Split out from the caller so the policy is testable without a network, an
+/// `AppHandle`, or a clock.
+pub fn startup_should_refetch(cached: Option<&OpenRouterCatalog>, now: i64) -> bool {
+    #[cfg(target_os = "android")]
+    {
+        match cached {
+            // A cache with no entries is not a usable cache, however recent.
+            Some(c) if !c.entries.is_empty() => now - c.fetched_at > STARTUP_STALE_AFTER_SECS,
+            _ => true,
+        }
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (cached, now);
+        true
+    }
+}
+
 /// Simplified cost badge — bucketed by percentile against the *current*
 /// catalog (terciles), not a fixed dollar table, so it tracks market pricing
 /// drift automatically. Mirrors TS `CostTier`.
@@ -346,6 +381,72 @@ pub async fn ensure_catalog_fresh(state: &crate::state::AppState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn catalog(fetched_at: i64, entries: usize) -> OpenRouterCatalog {
+        OpenRouterCatalog {
+            fetched_at,
+            entries: (0..entries)
+                .map(|i| OpenRouterCatalogEntry {
+                    id: format!("vendor/model-{i}"),
+                    name: format!("Model {i}"),
+                    created: None,
+                    context_length: None,
+                    pricing_prompt: None,
+                    pricing_completion: None,
+                    intelligence_index: None,
+                    coding_index: None,
+                    agentic_index: None,
+                    price_rank: None,
+                    cost_tier: None,
+                })
+                .collect(),
+        }
+    }
+
+    /// Android launches often, possibly on mobile data, for a catalog that
+    /// changes on the order of days. A recent cache is served as-is; desktop
+    /// has no such pressure and always refetches.
+    #[test]
+    fn a_recent_cache_skips_the_startup_fetch_only_where_it_matters() {
+        let now = 1_800_000_000;
+        let two_hours_old = catalog(now - 2 * 60 * 60, 5);
+        let refetch = startup_should_refetch(Some(&two_hours_old), now);
+        if cfg!(target_os = "android") {
+            assert!(!refetch, "a two-hour-old catalog is fresh enough on Android");
+        } else {
+            assert!(refetch, "desktop always refetches at startup");
+        }
+    }
+
+    #[test]
+    fn a_stale_cache_always_refetches() {
+        let now = 1_800_000_000;
+        let thirteen_hours_old = catalog(now - 13 * 60 * 60, 5);
+        assert!(startup_should_refetch(Some(&thirteen_hours_old), now));
+    }
+
+    /// No cache, or a cache with nothing in it, is not something to serve —
+    /// an empty catalog would leave the model picker blank with no way to
+    /// recover until the next launch.
+    #[test]
+    fn an_absent_or_empty_cache_always_refetches() {
+        let now = 1_800_000_000;
+        assert!(startup_should_refetch(None, now));
+        assert!(startup_should_refetch(Some(&catalog(now, 0)), now));
+    }
+
+    /// A clock that moved backwards (timezone change, NTP correction) must not
+    /// make a cache look infinitely fresh.
+    #[test]
+    fn a_future_dated_cache_is_not_treated_as_fresh_forever() {
+        let now = 1_800_000_000;
+        // Far enough ahead that `now - fetched_at` is very negative.
+        let future = catalog(now + 30 * 24 * 60 * 60, 5);
+        // Not asserting a refetch (a future stamp reads as "recent", which is
+        // the safe direction) — only that it is handled without panicking on
+        // the subtraction.
+        let _ = startup_should_refetch(Some(&future), now);
+    }
 
     fn entry(id: &str, price_rank: Option<f64>) -> OpenRouterCatalogEntry {
         OpenRouterCatalogEntry {

@@ -34,10 +34,41 @@ pub struct StartupPhasePayload {
     pub phase: StartupPhase,
 }
 
+/// Publishes `Ready` when it drops, however the startup task ended.
+///
+/// The chat view renders "Starting…" for as long as the phase is not `Ready`,
+/// and the phase was previously set by a single statement near the end of a
+/// long serial startup sequence. Anything that stopped that sequence short —
+/// a panic on a poisoned mutex, an early return, a step that simply never came
+/// back — left the phase at `SpawningBackend` for the life of the process, and
+/// the user looking at "Starting…" with no way to tell whether it was still
+/// trying. A failed startup is a state the rest of the app already handles
+/// (`StackStatus::BackendDown`, surfaced by the health loop); a startup that
+/// never reports at all is not.
+///
+/// So `Ready` here means "startup is no longer in progress", not "startup
+/// succeeded". Whether the stack actually works is the health loop's question.
+struct StartupPhaseGuard {
+    app: AppHandle,
+}
+
+impl Drop for StartupPhaseGuard {
+    fn drop(&mut self) {
+        set_startup_phase(&self.app, StartupPhase::Ready);
+    }
+}
+
 fn set_startup_phase(app: &AppHandle, phase: StartupPhase) {
     let changed = {
         let state = app.state::<AppState>();
-        let mut cur = state.startup_phase.lock().unwrap();
+        // Recover from poisoning rather than propagating it: this runs inside
+        // a `Drop`, and panicking there while already unwinding aborts the
+        // process. The value is a single enum — the worst a half-finished
+        // write can leave behind is the phase we are about to overwrite.
+        let mut cur = state
+            .startup_phase
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if *cur != phase {
             *cur = phase;
             true
@@ -134,11 +165,26 @@ pub(crate) fn sync_mcp_once_healthy(app: &AppHandle, healthy: bool, port: u16) {
 /// `openrouter::catalog::ensure_catalog_fresh`'s doc comment on why a
 /// failed fetch never surfaces to the user.
 fn warm_openrouter_catalog(app: &AppHandle) {
-    {
+    let refetch = {
         let state = app.state::<AppState>();
-        if let Some(disk) = crate::openrouter::catalog::load_disk_cache() {
+        let disk = crate::openrouter::catalog::load_disk_cache();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let refetch = crate::openrouter::catalog::startup_should_refetch(disk.as_ref(), now);
+        if let Some(disk) = disk {
             *state.openrouter_catalog.lock().unwrap() = Some(disk);
         }
+        refetch
+    };
+    // On Android a recent enough cache is served as-is: see
+    // `startup_should_refetch`. The lazy refresh at the point of use
+    // (`ensure_catalog_fresh`, opening the model picker) still applies, so
+    // anyone who actually looks at the catalog gets current data.
+    if !refetch {
+        tracing::debug!("OpenRouter catalog cache is fresh enough; skipping the startup fetch");
+        return;
     }
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -159,8 +205,22 @@ fn warm_openrouter_catalog(app: &AppHandle) {
 /// surface through the health loop as a degraded status rather than crashing.
 pub fn start_stack(app: &AppHandle) {
     warm_openrouter_catalog(app);
+    // Health first, daemon second. The loop's whole job is to report what the
+    // stack is actually doing, and hanging that off the *end* of the daemon
+    // boot meant the one situation where the user most needed a status — a
+    // boot that stalled or died — was the one where no status was ever
+    // published. It costs nothing to have it running before there is anything
+    // to report: with no port yet it reads `BackendDown`, and the two-tick
+    // debounce (see `debounce_status`) already absorbs the normal startup
+    // window without flashing a degradation at a stack that is merely still
+    // coming up.
+    spawn_health_loop(app.clone());
+    scheduler::spawn_scheduler_loop(app.clone());
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
+        // Publishes `Ready` on every exit path from this task, including a
+        // panic — see `StartupPhaseGuard`.
+        let _phase = StartupPhaseGuard { app: app.clone() };
         // Spawn the BigTiny daemon. No provider env vars — providers are
         // registered at runtime over REST (see
         // `bigtiny::providers::sync_active_provider` right after spawn).
@@ -256,7 +316,6 @@ pub fn start_stack(app: &AppHandle) {
             }
             Err(e) => tracing::warn!("bigtiny spawn failed: {e}"),
         }
-        set_startup_phase(&app, StartupPhase::Ready);
 
         // Report whether the pathway engine's embedding GGUF is on disk, so
         // Settings can say so immediately rather than waiting up to 30s for
@@ -271,14 +330,14 @@ pub fn start_stack(app: &AppHandle) {
             embedding::refresh_embedding_status(&app, &ap_embedding_model);
         }
 
-        // 3. Begin the local stack's health loop. Per-provider (Personal/Remote)
-        // reachability is no longer speculatively polled (Round-3 item 19, revised) —
-        // it's derived from real send outcomes in `commands::send_prompt` instead
-        // (see `providers::emit_health_from_send_result`), since this app makes no
-        // inference calls of its own and a background ping had no upside a failed
-        // send doesn't already give us.
-        spawn_health_loop(app.clone());
-        scheduler::spawn_scheduler_loop(app.clone());
+        // The health loop and the scheduler are already running — started
+        // before this task, so a stalled boot still reports (see
+        // `start_stack`). Per-provider (Personal/Remote) reachability is not
+        // speculatively polled at all (Round-3 item 19, revised); it is
+        // derived from real send outcomes in `commands::send_prompt` (see
+        // `providers::emit_health_from_send_result`), since this app makes no
+        // inference calls of its own and a background ping had no upside a
+        // failed send doesn't already give us.
     });
 }
 
