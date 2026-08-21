@@ -35,6 +35,17 @@ use crate::capture::CaptureStream;
 pub const EPOCH_TICK_MS: u64 = 50;
 
 /// Default ceiling on guest linear memory.
+///
+/// Lower on Android, and not by a little. 512 MB is a reasonable desktop
+/// ceiling; on a phone it is larger than what many devices will let a single
+/// app hold at all, so a guest allowed to grow that far gets *Kitty* killed by
+/// the OS rather than being stopped by this limit. A guest that exceeds the
+/// ceiling traps cleanly and the tool reports it — infinitely better than the
+/// whole app disappearing — so the right number here is one the platform will
+/// actually honour.
+#[cfg(target_os = "android")]
+pub const DEFAULT_MEMORY_LIMIT_BYTES: usize = 128 * 1024 * 1024;
+#[cfg(not(target_os = "android"))]
 pub const DEFAULT_MEMORY_LIMIT_BYTES: usize = 512 * 1024 * 1024;
 
 /// Default wall-clock budget for one run.
@@ -322,23 +333,19 @@ fn classify_trap(err: &anyhow::Error) -> Outcome {
 /// key — so an upgrade degrades to "slow once" with no stale files left
 /// behind, and there is no version constant that can drift out of sync.
 pub fn load_module_cached(path: &Path, cache_dir: &Path) -> Result<Module> {
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("failed to read wasm module at {}", path.display()))?;
-    let digest = crate::guest::sha256_hex(&bytes);
-    let cached = cache_dir.join(format!("{}.cwasm", &digest[..16]));
+    let key = cache_key(path)
+        .with_context(|| format!("failed to stat wasm module at {}", path.display()))?;
+    let cached = cache_dir.join(format!("{key}.cwasm"));
 
     if cached.exists() {
-        // SAFETY: the file was produced by `Module::serialize` below, in this
-        // same cache directory, and `deserialize` validates the embedded
-        // version/config fingerprint before trusting the contents. A
-        // corrupted or foreign file fails here and falls through to a fresh
-        // compile rather than being executed.
-        if let Ok(module) = unsafe { Module::deserialize_file(engine(), &cached) } {
+        if let Some(module) = load_cached_entry(&cached) {
             return Ok(module);
         }
         let _ = std::fs::remove_file(&cached);
     }
 
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("failed to read wasm module at {}", path.display()))?;
     let module = Module::new(engine(), &bytes)
         .with_context(|| format!("failed to compile wasm module at {}", path.display()))?;
 
@@ -368,6 +375,58 @@ pub fn load_module_cached(path: &Path, cache_dir: &Path) -> Result<Module> {
 /// Per-process sequence for compile-cache tmp names — see
 /// `load_module_cached`.
 static TMP_NAME_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The cache key for a module file: path, length and mtime, hashed.
+///
+/// Deliberately *not* the file's content digest, which is what this used to
+/// be. Hashing the content meant reading and SHA-256ing the whole 26 MB
+/// CPython guest on **every** call — before even looking at the cache — so the
+/// cache saved the 20s compile but still paid a full read and hash per tool
+/// call. On a phone that is the difference between a warm call being free and
+/// it being the most expensive thing the model does.
+///
+/// The tradeoff is a mtime-granularity staleness window, which is the same
+/// tradeoff every build system makes and is safe here for a second reason:
+/// wasmtime's `deserialize` validates its own version/config fingerprint, so
+/// the worst a mismatched entry can do is fail to load and be rebuilt.
+fn cache_key(path: &Path) -> std::io::Result<String> {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let meta = std::fs::metadata(path)?;
+    let mut hasher = DefaultHasher::new();
+    path.hash(&mut hasher);
+    meta.len().hash(&mut hasher);
+    if let Ok(modified) = meta.modified() {
+        if let Ok(since_epoch) = modified.duration_since(std::time::UNIX_EPOCH) {
+            since_epoch.as_nanos().hash(&mut hasher);
+        }
+    }
+    Ok(format!("{:016x}", hasher.finish()))
+}
+
+/// Loads a previously-serialized module, or `None` if the entry is unusable.
+///
+/// **Reads the file into memory rather than mapping it**, which matters on
+/// Android and nowhere else. `Module::deserialize_file` mmaps the `.cwasm`
+/// and then `mprotect`s that mapping `PROT_EXEC`; Android's SELinux policy
+/// denies `file { execute }` on `app_data_file`, so mapping a file out of
+/// app-writable storage as executable is refused — the W^X rule that also
+/// forbids `exec()`ing a bundled binary, which is why this crate is hosted
+/// in-process there at all. `deserialize` from a byte slice lands in an
+/// anonymous mapping instead, which needs only `process { execmem }`, and app
+/// processes have that (ART's own JIT depends on it).
+///
+/// The cost is one extra copy of the serialized module, which is far cheaper
+/// than the alternative: a cache that silently never loads, making every tool
+/// call pay a full compile.
+fn load_cached_entry(cached: &Path) -> Option<Module> {
+    let bytes = std::fs::read(cached).ok()?;
+    // SAFETY: the file was produced by `Module::serialize` in this same cache
+    // directory, and `deserialize` validates the embedded version/config
+    // fingerprint before trusting the contents. A corrupted or foreign file
+    // fails here and the caller falls through to a fresh compile rather than
+    // executing it.
+    unsafe { Module::deserialize(engine(), &bytes) }.ok()
+}
 
 #[cfg(test)]
 mod tests {
@@ -637,5 +696,66 @@ mod tests {
 
         let module = load_module_cached(&wasm_path, &cache).expect("must recover, not error");
         assert!(run(&module, RunRequest::default()).outcome.is_success());
+    }
+
+    /// The cache key stopped being a content digest (it cost a full read and
+    /// hash of the 26 MB guest on every call, cache hit or not). It still has
+    /// to notice when the source module actually changes, or a stale artifact
+    /// would be run in place of the edited file.
+    #[test]
+    fn editing_the_source_module_invalidates_its_cache_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let wasm_path = dir.path().join("m.wat");
+        std::fs::write(&wasm_path, HELLO).unwrap();
+        let cache = dir.path().join("cache");
+
+        let before = cache_key(&wasm_path).unwrap();
+        let first = load_module_cached(&wasm_path, &cache).unwrap();
+        assert_eq!(
+            run(&first, RunRequest::default()).stdout.contents(),
+            "hello from wasm\n"
+        );
+
+        // A different module, and a different length, so the key must move
+        // even on a filesystem with coarse mtime resolution.
+        std::fs::write(
+            &wasm_path,
+            r#"
+            (module
+              (import "wasi_snapshot_preview1" "fd_write"
+                (func $fd_write (param i32 i32 i32 i32) (result i32)))
+              (memory (export "memory") 1)
+              (data (i32.const 100) "a different guest entirely\n")
+              (func (export "_start")
+                (i32.store (i32.const 8) (i32.const 100))
+                (i32.store (i32.const 12) (i32.const 27))
+                (drop (call $fd_write (i32.const 1) (i32.const 8) (i32.const 1) (i32.const 20)))))
+            "#,
+        )
+        .unwrap();
+
+        assert_ne!(
+            cache_key(&wasm_path).unwrap(),
+            before,
+            "an edited source must not keep its old cache key"
+        );
+        let second = load_module_cached(&wasm_path, &cache).unwrap();
+        assert_eq!(
+            run(&second, RunRequest::default()).stdout.contents(),
+            "a different guest entirely\n",
+            "the edited module must run, not the stale cached one"
+        );
+    }
+
+    /// Two different files must not share a key even at identical size —
+    /// the path is part of it.
+    #[test]
+    fn different_module_paths_get_different_cache_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.wat");
+        let b = dir.path().join("b.wat");
+        std::fs::write(&a, HELLO).unwrap();
+        std::fs::write(&b, HELLO).unwrap();
+        assert_ne!(cache_key(&a).unwrap(), cache_key(&b).unwrap());
     }
 }

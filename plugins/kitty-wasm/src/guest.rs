@@ -161,6 +161,61 @@ pub fn verify_guest(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Per-process sequence for download temp names — see `download_tmp_name`.
+static TMP_NAME_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A temp filename for the in-flight download, unique per call.
+///
+/// Process id *and* a per-process counter — the same fix `sandbox.rs`'s
+/// compile cache took for audit #127. The pid alone is not unique when
+/// several servers share one process, which is exactly how this crate is
+/// hosted on Android, so two concurrent `install=true` calls would interleave
+/// their writes into a single temp file and then race each other's rename.
+fn download_tmp_name() -> String {
+    format!(
+        "{PYTHON_GUEST_FILENAME}.tmp{}-{}",
+        std::process::id(),
+        TMP_NAME_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
+}
+
+/// Hard ceiling on the download, a little above the pinned size so a
+/// legitimate transfer always fits.
+const DOWNLOAD_MAX_BYTES: u64 = PYTHON_GUEST_BYTES + 1024 * 1024;
+
+/// Reads the response body with a byte ceiling, checking `Content-Length`
+/// first and capping the streaming accumulation regardless.
+///
+/// The download used to be a bare `response.bytes()`. That has no bound at
+/// all: the checksum would eventually reject a wrong file, but only *after*
+/// buffering however much the server chose to send — and the whole point of
+/// this path is that it runs on a phone, where an endpoint that streams
+/// indefinitely takes the app down long before any verification happens. Same
+/// header-plus-streaming pattern `kitty-web`'s `read_body_capped` uses (audit
+/// #112); duplicated rather than shared for the same reason the rest of these
+/// crates duplicate.
+async fn read_body_capped(mut response: reqwest::Response, cap: u64) -> Result<Vec<u8>> {
+    if let Some(len) = response.content_length() {
+        if len > cap {
+            bail!("guest download is {len} bytes, over the {cap}-byte ceiling; refusing it");
+        }
+    }
+    let mut buf: Vec<u8> = Vec::with_capacity(PYTHON_GUEST_BYTES as usize);
+    // `chunk()` rather than `bytes_stream()`: one fewer feature to enable, and
+    // the cap check has to happen per-chunk either way.
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .context("failed to read the guest download body")?
+    {
+        if buf.len() as u64 + chunk.len() as u64 > cap {
+            bail!("guest download exceeded the {cap}-byte ceiling; refusing it");
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
 /// Returns the guest path, downloading it first if necessary and permitted.
 ///
 /// The download is verified before it is moved into place, so a truncated or
@@ -203,10 +258,7 @@ pub async fn ensure_python_guest(allow_download: bool) -> Result<PathBuf> {
     if !response.status().is_success() {
         bail!("guest download failed: HTTP {}", response.status());
     }
-    let bytes = response
-        .bytes()
-        .await
-        .context("failed to read the guest download body")?;
+    let bytes = read_body_capped(response, DOWNLOAD_MAX_BYTES).await?;
 
     let actual = sha256_hex(&bytes);
     if actual != PYTHON_GUEST_SHA256 {
@@ -217,7 +269,12 @@ pub async fn ensure_python_guest(allow_download: bool) -> Result<PathBuf> {
     }
 
     let final_path = dir.join(PYTHON_GUEST_FILENAME);
-    let tmp = dir.join(format!("{PYTHON_GUEST_FILENAME}.tmp{}", std::process::id()));
+    // Process id *and* a per-process counter (the same fix `sandbox.rs`'s
+    // compile cache took for audit #127): the pid alone is not unique when
+    // several servers share one process, which is how this crate is hosted on
+    // Android. Two concurrent `install=true` calls would otherwise interleave
+    // writes into a single temp file and race each other's rename.
+    let tmp = dir.join(download_tmp_name());
     std::fs::write(&tmp, &bytes).with_context(|| format!("failed to write {}", tmp.display()))?;
     std::fs::rename(&tmp, &final_path).with_context(|| {
         format!(
@@ -302,6 +359,33 @@ pub(crate) mod testing {
 mod tests {
     use super::testing::{block_on, env_lock, EnvGuard};
     use super::*;
+
+    /// Two concurrent installs in one process must not collide on one temp
+    /// file. The name used to be the pid alone, which is identical for every
+    /// in-process server — the hosting model Android uses.
+    #[test]
+    fn concurrent_downloads_do_not_share_a_temp_filename() {
+        let names: std::collections::HashSet<String> =
+            (0..64).map(|_| download_tmp_name()).collect();
+        assert_eq!(
+            names.len(),
+            64,
+            "every in-flight download needs its own file"
+        );
+
+        // Still recognisably the guest's temp file, and still not mistakable
+        // for the finished artifact `find_python_guest` looks for.
+        let one = download_tmp_name();
+        assert!(one.starts_with(PYTHON_GUEST_FILENAME));
+        assert_ne!(one, PYTHON_GUEST_FILENAME);
+    }
+
+    /// The ceiling has to leave room for the real file, or a correct download
+    /// is rejected before it can even be checksummed.
+    #[test]
+    fn the_download_ceiling_admits_the_pinned_guest() {
+        const { assert!(DOWNLOAD_MAX_BYTES > PYTHON_GUEST_BYTES) };
+    }
 
     #[test]
     fn sha256_matches_known_vectors() {
