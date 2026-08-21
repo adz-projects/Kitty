@@ -62,24 +62,29 @@
   --safe-left: 0px;
 }
 
-/* Windows-only: whole type ramp shifted -1px from the shared tokens above.
+/* Windows-only: whole type ramp shifted -3px from the shared tokens above.
    Android keeps the larger ramp (touch targets, one-row headers already
    budgeted for it) — this only affects desktop, gated on `data-platform`
    like the safe-area override below. Additive, same as the +2px sweep this
-   overrides, to preserve proportions between steps. */
+   overrides, to preserve proportions between steps.
+
+   Was -1px; taken down a further 2px on request. Note the bottom of the ramp
+   now lands at 9px, which is genuinely small — it is only used for incidental
+   meta labels (timestamps, token counts), but it is the step to raise first if
+   this reads as too tight. */
 :root[data-platform='desktop'] {
-  --fs-2xs: 0.6875rem; /* 11px */
-  --fs-xs: 0.75rem; /* 12px */
-  --fs-xs-plus: 0.78125rem; /* 12.5px */
-  --fs-sm: 0.8125rem; /* 13px */
-  --fs-sm-plus: 0.84375rem; /* 13.5px */
-  --fs-md: 0.875rem; /* 14px */
-  --fs-base: 0.9375rem; /* 15px */
-  --fs-lg: 1rem; /* 16px */
-  --fs-xl: 1.0625rem; /* 17px */
-  --fs-2xl: 1.1875rem; /* 19px */
-  --fs-3xl: 1.3125rem; /* 21px */
-  --fs-4xl: 1.4375rem; /* 23px */
+  --fs-2xs: 0.5625rem; /* 9px  */
+  --fs-xs: 0.625rem; /* 10px */
+  --fs-xs-plus: 0.65625rem; /* 10.5px */
+  --fs-sm: 0.6875rem; /* 11px */
+  --fs-sm-plus: 0.71875rem; /* 11.5px */
+  --fs-md: 0.75rem; /* 12px */
+  --fs-base: 0.8125rem; /* 13px */
+  --fs-lg: 0.875rem; /* 14px */
+  --fs-xl: 0.9375rem; /* 15px */
+  --fs-2xl: 1.0625rem; /* 17px */
+  --fs-3xl: 1.1875rem; /* 19px */
+  --fs-4xl: 1.3125rem; /* 21px */
 }
 
 /* `rem` is relative to this, so it is the single multiplication point for
@@ -1590,7 +1595,7 @@ button.primary {
 }
 /* Subfolder rows (release-fixes-2): listed above the file cards, muted
    slightly relative to them since there's nothing to preview/open
-   in-app — the folder icon plus the one "Open in Explorer" action already
+   in-app — the folder icon plus the one "Show in Folder" action already
    say everything the row can offer. */
 .artifacts-subfolders {
   border-bottom: 2px solid var(--border);
@@ -1909,6 +1914,31 @@ button.link {
     outline: 2px solid var(--accent);
   }
 }
+/* Square icon-only button — the shared shape for a row of glyph actions
+   (Settings → Providers today). Sized from the type ramp rather than a fixed
+   px so it tracks `--font-scale` and the platform ramps along with everything
+   around it. */
+.icon-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  flex: none;
+  color: var(--text-muted);
+}
+.icon-button:hover {
+  color: var(--text);
+}
+/* Deleting a provider is the one destructive action in the row; the hover
+   state is where it gets to say so, since the glyph alone reads the same as
+   its neighbours at 14px. */
+.provider-row-actions .icon-button:last-child:hover {
+  color: var(--danger);
+  border-color: var(--danger);
+}
+
 .provider-row-info {
   /* Lets the name/url text truncate with ellipsis instead of wrapping —
      a flex child's default min-width is `auto` (its content size), which
@@ -2345,11 +2375,52 @@ button.link {
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  /* Model/effort boxes were noticeably smaller than the neighboring "Show
-     artifacts"/"New chat" buttons (which inherit --fs-base) — match them. */
+
+  /* One shape for every control in this row.
+
+     They come from three different places — `.status-badge` (6px radius, 2px
+     padding, --fs-xs), `.effort-dropdown` (999px radius, 3px padding, --fs-xs)
+     and the bare `button` rule (calc(--radius)/2 radius, 6px padding,
+     inherited size) — so the row read as a jumble of mismatched heights and
+     corner shapes, and the tallest of them decided how much vertical space the
+     header took. Pinning one height and one radius here is what makes it a
+     single tidy row; the type step down to --fs-sm is what makes that height
+     fit the labels rather than the labels fighting the height.
+
+     Below the 44px touch guideline on purpose: this row is the whole header on
+     a phone, every control in it is a low-frequency action next to a full-width
+     scrollable conversation, and a taller row costs conversation. */
+  .main-header {
+    --hdr-control-h: 34px;
+  }
+  .main-header button,
   .main-header .provider-badge,
   .main-header .effort-dropdown {
-    font-size: var(--fs-base);
+    height: var(--hdr-control-h);
+    min-height: var(--hdr-control-h);
+    box-sizing: border-box;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    padding: 0 10px;
+    border-radius: calc(var(--radius) / 2);
+    font-size: var(--fs-sm);
+    line-height: 1;
+    /* A `<select>` (the effort dropdown) otherwise reserves room for its own
+       native chrome and comes out taller than everything else. */
+    appearance: none;
+  }
+  /* Icon-only buttons are square rather than pill-shaped, so the row reads as
+     "controls, then actions" instead of one undifferentiated run of boxes. */
+  .main-header button:has(> svg:only-child) {
+    width: var(--hdr-control-h);
+    padding: 0;
+  }
+  /* The mark is not a control and must not be stretched to match one; it just
+     needs to sit on the same centre line. */
+  .main-header h1.app-mark {
+    height: var(--hdr-control-h);
   }
 
   /* Artifacts stay reachable on a phone — files the model wrote are the

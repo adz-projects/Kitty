@@ -5,6 +5,8 @@ import type { OpenRouterCredits, ProviderProfile, ProviderView } from '@/lib/typ
 import { TrustIcon, trustKind } from '@/lib/provider_trust';
 import { ProviderTypeIcon, providerTypeLabel } from '@/components/icons/ProviderTypeIcon';
 import { StarIcon } from '@/components/icons/StarIcon';
+import { PencilIcon } from '@/components/icons/PencilIcon';
+import { TrashIcon } from '@/components/icons/TrashIcon';
 import { ProviderForm } from './providers/ProviderForm';
 import { blank, hostOf, isLocal } from './providers/providerUtils';
 
@@ -207,24 +209,45 @@ export function Providers({ highlight }: { highlight: string | null }) {
                 </div>
               )}
             </div>
-            <div className="row">
+            {/* Icon-only, matching the app's black-and-white icon set. The row
+                already carries a provider name, a type icon, a trust badge, a
+                URL and sometimes a credit balance; three more words of button
+                text was the thing pushing it wide. Each keeps its `title` (the
+                full explanation on hover) and an `aria-label`, so nothing is
+                lost for a screen reader or a first-time user. */}
+            <div className="row provider-row-actions">
               {!p.active && (
                 <button
+                  className="icon-button"
                   onClick={() => void onActivate(p)}
-                  title="Sets the default for brand-new chats — doesn't change any chat you already have open"
+                  title="Set as default — applies to brand-new chats, and doesn't change any chat you already have open"
+                  aria-label={`Set ${p.name} as the default for new chats`}
                 >
-                  Set as default
+                  {/* Outline here, filled on the row above once it *is* the
+                      default: the button and the marker are the same glyph at
+                      two states of the same idea. */}
+                  <StarIcon filled={false} />
                 </button>
               )}
               <button
+                className="icon-button"
                 onClick={() => {
                   setEditing({ ...p });
                   setSecret('');
                 }}
+                title="Edit"
+                aria-label={`Edit ${p.name}`}
               >
-                Edit
+                <PencilIcon />
               </button>
-              <button onClick={() => void onDelete(p)}>Delete</button>
+              <button
+                className="icon-button"
+                onClick={() => void onDelete(p)}
+                title="Delete"
+                aria-label={`Delete ${p.name}`}
+              >
+                <TrashIcon />
+              </button>
             </div>
           </div>
         ))}

@@ -107,7 +107,13 @@ function SubfolderRow({ folder }: { folder: FileEntry }) {
         <FolderIcon /> {folder.name}
       </div>
       <div className="artifact-actions">
-        <button onClick={() => void ipc.openPath(folder.path)}>Open in Explorer</button>
+        {/* `revealPath`, not `openPath`, so this button means the same thing
+            here as it does on a file card below: show the item where it
+            lives. Opening the folder outright under the same label would make
+            one word describe two different actions depending on what you
+            clicked — and the file explorer is one double-click away either
+            way. */}
+        <button onClick={() => void ipc.revealPath(folder.path)}>Show in Folder</button>
       </div>
     </div>
   );
@@ -130,7 +136,7 @@ function ArtifactCard({ artifact, android }: { artifact: Artifact; android: bool
       )}
       <div className="artifact-actions">
         {android ? (
-          // "Open"/"Show in folder"/"Copy path" are all meaningless against an
+          // "Open"/"Show in Folder"/"Copy path" are all meaningless against an
           // app-private path. Saving a copy out through the system file picker
           // is the only way a file the model wrote reaches the user's device.
           <button
@@ -146,7 +152,7 @@ function ArtifactCard({ artifact, android }: { artifact: Artifact; android: bool
         ) : (
           <>
             <button onClick={() => void ipc.openPath(artifact.path)}>Open</button>
-            <button onClick={() => void ipc.revealPath(artifact.path)}>Show in folder</button>
+            <button onClick={() => void ipc.revealPath(artifact.path)}>Show in Folder</button>
             <button
               onClick={() =>
                 void navigator.clipboard.writeText(artifact.path).catch(() => {
