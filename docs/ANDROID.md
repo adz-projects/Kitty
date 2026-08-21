@@ -156,6 +156,7 @@ work this plan has to invent — the plan only has to *cross-compile* and
 | `connect_in_process` | `src/mcp/client.rs` | Opens a `tokio::io::duplex` pipe, spawns the server future on one end, hands the other to `rmcp`'s client. `rmcp` is generic over `AsyncRead + AsyncWrite`, so a duplex stream is indistinguishable from a child's stdio. |
 | `mcp::builtin::connect` | `src/mcp/builtin.rs` | Maps logical name → `serve_in_process` on the linked crate. `BUILTIN_SERVERS` lists them; the test `every_advertised_builtin_actually_connects` asserts every advertised name has a live match arm. |
 | `serve_in_process` | each crate's `src/lib.rs` | `kitty-tools`, `kitty-web`, `kitty-wasm`, `adaptive-pathway` each expose a `[lib]` target wrapping the same server their `main.rs` serves over stdio. |
+| `KITTY_PLUGIN_HOME` | `src-tauri/src/lifecycle/bigtiny_env.rs` | **Android-only.** Where the three tool plugins put their caches, and what their path-containment checks treat as "inside home". Set to `config::config_dir()`. See §2.4a for why they cannot work it out themselves. |
 
 All four are already `{ path = ... }` dependencies of `bigtiny_rust`. `docs/PLUGINS.md`
 ("A third shape: in-process MCP server") is the canonical write-up.
@@ -198,18 +199,73 @@ nothing; the notes that matter:
   `#[cfg(not(target_os = "android"))]` in `plugins/kitty-tools/src/server.rs`,
   with the rationale in-place ("an app-sandbox shell backed by toybox isn't a
   useful `lean_shell` for a model to drive"). Nothing to do; don't re-add it.
-  **But `ALWAYS_ON_TOOLS` in the test is *not* gated**, so
-  `tool_surface_matches_env_gating` asserts a 22-tool surface unconditionally and
-  will fail the moment that suite is run for an Android target. Gate the
-  constant's `lean_shell` entry to match the server — a one-line fix, but a
-  confusing failure if it's hit cold.
-- **`lean_analyze_workspace` needs scoping.** It walks an arbitrary path, which
-  on Android's scoped storage only usefully covers the app's own sandbox or a
-  SAF-granted tree. Scope it to the app data dir on Android rather than letting
-  it silently return almost nothing for a path the model picked.
+  `ALWAYS_ON_TOOLS` in `tests/protocol.rs` carries the same `cfg`, so the
+  suite asserts the surface the server actually advertises on each target.
+- **`lean_analyze_workspace` is scoped — DONE.** It walks an arbitrary path,
+  which under scoped storage is unreadable or nearly empty, and a near-empty
+  listing reads to the model as "this directory is empty" rather than "you
+  cannot see this". `workspace.rs::scoped_root` redirects a root outside the
+  app's storage to `KITTY_PLUGIN_HOME` on Android; the response's `root` says
+  which directory was actually walked.
 - The file/Word/Excel/PDF/cache/scratchpad tools take explicit caller-supplied
   paths and work as-is once pointed at app-private storage — the same way they
   take an arbitrary Windows path today.
+
+### 2.4a Where the tool plugins write (D-plugin-paths) — **DONE**
+
+**Landed 2026-08-21.** The three plugins were written for the desktop hosting
+model — a stdio child with a real `$HOME` and a working `/tmp`. Hosted
+in-process on Android they have neither: the app process has no useful `$HOME`
+(bionic's `getpwuid` reports `/data`), no `/tmp` and no `TMPDIR`, and a working
+directory of `/`. Five directory helpers resolved somewhere unwritable, which
+is what broke PDF scraping and reading, the search offload store, the
+scratchpad, the whole cache tool family, and the `kitty-wasm` guest download
+this platform's design depends on.
+
+`KITTY_PLUGIN_HOME` (§2.3) is the answer: one variable, set once, from which
+each crate derives its own directories.
+
+```
+paths::home_dir()  ->  KITTY_PLUGIN_HOME, else USERPROFILE, else HOME, else dirs::home_dir
+cache_dir()        ->  <home>/.cache/lean-goose-mcp        (kitty-tools, kitty-web)
+search_store_dir() ->  <home>/.cache/kitty-search-offload
+guest::data_dir()  ->  KITTY_WASM_DATA_DIR, else <home>/.kitty-wasm
+guest::run_dir()   ->  <data dir>/run                      (replaces std::env::temp_dir)
+```
+
+Three things about it are load-bearing:
+
+- **It is set in `daemon_env`, not `bigtiny::mcp::server_env`.** The latter
+  calls `set_var` from `sync_mcp_once_healthy`, i.e. after the daemon's tasks
+  are already running, which is not sound against a concurrent reader.
+  `bigtiny_embedded::start` applies `daemon_env` before the daemon exists.
+  Don't add new variables to `server_env`.
+- **It is unset on desktop.** `~/.cache/lean-goose-mcp` is shared with users'
+  existing cached data and with the retired Python tools; overriding it there
+  would orphan it.
+- **There is no working-directory fallback any more, on any platform.** There
+  used to be, and it silently inverted the containment boundary: with home
+  resolved as `/`, `path_within_home` admitted every path on the device — so
+  `kitty-wasm`'s `workspace` could have mounted anything read-write into the
+  guest, the hole audit #111 closed. A boundary that cannot be located now
+  rejects, and `home_dir()` returns `Option` so that is unmissable at each
+  call site.
+
+`kitty-wasm` needed three more things to be viable here, recorded because they
+are not obvious from the code: the compile cache loads via `Module::deserialize`
+from bytes rather than `deserialize_file`, because the latter mmaps the
+`.cwasm` and `mprotect`s it `PROT_EXEC` and Android's SELinux policy denies
+`file { execute }` on `app_data_file` (anonymous mappings only need
+`process { execmem }`, which app processes have); the guest linear-memory
+ceiling drops from 512 MB to 128 MB, because a guest allowed to grow past what
+the device will give one app gets *Kitty* OOM-killed rather than trapping
+cleanly; and the guest download is `Content-Length`-checked and capped rather
+than buffered whole.
+
+**Still unverified on hardware:** whether wasmtime's JIT works at all on the
+target API levels. If it does not, the fallback is to gate `kitty-wasm` off on
+Android rather than leave the model tools that cannot work — record that here
+as a tombstone if it comes to it.
 
 This is graceful degradation, not a blocker, and it is **not** a reason to
 reintroduce a Python runtime: `kitty-docs-web` is retired, and its PDF/Excel/web

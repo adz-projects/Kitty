@@ -59,3 +59,9 @@ open an item here instead.
   extract-to-app-storage-on-first-run step, since wasmtime needs a real path.
   Fix is that extraction step plus pointing the env var at it; until then the
   behaviour is a first-use download, which is graceful but not offline.
+
+  **Update 2026-08-21:** that download now actually works. It could not before
+  — `guest::data_dir()` resolved to an unwritable path on Android, so every
+  write failed (see docs/ANDROID.md §2.4a). This item stays open: the download
+  path being functional is not the same as being offline, and bundling still
+  needs the extract-to-app-storage step described above.
