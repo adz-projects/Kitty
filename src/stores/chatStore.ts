@@ -2437,6 +2437,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         lastSentModel = null;
         const usage = e.result.usage;
         const ttftMs = e.result.timing?.ttftMs;
+        const tokensPerSecond = e.result.timing?.tokensPerSecond;
         // Read before the set() below clears it — see `pendingForcedAnswer`'s
         // doc comment: there's no ACP way to redirect a generation already in
         // flight to its final answer, so a reasoning-cap cancel instead waits
@@ -2456,6 +2457,7 @@ export const useChatStore = create<ChatState>((set, get) => {
               cacheReadTokens: usage?.cacheReadTokens,
               cacheCreationTokens: usage?.cacheCreationTokens,
               ttftMs,
+              tokensPerSecond,
               providerName,
               model,
             };

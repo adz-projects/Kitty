@@ -326,6 +326,39 @@ fn exceeds_content_ceiling(content_chars: usize) -> bool {
     content_chars > MAX_TURN_CONTENT_CHARS
 }
 
+/// Everything the model actually generated for one call, thinking included.
+///
+/// Endpoints disagree about `reasoning_tokens`, and the disagreement is not
+/// detectable from the field alone. OpenAI's spec counts them *inside*
+/// `completion_tokens` and reports the breakdown for information; plenty of
+/// OpenAI-compatible servers instead report `completion_tokens` as the visible
+/// completion only, with thinking accounted separately. Summing blindly double
+/// counts on the first kind; ignoring them undercounts badly on the second —
+/// which is what made a reasoning model's measured tokens/sec come out around a
+/// third of what the server itself reported.
+///
+/// The one thing that *is* decidable: reasoning tokens cannot exceed a total
+/// they are part of. So `reasoning >= output` proves they are being reported
+/// outside it, and only then are they added. A server that excludes them but
+/// happens to think less than it says is still undercounted; that is a narrower
+/// wrong answer than either blanket rule, and it never over-reports.
+fn output_tokens_including_reasoning(usage: &Value) -> Option<i32> {
+    // Saturating casts, not `as i32` (which wraps an absurd reported value
+    // negative) — same pattern as `record_usage`.
+    let clamp = |v: i64| i32::try_from(v).unwrap_or(i32::MAX);
+    let output = clamp(usage.get("output_tokens").and_then(|v| v.as_i64())?);
+    let reasoning = usage
+        .get("reasoning_tokens")
+        .and_then(|v| v.as_i64())
+        .map(clamp)
+        .unwrap_or(0);
+    if reasoning >= output {
+        Some(output.saturating_add(reasoning))
+    } else {
+        Some(output)
+    }
+}
+
 const BUDGET_TOOL: &str = "request_more_steps";
 const BUDGET_SYSTEM_MESSAGE: &str =
     "[System: You have executed 20 steps. Summarize your progress, explain what \
@@ -1369,6 +1402,7 @@ impl AgentLoop {
                 ttfb_ms: Some(timing.ttfb_ms),
                 ttft_ms: Some(timing.ttft_ms),
                 generation_ms: Some(timing.generation_ms),
+                tokens_per_second: timing.tokens_per_second,
                 provider_id: Some(provider_id.clone()),
                 model: Some(provider_model.clone()),
                 total_tokens: Some(timing.total_tokens as i64),
@@ -1815,6 +1849,12 @@ impl AgentLoop {
                     // case `MAX_TURN_CONTENT_CHARS` exists to catch, and
                     // hosted providers get no max_tokens floor.
                     content_chars += reasoning.chars().count();
+                    // ...and toward the same delta count. This is only the
+                    // fallback for a provider that reports no usage at all,
+                    // but leaving thinking out of it meant a reasoning model
+                    // on such a provider had most of its generated output
+                    // missing from the measured rate.
+                    token_count += 1;
                     let _ = event_tx.send(SSEEvent {
                         event_type: SSEEventType::ReasoningDelta,
                         content: Some(reasoning.clone()),
@@ -1860,20 +1900,17 @@ impl AgentLoop {
 
         timing.generation_ms = start.elapsed().as_secs_f64() * 1000.0;
         // Prefer the provider's own reported output-token count — `token_count`
-        // is actually a count of non-empty SSE content deltas, not tokens (a
-        // single delta can be a sub-token fragment or bundle several tokens
-        // depending on the provider's streaming granularity), and was
-        // misleadingly reported as `total_tokens` in LlmTiming/the timings
-        // table. Only fall back to the delta count when the provider genuinely
-        // didn't report usage.
+        // is actually a count of non-empty SSE deltas, not tokens (a single
+        // delta can be a sub-token fragment or bundle several tokens depending
+        // on the provider's streaming granularity), and was misleadingly
+        // reported as `total_tokens` in LlmTiming/the timings table. Only fall
+        // back to the delta count when the provider genuinely didn't report
+        // usage.
         timing.total_tokens = usage
             .as_ref()
-            .and_then(|u| u.get("output_tokens"))
-            .and_then(|v| v.as_i64())
-            // Saturating cast, not `as i32` (which wraps an absurd reported
-            // usage value negative) — same pattern as `record_usage` above.
-            .map(|v| i32::try_from(v).unwrap_or(i32::MAX))
+            .and_then(output_tokens_including_reasoning)
             .unwrap_or(token_count);
+        timing.finalize_rate();
 
         Ok((content_chunks, tool_calls, finish_reason, usage, timing))
     }
@@ -2357,6 +2394,59 @@ mod write_tool_tests {
         ] {
             assert!(!is_write_tool(name), "{name} should NOT be a write tool");
         }
+    }
+}
+
+#[cfg(test)]
+mod output_token_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// OpenAI's spec counts reasoning tokens *inside* `completion_tokens` and
+    /// reports the breakdown for information only. Summing would double count.
+    #[test]
+    fn reasoning_already_inside_the_total_is_not_added_again() {
+        let usage = json!({"output_tokens": 300, "reasoning_tokens": 200});
+        assert_eq!(output_tokens_including_reasoning(&usage), Some(300));
+    }
+
+    /// Servers that report `completion_tokens` as the visible completion alone
+    /// give themselves away: reasoning cannot exceed a total it is part of.
+    /// This is the shape that made a reasoning model read a third of its real
+    /// speed.
+    #[test]
+    fn reasoning_reported_outside_the_total_is_added() {
+        let usage = json!({"output_tokens": 100, "reasoning_tokens": 200});
+        assert_eq!(output_tokens_including_reasoning(&usage), Some(300));
+        // Equal counts are also impossible for a subset of a non-zero total.
+        let usage = json!({"output_tokens": 50, "reasoning_tokens": 50});
+        assert_eq!(output_tokens_including_reasoning(&usage), Some(100));
+    }
+
+    #[test]
+    fn a_non_reasoning_response_is_unaffected() {
+        let usage = json!({"output_tokens": 42});
+        assert_eq!(output_tokens_including_reasoning(&usage), Some(42));
+        let usage = json!({"output_tokens": 42, "reasoning_tokens": 0});
+        assert_eq!(output_tokens_including_reasoning(&usage), Some(42));
+    }
+
+    /// No reported output tokens at all means the caller must fall back to its
+    /// own delta count, not to zero.
+    #[test]
+    fn missing_usage_reports_nothing_rather_than_zero() {
+        assert_eq!(output_tokens_including_reasoning(&json!({})), None);
+        assert_eq!(
+            output_tokens_including_reasoning(&json!({"input_tokens": 10})),
+            None
+        );
+    }
+
+    /// An absurd reported value must clamp, not wrap negative.
+    #[test]
+    fn an_absurd_reported_count_saturates() {
+        let usage = json!({"output_tokens": i64::MAX, "reasoning_tokens": i64::MAX});
+        assert_eq!(output_tokens_including_reasoning(&usage), Some(i32::MAX));
     }
 }
 

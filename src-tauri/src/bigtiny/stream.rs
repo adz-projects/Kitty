@@ -608,6 +608,10 @@ fn handle_event(
                 "ttfbMs": get_f64("ttfb_ms"),
                 "ttftMs": get_f64("ttft_ms"),
                 "generationMs": get_f64("generation_ms"),
+                // Computed by the daemon, not derived here: it is the only
+                // side holding both the decode window and the token count for
+                // the *same* call. See `TimingResult::finalize_rate`.
+                "tokensPerSecond": get_f64("tokens_per_second"),
                 "totalTokens": event.get("total_tokens").and_then(|v| v.as_i64()),
             }));
         }

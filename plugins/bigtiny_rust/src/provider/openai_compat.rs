@@ -11,8 +11,8 @@ use super::base::{
     classify_provider_error, classify_transport_error, parse_retry_after, read_bounded_error_body,
     Delta, Effort, HealthStatus, ModelInfo, Provider, SamplingParams,
 };
-use crate::config::ProviderConfig;
 use super::tag_split::TagSplitter;
+use crate::config::ProviderConfig;
 use crate::error::ProviderError;
 use crate::network::{maybe_direct_url, TailscaleClient};
 
@@ -130,7 +130,6 @@ impl OpenAICompatibleProvider {
         }
     }
 
-
     /// Merges the contiguous *leading* run of `role: "system"` messages into a
     /// single one at the front of the array, leaving everything else (and its
     /// relative order) untouched.
@@ -176,10 +175,13 @@ impl OpenAICompatibleProvider {
         }
 
         if !system_parts.is_empty() {
-            out.insert(0, serde_json::json!({
-                "role": "system",
-                "content": system_parts.join("\n\n"),
-            }));
+            out.insert(
+                0,
+                serde_json::json!({
+                    "role": "system",
+                    "content": system_parts.join("\n\n"),
+                }),
+            );
         }
         out.extend(iter);
         out
@@ -261,9 +263,9 @@ impl OpenAICompatibleProvider {
                     if args.is_string() {
                         continue;
                     }
-                    *args = Value::String(serde_json::to_string(args).unwrap_or_else(
-                        |_| "{}".to_string(),
-                    ));
+                    *args = Value::String(
+                        serde_json::to_string(args).unwrap_or_else(|_| "{}".to_string()),
+                    );
                 }
                 msg
             })
@@ -276,11 +278,7 @@ impl OpenAICompatibleProvider {
     /// is *not* a usable response (the tunnel is the authoritative path).
     /// `send()` resolves as soon as headers arrive, so the timeout never caps
     /// a slow-but-healthy SSE *body* (that's `idle_timeout`'s job).
-    async fn try_direct(
-        &self,
-        direct_url: &str,
-        body: &Value,
-    ) -> Result<reqwest::Response, ()> {
+    async fn try_direct(&self, direct_url: &str, body: &Value) -> Result<reqwest::Response, ()> {
         let direct = self
             .direct_client
             .post(direct_url)
@@ -524,7 +522,11 @@ impl Provider for OpenAICompatibleProvider {
             // Bounded in both time and size — a stalled error body used to
             // hang the turn forever (see `read_bounded_error_body`).
             let body_text = read_bounded_error_body(resp).await;
-            return Err(classify_provider_error(status_code, &body_text, retry_after));
+            return Err(classify_provider_error(
+                status_code,
+                &body_text,
+                retry_after,
+            ));
         }
 
         // Use bytes_stream from the stream feature
@@ -544,9 +546,7 @@ impl Provider for OpenAICompatibleProvider {
             .timeout(std::time::Duration::from_secs(5))
             .send()
             .await
-            .map_err(|e| {
-                classify_transport_error(&e, format!("failed to discover models: {e}"))
-            })?;
+            .map_err(|e| classify_transport_error(&e, format!("failed to discover models: {e}")))?;
 
         if !resp.status().is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -734,8 +734,7 @@ impl OpenAISSEStream {
                 // Empty accumulated arguments are legitimate (a zero-arg tool
                 // streams no fragments) — only NON-empty unparseable text is
                 // malformed.
-                !buf.arguments.is_empty()
-                    && serde_json::from_str::<Value>(&buf.arguments).is_err()
+                !buf.arguments.is_empty() && serde_json::from_str::<Value>(&buf.arguments).is_err()
             })
             .map(|(_, buf)| buf.name.clone().unwrap_or_else(|| "<unnamed>".into()))
             .collect();
@@ -794,12 +793,10 @@ impl OpenAISSEStream {
                 tool_calls: None,
                 finish_reason: None,
                 usage: None,
-                error_type: Some(
-                    format!(
-                        "malformed streamed tool arguments for: {}",
-                        bad.join(", ")
-                    ),
-                ),
+                error_type: Some(format!(
+                    "malformed streamed tool arguments for: {}",
+                    bad.join(", ")
+                )),
             });
         }
         self.pending.push_back(Delta {
@@ -874,6 +871,20 @@ impl OpenAISSEStream {
             }
             if let Some(i) = usage["completion_tokens"].as_i64() {
                 usage_map.insert("output_tokens".into(), i as i32);
+            }
+            // Reasoning/thinking tokens, when the endpoint breaks them out.
+            //
+            // OpenAI's own spec counts these *inside* `completion_tokens` and
+            // reports them here only as a breakdown. Plenty of
+            // OpenAI-compatible servers do the opposite and report
+            // `completion_tokens` as the visible completion alone — which is
+            // why a reasoning model's measured tokens/sec came out a third of
+            // what the server itself reported. Recorded as its own field so
+            // the consumer can decide (see `agent::loop_`'s
+            // `output_tokens_including_reasoning`), rather than guessing here
+            // with only half the numbers in hand.
+            if let Some(i) = usage["completion_tokens_details"]["reasoning_tokens"].as_i64() {
+                usage_map.insert("reasoning_tokens".into(), i as i32);
             }
             // OpenAI-style prompt-cache reporting (also mirrored by some
             // llama.cpp/vLLM-compatible endpoints): tokens served from cache
@@ -1045,9 +1056,8 @@ impl Stream for OpenAISSEStream {
                         // Decode only at complete line boundaries — this is
                         // what keeps a multi-byte UTF-8 char split across two
                         // TCP chunks intact (see `buf`'s comment).
-                        let line = String::from_utf8(raw).unwrap_or_else(|e| {
-                            String::from_utf8_lossy(e.as_bytes()).into_owned()
-                        });
+                        let line = String::from_utf8(raw)
+                            .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
                         if self.process_line(&line) {
                             self.done = true;
                         }
@@ -1089,9 +1099,8 @@ impl Stream for OpenAISSEStream {
                     // a real SSE line — decode it before finishing.
                     if !self.buf.is_empty() {
                         let raw = std::mem::take(&mut self.buf);
-                        let line = String::from_utf8(raw).unwrap_or_else(|e| {
-                            String::from_utf8_lossy(e.as_bytes()).into_owned()
-                        });
+                        let line = String::from_utf8(raw)
+                            .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
                         if self.process_line(&line) {
                             self.done = true;
                         }
@@ -1185,7 +1194,9 @@ mod sse_tests {
         let inner = stream::iter(vec![Ok::<bytes::Bytes, reqwest::Error>(
             bytes::Bytes::from(chunk),
         )]);
-        let deltas: Vec<Delta> = parse_openai_sse(inner, Duration::from_secs(300)).collect().await;
+        let deltas: Vec<Delta> = parse_openai_sse(inner, Duration::from_secs(300))
+            .collect()
+            .await;
         let contents: Vec<String> = deltas.into_iter().filter_map(|d| d.content).collect();
         assert_eq!(contents, vec!["Hello".to_string(), " world".to_string()]);
     }
@@ -1198,7 +1209,9 @@ mod sse_tests {
             Ok::<bytes::Bytes, reqwest::Error>(bytes::Bytes::from(chunk1)),
             Ok::<bytes::Bytes, reqwest::Error>(bytes::Bytes::from(chunk2)),
         ]);
-        let deltas: Vec<Delta> = parse_openai_sse(inner, Duration::from_secs(300)).collect().await;
+        let deltas: Vec<Delta> = parse_openai_sse(inner, Duration::from_secs(300))
+            .collect()
+            .await;
         let contents: Vec<String> = deltas.into_iter().filter_map(|d| d.content).collect();
         assert_eq!(contents, vec!["Hello".to_string()]);
     }
@@ -1243,10 +1256,7 @@ mod sse_tests {
         assert_eq!(tool_calls.len(), 1);
         assert_eq!(tool_calls[0].id, "call_1");
         assert_eq!(
-            tool_calls[0]
-                .function
-                .get("name")
-                .and_then(|v| v.as_str()),
+            tool_calls[0].function.get("name").and_then(|v| v.as_str()),
             Some("read_file")
         );
     }
@@ -1293,9 +1303,9 @@ mod sse_tests {
     #[tokio::test]
     async fn an_overlong_line_without_newline_terminates_as_a_transient_error() {
         let garbage = vec![b'x'; MAX_SSE_LINE_BYTES + 1];
-        let inner = stream::iter(vec![Ok::<bytes::Bytes, reqwest::Error>(bytes::Bytes::from(
-            garbage,
-        ))]);
+        let inner = stream::iter(vec![Ok::<bytes::Bytes, reqwest::Error>(
+            bytes::Bytes::from(garbage),
+        )]);
         let deltas: Vec<Delta> = parse_openai_sse(inner, Duration::from_secs(300))
             .collect()
             .await;
@@ -1304,7 +1314,7 @@ mod sse_tests {
         assert_eq!(deltas[0].finish_reason.as_deref(), Some("error"));
     }
 
-/// #7 regression: unbounded per-tool argument accumulation must terminate
+    /// #7 regression: unbounded per-tool argument accumulation must terminate
     /// as a transient error rather than growing memory forever.
     #[tokio::test]
     async fn overlong_tool_arguments_terminate_as_a_transient_error() {
@@ -1355,7 +1365,9 @@ mod sse_tests {
         let inner = stream::iter(vec![Ok::<bytes::Bytes, reqwest::Error>(
             bytes::Bytes::from(chunk),
         )]);
-        let deltas: Vec<Delta> = parse_openai_sse(inner, Duration::from_secs(300)).collect().await;
+        let deltas: Vec<Delta> = parse_openai_sse(inner, Duration::from_secs(300))
+            .collect()
+            .await;
         assert_eq!(deltas.len(), 1);
         assert_eq!(deltas[0].content.as_deref(), Some("Hi"));
     }
@@ -1369,7 +1381,9 @@ mod sse_tests {
         let inner = stream::iter(vec![Ok::<bytes::Bytes, reqwest::Error>(
             bytes::Bytes::from(chunk),
         )]);
-        let deltas: Vec<Delta> = parse_openai_sse(inner, Duration::from_secs(300)).collect().await;
+        let deltas: Vec<Delta> = parse_openai_sse(inner, Duration::from_secs(300))
+            .collect()
+            .await;
         let contents: Vec<String> = deltas.into_iter().filter_map(|d| d.content).collect();
         assert_eq!(contents, vec!["Hi".to_string()]);
     }
@@ -1385,7 +1399,9 @@ mod sse_tests {
         let inner = stream::iter(vec![Ok::<bytes::Bytes, reqwest::Error>(
             bytes::Bytes::from(chunk),
         )]);
-        let deltas: Vec<Delta> = parse_openai_sse(inner, Duration::from_secs(300)).collect().await;
+        let deltas: Vec<Delta> = parse_openai_sse(inner, Duration::from_secs(300))
+            .collect()
+            .await;
         let tool_calls = deltas
             .into_iter()
             .find_map(|d| d.tool_calls)
@@ -1419,7 +1435,9 @@ mod sse_tests {
         let inner = stream::iter(vec![Ok::<bytes::Bytes, reqwest::Error>(
             bytes::Bytes::from(chunk),
         )]);
-        let deltas: Vec<Delta> = parse_openai_sse(inner, Duration::from_secs(300)).collect().await;
+        let deltas: Vec<Delta> = parse_openai_sse(inner, Duration::from_secs(300))
+            .collect()
+            .await;
         assert!(
             deltas.iter().all(|d| d.error_type.is_none()),
             "no error delta for a legitimate zero-arg call: {deltas:?}"
@@ -1451,7 +1469,9 @@ mod sse_tests {
         let inner = stream::iter(vec![Ok::<bytes::Bytes, reqwest::Error>(
             bytes::Bytes::from(chunk),
         )]);
-        let deltas: Vec<Delta> = parse_openai_sse(inner, Duration::from_secs(300)).collect().await;
+        let deltas: Vec<Delta> = parse_openai_sse(inner, Duration::from_secs(300))
+            .collect()
+            .await;
         let tool_calls = deltas
             .into_iter()
             .find_map(|d| d.tool_calls)
@@ -1473,9 +1493,14 @@ mod sse_tests {
         let inner = stream::iter(vec![Ok::<bytes::Bytes, reqwest::Error>(
             bytes::Bytes::from(chunk),
         )]);
-        let deltas: Vec<Delta> = parse_openai_sse(inner, Duration::from_secs(300)).collect().await;
+        let deltas: Vec<Delta> = parse_openai_sse(inner, Duration::from_secs(300))
+            .collect()
+            .await;
         let content: String = deltas.iter().filter_map(|d| d.content.clone()).collect();
-        assert_eq!(content, "tail<th", "the held-back partial tag must be flushed");
+        assert_eq!(
+            content, "tail<th",
+            "the held-back partial tag must be flushed"
+        );
     }
 
     #[tokio::test]
@@ -1491,7 +1516,9 @@ mod sse_tests {
         let inner = stream::iter(vec![Ok::<bytes::Bytes, reqwest::Error>(
             bytes::Bytes::from(chunk),
         )]);
-        let deltas: Vec<Delta> = parse_openai_sse(inner, Duration::from_secs(300)).collect().await;
+        let deltas: Vec<Delta> = parse_openai_sse(inner, Duration::from_secs(300))
+            .collect()
+            .await;
         let content: String = deltas.iter().filter_map(|d| d.content.clone()).collect();
         let reasoning: String = deltas.iter().filter_map(|d| d.reasoning.clone()).collect();
         assert_eq!(content, "answer");
@@ -1509,7 +1536,9 @@ mod sse_tests {
         let inner = stream::iter(vec![Ok::<bytes::Bytes, reqwest::Error>(
             bytes::Bytes::from(chunk),
         )]);
-        let deltas: Vec<Delta> = parse_openai_sse(inner, Duration::from_secs(300)).collect().await;
+        let deltas: Vec<Delta> = parse_openai_sse(inner, Duration::from_secs(300))
+            .collect()
+            .await;
         let content: String = deltas.iter().filter_map(|d| d.content.clone()).collect();
         let reasoning: String = deltas.iter().filter_map(|d| d.reasoning.clone()).collect();
         assert_eq!(content, "answer");
@@ -1522,7 +1551,9 @@ mod sse_tests {
         let inner = stream::iter(vec![Ok::<bytes::Bytes, reqwest::Error>(
             bytes::Bytes::from(chunk),
         )]);
-        let deltas: Vec<Delta> = parse_openai_sse(inner, Duration::from_secs(300)).collect().await;
+        let deltas: Vec<Delta> = parse_openai_sse(inner, Duration::from_secs(300))
+            .collect()
+            .await;
         let usage = deltas
             .iter()
             .find_map(|d| d.usage.as_ref())
@@ -1543,7 +1574,9 @@ mod sse_tests {
         let inner = stream::iter(vec![Ok::<bytes::Bytes, reqwest::Error>(
             bytes::Bytes::from(chunk),
         )]);
-        let deltas: Vec<Delta> = parse_openai_sse(inner, Duration::from_secs(300)).collect().await;
+        let deltas: Vec<Delta> = parse_openai_sse(inner, Duration::from_secs(300))
+            .collect()
+            .await;
         assert!(
             deltas
                 .iter()
@@ -2018,7 +2051,9 @@ mod sse_tests {
         })];
         let out = OpenAICompatibleProvider::stringify_tool_call_arguments(messages);
         // Missing arguments key is left absent; empty-string arguments stay a string.
-        assert!(out[0]["tool_calls"][0]["function"].get("arguments").is_none());
+        assert!(out[0]["tool_calls"][0]["function"]
+            .get("arguments")
+            .is_none());
         assert_eq!(
             out[0]["tool_calls"][1]["function"]["arguments"],
             serde_json::json!("")

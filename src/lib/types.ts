@@ -658,6 +658,11 @@ export interface CompleteEvent {
       ttfbMs?: number;
       ttftMs?: number;
       generationMs?: number;
+      /** Generation speed for that call, computed by the daemon. Not derived
+          here: the browser's own wall clock covers the whole turn (context
+          building, memory recall, every tool call), which is a different span
+          from the one the token count describes. */
+      tokensPerSecond?: number;
       totalTokens?: number;
     };
   };

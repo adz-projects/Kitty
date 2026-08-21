@@ -39,6 +39,13 @@ export interface Message {
       produced this message's final visible text. Same completeness caveat
       as the other metrics fields: only set on a message from a live send(). */
   ttftMs?: number;
+  /** Generation speed for that same call, as measured by BigTiny.
+      Deliberately not derived here from `outputTokens`/`durationMs`: those
+      describe the *whole turn* on the browser's clock — every LLM step, tool
+      call, memory recall and DB write — while the token count and the decode
+      window belong to one provider call. Dividing one by the other understated
+      the real rate roughly threefold on a tool-using turn. */
+  tokensPerSecond?: number;
   providerName?: string;
   /** The actual model that generated this message (Round-4 info button) —
       captured at send time, not read back from the live chat-pill state. */

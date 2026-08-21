@@ -101,19 +101,12 @@ export function MessageInfo({ message }: { message: Message }) {
                 {(message.ttftMs / 1000).toFixed(2)}s
               </div>
             )}
-            {message.ttftMs != null &&
-              message.durationMs != null &&
-              message.outputTokens != null &&
-              message.outputTokens > 0 &&
-              message.durationMs > message.ttftMs && (
-                <div>
-                  <span className="muted">Generation speed:</span>{' '}
-                  {((message.outputTokens / (message.durationMs - message.ttftMs)) * 1000).toFixed(
-                    1
-                  )}{' '}
-                  tok/s
-                </div>
-              )}
+            {message.tokensPerSecond != null && message.tokensPerSecond > 0 && (
+              <div>
+                <span className="muted">Generation speed:</span>{' '}
+                {message.tokensPerSecond.toFixed(1)} tok/s
+              </div>
+            )}
           </div>,
           document.body
         )}

@@ -58,6 +58,11 @@ pub struct SSEEvent {
     pub ttft_ms: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub generation_ms: Option<f64>,
+    /// Generation speed for this LLM call, computed daemon-side — see
+    /// `agent::types::TimingResult::finalize_rate` for why the client must
+    /// not derive it itself.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens_per_second: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -122,6 +127,7 @@ impl Default for SSEEvent {
             ttfb_ms: None,
             ttft_ms: None,
             generation_ms: None,
+            tokens_per_second: None,
             provider_id: None,
             model: None,
             total_tokens: None,
