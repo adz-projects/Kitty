@@ -3,6 +3,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, SqlitePool};
 use std::collections::HashSet;
+use std::time::Duration;
 
 use crate::error::StorageError;
 
@@ -52,7 +53,48 @@ pub struct MessageRow {
     pub created_at: Option<DateTime<Utc>>,
 }
 
+/// SQLITE_BUSY (code 5) surfaces as `database is locked` / `database table
+/// is locked` — a concurrent writer (e.g. a compaction pass or another
+/// turn) holds the write lock. Retrying shortly is safe: every insert is
+/// inside a transaction, so a busy failure committed nothing.
+fn is_busy_error(e: &StorageError) -> bool {
+    match e {
+        StorageError::Sqlx(sqlx::Error::Database(db)) => {
+            db.code().as_deref() == Some("5")
+                || db.message().to_lowercase().contains("database is locked")
+        }
+        _ => false,
+    }
+}
+
 pub async fn save_messages(
+    pool: &SqlitePool,
+    session_id: &str,
+    messages: &[MessageRow],
+) -> Result<(), StorageError> {
+    // A transient SQLITE_BUSY used to abort the whole save; the caller
+    // warned and moved on, and a later save re-inserted the same content
+    // under fresh UUIDs — duplicate transcript rows. Retry the batch a few
+    // times with a short linear backoff before giving up.
+    const BUSY_SAVE_RETRIES: u32 = 3;
+    const BUSY_SAVE_RETRY_DELAY_MS: u64 = 50;
+    let mut attempt = 0u32;
+    loop {
+        match save_messages_once(pool, session_id, messages).await {
+            Ok(()) => return Ok(()),
+            Err(e) if is_busy_error(&e) && attempt < BUSY_SAVE_RETRIES => {
+                attempt += 1;
+                tokio::time::sleep(Duration::from_millis(
+                    BUSY_SAVE_RETRY_DELAY_MS * attempt as u64,
+                ))
+                .await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+async fn save_messages_once(
     pool: &SqlitePool,
     session_id: &str,
     messages: &[MessageRow],

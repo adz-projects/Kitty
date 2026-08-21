@@ -381,14 +381,28 @@ impl ContextBuilder {
         }
 
         if !rows.is_empty() {
-            messages::save_messages(&self.pool, session_id, &rows)
-                .await
-                .map_err(|e| format!("Failed to save messages: {}", e))?;
-        }
-
-        for (idx, id) in ids {
-            if let Some(obj) = message_dicts[idx].as_object_mut() {
-                obj.insert("id".to_string(), Value::String(id));
+            // Claim the generated ids on the in-memory messages BEFORE the
+            // insert. If this save is ever re-run later in the turn (it is,
+            // after nearly every step), the dedupe in
+            // `storage::messages::save_messages` skips ids that already
+            // exist — so a transient DB failure can't make the next save
+            // re-generate fresh UUIDs for the *same* content and duplicate
+            // transcript rows. The claim tokens are reverted on failure
+            // below, so a message that never reached the DB isn't silently
+            // skipped forever. (Each storage save is atomic, so on error
+            // nothing was committed and reverting is always safe.)
+            for (idx, id) in &ids {
+                if let Some(obj) = message_dicts[*idx].as_object_mut() {
+                    obj.insert("id".to_string(), Value::String(id.clone()));
+                }
+            }
+            if let Err(e) = messages::save_messages(&self.pool, session_id, &rows).await {
+                for (idx, _) in &ids {
+                    if let Some(obj) = message_dicts[*idx].as_object_mut() {
+                        obj.remove("id");
+                    }
+                }
+                return Err(format!("Failed to save messages: {}", e));
             }
         }
 
@@ -581,6 +595,48 @@ mod tests {
         for msg in &messages {
             assert!(msg.get("id").and_then(|v| v.as_str()).is_some());
         }
+    }
+
+    /// #3 regression: ids are now claimed on the in-memory messages BEFORE
+    /// the insert (so a later re-save can't re-generate fresh UUIDs for the
+    /// same content and duplicate rows). On a failed save the claim tokens
+    /// must be REVERTED — otherwise a message that never reached the DB
+    /// would be silently skipped forever on the next save.
+    #[tokio::test]
+    async fn failed_save_reverts_claimed_ids_so_a_retry_can_persist() {
+        let pool = test_pool().await;
+        sessions::create_session(&pool, "sess-1", "Test")
+            .await
+            .unwrap();
+        let builder = ContextBuilder::new(pool.clone(), TokenManagementConfig::default(), 2);
+
+        let mut messages = vec![json!({"role": "user", "content": "hello"})];
+
+        // Force a failure: saving against a session that doesn't exist trips
+        // the FK constraint on insert (nothing is committed — the storage
+        // save is atomic).
+        let err = builder
+            .save_messages("missing-session", &mut messages)
+            .await;
+        assert!(err.is_err(), "the failed save must return an error");
+
+        // The claim token must have been reverted, not left behind.
+        assert!(
+            messages[0].get("id").is_none(),
+            "a failed save must revert the claimed id"
+        );
+
+        // A retry against the real session succeeds and produces exactly ONE
+        // row — no duplicates, no dropped tail.
+        builder
+            .save_messages("sess-1", &mut messages)
+            .await
+            .unwrap();
+        let rows = messages::get_messages_by_session(&pool, "sess-1")
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].content.as_deref(), Some("hello"));
     }
 
     /// Prompt-determinism regression: two `build_messages` calls with

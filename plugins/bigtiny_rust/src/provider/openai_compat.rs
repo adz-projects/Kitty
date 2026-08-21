@@ -5,10 +5,11 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::base::{
-    classify_provider_error, Delta, Effort, HealthStatus, ModelInfo, Provider, SamplingParams,
+    classify_provider_error, classify_transport_error, parse_retry_after, read_bounded_error_body,
+    Delta, Effort, HealthStatus, ModelInfo, Provider, SamplingParams,
 };
 use crate::config::ProviderConfig;
 use super::tag_split::TagSplitter;
@@ -41,7 +42,7 @@ pub struct OpenAICompatibleProvider {
     tailscale: Arc<TailscaleClient>,
     /// SSE idle-read timeout — if no bytes arrive for this long, the stream
     /// is terminated with a transient error (see `parse_openai_sse`). Per
-    /// provider, from the config blob's `idle_timeout_secs`, default 300s.
+    /// provider, from the config blob's `idle_timeout_secs`, default 120s.
     idle_timeout: Duration,
 }
 
@@ -52,24 +53,73 @@ pub struct OpenAICompatibleProvider {
 /// that's the per-chunk `idle_timeout`'s job.
 const RESPONSE_HEADERS_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Bounds time-to-headers for the DIRECT Tailscale attempt only. The direct
+/// path is an optimization over the tunnel — a half-open/stale LAN address
+/// must not burn the full `RESPONSE_HEADERS_TIMEOUT` before falling back.
+/// Like the outer wrapper, this resolves as soon as headers arrive and never
+/// caps a slow-but-healthy SSE *body* (that's `idle_timeout`'s job).
+const DIRECT_HEADERS_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// TCP keepalive probe interval for provider connections (see #10). A
+/// dead-but-open TCP connection (peer gone, NAT entry flushed, Android
+/// backgrounding the app) used to be detectable only by the SSE idle-read
+/// timeout — up to a full `idle_timeout` of stuck silence. Periodic
+/// keepalives let the OS time the dead peer out within a few probes and
+/// surface it as an ordinary connection error.
+const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Total-duration ceiling for one streamed response (see #10). The idle-read
+/// timeout only bounds *gaps* between bytes — a provider dribbling data fast
+/// enough to stay under the idle gap would otherwise hold a turn (and its
+/// memory) open indefinitely. A turn cannot legitimately need an hour of
+/// continuous streaming; if it does, `idle_timeout_secs` is the knob.
+const MAX_STREAM_DURATION: Duration = Duration::from_secs(3600);
+
 impl OpenAICompatibleProvider {
     pub const DEFAULT_MODEL: &'static str = "gpt-4o";
 
     pub fn new(provider_id: &str, config: ProviderConfig, tailscale: Arc<TailscaleClient>) -> Self {
         let idle_timeout = config.idle_timeout();
-        let client = reqwest::Client::builder()
+        let client = match reqwest::Client::builder()
             // Bound the TCP/TLS setup phase so a provider that accepts the
             // connection but stalls before sending response headers can't
             // block `chat_completion` forever. This does NOT bound the SSE
             // body (a healthy long stream would trip a whole-request timeout
             // — that's the per-chunk `idle_timeout`'s job instead).
             .connect_timeout(std::time::Duration::from_secs(30))
+            .tcp_keepalive(TCP_KEEPALIVE_INTERVAL)
             .build()
-            .unwrap_or_default();
-        let direct_client = reqwest::Client::builder()
+        {
+            Ok(c) => c,
+            // Don't degrade silently (see #12): a builder failure must not
+            // quietly hand a provider a default client without its
+            // connect-timeout/keepalive settings — log it loudly. The
+            // provider still constructs (the default client usually works),
+            // so this is an error, not a fatal.
+            Err(e) => {
+                tracing::error!(
+                    provider_id = %provider_id,
+                    error = %e,
+                    "failed to build the provider HTTP client; falling back to a default client (no connect-timeout/keepalive)"
+                );
+                reqwest::Client::new()
+            }
+        };
+        let direct_client = match reqwest::Client::builder()
             .connect_timeout(crate::network::DIRECT_CONNECT_TIMEOUT)
+            .tcp_keepalive(TCP_KEEPALIVE_INTERVAL)
             .build()
-            .unwrap_or_default();
+        {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(
+                    provider_id = %provider_id,
+                    error = %e,
+                    "failed to build the Tailscale direct HTTP client; falling back to a default client (no connect-timeout/keepalive)"
+                );
+                reqwest::Client::new()
+            }
+        };
         Self {
             provider_id: provider_id.into(),
             client,
@@ -220,10 +270,37 @@ impl OpenAICompatibleProvider {
             .collect()
     }
 
+    /// Single direct attempt against `direct_url`, bounded by
+    /// `DIRECT_HEADERS_TIMEOUT`. Returns `Err` on timeout, transport error,
+    /// or any non-success status — a stale direct address answering `401`/`500`
+    /// is *not* a usable response (the tunnel is the authoritative path).
+    /// `send()` resolves as soon as headers arrive, so the timeout never caps
+    /// a slow-but-healthy SSE *body* (that's `idle_timeout`'s job).
+    async fn try_direct(
+        &self,
+        direct_url: &str,
+        body: &Value,
+    ) -> Result<reqwest::Response, ()> {
+        let direct = self
+            .direct_client
+            .post(direct_url)
+            .header("Authorization", format!("Bearer {}", self.config.api_key))
+            .json(body)
+            .send();
+        match tokio::time::timeout(DIRECT_HEADERS_TIMEOUT, direct).await {
+            Ok(Ok(resp)) if resp.status().is_success() => Ok(resp),
+            _ => Err(()),
+        }
+    }
+
     /// If `url`'s host is a Tailscale peer with a discoverable direct (LAN)
-    /// address, tries that address first (connect phase bounded by
-    /// `network::DIRECT_CONNECT_TIMEOUT` via `direct_client`) and falls back
-    /// to the original (tunneled) URL on any error. A no-op — single
+    /// address, tries that address first (via `try_direct`: connect +
+    /// time-to-headers bounded by `DIRECT_HEADERS_TIMEOUT`) and falls back to
+    /// the original (tunneled) URL on timeout, transport error, or a
+    /// non-success response. A stale direct IP answering `401`/`500` is *not*
+    /// a usable response — the tunnel is the authoritative path, so surfacing
+    /// a bogus endpoint failure instead of falling back used to kill every
+    /// Tailscale-provider turn after a network change. A no-op — single
     /// request, original URL — for every other host (localhost,
     /// non-Tailscale, or no direct address known). Mirrors Python's
     /// `PreferDirectTransport`.
@@ -233,14 +310,7 @@ impl OpenAICompatibleProvider {
         body: &Value,
     ) -> Result<reqwest::Response, reqwest::Error> {
         if let Some(direct_url) = maybe_direct_url(&self.tailscale, url).await {
-            let direct = self
-                .direct_client
-                .post(&direct_url)
-                .header("Authorization", format!("Bearer {}", self.config.api_key))
-                .json(body)
-                .send()
-                .await;
-            if let Ok(resp) = direct {
+            if let Ok(resp) = self.try_direct(&direct_url, body).await {
                 return Ok(resp);
             }
         }
@@ -436,7 +506,7 @@ impl Provider for OpenAICompatibleProvider {
             self.send_preferring_direct(&url, &body),
         )
         .await
-        .map_err(|_| ProviderError::Request {
+        .map_err(|_| ProviderError::Timeout {
             user_message: format!(
                 "Provider sent no response headers within {}s",
                 RESPONSE_HEADERS_TIMEOUT.as_secs()
@@ -444,16 +514,17 @@ impl Provider for OpenAICompatibleProvider {
             raw_message: "timed out waiting for response headers".into(),
             http_status: 0,
         })?
-        .map_err(|e| ProviderError::Request {
-            user_message: format!("Failed to connect to provider: {}", e),
-            raw_message: e.to_string(),
-            http_status: 0,
-        })?;
+        .map_err(|e| classify_transport_error(&e, format!("failed to reach provider: {e}")))?;
 
         let status_code = resp.status().as_u16();
         if !resp.status().is_success() {
-            let body_text = resp.text().await.unwrap_or_default();
-            return Err(classify_provider_error(status_code, &body_text));
+            // `Retry-After` (429/503) must be read before the body is
+            // consumed — the retry loop honors it as a backoff floor.
+            let retry_after = parse_retry_after(resp.headers());
+            // Bounded in both time and size — a stalled error body used to
+            // hang the turn forever (see `read_bounded_error_body`).
+            let body_text = read_bounded_error_body(resp).await;
+            return Err(classify_provider_error(status_code, &body_text, retry_after));
         }
 
         // Use bytes_stream from the stream feature
@@ -473,21 +544,20 @@ impl Provider for OpenAICompatibleProvider {
             .timeout(std::time::Duration::from_secs(5))
             .send()
             .await
-            .map_err(|e| ProviderError::Request {
-                user_message: format!("Failed to discover models: {}", e),
-                raw_message: e.to_string(),
-                http_status: 0,
+            .map_err(|e| {
+                classify_transport_error(&e, format!("failed to discover models: {e}"))
             })?;
 
         if !resp.status().is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(classify_provider_error(0, &body));
+            return Err(classify_provider_error(0, &body, None));
         }
 
         let data: Value = resp.json().await.map_err(|e| ProviderError::Other {
             user_message: format!("Failed to parse models response: {}", e),
             raw_message: e.to_string(),
             http_status: 0,
+            retry_after_secs: None,
         })?;
 
         let models: Vec<ModelInfo> = data["data"]
@@ -568,6 +638,16 @@ struct PendingToolCall {
     arguments: String,
 }
 
+/// Cap on the line buffer between newlines — a broken/hostile provider
+/// streaming garbage with no newlines used to grow `buf` without limit (OOM
+/// vector, see #7). Any line past this is terminated as a transient error.
+/// Chosen far above any legitimate single JSON SSE frame.
+const MAX_SSE_LINE_BYTES: usize = 8 * 1024 * 1024;
+/// Cap on accumulated streamed tool-argument text per tool call — the old
+/// code grew `PendingToolCall::arguments` unboundedly. Same reasoning as
+/// `MAX_SSE_LINE_BYTES`; 1MB is far beyond any realistic tool signature.
+const MAX_TOOL_ARGUMENTS_BYTES: usize = 1024 * 1024;
+
 type RawBytesStream = Pin<Box<dyn Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>>;
 
 struct OpenAISSEStream {
@@ -597,6 +677,8 @@ struct OpenAISSEStream {
     /// across SSE chunks), since a single reasoning block routinely spans
     /// many deltas.
     thinking: TagSplitter,
+    /// When this stream's response started (see `MAX_STREAM_DURATION`, #10).
+    stream_started: Instant,
 }
 
 fn parse_openai_sse(
@@ -615,6 +697,7 @@ fn parse_openai_sse(
         done: false,
         last_finish_reason: None,
         thinking: TagSplitter::thinking(),
+        stream_started: Instant::now(),
     }
 }
 
@@ -759,6 +842,25 @@ impl OpenAISSEStream {
             }
         };
 
+        // A top-level `error` object (many OpenAI-compatible endpoints emit
+        // this on mid-stream failures instead of a `choices` chunk) was
+        // previously swallowed — the stream then ended with no finish reason
+        // at all, feeding the unbounded step-retry path in `agent::loop_`
+        // (see #1). Surface it as the same transient-error delta as a dropped
+        // connection so `process_stream` routes it through retry/failover.
+        if json.get("error").is_some() {
+            self.pending.push_back(Delta {
+                role: "assistant".into(),
+                content: None,
+                reasoning: None,
+                tool_calls: None,
+                finish_reason: Some("error".into()),
+                usage: None,
+                error_type: Some("request".into()),
+            });
+            return true;
+        }
+
         // Standard OpenAI-compatible endpoints send `usage` and the final
         // `choices[].delta.finish_reason` in the SAME chunk. Returning early
         // here used to skip the `choices` parsing below entirely, so the
@@ -829,6 +931,24 @@ impl OpenAISSEStream {
                             entry.name = Some(name.into());
                         }
                         if let Some(f) = t["function"]["arguments"].as_str() {
+                            if entry.arguments.len() + f.len() > MAX_TOOL_ARGUMENTS_BYTES {
+                                // Unbounded per-tool accumulation was an OOM
+                                // vector (see #7) — a broken provider
+                                // streaming ever-growing argument JSON used to
+                                // grow `arguments` forever. Terminate as a
+                                // transient error so the turn routes through
+                                // retry/failover.
+                                self.pending.push_back(Delta {
+                                    role: "assistant".into(),
+                                    content: None,
+                                    reasoning: None,
+                                    tool_calls: None,
+                                    finish_reason: Some("error".into()),
+                                    usage: None,
+                                    error_type: Some("request".into()),
+                                });
+                                return true;
+                            }
                             entry.arguments.push_str(f);
                         }
                     }
@@ -877,10 +997,46 @@ impl Stream for OpenAISSEStream {
             if self.done {
                 return Poll::Ready(None);
             }
+            // Total-stream-duration cap (see #10, `MAX_STREAM_DURATION`): the
+            // idle-read timeout only bounds gaps between bytes — a provider
+            // dribbling data fast enough to beat it must not hold this turn
+            // (and its memory) open forever. Buffered content already queued
+            // buffered in `pending` are drained first (the check sits below
+            // the drain), then the turn gets the usual transient error.
+            if self.stream_started.elapsed() >= MAX_STREAM_DURATION {
+                self.pending.push_back(Delta {
+                    role: "assistant".into(),
+                    content: None,
+                    reasoning: None,
+                    tool_calls: None,
+                    finish_reason: Some("error".into()),
+                    usage: None,
+                    error_type: Some("request".into()),
+                });
+                self.done = true;
+                continue;
+            }
 
             match self.inner.as_mut().poll_next(cx) {
                 Poll::Ready(Some(Ok(Ok(chunk)))) => {
                     self.buf.extend_from_slice(&chunk);
+                    // Unbounded line buffer was an OOM vector (see #7): a
+                    // provider streaming garbage without newlines grew `buf`
+                    // forever. Any line past the cap is a broken/hostile
+                    // stream — terminate with the transient-error delta.
+                    if self.buf.len() > MAX_SSE_LINE_BYTES {
+                        self.pending.push_back(Delta {
+                            role: "assistant".into(),
+                            content: None,
+                            reasoning: None,
+                            tool_calls: None,
+                            finish_reason: Some("error".into()),
+                            usage: None,
+                            error_type: Some("request".into()),
+                        });
+                        self.done = true;
+                        continue;
+                    }
                     while let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
                         let mut raw: Vec<u8> = self.buf.drain(..=pos).collect();
                         while matches!(raw.last(), Some(&b'\r') | Some(&b'\n')) {
@@ -1107,6 +1263,88 @@ mod sse_tests {
             .collect()
             .await;
         let last = deltas.last().expect("expected at least the error Delta");
+        assert_eq!(last.error_type.as_deref(), Some("request"));
+        assert_eq!(last.finish_reason.as_deref(), Some("error"));
+    }
+
+    #[tokio::test]
+    async fn top_level_error_object_surfaces_as_a_transient_error_delta() {
+        // An OpenAI-compatible endpoint can fail mid-stream with a top-level
+        // `error` object instead of a `choices` chunk. That used to be
+        // silently swallowed — the stream ended with no finish reason and the
+        // turn ran on unboundedly. It must surface as the same transient-error
+        // delta as a dropped connection so `process_stream` retries/fails over.
+        let chunk =
+            "data: {\"error\": {\"message\": \"upstream failure\", \"type\": \"server_error\"}}\n\n";
+        let inner = stream::iter(vec![Ok::<bytes::Bytes, reqwest::Error>(
+            bytes::Bytes::from(chunk),
+        )]);
+        let deltas: Vec<Delta> = parse_openai_sse(inner, Duration::from_secs(300))
+            .collect()
+            .await;
+        let last = deltas.last().expect("expected the error Delta");
+        assert_eq!(last.error_type.as_deref(), Some("request"));
+        assert_eq!(last.finish_reason.as_deref(), Some("error"));
+    }
+
+    /// #7 regression: a provider streaming garbage with no newlines must not
+    /// grow the line buffer without bound — past `MAX_SSE_LINE_BYTES` the
+    /// stream terminates with the transient-error delta instead of OOMing.
+    #[tokio::test]
+    async fn an_overlong_line_without_newline_terminates_as_a_transient_error() {
+        let garbage = vec![b'x'; MAX_SSE_LINE_BYTES + 1];
+        let inner = stream::iter(vec![Ok::<bytes::Bytes, reqwest::Error>(bytes::Bytes::from(
+            garbage,
+        ))]);
+        let deltas: Vec<Delta> = parse_openai_sse(inner, Duration::from_secs(300))
+            .collect()
+            .await;
+        assert_eq!(deltas.len(), 1, "exactly one transient-error delta");
+        assert_eq!(deltas[0].error_type.as_deref(), Some("request"));
+        assert_eq!(deltas[0].finish_reason.as_deref(), Some("error"));
+    }
+
+/// #7 regression: unbounded per-tool argument accumulation must terminate
+    /// as a transient error rather than growing memory forever.
+    #[tokio::test]
+    async fn overlong_tool_arguments_terminate_as_a_transient_error() {
+        let payload = serde_json::json!({
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "boom",
+                            "arguments": "x".repeat(MAX_TOOL_ARGUMENTS_BYTES + 1),
+                        },
+                    }],
+                },
+            }],
+        });
+        let chunk = format!("data: {payload}\n\n");
+        let inner = stream::iter(vec![Ok::<bytes::Bytes, reqwest::Error>(
+            bytes::Bytes::from(chunk),
+        )]);
+        let deltas: Vec<Delta> = parse_openai_sse(inner, Duration::from_secs(300))
+            .collect()
+            .await;
+        let last = deltas.last().expect("expected the transient-error Delta");
+        assert_eq!(last.error_type.as_deref(), Some("request"));
+        assert_eq!(last.finish_reason.as_deref(), Some("error"));
+    }
+
+    /// #10 regression: a stream open longer than `MAX_STREAM_DURATION` must
+    /// terminate as a transient error instead of waiting on a provider that
+    /// keeps just enough bytes flowing to beat the idle-read timeout.
+    #[tokio::test]
+    async fn a_stream_past_the_total_duration_cap_terminates_as_a_transient_error() {
+        let silent = stream::pending::<Result<bytes::Bytes, reqwest::Error>>();
+        let mut s = parse_openai_sse(silent, Duration::from_secs(300));
+        s.stream_started = Instant::now() - (MAX_STREAM_DURATION + Duration::from_secs(1));
+        let deltas: Vec<Delta> = s.collect().await;
+        let last = deltas.last().expect("expected the transient-error Delta");
         assert_eq!(last.error_type.as_deref(), Some("request"));
         assert_eq!(last.finish_reason.as_deref(), Some("error"));
     }
@@ -1543,6 +1781,118 @@ mod sse_tests {
         let _: Vec<Delta> = stream.collect().await;
 
         mock.assert_async().await;
+    }
+
+    /// Regression for the #4 fix: a stale direct address that *answers* with a
+    /// server error must not be surfaced as a usable response — before the
+    /// fix, `send_preferring_direct` returned any `Ok(resp)` from the direct
+    /// attempt, so a `500` from a leftover LAN IP after a Tailscale network
+    /// change became a bogus endpoint failure that killed the turn even
+    /// though the tunnel was fine. `try_direct` must reject non-success
+    /// statuses (the tunnel is the authoritative path).
+    #[tokio::test]
+    async fn try_direct_rejects_a_server_error_from_a_stale_direct_address() {
+        let mut stale = mockito::Server::new_with_opts_async(mockito::ServerOpts {
+            host: "127.0.0.2",
+            ..Default::default()
+        })
+        .await;
+        let stale_mock = stale
+            .mock("POST", "/v1/chat/completions")
+            .with_status(500)
+            .with_body("{\"error\":{\"message\":\"stale endpoint\"}}")
+            .expect(1)
+            .create_async()
+            .await;
+
+        let provider = OpenAICompatibleProvider::new(
+            "test",
+            crate::config::ProviderConfig::default(),
+            Arc::new(TailscaleClient::new()),
+        );
+        let body = serde_json::json!({"messages": [{"role": "user", "content": "hi"}]});
+        let direct_url = format!("{}/v1/chat/completions", stale.url());
+
+        assert!(
+            provider.try_direct(&direct_url, &body).await.is_err(),
+            "a 500 from the direct path must not be treated as usable"
+        );
+        stale_mock.assert_async().await;
+    }
+
+    /// Same as above for a `401` from a stale direct address (the IP has been
+    /// reused by some other service on the LAN). Must fall back to the tunnel,
+    /// not surface the bogus auth failure.
+    #[tokio::test]
+    async fn try_direct_rejects_an_auth_error_from_a_stale_direct_address() {
+        let mut stale = mockito::Server::new_with_opts_async(mockito::ServerOpts {
+            host: "127.0.0.2",
+            ..Default::default()
+        })
+        .await;
+        let stale_mock = stale
+            .mock("POST", "/v1/chat/completions")
+            .with_status(401)
+            .with_body("{\"error\":{\"message\":\"not your service\"}}")
+            .expect(1)
+            .create_async()
+            .await;
+
+        let provider = OpenAICompatibleProvider::new(
+            "test",
+            crate::config::ProviderConfig::default(),
+            Arc::new(TailscaleClient::new()),
+        );
+        let body = serde_json::json!({"messages": [{"role": "user", "content": "hi"}]});
+        let direct_url = format!("{}/v1/chat/completions", stale.url());
+
+        assert!(
+            provider.try_direct(&direct_url, &body).await.is_err(),
+            "a 401 from the direct path must not be treated as usable"
+        );
+        stale_mock.assert_async().await;
+    }
+
+    /// Regression for the #4 fix: a half-open/stale direct address that
+    /// accepts the TCP connection but never sends response headers must not
+    /// block the turn for the full 30s `RESPONSE_HEADERS_TIMEOUT` — the
+    /// direct attempt is an optimization and `try_direct` bounds it with
+    /// `DIRECT_HEADERS_TIMEOUT`. The timeout fires around 5s and `try_direct`
+    /// returns `Err`, letting the tunnel fallback proceed.
+    #[tokio::test]
+    async fn try_direct_bounds_a_silent_direct_address() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.2:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            // Accept but never respond — simulates a half-open stale LAN
+            // address whose TCP handshake succeeds but which never produces
+            // response headers.
+            let (_sock, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+
+        let provider = OpenAICompatibleProvider::new(
+            "test",
+            crate::config::ProviderConfig::default(),
+            Arc::new(TailscaleClient::new()),
+        );
+        let body = serde_json::json!({"messages": [{"role": "user", "content": "hi"}]});
+        let direct_url = format!("http://127.0.0.2:{port}/v1/chat/completions");
+
+        let started = std::time::Instant::now();
+        assert!(
+            provider.try_direct(&direct_url, &body).await.is_err(),
+            "a silent direct address must fail fast, not hang"
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_secs(5),
+            "the direct attempt should ride out its full 5s header timeout"
+        );
+        assert!(
+            elapsed < Duration::from_secs(8),
+            "the direct attempt must not burn the 30s outer header timeout"
+        );
     }
 
     #[test]

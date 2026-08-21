@@ -154,11 +154,11 @@ pub struct ProviderConfig {
     pub context_length: Option<i32>,
     /// Per-provider "response timeout" — seconds of *idle* time allowed on an
     /// SSE stream before the daemon treats the provider as stuck and aborts
-    /// the turn with a transient error (default 300s). Only gates on bytes
+    /// the turn with a transient error (default 120s). Only gates on bytes
     /// not arriving; a long, actively-streaming turn is never capped.
     /// Mirrored out of the transport `config` JSON blob as `idle_timeout_secs`
     /// (see `ProviderRouter::register_from_row`), and resolved to a
-    /// `Duration` by `ProviderConfig::idle_timeout` (invalid/missing → 300s).
+    /// `Duration` by `ProviderConfig::idle_timeout` (invalid/missing → 120s).
     #[serde(default)]
     pub idle_timeout_secs: Option<f64>,
     /// Opt-in for `Provider::supports_assistant_prefill` on an
@@ -180,12 +180,16 @@ pub struct ProviderConfig {
 impl ProviderConfig {
     /// Resolve the per-provider SSE idle-read timeout (see
     /// `idle_timeout_secs`). A missing, zero, negative, or non-finite value
-    /// falls back to the 300s default so a malformed blob can never produce a
-    /// zero/instant timeout that kills otherwise-healthy turns.
+    /// falls back to the 120s default so a malformed blob can never produce a
+    /// zero/instant timeout that kills otherwise-healthy turns. The default
+    /// was shortened from 300s (see #10): provider connections now send TCP
+    /// keepalives (OS-level dead-socket detection in ~1-2 min) and streams
+    /// have a total-duration ceiling, so a tighter per-gap idle bound no
+    /// longer risks a healthy turn that is merely slow.
     pub fn idle_timeout(&self) -> Duration {
         match self.idle_timeout_secs {
             Some(s) if s.is_finite() && s > 0.0 => Duration::from_secs_f64(s),
-            _ => Duration::from_secs(300),
+            _ => Duration::from_secs(120),
         }
     }
 }
@@ -763,17 +767,17 @@ server:
         };
         assert_eq!(cfg.idle_timeout(), Duration::from_secs(120));
 
-        // Missing (None) falls back to the 300s default.
+        // Missing (None) falls back to the 120s default.
         let cfg = ProviderConfig::default();
-        assert_eq!(cfg.idle_timeout(), Duration::from_secs(300));
+        assert_eq!(cfg.idle_timeout(), Duration::from_secs(120));
 
-        // Invalid values (zero, negative, non-finite) also fall back to 300s.
+        // Invalid values (zero, negative, non-finite) also fall back to 120s.
         for invalid in [Some(0.0), Some(-5.0), Some(f64::NAN), Some(f64::INFINITY)] {
             let cfg = ProviderConfig {
                 idle_timeout_secs: invalid,
                 ..Default::default()
             };
-            assert_eq!(cfg.idle_timeout(), Duration::from_secs(300));
+            assert_eq!(cfg.idle_timeout(), Duration::from_secs(120));
         }
     }
 }

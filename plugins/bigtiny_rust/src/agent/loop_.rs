@@ -1,11 +1,12 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
 use futures::{Stream, StreamExt};
 use serde_json::{json, Value};
 use sqlx::SqlitePool;
 use std::pin::Pin;
-use std::time::Duration;
 use tokio::sync::{mpsc, Mutex, Notify, Semaphore};
 use tokio::time::Instant;
 
@@ -19,6 +20,7 @@ use crate::agent::sandbox::{allowed_dirs_for_session, check_containment};
 use crate::agent::summarizer_chain::SummarizerChain;
 use crate::agent::types::TimingResult;
 use crate::config::{FallbackConfig, PathwayConfig, SummarizerConfig};
+use crate::error::ProviderError;
 use crate::hitl::manager::HITLManager;
 use crate::mcp::MCPManager;
 use crate::models::mcp::ToolDefinition;
@@ -46,6 +48,49 @@ const SUBSCHEMA_MAP_KEYWORDS: [&str; 4] =
     ["properties", "patternProperties", "$defs", "definitions"];
 /// Keywords whose value is an array of schemas.
 const SUBSCHEMA_LIST_KEYWORDS: [&str; 4] = ["anyOf", "allOf", "oneOf", "prefixItems"];
+
+/// Ceiling for the jittered retry backoff — no retry sleeps longer than this.
+const MAX_BACKOFF_MS: u64 = 60_000;
+
+/// Lock-free xorshift64 — the crate pulls no `rand` dependency, and this
+/// only needs to be *unpredictable enough* to stop retries from colliding
+/// (thundering herd), not cryptographically random.
+fn next_random_u64() -> u64 {
+    static STATE: AtomicU64 = AtomicU64::new(0);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9E37_79B9_7F4A_7C15);
+    // Seed once on first use.
+    let _ = STATE.compare_exchange(0, now | 1, Ordering::Relaxed, Ordering::Relaxed);
+    let mut cur = STATE.load(Ordering::Relaxed);
+    loop {
+        let next = cur ^ (cur << 13);
+        let next = next ^ (next >> 7);
+        let next = next ^ (next << 17);
+        match STATE.compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return next,
+            Err(actual) => cur = actual,
+        }
+    }
+}
+
+/// Partial-jitter exponential backoff in milliseconds for a retry `attempt`
+/// (1-based) with a `retry_delay_ms` base: the cap doubles each attempt up to
+/// `MAX_BACKOFF_MS`, and the actual sleep is a random value in
+/// `[cap/2, cap)` — guaranteed minimum plus spread, so concurrent failures
+/// don't all retry on the same tick.
+fn backoff_ms(retry_delay_ms: u64, attempt: u32) -> u64 {
+    let base = retry_delay_ms.max(1);
+    let cap = base
+        .saturating_mul(1u64 << attempt.saturating_sub(1).min(16))
+        .min(MAX_BACKOFF_MS);
+    let half = cap / 2;
+    if half == 0 {
+        return cap;
+    }
+    half + next_random_u64() % half
+}
 
 /// Rewrite boolean sub-schemas out of a JSON Schema, in place.
 ///
@@ -258,6 +303,21 @@ fn fnv1a64(s: &str) -> u64 {
 /// legitimate reply (a very long essay is a few thousand words, comfortably
 /// under 20k characters) so it never fires in a healthy session.
 const MAX_TURN_CONTENT_CHARS: usize = 300_000;
+
+/// One completed streamed attempt: the assembled content chunks, tool calls,
+/// finish reason, usage, and timing — or a `ProviderError` (including
+/// mid-stream failures, which `process_stream` surfaces the same way as a
+/// pre-stream `chat_completion` error so both ride one retry/failover budget).
+type TurnStreamResult = Result<
+    (
+        Vec<String>,
+        Vec<ToolCall>,
+        Option<String>,
+        Option<Value>,
+        TimingResult,
+    ),
+    ProviderError,
+>;
 
 /// Pure predicate factored out of `AgentLoop::process_stream` so the
 /// containment threshold is unit-testable without constructing a full
@@ -1087,7 +1147,7 @@ impl AgentLoop {
                 1
             };
             let mut attempt = 0u32;
-            let stream = loop {
+            let turn_result = loop {
                 attempt += 1;
                 // Recomputed every attempt, not once up front: fallback can
                 // switch `provider_id` mid-loop (below), and each provider's
@@ -1134,7 +1194,14 @@ impl AgentLoop {
                     }
                     _ => messages.clone(),
                 };
-                match self
+                // A `chat_completion` `Err` and a mid-stream failure from
+                // `process_stream` are the same kind of failure — a transient
+                // error that the retry/failover block below must handle with a
+                // shared attempt budget. (Mid-stream errors used to fall
+                // through as an empty `finish_reason:"error"` delta and then
+                // re-call the same provider unboundedly, one `step` per
+                // failure, until `max_steps` — see `process_stream`.)
+                let outcome: TurnStreamResult = match self
                     .router
                     .chat_completion(
                         &provider_id,
@@ -1146,9 +1213,27 @@ impl AgentLoop {
                     )
                     .await
                 {
-                    Ok(s) => break s,
+                    Ok(s) => self.process_stream(s, event_tx).await,
+                    Err(e) => Err(e),
+                };
+                match outcome {
+                    Ok(result) => break result,
                     Err(e) => {
-                        if attempt >= max_attempts {
+                        // Passive circuit breaker: a transport-class failure
+                        // (connect error, header timeout, mid-stream drop —
+                        // `Request`/`ConnectFailed`/`Timeout`, see
+                        // `is_transport_error`) marks this provider unhealthy
+                        // with a cooldown, so the failover re-resolution below
+                        // — and any future unpinned turn — skips it until a
+                        // health probe flips it back.
+                        if e.is_transport_error() {
+                            self.router.mark_unhealthy(&provider_id, &format!("{e}"));
+                        }
+                        // A fatal classification (bad key, exhausted billing,
+                        // overlong context) won't be fixed by another attempt
+                        // — fail fast instead of burning the budget and
+                        // possibly triggering a pointless `ModelFailover`.
+                        if attempt >= max_attempts || !e.is_retryable() {
                             // release-fixes item 27: `wire_type_tag` is `Some`
                             // for the classified cases the frontend can give
                             // real guidance on (context/credits/auth/network)
@@ -1172,10 +1257,18 @@ impl AgentLoop {
                             });
                             return;
                         }
-                        tokio::time::sleep(std::time::Duration::from_millis(
-                            self.fallback_cfg.retry_delay_ms,
-                        ))
-                        .await;
+                        // Jittered exponential backoff; a provider-supplied
+                        // `Retry-After` hint (429/503) is honored as a floor
+                        // so we don't hammer a rate-limited endpoint on our
+                        // own (shorter) schedule.
+                        let backoff = backoff_ms(self.fallback_cfg.retry_delay_ms, attempt);
+                        let delay_ms = match e.retry_after() {
+                            Some(secs) => backoff.max(secs.saturating_mul(1000)),
+                            None => backoff,
+                        };
+                        if delay_ms > 0 {
+                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                        }
                         // Re-resolve — the router prefers a healthy provider,
                         // so if a background health check has since marked
                         // the one that just failed unhealthy (or another
@@ -1201,7 +1294,7 @@ impl AgentLoop {
             };
 
             let (content_chunks, mut turn_tool_calls, finish_reason, turn_usage, timing) =
-                self.process_stream(stream, event_tx).await;
+                turn_result;
 
             last_provider_id = Some(provider_id.clone());
             last_provider_model = Some(provider_model.clone());
@@ -1641,13 +1734,16 @@ impl AgentLoop {
         &self,
         mut stream: Pin<Box<dyn Stream<Item = Delta> + Send>>,
         event_tx: &mpsc::UnboundedSender<SSEEvent>,
-    ) -> (
-        Vec<String>,
-        Vec<ToolCall>,
-        Option<String>,
-        Option<Value>,
-        TimingResult,
-    ) {
+    ) -> Result<
+        (
+            Vec<String>,
+            Vec<ToolCall>,
+            Option<String>,
+            Option<Value>,
+            TimingResult,
+        ),
+        ProviderError,
+    > {
         let mut content_chunks: Vec<String> = Vec::new();
         let mut tool_calls: Vec<ToolCall> = Vec::new();
         let mut finish_reason: Option<String> = None;
@@ -1660,6 +1756,27 @@ impl AgentLoop {
         let mut content_chars = 0usize;
 
         while let Some(delta) = stream.next().await {
+            // A mid-stream provider failure (connection drop, idle timeout,
+            // or an SSE `error` event) arrives as a Delta with
+            // `error_type == "request"` (see `openai_compat.rs`/`anthropic.rs`
+            // transient-error emission). It used to fall through as an empty
+            // `finish_reason: "error"` delta, and the turn then treated a
+            // non-`stop` finish as "another step" — re-calling the same
+            // provider with no backoff, no failover, and no shared retry
+            // budget, up to `max_steps` times per turn. Surface it as a
+            // `ProviderError` instead so the caller's retry/failover block
+            // handles it exactly like any other transient failure.
+            if delta.error_type.as_deref() == Some("request") {
+                return Err(ProviderError::Request {
+                    user_message: "Provider stream failed mid-response (connection dropped or idle timeout)".to_string(),
+                    raw_message: format!(
+                        "finish_reason={:?} error_type={:?}",
+                        delta.finish_reason, delta.error_type
+                    ),
+                    http_status: 0,
+                });
+            }
+
             if first_token {
                 timing.ttfb_ms = start.elapsed().as_secs_f64() * 1000.0;
                 timing.ttft_ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -1751,7 +1868,7 @@ impl AgentLoop {
             .map(|v| i32::try_from(v).unwrap_or(i32::MAX))
             .unwrap_or(token_count);
 
-        (content_chunks, tool_calls, finish_reason, usage, timing)
+        Ok((content_chunks, tool_calls, finish_reason, usage, timing))
     }
 
     /// Run every tool call in `tool_calls` concurrently (bounded by
@@ -2028,6 +2145,46 @@ impl AgentLoop {
         });
 
         output
+    }
+}
+
+#[cfg(test)]
+mod backoff_tests {
+    use super::backoff_ms;
+
+    #[test]
+    fn backoff_doubles_the_cap_each_attempt() {
+        // Partial jitter: sleep is in [cap/2, cap). Bounds must double per
+        // attempt from the base (1000ms).
+        for attempt in 1..=4u32 {
+            let b = backoff_ms(1000, attempt);
+            assert!(b >= 500, "attempt {attempt}: got {b}");
+            assert!(b < 1000 << (attempt - 1), "attempt {attempt}: got {b}");
+        }
+    }
+
+    #[test]
+    fn backoff_caps_at_the_ceiling() {
+        // Attempt 30 would be 2^29 * base — far past the 60s cap; the sleep
+        // must stay under MAX_BACKOFF_MS.
+        for attempt in [20u32, 30, 50] {
+            let b = backoff_ms(1000, attempt);
+            assert!(b < 60_000, "attempt {attempt}: got {b}");
+        }
+    }
+
+    #[test]
+    fn backoff_is_always_within_its_own_cap() {
+        for delay in [1u64, 250, 1000, 10_000] {
+            for attempt in 1..=10u32 {
+                let b = backoff_ms(delay, attempt);
+                let cap = (delay.max(1) << (attempt - 1).min(16)).min(60_000);
+                assert!(
+                    b <= cap,
+                    "delay {delay} attempt {attempt}: {b} > cap {cap}"
+                );
+            }
+        }
     }
 }
 
@@ -2379,6 +2536,90 @@ mod containment_order_tests {
             !result.contains("denied"),
             "an approved in-dir write must not be denied: {result}"
         );
+    }
+
+    /// #1 regression: a mid-stream transient-error delta (`error_type ==
+    /// "request"`, the shape the parsers emit on a dropped connection, idle
+    /// timeout, or SSE `error` event) must fail the attempt as a
+    /// `ProviderError::Request` so the caller's retry/failover block handles
+    /// it — not fall through as an empty `finish_reason:"error"` that
+    /// triggered unbounded step-retries.
+    #[tokio::test]
+    async fn process_stream_surfaces_a_mid_stream_error_delta_as_a_provider_error() {
+        let (agent_loop, _hitl) = test_loop().await;
+        let (tx, _rx) = mpsc::unbounded_channel::<SSEEvent>();
+        let stream: Pin<Box<dyn Stream<Item = Delta> + Send>> = Box::pin(futures::stream::iter(vec![
+            Delta {
+                role: "assistant".into(),
+                content: None,
+                reasoning: None,
+                tool_calls: None,
+                finish_reason: Some("error".into()),
+                usage: None,
+                error_type: Some("request".into()),
+            },
+        ]));
+        let result = agent_loop.process_stream(stream, &tx).await;
+        match result {
+            Err(ProviderError::Request { .. }) => {}
+            other => panic!("expected ProviderError::Request, got {other:?}"),
+        }
+    }
+
+    /// #1 regression (mirror): even after content was already streamed, a
+    /// trailing transient-error delta must still fail the attempt — partial
+    /// content must never be persisted as if the turn succeeded.
+    #[tokio::test]
+    async fn process_stream_errors_out_even_after_partial_content() {
+        let (agent_loop, _hitl) = test_loop().await;
+        let (tx, _rx) = mpsc::unbounded_channel::<SSEEvent>();
+        let stream: Pin<Box<dyn Stream<Item = Delta> + Send>> = Box::pin(futures::stream::iter(vec![
+            Delta {
+                role: "assistant".into(),
+                content: Some("partial reply".into()),
+                reasoning: None,
+                tool_calls: None,
+                finish_reason: None,
+                usage: None,
+                error_type: None,
+            },
+            Delta {
+                role: "assistant".into(),
+                content: None,
+                reasoning: None,
+                tool_calls: None,
+                finish_reason: Some("error".into()),
+                usage: None,
+                error_type: Some("request".into()),
+            },
+        ]));
+        let result = agent_loop.process_stream(stream, &tx).await;
+        assert!(result.is_err(), "a mid-stream error must fail the attempt");
+    }
+
+    /// A clean stream still succeeds and returns the accumulated chunks.
+    #[tokio::test]
+    async fn process_stream_returns_ok_for_a_clean_stream() {
+        let (agent_loop, _hitl) = test_loop().await;
+        let (tx, _rx) = mpsc::unbounded_channel::<SSEEvent>();
+        let stream: Pin<Box<dyn Stream<Item = Delta> + Send>> = Box::pin(futures::stream::iter(vec![
+            Delta {
+                role: "assistant".into(),
+                content: Some("hello".into()),
+                reasoning: None,
+                tool_calls: None,
+                finish_reason: Some("stop".into()),
+                usage: None,
+                error_type: None,
+            },
+        ]));
+        let (content_chunks, tool_calls, finish_reason, _usage, _timing) = agent_loop
+            .process_stream(stream, &tx)
+            .await
+            .expect("a clean stream must succeed");
+        assert_eq!(content_chunks, vec!["hello".to_string()]);
+        assert!(tool_calls.is_empty());
+        assert_eq!(finish_reason.as_deref(), Some("stop"));
     }
 }
 

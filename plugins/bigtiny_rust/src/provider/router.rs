@@ -302,6 +302,14 @@ impl ProviderRouter {
         let mut candidates: Vec<(bool, i32, String)> = self
             .providers
             .iter()
+            // Known-broken providers are excluded outright when nothing was
+            // explicitly requested: running a turn against an endpoint the
+            // daemon already knows is down wastes the attempt budget and, for
+            // a failing failover, doubles the latency of the eventual error.
+            // `disconnected` (never probed yet — e.g. at daemon startup) is
+            // NOT excluded; with all providers fresh, the first turn would
+            // otherwise fail with `NoHealthyProvider` before any probe ran.
+            .filter(|e| e.health.status != "unhealthy")
             .map(|e| {
                 (
                     e.health.status != "healthy",
@@ -317,8 +325,32 @@ impl ProviderRouter {
             .next()
             .map(|(_, _, id)| id)
             .ok_or_else(|| ProviderError::NoHealthyProvider {
-                user_message: "No providers are configured.".into(),
+                user_message: "No providers are configured or reachable.".into(),
             })
+    }
+
+    /// Passive circuit breaker — called by the agent loop after a
+    /// transport-class failure (`ProviderError::is_transport_error`: connect
+    /// failure, header timeout, or a mid-stream drop surfacing as
+    /// `error_type == "request"`). Marks the provider `unhealthy` with the
+    /// failure reason and starts a cooldown (`health_checked_at = now`):
+    /// `check_all_health` won't re-probe it for `HEALTH_TTL_SECS`, and
+    /// unpinned selection filters it out in the meantime. The next probe
+    /// after the cooldown flips it back to healthy if it recovered.
+    ///
+    /// `AuthFailed`/`InsufficientCredits`/`ContextExceeded` deliberately do
+    /// NOT mark a provider down — a bad key or empty billing account says
+    /// nothing about connectivity, and the failed-over provider would likely
+    /// fail the same way.
+    pub fn mark_unhealthy(&self, provider_id: &str, reason: &str) {
+        if let Some(mut entry) = self.providers.get_mut(provider_id) {
+            entry.health = HealthStatus {
+                status: "unhealthy".into(),
+                latency_ms: None,
+                error: Some(reason.into()),
+            };
+            entry.health_checked_at = Instant::now();
+        }
     }
 
     pub async fn check_all_health(&self) {
@@ -721,6 +753,98 @@ mod tests {
 
     /// A `preferred_id` naming a provider that isn't registered at all (a
     /// stale id on an old session, say) still falls back rather than failing.
+    /// All-unhealthy registry: unpinned selection must fail rather than run
+    /// the turn against a provider the daemon already knows is down — this
+    /// was the pre-#6 behavior (`NoHealthyProvider` only fired on an *empty*
+    /// map).
+    #[test]
+    fn unpinned_selection_rejects_an_all_unhealthy_registry() {
+        let router = ProviderRouter::default();
+        router.register_openai(
+            "down-a",
+            ProviderConfig {
+                fallback_priority: 1,
+                ..Default::default()
+            },
+        );
+        router.register_openai(
+            "down-b",
+            ProviderConfig {
+                fallback_priority: 2,
+                ..Default::default()
+            },
+        );
+        router.set_health_for_test("down-a", "unhealthy");
+        router.set_health_for_test("down-b", "unhealthy");
+        assert!(router.get_provider_id(None).is_err());
+    }
+
+    /// A provider marked down by the circuit breaker (or a probe) is skipped
+    /// on failover re-resolution, even when it outranks the healthy backup by
+    /// `fallback_priority` — this is what lets the loop actually fail over
+    /// instead of re-picking the same broken endpoint.
+    #[test]
+    fn an_unhealthy_provider_is_filtered_out_of_unpinned_selection() {
+        let router = ProviderRouter::default();
+        router.register_openai(
+            "circuit-broken",
+            ProviderConfig {
+                fallback_priority: 1,
+                ..Default::default()
+            },
+        );
+        router.register_openai(
+            "healthy-backup",
+            ProviderConfig {
+                fallback_priority: 50,
+                ..Default::default()
+            },
+        );
+        router.mark_unhealthy("circuit-broken", "connection reset");
+
+        assert_eq!(router.get_provider_id(None).unwrap(), "healthy-backup");
+    }
+
+    /// `disconnected` (never probed — e.g. right after daemon startup) must
+    /// stay selectable: with every provider fresh, an unpinned first turn
+    /// would otherwise fail before any health probe ran.
+    #[test]
+    fn disconnected_providers_remain_selectable_unpinned() {
+        let router = ProviderRouter::default();
+        router.register_openai("fresh", ProviderConfig::default());
+        assert_eq!(router.get_provider_id(None).unwrap(), "fresh");
+    }
+
+    /// The circuit breaker must not be tripped by non-connectivity errors:
+    /// a pinned provider with a bad key stays selectable (the explicit
+    /// choice must still win and fail loudly as itself).
+    #[test]
+    fn a_pinned_provider_is_never_filtered_out() {
+        let router = ProviderRouter::default();
+        router.register_openai(
+            "pinned",
+            ProviderConfig {
+                fallback_priority: 1,
+                ..Default::default()
+            },
+        );
+        router.register_openai(
+            "healthy",
+            ProviderConfig {
+                fallback_priority: 100,
+                ..Default::default()
+            },
+        );
+        router.set_health_for_test("pinned", "unhealthy");
+        router.set_health_for_test("healthy", "healthy");
+
+        assert_eq!(
+            router.get_provider_id(Some("pinned")).unwrap(),
+            "pinned",
+            "an explicit choice must win even when known to be down"
+        );
+    }
+
     #[test]
     fn an_unregistered_preferred_id_falls_back_by_priority() {
         let router = ProviderRouter::default();

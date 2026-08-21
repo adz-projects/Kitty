@@ -5,10 +5,11 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::base::{
-    classify_provider_error, Delta, Effort, HealthStatus, ModelInfo, Provider, SamplingParams,
+    classify_provider_error, classify_transport_error, parse_retry_after, read_bounded_error_body,
+    Delta, Effort, HealthStatus, ModelInfo, Provider, SamplingParams,
 };
 use crate::config::{CacheConfig, ProviderConfig};
 use crate::error::ProviderError;
@@ -80,6 +81,18 @@ pub struct AnthropicProvider {
 /// `openai_compat::RESPONSE_HEADERS_TIMEOUT`.
 const RESPONSE_HEADERS_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Bounds time-to-headers for the direct Tailscale attempt only — see
+/// `openai_compat::DIRECT_HEADERS_TIMEOUT`.
+const DIRECT_HEADERS_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// TCP keepalive probe interval for provider connections — see
+/// `openai_compat::TCP_KEEPALIVE_INTERVAL` (the #10 dead-socket rationale).
+const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Total-duration ceiling for one streamed response — see
+/// `openai_compat::MAX_STREAM_DURATION` (the #10 dribble rationale).
+const MAX_STREAM_DURATION: Duration = Duration::from_secs(3600);
+
 impl AnthropicProvider {
     pub const DEFAULT_MODEL: &'static str = "claude-sonnet-4-20250514";
 
@@ -90,18 +103,41 @@ impl AnthropicProvider {
         cache: CacheConfig,
     ) -> Self {
         let idle_timeout = config.idle_timeout();
-        let client = reqwest::Client::builder()
+        let client = match reqwest::Client::builder()
             // Same rationale as openai_compat.rs: bound the TCP/TLS setup
             // phase (a stalled-before-headers provider must not block
             // `chat_completion` forever) without imposing a whole-request
             // timeout on long SSE bodies.
             .connect_timeout(std::time::Duration::from_secs(30))
+            .tcp_keepalive(TCP_KEEPALIVE_INTERVAL)
             .build()
-            .unwrap_or_default();
-        let direct_client = reqwest::Client::builder()
+        {
+            Ok(c) => c,
+            // Don't degrade silently (see #12) — see openai_compat.rs.
+            Err(e) => {
+                tracing::error!(
+                    provider_id = %provider_id,
+                    error = %e,
+                    "failed to build the provider HTTP client; falling back to a default client (no connect-timeout/keepalive)"
+                );
+                reqwest::Client::new()
+            }
+        };
+        let direct_client = match reqwest::Client::builder()
             .connect_timeout(crate::network::DIRECT_CONNECT_TIMEOUT)
+            .tcp_keepalive(TCP_KEEPALIVE_INTERVAL)
             .build()
-            .unwrap_or_default();
+        {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(
+                    provider_id = %provider_id,
+                    error = %e,
+                    "failed to build the Tailscale direct HTTP client; falling back to a default client (no connect-timeout/keepalive)"
+                );
+                reqwest::Client::new()
+            }
+        };
         Self {
             provider_id: provider_id.into(),
             client,
@@ -114,22 +150,15 @@ impl AnthropicProvider {
     }
 
     /// See `OpenAICompatibleProvider::send_preferring_direct` — same
-    /// Tailscale direct-address-first, tunnel-fallback behavior.
+    /// Tailscale direct-address-first, tunnel-fallback behavior, including
+    /// falling back on a stale direct address's non-success response.
     async fn send_preferring_direct(
         &self,
         url: &str,
         body: &Value,
     ) -> Result<reqwest::Response, reqwest::Error> {
         if let Some(direct_url) = maybe_direct_url(&self.tailscale, url).await {
-            let direct = self
-                .direct_client
-                .post(&direct_url)
-                .header("x-api-key", &self.config.api_key)
-                .header("anthropic-version", "2023-06-01")
-                .json(body)
-                .send()
-                .await;
-            if let Ok(resp) = direct {
+            if let Ok(resp) = self.try_direct(&direct_url, body).await {
                 return Ok(resp);
             }
         }
@@ -140,6 +169,27 @@ impl AnthropicProvider {
             .json(body)
             .send()
             .await
+    }
+
+    /// See `OpenAICompatibleProvider::try_direct` — same
+    /// `DIRECT_HEADERS_TIMEOUT`-bounded single direct attempt; non-success
+    /// responses are not usable and trigger the tunnel fallback.
+    async fn try_direct(
+        &self,
+        direct_url: &str,
+        body: &Value,
+    ) -> Result<reqwest::Response, ()> {
+        let direct = self
+            .direct_client
+            .post(direct_url)
+            .header("x-api-key", &self.config.api_key)
+            .header("anthropic-version", "2023-06-01")
+            .json(body)
+            .send();
+        match tokio::time::timeout(DIRECT_HEADERS_TIMEOUT, direct).await {
+            Ok(Ok(resp)) if resp.status().is_success() => Ok(resp),
+            _ => Err(()),
+        }
     }
 
     fn group_tool_results(messages: &[Value]) -> Vec<Value> {
@@ -428,7 +478,7 @@ impl Provider for AnthropicProvider {
             self.send_preferring_direct(&url, &body),
         )
         .await
-        .map_err(|_| ProviderError::Request {
+        .map_err(|_| ProviderError::Timeout {
             user_message: format!(
                 "Anthropic sent no response headers within {}s",
                 RESPONSE_HEADERS_TIMEOUT.as_secs()
@@ -436,16 +486,17 @@ impl Provider for AnthropicProvider {
             raw_message: "timed out waiting for response headers".into(),
             http_status: 0,
         })?
-        .map_err(|e| ProviderError::Request {
-            user_message: format!("Failed to connect to Anthropic: {}", e),
-            raw_message: e.to_string(),
-            http_status: 0,
-        })?;
+        .map_err(|e| classify_transport_error(&e, format!("failed to reach Anthropic: {e}")))?;
 
         let status_code = resp.status().as_u16();
         if !resp.status().is_success() {
-            let body_text = resp.text().await.unwrap_or_default();
-            return Err(classify_provider_error(status_code, &body_text));
+            // `Retry-After` (429/503) must be read before the body is
+            // consumed — the retry loop honors it as a backoff floor.
+            let retry_after = parse_retry_after(resp.headers());
+            // Bounded in both time and size — a stalled error body used to
+            // hang the turn forever (see `read_bounded_error_body`).
+            let body_text = read_bounded_error_body(resp).await;
+            return Err(classify_provider_error(status_code, &body_text, retry_after));
         }
 
         let stream = resp.bytes_stream();
@@ -464,21 +515,20 @@ impl Provider for AnthropicProvider {
             .timeout(std::time::Duration::from_secs(5))
             .send()
             .await
-            .map_err(|e| ProviderError::Request {
-                user_message: format!("Failed to discover models: {}", e),
-                raw_message: e.to_string(),
-                http_status: 0,
+            .map_err(|e| {
+                classify_transport_error(&e, format!("failed to discover models: {e}"))
             })?;
 
         if !resp.status().is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(classify_provider_error(0, &body));
+            return Err(classify_provider_error(0, &body, None));
         }
 
         let data: Value = resp.json().await.map_err(|e| ProviderError::Other {
             user_message: format!("Failed to parse models response: {}", e),
             raw_message: e.to_string(),
             http_status: 0,
+            retry_after_secs: None,
         })?;
 
         let models: Vec<ModelInfo> = data["data"]
@@ -601,6 +651,13 @@ struct PendingToolCall {
     input_json: String,
 }
 
+/// Cap on the line buffer between newlines — mirror of openai_compat.rs's
+/// `MAX_SSE_LINE_BYTES` (see #7).
+const MAX_SSE_LINE_BYTES: usize = 8 * 1024 * 1024;
+/// Cap on accumulated streamed tool-input JSON per tool block — mirror of
+/// openai_compat.rs's `MAX_TOOL_ARGUMENTS_BYTES`.
+const MAX_TOOL_ARGUMENTS_BYTES: usize = 1024 * 1024;
+
 type RawBytesStream = Pin<Box<dyn Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>>;
 
 struct AnthropicSSEStream {
@@ -614,6 +671,8 @@ struct AnthropicSSEStream {
     buf: Vec<u8>,
     pending: std::collections::VecDeque<Delta>,
     done: bool,
+    /// When this stream's response started — see `MAX_STREAM_DURATION` (#10).
+    stream_started: Instant,
 }
 
 fn parse_anthropic_sse(
@@ -631,6 +690,7 @@ fn parse_anthropic_sse(
         buf: Vec::new(),
         pending: std::collections::VecDeque::new(),
         done: false,
+        stream_started: Instant::now(),
     }
 }
 
@@ -732,6 +792,22 @@ impl AnthropicSSEStream {
                     if let Some(partial) = delta["partial_json"].as_str() {
                         let idx = json["index"].as_u64().unwrap_or(0) as usize;
                         if let Some(entry) = self.tool_input_buf.get_mut(&idx) {
+                            if entry.input_json.len() + partial.len() > MAX_TOOL_ARGUMENTS_BYTES {
+                                // Unbounded per-tool accumulation was an OOM
+                                // vector (see #7) — terminate as a transient
+                                // error so the turn routes through
+                                // retry/failover.
+                                self.pending.push_back(Delta {
+                                    role: "assistant".into(),
+                                    content: None,
+                                    reasoning: None,
+                                    tool_calls: None,
+                                    finish_reason: Some("error".into()),
+                                    usage: None,
+                                    error_type: Some("request".into()),
+                                });
+                                return true;
+                            }
                             entry.input_json.push_str(partial);
                         }
                     }
@@ -802,6 +878,24 @@ impl AnthropicSSEStream {
             "message_stop" => {
                 return true;
             }
+            // An Anthropic `error` event (overloaded, rate-limited,
+            // mid-stream failure) was previously ignored — the stream then
+            // ended with no finish reason, feeding the unbounded step-retry
+            // path in `agent::loop_` (see #1). Surface it as the same
+            // transient-error delta as a dropped connection so
+            // `process_stream` routes it through retry/failover.
+            "error" => {
+                self.pending.push_back(Delta {
+                    role: "assistant".into(),
+                    content: None,
+                    reasoning: None,
+                    tool_calls: None,
+                    finish_reason: Some("error".into()),
+                    usage: None,
+                    error_type: Some("request".into()),
+                });
+                return true;
+            }
             _ => {}
         }
         false
@@ -819,10 +913,43 @@ impl Stream for AnthropicSSEStream {
             if self.done {
                 return Poll::Ready(None);
             }
+            // Total-stream-duration cap (see #10, `MAX_STREAM_DURATION`) —
+            // mirror of openai_compat.rs: the idle-read timeout only bounds
+            // gaps between bytes, so anything that keeps just enough bytes
+            // flowing must still be cut off eventually. Pending deltas are
+            // drained first (the check sits below the drain).
+            if self.stream_started.elapsed() >= MAX_STREAM_DURATION {
+                self.pending.push_back(Delta {
+                    role: "assistant".into(),
+                    content: None,
+                    reasoning: None,
+                    tool_calls: None,
+                    finish_reason: Some("error".into()),
+                    usage: None,
+                    error_type: Some("request".into()),
+                });
+                self.done = true;
+                continue;
+            }
 
             match self.inner.as_mut().poll_next(cx) {
                 Poll::Ready(Some(Ok(Ok(chunk)))) => {
                     self.buf.extend_from_slice(&chunk);
+                    // Unbounded line buffer was an OOM vector (see #7) —
+                    // mirror of openai_compat.rs.
+                    if self.buf.len() > MAX_SSE_LINE_BYTES {
+                        self.pending.push_back(Delta {
+                            role: "assistant".into(),
+                            content: None,
+                            reasoning: None,
+                            tool_calls: None,
+                            finish_reason: Some("error".into()),
+                            usage: None,
+                            error_type: Some("request".into()),
+                        });
+                        self.done = true;
+                        continue;
+                    }
                     while let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
                         let mut raw: Vec<u8> = self.buf.drain(..=pos).collect();
                         while matches!(raw.last(), Some(&b'\r') | Some(&b'\n')) {
@@ -1036,6 +1163,79 @@ mod sse_tests {
             .collect()
             .await;
         let last = deltas.last().expect("expected at least the error Delta");
+        assert_eq!(last.error_type.as_deref(), Some("request"));
+        assert_eq!(last.finish_reason.as_deref(), Some("error"));
+    }
+
+    #[tokio::test]
+    async fn error_event_surfaces_as_a_transient_error_delta() {
+        // An Anthropic `error` event (e.g. overloaded/rate-limited mid-stream)
+        // was previously ignored entirely — the stream then ended with no
+        // finish reason, feeding the unbounded step-retry path in
+        // `agent::loop_`. It must surface as the same transient-error delta as
+        // a dropped connection so `process_stream` retries/fails over.
+        let chunk = "event: error\n\n\
+                     data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n";
+        let inner = stream::iter(vec![Ok::<bytes::Bytes, reqwest::Error>(
+            bytes::Bytes::from(chunk),
+        )]);
+        let deltas: Vec<Delta> = parse_anthropic_sse(inner, Duration::from_secs(300))
+            .collect()
+            .await;
+        let last = deltas.last().expect("expected the error Delta");
+        assert_eq!(last.error_type.as_deref(), Some("request"));
+        assert_eq!(last.finish_reason.as_deref(), Some("error"));
+    }
+
+    /// #7 regression: garbage without newlines must not grow the line buffer
+    /// unboundedly — past `MAX_SSE_LINE_BYTES` the stream terminates with
+    /// the transient-error delta.
+    #[tokio::test]
+    async fn an_overlong_line_without_newline_terminates_as_a_transient_error() {
+        let garbage = vec![b'x'; MAX_SSE_LINE_BYTES + 1];
+        let inner = stream::iter(vec![Ok::<bytes::Bytes, reqwest::Error>(bytes::Bytes::from(
+            garbage,
+        ))]);
+        let deltas: Vec<Delta> = parse_anthropic_sse(inner, Duration::from_secs(300))
+            .collect()
+            .await;
+        assert_eq!(deltas.len(), 1, "exactly one transient-error delta");
+        assert_eq!(deltas[0].error_type.as_deref(), Some("request"));
+        assert_eq!(deltas[0].finish_reason.as_deref(), Some("error"));
+    }
+
+    /// #7 regression: unbounded per-tool input_json accumulation must
+    /// terminate as a transient error rather than growing memory forever.
+    #[tokio::test]
+    async fn overlong_tool_input_terminates_as_a_transient_error() {
+        let huge_json = "x".repeat(MAX_TOOL_ARGUMENTS_BYTES + 1);
+        let chunk = format!(
+            "event: content_block_start\n\
+             data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"boom\"}}}}\n\n\
+             event: content_block_delta\n\
+             data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":\"{huge_json}\"}}}}\n\n"
+        );
+        let inner = stream::iter(vec![Ok::<bytes::Bytes, reqwest::Error>(
+            bytes::Bytes::from(chunk),
+        )]);
+        let deltas: Vec<Delta> = parse_anthropic_sse(inner, Duration::from_secs(300))
+            .collect()
+            .await;
+        let last = deltas.last().expect("expected the transient-error Delta");
+        assert_eq!(last.error_type.as_deref(), Some("request"));
+        assert_eq!(last.finish_reason.as_deref(), Some("error"));
+    }
+
+    /// #10 regression: a stream open longer than `MAX_STREAM_DURATION` must
+    /// terminate as a transient error instead of waiting on a provider that
+    /// keeps just enough bytes flowing to beat the idle-read timeout.
+    #[tokio::test]
+    async fn a_stream_past_the_total_duration_cap_terminates_as_a_transient_error() {
+        let silent = stream::pending::<Result<bytes::Bytes, reqwest::Error>>();
+        let mut s = parse_anthropic_sse(silent, Duration::from_secs(300));
+        s.stream_started = Instant::now() - (MAX_STREAM_DURATION + Duration::from_secs(1));
+        let deltas: Vec<Delta> = s.collect().await;
+        let last = deltas.last().expect("expected the transient-error Delta");
         assert_eq!(last.error_type.as_deref(), Some("request"));
         assert_eq!(last.finish_reason.as_deref(), Some("error"));
     }

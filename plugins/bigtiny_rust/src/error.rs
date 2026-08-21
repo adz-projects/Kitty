@@ -107,10 +107,38 @@ pub enum ProviderError {
         user_message: String,
         raw_message: String,
         http_status: i32,
+        /// Seconds the provider asked us to wait before retrying
+        /// (`Retry-After` on 429/503). `None` when the response carried no
+        /// such hint — the retry loop then uses its own backoff.
+        retry_after_secs: Option<u64>,
     },
 
     #[error("request failed: {user_message}")]
     Request {
+        user_message: String,
+        raw_message: String,
+        http_status: i32,
+    },
+
+    /// The TCP/TLS connection to the provider itself failed (DNS, refusal,
+    /// reset during handshake) — the network path to the provider is down
+    /// right now (see #11). Distinct from `Timeout` (the network is up, the
+    /// peer stalled) and `Request` (the request was sent and failed
+    /// mid-flight) so the retry policy and wire tags can tell the classes
+    /// apart instead of the old single catch-all.
+    #[error("cannot connect to provider: {user_message}")]
+    ConnectFailed {
+        user_message: String,
+        raw_message: String,
+        http_status: i32,
+    },
+
+    /// The connection was (or tried to be) established but the provider went
+    /// silent past the deadline — no response headers in time, or the body
+    /// stream stalled (see #11). The network is reachable; the peer is
+    /// stuck, throttled, or crashed mid-request.
+    #[error("provider request timed out: {user_message}")]
+    Timeout {
         user_message: String,
         raw_message: String,
         http_status: i32,
@@ -127,8 +155,10 @@ impl ProviderError {
     /// generic "something went wrong". `None` for everything else, which
     /// stays on the existing generic error path unchanged.
     ///
-    /// `Request` covers every connect/timeout failure across both provider
-    /// implementations (see `anthropic.rs`/`openai_compat.rs` — constructed
+    /// `Request`/`ConnectFailed`/`Timeout` (the transport-class failures —
+    /// see `is_transport_error`) cover every connect/timeout/network failure
+    /// across both provider implementations (see `anthropic.rs`/
+    /// `openai_compat.rs` — constructed via `classify_transport_error` or
     /// directly, never through `classify_provider_error`, since there's no
     /// HTTP response to classify) — that's exactly "can't reach the
     /// provider", tagged `network_unreachable` here.
@@ -137,7 +167,9 @@ impl ProviderError {
             ProviderError::InsufficientCredits { .. } => Some("insufficient_credits"),
             ProviderError::ContextExceeded { .. } => Some("context_exceeded"),
             ProviderError::AuthFailed { .. } => Some("auth_failed"),
-            ProviderError::Request { .. } => Some("network_unreachable"),
+            ProviderError::Request { .. }
+            | ProviderError::ConnectFailed { .. }
+            | ProviderError::Timeout { .. } => Some("network_unreachable"),
             ProviderError::Http(_)
             | ProviderError::SseParse(_)
             | ProviderError::NotImplemented(_)
@@ -145,6 +177,50 @@ impl ProviderError {
             | ProviderError::Other { .. }
             | ProviderError::NoHealthyProvider { .. } => None,
         }
+    }
+
+    /// Whether retrying (or failing over to another provider) can plausibly
+    /// succeed. `false` for the fatal classifications — a bad API key, an
+    /// exhausted billing account, or an overlong context will not be fixed by
+    /// another attempt, and re-sending the same failing request to another
+    /// provider just burns the budget (and can trigger a pointless
+    /// `ModelFailover` to a provider that fails the same way). Everything
+    /// else (`Request`/transport, `Http`, `Other`/5xx/429) is transient and
+    /// retryable.
+    pub fn is_retryable(&self) -> bool {
+        !matches!(
+            self,
+            ProviderError::AuthFailed { .. }
+                | ProviderError::InsufficientCredits { .. }
+                | ProviderError::ContextExceeded { .. }
+        )
+    }
+
+    /// Seconds the provider asked us to wait before retrying, if any —
+    /// populated from the `Retry-After` header on a rate-limited/throttled
+    /// response. The retry loop uses this as a floor for its backoff.
+    pub fn retry_after(&self) -> Option<u64> {
+        match self {
+            ProviderError::Other {
+                retry_after_secs, ..
+            } => *retry_after_secs,
+            _ => None,
+        }
+    }
+
+    /// True for the transport-class failures — `Request`, `ConnectFailed`,
+    /// and `Timeout` (see #11). These all mean "the connection to the
+    /// provider is broken right now"; the passive circuit breaker in
+    /// `agent::loop_` uses this to mark the provider unhealthy (with a
+    /// cooldown) rather than hammering it again. Distinct from HTTP-status
+    /// failures (bad key, 5xx, 429) where the connection itself was fine.
+    pub fn is_transport_error(&self) -> bool {
+        matches!(
+            self,
+            ProviderError::Request { .. }
+                | ProviderError::ConnectFailed { .. }
+                | ProviderError::Timeout { .. }
+        )
     }
 }
 

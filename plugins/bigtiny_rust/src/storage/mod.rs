@@ -109,15 +109,6 @@ async fn bootstrap_legacy_python_schema(pool: &SqlitePool) -> Result<(), Storage
         return Ok(());
     }
 
-    let already_bootstrapped: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations'",
-    )
-    .fetch_one(pool)
-    .await?;
-    if already_bootstrapped > 0 {
-        return Ok(());
-    }
-
     let max_version: i64 =
         sqlx::query_scalar("SELECT COALESCE(MAX(version), 0) FROM schema_version")
             .fetch_one(pool)
@@ -126,14 +117,48 @@ async fn bootstrap_legacy_python_schema(pool: &SqlitePool) -> Result<(), Storage
         return Ok(());
     }
 
+    let migrator = sqlx::migrate!("./migrations");
+    let legacy_rows: Vec<_> = migrator
+        .iter()
+        .filter(|m| m.version <= max_version)
+        .collect();
+
+    // If every legacy version is already recorded, the bootstrap is complete
+    // (this is the normal second-open path, and also the pre-fix crash state
+    // where only *some* rows made it in). Otherwise finish seeding below.
+    // `_sqlx_migrations` may not exist yet on a first open, so probe
+    // `sqlite_master` first (a straight COUNT on the table would error).
+    let has_sqlx_table: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations'",
+    )
+    .fetch_one(pool)
+    .await?;
+    let recorded: i64 = if has_sqlx_table > 0 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations WHERE version <= ?1")
+            .bind(max_version)
+            .fetch_one(pool)
+            .await?
+    } else {
+        0
+    };
+    if (recorded as usize) >= legacy_rows.len() {
+        return Ok(());
+    }
+
+    // Seed the missing synthetic "already applied" rows atomically. A crash
+    // mid-loop would leave a *partial* `_sqlx_migrations` table; the next
+    // boot's completeness check would then still see rows missing, so
+    // `sqlx::migrate!` would re-apply the already-done ALTER TABLEs and brick
+    // the daemon with "duplicate column name". `BEGIN IMMEDIATE` takes the
+    // write lock up front so this can't deadlock against a concurrent reader.
     let mut conn = pool.acquire().await?;
     conn.ensure_migrations_table()
         .await
         .map_err(|e| StorageError::Generic(e.to_string()))?;
 
-    let migrator = sqlx::migrate!("./migrations");
-    for m in migrator.iter().filter(|m| m.version <= max_version) {
-        sqlx::query(
+    sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+    for m in &legacy_rows {
+        if let Err(e) = sqlx::query(
             "INSERT OR IGNORE INTO _sqlx_migrations \
              (version, description, success, checksum, execution_time) \
              VALUES (?1, ?2, TRUE, ?3, -1)",
@@ -142,8 +167,13 @@ async fn bootstrap_legacy_python_schema(pool: &SqlitePool) -> Result<(), Storage
         .bind(m.description.as_ref())
         .bind(m.checksum.as_ref())
         .execute(&mut *conn)
-        .await?;
+        .await
+        {
+            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+            return Err(e.into());
+        }
     }
+    sqlx::query("COMMIT").execute(&mut *conn).await?;
 
     Ok(())
 }
@@ -404,6 +434,94 @@ mod tests {
         let db2 = super::Database::connect(db_path.to_str().unwrap())
             .await
             .expect("reconnecting to an already-bootstrapped db must succeed");
+        let session = sessions::get_session(db2.pool(), "legacy-sess")
+            .await
+            .unwrap();
+        assert!(session.is_some());
+
+        drop(db2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression test for the mid-bootstrap crash: a `_sqlx_migrations` table
+    /// left *partial* (the pre-fix crash state) must not make `sqlx::migrate!`
+    /// re-apply the already-done ALTER TABLEs ("duplicate column name") and
+    /// brick the daemon. The bootstrap completes the missing rows instead.
+    #[tokio::test]
+    async fn connect_heals_a_partial_legacy_bootstrap() {
+        let dir = std::env::temp_dir().join(format!(
+            "bigtiny-rust-legacy-partial-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("bigtiny.db");
+
+        legacy_python_db_at_v003(&db_path).await;
+
+        // Simulate the pre-fix crash state: `_sqlx_migrations` was created and
+        // only version 1's synthetic row was seeded before the process died
+        // mid-bootstrap (rows used to be inserted one-by-one in autocommit).
+        // Versions 2-3 are unrecorded and sqlx has never run past them, so a
+        // naive re-open re-applies the already-done ALTER TABLEs.
+        let pool = SqlitePool::connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&db_path)
+                .create_if_missing(true),
+        )
+        .await
+        .unwrap();
+        sqlx::raw_sql(
+            "CREATE TABLE _sqlx_migrations (
+                version BIGINT PRIMARY KEY,
+                description TEXT NOT NULL,
+                installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                success BOOLEAN NOT NULL,
+                checksum BLOB NOT NULL,
+                execution_time BIGINT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let m1 = sqlx::migrate!("./migrations")
+            .iter()
+            .find(|m| m.version == 1)
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO _sqlx_migrations \
+             (version, description, success, checksum, execution_time) \
+             VALUES (?1, ?2, TRUE, ?3, -1)",
+        )
+        .bind(m1.version)
+        .bind(m1.description.as_ref())
+        .bind(m1.checksum.as_ref())
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        // Reconnect must succeed (previously "duplicate column name:
+        // tool_call_id"/"content_format" once 002/003 were re-applied) and
+        // must re-seed the missing rows so bookkeeping is complete before
+        // sqlx runs.
+        let db2 = super::Database::connect(db_path.to_str().unwrap())
+            .await
+            .expect("connect must heal a partial legacy bootstrap");
+        let recorded: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM _sqlx_migrations WHERE version <= 3",
+        )
+        .fetch_one(db2.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            recorded, 3,
+            "expected all 3 legacy versions to be re-seeded"
+        );
+
         let session = sessions::get_session(db2.pool(), "legacy-sess")
             .await
             .unwrap();

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use ipnet::IpNet;
@@ -13,6 +13,16 @@ pub static TAILSCALE_NETWORK: Lazy<IpNet> =
     Lazy::new(|| IpNet::new(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 0)), 10).unwrap());
 pub const TAILSCALE_LOCAL_API: &str = "http://[::1]:42711/localapi/v0/status?peers=1";
 pub const DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long a fetched peer map is trusted before re-querying the local
+/// Tailscale API — a network change must not leave the daemon dialing stale
+/// direct IPs forever (see #9).
+const PEERS_CACHE_TTL: Duration = Duration::from_secs(600);
+/// How long a resolved direct address is trusted before re-resolving (and
+/// re-checking it against the current peer map) — see #9.
+const RESOLVED_CACHE_TTL: Duration = Duration::from_secs(300);
+/// Ceiling for a single `lookup_host` call — a stuck system resolver used to
+/// delay every Tailscale-provider request indefinitely (see #8).
+const DNS_RESOLVE_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone)]
 pub struct TailscalePeer {
@@ -22,8 +32,8 @@ pub struct TailscalePeer {
 }
 
 pub struct TailscaleClient {
-    peers_cache: Mutex<Option<HashMap<String, TailscalePeer>>>,
-    resolved_cache: DashMap<String, Option<String>>,
+    peers_cache: Mutex<Option<(Instant, HashMap<String, TailscalePeer>)>>,
+    resolved_cache: DashMap<String, (Instant, Option<String>)>,
     warned_unavailable: AtomicBool,
     client: Client,
 }
@@ -49,11 +59,16 @@ impl TailscaleClient {
 
     pub async fn get_peers(&self) -> HashMap<String, TailscalePeer> {
         let mut cache = self.peers_cache.lock().await;
-        if cache.is_some() {
-            return cache.clone().unwrap_or_default();
+        // TTL instead of never-expiring (see #9): a cached peer map older
+        // than `PEERS_CACHE_TTL` is discarded and re-fetched, so a changed
+        // network (peer re-IP'd, gone, etc.) is picked up without a restart.
+        if let Some((fetched_at, peers)) = cache.as_ref() {
+            if fetched_at.elapsed() < PEERS_CACHE_TTL {
+                return peers.clone();
+            }
         }
         let peers = self.fetch_peers().await;
-        *cache = Some(peers.clone());
+        *cache = Some((Instant::now(), peers.clone()));
         peers
     }
 
@@ -131,35 +146,77 @@ impl TailscaleClient {
     /// to exercise `maybe_direct_url`'s full behavior in a unit test.
     #[cfg(test)]
     pub(crate) fn seed_resolved_for_test(&self, host_or_ip: &str, direct_ip: Option<String>) {
-        self.resolved_cache.insert(host_or_ip.to_string(), direct_ip);
+        self.resolved_cache
+            .insert(host_or_ip.to_string(), (Instant::now(), direct_ip));
     }
 
     pub async fn resolve_direct_ip(&self, host_or_ip: &str) -> Option<String> {
+        // TTL instead of never-expiring (see #9): a resolved address older
+        // than `RESOLVED_CACHE_TTL` is re-resolved against a fresh peer map,
+        // so a peer that changed IPs after a network change stops being
+        // dialed at its old address.
         if let Some(cached) = self.resolved_cache.get(host_or_ip) {
-            return cached.value().clone();
+            if cached.value().0.elapsed() < RESOLVED_CACHE_TTL {
+                return cached.value().1.clone();
+            }
         }
 
         let peers = self.get_peers().await;
-        let peer = peers.get(host_or_ip)?;
+        let Some(peer) = peers.get(host_or_ip) else {
+            // The peer is gone from the current map — don't keep a stale
+            // resolved address for it any longer.
+            self.resolved_cache.remove(host_or_ip);
+            return None;
+        };
 
         let direct_ip = Self::resolve_dns_excluding_tailscale(&peer.name).await;
-        self.resolved_cache
-            .insert(host_or_ip.to_string(), direct_ip.clone());
+        self.resolved_cache.insert(
+            host_or_ip.to_string(),
+            (Instant::now(), direct_ip.clone()),
+        );
         direct_ip
     }
+}
 
-    async fn resolve_dns_excluding_tailscale(hostname: &str) -> Option<String> {
-        match tokio::net::lookup_host((hostname, 0)).await {
-            Ok(addrs) => {
-                for addr in addrs {
-                    if !TAILSCALE_NETWORK.contains(&addr.ip()) {
-                        return Some(addr.ip().to_string());
-                    }
-                }
-                None
+/// Prefer the first IPv4 address outside the Tailscale CGNAT range, falling
+/// back to an IPv6 one if that's all there is — see
+/// `resolve_dns_excluding_tailscale`. Split out so the ordering policy is
+/// testable without touching OS-level DNS.
+fn pick_direct_address(addrs: impl Iterator<Item = std::net::SocketAddr>) -> Option<String> {
+    let mut v6_fallback: Option<String> = None;
+    for addr in addrs {
+        if !TAILSCALE_NETWORK.contains(&addr.ip()) {
+            if addr.is_ipv4() {
+                return Some(addr.ip().to_string());
             }
-            Err(_) => None,
+            if v6_fallback.is_none() {
+                v6_fallback = Some(addr.ip().to_string());
+            }
         }
+    }
+    v6_fallback
+}
+
+impl TailscaleClient {
+    /// `lookup_host` with a hard timeout and IPv4-first ordering — the two
+    /// #8 fixes. A stuck system resolver used to delay every
+    /// Tailscale-provider request indefinitely (there was no timeout at all),
+    /// and the *first* non-Tailscale result (frequently IPv6-only on Android)
+    /// was used verbatim even when unreachable. The direct-LAN shortcut is an
+    /// optimization, not a requirement — the tunnel remains the authoritative
+    /// path, so a `None` here just means "skip the direct attempt".
+    async fn resolve_dns_excluding_tailscale(hostname: &str) -> Option<String> {
+        let lookup = async {
+            match tokio::net::lookup_host((hostname, 0)).await {
+                Ok(addrs) => pick_direct_address(addrs),
+                Err(_) => None,
+            }
+        };
+        // A stuck resolver (or any lookup failure) resolves to `None` —
+        // skip the direct attempt, let the tunnel carry the request.
+        tokio::time::timeout(DNS_RESOLVE_TIMEOUT, lookup)
+            .await
+            .unwrap_or_default()
     }
 }
 
@@ -296,5 +353,72 @@ mod tests {
             .await
             .expect("a direct address was seeded");
         assert_eq!(rewritten, "http://192.168.1.50:8080/v1/chat/completions");
+    }
+
+    /// #8: the direct address must prefer IPv4 even when an IPv6 result comes
+    /// first from the resolver — an IPv6-only address is frequently
+    /// unreachable on Android, and the LAN shortcut is an optimization.
+    #[test]
+    fn pick_direct_address_prefers_ipv4_over_an_earlier_ipv6_result() {
+        use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+        let v6: SocketAddr = (Ipv6Addr::LOCALHOST, 8080).into();
+        let v4: SocketAddr = ("192.168.1.50".parse::<IpAddr>().unwrap(), 8080).into();
+        assert_eq!(
+            pick_direct_address(vec![v6, v4].into_iter()).as_deref(),
+            Some("192.168.1.50")
+        );
+    }
+
+    #[test]
+    fn pick_direct_address_skips_tailscale_cgnat_addresses() {
+        use std::net::{IpAddr, SocketAddr};
+        let cgnat: SocketAddr = ("100.64.5.5".parse::<IpAddr>().unwrap(), 8080).into();
+        let lan: SocketAddr = ("10.0.0.9".parse::<IpAddr>().unwrap(), 8080).into();
+        assert_eq!(
+            pick_direct_address(vec![cgnat, lan].into_iter()).as_deref(),
+            Some("10.0.0.9")
+        );
+    }
+
+    #[test]
+    fn pick_direct_address_falls_back_to_ipv6_when_no_ipv4_exists() {
+        use std::net::{Ipv6Addr, SocketAddr};
+        let v6: SocketAddr = (Ipv6Addr::LOCALHOST, 8080).into();
+        assert_eq!(
+            pick_direct_address(vec![v6].into_iter()).as_deref(),
+            Some("::1")
+        );
+        assert_eq!(pick_direct_address(vec![].into_iter()), None);
+    }
+
+    /// #9: a resolved address older than `RESOLVED_CACHE_TTL` must not be
+    /// returned blindly — it is re-resolved (here against an empty peer map,
+    /// so it must come back `None`) instead of staying stale forever.
+    #[tokio::test]
+    async fn stale_resolved_cache_entries_are_re_resolved() {
+        let ts = TailscaleClient::new();
+        ts.resolved_cache.insert(
+            "100.64.1.2".into(),
+            (
+                Instant::now() - RESOLVED_CACHE_TTL - Duration::from_secs(1),
+                Some("10.0.0.9".into()),
+            ),
+        );
+        assert_eq!(
+            ts.resolve_direct_ip("100.64.1.2").await,
+            None,
+            "a stale resolved address must not be trusted past its TTL"
+        );
+    }
+
+    /// #9: a fresh resolved address short-circuits without touching DNS.
+    #[tokio::test]
+    async fn fresh_resolved_cache_entries_short_circuit() {
+        let ts = TailscaleClient::new();
+        ts.seed_resolved_for_test("100.64.1.2", Some("192.168.1.50".into()));
+        assert_eq!(
+            ts.resolve_direct_ip("100.64.1.2").await.as_deref(),
+            Some("192.168.1.50")
+        );
     }
 }
