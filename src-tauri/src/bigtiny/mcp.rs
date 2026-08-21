@@ -44,6 +44,26 @@ fn bundled_transport(logical: &str, exe: &str) -> (String, String) {
 ///
 /// Returns the env map to attach to the spec: populated on desktop (where a
 /// child process needs it), empty on Android (where it would be ignored).
+///
+/// **The Android branch mutates the process environment while the daemon's
+/// tasks are already running**, because `sync_mcp_once_healthy` is what calls
+/// this, and by definition that is after the daemon is healthy.
+/// `std::env::set_var` is not safe against a concurrent reader — it is
+/// `unsafe` in Rust 2024 for exactly this reason — so the only genuinely sound
+/// place to set a variable for the daemon is `bigtiny_env::daemon_env`, whose
+/// values `bigtiny_embedded::start` applies *before* the daemon exists.
+///
+/// The three variables that still go through here are tolerated rather than
+/// endorsed, and each is a value this function cannot know at startup:
+/// `KITTY_VIZ_ENABLED` and `BRAVE_API_KEY` follow Settings toggles that can
+/// change at runtime, and `KITTY_WASM_PYTHON` needs an `AppHandle`. All three
+/// are read once, by an in-process server, at the connect that this same sync
+/// pass triggers — so the write and the read are ordered in practice even
+/// though nothing enforces it.
+///
+/// **Do not add new variables here.** Anything knowable at startup belongs in
+/// `daemon_env` (that is where `KITTY_PLUGIN_HOME` went), and anything added
+/// here inherits a data race that is currently only benign by luck.
 #[allow(unused_variables)]
 fn server_env(pairs: Vec<(String, String)>) -> HashMap<String, String> {
     if cfg!(target_os = "android") {

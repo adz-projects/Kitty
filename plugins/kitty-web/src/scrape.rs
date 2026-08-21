@@ -609,8 +609,10 @@ pub async fn web_scrape(
         .connect_timeout(Duration::from_secs(10))
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
             // A custom policy does not inherit reqwest's 10-hop cap, so the
-            // limit is re-imposed here (mirroring `Policy::limited(10)`).
-            if attempt.previous().len() > MAX_REDIRECTS {
+            // limit is re-imposed here. `>=`, matching `Policy::limited(n)`,
+            // which errors once `previous().len() == n`: `>` allowed an
+            // eleventh hop past a cap documented as ten.
+            if attempt.previous().len() >= MAX_REDIRECTS {
                 return attempt.error("too many redirects".to_string());
             }
             // Every hop is re-validated: a public page must not be able to

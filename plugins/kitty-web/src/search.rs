@@ -43,6 +43,10 @@ pub const READ_CHUNK_MAX_CHARS: usize = 20000;
 pub const MAX_OFFLOAD_FILES: usize = 20;
 pub const MAX_RATE_LIMIT_RETRIES: u32 = 2;
 pub const BASE_BACKOFF_SECONDS: f64 = 1.5;
+/// Ceiling on a server-supplied `Retry-After`. The header is a number chosen
+/// by the remote side, and honouring it unbounded means one response can park
+/// a tool call — and the model's turn behind it — for as long as it likes.
+pub const MAX_RETRY_AFTER_SECONDS: f64 = 30.0;
 /// `lean_web_search_read_chunk` returns at most this many ids per call.
 pub const READ_CHUNK_MAX_IDS: usize = 5;
 
@@ -823,12 +827,16 @@ async fn brave_query(
         let status = response.status();
         if status.as_u16() == 429 {
             if attempt < MAX_RATE_LIMIT_RETRIES {
+                // Clamped, not merely floored at zero. `Retry-After` is a
+                // server-supplied number, and an unbounded sleep on it means
+                // one header (`Retry-After: 86400`) parks a tool call for a
+                // day inside the model's turn.
                 let retry_after = response
                     .headers()
                     .get("Retry-After")
                     .and_then(|v| v.to_str().ok())
                     .and_then(|v| v.parse::<f64>().ok())
-                    .map(|v| v.max(0.0));
+                    .map(|v| v.clamp(0.0, MAX_RETRY_AFTER_SECONDS));
                 let delay = retry_after.unwrap_or_else(|| {
                     use rand::Rng;
                     BASE_BACKOFF_SECONDS * 2f64.powi(attempt as i32)
@@ -1149,7 +1157,15 @@ pub async fn web_search(
 }
 
 pub fn web_search_read_chunk(search_id: &str, ids: &[i64]) -> String {
-    if search_id.contains('/') || search_id.contains('\\') || search_id.contains("..") {
+    // `:` alongside the traversal characters: on NTFS `id:stream` names an
+    // alternate data stream, which reads and writes outside the plain file the
+    // path is meant to name. `kitty-tools`' `cache.rs` already rejects it for
+    // exactly this reason (audit #126); this guard had not been kept in step.
+    if search_id.contains('/')
+        || search_id.contains('\\')
+        || search_id.contains("..")
+        || search_id.contains(':')
+    {
         return error_response(
             "SEARCH_ID_NOT_FOUND",
             "Invalid search_id.",
@@ -1226,11 +1242,20 @@ pub fn web_search_read_chunk(search_id: &str, ids: &[i64]) -> String {
     let mut char_truncated = false;
     for r in candidates {
         let mut item = r.to_inline_json();
-        let full = if r.snippet_full.is_empty() {
+        let mut full = if r.snippet_full.is_empty() {
             r.snippet.clone()
         } else {
             r.snippet_full.clone()
         };
+        // Always return *something* for the first requested id, but not at
+        // any size: the cap used to be skipped entirely while `matched` was
+        // empty, so one oversized `snippet_full` came back whole and the
+        // documented ceiling meant nothing. Truncate that snippet to the cap
+        // instead of exempting it.
+        if matched.is_empty() && full.chars().count() > READ_CHUNK_MAX_CHARS {
+            full = full.chars().take(READ_CHUNK_MAX_CHARS).collect();
+            char_truncated = true;
+        }
         if let Some(obj) = item.as_object_mut() {
             obj.insert("snippet".into(), json!(full));
         }
@@ -1541,7 +1566,10 @@ mod tests {
 
     #[test]
     fn read_chunk_rejects_path_traversal_in_search_id() {
-        for bad in ["../etc/passwd", "a/b", "a\\b", ".."] {
+        // `x:y` names an NTFS alternate data stream, which reads and writes
+        // outside the plain file — `kitty-tools`' cache guard has rejected it
+        // since audit #126 and this one had not kept up.
+        for bad in ["../etc/passwd", "a/b", "a\\b", "..", "id:stream", "C:x"] {
             let out = web_search_read_chunk(bad, &[1]);
             let v: Value = serde_json::from_str(&out).unwrap();
             assert_eq!(v["error_code"], "SEARCH_ID_NOT_FOUND", "must reject {bad}");
@@ -1645,6 +1673,55 @@ mod tests {
         assert_eq!(nv["error_code"], "ID_NOT_FOUND");
 
         let _ = std::fs::remove_file(offload_path(&search_id));
+    }
+
+    /// The char cap used to be skipped entirely for the first item, so a
+    /// single oversized `snippet_full` came back whole and the documented
+    /// ceiling meant nothing. The first item must still be *returned* — the
+    /// caller asked for it — but truncated to the cap like any other.
+    #[test]
+    fn the_first_item_is_capped_rather_than_exempted() {
+        let search_id = format!("test-{}", new_search_id());
+        let huge = "z".repeat(READ_CHUNK_MAX_CHARS * 3);
+        let results = vec![SearchItem {
+            id: 1,
+            title: "T".into(),
+            domain: "e.com".into(),
+            url: "https://e.com/1".into(),
+            date: None,
+            snippet: "short".into(),
+            snippet_full: huge,
+            engine: "test".into(),
+        }];
+        write_offload(&search_id, "q", &results)
+            .expect("offload write should succeed in a test home");
+
+        let out = web_search_read_chunk(&search_id, &[1]);
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["status"], "success", "the item must still come back: {v}");
+        let returned = v["data"][0]["snippet"].as_str().unwrap().chars().count();
+        assert!(
+            returned <= READ_CHUNK_MAX_CHARS,
+            "first item returned {returned} chars, over the {READ_CHUNK_MAX_CHARS} cap"
+        );
+        assert_eq!(v["truncated"], json!(true), "truncation must be declared");
+
+        let _ = std::fs::remove_file(offload_path(&search_id));
+    }
+
+    /// A hostile or broken endpoint must not be able to park a tool call for
+    /// an arbitrary length of time by naming one in a header.
+    #[test]
+    fn the_retry_after_ceiling_is_bounded_and_usable() {
+        const { assert!(MAX_RETRY_AFTER_SECONDS > 0.0) };
+        // A tool call should not sit on a rate-limit sleep longer than this.
+        const { assert!(MAX_RETRY_AFTER_SECONDS <= 60.0) };
+        // The clamp is what the call site applies to the parsed header.
+        assert_eq!(
+            86_400.0_f64.clamp(0.0, MAX_RETRY_AFTER_SECONDS),
+            MAX_RETRY_AFTER_SECONDS
+        );
+        assert_eq!((-5.0_f64).clamp(0.0, MAX_RETRY_AFTER_SECONDS), 0.0);
     }
 
     #[test]

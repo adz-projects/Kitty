@@ -50,14 +50,20 @@ pub fn extract_paragraphs(document_xml: &[u8], style_names: &StyleNames) -> Vec<
                 return None;
             }
             let heading_level = compute_heading_level(&raw, style_names);
-            Some(ParagraphInfo { text, heading_level })
+            Some(ParagraphInfo {
+                text,
+                heading_level,
+            })
         })
         .collect()
 }
 
 fn compute_heading_level(raw: &RawParagraph, style_names: &StyleNames) -> Option<u32> {
     if let Some(style_id) = &raw.style_id {
-        let name = style_names.get(style_id).cloned().unwrap_or_else(|| style_id.clone());
+        let name = style_names
+            .get(style_id)
+            .cloned()
+            .unwrap_or_else(|| style_id.clone());
         if name.to_lowercase().contains("heading") {
             if let Some(level) = first_digit_run(&name) {
                 return Some(level);
@@ -113,7 +119,9 @@ fn local_name(qualified: &[u8]) -> &[u8] {
 fn attr_value(e: &BytesStart, key: &[u8]) -> Option<String> {
     e.attributes().flatten().find_map(|a| {
         if local_name(a.key.as_ref()) == local_name(key) {
-            a.normalized_value(quick_xml::XmlVersion::Implicit1_0).ok().map(|v| v.into_owned())
+            a.normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                .ok()
+                .map(|v| v.into_owned())
         } else {
             None
         }
@@ -194,7 +202,9 @@ fn extract_raw_paragraphs(document_xml: &[u8]) -> Vec<RawParagraph> {
                             p.is_bold = true;
                         }
                     } else if in_rpr && local == b"sz" {
-                        if let Some(sz) = attr_value(&e, b"w:val").and_then(|v| v.parse::<u32>().ok()) {
+                        if let Some(sz) =
+                            attr_value(&e, b"w:val").and_then(|v| v.parse::<u32>().ok())
+                        {
                             if let Some(p) = current.as_mut() {
                                 p.max_sz = Some(p.max_sz.map_or(sz, |cur| cur.max(sz)));
                             }
@@ -230,7 +240,9 @@ fn extract_raw_paragraphs(document_xml: &[u8]) -> Vec<RawParagraph> {
                             p.is_bold = true;
                         }
                     } else if in_rpr && local == b"sz" {
-                        if let Some(sz) = attr_value(&e, b"w:val").and_then(|v| v.parse::<u32>().ok()) {
+                        if let Some(sz) =
+                            attr_value(&e, b"w:val").and_then(|v| v.parse::<u32>().ok())
+                        {
                             if let Some(p) = current.as_mut() {
                                 p.max_sz = Some(p.max_sz.map_or(sz, |cur| cur.max(sz)));
                             }
@@ -332,7 +344,8 @@ mod tests {
 
     #[test]
     fn falls_back_to_outline_level_when_no_heading_style() {
-        let xml = doc(r#"<w:p><w:pPr><w:outlineLvl w:val="1"/></w:pPr><w:r><w:t>Text</w:t></w:r></w:p>"#);
+        let xml =
+            doc(r#"<w:p><w:pPr><w:outlineLvl w:val="1"/></w:pPr><w:r><w:t>Text</w:t></w:r></w:p>"#);
         let paras = extract_paragraphs(xml.as_bytes(), &HashMap::new());
         assert_eq!(paras[0].heading_level, Some(2));
     }
@@ -358,12 +371,10 @@ mod tests {
 
     #[test]
     fn drops_mc_fallback_content_to_avoid_double_counting() {
-        let xml = doc(
-            r#"<w:p><w:r><mc:AlternateContent>
+        let xml = doc(r#"<w:p><w:r><mc:AlternateContent>
                 <mc:Choice Requires="wps"><w:t>Choice text</w:t></mc:Choice>
                 <mc:Fallback><w:t>Fallback text</w:t></mc:Fallback>
-            </mc:AlternateContent></w:r></w:p>"#,
-        );
+            </mc:AlternateContent></w:r></w:p>"#);
         let paras = extract_paragraphs(xml.as_bytes(), &HashMap::new());
         assert_eq!(paras.len(), 1);
         assert!(paras[0].text.contains("Choice text"));
@@ -372,7 +383,9 @@ mod tests {
 
     #[test]
     fn non_integer_outline_lvl_does_not_panic() {
-        let xml = doc(r#"<w:p><w:pPr><w:outlineLvl w:val="not-a-number"/></w:pPr><w:r><w:t>Text</w:t></w:r></w:p>"#);
+        let xml = doc(
+            r#"<w:p><w:pPr><w:outlineLvl w:val="not-a-number"/></w:pPr><w:r><w:t>Text</w:t></w:r></w:p>"#,
+        );
         let paras = extract_paragraphs(xml.as_bytes(), &HashMap::new());
         // Falls through to no heuristic matching -> no heading level, not a panic.
         assert_eq!(paras[0].heading_level, None);
@@ -407,7 +420,8 @@ mod tests {
     fn tab_and_break_inside_runs_are_materialized() {
         // `<w:tab/>` renders as a tab and `<w:br/>` as a line break —
         // matching python-docx's `paragraph.text`.
-        let xml = doc(r#"<w:p><w:r><w:t>a</w:t><w:tab/><w:t>b</w:t><w:br/><w:t>c</w:t></w:r></w:p>"#);
+        let xml =
+            doc(r#"<w:p><w:r><w:t>a</w:t><w:tab/><w:t>b</w:t><w:br/><w:t>c</w:t></w:r></w:p>"#);
         let paras = extract_paragraphs(xml.as_bytes(), &HashMap::new());
         assert_eq!(paras[0].text, "a\tb\nc");
     }
@@ -416,12 +430,10 @@ mod tests {
     fn inter_element_whitespace_is_not_paragraph_text() {
         // Pretty-printed XML puts newlines/spaces between runs; those are not
         // content and must not be folded into the extracted text.
-        let xml = doc(
-            r#"<w:p>
+        let xml = doc(r#"<w:p>
                 <w:r><w:t>Hello</w:t></w:r>
                 <w:r><w:t>World</w:t></w:r>
-            </w:p>"#,
-        );
+            </w:p>"#);
         let paras = extract_paragraphs(xml.as_bytes(), &HashMap::new());
         assert_eq!(paras.len(), 1);
         assert_eq!(paras[0].text, "HelloWorld");

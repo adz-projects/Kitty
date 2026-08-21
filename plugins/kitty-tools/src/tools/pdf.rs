@@ -101,6 +101,24 @@ pub fn pdf_read_text(
         return too_large(&resolved);
     }
 
+    let s_page = start_page.unwrap_or(1).max(1);
+    // Checked before the parse: an inverted range is a caller mistake that
+    // shouldn't first cost reading and parsing a file of up to 64 MB. And the
+    // clamping arithmetic further down turns it into something worse than an
+    // error — `end_page` gets floored at `start_page - 1`, so asking for pages
+    // 5–2 returned an empty list reported as `end_page: 4`, a range nobody
+    // asked for with no indication anything was wrong.
+    if let Some(end) = end_page {
+        if end < s_page {
+            return error_response(
+                "PDF_BAD_RANGE",
+                &format!("end_page ({end}) is before start_page ({s_page})"),
+                Some(&resolved.to_string_lossy()),
+                Some("Pass end_page greater than or equal to start_page, or omit it."),
+            );
+        }
+    }
+
     let doc = match open(&resolved) {
         Ok(d) => d,
         Err(e) => {
@@ -123,7 +141,6 @@ pub fn pdf_read_text(
     }
 
     let total_pages = doc.get_pages().len() as u32;
-    let s_page = start_page.unwrap_or(1).max(1);
     // Both the caller's `end_page` and the hard cap bound the extraction; the
     // range is clamped to at most PDF_MAX_PAGES pages.
     let end_requested = end_page
@@ -291,6 +308,25 @@ mod tests {
         let out = pdf_read_outline(f.to_str().unwrap());
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["error_code"], "PDF_TOO_LARGE");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An inverted range used to be absorbed by the clamping arithmetic: pages
+    /// 5-2 came back as an empty list reported with `end_page: 4`, a range
+    /// nobody asked for and no indication anything was wrong.
+    #[test]
+    fn an_inverted_page_range_is_rejected_rather_than_silently_reshaped() {
+        let dir = std::env::temp_dir().join(format!("kt-pdf-range-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("x.pdf");
+        // Deliberately not a valid PDF: the range check runs before the
+        // parse, so this asserts the ordering as well as the verdict.
+        std::fs::write(&f, b"%PDF-1.4 not really a pdf").unwrap();
+
+        let out = pdf_read_text(f.to_str().unwrap(), Some(5), Some(2), None, 0);
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["error_code"], "PDF_BAD_RANGE", "{v}");
 
         std::fs::remove_dir_all(&dir).ok();
     }

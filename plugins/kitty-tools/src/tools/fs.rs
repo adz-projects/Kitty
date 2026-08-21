@@ -83,11 +83,26 @@ pub fn file_read(
         let message = result
             .no_match
             .then(|| format!("No direct matches for query '{q}'. Showing top section."));
+        // The query searches the *whole* file, so any `start_line`/`end_line`
+        // the caller also passed does not apply. That has always been the
+        // behaviour; what it never did was say so, leaving a caller who sent
+        // both to conclude the range was honoured and the file simply had no
+        // matches outside it.
+        let mut meta = serde_json::Map::new();
+        meta.insert("total_lines".into(), json!(total_lines));
+        meta.insert("filtered_by_query".into(), json!(q));
+        if start_line.is_some() || end_line.is_some() {
+            meta.insert("line_range_ignored".into(), json!(true));
+            meta.insert(
+                "line_range_ignored_reason".into(),
+                json!("query searches the whole file; start_line/end_line apply only to an unfiltered read"),
+            );
+        }
         return success_response(
             json!(result.items.join("\n")),
             message.as_deref(),
             result.truncated,
-            Some(json!({"total_lines": total_lines, "filtered_by_query": q})),
+            Some(serde_json::Value::Object(meta)),
         );
     }
 
@@ -599,5 +614,39 @@ mod tests {
         assert_eq!(v["error_code"], "FILE_TOO_LARGE");
 
         fs::remove_dir_all(f.parent().unwrap()).ok();
+    }
+
+    /// A query searches the whole file, so a `start_line`/`end_line` sent
+    /// alongside it does not apply. That was always true; it was never said,
+    /// so a caller who passed both had no way to tell the range had been
+    /// dropped rather than simply matching nothing.
+    #[test]
+    fn a_query_declares_that_it_ignored_the_line_range() {
+        let dir = std::env::temp_dir().join(format!("kt-fs-range-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("x.txt");
+        fs::write(
+            &f,
+            "alpha
+beta
+gamma
+delta
+",
+        )
+        .unwrap();
+
+        let out = file_read(f.to_str().unwrap(), Some(1), Some(2), Some("delta"));
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["status"], "success");
+        assert_eq!(v["metadata"]["line_range_ignored"], serde_json::json!(true));
+        // And it really did search past the range it was given.
+        assert!(v["data"].as_str().unwrap().contains("delta"));
+
+        // No range passed, no note.
+        let out = file_read(f.to_str().unwrap(), None, None, Some("delta"));
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(v["metadata"].get("line_range_ignored").is_none());
+
+        fs::remove_dir_all(&dir).ok();
     }
 }

@@ -18,8 +18,31 @@ fn blacklisted(name: &str) -> bool {
     )
 }
 
-pub fn analyze_workspace(path: &str, max_depth: Option<u32>) -> String {
+/// The directory this walk actually starts from.
+///
+/// On desktop, whatever the caller asked for. **On Android, anything outside
+/// the app's own storage is redirected to it**, because scoped storage means
+/// a path the model picked — `/sdcard/Documents`, `/storage/emulated/0`, some
+/// remembered Windows path — is either unreadable or returns almost nothing,
+/// and a near-empty listing reads to the model as "this directory is empty"
+/// rather than "you cannot see this". Walking the one tree the app can
+/// actually read is the honest answer, and the response's `root` says which
+/// directory that was (docs/ANDROID.md §2.4).
+fn scoped_root(path: &str) -> std::path::PathBuf {
     let resolved = resolve(path);
+    #[cfg(target_os = "android")]
+    {
+        if !path_within_home(&resolved) {
+            if let Some(home) = crate::paths::home_dir() {
+                return home;
+            }
+        }
+    }
+    resolved
+}
+
+pub fn analyze_workspace(path: &str, max_depth: Option<u32>) -> String {
+    let resolved = scoped_root(path);
     if !path_within_home(&resolved) {
         return error_response(
             "PATH_OUTSIDE_HOME",
@@ -61,36 +84,59 @@ pub fn analyze_workspace(path: &str, max_depth: Option<u32>) -> String {
     let depth = max_depth
         .unwrap_or(WORKSPACE_MAX_DEPTH)
         .min(WORKSPACE_MAX_DEPTH);
-    let mut files: Vec<String> = Vec::new();
-    let mut dirs: Vec<String> = Vec::new();
-    let mut abort = false;
+    let mut found = Found::default();
+    walk(&resolved, &resolved, 0, depth, &mut found);
+    let Found {
+        files,
+        dirs,
+        symlinks,
+        abort,
+    } = found;
 
-    walk(
-        &resolved, &resolved, 0, depth, &mut files, &mut dirs, &mut abort,
-    );
+    // `symlinks` is reported separately rather than folded into `files`: they
+    // are not descended into (see `walk`), so calling a symlinked directory a
+    // file would be a plain lie to the model about what it is looking at.
+    let mut data = serde_json::Map::new();
+    data.insert("files".into(), json!(files));
+    data.insert("directories".into(), json!(dirs));
+    if !symlinks.is_empty() {
+        data.insert("symlinks".into(), json!(symlinks));
+    }
+    let mut meta = serde_json::Map::new();
+    meta.insert("total_files".into(), json!(files.len()));
+    meta.insert("total_directories".into(), json!(dirs.len()));
+    if !symlinks.is_empty() {
+        meta.insert("total_symlinks".into(), json!(symlinks.len()));
+        meta.insert(
+            "symlinks_note".into(),
+            json!("Symlinks are listed but not followed, so nothing outside this tree is walked."),
+        );
+    }
+    meta.insert("root".into(), json!(resolved.to_string_lossy()));
 
     success_response(
-        json!({"files": files, "directories": dirs}),
+        serde_json::Value::Object(data),
         None,
         abort,
-        Some(json!({
-            "total_files": files.len(),
-            "total_directories": dirs.len(),
-            "root": resolved.to_string_lossy(),
-        })),
+        Some(serde_json::Value::Object(meta)),
     )
 }
 
-fn walk(
-    root: &Path,
-    current: &Path,
-    current_depth: u32,
-    max_depth: u32,
-    files: &mut Vec<String>,
-    dirs: &mut Vec<String>,
-    abort: &mut bool,
-) {
-    if *abort || current_depth > max_depth {
+/// What the walk has collected so far, plus whether it stopped early.
+/// Grouped rather than passed as four `&mut` parameters threaded through the
+/// recursion.
+#[derive(Default)]
+struct Found {
+    files: Vec<String>,
+    dirs: Vec<String>,
+    /// Listed but never descended into — see the note in `walk`.
+    symlinks: Vec<String>,
+    /// Set when a budget was hit, so the response can flag itself truncated.
+    abort: bool,
+}
+
+fn walk(root: &Path, current: &Path, current_depth: u32, max_depth: u32, found: &mut Found) {
+    if found.abort || current_depth > max_depth {
         return;
     }
 
@@ -108,7 +154,7 @@ fn walk(
     });
 
     for entry in entries {
-        if *abort {
+        if found.abort {
             return;
         }
         let name = entry.file_name().to_string_lossy().to_string();
@@ -121,29 +167,39 @@ fn walk(
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or(name);
 
-        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        // `file_type()` from `read_dir` does **not** follow symlinks, and that
+        // is deliberate: following one would let a link inside home produce a
+        // listing of anything outside it, since the home boundary is only
+        // checked on the root. But the un-followed type also made a symlinked
+        // *directory* come back as `is_dir() == false`, so it was silently
+        // filed under `files` and counted against that budget. Report it as
+        // what it is instead of mislabelling it.
+        let file_type = entry.file_type();
+        let is_symlink = file_type.as_ref().map(|t| t.is_symlink()).unwrap_or(false);
+        let is_dir = file_type.map(|t| t.is_dir()).unwrap_or(false);
+
+        if is_symlink {
+            found.symlinks.push(rel);
+            if found.symlinks.len() >= WORKSPACE_MAX_FILES {
+                found.abort = true;
+                return;
+            }
+            continue;
+        }
         if is_dir {
-            dirs.push(rel);
+            found.dirs.push(rel);
             // Cap collected dirs too — a huge empty tree (all dirs, no files)
             // used to be able to run forever because the abort only fired on
             // the file count.
-            if dirs.len() >= WORKSPACE_MAX_DIRS {
-                *abort = true;
+            if found.dirs.len() >= WORKSPACE_MAX_DIRS {
+                found.abort = true;
                 return;
             }
-            walk(
-                root,
-                &entry_path,
-                current_depth + 1,
-                max_depth,
-                files,
-                dirs,
-                abort,
-            );
+            walk(root, &entry_path, current_depth + 1, max_depth, found);
         } else {
-            files.push(rel);
-            if files.len() >= WORKSPACE_MAX_FILES {
-                *abort = true;
+            found.files.push(rel);
+            if found.files.len() >= WORKSPACE_MAX_FILES {
+                found.abort = true;
                 return;
             }
         }
@@ -253,5 +309,48 @@ mod tests {
         assert!(!files.iter().any(|f| f.contains(".git")));
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A symlinked *directory* used to be reported as a file: `read_dir`'s
+    /// `file_type()` does not follow links, so `is_dir()` was false and it
+    /// fell into the `files` bucket. Not following remains correct — a link
+    /// inside home pointing outside it would otherwise leak a listing of
+    /// wherever it points — but it must be *labelled* for what it is.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_directory_is_listed_as_a_symlink_not_a_file() {
+        let root = std::env::temp_dir().join(format!("kt-ws-link-{}", std::process::id()));
+        let real = root.join("real");
+        std::fs::create_dir_all(real.join("inner")).unwrap();
+        std::fs::write(real.join("inner").join("secret.txt"), "x").unwrap();
+        let link = root.join("link");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let out = analyze_workspace(root.to_str().unwrap(), Some(3));
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let symlinks = v["data"]["symlinks"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let files = v["data"]["files"].as_array().cloned().unwrap_or_default();
+
+        assert!(
+            symlinks.iter().any(|s| s.as_str() == Some("link")),
+            "the symlink must be listed as one: {v}"
+        );
+        assert!(
+            !files.iter().any(|f| f.as_str() == Some("link")),
+            "and must not be mislabelled as a file: {v}"
+        );
+        // Not followed: the linked tree's contents must not appear twice.
+        assert!(
+            !files
+                .iter()
+                .any(|f| f.as_str().unwrap_or("").starts_with("link")),
+            "the symlink must not be descended into: {v}"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }

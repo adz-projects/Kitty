@@ -55,13 +55,37 @@ impl Inner {
         if rest.is_empty() {
             return;
         }
-
-        for &b in rest {
-            self.tail.push_back(b);
-        }
-        while self.tail.len() > self.tail_limit {
-            self.tail.pop_front();
+        if self.tail_limit == 0 {
             self.truncated = true;
+            return;
+        }
+
+        // Work in chunks, not byte by byte. The previous version pushed every
+        // byte individually and then popped every excess byte individually, so
+        // a guest printing a gigabyte cost ~2e9 deque operations. Memory was
+        // correctly bounded the whole time; CPU was not, and the only thing
+        // stopping it was the run's wall-clock timeout — up to 300s of a
+        // pinned core, which on a phone is a battery and heat problem rather
+        // than a memory one.
+        if rest.len() >= self.tail_limit {
+            // This chunk alone fills the ring: everything currently held, and
+            // everything but its last `tail_limit` bytes, goes. Only flag
+            // truncation if something was genuinely dropped — a chunk landing
+            // exactly on the limit against an empty tail loses nothing, and
+            // must not grow a spurious "0 bytes omitted" marker.
+            if rest.len() > self.tail_limit || !self.tail.is_empty() {
+                self.truncated = true;
+            }
+            self.tail.clear();
+            self.tail.extend(&rest[rest.len() - self.tail_limit..]);
+            return;
+        }
+
+        self.tail.extend(rest);
+        if self.tail.len() > self.tail_limit {
+            self.truncated = true;
+            let excess = self.tail.len() - self.tail_limit;
+            self.tail.drain(..excess);
         }
     }
 
@@ -235,6 +259,59 @@ mod tests {
         let c = CaptureStream::new(10, 10);
         c.inner.lock().unwrap().push(&[0xff, 0xfe, 0x80]);
         let _ = c.contents();
+    }
+
+    /// A gigabyte of output used to cost ~2e9 individual deque operations
+    /// (every byte pushed, every excess byte popped). Memory was bounded the
+    /// whole time; CPU was not, and only the run's wall-clock timeout stopped
+    /// it — up to 300s of a pinned core. Bounded time here, not just bounded
+    /// bytes.
+    #[test]
+    fn a_huge_write_is_bounded_in_time_not_only_in_memory() {
+        let c = CaptureStream::new(1_000, 1_000);
+        let big = vec![b'x'; 64 * 1024 * 1024];
+
+        let start = std::time::Instant::now();
+        c.inner.lock().unwrap().push(&big);
+        let elapsed = start.elapsed();
+
+        assert_eq!(c.total_bytes(), big.len());
+        assert!(c.truncated());
+        // Generous by two orders of magnitude against the chunk-wise path and
+        // still far under what the byte-at-a-time version took, so this fails
+        // on a regression without being flaky on a loaded machine.
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "64 MiB took {elapsed:?}; the ring is back to per-byte work"
+        );
+    }
+
+    /// The chunk-wise rewrite must not change *what* is kept: head first, then
+    /// the last `tail_limit` bytes, whether they arrive in one write or many.
+    #[test]
+    fn chunked_and_byte_sized_writes_keep_the_same_window() {
+        let one_shot = CaptureStream::new(4, 4);
+        one_shot.inner.lock().unwrap().push(b"abcdefghij");
+
+        let drip = CaptureStream::new(4, 4);
+        for b in b"abcdefghij" {
+            drip.inner.lock().unwrap().push(&[*b]);
+        }
+
+        assert_eq!(one_shot.contents(), drip.contents());
+        assert!(one_shot.contents().starts_with("abcd"));
+        assert!(one_shot.contents().ends_with("ghij"));
+        assert_eq!(one_shot.total_bytes(), drip.total_bytes());
+    }
+
+    /// A write landing exactly on the tail limit takes the whole-chunk path;
+    /// it must still be kept in full, not treated as an overrun of itself.
+    #[test]
+    fn a_write_exactly_the_size_of_the_tail_is_kept_whole() {
+        let c = CaptureStream::new(0, 4);
+        c.inner.lock().unwrap().push(b"wxyz");
+        assert_eq!(c.contents(), "wxyz");
+        assert!(!c.truncated());
     }
 
     #[tokio::test]

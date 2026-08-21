@@ -70,7 +70,9 @@ fn local_name(qualified: &[u8]) -> &[u8] {
 fn attr_value(e: &quick_xml::events::BytesStart, key: &[u8]) -> Option<String> {
     e.attributes().flatten().find_map(|a| {
         if local_name(a.key.as_ref()) == local_name(key) {
-            a.normalized_value(quick_xml::XmlVersion::Implicit1_0).ok().map(|v| v.into_owned())
+            a.normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                .ok()
+                .map(|v| v.into_owned())
         } else {
             None
         }

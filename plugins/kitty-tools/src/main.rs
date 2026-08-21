@@ -1,5 +1,5 @@
-use rmcp::ServiceExt;
 use kitty_tools::server::KittyToolsServer;
+use rmcp::ServiceExt;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

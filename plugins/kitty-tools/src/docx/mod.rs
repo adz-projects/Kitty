@@ -51,7 +51,9 @@ fn read_zip_entry(archive: &mut zip::ZipArchive<std::fs::File>, name: &str) -> O
     let mut buf = Vec::new();
     // Cap decompression (`take` + explicit size check) so a bombed entry is
     // treated as corrupt rather than materialized into memory.
-    file.take(MAX_DOCX_ENTRY_BYTES + 1).read_to_end(&mut buf).ok()?;
+    file.take(MAX_DOCX_ENTRY_BYTES + 1)
+        .read_to_end(&mut buf)
+        .ok()?;
     if buf.len() as u64 > MAX_DOCX_ENTRY_BYTES {
         return None;
     }

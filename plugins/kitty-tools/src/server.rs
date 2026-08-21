@@ -346,7 +346,10 @@ impl VizStepParam {
         viz_model::Step {
             id: self.id,
             text: self.text,
-            step_type: self.step_type.map(VizStepType::to_model).unwrap_or_default(),
+            step_type: self
+                .step_type
+                .map(VizStepType::to_model)
+                .unwrap_or_default(),
             subtitle: self.subtitle,
             lane: self.lane,
             sentiment: self.sentiment,
@@ -493,7 +496,9 @@ impl KittyToolsServer {
         if std::env::var("KITTY_VIZ_ENABLED").as_deref() == Ok("1") {
             router += Self::viz_tool_router();
         }
-        Self { tool_router: router }
+        Self {
+            tool_router: router,
+        }
     }
 
     /// Sorted list of every currently-registered tool name — used by
@@ -502,7 +507,12 @@ impl KittyToolsServer {
     /// the base plan's "tool names are load-bearing" section), so this list
     /// must never be "tidied."
     pub fn tool_names(&self) -> Vec<String> {
-        let mut names: Vec<String> = self.tool_router.list_all().into_iter().map(|t| t.name.to_string()).collect();
+        let mut names: Vec<String> = self
+            .tool_router
+            .list_all()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
         names.sort();
         names
     }
@@ -526,7 +536,10 @@ fn guarded(f: impl FnOnce() -> String) -> String {
 
 #[tool_router(router = core_tool_router)]
 impl KittyToolsServer {
-    #[tool(name = "lean_word_read_text", description = "Reads body text from a Word .docx, reaching paragraphs inside tables and text boxes. Supports offset-based pagination and keyword query filtering.")]
+    #[tool(
+        name = "lean_word_read_text",
+        description = "Reads body text from a Word .docx, reaching paragraphs inside tables and text boxes. Supports offset-based pagination and keyword query filtering."
+    )]
     pub fn word_read_text(&self, Parameters(req): Parameters<WordReadTextRequest>) -> String {
         guarded(move || {
             let resolved = resolve(&req.path);
@@ -536,10 +549,20 @@ impl KittyToolsServer {
             let paragraphs = match docx::read_paragraphs(&resolved) {
                 Ok(p) => p,
                 Err(docx::DocxError::NotFound) => {
-                    return error_response("DOCX_NOT_FOUND", "Document does not exist", Some(&resolved.to_string_lossy()), None);
+                    return error_response(
+                        "DOCX_NOT_FOUND",
+                        "Document does not exist",
+                        Some(&resolved.to_string_lossy()),
+                        None,
+                    );
                 }
                 Err(docx::DocxError::Corrupt(detail)) => {
-                    return error_response("DOCX_CORRUPT", &format!("Cannot open docx: {detail}"), Some(&resolved.to_string_lossy()), None);
+                    return error_response(
+                        "DOCX_CORRUPT",
+                        &format!("Cannot open docx: {detail}"),
+                        Some(&resolved.to_string_lossy()),
+                        None,
+                    );
                 }
             };
             let texts: Vec<String> = paragraphs.iter().map(|p| p.text.clone()).collect();
@@ -547,9 +570,9 @@ impl KittyToolsServer {
 
             if let Some(query) = req.query.as_deref().filter(|q| !q.trim().is_empty()) {
                 let result = filter_by_query(&texts, Some(query), 50, offset);
-                let message = result
-                    .no_match
-                    .then(|| format!("No direct matches for query '{query}'. Showing top section."));
+                let message = result.no_match.then(|| {
+                    format!("No direct matches for query '{query}'. Showing top section.")
+                });
                 let mut metadata = json!({
                     "read_method": "xml_scan",
                     "filtered_by_query": query,
@@ -584,7 +607,10 @@ impl KittyToolsServer {
         })
     }
 
-    #[tool(name = "lean_word_read_outline", description = "Returns the heading structure (levels 1-4) of a Word document, reaching headings inside tables and text boxes.")]
+    #[tool(
+        name = "lean_word_read_outline",
+        description = "Returns the heading structure (levels 1-4) of a Word document, reaching headings inside tables and text boxes."
+    )]
     pub fn word_read_outline(&self, Parameters(req): Parameters<WordReadOutlineRequest>) -> String {
         guarded(move || {
             let resolved = resolve(&req.path);
@@ -594,10 +620,20 @@ impl KittyToolsServer {
             let paragraphs = match docx::read_paragraphs(&resolved) {
                 Ok(p) => p,
                 Err(docx::DocxError::NotFound) => {
-                    return error_response("DOCX_NOT_FOUND", "Document does not exist", Some(&resolved.to_string_lossy()), None);
+                    return error_response(
+                        "DOCX_NOT_FOUND",
+                        "Document does not exist",
+                        Some(&resolved.to_string_lossy()),
+                        None,
+                    );
                 }
                 Err(docx::DocxError::Corrupt(detail)) => {
-                    return error_response("DOCX_CORRUPT", &format!("Cannot open docx: {detail}"), Some(&resolved.to_string_lossy()), None);
+                    return error_response(
+                        "DOCX_CORRUPT",
+                        &format!("Cannot open docx: {detail}"),
+                        Some(&resolved.to_string_lossy()),
+                        None,
+                    );
                 }
             };
             let outline: Vec<_> = paragraphs
@@ -608,11 +644,19 @@ impl KittyToolsServer {
                         .map(|lvl| json!({"level": lvl, "text": p.text}))
                 })
                 .collect();
-            success_response(json!(outline), None, false, Some(json!({"read_method": "xml_scan"})))
+            success_response(
+                json!(outline),
+                None,
+                false,
+                Some(json!({"read_method": "xml_scan"})),
+            )
         })
     }
 
-    #[tool(name = "lean_word_write_doc", description = "Writes a new Word document or appends to an existing one, from markdown-lite text (headings, lists, tables, bold/italic), with WCAG accessibility structures.")]
+    #[tool(
+        name = "lean_word_write_doc",
+        description = "Writes a new Word document or appends to an existing one, from markdown-lite text (headings, lists, tables, bold/italic), with WCAG accessibility structures."
+    )]
     pub fn word_write_doc(&self, Parameters(req): Parameters<WordWriteDocRequest>) -> String {
         guarded(move || {
             let resolved = resolve(&req.path);
@@ -626,28 +670,48 @@ impl KittyToolsServer {
             let language = req.language.as_deref().unwrap_or("en-US");
 
             if matches!(mode, WriteMode::Append) && !resolved.exists() {
-                return error_response("DOCX_NOT_FOUND", "Document does not exist", Some(&resolved.to_string_lossy()), None);
+                return error_response(
+                    "DOCX_NOT_FOUND",
+                    "Document does not exist",
+                    Some(&resolved.to_string_lossy()),
+                    None,
+                );
             }
 
-            let mode_label = if matches!(mode, WriteMode::Append) { "append" } else { "create" };
+            let mode_label = if matches!(mode, WriteMode::Append) {
+                "append"
+            } else {
+                "create"
+            };
 
-            match docx::write::write_document(&resolved, req.doc_text.as_deref(), mode, req.title.as_deref(), language) {
+            match docx::write::write_document(
+                &resolved,
+                req.doc_text.as_deref(),
+                mode,
+                req.title.as_deref(),
+                language,
+            ) {
                 Ok(result) => success_response(
                     json!({"path": result.path, "mode": result.mode, "language": result.language}),
                     Some("Document saved with WCAG accessibility metadata."),
                     false,
                     None,
                 ),
-                Err(docx::DocxError::NotFound) => {
-                    error_response("DOCX_NOT_FOUND", "Document does not exist", Some(&resolved.to_string_lossy()), None)
-                }
+                Err(docx::DocxError::NotFound) => error_response(
+                    "DOCX_NOT_FOUND",
+                    "Document does not exist",
+                    Some(&resolved.to_string_lossy()),
+                    None,
+                ),
                 Err(docx::DocxError::Corrupt(detail)) => {
                     // A same-name file locked open in Word (PermissionError
                     // on the equivalent Python path) surfaces here as an I/O
                     // failure during the write; distinguish it so the model
                     // gets an actionable hint instead of a generic corrupt-
                     // file message for what is really a save-mode failure.
-                    if detail.to_lowercase().contains("denied") || detail.to_lowercase().contains("used by another process") {
+                    if detail.to_lowercase().contains("denied")
+                        || detail.to_lowercase().contains("used by another process")
+                    {
                         error_response(
                             "DOCX_LOCKED",
                             "Could not save the document — it may be open in Word.",
@@ -655,19 +719,30 @@ impl KittyToolsServer {
                             Some("Close the file in Word (or any other program with it open) and try again."),
                         )
                     } else {
-                        error_response("DOCX_WRITE_ERROR", &format!("Cannot {mode_label} docx: {detail}"), Some(&resolved.to_string_lossy()), None)
+                        error_response(
+                            "DOCX_WRITE_ERROR",
+                            &format!("Cannot {mode_label} docx: {detail}"),
+                            Some(&resolved.to_string_lossy()),
+                            None,
+                        )
                     }
                 }
             }
         })
     }
 
-    #[tool(name = "lean_excel_inspect", description = "Returns sheet names, dimensions, and the header row for an Excel spreadsheet (.xlsx/.xls/.ods).")]
+    #[tool(
+        name = "lean_excel_inspect",
+        description = "Returns sheet names, dimensions, and the header row for an Excel spreadsheet (.xlsx/.xls/.ods)."
+    )]
     pub fn excel_inspect(&self, Parameters(req): Parameters<ExcelInspectRequest>) -> String {
         guarded(move || tools::excel::excel_inspect(&req.path))
     }
 
-    #[tool(name = "lean_excel_read_rows", description = "Reads rows from an Excel spreadsheet (.xlsx/.xls/.ods) as structured JSON (or CSV). Supports sheet selection, a cell range, keyword query filtering, and offset pagination (default page size 500 rows).")]
+    #[tool(
+        name = "lean_excel_read_rows",
+        description = "Reads rows from an Excel spreadsheet (.xlsx/.xls/.ods) as structured JSON (or CSV). Supports sheet selection, a cell range, keyword query filtering, and offset pagination (default page size 500 rows)."
+    )]
     pub fn excel_read_rows(&self, Parameters(req): Parameters<ExcelReadRowsRequest>) -> String {
         guarded(move || {
             tools::excel::excel_read_rows(
@@ -681,7 +756,10 @@ impl KittyToolsServer {
         })
     }
 
-    #[tool(name = "lean_pdf_read_text", description = "Reads text from a PDF page-by-page. Supports page ranges, keyword query filtering, and offset pagination.")]
+    #[tool(
+        name = "lean_pdf_read_text",
+        description = "Reads text from a PDF page-by-page. Supports page ranges, keyword query filtering, and offset pagination."
+    )]
     pub fn pdf_read_text(&self, Parameters(req): Parameters<PdfReadTextRequest>) -> String {
         guarded(move || {
             tools::pdf::pdf_read_text(
@@ -694,79 +772,156 @@ impl KittyToolsServer {
         })
     }
 
-    #[tool(name = "lean_pdf_read_outline", description = "Returns the table-of-contents/bookmark outline of a PDF, if it has one.")]
+    #[tool(
+        name = "lean_pdf_read_outline",
+        description = "Returns the table-of-contents/bookmark outline of a PDF, if it has one."
+    )]
     pub fn pdf_read_outline(&self, Parameters(req): Parameters<PdfReadOutlineRequest>) -> String {
         guarded(move || tools::pdf::pdf_read_outline(&req.path))
     }
 
-    #[tool(name = "lean_analyze_workspace", description = "Lists files and folders under path (or returns metadata if path is a file).")]
-    pub fn analyze_workspace(&self, Parameters(req): Parameters<AnalyzeWorkspaceRequest>) -> String {
-        guarded(move || tools::workspace::analyze_workspace(req.path.as_deref().unwrap_or("."), req.max_depth))
-    }
-
-    #[tool(name = "lean_file_read", description = "Reads lines from a text file with line numbers. Supports query filtering.")]
-    pub fn file_read(&self, Parameters(req): Parameters<FileReadRequest>) -> String {
-        guarded(move || tools::fs::file_read(&req.path, req.start_line, req.end_line, req.query.as_deref()))
-    }
-
-    #[tool(name = "lean_file_write", description = "Overwrites (or creates) a text file with the given content.")]
-    pub fn file_write(&self, Parameters(req): Parameters<FileWriteRequest>) -> String {
-        guarded(move || tools::fs::file_write(&req.path, &req.content, req.dry_run.unwrap_or(false)))
-    }
-
-    #[tool(name = "lean_file_append", description = "Appends content to the end of an existing text file.")]
-    pub fn file_append(&self, Parameters(req): Parameters<FileAppendRequest>) -> String {
-        guarded(move || tools::fs::file_append(&req.path, &req.content, req.dry_run.unwrap_or(false)))
-    }
-
-    #[tool(name = "lean_file_replace_str", description = "Replaces exact string occurrences in a file.")]
-    pub fn file_replace_str(&self, Parameters(req): Parameters<FileReplaceStrRequest>) -> String {
-        guarded(move || tools::fs::file_replace_str(&req.path, &req.old_str, &req.new_str, req.dry_run.unwrap_or(false)))
-    }
-
-    #[tool(name = "lean_file_replace_lines", description = "Replaces a specific 1-indexed inclusive line range with new content.")]
-    pub fn file_replace_lines(&self, Parameters(req): Parameters<FileReplaceLinesRequest>) -> String {
+    #[tool(
+        name = "lean_analyze_workspace",
+        description = "Lists files and folders under path (or returns metadata if path is a file)."
+    )]
+    pub fn analyze_workspace(
+        &self,
+        Parameters(req): Parameters<AnalyzeWorkspaceRequest>,
+    ) -> String {
         guarded(move || {
-            tools::fs::file_replace_lines(&req.path, req.start_line, req.end_line, &req.new_content, req.dry_run.unwrap_or(false))
+            tools::workspace::analyze_workspace(req.path.as_deref().unwrap_or("."), req.max_depth)
         })
     }
 
-    #[tool(name = "lean_cache_list", description = "Lists files currently stored in the scratch cache directory with their sizes.")]
+    #[tool(
+        name = "lean_file_read",
+        description = "Reads lines from a text file with line numbers. Supports query filtering."
+    )]
+    pub fn file_read(&self, Parameters(req): Parameters<FileReadRequest>) -> String {
+        guarded(move || {
+            tools::fs::file_read(
+                &req.path,
+                req.start_line,
+                req.end_line,
+                req.query.as_deref(),
+            )
+        })
+    }
+
+    #[tool(
+        name = "lean_file_write",
+        description = "Overwrites (or creates) a text file with the given content."
+    )]
+    pub fn file_write(&self, Parameters(req): Parameters<FileWriteRequest>) -> String {
+        guarded(move || {
+            tools::fs::file_write(&req.path, &req.content, req.dry_run.unwrap_or(false))
+        })
+    }
+
+    #[tool(
+        name = "lean_file_append",
+        description = "Appends content to the end of an existing text file."
+    )]
+    pub fn file_append(&self, Parameters(req): Parameters<FileAppendRequest>) -> String {
+        guarded(move || {
+            tools::fs::file_append(&req.path, &req.content, req.dry_run.unwrap_or(false))
+        })
+    }
+
+    #[tool(
+        name = "lean_file_replace_str",
+        description = "Replaces exact string occurrences in a file."
+    )]
+    pub fn file_replace_str(&self, Parameters(req): Parameters<FileReplaceStrRequest>) -> String {
+        guarded(move || {
+            tools::fs::file_replace_str(
+                &req.path,
+                &req.old_str,
+                &req.new_str,
+                req.dry_run.unwrap_or(false),
+            )
+        })
+    }
+
+    #[tool(
+        name = "lean_file_replace_lines",
+        description = "Replaces a specific 1-indexed inclusive line range with new content."
+    )]
+    pub fn file_replace_lines(
+        &self,
+        Parameters(req): Parameters<FileReplaceLinesRequest>,
+    ) -> String {
+        guarded(move || {
+            tools::fs::file_replace_lines(
+                &req.path,
+                req.start_line,
+                req.end_line,
+                &req.new_content,
+                req.dry_run.unwrap_or(false),
+            )
+        })
+    }
+
+    #[tool(
+        name = "lean_cache_list",
+        description = "Lists files currently stored in the scratch cache directory with their sizes."
+    )]
     pub fn cache_list(&self) -> String {
         guarded(tools::cache::cache_list)
     }
 
-    #[tool(name = "lean_cache_view", description = "Reads the text content of a file previously stored in the scratch cache directory.")]
+    #[tool(
+        name = "lean_cache_view",
+        description = "Reads the text content of a file previously stored in the scratch cache directory."
+    )]
     pub fn cache_view(&self, Parameters(req): Parameters<CacheFilenameRequest>) -> String {
         guarded(move || tools::cache::cache_view(&req.filename))
     }
 
-    #[tool(name = "lean_cache_delete", description = "Deletes a single file from the scratch cache directory.")]
+    #[tool(
+        name = "lean_cache_delete",
+        description = "Deletes a single file from the scratch cache directory."
+    )]
     pub fn cache_delete(&self, Parameters(req): Parameters<CacheFilenameRequest>) -> String {
         guarded(move || tools::cache::cache_delete(&req.filename))
     }
 
-    #[tool(name = "lean_cache_clear", description = "Deletes every file in the scratch cache directory and returns how many were removed.")]
+    #[tool(
+        name = "lean_cache_clear",
+        description = "Deletes every file in the scratch cache directory and returns how many were removed."
+    )]
     pub fn cache_clear(&self) -> String {
         guarded(tools::cache::cache_clear)
     }
 
-    #[tool(name = "lean_scratchpad_set", description = "Stores a key/value pair in the persistent scratchpad for recall across turns.")]
+    #[tool(
+        name = "lean_scratchpad_set",
+        description = "Stores a key/value pair in the persistent scratchpad for recall across turns."
+    )]
     pub fn scratchpad_set(&self, Parameters(req): Parameters<ScratchpadSetRequest>) -> String {
         guarded(move || tools::scratchpad::scratchpad_set(&req.key, &req.value))
     }
 
-    #[tool(name = "lean_scratchpad_get", description = "Retrieves a previously stored scratchpad value by key.")]
+    #[tool(
+        name = "lean_scratchpad_get",
+        description = "Retrieves a previously stored scratchpad value by key."
+    )]
     pub fn scratchpad_get(&self, Parameters(req): Parameters<ScratchpadKeyRequest>) -> String {
         guarded(move || tools::scratchpad::scratchpad_get(&req.key))
     }
 
-    #[tool(name = "lean_scratchpad_delete", description = "Deletes a key from the persistent scratchpad.")]
+    #[tool(
+        name = "lean_scratchpad_delete",
+        description = "Deletes a key from the persistent scratchpad."
+    )]
     pub fn scratchpad_delete(&self, Parameters(req): Parameters<ScratchpadKeyRequest>) -> String {
         guarded(move || tools::scratchpad::scratchpad_delete(&req.key))
     }
 
-    #[tool(name = "lean_scratchpad_list", description = "Lists all keys currently stored in the persistent scratchpad.")]
+    #[tool(
+        name = "lean_scratchpad_list",
+        description = "Lists all keys currently stored in the persistent scratchpad."
+    )]
     pub fn scratchpad_list(&self) -> String {
         guarded(tools::scratchpad::scratchpad_list)
     }
@@ -782,7 +937,10 @@ impl KittyToolsServer {
 // this is a registration decision, not a build one.
 #[tool_router(router = shell_tool_router)]
 impl KittyToolsServer {
-    #[tool(name = "lean_shell", description = "Runs a shell command and returns truncated stdout/stderr. Set dry_run=True to preview without executing.")]
+    #[tool(
+        name = "lean_shell",
+        description = "Runs a shell command and returns truncated stdout/stderr. Set dry_run=True to preview without executing."
+    )]
     pub async fn shell(&self, Parameters(req): Parameters<ShellRequest>) -> String {
         tools::shell::shell(&req.command, req.dry_run.unwrap_or(false)).await
     }
@@ -794,18 +952,35 @@ impl KittyToolsServer {
         name = "generate_accessible_table",
         description = "Renders a WCAG 2.2 AA compliant HTML table inline in the chat. Use it when the individual values matter -- comparisons across more than two dimensions, or any data a reader needs to read exactly. Use generate_accessible_chart instead when the shape of the numbers is the point, not the exact values. Every row must have exactly as many values as there are headers."
     )]
-    pub fn generate_accessible_table(&self, Parameters(req): Parameters<AccessibleTableRequest>) -> String {
-        guarded(move || tools::viz::generate_accessible_table(&req.title, &req.headers, &req.rows, req.summary.as_deref()))
+    pub fn generate_accessible_table(
+        &self,
+        Parameters(req): Parameters<AccessibleTableRequest>,
+    ) -> String {
+        guarded(move || {
+            tools::viz::generate_accessible_table(
+                &req.title,
+                &req.headers,
+                &req.rows,
+                req.summary.as_deref(),
+            )
+        })
     }
 
     #[tool(
         name = "generate_accessible_svg",
         description = "Draws a process, hierarchy or user-journey diagram as an accessible SVG, rendered inline in the chat. Use this for anything with steps, actors, branches or stages -- pick diagram_type by the shape of your data (see its description). Do NOT use it for numeric data -- use generate_accessible_chart for that, or generate_accessible_table for raw values. Every node comes from `steps`; there is no built-in content. Example, a branching flowchart: {\"diagram_type\":\"flowchart\",\"title\":\"Login\",\"description\":\"How a login request is authenticated.\",\"steps\":[{\"id\":\"a\",\"text\":\"Receive request\",\"type\":\"start\",\"next\":[\"b\"]},{\"id\":\"b\",\"text\":\"Credentials valid?\",\"type\":\"decision\",\"next\":[\"c\",\"d\"]},{\"id\":\"c\",\"text\":\"Issue token\",\"type\":\"end\"},{\"id\":\"d\",\"text\":\"Return 401\",\"type\":\"end\"}]}"
     )]
-    pub fn generate_accessible_svg(&self, Parameters(req): Parameters<AccessibleSvgRequest>) -> String {
+    pub fn generate_accessible_svg(
+        &self,
+        Parameters(req): Parameters<AccessibleSvgRequest>,
+    ) -> String {
         guarded(move || {
             let diagram_type = req.diagram_type.to_model();
-            let steps: Vec<viz_model::Step> = req.steps.into_iter().map(VizStepParam::into_model).collect();
+            let steps: Vec<viz_model::Step> = req
+                .steps
+                .into_iter()
+                .map(VizStepParam::into_model)
+                .collect();
             tools::viz::generate_accessible_svg(diagram_type, &req.title, &req.description, steps)
         })
     }
@@ -814,11 +989,20 @@ impl KittyToolsServer {
         name = "generate_accessible_chart",
         description = "Draws a bar or line chart from numeric data as an accessible SVG, with a hidden data table for screen readers. Use it when you have numbers per category and want to show comparison or trend; use generate_accessible_table when the exact values matter more than the shape. Every series must have one value per category. Example: {\"chart_type\":\"bar\",\"title\":\"Revenue by quarter\",\"description\":\"Revenue rose each quarter, with the largest jump in Q3.\",\"categories\":[\"Q1\",\"Q2\",\"Q3\",\"Q4\"],\"series\":[{\"name\":\"Revenue\",\"values\":[12.4,15.1,22.8,24.0]}],\"y_label\":\"USD millions\"}"
     )]
-    pub fn generate_accessible_chart(&self, Parameters(req): Parameters<AccessibleChartRequest>) -> String {
+    pub fn generate_accessible_chart(
+        &self,
+        Parameters(req): Parameters<AccessibleChartRequest>,
+    ) -> String {
         guarded(move || {
             let chart_type = req.chart_type.to_model();
-            let series: Vec<viz_model::ChartSeries> =
-                req.series.into_iter().map(|s| viz_model::ChartSeries { name: s.name, values: s.values }).collect();
+            let series: Vec<viz_model::ChartSeries> = req
+                .series
+                .into_iter()
+                .map(|s| viz_model::ChartSeries {
+                    name: s.name,
+                    values: s.values,
+                })
+                .collect();
             tools::viz::generate_accessible_chart(
                 chart_type,
                 &req.title,
@@ -835,8 +1019,17 @@ impl KittyToolsServer {
         name = "generate_accessible_mermaid",
         description = "Renders a Mermaid diagram inline in the chat. Use it when a step/edge model is too rigid: Mermaid gives you flowcharts, sequence diagrams, class diagrams, state diagrams, ER diagrams, gantt, journey maps, pie, mindmap, gitGraph, and timeline from a single source string. Preferred over generate_accessible_svg when the caller already has Mermaid source, or needs a diagram type that steps-based layout can't express. Example: {\"title\":\"Login flow\",\"description\":\"The login flow branches on whether the credentials are valid.\",\"mermaid\":\"flowchart TD\\n  A[Receive request] --> B{Credentials valid?}\\n  B -->|Yes| C[Issue token]\\n  B -->|No| D[Return 401]\"}. Rendered server-side into a static SVG shown in the chat; invalid/unsupported source returns an error instead of a blank frame."
     )]
-    pub fn generate_accessible_mermaid(&self, Parameters(req): Parameters<AccessibleMermaidRequest>) -> String {
-        guarded(move || tools::viz::mermaid::generate_accessible_mermaid(&req.mermaid, &req.title, &req.description))
+    pub fn generate_accessible_mermaid(
+        &self,
+        Parameters(req): Parameters<AccessibleMermaidRequest>,
+    ) -> String {
+        guarded(move || {
+            tools::viz::mermaid::generate_accessible_mermaid(
+                &req.mermaid,
+                &req.title,
+                &req.description,
+            )
+        })
     }
 }
 

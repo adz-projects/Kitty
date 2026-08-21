@@ -165,7 +165,9 @@ fn table_xml(rows: &[Vec<String>]) -> String {
         return String::new();
     }
 
-    let grid_cols: String = (0..num_cols).map(|_| r#"<w:gridCol w:w="2000"/>"#).collect();
+    let grid_cols: String = (0..num_cols)
+        .map(|_| r#"<w:gridCol w:w="2000"/>"#)
+        .collect();
 
     let mut trs = String::new();
     for (r_idx, row) in rows.iter().enumerate() {
@@ -263,7 +265,11 @@ fn render_body(doc_text: &str) -> String {
         } else if let Some(rest) = strip_ordered_list_prefix(line) {
             out.push_str(&list_paragraph_xml("ListNumber", 2, rest));
         } else {
-            out.push_str(&paragraph_xml(Some("Normal"), "", &render_inline_runs(line)));
+            out.push_str(&paragraph_xml(
+                Some("Normal"),
+                "",
+                &render_inline_runs(line),
+            ));
         }
         i += 1;
     }
@@ -280,7 +286,12 @@ fn strip_ordered_list_prefix(line: &str) -> Option<&str> {
 // Create mode
 // ---------------------------------------------------------------------------
 
-fn create(path: &Path, doc_text: Option<&str>, title: Option<&str>, language: &str) -> Result<WriteResult, DocxError> {
+fn create(
+    path: &Path,
+    doc_text: Option<&str>,
+    title: Option<&str>,
+    language: &str,
+) -> Result<WriteResult, DocxError> {
     let doc_title = title.map(str::to_string).unwrap_or_else(|| {
         path.file_stem()
             .map(|s| s.to_string_lossy().to_string())
@@ -325,13 +336,19 @@ fn create(path: &Path, doc_text: Option<&str>, title: Option<&str>, language: &s
 
     write_zip_str(&mut zip, "[Content_Types].xml", CONTENT_TYPES, opts)?;
     write_zip_str(&mut zip, "_rels/.rels", ROOT_RELS, opts)?;
-    write_zip_str(&mut zip, "word/_rels/document.xml.rels", DOCUMENT_RELS, opts)?;
+    write_zip_str(
+        &mut zip,
+        "word/_rels/document.xml.rels",
+        DOCUMENT_RELS,
+        opts,
+    )?;
     write_zip_str(&mut zip, "word/document.xml", &document_xml, opts)?;
     write_zip_str(&mut zip, "word/styles.xml", &styles_xml, opts)?;
     write_zip_str(&mut zip, "word/numbering.xml", NUMBERING, opts)?;
     write_zip_str(&mut zip, "docProps/core.xml", &core_xml, opts)?;
     write_zip_str(&mut zip, "docProps/app.xml", APP_PROPS, opts)?;
-    zip.finish().map_err(|e| DocxError::Corrupt(e.to_string()))?;
+    zip.finish()
+        .map_err(|e| DocxError::Corrupt(e.to_string()))?;
 
     Ok(WriteResult {
         path: path.to_string_lossy().to_string(),
@@ -346,8 +363,10 @@ fn write_zip_str(
     contents: &str,
     opts: SimpleFileOptions,
 ) -> Result<(), DocxError> {
-    zip.start_file(name, opts).map_err(|e| DocxError::Corrupt(e.to_string()))?;
-    zip.write_all(contents.as_bytes()).map_err(|e| DocxError::Corrupt(e.to_string()))?;
+    zip.start_file(name, opts)
+        .map_err(|e| DocxError::Corrupt(e.to_string()))?;
+    zip.write_all(contents.as_bytes())
+        .map_err(|e| DocxError::Corrupt(e.to_string()))?;
     Ok(())
 }
 
@@ -378,7 +397,12 @@ fn append_lang_to_styles_root(styles_xml: &str, language: &str) -> String {
 // `<w:sectPr>`.
 // ---------------------------------------------------------------------------
 
-fn append(path: &Path, doc_text: Option<&str>, title: Option<&str>, language: &str) -> Result<WriteResult, DocxError> {
+fn append(
+    path: &Path,
+    doc_text: Option<&str>,
+    title: Option<&str>,
+    language: &str,
+) -> Result<WriteResult, DocxError> {
     if !path.exists() {
         return Err(DocxError::NotFound);
     }
@@ -393,7 +417,9 @@ fn append(path: &Path, doc_text: Option<&str>, title: Option<&str>, language: &s
 
     let mut parts: BTreeMap<String, Vec<u8>> = BTreeMap::new();
     for i in 0..archive.len() {
-        let entry = archive.by_index(i).map_err(|e| DocxError::Corrupt(e.to_string()))?;
+        let entry = archive
+            .by_index(i)
+            .map_err(|e| DocxError::Corrupt(e.to_string()))?;
         let name = entry.name().to_string();
         let mut buf = Vec::new();
         // Cap decompression per part (zip-bomb hardening, same as the read
@@ -448,10 +474,13 @@ fn append(path: &Path, doc_text: Option<&str>, title: Option<&str>, language: &s
     let mut zip = zip::ZipWriter::new(file);
     let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
     for (name, bytes) in &parts {
-        zip.start_file(name, opts).map_err(|e| DocxError::Corrupt(e.to_string()))?;
-        zip.write_all(bytes).map_err(|e| DocxError::Corrupt(e.to_string()))?;
+        zip.start_file(name, opts)
+            .map_err(|e| DocxError::Corrupt(e.to_string()))?;
+        zip.write_all(bytes)
+            .map_err(|e| DocxError::Corrupt(e.to_string()))?;
     }
-    zip.finish().map_err(|e| DocxError::Corrupt(e.to_string()))?;
+    zip.finish()
+        .map_err(|e| DocxError::Corrupt(e.to_string()))?;
 
     Ok(WriteResult {
         path: path.to_string_lossy().to_string(),
@@ -537,7 +566,10 @@ mod tests {
 
     #[test]
     fn table_rows_short_row_leaves_trailing_cells_empty() {
-        let rows = vec![vec!["a".to_string(), "b".to_string()], vec!["c".to_string()]];
+        let rows = vec![
+            vec!["a".to_string(), "b".to_string()],
+            vec!["c".to_string()],
+        ];
         let xml = table_xml(&rows);
         // 2 columns (max row len), second row's second cell empty.
         assert_eq!(xml.matches("<w:gridCol").count(), 2);
@@ -565,7 +597,10 @@ mod tests {
         // `[1..0]`. It now renders as one empty cell, mirroring Python's
         // forgiving `line[1:-1]`.
         let body = render_body("|");
-        assert!(body.contains("<w:tbl>"), "a pipe-gated line still renders as a table: {body}");
+        assert!(
+            body.contains("<w:tbl>"),
+            "a pipe-gated line still renders as a table: {body}"
+        );
     }
 
     #[test]
@@ -609,7 +644,10 @@ mod tests {
                 ("LANGUAGE", &xml_escape("en-US")),
             ],
         );
-        assert!(core.contains("<dc:title>foo __LANGUAGE__ bar</dc:title>"), "{core}");
+        assert!(
+            core.contains("<dc:title>foo __LANGUAGE__ bar</dc:title>"),
+            "{core}"
+        );
         assert!(core.contains("<dc:language>en-US</dc:language>"), "{core}");
     }
 }

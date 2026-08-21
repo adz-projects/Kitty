@@ -20,7 +20,8 @@ pub fn py_splitlines(text: &str) -> Vec<String> {
                 }
                 lines.push(std::mem::take(&mut current));
             }
-            '\n' | '\u{0B}' | '\u{0C}' | '\u{1C}' | '\u{1D}' | '\u{1E}' | '\u{85}' | '\u{2028}' | '\u{2029}' => {
+            '\n' | '\u{0B}' | '\u{0C}' | '\u{1C}' | '\u{1D}' | '\u{1E}' | '\u{85}' | '\u{2028}'
+            | '\u{2029}' => {
                 lines.push(std::mem::take(&mut current));
             }
             _ => current.push(c),

@@ -26,7 +26,12 @@ fn is_falsy(v: &Value) -> bool {
 /// metadata=None)`. `truncated` and `data` are always present (matching
 /// Python's unconditional `payload["truncated"]`/`payload["data"]`), even
 /// when `data` is `false`/`null`/empty.
-pub fn success_response(data: Value, message: Option<&str>, truncated: bool, metadata: Option<Value>) -> String {
+pub fn success_response(
+    data: Value,
+    message: Option<&str>,
+    truncated: bool,
+    metadata: Option<Value>,
+) -> String {
     let mut payload = Map::new();
     payload.insert("status".to_string(), json!("success"));
     payload.insert("truncated".to_string(), json!(truncated));
@@ -52,7 +57,12 @@ pub fn success_response(data: Value, message: Option<&str>, truncated: bool, met
 /// in "TARGET_NOT_FOUND"` matches the first arm before it), matching
 /// `lean_mcp.py:84-93` exactly. Do not "fix" the ordering — a golden test
 /// pins this.
-pub fn error_response(code: &str, message: &str, detail: Option<&str>, hint: Option<&str>) -> String {
+pub fn error_response(
+    code: &str,
+    message: &str,
+    detail: Option<&str>,
+    hint: Option<&str>,
+) -> String {
     let mut payload = Map::new();
     payload.insert("status".to_string(), json!("error"));
     payload.insert("error_code".to_string(), json!(code));
@@ -76,14 +86,20 @@ pub fn error_response(code: &str, message: &str, detail: Option<&str>, hint: Opt
 
 fn auto_hint(code: &str) -> Option<String> {
     if code.contains("NOT_FOUND") || code.contains("MISSING") {
-        Some("Verify path spelling or call lean_analyze_workspace to check available files.".to_string())
+        Some(
+            "Verify path spelling or call lean_analyze_workspace to check available files."
+                .to_string(),
+        )
     } else if code.contains("CORRUPT") || code.contains("PARSE") {
         Some("File may be damaged or password-protected. Verify format.".to_string())
     } else if code.contains("BAD_RANGE") || code.contains("OUT_OF_BOUNDS") {
         Some("Inspect dimensions or line counts before specifying bounds.".to_string())
     } else if code.contains("TARGET_NOT_FOUND") {
         // Dead branch, kept for parity — see doc comment above.
-        Some("Use lean_file_read first to confirm exact string formatting or line numbers.".to_string())
+        Some(
+            "Use lean_file_read first to confirm exact string formatting or line numbers."
+                .to_string(),
+        )
     } else if code.contains("SEARCH") || code.contains("SCRAPE") {
         Some("Broaden search keywords or check domain connectivity.".to_string())
     } else {
@@ -118,7 +134,10 @@ mod tests {
     fn not_found_gets_the_workspace_hint() {
         let s = error_response("DOCX_NOT_FOUND", "missing", None, None);
         let v: Value = serde_json::from_str(&s).unwrap();
-        assert!(v["hint"].as_str().unwrap().contains("lean_analyze_workspace"));
+        assert!(v["hint"]
+            .as_str()
+            .unwrap()
+            .contains("lean_analyze_workspace"));
     }
 
     #[test]
@@ -128,7 +147,10 @@ mod tests {
         // wins and the TARGET_NOT_FOUND-specific hint is unreachable.
         let s = error_response("TARGET_NOT_FOUND", "no match", None, None);
         let v: Value = serde_json::from_str(&s).unwrap();
-        assert!(v["hint"].as_str().unwrap().contains("lean_analyze_workspace"));
+        assert!(v["hint"]
+            .as_str()
+            .unwrap()
+            .contains("lean_analyze_workspace"));
         assert!(!v["hint"].as_str().unwrap().contains("lean_file_read"));
     }
 
