@@ -58,3 +58,12 @@ plugins/bigtiny/
 plugins/visualizations/
 plugins/brave-mcp-search/
 plugins/replacement-mcp/
+
+# OpenCode session summaries — machine-local working notes, same rationale as
+# `.claude/` above (this tool writes to `opencode/`, not `.opencode/`).
+opencode/
+
+# npm lockfile. This project uses pnpm (`pnpm-lock.yaml`); a stray
+# package-lock.json from an accidental `npm install` would pin a second,
+# divergent dependency graph.
+package-lock.json

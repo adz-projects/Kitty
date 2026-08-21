@@ -137,11 +137,10 @@ pub async fn spawn(
     // file fallback just because Kitty's own lookup failed (that fallback
     // exists for genuinely standalone runs with no Kitty parent process,
     // not as a safety net for this).
-    let encryption_key = tokio::task::spawn_blocking(
-        crate::config::providers::get_or_create_bigtiny_encryption_key,
-    )
-    .await
-    .map_err(|e| format!("encryption key task panicked: {e}"))??;
+    let encryption_key =
+        tokio::task::spawn_blocking(crate::config::providers::get_or_create_bigtiny_encryption_key)
+            .await
+            .map_err(|e| format!("encryption key task panicked: {e}"))??;
 
     let mut cmd = hidden_command(Path::new(command));
     cmd.args(args)

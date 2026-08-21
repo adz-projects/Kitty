@@ -190,7 +190,10 @@ mod tests {
     #[test]
     fn debounce_publishes_ok_immediately_and_resets_the_streak() {
         let mut streak = 0;
-        assert_eq!(debounce_status(&mut streak, StackStatus::Ok), Some(StackStatus::Ok));
+        assert_eq!(
+            debounce_status(&mut streak, StackStatus::Ok),
+            Some(StackStatus::Ok)
+        );
         assert_eq!(streak, 0);
     }
 
@@ -199,7 +202,10 @@ mod tests {
         let mut streak = 0;
         assert_eq!(debounce_status(&mut streak, StackStatus::BackendDown), None);
         // One blip followed by a recovery: nothing degraded was ever published.
-        assert_eq!(debounce_status(&mut streak, StackStatus::Ok), Some(StackStatus::Ok));
+        assert_eq!(
+            debounce_status(&mut streak, StackStatus::Ok),
+            Some(StackStatus::Ok)
+        );
         assert_eq!(streak, 0);
     }
 
