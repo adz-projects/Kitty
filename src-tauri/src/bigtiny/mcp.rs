@@ -29,8 +29,7 @@ fn bundled_transport(logical: &str, exe: &str) -> (String, String) {
     if cfg!(target_os = "android") {
         ("in_process".to_string(), logical.to_string())
     } else {
-        let path =
-            crate::config::bundled_plugin_path(exe).unwrap_or_else(|| logical.to_string());
+        let path = crate::config::bundled_plugin_path(exe).unwrap_or_else(|| logical.to_string());
         ("stdio".to_string(), path)
     }
 }
@@ -94,6 +93,10 @@ pub struct McpServer {
     /// auth (never used for `stdio`).
     #[serde(default)]
     pub headers: HashMap<String, String>,
+    /// Per-server tool-call timeout in seconds (`NULL` in the row = the
+    /// daemon's 30s default).
+    #[serde(default)]
+    pub timeout_s: Option<i64>,
     #[serde(default = "default_true")]
     pub enabled: bool,
     pub status: String,
@@ -117,6 +120,10 @@ pub struct McpServerSpec {
     pub env: HashMap<String, String>,
     #[serde(default)]
     pub headers: HashMap<String, String>,
+    /// Per-server tool-call timeout in seconds; `None` leaves the daemon's
+    /// 30s default (`mcp::manager::DEFAULT_TOOL_TIMEOUT`) in place.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_s: Option<i64>,
     #[serde(default = "default_true")]
     pub enabled: bool,
 }
@@ -140,6 +147,8 @@ pub struct McpServerPatch {
     pub env: Option<HashMap<String, String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub headers: Option<HashMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_s: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
 }
@@ -172,6 +181,7 @@ fn parse_server(row: &Value) -> Option<McpServer> {
         url: row.get("url").and_then(|v| v.as_str()).map(String::from),
         env,
         headers,
+        timeout_s: row.get("timeout_s").and_then(|v| v.as_i64()),
         enabled: row
             .get("enabled")
             .and_then(|v| v.as_i64())
@@ -357,6 +367,8 @@ pub async fn ensure_builtin_servers(app: &AppHandle) {
             url: None,
             env: HashMap::new(),
             headers: HashMap::new(),
+            // Default 30s tool timeout is right here; only kitty-wasm needs more.
+            timeout_s: None,
             enabled: pathway_enabled,
         },
     )
@@ -402,6 +414,21 @@ pub async fn ensure_builtin_servers(app: &AppHandle) {
             url: None,
             env: kitty_wasm_env,
             headers: HashMap::new(),
+            // The only builtin that needs more than the daemon's 30s default,
+            // for two reasons that compound. Its own `timeout_s` argument
+            // accepts up to 300s (`sandbox::MAX_TIMEOUT_SECS`), so a 30s MCP
+            // cut made that argument a lie past 30 — the model would ask for
+            // 300 and be killed at 30 with no explanation. And on first use
+            // the tool downloads a ~26 MB CPython guest before it can run
+            // anything, which on a phone reliably exceeds 30s: verified on
+            // device, where the download completed but the *call* was cut off,
+            // so the tool reported a timeout for work that had actually
+            // succeeded.
+            //
+            // Safe to be this large: the sandbox enforces its own wall clock
+            // via epoch interruption and always returns within `timeout_s`, so
+            // this bounds the download rather than the execution.
+            timeout_s: Some(600),
             enabled: kitty_wasm_enabled,
         },
     )
@@ -435,6 +462,8 @@ pub async fn ensure_builtin_servers(app: &AppHandle) {
             url: None,
             env: kitty_tools_env,
             headers: HashMap::new(),
+            // Default 30s tool timeout is right here; only kitty-wasm needs more.
+            timeout_s: None,
             enabled: kitty_tools_enabled,
         },
     )
@@ -483,6 +512,8 @@ pub async fn ensure_builtin_servers(app: &AppHandle) {
                     url: None,
                     env: kitty_web_env,
                     headers: HashMap::new(),
+                    // Default 30s tool timeout is right here; only kitty-wasm needs more.
+                    timeout_s: None,
                     enabled: kitty_web_enabled,
                 },
             )
@@ -571,7 +602,10 @@ fn decide_sync_action(existing: &[McpServer], name: &str, desired: &McpServerSpe
         // (the old `adaptive-pathway` stdio row), but a builtin ever
         // changing transport again without a name change should self-heal
         // here rather than repeat that gap.
-        || row.transport != desired.transport;
+        || row.transport != desired.transport
+        // Without this, raising a builtin's timeout in a new release would
+        // never reach an install that already has the row.
+        || row.timeout_s != desired.timeout_s;
 
     if changed {
         SyncAction::Patch {
@@ -582,6 +616,7 @@ fn decide_sync_action(existing: &[McpServer], name: &str, desired: &McpServerSpe
                 env: Some(desired.env.clone()),
                 enabled: Some(desired.enabled),
                 transport: Some(desired.transport.clone()),
+                timeout_s: desired.timeout_s,
                 ..Default::default()
             }),
         }
@@ -670,6 +705,7 @@ mod tests {
 
     fn spec(name: &str, command: &str, enabled: bool) -> McpServerSpec {
         McpServerSpec {
+            timeout_s: None,
             name: name.to_string(),
             transport: "stdio".to_string(),
             command: Some(command.to_string()),
@@ -681,8 +717,41 @@ mod tests {
         }
     }
 
+    /// A change to a builtin's timeout has to reach installs that already
+    /// have the row, or the fix only helps people who install fresh.
+    #[test]
+    fn a_changed_timeout_triggers_a_patch_that_carries_it() {
+        let existing = vec![row("kitty-wasm", "kitty-wasm", true, "connected")];
+        let mut desired = spec("kitty-wasm", "kitty-wasm", true);
+        desired.timeout_s = Some(600);
+
+        match decide_sync_action(&existing, "kitty-wasm", &desired) {
+            SyncAction::Patch { patch, .. } => assert_eq!(
+                patch.timeout_s,
+                Some(600),
+                "the patch must carry the new timeout, not merely be triggered by it"
+            ),
+            other => panic!("expected a patch, got {other:?}"),
+        }
+    }
+
+    /// ...and an unchanged one must not churn the row on every launch.
+    #[test]
+    fn a_matching_timeout_is_left_alone() {
+        let mut existing_row = row("kitty-wasm", "kitty-wasm", true, "connected");
+        existing_row.timeout_s = Some(600);
+        let mut desired = spec("kitty-wasm", "kitty-wasm", true);
+        desired.timeout_s = Some(600);
+
+        assert!(matches!(
+            decide_sync_action(&[existing_row], "kitty-wasm", &desired),
+            SyncAction::Noop
+        ));
+    }
+
     fn row(name: &str, command: &str, enabled: bool, status: &str) -> McpServer {
         McpServer {
+            timeout_s: None,
             id: format!("{name}-id"),
             name: name.to_string(),
             transport: "stdio".to_string(),
@@ -761,6 +830,7 @@ mod tests {
         // old shape being migrated away from here.
         let existing_row = row("pathway", "pathway", true, "connected");
         let desired = McpServerSpec {
+            timeout_s: None,
             name: "pathway".to_string(),
             transport: "in_process".to_string(),
             command: Some("pathway".to_string()),

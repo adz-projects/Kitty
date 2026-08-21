@@ -16,8 +16,8 @@
 pub mod bigtiny_embedded;
 pub mod bigtiny_env;
 pub mod bigtiny_proc;
-pub mod engine_restart;
 pub(crate) mod embedding;
+pub mod engine_restart;
 mod health;
 pub mod scheduler;
 
@@ -183,7 +183,7 @@ fn warm_openrouter_catalog(app: &AppHandle) {
     // (`ensure_catalog_fresh`, opening the model picker) still applies, so
     // anyone who actually looks at the catalog gets current data.
     if !refetch {
-        tracing::debug!("OpenRouter catalog cache is fresh enough; skipping the startup fetch");
+        tracing::info!("OpenRouter catalog cache is fresh enough; skipping the startup fetch");
         return;
     }
     let app = app.clone();
@@ -324,7 +324,10 @@ pub fn start_stack(app: &AppHandle) {
         let (ap_enabled, ap_embedding_model) = {
             let state = app.state::<AppState>();
             let cfg = state.config.lock().unwrap();
-            (cfg.adaptive_pathway_enabled, cfg.adaptive_pathway_embedding_model.clone())
+            (
+                cfg.adaptive_pathway_enabled,
+                cfg.adaptive_pathway_embedding_model.clone(),
+            )
         };
         if ap_enabled {
             embedding::refresh_embedding_status(&app, &ap_embedding_model);

@@ -175,9 +175,17 @@ the AAB.
 ### Build
 
 ```powershell
-pnpm tauri android build          # AAB, release variant
-pnpm tauri android build --apk    # APK, for sideloading a test build
+pnpm tauri android build --target aarch64          # AAB, release variant
+pnpm tauri android build --apk --target aarch64    # APK, for sideloading
+pnpm tauri android build --apk --debug --target aarch64   # debug APK
 ```
+
+**`--target aarch64` is not optional.** Without it the CLI builds a *universal*
+APK — all four ABIs — and `armeabi-v7a` fails: `edgefirst-tflite-sys` does not
+compile for 32-bit (25 × `E0080` const-eval errors on pointer width). That ABI
+is not shipped anyway; D22 in `docs/ANDROID.md` pins `aarch64-linux-android` as
+the only v1 target. Verified 2026-08-21: the bare `--apk` form gets through the
+aarch64 work and then dies on armv7 after ~8 minutes.
 
 **`plugins/build.py` is not part of this lane and must not be run for it.**
 There are no Android sidecars: `tauri.android.conf.json` clears
