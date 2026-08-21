@@ -86,7 +86,11 @@ doc.save(r"{}")
     let v = parse(&result);
     assert_eq!(v["status"], "success");
     let data = v["data"].as_array().unwrap();
-    let joined: String = data.iter().map(|x| x.as_str().unwrap()).collect::<Vec<_>>().join(" ");
+    let joined: String = data
+        .iter()
+        .map(|x| x.as_str().unwrap())
+        .collect::<Vec<_>>()
+        .join(" ");
     assert!(joined.contains("Title Paragraph"));
     assert!(joined.contains("Row1Col1"));
     assert!(joined.contains("Row3Col2"));
@@ -147,9 +151,11 @@ doc.save(r"{}")
     ));
 
     let server = KittyToolsServer::new();
-    let result = parse(&server.word_read_outline(Parameters(WordReadOutlineRequest {
-        path: path.to_string_lossy().to_string(),
-    })));
+    let result = parse(
+        &server.word_read_outline(Parameters(WordReadOutlineRequest {
+            path: path.to_string_lossy().to_string(),
+        })),
+    );
     assert_eq!(result["status"], "success");
     let outline = result["data"].as_array().unwrap();
     assert_eq!(outline.len(), 2);
@@ -164,12 +170,16 @@ fn word_read_text_not_found_error() {
     let server = KittyToolsServer::new();
     // Inside home (temp dir) so the home boundary passes through to the
     // not-found error path.
-    let result = parse(&server.word_read_text(Parameters(WordReadTextRequest {
-        path: tmp_path("does-not-exist.docx").to_string_lossy().to_string(),
-        query: None,
-        offset: None,
-        limit: None,
-    })));
+    let result = parse(
+        &server.word_read_text(Parameters(WordReadTextRequest {
+            path: tmp_path("does-not-exist.docx")
+                .to_string_lossy()
+                .to_string(),
+            query: None,
+            offset: None,
+            limit: None,
+        })),
+    );
     assert_eq!(result["status"], "error");
     assert_eq!(result["error_code"], "DOCX_NOT_FOUND");
 }
@@ -291,7 +301,10 @@ doc.save(r"{}")
         let after = after_hashes
             .get(name)
             .unwrap_or_else(|| panic!("part {name} disappeared after append"));
-        assert_eq!(after, before, "part {name} changed on append but shouldn't have");
+        assert_eq!(
+            after, before,
+            "part {name} changed on append but shouldn't have"
+        );
     }
 
     let check = run_python(&format!(
@@ -346,9 +359,11 @@ shutil.move(tmp2, r"{path}")
     ));
 
     let server = KittyToolsServer::new();
-    let outline_result = parse(&server.word_read_outline(Parameters(WordReadOutlineRequest {
-        path: path.to_string_lossy().to_string(),
-    })));
+    let outline_result = parse(
+        &server.word_read_outline(Parameters(WordReadOutlineRequest {
+            path: path.to_string_lossy().to_string(),
+        })),
+    );
     assert_eq!(outline_result["status"], "success");
     // The dangling-style paragraph is no longer detected as a heading (its
     // styleId doesn't resolve to anything containing "heading"), so the
@@ -371,13 +386,17 @@ shutil.move(tmp2, r"{path}")
 #[test]
 fn word_write_doc_append_to_missing_file_errors() {
     let server = KittyToolsServer::new();
-    let result = parse(&server.word_write_doc(Parameters(WordWriteDocRequest {
-        path: tmp_path("does-not-exist.docx").to_string_lossy().to_string(),
-        doc_text: Some("text".to_string()),
-        write_mode: Some(WordWriteModeParam::Append),
-        title: None,
-        language: None,
-    })));
+    let result = parse(
+        &server.word_write_doc(Parameters(WordWriteDocRequest {
+            path: tmp_path("does-not-exist.docx")
+                .to_string_lossy()
+                .to_string(),
+            doc_text: Some("text".to_string()),
+            write_mode: Some(WordWriteModeParam::Append),
+            title: None,
+            language: None,
+        })),
+    );
     assert_eq!(result["status"], "error");
     assert_eq!(result["error_code"], "DOCX_NOT_FOUND");
 }
@@ -397,4 +416,133 @@ fn zip_part_hashes(path: &Path) -> std::collections::HashMap<String, u64> {
         map.insert(name, hasher.finish());
     }
     map
+}
+
+/// The unit tests assert the XML this writer *emits*; this asserts the package
+/// it produces is one Word can actually open, with the link resolving through
+/// the relationships part to the right target. That round trip is the only
+/// thing that proves the `r:id` / rels / namespace / style pieces line up.
+#[test]
+fn word_write_doc_hyperlinks_resolve_through_the_relationships_part() {
+    let path = tmp_path("links.docx");
+    let server = KittyToolsServer::new();
+    let result = parse(&server.word_write_doc(Parameters(WordWriteDocRequest {
+        path: path.to_string_lossy().to_string(),
+        doc_text: Some(
+            "See [the docs](https://example.com/a?x=1&y=2) and [mail us](mailto:x@y.example).\n\n\
+             Not a link: [nope](javascript:alert(1))"
+                .to_string(),
+        ),
+        write_mode: Some(WordWriteModeParam::Create),
+        title: Some("Links".to_string()),
+        language: None,
+    })));
+    assert_eq!(result["status"], "success", "{result:?}");
+
+    let check = run_python(&format!(
+        r#"
+from docx import Document
+from docx.opc.constants import RELATIONSHIP_TYPE as RT
+
+doc = Document(r"{}")
+part = doc.part
+
+targets = sorted(
+    rel.target_ref for rel in part.rels.values() if rel.reltype == RT.HYPERLINK
+)
+assert targets == ["https://example.com/a?x=1&y=2", "mailto:x@y.example"], targets
+# External targets must be flagged as such or Word treats them as package parts.
+assert all(
+    rel.is_external for rel in part.rels.values() if rel.reltype == RT.HYPERLINK
+)
+
+# Every w:hyperlink in the body must point at a relationship that exists.
+ns = {{"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+      "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships"}}
+links = part.element.findall(".//w:hyperlink", ns)
+assert len(links) == 2, len(links)
+for link in links:
+    rid = link.get("{{%s}}id" % ns["r"])
+    assert rid in part.rels, (rid, list(part.rels))
+    assert part.rels[rid].reltype == RT.HYPERLINK
+
+# The label is the visible text, and it carries the Hyperlink character style.
+text = "".join(p.text for p in doc.paragraphs)
+assert "the docs" in text, text
+assert "mail us" in text, text
+styles = [
+    r.get("{{%s}}val" % ns["w"])
+    for link in links
+    for r in link.findall(".//w:rStyle", ns)
+]
+assert styles == ["Hyperlink", "Hyperlink"], styles
+assert "Hyperlink" in [s.style_id for s in doc.styles], "Hyperlink style not defined"
+
+# The refused target is present as readable text, but not as a link.
+assert "javascript:alert(1)" in text, text
+print("OK")
+"#,
+        path.display()
+    ));
+    assert_eq!(check, "OK");
+}
+
+/// Appending to a document written *before* this feature existed is the case
+/// that can corrupt a real user file: the root has no `xmlns:r`, the styles
+/// have no `Hyperlink`, and the relationship ids already in use must not be
+/// reissued. Word opening the result is the whole assertion.
+#[test]
+fn word_write_doc_appending_a_link_to_an_existing_document_stays_valid() {
+    let path = tmp_path("append_links.docx");
+    let server = KittyToolsServer::new();
+
+    // A document produced by python-docx, i.e. not by this writer at all —
+    // its relationship ids and root attributes are somebody else's.
+    run_python(&format!(
+        r#"
+from docx import Document
+d = Document()
+d.add_heading("Existing", level=1)
+d.add_paragraph("Body written by python-docx.")
+d.save(r"{}")
+print("OK")
+"#,
+        path.display()
+    ));
+
+    let result = parse(&server.word_write_doc(Parameters(WordWriteDocRequest {
+        path: path.to_string_lossy().to_string(),
+        doc_text: Some("Appended [link](https://example.org/z).".to_string()),
+        write_mode: Some(WordWriteModeParam::Append),
+        title: None,
+        language: None,
+    })));
+    assert_eq!(result["status"], "success", "{result:?}");
+
+    let check = run_python(&format!(
+        r#"
+from docx import Document
+from docx.opc.constants import RELATIONSHIP_TYPE as RT
+
+doc = Document(r"{}")
+part = doc.part
+text = "".join(p.text for p in doc.paragraphs)
+# Pre-existing content survived the rewrite.
+assert "Existing" in text, text
+assert "Body written by python-docx." in text, text
+assert "Appended" in text, text
+
+hyperlinks = [rel for rel in part.rels.values() if rel.reltype == RT.HYPERLINK]
+assert len(hyperlinks) == 1, hyperlinks
+assert hyperlinks[0].target_ref == "https://example.org/z", hyperlinks[0].target_ref
+
+# The new id must not have collided with anything python-docx already used.
+ids = [rid for rid in part.rels]
+assert len(ids) == len(set(ids)), ids
+assert "Hyperlink" in [s.style_id for s in doc.styles], "Hyperlink style not added"
+print("OK")
+"#,
+        path.display()
+    ));
+    assert_eq!(check, "OK");
 }

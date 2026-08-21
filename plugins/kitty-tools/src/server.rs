@@ -67,7 +67,10 @@ pub enum WordWriteModeParam {
 pub struct WordWriteDocRequest {
     /// Path to the .docx file to create or append to.
     pub path: String,
-    /// Markdown-lite body text (headings, lists, tables, **bold**/*italic*).
+    /// Markdown-lite body text: headings (`#`..`####`), bullet and numbered
+    /// lists, pipe tables, `**bold**`, `*italic*`, and `[label](url)`
+    /// hyperlinks (http/https/mailto only — any other scheme is written as
+    /// plain text with the URL still visible).
     pub doc_text: Option<String>,
     /// "create" (default) or "append".
     pub write_mode: Option<WordWriteModeParam>,
@@ -655,7 +658,7 @@ impl KittyToolsServer {
 
     #[tool(
         name = "lean_word_write_doc",
-        description = "Writes a new Word document or appends to an existing one, from markdown-lite text (headings, lists, tables, bold/italic), with WCAG accessibility structures."
+        description = "Writes a new Word document or appends to an existing one, from markdown-lite text (headings, lists, tables, bold/italic, and [label](url) hyperlinks), with WCAG accessibility structures."
     )]
     pub fn word_write_doc(&self, Parameters(req): Parameters<WordWriteDocRequest>) -> String {
         guarded(move || {

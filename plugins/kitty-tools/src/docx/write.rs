@@ -29,7 +29,7 @@ const STYLES_TEMPLATE: &str = include_str!("assets/styles.xml");
 const CORE_TEMPLATE: &str = include_str!("assets/core.xml");
 const APP_PROPS: &str = include_str!("assets/app.xml");
 
-const DOCUMENT_XML_NS: &str = r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006""#;
+const DOCUMENT_XML_NS: &str = r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006""#;
 
 pub enum WriteMode {
     Create,
@@ -68,12 +68,80 @@ fn xml_escape(s: &str) -> String {
 // line-by-line dispatch exactly, including its edge behaviors)
 // ---------------------------------------------------------------------------
 
-fn render_inline_runs(text: &str) -> String {
-    // Non-greedy, bold (**) checked before italic (*) — matches
-    // `re.split(r"(\*\*.*?\*\*|\*.*?\*)", text)`. A lone `*` with no partner
-    // falls through as a literal token, same as the Python version.
-    static PATTERN: &str = r"(\*\*.*?\*\*|\*.*?\*)";
-    let re = Regex::new(PATTERN).unwrap();
+/// Hyperlinks discovered while rendering a body, in the order they appear.
+///
+/// A `w:hyperlink` does not carry its URL: it carries an `r:id` pointing at a
+/// relationship in `word/_rels/document.xml.rels`, so the target lives in a
+/// different part of the package from the text that links to it. Rendering
+/// therefore has to *collect* as it goes and hand the caller the relationship
+/// entries to write alongside the document.
+///
+/// Ids start above whatever the package already uses — `create` seeds from the
+/// static relationships in `document_rels.xml`, `append` from the highest
+/// `rIdN` already in the file — because reusing an id would silently repoint
+/// an existing relationship (styles, numbering, an image) at a URL.
+#[derive(Debug, Default)]
+pub(crate) struct LinkCollector {
+    next_id: u32,
+    links: Vec<(String, String)>,
+}
+
+impl LinkCollector {
+    fn starting_at(next_id: u32) -> Self {
+        Self {
+            next_id,
+            links: Vec::new(),
+        }
+    }
+
+    fn add(&mut self, url: &str) -> String {
+        let id = format!("rId{}", self.next_id);
+        self.next_id += 1;
+        self.links.push((id.clone(), url.to_string()));
+        id
+    }
+
+    fn is_empty(&self) -> bool {
+        self.links.is_empty()
+    }
+
+    /// The `<Relationship>` elements to splice into `document.xml.rels`.
+    fn relationships_xml(&self) -> String {
+        self.links
+            .iter()
+            .map(|(id, url)| {
+                format!(
+                    r#"<Relationship Id="{id}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="{}" TargetMode="External"/>"#,
+                    xml_escape(url)
+                )
+            })
+            .collect()
+    }
+}
+
+/// Whether a markdown link target is safe to write into a document.
+///
+/// The text being rendered came from a model, and the `.docx` is something the
+/// user opens later in Word — so a `javascript:`/`vbscript:` URL, or a `file:`
+/// target pointing at a UNC path, is a link the document should simply not
+/// contain. Word's own prompts are not a reason to emit one. An unrecognised
+/// scheme falls back to plain text with the URL still visible, which is a
+/// strictly better failure than a live link to somewhere unexpected.
+fn is_safe_link_target(url: &str) -> bool {
+    let lower = url.trim().to_ascii_lowercase();
+    ["http://", "https://", "mailto:"]
+        .iter()
+        .any(|scheme| lower.starts_with(scheme))
+}
+
+fn render_inline_runs(text: &str, links: &mut LinkCollector) -> String {
+    // Markdown links first in the alternation, so `[a **b**](url)` is seen as a
+    // link rather than having its label chewed up by the emphasis patterns. The
+    // target stops at whitespace or `)`, which keeps `see [docs](https://x) for
+    // more` from swallowing the rest of the line.
+    static PATTERN: &str = r"(\[[^\]]*\]\([^)\s]*\)|\*\*.*?\*\*|\*.*?\*)";
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(PATTERN).unwrap());
 
     let mut out = String::new();
     let mut last = 0;
@@ -82,10 +150,12 @@ fn render_inline_runs(text: &str) -> String {
             out.push_str(&plain_run(&text[last..m.start()]));
         }
         let token = m.as_str();
-        if token.starts_with("**") && token.ends_with("**") && token.len() >= 4 {
-            out.push_str(&run(&token[2..token.len() - 2], true, false));
+        if let Some((label, url)) = parse_markdown_link(token) {
+            out.push_str(&link_or_plain(label, url, links));
+        } else if token.starts_with("**") && token.ends_with("**") && token.len() >= 4 {
+            out.push_str(&run(&token[2..token.len() - 2], true, false, None));
         } else if token.starts_with('*') && token.ends_with('*') && token.len() >= 2 {
-            out.push_str(&run(&token[1..token.len() - 1], false, true));
+            out.push_str(&run(&token[1..token.len() - 1], false, true, None));
         } else {
             out.push_str(&plain_run(token));
         }
@@ -97,17 +167,50 @@ fn render_inline_runs(text: &str) -> String {
     out
 }
 
-fn plain_run(text: &str) -> String {
-    run(text, false, false)
+/// `[label](url)` -> `(label, url)`. `None` for anything else the emphasis
+/// alternation matched.
+fn parse_markdown_link(token: &str) -> Option<(&str, &str)> {
+    let rest = token.strip_prefix('[')?;
+    let close = rest.find("](")?;
+    let label = &rest[..close];
+    let url = rest[close + 2..].strip_suffix(')')?;
+    Some((label, url))
 }
 
-fn run(text: &str, bold: bool, italic: bool) -> String {
+/// A real hyperlink when the target is one we are willing to write, otherwise
+/// the markdown rendered as ordinary text.
+fn link_or_plain(label: &str, url: &str, links: &mut LinkCollector) -> String {
+    if !is_safe_link_target(url) {
+        // Keep the URL visible rather than dropping it: the reader can still
+        // see where it was meant to point and judge it themselves.
+        return plain_run(&format!("{label} ({url})"));
+    }
+    let rel_id = links.add(url.trim());
+    // An empty label would render as an invisible, unclickable link; show the
+    // target instead, which is what a bare URL in prose looks like anyway.
+    let shown = if label.trim().is_empty() { url } else { label };
+    format!(
+        r#"<w:hyperlink r:id="{rel_id}">{}</w:hyperlink>"#,
+        run(shown, false, false, Some("Hyperlink"))
+    )
+}
+
+fn plain_run(text: &str) -> String {
+    run(text, false, false, None)
+}
+
+fn run(text: &str, bold: bool, italic: bool, style: Option<&str>) -> String {
     if text.is_empty() {
         return String::new();
     }
     let mut rpr = String::new();
-    if bold || italic {
+    if bold || italic || style.is_some() {
         rpr.push_str("<w:rPr>");
+        // `w:rStyle` comes first in `w:rPr`: the schema's sequence is ordered
+        // and Word rejects a document that gets it wrong.
+        if let Some(style) = style {
+            rpr.push_str(&format!(r#"<w:rStyle w:val="{style}"/>"#));
+        }
         if bold {
             rpr.push_str("<w:b/>");
         }
@@ -133,7 +236,7 @@ fn paragraph_xml(style_id: Option<&str>, extra_ppr: &str, runs_xml: &str) -> Str
     }
 }
 
-fn heading_xml(level: u32, text: &str) -> String {
+fn heading_xml(level: u32, text: &str, links: &mut LinkCollector) -> String {
     // level 0 = "Title" style (python-docx's `add_heading(title, level=0)`
     // convention, reproduced literally — the base plan notes `create` mode
     // always emits this first).
@@ -142,12 +245,17 @@ fn heading_xml(level: u32, text: &str) -> String {
     } else {
         format!("Heading{}", level.min(4))
     };
-    paragraph_xml(Some(&style), "", &render_inline_runs(text))
+    paragraph_xml(Some(&style), "", &render_inline_runs(text, links))
 }
 
-fn list_paragraph_xml(style_id: &str, num_id: u32, text: &str) -> String {
+fn list_paragraph_xml(
+    style_id: &str,
+    num_id: u32,
+    text: &str,
+    links: &mut LinkCollector,
+) -> String {
     let num_pr = format!(r#"<w:numPr><w:ilvl w:val="0"/><w:numId w:val="{num_id}"/></w:numPr>"#);
-    paragraph_xml(Some(style_id), &num_pr, &render_inline_runs(text))
+    paragraph_xml(Some(style_id), &num_pr, &render_inline_runs(text, links))
 }
 
 /// A markdown-lite table block: consumes lines only while they both start
@@ -156,7 +264,7 @@ fn list_paragraph_xml(style_id: &str, num_id: u32, text: &str) -> String {
 /// trailing cells empty. Row 0 gets `w:tblHeader`; **every** row (row 0
 /// included) gets `w:cantSplit` — both ported literally from
 /// `_make_table_accessible`, which is exactly what it did.
-fn table_xml(rows: &[Vec<String>]) -> String {
+fn table_xml(rows: &[Vec<String>], links: &mut LinkCollector) -> String {
     if rows.is_empty() {
         return String::new();
     }
@@ -182,7 +290,7 @@ fn table_xml(rows: &[Vec<String>]) -> String {
             let cell_text = row.get(c_idx).map(String::as_str).unwrap_or("");
             cells.push_str(&format!(
                 "<w:tc><w:tcPr><w:tcW w:w=\"2000\" w:type=\"dxa\"/></w:tcPr>{}</w:tc>",
-                paragraph_xml(None, "", &plain_run(cell_text))
+                paragraph_xml(None, "", &render_inline_runs(cell_text, links))
             ));
         }
         trs.push_str(&format!(
@@ -202,6 +310,81 @@ fn table_xml(rows: &[Vec<String>]) -> String {
     )
 }
 
+/// First relationship id `create` may hand out: `document_rels.xml` ships
+/// rId1 (styles) and rId2 (numbering).
+const FIRST_FREE_REL_ID: u32 = 3;
+
+/// The `Hyperlink` character style, as Word itself writes it — blue and
+/// underlined, which is what makes a link look like one.
+const HYPERLINK_STYLE: &str = r#"<w:style w:type="character" w:styleId="Hyperlink"><w:name w:val="Hyperlink"/><w:basedOn w:val="DefaultParagraphFont"/><w:rPr><w:color w:val="0563C1"/><w:u w:val="single"/></w:rPr></w:style>"#;
+
+/// Lowest `rIdN` not already taken by `rels_xml`.
+///
+/// Scans for the numeric suffix of every `Id="rIdN"` rather than counting
+/// elements: ids in a real document are not necessarily contiguous or ordered
+/// (Word leaves gaps when a relationship is deleted), so "one past the count"
+/// would happily collide.
+fn next_free_rel_id(rels_xml: &str) -> u32 {
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(r#"Id="rId(\d+)""#).unwrap());
+    let highest = re
+        .captures_iter(rels_xml)
+        .filter_map(|c| c.get(1)?.as_str().parse::<u32>().ok())
+        .max()
+        .unwrap_or(0);
+    highest.saturating_add(1).max(FIRST_FREE_REL_ID)
+}
+
+/// Splices `links`' relationship elements in before the closing tag.
+///
+/// A no-op when there are no links, so a document with none is written
+/// byte-identically to before this feature existed.
+fn insert_relationships(rels_xml: &str, links: &LinkCollector) -> String {
+    if links.is_empty() {
+        return rels_xml.to_string();
+    }
+    let additions = links.relationships_xml();
+    match rels_xml.rfind("</Relationships>") {
+        Some(idx) => format!("{}{additions}{}", &rels_xml[..idx], &rels_xml[idx..]),
+        // No closing tag means this isn't a relationships part we understand;
+        // returning it untouched loses the links but cannot corrupt the file.
+        None => rels_xml.to_string(),
+    }
+}
+
+/// Declares the relationships namespace on `<w:document>` if it isn't already.
+fn ensure_relationship_namespace(document_xml: &str) -> String {
+    if document_xml.contains("xmlns:r=") {
+        return document_xml.to_string();
+    }
+    match document_xml.find("<w:document") {
+        Some(start) => {
+            let insert_at = start + "<w:document".len();
+            format!(
+                r#"{} xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"{}"#,
+                &document_xml[..insert_at],
+                &document_xml[insert_at..]
+            )
+        }
+        None => document_xml.to_string(),
+    }
+}
+
+/// Adds the `Hyperlink` character style if the package doesn't define one.
+fn ensure_hyperlink_style(styles_xml: &str) -> String {
+    if styles_xml.contains(r#"w:styleId="Hyperlink""#) {
+        return styles_xml.to_string();
+    }
+    match styles_xml.rfind("</w:styles>") {
+        Some(idx) => format!(
+            "{}{HYPERLINK_STYLE}{}",
+            &styles_xml[..idx],
+            &styles_xml[idx..]
+        ),
+        None => styles_xml.to_string(),
+    }
+}
+
 fn is_table_separator(line: &str) -> bool {
     static SEP: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     let re = SEP.get_or_init(|| Regex::new(r"^\|[\s\-:\t|]+\|$").unwrap());
@@ -211,7 +394,7 @@ fn is_table_separator(line: &str) -> bool {
 /// Renders `doc_text` into a sequence of body-XML fragments, mirroring
 /// `word_write_doc`'s line dispatch loop exactly (table detection,
 /// heading levels longest-prefix-first, bullet/number lists, else Normal).
-fn render_body(doc_text: &str) -> String {
+fn render_body(doc_text: &str, links: &mut LinkCollector) -> String {
     let lines = crate::text::py_splitlines(doc_text.trim());
     let mut out = String::new();
     let mut i = 0;
@@ -247,28 +430,28 @@ fn render_body(doc_text: &str) -> String {
                 })
                 .collect();
             if !rows.is_empty() {
-                out.push_str(&table_xml(&rows));
+                out.push_str(&table_xml(&rows, links));
             }
             continue;
         }
 
         if let Some(rest) = line.strip_prefix("#### ") {
-            out.push_str(&heading_xml(4, rest));
+            out.push_str(&heading_xml(4, rest, links));
         } else if let Some(rest) = line.strip_prefix("### ") {
-            out.push_str(&heading_xml(3, rest));
+            out.push_str(&heading_xml(3, rest, links));
         } else if let Some(rest) = line.strip_prefix("## ") {
-            out.push_str(&heading_xml(2, rest));
+            out.push_str(&heading_xml(2, rest, links));
         } else if let Some(rest) = line.strip_prefix("# ") {
-            out.push_str(&heading_xml(1, rest));
+            out.push_str(&heading_xml(1, rest, links));
         } else if let Some(rest) = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")) {
-            out.push_str(&list_paragraph_xml("ListBullet", 1, rest));
+            out.push_str(&list_paragraph_xml("ListBullet", 1, rest, links));
         } else if let Some(rest) = strip_ordered_list_prefix(line) {
-            out.push_str(&list_paragraph_xml("ListNumber", 2, rest));
+            out.push_str(&list_paragraph_xml("ListNumber", 2, rest, links));
         } else {
             out.push_str(&paragraph_xml(
                 Some("Normal"),
                 "",
-                &render_inline_runs(line),
+                &render_inline_runs(line, links),
             ));
         }
         i += 1;
@@ -298,10 +481,13 @@ fn create(
             .unwrap_or_default()
     });
 
-    let mut body = heading_xml(0, &doc_title);
+    // Seeded past the two static relationships in `document_rels.xml`
+    // (styles = rId1, numbering = rId2) so a link can never collide with one.
+    let mut links = LinkCollector::starting_at(FIRST_FREE_REL_ID);
+    let mut body = heading_xml(0, &doc_title, &mut links);
     if let Some(text) = doc_text {
         if !text.trim().is_empty() {
-            body.push_str(&render_body(text));
+            body.push_str(&render_body(text, &mut links));
         }
     }
 
@@ -339,7 +525,7 @@ fn create(
     write_zip_str(
         &mut zip,
         "word/_rels/document.xml.rels",
-        DOCUMENT_RELS,
+        &insert_relationships(DOCUMENT_RELS, &links),
         opts,
     )?;
     write_zip_str(&mut zip, "word/document.xml", &document_xml, opts)?;
@@ -443,15 +629,40 @@ fn append(
         .ok_or_else(|| DocxError::Corrupt("missing word/document.xml".to_string()))?;
     let document_xml = String::from_utf8_lossy(document_xml).to_string();
 
+    // Relationship ids have to clear everything the existing package already
+    // uses — including parts this writer never emits (images, headers, an
+    // embedded font). Reusing one would repoint that relationship at a URL.
+    let rels_xml = parts
+        .get("word/_rels/document.xml.rels")
+        .map(|b| String::from_utf8_lossy(b).to_string())
+        .unwrap_or_else(|| DOCUMENT_RELS.to_string());
+    let mut links = LinkCollector::starting_at(next_free_rel_id(&rels_xml));
+
     let mut new_body = String::new();
     if let Some(text) = doc_text {
         if !text.trim().is_empty() {
-            new_body = render_body(text);
+            new_body = render_body(text, &mut links);
         }
     }
 
     let spliced = splice_before_sect_pr(&document_xml, &new_body);
+    // A document written by an older build of this writer has no `xmlns:r` on
+    // its root, and `r:id` against an undeclared prefix is not well-formed XML
+    // — Word refuses to open the file at all. Only touched when links were
+    // actually emitted, so an append with no links leaves the root byte-identical.
+    let spliced = if links.is_empty() {
+        spliced
+    } else {
+        ensure_relationship_namespace(&spliced)
+    };
     parts.insert("word/document.xml".to_string(), spliced.into_bytes());
+
+    if !links.is_empty() {
+        parts.insert(
+            "word/_rels/document.xml.rels".to_string(),
+            insert_relationships(&rels_xml, &links).into_bytes(),
+        );
+    }
 
     // `_set_doc_accessibility_meta` runs on append too — the language
     // append hits styles.xml regardless of `title`; the title change to
@@ -460,6 +671,13 @@ fn append(
     if let Some(styles_bytes) = parts.get("word/styles.xml").cloned() {
         let styles_str = String::from_utf8_lossy(&styles_bytes).to_string();
         let patched = append_lang_to_styles_root(&styles_str, language);
+        // A `w:rStyle` naming a style the package doesn't define is legal but
+        // renders as body text — the link would work and look like nothing.
+        let patched = if links.is_empty() {
+            patched
+        } else {
+            ensure_hyperlink_style(&patched)
+        };
         parts.insert("word/styles.xml".to_string(), patched.into_bytes());
     }
     if let Some(t) = title {
@@ -539,7 +757,7 @@ mod tests {
 
     #[test]
     fn render_inline_runs_handles_bold_then_italic_non_greedy() {
-        let xml = render_inline_runs("**bold** and *italic* text");
+        let xml = render_inline_runs("**bold** and *italic* text", &mut LinkCollector::default());
         assert!(xml.contains("<w:b/>"));
         assert!(xml.contains("<w:i/>"));
         assert!(xml.contains(">bold<"));
@@ -548,14 +766,17 @@ mod tests {
 
     #[test]
     fn lone_asterisk_is_literal() {
-        let xml = render_inline_runs("a * b");
+        let xml = render_inline_runs("a * b", &mut LinkCollector::default());
         assert!(!xml.contains("<w:b/>"));
         assert!(!xml.contains("<w:i/>"));
     }
 
     #[test]
     fn heading_dispatch_prefers_longest_prefix_first() {
-        let body = render_body("#### four\n### three\n## two\n# one");
+        let body = render_body(
+            "#### four\n### three\n## two\n# one",
+            &mut LinkCollector::default(),
+        );
         // Ensure each maps to its own distinct heading style, not misfired
         // by a shorter prefix matching first (e.g. "#" matching "####").
         assert!(body.contains(r#"w:val="Heading4""#));
@@ -570,7 +791,7 @@ mod tests {
             vec!["a".to_string(), "b".to_string()],
             vec!["c".to_string()],
         ];
-        let xml = table_xml(&rows);
+        let xml = table_xml(&rows, &mut LinkCollector::default());
         // 2 columns (max row len), second row's second cell empty.
         assert_eq!(xml.matches("<w:gridCol").count(), 2);
     }
@@ -578,14 +799,17 @@ mod tests {
     #[test]
     fn table_header_and_cant_split_on_every_row() {
         let rows = vec![vec!["h".to_string()], vec!["v".to_string()]];
-        let xml = table_xml(&rows);
+        let xml = table_xml(&rows, &mut LinkCollector::default());
         assert_eq!(xml.matches("<w:tblHeader/>").count(), 1);
         assert_eq!(xml.matches("<w:cantSplit/>").count(), 2);
     }
 
     #[test]
     fn table_separator_row_is_not_rendered_as_data() {
-        let body = render_body("| a | b |\n|---|---|\n| 1 | 2 |");
+        let body = render_body(
+            "| a | b |\n|---|---|\n| 1 | 2 |",
+            &mut LinkCollector::default(),
+        );
         assert!(body.contains(">a<"));
         assert!(body.contains(">1<"));
         assert!(!body.contains("---"));
@@ -596,7 +820,7 @@ mod tests {
         // Audit #114: a lone "|" passed the table gate and panicked slicing
         // `[1..0]`. It now renders as one empty cell, mirroring Python's
         // forgiving `line[1:-1]`.
-        let body = render_body("|");
+        let body = render_body("|", &mut LinkCollector::default());
         assert!(
             body.contains("<w:tbl>"),
             "a pipe-gated line still renders as a table: {body}"
@@ -649,5 +873,197 @@ mod tests {
             "{core}"
         );
         assert!(core.contains("<dc:language>en-US</dc:language>"), "{core}");
+    }
+
+    #[test]
+    fn a_markdown_link_becomes_a_hyperlink_and_a_relationship() {
+        let mut links = LinkCollector::starting_at(FIRST_FREE_REL_ID);
+        let xml = render_inline_runs("see [the docs](https://example.com/x) now", &mut links);
+
+        assert!(xml.contains(r#"<w:hyperlink r:id="rId3">"#), "{xml}");
+        assert!(xml.contains(r#"<w:rStyle w:val="Hyperlink"/>"#), "{xml}");
+        assert!(xml.contains("the docs"), "{xml}");
+        // Text either side survives untouched.
+        assert!(xml.contains("see "), "{xml}");
+        assert!(xml.contains(" now"), "{xml}");
+
+        let rels = links.relationships_xml();
+        assert!(rels.contains(r#"Id="rId3""#), "{rels}");
+        assert!(rels.contains(r#"Target="https://example.com/x""#), "{rels}");
+        assert!(rels.contains(r#"TargetMode="External""#), "{rels}");
+    }
+
+    /// The document is opened later in Word, so a `javascript:` target is one
+    /// this writer simply does not emit. The URL stays readable as text.
+    #[test]
+    fn an_unsafe_link_target_is_written_as_text_not_a_link() {
+        for url in [
+            "javascript:alert(1)",
+            "vbscript:msgbox",
+            "file://server/share/x",
+            "data:text/html,<script>",
+        ] {
+            let mut links = LinkCollector::starting_at(FIRST_FREE_REL_ID);
+            let xml = render_inline_runs(&format!("[click]({url})"), &mut links);
+            assert!(
+                !xml.contains("<w:hyperlink"),
+                "{url} produced a link: {xml}"
+            );
+            assert!(links.is_empty(), "{url} allocated a relationship");
+            assert!(xml.contains("click"), "the label must survive: {xml}");
+        }
+    }
+
+    #[test]
+    fn several_links_get_distinct_ids_in_document_order() {
+        let mut links = LinkCollector::starting_at(FIRST_FREE_REL_ID);
+        let xml = render_body(
+            "[one](https://a.example) and [two](https://b.example)\n\n- [three](mailto:x@y.example)",
+            &mut links,
+        );
+        for id in ["rId3", "rId4", "rId5"] {
+            assert!(
+                xml.contains(&format!(r#"r:id="{id}""#)),
+                "missing {id}: {xml}"
+            );
+        }
+        let rels = links.relationships_xml();
+        assert!(rels.contains("https://a.example"));
+        assert!(rels.contains("https://b.example"));
+        assert!(rels.contains("mailto:x@y.example"));
+    }
+
+    /// Emphasis inside a label must not be mistaken for the label's end, and a
+    /// link must not swallow the rest of the sentence.
+    #[test]
+    fn links_and_emphasis_do_not_interfere() {
+        let mut links = LinkCollector::starting_at(FIRST_FREE_REL_ID);
+        let xml = render_inline_runs(
+            "**bold** then [a b](https://x.example) then *it*",
+            &mut links,
+        );
+        assert!(xml.contains("<w:b/>"), "{xml}");
+        assert!(xml.contains("<w:i/>"), "{xml}");
+        assert_eq!(xml.matches("<w:hyperlink").count(), 1, "{xml}");
+        assert!(xml.contains(" then "), "{xml}");
+    }
+
+    /// A URL with `&` in it has to be escaped in both the run text and the
+    /// relationship target, or the package is not well-formed XML.
+    #[test]
+    fn an_ampersand_in_a_target_is_escaped_in_the_relationship() {
+        let mut links = LinkCollector::starting_at(FIRST_FREE_REL_ID);
+        let _ = render_inline_runs("[q](https://x.example/s?a=1&b=2)", &mut links);
+        let rels = links.relationships_xml();
+        assert!(rels.contains("a=1&amp;b=2"), "{rels}");
+        assert!(!rels.contains("a=1&b=2"), "raw ampersand in XML: {rels}");
+    }
+
+    /// A relationship id must clear every id already in the package, including
+    /// ones this writer never emits (images, headers) and non-contiguous ones
+    /// Word leaves behind when a relationship is deleted.
+    #[test]
+    fn new_relationship_ids_clear_every_existing_one() {
+        let rels = concat!(
+            r#"<Relationships><Relationship Id="rId1" Target="styles.xml"/>"#,
+            r#"<Relationship Id="rId9" Target="media/image1.png"/>"#,
+            r#"<Relationship Id="rId4" Target="header1.xml"/></Relationships>"#
+        );
+        assert_eq!(next_free_rel_id(rels), 10);
+        // An empty or unrecognisable rels part still starts above the two
+        // static relationships `create` writes.
+        assert_eq!(next_free_rel_id("<Relationships/>"), FIRST_FREE_REL_ID);
+        assert_eq!(next_free_rel_id(DOCUMENT_RELS), FIRST_FREE_REL_ID);
+    }
+
+    #[test]
+    fn relationships_are_spliced_before_the_closing_tag() {
+        let mut links = LinkCollector::starting_at(3);
+        links.add("https://x.example");
+        let out = insert_relationships(DOCUMENT_RELS, &links);
+        assert!(out.contains(r#"Id="rId3""#));
+        assert!(out.trim_end().ends_with("</Relationships>"));
+        // Existing entries survive.
+        assert!(out.contains(r#"Id="rId1""#));
+        assert!(out.contains(r#"Id="rId2""#));
+    }
+
+    /// With no links, every part must come out byte-identical to before this
+    /// feature existed — an append that adds a plain paragraph must not
+    /// rewrite the package's relationships, root element or styles.
+    #[test]
+    fn a_document_with_no_links_is_left_untouched() {
+        let empty = LinkCollector::default();
+        assert_eq!(insert_relationships(DOCUMENT_RELS, &empty), DOCUMENT_RELS);
+    }
+
+    /// A file written by an older build has no `xmlns:r`, and an `r:id`
+    /// against an undeclared prefix is not well-formed XML — Word refuses to
+    /// open it at all.
+    #[test]
+    fn appending_a_link_declares_the_namespace_if_it_is_missing() {
+        let old = r#"<?xml version="1.0"?><w:document xmlns:w="http://x"><w:body/></w:document>"#;
+        let patched = ensure_relationship_namespace(old);
+        assert!(patched.contains("xmlns:r="), "{patched}");
+        assert!(
+            patched.contains("<w:body/>"),
+            "the body must survive: {patched}"
+        );
+
+        // Already declared: left exactly as it was.
+        let current = format!(r#"<w:document {DOCUMENT_XML_NS}><w:body/></w:document>"#);
+        assert_eq!(ensure_relationship_namespace(&current), current);
+    }
+
+    /// A `w:rStyle` naming a style the package doesn't define is legal but
+    /// renders as body text — the link would work and look like nothing.
+    #[test]
+    fn appending_a_link_adds_the_hyperlink_style_if_it_is_missing() {
+        let bare = r#"<w:styles><w:style w:styleId="Normal"/></w:styles>"#;
+        let patched = ensure_hyperlink_style(bare);
+        assert!(patched.contains(r#"w:styleId="Hyperlink""#), "{patched}");
+        assert!(patched.contains(r#"w:styleId="Normal""#), "{patched}");
+        // The shipped template already has it; adding a second would be invalid.
+        assert_eq!(
+            ensure_hyperlink_style(STYLES_TEMPLATE)
+                .matches(r#"w:styleId="Hyperlink""#)
+                .count(),
+            1
+        );
+    }
+
+    /// The create-mode template must define the style the writer references,
+    /// or every link in a new document renders as plain body text.
+    #[test]
+    fn the_shipped_styles_define_the_hyperlink_style() {
+        assert!(STYLES_TEMPLATE.contains(r#"w:styleId="Hyperlink""#));
+    }
+
+    /// A link inside a table cell is exactly where a model puts a source, and
+    /// cells used to render without any inline handling at all.
+    #[test]
+    fn a_link_inside_a_table_cell_is_rendered() {
+        let mut links = LinkCollector::starting_at(FIRST_FREE_REL_ID);
+        let body = render_body(
+            "| name | source |\n|---|---|\n| a | [ref](https://x.example) |",
+            &mut links,
+        );
+        assert!(body.contains("<w:hyperlink"), "{body}");
+        assert_eq!(
+            links
+                .relationships_xml()
+                .matches("Relationship Id=")
+                .count(),
+            1
+        );
+    }
+
+    /// A label-less link would be invisible and unclickable; show the target.
+    #[test]
+    fn an_empty_label_falls_back_to_showing_the_url() {
+        let mut links = LinkCollector::starting_at(FIRST_FREE_REL_ID);
+        let xml = render_inline_runs("[](https://x.example/page)", &mut links);
+        assert!(xml.contains("<w:hyperlink"), "{xml}");
+        assert!(xml.contains("https://x.example/page"), "{xml}");
     }
 }
