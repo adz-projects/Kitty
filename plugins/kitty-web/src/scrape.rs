@@ -447,6 +447,36 @@ fn extract_metadata(document: &scraper::Html) -> PageMeta {
     }
 }
 
+/// The name a downloaded PDF is actually cached under.
+///
+/// `pdf_filename_for` alone is not enough: it derives the name from the URL's
+/// *last path segment*, so `https://a.com/docs/report.pdf` and
+/// `https://b.com/2024/report.pdf` both became `report.pdf` and silently
+/// overwrote each other in a cache directory shared across every scrape (and
+/// with `kitty-tools`' `lean_cache_view`). A model that scraped two papers and
+/// then read them back got the same one twice, with nothing to indicate it.
+///
+/// Prefixing a digest of the full URL makes the name unique per source while
+/// keeping the readable tail, so the directory is still browsable by a human.
+/// It also makes a Windows reserved device stem unreachable by construction —
+/// `CON.pdf` becomes `<digest>-CON_.pdf` — though `pdf_filename_for` keeps its
+/// own guard for that (audit #125), since it is the function whose output a
+/// human reads.
+fn pdf_cache_filename_for(stripped_url: &str) -> String {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    stripped_url.hash(&mut hasher);
+    // Not a security boundary — this only has to separate distinct URLs from
+    // one another inside one cache directory. Stability across Rust releases
+    // is not required either: the absolute `cached_path` is handed back to the
+    // caller directly, so nothing looks a cache entry up by name later.
+    format!(
+        "{:016x}-{}",
+        hasher.finish(),
+        pdf_filename_for(stripped_url)
+    )
+}
+
 /// Filename sanitization for a downloaded PDF, matching Python's
 /// `re.sub(r"[^\w.\-]", "_", ...)`.
 fn pdf_filename_for(stripped_url: &str) -> String {
@@ -699,7 +729,7 @@ pub async fn web_scrape(
                 Some("Check filesystem permissions for the user cache directory."),
             );
         }
-        let pdf_path = dir.join(pdf_filename_for(stripped_url));
+        let pdf_path = dir.join(pdf_cache_filename_for(stripped_url));
         if let Err(e) = std::fs::write(&pdf_path, &bytes) {
             return error_response(
                 "SCRAPE_NETWORK_ERROR",
@@ -1181,6 +1211,35 @@ mod tests {
         );
         assert_eq!(pdf_filename_for("https://e.com/paper"), "paper.pdf");
         assert_eq!(pdf_filename_for("https://e.com/"), "downloaded.pdf");
+    }
+
+    /// Two different sources whose URLs end in the same path segment must not
+    /// share a cache file. They used to, silently: the second scrape
+    /// overwrote the first, and a model reading both back got the same
+    /// document twice.
+    #[test]
+    fn pdf_cache_names_do_not_collide_across_sources() {
+        let a = pdf_cache_filename_for("https://a.com/docs/report.pdf");
+        let b = pdf_cache_filename_for("https://b.com/2024/report.pdf");
+        let c = pdf_cache_filename_for("https://a.com/other/report.pdf");
+        assert_ne!(a, b, "different hosts must not share a cache file");
+        assert_ne!(
+            a, c,
+            "different paths on one host must not share one either"
+        );
+
+        // Still recognisable, and still ends in .pdf so the extension-based
+        // handling downstream is unchanged.
+        for name in [&a, &b, &c] {
+            assert!(
+                name.ends_with("report.pdf"),
+                "{name} should keep its readable tail"
+            );
+        }
+
+        // Same URL twice is the same file — this is a cache, not a
+        // scatter-gun.
+        assert_eq!(a, pdf_cache_filename_for("https://a.com/docs/report.pdf"));
     }
 
     #[test]

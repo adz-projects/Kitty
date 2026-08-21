@@ -151,6 +151,36 @@ fn validate_workspace(workspace: Option<&String>) -> Result<Option<std::path::Pa
     Ok(Some(dir))
 }
 
+/// Validates `wasm_run_module`'s `module_path` before the file is read and
+/// compiled.
+///
+/// It is model-supplied, and it was previously checked only for existence —
+/// so while `workspace` two functions up was confined to the user's home
+/// directory (audit #111), the module itself could be any file on the host.
+/// That is not a sandbox escape (the compiled module still gets no capability
+/// beyond the home-checked `/work` mount), but it is a read-and-compile
+/// primitive over the whole filesystem, and an inconsistency with the
+/// argument sitting right next to it. Same boundary, same reason.
+fn validate_module_path(module_path: &str) -> Result<std::path::PathBuf, String> {
+    let path = std::path::PathBuf::from(module_path);
+    if !path.is_file() {
+        return Err(error_json(
+            "ModuleNotFound",
+            &format!("no wasm module at {}", path.display()),
+        ));
+    }
+    if !crate::paths::path_within_home(&path) {
+        return Err(error_json(
+            "ModuleOutsideHome",
+            &format!(
+                "the module must be inside your home directory: {}",
+                path.display()
+            ),
+        ));
+    }
+    Ok(path)
+}
+
 /// Shared by both Python tool names.
 async fn execute_python(req: ExecutePythonRequest) -> String {
     // Cheap input validation before the (potentially downloading) guest
@@ -224,13 +254,18 @@ impl KittyWasmServer {
         // and `sandbox::run_module`'s doc comment for why this is required.
         tokio::task::spawn_blocking(move || {
             guarded(move || {
-                let module_path = std::path::PathBuf::from(&req.module_path);
-                if !module_path.is_file() {
-                    return error_json(
-                        "ModuleNotFound",
-                        &format!("no wasm module at {}", module_path.display()),
-                    );
-                }
+                // Validate both paths before doing any work. `workspace` used
+                // to be checked *after* the module was compiled, so a bad
+                // argument still paid a full compile first — `execute_python`
+                // above deliberately validates first for exactly this reason.
+                let module_path = match validate_module_path(&req.module_path) {
+                    Ok(p) => p,
+                    Err(e) => return e,
+                };
+                let workspace = match validate_workspace(req.workspace.as_ref()) {
+                    Ok(w) => w,
+                    Err(e) => return e,
+                };
 
                 let module =
                     match sandbox::load_module_cached(&module_path, &guest::module_cache_dir()) {
@@ -239,10 +274,6 @@ impl KittyWasmServer {
                     };
 
                 let mut mounts = Vec::new();
-                let workspace = match validate_workspace(req.workspace.as_ref()) {
-                    Ok(w) => w,
-                    Err(e) => return e,
-                };
                 if let Some(dir) = workspace {
                     mounts.push(Mount::writable(dir, "/work"));
                 }
@@ -370,16 +401,113 @@ mod tests {
         assert_eq!(v["error"]["error_type"], "ModuleNotFound");
     }
 
+    /// A scratch directory **inside home**, which both `module_path` and
+    /// `workspace` now require. `tempfile::tempdir()` is not inside home on
+    /// every platform (`/tmp` on Linux), so these tests can't use it for
+    /// anything the containment check will see.
+    struct HomeScratch(std::path::PathBuf);
+
+    impl HomeScratch {
+        fn new(tag: &str) -> Self {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static N: AtomicU32 = AtomicU32::new(0);
+            let dir = crate::paths::home_dir()
+                .expect("the test host has a home directory")
+                .join(format!(
+                    "kitty-wasm-test-{tag}-{}-{}",
+                    std::process::id(),
+                    N.fetch_add(1, Ordering::Relaxed)
+                ));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+
+        /// Writes a minimal valid WASI command module and returns its path.
+        fn wat(&self, name: &str) -> String {
+            let p = self.0.join(name);
+            std::fs::write(&p, "(module (func (export \"_start\")))").unwrap();
+            p.to_string_lossy().into_owned()
+        }
+    }
+
+    impl Drop for HomeScratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Audit follow-up: `workspace` was contained to home but the module
+    /// itself was not, so the tool would read and compile any file on the
+    /// host. Not a sandbox escape — the compiled module still gets no
+    /// capability beyond `/work` — but the same boundary should apply to
+    /// both arguments.
     #[tokio::test]
-    async fn run_module_rejects_a_workspace_that_is_not_a_directory() {
-        let dir = tempfile::tempdir().unwrap();
-        let wat = dir.path().join("m.wat");
-        std::fs::write(&wat, "(module (func (export \"_start\")))").unwrap();
+    async fn run_module_rejects_a_module_outside_home() {
+        #[cfg(windows)]
+        let outside = r"C:\Windows\System32\drivers\etc\hosts".to_string();
+        #[cfg(not(windows))]
+        let outside = "/etc/hosts".to_string();
+
+        // Only meaningful where that file actually exists; otherwise the
+        // not-found arm fires first and proves nothing.
+        if !std::path::Path::new(&outside).is_file() {
+            return;
+        }
 
         let server = KittyWasmServer::new();
         let out = server
             .wasm_run_module(Parameters(RunModuleRequest {
-                module_path: wat.to_string_lossy().into_owned(),
+                module_path: outside,
+                args: None,
+                workspace: None,
+                timeout_s: None,
+                fuel: None,
+            }))
+            .await;
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["error"]["error_type"], "ModuleOutsideHome");
+    }
+
+    /// A rejected argument must not have cost a module compile first — the
+    /// Python path validates before resolving its guest for the same reason.
+    #[tokio::test]
+    async fn run_module_rejects_a_bad_workspace_before_compiling_the_module() {
+        let scratch = HomeScratch::new("order");
+        let server = KittyWasmServer::new();
+        let out = server
+            .wasm_run_module(Parameters(RunModuleRequest {
+                // Deliberately not a valid module: if this still reports the
+                // *workspace* problem, validation ran first.
+                module_path: {
+                    let p = scratch.path().join("not-really.wasm");
+                    std::fs::write(&p, b"definitely not wasm").unwrap();
+                    p.to_string_lossy().into_owned()
+                },
+                args: None,
+                workspace: Some("/definitely/not/a/dir".into()),
+                timeout_s: None,
+                fuel: None,
+            }))
+            .await;
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            v["error"]["error_type"], "WorkspaceNotFound",
+            "argument validation must precede the compile, got: {v}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_module_rejects_a_workspace_that_is_not_a_directory() {
+        let scratch = HomeScratch::new("nodir");
+
+        let server = KittyWasmServer::new();
+        let out = server
+            .wasm_run_module(Parameters(RunModuleRequest {
+                module_path: scratch.wat("m.wat"),
                 args: None,
                 workspace: Some("/definitely/not/a/dir".into()),
                 timeout_s: None,
@@ -394,9 +522,7 @@ mod tests {
     async fn run_module_rejects_a_workspace_outside_home() {
         // Audit #111: any existing host dir used to be mounted read-write
         // into the guest; workspaces are now contained to the user's home.
-        let dir = tempfile::tempdir().unwrap();
-        let wat = dir.path().join("m.wat");
-        std::fs::write(&wat, "(module (func (export \"_start\")))").unwrap();
+        let scratch = HomeScratch::new("wsout");
 
         #[cfg(windows)]
         let outside = "C:\\Windows\\System32".to_string();
@@ -406,7 +532,7 @@ mod tests {
         let server = KittyWasmServer::new();
         let out = server
             .wasm_run_module(Parameters(RunModuleRequest {
-                module_path: wat.to_string_lossy().into_owned(),
+                module_path: scratch.wat("m.wat"),
                 args: None,
                 workspace: Some(outside),
                 timeout_s: None,

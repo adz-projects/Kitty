@@ -739,21 +739,38 @@ fn new_search_id() -> String {
     format!("{millis:x}-{salt:04x}")
 }
 
-fn write_offload(search_id: &str, query: &str, results: &[SearchItem]) {
-    let dir = search_store_dir();
-    if std::fs::create_dir_all(&dir).is_err() {
-        return;
-    }
+/// Persists the full result set so `lean_web_search_read_chunk` can serve
+/// `snippet_full` later.
+///
+/// Reports its failures. It used to swallow them — a failed `create_dir_all`
+/// returned early and the write was `let _ =` — while the caller went on
+/// handing the model a `search_id` regardless. The model then called
+/// `read_chunk` with that id and got `SEARCH_ID_NOT_FOUND`, with nothing
+/// anywhere to explain why. On Android, where the store directory was
+/// unwritable for every search, that was the failure mode *every single time*.
+fn write_offload(search_id: &str, query: &str, results: &[SearchItem]) -> Result<(), String> {
+    write_offload_to(&search_store_dir(), search_id, query, results)
+}
+
+/// Split from `write_offload` purely for testability: the failure path needs
+/// a directory that genuinely cannot be created, which is not something to
+/// arrange by mutating the process's idea of its own home.
+fn write_offload_to(
+    dir: &std::path::Path,
+    search_id: &str,
+    query: &str,
+    results: &[SearchItem],
+) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("could not create {}: {e}", dir.display()))?;
     prune_old_offloads();
     let payload = json!({
         "search_id": search_id,
         "query": query,
         "results": results.iter().map(|r| r.to_stored_json()).collect::<Vec<_>>(),
     });
-    let _ = std::fs::write(
-        offload_path(search_id),
-        serde_json::to_string(&payload).unwrap_or_default(),
-    );
+    let path = dir.join(format!("search-{search_id}.json"));
+    std::fs::write(&path, serde_json::to_string(&payload).unwrap_or_default())
+        .map_err(|e| format!("could not write {}: {e}", path.display()))
 }
 
 // ---------------------------------------------------------------------------
@@ -1068,15 +1085,37 @@ pub async fn web_search(
         item.id = idx + 1;
     }
     let search_id = new_search_id();
-    write_offload(&search_id, &guarded_q, &results);
+    let offload = write_offload(&search_id, &guarded_q, &results);
 
-    let base_metadata = json!({
-        "mode": mode,
-        "engines": diagnostics,
-        "search_id": search_id,
-        "query": guarded_q,
-        "count": count,
-    });
+    // The results are good either way — only the *follow-up* is lost. So keep
+    // returning them, but don't advertise a `search_id` that `read_chunk`
+    // would only reject: an id the model cannot use is worse than no id,
+    // because it invites a second failing call and explains nothing.
+    let mut base_metadata = serde_json::Map::new();
+    base_metadata.insert("mode".into(), json!(mode));
+    base_metadata.insert("engines".into(), json!(diagnostics));
+    base_metadata.insert("query".into(), json!(guarded_q));
+    base_metadata.insert("count".into(), json!(count));
+    match &offload {
+        Ok(()) => {
+            base_metadata.insert("search_id".into(), json!(search_id));
+        }
+        Err(reason) => {
+            // stderr, not stdout: stdout is the JSON-RPC transport. The host
+            // inherits stderr (desktop) or captures it (in-process), so this
+            // reaches the daemon log either way.
+            eprintln!("[kitty-web] search offload unavailable: {reason}");
+            base_metadata.insert("read_chunk_available".into(), json!(false));
+            base_metadata.insert(
+                "read_chunk_unavailable_reason".into(),
+                json!(format!(
+                    "full snippets could not be stored, so lean_web_search_read_chunk \
+                     is unavailable for this search: {reason}"
+                )),
+            );
+        }
+    }
+    let base_metadata = Value::Object(base_metadata);
 
     let shown: Vec<SearchItem> = results.iter().take(count).cloned().collect();
 
@@ -1509,6 +1548,33 @@ mod tests {
         }
     }
 
+    /// The offload write used to swallow every failure while the caller
+    /// handed the model a `search_id` anyway — so `read_chunk` answered
+    /// `SEARCH_ID_NOT_FOUND` with nothing anywhere to explain why. On Android,
+    /// where the store directory was unwritable for every search, that was the
+    /// outcome of *every* search. It must report instead.
+    #[test]
+    fn an_unwritable_offload_store_is_reported_not_swallowed() {
+        // A plain file where the store directory should be: `create_dir_all`
+        // cannot succeed against it on any platform, which is the portable way
+        // to stand in for Android's unwritable location.
+        let blocker = std::env::temp_dir().join(format!(
+            "kitty-web-offload-blocker-{}-{}",
+            std::process::id(),
+            new_search_id()
+        ));
+        std::fs::write(&blocker, b"not a directory").unwrap();
+
+        let err = write_offload_to(&blocker, "id", "q", &[])
+            .expect_err("a file standing in for the store directory must fail the write");
+        assert!(
+            err.contains(&blocker.display().to_string()),
+            "the reason must name the path that could not be used, got: {err}"
+        );
+
+        let _ = std::fs::remove_file(&blocker);
+    }
+
     #[test]
     fn read_chunk_reports_missing_search_id_cleanly() {
         let out = web_search_read_chunk("deadbeef-0000", &[1]);
@@ -1555,7 +1621,8 @@ mod tests {
                 engine: "duckduckgo".into(),
             },
         ];
-        write_offload(&search_id, "q", &results);
+        write_offload(&search_id, "q", &results)
+            .expect("offload write should succeed in a test home");
 
         let out = web_search_read_chunk(&search_id, &[1, 2]);
         let v: Value = serde_json::from_str(&out).unwrap();
@@ -1595,7 +1662,8 @@ mod tests {
                 engine: "brave".into(),
             })
             .collect();
-        write_offload(&search_id, "q", &results);
+        write_offload(&search_id, "q", &results)
+            .expect("offload write should succeed in a test home");
 
         let out = web_search_read_chunk(&search_id, &[1, 2, 3, 4, 5, 6, 7, 8]);
         let v: Value = serde_json::from_str(&out).unwrap();

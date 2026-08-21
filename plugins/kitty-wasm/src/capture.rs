@@ -113,7 +113,10 @@ impl CaptureStream {
 
     /// Total bytes the guest wrote, including any dropped middle.
     pub fn total_bytes(&self) -> usize {
-        self.inner.lock().expect("capture mutex poisoned").total_bytes
+        self.inner
+            .lock()
+            .expect("capture mutex poisoned")
+            .total_bytes
     }
 
     pub fn truncated(&self) -> bool {
@@ -153,10 +156,7 @@ impl AsyncWrite for CaptureWriter {
     ) -> Poll<std::io::Result<usize>> {
         // Always accepts everything and never errors — the whole point.
         // Over-limit bytes are folded into the tail ring by `push`.
-        self.inner
-            .lock()
-            .expect("capture mutex poisoned")
-            .push(buf);
+        self.inner.lock().expect("capture mutex poisoned").push(buf);
         Poll::Ready(Ok(buf.len()))
     }
 
@@ -174,11 +174,7 @@ mod tests {
     use super::*;
 
     fn push(stream: &CaptureStream, s: &str) {
-        stream
-            .inner
-            .lock()
-            .unwrap()
-            .push(s.as_bytes());
+        stream.inner.lock().unwrap().push(s.as_bytes());
     }
 
     #[test]

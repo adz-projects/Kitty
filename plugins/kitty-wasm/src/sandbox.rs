@@ -409,9 +409,7 @@ mod tests {
 
     #[test]
     fn an_infinite_loop_is_stopped_by_the_epoch_deadline() {
-        let module = wat_module(
-            r#"(module (func (export "_start") (loop $l (br $l))))"#,
-        );
+        let module = wat_module(r#"(module (func (export "_start") (loop $l (br $l))))"#);
         let out = run(
             &module,
             RunRequest {
@@ -511,7 +509,11 @@ mod tests {
         );
         // Growth is refused (returns -1), so the module falls through to its
         // own `unreachable` — the point is the host stayed bounded.
-        assert!(matches!(out.outcome, Outcome::Trapped { .. }), "{:?}", out.outcome);
+        assert!(
+            matches!(out.outcome, Outcome::Trapped { .. }),
+            "{:?}",
+            out.outcome
+        );
     }
 
     #[test]
@@ -578,7 +580,11 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!(out.outcome, Outcome::Exited { code: 0 }, "chatty guest must not trap");
+        assert_eq!(
+            out.outcome,
+            Outcome::Exited { code: 0 },
+            "chatty guest must not trap"
+        );
         assert_eq!(out.stdout.total_bytes(), 1_600_000);
         assert!(out.stdout.truncated());
         assert!(out.stdout.contents().len() < 60_000);
@@ -603,12 +609,18 @@ mod tests {
         let first = load_module_cached(&wasm_path, &cache).unwrap();
         assert!(run(&first, RunRequest::default()).outcome.is_success());
 
-        let entries: Vec<_> = std::fs::read_dir(&cache).unwrap().filter_map(|e| e.ok()).collect();
+        let entries: Vec<_> = std::fs::read_dir(&cache)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
         assert_eq!(entries.len(), 1, "expected exactly one cached artifact");
 
         // Second load must come off the cache and still work.
         let second = load_module_cached(&wasm_path, &cache).unwrap();
-        assert_eq!(run(&second, RunRequest::default()).stdout.contents(), "hello from wasm\n");
+        assert_eq!(
+            run(&second, RunRequest::default()).stdout.contents(),
+            "hello from wasm\n"
+        );
     }
 
     #[test]

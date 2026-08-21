@@ -86,7 +86,7 @@ pub fn ip_is_public(ip: IpAddr) -> bool {
 }
 
 fn ipv4_is_public(ip: Ipv4Addr) -> bool {
-    let [a, b, _, _] = ip.octets();
+    let [a, b, c, _] = ip.octets();
     !(a == 0                        // 0.0.0.0/8 "this network"
         || ip.is_private()          // 10/8, 172.16/12, 192.168/16
         || ip.is_loopback()         // 127/8
@@ -95,15 +95,61 @@ fn ipv4_is_public(ip: Ipv4Addr) -> bool {
         || ip.is_documentation()    // 192.0.2/24, 198.51.100/24, 203.0.113/24
         || (a == 100 && (64..=127).contains(&b)) // 100.64.0.0/10 CGNAT
         || (a == 192 && b == 0)     // 192.0.0.0/24 IETF protocol assignments
+        || (a == 192 && b == 88 && c == 99) // 192.88.99.0/24 6to4 relay anycast
         || (a == 198 && (b == 18 || b == 19)) // 198.18.0.0/15 benchmarking
         || a >= 240) // 240.0.0.0/4 reserved
 }
 
-fn ipv6_is_public(ip: Ipv6Addr) -> bool {
-    // An IPv4-mapped IPv6 address (`::ffff:127.0.0.1`) must answer the IPv4
-    // question, or every v4 rule above is trivially bypassed.
+/// The IPv4 address an IPv6 transition address carries, if any.
+///
+/// This is the gap that mattered. `to_ipv4_mapped` covers `::ffff:a.b.c.d`,
+/// but three other well-known formats also *embed* a v4 address, and each one
+/// used to sail straight past every rule above:
+///
+/// - **NAT64** `64:ff9b::/96` — on any network with a NAT64 gateway (most
+///   IPv6-only mobile networks, which is exactly where Kitty runs on Android),
+///   `http://[64:ff9b::7f00:1]/` is a live route to `127.0.0.1`.
+/// - **6to4** `2002::/16` — the v4 address is segments 1–2.
+/// - **Teredo** `2001::/32` — the client v4 address is segments 6–7, stored
+///   obfuscated (bitwise NOT).
+///
+/// Returning the embedded address here lets `ipv6_is_public` ask the v4
+/// question about it, which is the same move `to_ipv4_mapped` already earns.
+fn embedded_ipv4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
     if let Some(mapped) = ip.to_ipv4_mapped() {
-        return ipv4_is_public(mapped);
+        return Some(mapped);
+    }
+    let seg = ip.segments();
+    // NAT64 well-known prefix: 64:ff9b::/96 (and 64:ff9b:1::/48, the local-use
+    // prefix from RFC 8215, whose v4 also sits in the last two segments).
+    if seg[0] == 0x0064 && seg[1] == 0xff9b {
+        return Some(v4_from(seg[6], seg[7]));
+    }
+    // 6to4: 2002:V4ADDR::/48
+    if seg[0] == 0x2002 {
+        return Some(v4_from(seg[1], seg[2]));
+    }
+    // Teredo: 2001:0::/32, client address in the last two segments, inverted.
+    if seg[0] == 0x2001 && seg[1] == 0x0000 {
+        return Some(v4_from(!seg[6], !seg[7]));
+    }
+    None
+}
+
+fn v4_from(hi: u16, lo: u16) -> Ipv4Addr {
+    Ipv4Addr::new(
+        (hi >> 8) as u8,
+        (hi & 0xff) as u8,
+        (lo >> 8) as u8,
+        (lo & 0xff) as u8,
+    )
+}
+
+fn ipv6_is_public(ip: Ipv6Addr) -> bool {
+    // Any address that embeds an IPv4 address must answer the IPv4 question,
+    // or every v4 rule above is trivially bypassed by re-encoding.
+    if let Some(embedded) = embedded_ipv4(ip) {
+        return ipv4_is_public(embedded);
     }
     let seg = ip.segments();
     !(ip.is_unspecified()                    // ::
@@ -111,6 +157,7 @@ fn ipv6_is_public(ip: Ipv6Addr) -> bool {
         || (seg[0] & 0xffc0) == 0xfe80       // fe80::/10 link-local
         || (seg[0] & 0xfe00) == 0xfc00       // fc00::/7 unique-local
         || (seg[0] & 0xff00) == 0xff00       // ff00::/8 multicast
+        || (seg[0] == 0x0100 && seg[1] == 0 && seg[2] == 0 && seg[3] == 0) // 100::/64 discard-only
         || (seg[0] == 0x2001 && seg[1] == 0x0db8)) // 2001:db8::/32 documentation
 }
 
@@ -163,6 +210,40 @@ mod tests {
         assert!(blocked("http://255.255.255.255/"));
         assert!(blocked("http://[2001:db8::1]/"));
         assert!(blocked("http://[ff02::1]/"));
+    }
+
+    /// The gap `to_ipv4_mapped` alone left open: three other IPv6 formats
+    /// embed a v4 address, and re-encoding an internal target in one of them
+    /// used to walk past every v4 rule. NAT64 is the one that matters most
+    /// here — it is a live route to the embedded address on the IPv6-only
+    /// mobile networks Kitty runs on.
+    #[test]
+    fn rejects_internal_addresses_re_encoded_as_ipv6_transition_formats() {
+        // NAT64 (64:ff9b::/96) wrapping 127.0.0.1, 169.254.169.254, 10.0.0.1.
+        assert!(blocked("http://[64:ff9b::7f00:1]/"));
+        assert!(blocked("http://[64:ff9b::a9fe:a9fe]/latest/meta-data"));
+        assert!(blocked("http://[64:ff9b::a00:1]/"));
+        // 6to4 (2002::/16) wrapping 127.0.0.1 and 192.168.1.1.
+        assert!(blocked("http://[2002:7f00:1::]/"));
+        assert!(blocked("http://[2002:c0a8:101::]/"));
+        // Teredo (2001:0::/32) — the client v4 is stored inverted, so
+        // !0x8071 !0xfffe == 127.142.0.1... use the exact inverse of
+        // 127.0.0.1 (0x7f00, 0x0001) => 0x80ff, 0xfffe.
+        assert!(blocked("http://[2001:0:0:0:0:0:80ff:fffe]/"));
+        // 100::/64 discard-only.
+        assert!(blocked("http://[100::1]/"));
+        // 6to4 relay anycast.
+        assert!(blocked("http://192.88.99.1/"));
+    }
+
+    /// The transition prefixes must not become blanket blocks: a 6to4 or
+    /// NAT64 address wrapping a genuinely public v4 is fine, and rejecting
+    /// those would break real IPv6-only clients.
+    #[test]
+    fn transition_addresses_wrapping_public_v4_are_still_allowed() {
+        // 8.8.8.8 == 0x0808:0808
+        assert!(!blocked("http://[64:ff9b::808:808]/"));
+        assert!(!blocked("http://[2002:808:808::]/"));
     }
 
     #[test]
