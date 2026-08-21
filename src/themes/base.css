@@ -2393,7 +2393,15 @@ button.link {
   .main-header {
     --hdr-control-h: 34px;
   }
-  .main-header button,
+  /* The `:not()`s below matter: these are *descendant* selectors, and both
+     header popovers render inside this row's DOM, so without them the rule
+     also restyles their menu rows. A menu row pinned to --hdr-control-h and
+     centred can't fit a two-line provider name, and content wider than the
+     row gets centred *out of both edges* — where the popover's
+     `overflow-x: hidden` clips it, silently eating the leading character and
+     the trust icon. Menu rows size to their content and start at the left
+     edge; only the controls in the row itself get the uniform shape. */
+  .main-header button:not(.mode-popover *):not(.chat-header-menu *),
   .main-header .provider-badge,
   .main-header .effort-dropdown {
     height: var(--hdr-control-h);
@@ -2413,7 +2421,7 @@ button.link {
   }
   /* Icon-only buttons are square rather than pill-shaped, so the row reads as
      "controls, then actions" instead of one undifferentiated run of boxes. */
-  .main-header button:has(> svg:only-child) {
+  .main-header button:has(> svg:only-child):not(.mode-popover *):not(.chat-header-menu *) {
     width: var(--hdr-control-h);
     padding: 0;
   }
