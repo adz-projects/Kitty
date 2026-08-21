@@ -147,6 +147,19 @@ fn nullable_json_patch(body: &Value, key: &str, existing: Option<String>) -> Opt
     }
 }
 
+/// Same tri-state for `timeout_s` (per-server tool-call timeout, seconds):
+/// absent keeps the stored value, explicit `null` clears it back to the
+/// daemon default, a number sets it. A non-positive or non-numeric value is
+/// rejected by clearing rather than storing a timeout that would expire
+/// instantly.
+fn timeout_patch(body: &Value, existing: Option<i64>) -> Option<i64> {
+    match body.get("timeout_s") {
+        None => existing,
+        Some(Value::Null) => None,
+        Some(v) => v.as_i64().filter(|s| *s > 0),
+    }
+}
+
 /// Same tri-state for `headers`, with encryption and the `"***"`
 /// keep-existing sentinel applied to any present value.
 fn nullable_headers_patch(body: &Value, existing: Option<String>) -> Option<String> {
@@ -177,6 +190,7 @@ pub async fn create_server(
     let args = nullable_json_patch(&body, "args", None);
     let env = nullable_json_patch(&body, "env", None);
     let headers = nullable_headers_patch(&body, None);
+    let timeout_s = timeout_patch(&body, None);
     let enabled = body
         .get("enabled")
         .and_then(|v| v.as_bool())
@@ -199,7 +213,7 @@ pub async fn create_server(
             .execute(&mut *tx)
             .await?;
         sqlx::query(
-            r#"UPDATE mcp_servers SET command = ?1, args = ?2, url = ?3, env = ?4, headers = ?5, enabled = ?6 WHERE id = ?7"#,
+            r#"UPDATE mcp_servers SET command = ?1, args = ?2, url = ?3, env = ?4, headers = ?5, enabled = ?6, timeout_s = ?7 WHERE id = ?8"#,
         )
         .bind(command)
         .bind(&args)
@@ -207,6 +221,7 @@ pub async fn create_server(
         .bind(&env)
         .bind(&headers)
         .bind(enabled as i32)
+        .bind(timeout_s)
         .bind(&id)
         .execute(&mut *tx)
         .await?;
@@ -248,7 +263,7 @@ pub async fn update_server(
     let result = async {
         let mut tx = conn.begin_with("BEGIN IMMEDIATE").await?;
         let existing = sqlx::query_as::<_, mcp_servers::MCPServerRow>(
-            r#"SELECT id, name, transport, command, args, url, env, headers, enabled, status, error_message, created_at, updated_at
+            r#"SELECT id, name, transport, command, args, url, env, headers, enabled, timeout_s, status, error_message, created_at, updated_at
                FROM mcp_servers WHERE id = ?"#,
         )
         .bind(&id)
@@ -268,12 +283,13 @@ pub async fn update_server(
         let new_args = nullable_json_patch(&body, "args", existing.args);
         let new_env = nullable_json_patch(&body, "env", existing.env);
         let new_headers = nullable_headers_patch(&body, existing.headers);
+        let new_timeout_s = timeout_patch(&body, existing.timeout_s);
 
         sqlx::query(
             r#"UPDATE mcp_servers SET
                name = ?1, transport = ?2, url = ?3, enabled = ?4,
-               command = ?5, args = ?6, env = ?7, headers = ?8
-               WHERE id = ?9"#,
+               command = ?5, args = ?6, env = ?7, headers = ?8, timeout_s = ?9
+               WHERE id = ?10"#,
         )
         .bind(new_name)
         .bind(new_transport)
@@ -283,6 +299,7 @@ pub async fn update_server(
         .bind(new_args)
         .bind(new_env)
         .bind(new_headers)
+        .bind(new_timeout_s)
         .bind(&id)
         .execute(&mut *tx)
         .await?;

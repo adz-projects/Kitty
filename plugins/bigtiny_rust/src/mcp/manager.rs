@@ -15,6 +15,16 @@ use super::tools::validate_tool_args;
 const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// How often the supervisor looks for servers that have died or never came
+/// up. Short enough that a crashed server's tools stop being offered to the
+/// model within a turn or two, long enough to be free.
+const HEALTH_TICK: Duration = Duration::from_secs(15);
+/// First reconnect delay after a failure; doubles per consecutive failure up
+/// to `RECONNECT_MAX_BACKOFF`. A server that is broken (bad command, missing
+/// binary) must not be respawned every tick forever.
+const RECONNECT_BASE_BACKOFF: Duration = Duration::from_secs(5);
+const RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(300);
+
 /// Registry/dispatcher over all connected MCP servers. Ports
 /// `plugins/bigtiny/bigtiny/mcp/manager.py::MCPManager`.
 ///
@@ -36,6 +46,23 @@ pub struct MCPManager {
     /// same shard for the whole call duration.
     servers: DashMap<String, Arc<MCPServerClient>>,
     tool_registry: DashMap<String, ToolDefinition>,
+    /// Per-server tool-call timeout, captured at connect from the server's
+    /// `timeout_s` column. Absent = `DEFAULT_TOOL_TIMEOUT`. Kept here rather
+    /// than on the client because in-process servers are built by
+    /// `mcp::builtin` and never see an `MCPServerConfig`.
+    server_timeouts: DashMap<String, Duration>,
+    /// One lock per server id, held for the duration of a connect. Without
+    /// it a `POST /connect` racing a connection-relevant `PATCH` (or a recipe
+    /// run, which connects on demand) could spawn two children for the same
+    /// server, with only the second reachable and the first left running
+    /// until process exit.
+    connect_locks: DashMap<String, Arc<tokio::sync::Mutex<()>>>,
+    /// Consecutive failed reconnect attempts per server id, for the
+    /// supervisor's exponential backoff. Cleared on a successful connect.
+    reconnect_failures: DashMap<String, u32>,
+    /// Earliest instant the supervisor may retry a server, derived from
+    /// `reconnect_failures`.
+    reconnect_after: DashMap<String, std::time::Instant>,
 }
 
 impl MCPManager {
@@ -48,10 +75,36 @@ impl MCPManager {
             pathway,
             servers: DashMap::new(),
             tool_registry: DashMap::new(),
+            server_timeouts: DashMap::new(),
+            connect_locks: DashMap::new(),
+            reconnect_failures: DashMap::new(),
+            reconnect_after: DashMap::new(),
         }
     }
 
     pub async fn connect_server(&self, server_id: &str) -> Result<(), MCPServerError> {
+        // Serialize connects per server id (#23): two concurrent callers
+        // would otherwise each spawn a child, and only the one that wins the
+        // `servers.insert` race would ever be reachable or shut down.
+        let lock = self
+            .connect_locks
+            .entry(server_id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _guard = lock.lock().await;
+
+        let result = self.connect_server_locked(server_id).await;
+        match &result {
+            Ok(()) => {
+                self.reconnect_failures.remove(server_id);
+                self.reconnect_after.remove(server_id);
+            }
+            Err(_) => self.note_reconnect_failure(server_id),
+        }
+        result
+    }
+
+    async fn connect_server_locked(&self, server_id: &str) -> Result<(), MCPServerError> {
         let row = mcp_servers::get_server(&self.pool, server_id)
             .await
             .map_err(|e| MCPServerError::Generic(e.to_string()))?
@@ -89,6 +142,15 @@ impl MCPManager {
                     self.tool_registry.insert(tool.name.clone(), tool.clone());
                 }
                 self.servers.insert(server_id.to_string(), Arc::new(client));
+                match config.timeout_s {
+                    Some(secs) => {
+                        self.server_timeouts
+                            .insert(server_id.to_string(), Duration::from_secs(secs));
+                    }
+                    None => {
+                        self.server_timeouts.remove(server_id);
+                    }
+                }
                 let _ = mcp_servers::update_status(&self.pool, server_id, "connected", None).await;
                 Ok(())
             }
@@ -129,6 +191,7 @@ impl MCPManager {
     /// `DEFAULT_TOOL_TIMEOUT` instead of failing fast), and the tool
     /// registry kept advertising tools that were no longer reachable.
     async fn evict_stale(&self, server_id: &str) {
+        self.server_timeouts.remove(server_id);
         if let Some((_, client)) = self.servers.remove(server_id) {
             self.prune_registry_for(server_id);
             // `Arc::try_unwrap` recovers ownership of the client (needed for
@@ -163,6 +226,95 @@ impl MCPManager {
             }
         });
         futures::future::join_all(futures).await;
+    }
+
+    fn note_reconnect_failure(&self, server_id: &str) {
+        let attempts = {
+            let mut entry = self
+                .reconnect_failures
+                .entry(server_id.to_string())
+                .or_insert(0);
+            *entry = entry.saturating_add(1);
+            *entry
+        };
+        // 5s, 10s, 20s … capped at 5 min.
+        let backoff = RECONNECT_BASE_BACKOFF
+            .saturating_mul(1u32 << attempts.saturating_sub(1).min(6))
+            .min(RECONNECT_MAX_BACKOFF);
+        self.reconnect_after
+            .insert(server_id.to_string(), std::time::Instant::now() + backoff);
+    }
+
+    fn reconnect_is_due(&self, server_id: &str) -> bool {
+        self.reconnect_after
+            .get(server_id)
+            .is_none_or(|t| std::time::Instant::now() >= *t)
+    }
+
+    /// One pass of the supervisor: retire servers whose transport has died,
+    /// then try to bring back any `enabled` server that isn't connected.
+    ///
+    /// Before this existed, `connect_all` ran exactly once at boot: a server
+    /// that crashed afterwards stayed in the map with its tools still in the
+    /// registry and its DB row still reading `"connected"`, so the model kept
+    /// being offered tools that could only ever fail, and the only recovery
+    /// was a manual PATCH from the UI.
+    pub async fn health_sweep(&self) {
+        let dead: Vec<String> = self
+            .servers
+            .iter()
+            .filter(|e| !e.value().is_transport_alive())
+            .map(|e| e.key().clone())
+            .collect();
+        for id in dead {
+            tracing::warn!("mcp server {id} transport closed; retiring its tools");
+            let _ = mcp_servers::update_status(
+                &self.pool,
+                &id,
+                "error",
+                Some("transport closed unexpectedly"),
+            )
+            .await;
+            // Prunes the registry immediately, so the very next turn stops
+            // advertising this server's tools to the model.
+            self.evict_stale(&id).await;
+        }
+
+        let rows = match mcp_servers::list_servers(&self.pool).await {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!("mcp health sweep could not list servers: {e}");
+                return;
+            }
+        };
+        for row in rows {
+            if row.enabled == 0 || self.servers.contains_key(&row.id) {
+                continue;
+            }
+            if !self.reconnect_is_due(&row.id) {
+                continue;
+            }
+            match self.connect_server(&row.id).await {
+                Ok(()) => tracing::info!("mcp server {} reconnected", row.id),
+                Err(e) => tracing::debug!("mcp server {} still down: {e}", row.id),
+            }
+        }
+    }
+
+    /// Run `health_sweep` forever on `HEALTH_TICK`. The caller keeps the
+    /// handle and aborts it at shutdown.
+    pub fn spawn_health_watcher(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(HEALTH_TICK);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // The first tick fires immediately; skip it so this never races
+            // the initial `connect_all`.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                self.health_sweep().await;
+            }
+        })
     }
 
     /// Sorted by tool name — feeds directly into the request-head tool-hints
@@ -205,11 +357,16 @@ impl MCPManager {
         args: &Value,
         timeout: Option<Duration>,
     ) -> ToolResult {
-        let timeout = timeout.unwrap_or(DEFAULT_TOOL_TIMEOUT);
-
         let Some(tool) = self.tool_registry.get(tool_name).map(|e| e.value().clone()) else {
             return error_result(tool_name, format!("[Unknown tool: {tool_name}]"));
         };
+
+        // Precedence: an explicit caller override, else the server's own
+        // configured `timeout_s`, else the daemon default. Callers pass
+        // `None` today, so in practice this is the per-server setting.
+        let timeout = timeout
+            .or_else(|| self.server_timeouts.get(&tool.server_id).map(|d| *d))
+            .unwrap_or(DEFAULT_TOOL_TIMEOUT);
 
         if let Err(msg) = validate_tool_args(&tool, args) {
             return error_result(
@@ -233,6 +390,7 @@ impl MCPManager {
     }
 
     pub async fn disconnect_server(&self, server_id: &str) {
+        self.server_timeouts.remove(server_id);
         if let Some((_, client)) = self.servers.remove(server_id) {
             self.prune_registry_for(server_id);
             if let Ok(client) = Arc::try_unwrap(client) {
@@ -284,6 +442,9 @@ fn row_to_config(row: &mcp_servers::MCPServerRow) -> MCPServerConfig {
             .as_ref()
             .and_then(|s| serde_json::from_str(s).ok())
             .map(decrypt_headers_value),
+        // A non-positive stored value is meaningless as a timeout; treat it
+        // as "unset" rather than as an instantly-expiring call.
+        timeout_s: row.timeout_s.filter(|s| *s > 0).map(|s| s as u64),
         status: row.status.clone(),
         error_message: row.error_message.clone(),
         created_at: row.created_at,

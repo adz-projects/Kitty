@@ -46,7 +46,7 @@ tokenizers = { version = "0.22", default-features = false, features = [
 ], optional = true }
 axum = { version = "0.8", features = ["json", "macros"] }
 tokio = { version = "1", features = ["full"] }
-tokio-util = { version = "0.7", features = ["io"] }
+tokio-util = { version = "0.7", features = ["io", "codec"] }
 # `time` enables `TimeoutStream`, used to implement the per-provider SSE
 # idle-read timeout (see `provider::openai_compat`/`anthropic`).
 tokio-stream = { version = "0.1", features = ["time"] }
@@ -114,6 +114,11 @@ adaptive-pathway = { path = "../adaptive-pathway_rust" }
 litert-lm-rust = { version = "0.2", optional = true }
 
 [dev-dependencies]
+# `test-util` only here: it enables tokio's paused-clock test runtime, which
+# lets the transport/stream timeout tests assert on multi-second bounds
+# without actually sleeping. Kept out of the main dependency so the pausable
+# clock can never be reachable from the shipped daemon.
+tokio = { version = "1", features = ["full", "test-util"] }
 mockito = "1"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"

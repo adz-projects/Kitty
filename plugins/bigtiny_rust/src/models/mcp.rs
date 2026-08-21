@@ -36,6 +36,10 @@ pub struct MCPServerConfig {
     pub env: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub headers: Option<serde_json::Value>,
+    /// Per-server tool-call timeout in seconds. `None` = the daemon default
+    /// (`mcp::manager::DEFAULT_TOOL_TIMEOUT`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_s: Option<u64>,
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
@@ -56,6 +60,7 @@ impl MCPServerConfig {
             url: None,
             env: None,
             headers: None,
+            timeout_s: None,
             status: "disconnected".into(),
             error_message: None,
             created_at: Some(Utc::now()),

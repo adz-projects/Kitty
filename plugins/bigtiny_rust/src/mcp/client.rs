@@ -1,11 +1,12 @@
 use std::time::Duration;
 
 use rmcp::model::{
-    CallToolRequestParam, ClientCapabilities, ClientInfo, Implementation, ProtocolVersion,
+    CallToolRequest, CallToolRequestParam, ClientCapabilities, ClientInfo, ClientRequest,
+    Implementation, ProtocolVersion, ServerResult,
 };
-use rmcp::service::RunningService;
+use rmcp::service::{PeerRequestOptions, RunningService};
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
-use rmcp::transport::{ConfigureCommandExt, StreamableHttpClientTransport, TokioChildProcess};
+use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::{RoleClient, ServiceExt};
 use serde_json::Value;
 use tokio::process::Command;
@@ -13,8 +14,10 @@ use tokio::process::Command;
 use crate::error::MCPServerError;
 use crate::models::mcp::{MCPServerConfig, ToolDefinition, ToolResult, TransportType};
 
+use super::child_transport::ChildProcessTransport;
+use super::rw_transport::HardenedRwTransport;
 use super::sse_transport::SseTransport;
-use super::tools::{extract_content_from_rmcp, truncate_output};
+use super::tools::{extract_content_from_rmcp_sized, truncate_output};
 
 const CLIENT_NAME: &str = "bigtiny";
 const CLIENT_VERSION: &str = "0.1.0";
@@ -25,6 +28,11 @@ const CLIENT_VERSION: &str = "0.1.0";
 /// fills, which is exactly the read/write coupling a real stdio pipe would
 /// also impose, but a too-small buffer would make it bite far more often).
 const IN_PROCESS_BUF_SIZE: usize = 256 * 1024;
+/// Slack on the outer `execute_tool` bound so the inner, *cancelling* rmcp
+/// timeout fires first on the transports that support it — otherwise the
+/// outer one would win the race and we would be back to abandoning the call
+/// instead of cancelling it.
+const TIMEOUT_GRACE: Duration = Duration::from_secs(2);
 
 fn client_info() -> ClientInfo {
     ClientInfo {
@@ -104,13 +112,19 @@ impl MCPServerClient {
             .and_then(|v| serde_json::from_value(v.clone()).ok())
             .unwrap_or_default();
 
-        let child = TokioChildProcess::new(Command::new(&command).configure(|cmd| {
-            cmd.args(&args);
-            for (k, v) in &env_overlay {
-                cmd.env(k, v);
-            }
-        }))
-        .map_err(|e| MCPServerError::Transport(e.to_string()))?;
+        let mut cmd = Command::new(&command);
+        cmd.args(&args);
+        for (k, v) in &env_overlay {
+            cmd.env(k, v);
+        }
+        // `ChildProcessTransport`, not rmcp's `TokioChildProcess`: same child
+        // lifecycle (graceful stdin-close, 3s grace, reaping kill), but framed
+        // by `rw_transport::HardenedRwTransport` so one non-JSON log line from
+        // a third-party server can't take its whole tool set offline, an
+        // unbounded stdout can't OOM the daemon, and a child that stops
+        // draining its stdin can't wedge the transport forever.
+        let child = ChildProcessTransport::spawn(cmd)
+            .map_err(|e| MCPServerError::Transport(e.to_string()))?;
 
         let running = client_info()
             .serve(child)
@@ -149,10 +163,26 @@ impl MCPServerClient {
         Fut: std::future::Future<Output = ()> + Send + 'static,
     {
         let (client_side, server_side) = tokio::io::duplex(IN_PROCESS_BUF_SIZE);
-        tokio::spawn(serve(server_side));
+        // Observe the serve task rather than dropping its `JoinHandle`: a
+        // panicking in-process tool used to vanish silently, leaving the
+        // client to fail every later call with an opaque transport error and
+        // no clue in the log about what actually died.
+        let observed_id = server_id.clone();
+        tokio::spawn(async move {
+            if let Err(e) = tokio::spawn(serve(server_side)).await {
+                if e.is_panic() {
+                    tracing::error!(
+                        "in-process MCP server {observed_id} panicked; its transport is now dead: {e}"
+                    );
+                } else {
+                    tracing::warn!("in-process MCP server {observed_id} task ended: {e}");
+                }
+            }
+        });
 
+        let (read, write) = tokio::io::split(client_side);
         let running = client_info()
-            .serve(client_side)
+            .serve(HardenedRwTransport::new(read, write))
             .await
             .map_err(|e| MCPServerError::Transport(e.to_string()))?;
 
@@ -275,6 +305,21 @@ impl MCPServerClient {
         &self.server_id
     }
 
+    /// Whether this client's transport is still usable. Cheap and
+    /// non-blocking — it reads rmcp's own closed flag, which flips when the
+    /// serve loop ends (child exited, pipe broke, or `HardenedRwTransport`
+    /// declared a wedged peer dead). Drives `MCPManager`'s health watcher.
+    ///
+    /// The hand-rolled SSE transport is stateless request/response HTTP with
+    /// no session to lose, so it has no closed state to report and is always
+    /// "alive"; a broken endpoint there surfaces as a failing call instead.
+    pub fn is_transport_alive(&self) -> bool {
+        match &self.handle {
+            ClientHandle::Rmcp(running) => !running.peer().is_transport_closed(),
+            ClientHandle::Sse(_) => true,
+        }
+    }
+
     /// Never returns an `Err` — every failure mode maps to a
     /// `ToolResult { is_error: true, .. }`. Load-bearing: callers run tool
     /// calls concurrently and one failing call must not cancel its siblings.
@@ -294,24 +339,63 @@ impl MCPServerClient {
         let call = async {
             match &self.handle {
                 ClientHandle::Rmcp(running) => {
-                    let result = running
-                        .call_tool(CallToolRequestParam {
+                    // Deliberately not `running.call_tool(..)`: that sends the
+                    // request with no options, so a timeout on our side just
+                    // drops the caller's future. The server-side tool keeps
+                    // running (duplicate side effects when the model retries)
+                    // and rmcp leaks the pending responder until a reply that
+                    // may never come. Handing rmcp the timeout instead makes
+                    // it emit `notifications/cancelled` and drop the responder.
+                    let request = ClientRequest::CallToolRequest(CallToolRequest {
+                        method: Default::default(),
+                        params: CallToolRequestParam {
                             name: tool_name.to_string().into(),
                             arguments,
-                        })
+                        },
+                        extensions: Default::default(),
+                    });
+                    let handle = running
+                        .peer()
+                        .send_cancellable_request(
+                            request,
+                            PeerRequestOptions {
+                                timeout: Some(timeout),
+                                meta: None,
+                            },
+                        )
                         .await
                         .map_err(|e| MCPServerError::Transport(e.to_string()))?;
+                    let result = match handle.await_response().await {
+                        Ok(ServerResult::CallToolResult(result)) => result,
+                        Ok(_) => {
+                            return Err(MCPServerError::Transport(
+                                "server answered tools/call with the wrong result type".into(),
+                            ))
+                        }
+                        Err(rmcp::service::ServiceError::Timeout { .. }) => {
+                            return Err(MCPServerError::Timeout(timeout.as_secs_f64()))
+                        }
+                        Err(e) => return Err(MCPServerError::Transport(e.to_string())),
+                    };
                     let is_error = result.is_error.unwrap_or(false);
-                    let content = extract_content_from_rmcp(&result.content);
-                    Ok::<(bool, String), MCPServerError>((is_error, content))
+                    let (content, raw_bytes) = extract_content_from_rmcp_sized(&result.content);
+                    Ok::<(bool, String, usize), MCPServerError>((is_error, content, raw_bytes))
                 }
                 ClientHandle::Sse(sse) => sse.call_tool(tool_name, args).await,
             }
         };
 
-        match tokio::time::timeout(timeout, call).await {
-            Ok(Ok((is_error, content))) => {
-                let output_size_bytes = content.len() as i32;
+        // Outer belt-and-braces bound. The rmcp path already cancels at
+        // `timeout`; this catches the transports that don't (SSE) and any
+        // stall *before* the request reaches rmcp's pending map. The grace
+        // lets the inner, cancelling timeout win the race and report the
+        // clearer error.
+        match tokio::time::timeout(timeout + TIMEOUT_GRACE, call).await {
+            Ok(Ok((is_error, content, raw_bytes))) => {
+                // Clamp, don't wrap: `raw_bytes as i32` silently goes
+                // negative past 2 GB, which then lands in the DB as a
+                // nonsense negative size.
+                let output_size_bytes = raw_bytes.min(i32::MAX as usize) as i32;
                 let (content, truncated) = truncate_output(&content);
                 ToolResult {
                     content,
@@ -322,6 +406,17 @@ impl MCPServerClient {
                     truncated,
                 }
             }
+            // The rmcp path's own (cancelling) timeout. Reported with the same
+            // wording as the outer one so callers and the model can't tell
+            // which bound fired — only that the tool ran out of time.
+            Ok(Err(MCPServerError::Timeout(secs))) => ToolResult {
+                content: format!("[Tool '{tool_name}' timed out after {secs:.0}s]"),
+                tool_call_id,
+                duration_ms: start.elapsed().as_millis() as i32,
+                output_size_bytes: 0,
+                is_error: true,
+                truncated: false,
+            },
             Ok(Err(e)) => ToolResult {
                 content: format!("[Tool '{tool_name}' error: {e}]"),
                 tool_call_id,
@@ -567,7 +662,9 @@ mod in_process_tests {
         let result =
             MCPServerClient::connect_in_process("bad-schema".to_string(), fake_server_bad_schema)
                 .await;
-        let err = result.err().expect("connect must fail on an uncompilable schema");
+        let err = result
+            .err()
+            .expect("connect must fail on an uncompilable schema");
         assert!(
             err.to_string().contains("not a valid JSON Schema"),
             "error should name the schema problem, got: {err}"

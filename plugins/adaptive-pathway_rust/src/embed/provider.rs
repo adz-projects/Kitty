@@ -16,7 +16,7 @@
 //! circuit-breaker, dimension projection and cache behave identically whether
 //! the failure was a dead socket or a model that wouldn't load.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -54,6 +54,25 @@ struct ProviderState {
     available: Option<bool>, // None = never probed; Some(true/false)
     last_probe: Instant,
     cache: EmbedCache,
+}
+
+/// Take the state lock, recovering from poisoning instead of propagating it.
+///
+/// `std::sync::Mutex` is the right choice here — no critical section spans an
+/// `.await` — but `.lock().unwrap()` made a single panic anywhere inside one
+/// of them permanent and global: this provider is shared by every session and
+/// every background pass, so one poisoned lock would panic all of them from
+/// then on, for the rest of the process. The guarded state is a cache plus
+/// two availability fields; the worst a half-finished update can leave behind
+/// is a stale entry or a stale probe timestamp, both self-correcting. Taking
+/// the state as-is is strictly better than bringing down memory recall.
+fn lock_state(state: &Mutex<ProviderState>) -> MutexGuard<'_, ProviderState> {
+    state.lock().unwrap_or_else(|poisoned| {
+        tracing::warn!(
+            "embedding provider state lock was poisoned by an earlier panic; continuing with the              state as it stands"
+        );
+        poisoned.into_inner()
+    })
 }
 
 impl EmbeddingProvider {
@@ -100,16 +119,14 @@ impl EmbeddingProvider {
         if t.is_empty() {
             return (vec![0.0; self.dim], false);
         }
-        if let Some((v, semantic)) = self.state.lock().unwrap().cache.get(t).cloned() {
+        if let Some((v, semantic)) = lock_state(&self.state).cache.get(t).cloned() {
             return (v, semantic);
         }
         let (vec, semantic) = match self.embed_semantic(t).await {
             Some(v) => (v, true),
             None => (hash_embed(t, self.dim), false),
         };
-        self.state
-            .lock()
-            .unwrap()
+        lock_state(&self.state)
             .cache
             .put(t.to_string(), vec.clone(), semantic);
         (vec, semantic)
@@ -135,9 +152,7 @@ impl EmbeddingProvider {
         // Refresh the shared cache with the up-to-date result so subsequent
         // `embed_with_space` calls for the same text also see the corrected
         // space instead of a stale entry.
-        self.state
-            .lock()
-            .unwrap()
+        lock_state(&self.state)
             .cache
             .put(t.to_string(), vec.clone(), semantic);
         (vec, semantic)
@@ -149,7 +164,7 @@ impl EmbeddingProvider {
     /// identically.
     async fn embed_semantic(&self, text: &str) -> Option<Vec<f32>> {
         {
-            let st = self.state.lock().unwrap();
+            let st = lock_state(&self.state);
             match st.available {
                 Some(false) if st.last_probe.elapsed() < self.probe_interval => return None,
                 _ => {}
@@ -189,13 +204,13 @@ impl EmbeddingProvider {
     }
 
     fn mark_available(&self) {
-        let mut st = self.state.lock().unwrap();
+        let mut st = lock_state(&self.state);
         st.available = Some(true);
         st.last_probe = Instant::now();
     }
 
     fn mark_unavailable(&self) {
-        let mut st = self.state.lock().unwrap();
+        let mut st = lock_state(&self.state);
         st.available = Some(false);
         st.last_probe = Instant::now();
     }
@@ -204,7 +219,7 @@ impl EmbeddingProvider {
     /// answered — whichever backend is configured.
     pub async fn probe_semantic(&self) -> bool {
         {
-            let mut st = self.state.lock().unwrap();
+            let mut st = lock_state(&self.state);
             st.available = None;
             st.last_probe = Instant::now() - Duration::from_secs(3600);
         }
@@ -212,7 +227,7 @@ impl EmbeddingProvider {
     }
 
     pub fn cache_len(&self) -> usize {
-        self.state.lock().unwrap().cache.len()
+        lock_state(&self.state).cache.len()
     }
 }
 
@@ -265,7 +280,10 @@ mod tests {
             EmbeddingProvider::with_embedder(cfg, Some(Arc::new(Fixed(vec![0.1, 0.2, 0.3]))));
 
         let (v, semantic) = provider.embed_with_space("hello world").await;
-        assert!(semantic, "an in-process embedder produces the semantic space");
+        assert!(
+            semantic,
+            "an in-process embedder produces the semantic space"
+        );
         assert!(v.iter().any(|x| *x != 0.0), "got a zero vector");
         assert!(provider.probe_semantic().await);
         never.assert_async().await;
@@ -310,13 +328,19 @@ mod tests {
         let provider = provider_for(server.url());
 
         let (v1, semantic1) = provider.embed_with_space("hello world").await;
-        assert!(semantic1, "first call must hit the (mocked) Ollama endpoint");
+        assert!(
+            semantic1,
+            "first call must hit the (mocked) Ollama endpoint"
+        );
 
         // Second call for the exact same text must be served from cache,
         // WITHOUT a second HTTP request (`mock.expect(1)` above is the real
         // assertion), and must still report `semantic == true`.
         let (v2, semantic2) = provider.embed_with_space("hello world").await;
-        assert!(semantic2, "a cached semantic vector must still read back as semantic");
+        assert!(
+            semantic2,
+            "a cached semantic vector must still read back as semantic"
+        );
         assert_eq!(v1, v2);
         mock.assert_async().await;
     }
@@ -355,7 +379,10 @@ mod tests {
         let provider = provider_for(server.url());
 
         let (_hash_vec, semantic) = provider.embed_with_space("hello world").await;
-        assert!(!semantic, "the first (failing) response must fall back to the hash embedder");
+        assert!(
+            !semantic,
+            "the first (failing) response must fall back to the hash embedder"
+        );
         assert_eq!(provider.cache_len(), 1);
 
         // Ollama "recovers" (every request from here on succeeds). A plain
@@ -364,15 +391,25 @@ mod tests {
         // to route around, not something a plain cache hit can fix on its
         // own.
         let (_stale, still_cached_as_hash) = provider.embed_with_space("hello world").await;
-        assert!(!still_cached_as_hash, "a plain cache hit is expected to still surface the stale entry");
-        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1, "a cache hit must not perform a new HTTP request");
+        assert!(
+            !still_cached_as_hash,
+            "a plain cache hit is expected to still surface the stale entry"
+        );
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a cache hit must not perform a new HTTP request"
+        );
 
         // `reembed_stale_beliefs` always probes before re-embedding —
         // mirror that here, since it's what actually clears the
         // `available == Some(false)` + probe-interval gate that would
         // otherwise short-circuit `embed_semantic` before it ever reaches the
         // network, independent of the cache.
-        assert!(provider.probe_semantic().await, "the probe must see the recovered endpoint");
+        assert!(
+            provider.probe_semantic().await,
+            "the probe must see the recovered endpoint"
+        );
         let hits_after_probe = hits.load(std::sync::atomic::Ordering::SeqCst);
 
         // The fresh/bypass path must ignore that cache entry and actually
@@ -392,6 +429,9 @@ mod tests {
         // And it refreshes the shared cache, so subsequent plain lookups for
         // the same text now correctly report semantic too.
         let (_refreshed, now_semantic) = provider.embed_with_space("hello world").await;
-        assert!(now_semantic, "embed_fresh_with_space must write its corrected result back into the cache");
+        assert!(
+            now_semantic,
+            "embed_fresh_with_space must write its corrected result back into the cache"
+        );
     }
 }

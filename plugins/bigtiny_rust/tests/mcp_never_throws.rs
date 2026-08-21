@@ -13,6 +13,11 @@ use serde_json::json;
 use sqlx::SqlitePool;
 
 async fn setup_pool_with_server() -> (SqlitePool, String) {
+    setup_pool_with_args("[]").await
+}
+
+/// `args` is the JSON array stored in the `mcp_servers.args` column.
+async fn setup_pool_with_args(args: &str) -> (SqlitePool, String) {
     let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
     sqlx::query("PRAGMA journal_mode = WAL")
         .execute(&pool)
@@ -28,11 +33,12 @@ async fn setup_pool_with_server() -> (SqlitePool, String) {
     let command = env!("CARGO_BIN_EXE_fake_mcp_server");
     sqlx::query(
         "INSERT INTO mcp_servers (id, name, transport, command, args, enabled, status) \
-         VALUES (?, ?, 'stdio', ?, '[]', 1, 'disconnected')",
+         VALUES (?, ?, 'stdio', ?, ?, 1, 'disconnected')",
     )
     .bind(server_id)
     .bind("fake")
     .bind(command)
+    .bind(args)
     .execute(&pool)
     .await
     .unwrap();
@@ -119,4 +125,35 @@ async fn execute_tool_crashed_subprocess_never_errors() {
         .execute_tool("crash_tool", &json!({}), Some(Duration::from_secs(5)))
         .await;
     assert!(result.is_error);
+}
+
+/// Regression for the "one bad line kills the server" failure: a third-party
+/// stdio server that writes plain log lines to stdout (extremely common) used
+/// to take its entire tool set offline at the first one, because rmcp's own
+/// transport maps any decode error to end-of-stream. `mcp::rw_transport` skips
+/// the junk and keeps the connection, so the handshake, tool listing and tool
+/// calls must all still work with a server that is noisy on every message.
+#[tokio::test]
+async fn a_server_that_logs_plain_text_to_stdout_still_works() {
+    let (pool, server_id) = setup_pool_with_args(r#"["--noisy"]"#).await;
+    let manager = MCPManager::new(pool, None);
+    manager
+        .connect_server(&server_id)
+        .await
+        .expect("connect must survive non-JSON lines on stdout");
+
+    assert!(
+        manager.has_tool("echo_tool"),
+        "tools must still be registered for a noisy server"
+    );
+
+    // Two calls: the second proves the transport is still live after the
+    // first reply arrived interleaved with more junk.
+    for expected in ["first", "second"] {
+        let result = manager
+            .execute_tool("echo_tool", &json!({"text": expected}), None)
+            .await;
+        assert!(!result.is_error, "unexpected error: {}", result.content);
+        assert_eq!(result.content, expected);
+    }
 }

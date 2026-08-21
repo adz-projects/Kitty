@@ -151,6 +151,11 @@ pub async fn run(config: BigTinyConfig, options: RunOptions) -> Result<(), Daemo
 
     let mcp = Arc::new(MCPManager::new(pool.clone(), pathway_engine.clone()));
     mcp.connect_all().await; // isolated per-server failure, matches Python's connect_all
+    // Supervisor: retires the tools of a server whose transport died and
+    // brings enabled-but-down servers back with exponential backoff. Without
+    // it `connect_all` above is the only connect attempt for the whole
+    // process lifetime.
+    let mcp_health_watcher = mcp.clone().spawn_health_watcher();
 
     let router = Arc::new(ProviderRouter::new(config.cache.clone()));
     router.load_providers(&pool).await?;
@@ -297,6 +302,7 @@ pub async fn run(config: BigTinyConfig, options: RunOptions) -> Result<(), Daemo
             // competing with it.
             scheduler.lock().await.stop().await;
             agent.shutdown().await;
+            mcp_health_watcher.abort();
             mcp.disconnect_all().await;
             match tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, &mut server).await {
                 // The drain finished inside the cap — propagate a serve
@@ -316,6 +322,7 @@ pub async fn run(config: BigTinyConfig, options: RunOptions) -> Result<(), Daemo
     // signal landed) — the subsystems still need their teardown.
     scheduler.lock().await.stop().await;
     agent.shutdown().await;
+    mcp_health_watcher.abort();
     mcp.disconnect_all().await;
 
     Ok(())

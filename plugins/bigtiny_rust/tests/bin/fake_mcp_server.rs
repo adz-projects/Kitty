@@ -18,6 +18,15 @@ fn write_line(stdout: &mut impl Write, value: &Value) {
 fn main() {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
+    // `--noisy`: emit a plain (non-JSON) log line to stdout before every
+    // reply, the way a real third-party server that logs to stdout does.
+    // rmcp's own stdio transport treats the first such line as end-of-stream
+    // and takes the whole server offline; `mcp::rw_transport` skips it.
+    let noisy = std::env::args().any(|a| a == "--noisy");
+    if noisy {
+        let _ = writeln!(stdout, "[fake-mcp] starting up (this line is not JSON)");
+        let _ = stdout.flush();
+    }
 
     for line in stdin.lock().lines() {
         let line = match line {
@@ -33,6 +42,10 @@ fn main() {
         };
         let method = msg.get("method").and_then(|v| v.as_str()).unwrap_or("");
         let id = msg.get("id").cloned();
+        if noisy {
+            let _ = writeln!(stdout, "[fake-mcp] handling {method}");
+            let _ = stdout.flush();
+        }
 
         match method {
             "initialize" => {

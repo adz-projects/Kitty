@@ -7,6 +7,58 @@ pub const MAX_TOOL_OUTPUT_BYTES: usize = 100 * 1024;
 pub const TRUNCATION_MESSAGE: &str =
     "[Output truncated at 100KB. Use server-specific pagination to retrieve full data.]";
 
+/// Accumulates extracted content parts, stopping once the 100 KB output cap
+/// is reached. Extraction used to build the *whole* joined string and only
+/// then truncate, so a 500 MB tool result was materialized twice over before
+/// 99.98% of it was thrown away. Callers still run the joined result through
+/// `truncate_output`, which appends the truncation notice — this only bounds
+/// what gets copied on the way there.
+struct CappedJoin {
+    out: String,
+    /// Total bytes seen, including what was dropped, so the caller can still
+    /// report a truthful `output_size_bytes`.
+    seen: usize,
+    full: bool,
+}
+
+impl CappedJoin {
+    fn new() -> Self {
+        Self {
+            out: String::new(),
+            seen: 0,
+            full: false,
+        }
+    }
+
+    fn push(&mut self, piece: &str) {
+        self.seen = self.seen.saturating_add(piece.len());
+        if self.full {
+            return;
+        }
+        if !self.out.is_empty() {
+            self.out.push('\n');
+        }
+        // One byte past the cap is enough for `truncate_output` to notice.
+        let room = (MAX_TOOL_OUTPUT_BYTES + 1).saturating_sub(self.out.len());
+        if piece.len() <= room {
+            self.out.push_str(piece);
+        } else {
+            // Cut on a char boundary at or below `room`.
+            let mut end = room.min(piece.len());
+            while end > 0 && !piece.is_char_boundary(end) {
+                end -= 1;
+            }
+            self.out.push_str(&piece[..end]);
+            self.full = true;
+        }
+    }
+
+    /// `(joined_text, total_bytes_before_capping)`
+    fn finish(self) -> (String, usize) {
+        (self.out, self.seen)
+    }
+}
+
 /// Truncate `content` to `MAX_TOOL_OUTPUT_BYTES` UTF-8 *bytes* (matching
 /// Python's byte-based limit, not a char-based one). Returns `(content, was_truncated)`.
 pub fn truncate_output(content: &str) -> (String, bool) {
@@ -23,42 +75,53 @@ pub fn truncate_output(content: &str) -> (String, bool) {
 /// reference does. Ported exactly from `_extract_content`: text parts pass
 /// through as-is, resource parts are stringified, everything else is dropped.
 pub fn extract_content_from_json(content: &Value) -> String {
+    extract_content_from_json_sized(content).0
+}
+
+/// As `extract_content_from_json`, also reporting the pre-cap byte total so
+/// callers can record a truthful `output_size_bytes`.
+pub fn extract_content_from_json_sized(content: &Value) -> (String, usize) {
     let Some(parts) = content.as_array() else {
-        return String::new();
+        return (String::new(), 0);
     };
-    let mut pieces = Vec::new();
+    let mut join = CappedJoin::new();
     for part in parts {
         if let Some(s) = part.as_str() {
-            pieces.push(s.to_string());
+            join.push(s);
             continue;
         }
         match part.get("type").and_then(|v| v.as_str()) {
             Some("text") => {
                 if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
-                    pieces.push(text.to_string());
+                    join.push(text);
                 }
             }
             Some("resource") => {
                 if let Some(resource) = part.get("resource") {
-                    pieces.push(resource.to_string());
+                    join.push(&resource.to_string());
                 }
             }
             _ => {}
         }
     }
-    pieces.join("\n")
+    join.finish()
 }
 
 /// Same extraction rules as `extract_content_from_json`, for rmcp's typed
 /// `CallToolResult.content` (used by the stdio/streamable_http paths).
 pub fn extract_content_from_rmcp(content: &[rmcp::model::Content]) -> String {
-    let mut pieces = Vec::new();
+    extract_content_from_rmcp_sized(content).0
+}
+
+/// As `extract_content_from_rmcp`, also reporting the pre-cap byte total.
+pub fn extract_content_from_rmcp_sized(content: &[rmcp::model::Content]) -> (String, usize) {
+    let mut join = CappedJoin::new();
     for part in content {
         match &part.raw {
-            rmcp::model::RawContent::Text(t) => pieces.push(t.text.clone()),
+            rmcp::model::RawContent::Text(t) => join.push(&t.text),
             rmcp::model::RawContent::Resource(r) => {
-                pieces.push(
-                    serde_json::to_value(r)
+                join.push(
+                    &serde_json::to_value(r)
                         .map(|v| v.to_string())
                         .unwrap_or_default(),
                 );
@@ -66,7 +129,7 @@ pub fn extract_content_from_rmcp(content: &[rmcp::model::Content]) -> String {
             _ => {}
         }
     }
-    pieces.join("\n")
+    join.finish()
 }
 
 /// Validate `args` against a tool's JSON Schema (`input_schema`), mirroring

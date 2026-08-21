@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 use crate::error::MCPServerError;
 use crate::models::mcp::ToolDefinition;
 
-use super::tools::extract_content_from_json;
+use super::tools::extract_content_from_json_sized;
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
 const CLIENT_NAME: &str = "bigtiny";
@@ -49,13 +49,19 @@ impl SseTransport {
         let mut header_map = reqwest::header::HeaderMap::new();
         if let Some(obj) = headers.as_ref().and_then(|v| v.as_object()) {
             for (k, v) in obj {
-                if let (Ok(name), Some(val)) = (
-                    reqwest::header::HeaderName::from_bytes(k.as_bytes()),
-                    v.as_str(),
-                ) {
-                    if let Ok(val) = val.parse() {
+                // Silently dropping a header means the server is dialled
+                // with NO auth: every call 401s while the UI still says
+                // "connected", or worse the server accepts the
+                // unauthenticated session. Log it.
+                let name = reqwest::header::HeaderName::from_bytes(k.as_bytes());
+                let val = v.as_str().and_then(|s| s.parse().ok());
+                match (name, val) {
+                    (Ok(name), Some(val)) => {
                         header_map.insert(name, val);
                     }
+                    _ => tracing::warn!(
+                        "dropping invalid configured header {k:?} for sse MCP server at {url}"
+                    ),
                 }
             }
         }
@@ -119,6 +125,27 @@ impl SseTransport {
             .json()
             .await
             .map_err(|e| MCPServerError::Transport(e.to_string()))?;
+        // Correlate the reply with the request. A server that answers with
+        // someone else's `id` (or with a body that isn't the reply at all)
+        // used to be accepted as this call's result — under concurrent tool
+        // calls that silently returns one tool's output as another's.
+        match data.get("id") {
+            Some(Value::Number(n)) if n.as_i64() == Some(id) => {}
+            Some(other) => {
+                return Err(MCPServerError::Transport(format!(
+                    "MCP request '{method}' got a reply for id {other} (expected {id})"
+                )))
+            }
+            // An error reply may legitimately carry a null id (JSON-RPC
+            // allows it when the request couldn't be parsed), so only demand
+            // a matching id on something claiming to be a result.
+            None if data.get("error").is_none() => {
+                return Err(MCPServerError::Transport(format!(
+                    "MCP request '{method}' got a reply with no id"
+                )))
+            }
+            None => {}
+        }
         if let Some(err) = data.get("error") {
             let code = err.get("code").and_then(|v| v.as_i64()).unwrap_or(0);
             let message = err
@@ -128,7 +155,16 @@ impl SseTransport {
                 .to_string();
             return Err(MCPServerError::Protocol { code, message });
         }
-        Ok(data.get("result").cloned().unwrap_or_else(|| json!({})))
+        // A JSON-RPC reply carries exactly one of `result`/`error`. Defaulting
+        // a missing `result` to `{}` reported a protocol violation (or a 200
+        // with an empty body) as a *successful* call with no content — the
+        // model then saw an empty tool result instead of an error it could
+        // react to.
+        data.get("result").cloned().ok_or_else(|| {
+            MCPServerError::Transport(format!(
+                "MCP request '{method}' reply had neither a result nor an error"
+            ))
+        })
     }
 
     async fn send_notification(&self, method: &str, params: Value) -> Result<(), MCPServerError> {
@@ -179,13 +215,16 @@ impl SseTransport {
             .collect())
     }
 
-    /// Returns `(is_error, content_text)`; the caller (`client.rs`) wraps this
-    /// into a `ToolResult`, matching the rmcp-backed transports' shape.
+    /// Returns `(is_error, content_text, raw_bytes)`; the caller
+    /// (`client.rs`) wraps this into a `ToolResult`, matching the rmcp-backed
+    /// transports' shape. `raw_bytes` is the pre-cap size, so
+    /// `output_size_bytes` stays truthful about what the server actually
+    /// produced even when the text was capped during extraction.
     pub async fn call_tool(
         &self,
         tool_name: &str,
         args: &Value,
-    ) -> Result<(bool, String), MCPServerError> {
+    ) -> Result<(bool, String, usize), MCPServerError> {
         let result = self
             .send_request("tools/call", json!({"name": tool_name, "arguments": args}))
             .await?;
@@ -193,8 +232,13 @@ impl SseTransport {
             .get("isError")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        let content = result.get("content").cloned().unwrap_or_else(|| json!([]));
-        Ok((is_error, extract_content_from_json(&content)))
+        // Same reasoning as the missing-`result` case: a `tools/call` reply
+        // with no `content` is malformed, not an empty success.
+        let content = result.get("content").ok_or_else(|| {
+            MCPServerError::Transport(format!("tool '{tool_name}' reply had no content array"))
+        })?;
+        let (text, raw_bytes) = extract_content_from_json_sized(content);
+        Ok((is_error, text, raw_bytes))
     }
 
     /// Stateless POST-only transport — nothing to tear down.

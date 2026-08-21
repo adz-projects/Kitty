@@ -16,6 +16,9 @@ pub struct MCPServerRow {
     pub env: Option<String>,
     pub headers: Option<String>,
     pub enabled: i32,
+    /// Per-server tool-call timeout in seconds; `None` falls back to
+    /// `mcp::manager::DEFAULT_TOOL_TIMEOUT`.
+    pub timeout_s: Option<i64>,
     pub status: String,
     pub error_message: Option<String>,
     pub created_at: Option<DateTime<Utc>>,
@@ -24,7 +27,7 @@ pub struct MCPServerRow {
 
 pub async fn list_servers(pool: &SqlitePool) -> Result<Vec<MCPServerRow>, StorageError> {
     let rows = sqlx::query_as::<_, MCPServerRow>(
-        r#"SELECT id, name, transport, command, args, url, env, headers, enabled, status, error_message, created_at, updated_at
+        r#"SELECT id, name, transport, command, args, url, env, headers, enabled, timeout_s, status, error_message, created_at, updated_at
            FROM mcp_servers ORDER BY name ASC"#
     )
     .fetch_all(pool)
@@ -37,7 +40,7 @@ pub async fn get_server(
     server_id: &str,
 ) -> Result<Option<MCPServerRow>, StorageError> {
     let row = sqlx::query_as::<_, MCPServerRow>(
-        r#"SELECT id, name, transport, command, args, url, env, headers, enabled, status, error_message, created_at, updated_at
+        r#"SELECT id, name, transport, command, args, url, env, headers, enabled, timeout_s, status, error_message, created_at, updated_at
            FROM mcp_servers WHERE id = ?"#
     )
     .bind(server_id)
