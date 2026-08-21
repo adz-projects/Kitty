@@ -13,10 +13,13 @@ use std::collections::VecDeque;
 
 /// ASCII 0x20..=0x7E advance widths, in 1/1000 em (Helvetica AFM metrics).
 const ADVANCE_1000: [u16; 95] = [
-    278, 278, 355, 556, 556, 889, 667, 191, 333, 333, 389, 584, 278, 333, 278, 278, // space ! " # $ % & ' ( ) * + , - . /
-    556, 556, 556, 556, 556, 556, 556, 556, 556, 556, 278, 278, 584, 584, 584, 556, // 0-9 : ; < = > ?
+    278, 278, 355, 556, 556, 889, 667, 191, 333, 333, 389, 584, 278, 333, 278,
+    278, // space ! " # $ % & ' ( ) * + , - . /
+    556, 556, 556, 556, 556, 556, 556, 556, 556, 556, 278, 278, 584, 584, 584,
+    556, // 0-9 : ; < = > ?
     1015, 667, 667, 722, 722, 667, 611, 778, 722, 278, 500, 667, 556, 833, 722, 778, // @ A-O
-    667, 778, 722, 667, 611, 722, 667, 944, 667, 667, 611, 278, 278, 278, 469, 556, // P-Z [ \ ] ^ _
+    667, 778, 722, 667, 611, 722, 667, 944, 667, 667, 611, 278, 278, 278, 469,
+    556, // P-Z [ \ ] ^ _
     333, 556, 556, 500, 556, 556, 278, 556, 556, 222, 222, 500, 222, 833, 556, 556, // ` a-o
     556, 556, 333, 500, 278, 556, 500, 722, 500, 500, 500, 334, 260, 334, 584, // p-z { | } ~
 ];
@@ -84,7 +87,15 @@ pub fn wrap(s: &str, max_px: f32, font_size: f32, max_lines: usize) -> Vec<Strin
                     break;
                 }
             }
-            current_width = split_wide_word(&word, max_px, font_size, &mut lines, &mut pending, max_lines, &mut current);
+            current_width = split_wide_word(
+                &word,
+                max_px,
+                font_size,
+                &mut lines,
+                &mut pending,
+                max_lines,
+                &mut current,
+            );
             continue;
         }
 
@@ -200,7 +211,10 @@ mod tests {
         let max_px = 200.0;
         let font_size = 12.5;
         for line in wrap(text, max_px, font_size, 5) {
-            assert!(measure_px(&line, font_size) <= max_px, "line {line:?} exceeds {max_px}px");
+            assert!(
+                measure_px(&line, font_size) <= max_px,
+                "line {line:?} exceeds {max_px}px"
+            );
         }
     }
 
@@ -210,7 +224,10 @@ mod tests {
         let max_px = 100.0;
         let font_size = 12.5;
         let lines = wrap(&word, max_px, font_size, 10);
-        assert!(lines.len() > 1, "expected the 60-char word to break across multiple lines");
+        assert!(
+            lines.len() > 1,
+            "expected the 60-char word to break across multiple lines"
+        );
         for line in &lines {
             assert!(measure_px(line, font_size) <= max_px);
         }
@@ -257,6 +274,10 @@ mod tests {
             "wrap of a 1MB token took {elapsed:?} -- likely quadratic behavior"
         );
         let echoed: usize = lines.iter().map(String::len).sum();
-        assert!(echoed >= word.len(), "output length {echoed} < input length {}", word.len());
+        assert!(
+            echoed >= word.len(),
+            "output length {echoed} < input length {}",
+            word.len()
+        );
     }
 }

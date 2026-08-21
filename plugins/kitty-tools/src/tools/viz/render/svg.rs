@@ -141,15 +141,18 @@ impl SvgCanvas {
 
     pub fn rect(&mut self, x: f32, y: f32, w: f32, h: f32, class: &str) {
         self.bounds.include_rect(x, y, w, h);
-        self.body
-            .push_str(&format!(r#"<rect x="{x:.1}" y="{y:.1}" width="{w:.1}" height="{h:.1}" class="{class}"/>"#));
+        self.body.push_str(&format!(
+            r#"<rect x="{x:.1}" y="{y:.1}" width="{w:.1}" height="{h:.1}" class="{class}"/>"#
+        ));
         self.body.push('\n');
     }
 
     pub fn text_line(&mut self, x: f32, y: f32, class: &str, content: &str) {
         include_text(&mut self.bounds, x, y, content, class_font_px(class), class);
-        self.body
-            .push_str(&format!(r#"<text x="{x:.1}" y="{y:.1}" class="{class}">{}</text>"#, escape_text(content)));
+        self.body.push_str(&format!(
+            r#"<text x="{x:.1}" y="{y:.1}" class="{class}">{}</text>"#,
+            escape_text(content)
+        ));
         self.body.push('\n');
     }
 
@@ -160,16 +163,27 @@ impl SvgCanvas {
     /// user's `system-ui` font differs from the crate's metric table. When the
     /// text already fits (measurement over-estimates by design), no attribute
     /// is emitted and the text renders undistorted.
-    pub fn text_line_fit(&mut self, x: f32, y: f32, class: &str, content: &str, font_size: f32, max_width: f32) {
+    pub fn text_line_fit(
+        &mut self,
+        x: f32,
+        y: f32,
+        class: &str,
+        content: &str,
+        font_size: f32,
+        max_width: f32,
+    ) {
         let measured = text::measure_px(content, font_size);
         include_text(&mut self.bounds, x, y, content, font_size, class);
         let text = escape_text(content);
         let mut tspans = format!(r#"<tspan x="{x:.1}">{text}</tspan>"#);
         if max_width > 1.0 && measured > max_width {
-            tspans = format!(r#"<tspan x="{x:.1}" textLength="{max_width:.1}" lengthAdjust="spacingAndGlyphs">{text}</tspan>"#);
+            tspans = format!(
+                r#"<tspan x="{x:.1}" textLength="{max_width:.1}" lengthAdjust="spacingAndGlyphs">{text}</tspan>"#
+            );
         }
-        self.body
-            .push_str(&format!(r#"<text x="{x:.1}" y="{y:.1}" class="{class}">{tspans}</text>"#));
+        self.body.push_str(&format!(
+            r#"<text x="{x:.1}" y="{y:.1}" class="{class}">{tspans}</text>"#
+        ));
         self.body.push('\n');
     }
 
@@ -188,10 +202,19 @@ impl SvgCanvas {
         let n = lines.len() as f32;
         let mut tspans = String::new();
         for (i, line) in lines.iter().enumerate() {
-            let dy = if i == 0 { -(n - 1.0) * line_h / 2.0 } else { line_h };
-            tspans.push_str(&format!(r#"<tspan x="{x:.1}" dy="{dy:.1}">{}</tspan>"#, escape_text(line)));
+            let dy = if i == 0 {
+                -(n - 1.0) * line_h / 2.0
+            } else {
+                line_h
+            };
+            tspans.push_str(&format!(
+                r#"<tspan x="{x:.1}" dy="{dy:.1}">{}</tspan>"#,
+                escape_text(line)
+            ));
         }
-        self.body.push_str(&format!(r#"<text x="{x:.1}" y="{y:.1}" class="{class}">{tspans}</text>"#));
+        self.body.push_str(&format!(
+            r#"<text x="{x:.1}" y="{y:.1}" class="{class}">{tspans}</text>"#
+        ));
         self.body.push('\n');
     }
 
@@ -201,14 +224,27 @@ impl SvgCanvas {
     /// never paint wider than the container. Lines that already fit are
     /// untouched (no glyph distortion).
     #[allow(clippy::too_many_arguments)]
-    pub fn text_lines_fit(&mut self, x: f32, y: f32, class: &str, lines: &[String], line_h: f32, font_size: f32, max_width: f32) {
+    pub fn text_lines_fit(
+        &mut self,
+        x: f32,
+        y: f32,
+        class: &str,
+        lines: &[String],
+        line_h: f32,
+        font_size: f32,
+        max_width: f32,
+    ) {
         if lines.is_empty() {
             return;
         }
         let n = lines.len() as f32;
         let mut tspans = String::new();
         for (i, line) in lines.iter().enumerate() {
-            let dy = if i == 0 { -(n - 1.0) * line_h / 2.0 } else { line_h };
+            let dy = if i == 0 {
+                -(n - 1.0) * line_h / 2.0
+            } else {
+                line_h
+            };
             let text = escape_text(line);
             let measured = text::measure_px(line, font_size);
             include_text(&mut self.bounds, x, y, line, font_size, class);
@@ -220,14 +256,17 @@ impl SvgCanvas {
                 tspans.push_str(&format!(r#"<tspan x="{x:.1}" dy="{dy:.1}">{text}</tspan>"#));
             }
         }
-        self.body.push_str(&format!(r#"<text x="{x:.1}" y="{y:.1}" class="{class}">{tspans}</text>"#));
+        self.body.push_str(&format!(
+            r#"<text x="{x:.1}" y="{y:.1}" class="{class}">{tspans}</text>"#
+        ));
         self.body.push('\n');
     }
 
     pub fn line(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, class: &str) {
         self.bounds.include_point(x1.max(x2), y1.max(y2));
-        self.body
-            .push_str(&format!(r#"<line x1="{x1:.1}" y1="{y1:.1}" x2="{x2:.1}" y2="{y2:.1}" class="{class}"/>"#));
+        self.body.push_str(&format!(
+            r#"<line x1="{x1:.1}" y1="{y1:.1}" x2="{x2:.1}" y2="{y2:.1}" class="{class}"/>"#
+        ));
         self.body.push('\n');
     }
 
@@ -235,8 +274,13 @@ impl SvgCanvas {
         for &(x, y) in points {
             self.bounds.include_point(x, y);
         }
-        let pts: String = points.iter().map(|(x, y)| format!("{x:.1},{y:.1}")).collect::<Vec<_>>().join(" ");
-        self.body.push_str(&format!(r#"<polygon points="{pts}" class="{class}"/>"#));
+        let pts: String = points
+            .iter()
+            .map(|(x, y)| format!("{x:.1},{y:.1}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        self.body
+            .push_str(&format!(r#"<polygon points="{pts}" class="{class}"/>"#));
         self.body.push('\n');
     }
 
@@ -247,13 +291,16 @@ impl SvgCanvas {
     pub fn path(&mut self, d: &str, class: &str, bbox: (f32, f32, f32, f32)) {
         let (x, y, w, h) = bbox;
         self.bounds.include_rect(x, y, w, h);
-        self.body.push_str(&format!(r#"<path d="{d}" class="{class}"/>"#));
+        self.body
+            .push_str(&format!(r#"<path d="{d}" class="{class}"/>"#));
         self.body.push('\n');
     }
 
     pub fn circle(&mut self, cx: f32, cy: f32, r: f32, class: &str) {
         self.bounds.include_rect(cx - r, cy - r, 2.0 * r, 2.0 * r);
-        self.body.push_str(&format!(r#"<circle cx="{cx:.1}" cy="{cy:.1}" r="{r:.1}" class="{class}"/>"#));
+        self.body.push_str(&format!(
+            r#"<circle cx="{cx:.1}" cy="{cy:.1}" r="{r:.1}" class="{class}"/>"#
+        ));
         self.body.push('\n');
     }
 
@@ -275,7 +322,14 @@ impl SvgCanvas {
 /// document: the shared `<defs>`, a full-canvas background rect, the title
 /// bar, and `<title>`/`<desc>` for screen readers. `width`/`height` should
 /// already include `CANVAS_MARGIN`.
-pub fn document(defs: &str, title: &str, description: &str, width: f32, height: f32, body: &str) -> String {
+pub fn document(
+    defs: &str,
+    title: &str,
+    description: &str,
+    width: f32,
+    height: f32,
+    body: &str,
+) -> String {
     let title_attr = escape_attr(title);
     let title_text = escape_text(title);
     let desc_text = escape_text(description);
@@ -319,15 +373,28 @@ mod tests {
     #[test]
     fn text_line_fit_squeezes_a_too_wide_line_but_leaves_a_fit_one_alone() {
         let mut wide = SvgCanvas::new();
-        wide.text_line_fit(0.0, 0.0, "node-text", "A label that is far wider than the box", 12.5, 40.0);
+        wide.text_line_fit(
+            0.0,
+            0.0,
+            "node-text",
+            "A label that is far wider than the box",
+            12.5,
+            40.0,
+        );
         let (body, _) = wide.into_parts();
-        assert!(body.contains(r#"textLength="40.0""#), "too-wide line must get the textLength backstop: {body}");
+        assert!(
+            body.contains(r#"textLength="40.0""#),
+            "too-wide line must get the textLength backstop: {body}"
+        );
         assert!(body.contains("lengthAdjust=\"spacingAndGlyphs\""));
 
         let mut fits = SvgCanvas::new();
         fits.text_line_fit(0.0, 0.0, "node-text", "Ok", 12.5, 40.0);
         let (body, _) = fits.into_parts();
-        assert!(!body.contains("textLength"), "a fitting line must render undistorted: {body}");
+        assert!(
+            !body.contains("textLength"),
+            "a fitting line must render undistorted: {body}"
+        );
     }
 
     #[test]
@@ -348,7 +415,10 @@ mod tests {
             bounds.width(),
             w / 2.0
         );
-        assert!(bounds.height() > 0.0, "text contributes vertical extent too");
+        assert!(
+            bounds.height() > 0.0,
+            "text contributes vertical extent too"
+        );
     }
 
     #[test]
@@ -391,13 +461,20 @@ mod tests {
             0.0,
             0.0,
             "node-text",
-            &["short".to_string(), "this second line is far too wide for the given budget".to_string()],
+            &[
+                "short".to_string(),
+                "this second line is far too wide for the given budget".to_string(),
+            ],
             15.0,
             12.5,
             40.0,
         );
         let (body, _) = c.into_parts();
-        assert_eq!(body.matches("textLength").count(), 1, "only the overflowing line gets clamped: {body}");
+        assert_eq!(
+            body.matches("textLength").count(),
+            1,
+            "only the overflowing line gets clamped: {body}"
+        );
     }
 
     #[test]
@@ -416,7 +493,14 @@ mod tests {
         use quick_xml::events::Event;
         use quick_xml::reader::Reader;
 
-        let doc = document("<defs></defs>", "T", "D", 200.0, 100.0, r#"<rect x="0" y="0" width="10" height="10" class="node-box"/>"#);
+        let doc = document(
+            "<defs></defs>",
+            "T",
+            "D",
+            200.0,
+            100.0,
+            r#"<rect x="0" y="0" width="10" height="10" class="node-box"/>"#,
+        );
         let mut reader = Reader::from_str(&doc);
         loop {
             match reader.read_event() {

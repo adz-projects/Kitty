@@ -6,7 +6,10 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use crate::tools::viz::layout::{draw_node, size_node_capped, NodeVisual, SizedNode, GAP_X, GAP_Y, MAX_CONTENT_W, MAX_NODE_W, MIN_LAYER_GAP, MIN_NODE_H, MIN_NODE_W};
+use crate::tools::viz::layout::{
+    draw_node, size_node_capped, NodeVisual, SizedNode, GAP_X, GAP_Y, MAX_CONTENT_W, MAX_NODE_W,
+    MIN_LAYER_GAP, MIN_NODE_H, MIN_NODE_W,
+};
 use crate::tools::viz::model::{Step, StepType};
 use crate::tools::viz::render::svg::{SvgCanvas, CANVAS_MARGIN, TITLE_BAND};
 use crate::tools::viz::text;
@@ -21,7 +24,11 @@ fn decision_badge(s: &Step) -> Option<String> {
 }
 
 fn resolve_edges(steps: &[Step]) -> (HashMap<&str, usize>, Vec<(usize, usize)>) {
-    let id_to_index: HashMap<&str, usize> = steps.iter().enumerate().filter_map(|(i, s)| s.id.as_deref().map(|id| (id, i))).collect();
+    let id_to_index: HashMap<&str, usize> = steps
+        .iter()
+        .enumerate()
+        .filter_map(|(i, s)| s.id.as_deref().map(|id| (id, i)))
+        .collect();
     let edges: Vec<(usize, usize)> = steps
         .iter()
         .enumerate()
@@ -31,7 +38,9 @@ fn resolve_edges(steps: &[Step]) -> (HashMap<&str, usize>, Vec<(usize, usize)>) 
             // instead of trying to move the map itself out from under the
             // outer `FnMut` closure on the first iteration.
             let id_to_index = &id_to_index;
-            s.next.iter().filter_map(move |nid| id_to_index.get(nid.as_str()).map(|&j| (i, j)))
+            s.next
+                .iter()
+                .filter_map(move |nid| id_to_index.get(nid.as_str()).map(|&j| (i, j)))
         })
         .collect();
     (id_to_index, edges)
@@ -83,7 +92,12 @@ fn compute_layers(n: usize, edges: &[(usize, usize)]) -> Vec<usize> {
         }
     }
 
-    let mut next_layer = layer.iter().filter_map(|l| *l).max().map(|m| m + 1).unwrap_or(0);
+    let mut next_layer = layer
+        .iter()
+        .filter_map(|l| *l)
+        .max()
+        .map(|m| m + 1)
+        .unwrap_or(0);
     for l in layer.iter_mut() {
         if l.is_none() {
             *l = Some(next_layer);
@@ -114,7 +128,12 @@ fn order_layers(n: usize, layer: &[usize], edges: &[(usize, usize)]) -> Vec<Vec<
         }
     };
     for bucket in buckets.iter_mut().skip(1) {
-        bucket.sort_by(|&a, &b| barycenter(&preds[a]).partial_cmp(&barycenter(&preds[b])).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b)));
+        bucket.sort_by(|&a, &b| {
+            barycenter(&preds[a])
+                .partial_cmp(&barycenter(&preds[b]))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.cmp(&b))
+        });
     }
     buckets
 }
@@ -122,7 +141,11 @@ fn order_layers(n: usize, layer: &[usize], edges: &[(usize, usize)]) -> Vec<Vec<
 fn draw_branch_tag(canvas: &mut SvgCanvas, cx: f32, cy: f32, label: &str, dark: bool) {
     let w = (text::measure_px(label, 10.0) + 16.0).max(28.0);
     let h = 22.0;
-    let (bg_class, text_class) = if dark { ("tag-bg-dark", "tag-text-light") } else { ("tag-bg-light", "tag-text-dark") };
+    let (bg_class, text_class) = if dark {
+        ("tag-bg-dark", "tag-text-light")
+    } else {
+        ("tag-bg-light", "tag-text-dark")
+    };
     canvas.rect(cx - w / 2.0, cy - h / 2.0, w, h, bg_class);
     canvas.text_line(cx, cy, text_class, label);
 }
@@ -137,17 +160,26 @@ pub fn render_flowchart(steps: &[Step]) -> (String, f32, f32) {
     // Readability compression: size nodes (reducing the width cap on each
     // iteration if needed) until the widest layer fits `MAX_CONTENT_W`.
     let mut cap = MAX_NODE_W;
-    let mut sized: Vec<SizedNode> = steps.iter().map(|s| size_node_capped(&s.text, decision_badge(s).as_deref(), cap)).collect();
+    let mut sized: Vec<SizedNode> = steps
+        .iter()
+        .map(|s| size_node_capped(&s.text, decision_badge(s).as_deref(), cap))
+        .collect();
     for _ in 0..4 {
         let widest = layers
             .iter()
-            .map(|nodes| nodes.iter().map(|&i| sized[i].w).sum::<f32>() + GAP_X * (nodes.len() as f32 - 1.0).max(0.0))
+            .map(|nodes| {
+                nodes.iter().map(|&i| sized[i].w).sum::<f32>()
+                    + GAP_X * (nodes.len() as f32 - 1.0).max(0.0)
+            })
             .fold(0.0_f32, f32::max);
         if widest <= MAX_CONTENT_W {
             break;
         }
         cap = (cap * (MAX_CONTENT_W - MIN_LAYER_GAP * 2.0) / widest).clamp(MIN_NODE_W, MAX_NODE_W);
-        sized = steps.iter().map(|s| size_node_capped(&s.text, decision_badge(s).as_deref(), cap)).collect();
+        sized = steps
+            .iter()
+            .map(|s| size_node_capped(&s.text, decision_badge(s).as_deref(), cap))
+            .collect();
     }
 
     // Per-layer gap: squeeze gaps to fit the budget before shrinking nodes
@@ -182,7 +214,11 @@ pub fn render_flowchart(steps: &[Step]) -> (String, f32, f32) {
             nodes.iter().map(|&i| sized[i].w).sum::<f32>() + gap * (nodes.len() as f32 - 1.0)
         }
     };
-    let widths: Vec<f32> = layers.iter().enumerate().map(|(l, nodes)| layer_width(nodes, gaps[l])).collect();
+    let widths: Vec<f32> = layers
+        .iter()
+        .enumerate()
+        .map(|(l, nodes)| layer_width(nodes, gaps[l]))
+        .collect();
     let max_w = widths.iter().cloned().fold(0.0_f32, f32::max);
 
     let mut center_x = vec![0.0f32; n];
@@ -212,7 +248,11 @@ pub fn render_flowchart(steps: &[Step]) -> (String, f32, f32) {
         if step.step_type != StepType::Decision {
             continue;
         }
-        let outgoing: Vec<usize> = step.next.iter().filter_map(|nid| id_to_index.get(nid.as_str()).copied()).collect();
+        let outgoing: Vec<usize> = step
+            .next
+            .iter()
+            .filter_map(|nid| id_to_index.get(nid.as_str()).copied())
+            .collect();
         if outgoing.len() < 2 {
             continue;
         }
@@ -227,7 +267,11 @@ pub fn render_flowchart(steps: &[Step]) -> (String, f32, f32) {
             // Clamping horizontally keeps it inside the canvas.
             let tag_x = ((x1 + x2) / 2.0).clamp(LEFT_X + 24.0, LEFT_X + max_w - 24.0);
             let tag_y = (y1 + y2) / 2.0;
-            let (label, dark) = if branch_idx == 0 { ("YES", true) } else { ("NO", false) };
+            let (label, dark) = if branch_idx == 0 {
+                ("YES", true)
+            } else {
+                ("NO", false)
+            };
             draw_branch_tag(&mut canvas, tag_x, tag_y, label, dark);
         }
     }
@@ -239,12 +283,20 @@ pub fn render_flowchart(steps: &[Step]) -> (String, f32, f32) {
             top_y[i],
             n.w,
             n.h,
-            NodeVisual { lines: &n.lines, badge: n.badge.as_deref(), step_type: steps[i].step_type },
+            NodeVisual {
+                lines: &n.lines,
+                badge: n.badge.as_deref(),
+                step_type: steps[i].step_type,
+            },
         );
     }
 
     let (body, bounds) = canvas.into_parts();
-    (body, bounds.width() + CANVAS_MARGIN, bounds.height() + CANVAS_MARGIN)
+    (
+        body,
+        bounds.width() + CANVAS_MARGIN,
+        bounds.height() + CANVAS_MARGIN,
+    )
 }
 
 fn tree_depths(n: usize, roots: &[usize], children: &[Vec<usize>]) -> Vec<usize> {
@@ -275,25 +327,38 @@ fn post_order(node: usize, children: &[Vec<usize>], order: &mut Vec<usize>, visi
     order.push(node);
 }
 
-fn subtree_widths(n: usize, order: &[usize], children: &[Vec<usize>], sized: &[SizedNode]) -> Vec<f32> {
+fn subtree_widths(
+    n: usize,
+    order: &[usize],
+    children: &[Vec<usize>],
+    sized: &[SizedNode],
+) -> Vec<f32> {
     let mut w = vec![0.0f32; n];
     for &i in order {
         if children[i].is_empty() {
             w[i] = sized[i].w;
         } else {
-            let sum: f32 = children[i].iter().map(|&c| w[c]).sum::<f32>() + GAP_X * (children[i].len() as f32 - 1.0).max(0.0);
+            let sum: f32 = children[i].iter().map(|&c| w[c]).sum::<f32>()
+                + GAP_X * (children[i].len() as f32 - 1.0).max(0.0);
             w[i] = sized[i].w.max(sum);
         }
     }
     w
 }
 
-fn place_subtree(node: usize, x_start: f32, children: &[Vec<usize>], subtree_w: &[f32], center_x: &mut [f32]) {
+fn place_subtree(
+    node: usize,
+    x_start: f32,
+    children: &[Vec<usize>],
+    subtree_w: &[f32],
+    center_x: &mut [f32],
+) {
     center_x[node] = x_start + subtree_w[node] / 2.0;
     if children[node].is_empty() {
         return;
     }
-    let total_children_w: f32 = children[node].iter().map(|&c| subtree_w[c]).sum::<f32>() + GAP_X * (children[node].len() as f32 - 1.0).max(0.0);
+    let total_children_w: f32 = children[node].iter().map(|&c| subtree_w[c]).sum::<f32>()
+        + GAP_X * (children[node].len() as f32 - 1.0).max(0.0);
     let mut cursor = center_x[node] - total_children_w / 2.0;
     for &c in &children[node] {
         place_subtree(c, cursor, children, subtree_w, center_x);
@@ -307,8 +372,15 @@ fn place_subtree(node: usize, x_start: f32, children: &[Vec<usize>], subtree_w: 
 pub fn render_tree(steps: &[Step]) -> (String, f32, f32) {
     let n = steps.len();
     let (id_to_index, _) = resolve_edges(steps);
-    let children: Vec<Vec<usize>> =
-        steps.iter().map(|s| s.next.iter().filter_map(|nid| id_to_index.get(nid.as_str()).copied()).collect()).collect();
+    let children: Vec<Vec<usize>> = steps
+        .iter()
+        .map(|s| {
+            s.next
+                .iter()
+                .filter_map(|nid| id_to_index.get(nid.as_str()).copied())
+                .collect()
+        })
+        .collect();
     let referenced: HashSet<usize> = children.iter().flatten().copied().collect();
     let mut roots: Vec<usize> = (0..n).filter(|i| !referenced.contains(i)).collect();
     if roots.is_empty() {
@@ -318,7 +390,10 @@ pub fn render_tree(steps: &[Step]) -> (String, f32, f32) {
     // Readability compression: shrink the node-width cap until the widest root
     // subtree fits `MAX_CONTENT_W` (plus the inter-root spacing).
     let mut cap = MAX_NODE_W;
-    let mut sized: Vec<SizedNode> = steps.iter().map(|s| size_node_capped(&s.text, None, cap)).collect();
+    let mut sized: Vec<SizedNode> = steps
+        .iter()
+        .map(|s| size_node_capped(&s.text, None, cap))
+        .collect();
     for _ in 0..4 {
         let mut visited = vec![false; n];
         let mut order: Vec<usize> = Vec::with_capacity(n);
@@ -326,12 +401,16 @@ pub fn render_tree(steps: &[Step]) -> (String, f32, f32) {
             post_order(r, &children, &mut order, &mut visited);
         }
         let subtree_w = subtree_widths(n, &order, &children, &sized);
-        let total: f32 = roots.iter().map(|&r| subtree_w[r]).sum::<f32>() + GAP_X * 2.0 * (roots.len() as f32 - 1.0).max(0.0);
+        let total: f32 = roots.iter().map(|&r| subtree_w[r]).sum::<f32>()
+            + GAP_X * 2.0 * (roots.len() as f32 - 1.0).max(0.0);
         if total <= MAX_CONTENT_W {
             break;
         }
         cap = (cap * (MAX_CONTENT_W - 40.0) / total).clamp(MIN_NODE_W, MAX_NODE_W);
-        sized = steps.iter().map(|s| size_node_capped(&s.text, None, cap)).collect();
+        sized = steps
+            .iter()
+            .map(|s| size_node_capped(&s.text, None, cap))
+            .collect();
     }
 
     let depth = tree_depths(n, &roots, &children);
@@ -368,7 +447,9 @@ pub fn render_tree(steps: &[Step]) -> (String, f32, f32) {
             let (x1, x2) = (center_x[i], center_x[c]);
             let y2 = row_y[depth[c]] + (row_h[depth[c]] - sized[c].h) / 2.0;
             let mid_y = (y1 + y2) / 2.0;
-            let d = format!("M {x1:.1},{y1:.1} L {x1:.1},{mid_y:.1} L {x2:.1},{mid_y:.1} L {x2:.1},{y2:.1}");
+            let d = format!(
+                "M {x1:.1},{y1:.1} L {x1:.1},{mid_y:.1} L {x2:.1},{mid_y:.1} L {x2:.1},{y2:.1}"
+            );
             let bbox = (x1.min(x2), y1.min(y2), (x1 - x2).abs(), (y2 - y1).abs());
             canvas.path(&d, "flow-path", bbox);
         }
@@ -381,12 +462,20 @@ pub fn render_tree(steps: &[Step]) -> (String, f32, f32) {
             y,
             sized[i].w,
             sized[i].h,
-            NodeVisual { lines: &sized[i].lines, badge: None, step_type: StepType::Process },
+            NodeVisual {
+                lines: &sized[i].lines,
+                badge: None,
+                step_type: StepType::Process,
+            },
         );
     }
 
     let (body, bounds) = canvas.into_parts();
-    (body, bounds.width() + CANVAS_MARGIN, bounds.height() + CANVAS_MARGIN)
+    (
+        body,
+        bounds.width() + CANVAS_MARGIN,
+        bounds.height() + CANVAS_MARGIN,
+    )
 }
 
 #[cfg(test)]
@@ -394,7 +483,12 @@ mod tests {
     use super::*;
 
     fn step(id: &str, text: &str, next: &[&str]) -> Step {
-        Step { id: Some(id.to_string()), text: text.to_string(), next: next.iter().map(|s| s.to_string()).collect(), ..Default::default() }
+        Step {
+            id: Some(id.to_string()),
+            text: text.to_string(),
+            next: next.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -410,8 +504,14 @@ mod tests {
         assert!(body.contains("Payment ok?"));
         assert!(body.contains("Ship it"));
         assert!(body.contains("Cancel order"));
-        assert!(!body.contains("Receive API Request"), "must not fall back to the retired HTTP-auth clipart");
-        assert!(!body.contains("Inspect Bearer Token"), "must not fall back to the retired HTTP-auth clipart");
+        assert!(
+            !body.contains("Receive API Request"),
+            "must not fall back to the retired HTTP-auth clipart"
+        );
+        assert!(
+            !body.contains("Inspect Bearer Token"),
+            "must not fall back to the retired HTTP-auth clipart"
+        );
     }
 
     #[test]
@@ -423,14 +523,21 @@ mod tests {
             step("d", "Merge", &[]),
         ];
         let layer = compute_layers(4, &[(0, 1), (0, 2), (1, 3), (2, 3)]);
-        assert_eq!(layer[3], 2, "merge node must be laid out after both of its predecessors");
+        assert_eq!(
+            layer[3], 2,
+            "merge node must be laid out after both of its predecessors"
+        );
         let (body, _, _) = render_flowchart(&steps);
         assert!(body.contains("Merge"));
     }
 
     #[test]
     fn flowchart_decision_with_two_branches_gets_yes_no_tags() {
-        let steps = vec![step("a", "Check?", &["b", "c"]), step("b", "Yes path", &[]), step("c", "No path", &[])];
+        let steps = vec![
+            step("a", "Check?", &["b", "c"]),
+            step("b", "Yes path", &[]),
+            step("c", "No path", &[]),
+        ];
         let mut steps = steps;
         steps[0].step_type = StepType::Decision;
         let (body, _, _) = render_flowchart(&steps);
@@ -448,7 +555,12 @@ mod tests {
     }
 
     fn plain_step(text: &str, next: &[&str], id: &str) -> Step {
-        Step { id: Some(id.to_string()), text: text.to_string(), next: next.iter().map(|s| s.to_string()).collect(), ..Default::default() }
+        Step {
+            id: Some(id.to_string()),
+            text: text.to_string(),
+            next: next.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -485,18 +597,31 @@ mod tests {
         ];
         let (body, w, h) = render_flowchart(&steps);
         for (x, y, rw, rh) in extract_rects(&body) {
-            assert!(x + rw <= w + 0.5, "rect exceeds canvas width: x={x} rw={rw} w={w}");
-            assert!(y + rh <= h + 0.5, "rect exceeds canvas height: y={y} rh={rh} h={h}");
+            assert!(
+                x + rw <= w + 0.5,
+                "rect exceeds canvas width: x={x} rw={rw} w={w}"
+            );
+            assert!(
+                y + rh <= h + 0.5,
+                "rect exceeds canvas height: y={y} rh={rh} h={h}"
+            );
         }
     }
 
     fn extract_rects(svg: &str) -> Vec<(f32, f32, f32, f32)> {
         let mut out = Vec::new();
         for cap_start in svg.match_indices("<rect ") {
-            let tag_end = svg[cap_start.0..].find('/').map(|i| cap_start.0 + i).unwrap_or(svg.len());
+            let tag_end = svg[cap_start.0..]
+                .find('/')
+                .map(|i| cap_start.0 + i)
+                .unwrap_or(svg.len());
             let tag = &svg[cap_start.0..tag_end];
             let get = |attr: &str| -> f32 {
-                tag.split(&format!(r#"{attr}=""#)).nth(1).and_then(|rest| rest.split('"').next()).and_then(|v| v.parse().ok()).unwrap_or(0.0)
+                tag.split(&format!(r#"{attr}=""#))
+                    .nth(1)
+                    .and_then(|rest| rest.split('"').next())
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0.0)
             };
             out.push((get("x"), get("y"), get("width"), get("height")));
         }

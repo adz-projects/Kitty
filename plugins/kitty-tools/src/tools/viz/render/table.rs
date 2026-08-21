@@ -8,13 +8,21 @@ use crate::tools::viz::escape::escape_text;
 
 const TABLE_CSS: &str = include_str!("../assets/table.css");
 
-pub fn render(title: &str, headers: &[String], rows: &[Vec<Value>], summary: Option<&str>) -> String {
+pub fn render(
+    title: &str,
+    headers: &[String],
+    rows: &[Vec<Value>],
+    summary: Option<&str>,
+) -> String {
     let summary_html = summary
         .filter(|s| !s.trim().is_empty())
         .map(|s| format!(r#"<p class="sr-only">{}</p>"#, escape_text(s)))
         .unwrap_or_default();
 
-    let header_cells: String = headers.iter().map(|h| format!(r#"<th scope="col">{}</th>"#, escape_text(h))).collect();
+    let header_cells: String = headers
+        .iter()
+        .map(|h| format!(r#"<th scope="col">{}</th>"#, escape_text(h)))
+        .collect();
 
     let body_rows: String = rows
         .iter()
@@ -59,7 +67,10 @@ pub fn render(title: &str, headers: &[String], rows: &[Vec<Value>], summary: Opt
 /// visual hiding — used by chart output to give screen readers the exact
 /// numbers behind a chart the SVG only shows as bars/lines.
 pub fn render_sr_only(title: &str, headers: &[String], rows: &[Vec<Value>]) -> String {
-    let header_cells: String = headers.iter().map(|h| format!(r#"<th scope="col">{}</th>"#, escape_text(h))).collect();
+    let header_cells: String = headers
+        .iter()
+        .map(|h| format!(r#"<th scope="col">{}</th>"#, escape_text(h)))
+        .collect();
     let body_rows: String = rows
         .iter()
         .map(|row| {
@@ -101,7 +112,12 @@ mod tests {
 
     #[test]
     fn renders_headers_and_rows() {
-        let html = render("My Table", &["A".to_string(), "B".to_string()], &[vec![json!("1"), json!("2")]], None);
+        let html = render(
+            "My Table",
+            &["A".to_string(), "B".to_string()],
+            &[vec![json!("1"), json!("2")]],
+            None,
+        );
         assert!(html.contains("My Table"));
         assert!(html.contains(r#"<th scope="row">1</th>"#));
         assert!(html.contains("<td>2</td>"));
@@ -109,28 +125,47 @@ mod tests {
 
     #[test]
     fn escapes_hostile_cell_content() {
-        let html = render("T", &["H".to_string()], &[vec![json!("<script>alert(1)</script>")]], None);
+        let html = render(
+            "T",
+            &["H".to_string()],
+            &[vec![json!("<script>alert(1)</script>")]],
+            None,
+        );
         assert!(!html.contains("<script>"));
         assert!(html.contains("&lt;script&gt;"));
     }
 
     #[test]
     fn escapes_hostile_title_and_summary() {
-        let html = render("<b>T</b>", &["H".to_string()], &[vec![json!("x")]], Some("<i>S</i>"));
+        let html = render(
+            "<b>T</b>",
+            &["H".to_string()],
+            &[vec![json!("x")]],
+            Some("<i>S</i>"),
+        );
         assert!(!html.contains("<b>"));
         assert!(!html.contains("<i>"));
     }
 
     #[test]
     fn null_cell_renders_empty_and_bool_renders_word() {
-        let html = render("T", &["A".to_string(), "B".to_string()], &[vec![json!(null), json!(true)]], None);
+        let html = render(
+            "T",
+            &["A".to_string(), "B".to_string()],
+            &[vec![json!(null), json!(true)]],
+            None,
+        );
         assert!(html.contains(r#"<th scope="row"></th>"#));
         assert!(html.contains("<td>true</td>"));
     }
 
     #[test]
     fn sr_only_table_carries_scope_row_on_first_column() {
-        let html = render_sr_only("Chart data", &["Category".to_string(), "Revenue".to_string()], &[vec![json!("Q1"), json!(12.4)]]);
+        let html = render_sr_only(
+            "Chart data",
+            &["Category".to_string(), "Revenue".to_string()],
+            &[vec![json!("Q1"), json!(12.4)]],
+        );
         assert!(html.contains(r#"class="sr-only""#));
         assert!(html.contains(r#"<th scope="row">Q1</th>"#));
     }

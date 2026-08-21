@@ -20,8 +20,8 @@ use calamine::{open_workbook_auto, Data, Range, Reader};
 use serde_json::{json, Value};
 
 use crate::envelope::{error_response, success_response};
-use crate::query_filter::filter_by_query;
 use crate::paths::{path_within_home, resolve};
+use crate::query_filter::filter_by_query;
 
 /// Same default as the Python plugin's `EXCEL_MAX_ROWS_DEFAULT` — rows beyond
 /// this per page are exposed via `next_offset`, never dumped unbounded.
@@ -42,13 +42,18 @@ const EXCEL_MAX_QUERY_SCAN_ROWS: usize = 100_000;
 /// True when the file's metadata size is past `EXCEL_MAX_FILE_BYTES` — the
 /// check that keeps giant workbooks from being parsed into memory at all.
 fn file_size_exceeds(resolved: &Path) -> bool {
-    std::fs::metadata(resolved).map(|m| m.len() > EXCEL_MAX_FILE_BYTES).unwrap_or(false)
+    std::fs::metadata(resolved)
+        .map(|m| m.len() > EXCEL_MAX_FILE_BYTES)
+        .unwrap_or(false)
 }
 
 fn too_large(resolved: &Path) -> String {
     error_response(
         "XLSX_TOO_LARGE",
-        &format!("File is larger than the {} byte read limit", EXCEL_MAX_FILE_BYTES),
+        &format!(
+            "File is larger than the {} byte read limit",
+            EXCEL_MAX_FILE_BYTES
+        ),
         Some(&resolved.to_string_lossy()),
         Some("Split the workbook, or export the needed sheet/range to CSV and use lean_file_read."),
     )
@@ -118,7 +123,11 @@ fn display_data(d: &Data) -> Option<String> {
         Data::String(s) => Some(s.clone()),
         Data::Int(i) => Some(i.to_string()),
         Data::Float(f) => Some(float_to_display(*f)),
-        Data::Bool(b) => Some(if *b { "True".to_string() } else { "False".to_string() }),
+        Data::Bool(b) => Some(if *b {
+            "True".to_string()
+        } else {
+            "False".to_string()
+        }),
         Data::DateTime(dt) => dt
             .as_datetime()
             .map(|ndt| ndt.format("%Y-%m-%d %H:%M:%S").to_string()),
@@ -150,7 +159,9 @@ fn col_letter_to_num(s: &str) -> Option<u32> {
         // the `u32` this returns (audit #129): a long letter run (~14+
         // letters) used to overflow the `u64` accumulator mid-loop and
         // silently wrap to a wrong column.
-        col = col.checked_mul(26)?.checked_add(((c as u8) - b'A' + 1) as u64)?;
+        col = col
+            .checked_mul(26)?
+            .checked_add(((c as u8) - b'A' + 1) as u64)?;
         if col > u32::MAX as u64 {
             return None;
         }
@@ -180,10 +191,7 @@ fn parse_range_boundaries(s: &str) -> Option<(u32, u32, u32, u32)> {
 
 /// Parses "A1" into `(row, col)` (1-based).
 fn parse_cell(s: &str) -> Option<(u32, u32)> {
-    let letters: String = s
-        .chars()
-        .take_while(|c| c.is_ascii_alphabetic())
-        .collect();
+    let letters: String = s.chars().take_while(|c| c.is_ascii_alphabetic()).collect();
     if letters.is_empty() {
         return None;
     }
@@ -202,7 +210,12 @@ pub fn excel_inspect(path: &str) -> String {
         return err;
     }
     if !resolved.exists() {
-        return error_response("XLSX_NOT_FOUND", "Spreadsheet does not exist", Some(&resolved.to_string_lossy()), None);
+        return error_response(
+            "XLSX_NOT_FOUND",
+            "Spreadsheet does not exist",
+            Some(&resolved.to_string_lossy()),
+            None,
+        );
     }
     if file_size_exceeds(&resolved) {
         return too_large(&resolved);
@@ -211,20 +224,30 @@ pub fn excel_inspect(path: &str) -> String {
     let mut wb = match open(&resolved) {
         Ok(wb) => wb,
         Err(e) => {
-            return error_response("XLSX_CORRUPT", &format!("Cannot open workbook: {e}"), Some(&resolved.to_string_lossy()), None);
+            return error_response(
+                "XLSX_CORRUPT",
+                &format!("Cannot open workbook: {e}"),
+                Some(&resolved.to_string_lossy()),
+                None,
+            );
         }
     };
 
     let sheet_names = wb.sheet_names();
     if sheet_names.is_empty() {
-        return success_response(json!({
-            "sheet_names": [],
-            "active_sheet": Value::Null,
-            "headers": [],
-            "dimensions": Value::Null,
-            "max_rows": 0,
-            "max_cols": 0,
-        }), None, false, None);
+        return success_response(
+            json!({
+                "sheet_names": [],
+                "active_sheet": Value::Null,
+                "headers": [],
+                "dimensions": Value::Null,
+                "max_rows": 0,
+                "max_cols": 0,
+            }),
+            None,
+            false,
+            None,
+        );
     }
 
     let active = sheet_names[0].clone();
@@ -262,14 +285,19 @@ pub fn excel_inspect(path: &str) -> String {
         _ => ("A1:A1".to_string(), 0, 0),
     };
 
-    success_response(json!({
-        "sheet_names": sheet_names,
-        "active_sheet": active,
-        "headers": headers,
-        "dimensions": dimensions,
-        "max_rows": max_rows,
-        "max_cols": max_cols,
-    }), None, false, None)
+    success_response(
+        json!({
+            "sheet_names": sheet_names,
+            "active_sheet": active,
+            "headers": headers,
+            "dimensions": dimensions,
+            "max_rows": max_rows,
+            "max_cols": max_cols,
+        }),
+        None,
+        false,
+        None,
+    )
 }
 
 /// `output_format` is `"json"` (default) or `"csv"`.
@@ -286,7 +314,12 @@ pub fn excel_read_rows(
         return err;
     }
     if !resolved.exists() {
-        return error_response("XLSX_NOT_FOUND", "Spreadsheet does not exist", Some(&resolved.to_string_lossy()), None);
+        return error_response(
+            "XLSX_NOT_FOUND",
+            "Spreadsheet does not exist",
+            Some(&resolved.to_string_lossy()),
+            None,
+        );
     }
     if file_size_exceeds(&resolved) {
         return too_large(&resolved);
@@ -295,7 +328,12 @@ pub fn excel_read_rows(
     let mut wb = match open(&resolved) {
         Ok(wb) => wb,
         Err(e) => {
-            return error_response("XLSX_CORRUPT", &format!("Cannot open workbook: {e}"), Some(&resolved.to_string_lossy()), None);
+            return error_response(
+                "XLSX_CORRUPT",
+                &format!("Cannot open workbook: {e}"),
+                Some(&resolved.to_string_lossy()),
+                None,
+            );
         }
     };
 
@@ -310,7 +348,12 @@ pub fn excel_read_rows(
         match sheet_names.iter().position(|n| n == &ws_name) {
             Some(i) => i,
             None => {
-                return error_response("XLSX_BAD_SHEET", &format!("Sheet '{ws_name}' not found"), Some(&resolved.to_string_lossy()), None);
+                return error_response(
+                    "XLSX_BAD_SHEET",
+                    &format!("Sheet '{ws_name}' not found"),
+                    Some(&resolved.to_string_lossy()),
+                    None,
+                );
             }
         }
     };
@@ -320,7 +363,12 @@ pub fn excel_read_rows(
         Some(rb) if !rb.trim().is_empty() => match parse_range_boundaries(rb) {
             Some(w) => Some(w),
             None => {
-                return error_response("XLSX_BAD_RANGE", &format!("Invalid range '{rb}'"), Some(&resolved.to_string_lossy()), None);
+                return error_response(
+                    "XLSX_BAD_RANGE",
+                    &format!("Invalid range '{rb}'"),
+                    Some(&resolved.to_string_lossy()),
+                    None,
+                );
             }
         },
         _ => None,
@@ -329,7 +377,12 @@ pub fn excel_read_rows(
     let range: Range<Data> = match wb.worksheet_range_at(idx) {
         Some(Ok(r)) => r,
         _ => {
-            return error_response("XLSX_CORRUPT", "Cannot read worksheet cells", Some(&resolved.to_string_lossy()), None);
+            return error_response(
+                "XLSX_CORRUPT",
+                "Cannot read worksheet cells",
+                Some(&resolved.to_string_lossy()),
+                None,
+            );
         }
     };
     // calamine trims to the used box; each `rows()` row is padded to the box
@@ -397,7 +450,12 @@ pub fn excel_read_rows(
         } else {
             Value::Array(filtered)
         };
-        return success_response(data, message.as_deref(), result.truncated || scan_capped, Some(Value::Object(meta)));
+        return success_response(
+            data,
+            message.as_deref(),
+            result.truncated || scan_capped,
+            Some(Value::Object(meta)),
+        );
     }
 
     // No-query path: materialize only the header row and the page window,
@@ -426,7 +484,10 @@ pub fn excel_read_rows(
     // Headers from the first row; empty header cells become `col_{n}`.
     let headers = build_headers(header_row.as_deref().unwrap_or_default());
 
-    let page: Vec<Value> = page_raw.iter().map(|row| row_to_obj(row, &headers)).collect();
+    let page: Vec<Value> = page_raw
+        .iter()
+        .map(|row| row_to_obj(row, &headers))
+        .collect();
     let total_rows = surviving_rows.saturating_sub(1);
     let has_more = offset + page.len() < total_rows;
     let mut meta = serde_json::Map::new();
@@ -447,7 +508,12 @@ pub fn excel_read_rows(
             }
             lines.push(csv_line(&fields));
         }
-        return success_response(json!(lines.join("\r\n")), None, has_more, Some(Value::Object(meta)));
+        return success_response(
+            json!(lines.join("\r\n")),
+            None,
+            has_more,
+            Some(Value::Object(meta)),
+        );
     }
 
     success_response(json!(page), None, has_more, Some(Value::Object(meta)))
@@ -532,7 +598,13 @@ fn cell_to_csv(v: &Value) -> String {
         Value::Null => String::new(),
         // Match Python's `csv.writer` + `str(bool)` -> "True"/"False", which
         // Excel understands as booleans when importing a CSV.
-        Value::Bool(b) => if *b { "True".to_string() } else { "False".to_string() },
+        Value::Bool(b) => {
+            if *b {
+                "True".to_string()
+            } else {
+                "False".to_string()
+            }
+        }
         other => other.to_string(),
     }
 }
@@ -553,7 +625,11 @@ fn csv_line(fields: &[String]) -> String {
             } else {
                 f.clone()
             };
-            if guarded.contains(',') || guarded.contains('"') || guarded.contains('\n') || guarded.contains('\r') {
+            if guarded.contains(',')
+                || guarded.contains('"')
+                || guarded.contains('\n')
+                || guarded.contains('\r')
+            {
                 format!("\"{}\"", guarded.replace('"', "\"\""))
             } else {
                 guarded
@@ -585,7 +661,7 @@ mod tests {
         assert_eq!(col_letter_to_num("FXSHRXW"), Some(2147483647)); // still fits u32
         assert_eq!(col_letter_to_num("FXSHRXWX"), None); // 5.5e10 > u32::MAX
         assert_eq!(col_letter_to_num("ZZZZZZZ"), None); // ~8.3e9 > u32::MAX
-        // Very long runs bail before the arithmetic can wrap.
+                                                        // Very long runs bail before the arithmetic can wrap.
         assert_eq!(col_letter_to_num("ZZZZZZZZZZZZZZ"), None);
     }
 

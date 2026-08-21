@@ -31,7 +31,9 @@ pub fn check_url(url: &url::Url) -> Result<(), String> {
     match url.scheme() {
         "http" | "https" => {}
         other => {
-            return Err(format!("scheme '{other}' is not allowed; only http and https URLs can be scraped"));
+            return Err(format!(
+                "scheme '{other}' is not allowed; only http and https URLs can be scraped"
+            ));
         }
     }
     let Some(host) = url.host() else {

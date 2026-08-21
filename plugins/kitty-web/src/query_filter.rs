@@ -39,7 +39,12 @@ pub struct QueryFilterResult {
     pub no_match: bool,
 }
 
-fn page(items: &[String], offset: usize, max_results: usize, total: usize) -> (Vec<String>, bool, Option<usize>) {
+fn page(
+    items: &[String],
+    offset: usize,
+    max_results: usize,
+    total: usize,
+) -> (Vec<String>, bool, Option<usize>) {
     let page: Vec<String> = items
         .iter()
         .skip(offset)
@@ -47,7 +52,11 @@ fn page(items: &[String], offset: usize, max_results: usize, total: usize) -> (V
         .cloned()
         .collect();
     let has_more = offset + page.len() < total;
-    let next_offset = if has_more { Some(offset + page.len()) } else { None };
+    let next_offset = if has_more {
+        Some(offset + page.len())
+    } else {
+        None
+    };
     (page, has_more, next_offset)
 }
 
@@ -58,18 +67,35 @@ fn page(items: &[String], offset: usize, max_results: usize, total: usize) -> (V
 /// descending preserves original order among ties. Do **not** sort ascending
 /// then reverse — that flips tie order (see the base plan's warning on this
 /// exact trap).
-pub fn filter_by_query(items: &[String], query: Option<&str>, max_results: usize, offset: usize) -> QueryFilterResult {
+pub fn filter_by_query(
+    items: &[String],
+    query: Option<&str>,
+    max_results: usize,
+    offset: usize,
+) -> QueryFilterResult {
     let query = query.map(str::trim).filter(|q| !q.is_empty());
 
     let Some(query) = query else {
         let (p, truncated, next_offset) = page(items, offset, max_results, items.len());
-        return QueryFilterResult { items: p, truncated, total_matches: items.len(), next_offset, no_match: false };
+        return QueryFilterResult {
+            items: p,
+            truncated,
+            total_matches: items.len(),
+            next_offset,
+            no_match: false,
+        };
     };
 
     let query_words = words_lower(query);
     if query_words.is_empty() {
         let (p, truncated, next_offset) = page(items, offset, max_results, items.len());
-        return QueryFilterResult { items: p, truncated, total_matches: items.len(), next_offset, no_match: false };
+        return QueryFilterResult {
+            items: p,
+            truncated,
+            total_matches: items.len(),
+            next_offset,
+            no_match: false,
+        };
     }
 
     let mut scored: Vec<(usize, usize, &String)> = Vec::new();
@@ -83,7 +109,13 @@ pub fn filter_by_query(items: &[String], query: Option<&str>, max_results: usize
 
     if scored.is_empty() {
         let (p, truncated, next_offset) = page(items, offset, max_results, items.len());
-        return QueryFilterResult { items: p, truncated, total_matches: 0, next_offset, no_match: true };
+        return QueryFilterResult {
+            items: p,
+            truncated,
+            total_matches: 0,
+            next_offset,
+            no_match: true,
+        };
     }
 
     // Stable descending sort by score, ties keep document order. `Reverse`
@@ -92,9 +124,18 @@ pub fn filter_by_query(items: &[String], query: Option<&str>, max_results: usize
     // stays correct.
     scored.sort_by_key(|(score, _, _)| std::cmp::Reverse(*score));
     let total_matches = scored.len();
-    let ordered: Vec<String> = scored.into_iter().map(|(_, _, item)| item.clone()).collect();
+    let ordered: Vec<String> = scored
+        .into_iter()
+        .map(|(_, _, item)| item.clone())
+        .collect();
     let (p, truncated, next_offset) = page(&ordered, offset, max_results, total_matches);
-    QueryFilterResult { items: p, truncated, total_matches, next_offset, no_match: false }
+    QueryFilterResult {
+        items: p,
+        truncated,
+        total_matches,
+        next_offset,
+        no_match: false,
+    }
 }
 
 #[cfg(test)]

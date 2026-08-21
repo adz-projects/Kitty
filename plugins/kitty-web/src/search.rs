@@ -96,17 +96,40 @@ impl SearchItem {
     fn from_stored_json(v: &Value) -> Option<Self> {
         Some(Self {
             id: v.get("id")?.as_u64()? as usize,
-            title: v.get("title").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-            domain: v.get("domain").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-            url: v.get("url").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-            date: v.get("date").and_then(|x| x.as_str()).map(|s| s.to_string()),
-            snippet: v.get("snippet").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+            title: v
+                .get("title")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+            domain: v
+                .get("domain")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+            url: v
+                .get("url")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+            date: v
+                .get("date")
+                .and_then(|x| x.as_str())
+                .map(|s| s.to_string()),
+            snippet: v
+                .get("snippet")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
             snippet_full: v
                 .get("snippet_full")
                 .and_then(|x| x.as_str())
                 .unwrap_or("")
                 .to_string(),
-            engine: v.get("engine").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+            engine: v
+                .get("engine")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
         })
     }
 }
@@ -265,7 +288,11 @@ pub fn apply_query_guardrails(query: &str) -> String {
 pub fn split_snippet(short: &str, full: &str) -> (String, String) {
     let full = full.trim().to_string();
     let short = short.trim();
-    let short = if short.is_empty() { full.as_str() } else { short };
+    let short = if short.is_empty() {
+        full.as_str()
+    } else {
+        short
+    };
     (
         short.chars().take(INLINE_SNIPPET_MAX_CHARS).collect(),
         full.clone(),
@@ -278,7 +305,11 @@ pub fn split_snippet(short: &str, full: &str) -> (String, String) {
 fn source_date(source: &Value) -> Option<String> {
     let age = source.get("age")?;
     if let Some(s) = age.as_str() {
-        return if s.is_empty() { None } else { Some(s.to_string()) };
+        return if s.is_empty() {
+            None
+        } else {
+            Some(s.to_string())
+        };
     }
     let arr = age.as_array()?;
     let candidates: Vec<&str> = arr
@@ -316,7 +347,10 @@ fn normalize_sources(raw: Option<&Value>) -> HashMap<String, Value> {
             .filter(|v| v.is_object())
             .map(|v| {
                 (
-                    v.get("url").and_then(|u| u.as_str()).unwrap_or("").to_string(),
+                    v.get("url")
+                        .and_then(|u| u.as_str())
+                        .unwrap_or("")
+                        .to_string(),
                     v.clone(),
                 )
             })
@@ -341,7 +375,10 @@ fn domain_of(url: &str) -> String {
 /// never failing at all, with the empty-result case flowing into the same
 /// `ALL_ENGINES_FAILED`/`NO_RESULTS` discrimination at the tool boundary.
 pub fn parse_brave_results(payload: &Value) -> Vec<SearchItem> {
-    let grounding = payload.get("grounding").cloned().unwrap_or_else(|| json!({}));
+    let grounding = payload
+        .get("grounding")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
     let sources = normalize_sources(payload.get("sources"));
     let mut items = Vec::new();
 
@@ -359,7 +396,11 @@ pub fn parse_brave_results(payload: &Value) -> Vec<SearchItem> {
             let source = sources.get(raw_url).unwrap_or(&empty);
 
             let snippets: Vec<String> = match entry.get("snippets").and_then(|s| s.as_array()) {
-                Some(arr) => arr.iter().filter_map(|s| s.as_str()).map(String::from).collect(),
+                Some(arr) => arr
+                    .iter()
+                    .filter_map(|s| s.as_str())
+                    .map(String::from)
+                    .collect(),
                 None => entry
                     .get("snippet")
                     .and_then(|s| s.as_str())
@@ -374,7 +415,11 @@ pub fn parse_brave_results(payload: &Value) -> Vec<SearchItem> {
 
             items.push(SearchItem {
                 id: 0,
-                title: entry.get("title").and_then(|t| t.as_str()).unwrap_or("").to_string(),
+                title: entry
+                    .get("title")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("")
+                    .to_string(),
                 domain: if domain.is_empty() {
                     source
                         .get("hostname")
@@ -396,11 +441,18 @@ pub fn parse_brave_results(payload: &Value) -> Vec<SearchItem> {
     if let Some(poi) = grounding.get("poi").filter(|p| !p.is_null()) {
         let raw_url = poi.get("url").and_then(|u| u.as_str()).unwrap_or("");
         let (clean_url, domain) = clean(raw_url);
-        let desc = poi.get("description").and_then(|d| d.as_str()).unwrap_or("");
+        let desc = poi
+            .get("description")
+            .and_then(|d| d.as_str())
+            .unwrap_or("");
         let (snippet, snippet_full) = split_snippet(desc, desc);
         items.push(SearchItem {
             id: 0,
-            title: poi.get("title").and_then(|t| t.as_str()).unwrap_or("").to_string(),
+            title: poi
+                .get("title")
+                .and_then(|t| t.as_str())
+                .unwrap_or("")
+                .to_string(),
             domain,
             url: clean_url,
             date: None,
@@ -414,11 +466,18 @@ pub fn parse_brave_results(payload: &Value) -> Vec<SearchItem> {
         for entry in map_entries {
             let raw_url = entry.get("url").and_then(|u| u.as_str()).unwrap_or("");
             let (clean_url, domain) = clean(raw_url);
-            let desc = entry.get("description").and_then(|d| d.as_str()).unwrap_or("");
+            let desc = entry
+                .get("description")
+                .and_then(|d| d.as_str())
+                .unwrap_or("");
             let (snippet, snippet_full) = split_snippet(desc, desc);
             items.push(SearchItem {
                 id: 0,
-                title: entry.get("title").and_then(|t| t.as_str()).unwrap_or("").to_string(),
+                title: entry
+                    .get("title")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("")
+                    .to_string(),
                 domain,
                 url: clean_url,
                 date: None,
@@ -552,7 +611,8 @@ fn stopwords() -> &'static HashSet<&'static str> {
 pub fn extract_keywords(text: &str, top_k: usize) -> Vec<String> {
     use std::sync::OnceLock;
     static RE: OnceLock<regex::Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| regex::Regex::new(r"[a-zA-Z][a-zA-Z\-']+").expect("static regex is valid"));
+    let re = RE
+        .get_or_init(|| regex::Regex::new(r"[a-zA-Z][a-zA-Z\-']+").expect("static regex is valid"));
 
     let lowered = text.to_lowercase();
     let mut counts: HashMap<String, (usize, usize)> = HashMap::new();
@@ -636,16 +696,10 @@ pub fn mode_for_count(count: usize) -> &'static str {
 // Offload store
 // ---------------------------------------------------------------------------
 
-/// Sibling to the tool cache dir, not inside it — so a future cache-clear
-/// tool can never delete an in-flight search offload. Mirrors the Python
-/// constant `SEARCH_STORE_DIR` (`~/.cache/kitty-search-offload`) exactly, so
-/// a mixed Python/Rust install shares one store.
-pub fn search_store_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".cache")
-        .join("kitty-search-offload")
-}
+/// Sibling to the tool cache dir — see `paths::search_store_dir`, which owns
+/// the resolution (and the `KITTY_PLUGIN_HOME` override that makes it
+/// writable on Android).
+pub use crate::paths::search_store_dir;
 
 fn offload_path(search_id: &str) -> PathBuf {
     search_store_dir().join(format!("search-{search_id}.json"))
@@ -661,11 +715,7 @@ fn prune_old_offloads() {
     };
     let mut files: Vec<(std::time::SystemTime, PathBuf)> = entries
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.file_name()
-                .to_string_lossy()
-                .starts_with("search-")
-        })
+        .filter(|e| e.file_name().to_string_lossy().starts_with("search-"))
         .filter_map(|e| {
             let mtime = e.metadata().ok()?.modified().ok()?;
             Some((mtime, e.path()))
@@ -774,15 +824,20 @@ async fn brave_query(
             return Err(BraveFailure::RateLimitExhausted(body));
         }
 
-        let body = match crate::scrape::read_body_capped(response, crate::scrape::SCRAPE_MAX_BODY_BYTES).await {
-            Ok(b) => String::from_utf8_lossy(&b).into_owned(),
-            Err(crate::scrape::BodyReadError::TooLarge) => {
-                return Err(BraveFailure::Api("response body exceeded the download cap".into()));
-            }
-            Err(crate::scrape::BodyReadError::Network(e)) => {
-                return Err(BraveFailure::Network(e.to_string()));
-            }
-        };
+        let body =
+            match crate::scrape::read_body_capped(response, crate::scrape::SCRAPE_MAX_BODY_BYTES)
+                .await
+            {
+                Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+                Err(crate::scrape::BodyReadError::TooLarge) => {
+                    return Err(BraveFailure::Api(
+                        "response body exceeded the download cap".into(),
+                    ));
+                }
+                Err(crate::scrape::BodyReadError::Network(e)) => {
+                    return Err(BraveFailure::Network(e.to_string()));
+                }
+            };
         if status.as_u16() == 400 || status.as_u16() == 422 {
             return Err(BraveFailure::InvalidQuery(body));
         }
@@ -809,7 +864,9 @@ async fn brave_query(
 async fn read_error_body(response: reqwest::Response) -> String {
     match crate::scrape::read_body_capped(response, crate::scrape::SCRAPE_MAX_BODY_BYTES).await {
         Ok(b) => String::from_utf8_lossy(&b).into_owned(),
-        Err(crate::scrape::BodyReadError::TooLarge) => "[body exceeded the download cap]".to_string(),
+        Err(crate::scrape::BodyReadError::TooLarge) => {
+            "[body exceeded the download cap]".to_string()
+        }
         Err(crate::scrape::BodyReadError::Network(_)) => String::new(),
     }
 }
@@ -832,7 +889,9 @@ async fn ddg_query(query: &str, count: usize) -> Result<Vec<SearchItem>, String>
     if !response.status().is_success() {
         return Err(format!("HTTP {}", response.status()));
     }
-    let html = match crate::scrape::read_body_capped(response, crate::scrape::SCRAPE_MAX_BODY_BYTES).await {
+    let html = match crate::scrape::read_body_capped(response, crate::scrape::SCRAPE_MAX_BODY_BYTES)
+        .await
+    {
         Ok(b) => String::from_utf8_lossy(&b).into_owned(),
         Err(crate::scrape::BodyReadError::TooLarge) => {
             return Err("response body exceeded the download cap".to_string());
@@ -1038,7 +1097,10 @@ pub async fn web_search(
         let mut meta = base_metadata.as_object().cloned().unwrap_or_default();
         meta.insert("total_results_found".into(), json!(results.len()));
         meta.insert("downgraded_to_index".into(), json!(true));
-        meta.insert("inline_chars".into(), json!(inline_response.chars().count()));
+        meta.insert(
+            "inline_chars".into(),
+            json!(inline_response.chars().count()),
+        );
         return success_response(build_index(&shown), None, false, Some(Value::Object(meta)));
     }
 
@@ -1133,7 +1195,10 @@ pub fn web_search_read_chunk(search_id: &str, ids: &[i64]) -> String {
         if let Some(obj) = item.as_object_mut() {
             obj.insert("snippet".into(), json!(full));
         }
-        let item_chars = serde_json::to_string(&item).unwrap_or_default().chars().count();
+        let item_chars = serde_json::to_string(&item)
+            .unwrap_or_default()
+            .chars()
+            .count();
         if !matched.is_empty() && running_chars + item_chars > READ_CHUNK_MAX_CHARS {
             char_truncated = true;
             break;
@@ -1181,7 +1246,8 @@ mod tests {
     fn strip_tracking_keeps_resource_params_and_drops_junk() {
         // The exact regression the Python comment calls out: a blanket
         // `?.*$` strip breaks YouTube links.
-        let cleaned = strip_tracking_params("https://youtube.com/watch?v=abc123&utm_source=x&fbclid=y");
+        let cleaned =
+            strip_tracking_params("https://youtube.com/watch?v=abc123&utm_source=x&fbclid=y");
         assert!(cleaned.contains("v=abc123"), "got {cleaned}");
         assert!(!cleaned.contains("utm_source"));
         assert!(!cleaned.contains("fbclid"));
@@ -1211,8 +1277,14 @@ mod tests {
 
     #[test]
     fn query_guardrails_strip_conversational_prefixes_and_clamp() {
-        assert_eq!(apply_query_guardrails("  please search for rust wasm  "), "rust wasm");
-        assert_eq!(apply_query_guardrails("\"what is borrow checker\""), "borrow checker");
+        assert_eq!(
+            apply_query_guardrails("  please search for rust wasm  "),
+            "rust wasm"
+        );
+        assert_eq!(
+            apply_query_guardrails("\"what is borrow checker\""),
+            "borrow checker"
+        );
         let long = "word ".repeat(80);
         assert_eq!(apply_query_guardrails(&long).split_whitespace().count(), 50);
     }
@@ -1377,7 +1449,9 @@ mod tests {
         let first = extract_keywords(text, 5);
         let second = extract_keywords(text, 5);
         assert_eq!(first, second, "must be reproducible across calls");
-        assert!(!first.iter().any(|w| w == "the" || w == "and" || w == "with"));
+        assert!(!first
+            .iter()
+            .any(|w| w == "the" || w == "and" || w == "with"));
         // "quick"/"brown"/"fox" all appear; counts order them, first-appearance breaks ties.
         assert_eq!(first[0], "quick");
         assert_eq!(first[1], "brown");
@@ -1386,7 +1460,9 @@ mod tests {
 
     #[test]
     fn extract_keywords_skips_short_words() {
-        assert!(extract_keywords("go up at ax bee", 5).iter().all(|w| w.len() > 2));
+        assert!(extract_keywords("go up at ax bee", 5)
+            .iter()
+            .all(|w| w.len() > 2));
     }
 
     #[test]
@@ -1398,14 +1474,20 @@ mod tests {
         r.snippet_full = "distinctive fulltext keyword appears here".into();
         let index = build_index(&[r]);
         let entry = &index[0];
-        assert_eq!(entry["title"].as_str().unwrap().chars().count(), MANIFEST_TITLE_MAX_CHARS);
+        assert_eq!(
+            entry["title"].as_str().unwrap().chars().count(),
+            MANIFEST_TITLE_MAX_CHARS
+        );
         let kws: Vec<String> = entry["keywords"]
             .as_array()
             .unwrap()
             .iter()
             .map(|k| k.as_str().unwrap().to_string())
             .collect();
-        assert!(kws.contains(&"distinctive".to_string()), "keywords must come from snippet_full: {kws:?}");
+        assert!(
+            kws.contains(&"distinctive".to_string()),
+            "keywords must come from snippet_full: {kws:?}"
+        );
     }
 
     #[test]

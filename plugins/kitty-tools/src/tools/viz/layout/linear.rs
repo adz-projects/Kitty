@@ -28,7 +28,8 @@ pub fn render(steps: &[Step]) -> (String, f32, f32) {
     let sized: Vec<_> = steps
         .iter()
         .map(|s| {
-            let badge = (s.step_type == StepType::Decision).then(|| s.subtitle.clone().unwrap_or_else(|| "GATE".to_string()));
+            let badge = (s.step_type == StepType::Decision)
+                .then(|| s.subtitle.clone().unwrap_or_else(|| "GATE".to_string()));
             size_node(&s.text, badge.as_deref())
         })
         .collect();
@@ -60,7 +61,13 @@ pub fn render(steps: &[Step]) -> (String, f32, f32) {
         }
         let row_top = TITLE_BAND + current_row as f32 * (row_h + GAP_Y);
         let node_top = row_top + (row_h - n.h) / 2.0;
-        placed.push(Placed { x, y: node_top, w: n.w, h: n.h, row: current_row });
+        placed.push(Placed {
+            x,
+            y: node_top,
+            w: n.w,
+            h: n.h,
+            row: current_row,
+        });
         x += n.w + GAP_X;
     }
 
@@ -78,19 +85,49 @@ pub fn render(steps: &[Step]) -> (String, f32, f32) {
             // Serpentine connector: loop right past the wider of the two rows'
             // content, then back down/left into the next row's first node.
             let turn_x = (a.x + a.w).max(b.x) + 24.0;
-            let d = format!("M {:.1},{:.1} C {:.1},{:.1} {:.1},{:.1} {:.1},{:.1}", a.x + a.w, ay, turn_x, ay, turn_x, by, b.x, by);
-            let bbox = (a.x + a.w, ay.min(by), (turn_x - (a.x + a.w)).max(0.0), (ay - by).abs());
+            let d = format!(
+                "M {:.1},{:.1} C {:.1},{:.1} {:.1},{:.1} {:.1},{:.1}",
+                a.x + a.w,
+                ay,
+                turn_x,
+                ay,
+                turn_x,
+                by,
+                b.x,
+                by
+            );
+            let bbox = (
+                a.x + a.w,
+                ay.min(by),
+                (turn_x - (a.x + a.w)).max(0.0),
+                (ay - by).abs(),
+            );
             canvas.path(&d, "flow-path", bbox);
         }
     }
 
     for (i, n) in sized.iter().enumerate() {
         let p = &placed[i];
-        draw_node(&mut canvas, p.x, p.y, p.w, p.h, NodeVisual { lines: &n.lines, badge: n.badge.as_deref(), step_type: steps[i].step_type });
+        draw_node(
+            &mut canvas,
+            p.x,
+            p.y,
+            p.w,
+            p.h,
+            NodeVisual {
+                lines: &n.lines,
+                badge: n.badge.as_deref(),
+                step_type: steps[i].step_type,
+            },
+        );
     }
 
     let (body, bounds) = canvas.into_parts();
-    (body, bounds.width() + CANVAS_MARGIN, bounds.height() + CANVAS_MARGIN)
+    (
+        body,
+        bounds.width() + CANVAS_MARGIN,
+        bounds.height() + CANVAS_MARGIN,
+    )
 }
 
 #[cfg(test)]
@@ -98,7 +135,10 @@ mod tests {
     use super::*;
 
     fn step(text: &str) -> Step {
-        Step { text: text.to_string(), ..Default::default() }
+        Step {
+            text: text.to_string(),
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -108,7 +148,10 @@ mod tests {
         for n in [1usize, 3, 6, 10, 20] {
             let steps: Vec<Step> = (0..n).map(|i| step(&format!("Step {i}"))).collect();
             let (_, w, h) = render(&steps);
-            assert!(w >= prev_w, "width should not shrink as steps grow ({n} steps)");
+            assert!(
+                w >= prev_w,
+                "width should not shrink as steps grow ({n} steps)"
+            );
             // Height only needs to grow once rows wrap; width growth alone
             // satisfies "the diagram accommodates more content" for small n.
             prev_w = w;
@@ -116,7 +159,11 @@ mod tests {
         }
         // With 20 steps at ~150px each, wrapping must have occurred, so
         // height must have grown past a single row.
-        let (_, _, h20) = render(&(0..20).map(|i| step(&format!("Step {i}"))).collect::<Vec<_>>());
+        let (_, _, h20) = render(
+            &(0..20)
+                .map(|i| step(&format!("Step {i}")))
+                .collect::<Vec<_>>(),
+        );
         assert!(h20 > 220.0, "20 steps must wrap to more than one row");
     }
 
@@ -125,11 +172,19 @@ mod tests {
         // The historical bug: >5 steps on the old fixed 880-wide viewBox
         // clipped silently. Every drawn node must now lie fully inside the
         // returned canvas bounds.
-        let steps: Vec<Step> = (0..9).map(|i| step(&format!("Process step number {i}"))).collect();
+        let steps: Vec<Step> = (0..9)
+            .map(|i| step(&format!("Process step number {i}")))
+            .collect();
         let (body, w, h) = render(&steps);
         for (x, y, rw, rh) in extract_rects(&body) {
-            assert!(x + rw <= w + 0.5, "rect at x={x} w={rw} exceeds canvas width {w}");
-            assert!(y + rh <= h + 0.5, "rect at y={y} h={rh} exceeds canvas height {h}");
+            assert!(
+                x + rw <= w + 0.5,
+                "rect at x={x} w={rw} exceeds canvas width {w}"
+            );
+            assert!(
+                y + rh <= h + 0.5,
+                "rect at y={y} h={rh} exceeds canvas height {h}"
+            );
         }
     }
 
@@ -140,13 +195,19 @@ mod tests {
         assert!(body.contains("Alpha"));
         assert!(body.contains("Bravo"));
         assert!(body.contains("Charlie"));
-        assert!(!body.contains("Ingest Data"), "must not fall back to the retired canned pipeline");
+        assert!(
+            !body.contains("Ingest Data"),
+            "must not fall back to the retired canned pipeline"
+        );
     }
 
     fn extract_rects(svg: &str) -> Vec<(f32, f32, f32, f32)> {
         let mut out = Vec::new();
         for cap_start in svg.match_indices("<rect ") {
-            let tag_end = svg[cap_start.0..].find('/').map(|i| cap_start.0 + i).unwrap_or(svg.len());
+            let tag_end = svg[cap_start.0..]
+                .find('/')
+                .map(|i| cap_start.0 + i)
+                .unwrap_or(svg.len());
             let tag = &svg[cap_start.0..tag_end];
             let get = |attr: &str| -> f32 {
                 tag.split(&format!(r#"{attr}=""#))

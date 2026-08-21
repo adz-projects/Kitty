@@ -31,8 +31,8 @@ const MAX_REDIRECTS: usize = 10;
 /// Windows device basenames (compared case-insensitively, up to the first
 /// dot): a file whose stem is one of these is not a file at all on Windows.
 const WINDOWS_RESERVED_STEMS: [&str; 22] = [
-    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
-    "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
 ];
 
 /// A complete, current-looking UA string. The Python original's note applies
@@ -40,8 +40,7 @@ const WINDOWS_RESERVED_STEMS: [&str; 22] = [
 /// `(KHTML, like Gecko) Chrome/... Safari/...` tail is a shape several WAFs
 /// fingerprint directly as non-browser traffic, and an avoidable cause of
 /// 403s. Also reused by `search::ddg_query`.
-pub const SCRAPE_USER_AGENT: &str =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+pub const SCRAPE_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
      (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
 /// Splits markdown on blank-line boundaries, keeping a fenced code block
@@ -85,8 +84,11 @@ pub fn strip_markdown_links(text: &str) -> String {
     use std::sync::OnceLock;
     static FENCE: OnceLock<regex::Regex> = OnceLock::new();
     static LINK: OnceLock<regex::Regex> = OnceLock::new();
-    let fence = FENCE.get_or_init(|| regex::Regex::new(r"(?s)```.*?```").expect("static regex is valid"));
-    let link = LINK.get_or_init(|| regex::Regex::new(r"\[([^\]]+)\]\([^\)]+\)").expect("static regex is valid"));
+    let fence =
+        FENCE.get_or_init(|| regex::Regex::new(r"(?s)```.*?```").expect("static regex is valid"));
+    let link = LINK.get_or_init(|| {
+        regex::Regex::new(r"\[([^\]]+)\]\([^\)]+\)").expect("static regex is valid")
+    });
 
     let mut out = String::with_capacity(text.len());
     let mut last = 0usize;
@@ -144,7 +146,9 @@ pub fn markdown_to_text(md: &str) -> String {
     use std::sync::OnceLock;
     static LINK: OnceLock<regex::Regex> = OnceLock::new();
     static EMPH: OnceLock<regex::Regex> = OnceLock::new();
-    let link = LINK.get_or_init(|| regex::Regex::new(r"\[([^\]]+)\]\([^\)]+\)").expect("static regex is valid"));
+    let link = LINK.get_or_init(|| {
+        regex::Regex::new(r"\[([^\]]+)\]\([^\)]+\)").expect("static regex is valid")
+    });
     // Emphasis markers (`**`/`__`/inline-code backticks/single `*`/`_`) are
     // pure formatting the text mode wants gone entirely.
     let emph = EMPH.get_or_init(|| regex::Regex::new(r"[*_`]").expect("static regex is valid"));
@@ -229,7 +233,14 @@ const BOILERPLATE_TAGS: [&str; 12] = [
 /// `trafilatura`'s preference for a semantic main-content container over the
 /// whole `<body>`. Falling through to `body` is the recall-favoring default
 /// the Python docstring describes.
-const CONTENT_SELECTORS: [&str; 6] = ["article", "main", "[role=main]", "#content", ".content", "body"];
+const CONTENT_SELECTORS: [&str; 6] = [
+    "article",
+    "main",
+    "[role=main]",
+    "#content",
+    ".content",
+    "body",
+];
 
 /// Extracts `(markdown_body, metadata)` from an HTML document.
 ///
@@ -241,7 +252,11 @@ const CONTENT_SELECTORS: [&str; 6] = ["article", "main", "[role=main]", "#conten
 /// `body`-wide fallback), matching the Python parameter's documented intent:
 /// the default favors *recall*, because documentation/API-reference pages
 /// often lose sidebars and short definition blocks under precision mode.
-pub fn extract_markdown(html: &str, favor_precision: bool, include_links: bool) -> Option<(String, PageMeta)> {
+pub fn extract_markdown(
+    html: &str,
+    favor_precision: bool,
+    include_links: bool,
+) -> Option<(String, PageMeta)> {
     use scraper::{Html, Selector};
 
     let document = Html::parse_document(html);
@@ -250,7 +265,8 @@ pub fn extract_markdown(html: &str, favor_precision: bool, include_links: bool) 
     // `scraper` gives an immutable DOM, so boilerplate is removed by
     // collecting the ids of unwanted subtrees and skipping them during
     // serialization rather than by mutating the tree.
-    let mut excluded: std::collections::HashSet<ego_tree::NodeId> = std::collections::HashSet::new();
+    let mut excluded: std::collections::HashSet<ego_tree::NodeId> =
+        std::collections::HashSet::new();
     for tag in BOILERPLATE_TAGS {
         if let Ok(sel) = Selector::parse(tag) {
             for el in document.select(&sel) {
@@ -369,13 +385,23 @@ fn serialize_without(
                         if depth < MAX_SERIALIZE_DEPTH {
                             // Reversed so children serialize in document order.
                             let children: Vec<_> = node.children().collect();
-                            stack.extend(children.into_iter().rev().map(|c| Frame::Enter(c, depth + 1)));
+                            stack.extend(
+                                children
+                                    .into_iter()
+                                    .rev()
+                                    .map(|c| Frame::Enter(c, depth + 1)),
+                            );
                         }
                     }
                     _ => {
                         if depth < MAX_SERIALIZE_DEPTH {
                             let children: Vec<_> = node.children().collect();
-                            stack.extend(children.into_iter().rev().map(|c| Frame::Enter(c, depth + 1)));
+                            stack.extend(
+                                children
+                                    .into_iter()
+                                    .rev()
+                                    .map(|c| Frame::Enter(c, depth + 1)),
+                            );
                         }
                     }
                 }
@@ -414,7 +440,11 @@ fn extract_metadata(document: &scraper::Html) -> PageMeta {
         .or_else(|| meta_content(r#"meta[name="date"]"#))
         .or_else(|| meta_content(r#"meta[itemprop="datePublished"]"#));
 
-    PageMeta { title, sitename, date }
+    PageMeta {
+        title,
+        sitename,
+        date,
+    }
 }
 
 /// Filename sanitization for a downloaded PDF, matching Python's
@@ -425,7 +455,11 @@ fn pdf_filename_for(stripped_url: &str) -> String {
     let re = RE.get_or_init(|| regex::Regex::new(r"[^\w.\-]").expect("static regex is valid"));
 
     let tail = stripped_url.rsplit('/').next().unwrap_or("");
-    let tail = if tail.is_empty() { "downloaded.pdf" } else { tail };
+    let tail = if tail.is_empty() {
+        "downloaded.pdf"
+    } else {
+        tail
+    };
     let mut name = re.replace_all(tail, "_").into_owned();
     if !name.to_lowercase().ends_with(".pdf") {
         name.push_str(".pdf");
@@ -440,16 +474,10 @@ fn pdf_filename_for(stripped_url: &str) -> String {
     name
 }
 
-/// Same cache directory the Python tools use, so a PDF downloaded here stays
-/// readable by `lean_pdf_read_text` (still hosted by `kitty-docs-web`) and
-/// inspectable via `kitty-tools`' `lean_cache_view` without the two halves
-/// having to agree on a second location.
-fn cache_dir() -> std::path::PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".cache")
-        .join("lean-goose-mcp")
-}
+/// Same cache directory the Python tools use — see `paths::cache_dir`, which
+/// owns the resolution (and the `KITTY_PLUGIN_HOME` override that makes it
+/// writable on Android).
+use crate::paths::cache_dir;
 
 /// Why a response-body read failed: the stream crossed the byte cap, or the
 /// transport did.
@@ -464,7 +492,10 @@ pub enum BodyReadError {
 /// streaming accumulation caps the actual bytes — a lied-about or missing
 /// header can't sneak a huge body past. `chunk()` rather than
 /// `bytes_stream()` so this builds without reqwest's `stream` feature.
-pub async fn read_body_capped(mut response: reqwest::Response, cap: usize) -> Result<Vec<u8>, BodyReadError> {
+pub async fn read_body_capped(
+    mut response: reqwest::Response,
+    cap: usize,
+) -> Result<Vec<u8>, BodyReadError> {
     if let Some(len) = response.content_length() {
         if len > cap as u64 {
             return Err(BodyReadError::TooLarge);
@@ -642,7 +673,10 @@ pub async fn web_scrape(
             Err(BodyReadError::TooLarge) => {
                 return error_response(
                     "SCRAPE_TOO_LARGE",
-                    &format!("The response body exceeded the {} MiB download cap.", SCRAPE_MAX_BODY_BYTES / (1024 * 1024)),
+                    &format!(
+                        "The response body exceeded the {} MiB download cap.",
+                        SCRAPE_MAX_BODY_BYTES / (1024 * 1024)
+                    ),
                     Some(url),
                     Some("Download the file directly and read it with lean_pdf_read_text instead."),
                 );
@@ -686,7 +720,11 @@ pub async fn web_scrape(
     }
 
     if !(content_type.starts_with("text/html") || content_type.starts_with("application/xhtml")) {
-        let shown = if content_type.is_empty() { "unknown" } else { &content_type };
+        let shown = if content_type.is_empty() {
+            "unknown"
+        } else {
+            &content_type
+        };
         return error_response(
             "SCRAPE_UNSUPPORTED_CONTENT_TYPE",
             &format!("URL did not return an HTML page (Content-Type: {shown})."),
@@ -700,7 +738,10 @@ pub async fn web_scrape(
         Err(BodyReadError::TooLarge) => {
             return error_response(
                 "SCRAPE_TOO_LARGE",
-                &format!("The response body exceeded the {} MiB download cap.", SCRAPE_MAX_BODY_BYTES / (1024 * 1024)),
+                &format!(
+                    "The response body exceeded the {} MiB download cap.",
+                    SCRAPE_MAX_BODY_BYTES / (1024 * 1024)
+                ),
                 Some(url),
                 Some("Fetch a smaller page, or page through a lighter endpoint."),
             );
@@ -717,8 +758,11 @@ pub async fn web_scrape(
 
     // Extraction/serialization is CPU-bound DOM work — keep it off the
     // reactor (audit #113). Owned copies cross the thread boundary.
-    let (url_owned, query_owned, format_owned) =
-        (url.to_string(), query.map(str::to_string), output_format.to_string());
+    let (url_owned, query_owned, format_owned) = (
+        url.to_string(),
+        query.map(str::to_string),
+        output_format.to_string(),
+    );
     let rendered = tokio::task::spawn_blocking(move || {
         render_scrape_result(
             &html,
@@ -813,7 +857,10 @@ pub fn render_scrape_result(
         meta.insert("filtered_by_query".into(), json!(q));
         meta.insert("total_matches".into(), json!(result.total_matches));
         meta.insert("offset".into(), json!(offset));
-        meta.insert("char_count_returned".into(), json!(capped_text.chars().count()));
+        meta.insert(
+            "char_count_returned".into(),
+            json!(capped_text.chars().count()),
+        );
         if let Some(next) = result.next_offset {
             meta.insert("next_offset".into(), json!(next));
         } else if char_truncated {
@@ -838,14 +885,22 @@ pub fn render_scrape_result(
     let full_len: usize = blocks.join("\n\n").chars().count();
 
     let mut meta = base_meta;
-    meta.insert("char_count_returned".into(), json!(returned_text.chars().count()));
+    meta.insert(
+        "char_count_returned".into(),
+        json!(returned_text.chars().count()),
+    );
     meta.insert("char_count_total".into(), json!(full_len));
     meta.insert("offset".into(), json!(offset));
     if has_more {
         meta.insert("next_offset".into(), json!(end_idx));
     }
 
-    success_response(json!(returned_text), None, has_more, Some(Value::Object(meta)))
+    success_response(
+        json!(returned_text),
+        None,
+        has_more,
+        Some(Value::Object(meta)),
+    )
 }
 
 #[cfg(test)]
@@ -938,7 +993,10 @@ mod tests {
         assert!(md.contains("Main Heading"));
         assert!(md.contains("First paragraph"));
         assert!(md.contains("Second paragraph"));
-        assert!(!md.contains("SHOULD_NOT_APPEAR"), "script body leaked: {md}");
+        assert!(
+            !md.contains("SHOULD_NOT_APPEAR"),
+            "script body leaked: {md}"
+        );
         assert!(!md.contains("Navigation link"), "nav leaked: {md}");
         assert!(!md.contains("Footer boilerplate"), "footer leaked: {md}");
 
@@ -951,10 +1009,16 @@ mod tests {
     fn extract_strips_links_by_default_and_keeps_them_when_asked() {
         let (plain, _) = extract_markdown(PAGE, false, false).unwrap();
         assert!(plain.contains("a link"));
-        assert!(!plain.contains("https://example.com"), "link url leaked: {plain}");
+        assert!(
+            !plain.contains("https://example.com"),
+            "link url leaked: {plain}"
+        );
 
         let (linked, _) = extract_markdown(PAGE, false, true).unwrap();
-        assert!(linked.contains("https://example.com"), "link url missing: {linked}");
+        assert!(
+            linked.contains("https://example.com"),
+            "link url missing: {linked}"
+        );
     }
 
     #[test]
@@ -966,7 +1030,12 @@ mod tests {
 
     #[test]
     fn extract_returns_none_for_a_page_with_no_body_content() {
-        assert!(extract_markdown("<html><head><title>t</title></head><body></body></html>", false, false).is_none());
+        assert!(extract_markdown(
+            "<html><head><title>t</title></head><body></body></html>",
+            false,
+            false
+        )
+        .is_none());
         assert!(extract_markdown("", false, false).is_none());
     }
 
@@ -975,28 +1044,58 @@ mod tests {
         // No <article>/<main>/#content — recall mode falls back to <body>,
         // precision mode declines and reports nothing extractable.
         let html = "<html><body><p>Loose prose with no semantic container.</p></body></html>";
-        assert!(extract_markdown(html, false, false).is_some(), "recall mode should extract");
-        assert!(extract_markdown(html, true, false).is_none(), "precision mode should decline");
+        assert!(
+            extract_markdown(html, false, false).is_some(),
+            "recall mode should extract"
+        );
+        assert!(
+            extract_markdown(html, true, false).is_none(),
+            "precision mode should decline"
+        );
     }
 
     #[test]
     fn render_reports_pagination_metadata_and_next_offset() {
         let html = format!(
             "<html><head><title>T</title></head><body><article>{}</article></body></html>",
-            (0..20).map(|i| format!("<p>Paragraph number {i} with some filler text.</p>")).collect::<String>()
+            (0..20)
+                .map(|i| format!("<p>Paragraph number {i} with some filler text.</p>"))
+                .collect::<String>()
         );
-        let out = render_scrape_result(&html, "u", "fu", "text/html", None, "markdown", 0, Some(120), false, false);
+        let out = render_scrape_result(
+            &html,
+            "u",
+            "fu",
+            "text/html",
+            None,
+            "markdown",
+            0,
+            Some(120),
+            false,
+            false,
+        );
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["status"], "success");
         assert_eq!(v["truncated"], json!(true));
-        let next = v["metadata"]["next_offset"].as_u64().expect("next_offset present");
+        let next = v["metadata"]["next_offset"]
+            .as_u64()
+            .expect("next_offset present");
         assert!(next > 0);
         assert_eq!(v["metadata"]["offset"], json!(0));
         assert_eq!(v["metadata"]["final_url"], json!("fu"));
 
         // Paging from next_offset returns different content.
         let page2 = render_scrape_result(
-            &html, "u", "fu", "text/html", None, "markdown", next as usize, Some(120), false, false,
+            &html,
+            "u",
+            "fu",
+            "text/html",
+            None,
+            "markdown",
+            next as usize,
+            Some(120),
+            false,
+            false,
         );
         let v2: Value = serde_json::from_str(&page2).unwrap();
         assert_ne!(v["data"], v2["data"]);
@@ -1009,11 +1108,25 @@ mod tests {
             <p>Beta content about aardvarks.</p>\
             <p>Gamma content about zebras again.</p>\
             </article></body></html>";
-        let out = render_scrape_result(html, "u", "u", "text/html", Some("zebras"), "markdown", 0, None, false, false);
+        let out = render_scrape_result(
+            html,
+            "u",
+            "u",
+            "text/html",
+            Some("zebras"),
+            "markdown",
+            0,
+            None,
+            false,
+            false,
+        );
         let v: Value = serde_json::from_str(&out).unwrap();
         let data = v["data"].as_str().unwrap();
         assert!(data.contains("zebras"));
-        assert!(!data.contains("aardvarks"), "non-matching block leaked: {data}");
+        assert!(
+            !data.contains("aardvarks"),
+            "non-matching block leaked: {data}"
+        );
         assert_eq!(v["metadata"]["total_matches"], json!(2));
         assert_eq!(v["metadata"]["filtered_by_query"], json!("zebras"));
     }
@@ -1022,7 +1135,16 @@ mod tests {
     fn render_with_a_no_match_query_says_so_without_fabricating_data() {
         let html = "<html><body><article><p>Alpha.</p><p>Beta.</p></article></body></html>";
         let out = render_scrape_result(
-            html, "u", "u", "text/html", Some("zzzznonexistent"), "markdown", 0, None, false, false,
+            html,
+            "u",
+            "u",
+            "text/html",
+            Some("zzzznonexistent"),
+            "markdown",
+            0,
+            None,
+            false,
+            false,
         );
         let v: Value = serde_json::from_str(&out).unwrap();
         assert!(v["message"].as_str().unwrap().contains("No direct matches"));
@@ -1034,7 +1156,16 @@ mod tests {
     #[test]
     fn render_reports_scrape_empty_for_an_unextractable_page() {
         let out = render_scrape_result(
-            "<html><body></body></html>", "u", "u", "text/html", None, "markdown", 0, None, false, false,
+            "<html><body></body></html>",
+            "u",
+            "u",
+            "text/html",
+            None,
+            "markdown",
+            0,
+            None,
+            false,
+            false,
         );
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["error_code"], "SCRAPE_EMPTY");
@@ -1044,7 +1175,10 @@ mod tests {
 
     #[test]
     fn pdf_filename_sanitizes_and_forces_extension() {
-        assert_eq!(pdf_filename_for("https://e.com/docs/my report.pdf"), "my_report.pdf");
+        assert_eq!(
+            pdf_filename_for("https://e.com/docs/my report.pdf"),
+            "my_report.pdf"
+        );
         assert_eq!(pdf_filename_for("https://e.com/paper"), "paper.pdf");
         assert_eq!(pdf_filename_for("https://e.com/"), "downloaded.pdf");
     }
@@ -1080,7 +1214,10 @@ mod tests {
 
         let (md, _) = extract_markdown(&html, false, false).expect("must return, not abort");
         assert!(md.contains("shallow text"), "shallow content lost: {md}");
-        assert!(!md.contains("deep needle"), "content past the depth cap must be clipped");
+        assert!(
+            !md.contains("deep needle"),
+            "content past the depth cap must be clipped"
+        );
     }
 
     #[tokio::test]
@@ -1096,7 +1233,10 @@ mod tests {
                 let mut req = [0u8; 4096];
                 let _ = sock.read(&mut req).await;
                 let head = if with_content_length {
-                    format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len())
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
                 } else {
                     "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".to_string()
                 };
@@ -1109,12 +1249,18 @@ mod tests {
         // Content-Length pre-check path.
         let url = serve_once(vec![b'x'; 64 * 1024], true).await;
         let resp = reqwest::Client::new().get(url).send().await.unwrap();
-        assert!(matches!(read_body_capped(resp, 1024).await, Err(BodyReadError::TooLarge)));
+        assert!(matches!(
+            read_body_capped(resp, 1024).await,
+            Err(BodyReadError::TooLarge)
+        ));
 
         // Streaming path: no Content-Length header to pre-check.
         let url = serve_once(vec![b'x'; 64 * 1024], false).await;
         let resp = reqwest::Client::new().get(url).send().await.unwrap();
-        assert!(matches!(read_body_capped(resp, 1024).await, Err(BodyReadError::TooLarge)));
+        assert!(matches!(
+            read_body_capped(resp, 1024).await,
+            Err(BodyReadError::TooLarge)
+        ));
 
         // A small body passes through whole.
         let url = serve_once(b"hello body".to_vec(), true).await;
@@ -1129,7 +1275,10 @@ mod tests {
         assert!(text.contains("Big Title"), "heading text kept, got: {text}");
         assert!(!text.contains('#'));
 
-        assert!(text.contains("Some bold and italic text with a link"), "got: {text}");
+        assert!(
+            text.contains("Some bold and italic text with a link"),
+            "got: {text}"
+        );
         assert!(!text.contains("https://e.com/a"), "link url leaked");
         assert!(!text.contains("**"));
         assert!(!text.contains('|'), "table pipes leaked: {text}");
@@ -1137,25 +1286,59 @@ mod tests {
         assert!(text.contains("ignore"), "fence content should remain");
 
         let lower = text.lines().map(str::trim).collect::<Vec<_>>();
-        assert!(lower.contains(&"A   B"), "table header not rendered: {lower:?}");
-        assert!(lower.contains(&"1   2"), "table row not rendered: {lower:?}");
+        assert!(
+            lower.contains(&"A   B"),
+            "table header not rendered: {lower:?}"
+        );
+        assert!(
+            lower.contains(&"1   2"),
+            "table row not rendered: {lower:?}"
+        );
     }
 
     #[test]
     fn render_text_mode_returns_plain_text_instead_of_markdown() {
         let html = "<html><body><article><h1>Hello</h1><p>Tail text.</p></article></body></html>";
 
-        let out_md = render_scrape_result(html, "u", "u", "text/html", None, "markdown", 0, None, false, false);
+        let out_md = render_scrape_result(
+            html,
+            "u",
+            "u",
+            "text/html",
+            None,
+            "markdown",
+            0,
+            None,
+            false,
+            false,
+        );
         let vm: Value = serde_json::from_str(&out_md).unwrap();
         assert_eq!(vm["status"], "success");
-        assert!(vm["data"].as_str().unwrap().contains("# Hello"), "md mode keeps heading marker");
+        assert!(
+            vm["data"].as_str().unwrap().contains("# Hello"),
+            "md mode keeps heading marker"
+        );
 
-        let out_text = render_scrape_result(html, "u", "u", "text/html", None, "text", 0, None, false, false);
+        let out_text = render_scrape_result(
+            html,
+            "u",
+            "u",
+            "text/html",
+            None,
+            "text",
+            0,
+            None,
+            false,
+            false,
+        );
         let vt: Value = serde_json::from_str(&out_text).unwrap();
         assert_eq!(vt["status"], "success");
         let data = vt["data"].as_str().unwrap();
         assert!(data.contains("Hello"), "heading text kept: {data}");
         assert!(data.contains("Tail text."), "body kept: {data}");
-        assert!(!data.contains('#'), "heading marker stripped in text mode: {data}");
+        assert!(
+            !data.contains('#'),
+            "heading marker stripped in text mode: {data}"
+        );
     }
 }

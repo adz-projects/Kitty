@@ -41,9 +41,7 @@ const MAX_SOURCE_CHARS: usize = 12_000;
 static RENDERER: OnceLock<HeadlessRenderer> = OnceLock::new();
 
 fn renderer() -> &'static HeadlessRenderer {
-    RENDERER.get_or_init(|| {
-        HeadlessRenderer::new().with_svg_pipeline(SvgPipeline::resvg_safe())
-    })
+    RENDERER.get_or_init(|| HeadlessRenderer::new().with_svg_pipeline(SvgPipeline::resvg_safe()))
 }
 
 /// Extracts the width component of a rendered SVG's `viewBox="min-x min-y w h"`.
@@ -148,20 +146,19 @@ mod tests {
     fn invalid_source_is_rejected_server_side() {
         // Prose/empty-with-no-diagram must produce an error envelope, not a
         // (previously JS-time) blank frame.
-        let v: Value =
-            serde_json::from_str(&generate_accessible_mermaid("this is not a diagram", "T", "D"))
-                .unwrap();
+        let v: Value = serde_json::from_str(&generate_accessible_mermaid(
+            "this is not a diagram",
+            "T",
+            "D",
+        ))
+        .unwrap();
         assert_eq!(v["status"], "error");
         assert_eq!(v["error_code"], "VIZ_MERMAID_RENDER_FAILED");
     }
 
     #[test]
     fn success_payload_embeds_a_static_svg() {
-        let out = generate_accessible_mermaid(
-            "flowchart TD\nA-->B",
-            "Flow",
-            "A goes to B",
-        );
+        let out = generate_accessible_mermaid("flowchart TD\nA-->B", "Flow", "A goes to B");
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["status"], "success");
         assert_eq!(v["render_config"]["target"], "iframe");
@@ -224,8 +221,14 @@ mod tests {
 
     #[test]
     fn viewbox_width_is_parsed() {
-        assert_eq!(svg_viewbox_width(r#"<svg viewBox="0 0 85 174">"#), Some(85.0));
-        assert_eq!(svg_viewbox_width(r#"<svg viewBox="10 -5 300 200">"#), Some(300.0));
+        assert_eq!(
+            svg_viewbox_width(r#"<svg viewBox="0 0 85 174">"#),
+            Some(85.0)
+        );
+        assert_eq!(
+            svg_viewbox_width(r#"<svg viewBox="10 -5 300 200">"#),
+            Some(300.0)
+        );
         assert_eq!(svg_viewbox_width(r#"<svg>"#), None);
     }
 }

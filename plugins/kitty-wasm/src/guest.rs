@@ -39,13 +39,34 @@ pub const PYTHON_GUEST_BYTES: u64 = 26_267_204;
 /// `~/.kitty-wasm` unless overridden. Kept independent of BigTiny's data dir
 /// so this plugin works standalone (as a stdio MCP server started by hand)
 /// without inheriting a host's layout.
+///
+/// `KITTY_WASM_DATA_DIR` is the specific override and wins outright. Failing
+/// that, the base comes from `paths::home_dir`, which honours
+/// `KITTY_PLUGIN_HOME` — the only thing that makes this directory writable on
+/// Android, where `dirs::home_dir()` reports `/data` and the old `"."`
+/// fallback resolved to `/`. That is why the guest download this crate's
+/// Android path depends on could never succeed: every write went to an
+/// unwritable location.
 pub fn data_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("KITTY_WASM_DATA_DIR") {
-        return PathBuf::from(dir);
+        if !dir.trim().is_empty() {
+            return PathBuf::from(dir);
+        }
     }
-    dirs::home_dir()
+    crate::paths::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".kitty-wasm")
+}
+
+/// Per-run scratch space, replacing `std::env::temp_dir()`.
+///
+/// Android has no `/tmp` and sets no `TMPDIR` for an app process, so
+/// `std::env::temp_dir()` returned a path that does not exist and cannot be
+/// created — which failed every `execute_math_python` call before the sandbox
+/// was even started. Keeping scratch under the (now correctly resolved) data
+/// dir means there is exactly one directory to get right per platform.
+pub fn run_dir() -> PathBuf {
+    data_dir().join("run")
 }
 
 pub fn guests_dir() -> PathBuf {
@@ -251,13 +272,19 @@ pub(crate) mod testing {
         pub(crate) fn set(key: &str, value: &str) -> Self {
             let previous = std::env::var(key).ok();
             std::env::set_var(key, value);
-            Self { key: key.to_string(), previous }
+            Self {
+                key: key.to_string(),
+                previous,
+            }
         }
 
         pub(crate) fn unset(key: &str) -> Self {
             let previous = std::env::var(key).ok();
             std::env::remove_var(key);
-            Self { key: key.to_string(), previous }
+            Self {
+                key: key.to_string(),
+                previous,
+            }
         }
     }
 
@@ -292,7 +319,9 @@ mod tests {
     fn sha256_hex_is_always_64_lowercase_hex_chars() {
         let digest = sha256_hex(&[0u8, 1, 2, 255]);
         assert_eq!(digest.len(), 64);
-        assert!(digest.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(digest
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
     }
 
     #[test]
@@ -326,7 +355,10 @@ mod tests {
 
         let status = python_guest_status();
         assert_eq!(status["available"], serde_json::json!(false));
-        assert_eq!(status["pinned"]["sha256"], serde_json::json!(PYTHON_GUEST_SHA256));
+        assert_eq!(
+            status["pinned"]["sha256"],
+            serde_json::json!(PYTHON_GUEST_SHA256)
+        );
         assert!(status["install_path"].as_str().unwrap().contains("guests"));
     }
 
@@ -346,11 +378,19 @@ mod tests {
             let _lock = env_lock();
             let _data = EnvGuard::set("KITTY_WASM_DATA_DIR", dir.path().to_str().unwrap());
             let _no_override = EnvGuard::unset("KITTY_WASM_PYTHON");
-            block_on(ensure_python_guest(false)).unwrap_err().to_string()
+            block_on(ensure_python_guest(false))
+                .unwrap_err()
+                .to_string()
         };
         assert!(err.contains("not installed"), "got: {err}");
-        assert!(err.contains("install=true"), "must say how to fix it: {err}");
-        assert!(err.contains(PYTHON_GUEST_SHA256), "must state the pin: {err}");
+        assert!(
+            err.contains("install=true"),
+            "must say how to fix it: {err}"
+        );
+        assert!(
+            err.contains(PYTHON_GUEST_SHA256),
+            "must state the pin: {err}"
+        );
     }
 
     #[test]
@@ -358,7 +398,9 @@ mod tests {
         let err = {
             let _lock = env_lock();
             let _bad = EnvGuard::set("KITTY_WASM_PYTHON", "/definitely/not/here.wasm");
-            block_on(ensure_python_guest(false)).unwrap_err().to_string()
+            block_on(ensure_python_guest(false))
+                .unwrap_err()
+                .to_string()
         };
         // A configured-but-wrong path is a misconfiguration to surface, not
         // something to silently paper over with the managed guest.

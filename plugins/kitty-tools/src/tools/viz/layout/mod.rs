@@ -61,7 +61,11 @@ pub const WIDTH_SLACK: f32 = 60.0;
 /// Non-decision nodes wrap labels to the capped inner width; decisions clamp
 /// their box and triangle label band to it.
 pub fn size_node_capped(label: &str, badge: Option<&str>, max_w: f32) -> SizedNode {
-    let label = if label.trim().is_empty() { "Untitled".to_string() } else { label.to_string() };
+    let label = if label.trim().is_empty() {
+        "Untitled".to_string()
+    } else {
+        label.to_string()
+    };
 
     if badge.is_some() {
         return size_decision_capped(&label, badge, max_w);
@@ -74,7 +78,10 @@ pub fn size_node_capped(label: &str, badge: Option<&str>, max_w: f32) -> SizedNo
         (vec![label], w)
     } else {
         let wrapped = text::wrap(&label, inner_w, NODE_FONT_PX, MAX_LINES);
-        let widest = wrapped.iter().map(|l| text::measure_px(l, NODE_FONT_PX)).fold(0.0_f32, f32::max);
+        let widest = wrapped
+            .iter()
+            .map(|l| text::measure_px(l, NODE_FONT_PX))
+            .fold(0.0_f32, f32::max);
         (wrapped, widest)
     };
 
@@ -82,7 +89,12 @@ pub fn size_node_capped(label: &str, badge: Option<&str>, max_w: f32) -> SizedNo
 
     let h = (2.0 * PAD_Y + lines.len() as f32 * LINE_H).max(MIN_NODE_H);
 
-    SizedNode { w, h, lines, badge: None }
+    SizedNode {
+        w,
+        h,
+        lines,
+        badge: None,
+    }
 }
 
 /// `size_decision` capped at `max_w` (see `size_node_capped`). Iterates to
@@ -101,7 +113,10 @@ fn size_decision_capped(label: &str, badge: Option<&str>, max_w: f32) -> SizedNo
             (vec![label.clone()], m)
         } else {
             let wrapped = text::wrap(&label, band, NODE_FONT_PX, 2);
-            let widest = wrapped.iter().map(|l| text::measure_px(l, NODE_FONT_PX)).fold(0.0_f32, f32::max);
+            let widest = wrapped
+                .iter()
+                .map(|l| text::measure_px(l, NODE_FONT_PX))
+                .fold(0.0_f32, f32::max);
             (wrapped, widest)
         };
         let new_w = (new_content + 2.0 * PAD_X).clamp(DECISION_MIN_W, max_w);
@@ -115,10 +130,17 @@ fn size_decision_capped(label: &str, badge: Option<&str>, max_w: f32) -> SizedNo
 
     let badge = badge.and_then(|b| {
         let max_badge_w = (DECISION_BADGE_FRAC * w).max(10.0);
-        text::wrap(b, max_badge_w, BADGE_FONT_PX, 1).into_iter().next()
+        text::wrap(b, max_badge_w, BADGE_FONT_PX, 1)
+            .into_iter()
+            .next()
     });
 
-    SizedNode { w, h: DECISION_MIN_H, lines, badge }
+    SizedNode {
+        w,
+        h: DECISION_MIN_H,
+        lines,
+        badge,
+    }
 }
 
 pub struct SizedNode {
@@ -162,7 +184,14 @@ pub fn draw_node(canvas: &mut SvgCanvas, x: f32, y: f32, w: f32, h: f32, visual:
                 // Badge just below the apex, where the triangle is wide enough
                 // for a short caption; `text_line_fit` clamps it to the
                 // available band so it can never spill past the slanted edges.
-                canvas.text_line_fit(cx, y + h * 0.26, "badge-meta", b, BADGE_FONT_PX, DECISION_BADGE_FRAC * w);
+                canvas.text_line_fit(
+                    cx,
+                    y + h * 0.26,
+                    "badge-meta",
+                    b,
+                    BADGE_FONT_PX,
+                    DECISION_BADGE_FRAC * w,
+                );
             }
             // Bottom-anchored label: the block is centered so its last line
             // sits DECISION_BASE_MARGIN above the base, keeping every line in
@@ -170,15 +199,39 @@ pub fn draw_node(canvas: &mut SvgCanvas, x: f32, y: f32, w: f32, h: f32, visual:
             // line fits that band, so the textLength backstop stays idle.
             let n = visual.lines.len() as f32;
             let block_center = (y + h - DECISION_BASE_MARGIN) - (n - 1.0) * LINE_H / 2.0;
-            canvas.text_lines_fit(cx, block_center, "node-text", visual.lines, LINE_H, NODE_FONT_PX, DECISION_LABEL_FRAC * w);
+            canvas.text_lines_fit(
+                cx,
+                block_center,
+                "node-text",
+                visual.lines,
+                LINE_H,
+                NODE_FONT_PX,
+                DECISION_LABEL_FRAC * w,
+            );
         }
         StepType::Start | StepType::End => {
             canvas.rect(x, y, w, h, "node-box pill");
-            canvas.text_lines_fit(cx, y + h / 2.0, "node-text", visual.lines, LINE_H, NODE_FONT_PX, w - 2.0 * PAD_X);
+            canvas.text_lines_fit(
+                cx,
+                y + h / 2.0,
+                "node-text",
+                visual.lines,
+                LINE_H,
+                NODE_FONT_PX,
+                w - 2.0 * PAD_X,
+            );
         }
         StepType::Process => {
             canvas.rect(x, y, w, h, "node-box");
-            canvas.text_lines_fit(cx, y + h / 2.0, "node-text", visual.lines, LINE_H, NODE_FONT_PX, w - 2.0 * PAD_X);
+            canvas.text_lines_fit(
+                cx,
+                y + h / 2.0,
+                "node-text",
+                visual.lines,
+                LINE_H,
+                NODE_FONT_PX,
+                w - 2.0 * PAD_X,
+            );
         }
     }
 }
@@ -196,7 +249,10 @@ mod tests {
 
     #[test]
     fn long_label_wraps_and_caps_width() {
-        let n = size_node("This is a much longer label than any single line node should hold comfortably", None);
+        let n = size_node(
+            "This is a much longer label than any single line node should hold comfortably",
+            None,
+        );
         assert!(n.lines.len() > 1);
         assert!(n.w <= MAX_NODE_W);
         assert!(n.lines.len() <= MAX_LINES);
@@ -217,7 +273,10 @@ mod tests {
 
     #[test]
     fn every_node_line_fits_inside_its_own_width() {
-        let n = size_node("An extremely long process step description that must wrap several times over", None);
+        let n = size_node(
+            "An extremely long process step description that must wrap several times over",
+            None,
+        );
         let inner_w = n.w - 2.0 * PAD_X;
         for line in &n.lines {
             assert!(text::measure_px(line, NODE_FONT_PX) <= inner_w + 0.5);
@@ -231,7 +290,12 @@ mod tests {
         // t = (h - DECISION_BASE_MARGIN - (n-1)*LINE_H)/h where the triangle
         // offers t*w of width. Assert both directly so a constant drift fails
         // loudly instead of silently re-introducing apex spill.
-        for label in ["Payment approved?", "Are all credentials valid before we proceed to the next step?", "OK", "x".repeat(60).as_str()] {
+        for label in [
+            "Payment approved?",
+            "Are all credentials valid before we proceed to the next step?",
+            "OK",
+            "x".repeat(60).as_str(),
+        ] {
             let n = size_node(label, Some("GATE"));
             let block_clearance = DECISION_BASE_MARGIN + (n.lines.len() as f32 - 1.0) * LINE_H;
             let top_line_t = (n.h - block_clearance) / n.h;

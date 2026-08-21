@@ -31,13 +31,19 @@ fn wrap_in_standalone_html(title: &str, body_content: &str) -> String {
     // `BODY` is already-escaped SVG/HTML from the renderers and must NOT be
     // double-escaped, so it passes through verbatim.
     let escaped_title = escape::escape_text(title);
-    escape::render_template(WRAPPER, &[("TITLE", &escaped_title), ("BODY", body_content)])
+    escape::render_template(
+        WRAPPER,
+        &[("TITLE", &escaped_title), ("BODY", body_content)],
+    )
 }
 
 fn success_payload(title: &str, html_payload: &str, warnings: &[String]) -> String {
     let mut payload = Map::new();
     payload.insert("status".to_string(), json!("success"));
-    payload.insert("render_config".to_string(), json!({"target": "iframe", "title": title, "sandbox": "allow-scripts"}));
+    payload.insert(
+        "render_config".to_string(),
+        json!({"target": "iframe", "title": title, "sandbox": "allow-scripts"}),
+    );
     payload.insert("html_payload".to_string(), json!(html_payload));
     if !warnings.is_empty() {
         payload.insert("warnings".to_string(), json!(warnings));
@@ -45,7 +51,12 @@ fn success_payload(title: &str, html_payload: &str, warnings: &[String]) -> Stri
     serde_json::to_string_pretty(&Value::Object(payload)).unwrap_or_else(|_| "{}".to_string())
 }
 
-pub fn generate_accessible_table(title: &str, headers: &[String], rows: &[Vec<Value>], summary: Option<&str>) -> String {
+pub fn generate_accessible_table(
+    title: &str,
+    headers: &[String],
+    rows: &[Vec<Value>],
+    summary: Option<&str>,
+) -> String {
     if let Err(e) = model::validate_table(headers, rows) {
         return e;
     }
@@ -54,7 +65,12 @@ pub fn generate_accessible_table(title: &str, headers: &[String], rows: &[Vec<Va
     success_payload(title, &standalone, &[])
 }
 
-pub fn generate_accessible_svg(diagram_type: model::DiagramType, title: &str, description: &str, steps: Vec<model::Step>) -> String {
+pub fn generate_accessible_svg(
+    diagram_type: model::DiagramType,
+    title: &str,
+    description: &str,
+    steps: Vec<model::Step>,
+) -> String {
     let validated = match model::validate_diagram(diagram_type, title, description, steps) {
         Ok(v) => v,
         Err(e) => return e,
@@ -85,7 +101,14 @@ pub fn generate_accessible_svg(diagram_type: model::DiagramType, title: &str, de
         );
     }
 
-    let svg = render::svg::document(DEFS, &validated.title, &validated.description, width, height, &body);
+    let svg = render::svg::document(
+        DEFS,
+        &validated.title,
+        &validated.description,
+        width,
+        height,
+        &body,
+    );
     let standalone = wrap_in_standalone_html(&validated.title, &svg);
     success_payload(&validated.title, &standalone, &validated.warnings)
 }
@@ -104,13 +127,16 @@ pub fn generate_accessible_chart(
         return e;
     }
 
-    let (body, width, height) = layout::chart::render(chart_type, &categories, &series, x_label, y_label);
+    let (body, width, height) =
+        layout::chart::render(chart_type, &categories, &series, x_label, y_label);
     let svg = render::svg::document(DEFS, title, description, width, height, &body);
 
     // A hidden data table alongside the SVG gives screen readers the exact
     // numbers a chart otherwise only conveys visually (bar height, line
     // slope) — nearly free since `render::table` already exists.
-    let table_headers: Vec<String> = std::iter::once("Category".to_string()).chain(series.iter().map(|s| s.name.clone())).collect();
+    let table_headers: Vec<String> = std::iter::once("Category".to_string())
+        .chain(series.iter().map(|s| s.name.clone()))
+        .collect();
     let table_rows: Vec<Vec<Value>> = categories
         .iter()
         .enumerate()
@@ -152,7 +178,11 @@ mod tests {
 
     #[test]
     fn svg_success_carries_warnings_when_present() {
-        let steps = vec![Step { text: "A".to_string(), sentiment: Some(1), ..Default::default() }];
+        let steps = vec![Step {
+            text: "A".to_string(),
+            sentiment: Some(1),
+            ..Default::default()
+        }];
         let s = generate_accessible_svg(DiagramType::SingleLane, "T", "D", steps);
         let v: Value = serde_json::from_str(&s).unwrap();
         assert_eq!(v["status"], "success");
@@ -174,7 +204,10 @@ mod tests {
     #[test]
     fn chart_success_embeds_a_screen_reader_table() {
         let categories = vec!["Q1".to_string(), "Q2".to_string()];
-        let series = vec![ChartSeries { name: "Revenue".to_string(), values: vec![1.0, 2.0] }];
+        let series = vec![ChartSeries {
+            name: "Revenue".to_string(),
+            values: vec![1.0, 2.0],
+        }];
         let s = generate_accessible_chart(ChartType::Bar, "T", "D", categories, series, None, None);
         let v: Value = serde_json::from_str(&s).unwrap();
         assert_eq!(v["status"], "success");
@@ -188,12 +221,19 @@ mod tests {
         // Historical bug: `.replace("__TITLE__", t).replace("__BODY__", b)`
         // would let a title containing the literal "__BODY__" get re-scanned
         // by the second replace. `render_template` fixes this by construction.
-        let steps = vec![Step { text: "Alpha".to_string(), ..Default::default() }];
-        let s = generate_accessible_svg(DiagramType::SingleLane, "evil __BODY__ literal", "D", steps);
+        let steps = vec![Step {
+            text: "Alpha".to_string(),
+            ..Default::default()
+        }];
+        let s =
+            generate_accessible_svg(DiagramType::SingleLane, "evil __BODY__ literal", "D", steps);
         let v: Value = serde_json::from_str(&s).unwrap();
         let html = v["html_payload"].as_str().unwrap();
         assert!(html.contains("evil __BODY__ literal"));
-        assert!(html.contains("Alpha"), "the real body must still be present, not replaced by the title's literal token");
+        assert!(
+            html.contains("Alpha"),
+            "the real body must still be present, not replaced by the title's literal token"
+        );
     }
 
     #[test]
@@ -211,7 +251,10 @@ mod tests {
         let v: Value = serde_json::from_str(&s).unwrap();
         assert_eq!(v["status"], "success");
         let html = v["html_payload"].as_str().unwrap();
-        assert!(!html.contains("</title><script"), "title must not break out of the element: {html}");
+        assert!(
+            !html.contains("</title><script"),
+            "title must not break out of the element: {html}"
+        );
         assert!(
             html.contains("&lt;/title&gt;&lt;script&gt;alert(1)&lt;/script&gt;"),
             "title should appear HTML-escaped: {html}"

@@ -73,10 +73,18 @@ pub struct ValidatedDiagram {
 /// directly as the tool's output. Fields that don't apply to the given
 /// `diagram_type` are warnings, not errors — the diagram is still renderable
 /// with them simply ignored, so rejecting the call outright would be hostile.
-pub fn validate_diagram(diagram_type: DiagramType, title: &str, description: &str, steps: Vec<Step>) -> Result<ValidatedDiagram, String> {
+pub fn validate_diagram(
+    diagram_type: DiagramType,
+    title: &str,
+    description: &str,
+    steps: Vec<Step>,
+) -> Result<ValidatedDiagram, String> {
     let mut warnings = Vec::new();
 
-    let non_empty: Vec<Step> = steps.into_iter().filter(|s| !s.text.trim().is_empty()).collect();
+    let non_empty: Vec<Step> = steps
+        .into_iter()
+        .filter(|s| !s.text.trim().is_empty())
+        .collect();
     if non_empty.is_empty() {
         return Err(error_response(
             "VIZ_EMPTY_STEPS",
@@ -94,9 +102,15 @@ pub fn validate_diagram(diagram_type: DiagramType, title: &str, description: &st
     if non_empty.len() > cap {
         return Err(error_response(
             "VIZ_TOO_MANY_NODES",
-            &format!("{} steps were provided, but \"{}\" supports at most {cap}.", non_empty.len(), diagram_type_name(diagram_type)),
+            &format!(
+                "{} steps were provided, but \"{}\" supports at most {cap}.",
+                non_empty.len(),
+                diagram_type_name(diagram_type)
+            ),
             None,
-            Some(&format!("Split into multiple diagrams, or summarize down to at most {cap} steps.")),
+            Some(&format!(
+                "Split into multiple diagrams, or summarize down to at most {cap} steps."
+            )),
         ));
     }
 
@@ -142,7 +156,9 @@ pub fn validate_diagram(diagram_type: DiagramType, title: &str, description: &st
     }
 
     if diagram_type == DiagramType::Swimlane {
-        let any_lane = non_empty.iter().any(|s| s.lane.as_deref().is_some_and(|l| !l.trim().is_empty()));
+        let any_lane = non_empty
+            .iter()
+            .any(|s| s.lane.as_deref().is_some_and(|l| !l.trim().is_empty()));
         if !any_lane {
             return Err(error_response(
                 "VIZ_MISSING_LANES",
@@ -199,15 +215,29 @@ pub fn validate_diagram(diagram_type: DiagramType, title: &str, description: &st
             }
         }
         if !irrelevant.is_empty() {
-            warnings.push(format!("Step {idx}: {} ignored by \"{}\".", join_backtick(&irrelevant), diagram_type_name(diagram_type)));
+            warnings.push(format!(
+                "Step {idx}: {} ignored by \"{}\".",
+                join_backtick(&irrelevant),
+                diagram_type_name(diagram_type)
+            ));
         }
     }
 
-    Ok(ValidatedDiagram { diagram_type, title: title.to_string(), description: description.to_string(), steps: non_empty, warnings })
+    Ok(ValidatedDiagram {
+        diagram_type,
+        title: title.to_string(),
+        description: description.to_string(),
+        steps: non_empty,
+        warnings,
+    })
 }
 
 fn join_backtick(fields: &[&str]) -> String {
-    fields.iter().map(|f| format!("`{f}`")).collect::<Vec<_>>().join("/")
+    fields
+        .iter()
+        .map(|f| format!("`{f}`"))
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// Computes each node's longest-path layer (Bellman-Ford-style relaxation)
@@ -274,16 +304,30 @@ fn reject_skip_level_edges(steps: &[Step]) -> Result<(), String> {
 
 pub fn validate_table(headers: &[String], rows: &[Vec<Value>]) -> Result<(), String> {
     if headers.is_empty() {
-        return Err(error_response("VIZ_EMPTY_TABLE", "No headers were provided.", None, Some("Provide at least one column header.")));
+        return Err(error_response(
+            "VIZ_EMPTY_TABLE",
+            "No headers were provided.",
+            None,
+            Some("Provide at least one column header."),
+        ));
     }
     if rows.is_empty() {
-        return Err(error_response("VIZ_EMPTY_TABLE", "No rows were provided.", None, Some("Provide at least one row of data.")));
+        return Err(error_response(
+            "VIZ_EMPTY_TABLE",
+            "No rows were provided.",
+            None,
+            Some("Provide at least one row of data."),
+        ));
     }
     for (idx, row) in rows.iter().enumerate() {
         if row.len() != headers.len() {
             return Err(error_response(
                 "VIZ_RAGGED_ROWS",
-                &format!("Row {idx} has {} value(s) but there are {} headers.", row.len(), headers.len()),
+                &format!(
+                    "Row {idx} has {} value(s) but there are {} headers.",
+                    row.len(),
+                    headers.len()
+                ),
                 None,
                 Some("Every row must have exactly as many values as there are headers."),
             ));
@@ -310,24 +354,44 @@ pub struct ChartSeries {
 
 pub fn validate_chart(categories: &[String], series: &[ChartSeries]) -> Result<(), String> {
     if categories.is_empty() {
-        return Err(error_response("VIZ_EMPTY_TABLE", "No categories were provided.", None, Some("Provide at least one category label.")));
+        return Err(error_response(
+            "VIZ_EMPTY_TABLE",
+            "No categories were provided.",
+            None,
+            Some("Provide at least one category label."),
+        ));
     }
     if categories.len() > MAX_CHART_CATEGORIES {
         return Err(error_response(
             "VIZ_TOO_MANY_NODES",
-            &format!("{} categories were provided, but charts support at most {MAX_CHART_CATEGORIES}.", categories.len()),
+            &format!(
+                "{} categories were provided, but charts support at most {MAX_CHART_CATEGORIES}.",
+                categories.len()
+            ),
             None,
-            Some(&format!("Summarize down to at most {MAX_CHART_CATEGORIES} categories.")),
+            Some(&format!(
+                "Summarize down to at most {MAX_CHART_CATEGORIES} categories."
+            )),
         ));
     }
     if series.is_empty() {
-        return Err(error_response("VIZ_EMPTY_TABLE", "No series were provided.", None, Some("Provide at least one series of values.")));
+        return Err(error_response(
+            "VIZ_EMPTY_TABLE",
+            "No series were provided.",
+            None,
+            Some("Provide at least one series of values."),
+        ));
     }
     for s in series {
         if s.values.len() != categories.len() {
             return Err(error_response(
                 "VIZ_SERIES_LENGTH_MISMATCH",
-                &format!("Series \"{}\" has {} value(s) but there are {} categories.", s.name, s.values.len(), categories.len()),
+                &format!(
+                    "Series \"{}\" has {} value(s) but there are {} categories.",
+                    s.name,
+                    s.values.len(),
+                    categories.len()
+                ),
                 None,
                 Some("Every series must have exactly one value per category."),
             ));
@@ -350,35 +414,59 @@ mod tests {
     use serde_json::json;
 
     fn step(text: &str) -> Step {
-        Step { text: text.to_string(), ..Default::default() }
+        Step {
+            text: text.to_string(),
+            ..Default::default()
+        }
     }
 
     #[test]
     fn rejects_all_blank_steps() {
-        let err = validate_diagram(DiagramType::SingleLane, "T", "D", vec![step(""), step("   ")]).unwrap_err();
+        let err = validate_diagram(
+            DiagramType::SingleLane,
+            "T",
+            "D",
+            vec![step(""), step("   ")],
+        )
+        .unwrap_err();
         assert!(err.contains("VIZ_EMPTY_STEPS"));
         assert!(err.contains("\"hint\""));
     }
 
     #[test]
     fn filters_blank_steps_but_keeps_the_rest() {
-        let v = validate_diagram(DiagramType::SingleLane, "T", "D", vec![step(""), step("Real step")]).unwrap();
+        let v = validate_diagram(
+            DiagramType::SingleLane,
+            "T",
+            "D",
+            vec![step(""), step("Real step")],
+        )
+        .unwrap();
         assert_eq!(v.steps.len(), 1);
         assert_eq!(v.steps[0].text, "Real step");
     }
 
     #[test]
     fn rejects_too_many_nodes_for_swimlane() {
-        let steps: Vec<Step> = (0..30).map(|i| Step { text: format!("s{i}"), lane: Some("A".into()), ..Default::default() }).collect();
+        let steps: Vec<Step> = (0..30)
+            .map(|i| Step {
+                text: format!("s{i}"),
+                lane: Some("A".into()),
+                ..Default::default()
+            })
+            .collect();
         let err = validate_diagram(DiagramType::Swimlane, "T", "D", steps).unwrap_err();
         assert!(err.contains("VIZ_TOO_MANY_NODES"));
     }
 
     #[test]
     fn rejects_unknown_next_reference() {
-        let steps = vec![
-            Step { id: Some("a".into()), text: "A".into(), next: vec!["ghost".into()], ..Default::default() },
-        ];
+        let steps = vec![Step {
+            id: Some("a".into()),
+            text: "A".into(),
+            next: vec!["ghost".into()],
+            ..Default::default()
+        }];
         let err = validate_diagram(DiagramType::Flowchart, "T", "D", steps).unwrap_err();
         assert!(err.contains("VIZ_BAD_EDGE_REF"));
         assert!(err.contains("\"hint\""));
@@ -391,16 +479,34 @@ mod tests {
         // depths higher. The loop is now bounded and the cycle rejected
         // through the validation entry point (not just at render).
         let steps = vec![
-            Step { id: Some("a".into()), text: "A".into(), next: vec!["b".into()], ..Default::default() },
-            Step { id: Some("b".into()), text: "B".into(), next: vec!["a".into()], ..Default::default() },
+            Step {
+                id: Some("a".into()),
+                text: "A".into(),
+                next: vec!["b".into()],
+                ..Default::default()
+            },
+            Step {
+                id: Some("b".into()),
+                text: "B".into(),
+                next: vec!["a".into()],
+                ..Default::default()
+            },
         ];
         let err = validate_diagram(DiagramType::Flowchart, "T", "D", steps).unwrap_err();
         assert!(err.contains("VIZ_BAD_EDGE_REF"), "got: {err}");
-        assert!(err.contains("cycle"), "the message should name the problem: {err}");
+        assert!(
+            err.contains("cycle"),
+            "the message should name the problem: {err}"
+        );
         assert!(err.contains("\"hint\""));
 
         // A self-loop is the one-node form of the same bug.
-        let steps = vec![Step { id: Some("a".into()), text: "A".into(), next: vec!["a".into()], ..Default::default() }];
+        let steps = vec![Step {
+            id: Some("a".into()),
+            text: "A".into(),
+            next: vec!["a".into()],
+            ..Default::default()
+        }];
         let err = validate_diagram(DiagramType::Flowchart, "T", "D", steps).unwrap_err();
         assert!(err.contains("VIZ_BAD_EDGE_REF"), "got: {err}");
     }
@@ -408,9 +514,23 @@ mod tests {
     #[test]
     fn rejects_tree_node_with_two_parents() {
         let steps = vec![
-            Step { id: Some("a".into()), text: "A".into(), next: vec!["c".into()], ..Default::default() },
-            Step { id: Some("b".into()), text: "B".into(), next: vec!["c".into()], ..Default::default() },
-            Step { id: Some("c".into()), text: "C".into(), ..Default::default() },
+            Step {
+                id: Some("a".into()),
+                text: "A".into(),
+                next: vec!["c".into()],
+                ..Default::default()
+            },
+            Step {
+                id: Some("b".into()),
+                text: "B".into(),
+                next: vec!["c".into()],
+                ..Default::default()
+            },
+            Step {
+                id: Some("c".into()),
+                text: "C".into(),
+                ..Default::default()
+            },
         ];
         let err = validate_diagram(DiagramType::Tree, "T", "D", steps).unwrap_err();
         assert!(err.contains("VIZ_BAD_EDGE_REF"));
@@ -419,9 +539,23 @@ mod tests {
     #[test]
     fn allows_dag_merge_in_flowchart() {
         let steps = vec![
-            Step { id: Some("a".into()), text: "A".into(), next: vec!["c".into()], ..Default::default() },
-            Step { id: Some("b".into()), text: "B".into(), next: vec!["c".into()], ..Default::default() },
-            Step { id: Some("c".into()), text: "C".into(), ..Default::default() },
+            Step {
+                id: Some("a".into()),
+                text: "A".into(),
+                next: vec!["c".into()],
+                ..Default::default()
+            },
+            Step {
+                id: Some("b".into()),
+                text: "B".into(),
+                next: vec!["c".into()],
+                ..Default::default()
+            },
+            Step {
+                id: Some("c".into()),
+                text: "C".into(),
+                ..Default::default()
+            },
         ];
         let v = validate_diagram(DiagramType::Flowchart, "T", "D", steps).unwrap();
         assert_eq!(v.steps.len(), 3);
@@ -429,13 +563,18 @@ mod tests {
 
     #[test]
     fn rejects_swimlane_with_no_lanes() {
-        let err = validate_diagram(DiagramType::Swimlane, "T", "D", vec![step("A"), step("B")]).unwrap_err();
+        let err = validate_diagram(DiagramType::Swimlane, "T", "D", vec![step("A"), step("B")])
+            .unwrap_err();
         assert!(err.contains("VIZ_MISSING_LANES"));
     }
 
     #[test]
     fn warns_on_irrelevant_fields_but_still_renders() {
-        let steps = vec![Step { text: "A".into(), sentiment: Some(1), ..Default::default() }];
+        let steps = vec![Step {
+            text: "A".into(),
+            sentiment: Some(1),
+            ..Default::default()
+        }];
         let v = validate_diagram(DiagramType::SingleLane, "T", "D", steps).unwrap();
         assert_eq!(v.steps.len(), 1);
         assert!(!v.warnings.is_empty());
@@ -458,7 +597,8 @@ mod tests {
 
     #[test]
     fn table_rejects_ragged_rows() {
-        let err = validate_table(&["A".to_string(), "B".to_string()], &[vec![json!(1)]]).unwrap_err();
+        let err =
+            validate_table(&["A".to_string(), "B".to_string()], &[vec![json!(1)]]).unwrap_err();
         assert!(err.contains("VIZ_RAGGED_ROWS"));
         assert!(err.contains("\"hint\""));
     }
@@ -471,14 +611,24 @@ mod tests {
 
     #[test]
     fn chart_rejects_series_length_mismatch() {
-        let series = vec![ChartSeries { name: "S".to_string(), values: vec![1.0, 2.0] }];
-        let err = validate_chart(&["Q1".to_string(), "Q2".to_string(), "Q3".to_string()], &series).unwrap_err();
+        let series = vec![ChartSeries {
+            name: "S".to_string(),
+            values: vec![1.0, 2.0],
+        }];
+        let err = validate_chart(
+            &["Q1".to_string(), "Q2".to_string(), "Q3".to_string()],
+            &series,
+        )
+        .unwrap_err();
         assert!(err.contains("VIZ_SERIES_LENGTH_MISMATCH"));
     }
 
     #[test]
     fn chart_rejects_non_finite_values() {
-        let series = vec![ChartSeries { name: "S".to_string(), values: vec![1.0, f64::NAN] }];
+        let series = vec![ChartSeries {
+            name: "S".to_string(),
+            values: vec![1.0, f64::NAN],
+        }];
         let err = validate_chart(&["Q1".to_string(), "Q2".to_string()], &series).unwrap_err();
         assert!(err.contains("VIZ_BAD_NUMBER"));
     }
@@ -486,7 +636,10 @@ mod tests {
     #[test]
     fn chart_rejects_too_many_categories() {
         let categories: Vec<String> = (0..30).map(|i| format!("c{i}")).collect();
-        let series = vec![ChartSeries { name: "S".to_string(), values: vec![1.0; 30] }];
+        let series = vec![ChartSeries {
+            name: "S".to_string(),
+            values: vec![1.0; 30],
+        }];
         let err = validate_chart(&categories, &series).unwrap_err();
         assert!(err.contains("VIZ_TOO_MANY_NODES"));
     }

@@ -75,16 +75,31 @@ pub fn scratchpad_set(key: &str, value: &str) -> String {
     let mut data = load(&path);
     data.insert(key.to_string(), value.to_string());
     if let Err(e) = save(&path, &data) {
-        return error_response("SCRATCHPAD_WRITE_ERROR", &format!("Cannot save scratchpad: {e}"), None, None);
+        return error_response(
+            "SCRATCHPAD_WRITE_ERROR",
+            &format!("Cannot save scratchpad: {e}"),
+            None,
+            None,
+        );
     }
-    success_response(json!({"key": key}), Some("Stored successfully."), false, None)
+    success_response(
+        json!({"key": key}),
+        Some("Stored successfully."),
+        false,
+        None,
+    )
 }
 
 pub fn scratchpad_get(key: &str) -> String {
     let data = load(&scratch_path());
     match data.get(key) {
         Some(value) => success_response(json!({"key": key, "value": value}), None, false, None),
-        None => error_response("KEY_NOT_FOUND", &format!("Key '{key}' not in scratchpad."), None, None),
+        None => error_response(
+            "KEY_NOT_FOUND",
+            &format!("Key '{key}' not in scratchpad."),
+            None,
+            None,
+        ),
     }
 }
 
@@ -92,11 +107,21 @@ pub fn scratchpad_delete(key: &str) -> String {
     let path = scratch_path();
     let mut data = load(&path);
     if !data.contains_key(key) {
-        return error_response("KEY_NOT_FOUND", &format!("Key '{key}' not in scratchpad."), None, None);
+        return error_response(
+            "KEY_NOT_FOUND",
+            &format!("Key '{key}' not in scratchpad."),
+            None,
+            None,
+        );
     }
     data.remove(key);
     if let Err(e) = save(&path, &data) {
-        return error_response("SCRATCHPAD_WRITE_ERROR", &format!("Cannot save scratchpad: {e}"), None, None);
+        return error_response(
+            "SCRATCHPAD_WRITE_ERROR",
+            &format!("Cannot save scratchpad: {e}"),
+            None,
+            None,
+        );
     }
     success_response(json!({"deleted_key": key}), None, false, None)
 }
@@ -124,7 +149,8 @@ mod tests {
 
         assert!(new.exists());
         assert!(!old.exists());
-        let data: BTreeMap<String, String> = serde_json::from_str(&fs::read_to_string(&new).unwrap()).unwrap();
+        let data: BTreeMap<String, String> =
+            serde_json::from_str(&fs::read_to_string(&new).unwrap()).unwrap();
         assert_eq!(data.get("k").unwrap(), "v");
 
         fs::remove_dir_all(&base).ok();
@@ -142,9 +168,13 @@ mod tests {
 
         migrate_scratchpad_impl(&old, &new);
 
-        let data: BTreeMap<String, String> = serde_json::from_str(&fs::read_to_string(&new).unwrap()).unwrap();
+        let data: BTreeMap<String, String> =
+            serde_json::from_str(&fs::read_to_string(&new).unwrap()).unwrap();
         assert!(data.contains_key("authoritative"));
-        assert!(old.exists(), "old file must survive untouched when destination already exists");
+        assert!(
+            old.exists(),
+            "old file must survive untouched when destination already exists"
+        );
 
         fs::remove_dir_all(&base).ok();
     }

@@ -27,13 +27,21 @@ pub fn render(steps: &[Step]) -> (String, f32, f32) {
     // order), so fit `MAX_CONTENT_W_WIDE` by capping the column width; stage
     // labels wrap to two lines to survive the cap. If even `MIN_COL_W` won't
     // fit, the centralized width check returns `VIZ_TOO_WIDE`.
-    let natural_col = steps.iter().map(|s| text::measure_px(&s.text, NODE_FONT_PX) + 24.0).fold(MIN_COL_W, f32::max);
-    let budget_col = (crate::tools::viz::layout::MAX_CONTENT_W_WIDE - LEFT_GUTTER) / n.max(1) as f32;
+    let natural_col = steps
+        .iter()
+        .map(|s| text::measure_px(&s.text, NODE_FONT_PX) + 24.0)
+        .fold(MIN_COL_W, f32::max);
+    let budget_col =
+        (crate::tools::viz::layout::MAX_CONTENT_W_WIDE - LEFT_GUTTER) / n.max(1) as f32;
     let col_w = natural_col.min(budget_col.max(MIN_COL_W));
 
-    let has_action = steps.iter().any(|s| s.subtitle.as_deref().is_some_and(|t| !t.trim().is_empty()));
+    let has_action = steps
+        .iter()
+        .any(|s| s.subtitle.as_deref().is_some_and(|t| !t.trim().is_empty()));
     let has_sentiment = steps.iter().any(|s| s.sentiment.is_some());
-    let has_pain = steps.iter().any(|s| s.pain.as_deref().is_some_and(|t| !t.trim().is_empty()));
+    let has_pain = steps
+        .iter()
+        .any(|s| s.pain.as_deref().is_some_and(|t| !t.trim().is_empty()));
 
     let stage_top = TITLE_BAND;
     let action_top = stage_top + STAGE_BAND_H;
@@ -46,17 +54,37 @@ pub fn render(steps: &[Step]) -> (String, f32, f32) {
 
     for i in 0..n {
         if i % 2 == 1 {
-            canvas.rect(LEFT_GUTTER + i as f32 * col_w, stage_top, col_w, content_bottom - stage_top, "journey-col-shade");
+            canvas.rect(
+                LEFT_GUTTER + i as f32 * col_w,
+                stage_top,
+                col_w,
+                content_bottom - stage_top,
+                "journey-col-shade",
+            );
         }
     }
 
-    canvas.line(0.0, stage_top + STAGE_BAND_H - 2.0, total_w, stage_top + STAGE_BAND_H - 2.0, "lane-divider");
+    canvas.line(
+        0.0,
+        stage_top + STAGE_BAND_H - 2.0,
+        total_w,
+        stage_top + STAGE_BAND_H - 2.0,
+        "lane-divider",
+    );
 
     for (i, step) in steps.iter().enumerate() {
         let cx = LEFT_GUTTER + (i as f32 + 0.5) * col_w;
         let label = format!("{}. {}", i + 1, step.text);
         let lines = text::wrap(&label, col_w - 12.0, NODE_FONT_PX, 2);
-        canvas.text_lines_fit(cx, stage_top + 30.0, "node-text", &lines, 15.0, NODE_FONT_PX, col_w - 12.0);
+        canvas.text_lines_fit(
+            cx,
+            stage_top + 30.0,
+            "node-text",
+            &lines,
+            15.0,
+            NODE_FONT_PX,
+            col_w - 12.0,
+        );
     }
 
     if has_action {
@@ -65,13 +93,24 @@ pub fn render(steps: &[Step]) -> (String, f32, f32) {
             if let Some(subtitle) = step.subtitle.as_deref().filter(|t| !t.trim().is_empty()) {
                 let cx = LEFT_GUTTER + (i as f32 + 0.5) * col_w;
                 let lines = text::wrap(subtitle, col_w - 20.0, NODE_FONT_PX, 2);
-                canvas.text_lines(cx, action_top + ACTION_BAND_H / 2.0, "node-text", &lines, 15.0);
+                canvas.text_lines(
+                    cx,
+                    action_top + ACTION_BAND_H / 2.0,
+                    "node-text",
+                    &lines,
+                    15.0,
+                );
             }
         }
     }
 
     if has_sentiment {
-        canvas.text_line(8.0, sentiment_top + SENTIMENT_BAND_H / 2.0, "lane-header", "SENTIMENT");
+        canvas.text_line(
+            8.0,
+            sentiment_top + SENTIMENT_BAND_H / 2.0,
+            "lane-header",
+            "SENTIMENT",
+        );
         let points: Vec<(f32, f32)> = steps
             .iter()
             .enumerate()
@@ -79,7 +118,8 @@ pub fn render(steps: &[Step]) -> (String, f32, f32) {
                 s.sentiment.map(|sentiment| {
                     let cx = LEFT_GUTTER + (i as f32 + 0.5) * col_w;
                     let clamped = sentiment.clamp(-2, 2) as f32;
-                    let cy = sentiment_top + SENTIMENT_BAND_H / 2.0 - clamped / 2.0 * (SENTIMENT_BAND_H / 2.0 - 15.0);
+                    let cy = sentiment_top + SENTIMENT_BAND_H / 2.0
+                        - clamped / 2.0 * (SENTIMENT_BAND_H / 2.0 - 15.0);
                     (cx, cy)
                 })
             })
@@ -92,13 +132,19 @@ pub fn render(steps: &[Step]) -> (String, f32, f32) {
                 let (x1, y1) = w[1];
                 let c1x = x0 + (x1 - x0) / 3.0;
                 let c2x = x1 - (x1 - x0) / 3.0;
-                d.push_str(&format!(" C {c1x:.1},{y0:.1} {c2x:.1},{y1:.1} {x1:.1},{y1:.1}"));
+                d.push_str(&format!(
+                    " C {c1x:.1},{y0:.1} {c2x:.1},{y1:.1} {x1:.1},{y1:.1}"
+                ));
             }
             let min_x = points.iter().map(|p| p.0).fold(f32::MAX, f32::min);
             let max_x = points.iter().map(|p| p.0).fold(f32::MIN, f32::max);
             let min_y = points.iter().map(|p| p.1).fold(f32::MAX, f32::min);
             let max_y = points.iter().map(|p| p.1).fold(f32::MIN, f32::max);
-            canvas.path(&d, "curve-line", (min_x, min_y, max_x - min_x, max_y - min_y));
+            canvas.path(
+                &d,
+                "curve-line",
+                (min_x, min_y, max_x - min_x, max_y - min_y),
+            );
         }
         for &(cx, cy) in &points {
             canvas.circle(cx, cy, 6.0, "curve-dot");
@@ -106,7 +152,12 @@ pub fn render(steps: &[Step]) -> (String, f32, f32) {
     }
 
     if has_pain {
-        canvas.text_line(8.0, pain_top + PAIN_BAND_H / 2.0, "lane-header", "PAIN POINTS");
+        canvas.text_line(
+            8.0,
+            pain_top + PAIN_BAND_H / 2.0,
+            "lane-header",
+            "PAIN POINTS",
+        );
         for (i, step) in steps.iter().enumerate() {
             if let Some(pain) = step.pain.as_deref().filter(|t| !t.trim().is_empty()) {
                 let card_w = (col_w - 20.0).max(80.0);
@@ -124,7 +175,11 @@ pub fn render(steps: &[Step]) -> (String, f32, f32) {
     canvas.reserve(0.0, 0.0, total_w, content_bottom);
 
     let (body, bounds) = canvas.into_parts();
-    (body, bounds.width() + CANVAS_MARGIN, bounds.height() + CANVAS_MARGIN)
+    (
+        body,
+        bounds.width() + CANVAS_MARGIN,
+        bounds.height() + CANVAS_MARGIN,
+    )
 }
 
 #[cfg(test)]
@@ -132,18 +187,31 @@ mod tests {
     use super::*;
 
     fn stage(text: &str) -> Step {
-        Step { text: text.to_string(), ..Default::default() }
+        Step {
+            text: text.to_string(),
+            ..Default::default()
+        }
     }
 
     #[test]
     fn renders_caller_supplied_stages_not_the_retired_saas_clipart() {
-        let steps = vec![stage("Discovers product"), stage("Trials it"), stage("Buys plan")];
+        let steps = vec![
+            stage("Discovers product"),
+            stage("Trials it"),
+            stage("Buys plan"),
+        ];
         let (body, _, _) = render(&steps);
         assert!(body.contains("Discovers product"));
         assert!(body.contains("Trials it"));
         assert!(body.contains("Buys plan"));
-        assert!(!body.contains("Reads Overview"), "must not fall back to the retired SaaS-onboarding clipart");
-        assert!(!body.contains("Fills Auth Form"), "must not fall back to the retired SaaS-onboarding clipart");
+        assert!(
+            !body.contains("Reads Overview"),
+            "must not fall back to the retired SaaS-onboarding clipart"
+        );
+        assert!(
+            !body.contains("Fills Auth Form"),
+            "must not fall back to the retired SaaS-onboarding clipart"
+        );
     }
 
     #[test]
@@ -153,8 +221,16 @@ mod tests {
         assert!(!body_without.contains("SENTIMENT"));
 
         let with_sentiment = vec![
-            Step { text: "A".to_string(), sentiment: Some(2), ..Default::default() },
-            Step { text: "B".to_string(), sentiment: Some(-1), ..Default::default() },
+            Step {
+                text: "A".to_string(),
+                sentiment: Some(2),
+                ..Default::default()
+            },
+            Step {
+                text: "B".to_string(),
+                sentiment: Some(-1),
+                ..Default::default()
+            },
         ];
         let (body_with, _, _) = render(&with_sentiment);
         assert!(body_with.contains("SENTIMENT"));
@@ -163,7 +239,14 @@ mod tests {
 
     #[test]
     fn pain_band_only_appears_when_data_is_present() {
-        let steps = vec![Step { text: "A".to_string(), pain: Some("Too many fields".to_string()), ..Default::default() }, stage("B")];
+        let steps = vec![
+            Step {
+                text: "A".to_string(),
+                pain: Some("Too many fields".to_string()),
+                ..Default::default()
+            },
+            stage("B"),
+        ];
         let (body, _, _) = render(&steps);
         assert!(body.contains("PAIN POINTS"));
         assert!(body.contains("Too many fields"));
@@ -174,18 +257,31 @@ mod tests {
         let steps: Vec<Step> = (0..12).map(|i| stage(&format!("Stage {i}"))).collect();
         let (body, w, h) = render(&steps);
         for (x, y, rw, rh) in extract_rects(&body) {
-            assert!(x + rw <= w + 0.5, "rect exceeds canvas width: x={x} rw={rw} w={w}");
-            assert!(y + rh <= h + 0.5, "rect exceeds canvas height: y={y} rh={rh} h={h}");
+            assert!(
+                x + rw <= w + 0.5,
+                "rect exceeds canvas width: x={x} rw={rw} w={w}"
+            );
+            assert!(
+                y + rh <= h + 0.5,
+                "rect exceeds canvas height: y={y} rh={rh} h={h}"
+            );
         }
     }
 
     fn extract_rects(svg: &str) -> Vec<(f32, f32, f32, f32)> {
         let mut out = Vec::new();
         for cap_start in svg.match_indices("<rect ") {
-            let tag_end = svg[cap_start.0..].find('/').map(|i| cap_start.0 + i).unwrap_or(svg.len());
+            let tag_end = svg[cap_start.0..]
+                .find('/')
+                .map(|i| cap_start.0 + i)
+                .unwrap_or(svg.len());
             let tag = &svg[cap_start.0..tag_end];
             let get = |attr: &str| -> f32 {
-                tag.split(&format!(r#"{attr}=""#)).nth(1).and_then(|rest| rest.split('"').next()).and_then(|v| v.parse().ok()).unwrap_or(0.0)
+                tag.split(&format!(r#"{attr}=""#))
+                    .nth(1)
+                    .and_then(|rest| rest.split('"').next())
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0.0)
             };
             out.push((get("x"), get("y"), get("width"), get("height")));
         }

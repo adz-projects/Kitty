@@ -102,7 +102,10 @@ pub fn error_response(
 
 fn auto_hint(code: &str) -> Option<String> {
     if code.contains("NOT_FOUND") || code.contains("MISSING") {
-        Some("Verify path spelling or call lean_analyze_workspace to check available files.".to_string())
+        Some(
+            "Verify path spelling or call lean_analyze_workspace to check available files."
+                .to_string(),
+        )
     } else if code.contains("CORRUPT") || code.contains("PARSE") {
         Some("File may be damaged or password-protected. Verify format.".to_string())
     } else if code.contains("BAD_RANGE") || code.contains("OUT_OF_BOUNDS") {
@@ -110,7 +113,10 @@ fn auto_hint(code: &str) -> Option<String> {
     } else if code.contains("SEARCH") {
         Some("Broaden search keywords or check network connectivity.".to_string())
     } else if code.contains("SCRAPE") {
-        Some("Try a different URL, or use lean_web_search to find an alternative source.".to_string())
+        Some(
+            "Try a different URL, or use lean_web_search to find an alternative source."
+                .to_string(),
+        )
     } else {
         None
     }
@@ -148,7 +154,10 @@ mod tests {
         let scrape: Value = serde_json::from_str(&scrape).unwrap();
         let search: Value = serde_json::from_str(&search).unwrap();
         assert!(scrape["hint"].as_str().unwrap().contains("different URL"));
-        assert!(search["hint"].as_str().unwrap().contains("Broaden search keywords"));
+        assert!(search["hint"]
+            .as_str()
+            .unwrap()
+            .contains("Broaden search keywords"));
     }
 
     #[test]
@@ -158,7 +167,10 @@ mod tests {
         // "tidied" reordering would silently change it.
         let s = error_response("SEARCH_ID_NOT_FOUND", "missing", None, None);
         let v: Value = serde_json::from_str(&s).unwrap();
-        assert!(v["hint"].as_str().unwrap().contains("lean_analyze_workspace"));
+        assert!(v["hint"]
+            .as_str()
+            .unwrap()
+            .contains("lean_analyze_workspace"));
     }
 
     #[test]

@@ -22,10 +22,17 @@ fn outside_home(resolved: &std::path::Path) -> bool {
 /// True when the file's metadata size is past `MAX_FILE_BYTES` — the check
 /// that keeps giant files from being materialized into memory at all.
 fn file_size_exceeds(resolved: &std::path::Path) -> bool {
-    std::fs::metadata(resolved).map(|m| m.len() > MAX_FILE_BYTES as u64).unwrap_or(false)
+    std::fs::metadata(resolved)
+        .map(|m| m.len() > MAX_FILE_BYTES as u64)
+        .unwrap_or(false)
 }
 
-pub fn file_read(path: &str, start_line: Option<i64>, end_line: Option<i64>, query: Option<&str>) -> String {
+pub fn file_read(
+    path: &str,
+    start_line: Option<i64>,
+    end_line: Option<i64>,
+    query: Option<&str>,
+) -> String {
     let resolved = resolve(path);
     if outside_home(&resolved) {
         return error_response(
@@ -36,7 +43,12 @@ pub fn file_read(path: &str, start_line: Option<i64>, end_line: Option<i64>, que
         );
     }
     if !resolved.exists() {
-        return error_response("FILE_NOT_FOUND", "Path does not exist", Some(&resolved.to_string_lossy()), None);
+        return error_response(
+            "FILE_NOT_FOUND",
+            "Path does not exist",
+            Some(&resolved.to_string_lossy()),
+            None,
+        );
     }
     if file_size_exceeds(&resolved) {
         return error_response(
@@ -49,15 +61,28 @@ pub fn file_read(path: &str, start_line: Option<i64>, end_line: Option<i64>, que
 
     let text = match std::fs::read_to_string(&resolved) {
         Ok(t) => t,
-        Err(e) => return error_response("FILE_READ_ERROR", &format!("Cannot read file: {e}"), Some(&resolved.to_string_lossy()), None),
+        Err(e) => {
+            return error_response(
+                "FILE_READ_ERROR",
+                &format!("Cannot read file: {e}"),
+                Some(&resolved.to_string_lossy()),
+                None,
+            )
+        }
     };
     let lines = py_splitlines(&text);
     let total_lines = lines.len();
 
     if let Some(q) = query.filter(|q| !q.trim().is_empty()) {
-        let numbered: Vec<String> = lines.iter().enumerate().map(|(idx, l)| format!("{}: {}", idx + 1, l)).collect();
+        let numbered: Vec<String> = lines
+            .iter()
+            .enumerate()
+            .map(|(idx, l)| format!("{}: {}", idx + 1, l))
+            .collect();
         let result = filter_by_query(&numbered, Some(q), 50, 0);
-        let message = result.no_match.then(|| format!("No direct matches for query '{q}'. Showing top section."));
+        let message = result
+            .no_match
+            .then(|| format!("No direct matches for query '{q}'. Showing top section."));
         return success_response(
             json!(result.items.join("\n")),
             message.as_deref(),
@@ -112,15 +137,30 @@ pub fn file_write(path: &str, content: &str, dry_run: bool) -> String {
         );
     }
     if dry_run {
-        return success_response(json!({"path": resolved.to_string_lossy()}), Some("[DRY RUN] Would write file."), false, None);
+        return success_response(
+            json!({"path": resolved.to_string_lossy()}),
+            Some("[DRY RUN] Would write file."),
+            false,
+            None,
+        );
     }
     if let Some(parent) = resolved.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
-            return error_response("FILE_WRITE_ERROR", &format!("Cannot create parent directory: {e}"), None, None);
+            return error_response(
+                "FILE_WRITE_ERROR",
+                &format!("Cannot create parent directory: {e}"),
+                None,
+                None,
+            );
         }
     }
     if let Err(e) = std::fs::write(&resolved, content) {
-        return error_response("FILE_WRITE_ERROR", &format!("Cannot write file: {e}"), None, None);
+        return error_response(
+            "FILE_WRITE_ERROR",
+            &format!("Cannot write file: {e}"),
+            None,
+            None,
+        );
     }
     success_response(
         json!({"path": resolved.to_string_lossy(), "words": content.split_whitespace().count()}),
@@ -141,20 +181,42 @@ pub fn file_append(path: &str, content: &str, dry_run: bool) -> String {
         );
     }
     if !resolved.exists() {
-        return error_response("FILE_NOT_FOUND", "Path does not exist", Some(&resolved.to_string_lossy()), None);
+        return error_response(
+            "FILE_NOT_FOUND",
+            "Path does not exist",
+            Some(&resolved.to_string_lossy()),
+            None,
+        );
     }
     if dry_run {
-        return success_response(json!({"path": resolved.to_string_lossy()}), Some("[DRY RUN] Would append to file."), false, None);
+        return success_response(
+            json!({"path": resolved.to_string_lossy()}),
+            Some("[DRY RUN] Would append to file."),
+            false,
+            None,
+        );
     }
     use std::io::Write;
     let file = std::fs::OpenOptions::new().append(true).open(&resolved);
     match file {
         Ok(mut f) => {
             if let Err(e) = f.write_all(content.as_bytes()) {
-                return error_response("FILE_WRITE_ERROR", &format!("Cannot append to file: {e}"), None, None);
+                return error_response(
+                    "FILE_WRITE_ERROR",
+                    &format!("Cannot append to file: {e}"),
+                    None,
+                    None,
+                );
             }
         }
-        Err(e) => return error_response("FILE_WRITE_ERROR", &format!("Cannot open file: {e}"), None, None),
+        Err(e) => {
+            return error_response(
+                "FILE_WRITE_ERROR",
+                &format!("Cannot open file: {e}"),
+                None,
+                None,
+            )
+        }
     }
     success_response(
         json!({"path": resolved.to_string_lossy(), "appended_words": content.split_whitespace().count()}),
@@ -175,13 +237,23 @@ pub fn file_replace_str(path: &str, old_str: &str, new_str: &str, dry_run: bool)
         );
     }
     if !resolved.exists() {
-        return error_response("FILE_NOT_FOUND", "Path does not exist", Some(&resolved.to_string_lossy()), None);
+        return error_response(
+            "FILE_NOT_FOUND",
+            "Path does not exist",
+            Some(&resolved.to_string_lossy()),
+            None,
+        );
     }
     // An empty `old_str` is not "zero occurrences" — `str::matches("")` counts
     // every character boundary and `str::replace("", x)` inserts `x` between
     // every character, which would corrupt the file. Reject before any read.
     if old_str.is_empty() {
-        return error_response("INVALID_ARGUMENT", "old_str must not be empty.", None, Some("Provide a non-empty string to search for."));
+        return error_response(
+            "INVALID_ARGUMENT",
+            "old_str must not be empty.",
+            None,
+            Some("Provide a non-empty string to search for."),
+        );
     }
     if file_size_exceeds(&resolved) {
         return error_response(
@@ -193,33 +265,60 @@ pub fn file_replace_str(path: &str, old_str: &str, new_str: &str, dry_run: bool)
     }
     let file_text = match std::fs::read_to_string(&resolved) {
         Ok(t) => t,
-        Err(e) => return error_response("FILE_READ_ERROR", &format!("Cannot read file: {e}"), None, None),
+        Err(e) => {
+            return error_response(
+                "FILE_READ_ERROR",
+                &format!("Cannot read file: {e}"),
+                None,
+                None,
+            )
+        }
     };
     let occurrences = file_text.matches(old_str).count();
     if occurrences == 0 {
-        return error_response("TARGET_NOT_FOUND", "Target string 'old_str' was not found in the file.", None, None);
+        return error_response(
+            "TARGET_NOT_FOUND",
+            "Target string 'old_str' was not found in the file.",
+            None,
+            None,
+        );
     }
     if dry_run {
         return success_response(
             json!({"occurrences": occurrences, "path": resolved.to_string_lossy()}),
-            Some(&format!("[DRY RUN] Would replace {occurrences} occurrence(s).")),
+            Some(&format!(
+                "[DRY RUN] Would replace {occurrences} occurrence(s)."
+            )),
             false,
             None,
         );
     }
     let updated = file_text.replace(old_str, new_str);
     if let Err(e) = std::fs::write(&resolved, updated) {
-        return error_response("FILE_WRITE_ERROR", &format!("Cannot write file: {e}"), None, None);
+        return error_response(
+            "FILE_WRITE_ERROR",
+            &format!("Cannot write file: {e}"),
+            None,
+            None,
+        );
     }
     success_response(
         json!({"path": resolved.to_string_lossy(), "replacements_made": occurrences}),
-        Some(&format!("Successfully replaced {occurrences} occurrence(s).")),
+        Some(&format!(
+            "Successfully replaced {occurrences} occurrence(s)."
+        )),
         false,
         None,
     )
 }
 
-pub fn file_replace_lines(path: &str, start_line: i64, end_line: i64, new_content: &str, dry_run: bool) -> String {
+pub fn file_replace_lines(
+    path: &str,
+    start_line: i64,
+    end_line: i64,
+    new_content: &str,
+    dry_run: bool,
+) -> String {
     let resolved = resolve(path);
     if outside_home(&resolved) {
         return error_response(
@@ -230,7 +329,12 @@ pub fn file_replace_lines(path: &str, start_line: i64, end_line: i64, new_conten
         );
     }
     if !resolved.exists() {
-        return error_response("FILE_NOT_FOUND", "Path does not exist", Some(&resolved.to_string_lossy()), None);
+        return error_response(
+            "FILE_NOT_FOUND",
+            "Path does not exist",
+            Some(&resolved.to_string_lossy()),
+            None,
+        );
     }
     if file_size_exceeds(&resolved) {
         return error_response(
@@ -242,7 +346,14 @@ pub fn file_replace_lines(path: &str, start_line: i64, end_line: i64, new_conten
     }
     let text = match std::fs::read_to_string(&resolved) {
         Ok(t) => t,
-        Err(e) => return error_response("FILE_READ_ERROR", &format!("Cannot read file: {e}"), None, None),
+        Err(e) => {
+            return error_response(
+                "FILE_READ_ERROR",
+                &format!("Cannot read file: {e}"),
+                None,
+                None,
+            )
+        }
     };
     let mut lines = py_splitlines(&text);
     let total_lines = lines.len() as i64;
@@ -250,7 +361,9 @@ pub fn file_replace_lines(path: &str, start_line: i64, end_line: i64, new_conten
     if start_line < 1 || start_line > total_lines || end_line < start_line {
         return error_response(
             "OUT_OF_BOUNDS",
-            &format!("Invalid line range {start_line}-{end_line} for file with {total_lines} lines."),
+            &format!(
+                "Invalid line range {start_line}-{end_line} for file with {total_lines} lines."
+            ),
             None,
             None,
         );
@@ -268,7 +381,11 @@ pub fn file_replace_lines(path: &str, start_line: i64, end_line: i64, new_conten
         );
     }
 
-    let new_lines: Vec<String> = if new_content.is_empty() { Vec::new() } else { py_splitlines(new_content) };
+    let new_lines: Vec<String> = if new_content.is_empty() {
+        Vec::new()
+    } else {
+        py_splitlines(new_content)
+    };
     let removed = actual_end - start_idx + 1;
     lines.splice(start_idx - 1..actual_end, new_lines.iter().cloned());
 
@@ -283,7 +400,12 @@ pub fn file_replace_lines(path: &str, start_line: i64, end_line: i64, new_conten
         out.push_str(eol);
     }
     if let Err(e) = std::fs::write(&resolved, out) {
-        return error_response("FILE_WRITE_ERROR", &format!("Cannot write file: {e}"), None, None);
+        return error_response(
+            "FILE_WRITE_ERROR",
+            &format!("Cannot write file: {e}"),
+            None,
+            None,
+        );
     }
 
     success_response(

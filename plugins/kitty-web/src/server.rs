@@ -129,10 +129,12 @@ where
     F: std::future::Future<Output = String>,
 {
     let mut fut = std::pin::pin!(fut);
-    std::future::poll_fn(|cx| match catch_unwind(AssertUnwindSafe(|| fut.as_mut().poll(cx))) {
-        Ok(poll) => poll,
-        Err(_) => std::task::Poll::Ready(panic_envelope()),
-    })
+    std::future::poll_fn(
+        |cx| match catch_unwind(AssertUnwindSafe(|| fut.as_mut().poll(cx))) {
+            Ok(poll) => poll,
+            Err(_) => std::task::Poll::Ready(panic_envelope()),
+        },
+    )
     .await
 }
 

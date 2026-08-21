@@ -222,65 +222,67 @@ impl KittyWasmServer {
     pub async fn wasm_run_module(&self, Parameters(req): Parameters<RunModuleRequest>) -> String {
         // Blocking sandbox work off the reactor — see `execute_python` above
         // and `sandbox::run_module`'s doc comment for why this is required.
-        tokio::task::spawn_blocking(move || guarded(move || {
-            let module_path = std::path::PathBuf::from(&req.module_path);
-            if !module_path.is_file() {
-                return error_json(
-                    "ModuleNotFound",
-                    &format!("no wasm module at {}", module_path.display()),
-                );
-            }
-
-            let module = match sandbox::load_module_cached(&module_path, &guest::module_cache_dir())
-            {
-                Ok(m) => m,
-                Err(e) => return error_json("ModuleLoadFailed", &format!("{e:#}")),
-            };
-
-            let mut mounts = Vec::new();
-            let workspace = match validate_workspace(req.workspace.as_ref()) {
-                Ok(w) => w,
-                Err(e) => return e,
-            };
-            if let Some(dir) = workspace {
-                mounts.push(Mount::writable(dir, "/work"));
-            }
-
-            let mut args = vec!["module".to_string()];
-            args.extend(req.args.clone().unwrap_or_default());
-
-            let request = RunRequest {
-                args,
-                mounts,
-                timeout: clamp_timeout(req.timeout_s),
-                fuel: req.fuel,
-                ..Default::default()
-            };
-
-            match sandbox::run_module(&module, &request) {
-                Ok(output) => {
-                    let exit_code = match &output.outcome {
-                        sandbox::Outcome::Exited { code } => Some(*code),
-                        _ => None,
-                    };
-                    serde_json::to_string_pretty(&json!({
-                        "status": if output.outcome.is_success() { "success" } else { "error" },
-                        "outcome": output.outcome.label(),
-                        "exit_code": exit_code,
-                        "detail": match &output.outcome {
-                            sandbox::Outcome::Trapped { message } => Some(message.clone()),
-                            _ => None,
-                        },
-                        "stdout": output.stdout.contents(),
-                        "stderr": output.stderr.contents(),
-                        "stdout_truncated": output.stdout.truncated(),
-                        "execution_time_ms": output.duration.as_millis() as u64,
-                    }))
-                    .unwrap_or_else(|e| error_json("SerializationError", &e.to_string()))
+        tokio::task::spawn_blocking(move || {
+            guarded(move || {
+                let module_path = std::path::PathBuf::from(&req.module_path);
+                if !module_path.is_file() {
+                    return error_json(
+                        "ModuleNotFound",
+                        &format!("no wasm module at {}", module_path.display()),
+                    );
                 }
-                Err(e) => error_json("SandboxError", &format!("{e:#}")),
-            }
-        }))
+
+                let module =
+                    match sandbox::load_module_cached(&module_path, &guest::module_cache_dir()) {
+                        Ok(m) => m,
+                        Err(e) => return error_json("ModuleLoadFailed", &format!("{e:#}")),
+                    };
+
+                let mut mounts = Vec::new();
+                let workspace = match validate_workspace(req.workspace.as_ref()) {
+                    Ok(w) => w,
+                    Err(e) => return e,
+                };
+                if let Some(dir) = workspace {
+                    mounts.push(Mount::writable(dir, "/work"));
+                }
+
+                let mut args = vec!["module".to_string()];
+                args.extend(req.args.clone().unwrap_or_default());
+
+                let request = RunRequest {
+                    args,
+                    mounts,
+                    timeout: clamp_timeout(req.timeout_s),
+                    fuel: req.fuel,
+                    ..Default::default()
+                };
+
+                match sandbox::run_module(&module, &request) {
+                    Ok(output) => {
+                        let exit_code = match &output.outcome {
+                            sandbox::Outcome::Exited { code } => Some(*code),
+                            _ => None,
+                        };
+                        serde_json::to_string_pretty(&json!({
+                            "status": if output.outcome.is_success() { "success" } else { "error" },
+                            "outcome": output.outcome.label(),
+                            "exit_code": exit_code,
+                            "detail": match &output.outcome {
+                                sandbox::Outcome::Trapped { message } => Some(message.clone()),
+                                _ => None,
+                            },
+                            "stdout": output.stdout.contents(),
+                            "stderr": output.stderr.contents(),
+                            "stdout_truncated": output.stdout.truncated(),
+                            "execution_time_ms": output.duration.as_millis() as u64,
+                        }))
+                        .unwrap_or_else(|e| error_json("SerializationError", &e.to_string()))
+                    }
+                    Err(e) => error_json("SandboxError", &format!("{e:#}")),
+                }
+            })
+        })
         .await
         .unwrap_or_else(|e| error_json("SandboxPanicked", &format!("sandbox task failed: {e}")))
     }
@@ -335,7 +337,11 @@ mod tests {
     #[test]
     fn timeout_is_clamped_into_the_documented_range() {
         assert_eq!(clamp_timeout(None).as_secs(), sandbox::DEFAULT_TIMEOUT_SECS);
-        assert_eq!(clamp_timeout(Some(0)).as_secs(), 1, "must not allow a zero budget");
+        assert_eq!(
+            clamp_timeout(Some(0)).as_secs(),
+            1,
+            "must not allow a zero budget"
+        );
         assert_eq!(clamp_timeout(Some(5)).as_secs(), 5);
         assert_eq!(clamp_timeout(Some(99_999)).as_secs(), MAX_TIMEOUT_SECS);
     }
@@ -454,7 +460,9 @@ mod tests {
 
         // The workspace must be inside home (audit #111's containment); a
         // bare tempdir is not on every platform (e.g. /tmp on Linux).
-        let work = crate::paths::home_dir().join(format!("kitty-wasm-test-{}", std::process::id()));
+        let work = crate::paths::home_dir()
+            .expect("the test host has a home directory")
+            .join(format!("kitty-wasm-test-{}", std::process::id()));
         std::fs::create_dir_all(&work).unwrap();
 
         let server = KittyWasmServer::new();
@@ -479,7 +487,9 @@ mod tests {
     async fn guest_status_is_always_answerable_even_with_no_guest_installed() {
         let server = KittyWasmServer::new();
         let out = server
-            .wasm_guest_status(Parameters(GuestStatusRequest { install: Some(false) }))
+            .wasm_guest_status(Parameters(GuestStatusRequest {
+                install: Some(false),
+            }))
             .await;
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["status"], "success");
@@ -510,6 +520,9 @@ mod tests {
 
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["error"]["error_type"], "GuestUnavailable");
-        assert!(v["error"]["message"].as_str().unwrap().contains("install=true"));
+        assert!(v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("install=true"));
     }
 }

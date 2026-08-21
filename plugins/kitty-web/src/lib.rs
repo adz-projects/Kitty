@@ -13,6 +13,7 @@
 //! view — see `server.rs` and `envelope.rs` for why both are load-bearing.
 
 pub mod envelope;
+pub mod paths;
 pub mod query_filter;
 pub mod scrape;
 pub mod search;

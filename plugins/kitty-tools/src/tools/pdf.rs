@@ -13,8 +13,8 @@ use std::path::Path;
 use serde_json::{json, Value};
 
 use crate::envelope::{error_response, success_response};
-use crate::query_filter::filter_by_query;
 use crate::paths::{path_within_home, resolve};
+use crate::query_filter::filter_by_query;
 
 /// Hard cap on pages extracted in one call when no `end_page` is given — a
 /// 10,000-page PDF must not balloon the payload. Still large enough for any
@@ -35,13 +35,18 @@ fn open(path: &Path) -> Result<lopdf::Document, lopdf::Error> {
 /// True when the file's metadata size is past `PDF_MAX_FILE_BYTES` — the
 /// check that keeps giant PDFs from being loaded into memory at all.
 fn file_size_exceeds(resolved: &Path) -> bool {
-    std::fs::metadata(resolved).map(|m| m.len() > PDF_MAX_FILE_BYTES).unwrap_or(false)
+    std::fs::metadata(resolved)
+        .map(|m| m.len() > PDF_MAX_FILE_BYTES)
+        .unwrap_or(false)
 }
 
 fn too_large(resolved: &Path) -> String {
     error_response(
         "PDF_TOO_LARGE",
-        &format!("File is larger than the {} byte read limit", PDF_MAX_FILE_BYTES),
+        &format!(
+            "File is larger than the {} byte read limit",
+            PDF_MAX_FILE_BYTES
+        ),
         Some(&resolved.to_string_lossy()),
         Some("Split the PDF, or read a page range from a smaller copy."),
     )
@@ -85,7 +90,12 @@ pub fn pdf_read_text(
         return err;
     }
     if !resolved.exists() {
-        return error_response("PDF_NOT_FOUND", "PDF does not exist", Some(&resolved.to_string_lossy()), None);
+        return error_response(
+            "PDF_NOT_FOUND",
+            "PDF does not exist",
+            Some(&resolved.to_string_lossy()),
+            None,
+        );
     }
     if file_size_exceeds(&resolved) {
         return too_large(&resolved);
@@ -94,19 +104,32 @@ pub fn pdf_read_text(
     let doc = match open(&resolved) {
         Ok(d) => d,
         Err(e) => {
-            return error_response("PDF_CORRUPT", &format!("Cannot parse PDF: {e}"), Some(&resolved.to_string_lossy()), None);
+            return error_response(
+                "PDF_CORRUPT",
+                &format!("Cannot parse PDF: {e}"),
+                Some(&resolved.to_string_lossy()),
+                None,
+            );
         }
     };
 
     if doc.is_encrypted() {
-        return error_response("PDF_ENCRYPTED", "PDF is password protected", Some(&resolved.to_string_lossy()), None);
+        return error_response(
+            "PDF_ENCRYPTED",
+            "PDF is password protected",
+            Some(&resolved.to_string_lossy()),
+            None,
+        );
     }
 
     let total_pages = doc.get_pages().len() as u32;
     let s_page = start_page.unwrap_or(1).max(1);
     // Both the caller's `end_page` and the hard cap bound the extraction; the
     // range is clamped to at most PDF_MAX_PAGES pages.
-    let end_requested = end_page.map(|e| e.min(total_pages)).unwrap_or(total_pages).max(s_page.saturating_sub(1));
+    let end_requested = end_page
+        .map(|e| e.min(total_pages))
+        .unwrap_or(total_pages)
+        .max(s_page.saturating_sub(1));
     let capped_end = s_page.saturating_add(PDF_MAX_PAGES - 1).min(total_pages);
     let e_page = end_requested.min(capped_end);
     let mut truncated = end_requested > e_page;
@@ -139,7 +162,12 @@ pub fn pdf_read_text(
             meta.insert("next_offset".into(), json!(next));
         }
         let any_truncated = truncated || result.truncated;
-        return success_response(json!(result.items), message.as_deref(), any_truncated, Some(Value::Object(meta)));
+        return success_response(
+            json!(result.items),
+            message.as_deref(),
+            any_truncated,
+            Some(Value::Object(meta)),
+        );
     }
 
     let message = truncated.then(|| format!("Output truncated: limited to {PDF_MAX_PAGES} pages and {PDF_MAX_PAGE_CHARS} characters per page."));
@@ -157,7 +185,12 @@ pub fn pdf_read_outline(path: &str) -> String {
         return err;
     }
     if !resolved.exists() {
-        return error_response("PDF_NOT_FOUND", "PDF does not exist", Some(&resolved.to_string_lossy()), None);
+        return error_response(
+            "PDF_NOT_FOUND",
+            "PDF does not exist",
+            Some(&resolved.to_string_lossy()),
+            None,
+        );
     }
     if file_size_exceeds(&resolved) {
         return too_large(&resolved);
@@ -166,12 +199,22 @@ pub fn pdf_read_outline(path: &str) -> String {
     let doc = match open(&resolved) {
         Ok(d) => d,
         Err(e) => {
-            return error_response("PDF_CORRUPT", &format!("Cannot parse PDF: {e}"), Some(&resolved.to_string_lossy()), None);
+            return error_response(
+                "PDF_CORRUPT",
+                &format!("Cannot parse PDF: {e}"),
+                Some(&resolved.to_string_lossy()),
+                None,
+            );
         }
     };
 
     if doc.is_encrypted() {
-        return error_response("PDF_ENCRYPTED", "PDF is password protected", Some(&resolved.to_string_lossy()), None);
+        return error_response(
+            "PDF_ENCRYPTED",
+            "PDF is password protected",
+            Some(&resolved.to_string_lossy()),
+            None,
+        );
     }
 
     // lopdf's get_toc already flattens the outline tree into

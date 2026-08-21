@@ -60,9 +60,8 @@ fn strip_ansi(text: &str) -> String {
     // `\x5F`, not a literal backslash then `-_`. Written explicitly here.
     use std::sync::OnceLock;
     static RE: OnceLock<regex::Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| {
-        regex::Regex::new(r"\x1B(?:[@-Z\x5C-\x5F]|\[[0-?]*[ -/]*[@-~])").unwrap()
-    });
+    let re = RE
+        .get_or_init(|| regex::Regex::new(r"\x1B(?:[@-Z\x5C-\x5F]|\[[0-?]*[ -/]*[@-~])").unwrap());
     re.replace_all(text, "").into_owned()
 }
 
@@ -141,10 +140,21 @@ async fn shell_impl(command: &str, dry_run: bool, timeout: Duration) -> (String,
     // dropped future kills the process, so no orphaned shell is left
     // running. The timeout path kills the process *tree* explicitly (see
     // the `Err` arm below) before this backstop is needed.
-    let mut child = match tokio::process::Command::from(std_cmd).kill_on_drop(true).spawn() {
+    let mut child = match tokio::process::Command::from(std_cmd)
+        .kill_on_drop(true)
+        .spawn()
+    {
         Ok(c) => c,
         Err(e) => {
-            return (error_response("SHELL_SPAWN_ERROR", &format!("Failed to spawn shell: {e}"), None, None), None);
+            return (
+                error_response(
+                    "SHELL_SPAWN_ERROR",
+                    &format!("Failed to spawn shell: {e}"),
+                    None,
+                    None,
+                ),
+                None,
+            );
         }
     };
     let pid = child.id();
@@ -171,7 +181,12 @@ async fn shell_impl(command: &str, dry_run: bool, timeout: Duration) -> (String,
                 Ok(s) => s,
                 Err(e) => {
                     return (
-                        error_response("SHELL_SPAWN_ERROR", &format!("Failed to run shell: {e}"), None, None),
+                        error_response(
+                            "SHELL_SPAWN_ERROR",
+                            &format!("Failed to run shell: {e}"),
+                            None,
+                            None,
+                        ),
                         pid,
                     );
                 }
@@ -247,7 +262,12 @@ fn finish(output: std::process::Output, capture_truncated: bool) -> String {
         } else {
             stderr.trim().to_string()
         };
-        return error_response("SHELL_NONZERO", &format!("Exit code {returncode}"), Some(&stderr), None);
+        return error_response(
+            "SHELL_NONZERO",
+            &format!("Exit code {returncode}"),
+            Some(&stderr),
+            None,
+        );
     }
 
     let stdout_raw = String::from_utf8_lossy(&output.stdout);
@@ -268,7 +288,12 @@ fn finish(output: std::process::Output, capture_truncated: bool) -> String {
         stdout.trim().to_string()
     };
 
-    success_response(json!(final_output), None, truncated, Some(json!({"returncode": returncode})))
+    success_response(
+        json!(final_output),
+        None,
+        truncated,
+        Some(json!({"returncode": returncode})),
+    )
 }
 
 #[cfg(test)]
@@ -327,7 +352,10 @@ mod tests {
 
         // Give the kill a moment to land, then assert the process is gone.
         tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(!pid_alive(pid), "child process {pid} still alive after timeout");
+        assert!(
+            !pid_alive(pid),
+            "child process {pid} still alive after timeout"
+        );
     }
 
     #[cfg(windows)]
@@ -338,7 +366,12 @@ mod tests {
         // to be orphaned and keep running past the timeout. The timeout path
         // now `taskkill /T /F`s the whole tree.
         let before = ping_pids();
-        let (response, pid) = shell_impl("ping -n 99999 127.0.0.1 > nul", false, Duration::from_millis(300)).await;
+        let (response, pid) = shell_impl(
+            "ping -n 99999 127.0.0.1 > nul",
+            false,
+            Duration::from_millis(300),
+        )
+        .await;
         let v: serde_json::Value = serde_json::from_str(&response).unwrap();
         assert_eq!(v["error_code"], "SHELL_TIMEOUT", "{v}");
         assert!(pid.is_some());
@@ -346,8 +379,14 @@ mod tests {
         // Give the tree kill a moment to land, then assert no *new* ping
         // survived (pre-existing ones, if any, are not ours to judge).
         tokio::time::sleep(Duration::from_millis(500)).await;
-        let leaked: Vec<u32> = ping_pids().into_iter().filter(|p| !before.contains(p)).collect();
-        assert!(leaked.is_empty(), "grandchild ping process(es) leaked past the timeout: {leaked:?}");
+        let leaked: Vec<u32> = ping_pids()
+            .into_iter()
+            .filter(|p| !before.contains(p))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "grandchild ping process(es) leaked past the timeout: {leaked:?}"
+        );
     }
 
     #[cfg(windows)]
@@ -376,7 +415,8 @@ mod tests {
 
     #[tokio::test]
     async fn read_bounded_passes_through_small_streams() {
-        let (data, truncated) = read_bounded(Some(b"hello".as_slice()), SHELL_MAX_CAPTURE_BYTES).await;
+        let (data, truncated) =
+            read_bounded(Some(b"hello".as_slice()), SHELL_MAX_CAPTURE_BYTES).await;
         assert_eq!(&data, b"hello");
         assert!(!truncated);
     }
@@ -395,12 +435,20 @@ mod tests {
 
     #[cfg(windows)]
     fn success_status() -> std::process::ExitStatus {
-        std::process::Command::new("cmd").arg("/c").arg("exit 0").status().unwrap()
+        std::process::Command::new("cmd")
+            .arg("/c")
+            .arg("exit 0")
+            .status()
+            .unwrap()
     }
 
     #[cfg(not(windows))]
     fn success_status() -> std::process::ExitStatus {
-        std::process::Command::new("sh").arg("-c").arg("exit 0").status().unwrap()
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exit 0")
+            .status()
+            .unwrap()
     }
 
     #[cfg(windows)]

@@ -83,23 +83,45 @@ fn line_class(idx: usize) -> String {
     format!("series-line dash-{}", idx % 4)
 }
 
-pub fn render(chart_type: ChartType, categories: &[String], series: &[ChartSeries], x_label: Option<&str>, y_label: Option<&str>) -> (String, f32, f32) {
+pub fn render(
+    chart_type: ChartType,
+    categories: &[String],
+    series: &[ChartSeries],
+    x_label: Option<&str>,
+    y_label: Option<&str>,
+) -> (String, f32, f32) {
     match chart_type {
         ChartType::HorizontalBar => render_horizontal_bar(categories, series, x_label, y_label),
         _ => render_vertical(chart_type, categories, series, x_label, y_label),
     }
 }
 
-fn render_vertical(chart_type: ChartType, categories: &[String], series: &[ChartSeries], x_label: Option<&str>, y_label: Option<&str>) -> (String, f32, f32) {
+fn render_vertical(
+    chart_type: ChartType,
+    categories: &[String],
+    series: &[ChartSeries],
+    x_label: Option<&str>,
+    y_label: Option<&str>,
+) -> (String, f32, f32) {
     let (min_v, max_v) = value_bounds(series);
     let ticks = nice_ticks(min_v, max_v, 5);
-    let (tick_lo, tick_hi) = (ticks.first().copied().unwrap_or(min_v), ticks.last().copied().unwrap_or(max_v));
+    let (tick_lo, tick_hi) = (
+        ticks.first().copied().unwrap_or(min_v),
+        ticks.last().copied().unwrap_or(max_v),
+    );
 
     let tick_labels: Vec<String> = ticks.iter().map(|&t| format_number(t)).collect();
-    let widest_tick = tick_labels.iter().map(|l| text::measure_px(l, AXIS_FONT_PX)).fold(0.0_f32, f32::max);
+    let widest_tick = tick_labels
+        .iter()
+        .map(|l| text::measure_px(l, AXIS_FONT_PX))
+        .fold(0.0_f32, f32::max);
     let left_gutter = widest_tick + 16.0;
 
-    let bars_per_slot = if chart_type == ChartType::Line { 0 } else { series.len().max(1) };
+    let bars_per_slot = if chart_type == ChartType::Line {
+        0
+    } else {
+        series.len().max(1)
+    };
     let slot_content_w = if bars_per_slot > 0 {
         bars_per_slot as f32 * BAR_W + (bars_per_slot as f32 - 1.0).max(0.0) * BAR_GAP
     } else {
@@ -108,13 +130,18 @@ fn render_vertical(chart_type: ChartType, categories: &[String], series: &[Chart
     let slot_w = (slot_content_w + GROUP_GAP).max(60.0);
 
     let legend_h = if series.len() > 1 { LEGEND_ROW_H } else { 0.0 };
-    let y_label_h = if y_label.is_some() { Y_LABEL_ROW_H } else { 0.0 };
+    let y_label_h = if y_label.is_some() {
+        Y_LABEL_ROW_H
+    } else {
+        0.0
+    };
     let plot_top = TITLE_BAND + legend_h + y_label_h;
     let plot_bottom = plot_top + PLOT_H;
     let plot_left = left_gutter;
     let plot_w = slot_w * categories.len() as f32;
 
-    let value_to_y = |v: f64| -> f32 { plot_bottom - ((v - tick_lo) / (tick_hi - tick_lo)) as f32 * PLOT_H };
+    let value_to_y =
+        |v: f64| -> f32 { plot_bottom - ((v - tick_lo) / (tick_hi - tick_lo)) as f32 * PLOT_H };
 
     let mut canvas = SvgCanvas::new();
 
@@ -124,8 +151,19 @@ fn render_vertical(chart_type: ChartType, categories: &[String], series: &[Chart
     if series.len() > 1 {
         let mut lx = plot_left;
         for (j, s) in series.iter().enumerate() {
-            canvas.rect(lx, plot_top - legend_h + 6.0, 12.0, 12.0, &format!("legend-swatch {}", bar_class(j)));
-            canvas.text_line(lx + 16.0, plot_top - legend_h + 16.0, "legend-text", &s.name);
+            canvas.rect(
+                lx,
+                plot_top - legend_h + 6.0,
+                12.0,
+                12.0,
+                &format!("legend-swatch {}", bar_class(j)),
+            );
+            canvas.text_line(
+                lx + 16.0,
+                plot_top - legend_h + 16.0,
+                "legend-text",
+                &s.name,
+            );
             lx += 16.0 + text::measure_px(&s.name, AXIS_FONT_PX) + 20.0;
         }
     }
@@ -133,7 +171,12 @@ fn render_vertical(chart_type: ChartType, categories: &[String], series: &[Chart
     for &t in &ticks {
         let y = value_to_y(t);
         canvas.line(plot_left, y, plot_left + plot_w, y, "grid-line");
-        canvas.text_line(plot_left - 10.0, y + 3.5, "axis-label-end", &format_number(t));
+        canvas.text_line(
+            plot_left - 10.0,
+            y + 3.5,
+            "axis-label-end",
+            &format_number(t),
+        );
     }
     canvas.line(plot_left, plot_top, plot_left, plot_bottom, "axis-line");
     let zero_y = value_to_y(0.0_f64.clamp(tick_lo, tick_hi));
@@ -151,19 +194,36 @@ fn render_vertical(chart_type: ChartType, categories: &[String], series: &[Chart
                 let y_top = value_to_y(v).min(zero_y);
                 let y_bottom = value_to_y(v).max(zero_y);
                 canvas.rect(bx, y_top, BAR_W, (y_bottom - y_top).max(1.0), &bar_class(j));
-                canvas.text_line(bx + BAR_W / 2.0, y_top - 6.0, "value-label", &format_number(v));
+                canvas.text_line(
+                    bx + BAR_W / 2.0,
+                    y_top - 6.0,
+                    "value-label",
+                    &format_number(v),
+                );
                 bx += BAR_W + BAR_GAP;
             }
         }
 
         let lines = text::wrap(category, slot_w - 6.0, AXIS_FONT_PX, 2);
-        canvas.text_lines(slot_cx, plot_bottom + 14.0, "axis-label", &lines, LABEL_LINE_H);
+        canvas.text_lines(
+            slot_cx,
+            plot_bottom + 14.0,
+            "axis-label",
+            &lines,
+            LABEL_LINE_H,
+        );
     }
 
     if chart_type == ChartType::Line {
         for (j, s) in series.iter().enumerate() {
-            let points: Vec<(f32, f32)> =
-                (0..categories.len()).map(|i| (plot_left + (i as f32 + 0.5) * slot_w, value_to_y(s.values[i]))).collect();
+            let points: Vec<(f32, f32)> = (0..categories.len())
+                .map(|i| {
+                    (
+                        plot_left + (i as f32 + 0.5) * slot_w,
+                        value_to_y(s.values[i]),
+                    )
+                })
+                .collect();
             if points.len() >= 2 {
                 let mut d = format!("M {:.1},{:.1}", points[0].0, points[0].1);
                 for p in &points[1..] {
@@ -173,7 +233,11 @@ fn render_vertical(chart_type: ChartType, categories: &[String], series: &[Chart
                 let max_x = points.iter().map(|p| p.0).fold(f32::MIN, f32::max);
                 let min_y = points.iter().map(|p| p.1).fold(f32::MAX, f32::min);
                 let max_y = points.iter().map(|p| p.1).fold(f32::MIN, f32::max);
-                canvas.path(&d, &line_class(j), (min_x, min_y, max_x - min_x, max_y - min_y));
+                canvas.path(
+                    &d,
+                    &line_class(j),
+                    (min_x, min_y, max_x - min_x, max_y - min_y),
+                );
             }
             for &(x, y) in &points {
                 canvas.circle(x, y, 5.0, "data-point");
@@ -182,37 +246,76 @@ fn render_vertical(chart_type: ChartType, categories: &[String], series: &[Chart
     }
 
     if let Some(x_label) = x_label {
-        canvas.text_line(plot_left + plot_w / 2.0, plot_bottom + 2.0 * LABEL_LINE_H + AXIS_TITLE_ROW_H, "axis-title-center", x_label);
+        canvas.text_line(
+            plot_left + plot_w / 2.0,
+            plot_bottom + 2.0 * LABEL_LINE_H + AXIS_TITLE_ROW_H,
+            "axis-title-center",
+            x_label,
+        );
     }
 
-    canvas.reserve(0.0, 0.0, plot_left + plot_w, plot_bottom + 2.0 * LABEL_LINE_H + AXIS_TITLE_ROW_H);
+    canvas.reserve(
+        0.0,
+        0.0,
+        plot_left + plot_w,
+        plot_bottom + 2.0 * LABEL_LINE_H + AXIS_TITLE_ROW_H,
+    );
 
     let (body, bounds) = canvas.into_parts();
-    (body, bounds.width() + CANVAS_MARGIN, bounds.height() + CANVAS_MARGIN)
+    (
+        body,
+        bounds.width() + CANVAS_MARGIN,
+        bounds.height() + CANVAS_MARGIN,
+    )
 }
 
-fn render_horizontal_bar(categories: &[String], series: &[ChartSeries], x_label: Option<&str>, y_label: Option<&str>) -> (String, f32, f32) {
+fn render_horizontal_bar(
+    categories: &[String],
+    series: &[ChartSeries],
+    x_label: Option<&str>,
+    y_label: Option<&str>,
+) -> (String, f32, f32) {
     let (min_v, max_v) = value_bounds(series);
     let ticks = nice_ticks(min_v, max_v, 5);
-    let (tick_lo, tick_hi) = (ticks.first().copied().unwrap_or(min_v), ticks.last().copied().unwrap_or(max_v));
+    let (tick_lo, tick_hi) = (
+        ticks.first().copied().unwrap_or(min_v),
+        ticks.last().copied().unwrap_or(max_v),
+    );
 
-    let left_gutter = categories.iter().map(|c| text::measure_px(c, AXIS_FONT_PX)).fold(0.0_f32, f32::max) + 16.0;
+    let left_gutter = categories
+        .iter()
+        .map(|c| text::measure_px(c, AXIS_FONT_PX))
+        .fold(0.0_f32, f32::max)
+        + 16.0;
     let legend_h = if series.len() > 1 { LEGEND_ROW_H } else { 0.0 };
     let plot_top = TITLE_BAND + legend_h;
     let plot_w = 640.0_f32;
     let bars_per_slot = series.len().max(1);
-    let row_content_h = bars_per_slot as f32 * BAR_W + (bars_per_slot as f32 - 1.0).max(0.0) * BAR_GAP;
+    let row_content_h =
+        bars_per_slot as f32 * BAR_W + (bars_per_slot as f32 - 1.0).max(0.0) * BAR_GAP;
     let row_h = row_content_h + GROUP_GAP;
 
-    let value_to_x = |v: f64| -> f32 { left_gutter + ((v - tick_lo) / (tick_hi - tick_lo)) as f32 * plot_w };
+    let value_to_x =
+        |v: f64| -> f32 { left_gutter + ((v - tick_lo) / (tick_hi - tick_lo)) as f32 * plot_w };
 
     let mut canvas = SvgCanvas::new();
 
     if series.len() > 1 {
         let mut lx = left_gutter;
         for (j, s) in series.iter().enumerate() {
-            canvas.rect(lx, plot_top - legend_h + 6.0, 12.0, 12.0, &format!("legend-swatch {}", bar_class(j)));
-            canvas.text_line(lx + 16.0, plot_top - legend_h + 16.0, "legend-text", &s.name);
+            canvas.rect(
+                lx,
+                plot_top - legend_h + 6.0,
+                12.0,
+                12.0,
+                &format!("legend-swatch {}", bar_class(j)),
+            );
+            canvas.text_line(
+                lx + 16.0,
+                plot_top - legend_h + 16.0,
+                "legend-text",
+                &s.name,
+            );
             lx += 16.0 + text::measure_px(&s.name, AXIS_FONT_PX) + 20.0;
         }
     }
@@ -237,23 +340,48 @@ fn render_horizontal_bar(categories: &[String], series: &[ChartSeries], x_label:
             let v = s.values[i];
             let x_left = value_to_x(v).min(zero_x);
             let x_right = value_to_x(v).max(zero_x);
-            canvas.rect(x_left, by, (x_right - x_left).max(1.0), BAR_W, &bar_class(j));
-            canvas.text_line(x_right + 6.0, by + BAR_W / 2.0 + 3.5, "value-label-start", &format_number(v));
+            canvas.rect(
+                x_left,
+                by,
+                (x_right - x_left).max(1.0),
+                BAR_W,
+                &bar_class(j),
+            );
+            canvas.text_line(
+                x_right + 6.0,
+                by + BAR_W / 2.0 + 3.5,
+                "value-label-start",
+                &format_number(v),
+            );
             by += BAR_W + BAR_GAP;
         }
     }
 
     if let Some(x_label) = x_label {
-        canvas.text_line(left_gutter + plot_w / 2.0, plot_bottom + 2.0 * LABEL_LINE_H + AXIS_TITLE_ROW_H, "axis-title-center", x_label);
+        canvas.text_line(
+            left_gutter + plot_w / 2.0,
+            plot_bottom + 2.0 * LABEL_LINE_H + AXIS_TITLE_ROW_H,
+            "axis-title-center",
+            x_label,
+        );
     }
     if let Some(y_label) = y_label {
         canvas.text_line(0.0, plot_top - 10.0, "axis-title", y_label);
     }
 
-    canvas.reserve(0.0, 0.0, left_gutter + plot_w + 80.0, plot_bottom + 2.0 * LABEL_LINE_H + AXIS_TITLE_ROW_H);
+    canvas.reserve(
+        0.0,
+        0.0,
+        left_gutter + plot_w + 80.0,
+        plot_bottom + 2.0 * LABEL_LINE_H + AXIS_TITLE_ROW_H,
+    );
 
     let (body, bounds) = canvas.into_parts();
-    (body, bounds.width() + CANVAS_MARGIN, bounds.height() + CANVAS_MARGIN)
+    (
+        body,
+        bounds.width() + CANVAS_MARGIN,
+        bounds.height() + CANVAS_MARGIN,
+    )
 }
 
 #[cfg(test)]
@@ -261,7 +389,10 @@ mod tests {
     use super::*;
 
     fn series(name: &str, values: &[f64]) -> ChartSeries {
-        ChartSeries { name: name.to_string(), values: values.to_vec() }
+        ChartSeries {
+            name: name.to_string(),
+            values: values.to_vec(),
+        }
     }
 
     #[test]
@@ -280,9 +411,20 @@ mod tests {
 
     #[test]
     fn bar_chart_renders_caller_categories_and_values() {
-        let categories = vec!["Q1".to_string(), "Q2".to_string(), "Q3".to_string(), "Q4".to_string()];
+        let categories = vec![
+            "Q1".to_string(),
+            "Q2".to_string(),
+            "Q3".to_string(),
+            "Q4".to_string(),
+        ];
         let series = vec![series("Revenue", &[12.4, 15.1, 22.8, 24.0])];
-        let (body, _, _) = render(ChartType::Bar, &categories, &series, None, Some("USD millions"));
+        let (body, _, _) = render(
+            ChartType::Bar,
+            &categories,
+            &series,
+            None,
+            Some("USD millions"),
+        );
         assert!(body.contains("Q1"));
         assert!(body.contains("24"));
     }
@@ -309,7 +451,10 @@ mod tests {
 
     #[test]
     fn horizontal_bar_handles_long_category_names() {
-        let categories = vec!["A very long category name indeed".to_string(), "Short".to_string()];
+        let categories = vec![
+            "A very long category name indeed".to_string(),
+            "Short".to_string(),
+        ];
         let series = vec![series("Value", &[42.0, 7.0])];
         let (body, w, _) = render(ChartType::HorizontalBar, &categories, &series, None, None);
         assert!(body.contains("A very long category name indeed"));
@@ -318,23 +463,44 @@ mod tests {
 
     #[test]
     fn every_bar_stays_within_canvas_bounds() {
-        let categories: Vec<String> = (0..10).map(|i| format!("Category {i} with a longer label")).collect();
+        let categories: Vec<String> = (0..10)
+            .map(|i| format!("Category {i} with a longer label"))
+            .collect();
         let values: Vec<f64> = (0..10).map(|i| i as f64 * 3.5).collect();
         let series = vec![series("S", &values)];
-        let (body, w, h) = render(ChartType::Bar, &categories, &series, Some("Category"), Some("Value"));
+        let (body, w, h) = render(
+            ChartType::Bar,
+            &categories,
+            &series,
+            Some("Category"),
+            Some("Value"),
+        );
         for (x, y, rw, rh) in extract_rects(&body) {
-            assert!(x + rw <= w + 0.5, "rect exceeds canvas width: x={x} rw={rw} w={w}");
-            assert!(y + rh <= h + 0.5, "rect exceeds canvas height: y={y} rh={rh} h={h}");
+            assert!(
+                x + rw <= w + 0.5,
+                "rect exceeds canvas width: x={x} rw={rw} w={w}"
+            );
+            assert!(
+                y + rh <= h + 0.5,
+                "rect exceeds canvas height: y={y} rh={rh} h={h}"
+            );
         }
     }
 
     fn extract_rects(svg: &str) -> Vec<(f32, f32, f32, f32)> {
         let mut out = Vec::new();
         for cap_start in svg.match_indices("<rect ") {
-            let tag_end = svg[cap_start.0..].find('/').map(|i| cap_start.0 + i).unwrap_or(svg.len());
+            let tag_end = svg[cap_start.0..]
+                .find('/')
+                .map(|i| cap_start.0 + i)
+                .unwrap_or(svg.len());
             let tag = &svg[cap_start.0..tag_end];
             let get = |attr: &str| -> f32 {
-                tag.split(&format!(r#"{attr}=""#)).nth(1).and_then(|rest| rest.split('"').next()).and_then(|v| v.parse().ok()).unwrap_or(0.0)
+                tag.split(&format!(r#"{attr}=""#))
+                    .nth(1)
+                    .and_then(|rest| rest.split('"').next())
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0.0)
             };
             out.push((get("x"), get("y"), get("width"), get("height")));
         }

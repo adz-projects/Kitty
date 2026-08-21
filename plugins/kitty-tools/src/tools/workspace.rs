@@ -29,12 +29,20 @@ pub fn analyze_workspace(path: &str, max_depth: Option<u32>) -> String {
         );
     }
     if !resolved.exists() {
-        return error_response("PATH_NOT_FOUND", "Directory does not exist", Some(&resolved.to_string_lossy()), None);
+        return error_response(
+            "PATH_NOT_FOUND",
+            "Directory does not exist",
+            Some(&resolved.to_string_lossy()),
+            None,
+        );
     }
 
     if resolved.is_file() {
         let size = std::fs::metadata(&resolved).map(|m| m.len()).unwrap_or(0);
-        let name = resolved.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let name = resolved
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
         return success_response(
             json!({
                 "type": "file",
@@ -50,12 +58,16 @@ pub fn analyze_workspace(path: &str, max_depth: Option<u32>) -> String {
 
     // Clamp a caller-supplied `max_depth` so a huge value can't walk
     // arbitrarily deep — the default is already the ceiling.
-    let depth = max_depth.unwrap_or(WORKSPACE_MAX_DEPTH).min(WORKSPACE_MAX_DEPTH);
+    let depth = max_depth
+        .unwrap_or(WORKSPACE_MAX_DEPTH)
+        .min(WORKSPACE_MAX_DEPTH);
     let mut files: Vec<String> = Vec::new();
     let mut dirs: Vec<String> = Vec::new();
     let mut abort = false;
 
-    walk(&resolved, &resolved, 0, depth, &mut files, &mut dirs, &mut abort);
+    walk(
+        &resolved, &resolved, 0, depth, &mut files, &mut dirs, &mut abort,
+    );
 
     success_response(
         json!({"files": files, "directories": dirs}),
@@ -119,7 +131,15 @@ fn walk(
                 *abort = true;
                 return;
             }
-            walk(root, &entry_path, current_depth + 1, max_depth, files, dirs, abort);
+            walk(
+                root,
+                &entry_path,
+                current_depth + 1,
+                max_depth,
+                files,
+                dirs,
+                abort,
+            );
         } else {
             files.push(rel);
             if files.len() >= WORKSPACE_MAX_FILES {
@@ -188,7 +208,10 @@ mod tests {
         let total = v["metadata"]["total_directories"].as_u64().unwrap();
         // 12 levels exist; the clamp to WORKSPACE_MAX_DEPTH (10) must stop
         // short of walking them all.
-        assert!(total < 12, "depth not clamped: walked {total} levels with clamp {WORKSPACE_MAX_DEPTH}");
+        assert!(
+            total < 12,
+            "depth not clamped: walked {total} levels with clamp {WORKSPACE_MAX_DEPTH}"
+        );
         fs::remove_dir_all(&root).ok();
     }
 
@@ -220,7 +243,12 @@ mod tests {
 
         let s = analyze_workspace(dir.to_str().unwrap(), None);
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
-        let files: Vec<String> = v["data"]["files"].as_array().unwrap().iter().map(|f| f.as_str().unwrap().to_string()).collect();
+        let files: Vec<String> = v["data"]["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f.as_str().unwrap().to_string())
+            .collect();
         assert!(files.iter().any(|f| f.contains("keep.txt")));
         assert!(!files.iter().any(|f| f.contains(".git")));
 

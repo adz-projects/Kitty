@@ -308,9 +308,7 @@ pub fn run_python(
             Outcome::Trapped { message } => ("WasmTrap", message.clone()),
             Outcome::Exited { code } => (
                 "NoResult",
-                format!(
-                    "The interpreter exited with code {code} without reporting a result."
-                ),
+                format!("The interpreter exited with code {code} without reporting a result."),
             ),
         };
         return Ok(json!({
@@ -365,7 +363,10 @@ pub fn run_python(
     out.insert("result_size_bytes".into(), json!(result_size_bytes));
     if output.stdout.truncated() {
         out.insert("stdout_truncated".into(), json!(true));
-        out.insert("stdout_total_bytes".into(), json!(output.stdout.total_bytes()));
+        out.insert(
+            "stdout_total_bytes".into(),
+            json!(output.stdout.total_bytes()),
+        );
     }
 
     Ok(Value::Object(out))
@@ -375,6 +376,11 @@ pub fn run_python(
 /// production code needs a scratch directory, and it needs exactly one
 /// behavior (unique dir, removed on drop), so it's cheaper to implement than
 /// to promote a dependency.
+///
+/// Rooted at `guest::run_dir()`, **not** `std::env::temp_dir()`: Android has
+/// no `/tmp` and sets no `TMPDIR` for an app process, so the latter named a
+/// directory that could be neither found nor created, and every Python run
+/// failed here before the sandbox was even started.
 fn tempdir() -> anyhow::Result<ScratchDir> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -383,8 +389,11 @@ fn tempdir() -> anyhow::Result<ScratchDir> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
+    // Process id *and* a per-process counter: the pid alone is not unique
+    // when several servers run in one process, which is exactly how this
+    // crate is hosted on Android (`bigtiny_rust::mcp::builtin`).
     let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!(
+    let path = guest::run_dir().join(format!(
         "kitty-wasm-{}-{nanos:x}-{unique}",
         std::process::id()
     ));
@@ -510,7 +519,10 @@ mod tests {
         assert!(err.contains("cap"), "{err}");
 
         // Missing/corrupt files stay on the ordinary `None` path.
-        assert_eq!(read_result_envelope(&dir.path().join("missing.json")).unwrap(), None);
+        assert_eq!(
+            read_result_envelope(&dir.path().join("missing.json")).unwrap(),
+            None
+        );
         let corrupt = dir.path().join("corrupt.json");
         std::fs::write(&corrupt, b"not json").unwrap();
         assert_eq!(read_result_envelope(&corrupt).unwrap(), None);

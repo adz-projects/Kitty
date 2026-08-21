@@ -87,10 +87,7 @@ pub fn daemon_env(
     let mut env: Vec<(String, String)> = vec![
         ("BIGTINY_SECRET".into(), secret.to_string()),
         ("BIGTINY_ENCRYPTION_KEY".into(), encryption_key.to_string()),
-        (
-            "BIGTINY_SUMMARIZER__ENABLED".into(),
-            b(summarizer.enabled),
-        ),
+        ("BIGTINY_SUMMARIZER__ENABLED".into(), b(summarizer.enabled)),
         (
             "BIGTINY_TOKEN_MANAGEMENT__MAX_CONTEXT_TOKENS".into(),
             token_management.max_context_tokens.to_string(),
@@ -164,10 +161,7 @@ pub fn daemon_env(
     env.extend([
         ("BIGTINY_LITERT__ENABLED".to_string(), b(litert_enabled)),
         ("BIGTINY_LITERT__LIB_PATH".to_string(), lib_name.to_string()),
-        (
-            "BIGTINY_LITERT__EMBED_MODEL_PATH".to_string(),
-            embed_tflite,
-        ),
+        ("BIGTINY_LITERT__EMBED_MODEL_PATH".to_string(), embed_tflite),
         ("BIGTINY_LITERT__TOKENIZER_PATH".to_string(), tokenizer),
         (
             "BIGTINY_LITERT__SUMMARIZER_MODEL_PATH".to_string(),
@@ -192,6 +186,35 @@ pub fn daemon_env(
             "BIGTINY_DATA_DIR".to_string(),
             data_dir.to_string_lossy().into_owned(),
         ));
+    }
+
+    // Where the three bundled tool plugins (`kitty-tools`, `kitty-web`,
+    // `kitty-wasm`) should put their caches, and what their path-containment
+    // checks treat as "inside home".
+    //
+    // **Android only, and deliberately so.** Those crates resolve
+    // `%USERPROFILE%`/`$HOME`/`dirs::home_dir()` for themselves, which is
+    // correct on desktop — and their cache directory
+    // (`~/.cache/lean-goose-mcp`) is shared with users' existing cached data
+    // and with the retired Python tools, so overriding it there would orphan
+    // it. On Android none of those sources answer usefully: the app process
+    // has no meaningful `$HOME` (bionic's `getpwuid` reports `/data`) and a
+    // working directory of `/`, so every cache landed somewhere unwritable
+    // and every containment check compared against the filesystem root.
+    //
+    // Set here rather than in `bigtiny::mcp::server_env`, which is the other
+    // place that hands settings to in-process servers: that one runs
+    // `set_var` from `sync_mcp_once_healthy`, i.e. after the daemon's tasks
+    // are already live. `daemon_env`'s values are applied by
+    // `bigtiny_embedded::start` before the daemon exists, which is the only
+    // point where mutating the process environment is sound.
+    if cfg!(target_os = "android") {
+        if let Ok(dir) = crate::config::config_dir() {
+            env.push((
+                "KITTY_PLUGIN_HOME".to_string(),
+                dir.to_string_lossy().into_owned(),
+            ));
+        }
     }
 
     env
@@ -226,10 +249,7 @@ mod tests {
     }
 
     fn env_of(pairs: &[(String, String)], key: &str) -> Option<String> {
-        pairs
-            .iter()
-            .find(|(k, _)| k == key)
-            .map(|(_, v)| v.clone())
+        pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
     }
 
     /// The secret and the encryption key are the two values that must reach
@@ -251,7 +271,10 @@ mod tests {
         let (s, t, m, l) = settings();
         let on = daemon_env("", "", &s, &t, &m, &l, true, "", "");
         let off = daemon_env("", "", &s, &t, &m, &l, false, "", "");
-        assert_eq!(env_of(&on, "BIGTINY_PATHWAY__ENABLED").as_deref(), Some("true"));
+        assert_eq!(
+            env_of(&on, "BIGTINY_PATHWAY__ENABLED").as_deref(),
+            Some("true")
+        );
         assert_eq!(
             env_of(&off, "BIGTINY_PATHWAY__ENABLED").as_deref(),
             Some("false")
@@ -313,6 +336,31 @@ mod tests {
             env_of(&e, "BIGTINY_MEMORY__BM25_THRESHOLD").as_deref(),
             Some("1.5")
         );
+    }
+
+    /// The three bundled tool plugins get their directory base from this
+    /// variable on Android and *only* on Android: their desktop cache path
+    /// (`~/.cache/lean-goose-mcp`) is shared with existing user data, so
+    /// overriding it there would orphan it.
+    #[test]
+    fn the_plugin_home_is_sent_only_where_it_is_needed() {
+        let (s, t, m, l) = settings();
+        let e = daemon_env("", "", &s, &t, &m, &l, false, "", "");
+        let sent = env_of(&e, "KITTY_PLUGIN_HOME");
+        if cfg!(target_os = "android") {
+            let dir = sent.expect("Android must be told where the plugins may write");
+            assert!(
+                !dir.trim().is_empty(),
+                "an empty value is worse than none: the plugins would treat it as unset \
+                 and fall back to the paths that don't work there"
+            );
+        } else {
+            assert!(
+                sent.is_none(),
+                "desktop plugins resolve their own home; overriding it would move \
+                 users' existing cache out from under them"
+            );
+        }
     }
 
     /// No duplicate keys. `Command::envs` would silently take the last, and

@@ -66,7 +66,7 @@ async fn live_scrape_extracts_real_article_body() {
     assert_eq!(v["status"], "success", "scrape failed: {v}");
 
     let body = v["data"].as_str().expect("data is a string");
-    eprintln!("--- first 600 chars ---\n{}", &body.chars().take(600).collect::<String>());
+    eprintln!("--- first 600 chars ---\n{}", body.chars().take(600).collect::<String>());
     assert!(body.len() > 500, "suspiciously short extraction: {body}");
     assert!(
         body.to_lowercase().contains("webassembly"),

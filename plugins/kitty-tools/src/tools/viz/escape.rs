@@ -78,7 +78,11 @@ fn utf8_char_len(first_byte: u8) -> usize {
     }
 }
 
-fn match_token<'a>(template: &str, start: usize, values: &[(&str, &'a str)]) -> Option<(&'a str, usize)> {
+fn match_token<'a>(
+    template: &str,
+    start: usize,
+    values: &[(&str, &'a str)],
+) -> Option<(&'a str, usize)> {
     for (name, value) in values {
         let token = format!("__{name}__");
         if template[start..].starts_with(&token) {
@@ -99,12 +103,18 @@ mod tests {
 
     #[test]
     fn escape_text_strips_control_chars_but_keeps_tab_newline() {
-        assert_eq!(escape_text("a\x00b\tc\nd\x1fe"), "abtcnde".replace("t", "\t").replace("n", "\n"));
+        assert_eq!(
+            escape_text("a\x00b\tc\nd\x1fe"),
+            "abtcnde".replace("t", "\t").replace("n", "\n")
+        );
     }
 
     #[test]
     fn escape_attr_handles_quotes() {
-        assert_eq!(escape_attr(r#"say "hi" and 'bye'"#), "say &quot;hi&quot; and &#39;bye&#39;");
+        assert_eq!(
+            escape_attr(r#"say "hi" and 'bye'"#),
+            "say &quot;hi&quot; and &#39;bye&#39;"
+        );
     }
 
     #[test]
@@ -116,7 +126,10 @@ mod tests {
 
     #[test]
     fn render_template_substitutes_all_tokens() {
-        let out = render_template("<title>__TITLE__</title><body>__BODY__</body>", &[("TITLE", "T"), ("BODY", "B")]);
+        let out = render_template(
+            "<title>__TITLE__</title><body>__BODY__</body>",
+            &[("TITLE", "T"), ("BODY", "B")],
+        );
         assert_eq!(out, "<title>T</title><body>B</body>");
     }
 
@@ -124,8 +137,14 @@ mod tests {
     fn render_template_does_not_rescan_substituted_values() {
         // The historical bug: a TITLE value containing the literal "__BODY__"
         // must not cause BODY's content to be spliced into the title slot.
-        let out = render_template("<title>__TITLE__</title><body>__BODY__</body>", &[("TITLE", "evil __BODY__ literal"), ("BODY", "real body")]);
-        assert_eq!(out, "<title>evil __BODY__ literal</title><body>real body</body>");
+        let out = render_template(
+            "<title>__TITLE__</title><body>__BODY__</body>",
+            &[("TITLE", "evil __BODY__ literal"), ("BODY", "real body")],
+        );
+        assert_eq!(
+            out,
+            "<title>evil __BODY__ literal</title><body>real body</body>"
+        );
     }
 
     #[test]

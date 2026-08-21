@@ -21,8 +21,8 @@ const CACHE_MAX_BYTES: u64 = 4 * 1024 * 1024;
 /// dot): joining `NUL` or `CON.txt` under the cache dir opens the *device*,
 /// not a file inside it (audit #126).
 const WINDOWS_RESERVED_STEMS: [&str; 22] = [
-    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
-    "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
 ];
 
 fn rejects_traversal(filename: &str) -> bool {
@@ -33,8 +33,14 @@ fn rejects_traversal(filename: &str) -> bool {
         || filename.contains('\\')
         || filename.contains("..")
         || filename.contains(':')
-        || WINDOWS_RESERVED_STEMS
-            .contains(&filename.split('.').next().unwrap_or("").to_uppercase().as_str())
+        || WINDOWS_RESERVED_STEMS.contains(
+            &filename
+                .split('.')
+                .next()
+                .unwrap_or("")
+                .to_uppercase()
+                .as_str(),
+        )
 }
 
 /// Defense-in-depth home boundary on a filename already joined under the
@@ -58,7 +64,11 @@ pub fn cache_list() -> String {
         return success_response(json!([]), None, false, None);
     }
     let mut entries: Vec<std::path::PathBuf> = match std::fs::read_dir(&dir) {
-        Ok(rd) => rd.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.is_file()).collect(),
+        Ok(rd) => rd
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.is_file())
+            .collect(),
         Err(_) => return success_response(json!([]), None, false, None),
     };
     // Python: `sorted(CACHE_DIR.iterdir())` sorts by full path, not filename.
@@ -81,20 +91,40 @@ pub fn cache_view(filename: &str) -> String {
 /// the truncation test needs to plant an oversized file in a scratch dir.
 fn cache_view_in(dir: std::path::PathBuf, filename: &str) -> String {
     if rejects_traversal(filename) {
-        return error_response("CACHE_INVALID_FILENAME", "Filename must not contain path separators or '..'.", None, None);
+        return error_response(
+            "CACHE_INVALID_FILENAME",
+            "Filename must not contain path separators or '..'.",
+            None,
+            None,
+        );
     }
     let file_path = dir.join(filename);
     if let Some(err) = ensure_within_home(&file_path) {
         return err;
     }
     if !file_path.exists() {
-        return error_response("CACHE_MISS", &format!("File '{filename}' not found."), None, None);
+        return error_response(
+            "CACHE_MISS",
+            &format!("File '{filename}' not found."),
+            None,
+            None,
+        );
     }
-    if std::fs::metadata(&file_path).map(|m| m.len() > CACHE_MAX_BYTES).unwrap_or(false) {
+    if std::fs::metadata(&file_path)
+        .map(|m| m.len() > CACHE_MAX_BYTES)
+        .unwrap_or(false)
+    {
         use std::io::Read;
         let f = match std::fs::File::open(&file_path) {
             Ok(f) => f,
-            Err(e) => return error_response("CACHE_READ_ERROR", &format!("Cannot read cached file: {e}"), None, None),
+            Err(e) => {
+                return error_response(
+                    "CACHE_READ_ERROR",
+                    &format!("Cannot read cached file: {e}"),
+                    None,
+                    None,
+                )
+            }
         };
         let mut buf = Vec::with_capacity(CACHE_MAX_BYTES as usize / 2);
         if f.take(CACHE_MAX_BYTES).read_to_end(&mut buf).is_err() {
@@ -110,13 +140,23 @@ fn cache_view_in(dir: std::path::PathBuf, filename: &str) -> String {
     }
     match std::fs::read_to_string(&file_path) {
         Ok(text) => success_response(json!(text), None, false, None),
-        Err(e) => error_response("CACHE_READ_ERROR", &format!("Cannot read cached file: {e}"), None, None),
+        Err(e) => error_response(
+            "CACHE_READ_ERROR",
+            &format!("Cannot read cached file: {e}"),
+            None,
+            None,
+        ),
     }
 }
 
 pub fn cache_delete(filename: &str) -> String {
     if rejects_traversal(filename) {
-        return error_response("CACHE_INVALID_FILENAME", "Filename must not contain path separators or '..'.", None, None);
+        return error_response(
+            "CACHE_INVALID_FILENAME",
+            "Filename must not contain path separators or '..'.",
+            None,
+            None,
+        );
     }
     let file_path = cache_dir().join(filename);
     if let Some(err) = ensure_within_home(&file_path) {
@@ -124,11 +164,21 @@ pub fn cache_delete(filename: &str) -> String {
     }
     if file_path.exists() {
         if let Err(e) = std::fs::remove_file(&file_path) {
-            return error_response("CACHE_DELETE_ERROR", &format!("Cannot delete cached file: {e}"), None, None);
+            return error_response(
+                "CACHE_DELETE_ERROR",
+                &format!("Cannot delete cached file: {e}"),
+                None,
+                None,
+            );
         }
         return success_response(json!({"deleted": filename}), None, false, None);
     }
-    error_response("CACHE_MISS", &format!("File '{filename}' not found."), None, None)
+    error_response(
+        "CACHE_MISS",
+        &format!("File '{filename}' not found."),
+        None,
+        None,
+    )
 }
 
 pub fn cache_clear() -> String {
@@ -166,10 +216,21 @@ mod tests {
     fn ads_and_device_names_are_rejected() {
         // Audit #126: `file.txt:stream` is an NTFS alternate data stream and
         // `NUL`/`CON.txt` are devices, not files inside the cache dir.
-        for bad in ["notes.txt:secret", "C:", "NUL", "nul.txt", "CON", "COM1", "lpt9.log"] {
+        for bad in [
+            "notes.txt:secret",
+            "C:",
+            "NUL",
+            "nul.txt",
+            "CON",
+            "COM1",
+            "lpt9.log",
+        ] {
             let s = cache_view(bad);
             let v: serde_json::Value = serde_json::from_str(&s).unwrap();
-            assert_eq!(v["error_code"], "CACHE_INVALID_FILENAME", "{bad} must be rejected");
+            assert_eq!(
+                v["error_code"], "CACHE_INVALID_FILENAME",
+                "{bad} must be rejected"
+            );
         }
         // Lookalikes are still fine.
         assert!(!rejects_traversal("console.log"));
@@ -188,14 +249,23 @@ mod tests {
     fn oversized_cached_file_is_read_truncated_with_flag() {
         let dir = std::env::temp_dir().join(format!("kt-cache-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("big.txt"), "x".repeat(CACHE_MAX_BYTES as usize + 1)).unwrap();
+        std::fs::write(
+            dir.join("big.txt"),
+            "x".repeat(CACHE_MAX_BYTES as usize + 1),
+        )
+        .unwrap();
 
         let s = cache_view_in(dir.clone(), "big.txt");
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(v["status"], "success", "{s}");
         assert_eq!(v["truncated"], true);
         let text = v["data"].as_str().unwrap();
-        assert!(text.len() <= CACHE_MAX_BYTES as usize, "read {} bytes past the {} cap", text.len(), CACHE_MAX_BYTES);
+        assert!(
+            text.len() <= CACHE_MAX_BYTES as usize,
+            "read {} bytes past the {} cap",
+            text.len(),
+            CACHE_MAX_BYTES
+        );
         assert!(v["message"].as_str().unwrap().contains("truncate"));
 
         std::fs::remove_dir_all(&dir).ok();
