@@ -17,16 +17,21 @@ use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_stream::wrappers::ReceiverStream;
 
 use crate::agent::context::stats::SessionStats;
 use crate::error::StorageError;
-use crate::server::events::{serialize_sse, SSEEvent};
+use crate::server::events::{serialize_sse, SSEEvent, SSEEventType};
 use crate::storage::messages::{self, MessageRow};
 use crate::storage::sessions;
 use crate::storage::timings;
 
 use super::AppState;
+
+/// Depth of the per-response SSE queue. Deep enough that an ordinary
+/// browser hiccup never costs a delta, shallow enough that a client which
+/// stops reading can't hold a turn's worth of text in RAM.
+const SSE_CLIENT_QUEUE: usize = 1024;
 
 fn err_response(status: StatusCode, message: impl Into<String>) -> Response {
     (status, Json(json!({"error": message.into()}))).into_response()
@@ -137,6 +142,9 @@ pub async fn delete_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Response {
+    // `cancel` also drops the session's pending HITL approvals and their
+    // parked notifies — a deleted session must not leave action ids behind
+    // pointing at a session row that no longer exists.
     state.agent.cancel(&id).await;
     match sessions::delete_session(&state.db, &id).await {
         // `delete_session` returns the affected row count, and discarding it
@@ -178,7 +186,11 @@ pub async fn update_config(
                 // and a later turn attaching a *different* file must not silently
                 // revoke access to an earlier one. Union + dedup, order-stable.
                 if k == "attached_paths" {
-                    let existing = obj.get(k).and_then(|e| e.as_array()).cloned().unwrap_or_default();
+                    let existing = obj
+                        .get(k)
+                        .and_then(|e| e.as_array())
+                        .cloned()
+                        .unwrap_or_default();
                     let incoming = v.as_array().cloned().unwrap_or_default();
                     let mut merged_paths: Vec<Value> = existing;
                     for item in incoming {
@@ -250,9 +262,7 @@ pub async fn get_stats(State(state): State<Arc<AppState>>, Path(id): Path<String
         // match (unlike `update_config`'s `StorageError::NotFound` variant)
         // because `SessionStats::get_stats` is agent-side and returns a
         // plain `String` error — there is no variant to match on here.
-        Err(e) if e.contains("not found") => {
-            err_response(StatusCode::NOT_FOUND, e)
-        }
+        Err(e) if e.contains("not found") => err_response(StatusCode::NOT_FOUND, e),
         Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, e),
     }
 }
@@ -265,7 +275,11 @@ pub async fn get_timings(State(state): State<Arc<AppState>>, Path(id): Path<Stri
 }
 
 pub async fn get_pending(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
-    let hitl = state.agent.hitl().lock().await;
+    let mut hitl = state.agent.hitl().lock().await;
+    // Sweep before answering: otherwise the only thing that ever expires a
+    // pending action is some *other* tool call creating a new one, so this
+    // route could keep advertising an approval whose waiter is long gone.
+    hitl.sweep_stale_now();
     let pending: Vec<Value> = hitl
         .get_pending_approvals(&id)
         .iter()
@@ -457,7 +471,13 @@ pub async fn approve_action(
     };
     state.agent.resolve_approval(&body.action_id);
     if let Some(tool_name) = rule_to_persist {
-        state.agent.hitl().lock().await.persist_allow_rule(&tool_name).await;
+        state
+            .agent
+            .hitl()
+            .lock()
+            .await
+            .persist_allow_rule(&tool_name)
+            .await;
     }
     Json(decision.to_dict()).into_response()
 }
@@ -493,7 +513,11 @@ pub async fn compact_session(
     // failure to resolve a provider is not fatal here — compaction's token
     // budget only *defines* the high/low watermarks; fall back to the
     // configured `max_context_tokens` the way the loop does.
-    let resolved_provider_id = state.agent.router().get_provider_id(effective_provider).ok();
+    let resolved_provider_id = state
+        .agent
+        .router()
+        .get_provider_id(effective_provider)
+        .ok();
     let context_length = resolved_provider_id
         .as_deref()
         .and_then(|pid| state.agent.router().context_length(pid))
@@ -563,7 +587,42 @@ pub async fn send_message(
         return err_response(StatusCode::CONFLICT, e);
     }
 
-    let stream = UnboundedReceiverStream::new(rx)
+    // The turn side stays unbounded on purpose — the agent loop emits from
+    // ~15 call sites, several of them inside `?`-free helper fns, and making
+    // every one of them awaitable-and-fallible would be a far larger change
+    // than the risk warrants. Backpressure is applied here instead, at the
+    // one place that knows how fast the client is actually reading: the
+    // response stream is fed through a bounded queue, and once that queue
+    // fills, further *content deltas* are dropped rather than buffered in
+    // RAM. Anything structural (tool calls, errors, status, the terminal
+    // frame) still waits its turn, so a slow reader loses resolution, never
+    // correctness — and a client that has stopped reading entirely closes
+    // the channel, which the turn already treats as a cancel.
+    let (client_tx, client_rx) = mpsc::channel::<SSEEvent>(SSE_CLIENT_QUEUE);
+    tokio::spawn(async move {
+        let mut rx = rx;
+        let mut dropped: u64 = 0;
+        while let Some(event) = rx.recv().await {
+            let droppable = matches!(
+                event.event_type,
+                SSEEventType::LlmDelta | SSEEventType::ReasoningDelta
+            ) && !event.is_last;
+            if droppable {
+                if client_tx.try_send(event).is_err() {
+                    dropped += 1;
+                }
+                continue;
+            }
+            if client_tx.send(event).await.is_err() {
+                break; // client is gone; dropping `rx` ends the turn's stream
+            }
+        }
+        if dropped > 0 {
+            tracing::warn!("dropped {dropped} streaming deltas for a client that fell behind");
+        }
+    });
+
+    let stream = ReceiverStream::new(client_rx)
         .map(|event| Ok::<Bytes, std::convert::Infallible>(Bytes::from(serialize_sse(&event))));
 
     let mut response = Response::new(Body::from_stream(stream));

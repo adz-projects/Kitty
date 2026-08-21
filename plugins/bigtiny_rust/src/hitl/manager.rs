@@ -19,9 +19,8 @@ const MAX_PENDING_AGE: Duration = Duration::from_secs(3600);
 /// `Regex::new` is cheap-but-not-free and callers only ever insert valid or
 /// gracefully-invalid patterns, so a small unbounded cache is fine. The mutex
 /// is held only for the map lookup/insert, never across any await.
-static REGEX_CACHE: Lazy<Mutex<HashMap<String, Option<regex::Regex>>>> = Lazy::new(|| {
-    Mutex::new(HashMap::new())
-});
+static REGEX_CACHE: Lazy<Mutex<HashMap<String, Option<regex::Regex>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 
 /// A pending tool call awaiting human approval.
 #[derive(Debug, Clone)]
@@ -145,8 +144,9 @@ impl HITLManager {
         tool_name: &str,
         args: &Value,
     ) -> HITLDecision {
-        let rules =
-            hitl_rules::list_rules_by_tool(&self.pool, tool_name).await.unwrap_or_default();
+        let rules = hitl_rules::list_rules_by_tool(&self.pool, tool_name)
+            .await
+            .unwrap_or_default();
         self.check_tool_call_with_rules(session_id, tool_name, args, &rules)
     }
 
@@ -359,8 +359,7 @@ impl HITLManager {
     /// recorded `always_allow` decision, run by the caller AFTER releasing
     /// the shared mutex (see `record_decision`).
     pub async fn persist_allow_rule(&self, tool_name: &str) {
-        if let Err(e) = hitl_rules::upsert_rule(&self.pool, tool_name, None, "always_allow").await
-        {
+        if let Err(e) = hitl_rules::upsert_rule(&self.pool, tool_name, None, "always_allow").await {
             tracing::error!("Failed to insert always_allow rule: {}", e);
         }
     }
@@ -384,13 +383,29 @@ impl HITLManager {
             .unwrap_or_default()
     }
 
-    /// Cancel all pending actions for a session.
-    pub fn cancel_pending(&mut self, session_id: &str) {
-        if let Some(action_ids) = self.session_pending.remove(session_id) {
-            for aid in action_ids {
-                self.pending.remove(&aid);
-            }
+    /// Cancel all pending actions for a session, returning the action ids
+    /// that were dropped so the caller can also drain whatever it keyed by
+    /// them (the agent's `hitl_notifies` map).
+    pub fn cancel_pending(&mut self, session_id: &str) -> Vec<String> {
+        let Some(action_ids) = self.session_pending.remove(session_id) else {
+            return Vec::new();
+        };
+        for aid in &action_ids {
+            self.pending.remove(aid);
+            // A decision that raced in just as the turn was cancelled has no
+            // waiter left to consume it; leaving it behind would resolve an
+            // unrelated later action that happened to reuse the id.
+            self.decisions.remove(aid);
         }
+        action_ids
+    }
+
+    /// `sweep_stale`, exposed for the pending-approvals route: without a
+    /// sweep on read, `GET /api/chat/{id}/pending` could keep advertising an
+    /// approval whose waiter is long gone, since the sweep otherwise only
+    /// runs when some *other* tool call creates a new pending action.
+    pub fn sweep_stale_now(&mut self) {
+        self.sweep_stale();
     }
 
     /// Remove a single pending action plus any decision already recorded for
@@ -521,8 +536,7 @@ mod tests {
             rule_row(Some("rm -rf"), "reject"),
             rule_row(Some("git reset --hard"), "reject"),
         ];
-        let matched =
-            HITLManager::match_rule(&rules, r#"{"command": "rm -rf /tmp/x"}"#).unwrap();
+        let matched = HITLManager::match_rule(&rules, r#"{"command": "rm -rf /tmp/x"}"#).unwrap();
         assert_eq!(matched.decision, "reject");
         assert_eq!(matched.args_pattern.as_deref(), Some("rm -rf"));
     }
@@ -548,9 +562,7 @@ mod tests {
     #[test]
     fn match_rule_no_match_returns_none() {
         let rules = vec![rule_row(Some("rm -rf"), "reject")];
-        assert!(
-            HITLManager::match_rule(&rules, r#"{"command": "echo hi"}"#).is_none()
-        );
+        assert!(HITLManager::match_rule(&rules, r#"{"command": "echo hi"}"#).is_none());
     }
 
     async fn test_manager() -> HITLManager {

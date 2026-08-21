@@ -368,8 +368,8 @@ mod tests {
     async fn collect_text_caps_runaway_output_at_the_char_ceiling() {
         use crate::provider::base::Delta;
         let runaway = "x".repeat(MAX_SUMMARIZER_TEXT_CHARS + 1);
-        let stream: std::pin::Pin<Box<dyn futures::Stream<Item = Delta> + Send>> = Box::pin(
-            futures::stream::iter(vec![Delta {
+        let stream: std::pin::Pin<Box<dyn futures::Stream<Item = Delta> + Send>> =
+            Box::pin(futures::stream::iter(vec![Delta {
                 role: "assistant".into(),
                 content: Some(runaway),
                 reasoning: None,
@@ -377,8 +377,7 @@ mod tests {
                 finish_reason: None,
                 usage: None,
                 error_type: None,
-            }]),
-        );
+            }]));
         let err = collect_text(stream).await.unwrap_err();
         assert!(err.contains("ceiling"), "got {err}");
     }
@@ -405,9 +404,8 @@ mod tests {
         );
         assert_eq!(collect_text(stream).await.unwrap(), "{\"ok\":true}");
 
-        let stream: std::pin::Pin<Box<dyn futures::Stream<Item = Delta> + Send>> = Box::pin(
-            futures::stream::iter(vec![delta(None, Some("request"))]),
-        );
+        let stream: std::pin::Pin<Box<dyn futures::Stream<Item = Delta> + Send>> =
+            Box::pin(futures::stream::iter(vec![delta(None, Some("request"))]));
         assert_eq!(collect_text(stream).await.unwrap_err(), "request");
     }
 }

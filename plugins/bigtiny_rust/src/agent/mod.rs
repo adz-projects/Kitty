@@ -23,6 +23,7 @@ use crate::hitl::manager::HITLManager;
 use crate::mcp::MCPManager;
 use crate::provider::router::ProviderRouter;
 use crate::server::events::{SSEEvent, SSEEventType};
+use crate::storage::sessions;
 
 type PathwayEngine = adaptive_pathway::engine::PathwayEngine;
 
@@ -49,7 +50,14 @@ pub struct Agent {
     /// The sender clone lets `cancel()` emit the terminal `Cancelled`
     /// session-status frame before aborting the turn; it is dropped with the
     /// entry, so the stream still closes exactly when the turn ends.
-    tasks: DashMap<String, (Uuid, tokio::task::JoinHandle<()>, mpsc::UnboundedSender<SSEEvent>)>,
+    tasks: DashMap<
+        String,
+        (
+            Uuid,
+            tokio::task::JoinHandle<()>,
+            mpsc::UnboundedSender<SSEEvent>,
+        ),
+    >,
     summarizer: Arc<SummarizerChain>,
     config: BigTinyConfig,
     /// Daemon-wide pre-flight recall counters, shared across every per-turn
@@ -348,6 +356,32 @@ impl Agent {
         if let Some((_, (_, handle, tx))) = self.tasks.remove(session_id) {
             Self::emit_cancelled(&tx, session_id);
             handle.abort();
+            self.cleanup_after_abort(session_id).await;
+        }
+    }
+
+    /// State an aborted turn cannot clean up for itself.
+    ///
+    /// `handle.abort()` unwinds the turn task wherever it happens to be
+    /// awaiting. If that is the HITL approval wait, the task never reaches
+    /// its own cleanup, so the `PendingAction` lingers (and
+    /// `GET /api/chat/{id}/pending` keeps advertising an approval no waiter
+    /// will ever honor) until some later `create_pending` happens to sweep
+    /// it, and the parked `Notify` keyed by that action id is never dropped
+    /// at all. Separately, only the explicit `/cancel` route reset
+    /// `sessions.status`, so a turn killed by the disconnect watcher or by
+    /// shutdown left the row stuck at `'active'` — a session that looks
+    /// permanently busy.
+    async fn cleanup_after_abort(&self, session_id: &str) {
+        let dropped = {
+            let mut hitl = self.hitl.lock().await;
+            hitl.cancel_pending(session_id)
+        };
+        for action_id in dropped {
+            self.hitl_notifies.remove(&action_id);
+        }
+        if let Err(e) = sessions::update_session_status(&self.db, session_id, "idle").await {
+            tracing::warn!("failed to mark session {session_id} idle after abort: {e}");
         }
     }
 
@@ -376,6 +410,7 @@ impl Agent {
         {
             Self::emit_cancelled(&tx, session_id);
             handle.abort();
+            self.cleanup_after_abort(session_id).await;
         }
     }
 
@@ -418,8 +453,15 @@ mod tests {
         let config = BigTinyConfig::default();
         let router = Arc::new(ProviderRouter::new(config.cache.clone()));
         let mcp = Arc::new(MCPManager::new(pool.clone(), None));
-        let hitl = Arc::new(Mutex::new(HITLManager::new(pool.clone(), config.hitl.clone())));
-        let summarizer = Arc::new(SummarizerChain::new(None, router.clone(), config.summarizer.clone()));
+        let hitl = Arc::new(Mutex::new(HITLManager::new(
+            pool.clone(),
+            config.hitl.clone(),
+        )));
+        let summarizer = Arc::new(SummarizerChain::new(
+            None,
+            router.clone(),
+            config.summarizer.clone(),
+        ));
         Arc::new(Agent::new(
             pool,
             router,
@@ -444,8 +486,60 @@ mod tests {
         let token = Uuid::new_v4();
         let handle = tokio::spawn(std::future::pending::<()>());
         let (tx, rx) = mpsc::unbounded_channel::<SSEEvent>();
-        agent.tasks.insert(session_id.to_string(), (token, handle, tx));
+        agent
+            .tasks
+            .insert(session_id.to_string(), (token, handle, tx));
         (token, rx)
+    }
+
+    /// Aborting a turn that was parked on an approval must not leave the
+    /// approval (or its parked `Notify`) behind: `handle.abort()` unwinds at
+    /// the `notified()` await, so the turn's own cleanup never runs.
+    /// `GET /api/chat/{id}/pending` would otherwise keep advertising an
+    /// approval no waiter will ever honor. The session row must also come
+    /// back to `idle` — only the explicit `/cancel` route used to do that, so
+    /// a disconnect-watcher abort left the session permanently `active`.
+    #[tokio::test]
+    async fn aborting_a_turn_clears_its_pending_approval_and_unsticks_the_session() {
+        let agent = test_agent().await;
+        sessions::create_session(&agent.db, "sess-1", "Test")
+            .await
+            .unwrap();
+        sessions::update_session_status(&agent.db, "sess-1", "active")
+            .await
+            .unwrap();
+
+        let action_id = {
+            let mut hitl = agent.hitl.lock().await;
+            let decision =
+                hitl.force_approval("sess-1", "shell", &serde_json::json!({"cmd": "rm -rf /"}));
+            decision.pending_action_id.expect("must be pending")
+        };
+        agent
+            .hitl_notifies
+            .insert(action_id.clone(), Arc::new(Notify::new()));
+
+        let (token, _rx) = insert_fake_turn(&agent, "sess-1");
+        agent.cancel_if_current("sess-1", token).await;
+
+        let still_pending = agent.hitl.lock().await.get_pending_approvals("sess-1");
+        assert!(
+            still_pending.is_empty(),
+            "an aborted turn must not leave an approval nobody is waiting on"
+        );
+        assert!(
+            !agent.hitl_notifies.contains_key(&action_id),
+            "the parked Notify must be dropped with its pending action"
+        );
+
+        let status: String = sqlx::query_scalar("SELECT status FROM sessions WHERE id = 'sess-1'")
+            .fetch_one(&agent.db)
+            .await
+            .unwrap();
+        assert_eq!(
+            status, "idle",
+            "an aborted turn must not leave the session busy"
+        );
     }
 
     #[tokio::test]
@@ -567,7 +661,10 @@ mod tests {
 
         let (tx2, _rx2) = mpsc::unbounded_channel::<SSEEvent>();
         let result = agent.run_turn("no-such-session".into(), "hi".into(), None, None, tx2);
-        assert!(result.is_ok(), "a finished entry must be replaceable: {result:?}");
+        assert!(
+            result.is_ok(),
+            "a finished entry must be replaceable: {result:?}"
+        );
     }
 
     /// The SSE channel must close once the turn is over.

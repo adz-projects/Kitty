@@ -40,7 +40,10 @@ async fn build_engine_with_provider(pool: &SqlitePool, base_url: &str) -> Arc<Re
     build_engine_inner(pool, Some(base_url)).await
 }
 
-async fn build_engine_inner(pool: &SqlitePool, provider_base_url: Option<&str>) -> Arc<RecipeEngine> {
+async fn build_engine_inner(
+    pool: &SqlitePool,
+    provider_base_url: Option<&str>,
+) -> Arc<RecipeEngine> {
     let config = BigTinyConfig::default();
     let router = Arc::new(ProviderRouter::new(config.cache.clone()));
     if let Some(base_url) = provider_base_url {
@@ -57,7 +60,11 @@ async fn build_engine_inner(pool: &SqlitePool, provider_base_url: Option<&str>) 
         pool.clone(),
         config.hitl.clone(),
     )));
-    let summarizer = Arc::new(SummarizerChain::new(None, router.clone(), config.summarizer.clone()));
+    let summarizer = Arc::new(SummarizerChain::new(
+        None,
+        router.clone(),
+        config.summarizer.clone(),
+    ));
     let agent = Arc::new(Agent::new(
         pool.clone(),
         router,
@@ -160,13 +167,13 @@ async fn run_job_failure_cleans_up_temp_session_and_execution_history() {
     let scheduler = Scheduler::new(pool.clone(), engine).await.unwrap();
     scheduler.run_job("j2").await.unwrap();
 
-    // Failed runs are now recorded, not erased (815bugs #91): the
-    // `execution_history` row is marked `failed` with the error message, and
-    // the `_job_*` temp session stays as the row's FK anchor. Previously a
-    // failure deleted both rows — and a provider-failed turn was misrecorded
-    // as `completed` — so failures were invisible in the history either way.
+    // Failed runs are recorded, not erased (815bugs #91): the
+    // `execution_history` row is marked `failed` with the error message.
+    // Since migration 016 made `session_id` nullable, the row no longer has
+    // to anchor the throwaway `_job_*` session to survive — that session (and
+    // its whole message batch) is deleted instead of leaking forever.
     let exec_rows = sqlx::query(
-        "SELECT status, error_message FROM execution_history WHERE trigger_id = 'j2'",
+        "SELECT status, error_message, session_id FROM execution_history WHERE trigger_id = 'j2'",
     )
     .fetch_all(&pool)
     .await
@@ -180,13 +187,51 @@ async fn run_job_failure_cleans_up_temp_session_and_execution_history() {
         "error_message should capture the failure, got: {error_message:?}"
     );
 
+    let anchored: Option<String> = exec_rows[0].get("session_id");
+    assert!(
+        anchored.is_none(),
+        "a finished run must release its temp-session anchor, got {anchored:?}"
+    );
+
     let temp_sessions = sqlx::query("SELECT id FROM sessions WHERE id LIKE '_job_%'")
         .fetch_all(&pool)
         .await
         .unwrap();
     assert_eq!(
         temp_sessions.len(),
-        1,
-        "temp `_job_*` session stays as the failed row's FK anchor"
+        0,
+        "the throwaway `_job_*` session must not outlive a failed run"
     );
+}
+
+/// Two ticks of the same job must not run concurrently: `tokio-cron-scheduler`
+/// spawns a fresh task per due tick regardless of whether the previous one
+/// finished, so a job slower than its own interval used to stack up
+/// overlapping runs (double provider spend, interleaved history rows).
+#[tokio::test]
+async fn a_job_already_in_flight_skips_the_overlapping_tick() {
+    let pool = test_pool().await;
+    sqlx::query("INSERT INTO recipes (id, name, prompt_template, max_steps) VALUES ('r3', 'Broken Recipe', '{% if %}', 30)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO schedule_jobs (id, name, cron, recipe_id, enabled) VALUES ('j3', 'job', '0 9 * * *', 'r3', 1)")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let engine = build_engine(&pool).await;
+    let scheduler = Scheduler::new(pool.clone(), engine).await.unwrap();
+
+    // Both futures are driven concurrently; exactly one may record a run.
+    let (a, b) = tokio::join!(scheduler.run_job("j3"), scheduler.run_job("j3"));
+    a.unwrap();
+    b.unwrap();
+
+    let runs: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM execution_history WHERE trigger_id = 'j3'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(runs, 1, "the overlapping tick must be skipped, not queued");
 }

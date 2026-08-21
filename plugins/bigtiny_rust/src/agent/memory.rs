@@ -313,7 +313,10 @@ mod tests {
 
     #[test]
     fn format_fts_query_short_phrase_and_long_or() {
-        assert_eq!(format_fts_query("checkpoints weeks"), "\"checkpoints weeks\"");
+        assert_eq!(
+            format_fts_query("checkpoints weeks"),
+            "\"checkpoints weeks\""
+        );
         assert_eq!(
             format_fts_query("foo bar baz qux"),
             "\"foo\" OR \"bar\" OR \"baz\" OR \"qux\""
@@ -352,12 +355,10 @@ mod tests {
             preflight_enabled: false,
             ..Default::default()
         };
-        assert!(
-            preflight_recall(&pool, "s1", "why did we do that", 0, &cfg)
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(preflight_recall(&pool, "s1", "why did we do that", 0, &cfg)
+            .await
+            .unwrap()
+            .is_none());
         let cfg2 = MemoryConfig::default();
         assert!(
             preflight_recall(&pool, "s1", "why did we do that", 0, &cfg2)
@@ -376,8 +377,18 @@ mod tests {
         insert(
             &pool,
             &[
-                row(1, "s1", "user", "Let's set checkpoints at weeks 5, 10 and 13."),
-                row(2, "s1", "assistant", "Aggregation checkpoints aligned to midterms."),
+                row(
+                    1,
+                    "s1",
+                    "user",
+                    "Let's set checkpoints at weeks 5, 10 and 13.",
+                ),
+                row(
+                    2,
+                    "s1",
+                    "assistant",
+                    "Aggregation checkpoints aligned to midterms.",
+                ),
                 row(3, "s1", "user", "Now write the draft."),
                 row(4, "s1", "assistant", "Draft done."),
             ],
@@ -404,8 +415,18 @@ mod tests {
         insert(
             &pool,
             &[
-                row(1, "s1", "user", "Let's set checkpoints at weeks 5, 10 and 13."),
-                row(2, "s1", "assistant", "Aggregation checkpoints aligned to midterms."),
+                row(
+                    1,
+                    "s1",
+                    "user",
+                    "Let's set checkpoints at weeks 5, 10 and 13.",
+                ),
+                row(
+                    2,
+                    "s1",
+                    "assistant",
+                    "Aggregation checkpoints aligned to midterms.",
+                ),
                 row(3, "s1", "user", "Now identify the entities for the rubric."),
                 row(4, "s1", "assistant", "Entities: invoice, pipeline, budget."),
             ],
@@ -442,12 +463,10 @@ mod tests {
             .unwrap();
         insert(
             &pool,
-            &[row(1, "s1", "user", "quantum decoherence rate"), row(
-                2,
-                "s1",
-                "assistant",
-                "unrelated filler",
-            )],
+            &[
+                row(1, "s1", "user", "quantum decoherence rate"),
+                row(2, "s1", "assistant", "unrelated filler"),
+            ],
         )
         .await;
 

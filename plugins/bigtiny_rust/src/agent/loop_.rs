@@ -11,14 +11,14 @@ use tokio::sync::{mpsc, Mutex, Notify, Semaphore};
 use tokio::time::Instant;
 
 use crate::agent::compaction::run_compaction;
-use crate::agent::memory::{PreflightCounters, preflight_recall};
-use crate::config::MemoryConfig;
 use crate::agent::context::builder::ContextBuilder;
 use crate::agent::context::stats::SessionStats;
+use crate::agent::memory::{preflight_recall, PreflightCounters};
 use crate::agent::reasoning_models;
 use crate::agent::sandbox::{allowed_dirs_for_session, check_containment};
 use crate::agent::summarizer_chain::SummarizerChain;
 use crate::agent::types::TimingResult;
+use crate::config::MemoryConfig;
 use crate::config::{FallbackConfig, PathwayConfig, SummarizerConfig};
 use crate::error::ProviderError;
 use crate::hitl::manager::HITLManager;
@@ -837,7 +837,10 @@ impl AgentLoop {
         // `get_provider_id` call does that properly a few lines of control flow
         // later. Resolved once and reused by the pathway-recall path-pick
         // below, which also needs to know which provider/model is active.
-        let resolved_provider_id = self.router.get_provider_id(effective_provider.as_deref()).ok();
+        let resolved_provider_id = self
+            .router
+            .get_provider_id(effective_provider.as_deref())
+            .ok();
         let context_tokens_override = resolved_provider_id
             .as_deref()
             .and_then(|pid| self.router.context_length(pid));
@@ -855,7 +858,8 @@ impl AgentLoop {
         let (ap_hints, thought_seed) = match &resolved_provider_id {
             Some(pid) => {
                 let model = self.router.resolve_model(pid, model_override);
-                self.pathway_recall(session_id, user_message, pid, &model).await
+                self.pathway_recall(session_id, user_message, pid, &model)
+                    .await
             }
             None => (None, None),
         };
@@ -1612,13 +1616,12 @@ impl AgentLoop {
             // The MAX(rowid) guard below is redundant with
             // `extract_and_record`'s watermark, so we skip re-deriving it here.
             if exchange_count % learn_every_n as i64 == 0 {
-                let max_rowid: i64 = sqlx::query_scalar(
-                    "SELECT MAX(rowid) FROM messages WHERE session_id = ?",
-                )
-                .bind(&learn_session_id)
-                .fetch_one(&host_pool)
-                .await
-                .unwrap_or(0);
+                let max_rowid: i64 =
+                    sqlx::query_scalar("SELECT MAX(rowid) FROM messages WHERE session_id = ?")
+                        .bind(&learn_session_id)
+                        .fetch_one(&host_pool)
+                        .await
+                        .unwrap_or(0);
                 if max_rowid > 0 {
                     let _ = adaptive_pathway::learn::extract_and_record(
                         &engine,
@@ -1674,8 +1677,8 @@ impl AgentLoop {
         let Some(engine) = self.pathway.as_ref() else {
             return (None, None);
         };
-        let seed_eligible =
-            self.router.supports_assistant_prefill(provider_id) && reasoning_models::supports_reasoning(model);
+        let seed_eligible = self.router.supports_assistant_prefill(provider_id)
+            && reasoning_models::supports_reasoning(model);
         if seed_eligible {
             let seed = tokio::time::timeout(
                 Duration::from_millis(AP_RECALL_EMBED_BUDGET_MS),
@@ -1725,8 +1728,10 @@ impl AgentLoop {
                 None
             }
         };
-        self.preflight
-            .record(self.memory_cfg.preflight_enabled && compacted_through > 0, injected.is_some());
+        self.preflight.record(
+            self.memory_cfg.preflight_enabled && compacted_through > 0,
+            injected.is_some(),
+        );
         injected
     }
 
@@ -1768,7 +1773,9 @@ impl AgentLoop {
             // handles it exactly like any other transient failure.
             if delta.error_type.as_deref() == Some("request") {
                 return Err(ProviderError::Request {
-                    user_message: "Provider stream failed mid-response (connection dropped or idle timeout)".to_string(),
+                    user_message:
+                        "Provider stream failed mid-response (connection dropped or idle timeout)"
+                            .to_string(),
                     raw_message: format!(
                         "finish_reason={:?} error_type={:?}",
                         delta.finish_reason, delta.error_type
@@ -1975,7 +1982,9 @@ impl AgentLoop {
         // a pending action, which a post-hoc deny then orphaned in the
         // pending-approvals API for ~1h with no HitlPause ever emitted. This
         // is a policy violation, not an ask-the-human question.
-        if is_write_tool(&tool_name) && !check_containment(&tool_args, allowed_dirs, self.sandbox_strict) {
+        if is_write_tool(&tool_name)
+            && !check_containment(&tool_args, allowed_dirs, self.sandbox_strict)
+        {
             let err = format!(
                 "Tool {tool_name} denied: it would write to a path outside this \
                  session's allowed directories"
@@ -2179,10 +2188,7 @@ mod backoff_tests {
             for attempt in 1..=10u32 {
                 let b = backoff_ms(delay, attempt);
                 let cap = (delay.max(1) << (attempt - 1).min(16)).min(60_000);
-                assert!(
-                    b <= cap,
-                    "delay {delay} attempt {attempt}: {b} > cap {cap}"
-                );
+                assert!(b <= cap, "delay {delay} attempt {attempt}: {b} > cap {cap}");
             }
         }
     }
@@ -2323,7 +2329,6 @@ mod schema_sanitizer_tests {
             json!({ "type": "object", "properties": {} })
         );
     }
-
 }
 
 #[cfg(test)]
@@ -2333,13 +2338,23 @@ mod write_tool_tests {
     #[test]
     fn classifies_every_known_write_tool() {
         for name in WRITE_TOOL_NAMES {
-            assert!(is_write_tool(name), "{name} should be classified as a write tool");
+            assert!(
+                is_write_tool(name),
+                "{name} should be classified as a write tool"
+            );
         }
     }
 
     #[test]
     fn read_tools_are_not_write_tools() {
-        for name in ["lean_file_read", "lean_excel_inspect", "lean_pdf_read_text", "lean_analyze_workspace", "lean_web_search", "decide"] {
+        for name in [
+            "lean_file_read",
+            "lean_excel_inspect",
+            "lean_pdf_read_text",
+            "lean_analyze_workspace",
+            "lean_web_search",
+            "decide",
+        ] {
             assert!(!is_write_tool(name), "{name} should NOT be a write tool");
         }
     }
@@ -2396,10 +2411,7 @@ mod budget_abort_tests {
             assert_eq!(result["role"], "tool");
             assert_eq!(result["tool_call_id"], call.id);
             assert!(
-                result["content"]
-                    .as_str()
-                    .unwrap()
-                    .contains("cancelled"),
+                result["content"].as_str().unwrap().contains("cancelled"),
                 "each call should carry an explanatory error result"
             );
         }
@@ -2432,8 +2444,15 @@ mod containment_order_tests {
         let config = BigTinyConfig::default();
         let router = Arc::new(ProviderRouter::new(config.cache.clone()));
         let mcp = Arc::new(MCPManager::new(pool.clone(), None));
-        let hitl = Arc::new(Mutex::new(HITLManager::new(pool.clone(), config.hitl.clone())));
-        let summarizer = Arc::new(SummarizerChain::new(None, router.clone(), config.summarizer.clone()));
+        let hitl = Arc::new(Mutex::new(HITLManager::new(
+            pool.clone(),
+            config.hitl.clone(),
+        )));
+        let summarizer = Arc::new(SummarizerChain::new(
+            None,
+            router.clone(),
+            config.summarizer.clone(),
+        ));
         let context = ContextBuilder::new(
             pool.clone(),
             config.token_management.clone(),
@@ -2501,15 +2520,15 @@ mod containment_order_tests {
         let agent_loop = Arc::new(agent_loop);
         let al = agent_loop.clone();
         let handle = tokio::spawn(async move {
-                al.execute_one_tool_call(
-                    "sess-1",
-                    "lean_file_write".to_string(),
-                    json!({"path": "/allowed/ok.txt", "content": "x"}),
-                    &["/allowed".to_string()],
-                    Arc::new(Semaphore::new(1)),
-                    &tx,
-                )
-                .await
+            al.execute_one_tool_call(
+                "sess-1",
+                "lean_file_write".to_string(),
+                json!({"path": "/allowed/ok.txt", "content": "x"}),
+                &["/allowed".to_string()],
+                Arc::new(Semaphore::new(1)),
+                &tx,
+            )
+            .await
         });
         // Wait for the HitlPause, then approve via the manager directly.
         let mut action_id = None;
@@ -2548,8 +2567,8 @@ mod containment_order_tests {
     async fn process_stream_surfaces_a_mid_stream_error_delta_as_a_provider_error() {
         let (agent_loop, _hitl) = test_loop().await;
         let (tx, _rx) = mpsc::unbounded_channel::<SSEEvent>();
-        let stream: Pin<Box<dyn Stream<Item = Delta> + Send>> = Box::pin(futures::stream::iter(vec![
-            Delta {
+        let stream: Pin<Box<dyn Stream<Item = Delta> + Send>> =
+            Box::pin(futures::stream::iter(vec![Delta {
                 role: "assistant".into(),
                 content: None,
                 reasoning: None,
@@ -2557,8 +2576,7 @@ mod containment_order_tests {
                 finish_reason: Some("error".into()),
                 usage: None,
                 error_type: Some("request".into()),
-            },
-        ]));
+            }]));
         let result = agent_loop.process_stream(stream, &tx).await;
         match result {
             Err(ProviderError::Request { .. }) => {}
@@ -2573,26 +2591,27 @@ mod containment_order_tests {
     async fn process_stream_errors_out_even_after_partial_content() {
         let (agent_loop, _hitl) = test_loop().await;
         let (tx, _rx) = mpsc::unbounded_channel::<SSEEvent>();
-        let stream: Pin<Box<dyn Stream<Item = Delta> + Send>> = Box::pin(futures::stream::iter(vec![
-            Delta {
-                role: "assistant".into(),
-                content: Some("partial reply".into()),
-                reasoning: None,
-                tool_calls: None,
-                finish_reason: None,
-                usage: None,
-                error_type: None,
-            },
-            Delta {
-                role: "assistant".into(),
-                content: None,
-                reasoning: None,
-                tool_calls: None,
-                finish_reason: Some("error".into()),
-                usage: None,
-                error_type: Some("request".into()),
-            },
-        ]));
+        let stream: Pin<Box<dyn Stream<Item = Delta> + Send>> =
+            Box::pin(futures::stream::iter(vec![
+                Delta {
+                    role: "assistant".into(),
+                    content: Some("partial reply".into()),
+                    reasoning: None,
+                    tool_calls: None,
+                    finish_reason: None,
+                    usage: None,
+                    error_type: None,
+                },
+                Delta {
+                    role: "assistant".into(),
+                    content: None,
+                    reasoning: None,
+                    tool_calls: None,
+                    finish_reason: Some("error".into()),
+                    usage: None,
+                    error_type: Some("request".into()),
+                },
+            ]));
         let result = agent_loop.process_stream(stream, &tx).await;
         assert!(result.is_err(), "a mid-stream error must fail the attempt");
     }
@@ -2602,8 +2621,8 @@ mod containment_order_tests {
     async fn process_stream_returns_ok_for_a_clean_stream() {
         let (agent_loop, _hitl) = test_loop().await;
         let (tx, _rx) = mpsc::unbounded_channel::<SSEEvent>();
-        let stream: Pin<Box<dyn Stream<Item = Delta> + Send>> = Box::pin(futures::stream::iter(vec![
-            Delta {
+        let stream: Pin<Box<dyn Stream<Item = Delta> + Send>> =
+            Box::pin(futures::stream::iter(vec![Delta {
                 role: "assistant".into(),
                 content: Some("hello".into()),
                 reasoning: None,
@@ -2611,8 +2630,7 @@ mod containment_order_tests {
                 finish_reason: Some("stop".into()),
                 usage: None,
                 error_type: None,
-            },
-        ]));
+            }]));
         let (content_chunks, tool_calls, finish_reason, _usage, _timing) = agent_loop
             .process_stream(stream, &tx)
             .await
@@ -2622,4 +2640,3 @@ mod containment_order_tests {
         assert_eq!(finish_reason.as_deref(), Some("stop"));
     }
 }
-

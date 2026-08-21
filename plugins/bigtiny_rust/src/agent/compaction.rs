@@ -98,7 +98,11 @@ fn map_path_strings(root: &Map<String, Value>, path: &str) -> Vec<String> {
         }
     }
     cur.as_array()
-        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -113,7 +117,9 @@ fn set_path_strings(map: &mut Map<String, Value>, path: &str, items: Vec<String>
     let last = parts[parts.len() - 1];
     let mut cur = map;
     for part in &parts[..parts.len() - 1] {
-        let entry = cur.entry((*part).to_string()).or_insert_with(|| Value::Object(Map::new()));
+        let entry = cur
+            .entry((*part).to_string())
+            .or_insert_with(|| Value::Object(Map::new()));
         match entry.as_object_mut() {
             Some(obj) => cur = obj,
             None => return,
@@ -161,7 +167,10 @@ fn normalize_slots(input: &Value) -> Value {
         "decision_rationale".to_string(),
         array_obj(obj, "new_decisions"),
     );
-    out.insert("user_facts_and_entities".to_string(), Value::Object(user_facts));
+    out.insert(
+        "user_facts_and_entities".to_string(),
+        Value::Object(user_facts),
+    );
     out.insert("exact_identifiers".to_string(), Value::Object(exact));
     out.insert("active_artifacts".to_string(), Value::Object(Map::new()));
     out.insert(
@@ -174,8 +183,7 @@ fn normalize_slots(input: &Value) -> Value {
 }
 
 fn append_unique(existing: &[String], incoming: &[String]) -> Vec<String> {
-    let mut seen: HashSet<String> =
-        existing.iter().map(|s| s.trim().to_lowercase()).collect();
+    let mut seen: HashSet<String> = existing.iter().map(|s| s.trim().to_lowercase()).collect();
     let mut out = existing.to_vec();
     for s in incoming {
         let t = s.trim().to_string();
@@ -306,7 +314,10 @@ pub fn merge_memory_slots(existing: Option<&Value>, new: &Value) -> Value {
     };
 
     for path in LIST_SLOT_PATHS {
-        let merged = append_unique(&map_path_strings(&out, path), &path_strings(&new_norm, path));
+        let merged = append_unique(
+            &map_path_strings(&out, path),
+            &path_strings(&new_norm, path),
+        );
         set_path_strings(&mut out, path, merged);
     }
 
@@ -335,11 +346,18 @@ pub fn merge_memory_slots(existing: Option<&Value>, new: &Value) -> Value {
 /// under `artifacts_max_tokens` by dropping keys oldest-first (insertion order,
 /// courtesy of serde_json `preserve_order`). Survivors are kept verbatim — the
 /// full evicted text remains searchable in FTS5.
-pub fn consolidate_slot_if_needed(mut slots: Value, max_items: i32, artifacts_max_tokens: i32) -> Value {
+pub fn consolidate_slot_if_needed(
+    mut slots: Value,
+    max_items: i32,
+    artifacts_max_tokens: i32,
+) -> Value {
     let max_items = max_items.max(0) as usize;
 
     if let Some(obj) = slots.as_object_mut() {
-        if let Some(arr) = obj.get_mut("decision_rationale").and_then(|v| v.as_array_mut()) {
+        if let Some(arr) = obj
+            .get_mut("decision_rationale")
+            .and_then(|v| v.as_array_mut())
+        {
             if arr.len() > DECISION_RATIONALE_CAP {
                 *arr = arr.split_off(arr.len() - DECISION_RATIONALE_CAP);
             }
@@ -354,10 +372,17 @@ pub fn consolidate_slot_if_needed(mut slots: Value, max_items: i32, artifacts_ma
         }
     }
 
-    if let Some(art) = slots.as_object_mut().and_then(|o| o.get_mut("active_artifacts")).and_then(|v| v.as_object_mut()) {
+    if let Some(art) = slots
+        .as_object_mut()
+        .and_then(|o| o.get_mut("active_artifacts"))
+        .and_then(|v| v.as_object_mut())
+    {
         if artifacts_max_tokens > 0 {
             loop {
-                let total: i32 = art.values().map(|v| count_text_tokens(v.as_str().unwrap_or(""))).sum();
+                let total: i32 = art
+                    .values()
+                    .map(|v| count_text_tokens(v.as_str().unwrap_or("")))
+                    .sum();
                 if total <= artifacts_max_tokens || art.is_empty() {
                     break;
                 }
@@ -423,11 +448,7 @@ fn mask_code_block(fence_block: &str, head_lines: i32, tail_lines: i32) -> Strin
     kept.extend(body[..head].iter().map(|s| s.to_string()));
     kept.push(format!("[...{elided} lines elided...]"));
     if tail > 0 {
-        kept.extend(
-            body[body.len() - tail..]
-                .iter()
-                .map(|s| s.to_string()),
-        );
+        kept.extend(body[body.len() - tail..].iter().map(|s| s.to_string()));
     }
 
     format!("{opening}\n{}\n{closing}", kept.join("\n"))
@@ -749,7 +770,10 @@ pub fn build_summarizer_prompt(existing_slots: Option<&Value>, chunk: &[Value]) 
             .unwrap_or("unknown");
         // Blocks content (image attachments) collapses to a placeholder —
         // never inline base64 payloads into the summarizer prompt.
-        let content_str = msg.get("content").map(render_content_as_text).unwrap_or_default();
+        let content_str = msg
+            .get("content")
+            .map(render_content_as_text)
+            .unwrap_or_default();
 
         let content_with_tools = if let Some(tc) = msg.get("tool_calls") {
             format!("{content_str} [tool_calls: {}]", tc)
@@ -995,8 +1019,11 @@ async fn run_compaction_inner(
     };
 
     let merged = merge_memory_slots(existing_slots.as_ref(), &new_slots);
-    let merged =
-        consolidate_slot_if_needed(merged, summarizer_cfg.max_slot_items, memory_cfg.artifacts_max_tokens);
+    let merged = consolidate_slot_if_needed(
+        merged,
+        summarizer_cfg.max_slot_items,
+        memory_cfg.artifacts_max_tokens,
+    );
 
     let new_watermark = to_fold
         .last()
@@ -1117,7 +1144,11 @@ mod tests {
         });
         let merged = merge_memory_slots(Some(&existing), &new);
         // decision_rationale dedups, keeps order.
-        let decisions = merged.get("decision_rationale").unwrap().as_array().unwrap();
+        let decisions = merged
+            .get("decision_rationale")
+            .unwrap()
+            .as_array()
+            .unwrap();
         assert_eq!(decisions.len(), 2);
         assert_eq!(decisions[0], "Use async");
         assert_eq!(decisions[1], "Use sync");
@@ -1152,9 +1183,21 @@ mod tests {
         });
         let merged = merge_memory_slots(Some(&existing), &new);
         assert_eq!(merged.get("current_task_state").unwrap(), "y");
-        assert_eq!(merged.get("active_artifacts").unwrap().as_object().unwrap().len(), 0);
+        assert_eq!(
+            merged
+                .get("active_artifacts")
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .len(),
+            0
+        );
         // legacy decisions folded into the new list, then appended.
-        let decisions = merged.get("decision_rationale").unwrap().as_array().unwrap();
+        let decisions = merged
+            .get("decision_rationale")
+            .unwrap()
+            .as_array()
+            .unwrap();
         assert_eq!(decisions.len(), 2);
     }
 
@@ -1172,7 +1215,11 @@ mod tests {
         // contribute nothing this pass, leaving `existing` intact.
         for malformed in [json!("oops"), json!([1, 2, 3]), json!(null), json!(42)] {
             let merged = merge_memory_slots(Some(&existing), &malformed);
-            let decisions = merged.get("decision_rationale").unwrap().as_array().unwrap();
+            let decisions = merged
+                .get("decision_rationale")
+                .unwrap()
+                .as_array()
+                .unwrap();
             assert_eq!(decisions.len(), 1);
             assert_eq!(decisions[0], "Use async");
         }
@@ -1243,9 +1290,19 @@ mod tests {
         slots.insert("user_facts_and_entities".to_string(), json!({}));
         slots.insert("current_task_state".to_string(), json!(""));
         let consolidated = consolidate_slot_if_needed(Value::Object(slots), 20, 5);
-        let arts = consolidated.get("active_artifacts").unwrap().as_object().unwrap();
-        assert!(arts.contains_key("newest"), "budget must keep the small newest artifact");
-        assert!(!arts.contains_key("oldest"), "oldest artifact must be evicted first");
+        let arts = consolidated
+            .get("active_artifacts")
+            .unwrap()
+            .as_object()
+            .unwrap();
+        assert!(
+            arts.contains_key("newest"),
+            "budget must keep the small newest artifact"
+        );
+        assert!(
+            !arts.contains_key("oldest"),
+            "oldest artifact must be evicted first"
+        );
         assert!(!arts.contains_key("middle"));
     }
 

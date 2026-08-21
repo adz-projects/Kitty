@@ -15,6 +15,23 @@ use std::str::FromStr;
 
 use crate::error::StorageError;
 
+/// How long a statement waits for SQLite's write lock before giving up.
+const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// How long a caller waits for a pool connection.
+const ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const MAX_CONNECTIONS: u32 = 4;
+
+/// Retention sweep cadence after the one at boot.
+const RETENTION_INTERVAL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+/// Age past which finished `execution_history` rows and `llm_timings` are
+/// pruned. Both are diagnostics, not user data — a month of either is far
+/// more than anyone reads.
+const RETENTION_DAYS: i64 = 30;
+/// Most recent messages kept per session. Compaction already summarizes what
+/// falls out of the context window, so older raw rows past this are dead
+/// weight in a session nobody is going to scroll that far back through.
+const MAX_MESSAGES_PER_SESSION: i64 = 5_000;
+
 pub struct Database {
     pool: SqlitePool,
 }
@@ -61,14 +78,55 @@ impl Database {
         //
         // `journal_mode = WAL` stays a one-shot below: it is a persistent
         // database-level property, not a per-connection one.
-        let options = options.foreign_keys(true);
+        //
+        // `busy_timeout` and `synchronous` are set here for the same reason
+        // (per-connection pragmas), and both defaults are a poor fit for this
+        // workload on a phone. sqlx's 5s `busy_timeout` is short against
+        // Android's throttled storage under the write burst every agent step
+        // produces (message rows + tool calls + timings + session metadata),
+        // and `synchronous = FULL` fsyncs on every one of those commits. In
+        // WAL mode `NORMAL` is still crash-safe against a process kill — the
+        // case that actually happens here, since Android kills backgrounded
+        // apps constantly — and only risks the last commits on OS/power
+        // loss, which is the right trade for a chat transcript.
+        let options = options
+            .foreign_keys(true)
+            .busy_timeout(BUSY_TIMEOUT)
+            .synchronous(sqlx::sqlite::SqliteSynchronous::Normal);
 
-        let pool = SqlitePool::connect_with(options).await?;
+        // sqlx's default pool is 10 connections. SQLite serializes writers
+        // anyway, so extra connections buy nothing but memory and more
+        // contention for the write lock; the concurrency that matters here is
+        // reads, which WAL serves without blocking.
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(MAX_CONNECTIONS)
+            .acquire_timeout(ACQUIRE_TIMEOUT)
+            .connect_with(options)
+            .await?;
         sqlx::query("PRAGMA journal_mode = WAL")
             .execute(&pool)
             .await?;
         bootstrap_legacy_python_schema(&pool).await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
+
+        // First pass now, then daily. Without this nothing in the daemon ever
+        // deleted a row: `llm_timings` and `execution_history` are
+        // insert-only and old session messages accumulate forever, and the
+        // WAL file grows with no checkpoint — on a phone-sized partition that
+        // ends in `SQLITE_FULL`, which turns every route into a 500 while
+        // `/api/health` still cheerfully reports healthy.
+        retention_sweep(&pool).await;
+        let sweep_pool = pool.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(RETENTION_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            ticker.tick().await; // fires immediately; the boot pass covered it
+            loop {
+                ticker.tick().await;
+                retention_sweep(&sweep_pool).await;
+            }
+        });
+
         Ok(Self { pool })
     }
 
@@ -178,6 +236,91 @@ async fn bootstrap_legacy_python_schema(pool: &SqlitePool) -> Result<(), Storage
     Ok(())
 }
 
+/// Bounded, idempotent cleanup of the tables nothing else ever deletes from.
+/// Deliberately conservative — each step is a plain `DELETE` guarded so it
+/// can only ever remove diagnostics or already-summarized history, and every
+/// failure is logged and stepped over rather than aborting the sweep, since
+/// a partial sweep is still better than none.
+pub async fn retention_sweep(pool: &SqlitePool) {
+    let cutoff = format!("-{RETENTION_DAYS} days");
+
+    // Finished executions only — a `running` row belongs to a job that may
+    // still be going (or that crashed, which is worth keeping visible).
+    let executions = sqlx::query(
+        "DELETE FROM execution_history \
+         WHERE status IN ('completed', 'failed', 'cancelled') \
+           AND COALESCE(completed_at, started_at) < datetime('now', ?)",
+    )
+    .bind(&cutoff)
+    .execute(pool)
+    .await;
+    match executions {
+        Ok(r) if r.rows_affected() > 0 => {
+            tracing::info!(
+                "retention: pruned {} execution_history rows",
+                r.rows_affected()
+            );
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!("retention: execution_history prune failed: {e}"),
+    }
+
+    let timings = sqlx::query("DELETE FROM llm_timings WHERE created_at < datetime('now', ?)")
+        .bind(&cutoff)
+        .execute(pool)
+        .await;
+    match timings {
+        Ok(r) if r.rows_affected() > 0 => {
+            tracing::info!("retention: pruned {} llm_timings rows", r.rows_affected());
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!("retention: llm_timings prune failed: {e}"),
+    }
+
+    // Cap raw messages per session. Two guards make this safe to run blind:
+    // only rows beyond the newest `MAX_MESSAGES_PER_SESSION` are considered,
+    // and only rows at or below the session's compaction watermark — i.e.
+    // content already folded into `memory_slots`, never anything the context
+    // builder could still need verbatim.
+    let messages = sqlx::query(
+        "DELETE FROM messages WHERE rowid IN ( \
+             SELECT m.rowid FROM messages m \
+             JOIN sessions s ON s.id = m.session_id \
+             WHERE m.rowid <= COALESCE(s.compacted_through_rowid, 0) \
+               AND m.rowid NOT IN ( \
+                   SELECT rowid FROM messages \
+                   WHERE session_id = m.session_id \
+                   ORDER BY rowid DESC LIMIT ? \
+               ) \
+         )",
+    )
+    .bind(MAX_MESSAGES_PER_SESSION)
+    .execute(pool)
+    .await;
+    match messages {
+        Ok(r) if r.rows_affected() > 0 => {
+            tracing::info!(
+                "retention: pruned {} compacted message rows",
+                r.rows_affected()
+            );
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!("retention: message prune failed: {e}"),
+    }
+
+    // Fold the WAL back into the main database and truncate it. Without this
+    // the WAL only ever grows: sqlx keeps pooled connections open, so SQLite's
+    // own auto-checkpoint-on-last-close never fires in a long-lived daemon.
+    // `TRUNCATE` blocks on active readers, and answering "couldn't checkpoint
+    // right now" is fine — the next sweep tries again.
+    if let Err(e) = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+        .execute(pool)
+        .await
+    {
+        tracing::debug!("retention: wal checkpoint skipped: {e}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use sqlx::SqlitePool;
@@ -199,6 +342,92 @@ mod tests {
             .unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
         pool
+    }
+
+    /// Nothing in the daemon ever deleted a row before the retention sweep,
+    /// so `llm_timings` and `execution_history` grew forever. Old finished
+    /// rows must go; recent rows and rows still `running` must stay.
+    #[tokio::test]
+    async fn retention_sweep_prunes_old_diagnostics_but_keeps_recent_and_running() {
+        let pool = get_test_pool().await;
+        sessions::create_session(&pool, "s1", "Test").await.unwrap();
+
+        for (id, status, when) in [
+            ("old-done", "completed", "-90 days"),
+            ("old-failed", "failed", "-90 days"),
+            ("old-running", "running", "-90 days"),
+            ("fresh-done", "completed", "-1 days"),
+        ] {
+            sqlx::query(
+                "INSERT INTO execution_history (id, session_id, trigger_type, status, started_at, completed_at)                  VALUES (?, 's1', 'schedule', ?, datetime('now', ?), datetime('now', ?))",
+            )
+            .bind(id)
+            .bind(status)
+            .bind(when)
+            .bind(when)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        for (id, when) in [("old-timing", "-90 days"), ("fresh-timing", "-1 days")] {
+            sqlx::query(
+                "INSERT INTO llm_timings (id, session_id, created_at)                  VALUES (?, 's1', datetime('now', ?))",
+            )
+            .bind(id)
+            .bind(when)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        super::retention_sweep(&pool).await;
+
+        let kept_execs: Vec<String> =
+            sqlx::query_scalar("SELECT id FROM execution_history ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            kept_execs,
+            vec!["fresh-done".to_string(), "old-running".to_string()],
+            "only aged-out FINISHED executions may be pruned"
+        );
+
+        let kept_timings: Vec<String> = sqlx::query_scalar("SELECT id FROM llm_timings")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(kept_timings, vec!["fresh-timing".to_string()]);
+    }
+
+    /// The message cap must never touch a row the context builder could still
+    /// need verbatim — only rows at or below the session's compaction
+    /// watermark are eligible, and even then only beyond the recent-message
+    /// window. With compaction never having run, nothing may be pruned.
+    #[tokio::test]
+    async fn retention_sweep_never_prunes_uncompacted_messages() {
+        let pool = get_test_pool().await;
+        sessions::create_session(&pool, "s1", "Test").await.unwrap();
+        for i in 0..20 {
+            sqlx::query(
+                "INSERT INTO messages (id, session_id, role, content) VALUES (?, 's1', 'user', 'hi')",
+            )
+            .bind(format!("m{i}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        super::retention_sweep(&pool).await;
+
+        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            remaining, 20,
+            "messages the session has not compacted through must survive"
+        );
     }
 
     /// Regression test for the "unable to open database file" bug: connect
@@ -511,12 +740,11 @@ mod tests {
         let db2 = super::Database::connect(db_path.to_str().unwrap())
             .await
             .expect("connect must heal a partial legacy bootstrap");
-        let recorded: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM _sqlx_migrations WHERE version <= 3",
-        )
-        .fetch_one(db2.pool())
-        .await
-        .unwrap();
+        let recorded: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations WHERE version <= 3")
+                .fetch_one(db2.pool())
+                .await
+                .unwrap();
         assert_eq!(
             recorded, 3,
             "expected all 3 legacy versions to be re-seeded"
@@ -651,11 +879,12 @@ mod tests {
             .unwrap();
 
         // The index followed the edit rather than keeping the stale text.
-        let hits: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'after'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let hits: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'after'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(hits, 1);
         let stale: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'before'",
@@ -1105,6 +1334,4 @@ mod tests {
         assert_eq!(recent[0].id, "tim1");
         assert!((recent[0].ttfb_ms.unwrap() - 120.5).abs() < f64::EPSILON);
     }
-
-
 }

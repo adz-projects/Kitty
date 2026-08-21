@@ -8,7 +8,9 @@ use crate::error::StorageError;
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct ExecutionRow {
     pub id: String,
-    pub session_id: String,
+    /// `NULL` once a scheduled run's throwaway `_job_<id>` session has been
+    /// cleaned up — the audit row outlives the session it ran in.
+    pub session_id: Option<String>,
     pub trigger_type: String,
     pub trigger_id: Option<String>,
     pub status: String,

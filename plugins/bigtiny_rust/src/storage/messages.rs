@@ -355,7 +355,11 @@ mod tests {
         save_messages(
             &pool,
             "s1",
-            &[msg("a", "s1", "user"), msg("c", "s1", "user"), msg("sys", "s1", "system")],
+            &[
+                msg("a", "s1", "user"),
+                msg("c", "s1", "user"),
+                msg("sys", "s1", "system"),
+            ],
         )
         .await
         .unwrap();
@@ -386,7 +390,11 @@ mod tests {
         save_messages(
             &pool,
             "s1",
-            &[msg("a", "s1", "user"), msg("b", "s1", "assistant"), msg("c", "s1", "user")],
+            &[
+                msg("a", "s1", "user"),
+                msg("b", "s1", "assistant"),
+                msg("c", "s1", "user"),
+            ],
         )
         .await
         .unwrap();
@@ -422,11 +430,14 @@ mod tests {
                 .to_string(),
         );
         let mut memory = msg("m2", "s1", "system");
-        memory.content =
-            Some("[CONSOLIDATED PROJECT MEMORY]\nkey: invoice pipeline is rate-limited\n".to_string());
+        memory.content = Some(
+            "[CONSOLIDATED PROJECT MEMORY]\nkey: invoice pipeline is rate-limited\n".to_string(),
+        );
         let user = msg("u1", "s1", "user");
 
-        save_messages(&pool, "s1", &[recall, memory, user]).await.unwrap();
+        save_messages(&pool, "s1", &[recall, memory, user])
+            .await
+            .unwrap();
 
         let rows = sqlx::query_as::<_, MessageRow>(
             "SELECT rowid, id, session_id, role, content, tool_calls, tool_call_id, token_count, content_format, created_at \
@@ -436,8 +447,10 @@ mod tests {
         .await
         .unwrap();
 
-        let persisted: Vec<(String, String)> =
-            rows.iter().map(|r| (r.id.clone(), r.role.clone())).collect();
+        let persisted: Vec<(String, String)> = rows
+            .iter()
+            .map(|r| (r.id.clone(), r.role.clone()))
+            .collect();
         assert_eq!(persisted, vec![("u1".to_string(), "user".to_string())]);
     }
 }

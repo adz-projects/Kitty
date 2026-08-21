@@ -35,6 +35,44 @@ pub struct Scheduler {
     job_uuids: DashMap<String, uuid::Uuid>,
 }
 
+/// Jobs currently executing, keyed by `schedule_jobs.id`.
+///
+/// `tokio-cron-scheduler` spawns a fresh task for every due tick and derives
+/// the next tick from the cron expression, never from when the previous run
+/// finished. A `*/5` schedule whose recipe takes ten minutes therefore piled
+/// up overlapping executions: concurrent provider spend, interleaved
+/// `execution_history` rows, and two agents writing the same recipe's state.
+///
+/// Process-wide rather than a `Scheduler` field because `run_now` (the manual
+/// trigger route) calls `execute_job` directly, and a manual run must contend
+/// with the cron run for the same slot.
+static JOBS_IN_FLIGHT: once_cell::sync::Lazy<DashMap<String, ()>> =
+    once_cell::sync::Lazy::new(DashMap::new);
+
+/// Releases a job's in-flight slot on every exit path — early returns and
+/// panics included.
+struct InFlightGuard(String);
+
+impl InFlightGuard {
+    /// `None` when the job is already running, which is the signal to skip
+    /// this tick entirely.
+    fn claim(job_id: &str) -> Option<Self> {
+        match JOBS_IN_FLIGHT.entry(job_id.to_string()) {
+            dashmap::mapref::entry::Entry::Occupied(_) => None,
+            dashmap::mapref::entry::Entry::Vacant(slot) => {
+                slot.insert(());
+                Some(Self(job_id.to_string()))
+            }
+        }
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        JOBS_IN_FLIGHT.remove(&self.0);
+    }
+}
+
 fn to_seconds_cron(cron: &str) -> String {
     if cron.split_whitespace().count() == 5 {
         format!("0 {cron}")
@@ -138,7 +176,9 @@ impl Scheduler {
             .ok_or_else(|| SchedulerError::NotFound(job_id.to_string()))?;
 
         let new_enabled = enabled.unwrap_or(current.enabled != 0);
-        let new_cron = cron.map(|s| s.to_string()).unwrap_or_else(|| current.cron.clone());
+        let new_cron = cron
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| current.cron.clone());
 
         if new_enabled {
             // Take the existing registration mapping out first (without
@@ -152,9 +192,7 @@ impl Scheduler {
                     // means there's never a gap where the job isn't firing.
                     if let Some(old_uuid) = old_uuid {
                         if let Err(e) = self.inner.remove(&old_uuid).await {
-                            tracing::warn!(
-                                "Failed to unregister old cron job {job_id}: {e}"
-                            );
+                            tracing::warn!("Failed to unregister old cron job {job_id}: {e}");
                         }
                     }
                 }
@@ -177,8 +215,8 @@ impl Scheduler {
         // so DB and the running scheduler don't diverge — the row still
         // advertises the OLD cron while a NEW live job would otherwise keep
         // firing against it until restart (mirror of add_job's rollback).
-        if let Err(e) = schedules::update_schedule(&self.db, job_id, cron, enabled.map(|b| b as i32))
-            .await
+        if let Err(e) =
+            schedules::update_schedule(&self.db, job_id, cron, enabled.map(|b| b as i32)).await
         {
             // Revert the live registration to match the still-persisted row.
             // Only re-register when the job was previously ENABLED — the old
@@ -235,8 +273,8 @@ impl Scheduler {
         if enabled {
             self.register_cron_job(&id, cron).await?;
         }
-        if let Err(e) = schedules::create_schedule(&self.db, &id, name, cron, recipe_id, enabled as i32)
-            .await
+        if let Err(e) =
+            schedules::create_schedule(&self.db, &id, name, cron, recipe_id, enabled as i32).await
         {
             // Roll back the live registration — the DB insert failed, so a
             // live job with no row would fire forever against nothing.
@@ -280,6 +318,12 @@ impl Scheduler {
 /// comment below for why the failure path can't just delete the temp
 /// session the way the success path does.
 pub(crate) async fn execute_job(db: &SqlitePool, engine: &RecipeEngine, job_id: &str) {
+    // Held for the whole execution; dropped on every return path below.
+    let Some(_in_flight) = InFlightGuard::claim(job_id) else {
+        tracing::warn!("scheduled job {job_id}: previous run still in flight; skipping this tick");
+        return;
+    };
+
     let Ok(Some(job)) = schedules::get_schedule(db, job_id).await else {
         // A DB error here used to be invisible — log it so a schedule that
         // silently stopped firing isn't indistinguishable from a dead daemon.
@@ -308,8 +352,8 @@ pub(crate) async fn execute_job(db: &SqlitePool, engine: &RecipeEngine, job_id: 
         return;
     }
     let _ = sessions::update_session_status(db, &temp_sid, "idle").await;
-    if let Err(e) = execution::insert_execution(db, &exec_id, &temp_sid, "schedule", Some(job_id))
-        .await
+    if let Err(e) =
+        execution::insert_execution(db, &exec_id, &temp_sid, "schedule", Some(job_id)).await
     {
         tracing::error!("scheduled job {job_id}: failed to insert execution row: {e}");
         let _ = sessions::delete_session(db, &temp_sid).await;
@@ -348,10 +392,15 @@ pub(crate) async fn execute_job(db: &SqlitePool, engine: &RecipeEngine, job_id: 
             // than deleting it: with `run_turn_and_wait` now propagating the
             // turn outcome, this arm also fires for provider-failed turns,
             // and those must be visible as `failed` — previously every such
-            // run was misrecorded as `completed`. The row keeps pointing at
-            // the temp session, so the session stays as its FK anchor.
+            // run was misrecorded as `completed`.
+            //
+            // `session_id` is nulled in the same statement (migration 016
+            // made the column nullable) so the row stops anchoring the
+            // throwaway `_job_` session. Before that, the failure path had no
+            // choice but to keep it, and every failed run leaked a session
+            // plus its whole message batch forever.
             if let Err(e2) = sqlx::query(
-                "UPDATE execution_history SET status = 'failed', error_message = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?",
+                "UPDATE execution_history SET status = 'failed', session_id = NULL, error_message = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?",
             )
             .bind(e.to_string())
             .bind(&exec_id)
@@ -360,6 +409,17 @@ pub(crate) async fn execute_job(db: &SqlitePool, engine: &RecipeEngine, job_id: 
             {
                 tracing::error!(
                     "scheduled job {job_id}: failed to mark execution {exec_id} failed: {e2}"
+                );
+                // The row still points at the temp session, so deleting it
+                // would violate the FK. Leave both; the retention sweep in
+                // `storage` prunes the pair once the row ages out.
+                return;
+            }
+            // Messages cascade with the session (`messages.session_id` is
+            // ON DELETE CASCADE).
+            if let Err(e2) = sessions::delete_session(db, &temp_sid).await {
+                tracing::warn!(
+                    "scheduled job {job_id}: failed to delete temp session {temp_sid}: {e2}"
                 );
             }
         }

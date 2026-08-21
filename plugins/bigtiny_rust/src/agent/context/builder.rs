@@ -292,8 +292,7 @@ impl ContextBuilder {
 
         let system_tokens = count_messages_tokens(&head);
         let new_msg_tokens = count_messages_tokens(&tail_messages);
-        let total_tokens =
-            live_token_sum + system_tokens + new_msg_tokens + tail_extra_tokens;
+        let total_tokens = live_token_sum + system_tokens + new_msg_tokens + tail_extra_tokens;
 
         if total_tokens > emergency_cap {
             let target = (max_context_tokens as f64 * self.config.compaction_target_ratio) as i32;
@@ -490,8 +489,7 @@ pub fn strip_trailing_thought_seed(messages: &mut Vec<Value>) -> Option<Value> {
     let is_seed = messages.last().is_some_and(|m| {
         m.get("role").and_then(|r| r.as_str()) == Some("assistant")
             && m.get("id").is_none()
-            && m
-                .get("content")
+            && m.get("content")
                 .and_then(|c| c.as_str())
                 .is_some_and(|c| c.starts_with("<think>\n"))
     });
@@ -503,7 +501,8 @@ pub fn strip_trailing_thought_seed(messages: &mut Vec<Value>) -> Option<Value> {
 }
 
 /// Convert a DB row to a message Value.
-fn row_to_message(row: &crate::storage::messages::MessageRow) -> Value {    let mut msg = serde_json::Map::new();
+fn row_to_message(row: &crate::storage::messages::MessageRow) -> Value {
+    let mut msg = serde_json::Map::new();
     msg.insert("id".to_string(), json!(row.id));
     msg.insert("rowid".to_string(), json!(row.rowid));
     msg.insert("role".to_string(), json!(row.role));
@@ -710,13 +709,31 @@ mod tests {
 
         let baseline = builder
             .build_messages(
-                "sess-1", "next", None, None, None, Some("C:\\c"), Some("C:\\w"), None, None, None,
+                "sess-1",
+                "next",
+                None,
+                None,
+                None,
+                Some("C:\\c"),
+                Some("C:\\w"),
+                None,
+                None,
+                None,
             )
             .await
             .unwrap();
         let with_empty_seed = builder
             .build_messages(
-                "sess-1", "next", None, None, None, Some("C:\\c"), Some("C:\\w"), None, None, Some("   "),
+                "sess-1",
+                "next",
+                None,
+                None,
+                None,
+                Some("C:\\c"),
+                Some("C:\\w"),
+                None,
+                None,
+                Some("   "),
             )
             .await
             .unwrap();
@@ -742,7 +759,11 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(with_seed.len(), baseline.len() + 1, "seeding must add exactly one trailing message");
+        assert_eq!(
+            with_seed.len(),
+            baseline.len() + 1,
+            "seeding must add exactly one trailing message"
+        );
         // Every message up to and including the user message is untouched.
         assert_eq!(
             serde_json::to_string(&with_seed[..baseline.len()]).unwrap(),
@@ -751,12 +772,11 @@ mod tests {
         );
         let last = with_seed.last().unwrap();
         assert_eq!(last.get("role").and_then(|r| r.as_str()), Some("assistant"));
-        assert!(
-            last.get("content")
-                .and_then(|c| c.as_str())
-                .map(|c| c.contains("The user prefers terse answers.") && c.starts_with("<think>"))
-                .unwrap_or(false)
-        );
+        assert!(last
+            .get("content")
+            .and_then(|c| c.as_str())
+            .map(|c| c.contains("The user prefers terse answers.") && c.starts_with("<think>"))
+            .unwrap_or(false));
         // The user message must still be the second-to-last, unchanged.
         let user_msg = &with_seed[with_seed.len() - 2];
         assert_eq!(user_msg.get("role").and_then(|r| r.as_str()), Some("user"));
@@ -777,7 +797,9 @@ mod tests {
         let builder = ContextBuilder::new(pool.clone(), TokenManagementConfig::default(), 2);
 
         let messages = builder
-            .build_messages("sess-1", "hello", None, None, None, None, None, None, None, None)
+            .build_messages(
+                "sess-1", "hello", None, None, None, None, None, None, None, None,
+            )
             .await
             .unwrap();
 
@@ -793,7 +815,7 @@ mod tests {
         }
     }
 
-        /// Adaptive-Pathway hints are injected into the tail region (immediately
+    /// Adaptive-Pathway hints are injected into the tail region (immediately
     /// before the new user message) so the stable head stays byte-identical
     /// for prefix caching. Asserting: (1) `None` and an empty/whitespace
     /// block both produce hints-free output (zero prompt delta), and (2) a
@@ -810,7 +832,18 @@ mod tests {
         builder.save_messages("sess-1", &mut seed).await.unwrap();
 
         let none = builder
-            .build_messages("sess-1", "next", None, None, None, Some("C:\\c"), Some("C:\\w"), None, None, None)
+            .build_messages(
+                "sess-1",
+                "next",
+                None,
+                None,
+                None,
+                Some("C:\\c"),
+                Some("C:\\w"),
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap();
         let empty = builder
@@ -906,7 +939,8 @@ mod tests {
     }
 
     #[test]
-    fn test_row_to_message_basic() {        let row = crate::storage::messages::MessageRow {
+    fn test_row_to_message_basic() {
+        let row = crate::storage::messages::MessageRow {
             rowid: 1,
             id: "msg-1".into(),
             session_id: "sess-1".into(),
@@ -947,7 +981,9 @@ mod tests {
         builder.save_messages("sess-1", &mut seed).await.unwrap();
 
         let messages = builder
-            .build_messages("sess-1", "next", None, None, None, None, None, None, None, None)
+            .build_messages(
+                "sess-1", "next", None, None, None, None, None, None, None, None,
+            )
             .await
             .unwrap();
 
@@ -991,29 +1027,42 @@ mod tests {
 
         let mut messages = builder
             .build_messages(
-                "sess-1", "next", None, None, None, None, None, None, None,
+                "sess-1",
+                "next",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
                 Some("The user prefers terse answers."),
             )
             .await
             .unwrap();
 
-        let stripped = strip_trailing_thought_seed(&mut messages)
-            .expect("the seed message must be stripped");
+        let stripped =
+            strip_trailing_thought_seed(&mut messages).expect("the seed message must be stripped");
         assert_eq!(stripped["role"], "assistant");
-        assert!(
-            stripped["content"]
-                .as_str()
-                .unwrap()
-                .contains("The user prefers terse answers.")
-        );
+        assert!(stripped["content"]
+            .as_str()
+            .unwrap()
+            .contains("The user prefers terse answers."));
         // The user message is now last again.
         assert_eq!(
-            messages.last().unwrap().get("role").and_then(|r| r.as_str()),
+            messages
+                .last()
+                .unwrap()
+                .get("role")
+                .and_then(|r| r.as_str()),
             Some("user")
         );
 
         // Persisting the stripped vec must not write any `<think>` content.
-        builder.save_messages("sess-1", &mut messages).await.unwrap();
+        builder
+            .save_messages("sess-1", &mut messages)
+            .await
+            .unwrap();
         let rows = messages::get_messages_by_session(&pool, "sess-1")
             .await
             .unwrap();
@@ -1055,7 +1104,8 @@ mod tests {
         assert_eq!(out["image_url"]["url"], "data:image/png;base64,QUJD");
 
         // An already-normalized block (has `type`) is passed through untouched.
-        let already = json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,ZZ"}});
+        let already =
+            json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,ZZ"}});
         assert_eq!(normalize_image_block(&already), already);
     }
 }

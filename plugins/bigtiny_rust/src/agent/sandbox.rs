@@ -233,8 +233,16 @@ fn scratch_allowance() -> Vec<String> {
         dirs.push(temp.to_string_lossy().replace('\\', "/"));
     }
     if let Some(home) = home_dir() {
-        dirs.push(home.join(SEARCH_OFFLOAD_DIR).to_string_lossy().replace('\\', "/"));
-        dirs.push(home.join(LEAN_CACHE_DIR).to_string_lossy().replace('\\', "/"));
+        dirs.push(
+            home.join(SEARCH_OFFLOAD_DIR)
+                .to_string_lossy()
+                .replace('\\', "/"),
+        );
+        dirs.push(
+            home.join(LEAN_CACHE_DIR)
+                .to_string_lossy()
+                .replace('\\', "/"),
+        );
     }
     dirs
 }
@@ -370,12 +378,24 @@ mod tests {
         let dirs = allowed_dirs_for_session(&metadata, "~/.bigtiny");
 
         let temp = std::env::temp_dir().to_string_lossy().replace('\\', "/");
-        assert!(dirs.contains(&temp), "OS temp dir must be allowed, got {dirs:?}");
+        assert!(
+            dirs.contains(&temp),
+            "OS temp dir must be allowed, got {dirs:?}"
+        );
 
         if let Some(home) = home_dir() {
-            let offload = home.join(SEARCH_OFFLOAD_DIR).to_string_lossy().replace('\\', "/");
-            assert!(dirs.contains(&offload), "search offload dir must be allowed");
-            let lean = home.join(LEAN_CACHE_DIR).to_string_lossy().replace('\\', "/");
+            let offload = home
+                .join(SEARCH_OFFLOAD_DIR)
+                .to_string_lossy()
+                .replace('\\', "/");
+            assert!(
+                dirs.contains(&offload),
+                "search offload dir must be allowed"
+            );
+            let lean = home
+                .join(LEAN_CACHE_DIR)
+                .to_string_lossy()
+                .replace('\\', "/");
             assert!(dirs.contains(&lean), "lean cache dir must be allowed");
         }
     }
@@ -397,7 +417,10 @@ mod tests {
 
         let metadata = json!({"chat_dir": "/home/user/chat"});
         let dirs = allowed_dirs_for_session(&metadata, "~/.bigtiny");
-        assert!(path_within_any(&dirs, &offload_file), "{offload_file} not allowed");
+        assert!(
+            path_within_any(&dirs, &offload_file),
+            "{offload_file} not allowed"
+        );
     }
 
     #[test]
@@ -449,10 +472,10 @@ mod tests {
     #[test]
     fn test_extract_shell_paths_ignores_absolute_urls() {
         assert!(extract_shell_paths("curl https://example.com").is_empty());
+        assert!(extract_shell_paths("git clone https://github.com/org/repo.git").is_empty());
         assert!(
-            extract_shell_paths("git clone https://github.com/org/repo.git").is_empty()
+            extract_shell_paths("curl -X POST 'https://api.example.com/v1' -d '{}'").is_empty()
         );
-        assert!(extract_shell_paths("curl -X POST 'https://api.example.com/v1' -d '{}'").is_empty());
     }
 
     /// Real Windows paths in a command must still be extracted — including

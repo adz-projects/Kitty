@@ -18,7 +18,7 @@ use regex::Regex;
 
 static REASONING_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     [
-        r"(?i)think",     // lfm2.5-thinking, qwen3-thinking, *-thinking
+        r"(?i)think", // lfm2.5-thinking, qwen3-thinking, *-thinking
         r"(?i)reason",
         r"(?i)deepseek-?r1",
         r"(?i)\bqwq\b",
@@ -69,7 +69,12 @@ mod tests {
 
     #[test]
     fn does_not_match_ordinary_models() {
-        for m in ["llama3.2:3b", "qwen2.5-coder:7b", "gpt-4o", "claude-sonnet-4-20250514"] {
+        for m in [
+            "llama3.2:3b",
+            "qwen2.5-coder:7b",
+            "gpt-4o",
+            "claude-sonnet-4-20250514",
+        ] {
             assert!(!supports_reasoning(m), "expected {m} to NOT match");
         }
     }
