@@ -27,19 +27,10 @@ check --lib` in `src-tauri/`.
 3. **Tier 2 — Provider health & memory safety**, in order #6 → #7 → #8 → #9 → #10 →
     #11 → #12 → #13 (passive circuit breaker, buffer caps, DNS/cache TTLs, keepalive,
     transport taxonomy, no silent client degradation, summarizer ceilings). **DONE (2026-08-20).**
-4. **Tier 3 — MCP transport robustness.** **Decision gate first:** investigate rmcp
-   2.x — does 2.2.0 (already pinned by `kitty-tools`) fix the stdio codec
-   (`new_with_max_length` default), decode-error resume, write-side send wedge, and
-   cancellation? If viable, migrate `src/mcp/` to 2.x and unify the two rmcp pins; if
-   not, fall back to a targeted `[patch.crates-io]` fork of 0.9.1. Either way #14/#15
-   (max frame length + skip-and-continue) and #16 (write-side timeout/eviction) and
-   #17 (`notifications/cancelled`) ride on it. Then #18 → #19 → #20 → #21 → #22 → #23.
-5. **Tier 4 — Turn lifecycle / HITL / scheduler / SSE**, in order #24 → #25 → #26 →
-   #27 → #28 → #29 → #31. #27 (nullable `execution_history.session_id`) and #28
-   (retention/pruning) are sqlx **migrations** with a conservative policy: prune
-   `execution_history`/`llm_timings` older than 30 days, cap messages per session,
-   `wal_checkpoint(TRUNCATE)` at boot + daily. Final checkpoint: full test/clippy +
-   Android gating check.
+4. **Tier 3 — MCP transport robustness.** Decision gate resolved: **stay on rmcp
+   0.9.1**, hardened transport built in-tree. #14–#23. **DONE (2026-08-21).**
+5. **Tier 4 — Turn lifecycle / HITL / scheduler / SSE**, #24 → #25 → #26 → #27 →
+   #28 → #29 → #31. **DONE (2026-08-21).**
 
 ---
 
@@ -103,13 +94,15 @@ check --lib` in `src-tauri/`.
 | 0 — Upgrade safety | ✅ Done | #30 | Transaction-wrapped legacy bootstrap; regression test `connect_heals_a_partial_legacy_bootstrap`. |
 | 1 — Data loss / hangs / unbounded retry | ✅ Done | #1, #2, #3, #4, #5 | Mid-stream errors route through shared retry budget; bounded error-body read; transcript idempotency; direct/tunnel fallback; retryable-vs-fatal classification + `Retry-After` + jittered backoff. Frontend `error_type` tags unchanged (still consumed). |
 | 2 — Provider health & memory safety | ✅ Done | #6, #7, #8, #9, #10, #11, #12, #13 | Passive circuit breaker (`mark_unhealthy` + cooldown, `is_transport_error`); SSE line/tool caps; DNS 2s timeout + IPv4-first; Tailscale cache TTLs (10m/5m); `tcp_keepalive` + idle default 300→120s + 1h stream cap; transport taxonomy (`ConnectFailed`/`Timeout`/`Request`); client-builder failure logged at `error`; summarizer 200k-char ceiling + 300s overall timeout. |
-| 3 — MCP transport robustness | ⬜ Not started | — | rmcp 2.x decision gate first (#14–#23). |
-| 4 — Turn lifecycle / HITL / scheduler / SSE | ⬜ Not started | — | #24–#29, #31. |
+| 3 — MCP transport robustness | ✅ Done | #14–#23 | Hardened stdio/in-process transport (skip-and-continue, 32MB frame cap, bounded+latching writes); own child transport keeping rmcp's reaping/graceful-shutdown; cancelling tool-call timeout; daemon-side health watcher with backoff reconnect; observed in-process serve task + de-poisoned AP embed lock; SSE id correlation + protocol-error strictness; per-server `timeout_s`; capped extraction + clamped `output_size_bytes`; per-id connect serialization. |
+| 4 — Turn lifecycle / HITL / scheduler / SSE | ✅ Done | #24–#29, #31 | Abort now clears pending HITL + notifies and unsticks `sessions.status`; scheduler in-flight guard; nullable `execution_history.session_id` + temp-session cleanup (migration 016); retention sweep at boot + daily incl. `wal_checkpoint(TRUNCATE)`; explicit pool/busy_timeout/synchronous; SSE backpressure at the HTTP boundary. |
 
 Checkpoints:
 - Tier 0+1 checkpoint: `cargo test` 330 unit + 30 integration green, `cargo clippy --all-targets` clean, `pnpm test` 272 green, `pnpm lint` fails only on pre-existing Prettier drift (no eslint errors).
 - Tier 2 checkpoint (2026-08-20): `cargo test` **350 unit + 30 integration, 0 failures**, `cargo clippy --all-targets` **clean**.
-- **Android gating check still blocked:** `cargo ndk -t arm64-v8a --platform 26 check --lib` (in `src-tauri/`) requires `ANDROID_NDK`/`ANDROID_NDK_ROOT` env, which is unset in this environment (cargo-ndk present). Must run before Tier 2 can be considered fully gated on Android.
+- Tier 3 checkpoint (2026-08-21): `cargo test` **355 unit + 34 integration, 0 failures**, `cargo clippy --all-targets` **clean**.
+- Tier 4 / final checkpoint (2026-08-21): `cargo test` **358 unit + 32 integration, 0 failures**, `cargo clippy --all-targets` **clean**.
+- **Android gating check now GREEN** (2026-08-21): `cargo ndk -t arm64-v8a --platform 26 check --lib` in `src-tauri/` passes (only pre-existing dead-code warnings for desktop-only fns). The NDK was present at `%LOCALAPPDATA%/Android/Sdk/ndk/27.2.12479018` all along — only `ANDROID_NDK_ROOT`/`ANDROID_NDK_HOME` were unset. This retroactively closes the Tier 2 gating gap as well.
 
 ---
 
@@ -278,3 +271,159 @@ Unchanged: the four `error_type` tags (`network_unreachable`, `auth_failed`,
 
 ### Next
 Tier 3 (#14–#23) — rmcp 2.x decision gate first.
+
+---
+
+## Implementation Report (2026-08-21) — Tiers 3 & 4
+
+Tier 3 (#14–#23) and Tier 4 (#24–#29, #31) are implemented and gated green:
+`cargo test` **358 unit + 32 integration, 0 failures**; `cargo clippy --all-targets`
+**clean**; `cargo ndk -t arm64-v8a --platform 26 check --lib` **clean**. All 31
+findings are now closed.
+
+### Tier 3 decision gate — outcome: stay on rmcp 0.9.1
+
+Investigated rmcp 2.2.0 (already in this workspace's lock, pinned by
+`kitty-tools`/`kitty-web`/`kitty-wasm`/`adaptive-pathway`) against the four
+questions the gate posed:
+
+| Question | rmcp 2.2.0 |
+|---|---|
+| Decode-error resume (#14) | **Fixed** — `async_rw.rs:163-193` skips unparsable lines. |
+| Codec `max_length` default (#15) | **Not fixed** — the 2.x read path is an unbounded `read_until` into `line_buf`; the frame cap exists only on the `Framed` path it no longer uses. |
+| Write-side send wedge (#16) | **Not fixed** — the write mutex is still held across `send().await` (`async_rw.rs:105-117`), verbatim from 0.9. |
+| Cancellation (#17) | **No change needed in either** — `send_cancellable_request` + `PeerRequestOptions { timeout }` already emits `notifications/cancelled` and drops the pending responder in **0.9.1** (`service.rs:251-277`). BigTiny simply wasn't using it. |
+
+So 2.x buys one of four, leaves #15/#16 needing our own transport anyway, and
+would churn every rmcp model type in `mcp/client.rs` (`CallToolRequestParam` →
+`CallToolRequestParams`, new `_meta`/`task` fields, changed result enums) for a
+binary-size win rather than a stability one. Note also that 0.9.1's read side
+uses `FramedRead` (internally buffered, cancellation-safe under the serve
+loop's `select!`), whereas 2.2.0's rewrite to `read_until` had to re-derive
+cancellation safety by hand — a *regression* risk, not an improvement.
+
+**Decision: keep 0.9.1, no `[patch.crates-io]` fork, build the hardened
+transport in-tree.** It fixes #14 + #15 + #16 in one place, is fully covered by
+our own tests, and leaves the dependency untouched.
+
+### Tier 3
+
+- **#14/#15** `mcp/rw_transport.rs` — `HardenedRwTransport`, used by both the
+  stdio child and the Android in-process duplex pipe. Drives
+  `JsonRpcMessageCodec` directly (`Reader::drain_buffer` + `read_buf`) instead
+  of via `FramedRead`, because `FramedRead` latches itself off after one error
+  and rmcp maps that to EOF — i.e. one non-JSON log line from a third-party
+  server took its whole tool set offline. Now a decode error is logged and
+  skipped; only EOF or a real I/O error ends the stream. Codec built with
+  `new_with_max_length(32 MB)`, which is also what makes the codec's own
+  discard-to-next-newline resync reachable (dead code at the default
+  `usize::MAX`). Cancellation-safe: the only await is `read_buf` into a field.
+  One subtlety handled explicitly: the codec answers `Ok(None)` both for "need
+  more input" and after *consuming* a line it chose to ignore, so the drain
+  loop compares buffer length before/after rather than trusting `None`.
+- **#16** every send is wrapped in a 20s `WRITE_TIMEOUT`; a send that times out
+  sets a `wedged` flag so queued sends fail fast instead of each waiting their
+  own timeout behind a child that stopped draining its stdin.
+- **#14/#16** `mcp/child_transport.rs` — `ChildProcessTransport` replaces
+  rmcp's `TokioChildProcess` (hardwired to its own framing, no way to swap it).
+  Reproduces the child lifecycle rmcp got right and the "already solid" list
+  requires: stdin close first, 3s grace, reaping `kill().await` (never a bare
+  `start_kill`), `kill_on_drop(true)` as the backstop, stderr inherited.
+  Dropping the rmcp transport also dropped the `process-wrap` code path, which
+  was un-wrapped (no JobObject) anyway, so no tree-kill behavior was lost.
+- **#17** `execute_tool`'s rmcp branch uses `send_cancellable_request` with
+  rmcp's own timeout, so a timeout emits `notifications/cancelled` and drops
+  the pending responder. The outer `tokio::time::timeout` remains as a
+  belt-and-braces bound with a 2s `TIMEOUT_GRACE`, so the *cancelling* timeout
+  always wins the race; both report the same wording.
+- **#18** `MCPManager::spawn_health_watcher` (15s tick, wired in `lib.rs`,
+  aborted at shutdown). Retires servers whose transport died — DB row to
+  `error`, registry pruned immediately so the next turn stops advertising dead
+  tools — then reconnects any `enabled`-but-absent server with exponential
+  backoff (5s → 5min). Liveness is `Peer::is_transport_closed()`; SSE is
+  stateless HTTP and reports alive by design. Eviction runs under the per-id
+  connect lock with a re-check, so it can't evict a client a concurrent
+  reconnect just installed.
+- **#19** the in-process serve task's `JoinHandle` is awaited in a wrapper task
+  and its panic logged with the server id. `adaptive-pathway`'s shared embed
+  provider now takes its `std::sync::Mutex` through `lock_state`, which
+  recovers from poisoning — no critical section spans an await, so the mutex
+  choice was right, but `.lock().unwrap()` made one panic permanent and global
+  across every session. Audited: that was the crate's only `std::sync::Mutex`.
+- **#20** `sse_transport.rs` correlates the response `id` against the request
+  (a wrong-id reply under concurrent calls previously returned one tool's
+  output as another's), treats a reply with neither `result` nor `error` — and
+  a `tools/call` with no `content` — as a protocol error instead of an empty
+  success, and logs dropped invalid headers instead of silently dialing with
+  no auth.
+- **#21** per-server `timeout_s` (migration 015) through
+  `MCPServerRow` → `MCPServerConfig` → routes (tri-state patch, non-positive
+  rejected) → `MCPManager::server_timeouts`. Precedence: explicit caller
+  override, then the server's setting, then the 30s default.
+- **#22** `CappedJoin` stops accumulating at the 100KB output cap during
+  extraction (previously the whole joined string was built, then truncated —
+  two full copies of a huge result), while still reporting the true pre-cap
+  byte total; `output_size_bytes` is clamped rather than wrapping negative
+  past 2 GB.
+- **#23** connects serialize on a per-server-id `tokio::sync::Mutex`, closing
+  the `/connect`-vs-PATCH-vs-recipe-engine double-spawn race.
+
+### Tier 4
+
+- **#24** `Agent::cleanup_after_abort` — drops the session's pending HITL
+  actions (`cancel_pending`, which now also clears their recorded decisions and
+  returns the ids) and the `hitl_notifies` entries keyed by them. Called from
+  `cancel`, `cancel_if_current`, and therefore `delete_session` and `shutdown`.
+  `GET /api/chat/{id}/pending` also sweeps stale entries on read.
+- **#25** the same helper resets `sessions.status` to `idle`.
+- **#26** `JOBS_IN_FLIGHT` + `InFlightGuard` — process-wide (so `run_now`
+  contends with cron for the same slot), released by `Drop` on every exit path
+  including panics.
+- **#27** migration 016 makes `execution_history.session_id` nullable; the
+  failure path nulls it in the same statement that records `failed`, then
+  deletes the temp session (messages cascade). The migration also retroactively
+  nulls and deletes sessions already leaked this way.
+- **#28** `storage::retention_sweep` at boot + daily. Conservative by design:
+  only *finished* `execution_history` rows and `llm_timings` past 30 days, and
+  messages only where `rowid <= sessions.compacted_through_rowid` **and**
+  outside the newest 5,000 per session — so nothing the context builder could
+  still need verbatim is ever eligible. Ends with
+  `PRAGMA wal_checkpoint(TRUNCATE)`, which nothing else ever triggered (sqlx
+  keeps pooled connections open, so SQLite's auto-checkpoint-on-last-close
+  never fires in a long-lived daemon).
+- **#29** explicit `max_connections(4)`, `acquire_timeout(30s)`,
+  `busy_timeout(15s)`, `synchronous = NORMAL`.
+- **#31** SSE backpressure at the HTTP boundary rather than in the loop: a
+  forwarder pumps the (still unbounded) turn channel into a bounded 1024-slot
+  client queue; once full, `LlmDelta`/`ReasoningDelta` are dropped (counted and
+  logged) while everything structural still awaits its slot. Deliberate scope
+  call: the loop emits from ~15 non-fallible call sites, and making each
+  awaitable-and-fallible would be a far larger change than the risk warrants.
+
+### Frontend
+
+No changes required. `timeout_s` is additive and Kitty's client parses MCP rows
+field-by-field (`src-tauri/src/bigtiny/mcp.rs::parse_server`, no
+`deny_unknown_fields`); nothing in the frontend reads `execution_history`.
+
+### Regression tests added
+
+`rw_transport`: skip a non-JSON line, skip valid-JSON-that-isn't-JSON-RPC,
+frame-cap discard-and-resync, EOF, and write-wedge latching (paused clock).
+`tests/mcp_never_throws.rs`: a real `--noisy` stdio child that logs plain text
+before every message must still connect, list tools, and serve repeat calls.
+`storage`: retention prunes aged-out finished diagnostics but keeps recent and
+`running` rows, and never prunes uncompacted messages.
+`agent`: aborting a turn parked on an approval clears the pending action, its
+`Notify`, and the `active` session status.
+`scheduler`: an overlapping tick is skipped, and a failed run releases its
+temp-session anchor and deletes the session.
+
+### Follow-ups deliberately not taken
+
+- **rmcp 2.x migration.** Worth revisiting only if a future 2.x fixes #15/#16
+  upstream, or if binary size from carrying two rmcp majors becomes a problem.
+  The decision table above is the record of why it was not worth it now.
+- **Bounded turn-side SSE channel.** See #31 above — the boundary-level
+  backpressure covers the memory risk; converting ~15 emit sites is a separate,
+  larger refactor.

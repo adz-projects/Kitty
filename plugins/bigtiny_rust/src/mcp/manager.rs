@@ -86,11 +86,7 @@ impl MCPManager {
         // Serialize connects per server id (#23): two concurrent callers
         // would otherwise each spawn a child, and only the one that wins the
         // `servers.insert` race would ever be reachable or shut down.
-        let lock = self
-            .connect_locks
-            .entry(server_id.to_string())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone();
+        let lock = self.connect_lock_for(server_id);
         let _guard = lock.lock().await;
 
         let result = self.connect_server_locked(server_id).await;
@@ -102,6 +98,14 @@ impl MCPManager {
             Err(_) => self.note_reconnect_failure(server_id),
         }
         result
+    }
+
+    /// The per-id lock every connect/evict for `server_id` serializes on.
+    fn connect_lock_for(&self, server_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.connect_locks
+            .entry(server_id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     async fn connect_server_locked(&self, server_id: &str) -> Result<(), MCPServerError> {
@@ -267,6 +271,21 @@ impl MCPManager {
             .map(|e| e.key().clone())
             .collect();
         for id in dead {
+            // Under the per-id connect lock: without it this could evict a
+            // client a concurrent PATCH-triggered reconnect had *just*
+            // installed, leaving the server down with its DB row saying
+            // "connected".
+            let lock = self.connect_lock_for(&id);
+            let _guard = lock.lock().await;
+            // Re-check now that we hold the lock — a reconnect may have
+            // replaced the dead client while we were waiting.
+            let still_dead = self
+                .servers
+                .get(&id)
+                .is_some_and(|c| !c.value().is_transport_alive());
+            if !still_dead {
+                continue;
+            }
             tracing::warn!("mcp server {id} transport closed; retiring its tools");
             let _ = mcp_servers::update_status(
                 &self.pool,
