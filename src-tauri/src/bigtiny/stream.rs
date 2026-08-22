@@ -16,6 +16,9 @@
 //! - `compaction`      -> `chat://compaction` (background context-compaction
 //!   notice; may arrive after this turn's own `chat://complete` since
 //!   compaction runs fire-and-forget from the daemon's turn-`finally` block)
+//! - `tool_finish` for the synthetic `__context_budget__` tool
+//!   -> `chat://context-budget` (the wrap-up valve withdrew this turn's tools
+//!   because the model was close to its context limit)
 
 use futures_util::StreamExt;
 use serde_json::{json, Value};
@@ -494,6 +497,22 @@ fn handle_event(
             // "__budget__" is BigTiny's internal step-budget bookkeeping, not
             // a real tool the user watched start — don't render it.
             if tool_name == "__budget__" {
+                return;
+            }
+            // The wrap-up valve's notice, which travels on the same synthetic
+            // channel but is emphatically NOT internal bookkeeping: the turn
+            // just ended early and the answer is shorter than it would have
+            // been, so the user is owed the reason. Routed to its own event
+            // (a dismissible banner, like the compaction notice) rather than
+            // rendered as a tool card for a tool nobody called.
+            if tool_name == "__context_budget__" {
+                let _ = app.emit(
+                    "chat://context-budget",
+                    json!({
+                        "session_id": session_id,
+                        "message": event.get("tool_result").and_then(|r| r.as_str()).unwrap_or(""),
+                    }),
+                );
                 return;
             }
             let (id, started_name) = current_tool

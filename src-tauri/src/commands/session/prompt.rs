@@ -1,7 +1,7 @@
 //! Turn submission: send/cancel a prompt and respond to tool-approval prompts.
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
 
 use crate::state::AppState;
 
@@ -30,6 +30,25 @@ pub async fn send_prompt(
     images: Option<Vec<ImageAttachment>>,
     attached_paths: Option<Vec<String>>,
 ) -> Result<(), String> {
+    // First turn of this chat: confirm its reasoning effort against the
+    // per-model memory before the prompt goes out, so the level the user is
+    // looking at is the level this turn actually runs at (and becomes this
+    // model's remembered default). `insert` returns true only for a session not
+    // yet confirmed this run, which is what keeps this to once per chat.
+    let first_turn = {
+        let state = app.state::<AppState>();
+        let mut confirmed = state.effort_confirmed_sessions.lock().unwrap();
+        confirmed.insert(session_id.clone())
+    };
+    if first_turn {
+        crate::bigtiny::effort::confirm_model_effort(&app, &session_id).await;
+        // Rides the same gate: the daemon's wrap-up valve reads the model's
+        // context window off the provider row, and a row without one leaves it
+        // budgeting against the daemon's 64k default instead of the model's
+        // real window. Same first-turn moment, same write-only-when-changed
+        // rule as the effort confirmation above.
+        crate::bigtiny::context_window::confirm_model_context_length(&app).await;
+    }
     crate::bigtiny::stream::send_prompt(app, session_id, text, images, attached_paths).await
 }
 

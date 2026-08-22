@@ -482,6 +482,13 @@ export const onChatError = (cb: (e: ChatErrorEvent) => void) =>
 export const onCompaction = (cb: (e: CompactionEvent) => void) =>
   listen<CompactionEvent>('chat://compaction', (e) => cb(e.payload));
 
+/** The wrap-up valve fired: BigTiny withdrew this turn's tools because the
+    model was close to its context limit, so the turn ended with whatever the
+    model could say rather than running into a provider-side context error.
+    Surfaced as a banner — see `chatStore`'s listener. */
+export const onContextBudget = (cb: (e: { session_id: string; message: string }) => void) =>
+  listen<{ session_id: string; message: string }>('chat://context-budget', (e) => cb(e.payload));
+
 export const onUserMessage = (cb: (e: TextDeltaEvent) => void) =>
   listen<TextDeltaEvent>('chat://user-message', (e) => cb(e.payload));
 export const onApprovalNeeded = (cb: (e: ApprovalNeededEvent) => void) =>

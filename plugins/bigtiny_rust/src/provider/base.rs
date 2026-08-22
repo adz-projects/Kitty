@@ -296,8 +296,19 @@ pub fn classify_provider_error(
         };
     }
 
+    // Anthropic says "input length and max_tokens exceed context limit" — it
+    // says *limit*, not *maximum*, so it matched none of the three original
+    // arms and fell through to the retryable `Other` below. The consequences
+    // were compounding: the attempt loop retried an identical, guaranteed-fatal
+    // request with backoff, failed over to a second provider and failed there
+    // too, and finally surfaced an untagged error, so `wire_type_tag` was
+    // `None` and none of Kitty's `context_exceeded` handling (the "New Session"
+    // affordance, the session-concluded state) ever engaged. It is also the
+    // exact wording the wrap-up valve provokes when its `max_tokens` clamp is
+    // wrong, which is why this is the arm that must be right.
     if lower.contains("context_length_exceeded")
         || lower.contains("context") && lower.contains("maximum")
+        || lower.contains("context") && lower.contains("limit")
         || lower.contains("too long")
     {
         return ProviderError::ContextExceeded {
@@ -364,6 +375,46 @@ mod tests {
         match err {
             ProviderError::ContextExceeded { .. } => {}
             other => panic!("Expected ContextExceeded, got {:?}", other),
+        }
+    }
+
+    /// The real Anthropic 400 body, which used to be classified as a
+    /// *retryable* `Other`: it says "context limit", and the only arms that
+    /// existed looked for "context_length_exceeded", "context"+"maximum", or
+    /// "too long". A guaranteed-fatal request was therefore retried with
+    /// backoff, failed over to a second provider, and surfaced untagged.
+    #[test]
+    fn anthropic_input_plus_max_tokens_wording_is_context_exceeded() {
+        for body in [
+            "input length and `max_tokens` exceed context limit: 199000 + 20480 > 200000",
+            "prompt is too long: 210000 tokens > 200000 maximum",
+            "This model's maximum context length is 128000 tokens",
+            "context_length_exceeded",
+        ] {
+            let err = classify_provider_error(400, body, None);
+            assert!(
+                matches!(err, ProviderError::ContextExceeded { .. }),
+                "{body:?} must classify as ContextExceeded, got {err:?}"
+            );
+            // Non-retryable is the half that stops the retry storm, and the
+            // wire tag is the half that lets Kitty offer "New Session".
+            let err = classify_provider_error(400, body, None);
+            assert!(!err.is_retryable(), "{body:?} must not be retried");
+            assert_eq!(err.wire_type_tag(), Some("context_exceeded"), "{body:?}");
+        }
+    }
+
+    /// Negative control for the arm above: "limit" and "context" have to
+    /// co-occur, so an unrelated limit error stays a plain retryable `Other`
+    /// rather than being swept up as a context overflow.
+    #[test]
+    fn an_unrelated_limit_error_is_not_context_exceeded() {
+        for body in ["rate limit exceeded", "request limit reached", "concurrency limit"] {
+            let err = classify_provider_error(429, body, None);
+            assert!(
+                !matches!(err, ProviderError::ContextExceeded { .. }),
+                "{body:?} must not be mistaken for a context overflow"
+            );
         }
     }
 

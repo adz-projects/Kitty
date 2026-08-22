@@ -17,6 +17,7 @@ use crate::agent::memory::{preflight_recall, PreflightCounters};
 use crate::agent::reasoning_models;
 use crate::agent::sandbox::{allowed_dirs_for_session, check_containment};
 use crate::agent::summarizer_chain::SummarizerChain;
+use crate::agent::tokens;
 use crate::agent::types::TimingResult;
 use crate::config::MemoryConfig;
 use crate::config::{FallbackConfig, PathwayConfig, SummarizerConfig};
@@ -265,18 +266,24 @@ fn build_assistant_message(content_chunks: &[String], turn_tool_calls: &[ToolCal
 /// a tool role message") when the per-message pairing is violated. Emit a
 /// single error result per pending call so the protocol invariant holds *and*
 /// the model can see what it attempted was cut off.
-fn build_aborted_tool_results(tool_calls: &[ToolCall]) -> Vec<Value> {
+fn build_aborted_tool_results(tool_calls: &[ToolCall], reason: &str) -> Vec<Value> {
     tool_calls
         .iter()
         .map(|tc| {
             json!({
                 "role": "tool",
-                "content": "[Tool call cancelled: the step budget was exhausted before this call could be executed.]",
+                "content": reason,
                 "tool_call_id": tc.id,
             })
         })
         .collect()
 }
+
+/// The original hardcoded reason, kept as a constant so the one existing call
+/// site reads the same as it did before `build_aborted_tool_results` was
+/// widened to take one.
+const ABORTED_FOR_STEP_BUDGET: &str =
+    "[Tool call cancelled: the step budget was exhausted before this call could be executed.]";
 
 /// FNV-1a 64-bit hash, used to deterministically derive a session's pinned
 /// llama-server `id_slot` (see `prompt_determinism.md`). Deliberately not
@@ -370,6 +377,105 @@ const BUDGET_EXTENSION_STEPS: i32 = 20;
 /// from making `step >= max_steps` true on the very first iteration (ending
 /// the turn before it starts) while still bounding runaway loops.
 const MAX_STEPS_CEILING: i64 = 10_000;
+
+/// Synthetic tool name for the wrap-up valve's notice. Deliberately NOT
+/// `__budget__`: Kitty suppresses that one (`bigtiny/stream.rs`) because the
+/// step-budget nudge is internal bookkeeping the user has no stake in. Running
+/// out of *context* is the opposite — it ends the turn early and the answer is
+/// visibly shorter than it would have been, so the user needs told why.
+const CONTEXT_BUDGET_TOOL: &str = "__context_budget__";
+
+/// Injected as a system message on the one request that carries no tools.
+///
+/// It has three jobs and each clause earns its place: forbid tool calls (some
+/// models emit one from habit even when none are offered, and any it emits are
+/// discarded), demand brevity (`max_tokens` is clamped to at most
+/// `WRAPUP_MAX_TOKENS_CEILING`, so an overrun is truncated mid-sentence), and
+/// state what remains — that last part lands in the transcript, where the
+/// summarizer folds it into the `current_task_state` memory slot and the user's
+/// next turn picks it up after compaction has reclaimed room.
+const WRAPUP_SYSTEM_MESSAGE: &str =
+    "[System: This conversation is close to the model's context limit, so no tools \
+     are available for this reply and this is the final step of the turn. Do not \
+     attempt any tool calls. Give the best answer you can from what you already \
+     have, briefly and directly. If anything still needs checking, say plainly \
+     what it is and that it will need a follow-up turn to verify.]";
+
+/// Output budget for the wrap-up reply. The floor keeps `max_tokens` a positive
+/// integer Anthropic will accept even when the window is already overshot; the
+/// ceiling is comfortably more than a closing paragraph while staying small
+/// enough that the reply itself can't push the request over the limit.
+const WRAPUP_MAX_TOKENS_FLOOR: i32 = 512;
+const WRAPUP_MAX_TOKENS_CEILING: i32 = 2048;
+
+/// Which of the two mutually exclusive budget interventions applies to an
+/// iteration.
+///
+/// Extracted so the precedence decision is assertable in a test rather than
+/// living implicitly in an `if/else if` that a later refactor could flatten
+/// back into two independent `if`s — which is exactly the shape that would
+/// reintroduce the incoherent state (offering `request_more_steps` on the same
+/// request that withdraws every tool).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnMode {
+    Normal,
+    StepNudge,
+    WrapUp,
+}
+
+/// Context exhaustion outranks the step nudge, always.
+///
+/// The two interventions contradict each other on the wire — the nudge's whole
+/// purpose is to *append* `request_more_steps` to the tool list while wrap-up
+/// *empties* it — and in prose, one saying "call request_more_steps to
+/// continue" while the other says stop now. And even reconciled, granting 20
+/// more *steps* is a non-answer when the exhausted resource is *context*: more
+/// steps against a full window is precisely what this valve exists to prevent.
+///
+/// Note there is deliberately no `step > 0` guard on the wrap-up arm. The
+/// condition is reachable at step 0, because `ContextBuilder` budgets against
+/// the daemon-wide `max_context_tokens` while this checks the provider's own
+/// window — so a provider with a smaller real window starts the turn already
+/// over. Suppressing the valve there would convert a graceful degradation into
+/// the hard provider 400 it exists to avoid.
+fn decide_turn_mode(step: i64, wrapup_issued: bool, wrapup_due: bool) -> TurnMode {
+    if wrapup_due && !wrapup_issued {
+        TurnMode::WrapUp
+    } else if step > 0 && step % 20 == 0 {
+        TurnMode::StepNudge
+    } else {
+        TurnMode::Normal
+    }
+}
+
+/// Pure: how a wrap-up turn's output is persisted.
+///
+/// Tool calls are **stripped**, not paired with synthetic results. A model can
+/// still emit one despite being offered none (habit, or a proxy injecting its
+/// own list), and `save_messages` would write those `tool_calls` to the DB —
+/// where, with no `tool` role following them, they are a hard 400 on the *next*
+/// turn's first request. The "the model would have no memory of having tried"
+/// argument that justifies keeping them in the step-budget branch does not
+/// apply here: that branch `continue`s and the model gets another attempt in
+/// the same turn, this one `break`s. Stripping is also the smaller write, which
+/// matters when the whole reason we are here is that the history is too big.
+///
+/// The empty-content guard is not theoretical: strip the calls from a reply
+/// that was *only* a tool call and the result is `{"content": ""}` with no
+/// `tool_calls`, which several backends reject outright.
+fn wrapup_persist_shape(content_chunks: &[String], turn_tool_calls: &[ToolCall]) -> Value {
+    let text = content_chunks.join("");
+    let content = if text.trim().is_empty() {
+        if turn_tool_calls.is_empty() {
+            "[No reply: the turn ended at the context limit.]".to_string()
+        } else {
+            "[The turn ended at the context limit before this step could run.]".to_string()
+        }
+    } else {
+        text
+    };
+    json!({ "role": "assistant", "content": content })
+}
 
 /// Best-effort budget for embedding the current user message at turn-start
 /// recall. Bounds the latency tax of query grounding — a timeout degrades to
@@ -1035,6 +1141,17 @@ impl AgentLoop {
             .and_then(|v| v.as_str())
             .and_then(crate::provider::base::Effort::from_wire);
         let mut step: i64 = 0;
+        // Wrap-up valve state, alongside the other survives-iterations values
+        // below. `wrapup_issued` is a belt against re-injecting on a later
+        // iteration; the unconditional `break` in the completion block is the
+        // braces. Both, deliberately — see that block's comment.
+        let mut wrapup_issued = false;
+        // (messages.len(), provider-reported input_tokens) as of the last
+        // completed response. The provider's own count already includes the
+        // tool schemas and system framing that a local count of `messages`
+        // cannot see, so this is the accurate base and everything appended
+        // since is the delta (`tokens::projected_input_tokens`).
+        let mut last_usage: Option<(usize, i32)> = None;
         // The provider/model the last completed model call actually used
         // (fallback can switch mid-turn) — remembered for the ONCE-per-turn
         // post-turn compaction pass below.
@@ -1142,31 +1259,111 @@ impl AgentLoop {
 
             // Progressive budget check
             let mut in_budget_check = false;
+            let mut in_wrapup = false;
             let mut tools_for_turn = tools_to_openai_format(active_tools);
 
-            // Fire the budget nudge at 20/40/60 *executed steps*. The old
-            // check counted messages carrying `tool_calls`/`tool_call_id`,
-            // which jumps by the number of tool calls per turn (usually > 1,
-            // often several) — so it skipped over multiples of 20 entirely
-            // and the nudge silently never fired for sessions doing any
-            // parallel tool execution. `step` is incremented exactly once per
-            // completed tool-loop iteration, so `step % 20 == 0` lands on the
-            // 20th, 40th, 60th... iteration reliably. The `step > 0` guard
-            // keeps the very first iteration (step == 0) from tripping it.
-            if step > 0 && step % 20 == 0 {
-                messages.push(json!({
-                    "role": "system",
-                    "content": BUDGET_SYSTEM_MESSAGE
-                }));
-                in_budget_check = true;
-                tools_for_turn.push(json!({
-                    "type": "function",
-                    "function": {
-                        "name": BUDGET_TOOL,
-                        "description": "Request additional steps to continue the current task",
-                        "parameters": {"type": "object", "properties": {}}
+            // How much room is left before the provider's own context limit.
+            //
+            // This is the in-loop check that used to not exist: context was
+            // assembled once, before the loop, and then every iteration
+            // appended tool results and re-sent the whole grown history with
+            // nothing watching. A turn could start comfortably inside the
+            // window and walk to 100% across 50 steps. Full compaction per
+            // iteration was rightly removed for cost (see the post-turn pass
+            // below); this is arithmetic on a running count, not a compaction
+            // pass, so it costs effectively nothing.
+            //
+            // Resolved against the *pre-failover* provider, matching
+            // `supports_tools` above. If the retry block switches provider
+            // mid-attempt the window may differ; that inconsistency predates
+            // this code and is not worth diverging from the neighbouring
+            // pattern to fix here.
+            let context_length = self
+                .router
+                .context_length(&provider_id)
+                .unwrap_or(self.context.config().max_context_tokens);
+            let token_cfg = self.context.config();
+            let wrapup_reserve = tokens::context_reserve_tokens(
+                context_length,
+                token_cfg.wrapup_reserve_ratio,
+                token_cfg.wrapup_reserve_cap,
+            );
+            let projected_input = tokens::projected_input_tokens(last_usage, &messages);
+            let wrapup_due = tokens::wrapup_due(projected_input, context_length, wrapup_reserve);
+
+            // Exactly one intervention per iteration, chosen here rather than
+            // by two independent `if`s — see `decide_turn_mode`.
+            match decide_turn_mode(step, wrapup_issued, wrapup_due) {
+                TurnMode::WrapUp => {
+                    if step == 0 {
+                        // The fingerprint of a provider whose `context_length`
+                        // is unset or wrong: the context builder assembled
+                        // against the daemon-wide budget and blew the real
+                        // window before a single tool ran. Without this line it
+                        // looks like a mysteriously terse assistant.
+                        tracing::warn!(
+                            session_id,
+                            context_length,
+                            projected_input,
+                            wrapup_reserve,
+                            "wrap-up valve fired before any tool ran — check this \
+                             provider's context_length"
+                        );
                     }
-                }));
+                    tracing::info!(
+                        session_id,
+                        step,
+                        context_length,
+                        projected_input,
+                        wrapup_reserve,
+                        "context reserve reached — withdrawing tools for a wrap-up reply"
+                    );
+                    messages.push(json!({
+                        "role": "system",
+                        "content": WRAPUP_SYSTEM_MESSAGE
+                    }));
+                    in_wrapup = true;
+                    wrapup_issued = true;
+                    tools_for_turn.clear();
+                    // Surfaced, unlike `__budget__` — the turn is about to end
+                    // early and the user is owed the reason.
+                    let _ = event_tx.send(SSEEvent {
+                        event_type: SSEEventType::ToolFinish,
+                        tool_name: Some(CONTEXT_BUDGET_TOOL.into()),
+                        tool_result: Some(format!(
+                            "Close to this model's context limit ({projected_input} of \
+                             {context_length} tokens used) — finishing this turn now. \
+                             Send another message to continue; the conversation will be \
+                             compacted first."
+                        )),
+                        session_id: Some(session_id.to_string()),
+                        ..Default::default()
+                    });
+                }
+                // Fire the budget nudge at 20/40/60 *executed steps*. The old
+                // check counted messages carrying `tool_calls`/`tool_call_id`,
+                // which jumps by the number of tool calls per turn (usually > 1,
+                // often several) — so it skipped over multiples of 20 entirely
+                // and the nudge silently never fired for sessions doing any
+                // parallel tool execution. `step` is incremented exactly once per
+                // completed tool-loop iteration, so `step % 20 == 0` lands on the
+                // 20th, 40th, 60th... iteration reliably.
+                TurnMode::StepNudge => {
+                    messages.push(json!({
+                        "role": "system",
+                        "content": BUDGET_SYSTEM_MESSAGE
+                    }));
+                    in_budget_check = true;
+                    tools_for_turn.push(json!({
+                        "type": "function",
+                        "function": {
+                            "name": BUDGET_TOOL,
+                            "description": "Request additional steps to continue the current task",
+                            "parameters": {"type": "object", "properties": {}}
+                        }
+                    }));
+                }
+                TurnMode::Normal => {}
             }
 
             let mut provider_id = provider_id;
@@ -1217,6 +1414,31 @@ impl AgentLoop {
                 // because this runs once per tool-loop iteration and `Effort` is
                 // no longer `Copy` (it can carry a model-specific level string).
                 sampling.effort = effort.clone();
+                if in_wrapup {
+                    // Counter-intuitive and load-bearing: withdrawing the tools
+                    // switches Anthropic extended thinking *on*.
+                    // `anthropic_thinking` short-circuits with
+                    // `if has_tools { return (max, None) }`, and that guard —
+                    // derived from the very tool list emptied above — is the
+                    // only thing suppressing thinking on a normal agent step.
+                    // At Medium effort with no explicit cap it would otherwise
+                    // return `((16384 + 4096).min(65536), Some(16384))`, i.e.
+                    // max_tokens jumping 4096 -> 20480 on the one request
+                    // issued *because* input is already near the ceiling.
+                    //
+                    // Clamping max_tokens alone does not fix it: with a 2048
+                    // cap the budget arithmetic yields `16384.min(2048 - 1024)`
+                    // = 1024, which clears the >= 1024 test, so thinking stays
+                    // on and eats half the wrap-up budget on reasoning nobody
+                    // will read. Zero the effort as well.
+                    sampling.effort = None;
+                    sampling.max_tokens = Some(tokens::wrapup_max_tokens(
+                        context_length,
+                        projected_input,
+                        WRAPUP_MAX_TOKENS_FLOOR,
+                        WRAPUP_MAX_TOKENS_CEILING,
+                    ));
+                }
                 // The ephemeral thought-seed prefill rides the FIRST provider
                 // request only: it primes the model's reply to the new user
                 // message; later iterations continue from real tool results.
@@ -1243,7 +1465,14 @@ impl AgentLoop {
                     .chat_completion(
                         &provider_id,
                         outgoing,
-                        Some(tools_for_turn.clone()),
+                        // `None`, not `Some(vec![])`: `openai_compat` writes the
+                        // vec through unconditionally, and a bare `"tools": []`
+                        // is a 400 on several OpenAI-compatible endpoints.
+                        if in_wrapup {
+                            None
+                        } else {
+                            Some(tools_for_turn.clone())
+                        },
                         sampling,
                         Some(provider_model.clone()),
                         id_slot,
@@ -1359,6 +1588,15 @@ impl AgentLoop {
                     .get("input_tokens")
                     .and_then(|v| v.as_i64())
                     .unwrap_or(0);
+                // Mark taken here, before the assistant message is pushed
+                // below, so it cleanly separates "what the provider counted"
+                // from "what we appended after" — that split is what makes the
+                // next iteration's reserve check a delta rather than a full
+                // re-encode of the transcript.
+                last_usage = Some((
+                    messages.len(),
+                    i32::try_from(input_tokens).unwrap_or(i32::MAX),
+                ));
                 let output_tokens = usage_val
                     .get("output_tokens")
                     .and_then(|v| v.as_i64())
@@ -1452,7 +1690,10 @@ impl AgentLoop {
                     // dangling tool_calls (HTTP 400 on OpenAI-compatible
                     // endpoints) — append a synthetic error result per call so
                     // the pairing stays valid (`build_aborted_tool_results`).
-                    messages.extend(build_aborted_tool_results(&turn_tool_calls));
+                    messages.extend(build_aborted_tool_results(
+                        &turn_tool_calls,
+                        ABORTED_FOR_STEP_BUDGET,
+                    ));
                     messages.push(json!({"role": "system", "content": err}));
                     step += 1;
                     if let Err(e) = self.context.save_messages(session_id, &mut messages).await {
@@ -1491,6 +1732,42 @@ impl AgentLoop {
                     step += 1;
                     continue;
                 }
+            }
+
+            // Wrap-up completion. `in_wrapup` and `in_budget_check` are
+            // mutually exclusive by `decide_turn_mode`, so the two
+            // `messages.pop()` calls can never both run in one iteration —
+            // that invariant is what makes "exactly one system message is
+            // injected per iteration and it is always popped" checkable.
+            if in_wrapup {
+                // Popped for the same reason as the budget branch's pop. Note
+                // this is NOT about persistence: `save_messages` skips
+                // `role == "system"` entirely. It is about not leaving a stale
+                // message to drift every later delta count, and about keeping
+                // that invariant one line long.
+                messages.pop();
+                messages.push(wrapup_persist_shape(&content_chunks, &turn_tool_calls));
+                if let Err(e) = self.context.save_messages(session_id, &mut messages).await {
+                    tracing::warn!("failed to save messages for session {session_id}: {e}");
+                }
+                // Unconditional — `finish_reason` is deliberately ignored.
+                //
+                // A clamped `max_tokens` makes `finish_reason: "length"` the
+                // *likely* outcome for a chatty model, and the normal path
+                // below only breaks on `stop`/`end_turn`. Falling through would
+                // `step += 1; continue` with `projected_input` now larger,
+                // whereupon the latch stops the re-injection but the full tool
+                // set is offered again with less room than when we intervened —
+                // the feature would cost a round trip and achieve nothing, then
+                // burn to `max_steps`.
+                //
+                // Ignoring the finish reason is sound because another iteration
+                // cannot acquire room, only consume it. Breaking here falls
+                // through to the post-turn compaction spawn below, which
+                // reclaims room for the user's *next* turn. The valve is a
+                // graceful bridge to compaction, not a retry loop — which is
+                // exactly what the system message promises the model.
+                break;
             }
 
             // Add assistant message (reached for a non-budget-check turn, or
@@ -2472,7 +2749,7 @@ mod content_ceiling_tests {
 
 #[cfg(test)]
 mod budget_abort_tests {
-    use super::{build_aborted_tool_results, ToolCall};
+    use super::{build_aborted_tool_results, ToolCall, ABORTED_FOR_STEP_BUDGET};
     use serde_json::json;
 
     fn pending_call(id: &str, name: &str) -> ToolCall {
@@ -2494,7 +2771,7 @@ mod budget_abort_tests {
             pending_call("call_1", "read_file"),
             pending_call("call_2", "shell_run"),
         ];
-        let results = build_aborted_tool_results(&calls);
+        let results = build_aborted_tool_results(&calls, ABORTED_FOR_STEP_BUDGET);
 
         assert_eq!(results.len(), 2);
         for (call, result) in calls.iter().zip(&results) {
@@ -2507,9 +2784,114 @@ mod budget_abort_tests {
         }
     }
 
+    /// The reason is a parameter now — the wrap-up valve aborts for a
+    /// different cause than the step budget, and telling the model the wrong
+    /// one is worse than saying nothing.
+    #[test]
+    fn the_reason_is_carried_through_verbatim() {
+        let calls = vec![pending_call("call_1", "read_file")];
+        let results = build_aborted_tool_results(&calls, "[custom reason]");
+        assert_eq!(results[0]["content"], "[custom reason]");
+    }
+
     #[test]
     fn no_tool_calls_means_no_tool_results() {
-        assert!(build_aborted_tool_results(&[]).is_empty());
+        assert!(build_aborted_tool_results(&[], ABORTED_FOR_STEP_BUDGET).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod wrapup_valve_tests {
+    use super::{decide_turn_mode, wrapup_persist_shape, ToolCall, TurnMode};
+    use serde_json::json;
+
+    fn call(id: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            r#type: "function".into(),
+            function: json!({"name": "read_file", "arguments": {}}),
+        }
+    }
+
+    #[test]
+    fn an_ordinary_step_gets_no_intervention() {
+        assert_eq!(decide_turn_mode(0, false, false), TurnMode::Normal);
+        assert_eq!(decide_turn_mode(7, false, false), TurnMode::Normal);
+        // Step 0 never trips the step nudge, whatever the modulus says.
+        assert_eq!(decide_turn_mode(0, true, false), TurnMode::Normal);
+    }
+
+    #[test]
+    fn the_step_nudge_still_fires_on_multiples_of_twenty() {
+        assert_eq!(decide_turn_mode(20, false, false), TurnMode::StepNudge);
+        assert_eq!(decide_turn_mode(40, false, false), TurnMode::StepNudge);
+    }
+
+    /// The collision case, and the reason this is a function rather than an
+    /// `if/else if`: offering `request_more_steps` on the same request that
+    /// withdraws every tool is incoherent, and granting 20 more *steps* is a
+    /// non-answer when the exhausted resource is *context*.
+    #[test]
+    fn context_exhaustion_outranks_the_step_nudge() {
+        assert_eq!(decide_turn_mode(20, false, true), TurnMode::WrapUp);
+    }
+
+    /// No `step > 0` guard: a provider whose real window is smaller than the
+    /// daemon-wide budget can be over the reserve before any tool has run, and
+    /// suppressing the valve there would hand the provider the request that
+    /// 400s instead.
+    #[test]
+    fn the_valve_can_fire_before_any_tool_has_run() {
+        assert_eq!(decide_turn_mode(0, false, true), TurnMode::WrapUp);
+    }
+
+    /// Once issued, it never re-issues — the latch behind the unconditional
+    /// `break`. (Dead in practice because the break ends the turn; it pins the
+    /// latch's meaning against a later refactor that removes the break.)
+    #[test]
+    fn the_latch_prevents_a_second_wrap_up() {
+        assert_eq!(decide_turn_mode(7, true, true), TurnMode::Normal);
+        assert_eq!(decide_turn_mode(20, true, true), TurnMode::StepNudge);
+    }
+
+    #[test]
+    fn prose_is_persisted_as_written() {
+        let msg = wrapup_persist_shape(&["Here is ".into(), "the answer.".into()], &[]);
+        assert_eq!(msg["role"], "assistant");
+        assert_eq!(msg["content"], "Here is the answer.");
+    }
+
+    /// A model can emit a tool call despite being offered none. Persisting it
+    /// would leave `tool_calls` with no `tool` role following, which is a hard
+    /// 400 on the *next* turn's first request — and this branch breaks, so
+    /// there is no later iteration that could ever supply the results.
+    #[test]
+    fn tool_calls_are_stripped_rather_than_persisted_dangling() {
+        let msg = wrapup_persist_shape(&["Wrapping up.".into()], &[call("c1"), call("c2")]);
+        assert!(
+            msg.get("tool_calls").is_none(),
+            "a wrap-up reply must never persist dangling tool_calls: {msg}"
+        );
+        assert_eq!(msg["content"], "Wrapping up.");
+    }
+
+    /// The case stripping makes reachable: a reply that was *only* a tool call
+    /// becomes `{"content": ""}` with no `tool_calls`, which several backends
+    /// reject outright on the next request.
+    #[test]
+    fn an_empty_reply_still_carries_content() {
+        for chunks in [vec![], vec![String::new()], vec!["   ".to_string()]] {
+            let msg = wrapup_persist_shape(&chunks, &[call("c1")]);
+            assert!(
+                !msg["content"].as_str().unwrap().trim().is_empty(),
+                "empty content is rejected by several backends: {msg}"
+            );
+            assert!(msg.get("tool_calls").is_none());
+        }
+        // ...and with no tool calls either, which is the "model said nothing
+        // at all" case.
+        let msg = wrapup_persist_shape(&[], &[]);
+        assert!(!msg["content"].as_str().unwrap().trim().is_empty());
     }
 }
 

@@ -1093,6 +1093,50 @@ mod thinking_tests {
         );
     }
 
+    /// Pins the trap the wrap-up valve has to work around, as *intended*
+    /// behaviour of this function rather than an accident.
+    ///
+    /// `has_tools` is the only thing suppressing thinking on a normal agent
+    /// step. The valve's whole mechanism is emptying the tool list — which
+    /// flips this guard off and, at Medium effort with no explicit cap, raises
+    /// max_tokens from 4096 to 20480 on the one request issued precisely
+    /// because the input is already near the context ceiling.
+    #[test]
+    fn withdrawing_tools_switches_thinking_on_and_inflates_max_tokens() {
+        // With tools: thinking suppressed, max_tokens at the 4096 default.
+        assert_eq!(
+            anthropic_thinking(Some(&Effort::Medium), None, true),
+            (4096, None)
+        );
+        // Tools withdrawn, everything else identical: 5x the output budget.
+        assert_eq!(
+            anthropic_thinking(Some(&Effort::Medium), None, false),
+            (20480, Some(16384))
+        );
+    }
+
+    /// ...and the shape the valve actually sends, which suppresses both halves.
+    ///
+    /// Clamping max_tokens alone is NOT enough: at a 2048 cap the arithmetic
+    /// yields `16384.min(2048 - 1024)` = 1024, which clears the `>= 1024` test,
+    /// so thinking stays on and spends half the clamped budget on reasoning
+    /// nobody will read. Zeroing the effort is what makes the clamp mean what
+    /// it says. If someone later drops `sampling.effort = None` from the
+    /// wrap-up branch in `loop_.rs`, this is the test that fails.
+    #[test]
+    fn the_wrapup_clamp_suppresses_thinking_as_well_as_the_budget() {
+        // What the valve sends: effort zeroed, explicit cap set.
+        assert_eq!(anthropic_thinking(None, Some(2048), false), (2048, None));
+        assert_eq!(anthropic_thinking(None, Some(512), false), (512, None));
+
+        // What it would send if only the cap were clamped — thinking survives
+        // and takes 1024 of the 2048.
+        assert_eq!(
+            anthropic_thinking(Some(&Effort::Medium), Some(2048), false),
+            (2048, Some(1024))
+        );
+    }
+
     #[test]
     fn a_cap_too_small_for_a_1024_budget_drops_thinking() {
         // cap 1500 → budget would be min(base, 476) = 476 < 1024 → no thinking,

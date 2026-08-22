@@ -71,6 +71,18 @@ pub fn apply_env_overrides(config: &mut BigTinyConfig) {
     {
         config.token_management.max_live_tail_tokens = n;
     }
+    if let Some(n) = std::env::var("BIGTINY_TOKEN_MANAGEMENT__WRAPUP_RESERVE_RATIO")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        config.token_management.wrapup_reserve_ratio = n;
+    }
+    if let Some(n) = std::env::var("BIGTINY_TOKEN_MANAGEMENT__WRAPUP_RESERVE_CAP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        config.token_management.wrapup_reserve_cap = n;
+    }
     if let Some(n) = std::env::var("BIGTINY_TOKEN_MANAGEMENT__MESSAGE_MASK_HEAD_LINES")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -166,6 +178,12 @@ mod tests {
         // bool parse every neighbor doesn't use. Exercised here on the LiteRT
         // enable flag (the retired `BIGTINY_LOCAL__TOOL_CALLS` used to cover it).
         std::env::set_var("BIGTINY_LITERT__ENABLED", "1");
+        // The wrap-up reserve has the same bypass exposure and a worse
+        // failure: a ratio above 1.0 reserves more than the whole window, so
+        // the valve is due at step 0 of every turn and the agent can never
+        // call a tool again.
+        std::env::set_var("BIGTINY_TOKEN_MANAGEMENT__WRAPUP_RESERVE_RATIO", "5.0");
+        std::env::set_var("BIGTINY_TOKEN_MANAGEMENT__WRAPUP_RESERVE_CAP", "-100");
 
         let mut config = BigTinyConfig::default();
         apply_env_overrides(&mut config);
@@ -173,6 +191,8 @@ mod tests {
         assert_eq!(config.token_management.message_mask_head_lines, 0);
         assert_eq!(config.token_management.message_mask_tail_lines, 0);
         assert!(config.litert.enabled);
+        assert_eq!(config.token_management.wrapup_reserve_ratio, 1.0);
+        assert_eq!(config.token_management.wrapup_reserve_cap, 0);
 
         std::env::set_var("BIGTINY_LITERT__ENABLED", "FALSE");
         let mut config = BigTinyConfig::default();
@@ -181,6 +201,8 @@ mod tests {
 
         std::env::remove_var("BIGTINY_TOKEN_MANAGEMENT__MESSAGE_MASK_HEAD_LINES");
         std::env::remove_var("BIGTINY_TOKEN_MANAGEMENT__MESSAGE_MASK_TAIL_LINES");
+        std::env::remove_var("BIGTINY_TOKEN_MANAGEMENT__WRAPUP_RESERVE_RATIO");
+        std::env::remove_var("BIGTINY_TOKEN_MANAGEMENT__WRAPUP_RESERVE_CAP");
         std::env::remove_var("BIGTINY_LITERT__ENABLED");
     }
 }

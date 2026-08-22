@@ -90,18 +90,33 @@ pub fn effort_options(dialect: EffortDialect) -> Vec<EffortOption> {
     }
 }
 
-/// The default effort when a session has never chosen one. OpenAI's o-series
-/// reasons no matter what, so "Medium" is the honest resting state; the others
-/// default to "Off" (opt-in).
-fn default_value(dialect: EffortDialect) -> &'static str {
-    match dialect {
-        EffortDialect::OpenAiReasoningEffort => "medium",
-        EffortDialect::OpenRouterReasoning | EffortDialect::AnthropicThinking => "off",
-        // Matches the model's own resting behavior — Qwen3 and friends think by
-        // default — so the displayed state agrees with what an untouched
-        // session actually does (no `thinking_effort` sent → server default).
-        EffortDialect::LlamaServerThinking => "high",
-    }
+/// The default effort when neither the session nor its model has a remembered
+/// choice: **Medium**, uniformly, for every dialect that has a control at all.
+///
+/// It used to vary per dialect — "off" for OpenRouter/Anthropic (reasoning as
+/// opt-in) and "high" for self-hosted (matching the model's own resting
+/// behaviour). Both are defensible in isolation and neither survives contact
+/// with switching between them: the same new chat reasoned hard, not at all, or
+/// somewhere in between depending purely on which provider happened to be
+/// active. Medium is the one setting that means the same thing everywhere, and
+/// `confirm_model_effort` now pushes it to the daemon on the first turn, so the
+/// displayed default is also what the session actually runs at rather than
+/// whatever the server would have picked unasked.
+fn default_value(_dialect: EffortDialect) -> &'static str {
+    "medium"
+}
+
+/// The preferred default among a *discovered* level set (the self-hosted
+/// dialect, whose levels come from the model's own chat template). Medium when
+/// the model offers it; otherwise the template's own default, which is its
+/// first — highest — level.
+fn preferred_default(options: &[EffortOption]) -> String {
+    options
+        .iter()
+        .find(|o| o.value == "medium")
+        .or_else(|| options.first())
+        .map(|o| o.value.clone())
+        .unwrap_or_default()
 }
 
 /// The `ThinkingEffort` payload for a session, derived from the **active**
@@ -135,18 +150,27 @@ pub fn thinking_effort_for(app: &AppHandle, session_id: &str) -> Option<Thinking
                     value: l.clone(),
                 })
                 .collect();
-            // The template's own default is its first (highest) level
-            // (`reasoning_effort|default('xhigh')`), so lead with that.
-            let default = opts.first().map(|o| o.value.clone()).unwrap_or_default();
+            let default = preferred_default(&opts);
             (opts, default)
         }
         _ => (effort_options(dialect), default_value(dialect).to_string()),
     };
 
+    // Resolution order: this session's own choice, then whatever was last
+    // confirmed for this exact provider+model, then the dialect default. Each
+    // candidate still has to be one of the offered options — a value carried
+    // over from a different provider (or from a template whose levels have
+    // since changed) must not stick when it isn't on the menu here.
+    let offered = |v: &String| options.iter().any(|o| &o.value == v);
     let current_value = cfg
         .session_efforts
         .get(session_id)
-        .filter(|v| options.iter().any(|o| &o.value == *v))
+        .filter(|v| offered(v))
+        .or_else(|| {
+            cfg.model_efforts
+                .get(&effort_cache_key(active_id, model))
+                .filter(|v| offered(v))
+        })
         .cloned()
         .unwrap_or(default);
     Some(ThinkingEffort {
@@ -326,6 +350,78 @@ pub async fn ensure_effort_levels_cached(app: &AppHandle) {
     state.effort_levels.lock().unwrap().insert(key, levels);
 }
 
+/// Materialize a chat's effective reasoning effort on its **first turn**:
+/// persist it as the session's own choice, remember it as this model's default
+/// for next time, and push it to the daemon so the wire matches the dropdown.
+///
+/// Until this runs, a session that has never touched the dropdown shows a
+/// default it never actually sent — `set_thinking_effort` is the only thing
+/// that PATCHes the daemon, so an untouched session ran at whatever the
+/// provider's own resting behaviour was while the UI claimed otherwise. Doing
+/// it at first send (rather than at session creation) is what lets the user
+/// pick a level in the header before sending and have *that* be the value
+/// confirmed and remembered.
+///
+/// Every write is conditional on an actual change, so a chat whose effort
+/// already matches its model's remembered value touches neither the config file
+/// nor the daemon. Failures are logged, never surfaced: this is bookkeeping
+/// around the turn, and the turn must still send if it fails.
+pub async fn confirm_model_effort(app: &AppHandle, session_id: &str) {
+    // Self-hosted levels have to be discovered before the resolved value means
+    // anything — without this the first turn after a restart would confirm
+    // against an empty option set.
+    ensure_effort_levels_cached(app).await;
+    let Some(effort) = thinking_effort_for(app, session_id) else {
+        return; // no effort control on this provider — nothing to confirm
+    };
+    let value = effort.current_value;
+
+    let push_to_daemon = {
+        let state = app.state::<crate::state::AppState>();
+        let mut cfg = state.config.lock().unwrap();
+        let key = match cfg.active_provider_id.as_deref().and_then(|id| {
+            let model = cfg
+                .providers
+                .iter()
+                .find(|p| p.id == id)?
+                .models
+                .first()
+                .map(String::as_str)
+                .unwrap_or("");
+            Some(effort_cache_key(id, model))
+        }) {
+            Some(k) => k,
+            None => return,
+        };
+
+        let session_changed = cfg.session_efforts.get(session_id) != Some(&value);
+        let model_changed = cfg.model_efforts.get(&key) != Some(&value);
+        if session_changed {
+            cfg.session_efforts
+                .insert(session_id.to_string(), value.clone());
+        }
+        if model_changed {
+            cfg.model_efforts.insert(key, value.clone());
+        }
+        if session_changed || model_changed {
+            if let Err(e) = crate::config::save(&cfg) {
+                tracing::warn!("failed to persist confirmed thinking effort: {e}");
+            }
+        }
+        // Only a session not already carrying this value needs the daemon told;
+        // one that does was PATCHed when it was set.
+        session_changed
+    };
+
+    if push_to_daemon {
+        if let Err(e) =
+            crate::bigtiny::sessions::update_thinking_effort(app, session_id, &value).await
+        {
+            tracing::warn!("failed to push confirmed thinking effort to the daemon: {e}");
+        }
+    }
+}
+
 /// `claude-*` minus the families that predate extended thinking. A denylist so
 /// a newly-shipped Claude id is assumed capable rather than needing this file
 /// edited before the dropdown appears.
@@ -468,6 +564,48 @@ mod tests {
     }
 
     #[test]
+    fn every_dialect_defaults_to_medium() {
+        // The owner ask: a new chat starts at Medium wherever there is a
+        // control at all, instead of "off" on the hosted dialects and "high"
+        // on a self-hosted one.
+        for d in [
+            EffortDialect::OpenAiReasoningEffort,
+            EffortDialect::OpenRouterReasoning,
+            EffortDialect::AnthropicThinking,
+            EffortDialect::LlamaServerThinking,
+        ] {
+            assert_eq!(default_value(d), "medium", "{d:?}");
+            // ...and Medium is always actually on the menu, so the default is
+            // never a value the dropdown would reject.
+            assert!(
+                effort_options(d).iter().any(|o| o.value == "medium"),
+                "{d:?} offers no medium option"
+            );
+        }
+    }
+
+    #[test]
+    fn discovered_levels_prefer_medium_and_fall_back_to_the_templates_own() {
+        let opt = |v: &str| EffortOption {
+            name: pretty_level(v),
+            value: v.to_string(),
+        };
+        // The real Qwen3 guard order — medium is offered, so medium wins over
+        // the template's own (first, highest) default.
+        let graded = [opt("xhigh"), opt("medium"), opt("low")];
+        assert_eq!(preferred_default(&graded), "medium");
+
+        // A model whose template names no medium keeps the old behaviour:
+        // its first, highest level.
+        let no_medium = [opt("xhigh"), opt("low")];
+        assert_eq!(preferred_default(&no_medium), "xhigh");
+
+        // Degenerate: no levels at all (the caller hides the dropdown before
+        // this can matter, but it must not panic).
+        assert_eq!(preferred_default(&[]), "");
+    }
+
+    #[test]
     fn pretty_level_names_are_readable() {
         assert_eq!(pretty_level("xhigh"), "Extra high");
         assert_eq!(pretty_level("medium"), "Medium");
@@ -498,7 +636,5 @@ mod tests {
         assert_eq!(opts[1].value, "low");
         assert_eq!(opts[2].value, "medium");
         assert_eq!(opts[3].value, "high");
-        // Default thinks (the model's resting behavior) at the top level.
-        assert_eq!(default_value(EffortDialect::LlamaServerThinking), "high");
     }
 }

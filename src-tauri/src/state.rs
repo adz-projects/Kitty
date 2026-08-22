@@ -179,6 +179,13 @@ pub struct AppState {
     /// dropdown read. An empty vec means "probed, none found" → hide the
     /// dropdown; a missing key means "not probed yet".
     pub effort_levels: Mutex<HashMap<String, Vec<String>>>,
+    /// Sessions whose reasoning effort has already been confirmed against the
+    /// per-model memory this run (see `bigtiny::effort::confirm_model_effort`).
+    /// The confirmation is a first-turn job, so this is what makes it happen
+    /// once per chat rather than on every send. Deliberately transient: a
+    /// session resumed in a later run confirms again on its next turn, which
+    /// re-pushes its effort to a daemon that has since restarted.
+    pub effort_confirmed_sessions: Mutex<HashSet<String>>,
     /// Cached OpenRouter model catalog (provider-add redesign) — the
     /// universal cost/capability/age ranking source the model picker uses
     /// for every provider type, not just OpenRouter. Loaded from disk
@@ -216,6 +223,7 @@ impl AppState {
             bigtiny_compaction_watermarks: Mutex::new(HashMap::new()),
             booted_windows: Mutex::new(HashSet::new()),
             effort_levels: Mutex::new(HashMap::new()),
+            effort_confirmed_sessions: Mutex::new(HashSet::new()),
             openrouter_catalog: Mutex::new(None),
         }
     }

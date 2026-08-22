@@ -10,6 +10,7 @@
 //! objects) ending at `is_last: true`.
 
 pub mod client;
+pub mod context_window;
 pub mod effort;
 pub mod mcp;
 pub mod pathway;

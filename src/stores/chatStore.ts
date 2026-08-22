@@ -10,6 +10,7 @@ import {
   onChatError,
   onClipboardAttach,
   onCompaction,
+  onContextBudget,
   onComplete,
   onMessageDelta,
   onProviderActivated,
@@ -2509,6 +2510,17 @@ export const useChatStore = create<ChatState>((set, get) => {
         // than a clean completion — still worth asking for an answer, since
         // the model's own prior reasoning is still available as context.
         if (forcedAnswerSession === e.session_id) void get().send(FORCED_ANSWER_PROMPT);
+      });
+      // Reuses `compactionNotice` rather than adding a second banner: this is
+      // a context-management notice like the compaction one, and it is
+      // immediately followed by a compaction pass. One banner, one dismiss,
+      // and it is already cleared everywhere a session changes.
+      void onContextBudget((e) => {
+        if (!forActive(e.session_id)) return;
+        set({
+          compactionNotice:
+            e.message || 'That turn ended early — the model was close to its context limit.',
+        });
       });
       void onCompaction((e) => {
         if (!forActive(e.session_id)) return;

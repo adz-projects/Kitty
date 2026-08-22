@@ -234,6 +234,19 @@ pub struct TokenManagementConfig {
     pub min_compaction_tokens: i32,
     #[serde(default = "default_max_live_tail_tokens")]
     pub max_live_tail_tokens: i32,
+    /// Wrap-up valve: the fraction of the model's context window held in
+    /// reserve, and the absolute ceiling on that reserve. The effective
+    /// reserve is `min(context_length * ratio, cap)` — see
+    /// `agent::tokens::context_reserve_tokens` for why `min` and not `max`.
+    ///
+    /// When remaining room falls below it, the tool loop withdraws every tool
+    /// and asks the model to finish the turn, rather than letting the next
+    /// request run into the provider's context limit. There is no separate
+    /// `enabled` flag: a `cap` of 0 yields a reserve of 0, which never fires.
+    #[serde(default = "default_wrapup_reserve_ratio")]
+    pub wrapup_reserve_ratio: f64,
+    #[serde(default = "default_wrapup_reserve_cap")]
+    pub wrapup_reserve_cap: i32,
     #[serde(default = "default_message_mask_head_lines")]
     pub message_mask_head_lines: i32,
     #[serde(default = "default_message_mask_tail_lines")]
@@ -259,6 +272,12 @@ fn default_min_compaction_tokens() -> i32 {
 fn default_max_live_tail_tokens() -> i32 {
     24000
 }
+fn default_wrapup_reserve_ratio() -> f64 {
+    0.25
+}
+fn default_wrapup_reserve_cap() -> i32 {
+    15000
+}
 fn default_message_mask_head_lines() -> i32 {
     10
 }
@@ -280,6 +299,8 @@ impl Default for TokenManagementConfig {
             compaction_target_ratio: default_compaction_target_ratio(),
             min_compaction_tokens: default_min_compaction_tokens(),
             max_live_tail_tokens: default_max_live_tail_tokens(),
+            wrapup_reserve_ratio: default_wrapup_reserve_ratio(),
+            wrapup_reserve_cap: default_wrapup_reserve_cap(),
             message_mask_head_lines: default_message_mask_head_lines(),
             message_mask_tail_lines: default_message_mask_tail_lines(),
             tool_mask_head: default_tool_mask_head(),
@@ -300,6 +321,17 @@ impl TokenManagementConfig {
         self.message_mask_tail_lines = self.message_mask_tail_lines.max(0);
         self.tool_mask_head = self.tool_mask_head.max(0);
         self.tool_mask_tail = self.tool_mask_tail.max(0);
+        // Same reasoning, higher stakes: a ratio above 1.0 makes the wrap-up
+        // reserve larger than the whole context window, so the valve is due on
+        // every turn at step 0 and the agent can never call a tool again. A
+        // negative one means it never fires at all. Both are silent bricking,
+        // so clamp rather than reject. NaN survives neither comparison, so it
+        // is mapped explicitly.
+        if self.wrapup_reserve_ratio.is_nan() {
+            self.wrapup_reserve_ratio = default_wrapup_reserve_ratio();
+        }
+        self.wrapup_reserve_ratio = self.wrapup_reserve_ratio.clamp(0.0, 1.0);
+        self.wrapup_reserve_cap = self.wrapup_reserve_cap.max(0);
     }
 }
 
