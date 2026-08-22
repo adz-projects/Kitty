@@ -37,9 +37,33 @@ export function usePopoverPosition(open: boolean, onClose: () => void) {
     if (!trigger || !popover) return;
 
     const triggerRect = trigger.getBoundingClientRect();
-    const popoverRect = popover.getBoundingClientRect();
     const vw = window.innerWidth;
     const vh = window.innerHeight;
+
+    // Measure the popover *as it will actually be laid out*, not as it
+    // currently is. Before this effect runs it is still in the class's
+    // `position: absolute` state, whose containing block is the trigger's tiny
+    // `position: relative` wrapper — so a shrink-to-fit popover measured there
+    // reports roughly the trigger's width, not its content's. The provider
+    // picker measured ~160px (its `min-width`) while its real width once fixed
+    // was well over 200, which made the right-aligned branch below look like it
+    // fit when it did not: the popover then rendered with a negative left edge,
+    // hanging off the left of the screen with its leading characters clipped by
+    // `overflow-x: hidden`.
+    //
+    // Pinning it to fixed/top-left with the final `maxWidth` for one
+    // synchronous read gives the true laid-out size. This happens inside
+    // `useLayoutEffect`, so nothing is painted in the measuring state.
+    const measuredCss = popover.style.cssText;
+    popover.style.position = 'fixed';
+    popover.style.top = '0px';
+    popover.style.left = '0px';
+    popover.style.right = 'auto';
+    popover.style.bottom = 'auto';
+    popover.style.maxWidth = `${Math.max(0, vw - 2 * MARGIN)}px`;
+    popover.style.maxHeight = 'none';
+    const popoverRect = popover.getBoundingClientRect();
+    popover.style.cssText = measuredCss;
 
     // `.mode-popover`'s own CSS class sets `top`/`right` as its default
     // (position: absolute) placement. Every axis below must be explicitly
@@ -82,12 +106,19 @@ export function usePopoverPosition(open: boolean, onClose: () => void) {
     }
 
     // Horizontal: prefer right-aligned to the trigger (matches the existing
-    // `.mode-popover` default); flip to left-aligned if that would overflow
-    // the left edge. `maxWidth` is the same last-resort clamp as above.
+    // `.mode-popover` default); fall back to left-aligned if that would
+    // overflow the left edge, and to the viewport's own left margin if the
+    // popover is too wide for either alignment to fit. That last case used to
+    // be folded into the left-aligned branch via `Math.max(MARGIN, …)`, which
+    // kept the left edge on-screen but silently pushed the right edge past the
+    // viewport instead. `maxWidth` is the same last-resort clamp as above and
+    // is what keeps the third branch honest.
     if (triggerRect.right - popoverRect.width >= MARGIN) {
       next.right = Math.max(MARGIN, vw - triggerRect.right);
-    } else {
+    } else if (triggerRect.left + popoverRect.width <= vw - MARGIN) {
       next.left = Math.max(MARGIN, triggerRect.left);
+    } else {
+      next.left = MARGIN;
     }
     next.maxWidth = Math.max(0, vw - 2 * MARGIN);
 

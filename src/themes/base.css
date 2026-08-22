@@ -12,7 +12,8 @@
    `--font-family`; this is the face that name resolves to. */
 @font-face {
   font-family: 'Montserrat';
-  src: url('../assets/fonts/Montserrat-Variable.woff2') format('woff2-variations'),
+  src:
+    url('../assets/fonts/Montserrat-Variable.woff2') format('woff2-variations'),
     url('../assets/fonts/Montserrat-Variable.woff2') format('woff2');
   font-weight: 100 900;
   font-style: normal;
@@ -309,6 +310,15 @@ button.primary {
 .message-list {
   flex: 1;
   overflow-y: auto;
+  /* `overflow-y: auto` alone computes `overflow-x` to `auto` as well, so any
+     child wider than the column (an unbreakable URL, a wide table) makes the
+     whole conversation horizontally scrollable. Everything else in the list is
+     a full-width flex item pinned to the content box's left edge, so scrolling
+     right carried them all off-screen to the left — which is what made the
+     progress indicator ("Provider is thinking…") vanish past the left edge on
+     a phone. Code blocks keep their own `overflow: auto` and still scroll
+     internally; nothing else has any business extending the column. */
+  overflow-x: hidden;
   overscroll-behavior: contain;
   display: flex;
   flex-direction: column;
@@ -344,6 +354,16 @@ button.primary {
   max-width: 85%;
   white-space: pre-wrap;
   word-break: break-word;
+}
+
+/* Both roles wrap unbreakable runs. `.msg-user .bubble` has carried
+   `word-break: break-word` since it was written; the assistant bubble never
+   did, so a bare URL or a long path in a reply overflowed the column instead
+   of wrapping — the source of the horizontal scroll `.message-list` now also
+   refuses above. `anywhere` rather than `break-word` so the overflow is
+   accounted for during intrinsic sizing too, not only when laying out. */
+.bubble {
+  overflow-wrap: anywhere;
 }
 
 .msg-assistant .bubble {
@@ -1040,7 +1060,6 @@ button.primary {
   line-height: 1.6;
 }
 
-
 .pasted-chip {
   flex-direction: column;
   align-items: stretch;
@@ -1132,6 +1151,29 @@ button.primary {
 .mode-popover button.active {
   color: var(--accent);
   font-weight: 600;
+}
+/* The provider picker specifically: 20% past the shared floor, because its
+   rows carry a trust icon plus a full provider+model name and the generic
+   160px turned most of them into two cramped lines. */
+.provider-popover {
+  min-width: 192px;
+}
+/* Hanging indent: the icon is a fixed-width flex item and the name is a
+   separate one, so a name that wraps aligns its second line under the first
+   line of the name rather than under the icon. */
+.provider-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+}
+.provider-option > svg {
+  flex: none;
+  /* Optical centring against the first line of the label, which the
+     flex-start alignment would otherwise leave the icon sitting above. */
+  margin-top: 2px;
+}
+.provider-option-name {
+  min-width: 0;
 }
 .mode-popover-sep {
   border: none;
@@ -1257,10 +1299,21 @@ button.primary {
   display: none;
 }
 
+/* Flex, so `.session-list` fills the route and becomes the scrolling box
+   itself. As a plain block child it took its content height, the route clipped
+   the overflow, and the list's own `overflow-y: auto` never engaged — which
+   left `.session-selection-bar` sticking to the bottom of a box taller than
+   the screen, i.e. permanently out of view on any history longer than one
+   page. */
 .sessions-route {
   height: 100%;
   overflow: hidden;
   background: var(--bg);
+  display: flex;
+}
+.sessions-route > .session-list {
+  flex: 1;
+  min-width: 0;
 }
 
 /* The hub is a column: the active route takes the remaining height and the

@@ -87,18 +87,22 @@ export function ProviderBadge() {
         {icon} <span className="provider-badge-label">{busy ? 'switching…' : label}</span> ▾
       </button>
       {open && (
-        <div ref={popoverRef} className="mode-popover" role="menu" style={style}>
+        <div ref={popoverRef} className="mode-popover provider-popover" role="menu" style={style}>
           {providers.map((p) => (
             <button
               key={p.id}
               role="menuitemradio"
               aria-checked={p.id === activeId}
-              className={p.id === activeId ? 'active' : ''}
+              className={`provider-option${p.id === activeId ? ' active' : ''}`}
               title={p.base_url}
               onClick={() => void switchTo(p.id)}
             >
-              <TrustIcon tier={p.network_tier} isTrusted={p.is_trusted} />{' '}
-              {p.name || p.provider_type}
+              {/* Icon and name are separate flex children rather than one run
+                  of inline content, so a name too long for the row wraps to a
+                  hanging indent under the name instead of under the icon
+                  (see `.provider-option` in base.css). */}
+              <TrustIcon tier={p.network_tier} isTrusted={p.is_trusted} />
+              <span className="provider-option-name">{p.name || p.provider_type}</span>
             </button>
           ))}
           {providers.length === 0 && <span className="muted">No providers configured</span>}
