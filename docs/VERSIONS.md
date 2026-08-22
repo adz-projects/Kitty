@@ -2,27 +2,23 @@
 
 This file is the single source of truth for external-dependency versions and any
 API-path / process-name assumptions the app relies on. A dependency bump is not
-done until this file is updated and the affected code (`goosed/api.rs`,
-`conflict.rs`, `starter_models.ts`, etc.) is re-verified against it.
+done until this file is updated and the affected code (`src-tauri/src/bigtiny/`,
+`src/lib/curated_models.ts`, `src/lib/reasoning_models.ts`, etc.) is
+re-verified against it.
 
-## Goose
-
-- **Pinned version:** **1.41.0** (CLI reports `1.41.0`; bundled Desktop `version` file `41.0.0`). Dev binary already on disk — pin to this.
-- **goose binary location (dev):** `C:\Users\azolkover\AppData\Local\Programs\dist-windows\resources\bin\goose.exe` (bundled inside the installed Goose Desktop app). Also present there: `uv.exe`, `uvx.exe`. Desktop shell: `...\dist-windows\Goose.exe`.
-- **Install method used for dev:** existing Goose Desktop install (no separate install needed). Block's Goose is **not on winget** (`Pressly.Goose` is an unrelated DB-migration tool).
-- **⚠️ API surface — ACP, not legacy REST:** this version has **completed** the migration CLAUDE.md warned about. There is **no `goosed agent` command and no `/reply` REST API**. Server subcommands:
-  - `goose serve` — **ACP (Agent Client Protocol) over HTTP + WebSocket**. Default host `127.0.0.1`, **default port `3284`**. Flags: `--host`, `--port`, `--tls[/-cert-path/-key-path]`, `--platform cli|desktop`, `--with-builtin <names>`, `--allowed-origin <origin>`, `--dangerously-unauthenticated`.
-  - `goose acp` — ACP over **stdio** (`--with-builtin` only).
-  - Secret-key auth **still applies**: `GOOSE_SERVER__SECRET_KEY` (the `--dangerously-unauthenticated` flag opts out). CLAUDE.md's secret-key model holds; the *transport/protocol* changes.
-- **Consequence for the plan:** integration targets **ACP JSON-RPC** (`session/new`, `session/prompt`, streamed `session/update` notifications, permission/approval requests, session loading), **not** REST routes `/agent`,`/reply`,`/sessions`,`/config`. No `openapi.json` to vendor — vendor/pin the **ACP schema + method list** instead. Architecture (Rust owns I/O, Tauri events to frontend) is unchanged; the change is confined to `goosed/api.rs` + `goosed/stream.rs` — the isolation boundary CLAUDE.md designed for.
-- **Streaming/reasoning surface:** ACP `session/update` **does** surface a distinct reasoning variant — `agent_thought_chunk` (separate from `agent_message_chunk`). Phase 10 renders it directly; no `<think>` splitting needed.
-- **Full ACP method/transport reference:** [acp-protocol.md](acp-protocol.md) (confirmed live 2026-07-04). Transport = WebSocket `ws://127.0.0.1:<port>/acp?token=<secret>`; readiness = `GET /status` + `X-Secret-Key`.
+Sections marked **HISTORICAL** describe code that no longer exists; they are
+kept only where they explain why something current is shaped the way it is.
+The Goose/goosed, Goose Desktop conflict-detection, Ollama-installer and
+`starter_models.ts` sections were removed outright — Goose is not part of this
+app, and every file they referenced is gone.
 
 ## Ollama — **HISTORICAL, no longer a dependency**
 
 Kitty managed an Ollama process through Phase 2a. Phase 2b removed it
 entirely: there is no detection, no install, no spawn, no supervision, and no
-`/api/pull`. Local inference is llama.cpp linked into the BigTiny daemon, and
+`/api/pull`. Local inference is **LiteRT** linked into the BigTiny daemon
+(embeddings on both platforms, compaction summarization on Windows only; there
+is no local chat), and
 models arrive through the HuggingFace downloader (`src-tauri/src/models/`).
 
 What survives is one thing only: `provider_type: "ollama"` as a **remote**
@@ -34,12 +30,6 @@ fields — not a process lifecycle. Do not re-add one.
 Retained for the record: the version this was verified against was **0.31.1**
 (`GET /api/version`), and the endpoints used were `GET /api/version`,
 `GET /api/tags`, `POST /api/pull` (NDJSON), `DELETE /api/delete`.
-
-## Stock Goose Desktop detection (Phase 1 `conflict.rs`)
-
-- **Process name(s) to match:** `Goose.exe` (case-sensitive; already implemented in
-  `conflict.rs` — this entry was left marked TBD after the fact, corrected in the
-  Stage-1 close-out).
 
 ## Windows Copilot app (REMOVED — UX-simplification pass)
 
@@ -144,38 +134,6 @@ historical context only; none of it reflects current code.
   surfacing a human decision point for genuinely risky commands instead of
   silently running them.
 
-## Installer URLs & hashes (Phase 7; Goose auto-install added in the wizard redesign)
-
-- **Ollama Windows installer:** ~~`https://ollama.com/download/OllamaSetup.exe`~~
-  — **dead.** The wizard no longer installs or detects Ollama (Phase 2b); the
-  local path is now "download a GGUF from HuggingFace" and the code that
-  fetched this URL is gone from `src-tauri/src/wizard.rs`.
-- **Goose:** _confirmed (Stage-1 close-out): there is no Windows `.exe`/`.msi`
-  installer at all_ — the [releases page](https://github.com/aaif-goose/goose/releases/latest)
-  (org renamed from `block/goose`; GitHub still redirects the old path) only
-  publishes zip archives for Windows:
-  - `goose-x86_64-pc-windows-msvc.zip` (~78 MB) — the bare CLI/`goose serve`
-    binary. **This is the one Kitty needs and installs automatically.**
-  - `goose-x86_64-pc-windows-msvc-cuda.zip` — same, CUDA-enabled build. Not
-    used by the auto-install (the plain build is the safe default).
-  - `Goose-win32-x64.zip` / `Goose-win32-x64-cuda.zip` / `Goose.zip` — the full
-    **Goose Desktop** Electron app. **Never auto-install this one** — it's
-    the separate GUI product `conflict.rs` already detects and warns about
-    (`Goose.exe` process name); installing it would create the exact conflict
-    Kitty is designed to flag.
-  - **Wizard redesign (current behavior):** since there's no installer
-    executable to silently run, `wizard::install("goose")`
-    (`src-tauri/src/wizard.rs`) instead resolves the CLI zip's real download
-    URL from the GitHub Releases API by exact asset name
-    (`GOOSE_CLI_ASSET_NAME`), downloads it, extracts it via the `zip` crate
-    into `%LOCALAPPDATA%\Kitty\goose\`, and persists the extracted
-    `goose.exe` path as `Config.goose_binary_override` — which
-    `lifecycle::goosed::locate_goose` now checks first, before the env var /
-    Goose Desktop bundle path / bare PATH fallbacks. The wizard's Detect step
-    calls this from a real "Install" button; a "I already have it" fallback
-    (native `.exe` file picker) sets the same override manually for a user
-    who's already got Goose somewhere non-standard.
-
 ## Wizard redesign: local-vs-API-key fork, `ollama_enabled` (2026-07-11)
 
 - **The wizard's first screen now forks**: "Run models on this computer"
@@ -207,15 +165,6 @@ historical context only; none of it reflects current code.
   a Tauri `externalBin` sidecar (no Python dependency at all) — not yet
   built; this pip-based path is an explicit bridge until that lands.
 
-## Starter models (Phase 7 `src/lib/starter_models.ts`)
-
-- **Curated VRAM-tiered list** (re-verified on ollama.com, replacing the
-  earlier ≤4B `llama3.2`/`qwen2.5`/`gemma2` set now that `gemma4`/`qwen3.5`
-  are current): `gemma4:e2b` (7.2GB — 4-8GB VRAM), `qwen3.5:4b` (3.4GB — 8GB
-  VRAM), `gemma4:e4b` (9.6GB — 8GB VRAM), `qwen3.5:9b` (6.6GB — 16GB VRAM).
-  Re-verify tags/sizes again before release if enough time has passed for the
-  lineup to have moved again.
-
 ## Reasoning-capable models (Phase 10 `src/lib/reasoning_models.ts`)
 
 - **Name patterns → supports-reasoning:** `think` (lfm2.5-thinking, *-thinking),
@@ -224,7 +173,7 @@ historical context only; none of it reflects current code.
   is **content-driven** (shown whenever a model actually emits `agent_thought_chunk`),
   so models that reason but don't match a pattern (e.g. `gemma4:e2b`, which emits
   thoughts here) still get a panel. ACP surfaces reasoning as a distinct
-  `agent_thought_chunk` — no `<think>` tag splitting needed (see acp-protocol.md).
+  `agent_thought_chunk` — no `<think>` tag splitting needed.
 - **Rust port**: `plugins/bigtiny_rust/src/agent/reasoning_models.rs`, same pattern
   table, same "re-verify on model updates" caveat. Two independent copies (this file
   is the frontend's) is an accepted duplication-drift risk — see that module's doc

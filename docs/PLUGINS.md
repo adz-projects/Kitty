@@ -5,9 +5,10 @@ packages, frozen to standalone Windows `.exe`s at build time and bundled via
 Tauri's `externalBin` mechanism. End users need no Python, `uv`, `pip`, or
 Rust toolchain — see `plugins/README.md` for the directory layout and how to
 add a new plugin; this file covers the *pattern* in more depth. The BigTiny
-daemon itself (Kitty's chat backend, vendored in-tree at `plugins/bigtiny/`)
-follows the same freeze pipeline, even though it isn't a "plugin" in the
-tool-augmentation sense — see `docs/bigtiny-backend.md`.
+daemon itself (Kitty's chat backend, the Rust crate at
+`plugins/bigtiny_rust/`) is built and bundled the same way, even though it
+isn't a "plugin" in the tool-augmentation sense — see
+`docs/bigtiny-backend.md`.
 
 **As of 0.5.0 every bundled binary is Rust**, built with plain
 `cargo build --release` — `kitty-tools`, `kitty-web`, `kitty-wasm`, and the
@@ -20,10 +21,10 @@ This is not a deviation from "the exception, by design" framing (CLAUDE.md's
 stack section): a frozen Rust binary has *less* runtime surface than a frozen
 Python one (no interpreter, no onefile self-extraction latency), so it fits the
 same externalBin-bundled-plugin slot even more comfortably. The Python freeze
-pipeline described below is retained because it still documents how the
-retired plugins were built, and `plugins/build.py`'s `kind` field still
-supports `"python"` should a future plugin need it — but no current target
-uses it.
+pipeline described below is retained only as a record of how the retired
+plugins were built; `plugins/build.py`'s `kind` field still accepts
+`"python"` should a future plugin need it, but no target uses it and every
+Python plugin's source has since been deleted.
 
 ## Why frozen `.exe`s, not a bundled Python runtime
 
@@ -137,8 +138,9 @@ text (`scrape::markdown_to_text`).
 **`kitty-docs-web` is retired.** Its web tools moved to `kitty-web`; its PDF
 (PyMuPDF) and Excel (openpyxl) tools moved to `kitty-tools`, implemented on
 `lopdf` and `calamine` respectively (`plugins/kitty-tools/src/tools/{pdf,excel}.rs`).
-The Python source stays in-tree, unbuilt, as the behavioral oracle for the Rust
-ports, exactly like `replacement-mcp`/`brave-mcp-search`. Excel is read-only by
+Its Python source has been deleted, as have `replacement-mcp` and
+`brave-mcp-search` — the ports are verified and shipping, and git history
+holds the originals. Excel is read-only by
 design — spreadsheet *writes* go through the existing `lean_file_*` CSV tools,
 so no lossy xlsx writer crept into the small frozen `kitty-tools` binary.
 

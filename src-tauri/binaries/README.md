@@ -12,7 +12,7 @@ Before an actual release build (`tauri build` / `pnpm tauri build`), run:
 python plugins/build.py
 ```
 
-from the repo root. It freezes every plugin with PyInstaller and overwrites
+from the repo root. It builds every plugin with `cargo build --release` and overwrites
 any placeholders with the real executables. Packaging with a placeholder
 still in place would produce an app that can't actually start that plugin —
 `tauri build` doesn't distinguish a placeholder from a real binary, only

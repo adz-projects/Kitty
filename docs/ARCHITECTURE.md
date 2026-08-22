@@ -1,7 +1,7 @@
 # Architecture
 
 One-page module map with dependency direction — the flat inventory in
-`PROJECT_INDEX.md` has no edges; this does. Arrows read "depends on" /
+a flat file inventory has no edges; this does. Arrows read "depends on" /
 "calls into."
 
 ## Rust (`src-tauri/src/`)
@@ -64,8 +64,10 @@ state.rs        AppState (managed Tauri state): config, the BigTiny
 ```
 
 **There is no Ollama module.** Kitty manages no inference process at all: the
-local engine is llama.cpp linked into the daemon
-(`plugins/bigtiny_rust/src/local/`), and `provider_type: "ollama"` survives
+local engine is **LiteRT** linked into the daemon
+(`plugins/bigtiny_rust/src/litert/`) — embeddings on both platforms, plus
+generative compaction summarization on Windows only. There is no local chat.
+`provider_type: "ollama"` survives
 only as a *remote* endpoint dialect the user points at a server they run
 themselves. `src-tauri/src/ollama/`, `commands/ollama.rs`,
 `lifecycle/ollama_proc.rs` and `config/env_helper.rs` were deleted in Phase 2b.
@@ -164,11 +166,11 @@ re-enabling always requires re-entering it). `kitty-wasm` hosts the sandboxed
 WebAssembly compute tools (Python via a bundled CPython wasm guest, plus
 arbitrary WASI modules) with no network and no filesystem beyond explicit
 mounts. `replacement-mcp`, `brave-mcp-search`, `visualizations`,
-`kitty-docs-web`, and `wasm-math-mcp` are retired with their source kept
-in-tree, unbuilt, as a re-verification oracle for the ports — except
-`visualizations`, whose Rust rebuild deliberately diverges rather than ports
-it (see `docs/PLUGINS.md` for why its source is no longer a correctness
-reference).
+`kitty-docs-web` and `wasm-math-mcp` are retired and their source has been
+**deleted** — the ports are verified and shipping, and git history holds the
+originals if a behavioral question ever needs settling. Their server rows are
+actively removed from the daemon on sync (`RETIRED_BUILTINS` in
+`src-tauri/src/bigtiny/mcp.rs`).
 
 ## Cross-cutting: the three "who's the source of truth" boundaries
 

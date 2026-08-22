@@ -238,13 +238,14 @@ pub struct Config {
     pub ollama_enabled: bool,
     /// Command used to launch the BigTiny daemon — the bundled
     /// `bigtiny-daemon.exe` (see `plugins/build.py`, same `externalBin`
-    /// convention as the other bundled plugins) if present, else `python`
-    /// for dev convenience (paired with `bigtiny_args`'s `-m bigtiny`
-    /// default, so `cargo tauri dev` still works from a source checkout).
+    /// convention as the other bundled plugins) if present, else `cargo`
+    /// for dev convenience (paired with `bigtiny_args`'s `run
+    /// --manifest-path plugins/bigtiny_rust/Cargo.toml` default, so
+    /// `cargo tauri dev` still works from a source checkout).
     #[serde(default = "default_bigtiny_command")]
     pub bigtiny_command: String,
-    /// Arguments before `--port`/`--host`. Empty for the bundled exe; `["-m",
-    /// "bigtiny"]` for the dev-convenience `python` fallback above.
+    /// Arguments before `--port`/`--host`. Empty for the bundled exe; a
+    /// `cargo run` against `plugins/bigtiny_rust/` for the dev fallback.
     #[serde(default = "default_bigtiny_args")]
     pub bigtiny_args: Vec<String>,
     /// Working directory to spawn BigTiny in — the checkout that contains the

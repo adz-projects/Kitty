@@ -8,7 +8,7 @@ A Tauri v2 app on **two targets — Windows and Android** — backed by **BigTin
 
 **The two targets differ in hosting, not in code.** Desktop spawns `bigtiny-daemon.exe` as a child process and bundles the MCP servers as `externalBin` sidecars. Android links the same daemon in and hosts it in-process (`lifecycle/bigtiny_embedded.rs`) with `transport: "in_process"` MCP servers, because Android 10+ refuses to `exec()` a binary in app-writable storage. Both sit behind the same HTTP boundary, so nothing above `lifecycle/` knows the difference. `docs/ANDROID.md` is the plan of record for that work and `docs/RELEASE.md` has both packaging lanes.
 
-Read `goose-overlay-project-description.md` in the repo root for the original product description (predates the BigTiny backend swap — treat backend-specific details there as historical). When it conflicts with this file, this file wins on *how* things currently work.
+The original product description (`goose-overlay-project-description.md`) has been **deleted** — it predated the BigTiny backend swap and described a Goose-based app that no longer exists. This file, plus `docs/ARCHITECTURE.md`, is the spec.
 
 **Goose is not part of this app.** Kitty used to spawn `goosed` (Goose's ACP-over-WebSocket server) as its backend; that entire integration (`src-tauri/src/goosed/`, `goose_config.rs`, the ACP protocol layer, the Goose Desktop conflict check, the wizard's Goose install step) has been removed. BigTiny is the only backend, and it is fully internalized — the wizard and UI never mention it, or Goose, as a dependency. See `docs/ARCHITECTURE.md` for the current, accurate module map.
 
@@ -20,10 +20,10 @@ Read `goose-overlay-project-description.md` in the repo root for the original pr
 - **Rust crates**: `tauri`, `tauri-plugin-global-shortcut`, `tauri-plugin-notification`, `tauri-plugin-shell` (open browser), `tauri-plugin-dialog`, `tauri-plugin-single-instance`, `reqwest` (with `stream` feature), `tokio`, `serde`/`serde_json`, `keyring` (Windows Credential Manager), `windows` (Win32 APIs for the keyboard hook), `sysinfo` (process detection), `thiserror`.
 - **HTTP to BigTiny/Ollama**: all network calls go through the Rust side (Tauri commands + events). The webview never fetches localhost directly — this keeps the BigTiny secret key out of JS and avoids CORS issues.
 - **Exception, by design**: packages under `plugins/` (see "Internal
-  plugins" below), plus the BigTiny daemon itself (vendored at
-  `plugins/bigtiny/`, same tree as everything else now), ship as part of the
-  app, frozen to standalone `.exe`s (PyInstaller for the Python ones, plain
-  `cargo build --release` for `kitty-tools`) and bundled through Tauri's
+  plugins" below), plus the BigTiny daemon itself (the Rust crate at
+  `plugins/bigtiny_rust/`), ship as part of the
+  app, built to standalone `.exe`s (plain `cargo build --release` —
+  every target is Rust) and bundled through Tauri's
   `externalBin` — this is an intentional, sanctioned part of the stack, not
   a deviation. A frozen Rust plugin is, if anything, *less* of an exception
   than a frozen Python one (no interpreter, no onefile self-extraction
@@ -52,7 +52,8 @@ maintained in this repo under `plugins/`, built to standalone Windows
 `.exe`s and bundled through Tauri's `externalBin` mechanism — end users need
 no runtime of any kind. **As of 0.5.0 every bundled binary is Rust**
 (`cargo build --release`); the PyInstaller freeze path still exists in
-`plugins/build.py` but no current target uses it. Full detail in
+`plugins/build.py` but no target uses it, and every Python plugin's source
+has been deleted. Full detail in
 `docs/PLUGINS.md`; the current plugins:
 
 - **`adaptive-pathway_rust`** — the behavioral-memory engine, and *not* a
@@ -77,26 +78,31 @@ no runtime of any kind. **As of 0.5.0 every bundled binary is Rust**
   involvement is keeping the registration's command path pointed at the
   current install's bundled exe and its `enabled` flag in sync with Settings
   (`bigtiny::mcp::ensure_builtin_servers`, `commands/mcp_servers.rs`). Hosts
-  18 context-optimized local-machine tools in one process — shell/workspace/
-  file/Word/cache/scratchpad (always on; this is the retired
-  `replacement-mcp`'s full surface, now hand-rolled in Rust — **on by
-  default**, since they're what makes the small local models Kitty targets
-  usable as agents at all), plus 3 accessible-table/SVG-diagram/chart
-  visualization tools, gated by their own Settings toggle (an env var on
-  this one process, not a separate server). No network calls of its own —
-  web search moved to `kitty-docs-web` below. Toggled in Settings → MCP
+  22 context-optimized local-machine tools in one process — shell,
+  workspace, 5 file, 3 Word, 2 Excel, 2 PDF, 4 scratchpad, 4 cache (always
+  on; this is the retired `replacement-mcp`'s full surface plus
+  `kitty-docs-web`'s PDF/Excel tools, now hand-rolled in Rust on `lopdf`/
+  `calamine` — **on by default**, since they're what makes the small local
+  models Kitty targets usable as agents at all), plus 3 accessible
+  table/chart/Mermaid visualization tools, gated by their own Settings
+  toggle (an env var on this one process, not a separate server). No network
+  calls of its own — web search lives in `kitty-web`. Toggled in Settings → MCP
   Servers. Installs predating the `replacement-mcp` default flip are flipped
   on once by `config::migrate_replacement_mcp_enabled` /
   `migrate_kitty_split_enabled`, which then respect any later opt-out.
-- **`kitty-docs-web`** — a **Python** stdio MCP server, same BigTiny
-  registration pattern as `kitty-tools`. Hosts the 8 tools that need Python's
-  native deps with no adequate Rust equivalent: PDF read/outline (PyMuPDF),
-  web scrape (trafilatura), the merged `lean_web_search`/
-  `lean_web_search_read_chunk` (DuckDuckGo via `ddgs`, always available; Brave
-  preferred per-query when `BRAVE_API_KEY` is configured, with a count-tiered
-  normal/expanded/expansive mode — see `docs/VERSIONS.md`), and 3 Excel tools
-  (openpyxl). On by default, no credentials (Brave preference is a separate,
-  off-by-default toggle requiring an API key).
+- **`kitty-web`** — a **Rust** stdio MCP server, same BigTiny registration
+  pattern as `kitty-tools`. Hosts 3 tools: `lean_web_scrape`, and the merged
+  `lean_web_search`/`lean_web_search_read_chunk` (DuckDuckGo always
+  available; Brave preferred per-query when `BRAVE_API_KEY` is configured,
+  with a count-tiered normal/expanded/expansive mode — see
+  `docs/VERSIONS.md`). On by default, no credentials (Brave preference is a
+  separate, off-by-default toggle requiring an API key).
+- **`kitty-wasm`** — a **Rust** stdio MCP server, same registration pattern.
+  4 tools running Python or any WASI module inside a wasmtime sandbox with
+  enforced time/memory ceilings, no network, and no filesystem beyond
+  explicit mounts. Supersedes the retired `wasm-math-mcp`. Its 26 MB CPython
+  guest is bundled on Windows; on Android it downloads once on first use
+  (see `docs/BACKLOG.md`).
 
 The above (and the BigTiny daemon itself) are frozen via
 `python plugins/build.py` (Python plugins) or `cargo build --release`
@@ -136,7 +142,6 @@ inventory. Subsystems built beyond the original phased plan:
 ```
 /                       # repo root
   CLAUDE.md
-  goose-overlay-project-description.md
   docs/
     VERSIONS.md         # pinned Goose + Ollama versions and tested goosed API paths
     goosed-openapi.json # vendored spec for the pinned version

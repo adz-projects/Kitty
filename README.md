@@ -1,163 +1,163 @@
 # Kitty
 
-A chat client and agentic AI assistant for **Windows and Android**. On Windows
-it includes a hotkey-summoned floating overlay; on Android it is a single
-routed window with a bottom tab bar. Kitty ships with a useful library of
-MCP-based tools for research, document parsing and creation, computation, and
-system-level operations, and includes **Adaptive Pathways** — a knowledge-graph
-system that learns your preferences and suggestion patterns while actively
-resisting overfitting through ensemble diversity, novelty tracking, and
-exploration incentives.
+An agentic AI chat client for **Windows and Android**, built on Tauri v2.
 
-All model inference, session management, and tool orchestration runs in
-**BigTiny**, a custom Rust REST/SSE daemon with llama.cpp linked in for local
-inference. Kitty is the client layer: window management, hotkeys, theming, HITL
-approval UI, file and screenshot context, provider configuration, and process
-lifecycle. On Windows the daemon is a child process; on Android the same code
-is hosted in-process, because Android will not execute a bundled binary out of
-app storage.
+On Windows it is a hotkey-summoned floating overlay that expands into a full
+window with session history and an artifacts pane. On Android it is a single
+routed window with a bottom tab bar. Both run the same React component tree —
+platform differences are a handful of `isAndroid()` gates and one CSS
+breakpoint, never a forked UI.
 
-## What it does
+Kitty is the **client layer**: window management, hotkeys, theming, tool
+approval, file and screenshot context, provider configuration, and process
+lifecycle. Everything an agent actually *does* — model routing, tool
+execution, MCP, sessions, streaming — happens in **BigTiny**, a Rust REST/SSE
+daemon in this repo at `plugins/bigtiny_rust/`.
 
-**Chat and agent modes.** A "thought partner" mode for open-ended
-conversing with access to tools, and a tool-first agentic mode with filesystem,
-shell, and MCP tool access. Chat actions are directory-sandboxed to the session's 
-chat folder; anything outside it triggers a human-in-the-loop approval prompt.
+## How it runs
 
-**Tool library.** Bundled MCP server plugins give the agent access to:
+The same daemon is hosted two different ways, behind one HTTP boundary:
 
-* **kitty-tools** (Rust) — 18 always-on local-machine tools: shell execution,
-file read/write/append with pagination, workspace analysis, Word document
-read/outline/write, a persistent scratchpad, and a content cache, plus 4
-WCAG 2.2 AA compliant visualization tools (accessible tables, SVG diagrams,
-charts, and Mermaid diagrams rendered client-side from a bundled runtime),
-gated by their own Settings toggle, and read-only Excel/PDF
-tools. On by default, no credentials.
-* **kitty-web** (Rust) — web article scraping and merged web search
-(DuckDuckGo always available, Brave preferred per-query when an API key is
-configured). On by default (Brave preference is a separate opt-in toggle).
-* **kitty-wasm** (Rust) — run Python (or any WASI module) in a sandboxed
-WebAssembly (wasmtime + WASI) interpreter for exact math, data filtering,
-and statistical computation. On by default, no credentials required; its
-CPython guest ships with the app so first use is offline.
-* **adaptive-pathway** — the `record`/`forget` tools the model calls to
-participate in the Adaptive Pathways learning loop. Not a separate server:
-the engine is linked into the daemon and its tools are registered in-process,
-so recall happens on the agent loop rather than over a socket.
+| | Windows | Android |
+|---|---|---|
+| BigTiny | child process (`bigtiny-daemon.exe`) | linked in, hosted in-process |
+| MCP tool servers | bundled `.exe` sidecars over stdio | in-process over `tokio::io::duplex` |
 
-**BigTiny backend.** A Rust daemon handling provider routing (Anthropic,
-OpenAI-compatible endpoints, and self-hosted servers including Ollama),
-local inference via llama.cpp, session persistence (SQLite),
-SSE streaming with token-budget compaction, provider failover, MCP server
-lifecycle, and a pattern-based HITL approval policy. Multiple sessions run
-concurrently, each with its own provider, model, and persona configuration.
+Android needs the in-process path because Android 10+ refuses to `exec()` a
+binary out of app-writable storage. Nothing above `lifecycle/` knows the
+difference — both sit behind the same localhost REST API, authenticated with a
+per-launch secret that never reaches the webview.
 
-**Adaptive Pathways.** A knowledge-graph sidecar that builds a weighted graph
-of learned preference edges across domains. It uses ensemble voting, inverse
-propensity scoring, DPP-based diversity, Thompson sampling, and novelty
-penalties to keep suggestions from collapsing into local optima. The system
-surfaces ensemble "schisms" for user resolution, tracks exploration health
-metrics, supports per-domain weight tuning, and lets the model itself flag
-exploration nudges. Suggestions can be paused; learning continues at reduced
-weight.
+## Tools
 
-**Window chrome.** A global hotkey toggles a small always-on-top overlay; an
-expand button opens a full window with session history, an artifacts pane,
-and settings. Multiple full windows can be open simultaneously, each on an
-independent session. Drag-and-drop file context and region screenshot capture
-feed directly into the conversation.
+The agent gets its capabilities from three bundled MCP servers, all Rust, all
+on by default and requiring no credentials.
 
-## Repository layout
+**`kitty-tools` — 22 local-machine tools.** Shell execution; file
+read/write/append/replace with pagination; workspace analysis; Word document
+read/outline/**write** (including hyperlinks); Excel inspect/read; PDF
+text/outline; a persistent scratchpad; and a content cache. Plus 3
+WCAG-oriented visualization tools (accessible table, chart, Mermaid diagram)
+behind their own Settings toggle.
 
-```
-src/                  React + TypeScript frontend (Vite)
-src-tauri/             Rust core (Tauri v2) — all I/O, window management,
-                        process lifecycle, config, secrets
-plugins/                Internal Python subsystems, frozen to standalone
-                        .exe's and bundled via Tauri's externalBin
-  bigtiny/              BigTiny itself — the chat backend daemon
-  adaptive-pathway/     Tool-selection/response-style learning sidecar + MCP
-  replacement-mcp/      Context-optimized shell/file/web/document MCP tools
-  brave-mcp-search/     Brave Search MCP tool
-  kitty-wasm/           Sandboxed WebAssembly compute MCP tool (Rust)
-docs/                   Architecture, plugin, release, and backend docs
-```
+**`kitty-web` — 3 tools.** Web scrape, plus web search and its paged
+read-back. DuckDuckGo always works; Brave is preferred per-query when an API
+key is configured (a separate, off-by-default toggle). Large result sets
+offload to disk with a keyword index instead of flooding the context.
+
+**`kitty-wasm` — 4 tools.** Runs Python — or any WASI module — inside a
+wasmtime sandbox with enforced time and memory ceilings, no network, and no
+filesystem beyond explicit mounts. Used for exact arithmetic, data filtering,
+and statistics. The 26 MB CPython guest ships with the app on Windows, so
+first use is offline; on Android it downloads once and is then cached
+(bundling it there needs an extract-to-app-storage step — see
+`docs/BACKLOG.md`).
+
+**Adaptive Pathway** is not a server. The behavioral-memory engine
+(`plugins/adaptive-pathway_rust/`) is statically linked into the daemon, so
+recall is an in-process call on the agent loop rather than a network hop. It
+extracts durable beliefs about you from conversation, decays and consolidates
+them across sessions, and injects a diverse handful per turn — framed as
+working assumptions to check a request against, never a profile to conform to.
+Its `record`/`forget` tools are exposed to the model through the daemon's
+in-process MCP registry, which is what lets the model drop a belief you tell it
+is wrong. Browsable in Settings; per-session incognito from the chat header.
+
+## Local inference
+
+Kitty runs **no inference process of its own**, and there is no local chat —
+chat always routes to a remote provider. LiteRT is linked into the daemon for
+exactly two local jobs:
+
+- **Semantic embeddings** for Adaptive Pathway's memory (EmbeddingGemma), on
+  both platforms.
+- **Compaction summarization**, on **Windows only**. Android hands that to the
+  session's remote chat model instead, so no generative model runs on the
+  phone — that was the fix for on-device GPU heat and artifacting.
+
+`provider_type: "ollama"` survives only as a *remote* endpoint dialect for a
+server you run yourself.
 
 ## Tech stack
 
-* **Shell**: Tauri v2 (Rust core + web frontend), targeting Windows and Android.
-* **Frontend**: React 18 + TypeScript + Vite, plain CSS with custom
-properties for theming (no Tailwind/CSS-in-JS). State via Zustand. One
-component tree across both platforms.
-* **Backend**: BigTiny (Rust) — REST + one SSE streaming endpoint, session
-storage in SQLite, provider routing (Anthropic/OpenAI-compatible/self-hosted),
-in-process llama.cpp for local models, MCP tool-server management, HITL
-approval policy.
-* **Rust crates of note**: `tauri-plugin-global-shortcut`,
-`tauri-plugin-notification`, `tauri-plugin-shell`, `tauri-plugin-dialog`,
-`tauri-plugin-single-instance`, `reqwest`, `tokio`, `keyring` (Windows
-Credential Manager — secrets never touch JS or plaintext disk), `windows`
-(Win32 APIs for the keyboard hook and screen capture), `sysinfo`.
+- **Shell** — Tauri v2. Windows ships an NSIS installer; Android ships an AAB
+  (`aarch64` is the only supported ABI).
+- **Frontend** — React 18 + TypeScript + Vite. Zustand for UI state. Plain CSS
+  with custom properties, so a theme is a single droppable `.css` file. No
+  Tailwind, no CSS-in-JS.
+- **Core** — Rust. All I/O lives here; the webview never fetches localhost
+  directly, which keeps the daemon secret out of JS and avoids CORS entirely.
+  Streaming reaches the UI as Tauri events.
+- **Secrets** — Windows Credential Manager via `keyring`. On Android, AES-256-GCM
+  sealed under a non-exportable AndroidKeyStore key (`keyring` has no Android
+  backend — it silently degrades to an in-memory mock, so it is excluded from
+  the Android dependency graph entirely).
 
-## Getting started (dev)
+## Getting started
 
-Prerequisites: Node.js + [pnpm](https://pnpm.io), a Rust toolchain
-(`rustup`), and Python 3.11+ for running BigTiny from source.
+Prerequisites: Node.js with [pnpm](https://pnpm.io), and a Rust toolchain via
+`rustup`. **No Python and no Rust toolchain is needed by end users**, and none
+is needed to run the app in dev either — BigTiny is pure Rust and runs straight
+from source.
 
 ```bash
 pnpm install
-
-# One-time: install BigTiny's own dependencies into your Python environment
-pip install -e plugins/bigtiny
-
 pnpm tauri dev
 ```
 
-In dev, Kitty launches BigTiny via `python -m bigtiny` against
-`plugins/bigtiny/` rather than a bundled `.exe` — see
-[`docs/bigtiny-backend.md`](docs/bigtiny-backend.md) for exactly how that's
-configured and why it must be `python -m bigtiny` specifically (the Windows
-Proactor event-loop factory stdio MCP servers need).
+In dev, Kitty launches the daemon with `cargo run` against
+`plugins/bigtiny_rust/`, so `pnpm tauri dev` works before `plugins/build.py`
+has ever run.
 
 ### Commands
 
-|Command|What|
-|-|-|
-|`pnpm tauri dev`|Full-stack dev (Vite on :1420 + Rust)|
-|`pnpm build`|`tsc \&\& vite build`|
-|`pnpm lint`|`eslint . \&\& prettier --check .`|
-|`pnpm test`|`vitest run`|
-|`cargo clippy` (in `src-tauri/`)|Rust lint|
-|`cargo test` (in `src-tauri/`)|Rust unit tests|
-|`pytest` (in `plugins/bigtiny/`)|BigTiny's own test suite|
-|`python plugins/build.py`|Freeze BigTiny + every internal plugin to `.exe`|
+| Command | What |
+|---|---|
+| `pnpm tauri dev` | Full-stack dev (Vite on :1420 + Rust core) |
+| `pnpm build` | `tsc && vite build` |
+| `pnpm test` | `vitest run` |
+| `pnpm lint` | `eslint . && prettier --check .` |
+| `cargo test` (in `src-tauri/`) | Rust unit tests |
+| `cargo clippy` (in `src-tauri/`) | Rust lint |
+| `cargo test` (in `plugins/<name>/`) | A bundled plugin's own suite |
+| `python plugins/build.py` | Build all four bundled binaries |
+
+`plugins/build.py` is the one place Python is still involved, and only as a
+script runner: every target it builds is Rust (`cargo build --release`). It
+exists because it owns the target-triple naming convention Tauri's
+`externalBin` expects.
 
 ### Building a release
 
-`src-tauri/binaries/` ships committed, zero-byte placeholder `.exe`s for
-every plugin so a fresh clone can `cargo check`/`cargo build` at all (Tauri
-validates every `externalBin` entry exists on disk, even for a plain build).
-Before an actual release build, freeze the real binaries first:
+`src-tauri/binaries/` holds committed placeholder `.exe`s so a fresh clone can
+`cargo check` — Tauri validates that every `externalBin` entry exists on disk
+even for a plain build. Those placeholders cannot run, so build the real ones
+first:
 
 ```bash
 python plugins/build.py
 pnpm tauri build
 ```
 
-See [`docs/RELEASE.md`](docs/RELEASE.md) for the full checklist and
-[`docs/PLUGINS.md`](docs/PLUGINS.md) for how the freeze pipeline and the two
-plugin-integration shapes (Kitty-managed process vs. BigTiny-managed MCP
-server) work.
+Android, which needs an explicit target:
 
-## Documentation map
+```bash
+pnpm tauri android build --apk --target aarch64
+```
 
-* [`CLAUDE.md`](CLAUDE.md) — the authoritative spec: architectural rules,
-coding conventions, and the full original phased build plan.
-* [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — current, accurate module
-map (supersedes the phase-by-phase repository layout in `CLAUDE.md`).
-* [`docs/bigtiny-backend.md`](docs/bigtiny-backend.md) — the BigTiny
-integration contract from Kitty's side.
-* [`docs/PLUGINS.md`](docs/PLUGINS.md) / [`plugins/README.md`](plugins/README.md)
-— the internal-plugin freeze pipeline and how to add a new one.
-* [`docs/RELEASE.md`](docs/RELEASE.md) — build/release checklist.
+`docs/RELEASE.md` has both lanes in full, including the LiteRT runtime files
+the Windows daemon needs bundled alongside it.
 
+## Documentation
+
+| Doc | What |
+|---|---|
+| [`CLAUDE.md`](CLAUDE.md) | Architectural rules and coding conventions — the spec |
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Current module map with dependency direction |
+| [`docs/PLUGINS.md`](docs/PLUGINS.md) | How bundled plugins are built and integrated |
+| [`docs/ANDROID.md`](docs/ANDROID.md) | The Android port: constraints, decisions, contracts |
+| [`docs/RELEASE.md`](docs/RELEASE.md) | Build and release checklist, both platforms |
+| [`docs/VERSIONS.md`](docs/VERSIONS.md) | Pinned versions and verified external contracts |
+| [`docs/BACKLOG.md`](docs/BACKLOG.md) | Known gaps and deferred work |
+| [`docs/bigtiny-backend.md`](docs/bigtiny-backend.md) | The daemon contract from Kitty's side |
+| [`src/themes/README.md`](src/themes/README.md) | The theming contract for custom CSS |

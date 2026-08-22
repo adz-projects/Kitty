@@ -13,9 +13,10 @@ Status: **PLAN — approved. Not yet implemented. Execution order in §10.**
   runs AP** — in-process inside the daemon, hash-space embeddings only.
 - This document is the spec an LLM/coder executes against. Each phase lists the
   concrete targets, files, config shape, and acceptance criteria.
-- `docs/ANDROID-PLAN.md` is the companion **execution** plan (toolchain
-  bootstrap, per-gate commands, verified environment facts). This file is the
-  *spec*; that file is the *order of operations*. Keep them in sync.
+- `docs/ANDROID-PLAN.md` was the companion **execution** plan (order of
+  operations, per-gate commands). It has been **deleted**: every phase in it
+  shipped, and its "current repo reality" preamble had gone stale enough to
+  mislead. Git history has it if the sequencing is ever worth revisiting.
 
 ### Finalization pass (2026-08-08)
 
@@ -37,8 +38,7 @@ changed:
 - **Phase 1, 2, 7, 8 acceptance criteria extended**; §11 reconciled with D1
   and given the two new risk classes.
 
-D1–D21 are unchanged and un-renumbered — existing references (including in
-`ANDROID-PLAN.md`) stay valid.
+D1–D21 are unchanged and un-renumbered — existing references stay valid.
 
 ### Execution status (2026-08-08)
 
@@ -106,8 +106,8 @@ D1–D21 are unchanged and un-renumbered — existing references (including in
 | D19 | **`flash_attn` auto-detected** at engine init; never a user toggle (read-only card diagnostic `"off"`/"on (<backend>)"). | §3.3 |
 | D20 | **`auto`/`-1` select backend**: `select_backend()` returns `Cuda|Vulkan|Cpu`; fit/badge/VRAM math uses the *selected* backend's VRAM bank. | §3.3 |
 | D21 | **Windows multi-window is preserved**: two (or more) hub windows may be open at once, each with its **own independent session and its own pinned model**. Android stays single-window. | §8.1, §4.2 |
-| D22 | **`aarch64-linux-android` is the only shipped v1 ABI** (no armeabi-v7a, no x86_64 — emulator testing is a dev convenience, not a release target). **minSdk 26, targetSdk 34.** **NDK pinned: `27.2.12479018` (r27c)**, SDK `platforms/android-34` + `build-tools/34.0.0`, JDK 17, installed and verified 2026-08-08. | §10 P1; `ANDROID-PLAN.md` P1a |
-| D23 | **Desktop-only `src-tauri` subsystems are `cfg`-gated, not ported.** Tray, global-shortcut hotkey, autostart, and `notify-rust` get `#[cfg(desktop)]`/`#[cfg(windows)]`. **`winreg` is in the plain `[dependencies]` block today and will break the very first Android build** — it must move under `[target.'cfg(windows)'.dependencies]`. No autostart equivalent ships on Android v1. | §2.5; `ANDROID-PLAN.md` P1a |
+| D22 | **`aarch64-linux-android` is the only shipped v1 ABI** (no armeabi-v7a, no x86_64 — emulator testing is a dev convenience, not a release target). **minSdk 26, targetSdk 34.** **NDK pinned: `27.2.12479018` (r27c)**, SDK `platforms/android-34` + `build-tools/34.0.0`, JDK 17, installed and verified 2026-08-08. | §10 P1 |
+| D23 | **Desktop-only `src-tauri` subsystems are `cfg`-gated, not ported.** Tray, global-shortcut hotkey, autostart, and `notify-rust` get `#[cfg(desktop)]`/`#[cfg(windows)]`. **`winreg` is in the plain `[dependencies]` block today and will break the very first Android build** — it must move under `[target.'cfg(windows)'.dependencies]`. No autostart equivalent ships on Android v1. | §2.5 |
 | D24 | ~~**Android secrets use the `keyring` crate's Android/Keystore backend**, not a hand-rolled store — its own Cargo feature plus JNI init wiring.~~ **Revised and closed 2026-08-11: there is no such backend.** keyring 3.6.3's feature list is `apple-native` / `linux-native` / `windows-native` and nothing else, so the premise of this decision was simply wrong — there was no feature to enable. The diagnosis was right, though, and worth keeping: with only `windows-native`, keyring hits its catch-all `pub use mock as default` on Android and compiles fine, so provider API keys appeared to save and vanished on relaunch with nothing failing loudly. **Actual fix:** `gen/android/.../SecretStore.kt` (AES-256-GCM under a non-exportable AndroidKeyStore key, sealed blobs in private SharedPreferences) behind `src/android/secrets.rs`, dispatched from `config::providers::keyring`. `keyring` is now confined to the non-Android target table so the mock cannot return. | §10 P7 |
 | D25 | **Android hardens the daemon's HTTP surface: `require_secret: true`, always.** Loopback is **not** process-private on Android — any app holding `INTERNET` can reach `127.0.0.1`. Also relax escalation-to-approval where the app sandbox *is* the security boundary. Both already flagged in code comments; neither had a decision until now. | §2.6, §10 P7 |
 
@@ -1135,9 +1135,10 @@ classloader either way). Rust side: `src-tauri/src/android/`.
   passes on code that does not build). `docs/RELEASE.md` split into Windows and
   Android sections with the full toolchain env. `CLAUDE.md`, `README.md` and
   `docs/ARCHITECTURE.md` rewritten off "Windows-only" and off Ollama;
-  `docs/VERSIONS.md`'s Ollama section and installer URL marked historical;
-  `docs/ADAPTIVE_PATHWAY.md` banner-superseded (it documents the retired Python
-  sidecar and its `AP_EMBED_OLLAMA_*` config).
+  `docs/VERSIONS.md`'s Ollama section marked historical (its installer-URL
+  section has since been deleted outright); `docs/ADAPTIVE_PATHWAY.md`
+  banner-superseded and later deleted along with the Python sidecar it
+  documented.
 
 Both former release blockers — D24's keyring mock and the missing download
 foreground service — were closed on the same day, in Phase 7 above. What is

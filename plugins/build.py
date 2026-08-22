@@ -71,6 +71,8 @@ BUILD_VENV_DIRNAME = ".build-venv"
 # `kitty-tools` (Rust), `kitty-web` (Rust), and `kitty-wasm` (Rust) now (the
 # Rust consolidation) — and deliberately absent from this dict, so
 # `python plugins/build.py` (no args) no longer builds or bundles them.
+# Their source trees have since been **deleted** outright; git history holds
+# them if a behavioral question ever needs settling.
 # `adaptive-pathway` (the HTTP sidecar) and `adaptive-pathway-mcp` (its stdio
 # MCP proxy) are retired the same way — the behavioral-memory engine now
 # runs in-process inside `bigtiny` (`plugins/adaptive-pathway_rust`, a path
@@ -105,11 +107,9 @@ PLUGINS: dict[str, dict[str, object]] = {
         "extras": [],
         "kind": "rust",
     },
-    # Backed by the pure-Rust rewrite (`plugins/bigtiny_rust/`), not the
-    # original Python daemon vendored at `plugins/bigtiny/` — that source
-    # tree stays in-tree, unbuilt, as the behavioral oracle the Rust port
-    # was verified against (same convention as `replacement-mcp` et al. per
-    # the module doc comment above). `exe` stays "bigtiny-daemon" so every
+    # Backed by the pure-Rust rewrite (`plugins/bigtiny_rust/`). The original
+    # Python daemon that preceded it has been deleted (git history holds it).
+    # `exe` stays "bigtiny-daemon" so every
     # bundling/lifecycle path that already looks for that filename
     # (`config::default_bigtiny_command`, `lifecycle::bigtiny_proc`) needs
     # no changes.

@@ -1,7 +1,7 @@
 # BigTiny backend
 
-Kitty is driven by **BigTiny** (the chat-first REST/SSE daemon, vendored
-in-tree at `plugins/bigtiny/`) — its only chat backend. The goosed/ACP
+Kitty is driven by **BigTiny** (the chat-first REST/SSE daemon, a pure-Rust
+crate in-tree at `plugins/bigtiny_rust/`) — its only chat backend. The goosed/ACP
 integration this app originally shipped with has been removed entirely; see
 `docs/ARCHITECTURE.md` for the current module map.
 
@@ -11,18 +11,21 @@ integration this app originally shipped with has been removed entirely; see
 control how the daemon is spawned:
 
 - **Normal installs**: `bigtiny_command` defaults to the bundled
-  `bigtiny-daemon.exe` (frozen via `plugins/build.py`, shipped next to
+  `bigtiny-daemon.exe` (built via `plugins/build.py`, shipped next to
   Kitty's own exe through Tauri's `externalBin`) with empty `bigtiny_args`.
   Nothing to configure — this is fully internalized and never surfaced to
   the user.
 - **Dev / source checkout**: if no bundled exe is present (e.g. running via
-  `cargo tauri dev`), the config falls back to `bigtiny_command: "python"`,
-  `bigtiny_args: ["-m", "bigtiny"]`, and `bigtiny_dir` pointing at
-  `plugins/bigtiny` (install its deps once with `pip install -e
-  plugins/bigtiny`). The daemon **must** be launched via `python -m bigtiny`
-  in this mode: that entry point installs the Windows Proactor event-loop
-  factory that stdio MCP servers need to spawn subprocesses (the frozen exe
-  doesn't need this — `bigtiny.server.app:loop_factory` handles it directly).
+  `cargo tauri dev`), `bigtiny_command` falls back to `cargo` and
+  `bigtiny_args` to a `run --quiet --manifest-path <repo>/plugins/
+  bigtiny_rust/Cargo.toml --bin bigtiny-daemon`. The manifest path is
+  resolved from this crate's own compile-time location, so it is correct
+  regardless of the working directory `cargo tauri dev` ran from. **No Python
+  and no separate install step** — the daemon is Rust and builds from source.
+
+  On Android neither applies: the daemon is linked in and hosted in-process
+  (`lifecycle/bigtiny_embedded.rs`), because Android 10+ refuses to `exec()`
+  a binary in app-writable storage.
 
 ## What the Rust layer does (src-tauri/src/bigtiny/)
 
@@ -31,7 +34,7 @@ control how the daemon is spawned:
   `X-API-Key`. Also passes `BIGTINY_DATA_DIR` (`config::bigtiny_data_dir()`)
   pointing at `%APPDATA%/Kitty/bigtiny/` — consolidates BigTiny's own db,
   directory-sandbox cache dir, and recipes dir there instead of its
-  standalone `~/.bigtiny` default (see `bigtiny/paths.py`); a one-time
+  standalone `~/.bigtiny` default; a one-time
   migration moves an existing `~/.bigtiny` over the first time this runs
   post-upgrade. Readiness and the 5s health loop probe `GET /api/health`
   (open without auth by design). A pidfile-based stale-orphan kill (mirrors
