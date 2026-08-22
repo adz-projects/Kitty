@@ -78,14 +78,26 @@ has been deleted. Full detail in
   involvement is keeping the registration's command path pointed at the
   current install's bundled exe and its `enabled` flag in sync with Settings
   (`bigtiny::mcp::ensure_builtin_servers`, `commands/mcp_servers.rs`). Hosts
-  22 context-optimized local-machine tools in one process — shell,
-  workspace, 5 file, 3 Word, 2 Excel, 2 PDF, 4 scratchpad, 4 cache (always
-  on; this is the retired `replacement-mcp`'s full surface plus
-  `kitty-docs-web`'s PDF/Excel tools, now hand-rolled in Rust on `lopdf`/
-  `calamine` — **on by default**, since they're what makes the small local
-  models Kitty targets usable as agents at all), plus 3 accessible
+  24 context-optimized local-machine tools in one process — shell,
+  workspace, 5 file, 3 Word, 2 Excel, 2 PDF, 4 scratchpad, 4 cache, 2
+  document-handle (always on; this is the retired `replacement-mcp`'s full
+  surface plus `kitty-docs-web`'s PDF/Excel tools, now hand-rolled in Rust on
+  `lopdf`/`calamine` — **on by default**, since they're what makes the small
+  local models Kitty targets usable as agents at all), plus 3 accessible
   table/chart/Mermaid visualization tools, gated by their own Settings
-  toggle (an env var on this one process, not a separate server). No network
+  toggle (an env var on this one process, not a separate server).
+
+  Every paged reader (`lean_file_read`, `lean_word_read_text`,
+  `lean_pdf_read_text`) writes through an **extract-once cache**
+  (`plugins/kitty-tools/src/doc_store.rs`) keyed by the file's
+  `(path, len, mtime)`, and returns a `document_id` alongside its window.
+  The two document-handle tools — `lean_doc_read_chunk` and `lean_doc_search`
+  — read the rest of that cached extraction without re-parsing the source.
+  Before this, each paged call redid the whole extraction and threw away
+  everything outside its window, so reading a 600-page PDF end to end parsed
+  that PDF once per chunk. The id is derived from the fingerprint rather than
+  random, so an unchanged file keeps its handle and an edited one can never
+  be served a stale extraction — there is nothing to invalidate. No network
   calls of its own — web search lives in `kitty-web`. Toggled in Settings → MCP
   Servers. Installs predating the `replacement-mcp` default flip are flipped
   on once by `config::migrate_replacement_mcp_enabled` /

@@ -33,12 +33,19 @@ per-launch secret that never reaches the webview.
 The agent gets its capabilities from three bundled MCP servers, all Rust, all
 on by default and requiring no credentials.
 
-**`kitty-tools` — 22 local-machine tools.** Shell execution; file
+**`kitty-tools` — 24 local-machine tools.** Shell execution; file
 read/write/append/replace with pagination; workspace analysis; Word document
 read/outline/**write** (including hyperlinks); Excel inspect/read; PDF
 text/outline; a persistent scratchpad; and a content cache. Plus 3
 WCAG-oriented visualization tools (accessible table, chart, Mermaid diagram)
 behind their own Settings toggle.
+
+Long documents are extracted **once**, not once per page. Every paged reader
+caches its full extraction keyed by the file's path, size and mtime, and hands
+back a `document_id`; `lean_doc_read_chunk` and `lean_doc_search` then walk or
+search the whole document from that cache without re-parsing it. The id is
+derived from the fingerprint, so an unchanged file keeps its handle and an
+edited one gets a fresh one automatically.
 
 **`kitty-web` — 3 tools.** Web scrape, plus web search and its paged
 read-back. DuckDuckGo always works; Brave is preferred per-query when an API

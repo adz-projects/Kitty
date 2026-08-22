@@ -17,7 +17,7 @@ still a Python script only because it owns the target-triple naming convention
 |---|---|---|
 | `bigtiny_rust` | HTTP+SSE daemon — Kitty's chat backend, and the host for everything below | Kitty: `lifecycle/bigtiny_proc.rs` (desktop) or `lifecycle/bigtiny_embedded.rs` (Android) |
 | `adaptive-pathway_rust` | **Not a binary.** A path dependency statically linked into the daemon; its `record`/`forget` tools are registered through `bigtiny_rust::mcp::builtin` | — (linked, not spawned) |
-| `kitty-tools` | MCP server, 22 tools: shell, workspace, 5 file, 3 Word, 2 Excel, 2 PDF, 4 scratchpad, 4 cache — plus 3 visualization tools (accessible table/chart/Mermaid) gated by `KITTY_VIZ_ENABLED`. No network access | BigTiny, registered via `src-tauri/src/bigtiny/mcp.rs` |
+| `kitty-tools` | MCP server, 24 tools: shell, workspace, 5 file, 3 Word, 2 Excel, 2 PDF, 4 scratchpad, 4 cache, 2 document-handle (`lean_doc_read_chunk`/`lean_doc_search`, reading the extract-once cache in `src/doc_store.rs`) — plus 3 visualization tools (accessible table/chart/Mermaid) gated by `KITTY_VIZ_ENABLED`. No network access | BigTiny, registered via `src-tauri/src/bigtiny/mcp.rs` |
 | `kitty-web` | MCP server, 3 tools: `lean_web_search`, `lean_web_search_read_chunk`, `lean_web_scrape`. DuckDuckGo always; Brave preferred per-query when `BRAVE_API_KEY` is set | BigTiny, same registration path |
 | `kitty-wasm` | MCP server, 4 tools: `execute_math_python`, `wasm_python_run`, `wasm_run_module`, `wasm_guest_status`. wasmtime + WASI, no network, no filesystem beyond explicit mounts, enforced time/memory ceilings | BigTiny, same registration path |
 

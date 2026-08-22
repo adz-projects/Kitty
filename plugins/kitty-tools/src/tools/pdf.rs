@@ -12,6 +12,7 @@ use std::path::Path;
 
 use serde_json::{json, Value};
 
+use crate::doc_store::{self, Extraction};
 use crate::envelope::{error_response, success_response};
 use crate::paths::{path_within_home, resolve};
 use crate::query_filter::filter_by_query;
@@ -30,6 +31,106 @@ const PDF_MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
 fn open(path: &Path) -> Result<lopdf::Document, lopdf::Error> {
     lopdf::Document::load(path)
+}
+
+/// Why an extraction couldn't be produced. `Stat` exists only to satisfy
+/// `doc_store::ensure`'s `E: From<String>` bound — that is the one failure the
+/// store itself can raise before the extractor runs.
+enum PdfError {
+    Corrupt(String),
+    Encrypted,
+    Stat(String),
+}
+
+impl From<String> for PdfError {
+    fn from(detail: String) -> Self {
+        PdfError::Stat(detail)
+    }
+}
+
+impl PdfError {
+    fn into_response(self, resolved: &Path) -> String {
+        let detail = Some(resolved.to_string_lossy().into_owned());
+        let detail = detail.as_deref();
+        match self {
+            PdfError::Corrupt(e) => error_response(
+                "PDF_CORRUPT",
+                &format!("Cannot parse PDF: {e}"),
+                detail,
+                None,
+            ),
+            PdfError::Encrypted => {
+                error_response("PDF_ENCRYPTED", "PDF is password protected", detail, None)
+            }
+            PdfError::Stat(e) => error_response(
+                "PDF_READ_ERROR",
+                &format!("Cannot read PDF: {e}"),
+                detail,
+                None,
+            ),
+        }
+    }
+}
+
+/// Parse the PDF **once** and extract every page, plus its table of contents.
+///
+/// This is what `doc_store::ensure` runs on a cache miss. It deliberately
+/// ignores the caller's page range: the old code extracted only the requested
+/// window and reparsed the file for the next one, so reading a long PDF end to
+/// end reparsed it once per chunk. Bounded by `doc_store::MAX_TOTAL_CHARS`
+/// rather than by `PDF_MAX_PAGES` — the latter is now purely a cap on how much
+/// one *response* carries, not on how much is ever read.
+fn extract_pages(resolved: &Path) -> Result<Extraction, PdfError> {
+    let doc = open(resolved).map_err(|e| PdfError::Corrupt(e.to_string()))?;
+    if doc.is_encrypted() {
+        return Err(PdfError::Encrypted);
+    }
+
+    // lopdf's get_toc already flattens the outline tree into
+    // { level, title, page } — the same triple PyMuPDF's get_toc produced.
+    let outline: Vec<Value> = match doc.get_toc() {
+        Ok(toc) => toc
+            .toc
+            .into_iter()
+            .map(|o| json!({ "level": o.level, "title": o.title, "page": o.page }))
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+
+    let total_pages = doc.get_pages().len();
+    let mut units = Vec::with_capacity(total_pages);
+    let mut content_capped = false;
+    let mut chars = 0usize;
+    for pno in 1..=total_pages as u32 {
+        let text = doc.extract_text(&[pno]).unwrap_or_default();
+        let mut page_text = text.trim().to_string();
+        if page_text.chars().count() > PDF_MAX_PAGE_CHARS {
+            content_capped = true;
+            page_text = truncate_chars(&page_text, PDF_MAX_PAGE_CHARS);
+        }
+        let unit = format!("--- Page {pno} ---\n{page_text}");
+        chars = chars.saturating_add(unit.chars().count());
+        units.push(unit);
+        if chars >= doc_store::MAX_TOTAL_CHARS {
+            break;
+        }
+    }
+
+    Ok(Extraction {
+        units,
+        outline,
+        total_units: total_pages,
+        content_capped,
+    })
+}
+
+/// Shared entry: every PDF tool goes through the cache, so whichever one the
+/// model calls first pays the single parse and the rest are slices.
+fn cached_pdf(resolved: &Path) -> Result<doc_store::StoredDoc, String> {
+    match doc_store::ensure(resolved, doc_store::UNIT_PAGE, || extract_pages(resolved)) {
+        Ok((doc, _persisted)) => Ok(doc),
+        Err(e) => Err(e.into_response(resolved)),
+    }
 }
 
 /// True when the file's metadata size is past `PDF_MAX_FILE_BYTES` — the
@@ -119,50 +220,30 @@ pub fn pdf_read_text(
         }
     }
 
-    let doc = match open(&resolved) {
+    // One parse, cached — see `extract_pages`. Every branch below slices the
+    // cached pages rather than touching the PDF again.
+    let doc = match cached_pdf(&resolved) {
         Ok(d) => d,
-        Err(e) => {
-            return error_response(
-                "PDF_CORRUPT",
-                &format!("Cannot parse PDF: {e}"),
-                Some(&resolved.to_string_lossy()),
-                None,
-            );
-        }
+        Err(envelope) => return envelope,
     };
 
-    if doc.is_encrypted() {
-        return error_response(
-            "PDF_ENCRYPTED",
-            "PDF is password protected",
-            Some(&resolved.to_string_lossy()),
-            None,
-        );
-    }
-
-    let total_pages = doc.get_pages().len() as u32;
-    // Both the caller's `end_page` and the hard cap bound the extraction; the
-    // range is clamped to at most PDF_MAX_PAGES pages.
+    let total_pages = doc.total_units as u32;
+    let held_pages = doc.stored_units() as u32;
+    // Both the caller's `end_page` and the hard cap bound the *response*; the
+    // extraction above already covers the whole document.
     let end_requested = end_page
-        .map(|e| e.min(total_pages))
-        .unwrap_or(total_pages)
+        .map(|e| e.min(held_pages))
+        .unwrap_or(held_pages)
         .max(s_page.saturating_sub(1));
-    let capped_end = s_page.saturating_add(PDF_MAX_PAGES - 1).min(total_pages);
+    let capped_end = s_page.saturating_add(PDF_MAX_PAGES - 1).min(held_pages);
     let e_page = end_requested.min(capped_end);
-    let mut truncated = end_requested > e_page;
+    let truncated = end_requested > e_page || doc.extraction_truncated;
 
-    let mut extracted_pages: Vec<String> = Vec::new();
-    if s_page <= e_page {
-        for pno in s_page..=e_page {
-            let text = doc.extract_text(&[pno]).unwrap_or_default();
-            let mut page_text = text.trim().to_string();
-            if page_text.chars().count() > PDF_MAX_PAGE_CHARS {
-                truncated = true;
-                page_text = truncate_chars(&page_text, PDF_MAX_PAGE_CHARS);
-            }
-            extracted_pages.push(format!("--- Page {pno} ---\n{page_text}"));
-        }
-    }
+    let extracted_pages: Vec<String> = if s_page <= e_page {
+        doc.units[(s_page - 1) as usize..e_page as usize].to_vec()
+    } else {
+        Vec::new()
+    };
 
     if let Some(q) = query.filter(|q| !q.trim().is_empty()) {
         let result = filter_by_query(&extracted_pages, Some(q), 50, offset);
@@ -170,6 +251,7 @@ pub fn pdf_read_text(
             .no_match
             .then(|| format!("No direct matches for query '{q}'. Showing top section."));
         let mut meta = serde_json::Map::new();
+        meta.insert("document_id".into(), json!(doc.document_id));
         meta.insert("start_page".into(), json!(s_page));
         meta.insert("end_page".into(), json!(e_page));
         meta.insert("filtered_by_query".into(), json!(q));
@@ -187,12 +269,39 @@ pub fn pdf_read_text(
         );
     }
 
-    let message = truncated.then(|| format!("Output truncated: limited to {PDF_MAX_PAGES} pages and {PDF_MAX_PAGE_CHARS} characters per page."));
+    let has_more = e_page < held_pages;
+    // The handle is the point: say plainly that the rest of the document is
+    // one `lean_doc_read_chunk` away rather than leaving the model to guess
+    // that re-calling with a new page range is cheap now.
+    let message = if doc.extraction_truncated {
+        Some(format!(
+            "Document is too large to extract in full: pages 1-{held_pages} of {total_pages} are \
+             available. Read the rest with lean_doc_read_chunk using document_id, or narrow the \
+             page range."
+        ))
+    } else if has_more {
+        Some(format!(
+            "Showing pages {s_page}-{e_page} of {total_pages}. The whole document is already \
+             extracted and cached — read on with lean_doc_read_chunk (document_id, offset \
+             {e_page}) or search it with lean_doc_search."
+        ))
+    } else {
+        None
+    };
     success_response(
         json!(extracted_pages),
         message.as_deref(),
         truncated,
-        Some(json!({ "start_page": s_page, "end_page": e_page, "total_pages": total_pages })),
+        Some(json!({
+            "document_id": doc.document_id,
+            "unit": doc.unit,
+            "start_page": s_page,
+            "end_page": e_page,
+            "total_pages": total_pages,
+            "pages_available": held_pages,
+            "has_more": has_more,
+            "outline": doc.outline,
+        })),
     )
 }
 
@@ -213,39 +322,25 @@ pub fn pdf_read_outline(path: &str) -> String {
         return too_large(&resolved);
     }
 
-    let doc = match open(&resolved) {
+    // Same cache as `pdf_read_text`: the outline is extracted alongside the
+    // pages, so whichever tool the model reaches for first pays the one parse
+    // and the other is free. Returning the `document_id` here too means an
+    // outline-first read loop can go straight to `lean_doc_read_chunk`.
+    let doc = match cached_pdf(&resolved) {
         Ok(d) => d,
-        Err(e) => {
-            return error_response(
-                "PDF_CORRUPT",
-                &format!("Cannot parse PDF: {e}"),
-                Some(&resolved.to_string_lossy()),
-                None,
-            );
-        }
+        Err(envelope) => return envelope,
     };
 
-    if doc.is_encrypted() {
-        return error_response(
-            "PDF_ENCRYPTED",
-            "PDF is password protected",
-            Some(&resolved.to_string_lossy()),
-            None,
-        );
-    }
-
-    // lopdf's get_toc already flattens the outline tree into
-    // { level, title, page } — the same triple PyMuPDF's get_toc produced.
-    let outline: Vec<Value> = match doc.get_toc() {
-        Ok(toc) => toc
-            .toc
-            .into_iter()
-            .map(|o| json!({ "level": o.level, "title": o.title, "page": o.page }))
-            .collect(),
-        Err(_) => Vec::new(),
-    };
-
-    success_response(json!(outline), None, false, None)
+    success_response(
+        json!(doc.outline),
+        None,
+        false,
+        Some(json!({
+            "document_id": doc.document_id,
+            "unit": doc.unit,
+            "total_pages": doc.total_units,
+        })),
+    )
 }
 
 #[cfg(test)]

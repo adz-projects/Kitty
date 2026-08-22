@@ -10,14 +10,18 @@
 
 use kitty_tools::server::KittyToolsServer;
 
-/// All 22 always-on tools this server exposes, sorted (**21 on Android**,
+/// All 24 always-on tools this server exposes, sorted (**23 on Android**,
 /// where `lean_shell` is compiled out), plus 4 more
 /// (`generate_accessible_table`/`generate_accessible_svg`/
 /// `generate_accessible_chart`/`generate_accessible_mermaid`) when
 /// `KITTY_VIZ_ENABLED=1`. `lean_word_*`
 /// and the Excel/PDF tools (`lean_excel_*`/`lean_pdf_*`) from the retired
 /// `kitty-docs-web`, plus shell, workspace, 5 file tools, 4 cache tools, 4
-/// scratchpad tools.
+/// scratchpad tools, and the 2 document-handle tools
+/// (`lean_doc_read_chunk`/`lean_doc_search`) that read from the extract-once
+/// cache every paged reader now writes into (`src/doc_store.rs`). Those two
+/// are new names, so they start cold in adaptive-pathway's bandit — the same
+/// accepted cost as the retirements noted above, not a regression.
 ///
 /// Web search (`brave_mcp_search`, formerly gated here on `BRAVE_API_KEY`)
 /// moved to the Rust `kitty-web` process as the merged, count-tiered
@@ -38,6 +42,8 @@ const ALWAYS_ON_TOOLS: &[&str] = &[
     "lean_cache_delete",
     "lean_cache_list",
     "lean_cache_view",
+    "lean_doc_read_chunk",
+    "lean_doc_search",
     "lean_excel_inspect",
     "lean_excel_read_rows",
     "lean_file_append",

@@ -14,6 +14,18 @@ pub enum DocxError {
     Corrupt(String),
 }
 
+/// Satisfies `doc_store::ensure`'s `E: From<String>` bound. The only failure
+/// the store itself raises before the extractor runs is being unable to stat
+/// the file, which for a `.docx` read is indistinguishable from it not being
+/// there — so it lands on `NotFound` and the caller's existing
+/// `DOCX_NOT_FOUND` branch, rather than inventing a second error code for a
+/// case the user cannot tell apart.
+impl From<String> for DocxError {
+    fn from(_detail: String) -> Self {
+        DocxError::NotFound
+    }
+}
+
 /// Per-part decompressed-size cap when reading a `.docx` archive — a zip
 /// bomb (a tiny compressed entry that expands to gigabytes) must bail with a
 /// corrupt-DOCUMENT error instead of exhausting process memory.

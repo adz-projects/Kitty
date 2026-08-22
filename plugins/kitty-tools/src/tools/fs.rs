@@ -1,6 +1,7 @@
 //! `lean_file_read`/`write`/`append`/`replace_str`/`replace_lines` — Rust
 //! port of `lean_mcp.py`'s file tools.
 
+use crate::doc_store::{self, Extraction};
 use crate::envelope::{error_response, success_response};
 use crate::paths::path_within_home;
 use crate::paths::resolve;
@@ -59,8 +60,21 @@ pub fn file_read(
         );
     }
 
-    let text = match std::fs::read_to_string(&resolved) {
-        Ok(t) => t,
+    // Read and split once, cached by (path, len, mtime) — see `doc_store`.
+    // A plain text file is cheap to re-read, so the win here is not the I/O:
+    // it is that a text file gets a `document_id` on the same terms as a PDF
+    // or a .docx, so one read loop (`lean_doc_read_chunk`/`lean_doc_search`)
+    // works across every document kind instead of three per-kind paginations.
+    let doc = match doc_store::ensure(&resolved, doc_store::UNIT_LINE, || {
+        let text = std::fs::read_to_string(&resolved).map_err(|e| e.to_string())?;
+        let numbered: Vec<String> = py_splitlines(&text)
+            .iter()
+            .enumerate()
+            .map(|(idx, l)| format!("{}: {}", idx + 1, l))
+            .collect();
+        Ok::<_, String>(Extraction::new(numbered, Vec::new()))
+    }) {
+        Ok((doc, _persisted)) => doc,
         Err(e) => {
             return error_response(
                 "FILE_READ_ERROR",
@@ -70,16 +84,11 @@ pub fn file_read(
             )
         }
     };
-    let lines = py_splitlines(&text);
-    let total_lines = lines.len();
+    let lines = &doc.units;
+    let total_lines = doc.total_units;
 
     if let Some(q) = query.filter(|q| !q.trim().is_empty()) {
-        let numbered: Vec<String> = lines
-            .iter()
-            .enumerate()
-            .map(|(idx, l)| format!("{}: {}", idx + 1, l))
-            .collect();
-        let result = filter_by_query(&numbered, Some(q), 50, 0);
+        let result = filter_by_query(lines, Some(q), 50, 0);
         let message = result
             .no_match
             .then(|| format!("No direct matches for query '{q}'. Showing top section."));
@@ -89,6 +98,7 @@ pub fn file_read(
         // both to conclude the range was honoured and the file simply had no
         // matches outside it.
         let mut meta = serde_json::Map::new();
+        meta.insert("document_id".into(), json!(doc.document_id));
         meta.insert("total_lines".into(), json!(total_lines));
         meta.insert("filtered_by_query".into(), json!(q));
         if start_line.is_some() || end_line.is_some() {
@@ -117,22 +127,28 @@ pub fn file_read(
         .unwrap_or_else(|| start_line.saturating_add(FILE_PAGE_SIZE - 1));
     let actual_end = window_end.min(total_lines);
 
-    let page: Vec<String> = if start_line <= actual_end && start_line <= total_lines {
-        lines[start_line - 1..actual_end]
-            .iter()
-            .enumerate()
-            .map(|(i, l)| format!("{}: {}", start_line + i, l))
-            .collect()
+    // Lines are stored already numbered, so the window is a plain slice.
+    let page: &[String] = if start_line <= actual_end && start_line <= total_lines {
+        &lines[start_line - 1..actual_end]
     } else {
-        Vec::new()
+        &[]
     };
     let has_more = actual_end < total_lines;
 
+    let message = has_more.then(|| {
+        format!(
+            "Showing lines {start_line}-{actual_end} of {total_lines}. The whole file is already \
+             read and cached — continue with lean_doc_read_chunk (document_id, offset \
+             {actual_end}) or search it with lean_doc_search."
+        )
+    });
     success_response(
         json!(page.join("\n")),
-        None,
+        message.as_deref(),
         has_more,
         Some(json!({
+            "document_id": doc.document_id,
+            "unit": doc.unit,
             "start_line": start_line,
             "end_line": actual_end,
             "total_lines": total_lines,

@@ -8,6 +8,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::doc_store::{self, Extraction};
 use crate::docx;
 use crate::docx::write::WriteMode;
 use crate::envelope::{error_response, success_response};
@@ -48,6 +49,28 @@ pub struct WordReadTextRequest {
     pub offset: Option<u32>,
     /// Max paragraphs to return when no query is given (default 200).
     pub limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DocReadChunkRequest {
+    /// A `document_id` from a previous read (`lean_file_read`,
+    /// `lean_word_read_text`, `lean_pdf_read_text`, `lean_pdf_read_outline`).
+    pub document_id: String,
+    /// Zero-based unit index to start from. Units are pages, paragraphs or
+    /// lines depending on the source — the response's `unit` says which.
+    pub offset: Option<u32>,
+    /// Max units to return (default 200).
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DocSearchRequest {
+    /// A `document_id` from a previous read.
+    pub document_id: String,
+    /// Keywords to find within the cached document.
+    pub query: String,
+    /// Zero-based match index to continue from — see `metadata.next_offset`.
+    pub offset: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -537,6 +560,38 @@ fn guarded(f: impl FnOnce() -> String) -> String {
     }
 }
 
+/// One place to turn a failed `document_id` lookup into an envelope, so both
+/// chunk tools answer a stale handle identically.
+///
+/// A pruned record is the expected failure (the store keeps the newest 20), so
+/// the hint says how to recover rather than treating it as a caller error:
+/// re-read by path, which re-extracts and issues a fresh id.
+fn doc_load_error(document_id: &str, err: doc_store::LoadError) -> String {
+    match err {
+        doc_store::LoadError::Malformed => error_response(
+            "DOCUMENT_ID_NOT_FOUND",
+            "Invalid document_id.",
+            None,
+            Some("Use a document_id exactly as returned by a previous read."),
+        ),
+        doc_store::LoadError::NotFound => error_response(
+            "DOCUMENT_ID_NOT_FOUND",
+            &format!("No cached document for document_id '{document_id}'."),
+            None,
+            Some(
+                "This document_id may have expired (only the 20 most recent documents are kept). \
+                 Read the file again by path to get a fresh one.",
+            ),
+        ),
+        doc_store::LoadError::Unreadable(detail) => error_response(
+            "DOCUMENT_READ_ERROR",
+            &format!("Cannot read the cached document: {detail}"),
+            None,
+            Some("Read the file again by path to re-extract it."),
+        ),
+    }
+}
+
 #[tool_router(router = core_tool_router)]
 impl KittyToolsServer {
     #[tool(
@@ -549,8 +604,25 @@ impl KittyToolsServer {
             if let Some(err) = outside_home(&resolved) {
                 return err;
             }
-            let paragraphs = match docx::read_paragraphs(&resolved) {
-                Ok(p) => p,
+            // Unzip and XML-parse once, cached by (path, len, mtime). This
+            // used to reparse the whole .docx on every paged call and then
+            // discard everything outside the window — see `doc_store`.
+            let doc = match doc_store::ensure(&resolved, doc_store::UNIT_PARAGRAPH, || {
+                let paragraphs = docx::read_paragraphs(&resolved)?;
+                // Headings double as the outline, and they are already in
+                // hand here, so it costs nothing to carry them.
+                let outline: Vec<serde_json::Value> = paragraphs
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(idx, p)| {
+                        p.heading_level
+                            .map(|level| json!({ "level": level, "title": p.text, "offset": idx }))
+                    })
+                    .collect();
+                let texts: Vec<String> = paragraphs.into_iter().map(|p| p.text).collect();
+                Ok::<_, docx::DocxError>(Extraction::new(texts, outline))
+            }) {
+                Ok((doc, _persisted)) => doc,
                 Err(docx::DocxError::NotFound) => {
                     return error_response(
                         "DOCX_NOT_FOUND",
@@ -568,16 +640,17 @@ impl KittyToolsServer {
                     );
                 }
             };
-            let texts: Vec<String> = paragraphs.iter().map(|p| p.text.clone()).collect();
+            let texts = &doc.units;
             let offset = req.offset.unwrap_or(0) as usize;
 
             if let Some(query) = req.query.as_deref().filter(|q| !q.trim().is_empty()) {
-                let result = filter_by_query(&texts, Some(query), 50, offset);
+                let result = filter_by_query(texts, Some(query), 50, offset);
                 let message = result.no_match.then(|| {
                     format!("No direct matches for query '{query}'. Showing top section.")
                 });
                 let mut metadata = json!({
                     "read_method": "xml_scan",
+                    "document_id": doc.document_id,
                     "filtered_by_query": query,
                     "total_matches": result.total_matches,
                     "offset": offset,
@@ -595,18 +668,112 @@ impl KittyToolsServer {
 
             let limit = req.limit.unwrap_or(DEFAULT_PAGE_SIZE) as usize;
             let total = texts.len();
-            let page: Vec<String> = texts.iter().skip(offset).take(limit).cloned().collect();
-            let has_more = offset + page.len() < total;
+            let (page, has_more) = doc_store::window(texts, offset, limit);
             let mut metadata = json!({
                 "read_method": "xml_scan",
+                "document_id": doc.document_id,
+                "unit": doc.unit,
                 "offset": offset,
                 "total_paragraphs": total,
+                "has_more": has_more,
+                "outline": doc.outline,
+            });
+            let message = if has_more {
+                metadata["next_offset"] = json!(offset + page.len());
+                Some(format!(
+                    "Showing paragraphs {}-{} of {total}. The whole document is already \
+                     extracted and cached — continue with lean_doc_read_chunk (document_id, \
+                     offset {}) or search it with lean_doc_search.",
+                    offset,
+                    offset + page.len(),
+                    offset + page.len()
+                ))
+            } else {
+                None
+            };
+            success_response(json!(page), message.as_deref(), has_more, Some(metadata))
+        })
+    }
+
+    #[tool(
+        name = "lean_doc_read_chunk",
+        description = "Reads a window of an already-extracted document by its document_id, with no re-parsing. Use the document_id returned by lean_file_read, lean_word_read_text, lean_pdf_read_text or lean_pdf_read_outline to walk a long document instead of re-reading it by path."
+    )]
+    pub fn doc_read_chunk(&self, Parameters(req): Parameters<DocReadChunkRequest>) -> String {
+        guarded(move || {
+            let doc = match doc_store::load(&req.document_id) {
+                Ok(d) => d,
+                Err(e) => return doc_load_error(&req.document_id, e),
+            };
+            let offset = req.offset.unwrap_or(0) as usize;
+            let limit = req.limit.unwrap_or(DEFAULT_PAGE_SIZE) as usize;
+            let (page, has_more) = doc_store::window(&doc.units, offset, limit);
+
+            let mut metadata = json!({
+                "document_id": doc.document_id,
+                "source_path": doc.source_path,
+                "unit": doc.unit,
+                "offset": offset,
+                "total_units": doc.total_units,
+                "units_available": doc.stored_units(),
                 "has_more": has_more,
             });
             if has_more {
                 metadata["next_offset"] = json!(offset + page.len());
             }
-            success_response(json!(page), None, has_more, Some(metadata))
+            success_response(
+                json!(page),
+                None,
+                has_more || doc.extraction_truncated,
+                Some(metadata),
+            )
+        })
+    }
+
+    #[tool(
+        name = "lean_doc_search",
+        description = "Keyword-searches the full text of an already-extracted document by its document_id, across the whole document rather than one page of it. Returns matching units with their positions."
+    )]
+    pub fn doc_search(&self, Parameters(req): Parameters<DocSearchRequest>) -> String {
+        guarded(move || {
+            if req.query.trim().is_empty() {
+                return error_response(
+                    "DOC_QUERY_EMPTY",
+                    "query must not be empty",
+                    None,
+                    Some("Pass keywords to search for, or use lean_doc_read_chunk to read sequentially."),
+                );
+            }
+            let doc = match doc_store::load(&req.document_id) {
+                Ok(d) => d,
+                Err(e) => return doc_load_error(&req.document_id, e),
+            };
+            let offset = req.offset.unwrap_or(0) as usize;
+            let result = filter_by_query(&doc.units, Some(&req.query), 50, offset);
+            let message = result.no_match.then(|| {
+                format!(
+                    "No direct matches for query '{}'. Showing top section.",
+                    req.query
+                )
+            });
+            let mut metadata = json!({
+                "document_id": doc.document_id,
+                "source_path": doc.source_path,
+                "unit": doc.unit,
+                "filtered_by_query": req.query,
+                "total_matches": result.total_matches,
+                "total_units": doc.total_units,
+                "offset": offset,
+            });
+            if let Some(next) = result.next_offset {
+                metadata["next_offset"] = json!(next);
+            }
+            success_response(
+                json!(result.items),
+                message.as_deref(),
+                result.truncated || doc.extraction_truncated,
+                Some(metadata),
+            )
         })
     }
 

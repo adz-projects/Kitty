@@ -1,3 +1,4 @@
+pub mod doc_store;
 pub mod docx;
 pub mod envelope;
 pub mod paths;

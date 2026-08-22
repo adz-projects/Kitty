@@ -150,3 +150,68 @@ print("OK")
     assert!(v["metadata"]["end_page"].as_u64().unwrap() <= 100);
     assert!(v["metadata"]["total_pages"].as_u64().unwrap() == 105);
 }
+
+/// The point of the extract-once cache, on the exact case that motivated it:
+/// a PDF longer than one response can carry. The first call caps at
+/// `PDF_MAX_PAGES` as it always did, but the *whole* document is already
+/// extracted behind a `document_id`, so pages past the cap come back without
+/// the file being parsed a second time — and both PDF tools share the one
+/// extraction, so whichever the model reaches for first pays for it.
+#[test]
+fn a_long_pdf_is_parsed_once_and_read_past_the_page_cap_by_handle() {
+    use kitty_tools::server::{DocReadChunkRequest, KittyToolsServer};
+    use rmcp::handler::server::wrapper::Parameters;
+
+    let path = tmp_path("handle.pdf");
+    run_python(&format!(
+        r#"
+import fitz
+doc = fitz.open()
+for i in range(105):
+    page = doc.new_page()
+    page.insert_text((72, 72), f"Page number {{i}} apple")
+doc.set_toc([[1, "Only Chapter", 1]])
+doc.save(r"{}")
+doc.close()
+print("OK")
+"#,
+        path.display()
+    ));
+    let ps = path.to_string_lossy();
+    let server = KittyToolsServer::new();
+
+    let first = parse(&pdf_read_text(&ps, None, None, None, 0));
+    let id = first["metadata"]["document_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(first["data"].as_array().unwrap().len(), 100);
+    assert_eq!(first["metadata"]["pages_available"], 105);
+    // The outline rides along with the pages rather than needing its own parse.
+    assert_eq!(first["metadata"]["outline"][0]["title"], "Only Chapter");
+
+    // Same document, same handle — the outline tool reuses the extraction.
+    let outline = parse(&pdf_read_outline(&ps));
+    assert_eq!(
+        outline["metadata"]["document_id"], id,
+        "both PDF tools must share one extraction"
+    );
+
+    // Pages 101-105: unreachable in one response, one chunk call away.
+    let tail = parse(&server.doc_read_chunk(Parameters(DocReadChunkRequest {
+        document_id: id.clone(),
+        offset: Some(100),
+        limit: Some(200),
+    })));
+    assert_eq!(tail["status"], "success", "{tail}");
+    assert_eq!(tail["metadata"]["unit"], "page");
+    let pages = tail["data"].as_array().unwrap();
+    assert_eq!(pages.len(), 5, "the last five pages must be reachable");
+    assert!(pages[0].as_str().unwrap().contains("--- Page 101 ---"));
+    assert!(pages[4].as_str().unwrap().contains("--- Page 105 ---"));
+    assert_eq!(tail["metadata"]["has_more"], false);
+
+    // An unchanged file keeps its handle across reads.
+    let again = parse(&pdf_read_text(&ps, None, None, None, 0));
+    assert_eq!(again["metadata"]["document_id"], id);
+}
