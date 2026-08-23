@@ -14,16 +14,29 @@
 #
 # which must print 0x4000, not 0x1000.
 #
+# `-C strip=symbols` (all four targets below): a `pnpm tauri android build
+# --debug` uses cargo's `dev` profile, which embeds full DWARF debug info
+# directly in the ELF `.so` — unlike Windows, where debug info lives in a
+# separate `.pdb` and the binary itself stays small regardless of profile.
+# Unstripped, `libkitty_lib.so` alone ran >1 GB (the daemon + adaptive-pathway
+# + all bundled MCP servers, statically linked in for Android). `strip=symbols`
+# applies the same shrink cargo's `[profile.release] strip = true` (below)
+# already gives release builds, to debug builds too — a debug APK is for
+# sideload-testing, not `gdb`/`lldb` symbol resolution, so there's nothing lost
+# by dropping it there as well. Harmless to also apply on top of the release
+# profile's own `strip = true` for android release builds — same effect, just
+# asserted twice.
+#
 # Applied per-target so desktop builds are untouched.
 
 [target.aarch64-linux-android]
-rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384", "-C", "strip=symbols"]
 
 [target.armv7-linux-androideabi]
-rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384", "-C", "strip=symbols"]
 
 [target.x86_64-linux-android]
-rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384", "-C", "strip=symbols"]
 
 [target.i686-linux-android]
-rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384", "-C", "strip=symbols"]
