@@ -408,6 +408,37 @@ to conform to. This is a behavioral contract, not styling:
   - **`kitty-web` `lean_web_scrape` honors `output_format="text"`** by
     rendering the extracted Markdown to plain text (`scrape::markdown_to_text`),
     instead of silently ignoring the parameter.
+  - **Android attachments are `content://` URIs, not paths.** The document
+    picker (`ACTION_OPEN_DOCUMENT`, behind Tauri's dialog plugin) returns a
+    URI; nothing in Rust can open one, and its last path segment is the
+    storage provider's internal document id (`msf%3A1000000123`), not a
+    filename. Every downstream decision was therefore wrong on Android: the
+    image check tested a document id against a list of extensions,
+    `read_file_any` had nothing to open, and the model received a URI it
+    correctly reported having no tool for (observed verbatim in a reasoning
+    trace: *"I don't have a tool to resolve content:// URIs"*). Resolved
+    through the ContentResolver in `KittyPlugin.copyContentUri` — display name
+    from `OpenableColumns.DISPLAY_NAME`, bytes from `openInputStream` — behind
+    `android::attachments`, and driven by `commands::file::stage_attachments`.
+    `chatStore`'s `addDroppedPaths` stages **before** any name-based
+    classification, since the name is exactly what is wrong until it does.
+  - **`lean_web_scrape` downloads documents, not just PDFs.** The tool used to
+    special-case exactly one non-HTML type; everything else — a `.docx` linked
+    from a page, a raw `.json` API reply, a `.csv` export, a `text/plain`
+    README — was refused with `SCRAPE_UNSUPPORTED_CONTENT_TYPE` and a hint that
+    the tool reads "HTML pages only", which the model could do nothing with.
+    `scrape::download_kind` now classifies the response against an allowlist
+    (pdf, docx, xlsx/xlsm/xls, csv, tsv, txt, md, rst, json/jsonl/ndjson, xml,
+    yaml/yml, toml, ini, log, srt, vtt), saves it to the shared cache, and
+    returns `cached_path` + `file_type` + a hint naming the reader to call
+    (`lean_pdf_read_text`, `lean_word_read_text`, `lean_excel_inspect`, or
+    `lean_file_read`). Content-type wins over the URL extension when it maps;
+    the extension is the fallback for a generic/absent one, which is what the
+    old `looks_like_pdf` check did. HTML/XHTML is never a download, whatever
+    the URL's extension says. The allowlist stays an allowlist: archives,
+    executables and media are still refused, not because the download would
+    run anything, but because no bundled reader can open them, so saving one
+    would only leave junk on disk.
 - **Tool-name fallout**: `lean_excel_*`/`lean_pdf_*` are new names that seed
   adaptive-pathway's Thompson bandit cold; no existing name was renamed
   (adaptive-pathway hashes the literal tool-name string — see

@@ -1,3 +1,4 @@
+/// <reference types="vitest" />
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 import { resolve } from 'node:path';
@@ -60,6 +61,14 @@ export default defineConfig({
     // under plugins/*/.build-venv, rustdoc output under src-tauri/target) as
     // optimizer entries.
     entries: WINDOWS.map(entryHtml),
+  },
+  // Vitest needs a DOM for the component-level tests (`*.test.tsx`), notably
+  // the differential test that holds `MarkdownBlocks` to rendering exactly
+  // what a single whole-text `<ReactMarkdown>` renders. `happy-dom` was
+  // already a devDependency but nothing selected it, so every test until now
+  // ran in the default node environment.
+  test: {
+    environment: 'happy-dom',
   },
   build: {
     target: 'esnext',

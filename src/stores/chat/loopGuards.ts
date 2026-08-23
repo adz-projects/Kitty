@@ -96,6 +96,62 @@ export function splitLeakedThinkTag(text: string): { reasoning: string; text: st
   return { reasoning: leaked.trim(), text: rest };
 }
 
+/** Tools whose whole job is to mutate one file a piece at a time, where
+    calling the same tool against the same path over and over is what correct
+    use *looks like* — not a symptom of being stuck.
+
+    The guard below identifies a call by tool name plus its primary argument,
+    and for an editing tool the primary argument is the file path. So five
+    successive line edits to one 400-line file — a completely ordinary
+    refactor — collapse to five copies of one signature and trip the loop
+    threshold, and the fifth edit is auto-declined mid-task. The alternation
+    half is worse: read → edit → read → edit against one path is the canonical
+    edit loop (you re-read to see what your edit did), and it registers as a
+    perfect A→B→A→B flip sequence, so it trips even faster.
+
+    These tools are therefore handled specially in both halves — see
+    `toolCallSignature` and `trackToolAlternation`. They are *not* exempted
+    outright: a genuinely stuck model repeating the byte-identical edit still
+    trips the counter, because the signature keeps discriminating on the edit
+    payload. What stops being a "repeat" is a *different* edit to the same
+    file. */
+const ITERATIVE_EDIT_TOOLS = new Set([
+  'lean_file_replace_str',
+  'lean_file_replace_lines',
+  'lean_file_append',
+  'lean_file_write',
+]);
+
+/** A tool name as the guard sees it, with any MCP server namespace prefix
+    stripped (`server__lean_file_write` → `lean_file_write`). BigTiny sends the
+    bare name today (`bigtiny/stream.rs` sets `title` to `tool_name`), so this
+    is purely defensive against a future namespaced form silently turning the
+    exemption off. */
+function bareToolName(title: string): string {
+  const cut = title.lastIndexOf('__');
+  return cut === -1 ? title : title.slice(cut + 2);
+}
+
+/** True for a tool where repeated calls against one path are normal work. */
+export function isIterativeEditTool(title: string): boolean {
+  return ITERATIVE_EDIT_TOOLS.has(bareToolName(title));
+}
+
+/** The part of an edit call that says *which* edit this is — the payload, not
+    the target. Two `lean_file_replace_str` calls on one file replacing
+    different strings are two different pieces of work; two replacing the same
+    string are the model going in circles. Truncated because the whole point is
+    a cheap discriminator, not a faithful record, and `new_str` can be
+    kilobytes. */
+function editPayloadDiscriminator(rawInput: unknown): string {
+  const input = (rawInput ?? {}) as Record<string, unknown>;
+  const parts = ['old_str', 'new_str', 'start_line', 'end_line', 'content', 'text']
+    .map((k) => (k in input ? `${k}=${JSON.stringify(input[k])}` : ''))
+    .filter(Boolean)
+    .join('|');
+  return parts.slice(0, 512);
+}
+
 /** Best-effort identifying string for a tool call — tool name/kind plus its
     primary argument (URL, path, or command; falls back to the whole input).
     Not a full hash, just enough to tell "the same call, again" apart from "a
@@ -115,6 +171,13 @@ export function toolCallSignature(title: string, rawInput: unknown): string {
     (Array.isArray(input.paths) ? input.paths[0] : undefined) ??
     input.command;
   const target = typeof primary === 'string' ? primary : JSON.stringify(input);
+  // For an editing tool the path alone is far too coarse (see
+  // `ITERATIVE_EDIT_TOOLS`): every edit to one file would share a signature.
+  // Folding the edit payload in makes "the same call again" mean what the
+  // guard's comment always claimed it meant.
+  if (isIterativeEditTool(title)) {
+    return `${title}::${target}::${editPayloadDiscriminator(rawInput)}`;
+  }
   return `${title}::${target}`;
 }
 
@@ -156,6 +219,14 @@ export function trackToolAlternation(
   title: string,
   rawInput: unknown
 ): { flips: number; state: ToolAlternationState } {
+  // read → edit → read → edit against one file is the shape of correct
+  // iterative editing, not an alternation loop, and it is the single most
+  // common way real work tripped this guard. Return without touching
+  // `lastTitle` so the edit call is invisible to the detector entirely: the
+  // surrounding reads then compare against each other (same title, no flip)
+  // instead of flipping across the edit between them. Genuine repetition by
+  // an editing tool is still caught by the per-signature counter above.
+  if (isIterativeEditTool(title)) return { flips: 0, state };
   const target = toolCallTarget(rawInput);
   if (!target) return { flips: 0, state };
   const next = new Map(state);

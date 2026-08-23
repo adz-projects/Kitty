@@ -153,15 +153,27 @@ const INTERNAL_MARKERS = [
     line that follows it until a blank line or the next marker header, so the
     whole injected block disappears cleanly. A no-op when no internal marker
     is present. */
+/** One compiled regex per marker, built once at module load instead of on
+    every call. `stripInternalMarkers` runs at the single render chokepoint for
+    user turns, so this used to compile three regexes per render of any user
+    message containing a marker. `INTERNAL_MARKERS` is a module constant, so
+    there is nothing per-call to key them on. */
+const MARKER_RES = INTERNAL_MARKERS.map((marker) => {
+  const escaped = marker.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(^|\\n)[ \\t]*${escaped}[^\\n]*(?:\\n(?!\\n|\\s*\\[)[^\\n]*)*`, 'g');
+});
+
 export function stripInternalMarkers(text: string): string {
   // No marker present? Skip the whole regex sweep and, crucially, the
   // trailing whitespace-collapse — that trimming would otherwise eat
   // intentional leading line breaks from plain user messages on every replay.
   if (!INTERNAL_MARKERS.some((m) => text.includes(m))) return text;
   let out = text;
-  for (const marker of INTERNAL_MARKERS) {
-    const escaped = marker.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const re = new RegExp(`(^|\\n)[ \\t]*${escaped}[^\\n]*(?:\\n(?!\\n|\\s*\\[)[^\\n]*)*`, 'g');
+  for (const re of MARKER_RES) {
+    // These are `g` regexes and now shared across calls. `String.replace`
+    // resets `lastIndex` itself, but reset explicitly rather than depending
+    // on that from a module-level object.
+    re.lastIndex = 0;
     out = out.replace(re, '$1');
   }
   // Collapse the blank-line trail a removed block leaves behind, and trim.

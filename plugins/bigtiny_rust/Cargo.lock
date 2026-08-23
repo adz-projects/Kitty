@@ -322,6 +322,7 @@ dependencies = [
  "kitty-wasm",
  "kitty-web",
  "litert-lm-rust",
+ "memchr",
  "minijinja",
  "mockito",
  "once_cell",

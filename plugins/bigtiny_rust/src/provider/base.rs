@@ -161,7 +161,7 @@ pub trait Provider: Send + Sync {
     /// explicitly configured.
     async fn chat_completion(
         &self,
-        messages: Vec<Value>,
+        messages: &[Value],
         tools: Option<Vec<Value>>,
         sampling: SamplingParams,
         model: Option<String>,

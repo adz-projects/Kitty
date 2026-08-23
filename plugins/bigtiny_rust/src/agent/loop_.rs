@@ -4,6 +4,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
 use futures::{Stream, StreamExt};
+use once_cell::sync::Lazy;
 use serde_json::{json, Value};
 use sqlx::SqlitePool;
 use std::pin::Pin;
@@ -234,10 +235,10 @@ fn tools_to_openai_format(tools: &[ToolDefinition]) -> Vec<Value> {
 /// tool-execution flow and both budget-check early-exit branches) builds
 /// the identical shape, rather than some paths building it and others
 /// silently skipping it.
-fn build_assistant_message(content_chunks: &[String], turn_tool_calls: &[ToolCall]) -> Value {
+fn build_assistant_message(content: &str, turn_tool_calls: &[ToolCall]) -> Value {
     let mut assistant_msg = json!({
         "role": "assistant",
-        "content": content_chunks.join(""),
+        "content": content,
     });
     if !turn_tool_calls.is_empty() {
         let tool_call_values: Vec<Value> = turn_tool_calls
@@ -317,7 +318,7 @@ const MAX_TURN_CONTENT_CHARS: usize = 300_000;
 /// pre-stream `chat_completion` error so both ride one retry/failover budget).
 type TurnStreamResult = Result<
     (
-        Vec<String>,
+        String,
         Vec<ToolCall>,
         Option<String>,
         Option<Value>,
@@ -463,13 +464,12 @@ fn decide_turn_mode(step: i64, wrapup_issued: bool, wrapup_due: bool) -> TurnMod
 /// The empty-content guard is not theoretical: strip the calls from a reply
 /// that was *only* a tool call and the result is `{"content": ""}` with no
 /// `tool_calls`, which several backends reject outright.
-fn wrapup_persist_shape(content_chunks: &[String], turn_tool_calls: &[ToolCall]) -> Value {
-    let text = content_chunks.join("");
+fn wrapup_persist_shape(text: &str, turn_tool_calls: &[ToolCall]) -> Value {
     let content = if text.trim().is_empty() {
         if turn_tool_calls.is_empty() {
-            "[No reply: the turn ended at the context limit.]".to_string()
+            "[No reply: the turn ended at the context limit.]"
         } else {
-            "[The turn ended at the context limit before this step could run.]".to_string()
+            "[The turn ended at the context limit before this step could run.]"
         }
     } else {
         text
@@ -493,11 +493,15 @@ const HITL_APPROVAL_TIMEOUT: Duration = Duration::from_secs(3600);
 
 /// Strip prompt preamble wrappers from the first user message for title derivation.
 fn strip_prompt_wrappers(text: &str) -> String {
-    let re_system = regex::Regex::new(r"^<system>\n.*?\n</system>\n\n").unwrap();
-    let re_recipe = regex::Regex::new(r"^<recipe\b[^>]*>\n.*?\n</recipe>\n\n[^\n]*\n\n").unwrap();
+    // Compiled once rather than on every call: `summarizer_title` runs this
+    // per message across the title fold, and `Regex::new` is not cheap.
+    static RE_SYSTEM: Lazy<regex::Regex> =
+        Lazy::new(|| regex::Regex::new(r"^<system>\n.*?\n</system>\n\n").unwrap());
+    static RE_RECIPE: Lazy<regex::Regex> =
+        Lazy::new(|| regex::Regex::new(r"^<recipe\b[^>]*>\n.*?\n</recipe>\n\n[^\n]*\n\n").unwrap());
 
-    let text = re_recipe.replace(text, "").to_string();
-    re_system.replace(&text, "").to_string()
+    let text = RE_RECIPE.replace(text, "").to_string();
+    RE_SYSTEM.replace(&text, "").to_string()
 }
 
 /// Strip leading `--- <label> ---\n<content>` attachment/paste blocks (see
@@ -519,7 +523,8 @@ fn strip_prompt_wrappers(text: &str) -> String {
 /// `derive_title`'s existing empty check already leaves the session
 /// unnamed rather than write a blank/junk title.
 fn strip_leading_attachment_markers(text: &str) -> String {
-    let marker = regex::Regex::new(r"^--- .+ ---$").unwrap();
+    static MARKER: Lazy<regex::Regex> = Lazy::new(|| regex::Regex::new(r"^--- .+ ---$").unwrap());
+    let marker = &*MARKER;
     let mut rest = text;
     loop {
         let trimmed = rest.trim_start();
@@ -1127,6 +1132,15 @@ impl AgentLoop {
             .and_then(|v| v.as_i64())
             .unwrap_or(50)
             .clamp(1, MAX_STEPS_CEILING);
+        // Converted once per turn, not once per tool-loop iteration. The
+        // registered tool set cannot change mid-turn, but
+        // `tools_to_openai_format` clones every tool's `input_schema` and then
+        // walks it recursively (`sanitize_boolean_subschemas`) — with ~40 tools
+        // registered that was a full rebuild of the whole schema array on every
+        // step. Iterations still take an owned copy, since the wrap-up and
+        // step-nudge branches mutate their own view of it, but a `Vec<Value>`
+        // clone is far cheaper than redoing the conversion.
+        let tools_base: Vec<Value> = tools_to_openai_format(active_tools);
         // Resolved once per turn rather than per attempt: an unknown name
         // yields `None` (no preset), never someone else's settings.
         let preset = metadata
@@ -1251,16 +1265,16 @@ impl AgentLoop {
                     ..Default::default()
                 });
             }
-            let active_tools: &[ToolDefinition] = if provider_takes_tools {
-                active_tools
-            } else {
-                &[]
-            };
-
             // Progressive budget check
             let mut in_budget_check = false;
             let mut in_wrapup = false;
-            let mut tools_for_turn = tools_to_openai_format(active_tools);
+            // Same two outcomes as the `provider_takes_tools` slice shadowing
+            // this replaced: the full converted set, or nothing at all.
+            let mut tools_for_turn: Vec<Value> = if provider_takes_tools {
+                tools_base.clone()
+            } else {
+                Vec::new()
+            };
 
             // How much room is left before the provider's own context limit.
             //
@@ -1443,16 +1457,27 @@ impl AgentLoop {
                 // request only: it primes the model's reply to the new user
                 // message; later iterations continue from real tool results.
                 // It is deliberately NOT in `messages` (so it can never be
-                // persisted into the transcript) — appended to the outgoing
-                // clone here instead.
-                let outgoing = match &thought_seed_msg {
+                // persisted into the transcript) — appended to a copy here
+                // instead.
+                //
+                // That copy is now made *only* when there is a seed to append.
+                // This used to deep-clone the entire conversation on every
+                // attempt, inside the retry loop, inside the step loop — N
+                // steps x M attempts full copies of a structure that grows all
+                // turn, and with serde_json's `preserve_order` every clone
+                // rebuilds an IndexMap per message. The providers immediately
+                // rebuild the array anyway (system-message merge/hoist, tool
+                // argument stringification), so the caller's copy was pure
+                // duplicate work; they take `&[Value]` now and materialize once.
+                let seeded: Option<Vec<Value>> = match &thought_seed_msg {
                     Some(seed) if step == 0 => {
                         let mut o = messages.clone();
                         o.push(seed.clone());
-                        o
+                        Some(o)
                     }
-                    _ => messages.clone(),
+                    _ => None,
                 };
+                let outgoing: &[Value] = seeded.as_deref().unwrap_or(&messages);
                 // A `chat_completion` `Err` and a mid-stream failure from
                 // `process_stream` are the same kind of failure — a transient
                 // error that the retry/failover block below must handle with a
@@ -1559,7 +1584,7 @@ impl AgentLoop {
                 }
             };
 
-            let (content_chunks, mut turn_tool_calls, finish_reason, turn_usage, timing) =
+            let (content_buf, mut turn_tool_calls, finish_reason, turn_usage, timing) =
                 turn_result;
 
             last_provider_id = Some(provider_id.clone());
@@ -1684,7 +1709,7 @@ impl AgentLoop {
                     // the assistant message, silently discarding it: the
                     // model would have no memory of having tried, and its
                     // output was gone from history for good.
-                    messages.push(build_assistant_message(&content_chunks, &turn_tool_calls));
+                    messages.push(build_assistant_message(&content_buf, &turn_tool_calls));
                     // Those persisted `tool_calls` are never executed here, so
                     // without results the next provider request carried
                     // dangling tool_calls (HTTP 400 on OpenAI-compatible
@@ -1720,7 +1745,7 @@ impl AgentLoop {
                 if turn_tool_calls.is_empty() {
                     // Same fix as above: this path used to `break`/`continue`
                     // without ever appending the assistant message.
-                    messages.push(build_assistant_message(&content_chunks, &turn_tool_calls));
+                    messages.push(build_assistant_message(&content_buf, &turn_tool_calls));
                     if let Err(e) = self.context.save_messages(session_id, &mut messages).await {
                         tracing::warn!("failed to save messages for session {session_id}: {e}");
                     }
@@ -1746,7 +1771,7 @@ impl AgentLoop {
                 // message to drift every later delta count, and about keeping
                 // that invariant one line long.
                 messages.pop();
-                messages.push(wrapup_persist_shape(&content_chunks, &turn_tool_calls));
+                messages.push(wrapup_persist_shape(&content_buf, &turn_tool_calls));
                 if let Err(e) = self.context.save_messages(session_id, &mut messages).await {
                     tracing::warn!("failed to save messages for session {session_id}: {e}");
                 }
@@ -1773,7 +1798,7 @@ impl AgentLoop {
             // Add assistant message (reached for a non-budget-check turn, or
             // a budget-check turn that approved more steps and still has
             // real tool calls left to execute this same turn).
-            messages.push(build_assistant_message(&content_chunks, &turn_tool_calls));
+            messages.push(build_assistant_message(&content_buf, &turn_tool_calls));
 
             if turn_tool_calls.is_empty() {
                 if finish_reason.as_deref() == Some("stop")
@@ -2052,7 +2077,7 @@ impl AgentLoop {
         event_tx: &mpsc::UnboundedSender<SSEEvent>,
     ) -> Result<
         (
-            Vec<String>,
+            String,
             Vec<ToolCall>,
             Option<String>,
             Option<Value>,
@@ -2060,7 +2085,10 @@ impl AgentLoop {
         ),
         ProviderError,
     > {
-        let mut content_chunks: Vec<String> = Vec::new();
+        // One growing buffer rather than one heap `String` per streamed
+        // delta: the vec was only ever `join("")`d, so the per-token
+        // allocations bought nothing and were held for the whole call.
+        let mut content_buf = String::new();
         let mut tool_calls: Vec<ToolCall> = Vec::new();
         let mut finish_reason: Option<String> = None;
         let mut usage: Option<Value> = None;
@@ -2071,7 +2099,7 @@ impl AgentLoop {
         let mut token_count = 0;
         let mut content_chars = 0usize;
 
-        while let Some(delta) = stream.next().await {
+        while let Some(mut delta) = stream.next().await {
             // A mid-stream provider failure (connection drop, idle timeout,
             // or an SSE `error` event) arrives as a Delta with
             // `error_type == "request"` (see `openai_compat.rs`/`anthropic.rs`
@@ -2101,7 +2129,7 @@ impl AgentLoop {
                 first_token = false;
             }
 
-            if let Some(ref content) = delta.content {
+            if let Some(content) = delta.content.take() {
                 if !content.is_empty() {
                     // Count characters, not bytes: the backstop threshold
                     // (`MAX_TURN_CONTENT_CHARS`) is documented in characters,
@@ -2109,17 +2137,22 @@ impl AgentLoop {
                     // UTF-8 ~3x, so a legitimate long CJK/emoji reply could
                     // be cut off early.
                     content_chars += content.chars().count();
-                    content_chunks.push(content.clone());
+                    content_buf.push_str(&content);
                     token_count += 1;
+                    // One clone per delta, not two: the accumulator now grows a
+                    // single buffer (it was a `Vec<String>` that only ever got
+                    // `join("")`d, i.e. one small heap allocation per token held
+                    // for the whole call), so `content` itself can move into the
+                    // event.
                     let _ = event_tx.send(SSEEvent {
                         event_type: SSEEventType::LlmDelta,
-                        content: Some(content.clone()),
+                        content: Some(content),
                         ..Default::default()
                     });
                 }
             }
 
-            if let Some(ref reasoning) = delta.reasoning {
+            if let Some(reasoning) = delta.reasoning.take() {
                 if !reasoning.is_empty() {
                     // Reasoning counts toward the same ceiling as content —
                     // a thinking-loop stream is exactly the unbounded-output
@@ -2134,7 +2167,7 @@ impl AgentLoop {
                     token_count += 1;
                     let _ = event_tx.send(SSEEvent {
                         event_type: SSEEventType::ReasoningDelta,
-                        content: Some(reasoning.clone()),
+                        content: Some(reasoning),
                         ..Default::default()
                     });
                 }
@@ -2189,7 +2222,7 @@ impl AgentLoop {
             .unwrap_or(token_count);
         timing.finalize_rate();
 
-        Ok((content_chunks, tool_calls, finish_reason, usage, timing))
+        Ok((content_buf, tool_calls, finish_reason, usage, timing))
     }
 
     /// Run every tool call in `tool_calls` concurrently (bounded by
@@ -2856,7 +2889,7 @@ mod wrapup_valve_tests {
 
     #[test]
     fn prose_is_persisted_as_written() {
-        let msg = wrapup_persist_shape(&["Here is ".into(), "the answer.".into()], &[]);
+        let msg = wrapup_persist_shape("Here is the answer.", &[]);
         assert_eq!(msg["role"], "assistant");
         assert_eq!(msg["content"], "Here is the answer.");
     }
@@ -2867,7 +2900,7 @@ mod wrapup_valve_tests {
     /// there is no later iteration that could ever supply the results.
     #[test]
     fn tool_calls_are_stripped_rather_than_persisted_dangling() {
-        let msg = wrapup_persist_shape(&["Wrapping up.".into()], &[call("c1"), call("c2")]);
+        let msg = wrapup_persist_shape("Wrapping up.", &[call("c1"), call("c2")]);
         assert!(
             msg.get("tool_calls").is_none(),
             "a wrap-up reply must never persist dangling tool_calls: {msg}"
@@ -2880,8 +2913,8 @@ mod wrapup_valve_tests {
     /// reject outright on the next request.
     #[test]
     fn an_empty_reply_still_carries_content() {
-        for chunks in [vec![], vec![String::new()], vec!["   ".to_string()]] {
-            let msg = wrapup_persist_shape(&chunks, &[call("c1")]);
+        for text in ["", "   "] {
+            let msg = wrapup_persist_shape(text, &[call("c1")]);
             assert!(
                 !msg["content"].as_str().unwrap().trim().is_empty(),
                 "empty content is rejected by several backends: {msg}"
@@ -2890,7 +2923,7 @@ mod wrapup_valve_tests {
         }
         // ...and with no tool calls either, which is the "model said nothing
         // at all" case.
-        let msg = wrapup_persist_shape(&[], &[]);
+        let msg = wrapup_persist_shape("", &[]);
         assert!(!msg["content"].as_str().unwrap().trim().is_empty());
     }
 }
@@ -3103,11 +3136,11 @@ mod containment_order_tests {
                 usage: None,
                 error_type: None,
             }]));
-        let (content_chunks, tool_calls, finish_reason, _usage, _timing) = agent_loop
+        let (content_buf, tool_calls, finish_reason, _usage, _timing) = agent_loop
             .process_stream(stream, &tx)
             .await
             .expect("a clean stream must succeed");
-        assert_eq!(content_chunks, vec!["hello".to_string()]);
+        assert_eq!(content_buf, "hello");
         assert!(tool_calls.is_empty());
         assert_eq!(finish_reason.as_deref(), Some("stop"));
     }

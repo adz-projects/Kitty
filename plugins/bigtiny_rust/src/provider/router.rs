@@ -502,7 +502,7 @@ impl ProviderRouter {
     pub async fn chat_completion(
         &self,
         provider_id: &str,
-        messages: Vec<serde_json::Value>,
+        messages: &[serde_json::Value],
         tools: Option<Vec<serde_json::Value>>,
         sampling: SamplingParams,
         model: Option<String>,

@@ -70,6 +70,10 @@ sha2 = "0.10"
 ipnet = "2"
 dashmap = "6"
 once_cell = "1"
+# Already in the tree transitively; taken as a direct dep for the SSE line
+# scanner (`openai_compat`'s `OpenAISSEStream`), which is the hottest loop in
+# the daemon.
+memchr = "2"
 rmcp = { version = "0.9", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
 jsonschema = "0.26"
 tower-http = { version = "0.6", features = ["cors", "catch-panic"] }
@@ -123,3 +127,20 @@ mockito = "1"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 tempfile = "3"
+
+# This crate is the root of the shipped `bigtiny-daemon` build
+# (`cargo build --release --features litert-engine --bin bigtiny-daemon`, see
+# docs/RELEASE.md), so without this section the daemon — and every path dep
+# linked into it — was built with bare cargo defaults: no LTO and
+# codegen-units = 16. `src-tauri` has been tuned since it was written; this
+# was simply never given the same treatment.
+#
+# `panic` is deliberately left at `unwind`. The agent loop relies on tokio
+# task-panic isolation (a panicking turn must not take the daemon with it),
+# which `panic = "abort"` would remove. `opt-level` stays at the default 3
+# rather than `src-tauri`'s "s": this is the latency-critical half of the
+# stack, and the daemon is not the binary competing for installer size.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

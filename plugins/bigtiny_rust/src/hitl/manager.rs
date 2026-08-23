@@ -22,6 +22,9 @@ const MAX_PENDING_AGE: Duration = Duration::from_secs(3600);
 static REGEX_CACHE: Lazy<Mutex<HashMap<String, Option<regex::Regex>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
+/// Ceiling on `REGEX_CACHE`. See `compiled_regex`.
+const REGEX_CACHE_MAX: usize = 256;
+
 /// A pending tool call awaiting human approval.
 #[derive(Debug, Clone)]
 pub struct PendingAction {
@@ -467,6 +470,14 @@ impl HITLManager {
         let mut cache = REGEX_CACHE.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(compiled) = cache.get(pattern) {
             return compiled.clone();
+        }
+        // Keyed by a user-supplied rule pattern, so give it a ceiling rather
+        // than trusting the rule count to stay small. Clearing wholesale (as
+        // opposed to evicting one entry) keeps this branch trivial; it costs a
+        // recompile of each live pattern on the next call and can only be
+        // reached by a user with hundreds of distinct HITL rules.
+        if cache.len() >= REGEX_CACHE_MAX {
+            cache.clear();
         }
         let compiled = regex::Regex::new(pattern).ok();
         cache.insert(pattern.to_string(), compiled.clone());

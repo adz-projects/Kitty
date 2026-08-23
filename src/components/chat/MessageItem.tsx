@@ -1,8 +1,4 @@
-import { memo, useEffect, useRef, useState, type ReactNode } from 'react';
-import ReactMarkdown from 'react-markdown';
-import remarkGfm from 'remark-gfm';
-import rehypeHighlight from 'rehype-highlight';
-import 'highlight.js/styles/github.css';
+import { memo, useEffect, useMemo, useRef, useState } from 'react';
 import {
   isVisualizationToolCall,
   stripInternalMarkers,
@@ -12,32 +8,10 @@ import {
 } from '@/stores/chatStore';
 import { ThinkingBox } from './ThinkingBox';
 import { PreviousAttemptBox } from './PreviousAttemptBox';
-import { CodeBlock } from './CodeBlock';
 import { MessageInfo } from './MessageInfo';
 import { MessageAttachmentChips } from './MessageAttachmentChips';
 import { VisualizationCard } from './VisualizationCard';
-import { ipc } from '@/lib/ipc';
-
-/** Open markdown links with the OS default handler instead of navigating the
-    Kitty window itself — Tauri's webview otherwise treats a bare `<a href>`
-    as in-window navigation. `open_path` already opens both file paths and
-    `https://` URLs via the OS default handler (same command the wizard's
-    "View release" link uses). */
-function ExternalLink({ href, children }: { href?: string; children?: ReactNode }) {
-  return (
-    <a
-      href={href}
-      onClick={(e) => {
-        e.preventDefault();
-        if (href) void ipc.openPath(href);
-      }}
-    >
-      {children}
-    </a>
-  );
-}
-
-const MARKDOWN_COMPONENTS = { pre: CodeBlock, a: ExternalLink };
+import { MarkdownBlocks } from './MarkdownBlocks';
 
 /** One chat message. User turns render as a plain bubble; assistant turns render
     markdown, with an optional collapsible reasoning block and tool cards. Hover
@@ -95,6 +69,19 @@ export const MessageItem = memo(function MessageItem({
         /* clipboard may be unavailable */
       });
   };
+
+  // Two fresh arrays per render, and this component is the one that genuinely
+  // does re-render every animation frame — it is the streaming message. Keyed
+  // on `toolCalls` identity, which only changes when a tool-call event lands.
+  // Declared up here, above the early returns below, because hooks have to run
+  // in the same order on every render.
+  const { vizCalls, otherToolCalls } = useMemo(
+    () => ({
+      vizCalls: message.toolCalls.filter(isVisualizationToolCall),
+      otherToolCalls: message.toolCalls.filter((c) => !isVisualizationToolCall(c)),
+    }),
+    [message.toolCalls]
+  );
 
   const actions = (
     <div className="msg-actions">
@@ -162,8 +149,6 @@ export const MessageItem = memo(function MessageItem({
   // Visualizations render as their own always-visible card, the same way a
   // fenced code block renders inline rather than behind a click — everything
   // else stays in the collapsed Thinking tray.
-  const vizCalls = message.toolCalls.filter(isVisualizationToolCall);
-  const otherToolCalls = message.toolCalls.filter((c) => !isVisualizationToolCall(c));
 
   return (
     <div className="msg msg-assistant">
@@ -180,13 +165,7 @@ export const MessageItem = memo(function MessageItem({
       ))}
       {message.text && (
         <div className="bubble markdown">
-          <ReactMarkdown
-            remarkPlugins={[remarkGfm]}
-            rehypePlugins={[rehypeHighlight]}
-            components={MARKDOWN_COMPONENTS}
-          >
-            {message.text}
-          </ReactMarkdown>
+          <MarkdownBlocks text={message.text} />
         </div>
       )}
       {actions}

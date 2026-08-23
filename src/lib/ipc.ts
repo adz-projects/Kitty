@@ -28,6 +28,7 @@ import type {
   ModelPickerEntry,
   OpenRouterCredits,
   PathInfo,
+  StagedAttachment,
   ProviderProfile,
   ProviderView,
   DownloadProgress,
@@ -258,6 +259,12 @@ export const ipc = {
     invoke<string>('copy_file_into_chat_folder', { sourcePath, cwd }),
   writeFile: (path: string, content: string) => invoke<void>('write_file', { path, content }),
   inspectPaths: (paths: string[]) => invoke<PathInfo[]>('inspect_paths', { paths }),
+  /** Make attached files openable by the model's file tools, copying any that
+      sit outside the tool plugins' own reachable root into `cwd`. See the Rust
+      `stage_attachments` for why that root is narrower than BigTiny's session
+      sandbox, and why Android effectively never satisfies it. */
+  stageAttachments: (paths: string[], cwd: string) =>
+    invoke<StagedAttachment[]>('stage_attachments', { paths, cwd }),
   openPath: (path: string) => invoke<void>('open_path', { path }),
   revealPath: (path: string) => invoke<void>('reveal_path', { path }),
   /** Save a copy of a file wherever the user picks. Resolves `false` if they

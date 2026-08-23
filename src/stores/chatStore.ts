@@ -473,6 +473,42 @@ export const useChatStore = create<ChatState>((set, get) => {
         : [...s.artifacts, artifact],
     }));
 
+  /** Resolve dropped/picked paths to ones the app and the model can actually
+      open, preserving the order they arrived in. Folders are left alone —
+      nothing is copied for them, and a working directory chosen from a drop is
+      the user's explicit choice of location.
+
+      Best-effort: if staging fails the originals are used, which is exactly
+      the behaviour this replaces. Never a reason to drop an attachment. */
+  const stageAttachments = async (infos: PathInfo[]): Promise<PathInfo[]> => {
+    const files = infos.filter((f) => !f.is_dir);
+    if (!files.length) return infos;
+    try {
+      // A real session (and therefore a working directory) has to exist before
+      // anything can be copied into it — a file can be attached before the
+      // first message of a brand-new chat is ever sent.
+      await get().ensureSession();
+      const cwd = get().cwd;
+      if (!cwd) throw new Error('no working directory yet');
+      const staged = await ipc.stageAttachments(
+        files.map((f) => f.path),
+        cwd
+      );
+      // Keyed by the path that went in, so the chips keep the order the user
+      // dropped them in rather than being regrouped files-after-folders.
+      const byOriginal = new Map(
+        staged.map((r) => [
+          r.original_path,
+          { path: r.path, name: r.name, is_dir: false, exists: true } as PathInfo,
+        ])
+      );
+      return infos.map((f) => byOriginal.get(f.path) ?? f);
+    } catch (e) {
+      console.warn('stageAttachments failed; using the original paths', e);
+      return infos;
+    }
+  };
+
   const inlineFileAsAttachment = async (f: PathInfo) => {
     if (f.is_dir) return;
     if (isImageFileName(f.name)) {
@@ -543,12 +579,34 @@ export const useChatStore = create<ChatState>((set, get) => {
   // re-checking, so a later, legitimate mention of that same literal
   // substring in the real answer is never mistaken for another leak.
   let thinkLeakResolved = false;
+  // How far into the streaming message's text we have already looked for a
+  // leaked `</think>`. Without this the check re-scanned the *whole*
+  // accumulated message every animation frame — and because the common case is
+  // that there is no leak at all, `thinkLeakResolved` never short-circuits it,
+  // so a long turn paid an O(n) scan per frame: O(n²) over the turn.
+  let thinkLeakScanned = 0;
+  const THINK_CLOSE = '</think>';
+  // See the repetition-loop check in `flushDeltas`.
+  const LOOP_CHECK_INTERVAL_MS = 500;
+  let lastLoopCheck = 0;
 
   const resolveThinkLeak = (
     text: string,
     reasoning: string
   ): { text: string; reasoning: string } => {
     if (thinkLeakResolved) return { text, reasoning };
+    // Scan only what has arrived since the last flush, overlapping by
+    // `THINK_CLOSE.length - 1` so a marker split across two flushes is still
+    // seen whole.
+    // Defensive: if the text is shorter than what we have already scanned it
+    // is a different (or restarted) message, so the cursor is meaningless.
+    if (text.length < thinkLeakScanned) thinkLeakScanned = 0;
+    const from = Math.max(0, thinkLeakScanned - (THINK_CLOSE.length - 1));
+    const present = text.indexOf(THINK_CLOSE, from) !== -1;
+    thinkLeakScanned = text.length;
+    if (!present) return { text, reasoning };
+    // Marker is there: now do the real (full-text) split, which needs the
+    // whole string to find the matching `<think>` and cut at the right place.
     const split = splitLeakedThinkTag(text);
     if (!split) return { text, reasoning };
     thinkLeakResolved = true;
@@ -595,6 +653,13 @@ export const useChatStore = create<ChatState>((set, get) => {
         msgs[msgs.length - 1] = { ...last, ...fixed };
         return { messages: msgs };
       }
+      // A new assistant message starts here, so the leaked-tag scan cursor has
+      // to go back to zero — it indexes into *this* message's text, and
+      // `discardDeltas` (the other reset point) does not run on this path.
+      // `thinkLeakResolved` is deliberately left alone: it was already
+      // per-stream rather than per-message before this change, and widening it
+      // here would alter behaviour rather than just cost.
+      thinkLeakScanned = 0;
       const fixed = resolveThinkLeak(t, r);
       const closed = closeOpen(msgs);
       closed.push({
@@ -627,7 +692,15 @@ export const useChatStore = create<ChatState>((set, get) => {
     // stricter enforcement instead — see the reasoning-token hard cap below —
     // so suppressing this suggestion here doesn't leave them unbounded.
     const s = get();
-    if (!s.loopSuspected && !s.activeRecipeTurn) {
+    // Throttled to ~2Hz rather than run on every rAF flush: `hasRepetitionLoop`
+    // is a nested `indexOf` sweep over a 4000-char window, and a degenerate
+    // loop takes many seconds to establish itself — detecting it within half a
+    // second of the frame that would have caught it is indistinguishable to the
+    // user, since this only *suggests* cancelling and never acts on its own.
+    const nowMs = Date.now();
+    const loopCheckDue = nowMs - lastLoopCheck >= LOOP_CHECK_INTERVAL_MS;
+    if (!s.loopSuspected && !s.activeRecipeTurn && loopCheckDue) {
+      lastLoopCheck = nowMs;
       const last = s.messages[s.messages.length - 1];
       // Slice BEFORE joining: hasRepetitionLoop only inspects a trailing
       // window (4000 chars by default) of whatever it's handed, so joining
@@ -696,6 +769,8 @@ export const useChatStore = create<ChatState>((set, get) => {
     pendingText = '';
     pendingReasoning = '';
     thinkLeakResolved = false;
+    thinkLeakScanned = 0;
+    lastLoopCheck = 0;
   };
 
   // The actual turn-submission body, shared by `send()` and `sendWithRecipe()`.
@@ -1751,7 +1826,24 @@ export const useChatStore = create<ChatState>((set, get) => {
         };
       });
       try {
-        let infos = await ipc.inspectPaths(paths);
+        const inspected = await ipc.inspectPaths(paths);
+        // Resolve every attachment to a real, openable path *before* anything
+        // below looks at its name or hands it to a provider.
+        //
+        // On Android a picked file is a `content://` URI, not a path: there is
+        // no file to read, and the URI's last segment is the storage
+        // provider's internal document id (`msf%3A1000000123`) rather than a
+        // filename. Every decision downstream is name- or path-based, so all
+        // of them were wrong on that platform — the image check below tested a
+        // document id against a list of extensions, `readFileAny` had nothing
+        // to open, and the model was handed a URI it correctly reported having
+        // no tool for.
+        //
+        // `stageAttachments` copies anything unreachable into the session's
+        // working directory (through the ContentResolver when it is a URI) and
+        // returns the real display name. A path a tool can already open is
+        // passed through untouched, so desktop pays nothing for this.
+        let infos = await stageAttachments(inspected);
         // The active model can't see images at all — drop them here, before
         // they ever reach droppedFiles/inlineFileAsAttachment, rather than
         // sending a picture a text-only model will just fail (or silently
@@ -1787,6 +1879,7 @@ export const useChatStore = create<ChatState>((set, get) => {
           return;
         }
         // Hand paths to the filesystem tools (works for any file type).
+        // Already staged above, so every path here is one a tool can open.
         set((s) => {
           const seen = new Set(s.droppedFiles.map((f) => f.path));
           return { droppedFiles: [...s.droppedFiles, ...infos.filter((f) => !seen.has(f.path))] };

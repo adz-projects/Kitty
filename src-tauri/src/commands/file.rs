@@ -502,3 +502,266 @@ mod tests {
         );
     }
 }
+
+/// The single directory tree the bundled MCP tool plugins are able to reach.
+///
+/// `kitty-tools` enforces its own path boundary (`plugins/kitty-tools/src/
+/// paths.rs::path_within_home`) independently of BigTiny's per-session
+/// sandbox, and it is the *narrower* of the two. This mirrors that crate's
+/// resolution order so both sides agree on where the wall is:
+///
+/// - **Android** — `KITTY_PLUGIN_HOME`, which `lifecycle::bigtiny_env` sets to
+///   the app-private data directory. Nothing outside it is readable by a tool,
+///   and that is essentially everything a user can pick: the document picker
+///   hands back paths under `/storage/emulated/0/…` or a content-provider
+///   cache, none of which live under the app's own data directory.
+/// - **Desktop** — the user's home directory (`%USERPROFILE%` / `$HOME`). Most
+///   attachments already qualify; a file on another volume does not.
+fn tools_reachable_root() -> Option<PathBuf> {
+    // Kept as a literal rather than importing the plugin crate's own
+    // `PLUGIN_HOME_ENV`: `kitty-tools` is a bundled sidecar, not a dependency
+    // of this binary. `lifecycle::bigtiny_env` writes the same literal.
+    for key in ["KITTY_PLUGIN_HOME", "USERPROFILE", "HOME"] {
+        if let Ok(v) = std::env::var(key) {
+            if !v.trim().is_empty() {
+                return Some(PathBuf::from(v));
+            }
+        }
+    }
+    dirs::home_dir()
+}
+
+/// Case-insensitively (on Windows) "is `candidate` inside `base`". Deliberately
+/// the same shape as `kitty-tools`' own check, including the trailing separator
+/// so a sibling directory cannot alias its neighbour.
+fn within_root(base: &std::path::Path, candidate: &std::path::Path) -> bool {
+    let norm = |p: &std::path::Path| {
+        let s = p.to_string_lossy().replace('\\', "/");
+        // Strip Windows' verbatim prefix. `canonicalize` emits `//?/C:/…`, and
+        // it only succeeds for a path that exists — so comparing a canonical
+        // root against a not-yet-canonicalizable candidate compared `//?/c:/…`
+        // with `c:/…` and answered "outside" for a path that was plainly
+        // inside. Harmless in direction (it stages a needless copy) but wrong,
+        // and it made the containment test unassertable.
+        let s = s.strip_prefix("//?/").unwrap_or(&s).to_string();
+        let s = s.trim_end_matches('/').to_string();
+        if cfg!(windows) {
+            s.to_lowercase()
+        } else {
+            s
+        }
+    };
+    // Canonicalize where possible so a symlinked or 8.3-shortened path is
+    // judged by where it actually lands, matching the plugin-side check.
+    let base_s = norm(&std::fs::canonicalize(base).unwrap_or_else(|_| base.to_path_buf()));
+    let cand_s =
+        norm(&std::fs::canonicalize(candidate).unwrap_or_else(|_| candidate.to_path_buf()));
+    cand_s == base_s || cand_s.starts_with(&format!("{base_s}/"))
+}
+
+/// True when a tool could open this path as-is.
+fn reachable_by_tools(path: &str) -> bool {
+    // A `content://` URI is not a path on any platform, so no containment test
+    // applies and no tool can open it. Answering `false` here rather than only
+    // inside the Android branch keeps the two in agreement: if the
+    // ContentResolver hop ever fails, the fallback is "unreachable", not
+    // "inside the root because the string happened not to start with C:\".
+    if is_content_uri(path) {
+        return false;
+    }
+    match tools_reachable_root() {
+        // No resolvable root means no boundary to be inside of. Fail closed —
+        // staging a copy is always safe, whereas handing over an unreachable
+        // path is the bug this exists to fix.
+        None => false,
+        Some(root) => within_root(&root, std::path::Path::new(path)),
+    }
+}
+
+/// True for a path that is really an Android `content://` URI rather than a
+/// filesystem path.
+///
+/// Lives here rather than beside the Kotlin boundary in `android::attachments`
+/// because that whole module is `#[cfg(target_os = "android")]` — the one
+/// piece of pure logic in this fix would then be untestable in the desktop
+/// build, which is the only build the test suite runs in.
+///
+/// Compared case-insensitively: `Uri.parse` treats the scheme that way, so a
+/// provider handing back `Content://` must not silently fall through to the
+/// filesystem branch, where there is no file to find.
+fn is_content_uri(path: &str) -> bool {
+    path.len() > "content://".len() && path[.."content://".len()].eq_ignore_ascii_case("content://")
+}
+
+/// One attached path as the model should be told about it.
+#[derive(Debug, Clone, Serialize)]
+pub struct StagedAttachment {
+    /// Where the file was originally picked from.
+    pub original_path: String,
+    /// The path to hand the model — the original when a tool can already open
+    /// it, otherwise the copy inside the session's working directory.
+    pub path: String,
+    /// Basename of `path`.
+    pub name: String,
+    /// True when a copy was made (the UI says so on the chip).
+    pub staged: bool,
+}
+
+/// Stage one attached path. Split from the command so the per-path decision
+/// is a single expression rather than a closure inside a `map` inside a
+/// `spawn_blocking`.
+fn stage_one(path: String, cwd: &str) -> StagedAttachment {
+    let original_path = path.clone();
+    let basename = |s: &str| {
+        std::path::Path::new(s)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| s.to_string())
+    };
+    let passthrough = |p: String| StagedAttachment {
+        name: basename(&p),
+        path: p,
+        original_path: original_path.clone(),
+        staged: false,
+    };
+
+    // Android's document picker hands back a `content://` URI, which is not a
+    // path at all — there is no file to stat, copy, or hand to a tool, and its
+    // last segment is the provider's internal document id rather than a name.
+    // Only the ContentResolver can answer either question, so this goes out to
+    // Kotlin. See `android::attachments`.
+    #[cfg(target_os = "android")]
+    if is_content_uri(&path) {
+        return match crate::android::attachments::copy_into(&path, cwd) {
+            Ok(copied) => StagedAttachment {
+                original_path,
+                path: copied.path,
+                name: copied.name,
+                staged: true,
+            },
+            Err(e) => {
+                tracing::warn!("could not stage content-uri attachment: {e}");
+                passthrough(path)
+            }
+        };
+    }
+
+    if reachable_by_tools(&path) {
+        return passthrough(path);
+    }
+    match copy_file_into_chat_folder_blocking(&path, cwd) {
+        Ok(name) => {
+            let dest = std::path::Path::new(cwd).join(&name);
+            StagedAttachment {
+                original_path,
+                path: dest.to_string_lossy().to_string(),
+                name,
+                staged: true,
+            }
+        }
+        // Best-effort: a failed copy leaves the original path in place. The
+        // model may still fail to open it, but that is no worse than the
+        // behaviour this replaces, and it beats dropping the attachment on the
+        // floor.
+        Err(e) => {
+            tracing::warn!("could not stage attachment {path}: {e}");
+            passthrough(path)
+        }
+    }
+}
+
+/// Make user-attached files actually openable by the model's file tools.
+///
+/// Real, observed bug: attaching a document on Android and asking about it got
+/// "I can't find that file", after the model tried `lean_analyze_workspace`
+/// several times looking for it. There are two separate causes, and fixing
+/// either alone leaves the feature broken:
+///
+/// 1. **The path is not a path.** Android's document picker returns a
+///    `content://` URI. Nothing in Rust can open one, and the model has no
+///    tool that can either — its own reasoning trace named the problem
+///    exactly: "I don't have a tool to resolve content:// URIs". The URI's
+///    last segment is the provider's document id, so it is not a usable name
+///    either. `android::attachments` resolves both through the
+///    ContentResolver.
+/// 2. **The reachable root is narrower than the daemon's sandbox.** BigTiny
+///    was never the obstacle: `routes::chat` unions `attached_paths` into the
+///    session metadata and `sandbox::allowed_dirs_for_session` honours them.
+///    `kitty-tools` enforces its *own* home-directory boundary, which on
+///    Android is the app-private data directory — so even a real path from
+///    outside it stays unreadable however the daemon is configured.
+///
+/// Rather than widen a security boundary to fix an ergonomics problem, bring
+/// the file to the model: anything unreachable is copied into the session's
+/// own working directory, which is inside the boundary by construction
+/// (`session::chats_base_dir` falls back to the same app data directory on
+/// Android). This is the mechanism `inlineFileAsAttachment` already uses for
+/// providers with no file tools; this makes it apply to the tool-using path
+/// too, which is where the bug was visible.
+///
+/// A file already inside the root is passed through untouched — no needless
+/// copy of a 2 GB video the tools could have opened where it lay.
+#[tauri::command]
+pub async fn stage_attachments(
+    paths: Vec<String>,
+    cwd: String,
+) -> Result<Vec<StagedAttachment>, String> {
+    // `spawn_blocking` is not just for the copy: on Android the
+    // ContentResolver call blocks on the main looper, and running it *from*
+    // the main thread deadlocks the app with no error (see
+    // `android::secrets`' warning).
+    tokio::task::spawn_blocking(move || {
+        paths
+            .into_iter()
+            .map(|p| stage_one(p, &cwd))
+            .collect::<Vec<_>>()
+    })
+    .await
+    .map_err(|e| format!("attachment staging task panicked: {e}"))
+}
+
+#[cfg(test)]
+mod staging_tests {
+    use super::*;
+
+    #[test]
+    fn content_uris_are_recognised_and_real_paths_are_not() {
+        // The bug this guards: a picked Android attachment arrives as a URI,
+        // not a path, so the filesystem branch can never stage it and the
+        // model is handed something no tool can open.
+        assert!(is_content_uri(
+            "content://com.android.providers.downloads.documents/document/msf%3A1000000123"
+        ));
+        assert!(is_content_uri("CONTENT://x/y"));
+
+        assert!(!is_content_uri("/data/user/0/com.kitty.app/files/a.pdf"));
+        assert!(!is_content_uri("/storage/emulated/0/Download/report.docx"));
+        assert!(!is_content_uri("file:///storage/emulated/0/a.pdf"));
+        // The scheme on its own names no document.
+        assert!(!is_content_uri("content://"));
+        assert!(!is_content_uri(""));
+    }
+
+    #[test]
+    fn a_path_inside_the_root_is_recognised() {
+        let dir = std::env::temp_dir().join("kitty-stage-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(within_root(&dir, &dir.join("a.txt")));
+        assert!(within_root(&dir, &dir));
+    }
+
+    #[test]
+    fn a_sibling_directory_cannot_alias_the_root() {
+        // `…/kitty2` must not count as inside `…/kitty` — the trailing
+        // separator is what stops the prefix match from being a string bug.
+        let base = std::env::temp_dir().join("kitty");
+        let sibling = std::env::temp_dir().join("kitty2").join("f.txt");
+        assert!(!within_root(&base, &sibling));
+    }
+
+    #[test]
+    fn an_unrelated_location_is_outside_the_root() {
+        let base = std::env::temp_dir().join("kitty-root");
+        assert!(!within_root(&base, std::path::Path::new("/etc/passwd")));
+    }
+}

@@ -194,6 +194,24 @@ There are no Android sidecars: `tauri.android.conf.json` clears
 `transport: "in_process"`. Android 10+ refuses to `exec()` a binary in
 app-writable storage, so a frozen per-plugin executable has nowhere to live.
 
+**Delete `app/build/outputs/apk` before every rebuild.** Gradle updates an
+existing APK *in place*, and its incremental zip writer appends the new
+`lib/arm64-v8a/libkitty_lib.so` without reclaiming the old entry's bytes. The
+result is a valid, installable APK carrying a full dead copy of the largest
+thing in it — observed twice: 578 MB against 285 MB of live entries (48%
+orphaned), and 807 MB on an earlier run. Nothing warns you; the build succeeds
+and `adb install` works.
+
+Check any APK you are about to ship or sideload:
+
+```powershell
+python -c "import zipfile,os,sys; p=sys.argv[1]; z=zipfile.ZipFile(p); live=sum(i.compress_size for i in z.infolist()); f=os.path.getsize(p); print('%.1f MB file, %.1f MB live, %.1f%% orphaned' % (f/1048576, live/1048576, 100*(f-live)/f))" <path-to.apk>
+```
+
+A clean build lands near 0%. Anything above a few percent means the output
+directory was reused — delete it and repackage (the Rust is cached, so the
+second pass is minutes, not the full compile).
+
 Artifacts:
 
 - `src-tauri/gen/android/app/build/outputs/bundle/universalRelease/app-universal-release.aab`

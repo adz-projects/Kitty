@@ -469,10 +469,29 @@ button.primary {
 .markdown h6 {
   font-size: 1em;
 }
-.markdown ul,
-.markdown ol {
+.markdown ul {
   margin: 0.4em 0;
   padding-left: 1.4em;
+}
+/* Ordered lists need materially more room than bullets. An `outside` marker
+   is painted in this padding, *not* inside the content box, so the padding is
+   the only thing standing between the marker and the left edge — and unlike a
+   bullet, the marker's width grows with the number of digits. At the shared
+   1.4em a two-digit marker ("19.") already sat within ~2px of the boundary in
+   Montserrat and a three-digit one ("119.") overflowed outright. That is not
+   a cosmetic overshoot: `.message-list` clips horizontally (see its
+   `overflow-x: hidden` above), so an overflowing marker is a digit the reader
+   never sees — reported from Android as numbered lists running off the left
+   edge of the screen.
+
+   2.4em clears three digits with room to spare, at every font scale: the
+   padding is em-relative, so it tracks the marker rather than being outgrown
+   by it. Nested lists deliberately inherit the same value — an inner list's
+   markers need their own room, and nesting must not compound the indent into
+   the text column. */
+.markdown ol {
+  margin: 0.4em 0;
+  padding-left: 2.4em;
 }
 .markdown li {
   margin: 0.15em 0;

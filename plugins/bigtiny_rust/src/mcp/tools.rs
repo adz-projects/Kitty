@@ -1,3 +1,9 @@
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::sync::Arc;
+
+use dashmap::DashMap;
+use once_cell::sync::Lazy;
 use serde_json::Value;
 
 use crate::models::mcp::ToolDefinition;
@@ -132,6 +138,48 @@ pub fn extract_content_from_rmcp_sized(content: &[rmcp::model::Content]) -> (Str
     join.finish()
 }
 
+/// Compiled-validator cache, keyed by `(server_id, tool name)`.
+///
+/// `jsonschema::validator_for` compiles the whole schema graph, and this used
+/// to run on *every* tool invocation — synchronously, on a tokio worker
+/// thread, immediately before the call itself. Tool schemas are fixed for the
+/// lifetime of a server connection, so the compile is pure repeat work.
+///
+/// The stored fingerprint is what makes this safe without any invalidation
+/// path: a reconnected server that re-registers a tool under the same name
+/// with a *different* schema simply misses on the fingerprint and recompiles.
+/// There is nothing to remember to clear (the same reasoning as `kitty-tools`'
+/// extract-once document cache, which keys on the file's identity rather than
+/// tracking invalidation).
+/// `(server_id, tool name)` -> `(schema fingerprint, compiled validator)`.
+type ValidatorCache = DashMap<(String, String), (u64, Arc<jsonschema::Validator>)>;
+
+static VALIDATOR_CACHE: Lazy<ValidatorCache> = Lazy::new(DashMap::new);
+
+fn schema_fingerprint(schema: &Value) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    // `Value` is not `Hash`; its serialized form is a faithful stand-in, and
+    // hashing a few hundred bytes is orders of magnitude cheaper than the
+    // compile this avoids.
+    schema.to_string().hash(&mut hasher);
+    hasher.finish()
+}
+
+/// `None` when the schema will not compile — callers fail open, matching the
+/// long-standing lenient behaviour documented on `validate_tool_args`.
+fn compiled_validator(tool: &ToolDefinition) -> Option<Arc<jsonschema::Validator>> {
+    let key = (tool.server_id.clone(), tool.name.clone());
+    let fingerprint = schema_fingerprint(&tool.input_schema);
+    if let Some(hit) = VALIDATOR_CACHE.get(&key) {
+        if hit.0 == fingerprint {
+            return Some(hit.1.clone());
+        }
+    }
+    let validator = Arc::new(jsonschema::validator_for(&tool.input_schema).ok()?);
+    VALIDATOR_CACHE.insert(key, (fingerprint, validator.clone()));
+    Some(validator)
+}
+
 /// Validate `args` against a tool's JSON Schema (`input_schema`), mirroring
 /// Python's `validate_tool_args` — a no-op if the schema is empty/absent, and
 /// fails open (treats as valid) if the schema itself is malformed, matching
@@ -151,9 +199,8 @@ pub fn validate_tool_args(tool: &ToolDefinition, args: &Value) -> Result<(), Str
     if is_empty_schema {
         return Ok(());
     }
-    let validator = match jsonschema::validator_for(&tool.input_schema) {
-        Ok(v) => v,
-        Err(_) => return Ok(()),
+    let Some(validator) = compiled_validator(tool) else {
+        return Ok(());
     };
     match validator.validate(args) {
         Ok(()) => Ok(()),

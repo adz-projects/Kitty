@@ -345,6 +345,15 @@ impl Agent {
         }
     }
 
+    /// Drop daemon-lifetime per-session bookkeeping for a session that is
+    /// going away. `provider_mismatch_warned` is keyed by session id and is
+    /// otherwise only ever removed when that session's pinned provider
+    /// resolves again, so a deleted session's entry would sit in the map for
+    /// the life of the process.
+    pub fn forget_session(&self, session_id: &str) {
+        self.provider_mismatch_warned.remove(session_id);
+    }
+
     /// Abort the in-flight turn for `session_id`, if any. Emits the terminal
     /// `Cancelled` session-status frame *before* aborting: Kitty's stream
     /// layer (`src-tauri/src/bigtiny/stream.rs`) matches

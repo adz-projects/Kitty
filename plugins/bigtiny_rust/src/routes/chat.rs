@@ -146,6 +146,10 @@ pub async fn delete_session(
     // parked notifies — a deleted session must not leave action ids behind
     // pointing at a session row that no longer exists.
     state.agent.cancel(&id).await;
+    // Daemon-lifetime per-session bookkeeping that nothing else reaps: without
+    // this the map keeps one entry per session that ever hit a provider
+    // mismatch, for as long as the daemon runs.
+    state.agent.forget_session(&id);
     match sessions::delete_session(&state.db, &id).await {
         // `delete_session` returns the affected row count, and discarding it
         // meant a DELETE that matched nothing still answered `{"ok": true}` —

@@ -168,7 +168,7 @@ impl KittyWebServer {
 
     #[tool(
         name = "lean_web_scrape",
-        description = "Scrapes a URL into clean Markdown (or plain text) for an LLM to read. offset and the response's metadata.next_offset page through long pages by markdown block, without severing a table or heading mid-cut. A PDF URL is downloaded to the cache and its local path is returned — use lean_pdf_read_text or lean_pdf_read_outline on that path next. favor_precision=True favors precision over recall; the default favors recall, since documentation/API-reference pages often lose sidebars and short definition blocks under the precision-favoring mode."
+        description = "Scrapes a URL into clean Markdown (or plain text) for an LLM to read. offset and the response's metadata.next_offset page through long pages by markdown block, without severing a table or heading mid-cut. A URL that returns a document or text file rather than a page (pdf, docx, xlsx, xls, csv, tsv, txt, md, json, xml, yaml, toml, log) is downloaded to the cache and its local path is returned as cached_path, along with a file_type and a hint naming the reader to call on it next (lean_pdf_read_text, lean_word_read_text, lean_excel_inspect, or lean_file_read). Types nothing can read (archives, executables, media) are still refused. favor_precision=True favors precision over recall; the default favors recall, since documentation/API-reference pages often lose sidebars and short definition blocks under the precision-favoring mode."
     )]
     pub async fn web_scrape(&self, Parameters(req): Parameters<WebScrapeRequest>) -> String {
         guarded_async(scrape::web_scrape(

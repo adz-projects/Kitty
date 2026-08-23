@@ -2,9 +2,7 @@ import { useEffect } from 'react';
 import { ipc, onFileDrop, pickFolder } from '@/lib/ipc';
 import { humanizeChatError, useChatStore } from '@/stores/chatStore';
 import { useStackStore } from '@/stores/stackStore';
-import { supportsReasoning } from '@/lib/reasoning_models';
-import { MessageList } from './MessageList';
-import { useProgressStage } from './useProgressStage';
+import { ChatTranscript } from './ChatTranscript';
 import { Composer } from './Composer';
 import { ApprovalPrompt } from './ApprovalPrompt';
 import { isAndroid } from '@/lib/platform';
@@ -30,14 +28,14 @@ export function ChatView() {
   // Individual slice selectors (not a whole-store `useChatStore()` call) so a
   // change to any one field — e.g. a streamed message delta — re-renders only
   // what consumes it, never the entire chat surface.
-  const messages = useChatStore((s) => s.messages);
+  // No `s.messages` subscription here, deliberately: a new array arrives every
+  // animation frame while streaming, and everything in this component that
+  // depends on the transcript now lives in `ChatTranscript`.
   const busy = useChatStore((s) => s.busy);
   const sessionConcluded = useChatStore((s) => s.sessionConcluded);
-  const replaying = useChatStore((s) => s.replaying);
   const error = useChatStore((s) => s.error);
   const errorType = useChatStore((s) => s.errorType);
   const cwd = useChatStore((s) => s.cwd);
-  const title = useChatStore((s) => s.title);
   const pendingApprovals = useChatStore((s) => s.pendingApprovals);
   const providerHost = useChatStore((s) => s.providerHost);
   const providerOffline = useChatStore((s) => s.providerOffline);
@@ -58,7 +56,6 @@ export function ChatView() {
   const isDefaultFolder = useChatStore((s) => s.isDefaultFolder);
   const bindEvents = useChatStore((s) => s.bindEvents);
   const refreshProvider = useChatStore((s) => s.refreshProvider);
-  const model = useChatStore((s) => s.model);
   const newSession = useChatStore((s) => s.newSession);
   const loadSession = useChatStore((s) => s.loadSession);
   // WS8 backgrounded-turn lifecycle (a chat this window left is still running):
@@ -79,17 +76,6 @@ export function ChatView() {
   }, [addDroppedPaths]);
 
   const folder = cwd ? cwd.split(/[\\/]/).filter(Boolean).pop() : null;
-  const last = messages[messages.length - 1];
-  const assistant = last && last.role === 'assistant' ? last : null;
-  // Real-terms progress while awaiting the answer (Round-5 Batch 6): connecting
-  // → thinking → formulating, derived from streaming signals + a client timer.
-  const progressStage = useProgressStage(
-    busy,
-    assistant?.reasoning.length ?? 0,
-    !!assistant?.text,
-    supportsReasoning(model)
-  );
-
   return (
     <div className="chat">
       {/* Android has no chat header at all: the folder pill points at a
@@ -231,17 +217,7 @@ export function ChatView() {
         </div>
       )}
 
-      {replaying ? (
-        <div className="message-list message-list-loading">
-          <p className="muted">Loading conversation…</p>
-        </div>
-      ) : (
-        <MessageList
-          messages={messages}
-          empty={title ?? 'Start a new chat.'}
-          stage={progressStage}
-        />
-      )}
+      <ChatTranscript />
 
       {pendingApprovals.map((a) => (
         <ApprovalPrompt key={a.tool_call_id} request={a} onRespond={respondApproval} />

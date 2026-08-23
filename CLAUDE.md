@@ -103,7 +103,11 @@ has been deleted. Full detail in
   on once by `config::migrate_replacement_mcp_enabled` /
   `migrate_kitty_split_enabled`, which then respect any later opt-out.
 - **`kitty-web`** — a **Rust** stdio MCP server, same BigTiny registration
-  pattern as `kitty-tools`. Hosts 3 tools: `lean_web_scrape`, and the merged
+  pattern as `kitty-tools`. Hosts 3 tools: `lean_web_scrape` (which
+  also **downloads** a URL returning a document or text file rather than a page
+  — pdf, docx, xlsx, csv, txt, md, json, xml, yaml and friends — to the shared
+  cache and hands back `cached_path` plus the reader to call on it;
+  archives/executables/media stay refused), and the merged
   `lean_web_search`/`lean_web_search_read_chunk` (DuckDuckGo always
   available; Brave preferred per-query when `BRAVE_API_KEY` is configured,
   with a count-tiered normal/expanded/expansive mode — see

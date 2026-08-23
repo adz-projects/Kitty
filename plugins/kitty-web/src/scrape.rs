@@ -447,7 +447,148 @@ fn extract_metadata(document: &scraper::Html) -> PageMeta {
     }
 }
 
-/// The name a downloaded PDF is actually cached under.
+/// What a saveable non-HTML response is, once classified: the extension its
+/// cache file gets, and the tool the model should reach for next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DownloadKind {
+    /// Canonical extension for the cached file. The kitty-tools readers
+    /// dispatch on extension, so this is what makes the handoff work.
+    pub ext: &'static str,
+    /// Prompt-visible instruction naming the reader to call on `cached_path`.
+    pub hint: &'static str,
+}
+
+/// Hints, deduplicated so the same wording can't drift between the two
+/// lookup tables below.
+const HINT_PDF: &str = "Use lean_pdf_read_text or lean_pdf_read_outline on the cached_path above.";
+const HINT_WORD: &str =
+    "Use lean_word_read_text or lean_word_read_outline on the cached_path above.";
+const HINT_EXCEL: &str =
+    "Use lean_excel_inspect on the cached_path above, then lean_excel_read_rows.";
+const HINT_TEXT: &str = "Use lean_file_read on the cached_path above.";
+
+/// Extensions this tool will save rather than refuse, and what to do with
+/// each.
+///
+/// The list is an allowlist and stays one deliberately. Every entry is inert
+/// data that some bundled reader can open: documents, spreadsheets, and plain
+/// text formats. Archives, executables, installers, disk images and media are
+/// **not** here — not because the download itself would run anything, but
+/// because nothing downstream can read them, so saving one only leaves an
+/// unusable file on the user's disk. Anything unlisted still gets the
+/// `SCRAPE_UNSUPPORTED_CONTENT_TYPE` refusal it always did.
+// (extension as it may appear in a URL, canonical extension for the cache
+// file, hint). A flat tuple rather than a struct literal per row purely so the
+// table stays one line per entry under rustfmt.
+const DOWNLOADABLE_EXTS: &[(&str, &str, &str)] = &[
+    ("pdf", "pdf", HINT_PDF),
+    ("docx", "docx", HINT_WORD),
+    ("xlsx", "xlsx", HINT_EXCEL),
+    ("xlsm", "xlsm", HINT_EXCEL),
+    ("xls", "xls", HINT_EXCEL),
+    ("csv", "csv", HINT_TEXT),
+    ("tsv", "tsv", HINT_TEXT),
+    ("txt", "txt", HINT_TEXT),
+    ("text", "txt", HINT_TEXT),
+    ("md", "md", HINT_TEXT),
+    ("markdown", "md", HINT_TEXT),
+    ("rst", "rst", HINT_TEXT),
+    ("json", "json", HINT_TEXT),
+    ("jsonl", "jsonl", HINT_TEXT),
+    ("ndjson", "ndjson", HINT_TEXT),
+    ("xml", "xml", HINT_TEXT),
+    ("yaml", "yaml", HINT_TEXT),
+    ("yml", "yml", HINT_TEXT),
+    ("toml", "toml", HINT_TEXT),
+    ("ini", "ini", HINT_TEXT),
+    ("log", "log", HINT_TEXT),
+    ("srt", "srt", HINT_TEXT),
+    ("vtt", "vtt", HINT_TEXT),
+];
+/// Content types mapped to the same set. Consulted *before* the URL
+/// extension, because the server is the authority on what it just sent and
+/// plenty of these URLs carry no extension at all (a REST endpoint returning
+/// `application/json`, a raw-file service returning `text/plain`).
+const DOWNLOADABLE_CONTENT_TYPES: &[(&str, &str)] = &[
+    ("application/pdf", "pdf"),
+    (
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "docx",
+    ),
+    (
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "xlsx",
+    ),
+    ("application/vnd.ms-excel", "xls"),
+    ("application/json", "json"),
+    ("text/json", "json"),
+    ("application/ld+json", "json"),
+    ("application/x-ndjson", "ndjson"),
+    ("text/csv", "csv"),
+    ("text/tab-separated-values", "tsv"),
+    ("text/markdown", "md"),
+    ("text/x-markdown", "md"),
+    ("application/xml", "xml"),
+    ("text/xml", "xml"),
+    ("application/yaml", "yaml"),
+    ("application/x-yaml", "yaml"),
+    ("text/yaml", "yaml"),
+    ("text/plain", "txt"),
+];
+
+fn kind_for_ext(ext: &str) -> Option<DownloadKind> {
+    let ext = ext.to_lowercase();
+    DOWNLOADABLE_EXTS
+        .iter()
+        .find(|(e, _, _)| *e == ext)
+        .map(|(_, canonical, hint)| DownloadKind {
+            ext: canonical,
+            hint,
+        })
+}
+
+/// The URL's trailing extension, if it has one. Read from the query- and
+/// fragment-stripped URL, so `?download=1` doesn't hide it.
+fn url_extension(stripped_url: &str) -> Option<String> {
+    let tail = stripped_url.rsplit('/').next().unwrap_or("");
+    let (_, ext) = tail.rsplit_once('.')?;
+    if ext.is_empty() || ext.len() > 10 || !ext.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    Some(ext.to_lowercase())
+}
+
+/// Decide whether this response is a document to save rather than a page to
+/// scrape.
+///
+/// Before this existed the tool special-cased exactly one type: PDF. Every
+/// other non-HTML response — a `.docx` linked from a page, a raw `.json` API
+/// reply, a `.csv` export, a `text/plain` README — was refused with
+/// `SCRAPE_UNSUPPORTED_CONTENT_TYPE` and a hint that the tool "extracts
+/// article/documentation body text from HTML pages only", which told the model
+/// nothing it could act on. The file was reachable and readable; there was
+/// simply no route from the fetch to the reader.
+///
+/// Content-type wins over the extension when it maps, since the server knows
+/// what it sent. An unmapped or generic content-type (`application/
+/// octet-stream`, or none at all) falls back to the URL's extension — that
+/// fallback is what the old `looks_like_pdf` check did, generalized.
+/// HTML/XHTML is never treated as a download, whatever the URL says, so a
+/// `.md` path that actually renders a web page still gets scraped.
+pub fn download_kind(stripped_url: &str, content_type: &str) -> Option<DownloadKind> {
+    if content_type.starts_with("text/html") || content_type.starts_with("application/xhtml") {
+        return None;
+    }
+    if let Some((_, ext)) = DOWNLOADABLE_CONTENT_TYPES
+        .iter()
+        .find(|(ct, _)| *ct == content_type)
+    {
+        return kind_for_ext(ext);
+    }
+    url_extension(stripped_url).and_then(|e| kind_for_ext(&e))
+}
+
+/// The name a downloaded document is actually cached under.
 ///
 /// `pdf_filename_for` alone is not enough: it derives the name from the URL's
 /// *last path segment*, so `https://a.com/docs/report.pdf` and
@@ -462,7 +603,7 @@ fn extract_metadata(document: &scraper::Html) -> PageMeta {
 /// `CON.pdf` becomes `<digest>-CON_.pdf` — though `pdf_filename_for` keeps its
 /// own guard for that (audit #125), since it is the function whose output a
 /// human reads.
-fn pdf_cache_filename_for(stripped_url: &str) -> String {
+fn download_cache_filename_for(stripped_url: &str, ext: &str) -> String {
     use std::hash::{DefaultHasher, Hash, Hasher};
     let mut hasher = DefaultHasher::new();
     stripped_url.hash(&mut hasher);
@@ -473,26 +614,24 @@ fn pdf_cache_filename_for(stripped_url: &str) -> String {
     format!(
         "{:016x}-{}",
         hasher.finish(),
-        pdf_filename_for(stripped_url)
+        download_filename_for(stripped_url, ext)
     )
 }
 
 /// Filename sanitization for a downloaded PDF, matching Python's
 /// `re.sub(r"[^\w.\-]", "_", ...)`.
-fn pdf_filename_for(stripped_url: &str) -> String {
+fn download_filename_for(stripped_url: &str, ext: &str) -> String {
     use std::sync::OnceLock;
     static RE: OnceLock<regex::Regex> = OnceLock::new();
     let re = RE.get_or_init(|| regex::Regex::new(r"[^\w.\-]").expect("static regex is valid"));
 
     let tail = stripped_url.rsplit('/').next().unwrap_or("");
-    let tail = if tail.is_empty() {
-        "downloaded.pdf"
-    } else {
-        tail
-    };
+    let fallback = format!("downloaded.{ext}");
+    let tail = if tail.is_empty() { &fallback } else { tail };
     let mut name = re.replace_all(tail, "_").into_owned();
-    if !name.to_lowercase().ends_with(".pdf") {
-        name.push_str(".pdf");
+    let suffix = format!(".{}", ext.to_lowercase());
+    if !name.to_lowercase().ends_with(&suffix) {
+        name.push_str(&suffix);
     }
     // Windows reserved device names (audit #125): `CON.pdf` is the console,
     // not a file, and writing it fails with a confusing error. Windows
@@ -573,7 +712,6 @@ pub async fn web_scrape(
 ) -> String {
     let stripped_url = url.split('?').next().unwrap_or(url);
     let stripped_url = stripped_url.split('#').next().unwrap_or(stripped_url);
-    let looks_like_pdf = stripped_url.to_lowercase().ends_with(".pdf");
 
     // SSRF guard (audit #109): the URL is model-supplied, so the scheme and
     // the host's resolved IPs are validated before any request goes out, and
@@ -697,9 +835,8 @@ pub async fn web_scrape(
         .trim()
         .to_lowercase();
 
-    let is_pdf = looks_like_pdf || content_type == "application/pdf";
-
-    if is_pdf {
+    // Generalized from a PDF-only special case — see `download_kind`.
+    if let Some(kind) = download_kind(stripped_url, &content_type) {
         let bytes = match read_body_capped(response, SCRAPE_MAX_BODY_BYTES).await {
             Ok(b) => b,
             Err(BodyReadError::TooLarge) => {
@@ -710,13 +847,16 @@ pub async fn web_scrape(
                         SCRAPE_MAX_BODY_BYTES / (1024 * 1024)
                     ),
                     Some(url),
-                    Some("Download the file directly and read it with lean_pdf_read_text instead."),
+                    Some(
+                        "The file is larger than this tool will buffer; fetch a smaller \
+                          artifact, or a paged/partial endpoint if the host offers one.",
+                    ),
                 );
             }
             Err(BodyReadError::Network(e)) => {
                 return error_response(
                     "SCRAPE_NETWORK_ERROR",
-                    "Failed to download the PDF body.",
+                    "Failed to download the response body.",
                     Some(&format!("{url}: {e}")),
                     Some("Check host connectivity, or try a different URL."),
                 );
@@ -726,26 +866,32 @@ pub async fn web_scrape(
         if let Err(e) = std::fs::create_dir_all(&dir) {
             return error_response(
                 "SCRAPE_NETWORK_ERROR",
-                "Could not create the cache directory for the downloaded PDF.",
+                "Could not create the cache directory for the downloaded file.",
                 Some(&e.to_string()),
                 Some("Check filesystem permissions for the user cache directory."),
             );
         }
-        let pdf_path = dir.join(pdf_cache_filename_for(stripped_url));
-        if let Err(e) = std::fs::write(&pdf_path, &bytes) {
+        let file_path = dir.join(download_cache_filename_for(stripped_url, kind.ext));
+        if let Err(e) = std::fs::write(&file_path, &bytes) {
             return error_response(
                 "SCRAPE_NETWORK_ERROR",
-                "Could not write the downloaded PDF to cache.",
+                "Could not write the downloaded file to cache.",
                 Some(&e.to_string()),
                 Some("Check filesystem permissions for the user cache directory."),
             );
         }
         return success_response(
-            json!({"cached_path": pdf_path.to_string_lossy(), "url": url}),
-            Some(
-                "URL is a PDF; downloaded to cache. Use lean_pdf_read_text or \
-                 lean_pdf_read_outline on the cached_path above.",
-            ),
+            json!({
+                "cached_path": file_path.to_string_lossy(),
+                "url": url,
+                "content_type": content_type,
+                "file_type": kind.ext,
+                "bytes": bytes.len(),
+            }),
+            Some(&format!(
+                "URL is a {} file, not an HTML page; downloaded to cache. {}",
+                kind.ext, kind.hint
+            )),
             false,
             None,
         );
@@ -761,7 +907,12 @@ pub async fn web_scrape(
             "SCRAPE_UNSUPPORTED_CONTENT_TYPE",
             &format!("URL did not return an HTML page (Content-Type: {shown})."),
             Some(url),
-            Some("This tool extracts article/documentation body text from HTML pages only."),
+            Some(
+                "This tool scrapes HTML pages, and downloads document/text types \
+                 (pdf, docx, xlsx, csv, txt, md, json, xml, yaml) to the cache for \
+                 the lean_*_read tools. This type is neither, so there is nothing \
+                 that could read it — look for an HTML or document version instead.",
+            ),
         );
     }
 
@@ -1206,13 +1357,134 @@ mod tests {
     }
 
     #[test]
-    fn pdf_filename_sanitizes_and_forces_extension() {
+    fn download_filename_sanitizes_and_forces_extension() {
         assert_eq!(
-            pdf_filename_for("https://e.com/docs/my report.pdf"),
+            download_filename_for("https://e.com/docs/my report.pdf", "pdf"),
             "my_report.pdf"
         );
-        assert_eq!(pdf_filename_for("https://e.com/paper"), "paper.pdf");
-        assert_eq!(pdf_filename_for("https://e.com/"), "downloaded.pdf");
+        assert_eq!(
+            download_filename_for("https://e.com/paper", "pdf"),
+            "paper.pdf"
+        );
+        assert_eq!(
+            download_filename_for("https://e.com/", "pdf"),
+            "downloaded.pdf"
+        );
+        // Same treatment for every other saveable type, which is the point of
+        // generalizing it: an extensionless API path still lands on a name a
+        // reader can dispatch on.
+        assert_eq!(
+            download_filename_for("https://e.com/api/v1/records", "json"),
+            "records.json"
+        );
+        assert_eq!(
+            download_filename_for("https://e.com/exports/q3 report.csv", "csv"),
+            "q3_report.csv"
+        );
+        assert_eq!(
+            download_filename_for("https://e.com/", "txt"),
+            "downloaded.txt"
+        );
+    }
+
+    /// The classifier is the whole fix: everything non-HTML except PDF used to
+    /// be refused outright, with a hint the model could do nothing with.
+    #[test]
+    fn documents_and_text_types_are_downloaded_not_refused() {
+        // Content-type is authoritative when it maps — these URLs have no
+        // extension at all, which is the common REST-endpoint shape.
+        assert_eq!(
+            download_kind("https://e.com/api/records", "application/json")
+                .expect("json is saveable")
+                .ext,
+            "json"
+        );
+        assert_eq!(
+            download_kind("https://e.com/readme", "text/plain")
+                .expect("plain text is saveable")
+                .ext,
+            "txt"
+        );
+        assert_eq!(
+            download_kind(
+                "https://e.com/d/1234",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            )
+            .expect("docx is saveable")
+            .ext,
+            "docx"
+        );
+        // …and the extension is the fallback when the server says nothing
+        // useful, which is what the old `looks_like_pdf` check did.
+        assert_eq!(
+            download_kind("https://e.com/report.xlsx", "application/octet-stream")
+                .expect("extension fallback")
+                .ext,
+            "xlsx"
+        );
+        assert_eq!(
+            download_kind("https://e.com/paper.pdf", "")
+                .expect("no content-type at all")
+                .ext,
+            "pdf"
+        );
+    }
+
+    #[test]
+    fn each_saveable_type_names_a_tool_that_can_read_it() {
+        // A cached path with no usable next step is no better than the refusal
+        // it replaces.
+        for (url, ct, want) in [
+            ("https://e.com/a.pdf", "", "lean_pdf_read_text"),
+            ("https://e.com/a.docx", "", "lean_word_read_text"),
+            ("https://e.com/a.xlsx", "", "lean_excel_inspect"),
+            ("https://e.com/a.csv", "", "lean_file_read"),
+            ("https://e.com/a.json", "", "lean_file_read"),
+        ] {
+            let k = download_kind(url, ct).expect(url);
+            assert!(k.hint.contains(want), "{url}: hint was {:?}", k.hint);
+        }
+    }
+
+    #[test]
+    fn html_is_never_treated_as_a_download() {
+        // A `.md`/`.txt` path that actually renders a page must still scrape,
+        // or the generalization would break ordinary docs URLs.
+        assert_eq!(download_kind("https://e.com/guide.md", "text/html"), None);
+        assert_eq!(download_kind("https://e.com/a.txt", "text/html"), None);
+        assert_eq!(
+            download_kind("https://e.com/page", "application/xhtml+xml"),
+            None
+        );
+    }
+
+    #[test]
+    fn unreadable_types_are_still_refused() {
+        // The allowlist stays an allowlist: nothing downstream can read these,
+        // so saving one would only leave junk on the user's disk.
+        for (url, ct) in [
+            ("https://e.com/a.zip", "application/zip"),
+            ("https://e.com/setup.exe", "application/octet-stream"),
+            ("https://e.com/a.mp4", "video/mp4"),
+            ("https://e.com/a.png", "image/png"),
+            ("https://e.com/thing", "application/octet-stream"),
+        ] {
+            assert_eq!(download_kind(url, ct), None, "{url} must stay refused");
+        }
+    }
+
+    #[test]
+    fn a_query_string_does_not_hide_the_extension() {
+        // `web_scrape` strips query/fragment before calling in; this pins that
+        // the extension reader agrees with that contract.
+        assert_eq!(
+            url_extension("https://e.com/a/report.csv"),
+            Some("csv".into())
+        );
+        assert_eq!(url_extension("https://e.com/a/report"), None);
+        // A dotted path segment with no real extension must not be mistaken
+        // for one.
+        assert_eq!(url_extension("https://e.com/v1.2/data"), None);
     }
 
     /// Two different sources whose URLs end in the same path segment must not
@@ -1220,10 +1492,10 @@ mod tests {
     /// overwrote the first, and a model reading both back got the same
     /// document twice.
     #[test]
-    fn pdf_cache_names_do_not_collide_across_sources() {
-        let a = pdf_cache_filename_for("https://a.com/docs/report.pdf");
-        let b = pdf_cache_filename_for("https://b.com/2024/report.pdf");
-        let c = pdf_cache_filename_for("https://a.com/other/report.pdf");
+    fn download_cache_names_do_not_collide_across_sources() {
+        let a = download_cache_filename_for("https://a.com/docs/report.pdf", "pdf");
+        let b = download_cache_filename_for("https://b.com/2024/report.pdf", "pdf");
+        let c = download_cache_filename_for("https://a.com/other/report.pdf", "pdf");
         assert_ne!(a, b, "different hosts must not share a cache file");
         assert_ne!(
             a, c,
@@ -1241,21 +1513,54 @@ mod tests {
 
         // Same URL twice is the same file — this is a cache, not a
         // scatter-gun.
-        assert_eq!(a, pdf_cache_filename_for("https://a.com/docs/report.pdf"));
+        assert_eq!(
+            a,
+            download_cache_filename_for("https://a.com/docs/report.pdf", "pdf")
+        );
     }
 
     #[test]
-    fn pdf_filename_suffixes_windows_reserved_stems() {
+    fn download_filename_suffixes_windows_reserved_stems() {
         // `CON.pdf`/`NUL.pdf`/`COM1.pdf` are device names on Windows, not
         // files — the stem must be suffixed (audit #125).
-        assert_eq!(pdf_filename_for("https://e.com/CON"), "CON_.pdf");
-        assert_eq!(pdf_filename_for("https://e.com/con.pdf"), "con_.pdf");
-        assert_eq!(pdf_filename_for("https://e.com/NUL.pdf"), "NUL_.pdf");
-        assert_eq!(pdf_filename_for("https://e.com/COM1.pdf"), "COM1_.pdf");
-        assert_eq!(pdf_filename_for("https://e.com/lpt9.pdf"), "lpt9_.pdf");
+        assert_eq!(
+            download_filename_for("https://e.com/CON", "pdf"),
+            "CON_.pdf"
+        );
+        assert_eq!(
+            download_filename_for("https://e.com/con.pdf", "pdf"),
+            "con_.pdf"
+        );
+        assert_eq!(
+            download_filename_for("https://e.com/NUL.pdf", "pdf"),
+            "NUL_.pdf"
+        );
+        assert_eq!(
+            download_filename_for("https://e.com/COM1.pdf", "pdf"),
+            "COM1_.pdf"
+        );
+        assert_eq!(
+            download_filename_for("https://e.com/lpt9.pdf", "pdf"),
+            "lpt9_.pdf"
+        );
         // Merely starting with a reserved stem is fine.
-        assert_eq!(pdf_filename_for("https://e.com/CONSOLE.pdf"), "CONSOLE.pdf");
-        assert_eq!(pdf_filename_for("https://e.com/contact.pdf"), "contact.pdf");
+        assert_eq!(
+            download_filename_for("https://e.com/CONSOLE.pdf", "pdf"),
+            "CONSOLE.pdf"
+        );
+        assert_eq!(
+            download_filename_for("https://e.com/contact.pdf", "pdf"),
+            "contact.pdf"
+        );
+        // The guard must hold for every newly-saveable type too, not just pdf.
+        assert_eq!(
+            download_filename_for("https://e.com/CON", "json"),
+            "CON_.json"
+        );
+        assert_eq!(
+            download_filename_for("https://e.com/aux.csv", "csv"),
+            "aux_.csv"
+        );
     }
 
     #[test]

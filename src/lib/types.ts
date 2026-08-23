@@ -725,6 +725,17 @@ export interface PathInfo {
   exists: boolean;
 }
 
+/** Mirrors `commands::file::StagedAttachment` — one attached path after
+    staging. `path` is what the model is told about: the original when the tool
+    plugins could already reach it, otherwise a copy inside the session's
+    working directory. */
+export interface StagedAttachment {
+  original_path: string;
+  path: string;
+  name: string;
+  staged: boolean;
+}
+
 /** Mirrors `commands::file::FileEntry` — one file (or, as of release-fixes-2,
     subfolder) from a `list_directory` disk-scan (Artifacts pane, Round-7
     item 5). */

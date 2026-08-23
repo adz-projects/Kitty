@@ -196,6 +196,7 @@ pub fn run() {
             commands::read_text_file,
             commands::read_file_any,
             commands::copy_file_into_chat_folder,
+            commands::stage_attachments,
             commands::write_file,
             commands::list_folders,
             commands::create_folder,

@@ -404,6 +404,7 @@ async fn run_stream(
         active_provider_idle_timeout(app).unwrap_or(300),
     ));
     let mut bytes = resp.bytes_stream();
+    let mut deltas = DeltaBatcher::default();
     'outer: loop {
         let chunk = match tokio::time::timeout(idle, bytes.next()).await {
             Ok(Some(item)) => item.map_err(|e| format!("BigTiny stream failed: {e}"))?,
@@ -431,13 +432,88 @@ async fn run_stream(
                 &mut outcome,
                 &mut tool_seq,
                 &mut current_tool,
+                &mut deltas,
             );
             if is_last {
+                deltas.flush(app, session_id);
                 break 'outer;
             }
         }
+        // Time-based release of whatever text accumulated across this chunk's
+        // frames. Checked per chunk rather than per frame so a burst of tokens
+        // in one chunk still goes out as a single event.
+        if deltas.due() {
+            deltas.flush(app, session_id);
+        }
     }
+    // The stream can also end via `Ok(None)` (daemon closed cleanly) without an
+    // `is_last` frame, so flush once more rather than stranding buffered text.
+    deltas.flush(app, session_id);
     Ok(outcome)
+}
+
+/// How long streamed text may accumulate before it is emitted to the webview.
+///
+/// BigTiny emits one SSE frame per token, and this used to forward each one as
+/// its own Tauri event — a JSON serialization plus an IPC hop across the
+/// webview bridge, per token, per open window. The frontend has always
+/// coalesced deltas into one store write per animation frame
+/// (`chatStore.ts`'s `bufferDelta`/`flushDeltas`), so batching here changes
+/// nothing it can observe: at 25 ms the webview still receives text faster
+/// than it can paint it.
+const DELTA_BATCH_MS: u128 = 25;
+
+/// Accumulates streamed text so it can be emitted in batches rather than per
+/// token.
+///
+/// Ordering is the thing to preserve: a tool call, an error, or the terminal
+/// `complete` event must never overtake the text that preceded it. Every
+/// non-delta emission is therefore preceded by a `flush`, and the stream
+/// flushes once more when it ends.
+#[derive(Default)]
+struct DeltaBatcher {
+    text: String,
+    reasoning: String,
+    last_flush: Option<std::time::Instant>,
+}
+
+impl DeltaBatcher {
+    fn push_text(&mut self, s: &str) {
+        self.text.push_str(s);
+    }
+
+    fn push_reasoning(&mut self, s: &str) {
+        self.reasoning.push_str(s);
+    }
+
+    /// True once enough time has passed that the buffered text should go out.
+    fn due(&self) -> bool {
+        if self.text.is_empty() && self.reasoning.is_empty() {
+            return false;
+        }
+        match self.last_flush {
+            None => true,
+            Some(t) => t.elapsed().as_millis() >= DELTA_BATCH_MS,
+        }
+    }
+
+    fn flush(&mut self, app: &AppHandle, session_id: &str) {
+        if !self.text.is_empty() {
+            let _ = app.emit(
+                "chat://message-delta",
+                json!({ "session_id": session_id, "text": self.text }),
+            );
+            self.text.clear();
+        }
+        if !self.reasoning.is_empty() {
+            let _ = app.emit(
+                "chat://reasoning-delta",
+                json!({ "session_id": session_id, "text": self.reasoning }),
+            );
+            self.reasoning.clear();
+        }
+        self.last_flush = Some(std::time::Instant::now());
+    }
 }
 
 /// Translate one BigTiny SSE event into its `chat://*` emission(s).
@@ -448,6 +524,7 @@ fn handle_event(
     outcome: &mut TurnOutcome,
     tool_seq: &mut u64,
     current_tool: &mut Option<(String, String)>,
+    deltas: &mut DeltaBatcher,
 ) {
     let kind = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
     let content = event.get("content").and_then(|c| c.as_str());
@@ -456,21 +533,21 @@ fn handle_event(
         .and_then(|t| t.as_str())
         .unwrap_or("");
 
+    // Text accumulates in the batcher; everything else flushes it first so a
+    // later event can never be delivered ahead of the text it followed.
+    if kind != "llm_delta" && kind != "reasoning_delta" {
+        deltas.flush(app, session_id);
+    }
+
     match kind {
         "llm_delta" => {
             if let Some(text) = content {
-                let _ = app.emit(
-                    "chat://message-delta",
-                    json!({ "session_id": session_id, "text": text }),
-                );
+                deltas.push_text(text);
             }
         }
         "reasoning_delta" => {
             if let Some(text) = content {
-                let _ = app.emit(
-                    "chat://reasoning-delta",
-                    json!({ "session_id": session_id, "text": text }),
-                );
+                deltas.push_reasoning(text);
             }
         }
         "tool_start" => {

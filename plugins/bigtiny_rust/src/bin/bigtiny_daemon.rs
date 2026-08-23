@@ -87,8 +87,39 @@ fn parse_args() -> Args {
 }
 
 
-#[tokio::main]
-async fn main() {
+/// Worker threads for the async runtime.
+///
+/// A bare `#[tokio::main]` spawns one worker per CPU and allows up to 512
+/// blocking threads, sized for a server saturating a machine. This is a
+/// single-user desktop/phone daemon whose async work is overwhelmingly waiting
+/// on a network socket or SQLite, so the extra workers buy nothing and each
+/// carries a stack. Capped rather than fixed so a 4-core machine still gets 4.
+///
+/// Blocking threads are what `spawn_blocking` uses — here that is the LiteRT
+/// embed/summarize actors plus token counting, a handful at a time, never
+/// hundreds.
+const MAX_WORKER_THREADS: usize = 4;
+const MAX_BLOCKING_THREADS: usize = 16;
+/// 2 MiB is the Rust default; the daemon has no deep-recursion paths, and on
+/// Android this is multiplied across every worker in a memory-tight process.
+const WORKER_STACK_SIZE: usize = 1024 * 1024;
+
+fn main() {
+    let worker_threads = std::thread::available_parallelism()
+        .map(|n| n.get().min(MAX_WORKER_THREADS))
+        .unwrap_or(2)
+        .max(2);
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .max_blocking_threads(MAX_BLOCKING_THREADS)
+        .thread_stack_size(WORKER_STACK_SIZE)
+        .enable_all()
+        .build()
+        .expect("failed to build tokio runtime")
+        .block_on(async_main());
+}
+
+async fn async_main() {
     let args = parse_args();
 
     let data_dir = resolve_data_dir();

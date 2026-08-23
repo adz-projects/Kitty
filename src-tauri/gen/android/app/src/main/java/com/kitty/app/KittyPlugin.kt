@@ -2,6 +2,10 @@ package com.kitty.app
 
 import android.Manifest
 import android.app.Activity
+import android.net.Uri
+import android.provider.OpenableColumns
+import android.webkit.MimeTypeMap
+import java.io.File
 import app.tauri.annotation.Command
 import app.tauri.annotation.InvokeArg
 import app.tauri.annotation.Permission
@@ -15,6 +19,12 @@ import app.tauri.plugin.Plugin
 class SecretArgs {
     lateinit var account: String
     var value: String? = null
+}
+
+@InvokeArg
+class CopyContentUriArgs {
+    lateinit var uri: String
+    lateinit var destDir: String
 }
 
 @InvokeArg
@@ -91,6 +101,98 @@ class KittyPlugin(private val activity: Activity) : Plugin(activity) {
             invoke.resolve()
         } catch (e: Exception) {
             invoke.reject("could not delete the secret: ${e.message}", e)
+        }
+    }
+
+    // --- Attachments -----------------------------------------------------
+
+    /**
+     * Copy a `content://` attachment into a real directory, and report the
+     * name the user actually knows it by.
+     *
+     * The document picker (`ACTION_OPEN_DOCUMENT`, behind Tauri's dialog
+     * plugin) hands back a `content://` URI, not a path. Rust cannot
+     * `File::open` one — there is no file there — so an attached document
+     * reached the model as an opaque URI it had no tool for. Worse, deriving a
+     * display name from the URI's last segment produces the provider's
+     * internal id (`msf%3A1000000123`), which is what the user saw on the
+     * attachment chip.
+     *
+     * Both answers live behind the ContentResolver, so both are taken here in
+     * one pass: `OpenableColumns.DISPLAY_NAME` for the name, and
+     * `openInputStream` for the bytes.
+     *
+     * Resolves `{ name, path }` — the copy's final basename (which may be
+     * de-duplicated) and its absolute path.
+     */
+    @Command
+    fun copyContentUri(invoke: Invoke) {
+        val args = invoke.parseArgs(CopyContentUriArgs::class.java)
+        try {
+            val uri = Uri.parse(args.uri)
+            val resolver = activity.contentResolver
+
+            // The provider is the only thing that knows the human name. A
+            // provider is allowed to answer nothing, so fall back to a
+            // generic name with an extension derived from the MIME type —
+            // the readers dispatch on extension, so losing that would break
+            // the handoff even when the copy itself succeeded.
+            var displayName: String? = null
+            try {
+                resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+                    ?.use { c ->
+                        if (c.moveToFirst()) {
+                            val i = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                            if (i >= 0 && !c.isNull(i)) displayName = c.getString(i)
+                        }
+                    }
+            } catch (_: Exception) {
+                // A provider that refuses the query is not a failed copy.
+            }
+
+            var name = displayName?.trim().orEmpty()
+            if (name.isEmpty()) {
+                val ext = MimeTypeMap.getSingleton()
+                    .getExtensionFromMimeType(resolver.getType(uri))
+                name = if (ext.isNullOrEmpty()) "attachment" else "attachment.$ext"
+            }
+            // Strip anything that could escape the destination directory or
+            // name a device on the host: the provider controls this string.
+            name = name.map {
+                if (it.isISOControl() || it in "\\/:*?\"<>|") "_" else it
+            }.joinToString("")
+            if (name == "." || name == "..") name = "attachment"
+
+            val dir = File(args.destDir)
+            dir.mkdirs()
+
+            // Same de-duplication rule as the desktop copy path
+            // (`commands::file::copy_file_into_chat_folder_blocking`): never
+            // overwrite, and keep the readable name.
+            val stem = name.substringBeforeLast('.', name)
+            val ext = name.substringAfterLast('.', "")
+            var dest = File(dir, name)
+            var n = 2
+            while (dest.exists()) {
+                dest = File(dir, if (ext.isEmpty()) "$stem ($n)" else "$stem ($n).$ext")
+                n++
+            }
+
+            val bytes = resolver.openInputStream(uri)?.use { input ->
+                dest.outputStream().use { output -> input.copyTo(output) }
+            } ?: run {
+                invoke.reject("could not open the attachment: ${args.uri}")
+                return
+            }
+
+            invoke.resolve(
+                JSObject()
+                    .put("name", dest.name)
+                    .put("path", dest.absolutePath)
+                    .put("bytes", bytes)
+            )
+        } catch (e: Exception) {
+            invoke.reject("could not copy the attachment: ${e.message}", e)
         }
     }
 

@@ -264,6 +264,7 @@ fn normalize_base(base_url: &str) -> String {
 ///   2. **HuggingFace** — when `model` is an `owner/repo`, its
 ///      `tokenizer_config.json` `chat_template`, same extraction;
 ///   3. otherwise `None`, which hides the dropdown.
+///
 /// Best-effort throughout: any network/parse failure falls through to the next
 /// source, then to `None`.
 async fn probe_effort_levels(

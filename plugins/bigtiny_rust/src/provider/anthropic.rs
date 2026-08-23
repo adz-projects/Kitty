@@ -338,7 +338,7 @@ impl Provider for AnthropicProvider {
 
     async fn chat_completion(
         &self,
-        messages: Vec<Value>,
+        messages: &[Value],
         tools: Option<Vec<Value>>,
         sampling: SamplingParams,
         model: Option<String>,
@@ -1405,7 +1405,7 @@ mod sse_tests {
             serde_json::json!({"role": "user", "content": "hi"}),
         ];
         let stream = provider
-            .chat_completion(messages, None, SamplingParams::default(), None, None)
+            .chat_completion(&messages, None, SamplingParams::default(), None, None)
             .await
             .unwrap();
         let _: Vec<Delta> = stream.collect().await;
@@ -1448,7 +1448,7 @@ mod sse_tests {
             serde_json::json!({"role": "user", "content": "hi"}),
         ];
         let stream = provider
-            .chat_completion(messages, None, SamplingParams::default(), None, None)
+            .chat_completion(&messages, None, SamplingParams::default(), None, None)
             .await
             .unwrap();
         let _: Vec<Delta> = stream.collect().await;
@@ -1489,7 +1489,7 @@ mod sse_tests {
             ..Default::default()
         };
         let stream = provider
-            .chat_completion(messages, None, sampling, None, None)
+            .chat_completion(&messages, None, sampling, None, None)
             .await
             .unwrap();
         let _: Vec<Delta> = stream.collect().await;

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use regex::Regex;
 use serde_json::Map;
@@ -962,12 +962,15 @@ async fn run_compaction_inner(
     // region warranted and the fold loop started from that inflated total,
     // stopping high above low-water. Base both the trigger and the fold
     // budget on the candidate region only.
-    let token_of = |rowid: i64| -> i64 {
-        rows.iter()
-            .find(|r| r.rowid == rowid)
-            .map(|r| r.token_count.unwrap_or(0) as i64)
-            .unwrap_or(0)
-    };
+    // Indexed once rather than a linear `rows.iter().find(...)` per lookup.
+    // This closure is called once per candidate row for the trigger sum and
+    // then again per row per exchange in the fold loop below, so the scan made
+    // the whole pass O(n²) over the uncompacted region.
+    let tokens_by_rowid: HashMap<i64, i64> = rows
+        .iter()
+        .map(|r| (r.rowid, r.token_count.unwrap_or(0) as i64))
+        .collect();
+    let token_of = |rowid: i64| -> i64 { tokens_by_rowid.get(&rowid).copied().unwrap_or(0) };
     let foldable_tokens: i64 = candidate_rows
         .iter()
         .filter_map(|v| v.get("rowid").and_then(|r| r.as_i64()))

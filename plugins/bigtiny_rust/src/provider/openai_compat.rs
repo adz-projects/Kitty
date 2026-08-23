@@ -152,9 +152,9 @@ impl OpenAICompatibleProvider {
     /// caching for backends keyed on a stable prompt head. Mirrors what
     /// `AnthropicProvider::chat_completion` does for its single `system`
     /// string field.
-    fn merge_system_messages(messages: Vec<Value>) -> Vec<Value> {
+    fn merge_system_messages(messages: &[Value]) -> Vec<Value> {
         let mut out = Vec::new();
-        let mut iter = messages.into_iter();
+        let mut iter = messages.iter();
 
         let mut system_parts: Vec<String> = Vec::new();
         // Consume the contiguous leading system run only; stop at the first
@@ -167,7 +167,7 @@ impl OpenAICompatibleProvider {
                     }
                 }
                 Some(msg) => {
-                    out.push(msg);
+                    out.push(msg.clone());
                     break;
                 }
                 None => break,
@@ -183,7 +183,7 @@ impl OpenAICompatibleProvider {
                 }),
             );
         }
-        out.extend(iter);
+        out.extend(iter.cloned());
         out
     }
 
@@ -195,7 +195,7 @@ impl OpenAICompatibleProvider {
     /// (leading-run only, KV-cache-preserving) this sacrifices the tail
     /// placement of injected recall to satisfy the template — correctness over
     /// prefix-cache reuse, and only for the self-hosted dialects that need it.
-    fn hoist_all_system_messages(messages: Vec<Value>) -> Vec<Value> {
+    fn hoist_all_system_messages(messages: &[Value]) -> Vec<Value> {
         let mut system_parts: Vec<String> = Vec::new();
         let mut rest: Vec<Value> = Vec::new();
         for msg in messages {
@@ -204,7 +204,7 @@ impl OpenAICompatibleProvider {
                     system_parts.push(c.to_string());
                 }
             } else {
-                rest.push(msg);
+                rest.push(msg.clone());
             }
         }
         let mut out = Vec::new();
@@ -349,7 +349,7 @@ impl Provider for OpenAICompatibleProvider {
 
     async fn chat_completion(
         &self,
-        messages: Vec<Value>,
+        messages: &[Value],
         tools: Option<Vec<Value>>,
         sampling: SamplingParams,
         model: Option<String>,
@@ -1048,7 +1048,11 @@ impl Stream for OpenAISSEStream {
                         self.done = true;
                         continue;
                     }
-                    while let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
+                    // `memchr` rather than a byte-by-byte `position`. This runs
+                    // once per line of every streamed chunk, and the scan
+                    // restarts at index 0 each time — on a chunk carrying many
+                    // short SSE frames that is the hottest loop in the daemon.
+                    while let Some(pos) = memchr::memchr(b'\n', &self.buf) {
                         let mut raw: Vec<u8> = self.buf.drain(..=pos).collect();
                         while matches!(raw.last(), Some(&b'\r') | Some(&b'\n')) {
                             raw.pop();
@@ -1609,7 +1613,7 @@ mod sse_tests {
         );
         let messages = vec![serde_json::json!({"role": "user", "content": "hi"})];
         let stream = provider
-            .chat_completion(messages, None, SamplingParams::default(), None, Some(2))
+            .chat_completion(&messages, None, SamplingParams::default(), None, Some(2))
             .await
             .unwrap();
         let _: Vec<Delta> = stream.collect().await;
@@ -1644,7 +1648,7 @@ mod sse_tests {
         );
         let messages = vec![serde_json::json!({"role": "user", "content": "hi"})];
         let stream = provider
-            .chat_completion(messages, None, SamplingParams::default(), None, None)
+            .chat_completion(&messages, None, SamplingParams::default(), None, None)
             .await
             .unwrap();
         let _: Vec<Delta> = stream.collect().await;
@@ -1710,7 +1714,7 @@ mod sse_tests {
         );
         let messages = vec![serde_json::json!({"role": "user", "content": "hi"})];
         let stream = provider
-            .chat_completion(messages, None, SamplingParams::default(), None, None)
+            .chat_completion(&messages, None, SamplingParams::default(), None, None)
             .await
             .unwrap();
         let _: Vec<Delta> = stream.collect().await;
@@ -1770,7 +1774,7 @@ mod sse_tests {
         );
         let messages = vec![serde_json::json!({"role": "user", "content": "hi"})];
         let stream = provider
-            .chat_completion(messages, None, SamplingParams::default(), None, None)
+            .chat_completion(&messages, None, SamplingParams::default(), None, None)
             .await
             .unwrap();
         let deltas: Vec<Delta> = stream.collect().await;
@@ -1808,7 +1812,7 @@ mod sse_tests {
         );
         let messages = vec![serde_json::json!({"role": "user", "content": "hi"})];
         let stream = provider
-            .chat_completion(messages, None, SamplingParams::default(), None, None)
+            .chat_completion(&messages, None, SamplingParams::default(), None, None)
             .await
             .unwrap();
         let _: Vec<Delta> = stream.collect().await;
@@ -1942,7 +1946,7 @@ mod sse_tests {
             serde_json::json!({"role": "system", "content": "memory"}),
             serde_json::json!({"role": "assistant", "content": "hello"}),
         ];
-        let merged = OpenAICompatibleProvider::merge_system_messages(messages);
+        let merged = OpenAICompatibleProvider::merge_system_messages(&messages);
         assert_eq!(merged.len(), 4);
         // Leading run merged into a single front system block...
         assert_eq!(merged[0]["role"], "system");
@@ -1961,7 +1965,7 @@ mod sse_tests {
             serde_json::json!({"role": "user", "content": "hi"}),
             serde_json::json!({"role": "assistant", "content": "hello"}),
         ];
-        let merged = OpenAICompatibleProvider::merge_system_messages(messages.clone());
+        let merged = OpenAICompatibleProvider::merge_system_messages(&messages);
         assert_eq!(merged, messages);
     }
 
@@ -1978,7 +1982,7 @@ mod sse_tests {
             serde_json::json!({"role": "system", "content": "memory"}),
             serde_json::json!({"role": "assistant", "content": "hello"}),
         ];
-        let out = OpenAICompatibleProvider::hoist_all_system_messages(messages);
+        let out = OpenAICompatibleProvider::hoist_all_system_messages(&messages);
         // One leading system block carrying every system part, in order.
         assert_eq!(out.len(), 3);
         assert_eq!(out[0]["role"], "system");
@@ -2100,7 +2104,7 @@ mod sse_tests {
             serde_json::json!({"role": "user", "content": "hi"}),
         ];
         let stream = provider
-            .chat_completion(messages, None, SamplingParams::default(), None, None)
+            .chat_completion(&messages, None, SamplingParams::default(), None, None)
             .await
             .unwrap();
         let _: Vec<Delta> = stream.collect().await;
