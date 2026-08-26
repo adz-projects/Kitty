@@ -210,13 +210,51 @@ pub fn check_containment(args: &Value, allowed_dirs: &[String], strict: bool) ->
 }
 
 /// Home directory for the current user — `USERPROFILE` on Windows, `HOME`
-/// elsewhere. BigTiny deliberately doesn't pull in a `dirs`-style crate just
-/// for this; these two env vars are the standard, and the paths built from
-/// them (the kitty-web cache dirs below) only need to *match* what kitty-web
-/// itself computes, which uses `dirs::home_dir()` — the same env var.
+/// elsewhere, with `KITTY_PLUGIN_HOME` taking priority over both. BigTiny
+/// deliberately doesn't pull in a `dirs`-style crate just for this; these env
+/// vars are the standard, and the paths built from them (the kitty-web/
+/// kitty-tools cache dirs below) only need to *match* what those crates
+/// themselves compute.
+///
+/// `KITTY_PLUGIN_HOME` has to come first because it's the one override that
+/// actually changes the answer on Android: bionic's `getpwuid` reports `/data`
+/// for `$HOME` there, which is unwritable and shared by every app on the
+/// device, so `bigtiny_env.rs`'s `daemon_env` sets `KITTY_PLUGIN_HOME` to
+/// Kitty's real app data dir before the daemon starts (see that env var's own
+/// doc comment in `kitty-tools`' `paths.rs`, which resolves `home_dir()` in
+/// exactly this order). Without checking it here too, this function and
+/// `kitty-tools::paths::home_dir` disagreed about where "home" was on
+/// Android — the cache dir `scratch_allowance` builds below never matched the
+/// directory `kitty-tools` actually writes its cache under
+/// (`~/.cache/lean-goose-mcp`), so every read of the daemon's own cached
+/// scrape/search files failed containment and was force-escalated to a human
+/// approval, on every single call.
 fn home_dir() -> Option<std::path::PathBuf> {
-    std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))
+    // A closure, not the bare `std::env::var_os` function item: that's
+    // generic over `K: AsRef<OsStr>`, and rustc can't unify it with the
+    // `impl Fn(&str) -> _` this function wants for every lifetime (a known
+    // higher-ranked-trait-bound inference gap around generic function items).
+    resolve_home(|key: &str| std::env::var_os(key))
+}
+
+/// The resolution order itself, taking its environment lookup as a parameter
+/// so the priority order is testable without mutating real process
+/// environment variables — `cargo test` runs this crate's tests in parallel
+/// within one binary, and `std::env::set_var` isn't safe against a
+/// concurrent reader (see `bigtiny_embedded.rs`'s own comment on that).
+/// Mirrors `kitty-tools`' `paths::resolve_home`.
+fn resolve_home(
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Option<std::path::PathBuf> {
+    // Filtered on the *string* form, not just non-empty `OsString`: Android
+    // sets some of these to whitespace/empty rather than leaving them unset
+    // (same reasoning as `kitty-tools::paths::resolve_home`, which this
+    // mirrors).
+    ["KITTY_PLUGIN_HOME", "USERPROFILE", "HOME"]
+        .into_iter()
+        .find_map(|key| {
+            env(key).filter(|v| v.to_str().is_none_or(|s| !s.trim().is_empty()))
+        })
         .map(std::path::PathBuf::from)
 }
 
@@ -296,6 +334,60 @@ pub fn allowed_dirs_for_session(metadata: &Value, cache_dir: &str) -> Vec<String
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The regression this module exists to prevent: on Android,
+    /// `KITTY_PLUGIN_HOME` must win over `USERPROFILE`/`HOME` (bionic's
+    /// `$HOME` there is the unhelpful, unwritable `/data`), or this crate's
+    /// notion of "home" disagrees with `kitty-tools`'/`kitty-web`'s — and every
+    /// read of their own cache files (`~/.cache/lean-goose-mcp/...`) fails
+    /// containment and is force-escalated to a human approval, every time.
+    #[test]
+    fn kitty_plugin_home_wins_over_userprofile_and_home() {
+        let env = |key: &str| match key {
+            "KITTY_PLUGIN_HOME" => {
+                Some(std::ffi::OsString::from("/data/user/0/com.kitty.app/Kitty"))
+            }
+            "HOME" => Some(std::ffi::OsString::from("/data")),
+            "USERPROFILE" => Some(std::ffi::OsString::from(r"C:\Users\someone")),
+            _ => None,
+        };
+        assert_eq!(
+            resolve_home(env),
+            Some(std::path::PathBuf::from(
+                "/data/user/0/com.kitty.app/Kitty"
+            ))
+        );
+    }
+
+    /// Android sets some of these to the empty string rather than leaving
+    /// them unset — a blank override must not shadow a real fallback.
+    #[test]
+    fn a_blank_kitty_plugin_home_is_skipped_not_used() {
+        let env = |key: &str| match key {
+            "KITTY_PLUGIN_HOME" => Some(std::ffi::OsString::from("   ")),
+            "HOME" => Some(std::ffi::OsString::from("/home/real")),
+            _ => None,
+        };
+        assert_eq!(
+            resolve_home(env),
+            Some(std::path::PathBuf::from("/home/real"))
+        );
+    }
+
+    /// With no `KITTY_PLUGIN_HOME` set at all (every non-Android host),
+    /// resolution falls through to `USERPROFILE`/`HOME` exactly as before —
+    /// the desktop path this change must not disturb.
+    #[test]
+    fn resolution_falls_through_to_userprofile_and_home_when_unset() {
+        let env = |key: &str| match key {
+            "USERPROFILE" => Some(std::ffi::OsString::from(r"C:\Users\someone")),
+            _ => None,
+        };
+        assert_eq!(
+            resolve_home(env),
+            Some(std::path::PathBuf::from(r"C:\Users\someone"))
+        );
+    }
 
     #[test]
     fn test_path_within_any_simple() {
