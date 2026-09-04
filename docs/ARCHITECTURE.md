@@ -4,6 +4,27 @@ One-page module map with dependency direction — the flat inventory in
 a flat file inventory has no edges; this does. Arrows read "depends on" /
 "calls into."
 
+> ## Two BigTiny daemons now exist. Know which one you are editing.
+>
+> - **`plugins/bigtiny_rust/` (V1) is FROZEN.** Bug fixes only, no new
+>   features. It is what Kitty ships against today, and it is the rollback path
+>   for the migration. Everything below in this document describes V1 and Kitty
+>   as they are, and stays accurate until Kitty migrates.
+> - **`BigTinyV2/` is where features land.** A fork of V1 being developed into
+>   a multi-app daemon: several frontends (Kitty, a research pipeline, an AI
+>   notebook) attach to one instance, each with its own sessions, providers,
+>   MCP servers, and plugin instances. Layout: `daemon/` (the fork),
+>   `protocol/` (wire types shared with clients), `client/` (the reusable Rust
+>   client).
+>
+> The two coexist deliberately and must not be able to touch each other: V2
+> uses `%APPDATA%/BigTinyV2` (env `BIGTINYV2_DATA_DIR`), a binary named
+> `bigtiny2-daemon`, and its own handshake file. Kitty is untouched by V2 work
+> and keeps spawning V1 exactly as it always has.
+>
+> Kitty migrates onto V2 as a separate, deferrable step. Kitty-on-V1 with new
+> apps on V2 is a stable resting state, not a half-finished one.
+
 ## Rust (`src-tauri/src/`)
 
 ```

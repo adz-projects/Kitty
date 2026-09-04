@@ -1,0 +1,24 @@
+# The BigTiny V2 wire contract: types only, no I/O.
+#
+# Exists so the daemon and the client crate cannot drift. A consumer that only
+# talks HTTP must never have to link the daemon (sqlx, rmcp, LiteRT, wasmtime)
+# to name an event or a request body -- which is exactly what V1 forced, since
+# `SSEEvent` lived inside the daemon crate and Kitty's client hand-rolled a
+# parallel copy in TypeScript and Rust.
+#
+# Dependencies here are deliberately minimal and must stay that way: serde plus
+# a clock. Anything needing a runtime, a socket, or a database belongs in the
+# daemon or the client, not in the contract.
+
+[package]
+name = "bigtiny2-protocol"
+version = "2.0.0"
+edition = "2021"
+
+[lib]
+name = "bigtiny2_protocol"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

@@ -1,0 +1,1569 @@
+use async_trait::async_trait;
+use futures::Stream;
+use serde_json::Value;
+use std::collections::HashMap;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
+
+use super::base::{
+    classify_provider_error, classify_transport_error, parse_retry_after, read_bounded_error_body,
+    Delta, Effort, HealthStatus, ModelInfo, Provider, SamplingParams,
+};
+use crate::config::{CacheConfig, ProviderConfig};
+use crate::error::ProviderError;
+use crate::network::{maybe_direct_url, TailscaleClient};
+
+/// Resolve Anthropic's `max_tokens` and optional extended-thinking budget for
+/// one turn — pure, so the three live-400 constraints it encodes are testable
+/// without an API key:
+///
+/// 1. `budget_tokens >= 1024` (Anthropic's floor).
+/// 2. `budget_tokens` strictly below `max_tokens` — which defaults to 4096, so
+///    a naive medium/high budget under that cap is an instant 400.
+/// 3. No thinking on a turn that carries tools, until signed thinking blocks
+///    round-trip across tool steps (a flagged follow-up).
+///
+/// Returns `(max_tokens, thinking_budget)`. A `None` budget means "no thinking
+/// block this turn"; the caller logs why.
+fn anthropic_thinking(
+    effort: Option<&Effort>,
+    explicit_max: Option<i32>,
+    has_tools: bool,
+) -> (i32, Option<i32>) {
+    let max = explicit_max.unwrap_or(4096);
+    let base = match effort {
+        Some(Effort::Low) => 4096,
+        Some(Effort::Medium) => 16384,
+        // High or a model-specific `Custom` level (Anthropic never actually
+        // receives one, but clamp defensively): the top budget.
+        Some(Effort::High) | Some(Effort::Custom(_)) => 32768,
+        // Off / None: no thinking, keep whatever max_tokens was resolved.
+        _ => return (max, None),
+    };
+    if has_tools {
+        return (max, None);
+    }
+    match explicit_max {
+        // No cap was set: give the answer 4096 tokens of headroom *above* the
+        // thinking budget, bounded to Anthropic's output ceiling.
+        None => ((base + 4096).min(65536), Some(base)),
+        // A cap was set: the budget must leave >=1024 tokens for the answer.
+        Some(cap) => {
+            let budget = base.min(cap - 1024);
+            if budget >= 1024 {
+                (cap, Some(budget))
+            } else {
+                (cap, None)
+            }
+        }
+    }
+}
+
+pub struct AnthropicProvider {
+    pub provider_id: String,
+    pub config: ProviderConfig,
+    client: reqwest::Client,
+    /// Dedicated client for the Tailscale direct-address attempt — bounds
+    /// ONLY the connect phase (`network::DIRECT_CONNECT_TIMEOUT`), never the
+    /// SSE body. See `OpenAICompatibleProvider::direct_client`; the old
+    /// request-level `.timeout(DIRECT_CONNECT_TIMEOUT)` killed every direct
+    /// stream at 3s.
+    direct_client: reqwest::Client,
+    tailscale: Arc<TailscaleClient>,
+    /// Cached direct-address reachability, `origin -> (reachable, checked at)`
+    /// — see `direct_is_reachable`.
+    direct_probe: dashmap::DashMap<String, (bool, Instant)>,
+    cache: CacheConfig,
+    /// SSE idle-read timeout — see `OpenAICompatibleProvider::idle_timeout`.
+    idle_timeout: Duration,
+}
+
+/// Bounds time-to-response-headers on a chat completion — see
+/// `openai_compat::RESPONSE_HEADERS_TIMEOUT`.
+const RESPONSE_HEADERS_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Bounds time-to-headers for the direct Tailscale attempt only — see
+/// `openai_compat::DIRECT_HEADERS_TIMEOUT`.
+const DIRECT_HEADERS_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// TCP keepalive probe interval for provider connections — see
+/// `openai_compat::TCP_KEEPALIVE_INTERVAL` (the #10 dead-socket rationale).
+/// How long a direct-address reachability verdict is trusted. Long enough
+/// that a normal back-and-forth pays for the probe once, short enough that
+/// moving off (or onto) the LAN is noticed within a turn or two.
+const DIRECT_PROBE_TTL: Duration = Duration::from_secs(60);
+
+const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Total-duration ceiling for one streamed response — see
+/// `openai_compat::MAX_STREAM_DURATION` (the #10 dribble rationale).
+const MAX_STREAM_DURATION: Duration = Duration::from_secs(3600);
+
+impl AnthropicProvider {
+    pub const DEFAULT_MODEL: &'static str = "claude-sonnet-4-20250514";
+
+    pub fn new(
+        provider_id: &str,
+        config: ProviderConfig,
+        tailscale: Arc<TailscaleClient>,
+        cache: CacheConfig,
+    ) -> Self {
+        let idle_timeout = config.idle_timeout();
+        let client = match reqwest::Client::builder()
+            // Same rationale as openai_compat.rs: bound the TCP/TLS setup
+            // phase (a stalled-before-headers provider must not block
+            // `chat_completion` forever) without imposing a whole-request
+            // timeout on long SSE bodies.
+            .connect_timeout(std::time::Duration::from_secs(30))
+            .tcp_keepalive(TCP_KEEPALIVE_INTERVAL)
+            .build()
+        {
+            Ok(c) => c,
+            // Don't degrade silently (see #12) — see openai_compat.rs.
+            Err(e) => {
+                tracing::error!(
+                    provider_id = %provider_id,
+                    error = %e,
+                    "failed to build the provider HTTP client; falling back to a default client (no connect-timeout/keepalive)"
+                );
+                reqwest::Client::new()
+            }
+        };
+        let direct_client = match reqwest::Client::builder()
+            .connect_timeout(crate::network::DIRECT_CONNECT_TIMEOUT)
+            .tcp_keepalive(TCP_KEEPALIVE_INTERVAL)
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(
+                    provider_id = %provider_id,
+                    error = %e,
+                    "failed to build the Tailscale direct HTTP client; falling back to a default client (no connect-timeout/keepalive)"
+                );
+                reqwest::Client::new()
+            }
+        };
+        Self {
+            provider_id: provider_id.into(),
+            client,
+            direct_client,
+            config,
+            tailscale,
+            direct_probe: dashmap::DashMap::new(),
+            cache,
+            idle_timeout,
+        }
+    }
+
+    /// See `OpenAICompatibleProvider::send_preferring_direct` — same
+    /// Tailscale direct-address-first, tunnel-fallback behavior, including
+    /// falling back on a stale direct address's non-success response.
+    async fn send_preferring_direct(
+        &self,
+        url: &str,
+        body: &Value,
+    ) -> Result<reqwest::Response, reqwest::Error> {
+        // Decide the URL first, then send the body exactly once.
+        let direct = match maybe_direct_url(&self.tailscale, url).await {
+            Some(c) if self.direct_is_reachable(&c).await => Some(c),
+            _ => None,
+        };
+        self.client
+            .post(direct.as_deref().unwrap_or(url))
+            .header("x-api-key", &self.config.api_key)
+            .header("anthropic-version", "2023-06-01")
+            .json(body)
+            .send()
+            .await
+    }
+
+    /// See `OpenAICompatibleProvider::direct_is_reachable` — same cached
+    /// cheap probe, replacing a duplicate-sending real POST.
+    async fn direct_is_reachable(&self, direct_url: &str) -> bool {
+        let origin = super::openai_compat::probe_origin(direct_url);
+        if let Some(hit) = self.direct_probe.get(&origin) {
+            if hit.1.elapsed() < DIRECT_PROBE_TTL {
+                return hit.0;
+            }
+        }
+        let req = self
+            .direct_client
+            .get(format!("{origin}/v1/models"))
+            .header("x-api-key", &self.config.api_key)
+            .header("anthropic-version", "2023-06-01")
+            .send();
+        let ok = matches!(
+            tokio::time::timeout(DIRECT_HEADERS_TIMEOUT, req).await,
+            Ok(Ok(resp)) if resp.status().is_success()
+        );
+        self.direct_probe.insert(origin, (ok, Instant::now()));
+        ok
+    }
+
+    fn group_tool_results(messages: &[Value]) -> Vec<Value> {
+        let mut result = Vec::new();
+        let mut tool_accumulator: Vec<Value> = Vec::new();
+
+        for msg in messages {
+            if msg["role"] == "tool" {
+                let mut block = serde_json::json!({
+                    "type": "tool_result",
+                    "tool_use_id": msg["tool_call_id"].as_str().unwrap_or(""),
+                });
+                if let Some(content) = msg["content"].as_str() {
+                    block["content"] = content.into();
+                } else {
+                    // Anthropic's API rejects `content: null` on a
+                    // `tool_result` block (400 on the turn) — a tool message
+                    // whose content is missing/null/non-string must become
+                    // an empty string, never null, or every such turn dies.
+                    block["content"] = "".into();
+                }
+                tool_accumulator.push(block);
+            } else {
+                if !tool_accumulator.is_empty() {
+                    result.push(serde_json::json!({
+                        "role": "user",
+                        "content": tool_accumulator.clone(),
+                    }));
+                    tool_accumulator.clear();
+                }
+                result.push(msg.clone());
+            }
+        }
+
+        if !tool_accumulator.is_empty() {
+            result.push(serde_json::json!({
+                "role": "user",
+                "content": tool_accumulator,
+            }));
+        }
+
+        result
+    }
+
+    /// One OpenAI-shaped tool definition
+    /// (`{"type":"function","function":{name,description,parameters}}`) in
+    /// Anthropic's shape (`{name, description, input_schema}`).
+    ///
+    /// The agent loop formats tools once, in OpenAI shape, for every provider
+    /// (`tools_to_openai_format`) — and this was previously assigned straight
+    /// onto the wire body, so Anthropic rejected the whole request the moment
+    /// any MCP server was connected. Converting here rather than in the loop
+    /// keeps the wire format the provider's own business (as
+    /// `convert_tool_calls` / `group_tool_results` already do) and covers the
+    /// synthetic budget tool, which the loop inlines in OpenAI shape at its
+    /// own call site and would otherwise need converting twice.
+    ///
+    /// Returns `None` for a definition with no usable name — that would 400
+    /// the entire request, and losing one tool beats losing the turn.
+    fn tool_to_anthropic(tool: &Value) -> Option<Value> {
+        // Idempotent: something already in Anthropic shape passes through.
+        if tool.get("input_schema").is_some_and(|s| s.is_object()) {
+            return Some(tool.clone());
+        }
+        let f = tool.get("function").unwrap_or(tool);
+        let name = f.get("name").and_then(|n| n.as_str()).unwrap_or("").trim();
+        if name.is_empty() {
+            tracing::warn!("dropping a tool with no name from the Anthropic request");
+            return None;
+        }
+        let mut schema = match f.get("parameters") {
+            Some(p) if p.is_object() => p.clone(),
+            _ => serde_json::json!({ "type": "object", "properties": {} }),
+        };
+        // Anthropic requires a top-level `type` on the schema; some MCP
+        // servers omit it and rely on the object-ness being implied.
+        if let Some(obj) = schema.as_object_mut() {
+            obj.entry("type").or_insert_with(|| "object".into());
+        }
+        Some(serde_json::json!({
+            "name": name,
+            "description": f.get("description").and_then(|d| d.as_str()).unwrap_or(""),
+            "input_schema": schema,
+        }))
+    }
+
+    fn tools_to_anthropic(tools: &[Value]) -> Vec<Value> {
+        tools.iter().filter_map(Self::tool_to_anthropic).collect()
+    }
+
+    fn convert_tool_calls(msg: &Value) -> Value {
+        if let Some(calls) = msg["tool_calls"].as_array() {
+            let mut content: Vec<Value> = Vec::with_capacity(calls.len() + 1);
+            // An assistant message can carry BOTH a text block and tool calls
+            // (Anthropic natively allows text before `tool_use` in one
+            // message, and some backends stream a short preamble then call
+            // tools). Rebuilding content with only the `tool_use` blocks
+            // silently dropped that text from the wire body AND from what
+            // gets persisted as history.
+            if let Some(text) = msg["content"].as_str() {
+                if !text.is_empty() {
+                    content.push(serde_json::json!({ "type": "text", "text": text }));
+                }
+            }
+            content.extend(calls.iter().map(|tc| {
+                serde_json::json!({
+                    "type": "tool_use",
+                    "id": tc["id"].as_str().unwrap_or(""),
+                    "name": tc["function"]["name"].as_str().unwrap_or(""),
+                    "input": tc["function"]["arguments"].clone(),
+                })
+            }));
+            serde_json::json!({
+                "role": "assistant",
+                "content": content,
+            })
+        } else {
+            msg.clone()
+        }
+    }
+}
+
+#[async_trait]
+impl Provider for AnthropicProvider {
+    fn provider_id(&self) -> &str {
+        &self.provider_id
+    }
+
+    fn resolve_model(&self, override_model: Option<&str>) -> String {
+        if let Some(m) = override_model {
+            return m.into();
+        }
+        if !self.config.model.is_empty() {
+            return self.config.model.clone();
+        }
+        Self::DEFAULT_MODEL.into()
+    }
+
+    /// Anthropic's Messages API natively treats a trailing `role:
+    /// "assistant"` message as a prefill to continue generation from --
+    /// documented protocol behavior, not a guess, so this is unconditional
+    /// (no config opt-in needed, unlike `OpenAICompatibleProvider`).
+    fn supports_assistant_prefill(&self) -> bool {
+        true
+    }
+
+    async fn chat_completion(
+        &self,
+        messages: &[Value],
+        tools: Option<Vec<Value>>,
+        sampling: SamplingParams,
+        model: Option<String>,
+        id_slot: Option<i32>,
+    ) -> Result<Pin<Box<dyn Stream<Item = Delta> + Send>>, ProviderError> {
+        let model = self.resolve_model(model.as_deref());
+        let url = format!("{}/v1/messages", self.config.base_url);
+
+        let (system, non_system): (Vec<Value>, Vec<Value>) = messages
+            .iter()
+            .map(Self::convert_tool_calls)
+            .partition(|m| m["role"] == "system");
+
+        let grouped = Self::group_tool_results(&non_system);
+
+        // Clamp max_tokens to a sane range before it hits the wire: a
+        // configured 0/negative (or a huge over-limit value) is answered with
+        // an opaque provider 400 instead of running. Anthropic requires a
+        // positive integer; the model's own documented cap isn't known here,
+        // so bound it to the same range the daemon budgets context to
+        // (64k covers every current Anthropic model's max output).
+        let explicit_max = sampling
+            .max_tokens
+            .and_then(|v| (1..=65536).contains(&v).then_some(v));
+        // Extended thinking is entangled with max_tokens (the budget must sit
+        // strictly below it), forbids temperature/top_p while on, and — until
+        // we persist *signed* thinking blocks across tool round-trips — can't
+        // ride a turn that carries tools without 400ing the next request. All
+        // of that arithmetic is pure and lives in `anthropic_thinking`.
+        let has_tools = tools.as_ref().is_some_and(|t| !t.is_empty());
+        let (max_tokens, thinking_budget) =
+            anthropic_thinking(sampling.effort.as_ref(), explicit_max, has_tools);
+        if thinking_budget.is_none()
+            && matches!(
+                sampling.effort,
+                Some(Effort::Low | Effort::Medium | Effort::High)
+            )
+        {
+            // Effort was asked for but produced no thinking block — say why,
+            // once, rather than silently ignoring it.
+            if has_tools {
+                tracing::info!(
+                    provider_id = %self.provider_id,
+                    "extended thinking suppressed: this turn carries tools (signed \
+                     thinking-block round-trips are a follow-up)"
+                );
+            } else {
+                tracing::info!(
+                    provider_id = %self.provider_id,
+                    "extended thinking suppressed: no room for a >=1024 budget under \
+                     the configured max_tokens"
+                );
+            }
+        }
+        let mut body = serde_json::json!({
+            "model": model,
+            "messages": grouped,
+            "max_tokens": max_tokens,
+            "stream": true,
+        });
+        if let Some(budget) = thinking_budget {
+            body["thinking"] = serde_json::json!({
+                "type": "enabled",
+                "budget_tokens": budget,
+            });
+        }
+
+        if !system.is_empty() {
+            // Context building layers up to 5 separate system messages
+            // (persona, session override, writable-dir hint, anchored first
+            // message, consolidated memory — see
+            // `agent/context/builder.rs`). Anthropic's API takes a single
+            // `system` string, so all of them need to survive here, not
+            // just the first — keeping only `system[0]` silently dropped
+            // every layer after the base persona on every Anthropic turn.
+            let joined = system
+                .iter()
+                .filter_map(|m| m["content"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            body["system"] = if self.cache.anthropic_cache_control {
+                // A single `cache_control` breakpoint on the (whole,
+                // already-joined) system block caches everything upstream of
+                // it — the conversation turns that follow are downstream of
+                // this prefix, so one marker is sufficient; no per-layer
+                // breakpoints needed.
+                serde_json::json!([{
+                    "type": "text",
+                    "text": joined,
+                    "cache_control": {"type": "ephemeral"},
+                }])
+            } else {
+                Value::String(joined)
+            };
+        }
+        // Extended thinking forbids both `temperature` and `top_p` — sending
+        // either alongside a `thinking` block is a 400. Only set them when
+        // thinking is off.
+        if thinking_budget.is_none() {
+            if let Some(t) = sampling.temperature {
+                body["temperature"] = t.into();
+            }
+            // Anthropic's Messages API takes temperature XOR top_p; sending
+            // both is a 400. Prefer temperature when a caller (unusually) sets
+            // both.
+            if sampling.temperature.is_none() {
+                if let Some(p) = sampling.top_p {
+                    body["top_p"] = p.into();
+                }
+            }
+            // Anthropic supports `top_k` alongside the other sampling knobs
+            // (same extended-thinking incompatibility, hence inside this
+            // gate) — a configured value used to be silently dropped.
+            if let Some(k) = sampling.top_k {
+                body["top_k"] = k.into();
+            }
+        }
+        if let Some(t) = tools {
+            // Converted, not passed through — see `tool_to_anthropic`. An
+            // empty result means every definition was unusable; omit the key
+            // entirely rather than sending `"tools": []`.
+            let converted = Self::tools_to_anthropic(&t);
+            if !converted.is_empty() {
+                body["tools"] = Value::Array(converted);
+            }
+        }
+        // `id_slot` is a llama.cpp/vLLM-only field (`parallel_slots`, self-hosted
+        // providers only, see openai_compat.rs's dialect gate) — Anthropic's
+        // real API has no such field, so it's never written onto this wire body.
+        let _ = id_slot;
+
+        // Bound time-to-response-headers (see RESPONSE_HEADERS_TIMEOUT);
+        // `send().await` resolves once headers arrive, so the SSE body
+        // streaming behind them is never capped by this.
+        let resp = tokio::time::timeout(
+            RESPONSE_HEADERS_TIMEOUT,
+            self.send_preferring_direct(&url, &body),
+        )
+        .await
+        .map_err(|_| ProviderError::Timeout {
+            user_message: format!(
+                "Anthropic sent no response headers within {}s",
+                RESPONSE_HEADERS_TIMEOUT.as_secs()
+            ),
+            raw_message: "timed out waiting for response headers".into(),
+            http_status: 0,
+        })?
+        .map_err(|e| classify_transport_error(&e, format!("failed to reach Anthropic: {e}")))?;
+
+        let status_code = resp.status().as_u16();
+        if !resp.status().is_success() {
+            // `Retry-After` (429/503) must be read before the body is
+            // consumed — the retry loop honors it as a backoff floor.
+            let retry_after = parse_retry_after(resp.headers());
+            // Bounded in both time and size — a stalled error body used to
+            // hang the turn forever (see `read_bounded_error_body`).
+            let body_text = read_bounded_error_body(resp).await;
+            return Err(classify_provider_error(status_code, &body_text, retry_after));
+        }
+
+        let stream = resp.bytes_stream();
+        let deltas = parse_anthropic_sse(stream, self.idle_timeout);
+        Ok(Box::pin(deltas))
+    }
+
+    async fn discover_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
+        let url = format!("{}/v1/models", self.config.base_url);
+        let resp = self
+            .client
+            .get(&url)
+            .header("x-api-key", &self.config.api_key)
+            // Same per-request bound as `check_health` — a stalled provider
+            // must not hang model discovery forever.
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+            .map_err(|e| {
+                classify_transport_error(&e, format!("failed to discover models: {e}"))
+            })?;
+
+        if !resp.status().is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(classify_provider_error(0, &body, None));
+        }
+
+        let data: Value = resp.json().await.map_err(|e| ProviderError::Other {
+            user_message: format!("Failed to parse models response: {}", e),
+            raw_message: e.to_string(),
+            http_status: 0,
+            retry_after_secs: None,
+        })?;
+
+        let models: Vec<ModelInfo> = data["data"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|m| {
+                        Some(ModelInfo {
+                            id: m["id"].as_str()?.to_string(),
+                            name: m["name"].as_str().map(|s| s.into()),
+                            provider_id: Some(self.provider_id.clone()),
+                            context_length: m["max_model_len"].as_i64().map(|v| v as i32),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Ok(models)
+    }
+
+    async fn check_health(&self) -> HealthStatus {
+        let url = format!("{}/v1/models", self.config.base_url);
+        let start = std::time::Instant::now();
+
+        // A per-request timeout, not the shared client's default — `self.client`
+        // is also used for chat completions, which can legitimately run far
+        // longer than a health probe should ever be allowed to block for.
+        match self
+            .client
+            .get(&url)
+            .header("x-api-key", &self.config.api_key)
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                let latency = start.elapsed().as_secs_f64() * 1000.0;
+                HealthStatus {
+                    status: "healthy".into(),
+                    latency_ms: Some(latency),
+                    error: None,
+                }
+            }
+            Ok(resp) => HealthStatus {
+                status: "unhealthy".into(),
+                latency_ms: Some(start.elapsed().as_secs_f64() * 1000.0),
+                error: Some(format!("HTTP {}", resp.status().as_u16())),
+            },
+            Err(e) => HealthStatus {
+                status: "unhealthy".into(),
+                latency_ms: None,
+                error: Some(e.to_string()),
+            },
+        }
+    }
+}
+
+/// Build a `Delta.usage` map from an Anthropic `usage` object (found at
+/// `message.usage` on `message_start`, and again — cumulatively updated,
+/// output tokens only in practice, but read defensively — at `usage` on
+/// `message_delta`). Field names are normalized to the same keys
+/// `openai_compat.rs` uses (`cache_read_tokens`/`cache_creation_tokens`) so
+/// downstream code never needs to know which provider produced them.
+///
+/// Anthropic's `input_tokens` deliberately *excludes* whatever was served
+/// from cache — OpenAI-style `prompt_tokens` does the opposite, it already
+/// counts cached tokens as part of the total. Left as-is, the same
+/// `input_tokens` key would mean two different things depending on which
+/// provider produced it, silently corrupting both the "Tokens: N in" display
+/// and any cache-hit-rate calculation derived from it (`cache_read_tokens /
+/// input_tokens` would double an Anthropic turn's true prompt size out from
+/// under it). Normalized here instead: `input_tokens` always means *total*
+/// prompt size, cache included, matching OpenAI's semantics — a fresh-only
+/// count isn't exposed separately since nothing downstream needs it.
+///
+/// Returns `None` rather than an empty map when the object has nothing
+/// usable, so a Delta with no real usage data doesn't spuriously participate
+/// in the per-turn merge in `agent/loop_.rs::process_stream`.
+fn usage_map_from_anthropic(usage: &Value) -> Option<HashMap<String, i32>> {
+    let mut map = HashMap::new();
+    let fresh_input = usage["input_tokens"].as_i64();
+    let cache_creation = usage["cache_creation_input_tokens"].as_i64();
+    let cache_read = usage["cache_read_input_tokens"].as_i64();
+    if fresh_input.is_some() || cache_creation.is_some() || cache_read.is_some() {
+        let total_input =
+            fresh_input.unwrap_or(0) + cache_creation.unwrap_or(0) + cache_read.unwrap_or(0);
+        map.insert("input_tokens".to_string(), total_input as i32);
+    }
+    if let Some(v) = usage["output_tokens"].as_i64() {
+        map.insert("output_tokens".to_string(), v as i32);
+    }
+    if let Some(v) = cache_creation {
+        map.insert("cache_creation_tokens".to_string(), v as i32);
+    }
+    if let Some(v) = cache_read {
+        map.insert("cache_read_tokens".to_string(), v as i32);
+    }
+    if map.is_empty() {
+        None
+    } else {
+        Some(map)
+    }
+}
+
+/// Parse Anthropic SSE stream into Delta chunks.
+///
+/// Buffers a trailing partial line across polls (`buf`) and queues every Delta
+/// produced while parsing one chunk (`pending`) since a single chunk routinely
+/// contains multiple `data:` frames — returning after the first one silently
+/// dropped the rest. `Poll::Pending` from the inner stream is propagated as-is,
+/// never conflated with end-of-stream.
+/// Accumulates one streamed `tool_use` content block. Anthropic sends the
+/// tool's `id`/`name` once, in `content_block_start`; the arguments arrive
+/// incrementally afterward as `input_json_delta` fragments.
+#[derive(Default)]
+struct PendingToolCall {
+    id: Option<String>,
+    name: Option<String>,
+    input_json: String,
+}
+
+/// Cap on the line buffer between newlines — mirror of openai_compat.rs's
+/// `MAX_SSE_LINE_BYTES` (see #7).
+const MAX_SSE_LINE_BYTES: usize = 8 * 1024 * 1024;
+/// Cap on accumulated streamed tool-input JSON per tool block — mirror of
+/// openai_compat.rs's `MAX_TOOL_ARGUMENTS_BYTES`.
+const MAX_TOOL_ARGUMENTS_BYTES: usize = 1024 * 1024;
+
+type RawBytesStream = Pin<Box<dyn Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>>;
+
+struct AnthropicSSEStream {
+    /// `tokio_stream::adapters::Timeout` used as an idle-read timeout — see
+    /// `parse_openai_sse` in openai_compat.rs for the rationale.
+    inner: Pin<Box<tokio_stream::adapters::Timeout<RawBytesStream>>>,
+    tool_input_buf: HashMap<usize, PendingToolCall>,
+    pending_tool_calls: Vec<super::base::ToolCall>,
+    /// Raw bytes between newlines, decoded to UTF-8 only at complete line
+    /// boundaries (see openai_compat.rs `buf`).
+    buf: Vec<u8>,
+    pending: std::collections::VecDeque<Delta>,
+    done: bool,
+    /// When this stream's response started — see `MAX_STREAM_DURATION` (#10).
+    stream_started: Instant,
+}
+
+fn parse_anthropic_sse(
+    stream: impl Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
+    idle_timeout: Duration,
+) -> AnthropicSSEStream {
+    use tokio_stream::StreamExt as _;
+    let inner = Box::pin(stream)
+        as Pin<Box<dyn Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>>;
+    let inner = inner.timeout(idle_timeout);
+    AnthropicSSEStream {
+        inner: Box::pin(inner),
+        tool_input_buf: HashMap::new(),
+        pending_tool_calls: Vec::new(),
+        buf: Vec::new(),
+        pending: std::collections::VecDeque::new(),
+        done: false,
+        stream_started: Instant::now(),
+    }
+}
+
+impl AnthropicSSEStream {
+    /// Process one complete SSE line, pushing any resulting Delta onto `pending`.
+    /// Returns true if this line signalled stream completion (`message_stop`).
+    fn process_line(&mut self, line: &str) -> bool {
+        if line.starts_with("event: ") {
+            return false;
+        }
+        // SSE spec: the colon may be followed by zero-or-more spaces — accept
+        // `data:{...}` with no space (mirror of openai_compat.rs).
+        let trimmed = line.trim_start();
+        let Some(data) = trimmed.strip_prefix("data:").map(|d| d.trim_start()) else {
+            return false;
+        };
+        let json: Value = match serde_json::from_str(data) {
+            Ok(j) => j,
+            Err(e) => {
+                // Log instead of silently swallowing — a malformed chunk was
+                // previously invisible, and the turn ran on until the idle
+                // timeout (mirror of openai_compat.rs).
+                tracing::debug!("dropped malformed Anthropic SSE data line: {e}: {data}");
+                return false;
+            }
+        };
+        let event_type = json["type"].as_str().unwrap_or("");
+
+        match event_type {
+            "message_start" => {
+                if let Some(role) = json["message"]["role"].as_str() {
+                    // `message.usage` carries prompt-cache stats up front —
+                    // `input_tokens` here already *excludes* whatever was
+                    // served from cache (Anthropic docs), so the three
+                    // together (this input_tokens + cache_creation +
+                    // cache_read) sum to the full prompt token count.
+                    // `output_tokens` also appears here (a small placeholder,
+                    // updated for real in `message_delta` below) — read it
+                    // too so a turn that errors before any `message_delta`
+                    // still reports *something* instead of nothing.
+                    let msg_usage = &json["message"]["usage"];
+                    let usage = usage_map_from_anthropic(msg_usage);
+                    self.pending.push_back(Delta {
+                        role: role.into(),
+                        content: None,
+                        reasoning: None,
+                        tool_calls: None,
+                        finish_reason: None,
+                        usage,
+                        error_type: None,
+                    });
+                }
+            }
+            "content_block_start" => {
+                let block = &json["content_block"];
+                if block["type"] == "tool_use" {
+                    let idx = json["index"].as_u64().unwrap_or(0) as usize;
+                    // `block["name"]` was never captured before — every
+                    // tool call ended up with `function` set to just the
+                    // parsed arguments object, no `name` key anywhere, so
+                    // every tool executed as an unnamed/"unknown" tool.
+                    self.tool_input_buf.insert(
+                        idx,
+                        PendingToolCall {
+                            id: block["id"].as_str().map(|s| s.into()),
+                            name: block["name"].as_str().map(|s| s.into()),
+                            input_json: String::new(),
+                        },
+                    );
+                }
+            }
+            "content_block_delta" => {
+                let delta = &json["delta"];
+                if delta["type"] == "text_delta" {
+                    if let Some(text) = delta["text"].as_str() {
+                        self.pending.push_back(Delta {
+                            role: "assistant".into(),
+                            content: Some(text.into()),
+                            reasoning: None,
+                            tool_calls: None,
+                            finish_reason: None,
+                            usage: None,
+                            error_type: None,
+                        });
+                    }
+                } else if delta["type"] == "thinking_delta" {
+                    if let Some(t) = delta["thinking"].as_str() {
+                        self.pending.push_back(Delta {
+                            role: "assistant".into(),
+                            content: None,
+                            reasoning: Some(t.into()),
+                            tool_calls: None,
+                            finish_reason: None,
+                            usage: None,
+                            error_type: None,
+                        });
+                    }
+                } else if delta["type"] == "input_json_delta" {
+                    if let Some(partial) = delta["partial_json"].as_str() {
+                        let idx = json["index"].as_u64().unwrap_or(0) as usize;
+                        if let Some(entry) = self.tool_input_buf.get_mut(&idx) {
+                            if entry.input_json.len() + partial.len() > MAX_TOOL_ARGUMENTS_BYTES {
+                                // Unbounded per-tool accumulation was an OOM
+                                // vector (see #7) — terminate as a transient
+                                // error so the turn routes through
+                                // retry/failover.
+                                self.pending.push_back(Delta {
+                                    role: "assistant".into(),
+                                    content: None,
+                                    reasoning: None,
+                                    tool_calls: None,
+                                    finish_reason: Some("error".into()),
+                                    usage: None,
+                                    error_type: Some("request".into()),
+                                });
+                                return true;
+                            }
+                            entry.input_json.push_str(partial);
+                        }
+                    }
+                }
+            }
+            "content_block_stop" => {
+                let idx = json["index"].as_u64().unwrap_or(0) as usize;
+                if let Some(entry) = self.tool_input_buf.remove(&idx) {
+                    // `function` must carry both `name` and `arguments` —
+                    // the agent loop reads `tc.function.get("name")` /
+                    // `.get("arguments")`. Previously `function` was set to
+                    // just the parsed input object with no `name` key at
+                    // all, so every tool call executed nameless/"unknown".
+                    //
+                    // Non-empty-but-unparseable arguments must NOT be
+                    // silently replaced with `{}` (which executes the tool
+                    // with empty args); empty input is legitimate (a
+                    // no-argument tool), so only that case maps to `{}`.
+                    let arguments: Value = if entry.input_json.is_empty() {
+                        serde_json::json!({})
+                    } else {
+                        match serde_json::from_str(&entry.input_json) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                tracing::warn!(
+                                    "tool call {:?} had unparseable streamed input: {e}",
+                                    entry.name
+                                );
+                                serde_json::json!({
+                                    "__error": format!("malformed tool input: {e}")
+                                })
+                            }
+                        }
+                    };
+                    let function = serde_json::json!({
+                        "name": entry.name.unwrap_or_default(),
+                        "arguments": arguments,
+                    });
+                    self.pending_tool_calls.push(super::base::ToolCall {
+                        id: entry.id.unwrap_or_default(),
+                        r#type: "function".into(),
+                        function,
+                    });
+                }
+            }
+            "message_delta" => {
+                let stop = json["delta"]["stop_reason"].as_str().map(|s| s.into());
+                let tool_calls = if !self.pending_tool_calls.is_empty() {
+                    Some(self.pending_tool_calls.drain(..).collect())
+                } else {
+                    None
+                };
+                // The final, real `output_tokens` count lands here (message_start's
+                // was just a placeholder); cache fields are read too in case a
+                // future API version repeats them here, but in practice they
+                // only appear on message_start.
+                let usage = usage_map_from_anthropic(&json["usage"]);
+                self.pending.push_back(Delta {
+                    role: "assistant".into(),
+                    content: None,
+                    reasoning: None,
+                    tool_calls,
+                    finish_reason: stop,
+                    usage,
+                    error_type: None,
+                });
+            }
+            "message_stop" => {
+                return true;
+            }
+            // An Anthropic `error` event (overloaded, rate-limited,
+            // mid-stream failure) was previously ignored — the stream then
+            // ended with no finish reason, feeding the unbounded step-retry
+            // path in `agent::loop_` (see #1). Surface it as the same
+            // transient-error delta as a dropped connection so
+            // `process_stream` routes it through retry/failover.
+            "error" => {
+                self.pending.push_back(Delta {
+                    role: "assistant".into(),
+                    content: None,
+                    reasoning: None,
+                    tool_calls: None,
+                    finish_reason: Some("error".into()),
+                    usage: None,
+                    error_type: Some("request".into()),
+                });
+                return true;
+            }
+            _ => {}
+        }
+        false
+    }
+}
+
+impl Stream for AnthropicSSEStream {
+    type Item = Delta;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        loop {
+            if let Some(delta) = self.pending.pop_front() {
+                return Poll::Ready(Some(delta));
+            }
+            if self.done {
+                return Poll::Ready(None);
+            }
+            // Total-stream-duration cap (see #10, `MAX_STREAM_DURATION`) —
+            // mirror of openai_compat.rs: the idle-read timeout only bounds
+            // gaps between bytes, so anything that keeps just enough bytes
+            // flowing must still be cut off eventually. Pending deltas are
+            // drained first (the check sits below the drain).
+            if self.stream_started.elapsed() >= MAX_STREAM_DURATION {
+                self.pending.push_back(Delta {
+                    role: "assistant".into(),
+                    content: None,
+                    reasoning: None,
+                    tool_calls: None,
+                    finish_reason: Some("error".into()),
+                    usage: None,
+                    error_type: Some("request".into()),
+                });
+                self.done = true;
+                continue;
+            }
+
+            match self.inner.as_mut().poll_next(cx) {
+                Poll::Ready(Some(Ok(Ok(chunk)))) => {
+                    self.buf.extend_from_slice(&chunk);
+                    // Unbounded line buffer was an OOM vector (see #7) —
+                    // mirror of openai_compat.rs.
+                    if self.buf.len() > MAX_SSE_LINE_BYTES {
+                        self.pending.push_back(Delta {
+                            role: "assistant".into(),
+                            content: None,
+                            reasoning: None,
+                            tool_calls: None,
+                            finish_reason: Some("error".into()),
+                            usage: None,
+                            error_type: Some("request".into()),
+                        });
+                        self.done = true;
+                        continue;
+                    }
+                    while let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
+                        let mut raw: Vec<u8> = self.buf.drain(..=pos).collect();
+                        while matches!(raw.last(), Some(&b'\r') | Some(&b'\n')) {
+                            raw.pop();
+                        }
+                        // Decode only at complete line boundaries so a
+                        // multi-byte UTF-8 char split across TCP chunks stays
+                        // intact.
+                        let line = String::from_utf8(raw).unwrap_or_else(|e| {
+                            String::from_utf8_lossy(e.as_bytes()).into_owned()
+                        });
+                        if self.process_line(&line) {
+                            self.done = true;
+                        }
+                    }
+                }
+                Poll::Ready(Some(Ok(Err(_)))) => {
+                    self.pending.push_back(Delta {
+                        role: "assistant".into(),
+                        content: None,
+                        reasoning: None,
+                        tool_calls: None,
+                        finish_reason: Some("error".into()),
+                        usage: None,
+                        error_type: Some("request".into()),
+                    });
+                    self.done = true;
+                }
+                // The idle-read timeout fired: see openai_compat.rs.
+                Poll::Ready(Some(Err(_elapsed))) => {
+                    self.pending.push_back(Delta {
+                        role: "assistant".into(),
+                        content: None,
+                        reasoning: None,
+                        tool_calls: None,
+                        finish_reason: Some("error".into()),
+                        usage: None,
+                        error_type: Some("request".into()),
+                    });
+                    self.done = true;
+                }
+                Poll::Ready(None) => {
+                    // A trailing complete line with no final newline is still
+                    // a real SSE line — decode it before finishing.
+                    if !self.buf.is_empty() {
+                        let raw = std::mem::take(&mut self.buf);
+                        let line = String::from_utf8(raw).unwrap_or_else(|e| {
+                            String::from_utf8_lossy(e.as_bytes()).into_owned()
+                        });
+                        if self.process_line(&line) {
+                            self.done = true;
+                        }
+                    }
+                    // A truncated/abrupt backend may end the stream after
+                    // `content_block_stop` (all tool inputs fully buffered)
+                    // but *before* `message_delta`/`message_stop` — without
+                    // this drain the completed tool calls would be silently
+                    // dropped from the turn. Emit them as a final Delta (same
+                    // shape `message_delta` would have produced).
+                    if !self.pending_tool_calls.is_empty() {
+                        let tool_calls: Vec<super::base::ToolCall> =
+                            self.pending_tool_calls.drain(..).collect();
+                        self.pending.push_back(Delta {
+                            role: "assistant".into(),
+                            content: None,
+                            reasoning: None,
+                            tool_calls: Some(tool_calls),
+                            finish_reason: None,
+                            usage: None,
+                            error_type: None,
+                        });
+                    }
+                    // Drain any Delta the trailing line produced before
+                    // reporting end-of-stream.
+                    if !self.pending.is_empty() {
+                        self.done = true;
+                        continue;
+                    }
+                    return Poll::Ready(None);
+                }
+                Poll::Pending => {
+                    return Poll::Pending;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod thinking_tests {
+    use super::*;
+
+    #[test]
+    fn no_effort_leaves_max_tokens_and_adds_no_thinking() {
+        assert_eq!(anthropic_thinking(None, None, false), (4096, None));
+        assert_eq!(anthropic_thinking(Some(&Effort::Off), None, false), (4096, None));
+        // An explicit cap is preserved untouched.
+        assert_eq!(anthropic_thinking(None, Some(8192), false), (8192, None));
+    }
+
+    #[test]
+    fn tools_suppress_thinking_even_when_asked() {
+        // The trap: a high effort on a tool-carrying turn must NOT emit a
+        // thinking block (it would 400 the next request).
+        assert_eq!(
+            anthropic_thinking(Some(&Effort::High), None, true),
+            (4096, None)
+        );
+    }
+
+    #[test]
+    fn without_an_explicit_cap_the_answer_gets_headroom_above_the_budget() {
+        // Low: budget 4096, max = 4096 + 4096 = 8192 (budget strictly below).
+        assert_eq!(
+            anthropic_thinking(Some(&Effort::Low), None, false),
+            (8192, Some(4096))
+        );
+        // High: budget 32768, max = 36864.
+        assert_eq!(
+            anthropic_thinking(Some(&Effort::High), None, false),
+            (36864, Some(32768))
+        );
+    }
+
+    #[test]
+    fn medium_effort_does_not_400_under_the_default_max_tokens() {
+        // The most likely bug in the cluster: default max_tokens is 4096, and a
+        // medium budget of 16384 is >= it. Because no explicit cap was set,
+        // max_tokens is raised to fit rather than the budget colliding with it.
+        let (max, budget) = anthropic_thinking(Some(&Effort::Medium), None, false);
+        assert!(budget.unwrap() < max, "budget must stay strictly below max_tokens");
+        assert_eq!((max, budget), (16384 + 4096, Some(16384)));
+    }
+
+    #[test]
+    fn an_explicit_cap_clamps_the_budget_below_it() {
+        // cap 8192, high base 32768 → budget clamped to 8192-1024 = 7168.
+        assert_eq!(
+            anthropic_thinking(Some(&Effort::High), Some(8192), false),
+            (8192, Some(7168))
+        );
+    }
+
+    /// Pins the trap the wrap-up valve has to work around, as *intended*
+    /// behaviour of this function rather than an accident.
+    ///
+    /// `has_tools` is the only thing suppressing thinking on a normal agent
+    /// step. The valve's whole mechanism is emptying the tool list — which
+    /// flips this guard off and, at Medium effort with no explicit cap, raises
+    /// max_tokens from 4096 to 20480 on the one request issued precisely
+    /// because the input is already near the context ceiling.
+    #[test]
+    fn withdrawing_tools_switches_thinking_on_and_inflates_max_tokens() {
+        // With tools: thinking suppressed, max_tokens at the 4096 default.
+        assert_eq!(
+            anthropic_thinking(Some(&Effort::Medium), None, true),
+            (4096, None)
+        );
+        // Tools withdrawn, everything else identical: 5x the output budget.
+        assert_eq!(
+            anthropic_thinking(Some(&Effort::Medium), None, false),
+            (20480, Some(16384))
+        );
+    }
+
+    /// ...and the shape the valve actually sends, which suppresses both halves.
+    ///
+    /// Clamping max_tokens alone is NOT enough: at a 2048 cap the arithmetic
+    /// yields `16384.min(2048 - 1024)` = 1024, which clears the `>= 1024` test,
+    /// so thinking stays on and spends half the clamped budget on reasoning
+    /// nobody will read. Zeroing the effort is what makes the clamp mean what
+    /// it says. If someone later drops `sampling.effort = None` from the
+    /// wrap-up branch in `loop_.rs`, this is the test that fails.
+    #[test]
+    fn the_wrapup_clamp_suppresses_thinking_as_well_as_the_budget() {
+        // What the valve sends: effort zeroed, explicit cap set.
+        assert_eq!(anthropic_thinking(None, Some(2048), false), (2048, None));
+        assert_eq!(anthropic_thinking(None, Some(512), false), (512, None));
+
+        // What it would send if only the cap were clamped — thinking survives
+        // and takes 1024 of the 2048.
+        assert_eq!(
+            anthropic_thinking(Some(&Effort::Medium), Some(2048), false),
+            (2048, Some(1024))
+        );
+    }
+
+    #[test]
+    fn a_cap_too_small_for_a_1024_budget_drops_thinking() {
+        // cap 1500 → budget would be min(base, 476) = 476 < 1024 → no thinking,
+        // and the cap is left as the user set it.
+        assert_eq!(
+            anthropic_thinking(Some(&Effort::Low), Some(1500), false),
+            (1500, None)
+        );
+    }
+}
+
+#[cfg(test)]
+mod sse_tests {
+    use super::*;
+    use futures::{stream, StreamExt};
+
+    #[tokio::test]
+    async fn multiple_data_lines_in_one_chunk_are_all_emitted() {
+        let chunk = "event: content_block_delta\n\
+                     data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n\
+                     event: content_block_delta\n\
+                     data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" there\"}}\n\n";
+        let inner = stream::iter(vec![Ok::<bytes::Bytes, reqwest::Error>(
+            bytes::Bytes::from(chunk),
+        )]);
+        let deltas: Vec<Delta> = parse_anthropic_sse(inner, Duration::from_secs(300)).collect().await;
+        let contents: Vec<String> = deltas.into_iter().filter_map(|d| d.content).collect();
+        assert_eq!(contents, vec!["Hi".to_string(), " there".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn data_line_split_across_chunk_boundary_still_parses() {
+        let chunk1 = "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"te";
+        let chunk2 = "xt\":\"Hello\"}}\n\n";
+        let inner = stream::iter(vec![
+            Ok::<bytes::Bytes, reqwest::Error>(bytes::Bytes::from(chunk1)),
+            Ok::<bytes::Bytes, reqwest::Error>(bytes::Bytes::from(chunk2)),
+        ]);
+        let deltas: Vec<Delta> = parse_anthropic_sse(inner, Duration::from_secs(300)).collect().await;
+        let contents: Vec<String> = deltas.into_iter().filter_map(|d| d.content).collect();
+        assert_eq!(contents, vec!["Hello".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn multi_byte_utf8_split_across_chunks_round_trips() {
+        // The é (U+00E9 = UTF-8 0xC3 0xA9) is split across the two chunks —
+        // per-chunk `String::from_utf8_lossy` used to corrupt it.
+        let mut chunk1 =
+            b"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"caf"
+                .to_vec();
+        chunk1.push(0xC3);
+        let chunk2 = b"\xA9\"}}\n\n".to_vec();
+        let inner = stream::iter(vec![
+            Ok::<bytes::Bytes, reqwest::Error>(bytes::Bytes::from(chunk1)),
+            Ok::<bytes::Bytes, reqwest::Error>(bytes::Bytes::from(chunk2)),
+        ]);
+        let deltas: Vec<Delta> = parse_anthropic_sse(inner, Duration::from_secs(300))
+            .collect()
+            .await;
+        let contents: String = deltas.iter().filter_map(|d| d.content.clone()).collect();
+        assert_eq!(contents, "café");
+    }
+
+    #[tokio::test]
+    async fn idle_read_timeout_terminates_a_silent_stream_as_a_transient_error() {
+        let silent = stream::pending::<Result<bytes::Bytes, reqwest::Error>>();
+        let deltas: Vec<Delta> = parse_anthropic_sse(silent, Duration::from_millis(50))
+            .collect()
+            .await;
+        let last = deltas.last().expect("expected at least the error Delta");
+        assert_eq!(last.error_type.as_deref(), Some("request"));
+        assert_eq!(last.finish_reason.as_deref(), Some("error"));
+    }
+
+    #[tokio::test]
+    async fn error_event_surfaces_as_a_transient_error_delta() {
+        // An Anthropic `error` event (e.g. overloaded/rate-limited mid-stream)
+        // was previously ignored entirely — the stream then ended with no
+        // finish reason, feeding the unbounded step-retry path in
+        // `agent::loop_`. It must surface as the same transient-error delta as
+        // a dropped connection so `process_stream` retries/fails over.
+        let chunk = "event: error\n\n\
+                     data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n";
+        let inner = stream::iter(vec![Ok::<bytes::Bytes, reqwest::Error>(
+            bytes::Bytes::from(chunk),
+        )]);
+        let deltas: Vec<Delta> = parse_anthropic_sse(inner, Duration::from_secs(300))
+            .collect()
+            .await;
+        let last = deltas.last().expect("expected the error Delta");
+        assert_eq!(last.error_type.as_deref(), Some("request"));
+        assert_eq!(last.finish_reason.as_deref(), Some("error"));
+    }
+
+    /// #7 regression: garbage without newlines must not grow the line buffer
+    /// unboundedly — past `MAX_SSE_LINE_BYTES` the stream terminates with
+    /// the transient-error delta.
+    #[tokio::test]
+    async fn an_overlong_line_without_newline_terminates_as_a_transient_error() {
+        let garbage = vec![b'x'; MAX_SSE_LINE_BYTES + 1];
+        let inner = stream::iter(vec![Ok::<bytes::Bytes, reqwest::Error>(bytes::Bytes::from(
+            garbage,
+        ))]);
+        let deltas: Vec<Delta> = parse_anthropic_sse(inner, Duration::from_secs(300))
+            .collect()
+            .await;
+        assert_eq!(deltas.len(), 1, "exactly one transient-error delta");
+        assert_eq!(deltas[0].error_type.as_deref(), Some("request"));
+        assert_eq!(deltas[0].finish_reason.as_deref(), Some("error"));
+    }
+
+    /// #7 regression: unbounded per-tool input_json accumulation must
+    /// terminate as a transient error rather than growing memory forever.
+    #[tokio::test]
+    async fn overlong_tool_input_terminates_as_a_transient_error() {
+        let huge_json = "x".repeat(MAX_TOOL_ARGUMENTS_BYTES + 1);
+        let chunk = format!(
+            "event: content_block_start\n\
+             data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"boom\"}}}}\n\n\
+             event: content_block_delta\n\
+             data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":\"{huge_json}\"}}}}\n\n"
+        );
+        let inner = stream::iter(vec![Ok::<bytes::Bytes, reqwest::Error>(
+            bytes::Bytes::from(chunk),
+        )]);
+        let deltas: Vec<Delta> = parse_anthropic_sse(inner, Duration::from_secs(300))
+            .collect()
+            .await;
+        let last = deltas.last().expect("expected the transient-error Delta");
+        assert_eq!(last.error_type.as_deref(), Some("request"));
+        assert_eq!(last.finish_reason.as_deref(), Some("error"));
+    }
+
+    /// #10 regression: a stream open longer than `MAX_STREAM_DURATION` must
+    /// terminate as a transient error instead of waiting on a provider that
+    /// keeps just enough bytes flowing to beat the idle-read timeout.
+    #[tokio::test]
+    async fn a_stream_past_the_total_duration_cap_terminates_as_a_transient_error() {
+        let silent = stream::pending::<Result<bytes::Bytes, reqwest::Error>>();
+        let mut s = parse_anthropic_sse(silent, Duration::from_secs(300));
+        s.stream_started = Instant::now() - (MAX_STREAM_DURATION + Duration::from_secs(1));
+        let deltas: Vec<Delta> = s.collect().await;
+        let last = deltas.last().expect("expected the transient-error Delta");
+        assert_eq!(last.error_type.as_deref(), Some("request"));
+        assert_eq!(last.finish_reason.as_deref(), Some("error"));
+    }
+
+    #[tokio::test]
+    async fn message_stop_ends_stream() {
+        let chunk = "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n\
+                     data: {\"type\":\"message_stop\"}\n\n";
+        let inner = stream::iter(vec![Ok::<bytes::Bytes, reqwest::Error>(
+            bytes::Bytes::from(chunk),
+        )]);
+        let deltas: Vec<Delta> = parse_anthropic_sse(inner, Duration::from_secs(300)).collect().await;
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(deltas[0].content.as_deref(), Some("Hi"));
+    }
+
+    #[tokio::test]
+    async fn trailing_complete_line_without_newline_is_still_decoded() {
+        // A final `data:` line with no trailing `\n` is still a real SSE
+        // line — it must be decoded and surfaced at end-of-stream.
+        let chunk = "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}";
+        let inner = stream::iter(vec![Ok::<bytes::Bytes, reqwest::Error>(
+            bytes::Bytes::from(chunk),
+        )]);
+        let deltas: Vec<Delta> = parse_anthropic_sse(inner, Duration::from_secs(300))
+            .collect()
+            .await;
+        let contents: Vec<String> = deltas.into_iter().filter_map(|d| d.content).collect();
+        assert_eq!(contents, vec!["Hi".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn tool_call_captures_name_and_wraps_arguments() {
+        let chunk = "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"read_file\"}}\n\n\
+                     data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\"}}\n\n\
+                     data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"a.txt\\\"}\"}}\n\n\
+                     data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+                     data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n";
+        let inner = stream::iter(vec![Ok::<bytes::Bytes, reqwest::Error>(
+            bytes::Bytes::from(chunk),
+        )]);
+        let deltas: Vec<Delta> = parse_anthropic_sse(inner, Duration::from_secs(300)).collect().await;
+        let tool_calls = deltas
+            .into_iter()
+            .find_map(|d| d.tool_calls)
+            .expect("expected a Delta carrying tool_calls");
+        assert_eq!(tool_calls.len(), 1);
+        let tc = &tool_calls[0];
+        assert_eq!(tc.id, "toolu_1");
+        assert_eq!(
+            tc.function.get("name").and_then(|v| v.as_str()),
+            Some("read_file")
+        );
+        assert_eq!(
+            tc.function
+                .get("arguments")
+                .and_then(|v| v.get("path"))
+                .and_then(|v| v.as_str()),
+            Some("a.txt")
+        );
+    }
+
+    #[tokio::test]
+    async fn message_start_captures_input_and_cache_tokens() {
+        let chunk = "data: {\"type\":\"message_start\",\"message\":{\"role\":\"assistant\",\"usage\":{\"input_tokens\":12,\"output_tokens\":1,\"cache_creation_input_tokens\":340,\"cache_read_input_tokens\":890}}}\n\n";
+        let inner = stream::iter(vec![Ok::<bytes::Bytes, reqwest::Error>(
+            bytes::Bytes::from(chunk),
+        )]);
+        let deltas: Vec<Delta> = parse_anthropic_sse(inner, Duration::from_secs(300)).collect().await;
+        let usage = deltas[0]
+            .usage
+            .as_ref()
+            .expect("expected usage on message_start Delta");
+        // Normalized to total prompt size (fresh + cache_creation +
+        // cache_read = 12 + 340 + 890), matching OpenAI's `prompt_tokens`
+        // semantics — see `usage_map_from_anthropic`'s doc comment.
+        assert_eq!(usage.get("input_tokens"), Some(&1242));
+        assert_eq!(usage.get("cache_creation_tokens"), Some(&340));
+        assert_eq!(usage.get("cache_read_tokens"), Some(&890));
+    }
+
+    #[tokio::test]
+    async fn message_delta_captures_final_output_tokens() {
+        let chunk = "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":57}}\n\n";
+        let inner = stream::iter(vec![Ok::<bytes::Bytes, reqwest::Error>(
+            bytes::Bytes::from(chunk),
+        )]);
+        let deltas: Vec<Delta> = parse_anthropic_sse(inner, Duration::from_secs(300)).collect().await;
+        let usage = deltas[0]
+            .usage
+            .as_ref()
+            .expect("expected usage on message_delta Delta");
+        assert_eq!(usage.get("output_tokens"), Some(&57));
+    }
+
+    #[tokio::test]
+    async fn all_system_messages_are_joined_not_just_the_first() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/v1/messages")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"system": "persona\n\ntool hints\n\nmemory"}),
+            ))
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body("data: {\"type\":\"message_stop\"}\n\n")
+            .create_async()
+            .await;
+
+        let provider = AnthropicProvider::new(
+            "test",
+            ProviderConfig {
+                base_url: server.url(),
+                ..Default::default()
+            },
+            Arc::new(TailscaleClient::new()),
+            CacheConfig::default(),
+        );
+        let messages = vec![
+            serde_json::json!({"role": "system", "content": "persona"}),
+            serde_json::json!({"role": "system", "content": "tool hints"}),
+            serde_json::json!({"role": "system", "content": "memory"}),
+            serde_json::json!({"role": "user", "content": "hi"}),
+        ];
+        let stream = provider
+            .chat_completion(&messages, None, SamplingParams::default(), None, None)
+            .await
+            .unwrap();
+        let _: Vec<Delta> = stream.collect().await;
+
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn system_gets_a_cache_control_breakpoint_when_enabled() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/v1/messages")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "system": [{
+                    "type": "text",
+                    "text": "persona",
+                    "cache_control": {"type": "ephemeral"},
+                }],
+            })))
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body("data: {\"type\":\"message_stop\"}\n\n")
+            .create_async()
+            .await;
+
+        let provider = AnthropicProvider::new(
+            "test",
+            ProviderConfig {
+                base_url: server.url(),
+                ..Default::default()
+            },
+            Arc::new(TailscaleClient::new()),
+            CacheConfig {
+                anthropic_cache_control: true,
+                ..Default::default()
+            },
+        );
+        let messages = vec![
+            serde_json::json!({"role": "system", "content": "persona"}),
+            serde_json::json!({"role": "user", "content": "hi"}),
+        ];
+        let stream = provider
+            .chat_completion(&messages, None, SamplingParams::default(), None, None)
+            .await
+            .unwrap();
+        let _: Vec<Delta> = stream.collect().await;
+
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn top_k_is_written_to_the_request_body() {
+        // Regression: a configured `top_k` was silently dropped even though
+        // Anthropic's Messages API supports it alongside temperature.
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/v1/messages")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "top_k": 40,
+                "temperature": 0.7,
+            })))
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body("data: {\"type\":\"message_stop\"}\n\n")
+            .create_async()
+            .await;
+
+        let provider = AnthropicProvider::new(
+            "test",
+            ProviderConfig {
+                base_url: server.url(),
+                ..Default::default()
+            },
+            Arc::new(TailscaleClient::new()),
+            CacheConfig::default(),
+        );
+        let messages = vec![serde_json::json!({"role": "user", "content": "hi"})];
+        let sampling = SamplingParams {
+            temperature: Some(0.7),
+            top_k: Some(40),
+            ..Default::default()
+        };
+        let stream = provider
+            .chat_completion(&messages, None, sampling, None, None)
+            .await
+            .unwrap();
+        let _: Vec<Delta> = stream.collect().await;
+
+        mock.assert_async().await;
+    }
+
+    #[test]
+    fn converts_openai_tool_definitions_to_anthropic_shape() {
+        // The regression this guards: the agent loop hands every provider
+        // OpenAI-shaped tools, and this one used to write them onto the wire
+        // body untouched, which 400s the whole request.
+        let openai = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read a file",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "path": { "type": "string" } },
+                    "required": ["path"]
+                }
+            }
+        });
+        let out = AnthropicProvider::tool_to_anthropic(&openai).expect("converted");
+        assert_eq!(out["name"], "read_file");
+        assert_eq!(out["description"], "Read a file");
+        assert_eq!(out["input_schema"]["properties"]["path"]["type"], "string");
+        assert!(out.get("function").is_none() && out.get("parameters").is_none());
+    }
+
+    #[test]
+    fn tool_conversion_is_idempotent_and_fills_a_missing_schema() {
+        let already = serde_json::json!({
+            "name": "t", "description": "d",
+            "input_schema": { "type": "object", "properties": {} }
+        });
+        assert_eq!(
+            AnthropicProvider::tool_to_anthropic(&already).unwrap(),
+            already
+        );
+
+        // No `parameters` at all, and a schema that omits the top-level
+        // `type` Anthropic requires — both must come out valid.
+        let bare = serde_json::json!({ "function": { "name": "noargs" } });
+        let out = AnthropicProvider::tool_to_anthropic(&bare).unwrap();
+        assert_eq!(out["input_schema"]["type"], "object");
+
+        let untyped = serde_json::json!({
+            "function": { "name": "u", "parameters": { "properties": {} } }
+        });
+        let out = AnthropicProvider::tool_to_anthropic(&untyped).unwrap();
+        assert_eq!(out["input_schema"]["type"], "object");
+    }
+
+    #[test]
+    fn a_nameless_tool_is_dropped_rather_than_failing_the_request() {
+        let nameless = serde_json::json!({ "function": { "description": "no name" } });
+        assert!(AnthropicProvider::tool_to_anthropic(&nameless).is_none());
+
+        let good = serde_json::json!({ "function": { "name": "ok" } });
+        let converted = AnthropicProvider::tools_to_anthropic(&[nameless, good]);
+        assert_eq!(converted.len(), 1, "the usable tool survives");
+        assert_eq!(converted[0]["name"], "ok");
+    }
+}

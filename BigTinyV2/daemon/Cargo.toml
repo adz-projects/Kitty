@@ -1,0 +1,172 @@
+# BigTiny V2 --- the multi-app daemon.
+#
+# Forked from `plugins/bigtiny_rust/` (V1) rather than rewritten: that crate is
+# ~29k lines of hard-won correctness (SSE framing, the directory sandbox,
+# compaction, prompt-prefix determinism, the hardened MCP transports) and none
+# of it is worth re-learning. V1 stays frozen and bootable --- Kitty runs on it
+# until the migration phase, and it is the rollback path until then.
+#
+# The plugin crates below are NOT forked. They are already independent and V2
+# takes the same path dependencies; only how they are *launched* changes.
+
+[package]
+name = "bigtiny2_daemon"
+version = "2.0.0"
+edition = "2021"
+
+[lib]
+name = "bigtiny2"
+path = "src/lib.rs"
+
+# Test-only helper: a minimal stdio MCP server used by tests/mcp_never_throws.rs.
+[[bin]]
+name = "fake_mcp_server"
+path = "tests/bin/fake_mcp_server.rs"
+
+# The daemon binary. Deliberately NOT named "bigtiny-daemon": Kitty's V1
+# lifecycle kills stale daemons by matching that process-name fragment
+# (`src-tauri/src/lifecycle/bigtiny_proc.rs:23,64`), and both daemons will be
+# running on the same machine through the migration. A distinct data dir
+# already separates them; a distinct name is belt-and-braces, and keeps
+# `Get-Process` legible while both run.
+[[bin]]
+name = "bigtiny2-daemon"
+path = "src/bin/bigtiny_daemon.rs"
+
+[features]
+# Exposes test-only hooks (e.g. `PluginHost::insert_for_test`) to the
+# integration tests, which are separate crates and so cannot see
+# `#[cfg(test)]` items.
+test-support = []
+# In-process LiteRT engine (the sole local-inference runtime; the llama.cpp
+# `local-engine` it replaced is gone). `litert-embed` is the cross-platform
+# embedding half: EmbeddingGemma `.tflite` via `edgefirst-tflite` (pure
+# `libloading`, no native build — the real `libLiteRt.dll`/`.so` is loaded at
+# runtime with `Library::from_path`) + pure-Rust `tokenizers` (canonical Gemma
+# `tokenizer.json`; `default-features=false` keeps the C `onig`/C++ `esaxx`
+# backends out so it cross-compiles clean to Android). `litert-engine` adds the
+# Windows-only generative summarizer (`litert-lm-rust`, `.litertlm`).
+litert-embed = ["dep:edgefirst-tflite", "dep:tokenizers"]
+litert-engine = ["litert-embed", "dep:litert-lm-rust"]
+
+[dependencies]
+# LiteRT (TFLite) bindings for the embedding engine. No `vendored` feature: the
+# real runtime lib is loaded at runtime via `Library::from_path` (bundled
+# `libLiteRt.dll` on Windows / `libLiteRt.so` from the Play AAR on Android), so
+# this crate is pure `libloading` and cross-compiles with no native build.
+edgefirst-tflite = { version = "0.9", optional = true }
+# Pure-Rust tokenizer. `default-features = false` drops the C `onig` and C++
+# `esaxx` backends (both break the clean Android cross-compile); `fancy-regex`
+# is the pure-Rust regex backend. Encodes the canonical Gemma `tokenizer.json`
+# identically to the reference (verified against `sentencepiece.model`).
+tokenizers = { version = "0.22", default-features = false, features = [
+    "fancy-regex",
+], optional = true }
+axum = { version = "0.8", features = ["json", "macros"] }
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io", "codec"] }
+# `time` enables `TimeoutStream`, used to implement the per-provider SSE
+# idle-read timeout (see `provider::openai_compat`/`anthropic`).
+tokio-stream = { version = "0.1", features = ["time"] }
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "chrono"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+serde_yaml = "0.9"
+tiktoken-rs = "0.6"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+thiserror = "2"
+futures = "0.3"
+url = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+base64 = "0.22"
+regex = "1"
+bytes = "1"
+async-trait = "0.1"
+sha2 = "0.10"
+ipnet = "2"
+dashmap = "6"
+once_cell = "1"
+# Already in the tree transitively; taken as a direct dep for the SSE line
+# scanner (`openai_compat`'s `OpenAISSEStream`), which is the hottest loop in
+# the daemon.
+memchr = "2"
+rmcp = { version = "0.9", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
+jsonschema = "0.26"
+tower-http = { version = "0.6", features = ["cors", "catch-panic"] }
+tokio-cron-scheduler = "0.13"
+minijinja = "2"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+aes-gcm = "0.10"
+rand = "0.8"
+# Only used for the in-process MCP transport (`mcp::client::connect_in_process`
+# via `mcp::builtin`), i.e. an exec()-restricted host that can't spawn
+# `kitty-tools`' stdio binary as a child process (see that module's doc
+# comment). This crate pins a *different* rmcp major version
+# (`kitty-tools` = 2.2.0, this crate = 0.9) — both resolve independently,
+# which is fine, since the two only ever exchange serialized JSON-RPC bytes
+# on the in-process pipe, never Rust types across the version boundary.
+#
+# Known tradeoff, accepted rather than engineered around: `kitty-tools`'
+# `[profile.release]` (opt-level="z", fat LTO — tuned for its life as a
+# small frozen exe) only takes effect when it's the crate cargo is building
+# at the workspace root. As a path dependency of this crate it inherits
+# whatever profile *this* build uses instead, same as any other dependency.
+# Not worth hoisting both crates into a shared Cargo workspace to fix — that
+# would reverse `kitty-tools/Cargo.toml`'s explicit "deliberately not a
+# workspace member" stance (MSRV isolation, `panic = "abort"` not leaking
+# from `src-tauri`), and the size/speed difference is unlikely to matter
+# once this is linked into a full app binary rather than shipped standalone.
+# The wire contract, shared with `bigtiny2-client`. Types only -- this is
+# what stops the daemon and its clients from drifting into two
+# definitions of the same event.
+bigtiny2-protocol = { path = "../protocol" }
+kitty-tools = { path = "../../plugins/kitty-tools" }
+kitty-web = { path = "../../plugins/kitty-web" }
+kitty-wasm = { path = "../../plugins/kitty-wasm" }
+# Behavioral memory engine, linked in-process (see docs/adaptive-pathway-v2.md).
+# Path dep so its crate is built with this crate's profile; it must stay
+# sqlx = "0.8" to keep a single libsqlite3-sys across this workspace.
+adaptive-pathway = { path = "../../plugins/adaptive-pathway_rust" }
+
+# Windows-only generative summarizer runtime.
+[target.'cfg(windows)'.dependencies]
+# LiteRT-LM generative runtime for the local summarizer (`gemma-4-E2B-it.litertlm`).
+# Windows-only: Android offloads compaction to the remote chat model, so no
+# generative model runs on the phone. `download-native` (default) fetches the
+# prebuilt DLLs; its packaged import lib is `litert-lm.if.lib` but the linker
+# wants `litert-lm.lib`, so our `build.rs` copies it (see build.rs).
+litert-lm-rust = { version = "0.2", optional = true }
+
+[dev-dependencies]
+# Self dev-dependency purely to turn `test-support` on for the
+# integration tests: they are separate crates and cannot otherwise see
+# test-only hooks like `PluginHost::insert_for_test`.
+bigtiny2_daemon = { path = ".", features = ["test-support"] }
+# `test-util` only here: it enables tokio's paused-clock test runtime, which
+# lets the transport/stream timeout tests assert on multi-second bounds
+# without actually sleeping. Kept out of the main dependency so the pausable
+# clock can never be reachable from the shipped daemon.
+tokio = { version = "1", features = ["full", "test-util"] }
+mockito = "1"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+tempfile = "3"
+
+# This crate is the root of the shipped `bigtiny-daemon` build
+# (`cargo build --release --features litert-engine --bin bigtiny-daemon`, see
+# docs/RELEASE.md), so without this section the daemon — and every path dep
+# linked into it — was built with bare cargo defaults: no LTO and
+# codegen-units = 16. `src-tauri` has been tuned since it was written; this
+# was simply never given the same treatment.
+#
+# `panic` is deliberately left at `unwind`. The agent loop relies on tokio
+# task-panic isolation (a panicking turn must not take the daemon with it),
+# which `panic = "abort"` would remove. `opt-level` stays at the default 3
+# rather than `src-tauri`'s "s": this is the latency-critical half of the
+# stack, and the daemon is not the binary competing for installer size.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

@@ -1,0 +1,1 @@
+ALTER TABLE mcp_servers ADD COLUMN enabled INTEGER DEFAULT 1;

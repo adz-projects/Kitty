@@ -1,0 +1,43 @@
+# The BigTiny V2 client library.
+#
+# Depends on `bigtiny2-protocol` and `reqwest` -- NOT on the daemon. A consumer
+# that only talks HTTP must never link sqlx, rmcp, wasmtime or LiteRT to do it.
+# V1 got away without this only because Kitty was the sole client and kept its
+# own hand-rolled copy under `src-tauri/src/bigtiny/`; with three frontends,
+# three hand-rolled copies of SSE framing is three places for it to be subtly
+# wrong.
+#
+# Much of this crate is a *port* of that Kitty code rather than new work. The
+# frame-boundary scanning and UTF-8-safe decode in particular are subtle and
+# already correct; they are lifted, not reinvented.
+
+[package]
+name = "bigtiny2-client"
+version = "2.0.0"
+edition = "2021"
+
+[lib]
+name = "bigtiny2_client"
+path = "src/lib.rs"
+
+[dependencies]
+bigtiny2-protocol = { path = "../protocol" }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["fs", "io-util", "process", "time", "sync"] }
+futures = "0.3"
+bytes = "1"
+thiserror = "2"
+tracing = "0.1"
+# Handshake/registration-token generation on the daemon side is not this
+# crate's job, but validating a discovered daemon is: we need a PID liveness
+# check that also confirms the process *name*, so a recycled PID cannot be
+# mistaken for a live daemon.
+sysinfo = "0.32"
+dirs = "5"
+
+[dev-dependencies]
+futures = "0.3"
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
