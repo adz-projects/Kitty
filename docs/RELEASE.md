@@ -155,9 +155,16 @@ bigtiny2-daemon import --from "%APPDATA%\Kitty\bigtiny\bigtiny.db" --pathway-fro
 ```
 
 It copies the database (never migrates in place), runs migrations `017+` on the
-copy, stamps every row as owned by the app `kitty`, registers that app, and
-prints the API key it issued. It refuses to run if a V2 database already
-exists, so it cannot silently clobber one.
+copy, and stamps every row as owned by the app `kitty`. It refuses to run if a
+V2 database already exists, so it cannot silently clobber one.
+
+It deliberately does **not** register the app. Kitty registers itself on first
+launch and stores its own key in the Credential Manager; an app row created
+here would hold a key hash for a credential Kitty can never obtain, so its
+registration would fail with a `409` it cannot recover from — a successful
+migration bricking first launch. The imported rows carry `app_id = 'kitty'`
+already and become visible the moment Kitty registers. Pass `--issue-key` only
+for a headless consumer that cannot register itself.
 
 ### The encryption key is the step people will skip
 

@@ -117,6 +117,7 @@ impl Database {
             .execute(&pool)
             .await?;
         bootstrap_legacy_python_schema(&pool).await?;
+        reconcile_line_ending_checksums(&pool).await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
 
         // First pass now, then daily. Without this nothing in the daemon ever
@@ -143,6 +144,87 @@ impl Database {
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
     }
+}
+
+
+/// Repair `_sqlx_migrations` checksums that differ from the embedded
+/// migrations **only** by line endings.
+///
+/// # The failure this exists to prevent
+///
+/// `sqlx::migrate!` hashes the *bytes* of each `.sql` file at compile time and
+/// refuses to open a database whose recorded checksum disagrees — "migration N
+/// was previously applied but has been modified". That is the right default:
+/// it catches someone editing a migration that has already run.
+///
+/// But this repository normalizes text to LF on checkout (`.gitattributes`:
+/// `* text=auto eol=lf`), while a working tree that predates that rule still
+/// holds CRLF until git next rewrites the file. So the *same logical migration*
+/// hashes differently depending on which side of a checkout produced the
+/// database. Concretely: V1's migrations sit CRLF in an older working tree, V2
+/// inherited byte-identical copies that a later checkout normalized to LF, and
+/// a daemon built from the normalized tree then refuses every database V1 ever
+/// created — including one the V2 importer had just successfully migrated.
+/// A successful migration producing an unopenable database is the worst
+/// possible shape for this bug, and nothing in the test suite could see it,
+/// because tests build and run from one consistent tree.
+///
+/// # Why this is safe
+///
+/// It is deliberately *not* "trust the database". A stored checksum is
+/// rewritten only when hashing the embedded SQL with its line endings
+/// converted reproduces that exact stored checksum — proving the difference is
+/// line endings and nothing else. A migration whose content genuinely changed
+/// matches neither variant and is left alone for `sqlx` to reject, which is
+/// what should happen.
+async fn reconcile_line_ending_checksums(pool: &SqlitePool) -> Result<(), StorageError> {
+    use sha2::{Digest, Sha384};
+
+    // Nothing to reconcile before the table exists (a brand-new database).
+    let exists: Option<String> = sqlx::query_scalar(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations'",
+    )
+    .fetch_optional(pool)
+    .await?;
+    if exists.is_none() {
+        return Ok(());
+    }
+
+    let checksum_of = |sql: &str| -> Vec<u8> {
+        let mut h = Sha384::new();
+        h.update(sql.as_bytes());
+        h.finalize().to_vec()
+    };
+
+    for migration in sqlx::migrate!("./migrations").iter() {
+        let version = migration.version;
+        let stored: Option<Vec<u8>> =
+            sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = ?")
+                .bind(version)
+                .fetch_optional(pool)
+                .await?;
+        let Some(stored) = stored else { continue };
+        if stored == migration.checksum.as_ref() {
+            continue;
+        }
+
+        // The two line-ending renderings of the same text. `\r\n -> \n` first
+        // so a mixed file collapses cleanly before being expanded again.
+        let lf = migration.sql.replace("\r\n", "\n");
+        let crlf = lf.replace('\n', "\r\n");
+        if checksum_of(&lf) == stored || checksum_of(&crlf) == stored {
+            sqlx::query("UPDATE _sqlx_migrations SET checksum = ? WHERE version = ?")
+                .bind(migration.checksum.as_ref())
+                .bind(version)
+                .execute(pool)
+                .await?;
+            tracing::info!(
+                version,
+                "migration checksum differed only by line endings; reconciled"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// BigTiny's Python daemon (`plugins/bigtiny/bigtiny/storage.py`) tracks its
@@ -1362,5 +1444,74 @@ mod tests {
         assert_eq!(recent.len(), 1);
         assert_eq!(recent[0].id, "tim1");
         assert!((recent[0].ttfb_ms.unwrap() - 120.5).abs() < f64::EPSILON);
+    }
+
+    /// A database whose migration checksums were recorded from CRLF files must
+    /// still open against an LF build, and vice versa.
+    ///
+    /// This is the bug that shipped a daemon which could not open the database
+    /// its own importer had just produced. No other test could catch it: they
+    /// all build and run from one consistent working tree, so the two renderings
+    /// never coexist. Here the divergence is created deliberately.
+    #[tokio::test]
+    async fn a_line_ending_only_checksum_difference_is_reconciled() {
+        use sha2::{Digest, Sha384};
+
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+
+        // Rewrite every stored checksum as if the files had the *other* line
+        // endings — exactly what a differently-normalized checkout produces.
+        let mut flipped = 0;
+        for m in sqlx::migrate!("./migrations").iter() {
+            let lf = m.sql.replace("\r\n", "\n");
+            let other = if m.sql.contains("\r\n") { lf } else { lf.replace('\n', "\r\n") };
+            let mut h = Sha384::new();
+            h.update(other.as_bytes());
+            sqlx::query("UPDATE _sqlx_migrations SET checksum = ? WHERE version = ?")
+                .bind(h.finalize().to_vec())
+                .bind(m.version)
+                .execute(&pool)
+                .await
+                .unwrap();
+            flipped += 1;
+        }
+        assert!(flipped > 0, "there are migrations to flip");
+
+        // Without reconciliation this is the shipping failure.
+        assert!(
+            sqlx::migrate!("./migrations").run(&pool).await.is_err(),
+            "the flipped checksums should be rejected before reconciliation"
+        );
+
+        super::reconcile_line_ending_checksums(&pool).await.unwrap();
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("reconciled checksums must open cleanly");
+    }
+
+    /// A migration whose *content* changed is still rejected. Reconciliation
+    /// must not become "trust whatever the database says".
+    #[tokio::test]
+    async fn a_genuinely_modified_migration_is_still_refused() {
+        use sha2::{Digest, Sha384};
+
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+
+        let mut h = Sha384::new();
+        h.update(b"-- something a developer actually edited after it ran");
+        sqlx::query("UPDATE _sqlx_migrations SET checksum = ? WHERE version = 1")
+            .bind(h.finalize().to_vec())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        super::reconcile_line_ending_checksums(&pool).await.unwrap();
+        assert!(
+            sqlx::migrate!("./migrations").run(&pool).await.is_err(),
+            "a real content change must not be silently accepted"
+        );
     }
 }

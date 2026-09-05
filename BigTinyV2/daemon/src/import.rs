@@ -188,9 +188,21 @@ async fn undecryptable_providers(pool: &SqlitePool) -> i64 {
 
 /// Import a copy of the V1 database at `source` into `dest`, owned by `app_id`.
 ///
-/// `api_key` is the key the app will present afterwards; it is hashed into
-/// `apps.key_hash` exactly as registration would, so an imported app is
-/// indistinguishable from a registered one.
+/// `api_key` is `None` in the normal case, and that is deliberate: the import
+/// stamps *ownership* onto rows, while issuing credentials is the client's own
+/// first-launch job.
+///
+/// Registering here by default was a real footgun, found by running a live
+/// migration. The import would mint a key, print it once, and write its hash
+/// into `apps`. Kitty's `ensure_app_key` then found nothing in the Credential
+/// Manager, tried to register, and got a `409` it cannot recover from -- the
+/// key is unrecoverable by design, so the app could never authenticate and
+/// first launch was bricked by a *successful* migration.
+///
+/// Leaving `apps` empty is the correct handoff: the rows carry `app_id`, they
+/// are simply invisible until an app registers under that id, and the client
+/// registering itself is the normal, already-exercised path. Pass `Some(key)`
+/// only for a headless consumer that cannot register on its own.
 ///
 /// The caller is responsible for having initialized `crypto` with V1's key
 /// (see the module doc) — the summary reports how many providers that failed
@@ -201,7 +213,7 @@ pub async fn import_v1(
     dest: &Path,
     app_id: &str,
     display_name: &str,
-    api_key: &str,
+    api_key: Option<&str>,
 ) -> Result<ImportSummary, DaemonError> {
     if dest.exists() {
         return Err(fail(format!(
@@ -216,9 +228,11 @@ pub async fn import_v1(
     let pool = open_pool(dest).await?;
 
     stamp_owner(&pool, app_id).await?;
-    crate::storage::apps::register_app(&pool, app_id, display_name, api_key)
-        .await
-        .map_err(|e| fail(format!("registering {app_id}: {e}")))?;
+    if let Some(key) = api_key {
+        crate::storage::apps::register_app(&pool, app_id, display_name, key)
+            .await
+            .map_err(|e| fail(format!("registering {app_id}: {e}")))?;
+    }
 
     let summary = ImportSummary {
         app_id: app_id.to_string(),
@@ -299,7 +313,7 @@ mod tests {
         let dest = dir.path().join("v2.db");
         v1_database(&source).await;
 
-        let summary = import_v1(&source, &dest, "kitty", "Kitty", "issued-key")
+        let summary = import_v1(&source, &dest, "kitty", "Kitty", Some("issued-key"))
             .await
             .expect("import should succeed");
 
@@ -327,7 +341,7 @@ mod tests {
         v1_database(&source).await;
         let before = std::fs::metadata(&source).unwrap().len();
 
-        import_v1(&source, &dest, "kitty", "Kitty", "k").await.unwrap();
+        import_v1(&source, &dest, "kitty", "Kitty", None).await.unwrap();
 
         let pool = open_pool(&source).await.unwrap();
         let still_orphaned: i64 =
@@ -348,7 +362,7 @@ mod tests {
         v1_database(&source).await;
         std::fs::write(&dest, b"existing").unwrap();
 
-        let err = import_v1(&source, &dest, "kitty", "Kitty", "k")
+        let err = import_v1(&source, &dest, "kitty", "Kitty", None)
             .await
             .expect_err("must not clobber an existing V2 database");
         assert!(err.to_string().contains("already exists"), "got: {err}");
@@ -363,7 +377,7 @@ mod tests {
         let source = dir.path().join("bigtiny.db");
         let dest = dir.path().join("v2.db");
         v1_database(&source).await;
-        import_v1(&source, &dest, "kitty", "Kitty", "k").await.unwrap();
+        import_v1(&source, &dest, "kitty", "Kitty", None).await.unwrap();
 
         let pool = open_pool(&dest).await.unwrap();
         crate::storage::apps::register_app(&pool, "other", "Other", "k2")
@@ -377,5 +391,32 @@ mod tests {
             .unwrap();
         pool.close().await;
         assert_eq!(owner, "kitty", "an existing owner was overwritten");
+    }
+
+    #[tokio::test]
+    async fn by_default_the_import_registers_nothing() {
+        // The rows are owned, but `apps` is empty, so the migrating client's
+        // own first-launch registration succeeds instead of hitting a 409 for
+        // a key it can never hold.
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("bigtiny.db");
+        let dest = dir.path().join("v2.db");
+        v1_database(&source).await;
+
+        import_v1(&source, &dest, "kitty", "Kitty", None).await.unwrap();
+
+        let pool = open_pool(&dest).await.unwrap();
+        let apps: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM apps")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let owned: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE app_id = 'kitty'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+
+        assert_eq!(apps, 0, "the import registered an app nobody holds a key for");
+        assert_eq!(owned, 1, "ownership is stamped regardless");
     }
 }

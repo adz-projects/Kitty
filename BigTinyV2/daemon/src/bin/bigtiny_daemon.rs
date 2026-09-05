@@ -182,10 +182,11 @@ async fn run_import(argv: &[String]) -> ! {
     }
 
     let dest = data_dir.join("bigtiny.db");
+    // Off by default -- see `import_v1`. A migrating GUI client registers
+    // itself on first launch and stores its own key; minting one here only
+    // guarantees it a 409 for a credential it cannot obtain.
+    let issue_key = argv.iter().any(|a| a == "--issue-key") || flag("--key").is_some();
     let key = flag("--key").unwrap_or_else(|| {
-        // A fresh key is generated rather than prompted for: the app has to
-        // store it somewhere anyway, and printing it once matches what
-        // registration does.
         use rand::Rng;
         let bytes: [u8; 32] = rand::thread_rng().gen();
         bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -196,7 +197,7 @@ async fn run_import(argv: &[String]) -> ! {
         &dest,
         &app_id,
         &display_name,
-        &key,
+        if issue_key { Some(key.as_str()) } else { None },
     )
     .await
     {
@@ -215,8 +216,18 @@ async fn run_import(argv: &[String]) -> ! {
             if adopted {
                 println!("  encryption key adopted -> {}", data_dir.join("encryption.key").display());
             }
-            println!("\n  API key for {app_id}: {key}");
-            println!("  Store this now — it is not recoverable from the database.");
+            if issue_key {
+                println!("\n  API key for {app_id}: {key}");
+                println!("  Store this now — it is not recoverable from the database.");
+            } else {
+                println!(
+                    "\n  No app was registered, which is what a GUI client wants:\n  \
+                     {app_id} registers itself on first launch and stores its own key.\n  \
+                     The imported rows are already owned by {app_id:?} and become\n  \
+                     visible the moment it does. Pass --issue-key for a headless\n  \
+                     consumer that cannot register itself."
+                );
+            }
             std::process::exit(0);
         }
         Err(e) => {
