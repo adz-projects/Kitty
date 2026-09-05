@@ -51,6 +51,13 @@ struct ProviderEntry {
     fallback_priority: i32,
     /// Owning app, or `None` for the shared pool every app can see.
     app_id: Option<String>,
+    /// Whether `concurrency` was configured, probed, or guessed.
+    slots_source: super::slots::SlotsSource,
+    /// Kept for the slot probe, which needs to know *what* to ask and
+    /// where. The `Provider` trait exposes neither, and widening it for
+    /// one caller would be the larger change.
+    dialect: String,
+    base_url: String,
 }
 
 const HEALTH_TTL_SECS: u64 = 30;
@@ -86,6 +93,9 @@ fn default_concurrency(dialect: &str) -> u32 {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct QueueStats {
     pub concurrency: u32,
+    /// `configured` | `probed` | `default` -- lets an operator tell a
+    /// measured slot count from a guess.
+    pub slots_source: super::slots::SlotsSource,
     pub in_flight: u32,
     pub queue_depth: usize,
     /// This caller's own waiters -- distinct from `queue_depth`, so an app can
@@ -192,6 +202,13 @@ impl ProviderRouter {
     ) {
         let (parallel_slots, concurrency, resolved_sampling, context_length, fallback_priority) =
             Self::resolved_fields(&config);
+        let slots_source = if parallel_slots.is_some() {
+            super::slots::SlotsSource::Configured
+        } else {
+            super::slots::SlotsSource::Default
+        };
+        let dialect = config.provider_type.clone();
+        let base_url = config.base_url.clone();
         let p: Arc<dyn Provider> = Arc::new(OpenAICompatibleProvider::new(
             provider_id,
             config,
@@ -213,6 +230,9 @@ impl ProviderRouter {
                 context_length,
                 fallback_priority,
                 app_id,
+                slots_source,
+                dialect,
+                base_url,
             },
         );
     }
@@ -232,6 +252,13 @@ impl ProviderRouter {
     ) {
         let (parallel_slots, concurrency, resolved_sampling, context_length, fallback_priority) =
             Self::resolved_fields(&config);
+        let slots_source = if parallel_slots.is_some() {
+            super::slots::SlotsSource::Configured
+        } else {
+            super::slots::SlotsSource::Default
+        };
+        let dialect = config.provider_type.clone();
+        let base_url = config.base_url.clone();
         let p: Arc<dyn Provider> = Arc::new(AnthropicProvider::new(
             provider_id,
             config,
@@ -254,6 +281,9 @@ impl ProviderRouter {
                 context_length,
                 fallback_priority,
                 app_id,
+                slots_source,
+                dialect,
+                base_url,
             },
         );
     }
@@ -372,6 +402,11 @@ impl ProviderRouter {
         for row in &rows {
             self.register_from_row(row);
         }
+        // Ask each endpoint what it can actually serve, concurrently and after
+        // every provider is already registered and usable. A slow or
+        // unreachable endpoint therefore delays nothing -- the probe only ever
+        // improves on the guess.
+        futures::future::join_all(rows.iter().map(|row| self.probe_slots(&row.id))).await;
         Ok(())
     }
 
@@ -746,6 +781,48 @@ impl ProviderRouter {
             .clone()
     }
 
+    /// Ask an endpoint how many parallel slots it really has, and adopt the
+    /// answer.
+    ///
+    /// Run *after* registration rather than during it, so a slow or unreachable
+    /// endpoint delays nothing: the provider is already usable at its guessed
+    /// concurrency, and the probe only ever improves on that.
+    ///
+    /// A user-set `parallel_slots` is never overridden -- an explicit statement
+    /// outranks a measurement.
+    pub async fn probe_slots(&self, provider_id: &str) {
+        let Some((dialect, base_url, already_configured)) = self
+            .providers
+            .get(provider_id)
+            .map(|e| (e.dialect.clone(), e.base_url.clone(), e.parallel_slots.is_some()))
+        else {
+            return;
+        };
+        if already_configured {
+            return;
+        }
+
+        let client = reqwest::Client::new();
+        let Some(found) = super::slots::probe(&client, &base_url, &dialect).await else {
+            return;
+        };
+
+        if let Some(mut entry) = self.providers.get_mut(provider_id) {
+            if entry.concurrency == found {
+                return;
+            }
+            tracing::info!(
+                provider_id,
+                from = entry.concurrency,
+                to = found,
+                "endpoint reported its parallel slot count"
+            );
+            entry.concurrency = found;
+            entry.slots_source = super::slots::SlotsSource::Probed;
+        }
+        self.sync_queue_limit(provider_id).await;
+    }
+
     /// Apply a provider's current concurrency to its live queue.
     ///
     /// Called after re-registration so editing `parallel_slots` takes effect
@@ -762,8 +839,14 @@ impl ProviderRouter {
     /// A snapshot of one provider's queue, for `GET /api/providers`.
     pub async fn queue_stats(&self, provider_id: &str, app_id: &str) -> Option<QueueStats> {
         let q = self.queues.get(provider_id)?.clone();
+        let slots_source = self
+            .providers
+            .get(provider_id)
+            .map(|e| e.slots_source)
+            .unwrap_or(super::slots::SlotsSource::Default);
         Some(QueueStats {
             concurrency: q.limit().await,
+            slots_source,
             in_flight: q.in_flight().await,
             queue_depth: q.queue_depth().await,
             my_queue_depth: q.queue_depth_for(app_id).await,

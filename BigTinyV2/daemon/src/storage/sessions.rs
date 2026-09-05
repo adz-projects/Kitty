@@ -177,6 +177,57 @@ pub async fn owner_of(
     Ok(owner)
 }
 
+/// Tag a session as a child of `parent_id`, for fan-out grouping.
+///
+/// A tag, not a foreign key with cascade: deleting a parent must not silently
+/// delete the subagent transcripts, which are often the actual output.
+pub async fn set_parent(
+    pool: &SqlitePool,
+    session_id: &str,
+    parent_id: &str,
+) -> Result<(), StorageError> {
+    sqlx::query("UPDATE sessions SET parent_session_id = ? WHERE id = ?")
+        .bind(parent_id)
+        .bind(session_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// The children an app grouped under `parent_id`.
+pub async fn children_of(
+    pool: &SqlitePool,
+    parent_id: &str,
+    app_id: &str,
+) -> Result<Vec<String>, StorageError> {
+    let ids: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM sessions WHERE parent_session_id = ? AND app_id = ? ORDER BY created_at",
+    )
+    .bind(parent_id)
+    .bind(app_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(ids)
+}
+
+/// The last assistant message in a session, which is a job's result.
+///
+/// Read from the transcript rather than captured from the SSE stream: a
+/// detached job has no stream to capture, and the transcript is the durable
+/// record either way.
+pub async fn last_assistant_text(
+    pool: &SqlitePool,
+    session_id: &str,
+) -> Result<Option<String>, StorageError> {
+    let text: Option<Option<String>> = sqlx::query_scalar(
+        "SELECT content FROM messages WHERE session_id = ? AND role = 'assistant'          ORDER BY rowid DESC LIMIT 1",
+    )
+    .bind(session_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(text.flatten())
+}
+
 pub async fn get_session(
     pool: &SqlitePool,
     session_id: &str,

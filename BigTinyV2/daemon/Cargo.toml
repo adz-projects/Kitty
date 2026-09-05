@@ -139,6 +139,8 @@ adaptive-pathway = { path = "../../plugins/adaptive-pathway_rust" }
 # wants `litert-lm.lib`, so our `build.rs` copies it (see build.rs).
 litert-lm-rust = { version = "0.2", optional = true }
 
+async-stream = "0.3"
+
 [dev-dependencies]
 # Self dev-dependency purely to turn `test-support` on for the
 # integration tests: they are separate crates and cannot otherwise see

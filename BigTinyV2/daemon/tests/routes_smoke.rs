@@ -101,6 +101,7 @@ async fn test_state_inner(
         config,
         plugins: plugins.clone(),
         key_cache: Arc::new(bigtiny2::server::middleware::KeyCache::new()),
+        replay: Arc::new(bigtiny2::server::replay::ReplayBuffers::new()),
         instance_id: "test-instance".to_string(),
     })
 }

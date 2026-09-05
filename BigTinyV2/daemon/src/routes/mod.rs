@@ -2,6 +2,7 @@ pub mod apps;
 pub mod chat;
 pub mod embeddings;
 pub mod health;
+pub mod jobs;
 pub mod local;
 pub mod mcp;
 pub mod memory;
@@ -49,6 +50,10 @@ pub struct AppState {
     /// revoking an app can invalidate it synchronously -- a revoked key that
     /// keeps working until a TTL expires is not an acceptable window.
     pub key_cache: Arc<crate::server::middleware::KeyCache>,
+    /// Per-turn event buffers, so a client that drops can rejoin a stream
+    /// already in progress. Necessary once work outlives its submitter --
+    /// see `server::replay`.
+    pub replay: crate::server::replay::SharedReplay,
     /// This launch's identity, echoed on `/api/health` so a client can prove
     /// the process answering on a port is the one its handshake describes.
     pub instance_id: String,
@@ -87,6 +92,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         // FTS5 index has existed since migration 009 but was only ever
         // reachable from the internal per-session recall path.
         .route("/api/search", get(search::search))
+        // Detached work: submit, poll, collect. A job is a turn with the
+        // stream taken away, so it survives its submitter going away.
+        .route("/api/jobs", get(jobs::list).post(jobs::create))
+        .route("/api/jobs/{id}", get(jobs::get).delete(jobs::cancel))
         // Ollama-compatible on purpose — see routes/embeddings.rs.
         .route("/api/embeddings", post(embeddings::embed))
         .route("/api/pathway/beliefs", get(pathway::list_beliefs))
@@ -106,6 +115,9 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/chat/{id}/config", patch(chat::update_config))
         .route("/api/chat/{id}/send", post(chat::send_message))
+        // Rejoin a turn already in progress: a reconnecting client, or a
+        // second window. A second *send* still 409s -- that rule is unchanged.
+        .route("/api/chat/{id}/stream", get(chat::attach_stream))
         .route("/api/chat/{id}/history", get(chat::get_history))
         .route("/api/chat/{id}/stats", get(chat::get_stats))
         .route("/api/chat/{id}/timings", get(chat::get_timings))

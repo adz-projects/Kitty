@@ -5,6 +5,7 @@ pub mod queue;
 pub mod router;
 pub mod presets;
 pub mod sampling;
+pub mod slots;
 pub mod tag_split;
 
 pub use base::classify_provider_error;

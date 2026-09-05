@@ -232,6 +232,8 @@ pub async fn create_provider(
         Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
     state.router.register_from_row(&row);
+    // A newly registered endpoint may support more than the dialect default.
+    state.router.probe_slots(&row.id).await;
 
     Json(json!({"id": row.id})).into_response()
 }
@@ -303,6 +305,9 @@ pub async fn update_provider(
     match providers::get_provider_for_app(&state.db, &id, &identity.app_id).await {
         Ok(Some(row)) => {
             state.router.register_from_row(&row);
+            // A PATCH may have changed the base URL, so re-ask rather than
+            // carrying the previous endpoint's answer over.
+            state.router.probe_slots(&row.id).await;
             Json(to_public_json(&row)).into_response()
         }
         Ok(None) => err_response(StatusCode::NOT_FOUND, "provider not found"),

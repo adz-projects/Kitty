@@ -22,6 +22,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::agent::context::stats::SessionStats;
 use crate::error::StorageError;
 use crate::server::events::{serialize_sse, SSEEvent, SSEEventType};
+use crate::server::replay::SharedReplay;
 use crate::storage::messages::{self, MessageRow};
 use crate::storage::apps::AppIdentity;
 use crate::storage::sessions;
@@ -206,6 +207,122 @@ pub async fn delete_session(
         Ok(_) => Json(json!({"ok": true})).into_response(),
         Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
+}
+
+/// One SSE frame, carrying an `id:` when the event was buffered.
+///
+/// Only buffered events get an id: an id a client could resume from but which
+/// the buffer does not hold would send it back to a position that no longer
+/// exists. Text deltas are best-effort and therefore unnumbered.
+fn sse_frame(event_id: Option<u64>, event: &SSEEvent) -> String {
+    match event_id {
+        Some(id) => format!("id: {id}\n{}", serialize_sse(event)),
+        None => serialize_sse(event),
+    }
+}
+
+/// `GET /api/chat/{id}/stream` — rejoin a turn already in progress.
+///
+/// This is the corollary of detached work: once a turn can outlive its
+/// submitter, a client needs a way back to one. A second `/send` still 409s --
+/// starting a second turn and rejoining an existing one are different things.
+///
+/// `Last-Event-ID` (the standard SSE resume header) names the last frame the
+/// client saw. Anything after it is replayed, then the live stream continues.
+pub async fn attach_stream(
+    State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<AppIdentity>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if let Some(denied) = deny_unless_owned(&state, &id, &identity).await {
+        return denied;
+    }
+
+    let last_id = headers
+        .get("last-event-id")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok());
+
+    let Some(replay) = state.replay.since(&id, last_id) else {
+        return err_response(
+            StatusCode::NOT_FOUND,
+            "no turn to attach to for this session",
+        );
+    };
+
+    let mut frames: Vec<String> = Vec::new();
+
+    // Tell the client up front if its transcript has a hole, rather than
+    // handing it a silently incomplete one. A gap it knows about can be
+    // repaired by reading the transcript; one it does not know about cannot.
+    if replay.has_gap() {
+        frames.push(sse_frame(
+            None,
+            &SSEEvent {
+                event_type: SSEEventType::SessionStatus,
+                content: Some("ResumedWithGap".into()),
+                session_id: Some(id.clone()),
+                error_message: Some(format!(
+                    "{} streamed text update(s) were not retained{}",
+                    replay.dropped_deltas,
+                    if replay.truncated {
+                        "; the resume point is older than the buffer"
+                    } else {
+                        ""
+                    }
+                )),
+                ..Default::default()
+            },
+        ));
+    }
+
+    for recorded in &replay.events {
+        frames.push(sse_frame(Some(recorded.id), &recorded.event));
+    }
+
+    // A turn that has already finished gets its tail and an immediate close;
+    // there is no live stream left to follow.
+    if replay.finished {
+        return sse_response(Body::from(frames.concat()));
+    }
+
+    // Live turn: replay the tail, then follow. Polling the buffer rather than
+    // subscribing keeps `/send`'s hot path free of fan-out bookkeeping, at the
+    // cost of up to one tick of latency for a rejoining client -- which is the
+    // rare path, not the common one.
+    let buffers = state.replay.clone();
+    let session = id.clone();
+    let mut cursor = replay.events.last().map(|r| r.id).or(last_id);
+    let stream = async_stream::stream! {
+        yield Ok::<Bytes, std::convert::Infallible>(Bytes::from(frames.concat()));
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let Some(next) = buffers.since(&session, cursor) else {
+                break;
+            };
+            for recorded in &next.events {
+                cursor = Some(recorded.id);
+                yield Ok(Bytes::from(sse_frame(Some(recorded.id), &recorded.event)));
+            }
+            if next.finished {
+                break;
+            }
+        }
+    };
+    sse_response(Body::from_stream(stream))
+}
+
+fn sse_response(body: Body) -> Response {
+    let mut response = Response::new(body);
+    response.headers_mut().insert(
+        "Content-Type",
+        HeaderValue::from_static("text/event-stream"),
+    );
+    response
+        .headers_mut()
+        .insert("Cache-Control", HeaderValue::from_static("no-cache"));
+    response
 }
 
 // ---- PATCH /api/chat/{id}/config -----------------------------------------
@@ -694,6 +811,13 @@ pub async fn send_message(
     }
 
     let (tx, rx) = mpsc::unbounded_channel::<SSEEvent>();
+    // Start this turn's replay buffer *before* the turn does, so an event
+    // emitted immediately is still recorded. Ids restart per turn, so a stale
+    // `Last-Event-ID` from a previous turn cannot skip past this one's events.
+    state.replay.begin(&id);
+    let replay = state.replay.clone();
+    let replay_session = id.clone();
+
     if let Err(e) = state
         .agent
         .run_turn(id, body.message, body.images, None, tx)
@@ -712,22 +836,25 @@ pub async fn send_message(
     // frame) still waits its turn, so a slow reader loses resolution, never
     // correctness — and a client that has stopped reading entirely closes
     // the channel, which the turn already treats as a cancel.
-    let (client_tx, client_rx) = mpsc::channel::<SSEEvent>(SSE_CLIENT_QUEUE);
+    let (client_tx, client_rx) = mpsc::channel::<(Option<u64>, SSEEvent)>(SSE_CLIENT_QUEUE);
     tokio::spawn(async move {
         let mut rx = rx;
         let mut dropped: u64 = 0;
         while let Some(event) = rx.recv().await {
+            // Record before sending: a client that drops mid-frame must still
+            // find the event waiting when it comes back.
+            let event_id = replay.record(&replay_session, &event);
             let droppable = matches!(
                 event.event_type,
                 SSEEventType::LlmDelta | SSEEventType::ReasoningDelta
             ) && !event.is_last;
             if droppable {
-                if client_tx.try_send(event).is_err() {
+                if client_tx.try_send((event_id, event)).is_err() {
                     dropped += 1;
                 }
                 continue;
             }
-            if client_tx.send(event).await.is_err() {
+            if client_tx.send((event_id, event)).await.is_err() {
                 break; // client is gone; dropping `rx` ends the turn's stream
             }
         }
@@ -736,8 +863,9 @@ pub async fn send_message(
         }
     });
 
-    let stream = ReceiverStream::new(client_rx)
-        .map(|event| Ok::<Bytes, std::convert::Infallible>(Bytes::from(serialize_sse(&event))));
+    let stream = ReceiverStream::new(client_rx).map(|(event_id, event)| {
+        Ok::<Bytes, std::convert::Infallible>(Bytes::from(sse_frame(event_id, &event)))
+    });
 
     let mut response = Response::new(Body::from_stream(stream));
     response.headers_mut().insert(

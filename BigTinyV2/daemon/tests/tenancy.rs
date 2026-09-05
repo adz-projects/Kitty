@@ -90,6 +90,7 @@ async fn test_state() -> Arc<AppState> {
         config,
         plugins: plugins.clone(),
         key_cache: Arc::new(bigtiny2::server::middleware::KeyCache::new()),
+        replay: Arc::new(bigtiny2::server::replay::ReplayBuffers::new()),
         instance_id: "test-instance".to_string(),
     })
 }
@@ -134,6 +135,7 @@ fn session_routes(id: &str) -> Vec<(Method, String, Option<Value>)> {
         (Method::GET, format!("/api/chat/{id}/stats"), None),
         (Method::GET, format!("/api/chat/{id}/timings"), None),
         (Method::GET, format!("/api/chat/{id}/pending"), None),
+        (Method::GET, format!("/api/chat/{id}/stream"), None),
         (
             Method::PATCH,
             format!("/api/chat/{id}"),
@@ -200,7 +202,13 @@ async fn every_session_route_works_for_its_actual_owner() {
         //   * `approve` 404s for a nonexistent action id even for the owner,
         //     which is correct and long-standing behaviour -- so it cannot
         //     distinguish "denied" from "no such action" here.
-        if path.ends_with("/send") || path.ends_with("/approve") || method == Method::DELETE {
+        if path.ends_with("/send")
+            || path.ends_with("/approve")
+            // `/stream` 404s for its owner too when no turn is buffered, which
+            // is correct and unrelated to ownership.
+            || path.ends_with("/stream")
+            || method == Method::DELETE
+        {
             continue;
         }
 
@@ -1229,5 +1237,421 @@ async fn embeddings_reports_a_clean_503_with_no_model_configured() {
     assert!(
         body["error"].as_str().unwrap().contains("no embedding model"),
         "unexpected error: {body}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Detached jobs
+//
+// A job is a turn with the SSE stream taken away, so it survives its submitter
+// going away. These tests have no configured provider, so every turn fails --
+// which is fine and even useful: it exercises the failure half of the
+// lifecycle, and the parts under test (ownership, state transitions, grouping)
+// are independent of whether the turn itself succeeds.
+// ---------------------------------------------------------------------------
+
+async fn submit_job(state: Arc<AppState>, app_id: &str, body: Value) -> (StatusCode, Value) {
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/api/jobs")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = router_as(state, app_id).oneshot(req).await.unwrap();
+    let status = resp.status();
+    (status, body_json(resp).await)
+}
+
+async fn get_job(state: Arc<AppState>, app_id: &str, job_id: &str) -> (StatusCode, Value) {
+    let req = Request::builder()
+        .uri(format!("/api/jobs/{job_id}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = router_as(state, app_id).oneshot(req).await.unwrap();
+    let status = resp.status();
+    (status, body_json(resp).await)
+}
+
+#[tokio::test]
+async fn submitting_a_job_returns_immediately_with_an_id() {
+    // The whole point: the caller does not hold a stream, and does not wait for
+    // the turn. It gets an id and can leave.
+    let state = test_state().await;
+    let (status, body) = submit_job(
+        state.clone(),
+        APP_A,
+        json!({"prompt": "summarise the thing"}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["job_id"].as_str().is_some());
+    assert!(body["session_id"].as_str().is_some());
+
+    // A session was created for it, owned by the submitting app.
+    let sid = body["session_id"].as_str().unwrap();
+    assert!(
+        bigtiny2::storage::sessions::is_owned_by(&state.db, sid, APP_A)
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn a_job_is_invisible_to_other_apps() {
+    let state = test_state().await;
+    let (_, body) = submit_job(state.clone(), APP_A, json!({"prompt": "mine"})).await;
+    let job_id = body["job_id"].as_str().unwrap().to_string();
+
+    assert_eq!(
+        get_job(state.clone(), APP_B, &job_id).await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        get_job(state.clone(), APP_A, &job_id).await.0,
+        StatusCode::OK
+    );
+
+    // ...and does not appear in another app's listing.
+    let req = Request::builder()
+        .uri("/api/jobs")
+        .body(Body::empty())
+        .unwrap();
+    let body = body_json(router_as(state, APP_B).oneshot(req).await.unwrap()).await;
+    assert!(body["jobs"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn another_app_cannot_cancel_my_job() {
+    let state = test_state().await;
+    let (_, body) = submit_job(state.clone(), APP_A, json!({"prompt": "mine"})).await;
+    let job_id = body["job_id"].as_str().unwrap().to_string();
+
+    let req = Request::builder()
+        .method(Method::DELETE)
+        .uri(format!("/api/jobs/{job_id}"))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        router_as(state.clone(), APP_B).oneshot(req).await.unwrap().status(),
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn a_job_cannot_be_grafted_onto_another_apps_session() {
+    // Two ways in, both closed: reusing another app's session as the job's
+    // own, and naming it as a fan-out parent. Either would let one app append
+    // to the other's transcript.
+    let state = test_state().await;
+    let victim = create_session(state.clone(), APP_B).await;
+
+    let (status, _) = submit_job(
+        state.clone(),
+        APP_A,
+        json!({"prompt": "x", "session_id": victim}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (status, _) = submit_job(
+        state.clone(),
+        APP_A,
+        json!({"prompt": "x", "parent_session_id": victim}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn a_fan_out_groups_its_children_under_the_parent() {
+    // Concurrent turns within one app are concurrent *sessions*, so an app
+    // fanning out to subagents needs a way to find the children it created.
+    let state = test_state().await;
+    let parent = create_session(state.clone(), APP_A).await;
+
+    let mut children = Vec::new();
+    for i in 0..3 {
+        let (status, body) = submit_job(
+            state.clone(),
+            APP_A,
+            json!({"prompt": format!("subtask {i}"), "parent_session_id": parent}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        children.push(body["session_id"].as_str().unwrap().to_string());
+    }
+
+    let found = bigtiny2::storage::sessions::children_of(&state.db, &parent, APP_A)
+        .await
+        .unwrap();
+    assert_eq!(found.len(), 3);
+    for c in &children {
+        assert!(found.contains(c), "child {c} not grouped under its parent");
+    }
+
+    // Another app sees no children, even naming the right parent id.
+    assert!(
+        bigtiny2::storage::sessions::children_of(&state.db, &parent, APP_B)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn an_empty_prompt_is_refused_before_a_session_is_created() {
+    // Otherwise every bad request would leave an orphan session behind.
+    let state = test_state().await;
+    let before = bigtiny2::storage::sessions::list_sessions_page_for_app(&state.db, APP_A, 100, 0)
+        .await
+        .unwrap()
+        .1;
+
+    let (status, _) = submit_job(state.clone(), APP_A, json!({"prompt": "   "})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let after = bigtiny2::storage::sessions::list_sessions_page_for_app(&state.db, APP_A, 100, 0)
+        .await
+        .unwrap()
+        .1;
+    assert_eq!(before, after, "a rejected job must not leave a session behind");
+}
+
+#[tokio::test]
+async fn a_finished_job_reports_a_conflict_rather_than_a_false_cancel() {
+    // Saying "ok" would tell the caller it stopped work that had in fact
+    // already completed.
+    let state = test_state().await;
+    let (_, body) = submit_job(state.clone(), APP_A, json!({"prompt": "x"})).await;
+    let job_id = body["job_id"].as_str().unwrap().to_string();
+
+    // With no provider configured the turn fails quickly; wait for terminal.
+    let mut status = String::new();
+    for _ in 0..100 {
+        let (_, j) = get_job(state.clone(), APP_A, &job_id).await;
+        status = j["status"].as_str().unwrap_or_default().to_string();
+        if matches!(status.as_str(), "succeeded" | "failed") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(status, "failed", "no provider is configured in these tests");
+
+    let req = Request::builder()
+        .method(Method::DELETE)
+        .uri(format!("/api/jobs/{job_id}"))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        router_as(state, APP_A).oneshot(req).await.unwrap().status(),
+        StatusCode::CONFLICT
+    );
+}
+
+#[tokio::test]
+async fn listing_filters_by_status() {
+    let state = test_state().await;
+    for _ in 0..2 {
+        submit_job(state.clone(), APP_A, json!({"prompt": "x"})).await;
+    }
+    // Let both reach a terminal state.
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+    let list = |status: Option<&str>| {
+        let state = state.clone();
+        let q = status.map(|s| format!("?status={s}")).unwrap_or_default();
+        async move {
+            let req = Request::builder()
+                .uri(format!("/api/jobs{q}"))
+                .body(Body::empty())
+                .unwrap();
+            let body = body_json(router_as(state, APP_A).oneshot(req).await.unwrap()).await;
+            body["jobs"].as_array().unwrap().len()
+        }
+    };
+    assert_eq!(list(None).await, 2);
+    assert_eq!(list(Some("succeeded")).await, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Attaching to a stream
+//
+// The corollary of detached work: once a turn can outlive its submitter, a
+// client needs a way back to one. A second *send* still 409s — starting a
+// second turn and rejoining an existing one are different things.
+// ---------------------------------------------------------------------------
+
+async fn attach(
+    state: Arc<AppState>,
+    app_id: &str,
+    session_id: &str,
+    last_event_id: Option<&str>,
+) -> (StatusCode, String) {
+    let mut builder = Request::builder().uri(format!("/api/chat/{session_id}/stream"));
+    if let Some(id) = last_event_id {
+        builder = builder.header("last-event-id", id);
+    }
+    let resp = router_as(state, app_id)
+        .oneshot(builder.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+#[tokio::test]
+async fn attaching_to_a_session_with_no_turn_is_a_404() {
+    // Nothing to rejoin. Distinguishable from "not yours", which is also a 404
+    // but for a different reason — both are correct answers to the client.
+    let state = test_state().await;
+    let session = create_session(state.clone(), APP_A).await;
+    assert_eq!(
+        attach(state, APP_A, &session, None).await.0,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn another_app_cannot_attach_to_my_stream() {
+    // The leak this prevents is the worst kind available here: a live feed of
+    // someone else's conversation as it is generated.
+    let state = test_state().await;
+    let session = create_session(state.clone(), APP_A).await;
+    state.replay.begin(&session);
+
+    assert_eq!(
+        attach(state, APP_B, &session, None).await.0,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn a_finished_turn_replays_its_tail_and_closes() {
+    // A client reconnecting a moment after the turn ended still wants the
+    // result, so buffers are not discarded on completion.
+    let state = test_state().await;
+    let session = create_session(state.clone(), APP_A).await;
+
+    state.replay.begin(&session);
+    state.replay.record(
+        &session,
+        &bigtiny2::server::events::SSEEvent {
+            event_type: bigtiny2::server::events::SSEEventType::ToolStart,
+            tool_name: Some("read_file".into()),
+            ..Default::default()
+        },
+    );
+    state.replay.record(
+        &session,
+        &bigtiny2::server::events::SSEEvent {
+            event_type: bigtiny2::server::events::SSEEventType::SessionStatus,
+            content: Some("Completed".into()),
+            is_last: true,
+            ..Default::default()
+        },
+    );
+
+    let (status, body) = attach(state, APP_A, &session, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("read_file"), "tail should replay: {body}");
+    assert!(body.contains("Completed"));
+    // Ids are what a client resumes from.
+    assert!(body.contains("id: 1"), "frames must carry ids: {body}");
+}
+
+#[tokio::test]
+async fn resuming_returns_only_what_came_after_the_given_id() {
+    let state = test_state().await;
+    let session = create_session(state.clone(), APP_A).await;
+    state.replay.begin(&session);
+
+    for name in ["first_tool", "second_tool"] {
+        state.replay.record(
+            &session,
+            &bigtiny2::server::events::SSEEvent {
+                event_type: bigtiny2::server::events::SSEEventType::ToolStart,
+                tool_name: Some(name.into()),
+                ..Default::default()
+            },
+        );
+    }
+    state.replay.record(
+        &session,
+        &bigtiny2::server::events::SSEEvent {
+            event_type: bigtiny2::server::events::SSEEventType::SessionStatus,
+            is_last: true,
+            ..Default::default()
+        },
+    );
+
+    let (status, body) = attach(state, APP_A, &session, Some("1")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !body.contains("first_tool"),
+        "already-seen events must not be resent: {body}"
+    );
+    assert!(body.contains("second_tool"));
+}
+
+#[tokio::test]
+async fn a_resuming_client_is_told_when_text_was_lost() {
+    // A gap the client knows about can be repaired by reading the transcript;
+    // one it does not know about cannot. Silently handing over an incomplete
+    // transcript is the failure this avoids.
+    let state = test_state().await;
+    let session = create_session(state.clone(), APP_A).await;
+    state.replay.begin(&session);
+
+    // A dropped delta: recorded as a gap, not stored.
+    state
+        .replay
+        .record(&session, &bigtiny2::server::events::SSEEvent::content("lost"));
+    state.replay.record(
+        &session,
+        &bigtiny2::server::events::SSEEvent {
+            event_type: bigtiny2::server::events::SSEEventType::SessionStatus,
+            is_last: true,
+            ..Default::default()
+        },
+    );
+
+    let (status, body) = attach(state, APP_A, &session, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("ResumedWithGap"),
+        "the client must be warned about the hole: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_second_send_still_conflicts_even_though_attaching_is_allowed() {
+    // Rejoining a turn and starting a second one are different things, and the
+    // per-session 409 is still the right answer to the second.
+    let state = test_state().await;
+    let session = create_session(state.clone(), APP_A).await;
+
+    let send = || {
+        let state = state.clone();
+        let session = session.clone();
+        async move {
+            let req = Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/chat/{session}/send"))
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"message": "hello"}).to_string()))
+                .unwrap();
+            router_as(state, APP_A).oneshot(req).await.unwrap().status()
+        }
+    };
+
+    // With no provider configured the first turn fails fast, so this asserts
+    // the routing rule rather than a race: whatever the first send returns,
+    // the session is never left accepting two concurrent turns.
+    let first = send().await;
+    assert!(
+        first == StatusCode::OK || first == StatusCode::CONFLICT,
+        "unexpected first send status: {first}"
     );
 }

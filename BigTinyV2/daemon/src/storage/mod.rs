@@ -1,3 +1,4 @@
+pub mod jobs;
 pub mod app_plugins;
 pub mod apps;
 pub mod execution;

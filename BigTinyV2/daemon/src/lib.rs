@@ -101,6 +101,16 @@ pub async fn run(config: BigTinyConfig, options: RunOptions) -> Result<(), Daemo
     let db = storage::Database::connect(&options.db_path).await?;
     let pool = db.pool().clone();
 
+    // Anything still `running` belongs to a previous process that stopped
+    // without finishing it. Marked `interrupted`, never re-queued: a turn may
+    // have executed tools with side effects, and silently re-running it would
+    // repeat them. The owner decides whether resubmitting is safe.
+    match storage::jobs::mark_interrupted_on_boot(&pool).await {
+        Ok(0) => {}
+        Ok(n) => tracing::warn!("marked {n} job(s) interrupted by a previous shutdown"),
+        Err(e) => tracing::warn!("could not sweep interrupted jobs: {e}"),
+    }
+
     // Behavioral-memory plugin. V1 opened exactly ONE engine here, for the
     // whole daemon. V2 opens one per app, lazily, through `PluginHost` — a
     // single graph shared by several frontends would mix their beliefs, which
@@ -233,6 +243,10 @@ pub async fn run(config: BigTinyConfig, options: RunOptions) -> Result<(), Daemo
     // Shared by the auth middleware (which populates it) and the app
     // routes (which invalidate it on revocation), so a deleted app stops
     // authenticating immediately rather than at some TTL boundary.
+    // Kept back before the pool is moved into `AppState`, for the idle
+    // timer's detached-job check.
+    let idle_pool = pool.clone();
+
     let key_cache = Arc::new(server::middleware::KeyCache::new());
 
     // Regenerated every launch. This is what lets a client tell "the
@@ -251,6 +265,7 @@ pub async fn run(config: BigTinyConfig, options: RunOptions) -> Result<(), Daemo
         scheduler: scheduler.clone(),
         config: config.clone(),
         plugins: plugins.clone(),
+        replay: Arc::new(server::replay::ReplayBuffers::new()),
         key_cache: key_cache.clone(),
         instance_id: instance_id.clone(),
     });
@@ -325,6 +340,7 @@ pub async fn run(config: BigTinyConfig, options: RunOptions) -> Result<(), Daemo
         let activity = activity.clone();
         let agent = agent.clone();
         let scheduler_for_idle = scheduler.clone();
+        let idle_pool = idle_pool.clone();
         tokio::spawn(async move {
             let window = std::time::Duration::from_secs(mins * 60);
             // Check several times per window so the actual exit lands close to
@@ -342,6 +358,17 @@ pub async fn run(config: BigTinyConfig, options: RunOptions) -> Result<(), Daemo
                 }
                 if scheduler_for_idle.lock().await.has_running_jobs() {
                     continue;
+                }
+                // Detached jobs have no client by definition, so the activity
+                // clock cannot see them -- and they are exactly the work it
+                // would be worst to kill halfway.
+                match crate::storage::jobs::list_by_status(&idle_pool, "running", 1).await {
+                    Ok(rows) if !rows.is_empty() => continue,
+                    Err(e) => {
+                        tracing::warn!("idle check could not read jobs: {e}; staying up");
+                        continue;
+                    }
+                    _ => {}
                 }
                 tracing::info!("idle for {mins} minutes with no active work; shutting down");
                 let _ = tx.send(());
