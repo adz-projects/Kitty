@@ -5,7 +5,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Instant;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use super::queue::{Priority, ProviderQueue, QueuePermit};
 
 use super::anthropic::AnthropicProvider;
 use super::base::{HealthStatus, Provider, SamplingParams};
@@ -81,9 +81,21 @@ fn default_concurrency(dialect: &str) -> u32 {
 /// releasing it when headers arrive would free the slot while the server is
 /// still generating, which is precisely the overlap this gate exists to
 /// prevent.
+/// What `GET /api/providers` reports about a provider's queue, so a client
+/// can pace itself instead of firing blind.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct QueueStats {
+    pub concurrency: u32,
+    pub in_flight: u32,
+    pub queue_depth: usize,
+    /// This caller's own waiters -- distinct from `queue_depth`, so an app can
+    /// tell "the endpoint is busy" from "*I* have a backlog".
+    pub my_queue_depth: usize,
+}
+
 struct PermitStream {
     inner: Pin<Box<dyn Stream<Item = Delta> + Send>>,
-    _permit: OwnedSemaphorePermit,
+    _permit: QueuePermit,
 }
 
 impl Stream for PermitStream {
@@ -97,20 +109,20 @@ impl Stream for PermitStream {
 
 pub struct ProviderRouter {
     providers: DashMap<String, ProviderEntry>,
-    /// Per-provider concurrency gates, `provider id -> (limit, semaphore)`.
+    /// Per-provider admission queues, `provider id -> queue`.
     ///
-    /// Deliberately NOT a field on `ProviderEntry`: `register_from_row` runs
-    /// on every provider PATCH from Kitty (changing a model, activating a
-    /// profile) and re-`insert`s the entry wholesale, which would swap the
-    /// semaphore out from under everything queued on it. Keyed separately, the
-    /// gate survives re-registration.
+    /// Replaces V1's `(limit, Semaphore)` pair. A semaphore is FIFO, which is
+    /// correct for one client and a starvation bug for several: against a
+    /// one-slot endpoint, an app that queues fifty turns puts fifty entries in
+    /// front of the next interactive message. `ProviderQueue` serves apps
+    /// round-robin instead, so the wait is bounded by the app count rather
+    /// than the queue depth.
     ///
-    /// Before this existed there was no limit anywhere — `parallel_slots`
-    /// looked like one but only ever produced an advisory `id_slot` hint on
-    /// the request body. Nothing stopped the three fire-and-forget turn-end
-    /// tasks (compaction, title, learn) from calling the same provider as each
-    /// other and as the user's next turn.
-    slots: DashMap<String, (u32, Arc<Semaphore>)>,
+    /// Deliberately NOT a field on `ProviderEntry`: `register_from_row` runs on
+    /// every provider PATCH and re-`insert`s the entry wholesale, which would
+    /// swap the queue out from under everything waiting on it. Keyed
+    /// separately, the queue survives re-registration.
+    queues: DashMap<String, Arc<ProviderQueue>>,
     /// Shared across every registered provider so the peer cache (and the
     /// "Tailscale unreachable" warn-once) is discovered/logged at most once
     /// per daemon run, not once per provider.
@@ -125,7 +137,7 @@ impl ProviderRouter {
     pub fn new(cache: CacheConfig) -> Self {
         Self {
             providers: DashMap::new(),
-            slots: DashMap::new(),
+            queues: DashMap::new(),
             tailscale: Arc::new(TailscaleClient::new()),
             cache,
         }
@@ -723,19 +735,46 @@ impl ProviderRouter {
     /// can briefly admit more than the new limit — acceptable for a rare,
     /// user-initiated event, and far better than ignoring the setting until
     /// restart.
-    fn gate(&self, provider_id: &str, limit: u32) -> Arc<Semaphore> {
-        let limit = limit.max(1) as usize;
-        if let Some(existing) = self.slots.get(provider_id) {
-            if existing.0 as usize == limit {
-                return existing.1.clone();
-            }
-        }
-        let sem = Arc::new(Semaphore::new(limit));
-        self.slots
-            .insert(provider_id.to_string(), (limit as u32, sem.clone()));
-        sem
+    /// This provider's queue, created on first use at `concurrency`.
+    ///
+    /// An existing queue is reused even if `concurrency` has since changed, so
+    /// a re-registration cannot strand callers already waiting on the old one.
+    fn queue_for(&self, provider_id: &str, concurrency: u32) -> Arc<ProviderQueue> {
+        self.queues
+            .entry(provider_id.to_string())
+            .or_insert_with(|| Arc::new(ProviderQueue::new(concurrency)))
+            .clone()
     }
 
+    /// Apply a provider's current concurrency to its live queue.
+    ///
+    /// Called after re-registration so editing `parallel_slots` takes effect
+    /// without a restart. Adjusts in place rather than replacing the queue,
+    /// which would strand anyone already waiting on it.
+    pub async fn sync_queue_limit(&self, provider_id: &str) {
+        let Some(concurrency) = self.providers.get(provider_id).map(|e| e.concurrency) else {
+            return;
+        };
+        let queue = self.queue_for(provider_id, concurrency);
+        queue.set_limit(concurrency).await;
+    }
+
+    /// A snapshot of one provider's queue, for `GET /api/providers`.
+    pub async fn queue_stats(&self, provider_id: &str, app_id: &str) -> Option<QueueStats> {
+        let q = self.queues.get(provider_id)?.clone();
+        Some(QueueStats {
+            concurrency: q.limit().await,
+            in_flight: q.in_flight().await,
+            queue_depth: q.queue_depth().await,
+            my_queue_depth: q.queue_depth_for(app_id).await,
+        })
+    }
+
+    /// `app_id` and `priority` drive fair admission: every caller funnels
+    /// through here -- the tool loop, its retry/failover attempts, and the
+    /// three fire-and-forget turn-end tasks -- so the queue is enforced in one
+    /// place rather than relying on each of them to remember.
+    #[allow(clippy::too_many_arguments)]
     pub async fn chat_completion(
         &self,
         provider_id: &str,
@@ -744,6 +783,8 @@ impl ProviderRouter {
         sampling: SamplingParams,
         model: Option<String>,
         id_slot: Option<i32>,
+        app_id: &str,
+        priority: Priority,
     ) -> Result<Pin<Box<dyn Stream<Item = Delta> + Send>>, ProviderError> {
         // Clone the provider's Arc out, drop the DashMap guard, then await —
         // a chat completion can run for minutes and must never hold the shard
@@ -762,12 +803,10 @@ impl ProviderRouter {
         // through here — the tool loop, its retry/failover attempts, and the
         // three fire-and-forget turn-end tasks — so the queue is enforced in
         // one place rather than relying on each of them to remember.
-        let gate = self.gate(provider_id, concurrency);
-        let permit = gate.acquire_owned().await.map_err(|_| {
-            ProviderError::NoHealthyProvider {
-                user_message: format!("Provider '{}' is shutting down", provider_id),
-            }
-        })?;
+        let permit = self
+            .queue_for(provider_id, concurrency)
+            .acquire(app_id, priority)
+            .await;
 
         let inner = provider
             .chat_completion(messages, tools, sampling, model, id_slot)
@@ -1331,66 +1370,86 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!(router.gate("many", 4).available_permits(), 4);
-        assert_eq!(router.gate("one", 1).available_permits(), 1);
+        assert_eq!(
+            futures::executor::block_on(router.queue_for("many", 4).limit()),
+            4
+        );
+        assert_eq!(
+            futures::executor::block_on(router.queue_for("one", 1).limit()),
+            1
+        );
     }
 
-    /// The gate must survive `register_from_row`, which re-inserts the whole
-    /// `ProviderEntry` on every provider PATCH from Kitty (activating a
-    /// profile, changing a model). A semaphore living on the entry would be
-    /// swapped out from under everything queued on it — which is why the map
-    /// is keyed separately.
-    #[test]
-    fn re_registering_a_provider_keeps_the_same_gate() {
+    /// The queue must survive `register_from_row`, which re-inserts the whole
+    /// `ProviderEntry` on every provider PATCH (activating a profile, changing
+    /// a model). A queue living on the entry would be swapped out from under
+    /// everything waiting on it — which is why the map is keyed separately.
+    #[tokio::test]
+    async fn re_registering_a_provider_keeps_the_same_queue() {
         let router = ProviderRouter::default();
         let cfg = || ProviderConfig {
             provider_type: "custom_openai".into(),
             ..Default::default()
         };
         router.register_openai("p", cfg());
-        let first = router.gate("p", 1);
-        let permit = first.clone().try_acquire_owned().expect("first permit");
+        let first = router.queue_for("p", 1);
+        let permit = first.acquire("app", Priority::Interactive).await;
 
         router.register_openai("p", cfg());
-        let second = router.gate("p", 1);
+        let second = router.queue_for("p", 1);
         assert!(
             Arc::ptr_eq(&first, &second),
-            "re-registration must not replace the gate"
+            "re-registration must not replace the queue"
         );
         assert_eq!(
-            second.available_permits(),
-            0,
-            "the in-flight call's permit must still be held"
+            second.in_flight().await,
+            1,
+            "the in-flight call's slot must still be held"
         );
         drop(permit);
-        assert_eq!(second.available_permits(), 1);
     }
 
-    /// Editing `parallel_slots` should take effect without a daemon restart.
-    #[test]
-    fn changing_the_limit_replaces_the_gate() {
+    /// Editing `parallel_slots` takes effect without a daemon restart — and,
+    /// unlike V1's swap-the-semaphore approach, without stranding waiters.
+    #[tokio::test]
+    async fn changing_the_limit_adjusts_the_queue_in_place() {
         let router = ProviderRouter::default();
-        let a = router.gate("p", 1);
-        let b = router.gate("p", 3);
-        assert!(!Arc::ptr_eq(&a, &b));
-        assert_eq!(b.available_permits(), 3);
+        let a = router.queue_for("p", 1);
+        assert_eq!(a.limit().await, 1);
+
+        a.set_limit(3).await;
+        let b = router.queue_for("p", 1);
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "the queue is adjusted, not replaced"
+        );
+        assert_eq!(b.limit().await, 3);
     }
 
     /// The permit has to outlive the whole response, not just the request:
     /// releasing it when headers arrive would free the slot while the server
-    /// is still generating — exactly the overlap the gate exists to prevent.
+    /// is still generating — exactly the overlap the queue exists to prevent.
     #[tokio::test]
     async fn a_permit_is_held_until_its_stream_is_dropped() {
-        let gate = Arc::new(Semaphore::new(1));
-        let permit = gate.clone().acquire_owned().await.unwrap();
+        let queue = Arc::new(ProviderQueue::new(1));
+        let permit = queue.acquire("app", Priority::Interactive).await;
         let inner: Pin<Box<dyn Stream<Item = Delta> + Send>> =
             Box::pin(futures::stream::iter(Vec::<Delta>::new()));
         let stream = PermitStream {
             inner,
             _permit: permit,
         };
-        assert_eq!(gate.available_permits(), 0);
+        assert_eq!(queue.in_flight().await, 1);
+
         drop(stream);
-        assert_eq!(gate.available_permits(), 1);
+        // `QueuePermit::drop` releases on a spawned task, so the slot frees
+        // shortly after rather than synchronously.
+        for _ in 0..50 {
+            if queue.in_flight().await == 0 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("dropping the stream must release the slot");
     }
 }

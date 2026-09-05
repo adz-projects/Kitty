@@ -1,6 +1,7 @@
 pub mod anthropic;
 pub mod base;
 pub mod openai_compat;
+pub mod queue;
 pub mod router;
 pub mod presets;
 pub mod sampling;

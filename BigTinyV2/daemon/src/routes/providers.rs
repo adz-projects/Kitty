@@ -111,7 +111,21 @@ pub async fn list_providers(
 ) -> Response {
     match providers::list_providers_for_app(&state.db, &identity.app_id).await {
         Ok(rows) => {
-            let redacted: Vec<Value> = rows.iter().map(to_public_json).collect();
+            // Queue state rides along so a client can pace itself against the
+            // endpoint's real slot count instead of firing blind and
+            // discovering the limit as latency. `my_queue_depth` is separate
+            // from `queue_depth` so an app can tell "the endpoint is busy"
+            // from "*I* have a backlog".
+            let mut redacted: Vec<Value> = Vec::with_capacity(rows.len());
+            for row in &rows {
+                let mut v = to_public_json(row);
+                if let Some(stats) = state.router.queue_stats(&row.id, &identity.app_id).await {
+                    if let Some(obj) = v.as_object_mut() {
+                        obj.insert("queue".to_string(), serde_json::to_value(stats).unwrap_or(Value::Null));
+                    }
+                }
+                redacted.push(v);
+            }
             Json(json!({"providers": redacted})).into_response()
         }
         Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),

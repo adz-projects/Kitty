@@ -1053,17 +1053,17 @@ impl AgentLoop {
             .as_deref()
             .and_then(|pid| self.router.context_length(pid));
 
-        // Take the provider back from any turn-end background work still
-        // running on it. Done here, before the (potentially slow) context
-        // build, so the slot is free by the time this turn actually sends.
+        // Drop this session's *own* leftover turn-end work before starting a
+        // new turn: a compaction or title call for the previous message is
+        // superseded by the one about to run, and holding both would have two
+        // summarizers writing the same session's metadata.
         //
-        // Without this, the concurrency gate alone would simply convert the
-        // old crash into a wait: a compaction or title call may hold a
-        // single-slot endpoint for five minutes, and the user's message would
-        // sit behind it with no explanation. See `Agent::background_tasks`.
-        if let Some(pid) = resolved_provider_id.as_deref() {
-            self.cancel_background(pid);
-        }
+        // Scoped to this session on purpose. V1 cancelled by provider, which
+        // meant a new turn here aborted an unrelated session's compaction --
+        // work that session had already paid for and would silently lose.
+        // Freeing the endpoint from another session's background task is the
+        // queue's job, via `Priority::Background`.
+        self.cancel_background(session_id);
 
         // Adaptive Pathway turn-start hook: in-process recall so the model
         // sees learned behavioral beliefs *before* picking tools this turn.
@@ -1191,8 +1191,20 @@ impl AgentLoop {
     /// Remember a fire-and-forget task so a later turn on the same provider
     /// can abort it. Also drops handles that have already finished, so the
     /// vector cannot grow across a long session.
-    fn track_background(&self, provider_id: &str, handle: tokio::task::AbortHandle) {
-        let mut entry = self.background_tasks.entry(provider_id.to_string()).or_default();
+    /// Record turn-end background work (compaction, title derivation, the
+    /// pathway learn pass) against the **session** that spawned it.
+    ///
+    /// V1 keyed this by provider, which was right when one client owned the
+    /// daemon and wrong the moment two sessions shared an endpoint: starting a
+    /// turn on session A would abort session B's in-flight compaction, so B
+    /// silently lost work it had already paid for. Cross-session contention
+    /// for the endpoint is the queue's job (see `provider::queue`), not
+    /// something to resolve by cancelling someone else's turn-end work.
+    fn track_background(&self, session_id: &str, handle: tokio::task::AbortHandle) {
+        let mut entry = self
+            .background_tasks
+            .entry(session_id.to_string())
+            .or_default();
         entry.retain(|h| !h.is_finished());
         entry.push(handle);
     }
@@ -1204,14 +1216,14 @@ impl AgentLoop {
     /// the slot immediately — rather than the user's message waiting out a
     /// summarization it never asked for. See `Agent::background_tasks` for why
     /// this loses nothing.
-    fn cancel_background(&self, provider_id: &str) {
-        if let Some((_, handles)) = self.background_tasks.remove(provider_id) {
+    fn cancel_background(&self, session_id: &str) {
+        if let Some((_, handles)) = self.background_tasks.remove(session_id) {
             let live = handles.iter().filter(|h| !h.is_finished()).count();
             if live > 0 {
                 tracing::debug!(
-                    provider_id,
+                    session_id,
                     live,
-                    "aborting turn-end background work so this turn gets the provider"
+                    "aborting this session's own turn-end background work"
                 );
             }
             for h in handles {
@@ -1245,12 +1257,14 @@ impl AgentLoop {
     ) {
         let pool = pool.clone();
         let session_id = session_id.to_string();
+        // Kept back from the move below so the spawned task can still be
+        // registered against the session that owns it.
+        let tracked_session = session_id.clone();
         let provider_id = provider_id.to_string();
         let summarizer = self.summarizer.clone();
         let token_cfg = self.context.config().clone();
         let summarizer_cfg = self.summarizer_cfg.clone();
         let memory_cfg = self.memory_cfg.clone();
-        let tracked = provider_id.clone();
         let handle = tokio::spawn(async move {
             let _ = run_compaction(
                 &pool,
@@ -1266,7 +1280,7 @@ impl AgentLoop {
             )
             .await;
         });
-        self.track_background(&tracked, handle.abort_handle());
+        self.track_background(&tracked_session, handle.abort_handle());
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1391,6 +1405,11 @@ impl AgentLoop {
         // being reverted by the next iteration's re-resolution — which is what
         // you want after failing over: a turn should not flap between engines
         // step by step.
+        // Resolved once per turn, alongside the provider: every request this
+        // turn makes queues in its owning app's lane, so one app's batch cannot
+        // put another app's user behind it.
+        let turn_app_id = self.app_scope(session_id).await.0;
+
         let mut turn_provider_id = match self
             .resolve_provider(session_id, effective_provider.as_deref())
             .await
@@ -1873,6 +1892,10 @@ impl AgentLoop {
                         sampling,
                         Some(provider_model.clone()),
                         id_slot,
+                        // The user is waiting on this one, and it is charged to
+                        // the app that owns the session.
+                        turn_app_id.as_deref().unwrap_or(crate::provider::queue::DAEMON_LANE),
+                        crate::provider::queue::Priority::Interactive,
                     )
                     .await
                 {
@@ -2256,9 +2279,6 @@ impl AgentLoop {
         // needs its own copies of whichever provider/model actually handled
         // this turn.
         let title_provider_id = last_provider_id.clone();
-        // The provider the fire-and-forget passes below will call, so their
-        // handles can be registered for cancellation by the next turn.
-        let background_provider = last_provider_id.clone();
         let title_provider_model = last_provider_model.clone();
 
         // Post-turn compaction check — ONCE per turn, fire-and-forget. This
@@ -2296,6 +2316,9 @@ impl AgentLoop {
         {
             let pool = pool.clone();
             let session_id = session_id.to_string();
+            // Kept back from the move below so the spawned task can still be
+            // registered against the session that owns it.
+            let tracked_session = session_id.clone();
             let summarizer = self.summarizer.clone();
             let event_tx = event_tx.clone();
             let handle = tokio::spawn(async move {
@@ -2309,9 +2332,7 @@ impl AgentLoop {
                 )
                 .await;
             });
-            if let Some(pid) = background_provider.as_deref() {
-                self.track_background(pid, handle.abort_handle());
-            }
+            self.track_background(&tracked_session, handle.abort_handle());
         }
 
         // Turn-end Adaptive Pathway pass (runs once per turn, fire-and-forget):
@@ -2346,6 +2367,9 @@ impl AgentLoop {
         let host_pool = pool.clone();
         let chat = self.summarizer.clone();
         let learn_session_id = session_id.to_string();
+        // Kept back from the move below so the spawned task can still be
+        // registered against the session that owns it.
+        let learn_session_id_for_tracking = learn_session_id.clone();
         let handle = tokio::spawn(async move {
             let Some(engine) = engine else { return };
             if engine.is_paused(&learn_session_id).await.unwrap_or(false) {
@@ -2393,9 +2417,7 @@ impl AgentLoop {
                 }
             }
         });
-        if let Some(pid) = background_provider.as_deref() {
-            self.track_background(pid, handle.abort_handle());
-        }
+        self.track_background(&learn_session_id_for_tracking, handle.abort_handle());
     }
 
     /// Adaptive Pathway turn-start hook: in-process recall against the

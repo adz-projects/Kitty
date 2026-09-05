@@ -137,7 +137,16 @@ impl SummarizerChain {
         let outcome = tokio::time::timeout(SUMMARIZER_OVERALL_TIMEOUT, async {
             let stream = self
                 .router
-                .chat_completion(provider_id, &prompted, None, sampling, model, None)
+                .chat_completion(
+                    provider_id,
+                    &prompted,
+                    None,
+                    sampling,
+                    model,
+                    None,
+                    crate::provider::queue::DAEMON_LANE,
+                    crate::provider::queue::Priority::Background,
+                )
                 .await
                 .map_err(|e| format!("summarizer fallback call to '{provider_id}' failed: {e}"))?;
             collect_text(stream).await

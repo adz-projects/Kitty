@@ -91,7 +91,9 @@ pub struct Agent {
     /// file in the folder changed.
     workspace_snapshots: Arc<DashMap<String, (String, String)>>,
     /// Handles for the fire-and-forget turn-end tasks (compaction, title
-    /// derivation, the pathway learn pass), keyed by the provider they call.
+    /// derivation, the pathway learn pass), keyed by the **session** that
+    /// spawned them -- see `AgentLoop::track_background` for why not by
+    /// provider.
     ///
     /// All three go to the *same* provider the chat does, and each may hold it
     /// for `SUMMARIZER_OVERALL_TIMEOUT` (five minutes). Against a single-slot
@@ -346,6 +348,9 @@ impl Agent {
         user_message: &str,
     ) -> Result<(), String> {
         let (tx, mut rx) = mpsc::unbounded_channel::<SSEEvent>();
+        // The `tasks` entry keeps a sender so `cancel` can emit a terminal
+        // frame to this turn's watcher, exactly as it does for `/send`.
+        let tx_for_map = tx.clone();
         // `is_last` is only set on terminal frames (Error / SessionStatus) —
         // `LlmStop` mid-turn carries the default `false`.
         let watcher = tokio::spawn(async move {
@@ -374,10 +379,49 @@ impl Agent {
             }
             failure
         });
-        let mut agent_loop = self.build_loop();
-        agent_loop
-            .run(session_id, user_message, tx, None, None)
-            .await;
+        // Reserve the same per-session slot an interactive `/send` takes.
+        //
+        // V1 ran this loop directly in the caller's task, so a recipe or
+        // scheduled run held no slot, never appeared in `tasks`, and was
+        // invisible to `/cancel`. A user could start a turn on a session a
+        // schedule was already driving and have the two interleave on one
+        // transcript -- and neither could be stopped.
+        let turn_token = Uuid::new_v4();
+        self.tasks
+            .remove_if(session_id, |_, (_, handle, _)| handle.is_finished());
+
+        let this = self.clone();
+        let sid = session_id.to_string();
+        let msg = user_message.to_string();
+        match self.tasks.entry(sid.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(_) => {
+                return Err(format!(
+                    "Session {session_id} already has a turn in progress"
+                ))
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                let task = tokio::spawn(async move {
+                    // Removes the `tasks` entry even on panic, and only if it
+                    // is still *this* turn's -- so a stale guard cannot evict
+                    // a newer turn for the same session.
+                    let _cleanup = TurnCleanup {
+                        agent: this.clone(),
+                        session_id: sid.clone(),
+                        turn_token,
+                    };
+                    let mut agent_loop = this.build_loop();
+                    agent_loop.run(&sid, &msg, tx, None, None).await;
+                });
+                // Both `tx` clones are now owned by the spawned task and the
+                // map entry, so the watcher's channel closes when the turn
+                // ends. Holding one here would make it wait forever.
+                entry.insert((turn_token, task, tx_for_map));
+            }
+        }
+
+        // The watcher completes on the turn's terminal frame -- including the
+        // one `cancel` emits before aborting -- so waiting on it covers both
+        // normal completion and cancellation without polling.
         match watcher.await {
             Ok(Some(msg)) => Err(msg),
             _ => Ok(()),

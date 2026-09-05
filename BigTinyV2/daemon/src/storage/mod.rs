@@ -21,7 +21,14 @@ use crate::error::StorageError;
 const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 /// How long a caller waits for a pool connection.
 const ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-const MAX_CONNECTIONS: u32 = 4;
+/// SQLite pool size.
+///
+/// V1 used 4, sized for one client. `save_messages` runs after nearly every
+/// tool-loop step, so with several apps each running concurrent turns four
+/// connections is a real ceiling reached well before the provider is. WAL is
+/// on and `BUSY_TIMEOUT` is 15s, so the extra readers are cheap; writes still
+/// serialize on SQLite's single writer regardless of pool size.
+const MAX_CONNECTIONS: u32 = 16;
 
 /// Retention sweep cadence after the one at boot.
 const RETENTION_INTERVAL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);

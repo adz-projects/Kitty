@@ -98,7 +98,12 @@ fn parse_args() -> Args {
 /// Blocking threads are what `spawn_blocking` uses — here that is the LiteRT
 /// embed/summarize actors plus token counting, a handful at a time, never
 /// hundreds.
-const MAX_WORKER_THREADS: usize = 4;
+/// Sized for several apps rather than one user. V1 pinned this at 4, which
+/// was right for a single-user desktop daemon; with three frontends each
+/// running concurrent turns, four workers is the bottleneck before the
+/// provider is. Clamped at 8 so a many-core machine does not spawn more
+/// runtime threads than the SQLite pool and provider slots can feed.
+const MAX_WORKER_THREADS: usize = 8;
 const MAX_BLOCKING_THREADS: usize = 16;
 /// 2 MiB is the Rust default; the daemon has no deep-recursion paths, and on
 /// Android this is multiplied across every worker in a memory-tight process.
