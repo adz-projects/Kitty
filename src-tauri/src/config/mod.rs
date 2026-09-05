@@ -939,11 +939,23 @@ fn command_path_is_stale(command: &str) -> bool {
 fn migrate_bigtiny_launch_command(mut config: Config) -> Config {
     const OLD_PYTHON_COMMAND: &str = "python";
     let old_python_args = ["-m".to_string(), "bigtiny".to_string()];
+    // Either daemon name: a config left on the V1 dev fallback
+    // (`--bin bigtiny-daemon`) must migrate onto V2 just as one on the
+    // current fallback re-resolves onto a freshly built sidecar.
     let is_cargo_dev_fallback = config.bigtiny_command == "cargo"
-        && config.bigtiny_args.iter().any(|a| a == "bigtiny-daemon");
+        && config
+            .bigtiny_args
+            .iter()
+            .any(|a| a == "bigtiny-daemon" || a == "bigtiny2-daemon");
     let is_resolved_path =
         config.bigtiny_command.contains('/') || config.bigtiny_command.contains('\\');
-    let bundled = bundled_plugin_path("bigtiny-daemon.exe");
+    // The **V2** sidecar. This is what carries an existing install across the
+    // Phase 7 migration: a config resolved to `...igtiny-daemon.exe` now
+    // differs from the bundled path, trips `points_elsewhere_than_bundled`,
+    // and is rewritten to the V2 daemon. Leaving the V1 name here would have
+    // left every upgrading user silently launching the old daemon, which no
+    // longer matches the client Kitty talks to it with.
+    let bundled = bundled_plugin_path("bigtiny2-daemon.exe");
     // Tauri's `externalBin` build step stages a copy of every sidecar next
     // to `current_exe()` on *every* build, dev included (`cargo tauri dev`
     // is not the unbundled case it looks like — `target/debug/` ends up with
@@ -1312,7 +1324,7 @@ mod tests {
         };
         let migrated = migrate_bigtiny_launch_command(cfg);
         assert_eq!(migrated.bigtiny_command, "cargo");
-        assert!(migrated.bigtiny_args.iter().any(|a| a == "bigtiny-daemon"));
+        assert!(migrated.bigtiny_args.iter().any(|a| a == "bigtiny2-daemon"));
     }
 
     #[test]
@@ -1381,7 +1393,7 @@ mod tests {
         };
         let migrated = migrate_bigtiny_launch_command(cfg);
         assert_eq!(migrated.bigtiny_command, "cargo");
-        assert!(migrated.bigtiny_args.iter().any(|a| a == "bigtiny-daemon"));
+        assert!(migrated.bigtiny_args.iter().any(|a| a == "bigtiny2-daemon"));
 
         fs::remove_dir_all(&dir).unwrap();
     }
