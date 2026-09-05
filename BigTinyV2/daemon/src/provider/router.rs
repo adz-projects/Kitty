@@ -802,8 +802,15 @@ impl ProviderRouter {
             return;
         }
 
-        let client = reqwest::Client::new();
-        let Some(found) = super::slots::probe(&client, &base_url, &dialect).await else {
+        // One client for every probe, not one per probe. Each
+        // `reqwest::Client` is its own connection pool and TLS session cache,
+        // so building a fresh one per probe throws away the handshake with
+        // the endpoint we are about to re-probe on the next health recovery.
+        // Probes are infrequent, so this is tidiness more than throughput --
+        // but it costs a `OnceLock`.
+        static PROBE_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+        let client = PROBE_CLIENT.get_or_init(reqwest::Client::new);
+        let Some(found) = super::slots::probe(client, &base_url, &dialect).await else {
             return;
         };
 

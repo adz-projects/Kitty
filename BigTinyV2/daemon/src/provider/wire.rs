@@ -21,6 +21,8 @@
 //! One place, both dialects, with a test that fails if anything internal
 //! reaches a request body.
 
+use std::borrow::Cow;
+
 use serde_json::Value;
 
 /// Keys the daemon uses internally and no provider should ever see.
@@ -37,19 +39,39 @@ fn is_internal(key: &str) -> bool {
 /// Applied once, at the point every request funnels through, rather than at
 /// each of the places a message is built — there are many of the latter and
 /// exactly one of the former.
-pub fn sanitize_for_wire(messages: &[Value]) -> Vec<Value> {
-    messages
-        .iter()
-        .map(|msg| match msg {
-            Value::Object(obj) => Value::Object(
-                obj.iter()
-                    .filter(|(k, _)| !is_internal(k))
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect(),
-            ),
-            other => other.clone(),
-        })
-        .collect()
+pub fn sanitize_for_wire(messages: &[Value]) -> Cow<'_, [Value]> {
+    // Rebuilding is a deep clone of the whole transcript -- every message
+    // body, every tool result -- and it runs on each provider attempt of each
+    // step. Most arrays need no rebuilding at all: the internal keys are
+    // stamped by specific paths, so a message that has none is untouched by
+    // definition. Scan first (a key comparison per top-level key, no
+    // allocation), and only pay for the copy when there is something to
+    // strip.
+    let dirty = messages.iter().any(|msg| {
+        msg.as_object()
+            .is_some_and(|obj| obj.keys().any(|k| is_internal(k)))
+    });
+    if !dirty {
+        return Cow::Borrowed(messages);
+    }
+
+    Cow::Owned(
+        messages
+            .iter()
+            .map(|msg| match msg {
+                // Only the messages that actually carry an internal key are
+                // rebuilt; the rest are cloned as-is, which for a `Value` is
+                // still a deep copy but avoids re-collecting a fresh map.
+                Value::Object(obj) if obj.keys().any(|k| is_internal(k)) => Value::Object(
+                    obj.iter()
+                        .filter(|(k, _)| !is_internal(k))
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect(),
+                ),
+                other => other.clone(),
+            })
+            .collect::<Vec<_>>(),
+    )
 }
 
 #[cfg(test)]
@@ -61,23 +83,25 @@ mod tests {
     fn database_identity_never_reaches_a_provider() {
         // The pre-existing leak: `id` is a row identifier, and it was being
         // sent to OpenAI and Anthropic on every turn since V1.
-        let out = sanitize_for_wire(&[json!({
+        let msgs = [json!({
             "id": "row-uuid",
             "rowid": 42,
             "role": "user",
             "content": "hello",
-        })]);
+        })];
+        let out = sanitize_for_wire(&msgs);
         assert_eq!(out[0], json!({"role": "user", "content": "hello"}));
     }
 
     #[test]
     fn underscore_prefixed_bookkeeping_is_stripped() {
-        let out = sanitize_for_wire(&[json!({
+        let msgs = [json!({
             "_tok": 12,
             "_future_internal_key": true,
             "role": "assistant",
             "content": "hi",
-        })]);
+        })];
+        let out = sanitize_for_wire(&msgs);
         assert_eq!(out[0], json!({"role": "assistant", "content": "hi"}));
     }
 
@@ -93,7 +117,8 @@ mod tests {
             "tool_call_id": "call_1",
             "name": "read",
         });
-        let out = sanitize_for_wire(&[msg.clone()]);
+        let msgs = [msg.clone()];
+        let out = sanitize_for_wire(&msgs);
         assert_eq!(out[0], msg, "no provider-visible field may be dropped");
     }
 
@@ -102,23 +127,48 @@ mod tests {
         // `id` inside a tool call is part of the wire format and load-bearing:
         // the provider matches results to calls by it. Only *top-level* keys
         // are internal.
-        let out = sanitize_for_wire(&[json!({
+        let msgs = [json!({
             "id": "row-uuid",
             "role": "assistant",
             "tool_calls": [{"id": "call_abc", "type": "function"}],
-        })]);
+        })];
+        let out = sanitize_for_wire(&msgs);
         assert!(out[0].get("id").is_none(), "the row id goes");
         assert_eq!(out[0]["tool_calls"][0]["id"], "call_abc", "the call id stays");
     }
 
     #[test]
     fn non_object_entries_pass_through_unchanged() {
-        let out = sanitize_for_wire(&[json!("a bare string"), json!(null)]);
-        assert_eq!(out, vec![json!("a bare string"), json!(null)]);
+        let msgs = [json!("a bare string"), json!(null)];
+        let out = sanitize_for_wire(&msgs);
+        assert_eq!(out.as_ref(), &[json!("a bare string"), json!(null)]);
     }
 
     #[test]
     fn an_empty_array_stays_empty() {
         assert!(sanitize_for_wire(&[]).is_empty());
+    }
+
+    #[test]
+    fn a_clean_array_is_not_copied_at_all() {
+        // The common case, and the reason this is worth a fast path: nothing
+        // to strip means nothing to allocate, on every attempt of every step.
+        let msgs = vec![
+            json!({"role": "user", "content": "hello"}),
+            json!({"role": "assistant", "content": "hi"}),
+        ];
+        assert!(matches!(sanitize_for_wire(&msgs), Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn one_dirty_message_does_not_spare_the_array_but_still_strips_correctly() {
+        let msgs = vec![
+            json!({"role": "user", "content": "hello"}),
+            json!({"_tok": 3, "role": "assistant", "content": "hi"}),
+        ];
+        let out = sanitize_for_wire(&msgs);
+        assert!(matches!(out, Cow::Owned(_)));
+        assert_eq!(out[0], msgs[0], "a clean message survives unchanged");
+        assert_eq!(out[1], json!({"role": "assistant", "content": "hi"}));
     }
 }

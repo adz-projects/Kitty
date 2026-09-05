@@ -961,7 +961,12 @@ impl Stream for AnthropicSSEStream {
                         self.done = true;
                         continue;
                     }
-                    while let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
+                    // `memchr`, matching `openai_compat`'s stream loop -- see
+                    // the comment there. This runs once per line of every
+                    // streamed chunk with the scan restarting at index 0, so
+                    // on a chunk carrying many short SSE frames a byte-by-byte
+                    // `position` is quadratic in the buffer for no reason.
+                    while let Some(pos) = memchr::memchr(b'\n', &self.buf) {
                         let mut raw: Vec<u8> = self.buf.drain(..=pos).collect();
                         while matches!(raw.last(), Some(&b'\r') | Some(&b'\n')) {
                             raw.pop();

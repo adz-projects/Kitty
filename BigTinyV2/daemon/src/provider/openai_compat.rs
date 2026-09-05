@@ -77,6 +77,29 @@ const DIRECT_PROBE_TTL: Duration = Duration::from_secs(60);
 /// `scheme://host:port` of a URL, for keying the direct-probe cache and
 /// building the probe request. Falls back to the whole string if it does not
 /// parse, which only makes the cache key coarser.
+/// The models endpoint sitting beside `url`'s chat-completions endpoint.
+///
+/// The probe used to request `{scheme}://{host}:{port}/models`, built from
+/// `probe_origin`, which discards the path entirely. But the request URL is
+/// `{base_url}/v1/chat/completions`, so the models endpoint that actually
+/// exists is `{base_url}/v1/models`. llama.cpp happens to serve `/models` at
+/// the root as well and so kept working; Ollama and vLLM serve only the
+/// `/v1`-prefixed form, and against those the probe answered 404 every time.
+/// A failed probe is indistinguishable from an unreachable host, so the
+/// direct LAN address was never chosen and every request went the long way
+/// round through the tunnel.
+///
+/// Derived by swapping the sibling path segment rather than by guessing a
+/// prefix, so it stays correct for any `base_url` shape.
+pub(super) fn models_probe_url(url: &str) -> String {
+    match url.strip_suffix("/chat/completions") {
+        Some(prefix) => format!("{prefix}/models"),
+        // Not the shape this provider builds; fall back to the conventional
+        // location rather than to the root, which is the bug being fixed.
+        None => format!("{}/v1/models", probe_origin(url)),
+    }
+}
+
 pub(super) fn probe_origin(url: &str) -> String {
     reqwest::Url::parse(url)
         .ok()
@@ -319,7 +342,7 @@ impl OpenAICompatibleProvider {
         }
         let req = self
             .direct_client
-            .get(format!("{origin}/models"))
+            .get(models_probe_url(direct_url))
             .header("Authorization", format!("Bearer {}", self.config.api_key))
             .send();
         let ok = matches!(
@@ -1905,7 +1928,7 @@ mod sse_tests {
         // rather than by firing the real request at it, so the fake has to
         // answer that too.
         let direct_probe = direct_server
-            .mock("GET", "/models")
+            .mock("GET", "/v1/models")
             .with_status(200)
             .with_body("{\"data\":[]}")
             .create_async()
@@ -2076,7 +2099,7 @@ mod sse_tests {
         })
         .await;
         let stale_mock = stale
-            .mock("GET", "/models")
+            .mock("GET", "/v1/models")
             .with_status(500)
             .expect(1)
             .create_async()
@@ -2104,7 +2127,7 @@ mod sse_tests {
         })
         .await;
         let stale_mock = stale
-            .mock("GET", "/models")
+            .mock("GET", "/v1/models")
             .with_status(401)
             .expect(1)
             .create_async()
@@ -2169,7 +2192,7 @@ mod sse_tests {
         .await;
         // `expect(1)` across two calls is the cache assertion.
         let probe = server
-            .mock("GET", "/models")
+            .mock("GET", "/v1/models")
             .with_status(200)
             .with_body("{\"data\":[]}")
             .expect(1)
@@ -2191,6 +2214,28 @@ mod sse_tests {
         assert!(provider.direct_is_reachable(&server.url()).await);
         probe.assert_async().await;
         chat.assert_async().await;
+    }
+
+    #[test]
+    fn the_probe_asks_the_models_endpoint_beside_the_chat_one() {
+        // The whole point: `/v1/models`, not `/models`. Against Ollama and
+        // vLLM the latter is a 404, which reads as "host unreachable" and
+        // silently disables the direct LAN path for every turn.
+        assert_eq!(
+            models_probe_url("http://100.64.1.2:8080/v1/chat/completions"),
+            "http://100.64.1.2:8080/v1/models"
+        );
+        // A non-standard prefix is preserved rather than guessed at.
+        assert_eq!(
+            models_probe_url("https://box.ts.net/openai/v1/chat/completions"),
+            "https://box.ts.net/openai/v1/models"
+        );
+        // An unexpected shape falls back to the conventional location, not
+        // to the root.
+        assert_eq!(
+            models_probe_url("http://host:1234/something-else"),
+            "http://host:1234/v1/models"
+        );
     }
 
     #[test]

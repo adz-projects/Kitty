@@ -257,7 +257,7 @@ async fn nothing_internal_reaches_a_provider() {
     let serialized = serde_json::to_string(&outgoing).unwrap();
 
     assert!(!serialized.contains(TOKEN_HINT_KEY), "token hint leaked");
-    for msg in &outgoing {
+    for msg in outgoing.iter() {
         let obj = msg.as_object().expect("messages are objects");
         assert!(obj.get("id").is_none(), "row id leaked: {msg}");
         assert!(obj.get("rowid").is_none(), "rowid leaked: {msg}");
