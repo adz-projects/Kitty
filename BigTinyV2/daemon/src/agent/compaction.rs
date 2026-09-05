@@ -530,6 +530,11 @@ pub fn apply_tool_mask(
                     if let Some(obj) = masked.as_object_mut() {
                         obj.insert("content".to_string(), json!(masked_content));
                     }
+                    // The content just changed, so the stored count no longer
+                    // describes it. Clearing forces a recount -- which is what
+                    // V1 always did, so forgetting this would cost accuracy,
+                    // not correctness. See `tokens::clear_token_hint`.
+                    crate::agent::tokens::clear_token_hint(&mut masked);
                     out.push(masked);
                     continue;
                 }
@@ -590,6 +595,7 @@ pub fn apply_content_mask(
             if let Some(obj) = masked.as_object_mut() {
                 obj.insert("content".to_string(), json!(masked_content));
             }
+            crate::agent::tokens::clear_token_hint(&mut masked);
             out.push(masked);
         }
     }
@@ -901,6 +907,7 @@ pub fn shrink_live_turn(
                 if let Some(obj) = out[idx].as_object_mut() {
                     obj.insert("content".to_string(), json!(masked));
                 }
+                crate::agent::tokens::clear_token_hint(&mut out[idx]);
                 changed = true;
             }
         }
@@ -957,6 +964,7 @@ pub fn shrink_live_turn(
                 if let Some(obj) = out[idx].as_object_mut() {
                     obj.insert("content".to_string(), json!(masked));
                 }
+                crate::agent::tokens::clear_token_hint(&mut out[idx]);
                 changed = true;
             }
             if count_messages_tokens(&out) <= budget_tokens {

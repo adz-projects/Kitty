@@ -28,8 +28,79 @@ pub fn count_text_tokens(text: &str) -> i32 {
     }
 }
 
+/// The private key carrying a message's already-known token count.
+///
+/// Underscore-prefixed and stripped before any request leaves the daemon (see
+/// `provider::wire::sanitize_for_wire`).
+pub const TOKEN_HINT_KEY: &str = "_tok";
+
+/// Whether reuse is enabled. A kill switch, not a tuning knob.
+///
+/// This code decides whether a request fits the context window, and a subtle
+/// error surfaces as an opaque provider 400 rather than anything legible. If a
+/// budget anomaly ever appears in the field, flipping this to `false` restores
+/// V1's always-recount behaviour without a rebuild being the only option.
+static REUSE_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+pub fn set_token_reuse(enabled: bool) {
+    REUSE_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn token_reuse_enabled() -> bool {
+    REUSE_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Stamp a known token count onto a message.
+///
+/// Called where a message is built from a row whose `token_count` was computed
+/// by this same function at save time, so the stored number is what a recount
+/// would produce -- not an estimate of it.
+pub fn stamp_token_hint(msg: &mut Value, tokens: i32) {
+    if let Some(obj) = msg.as_object_mut() {
+        obj.insert(TOKEN_HINT_KEY.to_string(), Value::from(tokens));
+    }
+}
+
+/// Remove the hint, forcing a recount.
+///
+/// **Every transform that mutates a message's content must call this.** The
+/// list is short and enumerable -- tool masking, the image-block collapse,
+/// image normalization, tool-call stringification, thought-seed injection --
+/// and the failure mode of forgetting one is a lost optimization, not a wrong
+/// budget: a stripped message simply recounts, which is what V1 always did.
+pub fn clear_token_hint(msg: &mut Value) {
+    if let Some(obj) = msg.as_object_mut() {
+        obj.remove(TOKEN_HINT_KEY);
+    }
+}
+
 /// Token count for one context message, matching what actually gets serialized.
+///
+/// Reuses a stamped hint when one is present. The hint is only ever written
+/// from a value this function produced, so reuse is exact rather than
+/// approximate -- but a debug build cross-checks it anyway, because "exact by
+/// construction" is a claim about code that changes.
 pub fn count_message_tokens(msg: &Value) -> i32 {
+    if token_reuse_enabled() {
+        if let Some(hint) = msg.get(TOKEN_HINT_KEY).and_then(|v| v.as_i64()) {
+            let hint = hint as i32;
+            #[cfg(debug_assertions)]
+            {
+                let recomputed = count_message_tokens_uncached(msg);
+                debug_assert_eq!(
+                    hint, recomputed,
+                    "a stamped token hint disagreed with a live recount; a \
+                     transform mutated this message without clearing the hint"
+                );
+            }
+            return hint;
+        }
+    }
+    count_message_tokens_uncached(msg)
+}
+
+/// The real count, always computed.
+fn count_message_tokens_uncached(msg: &Value) -> i32 {
     let mut total = 0;
 
     if let Some(content) = msg.get("content") {

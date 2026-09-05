@@ -8,6 +8,7 @@ pub mod sampling;
 pub mod response_cache;
 pub mod schema;
 pub mod slots;
+pub mod wire;
 pub mod tag_split;
 
 pub use base::classify_provider_error;

@@ -234,6 +234,30 @@ by joining through `sessions.app_id` **in the SQL**, not filtered afterwards:
 this route returns raw conversation text, so a leak here hands one app the
 contents of another's chats rather than merely confirming an id exists.
 
+### Token-count reuse
+
+`messages.token_count` has been persisted since V1 but was never read back for
+budgeting, so the tool loop re-encoded the whole transcript with `cl100k_base`
+on every iteration — tens of milliseconds of blocked worker per step on a long
+session, now multiplied by however many apps and subagents are running.
+
+The stored number is not an estimate: `save_messages` computes it with the very
+same function the hot path calls. It is carried forward on a private `_tok` key
+stamped onto the message, so `count_messages_tokens` reuses it with **no
+signature changes anywhere** — the alternative, threading a parallel
+`Vec<i32>` through every transform, has to be permuted in lockstep at each step
+that reorders or drops a message, and a single missed permutation is silent.
+
+The invariant that replaces that risk is narrow and enumerable: **any transform
+that mutates content clears the hint.** Forgetting one costs a lost
+optimisation, not a wrong budget — a cleared message simply recounts, which is
+what V1 always did. Debug builds additionally cross-check every reuse against a
+live recount.
+
+`provider::wire::sanitize_for_wire` strips the hint before any request leaves
+the daemon — and with it `id`, a database row identifier V1 had been sending to
+OpenAI and Anthropic on every turn.
+
 ## Tests
 
 ```bash

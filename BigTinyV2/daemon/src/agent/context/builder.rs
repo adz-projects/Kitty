@@ -566,6 +566,20 @@ fn row_to_message(row: &crate::storage::messages::MessageRow) -> Value {
         msg.insert("tool_call_id".to_string(), json!(tcid));
     }
 
+    // Carry the stored count forward. `save_messages` computed it with the
+    // very same function this feeds, so it is what a recount would produce
+    // rather than an estimate of it -- and reusing it avoids a full cl100k
+    // encode of the whole transcript on every tool-loop iteration.
+    //
+    // Only stamped when the row actually has one: a row written before this
+    // existed, or by a path that did not compute it, simply recounts.
+    if let Some(tokens) = row.token_count.filter(|t| *t > 0) {
+        msg.insert(
+            crate::agent::tokens::TOKEN_HINT_KEY.to_string(),
+            json!(tokens),
+        );
+    }
+
     Value::Object(msg)
 }
 

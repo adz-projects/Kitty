@@ -891,8 +891,11 @@ impl ProviderRouter {
             .acquire(app_id, priority)
             .await;
 
+        // Strip daemon-internal bookkeeping before anything leaves the
+        // process. One place, both dialects -- see `provider::wire`.
+        let outgoing = super::wire::sanitize_for_wire(messages);
         let inner = provider
-            .chat_completion(messages, tools, sampling, model, id_slot)
+            .chat_completion(&outgoing, tools, sampling, model, id_slot)
             .await?;
         Ok(Box::pin(PermitStream {
             inner,
