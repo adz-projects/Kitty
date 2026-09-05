@@ -53,8 +53,8 @@ fn parse(json_str: &str) -> Value {
     serde_json::from_str(json_str).expect("tool output was not valid JSON")
 }
 
-#[test]
-fn word_read_text_reaches_table_only_content() {
+#[tokio::test]
+async fn word_read_text_reaches_table_only_content() {
     let path = tmp_path("table_only.docx");
     // A document whose body has one stray title paragraph and all other
     // content inside a table — the exact shape that made the old
@@ -77,12 +77,14 @@ doc.save(r"{}")
     ));
 
     let server = KittyToolsServer::new();
-    let result = server.word_read_text(Parameters(WordReadTextRequest {
-        path: path.to_string_lossy().to_string(),
-        query: None,
-        offset: None,
-        limit: None,
-    }));
+    let result = server
+        .word_read_text(Parameters(WordReadTextRequest {
+            path: path.to_string_lossy().to_string(),
+            query: None,
+            offset: None,
+            limit: None,
+        }))
+        .await;
     let v = parse(&result);
     assert_eq!(v["status"], "success");
     let data = v["data"].as_array().unwrap();
@@ -97,8 +99,8 @@ doc.save(r"{}")
     assert!(data.len() >= 7, "expected title + 6 cells, got {data:?}");
 }
 
-#[test]
-fn word_read_text_paginates() {
+#[tokio::test]
+async fn word_read_text_paginates() {
     let path = tmp_path("many_paragraphs.docx");
     run_python(&format!(
         r#"
@@ -112,31 +114,39 @@ doc.save(r"{}")
     ));
 
     let server = KittyToolsServer::new();
-    let first = parse(&server.word_read_text(Parameters(WordReadTextRequest {
-        path: path.to_string_lossy().to_string(),
-        query: None,
-        offset: None,
-        limit: None,
-    })));
+    let first = parse(
+        &server
+            .word_read_text(Parameters(WordReadTextRequest {
+                path: path.to_string_lossy().to_string(),
+                query: None,
+                offset: None,
+                limit: None,
+            }))
+            .await,
+    );
     assert_eq!(first["truncated"], true);
     assert_eq!(first["metadata"]["total_paragraphs"], 250);
     let next_offset = first["metadata"]["next_offset"].as_u64().unwrap();
     assert_eq!(next_offset, 200);
 
-    let second = parse(&server.word_read_text(Parameters(WordReadTextRequest {
-        path: path.to_string_lossy().to_string(),
-        query: None,
-        offset: Some(next_offset as u32),
-        limit: None,
-    })));
+    let second = parse(
+        &server
+            .word_read_text(Parameters(WordReadTextRequest {
+                path: path.to_string_lossy().to_string(),
+                query: None,
+                offset: Some(next_offset as u32),
+                limit: None,
+            }))
+            .await,
+    );
     assert_eq!(second["truncated"], false);
     let data = second["data"].as_array().unwrap();
     assert_eq!(data.len(), 50);
     assert_eq!(data[0], "Paragraph number 200");
 }
 
-#[test]
-fn word_read_outline_resolves_style_id_to_name() {
+#[tokio::test]
+async fn word_read_outline_resolves_style_id_to_name() {
     let path = tmp_path("headings.docx");
     run_python(&format!(
         r#"
@@ -152,9 +162,11 @@ doc.save(r"{}")
 
     let server = KittyToolsServer::new();
     let result = parse(
-        &server.word_read_outline(Parameters(WordReadOutlineRequest {
-            path: path.to_string_lossy().to_string(),
-        })),
+        &server
+            .word_read_outline(Parameters(WordReadOutlineRequest {
+                path: path.to_string_lossy().to_string(),
+            }))
+            .await,
     );
     assert_eq!(result["status"], "success");
     let outline = result["data"].as_array().unwrap();
@@ -165,27 +177,29 @@ doc.save(r"{}")
     assert_eq!(outline[1]["text"], "Sub Level");
 }
 
-#[test]
-fn word_read_text_not_found_error() {
+#[tokio::test]
+async fn word_read_text_not_found_error() {
     let server = KittyToolsServer::new();
     // Inside home (temp dir) so the home boundary passes through to the
     // not-found error path.
     let result = parse(
-        &server.word_read_text(Parameters(WordReadTextRequest {
-            path: tmp_path("does-not-exist.docx")
-                .to_string_lossy()
-                .to_string(),
-            query: None,
-            offset: None,
-            limit: None,
-        })),
+        &server
+            .word_read_text(Parameters(WordReadTextRequest {
+                path: tmp_path("does-not-exist.docx")
+                    .to_string_lossy()
+                    .to_string(),
+                query: None,
+                offset: None,
+                limit: None,
+            }))
+            .await,
     );
     assert_eq!(result["status"], "error");
     assert_eq!(result["error_code"], "DOCX_NOT_FOUND");
 }
 
-#[test]
-fn word_write_doc_create_mode_opens_in_python_docx() {
+#[tokio::test]
+async fn word_write_doc_create_mode_opens_in_python_docx() {
     let path = tmp_path("created.docx");
     let server = KittyToolsServer::new();
     // Note: only the "|---|---|" line is a separator row per the ported
@@ -193,13 +207,17 @@ fn word_write_doc_create_mode_opens_in_python_docx() {
     // literal *data* row, not a header the parser special-cases.
     let doc_text = "# Heading One\n\nSome **bold** and *italic* text.\n\n- bullet one\n- bullet two\n\n1. first\n2. second\n\n| a | b |\n|---|---|\n| 1 | 2 |\n| 3 |";
 
-    let result = parse(&server.word_write_doc(Parameters(WordWriteDocRequest {
-        path: path.to_string_lossy().to_string(),
-        doc_text: Some(doc_text.to_string()),
-        write_mode: Some(WordWriteModeParam::Create),
-        title: Some("My Test Doc".to_string()),
-        language: Some("en-US".to_string()),
-    })));
+    let result = parse(
+        &server
+            .word_write_doc(Parameters(WordWriteDocRequest {
+                path: path.to_string_lossy().to_string(),
+                doc_text: Some(doc_text.to_string()),
+                write_mode: Some(WordWriteModeParam::Create),
+                title: Some("My Test Doc".to_string()),
+                language: Some("en-US".to_string()),
+            }))
+            .await,
+    );
     assert_eq!(result["status"], "success", "{result:?}");
     assert!(path.exists());
 
@@ -230,17 +248,19 @@ print("OK")
     assert_eq!(check, "OK");
 }
 
-#[test]
-fn word_write_doc_bold_and_italic_runs_are_actually_formatted() {
+#[tokio::test]
+async fn word_write_doc_bold_and_italic_runs_are_actually_formatted() {
     let path = tmp_path("formatting.docx");
     let server = KittyToolsServer::new();
-    server.word_write_doc(Parameters(WordWriteDocRequest {
-        path: path.to_string_lossy().to_string(),
-        doc_text: Some("**bold word** and *italic word*".to_string()),
-        write_mode: Some(WordWriteModeParam::Create),
-        title: None,
-        language: None,
-    }));
+    server
+        .word_write_doc(Parameters(WordWriteDocRequest {
+            path: path.to_string_lossy().to_string(),
+            doc_text: Some("**bold word** and *italic word*".to_string()),
+            write_mode: Some(WordWriteModeParam::Create),
+            title: None,
+            language: None,
+        }))
+        .await;
 
     let check = run_python(&format!(
         r#"
@@ -260,8 +280,8 @@ print("OK")
     assert_eq!(check, "OK");
 }
 
-#[test]
-fn word_write_doc_append_mode_preserves_existing_content_and_byte_identical_other_parts() {
+#[tokio::test]
+async fn word_write_doc_append_mode_preserves_existing_content_and_byte_identical_other_parts() {
     let path = tmp_path("append_target.docx");
     run_python(&format!(
         r#"
@@ -279,13 +299,17 @@ doc.save(r"{}")
     let before_hashes = zip_part_hashes(&path);
 
     let server = KittyToolsServer::new();
-    let result = parse(&server.word_write_doc(Parameters(WordWriteDocRequest {
-        path: path.to_string_lossy().to_string(),
-        doc_text: Some("Appended paragraph.".to_string()),
-        write_mode: Some(WordWriteModeParam::Append),
-        title: None,
-        language: Some("en-US".to_string()),
-    })));
+    let result = parse(
+        &server
+            .word_write_doc(Parameters(WordWriteDocRequest {
+                path: path.to_string_lossy().to_string(),
+                doc_text: Some("Appended paragraph.".to_string()),
+                write_mode: Some(WordWriteModeParam::Append),
+                title: None,
+                language: Some("en-US".to_string()),
+            }))
+            .await,
+    );
     assert_eq!(result["status"], "success", "{result:?}");
 
     let after_hashes = zip_part_hashes(&path);
@@ -322,8 +346,8 @@ print("OK")
     assert_eq!(check, "OK");
 }
 
-#[test]
-fn word_read_outline_degrades_gracefully_on_a_dangling_style_id() {
+#[tokio::test]
+async fn word_read_outline_degrades_gracefully_on_a_dangling_style_id() {
     // Simulates the classic Google-Docs-export gap: a paragraph's `w:pStyle`
     // references a styleId absent from `word/styles.xml`. python-docx
     // raises `KeyError` on `.style.name` for this; the old lean_mcp.py
@@ -360,9 +384,11 @@ shutil.move(tmp2, r"{path}")
 
     let server = KittyToolsServer::new();
     let outline_result = parse(
-        &server.word_read_outline(Parameters(WordReadOutlineRequest {
-            path: path.to_string_lossy().to_string(),
-        })),
+        &server
+            .word_read_outline(Parameters(WordReadOutlineRequest {
+                path: path.to_string_lossy().to_string(),
+            }))
+            .await,
     );
     assert_eq!(outline_result["status"], "success");
     // The dangling-style paragraph is no longer detected as a heading (its
@@ -371,31 +397,37 @@ shutil.move(tmp2, r"{path}")
     // the *other* paragraph's presence is confirmed via word_read_text.
     assert_eq!(outline_result["data"].as_array().unwrap().len(), 0);
 
-    let text_result = parse(&server.word_read_text(Parameters(WordReadTextRequest {
-        path: path.to_string_lossy().to_string(),
-        query: None,
-        offset: None,
-        limit: None,
-    })));
+    let text_result = parse(
+        &server
+            .word_read_text(Parameters(WordReadTextRequest {
+                path: path.to_string_lossy().to_string(),
+                query: None,
+                offset: None,
+                limit: None,
+            }))
+            .await,
+    );
     assert_eq!(text_result["status"], "success");
     let data = text_result["data"].as_array().unwrap();
     assert!(data.iter().any(|v| v.as_str() == Some("Normal para")));
     assert!(data.iter().any(|v| v.as_str() == Some("A Heading")));
 }
 
-#[test]
-fn word_write_doc_append_to_missing_file_errors() {
+#[tokio::test]
+async fn word_write_doc_append_to_missing_file_errors() {
     let server = KittyToolsServer::new();
     let result = parse(
-        &server.word_write_doc(Parameters(WordWriteDocRequest {
-            path: tmp_path("does-not-exist.docx")
-                .to_string_lossy()
-                .to_string(),
-            doc_text: Some("text".to_string()),
-            write_mode: Some(WordWriteModeParam::Append),
-            title: None,
-            language: None,
-        })),
+        &server
+            .word_write_doc(Parameters(WordWriteDocRequest {
+                path: tmp_path("does-not-exist.docx")
+                    .to_string_lossy()
+                    .to_string(),
+                doc_text: Some("text".to_string()),
+                write_mode: Some(WordWriteModeParam::Append),
+                title: None,
+                language: None,
+            }))
+            .await,
     );
     assert_eq!(result["status"], "error");
     assert_eq!(result["error_code"], "DOCX_NOT_FOUND");
@@ -422,21 +454,25 @@ fn zip_part_hashes(path: &Path) -> std::collections::HashMap<String, u64> {
 /// it produces is one Word can actually open, with the link resolving through
 /// the relationships part to the right target. That round trip is the only
 /// thing that proves the `r:id` / rels / namespace / style pieces line up.
-#[test]
-fn word_write_doc_hyperlinks_resolve_through_the_relationships_part() {
+#[tokio::test]
+async fn word_write_doc_hyperlinks_resolve_through_the_relationships_part() {
     let path = tmp_path("links.docx");
     let server = KittyToolsServer::new();
-    let result = parse(&server.word_write_doc(Parameters(WordWriteDocRequest {
-        path: path.to_string_lossy().to_string(),
-        doc_text: Some(
-            "See [the docs](https://example.com/a?x=1&y=2) and [mail us](mailto:x@y.example).\n\n\
-             Not a link: [nope](javascript:alert(1))"
-                .to_string(),
-        ),
-        write_mode: Some(WordWriteModeParam::Create),
-        title: Some("Links".to_string()),
-        language: None,
-    })));
+    let result = parse(
+        &server
+            .word_write_doc(Parameters(WordWriteDocRequest {
+                path: path.to_string_lossy().to_string(),
+                doc_text: Some(
+                    "See [the docs](https://example.com/a?x=1&y=2) and [mail us](mailto:x@y.example).\n\n\
+                     Not a link: [nope](javascript:alert(1))"
+                        .to_string(),
+                ),
+                write_mode: Some(WordWriteModeParam::Create),
+                title: Some("Links".to_string()),
+                language: None,
+            }))
+            .await,
+    );
     assert_eq!(result["status"], "success", "{result:?}");
 
     let check = run_python(&format!(
@@ -491,8 +527,8 @@ print("OK")
 /// that can corrupt a real user file: the root has no `xmlns:r`, the styles
 /// have no `Hyperlink`, and the relationship ids already in use must not be
 /// reissued. Word opening the result is the whole assertion.
-#[test]
-fn word_write_doc_appending_a_link_to_an_existing_document_stays_valid() {
+#[tokio::test]
+async fn word_write_doc_appending_a_link_to_an_existing_document_stays_valid() {
     let path = tmp_path("append_links.docx");
     let server = KittyToolsServer::new();
 
@@ -510,13 +546,17 @@ print("OK")
         path.display()
     ));
 
-    let result = parse(&server.word_write_doc(Parameters(WordWriteDocRequest {
-        path: path.to_string_lossy().to_string(),
-        doc_text: Some("Appended [link](https://example.org/z).".to_string()),
-        write_mode: Some(WordWriteModeParam::Append),
-        title: None,
-        language: None,
-    })));
+    let result = parse(
+        &server
+            .word_write_doc(Parameters(WordWriteDocRequest {
+                path: path.to_string_lossy().to_string(),
+                doc_text: Some("Appended [link](https://example.org/z).".to_string()),
+                write_mode: Some(WordWriteModeParam::Append),
+                title: None,
+                language: None,
+            }))
+            .await,
+    );
     assert_eq!(result["status"], "success", "{result:?}");
 
     let check = run_python(&format!(

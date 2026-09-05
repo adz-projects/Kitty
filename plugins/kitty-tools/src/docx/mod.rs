@@ -37,10 +37,13 @@ pub(crate) const MAX_DOCX_ENTRIES: usize = 4096;
 /// `word/styles.xml`, and extracts paragraphs (including inside tables and
 /// text boxes — see `read` module doc comment) in document order.
 pub fn read_paragraphs(path: &Path) -> Result<Vec<ParagraphInfo>, DocxError> {
-    if !path.exists() {
-        return Err(DocxError::NotFound);
-    }
-    let file = std::fs::File::open(path).map_err(|e| DocxError::Corrupt(e.to_string()))?;
+    // One syscall instead of `exists()` + `open()`: a missing file surfaces
+    // as `NotFound`, anything else as corruption.
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(DocxError::NotFound),
+        Err(e) => return Err(DocxError::Corrupt(e.to_string())),
+    };
     let mut archive = zip::ZipArchive::new(file).map_err(|e| DocxError::Corrupt(e.to_string()))?;
     if archive.len() > MAX_DOCX_ENTRIES {
         return Err(DocxError::Corrupt(format!(

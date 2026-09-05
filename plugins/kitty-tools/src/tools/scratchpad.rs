@@ -62,12 +62,46 @@ fn load(path: &Path) -> BTreeMap<String, String> {
         .unwrap_or_default()
 }
 
+/// Write the whole scratchpad, atomically.
+///
+/// The point of the scratchpad is to survive things going wrong, and the
+/// previous implementation — a plain `fs::write` truncate-then-write of the
+/// entire map — was the one thing that could not. A crash, power loss, or
+/// full disk partway through left a truncated file, and `load` swallows any
+/// parse error and returns an empty map, so the *entire* scratchpad silently
+/// came back empty with nothing to indicate anything had been lost. That is
+/// the worst possible failure mode for a durability feature.
+///
+/// Write to a temp file beside the target, fsync it so the bytes are really on
+/// disk before anything points at them, then rename over the target. Rename is
+/// atomic within a directory on both Windows and POSIX, so a reader sees
+/// either the whole old file or the whole new one.
 fn save(path: &Path, data: &BTreeMap<String, String>) -> std::io::Result<()> {
+    use std::io::Write;
+
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let text = serde_json::to_string_pretty(data).unwrap_or_else(|_| "{}".to_string());
-    std::fs::write(path, text)
+
+    // Same directory as the target: a rename across filesystems is not atomic
+    // (and fails outright on Windows), so the OS temp dir is not an option.
+    // The pid keeps two processes from colliding on the same temp name.
+    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(text.as_bytes())?;
+        f.sync_all()?;
+    }
+    // Windows `rename` refuses an existing destination, so `fs::rename`'s
+    // documented replace-on-overwrite behaviour is what carries this — it maps
+    // to `MoveFileEx(MOVEFILE_REPLACE_EXISTING)`. On failure the temp file is
+    // cleaned up rather than accumulating one turd per failed write.
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
 }
 
 pub fn scratchpad_set(key: &str, value: &str) -> String {

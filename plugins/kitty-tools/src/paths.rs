@@ -72,27 +72,69 @@ fn resolve_home(env: impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
 /// collapsed by `resolve()` before callers invoke this.
 ///
 /// An undeterminable home directory rejects everything — see `home_dir`.
+/// Canonicalized home, cached for the process lifetime like `home_dir`
+/// itself. `canonicalize` is a filesystem round-trip on every call otherwise,
+/// and this runs on every tool call's boundary check.
+fn home_canon() -> Option<PathBuf> {
+    static CANON: OnceLock<Option<PathBuf>> = OnceLock::new();
+    // Only a *successful* canonicalization is cached, and the fallback
+    // deliberately is not.
+    //
+    // `canonicalize` fails when the home directory does not exist yet, and on
+    // Windows it is also what rewrites `C:\...` into the verbatim `\\?\C:\...`
+    // form. `within_home_of_canon` always canonicalizes the candidate, and
+    // `path_is_within` is a plain string prefix test with no verbatim-prefix
+    // handling -- so a cached un-canonicalized base would compare
+    // `\\?\c:\users\me\f.txt` against `c:\users\me`, fail, and reject every
+    // path for the remaining life of the process. Before this value was
+    // cached at all, the next call re-canonicalized and recovered on its own.
+    if let Some(hit) = CANON.get() {
+        return hit.clone();
+    }
+    let home = home_dir()?;
+    match std::fs::canonicalize(&home) {
+        Ok(canon) => CANON.get_or_init(|| Some(canon)).clone(),
+        // Usable now, but not remembered: the directory may exist by the
+        // next call, and then the real canonical form gets cached instead.
+        Err(_) => Some(home),
+    }
+}
+
 pub fn path_within_home(path: &Path) -> bool {
-    within_home_of(home_dir().as_deref(), path)
+    let home = home_dir();
+    // No home means no boundary to be inside of. Fail closed.
+    let Some(_) = home.as_deref() else {
+        return false;
+    };
+    // `home_canon` is `None` only when `home_dir()` is `None`, handled above.
+    let canon = home_canon();
+    let Some(canon_ref) = canon.as_deref() else {
+        return false;
+    };
+    within_home_of_canon(canon_ref, path)
 }
 
 /// The containment test against an explicit home, split out so the
 /// fail-closed behaviour can be tested directly rather than by trying to
 /// convince the process it has no home directory.
+#[cfg(test)]
 fn within_home_of(home: Option<&Path>, path: &Path) -> bool {
     // No home means no boundary to be inside of. Fail closed.
     let Some(home) = home else {
         return false;
     };
     let home_canon = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+    within_home_of_canon(&home_canon, path)
+}
 
+fn within_home_of_canon(home_canon: &Path, path: &Path) -> bool {
     if let Some(anchor) = nearest_existing_ancestor(path) {
         if let Ok(canon) = std::fs::canonicalize(&anchor) {
-            return path_is_within(&home_canon, &canon);
+            return path_is_within(home_canon, &canon);
         }
     }
 
-    path_is_within(&home_canon, path)
+    path_is_within(home_canon, path)
 }
 
 /// The deepest ancestor of `path` (including `path` itself) that exists on

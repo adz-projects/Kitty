@@ -74,6 +74,11 @@ pub struct StoredDoc {
     /// either `MAX_TOTAL_CHARS` stopped it short of `total_units`, or an
     /// individual unit's content was capped.
     pub extraction_truncated: bool,
+    /// Storage format: 0 = legacy units stored pre-numbered (`"N: line"` baked
+    /// in at extraction), 1 = raw lines numbered on serve. Absent in records
+    /// written before the change, which therefore read back as 0.
+    #[serde(default)]
+    pub format_version: u32,
     len: u64,
     mtime_nanos: u128,
 }
@@ -255,6 +260,7 @@ where
         total_units: extraction.total_units,
         extraction_truncated: extraction.total_units > extraction.units.len()
             || extraction.content_capped,
+        format_version: STORED_FORMAT_VERSION,
         units: extraction.units,
         outline: extraction.outline,
         len,
@@ -271,16 +277,101 @@ fn write_record(doc: &StoredDoc) -> Result<(), String> {
     prune_old_records();
     let path = record_path(&doc.document_id);
     let body = serde_json::to_string(doc).map_err(|e| e.to_string())?;
-    std::fs::write(&path, body).map_err(|e| format!("could not write {}: {e}", path.display()))
+    // Atomic but not fsync'd: a torn record is useless while a merely lost
+    // one is just re-extracted. Buffered inside `write_atomic`.
+    write_atomic(&path, body.as_bytes())
+        .map_err(|e| format!("could not write {}: {e}", path.display()))
+}
+
+/// One window of units as a borrow, plus whether anything follows it. Clamps
+/// rather than erroring on an offset past the end, so a caller walking
+/// `next_offset` to completion gets an empty final page instead of a failure.
+/// Prefer this over `window`: it serves the page straight into the response
+/// without cloning every string twice (once into a `Vec`, once into JSON).
+pub fn window_slice(units: &[String], offset: usize, limit: usize) -> (&[String], bool) {
+    let start = offset.min(units.len());
+    let end = start.saturating_add(limit).min(units.len());
+    (&units[start..end], end < units.len())
+}
+
+/// The format new records are written in: raw lines, numbered on serve.
+pub const STORED_FORMAT_VERSION: u32 = 1;
+
+/// Display forms of `doc.units[start..end]` (clamped), numbering only the
+/// served slice when the record stores raw lines. Legacy records (version 0)
+/// already carry their `"N: "` prefixes and pass through untouched, so a
+/// cache written by an older build keeps serving byte-identical output.
+pub fn display_range(doc: &StoredDoc, start: usize, end: usize) -> Vec<String> {
+    let len = doc.units.len();
+    let start = start.min(len);
+    let mut end = end.min(len);
+    if end < start {
+        end = start;
+    }
+    if doc.unit == UNIT_LINE && doc.format_version >= STORED_FORMAT_VERSION {
+        doc.units[start..end]
+            .iter()
+            .enumerate()
+            .map(|(k, l)| format!("{}: {}", start + k + 1, l))
+            .collect()
+    } else {
+        doc.units[start..end].to_vec()
+    }
+}
+
+/// Display forms of every unit. Used by whole-document scans (keyword
+/// search), which score the same numbered text the old pre-numbered records
+/// carried; windowed reads should use `display_window` to number only the
+/// served slice.
+pub fn display_all(doc: &StoredDoc) -> Vec<String> {
+    display_range(doc, 0, doc.units.len())
+}
+
+/// Display forms of one window plus whether anything follows it — the
+/// numbered equivalent of `window` for records that store raw lines.
+pub fn display_window(doc: &StoredDoc, offset: usize, limit: usize) -> (Vec<String>, bool) {
+    let (_, has_more) = window_slice(&doc.units, offset, limit);
+    let start = offset.min(doc.units.len());
+    let end = start.saturating_add(limit).min(doc.units.len());
+    (display_range(doc, start, end), has_more)
+}
+
+/// Fast same-dir temp-file + rename write without `fsync`: atomic (a reader
+/// sees the whole old file or the whole new one, never a torn one) but not
+/// durable — a power loss right after the rename may lose the write. That is
+/// the intended trade for caches and tool outputs; the scratchpad keeps its
+/// `sync_all` write. The caller ensures the parent directory exists.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let stem = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "tmp".to_string());
+    let tmp = path.with_file_name(format!(".{stem}.tmp-{}-{n}", std::process::id()));
+
+    let mut f = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
+    f.write_all(bytes)?;
+    f.flush()?;
+    drop(f);
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
 }
 
 /// One window of units, plus whether anything follows it. Clamps rather than
 /// erroring on an offset past the end, so a caller walking `next_offset` to
 /// completion gets an empty final page instead of a failure.
 pub fn window(units: &[String], offset: usize, limit: usize) -> (Vec<String>, bool) {
-    let page: Vec<String> = units.iter().skip(offset).take(limit).cloned().collect();
-    let has_more = offset.saturating_add(page.len()) < units.len();
-    (page, has_more)
+    let (page, has_more) = window_slice(units, offset, limit);
+    (page.to_vec(), has_more)
 }
 
 #[cfg(test)]
@@ -427,6 +518,42 @@ mod tests {
 
         std::fs::remove_file(record_path(&doc.document_id)).ok();
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Raw-line records number on serve; legacy records (written before the
+    /// change, already carrying `"N: "` prefixes) pass through untouched so a
+    /// stale cache keeps serving byte-identical output.
+    #[test]
+    fn display_numbers_raw_lines_and_passes_legacy_through() {
+        let raw = StoredDoc {
+            document_id: "0123456789abcdef".into(),
+            source_path: "x".into(),
+            unit: UNIT_LINE.into(),
+            total_units: 2,
+            units: vec!["alpha".into(), "beta".into()],
+            outline: vec![],
+            extraction_truncated: false,
+            format_version: STORED_FORMAT_VERSION,
+            len: 0,
+            mtime_nanos: 0,
+        };
+        assert_eq!(display_all(&raw), vec!["1: alpha".to_string(), "2: beta".to_string()]);
+        assert_eq!(
+            display_window(&raw, 1, 5),
+            (vec!["2: beta".to_string()], false)
+        );
+
+        let legacy = StoredDoc {
+            units: vec!["1: alpha".into(), "2: beta".into()],
+            format_version: 0,
+            ..raw.clone()
+        };
+        // Legacy units are already numbered: serve verbatim, never double up.
+        assert_eq!(display_all(&legacy), vec!["1: alpha".to_string(), "2: beta".to_string()]);
+        assert_eq!(
+            display_window(&legacy, 0, 10),
+            (vec!["1: alpha".to_string(), "2: beta".to_string()], false)
+        );
     }
 
     #[test]

@@ -52,8 +52,8 @@ fn document_id_of(v: &Value) -> String {
         .to_string()
 }
 
-#[test]
-fn a_long_file_hands_back_a_stable_handle_and_the_rest_reads_from_cache() {
+#[tokio::test]
+async fn a_long_file_hands_back_a_stable_handle_and_the_rest_reads_from_cache() {
     let dir = scratch("loop");
     let path = long_file(&dir, "report.txt");
     let p = path.to_str().unwrap();
@@ -76,11 +76,15 @@ fn a_long_file_hands_back_a_stable_handle_and_the_rest_reads_from_cache() {
     // Reading on by handle continues exactly where the window stopped, with
     // no path and no re-read.
     let end_line = first["metadata"]["end_line"].as_u64().unwrap() as u32;
-    let next = json(&server.doc_read_chunk(Parameters(DocReadChunkRequest {
-        document_id: id.clone(),
-        offset: Some(end_line),
-        limit: Some(50),
-    })));
+    let next = json(
+        &server
+            .doc_read_chunk(Parameters(DocReadChunkRequest {
+                document_id: id.clone(),
+                offset: Some(end_line),
+                limit: Some(50),
+            }))
+            .await,
+    );
     assert_eq!(next["status"], "success", "{next}");
     assert_eq!(next["metadata"]["document_id"], id);
     let units = next["data"].as_array().unwrap();
@@ -99,8 +103,8 @@ fn a_long_file_hands_back_a_stable_handle_and_the_rest_reads_from_cache() {
 /// the document a window at a time. `file_read`'s own `query` searches the
 /// whole file too, but only by re-reading it by path; this searches the
 /// extraction already in hand.
-#[test]
-fn search_by_handle_finds_content_outside_every_window() {
+#[tokio::test]
+async fn search_by_handle_finds_content_outside_every_window() {
     let dir = scratch("search");
     let path = long_file(&dir, "notes.txt");
     let server = KittyToolsServer::new();
@@ -108,11 +112,15 @@ fn search_by_handle_finds_content_outside_every_window() {
     let first = json(&file_read(path.to_str().unwrap(), None, None, None));
     let id = document_id_of(&first);
 
-    let hit = json(&server.doc_search(Parameters(DocSearchRequest {
-        document_id: id.clone(),
-        query: "aardvark".to_string(),
-        offset: None,
-    })));
+    let hit = json(
+        &server
+            .doc_search(Parameters(DocSearchRequest {
+                document_id: id.clone(),
+                query: "aardvark".to_string(),
+                offset: None,
+            }))
+            .await,
+    );
     assert_eq!(hit["status"], "success", "{hit}");
     assert_eq!(hit["metadata"]["document_id"], id);
     let items = hit["data"].as_array().unwrap();
@@ -130,18 +138,22 @@ fn search_by_handle_finds_content_outside_every_window() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-#[test]
-fn an_empty_search_query_is_refused_rather_than_returning_the_document() {
+#[tokio::test]
+async fn an_empty_search_query_is_refused_rather_than_returning_the_document() {
     let dir = scratch("emptyq");
     let path = long_file(&dir, "q.txt");
     let server = KittyToolsServer::new();
     let id = document_id_of(&json(&file_read(path.to_str().unwrap(), None, None, None)));
 
-    let out = json(&server.doc_search(Parameters(DocSearchRequest {
-        document_id: id,
-        query: "   ".to_string(),
-        offset: None,
-    })));
+    let out = json(
+        &server
+            .doc_search(Parameters(DocSearchRequest {
+                document_id: id,
+                query: "   ".to_string(),
+                offset: None,
+            }))
+            .await,
+    );
     assert_eq!(out["status"], "error", "{out}");
     assert_eq!(out["error_code"], "DOC_QUERY_EMPTY");
 
@@ -178,8 +190,8 @@ fn the_handle_is_stable_across_reads_and_moves_when_the_file_changes() {
 /// expected outcome, not a caller error. It has to say so recoverably rather
 /// than failing opaquely mid-read-loop — the exact failure `kitty-web`'s
 /// `SEARCH_ID_NOT_FOUND` was fixed to stop producing silently.
-#[test]
-fn an_unknown_or_malformed_handle_fails_recoverably() {
+#[tokio::test]
+async fn an_unknown_or_malformed_handle_fails_recoverably() {
     let server = KittyToolsServer::new();
 
     for bad in [
@@ -189,11 +201,15 @@ fn an_unknown_or_malformed_handle_fails_recoverably() {
         "not-hex",
         "",
     ] {
-        let out = json(&server.doc_read_chunk(Parameters(DocReadChunkRequest {
-            document_id: bad.to_string(),
-            offset: None,
-            limit: None,
-        })));
+        let out = json(
+            &server
+                .doc_read_chunk(Parameters(DocReadChunkRequest {
+                    document_id: bad.to_string(),
+                    offset: None,
+                    limit: None,
+                }))
+                .await,
+        );
         assert_eq!(out["status"], "error", "{bad}: {out}");
         assert_eq!(out["error_code"], "DOCUMENT_ID_NOT_FOUND", "{bad}");
         assert!(
@@ -206,27 +222,35 @@ fn an_unknown_or_malformed_handle_fails_recoverably() {
 /// Reading to the very end must terminate cleanly: the final window says
 /// nothing follows, and an offset past the end is an empty answer rather than
 /// an error, so a model walking `next_offset` can't get stuck.
-#[test]
-fn walking_to_the_end_terminates_instead_of_erroring() {
+#[tokio::test]
+async fn walking_to_the_end_terminates_instead_of_erroring() {
     let dir = scratch("end");
     let path = long_file(&dir, "end.txt");
     let server = KittyToolsServer::new();
     let id = document_id_of(&json(&file_read(path.to_str().unwrap(), None, None, None)));
 
-    let last = json(&server.doc_read_chunk(Parameters(DocReadChunkRequest {
-        document_id: id.clone(),
-        offset: Some(450),
-        limit: Some(200),
-    })));
+    let last = json(
+        &server
+            .doc_read_chunk(Parameters(DocReadChunkRequest {
+                document_id: id.clone(),
+                offset: Some(450),
+                limit: Some(200),
+            }))
+            .await,
+    );
     assert_eq!(last["data"].as_array().unwrap().len(), 50);
     assert_eq!(last["metadata"]["has_more"], false);
     assert!(last["metadata"].get("next_offset").is_none());
 
-    let past = json(&server.doc_read_chunk(Parameters(DocReadChunkRequest {
-        document_id: id,
-        offset: Some(9999),
-        limit: Some(10),
-    })));
+    let past = json(
+        &server
+            .doc_read_chunk(Parameters(DocReadChunkRequest {
+                document_id: id,
+                offset: Some(9999),
+                limit: Some(10),
+            }))
+            .await,
+    );
     assert_eq!(past["status"], "success", "{past}");
     assert!(past["data"].as_array().unwrap().is_empty());
     assert_eq!(past["metadata"]["has_more"], false);

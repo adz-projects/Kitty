@@ -157,8 +157,8 @@ print("OK")
 /// extracted behind a `document_id`, so pages past the cap come back without
 /// the file being parsed a second time — and both PDF tools share the one
 /// extraction, so whichever the model reaches for first pays for it.
-#[test]
-fn a_long_pdf_is_parsed_once_and_read_past_the_page_cap_by_handle() {
+#[tokio::test]
+async fn a_long_pdf_is_parsed_once_and_read_past_the_page_cap_by_handle() {
     use kitty_tools::server::{DocReadChunkRequest, KittyToolsServer};
     use rmcp::handler::server::wrapper::Parameters;
 
@@ -198,11 +198,15 @@ print("OK")
     );
 
     // Pages 101-105: unreachable in one response, one chunk call away.
-    let tail = parse(&server.doc_read_chunk(Parameters(DocReadChunkRequest {
-        document_id: id.clone(),
-        offset: Some(100),
-        limit: Some(200),
-    })));
+    let tail = parse(
+        &server
+            .doc_read_chunk(Parameters(DocReadChunkRequest {
+                document_id: id.clone(),
+                offset: Some(100),
+                limit: Some(200),
+            }))
+            .await,
+    );
     assert_eq!(tail["status"], "success", "{tail}");
     assert_eq!(tail["metadata"]["unit"], "page");
     let pages = tail["data"].as_array().unwrap();

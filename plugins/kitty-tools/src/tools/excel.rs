@@ -21,7 +21,7 @@ use serde_json::{json, Value};
 
 use crate::envelope::{error_response, success_response};
 use crate::paths::{path_within_home, resolve};
-use crate::query_filter::filter_by_query;
+use crate::query_filter::filter_indices;
 
 /// Same default as the Python plugin's `EXCEL_MAX_ROWS_DEFAULT` — rows beyond
 /// this per page are exposed via `next_offset`, never dumped unbounded.
@@ -39,12 +39,11 @@ const EXCEL_MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 /// scan stops and the response is marked truncated.
 const EXCEL_MAX_QUERY_SCAN_ROWS: usize = 100_000;
 
-/// True when the file's metadata size is past `EXCEL_MAX_FILE_BYTES` — the
-/// check that keeps giant workbooks from being parsed into memory at all.
-fn file_size_exceeds(resolved: &Path) -> bool {
-    std::fs::metadata(resolved)
-        .map(|m| m.len() > EXCEL_MAX_FILE_BYTES)
-        .unwrap_or(false)
+/// Single-stat existence + size probe: one `metadata()` answers "does it
+/// exist" and "is it over the cap" together instead of `exists()` plus a
+/// second stat.
+fn stat_len(resolved: &Path) -> Option<u64> {
+    std::fs::metadata(resolved).map(|m| m.len()).ok()
 }
 
 fn too_large(resolved: &Path) -> String {
@@ -209,15 +208,18 @@ pub fn excel_inspect(path: &str) -> String {
     if let Some(err) = outside_home(&resolved) {
         return err;
     }
-    if !resolved.exists() {
-        return error_response(
-            "XLSX_NOT_FOUND",
-            "Spreadsheet does not exist",
-            Some(&resolved.to_string_lossy()),
-            None,
-        );
-    }
-    if file_size_exceeds(&resolved) {
+    let len = match stat_len(&resolved) {
+        Some(len) => len,
+        None => {
+            return error_response(
+                "XLSX_NOT_FOUND",
+                "Spreadsheet does not exist",
+                Some(&resolved.to_string_lossy()),
+                None,
+            );
+        }
+    };
+    if len > EXCEL_MAX_FILE_BYTES {
         return too_large(&resolved);
     }
 
@@ -313,15 +315,18 @@ pub fn excel_read_rows(
     if let Some(err) = outside_home(&resolved) {
         return err;
     }
-    if !resolved.exists() {
-        return error_response(
-            "XLSX_NOT_FOUND",
-            "Spreadsheet does not exist",
-            Some(&resolved.to_string_lossy()),
-            None,
-        );
-    }
-    if file_size_exceeds(&resolved) {
+    let len = match stat_len(&resolved) {
+        Some(len) => len,
+        None => {
+            return error_response(
+                "XLSX_NOT_FOUND",
+                "Spreadsheet does not exist",
+                Some(&resolved.to_string_lossy()),
+                None,
+            );
+        }
+    };
+    if len > EXCEL_MAX_FILE_BYTES {
         return too_large(&resolved);
     }
 
@@ -404,8 +409,14 @@ pub fn excel_read_rows(
     // beyond that the accumulated strings are the memory problem, and the
     // response says so via the truncated flag + metadata note.
     if let Some(q) = query.filter(|q| !q.trim().is_empty()) {
+        // Score plain-text haystacks, output JSON objects: the previous code
+        // serialized every scanned row to a JSON string for the keyword
+        // filter and then parsed the matched page back into `Value`s — two
+        // serde passes over rows that are never returned. Only the matched
+        // page is cloned into `Value`s now.
         let mut headers: Vec<String> = Vec::new();
-        let mut serialized: Vec<String> = Vec::new();
+        let mut haystacks: Vec<String> = Vec::new();
+        let mut objects: Vec<Value> = Vec::new();
         let mut survivor = 0usize;
         let mut scan_capped = false;
         for (row_idx, row) in range.rows().enumerate() {
@@ -417,26 +428,25 @@ pub fn excel_read_rows(
                 if survivor == 0 {
                     headers = build_headers(&clipped);
                 } else {
-                    let obj = row_to_obj(&clipped, &headers);
-                    serialized.push(serde_json::to_string(&obj).unwrap_or_default());
+                    haystacks.push(row_haystack(&clipped, &headers));
+                    objects.push(row_to_obj(&clipped, &headers));
                 }
                 survivor += 1;
             }
         }
-        let result = filter_by_query(&serialized, Some(q), 50, offset);
-        let filtered: Vec<Value> = result
-            .items
-            .iter()
-            .filter_map(|s| serde_json::from_str(s).ok())
+        let (idx, truncated, total_matches, next_offset, no_match) =
+            filter_indices(&haystacks, q, 50, offset);
+        let page: Vec<Value> = idx
+            .into_iter()
+            .filter_map(|i| objects.get(i).cloned())
             .collect();
-        let message = result
-            .no_match
+        let message = no_match
             .then(|| format!("No direct matches for query '{q}'. Showing top section."));
         let mut meta = serde_json::Map::new();
         meta.insert("filtered_by_query".into(), json!(q));
-        meta.insert("total_matches".into(), json!(result.total_matches));
+        meta.insert("total_matches".into(), json!(total_matches));
         meta.insert("offset".into(), json!(offset));
-        if let Some(next) = result.next_offset {
+        if let Some(next) = next_offset {
             meta.insert("next_offset".into(), json!(next));
         }
         if scan_capped {
@@ -445,15 +455,10 @@ pub fn excel_read_rows(
                 json!(EXCEL_MAX_QUERY_SCAN_ROWS),
             );
         }
-        let data = if filtered.is_empty() {
-            Value::Array(result.items.into_iter().map(Value::String).collect())
-        } else {
-            Value::Array(filtered)
-        };
         return success_response(
-            data,
+            json!(page),
             message.as_deref(),
-            result.truncated || scan_capped,
+            truncated || scan_capped,
             Some(Value::Object(meta)),
         );
     }
@@ -578,6 +583,26 @@ fn build_headers(header_row: &[Data]) -> Vec<String> {
         .enumerate()
         .map(|(i, c)| display_data(c).unwrap_or_else(|| format!("col_{}", i + 1)))
         .collect()
+}
+
+/// Plain-text scoring haystack for one data row: headers plus display values.
+///
+/// The previous haystack was the row's JSON serialization, so header names
+/// were matchable tokens — they stay matchable here. Empty cells contribute
+/// a `null` token, matching JSON's `Null`; every other token (numbers,
+/// booleans lowercased by the scorer, dates, strings) coincides with what
+/// the JSON text produced.
+fn row_haystack(row: &[Data], headers: &[String]) -> String {
+    let mut s = String::with_capacity(128);
+    s.push_str(&headers.join(" "));
+    for cell in row.iter() {
+        s.push(' ');
+        match display_data(cell) {
+            Some(d) if !d.is_empty() => s.push_str(&d),
+            _ => s.push_str("null"),
+        }
+    }
+    s
 }
 
 /// Builds a JSON object for one data row keyed by the headers.

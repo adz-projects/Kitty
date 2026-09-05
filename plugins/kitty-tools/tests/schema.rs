@@ -11,7 +11,12 @@
 //! enum picks up its own doc comment, so all per-value guidance in this
 //! crate lives on the *field* that uses the enum instead.
 
-use kitty_tools::server::{AccessibleChartRequest, AccessibleMermaidRequest, AccessibleSvgRequest, AccessibleTableRequest};
+use kitty_tools::server::{
+    AccessibleChartRequest, AccessibleMermaidRequest, AccessibleSvgRequest, AccessibleTableRequest,
+    AnalyzeWorkspaceRequest, CacheFilenameRequest, FileAppendRequest, FileReadRequest,
+    FileReplaceLinesRequest, FileReplaceStrRequest, FileWriteRequest, ScratchpadKeyRequest,
+    ScratchpadSetRequest,
+};
 use serde_json::Value;
 
 const MIN_DESCRIPTION_LEN: usize = 30;
@@ -169,4 +174,53 @@ fn no_viz_schema_contains_a_boolean_subschema() {
             "{name} has boolean sub-schemas at {found:?} -- llama.cpp will reject the entire tool list"
         );
     }
+}
+
+/// The same ratchet, extended past the viz tools to the file, cache and
+/// scratchpad surface — which had **no field descriptions whatsoever**.
+/// schemars emitted bare `{"type":"string"}` properties, so a model calling
+/// `lean_file_write` saw a parameter named `content` and nothing else: no
+/// statement that the write replaces the file, that append needs the file to
+/// exist first, or that finished work belongs on disk before the task ends.
+/// These are the everyday tools; leaving them undocumented while the four
+/// visualization tools were rigorously specified had it exactly backwards.
+#[test]
+fn file_cache_and_scratchpad_schemas_are_fully_documented() {
+    assert_every_property_documented(&schema_value::<FileReadRequest>(), "FileReadRequest");
+    assert_every_property_documented(&schema_value::<FileWriteRequest>(), "FileWriteRequest");
+    assert_every_property_documented(&schema_value::<FileAppendRequest>(), "FileAppendRequest");
+    assert_every_property_documented(
+        &schema_value::<FileReplaceStrRequest>(),
+        "FileReplaceStrRequest",
+    );
+    assert_every_property_documented(
+        &schema_value::<FileReplaceLinesRequest>(),
+        "FileReplaceLinesRequest",
+    );
+    assert_every_property_documented(
+        &schema_value::<AnalyzeWorkspaceRequest>(),
+        "AnalyzeWorkspaceRequest",
+    );
+    assert_every_property_documented(
+        &schema_value::<CacheFilenameRequest>(),
+        "CacheFilenameRequest",
+    );
+    assert_every_property_documented(&schema_value::<ScratchpadSetRequest>(), "ScratchpadSetRequest");
+    assert_every_property_documented(&schema_value::<ScratchpadKeyRequest>(), "ScratchpadKeyRequest");
+}
+
+/// `max_depth` used to be `Option<u32>`, which schemars renders as
+/// `"type": ["integer","null"], "format": "uint32"`. A model read those as
+/// contradictory ("requires an integer but the schema says uint32… maybe the
+/// JSON encoding made it a string") and spent turns retrying a call that was
+/// never wrong. The `format` annotation is ignored by every validator in the
+/// chain, so it was cost with no benefit.
+#[test]
+fn max_depth_carries_no_misleading_format_annotation() {
+    let schema = schema_value::<AnalyzeWorkspaceRequest>();
+    let max_depth = &schema["properties"]["max_depth"];
+    assert!(
+        max_depth.get("format").is_none(),
+        "max_depth regressed to a format-annotated integer type: {max_depth}"
+    );
 }

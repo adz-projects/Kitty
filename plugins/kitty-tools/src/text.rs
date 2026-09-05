@@ -8,6 +8,26 @@
 /// vertical tab, or form feed doesn't silently get treated as part of the
 /// previous line's content.
 pub fn py_splitlines(text: &str) -> Vec<String> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    // Fast path: LF-only text (the common case) splits without per-character
+    // dispatch. Any byte that *could* begin a multi-byte line boundary
+    // (`\x85` is `C2 85`, ` `/` ` are `E2 80 A8/A9` in UTF-8) or is
+    // itself a boundary (`\r \x0B \x0C \x1C-\x1E`) falls through to the slow
+    // path, which handles every case exactly.
+    if !text
+        .bytes()
+        .any(|b| matches!(b, b'\r' | 0x0B | 0x0C | 0x1C | 0x1D | 0x1E | 0xC2 | 0xE2))
+    {
+        let mut lines: Vec<String> = text.split('\n').map(str::to_string).collect();
+        // Python drops the single empty segment a trailing newline produces:
+        // "a\n" -> ["a"], "a\n\n" -> ["a", ""].
+        if text.ends_with('\n') {
+            lines.pop();
+        }
+        return lines;
+    }
     let mut lines = Vec::new();
     let mut current = String::new();
     let mut chars = text.chars().peekable();

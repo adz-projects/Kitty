@@ -157,7 +157,10 @@ fn extract_raw_paragraphs(document_xml: &[u8]) -> Vec<RawParagraph> {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => {
                 depth += 1;
-                let local = local_name(e.name().as_ref()).to_vec();
+                // Borrowed, not `to_vec()`: this runs per XML element and the
+                // per-tag allocation dominated profiles of large documents.
+                let name = e.name();
+                let local = local_name(name.as_ref());
 
                 if fallback_depth.is_none() && local == b"Fallback" {
                     fallback_depth = Some(depth);
@@ -217,7 +220,8 @@ fn extract_raw_paragraphs(document_xml: &[u8]) -> Vec<RawParagraph> {
                     buf.clear();
                     continue;
                 }
-                let local = local_name(e.name().as_ref()).to_vec();
+                let name = e.name();
+                let local = local_name(name.as_ref());
                 if current.is_some() {
                     if local == b"tab" {
                         if let Some(p) = current.as_mut() {
@@ -262,7 +266,8 @@ fn extract_raw_paragraphs(document_xml: &[u8]) -> Vec<RawParagraph> {
                 }
             }
             Ok(Event::End(e)) => {
-                let local = local_name(e.name().as_ref()).to_vec();
+                let name = e.name();
+                let local = local_name(name.as_ref());
                 if fallback_depth.is_some() {
                     if fallback_depth == Some(depth) {
                         fallback_depth = None;

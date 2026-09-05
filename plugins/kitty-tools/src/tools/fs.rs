@@ -20,12 +20,20 @@ fn outside_home(resolved: &std::path::Path) -> bool {
     !path_within_home(resolved)
 }
 
-/// True when the file's metadata size is past `MAX_FILE_BYTES` — the check
-/// that keeps giant files from being materialized into memory at all.
-fn file_size_exceeds(resolved: &std::path::Path) -> bool {
-    std::fs::metadata(resolved)
-        .map(|m| m.len() > MAX_FILE_BYTES as u64)
-        .unwrap_or(false)
+/// Single-stat existence + size probe: one `metadata()` answers "does it
+/// exist" and "is it over the cap" together. Callers previously paid for
+/// `exists()` and `metadata()` as two separate stats on every operation.
+fn stat_len(resolved: &std::path::Path) -> Option<u64> {
+    std::fs::metadata(resolved).map(|m| m.len()).ok()
+}
+
+fn too_large_response(resolved: &std::path::Path) -> String {
+    error_response(
+        "FILE_TOO_LARGE",
+        &format!("File is larger than the {} byte read limit", MAX_FILE_BYTES),
+        Some(&resolved.to_string_lossy()),
+        Some("Use lean_file_read on a smaller file, or search for it with lean_analyze_workspace first."),
+    )
 }
 
 pub fn file_read(
@@ -43,21 +51,19 @@ pub fn file_read(
             Some("Only paths inside your home directory can be accessed."),
         );
     }
-    if !resolved.exists() {
-        return error_response(
-            "FILE_NOT_FOUND",
-            "Path does not exist",
-            Some(&resolved.to_string_lossy()),
-            None,
-        );
-    }
-    if file_size_exceeds(&resolved) {
-        return error_response(
-            "FILE_TOO_LARGE",
-            &format!("File is larger than the {} byte read limit", MAX_FILE_BYTES),
-            Some(&resolved.to_string_lossy()),
-            Some("Use lean_file_read on a smaller file, or search for it with lean_analyze_workspace first."),
-        );
+    let len = match stat_len(&resolved) {
+        Some(len) => len,
+        None => {
+            return error_response(
+                "FILE_NOT_FOUND",
+                "Path does not exist",
+                Some(&resolved.to_string_lossy()),
+                None,
+            );
+        }
+    };
+    if len > MAX_FILE_BYTES as u64 {
+        return too_large_response(&resolved);
     }
 
     // Read and split once, cached by (path, len, mtime) — see `doc_store`.
@@ -67,12 +73,10 @@ pub fn file_read(
     // works across every document kind instead of three per-kind paginations.
     let doc = match doc_store::ensure(&resolved, doc_store::UNIT_LINE, || {
         let text = std::fs::read_to_string(&resolved).map_err(|e| e.to_string())?;
-        let numbered: Vec<String> = py_splitlines(&text)
-            .iter()
-            .enumerate()
-            .map(|(idx, l)| format!("{}: {}", idx + 1, l))
-            .collect();
-        Ok::<_, String>(Extraction::new(numbered, Vec::new()))
+        // Stored raw and numbered on serve (`display_*` in `doc_store`): the
+        // cache holds no `"N: "` prefixes, so it is smaller on disk and in
+        // memory, and extraction skips a `format!` per line.
+        Ok::<_, String>(Extraction::new(py_splitlines(&text), Vec::new()))
     }) {
         Ok((doc, _persisted)) => doc,
         Err(e) => {
@@ -84,11 +88,13 @@ pub fn file_read(
             )
         }
     };
-    let lines = &doc.units;
     let total_lines = doc.total_units;
 
     if let Some(q) = query.filter(|q| !q.trim().is_empty()) {
-        let result = filter_by_query(lines, Some(q), 50, 0);
+        // Score the numbered display forms — the same text pre-numbered
+        // records carried, so ranking (including its tie order) is unchanged.
+        let numbered = doc_store::display_all(&doc);
+        let result = filter_by_query(&numbered, Some(q), 50, 0);
         let message = result
             .no_match
             .then(|| format!("No direct matches for query '{q}'. Showing top section."));
@@ -127,11 +133,11 @@ pub fn file_read(
         .unwrap_or_else(|| start_line.saturating_add(FILE_PAGE_SIZE - 1));
     let actual_end = window_end.min(total_lines);
 
-    // Lines are stored already numbered, so the window is a plain slice.
-    let page: &[String] = if start_line <= actual_end && start_line <= total_lines {
-        &lines[start_line - 1..actual_end]
+    // Numbered on serve: only the served slice pays for its `"N: "` prefixes.
+    let page: Vec<String> = if start_line <= actual_end && start_line <= total_lines {
+        doc_store::display_range(&doc, start_line - 1, actual_end)
     } else {
-        &[]
+        Vec::new()
     };
     let has_more = actual_end < total_lines;
 
@@ -185,7 +191,9 @@ pub fn file_write(path: &str, content: &str, dry_run: bool) -> String {
             );
         }
     }
-    if let Err(e) = std::fs::write(&resolved, content) {
+    // Same-dir temp + rename (no fsync): a reader never sees a torn file,
+    // without paying the scratchpad's durability cost on every save.
+    if let Err(e) = doc_store::write_atomic(&resolved, content.as_bytes()) {
         return error_response(
             "FILE_WRITE_ERROR",
             &format!("Cannot write file: {e}"),
@@ -193,9 +201,16 @@ pub fn file_write(path: &str, content: &str, dry_run: bool) -> String {
             None,
         );
     }
+    // `content.len()` is O(1); the previous `split_whitespace().count()` paid
+    // a full extra scan over the just-written bytes for a cosmetic field.
     success_response(
-        json!({"path": resolved.to_string_lossy(), "words": content.split_whitespace().count()}),
-        Some("File written successfully."),
+        json!({"path": resolved.to_string_lossy(), "bytes": content.len()}),
+        // The read path already tells the model what to do next
+        // (`lean_doc_read_chunk` to continue); the write path said nothing at
+        // all, which left "save as you go" with no reinforcement anywhere the
+        // model actually looks. A long revision task that batches its writes
+        // to the end loses everything if it is interrupted.
+        Some("File saved. Save each piece of work as you finish it — don't batch writes to the end of a long task."),
         false,
         None,
     )
@@ -211,12 +226,14 @@ pub fn file_append(path: &str, content: &str, dry_run: bool) -> String {
             Some("Only paths inside your home directory can be accessed."),
         );
     }
-    if !resolved.exists() {
+    if stat_len(&resolved).is_none() {
         return error_response(
             "FILE_NOT_FOUND",
             "Path does not exist",
             Some(&resolved.to_string_lossy()),
-            None,
+            // Append cannot create the file, and nothing said so — which the
+            // natural "keep a running log" idiom hits on its very first call.
+            Some("Append only works on a file that already exists. Call lean_file_write once to create it, then append."),
         );
     }
     if dry_run {
@@ -227,11 +244,14 @@ pub fn file_append(path: &str, content: &str, dry_run: bool) -> String {
             None,
         );
     }
+    // Append stays an O(append-size) operation (no temp-file copy of the
+    // whole file): buffered so small log-style appends cost one syscall.
     use std::io::Write;
     let file = std::fs::OpenOptions::new().append(true).open(&resolved);
     match file {
-        Ok(mut f) => {
-            if let Err(e) = f.write_all(content.as_bytes()) {
+        Ok(f) => {
+            let mut f = std::io::BufWriter::new(f);
+            if let Err(e) = f.write_all(content.as_bytes()).and_then(|_| f.flush()) {
                 return error_response(
                     "FILE_WRITE_ERROR",
                     &format!("Cannot append to file: {e}"),
@@ -250,8 +270,8 @@ pub fn file_append(path: &str, content: &str, dry_run: bool) -> String {
         }
     }
     success_response(
-        json!({"path": resolved.to_string_lossy(), "appended_words": content.split_whitespace().count()}),
-        Some("Content appended successfully."),
+        json!({"path": resolved.to_string_lossy(), "appended_bytes": content.len()}),
+        Some("Appended and saved. Keep appending as you go so an interrupted task still leaves a record of what was done."),
         false,
         None,
     )
@@ -267,17 +287,9 @@ pub fn file_replace_str(path: &str, old_str: &str, new_str: &str, dry_run: bool)
             Some("Only paths inside your home directory can be accessed."),
         );
     }
-    if !resolved.exists() {
-        return error_response(
-            "FILE_NOT_FOUND",
-            "Path does not exist",
-            Some(&resolved.to_string_lossy()),
-            None,
-        );
-    }
     // An empty `old_str` is not "zero occurrences" — `str::matches("")` counts
     // every character boundary and `str::replace("", x)` inserts `x` between
-    // every character, which would corrupt the file. Reject before any read.
+    // every character, which would corrupt the file. Reject before any I/O.
     if old_str.is_empty() {
         return error_response(
             "INVALID_ARGUMENT",
@@ -286,7 +298,18 @@ pub fn file_replace_str(path: &str, old_str: &str, new_str: &str, dry_run: bool)
             Some("Provide a non-empty string to search for."),
         );
     }
-    if file_size_exceeds(&resolved) {
+    let len = match stat_len(&resolved) {
+        Some(len) => len,
+        None => {
+            return error_response(
+                "FILE_NOT_FOUND",
+                "Path does not exist",
+                Some(&resolved.to_string_lossy()),
+                None,
+            );
+        }
+    };
+    if len > MAX_FILE_BYTES as u64 {
         return error_response(
             "FILE_TOO_LARGE",
             &format!("File is larger than the {} byte read limit", MAX_FILE_BYTES),
@@ -305,7 +328,19 @@ pub fn file_replace_str(path: &str, old_str: &str, new_str: &str, dry_run: bool)
             )
         }
     };
-    let occurrences = file_text.matches(old_str).count();
+    // Single pass: count and rebuild together instead of `matches().count()`
+    // followed by `replace()` (two full scans). Non-overlapping left-to-right,
+    // exactly `str::replace`'s semantics.
+    let mut occurrences = 0usize;
+    let mut updated = String::with_capacity(file_text.len());
+    let mut rest = file_text.as_str();
+    while let Some(pos) = rest.find(old_str) {
+        occurrences += 1;
+        updated.push_str(&rest[..pos]);
+        updated.push_str(new_str);
+        rest = &rest[pos + old_str.len()..];
+    }
+    updated.push_str(rest);
     if occurrences == 0 {
         return error_response(
             "TARGET_NOT_FOUND",
@@ -324,8 +359,7 @@ pub fn file_replace_str(path: &str, old_str: &str, new_str: &str, dry_run: bool)
             None,
         );
     }
-    let updated = file_text.replace(old_str, new_str);
-    if let Err(e) = std::fs::write(&resolved, updated) {
+    if let Err(e) = doc_store::write_atomic(&resolved, updated.as_bytes()) {
         return error_response(
             "FILE_WRITE_ERROR",
             &format!("Cannot write file: {e}"),
@@ -359,15 +393,18 @@ pub fn file_replace_lines(
             Some("Only paths inside your home directory can be accessed."),
         );
     }
-    if !resolved.exists() {
-        return error_response(
-            "FILE_NOT_FOUND",
-            "Path does not exist",
-            Some(&resolved.to_string_lossy()),
-            None,
-        );
-    }
-    if file_size_exceeds(&resolved) {
+    let len = match stat_len(&resolved) {
+        Some(len) => len,
+        None => {
+            return error_response(
+                "FILE_NOT_FOUND",
+                "Path does not exist",
+                Some(&resolved.to_string_lossy()),
+                None,
+            );
+        }
+    };
+    if len > MAX_FILE_BYTES as u64 {
         return error_response(
             "FILE_TOO_LARGE",
             &format!("File is larger than the {} byte read limit", MAX_FILE_BYTES),
@@ -430,7 +467,7 @@ pub fn file_replace_lines(
     if had_trailing_newline && !lines.is_empty() {
         out.push_str(eol);
     }
-    if let Err(e) = std::fs::write(&resolved, out) {
+    if let Err(e) = doc_store::write_atomic(&resolved, out.as_bytes()) {
         return error_response(
             "FILE_WRITE_ERROR",
             &format!("Cannot write file: {e}"),

@@ -133,12 +133,11 @@ fn cached_pdf(resolved: &Path) -> Result<doc_store::StoredDoc, String> {
     }
 }
 
-/// True when the file's metadata size is past `PDF_MAX_FILE_BYTES` — the
-/// check that keeps giant PDFs from being loaded into memory at all.
-fn file_size_exceeds(resolved: &Path) -> bool {
-    std::fs::metadata(resolved)
-        .map(|m| m.len() > PDF_MAX_FILE_BYTES)
-        .unwrap_or(false)
+/// Single-stat existence + size probe: one `metadata()` answers "does it
+/// exist" and "is it over the cap" together instead of `exists()` plus a
+/// second stat.
+fn stat_len(resolved: &Path) -> Option<u64> {
+    std::fs::metadata(resolved).map(|m| m.len()).ok()
 }
 
 fn too_large(resolved: &Path) -> String {
@@ -169,14 +168,15 @@ fn outside_home(resolved: &Path) -> Option<String> {
 }
 
 /// Truncates `s` to at most `max_chars` characters, appending a `…` marker
-/// so truncation is visible in the payload.
+/// so truncation is visible in the payload. Slices at a character boundary
+/// without materializing the whole string as a `Vec<char>` first.
 fn truncate_chars(s: &str, max_chars: usize) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() <= max_chars {
+    // `nth(max_chars)` is the first char *past* the budget; `None` means the
+    // string holds at most `max_chars` characters and is returned as-is.
+    let Some((idx, _)) = s.char_indices().nth(max_chars) else {
         return s.to_string();
-    }
-    let kept: String = chars[..max_chars].iter().collect();
-    format!("{kept}…")
+    };
+    format!("{}…", &s[..idx])
 }
 
 pub fn pdf_read_text(
@@ -190,15 +190,18 @@ pub fn pdf_read_text(
     if let Some(err) = outside_home(&resolved) {
         return err;
     }
-    if !resolved.exists() {
-        return error_response(
-            "PDF_NOT_FOUND",
-            "PDF does not exist",
-            Some(&resolved.to_string_lossy()),
-            None,
-        );
-    }
-    if file_size_exceeds(&resolved) {
+    let len = match stat_len(&resolved) {
+        Some(len) => len,
+        None => {
+            return error_response(
+                "PDF_NOT_FOUND",
+                "PDF does not exist",
+                Some(&resolved.to_string_lossy()),
+                None,
+            );
+        }
+    };
+    if len > PDF_MAX_FILE_BYTES {
         return too_large(&resolved);
     }
 
@@ -239,14 +242,14 @@ pub fn pdf_read_text(
     let e_page = end_requested.min(capped_end);
     let truncated = end_requested > e_page || doc.extraction_truncated;
 
-    let extracted_pages: Vec<String> = if s_page <= e_page {
-        doc.units[(s_page - 1) as usize..e_page as usize].to_vec()
+    let extracted_pages: &[String] = if s_page <= e_page {
+        &doc.units[(s_page - 1) as usize..e_page as usize]
     } else {
-        Vec::new()
+        &[]
     };
 
     if let Some(q) = query.filter(|q| !q.trim().is_empty()) {
-        let result = filter_by_query(&extracted_pages, Some(q), 50, offset);
+        let result = filter_by_query(extracted_pages, Some(q), 50, offset);
         let message = result
             .no_match
             .then(|| format!("No direct matches for query '{q}'. Showing top section."));
@@ -310,15 +313,18 @@ pub fn pdf_read_outline(path: &str) -> String {
     if let Some(err) = outside_home(&resolved) {
         return err;
     }
-    if !resolved.exists() {
-        return error_response(
-            "PDF_NOT_FOUND",
-            "PDF does not exist",
-            Some(&resolved.to_string_lossy()),
-            None,
-        );
-    }
-    if file_size_exceeds(&resolved) {
+    let len = match stat_len(&resolved) {
+        Some(len) => len,
+        None => {
+            return error_response(
+                "PDF_NOT_FOUND",
+                "PDF does not exist",
+                Some(&resolved.to_string_lossy()),
+                None,
+            );
+        }
+    };
+    if len > PDF_MAX_FILE_BYTES {
         return too_large(&resolved);
     }
 

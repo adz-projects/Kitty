@@ -156,66 +156,130 @@ pub struct ShellRequest {
     pub dry_run: Option<bool>,
 }
 
+fn max_depth_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": ["integer", "null"],
+        "minimum": 1,
+        "maximum": 10,
+        "description": "Max recursion depth, 1-10. Omit for the default of 10, which is also the maximum — there is rarely a reason to set this."
+    })
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct AnalyzeWorkspaceRequest {
-    /// Directory (or file) to inspect. Defaults to ".".
+    /// Absolute path of the directory (or file) to inspect. Omit to use the
+    /// session's working directory.
     pub path: Option<String>,
-    /// Max recursion depth. Defaults to 10.
-    pub max_depth: Option<u32>,
+    // Hand-written schema rather than `Option<u32>`/`Option<i64>`, because
+    // schemars attaches a `format` to every sized integer — `"uint32"`,
+    // `"int64"` — next to `"type": ["integer","null"]`. Models read the pair
+    // as contradictory: an observed session talked itself into "requires
+    // max_depth as integer but the schema says uint32… maybe the JSON
+    // encoding made it a string" and burned several turns retrying a call
+    // that was never malformed. No validator in the chain (the daemon's
+    // `jsonschema` pass, serde, llama.cpp's grammar builder) uses `format`,
+    // so it was pure cost. `minimum`/`maximum` say the same thing in a form
+    // that is both accurate and enforceable. Still clamped in the handler —
+    // a schema is not a guarantee about what arrives.
+    #[schemars(schema_with = "max_depth_schema")]
+    pub max_depth: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct FileReadRequest {
+    /// Absolute path of the file to read.
     pub path: String,
+    /// First line to return, 1-indexed. Omit to start at the beginning.
     pub start_line: Option<i64>,
+    /// Last line to return, inclusive. Omit for one page from `start_line`.
     pub end_line: Option<i64>,
+    /// Return only lines containing this text, instead of a contiguous range.
     pub query: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct FileWriteRequest {
+    /// Absolute path to write. Parent directories must already exist; the
+    /// file is created if missing and REPLACED ENTIRELY if it exists.
     pub path: String,
+    /// The complete new contents of the file.
+    ///
+    /// Write each finished piece of work as you finish it rather than holding
+    /// results in your reply and saving everything at the end. Work that only
+    /// exists in the conversation is lost if the task is interrupted; work on
+    /// disk is not.
     pub content: String,
+    /// Report what would be written without writing it. Defaults to false.
     pub dry_run: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct FileAppendRequest {
+    /// Absolute path of an EXISTING file to append to. Appending to a file
+    /// that does not exist is an error — create it with `lean_file_write`
+    /// first, then append to it.
     pub path: String,
+    /// Text to add at the end of the file. Include your own leading newline
+    /// if you want the addition to start on a new line.
+    ///
+    /// This is the tool for a running log: append each step's outcome as you
+    /// go, so an interrupted task leaves a record of what was already done.
     pub content: String,
+    /// Report what would be appended without appending it. Defaults to false.
     pub dry_run: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct FileReplaceStrRequest {
+    /// Absolute path of the file to edit.
     pub path: String,
+    /// Exact text to find, including whitespace and indentation. Must match
+    /// the file byte for byte.
     pub old_str: String,
+    /// Text to put in its place. Every occurrence of `old_str` is replaced.
     pub new_str: String,
+    /// Report what would change without changing it. Defaults to false.
     pub dry_run: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct FileReplaceLinesRequest {
+    /// Absolute path of the file to edit.
     pub path: String,
+    /// First line to replace, 1-indexed and inclusive.
     pub start_line: i64,
+    /// Last line to replace, inclusive. Equal to `start_line` replaces one
+    /// line.
     pub end_line: i64,
+    /// Replacement text for that line range.
     pub new_content: String,
+    /// Report what would change without changing it. Defaults to false.
     pub dry_run: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct CacheFilenameRequest {
+    /// Name of a file in the scratch cache, as reported by
+    /// `lean_cache_list` — a bare filename, not a full path.
     pub filename: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ScratchpadSetRequest {
+    /// Short identifier to store this value under. Reusing a key overwrites
+    /// it. The scratchpad is shared across every chat, so prefix keys with
+    /// something specific to the task you are working on.
     pub key: String,
+    /// The value to remember. Survives restarts and crashes, so this is the
+    /// place to record progress on a long task — which items are done, what
+    /// is left — as you go rather than only at the end.
     pub value: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ScratchpadKeyRequest {
+    /// The key to act on, exactly as it was stored. `lean_scratchpad_list`
+    /// returns the keys currently set.
     pub key: String,
 }
 
@@ -560,6 +624,22 @@ fn guarded(f: impl FnOnce() -> String) -> String {
     }
 }
 
+/// Runs blocking tool work on the blocking pool instead of a tokio worker:
+/// every core tool is synchronous `std::fs` + parsing code, and awaiting it
+/// inline stalls the executor behind one big PDF or workbook while nothing
+/// else can run.
+async fn offload(f: impl FnOnce() -> String + Send + 'static) -> String {
+    match tokio::task::spawn_blocking(f).await {
+        Ok(s) => s,
+        Err(_) => error_response(
+            "INTERNAL_ERROR",
+            "The background task running this request failed.",
+            None,
+            Some("Retry the request; if this persists, restart the session."),
+        ),
+    }
+}
+
 /// One place to turn a failed `document_id` lookup into an envelope, so both
 /// chunk tools answer a stale handle identically.
 ///
@@ -598,8 +678,8 @@ impl KittyToolsServer {
         name = "lean_word_read_text",
         description = "Reads body text from a Word .docx, reaching paragraphs inside tables and text boxes. Supports offset-based pagination and keyword query filtering."
     )]
-    pub fn word_read_text(&self, Parameters(req): Parameters<WordReadTextRequest>) -> String {
-        guarded(move || {
+    pub async fn word_read_text(&self, Parameters(req): Parameters<WordReadTextRequest>) -> String {
+        offload(move || guarded(move || {
             let resolved = resolve(&req.path);
             if let Some(err) = outside_home(&resolved) {
                 return err;
@@ -668,7 +748,7 @@ impl KittyToolsServer {
 
             let limit = req.limit.unwrap_or(DEFAULT_PAGE_SIZE) as usize;
             let total = texts.len();
-            let (page, has_more) = doc_store::window(texts, offset, limit);
+            let (page, has_more) = doc_store::window_slice(texts, offset, limit);
             let mut metadata = json!({
                 "read_method": "xml_scan",
                 "document_id": doc.document_id,
@@ -692,22 +772,25 @@ impl KittyToolsServer {
                 None
             };
             success_response(json!(page), message.as_deref(), has_more, Some(metadata))
-        })
+        }))
+        .await
     }
 
     #[tool(
         name = "lean_doc_read_chunk",
         description = "Reads a window of an already-extracted document by its document_id, with no re-parsing. Use the document_id returned by lean_file_read, lean_word_read_text, lean_pdf_read_text or lean_pdf_read_outline to walk a long document instead of re-reading it by path."
     )]
-    pub fn doc_read_chunk(&self, Parameters(req): Parameters<DocReadChunkRequest>) -> String {
-        guarded(move || {
+    pub async fn doc_read_chunk(&self, Parameters(req): Parameters<DocReadChunkRequest>) -> String {
+        offload(move || guarded(move || {
             let doc = match doc_store::load(&req.document_id) {
                 Ok(d) => d,
                 Err(e) => return doc_load_error(&req.document_id, e),
             };
             let offset = req.offset.unwrap_or(0) as usize;
             let limit = req.limit.unwrap_or(DEFAULT_PAGE_SIZE) as usize;
-            let (page, has_more) = doc_store::window(&doc.units, offset, limit);
+            // Numbered on serve for raw-line records; legacy and non-line
+            // records pass through unchanged.
+            let (page, has_more) = doc_store::display_window(&doc, offset, limit);
 
             let mut metadata = json!({
                 "document_id": doc.document_id,
@@ -727,15 +810,16 @@ impl KittyToolsServer {
                 has_more || doc.extraction_truncated,
                 Some(metadata),
             )
-        })
+        }))
+        .await
     }
 
     #[tool(
         name = "lean_doc_search",
         description = "Keyword-searches the full text of an already-extracted document by its document_id, across the whole document rather than one page of it. Returns matching units with their positions."
     )]
-    pub fn doc_search(&self, Parameters(req): Parameters<DocSearchRequest>) -> String {
-        guarded(move || {
+    pub async fn doc_search(&self, Parameters(req): Parameters<DocSearchRequest>) -> String {
+        offload(move || guarded(move || {
             if req.query.trim().is_empty() {
                 return error_response(
                     "DOC_QUERY_EMPTY",
@@ -749,7 +833,10 @@ impl KittyToolsServer {
                 Err(e) => return doc_load_error(&req.document_id, e),
             };
             let offset = req.offset.unwrap_or(0) as usize;
-            let result = filter_by_query(&doc.units, Some(&req.query), 50, offset);
+            // Search scores the numbered display forms, matching what
+            // pre-numbered records carried before raw-line storage.
+            let numbered = doc_store::display_all(&doc);
+            let result = filter_by_query(&numbered, Some(&req.query), 50, offset);
             let message = result.no_match.then(|| {
                 format!(
                     "No direct matches for query '{}'. Showing top section.",
@@ -774,15 +861,16 @@ impl KittyToolsServer {
                 result.truncated || doc.extraction_truncated,
                 Some(metadata),
             )
-        })
+        }))
+        .await
     }
 
     #[tool(
         name = "lean_word_read_outline",
         description = "Returns the heading structure (levels 1-4) of a Word document, reaching headings inside tables and text boxes."
     )]
-    pub fn word_read_outline(&self, Parameters(req): Parameters<WordReadOutlineRequest>) -> String {
-        guarded(move || {
+    pub async fn word_read_outline(&self, Parameters(req): Parameters<WordReadOutlineRequest>) -> String {
+        offload(move || guarded(move || {
             let resolved = resolve(&req.path);
             if let Some(err) = outside_home(&resolved) {
                 return err;
@@ -820,15 +908,16 @@ impl KittyToolsServer {
                 false,
                 Some(json!({"read_method": "xml_scan"})),
             )
-        })
+        }))
+        .await
     }
 
     #[tool(
         name = "lean_word_write_doc",
         description = "Writes a new Word document or appends to an existing one, from markdown-lite text (headings, lists, tables, bold/italic, and [label](url) hyperlinks), with WCAG accessibility structures."
     )]
-    pub fn word_write_doc(&self, Parameters(req): Parameters<WordWriteDocRequest>) -> String {
-        guarded(move || {
+    pub async fn word_write_doc(&self, Parameters(req): Parameters<WordWriteDocRequest>) -> String {
+        offload(move || guarded(move || {
             let resolved = resolve(&req.path);
             if let Some(err) = outside_home(&resolved) {
                 return err;
@@ -898,23 +987,24 @@ impl KittyToolsServer {
                     }
                 }
             }
-        })
+        }))
+        .await
     }
 
     #[tool(
         name = "lean_excel_inspect",
         description = "Returns sheet names, dimensions, and the header row for an Excel spreadsheet (.xlsx/.xls/.ods)."
     )]
-    pub fn excel_inspect(&self, Parameters(req): Parameters<ExcelInspectRequest>) -> String {
-        guarded(move || tools::excel::excel_inspect(&req.path))
+    pub async fn excel_inspect(&self, Parameters(req): Parameters<ExcelInspectRequest>) -> String {
+        offload(move || guarded(move || tools::excel::excel_inspect(&req.path))).await
     }
 
     #[tool(
         name = "lean_excel_read_rows",
         description = "Reads rows from an Excel spreadsheet (.xlsx/.xls/.ods) as structured JSON (or CSV). Supports sheet selection, a cell range, keyword query filtering, and offset pagination (default page size 500 rows)."
     )]
-    pub fn excel_read_rows(&self, Parameters(req): Parameters<ExcelReadRowsRequest>) -> String {
-        guarded(move || {
+    pub async fn excel_read_rows(&self, Parameters(req): Parameters<ExcelReadRowsRequest>) -> String {
+        offload(move || guarded(move || {
             tools::excel::excel_read_rows(
                 &req.path,
                 req.sheet.as_deref(),
@@ -923,15 +1013,16 @@ impl KittyToolsServer {
                 req.query.as_deref(),
                 req.offset.unwrap_or(0) as usize,
             )
-        })
+        }))
+        .await
     }
 
     #[tool(
         name = "lean_pdf_read_text",
         description = "Reads text from a PDF page-by-page. Supports page ranges, keyword query filtering, and offset pagination."
     )]
-    pub fn pdf_read_text(&self, Parameters(req): Parameters<PdfReadTextRequest>) -> String {
-        guarded(move || {
+    pub async fn pdf_read_text(&self, Parameters(req): Parameters<PdfReadTextRequest>) -> String {
+        offload(move || guarded(move || {
             tools::pdf::pdf_read_text(
                 &req.path,
                 req.start_page,
@@ -939,161 +1030,180 @@ impl KittyToolsServer {
                 req.query.as_deref(),
                 req.offset.unwrap_or(0) as usize,
             )
-        })
+        }))
+        .await
     }
 
     #[tool(
         name = "lean_pdf_read_outline",
         description = "Returns the table-of-contents/bookmark outline of a PDF, if it has one."
     )]
-    pub fn pdf_read_outline(&self, Parameters(req): Parameters<PdfReadOutlineRequest>) -> String {
-        guarded(move || tools::pdf::pdf_read_outline(&req.path))
+    pub async fn pdf_read_outline(&self, Parameters(req): Parameters<PdfReadOutlineRequest>) -> String {
+        offload(move || guarded(move || tools::pdf::pdf_read_outline(&req.path))).await
     }
 
     #[tool(
         name = "lean_analyze_workspace",
         description = "Lists files and folders under path (or returns metadata if path is a file)."
     )]
-    pub fn analyze_workspace(
+    pub async fn analyze_workspace(
         &self,
         Parameters(req): Parameters<AnalyzeWorkspaceRequest>,
     ) -> String {
-        guarded(move || {
-            tools::workspace::analyze_workspace(req.path.as_deref().unwrap_or("."), req.max_depth)
+        offload(move || {
+            guarded(move || {
+                tools::workspace::analyze_workspace(req.path.as_deref().unwrap_or("."), req.max_depth)
+            })
         })
+        .await
     }
 
     #[tool(
         name = "lean_file_read",
         description = "Reads lines from a text file with line numbers. Supports query filtering."
     )]
-    pub fn file_read(&self, Parameters(req): Parameters<FileReadRequest>) -> String {
-        guarded(move || {
-            tools::fs::file_read(
-                &req.path,
-                req.start_line,
-                req.end_line,
-                req.query.as_deref(),
-            )
+    pub async fn file_read(&self, Parameters(req): Parameters<FileReadRequest>) -> String {
+        offload(move || {
+            guarded(move || {
+                tools::fs::file_read(
+                    &req.path,
+                    req.start_line,
+                    req.end_line,
+                    req.query.as_deref(),
+                )
+            })
         })
+        .await
     }
 
     #[tool(
         name = "lean_file_write",
         description = "Overwrites (or creates) a text file with the given content."
     )]
-    pub fn file_write(&self, Parameters(req): Parameters<FileWriteRequest>) -> String {
-        guarded(move || {
-            tools::fs::file_write(&req.path, &req.content, req.dry_run.unwrap_or(false))
+    pub async fn file_write(&self, Parameters(req): Parameters<FileWriteRequest>) -> String {
+        offload(move || {
+            guarded(move || {
+                tools::fs::file_write(&req.path, &req.content, req.dry_run.unwrap_or(false))
+            })
         })
+        .await
     }
 
     #[tool(
         name = "lean_file_append",
         description = "Appends content to the end of an existing text file."
     )]
-    pub fn file_append(&self, Parameters(req): Parameters<FileAppendRequest>) -> String {
-        guarded(move || {
-            tools::fs::file_append(&req.path, &req.content, req.dry_run.unwrap_or(false))
+    pub async fn file_append(&self, Parameters(req): Parameters<FileAppendRequest>) -> String {
+        offload(move || {
+            guarded(move || {
+                tools::fs::file_append(&req.path, &req.content, req.dry_run.unwrap_or(false))
+            })
         })
+        .await
     }
 
     #[tool(
         name = "lean_file_replace_str",
         description = "Replaces exact string occurrences in a file."
     )]
-    pub fn file_replace_str(&self, Parameters(req): Parameters<FileReplaceStrRequest>) -> String {
-        guarded(move || {
-            tools::fs::file_replace_str(
-                &req.path,
-                &req.old_str,
-                &req.new_str,
-                req.dry_run.unwrap_or(false),
-            )
+    pub async fn file_replace_str(&self, Parameters(req): Parameters<FileReplaceStrRequest>) -> String {
+        offload(move || {
+            guarded(move || {
+                tools::fs::file_replace_str(
+                    &req.path,
+                    &req.old_str,
+                    &req.new_str,
+                    req.dry_run.unwrap_or(false),
+                )
+            })
         })
+        .await
     }
 
     #[tool(
         name = "lean_file_replace_lines",
         description = "Replaces a specific 1-indexed inclusive line range with new content."
     )]
-    pub fn file_replace_lines(
+    pub async fn file_replace_lines(
         &self,
         Parameters(req): Parameters<FileReplaceLinesRequest>,
     ) -> String {
-        guarded(move || {
-            tools::fs::file_replace_lines(
-                &req.path,
-                req.start_line,
-                req.end_line,
-                &req.new_content,
-                req.dry_run.unwrap_or(false),
-            )
+        offload(move || {
+            guarded(move || {
+                tools::fs::file_replace_lines(
+                    &req.path,
+                    req.start_line,
+                    req.end_line,
+                    &req.new_content,
+                    req.dry_run.unwrap_or(false),
+                )
+            })
         })
+        .await
     }
 
     #[tool(
         name = "lean_cache_list",
         description = "Lists files currently stored in the scratch cache directory with their sizes."
     )]
-    pub fn cache_list(&self) -> String {
-        guarded(tools::cache::cache_list)
+    pub async fn cache_list(&self) -> String {
+        offload(move || guarded(tools::cache::cache_list)).await
     }
 
     #[tool(
         name = "lean_cache_view",
         description = "Reads the text content of a file previously stored in the scratch cache directory."
     )]
-    pub fn cache_view(&self, Parameters(req): Parameters<CacheFilenameRequest>) -> String {
-        guarded(move || tools::cache::cache_view(&req.filename))
+    pub async fn cache_view(&self, Parameters(req): Parameters<CacheFilenameRequest>) -> String {
+        offload(move || guarded(move || tools::cache::cache_view(&req.filename))).await
     }
 
     #[tool(
         name = "lean_cache_delete",
         description = "Deletes a single file from the scratch cache directory."
     )]
-    pub fn cache_delete(&self, Parameters(req): Parameters<CacheFilenameRequest>) -> String {
-        guarded(move || tools::cache::cache_delete(&req.filename))
+    pub async fn cache_delete(&self, Parameters(req): Parameters<CacheFilenameRequest>) -> String {
+        offload(move || guarded(move || tools::cache::cache_delete(&req.filename))).await
     }
 
     #[tool(
         name = "lean_cache_clear",
         description = "Deletes every file in the scratch cache directory and returns how many were removed."
     )]
-    pub fn cache_clear(&self) -> String {
-        guarded(tools::cache::cache_clear)
+    pub async fn cache_clear(&self) -> String {
+        offload(move || guarded(tools::cache::cache_clear)).await
     }
 
     #[tool(
         name = "lean_scratchpad_set",
         description = "Stores a key/value pair in the persistent scratchpad for recall across turns."
     )]
-    pub fn scratchpad_set(&self, Parameters(req): Parameters<ScratchpadSetRequest>) -> String {
-        guarded(move || tools::scratchpad::scratchpad_set(&req.key, &req.value))
+    pub async fn scratchpad_set(&self, Parameters(req): Parameters<ScratchpadSetRequest>) -> String {
+        offload(move || guarded(move || tools::scratchpad::scratchpad_set(&req.key, &req.value))).await
     }
 
     #[tool(
         name = "lean_scratchpad_get",
         description = "Retrieves a previously stored scratchpad value by key."
     )]
-    pub fn scratchpad_get(&self, Parameters(req): Parameters<ScratchpadKeyRequest>) -> String {
-        guarded(move || tools::scratchpad::scratchpad_get(&req.key))
+    pub async fn scratchpad_get(&self, Parameters(req): Parameters<ScratchpadKeyRequest>) -> String {
+        offload(move || guarded(move || tools::scratchpad::scratchpad_get(&req.key))).await
     }
 
     #[tool(
         name = "lean_scratchpad_delete",
         description = "Deletes a key from the persistent scratchpad."
     )]
-    pub fn scratchpad_delete(&self, Parameters(req): Parameters<ScratchpadKeyRequest>) -> String {
-        guarded(move || tools::scratchpad::scratchpad_delete(&req.key))
+    pub async fn scratchpad_delete(&self, Parameters(req): Parameters<ScratchpadKeyRequest>) -> String {
+        offload(move || guarded(move || tools::scratchpad::scratchpad_delete(&req.key))).await
     }
 
     #[tool(
         name = "lean_scratchpad_list",
         description = "Lists all keys currently stored in the persistent scratchpad."
     )]
-    pub fn scratchpad_list(&self) -> String {
-        guarded(tools::scratchpad::scratchpad_list)
+    pub async fn scratchpad_list(&self) -> String {
+        offload(move || guarded(tools::scratchpad::scratchpad_list)).await
     }
 }
 

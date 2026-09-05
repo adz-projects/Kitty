@@ -16,10 +16,45 @@ fn word_regex() -> &'static Regex {
 }
 
 fn words_lower(s: &str) -> HashSet<String> {
+    words_in_lowered(&s.to_lowercase())
+}
+
+fn words_in_lowered(lowered: &str) -> HashSet<String> {
     word_regex()
-        .find_iter(&s.to_lowercase())
+        .find_iter(lowered)
         .map(|m| m.as_str().to_string())
         .collect()
+}
+
+/// Stable score-descending indices of haystacks sharing at least one word
+/// with the query. Ties keep document order (built in index order + stable
+/// sort — do **not** sort ascending then reverse, which flips tie order).
+///
+/// Sound substring pre-filter: sharing a word implies containing it as a
+/// substring, so a haystack containing none of the query words as substrings
+/// scores 0 without paying for the regex + `HashSet` build. No false
+/// negatives — every skipped item would have scored 0 anyway.
+fn rank(haystacks: &[String], query_words: &HashSet<String>) -> Vec<usize> {
+    let mut scored: Vec<(usize, usize)> = Vec::new();
+    for (idx, item) in haystacks.iter().enumerate() {
+        let lowered = item.to_lowercase();
+        if !query_words.iter().any(|w| lowered.contains(w.as_str())) {
+            continue;
+        }
+        let score = words_in_lowered(&lowered)
+            .intersection(query_words)
+            .count();
+        if score > 0 {
+            scored.push((score, idx));
+        }
+    }
+
+    // Stable descending sort by score, ties keep document order. `Reverse`
+    // only flips the comparator (not the whole vec), so — unlike
+    // `sort_by_key(...); .reverse()`, which WOULD flip tie order — this
+    // stays correct.
+    scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+    scored.into_iter().map(|(_, idx)| idx).collect()
 }
 
 pub struct QueryFilterResult {
@@ -92,16 +127,9 @@ pub fn filter_by_query(
         };
     }
 
-    let mut scored: Vec<(usize, usize, &String)> = Vec::new();
-    for (idx, item) in items.iter().enumerate() {
-        let item_words = words_lower(item);
-        let score = query_words.intersection(&item_words).count();
-        if score > 0 {
-            scored.push((score, idx, item));
-        }
-    }
+    let ranked = rank(items, &query_words);
 
-    if scored.is_empty() {
+    if ranked.is_empty() {
         let (p, truncated, next_offset) = page(items, offset, max_results, items.len());
         return QueryFilterResult {
             items: p,
@@ -112,15 +140,10 @@ pub fn filter_by_query(
         };
     }
 
-    // Stable descending sort by score, ties keep document order. `Reverse`
-    // only flips the comparator (not the whole vec), so — unlike
-    // `sort_by_key(...); .reverse()`, which WOULD flip tie order — this
-    // stays correct.
-    scored.sort_by_key(|(score, _, _)| std::cmp::Reverse(*score));
-    let total_matches = scored.len();
-    let ordered: Vec<String> = scored
+    let total_matches = ranked.len();
+    let ordered: Vec<String> = ranked
         .into_iter()
-        .map(|(_, _, item)| item.clone())
+        .map(|idx| items[idx].clone())
         .collect();
     let (p, truncated, next_offset) = page(&ordered, offset, max_results, total_matches);
     QueryFilterResult {
@@ -130,6 +153,62 @@ pub fn filter_by_query(
         next_offset,
         no_match: false,
     }
+}
+
+/// Index-based sibling of `filter_by_query` for callers whose haystacks are
+/// not the payload (e.g. Excel rows: plain-text haystacks for scoring, JSON
+/// objects for output). Same ranking, same pagination — only the mapping
+/// from rank to value differs, so results stay identical while the caller
+/// clones just the returned page instead of every scanned row.
+pub fn filter_indices(
+    haystacks: &[String],
+    query: &str,
+    max_results: usize,
+    offset: usize,
+) -> (Vec<usize>, bool, usize, Option<usize>, bool) {
+    // Punctuation-only query: verbatim page, mirroring `filter_by_query`'s
+    // empty-word early return rather than reporting no match.
+    let query_words = words_lower(query.trim());
+    if query_words.is_empty() {
+        let total = haystacks.len();
+        let end = offset.saturating_add(max_results).min(total);
+        let start = offset.min(total);
+        let has_more = end < total;
+        return (
+            (start..end).collect(),
+            has_more,
+            total,
+            has_more.then(|| end),
+            false,
+        );
+    }
+    let ranked = rank(haystacks, &query_words);
+    if ranked.is_empty() {
+        let total = haystacks.len();
+        let end = offset.saturating_add(max_results).min(total);
+        let start = offset.min(total);
+        let idx: Vec<usize> = (start..end).collect();
+        let has_more = end < total;
+        return (
+            idx,
+            has_more,
+            0,
+            has_more.then(|| end),
+            true,
+        );
+    }
+    let total_matches = ranked.len();
+    let end = offset.saturating_add(max_results).min(total_matches);
+    let start = offset.min(total_matches);
+    let idx: Vec<usize> = ranked[start..end].to_vec();
+    let has_more = end < total_matches;
+    (
+        idx,
+        has_more,
+        total_matches,
+        has_more.then(|| end),
+        false,
+    )
 }
 
 #[cfg(test)]

@@ -41,7 +41,7 @@ fn scoped_root(path: &str) -> std::path::PathBuf {
     resolved
 }
 
-pub fn analyze_workspace(path: &str, max_depth: Option<u32>) -> String {
+pub fn analyze_workspace(path: &str, max_depth: Option<i64>) -> String {
     let resolved = scoped_root(path);
     if !path_within_home(&resolved) {
         return error_response(
@@ -80,10 +80,13 @@ pub fn analyze_workspace(path: &str, max_depth: Option<u32>) -> String {
     }
 
     // Clamp a caller-supplied `max_depth` so a huge value can't walk
-    // arbitrarily deep — the default is already the ceiling.
+    // arbitrarily deep — the default is already the ceiling. Signed input
+    // (see `AnalyzeWorkspaceRequest::max_depth` for why), so the low end
+    // needs clamping too: a negative depth would otherwise wrap to an
+    // enormous `u32`.
     let depth = max_depth
-        .unwrap_or(WORKSPACE_MAX_DEPTH)
-        .min(WORKSPACE_MAX_DEPTH);
+        .unwrap_or(WORKSPACE_MAX_DEPTH as i64)
+        .clamp(1, WORKSPACE_MAX_DEPTH as i64) as u32;
     let mut found = Found::default();
     walk(&resolved, &resolved, 0, depth, &mut found);
     let Found {
