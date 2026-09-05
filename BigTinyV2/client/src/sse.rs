@@ -74,6 +74,16 @@ pub fn parse_frame(frame: &str) -> Option<Frame> {
 
     for line in frame.lines() {
         if let Some(rest) = line.strip_prefix("data:") {
+            // Newline-separated, which is what the SSE spec actually says.
+            // The previous bare concatenation silently welded the lines of a
+            // multi-line payload together, corrupting any value that
+            // legitimately spans them. BigTiny's own daemon emits single-line
+            // JSON so nothing hits this today -- but this is a published
+            // client crate, and its next consumer may not be talking to
+            // BigTiny.
+            if !data.is_empty() {
+                data.push('\n');
+            }
             data.push_str(rest.trim_start());
         } else if let Some(rest) = line.strip_prefix("id:") {
             id = rest.trim().parse::<u64>().ok();

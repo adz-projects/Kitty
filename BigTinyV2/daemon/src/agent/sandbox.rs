@@ -153,15 +153,22 @@ pub fn extract_candidate_paths(args: &Value) -> Vec<String> {
 static URL_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r#"[A-Za-z][A-Za-z0-9+.-]*://[^\s"']+"#).unwrap());
 
-/// Best-effort extraction of literal filesystem paths from a shell command string.
-fn extract_shell_paths(command: &str) -> Vec<String> {
-    let re = Regex::new(
+/// Quoted Windows paths, bare drive-letter paths, and relative paths.
+///
+/// `Lazy` like its three neighbours in this file. This was recompiled once
+/// per tool call, and a turn runs its tool calls concurrently, so every one
+/// of them paid to build the same regex from scratch.
+static SHELL_PATH_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
         r#""([A-Za-z]:[^"]+)"|'([A-Za-z]:[^']+)'|([A-Za-z]:[\\/][^\s"\']+)|(\.{0,2}/[^\s\"']+)"#,
     )
-    .unwrap();
+    .unwrap()
+});
 
+/// Best-effort extraction of literal filesystem paths from a shell command string.
+fn extract_shell_paths(command: &str) -> Vec<String> {
     let scrubbed = URL_RE.replace_all(command, " ");
-    re.captures_iter(&scrubbed)
+    SHELL_PATH_RE.captures_iter(&scrubbed)
         .filter_map(|caps| {
             caps.iter()
                 .skip(1)
