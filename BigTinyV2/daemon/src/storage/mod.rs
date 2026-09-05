@@ -295,6 +295,15 @@ pub async fn retention_sweep(pool: &SqlitePool) {
         Err(e) => tracing::warn!("retention: llm_timings prune failed: {e}"),
     }
 
+    // Expired response-cache rows. `get` already refuses to serve them, so
+    // this reclaims space rather than fixing correctness -- but nothing else
+    // deletes them, and a pipeline is exactly the workload that writes many.
+    match crate::provider::response_cache::prune_expired(pool).await {
+        Ok(n) if n > 0 => tracing::info!("retention: pruned {n} expired response_cache rows"),
+        Ok(_) => {}
+        Err(e) => tracing::warn!("retention: response_cache prune failed: {e}"),
+    }
+
     // Cap raw messages per session. Two guards make this safe to run blind:
     // only rows beyond the newest `MAX_MESSAGES_PER_SESSION` are considered,
     // and only rows at or below the session's compaction watermark — i.e.

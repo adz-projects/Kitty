@@ -88,7 +88,11 @@ fn parse_total_slots(body: &serde_json::Value) -> Option<u32> {
         // that it wants to be unreachable.
         return None;
     }
-    Some((raw as u32).min(MAX_PROBED))
+    // Clamp in `u64`, then narrow. The other order truncates first, so a
+    // server reporting a slot count at or above 2^32 wrapped to a small
+    // number -- or to zero, which `MAX_PROBED` would then have no chance to
+    // catch. Nonsense input should hit the ceiling, not slip under it.
+    Some(raw.min(MAX_PROBED as u64) as u32)
 }
 
 #[cfg(test)]
@@ -142,6 +146,20 @@ mod tests {
         assert_eq!(
             probe(&client, "http://127.0.0.1:1", "custom_openai").await,
             None
+        );
+    }
+
+    #[test]
+    fn an_absurd_slot_count_hits_the_ceiling_rather_than_wrapping() {
+        // Narrowing before clamping turned 2^32 into 0 and 2^32+4 into 4 --
+        // nonsense input slipping *under* the ceiling instead of into it.
+        assert_eq!(
+            parse_total_slots(&json!({"total_slots": 4_294_967_296u64})),
+            Some(MAX_PROBED)
+        );
+        assert_eq!(
+            parse_total_slots(&json!({"total_slots": u64::MAX})),
+            Some(MAX_PROBED)
         );
     }
 }

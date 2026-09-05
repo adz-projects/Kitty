@@ -111,7 +111,7 @@ pub async fn create(
     if let Some(parent) = body.parent_session_id.as_deref() {
         match sessions::is_owned_by(&state.db, parent, &identity.app_id).await {
             Ok(true) => {
-                if let Err(e) = sessions::set_parent(&state.db, &session_id, parent).await {
+                if let Err(e) = sessions::set_parent(&state.db, &session_id, parent, &identity.app_id).await {
                     tracing::warn!("failed to record parent session: {e}");
                 }
             }

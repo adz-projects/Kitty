@@ -22,7 +22,6 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::agent::context::stats::SessionStats;
 use crate::error::StorageError;
 use crate::server::events::{serialize_sse, SSEEvent, SSEEventType};
-use crate::server::replay::SharedReplay;
 use crate::storage::messages::{self, MessageRow};
 use crate::storage::apps::AppIdentity;
 use crate::storage::sessions;
@@ -198,6 +197,11 @@ pub async fn delete_session(
     // this the map keeps one entry per session that ever hit a provider
     // mismatch, for as long as the daemon runs.
     state.agent.forget_session(&id);
+    // The turn replay buffer is keyed by session id and reaped by nothing
+    // else: without this it outlives the session for the daemon's lifetime,
+    // and -- worse -- `GET /api/chat/{id}/stream` with a `Last-Event-ID` could
+    // still replay a deleted conversation's events back to a client.
+    state.replay.forget(&id);
     match sessions::delete_session_for_app(&state.db, &id, &identity.app_id).await {
         // `delete_session` returns the affected row count, and discarding it
         // meant a DELETE that matched nothing still answered `{"ok": true}` —

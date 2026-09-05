@@ -138,7 +138,12 @@ impl ReplayBuffers {
         let oldest = buf.events.front().map(|r| r.id);
 
         let truncated = match (last_id, oldest) {
-            (Some(last), Some(oldest)) => last + 1 < oldest,
+            // `last_id` comes straight off a client's `Last-Event-ID` header,
+            // so `u64::MAX` is reachable input, and `last + 1` panics on it in
+            // a debug build. Saturating there means "you are not behind",
+            // which is the right reading: an id above everything retained
+            // cannot be older than the oldest event held.
+            (Some(last), Some(oldest)) => last.checked_add(1).is_some_and(|n| n < oldest),
             _ => false,
         };
         let events: Vec<Recorded> = match last_id {
@@ -317,5 +322,20 @@ mod tests {
         assert!(b.since("never-seen", None).is_none());
         assert!(!b.is_live("never-seen"));
         assert_eq!(b.record("never-seen", &tool()), None);
+    }
+
+    #[test]
+    fn a_max_value_last_event_id_neither_panics_nor_reports_truncation() {
+        // `Last-Event-ID` is a client-supplied header, so `u64::MAX` is
+        // reachable input rather than a hypothetical. `last + 1` panicked on
+        // it in debug builds -- a remote client could stop a turn's resume
+        // path with one header.
+        let b = ReplayBuffers::new();
+        b.begin("s1");
+        b.record("s1", &tool());
+
+        let out = b.since("s1", Some(u64::MAX)).expect("buffer exists");
+        assert!(!out.truncated, "an id above everything held is not behind");
+        assert!(out.events.is_empty(), "nothing is newer than u64::MAX");
     }
 }

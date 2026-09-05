@@ -181,17 +181,29 @@ pub async fn owner_of(
 ///
 /// A tag, not a foreign key with cascade: deleting a parent must not silently
 /// delete the subagent transcripts, which are often the actual output.
+/// Scoped like every other mutation here: an app may only group *its own*
+/// sessions. Returns rows affected so a caller can tell a real update from a
+/// session it does not own -- which reads as "no such session", not as an
+/// error, per the 404-not-403 rule.
 pub async fn set_parent(
     pool: &SqlitePool,
     session_id: &str,
     parent_id: &str,
-) -> Result<(), StorageError> {
-    sqlx::query("UPDATE sessions SET parent_session_id = ? WHERE id = ?")
-        .bind(parent_id)
-        .bind(session_id)
-        .execute(pool)
-        .await?;
-    Ok(())
+    app_id: &str,
+) -> Result<u64, StorageError> {
+    let out = sqlx::query(
+        "UPDATE sessions SET parent_session_id = ? \
+         WHERE id = ? AND app_id = ? \
+           AND EXISTS (SELECT 1 FROM sessions p WHERE p.id = ? AND p.app_id = ?)",
+    )
+    .bind(parent_id)
+    .bind(session_id)
+    .bind(app_id)
+    .bind(parent_id)
+    .bind(app_id)
+    .execute(pool)
+    .await?;
+    Ok(out.rows_affected())
 }
 
 /// The children an app grouped under `parent_id`.

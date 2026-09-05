@@ -105,17 +105,28 @@ pub async fn mark_running(pool: &SqlitePool, id: &str) -> Result<(), StorageErro
     Ok(())
 }
 
-/// Move a job to a terminal state.
+/// Move a job that has not already finished to a terminal state.
+///
+/// Conditional, because the turn task and a `DELETE /api/jobs/{id}` race by
+/// construction: the cancel marks the row `cancelled` while the turn is still
+/// unwinding, and an unconditional write then relabelled it `succeeded`. The
+/// owner cancelled the job and was told it had completed.
+///
+/// The guard is "not already terminal" rather than "is running": `mark_running`
+/// can itself fail, and a turn that dies before it lands must still be able to
+/// record why. Only a state someone has already been told about is protected.
+///
+/// Returns rows affected, so a caller can tell a real transition from a no-op.
 pub async fn finish(
     pool: &SqlitePool,
     id: &str,
     status: &str,
     result: Option<&str>,
     error: Option<&str>,
-) -> Result<(), StorageError> {
-    sqlx::query(
+) -> Result<u64, StorageError> {
+    let out = sqlx::query(
         "UPDATE jobs SET status = ?, result = ?, error = ?, finished_at = datetime('now') \
-         WHERE id = ?",
+         WHERE id = ? AND status IN ('pending', 'running')",
     )
     .bind(status)
     .bind(result)
@@ -123,7 +134,7 @@ pub async fn finish(
     .bind(id)
     .execute(pool)
     .await?;
-    Ok(())
+    Ok(out.rows_affected())
 }
 
 /// Cancel a job this app owns, if it has not already finished.
@@ -165,6 +176,7 @@ pub async fn mark_interrupted_on_boot(pool: &SqlitePool) -> Result<u64, StorageE
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     async fn pool() -> SqlitePool {
@@ -274,5 +286,49 @@ mod tests {
         );
         // A negative limit must not read the whole table.
         assert!(!list_for_app(&pool, "app-a", None, -1).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn finishing_a_cancelled_job_does_not_resurrect_it_as_succeeded() {
+        // The detached turn task and `DELETE /api/jobs/{id}` race by
+        // construction: cancel lands while the turn is still unwinding, and
+        // the turn's own `finish` used to overwrite it. The owner cancelled
+        // the job and was then told it had completed.
+        let pool = pool().await;
+        create(&pool, "j1", "app-a", "s1", "prompt", None)
+            .await
+            .unwrap();
+        mark_running(&pool, "j1").await.unwrap();
+
+        assert_eq!(cancel_for_app(&pool, "j1", "app-a").await.unwrap(), 1);
+        let changed = finish(&pool, "j1", "succeeded", Some("done"), None)
+            .await
+            .unwrap();
+
+        assert_eq!(changed, 0, "finish overwrote a terminal state");
+        let job = get_for_app(&pool, "j1", "app-a").await.unwrap().unwrap();
+        assert_eq!(job.status, "cancelled");
+        assert!(job.result.is_none(), "a cancelled job reported a result");
+    }
+
+    #[tokio::test]
+    async fn a_turn_that_dies_before_mark_running_can_still_record_why() {
+        // The guard is "not already terminal", not "is running" --
+        // `mark_running` can itself fail, and a job that never got there must
+        // still be able to report its own failure rather than sitting
+        // `pending` forever.
+        let pool = pool().await;
+        create(&pool, "j2", "app-a", "s1", "prompt", None)
+            .await
+            .unwrap();
+
+        let changed = finish(&pool, "j2", "failed", None, Some("no provider"))
+            .await
+            .unwrap();
+        assert_eq!(changed, 1);
+        assert_eq!(
+            get_for_app(&pool, "j2", "app-a").await.unwrap().unwrap().status,
+            "failed"
+        );
     }
 }

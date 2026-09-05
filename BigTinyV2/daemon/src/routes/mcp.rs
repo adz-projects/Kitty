@@ -332,9 +332,10 @@ pub async fn update_server(
         let mut tx = conn.begin_with("BEGIN IMMEDIATE").await?;
         let existing = sqlx::query_as::<_, mcp_servers::MCPServerRow>(
             r#"SELECT id, name, transport, command, args, url, env, headers, enabled, timeout_s, status, error_message, created_at, updated_at
-               FROM mcp_servers WHERE id = ?"#,
+               FROM mcp_servers WHERE id = ? AND (app_id = ? OR app_id IS NULL)"#,
         )
         .bind(&id)
+        .bind(&identity.app_id)
         .fetch_optional(&mut *tx)
         .await?;
         let Some(existing) = existing else {
@@ -357,7 +358,7 @@ pub async fn update_server(
             r#"UPDATE mcp_servers SET
                name = ?1, transport = ?2, url = ?3, enabled = ?4,
                command = ?5, args = ?6, env = ?7, headers = ?8, timeout_s = ?9
-               WHERE id = ?10"#,
+               WHERE id = ?10 AND (app_id = ?11 OR app_id IS NULL)"#,
         )
         .bind(new_name)
         .bind(new_transport)
@@ -369,6 +370,7 @@ pub async fn update_server(
         .bind(new_headers)
         .bind(new_timeout_s)
         .bind(&id)
+        .bind(&identity.app_id)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;

@@ -24,16 +24,26 @@
 //! - **Errors and partial responses.** Caching a failure would make a transient
 //!   outage permanent for the length of the TTL.
 //!
+//! # Why the key is a cryptographic hash
+//!
+//! A hit here does not report a hint or a statistic — it *returns a response*
+//! in place of calling the model. So a colliding key does not degrade the
+//! cache, it answers one prompt with another prompt's reply, and does so
+//! looking exactly like success. The app id is inside the key rather than in a
+//! `WHERE` clause precisely so a private and a shared entry cannot collide by
+//! accident; that argument only holds if collisions are infeasible at all,
+//! which a 64-bit `DefaultHasher` does not give (birthday bound ~2^32).
+//! SHA-256 over a canonical encoding costs microseconds against a network
+//! round trip, and `sha2` is already a dependency.
+//!
 //! # A hit skips the queue entirely
 //!
 //! No provider permit is acquired for a cache hit. That is the whole point —
 //! a hit that queued behind live traffic would save the tokens but not the
 //! latency, which is most of what a pipeline is buying.
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
-
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 
 use crate::error::StorageError;
@@ -105,30 +115,50 @@ pub fn cache_key(
     sampling: &Value,
     response_schema: Option<&Value>,
 ) -> String {
-    let mut hasher = DefaultHasher::new();
+    let mut hasher = Sha256::new();
+
+    // Every field is length-prefixed and separated. Without that, two
+    // different inputs can serialize to the same byte stream -- a provider
+    // named "a" with model "bc" hashes identically to "ab" with "c" -- and
+    // that is a collision an ordinary configuration change could produce, not
+    // an adversarial one.
+    let mut field = |bytes: &[u8]| {
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    };
 
     // The tenancy boundary, in the key itself rather than in a WHERE clause:
     // a private entry and a shared one cannot collide even by accident.
-    if shared {
-        "__shared__".hash(&mut hasher);
-    } else {
-        app_id.hash(&mut hasher);
-    }
+    field(if shared { b"__shared__" } else { app_id.as_bytes() });
+    field(provider_id.as_bytes());
+    field(model.as_bytes());
 
-    provider_id.hash(&mut hasher);
-    model.hash(&mut hasher);
-    serde_json::to_string(messages).unwrap_or_default().hash(&mut hasher);
-    tools
-        .map(|t| serde_json::to_string(t).unwrap_or_default())
-        .unwrap_or_default()
-        .hash(&mut hasher);
-    sampling.to_string().hash(&mut hasher);
-    response_schema
-        .map(|s| s.to_string())
-        .unwrap_or_default()
-        .hash(&mut hasher);
+    // `serde_json` cannot fail on a `Value` -- it holds no non-finite floats,
+    // no non-string map keys, no cycles. `expect` rather than
+    // `unwrap_or_default`, because the old fallback silently hashed the empty
+    // string, which would have collapsed every failure onto one key and
+    // served whatever was cached there.
+    let json = |v: &Value| serde_json::to_vec(v).expect("a Value always serializes");
+    field(&json(&Value::Array(messages.to_vec())));
+    field(&tools.map(|t| json(&Value::Array(t.to_vec()))).unwrap_or_default());
+    field(&json(sampling));
+    field(&response_schema.map(json).unwrap_or_default());
 
-    format!("{:016x}", hasher.finish())
+    format!("{:x}", hasher.finalize())
+}
+
+/// Drop expired rows.
+///
+/// `get` already filters on `expires_at`, so a stale row is never *served* --
+/// but nothing deleted it either, and the table only grows. Run from the
+/// daily retention sweep rather than on its own timer: it is the same kind of
+/// work, wants the same "not during a turn" scheduling, and one sweep is
+/// easier to reason about than two.
+pub async fn prune_expired(pool: &SqlitePool) -> Result<u64, StorageError> {
+    let out = sqlx::query("DELETE FROM response_cache WHERE expires_at <= datetime('now')")
+        .execute(pool)
+        .await?;
+    Ok(out.rows_affected())
 }
 
 /// Look up a cached response, if it has not expired.
@@ -291,5 +321,67 @@ mod tests {
     fn the_default_directive_is_off() {
         // Chat nondeterminism is usually wanted; caching it would surprise.
         assert!(!CacheDirective::default().is_active());
+    }
+
+    #[test]
+    fn adjacent_fields_cannot_be_confused_for_one_another() {
+        // Without length prefixes, concatenation makes ("a","bc") and
+        // ("ab","c") the same byte stream -- a collision an ordinary rename
+        // could produce, not an adversarial one. And a collision here does not
+        // degrade the cache, it answers one prompt with another's reply.
+        let key = |provider: &str, model: &str| {
+            cache_key(
+                "app-a",
+                false,
+                provider,
+                model,
+                &[json!({"role": "user", "content": "hi"})],
+                None,
+                &json!({}),
+                None,
+            )
+        };
+        assert_ne!(key("a", "bc"), key("ab", "c"));
+    }
+
+    #[test]
+    fn an_app_cannot_collide_with_the_shared_pool_or_with_another_app() {
+        // The tenancy boundary is the key itself, so this is the assertion
+        // that the boundary exists at all.
+        let key = |app: &str, shared: bool| {
+            cache_key(
+                app,
+                shared,
+                "p",
+                "m",
+                &[json!({"role": "user", "content": "hi"})],
+                None,
+                &json!({}),
+                None,
+            )
+        };
+        assert_ne!(key("app-a", false), key("app-b", false));
+        assert_ne!(key("app-a", false), key("app-a", true));
+        assert_eq!(
+            key("app-a", true),
+            key("app-b", true),
+            "the shared pool is the same entry for everyone, by construction"
+        );
+    }
+
+    #[test]
+    fn the_key_is_a_full_sha256_and_is_stable() {
+        let key = cache_key(
+            "app-a",
+            false,
+            "p",
+            "m",
+            &[json!({"role": "user", "content": "hi"})],
+            None,
+            &json!({}),
+            None,
+        );
+        assert_eq!(key.len(), 64, "a truncated key is a weaker key");
+        assert!(key.chars().all(|c| c.is_ascii_hexdigit()));
     }
 }
