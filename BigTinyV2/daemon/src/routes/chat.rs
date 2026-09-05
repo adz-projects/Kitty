@@ -691,7 +691,7 @@ pub async fn approve_action(
             .hitl()
             .lock()
             .await
-            .persist_allow_rule(&tool_name)
+            .persist_allow_rule(&identity.app_id, &tool_name)
             .await;
     }
     Json(decision.to_dict()).into_response()

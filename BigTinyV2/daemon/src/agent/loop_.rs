@@ -1033,7 +1033,17 @@ impl AgentLoop {
             Some(rendered)
         });
 
-        let active_tools: Vec<ToolDefinition> = self.mcp.list_tools(None);
+        // Only this app's own MCP servers, plus the shared pool. An
+        // unresolvable owner falls through to `""`, which matches no private
+        // server and so yields the shared pool alone -- a scheduled run on an
+        // unexpected session keeps working with shared tools rather than
+        // either failing or seeing everyone's.
+        let tool_scope = crate::storage::sessions::owner_of(&self.pool, session_id)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let active_tools: Vec<ToolDefinition> = self.mcp.list_tools_for_app(&tool_scope);
 
         // The active provider's own `context_length` (Settings → Providers →
         // Advanced) wins over the daemon-wide `token_management.max_context_tokens`
@@ -2838,6 +2848,21 @@ impl AgentLoop {
             return err;
         }
 
+        // Which app owns this session, resolved once for the rest of the call:
+        // it scopes both the HITL rules consulted below and the tool registry
+        // dispatched into. A primary-key lookup against a WAL database, next
+        // to a tool call that will take orders of magnitude longer.
+        //
+        // An unresolvable owner falls through to `""`, which matches no app's
+        // private rules and no app's private servers -- so such a call gets
+        // the shared pool and full approval prompts, rather than either
+        // failing outright or inheriting someone else's consent.
+        let caller_app = crate::storage::sessions::owner_of(&self.pool, session_id)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+
         // Resolve the HITL decision without holding the shared mutex across
         // `check_tool_call`'s DB rule query: `check_tool_call_with_rules` is
         // synchronous, but the rule lookup itself is an `.await` on the pool —
@@ -2851,7 +2876,7 @@ impl AgentLoop {
                 let hitl = self.hitl.lock().await;
                 hitl.pool().clone()
             };
-            let rules = hitl_rules::list_rules_by_tool(&rules, &tool_name)
+            let rules = hitl_rules::list_rules_by_tool(&rules, &caller_app, &tool_name)
                 .await
                 .unwrap_or_default();
             let mut hitl = self.hitl.lock().await;
@@ -2975,7 +3000,13 @@ impl AgentLoop {
         } else {
             tool_args
         };
-        let result = self.mcp.execute_tool(&tool_name, &tool_args, None).await;
+        // Dispatch through the caller's own view of the registry, so a tool
+        // name shadowed across apps resolves to *this* app's server -- and a
+        // name only another app has resolves to nothing.
+        let result = self
+            .mcp
+            .execute_tool_for_app(&caller_app, &tool_name, &tool_args, None)
+            .await;
 
         let output = if result.is_error {
             format!("[Tool '{}' error: {}]", tool_name, result.content)

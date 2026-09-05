@@ -1279,21 +1279,21 @@ mod tests {
     async fn test_hitl_rule_crud() {
         let pool = get_test_pool().await;
 
-        hitl_rules::upsert_rule(&pool, "browser.click", Some(".*"), "reject")
+        hitl_rules::upsert_rule(&pool, "app-a", "browser.click", Some(".*"), "reject")
             .await
             .unwrap();
 
-        let list = hitl_rules::list_rules(&pool).await.unwrap();
+        let list = hitl_rules::list_rules(&pool, "app-a").await.unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].tool_name, "browser.click");
         assert_eq!(list[0].decision, "reject");
 
-        let by_tool = hitl_rules::list_rules_by_tool(&pool, "browser.click")
+        let by_tool = hitl_rules::list_rules_by_tool(&pool, "app-a", "browser.click")
             .await
             .unwrap();
         assert_eq!(by_tool.len(), 1);
 
-        let deleted = hitl_rules::delete_rule(&pool, list[0].id).await.unwrap();
+        let deleted = hitl_rules::delete_rule(&pool, "app-a", list[0].id).await.unwrap();
         assert_eq!(deleted, 1);
     }
 
@@ -1304,24 +1304,24 @@ mod tests {
         // Same (tool_name, args_pattern) recorded twice — e.g. a user
         // clicking "always allow" for the same tool more than once — must
         // update the one row, not pile up a second.
-        hitl_rules::upsert_rule(&pool, "shell.exec", None, "allow")
+        hitl_rules::upsert_rule(&pool, "app-a", "shell.exec", None, "allow")
             .await
             .unwrap();
-        hitl_rules::upsert_rule(&pool, "shell.exec", None, "always_allow")
+        hitl_rules::upsert_rule(&pool, "app-a", "shell.exec", None, "always_allow")
             .await
             .unwrap();
 
-        let rows = hitl_rules::list_rules_by_tool(&pool, "shell.exec")
+        let rows = hitl_rules::list_rules_by_tool(&pool, "app-a", "shell.exec")
             .await
             .unwrap();
         assert_eq!(rows.len(), 1, "expected one row, got {rows:?}");
         assert_eq!(rows[0].decision, "always_allow");
 
         // A different args_pattern for the same tool is a distinct rule.
-        hitl_rules::upsert_rule(&pool, "shell.exec", Some("^rm "), "reject")
+        hitl_rules::upsert_rule(&pool, "app-a", "shell.exec", Some("^rm "), "reject")
             .await
             .unwrap();
-        let rows = hitl_rules::list_rules_by_tool(&pool, "shell.exec")
+        let rows = hitl_rules::list_rules_by_tool(&pool, "app-a", "shell.exec")
             .await
             .unwrap();
         assert_eq!(rows.len(), 2);

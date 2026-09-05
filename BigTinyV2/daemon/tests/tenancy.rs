@@ -1655,3 +1655,247 @@ async fn a_second_send_still_conflicts_even_though_attaching_is_allowed() {
         "unexpected first send status: {first}"
     );
 }
+
+
+// ---------------------------------------------------------------------------
+// Extensions: an app's tools, its approvals, and its provider list
+//
+// Everything below covers ground the sweep above cannot reach, because it is
+// not route-shaped: the tool registry the agent loop advertises to the model,
+// the HITL rules it consults before running a call, and the rows written by
+// paths (recipes, schedules) that create sessions without an HTTP request.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn an_app_sees_only_its_own_and_shared_mcp_tools() {
+    // The registry is a flat namespace shared by every connected server --
+    // that is deliberate and load-bearing for prompt caching -- so ownership
+    // has to be enforced at listing rather than by mangling tool names.
+    let state = test_state().await;
+    state.mcp.register_for_test("srv-a", Some(APP_A), &["a_only"]);
+    state.mcp.register_for_test("srv-b", Some(APP_B), &["b_only"]);
+    state.mcp.register_for_test("srv-shared", None, &["shared_tool"]);
+
+    let names = |app: &str| -> Vec<String> {
+        state
+            .mcp
+            .list_tools_for_app(app)
+            .into_iter()
+            .map(|t| t.name)
+            .collect()
+    };
+
+    assert_eq!(names(APP_A), vec!["a_only", "shared_tool"]);
+    assert_eq!(names(APP_B), vec!["b_only", "shared_tool"]);
+}
+
+#[tokio::test]
+async fn another_apps_tool_is_reported_as_unknown_not_refused() {
+    // "Unknown tool", not "forbidden": a distinct refusal would confirm that
+    // app B has a server by that name, which is the same disclosure the 404
+    // rule avoids on session routes.
+    let state = test_state().await;
+    state.mcp.register_for_test("srv-b", Some(APP_B), &["b_only"]);
+
+    let result = state
+        .mcp
+        .execute_tool_for_app(APP_A, "b_only", &json!({}), None)
+        .await;
+
+    assert!(result.is_error);
+    assert!(
+        result.content.contains("Unknown tool"),
+        "expected an unknown-tool result, got: {}",
+        result.content
+    );
+}
+
+#[tokio::test]
+async fn a_tool_from_a_disconnected_server_is_visible_to_nobody() {
+    // Ownership is recorded by a successful connect and dropped on eviction,
+    // so a registry entry with no ownership record means "not connected".
+    // That must read as invisible rather than as shared -- fail-closed is the
+    // right default for the map that decides whether A may call B's tools.
+    let state = test_state().await;
+    state.mcp.register_for_test("srv-a", Some(APP_A), &["orphan_tool"]);
+    state.mcp.forget_owner_for_test("srv-a");
+
+    assert!(state.mcp.list_tools_for_app(APP_A).is_empty());
+    let result = state
+        .mcp
+        .execute_tool_for_app(APP_A, "orphan_tool", &json!({}), None)
+        .await;
+    assert!(result.is_error);
+}
+
+#[tokio::test]
+async fn an_approval_granted_by_one_app_does_not_bind_another() {
+    // An `always_allow` rule records that *a particular app's user* agreed to
+    // let the model run a tool unsupervised. Applying it to a second app
+    // would widen a consent decision past the person who made it -- silently,
+    // and in the direction of running more code without asking.
+    use bigtiny2::storage::hitl_rules;
+
+    let state = test_state().await;
+    hitl_rules::upsert_rule(&state.db, APP_A, "shell.exec", None, "always_allow")
+        .await
+        .unwrap();
+
+    let for_a = hitl_rules::list_rules_by_tool(&state.db, APP_A, "shell.exec")
+        .await
+        .unwrap();
+    let for_b = hitl_rules::list_rules_by_tool(&state.db, APP_B, "shell.exec")
+        .await
+        .unwrap();
+
+    assert_eq!(for_a.len(), 1, "the granting app keeps its rule");
+    assert!(for_b.is_empty(), "app B inherited app A's approval");
+
+    // And the same rule id is not deletable from the other side.
+    let id = for_a[0].id;
+    assert_eq!(
+        hitl_rules::delete_rule(&state.db, APP_B, id).await.unwrap(),
+        0
+    );
+    assert_eq!(
+        hitl_rules::delete_rule(&state.db, APP_A, id).await.unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn status_reports_only_providers_the_caller_can_use() {
+    // A provider id names an endpoint someone configured, and its `error`
+    // text quotes that endpoint's own response. An unfiltered list handed
+    // every app a directory of everyone else's infrastructure.
+    let state = test_state().await;
+    let a_id = create_provider(state.clone(), APP_A, "a-private", false).await;
+    let b_id = create_provider(state.clone(), APP_B, "b-private", false).await;
+    let shared_id = create_provider(state.clone(), APP_A, "everyones", true).await;
+
+    let ids = |app: &str| {
+        let state = state.clone();
+        let app = app.to_string();
+        async move {
+            let req = Request::builder()
+                .uri("/api/status")
+                .body(Body::empty())
+                .unwrap();
+            let body = body_json(router_as(state, &app).oneshot(req).await.unwrap()).await;
+            body["providers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p["id"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        }
+    };
+
+    let a = ids(APP_A).await;
+    assert!(a.contains(&a_id));
+    assert!(a.contains(&shared_id), "a shared provider stays visible");
+    assert!(!a.contains(&b_id), "app B's private provider leaked to A");
+
+    let b = ids(APP_B).await;
+    assert!(!b.contains(&a_id), "app A's private provider leaked to B");
+}
+
+#[tokio::test]
+async fn a_recipe_run_produces_a_session_owned_by_the_recipes_app() {
+    // The recipe engine created its session with no `app_id` at all, so the
+    // row carried migration 017's `''` placeholder: invisible to the very app
+    // that asked for the run, and with no app whose default provider to use.
+    use bigtiny2::storage::recipes;
+
+    let state = test_state().await;
+    recipes::create_recipe(
+        &state.db,
+        "r1",
+        "Recipe One",
+        "say {{ thing }}",
+        None,
+        10,
+        APP_A,
+    )
+    .await
+    .unwrap();
+
+    // The turn itself fails -- there is no provider -- but the session row is
+    // written before the turn runs, which is the part under test.
+    let _ = state
+        .recipe_engine
+        .execute("r1", json!({"thing": "hello"}))
+        .await;
+
+    let owners: Vec<String> =
+        sqlx::query_scalar("SELECT app_id FROM sessions WHERE name = 'Recipe One'")
+            .fetch_all(&state.db)
+            .await
+            .unwrap();
+    assert_eq!(owners, vec![APP_A.to_string()], "recipe session is unowned");
+}
+
+#[tokio::test]
+async fn no_table_that_requires_an_owner_holds_an_unowned_row() {
+    // The companion to `the_empty_app_id_placeholder_is_unreachable`: that
+    // test proves a planted `''` row stays invisible, this one proves the
+    // daemon does not create them. Exercising the paths that write these
+    // tables and then sweeping for the placeholder is what turns "no code
+    // path may produce ''" from a comment into an assertion.
+    use bigtiny2::storage::{hitl_rules, recipes, schedules};
+
+    let state = test_state().await;
+    create_session(state.clone(), APP_A).await;
+    recipes::create_recipe(&state.db, "r1", "R", "p", None, 10, APP_A)
+        .await
+        .unwrap();
+    schedules::create_schedule(&state.db, "s1", "S", "0 0 * * *", "r1", 1, APP_A)
+        .await
+        .unwrap();
+    hitl_rules::upsert_rule(&state.db, APP_A, "shell.exec", None, "always_allow")
+        .await
+        .unwrap();
+    let _ = state.recipe_engine.execute("r1", json!({})).await;
+
+    for table in ["sessions", "recipes", "schedule_jobs", "hitl_rules"] {
+        let orphans: i64 =
+            sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table} WHERE app_id = ''"))
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+        assert_eq!(orphans, 0, "{table} holds a row with no owner");
+    }
+}
+
+#[tokio::test]
+async fn an_app_id_that_would_escape_the_data_dir_is_refused() {
+    // `app_id` becomes a path segment -- `PluginHost` opens
+    // `<data_dir>/apps/<app_id>/pathway.db`, and `scoped_env` derives that
+    // app's `KITTY_PLUGIN_HOME` the same way -- so it has to be safe as a
+    // directory name before it is safe as an identifier.
+    let state = test_state().await;
+    for bad in [
+        "../escape",
+        "..",
+        "a/b",
+        "a\\b",
+        "Has-Capitals",
+        "-leading-dash",
+        "with space",
+    ] {
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/apps/register")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({"app_id": bad, "display_name": "X"}).to_string(),
+            ))
+            .unwrap();
+        let status = router_as(state.clone(), APP_A).oneshot(req).await.unwrap().status();
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "app_id {bad:?} was accepted"
+        );
+    }
+}

@@ -10,16 +10,28 @@ pub type HITLRule = HITLRuleRow;
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct HITLRuleRow {
     pub id: i64,
+    pub app_id: String,
     pub tool_name: String,
     pub args_pattern: Option<String>,
     pub decision: String,
     pub created_at: Option<DateTime<Utc>>,
 }
 
-pub async fn list_rules(pool: &SqlitePool) -> Result<Vec<HITLRuleRow>, StorageError> {
+/// Every rule `app_id` recorded.
+///
+/// An approval decision is a statement about what *one app's* user agreed to
+/// let the model do on their behalf; applying it to another app's tool calls
+/// would silently widen a safety decision past the person who made it. So
+/// there is deliberately no unscoped listing function here.
+pub async fn list_rules(
+    pool: &SqlitePool,
+    app_id: &str,
+) -> Result<Vec<HITLRuleRow>, StorageError> {
     let rows = sqlx::query_as::<_, HITLRuleRow>(
-        r#"SELECT id, tool_name, args_pattern, decision, created_at FROM hitl_rules ORDER BY id ASC"#
+        r#"SELECT id, app_id, tool_name, args_pattern, decision, created_at
+           FROM hitl_rules WHERE app_id = ? ORDER BY id ASC"#,
     )
+    .bind(app_id)
     .fetch_all(pool)
     .await?;
     Ok(rows)
@@ -27,11 +39,14 @@ pub async fn list_rules(pool: &SqlitePool) -> Result<Vec<HITLRuleRow>, StorageEr
 
 pub async fn list_rules_by_tool(
     pool: &SqlitePool,
+    app_id: &str,
     tool_name: &str,
 ) -> Result<Vec<HITLRuleRow>, StorageError> {
     let rows = sqlx::query_as::<_, HITLRuleRow>(
-        r#"SELECT id, tool_name, args_pattern, decision, created_at FROM hitl_rules WHERE tool_name = ?"#
+        r#"SELECT id, app_id, tool_name, args_pattern, decision, created_at
+           FROM hitl_rules WHERE app_id = ? AND tool_name = ?"#,
     )
+    .bind(app_id)
     .bind(tool_name)
     .fetch_all(pool)
     .await?;
@@ -50,6 +65,7 @@ pub async fn list_rules_by_tool(
 /// resolve to the same effective policy.
 pub async fn upsert_rule(
     pool: &SqlitePool,
+    app_id: &str,
     tool_name: &str,
     args_pattern: Option<&str>,
     decision: &str,
@@ -65,8 +81,10 @@ pub async fn upsert_rule(
     let mut tx = conn.begin_with("BEGIN IMMEDIATE").await?;
 
     let existing: Option<i64> = sqlx::query_scalar(
-        r#"SELECT id FROM hitl_rules WHERE tool_name = ?1 AND args_pattern IS ?2"#,
+        r#"SELECT id FROM hitl_rules
+           WHERE app_id = ?1 AND tool_name = ?2 AND args_pattern IS ?3"#,
     )
+    .bind(app_id)
     .bind(tool_name)
     .bind(args_pattern)
     .fetch_optional(&mut *tx)
@@ -82,8 +100,10 @@ pub async fn upsert_rule(
         }
         None => {
             sqlx::query(
-                r#"INSERT INTO hitl_rules (tool_name, args_pattern, decision) VALUES (?, ?, ?)"#,
+                r#"INSERT INTO hitl_rules (app_id, tool_name, args_pattern, decision)
+                   VALUES (?, ?, ?, ?)"#,
             )
+            .bind(app_id)
             .bind(tool_name)
             .bind(args_pattern)
             .bind(decision)
@@ -96,9 +116,14 @@ pub async fn upsert_rule(
     Ok(())
 }
 
-pub async fn delete_rule(pool: &SqlitePool, rule_id: i64) -> Result<u64, StorageError> {
-    let result = sqlx::query(r#"DELETE FROM hitl_rules WHERE id = ?"#)
+pub async fn delete_rule(
+    pool: &SqlitePool,
+    app_id: &str,
+    rule_id: i64,
+) -> Result<u64, StorageError> {
+    let result = sqlx::query(r#"DELETE FROM hitl_rules WHERE id = ? AND app_id = ?"#)
         .bind(rule_id)
+        .bind(app_id)
         .execute(pool)
         .await?;
     Ok(result.rows_affected())

@@ -362,7 +362,16 @@ pub(crate) async fn execute_job(db: &SqlitePool, engine: &RecipeEngine, job_id: 
 
     let exec_id = uuid::Uuid::new_v4().simple().to_string();
     let temp_sid = format!("_job_{exec_id}");
-    if let Err(e) = sessions::create_session(db, &temp_sid, &format!("scheduled:{job_id}")).await {
+    // Owned by the app that owns the schedule -- see the recipe engine's
+    // session insert for why an ownerless session is worse than useless.
+    if let Err(e) = sessions::create_session_for_app(
+        db,
+        &temp_sid,
+        &format!("scheduled:{job_id}"),
+        &job.app_id,
+    )
+    .await
+    {
         // Previously `is_err() { return }` — a create failure (e.g. a rare
         // exec_id collision on the PK) silently dropped the whole tick with
         // no trace.

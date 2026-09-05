@@ -60,6 +60,19 @@ pub struct MCPManager {
     /// server, with only the second reachable and the first left running
     /// until process exit.
     connect_locks: DashMap<String, Arc<tokio::sync::Mutex<()>>>,
+    /// Which app owns each *connected* server: `Some(app_id)` for a private
+    /// server, `None` for one in the shared pool (`mcp_servers.app_id IS
+    /// NULL`), which every app may use.
+    ///
+    /// The registry itself stays flat and un-namespaced -- see the type-level
+    /// comment, which is load-bearing -- so ownership is tracked beside it
+    /// rather than encoded into tool names. Written in the same block that
+    /// installs a server's tools, so every entry in `tool_registry` has a
+    /// matching entry here; a *missing* entry therefore means the server is
+    /// not connected, and is treated as "not visible" rather than as shared.
+    /// Fail-closed is right for the one map that decides whether app A may
+    /// call app B's tools.
+    server_app: DashMap<String, Option<String>>,
     /// Consecutive failed reconnect attempts per server id, for the
     /// supervisor's exponential backoff. Cleared on a successful connect.
     reconnect_failures: DashMap<String, u32>,
@@ -90,6 +103,7 @@ impl MCPManager {
             servers: DashMap::new(),
             tool_registry: DashMap::new(),
             server_timeouts: DashMap::new(),
+            server_app: DashMap::new(),
             connect_locks: DashMap::new(),
             reconnect_failures: DashMap::new(),
             reconnect_after: DashMap::new(),
@@ -156,6 +170,11 @@ impl MCPManager {
                 // tools callable (routing to the stale client) after a code
                 // change or server-side tool removal.
                 self.prune_registry_for(server_id);
+                // Before the tools, not after: `list_tools_for_app` treats a
+                // registry entry with no ownership record as invisible, so a
+                // concurrent listing must never observe the tools first.
+                self.server_app
+                    .insert(server_id.to_string(), row.app_id.clone());
                 for tool in client.tools() {
                     self.tool_registry.insert(tool.name.clone(), tool.clone());
                 }
@@ -210,6 +229,7 @@ impl MCPManager {
     /// registry kept advertising tools that were no longer reachable.
     async fn evict_stale(&self, server_id: &str) {
         self.server_timeouts.remove(server_id);
+        self.server_app.remove(server_id);
         if let Some((_, client)) = self.servers.remove(server_id) {
             self.prune_registry_for(server_id);
             // `Arc::try_unwrap` recovers ownership of the client (needed for
@@ -371,6 +391,99 @@ impl MCPManager {
         };
         tools.sort_by(|a, b| a.name.cmp(&b.name));
         tools
+    }
+
+    /// Register a server and its tools without connecting anything.
+    ///
+    /// Ownership is otherwise only ever recorded by a successful connect,
+    /// which needs a real child process or endpoint. Cross-app visibility is
+    /// exactly the property that must be tested, so it needs a way in.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn register_for_test(
+        &self,
+        server_id: &str,
+        app_id: Option<&str>,
+        tool_names: &[&str],
+    ) {
+        self.server_app
+            .insert(server_id.to_string(), app_id.map(str::to_string));
+        for name in tool_names {
+            self.tool_registry.insert(
+                name.to_string(),
+                ToolDefinition {
+                    name: name.to_string(),
+                    description: String::new(),
+                    input_schema: serde_json::json!({"type": "object"}),
+                    server_id: server_id.to_string(),
+                },
+            );
+        }
+    }
+
+    /// Drop the ownership record for `server_id` while leaving its tools in
+    /// the registry -- the shape a mid-call eviction produces.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn forget_owner_for_test(&self, server_id: &str) {
+        self.server_app.remove(server_id);
+    }
+
+    /// Whether `app_id` may see and call `server_id`.
+    ///
+    /// Shared servers (`app_id IS NULL`) are visible to everyone -- a user
+    /// who configured one Anthropic key should not have to re-enter it per
+    /// app. A server owned by another app is treated exactly as one that does
+    /// not exist.
+    fn server_visible_to(&self, server_id: &str, app_id: &str) -> bool {
+        match self.server_app.get(server_id) {
+            Some(owner) => match owner.value() {
+                None => true,
+                Some(owner) => owner == app_id,
+            },
+            // Not connected (or evicted mid-call): nothing to authorize.
+            None => false,
+        }
+    }
+
+    /// The tools `app_id` may use: its own servers' plus the shared pool's.
+    ///
+    /// This is what the agent loop advertises to the model. Sorted by name for
+    /// the same prompt-prefix-caching reason as [`Self::list_tools`].
+    pub fn list_tools_for_app(&self, app_id: &str) -> Vec<ToolDefinition> {
+        let mut tools: Vec<ToolDefinition> = self
+            .tool_registry
+            .iter()
+            .filter(|e| self.server_visible_to(&e.value().server_id, app_id))
+            .map(|e| e.value().clone())
+            .collect();
+        tools.sort_by(|a, b| a.name.cmp(&b.name));
+        tools
+    }
+
+    /// [`Self::execute_tool`], but refusing to dispatch to a server `app_id`
+    /// cannot see.
+    ///
+    /// The registry is a flat namespace in which a later server shadows an
+    /// earlier one of the same name. That was harmless while one client owned
+    /// the daemon; with several, resolving a name to a server the caller
+    /// cannot see would let app A run app B's tool. Such a call is reported as
+    /// an unknown tool -- the same answer B's tool not existing would give, so
+    /// the response does not disclose that it exists.
+    pub async fn execute_tool_for_app(
+        &self,
+        app_id: &str,
+        tool_name: &str,
+        args: &Value,
+        timeout: Option<Duration>,
+    ) -> ToolResult {
+        let visible = self
+            .tool_registry
+            .get(tool_name)
+            .map(|e| self.server_visible_to(&e.value().server_id, app_id))
+            .unwrap_or(false);
+        if !visible {
+            return error_result(tool_name, format!("[Unknown tool: {tool_name}]"));
+        }
+        self.execute_tool(tool_name, args, timeout).await
     }
 
     /// Whether a tool name is currently registered (cheap `DashMap` lookup;

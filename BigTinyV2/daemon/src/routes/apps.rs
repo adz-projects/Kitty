@@ -47,6 +47,25 @@ pub async fn register(
     if app_id.len() > 64 {
         return err_response(StatusCode::BAD_REQUEST, "app_id must be 64 chars or fewer");
     }
+    // An app id becomes a path segment: `PluginHost` opens
+    // `<data_dir>/apps/<app_id>/pathway.db` and `scoped_env` derives that
+    // app's `KITTY_PLUGIN_HOME` the same way. Without a charset rule, `..`
+    // walks out of the data dir, and a separator or a NUL puts the database
+    // somewhere nobody intended. Restrict it to what is safe as both a
+    // directory name and an identifier on every platform the daemon runs on.
+    let shaped = app_id
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_' | '.'))
+        && app_id.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && app_id != "."
+        && app_id != ".."
+        && !app_id.contains("..");
+    if !shaped {
+        return err_response(
+            StatusCode::BAD_REQUEST,
+            "app_id must start with a lowercase letter or digit and contain only              lowercase letters, digits, '-', '_' and '.'",
+        );
+    }
 
     let api_key = generate_token();
     match apps::register_app(&state.db, app_id, &body.display_name, &api_key).await {

@@ -278,6 +278,14 @@ pub async fn list_sessions_page(
     Ok((rows, total))
 }
 
+/// Create a session with no owner.
+///
+/// Test-only. Every production path knows which app it is acting for and must
+/// use [`create_session_for_app`]; this one writes migration 017's `''`
+/// placeholder, producing a row no app can see. Gated rather than deleted
+/// because a large number of storage tests predate tenancy and do not care
+/// about it.
+#[cfg(test)]
 pub async fn create_session(
     pool: &SqlitePool,
     id: &str,

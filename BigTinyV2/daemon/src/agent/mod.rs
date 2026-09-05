@@ -508,6 +508,13 @@ impl Agent {
 
     /// Wake a tool call paused on `needs_approval` for `action_id`, after the
     /// caller has already recorded the decision via `hitl.record_decision`.
+    ///
+    /// Resolves by action id alone and performs no authorization of its own.
+    /// The caller must first establish that the action is pending for a
+    /// session the requester owns -- `routes::chat::approve_action` does this
+    /// with `deny_unless_owned` plus a `get_pending_approvals` membership
+    /// check, and any new caller must do the same. Waking another app's
+    /// paused tool call is a decision about *their* consent gate.
     pub fn resolve_approval(&self, action_id: &str) {
         if let Some((_, notify)) = self.hitl_notifies.remove(action_id) {
             notify.notify_one();

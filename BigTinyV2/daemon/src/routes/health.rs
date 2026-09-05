@@ -1,10 +1,12 @@
 use std::sync::Arc;
 
 use axum::extract::State;
+use axum::Extension;
 use axum::Json;
 use serde_json::{json, Value};
 
 use super::AppState;
+use crate::storage::apps::AppIdentity;
 
 /// `GET /api/health` — open, no auth, used by Kitty for readiness polling.
 ///
@@ -33,12 +35,21 @@ pub async fn check_health(State(state): State<Arc<AppState>>) -> Json<Value> {
 /// `ProviderRouter::check_all_health`'s `HEALTH_TTL_SECS`), and the per-
 /// provider status/latency/error it just computed (or reused) is now
 /// actually included below rather than discarded in favor of a bare id.
-pub async fn status(State(state): State<Arc<AppState>>) -> Json<Value> {
+pub async fn status(
+    State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<AppIdentity>,
+) -> Json<Value> {
     state.router.check_all_health().await;
     let providers: Vec<Value> = state
         .router
         .provider_health()
         .into_iter()
+        // Only what this app can actually use. A provider id names an
+        // endpoint someone configured -- often a hostname, sometimes a
+        // Tailscale node -- and its `error` text quotes the endpoint's own
+        // response, so an unfiltered list handed every app a directory of
+        // everyone else's infrastructure and how well it was working.
+        .filter(|(id, _)| state.router.is_visible_to(id, &identity.app_id))
         .map(|(id, health)| {
             json!({
                 "id": id,

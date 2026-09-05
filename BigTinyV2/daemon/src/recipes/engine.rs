@@ -41,7 +41,16 @@ impl RecipeEngine {
     /// Load `*.yaml`/`*.yml` recipe files from `directory` (or the
     /// configured default) into the `recipes` table via upsert-by-id.
     /// Malformed files are skipped with a warning, matching Python.
-    pub async fn load_recipes_from_directory(&self, directory: Option<&Path>) -> usize {
+    /// Load recipe files from disk as `app_id`'s recipes.
+    ///
+    /// A recipe file has no owner of its own, so one must be supplied: every
+    /// `recipes` row is `NOT NULL` on `app_id`, and there is no shared-recipe
+    /// concept the way there is a shared provider.
+    pub async fn load_recipes_from_directory(
+        &self,
+        app_id: &str,
+        directory: Option<&Path>,
+    ) -> usize {
         let target = directory
             .map(Path::to_path_buf)
             .unwrap_or_else(|| self.recipes_dir.clone());
@@ -74,7 +83,7 @@ impl RecipeEngine {
         entries.sort();
 
         for fpath in entries {
-            match self.load_one_recipe_file(&fpath).await {
+            match self.load_one_recipe_file(app_id, &fpath).await {
                 Ok(()) => count += 1,
                 Err(e) => tracing::warn!("Failed to load recipe {}: {}", fpath.display(), e),
             }
@@ -82,7 +91,7 @@ impl RecipeEngine {
         count
     }
 
-    async fn load_one_recipe_file(&self, fpath: &Path) -> Result<(), String> {
+    async fn load_one_recipe_file(&self, app_id: &str, fpath: &Path) -> Result<(), String> {
         let raw = std::fs::read_to_string(fpath).map_err(|e| e.to_string())?;
         let data: Value = serde_yaml::from_str(&raw).map_err(|e| e.to_string())?;
         let Some(obj) = data.as_object() else {
@@ -117,8 +126,8 @@ impl RecipeEngine {
         let max_steps = obj.get("max_steps").and_then(|v| v.as_i64()).unwrap_or(30);
 
         sqlx::query(
-            r#"INSERT INTO recipes (id, name, prompt_template, instructions, parameters, required_mcp_servers, system_prompt_layer, max_steps)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            r#"INSERT INTO recipes (id, name, prompt_template, instructions, parameters, required_mcp_servers, system_prompt_layer, max_steps, app_id)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                ON CONFLICT(id) DO UPDATE SET
                  name = excluded.name,
                  prompt_template = excluded.prompt_template,
@@ -137,6 +146,7 @@ impl RecipeEngine {
         .bind(required_servers.to_string())
         .bind(system_prompt_layer)
         .bind(max_steps)
+        .bind(app_id)
         .execute(&self.db)
         .await
         .map_err(|e| e.to_string())?;
@@ -183,10 +193,16 @@ impl RecipeEngine {
         }
 
         let session_id = uuid::Uuid::new_v4().simple().to_string();
-        sqlx::query("INSERT INTO sessions (id, name, metadata) VALUES (?1, ?2, ?3)")
+        // Owned by the app that owns the recipe. Without this the row carried
+        // migration 017's `''` placeholder, which no app can see -- so a
+        // recipe run produced a transcript that was invisible to its own
+        // caller, and `resolve_provider` fell back to the shared pool because
+        // the session had no app whose default to use.
+        sqlx::query("INSERT INTO sessions (id, name, metadata, app_id) VALUES (?1, ?2, ?3, ?4)")
             .bind(&session_id)
             .bind(&recipe.name)
             .bind(metadata.to_string())
+            .bind(&recipe.app_id)
             .execute(&self.db)
             .await
             .map_err(crate::error::StorageError::from)?;
@@ -197,7 +213,10 @@ impl RecipeEngine {
             .and_then(|s| serde_json::from_str(s).ok())
             .unwrap_or_default();
         for server_name in &required_servers {
-            if let Some(server_id) = self.find_server_id_by_name(server_name).await {
+            if let Some(server_id) = self
+                .find_server_id_by_name(&recipe.app_id, server_name)
+                .await
+            {
                 if let Err(e) = self.mcp.connect_server(&server_id).await {
                     tracing::warn!("Failed to connect MCP server '{server_name}': {e}");
                 }
@@ -215,14 +234,20 @@ impl RecipeEngine {
         Ok(session_id)
     }
 
-    async fn find_server_id_by_name(&self, name: &str) -> Option<String> {
-        sqlx::query("SELECT id FROM mcp_servers WHERE name = ?")
-            .bind(name)
-            .fetch_optional(&self.db)
-            .await
-            .ok()
-            .flatten()
-            .map(|row| row.get::<String, _>("id"))
+    /// The id of a server named `name` that `app_id` can see -- its own, or a
+    /// shared one. Names are unique per `(app_id, name)` (migration 017), so
+    /// two apps may each have a `kitty-tools`; a recipe must reach its own.
+    async fn find_server_id_by_name(&self, app_id: &str, name: &str) -> Option<String> {
+        sqlx::query(
+            "SELECT id FROM mcp_servers              WHERE name = ? AND (app_id = ? OR app_id IS NULL)              ORDER BY app_id IS NULL LIMIT 1",
+        )
+        .bind(name)
+        .bind(app_id)
+        .fetch_optional(&self.db)
+        .await
+        .ok()
+        .flatten()
+        .map(|row| row.get::<String, _>("id"))
     }
 }
 

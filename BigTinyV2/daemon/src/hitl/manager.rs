@@ -143,11 +143,12 @@ impl HITLManager {
     /// pre-fetched rules.
     pub async fn check_tool_call(
         &mut self,
+        app_id: &str,
         session_id: &str,
         tool_name: &str,
         args: &Value,
     ) -> HITLDecision {
-        let rules = hitl_rules::list_rules_by_tool(&self.pool, tool_name)
+        let rules = hitl_rules::list_rules_by_tool(&self.pool, app_id, tool_name)
             .await
             .unwrap_or_default();
         self.check_tool_call_with_rules(session_id, tool_name, args, &rules)
@@ -181,9 +182,16 @@ impl HITLManager {
             }
         }
 
-        // Check always-allow patterns
+        // Check always-allow patterns.
+        //
+        // Tool name only -- deliberately not `args_str`. Matching the
+        // serialized arguments meant any call whose *payload* happened to
+        // contain an allow-listed substring skipped approval entirely: a
+        // pattern of "read" would wave through a shell command whose text
+        // mentioned reading. Auto-reject above still matches both, because
+        // over-rejecting is a nuisance and over-allowing is a breach.
         for pattern in &self.config.always_allow_patterns {
-            if tool_name.contains(pattern.as_str()) || args_str.contains(pattern.as_str()) {
+            if tool_name.contains(pattern.as_str()) {
                 return HITLDecision {
                     action: "always_allow".to_string(),
                     reason: None,
@@ -208,11 +216,25 @@ impl HITLManager {
                     reason: None,
                     pending_action_id: None,
                 },
-                _ => HITLDecision {
-                    action: "proceed".to_string(),
-                    reason: None,
-                    pending_action_id: None,
-                },
+                // Fail CLOSED, matching `record_decision`'s catch-all. A
+                // decision string this code does not recognize is a rule it
+                // cannot honor; approving the call anyway turns an unreadable
+                // policy into a permissive one, which is the wrong direction
+                // for a gate whose whole job is to withhold consent.
+                other => {
+                    tracing::warn!(
+                        decision = other,
+                        tool_name,
+                        "unrecognized HITL rule decision; requiring approval"
+                    );
+                    HITLDecision {
+                        action: "needs_approval".to_string(),
+                        reason: Some(format!(
+                            "A stored rule for this tool has an unrecognized decision                              ('{other}'), so it cannot be applied automatically."
+                        )),
+                        pending_action_id: None,
+                    }
+                }
             };
         }
 
@@ -361,8 +383,10 @@ impl HITLManager {
     /// Persist an `always_allow` rule for `tool_name` — the DB half of a
     /// recorded `always_allow` decision, run by the caller AFTER releasing
     /// the shared mutex (see `record_decision`).
-    pub async fn persist_allow_rule(&self, tool_name: &str) {
-        if let Err(e) = hitl_rules::upsert_rule(&self.pool, tool_name, None, "always_allow").await {
+    pub async fn persist_allow_rule(&self, app_id: &str, tool_name: &str) {
+        if let Err(e) =
+            hitl_rules::upsert_rule(&self.pool, app_id, tool_name, None, "always_allow").await
+        {
             tracing::error!("Failed to insert always_allow rule: {}", e);
         }
     }
@@ -530,6 +554,7 @@ mod tests {
 
     fn rule_row(pattern: Option<&str>, decision: &str) -> hitl_rules::HITLRuleRow {
         hitl_rules::HITLRuleRow {
+            app_id: "app-a".to_string(),
             id: 0,
             tool_name: "tool".to_string(),
             args_pattern: pattern.map(|s| s.to_string()),
