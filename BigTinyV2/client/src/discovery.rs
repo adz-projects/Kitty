@@ -226,6 +226,30 @@ async fn spawn_and_wait(
         cmd.env(k, v);
     }
     cmd.env(paths::DATA_DIR_ENV, data_dir.as_os_str());
+
+    // The child inherits our stdio by default, so its tracing output lands in
+    // the consumer's stdout -- interleaved with their own, and corrupting any
+    // program whose stdout is structured (JSON, a progress bar, a pipe into
+    // another tool). A library must not do that to its caller.
+    //
+    // Sent to the daemon's own log file rather than discarded, so a failure to
+    // start is still diagnosable.
+    match std::fs::File::create(data_dir.join("daemon.log")) {
+        Ok(log) => {
+            let errors = match log.try_clone() {
+                Ok(handle) => std::process::Stdio::from(handle),
+                Err(_) => std::process::Stdio::null(),
+            };
+            cmd.stdout(std::process::Stdio::from(log)).stderr(errors);
+        }
+        Err(e) => {
+            tracing::warn!("could not open a daemon log ({e}); discarding its output");
+            cmd.stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+        }
+    }
+    cmd.stdin(std::process::Stdio::null());
+
     cmd.spawn()
         .map_err(|e| ClientError::NotFound(format!("{:?}: {e}", config.daemon_binary)))?;
 

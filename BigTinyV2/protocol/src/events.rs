@@ -26,48 +26,52 @@ pub enum SSEEventType {
 pub struct SSEEvent {
     #[serde(rename = "type")]
     pub event_type: SSEEventType,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_args: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_result: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action_id: Option<String>,
-    #[serde(skip_serializing_if = "is_false")]
+    #[serde(default, skip_serializing_if = "is_false")]
     pub is_last: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_code: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
-    #[serde(skip_serializing_if = "is_true")]
+    // `default_true`, not `default`: this field is omitted from the wire
+    // when it is `true`, so a missing value means true. Deriving `false`
+    // here would turn every ordinary recoverable error into a fatal one
+    // on the client side.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub recoverable: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_type: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttfb_ms: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttft_ms: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generation_ms: Option<f64>,
     /// Generation speed for this LLM call, computed daemon-side — see
     /// `agent::types::TimingResult::finalize_rate` for why the client must
     /// not derive it itself.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tokens_per_second: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_tokens: Option<i64>,
 }
 
@@ -77,6 +81,11 @@ fn is_false(b: &bool) -> bool {
 
 fn is_true(b: &bool) -> bool {
     *b
+}
+
+/// The default for `recoverable`, which is omitted from the wire when true.
+fn default_true() -> bool {
+    true
 }
 
 impl SSEEvent {
@@ -165,5 +174,36 @@ mod tests {
         let e = SSEEvent::stop("done", None);
         assert_eq!(e.event_type, SSEEventType::LlmStop);
         assert!(e.is_last);
+    }
+}
+
+#[cfg(test)]
+mod roundtrip_tests {
+    use super::*;
+
+    #[test]
+    fn an_event_deserializes_its_own_serialized_form() {
+        // The contract this crate exists to guarantee. `skip_serializing_if`
+        // without `default` omits a field on the way out and then *requires*
+        // it on the way in, so the daemon's own output would not parse in a
+        // client -- which is exactly the drift the shared crate prevents.
+        for event in [
+            SSEEvent::content("hello"),
+            SSEEvent::reasoning("thinking"),
+            SSEEvent::stop("done", None),
+            SSEEvent {
+                event_type: SSEEventType::ToolStart,
+                tool_name: Some("read_file".into()),
+                ..Default::default()
+            },
+        ] {
+            let wire = serialize_sse(&event);
+            let json = wire.trim_start_matches("data: ").trim();
+            let back: SSEEvent = serde_json::from_str(json)
+                .unwrap_or_else(|e| panic!("{:?} did not round-trip: {e}\n{json}", event.event_type));
+            assert_eq!(back.event_type, event.event_type);
+            assert_eq!(back.content, event.content);
+            assert_eq!(back.is_last, event.is_last);
+        }
     }
 }

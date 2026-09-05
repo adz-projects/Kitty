@@ -8,10 +8,15 @@
 //!
 //! Start at [`discovery::attach_or_spawn`].
 
+pub mod client;
 pub mod discovery;
+pub mod dispatcher;
 pub mod error;
 pub mod paths;
+pub mod sse;
 
+pub use client::{BigTinyClient, ProviderInfo};
+pub use dispatcher::{Dispatcher, Job, JobOutcome};
 pub use error::{ClientError, Result};
 
 /// The wire-contract version this client requires.
