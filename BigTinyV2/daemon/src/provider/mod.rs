@@ -5,6 +5,8 @@ pub mod queue;
 pub mod router;
 pub mod presets;
 pub mod sampling;
+pub mod response_cache;
+pub mod schema;
 pub mod slots;
 pub mod tag_split;
 

@@ -166,6 +166,66 @@ model is loaded regardless, and both new apps want vectors for retrieval.
 Ollama's `{"prompt": …}` shape is preserved verbatim; `{"input": [...]}` adds
 the batch form a pipeline needs.
 
+### Fair scheduling
+
+`ProviderQueue` replaces V1's per-provider semaphore. A semaphore is FIFO —
+right for one client, a starvation bug for several: against a one-slot endpoint
+an app that queues fifty turns puts fifty entries ahead of the next interactive
+message.
+
+- **Round-robin across apps**, so a wait is bounded by the *app count*, not the
+  queue depth.
+- **Interactive beats background** within an app.
+- **Work-conserving** — the fair share binds only while someone else is waiting,
+  so one app alone may still use every slot. Without this, the fix for
+  cross-app starvation would itself break subagent fan-out.
+
+Endpoint slot counts are **probed** (llama.cpp `/props`) rather than guessed,
+falling back to the dialect default. A user-set `parallel_slots` still wins.
+`GET /api/providers` reports `concurrency`, `in_flight`, `queue_depth`,
+`my_queue_depth` and `slots_source` so a client can pace itself.
+
+Daemon-internal work (compaction, the learn pass) queues in a reserved
+`__daemon__` lane: `SummarizerChain` implements a trait whose signature carries
+no identity, so it genuinely cannot name the app it serves.
+
+### Detached jobs and resumable streams
+
+`POST /api/jobs` submits a turn with no stream attached, so work survives its
+submitter going away. Jobs left `running` by a previous process become
+`interrupted` at boot — never re-queued, because a turn may have executed tools
+with side effects and silently repeating them is worse than stopping.
+
+`GET /api/chat/{id}/stream` rejoins a turn already in progress, resuming from
+`Last-Event-ID`. **This reverses an earlier decision** to skip SSE fan-out: that
+reasoning was about two clients *starting* work, where the per-session 409 is
+still correct, and says nothing about one client rejoining running work. A
+second send still 409s.
+
+Structural events are buffered unconditionally; text deltas stay best-effort,
+and a resuming client is *told* when text was lost rather than handed a silently
+incomplete transcript.
+
+### Structured output
+
+Per-dialect, because none of them agree: OpenAI takes `response_format`,
+Anthropic forces a single tool whose `input_schema` is the schema (tool-forcing
+*is* its mechanism, not a workaround), and self-hosted servers take the schema
+in `format`. The tool loop runs normally and the schema constrains only the
+final answer, so a turn can call tools and still return validated JSON.
+
+### Response cache
+
+Content-addressed, keyed on everything that can change a response. **Per-app by
+default**: serving app Y a response derived from app X's prompt would be a
+silent leak, so the app id is in the key rather than in a filter, and sharing is
+an explicit per-request opt-in. Never caches a turn that ran tools, an error, or
+a partial response. A hit acquires no queue permit — a hit that queued behind
+live traffic would save the tokens but not the latency.
+
+Distinct from the `cache` config, which is about prompt-*prefix* determinism for
+KV reuse. That makes the same call cheaper; this makes a repeat call free.
+
 ### Cross-session search
 
 `GET /api/search` exposes the FTS5 index that has existed since migration 009

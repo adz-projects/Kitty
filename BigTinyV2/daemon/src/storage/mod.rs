@@ -254,6 +254,14 @@ async fn bootstrap_legacy_python_schema(pool: &SqlitePool) -> Result<(), Storage
 pub async fn retention_sweep(pool: &SqlitePool) {
     let cutoff = format!("-{RETENTION_DAYS} days");
 
+    // Expired cache entries. Their own TTL governs them, so this is not
+    // subject to `RETENTION_DAYS` -- it only reclaims rows already dead.
+    match crate::provider::response_cache::sweep(pool).await {
+        Ok(n) if n > 0 => tracing::info!("retention: pruned {n} expired cache entries"),
+        Ok(_) => {}
+        Err(e) => tracing::warn!("retention: response_cache prune failed: {e}"),
+    }
+
     // Finished executions only — a `running` row belongs to a job that may
     // still be going (or that crashed, which is worth keeping visible).
     let executions = sqlx::query(

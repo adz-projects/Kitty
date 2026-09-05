@@ -180,6 +180,31 @@ fn compiled_validator(tool: &ToolDefinition) -> Option<Arc<jsonschema::Validator
     Some(validator)
 }
 
+/// Compiled validators for schemas that are not attached to a tool, keyed by
+/// the schema's own fingerprint.
+///
+/// Separate from `VALIDATOR_CACHE`, which is keyed by `(server_id, tool_name)`
+/// — a response schema has neither. Same reason for existing though: a
+/// pipeline sends the same schema thousands of times, and compiling it per
+/// request would dominate the cost of a small extraction.
+static SCHEMA_CACHE: Lazy<DashMap<u64, Arc<jsonschema::Validator>>> = Lazy::new(DashMap::new);
+
+/// A compiled validator for an arbitrary schema, or `None` if it will not
+/// compile.
+///
+/// Callers fail open on `None`, matching `validate_tool_args`. Note this must
+/// not use `jsonschema::validate`, which *panics* on a schema it cannot
+/// compile and would unwind the whole turn task.
+pub fn validator_for(schema: &Value) -> Option<Arc<jsonschema::Validator>> {
+    let fingerprint = schema_fingerprint(schema);
+    if let Some(hit) = SCHEMA_CACHE.get(&fingerprint) {
+        return Some(hit.clone());
+    }
+    let validator = Arc::new(jsonschema::validator_for(schema).ok()?);
+    SCHEMA_CACHE.insert(fingerprint, validator.clone());
+    Some(validator)
+}
+
 /// Validate `args` against a tool's JSON Schema (`input_schema`), mirroring
 /// Python's `validate_tool_args` — a no-op if the schema is empty/absent, and
 /// fails open (treats as valid) if the schema itself is malformed, matching
