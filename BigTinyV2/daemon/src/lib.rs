@@ -5,6 +5,7 @@ pub mod crypto;
 pub mod env_contract;
 pub mod error;
 pub mod hitl;
+pub mod import;
 #[cfg(feature = "litert-embed")]
 pub mod litert;
 pub mod mcp;

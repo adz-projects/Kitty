@@ -1,9 +1,13 @@
 # BigTiny backend
 
-Kitty is driven by **BigTiny** (the chat-first REST/SSE daemon, a pure-Rust
-crate in-tree at `plugins/bigtiny_rust/`) — its only chat backend. The goosed/ACP
-integration this app originally shipped with has been removed entirely; see
-`docs/ARCHITECTURE.md` for the current module map.
+Kitty is driven by **BigTiny**, the chat-first REST/SSE daemon — its only chat
+backend. The goosed/ACP integration this app originally shipped with has been
+removed entirely; see `docs/ARCHITECTURE.md` for the current module map.
+
+**Desktop runs BigTiny V2** (`BigTinyV2/daemon`, binary `bigtiny2-daemon`), a
+multi-app orchestrator that Kitty is one *client* of rather than the owner of.
+**Android still runs V1** (`plugins/bigtiny_rust/`) in-process and migrates
+separately. V1 stays in the tree, frozen and buildable, as the rollback path.
 
 ## Launching it
 
@@ -11,14 +15,14 @@ integration this app originally shipped with has been removed entirely; see
 control how the daemon is spawned:
 
 - **Normal installs**: `bigtiny_command` defaults to the bundled
-  `bigtiny-daemon.exe` (built via `plugins/build.py`, shipped next to
+  `bigtiny2-daemon.exe` (built via `plugins/build.py`, shipped next to
   Kitty's own exe through Tauri's `externalBin`) with empty `bigtiny_args`.
   Nothing to configure — this is fully internalized and never surfaced to
   the user.
 - **Dev / source checkout**: if no bundled exe is present (e.g. running via
   `cargo tauri dev`), `bigtiny_command` falls back to `cargo` and
-  `bigtiny_args` to a `run --quiet --manifest-path <repo>/plugins/
-  bigtiny_rust/Cargo.toml --bin bigtiny-daemon`. The manifest path is
+  `bigtiny_args` to a `run --quiet --manifest-path <repo>/BigTinyV2/
+  daemon/Cargo.toml --bin bigtiny2-daemon`. The manifest path is
   resolved from this crate's own compile-time location, so it is correct
   regardless of the working directory `cargo tauri dev` ran from. **No Python
   and no separate install step** — the daemon is Rust and builds from source.
@@ -29,9 +33,14 @@ control how the daemon is spawned:
 
 ## What the Rust layer does (src-tauri/src/bigtiny/)
 
-- **Lifecycle** (`lifecycle/bigtiny_proc.rs`): free port + random secret per
-  launch, passed as `BIGTINY_SECRET`; every request sends it back as
-  `X-API-Key`. Also passes `BIGTINY_DATA_DIR` (`config::bigtiny_data_dir()`)
+- **Lifecycle** (`lifecycle/bigtiny_v2.rs`): attach-or-spawn through
+  `bigtiny2-client`. No port is chosen here — the daemon binds an ephemeral one
+  and publishes it in `%APPDATA%\BigTinyV2\daemon.json`. No secret is minted
+  either: Kitty registers once as the app `kitty` and stores the issued key in
+  the Credential Manager, sending it as `X-API-Key` on every request. Nothing
+  kills a daemon; there is no pidfile and no stale-orphan sweep, because a
+  daemon Kitty finds may belong to another application. Readiness and the 5s
+  health loop still probe `GET /api/health` (open without auth by design). Also passes `BIGTINY_DATA_DIR` (`config::bigtiny_data_dir()`)
   pointing at `%APPDATA%/Kitty/bigtiny/` — consolidates BigTiny's own db,
   directory-sandbox cache dir, and recipes dir there instead of its
   standalone `~/.bigtiny` default; a one-time

@@ -24,7 +24,7 @@
       "binaries/kitty-wasm",
       "binaries/kitty-tools",
       "binaries/kitty-web",
-      "binaries/bigtiny-daemon"
+      "binaries/bigtiny2-daemon"
     ],
     "resources": [
       "resources/python-3.12.0.wasm",

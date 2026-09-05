@@ -548,7 +548,7 @@ impl Default for Config {
 }
 
 fn default_bigtiny_command() -> String {
-    bundled_plugin_path("bigtiny-daemon.exe").unwrap_or_else(|| "cargo".to_string())
+    bundled_plugin_path("bigtiny2-daemon.exe").unwrap_or_else(|| "cargo".to_string())
 }
 
 /// Empty when the bundled exe was found — it needs no extra args. Otherwise,
@@ -562,13 +562,13 @@ fn default_bigtiny_command() -> String {
 /// working directory, so it's correct regardless of where `cargo tauri dev`
 /// happens to be invoked from.
 fn default_bigtiny_args() -> Vec<String> {
-    if bundled_plugin_path("bigtiny-daemon.exe").is_some() {
+    if bundled_plugin_path("bigtiny2-daemon.exe").is_some() {
         Vec::new()
     } else {
         let manifest_path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("..")
-            .join("plugins")
-            .join("bigtiny_rust")
+            .join("BigTinyV2")
+            .join("daemon")
             .join("Cargo.toml");
         vec![
             "run".to_string(),
@@ -576,7 +576,7 @@ fn default_bigtiny_args() -> Vec<String> {
             "--manifest-path".to_string(),
             manifest_path.to_string_lossy().into_owned(),
             "--bin".to_string(),
-            "bigtiny-daemon".to_string(),
+            "bigtiny2-daemon".to_string(),
             "--".to_string(),
         ]
     }

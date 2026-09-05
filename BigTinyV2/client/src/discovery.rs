@@ -142,6 +142,15 @@ async fn validate(client: &reqwest::Client, handshake: &Handshake) -> Option<Str
 pub struct DiscoveryConfig {
     /// Path to the daemon binary, used only if we have to spawn one.
     pub daemon_binary: PathBuf,
+    /// Arguments placed *before* `--host`/`--port`, used only when spawning.
+    ///
+    /// Normally empty: a bundled daemon executable needs none. It exists for
+    /// the development shape where `daemon_binary` is a build tool rather than
+    /// the daemon itself -- `cargo run --manifest-path ... --bin
+    /// bigtiny2-daemon --` -- which a consumer otherwise could not express,
+    /// and without which running from a source checkout means building the
+    /// sidecar by hand first.
+    pub daemon_args: Vec<String>,
     /// Minimum wire-contract version this client can work with.
     pub min_api_version: u32,
     /// Extra environment for a spawned daemon (data dir overrides, model
@@ -221,6 +230,7 @@ async fn spawn_and_wait(
     // (`bind_reserved_port`), which needed a careful dance around holding the
     // listener open through setup to narrow a TOCTOU window. Letting the
     // daemon bind and then report removes that race rather than narrowing it.
+    cmd.args(&config.daemon_args);
     cmd.arg("--host").arg("127.0.0.1").arg("--port").arg("0");
     for (k, v) in &config.env {
         cmd.env(k, v);
@@ -249,6 +259,23 @@ async fn spawn_and_wait(
         }
     }
     cmd.stdin(std::process::Stdio::null());
+
+    // The daemon is a console-subsystem executable. Spawned from a GUI process
+    // (Kitty is a Tauri app, and any other frontend is likely windowed too),
+    // Windows allocates a console for it and a black window appears on screen
+    // and stays for the daemon's whole life. `CREATE_NO_WINDOW` suppresses
+    // that; stdio is already redirected to the daemon log above, so nothing is
+    // lost by having no console attached.
+    //
+    // Belongs here rather than in each consumer: every Windows GUI client that
+    // ever spawns a daemon needs it, and a missing flag is invisible in code
+    // review and glaring on screen.
+    #[cfg(windows)]
+    {
+        // `tokio::process::Command` exposes `creation_flags` itself on Windows.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
 
     cmd.spawn()
         .map_err(|e| ClientError::NotFound(format!("{:?}: {e}", config.daemon_binary)))?;

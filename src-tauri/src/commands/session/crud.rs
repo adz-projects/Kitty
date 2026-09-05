@@ -431,6 +431,15 @@ pub async fn rename_session(
 /// standalone destructive action, unrelated to provider switching). Also
 /// clears `session_folders` (app-side organization that can't refer to a
 /// now-deleted session) and the active-session pointer.
+///
+/// "Every session" now means *every session Kitty owns*, and that is enforced
+/// by the daemon rather than by this function being careful. `sessions::list`
+/// is `GET /api/chat/`, which is filtered by the caller's `app_id`, and each
+/// delete is ownership-checked and answers 404 for a session belonging to
+/// somebody else. Under V1 this genuinely did clear the whole daemon, which
+/// was harmless only because Kitty was the sole client; with a shared daemon
+/// it would have wiped another application's history from a Kitty settings
+/// toggle. The fix is the daemon's scoping, not a narrower loop here.
 #[tauri::command]
 pub async fn clear_all_sessions(app: AppHandle) -> Result<usize, String> {
     let sessions = crate::bigtiny::sessions::list(&app).await?;

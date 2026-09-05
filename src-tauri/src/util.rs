@@ -5,12 +5,24 @@ use std::path::Path;
 use std::process::{Child, Command};
 use std::sync::OnceLock;
 
+/// Child-process helpers, currently without a caller.
+///
+/// Kitty no longer spawns the BigTiny daemon -- `bigtiny2_client::discovery`
+/// does, and it applies the same two lessons these encode (`CREATE_NO_WINDOW`
+/// so a console-subsystem child does not pop a window out of a GUI app, and
+/// never decoding child stdio as strict UTF-8). They are kept rather than
+/// deleted because both cost real debugging to learn, the tests below pin the
+/// non-obvious half, and any future child process this app spawns wants
+/// exactly this. Delete them when something else proves they are not coming
+/// back.
+
 /// Read one line (up to and including `\n`, stripped) from `reader` as
 /// lossily-decoded UTF-8 — `None` at EOF. Reads raw bytes rather than using
 /// [`BufRead::lines`], whose strict UTF-8 decoding turns a single
 /// non-UTF8-encoded line (e.g. a child process whose stdio fell back to a
 /// legacy Windows codepage) into a permanent `Err` that silently ends the
 /// whole relay loop — see `capture_output`'s doc comment.
+#[allow(dead_code)]
 fn read_lossy_line(reader: &mut impl BufRead) -> Option<String> {
     let mut buf = Vec::new();
     match reader.read_until(b'\n', &mut buf) {
@@ -46,6 +58,7 @@ pub fn http_client() -> reqwest::Client {
 }
 
 /// Build a [`Command`] that does not flash a console window on Windows.
+#[allow(dead_code)]
 pub fn hidden_command(program: &Path) -> Command {
     // `mut` is only needed by the Windows arm below.
     #[cfg_attr(not(windows), allow(unused_mut))]
@@ -85,6 +98,7 @@ pub fn hidden_command(program: &Path) -> Command {
 /// report: continuous `OSError: [Errno 22] Invalid argument` "Logging error"
 /// spam from BigTiny once this happened). Lossy decoding never errors, so one
 /// bad line just renders with replacement characters instead of ending relay.
+#[allow(dead_code)]
 pub fn capture_output(child: &mut Child, tag: &'static str) {
     if let Some(stdout) = child.stdout.take() {
         std::thread::spawn(move || {

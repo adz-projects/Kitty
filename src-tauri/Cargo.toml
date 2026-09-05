@@ -78,6 +78,12 @@ winreg = "0.52"
 # store is `src/android/secrets.rs` over the AndroidKeyStore; having the crate
 # out of that target's graph entirely is what stops the mock coming back.
 keyring = { version = "3", features = ["windows-native"] }
+# Desktop talks to the BigTiny V2 daemon over HTTP through the shared client
+# crate -- discovery, the spawn lock, registration and SSE framing live there
+# so Kitty and the other frontends cannot drift apart. Deliberately NOT the
+# daemon crate: a desktop consumer speaking HTTP has no business linking sqlx,
+# rmcp and LiteRT. Android still links `bigtiny_rust` in-process (below).
+bigtiny2-client = { path = "../BigTinyV2/client" }
 tauri-plugin-single-instance = "2"
 # No OS-wide hotkey concept on mobile; the overlay-summon path this drives is
 # desktop-only (docs/ANDROID.md D9/D23).

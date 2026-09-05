@@ -54,6 +54,7 @@ from pathlib import Path
 TARGET_TRIPLE = "x86_64-pc-windows-msvc"
 
 PLUGINS_DIR = Path(__file__).resolve().parent
+ROOT_DIR = PLUGINS_DIR.parent
 REPO_ROOT = PLUGINS_DIR.parent
 BINARIES_DIR = REPO_ROOT / "src-tauri" / "binaries"
 BUILD_VENV_DIRNAME = ".build-venv"
@@ -114,8 +115,18 @@ PLUGINS: dict[str, dict[str, object]] = {
     # (`config::default_bigtiny_command`, `lifecycle::bigtiny_proc`) needs
     # no changes.
     "bigtiny": {
-        "dir": PLUGINS_DIR / "bigtiny_rust",
-        "exe": "bigtiny-daemon",
+        # BigTinyV2 (`BigTinyV2/daemon`), not `plugins/bigtiny_rust`. Desktop
+        # Kitty is now one client of a shared multi-app daemon rather than its
+        # owner -- see `src-tauri/src/lifecycle/bigtiny_v2.rs`. The V1 tree
+        # stays in the repo, frozen and buildable, because it is the rollback
+        # path and is still what Android links in-process.
+        #
+        # The exe name deliberately differs from V1's: both may sit on one
+        # machine during the migration, and a distinct name keeps
+        # `Get-Process` legible and makes any name-matching kill logic
+        # incapable of confusing them.
+        "dir": ROOT_DIR / "BigTinyV2" / "daemon",
+        "exe": "bigtiny2-daemon",
         "extras": [],
         "kind": "rust",
         # The in-process **LiteRT** engine (the llama.cpp `local-engine` it

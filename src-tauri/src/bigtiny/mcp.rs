@@ -283,6 +283,13 @@ const RETIRED_BUILTINS: &[&str] = &[
     "adaptive-pathway",
 ];
 
+/// Only ever reaches Kitty's own rows: `list_servers` is app-scoped and
+/// `delete_server` is ownership-checked daemon-side, so a name Kitty retired
+/// cannot match another application's server of the same name. That matters
+/// because these are *generic* names — another frontend could plausibly have
+/// its own "visualizations" — and matching by name across tenants would have
+/// deleted it. Migration 017's `UNIQUE(app_id, name)` is what lets two apps
+/// each own a server called the same thing in the first place.
 async fn remove_retired_builtins(client: &BigTinyClient) {
     let Some(existing) = list_servers_with_retry(client, "retired-builtins-cleanup").await else {
         return;

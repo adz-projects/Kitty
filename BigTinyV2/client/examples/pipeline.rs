@@ -28,6 +28,7 @@ async fn main() {
     // 1. Find a daemon, or start one. Never kills a daemon it did not prove
     //    dead, so running this alongside another app is safe.
     let located = match attach_or_spawn(&DiscoveryConfig {
+        daemon_args: Vec::new(),
         daemon_binary: daemon.into(),
         min_api_version: bigtiny2_client::MIN_API_VERSION,
         env: vec![],

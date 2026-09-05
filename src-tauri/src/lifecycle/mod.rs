@@ -16,6 +16,8 @@
 pub mod bigtiny_embedded;
 pub mod bigtiny_env;
 pub mod bigtiny_proc;
+#[cfg(not(target_os = "android"))]
+pub mod bigtiny_v2;
 pub(crate) mod embedding;
 pub mod engine_restart;
 mod health;
@@ -278,21 +280,27 @@ pub fn start_stack(app: &AppHandle) {
             )
             .await
         };
+        // Desktop attaches to a shared V2 daemon rather than spawning one it
+        // owns -- see `bigtiny_v2`. `args` and `dir` no longer apply: there is
+        // no bespoke command line when the daemon may already be running and
+        // was started by somebody else.
         #[cfg(not(target_os = "android"))]
-        let spawn_result = bigtiny_proc::spawn(
-            &command,
-            &args,
-            dir.as_deref(),
-            &summarizer,
-            &token_management,
-            &memory,
-            &local,
-            pathway_enabled,
-            &pathway_embedding_model,
-            &tokenizer_path,
-            Some(litert_lib_dir.as_str()),
-        )
-        .await;
+        let spawn_result = {
+            let _ = &dir;
+            bigtiny_v2::locate(
+                &command,
+                &args,
+                &summarizer,
+                &token_management,
+                &memory,
+                &local,
+                pathway_enabled,
+                &pathway_embedding_model,
+                &tokenizer_path,
+                Some(litert_lib_dir.as_str()),
+            )
+            .await
+        };
         match spawn_result {
             Ok(handle) => {
                 let (healthy, port) = (handle.healthy, handle.port);
@@ -356,13 +364,17 @@ pub fn start_stack(app: &AppHandle) {
 pub fn shutdown(app: &AppHandle) {
     let state = app.state::<AppState>();
     let mut bigtiny = state.bigtiny.lock().unwrap();
-    let bigtiny_was_owned = bigtiny.process.owned;
+    // On desktop `owned` is now always false: the daemon is a shared machine
+    // resource and another app may be mid-turn, so Kitty exiting must not end
+    // it. `kill_if_owned` therefore does nothing for BigTiny here, and is kept
+    // for the Android in-process host and any other child this app spawns.
+    // The daemon decides its own lifetime through its idle-exit timer.
+    //
+    // No pidfile to remove either: Kitty no longer tracks a daemon PID,
+    // because it no longer claims the right to kill one.
     bigtiny.process.kill_if_owned();
     drop(bigtiny);
-    if bigtiny_was_owned {
-        bigtiny_proc::remove_pidfile();
-    }
-    tracing::info!("stack shut down (owned children killed)");
+    tracing::info!("stack shut down");
 }
 
 #[cfg(test)]

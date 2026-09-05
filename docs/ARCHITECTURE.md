@@ -93,11 +93,33 @@ only as a *remote* endpoint dialect the user points at a server they run
 themselves. `src-tauri/src/ollama/`, `commands/ollama.rs`,
 `lifecycle/ollama_proc.rs` and `config/env_helper.rs` were deleted in Phase 2b.
 
-**Platform split.** Desktop spawns `bigtiny-daemon.exe` as a child process;
-Android hosts the identical daemon in-process via `bigtiny_rust::run`, because
-Android 10+ will not `exec()` a binary out of app-writable storage. Both go
-through the same HTTP boundary and the same env contract, so nothing above
+**Two daemons, and which one is which.** `BigTinyV2/` is where features land.
+`plugins/bigtiny_rust/` (V1) is **frozen: bug fixes only** — it is the rollback
+path for the desktop migration and is still what Android links in-process. If
+you are adding a capability, it goes in V2; putting it in V1 means writing it
+twice.
+
+**Platform split.** Desktop no longer *owns* a daemon. It attaches to a shared
+`bigtiny2-daemon.exe` via `lifecycle/bigtiny_v2.rs` and the `bigtiny2-client`
+crate — reading the handshake, proving the process behind it is really a V2
+daemon, and spawning one under an exclusive lock only when none is running.
+Kitty registers once as the app `kitty` and keeps the issued key in the
+Credential Manager, so its identity survives both its own restart and the
+daemon's. **Nothing in Kitty kills a daemon**: another application may be
+mid-turn, and lifetime is the daemon's own business via its idle-exit timer.
+
+Android still hosts V1 in-process via `bigtiny_rust::run`, because Android 10+
+will not `exec()` a binary out of app-writable storage — and because a phone
+runs exactly one frontend, so it gains nothing from tenancy and would inherit
+real risk from it. It migrates separately, after desktop has soaked. Both
+platforms still go through the same HTTP boundary, so nothing above
 `lifecycle/` knows which one it is talking to.
+
+One consequence worth knowing: **the first app to spawn decides the daemon's
+configuration.** Summarizer, token-management and memory settings are passed as
+spawn environment, so they apply only when Kitty is the process that started
+the daemon. Settings that genuinely must differ per app belong in the
+`app_plugins` table, which is per-app by construction.
 
 Dependency direction is meant to be roughly top-to-bottom: `commands/` calls
 into `lifecycle/`/`config/`/`bigtiny/`, never the reverse, with one

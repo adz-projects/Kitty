@@ -124,7 +124,114 @@ fn main() {
         .block_on(async_main());
 }
 
+/// `bigtiny2-daemon import --from <v1.db> [--app-id kitty] [--key <k>]
+///                        [--encryption-key <hex>] [--pathway-from <path>]`
+///
+/// Runs instead of the server and exits. Separated from `async_main` because
+/// an import must not start a listener, write a handshake file, or arm the
+/// idle-exit timer — it is a one-shot data migration that happens to need the
+/// daemon's own migration chain and crypto.
+async fn run_import(argv: &[String]) -> ! {
+    let flag = |name: &str| -> Option<String> {
+        argv.iter()
+            .position(|a| a == name)
+            .and_then(|i| argv.get(i + 1))
+            .cloned()
+    };
+
+    let Some(source) = flag("--from") else {
+        eprintln!("import requires --from <path to V1 bigtiny.db>");
+        std::process::exit(2);
+    };
+    let app_id = flag("--app-id").unwrap_or_else(|| "kitty".to_string());
+    let display_name = flag("--display-name").unwrap_or_else(|| "Kitty".to_string());
+
+    let data_dir = resolve_data_dir();
+    // The key must be in force *before* the pool is opened, so the
+    // decryptability check reads provider rows with the same cipher the
+    // running daemon will use. `--encryption-key` is how V1's key is carried
+    // across; without it the import still succeeds and reports how many
+    // providers it could not read.
+    // `BIGTINY_ENCRYPTION_KEY` is V1's variable name, and this is the one
+    // command whose entire job is to read V1's world -- so it is accepted here
+    // even though the running daemon reads the V2-scoped name. The explicit
+    // flag wins over both.
+    let env_key = flag("--encryption-key")
+        .or_else(|| std::env::var("BIGTINYV2_ENCRYPTION_KEY").ok())
+        .or_else(|| std::env::var("BIGTINY_ENCRYPTION_KEY").ok())
+        .filter(|k| !k.trim().is_empty());
+    if let Err(e) = bigtiny2::crypto::init(&data_dir, env_key.as_deref()) {
+        eprintln!("could not initialize encryption: {e}");
+        std::process::exit(1);
+    }
+    // Adopt V1's key permanently, not just for this process. Without this the
+    // import verifies that provider rows decrypt and then leaves a daemon that
+    // cannot read them on its next start -- the exact silent failure the
+    // summary's warning exists to prevent, arriving later and looking like a
+    // provider outage instead of a migration mistake.
+    let mut adopted = false;
+    if let Some(hex) = env_key.as_deref() {
+        match bigtiny2::crypto::adopt_key(&data_dir, hex) {
+            Ok(true) => adopted = true,
+            Ok(false) => {}
+            Err(e) => {
+                eprintln!("could not store the carried encryption key: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    let dest = data_dir.join("bigtiny.db");
+    let key = flag("--key").unwrap_or_else(|| {
+        // A fresh key is generated rather than prompted for: the app has to
+        // store it somewhere anyway, and printing it once matches what
+        // registration does.
+        use rand::Rng;
+        let bytes: [u8; 32] = rand::thread_rng().gen();
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    });
+
+    match bigtiny2::import::import_v1(
+        std::path::Path::new(&source),
+        &dest,
+        &app_id,
+        &display_name,
+        &key,
+    )
+    .await
+    {
+        Ok(summary) => {
+            println!("{}", summary.render());
+            if let Some(pathway_src) = flag("--pathway-from") {
+                match bigtiny2::import::import_pathway(
+                    std::path::Path::new(&pathway_src),
+                    &data_dir,
+                    &app_id,
+                ) {
+                    Some(p) => println!("  pathway graph -> {}", p.display()),
+                    None => println!("  no pathway graph imported (source not found)"),
+                }
+            }
+            if adopted {
+                println!("  encryption key adopted -> {}", data_dir.join("encryption.key").display());
+            }
+            println!("\n  API key for {app_id}: {key}");
+            println!("  Store this now — it is not recoverable from the database.");
+            std::process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("import failed: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
 async fn async_main() {
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.get(1).map(String::as_str) == Some("import") {
+        run_import(&argv).await;
+    }
+
     let args = parse_args();
 
     let data_dir = resolve_data_dir();
@@ -170,11 +277,13 @@ async fn async_main() {
         port: args.port,
         db_path,
         secret: args.secret,
-        // Preserves the historical desktop behavior of running
-        // unauthenticated when no secret is configured — this CLI entry
-        // point is the single-user-localhost case `AuthConfig::required`
-        // exists to distinguish from. An embedding host on a platform where
-        // loopback isn't process-private should set this `true` instead.
+        // Note this no longer means "run unauthenticated", which is what it
+        // meant in V1. `auth_middleware` requires a valid app key on every
+        // `/api/*` route except `/api/health` and the registration route,
+        // unconditionally -- there is no anonymous mode to fall into, because
+        // per-app identity is what the whole tenancy design rests on. All
+        // `secret` still does here is seed the registration token, and a
+        // random one is generated when it is absent.
         require_secret: false,
         recipes_dir,
         data_dir: data_dir.to_string_lossy().into_owned(),

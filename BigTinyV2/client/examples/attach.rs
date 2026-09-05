@@ -7,6 +7,7 @@ use bigtiny2_client::discovery::{attach_or_spawn, DiscoveryConfig};
 #[tokio::main]
 async fn main() {
     let config = DiscoveryConfig {
+        daemon_args: Vec::new(),
         daemon_binary: "bigtiny2-daemon.exe".into(),
         min_api_version: bigtiny2_client::MIN_API_VERSION,
         env: vec![],

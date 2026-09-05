@@ -45,9 +45,9 @@ two things beyond the ordinary `cargo build`:
 
    ```powershell
    cd plugins/bigtiny_rust
-   cargo build --release --features litert-engine --bin bigtiny-daemon
-   # → target/release/bigtiny-daemon.exe (~76 MB), then copy to
-   #   src-tauri/binaries/bigtiny-daemon-x86_64-pc-windows-msvc.exe
+   cargo build --release --features litert-engine --bin bigtiny2-daemon
+   # → target/release/bigtiny2-daemon.exe (~76 MB), then copy to
+   #   src-tauri/binaries/bigtiny2-daemon-x86_64-pc-windows-msvc.exe
    ```
 
 2. **Bundle the LiteRT native DLLs + the Gemma tokenizer beside the daemon.**
@@ -61,7 +61,7 @@ two things beyond the ordinary `cargo build`:
    - `libGemmaModelConstraintProvider.dll`
    - `litert-lm.dll`
 
-   These must land in the **same directory as `bigtiny-daemon.exe`** at
+   These must land in the **same directory as `bigtiny2-daemon.exe`** at
    runtime, because the daemon loads `libLiteRt.dll` by bare name
    (`Library::from_path("libLiteRt.dll")`, resolved by the OS from the loading
    process's own directory) and that DLL pulls in the other five. Tauri's
@@ -130,7 +130,9 @@ proceed — this is expected, not a build failure.
 - Manual smoke: first-run wizard → chat → tool approval → resume a session →
   restart Kitty's engine from the degraded panel and confirm the session rebuilds.
 - Soak: repeated summon/dismiss during active streams leaves no orphaned
-  `bigtiny-daemon` children (we kill only processes we spawned).
+  daemon children. Kitty no longer kills a BigTiny daemon at all: it is a
+  shared machine resource that may be serving another application, and it
+  exits on its own idle timer.
 
 ---
 

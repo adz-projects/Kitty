@@ -82,6 +82,30 @@ fn decode_hex_key(hex: &str) -> Result<[u8; KEY_LEN], String> {
         .map_err(|v: Vec<u8>| format!("expected {KEY_LEN} bytes (64 hex chars), got {}", v.len()))
 }
 
+/// Write `hex` as the daemon's at-rest key, unless one is already stored.
+///
+/// Used by the V1 import and nothing else. `init` with an env key configures
+/// only the *current process*, which is enough to verify that imported rows
+/// decrypt but not to keep them readable afterwards: the next daemon start
+/// without that env var would generate a fresh key and every imported
+/// provider row would fail to decrypt. Since the rows are not re-encrypted by
+/// the import, continuity requires the daemon to adopt V1's key permanently —
+/// which is what "carry the encryption key across" actually means.
+///
+/// Refuses to overwrite an existing key file: doing so would render anything
+/// *already* encrypted under it unreadable, which is a worse outcome than a
+/// failed import.
+pub fn adopt_key(data_dir: &Path, hex: &str) -> Result<bool, DaemonError> {
+    let key_bytes = decode_hex_key(hex).map_err(|e| DaemonError::Crypto(e))?;
+    let path = data_dir.join(KEY_FILE_NAME);
+    if path.exists() {
+        return Ok(false);
+    }
+    std::fs::create_dir_all(data_dir)?;
+    std::fs::write(&path, hex_encode(&key_bytes))?;
+    Ok(true)
+}
+
 fn load_or_create_key_file(data_dir: &Path) -> Result<[u8; KEY_LEN], DaemonError> {
     let path = data_dir.join(KEY_FILE_NAME);
     if let Ok(existing) = std::fs::read_to_string(&path) {

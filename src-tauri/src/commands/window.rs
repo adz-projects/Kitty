@@ -198,10 +198,13 @@ pub async fn restart_backend(app: AppHandle) -> Result<(), String> {
         // `bigtiny_env::locate_litert_resources`'s doc comment.
         let (tokenizer_path, litert_lib_dir) =
             lifecycle::bigtiny_env::locate_litert_resources(&app);
-        let handle = lifecycle::bigtiny_proc::spawn(
+        // Re-locate rather than re-spawn: if a daemon is already up (ours or
+        // another app's), this attaches to it. `args`/`dir` do not apply for
+        // the same reason as in `lifecycle::start_stack`.
+        let _ = &dir;
+        let handle = lifecycle::bigtiny_v2::locate(
             &command,
             &args,
-            dir.as_deref(),
             &summarizer,
             &token_management,
             &memory,

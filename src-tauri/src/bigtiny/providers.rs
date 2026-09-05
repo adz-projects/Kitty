@@ -88,7 +88,7 @@ pub async fn sync_active_provider(app: &AppHandle) -> Result<Option<String>, Str
     // circuit before any of it.
     if profile.provider_type == "local" {
         let client = ensure_client(app)?;
-        demote_others(&client, LOCAL_PROVIDER_ID).await;
+        set_app_default(&client, LOCAL_PROVIDER_ID).await;
         return Ok(Some(LOCAL_PROVIDER_ID.to_string()));
     }
 
@@ -210,35 +210,33 @@ pub async fn sync_active_provider(app: &AppHandle) -> Result<Option<String>, Str
             .to_string()
     };
 
-    demote_others(&client, &id).await;
+    set_app_default(&client, &id).await;
     Ok(Some(id))
 }
 
-/// Every profile Kitty has ever activated stays registered in BigTiny (a
-/// feature — instant switching), but the router picks by priority, so the
-/// active one must be unambiguous: demote everything else.
+/// Tell the daemon which provider *this app* defaults to.
 ///
-/// Best-effort per row: one unreachable provider shouldn't abort the rest.
-async fn demote_others(client: &super::client::BigTinyClient, active_id: &str) {
-    let Ok(existing) = client.get_json("/api/providers").await else {
-        return;
-    };
-    let Some(rows) = existing.get("providers").and_then(|p| p.as_array()) else {
-        return;
-    };
-    for row in rows {
-        let Some(other_id) = row.get("id").and_then(|i| i.as_str()) else {
-            continue;
-        };
-        let priority = row.get("fallback_priority").and_then(|p| p.as_i64());
-        if other_id != active_id && priority != Some(100) {
-            let _ = client
-                .patch_json(
-                    &format!("/api/providers/{other_id}"),
-                    &json!({ "fallback_priority": 100 }),
-                )
-                .await;
-        }
+/// Replaces `demote_others`, which existed only because "the active provider"
+/// used to be daemon-global: expressing "use mine" meant PATCHing
+/// `fallback_priority: 100` onto every row Kitty did not own. With a second
+/// app attached that is a cross-tenant stomp — Kitty would be reordering the
+/// research pipeline's providers on every profile switch, and the pipeline
+/// would be doing the same back.
+///
+/// V2 has a per-app default (`PATCH /api/apps/me`), so the same intent is one
+/// scoped write that cannot touch anyone else's configuration. Kitty's other
+/// profiles stay registered and instantly switchable, exactly as before;
+/// `fallback_priority` survives only as a tiebreaker *within* one app's own
+/// visible set.
+///
+/// Best-effort: a failure here means the next send falls back to the app's
+/// healthiest visible provider, which is the right answer anyway.
+async fn set_app_default(client: &super::client::BigTinyClient, active_id: &str) {
+    if let Err(e) = client
+        .patch_json("/api/apps/me", &json!({ "default_provider_id": active_id }))
+        .await
+    {
+        tracing::warn!("could not set Kitty's default provider to {active_id}: {e}");
     }
 }
 
