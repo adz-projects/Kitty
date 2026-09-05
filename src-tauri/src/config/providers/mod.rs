@@ -10,9 +10,15 @@ mod network;
 
 pub use connection::test_connection;
 pub use keyring::{
-    delete_secret, get_or_create_bigtiny_encryption_key, get_secret_async, get_secret_checked,
-    migrate_secrets, set_secret_async,
+    delete_secret, get_secret_async, get_secret_checked, migrate_secrets, set_secret_async,
 };
+// Android's in-process host is the only runtime caller since Phase 7 (desktop's
+// V2 daemon owns its own at-rest key). Re-exported there so that call site
+// keeps working, and left out of the desktop surface rather than dragged
+// through it unused -- see the function's own doc for why it is nonetheless
+// kept on desktop.
+#[cfg(target_os = "android")]
+pub use keyring::get_or_create_bigtiny_encryption_key;
 pub use network::{network_tier_for, NetworkTier};
 
 use serde::{Deserialize, Serialize};
