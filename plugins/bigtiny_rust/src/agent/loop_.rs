@@ -208,6 +208,17 @@ pub fn is_write_tool(tool_name: &str) -> bool {
 fn tools_to_openai_format(tools: &[ToolDefinition]) -> Vec<Value> {
     tools
         .iter()
+        // Same filter `tool_to_anthropic` has applied all along, which this
+        // path lacked: a tool advertised as `"name": ""` is not usable by any
+        // model, 400s the request on stricter gateways, and is a plausible way
+        // to end up with a model echoing an empty name back in a tool call.
+        .filter(|t| {
+            if t.name.trim().is_empty() {
+                tracing::warn!("dropping a tool with no name from the OpenAI-format request");
+                return false;
+            }
+            true
+        })
         .map(|t| {
             // A tool whose whole schema is a boolean (or anything other than
             // an object) can't describe parameters at all — send the empty
@@ -395,6 +406,22 @@ const CONTEXT_BUDGET_TOOL: &str = "__context_budget__";
 /// state what remains — that last part lands in the transcript, where the
 /// summarizer folds it into the `current_task_state` memory slot and the user's
 /// next turn picks it up after compaction has reclaimed room.
+/// Room the pre-flight guard keeps for the reply itself. Smaller than the
+/// wrap-up reserve on purpose: by the time the guard is deciding, the wrap-up
+/// valve has already clamped `max_tokens` to at most
+/// `WRAPUP_MAX_TOKENS_CEILING`, and the question is no longer "is there room
+/// to work" but "will this request be rejected outright".
+const PREFLIGHT_OUTPUT_FLOOR: i32 = 1024;
+
+/// The model name a provider will actually use, for user-facing copy.
+fn provider_model_for(
+    router: &ProviderRouter,
+    provider_id: &str,
+    model_override: Option<&str>,
+) -> String {
+    router.resolve_model(provider_id, model_override)
+}
+
 const WRAPUP_SYSTEM_MESSAGE: &str =
     "[System: This conversation is close to the model's context limit, so no tools \
      are available for this reply and this is the final step of the turn. Do not \
@@ -856,6 +883,8 @@ pub struct AgentLoop {
     /// pinned provider resolves again, so a *new* mismatch appearance
     /// re-warns.
     provider_mismatch_warned: Arc<DashMap<String, ()>>,
+    workspace_snapshots: Arc<DashMap<String, (String, String)>>,
+    background_tasks: Arc<DashMap<String, Vec<tokio::task::AbortHandle>>>,
 }
 
 impl AgentLoop {
@@ -878,6 +907,8 @@ impl AgentLoop {
         pathway: Option<Arc<adaptive_pathway::engine::PathwayEngine>>,
         pathway_cfg: PathwayConfig,
         provider_mismatch_warned: Arc<DashMap<String, ()>>,
+        workspace_snapshots: Arc<DashMap<String, (String, String)>>,
+    background_tasks: Arc<DashMap<String, Vec<tokio::task::AbortHandle>>>,
     ) -> Self {
         Self {
             router,
@@ -897,6 +928,8 @@ impl AgentLoop {
             pathway,
             pathway_cfg,
             provider_mismatch_warned,
+            workspace_snapshots,
+            background_tasks,
         }
     }
 
@@ -963,11 +996,36 @@ impl AgentLoop {
                     .get("provider")
                     .and_then(|v| v.as_str().map(String::from))
             });
-        let model_override = metadata.get("model").and_then(|v| v.as_str());
+        // `filter(|m| !m.is_empty())`: `activate_provider` stamps
+        // `models.first().cloned().unwrap_or_default()`, so a profile with no
+        // discovered models writes `"model": ""` into session metadata. Without
+        // this filter that empty string is a *successful* override — it wins
+        // over the provider's configured model and goes out as an empty
+        // `model` field on the wire. An empty pin is no pin; treat it as absent
+        // so the provider's own default applies.
+        let model_override = metadata
+            .get("model")
+            .and_then(|v| v.as_str())
+            .filter(|m| !m.trim().is_empty());
 
         let allowed_dirs = allowed_dirs_for_session(&metadata, &self.cache_dir);
         let chat_dir = metadata.get("chat_dir").and_then(|v| v.as_str());
         let cwd = metadata.get("cwd").and_then(|v| v.as_str());
+
+        // Orientation block for the prompt head. Rebuilt only when this
+        // session's working directory differs from the one the cached listing
+        // describes — see `Agent::workspace_snapshots`.
+        let workspace_snapshot: Option<String> = cwd.and_then(|dir| {
+            if let Some(hit) = self.workspace_snapshots.get(session_id) {
+                if hit.0 == dir {
+                    return Some(hit.1.clone());
+                }
+            }
+            let rendered = crate::agent::context::workspace_snapshot::block(dir)?;
+            self.workspace_snapshots
+                .insert(session_id.to_string(), (dir.to_string(), rendered.clone()));
+            Some(rendered)
+        });
 
         let active_tools: Vec<ToolDefinition> = self.mcp.list_tools(None);
 
@@ -988,6 +1046,18 @@ impl AgentLoop {
         let context_tokens_override = resolved_provider_id
             .as_deref()
             .and_then(|pid| self.router.context_length(pid));
+
+        // Take the provider back from any turn-end background work still
+        // running on it. Done here, before the (potentially slow) context
+        // build, so the slot is free by the time this turn actually sends.
+        //
+        // Without this, the concurrency gate alone would simply convert the
+        // old crash into a wait: a compaction or title call may hold a
+        // single-slot endpoint for five minutes, and the user's message would
+        // sit behind it with no explanation. See `Agent::background_tasks`.
+        if let Some(pid) = resolved_provider_id.as_deref() {
+            self.cancel_background(pid);
+        }
 
         // Adaptive Pathway turn-start hook: in-process recall so the model
         // sees learned behavioral beliefs *before* picking tools this turn.
@@ -1030,6 +1100,7 @@ impl AgentLoop {
                 context_tokens_override,
                 chat_dir,
                 cwd,
+                workspace_snapshot.as_deref(),
                 ap_hints.as_deref(),
                 recalled,
                 thought_seed.as_deref(),
@@ -1086,6 +1157,7 @@ impl AgentLoop {
             session_id,
             &pool,
             &allowed_dirs,
+            cwd,
             effective_provider,
             model_override,
             messages,
@@ -1110,11 +1182,96 @@ impl AgentLoop {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Remember a fire-and-forget task so a later turn on the same provider
+    /// can abort it. Also drops handles that have already finished, so the
+    /// vector cannot grow across a long session.
+    fn track_background(&self, provider_id: &str, handle: tokio::task::AbortHandle) {
+        let mut entry = self.background_tasks.entry(provider_id.to_string()).or_default();
+        entry.retain(|h| !h.is_finished());
+        entry.push(handle);
+    }
+
+    /// Abort any turn-end background work still running against this provider.
+    ///
+    /// Called at the top of a turn. Aborting drops the in-flight `reqwest`
+    /// future, which closes the connection and lets a single-slot server free
+    /// the slot immediately — rather than the user's message waiting out a
+    /// summarization it never asked for. See `Agent::background_tasks` for why
+    /// this loses nothing.
+    fn cancel_background(&self, provider_id: &str) {
+        if let Some((_, handles)) = self.background_tasks.remove(provider_id) {
+            let live = handles.iter().filter(|h| !h.is_finished()).count();
+            if live > 0 {
+                tracing::debug!(
+                    provider_id,
+                    live,
+                    "aborting turn-end background work so this turn gets the provider"
+                );
+            }
+            for h in handles {
+                h.abort();
+            }
+        }
+    }
+
+    /// Fire off a compaction pass for this session and return immediately.
+    ///
+    /// Extracted so the post-turn pass and the two context-overflow exits
+    /// share one definition. The overflow exits are the reason this is not
+    /// still inline: they `return` out of the tool loop from *above* the
+    /// post-turn block, so the one pass that could shrink the session for the
+    /// user's next message was skipped in exactly the situation that needed
+    /// it — which is why a blown context stayed blown until the user found
+    /// `/compact` by hand. Those callers pass `force = true`, since the
+    /// high-water gate is about routine housekeeping and this is not that.
+    ///
+    /// Fire-and-forget in every case: the CAS lock inside `run_compaction` is
+    /// the overlap guard if two passes for one session ever race, and a slow
+    /// summarizer must never hold up the turn's terminal event.
+    fn spawn_compaction(
+        &self,
+        pool: &SqlitePool,
+        session_id: &str,
+        provider_id: &str,
+        model: Option<String>,
+        context_length: i32,
+        force: bool,
+    ) {
+        let pool = pool.clone();
+        let session_id = session_id.to_string();
+        let provider_id = provider_id.to_string();
+        let summarizer = self.summarizer.clone();
+        let token_cfg = self.context.config().clone();
+        let summarizer_cfg = self.summarizer_cfg.clone();
+        let memory_cfg = self.memory_cfg.clone();
+        let tracked = provider_id.clone();
+        let handle = tokio::spawn(async move {
+            let _ = run_compaction(
+                &pool,
+                &session_id,
+                &summarizer,
+                Some(provider_id.as_str()),
+                model,
+                &token_cfg,
+                &summarizer_cfg,
+                &memory_cfg,
+                context_length,
+                force,
+            )
+            .await;
+        });
+        self.track_background(&tracked, handle.abort_handle());
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn run_tool_loop(
         &mut self,
         session_id: &str,
         pool: &SqlitePool,
         allowed_dirs: &[String],
+        // The session's working directory — the base a relative tool `path`
+        // argument is qualified against (see `qualify_relative_path_args`).
+        session_cwd: Option<&str>,
         effective_provider: Option<String>,
         model_override: Option<&str>,
         mut messages: Vec<Value>,
@@ -1172,6 +1329,43 @@ impl AgentLoop {
         let mut last_provider_id: Option<String> = None;
         let mut last_provider_model: Option<String> = None;
 
+        // Provider and model are resolved ONCE for the whole turn, not per
+        // step.
+        //
+        // They used to be re-resolved from the live router on every tool-loop
+        // iteration. The router is shared, and a Settings edit replaces the
+        // entry in place: `sync_active_provider` PATCHes the profile, the
+        // daemon's `update_provider` calls `register_from_row`, and that
+        // `insert`s a fresh `ProviderEntry` over the one the in-flight turn is
+        // using. So changing the default model in Settings switched the model
+        // of every *running* turn at its next step — mid-thought, on the wire,
+        // with no event and no banner (the mismatch warning below is gated on
+        // `step == 0`). A chat must keep the model it started with.
+        //
+        // Retry/failover inside the attempt loop still reassigns both, and
+        // that reassignment now persists for the rest of the turn rather than
+        // being reverted by the next iteration's re-resolution — which is what
+        // you want after failing over: a turn should not flap between engines
+        // step by step.
+        let mut turn_provider_id = match self.router.get_provider_id(effective_provider.as_deref())
+        {
+            Ok(id) => id,
+            Err(_) => {
+                let _ = event_tx.send(SSEEvent {
+                    event_type: SSEEventType::Error,
+                    content: Some("No healthy providers available".into()),
+                    error_message: Some("No healthy providers available".into()),
+                    session_id: Some(session_id.to_string()),
+                    is_last: true,
+                    ..Default::default()
+                });
+                return;
+            }
+        };
+        let mut turn_provider_model = self
+            .router
+            .resolve_model(&turn_provider_id, model_override);
+
         loop {
             // Stop generating once the SSE consumer is gone — a disconnected
             // client's stream body is dropped by axum, the receiver end is
@@ -1201,20 +1395,7 @@ impl AgentLoop {
                 break;
             }
 
-            let provider_id = match self.router.get_provider_id(effective_provider.as_deref()) {
-                Ok(id) => id,
-                Err(_) => {
-                    let _ = event_tx.send(SSEEvent {
-                        event_type: SSEEventType::Error,
-                        content: Some("No healthy providers available".into()),
-                        error_message: Some("No healthy providers available".into()),
-                        session_id: Some(session_id.to_string()),
-                        is_last: true,
-                        ..Default::default()
-                    });
-                    return;
-                }
-            };
+            let provider_id = turn_provider_id.clone();
 
             // The session pinned a provider that isn't registered, so the
             // router fell back to a different one. Tell the user once per
@@ -1380,8 +1561,153 @@ impl AgentLoop {
                 TurnMode::Normal => {}
             }
 
+            // ----------------------------------------------------------------
+            // Pre-flight: never hand the provider a request we already know is
+            // too big.
+            //
+            // The wrap-up valve above can only stop the history *growing* — it
+            // withdraws tools and clamps `max_tokens`, then sends the same
+            // array one more time. When a single step's tool results have
+            // already carried the history past the window (the results cap is
+            // 100 KB each, ~25-33k tokens, against a 15k default reserve, so
+            // one step can clear the guard in a single bound) that wrap-up
+            // request is itself the one that 400s, and the turn dies
+            // mid-thought with nothing salvaged. This is the check that was
+            // missing entirely: measure, shrink, and only then send.
+            // ----------------------------------------------------------------
+            {
+                // The delta estimate is deliberately cheap; a full cl100k
+                // encode of the transcript per iteration is what
+                // `projected_input_tokens` exists to avoid. Only pay for the
+                // exact count once the estimate says we are anywhere near the
+                // edge.
+                let preflight_gate = context_length
+                    .saturating_sub(wrapup_reserve.saturating_mul(3) / 2);
+                if projected_input > preflight_gate {
+                    // Tool schemas ride along on every request and are
+                    // routinely 2-6k tokens, so a count of `messages` alone
+                    // understates what the provider will bill.
+                    let schema_tokens = if in_wrapup {
+                        0
+                    } else {
+                        tokens::count_text_tokens(
+                            &serde_json::to_string(&tools_for_turn).unwrap_or_default(),
+                        )
+                    };
+                    let budget = context_length
+                        .saturating_sub(PREFLIGHT_OUTPUT_FLOOR)
+                        .saturating_sub(schema_tokens);
+
+                    if tokens::count_messages_tokens(&messages) > budget {
+                        if let Some(shrunk) = crate::agent::compaction::shrink_live_turn(
+                            &messages, budget, token_cfg,
+                        ) {
+                            let before = tokens::count_messages_tokens(&messages);
+                            let after = tokens::count_messages_tokens(&shrunk);
+                            tracing::info!(
+                                session_id,
+                                step,
+                                context_length,
+                                before,
+                                after,
+                                "pre-flight shrink: elided in-turn history to fit the window"
+                            );
+                            messages = shrunk;
+                            // The user is owed the reason their earlier tool
+                            // output stopped being visible to the model.
+                            let _ = event_tx.send(SSEEvent {
+                                event_type: SSEEventType::ToolFinish,
+                                tool_name: Some(CONTEXT_BUDGET_TOOL.into()),
+                                tool_result: Some(format!(
+                                    "Trimmed earlier steps of this turn to stay inside \
+                                     this model's context window ({before} → {after} of \
+                                     {context_length} tokens). Continuing."
+                                )),
+                                session_id: Some(session_id.to_string()),
+                                ..Default::default()
+                            });
+                            // The provider's count no longer describes this
+                            // array — drop the mark so the next iteration
+                            // recounts from scratch instead of adding a delta
+                            // to a base that included what we just removed.
+                            last_usage = None;
+                        }
+                    }
+
+                    // Still over after shrinking: stop asking for tools and
+                    // take the smallest possible final reply. This is the same
+                    // shape the wrap-up valve produces, reached from the other
+                    // direction.
+                    if !in_wrapup && tokens::count_messages_tokens(&messages) > budget {
+                        // `decide_turn_mode` guarantees exactly one injected
+                        // system message per iteration, and both branches rely
+                        // on popping *the last* message to remove their own.
+                        // Overriding a step nudge from here would push a
+                        // second one and leave both `in_budget_check` and
+                        // `in_wrapup` set, so retract the nudge first — running
+                        // out of context outranks running out of steps, and the
+                        // nudge would be asking the model to keep going into a
+                        // window that has no room left anyway.
+                        if in_budget_check {
+                            messages.pop();
+                            in_budget_check = false;
+                        }
+                        messages.push(json!({
+                            "role": "system",
+                            "content": WRAPUP_SYSTEM_MESSAGE
+                        }));
+                        in_wrapup = true;
+                        wrapup_issued = true;
+                        tools_for_turn.clear();
+                    }
+
+                    // Nothing left to give. Fail here, deliberately, rather
+                    // than letting the provider fail: this way the error is
+                    // correctly classified, compaction runs before the user's
+                    // next send, and the session does not become a wall the
+                    // user can only escape with a manual `/compact`.
+                    let final_count = tokens::count_messages_tokens(&messages);
+                    if final_count > context_length {
+                        tracing::warn!(
+                            session_id,
+                            step,
+                            context_length,
+                            final_count,
+                            "pre-flight: cannot fit this turn in the window even after \
+                             shrinking — ending the turn and compacting"
+                        );
+                        self.spawn_compaction(
+                            pool,
+                            session_id,
+                            &provider_id,
+                            Some(provider_model_for(&self.router, &provider_id, model_override)),
+                            context_length,
+                            true,
+                        );
+                        let _ = event_tx.send(SSEEvent {
+                            event_type: SSEEventType::ProviderError,
+                            error_message: Some(format!(
+                                "This conversation no longer fits in {model_label}'s \
+                                 {context_length}-token context window ({final_count} tokens \
+                                 needed). It is being compacted — send your message again.",
+                                model_label = provider_model_for(
+                                    &self.router,
+                                    &provider_id,
+                                    model_override
+                                ),
+                            )),
+                            error_type: Some("context_exceeded".into()),
+                            session_id: Some(session_id.to_string()),
+                            is_last: true,
+                            ..Default::default()
+                        });
+                        return;
+                    }
+                }
+            }
+
             let mut provider_id = provider_id;
-            let mut provider_model = self.router.resolve_model(&provider_id, model_override);
+            let mut provider_model = turn_provider_model.clone();
 
             // Retry/failover: a transient error (timeout, 5xx, rate limit)
             // used to end the whole turn on the first failure — dead
@@ -1533,6 +1859,43 @@ impl AgentLoop {
                             // instead of the generic untagged `error` every
                             // chat_completion failure used to collapse into
                             // regardless of what was actually wrong.
+                            // A context overflow that still got past the
+                            // pre-flight guard means our idea of the window
+                            // was wrong. The provider just told us the real
+                            // one (`n_ctx`), so record it — otherwise the
+                            // valve keeps budgeting against the same bad
+                            // number and blows the window again next turn —
+                            // and compact before returning, because this
+                            // `return` is above the post-turn compaction pass
+                            // and without it the session stays a wall.
+                            if let ProviderError::ContextExceeded {
+                                context_window, ..
+                            } = &e
+                            {
+                                if let Some(real) = context_window {
+                                    if Some(*real) != self.router.context_length(&provider_id) {
+                                        tracing::warn!(
+                                            session_id,
+                                            provider_id,
+                                            real,
+                                            "provider reports a different context window than \
+                                             configured — correcting"
+                                        );
+                                        self.router.set_context_length(&provider_id, *real);
+                                    }
+                                }
+                                let window = context_window
+                                    .unwrap_or(context_length)
+                                    .max(1);
+                                self.spawn_compaction(
+                                    pool,
+                                    session_id,
+                                    &provider_id,
+                                    Some(provider_model.clone()),
+                                    window,
+                                    true,
+                                );
+                            }
                             let tag = e.wire_type_tag();
                             let _ = event_tx.send(SSEEvent {
                                 event_type: if tag.is_some() {
@@ -1587,6 +1950,11 @@ impl AgentLoop {
             let (content_buf, mut turn_tool_calls, finish_reason, turn_usage, timing) =
                 turn_result;
 
+            // A failover inside the attempt loop above is a real, announced
+            // switch — carry it to the remaining steps instead of letting the
+            // next iteration silently revert to the pinned provider.
+            turn_provider_id = provider_id.clone();
+            turn_provider_model = provider_model.clone();
             last_provider_id = Some(provider_id.clone());
             last_provider_model = Some(provider_model.clone());
 
@@ -1815,7 +2183,13 @@ impl AgentLoop {
 
             // Execute tool calls concurrently (bounded by max_concurrent_tool_calls)
             let tool_results = self
-                .execute_tools(session_id, &turn_tool_calls, allowed_dirs, event_tx)
+                .execute_tools(
+                session_id,
+                &turn_tool_calls,
+                allowed_dirs,
+                session_cwd,
+                event_tx,
+            )
                 .await;
 
             for (tc, result) in turn_tool_calls.iter().zip(tool_results) {
@@ -1836,6 +2210,9 @@ impl AgentLoop {
         // needs its own copies of whichever provider/model actually handled
         // this turn.
         let title_provider_id = last_provider_id.clone();
+        // The provider the fire-and-forget passes below will call, so their
+        // handles can be registered for cancellation by the next turn.
+        let background_provider = last_provider_id.clone();
         let title_provider_model = last_provider_model.clone();
 
         // Post-turn compaction check — ONCE per turn, fire-and-forget. This
@@ -1852,27 +2229,14 @@ impl AgentLoop {
                 .router
                 .context_length(&pid)
                 .unwrap_or(self.context.config().max_context_tokens);
-            let pool = pool.clone();
-            let session_id = session_id.to_string();
-            let summarizer = self.summarizer.clone();
-            let token_cfg = self.context.config().clone();
-            let summarizer_cfg = self.summarizer_cfg.clone();
-            let memory_cfg = self.memory_cfg.clone();
-            tokio::spawn(async move {
-                let _ = run_compaction(
-                    &pool,
-                    &session_id,
-                    &summarizer,
-                    Some(pid.as_str()),
-                    last_provider_model,
-                    &token_cfg,
-                    &summarizer_cfg,
-                    &memory_cfg,
-                    context_length,
-                    false,
-                )
-                .await;
-            });
+            self.spawn_compaction(
+                pool,
+                session_id,
+                &pid,
+                last_provider_model,
+                context_length,
+                false,
+            );
         }
 
         // Post-turn title derivation (release-fixes item 12) — ONCE, only
@@ -1888,7 +2252,7 @@ impl AgentLoop {
             let session_id = session_id.to_string();
             let summarizer = self.summarizer.clone();
             let event_tx = event_tx.clone();
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 derive_and_set_title(
                     &pool,
                     &session_id,
@@ -1899,6 +2263,9 @@ impl AgentLoop {
                 )
                 .await;
             });
+            if let Some(pid) = background_provider.as_deref() {
+                self.track_background(pid, handle.abort_handle());
+            }
         }
 
         // Turn-end Adaptive Pathway pass (runs once per turn, fire-and-forget):
@@ -1927,7 +2294,7 @@ impl AgentLoop {
         let host_pool = pool.clone();
         let chat = self.summarizer.clone();
         let learn_session_id = session_id.to_string();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let Some(engine) = engine else { return };
             if engine.is_paused(&learn_session_id).await.unwrap_or(false) {
                 return;
@@ -1974,6 +2341,9 @@ impl AgentLoop {
                 }
             }
         });
+        if let Some(pid) = background_provider.as_deref() {
+            self.track_background(pid, handle.abort_handle());
+        }
     }
 
     /// Adaptive Pathway turn-start hook: in-process recall against the
@@ -2234,18 +2604,42 @@ impl AgentLoop {
         session_id: &str,
         tool_calls: &[ToolCall],
         allowed_dirs: &[String],
+        session_cwd: Option<&str>,
         event_tx: &mpsc::UnboundedSender<SSEEvent>,
     ) -> Vec<String> {
         let semaphore = Arc::new(Semaphore::new(self.max_concurrent_tool_calls.max(1)));
 
         let futures = tool_calls.iter().map(|tc| {
+            // `filter(non-empty)` as well as `unwrap_or`: the key is always
+            // present in a streamed call, so an empty name read as `""` rather
+            // than falling through to "unknown" — which made the failure
+            // invisible to every log filter looking for the latter.
             let tool_name = tc
                 .function
                 .get("name")
                 .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|n| !n.is_empty())
                 .unwrap_or("unknown")
                 .to_string();
-            let tool_args = tc.function.get("arguments").cloned().unwrap_or(json!({}));
+            let mut tool_args = tc.function.get("arguments").cloned().unwrap_or(json!({}));
+            // Before containment and HITL, so both judge the path the tool
+            // will really open rather than a bare "." the tool process would
+            // resolve against its own (wrong) working directory.
+            if let Some(cwd) = session_cwd {
+                if crate::agent::sandbox::qualify_relative_path_args(
+                    &tool_name,
+                    &mut tool_args,
+                    cwd,
+                ) {
+                    tracing::debug!(
+                        session_id,
+                        tool_name,
+                        cwd,
+                        "qualified a relative tool path against the session working directory"
+                    );
+                }
+            }
             let semaphore = semaphore.clone();
             self.execute_one_tool_call(
                 session_id,
@@ -2332,10 +2726,30 @@ impl AgentLoop {
         if is_write_tool(&tool_name)
             && !check_containment(&tool_args, allowed_dirs, self.sandbox_strict)
         {
-            let err = format!(
-                "Tool {tool_name} denied: it would write to a path outside this \
-                 session's allowed directories"
-            );
+            // Name the directories. The old message said only that the path
+            // was "outside this session's allowed directories" without saying
+            // where the model *could* write, which left it guessing — and a
+            // guessing model retries, so an unhelpful denial costs a round
+            // trip per attempt. `allowed_dirs` also carries scratch/cache
+            // entries that are true but useless to suggest, so list the first
+            // few (chat_dir and cwd lead, see `allowed_dirs_for_session`).
+            let suggestions = allowed_dirs
+                .iter()
+                .take(2)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" or ");
+            let err = if suggestions.is_empty() {
+                format!(
+                    "Tool {tool_name} denied: it would write to a path outside this \
+                     session's allowed directories"
+                )
+            } else {
+                format!(
+                    "Tool {tool_name} denied: it would write outside this session's \
+                     allowed directories. Write to {suggestions} instead."
+                )
+            };
             let _ = event_tx.send(SSEEvent {
                 event_type: SSEEventType::ToolFinish,
                 tool_name: Some(tool_name),
@@ -2981,6 +3395,8 @@ mod containment_order_tests {
             false,
             None,
             config.pathway.clone(),
+            Arc::new(DashMap::new()),
+            Arc::new(DashMap::new()),
             Arc::new(DashMap::new()),
         );
         (agent_loop, hitl)

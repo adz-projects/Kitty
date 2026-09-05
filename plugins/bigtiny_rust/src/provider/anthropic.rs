@@ -72,6 +72,9 @@ pub struct AnthropicProvider {
     /// stream at 3s.
     direct_client: reqwest::Client,
     tailscale: Arc<TailscaleClient>,
+    /// Cached direct-address reachability, `origin -> (reachable, checked at)`
+    /// — see `direct_is_reachable`.
+    direct_probe: dashmap::DashMap<String, (bool, Instant)>,
     cache: CacheConfig,
     /// SSE idle-read timeout — see `OpenAICompatibleProvider::idle_timeout`.
     idle_timeout: Duration,
@@ -87,6 +90,11 @@ const DIRECT_HEADERS_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// TCP keepalive probe interval for provider connections — see
 /// `openai_compat::TCP_KEEPALIVE_INTERVAL` (the #10 dead-socket rationale).
+/// How long a direct-address reachability verdict is trusted. Long enough
+/// that a normal back-and-forth pays for the probe once, short enough that
+/// moving off (or onto) the LAN is noticed within a turn or two.
+const DIRECT_PROBE_TTL: Duration = Duration::from_secs(60);
+
 const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Total-duration ceiling for one streamed response — see
@@ -144,6 +152,7 @@ impl AnthropicProvider {
             direct_client,
             config,
             tailscale,
+            direct_probe: dashmap::DashMap::new(),
             cache,
             idle_timeout,
         }
@@ -157,13 +166,13 @@ impl AnthropicProvider {
         url: &str,
         body: &Value,
     ) -> Result<reqwest::Response, reqwest::Error> {
-        if let Some(direct_url) = maybe_direct_url(&self.tailscale, url).await {
-            if let Ok(resp) = self.try_direct(&direct_url, body).await {
-                return Ok(resp);
-            }
-        }
+        // Decide the URL first, then send the body exactly once.
+        let direct = match maybe_direct_url(&self.tailscale, url).await {
+            Some(c) if self.direct_is_reachable(&c).await => Some(c),
+            _ => None,
+        };
         self.client
-            .post(url)
+            .post(direct.as_deref().unwrap_or(url))
             .header("x-api-key", &self.config.api_key)
             .header("anthropic-version", "2023-06-01")
             .json(body)
@@ -171,25 +180,27 @@ impl AnthropicProvider {
             .await
     }
 
-    /// See `OpenAICompatibleProvider::try_direct` — same
-    /// `DIRECT_HEADERS_TIMEOUT`-bounded single direct attempt; non-success
-    /// responses are not usable and trigger the tunnel fallback.
-    async fn try_direct(
-        &self,
-        direct_url: &str,
-        body: &Value,
-    ) -> Result<reqwest::Response, ()> {
-        let direct = self
+    /// See `OpenAICompatibleProvider::direct_is_reachable` — same cached
+    /// cheap probe, replacing a duplicate-sending real POST.
+    async fn direct_is_reachable(&self, direct_url: &str) -> bool {
+        let origin = super::openai_compat::probe_origin(direct_url);
+        if let Some(hit) = self.direct_probe.get(&origin) {
+            if hit.1.elapsed() < DIRECT_PROBE_TTL {
+                return hit.0;
+            }
+        }
+        let req = self
             .direct_client
-            .post(direct_url)
+            .get(format!("{origin}/v1/models"))
             .header("x-api-key", &self.config.api_key)
             .header("anthropic-version", "2023-06-01")
-            .json(body)
             .send();
-        match tokio::time::timeout(DIRECT_HEADERS_TIMEOUT, direct).await {
-            Ok(Ok(resp)) if resp.status().is_success() => Ok(resp),
-            _ => Err(()),
-        }
+        let ok = matches!(
+            tokio::time::timeout(DIRECT_HEADERS_TIMEOUT, req).await,
+            Ok(Ok(resp)) if resp.status().is_success()
+        );
+        self.direct_probe.insert(origin, (ok, Instant::now()));
+        ok
     }
 
     fn group_tool_results(messages: &[Value]) -> Vec<Value> {

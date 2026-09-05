@@ -275,6 +275,15 @@ fn default_max_live_tail_tokens() -> i32 {
 fn default_wrapup_reserve_ratio() -> f64 {
     0.25
 }
+/// Note the relationship to `mcp::tools::MAX_TOOL_OUTPUT_BYTES` (100 KB,
+/// roughly 25-33k tokens): a single tool result can be *larger than this
+/// reserve*, and parallel calls multiply that. So the wrap-up valve alone can
+/// never be a guarantee — one step can carry the history from inside the
+/// reserve to past the window in a single bound, and the valve then fires with
+/// a request that is already too big to send. That is what the pre-flight
+/// guard in `run_tool_loop` is for; this cap is the "start wrapping up" hint,
+/// not the last line of defence. Raising it costs usable working room on every
+/// turn, which is why the fix was the guard rather than a bigger number.
 fn default_wrapup_reserve_cap() -> i32 {
     15000
 }

@@ -54,7 +54,8 @@ export function Composer({
   const addPendingImage = useChatStore((s) => s.addPendingImage);
   const model = useChatStore((s) => s.model);
   const providerSupportsVision = useChatStore((s) => s.providerSupportsVision);
-  const canAttachImages = modelAcceptsImages(model, providerSupportsVision);
+  const providerAcceptsImages = useChatStore((s) => s.providerAcceptsImages);
+  const canAttachImages = modelAcceptsImages(model, providerSupportsVision, providerAcceptsImages);
   const sendWithRecipe = useChatStore((s) => s.sendWithRecipe);
   const compact = useChatStore((s) => s.compact);
   const stopPhase = useChatStore((s) => s.stopPhase);

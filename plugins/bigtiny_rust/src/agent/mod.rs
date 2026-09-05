@@ -77,6 +77,30 @@ pub struct Agent {
     /// `AgentLoop::provider_mismatch_warned`) — daemon-lifetime, since each
     /// `AgentLoop` is rebuilt per turn.
     provider_mismatch_warned: Arc<DashMap<String, ()>>,
+    /// Per-session cache of the working-directory listing injected into the
+    /// prompt head: `session_id -> (cwd it describes, rendered block)`.
+    ///
+    /// Keyed on the cwd so it rebuilds exactly when the working directory
+    /// changes and never otherwise. That is not only about the scan cost: the
+    /// block sits in the stable head that `build_messages` keeps
+    /// byte-identical so llama-server/OpenAI prefix caches keep hitting, and
+    /// re-rendering it every turn would invalidate that prefix the moment any
+    /// file in the folder changed.
+    workspace_snapshots: Arc<DashMap<String, (String, String)>>,
+    /// Handles for the fire-and-forget turn-end tasks (compaction, title
+    /// derivation, the pathway learn pass), keyed by the provider they call.
+    ///
+    /// All three go to the *same* provider the chat does, and each may hold it
+    /// for `SUMMARIZER_OVERALL_TIMEOUT` (five minutes). Against a single-slot
+    /// endpoint that is a five-minute wall in front of the user's next
+    /// message — the concurrency gate makes it a queue instead of a crash, but
+    /// a queue is still a wall. A new turn aborts them and takes the slot.
+    ///
+    /// Safe because every one of them is best-effort and re-runs: compaction
+    /// fires again next turn (its CAS lock is released on drop), title
+    /// derivation re-checks whether the session is still unnamed, and the
+    /// learn pass comes round again on the next multiple of `learn_every_n`.
+    background_tasks: Arc<DashMap<String, Vec<tokio::task::AbortHandle>>>,
 }
 
 /// Removes the turn's `tasks` entry when the turn task ends — normally *or*
@@ -123,6 +147,8 @@ impl Agent {
             pathway,
             pathway_shutdown,
             provider_mismatch_warned: Arc::new(DashMap::new()),
+            workspace_snapshots: Arc::new(DashMap::new()),
+            background_tasks: Arc::new(DashMap::new()),
         }
     }
 
@@ -186,6 +212,8 @@ impl Agent {
             self.pathway.clone(),
             self.config.pathway.clone(),
             self.provider_mismatch_warned.clone(),
+            self.workspace_snapshots.clone(),
+            self.background_tasks.clone(),
         )
     }
 
@@ -322,7 +350,16 @@ impl Agent {
             let mut failure: Option<String> = None;
             while let Some(ev) = rx.recv().await {
                 if ev.is_last {
-                    if ev.event_type == SSEEventType::Error {
+                    // `ProviderError` as well as `Error`: the classified
+                    // failures (context exceeded, bad key, exhausted billing)
+                    // were split onto their own event type so the frontend
+                    // could offer specific guidance, and this watcher was not
+                    // updated with them — so precisely the failures we
+                    // understand best were the ones the scheduler recorded as
+                    // `'completed'`.
+                    if ev.event_type == SSEEventType::Error
+                        || ev.event_type == SSEEventType::ProviderError
+                    {
                         failure = Some(
                             ev.error_message
                                 .clone()

@@ -62,3 +62,36 @@ describe('modelAcceptsImages', () => {
     expect(modelAcceptsImages(null, false)).toBe(false);
   });
 });
+
+describe('modelAcceptsImages — detected capability', () => {
+  /** The failure the whole detection pass exists to end: a model whose name
+      matches no pattern (self-hosted, renamed) had its image affordances
+      hidden with no recourse but a manual tick. A provider that reports its
+      own capabilities settles it. */
+  it('lets a detected yes enable images for a model the patterns miss', () => {
+    expect(supportsImages('internal-vlm-v3')).toBe(false);
+    expect(modelAcceptsImages('internal-vlm-v3', false, true)).toBe(true);
+  });
+
+  /** The mirror image, and the reason detection is authoritative rather than
+      widening-only: a text-only model with a vision-ish name used to offer an
+      attach button that could only ever produce a failed turn. */
+  it('lets a detected no disable images for a model the patterns match', () => {
+    expect(supportsImages('gemini-text-only-preview')).toBe(true);
+    expect(modelAcceptsImages('gemini-text-only-preview', false, false)).toBe(false);
+  });
+
+  it('falls back to name patterns when nothing was detected', () => {
+    for (const detected of [null, undefined]) {
+      expect(modelAcceptsImages('gpt-4o', false, detected)).toBe(true);
+      expect(modelAcceptsImages('mistral:7b', false, detected)).toBe(false);
+    }
+  });
+
+  /** The manual override still outranks everything — including a detected
+      no. The user ticked a box about their own endpoint. */
+  it('keeps the manual override on top', () => {
+    expect(modelAcceptsImages('anything', true, false)).toBe(true);
+    expect(modelAcceptsImages(null, true, null)).toBe(true);
+  });
+});

@@ -50,6 +50,26 @@ fn normalize_scheme(base_url: &str) -> String {
 /// it by sending this exact string as `provider`.
 pub const LOCAL_PROVIDER_ID: &str = "local";
 
+/// The id the daemon's provider registry knows this profile by — which is the
+/// Kitty profile id for everything except the in-process engine.
+///
+/// This distinction is what a session's `metadata.provider` stamp has to
+/// respect. `sync_active_provider` registers a `local` profile under the fixed
+/// `LOCAL_PROVIDER_ID` and creates no row for it, but sessions were being
+/// stamped with the *profile* id (`prof_…`) — an id the registry never
+/// contains. `get_provider_id` then fell through to the priority sort, and
+/// since `demote_others` had just made the newly-activated profile the only
+/// priority-1 row, every local-engine chat silently followed the global
+/// default instead of its own pin. Stamping through this function is what
+/// makes the pin name something real.
+pub fn daemon_provider_id(profile: &crate::config::providers::ProviderProfile) -> String {
+    if profile.provider_type == "local" {
+        LOCAL_PROVIDER_ID.to_string()
+    } else {
+        profile.id.clone()
+    }
+}
+
 pub async fn sync_active_provider(app: &AppHandle) -> Result<Option<String>, String> {
     let profile = {
         let state = app.state::<AppState>();
@@ -245,7 +265,10 @@ pub async fn set_session_provider(
             &format!("/api/chat/{session_id}/config"),
             &json!({
                 "provider": provider_id,
-                // Empty string clears a stale override when the profile has no model.
+                // Empty string clears a stale override when the profile has
+                // no model — the daemon's `model_override` filters a blank
+                // string back to "no pin" (`loop_.rs`), so this is a clear,
+                // not an override that puts an empty `model` on the wire.
                 "model": model,
             }),
         )

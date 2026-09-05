@@ -81,6 +81,8 @@ export function Providers({ highlight }: { highlight: string | null }) {
           available_modes: [],
           thinking_effort: null,
           is_default_folder: true,
+          provider_id: null,
+          model_id: null,
         });
       } catch {
         /* non-fatal */

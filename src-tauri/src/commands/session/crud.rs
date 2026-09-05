@@ -24,6 +24,21 @@ pub struct SessionInfo {
     /// True when `cwd` is a private per-chat folder (no explicit working
     /// directory chosen) — the chat header renders this as "thought partner".
     pub is_default_folder: bool,
+    /// The **Kitty profile id** this session was pinned to at birth, and the
+    /// model with it.
+    ///
+    /// The daemon has always been told the pin; the frontend never was. So
+    /// `newSession` left `sessionProviderId` null, and `refreshProvider` fell
+    /// back to whichever profile currently carries the global `active` flag —
+    /// which is why changing the default in Settings re-pointed the model,
+    /// badge, vision gate and system prompt of every already-open chat.
+    ///
+    /// Deliberately the *profile* id rather than the daemon-registry id these
+    /// are stamped into session metadata as: the frontend looks profiles up by
+    /// this id, and for the in-process engine the two differ (see
+    /// `bigtiny::providers::daemon_provider_id`).
+    pub provider_id: Option<String>,
+    pub model_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -51,17 +66,29 @@ pub async fn new_session(app: AppHandle, cwd: Option<String>) -> Result<SessionI
         _ => resolve_cwd(&app).await?,
     };
     // Resolve the global default provider/model to pin onto this session.
-    let active: (Option<String>, Option<String>) = {
+    // Three values, not two: the daemon is stamped with the registry id while
+    // the frontend needs the profile id, and they diverge for `local`.
+    let active: (Option<String>, Option<String>, Option<String>) = {
         let state = app.state::<AppState>();
         let cfg = state.config.lock().unwrap();
         let provider = cfg
             .active_provider_id
             .as_deref()
             .and_then(|id| cfg.providers.iter().find(|p| p.id == id))
-            .map(|p| (Some(p.id.clone()), p.models.first().cloned()));
-        provider.unwrap_or((None, None))
+            .map(|p| {
+                (
+                    // `daemon_provider_id`, not `p.id`: a `local` profile is
+                    // registered under a fixed id and stamping the profile id
+                    // pins the session to a provider the daemon registry has
+                    // never heard of, which silently un-pins it.
+                    Some(crate::bigtiny::providers::daemon_provider_id(p)),
+                    p.models.first().cloned(),
+                    Some(p.id.clone()),
+                )
+            });
+        provider.unwrap_or((None, None, None))
     };
-    crate::bigtiny::sessions::create(&app, cwd, active.0, active.1).await
+    crate::bigtiny::sessions::create(&app, cwd, active.0, active.1, active.2).await
 }
 
 /// Attach one recipe-declared extension to a live session — a no-op under

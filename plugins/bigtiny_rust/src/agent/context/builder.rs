@@ -2,7 +2,7 @@ use serde_json::{json, Value};
 use sqlx::SqlitePool;
 
 use crate::agent::compaction::{
-    apply_content_mask, apply_tool_mask, emergency_trim, find_reserve_floor_rowid,
+    apply_content_mask, apply_tool_mask, emergency_trim, find_reserve_floor_rowid_budgeted,
     render_memory_block, stored_content_as_text,
 };
 use crate::agent::tokens::count_messages_tokens;
@@ -63,6 +63,12 @@ impl ContextBuilder {
         max_context_tokens_override: Option<i32>,
         chat_dir: Option<&str>,
         cwd: Option<&str>,
+        // Pre-rendered listing of `cwd` (see `workspace_snapshot`). Passed in
+        // rather than built here because it must be cached per working
+        // directory: this head is kept byte-identical across turns for
+        // prefix-cache hits, so a rescan per turn would churn the prefix
+        // every time a file in the folder changed.
+        workspace_snapshot: Option<&str>,
         ap_hints: Option<&str>,
         retrieved: Option<&str>,
         thought_seed: Option<&str>,
@@ -110,15 +116,38 @@ impl ContextBuilder {
             } else {
                 writable_dirs.join(" or ")
             };
+            // `cwd` is named separately as *the* default rather than being
+            // listed as one of several equal roots. The model's problem was
+            // never that it lacked a list of permitted paths — it was not
+            // knowing which one a bare relative path or a `.` would land in,
+            // so it probed for one.
+            let default_hint = match cwd {
+                Some(d) => format!(" Unqualified and relative paths resolve against {d}."),
+                None => String::new(),
+            };
             messages.push(json!({
                 "role": "system",
                 "content": format!(
-                    "Your file tools (read/write/edit/list) are scoped to {}. \
+                    "Your file tools (read/write/edit/list) are scoped to {where_str}.{default_hint} \
                      Any files the user attached to this chat live there too — use that \
-                     path directly instead of searching for one.",
-                    where_str
+                     path directly instead of searching for one."
                 )
             }));
+        }
+
+        // Layer 2.6: what is actually in the working directory.
+        //
+        // Costs a few hundred tokens once per working-directory change and
+        // saves a round of orientation tool calls at the start of every task
+        // in a new folder — see `workspace_snapshot`'s module docs for the
+        // failure this replaces.
+        if let Some(snapshot) = workspace_snapshot {
+            if !snapshot.trim().is_empty() {
+                messages.push(json!({
+                    "role": "system",
+                    "content": snapshot
+                }));
+            }
         }
 
         // Layer 4: Anchor the first user message
@@ -181,7 +210,16 @@ impl ContextBuilder {
 
         let live_messages: Vec<Value> = live_rows.iter().map(row_to_message).collect();
 
-        let reserve_floor = find_reserve_floor_rowid(&live_messages, self.reserve_exchanges);
+        // Budgeted by the live-tail cap, which is exactly the question this
+        // floor answers: how much trailing history is allowed to stay
+        // verbatim. Unbudgeted, a session of three or fewer user turns
+        // reserved *everything*, so the mask and trim calls below were
+        // guaranteed no-ops no matter how far over the window it was.
+        let reserve_floor = find_reserve_floor_rowid_budgeted(
+            &live_messages,
+            self.reserve_exchanges,
+            self.config.max_live_tail_tokens,
+        );
         let live_messages = apply_tool_mask(&live_messages, reserve_floor, &self.config);
         let live_messages = apply_content_mask(&live_messages, reserve_floor, &self.config);
         let live_messages = self.enforce_live_tail_budget(&live_messages, reserve_floor);
@@ -665,6 +703,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -677,6 +716,7 @@ mod tests {
                 None,
                 Some("C:\\chat"),
                 Some("C:\\cwd"),
+                None,
                 None,
                 None,
                 None,
@@ -719,6 +759,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -731,6 +772,7 @@ mod tests {
                 None,
                 Some("C:\\c"),
                 Some("C:\\w"),
+                None,
                 None,
                 None,
                 Some("   "),
@@ -752,6 +794,7 @@ mod tests {
                 None,
                 Some("C:\\c"),
                 Some("C:\\w"),
+                None,
                 None,
                 None,
                 Some("The user prefers terse answers."),
@@ -798,7 +841,7 @@ mod tests {
 
         let messages = builder
             .build_messages(
-                "sess-1", "hello", None, None, None, None, None, None, None, None,
+                "sess-1", "hello", None, None, None, None, None, None, None, None, None,
             )
             .await
             .unwrap();
@@ -843,6 +886,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -855,6 +899,7 @@ mod tests {
                 None,
                 Some("C:\\c"),
                 Some("C:\\w"),
+                None,
                 Some("   "),
                 None,
                 None,
@@ -877,6 +922,7 @@ mod tests {
                 None,
                 Some("C:\\c"),
                 Some("C:\\w"),
+                None,
                 Some("Use write instead of edit for new files."),
                 None,
                 None,
@@ -982,7 +1028,7 @@ mod tests {
 
         let messages = builder
             .build_messages(
-                "sess-1", "next", None, None, None, None, None, None, None, None,
+                "sess-1", "next", None, None, None, None, None, None, None, None, None,
             )
             .await
             .unwrap();
@@ -1029,6 +1075,7 @@ mod tests {
             .build_messages(
                 "sess-1",
                 "next",
+                None,
                 None,
                 None,
                 None,

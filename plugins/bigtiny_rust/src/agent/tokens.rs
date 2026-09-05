@@ -43,7 +43,17 @@ pub fn count_message_tokens(msg: &Value) -> i32 {
                             if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
                                 total += count_text_tokens(text);
                             }
-                        } else if block_type == "image" {
+                        } else if block_type == "image" || block_type == "image_url" {
+                            // `image_url` is not a second spelling we accept
+                            // for tidiness — it is the *only* shape that
+                            // reaches a real request. `normalize_image_block`
+                            // in `context/builder.rs` emits
+                            // `{"type":"image_url", ...}`, so matching only
+                            // "image" charged every attached image zero
+                            // tokens in every budget: the wrap-up valve, the
+                            // emergency trim, and the per-row `token_count`
+                            // persisted for compaction all counted a
+                            // multi-megabyte base64 payload as free.
                             total += 256;
                         }
                     }
@@ -383,5 +393,24 @@ mod tests {
         ];
         let total = count_messages_tokens(&messages);
         assert!(total > 0);
+    }
+
+    /// `normalize_image_block` (context/builder.rs) emits `"image_url"`, so
+    /// an image charged nothing at all in every budget until that spelling
+    /// was matched. Guard both the shape that ships and the shape the old
+    /// arm handled.
+    #[test]
+    fn attached_images_are_never_free() {
+        for block_type in ["image", "image_url"] {
+            let msg = json!({
+                "role": "user",
+                "content": [{"type": block_type, "image_url": {"url": "data:image/png;base64,AAAA"}}]
+            });
+            let counted = count_message_tokens(&msg);
+            assert!(
+                counted >= 256,
+                "{block_type:?} must be charged the flat image cost, got {counted}"
+            );
+        }
     }
 }

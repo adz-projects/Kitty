@@ -55,17 +55,33 @@ export function supportsImages(model: string | null | undefined): boolean {
   return VISION_PATTERNS.some((re) => re.test(model));
 }
 
-/** Detection OR the provider profile's manual `supports_vision` override.
+/** Whether the user may attach images, resolving every source of evidence.
  *
  * Use this, not `supportsImages`, anywhere a decision is made about what the
- * *user* may attach. The patterns above cannot know a self-hosted or
- * unconventionally-named vision model, and defaulting those to "no" (correct
- * as a default) would otherwise leave no way to say so. The override only
- * widens — it can enable image affordances for a model the patterns miss, and
- * never disables them for one they recognize. */
+ * *user* may attach.
+ *
+ * `detected` is the backend's verdict (`ProviderView.accepts_images`), read
+ * from what the provider says about itself — Ollama's `/api/show`
+ * `capabilities`, OpenRouter's `architecture.input_modalities`. It is
+ * deliberately tri-state: `null` means nobody asked or nobody answered, which
+ * is not the same as a reported "no".
+ *
+ * Precedence, and why:
+ *   1. The manual override wins. The user ticked a box; respect it.
+ *   2. Then detection, **including a definite `false`**. A provider reporting
+ *      its own capabilities is better evidence than a regex over its name, so
+ *      this may narrow as well as widen — which is the point. A text-only
+ *      model with a vision-ish name used to offer an attach button that could
+ *      only ever produce a failed turn.
+ *   3. Then the name patterns, unchanged, for everything undetectable (a
+ *      llama.cpp or LM Studio server exposes no capability field at all).
+ */
 export function modelAcceptsImages(
   model: string | null | undefined,
-  providerOverride: boolean
+  providerOverride: boolean,
+  detected?: boolean | null
 ): boolean {
-  return providerOverride || supportsImages(model);
+  if (providerOverride) return true;
+  if (detected !== null && detected !== undefined) return detected;
+  return supportsImages(model);
 }

@@ -33,6 +33,7 @@ function profile(overrides: Partial<ProviderView>): ProviderView {
     network_tier: 'remote',
     has_secret: true,
     active: false,
+    accepts_images: null,
     ...overrides,
   };
 }

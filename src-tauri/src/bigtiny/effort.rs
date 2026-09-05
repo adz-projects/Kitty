@@ -240,6 +240,29 @@ fn extract_effort_levels(template: &str) -> Option<Vec<String>> {
     }
 }
 
+/// The graded levels to offer a template that has a thinking toggle but no
+/// `reasoning_effort` guard.
+///
+/// Qwen3's original template gates thinking with the boolean
+/// `enable_thinking` alone. `extract_effort_levels` returns `None` for those,
+/// which hid the control entirely — even though the daemon's emitter
+/// (`openai_compat.rs`) has always translated any non-Off level into
+/// `enable_thinking: true`. Discovery and emission disagreed, and discovery
+/// won. Offering the graded set means the toggle actually reaches the server;
+/// on a boolean-only template every non-Off level reads the same, which is
+/// the honest behaviour rather than a hidden control.
+fn boolean_thinking_levels(template: &str) -> Option<Vec<String>> {
+    template.contains("enable_thinking").then(|| {
+        vec!["low".to_string(), "medium".to_string(), "high".to_string()]
+    })
+}
+
+/// Levels for one chat template: the graded guard if present, else the
+/// boolean-toggle fallback, else `None` (genuinely no thinking control).
+fn levels_from_template(template: &str) -> Option<Vec<String>> {
+    extract_effort_levels(template).or_else(|| boolean_thinking_levels(template))
+}
+
 /// Cache key for discovered effort levels: keyed by provider **and** model, so
 /// switching the model on a provider re-probes rather than showing another
 /// model's levels.
@@ -248,9 +271,20 @@ fn effort_cache_key(provider_id: &str, model: &str) -> String {
 }
 
 /// Normalize a provider base URL to an origin we can hang `/props` off: add a
-/// scheme if the user typed a bare `host:port`, and drop a trailing slash.
+/// scheme if the user typed a bare `host:port`, drop a trailing slash, and
+/// drop a trailing `/v1`.
+///
+/// The `/v1` strip is the whole reason effort discovery silently did nothing
+/// on the most common setups. LM Studio's default base URL is
+/// `http://localhost:1234/v1`, and llama-server users routinely enter `/v1`
+/// too — but llama-server serves `/props` at the **root**, so probing
+/// `…/v1/props` 404s, discovery finds no levels, the dropdown is hidden, and
+/// not even `enable_thinking` is sent. `bigtiny_provider_target`
+/// (`bigtiny/providers.rs`) has always stripped `/v1` for the same reason;
+/// this function disagreeing with it about the same URL was the bug.
 fn normalize_base(base_url: &str) -> String {
     let b = base_url.trim().trim_end_matches('/');
+    let b = b.strip_suffix("/v1").unwrap_or(b);
     if b.contains("://") {
         b.to_string()
     } else {
@@ -271,8 +305,9 @@ async fn probe_effort_levels(
     base_url: &str,
     model: &str,
     api_key: Option<&str>,
-) -> Option<Vec<String>> {
+) -> ProbeOutcome {
     let client = crate::util::http_client();
+    let mut reached_a_template = false;
 
     // 1. The endpoint's own chat template.
     let props_url = format!("{}/props", normalize_base(base_url));
@@ -283,33 +318,89 @@ async fn probe_effort_levels(
     if let Ok(resp) = req.send().await {
         if let Ok(v) = resp.json::<serde_json::Value>().await {
             if let Some(tmpl) = v.get("chat_template").and_then(|t| t.as_str()) {
-                if let Some(levels) = extract_effort_levels(tmpl) {
-                    tracing::debug!(?levels, "effort levels from endpoint /props");
-                    return Some(levels);
+                reached_a_template = true;
+                if let Some(levels) = levels_from_template(tmpl) {
+                    tracing::debug!(?levels, props_url, "effort levels from endpoint /props");
+                    return ProbeOutcome::Levels(levels);
                 }
             }
         }
     }
 
-    // 2. HuggingFace, only when the model id is a plausible `owner/repo` (not a
-    //    local gguf path or a bare name).
-    if model.split('/').count() == 2 && !model.contains(' ') && !model.starts_with('/') {
-        let hf_url = format!(
-            "https://huggingface.co/{model}/resolve/main/tokenizer_config.json"
-        );
+    // 2. HuggingFace, when the model id looks like `owner/repo`. Quantized
+    //    local ids routinely carry a quant tag or file extension
+    //    (`Qwen/Qwen3-8B-GGUF:Q5_K_M`), so strip that before deciding — the
+    //    old exact-two-segments test skipped every one of them.
+    if let Some(repo) = hf_repo_id(model) {
+        let hf_url = format!("https://huggingface.co/{repo}/resolve/main/tokenizer_config.json");
         if let Ok(resp) = client.get(&hf_url).send().await {
             if let Ok(v) = resp.json::<serde_json::Value>().await {
                 if let Some(tmpl) = v.get("chat_template").and_then(|t| t.as_str()) {
-                    if let Some(levels) = extract_effort_levels(tmpl) {
-                        tracing::debug!(?levels, "effort levels from HuggingFace");
-                        return Some(levels);
+                    reached_a_template = true;
+                    if let Some(levels) = levels_from_template(tmpl) {
+                        tracing::debug!(?levels, repo, "effort levels from HuggingFace");
+                        return ProbeOutcome::Levels(levels);
                     }
                 }
             }
         }
     }
 
-    None
+    // Loud, because this used to be entirely silent: the only trace was a
+    // `debug!` on *success*, so a wrong base URL or an endpoint with no
+    // `/props` looked exactly like a model that genuinely cannot reason.
+    if reached_a_template {
+        tracing::info!(
+            props_url,
+            model,
+            "this model's chat template has no thinking control — hiding the effort dropdown"
+        );
+        ProbeOutcome::NoControl
+    } else {
+        tracing::warn!(
+            props_url,
+            model,
+            "could not read a chat template for this endpoint, so reasoning effort is \
+             unavailable. llama-server serves /props at the root; LM Studio serves it \
+             nowhere, in which case naming the model as an owner/repo id lets its \
+             template be read from HuggingFace instead"
+        );
+        ProbeOutcome::Unreachable
+    }
+}
+
+/// What a probe learned. Three outcomes, not two, because only two of them
+/// are worth remembering.
+enum ProbeOutcome {
+    /// The template names these levels (or carries a boolean toggle).
+    Levels(Vec<String>),
+    /// A template was read and it has no thinking control at all.
+    NoControl,
+    /// Nothing could be read — wrong URL, server down, no `/props`. Says
+    /// nothing about the model, so it must not be cached.
+    Unreachable,
+}
+
+/// The `owner/repo` HuggingFace id inside a model name, if there is a
+/// plausible one.
+///
+/// Local model ids pick up decoration that a bare `split('/').count() == 2`
+/// test rejects: an Ollama-style `:tag`, a `.gguf` extension, or a nested
+/// path inside a quantized repo. Strip those and take the first two segments.
+fn hf_repo_id(model: &str) -> Option<String> {
+    let m = model.trim();
+    if m.is_empty() || m.contains(' ') || m.starts_with('/') || m.contains('\\') {
+        return None;
+    }
+    let m = m.split(':').next().unwrap_or(m);
+    let m = m.strip_suffix(".gguf").unwrap_or(m);
+    let mut parts = m.split('/').filter(|p| !p.is_empty());
+    let owner = parts.next()?;
+    let repo = parts.next()?;
+    if owner.len() < 2 {
+        return None;
+    }
+    Some(format!("{owner}/{repo}"))
 }
 
 /// Populate `AppState::effort_levels` for the active provider if it's a
@@ -342,11 +433,18 @@ pub async fn ensure_effort_levels_cached(app: &AppHandle) {
     };
 
     let api_key = crate::config::providers::get_secret_async(&provider_id).await;
-    // Empty vec is a real answer ("probed, none found" → hide) and is cached so
-    // we don't re-probe a server that has no graded effort every dropdown read.
-    let levels = probe_effort_levels(&base_url, &model, api_key.as_deref())
-        .await
-        .unwrap_or_default();
+    // Only a *definite* answer is memoized. An empty vec means "read the
+    // template, it has no thinking control" — a real fact about the model,
+    // worth caching so the dropdown does not re-probe on every read. An
+    // unreachable endpoint says nothing about the model, and caching that as
+    // "no levels" pinned the control off for the rest of the process just
+    // because the server happened to be down at first read. Same rule
+    // `context_window::ensure_context_length_cached` documents.
+    let levels = match probe_effort_levels(&base_url, &model, api_key.as_deref()).await {
+        ProbeOutcome::Levels(levels) => levels,
+        ProbeOutcome::NoControl => Vec::new(),
+        ProbeOutcome::Unreachable => return,
+    };
     let state = app.state::<crate::state::AppState>();
     state.effort_levels.lock().unwrap().insert(key, levels);
 }
@@ -627,6 +725,81 @@ mod tests {
 
         let anth = effort_options(EffortDialect::AnthropicThinking);
         assert_eq!(anth.first().unwrap().value, "off");
+    }
+
+    /// The bug that made effort discovery a no-op on the most common setups.
+    /// LM Studio's default base URL is `http://localhost:1234/v1`, and
+    /// llama-server users routinely enter `/v1` too — but llama-server serves
+    /// `/props` at the root, so probing `…/v1/props` 404s and the control is
+    /// silently hidden. `bigtiny_provider_target` had always stripped `/v1`;
+    /// this function disagreeing with it about the same URL was the defect.
+    #[test]
+    fn normalize_base_strips_a_trailing_v1() {
+        for (input, want) in [
+            ("http://localhost:1234/v1", "http://localhost:1234"),
+            ("http://localhost:1234/v1/", "http://localhost:1234"),
+            ("localhost:1234/v1", "http://localhost:1234"),
+            ("https://box.ts.net:8080/v1", "https://box.ts.net:8080"),
+            // Not a `/v1` suffix — must be left alone.
+            ("http://localhost:1234", "http://localhost:1234"),
+            ("http://localhost:1234/v10", "http://localhost:1234/v10"),
+            ("http://host/api/v1/sub", "http://host/api/v1/sub"),
+        ] {
+            assert_eq!(normalize_base(input), want, "input {input:?}");
+        }
+    }
+
+    /// Qwen3's original template gates thinking with the boolean
+    /// `enable_thinking` alone, with no `reasoning_effort ... not in (...)`
+    /// guard. `extract_effort_levels` returns `None` for those, which hid the
+    /// control entirely — even though the daemon's emitter has always
+    /// translated any non-Off level into `enable_thinking: true`. Discovery
+    /// and emission disagreed, and discovery won.
+    #[test]
+    fn a_boolean_only_template_still_offers_graded_levels() {
+        let boolean_only = "{% if enable_thinking %}<think>{% endif %}";
+        assert_eq!(extract_effort_levels(boolean_only), None);
+        assert_eq!(
+            levels_from_template(boolean_only),
+            Some(vec!["low".into(), "medium".into(), "high".into()])
+        );
+    }
+
+    /// The graded guard still wins over the boolean fallback when both are
+    /// present, and a template with neither is still "no control".
+    #[test]
+    fn a_graded_guard_wins_and_a_plain_template_yields_nothing() {
+        let graded = "{% if reasoning_effort not in ('xhigh', 'medium', 'low') %}\
+                      {% set enable_thinking = false %}{% endif %}";
+        assert_eq!(
+            levels_from_template(graded),
+            Some(vec!["xhigh".into(), "medium".into(), "low".into()])
+        );
+        assert_eq!(levels_from_template("{{ messages }}"), None);
+    }
+
+    /// The old gate was `split('/').count() == 2`, which rejected every
+    /// quantized local id — exactly the ones that need the HuggingFace
+    /// fallback, since their server usually has no `/props`.
+    #[test]
+    fn hf_repo_id_tolerates_quant_tags_and_extensions() {
+        for (input, want) in [
+            ("Qwen/Qwen3-8B", Some("Qwen/Qwen3-8B")),
+            ("Qwen/Qwen3-8B-GGUF:Q5_K_M", Some("Qwen/Qwen3-8B-GGUF")),
+            ("Qwen/Qwen3-8B-GGUF/model.gguf", Some("Qwen/Qwen3-8B-GGUF")),
+            ("unsloth/Qwen3-27B-GGUF.gguf", Some("unsloth/Qwen3-27B-GGUF")),
+            // Not repo ids.
+            ("qwen3-8b", None),
+            ("", None),
+            ("/models/local.gguf", None),
+            ("some model/with a space", None),
+        ] {
+            assert_eq!(
+                hf_repo_id(input).as_deref(),
+                want,
+                "input {input:?}"
+            );
+        }
     }
 
     #[test]

@@ -20,6 +20,15 @@ pub struct ProviderView {
     pub network_tier: NetworkTier,
     pub has_secret: bool,
     pub active: bool,
+    /// Resolved image support for this profile's model: the manual
+    /// `supports_vision` override, else what `bigtiny::vision` discovered and
+    /// remembered. `None` means no evidence either way, and the frontend
+    /// falls back to the name patterns in `vision_models.ts`.
+    ///
+    /// Distinct from the flattened `supports_vision` field, which is only the
+    /// user's manual override — a `Some(false)` here is a real negative from
+    /// the provider and does turn image affordances off.
+    pub accepts_images: Option<bool>,
 }
 
 /// Async — `has_secret` is a blocking Windows Credential Manager IPC call per
@@ -34,6 +43,7 @@ async fn provider_views(cfg: &Config) -> Vec<ProviderView> {
             network_tier: p.network_tier(),
             has_secret,
             active: cfg.active_provider_id.as_deref() == Some(&p.id),
+            accepts_images: crate::bigtiny::vision::vision_for_profile(cfg, p),
             profile: p.clone(),
         });
     }
@@ -97,6 +107,11 @@ pub async fn upsert_provider(
                 profile.id
             );
         }
+        // Probe image support now rather than waiting for the first turn, so
+        // the composer offers (or hides) the attach controls correctly from
+        // the moment the profile is saved. Best-effort and already cached
+        // after the first success.
+        crate::bigtiny::vision::ensure_vision_cached(&app).await;
     }
     Ok(profile)
 }
@@ -149,6 +164,47 @@ pub async fn ollama_context_length(
         .map_err(|e| format!("could not reach Ollama: {e}"))?;
     let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
     Ok(context_length_from_show(&json))
+}
+
+/// Best-effort vision probe for a **remote** Ollama server, via the same
+/// `POST /api/show` call `ollama_context_length` already makes.
+///
+/// Ollama reports a top-level `capabilities` array (`["completion","vision"]`,
+/// or `"multimodal"` on some builds). Kitty was guessing vision support from
+/// the model *name* while this authoritative answer sat one field away in a
+/// response it was already fetching for the context length — the `qwen3.6`
+/// entry in `vision_models.ts` even documents someone reading this array by
+/// hand and hardcoding the result.
+///
+/// `Ok(None)` rather than `Err` on an unrecognized shape, matching every other
+/// probe here: an absent capabilities array (older Ollama) must stay
+/// distinguishable from a definite "no vision", because only the latter is
+/// allowed to narrow what the UI offers.
+#[tauri::command]
+pub async fn ollama_accepts_images(
+    base_url: String,
+    model: String,
+) -> Result<Option<bool>, String> {
+    let url = format!("{}/api/show", base_url.trim_end_matches('/'));
+    let resp = crate::util::http_client()
+        .post(url)
+        .json(&serde_json::json!({ "model": model }))
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|e| format!("could not reach Ollama: {e}"))?;
+    let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    Ok(vision_from_show(&json))
+}
+
+/// Read the `capabilities` array out of an Ollama `/api/show` response. Split
+/// out pure so it is testable without a live server, like
+/// `context_length_from_show` beside it.
+fn vision_from_show(json: &serde_json::Value) -> Option<bool> {
+    let caps = json.get("capabilities")?.as_array()?;
+    Some(caps.iter().filter_map(|c| c.as_str()).any(|c| {
+        c.eq_ignore_ascii_case("vision") || c.eq_ignore_ascii_case("multimodal")
+    }))
 }
 
 /// Pull `<arch>.context_length` out of an Ollama `/api/show` `model_info`
@@ -579,16 +635,28 @@ pub async fn activate_provider(
     // into other windows' sessions. Resolved from the profile's first model,
     // the same default `sync_active_provider`/`rebind_session` use.
     if let (Some(sid), Some(pid)) = (session_id.as_deref(), stamp_pid.as_deref()) {
-        let default_model = {
+        // Resolved together: the stamp must carry the id the daemon registry
+        // actually knows (see `daemon_provider_id`), which differs from the
+        // profile id for the in-process engine.
+        let stamp = {
             let state = app.state::<AppState>();
             let cfg = state.config.lock().unwrap();
-            cfg.providers
-                .iter()
-                .find(|p| p.id == pid)
-                .and_then(|p| p.models.first().cloned())
-                .unwrap_or_default()
+            cfg.providers.iter().find(|p| p.id == pid).map(|p| {
+                (
+                    crate::bigtiny::providers::daemon_provider_id(p),
+                    p.models.first().cloned().unwrap_or_default(),
+                )
+            })
         };
-        crate::bigtiny::providers::set_session_provider(&app, sid, pid, &default_model).await;
+        if let Some((daemon_pid, default_model)) = stamp {
+            crate::bigtiny::providers::set_session_provider(
+                &app,
+                sid,
+                &daemon_pid,
+                &default_model,
+            )
+            .await;
+        }
     }
 
     // Tell the frontend to re-sync provider state immediately (Round-2 item 4) —
@@ -659,6 +727,36 @@ mod tests {
         // read as "unknown", not panic.
         let body = json!({ "unexpected": "shape" });
         assert_eq!(context_length_from_show(&body), None);
+    }
+
+    /// The signal Kitty was guessing at from model names, sitting in a
+    /// response it already made for the context length. Both spellings are
+    /// real: `"vision"` is current Ollama, `"multimodal"` appears on some
+    /// builds (the `qwen3.6` note in `vision_models.ts` records seeing it).
+    #[test]
+    fn vision_from_show_reads_the_capabilities_array() {
+        for caps in [
+            serde_json::json!(["completion", "vision"]),
+            serde_json::json!(["completion", "multimodal"]),
+            serde_json::json!(["VISION"]),
+        ] {
+            let body = serde_json::json!({ "capabilities": caps });
+            assert_eq!(vision_from_show(&body), Some(true), "{caps}");
+        }
+        let text_only = serde_json::json!({"capabilities": ["completion", "tools"]});
+        assert_eq!(vision_from_show(&text_only), Some(false));
+    }
+
+    /// A missing array is "nobody answered", NOT "no vision" — only the
+    /// latter is allowed to turn image affordances off, so collapsing the two
+    /// would silently disable images on every older Ollama build.
+    #[test]
+    fn a_missing_capabilities_array_is_unknown_not_a_negative() {
+        assert_eq!(vision_from_show(&serde_json::json!({})), None);
+        assert_eq!(
+            vision_from_show(&serde_json::json!({"capabilities": "vision"})),
+            None
+        );
     }
 
     #[test]

@@ -286,6 +286,78 @@ fn scratch_allowance() -> Vec<String> {
 }
 
 /// The effective allowed-directory set for a session.
+/// Argument keys that name a filesystem path in kitty-tools' surface.
+const PATH_ARG_KEYS: [&str; 1] = ["path"];
+
+/// Rewrite a relative `path` argument to be relative to the *session's*
+/// working directory, returning whether anything changed.
+///
+/// kitty-tools resolves a relative path — including the `"."` that
+/// `lean_analyze_workspace` uses as its default — against its own process
+/// working directory. That process is an MCP child spawned without
+/// `current_dir`, so it inherits Kitty's launch directory: listing `"."`
+/// returned Kitty's app-data folder rather than the folder the user chose.
+/// The session's `cwd` lives in its metadata and never reached the tool
+/// process in any form, so there was no way for the model to get this right
+/// except by guessing absolute paths.
+///
+/// Rewriting here rather than in kitty-tools is deliberate. The tool process
+/// is shared by every session, so "the working directory" cannot be a
+/// property of it; only the daemon knows which session a call belongs to. It
+/// also keeps kitty-tools' own home-relative resolution intact, which Android
+/// depends on.
+///
+/// Scoped to `lean_*` tools and the `path` key: that is kitty-tools'
+/// naming convention, and a third-party MCP server is free to use "path" for
+/// something that is not a filesystem path at all (a JSON pointer, an API
+/// route). Absolute and home-relative (`~`) paths are left exactly as written
+/// — the model meant those literally.
+pub fn qualify_relative_path_args(tool_name: &str, args: &mut Value, cwd: &str) -> bool {
+    if !tool_name.starts_with("lean_") || cwd.is_empty() {
+        return false;
+    }
+    let Some(obj) = args.as_object_mut() else {
+        return false;
+    };
+    let mut changed = false;
+    for key in PATH_ARG_KEYS {
+        let Some(raw) = obj.get(key).and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let trimmed = raw.trim();
+        if trimmed.starts_with('~') {
+            continue;
+        }
+        // `has_root` as well as `is_absolute`: on Windows a POSIX-style
+        // "/foo" is rooted but not absolute (no drive prefix), and joining it
+        // onto the cwd would silently invent a path the model never asked for.
+        let p = std::path::Path::new(trimmed);
+        if p.is_absolute() || p.has_root() {
+            continue;
+        }
+        let rel = trimmed
+            .trim_start_matches("./")
+            .trim_start_matches(".\\")
+            .trim_end_matches('/')
+            .trim_end_matches('\\');
+        // Deliberately NOT `norm`: that case-folds on Windows for
+        // *comparison* purposes, and this string is handed straight to the
+        // tool as a real path — lowercasing the user's folder name in every
+        // result and error message would be gratuitous noise. Only separators
+        // and a trailing slash need normalizing here.
+        let base = cwd.replace('\\', "/");
+        let base = base.trim_end_matches('/');
+        let qualified = if rel.is_empty() || rel == "." {
+            base.to_string()
+        } else {
+            format!("{base}/{}", rel.replace('\\', "/"))
+        };
+        obj.insert(key.to_string(), Value::String(qualified));
+        changed = true;
+    }
+    changed
+}
+
 pub fn allowed_dirs_for_session(metadata: &Value, cache_dir: &str) -> Vec<String> {
     let mut dirs = Vec::new();
 
@@ -607,5 +679,70 @@ mod tests {
         assert_eq!(norm("/home/User/Project/"), "/home/User/Project");
         let bases = vec!["/home/User/project".to_string()];
         assert!(!path_within_any(&bases, "/home/user/project/evil"));
+    }
+
+    /// The bug this exists for: `lean_analyze_workspace` defaults `path` to
+    /// "." and kitty-tools resolves that against its own process working
+    /// directory — Kitty's launch folder — so the model was shown app-data
+    /// instead of the folder the user chose, did not recognize it, and kept
+    /// guessing.
+    #[test]
+    fn a_bare_dot_becomes_the_session_working_directory() {
+        let mut args = json!({"path": "."});
+        assert!(qualify_relative_path_args(
+            "lean_analyze_workspace",
+            &mut args,
+            "C:/Users/me/Labs"
+        ));
+        assert_eq!(args["path"], json!("C:/Users/me/Labs"));
+    }
+
+    #[test]
+    fn relative_paths_are_qualified_and_separators_normalized() {
+        for (input, want) in [
+            ("src", "C:/proj/src"),
+            ("./src", "C:/proj/src"),
+            ("src/main.rs", "C:/proj/src/main.rs"),
+            (r"src\main.rs", "C:/proj/src/main.rs"),
+            ("", "C:/proj"),
+        ] {
+            let mut args = json!({ "path": input });
+            qualify_relative_path_args("lean_file_read", &mut args, "C:/proj");
+            assert_eq!(args["path"], json!(want), "input {input:?}");
+        }
+    }
+
+    /// An absolute or home-relative path is what the model literally meant;
+    /// silently reparenting it under the cwd would invent a path nobody asked
+    /// for and turn a clear "not found" into a confusing one.
+    #[test]
+    fn absolute_and_home_relative_paths_are_left_alone() {
+        for input in [
+            "C:/elsewhere/file.txt",
+            "/etc/hosts",
+            "~/notes.md",
+            r"\\server\share\f.txt",
+        ] {
+            let mut args = json!({ "path": input });
+            assert!(
+                !qualify_relative_path_args("lean_file_read", &mut args, "C:/proj"),
+                "input {input:?} must not be rewritten"
+            );
+            assert_eq!(args["path"], json!(input));
+        }
+    }
+
+    /// Scoped to kitty-tools' `lean_` namespace: a third-party MCP server is
+    /// free to use "path" for a JSON pointer or an API route, and rewriting
+    /// that into a filesystem path would corrupt the call.
+    #[test]
+    fn other_servers_arguments_are_untouched() {
+        let mut args = json!({"path": "/users/me"});
+        assert!(!qualify_relative_path_args("github_get", &mut args, "C:/proj"));
+        assert_eq!(args["path"], json!("/users/me"));
+
+        // No cwd to qualify against is also a no-op, not a panic.
+        let mut args = json!({"path": "."});
+        assert!(!qualify_relative_path_args("lean_file_read", &mut args, ""));
     }
 }

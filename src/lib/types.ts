@@ -186,6 +186,16 @@ export interface ProviderView extends ProviderProfile {
   network_tier: NetworkTier;
   has_secret: boolean;
   active: boolean;
+  /** Resolved image support: the manual `supports_vision` override, else what
+      the backend discovered from the provider itself (Ollama's `/api/show`
+      `capabilities`, OpenRouter's `architecture.input_modalities`) and
+      remembered per provider+model. `null` means no evidence either way, and
+      the caller falls back to `vision_models.ts`'s name patterns.
+
+      Note this can be `false` where the name patterns would say true — a
+      provider reporting its own capabilities outranks a regex over its name.
+      Mirrors `ProviderView::accepts_images` in commands/provider.rs. */
+  accepts_images: boolean | null;
 }
 
 /** `GET /api/v1/key`'s `data` object — only the fields Kitty's UI reads are
@@ -596,6 +606,14 @@ export interface SessionInfo {
       rather than a folder pill. Mirrors `SessionInfo.is_default_folder` in
       commands/session/crud.rs. */
   is_default_folder: boolean;
+  /** The Kitty provider profile id and model this session was pinned to at
+      birth. `newSession` must copy these into `sessionProviderId` /
+      `sessionModelId`, or `refreshProvider` falls back to whichever profile
+      holds the global `active` flag and the chat silently follows the default
+      provider — see the Rust field's doc comment. `null` for session-info
+      results that carry no pin (resume/fork). */
+  provider_id: string | null;
+  model_id: string | null;
 }
 
 export interface EffortOption {

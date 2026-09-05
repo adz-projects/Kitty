@@ -306,15 +306,66 @@ pub fn classify_provider_error(
     // affordance, the session-concluded state) ever engaged. It is also the
     // exact wording the wrap-up valve provokes when its `max_tokens` clamp is
     // wrong, which is why this is the arm that must be right.
+    // Structured detection first. llama.cpp (and llama-server behind a
+    // `custom_openai` profile) reports
+    //   {"error":{"code":400,"message":"request (202370 tokens) exceeds the
+    //    available context size (192000 tokens), try increasing it",
+    //    "type":"exceed_context_size_error","n_prompt_tokens":202370,
+    //    "n_ctx":192000}}
+    // which says *size*, not *maximum* or *limit*, and so matched none of the
+    // substring arms below — it fell through to the retryable `Other` and took
+    // the whole compounding failure path described above with it. Reading the
+    // JSON is both more reliable than guessing at prose and the only way to
+    // recover `n_ctx`/`n_prompt_tokens`, which tell us exactly how far over we
+    // were and what the window actually is.
+    let structured = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("error").cloned());
+    if let Some(err_obj) = structured.as_ref() {
+        let kind = |k: &str| {
+            err_obj
+                .get(k)
+                .and_then(|v| v.as_str())
+                .map(str::to_ascii_lowercase)
+                .unwrap_or_default()
+        };
+        let ty = kind("type");
+        let code = kind("code");
+        if ty.contains("exceed_context_size")
+            || ty.contains("context_length_exceeded")
+            || code.contains("exceed_context_size")
+            || code.contains("context_length_exceeded")
+        {
+            let num = |k: &str| {
+                err_obj
+                    .get(k)
+                    .and_then(|v| v.as_i64())
+                    .and_then(|n| i32::try_from(n).ok())
+            };
+            return ProviderError::ContextExceeded {
+                user_message: "Context window exceeded. Consider compacting the session.".into(),
+                raw_message: body.into(),
+                http_status: status_code as i32,
+                prompt_tokens: num("n_prompt_tokens"),
+                context_window: num("n_ctx"),
+            };
+        }
+    }
+
     if lower.contains("context_length_exceeded")
+        || lower.contains("exceed_context_size")
+        || lower.contains("exceeds the available context")
         || lower.contains("context") && lower.contains("maximum")
         || lower.contains("context") && lower.contains("limit")
+        || lower.contains("context size")
         || lower.contains("too long")
     {
         return ProviderError::ContextExceeded {
             user_message: "Context window exceeded. Consider compacting the session.".into(),
             raw_message: body.into(),
             http_status: status_code as i32,
+            prompt_tokens: None,
+            context_window: None,
         };
     }
 
@@ -401,6 +452,58 @@ mod tests {
             let err = classify_provider_error(400, body, None);
             assert!(!err.is_retryable(), "{body:?} must not be retried");
             assert_eq!(err.wire_type_tag(), Some("context_exceeded"), "{body:?}");
+        }
+    }
+
+    /// The real llama.cpp 400 body from the field report. It says "context
+    /// size", not "maximum"/"limit", so before the structured arm it was a
+    /// *retryable* `Other` — the loop re-sent the identical fatal request with
+    /// backoff, could fail over to a second provider, and surfaced the raw
+    /// JSON untagged (the user saw a doubled "provider error: Provider error:"
+    /// prefix, which is `Other`'s format string). Untagged also meant
+    /// `sessionConcluded` never engaged in the frontend.
+    #[test]
+    fn llama_cpp_exceed_context_size_is_context_exceeded_with_numbers() {
+        let body = r#"{"error":{"code":400,"message":"request (202370 tokens) exceeds the available context size (192000 tokens), try increasing it","type":"exceed_context_size_error","n_prompt_tokens":202370,"n_ctx":192000}}"#;
+        let err = classify_provider_error(400, body, None);
+        match &err {
+            ProviderError::ContextExceeded {
+                prompt_tokens,
+                context_window,
+                ..
+            } => {
+                // The numbers are the point: `n_ctx` is ground truth for the
+                // window and `n_prompt_tokens` says how far over we went.
+                assert_eq!(*prompt_tokens, Some(202370));
+                assert_eq!(*context_window, Some(192000));
+            }
+            other => panic!("expected ContextExceeded, got {other:?}"),
+        }
+        assert!(!err.is_retryable(), "must not be retried or failed over");
+        assert_eq!(err.wire_type_tag(), Some("context_exceeded"));
+    }
+
+    /// The same wording reaching us as bare prose rather than parseable JSON
+    /// (a proxy that rewrites bodies, a truncated 8 KB read) still has to
+    /// classify — just without the numbers.
+    #[test]
+    fn exceed_context_size_prose_classifies_without_numbers() {
+        for body in [
+            "request (202370 tokens) exceeds the available context size (192000 tokens)",
+            "exceed_context_size_error",
+        ] {
+            let err = classify_provider_error(400, body, None);
+            assert!(
+                matches!(
+                    err,
+                    ProviderError::ContextExceeded {
+                        prompt_tokens: None,
+                        context_window: None,
+                        ..
+                    }
+                ),
+                "{body:?} must classify as ContextExceeded, got {err:?}"
+            );
         }
     }
 

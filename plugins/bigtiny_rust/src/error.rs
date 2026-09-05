@@ -90,6 +90,17 @@ pub enum ProviderError {
         user_message: String,
         raw_message: String,
         http_status: i32,
+        /// Tokens the provider counted in the request that it rejected, when
+        /// the error body reported a number (llama.cpp's `n_prompt_tokens`).
+        /// `None` for the wordings that only say *that* the window was blown,
+        /// not by how much.
+        prompt_tokens: Option<i32>,
+        /// The provider's own view of its context window (llama.cpp's
+        /// `n_ctx`), when reported. This is ground truth and outranks
+        /// whatever the router discovered — see `Agent`'s handling, which
+        /// writes it back onto the provider entry so the next turn budgets
+        /// against the real number.
+        context_window: Option<i32>,
     },
 
     /// A 401/403 from the provider — the API key is missing, wrong, or

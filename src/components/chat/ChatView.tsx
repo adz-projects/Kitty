@@ -33,6 +33,7 @@ export function ChatView() {
   // depends on the transcript now lives in `ChatTranscript`.
   const busy = useChatStore((s) => s.busy);
   const sessionConcluded = useChatStore((s) => s.sessionConcluded);
+  const concludedReason = useChatStore((s) => s.concludedReason);
   const error = useChatStore((s) => s.error);
   const errorType = useChatStore((s) => s.errorType);
   const cwd = useChatStore((s) => s.cwd);
@@ -57,6 +58,7 @@ export function ChatView() {
   const bindEvents = useChatStore((s) => s.bindEvents);
   const refreshProvider = useChatStore((s) => s.refreshProvider);
   const newSession = useChatStore((s) => s.newSession);
+  const compact = useChatStore((s) => s.compact);
   const loadSession = useChatStore((s) => s.loadSession);
   // WS8 backgrounded-turn lifecycle (a chat this window left is still running):
   const backgroundSession = useChatStore((s) => s.backgroundSession);
@@ -248,11 +250,31 @@ export function ChatView() {
           *state* right next to the input the user is looking at. */}
       {sessionConcluded && (
         <p className="chat-concluded-banner muted">
-          This chat has ended.{' '}
-          <button type="button" className="link" onClick={() => void newSession()}>
-            Start a new chat
-          </button>{' '}
-          to continue.
+          {concludedReason === 'context_exceeded' ? (
+            <>
+              {/* Compacting is what actually fixes an overflow, and it keeps
+                  the conversation — so it leads. Starting fresh stays
+                  available, but it should not be the only way out: finding
+                  `/compact` by hand was the workaround, not the design. */}
+              This chat filled the model&apos;s context window.{' '}
+              <button type="button" className="link" onClick={() => void compact()}>
+                Compact and continue
+              </button>
+              , or{' '}
+              <button type="button" className="link" onClick={() => void newSession()}>
+                start a new chat
+              </button>
+              .
+            </>
+          ) : (
+            <>
+              This chat has ended.{' '}
+              <button type="button" className="link" onClick={() => void newSession()}>
+                Start a new chat
+              </button>{' '}
+              to continue.
+            </>
+          )}
         </p>
       )}
       <Composer

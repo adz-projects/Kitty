@@ -11,6 +11,7 @@
 
 pub mod client;
 pub mod context_window;
+pub mod vision;
 pub mod effort;
 pub mod mcp;
 pub mod pathway;

@@ -89,6 +89,15 @@ pub struct OpenRouterCatalogEntry {
     pub intelligence_index: Option<f64>,
     pub coding_index: Option<f64>,
     pub agentic_index: Option<f64>,
+    /// Whether this model accepts image input, from OpenRouter's
+    /// `architecture.input_modalities`.
+    ///
+    /// `None` when the field is absent (an older cached catalog, or an entry
+    /// that omits it) — which must stay distinguishable from `Some(false)`,
+    /// since a definite "no vision" is allowed to *narrow* what the UI offers
+    /// while an unknown falls back to name-pattern detection.
+    #[serde(default)]
+    pub accepts_images: Option<bool>,
     /// Blended $/M-tokens (prompt weighted 0.75, completion 0.25 — prompt is
     /// typically the larger share of a turn), used both for the "Cheapest"
     /// sort and to derive `cost_tier`.
@@ -164,6 +173,19 @@ fn parse_entry(v: &Value) -> Option<OpenRouterCatalogEntry> {
         .and_then(|p| p.as_str())
         .and_then(|s| s.parse::<f64>().ok());
 
+    // The response has carried this all along; the parser just dropped it, so
+    // Kitty guessed vision support from model names while the authoritative
+    // answer sat unread in the same JSON it was already fetching.
+    let accepts_images = v
+        .get("architecture")
+        .and_then(|a| a.get("input_modalities"))
+        .and_then(|m| m.as_array())
+        .map(|mods| {
+            mods.iter()
+                .filter_map(|m| m.as_str())
+                .any(|m| m.eq_ignore_ascii_case("image"))
+        });
+
     let aa = v.get("benchmarks").and_then(|b| b.get("artificial_analysis"));
     let intelligence_index = aa
         .and_then(|a| a.get("intelligence_index"))
@@ -187,6 +209,7 @@ fn parse_entry(v: &Value) -> Option<OpenRouterCatalogEntry> {
         intelligence_index,
         coding_index,
         agentic_index,
+        accepts_images,
         price_rank,
         cost_tier: None, // filled in by assign_cost_tiers once the whole catalog is in hand
     })
@@ -396,6 +419,7 @@ mod tests {
                     intelligence_index: None,
                     coding_index: None,
                     agentic_index: None,
+                    accepts_images: None,
                     price_rank: None,
                     cost_tier: None,
                 })
@@ -459,6 +483,7 @@ mod tests {
             intelligence_index: None,
             coding_index: None,
             agentic_index: None,
+            accepts_images: None,
             price_rank,
             cost_tier: None,
         }
@@ -567,6 +592,22 @@ mod tests {
         assert!(entries.is_empty());
     }
 
+    /// `None` (field absent — an older cached catalog) must stay
+    /// distinguishable from `Some(false)` (the provider said no): only the
+    /// latter narrows what the UI offers, the former falls back to name
+    /// patterns.
+    #[test]
+    fn accepts_images_distinguishes_absent_from_negative() {
+        let text_only = serde_json::json!({
+            "id": "vendor/text-model",
+            "architecture": { "input_modalities": ["text"] },
+        });
+        assert_eq!(parse_entry(&text_only).unwrap().accepts_images, Some(false));
+
+        let unstated = serde_json::json!({ "id": "vendor/text-model" });
+        assert_eq!(parse_entry(&unstated).unwrap().accepts_images, None);
+    }
+
     #[test]
     fn parse_entry_reads_real_openrouter_shape() {
         let v = serde_json::json!({
@@ -574,6 +615,7 @@ mod tests {
             "name": "Claude Opus 5",
             "created": 1784912544,
             "context_length": 1000000,
+            "architecture": { "input_modalities": ["text", "image"] },
             "pricing": {
                 "prompt": "0.000005",
                 "completion": "0.000025"
@@ -595,6 +637,9 @@ mod tests {
         assert_eq!(e.intelligence_index, Some(63.1));
         assert_eq!(e.coding_index, Some(78.0));
         assert_eq!(e.agentic_index, Some(59.2));
+        // The field was in this response all along; the parser dropped it and
+        // Kitty guessed vision support from the model name instead.
+        assert_eq!(e.accepts_images, Some(true));
         assert!(e.price_rank.is_some());
     }
 

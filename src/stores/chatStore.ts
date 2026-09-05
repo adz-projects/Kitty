@@ -172,6 +172,12 @@ interface ChatState {
       "Chat concluded." instead of blocking on a provider Kitty can't
       restore. History still replays normally; only new sends are blocked. */
   sessionConcluded: boolean;
+  /** Why the session concluded, when it was an error rather than a replayed
+      already-ended session. `'context_exceeded'` is the one reason a
+      successful `/compact` can undo, so the banner offers that as the action
+      instead of only "start a new chat" — which is what the user was left to
+      discover by hand. */
+  concludedReason: 'context_exceeded' | null;
   /** True only while `loadSession` is actively replaying a resumed
       conversation (Round-7 perf fix). The message list renders a lightweight
       placeholder instead of the real list while this is true — a long
@@ -207,6 +213,13 @@ interface ChatState {
   /** The active provider profile's manual "accepts images" override. Widens
       `supportsImages`'s name-based detection; see `modelAcceptsImages`. */
   providerSupportsVision: boolean;
+  /** The backend's detected verdict on image support for the active model
+      (`ProviderView.accepts_images`), tri-state: `null` = nobody answered, so
+      fall back to name patterns. Kept separate from
+      `providerSupportsVision` (the manual override) because a detected
+      `false` is allowed to narrow while the override only widens — see
+      `modelAcceptsImages`. */
+  providerAcceptsImages: boolean | null;
   /** Whether the active provider can call tools at all — drives how a dropped
       file is handed over (path vs. inlined content).
       Derived client-side from the provider type because the daemon exposes no
@@ -1109,6 +1122,7 @@ export const useChatStore = create<ChatState>((set, get) => {
     sessionProviderId: null,
     sessionModelId: null,
     sessionConcluded: false,
+    concludedReason: null,
     replaying: false,
     error: null,
     errorType: null,
@@ -1121,6 +1135,7 @@ export const useChatStore = create<ChatState>((set, get) => {
     providerName: null,
     stripReasoning: false,
     providerSupportsVision: false,
+    providerAcceptsImages: null,
     providerHasTools: true,
     systemPrompt: null,
     warning: null,
@@ -1141,11 +1156,20 @@ export const useChatStore = create<ChatState>((set, get) => {
       if (!sid) return;
       try {
         const r = await ipc.compactSession(sid);
-        set({
+        set((s) => ({
           compactionNotice: r.compacted
             ? `Context manually compacted: ${r.messages_compacted ?? 0} older turns folded (${r.tokens_before ?? 0} → ${r.tokens_after ?? 0} tokens).`
             : 'Nothing old enough to compact yet.',
-        });
+          // A session concluded *because* it overflowed is exactly the one a
+          // successful compaction makes usable again — the room the error was
+          // about now exists. Compacting for any other reason must not
+          // silently reopen a session concluded on some other ground, so this
+          // is keyed on the reason, not on `sessionConcluded` alone.
+          sessionConcluded:
+            r.compacted && s.concludedReason === 'context_exceeded' ? false : s.sessionConcluded,
+          concludedReason:
+            r.compacted && s.concludedReason === 'context_exceeded' ? null : s.concludedReason,
+        }));
       } catch {
         set({ compactionNotice: 'Compact failed — check the backend is healthy.' });
       }
@@ -1234,6 +1258,7 @@ export const useChatStore = create<ChatState>((set, get) => {
           providerName: active ? active.name || active.provider_type : null,
           stripReasoning: active ? active.strip_reasoning : false,
           providerSupportsVision: active ? active.supports_vision : false,
+          providerAcceptsImages: active ? active.accepts_images : null,
           providerHasTools: active ? active.provider_type !== 'local' : true,
           systemPrompt: active ? active.system_prompt : null,
         });
@@ -1285,6 +1310,7 @@ export const useChatStore = create<ChatState>((set, get) => {
           providerName: null,
           stripReasoning: false,
           providerSupportsVision: false,
+          providerAcceptsImages: null,
           providerHasTools: true,
           systemPrompt: null,
         });
@@ -1335,6 +1361,10 @@ export const useChatStore = create<ChatState>((set, get) => {
             available_modes: s.availableModes,
             thinking_effort: s.thinkingEffort,
             is_default_folder: s.isDefaultFolder,
+            // Carried so the new window adopts this chat's pinned provider
+            // rather than resolving the global default for itself.
+            provider_id: s.sessionProviderId,
+            model_id: s.sessionModelId,
             // Snapshot of live render state, for adoptSession() to apply after
             // its replay — see that action's own comment for why this is
             // needed (session/load's replay alone can drop an in-progress
@@ -1374,6 +1404,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         sessionProviderId: null,
         sessionModelId: null,
         sessionConcluded: false,
+        concludedReason: null,
         replaying: false,
         messages: [],
         artifacts: [],
@@ -1487,6 +1518,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         sessionProviderId: null,
         sessionModelId: null,
         sessionConcluded: false,
+        concludedReason: null,
         warning: null,
         compactionNotice: null,
         stopPhase: null,
@@ -1527,6 +1559,15 @@ export const useChatStore = create<ChatState>((set, get) => {
           mode: info.current_mode,
           availableModes: info.available_modes,
           thinkingEffort: info.thinking_effort,
+          // Adopt the pin the backend stamped onto this session. Without it
+          // `sessionProviderId` stayed null for every chat started in this
+          // window, and `refreshProvider` below resolved from the global
+          // `active` flag instead — so changing the default provider in
+          // Settings re-pointed the model, badge, vision gate and system
+          // prompt of chats that were already open. `loadSession` has always
+          // done this from `_meta`; creation never did.
+          sessionProviderId: info.provider_id,
+          sessionModelId: info.model_id,
           creatingSession: false,
         });
         // Best-effort: a failure here only means a later notification for
@@ -1627,6 +1668,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         sessionProviderId: resolvedProviderId,
         sessionModelId: resolvedModelId,
         sessionConcluded: false,
+        concludedReason: null,
         warning: null,
         compactionNotice: null,
         stopPhase: null,
@@ -1848,7 +1890,13 @@ export const useChatStore = create<ChatState>((set, get) => {
         // they ever reach droppedFiles/inlineFileAsAttachment, rather than
         // sending a picture a text-only model will just fail (or silently
         // ignore) on. Non-image files in the same drop still go through.
-        if (!modelAcceptsImages(get().model, get().providerSupportsVision)) {
+        if (
+          !modelAcceptsImages(
+            get().model,
+            get().providerSupportsVision,
+            get().providerAcceptsImages
+          )
+        ) {
           const rejected = infos.filter((f) => !f.is_dir && isImageFileName(f.name));
           if (rejected.length) {
             infos = infos.filter((f) => !rejected.includes(f));
@@ -1957,7 +2005,9 @@ export const useChatStore = create<ChatState>((set, get) => {
       set((s) => ({ attachments: s.attachments.filter((a) => a.id !== id) })),
 
     addPendingImage: (mime: string, dataUrl: string) => {
-      if (!modelAcceptsImages(get().model, get().providerSupportsVision)) {
+      if (
+        !modelAcceptsImages(get().model, get().providerSupportsVision, get().providerAcceptsImages)
+      ) {
         set({ warning: "The active model doesn't support images — the image wasn't attached." });
         return;
       }
@@ -2345,6 +2395,7 @@ export const useChatStore = create<ChatState>((set, get) => {
             sessionProviderId: null,
             sessionModelId: null,
             sessionConcluded: false,
+            concludedReason: null,
             replaying: false,
             messages: [],
             artifacts: [],
@@ -2395,6 +2446,7 @@ export const useChatStore = create<ChatState>((set, get) => {
             sessionProviderId: null,
             sessionModelId: null,
             sessionConcluded: false,
+            concludedReason: null,
             replaying: false,
             messages: [],
             artifacts: [],
@@ -2595,9 +2647,15 @@ export const useChatStore = create<ChatState>((set, get) => {
           // network_unreachable) are all "fix something, then resend in the
           // same session" situations, and an unclassified error might well
           // be transient. Context genuinely won't fit regardless of what the
-          // user fixes, so that's the one case "start a new chat" is the
-          // actual next step rather than "try again" (release-fixes item 28).
+          // user fixes, so that's the one case plain "try again" is the wrong
+          // advice (release-fixes item 28). `concludedReason` below is what
+          // lets the banner offer compaction — which *does* fix it and keeps
+          // the conversation — rather than only "start a new chat".
           sessionConcluded: s.sessionConcluded || e.error_type === 'context_exceeded',
+          concludedReason:
+            e.error_type === 'context_exceeded' && !s.sessionConcluded
+              ? 'context_exceeded'
+              : s.concludedReason,
         }));
         // Cancelling due to the reasoning cap can surface as an error rather
         // than a clean completion — still worth asking for an answer, since

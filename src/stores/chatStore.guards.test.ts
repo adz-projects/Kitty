@@ -34,6 +34,8 @@ const info = (sessionId: string, cwd = '/c'): SessionInfo => ({
   available_modes: [],
   thinking_effort: null,
   is_default_folder: true,
+  provider_id: null,
+  model_id: null,
 });
 
 const approval: ApprovalNeededEvent = {
@@ -359,6 +361,7 @@ describe('chatStore refreshProvider malformed base_url', () => {
     network_tier: 'local',
     has_secret: false,
     active: true,
+    accepts_images: null,
   };
 
   it('derives everything but the host from a blank base_url', async () => {

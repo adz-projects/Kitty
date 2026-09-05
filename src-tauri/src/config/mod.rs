@@ -131,6 +131,25 @@ pub struct Config {
     /// discovery must not stomp it.
     #[serde(default)]
     pub model_context_lengths: HashMap<String, u32>,
+
+    /// Per-**model** vision memory: `"<provider id>\0<model>"` -> whether that
+    /// pair accepts image input. Same key shape and reasoning as
+    /// `model_context_lengths` above.
+    ///
+    /// Kitty decided this from the model name alone (`vision_models.ts`), so a
+    /// renamed or self-hosted vision model had its image affordances hidden
+    /// with no recourse, and a text-only model with a vision-ish name offered
+    /// an attach button that only ever produced a failed turn. The providers
+    /// were reporting the answer all along — Ollama's `/api/show`
+    /// `capabilities`, OpenRouter's `architecture.input_modalities` — in
+    /// responses Kitty already fetched.
+    ///
+    /// Written only by `bigtiny::vision`, and never for a profile whose
+    /// `supports_vision` is set — that is a deliberate override. Absent means
+    /// "no evidence", which falls back to name detection; a stored `false` is
+    /// a real negative and does narrow the UI.
+    #[serde(default)]
+    pub model_vision: HashMap<String, bool>,
     /// Whether the in-process behavioral-memory (pathway) engine, linked
     /// directly into the BigTiny daemon, is active for this install. On by
     /// default for fresh installs. Also gates whether Ollama must run at all
@@ -491,6 +510,7 @@ impl Default for Config {
             session_efforts: HashMap::new(),
             model_efforts: HashMap::new(),
             model_context_lengths: HashMap::new(),
+            model_vision: HashMap::new(),
             adaptive_pathway_enabled: default_adaptive_pathway_enabled(),
             adaptive_pathway_embedding_model: default_ap_embedding_model(),
             replacement_mcp_enabled: default_true(),

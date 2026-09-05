@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 use sqlx::SqlitePool;
 
 use crate::agent::summarizer_chain::SummarizerChain;
-use crate::agent::tokens::{count_messages_tokens, count_text_tokens};
+use crate::agent::tokens::{count_message_tokens, count_messages_tokens, count_text_tokens};
 use crate::config::{MemoryConfig, SummarizerConfig, TokenManagementConfig};
 use crate::storage::sessions;
 
@@ -475,6 +475,38 @@ fn ceil_char_boundary(s: &str, idx: usize) -> usize {
     idx
 }
 
+/// Mask the middle out of one tool result, keeping `head`/`tail` bytes.
+///
+/// `None` when the content is already short enough to leave alone, or when
+/// the thresholds overlap so there is nothing in the middle to elide — the
+/// caller then keeps the message as-is.
+///
+/// Factored out of `apply_tool_mask` so the in-turn shrink
+/// (`shrink_live_turn`) masks tool output by exactly the same rule. That path
+/// works on messages appended during the current turn, which have no `rowid`
+/// yet and so cannot use the rowid-keyed entry point.
+pub fn mask_tool_content(content: &str, head: usize, tail: usize) -> Option<String> {
+    if content.len() <= head + tail {
+        return None;
+    }
+    // `&content[..head]`/`&content[content.len()-tail..]` would slice at raw
+    // byte offsets and panic whenever a multi-byte UTF-8 character straddles
+    // the boundary — near-guaranteed for any tool output containing non-ASCII
+    // text at these default 400-byte thresholds. Round to the nearest valid
+    // char boundary instead.
+    let head_idx = floor_char_boundary(content, head);
+    let tail_idx = ceil_char_boundary(content, content.len() - tail);
+    if head_idx >= tail_idx {
+        return None;
+    }
+    Some(format!(
+        "{}\n[...{} bytes elided; re-run the tool if you need the full output...]\n{}",
+        &content[..head_idx],
+        tail_idx - head_idx,
+        &content[tail_idx..]
+    ))
+}
+
 pub fn apply_tool_mask(
     messages: &[Value],
     reserve_floor_rowid: i64,
@@ -493,30 +525,13 @@ pub fn apply_tool_mask(
 
         if role == Some("tool") && rowid.is_some() && rowid.unwrap() < reserve_floor_rowid {
             if let Some(content) = msg.get("content").and_then(|v| v.as_str()) {
-                if content.len() > head + tail {
-                    // `&content[..head]`/`&content[content.len()-tail..]`
-                    // would slice at raw byte offsets and panic whenever a
-                    // multi-byte UTF-8 character straddles the boundary —
-                    // near-guaranteed for any tool output containing
-                    // non-ASCII text at these default 400-byte thresholds.
-                    // Round to the nearest valid char boundary instead.
-                    let head_idx = floor_char_boundary(content, head);
-                    let tail_idx = ceil_char_boundary(content, content.len() - tail);
-                    if head_idx < tail_idx {
-                        let mut masked = msg.clone();
-                        let elided = tail_idx - head_idx;
-                        let masked_content = format!(
-                            "{}\n[...{} bytes elided; re-run the tool if you need the full output...]\n{}",
-                            &content[..head_idx],
-                            elided,
-                            &content[tail_idx..]
-                        );
-                        if let Some(obj) = masked.as_object_mut() {
-                            obj.insert("content".to_string(), json!(masked_content));
-                        }
-                        out.push(masked);
-                        continue;
+                if let Some(masked_content) = mask_tool_content(content, head, tail) {
+                    let mut masked = msg.clone();
+                    if let Some(obj) = masked.as_object_mut() {
+                        obj.insert("content".to_string(), json!(masked_content));
                     }
+                    out.push(masked);
+                    continue;
                 }
             }
         }
@@ -610,21 +625,129 @@ pub fn group_into_exchanges(rows: &[Value]) -> Vec<Vec<Value>> {
 /// kill an otherwise-healthy compaction pass. Both degenerate cases now
 /// return the earliest rowid (nothing is excluded from folding).
 pub fn find_reserve_floor_rowid(rows: &[Value], reserve_exchanges: i32) -> i64 {
+    find_reserve_floor_rowid_budgeted(rows, reserve_exchanges, 0)
+}
+
+/// `find_reserve_floor_rowid`, but the reserved live tail must also *fit* in
+/// `budget_tokens`. Pass `0` (or less) to disable the budget and get the
+/// historical exchange-only behaviour.
+///
+/// This exists because the exchange-only rule made long agentic turns
+/// structurally uncompactable. `group_into_exchanges` starts an exchange at
+/// each `role:"user"` message, so a fifty-step research turn is **one**
+/// exchange. With `reserve_exchanges = 3`, any session with three or fewer
+/// user turns hit the `exchanges.len() <= reserve` arm, got the earliest
+/// rowid, and every shrink path keyed off that floor then had nothing to work
+/// on: `run_compaction_inner` found no candidate rows and bailed,
+/// `emergency_trim` returned its input untouched, and the tool/content masks
+/// masked nothing. Even `/compact` with `force = true` could not help — force
+/// bypasses the high-water gate, not an empty candidate set. The session was
+/// unrecoverable except by starting a new chat.
+///
+/// So the reserve now *yields* under pressure instead of disabling folding:
+/// drop to fewer exchanges, and when even a single exchange is too big to
+/// reserve, fall back to reserving a number of trailing **messages** that
+/// fits. Reserving less is always safe — it only ever makes more history
+/// eligible for folding.
+pub fn find_reserve_floor_rowid_budgeted(
+    rows: &[Value],
+    reserve_exchanges: i32,
+    budget_tokens: i32,
+) -> i64 {
     let exchanges = group_into_exchanges(rows);
     let earliest = || {
         rows.first()
             .and_then(|r| r.get("rowid").and_then(|v| v.as_i64()))
             .unwrap_or(0)
     };
-    if reserve_exchanges <= 0 || exchanges.len() <= reserve_exchanges as usize {
+    let rowid_of = |v: &Value| v.get("rowid").and_then(|r| r.as_i64()).unwrap_or(0);
+
+    if reserve_exchanges <= 0 {
         return earliest();
     }
+    if budget_tokens <= 0 {
+        // Unbudgeted: historical behaviour, verbatim.
+        if exchanges.len() <= reserve_exchanges as usize {
+            return earliest();
+        }
+        let reserved = &exchanges[exchanges.len() - reserve_exchanges as usize..];
+        return rowid_of(&reserved[0][0]);
+    }
 
-    let reserved = &exchanges[exchanges.len() - reserve_exchanges as usize..];
-    reserved[0][0]
-        .get("rowid")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0)
+    // Widest reserve that fits, narrowing toward one exchange.
+    let max_n = (reserve_exchanges as usize).min(exchanges.len());
+    for n in (1..=max_n).rev() {
+        let reserved = &exchanges[exchanges.len() - n..];
+        let tokens: i32 = reserved
+            .iter()
+            .map(|ex| count_messages_tokens(ex))
+            .sum::<i32>();
+        if tokens <= budget_tokens {
+            let floor = rowid_of(&reserved[0][0]);
+            // Reserving every exchange means nothing is foldable, which is
+            // the state we are trying to escape — only accept it when there
+            // genuinely is nothing older to fold.
+            if n < exchanges.len() || exchanges.len() == 1 {
+                return floor;
+            }
+            return earliest();
+        }
+    }
+
+    // Even the final exchange is over budget: reserve trailing *messages*.
+    reserve_floor_by_messages(rows, budget_tokens).unwrap_or_else(earliest)
+}
+
+/// Walk backwards accumulating tokens until `budget_tokens` is spent, then
+/// return the rowid of the first message to keep.
+///
+/// The boundary is snapped so it can never orphan a `role:"tool"` message
+/// from the assistant `tool_calls` message that produced it — an
+/// OpenAI-compatible endpoint rejects a `tool_call_id` with no matching call,
+/// so a "smaller" history that splits a pair is not smaller, it is a 400.
+/// Snapping forward (dropping the orphaned results too) is always safe;
+/// snapping backwards would grow the reserved region past its budget.
+///
+/// Returns `None` when the region cannot be split usefully — a single message
+/// over budget has nothing to give, and the caller falls back to the earliest
+/// rowid.
+fn reserve_floor_by_messages(rows: &[Value], budget_tokens: i32) -> Option<i64> {
+    if rows.len() < 2 {
+        return None;
+    }
+    let mut spent = 0i32;
+    // Never reserve the whole region: index 0 must stay foldable.
+    let mut first_kept = rows.len() - 1;
+    for idx in (1..rows.len()).rev() {
+        spent = spent.saturating_add(count_message_tokens(&rows[idx]));
+        if spent > budget_tokens {
+            break;
+        }
+        first_kept = idx;
+    }
+    let is_tool = |i: usize| rows[i].get("role").and_then(|r| r.as_str()) == Some("tool");
+
+    // Snap the boundary off an orphaned tool result. Forward first (drop the
+    // orphans too, staying within budget); if that runs off the end there is
+    // nothing left to retain, so snap backwards instead and reserve the
+    // assistant message that owns them. Going slightly over budget beats
+    // returning an empty tail — and beats reserving the entire history, which
+    // is what the caller falls back to.
+    let mut forward = first_kept;
+    while forward < rows.len() && is_tool(forward) {
+        forward += 1;
+    }
+    if forward < rows.len() {
+        first_kept = forward;
+    } else {
+        while first_kept > 0 && is_tool(first_kept) {
+            first_kept -= 1;
+        }
+    }
+    if first_kept == 0 || first_kept >= rows.len() {
+        return None;
+    }
+    rows[first_kept].get("rowid").and_then(|r| r.as_i64())
 }
 
 /// Synchronous emergency trim: drop whole exchanges from eligible region.
@@ -683,6 +806,166 @@ pub fn emergency_trim(
     result.extend(reserved);
 
     result
+}
+
+/// Split messages into tool-call groups: every `role:"tool"` message joins
+/// the group opened by the message before it. Splitting anywhere other than a
+/// group boundary orphans a `tool_call_id` from the assistant `tool_calls`
+/// that produced it, which an OpenAI-compatible endpoint rejects with a 400.
+fn group_by_tool_calls(messages: &[Value]) -> Vec<std::ops::Range<usize>> {
+    let mut groups: Vec<std::ops::Range<usize>> = Vec::new();
+    for (i, msg) in messages.iter().enumerate() {
+        let is_tool = msg.get("role").and_then(|r| r.as_str()) == Some("tool");
+        match groups.last_mut() {
+            Some(last) if is_tool => last.end = i + 1,
+            _ => groups.push(i..i + 1),
+        }
+    }
+    groups
+}
+
+/// Number of trailing groups the in-turn shrink will never touch: the model's
+/// most recent call and its results, plus the one before it. Below that the
+/// model loses the thread of what it was just doing.
+const LIVE_SHRINK_PROTECTED_TAIL_GROUPS: usize = 2;
+
+/// Shrink the messages of a turn *in flight* so the next provider request
+/// fits, returning `None` when nothing could be given up.
+///
+/// This is the piece the wrap-up valve was missing. The valve can stop a turn
+/// from growing — it withdraws tools and clamps `max_tokens` — but it then
+/// sends the same oversized history one more time, so once the history alone
+/// exceeds the window the valve's own request is the one that 400s. Nothing
+/// here calls the summarizer or touches the database: it is synchronous
+/// arithmetic and slicing on the outgoing array, cheap enough to sit directly
+/// in front of `chat_completion`.
+///
+/// It cannot reuse the rowid-keyed `apply_tool_mask`/`emergency_trim` path,
+/// because the messages that actually blow the window are the ones this turn
+/// just appended — assistant replies and tool results that have no `rowid`
+/// until they are persisted, and which those functions therefore treat as
+/// permanently reserved. Eligibility here is positional instead.
+///
+/// Escalates in two phases, both oldest-first and both stopping the moment the
+/// budget is met: mask the tool output in eligible groups, then drop eligible
+/// groups whole, leaving a note in their place. `role:"system"` messages, the
+/// first group (the anchored user message), and the last
+/// `LIVE_SHRINK_PROTECTED_TAIL_GROUPS` groups are never touched.
+pub fn shrink_live_turn(
+    messages: &[Value],
+    budget_tokens: i32,
+    cfg: &TokenManagementConfig,
+) -> Option<Vec<Value>> {
+    if budget_tokens <= 0 || count_messages_tokens(messages) <= budget_tokens {
+        return None;
+    }
+    let groups = group_by_tool_calls(messages);
+    if groups.len() <= LIVE_SHRINK_PROTECTED_TAIL_GROUPS + 1 {
+        return None;
+    }
+    // `system` messages are injected instructions (persona, the wrap-up
+    // notice) and are small; `user` messages are what the turn is *for*.
+    // Neither is ever dropped — only assistant replies and tool results.
+    let droppable = |g: &std::ops::Range<usize>| {
+        !matches!(
+            messages[g.start].get("role").and_then(|r| r.as_str()),
+            Some("system") | Some("user")
+        )
+    };
+    let eligible: Vec<std::ops::Range<usize>> = groups
+        [1..groups.len() - LIVE_SHRINK_PROTECTED_TAIL_GROUPS]
+        .iter()
+        .filter(|g| droppable(g))
+        .cloned()
+        .collect();
+
+    let head = cfg.tool_mask_head.max(0) as usize;
+    let tail = cfg.tool_mask_tail.max(0) as usize;
+    let mut out = messages.to_vec();
+    let mut changed = false;
+
+    // Phase 1 — mask tool output in place. Preserves the shape of the turn
+    // (every call still has its result), just not the bulk.
+    for group in &eligible {
+        if count_messages_tokens(&out) <= budget_tokens {
+            break;
+        }
+        for idx in group.clone() {
+            if out[idx].get("role").and_then(|r| r.as_str()) != Some("tool") {
+                continue;
+            }
+            let Some(content) = out[idx].get("content").and_then(|c| c.as_str()) else {
+                continue;
+            };
+            if let Some(masked) = mask_tool_content(content, head, tail) {
+                if let Some(obj) = out[idx].as_object_mut() {
+                    obj.insert("content".to_string(), json!(masked));
+                }
+                changed = true;
+            }
+        }
+    }
+
+    // Phase 2 — drop whole groups. Only reached when masking every eligible
+    // result still left the request over budget, which means the assistant's
+    // own replies are the bulk.
+    if count_messages_tokens(&out) > budget_tokens {
+        let mut dropped: Vec<usize> = Vec::new();
+        for group in &eligible {
+            if count_messages_tokens(&out) <= budget_tokens {
+                break;
+            }
+            for idx in group.clone() {
+                // A tombstone rather than a removal, so the indices in
+                // `eligible` stay valid for the rest of the walk; the nulls
+                // are filtered out once at the end.
+                out[idx] = Value::Null;
+                dropped.push(idx);
+            }
+            changed = true;
+        }
+        if !dropped.is_empty() {
+            let notice = json!({
+                "role": "system",
+                "content": format!(
+                    "[{} earlier steps of this turn were elided to stay within the \
+                     context window. Re-run a tool if you need its output again.]",
+                    dropped.len()
+                )
+            });
+            out[dropped[0]] = notice;
+            out.retain(|m| !m.is_null());
+        }
+    }
+
+    // Phase 3 — mask the protected tail too. Reached only when giving up
+    // every eligible group still was not enough, which means the most recent
+    // results are themselves bigger than the whole window. Masking keeps the
+    // turn structurally valid (each call still has its result) where dropping
+    // the tail would strand the model with no idea what it just did, so this
+    // is the last thing tried and the first thing that is still safe.
+    if count_messages_tokens(&out) > budget_tokens {
+        for idx in 0..out.len() {
+            if out[idx].get("role").and_then(|r| r.as_str()) != Some("tool") {
+                continue;
+            }
+            let masked = out[idx]
+                .get("content")
+                .and_then(|c| c.as_str())
+                .and_then(|c| mask_tool_content(c, head, tail));
+            if let Some(masked) = masked {
+                if let Some(obj) = out[idx].as_object_mut() {
+                    obj.insert("content".to_string(), json!(masked));
+                }
+                changed = true;
+            }
+            if count_messages_tokens(&out) <= budget_tokens {
+                break;
+            }
+        }
+    }
+
+    changed.then_some(out)
 }
 
 #[derive(Debug, Clone)]
@@ -933,7 +1216,16 @@ async fn run_compaction_inner(
         return None;
     }
 
-    let reserve_floor = find_reserve_floor_rowid(&values, summarizer_cfg.reserve_exchanges);
+    // Budgeted by the fold target: if the reserved tail alone is larger than
+    // what compaction is trying to get the whole region down to, reserving it
+    // in full makes the pass unable to succeed by construction. Letting the
+    // reserve narrow instead is what makes a single long agentic turn
+    // compactable at all.
+    let reserve_floor = find_reserve_floor_rowid_budgeted(
+        &values,
+        summarizer_cfg.reserve_exchanges,
+        (context_length as f64 * token_cfg.compaction_target_ratio) as i32,
+    );
     let candidate_rows: Vec<Value> = values
         .iter()
         .filter(|v| {
@@ -1346,6 +1638,173 @@ mod tests {
 
     /// Regression: `reserve_exchanges == 0` used to panic on the empty
     /// `&exchanges[len..]` slice; it must return the earliest rowid instead.
+    /// The failure that made long research sessions unrecoverable: a
+    /// fifty-step agentic turn is ONE exchange (exchanges start at each
+    /// `role:"user"` message), so with `reserve_exchanges = 3` the old rule
+    /// hit `exchanges.len() <= reserve`, reserved the entire history, and left
+    /// every shrink path with nothing eligible — including `/compact
+    /// --force`, since force bypasses the high-water gate, not an empty
+    /// candidate set. Budgeted, the reserve narrows and the turn folds.
+    #[test]
+    fn a_single_long_agentic_turn_is_foldable_when_budgeted() {
+        let big = "x ".repeat(4000);
+        let mut rows = vec![json!({"rowid": 1, "role": "user", "content": "go research this"})];
+        for i in 0..8 {
+            rows.push(json!({"rowid": 2 + i * 2, "role": "assistant", "content": big}));
+            rows.push(json!({"rowid": 3 + i * 2, "role": "tool", "content": big}));
+        }
+        let earliest = 1;
+
+        // Unbudgeted: the whole thing is reserved, nothing folds.
+        assert_eq!(find_reserve_floor_rowid(&rows, 3), earliest);
+
+        // Budgeted: the floor moves up, leaving real candidates below it.
+        let floor = find_reserve_floor_rowid_budgeted(&rows, 3, 2000);
+        assert!(
+            floor > earliest,
+            "budgeted floor must leave something foldable, got {floor}"
+        );
+        let candidates = rows
+            .iter()
+            .filter(|r| r["rowid"].as_i64().unwrap() < floor)
+            .count();
+        assert!(candidates > 0, "expected foldable rows below {floor}");
+    }
+
+    /// A floor that starts the retained region on a `role:"tool"` message
+    /// orphans its `tool_call_id` from the assistant `tool_calls` message that
+    /// produced it, and an OpenAI-compatible endpoint 400s on that. A history
+    /// that splits a pair is not smaller, it is broken — so the boundary snaps
+    /// forward past the orphans.
+    #[test]
+    fn the_reserve_floor_never_orphans_a_tool_result() {
+        let big = "y ".repeat(4000);
+        let rows = vec![
+            json!({"rowid": 1, "role": "user", "content": "start"}),
+            json!({"rowid": 2, "role": "assistant", "content": big}),
+            json!({"rowid": 3, "role": "tool", "content": big}),
+            json!({"rowid": 4, "role": "tool", "content": big}),
+            json!({"rowid": 5, "role": "assistant", "content": "done"}),
+        ];
+        for budget in [200, 800, 2000, 6000] {
+            let floor = find_reserve_floor_rowid_budgeted(&rows, 3, budget);
+            let first_kept = rows
+                .iter()
+                .find(|r| r["rowid"].as_i64().unwrap() >= floor)
+                .expect("something must be retained");
+            assert_ne!(
+                first_kept["role"].as_str(),
+                Some("tool"),
+                "budget {budget}: retained region starts on an orphaned tool result"
+            );
+        }
+    }
+
+    /// The budget must not make things *worse* than the unbudgeted rule for
+    /// ordinary sessions that already fit — a generous budget is a no-op.
+    #[test]
+    fn a_reserve_that_already_fits_is_left_alone() {
+        let rows = vec![
+            json!({"rowid": 1, "role": "user", "content": "one"}),
+            json!({"rowid": 2, "role": "assistant", "content": "a"}),
+            json!({"rowid": 3, "role": "user", "content": "two"}),
+            json!({"rowid": 4, "role": "assistant", "content": "b"}),
+            json!({"rowid": 5, "role": "user", "content": "three"}),
+            json!({"rowid": 6, "role": "assistant", "content": "c"}),
+        ];
+        assert_eq!(
+            find_reserve_floor_rowid_budgeted(&rows, 2, 100_000),
+            find_reserve_floor_rowid(&rows, 2),
+        );
+    }
+
+    /// The gap the wrap-up valve could not close: messages appended during
+    /// the current turn have no `rowid` yet, so the rowid-keyed
+    /// `apply_tool_mask`/`emergency_trim` treat them as permanently reserved
+    /// — and those are exactly the messages that blow the window. The valve
+    /// would withdraw tools and then send the same oversized array anyway.
+    #[test]
+    fn a_turn_over_budget_shrinks_even_with_no_rowids() {
+        let cfg = TokenManagementConfig::default();
+        let big = "z ".repeat(6000);
+        let mut messages = vec![
+            json!({"role": "system", "content": "persona"}),
+            json!({"role": "user", "content": "research this"}),
+        ];
+        for i in 0..6 {
+            messages.push(json!({
+                "role": "assistant",
+                "tool_calls": [{"id": format!("c{i}"), "type": "function"}]
+            }));
+            messages.push(json!({"role": "tool", "content": big, "tool_call_id": format!("c{i}")}));
+        }
+        let before = count_messages_tokens(&messages);
+        let budget = before / 4;
+
+        let shrunk = shrink_live_turn(&messages, budget, &cfg).expect("must shrink");
+        let after = count_messages_tokens(&shrunk);
+        assert!(after < before, "expected a reduction, {before} -> {after}");
+        assert!(
+            after <= budget,
+            "expected to reach the budget of {budget}, got {after}"
+        );
+    }
+
+    /// Whatever it gives up, the result must still be a *valid* request: every
+    /// surviving `tool_call_id` needs the assistant `tool_calls` message that
+    /// produced it, or an OpenAI-compatible endpoint 400s on the orphan — and
+    /// a request that 400s is not a smaller request, it is a broken one.
+    #[test]
+    fn shrinking_never_orphans_a_tool_result() {
+        let cfg = TokenManagementConfig::default();
+        let big = "q ".repeat(6000);
+        let mut messages = vec![json!({"role": "user", "content": "start"})];
+        for i in 0..8 {
+            messages.push(json!({
+                "role": "assistant",
+                "tool_calls": [{"id": format!("call{i}"), "type": "function"}]
+            }));
+            messages.push(json!({
+                "role": "tool", "content": big, "tool_call_id": format!("call{i}")
+            }));
+        }
+        for divisor in [2, 4, 8, 20] {
+            let budget = count_messages_tokens(&messages) / divisor;
+            let Some(shrunk) = shrink_live_turn(&messages, budget, &cfg) else {
+                continue;
+            };
+            let issued: HashSet<String> = shrunk
+                .iter()
+                .filter_map(|m| m.get("tool_calls").and_then(|t| t.as_array()))
+                .flatten()
+                .filter_map(|c| c.get("id").and_then(|i| i.as_str()).map(str::to_string))
+                .collect();
+            for m in &shrunk {
+                if let Some(id) = m.get("tool_call_id").and_then(|i| i.as_str()) {
+                    assert!(
+                        issued.contains(id),
+                        "budget 1/{divisor}: tool result {id} lost its call"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A turn that already fits must be left exactly alone — the shrink is a
+    /// last resort, not a routine pass, and `None` is what tells the caller
+    /// nothing happened.
+    #[test]
+    fn a_turn_within_budget_is_not_touched() {
+        let cfg = TokenManagementConfig::default();
+        let messages = vec![
+            json!({"role": "user", "content": "hello"}),
+            json!({"role": "assistant", "content": "hi"}),
+        ];
+        assert!(shrink_live_turn(&messages, 100_000, &cfg).is_none());
+        // Nothing eligible (too few groups) is also `None`, not a panic.
+        assert!(shrink_live_turn(&messages, 1, &cfg).is_none());
+    }
+
     #[test]
     fn test_find_reserve_floor_rowid_zero_reserve_does_not_panic() {
         let rows = vec![

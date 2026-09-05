@@ -40,6 +40,9 @@ pub struct OpenAICompatibleProvider {
     /// SSE idle-read timeout instead (`idle_timeout`).
     direct_client: reqwest::Client,
     tailscale: Arc<TailscaleClient>,
+    /// Cached direct-address reachability, `origin -> (reachable, checked at)`
+    /// — see `direct_is_reachable`.
+    direct_probe: dashmap::DashMap<String, (bool, Instant)>,
     /// SSE idle-read timeout — if no bytes arrive for this long, the stream
     /// is terminated with a transient error (see `parse_openai_sse`). Per
     /// provider, from the config blob's `idle_timeout_secs`, default 120s.
@@ -66,6 +69,25 @@ const DIRECT_HEADERS_TIMEOUT: Duration = Duration::from_secs(5);
 /// timeout — up to a full `idle_timeout` of stuck silence. Periodic
 /// keepalives let the OS time the dead peer out within a few probes and
 /// surface it as an ordinary connection error.
+/// How long a direct-address reachability verdict is trusted. Long enough
+/// that a normal back-and-forth pays for the probe once, short enough that
+/// moving off (or onto) the LAN is noticed within a turn or two.
+const DIRECT_PROBE_TTL: Duration = Duration::from_secs(60);
+
+/// `scheme://host:port` of a URL, for keying the direct-probe cache and
+/// building the probe request. Falls back to the whole string if it does not
+/// parse, which only makes the cache key coarser.
+pub(super) fn probe_origin(url: &str) -> String {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| (u.scheme().to_string(), h.to_string(), u.port())))
+        .map(|(scheme, host, port)| match port {
+            Some(p) => format!("{scheme}://{host}:{p}"),
+            None => format!("{scheme}://{host}"),
+        })
+        .unwrap_or_else(|| url.trim_end_matches('/').to_string())
+}
+
 const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Total-duration ceiling for one streamed response (see #10). The idle-read
@@ -126,6 +148,7 @@ impl OpenAICompatibleProvider {
             direct_client,
             config,
             tailscale,
+            direct_probe: dashmap::DashMap::new(),
             idle_timeout,
         }
     }
@@ -272,23 +295,39 @@ impl OpenAICompatibleProvider {
             .collect()
     }
 
-    /// Single direct attempt against `direct_url`, bounded by
-    /// `DIRECT_HEADERS_TIMEOUT`. Returns `Err` on timeout, transport error,
-    /// or any non-success status — a stale direct address answering `401`/`500`
-    /// is *not* a usable response (the tunnel is the authoritative path).
-    /// `send()` resolves as soon as headers arrive, so the timeout never caps
-    /// a slow-but-healthy SSE *body* (that's `idle_timeout`'s job).
-    async fn try_direct(&self, direct_url: &str, body: &Value) -> Result<reqwest::Response, ()> {
-        let direct = self
-            .direct_client
-            .post(direct_url)
-            .header("Authorization", format!("Bearer {}", self.config.api_key))
-            .json(body)
-            .send();
-        match tokio::time::timeout(DIRECT_HEADERS_TIMEOUT, direct).await {
-            Ok(Ok(resp)) if resp.status().is_success() => Ok(resp),
-            _ => Err(()),
+    /// Is the direct (LAN) address usable right now?
+    ///
+    /// A cheap cached GET, not the real request. This used to *be* the real
+    /// streaming POST, abandoned after `DIRECT_HEADERS_TIMEOUT` — so a model
+    /// that takes longer than five seconds to its first token (every local
+    /// reasoning model) had its full prompt submitted twice on every turn:
+    /// once to the direct address, where the server kept generating for an
+    /// abandoned connection, and again to the tunnel. On a single-slot server
+    /// the second request then queued behind the first and died at the header
+    /// timeout.
+    ///
+    /// A probe costs nothing to abandon, and caching it means a steady-state
+    /// turn pays nothing at all. `false` on timeout, transport error, or any
+    /// non-success status — a stale direct address answering `401`/`500` is
+    /// not usable, and the tunnel is the authoritative path.
+    async fn direct_is_reachable(&self, direct_url: &str) -> bool {
+        let origin = probe_origin(direct_url);
+        if let Some(hit) = self.direct_probe.get(&origin) {
+            if hit.1.elapsed() < DIRECT_PROBE_TTL {
+                return hit.0;
+            }
         }
+        let req = self
+            .direct_client
+            .get(format!("{origin}/models"))
+            .header("Authorization", format!("Bearer {}", self.config.api_key))
+            .send();
+        let ok = matches!(
+            tokio::time::timeout(DIRECT_HEADERS_TIMEOUT, req).await,
+            Ok(Ok(resp)) if resp.status().is_success()
+        );
+        self.direct_probe.insert(origin, (ok, Instant::now()));
+        ok
     }
 
     /// If `url`'s host is a Tailscale peer with a discoverable direct (LAN)
@@ -307,13 +346,13 @@ impl OpenAICompatibleProvider {
         url: &str,
         body: &Value,
     ) -> Result<reqwest::Response, reqwest::Error> {
-        if let Some(direct_url) = maybe_direct_url(&self.tailscale, url).await {
-            if let Ok(resp) = self.try_direct(&direct_url, body).await {
-                return Ok(resp);
-            }
-        }
+        // Decide the URL first, then send the body exactly once.
+        let direct = match maybe_direct_url(&self.tailscale, url).await {
+            Some(c) if self.direct_is_reachable(&c).await => Some(c),
+            _ => None,
+        };
         self.client
-            .post(url)
+            .post(direct.as_deref().unwrap_or(url))
             .header("Authorization", format!("Bearer {}", self.config.api_key))
             .json(body)
             .send()
@@ -701,6 +740,34 @@ fn parse_openai_sse(
     }
 }
 
+/// The bucket a streamed tool-call fragment belongs to.
+///
+/// Accepts a number or a numeric string: the OpenAI spec says `index` is an
+/// integer, but real gateways send `"0"`. Anything unrecognizable falls back
+/// to `0`, which is right for the overwhelmingly common single-call case.
+fn delta_tool_index(v: &Value) -> usize {
+    v.as_u64()
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+        .unwrap_or(0) as usize
+}
+
+/// Cap a value before it goes into a log line — a streamed argument blob can
+/// be tens of kilobytes, and a diagnostic is not worth flooding the ring
+/// buffer Kitty surfaces in Settings.
+fn truncate_for_log(s: &str) -> String {
+    const MAX: usize = 400;
+    if s.len() <= MAX {
+        return s.to_string();
+    }
+    let end = s
+        .char_indices()
+        .map(|(i, _)| i)
+        .take_while(|i| *i <= MAX)
+        .last()
+        .unwrap_or(0);
+    format!("{}… ({} bytes total)", &s[..end], s.len())
+}
+
 impl OpenAISSEStream {
     /// Split `<think>...</think>` out of one content fragment. The
     /// cross-fragment bookkeeping lives in `TagSplitter` — a tag spanning
@@ -772,8 +839,33 @@ impl OpenAISSEStream {
                         }
                     }
                 };
+                // A call that finished accumulation with no name is not
+                // dispatchable: `execute_tools` would send a tool named `""`
+                // to MCP and get back an opaque "unknown tool" failure, with
+                // nothing in the logs naming the real problem (its
+                // `unwrap_or("unknown")` never fires, because the key exists
+                // and is empty). Convert it into the same `__error` sentinel
+                // the malformed-arguments path above uses — `execute_one_
+                // tool_call` short-circuits on that and hands the model a
+                // message it can act on.
+                let (name, arguments) = match buf.name {
+                    Some(n) if !n.is_empty() => (n, arguments),
+                    _ => {
+                        tracing::warn!(
+                            tool_call_id = ?buf.id,
+                            raw_arguments = %truncate_for_log(&buf.arguments),
+                            "provider streamed a tool call with no name — dropping it. If this                              recurs on one provider, the arguments above show what it actually sent"
+                        );
+                        (
+                            "unknown".to_string(),
+                            serde_json::json!({
+                                "__error": "the provider streamed this tool call without a name"
+                            }),
+                        )
+                    }
+                };
                 let function = serde_json::json!({
-                    "name": buf.name.unwrap_or_default(),
+                    "name": name,
                     "arguments": arguments,
                 });
                 super::base::ToolCall {
@@ -926,20 +1018,58 @@ impl OpenAISSEStream {
 
                 if let Some(tc) = delta["tool_calls"].as_array() {
                     for t in tc {
-                        let index = t["index"].as_u64().unwrap_or(0) as usize;
+                        // `as_u64` alone treated a stringified index (`"0"`,
+                        // which several OpenAI-compatible gateways send) as
+                        // absent and folded it into bucket 0 — harmless for a
+                        // single call, but it merges *parallel* calls into
+                        // one, where their names clobber each other and their
+                        // argument fragments concatenate into unparseable
+                        // JSON.
+                        let index = delta_tool_index(&t["index"]);
                         let entry = self.tool_call_buf.entry(index).or_default();
                         if let Some(i) = t["id"].as_str() {
-                            entry.id = Some(i.into());
+                            if !i.is_empty() {
+                                entry.id = Some(i.into());
+                            }
                         }
                         if let Some(tp) = t["type"].as_str() {
-                            entry.r#type = Some(tp.into());
+                            if !tp.is_empty() {
+                                entry.r#type = Some(tp.into());
+                            }
                         }
-                        // The tool name arrives once, in the first fragment
-                        // for this index — it was never captured before,
-                        // which is exactly why every tool call executed
-                        // nameless/"unknown".
+                        // The name arrives once, in the first fragment for
+                        // this index. Two guards, and both are load-bearing:
+                        //
+                        // *Non-empty*, because plenty of gateways (Qwen
+                        // Cloud's DeepSeek among them) send
+                        // `"function":{"name":"","arguments":"…"}` on every
+                        // continuation chunk. `as_str()` returns `Some("")`
+                        // for those, so the correctly-captured first-chunk
+                        // name was overwritten with a blank on the very next
+                        // fragment — the model appeared to call a tool with
+                        // no name at all, while its arguments arrived intact.
+                        //
+                        // *Only when unset*, so a late fragment can never
+                        // replace a good name. A differing non-empty name for
+                        // the same index means two calls got merged into one
+                        // bucket, which is worth saying out loud rather than
+                        // silently keeping the last one.
                         if let Some(name) = t["function"]["name"].as_str() {
-                            entry.name = Some(name.into());
+                            let name = name.trim();
+                            if !name.is_empty() {
+                                match &entry.name {
+                                    None => entry.name = Some(name.to_string()),
+                                    Some(existing) if existing != name => {
+                                        tracing::warn!(
+                                            index,
+                                            existing,
+                                            incoming = name,
+                                            "two different tool names streamed under one index —                                              the provider is reusing or omitting `index`"
+                                        );
+                                    }
+                                    Some(_) => {}
+                                }
+                            }
                         }
                         if let Some(f) = t["function"]["arguments"].as_str() {
                             if entry.arguments.len() + f.len() > MAX_TOOL_ARGUMENTS_BYTES {
@@ -1239,6 +1369,93 @@ mod sse_tests {
             .await;
         let contents: String = deltas.iter().filter_map(|d| d.content.clone()).collect();
         assert_eq!(contents, "café");
+    }
+
+    /// The reported Qwen-Cloud/DeepSeek failure: the name arrives correctly on
+    /// the first fragment, then every continuation chunk repeats
+    /// `"name":""`. `as_str()` returns `Some("")` for those, so the good name
+    /// was overwritten and the model appeared to call a nameless tool while
+    /// its arguments arrived intact.
+    #[tokio::test]
+    async fn an_empty_name_on_continuation_chunks_does_not_clobber_the_real_one() {
+        let chunks = [
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"read_file","arguments":""}}]}}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"","arguments":"{\"path\":"}}]}}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"","arguments":"\"a.txt\"}"}}]}}]}"#,
+            "data: [DONE]",
+        ];
+        let calls = drain_tool_calls(&chunks).await;
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0].function["name"], "read_file");
+        assert_eq!(calls[0].function["arguments"]["path"], "a.txt");
+    }
+
+    /// `index` is an integer per the spec, but real gateways send `"0"`.
+    /// Treating that as absent folded every parallel call into bucket 0,
+    /// where the names clobber each other and the argument fragments
+    /// concatenate into unparseable JSON.
+    #[tokio::test]
+    async fn a_stringified_index_keeps_parallel_calls_separate() {
+        let chunks = [
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":"0","id":"a","function":{"name":"read_file","arguments":"{\"path\":\"a\"}"}}]}}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":"1","id":"b","function":{"name":"write_file","arguments":"{\"path\":\"b\"}"}}]}}]}"#,
+            "data: [DONE]",
+        ];
+        let calls = drain_tool_calls(&chunks).await;
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert_eq!(calls[0].function["name"], "read_file");
+        assert_eq!(calls[1].function["name"], "write_file");
+    }
+
+    /// A call that never got a name is not dispatchable — sending a tool named
+    /// `""` to MCP yields an opaque "unknown tool" failure with nothing in the
+    /// logs naming the real problem. It becomes the same `__error` sentinel
+    /// the malformed-arguments path uses, which the agent loop short-circuits
+    /// on with a message the model can act on.
+    #[tokio::test]
+    async fn a_tool_call_that_never_got_a_name_becomes_an_error_not_a_blank_call() {
+        let chunks = [
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"arguments":"{\"path\":\"a\"}"}}]}}]}"#,
+            "data: [DONE]",
+        ];
+        let calls = drain_tool_calls(&chunks).await;
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_ne!(
+            calls[0].function["name"], "",
+            "a nameless call must not reach tool dispatch"
+        );
+        assert!(
+            calls[0].function["arguments"]["__error"].is_string(),
+            "expected the __error sentinel, got {:?}",
+            calls[0].function
+        );
+    }
+
+    #[test]
+    fn delta_tool_index_accepts_numbers_strings_and_garbage() {
+        assert_eq!(delta_tool_index(&serde_json::json!(2)), 2);
+        assert_eq!(delta_tool_index(&serde_json::json!("2")), 2);
+        assert_eq!(delta_tool_index(&serde_json::json!(" 2 ")), 2);
+        // Unrecognizable falls back to 0 — right for the single-call case,
+        // which is overwhelmingly the common one.
+        assert_eq!(delta_tool_index(&serde_json::json!(null)), 0);
+        assert_eq!(delta_tool_index(&serde_json::json!("x")), 0);
+    }
+
+    /// Feed SSE `data:` lines through the real parser and collect whatever
+    /// tool calls come out.
+    async fn drain_tool_calls(lines: &[&str]) -> Vec<super::super::base::ToolCall> {
+        let body: String = lines.iter().map(|c| format!("{c}\n\n")).collect();
+        let inner = stream::iter(vec![Ok::<bytes::Bytes, reqwest::Error>(
+            bytes::Bytes::from(body),
+        )]);
+        parse_openai_sse(inner, Duration::from_secs(300))
+            .collect::<Vec<Delta>>()
+            .await
+            .into_iter()
+            .filter_map(|d| d.tool_calls)
+            .flatten()
+            .collect()
     }
 
     #[tokio::test]
@@ -1684,6 +1901,15 @@ mod sse_tests {
             ..Default::default()
         })
         .await;
+        // The direct address is now selected by a cheap reachability probe
+        // rather than by firing the real request at it, so the fake has to
+        // answer that too.
+        let direct_probe = direct_server
+            .mock("GET", "/models")
+            .with_status(200)
+            .with_body("{\"data\":[]}")
+            .create_async()
+            .await;
         let direct_mock = direct_server
             .mock("POST", "/v1/chat/completions")
             .with_status(200)
@@ -1719,6 +1945,7 @@ mod sse_tests {
             .unwrap();
         let _: Vec<Delta> = stream.collect().await;
 
+        direct_probe.assert_async().await;
         direct_mock.assert_async().await;
     }
 
@@ -1737,6 +1964,22 @@ mod sse_tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
+            // First connection is the reachability probe (`GET /models`),
+            // which the direct path now uses instead of firing the real
+            // request twice. Answer it and close.
+            {
+                let (mut probe, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 8192];
+                let _ = probe.read(&mut buf).await;
+                let body = "{\"data\":[]}";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                probe.write_all(resp.as_bytes()).await.unwrap();
+                probe.flush().await.unwrap();
+            }
             let (mut sock, _) = listener.accept().await.unwrap();
             // Read the request head (headers + start of body is fine — we
             // never validate it).
@@ -1820,24 +2063,21 @@ mod sse_tests {
         mock.assert_async().await;
     }
 
-    /// Regression for the #4 fix: a stale direct address that *answers* with a
-    /// server error must not be surfaced as a usable response — before the
-    /// fix, `send_preferring_direct` returned any `Ok(resp)` from the direct
-    /// attempt, so a `500` from a leftover LAN IP after a Tailscale network
-    /// change became a bogus endpoint failure that killed the turn even
-    /// though the tunnel was fine. `try_direct` must reject non-success
-    /// statuses (the tunnel is the authoritative path).
+    /// Regression for the #4 fix, retargeted at `direct_is_reachable`: a
+    /// stale direct address that *answers* with a server error must not be
+    /// treated as usable — a `500` from a leftover LAN IP after a Tailscale
+    /// network change used to become a bogus endpoint failure that killed the
+    /// turn even though the tunnel was fine. The tunnel is authoritative.
     #[tokio::test]
-    async fn try_direct_rejects_a_server_error_from_a_stale_direct_address() {
+    async fn a_server_error_from_a_stale_direct_address_is_not_reachable() {
         let mut stale = mockito::Server::new_with_opts_async(mockito::ServerOpts {
             host: "127.0.0.2",
             ..Default::default()
         })
         .await;
         let stale_mock = stale
-            .mock("POST", "/v1/chat/completions")
+            .mock("GET", "/models")
             .with_status(500)
-            .with_body("{\"error\":{\"message\":\"stale endpoint\"}}")
             .expect(1)
             .create_async()
             .await;
@@ -1847,30 +2087,25 @@ mod sse_tests {
             crate::config::ProviderConfig::default(),
             Arc::new(TailscaleClient::new()),
         );
-        let body = serde_json::json!({"messages": [{"role": "user", "content": "hi"}]});
-        let direct_url = format!("{}/v1/chat/completions", stale.url());
-
         assert!(
-            provider.try_direct(&direct_url, &body).await.is_err(),
+            !provider.direct_is_reachable(&stale.url()).await,
             "a 500 from the direct path must not be treated as usable"
         );
         stale_mock.assert_async().await;
     }
 
-    /// Same as above for a `401` from a stale direct address (the IP has been
-    /// reused by some other service on the LAN). Must fall back to the tunnel,
-    /// not surface the bogus auth failure.
+    /// Same for a `401` — the IP has been reused by some other service on the
+    /// LAN. Fall back to the tunnel rather than surfacing a bogus auth error.
     #[tokio::test]
-    async fn try_direct_rejects_an_auth_error_from_a_stale_direct_address() {
+    async fn an_auth_error_from_a_stale_direct_address_is_not_reachable() {
         let mut stale = mockito::Server::new_with_opts_async(mockito::ServerOpts {
             host: "127.0.0.2",
             ..Default::default()
         })
         .await;
         let stale_mock = stale
-            .mock("POST", "/v1/chat/completions")
+            .mock("GET", "/models")
             .with_status(401)
-            .with_body("{\"error\":{\"message\":\"not your service\"}}")
             .expect(1)
             .create_async()
             .await;
@@ -1880,30 +2115,22 @@ mod sse_tests {
             crate::config::ProviderConfig::default(),
             Arc::new(TailscaleClient::new()),
         );
-        let body = serde_json::json!({"messages": [{"role": "user", "content": "hi"}]});
-        let direct_url = format!("{}/v1/chat/completions", stale.url());
-
         assert!(
-            provider.try_direct(&direct_url, &body).await.is_err(),
+            !provider.direct_is_reachable(&stale.url()).await,
             "a 401 from the direct path must not be treated as usable"
         );
         stale_mock.assert_async().await;
     }
 
-    /// Regression for the #4 fix: a half-open/stale direct address that
-    /// accepts the TCP connection but never sends response headers must not
-    /// block the turn for the full 30s `RESPONSE_HEADERS_TIMEOUT` — the
-    /// direct attempt is an optimization and `try_direct` bounds it with
-    /// `DIRECT_HEADERS_TIMEOUT`. The timeout fires around 5s and `try_direct`
-    /// returns `Err`, letting the tunnel fallback proceed.
+    /// A half-open stale address that accepts the TCP connection but never
+    /// sends headers must not block the turn for the full 30s
+    /// `RESPONSE_HEADERS_TIMEOUT` — the probe is an optimization and is
+    /// bounded by `DIRECT_HEADERS_TIMEOUT`.
     #[tokio::test]
-    async fn try_direct_bounds_a_silent_direct_address() {
+    async fn a_silent_direct_address_fails_fast_rather_than_hanging() {
         let listener = tokio::net::TcpListener::bind("127.0.0.2:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
-            // Accept but never respond — simulates a half-open stale LAN
-            // address whose TCP handshake succeeds but which never produces
-            // response headers.
             let (_sock, _) = listener.accept().await.unwrap();
             tokio::time::sleep(Duration::from_secs(30)).await;
         });
@@ -1913,23 +2140,68 @@ mod sse_tests {
             crate::config::ProviderConfig::default(),
             Arc::new(TailscaleClient::new()),
         );
-        let body = serde_json::json!({"messages": [{"role": "user", "content": "hi"}]});
-        let direct_url = format!("http://127.0.0.2:{port}/v1/chat/completions");
-
         let started = std::time::Instant::now();
         assert!(
-            provider.try_direct(&direct_url, &body).await.is_err(),
+            !provider
+                .direct_is_reachable(&format!("http://127.0.0.2:{port}"))
+                .await,
             "a silent direct address must fail fast, not hang"
         );
         let elapsed = started.elapsed();
         assert!(
-            elapsed >= Duration::from_secs(5),
-            "the direct attempt should ride out its full 5s header timeout"
+            elapsed >= Duration::from_secs(5) && elapsed < Duration::from_secs(20),
+            "expected the 5s probe budget, took {elapsed:?}"
         );
-        assert!(
-            elapsed < Duration::from_secs(8),
-            "the direct attempt must not burn the 30s outer header timeout"
+    }
+
+    /// The bug this replaced: the reachability check *was* the real streaming
+    /// POST, abandoned after five seconds. Any model slower than that to its
+    /// first token therefore had its whole prompt submitted twice per turn —
+    /// once to the direct address, which kept generating for an abandoned
+    /// connection, and once to the tunnel. A probe must be a probe: one cheap
+    /// GET, and cached, so a second call in the same window costs nothing.
+    #[tokio::test]
+    async fn the_reachability_probe_is_cheap_and_cached() {
+        let mut server = mockito::Server::new_with_opts_async(mockito::ServerOpts {
+            host: "127.0.0.2",
+            ..Default::default()
+        })
+        .await;
+        // `expect(1)` across two calls is the cache assertion.
+        let probe = server
+            .mock("GET", "/models")
+            .with_status(200)
+            .with_body("{\"data\":[]}")
+            .expect(1)
+            .create_async()
+            .await;
+        // Never hit: the probe must not be a chat completion.
+        let chat = server
+            .mock("POST", "/v1/chat/completions")
+            .expect(0)
+            .create_async()
+            .await;
+
+        let provider = OpenAICompatibleProvider::new(
+            "test",
+            crate::config::ProviderConfig::default(),
+            Arc::new(TailscaleClient::new()),
         );
+        assert!(provider.direct_is_reachable(&server.url()).await);
+        assert!(provider.direct_is_reachable(&server.url()).await);
+        probe.assert_async().await;
+        chat.assert_async().await;
+    }
+
+    #[test]
+    fn probe_origin_keys_on_scheme_host_and_port() {
+        assert_eq!(
+            probe_origin("http://100.64.1.2:8080/v1/chat/completions"),
+            "http://100.64.1.2:8080"
+        );
+        assert_eq!(probe_origin("https://box.ts.net/v1"), "https://box.ts.net");
+        // Unparseable input still produces a stable key rather than panicking.
+        assert_eq!(probe_origin("not a url/"), "not a url");
     }
 
     #[test]

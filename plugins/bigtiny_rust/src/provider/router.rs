@@ -3,7 +3,9 @@ use dashmap::DashMap;
 use futures::Stream;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Instant;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use super::anthropic::AnthropicProvider;
 use super::base::{HealthStatus, Provider, SamplingParams};
@@ -25,6 +27,11 @@ struct ProviderEntry {
     /// This provider's own `-np`/`--parallel` slot count, when set — see
     /// `ProviderConfig::parallel_slots`'s doc comment.
     parallel_slots: Option<u32>,
+    /// How many chat completions may be in flight against this provider at
+    /// once — `parallel_slots`, or `default_concurrency` for its dialect.
+    /// Resolved at registration so `chat_completion` never has to reason
+    /// about dialects.
+    concurrency: u32,
     /// Already resolved at registration time: the profile's configured
     /// overrides merged onto `sampling::defaults_for` — see that function's
     /// doc comment for why self-hosted providers get a non-empty floor and
@@ -42,8 +49,62 @@ struct ProviderEntry {
 
 const HEALTH_TTL_SECS: u64 = 30;
 
+/// Chat completions allowed in flight at once against a provider whose
+/// `parallel_slots` is unset.
+///
+/// One for anything self-hosted. A llama-server or LM Studio built without
+/// `--parallel` serves exactly one request at a time; a second arrives, waits
+/// behind the first with no response headers, and dies at the 30s header
+/// timeout — while the abandoned request keeps generating server-side. Being
+/// wrong in the other direction merely queues a request that could have run
+/// concurrently, so 1 is the safe default and `parallel_slots` is how a user
+/// with `--parallel 4` says so.
+fn default_concurrency(dialect: &str) -> u32 {
+    match dialect {
+        "custom_openai" | "ollama" | "local" => 1,
+        // Hosted APIs are built for concurrency; a low cap here would
+        // needlessly serialize multiple chat windows.
+        _ => 8,
+    }
+}
+
+/// A `Delta` stream that holds its provider's concurrency permit until the
+/// stream itself is dropped.
+///
+/// The permit must outlive the *whole* response, not just the request:
+/// releasing it when headers arrive would free the slot while the server is
+/// still generating, which is precisely the overlap this gate exists to
+/// prevent.
+struct PermitStream {
+    inner: Pin<Box<dyn Stream<Item = Delta> + Send>>,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl Stream for PermitStream {
+    type Item = Delta;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Delta>> {
+        // Both fields are `Unpin`, so projecting through `get_mut` is safe.
+        self.get_mut().inner.as_mut().poll_next(cx)
+    }
+}
+
 pub struct ProviderRouter {
     providers: DashMap<String, ProviderEntry>,
+    /// Per-provider concurrency gates, `provider id -> (limit, semaphore)`.
+    ///
+    /// Deliberately NOT a field on `ProviderEntry`: `register_from_row` runs
+    /// on every provider PATCH from Kitty (changing a model, activating a
+    /// profile) and re-`insert`s the entry wholesale, which would swap the
+    /// semaphore out from under everything queued on it. Keyed separately, the
+    /// gate survives re-registration.
+    ///
+    /// Before this existed there was no limit anywhere — `parallel_slots`
+    /// looked like one but only ever produced an advisory `id_slot` hint on
+    /// the request body. Nothing stopped the three fire-and-forget turn-end
+    /// tasks (compaction, title, learn) from calling the same provider as each
+    /// other and as the user's next turn.
+    slots: DashMap<String, (u32, Arc<Semaphore>)>,
     /// Shared across every registered provider so the peer cache (and the
     /// "Tailscale unreachable" warn-once) is discovered/logged at most once
     /// per daemon run, not once per provider.
@@ -58,6 +119,7 @@ impl ProviderRouter {
     pub fn new(cache: CacheConfig) -> Self {
         Self {
             providers: DashMap::new(),
+            slots: DashMap::new(),
             tailscale: Arc::new(TailscaleClient::new()),
             cache,
         }
@@ -67,7 +129,9 @@ impl ProviderRouter {
     /// from a `ProviderConfig` before it's moved into the concrete provider
     /// constructor — shared by `register_openai`/`register_anthropic` so
     /// both stay in sync.
-    fn resolved_fields(config: &ProviderConfig) -> (Option<u32>, SamplingParams, Option<i32>, i32) {
+    fn resolved_fields(
+        config: &ProviderConfig,
+    ) -> (Option<u32>, u32, SamplingParams, Option<i32>, i32) {
         let configured = SamplingParams {
             temperature: config.temperature,
             top_p: config.top_p,
@@ -82,8 +146,13 @@ impl ProviderRouter {
         };
         let resolved_sampling =
             sampling::resolve(&config.provider_type, &config.model, &configured);
+        let concurrency = config
+            .parallel_slots
+            .filter(|&n| n > 0)
+            .unwrap_or_else(|| default_concurrency(&config.provider_type));
         (
             config.parallel_slots,
+            concurrency,
             resolved_sampling,
             config.context_length,
             config.fallback_priority,
@@ -91,7 +160,7 @@ impl ProviderRouter {
     }
 
     pub fn register_openai(&self, provider_id: &str, config: ProviderConfig) {
-        let (parallel_slots, resolved_sampling, context_length, fallback_priority) =
+        let (parallel_slots, concurrency, resolved_sampling, context_length, fallback_priority) =
             Self::resolved_fields(&config);
         let p: Arc<dyn Provider> = Arc::new(OpenAICompatibleProvider::new(
             provider_id,
@@ -109,6 +178,7 @@ impl ProviderRouter {
                 },
                 health_checked_at: Instant::now(),
                 parallel_slots,
+                concurrency,
                 sampling: resolved_sampling,
                 context_length,
                 fallback_priority,
@@ -117,7 +187,7 @@ impl ProviderRouter {
     }
 
     pub fn register_anthropic(&self, provider_id: &str, config: ProviderConfig) {
-        let (parallel_slots, resolved_sampling, context_length, fallback_priority) =
+        let (parallel_slots, concurrency, resolved_sampling, context_length, fallback_priority) =
             Self::resolved_fields(&config);
         let p: Arc<dyn Provider> = Arc::new(AnthropicProvider::new(
             provider_id,
@@ -136,6 +206,7 @@ impl ProviderRouter {
                 },
                 health_checked_at: Instant::now(),
                 parallel_slots,
+                concurrency,
                 sampling: resolved_sampling,
                 context_length,
                 fallback_priority,
@@ -469,6 +540,28 @@ impl ProviderRouter {
             .and_then(|e| e.context_length)
     }
 
+    /// Correct this provider's cached context length from ground truth.
+    ///
+    /// The only caller is the context-overflow path in the tool loop: when a
+    /// provider rejects a request it reports its *own* view of the window
+    /// (llama.cpp sends `n_ctx`), and that number outranks anything discovery
+    /// guessed or a user typed into a profile. Without this, a provider whose
+    /// configured `context_length` is too generous keeps budgeting against the
+    /// wrong number and blows the window again on the very next turn.
+    ///
+    /// In-memory only — deliberately not written back to the DB profile, so a
+    /// user's explicit setting is never silently rewritten under them; the
+    /// correction lasts for this daemon's lifetime, which is what the valve
+    /// needs. Ignores non-positive values.
+    pub fn set_context_length(&self, provider_id: &str, context_length: i32) {
+        if context_length <= 0 {
+            return;
+        }
+        if let Some(mut entry) = self.providers.get_mut(provider_id) {
+            entry.context_length = Some(context_length);
+        }
+    }
+
     /// Resolve model for a specific provider.
     pub fn resolve_model(&self, provider_id: &str, override_model: Option<&str>) -> String {
         if let Some(entry) = self.providers.get(provider_id) {
@@ -499,6 +592,27 @@ impl ProviderRouter {
     }
 
     /// Call chat_completion on a specific provider.
+    /// The concurrency gate for one provider, created on first use.
+    ///
+    /// Replaced when the configured limit changes, so editing `parallel_slots`
+    /// takes effect without a daemon restart. Anything already holding a
+    /// permit keeps it (its `Arc` outlives the map entry), so a limit change
+    /// can briefly admit more than the new limit — acceptable for a rare,
+    /// user-initiated event, and far better than ignoring the setting until
+    /// restart.
+    fn gate(&self, provider_id: &str, limit: u32) -> Arc<Semaphore> {
+        let limit = limit.max(1) as usize;
+        if let Some(existing) = self.slots.get(provider_id) {
+            if existing.0 as usize == limit {
+                return existing.1.clone();
+            }
+        }
+        let sem = Arc::new(Semaphore::new(limit));
+        self.slots
+            .insert(provider_id.to_string(), (limit as u32, sem.clone()));
+        sem
+    }
+
     pub async fn chat_completion(
         &self,
         provider_id: &str,
@@ -511,17 +625,34 @@ impl ProviderRouter {
         // Clone the provider's Arc out, drop the DashMap guard, then await —
         // a chat completion can run for minutes and must never hold the shard
         // lock (which would block health checks and other completions).
-        let provider = self
-            .providers
-            .get(provider_id)
-            .ok_or_else(|| ProviderError::NoHealthyProvider {
-                user_message: format!("Provider '{}' not found", provider_id),
-            })?
-            .provider
-            .clone();
-        provider
+        let (provider, concurrency) = {
+            let entry =
+                self.providers
+                    .get(provider_id)
+                    .ok_or_else(|| ProviderError::NoHealthyProvider {
+                        user_message: format!("Provider '{}' not found", provider_id),
+                    })?;
+            (entry.provider.clone(), entry.concurrency)
+        };
+
+        // Wait for a slot before sending anything. Every caller funnels
+        // through here — the tool loop, its retry/failover attempts, and the
+        // three fire-and-forget turn-end tasks — so the queue is enforced in
+        // one place rather than relying on each of them to remember.
+        let gate = self.gate(provider_id, concurrency);
+        let permit = gate.acquire_owned().await.map_err(|_| {
+            ProviderError::NoHealthyProvider {
+                user_message: format!("Provider '{}' is shutting down", provider_id),
+            }
+        })?;
+
+        let inner = provider
             .chat_completion(messages, tools, sampling, model, id_slot)
-            .await
+            .await?;
+        Ok(Box::pin(PermitStream {
+            inner,
+            _permit: permit,
+        }))
     }
 
     /// Get the provider ID to use, preferring healthy ones.
@@ -866,5 +997,105 @@ mod tests {
         let router = ProviderRouter::default();
         assert!(router.get_provider_id(None).is_err());
         assert!(router.get_provider_id(Some("anything")).is_err());
+    }
+
+    /// A self-hosted endpoint is one request at a time unless its operator
+    /// says otherwise. Getting this wrong is what produced "Provider sent no
+    /// response headers within 30s": a second call queued behind the first on
+    /// a single-slot llama-server, received nothing, and timed out — while the
+    /// abandoned request kept generating.
+    #[test]
+    fn self_hosted_dialects_default_to_one_slot_hosted_ones_do_not() {
+        for dialect in ["custom_openai", "ollama", "local"] {
+            assert_eq!(default_concurrency(dialect), 1, "{dialect}");
+        }
+        for dialect in ["openai", "openrouter", "anthropic"] {
+            assert!(default_concurrency(dialect) > 1, "{dialect}");
+        }
+    }
+
+    /// `parallel_slots` finally means what its name says. It used to produce
+    /// only an advisory `id_slot` hint on the request body — a note to the
+    /// server about which slot to use, with nothing actually limiting how many
+    /// requests were in flight.
+    #[test]
+    fn parallel_slots_overrides_the_dialect_default() {
+        let router = ProviderRouter::default();
+        router.register_openai(
+            "many",
+            ProviderConfig {
+                provider_type: "custom_openai".into(),
+                parallel_slots: Some(4),
+                ..Default::default()
+            },
+        );
+        router.register_openai(
+            "one",
+            ProviderConfig {
+                provider_type: "custom_openai".into(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(router.gate("many", 4).available_permits(), 4);
+        assert_eq!(router.gate("one", 1).available_permits(), 1);
+    }
+
+    /// The gate must survive `register_from_row`, which re-inserts the whole
+    /// `ProviderEntry` on every provider PATCH from Kitty (activating a
+    /// profile, changing a model). A semaphore living on the entry would be
+    /// swapped out from under everything queued on it — which is why the map
+    /// is keyed separately.
+    #[test]
+    fn re_registering_a_provider_keeps_the_same_gate() {
+        let router = ProviderRouter::default();
+        let cfg = || ProviderConfig {
+            provider_type: "custom_openai".into(),
+            ..Default::default()
+        };
+        router.register_openai("p", cfg());
+        let first = router.gate("p", 1);
+        let permit = first.clone().try_acquire_owned().expect("first permit");
+
+        router.register_openai("p", cfg());
+        let second = router.gate("p", 1);
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "re-registration must not replace the gate"
+        );
+        assert_eq!(
+            second.available_permits(),
+            0,
+            "the in-flight call's permit must still be held"
+        );
+        drop(permit);
+        assert_eq!(second.available_permits(), 1);
+    }
+
+    /// Editing `parallel_slots` should take effect without a daemon restart.
+    #[test]
+    fn changing_the_limit_replaces_the_gate() {
+        let router = ProviderRouter::default();
+        let a = router.gate("p", 1);
+        let b = router.gate("p", 3);
+        assert!(!Arc::ptr_eq(&a, &b));
+        assert_eq!(b.available_permits(), 3);
+    }
+
+    /// The permit has to outlive the whole response, not just the request:
+    /// releasing it when headers arrive would free the slot while the server
+    /// is still generating — exactly the overlap the gate exists to prevent.
+    #[tokio::test]
+    async fn a_permit_is_held_until_its_stream_is_dropped() {
+        let gate = Arc::new(Semaphore::new(1));
+        let permit = gate.clone().acquire_owned().await.unwrap();
+        let inner: Pin<Box<dyn Stream<Item = Delta> + Send>> =
+            Box::pin(futures::stream::iter(Vec::<Delta>::new()));
+        let stream = PermitStream {
+            inner,
+            _permit: permit,
+        };
+        assert_eq!(gate.available_permits(), 0);
+        drop(stream);
+        assert_eq!(gate.available_permits(), 1);
     }
 }

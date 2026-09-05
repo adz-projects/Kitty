@@ -15,7 +15,13 @@ use crate::commands::{ModeInfo, SessionInfo};
 /// is `thinking_effort`, derived from the active provider's capability so the
 /// dropdown appears only where the provider actually accepts an effort control
 /// (see `bigtiny::effort`); everything else is fixed.
-fn session_info(app: &AppHandle, session_id: String, cwd: String) -> SessionInfo {
+fn session_info(
+    app: &AppHandle,
+    session_id: String,
+    cwd: String,
+    provider_id: Option<String>,
+    model_id: Option<String>,
+) -> SessionInfo {
     let thinking_effort = crate::bigtiny::effort::thinking_effort_for(app, &session_id);
     let is_default_folder = crate::commands::is_default_folder(app, &cwd);
     SessionInfo {
@@ -25,6 +31,8 @@ fn session_info(app: &AppHandle, session_id: String, cwd: String) -> SessionInfo
         available_modes: Vec::<ModeInfo>::new(),
         thinking_effort,
         is_default_folder,
+        provider_id,
+        model_id,
     }
 }
 
@@ -43,6 +51,9 @@ pub async fn create(
     cwd: String,
     provider: Option<String>,
     model: Option<String>,
+    // The Kitty profile id behind `provider`, echoed back so the caller's UI
+    // can pin itself without a second lookup — see `SessionInfo::provider_id`.
+    profile_id: Option<String>,
 ) -> Result<SessionInfo, String> {
     let client = ensure_client(app)?;
     // Always "agentic". The daemon's only use of `mode` is whether to add the
@@ -63,7 +74,7 @@ pub async fn create(
         .ok_or("BigTiny did not return a session id")?
         .to_string();
     let _ = app.emit("session://created", json!({ "sessionId": session_id }));
-    Ok(session_info(app, session_id, cwd))
+    Ok(session_info(app, session_id, cwd, profile_id, model))
 }
 
 
@@ -93,7 +104,7 @@ pub async fn reset_cwd(
     cwd: String,
 ) -> Result<SessionInfo, String> {
     update_cwd(app, session_id, &cwd).await?;
-    Ok(session_info(app, session_id.to_string(), cwd))
+    Ok(session_info(app, session_id.to_string(), cwd, None, None))
 }
 
 /// Set a session's custom/default persona (`PATCH /api/chat/{id}/config`).
@@ -313,7 +324,7 @@ pub async fn load(app: &AppHandle, session_id: String, cwd: String) -> Result<Se
         }
     }
 
-    Ok(session_info(app, session_id, cwd))
+    Ok(session_info(app, session_id, cwd, None, None))
 }
 
 /// Pure: an assistant row's stored `tool_calls` JSON -> replayable
@@ -379,7 +390,7 @@ pub async fn fork(
         .ok_or("BigTiny fork did not return a session id")?
         .to_string();
     let _ = app.emit("session://created", json!({ "sessionId": new_id }));
-    Ok(session_info(app, new_id, cwd))
+    Ok(session_info(app, new_id, cwd, None, None))
 }
 
 /// Pure: map "keep the first `keep` UI bubbles" onto the id of the last
