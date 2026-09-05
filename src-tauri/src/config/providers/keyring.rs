@@ -153,6 +153,7 @@ pub fn has_secret(id: &str) -> bool {
 /// `lifecycle/bigtiny_proc.rs::generate_secret`). This key must be stable
 /// across restarts (unlike `BIGTINY_SECRET`) or previously-encrypted rows
 /// in BigTiny's DB would become undecryptable.
+#[allow(dead_code)]
 const BIGTINY_ENCRYPTION_KEY_ACCOUNT: &str = "bigtiny-encryption-key";
 
 /// Serializes first-time key generation within this process — see
@@ -160,13 +161,29 @@ const BIGTINY_ENCRYPTION_KEY_ACCOUNT: &str = "bigtiny-encryption-key";
 /// tokio's): the guarded section is deliberately synchronous (the whole
 /// function is the blocking Credential Manager call), so it must be usable
 /// from plain blocking contexts too.
+#[allow(dead_code)]
 static ENCRYPTION_KEYGEN: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
 
+/// # Desktop no longer reads this at runtime
+///
+/// Since Phase 7 the V2 daemon owns its own at-rest key
+/// (`{data_dir}/encryption.key`), because a key injected by whichever app
+/// happened to spawn a *shared* daemon is a coin-flip: rows written under one
+/// app's key would be unreadable when another started it. Android still uses
+/// this — it hosts V1 in-process and is single-app, so the ownership question
+/// does not arise there.
+///
+/// It is kept on desktop, not deleted, because it holds the key that decrypts
+/// an existing install's provider rows. Migrating that install means handing
+/// this value to `bigtiny2-daemon import --encryption-key`, which adopts it as
+/// the V2 daemon's own (see docs/RELEASE.md). Deleting it would make those
+/// rows permanently unrecoverable.
 /// Return the existing at-rest encryption key for BigTiny's SQLite DB
 /// (provider API keys, MCP server auth headers), generating and storing a
 /// fresh random one on first call. Blocking (real Windows Credential
 /// Manager I/O) — call via `spawn_blocking` from async contexts, same
 /// rationale as `get_secret_async`.
+#[allow(dead_code)]
 pub fn get_or_create_bigtiny_encryption_key() -> Result<String, String> {
     // First-time generation is check-then-act: without a process-wide guard,
     // two concurrent first runs (e.g. the daemon boot racing a UI call) both

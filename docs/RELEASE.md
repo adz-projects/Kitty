@@ -136,6 +136,67 @@ proceed — this is expected, not a build failure.
 
 ---
 
+## Migrating an existing install onto BigTiny V2 (0.9.0)
+
+**Read this before shipping 0.9.0 to anyone with an existing install.**
+
+Desktop now runs BigTiny V2, which uses its own data directory
+(`%APPDATA%\BigTinyV2\`) rather than V1's `%APPDATA%\Kitty\bigtiny\`. That
+separation is deliberate — it is what lets V1 and V2 coexist during the
+migration, and what makes reverting the app a real rollback path rather than a
+restore-from-backup. The consequence is that **a fresh 0.9.0 launch starts with
+an empty database**: previous sessions, providers and MCP servers are still on
+disk, but the new daemon is not looking at them.
+
+Bringing them across is one command, run once, before first launch:
+
+```bash
+bigtiny2-daemon import --from "%APPDATA%\Kitty\bigtiny\bigtiny.db" --pathway-from "%APPDATA%\Kitty\bigtiny\pathway.db" --encryption-key <V1 key>
+```
+
+It copies the database (never migrates in place), runs migrations `017+` on the
+copy, stamps every row as owned by the app `kitty`, registers that app, and
+prints the API key it issued. It refuses to run if a V2 database already
+exists, so it cannot silently clobber one.
+
+### The encryption key is the step people will skip
+
+Provider API keys and MCP auth headers are encrypted at rest with a key V1 kept
+in the Windows Credential Manager. The import does **not** re-encrypt them, so
+the V2 daemon has to adopt that same key or every provider fails to
+authenticate later — surfacing as a provider 401, long after the migration,
+looking like a credentials problem rather than a migration mistake.
+
+Passing `--encryption-key` adopts it permanently into
+`%APPDATA%\BigTinyV2\encryption.key`. The import counts how many provider rows
+it could not decrypt and warns loudly when the count is non-zero, so a missed
+key is caught at migration time rather than in the field.
+
+Read the V1 key out of the Credential Manager (service `kitty`, account
+`bigtiny-encryption-key`) — for example with PowerShell and the CredentialManager
+module, or via Control Panel → Credential Manager → Windows Credentials.
+
+### Verifying a migration
+
+Compare counts between source and destination — sessions, messages, providers,
+recipes, schedules should match exactly — and confirm nothing was left
+ownerless:
+
+```sql
+SELECT COUNT(*) FROM sessions WHERE app_id = '';   -- must be 0
+```
+
+The import already asserts this and fails rather than leaving rows no app can
+see, but it is worth confirming on real data.
+
+### What is *not* migrated automatically
+
+Nothing. This is a manual one-shot by design: an automatic migration would have
+to decide on the user's behalf what to do when it half-fails, and the whole
+point of importing into a copy is that a failed attempt costs nothing. V1 stays
+bootable against its untouched original database, so reverting the app is a
+complete rollback.
+
 ## Android
 
 ### Toolchain

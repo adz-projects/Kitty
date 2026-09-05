@@ -46,10 +46,15 @@ const DISPLAY_NAME: &str = "Kitty";
 
 /// Where the issued app key is kept between launches.
 ///
-/// The Credential Manager rather than a config file, matching how the BigTiny
-/// encryption key is already handled: it is a bearer credential for everything
-/// Kitty owns in a daemon that other applications can also talk to.
-const KEY_CREDENTIAL: &str = "kitty-bigtiny-v2-app-key";
+/// The Credential Manager rather than a config file: it is a bearer credential
+/// for everything Kitty owns in a daemon other applications can also talk to.
+///
+/// `KEYRING_SERVICE` matches `config::providers::keyring`'s exactly — every
+/// secret this app stores lives under one service name, so they can be
+/// enumerated and cleared together rather than leaving an orphan namespace
+/// behind that nothing knows to look in.
+const KEYRING_SERVICE: &str = "kitty";
+const KEY_CREDENTIAL: &str = "bigtiny-v2-app-key";
 
 /// Resolve Kitty's durable app key, registering once if this is a first run.
 ///
@@ -85,7 +90,7 @@ async fn ensure_app_key(base_url: &str, registration_token: &str) -> Result<Stri
 
 #[cfg(windows)]
 fn read_stored_key() -> Option<String> {
-    keyring::Entry::new("Kitty", KEY_CREDENTIAL)
+    keyring::Entry::new(KEYRING_SERVICE, KEY_CREDENTIAL)
         .ok()
         .and_then(|e| e.get_password().ok())
         .filter(|k| !k.is_empty())
@@ -93,7 +98,7 @@ fn read_stored_key() -> Option<String> {
 
 #[cfg(windows)]
 fn store_key(key: &str) -> Result<(), String> {
-    keyring::Entry::new("Kitty", KEY_CREDENTIAL)
+    keyring::Entry::new(KEYRING_SERVICE, KEY_CREDENTIAL)
         .map_err(|e| format!("credential manager unavailable: {e}"))?
         .set_password(key)
         .map_err(|e| format!("could not store the BigTiny app key: {e}"))

@@ -13,6 +13,12 @@
 // Android hosts the daemon in-process; desktop spawns it. Both go through
 // the same `BIGTINY_*` pairs in `bigtiny_env`, so the two hosts cannot drift.
 #[cfg(target_os = "android")]
+// Android only, per its own module doc: it hosts the daemon in-process
+// because Android 10+ refuses to `exec()` a binary in app-writable storage.
+// Gated rather than merely unused since Phase 7 -- desktop no longer shares
+// any code with it, so compiling it there only produced dead-code warnings
+// for the Credential Manager key path that is now Android's alone.
+#[cfg(target_os = "android")]
 pub mod bigtiny_embedded;
 pub mod bigtiny_env;
 pub mod bigtiny_proc;
