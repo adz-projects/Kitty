@@ -165,6 +165,16 @@ pub struct AppState {
     /// stored here to decide whether to emit `chat://compaction` — this
     /// map is what makes that diff possible across polls.
     pub bigtiny_compaction_watermarks: Mutex<HashMap<String, i64>>,
+    /// Sessions whose auto-derived title we have already delivered to the
+    /// frontend, so `poll_session_title` stops polling for them.
+    ///
+    /// BigTiny derives a session's title once, in a detached task that runs
+    /// *after* the turn's terminal SSE frame — which is the frame the stream
+    /// reader stops at, so the `session_title` event it emits has no reader
+    /// left (the same shape of problem `bigtiny_compaction_watermarks` above
+    /// exists for). Polling covers the gap; this set keeps it to the one
+    /// turn per session that can actually produce a title.
+    pub bigtiny_titled_sessions: Mutex<HashSet<String>>,
     /// Window labels whose frontend has confirmed it mounted (dev-only
     /// load watchdog, see `windows::spawn_load_watchdog`). A window's first
     /// navigation in dev goes over HTTP to the Vite server; if that ever
@@ -221,6 +231,7 @@ impl AppState {
             screenshot_preview: Mutex::new(None),
             screenshot_selection: Mutex::new(None),
             bigtiny_compaction_watermarks: Mutex::new(HashMap::new()),
+            bigtiny_titled_sessions: Mutex::new(HashSet::new()),
             booted_windows: Mutex::new(HashSet::new()),
             effort_levels: Mutex::new(HashMap::new()),
             effort_confirmed_sessions: Mutex::new(HashSet::new()),

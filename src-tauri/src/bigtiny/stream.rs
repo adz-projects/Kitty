@@ -251,6 +251,7 @@ pub async fn send_prompt(
                 );
                 providers::emit_health_from_send_result(&app_bg, true);
                 poll_compaction_status(app_bg.clone(), session_id.clone());
+                poll_session_title(app_bg.clone(), session_id.clone());
             }
             Ok(TurnOutcome {
                 error: Some(message),
@@ -339,6 +340,72 @@ fn poll_compaction_status(app: AppHandle, session_id: String) {
                     "memory_slots": stats.get("memory_slots"),
                 }),
             );
+        }
+    });
+}
+
+/// BigTiny derives a session's title in a detached task that runs *after*
+/// the turn completes — and therefore after the turn's terminal (`is_last`)
+/// SSE frame, which is the frame `run_stream` stops reading at. Its
+/// `session_title` event lands on a connection nobody is reading any more,
+/// which is why an auto-titled chat used to stay "New Chat" in the sidebar
+/// until something else made the list refresh.
+///
+/// So: poll for it, the same way `poll_compaction_status` above covers the
+/// same gap for compaction. Emits the identical `chat://session-title` event
+/// the stream path emits, so the frontend needs no second code path.
+///
+/// Only the *first* completed turn of a session can produce a title (BigTiny
+/// never re-derives one once set), so a session is polled at most once per
+/// app run: `bigtiny_titled_sessions` records the ones already resolved,
+/// including those a user renamed by hand.
+fn poll_session_title(app: AppHandle, session_id: String) {
+    if app
+        .state::<AppState>()
+        .bigtiny_titled_sessions
+        .lock()
+        .unwrap()
+        .contains(&session_id)
+    {
+        return;
+    }
+    tauri::async_runtime::spawn(async move {
+        // The title is one summarizer call, but it queues behind the turn's
+        // own teardown and (on a cold local model) a load. Retry rather than
+        // guess one delay: a title that lands late is still worth showing,
+        // and giving up after ~20s costs nothing — the next app start reads
+        // the persisted name anyway.
+        for delay in [2u64, 3, 5, 10] {
+            tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+
+            let Ok(sessions) = crate::bigtiny::sessions::list(&app).await else {
+                continue;
+            };
+            let Some(row) = sessions
+                .iter()
+                .find(|s| s.get("sessionId").and_then(|v| v.as_str()) == Some(session_id.as_str()))
+            else {
+                // Deleted mid-poll, or older than the list window. Either
+                // way there is nothing left to title.
+                return;
+            };
+            let title = row.get("title").and_then(|v| v.as_str()).unwrap_or("");
+            // `translate_session_row` substitutes "New Chat" for a session
+            // BigTiny hasn't named yet, so that is the "still waiting"
+            // sentinel, not a real title.
+            if title.is_empty() || title == "New Chat" {
+                continue;
+            }
+            app.state::<AppState>()
+                .bigtiny_titled_sessions
+                .lock()
+                .unwrap()
+                .insert(session_id.clone());
+            let _ = app.emit(
+                "chat://session-title",
+                json!({ "session_id": session_id, "title": title }),
+            );
+            return;
         }
     });
 }
@@ -659,6 +726,15 @@ fn handle_event(
         }
         "session_title" => {
             if let Some(title) = content {
+                // Reaches us only when the daemon happens to emit it before
+                // the terminal frame; `poll_session_title` covers the usual
+                // case where it doesn't. Recording it here stops that poll
+                // from running for a session already titled.
+                app.state::<AppState>()
+                    .bigtiny_titled_sessions
+                    .lock()
+                    .unwrap()
+                    .insert(session_id.to_string());
                 let _ = app.emit(
                     "chat://session-title",
                     json!({ "session_id": session_id, "title": title }),

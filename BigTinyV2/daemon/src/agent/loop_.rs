@@ -575,7 +575,25 @@ fn derive_title(text: &str) -> String {
         return String::new();
     }
     let first_line = stripped.lines().next().unwrap_or("").trim();
-    truncate_title(first_line)
+    truncate_title(&truncate_title_words(first_line))
+}
+
+/// Titles are capped at five words. Short enough to scan a sidebar of them
+/// at a glance, which is the only job a session title has — the 60-char cap
+/// below is a *byte-safety* limit on top of this, not a substitute for it (a
+/// single five-word line can still be long, and one unbroken 200-char "word"
+/// passes the word cap untouched).
+const MAX_TITLE_WORDS: usize = 5;
+
+/// Keep at most [`MAX_TITLE_WORDS`] words, marking the cut with an ellipsis
+/// so a clipped title doesn't read as a complete one. Also collapses runs of
+/// whitespace, since it rebuilds the string from its words.
+fn truncate_title_words(s: &str) -> String {
+    let words: Vec<&str> = s.split_whitespace().collect();
+    if words.len() <= MAX_TITLE_WORDS {
+        return words.join(" ");
+    }
+    format!("{}…", words[..MAX_TITLE_WORDS].join(" "))
 }
 
 /// Cap a title at 60 characters, breaking on a word boundary where possible.
@@ -648,11 +666,19 @@ async fn derive_and_set_title(
     });
 }
 
-/// Ask the summarizer chain for a short (3-6 word) title from this
-/// session's recent messages. `None` on any failure — no messages yet,
-/// every summarizer leg erroring, or a response with no usable `title`
-/// field — so the caller falls back to the naive derivation instead of
-/// surfacing an error anywhere a user could see it.
+/// Ask the summarizer chain for a title describing what the user opened the
+/// session to do. `None` on any failure — no first message yet, every
+/// summarizer leg erroring, or a response with no usable `title` field — so
+/// the caller falls back to the naive derivation instead of surfacing an
+/// error anywhere a user could see it.
+///
+/// Titled from the **first user message alone**, not the last N messages.
+/// The title names the session in a sidebar, so it has to describe why the
+/// session exists; feeding in the tail of the exchange let it drift onto
+/// whatever the assistant happened to be doing at the end of the turn, which
+/// is exactly the thing a user scanning the list is not looking for. It also
+/// keeps the prompt small and stable, which matters for the small local
+/// model that usually answers it.
 async fn summarizer_title(
     pool: &SqlitePool,
     session_id: &str,
@@ -660,45 +686,43 @@ async fn summarizer_title(
     provider_id: Option<&str>,
     model: Option<String>,
 ) -> Option<String> {
-    let rows = crate::storage::messages::get_last_messages_by_session(pool, session_id, 8)
+    let row = crate::storage::messages::get_first_user_message(pool, session_id)
         .await
-        .ok()?;
-    let mut convo: Vec<Value> = rows
-        .into_iter()
-        .filter(|m| matches!(m.role.as_str(), "user" | "assistant"))
-        .filter_map(|m| {
-            let content = m.content?;
-            // Strip the same leading `--- <label> ---` attachment/paste
-            // markers `derive_title`'s naive fallback strips (see its doc
-            // comment) — a small/weak model given raw marker text as the
-            // most prominent thing in the prompt will happily parrot it
-            // back as the "title" despite being told not to (confirmed real
-            // report: a title of literally "--- Pasted text --- 130
-            // words."). Stripping before the model ever sees it is the
-            // actual fix; `sanitize_title` below is only a second line of
-            // defense for whatever slips past that.
-            let content = if m.role == "user" {
-                strip_leading_attachment_markers(&strip_prompt_wrappers(&content))
-            } else {
-                content
-            };
-            if content.trim().is_empty() {
-                return None;
-            }
-            Some(json!({ "role": m.role, "content": content }))
-        })
-        .collect();
-    if convo.is_empty() {
+        .ok()??;
+    // Strip the same leading `--- <label> ---` attachment/paste markers
+    // `derive_title`'s naive fallback strips (see its doc comment) — a
+    // small/weak model given raw marker text as the most prominent thing in
+    // the prompt will happily parrot it back as the "title" despite being
+    // told not to (confirmed real report: a title of literally "--- Pasted
+    // text --- 130 words."). Stripping before the model ever sees it is the
+    // actual fix; `sanitize_title` below is only a second line of defense
+    // for whatever slips past that.
+    let first =
+        strip_leading_attachment_markers(&strip_prompt_wrappers(&row.content.unwrap_or_default()));
+    let first = first.trim();
+    if first.is_empty() {
         return None;
     }
-    let mut prompt = vec![json!({
+    // A long first message is mostly pasted context; the ask is at the top
+    // and the tail only dilutes the prompt for a small model.
+    let first: String = first.chars().take(2000).collect();
+
+    // Kept as one flat line per rule so the model sees no stray indentation
+    // (a `\`-continued Rust string literal keeps every leading space of the
+    // next source line, which is exactly the kind of noise a 300M-class
+    // summarizer copies into its answer).
+    let instructions = concat!(
+        "Below is the first message a user sent in a new chat. ",
+        "Write a title for that chat saying what the user is asking about.\n",
+        "Rules: at most 5 words. No quotes, no trailing punctuation, no preamble. ",
+        "Describe the subject, not how any file or pasted text arrived. ",
+        "Never copy the message verbatim.\n\n",
+        "--- message ---\n",
+    );
+    let prompt = vec![json!({
         "role": "user",
-        "content": "Read the conversation below and suggest a short, specific, descriptive \
-                     title for it — 3 to 6 words, no surrounding quotes, no trailing \
-                     punctuation. Describe what the conversation is actually about, not how \
-                     any file or pasted text arrived."
+        "content": format!("{instructions}{first}"),
     })];
-    prompt.append(&mut convo);
 
     let schema = json!({
         "type": "object",
@@ -727,13 +751,53 @@ fn sanitize_title(raw: &str) -> String {
     // model that echoes one back anyway (or any other input path that
     // reaches `sanitize_title` without going through that stripping).
     let trimmed = strip_leading_attachment_markers(trimmed);
-    let collapsed = trimmed.split_whitespace().collect::<Vec<_>>().join(" ");
+    let collapsed = truncate_title_words(&trimmed);
     truncate_title(&collapsed)
 }
 
 #[cfg(test)]
 mod derive_title_tests {
-    use super::{derive_title, sanitize_title, strip_leading_attachment_markers, truncate_title};
+    // Several expectations below end in `…`: `derive_title` caps every title
+    // at five words (`MAX_TITLE_WORDS`), so a six-word message is clipped.
+    // That is the cap, not the marker-stripping, doing the work — these
+    // tests are still asserting what got stripped off the *front*.
+    use super::{
+        derive_title, sanitize_title, strip_leading_attachment_markers, truncate_title,
+        truncate_title_words,
+    };
+
+    #[test]
+    fn sanitize_title_caps_at_five_words() {
+        assert_eq!(
+            sanitize_title("Debugging a login redirect loop in staging"),
+            "Debugging a login redirect loop…"
+        );
+    }
+
+    #[test]
+    fn sanitize_title_leaves_five_words_alone() {
+        assert_eq!(
+            sanitize_title("Debugging a login redirect loop"),
+            "Debugging a login redirect loop"
+        );
+    }
+
+    #[test]
+    fn derive_title_caps_the_naive_fallback_at_five_words() {
+        // The fallback used to hand back the whole first line up to 60
+        // chars, which is what filled the sidebar with raw prompts like
+        // "please write me a python script to…".
+        let msg = "please write me a python script that counts words";
+        assert_eq!(derive_title(msg), "please write me a python…");
+    }
+
+    #[test]
+    fn truncate_title_words_is_char_safe_on_multi_byte_text() {
+        // Word-splitting a CJK/emoji title must not panic or split a
+        // grapheme — it only ever slices at whitespace boundaries.
+        let out = truncate_title_words("日本語 🎉 テスト です ね よ");
+        assert_eq!(out, "日本語 🎉 テスト です ね…");
+    }
 
     #[test]
     fn sanitize_title_strips_surrounding_quotes() {
@@ -805,13 +869,13 @@ mod derive_title_tests {
     fn skips_multiple_leading_marker_blocks() {
         let msg =
             "--- a.txt ---\ncontent a\n\n--- b.txt ---\ncontent b\n\nWhat do these have in common?";
-        assert_eq!(derive_title(msg), "What do these have in common?");
+        assert_eq!(derive_title(msg), "What do these have in…");
     }
 
     #[test]
     fn a_message_with_no_markers_is_unaffected() {
         let msg = "How do I center a div?";
-        assert_eq!(derive_title(msg), "How do I center a div?");
+        assert_eq!(derive_title(msg), "How do I center a…");
     }
 
     #[test]
@@ -820,7 +884,7 @@ mod derive_title_tests {
         // happens to start with "---" for some other reason (a markdown
         // horizontal rule, a code fence) must not be swallowed.
         let msg = "--- this is not a marker\nbecause it has no closing dashes";
-        assert_eq!(derive_title(msg), "--- this is not a marker");
+        assert_eq!(derive_title(msg), "--- this is not a…");
     }
 
     #[test]

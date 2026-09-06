@@ -63,7 +63,12 @@ control how the daemon is spawned:
   `chat://tool-approval-needed` (answered via `POST /approve`; `allow_once`→
   `allow`, `allow_always`→`always_allow`, reject/cancel→`reject`),
   `session_title`→`chat://session-title`, `llm_stop` usage + final frame →
-  `chat://complete` with `{stopReason, usage}`.
+  `chat://complete` with `{stopReason, usage}`. The stream reader stops at the
+  terminal (`is_last`) frame, so events the daemon emits from its own post-turn
+  background tasks land on a connection nobody is reading: both `compaction`
+  and `session_title` are therefore *polled* for after the turn
+  (`poll_compaction_status` / `poll_session_title`) rather than relied on
+  arriving over SSE.
 - **Providers** (`bigtiny/providers.rs`): activating a Kitty provider profile
   registers/updates it in BigTiny over `POST/PATCH /api/providers` — no
   daemon restart needed. `anthropic` maps to BigTiny's native Anthropic
