@@ -2157,10 +2157,25 @@ button.link {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  gap: 10px;
   padding: 8px 12px;
   border: 1px solid var(--border);
   border-radius: 8px;
   background: var(--surface);
+}
+/* The name/size column absorbs the slack and wraps inside itself. Without
+   `min-width: 0` a flex item refuses to shrink below its content width, so a
+   long model label pushed the buttons out of the row instead of wrapping. */
+.model-row > :first-child {
+  flex: 1;
+  min-width: 0;
+}
+/* Keep the action buttons on one line. They sit in a generic `.row`, which
+   is `flex-wrap: wrap` — on a phone that stacked "Installed" on top of the
+   delete button, which is what the row looked broken. */
+.model-row .row {
+  flex: none;
+  flex-wrap: nowrap;
 }
 .model-name {
   font-weight: 600;
@@ -2407,6 +2422,17 @@ button.link {
   :root {
     /* 44px tap target + whatever the gesture bar claims. */
     --mobile-tabs-h: calc(44px + var(--safe-bottom));
+  }
+
+  /* Settings → Helper Models. At phone width there isn't room for the model
+     label and its buttons side by side without the label wrapping to three
+     lines, so give each its own row and right-align the actions. */
+  .model-row {
+    flex-wrap: wrap;
+  }
+  .model-row .row {
+    width: 100%;
+    justify-content: flex-end;
   }
 
   /* The desktop chat layout is a three-column grid (history | chat |
