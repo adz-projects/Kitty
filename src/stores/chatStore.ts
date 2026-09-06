@@ -43,6 +43,8 @@ import type {
 import { decideChatApproval, pickRejectOption } from './chat/approvalUtils';
 import {
   buildStrippedTranscript,
+  isConnectivityError,
+  isProviderScopedError,
   stripPromptPreamble,
   stripRecipeWrapper,
   stripInternalMarkers,
@@ -1437,7 +1439,13 @@ export const useChatStore = create<ChatState>((set, get) => {
       set({ checkingConnection: true });
       try {
         await ipc.testActiveProviderConnection();
-        set({ providerOffline: false });
+        // A check the user asked for and that passed — same reasoning as the
+        // health-tick handler: retire the "can't reach provider" card too,
+        // not just the banner, or the retry appears to have done nothing.
+        set((s) => ({
+          providerOffline: false,
+          ...(isConnectivityError(s.error, s.errorType) ? { error: null, errorType: null } : null),
+        }));
       } catch (e) {
         set({ providerOffline: true, error: String(e) });
       } finally {
@@ -2353,7 +2361,19 @@ export const useChatStore = create<ChatState>((set, get) => {
       });
 
       void onProviderHealth((h) => {
-        set({ providerOffline: !h.reachable, providerHost: h.host ?? get().providerHost });
+        set((s) => ({
+          providerOffline: !h.reachable,
+          providerHost: h.host ?? s.providerHost,
+          // The provider answering again resolves the error card that said it
+          // couldn't be reached. Only the `providerOffline` banner used to
+          // clear here, leaving the card below it still reporting a problem
+          // that had gone away — with nothing but a restart to clear it.
+          // Narrow on purpose: an unrelated failure (bad key, context
+          // overflow) is not fixed by the host coming back, so it stays.
+          ...(h.reachable && isConnectivityError(s.error, s.errorType)
+            ? { error: null, errorType: null }
+            : null),
+        }));
       });
       // Provider (de)activated → re-sync provider-derived state immediately so the
       // UI doesn't drift until the next session or health tick (Round-2 item 4).
@@ -2369,7 +2389,14 @@ export const useChatStore = create<ChatState>((set, get) => {
       // every open window's session is exactly the cross-window leak it used
       // to cause (pick a provider in window 2 → window 1 switched too).
       void onProviderActivated(() => {
-        set({ providerOffline: false });
+        set((s) => ({
+          providerOffline: false,
+          // Same reasoning as the banner: an error *about the provider* (can't
+          // reach it, bad key, out of credits) describes the one we just
+          // switched away from, so its card goes with it. A conversation-level
+          // failure is left alone — switching providers didn't fix that.
+          ...(isProviderScopedError(s.errorType) ? { error: null, errorType: null } : null),
+        }));
         void get().refreshProvider();
       });
       // A session was deleted (any window, e.g. the sidebar's kebab menu) —

@@ -23,7 +23,7 @@ export function humanizeChatError(raw: string, errorType?: string): string {
     return "Your API credits are exhausted. Check your provider's billing settings or switch to another provider.";
   }
   if (errorType === 'auth_failed') {
-    return "This provider rejected the API key. Check it in Settings — it may be wrong, expired, or revoked.";
+    return 'This provider rejected the API key. Check it in Settings — it may be wrong, expired, or revoked.';
   }
   if (errorType === 'network_unreachable') {
     return "Kitty couldn't reach this provider. Check your connection (or the provider's own status) and try sending again.";
@@ -44,6 +44,47 @@ export function humanizeChatError(raw: string, errorType?: string): string {
     return "Lost the connection to Kitty's engine. Kitty will reconnect automatically — try sending again.";
   }
   return 'Something went wrong sending that message.';
+}
+
+/** Error types that describe the *provider*, not this conversation — so they
+    stop being true the moment a different provider is activated. Everything
+    else (a context overflow, a malformed request) survives the switch,
+    because switching providers didn't fix it. */
+const PROVIDER_SCOPED_ERROR_TYPES = new Set([
+  'network_unreachable',
+  'auth_failed',
+  'insufficient_credits',
+]);
+
+export function isProviderScopedError(errorType?: string | null): boolean {
+  return !!errorType && PROVIDER_SCOPED_ERROR_TYPES.has(errorType);
+}
+
+/** Is this error one that "the provider is reachable again" actually
+    resolves?
+
+    Kitty shows connectivity failures twice: the `providerOffline` banner
+    (health-tick driven, self-clearing) and the `ErrorDetail` card from the
+    failed turn. Only the banner had a path back to healthy, so a card
+    reading "Can't reach provider" sat there after the connection came back,
+    reporting a problem that no longer existed.
+
+    Kept deliberately narrow. A timeout is not included: the provider
+    answering a health probe says nothing about whether the request that
+    timed out would now succeed, so that card stays until the user retries
+    and finds out. */
+export function isConnectivityError(raw: string | null, errorType?: string | null): boolean {
+  if (!raw) return false;
+  // A classified error means the backend already decided what this is;
+  // don't second-guess it by also string-matching the raw text.
+  if (errorType) return errorType === 'network_unreachable';
+  const r = raw.toLowerCase();
+  return (
+    r.includes('connection closed') ||
+    r.includes('connection cancelled') ||
+    r.includes("isn't running") ||
+    r.includes('connect')
+  );
 }
 
 // STOPGAP client-side workaround for stripping reasoning from resent context
