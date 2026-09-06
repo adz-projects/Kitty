@@ -40,14 +40,60 @@
 <body>
     __BODY__
     <script>
-        function sendHeight() {
-            const height = document.documentElement.scrollHeight;
-            window.parent.postMessage({ type: 'mcp-iframe-resize', height: height }, '*');
-        }
-        window.addEventListener('load', sendHeight);
-        if (typeof ResizeObserver !== 'undefined') {
-            new ResizeObserver(sendHeight).observe(document.body);
-        }
+        // Height handshake with the host (see `ToolResultIframe` in
+        // `src/components/chat/VisualizationCard.tsx`).
+        //
+        // Two traps this has to survive:
+        //  1. Measure the *body*, never `documentElement`. Body's `overflow-y:
+        //     hidden` propagates to the viewport, and the root element's
+        //     scroll metrics then never report less than the viewport — i.e.
+        //     less than the height the host already gave us. That ratchets:
+        //     the card could grow but never shrink back when the content gets
+        //     shorter (a narrower window scales the width-driven SVG down).
+        //  2. `ResizeObserver` fires its first callback before the SVG has
+        //     laid out, so the first measurement is a placeholder. A
+        //     measurement is never final: re-send after load and again as the
+        //     layout settles, and answer the host whenever it asks.
+        (function () {
+            var last = -1;
+            function measure() {
+                var b = document.body;
+                return Math.max(
+                    b.scrollHeight,
+                    b.offsetHeight,
+                    Math.ceil(b.getBoundingClientRect().height)
+                );
+            }
+            function sendHeight(force) {
+                var h = measure();
+                // A zero/negative measurement means layout hasn't happened
+                // yet; a later re-measure will carry the real value.
+                if (h <= 0) return;
+                if (!force && h === last) return;
+                last = h;
+                window.parent.postMessage({ type: 'mcp-iframe-resize', height: h }, '*');
+            }
+            document.addEventListener('DOMContentLoaded', function () { sendHeight(); });
+            window.addEventListener('load', function () {
+                sendHeight();
+                requestAnimationFrame(function () { sendHeight(); });
+                // Fonts and late layout can still change the height after
+                // `load`; a few cheap re-measures cost nothing and stop the
+                // card settling on a too-short height.
+                [100, 300, 800].forEach(function (ms) { setTimeout(function () { sendHeight(); }, ms); });
+            });
+            if (typeof ResizeObserver !== 'undefined') {
+                new ResizeObserver(function () { sendHeight(); }).observe(document.body);
+            }
+            // The host asks again after its own load event and whenever the
+            // iframe's width changes (the SVG is width-driven, so its height
+            // changes with it). `force` because the host may have missed the
+            // last message it is asking us to repeat.
+            window.addEventListener('message', function (e) {
+                var d = e.data;
+                if (d && d.type === 'mcp-iframe-measure') sendHeight(true);
+            });
+        })();
     </script>
 </body>
 </html>

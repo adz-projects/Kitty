@@ -1,4 +1,4 @@
-import { memo, useEffect, useMemo, useRef, useState } from 'react';
+import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { ToolCall } from '@/stores/chatStore';
 
 function stringify(v: unknown): string {
@@ -64,12 +64,24 @@ const VIZ_LABELS: Record<string, string> = {
     document posts on load/resize (see `wrap_in_standalone_html` in
     `plugins/kitty-tools/src/tools/viz/mod.rs`, and the resize script baked
     into `assets/wrapper.html`). Only trusts resize messages that actually
-    originate from this iframe's own content window. */
+    originate from this iframe's own content window.
+
+    The listener goes on in a *layout* effect, not a passive one: React runs
+    passive effects after paint, which can land after the srcDoc document has
+    already loaded and posted its height — losing the only message that would
+    ever grow the card past the placeholder height. Layout effects run in the
+    same commit as the DOM insert, before the iframe's document can load.
+
+    Belt and braces on top of that, since the wrapper script ships inside the
+    `kitty-tools` sidecar and an installed build may predate it: ask the
+    document to re-measure on our own `load`, and again whenever the iframe's
+    width changes (the visualization SVG is width-driven, so its height moves
+    with it). */
 function ToolResultIframe({ payload }: { payload: IframeRenderPayload }) {
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const [height, setHeight] = useState(120);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     function onMessage(e: MessageEvent) {
       if (e.source !== iframeRef.current?.contentWindow) return;
       const data = e.data as { type?: string; height?: number } | null;
@@ -81,6 +93,26 @@ function ToolResultIframe({ payload }: { payload: IframeRenderPayload }) {
     return () => window.removeEventListener('message', onMessage);
   }, []);
 
+  const requestMeasure = () => {
+    iframeRef.current?.contentWindow?.postMessage({ type: 'mcp-iframe-measure' }, '*');
+  };
+
+  useEffect(() => {
+    const el = iframeRef.current;
+    if (!el || typeof ResizeObserver === 'undefined') return;
+    // Width only — reacting to our own height changes would just echo the
+    // resize we were told to make.
+    let lastWidth = el.clientWidth;
+    const ro = new ResizeObserver(() => {
+      const w = iframeRef.current?.clientWidth ?? lastWidth;
+      if (w === lastWidth) return;
+      lastWidth = w;
+      requestMeasure();
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
   return (
     <iframe
       ref={iframeRef}
@@ -88,6 +120,7 @@ function ToolResultIframe({ payload }: { payload: IframeRenderPayload }) {
       title={payload.title ?? 'Tool visualization'}
       srcDoc={payload.html}
       sandbox={payload.sandbox}
+      onLoad={requestMeasure}
       style={{ height }}
     />
   );
