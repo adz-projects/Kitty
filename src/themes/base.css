@@ -291,9 +291,37 @@ button.primary {
 }
 /* The folder/thought-partner pill takes remaining space and truncates first —
    the control group to its right (mode toggle/provider/effort/approval) holds
-   its own shrink behavior instead of the whole header wrapping to 2 lines. */
+   its own shrink behavior instead of the whole header wrapping to 2 lines.
+
+   Both the pill AND its popover wrapper are listed. The pill used to be a
+   direct child of `.chat-header`; wrapping it in `AllowedDirsPopover` (so a
+   thought-partner session can still show and revoke its file grants) made it a
+   *grandchild*, and this child-combinator rule silently stopped matching —
+   the pill shrink-wrapped to its label instead of spanning to the controls,
+   and lost the `min-width: 0` that keeps a long folder name from wrapping the
+   header to two lines. The growth now has to cross two boxes, so both need
+   `min-width: 0` for the ellipsis to still land. */
 .chat-header > .pill {
   flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* The wrapper grows and may shrink, but deliberately keeps `overflow: visible`:
+   it is the positioning context for the grants popover, which is absolutely
+   positioned and would be clipped away entirely by `overflow: hidden` here.
+   Truncation belongs to the pill inside it, which does the clipping. */
+.chat-header > .allowed-dirs-trigger {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+/* Fill the wrapper rather than shrink-wrapping inside it. `max-width` is reset
+   because the base `.pill` caps at 60% — which used to mean 60% of the header
+   and now would mean 60% of an already-shrink-wrapped trigger. */
+.chat-header > .allowed-dirs-trigger > .pill {
+  width: 100%;
+  max-width: none;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -936,6 +964,10 @@ button.primary {
   display: inline-flex;
   align-items: center;
   gap: 6px;
+  /* Take the pill's whole width so the folder name truncates and the reset
+     `×` stays pinned to the right edge. Without this the body sizes to its
+     text and the `×` floats mid-pill once the pill spans the header row. */
+  flex: 1 1 auto;
   min-width: 0;
   overflow: hidden;
   white-space: nowrap;

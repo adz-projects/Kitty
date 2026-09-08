@@ -1088,7 +1088,7 @@ impl AgentLoop {
         pathway_cfg: PathwayConfig,
         provider_mismatch_warned: Arc<DashMap<String, ()>>,
         workspace_snapshots: Arc<DashMap<String, (String, String)>>,
-    background_tasks: Arc<DashMap<String, Vec<tokio::task::AbortHandle>>>,
+        background_tasks: Arc<DashMap<String, Vec<tokio::task::AbortHandle>>>,
         pool: sqlx::SqlitePool,
     ) -> Self {
         Self {
@@ -1196,6 +1196,28 @@ impl AgentLoop {
             .filter(|m| !m.trim().is_empty());
 
         let allowed_dirs = allowed_dirs_for_session(&metadata, &self.cache_dir);
+        // Hand the same set to the bundled stdio tool servers.
+        //
+        // Those enforce a boundary of their own as defense-in-depth, and it is
+        // resolved from their environment — which, for a process shared by
+        // every session and spawned once, cannot know about this session's
+        // attached files or chosen working folders. Without this the two gates
+        // disagree: the daemon allows the session's chat directory, the tool
+        // refuses it as outside its own home, and the model is left unable to
+        // open a file the user just attached. See `mcp::kitty_grants`.
+        if let (Some(app_id), false) = (
+            crate::storage::sessions::owner_of(&self.pool, session_id)
+                .await
+                .ok()
+                .flatten(),
+            self.cache_dir.is_empty(),
+        ) {
+            crate::mcp::kitty_grants::publish(
+                std::path::Path::new(&self.cache_dir),
+                &app_id,
+                &allowed_dirs,
+            );
+        }
         let chat_dir = metadata.get("chat_dir").and_then(|v| v.as_str());
         let cwd = metadata.get("cwd").and_then(|v| v.as_str());
 
@@ -1489,7 +1511,7 @@ impl AgentLoop {
         let summarizer_cfg = self.summarizer_cfg.clone();
         let memory_cfg = self.memory_cfg.clone();
         let handle = tokio::spawn(async move {
-            let _ = run_compaction(
+            let outcome = run_compaction(
                 &pool,
                 &session_id,
                 &summarizer,
@@ -1502,6 +1524,29 @@ impl AgentLoop {
                 force,
             )
             .await;
+            // Still fire-and-forget as far as the turn is concerned, but no
+            // longer silent. A forced pass runs because a turn just overflowed
+            // the window and the user was told the session "is being compacted
+            // — send your message again"; when that pass frees nothing, the
+            // same overflow repeats on every retry. Logging the reason at
+            // `warn` is what makes that diagnosable at all, since the promise
+            // itself is made on a stream this task cannot reach.
+            match outcome {
+                Ok(r) => tracing::debug!(
+                    "compaction: session {session_id} folded {} messages ({} -> {} tokens)",
+                    r.messages_compacted,
+                    r.tokens_before,
+                    r.tokens_after,
+                ),
+                Err(skip) if force => tracing::warn!(
+                    "compaction: forced pass for session {session_id} freed nothing: {}",
+                    skip.message(),
+                ),
+                Err(skip) => tracing::debug!(
+                    "compaction: session {session_id} skipped: {}",
+                    skip.message(),
+                ),
+            }
         });
         self.track_background(&tracked_session, handle.abort_handle());
     }
@@ -1675,9 +1720,7 @@ impl AgentLoop {
 
         if cache.read {
             if let Some(key) = cache_key.as_deref() {
-                if let Ok(Some(hit)) =
-                    crate::provider::response_cache::get(&self.pool, key).await
-                {
+                if let Ok(Some(hit)) = crate::provider::response_cache::get(&self.pool, key).await {
                     if let Some(value) = response_schema::extract(&hit) {
                         // Re-validated rather than trusted: an entry written
                         // under an older schema would otherwise be served as if
@@ -2196,8 +2239,8 @@ impl AgentLoop {
                 // `projected_input_tokens` exists to avoid. Only pay for the
                 // exact count once the estimate says we are anywhere near the
                 // edge.
-                let preflight_gate = context_length
-                    .saturating_sub(wrapup_reserve.saturating_mul(3) / 2);
+                let preflight_gate =
+                    context_length.saturating_sub(wrapup_reserve.saturating_mul(3) / 2);
                 if projected_input > preflight_gate {
                     // Tool schemas ride along on every request and are
                     // routinely 2-6k tokens, so a count of `messages` alone
@@ -2214,9 +2257,9 @@ impl AgentLoop {
                         .saturating_sub(schema_tokens);
 
                     if tokens::count_messages_tokens(&messages) > budget {
-                        if let Some(shrunk) = crate::agent::compaction::shrink_live_turn(
-                            &messages, budget, token_cfg,
-                        ) {
+                        if let Some(shrunk) =
+                            crate::agent::compaction::shrink_live_turn(&messages, budget, token_cfg)
+                        {
                             let before = tokens::count_messages_tokens(&messages);
                             let after = tokens::count_messages_tokens(&shrunk);
                             tracing::info!(
@@ -2295,7 +2338,11 @@ impl AgentLoop {
                             pool,
                             session_id,
                             &provider_id,
-                            Some(provider_model_for(&self.router, &provider_id, model_override)),
+                            Some(provider_model_for(
+                                &self.router,
+                                &provider_id,
+                                model_override,
+                            )),
                             context_length,
                             true,
                         );
@@ -2305,11 +2352,8 @@ impl AgentLoop {
                                 "This conversation no longer fits in {model_label}'s \
                                  {context_length}-token context window ({final_count} tokens \
                                  needed). It is being compacted — send your message again.",
-                                model_label = provider_model_for(
-                                    &self.router,
-                                    &provider_id,
-                                    model_override
-                                ),
+                                model_label =
+                                    provider_model_for(&self.router, &provider_id, model_override),
                             )),
                             error_type: Some("context_exceeded".into()),
                             session_id: Some(session_id.to_string()),
@@ -2378,9 +2422,12 @@ impl AgentLoop {
                         // exactly the step it has to write its report.
                         sampling.effort = None;
                         sampling.reasoning_max_tokens = None;
-                        sampling.max_tokens = Some(sampling.max_tokens.unwrap_or(0).max(
-                            report_reserve.max(REPORT_RESERVE_FLOOR),
-                        ));
+                        sampling.max_tokens = Some(
+                            sampling
+                                .max_tokens
+                                .unwrap_or(0)
+                                .max(report_reserve.max(REPORT_RESERVE_FLOOR)),
+                        );
                     } else {
                         // A hint, where the dialect has a field for it. The
                         // accumulator below is what actually enforces this.
@@ -2470,7 +2517,9 @@ impl AgentLoop {
                         id_slot,
                         // The user is waiting on this one, and it is charged to
                         // the app that owns the session.
-                        turn_app_id.as_deref().unwrap_or(crate::provider::queue::DAEMON_LANE),
+                        turn_app_id
+                            .as_deref()
+                            .unwrap_or(crate::provider::queue::DAEMON_LANE),
                         self.priority,
                         // Unconstrained, deliberately: a schema is applied to
                         // the final answer only, by `finalize_structured`
@@ -2520,10 +2569,7 @@ impl AgentLoop {
                             // and compact before returning, because this
                             // `return` is above the post-turn compaction pass
                             // and without it the session stays a wall.
-                            if let ProviderError::ContextExceeded {
-                                context_window, ..
-                            } = &e
-                            {
+                            if let ProviderError::ContextExceeded { context_window, .. } = &e {
                                 if let Some(real) = context_window {
                                     if Some(*real) != self.router.context_length(&provider_id) {
                                         tracing::warn!(
@@ -2536,9 +2582,7 @@ impl AgentLoop {
                                         self.router.set_context_length(&provider_id, *real);
                                     }
                                 }
-                                let window = context_window
-                                    .unwrap_or(context_length)
-                                    .max(1);
+                                let window = context_window.unwrap_or(context_length).max(1);
                                 self.spawn_compaction(
                                     pool,
                                     session_id,
@@ -2593,10 +2637,7 @@ impl AgentLoop {
                                 model_override,
                             );
                             if next_id != provider_id
-                                && crate::agent::subagent_pick::is_denied(
-                                    &next_model,
-                                    &model_deny,
-                                )
+                                && crate::agent::subagent_pick::is_denied(&next_model, &model_deny)
                             {
                                 tracing::info!(
                                     session_id,
@@ -2632,8 +2673,7 @@ impl AgentLoop {
                 }
             };
 
-            let (content_buf, mut turn_tool_calls, finish_reason, turn_usage, timing) =
-                turn_result;
+            let (content_buf, mut turn_tool_calls, finish_reason, turn_usage, timing) = turn_result;
 
             // Reasoning accounting. This — not the wire fields — is what makes
             // the cap real: three of the five dialects have no budget field at
@@ -2918,12 +2958,12 @@ impl AgentLoop {
             // Execute tool calls concurrently (bounded by max_concurrent_tool_calls)
             let tool_results = self
                 .execute_tools(
-                session_id,
-                &turn_tool_calls,
-                allowed_dirs,
-                session_cwd,
-                event_tx,
-            )
+                    session_id,
+                    &turn_tool_calls,
+                    allowed_dirs,
+                    session_cwd,
+                    event_tx,
+                )
                 .await;
 
             for (tc, result) in turn_tool_calls.iter().zip(tool_results) {
@@ -2976,7 +3016,9 @@ impl AgentLoop {
                     &pid,
                     &model,
                     sampling,
-                    turn_app_id.as_deref().unwrap_or(crate::provider::queue::DAEMON_LANE),
+                    turn_app_id
+                        .as_deref()
+                        .unwrap_or(crate::provider::queue::DAEMON_LANE),
                     &response_spec,
                     report_reserve,
                     &cache_directive,

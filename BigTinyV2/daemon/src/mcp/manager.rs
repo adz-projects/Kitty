@@ -10,6 +10,7 @@ use crate::models::mcp::{MCPServerConfig, ToolDefinition, ToolResult, TransportT
 use crate::storage::mcp_servers;
 
 use super::client::MCPServerClient;
+use super::kitty_grants;
 use super::tools::validate_tool_args;
 
 const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -122,10 +123,7 @@ impl MCPManager {
 
     /// Supply the orchestrator the `specialists` built-in needs. Idempotent;
     /// a second call is ignored.
-    pub fn attach_orchestrator(
-        &self,
-        orchestrator: Arc<crate::agent::orchestrator::Orchestrator>,
-    ) {
+    pub fn attach_orchestrator(&self, orchestrator: Arc<crate::agent::orchestrator::Orchestrator>) {
         let _ = self.orchestrator.set(orchestrator);
     }
 
@@ -424,12 +422,7 @@ impl MCPManager {
     /// which needs a real child process or endpoint. Cross-app visibility is
     /// exactly the property that must be tested, so it needs a way in.
     #[cfg(any(test, feature = "test-support"))]
-    pub fn register_for_test(
-        &self,
-        server_id: &str,
-        app_id: Option<&str>,
-        tool_names: &[&str],
-    ) {
+    pub fn register_for_test(&self, server_id: &str, app_id: Option<&str>, tool_names: &[&str]) {
         self.server_app
             .insert(server_id.to_string(), app_id.map(str::to_string));
         for name in tool_names {
@@ -633,6 +626,31 @@ fn scoped_env(
     // server's own config is the operator speaking, and outranks this default.
     map.entry("KITTY_PLUGIN_HOME".to_string())
         .or_insert_with(|| serde_json::Value::String(home.to_string_lossy().into_owned()));
+
+    // `KITTY_PLUGIN_HOME` scopes the server's own *storage*. It must not also
+    // be the only tree the server will read: narrowing it to a per-app folder
+    // (above) put the session's chat directory outside the file tools'
+    // boundary, so the model was told by its system prompt to read attached
+    // files from a path every reader then rejected as outside home.
+    //
+    // These two grant the rest. The static half — the user's home directory,
+    // the OS temp directory, and the daemon's own data root — cannot change
+    // for the life of the child, so it travels in the environment.
+    map.entry(kitty_grants::ALLOWED_DIRS_ENV.to_string())
+        .or_insert_with(|| serde_json::Value::String(kitty_grants::static_allowed_dirs(data_dir)));
+    // The volatile half — attached files and chosen working folders — is
+    // per-session and accumulates mid-turn, so it cannot: one stdio server is
+    // shared by every session and its environment is fixed at spawn. The
+    // daemon rewrites this file (see `kitty_grants::publish`) and the child
+    // re-reads it when it changes.
+    map.entry(kitty_grants::ALLOWED_DIRS_FILE_ENV.to_string())
+        .or_insert_with(|| {
+            serde_json::Value::String(
+                kitty_grants::grants_file(data_dir, app_id)
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        });
     Some(serde_json::Value::Object(map))
 }
 

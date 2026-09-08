@@ -57,7 +57,10 @@ pub struct FileAttachment {
 /// longer rejected. Capped (default 25 MB — large enough for a typical photo)
 /// so we don't inline huge payloads.
 #[tauri::command]
-pub async fn read_file_any(path: String, max_bytes: Option<usize>) -> Result<FileAttachment, String> {
+pub async fn read_file_any(
+    path: String,
+    max_bytes: Option<usize>,
+) -> Result<FileAttachment, String> {
     tokio::task::spawn_blocking(move || {
         let cap = max_bytes.unwrap_or(25 * 1024 * 1024);
         let name = std::path::Path::new(&path)
@@ -142,7 +145,10 @@ const COPY_INTO_CHAT_FOLDER_MAX_BYTES: u64 = 512 * 1024 * 1024;
 /// command runs on the main thread, and an unbounded copy of a large
 /// attachment froze the UI. Capped at [`COPY_INTO_CHAT_FOLDER_MAX_BYTES`].
 #[tauri::command]
-pub async fn copy_file_into_chat_folder(source_path: String, cwd: String) -> Result<String, String> {
+pub async fn copy_file_into_chat_folder(
+    source_path: String,
+    cwd: String,
+) -> Result<String, String> {
     tokio::task::spawn_blocking(move || copy_file_into_chat_folder_blocking(&source_path, &cwd))
         .await
         .map_err(|e| format!("file copy task panicked: {e}"))?
@@ -162,7 +168,8 @@ fn copy_file_into_chat_folder_blocking(source_path: &str, cwd: &str) -> Result<S
         .unwrap_or_default();
     let ext = source.extension().map(|e| e.to_string_lossy().to_string());
 
-    let meta = std::fs::metadata(&source).map_err(|e| format!("could not open {source_path}: {e}"))?;
+    let meta =
+        std::fs::metadata(&source).map_err(|e| format!("could not open {source_path}: {e}"))?;
     if meta.len() > COPY_INTO_CHAT_FOLDER_MAX_BYTES {
         return Err(format!(
             "File is too large to attach (> {} MB).",
@@ -279,7 +286,10 @@ pub async fn download_file(app: AppHandle, path: String) -> Result<bool, String>
         .save_file(move |chosen| {
             let _ = tx.send(chosen);
         });
-    let Some(target) = rx.await.map_err(|_| "the save dialog closed unexpectedly")? else {
+    let Some(target) = rx
+        .await
+        .map_err(|_| "the save dialog closed unexpectedly")?
+    else {
         return Ok(false);
     };
 
@@ -349,8 +359,8 @@ const LIST_DIRECTORY_MAX_ENTRIES: usize = 500;
 pub async fn list_directory(path: String) -> Result<Vec<FileEntry>, String> {
     tokio::task::spawn_blocking(move || {
         let dir = PathBuf::from(&path);
-        let entries = std::fs::read_dir(&dir)
-            .map_err(|e| format!("could not list directory {path}: {e}"))?;
+        let entries =
+            std::fs::read_dir(&dir).map_err(|e| format!("could not list directory {path}: {e}"))?;
 
         let mut files: Vec<FileEntry> = entries
             .filter_map(|entry| entry.ok())
@@ -505,10 +515,10 @@ mod tests {
 
 /// The single directory tree the bundled MCP tool plugins are able to reach.
 ///
-/// `kitty-tools` enforces its own path boundary (`plugins/kitty-tools/src/
-/// paths.rs::path_within_home`) independently of BigTiny's per-session
-/// sandbox, and it is the *narrower* of the two. This mirrors that crate's
-/// resolution order so both sides agree on where the wall is:
+/// `kitty-tools` enforces its own path boundary
+/// (`plugins/kitty-tools/src/paths.rs::path_within_allowed`) independently of
+/// BigTiny's per-session sandbox. This mirrors the *baseline* of that crate's
+/// resolution order, so a file this function calls reachable really is:
 ///
 /// - **Android** — `KITTY_PLUGIN_HOME`, which `lifecycle::bigtiny_env` sets to
 ///   the app-private data directory. Nothing outside it is readable by a tool,
@@ -516,7 +526,23 @@ mod tests {
 ///   hands back paths under `/storage/emulated/0/…` or a content-provider
 ///   cache, none of which live under the app's own data directory.
 /// - **Desktop** — the user's home directory (`%USERPROFILE%` / `$HOME`). Most
-///   attachments already qualify; a file on another volume does not.
+///   attachments already qualify; a file on another volume does not, and gets
+///   staged into the chat folder instead.
+///
+/// **This is deliberately a lower bound, not the whole grant set.** The tools'
+/// real allowed set is home *plus* temp, the daemon's data root and the
+/// session's own grants (`mcp::kitty_grants`), which this process cannot see —
+/// they are composed daemon-side and some of them are per-session. Erring
+/// narrow is the safe direction: the cost of calling a reachable file
+/// unreachable is one needless copy into the chat folder, whereas the reverse
+/// hands the model a path it cannot open.
+///
+/// It used to err the *other* way. `kitty-tools` treated `KITTY_PLUGIN_HOME`
+/// as its authorization boundary, and the daemon scopes that per app — so the
+/// tools' real wall was a narrow `apps/<id>/plugin-home` while this function,
+/// reading Kitty's own environment where the variable is unset, answered with
+/// the entire user profile. Every attachment under the home directory was
+/// therefore passed through unstaged to a tool that would refuse to open it.
 fn tools_reachable_root() -> Option<PathBuf> {
     // Kept as a literal rather than importing the plugin crate's own
     // `PLUGIN_HOME_ENV`: `kitty-tools` is a bundled sidecar, not a dependency

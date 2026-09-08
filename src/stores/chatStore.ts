@@ -34,6 +34,7 @@ import type {
   NetworkTier,
   PathInfo,
   ProviderView,
+  SessionAllowedDirs,
   SessionInfo,
   SubagentStatusEvent,
   ThinkingEffort,
@@ -118,6 +119,19 @@ interface ChatState {
       chat_dir; the only consequence is a few more real approval prompts
       than strictly necessary, never a security gap. */
   chatDir: string | null;
+  /** Everything this session is allowed to touch, as the *daemon* sees it —
+      `chat_dir`/`cwd` plus every working folder set during the session and
+      every file the user attached to a turn.
+
+      Cached rather than fetched on demand because the only consumer is the
+      `chat://tool-approval-needed` handler, which is synchronous: awaiting an
+      IPC round-trip inside it would race the approval response it exists to
+      send. Refreshed wherever the grant set can change (session create/load/
+      adopt, and after a send that carried attachments).
+
+      Kept deliberately separate from `chatDir`/`cwd`: those are render state
+      for the header pill, this is the authorization view. */
+  sessionGrants: SessionAllowedDirs | null;
   title: string | null;
   mode: string | null;
   availableModes: ModeInfo[];
@@ -330,6 +344,10 @@ interface ChatState {
   /** "Return to thought partner" — repoint the session back to a private
       per-chat folder (the default state), clearing the chosen working folder. */
   resetWorkingDir: () => Promise<void>;
+  /** Re-read `sessionGrants` from the daemon. Best-effort: a failure leaves
+      the previous value in place rather than clearing it, since an empty grant
+      set makes the approval check *stricter*, not laxer. */
+  refreshSessionGrants: () => Promise<void>;
   adoptSession: (info: {
     session_id: string;
     cwd: string;
@@ -1002,6 +1020,11 @@ export const useChatStore = create<ChatState>((set, get) => {
         submitted = true;
         await ipc.sendPrompt(sessionId, promptText, images, attachedPaths);
       }
+      // A turn that carried attachments just widened the session's grant set
+      // daemon-side. Re-read it now, before the model's first tool call, or
+      // the approval check still judges those files against chat_dir/cwd
+      // alone and prompts for a file the user just handed over.
+      if (attachedPaths?.length) void get().refreshSessionGrants();
       return submitted;
     } catch (e) {
       set({ busy: false, error: String(e) });
@@ -1017,6 +1040,7 @@ export const useChatStore = create<ChatState>((set, get) => {
     backgroundSession: null,
     backgroundTurnToast: null,
     chatDir: null,
+    sessionGrants: null,
     title: null,
     mode: null,
     availableModes: [],
@@ -1067,9 +1091,15 @@ export const useChatStore = create<ChatState>((set, get) => {
       try {
         const r = await ipc.compactSession(sid);
         set((s) => ({
+          // The daemon distinguishes its skip reasons now (summarizer
+          // unreachable, lock held, nothing old enough, storage failure);
+          // show the one it gave rather than assuming the benign case. A
+          // session stuck at the context limit and a healthy no-op used to
+          // produce the identical sentence, which is precisely the pair a
+          // user needs told apart.
           compactionNotice: r.compacted
             ? `Context manually compacted: ${r.messages_compacted ?? 0} older turns folded (${r.tokens_before ?? 0} → ${r.tokens_after ?? 0} tokens).`
-            : 'Nothing old enough to compact yet.',
+            : (r.reason ?? 'Nothing old enough to compact yet.'),
           // A session concluded *because* it overflowed is exactly the one a
           // successful compaction makes usable again — the room the error was
           // about now exists. Compacting for any other reason must not
@@ -1080,8 +1110,10 @@ export const useChatStore = create<ChatState>((set, get) => {
           concludedReason:
             r.compacted && s.concludedReason === 'context_exceeded' ? null : s.concludedReason,
         }));
-      } catch {
-        set({ compactionNotice: 'Compact failed — check the backend is healthy.' });
+      } catch (e) {
+        set({
+          compactionNotice: `Compact failed — ${String(e)}`,
+        });
       }
     },
 
@@ -1306,6 +1338,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         sessionEpoch: get().sessionEpoch + 1,
         cwd: null,
         chatDir: null,
+        sessionGrants: null,
         title: null,
         mode: null,
         availableModes: [],
@@ -1406,6 +1439,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         replaying: false,
         cwd: null,
         chatDir: null,
+        sessionGrants: null,
         // Blank-chat default until the real `session/new` response lands with
         // the actual value — leaving the outgoing session's folder pill on a
         // fresh chat would show (and offer a no-op reset for) a folder this
@@ -1488,6 +1522,10 @@ export const useChatStore = create<ChatState>((set, get) => {
         // this session focuses a generic fallback window instead of this
         // specific one — no data loss, nothing else depends on it.
         void ipc.bindWindowSession(info.session_id).catch(() => {});
+        // A brand-new session starts with chat_dir/cwd only, but read it from
+        // the daemon rather than synthesising it here — that keeps one source
+        // of truth for what the session may touch.
+        void get().refreshSessionGrants();
         await get().refreshProvider();
       } catch (e) {
         // Real, observed bug: an uncaught failure here (e.g. goosed briefly
@@ -1590,6 +1628,10 @@ export const useChatStore = create<ChatState>((set, get) => {
         loopSuspected: false,
         subagents: [],
       });
+      // A resumed session keeps every grant it accumulated (working folders,
+      // attached files), so the approval check needs them back before the
+      // first tool call of the resumed turn.
+      void get().refreshSessionGrants();
       try {
         // Restore the provider this session was last used with, if it's
         // still around. Under BigTiny provider is PER-SESSION — resolved from
@@ -1879,6 +1921,9 @@ export const useChatStore = create<ChatState>((set, get) => {
         // session's folder stamped onto the new one.
         if (get().sessionId !== sid) return;
         set({ cwd: folder, isDefaultFolder: false });
+        // Working folders accumulate daemon-side; re-read rather than guessing
+        // at the union here.
+        void get().refreshSessionGrants();
       } catch (e) {
         set({ error: String(e) });
       }
@@ -1896,8 +1941,28 @@ export const useChatStore = create<ChatState>((set, get) => {
         // Same mid-await session-switch guard as setWorkingDir above.
         if (get().sessionId !== sid) return;
         set({ cwd: info.cwd, chatDir: info.cwd, isDefaultFolder: info.is_default_folder });
+        void get().refreshSessionGrants();
       } catch (e) {
         set({ error: String(e) });
+      }
+    },
+
+    refreshSessionGrants: async () => {
+      const sid = get().sessionId;
+      if (!sid) {
+        set({ sessionGrants: null });
+        return;
+      }
+      try {
+        const grants = await ipc.listSessionAllowedDirs(sid);
+        // The session can change while this is in flight; a late reply must
+        // not attach one chat's grants to another's approval decisions.
+        if (get().sessionId !== sid) return;
+        set({ sessionGrants: grants });
+      } catch (e) {
+        // Deliberately non-fatal and non-clearing: without grants the approval
+        // check falls back to chat_dir/cwd, which only prompts *more* often.
+        console.warn('listSessionAllowedDirs failed; keeping the previous grants', e);
       }
     },
 
@@ -2241,6 +2306,7 @@ export const useChatStore = create<ChatState>((set, get) => {
             sessionId: null,
             cwd: null,
             chatDir: null,
+            sessionGrants: null,
             title: null,
             mode: null,
             availableModes: [],
@@ -2290,6 +2356,7 @@ export const useChatStore = create<ChatState>((set, get) => {
             sessionId: null,
             cwd: null,
             chatDir: null,
+            sessionGrants: null,
             title: null,
             mode: null,
             availableModes: [],
@@ -2349,7 +2416,29 @@ export const useChatStore = create<ChatState>((set, get) => {
         // seamless in practice, in both modes now, rather than prompting
         // for everything.
         const s0 = get();
-        const dirs = [s0.chatDir, s0.cwd];
+        // The daemon's own view of what this session may touch, not just the
+        // header pill's. `chat_dir`/`cwd` are the baseline; `working_dirs`
+        // holds every folder set during the session (they accumulate, so
+        // switching the pill doesn't revoke the previous one) and
+        // `attached_paths` holds each file the user handed over by
+        // drag-and-drop or paste.
+        //
+        // Those attachments are the bug this closes. `sandbox.rs`'s
+        // `allowed_dirs_for_session` has always allowed them — the user
+        // handing us the file *is* the authorization — but this check only
+        // ever saw chat_dir/cwd, so an attachment that stayed at its original
+        // path (anything already under the tools' reachable root is passed
+        // through unstaged) was judged out-of-scope and prompted. BigTiny
+        // pauses on every tool call under the default `always_ask` policy, so
+        // whichever side is stricter is the one the user experiences: ours
+        // was, and the daemon's exemption never got a chance to apply.
+        //
+        // Falls back to chat_dir/cwd when the grants haven't loaded yet, which
+        // is the previous behaviour — stricter, never laxer.
+        const g = s0.sessionGrants;
+        const dirs = g
+          ? [g.chat_dir, g.cwd, ...g.working_dirs, ...g.attached_paths]
+          : [s0.chatDir, s0.cwd];
         // Tool-loop guard (owner-reported bug): a model can get stuck
         // alternating tools (e.g. web-fetch ↔ its own cache step) against
         // the same target — each call is real network/disk I/O, so this

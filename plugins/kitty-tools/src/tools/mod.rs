@@ -27,7 +27,7 @@ use std::path::PathBuf;
 ///
 /// A `None` home yields a relative placeholder. That is not a usable cache
 /// location, and deliberately so: every tool that touches this path runs it
-/// through `path_within_home` first, which rejects when home is
+/// through `path_within_allowed` first, which rejects when home is
 /// undeterminable, so the tools fail cleanly instead of writing somewhere
 /// arbitrary.
 pub fn cache_dir() -> PathBuf {

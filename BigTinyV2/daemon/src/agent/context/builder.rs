@@ -3,7 +3,7 @@ use sqlx::SqlitePool;
 
 use crate::agent::compaction::{
     apply_content_mask, apply_tool_mask, emergency_trim, find_reserve_floor_rowid_budgeted,
-    render_memory_block, stored_content_as_text,
+    live_tail_budget, render_memory_block, stored_content_as_text,
 };
 use crate::agent::tokens::count_messages_tokens;
 use crate::config::TokenManagementConfig;
@@ -215,14 +215,18 @@ impl ContextBuilder {
         // verbatim. Unbudgeted, a session of three or fewer user turns
         // reserved *everything*, so the mask and trim calls below were
         // guaranteed no-ops no matter how far over the window it was.
+        // Derived from the session's real window, not the flat configured
+        // constant — see `LIVE_TAIL_WINDOW_SHARE`.
+        let live_tail_budget = live_tail_budget(&self.config, max_context_tokens_override);
         let reserve_floor = find_reserve_floor_rowid_budgeted(
             &live_messages,
             self.reserve_exchanges,
-            self.config.max_live_tail_tokens,
+            live_tail_budget,
         );
         let live_messages = apply_tool_mask(&live_messages, reserve_floor, &self.config);
         let live_messages = apply_content_mask(&live_messages, reserve_floor, &self.config);
-        let live_messages = self.enforce_live_tail_budget(&live_messages, reserve_floor);
+        let live_messages =
+            self.enforce_live_tail_budget(&live_messages, reserve_floor, live_tail_budget);
 
         // Computed from the FINAL live messages (post-masking, post-budget),
         // not the raw rows: the emergency valve below compares this against
@@ -452,8 +456,12 @@ impl ContextBuilder {
     }
 
     /// Per-turn budget check for the live tail.
-    fn enforce_live_tail_budget(&self, live_messages: &[Value], reserve_floor: i64) -> Vec<Value> {
-        let budget = self.config.max_live_tail_tokens;
+    fn enforce_live_tail_budget(
+        &self,
+        live_messages: &[Value],
+        reserve_floor: i64,
+        budget: i32,
+    ) -> Vec<Value> {
         if self.count_tokens(live_messages) <= budget {
             return live_messages.to_vec();
         }

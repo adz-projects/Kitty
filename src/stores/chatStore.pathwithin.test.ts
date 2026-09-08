@@ -136,6 +136,24 @@ describe('decideChatApproval', () => {
     const r = decideChatApproval({ path: 'C:/Users/me/Desktop/x.docx' }, [BASE, CONTEXT_DIR], OPTS);
     expect(r.decision).toBe('prompt');
   });
+
+  // A file the user attached by drag-and-drop keeps its original path whenever
+  // that path is already reachable by the tools, so it is outside chat_dir and
+  // cwd by construction. The daemon allows it (`allowed_dirs_for_session`'s
+  // `attached_paths`); before this the store passed only [chat_dir, cwd] and
+  // prompted for a file the user had just handed over.
+  const ATTACHED = 'C:/Users/me/Downloads/Small model critique.docx';
+
+  it('allows an attached file that sits outside chat_dir and cwd', () => {
+    const r = decideChatApproval({ path: ATTACHED }, [BASE, CONTEXT_DIR, ATTACHED], OPTS);
+    expect(r.decision).toBe('allow');
+  });
+
+  it('grants an attached file exactly, without widening to its folder', () => {
+    const sibling = 'C:/Users/me/Downloads/unrelated-tax-return.pdf';
+    const r = decideChatApproval({ path: sibling }, [BASE, CONTEXT_DIR, ATTACHED], OPTS);
+    expect(r.decision).toBe('prompt');
+  });
 });
 
 describe('isSecuritySensitiveCommand', () => {

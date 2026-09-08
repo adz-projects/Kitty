@@ -22,8 +22,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::agent::context::stats::SessionStats;
 use crate::error::StorageError;
 use crate::server::events::{serialize_sse, SSEEvent, SSEEventType};
-use crate::storage::messages::{self, MessageRow};
 use crate::storage::apps::AppIdentity;
+use crate::storage::messages::{self, MessageRow};
 use crate::storage::sessions;
 use crate::storage::timings;
 
@@ -150,8 +150,7 @@ pub async fn list_sessions(
     // `total`" is pinned by the route smoke tests.
     let limit = query.limit.unwrap_or(50).clamp(0, 500);
     let offset = query.offset.unwrap_or(0).max(0);
-    match sessions::list_sessions_page_for_app(&state.db, &identity.app_id, limit, offset).await
-    {
+    match sessions::list_sessions_page_for_app(&state.db, &identity.app_id, limit, offset).await {
         Ok((rows, total)) => Json(json!({"sessions": rows, "total": total})).into_response(),
         Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
@@ -580,14 +579,13 @@ pub async fn fork_session(
         .collect();
 
     let new_id = uuid::Uuid::new_v4().to_string();
-    if let Err(e) =
-        sessions::create_session_for_app(
-            &state.db,
-            &new_id,
-            source.name.as_deref().unwrap_or(""),
-            &identity.app_id,
-        )
-        .await
+    if let Err(e) = sessions::create_session_for_app(
+        &state.db,
+        &new_id,
+        source.name.as_deref().unwrap_or(""),
+        &identity.app_id,
+    )
+    .await
     {
         return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
     }
@@ -634,7 +632,8 @@ pub async fn fork_session(
                 // leaving an orphaned zero-message session behind (the
                 // session row and its metadata commit before this loop).
                 let _ = tx.rollback().await;
-                let _ = sessions::delete_session_for_app(&state.db, &new_id, &identity.app_id).await;
+                let _ =
+                    sessions::delete_session_for_app(&state.db, &new_id, &identity.app_id).await;
                 return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
             }
         }
@@ -744,9 +743,11 @@ pub async fn approve_action(
 /// un-compacted exchanges into memory, bypassing the automatic token
 /// threshold (`run_compaction`'s `force`). Returns the `CompactionResult`
 /// so the client can report "compacted N messages / X → Y tokens", or a
-/// `{"compacted": false}` when there was nothing to fold (summarizer
-/// disabled, no messages past the watermark, or another pass already holds
-/// the compaction lock).
+/// `{"compacted": false, "reason": "..."}` when nothing was folded (summarizer
+/// disabled or failing, no messages past the watermark, or another pass
+/// already holds the compaction lock). The reason is the difference between a
+/// healthy no-op and a session that cannot recover, which the client has no
+/// other way to tell apart.
 pub async fn compact_session(
     State(state): State<Arc<AppState>>,
     Extension(identity): Extension<AppIdentity>,
@@ -813,14 +814,23 @@ pub async fn compact_session(
     .await;
 
     match result {
-        Some(r) => Json(json!({
+        Ok(r) => Json(json!({
             "compacted": true,
             "messages_compacted": r.messages_compacted,
             "tokens_before": r.tokens_before,
             "tokens_after": r.tokens_after,
         }))
         .into_response(),
-        None => Json(json!({"compacted": false})).into_response(),
+        // `reason` accompanies the `false` so the client can say *why* nothing
+        // happened. Without it every outcome — summarizer down, nothing old
+        // enough, lock held — rendered as the same unhelpful "Compact failed"
+        // line, which is what let a permanently stuck session look identical to
+        // a healthy no-op.
+        Err(skip) => Json(json!({
+            "compacted": false,
+            "reason": skip.message(),
+        }))
+        .into_response(),
     }
 }
 

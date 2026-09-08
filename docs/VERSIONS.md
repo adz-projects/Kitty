@@ -443,3 +443,72 @@ to conform to. This is a behavioral contract, not styling:
   adaptive-pathway's Thompson bandit cold; no existing name was renamed
   (adaptive-pathway hashes the literal tool-name string — see
   `plugins/kitty-tools/tests/protocol.rs`).
+
+## Tool-plugin filesystem grants — `KITTY_ALLOWED_DIRS` / `KITTY_ALLOWED_DIRS_FILE` (0.10.1)
+
+A cross-binary contract between the V2 daemon and the two bundled Rust tool
+servers. Both sides must be rebuilt together when it changes.
+
+**Why it exists.** `kitty-tools` and `kitty-wasm` enforce their own path
+boundary as defense-in-depth behind the daemon's per-session
+`check_containment`. That boundary used to be a single "home" resolved from
+`KITTY_PLUGIN_HOME` — which is *also* where those servers keep their scratchpad
+and extract-once document cache. When `mcp::manager::scoped_env` began giving
+each app its own `apps/<id>/plugin-home` (so two apps could not share a
+scratchpad), that narrow storage folder silently became the only tree the file
+tools would read. The session's chat directory was not inside it, so a model
+told by its own system prompt that the user's attached files live there got
+`PATH_OUTSIDE_HOME` from every reader and could not open them by any route.
+
+**The split.** `KITTY_PLUGIN_HOME` now governs **storage only**. Authorization
+travels separately, in two halves divided by how often they change:
+
+| Variable | Carries | Set by | Read by |
+|---|---|---|---|
+| `KITTY_ALLOWED_DIRS` | home dir, OS temp dir, daemon data root | `mcp::kitty_grants::static_allowed_dirs`, via `scoped_env` at spawn | `paths::allowed_roots` in both plugins |
+| `KITTY_ALLOWED_DIRS_FILE` | path to a JSON array: the session's `attached_paths`, `working_dirs`, `cwd`, `chat_dir` | `mcp::kitty_grants::publish`, rewritten per turn from `allowed_dirs_for_session` | same, mtime+length cached |
+
+The second exists because a stdio MCP server is **one long-lived process shared
+by every session**, with its environment fixed at spawn — per-session grants
+cannot ride in an env var. Format: a flat JSON array of strings
+(`["C:/Users/me/Documents/Kitty/chats/abc", "D:/work"]`); `join_paths`/
+`split_paths` conventions apply to `KITTY_ALLOWED_DIRS` (`;` on Windows).
+
+**Failure direction.** Both halves only ever *widen* the plugin-side check. The
+daemon has already run the authoritative per-session containment test by the
+time a tool executes, so a stale, missing or malformed grants file costs a
+spurious rejection — never an unauthorized read. An empty root set rejects
+everything, and with neither variable set the allowed set is exactly the home
+directory, which is the pre-split behaviour (and what Android, where the daemon
+is in-process and the process *is* the app, still uses).
+
+## Context budget schedule (0.10.1)
+
+The compaction schedule is derived from the session's real context window, not
+from flat token constants. `agent::compaction` owns both derivations and
+`context::builder` uses them, so there is one definition:
+
+- `live_tail_budget` — `min(max_live_tail_tokens, window × LIVE_TAIL_WINDOW_SHARE)`,
+  floored at 1024. `LIVE_TAIL_WINDOW_SHARE` is **0.35**.
+- `compaction_high_water` — `max(min_compaction_tokens, window × compaction_threshold)`,
+  then capped at `window − live_tail_budget − wrapup_reserve`, floored at 2048.
+
+The cap is the load-bearing part. Without it a 36k window waited for 21600
+foldable tokens while reserving 24000 for the live tail and 9000 for the reply —
+54600 tokens of intent inside a 36000-token window — so the wrap-up valve always
+fired first, automatic compaction never ran, and the chat became unusable within
+about three turns. `the_context_schedule_is_self_consistent_on_a_small_window`
+asserts `high_water + tail + reply <= window` across window sizes; keep it
+passing when tuning any of these.
+
+Summarizer prompts are bounded against the same window
+(`SUMMARIZER_REPLY_RESERVE`, `SUMMARIZER_PROMPT_MARGIN`) and folded in at most
+`MAX_FOLD_PASSES` chunks per pass — on every platform but Windows the summarizer
+*is* the session's own chat model, so an unbounded fold prompt was larger than
+the window it was sent to relieve.
+
+**These are no longer user-settable.** "Max context tokens", its "Match active
+provider" button and "Max live tail tokens" were removed from Settings →
+Advanced: they are derived per provider now, and a manual override could
+reintroduce the exact bug above. The `TokenManagementConfig` fields remain as
+the fallback for a provider that advertises no window.

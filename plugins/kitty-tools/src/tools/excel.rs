@@ -20,7 +20,7 @@ use calamine::{open_workbook_auto, Data, Range, Reader};
 use serde_json::{json, Value};
 
 use crate::envelope::{error_response, success_response};
-use crate::paths::{path_within_home, resolve};
+use crate::paths::{path_within_allowed, resolve};
 use crate::query_filter::filter_indices;
 
 /// Same default as the Python plugin's `EXCEL_MAX_ROWS_DEFAULT` — rows beyond
@@ -61,14 +61,14 @@ fn too_large(resolved: &Path) -> String {
 /// Home boundary shared by both Excel tools — defense-in-depth before any
 /// filesystem access (the daemon is the primary gate).
 fn outside_home(resolved: &Path) -> Option<String> {
-    if path_within_home(resolved) {
+    if path_within_allowed(resolved) {
         None
     } else {
         Some(error_response(
             "PATH_OUTSIDE_HOME",
-            "Path is outside the HOME directory",
+            "Path is outside the directories this session may access",
             Some(&resolved.to_string_lossy()),
-            Some("Only paths inside your home directory can be accessed."),
+            Some(&crate::paths::allowed_roots_hint()),
         ))
     }
 }

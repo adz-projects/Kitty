@@ -139,7 +139,7 @@ fn validate_workspace(workspace: Option<&String>) -> Result<Option<std::path::Pa
             &format!("workspace is not an existing directory: {}", dir.display()),
         ));
     }
-    if !crate::paths::path_within_home(&dir) {
+    if !crate::paths::path_within_allowed(&dir) {
         return Err(error_json(
             "WorkspaceOutsideHome",
             &format!(
@@ -169,7 +169,7 @@ fn validate_module_path(module_path: &str) -> Result<std::path::PathBuf, String>
             &format!("no wasm module at {}", path.display()),
         ));
     }
-    if !crate::paths::path_within_home(&path) {
+    if !crate::paths::path_within_allowed(&path) {
         return Err(error_json(
             "ModuleOutsideHome",
             &format!(

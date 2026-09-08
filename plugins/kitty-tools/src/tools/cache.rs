@@ -9,7 +9,7 @@
 //! arbitrary read/delete — a real path-traversal hole, not ported forward.
 
 use crate::envelope::{error_response, success_response};
-use crate::paths::path_within_home;
+use crate::paths::path_within_allowed;
 use crate::tools::cache_dir;
 use serde_json::json;
 
@@ -47,12 +47,12 @@ fn rejects_traversal(filename: &str) -> bool {
 /// cache dir — the join is inside home by construction, but a hostile home
 /// override should not redirect reads/writes out of it.
 fn ensure_within_home(file_path: &std::path::Path) -> Option<String> {
-    if !path_within_home(file_path) {
+    if !path_within_allowed(file_path) {
         return Some(error_response(
             "PATH_OUTSIDE_HOME",
-            "Path is outside the HOME directory",
+            "Path is outside the directories this session may access",
             Some(&file_path.to_string_lossy()),
-            Some("Only paths inside your home directory can be accessed."),
+            Some(&crate::paths::allowed_roots_hint()),
         ));
     }
     None

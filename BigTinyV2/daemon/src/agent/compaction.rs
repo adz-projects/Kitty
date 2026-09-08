@@ -201,6 +201,88 @@ fn append_unique(existing: &[String], incoming: &[String]) -> Vec<String> {
 /// the predefined `MEMORY_SLOTS_SCHEMA` template; this function does the
 /// rendering, never the model). Legacy-shaped slots are normalized first so the
 /// renderer only handles the current shape.
+/// The largest share of a model's context window the verbatim live tail may
+/// claim, before the system head, memory block, workspace snapshot, tool
+/// schemas and the reply itself are accounted for.
+///
+/// `max_live_tail_tokens` is a flat token count (24000 by default): a
+/// reasonable reserve against a 128k window and a catastrophic one against a
+/// small model. On a 36k window it hands 67% of the context to trailing history
+/// before anything else is counted, so the window blew before compaction could
+/// fire and the chat became unusable inside three turns.
+pub const LIVE_TAIL_WINDOW_SHARE: f64 = 0.35;
+
+/// Room left for the summarizer's own JSON reply. `via_router` asks for
+/// `max_tokens: 1024`; this matches it so the budget and the request agree.
+const SUMMARIZER_REPLY_RESERVE: i32 = 1024;
+
+/// Slack between the computed fold budget and the real window, covering the
+/// difference between this crate's token estimate and the provider's own
+/// tokenizer. Being a little under is free; being over is a 400 and a
+/// compaction that silently does nothing.
+const SUMMARIZER_PROMPT_MARGIN: i32 = 512;
+
+/// Summarizer requests one compaction pass may make.
+///
+/// A very long uncompacted history can need several window-sized folds. Each
+/// costs a real model call, so they are bounded per turn — the watermark
+/// advances with every successful pass, so the remainder is simply folded by
+/// the next compaction rather than lost.
+const MAX_FOLD_PASSES: usize = 4;
+
+/// How many tokens of verbatim trailing history a turn may keep.
+///
+/// The smaller of the configured `max_live_tail_tokens` and
+/// [`LIVE_TAIL_WINDOW_SHARE`] of the session's real window — so this only ever
+/// *lowers* the configured value, leaving the large windows it was tuned for
+/// untouched. Falls back to the configured value when the provider advertises
+/// no window at all.
+///
+/// Floored at 1024: a nonsensically small window must not yield a zero or
+/// negative budget, which every downstream shrink step would read as "drop
+/// everything".
+pub fn live_tail_budget(token_cfg: &TokenManagementConfig, context_length: Option<i32>) -> i32 {
+    match context_length {
+        Some(window) if window > 0 => {
+            let scaled = (window as f64 * LIVE_TAIL_WINDOW_SHARE) as i32;
+            token_cfg.max_live_tail_tokens.min(scaled).max(1024)
+        }
+        _ => token_cfg.max_live_tail_tokens,
+    }
+}
+
+/// The foldable-region size at which automatic compaction fires.
+///
+/// The configured ratio (with `min_compaction_tokens` as a floor for short
+/// sessions on roomy models), then capped by what the window can actually
+/// hold alongside everything compaction cannot fold: the reserved live tail
+/// and the wrap-up reply reserve.
+///
+/// That cap is the fix. Without it the schedule was internally inconsistent on
+/// a small window — a 36k model triggered at 21600 foldable tokens while
+/// simultaneously reserving 12600 for the live tail and 9000 for the reply,
+/// which is 43200 tokens of intent inside a 36000-token window. The wrap-up
+/// valve therefore always fired first, compaction never ran, and the session
+/// died with "send your message again" advice that could not work.
+pub fn compaction_high_water(token_cfg: &TokenManagementConfig, context_length: i32) -> i32 {
+    let window = context_length.max(0);
+    let from_ratio = (window as f64 * token_cfg.compaction_threshold) as i32;
+    let desired = token_cfg.min_compaction_tokens.max(from_ratio);
+
+    let tail = live_tail_budget(token_cfg, Some(window));
+    let reply = crate::agent::tokens::context_reserve_tokens(
+        window,
+        token_cfg.wrapup_reserve_ratio,
+        token_cfg.wrapup_reserve_cap,
+    );
+    let headroom = window.saturating_sub(tail).saturating_sub(reply);
+
+    // Floored rather than allowed to reach zero: a window so small that the
+    // tail and reply reserve consume all of it would otherwise compact on
+    // every single turn, which is its own kind of unusable.
+    desired.min(headroom).max(2048)
+}
+
 pub fn render_memory_block(slots: Option<&Value>) -> Option<String> {
     let slots = normalize_slots(slots?);
     let obj = slots.as_object()?;
@@ -983,6 +1065,56 @@ pub struct CompactionResult {
     pub tokens_after: i32,
 }
 
+/// Why a compaction pass did nothing.
+///
+/// Compaction used to return a bare `Option`, so all nine of its failure paths
+/// — no candidates, summarizer error, lock held, write failure — arrived at the
+/// caller indistinguishable from "nothing needed folding". That was invisible
+/// in the one place it mattered most: when a turn overflows the window, the
+/// agent tells the user "It is being compacted — send your message again", and
+/// if the compaction it just spawned silently did nothing, sending again
+/// produces exactly the same error. Forever. The advice was unfalsifiable from
+/// the user's side and simply wrong.
+///
+/// Carrying a reason lets that message tell the truth.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompactionSkip {
+    /// Summarization is switched off in config.
+    Disabled,
+    /// Another compaction for this session is already running.
+    LockHeld,
+    /// Nothing old enough to fold — the normal, healthy "no-op".
+    NothingToFold,
+    /// The foldable region has not yet reached the trigger threshold.
+    BelowThreshold,
+    /// The summarizer model itself failed or was unreachable.
+    SummarizerFailed(String),
+    /// Reading or writing session state failed.
+    StorageFailed(String),
+}
+
+impl CompactionSkip {
+    /// A short, user-facing explanation. Deliberately plain: this reaches the
+    /// chat UI, where "check the backend is healthy" was the entire vocabulary
+    /// before.
+    pub fn message(&self) -> String {
+        match self {
+            Self::Disabled => "Automatic summarization is turned off in settings.".into(),
+            Self::LockHeld => "Another compaction for this chat is already running.".into(),
+            Self::NothingToFold => "Nothing old enough to compact yet.".into(),
+            Self::BelowThreshold => {
+                "Not enough older history to compact yet — the recent turns are what is \
+                 filling the window."
+                    .into()
+            }
+            Self::SummarizerFailed(e) => {
+                format!("The summarizer model could not be reached or failed: {e}")
+            }
+            Self::StorageFailed(e) => format!("Saving the compacted history failed: {e}"),
+        }
+    }
+}
+
 /// Guidance for the summarizer model. The actual schema (`MEMORY_SLOTS_SCHEMA`)
 /// constrains the output shape; this prose steers *content* (only new items,
 /// no restatement) and describes what each field is for.
@@ -1115,15 +1247,15 @@ pub async fn run_compaction(
     memory_cfg: &MemoryConfig,
     context_length: i32,
     force: bool,
-) -> Option<CompactionResult> {
+) -> Result<CompactionResult, CompactionSkip> {
     if !summarizer_cfg.enabled {
-        return None;
+        return Err(CompactionSkip::Disabled);
     }
 
     let stale_after = chrono::Duration::seconds((summarizer_cfg.timeout_s * 2.0).ceil() as i64);
     match sessions::try_acquire_compaction_lock(pool, session_id, stale_after).await {
         Ok(true) => {}
-        _ => return None,
+        _ => return Err(CompactionSkip::LockHeld),
     }
 
     let result = run_compaction_inner(
@@ -1160,10 +1292,10 @@ async fn run_compaction_inner(
     memory_cfg: &MemoryConfig,
     context_length: i32,
     force: bool,
-) -> Option<CompactionResult> {
+) -> Result<CompactionResult, CompactionSkip> {
     let session = match sessions::get_session(pool, session_id).await.ok().flatten() {
         Some(s) => s,
-        None => return None,
+        None => return Err(CompactionSkip::StorageFailed("session not found".into())),
     };
 
     let compacted_through = session.compacted_through_rowid;
@@ -1181,11 +1313,11 @@ async fn run_compaction_inner(
     .await
     {
         Ok(r) => r,
-        Err(_) => return None,
+        Err(e) => return Err(CompactionSkip::StorageFailed(e.to_string())),
     };
 
     if rows.is_empty() {
-        return None;
+        return Err(CompactionSkip::NothingToFold);
     }
 
     // Convert to Value format
@@ -1221,7 +1353,7 @@ async fn run_compaction_inner(
         .collect();
 
     if values.is_empty() {
-        return None;
+        return Err(CompactionSkip::NothingToFold);
     }
 
     // Budgeted by the fold target: if the reserved tail alone is larger than
@@ -1246,13 +1378,14 @@ async fn run_compaction_inner(
         .collect();
 
     if candidate_rows.is_empty() {
-        return None;
+        // Everything still live is inside the reserve floor: the recent turns
+        // themselves are what fills the window, and there is nothing older to
+        // fold. `force` cannot help — it bypasses the high-water gate, not an
+        // empty candidate set.
+        return Err(CompactionSkip::NothingToFold);
     }
 
-    let high_water = token_cfg
-        .min_compaction_tokens
-        .max((context_length as f64 * token_cfg.compaction_threshold) as i32);
-
+    let high_water = compaction_high_water(token_cfg, context_length);
     let low_water = (context_length as f64 * token_cfg.compaction_target_ratio) as i32;
 
     // Sum only the FOLDABLE rows' tokens, not `rows.iter()` as a whole. The
@@ -1278,50 +1411,121 @@ async fn run_compaction_inner(
         .sum();
 
     if !force && foldable_tokens <= high_water as i64 {
-        return None;
+        return Err(CompactionSkip::BelowThreshold);
     }
 
     let candidate_exchanges = group_into_exchanges(&candidate_rows);
-    let mut to_fold: Vec<Value> = Vec::new();
+
+    // How much conversation one summarizer request may carry.
+    //
+    // Nothing used to bound this. The fold chunk grew until the *remaining*
+    // history was under low-water, then went out in a single request together
+    // with the whole existing memory-slot JSON — and on every platform but
+    // Windows that request goes to the session's own chat model
+    // (`SummarizerChain::via_router`). So the prompt sent to relieve a full
+    // context window was routinely larger than the window itself: it 400'd, the
+    // error was logged and swallowed, and the user was told to send their
+    // message again, forever.
+    //
+    // The budget is the window less the instructions, the existing slots, the
+    // reply and a margin. Anything that does not fit is folded by a later pass
+    // below rather than dropped.
+    let fold_budget = {
+        let overhead =
+            count_messages_tokens(&build_summarizer_prompt(existing_slots.as_ref(), &[]));
+        let budget = context_length
+            .saturating_sub(overhead)
+            .saturating_sub(SUMMARIZER_REPLY_RESERVE)
+            .saturating_sub(SUMMARIZER_PROMPT_MARGIN);
+        // A window too small to hold even the overhead still gets a usable
+        // floor: a chunk this size may overflow, but refusing to compact at all
+        // guarantees the session stays broken, and one exchange is folded per
+        // pass regardless (see the `is_empty` guard in the chunk loop).
+        budget.max(1024) as i64
+    };
+
+    // Split the fold region into window-sized chunks, oldest first, stopping
+    // once enough has been folded to bring the rest under low-water.
+    let mut chunks: Vec<Vec<Value>> = Vec::new();
+    let mut current: Vec<Value> = Vec::new();
+    let mut current_tokens: i64 = 0;
     let mut remaining_tokens = foldable_tokens;
 
-    // Calculate per-exchange token count
     for exchange in &candidate_exchanges {
         let exchange_tokens: i64 = exchange
             .iter()
             .map(|v| token_of(v.get("rowid").and_then(|r| r.as_i64()).unwrap_or(0)))
             .sum();
 
-        to_fold.extend(exchange.clone());
+        // Start a new chunk when this exchange would overflow the current one.
+        // Never on an empty chunk: a single exchange larger than the whole
+        // budget still has to go somewhere, and one oversized request that may
+        // fail beats an infinite loop that certainly does nothing.
+        if !current.is_empty() && current_tokens + exchange_tokens > fold_budget {
+            chunks.push(std::mem::take(&mut current));
+            current_tokens = 0;
+        }
+        current.extend(exchange.clone());
+        current_tokens += exchange_tokens;
         remaining_tokens -= exchange_tokens;
 
         if remaining_tokens <= low_water as i64 {
             break;
         }
     }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    if chunks.is_empty() {
+        return Err(CompactionSkip::NothingToFold);
+    }
+    // Bound the work one turn can do. The watermark advances with each
+    // successful pass, so whatever is left is folded by the next compaction
+    // rather than lost.
+    chunks.truncate(MAX_FOLD_PASSES);
 
-    if to_fold.is_empty() {
-        return None;
+    let mut to_fold: Vec<Value> = Vec::new();
+    let mut merged = existing_slots.clone().unwrap_or_else(|| json!({}));
+    let mut any_ok = false;
+    let mut last_error: Option<String> = None;
+
+    for chunk in &chunks {
+        let masked = apply_tool_mask(chunk, reserve_floor, token_cfg);
+        let prompt = build_summarizer_prompt(Some(&merged), &masked);
+
+        match summarizer
+            .structured_chat_for_session(
+                provider_id,
+                provider_model.clone(),
+                prompt,
+                &MEMORY_SLOTS_SCHEMA,
+            )
+            .await
+        {
+            Ok(new_slots) => {
+                merged = merge_memory_slots(Some(&merged), &new_slots);
+                to_fold.extend(chunk.clone());
+                any_ok = true;
+            }
+            Err(e) => {
+                // Never fail the turn or corrupt state on a bad summarizer
+                // pass. Earlier chunks that succeeded are still committed
+                // below — partial progress is what lets a session that only
+                // just overflowed recover on the next turn instead of getting
+                // stuck at exactly the same point every time.
+                tracing::warn!("compaction: summarizer call failed for session {session_id}: {e}");
+                last_error = Some(e.to_string());
+                break;
+            }
+        }
     }
 
-    // Apply masking to tool outputs in the fold region
-    let masked = apply_tool_mask(&to_fold, reserve_floor, token_cfg);
-    let prompt = build_summarizer_prompt(existing_slots.as_ref(), &masked);
+    if !any_ok {
+        return Err(CompactionSkip::SummarizerFailed(
+            last_error.unwrap_or_else(|| "no summarizer response".into()),
+        ));
+    }
 
-    let new_slots = match summarizer
-        .structured_chat_for_session(provider_id, provider_model, prompt, &MEMORY_SLOTS_SCHEMA)
-        .await
-    {
-        Ok(slots) => slots,
-        Err(e) => {
-            // Never fail the turn or corrupt state on a bad summarizer pass —
-            // just skip this compaction attempt.
-            tracing::warn!("compaction: summarizer call failed for session {session_id}: {e}");
-            return None;
-        }
-    };
-
-    let merged = merge_memory_slots(existing_slots.as_ref(), &new_slots);
     let merged = consolidate_slot_if_needed(
         merged,
         summarizer_cfg.max_slot_items,
@@ -1333,12 +1537,15 @@ async fn run_compaction_inner(
         .and_then(|v| v.get("rowid").and_then(|r| r.as_i64()))
         .unwrap_or(compacted_through);
 
-    let slots_json = serde_json::to_string(&merged).ok()?;
+    let slots_json = match serde_json::to_string(&merged) {
+        Ok(j) => j,
+        Err(e) => return Err(CompactionSkip::StorageFailed(e.to_string())),
+    };
     if let Err(e) =
         sessions::update_compaction_state(pool, session_id, &slots_json, new_watermark).await
     {
         tracing::error!("compaction: failed to update session: {}", e);
-        return None;
+        return Err(CompactionSkip::StorageFailed(e.to_string()));
     }
 
     let tokens_folded: i64 = to_fold
@@ -1347,7 +1554,7 @@ async fn run_compaction_inner(
         .sum();
     let tokens_after = (foldable_tokens - tokens_folded) as i32;
 
-    Some(CompactionResult {
+    Ok(CompactionResult {
         messages_compacted: to_fold.len(),
         tokens_before: foldable_tokens as i32,
         tokens_after,
@@ -1357,6 +1564,108 @@ async fn run_compaction_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The small-context regression this schedule was rebuilt for.
+    ///
+    /// A 36k window used to trigger compaction at 21600 foldable tokens while
+    /// simultaneously reserving 24000 for the verbatim live tail and 9000 for
+    /// the reply — 54600 tokens of intent inside a 36000-token window. The
+    /// wrap-up valve therefore always fired first, automatic compaction never
+    /// ran, and the chat died within about three turns with advice ("send your
+    /// message again") that could not possibly work.
+    ///
+    /// The invariant that has to hold: whatever compaction waits for must
+    /// actually fit alongside what it cannot fold.
+    #[test]
+    fn the_context_schedule_is_self_consistent_on_a_small_window() {
+        let cfg = TokenManagementConfig::default();
+        for window in [8_192, 16_384, 36_000, 65_536, 128_000, 200_000] {
+            let tail = live_tail_budget(&cfg, Some(window));
+            let reply = crate::agent::tokens::context_reserve_tokens(
+                window,
+                cfg.wrapup_reserve_ratio,
+                cfg.wrapup_reserve_cap,
+            );
+            let high_water = compaction_high_water(&cfg, window);
+            assert!(
+                high_water + tail + reply <= window,
+                "window {window}: high_water {high_water} + tail {tail} + reply {reply} \
+                 exceeds the window, so compaction can never fire before it overflows"
+            );
+        }
+    }
+
+    /// The live tail must scale with the window, not sit at a flat constant.
+    #[test]
+    fn the_live_tail_is_a_share_of_a_small_window_and_the_constant_on_a_large_one() {
+        let cfg = TokenManagementConfig::default();
+        // Small: the share binds, well under the 24000 default.
+        let small = live_tail_budget(&cfg, Some(36_000));
+        assert!(
+            small < cfg.max_live_tail_tokens,
+            "a 36k window must not hand {small} tokens to the live tail"
+        );
+        assert_eq!(small, (36_000.0 * LIVE_TAIL_WINDOW_SHARE) as i32);
+
+        // Large: the configured ceiling binds, so nothing changes for the
+        // windows this value was tuned against.
+        assert_eq!(
+            live_tail_budget(&cfg, Some(200_000)),
+            cfg.max_live_tail_tokens
+        );
+        // Unknown window: the configured value, exactly as before.
+        assert_eq!(live_tail_budget(&cfg, None), cfg.max_live_tail_tokens);
+    }
+
+    /// Never zero or negative, however absurd the window — every downstream
+    /// shrink step reads a non-positive budget as "drop everything".
+    #[test]
+    fn budgets_stay_positive_for_any_window() {
+        let cfg = TokenManagementConfig::default();
+        for window in [-1, 0, 1, 512, 2_048] {
+            assert!(live_tail_budget(&cfg, Some(window)) >= 1024);
+            assert!(compaction_high_water(&cfg, window) >= 2048);
+        }
+    }
+
+    /// A large window keeps the behaviour it had: the configured ratio decides,
+    /// not the new cap.
+    #[test]
+    fn a_large_window_still_triggers_on_the_configured_ratio() {
+        let cfg = TokenManagementConfig::default();
+        let window = 200_000;
+        assert_eq!(
+            compaction_high_water(&cfg, window),
+            (window as f64 * cfg.compaction_threshold) as i32
+        );
+    }
+
+    /// Every skip reason must say something specific. The whole point of
+    /// `CompactionSkip` is that "nothing old enough to fold" and "the
+    /// summarizer is unreachable" stop looking identical to the user.
+    #[test]
+    fn every_skip_reason_carries_a_distinct_message() {
+        let skips = [
+            CompactionSkip::Disabled,
+            CompactionSkip::LockHeld,
+            CompactionSkip::NothingToFold,
+            CompactionSkip::BelowThreshold,
+            CompactionSkip::SummarizerFailed("connection refused".into()),
+            CompactionSkip::StorageFailed("disk full".into()),
+        ];
+        let messages: Vec<String> = skips.iter().map(|s| s.message()).collect();
+        for m in &messages {
+            assert!(!m.trim().is_empty());
+        }
+        let mut unique = messages.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), messages.len(), "skip messages must differ");
+        // The two that name a cause must include it — that string is the only
+        // diagnostic the user gets.
+        assert!(messages[4].contains("connection refused"));
+        assert!(messages[5].contains("disk full"));
+    }
 
     #[test]
     fn test_render_memory_block_empty() {

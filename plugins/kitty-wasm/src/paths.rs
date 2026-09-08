@@ -15,11 +15,26 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-/// The environment variable a host sets to tell this crate where the user's
-/// files actually live. See `kitty_tools::paths::PLUGIN_HOME_ENV` — same
-/// variable, same reason, duplicated for the same reason the rest of this
-/// module is (these ship as separate frozen binaries).
+/// The environment variable a host sets to tell this crate where **its own
+/// storage** goes. See `kitty_tools::paths::PLUGIN_HOME_ENV` — same variable,
+/// same reason, duplicated for the same reason the rest of this module is
+/// (these ship as separate frozen binaries).
+///
+/// **A storage root, not an authorization boundary.** It used to be both, and
+/// once the daemon began scoping it per app (`mcp::manager::scoped_env`) that
+/// narrow folder became the only tree a workspace could be mounted from —
+/// which excluded the session's own chat directory. Authorization is
+/// [`allowed_roots`] now.
 pub const PLUGIN_HOME_ENV: &str = "KITTY_PLUGIN_HOME";
+
+/// Directories this process may mount, beyond [`home_dir`]. Set by the daemon
+/// at spawn; see `kitty_tools::paths::ALLOWED_DIRS_ENV`.
+pub const ALLOWED_DIRS_ENV: &str = "KITTY_ALLOWED_DIRS";
+
+/// A JSON array of additional allowed directories, re-read as it changes.
+/// Carries the per-session grants that cannot ride in a shared process's
+/// spawn-time environment; see `kitty_tools::paths::ALLOWED_DIRS_FILE_ENV`.
+pub const ALLOWED_DIRS_FILE_ENV: &str = "KITTY_ALLOWED_DIRS_FILE";
 
 /// The user's home directory, resolved once per process, or `None` when it
 /// genuinely cannot be determined. `KITTY_PLUGIN_HOME` wins, then
@@ -28,7 +43,7 @@ pub const PLUGIN_HOME_ENV: &str = "KITTY_PLUGIN_HOME";
 /// **There is deliberately no working-directory fallback.** There used to be,
 /// and it silently inverted the boundary: on a host where nothing else
 /// resolves, the working directory can be `/` (an Android app process), so
-/// `path_within_home` compared every path against the filesystem root and
+/// `path_within_allowed` compared every path against the filesystem root and
 /// answered `true` for all of them — meaning `workspace` could mount *any*
 /// directory on the device read-write into the guest, which is exactly what
 /// audit #111 added this check to prevent.
@@ -49,14 +64,60 @@ fn resolve_home(env: impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
 }
 
 /// True when `path` resolves to a location inside the user's home
-/// directory. Mirrors kitty-tools' `path_within_home`: canonicalize the
+/// directory. Mirrors kitty-tools' `path_within_allowed`: canonicalize the
 /// nearest existing ancestor (the workspace itself always exists — callers
 /// check `is_dir` first) so symlinked components and Windows 8.3 short-name
 /// segments can't alias their way across the boundary, with a lexical
 /// fallback for paths that don't exist yet.
-/// An undeterminable home directory rejects everything — see `home_dir`.
-pub fn path_within_home(path: &Path) -> bool {
-    within_home_of(home_dir().as_deref(), path)
+/// An undeterminable set of allowed roots rejects everything — see
+/// [`allowed_roots`].
+pub fn path_within_allowed(path: &Path) -> bool {
+    let roots = allowed_roots();
+    if roots.is_empty() {
+        return false;
+    }
+    roots.iter().any(|r| within_home_of(Some(r), path))
+}
+
+/// Every directory a workspace may be mounted from: [`home_dir`] plus whatever
+/// the host granted through [`ALLOWED_DIRS_ENV`] and [`ALLOWED_DIRS_FILE_ENV`].
+///
+/// With neither set this is exactly `[home_dir()]` — the behaviour before
+/// authorization was split out of `KITTY_PLUGIN_HOME`. An empty result rejects
+/// everything, for the same reason an undeterminable home does.
+pub fn allowed_roots() -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Some(home) = home_dir() {
+        roots.push(home);
+    }
+    if let Some(raw) = std::env::var_os(ALLOWED_DIRS_ENV) {
+        // `split_paths`, not a split on ':' — that would cut a Windows path at
+        // its drive letter.
+        roots.extend(std::env::split_paths(&raw).filter(|p| !p.as_os_str().is_empty()));
+    }
+    if let Some(file) = std::env::var_os(ALLOWED_DIRS_FILE_ENV) {
+        if let Ok(text) = std::fs::read_to_string(PathBuf::from(file)) {
+            roots.extend(parse_grants(&text));
+        }
+    }
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+/// The grants file's payload. Malformed input yields no roots rather than an
+/// error: this is the second gate behind the daemon's own per-session check,
+/// so losing grants costs a spurious rejection, never an unsafe mount.
+fn parse_grants(text: &str) -> Vec<PathBuf> {
+    serde_json::from_str::<Vec<String>>(text)
+        .map(|entries| {
+            entries
+                .into_iter()
+                .filter(|e| !e.trim().is_empty())
+                .map(PathBuf::from)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The containment test against an explicit home, split out so the
@@ -120,15 +181,15 @@ mod tests {
 
     #[test]
     fn home_dir_is_inside_itself() {
-        assert!(path_within_home(&home()));
+        assert!(path_within_allowed(&home()));
     }
 
     #[test]
     fn paths_inside_home_are_allowed() {
         let within = home().join("some").join("deeper").join("workspace");
-        assert!(path_within_home(&within));
+        assert!(path_within_allowed(&within));
         // Case differences must not slip past the boundary on Windows.
-        assert!(path_within_home(&home().join("MixedCase").join("x")));
+        assert!(path_within_allowed(&home().join("MixedCase").join("x")));
     }
 
     /// The regression that matters most here: an undeterminable home used to
@@ -183,7 +244,7 @@ mod tests {
         let outside = PathBuf::from("C:\\Windows\\system32");
         #[cfg(not(windows))]
         let outside = PathBuf::from("/etc");
-        assert!(!path_within_home(&outside));
+        assert!(!path_within_allowed(&outside));
     }
 
     #[test]
@@ -195,7 +256,7 @@ mod tests {
             sibling = base.parent().unwrap().join(format!("{name}2"));
         }
         if sibling != base {
-            assert!(!path_within_home(&sibling));
+            assert!(!path_within_allowed(&sibling));
         }
     }
 }

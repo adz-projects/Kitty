@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 
 use crate::doc_store::{self, Extraction};
 use crate::envelope::{error_response, success_response};
-use crate::paths::{path_within_home, resolve};
+use crate::paths::{path_within_allowed, resolve};
 use crate::query_filter::filter_by_query;
 
 /// Hard cap on pages extracted in one call when no `end_page` is given — a
@@ -155,14 +155,14 @@ fn too_large(resolved: &Path) -> String {
 /// Home boundary shared by both PDF tools — defense-in-depth before any
 /// filesystem access (the daemon is the primary gate).
 fn outside_home(resolved: &Path) -> Option<String> {
-    if path_within_home(resolved) {
+    if path_within_allowed(resolved) {
         None
     } else {
         Some(error_response(
             "PATH_OUTSIDE_HOME",
-            "Path is outside the HOME directory",
+            "Path is outside the directories this session may access",
             Some(&resolved.to_string_lossy()),
-            Some("Only paths inside your home directory can be accessed."),
+            Some(&crate::paths::allowed_roots_hint()),
         ))
     }
 }

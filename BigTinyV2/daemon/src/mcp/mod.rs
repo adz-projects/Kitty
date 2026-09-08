@@ -10,6 +10,7 @@
 pub mod builtin;
 pub mod child_transport;
 pub mod client;
+pub mod kitty_grants;
 pub mod manager;
 pub mod rw_transport;
 pub mod sse_transport;

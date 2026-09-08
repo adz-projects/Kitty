@@ -187,10 +187,28 @@ static SHELL_PATH_RE: Lazy<Regex> = Lazy::new(|| {
     .unwrap()
 });
 
+/// A Windows command switch (`/d`, `/s`, `/q`, `/ab`), which the extraction
+/// regex's POSIX-absolute alternative otherwise reads as a filesystem path.
+///
+/// This cost a real, reproducible failure: `lean_shell` is write-class, so a
+/// path it "touches" outside the allowed set is *hard-denied* with no approval
+/// path (`loop_::execute_one_tool_call`). `cd /d C:\chat\dir && …` therefore
+/// extracted `/d`, found it outside every allowed directory, and refused the
+/// command — telling the model it had tried to write somewhere it shouldn't
+/// when it had done nothing of the kind. The model, correctly believing the
+/// directory was allowed, retried variations until the turn was exhausted.
+///
+/// Deliberately narrow: one or two alphanumerics and nothing else. Real
+/// single-segment absolutes worth guarding (`/etc`, `/bin`, `/usr`) are three
+/// or more characters and still match, so this gives up no containment that
+/// matters on either platform.
+static WIN_SWITCH_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^/[A-Za-z0-9]{1,2}$").unwrap());
+
 /// Best-effort extraction of literal filesystem paths from a shell command string.
 fn extract_shell_paths(command: &str) -> Vec<String> {
     let scrubbed = URL_RE.replace_all(command, " ");
-    SHELL_PATH_RE.captures_iter(&scrubbed)
+    SHELL_PATH_RE
+        .captures_iter(&scrubbed)
         .filter_map(|caps| {
             caps.iter()
                 .skip(1)
@@ -198,6 +216,7 @@ fn extract_shell_paths(command: &str) -> Vec<String> {
                 .flatten()
                 .map(|m| m.as_str().to_string())
         })
+        .filter(|p| !WIN_SWITCH_RE.is_match(p))
         .collect()
 }
 
@@ -272,18 +291,14 @@ fn home_dir() -> Option<std::path::PathBuf> {
 /// within one binary, and `std::env::set_var` isn't safe against a
 /// concurrent reader (see `bigtiny_embedded.rs`'s own comment on that).
 /// Mirrors `kitty-tools`' `paths::resolve_home`.
-fn resolve_home(
-    env: impl Fn(&str) -> Option<std::ffi::OsString>,
-) -> Option<std::path::PathBuf> {
+fn resolve_home(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<std::path::PathBuf> {
     // Filtered on the *string* form, not just non-empty `OsString`: Android
     // sets some of these to whitespace/empty rather than leaving them unset
     // (same reasoning as `kitty-tools::paths::resolve_home`, which this
     // mirrors).
     ["KITTY_PLUGIN_HOME", "USERPROFILE", "HOME"]
         .into_iter()
-        .find_map(|key| {
-            env(key).filter(|v| v.to_str().is_none_or(|s| !s.trim().is_empty()))
-        })
+        .find_map(|key| env(key).filter(|v| v.to_str().is_none_or(|s| !s.trim().is_empty())))
         .map(std::path::PathBuf::from)
 }
 
@@ -331,6 +346,22 @@ fn scratch_allowance() -> Vec<String> {
 /// the literal string `src` and denied, while the model reasonably meant the
 /// `src` inside the folder it is working in.
 const PATH_ARG_KEYS: [&str; 2] = ["path", "cwd"];
+
+/// Tools whose `path` argument is *optional*, and whose own default when it is
+/// omitted is the tool process's working directory.
+///
+/// Rewriting only keys that are already present leaves exactly one hole, and
+/// it is the one the model falls into first: `lean_analyze_workspace` with no
+/// arguments at all. kitty-tools then defaults it to `"."`, which resolves
+/// against the MCP child's inherited working directory — Kitty's launch
+/// folder — so "show me what's here" answered with the app's own install
+/// directory, and the model concluded it had no access to anything. Inserting
+/// the session's `cwd` for these is the same correction the present-key path
+/// already makes, applied to the absent-key case.
+///
+/// Deliberately a list, not "every `lean_` tool": inserting a `path` into a
+/// tool that takes none would fail its schema validation.
+const OPTIONAL_PATH_TOOLS: [&str; 1] = ["lean_analyze_workspace"];
 
 /// Rewrite a relative `path` argument to be relative to the *session's*
 /// working directory, returning whether anything changed.
@@ -396,6 +427,15 @@ pub fn qualify_relative_path_args(tool_name: &str, args: &mut Value, cwd: &str) 
             format!("{base}/{}", rel.replace('\\', "/"))
         };
         obj.insert(key.to_string(), Value::String(qualified));
+        changed = true;
+    }
+    // The absent-key case (see `OPTIONAL_PATH_TOOLS`). Runs after the loop so
+    // an explicitly supplied `path` — relative or absolute — always wins.
+    if OPTIONAL_PATH_TOOLS.contains(&tool_name) && !obj.get("path").is_some_and(|v| v.is_string()) {
+        obj.insert(
+            "path".to_string(),
+            Value::String(cwd.replace('\\', "/").trim_end_matches('/').to_string()),
+        );
         changed = true;
     }
     changed
@@ -497,9 +537,7 @@ mod tests {
         };
         assert_eq!(
             resolve_home(env),
-            Some(std::path::PathBuf::from(
-                "/data/user/0/com.kitty.app/Kitty"
-            ))
+            Some(std::path::PathBuf::from("/data/user/0/com.kitty.app/Kitty"))
         );
     }
 
@@ -772,6 +810,86 @@ mod tests {
         assert_eq!(args["path"], json!("C:/Users/me/Labs"));
     }
 
+    /// The hole the bare-dot fix left open. `lean_analyze_workspace`'s `path`
+    /// is optional, and `qualify_relative_path_args` only ever rewrote keys
+    /// that were already present — so a model calling it with *no arguments*
+    /// bypassed the correction entirely and got kitty-tools' own default of
+    /// `"."`, resolved against the tool process's inherited working directory
+    /// (Kitty's install folder). "Show me what's here" answered with the app's
+    /// own directory, and the model concluded it had access to nothing.
+    #[test]
+    fn an_omitted_optional_path_becomes_the_session_working_directory() {
+        let mut args = json!({});
+        assert!(qualify_relative_path_args(
+            "lean_analyze_workspace",
+            &mut args,
+            "C:/Users/me/Labs"
+        ));
+        assert_eq!(args["path"], json!("C:/Users/me/Labs"));
+    }
+
+    /// An explicitly supplied path always wins over the inserted default,
+    /// whether it is relative (qualified against cwd) or absolute (untouched).
+    #[test]
+    fn an_explicit_path_is_never_overwritten_by_the_default() {
+        let mut rel = json!({"path": "src"});
+        qualify_relative_path_args("lean_analyze_workspace", &mut rel, "C:/proj");
+        assert_eq!(rel["path"], json!("C:/proj/src"));
+
+        let mut abs = json!({"path": "D:/elsewhere"});
+        qualify_relative_path_args("lean_analyze_workspace", &mut abs, "C:/proj");
+        assert_eq!(abs["path"], json!("D:/elsewhere"));
+    }
+
+    /// Only tools that actually take an optional `path` get one inserted:
+    /// adding the key to a tool with no such argument would fail its schema.
+    #[test]
+    fn no_path_is_invented_for_tools_that_take_none() {
+        let mut args = json!({"query": "cats"});
+        assert!(!qualify_relative_path_args(
+            "lean_web_search",
+            &mut args,
+            "C:/proj"
+        ));
+        assert!(args.get("path").is_none());
+
+        let mut shell = json!({"command": "dir"});
+        qualify_relative_path_args("lean_shell", &mut shell, "C:/proj");
+        assert!(shell.get("path").is_none());
+    }
+
+    /// Windows command switches are not filesystem paths. `lean_shell` is
+    /// write-class, so a "path" it touches outside the allowed set is
+    /// *hard-denied* with no approval route — which meant a plain
+    /// `cd /d <allowed dir>` was refused as an attempted out-of-scope write.
+    #[test]
+    fn windows_switches_are_not_extracted_as_paths() {
+        let allowed = vec!["C:/Users/me/chats/abc".to_string()];
+        for command in [
+            r"cd /d C:\Users\me\chats\abc && dir",
+            "dir /s C:/Users/me/chats/abc",
+            "del /q C:/Users/me/chats/abc/tmp.txt",
+        ] {
+            assert!(
+                check_containment(&json!({ "command": command }), &allowed, false),
+                "{command:?} must not be read as touching a path outside the allowed set"
+            );
+        }
+    }
+
+    /// The narrowness of that exclusion: a real single-segment absolute path is
+    /// three or more characters and must still be extracted and judged.
+    #[test]
+    fn real_absolute_paths_are_still_extracted() {
+        let allowed = vec!["C:/Users/me/chats/abc".to_string()];
+        for command in ["cat /etc/passwd", "rm -rf /usr/local", "cp x /bin/sh"] {
+            assert!(
+                !check_containment(&json!({ "command": command }), &allowed, false),
+                "{command:?} must still be caught as reaching outside"
+            );
+        }
+    }
+
     #[test]
     fn relative_paths_are_qualified_and_separators_normalized() {
         for (input, want) in [
@@ -813,7 +931,11 @@ mod tests {
     #[test]
     fn other_servers_arguments_are_untouched() {
         let mut args = json!({"path": "/users/me"});
-        assert!(!qualify_relative_path_args("github_get", &mut args, "C:/proj"));
+        assert!(!qualify_relative_path_args(
+            "github_get",
+            &mut args,
+            "C:/proj"
+        ));
         assert_eq!(args["path"], json!("/users/me"));
 
         // No cwd to qualify against is also a no-op, not a panic.
@@ -835,11 +957,7 @@ mod tests {
             false
         ));
         assert!(
-            !check_containment(
-                &json!({"command": "ls", "cwd": "/etc"}),
-                &allowed,
-                false
-            ),
+            !check_containment(&json!({"command": "ls", "cwd": "/etc"}), &allowed, false),
             "a cwd outside the allowed set must not pass containment"
         );
     }
@@ -936,8 +1054,10 @@ mod tests {
             "attached_paths": ["/home/user/chat"],
         });
         let dirs = allowed_dirs_for_session(&metadata, "~/.bigtiny");
-        let chat_entries = dirs.iter().filter(|d| d.contains("/home/user/chat")).count();
+        let chat_entries = dirs
+            .iter()
+            .filter(|d| d.contains("/home/user/chat"))
+            .count();
         assert_eq!(chat_entries, 1, "expected one entry, got {dirs:?}");
     }
-
 }

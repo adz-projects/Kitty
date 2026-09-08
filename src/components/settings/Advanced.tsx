@@ -3,7 +3,7 @@ import { ipc } from '@/lib/ipc';
 import { useConfigDraft } from './useConfigDraft';
 import { ClearChatHistory } from './ClearChatHistory';
 import { useStackStore } from '@/stores/stackStore';
-import type { LogEntry, MemoryStats, ProviderView } from '@/lib/types';
+import type { LogEntry, MemoryStats } from '@/lib/types';
 
 // How often to re-fetch the error log while its disclosure is open — there's
 // no push event for new entries (kept simple, matching this being a
@@ -35,7 +35,6 @@ export function Advanced() {
   const [logError, setLogError] = useState('');
   const logPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const memoryPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const [providers, setProviders] = useState<ProviderView[]>([]);
   const [memoryStats, setMemoryStats] = useState<MemoryStats | null>(null);
   const [memoryStatsError, setMemoryStatsError] = useState('');
 
@@ -54,19 +53,6 @@ export function Advanced() {
       setRepairMsg(String(e));
     }
   };
-
-  const loadProviders = () =>
-    void ipc
-      .listProviders()
-      .then(setProviders)
-      .catch(() => setProviders([]));
-  useEffect(loadProviders, []);
-
-  // The active provider's own `context_length` (Settings → Providers →
-  // Advanced) wins over the global `max_context_tokens` below as the per-chat
-  // budget — the global value only applies to providers with no override set.
-  const activeProvider = providers.find((p) => p.active) ?? null;
-  const providerCtxLen = activeProvider?.context_length ?? null;
 
   const loadLogEntries = () =>
     void ipc
@@ -173,95 +159,21 @@ export function Advanced() {
             </button>
             {tokenMgmtOpen && (
               <>
-                <label className="field">
-                  <span>Max context tokens</span>
-                  <input
-                    type="number"
-                    min={8192}
-                    step={1024}
-                    value={draft.token_management.max_context_tokens}
-                    onChange={(e) => {
-                      // `Number('') === 0`, which would violate the declared
-                      // `min` and get persisted as an invalid 0 — an emptied
-                      // field keeps the previous value instead (the type here
-                      // is a non-nullable number, so there's no null to write).
-                      const raw = e.target.value;
-                      if (raw === '') return;
-                      const numeric = Number(raw);
-                      if (!Number.isFinite(numeric)) return;
-                      update({
-                        token_management: {
-                          ...draft.token_management,
-                          max_context_tokens: numeric,
-                        },
-                      });
-                    }}
-                  />
-                  <small className="muted">
-                    BigTiny&apos;s context window size. Must match your active model&apos;s
-                    capability.
-                  </small>
-                  {providerCtxLen != null ? (
-                    <p className="muted" style={{ margin: 0 }}>
-                      Active provider <strong>{activeProvider?.name ?? 'provider'}</strong>{' '}
-                      overrides this to{' '}
-                      <strong>
-                        {providerCtxLen.toLocaleString()} tokens (effective this chat)
-                      </strong>{' '}
-                      via Settings → Providers. This global value is only the fallback for providers
-                      without an override.
-                    </p>
-                  ) : (
-                    <p className="muted" style={{ margin: 0 }}>
-                      No context-length override set on the active provider — this global value is
-                      the effective per-chat budget. Set one in Settings → Providers to scope it per
-                      provider.
-                    </p>
-                  )}
-                  <div className="row">
-                    <button
-                      type="button"
-                      disabled={providerCtxLen == null}
-                      onClick={() =>
-                        update({
-                          token_management: {
-                            ...draft!.token_management,
-                            max_context_tokens: providerCtxLen!,
-                          },
-                        })
-                      }
-                    >
-                      Match active provider ({providerCtxLen?.toLocaleString() ?? '—'})
-                    </button>
-                  </div>
-                </label>
-                <label className="field">
-                  <span>Max live tail tokens</span>
-                  <input
-                    type="number"
-                    min={1024}
-                    step={1024}
-                    value={draft.token_management.max_live_tail_tokens}
-                    onChange={(e) => {
-                      // Same empty-field guard as max_context_tokens: don't
-                      // persist `Number('')` === 0 against the `min` of 1024.
-                      const raw = e.target.value;
-                      if (raw === '') return;
-                      const numeric = Number(raw);
-                      if (!Number.isFinite(numeric)) return;
-                      update({
-                        token_management: {
-                          ...draft.token_management,
-                          max_live_tail_tokens: numeric,
-                        },
-                      });
-                    }}
-                  />
-                  <small className="muted">
-                    Per-turn budget for the live conversation tail. Lower = more aggressive
-                    compaction.
-                  </small>
-                </label>
+                {/* "Max context tokens", its "Match active provider" button and
+                    "Max live tail tokens" used to live here. All three are now
+                    derived automatically from the active provider's real window
+                    (detected per model, self-correcting when a provider reports
+                    its own limit), so there is nothing left for a person to set
+                    correctly and a great deal to set wrongly.
+
+                    They were also actively harmful. The live-tail budget is now
+                    scaled to the window rather than being a flat 24000 tokens —
+                    which on a 36k model reserved two thirds of the context for
+                    trailing history and made chats uncompactable within about
+                    three turns. A manual override here would let exactly that
+                    bug back in, so the field is gone rather than merely
+                    defaulted. The daemon config fields remain as the fallback
+                    for a provider that advertises no window at all. */}
                 <label className="field">
                   <span>Code block head lines</span>
                   <input

@@ -12,7 +12,7 @@ use crate::doc_store::{self, Extraction};
 use crate::docx;
 use crate::docx::write::WriteMode;
 use crate::envelope::{error_response, success_response};
-use crate::paths::{path_within_home, resolve};
+use crate::paths::{path_within_allowed, resolve};
 use crate::query_filter::filter_by_query;
 use crate::tools;
 use crate::tools::viz::model as viz_model;
@@ -26,14 +26,14 @@ const DEFAULT_PAGE_SIZE: u32 = 200;
 /// gate). Word read/write authorize through the *resolved* path here —
 /// before any filesystem access.
 fn outside_home(resolved: &std::path::Path) -> Option<String> {
-    if path_within_home(resolved) {
+    if path_within_allowed(resolved) {
         None
     } else {
         Some(error_response(
             "PATH_OUTSIDE_HOME",
-            "Path is outside the HOME directory",
+            "Path is outside the directories this session may access",
             Some(&resolved.to_string_lossy()),
-            Some("Only paths inside your home directory can be accessed."),
+            Some(&crate::paths::allowed_roots_hint()),
         ))
     }
 }

@@ -250,6 +250,11 @@ export const ipc = {
       messages_compacted?: number;
       tokens_before?: number;
       tokens_after?: number;
+      /** Why nothing was folded, when `compacted` is false. Present for every
+          skip reason the daemon distinguishes — summarizer unreachable, lock
+          held, nothing old enough — so the UI can stop rendering all of them
+          as the same unhelpful line. */
+      reason?: string;
     }>('compact_session', { sessionId }),
   setThinkingEffort: (sessionId: string, value: string) =>
     invoke<ThinkingEffort | null>('set_thinking_effort', { sessionId, value }),

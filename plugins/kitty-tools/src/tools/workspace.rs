@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use crate::envelope::{error_response, success_response};
-use crate::paths::path_within_home;
+use crate::paths::path_within_allowed;
 use crate::paths::resolve;
 use serde_json::json;
 
@@ -32,7 +32,7 @@ fn scoped_root(path: &str) -> std::path::PathBuf {
     let resolved = resolve(path);
     #[cfg(target_os = "android")]
     {
-        if !path_within_home(&resolved) {
+        if !path_within_allowed(&resolved) {
             if let Some(home) = crate::paths::home_dir() {
                 return home;
             }
@@ -43,12 +43,12 @@ fn scoped_root(path: &str) -> std::path::PathBuf {
 
 pub fn analyze_workspace(path: &str, max_depth: Option<i64>) -> String {
     let resolved = scoped_root(path);
-    if !path_within_home(&resolved) {
+    if !path_within_allowed(&resolved) {
         return error_response(
             "PATH_OUTSIDE_HOME",
-            "Path is outside the HOME directory",
+            "Path is outside the directories this session may access",
             Some(&resolved.to_string_lossy()),
-            Some("Only paths inside your home directory can be accessed."),
+            Some(&crate::paths::allowed_roots_hint()),
         );
     }
     if !resolved.exists() {

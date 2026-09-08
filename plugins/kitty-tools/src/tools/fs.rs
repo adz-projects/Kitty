@@ -3,7 +3,7 @@
 
 use crate::doc_store::{self, Extraction};
 use crate::envelope::{error_response, success_response};
-use crate::paths::path_within_home;
+use crate::paths::path_within_allowed;
 use crate::paths::resolve;
 use crate::query_filter::filter_by_query;
 use crate::text::py_splitlines;
@@ -17,7 +17,7 @@ const FILE_PAGE_SIZE: usize = 200;
 const MAX_FILE_BYTES: usize = 4 * 1024 * 1024;
 
 fn outside_home(resolved: &std::path::Path) -> bool {
-    !path_within_home(resolved)
+    !path_within_allowed(resolved)
 }
 
 /// Single-stat existence + size probe: one `metadata()` answers "does it
@@ -46,9 +46,9 @@ pub fn file_read(
     if outside_home(&resolved) {
         return error_response(
             "PATH_OUTSIDE_HOME",
-            "Path is outside the HOME directory",
+            "Path is outside the directories this session may access",
             Some(&resolved.to_string_lossy()),
-            Some("Only paths inside your home directory can be accessed."),
+            Some(&crate::paths::allowed_roots_hint()),
         );
     }
     let len = match stat_len(&resolved) {
@@ -168,9 +168,9 @@ pub fn file_write(path: &str, content: &str, dry_run: bool) -> String {
     if outside_home(&resolved) {
         return error_response(
             "PATH_OUTSIDE_HOME",
-            "Path is outside the HOME directory",
+            "Path is outside the directories this session may access",
             Some(&resolved.to_string_lossy()),
-            Some("Only paths inside your home directory can be accessed."),
+            Some(&crate::paths::allowed_roots_hint()),
         );
     }
     if dry_run {
@@ -221,9 +221,9 @@ pub fn file_append(path: &str, content: &str, dry_run: bool) -> String {
     if outside_home(&resolved) {
         return error_response(
             "PATH_OUTSIDE_HOME",
-            "Path is outside the HOME directory",
+            "Path is outside the directories this session may access",
             Some(&resolved.to_string_lossy()),
-            Some("Only paths inside your home directory can be accessed."),
+            Some(&crate::paths::allowed_roots_hint()),
         );
     }
     if stat_len(&resolved).is_none() {
@@ -282,9 +282,9 @@ pub fn file_replace_str(path: &str, old_str: &str, new_str: &str, dry_run: bool)
     if outside_home(&resolved) {
         return error_response(
             "PATH_OUTSIDE_HOME",
-            "Path is outside the HOME directory",
+            "Path is outside the directories this session may access",
             Some(&resolved.to_string_lossy()),
-            Some("Only paths inside your home directory can be accessed."),
+            Some(&crate::paths::allowed_roots_hint()),
         );
     }
     // An empty `old_str` is not "zero occurrences" — `str::matches("")` counts
@@ -388,9 +388,9 @@ pub fn file_replace_lines(
     if outside_home(&resolved) {
         return error_response(
             "PATH_OUTSIDE_HOME",
-            "Path is outside the HOME directory",
+            "Path is outside the directories this session may access",
             Some(&resolved.to_string_lossy()),
-            Some("Only paths inside your home directory can be accessed."),
+            Some(&crate::paths::allowed_roots_hint()),
         );
     }
     let len = match stat_len(&resolved) {
