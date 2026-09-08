@@ -1,33 +1,15 @@
-// Guards against a model getting stuck: verbatim reasoning/text repetition,
-// an over-length recipe reasoning cap, a leaked literal `<think>` tag, and a
-// tool-call loop (same call, same target, repeatedly) in chat mode.
+// Guards against a model getting stuck: verbatim reasoning/text repetition, a
+// leaked literal `<think>` tag, and a tool-call loop (same call, same target,
+// repeatedly) in chat mode.
+//
+// The reasoning hard cap that used to live here went with recipes. It was
+// driven entirely by a recipe's `max_reasoning_tokens`, and with no producer
+// for that number it could never fire again -- along with the forced-answer
+// follow-up that only a cap-triggered cancel ever scheduled.
 
 import type { ToolCallCounts } from './types';
 
 export type { ToolCallCounts };
-
-/** Sent automatically once a reasoning-cap-triggered cancel actually
-    completes (see `pendingForcedAnswer` in chatStore) — there's no way to
-    redirect an in-flight generation straight to its answer, so this asks for
-    one on a fresh turn instead of leaving the user with nothing. */
-export const FORCED_ANSWER_PROMPT =
-  'Based on the work you did in your previous turn, please produce a response.';
-
-/** Rough English-text chars-per-token approximation, used only to enforce a
-    recipe's `max_reasoning_tokens` hard cap client-side (see `flushDeltas` in
-    chatStore) — ACP exposes no numeric reasoning-token count to check
-    against, only effort levels, so this is the best available proxy, not an
-    exact count. */
-const CHARS_PER_TOKEN_ESTIMATE = 4;
-
-/** Pure decision function behind the recipe reasoning hard cap — separated
-    from `flushDeltas`'s zustand `get()`/`set()` plumbing so the actual
-    threshold math is unit-testable on its own, same pattern as
-    `hasRepetitionLoop`. */
-export function exceedsReasoningCap(reasoningLength: number, maxReasoningTokens: number): boolean {
-  const approxReasoningTokens = Math.ceil(reasoningLength / CHARS_PER_TOKEN_ESTIMATE);
-  return approxReasoningTokens > maxReasoningTokens;
-}
 
 /** Detects a real, observed local-model failure mode: instead of ever
     finishing, the model gets stuck repeating a short "planning out loud"

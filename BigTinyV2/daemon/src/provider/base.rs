@@ -7,6 +7,7 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use crate::error::ProviderError;
+use crate::provider::schema::SchemaDirective;
 pub use crate::models::provider::{HealthStatus, ModelInfo};
 
 /// Delta chunk emitted by a provider during streaming chat completion.
@@ -68,6 +69,20 @@ pub struct SamplingParams {
     pub presence_penalty: Option<f64>,
     pub frequency_penalty: Option<f64>,
     pub max_tokens: Option<i32>,
+    /// Ceiling on reasoning/thinking tokens for this request, where the dialect
+    /// has a field for it.
+    ///
+    /// A *hint*, not the enforcement. Only Anthropic (`thinking.budget_tokens`)
+    /// and OpenRouter (`reasoning.max_tokens`) accept a number; hosted OpenAI
+    /// has only an effort level, and the self-hosted dialects have nothing at
+    /// all. The mechanism that works everywhere is `agent::loop_`'s per-run
+    /// accumulator — this only stops the waste before it happens, where the
+    /// wire allows saying so.
+    ///
+    /// Beside `effort` rather than inside it, because the two are different
+    /// kinds of thing: `effort` is a level that changes how the model plans;
+    /// this is a bound on what that plan may cost.
+    pub reasoning_max_tokens: Option<i32>,
     /// Requested reasoning effort for this turn, or `None` for "don't ask".
     ///
     /// Unlike every other field here — each of which the provider just
@@ -159,6 +174,12 @@ pub trait Provider: Send + Sync {
     /// (real Anthropic/OpenAI) either ignore it or never receive `Some` in
     /// the first place, since it's only computed when slot pinning is
     /// explicitly configured.
+    ///
+    /// `schema` is already mapped to this provider's dialect by
+    /// `ProviderRouter::chat_completion` — the router is the only layer that
+    /// knows which dialect an implementor speaks, so implementors receive a
+    /// wire shape to write rather than a mode to interpret. See
+    /// `provider::schema`.
     async fn chat_completion(
         &self,
         messages: &[Value],
@@ -166,6 +187,7 @@ pub trait Provider: Send + Sync {
         sampling: SamplingParams,
         model: Option<String>,
         id_slot: Option<i32>,
+        schema: SchemaDirective,
     ) -> Result<Pin<Box<dyn Stream<Item = Delta> + Send>>, ProviderError>;
 
     /// Discover available models from the provider's API.

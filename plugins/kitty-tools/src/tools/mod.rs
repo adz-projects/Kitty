@@ -8,6 +8,7 @@ pub mod fs;
 pub mod pdf;
 pub mod scratchpad;
 pub mod shell;
+pub mod shell_ro;
 pub mod viz;
 pub mod workspace;
 

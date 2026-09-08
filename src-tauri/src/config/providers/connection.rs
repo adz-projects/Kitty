@@ -165,6 +165,7 @@ mod tests {
             base_url: base_url.to_string(),
             models: models.into_iter().map(String::from).collect(),
             is_trusted: false,
+        subagent_role: None,
             temperature: None,
             top_p: None,
             top_k: None,

@@ -37,7 +37,7 @@ The original product description (`goose-overlay-project-description.md`) has be
 
 ### BigTiny
 - Spawned by us as a child process (bundled `bigtiny-daemon.exe`, or `python -m bigtiny` from a source checkout for dev — see `docs/bigtiny-backend.md`). Binds a localhost port and requires a secret sent as `X-API-Key` — we generate the secret, pass it via env var `BIGTINY_SECRET`, and pick a free port. `GET /api/health` is open without auth by design, for readiness polling.
-- Plain REST + one SSE streaming endpoint (`POST /api/chat/{id}/send`). Key route families: session CRUD (`/api/chat/...`), providers (`/api/providers/...`), MCP servers (`/api/mcp/servers/...`), recipes/schedules (daemon-side, not currently used by Kitty). All BigTiny endpoint paths live in `src-tauri/src/bigtiny/` (`client.rs`, `sessions.rs`, `stream.rs`, `providers.rs`, `mcp.rs`) so a BigTiny API change touches one module.
+- Plain REST + one SSE streaming endpoint (`POST /api/chat/{id}/send`). Key route families: session CRUD (`/api/chat/...`), providers (`/api/providers/...`), MCP servers (`/api/mcp/servers/...`), specialists (`/api/specialists/...`) and schedules. All BigTiny endpoint paths live in `src-tauri/src/bigtiny/` (`client.rs`, `sessions.rs`, `stream.rs`, `providers.rs`, `mcp.rs`) so a BigTiny API change touches one module.
 - BigTiny's own API.md (in its repo) is the source of truth for route shapes.
 
 ### Ollama
@@ -135,12 +135,21 @@ is the accurate, current module map** — the repository layout tree
 immediately below this section is historical/aspirational, not a live
 inventory. Subsystems built beyond the original phased plan:
 
-- **Recipes** (`config/recipes.rs`, `config/recipe_yaml.rs`,
-  `commands/recipes.rs`, `components/settings/Recipes.tsx`) — Goose recipes
-  reinterpreted as client-side chat-turn templates (not the real `goose run
-  --recipe` CLI runner): instructions/extensions/starting-prompt attached to
-  a message via `/slug` in the composer. See `chatStore.ts`'s
-  `sendWithRecipe`.
+- **Specialists** (`bigtiny/specialists.rs`, `commands/specialists.rs`,
+  `components/settings/Specialists.tsx`) — delegate agents the *model*
+  calls mid-turn via `call_specialist`, each running in its own session
+  with its own model pin, tool allow-list and required JSON answer shape,
+  so its tool chatter never enters the parent transcript. Definitions live
+  in the daemon (`/api/specialists`), not Kitty's config: the model reaches
+  the same rows without Kitty in the loop. Kitty owns the authoring UI, the
+  per-provider "use for specialists" setting, the subagent model denylist
+  (relayed as `BIGTINY_AGENT__SUBAGENT_MODEL_DENY` at spawn, seeded once from
+  the OpenRouter catalog's premium tier), and the `chat://subagent-status`
+  tray. The daemon picks the host, bounds the run in wall-clock time and
+  reasoning tokens, and reports what it actually used. **Replaced the
+  client-side recipes feature** (Goose-style `/slug` prompt templates) —
+  users lose a deterministic shortcut and gain delegation they never have
+  to ask for.
 - **Scheduled tasks** (`config/scheduled_tasks.rs`, `commands/scheduled_tasks.rs`,
   `lifecycle/scheduler.rs`, `components/settings/ScheduledTasks.tsx`) —
   user-authored instructions the agent runs later, one-shot or recurring,

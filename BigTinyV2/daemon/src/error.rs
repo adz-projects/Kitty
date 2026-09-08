@@ -251,21 +251,6 @@ pub enum AgentError {
 }
 
 #[derive(Error, Debug)]
-pub enum RecipeError {
-    #[error("recipe not found: {0}")]
-    NotFound(String),
-
-    #[error("template error: {0}")]
-    Template(String),
-
-    #[error("storage error: {0}")]
-    Storage(#[from] StorageError),
-
-    #[error("turn failed: {0}")]
-    TurnFailed(String),
-}
-
-#[derive(Error, Debug)]
 pub enum SchedulerError {
     #[error("schedule not found: {0}")]
     NotFound(String),

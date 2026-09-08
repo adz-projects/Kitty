@@ -65,9 +65,11 @@ pub async fn update_execution_status(
     Ok(())
 }
 
-pub async fn get_executions_for_recipe(
+/// Runs recorded against one trigger -- a schedule id, or a specialist name
+/// for a `subagent` row.
+pub async fn get_executions_for_trigger(
     pool: &SqlitePool,
-    recipe_id: &str,
+    trigger_id: &str,
     limit: i64,
 ) -> Result<Vec<ExecutionRow>, StorageError> {
     // `LIMIT` pushed into SQL (and `trigger_id` indexed by migration 014) —
@@ -78,7 +80,7 @@ pub async fn get_executions_for_recipe(
         r#"SELECT id, session_id, trigger_type, trigger_id, status, started_at, completed_at, result_summary, error_message
            FROM execution_history WHERE trigger_id = ? ORDER BY started_at DESC LIMIT ?"#
     )
-    .bind(recipe_id)
+    .bind(trigger_id)
     .bind(limit.max(0))
     .fetch_all(pool)
     .await?;

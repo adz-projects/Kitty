@@ -91,19 +91,6 @@ pub async fn new_session(app: AppHandle, cwd: Option<String>) -> Result<SessionI
     crate::bigtiny::sessions::create(&app, cwd, active.0, active.1, active.2).await
 }
 
-/// Attach one recipe-declared extension to a live session — a no-op under
-/// BigTiny, where MCP servers are daemon-global (`/api/mcp/servers`), not
-/// per-session. Recipes still work; their extension hints are simply skipped
-/// (best-effort, never a hard failure).
-#[tauri::command]
-pub async fn add_recipe_extension(
-    _app: AppHandle,
-    _session_id: String,
-    _extension: crate::config::recipes::RecipeExtension,
-) -> Result<(), String> {
-    Ok(())
-}
-
 /// List past sessions (raw session objects; the frontend parses them).
 #[tauri::command]
 pub async fn list_sessions(app: AppHandle) -> Result<Vec<Value>, String> {

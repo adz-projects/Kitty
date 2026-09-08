@@ -51,6 +51,42 @@ impl Default for ResponseMode {
     }
 }
 
+/// What one request asks of the model's final answer, before it has been
+/// mapped to a dialect.
+///
+/// Carried from the caller down to [`ProviderRouter::chat_completion`], which
+/// is the only layer that knows which dialect a provider speaks and therefore
+/// the only one that can call [`directive_for`]. A caller states intent; the
+/// router states wire shape.
+#[derive(Debug, Clone, Default, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct ResponseSpec {
+    #[serde(default)]
+    pub mode: ResponseMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<Value>,
+}
+
+impl ResponseSpec {
+    /// The ordinary case: prose, no constraint.
+    pub fn text() -> Self {
+        Self::default()
+    }
+
+    /// Constrain the final answer to `schema`.
+    pub fn schema(schema: Value) -> Self {
+        Self {
+            mode: ResponseMode::Schema,
+            schema: Some(schema),
+        }
+    }
+
+    /// Whether this spec asks for anything at all. Lets callers skip the
+    /// validate/extract path entirely on an ordinary turn.
+    pub fn is_constrained(&self) -> bool {
+        !matches!(self.mode, ResponseMode::Text)
+    }
+}
+
 /// The name given to Anthropic's forced tool.
 ///
 /// Arbitrary but fixed: the unwrap step has to find the block again, and a

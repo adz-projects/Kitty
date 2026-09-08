@@ -13,6 +13,7 @@ import { ClipboardImageChips } from './ClipboardImageChips';
 import { PendingAttachmentChips } from './PendingAttachmentChips';
 import { ErrorDetail } from '@/components/shared/ErrorDetail';
 import { FolderIcon } from '@/components/icons/FolderIcon';
+import { AllowedDirsPopover } from '@/components/chat/AllowedDirsPopover';
 
 /** The shared chat surface used by both the overlay and the full window
     (CLAUDE.md rule 5).
@@ -45,6 +46,7 @@ export function ChatView() {
   const warning = useChatStore((s) => s.warning);
   const dismissWarning = useChatStore((s) => s.dismissWarning);
   const compactionNotice = useChatStore((s) => s.compactionNotice);
+  const subagents = useChatStore((s) => s.subagents);
   const dismissCompactionNotice = useChatStore((s) => s.dismissCompactionNotice);
   const loopSuspected = useChatStore((s) => s.loopSuspected);
   const dismissLoopWarning = useChatStore((s) => s.dismissLoopWarning);
@@ -55,6 +57,7 @@ export function ChatView() {
   const setWorkingDir = useChatStore((s) => s.setWorkingDir);
   const resetWorkingDir = useChatStore((s) => s.resetWorkingDir);
   const isDefaultFolder = useChatStore((s) => s.isDefaultFolder);
+  const sessionId = useChatStore((s) => s.sessionId);
   const bindEvents = useChatStore((s) => s.bindEvents);
   const refreshProvider = useChatStore((s) => s.refreshProvider);
   const newSession = useChatStore((s) => s.newSession);
@@ -89,40 +92,46 @@ export function ChatView() {
           {isDefaultFolder ? (
             // No project folder chosen — the "thought partner" state. No folder
             // icon; clicking the pill opens the picker to attach a working dir.
-            <button
-              className="pill pill-thought-partner"
-              title="Thinking space — click to set a working directory"
-              onClick={async () => {
-                const dir = await pickFolder();
-                if (dir) await setWorkingDir(dir);
-              }}
-            >
-              Thought Partner
-            </button>
-          ) : (
-            // A working folder is set: show it, plus an inline reset control
-            // that returns the session to the default "thought partner" state
-            // without opening the picker.
-            <span className="pill pill-folder">
+            // Still wrapped: a thought-partner session can have attached files,
+            // and those are grants the user should be able to see and withdraw.
+            <AllowedDirsPopover sessionId={sessionId}>
               <button
-                className="pill-body"
-                title={`Working directory: ${cwd} — click to change`}
+                className="pill pill-thought-partner"
+                title="Thinking space — click to set a working directory"
                 onClick={async () => {
                   const dir = await pickFolder();
                   if (dir) await setWorkingDir(dir);
                 }}
               >
-                <FolderIcon /> {folder ?? 'set folder'}
+                Thought Partner
               </button>
-              <button
-                className="pill-reset"
-                title="Return to thought partner (clear the working folder)"
-                aria-label="Return to thought partner"
-                onClick={() => void resetWorkingDir()}
-              >
-                ×
-              </button>
-            </span>
+            </AllowedDirsPopover>
+          ) : (
+            // A working folder is set: show it, plus an inline reset control
+            // that returns the session to the default "thought partner" state
+            // without opening the picker.
+            <AllowedDirsPopover sessionId={sessionId}>
+              <span className="pill pill-folder">
+                <button
+                  className="pill-body"
+                  title={`Working directory: ${cwd} — click to change`}
+                  onClick={async () => {
+                    const dir = await pickFolder();
+                    if (dir) await setWorkingDir(dir);
+                  }}
+                >
+                  <FolderIcon /> {folder ?? 'set folder'}
+                </button>
+                <button
+                  className="pill-reset"
+                  title="Return to thought partner (clear the working folder)"
+                  aria-label="Return to thought partner"
+                  onClick={() => void resetWorkingDir()}
+                >
+                  ×
+                </button>
+              </span>
+            </AllowedDirsPopover>
           )}
           <ChatHeaderControls />
         </div>
@@ -151,6 +160,31 @@ export function ChatView() {
           <button className="link" onClick={dismissWarning}>
             Dismiss
           </button>
+        </div>
+      )}
+
+      {/* Specialists this turn delegated to. Shown because a delegate's work
+          is otherwise invisible — its tool calls never enter this transcript,
+          which is the point — and the child session id is what lets the user
+          read what it actually did when the summary was not enough. */}
+      {subagents.length > 0 && (
+        <div className="subagent-tray" role="status">
+          {subagents.map((s) => (
+            <span className="subagent-chip" key={s.child_session_id} title={s.error ?? undefined}>
+              <span
+                className={
+                  s.status === 'failed'
+                    ? 'status-dot bad'
+                    : s.status === 'completed'
+                      ? 'status-dot ok'
+                      : 'status-dot warn'
+                }
+              />
+              {s.specialist}
+              {s.status === 'started' && <span className="muted"> · working</span>}
+              {s.status === 'failed' && <span className="muted"> · failed</span>}
+            </span>
+          ))}
         </div>
       )}
 

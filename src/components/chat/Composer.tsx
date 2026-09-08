@@ -1,14 +1,9 @@
 import { useEffect, useRef, useState } from 'react';
 import { useChatStore } from '@/stores/chatStore';
-import { ipc, onRecipesChanged, pickFiles } from '@/lib/ipc';
-import { matchRecipeCommand, primaryParameter, recipeNeedsAttention } from '@/lib/recipes';
-import type { Recipe } from '@/lib/types';
-import { usePopoverPosition } from '@/lib/usePopoverPosition';
-import { useRecipeAutocomplete } from '@/lib/useRecipeAutocomplete';
+import { ipc, pickFiles } from '@/lib/ipc';
 import { UploadIcon } from '@/components/icons/UploadIcon';
 import { CameraIcon } from '@/components/icons/CameraIcon';
 import { isAndroid } from '@/lib/platform';
-import { WarningIcon } from '@/components/icons/WarningIcon';
 import { modelAcceptsImages } from '@/lib/vision_models';
 
 // Pastes larger than this (chat-only mode) collapse into a document attachment.
@@ -21,10 +16,11 @@ const DEFAULT_PLACEHOLDER = 'Ask Kitty…';
 /** Message composer: Enter sends, Shift+Enter inserts a newline. While a reply
     streams, sending is blocked and a Stop button cancels the turn. In chat-only
     mode, large pastes collapse into an inlined document attachment. Typing
-    `/` at the start shows a recipe-command dropdown (Goose recipes,
-    client-side-interpreted — see `chatStore.ts`'s `sendWithRecipe`); accepting
-    one inserts `/slug ` and shows a guidance hint (above the composer) telling
-    the user what to type after the slug.
+    `/compact` is the one slash command left — a local action, not a message.
+    The recipe dropdown that used to live here went with the recipes feature:
+    delegation is chosen by the model from an ordinary request now (see
+    `bigtiny::specialists`), so there is no invocation syntax for the user to
+    discover.
 
     `concluded` (chatStore's `sessionConcluded`, see `loadSession`) locks the
     composer entirely — this session's provider profile was deleted since it
@@ -56,39 +52,9 @@ export function Composer({
   const providerSupportsVision = useChatStore((s) => s.providerSupportsVision);
   const providerAcceptsImages = useChatStore((s) => s.providerAcceptsImages);
   const canAttachImages = modelAcceptsImages(model, providerSupportsVision, providerAcceptsImages);
-  const sendWithRecipe = useChatStore((s) => s.sendWithRecipe);
   const compact = useChatStore((s) => s.compact);
   const stopPhase = useChatStore((s) => s.stopPhase);
   const forceStop = useChatStore((s) => s.forceStop);
-
-  const [recipes, setRecipes] = useState<Recipe[]>([]);
-  useEffect(() => {
-    const load = () =>
-      // Best-effort: a failure just leaves slash-command autocomplete stale
-      // until the next onRecipesChanged event or remount.
-      void ipc
-        .listRecipes()
-        .then(setRecipes)
-        .catch(() => {});
-    load();
-    const un = onRecipesChanged(load);
-    return () => void un.then((fn) => fn());
-  }, []);
-
-  const { open, matches, selectedIndex, setSelectedIndex, dismiss } = useRecipeAutocomplete(
-    text,
-    recipes
-  );
-  const { triggerRef, popoverRef, style } = usePopoverPosition(open, dismiss);
-
-  // A fully-matched `/slug` in the composer. Drives the guidance hint below —
-  // NOT the textarea placeholder: a placeholder only renders when the field is
-  // empty, but by the time a slug is matched the field always has `/slug …` in
-  // it, so a placeholder would never actually show. The dropdown covers the
-  // typing-the-slug phase; this hint covers the after-acceptance phase, where
-  // the user needs to know what to type after the slug.
-  const recipeMatch = matchRecipeCommand(text, recipes);
-  const recipeHint = recipeMatch ? primaryParameter(recipeMatch.recipe)?.description : undefined;
 
   const resetTextareaHeight = () => {
     if (resizeRaf.current) cancelAnimationFrame(resizeRaf.current);
@@ -122,15 +88,6 @@ export function Composer({
     []
   );
 
-  const acceptRecipe = (recipe: Recipe) => {
-    const next = `/${recipe.slug} `;
-    setText(next);
-    requestAnimationFrame(() => {
-      ref.current?.setSelectionRange(next.length, next.length);
-      ref.current?.focus();
-    });
-  };
-
   const submit = () => {
     const value = text.trim();
     if (!value) return;
@@ -148,12 +105,7 @@ export function Composer({
       resetTextareaHeight();
       return;
     }
-    const match = matchRecipeCommand(value, recipes);
-    if (match) {
-      void sendWithRecipe(match.recipe, match.primaryText);
-    } else {
-      onSend(value);
-    }
+    onSend(value);
     setText('');
     resetTextareaHeight();
   };
@@ -182,12 +134,6 @@ export function Composer({
 
   return (
     <div className="composer">
-      {recipeMatch && !open && (
-        <div className="composer-recipe-hint">
-          <strong>/{recipeMatch.recipe.slug}</strong>
-          {recipeHint ? ` — ${recipeHint}` : ` — ${recipeMatch.recipe.title}`}
-        </div>
-      )}
       <button
         className="composer-attach"
         onClick={() => void attachFiles()}
@@ -219,17 +165,7 @@ export function Composer({
       )}
       <textarea
         disabled={concluded}
-        ref={(el: HTMLTextAreaElement | null) => {
-          // Both `ref` (this component's own, for `setSelectionRange`/height
-          // adjustments) and `usePopoverPosition`'s `triggerRef` come back
-          // from `useRef` typed as read-only-looking `RefObject`s (matching
-          // how other callers just hand one straight to a `ref` prop, e.g.
-          // ProviderBadge) — this textarea needs both pointed at the same
-          // node, so both assignments are cast; it's a type-level formality,
-          // not a different underlying object.
-          (ref as React.MutableRefObject<HTMLTextAreaElement | null>).current = el;
-          (triggerRef as React.MutableRefObject<HTMLElement | null>).current = el;
-        }}
+        ref={ref}
         rows={1}
         autoFocus
         value={text}
@@ -241,32 +177,6 @@ export function Composer({
           scheduleResize();
         }}
         onKeyDown={(e) => {
-          if (open) {
-            if (e.key === 'ArrowDown') {
-              e.preventDefault();
-              setSelectedIndex((i) => (i + 1) % matches.length);
-              return;
-            }
-            if (e.key === 'ArrowUp') {
-              e.preventDefault();
-              setSelectedIndex((i) => (i - 1 + matches.length) % matches.length);
-              return;
-            }
-            if (e.key === 'Escape') {
-              e.preventDefault();
-              // Keep this Escape from bubbling to the overlay window's own
-              // keydown handler, which hides the whole overlay — dismissing
-              // just the dropdown must not take the window with it.
-              e.stopPropagation();
-              dismiss();
-              return;
-            }
-            if ((e.key === 'Enter' || e.key === 'Tab') && matches[selectedIndex]) {
-              e.preventDefault();
-              acceptRecipe(matches[selectedIndex]);
-              return;
-            }
-          }
           // Enter sends on desktop (Shift+Enter for a newline). On Android the
           // on-screen keyboard's Return key should start a new paragraph like
           // any other text field — there's no Shift chord on a touch keyboard —
@@ -285,26 +195,6 @@ export function Composer({
           }
         }}
       />
-      {open && (
-        <div ref={popoverRef} className="mode-popover recipe-popover" role="listbox" style={style}>
-          {matches.map((r, i) => (
-            <button
-              key={r.id}
-              role="option"
-              aria-selected={i === selectedIndex}
-              className={i === selectedIndex ? 'active' : ''}
-              onClick={() => acceptRecipe(r)}
-            >
-              <span className="recipe-option-title">
-                {recipeNeedsAttention(r).length > 0 && <WarningIcon />}/{r.slug} — {r.title}
-              </span>
-              {primaryParameter(r)?.description && (
-                <span className="recipe-option-hint muted">{primaryParameter(r)?.description}</span>
-              )}
-            </button>
-          ))}
-        </div>
-      )}
       {disabled ? (
         stopPhase === 'forceable' ? (
           <button

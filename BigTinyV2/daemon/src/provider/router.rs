@@ -11,6 +11,7 @@ use super::anthropic::AnthropicProvider;
 use super::base::{HealthStatus, Provider, SamplingParams};
 use super::openai_compat::OpenAICompatibleProvider;
 use super::sampling;
+use super::schema::{directive_for, ResponseSpec};
 use crate::config::{CacheConfig, ProviderConfig};
 use crate::error::ProviderError;
 use crate::network::TailscaleClient;
@@ -57,6 +58,12 @@ struct ProviderEntry {
     /// where. The `Provider` trait exposes neither, and widening it for
     /// one caller would be the larger change.
     dialect: String,
+    /// Delegate-host hints. `subagent_role` is the user's own statement; the
+    /// other two are folded by Kitty from its OpenRouter catalog and are
+    /// commonly `None`. See `agent::subagent_pick`.
+    subagent_role: Option<String>,
+    cost_tier: Option<String>,
+    capability_rank: Option<i32>,
     base_url: String,
 }
 
@@ -167,6 +174,8 @@ impl ProviderRouter {
             min_p: config.min_p,
             presence_penalty: config.presence_penalty,
             frequency_penalty: config.frequency_penalty,
+            // Not a provider setting — the agent loop sets it per run.
+            reasoning_max_tokens: None,
             max_tokens: config.max_tokens,
             // Effort is a per-turn request applied by the agent loop, never a
             // provider-config default — there's nothing to resolve here.
@@ -209,6 +218,9 @@ impl ProviderRouter {
         };
         let dialect = config.provider_type.clone();
         let base_url = config.base_url.clone();
+        let subagent_role = config.subagent_role.clone();
+        let cost_tier = config.cost_tier.clone();
+        let capability_rank = config.capability_rank;
         let p: Arc<dyn Provider> = Arc::new(OpenAICompatibleProvider::new(
             provider_id,
             config,
@@ -233,6 +245,9 @@ impl ProviderRouter {
                 slots_source,
                 dialect,
                 base_url,
+                subagent_role,
+                cost_tier,
+                capability_rank,
             },
         );
     }
@@ -259,6 +274,9 @@ impl ProviderRouter {
         };
         let dialect = config.provider_type.clone();
         let base_url = config.base_url.clone();
+        let subagent_role = config.subagent_role.clone();
+        let cost_tier = config.cost_tier.clone();
+        let capability_rank = config.capability_rank;
         let p: Arc<dyn Provider> = Arc::new(AnthropicProvider::new(
             provider_id,
             config,
@@ -284,6 +302,9 @@ impl ProviderRouter {
                 slots_source,
                 dialect,
                 base_url,
+                subagent_role,
+                cost_tier,
+                capability_rank,
             },
         );
     }
@@ -351,6 +372,22 @@ impl ProviderRouter {
                 .get("parallel_slots")
                 .and_then(|v| v.as_u64())
                 .map(|v| v as u32),
+            // Read out of the same unconstrained blob as `parallel_slots` and
+            // `provider_dialect`: these are Kitty's to write, and a daemon used
+            // without it simply gets `None` and falls back to the native
+            // signals, which carry every important part of the decision anyway.
+            subagent_role: config_json
+                .get("subagent_role")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            cost_tier: config_json
+                .get("cost_tier")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            capability_rank: config_json
+                .get("capability_rank")
+                .and_then(|v| v.as_i64())
+                .map(|v| v as i32),
             temperature: config_json.get("temperature").and_then(|v| v.as_f64()),
             top_p: config_json.get("top_p").and_then(|v| v.as_f64()),
             top_k: config_json
@@ -864,6 +901,10 @@ impl ProviderRouter {
     /// through here -- the tool loop, its retry/failover attempts, and the
     /// three fire-and-forget turn-end tasks -- so the queue is enforced in one
     /// place rather than relying on each of them to remember.
+    ///
+    /// `response` is the caller's *intent* for the final answer. Mapping it to
+    /// a wire shape happens here because this is the only layer that knows
+    /// which dialect `provider_id` speaks — see `provider::schema`.
     #[allow(clippy::too_many_arguments)]
     pub async fn chat_completion(
         &self,
@@ -875,19 +916,25 @@ impl ProviderRouter {
         id_slot: Option<i32>,
         app_id: &str,
         priority: Priority,
+        response: &ResponseSpec,
     ) -> Result<Pin<Box<dyn Stream<Item = Delta> + Send>>, ProviderError> {
         // Clone the provider's Arc out, drop the DashMap guard, then await —
         // a chat completion can run for minutes and must never hold the shard
         // lock (which would block health checks and other completions).
-        let (provider, concurrency) = {
+        let (provider, concurrency, dialect) = {
             let entry =
                 self.providers
                     .get(provider_id)
                     .ok_or_else(|| ProviderError::NoHealthyProvider {
                         user_message: format!("Provider '{}' not found", provider_id),
                     })?;
-            (entry.provider.clone(), entry.concurrency)
+            (
+                entry.provider.clone(),
+                entry.concurrency,
+                entry.dialect.clone(),
+            )
         };
+        let directive = directive_for(&dialect, &response.mode, response.schema.as_ref());
 
         // Wait for a slot before sending anything. Every caller funnels
         // through here — the tool loop, its retry/failover attempts, and the
@@ -902,12 +949,51 @@ impl ProviderRouter {
         // process. One place, both dialects -- see `provider::wire`.
         let outgoing = super::wire::sanitize_for_wire(messages);
         let inner = provider
-            .chat_completion(&outgoing, tools, sampling, model, id_slot)
+            .chat_completion(&outgoing, tools, sampling, model, id_slot, directive)
             .await?;
         Ok(Box::pin(PermitStream {
             inner,
             _permit: permit,
         }))
+    }
+
+    /// Every provider that could host a delegate for `app_id`, as the pure
+    /// picker wants them.
+    ///
+    /// A copy-out rather than exposing `ProviderEntry`: the policy in
+    /// `agent::subagent_pick` is a security decision as much as a preference,
+    /// and it is worth being unit-testable without a router, a database or a
+    /// clock.
+    pub fn subagent_candidates(
+        &self,
+        app_id: &str,
+        parent_provider_id: Option<&str>,
+    ) -> Vec<crate::agent::subagent_pick::Candidate> {
+        self.providers
+            .iter()
+            .filter(|e| match &e.app_id {
+                None => true,
+                Some(owner) => owner == app_id,
+            })
+            .map(|e| crate::agent::subagent_pick::Candidate {
+                provider_id: e.key().clone(),
+                model: e.provider.resolve_model(None),
+                dialect: e.dialect.clone(),
+                // `disconnected` (never probed) counts as usable for the same
+                // reason `resolve_provider_for_app` allows it: the first turn
+                // after startup happens before any health probe has run.
+                healthy: e.health.status != "unhealthy",
+                supports_tools: e.provider.supports_tools(),
+                concurrency: e.concurrency,
+                concurrency_is_guess: e.slots_source == super::slots::SlotsSource::Default,
+                context_length: e.context_length,
+                subagent_role: e.subagent_role.clone(),
+                cost_tier: e.cost_tier.clone(),
+                capability_rank: e.capability_rank,
+                fallback_priority: e.fallback_priority,
+                is_parent_provider: parent_provider_id == Some(e.key().as_str()),
+            })
+            .collect()
     }
 
     /// Get the provider ID to use, preferring healthy ones.

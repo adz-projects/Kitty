@@ -35,6 +35,15 @@ const RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(300);
 /// effectively global.
 pub struct MCPManager {
     pool: SqlitePool,
+    /// Handle to the delegated-run orchestrator, needed only to construct the
+    /// `specialists` in-process server (`builtin::connect`).
+    ///
+    /// A `OnceLock` set after construction rather than a constructor argument,
+    /// because the orchestrator needs the `Agent` and the `Agent` needs this
+    /// manager — somebody has to be filled in second. `None` until then, and on
+    /// every host that never registers the server, in which case
+    /// `builtin::connect` refuses cleanly rather than half-connecting.
+    orchestrator: std::sync::OnceLock<Arc<crate::agent::orchestrator::Orchestrator>>,
     /// Daemon data dir, used only to derive each app's `KITTY_PLUGIN_HOME`.
     /// Empty in tests and on hosts that never spawn stdio children.
     data_dir: std::path::PathBuf,
@@ -99,6 +108,7 @@ impl MCPManager {
         Self {
             pool,
             pathway,
+            orchestrator: std::sync::OnceLock::new(),
             data_dir,
             servers: DashMap::new(),
             tool_registry: DashMap::new(),
@@ -108,6 +118,15 @@ impl MCPManager {
             reconnect_failures: DashMap::new(),
             reconnect_after: DashMap::new(),
         }
+    }
+
+    /// Supply the orchestrator the `specialists` built-in needs. Idempotent;
+    /// a second call is ignored.
+    pub fn attach_orchestrator(
+        &self,
+        orchestrator: Arc<crate::agent::orchestrator::Orchestrator>,
+    ) {
+        let _ = self.orchestrator.set(orchestrator);
     }
 
     pub async fn connect_server(&self, server_id: &str) -> Result<(), MCPServerError> {
@@ -154,7 +173,13 @@ impl MCPManager {
             let name = config.command.clone().unwrap_or_default();
             tokio::time::timeout(
                 CONNECT_TIMEOUT,
-                super::builtin::connect(&name, server_id.to_string(), self.pathway.clone()),
+                super::builtin::connect(
+                    &name,
+                    server_id.to_string(),
+                    self.pathway.clone(),
+                    self.orchestrator.get().cloned(),
+                    self.pool.clone(),
+                ),
             )
             .await
         } else {

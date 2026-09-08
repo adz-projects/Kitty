@@ -59,7 +59,7 @@ lib.rs (app setup, window creation, generate_handler! list)
   │                     bundled_plugin_path(), models_dir()
   │     providers/     provider profiles: network tier, keyring, endpoint
   │                     scheme probing, connection test
-  │     recipes.rs, recipe_yaml.rs, scheduled_tasks.rs
+  │     scheduled_tasks.rs
   │
   ├─► models/                                 GGUF acquisition (no AppHandle —
   │     download.rs  resumable HuggingFace fetch: .part + sha256 + atomic rename
@@ -70,7 +70,7 @@ lib.rs (app setup, window creation, generate_handler! list)
   ├─► commands/                               #[tauri::command] handlers —
   │     session/       new/send/cancel/load/fork/delete, mode, thinking effort
   │     provider.rs, adaptive_pathway.rs, memory.rs, mcp_servers.rs,
-  │     recipes.rs, scheduled_tasks.rs, folders.rs, models.rs, file.rs,
+  │     specialists.rs, scheduled_tasks.rs, folders.rs, models.rs, file.rs,
   │     screenshot.rs, window.rs, setup.rs, config.rs, logs.rs
   │     (thin wrappers over the modules above — no business logic of their own)
   │
@@ -164,7 +164,7 @@ windows/{hub,overlay,screenshot-select}/App.tsx  one entry point per window labe
         types.ts      TS mirrors of Rust structs (kept in sync by hand)
         platform.ts   isAndroid() + the `data-platform` attribute CSS keys off
         viewport.ts   pins the app box to the visual viewport (soft keyboard)
-        recipes.ts, chatml.ts, provider_trust.tsx, system_prompts.ts, ...
+        chatml.ts, provider_trust.tsx, system_prompts.ts, ...
 ```
 
 `lib/ipc.ts` is the chokepoint CLAUDE.md's "webview never fetches localhost

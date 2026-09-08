@@ -10,13 +10,17 @@ pub struct ScheduleRow {
     pub id: String,
     pub name: String,
     pub cron: String,
-    pub recipe_id: String,
-    pub parameters: Option<String>,
+    /// The prompt a cron firing sends as an ordinary turn.
+    ///
+    /// Replaced `recipe_id`/`parameters` when recipes became specialists: a
+    /// scheduled run is now a plain turn whose model may itself delegate, so
+    /// the scheduler no longer needs a concept of a pre-rendered task.
+    pub prompt: String,
     pub enabled: i32,
     pub created_at: Option<DateTime<Utc>>,
     pub updated_at: Option<DateTime<Utc>>,
-    /// Owning app. `NOT NULL`, like recipes: a schedule runs one app's
-    /// recipe on that app's behalf.
+    /// Owning app. `NOT NULL`: a schedule runs a turn on one app's behalf,
+    /// against its provider and its billing account.
     pub app_id: String,
 }
 
@@ -26,7 +30,7 @@ pub async fn list_schedules_for_app(
     pool: &SqlitePool,
     app_id: &str,
 ) -> Result<Vec<ScheduleRow>, StorageError> {
-    let sql = format!("SELECT id, name, cron, recipe_id, parameters, enabled, created_at, updated_at, app_id FROM schedule_jobs WHERE app_id = ? ORDER BY name");
+    let sql = format!("SELECT id, name, cron, prompt, enabled, created_at, updated_at, app_id FROM schedule_jobs WHERE app_id = ? ORDER BY name");
     let rows = sqlx::query_as::<_, ScheduleRow>(&sql)
         .bind(app_id)
         .fetch_all(pool)
@@ -40,7 +44,7 @@ pub async fn get_schedule_for_app(
     schedule_id: &str,
     app_id: &str,
 ) -> Result<Option<ScheduleRow>, StorageError> {
-    let sql = format!("SELECT id, name, cron, recipe_id, parameters, enabled, created_at, updated_at, app_id FROM schedule_jobs WHERE id = ? AND app_id = ?");
+    let sql = format!("SELECT id, name, cron, prompt, enabled, created_at, updated_at, app_id FROM schedule_jobs WHERE id = ? AND app_id = ?");
     let row = sqlx::query_as::<_, ScheduleRow>(&sql)
         .bind(schedule_id)
         .bind(app_id)
@@ -65,7 +69,7 @@ pub async fn delete_schedule_for_app(
 
 pub async fn list_schedules(pool: &SqlitePool) -> Result<Vec<ScheduleRow>, StorageError> {
     let rows = sqlx::query_as::<_, ScheduleRow>(
-        r#"SELECT id, name, cron, recipe_id, parameters, enabled, created_at, updated_at, app_id
+        r#"SELECT id, name, cron, prompt, enabled, created_at, updated_at, app_id
            FROM schedule_jobs ORDER BY name ASC"#,
     )
     .fetch_all(pool)
@@ -78,7 +82,7 @@ pub async fn get_schedule(
     schedule_id: &str,
 ) -> Result<Option<ScheduleRow>, StorageError> {
     let row = sqlx::query_as::<_, ScheduleRow>(
-        r#"SELECT id, name, cron, recipe_id, parameters, enabled, created_at, updated_at, app_id
+        r#"SELECT id, name, cron, prompt, enabled, created_at, updated_at, app_id
            FROM schedule_jobs WHERE id = ?"#,
     )
     .bind(schedule_id)
@@ -92,18 +96,18 @@ pub async fn create_schedule(
     id: &str,
     name: &str,
     cron: &str,
-    recipe_id: &str,
+    prompt: &str,
     enabled: i32,
     app_id: &str,
 ) -> Result<(), StorageError> {
     sqlx::query(
-        r#"INSERT INTO schedule_jobs (id, name, cron, recipe_id, enabled, app_id)
+        r#"INSERT INTO schedule_jobs (id, name, cron, prompt, enabled, app_id)
            VALUES (?, ?, ?, ?, ?, ?)"#,
     )
     .bind(id)
     .bind(name)
     .bind(cron)
-    .bind(recipe_id)
+    .bind(prompt)
     .bind(enabled)
     .bind(app_id)
     .execute(pool)

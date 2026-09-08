@@ -16,12 +16,12 @@ mod mcp_servers;
 mod memory;
 mod models;
 mod provider;
-mod recipes;
 mod scheduled_tasks;
 // Win32 GDI desktop capture — see `crate::screenshot` (docs/ANDROID.md §2.5).
 #[cfg(windows)]
 mod screenshot;
 mod session;
+mod specialists;
 mod setup;
 mod window;
 
@@ -34,10 +34,10 @@ pub use mcp_servers::*;
 pub use memory::*;
 pub use models::*;
 pub use provider::*;
-pub use recipes::*;
 pub use scheduled_tasks::*;
 #[cfg(windows)]
 pub use screenshot::*;
 pub use session::*;
+pub use specialists::*;
 pub use setup::*;
 pub use window::*;

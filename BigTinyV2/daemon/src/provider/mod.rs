@@ -13,5 +13,6 @@ pub mod tag_split;
 
 pub use base::classify_provider_error;
 pub use base::{Delta, Provider, ToolCall, ToolCallChunk};
+pub use schema::{ResponseMode, ResponseSpec, SchemaDirective};
 // Re-export shared types from models
 pub use crate::models::provider::{HealthStatus, ModelInfo, ProviderConfig, ProviderType};

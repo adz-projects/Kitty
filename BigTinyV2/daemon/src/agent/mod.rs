@@ -3,8 +3,10 @@ pub mod context;
 pub(crate) mod json_extract;
 pub mod loop_;
 pub mod memory;
+pub mod orchestrator;
 pub mod reasoning_models;
 pub mod sandbox;
+pub mod subagent_pick;
 pub mod summarizer_chain;
 pub mod tokens;
 pub mod types;
@@ -320,6 +322,8 @@ impl Agent {
                             tx,
                             provider_override.as_deref(),
                             images,
+                            // A user is watching this one.
+                            crate::provider::queue::Priority::Interactive,
                         )
                         .await;
                     drop(turn_done);
@@ -340,13 +344,20 @@ impl Agent {
     /// Returns the turn's outcome, derived from the terminal frame: a
     /// terminal `Error` event is `Err(message)`, anything else (the
     /// `SessionStatus "idle"` success frame, or the channel closing without
-    /// a terminal frame) is `Ok(())`. Without this the scheduler recorded
+    /// a terminal frame) is `Ok(notices)`. Without this the scheduler recorded
     /// provider-failed runs as `'completed'` in `execution_history`.
+    ///
+    /// `notices` carries the mid-run frames a caller needs but nobody was
+    /// receiving. This watcher is the *only* consumer of a detached turn's
+    /// events, so anything it drops is gone: a `ModelFailover` telling the user
+    /// their pinned provider vanished reached exactly nobody, which is how a
+    /// specialist could silently run somewhere other than where it said.
     pub async fn run_turn_and_wait(
         self: &Arc<Self>,
         session_id: &str,
         user_message: &str,
-    ) -> Result<(), String> {
+        priority: crate::provider::queue::Priority,
+    ) -> Result<Vec<String>, String> {
         let (tx, mut rx) = mpsc::unbounded_channel::<SSEEvent>();
         // The `tasks` entry keeps a sender so `cancel` can emit a terminal
         // frame to this turn's watcher, exactly as it does for `/send`.
@@ -355,7 +366,22 @@ impl Agent {
         // `LlmStop` mid-turn carries the default `false`.
         let watcher = tokio::spawn(async move {
             let mut failure: Option<String> = None;
+            let mut notices: Vec<String> = Vec::new();
             while let Some(ev) = rx.recv().await {
+                // Frames a caller has to know about even when the turn
+                // succeeds. Collected rather than logged, because the caller is
+                // usually the orchestrator and its own caller is a model that
+                // can only be told things in its tool result.
+                if matches!(
+                    ev.event_type,
+                    SSEEventType::ModelFailover | SSEEventType::ProviderError
+                ) {
+                    if let Some(text) = ev.content.clone().or_else(|| ev.error_message.clone()) {
+                        if !notices.contains(&text) {
+                            notices.push(text);
+                        }
+                    }
+                }
                 if ev.is_last {
                     // `ProviderError` as well as `Error`: the classified
                     // failures (context exceeded, bad key, exhausted billing)
@@ -377,7 +403,7 @@ impl Agent {
                     break;
                 }
             }
-            failure
+            (failure, notices)
         });
         // Reserve the same per-session slot an interactive `/send` takes.
         //
@@ -410,7 +436,7 @@ impl Agent {
                         turn_token,
                     };
                     let mut agent_loop = this.build_loop();
-                    agent_loop.run(&sid, &msg, tx, None, None).await;
+                    agent_loop.run(&sid, &msg, tx, None, None, priority).await;
                 });
                 // Both `tx` clones are now owned by the spawned task and the
                 // map entry, so the watcher's channel closes when the turn
@@ -423,8 +449,9 @@ impl Agent {
         // one `cancel` emits before aborting -- so waiting on it covers both
         // normal completion and cancellation without polling.
         match watcher.await {
-            Ok(Some(msg)) => Err(msg),
-            _ => Ok(()),
+            Ok((Some(msg), _)) => Err(msg),
+            Ok((None, notices)) => Ok(notices),
+            Err(_) => Ok(Vec::new()),
         }
     }
 
@@ -449,6 +476,47 @@ impl Agent {
             Self::emit_cancelled(&tx, session_id);
             handle.abort();
             self.cleanup_after_abort(session_id).await;
+        }
+        self.cancel_delegates_of(session_id).await;
+    }
+
+    /// Stop every delegate this session started.
+    ///
+    /// A parent's turn is what a delegate exists to answer, so a cancelled
+    /// parent leaves its children with nobody to return to — and without this
+    /// they would keep running to completion, spending on an answer no one
+    /// will read. Cancelling the parent has to mean cancelling the work it
+    /// caused.
+    ///
+    /// Not recursive: `Orchestrator::DEPTH_LIMIT` is 1, so a delegate has no
+    /// delegates of its own to find.
+    async fn cancel_delegates_of(&self, session_id: &str) {
+        let Ok(Some(app_id)) = sessions::owner_of(&self.db, session_id).await else {
+            return;
+        };
+        let Ok(children) = sessions::children_of(&self.db, session_id, &app_id).await else {
+            return;
+        };
+        for child in children {
+            if let Some((_, (_, handle, tx))) = self.tasks.remove(&child) {
+                tracing::info!(parent = session_id, child = %child, "cancelling delegate");
+                Self::emit_cancelled(&tx, &child);
+                handle.abort();
+                self.cleanup_after_abort(&child).await;
+            }
+        }
+    }
+
+    /// Push one event into a session's live stream, if it has one.
+    ///
+    /// The `tasks` entry keeps the turn's sender precisely so out-of-band
+    /// frames (`cancel`'s terminal status, a delegate's progress) can reach a
+    /// watching client. A session with no in-flight turn, or a detached one
+    /// whose receiver was discarded, simply drops the event — every caller here
+    /// is reporting, not requesting.
+    pub fn emit_to(&self, session_id: &str, event: SSEEvent) {
+        if let Some(entry) = self.tasks.get(session_id) {
+            let _ = entry.value().2.send(event);
         }
     }
 

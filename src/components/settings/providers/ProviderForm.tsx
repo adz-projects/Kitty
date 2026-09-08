@@ -153,8 +153,8 @@ export function ProviderForm({
             <small className="muted">
               This is a Tailscale address, so one URL works both at home and away: BigTiny
               automatically tries a direct LAN connection first when you&rsquo;re on the same
-              network as the server, and falls back to routing over Tailscale otherwise — no need
-              to switch URLs manually.
+              network as the server, and falls back to routing over Tailscale otherwise — no need to
+              switch URLs manually.
             </small>
           )}
         </label>
@@ -241,6 +241,26 @@ export function ProviderForm({
           </span>
         </label>
       )}
+
+      {/* Specialists run on whichever provider the daemon judges best — this is
+          the one input to that decision that reflects what you want rather than
+          what it can measure, so it sits with trust rather than under Advanced.
+          A delegate is triage work: pointing it at a cheap, parallel endpoint is
+          usually the right answer, and "never" keeps it off an expensive one
+          entirely. */}
+      <div className="field">
+        <span>Use for specialists</span>
+        <select
+          value={profile.subagent_role ?? 'allowed'}
+          onChange={(e) =>
+            set({ subagent_role: e.target.value === 'allowed' ? null : e.target.value })
+          }
+        >
+          <option value="allowed">If it is the best available</option>
+          <option value="preferred">Prefer this one</option>
+          <option value="never">Never</option>
+        </select>
+      </div>
 
       <button
         type="button"

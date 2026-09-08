@@ -51,6 +51,24 @@ fn normalize_scheme(base_url: &str) -> String {
 pub const LOCAL_PROVIDER_ID: &str = "local";
 
 /// The id the daemon's provider registry knows this profile by — which is the
+/// This profile's model in the OpenRouter catalog, if it can be matched.
+///
+/// Best-effort and quiet: most self-hosted profiles run a fine-tune the catalog
+/// has never heard of, and that is the ordinary case rather than a failure. The
+/// catalog is refreshed opportunistically here because this runs on a provider
+/// write, which is exactly when its cost and capability figures are wanted.
+async fn catalog_entry_for(
+    app: &AppHandle,
+    profile: &ProviderProfile,
+) -> Option<crate::openrouter::catalog::OpenRouterCatalogEntry> {
+    let model = profile.models.first()?;
+    let state = app.state::<AppState>();
+    crate::openrouter::catalog::ensure_catalog_fresh(&state).await;
+    let guard = state.openrouter_catalog.lock().ok()?;
+    let catalog = guard.as_ref()?;
+    crate::openrouter::catalog::match_in_catalog(model, &catalog.entries).cloned()
+}
+
 /// Kitty profile id for everything except the in-process engine.
 ///
 /// This distinction is what a session's `metadata.provider` stamp has to
@@ -133,6 +151,37 @@ pub async fn sync_active_provider(app: &AppHandle) -> Result<Option<String>, Str
     }
     if let Some(c) = profile.context_length {
         config["context_length"] = json!(c);
+    }
+    // Delegate-host hints. `subagent_role` is the user's own setting; the other
+    // two are folded from the OpenRouter catalog here rather than in the daemon,
+    // because the catalog lives in this process and the daemon serves apps other
+    // than Kitty — it must not acquire a dependency it cannot refresh.
+    //
+    // All three are optional and commonly absent for a self-hosted profile that
+    // the catalog cannot match. That is the ordinary case: the daemon's native
+    // signals (tool support, concurrency, KV-slot sharing, health, context
+    // length) carry every important part of the decision without them.
+    if let Some(role) = profile.subagent_role.as_deref().filter(|r| !r.is_empty()) {
+        config["subagent_role"] = Value::String(role.to_string());
+    }
+    if let Some(entry) = catalog_entry_for(app, &profile).await {
+        if let Some(tier) = entry.cost_tier {
+            config["cost_tier"] = json!(match tier {
+                crate::openrouter::catalog::CostTier::Economy => "economy",
+                crate::openrouter::catalog::CostTier::Moderate => "moderate",
+                crate::openrouter::catalog::CostTier::Premium => "premium",
+            });
+        }
+        // One number out of three indices: a delegate's work is agentic
+        // tool-driving, so that index leads, with coding and general
+        // intelligence as fallbacks when a model has not been measured on it.
+        if let Some(rank) = entry
+            .agentic_index
+            .or(entry.coding_index)
+            .or(entry.intelligence_index)
+        {
+            config["capability_rank"] = json!(rank.clamp(0.0, 100.0) as i32);
+        }
     }
     if let Some(n) = profile.parallel_slots {
         config["parallel_slots"] = json!(n);
@@ -311,6 +360,7 @@ mod tests {
             id: "p1".into(),
             name: "Test".into(),
             provider_type: provider_type.into(),
+            subagent_role: None,
             base_url: base_url.into(),
             models: vec![],
             is_trusted: true,

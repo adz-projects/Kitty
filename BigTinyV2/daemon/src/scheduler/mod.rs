@@ -1,12 +1,11 @@
 use std::sync::Arc;
 
 use dashmap::DashMap;
-use serde_json::{json, Value};
 use sqlx::SqlitePool;
 use tokio_cron_scheduler::{Job, JobScheduler};
 
 use crate::error::SchedulerError;
-use crate::recipes::engine::RecipeEngine;
+use crate::agent::Agent;
 use crate::storage::execution;
 use crate::storage::schedules::{self, ScheduleRow};
 use crate::storage::sessions;
@@ -24,7 +23,11 @@ use crate::storage::sessions;
 /// `to_seconds_cron` prepends a `0` seconds field before handing it off.
 pub struct Scheduler {
     db: SqlitePool,
-    engine: Arc<RecipeEngine>,
+    /// A cron firing is an ordinary turn now, so the scheduler drives the agent
+    /// directly rather than going through a recipe engine that no longer
+    /// exists. Whether the work wants a specialist is the model's decision, made
+    /// per firing, exactly as it would be in a chat.
+    agent: Arc<Agent>,
     inner: JobScheduler,
     /// Maps our `schedule_jobs.id` to `tokio-cron-scheduler`'s own internal
     /// job `Uuid` (returned by `inner.add`, otherwise discarded) — needed so
@@ -82,13 +85,13 @@ fn to_seconds_cron(cron: &str) -> String {
 }
 
 impl Scheduler {
-    pub async fn new(db: SqlitePool, engine: Arc<RecipeEngine>) -> Result<Self, SchedulerError> {
+    pub async fn new(db: SqlitePool, agent: Arc<Agent>) -> Result<Self, SchedulerError> {
         let inner = JobScheduler::new()
             .await
             .map_err(|e| SchedulerError::Cron(e.to_string()))?;
         Ok(Self {
             db,
-            engine,
+            agent,
             inner,
             job_uuids: DashMap::new(),
         })
@@ -119,15 +122,15 @@ impl Scheduler {
     async fn register_cron_job(&mut self, job_id: &str, cron: &str) -> Result<(), SchedulerError> {
         let cron_expr = to_seconds_cron(cron);
         let db = self.db.clone();
-        let engine = self.engine.clone();
+        let agent = self.agent.clone();
         let job_id_owned = job_id.to_string();
 
         let job = Job::new_async(cron_expr.as_str(), move |_uuid, _lock| {
             let db = db.clone();
-            let engine = engine.clone();
+            let agent = agent.clone();
             let job_id = job_id_owned.clone();
             Box::pin(async move {
-                execute_job(&db, &engine, &job_id).await;
+                execute_job(&db, &agent, &job_id).await;
             })
         })
         .map_err(|e| SchedulerError::Cron(e.to_string()))?;
@@ -249,7 +252,7 @@ impl Scheduler {
         &mut self,
         name: &str,
         cron: &str,
-        recipe_id: &str,
+        prompt: &str,
         enabled: bool,
         app_id: &str,
     ) -> Result<String, SchedulerError> {
@@ -279,7 +282,7 @@ impl Scheduler {
             &id,
             name,
             cron,
-            recipe_id,
+            prompt,
             enabled as i32,
             app_id,
         )
@@ -294,8 +297,8 @@ impl Scheduler {
     }
 
     /// Execute one scheduled job: temp session + `execution_history`
-    /// bookkeeping, then the recipe run, using this scheduler's own DB +
-    /// engine handles. Returns `false` (not an error) when the job is
+    /// bookkeeping, then the turn, using this scheduler's own DB + agent
+    /// handles. Returns `false` (not an error) when the job is
     /// genuinely missing, so a caller can distinguish 404 from a real
     /// storage failure (500). Used by `tests/scheduler_and_recipes.rs`.
     pub async fn run_job(&self, job_id: &str) -> Result<bool, SchedulerError> {
@@ -305,7 +308,7 @@ impl Scheduler {
         let Some(job) = job else {
             return Ok(false);
         };
-        execute_job(&self.db, &self.engine, &job.id).await;
+        execute_job(&self.db, &self.agent, &job.id).await;
         Ok(true)
     }
 
@@ -327,15 +330,18 @@ impl Scheduler {
 }
 
 /// Execute one scheduled job: temp session + `execution_history` bookkeeping,
-/// then the recipe run. `pub(crate)` so the `run_now` route can execute a job
-/// using its own `db`/`recipe_engine` handles WITHOUT holding the scheduler
-/// mutex — running a multi-minute recipe turn while holding it serialized
-/// every other `POST/PATCH/DELETE /api/schedules*` call behind the one job.
-/// Ported exactly from Python's `_execute_job`,
-/// including the asymmetry between the success and failure paths — see the
-/// comment below for why the failure path can't just delete the temp
-/// session the way the success path does.
-pub(crate) async fn execute_job(db: &SqlitePool, engine: &RecipeEngine, job_id: &str) {
+/// then the turn. `pub(crate)` so the `run_now` route can execute a job using
+/// its own `db`/`agent` handles WITHOUT holding the scheduler mutex — running
+/// a multi-minute turn while holding it serialized every other
+/// `POST/PATCH/DELETE /api/schedules*` call behind the one job.
+///
+/// The session is no longer a throwaway. A recipe run produced its output in a
+/// session of its own, and this one existed only to anchor the audit row, so it
+/// was deleted afterwards. Now the turn runs *here*, and this session is the
+/// output: it is kept on both paths — a failed run's transcript is the only
+/// record of why it failed — and ages out through the same retention sweep as
+/// any other session.
+pub(crate) async fn execute_job(db: &SqlitePool, agent: &Arc<Agent>, job_id: &str) {
     // Held for the whole execution; dropped on every return path below.
     let Some(_in_flight) = InFlightGuard::claim(job_id) else {
         tracing::warn!("scheduled job {job_id}: previous run still in flight; skipping this tick");
@@ -361,13 +367,14 @@ pub(crate) async fn execute_job(db: &SqlitePool, engine: &RecipeEngine, job_id: 
     }
 
     let exec_id = uuid::Uuid::new_v4().simple().to_string();
-    let temp_sid = format!("_job_{exec_id}");
-    // Owned by the app that owns the schedule -- see the recipe engine's
-    // session insert for why an ownerless session is worse than useless.
+    let session_id = format!("job_{exec_id}");
+    // Owned by the app that owns the schedule: an ownerless session is
+    // unreachable by every scoped accessor in `storage::sessions`, so the run
+    // would produce a transcript nobody could read.
     if let Err(e) = sessions::create_session_for_app(
         db,
-        &temp_sid,
-        &format!("scheduled:{job_id}"),
+        &session_id,
+        &format!("scheduled: {}", job.name),
         &job.app_id,
     )
     .await
@@ -378,75 +385,56 @@ pub(crate) async fn execute_job(db: &SqlitePool, engine: &RecipeEngine, job_id: 
         tracing::error!("scheduled job {job_id}: failed to create temp session: {e}");
         return;
     }
-    let _ = sessions::update_session_status(db, &temp_sid, "idle").await;
+    let _ = sessions::update_session_status(db, &session_id, "idle").await;
     if let Err(e) =
-        execution::insert_execution(db, &exec_id, &temp_sid, "schedule", Some(job_id)).await
+        execution::insert_execution(db, &exec_id, &session_id, "schedule", Some(job_id)).await
     {
         tracing::error!("scheduled job {job_id}: failed to insert execution row: {e}");
-        let _ = sessions::delete_session(db, &temp_sid).await;
+        let _ = sessions::delete_session(db, &session_id).await;
         return;
     }
 
-    let parameters: Value = job
-        .parameters
-        .as_deref()
-        .and_then(|s| serde_json::from_str(s).ok())
-        .unwrap_or_else(|| json!({}));
-
-    match engine.execute(&job.recipe_id, parameters).await {
-        Ok(session_id) => {
+    // Background priority: a scheduled run must never put a user's own message
+    // behind it.
+    match agent
+        .run_turn_and_wait(
+            &session_id,
+            &job.prompt,
+            crate::provider::queue::Priority::Background,
+        )
+        .await
+    {
+        Ok(_notices) => {
             if let Err(e) = sqlx::query(
-                "UPDATE execution_history SET status = 'completed', session_id = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?",
+                "UPDATE execution_history SET status = 'completed', completed_at = CURRENT_TIMESTAMP WHERE id = ?",
             )
-            .bind(&session_id)
             .bind(&exec_id)
             .execute(db)
             .await
             {
-                // A failed completion-update leaves the execution_history row
-                // `running` forever — previously silent. Still clean up the
-                // temp session (removing it is safe: it isn't referenced by
-                // any history row that matters now), but tell the operator.
+                // A failed completion-update leaves the row `running` forever,
+                // which used to happen silently.
                 tracing::error!(
                     "scheduled job {job_id}: failed to mark execution {exec_id} completed: {e}"
                 );
             }
-            let _ = sessions::delete_session(db, &temp_sid).await;
         }
-        Err(e) => {
-            tracing::error!("Scheduled job {job_id} failed: {e}");
-            // Record the failure on the execution row (audit trail) rather
-            // than deleting it: with `run_turn_and_wait` now propagating the
-            // turn outcome, this arm also fires for provider-failed turns,
-            // and those must be visible as `failed` — previously every such
-            // run was misrecorded as `completed`.
-            //
-            // `session_id` is nulled in the same statement (migration 016
-            // made the column nullable) so the row stops anchoring the
-            // throwaway `_job_` session. Before that, the failure path had no
-            // choice but to keep it, and every failed run leaked a session
-            // plus its whole message batch forever.
-            if let Err(e2) = sqlx::query(
-                "UPDATE execution_history SET status = 'failed', session_id = NULL, error_message = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?",
+        Err(msg) => {
+            tracing::error!("Scheduled job {job_id} failed: {msg}");
+            // Recorded rather than deleted. `run_turn_and_wait` propagates the
+            // turn's outcome, so this arm also fires for provider-failed turns,
+            // and those must be visible as `failed` — every such run used to be
+            // misrecorded as `completed`.
+            if let Err(e) = sqlx::query(
+                "UPDATE execution_history SET status = 'failed', error_message = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?",
             )
-            .bind(e.to_string())
+            .bind(&msg)
             .bind(&exec_id)
             .execute(db)
             .await
             {
                 tracing::error!(
-                    "scheduled job {job_id}: failed to mark execution {exec_id} failed: {e2}"
-                );
-                // The row still points at the temp session, so deleting it
-                // would violate the FK. Leave both; the retention sweep in
-                // `storage` prunes the pair once the row ages out.
-                return;
-            }
-            // Messages cascade with the session (`messages.session_id` is
-            // ON DELETE CASCADE).
-            if let Err(e2) = sessions::delete_session(db, &temp_sid).await {
-                tracing::warn!(
-                    "scheduled job {job_id}: failed to delete temp session {temp_sid}: {e2}"
+                    "scheduled job {job_id}: failed to mark execution {exec_id} failed: {e}"
                 );
             }
         }

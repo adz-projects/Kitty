@@ -47,6 +47,14 @@ pub struct ProviderProfile {
     /// this makes a non-loopback provider trusted (globe) instead of untrusted (⚠).
     #[serde(default)]
     pub is_trusted: bool,
+    /// Whether this provider may host specialist runs: `"preferred"`,
+    /// `"allowed"` (the default when absent) or `"never"`.
+    ///
+    /// The user's own statement, and the first thing the daemon's host picker
+    /// consults — the only signal it has that reflects intent rather than
+    /// measurement. Pushed down in the provider's `config` blob.
+    #[serde(default)]
+    pub subagent_role: Option<String>,
     /// Per-provider sampling params (Round-2 item 27). `None` = provider/model
     /// default (BigTiny omits the field from the completion request entirely
     /// rather than sending an explicit default — see

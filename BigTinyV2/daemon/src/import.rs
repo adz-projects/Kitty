@@ -1,7 +1,7 @@
 //! Phase 7a: migrate a Kitty V1 database forward into V2.
 //!
 //! Kitty has real accumulated state — sessions, message history, providers,
-//! recipes, schedules. Because the V2 fork kept V1's sixteen migrations intact
+//! schedules. Because the V2 fork kept V1's sixteen migrations intact
 //! and added `017+` on top rather than squashing them, V2 can open a V1
 //! database and simply migrate it forward. That is what makes this an import
 //! rather than an export/transform pipeline.
@@ -50,7 +50,6 @@ pub struct ImportSummary {
     pub sessions: i64,
     pub messages: i64,
     pub providers: i64,
-    pub recipes: i64,
     pub schedules: i64,
     /// Providers whose stored `api_key` is encrypted but does not decrypt with
     /// the key in force. Non-zero means the key was not carried across, and
@@ -63,12 +62,11 @@ impl ImportSummary {
         let mut out = format!(
             "imported as app {:?}\n  \
              {} sessions, {} messages\n  \
-             {} providers, {} recipes, {} schedules",
+             {} providers, {} schedules",
             self.app_id,
             self.sessions,
             self.messages,
             self.providers,
-            self.recipes,
             self.schedules,
         );
         if self.undecryptable_providers > 0 {
@@ -129,7 +127,10 @@ async fn open_pool(path: &Path) -> Result<SqlitePool, DaemonError> {
 /// Scoped to `''` rather than "all rows" so re-running an import against an
 /// already-imported database cannot re-home another app's data.
 async fn stamp_owner(pool: &SqlitePool, app_id: &str) -> Result<(), DaemonError> {
-    for table in ["sessions", "recipes", "schedule_jobs", "hitl_rules"] {
+    // No `recipes`: migration 021 dropped that table when recipes became
+    // specialists, so a V1 database's recipe rows are gone by the time an
+    // import runs. Nothing to stamp, and stamping would 500 on a missing table.
+    for table in ["sessions", "schedule_jobs", "hitl_rules"] {
         sqlx::query(&format!("UPDATE {table} SET app_id = ? WHERE app_id = ''"))
             .bind(app_id)
             .execute(pool)
@@ -239,7 +240,6 @@ pub async fn import_v1(
         sessions: count(&pool, "SELECT COUNT(*) FROM sessions").await,
         messages: count(&pool, "SELECT COUNT(*) FROM messages").await,
         providers: count(&pool, "SELECT COUNT(*) FROM providers").await,
-        recipes: count(&pool, "SELECT COUNT(*) FROM recipes").await,
         schedules: count(&pool, "SELECT COUNT(*) FROM schedule_jobs").await,
         undecryptable_providers: undecryptable_providers(&pool).await,
     };
@@ -247,7 +247,7 @@ pub async fn import_v1(
     // The invariant the whole tenancy design rests on. If anything still
     // carries the placeholder, the import produced rows no app can see, and
     // saying so now is far better than discovering it as an empty session list.
-    for table in ["sessions", "recipes", "schedule_jobs", "hitl_rules"] {
+    for table in ["sessions", "schedule_jobs", "hitl_rules"] {
         let orphans = count(
             &pool,
             &format!("SELECT COUNT(*) FROM {table} WHERE app_id = ''"),

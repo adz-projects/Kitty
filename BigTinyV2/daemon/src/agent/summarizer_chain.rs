@@ -146,6 +146,7 @@ impl SummarizerChain {
                     None,
                     crate::provider::queue::DAEMON_LANE,
                     crate::provider::queue::Priority::Background,
+                    &crate::provider::schema::ResponseSpec::text(),
                 )
                 .await
                 .map_err(|e| format!("summarizer fallback call to '{provider_id}' failed: {e}"))?;

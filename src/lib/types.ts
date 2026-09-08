@@ -39,6 +39,7 @@ export interface Config {
       mirrors `bigtiny/config.py`'s `SummarizerConfig`). A daemon restart is
       needed for a change here to take effect. */
   summarizer: SummarizerSettings;
+  specialists: SpecialistSettings;
   /** BigTiny context-window/compaction budget settings — relayed as
       `BIGTINY_TOKEN_MANAGEMENT__*` env vars at spawn time (Rust
       `Config::token_management`, mirrors `bigtiny/config.py`'s
@@ -132,6 +133,11 @@ export interface ProviderProfile {
   base_url: string;
   models: string[];
   is_trusted: boolean;
+  /** Whether this provider may host specialist runs: `"preferred"`,
+      `"allowed"` (the default when absent) or `"never"`. The first thing the
+      daemon's host picker consults — the only signal it has that reflects
+      intent rather than measurement. */
+  subagent_role?: string | null;
   temperature: number | null;
   top_p: number | null;
   /** llama.cpp/Ollama sampling extension, only ever sent to a self-hosted
@@ -332,98 +338,106 @@ export interface GgufInfo {
   quantization?: string | null;
 }
 
-/** Mirrors `config::recipes::ParameterInputType`. */
-export type ParameterInputType = 'string' | 'number' | 'boolean' | 'date' | 'file' | 'select';
+/** One delegate agent the model can call mid-turn, as `/api/specialists`
+    reports it. Mirrors Rust `bigtiny::specialists::Specialist`.
 
-/** Mirrors `config::recipes::ParameterRequirement`. `user_prompt` is the one
-    parameter (at most one per recipe) whose value comes from whatever the
-    user typed after `/slug` — see `src/lib/recipes.ts`'s `primaryParameter`. */
-export type ParameterRequirement = 'required' | 'optional' | 'user_prompt';
-
-/** Mirrors `config::recipes::RecipeParameter`. For the `user_prompt`
-    parameter, `description` is user-facing invocation guidance shown in the
-    slash-autocomplete dropdown and as the composer's placeholder — not just
-    schema metadata. */
-export interface RecipeParameter {
-  key: string;
-  input_type: ParameterInputType;
-  requirement: ParameterRequirement;
-  description: string;
-  default: string | null;
-  options: string[];
-}
-
-/** Known real-schema extension types. Only `builtin`/`platform`/`stdio` have
-    an ACP equivalent Kitty can add to a live session (see
-    `add_recipe_extension`); the rest are stored for YAML round-trip fidelity
-    and silently skipped at launch. */
-export type RecipeExtensionType =
-  'stdio' | 'builtin' | 'platform' | 'streamable_http' | 'frontend' | 'inline_python';
-
-/** Mirrors `config::recipes::RecipeExtension`. Extra real-schema fields
-    Kitty doesn't specifically interpret pass through via an index signature
-    (Rust's `#[serde(flatten)] extra: HashMap<...>`). */
-export interface RecipeExtension {
-  type: RecipeExtensionType;
-  name: string;
-  cmd?: string | null;
-  args: string[];
-  env_keys: string[];
-  description?: string | null;
-  timeout?: number | null;
-  bundled?: boolean | null;
-  [extra: string]: unknown;
-}
-
-/** Mirrors `config::recipes::Recipe`. A recipe is a client-side-interpreted
-    template (Kitty attaches its `instructions`/`prompt`/`extensions` to an
-    ordinary chat turn rather than shelling out to the real `goose run
-    --recipe` CLI runner — see `docs/BACKLOG.md`'s now-resolved recipes entry
-    and `chatStore.ts`'s `sendWithRecipe`). Still mirrors the real, portable
-    Goose recipe YAML schema field-for-field so it round-trips through
-    import/export as a real `.yaml` file — only `id`/`slug`/`is_builtin`/
-    `created_at`/`max_reasoning_tokens` are Kitty-only, stripped on export. */
-export interface Recipe {
+    Replaces the old client-side `Recipe`, which was a prompt template the user
+    invoked by a `/slug` they had to learn. A specialist is chosen by the model
+    from the user's ordinary request, so `description` is the load-bearing
+    field: it is the only text the model routes on. */
+export interface Specialist {
   id: string;
-  slug: string;
-  title: string;
+  name: string;
   description: string;
-  instructions: string | null;
-  prompt: string | null;
-  version: string;
-  parameters: RecipeParameter[];
-  extensions: RecipeExtension[];
-  activities: string[];
-  is_builtin: boolean;
-  created_at: string;
-  /** Hard cap on how much a recipe-invoked turn is allowed to reason before
-      Kitty auto-cancels it — see `chatStore.ts`'s `activeRecipeTurn`. Not
-      part of the real Goose recipe schema (no ACP-exposed numeric reasoning-
-      token config exists to query per model, only effort levels), so this is
-      excluded from YAML export. Defaults to 2048. */
-  max_reasoning_tokens: number;
+  system_prompt: string;
+  provider: string | null;
+  model: string | null;
+  /** Exact tool names. Enforced daemon-side at dispatch, not merely used to
+      shape what the delegate is offered. */
+  tool_allow: string[];
+  /** JSON Schema the delegate's answer must validate against, or null for
+      prose. */
+  response_schema: unknown | null;
+  max_steps: number;
+  /** Absolute reasoning-token ceiling for a run. Exclusive with the fraction;
+      both null inherits the daemon default. */
+  reasoning_cap_tokens: number | null;
+  /** Share of the delegate's remaining context window it may spend thinking. */
+  reasoning_cap_fraction: number | null;
+  /** `"per_ref"` splits one call with N refs into N delegates. */
+  fan_out: string | null;
+  enabled: boolean;
+  /** Seeded by the daemon and shared by every app: editable only by saving one
+      of the same name (which shadows it for this app), never deletable. */
+  builtin: boolean;
 }
 
-/** Fields supplied when creating/updating a recipe — everything except the
-    Kitty-only bookkeeping the backend owns. Mirrors Rust `RecipeInput`. */
-export interface RecipeInput {
-  slug: string;
-  title: string;
+/** Fields supplied when saving a specialist. The daemon keys on `name`, so
+    there is no id: saving an existing name edits it, and saving a built-in's
+    name creates this app's override of it. */
+export interface SpecialistInput {
+  name: string;
   description: string;
-  instructions: string | null;
-  prompt: string | null;
-  parameters: RecipeParameter[];
-  extensions: RecipeExtension[];
-  activities: string[];
-  max_reasoning_tokens: number;
+  system_prompt: string;
+  provider: string | null;
+  model: string | null;
+  tool_allow: string[];
+  response_schema: unknown | null;
+  max_steps: number | null;
+  reasoning_cap_tokens: number | null;
+  reasoning_cap_fraction: number | null;
+  fan_out: string | null;
+  enabled: boolean;
 }
 
-/** Mirrors Rust `RecipeImportResult` — a successfully-imported recipe plus
-    any non-fatal warnings (e.g. a dropped `settings`/`response`/`retry`/
-    `sub_recipes` block real Goose recipes can carry but Kitty can't apply). */
-export interface RecipeImportResult {
-  recipe: Recipe;
-  warnings: string[];
+/** Limits on delegate runs, relayed to the daemon at spawn. Changing any of
+    these needs a daemon restart, which the engine-restart banner surfaces. */
+export interface SpecialistSettings {
+  /** Models that may never host a delegate. Exact ids, or `prefix*`. */
+  model_deny: string[];
+  /** Whether the premium-tier seeding has run. Distinguishes "not asked yet"
+      from "cleared deliberately", so an emptied list stays empty. */
+  seeded: boolean;
+  timeout_secs: number;
+  max_concurrent: number;
+}
+
+/** One recorded delegate run. Routing depends entirely on each specialist's
+    description, and a vague one does not fail — it just gets used for the wrong
+    things. This is how that becomes visible. */
+export interface SpecialistRun {
+  id: string;
+  specialist: string | null;
+  /** The delegate's own session, for reading what it actually did. */
+  session_id: string | null;
+  status: string;
+  started_at: string | null;
+  summary: string | null;
+}
+
+/** What a session may reach because the user granted it, from
+    `GET /api/chat/{id}/allowed_dirs`. Deliberately not the full sandbox set:
+    that also contains the daemon's data root and its plugins' cache
+    directories, which are machinery rather than choices. */
+export interface SessionAllowedDirs {
+  chat_dir: string | null;
+  cwd: string | null;
+  /** Every working folder set during this session. These accumulate, so the
+      one named on the pill is usually not the only one. */
+  working_dirs: string[];
+  attached_paths: string[];
+}
+
+/** A specialist this turn delegated to, as reported by `chat://subagent-status`
+    (the daemon's `subagent_status` SSE frame). `child_session_id` is the
+    delegate's own session — the click-through for when its structured report
+    was not enough. */
+export interface SubagentStatusEvent {
+  session_id: string;
+  child_session_id: string;
+  specialist: string;
+  status: 'started' | 'completed' | 'failed';
+  error?: string | null;
 }
 
 /** Mirrors Rust `log_capture::LogEntry` — one captured WARN/ERROR tracing

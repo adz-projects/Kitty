@@ -88,7 +88,35 @@ pub async fn update_cwd(app: &AppHandle, session_id: &str, cwd: &str) -> Result<
     client
         .patch_json(
             &format!("/api/chat/{session_id}/config"),
-            &json!({ "cwd": cwd }),
+            // `working_dirs` as well as `cwd`, and the daemon unions that key
+            // rather than replacing it. `cwd` alone says "this is where I am
+            // now", which is what the pill shows; it does not say "I may still
+            // read the folder I was working in a minute ago". Sending only
+            // `cwd` silently revoked the previous folder mid-task, so a model
+            // that had been reading files there started hitting approval
+            // prompts for no reason the user could see.
+            &json!({ "cwd": cwd, "working_dirs": [cwd] }),
+        )
+        .await?;
+    Ok(())
+}
+
+/// The folders this session may reach because the user granted them, for the
+/// working-directory pill's hover list.
+pub async fn allowed_dirs(app: &AppHandle, session_id: &str) -> Result<Value, String> {
+    let client = ensure_client(app)?;
+    client
+        .get_json(&format!("/api/chat/{session_id}/allowed_dirs"))
+        .await
+}
+
+/// Drop one granted folder or file path.
+pub async fn revoke_dir(app: &AppHandle, session_id: &str, path: &str) -> Result<(), String> {
+    let client = ensure_client(app)?;
+    client
+        .post_json(
+            &format!("/api/chat/{session_id}/allowed_dirs/revoke"),
+            &json!({ "path": path }),
         )
         .await?;
     Ok(())

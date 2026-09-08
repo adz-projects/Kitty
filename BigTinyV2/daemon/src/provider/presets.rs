@@ -34,6 +34,9 @@ pub fn resolve(name: &str) -> Option<SamplingParams> {
             // A preset is about creativity, not reasoning — effort is set by
             // the loop from the session's own thinking-effort choice.
             effort: None,
+            // Nor a reasoning budget: that is a per-run bound the agent
+            // loop computes from the specialist's cap, not a provider setting.
+            reasoning_max_tokens: None,
         }),
         "balanced" => Some(SamplingParams {
             temperature: Some(0.6),
@@ -46,6 +49,9 @@ pub fn resolve(name: &str) -> Option<SamplingParams> {
             // A preset is about creativity, not reasoning — effort is set by
             // the loop from the session's own thinking-effort choice.
             effort: None,
+            // Nor a reasoning budget: that is a per-run bound the agent
+            // loop computes from the specialist's cap, not a provider setting.
+            reasoning_max_tokens: None,
         }),
         "creative" => Some(SamplingParams {
             temperature: Some(1.0),
@@ -60,6 +66,9 @@ pub fn resolve(name: &str) -> Option<SamplingParams> {
             // A preset is about creativity, not reasoning — effort is set by
             // the loop from the session's own thinking-effort choice.
             effort: None,
+            // Nor a reasoning budget: that is a per-run bound the agent
+            // loop computes from the specialist's cap, not a provider setting.
+            reasoning_max_tokens: None,
         }),
         _ => None,
     }

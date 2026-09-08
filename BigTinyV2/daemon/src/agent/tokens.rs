@@ -485,3 +485,233 @@ mod tests {
         }
     }
 }
+
+/// How much of a delegate's run may go on reasoning.
+///
+/// Two shapes because the useful answer depends on what the caller knows. A
+/// pipeline that has measured its own workload wants an absolute number; a
+/// specialist definition that must work across a 8k local model and a 200k
+/// hosted one wants a share of whatever room there is.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningCap {
+    Tokens(i32),
+    ContextFraction(f64),
+}
+
+/// Anthropic will not accept a `budget_tokens` below this, and treats a smaller
+/// one as no thinking at all. A cap that cannot be expressed on the one dialect
+/// with a real budget field would silently mean "off" there, so it is the floor
+/// everywhere — a cap resolving below it is honestly reported as zero rather
+/// than quietly rounded up.
+pub const MIN_REASONING_BUDGET: i32 = 1024;
+
+/// Fallback when the model's context window is unknown.
+///
+/// Deliberately a concrete number rather than "unbounded". An unknown window is
+/// overwhelmingly the self-hosted case, which is also the case where nothing on
+/// the wire enforces anything — so it is exactly where a missing cap does the
+/// most damage, not the least.
+pub const UNKNOWN_CONTEXT_REASONING_BUDGET: i32 = 16_384;
+
+/// Resolve a cap to an absolute token budget for one run.
+///
+/// `report_reserve` is the output room the delegate still needs *after*
+/// thinking, to write its structured answer. It is subtracted before the clamp
+/// rather than after, because a budget that leaves no room for the report buys
+/// a well-reasoned silence.
+///
+/// Returns 0 for "no reasoning at all", which is a real answer: on a small
+/// window with a large schema there is genuinely nothing left to spend.
+pub fn reasoning_budget_tokens(
+    cap: ReasoningCap,
+    context_length: Option<i32>,
+    projected_input: i32,
+    report_reserve: i32,
+    ceiling: i32,
+) -> i32 {
+    let requested = match cap {
+        ReasoningCap::Tokens(n) => n,
+        // A fraction of what is *left*, not of the whole window: a delegate
+        // sixty percent through its context has sixty percent less to spend on
+        // thinking, which is the behaviour that keeps a long run from starving
+        // its own conclusion.
+        ReasoningCap::ContextFraction(f) => match context_length {
+            Some(ctx) => {
+                let remaining = ctx.saturating_sub(projected_input).max(0);
+                (f64::from(remaining) * f.clamp(0.0, 1.0)) as i32
+            }
+            None => UNKNOWN_CONTEXT_REASONING_BUDGET,
+        },
+    };
+
+    // The room that actually exists, once the report is accounted for.
+    let headroom = match context_length {
+        Some(ctx) => ctx
+            .saturating_sub(projected_input)
+            .saturating_sub(report_reserve.max(0))
+            .max(0),
+        None => i32::MAX,
+    };
+
+    let ceiling = ceiling.max(0).min(headroom);
+    let budget = requested.max(0).min(ceiling);
+    if budget < MIN_REASONING_BUDGET {
+        0
+    } else {
+        budget
+    }
+}
+
+#[cfg(test)]
+mod reasoning_budget_tests {
+    use super::*;
+
+    #[test]
+    fn an_explicit_token_cap_is_used_as_given() {
+        assert_eq!(
+            reasoning_budget_tokens(ReasoningCap::Tokens(8_000), Some(128_000), 1_000, 2_000, 32_768),
+            8_000
+        );
+    }
+
+    /// The fraction applies to remaining room, so the same cap yields less as
+    /// the run fills its window.
+    #[test]
+    fn a_fraction_shrinks_as_the_context_fills() {
+        let early = reasoning_budget_tokens(
+            ReasoningCap::ContextFraction(0.25),
+            Some(100_000),
+            10_000,
+            2_000,
+            i32::MAX,
+        );
+        let late = reasoning_budget_tokens(
+            ReasoningCap::ContextFraction(0.25),
+            Some(100_000),
+            80_000,
+            2_000,
+            i32::MAX,
+        );
+        assert_eq!(early, 22_500);
+        assert_eq!(late, 5_000);
+        assert!(late < early);
+    }
+
+    /// Unknown context is the self-hosted case, and the case where nothing on
+    /// the wire enforces a cap — so it must not read as "unbounded".
+    #[test]
+    fn an_unknown_context_falls_back_to_a_conservative_absolute() {
+        assert_eq!(
+            reasoning_budget_tokens(
+                ReasoningCap::ContextFraction(0.5),
+                None,
+                0,
+                2_000,
+                i32::MAX
+            ),
+            UNKNOWN_CONTEXT_REASONING_BUDGET
+        );
+    }
+
+    /// The report has to fit. A budget that consumes the room the answer needs
+    /// buys a well-reasoned silence.
+    #[test]
+    fn the_report_reserve_is_subtracted_before_the_clamp() {
+        // 20k window, 6k already used, 3k held back for the report -> 11k left,
+        // so the reserve is what bounds this, not the 50k the caller asked for.
+        assert_eq!(
+            reasoning_budget_tokens(
+                ReasoningCap::Tokens(50_000),
+                Some(20_000),
+                6_000,
+                3_000,
+                i32::MAX,
+            ),
+            11_000
+        );
+
+        // A larger reserve takes room away from thinking, not from the answer.
+        assert_eq!(
+            reasoning_budget_tokens(
+                ReasoningCap::Tokens(50_000),
+                Some(20_000),
+                6_000,
+                9_000,
+                i32::MAX,
+            ),
+            5_000
+        );
+
+        // And once the reserve leaves less than the floor, the honest answer is
+        // no thinking at all rather than a budget Anthropic would reject.
+        assert_eq!(
+            reasoning_budget_tokens(
+                ReasoningCap::Tokens(50_000),
+                Some(10_000),
+                6_000,
+                3_000,
+                i32::MAX,
+            ),
+            0,
+            "1000 tokens of headroom is below MIN_REASONING_BUDGET"
+        );
+    }
+
+    /// Below Anthropic's `budget_tokens` minimum, a cap means "no thinking",
+    /// not "a tiny bit of thinking" — rounding up would send a value that
+    /// dialect rejects.
+    #[test]
+    fn a_budget_under_the_floor_is_reported_as_none() {
+        assert_eq!(
+            reasoning_budget_tokens(ReasoningCap::Tokens(500), Some(128_000), 0, 0, i32::MAX),
+            0
+        );
+        assert_eq!(
+            reasoning_budget_tokens(
+                ReasoningCap::Tokens(MIN_REASONING_BUDGET),
+                Some(128_000),
+                0,
+                0,
+                i32::MAX
+            ),
+            MIN_REASONING_BUDGET
+        );
+    }
+
+    #[test]
+    fn a_full_context_leaves_nothing_to_spend() {
+        assert_eq!(
+            reasoning_budget_tokens(
+                ReasoningCap::ContextFraction(0.5),
+                Some(8_000),
+                8_000,
+                2_000,
+                i32::MAX
+            ),
+            0
+        );
+    }
+
+    /// Nonsense input must not produce a nonsense budget: `anthropic.rs`
+    /// silently discards an out-of-range value and falls back to a *larger*
+    /// default, so a negative here would widen the budget rather than narrow it.
+    #[test]
+    fn negative_and_absurd_inputs_clamp_rather_than_invert() {
+        assert_eq!(
+            reasoning_budget_tokens(ReasoningCap::Tokens(-5), Some(128_000), 0, 0, i32::MAX),
+            0
+        );
+        assert_eq!(
+            reasoning_budget_tokens(
+                ReasoningCap::ContextFraction(9.0),
+                Some(100_000),
+                0,
+                0,
+                32_768
+            ),
+            32_768,
+            "a fraction above 1.0 is clamped, and the ceiling still binds"
+        );
+    }
+}

@@ -19,13 +19,13 @@ import {
   onSessionDeleted,
   onSessionsCleared,
   onSessionTitle,
+  onSubagentStatus,
   onToolCall,
   onUserMessage,
   pickSavePath,
 } from '@/lib/ipc';
 import { buildExport, sanitizeFilename } from '@/lib/chatml';
 import { defaultSystemPrompt } from '@/lib/system_prompts';
-import { recipeNeedsAttention, resolveRecipe, launchableExtensions } from '@/lib/recipes';
 import { modelAcceptsImages } from '@/lib/vision_models';
 import type {
   ApprovalNeededEvent,
@@ -34,8 +34,8 @@ import type {
   NetworkTier,
   PathInfo,
   ProviderView,
-  Recipe,
   SessionInfo,
+  SubagentStatusEvent,
   ThinkingEffort,
   ToolCallUpdate,
 } from '@/lib/types';
@@ -51,8 +51,6 @@ import {
 } from './chat/errorUtils';
 import {
   countToolCall,
-  exceedsReasoningCap,
-  FORCED_ANSWER_PROMPT,
   hasRepetitionLoop,
   splitLeakedThinkTag,
   TOOL_LOOP_THRESHOLD,
@@ -254,32 +252,11 @@ interface ChatState {
       cancel (the user decides). Reset when a fresh turn starts or the turn
       ends. */
   loopSuspected: boolean;
-  /** Set by `sendWithRecipe`, consumed exactly once by `send()`'s prompt
-      construction (any turn, not just a session's first message — a recipe
-      can be invoked at any point in a conversation). `null` the rest of the
-      time. */
-  pendingRecipeCard: { title: string; instructions: string; maxReasoningTokens: number } | null;
-  /** Set alongside `busy: true` for a turn that came from `sendWithRecipe`
-      (derived from `pendingRecipeCard` right before it's consumed), cleared
-      at every turn-end/turn-reset site (same lifecycle as `loopSuspected`).
-      Two effects while set: (1) `flushDeltas` skips the repetition-loop
-      suggestion for this turn — a recipe (e.g. the debate moderator) can
-      legitimately produce long, structurally-repetitive output that would
-      otherwise false-positive; (2) `flushDeltas` enforces
-      `maxReasoningTokens` as a hard cap, auto-cancelling the turn if
-      exceeded — see that function for why this needs its own enforcement
-      instead of just suppressing the loop suggestion. */
-  activeRecipeTurn: { maxReasoningTokens: number } | null;
-  /** Set when the reasoning-cap cancel above fires, naming the session the
-      forced follow-up belongs to. There's no ACP way to interrupt just the
-      reasoning phase and redirect a generation already in flight to its
-      final answer — cancelling ends the whole turn — so instead, once the
-      cancelled turn's completion/error event actually arrives (`onComplete`/
-      `onChatError`), a follow-up asking the model to answer now is sent
-      automatically, so the user gets a response instead of nothing. Cleared
-      once consumed, and by `forceStop()` (an explicit Force Stop overrides
-      this — no surprise follow-up after the user deliberately kills a turn). */
-  pendingForcedAnswer: string | null;
+  /** Specialists this turn delegated to, in the order they started.
+      Cleared when a fresh turn starts, not when one ends: a delegate's report
+      is part of the answer the user is reading, so the strip has to survive
+      the turn that produced it. */
+  subagents: SubagentStatusEvent[];
   bindEvents: () => void;
   dismissWarning: () => void;
   dismissCompactionNotice: () => void;
@@ -328,12 +305,6 @@ interface ChatState {
   ) => Promise<void>;
   reloadCurrent: () => Promise<void>;
   send: (text: string) => Promise<void>;
-  /** Invoke a recipe: attaches its resolved instructions to the current
-      message (or a lazily-created one, via `ensureSession()`) rather than
-      forking a new session — the recipe augments whatever conversation is
-      already open, and the model decides whether prior history is relevant.
-      No-ops while `busy`, same as `send()`/`regenerate()`. */
-  sendWithRecipe: (recipe: Recipe, primaryText: string) => Promise<void>;
   cancel: () => Promise<void>;
   /** Hard-reset a stuck turn the user chose to force-stop (Round-5): clears
       `busy`, ends the in-flight message, and abandons the turn so late events
@@ -421,7 +392,7 @@ let toolAlternation: ToolAlternationState = new Map();
 // rapid double-submit (double-Enter) could both pass the `!busy` gate and
 // enqueue two prompts. This flag is set before ANY await and cleared in a
 // `finally`, so duplicates are impossible even within the same tick. Shared
-// by `send`, `regenerate` and `sendWithRecipe` (a recipe invocation holds it
+// by `send` and `regenerate` (each holds it
 // for its whole prepare-then-send sequence, so a concurrent plain send can't
 // slip in between).
 let sendInFlight = false;
@@ -699,13 +670,6 @@ export const useChatStore = create<ChatState>((set, get) => {
     // surfaced this suggestion with nothing actually running). This only
     // *suggests* cancelling (via `loopSuspected`) — it never cancels on its
     // own; the model may yet recover, and the choice is the user's.
-    //
-    // Also gated on `!s.activeRecipeTurn`: a recipe (e.g. the debate
-    // moderator, which deliberately produces structurally-repetitive
-    // "FOR — Round N" / "AGAINST — Round N" output) can legitimately look
-    // like a repetition loop to this heuristic. Recipe turns get their own,
-    // stricter enforcement instead — see the reasoning-token hard cap below —
-    // so suppressing this suggestion here doesn't leave them unbounded.
     const s = get();
     // Throttled to ~2Hz rather than run on every rAF flush: `hasRepetitionLoop`
     // is a nested `indexOf` sweep over a 4000-char window, and a degenerate
@@ -714,7 +678,7 @@ export const useChatStore = create<ChatState>((set, get) => {
     // user, since this only *suggests* cancelling and never acts on its own.
     const nowMs = Date.now();
     const loopCheckDue = nowMs - lastLoopCheck >= LOOP_CHECK_INTERVAL_MS;
-    if (!s.loopSuspected && !s.activeRecipeTurn && loopCheckDue) {
+    if (!s.loopSuspected && loopCheckDue) {
       lastLoopCheck = nowMs;
       const last = s.messages[s.messages.length - 1];
       // Slice BEFORE joining: hasRepetitionLoop only inspects a trailing
@@ -734,38 +698,6 @@ export const useChatStore = create<ChatState>((set, get) => {
         )
       ) {
         set({ loopSuspected: true });
-      }
-    }
-
-    // Recipe reasoning hard cap — the safety net the loop-detection suppression
-    // above needs: unlike general chat (where a suggestion is enough and the
-    // user decides), a recipe's `max_reasoning_tokens` is an explicit,
-    // enforced limit, so exceeding it auto-cancels the turn rather than just
-    // suggesting it. Approximated via character count (~4 chars/token for
-    // English text) since ACP exposes no numeric reasoning-token config to
-    // check against — only effort levels (confirmed via docs/acp-protocol.md;
-    // see `Recipe.max_reasoning_tokens`'s doc comment). `activeRecipeTurn` is
-    // cleared as part of the same `set()` that triggers the cancel, so this
-    // can only fire once per turn — no risk of calling `cancel()` repeatedly
-    // on every subsequent flush.
-    if (s.activeRecipeTurn && s.busy && !s.replaying) {
-      const last = s.messages[s.messages.length - 1];
-      if (
-        last?.role === 'assistant' &&
-        last.open &&
-        exceedsReasoningCap(last.reasoning.length, s.activeRecipeTurn.maxReasoningTokens)
-      ) {
-        set({
-          activeRecipeTurn: null,
-          warning: `This recipe's response hit its reasoning cap (${s.activeRecipeTurn.maxReasoningTokens} tokens) — stopping it and asking for a direct answer.`,
-          // There's no ACP way to redirect a generation already in flight
-          // straight to its answer, only to cancel the whole turn — so once
-          // this cancellation actually completes (`onComplete`/`onChatError`),
-          // a forced follow-up turn asks for one instead, rather than leaving
-          // the user with nothing.
-          pendingForcedAnswer: s.sessionId,
-        });
-        void get().cancel();
       }
     }
   };
@@ -788,16 +720,16 @@ export const useChatStore = create<ChatState>((set, get) => {
     lastLoopCheck = 0;
   };
 
-  // The actual turn-submission body, shared by `send()` and `sendWithRecipe()`.
+  // The actual turn-submission body, behind `send()`.
   // Callers MUST have already acquired the `sendInFlight` guard — this core
-  // deliberately does not re-check it (a recipe holds the guard across its
+  // deliberately does not re-check it (a caller holds the guard across its
   // whole prepare-then-send sequence and then delegates here). Returns whether
   // the prompt was actually handed to the backend (the caller's guard-abort
   // rollback depends on it: if we aborted before submission, side effects like
-  // a recipe's agentic flip should be undone; if we submitted, don't).
+  // a caller's already-applied side effects should be undone; if we submitted, don't).
   //
   // `snapshot` lets a caller that runs its own ensureSession() first
-  // (sendWithRecipe) hand over the composer state it captured BEFORE that
+  // hand over the composer state a caller captured BEFORE that
   // call — newSession()'s optimistic clear wipes droppedFiles/attachments/
   // pendingImages, so reading them only after a lazy session-create would
   // silently drop the first message's files.
@@ -912,7 +844,7 @@ export const useChatStore = create<ChatState>((set, get) => {
       }
       // Custom/default system prompt (Round-6 Feature 2), first turn of a
       // session only — set server-side via BigTiny's real `persona_override`
-      // session-metadata field (same mechanism recipes use), rendered as a
+      // session-metadata field, rendered as a
       // proper `role: "system"` message by ContextBuilder::build_messages.
       // Previously this prepended a literal `<system>...</system>` block onto
       // the outgoing *user* message text — a leftover from the pre-BigTiny
@@ -935,25 +867,6 @@ export const useChatStore = create<ChatState>((set, get) => {
           console.warn('setSessionPersonaOverride failed, continuing with default persona', e);
         }
       }
-      // Recipe invocation (`sendWithRecipe`) — unlike the system-prompt
-      // persona above, this applies on ANY turn, not just a session's first
-      // message: a recipe can be invoked at any point in a conversation,
-      // attaching to whatever's already open rather than requiring a fresh
-      // session. The recipe wrapper is still a text preamble on `promptText`
-      // itself (not `persona_override`) because, unlike the session-level
-      // persona, it's meant to be a one-off, mandatory instruction for THIS
-      // turn only, not a persisted system message every future turn resends.
-      const recipeCard = get().pendingRecipeCard;
-      if (recipeCard) {
-        promptText =
-          `<recipe title="${recipeCard.title}">\n${recipeCard.instructions}\n</recipe>\n\n` +
-          `Run the recipe above now — it is mandatory for this message. You may use the ` +
-          `conversation so far if it's relevant, but you are not required to.\n\n${promptText}`;
-      }
-      // Captured before the consume-once clear below, so the busy:true set()
-      // further down can derive activeRecipeTurn from it.
-      const recipeMaxReasoningTokens = recipeCard?.maxReasoningTokens ?? null;
-      set({ pendingRecipeCard: null }); // consume-once, unconditionally
       const cwd = get().cwd ?? undefined;
 
       // Snapshot what's attached to this turn before the set() below clears
@@ -1028,10 +941,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         stopPhase: null,
         abandonedSession: null,
         loopSuspected: false,
-        activeRecipeTurn:
-          recipeMaxReasoningTokens != null
-            ? { maxReasoningTokens: recipeMaxReasoningTokens }
-            : null,
+        subagents: [],
       }));
       lastSentAt = performance.now();
       lastSentProvider = get().providerName;
@@ -1145,9 +1055,7 @@ export const useChatStore = create<ChatState>((set, get) => {
     stopPhase: null,
     abandonedSession: null,
     loopSuspected: false,
-    pendingRecipeCard: null,
-    activeRecipeTurn: null,
-    pendingForcedAnswer: null,
+    subagents: [],
 
     dismissWarning: () => set({ warning: null }),
     dismissCompactionNotice: () => set({ compactionNotice: null }),
@@ -1430,8 +1338,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         stopPhase: null,
         abandonedSession: null,
         loopSuspected: false,
-        activeRecipeTurn: null,
-        pendingForcedAnswer: null,
+        subagents: [],
       });
     },
 
@@ -1532,8 +1439,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         stopPhase: null,
         abandonedSession: null,
         loopSuspected: false,
-        activeRecipeTurn: null,
-        pendingForcedAnswer: null,
+        subagents: [],
       });
       try {
         let info: SessionInfo;
@@ -1682,8 +1588,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         stopPhase: null,
         abandonedSession: null,
         loopSuspected: false,
-        activeRecipeTurn: null,
-        pendingForcedAnswer: null,
+        subagents: [],
       });
       try {
         // Restore the provider this session was last used with, if it's
@@ -1795,11 +1700,10 @@ export const useChatStore = create<ChatState>((set, get) => {
         messages: closeOpen(s.messages),
         warning: 'Stopped. Kitty may still be finishing this turn in the background.',
         loopSuspected: false,
-        activeRecipeTurn: null,
+        subagents: [],
         // An explicit Force Stop overrides the reasoning-cap's own automatic
         // cancel-then-ask-for-an-answer flow — no surprise follow-up after
         // the user deliberately kills a turn themselves.
-        pendingForcedAnswer: null,
       }));
     },
 
@@ -2056,7 +1960,7 @@ export const useChatStore = create<ChatState>((set, get) => {
 
     regenerate: async (assistantIndex: number) => {
       const { sessionId, messages, busy } = get();
-      // `sendInFlight` gate too: send()/sendWithRecipe() commit `busy` only
+      // `sendInFlight` gate too: send() commits `busy` only
       // after their own awaits, so without it a regenerate could slip in and
       // start a second turn while the first is still being prepared.
       if (!sessionId || busy || sendInFlight) return;
@@ -2091,7 +1995,6 @@ export const useChatStore = create<ChatState>((set, get) => {
           stopPhase: null,
           abandonedSession: null,
           loopSuspected: false,
-          activeRecipeTurn: null,
         };
       });
       try {
@@ -2141,10 +2044,6 @@ export const useChatStore = create<ChatState>((set, get) => {
         get().busy ||
         (!trimmed && attachments.length === 0 && pendingImages.length === 0)
       ) {
-        // Don't let a pending recipe card outlive an aborted send (e.g. a
-        // recipe invoked while a turn was somehow already in flight) — it
-        // would otherwise leak into the next unrelated message.
-        if (get().pendingRecipeCard) set({ pendingRecipeCard: null });
         return;
       }
       // Acquire the synchronous in-flight guard BEFORE any await — `busy` is
@@ -2154,80 +2053,6 @@ export const useChatStore = create<ChatState>((set, get) => {
       sendInFlight = true;
       try {
         await doSend(trimmed);
-      } finally {
-        sendInFlight = false;
-      }
-    },
-
-    sendWithRecipe: async (recipe: Recipe, primaryText: string) => {
-      // Same synchronous guard as send()/regenerate() — held across the whole
-      // prepare-then-send sequence below (ensureSession, extension-adds, mode
-      // flip), so a concurrent plain send can't slip in between.
-      if (sendInFlight || get().busy) return;
-      const missing = recipeNeedsAttention(recipe);
-      if (missing.length) {
-        set({
-          error: `"${recipe.title}" has unconfigured parameters (${missing.join(', ')}) — fix them in Settings → Recipes.`,
-        });
-        return;
-      }
-      const { resolvedInstructions, resolvedPromptText } = resolveRecipe(recipe, primaryText);
-      // A recipe with no `prompt` template invoked with no trailing text
-      // resolves to an empty prompt. `send('')` would early-return (no content)
-      // *without* consuming `pendingRecipeCard`, leaking it into the next
-      // message and silently dropping the recipe — so guarantee a non-empty
-      // driving message. The recipe's real instructions still ride along in the
-      // hidden `<recipe>` card; this is just the visible bubble / kick-off text.
-      const promptToSend = resolvedPromptText.trim() || `Run the "${recipe.title}" recipe.`;
-      sendInFlight = true;
-      try {
-        // Captured BEFORE ensureSession(): when this invocation lazily creates
-        // the session, newSession()'s optimistic clear wipes the composer's
-        // droppedFiles/attachments/pendingImages — reading them only inside
-        // doSend (after that clear) silently dropped a recipe-invocation's
-        // pasted attachments and dropped files.
-        const snapshot = {
-          droppedFiles: get().droppedFiles,
-          attachments: get().attachments,
-          pendingImages: get().pendingImages,
-        };
-        let sessionId: string;
-        try {
-          sessionId = await get().ensureSession(); // current session if one
-          // exists, else lazily creates one — the exact call send() itself makes;
-          // a mid-conversation invocation and a blank-chat invocation need no
-          // special-casing between them.
-        } catch (e) {
-          // Same treatment as doSend's own ensureSession failure — without a
-          // catch here this escaped as an unhandled rejection at the `void`
-          // call site in the composer.
-          set({ error: String(e) });
-          return;
-        }
-        for (const ext of launchableExtensions(recipe.extensions)) {
-          void ipc.addRecipeExtension(sessionId, ext).catch((e) => {
-            // The model's later tool calls for this extension will surface
-            // their own "not found" errors either way, but log here too so a
-            // launch failure (vs. e.g. a genuinely missing tool) is
-            // distinguishable in dev tools.
-            console.warn(`addRecipeExtension failed for "${ext.name}"`, e);
-          });
-        }
-        set({
-          pendingRecipeCard: {
-            title: recipe.title,
-            instructions: resolvedInstructions ?? '',
-            maxReasoningTokens: recipe.max_reasoning_tokens,
-          },
-        });
-        const submitted = await doSend(promptToSend, snapshot);
-        if (!submitted) {
-          // The turn never actually started (session creation failed or the
-          // send aborted) — undo the side effects this recipe already applied
-          // so they don't leak into a later unrelated message: drop the
-          // pending card.
-          set({ pendingRecipeCard: null });
-        }
       } finally {
         sendInFlight = false;
       }
@@ -2275,8 +2100,10 @@ export const useChatStore = create<ChatState>((set, get) => {
         if (!forActive(e.session_id)) return;
         flushDeltas(); // keep a replayed user turn after any buffered agent text
         // Strip any client-side prompt preamble before it's stored in
-        // Message.text so a resumed session doesn't show it raw. The recipe
-        // wrapper can be on ANY turn (a recipe is invokable mid-conversation),
+        // Message.text so a resumed session doesn't show it raw. The
+        // `<recipe>` wrapper is historical -- nothing produces one now that
+        // recipes are gone -- but sessions recorded before that still carry it
+        // on any turn, so replay keeps stripping it,
         // so it's stripped from every user message; the system-prompt/
         // strip-reasoning wrappers only ever wrap a session's first turn (see
         // stripPromptPreamble's doc comment). On a recipe-invoked first turn
@@ -2440,8 +2267,6 @@ export const useChatStore = create<ChatState>((set, get) => {
             stopPhase: null,
             abandonedSession: null,
             loopSuspected: false,
-            activeRecipeTurn: null,
-            pendingForcedAnswer: null,
           });
         }
       });
@@ -2491,8 +2316,6 @@ export const useChatStore = create<ChatState>((set, get) => {
             stopPhase: null,
             abandonedSession: null,
             loopSuspected: false,
-            activeRecipeTurn: null,
-            pendingForcedAnswer: null,
           });
         }
       });
@@ -2611,13 +2434,6 @@ export const useChatStore = create<ChatState>((set, get) => {
         const usage = e.result.usage;
         const ttftMs = e.result.timing?.ttftMs;
         const tokensPerSecond = e.result.timing?.tokensPerSecond;
-        // Read before the set() below clears it — see `pendingForcedAnswer`'s
-        // doc comment: there's no ACP way to redirect a generation already in
-        // flight to its final answer, so a reasoning-cap cancel instead waits
-        // for the cancelled turn to actually finish (here, or onChatError
-        // below — cancelling can surface as either) and then sends a forced
-        // follow-up turn asking for an answer directly.
-        const forcedAnswerSession = get().pendingForcedAnswer;
         set((s) => {
           const msgs = closeOpen(s.messages);
           const lastIdx = msgs.length - 1;
@@ -2641,11 +2457,8 @@ export const useChatStore = create<ChatState>((set, get) => {
             pendingApprovals: [],
             messages: msgs,
             loopSuspected: false,
-            activeRecipeTurn: null,
-            pendingForcedAnswer: null,
           };
         });
-        if (forcedAnswerSession === e.session_id) void get().send(FORCED_ANSWER_PROMPT);
       });
       void onChatError((e) => {
         // Same backgrounded-turn handling as onComplete — a backgrounded turn
@@ -2658,7 +2471,6 @@ export const useChatStore = create<ChatState>((set, get) => {
         if (!forActive(e.session_id)) return;
         flushDeltas();
         clearStopGrace();
-        const forcedAnswerSession = get().pendingForcedAnswer;
         set((s) => ({
           busy: false,
           stopPhase: null,
@@ -2667,8 +2479,6 @@ export const useChatStore = create<ChatState>((set, get) => {
           pendingApprovals: [],
           messages: closeOpen(s.messages),
           loopSuspected: false,
-          activeRecipeTurn: null,
-          pendingForcedAnswer: null,
           // Only context_exceeded is unrecoverable *for this session* — the
           // other classified types (insufficient_credits, auth_failed,
           // network_unreachable) are all "fix something, then resend in the
@@ -2684,10 +2494,6 @@ export const useChatStore = create<ChatState>((set, get) => {
               ? 'context_exceeded'
               : s.concludedReason,
         }));
-        // Cancelling due to the reasoning cap can surface as an error rather
-        // than a clean completion — still worth asking for an answer, since
-        // the model's own prior reasoning is still available as context.
-        if (forcedAnswerSession === e.session_id) void get().send(FORCED_ANSWER_PROMPT);
       });
       // Reuses `compactionNotice` rather than adding a second banner: this is
       // a context-management notice like the compaction one, and it is
@@ -2698,6 +2504,16 @@ export const useChatStore = create<ChatState>((set, get) => {
         set({
           compactionNotice:
             e.message || 'That turn ended early — the model was close to its context limit.',
+        });
+      });
+      void onSubagentStatus((e) => {
+        if (!forActive(e.session_id)) return;
+        set((st) => {
+          // Keyed by the delegate's own session, so a `started` frame is
+          // replaced in place by its `completed`/`failed` rather than stacking
+          // up three rows for one specialist.
+          const rest = st.subagents.filter((s) => s.child_session_id !== e.child_session_id);
+          return { subagents: [...rest, e] };
         });
       });
       void onCompaction((e) => {

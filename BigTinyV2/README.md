@@ -58,7 +58,7 @@ activation rewrote every row it did not own.
 
 - `apps` table: registered clients, their hashed keys, and their own default
   provider/model.
-- `app_id` on sessions, recipes, schedules and HITL rules (`NOT NULL` — always
+- `app_id` on sessions, schedules and HITL rules (`NOT NULL` — always
   owned by exactly one app).
 - Nullable `app_id` on providers and MCP servers, where `NULL` means a shared
   pool visible to every app, so one API key need not be entered per app.
@@ -76,9 +76,11 @@ Keys are long-lived and survive daemon restarts (an app that did not spawn the
 daemon has no way to learn a per-launch secret), and only their SHA-256 is
 stored — a leaked database yields no usable credentials.
 
-### Per-app MCP servers, recipes and schedules
+### Per-app MCP servers, specialists and schedules
 
-MCP servers follow the provider model exactly. Recipes and schedules are
+MCP servers follow the provider model exactly. Specialists are nullable too
+(`NULL` = a built-in every app can see and none may modify; an app's own row of
+the same name shadows it). Schedules are
 `NOT NULL` — they encode one app's workflow, not a machine resource, so there
 is no shared variant.
 

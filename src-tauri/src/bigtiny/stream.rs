@@ -9,6 +9,9 @@
 //! - `tool_finish`     -> `chat://tool-call` (phase `tool_call_update`)
 //! - `hitl_pause`      -> `chat://tool-approval-needed` (answered later via
 //!   `respond_permission` -> `POST .../approve`)
+//! - `subagent_status` -> `chat://subagent-status` (a specialist this turn
+//!   delegated to started/finished/failed; carries the *child's* session id so
+//!   the UI can link into its transcript)
 //! - `session_title`   -> `chat://session-title`
 //! - `llm_stop`        -> captures usage for the final `chat://complete`
 //! - `error`           -> `chat://error` at stream end
@@ -174,21 +177,37 @@ pub async fn send_prompt(
     // (the daemon unions these into `metadata.attached_paths`, which
     // `sandbox::allowed_dirs_for_session` honours). Awaited before the SSE call
     // so the allowance is in place when the tool loop computes allowed_dirs.
-    let paths: Vec<String> = attached_paths
+    // Directories and files are registered under different keys, because they
+    // are different grants. An attached *file* allows exactly that file
+    // (`path_within_any`'s equality case); a *directory* widens to its whole
+    // subtree for the rest of the session. Filing a dropped folder under
+    // `attached_paths` made those indistinguishable in the UI — a subtree grant
+    // showed up looking like "a file the user handed over" — so a folder goes
+    // to `working_dirs` instead, which is where the pill's hover list reads
+    // from and where it can be revoked.
+    let (dirs, files): (Vec<String>, Vec<String>) = attached_paths
         .unwrap_or_default()
         .into_iter()
         .filter(|p| !p.trim().is_empty())
-        .collect();
-    if !paths.is_empty() {
+        .partition(|p| std::path::Path::new(p).is_dir());
+
+    if !dirs.is_empty() || !files.is_empty() {
+        let mut patch = serde_json::Map::new();
+        if !files.is_empty() {
+            patch.insert("attached_paths".into(), json!(files));
+        }
+        if !dirs.is_empty() {
+            patch.insert("working_dirs".into(), json!(dirs));
+        }
         if let Err(e) = client
             .patch_json(
                 &format!("/api/chat/{session_id}/config"),
-                &json!({ "attached_paths": paths }),
+                &Value::Object(patch),
             )
             .await
         {
-            // Non-fatal: the attachment path is still named in the prompt text,
-            // so at worst the model hits the old approval flow for it.
+            // Non-fatal: the path is still named in the prompt text, so at
+            // worst the model hits the old approval flow for it.
             tracing::warn!("failed to register attached paths for {session_id}: {e}");
         }
     }
@@ -723,6 +742,24 @@ fn handle_event(
         }
         "hitl_resolved" => {
             notifications::set_tray_pending(app, false);
+        }
+        "subagent_status" => {
+            // The `session_id` *on the frame* is the delegate's, not the
+            // parent's, so the two swap here: this handler's `session_id`
+            // argument is the stream being read, i.e. the parent. That is
+            // deliberate daemon-side — the child id is what lets the UI offer a
+            // click-through into the delegate's own transcript, the escape
+            // hatch for when its structured report was not enough.
+            let _ = app.emit(
+                "chat://subagent-status",
+                json!({
+                    "session_id": session_id,
+                    "child_session_id": event.get("session_id"),
+                    "specialist": event.get("tool_name"),
+                    "status": content,
+                    "error": event.get("error_message"),
+                }),
+            );
         }
         "session_title" => {
             if let Some(title) = content {

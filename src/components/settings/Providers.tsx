@@ -155,7 +155,9 @@ export function Providers({ highlight }: { highlight: string | null }) {
                 >
                   <ProviderTypeIcon type={p.provider_type} />
                 </span>
-                <span className="provider-name-text">{p.name || providerTypeLabel(p.provider_type)}</span>
+                <span className="provider-name-text">
+                  {p.name || providerTypeLabel(p.provider_type)}
+                </span>
                 <span
                   title={`${trustKind(p.network_tier, p.is_trusted)} — ${hostOf(p.base_url)}`}
                   aria-label={trustKind(p.network_tier, p.is_trusted)}
@@ -266,7 +268,10 @@ export function Providers({ highlight }: { highlight: string | null }) {
       )}
 
       {confirmUntrusted && editing && (
-        <Modal title="This provider isn’t marked trusted" onClose={() => setConfirmUntrusted(false)}>
+        <Modal
+          title="This provider isn’t marked trusted"
+          onClose={() => setConfirmUntrusted(false)}
+        >
           <p>
             Prompts, file contents, and tool outputs may be transmitted to{' '}
             <strong>{hostOf(editing.base_url)}</strong> — an unverified third party. Mark it trusted

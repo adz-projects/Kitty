@@ -206,6 +206,24 @@ pub async fn set_parent(
     Ok(out.rows_affected())
 }
 
+/// The session `session_id` was grouped under, if any.
+///
+/// Unscoped, like the other internal accessors above it: the caller is the
+/// orchestrator asking "is this session already a delegate?", and a wrong
+/// answer there would let a delegate spawn delegates. Tenancy is enforced
+/// where the session is *reached*, not here.
+pub async fn parent_of(
+    pool: &SqlitePool,
+    session_id: &str,
+) -> Result<Option<String>, StorageError> {
+    let parent: Option<Option<String>> =
+        sqlx::query_scalar("SELECT parent_session_id FROM sessions WHERE id = ?")
+            .bind(session_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(parent.flatten())
+}
+
 /// The children an app grouped under `parent_id`.
 pub async fn children_of(
     pool: &SqlitePool,
@@ -220,6 +238,21 @@ pub async fn children_of(
     .fetch_all(pool)
     .await?;
     Ok(ids)
+}
+
+/// Tokens a session's transcript accounts for.
+///
+/// Summed from `messages.token_count` rather than tracked separately, so it
+/// cannot drift from the transcript it describes. Used to report what a
+/// delegate cost, which is otherwise invisible: its tokens are spent in a
+/// session nobody is looking at.
+pub async fn token_total(pool: &SqlitePool, session_id: &str) -> Result<i64, StorageError> {
+    let total: Option<i64> =
+        sqlx::query_scalar("SELECT SUM(token_count) FROM messages WHERE session_id = ?")
+            .bind(session_id)
+            .fetch_one(pool)
+            .await?;
+    Ok(total.unwrap_or(0))
 }
 
 /// The last assistant message in a session, which is a job's result.

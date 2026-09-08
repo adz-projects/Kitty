@@ -156,6 +156,15 @@ pub struct ShellRequest {
     pub dry_run: Option<bool>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ShellRoRequest {
+    /// One read-only command. No chaining, redirection or substitution.
+    pub command: String,
+    /// The directory to run it in. Required — it is what lets the daemon check
+    /// this call against the session's allowed directories.
+    pub cwd: String,
+}
+
 fn max_depth_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
     schemars::json_schema!({
         "type": ["integer", "null"],
@@ -1223,6 +1232,14 @@ impl KittyToolsServer {
     )]
     pub async fn shell(&self, Parameters(req): Parameters<ShellRequest>) -> String {
         tools::shell::shell(&req.command, req.dry_run.unwrap_or(false)).await
+    }
+
+    #[tool(
+        name = "lean_shell_ro",
+        description = "Runs ONE read-only shell command in a directory you name, and returns truncated stdout/stderr. Allowed: ls, dir, find, cat, type, head, tail, wc, grep, findstr, rg, stat, file, du, tree. Chaining, redirection and command substitution (; & | > < ` $()) are refused, as are find's -delete/-exec actions. Every path in the command must be RELATIVE and stay inside cwd: absolute paths, drive letters, ~ and .. are refused, so put the folder you want to search in cwd and name files relative to it. Use this to locate and inspect files; use lean_shell when you genuinely need to change something."
+    )]
+    pub async fn shell_ro(&self, Parameters(req): Parameters<ShellRoRequest>) -> String {
+        tools::shell_ro::shell_ro(&req.command, &req.cwd).await
     }
 }
 

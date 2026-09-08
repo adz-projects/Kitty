@@ -74,6 +74,29 @@ pub async fn set_session_context_dir(
 /// `set_session_context_dir`: it hands the session a new `<base>/chats/…`
 /// directory so `is_default_folder` becomes true again, and returns the
 /// refreshed `SessionInfo` for the chat header to re-render from.
+/// The folders this session may reach because the user granted them: its own
+/// chat folder, every working folder set during the session, and anything
+/// attached. Backs the working-directory pill's hover list.
+#[tauri::command]
+pub async fn list_session_allowed_dirs(
+    app: AppHandle,
+    session_id: String,
+) -> Result<serde_json::Value, String> {
+    crate::bigtiny::sessions::allowed_dirs(&app, &session_id).await
+}
+
+/// Withdraw one granted path. The pill's hover list is the only place this is
+/// reachable, which is deliberate: an allowance the user cannot see is one they
+/// cannot knowingly withdraw.
+#[tauri::command]
+pub async fn revoke_session_dir(
+    app: AppHandle,
+    session_id: String,
+    path: String,
+) -> Result<(), String> {
+    crate::bigtiny::sessions::revoke_dir(&app, &session_id, &path).await
+}
+
 #[tauri::command]
 pub async fn reset_session_context_dir(
     app: AppHandle,

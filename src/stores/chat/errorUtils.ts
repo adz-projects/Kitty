@@ -127,13 +127,16 @@ const TRANSCRIPT_WRAPPER_PREAMBLE =
 // (e.g. a pasted chat log) and eat its head. Model-sensible text, not a
 // control sequence, since it rides along in the prompt the model sees.
 const TRANSCRIPT_SENTINEL = '[End of earlier conversation]';
-// The hidden `<recipe>…</recipe>` + "Run the recipe above now…" wrapper
-// `sendWithRecipe` prepends. `[^>]*` tolerates any title attribute content
+// The hidden `<recipe>…</recipe>` + "Run the recipe above now…" wrapper the
+// removed recipes feature used to prepend. Nothing produces one any more, but
+// sessions recorded before specialists replaced recipes still carry it, and a
+// replay that stopped stripping it would start showing raw markup in old
+// transcripts. `[^>]*` tolerates any title attribute content
 // (except a literal `>`); the lazy `[\s\S]*?` stops at the first
 // `\n</recipe>`; `[^>]*\n\n` after it consumes the single-line run
 // instruction. Unlike the system/transcript wrappers (first turn only), a
-// recipe can be invoked on ANY turn, so this is stripped from every replayed
-// user message — see `stripRecipeWrapper`'s use below.
+// a recipe could be invoked on ANY turn, so this is stripped from every
+// replayed user message — see `stripRecipeWrapper`'s use below.
 const RECIPE_WRAPPER_RE = /^<recipe\b[^>]*>\n[\s\S]*?\n<\/recipe>\n\n[^\n]*\n\n/;
 
 /** Strip a known prompt-preamble wrapper from a replayed first user message, if
@@ -166,8 +169,9 @@ export function stripPromptPreamble(text: string): string {
   return text;
 }
 
-/** Strip the hidden `<recipe>` wrapper from a replayed user message, if
-    present. Separate from `stripPromptPreamble` because a recipe can be
+/** Strip the historical `<recipe>` wrapper from a replayed user message, if
+    present. Kept for transcripts recorded before specialists replaced recipes.
+    Separate from `stripPromptPreamble` because a recipe could be
     invoked on any turn (not just the first), so this runs on every replayed
     user message; on a recipe-invoked first turn the recipe wrapper is
     outermost (wraps the system-prompt wrapper), so callers strip this first

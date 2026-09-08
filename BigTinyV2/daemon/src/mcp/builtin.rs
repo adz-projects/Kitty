@@ -42,6 +42,8 @@ pub async fn connect(
     name: &str,
     server_id: String,
     engine: Option<Arc<adaptive_pathway::engine::PathwayEngine>>,
+    orchestrator: Option<Arc<crate::agent::orchestrator::Orchestrator>>,
+    pool: sqlx::SqlitePool,
 ) -> Result<MCPServerClient, MCPServerError> {
     match name {
         "pathway" => {
@@ -60,6 +62,30 @@ pub async fn connect(
                 let server = adaptive_pathway::mcp::PathwayServer::new(engine, String::new());
                 if let Err(e) = server.serve_in_process(stream).await {
                     tracing::error!("pathway in-process server exited with error: {e}");
+                }
+            })
+            .await
+        }
+        "specialists" => {
+            // The daemon's only MCP *server* role, and the one built-in that
+            // reaches back into the daemon rather than out to a plugin crate:
+            // it needs the orchestrator to run a delegate and the pool to
+            // resolve which definition the calling app should get.
+            //
+            // `None` means the orchestrator was never attached — a host that
+            // built an `MCPManager` without an `Agent`, i.e. a test. Refuse
+            // rather than connecting a server whose only tool would fail on
+            // every call.
+            let orchestrator = orchestrator.ok_or_else(|| {
+                MCPServerError::Generic(
+                    "specialists MCP server requested but no orchestrator is attached".to_string(),
+                )
+            })?;
+            MCPServerClient::connect_in_process(server_id, |stream| async move {
+                let server =
+                    crate::specialists::server::SpecialistServer::new(pool, orchestrator);
+                if let Err(e) = server.serve_in_process(stream).await {
+                    tracing::error!("specialists in-process server exited with error: {e}");
                 }
             })
             .await
@@ -96,7 +122,8 @@ pub async fn connect(
 
 /// Every registered built-in name, for callers that want to validate a
 /// configured name before attempting a connect.
-pub const BUILTIN_SERVERS: [&str; 4] = ["kitty-tools", "kitty-web", "kitty-wasm", "pathway"];
+pub const BUILTIN_SERVERS: [&str; 5] =
+    ["kitty-tools", "kitty-web", "kitty-wasm", "pathway", "specialists"];
 
 /// Tool names owned by the `pathway` server, which need the executing
 /// session id injected into their arguments before dispatch
@@ -108,9 +135,31 @@ pub const PATHWAY_TOOLS: [&str; 2] = ["record", "forget"];
 mod tests {
     use super::*;
 
+    async fn test_pool() -> sqlx::SqlitePool {
+        sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap()
+    }
+
+    async fn test_orchestrator() -> Arc<crate::agent::orchestrator::Orchestrator> {
+        // Never attached to an `Agent`, which is exactly right for a connect
+        // test: the server must come up and advertise its tools without one.
+        Arc::new(crate::agent::orchestrator::Orchestrator::new(
+            test_pool().await,
+            1,
+            0.25,
+            vec![],
+            300,
+        ))
+    }
+
     #[tokio::test]
     async fn connects_the_kitty_tools_builtin_and_lists_its_tools() {
-        let client = connect("kitty-tools", "test-kitty-tools".to_string(), None)
+        let client = connect(
+            "kitty-tools",
+            "test-kitty-tools".to_string(),
+            None,
+            None,
+            test_pool().await,
+        )
             .await
             .expect("kitty-tools in-process connect should succeed");
 
@@ -127,13 +176,26 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_builtin_name_is_a_clean_error_not_a_panic() {
-        let result = connect("no-such-server", "test".to_string(), None).await;
+        let result = connect(
+            "no-such-server",
+            "test".to_string(),
+            None,
+            None,
+            test_pool().await,
+        )
+        .await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn connects_the_kitty_web_builtin_and_lists_its_tools() {
-        let client = connect("kitty-web", "test-kitty-web".to_string(), None)
+        let client = connect(
+            "kitty-web",
+            "test-kitty-web".to_string(),
+            None,
+            None,
+            test_pool().await,
+        )
             .await
             .expect("kitty-web in-process connect should succeed");
         let names: Vec<&str> = client.tools().iter().map(|t| t.name.as_str()).collect();
@@ -143,7 +205,13 @@ mod tests {
 
     #[tokio::test]
     async fn connects_the_kitty_wasm_builtin_and_lists_its_tools() {
-        let client = connect("kitty-wasm", "test-kitty-wasm".to_string(), None)
+        let client = connect(
+            "kitty-wasm",
+            "test-kitty-wasm".to_string(),
+            None,
+            None,
+            test_pool().await,
+        )
             .await
             .expect("kitty-wasm in-process connect should succeed");
         let names: Vec<&str> = client.tools().iter().map(|t| t.name.as_str()).collect();
@@ -164,10 +232,17 @@ mod tests {
         )
         .await
         .expect("in-memory pathway engine");
+        let orchestrator = test_orchestrator().await;
         for name in BUILTIN_SERVERS {
-            connect(name, format!("test-{name}"), Some(engine.clone()))
-                .await
-                .unwrap_or_else(|e| panic!("advertised builtin {name} failed to connect: {e}"));
+            connect(
+                name,
+                format!("test-{name}"),
+                Some(engine.clone()),
+                Some(orchestrator.clone()),
+                test_pool().await,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("advertised builtin {name} failed to connect: {e}"));
         }
     }
 
@@ -178,7 +253,13 @@ mod tests {
         )
         .await
         .expect("in-memory pathway engine");
-        let client = connect("pathway", "test-pathway".to_string(), Some(engine))
+        let client = connect(
+            "pathway",
+            "test-pathway".to_string(),
+            Some(engine),
+            None,
+            test_pool().await,
+        )
             .await
             .expect("pathway in-process connect should succeed");
         let names: Vec<&str> = client.tools().iter().map(|t| t.name.as_str()).collect();
@@ -191,11 +272,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_specialists_server_advertises_both_delegation_tools() {
+        let client = connect(
+            "specialists",
+            "test-specialists".to_string(),
+            None,
+            Some(test_orchestrator().await),
+            test_pool().await,
+        )
+        .await
+        .expect("specialists in-process connect should succeed");
+        let names: Vec<&str> = client.tools().iter().map(|t| t.name.as_str()).collect();
+        for tool in crate::specialists::server::SESSION_SCOPED_TOOLS {
+            assert!(
+                names.contains(&tool),
+                "specialists must advertise {tool}; it is how the model delegates at all"
+            );
+        }
+    }
+
+    /// Mirrors the pathway arm's contract: a built-in whose dependency is
+    /// missing must refuse, not connect a server whose every call would fail.
+    #[tokio::test]
+    async fn specialists_fails_cleanly_without_an_orchestrator() {
+        match connect(
+            "specialists",
+            "test-specialists-off".to_string(),
+            None,
+            None,
+            test_pool().await,
+        )
+        .await
+        {
+            Ok(_) => panic!("specialists must not connect without an orchestrator"),
+            Err(e) => assert!(e.to_string().contains("orchestrator"), "unexpected: {e}"),
+        }
+    }
+
+    #[tokio::test]
     async fn pathway_fails_cleanly_when_the_engine_is_disabled() {
         // `engine == None` whenever behavioral memory is configured off. A
         // clean error is right; half-connecting a server whose tools would
         // then panic is not.
-        match connect("pathway", "test-pathway-off".to_string(), None).await {
+        match connect(
+            "pathway",
+            "test-pathway-off".to_string(),
+            None,
+            None,
+            test_pool().await,
+        )
+        .await
+        {
             Ok(_) => panic!("pathway must not connect without an engine"),
             Err(e) => assert!(e.to_string().contains("disabled"), "unexpected error: {e}"),
         }

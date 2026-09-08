@@ -19,8 +19,6 @@ pub struct BigTinyConfig {
     #[serde(default)]
     pub hitl: HITLConfig,
     #[serde(default)]
-    pub recipes: RecipesConfig,
-    #[serde(default)]
     pub scheduler: SchedulerConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
@@ -118,6 +116,27 @@ pub struct ProviderConfig {
     /// silently thrashes the KV cache instead of pinning it.
     #[serde(default)]
     pub parallel_slots: Option<u32>,
+    /// Whether this provider may host delegate runs: `"preferred"`,
+    /// `"allowed"` (the default when absent), or `"never"`.
+    ///
+    /// The user's own statement, set in Kitty's provider settings. It is step
+    /// one of the fallback chain precisely because it is the only signal here
+    /// that reflects intent rather than measurement.
+    #[serde(default)]
+    pub subagent_role: Option<String>,
+    /// `"economy" | "moderate" | "premium"`, folded by Kitty from its
+    /// OpenRouter catalog (`openrouter::catalog`).
+    ///
+    /// Pushed down as a scalar rather than the daemon fetching a catalog: the
+    /// daemon serves apps other than Kitty and must not acquire a Kitty-shaped
+    /// dependency it cannot refresh or validate. `None` for most self-hosted
+    /// profiles, which is the ordinary case, not a degenerate one.
+    #[serde(default)]
+    pub cost_tier: Option<String>,
+    /// 0-100 capability score, likewise folded by Kitty from the catalog's
+    /// coding/agentic indices.
+    #[serde(default)]
+    pub capability_rank: Option<i32>,
     /// Sampling overrides for this provider. All `None` by default — serde
     /// silently drops unknown fields on this struct, which is what let these
     /// settings round-trip through Kitty's UI for months without ever
@@ -475,6 +494,52 @@ pub struct AgentConfig {
     /// failure mode than a silent bypass.
     #[serde(default)]
     pub sandbox_strict: bool,
+    /// How many specialist runs may be in flight across the daemon at once.
+    ///
+    /// Separate from `max_concurrent_tool_calls` (which bounds one turn's tool
+    /// fan-out) and from a provider's own `parallel_slots` (which bounds
+    /// requests, not agents): a delegate holds its slot across its whole run,
+    /// including the stretches where it is executing tools and sending nothing.
+    /// Without a bound of its own, a single turn that decides to delegate ten
+    /// times commits to ten full agent runs before anyone can see the bill.
+    ///
+    /// Default 3 — enough for real fan-out on a desktop, low enough that a
+    /// runaway is visible rather than ruinous.
+    #[serde(default = "default_max_concurrent_specialists")]
+    pub max_concurrent_specialists: i32,
+    /// Share of a delegate's remaining context window it may spend on
+    /// reasoning, when its definition names no cap of its own.
+    ///
+    /// Delegates are capped by default and ordinary chat is not, deliberately.
+    /// A user watching their own conversation can see a model over-thinking and
+    /// stop it; nobody is watching a delegate, it blocks the turn that called
+    /// it, and it holds one of a small number of concurrency permits while it
+    /// does. Cutting off a user's own hard question is the worse failure.
+    ///
+    /// A quarter, because reasoning is only one claim on the window: tool
+    /// results and the structured report need the rest.
+    #[serde(default = "default_specialist_reasoning_fraction")]
+    pub specialist_reasoning_fraction: f64,
+    /// Models that may never host a delegate, as exact ids or `prefix*`
+    /// patterns matched case-insensitively.
+    ///
+    /// Separate from a provider's `subagent_role` because the thing a user
+    /// wants to forbid is usually a *model*: denying an expensive flagship must
+    /// not also deny the cheap sibling on the same provider profile.
+    ///
+    /// Checked at final host resolution, not only while scoring — the last step
+    /// before refusing is "run on the parent's own provider", and the parent's
+    /// model is exactly the one this list exists to keep delegates off.
+    #[serde(default)]
+    pub subagent_model_deny: Vec<String>,
+    /// How long one delegate may run before it is cancelled.
+    ///
+    /// Matches `SUMMARIZER_OVERALL_TIMEOUT`, and exists for the same reason:
+    /// the turn machinery bounds gaps between bytes, not total duration, so a
+    /// slow-but-alive run is otherwise unbounded — and this one blocks the
+    /// parent's tool call while holding a concurrency permit.
+    #[serde(default = "default_specialist_timeout_secs")]
+    pub specialist_timeout_secs: u64,
 }
 
 impl Default for AgentConfig {
@@ -483,12 +548,28 @@ impl Default for AgentConfig {
             max_concurrent_tool_calls: default_max_concurrent_tool_calls(),
             disconnect_grace_secs: default_disconnect_grace_secs(),
             sandbox_strict: false,
+            max_concurrent_specialists: default_max_concurrent_specialists(),
+            specialist_reasoning_fraction: default_specialist_reasoning_fraction(),
+            subagent_model_deny: Vec::new(),
+            specialist_timeout_secs: default_specialist_timeout_secs(),
         }
     }
 }
 
 fn default_max_concurrent_tool_calls() -> i32 {
     5
+}
+
+fn default_max_concurrent_specialists() -> i32 {
+    3
+}
+
+fn default_specialist_reasoning_fraction() -> f64 {
+    0.25
+}
+
+fn default_specialist_timeout_secs() -> u64 {
+    300
 }
 
 fn default_disconnect_grace_secs() -> u64 {
@@ -528,23 +609,6 @@ impl Default for HITLConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct RecipesConfig {
-    #[serde(default = "default_recipes_directory")]
-    pub directory: String,
-}
-
-impl Default for RecipesConfig {
-    fn default() -> Self {
-        Self {
-            directory: default_recipes_directory(),
-        }
-    }
-}
-
-pub fn default_recipes_directory() -> String {
-    "~/.bigtiny/recipes".into()
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SchedulerConfig {
@@ -674,9 +738,6 @@ Ok(config)
         }
         if other.hitl != HITLConfig::default() {
             self.hitl = other.hitl.clone();
-        }
-        if other.recipes != RecipesConfig::default() {
-            self.recipes = other.recipes.clone();
         }
         if other.scheduler != SchedulerConfig::default() {
             self.scheduler = other.scheduler.clone();

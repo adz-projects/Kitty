@@ -42,7 +42,7 @@ control how the daemon is spawned:
   daemon Kitty finds may belong to another application. Readiness and the 5s
   health loop still probe `GET /api/health` (open without auth by design). Also passes `BIGTINY_DATA_DIR` (`config::bigtiny_data_dir()`)
   pointing at `%APPDATA%/Kitty/bigtiny/` — consolidates BigTiny's own db,
-  directory-sandbox cache dir, and recipes dir there instead of its
+  directory-sandbox cache dir there instead of its
   standalone `~/.bigtiny` default; a one-time
   migration moves an existing `~/.bigtiny` over the first time this runs
   post-upgrade. Readiness and the 5s health loop probe `GET /api/health`
@@ -93,9 +93,10 @@ control how the daemon is spawned:
   modes. The client-side chat/agentic override works as before.
 - **No thinking-effort control**: `thinking_effort` is always `null`, so the
   UI hides the dropdown.
-- **Recipe extensions are skipped**: BigTiny MCP servers are daemon-global,
-  not per-session; recipe prompts still work, their extension hints just
-  don't attach anything.
+- **Specialists replaced recipes**: a specialist's tool set is a per-run
+  allow-list over the daemon's own MCP registry (`tool_allow` in session
+  metadata, enforced at dispatch), so there is no per-session extension to
+  attach and nothing to skip.
 - **Session list carries no provider/model memory** yet — resumed sessions
   stay on the currently-active provider.
 - **No context-management-strategy setting** — goosed's `GOOSE_CONTEXT_STRATEGY`

@@ -70,15 +70,12 @@ pub async fn create_schedule(
     Extension(identity): Extension<AppIdentity>,
     Json(body): Json<Value>,
 ) -> Response {
-    let (Some(name), Some(cron), Some(recipe_id)) = (
+    let (Some(name), Some(cron), Some(prompt)) = (
         body.get("name").and_then(|v| v.as_str()),
         body.get("cron").and_then(|v| v.as_str()),
-        body.get("recipe_id").and_then(|v| v.as_str()),
+        body.get("prompt").and_then(|v| v.as_str()),
     ) else {
-        return err_response(
-            StatusCode::BAD_REQUEST,
-            "name, cron, recipe_id are required",
-        );
+        return err_response(StatusCode::BAD_REQUEST, "name, cron, prompt are required");
     };
     let enabled = body
         .get("enabled")
@@ -87,7 +84,7 @@ pub async fn create_schedule(
 
     let mut scheduler = state.scheduler.lock().await;
     match scheduler
-        .add_job(name, cron, recipe_id, enabled, &identity.app_id)
+        .add_job(name, cron, prompt, enabled, &identity.app_id)
         .await
     {
         Ok(id) => Json(json!({"id": id})).into_response(),
@@ -143,15 +140,15 @@ pub async fn run_now(
     Path(id): Path<String>,
 ) -> Response {
     // Run the job WITHOUT the scheduler mutex: it's a potentially multi-minute
-    // recipe turn that only needs DB + recipe engine — holding the lock across
-    // it would serialize every other `POST/PATCH/DELETE /api/schedules*` (and
-    // other run_nows) behind this one job for its whole run.
-    // Scoped: triggering another app's schedule would run its recipe, on
-    // its provider, against its billing account.
+    // turn that only needs DB + agent — holding the lock across it would
+    // serialize every other `POST/PATCH/DELETE /api/schedules*` (and other
+    // run_nows) behind this one job for its whole run.
+    // Scoped: triggering another app's schedule would run its turn, on its
+    // provider, against its billing account.
     let exists = schedules::get_schedule_for_app(&state.db, &id, &identity.app_id).await;
     match exists {
         Ok(Some(_)) => {
-            crate::scheduler::execute_job(&state.db, &state.recipe_engine, &id).await;
+            crate::scheduler::execute_job(&state.db, &state.agent, &id).await;
             Json(json!({"ok": true})).into_response()
         }
         // NotFound for a missing job; 500 for a real storage failure — the

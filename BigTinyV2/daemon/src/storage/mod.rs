@@ -6,9 +6,9 @@ pub mod hitl_rules;
 pub mod mcp_servers;
 pub mod messages;
 pub mod providers;
-pub mod recipes;
 pub mod schedules;
 pub mod sessions;
+pub mod specialists;
 pub mod timings;
 
 use sqlx::migrate::Migrate;
@@ -435,8 +435,7 @@ mod tests {
     use sqlx::SqlitePool;
 
     use super::{
-        execution, hitl_rules, mcp_servers, messages, providers, recipes, schedules, sessions,
-        timings,
+        execution, hitl_rules, mcp_servers, messages, providers, schedules, sessions, timings,
     };
 
     async fn get_test_pool() -> SqlitePool {
@@ -1053,36 +1052,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_delete_recipe_cascades_schedule_jobs() {
-        // Migration 012 added ON DELETE CASCADE to `schedule_jobs.recipe_id` —
-        // deleting a still-referenced recipe used to 500.
-        let pool = get_test_pool().await;
-        sqlx::query("INSERT INTO recipes (id, name, prompt_template, max_steps) VALUES ('r-cascade', 'R', 'p', 10)")
-            .execute(&pool)
-            .await
-            .unwrap();
-        sqlx::query(
-            "INSERT INTO schedule_jobs (id, name, cron, recipe_id, enabled) \
-             VALUES ('s-cascade', 'job', '0 9 * * *', 'r-cascade', 1)",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        sqlx::query("DELETE FROM recipes WHERE id = 'r-cascade'")
-            .execute(&pool)
-            .await
-            .unwrap();
-
-        let leftover: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM schedule_jobs WHERE id = 's-cascade'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(leftover, 0);
-    }
-
-    #[tokio::test]
     async fn test_compaction_lock_cas_and_stale_reclaim() {
         let pool = get_test_pool().await;
         sessions::create_session(&pool, "compact-1", "Compaction Test")
@@ -1262,57 +1231,115 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_recipe_crud() {
+    async fn test_specialist_crud_and_shadowing() {
+        use super::specialists;
+        use crate::models::specialist::Specialist;
+
         let pool = get_test_pool().await;
 
-        recipes::create_recipe(
+        // Built-ins are seeded once and never overwritten, so a user who edits
+        // one keeps that edit across restarts.
+        let seeded = crate::specialists::registry::seed_builtins(&pool)
+            .await
+            .unwrap();
+        assert!(seeded > 0);
+        assert_eq!(
+            crate::specialists::registry::seed_builtins(&pool)
+                .await
+                .unwrap(),
+            0,
+            "re-seeding must not rewrite existing definitions"
+        );
+
+        let visible = specialists::list_visible(&pool, "test-app").await.unwrap();
+        assert_eq!(visible.len(), seeded, "an app sees every built-in");
+        assert!(visible.iter().all(|s| s.builtin && s.app_id.is_none()));
+
+        // An app's own definition of the same name shadows the built-in for
+        // that app -- one row per name, and it is the app's.
+        specialists::upsert(
             &pool,
-            "r1",
-            "Code Review",
-            "Review this code: {}",
-            Some("Be thorough"),
-            10,
-            "test-app",
+            &Specialist {
+                id: "mine".into(),
+                app_id: Some("test-app".into()),
+                name: "researcher".into(),
+                description: "My researcher.".into(),
+                system_prompt: "Be terse.".into(),
+                provider: None,
+                model: None,
+                tool_allow: vec!["lean_web_search".into()],
+                response_schema: None,
+                max_steps: 5,
+                reasoning_cap: None,
+                fan_out: None,
+                max_concurrent: None,
+                enabled: true,
+                builtin: false,
+            },
         )
         .await
         .unwrap();
 
-        let got = recipes::get_recipe(&pool, "r1").await.unwrap().unwrap();
-        assert_eq!(got.id, "r1");
-        assert_eq!(got.name, "Code Review");
-        assert_eq!(got.max_steps, 10);
-
-        let list = recipes::list_recipes(&pool).await.unwrap();
-        assert_eq!(list.len(), 1);
-
-        recipes::update_recipe(&pool, "r1", Some("Code Review v2"), None, None)
+        let resolved = specialists::resolve(&pool, "test-app", "researcher")
             .await
+            .unwrap()
             .unwrap();
-        let updated = recipes::get_recipe(&pool, "r1").await.unwrap().unwrap();
-        assert_eq!(updated.name, "Code Review v2");
+        assert_eq!(resolved.id, "mine", "an app's own row wins");
 
-        let deleted = recipes::delete_recipe(&pool, "r1").await.unwrap();
-        assert_eq!(deleted, 1);
+        let visible = specialists::list_visible(&pool, "test-app").await.unwrap();
+        assert_eq!(visible.len(), seeded, "the shadow replaces, not duplicates");
+        assert_eq!(
+            visible.iter().filter(|s| s.name == "researcher").count(),
+            1
+        );
+
+        // ...and only for that app. Another app still gets the built-in, which
+        // is the whole point of scoping the override.
+        let other = specialists::resolve(&pool, "other-app", "researcher")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(other.id, "builtin:researcher");
+
+        // Deleting the shadow reverts to the built-in rather than removing the
+        // specialist.
+        assert_eq!(
+            specialists::delete_for_app(&pool, "mine", "test-app")
+                .await
+                .unwrap(),
+            1
+        );
+        let reverted = specialists::resolve(&pool, "test-app", "researcher")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reverted.id, "builtin:researcher");
+
+        // A built-in is matched by no app-scoped delete, which is what makes it
+        // undeletable without a special case in the storage layer.
+        assert_eq!(
+            specialists::delete_for_app(&pool, "builtin:researcher", "test-app")
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]
     async fn test_schedule_crud() {
         let pool = get_test_pool().await;
-        recipes::create_recipe(
+
+        schedules::create_schedule(
             &pool,
-            "r1",
-            "Code Review",
-            "Review this code: {}",
-            Some("Be thorough"),
-            10,
+            "sch1",
+            "Daily Review",
+            "0 9 * * *",
+            "Review yesterday's commits",
+            1,
             "test-app",
         )
         .await
         .unwrap();
-
-        schedules::create_schedule(&pool, "sch1", "Daily Review", "0 9 * * *", "r1", 1, "test-app")
-            .await
-            .unwrap();
 
         let got = schedules::get_schedule(&pool, "sch1")
             .await
@@ -1320,6 +1347,7 @@ mod tests {
             .unwrap();
         assert_eq!(got.id, "sch1");
         assert_eq!(got.cron, "0 9 * * *");
+        assert_eq!(got.prompt, "Review yesterday's commits");
         assert_eq!(got.enabled, 1);
 
         let list = schedules::list_schedules(&pool).await.unwrap();
@@ -1349,7 +1377,7 @@ mod tests {
             .await
             .unwrap();
 
-        let execs = execution::get_executions_for_recipe(&pool, "sch1", 100)
+        let execs = execution::get_executions_for_trigger(&pool, "sch1", 100)
             .await
             .unwrap();
         assert_eq!(execs.len(), 1);
@@ -1359,7 +1387,7 @@ mod tests {
         execution::update_execution_status(&pool, "exec1", "completed", Some("All done"), None)
             .await
             .unwrap();
-        let execs = execution::get_executions_for_recipe(&pool, "sch1", 100)
+        let execs = execution::get_executions_for_trigger(&pool, "sch1", 100)
             .await
             .unwrap();
         assert_eq!(execs[0].status, "completed");

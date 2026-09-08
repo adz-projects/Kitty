@@ -21,7 +21,6 @@ use bigtiny2::config::BigTinyConfig;
 use bigtiny2::hitl::manager::HITLManager;
 use bigtiny2::mcp::MCPManager;
 use bigtiny2::provider::router::ProviderRouter;
-use bigtiny2::recipes::engine::RecipeEngine;
 use bigtiny2::routes::AppState;
 use bigtiny2::scheduler::Scheduler;
 use bigtiny2::storage::apps::{self, AppIdentity};
@@ -68,14 +67,18 @@ async fn test_state() -> Arc<AppState> {
         std::env::temp_dir().to_string_lossy().into_owned(),
         plugins.clone(),
     ));
-    let recipe_engine = Arc::new(RecipeEngine::new(
+    let orchestrator = Arc::new(bigtiny2::agent::orchestrator::Orchestrator::new(
         pool.clone(),
-        agent.clone(),
-        mcp.clone(),
-        std::env::temp_dir(),
+        config.agent.max_concurrent_specialists.max(1) as usize,
+        config.agent.specialist_reasoning_fraction,
+        config.agent.subagent_model_deny.clone(),
+        config.agent.specialist_timeout_secs,
     ));
+    orchestrator.attach(&agent);
+    orchestrator.attach_router(router.clone());
+    mcp.attach_orchestrator(orchestrator.clone());
     let scheduler = Arc::new(tokio::sync::Mutex::new(
-        Scheduler::new(pool.clone(), recipe_engine.clone())
+        Scheduler::new(pool.clone(), agent.clone())
             .await
             .unwrap(),
     ));
@@ -85,7 +88,7 @@ async fn test_state() -> Arc<AppState> {
         agent,
         mcp,
         router,
-        recipe_engine,
+        orchestrator,
         scheduler,
         config,
         plugins: plugins.clone(),
@@ -656,7 +659,7 @@ async fn provider_api_keys_are_never_echoed_back() {
 }
 
 // ---------------------------------------------------------------------------
-// MCP servers, recipes, schedules
+// MCP servers, specialists, schedules
 //
 // MCP servers follow the provider model (visible = own or shared, mutable =
 // own only). Recipes and schedules are always exactly one app's -- they encode
@@ -793,45 +796,66 @@ async fn a_shared_mcp_server_is_usable_but_not_reconfigurable() {
 }
 
 #[tokio::test]
-async fn recipes_are_scoped_and_not_executable_across_apps() {
+async fn specialists_are_scoped_and_not_runnable_across_apps() {
     let state = test_state().await;
     let req = Request::builder()
         .method(Method::POST)
-        .uri("/api/recipes")
+        .uri("/api/specialists")
         .header("content-type", "application/json")
         .body(Body::from(
-            json!({"name": "a-recipe", "prompt_template": "do the thing"}).to_string(),
+            json!({
+                "name": "a-specialist",
+                "description": "does the thing",
+                "system_prompt": "do the thing",
+                "tool_allow": []
+            })
+            .to_string(),
         ))
         .unwrap();
     let resp = router_as(state.clone(), APP_A).oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let id = body_json(resp).await["id"].as_str().unwrap().to_string();
 
-    let list = |app: &str| {
+    let names = |app: &str| {
         let state = state.clone();
         let app = app.to_string();
         async move {
             let req = Request::builder()
-                .uri("/api/recipes")
+                .uri("/api/specialists")
                 .body(Body::empty())
                 .unwrap();
             let body = body_json(router_as(state, &app).oneshot(req).await.unwrap()).await;
-            body["recipes"].as_array().unwrap().len()
+            body["specialists"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|s| s["name"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
         }
     };
-    assert_eq!(list(APP_A).await, 1);
-    assert_eq!(list(APP_B).await, 0, "recipes must not leak across apps");
+    assert!(names(APP_A).await.contains(&"a-specialist".to_string()));
+    assert!(
+        !names(APP_B).await.contains(&"a-specialist".to_string()),
+        "a private specialist must not leak across apps"
+    );
 
-    // Executing it would run A's workflow on A's provider and billing account.
-    let exec = Request::builder()
+    // Running it would delegate on A's provider and billing account. B does not
+    // even resolve the name, so this is a 404 rather than a 403.
+    let parent = uuid::Uuid::new_v4().to_string();
+    bigtiny2::storage::sessions::create_session_for_app(&state.db, &parent, "B parent", APP_B)
+        .await
+        .unwrap();
+    let run = Request::builder()
         .method(Method::POST)
-        .uri(format!("/api/recipes/{id}/execute"))
+        .uri("/api/specialists/a-specialist/run")
         .header("content-type", "application/json")
-        .body(Body::from("{}"))
+        .body(Body::from(
+            json!({"request": "go", "session_id": parent}).to_string(),
+        ))
         .unwrap();
     assert_eq!(
         router_as(state.clone(), APP_B)
-            .oneshot(exec)
+            .oneshot(run)
             .await
             .unwrap()
             .status(),
@@ -840,7 +864,7 @@ async fn recipes_are_scoped_and_not_executable_across_apps() {
 
     let del = Request::builder()
         .method(Method::DELETE)
-        .uri(format!("/api/recipes/{id}"))
+        .uri(format!("/api/specialists/{id}"))
         .body(Body::empty())
         .unwrap();
     assert_eq!(
@@ -851,31 +875,56 @@ async fn recipes_are_scoped_and_not_executable_across_apps() {
             .status(),
         StatusCode::NOT_FOUND
     );
-    assert_eq!(
-        list(APP_A).await,
-        1,
+    assert!(
+        names(APP_A).await.contains(&"a-specialist".to_string()),
         "the failed delete must not have landed"
     );
+}
+
+/// A delegate may not be grafted onto another app's session tree.
+///
+/// The parent is what a delegate's own session is tagged under and what its
+/// status events are pushed to, so a cross-app parent would let one app both
+/// bill another and read the result — checked before anything runs.
+#[tokio::test]
+async fn a_specialist_run_cannot_name_another_apps_session_as_its_parent() {
+    let state = test_state().await;
+    bigtiny2::specialists::registry::seed_builtins(&state.db)
+        .await
+        .unwrap();
+
+    let a_session = uuid::Uuid::new_v4().to_string();
+    bigtiny2::storage::sessions::create_session_for_app(&state.db, &a_session, "A", APP_A)
+        .await
+        .unwrap();
+
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/api/specialists/researcher/run")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({"request": "go", "session_id": a_session}).to_string(),
+        ))
+        .unwrap();
+    assert_eq!(
+        router_as(state.clone(), APP_B)
+            .oneshot(req)
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND,
+        "app B must not delegate under app A's session"
+    );
+
+    let children = bigtiny2::storage::sessions::children_of(&state.db, &a_session, APP_A)
+        .await
+        .unwrap();
+    assert!(children.is_empty(), "no delegate session may have been created");
 }
 
 #[tokio::test]
 async fn schedules_are_scoped_and_not_triggerable_across_apps() {
     let state = test_state().await;
-
-    // A schedule needs a recipe to point at.
-    let req = Request::builder()
-        .method(Method::POST)
-        .uri("/api/recipes")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            json!({"name": "a-recipe", "prompt_template": "x"}).to_string(),
-        ))
-        .unwrap();
-    let recipe_id = body_json(router_as(state.clone(), APP_A).oneshot(req).await.unwrap()).await
-        ["id"]
-        .as_str()
-        .unwrap()
-        .to_string();
 
     let req = Request::builder()
         .method(Method::POST)
@@ -885,7 +934,7 @@ async fn schedules_are_scoped_and_not_triggerable_across_apps() {
             json!({
                 "name": "nightly",
                 "cron": "0 0 3 * * *",
-                "recipe_id": recipe_id,
+                "prompt": "x",
                 "enabled": false
             })
             .to_string(),
@@ -1801,38 +1850,49 @@ async fn status_reports_only_providers_the_caller_can_use() {
 }
 
 #[tokio::test]
-async fn a_recipe_run_produces_a_session_owned_by_the_recipes_app() {
-    // The recipe engine created its session with no `app_id` at all, so the
-    // row carried migration 017's `''` placeholder: invisible to the very app
-    // that asked for the run, and with no app whose default provider to use.
-    use bigtiny2::storage::recipes;
-
+async fn a_specialist_run_produces_a_session_owned_by_the_calling_app() {
+    // The recipe engine this replaces created its session with no `app_id` at
+    // all, so the row carried migration 017's `''` placeholder: invisible to the
+    // very app that asked for the run, and with no app whose default provider to
+    // use. The orchestrator derives the owner from the parent instead.
     let state = test_state().await;
-    recipes::create_recipe(
-        &state.db,
-        "r1",
-        "Recipe One",
-        "say {{ thing }}",
-        None,
-        10,
-        APP_A,
-    )
-    .await
-    .unwrap();
+    bigtiny2::specialists::registry::seed_builtins(&state.db)
+        .await
+        .unwrap();
 
-    // The turn itself fails -- there is no provider -- but the session row is
-    // written before the turn runs, which is the part under test.
-    let _ = state
-        .recipe_engine
-        .execute("r1", json!({"thing": "hello"}))
-        .await;
+    // A registered (if unreachable) provider, because host selection now runs
+    // *before* the session is created and refuses outright when nothing can
+    // host a delegate. Registered inside this test rather than in the shared
+    // harness so it cannot perturb the provider-scoping tests.
+    state.router.register_openai(
+        "mock",
+        bigtiny2::config::ProviderConfig {
+            base_url: "http://127.0.0.1:9".into(),
+            ..Default::default()
+        },
+    );
 
-    let owners: Vec<String> =
-        sqlx::query_scalar("SELECT app_id FROM sessions WHERE name = 'Recipe One'")
-            .fetch_all(&state.db)
-            .await
-            .unwrap();
-    assert_eq!(owners, vec![APP_A.to_string()], "recipe session is unowned");
+    let parent = uuid::Uuid::new_v4().to_string();
+    bigtiny2::storage::sessions::create_session_for_app(&state.db, &parent, "Parent", APP_A)
+        .await
+        .unwrap();
+
+    // The turn itself fails -- the provider is unreachable -- but the session
+    // row is written before the turn runs, which is the part under test.
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/api/specialists/researcher/run")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({"request": "go", "session_id": parent}).to_string(),
+        ))
+        .unwrap();
+    let _ = router_as(state.clone(), APP_A).oneshot(req).await.unwrap();
+
+    let children = bigtiny2::storage::sessions::children_of(&state.db, &parent, APP_A)
+        .await
+        .unwrap();
+    assert_eq!(children.len(), 1, "delegate session is unowned or missing");
 }
 
 #[tokio::test]
@@ -1842,22 +1902,35 @@ async fn no_table_that_requires_an_owner_holds_an_unowned_row() {
     // daemon does not create them. Exercising the paths that write these
     // tables and then sweeping for the placeholder is what turns "no code
     // path may produce ''" from a comment into an assertion.
-    use bigtiny2::storage::{hitl_rules, recipes, schedules};
+    use bigtiny2::storage::{hitl_rules, schedules};
 
     let state = test_state().await;
     create_session(state.clone(), APP_A).await;
-    recipes::create_recipe(&state.db, "r1", "R", "p", None, 10, APP_A)
-        .await
-        .unwrap();
-    schedules::create_schedule(&state.db, "s1", "S", "0 0 * * *", "r1", 1, APP_A)
+    schedules::create_schedule(&state.db, "s1", "S", "0 0 * * *", "do a thing", 1, APP_A)
         .await
         .unwrap();
     hitl_rules::upsert_rule(&state.db, APP_A, "shell.exec", None, "always_allow")
         .await
         .unwrap();
-    let _ = state.recipe_engine.execute("r1", json!({})).await;
+    // A delegate run, which is the path that used to produce ownerless rows.
+    bigtiny2::specialists::registry::seed_builtins(&state.db)
+        .await
+        .unwrap();
+    let parent = uuid::Uuid::new_v4().to_string();
+    bigtiny2::storage::sessions::create_session_for_app(&state.db, &parent, "P", APP_A)
+        .await
+        .unwrap();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/api/specialists/researcher/run")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({"request": "go", "session_id": parent}).to_string(),
+        ))
+        .unwrap();
+    let _ = router_as(state.clone(), APP_A).oneshot(req).await.unwrap();
 
-    for table in ["sessions", "recipes", "schedule_jobs", "hitl_rules"] {
+    for table in ["sessions", "schedule_jobs", "hitl_rules"] {
         let orphans: i64 =
             sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table} WHERE app_id = ''"))
                 .fetch_one(&state.db)

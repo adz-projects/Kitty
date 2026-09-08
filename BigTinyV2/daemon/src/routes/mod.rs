@@ -9,9 +9,9 @@ pub mod memory;
 pub mod pathway;
 pub mod plugins;
 pub mod providers;
-pub mod recipes;
 pub mod schedules;
 pub mod search;
+pub mod specialists;
 
 use std::sync::Arc;
 
@@ -23,7 +23,6 @@ use crate::agent::Agent;
 use crate::config::BigTinyConfig;
 use crate::mcp::MCPManager;
 use crate::provider::router::ProviderRouter;
-use crate::recipes::engine::RecipeEngine;
 use crate::scheduler::Scheduler;
 
 /// Request-body ceiling for every route. axum's default is 2 MiB, which a
@@ -39,7 +38,11 @@ pub struct AppState {
     pub agent: Arc<Agent>,
     pub mcp: Arc<MCPManager>,
     pub router: Arc<ProviderRouter>,
-    pub recipe_engine: Arc<RecipeEngine>,
+    /// Runs delegated turns for `/api/specialists/{name}/run` and, through the
+    /// `specialists` MCP server, for the model itself. One orchestrator for
+    /// both, so the concurrency cap and depth limit cannot be bypassed by
+    /// picking the other entry point.
+    pub orchestrator: Arc<crate::agent::orchestrator::Orchestrator>,
     pub scheduler: Arc<tokio::sync::Mutex<Scheduler>>,
     pub config: BigTinyConfig,
     /// Loop-integrated plugins, hosted per app. Replaces V1's single
@@ -114,6 +117,11 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             patch(chat::rename_session).delete(chat::delete_session),
         )
         .route("/api/chat/{id}/config", patch(chat::update_config))
+        .route("/api/chat/{id}/allowed_dirs", get(chat::allowed_dirs))
+        .route(
+            "/api/chat/{id}/allowed_dirs/revoke",
+            post(chat::revoke_dir),
+        )
         .route("/api/chat/{id}/send", post(chat::send_message))
         // Rejoin a turn already in progress: a reconnecting client, or a
         // second window. A second *send* still 409s -- that rule is unchanged.
@@ -147,11 +155,12 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/mcp/servers/{id}/connect", post(mcp::connect_server))
         .route("/api/mcp/servers/{id}/tools", get(mcp::list_tools))
         .route(
-            "/api/recipes",
-            get(recipes::list_recipes).post(recipes::create_recipe),
+            "/api/specialists",
+            get(specialists::list).post(specialists::create),
         )
-        .route("/api/recipes/{id}", delete(recipes::delete_recipe))
-        .route("/api/recipes/{id}/execute", post(recipes::execute_recipe))
+        .route("/api/specialists/runs", get(specialists::runs))
+        .route("/api/specialists/{id}", delete(specialists::delete))
+        .route("/api/specialists/{name}/run", post(specialists::run))
         .route(
             "/api/schedules",
             get(schedules::list_schedules).post(schedules::create_schedule),

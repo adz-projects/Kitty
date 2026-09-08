@@ -140,6 +140,11 @@ pub(crate) fn sync_mcp_once_healthy(app: &AppHandle, healthy: bool, port: u16) {
         let app = app.clone();
         tauri::async_runtime::spawn(async move {
             crate::bigtiny::mcp::ensure_builtin_servers(&app).await;
+            // Once, on the first healthy start: fill the subagent denylist from
+            // the catalog's premium tier so an expensive model is denied before
+            // a bill rather than after one. Deliberately after the daemon is up,
+            // because it needs the provider list this app actually has.
+            crate::commands::seed_subagent_denylist(&app).await;
         });
         return;
     }
@@ -240,6 +245,7 @@ pub fn start_stack(app: &AppHandle) {
             token_management,
             memory,
             local,
+            specialists,
             pathway_enabled,
             pathway_embedding_model,
         ) = {
@@ -253,6 +259,7 @@ pub fn start_stack(app: &AppHandle) {
                 cfg.token_management.clone(),
                 cfg.memory.clone(),
                 cfg.local.clone(),
+                cfg.specialists.clone(),
                 cfg.adaptive_pathway_enabled,
                 cfg.adaptive_pathway_embedding_model.clone(),
             )
@@ -280,6 +287,7 @@ pub fn start_stack(app: &AppHandle) {
                 &token_management,
                 &memory,
                 &local,
+                &specialists,
                 pathway_enabled,
                 &pathway_embedding_model,
                 &tokenizer_path,
@@ -300,6 +308,7 @@ pub fn start_stack(app: &AppHandle) {
                 &token_management,
                 &memory,
                 &local,
+                &specialists,
                 pathway_enabled,
                 &pathway_embedding_model,
                 &tokenizer_path,
@@ -398,6 +407,7 @@ mod tests {
             id: "p1".into(),
             name: "test".into(),
             provider_type: provider_type.into(),
+            subagent_role: None,
             base_url: "https://example.invalid".into(),
             models: vec!["some-model".into()],
             is_trusted: true,

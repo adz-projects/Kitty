@@ -25,6 +25,22 @@ pub const CACHE_DIR: &str = "~/.bigtiny";
 pub const SEARCH_OFFLOAD_DIR: &str = ".cache/kitty-search-offload";
 pub const LEAN_CACHE_DIR: &str = ".cache/lean-goose-mcp";
 
+/// Where `lean_scratchpad_set`/`lean_scratchpad_delete` actually write.
+///
+/// Deliberately a sibling of `LEAN_CACHE_DIR` rather than a child, because
+/// `lean_cache_clear` must not be able to wipe the scratchpad — see
+/// `kitty-tools`' `scratchpad::new_scratch_path`, which this must stay in sync
+/// with.
+///
+/// That sibling placement is also why this was missing here: it sits outside
+/// `LEAN_CACHE_DIR`'s subtree, so the scratchpad allowance came from nowhere.
+/// Both scratchpad tools are in `WRITE_TOOL_NAMES`, so a write there should
+/// have been hard-denied on every call; it only worked because their arguments
+/// are `key`/`value` with no path-shaped key, which makes
+/// `extract_candidate_paths` return nothing and `check_containment` fail open.
+/// Under `sandbox_strict = true` the same code denies every scratchpad write.
+pub const SCRATCHPAD_DIR: &str = ".cache/kitty-tools-scratchpad";
+
 fn norm(path: &str) -> String {
     let mut p = path.replace('\\', "/");
     while p.ends_with('/') && p.len() > 1 {
@@ -121,6 +137,12 @@ pub fn extract_candidate_paths(args: &Value) -> Vec<String> {
         "input_path",
         "filename",
         "filepath",
+        // A working directory is a path like any other, and `lean_shell_ro`
+        // requires one precisely so its calls are checkable here — `lean_shell`
+        // takes no directory at all, which is why containment finds nothing to
+        // check on it and falls open.
+        "cwd",
+        "working_dir",
     ] {
         if let Some(value) = obj.get(*key).and_then(|v| v.as_str()) {
             if !value.is_empty() {
@@ -265,18 +287,21 @@ fn resolve_home(
         .map(std::path::PathBuf::from)
 }
 
-/// Add the permissions-free "always reachable" working set: the OS temp dir
-/// plus kitty-web's app-owned cache dirs under the user's home (search
-/// offload + downloaded-PDF cache). These are appended to the allowed set for
-/// *every* session so tools (and the model reaching for their files with a
-/// path-arg read) never hit an approval just for touching scratch storage the
-/// daemon's own bundled plugins manage.
+/// Add the permissions-free "always reachable" working set: the app-owned
+/// cache dirs, under the user's home, that the daemon's own bundled plugins
+/// write to. These are appended to the allowed set for *every* session so tools
+/// (and the model reaching for their files with a path-arg read) never hit an
+/// approval just for touching scratch storage those plugins manage.
+///
+/// The OS temp directory is deliberately **not** here. It used to be, on the
+/// theory that tools scratch there — but no production kitty-tools path does
+/// (`std::env::temp_dir()` appears only in its `#[cfg(test)]` blocks, and
+/// `doc_store::write_atomic` writes its temp file same-dir precisely to avoid a
+/// cross-filesystem rename). So the grant covered nothing we do while handing
+/// the model read/write over every other process's temp files, which on a
+/// shared machine is other people's data.
 fn scratch_allowance() -> Vec<String> {
     let mut dirs = Vec::new();
-    let temp = std::env::temp_dir();
-    if !temp.as_os_str().is_empty() {
-        dirs.push(temp.to_string_lossy().replace('\\', "/"));
-    }
     if let Some(home) = home_dir() {
         dirs.push(
             home.join(SEARCH_OFFLOAD_DIR)
@@ -288,13 +313,24 @@ fn scratch_allowance() -> Vec<String> {
                 .to_string_lossy()
                 .replace('\\', "/"),
         );
+        dirs.push(
+            home.join(SCRATCHPAD_DIR)
+                .to_string_lossy()
+                .replace('\\', "/"),
+        );
     }
     dirs
 }
 
 /// The effective allowed-directory set for a session.
 /// Argument keys that name a filesystem path in kitty-tools' surface.
-const PATH_ARG_KEYS: [&str; 1] = ["path"];
+///
+/// `cwd` is here as well as in `extract_candidate_paths` because a relative
+/// working directory has to be resolved against the session's own before it can
+/// be judged: unqualified, `lean_shell_ro` with `cwd: "src"` would be checked as
+/// the literal string `src` and denied, while the model reasonably meant the
+/// `src` inside the folder it is working in.
+const PATH_ARG_KEYS: [&str; 2] = ["path", "cwd"];
 
 /// Rewrite a relative `path` argument to be relative to the *session's*
 /// working directory, returning whether anything changed.
@@ -385,6 +421,25 @@ pub fn allowed_dirs_for_session(metadata: &Value, cache_dir: &str) -> Vec<String
         dirs.push(cwd.to_string());
     }
 
+    // Every working folder set during this session, not just the current one.
+    //
+    // `cwd` holds only the folder in force *now*, so switching the pill used to
+    // silently revoke the previous one — mid-task, with no notice, and with the
+    // model's next read of a file it had been working on turning into an
+    // approval prompt. A user who points Kitty at a second folder is adding a
+    // place to work, not withdrawing the first. Accumulated (union, never
+    // pruned) by `routes::chat::update_config`, and revocable one entry at a
+    // time from the working-directory pill.
+    if let Some(paths) = metadata.get("working_dirs").and_then(|v| v.as_array()) {
+        for p in paths {
+            if let Some(s) = p.as_str() {
+                if !s.is_empty() {
+                    dirs.push(s.to_string());
+                }
+            }
+        }
+    }
+
     // Files the user explicitly attached to a turn (drag-and-drop / paste). Each
     // is an absolute path that is, by construction, outside the session's
     // chat_dir/cwd — so without this it would force a HITL approval every time
@@ -405,6 +460,16 @@ pub fn allowed_dirs_for_session(metadata: &Value, cache_dir: &str) -> Vec<String
     }
 
     dirs.extend(scratch_allowance());
+
+    // Normalised and de-duplicated. `cwd` is almost always also `chat_dir`, and
+    // a folder can be both the working directory and an attachment, so the raw
+    // list repeats itself — which makes `path_within_any` do the same
+    // comparison several times per tool call, and makes the "you may write to
+    // {first two}" denial message list one directory twice. `norm` is the same
+    // function containment compares with, so de-duplicating on it cannot change
+    // which paths are allowed.
+    let mut seen = std::collections::HashSet::new();
+    dirs.retain(|d| !d.is_empty() && seen.insert(norm(d)));
 
     dirs
 }
@@ -544,14 +609,17 @@ mod tests {
     }
 
     #[test]
-    fn test_allowed_dirs_include_os_temp_and_app_cache_dirs() {
+    fn test_allowed_dirs_include_the_app_cache_dirs_but_not_os_temp() {
         let metadata = json!({"chat_dir": "/home/user/chat"});
         let dirs = allowed_dirs_for_session(&metadata, "~/.bigtiny");
 
+        // The OS temp dir is NOT granted. Nothing in kitty-tools writes there
+        // outside its own tests, so the grant covered none of our own work
+        // while handing the model every other process's temp files.
         let temp = std::env::temp_dir().to_string_lossy().replace('\\', "/");
         assert!(
-            dirs.contains(&temp),
-            "OS temp dir must be allowed, got {dirs:?}"
+            !dirs.contains(&temp),
+            "the OS temp dir must not be granted wholesale, got {dirs:?}"
         );
 
         if let Some(home) = home_dir() {
@@ -752,4 +820,124 @@ mod tests {
         let mut args = json!({"path": "."});
         assert!(!qualify_relative_path_args("lean_file_read", &mut args, ""));
     }
+
+    /// `lean_shell_ro` requires a `cwd` for exactly one reason: so that this
+    /// function sees it. If `cwd` were not a recognised key the call would carry
+    /// no path candidates at all, `check_containment` would fall open, and the
+    /// read-only shell would be running wherever it liked — which is the hole
+    /// `lean_shell` has and this tool exists to avoid.
+    #[test]
+    fn test_a_cwd_argument_is_containment_checked() {
+        let allowed = vec!["/home/user/project".to_string()];
+        assert!(check_containment(
+            &json!({"command": "ls", "cwd": "/home/user/project/src"}),
+            &allowed,
+            false
+        ));
+        assert!(
+            !check_containment(
+                &json!({"command": "ls", "cwd": "/etc"}),
+                &allowed,
+                false
+            ),
+            "a cwd outside the allowed set must not pass containment"
+        );
+    }
+
+    /// The scratchpad lives *beside* `LEAN_CACHE_DIR`, not inside it (so
+    /// `lean_cache_clear` cannot wipe it), which is exactly why it was missing
+    /// from the allowed set.
+    ///
+    /// This is not a theoretical gap: `lean_scratchpad_set` and
+    /// `lean_scratchpad_delete` are both in `WRITE_TOOL_NAMES`, so a write
+    /// there is supposed to be hard-denied unless contained. It only ever
+    /// worked because those tools take `key`/`value` and no path-shaped
+    /// argument, so `extract_candidate_paths` finds nothing and containment
+    /// fails open — and under `sandbox_strict` the same code denies every
+    /// scratchpad write instead.
+    #[test]
+    fn test_scratchpad_writes_are_inside_the_allowed_set() {
+        let Some(home) = home_dir() else {
+            eprintln!("no home dir in this env; skipping");
+            return;
+        };
+        let scratch_file = home
+            .join(SCRATCHPAD_DIR)
+            .join("scratchpad.json")
+            .to_string_lossy()
+            .replace('\\', "/");
+
+        let metadata = json!({"chat_dir": "/home/user/chat"});
+        let dirs = allowed_dirs_for_session(&metadata, "~/.bigtiny");
+        assert!(
+            path_within_any(&dirs, &scratch_file),
+            "{scratch_file} not allowed; scratchpad writes would rely on \
+             containment failing open"
+        );
+    }
+
+    /// Switching the working folder adds, never revokes. A model mid-task in
+    /// the first folder must not silently lose it when the user points the pill
+    /// somewhere else.
+    #[test]
+    fn test_working_dirs_accumulate_across_a_folder_change() {
+        let metadata = json!({
+            "chat_dir": "/home/user/chat",
+            "cwd": "/home/user/second",
+            "working_dirs": ["/home/user/first", "/home/user/second"],
+        });
+        let dirs = allowed_dirs_for_session(&metadata, "~/.bigtiny");
+        assert!(
+            path_within_any(&dirs, "/home/user/first/notes.md"),
+            "the previous working folder must stay reachable, got {dirs:?}"
+        );
+        assert!(path_within_any(&dirs, "/home/user/second/notes.md"));
+    }
+
+    /// An attached *file* allows that file alone. Widening to its directory
+    /// would turn "the user handed me this document" into "the user handed me
+    /// their whole Downloads folder".
+    #[test]
+    fn test_an_attached_file_does_not_widen_to_its_directory() {
+        let metadata = json!({
+            "chat_dir": "/home/user/chat",
+            "attached_paths": ["/home/user/docs/report.pdf"],
+        });
+        let dirs = allowed_dirs_for_session(&metadata, "~/.bigtiny");
+        assert!(path_within_any(&dirs, "/home/user/docs/report.pdf"));
+        assert!(
+            !path_within_any(&dirs, "/home/user/docs/private.pdf"),
+            "a sibling of an attached file must not be readable, got {dirs:?}"
+        );
+    }
+
+    /// An attached *directory* does widen to its subtree — that is what
+    /// dropping a folder means, and the companion to the test above.
+    #[test]
+    fn test_an_attached_directory_widens_to_its_subtree() {
+        let metadata = json!({
+            "chat_dir": "/home/user/chat",
+            "attached_paths": ["/home/user/project"],
+        });
+        let dirs = allowed_dirs_for_session(&metadata, "~/.bigtiny");
+        assert!(path_within_any(&dirs, "/home/user/project/src/main.rs"));
+    }
+
+    /// `cwd` is almost always also `chat_dir`, and a folder is often both the
+    /// working directory and an attachment. Repeats cost a redundant comparison
+    /// per tool call and make the "you may write to {first two}" denial name one
+    /// directory twice.
+    #[test]
+    fn test_allowed_dirs_are_deduplicated() {
+        let metadata = json!({
+            "chat_dir": "/home/user/chat",
+            "cwd": "/home/user/chat",
+            "working_dirs": ["/home/user/chat"],
+            "attached_paths": ["/home/user/chat"],
+        });
+        let dirs = allowed_dirs_for_session(&metadata, "~/.bigtiny");
+        let chat_entries = dirs.iter().filter(|d| d.contains("/home/user/chat")).count();
+        assert_eq!(chat_entries, 1, "expected one entry, got {dirs:?}");
+    }
+
 }

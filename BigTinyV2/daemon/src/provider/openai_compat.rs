@@ -14,15 +14,21 @@ use super::base::{
 use super::tag_split::TagSplitter;
 use crate::config::ProviderConfig;
 use crate::error::ProviderError;
+use super::schema::SchemaDirective;
 use crate::network::{maybe_direct_url, TailscaleClient};
 
 /// OpenRouter's nested `reasoning` object for an effort level. OpenRouter is
 /// the one dialect here that can switch reasoning off explicitly. A model-
 /// specific `Custom` level is clamped to `high` (see `Effort::hosted_level`).
-fn openrouter_reasoning(e: &Effort) -> Value {
-    match e.hosted_level() {
-        None => serde_json::json!({ "enabled": false }),
-        Some(level) => serde_json::json!({ "effort": level }),
+fn openrouter_reasoning(e: &Effort, max_tokens: Option<i32>) -> Value {
+    match (e.hosted_level(), max_tokens) {
+        (None, _) => serde_json::json!({ "enabled": false }),
+        // `max_tokens` *instead of* `effort`, not alongside it. OpenRouter
+        // routes to many upstreams and several reject a `reasoning` object
+        // carrying both, so when a budget is set it is the more specific of the
+        // two and wins outright.
+        (Some(_), Some(cap)) if cap > 0 => serde_json::json!({ "max_tokens": cap }),
+        (Some(level), _) => serde_json::json!({ "effort": level }),
     }
 }
 
@@ -416,6 +422,7 @@ impl Provider for OpenAICompatibleProvider {
         sampling: SamplingParams,
         model: Option<String>,
         id_slot: Option<i32>,
+        schema: SchemaDirective,
     ) -> Result<Pin<Box<dyn Stream<Item = Delta> + Send>>, ProviderError> {
         let model = self.resolve_model(model.as_deref());
         let url = format!("{}/v1/chat/completions", self.config.base_url);
@@ -505,7 +512,7 @@ impl Provider for OpenAICompatibleProvider {
                     }
                 }
                 "openrouter" => {
-                    body["reasoning"] = openrouter_reasoning(e);
+                    body["reasoning"] = openrouter_reasoning(e, sampling.reasoning_max_tokens);
                 }
                 "custom_openai" | "ollama" => {
                     // A self-hosted server exposes reasoning several ways and
@@ -541,6 +548,46 @@ impl Provider for OpenAICompatibleProvider {
                     }
                 }
                 _ => {}
+            }
+        }
+        // Schema-constrained output. `ResponseFormat` is the hosted-OpenAI
+        // shape and goes on verbatim.
+        //
+        // `Format` is the self-hosted shape, and needs translating here rather
+        // than in `provider::schema`: that mapping names the *field* Ollama's
+        // and llama.cpp's native APIs read, but this method posts to
+        // `/v1/chat/completions`, where a top-level `format` is ignored. So,
+        // following the same "populate every spelling and let the server use
+        // whichever it understands" approach as `reasoning_effort` above, a
+        // schema is written three ways: `format` (a native-API proxy),
+        // top-level `json_schema` (llama-server), and a `response_format`
+        // *without* `strict` (Ollama's OpenAI-compat layer — llama.cpp ignores
+        // the flag and Ollama does not implement OpenAI's strict subset, so
+        // asking for it turns a working request into a 400).
+        match &schema {
+            SchemaDirective::None => {}
+            SchemaDirective::ResponseFormat(v) => {
+                body["response_format"] = v.clone();
+            }
+            SchemaDirective::Format(v) => {
+                body["format"] = v.clone();
+                if v.is_string() {
+                    body["response_format"] = serde_json::json!({"type": "json_object"});
+                } else {
+                    body["json_schema"] = v.clone();
+                    body["response_format"] = serde_json::json!({
+                        "type": "json_schema",
+                        "json_schema": {"name": "response", "schema": v},
+                    });
+                }
+            }
+            // Anthropic-only; `provider::schema::directive_for` never produces
+            // one for a dialect this provider serves.
+            SchemaDirective::ForcedTool(..) => {
+                tracing::warn!(
+                    provider_id = %self.provider_id,
+                    "ignoring a forced-tool schema directive on an OpenAI-compatible wire"
+                );
             }
         }
         if let Some(slot) = id_slot {
@@ -1329,11 +1376,33 @@ mod effort_tests {
     #[test]
     fn openrouter_uses_a_nested_object_and_can_disable() {
         assert_eq!(
-            openrouter_reasoning(&Effort::Off),
+            openrouter_reasoning(&Effort::Off, None),
             serde_json::json!({ "enabled": false })
         );
         assert_eq!(
-            openrouter_reasoning(&Effort::High),
+            openrouter_reasoning(&Effort::High, None),
+            serde_json::json!({ "effort": "high" })
+        );
+    }
+
+    /// A budget replaces the effort level rather than accompanying it: several
+    /// of the upstreams OpenRouter routes to reject a `reasoning` object
+    /// carrying both, and the budget is the more specific of the two.
+    #[test]
+    fn openrouter_sends_a_reasoning_budget_instead_of_an_effort_level() {
+        assert_eq!(
+            openrouter_reasoning(&Effort::High, Some(8_000)),
+            serde_json::json!({ "max_tokens": 8_000 })
+        );
+        // "Off" still wins over a budget — a cap is a ceiling on thinking that
+        // is happening, not an instruction to start.
+        assert_eq!(
+            openrouter_reasoning(&Effort::Off, Some(8_000)),
+            serde_json::json!({ "enabled": false })
+        );
+        // A zero budget is not a field worth sending; fall back to the level.
+        assert_eq!(
+            openrouter_reasoning(&Effort::High, Some(0)),
             serde_json::json!({ "effort": "high" })
         );
     }
@@ -1853,11 +1922,150 @@ mod sse_tests {
         );
         let messages = vec![serde_json::json!({"role": "user", "content": "hi"})];
         let stream = provider
-            .chat_completion(&messages, None, SamplingParams::default(), None, Some(2))
+            .chat_completion(&messages, None, SamplingParams::default(), None, Some(2), SchemaDirective::None)
             .await
             .unwrap();
         let _: Vec<Delta> = stream.collect().await;
 
+        mock.assert_async().await;
+    }
+
+    /// The hosted shape goes on the wire verbatim — `provider::schema`
+    /// already built it for this dialect.
+    #[tokio::test]
+    async fn a_response_format_directive_is_written_verbatim() {
+        let mut server = mockito::Server::new_async().await;
+        let directive = serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {"name": "response", "strict": true, "schema": {"type": "object"}},
+        });
+        let mock = server
+            .mock("POST", "/v1/chat/completions")
+            .match_body(mockito::Matcher::PartialJson(
+                serde_json::json!({"response_format": directive}),
+            ))
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body("data: [DONE]
+
+")
+            .create_async()
+            .await;
+
+        let provider = OpenAICompatibleProvider::new(
+            "test",
+            crate::config::ProviderConfig {
+                base_url: server.url(),
+                ..Default::default()
+            },
+            Arc::new(TailscaleClient::new()),
+        );
+        let messages = vec![serde_json::json!({"role": "user", "content": "hi"})];
+        let stream = provider
+            .chat_completion(
+                &messages,
+                None,
+                SamplingParams::default(),
+                None,
+                None,
+                SchemaDirective::ResponseFormat(directive.clone()),
+            )
+            .await
+            .unwrap();
+        let _: Vec<Delta> = stream.collect().await;
+
+        mock.assert_async().await;
+    }
+
+    /// `Format` names the field Ollama's and llama.cpp's *native* APIs read,
+    /// but this method posts to `/v1/chat/completions`, where a top-level
+    /// `format` is ignored. Every spelling a self-hosted build might honor is
+    /// written — and `strict` is deliberately absent, since neither server
+    /// implements OpenAI's strict subset and sending it turns a working
+    /// request into a 400.
+    #[tokio::test]
+    async fn a_self_hosted_schema_is_written_in_every_spelling_and_never_strict() {
+        let mut server = mockito::Server::new_async().await;
+        let schema = serde_json::json!({"type": "object", "properties": {"a": {"type": "string"}}});
+        let mock = server
+            .mock("POST", "/v1/chat/completions")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "format": schema,
+                "json_schema": schema,
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {"name": "response", "schema": schema},
+                },
+            })))
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body("data: [DONE]
+
+")
+            .create_async()
+            .await;
+
+        let provider = OpenAICompatibleProvider::new(
+            "test",
+            crate::config::ProviderConfig {
+                base_url: server.url(),
+                provider_type: "custom_openai".into(),
+                ..Default::default()
+            },
+            Arc::new(TailscaleClient::new()),
+        );
+        let messages = vec![serde_json::json!({"role": "user", "content": "hi"})];
+        let stream = provider
+            .chat_completion(
+                &messages,
+                None,
+                SamplingParams::default(),
+                None,
+                None,
+                SchemaDirective::Format(schema.clone()),
+            )
+            .await
+            .unwrap();
+        let _: Vec<Delta> = stream.collect().await;
+
+        mock.assert_async().await;
+
+        // A schema-less JSON ask is the other `Format` shape and must not
+        // produce a `json_schema` with a string where an object belongs.
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/v1/chat/completions")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "response_format": {"type": "json_object"},
+            })))
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body("data: [DONE]
+
+")
+            .create_async()
+            .await;
+        let provider = OpenAICompatibleProvider::new(
+            "test",
+            crate::config::ProviderConfig {
+                base_url: server.url(),
+                provider_type: "ollama".into(),
+                ..Default::default()
+            },
+            Arc::new(TailscaleClient::new()),
+        );
+        let stream = provider
+            .chat_completion(
+                &messages,
+                None,
+                SamplingParams::default(),
+                None,
+                None,
+                SchemaDirective::Format(serde_json::json!("json")),
+            )
+            .await
+            .unwrap();
+        let _: Vec<Delta> = stream.collect().await;
         mock.assert_async().await;
     }
 
@@ -1888,7 +2096,7 @@ mod sse_tests {
         );
         let messages = vec![serde_json::json!({"role": "user", "content": "hi"})];
         let stream = provider
-            .chat_completion(&messages, None, SamplingParams::default(), None, None)
+            .chat_completion(&messages, None, SamplingParams::default(), None, None, SchemaDirective::None)
             .await
             .unwrap();
         let _: Vec<Delta> = stream.collect().await;
@@ -1963,7 +2171,7 @@ mod sse_tests {
         );
         let messages = vec![serde_json::json!({"role": "user", "content": "hi"})];
         let stream = provider
-            .chat_completion(&messages, None, SamplingParams::default(), None, None)
+            .chat_completion(&messages, None, SamplingParams::default(), None, None, SchemaDirective::None)
             .await
             .unwrap();
         let _: Vec<Delta> = stream.collect().await;
@@ -2040,7 +2248,7 @@ mod sse_tests {
         );
         let messages = vec![serde_json::json!({"role": "user", "content": "hi"})];
         let stream = provider
-            .chat_completion(&messages, None, SamplingParams::default(), None, None)
+            .chat_completion(&messages, None, SamplingParams::default(), None, None, SchemaDirective::None)
             .await
             .unwrap();
         let deltas: Vec<Delta> = stream.collect().await;
@@ -2078,7 +2286,7 @@ mod sse_tests {
         );
         let messages = vec![serde_json::json!({"role": "user", "content": "hi"})];
         let stream = provider
-            .chat_completion(&messages, None, SamplingParams::default(), None, None)
+            .chat_completion(&messages, None, SamplingParams::default(), None, None, SchemaDirective::None)
             .await
             .unwrap();
         let _: Vec<Delta> = stream.collect().await;
@@ -2421,7 +2629,7 @@ mod sse_tests {
             serde_json::json!({"role": "user", "content": "hi"}),
         ];
         let stream = provider
-            .chat_completion(&messages, None, SamplingParams::default(), None, None)
+            .chat_completion(&messages, None, SamplingParams::default(), None, None, SchemaDirective::None)
             .await
             .unwrap();
         let _: Vec<Delta> = stream.collect().await;

@@ -17,6 +17,19 @@ pub struct TimingResult {
     /// with a reasoning model that understated the real rate roughly
     /// threefold.
     pub tokens_per_second: Option<f64>,
+    /// Reasoning tokens this response spent, for the per-run budget in
+    /// `agent::loop_`.
+    ///
+    /// Measured rather than requested: only two dialects accept a budget on the
+    /// wire, so the number that can actually be enforced everywhere is the one
+    /// observed coming back. Taken from the provider's own
+    /// `usage.reasoning_tokens` when it reports one, and otherwise counted from
+    /// the reasoning stream with the real tokenizer.
+    ///
+    /// Covers *declared* reasoning only. A model that emits its thinking as
+    /// ordinary content — or through a marker `TagSplitter` does not recognise
+    /// — is invisible here, and bounded by `MAX_TURN_CONTENT_CHARS` instead.
+    pub reasoning_tokens: i32,
 }
 
 impl TimingResult {

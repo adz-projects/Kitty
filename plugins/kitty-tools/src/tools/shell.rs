@@ -100,13 +100,29 @@ where
 }
 
 pub async fn shell(command: &str, dry_run: bool) -> String {
-    shell_impl(command, dry_run, SHELL_TIMEOUT).await.0
+    shell_impl(command, dry_run, SHELL_TIMEOUT, None).await.0
+}
+
+/// Run a command in an explicit working directory.
+///
+/// `lean_shell` itself has no `cwd` argument and inherits the plugin process's
+/// directory, which is exactly why the daemon's containment check finds no path
+/// to check and falls open on it. `lean_shell_ro` requires one — see that
+/// module — and this is the seam it runs through, so both share one
+/// implementation of the timeout, tree-kill and output caps.
+pub(crate) async fn shell_in(command: &str, cwd: Option<&str>) -> String {
+    shell_impl(command, false, SHELL_TIMEOUT, cwd).await.0
 }
 
 /// Runs a command with an explicit timeout (so tests don't wait 30s) and
 /// returns the child's pid alongside the envelope so tests can assert the
 /// process is actually reaped on timeout.
-async fn shell_impl(command: &str, dry_run: bool, timeout: Duration) -> (String, Option<u32>) {
+async fn shell_impl(
+    command: &str,
+    dry_run: bool,
+    timeout: Duration,
+    cwd: Option<&str>,
+) -> (String, Option<u32>) {
     if dry_run {
         return (
             success_response(
@@ -132,6 +148,9 @@ async fn shell_impl(command: &str, dry_run: bool, timeout: Duration) -> (String,
         c.arg("-c").arg(command);
         c
     };
+    if let Some(dir) = cwd.filter(|d| !d.trim().is_empty()) {
+        std_cmd.current_dir(dir);
+    }
     std_cmd.stdout(Stdio::piped());
     std_cmd.stderr(Stdio::piped());
     std_cmd.stdin(Stdio::null());
@@ -345,7 +364,7 @@ mod tests {
         #[cfg(not(windows))]
         let cmd = "sleep 60";
 
-        let (response, pid) = shell_impl(cmd, false, Duration::from_millis(300)).await;
+        let (response, pid) = shell_impl(cmd, false, Duration::from_millis(300), None).await;
         let v: serde_json::Value = serde_json::from_str(&response).unwrap();
         assert_eq!(v["error_code"], "SHELL_TIMEOUT", "{v}");
         let pid = pid.expect("spawned child must report a pid");
@@ -370,6 +389,7 @@ mod tests {
             "ping -n 99999 127.0.0.1 > nul",
             false,
             Duration::from_millis(300),
+            None,
         )
         .await;
         let v: serde_json::Value = serde_json::from_str(&response).unwrap();

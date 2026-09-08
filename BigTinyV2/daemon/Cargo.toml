@@ -92,7 +92,14 @@ once_cell = "1"
 # scanner (`openai_compat`'s `OpenAISSEStream`), which is the hottest loop in
 # the daemon.
 memchr = "2"
-rmcp = { version = "0.9", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
+# `server`/`macros` are here for the `specialists` in-process tool server
+# (`specialists::server`), the daemon's only MCP *server* role -- every other
+# rmcp use in this crate is a client dialing something else.
+rmcp = { version = "0.9", features = ["client", "server", "macros", "transport-child-process", "transport-streamable-http-client-reqwest"] }
+# Tool-argument schemas for that server. Version pinned by rmcp 0.9's own
+# `schemars` dependency; a mismatch here is a derive that silently does not
+# satisfy the trait rmcp wants.
+schemars = "1"
 jsonschema = "0.26"
 tower-http = { version = "0.6", features = ["cors", "catch-panic"] }
 tokio-cron-scheduler = "0.13"

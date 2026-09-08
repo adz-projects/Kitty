@@ -4,8 +4,6 @@
 //! `keyring`).
 
 pub mod providers;
-pub mod recipe_yaml;
-pub mod recipes;
 pub mod scheduled_tasks;
 
 use std::collections::HashMap;
@@ -15,7 +13,6 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use providers::ProviderProfile;
-use recipes::Recipe;
 use scheduled_tasks::ScheduledTask;
 
 /// The persisted application configuration.
@@ -305,14 +302,6 @@ pub struct Config {
     /// and the bundled exe isn't in use. `None` = inherit Kitty's own cwd.
     #[serde(default)]
     pub bigtiny_dir: Option<String>,
-    /// User + built-in recipe templates (Goose recipes reinterpreted as
-    /// client-side chat-turn templates — see `recipes` module doc comment).
-    /// Seeded with the 4 built-ins two ways: `Config::default()` below contains
-    /// them (so a missing key fills from the container-level `#[serde(default)]`,
-    /// and the first-launch/corrupt-fallback paths that use `Config::default()`
-    /// directly get them too), and `migrate_recipes` in `load` re-seeds the one
-    /// case `Default` can't reach — an explicit `"recipes": []`.
-    pub recipes: Vec<Recipe>,
     /// BigTiny background context-compaction settings, relayed to the daemon
     /// as `BIGTINY_SUMMARIZER__*` env vars at spawn
     /// (`lifecycle::bigtiny_proc::spawn`) — BigTiny only ever reads config via
@@ -320,6 +309,10 @@ pub struct Config {
     /// this is the one place these settings need to exist on the Kitty side.
     #[serde(default)]
     pub summarizer: SummarizerSettings,
+    /// Delegate-run limits, relayed to the daemon as `BIGTINY_AGENT__*` env
+    /// vars at spawn.
+    #[serde(default)]
+    pub specialists: SpecialistSettings,
     /// BigTiny context-window/compaction budget settings, relayed as
     /// `BIGTINY_TOKEN_MANAGEMENT__*` env vars at spawn (same mechanism and
     /// rationale as `summarizer` above). `#[serde(default)]` covers loading
@@ -538,8 +531,8 @@ impl Default for Config {
             bigtiny_command: default_bigtiny_command(),
             bigtiny_args: default_bigtiny_args(),
             bigtiny_dir: None,
-            recipes: recipes::builtin_templates(),
             summarizer: SummarizerSettings::default(),
+            specialists: SpecialistSettings::default(),
             token_management: TokenManagementSettings::default(),
             memory: MemorySettings::default(),
             local: LocalModelSettings::default(),
@@ -817,9 +810,7 @@ pub fn load() -> Result<Config, ConfigError> {
             Ok(migrate_theme_default_to_light(migrate_model_tags_to_gguf(
                 migrate_kitty_wasm_enabled(migrate_kitty_web_enabled(
                     migrate_kitty_split_enabled(migrate_replacement_mcp_enabled(
-                        migrate_bigtiny_launch_command(migrate_recipes(migrate_hotkeys(
-                            config, &text,
-                        ))),
+                        migrate_bigtiny_launch_command(migrate_hotkeys(config, &text)),
                     )),
                 )),
             )))
@@ -890,22 +881,45 @@ pub(crate) fn backup_corrupt_config_file(path: &Path) -> Option<PathBuf> {
     }
 }
 
-/// Re-seed the built-in recipe templates if a loaded config somehow has an
-/// empty recipe list. The common cases are already covered by `Config`'s
-/// `Default` (which contains the built-ins): a config predating the feature is
-/// missing the `recipes` key entirely, so serde's container-level
-/// `#[serde(default)]` fills it from `Default` (built-ins present → this is a
-/// no-op), and first-launch/corrupt-fallback both use `Config::default()`
-/// directly without going through `load`. This only additionally handles the
-/// one gap `Default` can't: a config saved with an explicit `"recipes": []`.
-/// Built-ins are never deletable (`commands::recipes` guards this), so a
-/// populated list is never legitimately empty — re-seeding an empty one can't
-/// clobber user intent.
-fn migrate_recipes(mut config: Config) -> Config {
-    if config.recipes.is_empty() {
-        config.recipes = recipes::builtin_templates();
+/// Limits on delegate (specialist) runs.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SpecialistSettings {
+    /// Models that may never host a delegate. Exact ids, or `prefix*`.
+    ///
+    /// Seeded on first run from the OpenRouter catalog's premium tier — denied
+    /// by default rather than after a surprising bill — and freely editable
+    /// afterwards, including back to empty. `seeded` is what distinguishes "the
+    /// user has not been asked yet" from "the user cleared this deliberately",
+    /// so clearing it does not get silently undone on the next launch.
+    #[serde(default)]
+    pub model_deny: Vec<String>,
+    #[serde(default)]
+    pub seeded: bool,
+    /// How long one delegate may run before it is cancelled.
+    #[serde(default = "default_specialist_timeout_secs")]
+    pub timeout_secs: u64,
+    /// How many delegates may run at once.
+    #[serde(default = "default_max_concurrent_specialists")]
+    pub max_concurrent: u32,
+}
+
+impl Default for SpecialistSettings {
+    fn default() -> Self {
+        Self {
+            model_deny: Vec::new(),
+            seeded: false,
+            timeout_secs: default_specialist_timeout_secs(),
+            max_concurrent: default_max_concurrent_specialists(),
+        }
     }
-    config
+}
+
+fn default_specialist_timeout_secs() -> u64 {
+    300
+}
+
+fn default_max_concurrent_specialists() -> u32 {
+    3
 }
 
 /// True for a configured launch command that looks like a filesystem path
@@ -1472,29 +1486,6 @@ mod tests {
         assert!(back.scheduled_tasks.is_empty());
     }
 
-    #[test]
-    fn old_shape_config_migrates_recipes_default() {
-        // A config predating recipes must still load, seeded with the 4
-        // built-in templates (unlike scheduled_tasks, which is correctly
-        // empty for everyone) — the field has no override, so container-level
-        // `#[serde(default)]` fills it from `Config::default()`.
-        let back: Config = serde_json::from_str(r#"{"theme":"dark"}"#).unwrap();
-        assert_eq!(back.recipes.len(), 4);
-        assert!(back.recipes.iter().all(|r| r.is_builtin));
-        let slugs: Vec<_> = back.recipes.iter().map(|r| r.slug.as_str()).collect();
-        assert!(slugs.contains(&"annotated_bibliography"));
-    }
-
-    #[test]
-    fn migrate_recipes_reseeds_an_explicitly_empty_list() {
-        // The one case `Default` can't reach: a config with `"recipes": []`
-        // present (so serde uses the empty array, not the default).
-        let mut cfg: Config = serde_json::from_str(r#"{"recipes":[]}"#).unwrap();
-        assert!(cfg.recipes.is_empty());
-        cfg = migrate_recipes(cfg);
-        assert_eq!(cfg.recipes.len(), 4);
-        assert!(cfg.recipes.iter().all(|r| r.is_builtin));
-    }
 
     #[test]
     fn replacement_mcp_enables_once_for_a_config_predating_the_default_flip() {

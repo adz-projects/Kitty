@@ -334,6 +334,30 @@ fn sse_response(body: Body) -> Response {
 /// Shallow-merges the request body's top-level keys into the session's
 /// metadata JSON (`cwd`, `mode`, `provider`, `model`, etc.) — a PATCH, not a
 /// replace, matching Python's `update_session_config` route behavior.
+/// Metadata keys whose PATCH semantics are union-not-replace.
+///
+/// Named together because they are the same rule for the same reason, and a
+/// third grant list added later must join them rather than quietly getting
+/// replace semantics.
+const UNION_KEYS: [&str; 2] = ["attached_paths", "working_dirs"];
+
+/// Most entries either grant list may hold before the oldest are forgotten.
+///
+/// A union with no ceiling is not just untidy. This blob is parsed on every
+/// turn, rewritten by `record_usage` after nearly every model call, walked
+/// linearly by `path_within_any` on every tool call, and — since specialists —
+/// copied wholesale into every delegate session. A month-old chat where the user
+/// has dropped four hundred files would carry all four hundred into each of
+/// thirty-two fan-out children.
+///
+/// It is also a grant that nobody revisits: a folder opened once in week one
+/// stays writable in week six, and the user has no reason to remember it is
+/// there. Bounding to the most recent entries makes the list roughly "the places
+/// this chat is actually working", which is what it is read as anyway. Deliberate
+/// removal still goes through the revoke route, which is exact rather than
+/// age-ordered.
+const MAX_UNION_ENTRIES: usize = 64;
+
 pub async fn update_config(
     State(state): State<Arc<AppState>>,
     Extension(identity): Extension<AppIdentity>,
@@ -356,12 +380,16 @@ pub async fn update_config(
     let result = sessions::update_metadata_with(&state.db, &id, move |mut merged| {
         if let Some(obj) = merged.as_object_mut() {
             for (k, v) in &patch_obj {
-                // `attached_paths` accumulates rather than replaces: each turn's
-                // drag-and-drop attachments are added to the session's
+                // These accumulate rather than replace: both feed the session's
                 // approval-free read set (see `sandbox::allowed_dirs_for_session`),
-                // and a later turn attaching a *different* file must not silently
-                // revoke access to an earlier one. Union + dedup, order-stable.
-                if k == "attached_paths" {
+                // and adding a *new* grant must not silently revoke an earlier
+                // one — a later turn attaching a different file, or the user
+                // pointing the working-directory pill at a second folder, is
+                // adding a place to work, not withdrawing the first. Union +
+                // dedup, order-stable. Removal is deliberately not expressible
+                // here; it has its own route, so a routine config PATCH can
+                // never drop an allowance by omission.
+                if UNION_KEYS.contains(&k.as_str()) {
                     let existing = obj
                         .get(k)
                         .and_then(|e| e.as_array())
@@ -373,6 +401,15 @@ pub async fn update_config(
                         if !merged_paths.contains(&item) {
                             merged_paths.push(item);
                         }
+                    }
+                    // Oldest first out, so what survives is what the chat has
+                    // touched most recently. Trimming the front rather than
+                    // refusing the write: a new grant is the one the user just
+                    // asked for, and dropping *that* to preserve a stale one
+                    // would be the wrong way round.
+                    if merged_paths.len() > MAX_UNION_ENTRIES {
+                        let excess = merged_paths.len() - MAX_UNION_ENTRIES;
+                        merged_paths.drain(..excess);
                     }
                     obj.insert(k.clone(), Value::Array(merged_paths));
                 } else {
@@ -880,4 +917,111 @@ pub async fn send_message(
         .headers_mut()
         .insert("Cache-Control", HeaderValue::from_static("no-cache"));
     response
+}
+
+/// `GET /api/chat/{id}/allowed_dirs`
+///
+/// The folders this session may reach *because the user said so* — its own chat
+/// folder, every working folder set during the session, and anything attached.
+/// Deliberately not the full `allowed_dirs_for_session` set: that also contains
+/// the daemon's data root and its plugins' cache directories, which are
+/// machinery rather than choices and would be noise in a folder list.
+pub async fn allowed_dirs(
+    State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<AppIdentity>,
+    Path(id): Path<String>,
+) -> Response {
+    if let Some(denied) = deny_unless_owned(&state, &id, &identity).await {
+        return denied;
+    }
+    let metadata = match sessions::get_session(&state.db, &id).await {
+        Ok(Some(row)) => row
+            .metadata
+            .as_deref()
+            .and_then(|m| serde_json::from_str::<Value>(m).ok())
+            .unwrap_or_else(|| json!({})),
+        Ok(None) => return err_response(StatusCode::NOT_FOUND, format!("no such session: {id}")),
+        Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+
+    let list = |key: &str| -> Vec<String> {
+        metadata
+            .get(key)
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    Json(json!({
+        // Not revocable: it is the session's own folder, and revoking it would
+        // leave the session unable to write its own artifacts.
+        "chat_dir": metadata.get("chat_dir").and_then(|v| v.as_str()),
+        "cwd": metadata.get("cwd").and_then(|v| v.as_str()),
+        "working_dirs": list("working_dirs"),
+        "attached_paths": list("attached_paths"),
+    }))
+    .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RevokeDirRequest {
+    pub path: String,
+}
+
+/// `POST /api/chat/{id}/allowed_dirs/revoke`
+///
+/// Drop one granted path. Its own route rather than a `config` PATCH because
+/// the grant lists are union-only there (see `UNION_KEYS`) — which is what stops
+/// an ordinary config write from revoking access by omission, and therefore what
+/// makes revocation need to be said explicitly.
+///
+/// `chat_dir` and `cwd` are not removable here: the first is the session's own
+/// folder, and the second is cleared by resetting the working directory, which
+/// is a different gesture with different UI.
+pub async fn revoke_dir(
+    State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<AppIdentity>,
+    Path(id): Path<String>,
+    Json(body): Json<RevokeDirRequest>,
+) -> Response {
+    if let Some(denied) = deny_unless_owned(&state, &id, &identity).await {
+        return denied;
+    }
+    let target = body.path.trim().to_string();
+    if target.is_empty() {
+        return err_response(StatusCode::BAD_REQUEST, "path must not be empty");
+    }
+
+    let result = sessions::update_metadata_with(&state.db, &id, move |mut merged| {
+        if let Some(obj) = merged.as_object_mut() {
+            for key in UNION_KEYS {
+                if let Some(arr) = obj.get(key).and_then(|v| v.as_array()).cloned() {
+                    let kept: Vec<Value> = arr
+                        .into_iter()
+                        .filter(|v| v.as_str() != Some(target.as_str()))
+                        .collect();
+                    obj.insert(key.to_string(), Value::Array(kept));
+                }
+            }
+        }
+        merged
+    })
+    .await;
+
+    match result {
+        Ok(()) => Json(json!({"ok": true})).into_response(),
+        Err(e) => {
+            let status = match &e {
+                StorageError::NotFound(_) => StatusCode::NOT_FOUND,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            err_response(status, e.to_string())
+        }
+    }
 }

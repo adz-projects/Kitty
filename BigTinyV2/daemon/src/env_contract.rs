@@ -140,6 +140,34 @@ pub fn apply_env_overrides(config: &mut BigTinyConfig) {
     // in-process behavioral-memory engine permanently dead in every real
     // deployment regardless of anything the host does -- this is the actual
     // toggle a host needs to opt in, mirroring `BIGTINY_SUMMARIZER__*`.
+    // Models that may never host a delegate. Comma-separated, exact ids or
+    // `prefix*` patterns.
+    //
+    // An env var rather than a route because it is a spend guard, and a spend
+    // guard a running daemon could be talked out of over HTTP is a weaker one.
+    // Kitty's `lifecycle/bigtiny_env.rs` is the other half of this contract; a
+    // change takes effect on the next daemon start, which the engine-restart
+    // banner already surfaces.
+    if let Ok(v) = std::env::var("BIGTINY_AGENT__SUBAGENT_MODEL_DENY") {
+        config.agent.subagent_model_deny = v
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+    }
+    if let Some(n) = std::env::var("BIGTINY_AGENT__SPECIALIST_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        config.agent.specialist_timeout_secs = n;
+    }
+    if let Some(n) = std::env::var("BIGTINY_AGENT__MAX_CONCURRENT_SPECIALISTS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        config.agent.max_concurrent_specialists = n;
+    }
     if let Ok(v) = std::env::var("BIGTINY_PATHWAY__ENABLED") {
         config.pathway.enabled = v.eq_ignore_ascii_case("true") || v == "1";
     }

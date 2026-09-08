@@ -10,8 +10,8 @@
 
 use kitty_tools::server::KittyToolsServer;
 
-/// All 24 always-on tools this server exposes, sorted (**23 on Android**,
-/// where `lean_shell` is compiled out), plus 4 more
+/// All 25 always-on tools this server exposes, sorted (**23 on Android**,
+/// where `lean_shell` and `lean_shell_ro` are compiled out), plus 4 more
 /// (`generate_accessible_table`/`generate_accessible_svg`/
 /// `generate_accessible_chart`/`generate_accessible_mermaid`) when
 /// `KITTY_VIZ_ENABLED=1`. `lean_word_*`
@@ -65,6 +65,11 @@ const ALWAYS_ON_TOOLS: &[&str] = &[
     // (docs/ANDROID.md §2.4).
     #[cfg(not(target_os = "android"))]
     "lean_shell",
+    // Same registration gate, same reason. Read-only, and required by the
+    // `locator` specialist: `lean_shell` is write-classed daemon-side, so a
+    // delegate running under `auto_reject` has it hard-denied.
+    #[cfg(not(target_os = "android"))]
+    "lean_shell_ro",
     "lean_word_read_outline",
     "lean_word_read_text",
     "lean_word_write_doc",

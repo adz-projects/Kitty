@@ -28,6 +28,7 @@ use crate::mcp::MCPManager;
 use crate::models::mcp::ToolDefinition;
 use crate::provider::base::{Delta, ToolCall};
 use crate::provider::router::ProviderRouter;
+use crate::provider::schema::{self as response_schema, ResponseSpec, ANTHROPIC_STRUCTURED_TOOL};
 use crate::server::events::{SSEEvent, SSEEventType};
 use crate::storage::hitl_rules;
 use crate::storage::sessions;
@@ -246,6 +247,73 @@ fn tools_to_openai_format(tools: &[ToolDefinition]) -> Vec<Value> {
 /// tool-execution flow and both budget-check early-exit branches) builds
 /// the identical shape, rather than some paths building it and others
 /// silently skipping it.
+/// The `tool_allow` list from a session's metadata, or `None` when it has none.
+///
+/// An empty array is *not* `None`: a definition that names no tools means a
+/// run with no tools, and collapsing that to "unrestricted" would hand the
+/// most restricted run the widest surface.
+fn parse_tool_allow(metadata: &Value) -> Option<std::collections::HashSet<String>> {
+    let entries = metadata.get("tool_allow")?.as_array()?;
+    Some(
+        entries
+            .iter()
+            .filter_map(|v| v.as_str())
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
+/// The sampling fields that can change an answer, as a value for the cache key.
+///
+/// `SamplingParams` is not `Serialize`, and should not become so for this: the
+/// key must cover exactly what alters the response and nothing that merely
+/// alters transport. Missing a field here would serve a response generated under
+/// different settings, which is worse than a miss because it looks like success.
+fn sampling_fingerprint(s: &crate::provider::base::SamplingParams) -> Value {
+    json!({
+        "temperature": s.temperature,
+        "top_p": s.top_p,
+        "top_k": s.top_k,
+        "min_p": s.min_p,
+        "presence_penalty": s.presence_penalty,
+        "frequency_penalty": s.frequency_penalty,
+        "max_tokens": s.max_tokens,
+        "effort": s.effort.as_ref().and_then(|e| e.wire_level()),
+        "reasoning_max_tokens": s.reasoning_max_tokens,
+    })
+}
+
+/// Drain a schema-constrained response stream into `(text, forced_tool_args)`.
+///
+/// Simpler than `process_stream` on purpose: this request carries no tools of
+/// its own, cannot fail over, and produces no timings — the only thing to
+/// recover is the answer, in whichever of the two places the dialect put it.
+async fn drain_structured_answer(
+    mut stream: Pin<Box<dyn Stream<Item = Delta> + Send>>,
+) -> (String, Option<Value>) {
+    let mut text = String::new();
+    let mut forced: Option<Value> = None;
+    while let Some(delta) = stream.next().await {
+        if let Some(c) = delta.content {
+            text.push_str(&c);
+        }
+        for tc in delta.tool_calls.into_iter().flatten() {
+            if tc.function.get("name").and_then(|v| v.as_str()) != Some(ANTHROPIC_STRUCTURED_TOOL) {
+                continue;
+            }
+            // `arguments` is a JSON string on the OpenAI-shaped wire and an
+            // object on Anthropic's; accept either rather than assuming the
+            // dialect that produced this directive.
+            forced = match tc.function.get("arguments") {
+                Some(Value::String(raw)) => serde_json::from_str(raw).ok(),
+                Some(v) => Some(v.clone()),
+                None => None,
+            };
+        }
+    }
+    (text, forced)
+}
+
 fn build_assistant_message(content: &str, turn_tool_calls: &[ToolCall]) -> Value {
     let mut assistant_msg = json!({
         "role": "assistant",
@@ -322,6 +390,23 @@ fn fnv1a64(s: &str) -> u64 {
 /// legitimate reply (a very long essay is a few thousand words, comfortably
 /// under 20k characters) so it never fires in a healthy session.
 const MAX_TURN_CONTENT_CHARS: usize = 300_000;
+
+/// Synthetic tool name for the reasoning-budget notice.
+///
+/// Distinct from `BUDGET_TOOL`'s `__budget__`, which Kitty's stream layer
+/// suppresses — this one is meant to be visible, because a delegate that
+/// stopped thinking part-way is something the reader should be able to see in
+/// the transcript.
+const REASONING_BUDGET_TOOL: &str = "__reasoning_budget__";
+
+/// Output room held back for a delegate's structured report when no schema-
+/// derived figure is available, and the bounds that figure is clamped to. A
+/// twenty-field schema genuinely needs more room than a three-field one, so the
+/// reserve is derived from the schema rather than fixed — but never so small
+/// that the answer cannot be written, nor so large that it eats the whole
+/// window.
+const REPORT_RESERVE_FLOOR: i32 = 1024;
+const REPORT_RESERVE_CEILING: i32 = 4096;
 
 /// One completed streamed attempt: the assembled content chunks, tool calls,
 /// finish reason, usage, and timing — or a `ProviderError` (including
@@ -518,7 +603,14 @@ const AP_RECALL_EMBED_BUDGET_MS: u64 = 1500;
 /// responds) would wait on `Notify::notified()` forever.
 const HITL_APPROVAL_TIMEOUT: Duration = Duration::from_secs(3600);
 
-/// Strip prompt preamble wrappers from the first user message for title derivation.
+/// Strip prompt preamble wrappers from the first user message for title
+/// derivation.
+///
+/// `RE_RECIPE` is historical: nothing produces a `<recipe>` wrapper now that
+/// specialists replaced recipes (a delegate's request never reaches a user
+/// message at all). Sessions recorded before that still carry one, and a title
+/// derived from the wrapper instead of the user's own words is exactly the bad
+/// title this function exists to avoid -- so the pattern stays.
 fn strip_prompt_wrappers(text: &str) -> String {
     // Compiled once rather than on every call: `summarizer_title` runs this
     // per message across the title fold, and `Regex::new` is not cheap.
@@ -953,6 +1045,26 @@ pub struct AgentLoop {
     provider_mismatch_warned: Arc<DashMap<String, ()>>,
     workspace_snapshots: Arc<DashMap<String, (String, String)>>,
     background_tasks: Arc<DashMap<String, Vec<tokio::task::AbortHandle>>>,
+    /// The tool names this turn may call, or `None` for "everything the
+    /// owning app can see" — the ordinary chat case.
+    ///
+    /// Set from session metadata at the top of `run_inner`, which is safe
+    /// because a loop is built fresh per turn (`Agent::build_loop`) and holds
+    /// no session state between them. It is a field rather than an argument
+    /// because the enforcement point is `execute_one_tool_call`, five frames
+    /// below the only place that can read the session's metadata.
+    tool_allow: Option<std::collections::HashSet<String>>,
+    /// Whether a tool call that would need human approval is refused outright
+    /// instead of pausing for one. Set per session; see `run_inner`.
+    hitl_auto_reject: bool,
+    /// How this turn's model calls queue for the provider. Interactive by
+    /// default; a detached run (job, schedule, specialist) sets `Background` so
+    /// a user waiting on a chat message never sits behind a batch.
+    ///
+    /// Was hardcoded `Interactive` at the one `chat_completion` site, which
+    /// silently contradicted both `routes::jobs`' own comment and API.md — so
+    /// every job competed with live chat at full priority.
+    priority: crate::provider::queue::Priority,
 }
 
 impl AgentLoop {
@@ -1000,6 +1112,9 @@ impl AgentLoop {
             provider_mismatch_warned,
             workspace_snapshots,
             background_tasks,
+            tool_allow: None,
+            hitl_auto_reject: false,
+            priority: crate::provider::queue::Priority::Interactive,
         }
     }
 
@@ -1018,7 +1133,9 @@ impl AgentLoop {
         event_tx: mpsc::UnboundedSender<SSEEvent>,
         provider_override: Option<&str>,
         images: Option<Vec<Value>>,
+        priority: crate::provider::queue::Priority,
     ) {
+        self.priority = priority;
         self.run_inner(
             session_id,
             user_message,
@@ -1107,7 +1224,39 @@ impl AgentLoop {
             .ok()
             .flatten()
             .unwrap_or_default();
-        let active_tools: Vec<ToolDefinition> = self.mcp.list_tools_for_app(&tool_scope);
+        let mut active_tools: Vec<ToolDefinition> = self.mcp.list_tools_for_app(&tool_scope);
+
+        // Per-run narrowing, on top of the per-app scope above. A specialist
+        // gets only the tools its definition names; an ordinary chat turn has
+        // no list and keeps everything.
+        //
+        // Filtering here shapes what the model is *offered*. It is not the
+        // enforcement point — a model can name a tool it was never shown, so
+        // `execute_one_tool_call` checks the same list again at dispatch. Both,
+        // deliberately: the filter is what makes the restriction cheap (a
+        // narrower prompt), the check is what makes it true.
+        self.tool_allow = parse_tool_allow(&metadata);
+        // A detached run — a specialist, a job, a scheduled turn — has no user
+        // attached to answer an approval prompt. The bounded wait below is an
+        // hour, which is not a hang but is indistinguishable from one to a
+        // caller waiting on the result, and it is an hour *per tool call*. Such
+        // a run refuses instead, immediately, and reports the refusal in its
+        // own answer.
+        self.hitl_auto_reject = metadata
+            .get("hitl_policy")
+            .and_then(|v| v.as_str())
+            .is_some_and(|p| p == "auto_reject");
+        if let Some(allow) = self.tool_allow.as_ref() {
+            let before = active_tools.len();
+            active_tools.retain(|t| allow.contains(&t.name) || t.name == BUDGET_TOOL);
+            tracing::debug!(
+                session_id,
+                before,
+                after = active_tools.len(),
+                "tool set narrowed by the session's allow-list"
+            );
+        }
+        let active_tools = active_tools;
 
         // The active provider's own `context_length` (Settings → Providers →
         // Advanced) wins over the daemon-wide `token_management.max_context_tokens`
@@ -1382,6 +1531,28 @@ impl AgentLoop {
     ///
     /// Falls back to the daemon-global selection only when the session has no
     /// resolvable owner -- see [`Self::app_scope`].
+    /// A model pin is only valid for the provider it was pinned to.
+    ///
+    /// `model_override` comes from the session's `model` metadata and was
+    /// chosen *for* `pinned_provider`. When the resolved provider is a
+    /// substitute — the pinned one was deleted, or a mid-turn failover moved
+    /// us — carrying the override across sends one vendor's model id to
+    /// another's endpoint. Best case that is a 400; worst case a self-hosted
+    /// server ignores the field and serves whatever it has loaded, which looks
+    /// exactly like success.
+    fn model_for(
+        &self,
+        resolved_provider: &str,
+        pinned_provider: Option<&str>,
+        model_override: Option<&str>,
+    ) -> String {
+        let pin_still_applies = pinned_provider == Some(resolved_provider);
+        self.router.resolve_model(
+            resolved_provider,
+            pin_still_applies.then_some(model_override).flatten(),
+        )
+    }
+
     async fn resolve_provider(
         &self,
         session_id: &str,
@@ -1394,6 +1565,226 @@ impl AgentLoop {
             }
             (None, _) => self.router.get_provider_id(preferred),
         }
+    }
+
+    /// Publish a validated structured answer as the turn's final message.
+    ///
+    /// Persisted as the last assistant message so
+    /// `sessions::last_assistant_text` — what jobs and specialist runs read
+    /// back — returns the validated JSON rather than the prose that preceded
+    /// it. Shared by the live and cached paths so a cache hit is
+    /// indistinguishable downstream.
+    async fn emit_structured_answer(
+        &mut self,
+        session_id: &str,
+        messages: &mut Vec<Value>,
+        value: &Value,
+        event_tx: &mpsc::UnboundedSender<SSEEvent>,
+    ) {
+        let rendered = value.to_string();
+        let _ = event_tx.send(SSEEvent {
+            event_type: SSEEventType::LlmDelta,
+            content: Some(rendered.clone()),
+            session_id: Some(session_id.to_string()),
+            ..Default::default()
+        });
+        messages.push(json!({"role": "assistant", "content": rendered}));
+        if let Err(e) = self.context.save_messages(session_id, messages).await {
+            tracing::warn!("failed to save structured answer for session {session_id}: {e}");
+        }
+    }
+
+    /// Re-ask for the turn's final answer with a schema attached, and
+    /// validate it.
+    ///
+    /// The one retry is the whole point: a model that returns the wrong shape
+    /// almost always fixes it when shown the validator's complaint, and a
+    /// second failure is a signal the caller needs (a bad schema, or a model
+    /// too small for it) rather than something to paper over. Unvalidated
+    /// prose is never returned as if it were structured — a parent that asked
+    /// for a guarantee gets one or gets an error.
+    #[allow(clippy::too_many_arguments)]
+    async fn finalize_structured(
+        &mut self,
+        session_id: &str,
+        messages: &mut Vec<Value>,
+        provider_id: &str,
+        provider_model: &str,
+        sampling: crate::provider::base::SamplingParams,
+        app_id: &str,
+        spec: &ResponseSpec,
+        report_reserve: i32,
+        cache: &crate::provider::response_cache::CacheDirective,
+        event_tx: &mpsc::UnboundedSender<SSEEvent>,
+    ) {
+        const INSTRUCTION: &str = "Now return your final answer for this task,              as JSON matching the required schema. Return only the JSON.";
+
+        // Thinking off, output room pinned — and this is a fix, not a
+        // precaution.
+        //
+        // This request deliberately withholds tools, and on Anthropic that is
+        // exactly the condition that switches extended thinking *on*:
+        // `anthropic_thinking` short-circuits with
+        // `if has_tools { return (max, None) }`, and that guard, derived from
+        // the tool list, is the only thing suppressing thinking on a normal
+        // agent step. The wrap-up valve documents this trap and defends against
+        // it; this path inherited the caller's sampling untouched, which made
+        // the report request the single most likely place in a delegate's whole
+        // run for an unbudgeted think — after its budget had already been spent.
+        //
+        // `max_tokens` is pinned for the same reason the wrap-up path pins it:
+        // zeroing the effort drops out of the `(base + 4096)` branch back to a
+        // bare 4096, shrinking the answer's room at exactly the moment the
+        // answer is due.
+        let mut sampling = sampling;
+        sampling.effort = None;
+        sampling.reasoning_max_tokens = None;
+        sampling.max_tokens = Some(
+            sampling
+                .max_tokens
+                .unwrap_or(0)
+                .max(report_reserve.max(REPORT_RESERVE_FLOOR)),
+        );
+
+        // Built from the turn's own history so the answer is grounded in the
+        // tool results the loop actually gathered, not re-derived.
+        let mut attempt: Vec<Value> = messages.clone();
+        attempt.push(json!({"role": "system", "content": INSTRUCTION}));
+
+        // Cached on the *final* request only, which is the one place in a
+        // delegate's run where caching is unambiguously safe: it carries no
+        // tools by construction, so replaying it cannot claim work that never
+        // happened. It is also the expensive request to repeat and the one whose
+        // inputs are most stable — same schema, same pinned model, same corpus.
+        //
+        // A hit takes no provider permit. That is the point: a hit that queued
+        // behind live traffic would save the tokens but not the latency, which
+        // is most of what a pipeline is buying.
+        let cache_key = cache.is_active().then(|| {
+            crate::provider::response_cache::cache_key(
+                app_id,
+                cache.shared,
+                provider_id,
+                provider_model,
+                &attempt,
+                None,
+                &sampling_fingerprint(&sampling),
+                spec.schema.as_ref(),
+            )
+        });
+
+        if cache.read {
+            if let Some(key) = cache_key.as_deref() {
+                if let Ok(Some(hit)) =
+                    crate::provider::response_cache::get(&self.pool, key).await
+                {
+                    if let Some(value) = response_schema::extract(&hit) {
+                        // Re-validated rather than trusted: an entry written
+                        // under an older schema would otherwise be served as if
+                        // it still matched.
+                        let still_valid = spec
+                            .schema
+                            .as_ref()
+                            .is_none_or(|sc| response_schema::validate(sc, &value).is_ok());
+                        if still_valid {
+                            tracing::debug!(session_id, "structured answer served from cache");
+                            self.emit_structured_answer(session_id, messages, &value, event_tx)
+                                .await;
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut last_error = String::new();
+        for pass in 0..2 {
+            let stream = match self
+                .router
+                .chat_completion(
+                    provider_id,
+                    &attempt,
+                    // Withheld: this request is the answer, not another step.
+                    None,
+                    sampling.clone(),
+                    Some(provider_model.to_string()),
+                    None,
+                    app_id,
+                    self.priority,
+                    spec,
+                )
+                .await
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    last_error = format!("structured-response request failed: {e}");
+                    break;
+                }
+            };
+
+            let (text, forced) = drain_structured_answer(stream).await;
+            // Anthropic returns the answer as the forced tool's arguments;
+            // every other dialect returns it as the message body.
+            let candidate = forced.or_else(|| response_schema::extract(&text));
+            let Some(value) = candidate else {
+                last_error = "model returned no JSON for a schema-constrained answer".to_string();
+                attempt.push(json!({"role": "assistant", "content": text}));
+                attempt.push(json!({"role": "system", "content": format!(
+                    "{last_error}. {INSTRUCTION}"
+                )}));
+                continue;
+            };
+
+            if let Some(schema) = spec.schema.as_ref() {
+                if let Err(why) = response_schema::validate(schema, &value) {
+                    last_error = format!("response did not match the required schema: {why}");
+                    if pass == 0 {
+                        tracing::info!(
+                            session_id,
+                            "structured answer failed validation; retrying once with the error"
+                        );
+                        attempt.push(json!({"role": "assistant", "content": value.to_string()}));
+                        attempt.push(json!({"role": "system", "content": format!(
+                            "That response was rejected — {why}. {INSTRUCTION}"
+                        )}));
+                    }
+                    continue;
+                }
+            }
+
+            if cache.write {
+                if let Some(key) = cache_key.as_deref() {
+                    let ttl = cache
+                        .ttl_s
+                        .unwrap_or(crate::provider::response_cache::DEFAULT_TTL_SECS);
+                    if let Err(e) = crate::provider::response_cache::put(
+                        &self.pool,
+                        key,
+                        &value.to_string(),
+                        ttl,
+                    )
+                    .await
+                    {
+                        // Never fatal: a cache that cannot be written is slower,
+                        // not wrong.
+                        tracing::warn!("could not cache structured answer: {e}");
+                    }
+                }
+            }
+            self.emit_structured_answer(session_id, messages, &value, event_tx)
+                .await;
+            return;
+        }
+
+        tracing::warn!(session_id, error = %last_error, "structured answer unavailable");
+        let _ = event_tx.send(SSEEvent {
+            event_type: SSEEventType::Error,
+            content: Some(last_error.clone()),
+            error_message: Some(last_error),
+            session_id: Some(session_id.to_string()),
+            is_last: true,
+            ..Default::default()
+        });
     }
 
     async fn run_tool_loop(
@@ -1443,12 +1834,72 @@ impl AgentLoop {
             .get("thinking_effort")
             .and_then(|v| v.as_str())
             .and_then(crate::provider::base::Effort::from_wire);
+        // Whether this turn's final answer may be served from, and written to,
+        // the response cache.
+        //
+        // On for delegates and jobs, off for interactive chat: a repeat question
+        // in a conversation usually wants a fresh answer, while a pipeline
+        // re-running over the same corpus is paying for identical calls.
+        let cache_directive: crate::provider::response_cache::CacheDirective = metadata
+            .get("response_cache")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+
+        // How much of this run may go on reasoning. Set by a specialist run;
+        // absent for an ordinary chat turn, which is deliberately uncapped —
+        // cutting off a user's own hard question is a worse failure than an
+        // expensive one, and unlike a delegate they can see it happening and
+        // stop it themselves.
+        let reasoning_cap: Option<tokens::ReasoningCap> = metadata
+            .get("reasoning_cap")
+            .and_then(|v| serde_json::from_value(v.clone()).ok());
+
+        // Models this session may never run on. Written into a delegate's
+        // metadata by `Orchestrator::run`, absent for an ordinary chat turn.
+        //
+        // `subagent_pick::choose_host` gates the models it can see, but it is
+        // not the last word: the provider is re-resolved here at step 0 (the
+        // picked one may have gone unhealthy in between) and again on every
+        // failover in the attempt loop, and neither of those knows a specialist
+        // is asking. A delegate placed on a permitted host could therefore fail
+        // over onto the expensive model the denylist exists to keep it off —
+        // the same class of bypass as applying the list only while scoring.
+        let model_deny: Vec<String> = metadata
+            .get("subagent_model_deny")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+
+        // The shape this turn's final answer must take. Set by a specialist
+        // run (and by `POST /api/jobs` with a schema); absent, and therefore
+        // `Text`, for an ordinary chat turn.
+        let response_spec: ResponseSpec = metadata
+            .get("response_schema")
+            .cloned()
+            .map(ResponseSpec::schema)
+            .unwrap_or_default();
         let mut step: i64 = 0;
         // Wrap-up valve state, alongside the other survives-iterations values
         // below. `wrapup_issued` is a belt against re-injecting on a later
         // iteration; the unconditional `break` in the completion block is the
         // braces. Both, deliberately — see that block's comment.
         let mut wrapup_issued = false;
+        // Reasoning spend across the whole run, and the latch it trips.
+        //
+        // Per *run*, not per response: `MAX_TURN_CONTENT_CHARS` already bounds
+        // one response, and a delegate with twenty steps could spend that
+        // twenty times over while never tripping it once.
+        let mut reasoning_spent: i32 = 0;
+        let mut reasoning_exhausted = false;
+        // Derived from the answer schema: the room the delegate still needs
+        // after thinking, to actually write its report.
+        let report_reserve = response_spec
+            .schema
+            .as_ref()
+            .map(|s| {
+                (tokens::count_text_tokens(&s.to_string()) * 3)
+                    .clamp(REPORT_RESERVE_FLOOR, REPORT_RESERVE_CEILING)
+            })
+            .unwrap_or(REPORT_RESERVE_FLOOR);
         // (messages.len(), provider-reported input_tokens) as of the last
         // completed response. The provider's own count already includes the
         // tool schemas and system framing that a local count of `messages`
@@ -1501,9 +1952,34 @@ impl AgentLoop {
                 return;
             }
         };
-        let mut turn_provider_model = self
-            .router
-            .resolve_model(&turn_provider_id, model_override);
+        let mut turn_provider_model = self.model_for(
+            &turn_provider_id,
+            effective_provider.as_deref(),
+            model_override,
+        );
+
+        // Refused rather than downgraded. There is no cheaper host to fall back
+        // to at this point — the picker already searched — and running anyway is
+        // the one outcome the setting was added to prevent, so the honest answer
+        // is to say which pattern stopped it and let the delegate report that.
+        if let Some(pattern) =
+            crate::agent::subagent_pick::denied_by(&turn_provider_model, &model_deny)
+        {
+            let msg = format!(
+                "'{turn_provider_model}' matches '{pattern}' on the subagent denylist, so this \
+                 specialist did not run. Edit the list in Settings, or give the specialist a \
+                 provider that is not denied."
+            );
+            let _ = event_tx.send(SSEEvent {
+                event_type: SSEEventType::Error,
+                content: Some(msg.clone()),
+                error_message: Some(msg),
+                session_id: Some(session_id.to_string()),
+                is_last: true,
+                ..Default::default()
+            });
+            return;
+        }
 
         loop {
             // Stop generating once the SSE consumer is gone — a disconnected
@@ -1893,6 +2369,32 @@ impl AgentLoop {
                 // because this runs once per tool-loop iteration and `Effort` is
                 // no longer `Copy` (it can carry a model-specific level string).
                 sampling.effort = effort.clone();
+                if let Some(cap) = reasoning_cap {
+                    if reasoning_exhausted {
+                        // Latched. Zero the effort *and* pin an explicit
+                        // max_tokens: on Anthropic, dropping the effort alone
+                        // falls out of the `(base + 4096)` branch back to a bare
+                        // 4096, which would shrink the delegate's output room at
+                        // exactly the step it has to write its report.
+                        sampling.effort = None;
+                        sampling.reasoning_max_tokens = None;
+                        sampling.max_tokens = Some(sampling.max_tokens.unwrap_or(0).max(
+                            report_reserve.max(REPORT_RESERVE_FLOOR),
+                        ));
+                    } else {
+                        // A hint, where the dialect has a field for it. The
+                        // accumulator below is what actually enforces this.
+                        let remaining = (tokens::reasoning_budget_tokens(
+                            cap,
+                            Some(context_length),
+                            projected_input,
+                            report_reserve,
+                            i32::MAX,
+                        ) - reasoning_spent)
+                            .max(0);
+                        sampling.reasoning_max_tokens = Some(remaining);
+                    }
+                }
                 if in_wrapup {
                     // Counter-intuitive and load-bearing: withdrawing the tools
                     // switches Anthropic extended thinking *on*.
@@ -1969,7 +2471,14 @@ impl AgentLoop {
                         // The user is waiting on this one, and it is charged to
                         // the app that owns the session.
                         turn_app_id.as_deref().unwrap_or(crate::provider::queue::DAEMON_LANE),
-                        crate::provider::queue::Priority::Interactive,
+                        self.priority,
+                        // Unconstrained, deliberately: a schema is applied to
+                        // the final answer only, by `finalize_structured`
+                        // after this loop. Constraining the tool loop itself
+                        // would forbid tool calls outright on Anthropic (whose
+                        // mechanism *is* a forced tool) — see
+                        // `provider::schema`'s "Interaction with tools".
+                        &ResponseSpec::text(),
                     )
                     .await
                 {
@@ -2072,18 +2581,51 @@ impl AgentLoop {
                         // provider outranks it), this can pick a different
                         // one; otherwise it retries the same provider.
                         if let Ok(next_id) = self.resolve_provider(session_id, None).await {
-                            if next_id != provider_id {
+                            // A failover that lands on a denied model is not a
+                            // failover, it is the bypass. Staying put and
+                            // retrying the provider that just failed is the
+                            // lesser harm: it may recover, and if it does not
+                            // the run ends with an error the caller can read
+                            // rather than a bill it cannot.
+                            let next_model = self.model_for(
+                                &next_id,
+                                effective_provider.as_deref(),
+                                model_override,
+                            );
+                            if next_id != provider_id
+                                && crate::agent::subagent_pick::is_denied(
+                                    &next_model,
+                                    &model_deny,
+                                )
+                            {
+                                tracing::info!(
+                                    session_id,
+                                    from = %provider_id,
+                                    to = %next_id,
+                                    "declining a failover onto a denylisted subagent model"
+                                );
+                            } else if next_id != provider_id {
                                 let _ = event_tx.send(SSEEvent {
                                     event_type: SSEEventType::ModelFailover,
                                     content: Some(format!(
-                                        "Switching from provider '{provider_id}' to '{next_id}' after error: {e}"
+                                        "Switching from provider '{provider_id}' to '{next_id}' \
+                                         after error: {e}. The model changes with it — a model \
+                                         pinned to '{provider_id}' does not apply to '{next_id}'."
                                     )),
                                     session_id: Some(session_id.to_string()),
                                     ..Default::default()
                                 });
                                 provider_id = next_id;
-                                provider_model =
-                                    self.router.resolve_model(&provider_id, model_override);
+                                // The pin does not follow the failover either —
+                                // same rule, and this site is the one that
+                                // switches providers *mid-turn*, so a carried
+                                // pin here changes the model under a
+                                // conversation already in progress.
+                                provider_model = self.model_for(
+                                    &provider_id,
+                                    effective_provider.as_deref(),
+                                    model_override,
+                                );
                             }
                         }
                     }
@@ -2092,6 +2634,55 @@ impl AgentLoop {
 
             let (content_buf, mut turn_tool_calls, finish_reason, turn_usage, timing) =
                 turn_result;
+
+            // Reasoning accounting. This — not the wire fields — is what makes
+            // the cap real: three of the five dialects have no budget field at
+            // all, including the self-hosted ones where an over-thinking
+            // quantized model is most likely.
+            if let Some(cap) = reasoning_cap {
+                reasoning_spent = reasoning_spent.saturating_add(timing.reasoning_tokens);
+                let budget = tokens::reasoning_budget_tokens(
+                    cap,
+                    Some(context_length),
+                    projected_input,
+                    report_reserve,
+                    i32::MAX,
+                );
+                // `budget > 0` is not redundant with the comparison. A budget
+                // below `MIN_REASONING_BUDGET` resolves to zero — which happens
+                // at step 0 on any model whose window leaves less than a
+                // thousand tokens of headroom once the report reserve is taken —
+                // and `0 >= 0` then latched on a run that had not thought at
+                // all, announcing "spent 0 of 0 tokens" and turning thinking off
+                // before the first step. A budget of zero means there was never
+                // room to think here, which the wrap-up valve already handles;
+                // it is not a run that overspent.
+                if !reasoning_exhausted && budget > 0 && reasoning_spent >= budget {
+                    reasoning_exhausted = true;
+                    tracing::info!(
+                        session_id,
+                        spent = reasoning_spent,
+                        budget,
+                        "reasoning budget exhausted; thinking disabled for the rest of this run"
+                    );
+                    // A latch, not an abort. The delegate still owes its caller
+                    // a report, and one written without further thinking is far
+                    // more useful than a turn that ended with nothing.
+                    let notice = format!(
+                        "Reasoning budget spent ({reasoning_spent} of {budget} tokens). \
+                         Thinking is now off. Finish with what you have, and record anything \
+                         you could not determine in `refusals`."
+                    );
+                    let _ = event_tx.send(SSEEvent {
+                        event_type: SSEEventType::ToolFinish,
+                        tool_name: Some(REASONING_BUDGET_TOOL.to_string()),
+                        tool_result: Some(notice.clone()),
+                        session_id: Some(session_id.to_string()),
+                        ..Default::default()
+                    });
+                    messages.push(json!({"role": "system", "content": notice}));
+                }
+            }
 
             // A failover inside the attempt loop above is a real, announced
             // switch — carry it to the remaining steps instead of letting the
@@ -2354,6 +2945,46 @@ impl AgentLoop {
         // this turn.
         let title_provider_id = last_provider_id.clone();
         let title_provider_model = last_provider_model.clone();
+
+        // Schema-constrained final answer.
+        //
+        // Runs after the tool loop rather than inside it: the loop must stay
+        // unconstrained so the model can call tools, and every dialect's
+        // structured-output mechanism is mutually exclusive with ordinary tool
+        // use to some degree. So the answer is re-asked for, once, with tools
+        // withheld and the schema attached — one extra cheap call in exchange
+        // for a guarantee instead of a scrape.
+        //
+        // Deliberately also runs after a step-limit exit: a specialist that ran
+        // out of budget still owes its caller a report of what it did get, and
+        // a truncated structured answer is far more useful to the parent than
+        // prose it cannot parse. It does not run for a vanished client, where
+        // there is nobody to answer and the next request would be wasted work.
+        if response_spec.is_constrained() && !event_tx.is_closed() {
+            if let Some(pid) = title_provider_id.clone() {
+                let provider_sampling = self.router.sampling(&pid);
+                let sampling = match preset.as_ref() {
+                    Some(p) => crate::provider::sampling::merge(p, &provider_sampling),
+                    None => provider_sampling,
+                };
+                let model = title_provider_model
+                    .clone()
+                    .unwrap_or_else(|| self.router.resolve_model(&pid, model_override));
+                self.finalize_structured(
+                    session_id,
+                    &mut messages,
+                    &pid,
+                    &model,
+                    sampling,
+                    turn_app_id.as_deref().unwrap_or(crate::provider::queue::DAEMON_LANE),
+                    &response_spec,
+                    report_reserve,
+                    &cache_directive,
+                    event_tx,
+                )
+                .await;
+            }
+        }
 
         // Post-turn compaction check — ONCE per turn, fire-and-forget. This
         // used to be awaited inline on EVERY tool-loop iteration: O(steps ×
@@ -2620,6 +3251,10 @@ impl AgentLoop {
         let mut first_token = true;
         let mut token_count = 0;
         let mut content_chars = 0usize;
+        // Buffered and tokenized once at end of stream rather than per delta:
+        // `count_text_tokens` runs a real BPE encode, and doing that on every
+        // fragment of a long think would cost more than the think.
+        let mut reasoning_buf = String::new();
 
         while let Some(mut delta) = stream.next().await {
             // A mid-stream provider failure (connection drop, idle timeout,
@@ -2681,6 +3316,7 @@ impl AgentLoop {
                     // case `MAX_TURN_CONTENT_CHARS` exists to catch, and
                     // hosted providers get no max_tokens floor.
                     content_chars += reasoning.chars().count();
+                    reasoning_buf.push_str(&reasoning);
                     // ...and toward the same delta count. This is only the
                     // fallback for a provider that reports no usage at all,
                     // but leaving thinking out of it meant a reasoning model
@@ -2742,6 +3378,17 @@ impl AgentLoop {
             .as_ref()
             .and_then(output_tokens_including_reasoning)
             .unwrap_or(token_count);
+        // The provider's own count when it reports one — it knows what it
+        // charged for. Otherwise the tokenizer over what we actually received,
+        // which under-counts for CJK and some code. Erring low is deliberate:
+        // a budget that trips late costs some tokens, while one that trips
+        // early cuts off a legitimately hard question.
+        timing.reasoning_tokens = usage
+            .as_ref()
+            .and_then(|u| u.get("reasoning_tokens"))
+            .and_then(|v| v.as_i64())
+            .map(|v| v as i32)
+            .unwrap_or_else(|| tokens::count_text_tokens(&reasoning_buf));
         timing.finalize_rate();
 
         Ok((content_buf, tool_calls, finish_reason, usage, timing))
@@ -2862,6 +3509,37 @@ impl AgentLoop {
             return err;
         }
 
+        // Enforce the per-run allow-list. The advertised tool set was already
+        // narrowed to it in `run_inner`, but a model can call a tool it was
+        // never offered — from a stale prompt prefix, a cached tool block, or
+        // plain invention — so the restriction is re-checked here, where it is
+        // load-bearing. A specialist's tool list is a boundary, not a hint.
+        //
+        // Denied before containment and HITL for the same reason the write
+        // hard-deny below runs first: this is a policy violation, not a
+        // question to put to a human, and reaching the approval path would let
+        // an approval grant what the definition forbids.
+        if let Some(allow) = self.tool_allow.as_ref() {
+            if !allow.contains(&tool_name) && tool_name != BUDGET_TOOL {
+                let err = format!(
+                    "Tool {tool_name} is not available to this run. Available: {}.",
+                    {
+                        let mut names: Vec<&str> = allow.iter().map(|s| s.as_str()).collect();
+                        names.sort_unstable();
+                        names.join(", ")
+                    }
+                );
+                let _ = event_tx.send(SSEEvent {
+                    event_type: SSEEventType::ToolFinish,
+                    tool_name: Some(tool_name),
+                    tool_result: Some(err.clone()),
+                    session_id: Some(session_id.to_string()),
+                    ..Default::default()
+                });
+                return err;
+            }
+        }
+
         // Hard-deny a *write-class* tool that resolves to a path outside the
         // session's allowed directories — checked unconditionally, BEFORE the
         // HITL decision below. It only needs tool_name/args/allowed_dirs,
@@ -2969,6 +3647,34 @@ impl AgentLoop {
         if decision.action == "needs_approval" {
             let action_id = decision.pending_action_id.clone().unwrap_or_default();
 
+            // No approver exists for this run, so there is nothing to wait for.
+            // Refuse now and say why: the refusal reaches the model as this
+            // call's result, which is what lets a specialist report what it was
+            // blocked from doing rather than quietly returning a thinner answer
+            // than its caller thinks it got.
+            //
+            // The pending record is dropped as well. `check_tool_call_with_rules`
+            // registers one as a side effect of deciding `needs_approval`, and
+            // leaving it behind would advertise an approval no waiter will ever
+            // honor in the pending-approvals API until `sweep_stale` reaps it.
+            if self.hitl_auto_reject {
+                {
+                    let mut hitl = self.hitl.lock().await;
+                    hitl.remove_pending(&action_id);
+                }
+                let err = format!(
+                    "Tool {tool_name} requires human approval, which is unavailable in an                      unattended run. It was not executed; report this in your answer."
+                );
+                let _ = event_tx.send(SSEEvent {
+                    event_type: SSEEventType::ToolFinish,
+                    tool_name: Some(tool_name.clone()),
+                    tool_result: Some(err.clone()),
+                    session_id: Some(session_id.to_string()),
+                    ..Default::default()
+                });
+                return err;
+            }
+
             // Register the Notify *before* emitting HitlPause — Kitty's own
             // frontend races to auto-decide/approve the instant it sees this
             // event (see `stream.rs`'s `hitl_pause` handler), so if the
@@ -3055,7 +3761,15 @@ impl AgentLoop {
         // unambiguous. `session_id` is hidden from the tool's advertised
         // schema (`#[schemars(skip)]`), so the model never sees or supplies
         // it; this is the only writer.
-        let tool_args = if crate::mcp::builtin::PATHWAY_TOOLS.contains(&tool_name.as_str()) {
+        //
+        // `specialists`' two tools need the same injection for the same reason,
+        // and one more besides: the session they are told about becomes the
+        // *parent* of whatever delegate they start. A model-supplied id there
+        // would let a turn graft its subagents onto another session's tree, so
+        // this is the only writer for those as well.
+        let needs_session = crate::mcp::builtin::PATHWAY_TOOLS.contains(&tool_name.as_str())
+            || crate::specialists::server::SESSION_SCOPED_TOOLS.contains(&tool_name.as_str());
+        let tool_args = if needs_session {
             let mut args = tool_args.clone();
             if let Some(obj) = args.as_object_mut() {
                 obj.insert("session_id".to_string(), json!(session_id));

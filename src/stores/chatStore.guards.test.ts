@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import type { ApprovalNeededEvent, ProviderView, Recipe, SessionInfo } from '@/lib/types';
+import type { ApprovalNeededEvent, ProviderView, SessionInfo } from '@/lib/types';
 import type { Message } from './chatStore';
 
 // Store-action tests for the WS8 chat-layer guards. chatStore calls ipc only
@@ -14,7 +14,6 @@ vi.mock('@/lib/ipc', () => ({
     setSessionPersonaOverride: vi.fn(),
     bindWindowSession: vi.fn(),
     respondPermission: vi.fn(),
-    addRecipeExtension: vi.fn(),
     deleteSession: vi.fn(),
     loadSession: vi.fn(),
     isSessionBusy: vi.fn(),
@@ -87,9 +86,6 @@ beforeEach(() => {
     stopPhase: null,
     abandonedSession: null,
     loopSuspected: false,
-    pendingRecipeCard: null,
-    activeRecipeTurn: null,
-    pendingForcedAnswer: null,
   });
   vi.mocked(ipc.newSession).mockResolvedValue(info('s1'));
   vi.mocked(ipc.listProviders).mockResolvedValue([]);
@@ -98,7 +94,6 @@ beforeEach(() => {
   vi.mocked(ipc.setSessionPersonaOverride).mockResolvedValue(undefined);
   vi.mocked(ipc.bindWindowSession).mockRejectedValue(new Error('best-effort'));
   vi.mocked(ipc.respondPermission).mockResolvedValue(undefined);
-  vi.mocked(ipc.addRecipeExtension).mockResolvedValue(undefined);
   vi.mocked(ipc.isSessionBusy).mockResolvedValue(false);
 });
 
@@ -125,33 +120,6 @@ describe('chatStore send in-flight guard', () => {
     await useChatStore.getState().send('second');
 
     expect(ipc.sendPrompt).toHaveBeenCalledTimes(2);
-  });
-});
-
-describe('chatStore sendWithRecipe guard', () => {
-  const recipe: Recipe = {
-    id: 'r1',
-    slug: 'test',
-    title: 'Test recipe',
-    description: '',
-    instructions: 'Be thorough.',
-    prompt: null,
-    version: '1.0',
-    parameters: [],
-    extensions: [],
-    activities: [],
-    is_builtin: false,
-    created_at: '',
-    max_reasoning_tokens: 1000,
-  };
-
-  it('invokes the recipe exactly once across a rapid double-click', async () => {
-    const store = useChatStore.getState();
-    const p1 = store.sendWithRecipe(recipe, 'go');
-    const p2 = store.sendWithRecipe(recipe, 'go');
-    await Promise.all([p1, p2]);
-
-    expect(ipc.sendPrompt).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -382,7 +350,7 @@ describe('chatStore refreshProvider malformed base_url', () => {
 /** Regression: doSend read `droppedFiles` only AFTER ensureSession() — whose
     lazy newSession() optimistically wipes droppedFiles/attachments/
     pendingImages — so the first message of a fresh chat silently lost its
-    dropped files, and sendWithRecipe lost pasted attachments the same way. */
+    dropped files, and pasted attachments were lost the same way. */
 describe('chatStore first-send attachments survive session creation', () => {
   it('keeps dropped files on the first message of a fresh chat', async () => {
     useChatStore.setState({
@@ -397,27 +365,12 @@ describe('chatStore first-send attachments survive session creation', () => {
     expect(text).toContain('hello');
   });
 
-  it('keeps pasted attachments when a recipe invocation lazily creates the session', async () => {
-    const recipe: Recipe = {
-      id: 'r1',
-      slug: 'test',
-      title: 'Test recipe',
-      description: '',
-      instructions: 'Be thorough.',
-      prompt: null,
-      version: '1.0',
-      parameters: [],
-      extensions: [],
-      activities: [],
-      is_builtin: false,
-      created_at: '',
-      max_reasoning_tokens: 1000,
-    };
+  it('keeps pasted attachments when a first send lazily creates the session', async () => {
     useChatStore.setState({
       attachments: [{ id: 'a1', label: 'doc.txt', content: 'pasted contents' }],
     });
 
-    await useChatStore.getState().sendWithRecipe(recipe, 'go');
+    await useChatStore.getState().send('go');
 
     expect(ipc.sendPrompt).toHaveBeenCalledTimes(1);
     const text = vi.mocked(ipc.sendPrompt).mock.calls[0][1];

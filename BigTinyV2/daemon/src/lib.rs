@@ -13,10 +13,10 @@ pub mod models;
 pub mod network;
 pub mod plugins;
 pub mod provider;
-pub mod recipes;
 pub mod routes;
 pub mod scheduler;
 pub mod server;
+pub mod specialists;
 pub mod storage;
 
 use std::sync::Arc;
@@ -31,7 +31,6 @@ use error::DaemonError;
 use hitl::manager::HITLManager;
 use mcp::MCPManager;
 use provider::router::ProviderRouter;
-use recipes::engine::RecipeEngine;
 use scheduler::Scheduler;
 
 /// Everything the CLI entry point (or an embedding host, e.g. Kitty's Rust
@@ -55,7 +54,6 @@ pub struct RunOptions {
     /// this `false` to preserve existing single-user-localhost behavior. See
     /// `server::middleware::AuthConfig`.
     pub require_secret: bool,
-    pub recipes_dir: std::path::PathBuf,
     /// BigTiny's app-data directory (respects `BIGTINY_DATA_DIR`) — also
     /// used as the sandbox's always-allowed "cache dir"
     /// (`agent::sandbox::CACHE_DIR`'s real, non-fallback value).
@@ -215,6 +213,19 @@ pub async fn run(config: BigTinyConfig, options: RunOptions) -> Result<(), Daemo
         summarizer.clone(),
     ));
 
+    // Built before the agent and pointed at it afterwards: the orchestrator
+    // needs an `Agent` to run delegates on, and the agent's `MCPManager` needs
+    // the orchestrator to construct the `specialists` tool server. One of the
+    // two has to be filled in second (see `Orchestrator::attach`, which holds
+    // a `Weak` so the cycle cannot leak the daemon).
+    let orchestrator = Arc::new(agent::orchestrator::Orchestrator::new(
+        pool.clone(),
+        config.agent.max_concurrent_specialists.max(1) as usize,
+        config.agent.specialist_reasoning_fraction,
+        config.agent.subagent_model_deny.clone(),
+        config.agent.specialist_timeout_secs,
+    ));
+
     let agent = Arc::new(Agent::new(
         pool.clone(),
         router.clone(),
@@ -226,14 +237,20 @@ pub async fn run(config: BigTinyConfig, options: RunOptions) -> Result<(), Daemo
         plugins.clone(),
     ));
 
-    let recipe_engine = Arc::new(RecipeEngine::new(
-        pool.clone(),
-        agent.clone(),
-        mcp.clone(),
-        options.recipes_dir.clone(),
-    ));
+    orchestrator.attach(&agent);
+    orchestrator.attach_router(router.clone());
+    mcp.attach_orchestrator(orchestrator.clone());
 
-    let mut scheduler = Scheduler::new(pool.clone(), recipe_engine.clone()).await?;
+    // Written before the scheduler starts and before any app can register, so
+    // the first `call_specialist` of the daemon's life already has a roster.
+    // Never overwrites an edited definition -- see `seed_builtins`.
+    match specialists::registry::seed_builtins(&pool).await {
+        Ok(0) => {}
+        Ok(n) => tracing::info!("seeded {n} built-in specialists"),
+        Err(e) => tracing::warn!("could not seed built-in specialists: {e}"),
+    }
+
+    let mut scheduler = Scheduler::new(pool.clone(), agent.clone()).await?;
     if config.scheduler.enabled {
         if let Err(e) = scheduler.start().await {
             tracing::warn!("Scheduler failed to start: {e}");
@@ -262,7 +279,7 @@ pub async fn run(config: BigTinyConfig, options: RunOptions) -> Result<(), Daemo
         agent: agent.clone(),
         mcp: mcp.clone(),
         router,
-        recipe_engine,
+        orchestrator,
         scheduler: scheduler.clone(),
         config: config.clone(),
         plugins: plugins.clone(),

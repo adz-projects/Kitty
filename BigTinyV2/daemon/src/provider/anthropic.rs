@@ -13,6 +13,7 @@ use super::base::{
 };
 use crate::config::{CacheConfig, ProviderConfig};
 use crate::error::ProviderError;
+use super::schema::SchemaDirective;
 use crate::network::{maybe_direct_url, TailscaleClient};
 
 /// Resolve Anthropic's `max_tokens` and optional extended-thinking budget for
@@ -31,6 +32,7 @@ fn anthropic_thinking(
     effort: Option<&Effort>,
     explicit_max: Option<i32>,
     has_tools: bool,
+    budget_cap: Option<i32>,
 ) -> (i32, Option<i32>) {
     let max = explicit_max.unwrap_or(4096);
     let base = match effort {
@@ -45,6 +47,15 @@ fn anthropic_thinking(
     if has_tools {
         return (max, None);
     }
+    // A run-level cap only ever narrows the level's budget. Applied before the
+    // `explicit_max` arithmetic below so both bounds compose, and *not* rounded
+    // up if it lands under 1024 — Anthropic rejects a smaller budget, so a cap
+    // below the floor honestly means no thinking rather than the floor.
+    let base = match budget_cap {
+        Some(cap) if cap < 1024 => return (max, None),
+        Some(cap) => base.min(cap),
+        None => base,
+    };
     match explicit_max {
         // No cap was set: give the answer 4096 tokens of headroom *above* the
         // thinking budget, bounded to Anthropic's output ceiling.
@@ -354,6 +365,7 @@ impl Provider for AnthropicProvider {
         sampling: SamplingParams,
         model: Option<String>,
         id_slot: Option<i32>,
+        schema: SchemaDirective,
     ) -> Result<Pin<Box<dyn Stream<Item = Delta> + Send>>, ProviderError> {
         let model = self.resolve_model(model.as_deref());
         let url = format!("{}/v1/messages", self.config.base_url);
@@ -379,9 +391,18 @@ impl Provider for AnthropicProvider {
         // we persist *signed* thinking blocks across tool round-trips — can't
         // ride a turn that carries tools without 400ing the next request. All
         // of that arithmetic is pure and lives in `anthropic_thinking`.
-        let has_tools = tools.as_ref().is_some_and(|t| !t.is_empty());
-        let (max_tokens, thinking_budget) =
-            anthropic_thinking(sampling.effort.as_ref(), explicit_max, has_tools);
+        // A forced structured-response tool counts as tools for this
+        // arithmetic: it is a real `tools` entry on the wire, so a `thinking`
+        // block alongside it would 400 exactly as it does for an ordinary
+        // tool-carrying turn.
+        let forced_tool = matches!(schema, SchemaDirective::ForcedTool(..));
+        let has_tools = tools.as_ref().is_some_and(|t| !t.is_empty()) || forced_tool;
+        let (max_tokens, thinking_budget) = anthropic_thinking(
+            sampling.effort.as_ref(),
+            explicit_max,
+            has_tools,
+            sampling.reasoning_max_tokens,
+        );
         if thinking_budget.is_none()
             && matches!(
                 sampling.effort,
@@ -467,14 +488,24 @@ impl Provider for AnthropicProvider {
                 body["top_k"] = k.into();
             }
         }
-        if let Some(t) = tools {
-            // Converted, not passed through — see `tool_to_anthropic`. An
-            // empty result means every definition was unusable; omit the key
-            // entirely rather than sending `"tools": []`.
-            let converted = Self::tools_to_anthropic(&t);
-            if !converted.is_empty() {
-                body["tools"] = Value::Array(converted);
-            }
+        // Converted, not passed through — see `tool_to_anthropic`. An empty
+        // result means every definition was unusable; the key is omitted
+        // entirely rather than sending `"tools": []`.
+        let mut converted = match tools {
+            Some(t) => Self::tools_to_anthropic(&t),
+            None => Vec::new(),
+        };
+        // Anthropic has no `response_format`; forcing a single tool whose
+        // `input_schema` is the requested schema *is* its structured-output
+        // mechanism. The definition is already dialect-shaped by
+        // `provider::schema::directive_for`, so it joins the array verbatim
+        // rather than going through `tools_to_anthropic`.
+        if let SchemaDirective::ForcedTool(tool, choice) = &schema {
+            converted.push(tool.clone());
+            body["tool_choice"] = choice.clone();
+        }
+        if !converted.is_empty() {
+            body["tools"] = Value::Array(converted);
         }
         // `id_slot` is a llama.cpp/vLLM-only field (`parallel_slots`, self-hosted
         // providers only, see openai_compat.rs's dialect gate) — Anthropic's
@@ -1060,10 +1091,10 @@ mod thinking_tests {
 
     #[test]
     fn no_effort_leaves_max_tokens_and_adds_no_thinking() {
-        assert_eq!(anthropic_thinking(None, None, false), (4096, None));
-        assert_eq!(anthropic_thinking(Some(&Effort::Off), None, false), (4096, None));
+        assert_eq!(anthropic_thinking(None, None, false, None), (4096, None));
+        assert_eq!(anthropic_thinking(Some(&Effort::Off), None, false, None), (4096, None));
         // An explicit cap is preserved untouched.
-        assert_eq!(anthropic_thinking(None, Some(8192), false), (8192, None));
+        assert_eq!(anthropic_thinking(None, Some(8192), false, None), (8192, None));
     }
 
     #[test]
@@ -1071,7 +1102,7 @@ mod thinking_tests {
         // The trap: a high effort on a tool-carrying turn must NOT emit a
         // thinking block (it would 400 the next request).
         assert_eq!(
-            anthropic_thinking(Some(&Effort::High), None, true),
+            anthropic_thinking(Some(&Effort::High), None, true, None),
             (4096, None)
         );
     }
@@ -1080,12 +1111,12 @@ mod thinking_tests {
     fn without_an_explicit_cap_the_answer_gets_headroom_above_the_budget() {
         // Low: budget 4096, max = 4096 + 4096 = 8192 (budget strictly below).
         assert_eq!(
-            anthropic_thinking(Some(&Effort::Low), None, false),
+            anthropic_thinking(Some(&Effort::Low), None, false, None),
             (8192, Some(4096))
         );
         // High: budget 32768, max = 36864.
         assert_eq!(
-            anthropic_thinking(Some(&Effort::High), None, false),
+            anthropic_thinking(Some(&Effort::High), None, false, None),
             (36864, Some(32768))
         );
     }
@@ -1095,16 +1126,70 @@ mod thinking_tests {
         // The most likely bug in the cluster: default max_tokens is 4096, and a
         // medium budget of 16384 is >= it. Because no explicit cap was set,
         // max_tokens is raised to fit rather than the budget colliding with it.
-        let (max, budget) = anthropic_thinking(Some(&Effort::Medium), None, false);
+        let (max, budget) = anthropic_thinking(Some(&Effort::Medium), None, false, None);
         assert!(budget.unwrap() < max, "budget must stay strictly below max_tokens");
         assert_eq!((max, budget), (16384 + 4096, Some(16384)));
+    }
+
+    /// A run-level budget cap narrows the level's budget, and composes with an
+    /// explicit `max_tokens` rather than replacing it.
+    #[test]
+    fn a_reasoning_cap_narrows_the_budget() {
+        // High would be 32768; the run allows 8000.
+        assert_eq!(
+            anthropic_thinking(Some(&Effort::High), None, false, Some(8_000)),
+            (8_000 + 4096, Some(8_000))
+        );
+        // A cap above the level's own budget changes nothing — it is a ceiling,
+        // not a target.
+        assert_eq!(
+            anthropic_thinking(Some(&Effort::Low), None, false, Some(30_000)),
+            (8192, Some(4096))
+        );
+    }
+
+    /// Both bounds apply. `cap - 1024` is the explicit-max rule, and the run
+    /// budget is applied first, so the answer is the smaller of the two — the
+    /// exact interaction this module's arithmetic is easy to get wrong on.
+    #[test]
+    fn a_reasoning_cap_and_an_explicit_max_compose() {
+        // Run cap 6000, explicit max 8192 -> min(6000, 8192-1024=7168) = 6000.
+        assert_eq!(
+            anthropic_thinking(Some(&Effort::High), Some(8192), false, Some(6_000)),
+            (8192, Some(6_000))
+        );
+        // Run cap 7000, explicit max 4096 -> 4096-1024 = 3072 binds instead.
+        assert_eq!(
+            anthropic_thinking(Some(&Effort::High), Some(4096), false, Some(7_000)),
+            (4096, Some(3072))
+        );
+    }
+
+    /// Below Anthropic's floor a cap means *no thinking*, not a floor-sized
+    /// budget: sending a sub-1024 `budget_tokens` is rejected, and rounding up
+    /// would spend more than the run was allowed.
+    #[test]
+    fn a_cap_under_the_floor_turns_thinking_off_rather_than_clamping_up() {
+        assert_eq!(
+            anthropic_thinking(Some(&Effort::High), None, false, Some(500)),
+            (4096, None)
+        );
+        assert_eq!(
+            anthropic_thinking(Some(&Effort::High), None, false, Some(0)),
+            (4096, None)
+        );
+        // Exactly at the floor is still a real budget.
+        assert_eq!(
+            anthropic_thinking(Some(&Effort::High), None, false, Some(1024)),
+            (1024 + 4096, Some(1024))
+        );
     }
 
     #[test]
     fn an_explicit_cap_clamps_the_budget_below_it() {
         // cap 8192, high base 32768 → budget clamped to 8192-1024 = 7168.
         assert_eq!(
-            anthropic_thinking(Some(&Effort::High), Some(8192), false),
+            anthropic_thinking(Some(&Effort::High), Some(8192), false, None),
             (8192, Some(7168))
         );
     }
@@ -1121,12 +1206,12 @@ mod thinking_tests {
     fn withdrawing_tools_switches_thinking_on_and_inflates_max_tokens() {
         // With tools: thinking suppressed, max_tokens at the 4096 default.
         assert_eq!(
-            anthropic_thinking(Some(&Effort::Medium), None, true),
+            anthropic_thinking(Some(&Effort::Medium), None, true, None),
             (4096, None)
         );
         // Tools withdrawn, everything else identical: 5x the output budget.
         assert_eq!(
-            anthropic_thinking(Some(&Effort::Medium), None, false),
+            anthropic_thinking(Some(&Effort::Medium), None, false, None),
             (20480, Some(16384))
         );
     }
@@ -1142,13 +1227,13 @@ mod thinking_tests {
     #[test]
     fn the_wrapup_clamp_suppresses_thinking_as_well_as_the_budget() {
         // What the valve sends: effort zeroed, explicit cap set.
-        assert_eq!(anthropic_thinking(None, Some(2048), false), (2048, None));
-        assert_eq!(anthropic_thinking(None, Some(512), false), (512, None));
+        assert_eq!(anthropic_thinking(None, Some(2048), false, None), (2048, None));
+        assert_eq!(anthropic_thinking(None, Some(512), false, None), (512, None));
 
         // What it would send if only the cap were clamped — thinking survives
         // and takes 1024 of the 2048.
         assert_eq!(
-            anthropic_thinking(Some(&Effort::Medium), Some(2048), false),
+            anthropic_thinking(Some(&Effort::Medium), Some(2048), false, None),
             (2048, Some(1024))
         );
     }
@@ -1158,7 +1243,7 @@ mod thinking_tests {
         // cap 1500 → budget would be min(base, 476) = 476 < 1024 → no thinking,
         // and the cap is left as the user set it.
         assert_eq!(
-            anthropic_thinking(Some(&Effort::Low), Some(1500), false),
+            anthropic_thinking(Some(&Effort::Low), Some(1500), false, None),
             (1500, None)
         );
     }
@@ -1421,7 +1506,77 @@ mod sse_tests {
             serde_json::json!({"role": "user", "content": "hi"}),
         ];
         let stream = provider
-            .chat_completion(&messages, None, SamplingParams::default(), None, None)
+            .chat_completion(&messages, None, SamplingParams::default(), None, None, SchemaDirective::None)
+            .await
+            .unwrap();
+        let _: Vec<Delta> = stream.collect().await;
+
+        mock.assert_async().await;
+    }
+
+    /// Anthropic has no `response_format`; forcing a tool whose
+    /// `input_schema` is the schema *is* its structured-output mechanism. The
+    /// forced tool must reach `tools` alongside `tool_choice`, and — because
+    /// it is a real tools entry — must suppress extended thinking, which
+    /// 400s when sent with tools.
+    #[tokio::test]
+    async fn a_forced_tool_directive_reaches_tools_and_suppresses_thinking() {
+        let mut server = mockito::Server::new_async().await;
+        let schema = serde_json::json!({"type": "object", "properties": {"a": {"type": "string"}}});
+        let (tool, choice) = match crate::provider::schema::directive_for(
+            "anthropic",
+            &crate::provider::schema::ResponseMode::Schema,
+            Some(&schema),
+        ) {
+            SchemaDirective::ForcedTool(t, c) => (t, c),
+            other => panic!("expected a forced tool, got {other:?}"),
+        };
+        let mock = server
+            .mock("POST", "/v1/messages")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "tools": [{
+                    "name": crate::provider::schema::ANTHROPIC_STRUCTURED_TOOL,
+                    "input_schema": schema,
+                }],
+                "tool_choice": {
+                    "type": "tool",
+                    "name": crate::provider::schema::ANTHROPIC_STRUCTURED_TOOL,
+                },
+            })))
+            .with_status(200)
+            .with_header("content-type", "text/event-stream")
+            .with_body("data: {\"type\":\"message_stop\"}
+
+")
+            .create_async()
+            .await;
+
+        let provider = AnthropicProvider::new(
+            "test",
+            ProviderConfig {
+                base_url: server.url(),
+                ..Default::default()
+            },
+            Arc::new(TailscaleClient::new()),
+            CacheConfig::default(),
+        );
+        let messages = vec![serde_json::json!({"role": "user", "content": "hi"})];
+        // High effort would normally produce a `thinking` block; the forced
+        // tool must take precedence, exactly as an ordinary tool would.
+        let sampling = SamplingParams {
+            effort: Some(Effort::High),
+            max_tokens: Some(8192),
+            ..Default::default()
+        };
+        let stream = provider
+            .chat_completion(
+                &messages,
+                None,
+                sampling,
+                None,
+                None,
+                SchemaDirective::ForcedTool(tool, choice),
+            )
             .await
             .unwrap();
         let _: Vec<Delta> = stream.collect().await;
@@ -1464,7 +1619,7 @@ mod sse_tests {
             serde_json::json!({"role": "user", "content": "hi"}),
         ];
         let stream = provider
-            .chat_completion(&messages, None, SamplingParams::default(), None, None)
+            .chat_completion(&messages, None, SamplingParams::default(), None, None, SchemaDirective::None)
             .await
             .unwrap();
         let _: Vec<Delta> = stream.collect().await;
@@ -1505,7 +1660,7 @@ mod sse_tests {
             ..Default::default()
         };
         let stream = provider
-            .chat_completion(&messages, None, sampling, None, None)
+            .chat_completion(&messages, None, sampling, None, None, SchemaDirective::None)
             .await
             .unwrap();
         let _: Vec<Delta> = stream.collect().await;

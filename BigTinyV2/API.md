@@ -4,7 +4,7 @@
 
 The daemon serves several apps at once. Two rules run through everything below:
 
-- **You only ever see your own things.** Another app's session, job, recipe or
+- **You only ever see your own things.** Another app's session, job, specialist or
   private provider answers **404**, never 403 — "this exists but is not yours"
   is itself a disclosure.
 - **Visibility and mutability are different questions.** You may *use* a shared
@@ -151,6 +151,80 @@ Same model: `GET|POST /api/mcp/servers`, `PATCH|DELETE /{id}`,
 
 A shared server's `command` is what *every* app's agent loop executes, so
 shared rows are 403 to modify or connect.
+
+## Specialists
+
+A **specialist** is a named delegate agent the model can call mid-turn through
+the built-in `call_specialist` tool. It runs in its own session, with its own
+model pin, its own tool allow-list, and a required JSON answer shape — so its
+tool calls never enter the calling session's transcript and the caller sees only
+the result.
+
+| Route | Notes |
+|---|---|
+| `GET /api/specialists` | your own, plus the built-ins you have not shadowed |
+| `POST /api/specialists` | `{name, description, system_prompt, provider?, model?, tool_allow?, response_schema?, max_steps?, enabled?}` to `{id}`; also the edit path |
+| `DELETE /api/specialists/{id}` | your own only; **403** on a built-in |
+| `POST /api/specialists/{name}/run` | `{request, refs?, session_id}` to `{ok, ran_on, notes, result}` — runs to completion |
+| `GET /api/specialists/runs` | the last 100 delegate runs, for diagnosing what routed where |
+
+`description` is the only text the calling model reads when deciding whether to
+delegate, so a vague one does not fail loudly; it just gets used for the wrong
+things.
+
+`tool_allow` is enforced at dispatch, not merely used to shape what the delegate
+is offered — a model calling a tool it was never shown is refused. A name no
+connected server provides is a **400** at write time rather than a surprise at
+run time. An empty array means *no* tools, never "unrestricted".
+
+Built-ins (`researcher`, `summarizer`, `locator`, `extractor`, `analyst`) are
+seeded by the daemon and shared by every app: **403** to modify or delete.
+POSTing one's name creates your own definition that shadows it for you alone;
+deleting that reverts to the built-in.
+
+Delegates run at background priority, cannot start delegates of their own, are
+capped by `agent.max_concurrent_specialists`, and are cancelled when their parent
+session is or when they exceed `agent.specialist_timeout_secs`. A run that needs
+human approval refuses immediately and says so in its answer rather than waiting
+for an approver that does not exist.
+
+**Host selection.** A delegate does not simply run wherever the parent did. The
+daemon scores every provider visible to the app — tool support and health are
+hard gates, then whether it shares a single KV slot with the parent, its
+concurrency, and (when Kitty supplies them) `cost_tier` and `capability_rank`
+from its own provider config. A specialist's `provider`/`model` pin wins if it is
+still eligible; if it is not, **both** are dropped together, because a model
+chosen for one provider is not meaningful at another. The result names what it
+actually ran on in `ran_on`, and any degradation in `notes`.
+
+`agent.subagent_model_deny` (exact ids or `prefix*`) is checked at final
+resolution, including the step that would otherwise fall back to the parent's own
+model — so a denied model is refused rather than used as a last resort, and the
+refusal names the pattern. The list is also copied into the delegate's own
+session metadata, because host selection is not the last word on which model runs:
+the turn loop re-resolves the provider at step 0 and again on every failover, and
+neither knows a specialist is asking. A delegate placed on a permitted host will
+decline a failover onto a denied one and stay where it is.
+
+**Reasoning budget.** Each delegate gets one, from its own `reasoning_cap` or
+`agent.specialist_reasoning_fraction`. Enforced by a per-run accumulator in the
+agent loop rather than on the wire, because only Anthropic and OpenRouter accept
+a budget field — the other dialects would silently ignore one. Exceeding it
+disables thinking for the rest of the run and tells the model to finish; it never
+aborts, because the delegate still owes its caller a report.
+
+**Fan-out.** A specialist with `fan_out: "per_ref"` (built-in `extractor` and
+`summarizer`) turns one call carrying N refs into N delegates, returning
+`{succeeded, failed, results[]}`. A failure is per element, never for the batch.
+Refs are capped at 32, and the whole batch shares one deadline of three times
+`specialist_timeout_secs` — a per-run ceiling bounds one child, and thirty-two
+children against three permits is eleven waves of it with the parent's tool call
+blocked throughout. A source the batch did not reach is reported as such, so a
+caller can re-run just the ones that are missing.
+
+Progress reaches a watching client as `subagent_status` frames carrying the
+*child's* session id, so its full transcript stays readable through
+`GET /api/chat/{child}/history` when the report was not enough.
 
 ## Plugins
 

@@ -23,6 +23,11 @@ import type {
   McpServerPatch,
   McpServerSpec,
   MemoryStats,
+  SessionAllowedDirs,
+  Specialist,
+  SpecialistInput,
+  SpecialistRun,
+  SubagentStatusEvent,
   LocalEngineStatus,
   LocalModel,
   ModelPickerEntry,
@@ -33,10 +38,6 @@ import type {
   ProviderView,
   DownloadProgress,
   EngineRestartState,
-  Recipe,
-  RecipeExtension,
-  RecipeImportResult,
-  RecipeInput,
   Schedule,
   ScheduledTask,
   SessionInfo,
@@ -114,7 +115,7 @@ export const ipc = {
     sessionId: string,
     text: string,
     images?: { mime: string; data_url: string }[],
-    attachedPaths?: string[],
+    attachedPaths?: string[]
   ) =>
     invoke<void>('send_prompt', {
       sessionId,
@@ -208,17 +209,32 @@ export const ipc = {
   deleteScheduledTask: (id: string) => invoke<void>('delete_scheduled_task', { id }),
   setScheduledTaskEnabled: (id: string, enabled: boolean) =>
     invoke<void>('set_scheduled_task_enabled', { id, enabled }),
-  // Recipes — client-side-interpreted Goose recipe templates (see
-  // chatStore.ts's sendWithRecipe and docs/BACKLOG.md's now-resolved entry).
-  listRecipes: () => invoke<Recipe[]>('list_recipes'),
-  createRecipe: (recipe: RecipeInput) => invoke<Recipe>('create_recipe', { recipe }),
-  updateRecipe: (id: string, recipe: RecipeInput) => invoke<void>('update_recipe', { id, recipe }),
-  deleteRecipe: (id: string) => invoke<void>('delete_recipe', { id }),
-  duplicateRecipe: (id: string) => invoke<Recipe>('duplicate_recipe', { id }),
-  importRecipeYaml: (path: string) => invoke<RecipeImportResult>('import_recipe_yaml', { path }),
-  exportRecipeYaml: (id: string, path: string) => invoke<void>('export_recipe_yaml', { id, path }),
-  addRecipeExtension: (sessionId: string, extension: RecipeExtension) =>
-    invoke<void>('add_recipe_extension', { sessionId, extension }),
+  /** What this session may read and write, for the working-directory pill's
+      hover list. */
+  listSessionAllowedDirs: (sessionId: string) =>
+    invoke<SessionAllowedDirs>('list_session_allowed_dirs', { sessionId }),
+  /** Withdraw one granted folder or attached file. */
+  revokeSessionDir: (sessionId: string, path: string) =>
+    invoke<void>('revoke_session_dir', { sessionId, path }),
+  // Specialists — delegate agents the model calls mid-turn. Definitions live
+  // in the daemon (`/api/specialists`), not in Kitty's config: the model
+  // reaches the same rows through `call_specialist` without Kitty in the loop,
+  // so a client-side copy would be a second source of truth for something
+  // Kitty does not own.
+  listSpecialists: () => invoke<Specialist[]>('list_specialists'),
+  /** Create or edit. One call for both — the daemon keys on `name`. */
+  saveSpecialist: (spec: SpecialistInput) => invoke<string>('save_specialist', { spec }),
+  deleteSpecialist: (id: string) => invoke<void>('delete_specialist', { id }),
+  /** Every tool name this app can reach, for the Specialists tool checklist. */
+  listAvailableTools: () => invoke<string[]>('list_available_tools'),
+  /** What has been delegated recently, and how it went. */
+  listSpecialistRuns: () => invoke<SpecialistRun[]>('list_specialist_runs'),
+  /** Run one from the UI, under an existing session. Goes through the same
+      orchestrator as the model's own `call_specialist`, so the concurrency cap
+      and depth limit apply identically. Resolves only when the delegate is
+      done. */
+  runSpecialist: (name: string, request: string, sessionId: string, refs?: string[]) =>
+    invoke<unknown>('run_specialist', { name, request, sessionId, refs }),
   // Error/warning log (Settings → Advanced) — captured server-side from
   // `tracing::warn!`/`error!` calls via `log_capture`'s in-memory ring buffer.
   listLogEntries: () => invoke<LogEntry[]>('list_log_entries'),
@@ -432,28 +448,6 @@ export async function pickSavePath(defaultName: string): Promise<string | null> 
   return res ?? null;
 }
 
-/** Native picker for importing a standalone Goose recipe file. `.yml` is
-    deliberately not offered — Goose's own docs say only `.yaml`/`.json` are
-    supported for recipes (the Rust-side command rejects `.yml` explicitly
-    too, with a clearer message, in case one gets through some other way). */
-export async function pickRecipeYaml(): Promise<string | null> {
-  const res = await openDialog({
-    multiple: false,
-    filters: [{ name: 'Recipe', extensions: ['yaml', 'json'] }],
-  });
-  return typeof res === 'string' ? res : null;
-}
-
-/** Native save-file dialog for exporting a recipe as a real, portable Goose
-    recipe `.yaml` (usable by the standalone `goose run --recipe` CLI). */
-export async function pickRecipeSavePath(defaultName: string): Promise<string | null> {
-  const res = await saveDialog({
-    defaultPath: defaultName,
-    filters: [{ name: 'YAML', extensions: ['yaml'] }],
-  });
-  return res ?? null;
-}
-
 /** Subscribe to stack status changes. Returns an unlisten fn. */
 export function onStackStatus(cb: (payload: StackStatusPayload) => void): Promise<UnlistenFn> {
   return listen<StackStatusPayload>('stack://status', (e) => cb(e.payload));
@@ -495,6 +489,12 @@ export const onCompaction = (cb: (e: CompactionEvent) => void) =>
     Surfaced as a banner — see `chatStore`'s listener. */
 export const onContextBudget = (cb: (e: { session_id: string; message: string }) => void) =>
   listen<{ session_id: string; message: string }>('chat://context-budget', (e) => cb(e.payload));
+
+/** A specialist this turn delegated to changed state. Carries the delegate's
+    own session id, so the transcript it produced stays reachable when its
+    structured report was not enough. */
+export const onSubagentStatus = (cb: (e: SubagentStatusEvent) => void) =>
+  listen<SubagentStatusEvent>('chat://subagent-status', (e) => cb(e.payload));
 
 export const onUserMessage = (cb: (e: TextDeltaEvent) => void) =>
   listen<TextDeltaEvent>('chat://user-message', (e) => cb(e.payload));
@@ -575,12 +575,6 @@ export const onSessionsCleared = (cb: (deleted: number) => void) =>
     another window are both open. */
 export const onScheduledTasksChanged = (cb: () => void) =>
   listen('scheduled_tasks://changed', () => cb());
-
-/** Fires on any recipe create/update/delete/duplicate/import — same
-    live-refresh staleness pattern as `onScheduledTasksChanged`, since both
-    `Composer.tsx` (slash-command matching) and Settings → Recipes may be
-    open at once. */
-export const onRecipesChanged = (cb: () => void) => listen('recipes://changed', () => cb());
 
 export interface ProviderHealth {
   reachable: boolean;

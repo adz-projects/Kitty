@@ -17,4 +17,5 @@ pub mod mcp;
 pub mod pathway;
 pub mod providers;
 pub mod sessions;
+pub mod specialists;
 pub mod stream;

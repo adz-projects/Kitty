@@ -11,7 +11,7 @@
 use std::path::Path;
 
 use bigtiny2::config::BigTinyConfig;
-use bigtiny2::env_contract::{apply_env_overrides, resolve_data_dir, shellexpand_home};
+use bigtiny2::env_contract::{apply_env_overrides, resolve_data_dir};
 use bigtiny2::RunOptions;
 
 struct Args {
@@ -257,19 +257,6 @@ async fn async_main() {
     };
     apply_env_overrides(&mut config);
 
-    // `config.recipes.directory` was previously always ignored in favor of
-    // a hardcoded `data_dir/recipes` — that's still the right zero-config
-    // default (keeps recipes consolidated under `BIGTINY_DATA_DIR` /
-    // Kitty's data root with no extra knob to manage), but an explicit
-    // override via `--config` should actually take effect instead of being
-    // silently dropped.
-    let recipes_dir =
-        if config.recipes.directory == bigtiny2::config::default_recipes_directory() {
-            data_dir.join("recipes")
-        } else {
-            shellexpand_home(&config.recipes.directory)
-        };
-
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(config.logging.level.clone()));
     // `json_format` was previously ignored too — only `level` (via
@@ -296,7 +283,6 @@ async fn async_main() {
         // `secret` still does here is seed the registration token, and a
         // random one is generated when it is absent.
         require_secret: false,
-        recipes_dir,
         data_dir: data_dir.to_string_lossy().into_owned(),
         // Env-only, no `--encryption-key` flag — matches `BIGTINY_SECRET`'s
         // own env-only convention (Kitty never passes secrets via argv).

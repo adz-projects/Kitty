@@ -12,7 +12,7 @@ import { Appearance } from '@/components/settings/Appearance';
 import { Advanced } from '@/components/settings/Advanced';
 import { AdaptivePathway } from '@/components/settings/AdaptivePathway';
 import { ScheduledTasks } from '@/components/settings/ScheduledTasks';
-import { Recipes } from '@/components/settings/Recipes';
+import { Specialists } from '@/components/settings/Specialists';
 
 function sectionLabels(): Record<string, string> {
   return {
@@ -21,7 +21,7 @@ function sectionLabels(): Record<string, string> {
     local_models: 'Helper Models',
     mcp_servers: 'MCP Servers',
     scheduled_tasks: 'Scheduled Tasks',
-    recipes: 'Recipes',
+    specialists: 'Specialists',
     adaptive_pathway: 'Adaptive Pathway',
     notifications: 'Notifications',
     appearance: 'Appearance',
@@ -55,7 +55,10 @@ function buildGroups(): { label: string; sections: string[] }[] {
         ...(isAndroid() ? [] : ['notifications']),
       ],
     },
-    { label: 'Automation & extensions', sections: ['mcp_servers', 'scheduled_tasks', 'recipes'] },
+    {
+      label: 'Automation & extensions',
+      sections: ['mcp_servers', 'scheduled_tasks', 'specialists'],
+    },
     { label: 'Advanced', sections: ['advanced', 'adaptive_pathway'] },
   ];
 }
@@ -72,7 +75,7 @@ export function SettingsView() {
   // General doesn't exist on Android (removed above), so it can't be the
   // default landing section there — start on Providers instead.
   const [section, setSection] = useState<string>(
-    routedSection ?? (isAndroid() ? 'providers' : 'general'),
+    routedSection ?? (isAndroid() ? 'providers' : 'general')
   );
   const [highlight, setHighlight] = useState<string | null>(routedHighlight);
   const [recoveryNotice, setRecoveryNotice] = useState<string | null>(null);
@@ -150,7 +153,7 @@ export function SettingsView() {
         {section === 'local_models' && <HelperModels />}
         {section === 'mcp_servers' && <McpServers />}
         {section === 'scheduled_tasks' && <ScheduledTasks />}
-        {section === 'recipes' && <Recipes />}
+        {section === 'specialists' && <Specialists />}
         {section === 'adaptive_pathway' && <AdaptivePathway />}
         {section === 'notifications' && <NotificationsSection />}
         {section === 'appearance' && <Appearance />}

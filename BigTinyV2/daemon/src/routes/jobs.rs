@@ -152,8 +152,11 @@ pub async fn create(
         }
         // Jobs are `Background` in the provider queue: a user waiting on a
         // chat message should not sit behind a batch.
-        match agent.run_turn_and_wait(&sid, &prompt).await {
-            Ok(()) => {
+        match agent
+            .run_turn_and_wait(&sid, &prompt, crate::provider::queue::Priority::Background)
+            .await
+        {
+            Ok(_notices) => {
                 let result = sessions::last_assistant_text(&pool, &sid).await.ok().flatten();
                 let _ = jobs::finish(&pool, &jid, "succeeded", result.as_deref(), None).await;
             }

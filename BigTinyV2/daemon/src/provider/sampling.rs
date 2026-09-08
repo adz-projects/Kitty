@@ -37,6 +37,9 @@ pub fn defaults_for(provider_type: &str, _model: &str) -> SamplingParams {
             // floor — a self-hosted endpoint has no reasoning-effort parameter
             // at all, so there is nothing to default here.
             effort: None,
+            // Same reasoning as `effort`: a provider has no reasoning-budget
+            // setting to default, only the agent loop knows the run's cap.
+            reasoning_max_tokens: None,
         }
     } else {
         SamplingParams::default()
@@ -53,6 +56,9 @@ pub fn merge(configured: &SamplingParams, defaults: &SamplingParams) -> Sampling
         min_p: configured.min_p.or(defaults.min_p),
         presence_penalty: configured.presence_penalty.or(defaults.presence_penalty),
         frequency_penalty: configured.frequency_penalty.or(defaults.frequency_penalty),
+        reasoning_max_tokens: configured
+            .reasoning_max_tokens
+            .or(defaults.reasoning_max_tokens),
         max_tokens: configured.max_tokens.or(defaults.max_tokens),
         // Neither presets nor floors ever set effort (the loop applies it after
         // this merge), so this `or` is only ever `None.or(None)` — carried

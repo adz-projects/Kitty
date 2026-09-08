@@ -11,7 +11,6 @@ use bigtiny2::config::BigTinyConfig;
 use bigtiny2::hitl::manager::HITLManager;
 use bigtiny2::mcp::MCPManager;
 use bigtiny2::provider::router::ProviderRouter;
-use bigtiny2::recipes::engine::RecipeEngine;
 use bigtiny2::routes::AppState;
 use bigtiny2::scheduler::Scheduler;
 use http_body_util::BodyExt;
@@ -72,14 +71,19 @@ async fn test_state_inner(
         plugins.clone(),
     ));
 
-    let recipe_engine = Arc::new(RecipeEngine::new(
+    let orchestrator = Arc::new(bigtiny2::agent::orchestrator::Orchestrator::new(
         pool.clone(),
-        agent.clone(),
-        mcp.clone(),
-        std::env::temp_dir(),
+        config.agent.max_concurrent_specialists.max(1) as usize,
+        config.agent.specialist_reasoning_fraction,
+        config.agent.subagent_model_deny.clone(),
+        config.agent.specialist_timeout_secs,
     ));
+    orchestrator.attach(&agent);
+    orchestrator.attach_router(router.clone());
+    mcp.attach_orchestrator(orchestrator.clone());
+
     let scheduler = Arc::new(tokio::sync::Mutex::new(
-        Scheduler::new(pool.clone(), recipe_engine.clone())
+        Scheduler::new(pool.clone(), agent.clone())
             .await
             .unwrap(),
     ));
@@ -96,7 +100,7 @@ async fn test_state_inner(
         agent,
         mcp,
         router,
-        recipe_engine,
+        orchestrator,
         scheduler,
         config,
         plugins: plugins.clone(),
@@ -282,6 +286,104 @@ async fn create_list_and_fetch_session_roundtrip() {
     assert!(history.as_array().unwrap().is_empty());
 }
 
+/// Working folders accumulate across changes, and stop accumulating forever.
+///
+/// The union is the point: `cwd` holds only the folder in force now, so without
+/// it, pointing the pill at a second folder silently revoked the first
+/// mid-task. The ceiling is the other half — this blob is parsed every turn,
+/// walked on every tool call, and copied into every delegate session, so an
+/// unbounded list is a cost paid over and over by everything downstream.
+#[tokio::test]
+async fn working_folders_accumulate_up_to_a_ceiling_and_then_forget_the_oldest() {
+    let state = test_state().await;
+    let app = create_router(state);
+
+    let create_resp = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/api/chat/")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    json!({"cwd": "/first"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let session_id = body_json(create_resp).await["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let patch = |body: Value| {
+        let app = app.clone();
+        let session_id = session_id.clone();
+        async move {
+            let resp = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("PATCH")
+                        .uri(format!("/api/chat/{session_id}/config"))
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        }
+    };
+
+    patch(json!({"cwd": "/first", "working_dirs": ["/first"]})).await;
+    patch(json!({"cwd": "/second", "working_dirs": ["/second"]})).await;
+
+    let read_dirs = || {
+        let app = app.clone();
+        let session_id = session_id.clone();
+        async move {
+            let list = body_json(
+                app.oneshot(
+                    axum::http::Request::builder()
+                        .uri("/api/chat/?limit=200")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+            )
+            .await;
+            let sessions = list["sessions"].as_array().unwrap().clone();
+            let row = sessions.iter().find(|s| s["id"] == session_id).unwrap();
+            let metadata: Value = serde_json::from_str(row["metadata"].as_str().unwrap()).unwrap();
+            metadata["working_dirs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        }
+    };
+
+    // The first folder is still readable after the pill moved to the second.
+    assert_eq!(read_dirs().await, vec!["/first", "/second"]);
+
+    // Push well past the ceiling. What survives is the most recent, which is
+    // what "the places this chat is working" means; the earliest grants are the
+    // ones nobody is coming back to.
+    for i in 0..80 {
+        patch(json!({"working_dirs": [format!("/bulk/{i}")]})).await;
+    }
+    let dirs = read_dirs().await;
+    assert_eq!(dirs.len(), 64, "the list must not grow without bound");
+    assert_eq!(dirs.last().unwrap(), "/bulk/79", "the newest grant survives");
+    assert!(
+        !dirs.contains(&"/first".to_string()),
+        "the oldest grants are the ones dropped"
+    );
+}
+
 #[tokio::test]
 async fn chat_dir_is_set_at_creation_and_survives_a_later_cwd_repoint() {
     let state = test_state().await;
@@ -377,14 +479,14 @@ async fn create_session_defaults_mode_to_chat_not_null() {
 }
 
 #[tokio::test]
-async fn mcp_and_providers_and_recipes_and_schedules_list_endpoints_respond() {
+async fn mcp_and_providers_and_specialists_and_schedules_list_endpoints_respond() {
     let state = test_state().await;
     let app = create_router(state);
 
     for path in [
         "/api/mcp/servers",
         "/api/providers",
-        "/api/recipes",
+        "/api/specialists",
         "/api/schedules",
     ] {
         let resp = app
@@ -582,7 +684,7 @@ async fn fork_remaps_the_compaction_boundary_to_the_new_sessions_own_rowids() {
 }
 
 #[tokio::test]
-async fn create_recipe_then_execute_it_creates_a_session() {
+async fn defining_a_specialist_then_running_it_creates_a_delegate_session() {
     let state = test_state().await;
     let app = create_router(state.clone());
 
@@ -591,78 +693,99 @@ async fn create_recipe_then_execute_it_creates_a_session() {
         .oneshot(
             axum::http::Request::builder()
                 .method("POST")
-                .uri("/api/recipes")
+                .uri("/api/specialists")
                 .header("content-type", "application/json")
                 .body(axum::body::Body::from(
-                    json!({"name": "smoke test recipe", "prompt_template": "Say hi"}).to_string(),
+                    json!({
+                        "name": "smoke",
+                        "description": "A specialist for the smoke test.",
+                        "system_prompt": "Answer briefly.",
+                        "tool_allow": []
+                    })
+                    .to_string(),
                 ))
                 .unwrap(),
         )
         .await
         .unwrap();
     assert_eq!(create_resp.status(), axum::http::StatusCode::OK);
-    let recipe_id = body_json(create_resp).await["id"]
-        .as_str()
-        .unwrap()
-        .to_string();
 
-    let exec_resp = app
+    // A delegate is always a delegate *of* something, so the run needs a
+    // parent session to hang off.
+    let parent = uuid::Uuid::new_v4().to_string();
+    bigtiny2::storage::sessions::create_session_for_app(&state.db, &parent, "Parent", TEST_APP)
+        .await
+        .unwrap();
+
+    let run_resp = app
         .oneshot(
             axum::http::Request::builder()
                 .method("POST")
-                .uri(format!("/api/recipes/{recipe_id}/execute"))
-                .header("content-type", "application/json")
-                .body(axum::body::Body::from(json!({}).to_string()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    // 815bugs #91: with no healthy providers the turn fails, and that
-    // outcome is now propagated — the route answers 500 instead of the old
-    // swallow-and-200. The recipe's session row is still created (it holds
-    // the failed run's trail), which is what this test originally pinned.
-    assert_eq!(
-        exec_resp.status(),
-        axum::http::StatusCode::INTERNAL_SERVER_ERROR
-    );
-    let err = body_json(exec_resp).await;
-    assert!(err["error"].as_str().unwrap().contains("turn failed"));
-    let sessions: Vec<String> = sqlx::query_scalar("SELECT id FROM sessions WHERE name = ?")
-        .bind("smoke test recipe")
-        .fetch_all(&state.db)
-        .await
-        .unwrap();
-    assert_eq!(sessions.len(), 1, "recipe session row must still be created");
-}
-
-#[tokio::test]
-async fn create_schedule_then_run_now_executes_its_recipe() {
-    let state = test_state().await;
-    let app = create_router(state.clone());
-
-    let recipe_resp = app
-        .clone()
-        .oneshot(
-            axum::http::Request::builder()
-                .method("POST")
-                .uri("/api/recipes")
+                .uri("/api/specialists/smoke/run")
                 .header("content-type", "application/json")
                 .body(axum::body::Body::from(
-                    json!({"name": "scheduled recipe", "prompt_template": "Say hi"}).to_string(),
+                    json!({"request": "say hi", "session_id": parent}).to_string(),
                 ))
                 .unwrap(),
         )
         .await
         .unwrap();
-    let recipe_id = body_json(recipe_resp).await["id"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    // With no provider that can host a delegate, the run is refused *before*
+    // anything is created — 409, not a 500 from a turn that started and failed.
+    // That ordering is the point: a delegate that cannot run should cost
+    // nothing and leave no half-built transcript behind.
+    assert_eq!(run_resp.status(), axum::http::StatusCode::CONFLICT);
 
-    // `enabled: true` so `execute_job`'s disabled-guard lets the run
-    // through (a disabled schedule is never executed, not even via
-    // `run_now`). The scheduler itself is never started in this harness, so
-    // the registered cron never fires on its own.
+    // And the refusal says which setting is responsible, so a user who denied
+    // their only model gets that sentence rather than "unavailable".
+    let body = body_json(run_resp).await;
+    let err = body["error"].as_str().unwrap_or_default();
+    assert!(
+        err.contains("host a specialist") || err.contains("no provider is configured"),
+        "the refusal must name a cause, got: {err}"
+    );
+
+    let children = bigtiny2::storage::sessions::children_of(&state.db, &parent, TEST_APP)
+        .await
+        .unwrap();
+    assert!(
+        children.is_empty(),
+        "a refused delegate must not leave a session behind"
+    );
+}
+
+/// A built-in is visible to every app and belongs to none, so an app may not
+/// delete one. Overriding it is a POST of the same name, not a DELETE.
+#[tokio::test]
+async fn a_built_in_specialist_cannot_be_deleted() {
+    let state = test_state().await;
+    bigtiny2::specialists::registry::seed_builtins(&state.db)
+        .await
+        .unwrap();
+    let app = create_router(state.clone());
+
+    let resp = app
+        .oneshot(
+            axum::http::Request::builder()
+                .method("DELETE")
+                .uri("/api/specialists/builtin:researcher")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn create_schedule_then_run_now_executes_a_turn() {
+    let state = test_state().await;
+    let app = create_router(state.clone());
+
+    // `enabled: true` so `execute_job`'s disabled-guard lets the run through (a
+    // disabled schedule is never executed, not even via `run_now`). The
+    // scheduler itself is never started in this harness, so the registered cron
+    // never fires on its own.
     let schedule_resp = app
         .clone()
         .oneshot(
@@ -674,7 +797,7 @@ async fn create_schedule_then_run_now_executes_its_recipe() {
                     json!({
                         "name": "nightly",
                         "cron": "0 0 * * *",
-                        "recipe_id": recipe_id,
+                        "prompt": "Say hi",
                         "enabled": true
                     })
                     .to_string(),
@@ -702,9 +825,9 @@ async fn create_schedule_then_run_now_executes_its_recipe() {
     assert_eq!(run_resp.status(), axum::http::StatusCode::OK);
     assert_eq!(body_json(run_resp).await["ok"], true);
 
-    // execute_job (fired by run_now) creates a temp session and an
-    // execution_history row for it — confirms the recipe actually ran
-    // through the scheduler path, not just that the HTTP call returned ok.
+    // `execute_job` (fired by run_now) creates the session and an
+    // `execution_history` row for it — confirming the turn actually ran through
+    // the scheduler path, not just that the HTTP call returned ok.
     let execution_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM execution_history WHERE trigger_type = 'schedule'",
     )

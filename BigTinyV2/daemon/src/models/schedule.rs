@@ -7,9 +7,8 @@ use uuid::Uuid;
 pub struct JobConfig {
     pub name: String,
     pub cron: String,
-    pub recipe_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub parameters: Option<serde_json::Value>,
+    /// The turn this schedule sends. See `ScheduleJob::prompt`.
+    pub prompt: String,
     pub enabled: bool,
 }
 
@@ -18,9 +17,13 @@ pub struct ScheduleJob {
     pub id: String,
     pub name: String,
     pub cron: String,
-    pub recipe_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub parameters: Option<serde_json::Value>,
+    /// What a cron firing sends, as an ordinary user turn.
+    ///
+    /// A schedule used to name a recipe and its parameters. With recipes
+    /// replaced by specialists there is nothing to parameterize: the model that
+    /// receives this prompt decides for itself whether the work wants a
+    /// specialist, exactly as it would in a chat.
+    pub prompt: String,
     pub enabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_at: Option<DateTime<Utc>>,
@@ -32,14 +35,13 @@ impl ScheduleJob {
     pub fn new(
         name: impl Into<String>,
         cron: impl Into<String>,
-        recipe_id: impl Into<String>,
+        prompt: impl Into<String>,
     ) -> Self {
         Self {
             id: Uuid::new_v4().to_string(),
             name: name.into(),
             cron: cron.into(),
-            recipe_id: recipe_id.into(),
-            parameters: None,
+            prompt: prompt.into(),
             enabled: true,
             created_at: Some(Utc::now()),
             updated_at: Some(Utc::now()),
@@ -102,7 +104,7 @@ mod tests {
 
     #[test]
     fn test_schedule_job_new() {
-        let job = ScheduleJob::new("daily", "0 0 * * *", "recipe1");
+        let job = ScheduleJob::new("daily", "0 0 * * *", "summarize yesterday");
         assert!(job.enabled);
         assert_eq!(job.cron, "0 0 * * *");
     }

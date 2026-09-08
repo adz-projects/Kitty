@@ -363,6 +363,7 @@ dependencies = [
  "regex",
  "reqwest",
  "rmcp 0.9.1",
+ "schemars",
  "serde",
  "serde_json",
  "serde_yaml",
