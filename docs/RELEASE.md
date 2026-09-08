@@ -41,14 +41,24 @@ whole cmake/Vulkan/glslc build surface is gone). Building and shipping it needs
 two things beyond the ordinary `cargo build`:
 
 1. **Build the daemon with the feature** (its `build.rs` auto-copies
-   `litert-lm.if.lib` → `litert-lm.lib`, so no manual link step):
+   `litert-lm.if.lib` → `litert-lm.lib`, so no manual link step).
+   `plugins/build.py` already does this — it is the source of truth for the
+   crate path, the feature list and the destination filename, so prefer it
+   over the manual form and change it rather than this document if any of
+   those move:
 
    ```powershell
-   cd plugins/bigtiny_rust
-   cargo build --release --features litert-engine --bin bigtiny2-daemon
-   # → target/release/bigtiny2-daemon.exe (~76 MB), then copy to
-   #   src-tauri/binaries/bigtiny2-daemon-x86_64-pc-windows-msvc.exe
+   python plugins/build.py bigtiny
+   # runs, in BigTinyV2/daemon:
+   #   cargo build --release --locked --features litert-engine
+   # → copied to
+   #   src-tauri/binaries/bigtiny2-daemon-x86_64-pc-windows-msvc.exe (~71 MB)
    ```
+
+   The daemon is `BigTinyV2/daemon`, **not** `plugins/bigtiny_rust`. The V1
+   tree is frozen and still linked in-process by the Android build; a release
+   built from it would ship an engine several phases behind the one Kitty's
+   client code targets, and would do so silently.
 
 2. **Bundle the LiteRT native DLLs + the Gemma tokenizer beside the daemon.**
    `litert-lm-rust`'s `download-native` fetches these into the crate's build
@@ -186,7 +196,7 @@ module, or via Control Panel → Credential Manager → Windows Credentials.
 ### Verifying a migration
 
 Compare counts between source and destination — sessions, messages, providers,
-recipes, schedules should match exactly — and confirm nothing was left
+specialists, schedules should match exactly — and confirm nothing was left
 ownerless:
 
 ```sql
