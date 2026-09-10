@@ -56,9 +56,10 @@ two things beyond the ordinary `cargo build`:
    ```
 
    The daemon is `BigTinyV2/daemon`, **not** `plugins/bigtiny_rust`. The V1
-   tree is frozen and still linked in-process by the Android build; a release
-   built from it would ship an engine several phases behind the one Kitty's
-   client code targets, and would do so silently.
+   tree is frozen and **nothing builds or links it any more** — Android moved
+   to V2 in-process too (D26), so both targets now run one daemon. V1 is kept
+   solely as the rollback path; a release built from it would ship an engine
+   several phases behind the client code, and would do so silently.
 
 2. **Bundle the LiteRT native DLLs + the Gemma tokenizer beside the daemon.**
    `litert-lm-rust`'s `download-native` fetches these into the crate's build
@@ -269,10 +270,18 @@ aarch64 work and then dies on armv7 after ~8 minutes.
 
 **`plugins/build.py` is not part of this lane and must not be run for it.**
 There are no Android sidecars: `tauri.android.conf.json` clears
-`bundle.externalBin`, the daemon is linked in and hosted in-process
-(`lifecycle/bigtiny_embedded.rs`), and the three MCP servers register with
+`bundle.externalBin`, the **V2** daemon is linked in and hosted in-process
+(`lifecycle/bigtiny_embedded.rs`), and the MCP servers register with
 `transport: "in_process"`. Android 10+ refuses to `exec()` a binary in
 app-writable storage, so a frozen per-plugin executable has nowhere to live.
+
+**The version Gradle stamps comes from Tauri, not from Gradle.**
+`gen/android/app/tauri.properties` is gitignored and regenerated from
+`tauri.conf.json` on `pnpm tauri android build`. A bare
+`gradlew assembleRelease` skips that step and happily ships whatever stale
+`versionName`/`versionCode` is on disk — it was two releases behind at 0.9.0/9000
+when the Android lane was picked back up. Always go through the Tauri command,
+and check the built artifact's version before uploading.
 
 **Delete `app/build/outputs/apk` before every rebuild.** Gradle updates an
 existing APK *in place*, and its incremental zip writer appends the new
@@ -329,6 +338,16 @@ end, and Play rejects the artifact, so nothing ships by accident.
 - **A second app on the device cannot reach the daemon** — loopback is not
   process-private on Android. From `adb shell` (the same unprivileged position
   any installed app is in), `curl 127.0.0.1:<port>/api/chat/` must 401.
+- **The app key survives a relaunch.** New surface with V2 (D26): the host
+  exchanges a per-launch registration token for a durable app key on first run
+  and stores it in the AndroidKeyStore. Force-stop and reopen; the second launch
+  must *not* re-register. A lost key surfaces as a `409` from
+  `POST /api/apps/register` and is only recoverable by revoking the app
+  (`DELETE /api/apps/kitty`), so this is worth checking deliberately rather than
+  assuming.
+- **The model is offered `call_specialist`.** Ask it to delegate something and
+  confirm a specialist actually runs — the tool is only reachable if
+  `ensure_builtin_servers` registered the `specialists` in-process row.
 - Soft keyboard: the header and model picker stay on screen and the composer
   sits on the keyboard (`lib/viewport.ts`).
 - Download an artifact and confirm it lands where the file picker said.

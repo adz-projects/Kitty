@@ -700,7 +700,7 @@ fn handle_event(
                 }),
             );
             // End-of-turn outcome recording now lives in the BigTiny daemon
-            // (`bigtiny_rust::agent::loop_::spawn_record_outcome`) where the
+            // (`bigtiny2::agent::loop_::spawn_record_outcome`) where the
             // real context + reward source is available; the old app-layer
             // context-free backstop was removed to avoid double-recording the
             // same tool outcome to AP (which would skew learning rewards).

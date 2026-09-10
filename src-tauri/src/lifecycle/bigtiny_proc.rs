@@ -26,19 +26,23 @@
 //! # What is left
 //!
 //! `probe_health` — used by the health monitor and by the Android host — and
-//! `generate_secret`, which Android still needs because the in-process host
-//! has no separate executable to authenticate and keeps V1's shared-secret
-//! model until it migrates separately (Phase 7d).
+//! `generate_secret`, which the Android host uses to mint the per-launch
+//! registration token it hands the in-process daemon. Both platforms are on
+//! V2 and authenticate as registered apps; nothing here mints a daemon-wide
+//! shared secret any more.
 
 use std::time::Duration;
 
 #[cfg(target_os = "android")]
 use rand::Rng;
 
-/// 32 hex chars of randomness for `BIGTINY_SECRET`.
+/// 32 hex chars of randomness for the daemon's per-launch
+/// `registration_token` (`BIGTINY_SECRET`, `RunOptions::secret`).
 ///
-/// Android only: the desktop path authenticates as a registered app with a
-/// durable key instead (`bigtiny_v2::ensure_app_key`).
+/// Android only: the desktop daemon generates its own and publishes it in the
+/// handshake file. On both platforms the *durable* credential is the app key
+/// this token is exchanged for (`bigtiny_app_key::ensure_app_key`); the token
+/// authorizes `POST /api/apps/register` and nothing else.
 #[cfg(target_os = "android")]
 pub fn generate_secret() -> String {
     let mut rng = rand::thread_rng();

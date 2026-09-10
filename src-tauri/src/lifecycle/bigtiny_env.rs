@@ -2,7 +2,7 @@
 //!
 //! Kitty never writes a `--config` YAML for the daemon, so this is the *only*
 //! channel these settings reach it by. The daemon's half is
-//! `bigtiny_rust::env_contract::apply_env_overrides`; the two must stay in
+//! `bigtiny2::env_contract::apply_env_overrides`; the two must stay in
 //! lockstep, and a variable set here that isn't read there (or vice versa) is
 //! silently ignored rather than reported.
 //!
@@ -10,7 +10,7 @@
 //! hosts.** Desktop spawns the daemon and passes these as child-process env
 //! (`bigtiny_proc::spawn`). Android links the daemon in and has no child to
 //! configure, so it sets the same pairs on its *own* process before calling
-//! `bigtiny_rust::run` (`bigtiny_embedded::start`). Returning data keeps one
+//! `bigtiny2::run` (`bigtiny_embedded::start`). Returning data keeps one
 //! definition serving both; two copies of a ~40-variable list would drift on
 //! the first change and fail as a silently-unapplied setting.
 
@@ -194,7 +194,7 @@ pub fn daemon_env(
             threshold.to_string(),
         ));
     }
-    // Consolidates BigTiny's db / cache-sandbox-root / recipes under Kitty's
+    // Consolidates BigTiny's db and cache-sandbox-root under Kitty's
     // own data dir instead of its standalone `~/.bigtiny` default.
     // Best-effort: if this can't be resolved the daemon just uses that
     // default rather than failing to start.
@@ -233,6 +233,21 @@ pub fn daemon_env(
             ));
         }
     }
+
+    // Neither credential may be sent empty, and both hosts now legitimately
+    // pass one that way: desktop supplies neither (V2 authenticates per app and
+    // owns its own at-rest key), Android supplies a registration token but no
+    // encryption key. An empty `BIGTINY_ENCRYPTION_KEY` is a *malformed* key to
+    // the daemon and it refuses to start; an empty `BIGTINY_SECRET` would pin a
+    // daemon-wide shared secret in place of per-app keys. Both arguments stay
+    // in the signature because each host still supplies one of them.
+    //
+    // Filtered here rather than at the call sites so there is one rule instead
+    // of two copies of it — the Android host sets these on its own process, and
+    // a `set_var` of an empty value is not the same as leaving it unset.
+    env.retain(|(k, v)| {
+        !((k == "BIGTINY_SECRET" || k == "BIGTINY_ENCRYPTION_KEY") && v.is_empty())
+    });
 
     env
 }

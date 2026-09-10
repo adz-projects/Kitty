@@ -1,12 +1,30 @@
 # Kitty — Android & Local-Inference Plan
 
 One Tauri v2 codebase for **Windows desktop** and **Android**. The BigTiny daemon
-(`plugins/bigtiny_rust/`) hosts an **in-process llama.cpp** engine and serves chat,
-compaction summarization, and desktop-only embeddings. **Ollama is removed
-everywhere** — no `ollama serve`, no pull API, no HKCU env vars, no spawned
-inference binary.
+(`BigTinyV2/daemon/`) serves chat, compaction summarization and embeddings on
+both targets. **Ollama is removed everywhere** — no `ollama serve`, no pull API,
+no HKCU env vars, no spawned inference binary.
 
-Status: **PLAN — approved. Not yet implemented. Execution order in §10.**
+Status: **SHIPPED.** Phases 0–8 are implemented; §10 is the record of the order
+they were built in, not outstanding work. Open items live in `docs/BACKLOG.md`.
+
+> **Two things below are superseded by later work and kept only as record.**
+> Read them through these corrections:
+>
+> 1. **There is no llama.cpp anywhere.** D1 and §9 are written against
+>    `llama-cpp-2` and GGUF weights; v0.7.0 replaced that engine wholesale with
+>    **LiteRT** (`BigTinyV2/daemon/src/litert/`). On Android LiteRT does exactly
+>    one job — EmbeddingGemma `.tflite` semantic embeddings for adaptive
+>    pathway, loaded through the Play AAR's `libLiteRt.so` — and **no generative
+>    model runs on the phone at all**; compaction offloads to the session's
+>    remote chat model. The Windows-only generative summarizer
+>    (`gemma-4-E2B-it.litertlm`) is gated `cfg(all(windows, feature =
+>    "litert-engine"))`. Consequence worth stating: the cmake / Ninja / libclang
+>    / Vulkan-SDK toolchain §11 warns about is **gone** — `litert-embed` is pure
+>    `libloading` plus the pure-Rust `tokenizers` crate, and cross-compiles with
+>    no native build step.
+> 2. **The daemon is BigTiny V2, on both targets.** This doc predates the V2
+>    fork and describes `plugins/bigtiny_rust` (V1) throughout. See **D26**.
 
 - Scope-at-a-glance: desktop keeps full local chat + AP + stdio MCP; Android is
   **cloud-chat only** with a packed single local summarizer model, **and still
@@ -106,10 +124,11 @@ D1–D21 are unchanged and un-renumbered — existing references stay valid.
 | D19 | **`flash_attn` auto-detected** at engine init; never a user toggle (read-only card diagnostic `"off"`/"on (<backend>)"). | §3.3 |
 | D20 | **`auto`/`-1` select backend**: `select_backend()` returns `Cuda|Vulkan|Cpu`; fit/badge/VRAM math uses the *selected* backend's VRAM bank. | §3.3 |
 | D21 | **Windows multi-window is preserved**: two (or more) hub windows may be open at once, each with its **own independent session and its own pinned model**. Android stays single-window. | §8.1, §4.2 |
-| D22 | **`aarch64-linux-android` is the only shipped v1 ABI** (no armeabi-v7a, no x86_64 — emulator testing is a dev convenience, not a release target). **minSdk 26, targetSdk 34.** **NDK pinned: `27.2.12479018` (r27c)**, SDK `platforms/android-34` + `build-tools/34.0.0`, JDK 17, installed and verified 2026-08-08. | §10 P1 |
+| D22 | **`aarch64-linux-android` is the only shipped v1 ABI** (no armeabi-v7a, no x86_64 — emulator testing is a dev convenience, not a release target). **minSdk 26, ~~targetSdk 34~~ → `compileSdk`/`targetSdk` **36** (`gen/android/app/build.gradle.kts`; raised after this row was written, and the code is the current answer).** **NDK pinned: `27.2.12479018` (r27c)**, SDK `platforms/android-36` + `build-tools/35.0.0`, JDK 17. `minSdk` must keep matching `cargo ndk --platform 26` — linking against a newer sysroot than the manifest declares crashes on a real API-26 device rather than failing at build time. | §10 P1 |
 | D23 | **Desktop-only `src-tauri` subsystems are `cfg`-gated, not ported.** Tray, global-shortcut hotkey, autostart, and `notify-rust` get `#[cfg(desktop)]`/`#[cfg(windows)]`. **`winreg` is in the plain `[dependencies]` block today and will break the very first Android build** — it must move under `[target.'cfg(windows)'.dependencies]`. No autostart equivalent ships on Android v1. | §2.5 |
 | D24 | ~~**Android secrets use the `keyring` crate's Android/Keystore backend**, not a hand-rolled store — its own Cargo feature plus JNI init wiring.~~ **Revised and closed 2026-08-11: there is no such backend.** keyring 3.6.3's feature list is `apple-native` / `linux-native` / `windows-native` and nothing else, so the premise of this decision was simply wrong — there was no feature to enable. The diagnosis was right, though, and worth keeping: with only `windows-native`, keyring hits its catch-all `pub use mock as default` on Android and compiles fine, so provider API keys appeared to save and vanished on relaunch with nothing failing loudly. **Actual fix:** `gen/android/.../SecretStore.kt` (AES-256-GCM under a non-exportable AndroidKeyStore key, sealed blobs in private SharedPreferences) behind `src/android/secrets.rs`, dispatched from `config::providers::keyring`. `keyring` is now confined to the non-Android target table so the mock cannot return. | §10 P7 |
-| D25 | **Android hardens the daemon's HTTP surface: `require_secret: true`, always.** Loopback is **not** process-private on Android — any app holding `INTERNET` can reach `127.0.0.1`. Also relax escalation-to-approval where the app sandbox *is* the security boundary. Both already flagged in code comments; neither had a decision until now. | §2.6, §10 P7 |
+| D25 | **Closed 2026-09-09 — satisfied by construction, see D26.** V2's `server::middleware::auth_middleware` denies every `/api/*` route but `/api/health` unless the caller presents a key resolving to a registered app, with **no opt-out**; `RunOptions::require_secret` survives as a vestigial field nothing reads. The original decision, which remains the correct reasoning: **Android hardens the daemon's HTTP surface: `require_secret: true`, always.** Loopback is **not** process-private on Android — any app holding `INTERNET` can reach `127.0.0.1`. Also relax escalation-to-approval where the app sandbox *is* the security boundary. Both already flagged in code comments; neither had a decision until now. | §2.6, §10 P7 |
+| D26 | **Android hosts BigTiny **V2** in-process, not V1** (2026-09-09). Desktop moved to `BigTinyV2/daemon` while `src-tauri`'s Android target block still path-dep'd the frozen `plugins/bigtiny_rust`, leaving one product shipping two daemons with two schemas and two auth models — and leaving Android without specialists, the `KITTY_ALLOWED_DIRS` tool grants, and every other V2 fix. Android now links `bigtiny2_daemon` with `litert-embed`. Three consequences: **(a)** auth is per-app, so the host mints a per-launch `registration_token` (`RunOptions::secret`), exchanges it once via `POST /api/apps/register`, and keeps the issued app key in the AndroidKeyStore through `config::providers::keyring` — that key, not the token, is the `X-API-Key` on every request; **(b)** **Kitty no longer supplies the at-rest encryption key** — V2 owns `{data_dir}/encryption.key`, as on desktop, which also removes the AndroidKeyStore round trip from the startup path; **(c)** the device starts fresh on a V2 database, so provider keys are re-entered once. V1 stays in the tree, frozen and unbuilt, as the rollback path. | §2.1, §2.3, §2.6 |
 
 ---
 

@@ -289,12 +289,12 @@ pub struct Config {
     /// `bigtiny-daemon.exe` (see `plugins/build.py`, same `externalBin`
     /// convention as the other bundled plugins) if present, else `cargo`
     /// for dev convenience (paired with `bigtiny_args`'s `run
-    /// --manifest-path plugins/bigtiny_rust/Cargo.toml` default, so
+    /// --manifest-path BigTinyV2/daemon/Cargo.toml` default, so
     /// `cargo tauri dev` still works from a source checkout).
     #[serde(default = "default_bigtiny_command")]
     pub bigtiny_command: String,
     /// Arguments before `--port`/`--host`. Empty for the bundled exe; a
-    /// `cargo run` against `plugins/bigtiny_rust/` for the dev fallback.
+    /// `cargo run` against `BigTinyV2/daemon/` for the dev fallback.
     #[serde(default = "default_bigtiny_args")]
     pub bigtiny_args: Vec<String>,
     /// Working directory to spawn BigTiny in — the checkout that contains the
@@ -322,7 +322,7 @@ pub struct Config {
     #[serde(default)]
     pub token_management: TokenManagementSettings,
     /// See `Config::memory`. Field names mirror BigTiny's own `MemoryConfig`
-    /// (`plugins/bigtiny_rust/src/config.rs`) so the two don't drift apart.
+    /// (`BigTinyV2/daemon/src/config.rs`) so the two don't drift apart.
     /// `#[serde(default)]` covers loading a pre-existing config file that
     /// predates this field — no explicit migration function needed, unlike
     /// the value-changing `migrate_*` functions in `load` below.
@@ -341,7 +341,7 @@ pub struct Config {
 }
 
 /// See `Config::local`. Field names and defaults mirror BigTiny's own
-/// `LocalEngineConfig` (`plugins/bigtiny_rust/src/config.rs`) exactly, so the
+/// `LocalEngineConfig` (`BigTinyV2/daemon/src/config.rs`) exactly, so the
 /// two structs can't drift apart silently — a field renamed on one side and
 /// not the other would otherwise fail only at runtime, as an env var the
 /// daemon never reads.
@@ -360,7 +360,7 @@ pub struct LocalModelSettings {
     #[serde(default = "default_local_n_gpu_layers")]
     pub n_gpu_layers: i32,
     /// `"auto"` (default) | `"cuda"` | `"vulkan"` | `"cpu"` — see
-    /// `bigtiny_rust::local::backend`. Only `"cpu"` and `"auto"` do anything
+    /// `bigtiny2::local::backend`. Only `"cpu"` and `"auto"` do anything
     /// on current builds: no GPU cargo feature is enabled yet, so the device
     /// registry reports CPU only and the other two fall back to it.
     #[serde(default = "default_local_backend")]
@@ -372,7 +372,7 @@ pub struct LocalModelSettings {
     pub embed_pooling: String,
     /// `"f16"` (default, always safe) | `"q8_0"` | `"q4_0"` | `"q4_1"` |
     /// `"q5_0"` | `"q5_1"`. An advanced knob — see
-    /// `bigtiny_rust::local::engine::parse_kv_cache_type`'s doc comment for
+    /// `bigtiny2::local::engine::parse_kv_cache_type`'s doc comment for
     /// why a non-default value's safety on a given backend isn't guaranteed.
     #[serde(default = "default_local_cache_type")]
     pub cache_type_k: String,
@@ -471,7 +471,7 @@ impl Default for TokenManagementSettings {
 }
 
 /// See `Config::memory`. Field names/defaults mirror BigTiny's own
-/// `MemoryConfig` (`plugins/bigtiny_rust/src/config.rs`) so the two don't
+/// `MemoryConfig` (`BigTinyV2/daemon/src/config.rs`) so the two don't
 /// drift apart — this is Kitty's independent copy; BigTiny's own defaults
 /// still apply if the daemon is ever launched without these env vars.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
@@ -546,7 +546,7 @@ fn default_bigtiny_command() -> String {
 
 /// Empty when the bundled exe was found — it needs no extra args. Otherwise,
 /// the dev-convenience fallback runs the daemon straight out of the
-/// `plugins/bigtiny_rust` source checkout via `cargo run` (this backend is
+/// `BigTinyV2/daemon` source checkout via `cargo run` (this backend is
 /// pure Rust now — no Python interpreter/package involved at all), matching
 /// the old `python -m bigtiny` fallback's purpose: `cargo tauri dev` should
 /// work without requiring `plugins/build.py` to have run first.
@@ -945,7 +945,7 @@ fn command_path_is_stale(command: &str) -> bool {
 
 /// Self-heals an existing install's `bigtiny_command`/`bigtiny_args` off
 /// either dev-convenience default — the original Python-era `python -m
-/// bigtiny`, or the current `cargo run --manifest-path .../bigtiny_rust
+/// bigtiny`, or the current `cargo run --manifest-path .../BigTinyV2/daemon
 /// ...` (see `default_bigtiny_args`) — onto the bundled exe, once one is
 /// present, including a stale-absolute-path self-heal
 /// (`command_path_is_stale`). A deliberate override (e.g. `uv run bigtiny`,

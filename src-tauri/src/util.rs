@@ -5,16 +5,16 @@ use std::path::Path;
 use std::process::{Child, Command};
 use std::sync::OnceLock;
 
-/// Child-process helpers, currently without a caller.
-///
-/// Kitty no longer spawns the BigTiny daemon -- `bigtiny2_client::discovery`
-/// does, and it applies the same two lessons these encode (`CREATE_NO_WINDOW`
-/// so a console-subsystem child does not pop a window out of a GUI app, and
-/// never decoding child stdio as strict UTF-8). They are kept rather than
-/// deleted because both cost real debugging to learn, the tests below pin the
-/// non-obvious half, and any future child process this app spawns wants
-/// exactly this. Delete them when something else proves they are not coming
-/// back.
+// Child-process helpers, currently without a caller.
+//
+// Kitty no longer spawns the BigTiny daemon -- `bigtiny2_client::discovery`
+// does, and it applies the same two lessons these encode (`CREATE_NO_WINDOW`
+// so a console-subsystem child does not pop a window out of a GUI app, and
+// never decoding child stdio as strict UTF-8). They are kept rather than
+// deleted because both cost real debugging to learn, the tests below pin the
+// non-obvious half, and any future child process this app spawns wants
+// exactly this. Delete them when something else proves they are not coming
+// back.
 
 /// Read one line (up to and including `\n`, stripped) from `reader` as
 /// lossily-decoded UTF-8 — `None` at EOF. Reads raw bytes rather than using

@@ -164,17 +164,18 @@ const BIGTINY_ENCRYPTION_KEY_ACCOUNT: &str = "bigtiny-encryption-key";
 #[allow(dead_code)]
 static ENCRYPTION_KEYGEN: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
 
-/// # Desktop no longer reads this at runtime
+/// # Nothing reads this at runtime any more
 ///
 /// Since Phase 7 the V2 daemon owns its own at-rest key
 /// (`{data_dir}/encryption.key`), because a key injected by whichever app
 /// happened to spawn a *shared* daemon is a coin-flip: rows written under one
-/// app's key would be unreadable when another started it. Android still uses
-/// this — it hosts V1 in-process and is single-app, so the ownership question
-/// does not arise there.
+/// app's key would be unreadable when another started it. Android was the last
+/// caller, and it stopped being one when it migrated to V2 in-process (D26) —
+/// single-app or not, having two key-ownership models in one product was the
+/// thing worth removing.
 ///
-/// It is kept on desktop, not deleted, because it holds the key that decrypts
-/// an existing install's provider rows. Migrating that install means handing
+/// It is kept, not deleted, because it holds the key that decrypts an existing
+/// install's provider rows. Migrating that install means handing
 /// this value to `bigtiny2-daemon import --encryption-key`, which adopts it as
 /// the V2 daemon's own (see docs/RELEASE.md). Deleting it would make those
 /// rows permanently unrecoverable.

@@ -157,13 +157,6 @@ pub async fn run(config: BigTinyConfig, options: RunOptions) -> Result<(), Daemo
         None,
         std::path::PathBuf::from(&options.data_dir),
     ));
-    mcp.connect_all().await; // isolated per-server failure, matches Python's connect_all
-    // Supervisor: retires the tools of a server whose transport died and
-    // brings enabled-but-down servers back with exponential backoff. Without
-    // it `connect_all` above is the only connect attempt for the whole
-    // process lifetime.
-    let mcp_health_watcher = mcp.clone().spawn_health_watcher();
-
     let router = Arc::new(ProviderRouter::new(config.cache.clone()));
     router.load_providers(&pool).await?;
 
@@ -240,6 +233,19 @@ pub async fn run(config: BigTinyConfig, options: RunOptions) -> Result<(), Daemo
     orchestrator.attach(&agent);
     orchestrator.attach_router(router.clone());
     mcp.attach_orchestrator(orchestrator.clone());
+
+    // **Only now** connect the MCP servers. This used to run immediately after
+    // `MCPManager::with_data_dir`, which is before the orchestrator exists --
+    // so the `specialists` builtin, whose `builtin::connect` arm requires one,
+    // failed at every boot with "no orchestrator is attached" and came back
+    // only when the health watcher or a client's sync retried it later. Nothing
+    // else connected here needs the agent, so deferring costs nothing.
+    mcp.connect_all().await; // isolated per-server failure, matches Python's connect_all
+    // Supervisor: retires the tools of a server whose transport died and
+    // brings enabled-but-down servers back with exponential backoff. Without
+    // it `connect_all` above is the only connect attempt for the whole
+    // process lifetime.
+    let mcp_health_watcher = mcp.clone().spawn_health_watcher();
 
     // Written before the scheduler starts and before any app can register, so
     // the first `call_specialist` of the daemon's life already has a roster.

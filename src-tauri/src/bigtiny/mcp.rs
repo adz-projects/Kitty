@@ -19,11 +19,11 @@ use crate::state::AppState;
 /// 10+ refuses to `exec()` anything in an app-writable directory, which is
 /// why the `InProcess` transport exists at all. There the daemon links the
 /// same crate and `command` carries a *logical name* that
-/// `bigtiny_rust::mcp::builtin::connect` switches on, not a path — the shape
+/// `bigtiny2::mcp::builtin::connect` switches on, not a path — the shape
 /// `"pathway"` has always used.
 ///
 /// Returns `(transport, command)`. `logical` must match an entry in
-/// `bigtiny_rust::mcp::builtin::BUILTIN_SERVERS`, which the daemon-side test
+/// `bigtiny2::mcp::builtin::BUILTIN_SERVERS`, which the daemon-side test
 /// `every_advertised_builtin_actually_connects` pins.
 fn bundled_transport(logical: &str, exe: &str) -> (String, String) {
     if cfg!(target_os = "android") {
@@ -266,6 +266,25 @@ pub async fn connect_server(client: &BigTinyClient, id: &str) -> Result<(), Stri
 /// user-added card (since `HIDDEN_SERVER_NAMES` only hides the *current*
 /// name set). Called before any upsert so a stale row never races a fresh
 /// create under the same name.
+/// Every builtin `ensure_builtin_servers` is responsible for registering.
+///
+/// This must cover the daemon's own `mcp::builtin::BUILTIN_SERVERS`
+/// (`BigTinyV2/daemon/src/mcp/builtin.rs`). The two lists are the two halves of
+/// one contract and neither is derivable from the other: the daemon decides
+/// what it *can* host, Kitty decides what actually gets a row — and a tool
+/// reaches the model only if it has a row (`mcp::manager::connect_all` iterates
+/// the table). `specialists` sat on the daemon side of that gap for a full
+/// release, fully implemented and completely unreachable, because nothing here
+/// registered it. `registered_builtins_covers_the_daemons_builtin_servers`
+/// below is what now fails when they drift.
+const REGISTERED_BUILTINS: &[&str] = &[
+    "pathway",
+    "specialists",
+    "kitty-wasm",
+    "kitty-tools",
+    "kitty-web",
+];
+
 const RETIRED_BUILTINS: &[&str] = &[
     "replacement-mcp",
     "brave-mcp-search",
@@ -327,6 +346,7 @@ pub async fn ensure_builtin_servers(app: &AppHandle) {
         kitty_tools_enabled,
         kitty_web_enabled,
         pathway_enabled,
+        specialist_timeout_secs,
     ) = {
         let state = app.state::<AppState>();
         let cfg = state.config.lock().unwrap();
@@ -337,13 +357,14 @@ pub async fn ensure_builtin_servers(app: &AppHandle) {
             cfg.kitty_tools_enabled,
             cfg.kitty_web_enabled,
             cfg.adaptive_pathway_enabled,
+            cfg.specialists.timeout_secs,
         )
     };
 
     // The behavioral-memory engine is linked directly into the BigTiny
     // daemon (`plugins/adaptive-pathway_rust`), not spawned as a separate
     // process — `command` here is a *logical name* `builtin::connect`
-    // switches on (`plugins/bigtiny_rust/src/mcp/builtin.rs`), not an
+    // switches on (`BigTinyV2/daemon/src/mcp/builtin.rs`), not an
     // executable path, and `transport: "in_process"` is what tells
     // `mcp::manager` to route through that in-process constructor
     // (`tokio::io::duplex`) instead of spawning a stdio child. No env map:
@@ -377,6 +398,51 @@ pub async fn ensure_builtin_servers(app: &AppHandle) {
             // Default 30s tool timeout is right here; only kitty-wasm needs more.
             timeout_s: None,
             enabled: pathway_enabled,
+        },
+    )
+    .await;
+
+    // `specialists` is the daemon's own delegation tool server
+    // (`BigTinyV2/daemon/src/specialists/server.rs`), exposing `call_specialist`
+    // and `list_specialists`. Like `pathway` it lives *inside* the daemon, so
+    // `transport` is hardcoded `in_process` rather than going through
+    // `bundled_transport` — there is no `specialists.exe`, and the desktop
+    // stdio branch would register a row pointing at a path that does not exist.
+    //
+    // Without this row the feature was fully built and completely unreachable:
+    // MCP tools reach the model only via connected `mcp_servers` rows
+    // (`mcp::manager::connect_all` lists the table), and nothing else inserts
+    // one — the daemon's `BUILTIN_SERVERS` const is referenced only by its own
+    // test. Definitions authored in Settings, the `/api/specialists` routes and
+    // the orchestrator were all live while the model was never told the tool
+    // existed. Exactly the `pathway` failure above, with the two sides swapped:
+    // there Kitty registered a row the daemon had no arm for.
+    //
+    // No `enabled` toggle: `SpecialistSettings` deliberately has none, bounding
+    // delegation with `model_deny`/`timeout_secs`/`max_concurrent` instead, so
+    // the server is always registered.
+    upsert_builtin(
+        &client,
+        "specialists",
+        &McpServerSpec {
+            name: "specialists".to_string(),
+            transport: "in_process".to_string(),
+            command: Some("specialists".to_string()),
+            args: vec![],
+            url: None,
+            env: HashMap::new(),
+            headers: HashMap::new(),
+            // A `call_specialist` blocks the parent's tool call for as long as
+            // the delegate runs, which the daemon bounds at
+            // `SpecialistSettings::timeout_secs` (300s by default) — ten times
+            // the daemon's 30s MCP default. Left at that default the MCP layer
+            // would cut off the parent before the orchestrator's own cancel
+            // fired, reporting a timeout for a delegate still running: the
+            // `kitty-wasm` failure documented below. The margin keeps the
+            // orchestrator the thing that decides, so a real timeout is
+            // reported as one.
+            timeout_s: Some((specialist_timeout_secs + 30) as i64),
+            enabled: true,
         },
     )
     .await;
@@ -677,6 +743,13 @@ pub async fn validate_brave_api_key(api_key: &str) -> Result<(), String> {
 }
 
 async fn upsert_builtin(client: &BigTinyClient, name: &str, desired: &McpServerSpec) {
+    // A name outside the contract is a registration the coverage test cannot
+    // see and the daemon has no arm for — it would resolve to
+    // `unknown in-process server: <name>` at connect time, on a user's machine.
+    debug_assert!(
+        REGISTERED_BUILTINS.contains(&name),
+        "{name} is not in REGISTERED_BUILTINS; add it there (and give the daemon an arm) rather than registering a row nothing can connect"
+    );
     let Some(existing) = list_servers_with_retry(client, name).await else {
         return;
     };
@@ -709,6 +782,60 @@ async fn upsert_builtin(client: &BigTinyClient, name: &str, desired: &McpServerS
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The daemon's `mcp::builtin::BUILTIN_SERVERS`, mirrored.
+    ///
+    /// A literal rather than the real const because `src-tauri` does not link
+    /// the daemon crate on desktop — it talks to it over HTTP. The Android
+    /// target does link it, and asserts against the real thing below, so this
+    /// mirror cannot rot silently in both places at once.
+    const DAEMON_BUILTIN_SERVERS: [&str; 5] = [
+        "kitty-tools",
+        "kitty-web",
+        "kitty-wasm",
+        "pathway",
+        "specialists",
+    ];
+
+    /// The test that would have caught `specialists` never being registered.
+    ///
+    /// The daemon side already had `every_advertised_builtin_actually_connects`,
+    /// which proves each builtin connects *when asked*. Nothing checked that
+    /// anything ever asked.
+    #[test]
+    fn registered_builtins_covers_the_daemons_builtin_servers() {
+        for name in DAEMON_BUILTIN_SERVERS {
+            assert!(
+                REGISTERED_BUILTINS.contains(&name),
+                "the daemon can host `{name}` but ensure_builtin_servers never registers it,                  so the model is never offered its tools"
+            );
+        }
+    }
+
+    /// ...and the reverse: a row Kitty registers that the daemon cannot host
+    /// resolves to `unknown in-process server` and shows up as a permanently
+    /// failing server.
+    #[test]
+    fn every_registered_builtin_is_one_the_daemon_can_host() {
+        for name in REGISTERED_BUILTINS {
+            assert!(
+                DAEMON_BUILTIN_SERVERS.contains(name),
+                "`{name}` is registered here but is not a daemon builtin"
+            );
+        }
+    }
+
+    /// On Android the daemon is linked in, so the mirror above can be checked
+    /// against the real const instead of trusted.
+    #[cfg(target_os = "android")]
+    #[test]
+    fn the_mirrored_daemon_list_matches_the_real_one() {
+        let mut mirrored = DAEMON_BUILTIN_SERVERS.to_vec();
+        let mut actual = bigtiny2::mcp::builtin::BUILTIN_SERVERS.to_vec();
+        mirrored.sort_unstable();
+        actual.sort_unstable();
+        assert_eq!(mirrored, actual, "DAEMON_BUILTIN_SERVERS has drifted");
+    }
 
     fn spec(name: &str, command: &str, enabled: bool) -> McpServerSpec {
         McpServerSpec {

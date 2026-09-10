@@ -20,6 +20,8 @@
 // for the Credential Manager key path that is now Android's alone.
 #[cfg(target_os = "android")]
 pub mod bigtiny_embedded;
+// Both hosts register with the V2 daemon for an app key, so this is not gated.
+pub mod bigtiny_app_key;
 pub mod bigtiny_env;
 pub mod bigtiny_proc;
 #[cfg(not(target_os = "android"))]

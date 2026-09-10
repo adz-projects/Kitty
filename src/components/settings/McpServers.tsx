@@ -21,6 +21,10 @@ const HIDDEN_SERVER_NAMES = new Set([
   // RETIRED_BUILTINS cleanup list — kept here too for the same one-release
   // guard as everything else in this set).
   'pathway',
+  // The daemon's own delegation tool server (`call_specialist`). Registered
+  // by `ensure_builtin_servers` like the rest of this set, and configured
+  // under Settings -> Specialists rather than as an editable MCP card.
+  'specialists',
   'adaptive-pathway',
   'replacement-mcp',
   'wasm-math-mcp',
@@ -144,9 +148,7 @@ function BuiltinHealth({
       <span className="chat-error" style={{ margin: 0 }}>
         {statusLabel(health)}
       </span>
-      {health.enabled && (
-        <button onClick={() => void onRetry(health)}>Retry connect</button>
-      )}
+      {health.enabled && <button onClick={() => void onRetry(health)}>Retry connect</button>}
     </div>
   );
 }

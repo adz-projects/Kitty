@@ -512,3 +512,116 @@ provider" button and "Max live tail tokens" were removed from Settings →
 Advanced: they are derived per provider now, and a manual override could
 reintroduce the exact bug above. The `TokenManagementConfig` fields remain as
 the fallback for a provider that advertises no window.
+
+## Android on BigTiny V2, and the builtin-registration contract (2026-09-09)
+
+Two findings from picking the Android lane back up after two releases. They are
+recorded here because both are contracts between files that cannot be checked by
+reading either file alone.
+
+### Both targets now run one daemon
+
+`src-tauri`'s `cfg(target_os = "android")` block path-dep'd `plugins/bigtiny_rust`
+(V1, 0.1.0) while desktop had moved to `BigTinyV2/daemon` (2.0.0). Android now
+links `bigtiny2_daemon` with `litert-embed`. What changed with it:
+
+| | V1 (was) | V2 (now) |
+|---|---|---|
+| Auth | daemon-wide `BIGTINY_SECRET`, opt-in via `require_secret` | per-app key; **unconditional** — every `/api/*` route but `/api/health` requires one |
+| Android's credential | the shared secret | a per-launch `registration_token` (`RunOptions::secret`) exchanged once at `POST /api/apps/register` for a durable app key, kept in the AndroidKeyStore |
+| At-rest encryption key | injected by Kitty from the keystore | daemon-owned, `{data_dir}/encryption.key` |
+| `RunOptions::recipes_dir` | present | gone (recipes were replaced by specialists) |
+| `RunOptions::idle_exit_mins` | — | present; `None` in-process, where the app *is* the daemon's lifetime |
+
+`require_secret` still exists on `RunOptions` but **nothing reads it** — do not
+take its presence as evidence that auth is optional.
+
+Two traps that cost time and are not obvious from the code:
+
+- **`async-stream` was declared under `[target.'cfg(windows)'.dependencies]`**
+  in the V2 daemon's manifest while `routes/chat.rs` used it unconditionally, so
+  the daemon could not compile for *any* non-Windows target. A dependency's
+  position in a manifest is invisible until something cross-compiles.
+- **V2 renamed the data-dir variable, and only Android notices.** Kitty's
+  `daemon_env` sets `BIGTINY_DATA_DIR` (V1's name); V2's `resolve_data_dir`
+  reads **`BIGTINYV2_DATA_DIR`** (`discovery::DATA_DIR_ENV`). With it unset the
+  function falls back to `dirs_home().join(".bigtiny-v2")`, and bionic reports
+  `HOME` as `/` — so the in-process daemon tried to create `/.bigtiny-v2` and
+  died with `Read-only file system (os error 30)` *before binding*, surfacing
+  only as `BackendDown`. **Desktop cannot reproduce this**: the same function
+  short-circuits to `%APPDATA%/BigTinyV2` on Windows before the fallback is
+  reached, so the missing variable is invisible there. `bigtiny_embedded::start`
+  now sets it explicitly to `config_dir()/bigtiny-v2` — a *sibling* of V1's
+  `bigtiny/`, so the frozen V1 crate stays a real rollback path.
+
+  The general lesson, since this will recur: **`daemon_env`'s `BIGTINY_*` names
+  are the config-override contract, not the whole environment contract.** V2 has
+  its own `BIGTINYV2_*` variables (`DATA_DIR`, `ENCRYPTION_KEY`,
+  `IDLE_EXIT_MINS`) that `apply_env_overrides` does not touch, and an embedding
+  host has to supply them itself.
+
+- **`cargo ndk -t arm64-v8a --platform 26 check --lib` is the gate**, now also
+  run by `.github/workflows/android.yml`. Plain
+  `cargo check --target aarch64-linux-android` sets no NDK sysroot or linker and
+  is not a substitute. `--platform` must track `minSdk` in
+  `gen/android/app/build.gradle.kts` (26).
+
+For the record, the Android dependency delta V1 -> V2 is four **pure-Rust**
+crates (`rmcp`'s `server`/`macros` features, `schemars`, `bigtiny2-protocol`,
+`async-stream`). Everything with native code — `sqlx`/`libsqlite3-sys`,
+`wasmtime` via `kitty-wasm`, `edgefirst-tflite` — is identical in both trees, and
+`litert-lm-rust` stays correctly `cfg(windows)`-only. No openssl anywhere; keep
+it that way (`reqwest` is `default-features = false` + `rustls-tls` throughout).
+
+### A daemon builtin is only reachable if Kitty registers a row for it
+
+MCP tools reach the model **only** through connected `mcp_servers` rows —
+`mcp::manager::connect_all` lists the table and connects what it finds, and the
+daemon's `mcp::builtin::BUILTIN_SERVERS` const is referenced nowhere outside its
+own test. There is no boot-time auto-provisioning.
+
+`specialists` shipped fully implemented on the daemon side — `call_specialist`
+and `list_specialists`, the `builtin::connect` arm, the orchestrator attached,
+the roster seeded, session-id injection in `agent::loop_` — and **completely
+unreachable**, because `bigtiny::mcp::ensure_builtin_servers` never upserted a
+row for it. The mirror image of the earlier `pathway` bug, where Kitty
+registered a row the daemon had no arm for.
+
+The contract is now explicit on both sides and tested:
+
+| Side | Const | File |
+|---|---|---|
+| daemon: what it *can* host | `mcp::builtin::BUILTIN_SERVERS` | `BigTinyV2/daemon/src/mcp/builtin.rs` |
+| Kitty: what actually gets a row | `REGISTERED_BUILTINS` | `src-tauri/src/bigtiny/mcp.rs` |
+
+Registering that row exposed two further V2 bugs, **both of which affect
+Windows** and neither of which a fresh install can reproduce:
+
+* **`PATCH /api/mcp/servers/{id}` returned 500 `no column found for name:
+  app_id`.** `routes/mcp.rs`'s pre-update `SELECT` omitted `app_id` while
+  `MCPServerRow` requires it, so `FromRow` failed. Every other query in
+  `storage::mcp_servers` selects it; this one was the outlier. Latent because a
+  just-created row is never patched — it fires the first time a builtin's
+  desired spec changes (a new timeout, an env change), i.e. on upgrade, not on
+  install.
+* **`mcp.connect_all()` ran before `mcp.attach_orchestrator()`.** The
+  `specialists` builtin requires the orchestrator, so it failed at every boot
+  with "no orchestrator is attached" and recovered only on a later retry.
+  `connect_all` now runs after the attach; nothing else connected there needs
+  the agent.
+
+Still open, and **not** caused by this work: the `pathway` builtin can never
+connect on V2 (`MCPManager` is constructed with `pathway: None` and the per-app
+hand-over its comment describes was never implemented), so the model has lost
+`record`/`forget` on both platforms. See `docs/BACKLOG.md`.
+
+`registered_builtins_covers_the_daemons_builtin_servers` fails when the daemon
+gains a builtin nothing registers; `every_registered_builtin_is_one_the_daemon_can_host`
+fails in the other direction; `upsert_builtin` `debug_assert!`s membership. **Change
+the two lists together.**
+
+Note also that `specialists` is the one builtin whose MCP timeout must not be
+left at the daemon's 30s default: `call_specialist` blocks the parent's tool
+call for the whole delegate run, bounded at `SpecialistSettings::timeout_secs`
+(300s default). The row is registered at `timeout_secs + 30` so the orchestrator,
+not the MCP layer, is what decides a delegate has run too long.

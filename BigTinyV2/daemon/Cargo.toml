@@ -84,6 +84,12 @@ base64 = "0.22"
 regex = "1"
 bytes = "1"
 async-trait = "0.1"
+# The SSE body generator behind `POST /api/chat/{id}/send`
+# (`routes::chat`). Used unconditionally, so it belongs here: it spent a
+# release under `[target.'cfg(windows)'.dependencies]` below, which made
+# this crate unbuildable for every non-Windows target — including the
+# Android in-process host.
+async-stream = "0.3"
 sha2 = "0.10"
 ipnet = "2"
 dashmap = "6"
@@ -145,8 +151,6 @@ adaptive-pathway = { path = "../../plugins/adaptive-pathway_rust" }
 # prebuilt DLLs; its packaged import lib is `litert-lm.if.lib` but the linker
 # wants `litert-lm.lib`, so our `build.rs` copies it (see build.rs).
 litert-lm-rust = { version = "0.2", optional = true }
-
-async-stream = "0.3"
 
 [dev-dependencies]
 # Self dev-dependency purely to turn `test-support` on for the

@@ -35,100 +35,10 @@
 use std::path::PathBuf;
 
 use bigtiny2_client::discovery::{attach_or_spawn, DiscoveryConfig};
-use bigtiny2_client::BigTinyClient;
 
 use crate::state::{DaemonHandle, ManagedProcess};
 
-/// The app id Kitty registers under. Stable: it keys every row Kitty owns in
-/// the daemon's database, and the Phase 7a import stamps this exact value.
-pub const APP_ID: &str = "kitty";
-const DISPLAY_NAME: &str = "Kitty";
-
-/// Where the issued app key is kept between launches.
-///
-/// The Credential Manager rather than a config file: it is a bearer credential
-/// for everything Kitty owns in a daemon other applications can also talk to.
-///
-/// `KEYRING_SERVICE` matches `config::providers::keyring`'s exactly — every
-/// secret this app stores lives under one service name, so they can be
-/// enumerated and cleared together rather than leaving an orphan namespace
-/// behind that nothing knows to look in.
-const KEYRING_SERVICE: &str = "kitty";
-const KEY_CREDENTIAL: &str = "bigtiny-v2-app-key";
-
-/// Resolve Kitty's durable app key, registering once if this is a first run.
-///
-/// Registration is gated on the handshake's `registration_token`, which is why
-/// this needs the whole `Located` rather than just a base URL. A `409` means
-/// some previous run already registered and we have lost the key — recoverable
-/// only by revoking the app, so it is reported rather than papered over.
-async fn ensure_app_key(base_url: &str, registration_token: &str) -> Result<String, String> {
-    if let Some(existing) = tokio::task::spawn_blocking(|| read_stored_key())
-        .await
-        .map_err(|e| format!("key lookup task panicked: {e}"))?
-    {
-        return Ok(existing);
-    }
-
-    let issued = BigTinyClient::register(base_url, registration_token, APP_ID, DISPLAY_NAME)
-        .await
-        .map_err(|e| {
-            format!(
-                "could not register Kitty with BigTiny: {e}. If Kitty was registered by an \
-                 earlier install whose key is gone, revoke the app with \
-                 `DELETE /api/apps/kitty` and restart."
-            )
-        })?;
-
-    let key = issued.api_key.clone();
-    let to_store = key.clone();
-    tokio::task::spawn_blocking(move || store_key(&to_store))
-        .await
-        .map_err(|e| format!("key store task panicked: {e}"))??;
-    Ok(key)
-}
-
-#[cfg(windows)]
-fn read_stored_key() -> Option<String> {
-    keyring::Entry::new(KEYRING_SERVICE, KEY_CREDENTIAL)
-        .ok()
-        .and_then(|e| e.get_password().ok())
-        .filter(|k| !k.is_empty())
-}
-
-#[cfg(windows)]
-fn store_key(key: &str) -> Result<(), String> {
-    keyring::Entry::new(KEYRING_SERVICE, KEY_CREDENTIAL)
-        .map_err(|e| format!("credential manager unavailable: {e}"))?
-        .set_password(key)
-        .map_err(|e| format!("could not store the BigTiny app key: {e}"))
-}
-
-/// Non-Windows keeps the key in the BigTiny data dir. Not as good as a
-/// keychain, but the alternative is re-registering every launch, and the file
-/// sits beside `encryption.key`, which is no less sensitive.
-#[cfg(not(windows))]
-fn key_file() -> Option<PathBuf> {
-    crate::config::bigtiny_data_dir().ok().map(|d| d.join("app-key"))
-}
-
-#[cfg(not(windows))]
-fn read_stored_key() -> Option<String> {
-    let path = key_file()?;
-    std::fs::read_to_string(path)
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|k| !k.is_empty())
-}
-
-#[cfg(not(windows))]
-fn store_key(key: &str) -> Result<(), String> {
-    let path = key_file().ok_or("no data directory for the app key")?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
-    }
-    std::fs::write(&path, key).map_err(|e| format!("{}: {e}", path.display()))
-}
+use super::bigtiny_app_key::ensure_app_key;
 
 /// Find (or start) a V2 daemon and return a handle Kitty can use.
 ///
@@ -180,16 +90,7 @@ pub async fn locate(
         pathway_enabled,
         pathway_embedding_model,
         tokenizer_path,
-    )
-    .into_iter()
-    // Drop the two credentials this path no longer supplies rather than
-    // sending them empty: the daemon treats a present-but-empty
-    // `BIGTINY_ENCRYPTION_KEY` as a malformed key and refuses to start, and an
-    // empty `BIGTINY_SECRET` would pin a daemon-wide shared secret in place of
-    // per-app keys. `daemon_env` keeps both in its signature because the
-    // Android in-process host still uses them.
-    .filter(|(k, v)| !((k == "BIGTINY_SECRET" || k == "BIGTINY_ENCRYPTION_KEY") && v.is_empty()))
-    .collect();
+    );
 
     if let Some(lib_dir) = litert_lib_dir.filter(|d| !d.is_empty()) {
         let existing = std::env::var("PATH").unwrap_or_default();

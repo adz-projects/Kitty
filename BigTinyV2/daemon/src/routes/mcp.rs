@@ -331,7 +331,16 @@ pub async fn update_server(
     let result = async {
         let mut tx = conn.begin_with("BEGIN IMMEDIATE").await?;
         let existing = sqlx::query_as::<_, mcp_servers::MCPServerRow>(
-            r#"SELECT id, name, transport, command, args, url, env, headers, enabled, timeout_s, status, error_message, created_at, updated_at
+            // `app_id` is not decoration: `MCPServerRow` has the field, so
+            // omitting it here made `FromRow` fail with
+            // `no column found for name: app_id` and turned every PATCH into a
+            // 500. Invisible on a fresh install, because a row that has just
+            // been created is never patched -- it only fired once a builtin's
+            // desired spec changed (a new timeout, an env change) and Kitty's
+            // sync issued its first real PATCH. Every other query in
+            // `storage::mcp_servers` already selects it; this one was the
+            // outlier.
+            r#"SELECT id, name, transport, command, args, url, env, headers, enabled, timeout_s, status, error_message, created_at, updated_at, app_id
                FROM mcp_servers WHERE id = ? AND (app_id = ? OR app_id IS NULL)"#,
         )
         .bind(&id)

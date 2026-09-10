@@ -1,0 +1,86 @@
+# The Android cross-compile gate.
+#
+# This exists because the Android lane silently rotted for two releases: the
+# backend was forked to BigTiny V2 and desktop moved onto it while
+# `src-tauri/Cargo.toml`'s Android target block kept pointing at the frozen V1
+# crate. Nothing failed, because nothing built it. A `cargo ndk` check is cheap
+# and would have caught both that and the `async-stream` dependency that sat
+# under a `cfg(windows)` table while being used unconditionally.
+#
+# Scope is deliberately a type-check, not a package: a signed AAB needs the
+# upload keystore (not in CI) and produces ~190 MB of artifacts. What breaks in
+# practice is compilation, and that is what this covers.
+name: android
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: cargo ndk check (arm64-v8a)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install the NDK
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          # Pinned to match docs/ANDROID.md D22 and the local dev setup. A
+          # different NDK is a different libc++ and a different sysroot; this
+          # gate is only meaningful against the one that ships the app.
+          ndk-version: r27c
+          local-cache: true
+
+      - name: Install the Rust target
+        run: rustup target add aarch64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      # `tauri-build` fails without the frontend build output it expects to
+      # bundle. Building the web app is not what this gate is testing, but it
+      # is a prerequisite for the Rust crate to compile at all.
+      - uses: pnpm/action-setup@v4
+        with:
+          run_install: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+
+      # The gate. `--platform 26` must match `minSdk` in
+      # `gen/android/app/build.gradle.kts`: linking against a newer sysroot than
+      # the app declares produces a binary that crashes on a real API-26 device
+      # rather than failing here.
+      #
+      # `cargo ndk`, not a plain `cargo check --target aarch64-linux-android`.
+      # The latter does not set the NDK sysroot/linker, so it passes or fails
+      # for unrelated reasons and is not a substitute (see AGENTS.md).
+      #
+      # arm64 only, deliberately: `edgefirst-tflite-sys` does not compile 32-bit
+      # (const-eval pointer-width errors), and arm64-v8a is the only ABI shipped.
+      - name: cargo ndk check
+        working-directory: src-tauri
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+          ANDROID_NDK: ${{ steps.ndk.outputs.ndk-path }}
+        run: cargo ndk -t arm64-v8a --platform 26 check --lib

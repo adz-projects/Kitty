@@ -41,6 +41,14 @@ futures-util = "0.3"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 base64 = "0.22"
 semver = "1"
+# The BigTiny V2 client crate -- discovery, app registration and SSE framing,
+# shared with the other V2 frontends so they cannot drift apart. Needed on
+# *both* targets: desktop uses `discovery::attach_or_spawn` to find a daemon
+# it does not own, and Android, which hosts the daemon in-process, still uses
+# `BigTinyClient::register` to obtain its app key over the loopback boundary.
+# Deliberately NOT the daemon crate on desktop: a consumer speaking HTTP has
+# no business linking sqlx, rmcp and LiteRT to do it.
+bigtiny2-client = { path = "../BigTinyV2/client" }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
@@ -73,12 +81,6 @@ winreg = "0.52"
 # store is `src/android/secrets.rs` over the AndroidKeyStore; having the crate
 # out of that target's graph entirely is what stops the mock coming back.
 keyring = { version = "3", features = ["windows-native"] }
-# Desktop talks to the BigTiny V2 daemon over HTTP through the shared client
-# crate -- discovery, the spawn lock, registration and SSE framing live there
-# so Kitty and the other frontends cannot drift apart. Deliberately NOT the
-# daemon crate: a desktop consumer speaking HTTP has no business linking sqlx,
-# rmcp and LiteRT. Android still links `bigtiny_rust` in-process (below).
-bigtiny2-client = { path = "../BigTinyV2/client" }
 tauri-plugin-single-instance = "2"
 # No OS-wide hotkey concept on mobile; the overlay-summon path this drives is
 # desktop-only (docs/ANDROID.md D9/D23).
@@ -88,22 +90,28 @@ tauri-plugin-global-shortcut = "2"
 #
 # Not a portability nicety — a requirement. Android 10+ refuses to `exec()`
 # anything in an app-writable directory, which is why `externalBin` is empty
-# in `tauri.android.conf.json` and why there is no `bigtiny-daemon` binary to
-# spawn on this platform. Without this dependency the app has no backend at
-# all: no chat, no MCP, no memory.
+# in `tauri.android.conf.json` and why there is no daemon binary to spawn on
+# this platform. Without this dependency the app has no backend at all: no
+# chat, no MCP, no memory.
+#
+# This is **BigTinyV2**, the same daemon desktop talks to over HTTP. It used to
+# be `plugins/bigtiny_rust` (V1), which left one product shipping two daemons
+# with two schemas and two auth models — and left Android without specialists,
+# the `KITTY_ALLOWED_DIRS` tool grants, and every other V2 fix. V1 stays in the
+# tree, frozen, as the rollback path; nothing builds it.
 #
 # Desktop deliberately does NOT take this dependency. There the daemon stays a
-# separate supervised process, which keeps a daemon crash survivable
-# (`lifecycle::bigtiny_proc` restarts it) instead of taking the UI down with
-# it. Linking it on both platforms would trade that away for nothing.
+# separate supervised process, which keeps a daemon crash survivable instead of
+# taking the UI down with it, and lets other frontends share it. Linking it on
+# both platforms would trade that away for nothing.
 #
-# `litert-embed` is on (replacing the old llama.cpp `local-engine`): embeddings
-# run in-process via LiteRT (EmbeddingGemma `.tflite` + the AAR `libLiteRt.so`);
+# `litert-embed`, not `litert-engine`: embeddings run in-process via LiteRT
+# (EmbeddingGemma `.tflite` + the AAR `libLiteRt.so`), while
 # compaction/summarization offloads to the remote chat model, so no generative
-# model — and no cmake/Vulkan/NDK native build — runs on the phone. `litert-embed`
-# is pure `libloading` + pure-Rust `tokenizers`, which cross-compiles clean.
+# model — and no native build — runs on the phone. `litert-embed` is pure
+# `libloading` + pure-Rust `tokenizers`, which cross-compiles clean.
 [target.'cfg(target_os = "android")'.dependencies]
-bigtiny_rust = { path = "../plugins/bigtiny_rust", features = ["litert-embed"] }
+bigtiny2_daemon = { path = "../BigTinyV2/daemon", features = ["litert-embed"] }
 # Resolves the `content://` URI the save dialog returns into a writable file
 # descriptor (`commands::download_file`). Rust-side only — see the plugin
 # registration in `lib.rs` for why the webview gains nothing from this.
