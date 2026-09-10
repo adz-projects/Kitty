@@ -64,6 +64,7 @@ import {
   deriveArtifact,
   extractGooseToolMeta,
   findMatchingProvider,
+  isArtifactInScope,
   isImageFileName,
   isStragglerAssistantMessage,
   userFileArtifact,
@@ -2196,7 +2197,23 @@ export const useChatStore = create<ChatState>((set, get) => {
           String(u.toolCallId ?? '').trim() !== ''
             ? String(u.toolCallId)
             : `#${String(u.title ?? u.kind ?? 'tool')}:${JSON.stringify(u.rawInput ?? {})}`;
-        const artifact = deriveArtifact(u, get().cwd);
+        // Scope the pane to the user's own files. `sessionGrants` is the
+        // daemon's view of what this session may touch (chat folder, current
+        // cwd, every working folder set during it, every attached file) and
+        // is already cached here for the approval handler; chat folder + cwd
+        // is the pre-load fallback, same as there. See `isArtifactInScope`
+        // for why a tool's own cache/temp writes must not land in the pane.
+        const g0 = get();
+        const scope = g0.sessionGrants
+          ? [
+              g0.sessionGrants.chat_dir,
+              g0.sessionGrants.cwd,
+              ...g0.sessionGrants.working_dirs,
+              ...g0.sessionGrants.attached_paths,
+            ]
+          : [g0.chatDir, g0.cwd];
+        const derived = deriveArtifact(u, g0.cwd);
+        const artifact = derived && isArtifactInScope(derived.path, scope) ? derived : null;
         set((s) => {
           let msgs = s.messages.slice();
           let last = msgs[msgs.length - 1];

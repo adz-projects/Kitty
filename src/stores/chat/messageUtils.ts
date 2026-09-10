@@ -3,6 +3,7 @@
 // a currently-configured Kitty provider profile.
 
 import type { ProviderType, ProviderView, ToolCallUpdate } from '@/lib/types';
+import { pathWithinDir } from './approvalUtils';
 import type { Artifact, Message, ToolCall } from './types';
 
 export const closeOpen = (msgs: Message[]): Message[] =>
@@ -101,6 +102,36 @@ export function deriveArtifact(u: ToolCallUpdate, cwd: string | null = null): Ar
     tool: toolName || String(u.title || 'tool'),
     source: 'tool',
   };
+}
+
+/** Whether a tool-derived artifact path belongs in the Artifacts pane at all.
+
+    The pane is a view of *the user's* files — what this chat produced in its
+    own folder, what it produced in a folder the user pointed it at, and what
+    the user handed it. It is not a view of everything a tool happened to
+    touch. Without this check it was both: `kitty-tools` writes every paged
+    read through an extract-once cache under `~/.cache/lean-goose-mcp`, and
+    `kitty-web`'s scrape/download path writes there too, so reading a PDF or
+    fetching a page filed the cache copy as an artifact — `.json`/`.md`/`.txt`
+    scratch that matches ARTIFACT_EXT_RE, in a directory the user has no
+    reason to know exists. Same for anything a tool staged in the OS temp dir.
+
+    `scope` is the session's grant set as the daemon sees it (`chat_dir`, the
+    current `cwd`, every folder set during the session, and every attached
+    file — `SessionAllowedDirs`), falling back to chat folder + cwd before
+    those load. That set is exactly "chat home, selected working directory,
+    attachments", so deriving the pane's boundary from it means the two can't
+    drift: a folder the user grants becomes visible in the pane by the same
+    act that makes it reachable by tools.
+
+    An *empty* scope keeps the artifact. That case is "we do not yet know what
+    this session may touch", not "this session may touch nothing", and
+    silently swallowing a real output is the worse failure — the same reason
+    `decideChatApproval` guards on `bases.length > 0`. */
+export function isArtifactInScope(path: string, scope: (string | null)[]): boolean {
+  const bases = scope.filter((d): d is string => !!d && d.trim() !== '');
+  if (bases.length === 0) return true;
+  return bases.some((base) => pathWithinDir(base, path));
 }
 
 /** Registers a user-attached file as an artifact (distinct from

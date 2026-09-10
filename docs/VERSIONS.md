@@ -625,3 +625,50 @@ left at the daemon's 30s default: `call_specialist` blocks the parent's tool
 call for the whole delegate run, bounded at `SpecialistSettings::timeout_secs`
 (300s default). The row is registered at `timeout_secs + 30` so the orchestrator,
 not the MCP layer, is what decides a delegate has run too long.
+
+## Artifacts pane scope — grants, not "every path a tool touched" (0.10.2)
+
+The heuristic above decides whether a tool call *produced a file*. It never
+decided whether that file is one the **user** would recognize, and the two are
+not the same question. Both plugins keep working storage under
+`~/.cache/lean-goose-mcp`: `kitty-tools` writes every paged read through its
+extract-once document cache (`plugins/kitty-tools/src/doc_store.rs`), and
+`kitty-web`'s scrape/download path files its copy there too. Those writes carry
+a `path` ending in `.json`/`.md`/`.txt`, so they matched `ARTIFACT_EXT_RE` and
+landed in the pane — reading one PDF filed a cache artifact the user has no
+reason to know exists. Anything a tool staged under the OS temp dir did the
+same.
+
+`isArtifactInScope` (`src/stores/chat/messageUtils.ts`) now gates every
+tool-derived artifact on the session's **grant set** rather than on a
+blocklist of cache directories:
+
+| Source | In the pane? |
+|---|---|
+| `source: 'user'` (attached by drag/paste) | always — never routed through the check |
+| `source: 'disk'` (the `cwd` scan) | always — `refreshArtifactsFromDisk` only lists `cwd` |
+| `source: 'tool'` | only inside `SessionAllowedDirs` |
+
+`SessionAllowedDirs` (`GET /api/chat/{id}/allowed_dirs`) is already cached in
+`chatStore` for the approval handler, and is deliberately *not* the full sandbox
+set — it excludes the daemon's data root and its plugins' cache directories,
+which is exactly the distinction the pane needs. Its members are `chat_dir`,
+`cwd`, every `working_dirs` entry set during the session, and every
+`attached_paths` entry. So "chat home, selected working directory, attachments"
+is not restated here; it is read off the same grants that make those places
+reachable by tools in the first place, and the two cannot drift.
+
+Two deliberate choices:
+
+- **Blocklisting the cache paths was rejected.** A blocklist has to be kept
+  current with every plugin's storage decisions, and it silently fails open —
+  a new cache directory shows up in the pane until someone notices. The grant
+  set fails closed and is maintained for other reasons anyway.
+- **An empty scope keeps the artifact.** That state means "the grants have not
+  loaded yet", not "this session may touch nothing" — the pre-load fallback is
+  `chatDir`/`cwd`, and swallowing a real output is the worse failure. Same
+  reasoning as `decideChatApproval`'s `bases.length > 0` guard.
+
+Attachment grants are per *file*, not per folder: `pathWithinDir(file, file)` is
+true by the `resolved === b` arm, so attaching `~/Downloads/a.pdf` does not make
+the rest of `~/Downloads` visible in the pane.
