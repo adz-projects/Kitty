@@ -3667,9 +3667,11 @@ impl AgentLoop {
             hitl.check_tool_call_with_rules(session_id, &tool_name, &tool_args, &rules)
         };
 
+        let mut escalated_by_containment = false;
         if (decision.action == "proceed" || decision.action == "always_allow")
             && !check_containment(&tool_args, allowed_dirs, self.sandbox_strict)
         {
+            escalated_by_containment = true;
             let mut hitl = self.hitl.lock().await;
             decision = hitl.force_approval(session_id, &tool_name, &tool_args);
         }
@@ -3686,7 +3688,57 @@ impl AgentLoop {
             return err;
         }
 
-        if decision.action == "needs_approval" {
+        // An unattended run whose definition already named this tool, on a call
+        // nobody has otherwise decided anything about, proceeds.
+        //
+        // Without this every specialist that uses a tool fails, always. The
+        // shipped default policy is `always_ask` and a delegate has no
+        // approver, so `needs_approval` became a refusal on the first call of
+        // every run -- the researcher could not search, the summarizer could
+        // not read. Worse than failing: a model handed "the tool is blocked"
+        // mid-task does not reliably stop, and one observed run answered a
+        // literature-search request out of its own memory, fabricating the
+        // citations it had been unable to look up.
+        //
+        // `tool_allow` is not a hint here -- it is a decision the user made
+        // when they wrote the specialist, in advance and in writing, which is
+        // exactly what the approval prompt would have asked them for. It has
+        // already been enforced twice by this point (the advertised tool set
+        // was narrowed to it in `run_inner`, and the dispatch check above
+        // re-tested it), so reaching here means the call is on the list. The
+        // delegate also inherits the parent's grants and nothing more, so it
+        // can reach nothing its parent could not.
+        //
+        // Deliberately narrow. `from_default_policy` is true only when no
+        // pattern and no stored rule matched, so a user's explicit `reject`
+        // rule still rejects, a rule this code cannot parse still fails closed,
+        // and a path outside the session's allowed directories still refuses
+        // (`escalated_by_containment`). Those are decisions; this covers only
+        // the absence of one.
+        let preauthorized_for_unattended_run = decision.action == "needs_approval"
+            && self.hitl_auto_reject
+            && decision.from_default_policy
+            && !escalated_by_containment
+            && self
+                .tool_allow
+                .as_ref()
+                .is_some_and(|allow| allow.contains(&tool_name));
+        if preauthorized_for_unattended_run {
+            // Drop the pending record the decision registered as a side effect;
+            // nothing will ever approve it, and leaving it behind advertises an
+            // approval that no waiter will honor until `sweep_stale` reaps it.
+            if let Some(action_id) = decision.pending_action_id.as_deref() {
+                let mut hitl = self.hitl.lock().await;
+                hitl.remove_pending(action_id);
+            }
+            tracing::debug!(
+                session_id,
+                tool_name,
+                "unattended run: proceeding on a tool its definition allows"
+            );
+        }
+
+        if decision.action == "needs_approval" && !preauthorized_for_unattended_run {
             let action_id = decision.pending_action_id.clone().unwrap_or_default();
 
             // No approver exists for this run, so there is nothing to wait for.

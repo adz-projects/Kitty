@@ -59,6 +59,17 @@ pub struct HITLDecision {
     pub action: String,
     pub reason: Option<String>,
     pub pending_action_id: Option<String>,
+    /// True only when no auto-reject pattern, always-allow pattern or stored
+    /// rule matched and this decision came from `config.hitl.default_policy`.
+    ///
+    /// It is the difference between "the user decided this needs a human" and
+    /// "nobody has decided anything about this tool yet", which a bare
+    /// `needs_approval` cannot express. An unattended run (a specialist) needs
+    /// that distinction: its `tool_allow` list is a decision the user already
+    /// made in advance, so it may proceed past the *undecided* case, but must
+    /// still honour an explicit rule, a containment escalation, or a rule this
+    /// code could not parse. See `agent::loop_`'s `hitl_auto_reject` branch.
+    pub from_default_policy: bool,
 }
 
 impl HITLDecision {
@@ -178,6 +189,7 @@ impl HITLManager {
                         pattern
                     )),
                     pending_action_id: None,
+                    from_default_policy: false,
                 };
             }
         }
@@ -196,6 +208,7 @@ impl HITLManager {
                     action: "always_allow".to_string(),
                     reason: None,
                     pending_action_id: None,
+                    from_default_policy: false,
                 };
             }
         }
@@ -210,11 +223,13 @@ impl HITLManager {
                         rule.args_pattern.as_deref().unwrap_or(tool_name)
                     )),
                     pending_action_id: None,
+                    from_default_policy: false,
                 },
                 "allow" | "always_allow" => HITLDecision {
                     action: "proceed".to_string(),
                     reason: None,
                     pending_action_id: None,
+                    from_default_policy: false,
                 },
                 // Fail CLOSED, matching `record_decision`'s catch-all. A
                 // decision string this code does not recognize is a rule it
@@ -233,17 +248,26 @@ impl HITLManager {
                             "A stored rule for this tool has an unrecognized decision                              ('{other}'), so it cannot be applied automatically."
                         )),
                         pending_action_id: None,
+                        from_default_policy: false,
                     }
                 }
             };
         }
 
-        // Apply default policy
-        match self.config.default_policy.as_str() {
+        // Apply default policy.
+        //
+        // Everything above was a decision *about this tool*: a pattern, a rule
+        // the user stored, a rule that could not be parsed. Reaching here means
+        // none existed, so what follows is the fallback for an undecided call.
+        // That is marked on the decision (`from_default_policy`) because an
+        // unattended run treats the two cases differently -- see the field's
+        // own doc comment.
+        let mut decision = match self.config.default_policy.as_str() {
             "auto_allow" => HITLDecision {
                 action: "proceed".to_string(),
                 reason: None,
                 pending_action_id: None,
+                from_default_policy: false,
             },
             "auto_reject" => HITLDecision {
                 action: "rejected".to_string(),
@@ -251,9 +275,12 @@ impl HITLManager {
                     "Default policy is auto-reject for unclassified tool calls".to_string(),
                 ),
                 pending_action_id: None,
+                from_default_policy: false,
             },
             _ => self.create_pending(session_id, tool_name, args, "requires human approval"),
-        }
+        };
+        decision.from_default_policy = true;
+        decision
     }
 
     /// Force-escalate a tool call to need approval (used by sandbox).
@@ -298,6 +325,7 @@ impl HITLManager {
             action: "needs_approval".to_string(),
             reason: Some(format!("Tool '{}' {}", tool_name, reason)),
             pending_action_id: Some(action_id),
+            from_default_policy: false,
         }
     }
 
@@ -321,6 +349,7 @@ impl HITLManager {
                         action: "rejected".to_string(),
                         reason: Some(format!("No pending action found: {}", action_id)),
                         pending_action_id: None,
+                        from_default_policy: false,
                     },
                     None,
                 );
@@ -345,6 +374,7 @@ impl HITLManager {
                     action: "rejected".to_string(),
                     reason: Some(format!("User rejected tool call '{}'", pending.tool_name)),
                     pending_action_id: None,
+                    from_default_policy: false,
                 },
                 None,
             ),
@@ -353,6 +383,7 @@ impl HITLManager {
                     action: "always_allow".to_string(),
                     reason: None,
                     pending_action_id: None,
+                    from_default_policy: false,
                 },
                 Some(pending.tool_name),
             ),
@@ -361,6 +392,7 @@ impl HITLManager {
                     action: "proceed".to_string(),
                     reason: None,
                     pending_action_id: None,
+                    from_default_policy: false,
                 },
                 None,
             ),
@@ -374,6 +406,7 @@ impl HITLManager {
                          allow/proceed/always_allow/reject"
                     )),
                     pending_action_id: None,
+                    from_default_policy: false,
                 },
                 None,
             ),
@@ -540,6 +573,7 @@ mod tests {
             action: "needs_approval".to_string(),
             reason: Some("Test reason".to_string()),
             pending_action_id: Some("action-1".to_string()),
+            from_default_policy: false,
         };
         let dict = decision.to_dict();
         assert_eq!(
@@ -599,6 +633,73 @@ mod tests {
     fn match_rule_no_match_returns_none() {
         let rules = vec![rule_row(Some("rm -rf"), "reject")];
         assert!(HITLManager::match_rule(&rules, r#"{"command": "echo hi"}"#).is_none());
+    }
+
+    // `from_default_policy` is what lets an unattended run (a specialist) tell
+    // "nobody has decided anything about this tool" apart from "the user
+    // decided this needs a human". Getting it wrong in either direction is a
+    // real fault: false where it should be true breaks every specialist that
+    // uses a tool, true where it should be false lets a delegate walk past a
+    // rule the user stored. See `agent::loop_`'s pre-authorization branch.
+
+    #[tokio::test]
+    async fn undecided_call_is_marked_as_coming_from_the_default_policy() {
+        let mut m = test_manager().await;
+        let d = m.check_tool_call_with_rules("s1", "lean_web_search", &json!({}), &[]);
+        assert_eq!(d.action, "needs_approval");
+        assert!(
+            d.from_default_policy,
+            "no pattern and no rule matched, so this is the undecided case"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stored_rule_is_never_marked_as_the_default_policy() {
+        let mut m = test_manager().await;
+        for decision in ["reject", "always_allow"] {
+            let rules = vec![rule_row(None, decision)];
+            let d = m.check_tool_call_with_rules("s1", "tool", &json!({}), &rules);
+            assert!(
+                !d.from_default_policy,
+                "{decision} rule produced {} but claimed to be the default policy",
+                d.action
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unparseable_rule_needs_approval_without_claiming_the_default_policy() {
+        // Fails closed, and must keep failing closed for an unattended run:
+        // a rule this code cannot honor is still a rule the user stored.
+        let mut m = test_manager().await;
+        let rules = vec![rule_row(None, "sometimes-maybe")];
+        let d = m.check_tool_call_with_rules("s1", "tool", &json!({}), &rules);
+        assert_eq!(d.action, "needs_approval");
+        assert!(!d.from_default_policy);
+    }
+
+    #[tokio::test]
+    async fn an_auto_reject_pattern_is_never_marked_as_the_default_policy() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        let config = HITLConfig {
+            auto_reject_patterns: vec!["rm -rf".to_string()],
+            ..HITLConfig::default()
+        };
+        let mut m = HITLManager::new(pool, config);
+        let d = m.check_tool_call_with_rules("s1", "shell", &json!({"command": "rm -rf /"}), &[]);
+        assert_eq!(d.action, "rejected");
+        assert!(!d.from_default_policy);
+    }
+
+    #[tokio::test]
+    async fn a_containment_escalation_is_never_marked_as_the_default_policy() {
+        // `force_approval` is the sandbox saying a path is out of bounds. An
+        // unattended run must refuse it, not pre-authorize it, so this flag
+        // has to stay false however the call was classified beforehand.
+        let mut m = test_manager().await;
+        let d = m.force_approval("s1", "lean_file_read", &json!({"path": "/etc/shadow"}));
+        assert_eq!(d.action, "needs_approval");
+        assert!(!d.from_default_policy);
     }
 
     async fn test_manager() -> HITLManager {

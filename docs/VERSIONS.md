@@ -672,3 +672,73 @@ Two deliberate choices:
 Attachment grants are per *file*, not per folder: `pathWithinDir(file, file)` is
 true by the `resolved === b` arm, so attaching `~/Downloads/a.pdf` does not make
 the rest of `~/Downloads` visible in the pane.
+
+## Specialist tool calls and the HITL gate (0.10.3)
+
+**Every specialist that used a tool failed, on every run, on both platforms.**
+Registering the `specialists` MCP server in 0.10.2 made `call_specialist`
+reachable for the first time, which is what exposed this: the delegate would
+spend its whole run being refused and then answer anyway.
+
+The chain. A delegate is spawned with `hitl_policy: "auto_reject"`
+(`agent/orchestrator.rs`) because there is no user attached to answer an
+approval prompt and `always_ask`'s wait is bounded at an hour *per tool call*.
+The shipped `config.hitl.default_policy` is `always_ask` and
+`always_allow_patterns` is empty, so a tool with no stored rule resolves to
+`needs_approval` — and in an unattended run that became an immediate refusal.
+The researcher's three tools (`lean_web_search`, `lean_web_search_read_chunk`,
+`lean_web_scrape`) have no rule, so it could never search.
+
+Observed on a Pixel 10 Pro, 2026-09-10: five turns, every `lean_web_search`
+answered with "requires human approval, which is unavailable in an unattended
+run", after which the model **fabricated a bibliography from memory** —
+plausible authors, venues and dates for a literature search it had been unable
+to perform. The `COMMON` preamble tells specialists to report refusals in
+`refusals` rather than present a partial result as a complete one; a small
+model handed a blocked tool mid-task does not reliably comply. That is why this
+is a correctness bug and not a papercut.
+
+**Why Android showed it and Windows had not.** Nothing platform-specific — the
+Android install is a fresh V2 database (D26c) with zero `hitl_rules`, so
+*everything* is undecided. The Windows database had accumulated three
+`always_allow` rows from earlier sessions (`lean_analyze_workspace`,
+`lean_pdf_read_outline`, `lean_pdf_read_text`), which would have let `locator`
+and parts of `summarizer`/`extractor` through while `researcher` failed there
+too. The bug is identical on both; the symptom depends on which rules a user
+happens to have accrued.
+
+### The fix, and what it deliberately does not cover
+
+`HITLDecision` gains `from_default_policy`, true only when no auto-reject
+pattern, no always-allow pattern and no stored rule matched — the difference
+between *the user decided this needs a human* and *nobody has decided anything
+about this tool yet*. `agent/loop_`'s unattended branch proceeds on the second
+case when the tool is on the run's `tool_allow` list, and refuses as before on
+everything else:
+
+| Classification | Unattended run |
+|---|---|
+| auto-reject pattern | rejected (unchanged) |
+| stored `reject` rule | rejected (unchanged) |
+| stored rule too damaged to apply | refused — fails closed (unchanged) |
+| containment escalation (path outside `allowed_dirs`) | refused (unchanged) |
+| default policy, tool on `tool_allow` | **proceeds** |
+| default policy, no `tool_allow` on the session | refused (unchanged) |
+
+`tool_allow` is not a hint being promoted to an authorization here. It is a
+decision the user made in writing when they wrote the specialist — the same
+decision the approval prompt would have asked for — and it was already enforced
+twice before this point (the advertised tool set is narrowed to it in
+`run_inner`; `execute_one_tool_call` re-checks it at dispatch). The delegate
+also inherits the parent's filesystem grants and nothing more, so it can reach
+nothing its parent could not, and `check_containment` still runs.
+
+`hitl_auto_reject` is set by exactly one caller — the orchestrator — so this
+touches delegate runs only. A session with no `tool_allow` at all is still
+refused: absent means unrestricted, which is the opposite of a
+pre-authorization.
+
+All five builtin specialists are read-only or sandboxed (web reads, document
+readers, `wasm_python_run`); none names `shell` or a write tool. A
+*user-authored* specialist that lists one will now run it unattended, which is
+what listing it means.

@@ -225,21 +225,88 @@ async fn a_session_without_an_allow_list_is_unrestricted() {
     );
 }
 
-/// An unattended run refuses an approval-needing tool immediately.
+/// An unattended run proceeds on a tool its own definition allows.
 ///
-/// The default HITL policy is `always_ask`, whose wait is bounded at an hour —
-/// not a hang, but indistinguishable from one to a caller, and an hour *per
-/// tool call*. The refusal must also be legible enough for the delegate to
-/// report it, which is what keeps a blocked run from returning a quietly
-/// thinner answer than its caller believes.
+/// This is the whole feature working or not working. The shipped default HITL
+/// policy is `always_ask` and a delegate has no approver, so before this every
+/// specialist that used a tool was refused on its first call, on every run: the
+/// researcher could not search, the summarizer could not read. `tool_allow` is
+/// the decision the approval prompt would have asked for, made in advance when
+/// the specialist was written, so an undecided call on a listed tool proceeds.
 #[tokio::test]
-async fn an_unattended_run_refuses_an_approval_instead_of_waiting_for_one() {
+async fn an_unattended_run_proceeds_on_a_tool_its_definition_allows() {
     let pool = test_pool().await;
     let mut server = mockito::Server::new_async().await;
-    // Not in the allow-list check's way: this session allows the tool, so the
-    // call reaches HITL, which is the gate under test.
     mock_tool_then_stop(&mut server, "some_tool_needing_approval").await;
     let agent = build_agent(&pool, Some(&server.url()));
+
+    seed_session(
+        &pool,
+        "s-hitl-allow",
+        json!({
+            "provider": "mock",
+            "hitl_policy": "auto_reject",
+            "tool_allow": ["some_tool_needing_approval"],
+        }),
+    )
+    .await;
+
+    let events = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        run_and_collect(&agent, "s-hitl-allow"),
+    )
+    .await
+    .expect("an unattended run must not block on approval");
+
+    let results = tool_results(&events);
+    assert_eq!(results.len(), 1);
+    // No MCP server is registered in this harness, so the call lands on
+    // "Unknown tool" at dispatch. That *is* the assertion: reaching dispatch at
+    // all means HITL let it through. What must not appear is the refusal.
+    assert!(
+        !results[0].contains("unattended"),
+        "an allow-listed tool must not be refused for want of an approver. Got: {}",
+        results[0]
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| e.event_type == SSEEventType::HitlPause),
+        "no approval may be requested when there is nobody to answer it"
+    );
+}
+
+/// ...but a rule the user stored still decides, and refuses immediately.
+///
+/// The pre-authorization above covers exactly one case: nobody has decided
+/// anything about this tool. A stored `reject` rule is a decision, and an
+/// unattended run must honour it rather than walk past it because its
+/// definition happened to name the tool. `from_default_policy` is what keeps
+/// those two apart; `hitl::manager`'s own tests pin the flag for every other
+/// classification, including the containment escalation and a rule too damaged
+/// to apply.
+///
+/// The refusal must also be legible enough for the delegate to report, which is
+/// what keeps a blocked run from returning a quietly thinner answer than its
+/// caller believes. And it must be immediate: `always_ask`'s wait is bounded at
+/// an hour, which is not a hang but is indistinguishable from one to a caller,
+/// and it is an hour *per tool call*.
+#[tokio::test]
+async fn an_unattended_run_refuses_a_tool_a_stored_rule_rejects() {
+    let pool = test_pool().await;
+    let mut server = mockito::Server::new_async().await;
+    mock_tool_then_stop(&mut server, "some_tool_needing_approval").await;
+    let agent = build_agent(&pool, Some(&server.url()));
+
+    bigtiny2::storage::hitl_rules::upsert_rule(
+        &pool,
+        APP,
+        "some_tool_needing_approval",
+        None,
+        "reject",
+    )
+    .await
+    .unwrap();
 
     seed_session(
         &pool,
@@ -264,8 +331,8 @@ async fn an_unattended_run_refuses_an_approval_instead_of_waiting_for_one() {
     let results = tool_results(&events);
     assert_eq!(results.len(), 1);
     assert!(
-        results[0].contains("unattended") && results[0].contains("report this"),
-        "the refusal must be reportable by the delegate, got: {}",
+        results[0].contains("denied") && results[0].contains("some_tool_needing_approval"),
+        "the refusal must name the tool so the delegate can report it, got: {}",
         results[0]
     );
     assert!(
