@@ -695,6 +695,28 @@ const MAX_TITLE_WORDS: usize = 5;
 /// genuinely needs the next chunk reads the note and carries on.
 const REPEAT_TOOL_NUDGE_AFTER: u32 = 5;
 
+/// A control message the daemon injects mid-conversation — a budget warning,
+/// a wrap-up instruction, a step nudge, "now give me the answer".
+///
+/// **Role `user`, never `system`.** These land after an assistant or tool turn,
+/// and a system message in a non-first position is not portable: Qwen-family
+/// chat templates walk the transcript expecting `system` only at the head and
+/// throw inside the Jinja when they meet a later one. llama-server surfaces
+/// that from whichever layer notices first, so the same defect appears as
+/// `Failed to initialize samplers: std::exception` on one build and
+/// `While executing CallExpression at line 110` on another. Neither names a
+/// system message; both read like a sampler or grammar fault, which is what
+/// made this expensive to find.
+///
+/// Confirmed against two live llama-servers: the exact shapes these call sites
+/// produce fail on a Qwen 27B host and succeed with nothing changed but the
+/// role. A trailing `user` turn is accepted by every template, and it is also
+/// the honest description of what these messages are — the caller speaking, not
+/// a new system prompt.
+fn control_message(content: impl Into<Value>) -> Value {
+    json!({"role": "user", "content": content.into()})
+}
+
 /// The note appended to a tool result once the same tool has been called
 /// `REPEAT_TOOL_NUDGE_AFTER` steps in a row.
 fn repeat_tool_nudge(tool_name: &str, runs: u32) -> String {
@@ -876,6 +898,30 @@ fn sanitize_title(raw: &str) -> String {
 }
 
 #[cfg(test)]
+mod control_message_tests {
+    use super::control_message;
+
+    /// The whole point of the helper. A `system` role here is not a style
+    /// preference — it is a request a Qwen-family chat template cannot render,
+    /// and the error it produces names neither the role nor the message.
+    #[test]
+    fn control_messages_are_user_turns_not_system_turns() {
+        let m = control_message("now answer");
+        assert_eq!(
+            m["role"], "user",
+            "a mid-conversation system message is not portable"
+        );
+        assert_eq!(m["content"], "now answer");
+
+        // Owned content goes through unchanged too — several call sites pass a
+        // formatted String rather than a literal.
+        let owned = control_message(String::from("budget exhausted"));
+        assert_eq!(owned["role"], "user");
+        assert_eq!(owned["content"], "budget exhausted");
+    }
+}
+
+#[cfg(test)]
 mod repeat_nudge_tests {
     use super::repeat_tool_nudge;
 
@@ -891,9 +937,11 @@ mod repeat_nudge_tests {
             "the nudge must not read as a prohibition: {note}"
         );
         // Its own lines, so it cannot be mistaken for the tool's own output.
-        assert!(note.starts_with("
+        assert!(note.starts_with(
+            "
 
-[note]"));
+[note]"
+        ));
     }
 }
 
@@ -1744,7 +1792,10 @@ impl AgentLoop {
         // Built from the turn's own history so the answer is grounded in the
         // tool results the loop actually gathered, not re-derived.
         let mut attempt: Vec<Value> = messages.clone();
-        attempt.push(json!({"role": "system", "content": INSTRUCTION}));
+        // A delegate's transcript always ends on an assistant turn, so this
+        // instruction necessarily lands after one — see `control_message` for
+        // why that makes the role load-bearing.
+        attempt.push(control_message(INSTRUCTION));
 
         // Cached on the *final* request only, which is the one place in a
         // delegate's run where caching is unambiguously safe: it carries no
@@ -1822,9 +1873,9 @@ impl AgentLoop {
             let Some(value) = candidate else {
                 last_error = "model returned no JSON for a schema-constrained answer".to_string();
                 attempt.push(json!({"role": "assistant", "content": text}));
-                attempt.push(json!({"role": "system", "content": format!(
-                    "{last_error}. {INSTRUCTION}"
-                )}));
+                // `user` for the same reason as the first instruction above:
+                // this one also lands after an assistant turn.
+                attempt.push(control_message(format!("{last_error}. {INSTRUCTION}")));
                 continue;
             };
 
@@ -1837,9 +1888,9 @@ impl AgentLoop {
                             "structured answer failed validation; retrying once with the error"
                         );
                         attempt.push(json!({"role": "assistant", "content": value.to_string()}));
-                        attempt.push(json!({"role": "system", "content": format!(
+                        attempt.push(control_message(format!(
                             "That response was rejected — {why}. {INSTRUCTION}"
-                        )}));
+                        )));
                     }
                     continue;
                 }
@@ -2098,10 +2149,7 @@ impl AgentLoop {
                     session_id: Some(session_id.to_string()),
                     ..Default::default()
                 });
-                messages.push(json!({
-                    "role": "system",
-                    "content": err_msg
-                }));
+                messages.push(control_message(err_msg.clone()));
                 if let Err(e) = self.context.save_messages(session_id, &mut messages).await {
                     tracing::warn!("failed to save messages for session {session_id}: {e}");
                 }
@@ -2226,10 +2274,7 @@ impl AgentLoop {
                         wrapup_reserve,
                         "context reserve reached — withdrawing tools for a wrap-up reply"
                     );
-                    messages.push(json!({
-                        "role": "system",
-                        "content": WRAPUP_SYSTEM_MESSAGE
-                    }));
+                    messages.push(control_message(WRAPUP_SYSTEM_MESSAGE));
                     in_wrapup = true;
                     wrapup_issued = true;
                     tools_for_turn.clear();
@@ -2257,10 +2302,7 @@ impl AgentLoop {
                 // completed tool-loop iteration, so `step % 20 == 0` lands on the
                 // 20th, 40th, 60th... iteration reliably.
                 TurnMode::StepNudge => {
-                    messages.push(json!({
-                        "role": "system",
-                        "content": BUDGET_SYSTEM_MESSAGE
-                    }));
+                    messages.push(control_message(BUDGET_SYSTEM_MESSAGE));
                     in_budget_check = true;
                     tools_for_turn.push(json!({
                         "type": "function",
@@ -2365,10 +2407,7 @@ impl AgentLoop {
                             messages.pop();
                             in_budget_check = false;
                         }
-                        messages.push(json!({
-                            "role": "system",
-                            "content": WRAPUP_SYSTEM_MESSAGE
-                        }));
+                        messages.push(control_message(WRAPUP_SYSTEM_MESSAGE));
                         in_wrapup = true;
                         wrapup_issued = true;
                         tools_for_turn.clear();
@@ -2795,7 +2834,7 @@ impl AgentLoop {
                         session_id: Some(session_id.to_string()),
                         ..Default::default()
                     });
-                    messages.push(json!({"role": "system", "content": notice}));
+                    messages.push(control_message(notice.clone()));
                 }
             }
 
@@ -2936,7 +2975,7 @@ impl AgentLoop {
                         &turn_tool_calls,
                         ABORTED_FOR_STEP_BUDGET,
                     ));
-                    messages.push(json!({"role": "system", "content": err}));
+                    messages.push(control_message(err.clone()));
                     step += 1;
                     if let Err(e) = self.context.save_messages(session_id, &mut messages).await {
                         tracing::warn!("failed to save messages for session {session_id}: {e}");
@@ -3048,7 +3087,8 @@ impl AgentLoop {
                 .iter()
                 .filter_map(|tc| tc.function.get("name").and_then(|v| v.as_str()))
                 .collect();
-            let single = (distinct.len() == 1).then(|| distinct.iter().next().copied().unwrap_or(""));
+            let single =
+                (distinct.len() == 1).then(|| distinct.iter().next().copied().unwrap_or(""));
             match single {
                 Some(name) if repeat_tool.as_deref() == Some(name) => repeat_runs += 1,
                 Some(name) => {
@@ -3064,7 +3104,11 @@ impl AgentLoop {
             // next decision, and repeating it on every result of a fan-out
             // step would just spend context saying the same thing.
             let nudge = (repeat_runs >= REPEAT_TOOL_NUDGE_AFTER)
-                .then(|| repeat_tool.as_deref().map(|t| repeat_tool_nudge(t, repeat_runs)))
+                .then(|| {
+                    repeat_tool
+                        .as_deref()
+                        .map(|t| repeat_tool_nudge(t, repeat_runs))
+                })
                 .flatten();
             let last = turn_tool_calls.len().saturating_sub(1);
             for (idx, (tc, result)) in turn_tool_calls.iter().zip(tool_results).enumerate() {
