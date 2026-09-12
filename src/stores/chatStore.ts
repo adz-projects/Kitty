@@ -263,6 +263,14 @@ interface ChatState {
       Cleared when a fresh turn starts, not when one ends: a delegate's report
       is part of the answer the user is reading, so the strip has to survive
       the turn that produced it. */
+  /** Non-null when this window is *watching* a delegate rather than hosting a
+      conversation — the specialist's name, from the spectate handoff. A
+      delegate answers to the turn that spawned it and runs unattended by
+      design (its `hitl_policy` is set at spawn), so a user turn typed into its
+      transcript would corrupt the report its parent is blocked on. The
+      composer is disabled for the window's whole life; there is no way out of
+      this mode except closing it. */
+  spectating: string | null;
   subagents: SubagentStatusEvent[];
   bindEvents: () => void;
   dismissWarning: () => void;
@@ -341,6 +349,10 @@ interface ChatState {
       the previous value in place rather than clearing it, since an empty grant
       set makes the approval check *stricter*, not laxer. */
   refreshSessionGrants: () => Promise<void>;
+  /** Open a delegate's transcript read-only (Settings-free "watch this
+      specialist" window). Loads the session exactly as a resume would, then
+      latches `spectating` so nothing can be sent into it. */
+  spectateSession: (sessionId: string, specialist: string) => Promise<void>;
   adoptSession: (info: {
     session_id: string;
     cwd: string;
@@ -387,6 +399,60 @@ const clearStopGrace = () => {
     stopGraceTimer = null;
   }
 };
+// A finished specialist chip lingers this long before it disappears, so a
+// failure is noticeable without the tray becoming a permanent fixture of the
+// turn. Per-delegate timers, keyed by child session id: a second frame for one
+// delegate must reschedule rather than stack a second deletion, and every
+// place that resets `subagents` has to cancel them or a timer armed in the
+// previous turn fires into the next one and deletes a chip that is still live.
+const SUBAGENT_LINGER_MS = 5_000;
+const subagentTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const clearSubagentTimers = () => {
+  for (const t of subagentTimers.values()) clearTimeout(t);
+  subagentTimers.clear();
+};
+/** The empty tray, with any pending disappear-timers cancelled. Used wherever
+    `subagents` is reset so a timer armed last turn cannot delete a live chip
+    in the next one. Exported for tests, which need the real reset rather than
+    a bare `setState({ subagents: [] })` that would leave the timers armed. */
+export const resetSubagents = (): SubagentStatusEvent[] => {
+  clearSubagentTimers();
+  return [];
+};
+
+/** Fold one `chat://subagent-status` frame into the tray, and schedule the
+    chip's disappearance once its delegate has finished.
+ *
+ *  Split out of the event listener so it can be tested without Tauri: the
+ *  listener is only a `forActive` guard in front of this. */
+export function applySubagentStatus(e: SubagentStatusEvent) {
+  useChatStore.setState((st) => {
+    // Keyed by the delegate's own session, so a `started` frame is replaced in
+    // place by its `completed`/`failed` rather than stacking up three rows for
+    // one specialist.
+    const rest = st.subagents.filter((s) => s.child_session_id !== e.child_session_id);
+    return { subagents: [...rest, e] };
+  });
+
+  // A finished delegate stays visible briefly, then goes. Reschedule rather
+  // than add: `completed` can follow `failed` on a retry, and two timers for
+  // one chip would delete whatever replaced it.
+  const existing = subagentTimers.get(e.child_session_id);
+  if (existing) {
+    clearTimeout(existing);
+    subagentTimers.delete(e.child_session_id);
+  }
+  if (e.status === 'completed' || e.status === 'failed') {
+    const timer = setTimeout(() => {
+      subagentTimers.delete(e.child_session_id);
+      useChatStore.setState((st) => ({
+        subagents: st.subagents.filter((s) => s.child_session_id !== e.child_session_id),
+      }));
+    }, SUBAGENT_LINGER_MS);
+    subagentTimers.set(e.child_session_id, timer);
+  }
+}
+
 let msgSeq = 0;
 const newId = () => `m${Date.now()}_${++msgSeq}`;
 
@@ -940,7 +1006,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         stopPhase: null,
         abandonedSession: null,
         loopSuspected: false,
-        subagents: [],
+        subagents: resetSubagents(),
       }));
       lastSentAt = performance.now();
       lastSentProvider = get().providerName;
@@ -1060,7 +1126,10 @@ export const useChatStore = create<ChatState>((set, get) => {
     stopPhase: null,
     abandonedSession: null,
     loopSuspected: false,
-    subagents: [],
+    subagents: resetSubagents(),
+    // Set once, by `spectateSession`, and never cleared: a watch window is a
+    // watch window for its whole life.
+    spectating: null,
 
     dismissWarning: () => set({ warning: null }),
     dismissCompactionNotice: () => set({ compactionNotice: null }),
@@ -1240,6 +1309,14 @@ export const useChatStore = create<ChatState>((set, get) => {
       }
     },
 
+    spectateSession: async (sessionId, specialist) => {
+      // Latch *before* the load: `loadSession` replays the transcript through
+      // the same events a live turn uses, and a composer that is briefly
+      // enabled during a multi-second replay is a composer someone can type
+      // into.
+      set({ spectating: specialist });
+      await get().loadSession(sessionId, '');
+    },
     adoptSession: async (info) => {
       // Replay the handed-off conversation (Expand / auto-promote) so the full
       // window shows it — previously this only set the session id, leaving the
@@ -1352,7 +1429,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         stopPhase: null,
         abandonedSession: null,
         loopSuspected: false,
-        subagents: [],
+        subagents: resetSubagents(),
       });
     },
 
@@ -1454,7 +1531,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         stopPhase: null,
         abandonedSession: null,
         loopSuspected: false,
-        subagents: [],
+        subagents: resetSubagents(),
       });
       try {
         let info: SessionInfo;
@@ -1607,7 +1684,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         stopPhase: null,
         abandonedSession: null,
         loopSuspected: false,
-        subagents: [],
+        subagents: resetSubagents(),
       });
       // A resumed session keeps every grant it accumulated (working folders,
       // attached files), so the approval check needs them back before the
@@ -1723,7 +1800,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         messages: closeOpen(s.messages),
         warning: 'Stopped. Kitty may still be finishing this turn in the background.',
         loopSuspected: false,
-        subagents: [],
+        subagents: resetSubagents(),
         // An explicit Force Stop overrides the reasoning-cap's own automatic
         // cancel-then-ask-for-an-answer flow — no surprise follow-up after
         // the user deliberately kills a turn themselves.
@@ -2581,13 +2658,7 @@ export const useChatStore = create<ChatState>((set, get) => {
       });
       void onSubagentStatus((e) => {
         if (!forActive(e.session_id)) return;
-        set((st) => {
-          // Keyed by the delegate's own session, so a `started` frame is
-          // replaced in place by its `completed`/`failed` rather than stacking
-          // up three rows for one specialist.
-          const rest = st.subagents.filter((s) => s.child_session_id !== e.child_session_id);
-          return { subagents: [...rest, e] };
-        });
+        applySubagentStatus(e);
       });
       void onCompaction((e) => {
         if (!forActive(e.session_id)) return;

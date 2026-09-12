@@ -33,16 +33,27 @@ export function Composer({
   disabled,
   concluded,
   sendBlocked,
+  spectating,
 }: {
   onSend: (text: string) => void;
   onStop: () => void;
   disabled: boolean;
   concluded?: boolean;
+  /** The specialist this window is watching, when it is a spectate window
+      (`SubagentChip` -> `spectateSession`). Locks the composer exactly as
+      `concluded` does, because the reason is the same shape: this transcript
+      is readable but not writable. A delegate runs unattended and reports to
+      the turn that spawned it, so a user turn typed in here would corrupt the
+      report its parent is blocked on. */
+  spectating?: string | null;
   /** Blocks submission without swapping the button to the Stop/streaming UI
       (unlike `disabled`, which implies a response is actively streaming) —
       used while the stack is still warming up at startup. */
   sendBlocked?: boolean;
 }) {
+  // One flag for "input is closed", so a new reason cannot be added to the
+  // placeholder and forgotten on the three `disabled` attributes below.
+  const readOnly = concluded || !!spectating;
   const [text, setText] = useState('');
   const ref = useRef<HTMLTextAreaElement>(null);
   const addPastedText = useChatStore((s) => s.addPastedText);
@@ -91,7 +102,7 @@ export function Composer({
   const submit = () => {
     const value = text.trim();
     if (!value) return;
-    if (disabled || concluded || sendBlocked) return;
+    if (disabled || readOnly || sendBlocked) return;
     // Manual context compaction — a local command, not a message to the
     // model. Exact-slug match only: a word-boundary check would still let a
     // user message like "/compactify the plan" trigger compaction and be
@@ -139,7 +150,7 @@ export function Composer({
         onClick={() => void attachFiles()}
         title="Attach files"
         aria-label="Attach files"
-        disabled={concluded}
+        disabled={readOnly}
       >
         <UploadIcon />
       </button>
@@ -158,18 +169,24 @@ export function Composer({
           onClick={() => void captureScreenshot()}
           title="Capture a screenshot region"
           aria-label="Capture a screenshot region"
-          disabled={concluded}
+          disabled={readOnly}
         >
           <CameraIcon />
         </button>
       )}
       <textarea
-        disabled={concluded}
+        disabled={readOnly}
         ref={ref}
         rows={1}
         autoFocus
         value={text}
-        placeholder={concluded ? 'Chat concluded.' : DEFAULT_PLACEHOLDER}
+        placeholder={
+          spectating
+            ? `Watching ${spectating} — you can't reply to a specialist.`
+            : concluded
+              ? 'Chat concluded.'
+              : DEFAULT_PLACEHOLDER
+        }
         onChange={(e) => {
           setText(e.target.value);
           // Resize is coalesced into a rAF (see scheduleResize) so typing never
@@ -217,7 +234,7 @@ export function Composer({
         <button
           className="primary"
           onClick={submit}
-          disabled={!text.trim() || concluded || sendBlocked}
+          disabled={!text.trim() || readOnly || sendBlocked}
         >
           Send
         </button>

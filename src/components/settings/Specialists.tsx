@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { ipc } from '@/lib/ipc';
 import type { ProviderView, Specialist, SpecialistRun } from '@/lib/types';
+import { DelegateRunRow } from './DelegateRunRow';
 import { Modal } from '@/components/shared/Modal';
 
 interface FormState {
@@ -306,33 +307,15 @@ export function Specialists() {
       <p className="muted">
         Which specialist answered which request, and on what. The model chooses a specialist by
         reading its description, so this is where a description that is drawing the wrong work
-        becomes visible.
+        becomes visible. Expand a run to read the delegate&apos;s own transcript — delegate sessions
+        are deliberately kept out of Saved Chats, so this is where they live.
       </p>
       {runs.length === 0 ? (
         <p className="muted">Nothing delegated yet.</p>
       ) : (
         <div className="ext-list">
           {runs.slice(0, 20).map((r) => (
-            <div className="row" key={r.id} style={{ alignItems: 'center' }}>
-              <span
-                className={
-                  r.status === 'failed'
-                    ? 'status-dot bad'
-                    : r.status === 'completed'
-                      ? 'status-dot ok'
-                      : 'status-dot warn'
-                }
-              />
-              <div style={{ flex: 1 }}>
-                <div>{r.specialist ?? 'specialist'}</div>
-                <div className="muted" style={{ fontSize: 13 }}>
-                  {r.summary ?? r.status}
-                </div>
-              </div>
-              <span className="muted" style={{ fontSize: 12 }}>
-                {r.started_at ? new Date(r.started_at).toLocaleString() : ''}
-              </span>
-            </div>
+            <DelegateRunRow key={r.id} run={r} />
           ))}
         </div>
       )}

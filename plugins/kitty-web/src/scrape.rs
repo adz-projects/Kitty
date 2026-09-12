@@ -888,8 +888,14 @@ pub async fn web_scrape(
                 "file_type": kind.ext,
                 "bytes": bytes.len(),
             }),
+            // The source URL is named here, not just in `data.url`: a turn
+            // that downloads two documents gets two `cached_path`s and one
+            // sentence to tell them apart by, and a model reading only the
+            // message has otherwise no way to know which file is which. (A
+            // real transcript shows one concluding, wrongly, that the second
+            // download had overwritten the first.)
             Some(&format!(
-                "URL is a {} file, not an HTML page; downloaded to cache. {}",
+                "{url} is a {} file, not an HTML page; downloaded to cache. {}",
                 kind.ext, kind.hint
             )),
             false,

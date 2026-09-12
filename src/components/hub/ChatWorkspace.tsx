@@ -44,7 +44,21 @@ export function ChatWorkspace() {
     void (async () => {
       try {
         const info = await ipc.getPendingHandoff();
-        if (mounted && info?.session_id) await useChatStore.getState().adoptSession(info);
+        if (!mounted || !info?.session_id) return;
+        if (info.spectate) {
+          // Watching a specialist, not resuming a conversation: load the
+          // delegate's transcript read-only. It has no provider/effort of its
+          // own to adopt — it is mid-run and answers to the turn that spawned
+          // it, not to this window.
+          await useChatStore
+            .getState()
+            .spectateSession(info.session_id, String(info.specialist ?? 'specialist'));
+          return;
+        }
+        // The Expand path always hands over a complete snapshot; the cast is
+        // narrowing `Partial` back to that, not inventing fields.
+        const adopt = useChatStore.getState().adoptSession;
+        await adopt(info as unknown as Parameters<typeof adopt>[0]);
       } catch {
         // No handoff (or backend briefly unreachable) — a plain chat window.
       }
@@ -121,7 +135,13 @@ export function ChatWorkspace() {
               {/* Windows has room to spell it out; Android's header is one
                   crowded row shared with the model picker, so it keeps the
                   terser "Hide"/"Artifacts" wording. */}
-              {android ? (showArtifacts ? 'Hide' : 'Artifacts') : showArtifacts ? 'Hide Artifacts' : 'Show Artifacts'}
+              {android
+                ? showArtifacts
+                  ? 'Hide'
+                  : 'Artifacts'
+                : showArtifacts
+                  ? 'Hide Artifacts'
+                  : 'Show Artifacts'}
             </button>
             {/* Routes within this hub rather than opening a window: with
                 multiple hubs open (D21) a shared Settings window would be

@@ -6,6 +6,7 @@ import { ChatTranscript } from './ChatTranscript';
 import { Composer } from './Composer';
 import { ApprovalPrompt } from './ApprovalPrompt';
 import { isAndroid } from '@/lib/platform';
+import { SubagentChip } from './SubagentChip';
 import { ChatHeaderControls } from './ChatHeaderControls';
 import { FileChips } from './FileChips';
 import { AttachmentChips } from './AttachmentChips';
@@ -47,6 +48,7 @@ export function ChatView() {
   const dismissWarning = useChatStore((s) => s.dismissWarning);
   const compactionNotice = useChatStore((s) => s.compactionNotice);
   const subagents = useChatStore((s) => s.subagents);
+  const spectating = useChatStore((s) => s.spectating);
   const dismissCompactionNotice = useChatStore((s) => s.dismissCompactionNotice);
   const loopSuspected = useChatStore((s) => s.loopSuspected);
   const dismissLoopWarning = useChatStore((s) => s.dismissLoopWarning);
@@ -163,28 +165,20 @@ export function ChatView() {
         </div>
       )}
 
-      {/* Specialists this turn delegated to. Shown because a delegate's work
-          is otherwise invisible — its tool calls never enter this transcript,
-          which is the point — and the child session id is what lets the user
-          read what it actually did when the summary was not enough. */}
+      {/* Specialists this turn delegated to.
+
+          One chip, not one per delegate: a fan-out is routinely three, and
+          three chips wrap onto multiple lines on a phone. The count is the
+          useful part; which specialist is which only matters when you want to
+          watch one, and that is a desktop affordance.
+
+          A delegate's tool calls never enter this transcript, which is the
+          point — so this tray is the only sign the work is happening at all.
+          Finished chips clear themselves after a few seconds (see
+          `SUBAGENT_LINGER_MS`). */}
       {subagents.length > 0 && (
         <div className="subagent-tray" role="status">
-          {subagents.map((s) => (
-            <span className="subagent-chip" key={s.child_session_id} title={s.error ?? undefined}>
-              <span
-                className={
-                  s.status === 'failed'
-                    ? 'status-dot bad'
-                    : s.status === 'completed'
-                      ? 'status-dot ok'
-                      : 'status-dot warn'
-                }
-              />
-              {s.specialist}
-              {s.status === 'started' && <span className="muted"> · working</span>}
-              {s.status === 'failed' && <span className="muted"> · failed</span>}
-            </span>
-          ))}
+          <SubagentChip subagents={subagents} />
         </div>
       )}
 
@@ -317,6 +311,7 @@ export function ChatView() {
         disabled={busy}
         concluded={sessionConcluded}
         sendBlocked={starting}
+        spectating={spectating}
       />
     </div>
   );

@@ -1448,6 +1448,70 @@ async fn a_fan_out_groups_its_children_under_the_parent() {
     );
 }
 
+/// A delegate is a real session, and a three-way fan-out therefore adds three
+/// of them per turn. Left in the listing, they bury the user's own
+/// conversations in Saved Chats — so the default listing shows parents only.
+/// They stay reachable by id and through `GET /api/specialists/runs`, which is
+/// what Settings -> Specialists reads.
+#[tokio::test]
+async fn the_session_listing_shows_parents_but_not_their_delegates() {
+    let state = test_state().await;
+    let parent = create_session(state.clone(), APP_A).await;
+
+    let (before_rows, before_total) =
+        bigtiny2::storage::sessions::list_sessions_page_for_app(&state.db, APP_A, 100, 0)
+            .await
+            .unwrap();
+    assert!(before_rows.iter().any(|r| r.id == parent));
+
+    let mut children = Vec::new();
+    for i in 0..3 {
+        let (status, body) = submit_job(
+            state.clone(),
+            APP_A,
+            json!({"prompt": format!("subtask {i}"), "parent_session_id": parent}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        children.push(body["session_id"].as_str().unwrap().to_string());
+    }
+
+    let (rows, total) =
+        bigtiny2::storage::sessions::list_sessions_page_for_app(&state.db, APP_A, 100, 0)
+            .await
+            .unwrap();
+
+    for c in &children {
+        assert!(
+            !rows.iter().any(|r| &r.id == c),
+            "delegate {c} leaked into the session listing"
+        );
+    }
+    assert!(
+        rows.iter().any(|r| r.id == parent),
+        "the parent must still be listed"
+    );
+
+    // `total` has to carry the same predicate as the page, or the pager
+    // promises rows it will never return - which reads as a listing that
+    // silently loses entries.
+    assert_eq!(
+        total, before_total,
+        "three delegates changed the reported total"
+    );
+    assert_eq!(
+        total,
+        rows.len() as i64,
+        "total disagrees with the rows actually returned"
+    );
+
+    // Still reachable the way Settings reads them.
+    let found = bigtiny2::storage::sessions::children_of(&state.db, &parent, APP_A)
+        .await
+        .unwrap();
+    assert_eq!(found.len(), 3, "hiding a delegate must not orphan it");
+}
+
 #[tokio::test]
 async fn an_empty_prompt_is_refused_before_a_session_is_created() {
     // Otherwise every bad request would leave an orphan session behind.

@@ -760,6 +760,57 @@ button.primary {
   border-radius: 999px;
   font-size: 12px;
   white-space: nowrap;
+  /* The tray is one chip now, whatever the fan-out — `nowrap` keeps it one
+     line on a phone, where three separate chips used to wrap. */
+  background: none;
+  color: inherit;
+  font-family: inherit;
+}
+
+/* Desktop only: the chip becomes a button that opens a delegate's window. */
+.subagent-chip.is-clickable {
+  cursor: pointer;
+}
+.subagent-chip.is-clickable:hover {
+  border-color: var(--accent);
+}
+
+.subagent-chip-wrap {
+  position: relative;
+  display: inline-flex;
+}
+
+/* Shown only when more than one delegate is running, to pick which to watch. */
+.subagent-popover {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  min-width: 160px;
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: 0 4px 16px rgb(0 0 0 / 25%);
+}
+.subagent-popover button {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: calc(var(--radius) - 2px);
+  background: none;
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+.subagent-popover button:hover {
+  background: var(--surface-2);
 }
 .composer textarea {
   flex: 1;
@@ -2678,4 +2729,62 @@ button.link {
     padding-left: calc(24px + var(--safe-left));
     padding-right: calc(24px + var(--safe-right));
   }
+}
+
+/* Settings -> Specialists: one delegate run, expandable to its transcript.
+   Delegate sessions are filtered out of Saved Chats (they would otherwise add
+   one row per fan-out, every turn), so this is where they are read. */
+.delegate-run {
+  border-bottom: 1px solid var(--border);
+}
+.delegate-run:last-child {
+  border-bottom: 0;
+}
+.delegate-run-head {
+  width: 100%;
+  align-items: center;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.delegate-run-head:hover {
+  background: var(--surface-2);
+}
+.delegate-run-caret {
+  font-size: 11px;
+}
+.delegate-run-body {
+  /* Bounded: a researcher's transcript can be dozens of turns, and this is a
+     settings pane, not a chat window. */
+  max-height: 320px;
+  overflow-y: auto;
+  padding: 4px 8px 10px 22px;
+}
+.delegate-run-msg {
+  margin-bottom: 10px;
+}
+.delegate-run-role {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.delegate-run-text {
+  font-size: 13px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.delegate-run-tools {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 4px;
+}
+.delegate-run-tool {
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-size: 11px;
 }

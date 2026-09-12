@@ -108,6 +108,17 @@ pub async fn load_session(
     crate::bigtiny::sessions::load(&app, session_id, cwd).await
 }
 
+/// Read a session's transcript without resuming it. Backs Settings ->
+/// Specialists' delegate-run accordion; see `bigtiny::sessions::transcript` for
+/// why this is not `load_session`.
+#[tauri::command]
+pub async fn fetch_session_transcript(
+    app: AppHandle,
+    session_id: String,
+) -> Result<Vec<serde_json::Value>, String> {
+    crate::bigtiny::sessions::transcript(&app, session_id).await
+}
+
 /// Fork a session, optionally truncating the copy to a branch point. Powers
 /// "Branch from here" and "Regenerate".
 #[tauri::command]

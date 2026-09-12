@@ -27,6 +27,7 @@ import type {
   Specialist,
   SpecialistInput,
   SpecialistRun,
+  TranscriptRow,
   SubagentStatusEvent,
   LocalEngineStatus,
   LocalModel,
@@ -66,13 +67,17 @@ export const ipc = {
       overlay's Expand). Distinct from `setActiveSession`/`getActiveSession`
       below, which remain in place for the unrelated provider
       context-handoff gate (Settings -> Providers). */
-  openNewChatWindow: (handoff?: (SessionInfo & Record<string, unknown>) | null) =>
+  openNewChatWindow: (handoff?: Record<string, unknown> | null) =>
     invoke<void>('open_new_chat_window', { handoff: handoff ?? null }),
   /** One-shot read of *this* window's pending handoff, if Expand created it
       with one — consumed server-side on read, so calling this twice returns
       `null` the second time. */
   getPendingHandoff: () =>
-    invoke<(SessionInfo & Record<string, unknown>) | null>('get_pending_handoff'),
+    // `Partial`, because there are two kinds of handoff and only one is a full
+    // session snapshot: Expand hands over everything, while a specialist
+    // spectate window (`SubagentChip`) hands over just the delegate's session
+    // id and a `spectate` marker and lets the new window load the rest.
+    invoke<(Partial<SessionInfo> & Record<string, unknown>) | null>('get_pending_handoff'),
   /** Feature 3 — screenshot region capture. Opens the selection window over
       a lightweight preview and resolves once the user confirms a rectangle
       (rejects on Escape/cancel); the final image is a fresh, full-resolution
@@ -229,6 +234,12 @@ export const ipc = {
   listAvailableTools: () => invoke<string[]>('list_available_tools'),
   /** What has been delegated recently, and how it went. */
   listSpecialistRuns: () => invoke<SpecialistRun[]>('list_specialist_runs'),
+  /** A session's transcript, for reading only. Deliberately not `loadSession`,
+      which *replays* a session into the open chat window by emitting the same
+      events a live turn does — right for resuming, catastrophic for peeking at
+      a delegate from Settings. See `bigtiny::sessions::transcript`. */
+  fetchSessionTranscript: (sessionId: string) =>
+    invoke<TranscriptRow[]>('fetch_session_transcript', { sessionId }),
   /** Run one from the UI, under an existing session. Goes through the same
       orchestrator as the model's own `call_specialist`, so the concurrency cap
       and depth limit apply identically. Resolves only when the delegate is

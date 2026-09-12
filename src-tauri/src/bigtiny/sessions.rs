@@ -297,6 +297,38 @@ pub(crate) fn extract_text(row: &Value) -> String {
 /// Resume a session: replay its history as the same `chat://*` events
 /// goosed's `session/load` produces (the store buffers/renders them during
 /// the call), then return the session info.
+/// A delegate's transcript, for reading — not for resuming.
+///
+/// Deliberately separate from [`load`], which *replays* a session into the UI
+/// by emitting `chat://user-message` / `chat://message-delta` / tool events.
+/// That is right for resuming a conversation and wrong for the specialist-runs
+/// accordion in Settings: reading what a delegate did must not inject its
+/// transcript into whatever chat happens to be open.
+///
+/// Returns rows oldest-first as `{role, text, tools}`, where `tools` is the
+/// names of any tool calls that turn made — enough to see the shape of the run
+/// without shipping every argument blob to the settings pane.
+pub async fn transcript(app: &AppHandle, session_id: String) -> Result<Vec<Value>, String> {
+    let client = ensure_client(app)?;
+    let rows = fetch_history(&client, &session_id).await?;
+    Ok(rows
+        .iter()
+        .map(|row| {
+            let role = row.get("role").and_then(|r| r.as_str()).unwrap_or("");
+            let tools: Vec<String> = parse_tool_calls(row)
+                .iter()
+                .filter_map(|tc| {
+                    tc.get("title")
+                        .or_else(|| tc.get("name"))
+                        .and_then(|n| n.as_str())
+                        .map(str::to_string)
+                })
+                .collect();
+            json!({ "role": role, "text": extract_text(row), "tools": tools })
+        })
+        .collect())
+}
+
 pub async fn load(app: &AppHandle, session_id: String, cwd: String) -> Result<SessionInfo, String> {
     let client = ensure_client(app)?;
     let rows = fetch_history(&client, &session_id).await?;

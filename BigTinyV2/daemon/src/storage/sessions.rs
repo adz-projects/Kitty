@@ -84,6 +84,19 @@ pub async fn is_owned_by(
 /// The `total` is scoped too. An unscoped count would leak the size of every
 /// other app's history through a pagination footer -- a small leak, but a
 /// completely gratuitous one.
+/// One page of the app's *own* sessions — the list a user browses.
+///
+/// Delegate sessions are excluded. Every `call_specialist` creates a real
+/// session (`orchestrator::run_by`), so a turn that fans out to three
+/// researchers adds three rows the user never asked for and cannot act on;
+/// left in, they bury the conversations the list exists to show. They remain
+/// first-class rows, reachable by id and through `GET /api/specialists/runs`
+/// (Settings -> Specialists) — this hides them from one listing, it does not
+/// orphan them.
+///
+/// `total` carries the same predicate as the page. Counting all sessions while
+/// returning only the parents makes the pager promise rows it will never
+/// produce, which reads as a listing that silently loses entries.
 pub async fn list_sessions_page_for_app(
     pool: &SqlitePool,
     app_id: &str,
@@ -93,17 +106,20 @@ pub async fn list_sessions_page_for_app(
     let rows = sqlx::query_as::<_, SessionRow>(
         r#"SELECT id, name, created_at, updated_at, status, metadata,
                   memory_slots, compacted_through_rowid, compaction_state, compaction_started_at
-           FROM sessions WHERE app_id = ?1 ORDER BY updated_at DESC LIMIT ?2 OFFSET ?3"#,
+           FROM sessions WHERE app_id = ?1 AND parent_session_id IS NULL
+           ORDER BY updated_at DESC LIMIT ?2 OFFSET ?3"#,
     )
     .bind(app_id)
     .bind(limit)
     .bind(offset)
     .fetch_all(pool)
     .await?;
-    let total: i64 = sqlx::query_scalar(r#"SELECT COUNT(*) FROM sessions WHERE app_id = ?"#)
-        .bind(app_id)
-        .fetch_one(pool)
-        .await?;
+    let total: i64 = sqlx::query_scalar(
+        r#"SELECT COUNT(*) FROM sessions WHERE app_id = ? AND parent_session_id IS NULL"#,
+    )
+    .bind(app_id)
+    .fetch_one(pool)
+    .await?;
     Ok((rows, total))
 }
 

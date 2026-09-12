@@ -432,6 +432,15 @@ export interface SessionAllowedDirs {
     (the daemon's `subagent_status` SSE frame). `child_session_id` is the
     delegate's own session — the click-through for when its structured report
     was not enough. */
+/** One row of a read-only transcript (`fetchSessionTranscript`). `tools` holds
+    the names of any tool calls that turn made — enough to see the shape of a
+    delegate's run without shipping every argument blob into Settings. */
+export interface TranscriptRow {
+  role: string;
+  text: string;
+  tools: string[];
+}
+
 export interface SubagentStatusEvent {
   session_id: string;
   child_session_id: string;

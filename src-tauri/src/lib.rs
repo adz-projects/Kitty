@@ -184,6 +184,7 @@ pub fn run() {
             commands::set_mode,
             commands::list_sessions,
             commands::load_session,
+            commands::fetch_session_transcript,
             commands::delete_session,
             commands::rename_session,
             commands::clear_all_sessions,
