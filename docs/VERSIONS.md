@@ -255,6 +255,52 @@ to conform to. This is a behavioral contract, not styling:
   `python plugins/build.py` overwrites them with real frozen executables —
   see `src-tauri/binaries/README.md`.
 
+## Agent-loop behaviour changes (2026-09-12)
+
+### Transient provider errors are now retried
+
+`agent.fallback.enabled` used to gate **both** retrying the provider you chose
+and failing over to a different one, and it defaults to `false` — so
+`max_attempts` was 1 and any transient error (reset connection, 502, gateway
+timeout, 429) ended the whole turn on the first try. The classification
+(`ProviderError::is_retryable`), the jittered backoff and the `Retry-After`
+floor were all already correct; only the attempt budget was missing.
+
+The two are now separate:
+
+- **Retry on the same provider** is always on (`fallback.max_retries + 1`
+  attempts, default 3 total).
+- **Failover to a different provider** still requires `fallback.enabled`. It
+  sends the conversation somewhere the user did not choose for this turn, on
+  another set of credentials, so it stays opt-in — `agent/loop_.rs` skips the
+  re-resolution entirely when it is off, rather than letting the router hand
+  back a different id.
+
+Found while investigating an Alibaba `maas.aliyuncs.com/compatible-mode/v1`
+endpoint that intermittently refused connections.
+
+### The tool-call loop guard is a nudge, not a block
+
+Kitty's frontend used to count identical tool calls within a turn and
+**decline the fifth** (`TOOL_LOOP_THRESHOLD` in `src/stores/chat/loopGuards.ts`,
+now removed along with `countToolCall`/`trackToolAlternation`).
+
+That stopped being a loop detector once the lean readers and writers went
+paged. `lean_file_read`, `lean_pdf_read_text` and `lean_doc_read_chunk` are
+*designed* to be called once per window, so reading a long document end to end
+is a legitimate run of a dozen identical-looking calls — and the guard cut it
+off mid-document. It also only ever ran for calls that paused for approval, so
+an auto-approved tool could repeat freely while an approved one could not.
+
+Replaced by `REPEAT_TOOL_NUDGE_AFTER` in
+`BigTinyV2/daemon/src/agent/loop_.rs`: after that many consecutive steps
+calling one tool, a short note is appended to the tool result asking the model
+to check whether the results already answer the question (and pointing at
+`lean_doc_search`), while explicitly saying it may continue if it genuinely
+needs the next chunk. It is in the daemon rather than the frontend because
+every call passes through there, approved or not, and because the model is the
+only party that can tell "still paging" from "stuck".
+
 ## Scraped search engines — verified surface (2026-09-11)
 
 `kitty-web` scrapes two engines. Neither is a versioned API, so this records
