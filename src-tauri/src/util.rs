@@ -166,3 +166,79 @@ mod tests {
         assert_eq!(read_lossy_line(&mut r), None);
     }
 }
+
+/// Standard base64, no line breaks.
+///
+/// Lives here rather than beside its one caller (`android::documents`, which
+/// needs what `android.util.Base64.DEFAULT` decodes) because that whole module
+/// is `cfg(target_os = "android")` — tests inside it never run on the desktop
+/// or in CI, and this is the one piece of genuinely fiddly pure logic in that
+/// path. Wrong padding is a corrupted chat export that still reports success.
+///
+/// Hand-rolled rather than taking a dependency for one call site.
+// Only Android calls this; the tests below are the point of it living here
+// rather than in that platform-gated module, so "unused" off Android is
+// expected, not a sign it can go.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
+        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+#[cfg(test)]
+mod base64_tests {
+    use super::base64_encode;
+
+    #[test]
+    fn matches_the_rfc_4648_vectors() {
+        for (input, expected) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(base64_encode(input.as_bytes()), expected, "input {input:?}");
+        }
+    }
+
+    #[test]
+    fn handles_bytes_that_are_not_utf8() {
+        assert_eq!(base64_encode(&[0xff, 0xfe, 0xfd]), "//79");
+        assert_eq!(base64_encode(&[0x00]), "AA==");
+    }
+
+    /// Length is what a truncated export would show up as first.
+    #[test]
+    fn output_length_is_always_a_multiple_of_four() {
+        for len in 0..40usize {
+            let encoded = base64_encode(&vec![0x41; len]);
+            assert_eq!(encoded.len() % 4, 0, "len {len} produced {encoded:?}");
+            assert_eq!(encoded.len(), len.div_ceil(3) * 4);
+        }
+    }
+}

@@ -572,8 +572,9 @@ function KittyToolsCard({
 /** Dedicated card for the bundled `kitty-web` server (see
     `plugins/kitty-web/`) — web scraping and the merged
     `lean_web_search`/`lean_web_search_read_chunk` web search tools (Brave
-    preference controlled separately by `BraveMcpSearchCard` below;
-    DuckDuckGo always works here with no key). The Rust replacement for the
+    preference controlled separately by `BraveMcpSearchCard` below; without a
+    key this falls back to DuckDuckGo and Bing queried together, so search
+    always works here with no credentials). The Rust replacement for the
     retired `kitty-docs-web` server's web half; on by default, no
     credentials — same shape as `KittyWasmCard`. */
 function KittyWebCard({
@@ -619,7 +620,7 @@ function KittyWebCard({
         />
       </div>
       <span className="muted ext-card-desc">
-        Lets the agent search the web and read pages, via DuckDuckGo (no key needed).
+        Lets the agent search the web and read pages, via DuckDuckGo and Bing (no key needed).
       </span>
       <BuiltinHealth health={health} onRetry={onRetry} />
       {error && <div className="chat-error">{error}</div>}
@@ -630,11 +631,11 @@ function KittyWebCard({
 /** Dedicated card for Brave search preference — this toggle does not spawn
     its own process and does not gate whether `lean_web_search` exists at
     all (it always does, via `kitty-web` — see `KittyWebCard` above — since
-    DuckDuckGo needs no key). It only controls whether `BRAVE_API_KEY` is
-    present on that server's env, which makes `lean_web_search` prefer Brave
-    (with automatic DuckDuckGo fallback) for small requests, and query both
-    engines together for broader ones. Off by default, requires a Brave
-    Search API key. Unlike every other builtin card, "enabled" and
+    the DuckDuckGo/Bing pair needs no key). It only controls whether
+    `BRAVE_API_KEY` is present on that server's env, which makes
+    `lean_web_search` prefer Brave (falling back to the key-free pair on
+    failure) for small requests, and query every engine together for broader
+    ones. Off by default, requires a Brave Search API key. Unlike every other builtin card, "enabled" and
     "configured" are tracked separately: disabling always wipes the stored
     key server-side (`ipc.setBraveMcpSearchEnabled(false)`), so the checkbox
     alone can never turn it back on — re-enabling always re-opens the API key
@@ -714,7 +715,7 @@ function BraveMcpSearchCard() {
         />
       </div>
       <span className="muted ext-card-desc">
-        Prefers Brave over DuckDuckGo for web search, using your own Brave Search API key.
+        Prefers Brave over DuckDuckGo and Bing for web search, using your own Brave Search API key.
       </span>
       {!isOn && configured && (
         <span className="muted ext-card-desc">

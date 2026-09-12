@@ -142,7 +142,7 @@ where
 impl KittyWebServer {
     #[tool(
         name = "lean_web_search",
-        description = "Searches the web. count<=5 (default): Brave if configured, DuckDuckGo only as a fallback on Brave failure. count 6-10: queries Brave AND DuckDuckGo together for broader coverage, still returned inline. count>10: same broadened fetch, but the full result set is offloaded to disk and a compact keyword index is returned instead of full detail. Every call returns a search_id; a large inline reply may be auto-downgraded to the keyword index (see \"downgraded_to_index\" in the response metadata). Follow up with lean_web_search_read_chunk for full detail on any id."
+        description = "Searches the web. count<=5 (default): Brave if configured, otherwise DuckDuckGo and Bing together. count 6-10: queries Brave AND both of DuckDuckGo and Bing for broader coverage, still returned inline. count>10: same broadened fetch, but the full result set is offloaded to disk and a compact keyword index is returned instead of full detail. Every call returns a search_id; a large inline reply may be auto-downgraded to the keyword index (see \"downgraded_to_index\" in the response metadata). Follow up with lean_web_search_read_chunk for full detail on any id."
     )]
     pub async fn web_search(&self, Parameters(req): Parameters<WebSearchRequest>) -> String {
         guarded_async(search::web_search(

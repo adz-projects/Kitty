@@ -67,12 +67,16 @@ print("OK")
     assert_eq!(v["data"]["headers"], serde_json::json!(["id", "name"]));
     assert_eq!(v["data"]["max_rows"], 4);
     assert_eq!(v["data"]["max_cols"], 2);
-    assert!(v["data"]["dimensions"].as_str().unwrap().contains('4'), "{v}");
+    assert!(
+        v["data"]["dimensions"].as_str().unwrap().contains('4'),
+        "{v}"
+    );
 }
 
 #[test]
 fn read_rows_caps_and_paginates() {
-    let path = tmp_path("big.xlsx");    run_python(&format!(
+    let path = tmp_path("big.xlsx");
+    run_python(&format!(
         r#"
 from openpyxl import Workbook
 wb = Workbook()
@@ -86,7 +90,14 @@ print("OK")
         path.display()
     ));
 
-    let first = parse(&excel_read_rows(&path.to_string_lossy(), None, None, "json", None, 0));
+    let first = parse(&excel_read_rows(
+        &path.to_string_lossy(),
+        None,
+        None,
+        "json",
+        None,
+        0,
+    ));
     assert_eq!(first["status"], "success", "{first}");
     assert_eq!(first["truncated"], true);
     assert_eq!(first["data"].as_array().unwrap().len(), 500);
@@ -129,15 +140,36 @@ print("OK")
     ));
 
     // Default picks the first sheet.
-    let v = parse(&excel_read_rows(&path.to_string_lossy(), None, None, "json", None, 0));
+    let v = parse(&excel_read_rows(
+        &path.to_string_lossy(),
+        None,
+        None,
+        "json",
+        None,
+        0,
+    ));
     assert_eq!(v["data"][0]["a"], 1);
 
     // Explicit sheet selection.
-    let v2 = parse(&excel_read_rows(&path.to_string_lossy(), Some("Second"), None, "json", None, 0));
+    let v2 = parse(&excel_read_rows(
+        &path.to_string_lossy(),
+        Some("Second"),
+        None,
+        "json",
+        None,
+        0,
+    ));
     assert_eq!(v2["data"][0]["x"], 9);
 
     // Range box on the first sheet: "A1:B2" -> headers row 1, data row 2.
-    let v3 = parse(&excel_read_rows(&path.to_string_lossy(), Some("First"), Some("A1:B2"), "json", None, 0));
+    let v3 = parse(&excel_read_rows(
+        &path.to_string_lossy(),
+        Some("First"),
+        Some("A1:B2"),
+        "json",
+        None,
+        0,
+    ));
     assert_eq!(v3["data"][0]["a"], 1);
     assert_eq!(v3["data"][0]["b"], 2);
 }
@@ -159,7 +191,14 @@ print("OK")
         path.display()
     ));
 
-    let v = parse(&excel_read_rows(&path.to_string_lossy(), None, None, "csv", None, 0));
+    let v = parse(&excel_read_rows(
+        &path.to_string_lossy(),
+        None,
+        None,
+        "csv",
+        None,
+        0,
+    ));
     assert_eq!(v["status"], "success", "{v}");
     let csv = v["data"].as_str().unwrap();
     assert!(csv.contains("id,name"), "got: {csv}");
@@ -169,7 +208,8 @@ print("OK")
 
 #[test]
 fn read_rows_errors() {
-    let dir = std::env::temp_dir().join(format!("kitty-tools-excel-missing-{}", std::process::id()));
+    let dir =
+        std::env::temp_dir().join(format!("kitty-tools-excel-missing-{}", std::process::id()));
     let not_found = excel_read_rows(
         dir.join("does-not-exist.xlsx").to_str().unwrap(),
         None,
@@ -198,4 +238,3 @@ print("OK")
     let v2 = parse(&bad_sheet);
     assert_eq!(v2["error_code"], "XLSX_BAD_SHEET");
 }
-

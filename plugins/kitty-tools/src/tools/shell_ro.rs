@@ -373,7 +373,10 @@ mod tests {
             "head -n 50 docs/README.md",
             "wc -l src/lib.rs",
         ] {
-            assert!(validate_read_only(fine).is_ok(), "{fine:?} should be permitted");
+            assert!(
+                validate_read_only(fine).is_ok(),
+                "{fine:?} should be permitted"
+            );
         }
     }
 
@@ -405,7 +408,11 @@ mod tests {
     /// No shell metacharacter, no forbidden command name, arbitrary execution.
     #[test]
     fn options_that_run_something_else_are_refused() {
-        for bad in ["rg --pre evil pattern", "rg --pre=evil pattern", "tree -o out.txt"] {
+        for bad in [
+            "rg --pre evil pattern",
+            "rg --pre=evil pattern",
+            "tree -o out.txt",
+        ] {
             let err = validate_read_only(bad).unwrap_err();
             assert!(
                 err.contains("can run or write something"),

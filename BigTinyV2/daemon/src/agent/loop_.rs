@@ -677,6 +677,34 @@ fn derive_title(text: &str) -> String {
 /// passes the word cap untouched).
 const MAX_TITLE_WORDS: usize = 5;
 
+/// Consecutive steps calling the same tool before the model is reminded to
+/// check whether it still needs it.
+///
+/// This replaced a hard block. Kitty's frontend used to *decline* the fifth
+/// identical call outright, on the theory that a model repeating one tool is
+/// stuck. That theory stopped holding once the lean readers and writers went
+/// paged: `lean_file_read`, `lean_pdf_read_text` and `lean_doc_read_chunk`
+/// are *designed* to be called once per window, so reading a long document
+/// end to end is a legitimate run of a dozen identical-looking calls, and the
+/// guard cut it off mid-document. The block also only ever fired on calls
+/// that paused for approval, so it was inconsistent as well as wrong.
+///
+/// A nudge is the right shape for this: the failure it guards against is the
+/// model not noticing it already has what it needs, and the fix for that is
+/// telling it to look — not removing its ability to continue. A model that
+/// genuinely needs the next chunk reads the note and carries on.
+const REPEAT_TOOL_NUDGE_AFTER: u32 = 5;
+
+/// The note appended to a tool result once the same tool has been called
+/// `REPEAT_TOOL_NUDGE_AFTER` steps in a row.
+fn repeat_tool_nudge(tool_name: &str, runs: u32) -> String {
+    format!(
+        "
+
+[note] You have called `{tool_name}` {runs} times in a row this turn.          Before calling it again, check whether the results above already answer the          question — a paged reader returns a document_id and a window, so what you need          may already be in hand, and lean_doc_search can find a specific passage without          paging to it. If you have what you need, stop calling this tool and continue          with the task. If you genuinely need the next chunk, carry on: this is a          reminder, not a limit."
+    )
+}
+
 /// Keep at most [`MAX_TITLE_WORDS`] words, marking the cut with an ellipsis
 /// so a clipped title doesn't read as a complete one. Also collapses runs of
 /// whitespace, since it rebuilds the string from its words.
@@ -845,6 +873,28 @@ fn sanitize_title(raw: &str) -> String {
     let trimmed = strip_leading_attachment_markers(trimmed);
     let collapsed = truncate_title_words(&trimmed);
     truncate_title(&collapsed)
+}
+
+#[cfg(test)]
+mod repeat_nudge_tests {
+    use super::repeat_tool_nudge;
+
+    #[test]
+    fn the_nudge_names_the_tool_and_does_not_forbid_another_call() {
+        let note = repeat_tool_nudge("lean_pdf_read_text", 5);
+        assert!(note.contains("lean_pdf_read_text"));
+        assert!(note.contains('5'));
+        // The whole point of replacing the old hard block: paging through a
+        // long document is legitimate, so the note must leave that open.
+        assert!(
+            note.contains("carry on") && note.contains("not a limit"),
+            "the nudge must not read as a prohibition: {note}"
+        );
+        // Its own lines, so it cannot be mistaken for the tool's own output.
+        assert!(note.starts_with("
+
+[note]"));
+    }
 }
 
 #[cfg(test)]
@@ -1921,6 +1971,11 @@ impl AgentLoop {
             .map(ResponseSpec::schema)
             .unwrap_or_default();
         let mut step: i64 = 0;
+        // Tracks a run of steps that all called the same single tool, for
+        // `REPEAT_TOOL_NUDGE_AFTER`. Per turn, like every other loop guard
+        // here: repeating a tool across separate turns is ordinary use.
+        let mut repeat_tool: Option<String> = None;
+        let mut repeat_runs: u32 = 0;
         // Wrap-up valve state, alongside the other survives-iterations values
         // below. `wrapup_issued` is a belt against re-injecting on a later
         // iteration; the unconditional `break` in the completion block is the
@@ -2368,17 +2423,27 @@ impl AgentLoop {
             let mut provider_id = provider_id;
             let mut provider_model = turn_provider_model.clone();
 
-            // Retry/failover: a transient error (timeout, 5xx, rate limit)
-            // used to end the whole turn on the first failure — dead
-            // `fallback` config despite the router already tracking
-            // multiple providers by `fallback_priority` for exactly this.
-            // `enabled=false` (the default) preserves the old one-shot
-            // behavior exactly (`max_attempts == 1`).
-            let max_attempts = if self.fallback_cfg.enabled {
-                self.fallback_cfg.max_retries + 1
-            } else {
-                1
-            };
+            // Retry and failover are two different decisions and are no
+            // longer taken by one switch.
+            //
+            // **Retrying the same provider** after a transient error (a reset
+            // connection, a 502, a gateway timeout, a 429) is what any HTTP
+            // client should do, and it is what a flaky endpoint needs: the
+            // request that failed was fine, the network moment was not.
+            // Reaching a hosted endpoint that intermittently refuses — the
+            // reported case was an Alibaba `compatible-mode/v1` region —
+            // otherwise ends the user's whole turn on the first hiccup, with
+            // no attempt to simply ask again. The classification
+            // (`is_retryable`), the jittered backoff and the `Retry-After`
+            // floor below were all already built and correct; only the
+            // attempt budget was missing, because it was tied to a setting
+            // about something else.
+            //
+            // **Failing over to a different provider** is a different matter:
+            // it sends the conversation somewhere the user did not choose for
+            // this turn, on someone else's credentials and bill. That stays
+            // opt-in, gated on `fallback.enabled` at the re-resolution below.
+            let max_attempts = self.fallback_cfg.max_retries + 1;
             let mut attempt = 0u32;
             let turn_result = loop {
                 attempt += 1;
@@ -2624,6 +2689,16 @@ impl AgentLoop {
                         // the one that just failed unhealthy (or another
                         // provider outranks it), this can pick a different
                         // one; otherwise it retries the same provider.
+                        //
+                        // Skipped entirely when failover is off: the retry
+                        // above still happens, it just goes back to the
+                        // provider the user picked. Re-resolving anyway would
+                        // reintroduce the cross-provider switch through the
+                        // back door, since the router is free to return a
+                        // different id.
+                        if !self.fallback_cfg.enabled {
+                            continue;
+                        }
                         if let Ok(next_id) = self.resolve_provider(session_id, None).await {
                             // A failover that lands on a denied model is not a
                             // failover, it is the bypass. Staying put and
@@ -2966,10 +3041,40 @@ impl AgentLoop {
                 )
                 .await;
 
-            for (tc, result) in turn_tool_calls.iter().zip(tool_results) {
+            // A step that called exactly one distinct tool continues (or
+            // starts) a run; a step that fanned out across several tools is
+            // not the shape this is about and resets it.
+            let distinct: std::collections::BTreeSet<&str> = turn_tool_calls
+                .iter()
+                .filter_map(|tc| tc.function.get("name").and_then(|v| v.as_str()))
+                .collect();
+            let single = (distinct.len() == 1).then(|| distinct.iter().next().copied().unwrap_or(""));
+            match single {
+                Some(name) if repeat_tool.as_deref() == Some(name) => repeat_runs += 1,
+                Some(name) => {
+                    repeat_tool = Some(name.to_string());
+                    repeat_runs = 1;
+                }
+                None => {
+                    repeat_tool = None;
+                    repeat_runs = 0;
+                }
+            }
+            // Appended to the last result only: the note is for the model's
+            // next decision, and repeating it on every result of a fan-out
+            // step would just spend context saying the same thing.
+            let nudge = (repeat_runs >= REPEAT_TOOL_NUDGE_AFTER)
+                .then(|| repeat_tool.as_deref().map(|t| repeat_tool_nudge(t, repeat_runs)))
+                .flatten();
+            let last = turn_tool_calls.len().saturating_sub(1);
+            for (idx, (tc, result)) in turn_tool_calls.iter().zip(tool_results).enumerate() {
+                let content = match (&nudge, idx == last) {
+                    (Some(note), true) => format!("{result}{note}"),
+                    _ => result,
+                };
                 messages.push(json!({
                     "role": "tool",
-                    "content": result,
+                    "content": content,
                     "tool_call_id": tc.id,
                 }));
             }

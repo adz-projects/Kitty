@@ -3,7 +3,7 @@ name = "kitty-web"
 version = "0.1.0"
 edition = "2021"
 publish = false
-description = "Web search (Brave-preferred, DuckDuckGo fallback) and page scraping — the Rust replacement for kitty-docs-web's three web tools. See docs/PLUGINS.md."
+description = "Web search (Brave-preferred; DuckDuckGo + Bing co-equal when key-free) and page scraping — the Rust replacement for kitty-docs-web's three web tools. See docs/PLUGINS.md."
 
 # Standalone package, NOT a workspace member of src-tauri — same rationale as
 # `plugins/kitty-tools/Cargo.toml` (MSRV isolation for rmcp; `[profile.*]` is
@@ -33,6 +33,9 @@ regex = "1"
 dirs = "5"
 url = "2"
 rand = "0.8"
+# Bing wraps every result URL as `bing.com/ck/a?…&u=a1<base64url>`; decoding it
+# back to the real target is the whole reason this is here.
+base64 = "0.22"
 # `default-features = false` is load-bearing, not tidiness: reqwest's default
 # `default-tls` pulls in native-tls (schannel on Windows, OpenSSL elsewhere),
 # and OpenSSL cross-compilation is the classic Android build failure. Same
@@ -51,7 +54,9 @@ htmd = "0.2"
 ego-tree = "0.10"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+# `test-util` gives `#[tokio::test(start_paused = true)]` a virtual clock, so
+# `ratelimit`'s pacing tests assert real timings without real sleeps.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "test-util"] }
 
 [profile.release]
 opt-level = "z"

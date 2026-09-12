@@ -15,6 +15,7 @@
 pub mod envelope;
 pub mod paths;
 pub mod query_filter;
+pub mod ratelimit;
 pub mod scrape;
 pub mod search;
 pub mod server;

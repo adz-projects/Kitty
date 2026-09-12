@@ -54,12 +54,21 @@ pub const LIST_TOOL: &str = "list_specialists";
 /// Both do: neither can be answered without knowing which app is asking.
 pub const SESSION_SCOPED_TOOLS: [&str; 2] = [CALL_TOOL, LIST_TOOL];
 
-/// Most refs one call may fan out over.
+/// Absolute ceiling on refs one call may fan out over.
 ///
 /// A model handed a directory listing will happily pass all of it, and each ref
 /// is a full paid agent run — so this is a spend guard, not an efficiency one.
 /// Refused above the cap rather than truncated: silently doing part of the work
 /// is worse than saying the request was too big.
+///
+/// This is only the outer bound. The binding limit is usually
+/// `Orchestrator::completable_fan_out()` — `max_concurrent_specialists` times
+/// the number of deadline waves, which at default config is **9**, not 32.
+/// Refusing on this constant alone left everything between the two enforced by
+/// the batch deadline instead, which does exactly the silent partial work the
+/// paragraph above rejects: pass twenty sources and eleven come back saying
+/// "the batch ran out of time before this source was reached", with no single
+/// message anywhere saying the request was too big.
 const MAX_FAN_OUT: usize = 32;
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -144,7 +153,8 @@ fields from many documents into rows); `analyst` (computes figures from spreadsh
 the method). Call `list_specialists` if none of those fit — the user may have defined others. \
 Pass document ids and paths in `refs` rather than pasting content into `request`; the specialist \
 shares your document cache. `summarizer` and `extractor` run one instance per ref, so passing \
-ten documents processes them in parallel and returns one result per document. You can also \
+several documents processes them in parallel and returns one result per document; pass \
+more than the limit and the call is refused outright rather than partly served. You can also \
 issue several call_specialist calls in a single step and they will run at the same time. Do \
 not delegate work that needs this conversation's context, and do not delegate anything you \
 can answer directly."
@@ -197,10 +207,14 @@ can answer directly."
         // a step's calls concurrently, but only when the model knows how many
         // there are, and the usual case is a folder or a search result.
         let fan_out = spec.fan_out.as_deref() == Some("per_ref") && refs.len() > 1;
-        if fan_out && refs.len() > MAX_FAN_OUT {
+        // The smaller of the spend ceiling and what the limiter plus the batch
+        // deadline can actually get through.
+        let fan_out_cap = self.orchestrator.completable_fan_out().min(MAX_FAN_OUT);
+        if fan_out && refs.len() > fan_out_cap {
             return Self::refuse(format!(
-                "{} sources is more than one call may fan out over (limit {MAX_FAN_OUT}). \
-                 Narrow the list, or call the specialist more than once.",
+                "{} sources is more than one call may fan out over (limit {fan_out_cap}). \
+                 Narrow the list, or call the specialist more than once. Raising \
+                 `agent.max_concurrent_specialists` raises this limit.",
                 refs.len()
             ));
         }

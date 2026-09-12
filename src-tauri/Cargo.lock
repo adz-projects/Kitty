@@ -3604,7 +3604,7 @@ dependencies = [
 
 [[package]]
 name = "kitty"
-version = "0.10.3"
+version = "0.10.4"
 dependencies = [
  "base64 0.22.1",
  "bigtiny2-client",
@@ -3628,7 +3628,6 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-clipboard-manager",
  "tauri-plugin-dialog",
- "tauri-plugin-fs",
  "tauri-plugin-global-shortcut",
  "tauri-plugin-notification",
  "tauri-plugin-opener",
@@ -3685,6 +3684,7 @@ name = "kitty-web"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "dirs 5.0.1",
  "ego-tree",
  "htmd",

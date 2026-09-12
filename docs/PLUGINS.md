@@ -127,11 +127,21 @@ prompt-visible contract.
 
 **`kitty-web`** replaces `kitty-docs-web`'s three web tools (`lean_web_search`,
 `lean_web_search_read_chunk`, `lean_web_scrape`), preserving the count-tiered
-Brave/DuckDuckGo behavior and the offload/keyword-index modes. Two deliberate
+Brave-preferred behavior and the offload/keyword-index modes. Two deliberate
 substitutions: `ddgs` has no Rust equivalent, so DuckDuckGo is scraped from its
 own no-JS HTML endpoint (`parse_ddg_html` is written to degrade, not fail, when
 that markup drifts — and `tests/live.rs` is how the drift gets noticed); and
 `trafilatura` is replaced by `scraper` boilerplate-stripping plus `htmd`.
+
+One addition beyond the Python original: **Bing is scraped as a co-equal
+key-free engine** alongside DuckDuckGo, and `src/ratelimit.rs` paces both
+process-wide. DuckDuckGo challenges an unauthenticated scrape under concurrent
+load and serves that challenge with **HTTP 202**, which passes
+`is_success()` — so it used to parse as a real page with no results and get
+reported to the model as `NO_RESULTS` ("try a broader query"), which made the
+model reword and retry and drove the challenge rate higher still. A scraped
+engine's failure must be reported as `blocked`, and one scraped engine is not
+a dependable tier on its own.
 `output_format="text"` is honored by rendering the extracted Markdown to plain
 text (`scrape::markdown_to_text`).
 

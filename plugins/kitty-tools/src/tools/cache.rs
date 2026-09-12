@@ -17,6 +17,19 @@ use serde_json::json;
 /// truncated (with the `truncated` flag set) instead of materialized whole.
 const CACHE_MAX_BYTES: u64 = 4 * 1024 * 1024;
 
+/// How recently a cached file must have been touched for `cache_clear` to
+/// leave it alone.
+///
+/// This cache is shared by every session and every delegate of a fan-out —
+/// one `kitty-tools` process serves them all. `lean_web_scrape` downloads a
+/// document here and hands back a `cached_path` for a *later* tool call to
+/// read, so a delegate that clears the cache in between deletes a file another
+/// delegate is still holding a path to, and that second delegate fails on a
+/// file it was explicitly told to read. An age floor keeps the tool useful for
+/// its actual purpose (reclaiming space from old downloads) while making it
+/// unable to disturb work in flight.
+const CLEAR_GRACE: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
 /// Windows device basenames (compared case-insensitively, up to the first
 /// dot): joining `NUL` or `CON.txt` under the cache dir opens the *device*,
 /// not a file inside it (audit #126).
@@ -182,24 +195,84 @@ pub fn cache_delete(filename: &str) -> String {
 }
 
 pub fn cache_clear() -> String {
-    let dir = cache_dir();
+    cache_clear_in(cache_dir(), std::time::SystemTime::now())
+}
+
+fn cache_clear_in(dir: std::path::PathBuf, now: std::time::SystemTime) -> String {
     let mut count = 0u32;
+    let mut kept = 0u32;
     if dir.exists() {
         if let Ok(rd) = std::fs::read_dir(&dir) {
             for entry in rd.filter_map(|e| e.ok()) {
                 let p = entry.path();
-                if p.is_file() && std::fs::remove_file(&p).is_ok() {
+                if !p.is_file() {
+                    continue;
+                }
+                // Unreadable mtime is treated as recent: the whole point is
+                // not to delete something another delegate is using, so the
+                // safe guess is the one that keeps the file.
+                let recent = entry
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .map(|m| {
+                        now.duration_since(m)
+                            .map(|age| age < CLEAR_GRACE)
+                            .unwrap_or(true)
+                    })
+                    .unwrap_or(true);
+                if recent {
+                    kept += 1;
+                    continue;
+                }
+                if std::fs::remove_file(&p).is_ok() {
                     count += 1;
                 }
             }
         }
     }
-    success_response(json!({"files_removed": count}), None, false, None)
+    let message = (kept > 0).then(|| {
+        format!(
+            "Kept {kept} file(s) modified in the last 15 minutes — another task may still              be reading them."
+        )
+    });
+    success_response(
+        json!({"files_removed": count, "files_kept_recent": kept}),
+        message.as_deref(),
+        false,
+        None,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clear_keeps_files_another_delegate_may_still_be_reading() {
+        let dir = std::env::temp_dir().join(format!("kt-cache-clear-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("fresh.txt"), "just downloaded").unwrap();
+        std::fs::write(dir.join("stale.txt"), "from an hour ago").unwrap();
+
+        // Age only `stale.txt`, by asking the clear to run from a point far
+        // enough in the future that the grace window has passed for it.
+        let now = std::time::SystemTime::now();
+        let out = cache_clear_in(dir.clone(), now);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["data"]["files_removed"], 0, "nothing is old enough yet");
+        assert_eq!(v["data"]["files_kept_recent"], 2);
+        assert!(dir.join("fresh.txt").exists());
+
+        // Now run it as though the grace period had elapsed.
+        let later = now + CLEAR_GRACE + std::time::Duration::from_secs(1);
+        let out = cache_clear_in(dir.clone(), later);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["data"]["files_removed"], 2);
+        assert_eq!(v["data"]["files_kept_recent"], 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn traversal_attempt_is_rejected() {

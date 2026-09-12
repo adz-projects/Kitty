@@ -6,12 +6,13 @@
 //! string, and the model's prompt-visible contract is the JSON envelope, so
 //! both are load-bearing (see `docs/PLUGINS.md`).
 //!
-//! Tiering, unchanged from Python:
-//! - `count <= NORMAL_MAX_COUNT` (5): Brave if configured, DuckDuckGo only as
-//!   a fallback *on Brave failure*. Inline, full detail.
-//! - `count <= EXPANDED_MAX_COUNT` (10): Brave AND DuckDuckGo queried
-//!   concurrently regardless of whether Brave succeeds — "expansion" means
-//!   broader source coverage, not lexical query variants. Still inline.
+//! Tiering:
+//! - `count <= NORMAL_MAX_COUNT` (5): Brave if configured; otherwise (or on
+//!   Brave failure) the key-free pair, DuckDuckGo and Bing, queried together.
+//!   Inline, full detail.
+//! - `count <= EXPANDED_MAX_COUNT` (10): Brave AND both key-free engines
+//!   queried concurrently regardless of whether Brave succeeds — "expansion"
+//!   means broader source coverage, not lexical query variants. Still inline.
 //! - `count > EXPANDED_MAX_COUNT`: same dual-engine fetch, but the full set is
 //!   offloaded to disk and a compact keyword index is returned instead.
 //!
@@ -23,6 +24,13 @@
 //! is what `ddgs` does under the hood too, but it means DuckDuckGo markup
 //! changes are now this crate's problem — `parse_ddg_html` is deliberately
 //! tolerant (see its doc comment) and pinned by fixture tests.
+//!
+//! Bing is scraped the same way and for a specific reason: DuckDuckGo answers
+//! an unauthenticated scrape with a **bot challenge** under load, and did so
+//! for every request in a six-way parallel test. One scraped engine is not a
+//! dependable key-free tier, so there are two, queried together, plus
+//! `ratelimit`'s process-wide pacing to keep parallel specialists from
+//! provoking the challenge in the first place.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -40,7 +48,25 @@ pub const MANIFEST_TITLE_MAX_CHARS: usize = 60;
 pub const INLINE_SNIPPET_MAX_CHARS: usize = 320;
 pub const INLINE_RESPONSE_MAX_CHARS: usize = 8000;
 pub const READ_CHUNK_MAX_CHARS: usize = 20000;
-pub const MAX_OFFLOAD_FILES: usize = 20;
+/// How many stored searches are retained.
+///
+/// Was 20, sized for one agent asking one question at a time. A fan-out runs
+/// many delegates through this one process at once and each may search
+/// repeatedly, so 20 is reached within a single parent turn — and the file a
+/// delegate is about to read is exactly the kind that gets evicted. These are
+/// small JSON blobs; the cap exists to stop unbounded growth, not to be tight.
+pub const MAX_OFFLOAD_FILES: usize = 100;
+
+/// How recently a stored search must have been written to be safe from
+/// pruning, regardless of the count cap.
+///
+/// The count cap alone cannot tell "old" from "in flight". Every search hands
+/// the model a `search_id` and invites a later `lean_web_search_read_chunk`
+/// call against it, so a concurrent delegate's search can delete a handle
+/// another delegate is still holding — which surfaces as `SEARCH_ID_NOT_FOUND`
+/// on an id the model was given moments earlier. Age is the discriminator the
+/// count cannot supply.
+pub const OFFLOAD_GRACE: Duration = Duration::from_secs(15 * 60);
 pub const MAX_RATE_LIMIT_RETRIES: u32 = 2;
 pub const BASE_BACKOFF_SECONDS: f64 = 1.5;
 /// Ceiling on a server-supplied `Retry-After`. The header is a number chosen
@@ -53,6 +79,10 @@ pub const READ_CHUNK_MAX_IDS: usize = 5;
 const BRAVE_ENDPOINT: &str = "https://api.search.brave.com/res/v1/llm/context";
 /// DuckDuckGo's no-JS HTML endpoint — the same one `ddgs` drives.
 const DDG_ENDPOINT: &str = "https://html.duckduckgo.com/html/";
+/// Bing's ordinary results page. Scraped, not an API: Microsoft retired the
+/// standalone Bing Search API, so there is no keyed alternative to fall back
+/// to for this engine.
+const BING_ENDPOINT: &str = "https://www.bing.com/search";
 
 /// One search result, in the shape the Python dicts used. `snippet_full` is
 /// offload-only and is never serialized inline (see `inline_view`).
@@ -170,6 +200,44 @@ impl BraveFailure {
             | Self::Network(d)
             | Self::Api(d)
             | Self::InvalidQuery(d) => d,
+        }
+    }
+}
+
+/// Why a scraped engine (DuckDuckGo, Bing) failed.
+///
+/// `Blocked` is the one that matters. An unauthenticated scrape gets refused
+/// by a bot challenge, not by an error status — DuckDuckGo serves its
+/// challenge page with **HTTP 202**, which `is_success()` happily accepts.
+/// Parsing that page finds no results and looks exactly like a query that
+/// genuinely matched nothing, so before this existed the tool reported
+/// `NO_RESULTS` and told the model to try a broader query. The model then
+/// reworded and retried, which raised the request rate, which raised the
+/// challenge rate. Distinguishing "refused" from "matched nothing" is what
+/// stops that loop.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ScrapeFailure {
+    /// A bot challenge, an anomaly page, or a rate-limit refusal.
+    Blocked(String),
+    Network(String),
+    Http(u16),
+}
+
+impl ScrapeFailure {
+    /// The short string recorded in the response's `metadata.engines` map,
+    /// matching `BraveFailure::kind`'s vocabulary so the map stays uniform.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Blocked(_) => "blocked",
+            Self::Network(_) => "network",
+            Self::Http(_) => "http_error",
+        }
+    }
+
+    pub fn detail(&self) -> String {
+        match self {
+            Self::Blocked(d) | Self::Network(d) => d.clone(),
+            Self::Http(code) => format!("HTTP {code}"),
         }
     }
 }
@@ -580,6 +648,117 @@ pub fn parse_ddg_html(html: &str, count: usize) -> Vec<SearchItem> {
     out
 }
 
+/// Markers unique to DuckDuckGo's bot-challenge / anomaly page.
+///
+/// Only ever consulted for a response that parsed to **zero** results (see
+/// `ddg_query`). That ordering is the safety property: a page we successfully
+/// pulled results out of is a real results page whatever strings it happens to
+/// contain, so this can never demote a working search to a failure.
+pub fn ddg_challenge_marker(html: &str) -> bool {
+    html.contains("anomaly.js") || html.contains("cc=botnet") || html.contains("challenge-form")
+}
+
+/// Unwraps Bing's `bing.com/ck/a?…&u=a1<base64url>` click-tracking wrapper.
+///
+/// Returns the input unchanged when it isn't a wrapper or the payload won't
+/// decode — a tracking URL that still resolves beats dropping the result.
+fn unwrap_bing_redirect(href: &str) -> String {
+    use base64::Engine as _;
+
+    let Ok(parsed) = url::Url::parse(href) else {
+        return href.to_string();
+    };
+    let Some((_, encoded)) = parsed.query_pairs().find(|(k, _)| k == "u") else {
+        return href.to_string();
+    };
+    // The payload carries a one-byte format tag; `a1` is base64url. Anything
+    // else is a shape we don't know how to read.
+    let Some(payload) = encoded.strip_prefix("a1") else {
+        return href.to_string();
+    };
+    match base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload) {
+        Ok(bytes) => String::from_utf8(bytes).unwrap_or_else(|_| href.to_string()),
+        Err(_) => href.to_string(),
+    }
+}
+
+/// Parses Bing's results page.
+///
+/// Same deliberate tolerance as `parse_ddg_html`: selects on the long-stable
+/// `.b_algo` / `.b_caption` class names and skips any result it can't get a
+/// usable URL out of, so a Bing markup change degrades to "fewer/no Bing
+/// results" rather than a hard error. Ad containers (`b_ad`) are skipped.
+pub fn parse_bing_html(html: &str, count: usize) -> Vec<SearchItem> {
+    use scraper::{Html, Selector};
+
+    let document = Html::parse_document(html);
+    let (Ok(result_sel), Ok(link_sel), Ok(snippet_sel), Ok(cite_sel)) = (
+        Selector::parse("li.b_algo"),
+        Selector::parse("h2 a"),
+        Selector::parse(".b_caption p, p.b_lineclamp2, div.b_lineclamp2"),
+        Selector::parse("cite"),
+    ) else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    for element in document.select(&result_sel) {
+        if out.len() >= count {
+            break;
+        }
+        if element.value().attr("class").unwrap_or("").contains("b_ad") {
+            continue;
+        }
+
+        let Some(link) = element.select(&link_sel).next() else {
+            continue;
+        };
+        let Some(href) = link.value().attr("href") else {
+            continue;
+        };
+        let target = unwrap_bing_redirect(href);
+        if !target.starts_with("http") {
+            continue;
+        }
+
+        let title = link.text().collect::<String>().trim().to_string();
+        let body = element
+            .select(&snippet_sel)
+            .next()
+            .map(|s| s.text().collect::<String>().trim().to_string())
+            .unwrap_or_default();
+
+        let clean_url = strip_tracking_params(&target);
+        // `domain_of` reads the real URL; the visible `<cite>` is only a
+        // fallback for a wrapper we failed to unwrap.
+        let mut domain = domain_of(&clean_url);
+        // `domain_of` keeps the host verbatim, so an undecoded wrapper shows
+        // up as `www.bing.com` rather than `bing.com`.
+        if domain.is_empty() || domain == "bing.com" || domain.ends_with(".bing.com") {
+            if let Some(cite) = element.select(&cite_sel).next() {
+                let text = cite.text().collect::<String>();
+                let shown = text.split_whitespace().next().unwrap_or("").to_string();
+                if !shown.is_empty() {
+                    domain = domain_of(&shown);
+                }
+            }
+        }
+
+        let (snippet, snippet_full) = split_snippet(&body, &body);
+        out.push(SearchItem {
+            id: 0,
+            title,
+            domain,
+            url: clean_url,
+            date: None,
+            snippet,
+            snippet_full,
+            engine: "bing".to_string(),
+        });
+    }
+    out
+}
+
 /// ~150 common English stopwords, filtered out before frequency-counting a
 /// result's title+snippet. Frequency-based (TF), not LSA: at this scale (a
 /// handful of short blurbs) there isn't enough text for SVD to find real
@@ -671,15 +850,33 @@ fn inline_view(results: &[SearchItem]) -> Value {
     Value::Array(results.iter().map(|r| r.to_inline_json()).collect())
 }
 
-/// Merges Brave-first then DuckDuckGo-only results, deduping on
-/// `normalize_url_key`.
-pub fn merge_dedup(brave: Vec<SearchItem>, ddg: Vec<SearchItem>) -> Vec<SearchItem> {
+/// Merges Brave's results (always first, when configured) with the key-free
+/// co-equal engines, deduping on `normalize_url_key`.
+///
+/// The co-equal lists are **round-robined**, not concatenated. Concatenating
+/// would make whichever engine happened to be listed first own the entire head
+/// of the result set, and the head is what a `count<=5` search actually
+/// returns — so "co-equal" would quietly mean "DuckDuckGo, plus Bing if you
+/// scroll". Interleaving keeps both engines represented in the part the model
+/// reads. First-seen wins on a duplicate URL, so an engine only ever loses a
+/// position it was going to duplicate anyway.
+pub fn merge_dedup(brave: Vec<SearchItem>, coequal: Vec<Vec<SearchItem>>) -> Vec<SearchItem> {
     let mut seen: HashSet<String> = brave.iter().map(|r| normalize_url_key(&r.url)).collect();
     let mut merged = brave;
-    for item in ddg {
-        let key = normalize_url_key(&item.url);
-        if seen.insert(key) {
-            merged.push(item);
+
+    let mut cursors: Vec<std::vec::IntoIter<SearchItem>> =
+        coequal.into_iter().map(|v| v.into_iter()).collect();
+    let mut exhausted = false;
+    while !exhausted {
+        exhausted = true;
+        for cursor in &mut cursors {
+            let Some(item) = cursor.next() else {
+                continue;
+            };
+            exhausted = false;
+            if seen.insert(normalize_url_key(&item.url)) {
+                merged.push(item);
+            }
         }
     }
     merged
@@ -709,12 +906,11 @@ fn offload_path(search_id: &str) -> PathBuf {
     search_store_dir().join(format!("search-{search_id}.json"))
 }
 
-fn prune_old_offloads() {
-    let dir = search_store_dir();
+fn prune_old_offloads_in(dir: &std::path::Path, now: std::time::SystemTime) {
     if !dir.exists() {
         return;
     }
-    let Ok(entries) = std::fs::read_dir(&dir) else {
+    let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     let mut files: Vec<(std::time::SystemTime, PathBuf)> = entries
@@ -728,8 +924,17 @@ fn prune_old_offloads() {
     // Newest first, so `skip(MAX_OFFLOAD_FILES - 1)` below drops the oldest.
     files.sort_by_key(|(mtime, _)| std::cmp::Reverse(*mtime));
     // -1: room for the new file about to be written.
-    for (_, stale) in files.into_iter().skip(MAX_OFFLOAD_FILES.saturating_sub(1)) {
-        let _ = std::fs::remove_file(stale);
+    for (mtime, stale) in files.into_iter().skip(MAX_OFFLOAD_FILES.saturating_sub(1)) {
+        // A file whose age cannot be established (unreadable clock, mtime in
+        // the future) is kept: deleting a handle still in use is the expensive
+        // mistake, keeping one file too long is not.
+        let old_enough = now
+            .duration_since(mtime)
+            .map(|age| age >= OFFLOAD_GRACE)
+            .unwrap_or(false);
+        if old_enough {
+            let _ = std::fs::remove_file(stale);
+        }
     }
 }
 
@@ -766,7 +971,10 @@ fn write_offload_to(
     results: &[SearchItem],
 ) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("could not create {}: {e}", dir.display()))?;
-    prune_old_offloads();
+    // `dir`, not `search_store_dir()`: the split exists so a test can drive
+    // this against a directory of its own, and pruning the *real* store from
+    // a test run would be both wrong and surprising.
+    prune_old_offloads_in(dir, std::time::SystemTime::now());
     let payload = json!({
         "search_id": search_id,
         "query": query,
@@ -780,6 +988,29 @@ fn write_offload_to(
 // ---------------------------------------------------------------------------
 // Network calls
 // ---------------------------------------------------------------------------
+
+/// The `metadata.engines` map, pre-seeded with every engine.
+///
+/// Seeding matters for correctness, not tidiness: `web_search` decides between
+/// `NO_RESULTS` and `ALL_ENGINES_FAILED` by looking for at least one `"ok"` in
+/// this map, so an engine that is missing entirely and one that succeeded must
+/// never be indistinguishable.
+fn new_diagnostics() -> HashMap<String, String> {
+    HashMap::from([
+        ("brave".to_string(), "not_configured".to_string()),
+        ("duckduckgo".to_string(), "not_queried".to_string()),
+        ("bing".to_string(), "not_queried".to_string()),
+    ])
+}
+
+/// Jittered exponential backoff for retry `attempt` (0-based).
+///
+/// Returns the delay rather than sleeping: `rand::thread_rng()` is not `Send`,
+/// so the RNG must be dropped before any `.await`.
+fn backoff_seconds(attempt: u32) -> f64 {
+    use rand::Rng;
+    BASE_BACKOFF_SECONDS * 2f64.powi(attempt as i32) + rand::thread_rng().gen_range(0.0..0.5)
+}
 
 fn brave_api_key() -> String {
     std::env::var("BRAVE_API_KEY").unwrap_or_default()
@@ -837,11 +1068,7 @@ async fn brave_query(
                     .and_then(|v| v.to_str().ok())
                     .and_then(|v| v.parse::<f64>().ok())
                     .map(|v| v.clamp(0.0, MAX_RETRY_AFTER_SECONDS));
-                let delay = retry_after.unwrap_or_else(|| {
-                    use rand::Rng;
-                    BASE_BACKOFF_SECONDS * 2f64.powi(attempt as i32)
-                        + rand::thread_rng().gen_range(0.0..0.5)
-                });
+                let delay = retry_after.unwrap_or_else(|| backoff_seconds(attempt));
                 tokio::time::sleep(Duration::from_secs_f64(delay)).await;
                 continue;
             }
@@ -863,11 +1090,21 @@ async fn brave_query(
                     return Err(BraveFailure::Network(e.to_string()));
                 }
             };
-        if status.as_u16() == 400 || status.as_u16() == 422 {
-            return Err(BraveFailure::InvalidQuery(body));
-        }
         if status.as_u16() == 401 || status.as_u16() == 403 {
             return Err(BraveFailure::Auth(body));
+        }
+        if status.as_u16() == 400 || status.as_u16() == 422 {
+            // Brave reports a bad subscription token as **422**, not 401, so
+            // status alone can't tell "your key is wrong" from "your query is
+            // wrong". The difference decides whether search still works:
+            // `InvalidQuery` is a caller error that propagates straight to the
+            // model instead of falling back, so misfiling an auth failure as
+            // one takes the key-free engines out of play entirely and tells
+            // the model to reword a query that was never the problem.
+            if brave_body_is_auth_failure(&body) {
+                return Err(BraveFailure::Auth(body));
+            }
+            return Err(BraveFailure::InvalidQuery(body));
         }
         if !status.is_success() {
             return Err(BraveFailure::Api(format!("HTTP {status}: {body}")));
@@ -879,6 +1116,19 @@ async fn brave_query(
     }
 
     Err(BraveFailure::RateLimitExhausted("retries exhausted".into()))
+}
+
+/// Whether a Brave 400/422 body is really an authentication failure.
+///
+/// Matches on Brave's own error vocabulary rather than the status code, which
+/// it overloads. Conservative by construction: anything unrecognised stays
+/// `InvalidQuery`, preserving the existing behaviour for genuinely malformed
+/// queries.
+fn brave_body_is_auth_failure(body: &str) -> bool {
+    let lowered = body.to_ascii_lowercase();
+    lowered.contains("subscription_token")
+        || lowered.contains("\"component\":\"authentication\"")
+        || lowered.contains("subscription token")
 }
 
 /// Reads an error/status body (rate-limit, auth, API-error details) with
@@ -896,39 +1146,175 @@ async fn read_error_body(response: reqwest::Response) -> String {
     }
 }
 
-/// Single-shot DuckDuckGo search, no retry — matching the Python original's
-/// `_ddg_query` behavior.
-async fn ddg_query(query: &str, count: usize) -> Result<Vec<SearchItem>, String> {
-    let capped = count.clamp(1, 20);
-    let client = http_client()?;
-    let response = client
-        .post(DDG_ENDPOINT)
-        .form(&[("q", query), ("kl", "wt-wt")])
+/// Classifies a scraped engine's status code.
+///
+/// `Ok(())` only for a literal 200. The whole bug this replaces came from
+/// trusting `is_success()`, which also accepts the **202** DuckDuckGo serves
+/// its bot challenge with.
+fn classify_scrape_status(status: reqwest::StatusCode) -> Result<(), ScrapeFailure> {
+    match status.as_u16() {
+        200 => Ok(()),
+        // 202: DuckDuckGo's anomaly page. 403/429: an outright refusal.
+        code @ (202 | 403 | 429) => Err(ScrapeFailure::Blocked(format!(
+            "engine refused the request (HTTP {code})"
+        ))),
+        code => Err(ScrapeFailure::Http(code)),
+    }
+}
+
+/// Fetches a scraped engine's HTML, after waiting for its pacing slot.
+async fn fetch_scraped(
+    engine: &str,
+    request: reqwest::RequestBuilder,
+) -> Result<String, ScrapeFailure> {
+    crate::ratelimit::acquire(engine).await.map_err(|_| {
+        ScrapeFailure::Blocked(format!(
+            "{engine} is locally rate-limited and the queue is longer than this call can wait for"
+        ))
+    })?;
+
+    let response = request
         .header("User-Agent", crate::scrape::SCRAPE_USER_AGENT)
         .header("Accept", "text/html,application/xhtml+xml")
         .header("Accept-Language", "en-US,en;q=0.9")
         .send()
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| ScrapeFailure::Network(e.to_string()))?;
 
-    if !response.status().is_success() {
-        return Err(format!("HTTP {}", response.status()));
-    }
-    let html = match crate::scrape::read_body_capped(response, crate::scrape::SCRAPE_MAX_BODY_BYTES)
+    let status = response.status();
+    let body = match crate::scrape::read_body_capped(response, crate::scrape::SCRAPE_MAX_BODY_BYTES)
         .await
     {
         Ok(b) => String::from_utf8_lossy(&b).into_owned(),
         Err(crate::scrape::BodyReadError::TooLarge) => {
-            return Err("response body exceeded the download cap".to_string());
+            return Err(ScrapeFailure::Network(
+                "response body exceeded the download cap".to_string(),
+            ));
         }
-        Err(crate::scrape::BodyReadError::Network(e)) => return Err(e.to_string()),
+        Err(crate::scrape::BodyReadError::Network(e)) => {
+            return Err(ScrapeFailure::Network(e.to_string()))
+        }
     };
-    Ok(parse_ddg_html(&html, capped))
+
+    classify_scrape_status(status)?;
+    Ok(body)
 }
 
-/// `count <= NORMAL_MAX_COUNT`: Brave-first-if-configured, DuckDuckGo only as
-/// a failure fallback. `InvalidQuery` is a caller error and propagates
-/// directly rather than triggering a fallback.
+/// Retries an engine call while it comes back `Blocked`, with jittered
+/// backoff. Every other failure returns immediately — a network error or an
+/// unexpected status won't be fixed by asking again, and the *other* co-equal
+/// engine is already answering in parallel.
+async fn with_blocked_retry<F, Fut>(mut attempt_fn: F) -> Result<Vec<SearchItem>, ScrapeFailure>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<SearchItem>, ScrapeFailure>>,
+{
+    let mut last = ScrapeFailure::Blocked("no attempt was made".to_string());
+    for attempt in 0..=MAX_RATE_LIMIT_RETRIES {
+        match attempt_fn().await {
+            Ok(results) => return Ok(results),
+            Err(blocked @ ScrapeFailure::Blocked(_)) => {
+                last = blocked;
+                if attempt < MAX_RATE_LIMIT_RETRIES {
+                    let delay = backoff_seconds(attempt);
+                    tokio::time::sleep(Duration::from_secs_f64(delay)).await;
+                }
+            }
+            Err(other) => return Err(other),
+        }
+    }
+    Err(last)
+}
+
+async fn ddg_attempt(query: &str, count: usize) -> Result<Vec<SearchItem>, ScrapeFailure> {
+    let client = http_client().map_err(ScrapeFailure::Network)?;
+    let html = fetch_scraped(
+        "duckduckgo",
+        client
+            .post(DDG_ENDPOINT)
+            .form(&[("q", query), ("kl", "wt-wt")]),
+    )
+    .await?;
+
+    let results = parse_ddg_html(&html, count);
+    // Marker check only on an empty parse — see `ddg_challenge_marker`. A 200
+    // response can still be a challenge page.
+    if results.is_empty() && ddg_challenge_marker(&html) {
+        return Err(ScrapeFailure::Blocked(
+            "DuckDuckGo returned its bot-challenge page".to_string(),
+        ));
+    }
+    Ok(results)
+}
+
+/// DuckDuckGo search, paced and retried on a challenge.
+async fn ddg_query(query: &str, count: usize) -> Result<Vec<SearchItem>, ScrapeFailure> {
+    let capped = count.clamp(1, 20);
+    with_blocked_retry(|| ddg_attempt(query, capped)).await
+}
+
+/// Markers for Bing's own block page. Same gating rule as DuckDuckGo's: only
+/// consulted when the parse produced nothing.
+fn bing_challenge_marker(html: &str) -> bool {
+    html.contains("unusual traffic") || html.contains("captcha") || html.contains("blockpage")
+}
+
+async fn bing_attempt(query: &str, count: usize) -> Result<Vec<SearchItem>, ScrapeFailure> {
+    let client = http_client().map_err(ScrapeFailure::Network)?;
+    let html = fetch_scraped(
+        "bing",
+        client
+            .get(BING_ENDPOINT)
+            .query(&[("q", query), ("setlang", "en")]),
+    )
+    .await?;
+
+    let results = parse_bing_html(&html, count);
+    if results.is_empty() && bing_challenge_marker(&html) {
+        return Err(ScrapeFailure::Blocked(
+            "Bing returned a block page".to_string(),
+        ));
+    }
+    Ok(results)
+}
+
+/// Bing search, paced and retried on a challenge. Co-equal with DuckDuckGo:
+/// the two are queried together whenever Brave isn't answering, so one
+/// engine's challenge rate stops being the whole tool's failure rate.
+async fn bing_query(query: &str, count: usize) -> Result<Vec<SearchItem>, ScrapeFailure> {
+    let capped = count.clamp(1, 20);
+    with_blocked_retry(|| bing_attempt(query, capped)).await
+}
+
+/// Runs both key-free engines concurrently and merges them, recording each
+/// engine's outcome in `diagnostics`.
+async fn coequal_search(
+    query: &str,
+    count: usize,
+    diagnostics: &mut HashMap<String, String>,
+) -> Vec<SearchItem> {
+    let (ddg_outcome, bing_outcome) =
+        tokio::join!(ddg_query(query, count), bing_query(query, count));
+
+    let mut lists = Vec::new();
+    for (engine, outcome) in [("duckduckgo", ddg_outcome), ("bing", bing_outcome)] {
+        match outcome {
+            Ok(results) => {
+                diagnostics.insert(engine.into(), "ok".into());
+                lists.push(results);
+            }
+            Err(e) => {
+                diagnostics.insert(engine.into(), e.kind().into());
+            }
+        }
+    }
+    merge_dedup(Vec::new(), lists)
+}
+
+/// `count <= NORMAL_MAX_COUNT`: Brave-first-if-configured; the key-free
+/// co-equal pair (DuckDuckGo + Bing) only as a failure fallback.
+/// `InvalidQuery` is a caller error and propagates directly rather than
+/// triggering a fallback.
 async fn normal_search(
     query: &str,
     count: usize,
@@ -936,10 +1322,7 @@ async fn normal_search(
     freshness: Option<&str>,
     country: &str,
 ) -> Result<(Vec<SearchItem>, HashMap<String, String>), BraveFailure> {
-    let mut diagnostics: HashMap<String, String> = HashMap::from([
-        ("brave".to_string(), "not_configured".to_string()),
-        ("duckduckgo".to_string(), "not_queried".to_string()),
-    ]);
+    let mut diagnostics = new_diagnostics();
 
     if !brave_api_key().is_empty() {
         match brave_query(query, count, search_lang, freshness, country).await {
@@ -956,22 +1339,15 @@ async fn normal_search(
         }
     }
 
-    match ddg_query(query, count).await {
-        Ok(results) => {
-            diagnostics.insert("duckduckgo".into(), "ok".into());
-            Ok((results, diagnostics))
-        }
-        Err(e) => {
-            diagnostics.insert("duckduckgo".into(), format!("failed: {e}"));
-            Ok((Vec::new(), diagnostics))
-        }
-    }
+    let results = coequal_search(query, count, &mut diagnostics).await;
+    Ok((results, diagnostics))
 }
 
-/// `count > NORMAL_MAX_COUNT`: queries Brave AND DuckDuckGo concurrently
-/// regardless of whether Brave succeeds — this is the "expansion": broader
-/// source coverage, not lexical query variants. Brave's `invalid_query` does
-/// not abort DuckDuckGo's side here; it's only recorded in diagnostics.
+/// `count > NORMAL_MAX_COUNT`: queries Brave AND both key-free engines
+/// concurrently regardless of whether Brave succeeds — this is the
+/// "expansion": broader source coverage, not lexical query variants. Brave's
+/// `invalid_query` does not abort the others here; it's only recorded in
+/// diagnostics.
 async fn dual_engine_search(
     query: &str,
     count: usize,
@@ -979,10 +1355,7 @@ async fn dual_engine_search(
     freshness: Option<&str>,
     country: &str,
 ) -> (Vec<SearchItem>, HashMap<String, String>) {
-    let mut diagnostics: HashMap<String, String> = HashMap::from([
-        ("brave".to_string(), "not_configured".to_string()),
-        ("duckduckgo".to_string(), "not_queried".to_string()),
-    ]);
+    let mut diagnostics = new_diagnostics();
 
     let key_configured = !brave_api_key().is_empty();
     let brave_fut = async {
@@ -992,7 +1365,8 @@ async fn dual_engine_search(
             None
         }
     };
-    let (brave_outcome, ddg_outcome) = tokio::join!(brave_fut, ddg_query(query, count));
+    let (brave_outcome, ddg_outcome, bing_outcome) =
+        tokio::join!(brave_fut, ddg_query(query, count), bing_query(query, count));
 
     let brave_results = match brave_outcome {
         Some(Ok(r)) => {
@@ -1000,23 +1374,26 @@ async fn dual_engine_search(
             r
         }
         Some(Err(e)) => {
-            diagnostics.insert("brave".into(), e.kind().to_string());
+            diagnostics.insert("brave".into(), e.kind().into());
             Vec::new()
         }
         None => Vec::new(),
     };
-    let ddg_results = match ddg_outcome {
-        Ok(r) => {
-            diagnostics.insert("duckduckgo".into(), "ok".into());
-            r
-        }
-        Err(e) => {
-            diagnostics.insert("duckduckgo".into(), format!("failed: {e}"));
-            Vec::new()
-        }
-    };
 
-    (merge_dedup(brave_results, ddg_results), diagnostics)
+    let mut coequal = Vec::new();
+    for (engine, outcome) in [("duckduckgo", ddg_outcome), ("bing", bing_outcome)] {
+        match outcome {
+            Ok(results) => {
+                diagnostics.insert(engine.into(), "ok".into());
+                coequal.push(results);
+            }
+            Err(e) => {
+                diagnostics.insert(engine.into(), e.kind().into());
+            }
+        }
+    }
+
+    (merge_dedup(brave_results, coequal), diagnostics)
 }
 
 // ---------------------------------------------------------------------------
@@ -1181,8 +1558,8 @@ pub fn web_search_read_chunk(search_id: &str, ids: &[i64]) -> String {
             &format!("No stored search results for search_id '{search_id}'."),
             None,
             Some(
-                "This search_id may have expired (only the 20 most recent searches are \
-                 retained) or been mistyped; call lean_web_search again.",
+                "This search_id may have expired (older searches are eventually \
+                 discarded) or been mistyped; call lean_web_search again.",
             ),
         );
     }
@@ -1485,6 +1862,224 @@ mod tests {
         assert!(parse_ddg_html("<<<not really html", 10).is_empty());
     }
 
+    // Mirrors Bing's live markup: `li.b_algo`, a `b_tpcn` breadcrumb block
+    // carrying the same wrapped href as the `h2` title link, and the snippet
+    // in `.b_caption p.b_lineclamp2`. The `u=a1…` payloads are base64url of
+    // the URLs asserted below.
+    const BING_FIXTURE: &str = r##"
+    <html><body><ol id="b_results">
+      <li class="b_algo">
+        <div class="b_tpcn"><a class="tilk" href="https://www.bing.com/ck/a?!&amp;&amp;p=1&amp;u=a1aHR0cHM6Ly9leGFtcGxlLmNvbS9vbmU_dj0x&amp;ntb=1">
+          <cite>https://example.com <span class="b_ctdif">&#8250; one</span></cite>
+        </a></div>
+        <h2 class=""><a target="_blank" href="https://www.bing.com/ck/a?!&amp;&amp;p=1&amp;u=a1aHR0cHM6Ly9leGFtcGxlLmNvbS9vbmU_dj0x&amp;ntb=1">First Result</a></h2>
+        <div class="b_caption"><p class="b_lineclamp2">The first snippet body.</p></div>
+      </li>
+      <li class="b_ad b_algo">
+        <h2><a href="https://www.bing.com/ck/a?u=a1aHR0cHM6Ly9hZC5jb20&amp;ntb=1">Ad</a></h2>
+        <div class="b_caption"><p class="b_lineclamp2">Should be skipped.</p></div>
+      </li>
+      <li class="b_algo">
+        <h2><a href="https://direct.example.org/two">Second Result</a></h2>
+        <div class="b_caption"><p class="b_lineclamp2">Second snippet.</p></div>
+      </li>
+      <li class="b_algo">
+        <h2><a href="https://www.bing.com/ck/a?u=zzNOT_BASE64_TAG&amp;ntb=1">Undecodable</a></h2>
+      </li>
+    </ol></body></html>
+    "##;
+
+    #[test]
+    fn parse_bing_decodes_redirects_skips_ads_and_handles_direct_hrefs() {
+        let items = parse_bing_html(BING_FIXTURE, 10);
+        assert_eq!(items.len(), 3, "ad result must be skipped");
+
+        assert_eq!(items[0].title, "First Result");
+        assert_eq!(items[0].url, "https://example.com/one?v=1");
+        assert_eq!(items[0].domain, "example.com");
+        assert_eq!(items[0].snippet, "The first snippet body.");
+        assert_eq!(items[0].engine, "bing");
+
+        // Direct (non-wrapped) href shape still works.
+        assert_eq!(items[1].url, "https://direct.example.org/two");
+
+        // An unknown payload tag keeps the tracking URL rather than dropping
+        // the result — it still resolves. The visible `<cite>` is absent here,
+        // so the domain falls back to bing.com; that is the documented cost.
+        assert!(items[2].url.starts_with("https://www.bing.com/ck/a"));
+    }
+
+    #[test]
+    fn parse_bing_falls_back_to_cite_when_the_wrapper_will_not_decode() {
+        const FIXTURE: &str = r##"
+        <html><body><ol><li class="b_algo">
+          <div class="b_tpcn"><a class="tilk"><cite>https://shown.example.net &#8250; path</cite></a></div>
+          <h2><a href="https://www.bing.com/ck/a?u=zzbroken&amp;ntb=1">T</a></h2>
+        </li></ol></body></html>
+        "##;
+        let items = parse_bing_html(FIXTURE, 10);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].domain, "shown.example.net");
+    }
+
+    #[test]
+    fn parse_bing_respects_count_and_survives_garbage() {
+        assert_eq!(parse_bing_html(BING_FIXTURE, 1).len(), 1);
+        assert!(parse_bing_html("<html><body>nothing here</body></html>", 10).is_empty());
+        assert!(parse_bing_html("", 10).is_empty());
+        assert!(parse_bing_html("<<<not really html", 10).is_empty());
+    }
+
+    #[test]
+    fn unwrap_bing_redirect_is_identity_for_non_wrappers() {
+        assert_eq!(
+            unwrap_bing_redirect("https://plain.example.com/x?a=1"),
+            "https://plain.example.com/x?a=1"
+        );
+        assert_eq!(unwrap_bing_redirect("not a url"), "not a url");
+        // A wrapper with no `u` at all.
+        assert_eq!(
+            unwrap_bing_redirect("https://www.bing.com/ck/a?p=1"),
+            "https://www.bing.com/ck/a?p=1"
+        );
+    }
+
+    /// The exact bytes that made the original bug silent: DuckDuckGo's anomaly
+    /// page, which arrives with HTTP 202 and parses to zero results.
+    const DDG_CHALLENGE_FIXTURE: &str = r##"
+    <html><head><title>DuckDuckGo</title></head><body>
+      <div class="anomaly-modal__mask"></div>
+      <p>Unfortunately, bots use DuckDuckGo too.</p>
+      <form id="challenge-form" action="//duckduckgo.com/anomaly.js?sv=html&cc=botnet&q=python" method="POST"></form>
+    </body></html>
+    "##;
+
+    #[test]
+    fn a_challenge_page_is_recognised_and_a_real_page_is_not() {
+        assert!(ddg_challenge_marker(DDG_CHALLENGE_FIXTURE));
+        assert!(parse_ddg_html(DDG_CHALLENGE_FIXTURE, 10).is_empty());
+
+        // The real results fixture must never be mistaken for a challenge —
+        // this is the assertion that keeps the marker check from demoting a
+        // working search to a failure.
+        assert!(!ddg_challenge_marker(DDG_FIXTURE));
+    }
+
+    #[test]
+    fn a_202_is_blocked_not_success() {
+        use reqwest::StatusCode;
+        // The whole bug: 202 passes `is_success()`.
+        assert!(StatusCode::ACCEPTED.is_success());
+
+        assert_eq!(
+            classify_scrape_status(StatusCode::ACCEPTED),
+            Err(ScrapeFailure::Blocked(
+                "engine refused the request (HTTP 202)".to_string()
+            ))
+        );
+        assert_eq!(
+            classify_scrape_status(StatusCode::TOO_MANY_REQUESTS).map_err(|e| e.kind()),
+            Err("blocked")
+        );
+        assert_eq!(
+            classify_scrape_status(StatusCode::FORBIDDEN).map_err(|e| e.kind()),
+            Err("blocked")
+        );
+        assert_eq!(
+            classify_scrape_status(StatusCode::INTERNAL_SERVER_ERROR),
+            Err(ScrapeFailure::Http(500))
+        );
+        assert!(classify_scrape_status(StatusCode::OK).is_ok());
+    }
+
+    #[test]
+    fn an_invalid_brave_key_is_auth_not_invalid_query() {
+        // Verbatim from a live 422 against Brave with a bad key. Filing this
+        // as InvalidQuery stops the key-free fallback dead.
+        let body = r#"{"error":{"code":"SUBSCRIPTION_TOKEN_INVALID","detail":"The provided subscription token is invalid.","meta":{"component":"authentication"},"status":422},"type":"ErrorResponse"}"#;
+        assert!(brave_body_is_auth_failure(body));
+
+        // A genuinely malformed query must still be a caller error.
+        assert!(!brave_body_is_auth_failure(
+            r#"{"error":{"code":"VALIDATION","detail":"freshness is not a valid value"}}"#
+        ));
+        assert!(!brave_body_is_auth_failure(""));
+    }
+
+    #[test]
+    fn diagnostics_name_every_engine_up_front() {
+        // `web_search` discriminates NO_RESULTS from ALL_ENGINES_FAILED by
+        // looking for an "ok" here, so a missing engine must not read as one
+        // that ran.
+        let d = new_diagnostics();
+        assert_eq!(d.len(), 3);
+        for engine in ["brave", "duckduckgo", "bing"] {
+            assert!(d.contains_key(engine), "{engine} missing from diagnostics");
+        }
+        assert!(!d.values().any(|v| v == "ok"));
+    }
+
+    /// A fan-out runs many delegates through this one process, each searching
+    /// and each holding a `search_id` it intends to read later. The count cap
+    /// must not be able to delete a handle that is still in flight.
+    #[test]
+    fn a_flood_of_searches_cannot_evict_a_handle_still_in_flight() {
+        let dir = std::env::temp_dir().join(format!("kw-offload-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let results = vec![item("https://example.com/a", "bing")];
+        write_offload_to(&dir, "first", "q", &results).expect("first offload written");
+
+        // Well past the cap, all of them written now.
+        for i in 0..(MAX_OFFLOAD_FILES + 20) {
+            write_offload_to(&dir, &format!("flood{i}"), "q", &results)
+                .expect("flood offload written");
+        }
+
+        assert!(
+            dir.join("search-first.json").exists(),
+            "a handle written moments ago was evicted by concurrent searches"
+        );
+
+        // With the grace period elapsed, the cap applies again and the oldest go.
+        let later = std::time::SystemTime::now() + OFFLOAD_GRACE + Duration::from_secs(1);
+        prune_old_offloads_in(&dir, later);
+        let remaining = std::fs::read_dir(&dir).unwrap().count();
+        assert!(
+            remaining <= MAX_OFFLOAD_FILES,
+            "the cap stopped applying entirely: {remaining} files left"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_offload_past_the_grace_period_is_still_pruned() {
+        let dir = std::env::temp_dir().join(format!("kw-offload-age-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let results = vec![item("https://example.com/a", "bing")];
+        for i in 0..(MAX_OFFLOAD_FILES + 5) {
+            write_offload_to(&dir, &format!("s{i}"), "q", &results).unwrap();
+        }
+        let before = std::fs::read_dir(&dir).unwrap().count();
+        assert_eq!(
+            before,
+            MAX_OFFLOAD_FILES + 5,
+            "nothing pruned inside the grace"
+        );
+
+        prune_old_offloads_in(
+            &dir,
+            std::time::SystemTime::now() + OFFLOAD_GRACE + Duration::from_secs(1),
+        );
+        let after = std::fs::read_dir(&dir).unwrap().count();
+        assert!(after < before, "the age floor disabled pruning outright");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn merge_dedup_prefers_brave_and_drops_equivalent_ddg_urls() {
         let brave = vec![item("https://example.com/a", "brave")];
@@ -1492,10 +2087,56 @@ mod tests {
             item("https://www.example.com/a/", "duckduckgo"),
             item("https://other.com/b", "duckduckgo"),
         ];
-        let merged = merge_dedup(brave, ddg);
+        let merged = merge_dedup(brave, vec![ddg]);
         assert_eq!(merged.len(), 2);
         assert_eq!(merged[0].engine, "brave");
         assert_eq!(merged[1].url, "https://other.com/b");
+    }
+
+    #[test]
+    fn merge_dedup_round_robins_the_coequal_engines() {
+        let ddg = vec![
+            item("https://d1.com", "duckduckgo"),
+            item("https://d2.com", "duckduckgo"),
+            item("https://d3.com", "duckduckgo"),
+        ];
+        let bing = vec![
+            item("https://b1.com", "bing"),
+            item("https://b2.com", "bing"),
+        ];
+        let merged = merge_dedup(Vec::new(), vec![ddg, bing]);
+
+        // Bing must reach the head of the list, not trail all of DuckDuckGo:
+        // `count<=5` only ever returns the head.
+        let engines: Vec<&str> = merged.iter().map(|r| r.engine.as_str()).collect();
+        assert_eq!(
+            engines,
+            ["duckduckgo", "bing", "duckduckgo", "bing", "duckduckgo"]
+        );
+    }
+
+    #[test]
+    fn merge_dedup_drops_cross_engine_duplicates_and_survives_uneven_lists() {
+        let ddg = vec![item("https://same.com/x", "duckduckgo")];
+        let bing = vec![
+            item("https://www.same.com/x/", "bing"),
+            item("https://only-bing.com", "bing"),
+        ];
+        let merged = merge_dedup(Vec::new(), vec![ddg, bing]);
+        assert_eq!(merged.len(), 2, "the equivalent URL must collapse");
+        assert_eq!(merged[0].engine, "duckduckgo");
+        assert_eq!(merged[1].url, "https://only-bing.com");
+    }
+
+    #[test]
+    fn merge_dedup_handles_empty_and_absent_engines() {
+        assert!(merge_dedup(Vec::new(), Vec::new()).is_empty());
+        assert!(merge_dedup(Vec::new(), vec![Vec::new(), Vec::new()]).is_empty());
+        let only = merge_dedup(
+            Vec::new(),
+            vec![Vec::new(), vec![item("https://b.com", "bing")]],
+        );
+        assert_eq!(only.len(), 1);
     }
 
     #[test]

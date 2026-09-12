@@ -1,15 +1,23 @@
-// Guards against a model getting stuck: verbatim reasoning/text repetition, a
-// leaked literal `<think>` tag, and a tool-call loop (same call, same target,
-// repeatedly) in chat mode.
+// Guards against a model getting stuck: verbatim reasoning/text repetition and
+// a leaked literal `<think>` tag.
 //
 // The reasoning hard cap that used to live here went with recipes. It was
 // driven entirely by a recipe's `max_reasoning_tokens`, and with no producer
 // for that number it could never fire again -- along with the forced-answer
 // follow-up that only a cap-triggered cancel ever scheduled.
-
-import type { ToolCallCounts } from './types';
-
-export type { ToolCallCounts };
+//
+// The tool-call loop guard went too. It counted identical calls in a turn and
+// had the frontend decline the fifth, which stopped being a loop detector once
+// the lean readers and writers went paged: `lean_file_read`,
+// `lean_pdf_read_text` and `lean_doc_read_chunk` are meant to be called once
+// per window, so reading a long document end to end is a legitimate run of
+// identical-looking calls and the guard cut it off mid-document. It also only
+// ever ran for calls that paused for approval. The daemon now nudges instead
+// -- after several consecutive calls to one tool it appends a note to the tool
+// result asking the model to check whether it already has what it needs (see
+// `REPEAT_TOOL_NUDGE_AFTER` in `BigTinyV2/daemon/src/agent/loop_.rs`). That
+// reaches the only party who can tell "still paging" from "stuck", and it
+// cannot strand a turn halfway through a document.
 
 /** Detects a real, observed local-model failure mode: instead of ever
     finishing, the model gets stuck repeating a short "planning out loud"
@@ -77,168 +85,3 @@ export function splitLeakedThinkTag(text: string): { reasoning: string; text: st
   const rest = text.slice(closeIdx + '</think>'.length).replace(/^\s+/, '');
   return { reasoning: leaked.trim(), text: rest };
 }
-
-/** Tools whose whole job is to mutate one file a piece at a time, where
-    calling the same tool against the same path over and over is what correct
-    use *looks like* — not a symptom of being stuck.
-
-    The guard below identifies a call by tool name plus its primary argument,
-    and for an editing tool the primary argument is the file path. So five
-    successive line edits to one 400-line file — a completely ordinary
-    refactor — collapse to five copies of one signature and trip the loop
-    threshold, and the fifth edit is auto-declined mid-task. The alternation
-    half is worse: read → edit → read → edit against one path is the canonical
-    edit loop (you re-read to see what your edit did), and it registers as a
-    perfect A→B→A→B flip sequence, so it trips even faster.
-
-    These tools are therefore handled specially in both halves — see
-    `toolCallSignature` and `trackToolAlternation`. They are *not* exempted
-    outright: a genuinely stuck model repeating the byte-identical edit still
-    trips the counter, because the signature keeps discriminating on the edit
-    payload. What stops being a "repeat" is a *different* edit to the same
-    file. */
-const ITERATIVE_EDIT_TOOLS = new Set([
-  'lean_file_replace_str',
-  'lean_file_replace_lines',
-  'lean_file_append',
-  'lean_file_write',
-]);
-
-/** A tool name as the guard sees it, with any MCP server namespace prefix
-    stripped (`server__lean_file_write` → `lean_file_write`). BigTiny sends the
-    bare name today (`bigtiny/stream.rs` sets `title` to `tool_name`), so this
-    is purely defensive against a future namespaced form silently turning the
-    exemption off. */
-function bareToolName(title: string): string {
-  const cut = title.lastIndexOf('__');
-  return cut === -1 ? title : title.slice(cut + 2);
-}
-
-/** True for a tool where repeated calls against one path are normal work. */
-export function isIterativeEditTool(title: string): boolean {
-  return ITERATIVE_EDIT_TOOLS.has(bareToolName(title));
-}
-
-/** The part of an edit call that says *which* edit this is — the payload, not
-    the target. Two `lean_file_replace_str` calls on one file replacing
-    different strings are two different pieces of work; two replacing the same
-    string are the model going in circles. Truncated because the whole point is
-    a cheap discriminator, not a faithful record, and `new_str` can be
-    kilobytes. */
-function editPayloadDiscriminator(rawInput: unknown): string {
-  const input = (rawInput ?? {}) as Record<string, unknown>;
-  const parts = ['old_str', 'new_str', 'start_line', 'end_line', 'content', 'text']
-    .map((k) => (k in input ? `${k}=${JSON.stringify(input[k])}` : ''))
-    .filter(Boolean)
-    .join('|');
-  return parts.slice(0, 512);
-}
-
-/** Best-effort identifying string for a tool call — tool name/kind plus its
-    primary argument (URL, path, or command; falls back to the whole input).
-    Not a full hash, just enough to tell "the same call, again" apart from "a
-    different call." */
-export function toolCallSignature(title: string, rawInput: unknown): string {
-  const input = (rawInput ?? {}) as {
-    url?: string;
-    path?: string;
-    file_path?: string;
-    paths?: string[];
-    command?: string;
-  };
-  const primary =
-    input.url ??
-    input.path ??
-    input.file_path ??
-    (Array.isArray(input.paths) ? input.paths[0] : undefined) ??
-    input.command;
-  const target = typeof primary === 'string' ? primary : JSON.stringify(input);
-  // For an editing tool the path alone is far too coarse (see
-  // `ITERATIVE_EDIT_TOOLS`): every edit to one file would share a signature.
-  // Folding the edit payload in makes "the same call again" mean what the
-  // guard's comment always claimed it meant.
-  if (isIterativeEditTool(title)) {
-    return `${title}::${target}::${editPayloadDiscriminator(rawInput)}`;
-  }
-  return `${title}::${target}`;
-}
-
-/** The `target` half of a tool call's signature (URL/path/command), without
-    the tool title. Used by the alternation detector below — two *different*
-    tools against the *same* target need a shared key to recognize an
-    alternating loop. */
-export function toolCallTarget(rawInput: unknown): string | null {
-  const input = (rawInput ?? {}) as {
-    url?: string;
-    path?: string;
-    file_path?: string;
-    paths?: string[];
-    command?: string;
-  };
-  const primary =
-    input.url ??
-    input.path ??
-    input.file_path ??
-    (Array.isArray(input.paths) ? input.paths[0] : undefined) ??
-    input.command;
-  return typeof primary === 'string' ? primary : null;
-}
-
-/** Alternation-tracking state for the tool-loop guard. Keyed by target so two
-    different tools against the same target share one counter. */
-export type ToolAlternationState = Map<string, { lastTitle: string | null; flips: number }>;
-
-/** Pure updater behind the *alternating*-tools half of the tool-loop guard.
-    The per-signature count in `countToolCall` alone can't catch a model that
-    bounces between two tools (web-fetch ↔ its own caching step) on the same
-    target — each tool's own count stays below the threshold forever. This
-    instead tracks consecutive tool-title *changes* for each target; a
-    sustained A→B→A→B… sequence keeps incrementing `flips` against the shared
-    target key, so the guard can flag it. A repeated same-tool call leaves
-    `flips` at 0 and is left to the per-signature counter. */
-export function trackToolAlternation(
-  state: ToolAlternationState,
-  title: string,
-  rawInput: unknown
-): { flips: number; state: ToolAlternationState } {
-  // read → edit → read → edit against one file is the shape of correct
-  // iterative editing, not an alternation loop, and it is the single most
-  // common way real work tripped this guard. Return without touching
-  // `lastTitle` so the edit call is invisible to the detector entirely: the
-  // surrounding reads then compare against each other (same title, no flip)
-  // instead of flipping across the edit between them. Genuine repetition by
-  // an editing tool is still caught by the per-signature counter above.
-  if (isIterativeEditTool(title)) return { flips: 0, state };
-  const target = toolCallTarget(rawInput);
-  if (!target) return { flips: 0, state };
-  const next = new Map(state);
-  const cur = next.get(target) ?? { lastTitle: null, flips: 0 };
-  const flips = cur.lastTitle !== null && cur.lastTitle !== title ? cur.flips + 1 : 0;
-  next.set(target, { lastTitle: title, flips });
-  return { flips, state: next };
-}
-
-/** Chat-mode tool-loop guard (owner-reported bug): a model can get stuck
-    alternating between two tools against the same target (e.g. a web-fetch
-    tool and its own cache step) — each iteration a real network/disk
-    round-trip, not just wasted tokens, since goose actually executes the call
-    before this fires. Increments and returns the new count for this call's
-    signature. Pure (counts passed in/out, a fresh Map returned) so it's
-    unit-testable and resettable per turn — see `send()` in chatStore, which
-    clears the live counts at the start of every fresh turn; repeating a call
-    across different turns is normal, not a loop. */
-export function countToolCall(
-  counts: ToolCallCounts,
-  title: string,
-  rawInput: unknown
-): { count: number; counts: ToolCallCounts } {
-  const sig = toolCallSignature(title, rawInput);
-  const next = new Map(counts);
-  const count = (next.get(sig) ?? 0) + 1;
-  next.set(sig, count);
-  return { count, counts: next };
-}
-
-/** More than this many identical calls in one turn is treated as a stuck
-    loop, not legitimate repeated tool use. */
-export const TOOL_LOOP_THRESHOLD = 4;

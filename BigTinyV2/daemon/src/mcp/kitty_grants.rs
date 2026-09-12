@@ -111,7 +111,54 @@ pub fn publish(data_dir: &Path, app_id: &str, dirs: &[String]) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let _ = std::fs::write(&path, json);
+    let _ = write_atomic(&path, &json);
+}
+
+/// Replace `path`'s contents in one step.
+///
+/// A plain `fs::write` truncates and then writes, so there is a window in
+/// which the file on disk is short or empty. That window matters here because
+/// of how the other side reads: `kitty-tools` caches this file's parse against
+/// a `(mtime, len)` stamp, stat-ing first and reading second
+/// (`plugins/kitty-tools/src/paths.rs`). A read landing inside the window gets
+/// truncated JSON, which parses to no grants at all — and the empty result is
+/// then cached against the completed write's stamp, so it persists until the
+/// file next changes. The daemon's own per-session `check_containment` is the
+/// authoritative gate, so this fails safe rather than open; what the user sees
+/// is a model that cannot open a file they just attached.
+///
+/// The window is small and the write is frequent — this file is rewritten
+/// whenever a session's grants change, and several sessions do that
+/// concurrently — so "small" is not the same as "won't happen".
+///
+/// Temp-then-rename closes it: a reader sees either the whole old file or the
+/// whole new one. The temp name carries a per-call sequence number as well as
+/// the pid, because the racing writers here are tasks inside one daemon rather
+/// than separate processes, and a shared temp name would merely move the torn
+/// write one level down.
+fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    // Same directory as the target: a cross-filesystem rename is not atomic,
+    // and on Windows fails outright.
+    let tmp = path.with_extension(format!(
+        "tmp{}-{}",
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(contents.as_bytes())?;
+        f.sync_all()?;
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -142,6 +189,68 @@ mod tests {
             roots.iter().any(|r| chat.starts_with(r)),
             "no static root contains {chat:?}"
         );
+    }
+
+    /// Several sessions publish their grants at once while a reader (standing
+    /// in for `kitty-tools`) parses the file. Every read must see a complete
+    /// document — `fs::write`'s truncate-then-write window is what this closes.
+    #[test]
+    fn concurrent_publishes_are_never_observed_half_written() {
+        let tmp = std::env::temp_dir().join(format!("kg-atomic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("apps").join("app1")).unwrap();
+        let path = grants_file(&tmp, "app1");
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let torn = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        std::thread::scope(|scope| {
+            let stop_r = stop.clone();
+            let torn_r = torn.clone();
+            let path_r = path.clone();
+            scope.spawn(move || {
+                while !stop_r.load(std::sync::atomic::Ordering::Relaxed) {
+                    // A missing file is fine (nothing published yet); a present
+                    // one must always be parseable.
+                    if let Ok(text) = std::fs::read_to_string(&path_r) {
+                        if serde_json::from_str::<Vec<String>>(&text).is_err() {
+                            torn_r.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                }
+            });
+
+            let writers: Vec<_> = (0..8)
+                .map(|w| {
+                    let tmp = tmp.clone();
+                    scope.spawn(move || {
+                        for i in 0..40 {
+                            // Varying length is what makes a torn write visible:
+                            // a short write over a long one leaves a tail behind.
+                            let dirs: Vec<String> = (0..=(w * 5 + i % 7))
+                                .map(|n| format!("/dir/{w}/{n}"))
+                                .collect();
+                            publish(&tmp, "app1", &dirs);
+                        }
+                    })
+                })
+                .collect();
+
+            // Join the writers before stopping the reader, or the reader exits
+            // before the race it exists to observe has even started.
+            for w in writers {
+                w.join().unwrap();
+            }
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+
+        assert_eq!(
+            torn.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a reader observed a half-written grants file"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

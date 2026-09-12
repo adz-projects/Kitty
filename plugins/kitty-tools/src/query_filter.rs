@@ -41,9 +41,7 @@ fn rank(haystacks: &[String], query_words: &HashSet<String>) -> Vec<usize> {
         if !query_words.iter().any(|w| lowered.contains(w.as_str())) {
             continue;
         }
-        let score = words_in_lowered(&lowered)
-            .intersection(query_words)
-            .count();
+        let score = words_in_lowered(&lowered).intersection(query_words).count();
         if score > 0 {
             scored.push((score, idx));
         }
@@ -141,10 +139,7 @@ pub fn filter_by_query(
     }
 
     let total_matches = ranked.len();
-    let ordered: Vec<String> = ranked
-        .into_iter()
-        .map(|idx| items[idx].clone())
-        .collect();
+    let ordered: Vec<String> = ranked.into_iter().map(|idx| items[idx].clone()).collect();
     let (p, truncated, next_offset) = page(&ordered, offset, max_results, total_matches);
     QueryFilterResult {
         items: p,
@@ -189,26 +184,14 @@ pub fn filter_indices(
         let start = offset.min(total);
         let idx: Vec<usize> = (start..end).collect();
         let has_more = end < total;
-        return (
-            idx,
-            has_more,
-            0,
-            has_more.then(|| end),
-            true,
-        );
+        return (idx, has_more, 0, has_more.then(|| end), true);
     }
     let total_matches = ranked.len();
     let end = offset.saturating_add(max_results).min(total_matches);
     let start = offset.min(total_matches);
     let idx: Vec<usize> = ranked[start..end].to_vec();
     let has_more = end < total_matches;
-    (
-        idx,
-        has_more,
-        total_matches,
-        has_more.then(|| end),
-        false,
-    )
+    (idx, has_more, total_matches, has_more.then(|| end), false)
 }
 
 #[cfg(test)]

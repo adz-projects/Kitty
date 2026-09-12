@@ -108,11 +108,18 @@ has been deleted. Full detail in
   — pdf, docx, xlsx, csv, txt, md, json, xml, yaml and friends — to the shared
   cache and hands back `cached_path` plus the reader to call on it;
   archives/executables/media stay refused), and the merged
-  `lean_web_search`/`lean_web_search_read_chunk` (DuckDuckGo always
-  available; Brave preferred per-query when `BRAVE_API_KEY` is configured,
-  with a count-tiered normal/expanded/expansive mode — see
-  `docs/VERSIONS.md`). On by default, no credentials (Brave preference is a
-  separate, off-by-default toggle requiring an API key).
+  `lean_web_search`/`lean_web_search_read_chunk` (Brave preferred per-query
+  when `BRAVE_API_KEY` is configured; otherwise the key-free pair —
+  DuckDuckGo **and Bing**, queried together — with a count-tiered
+  normal/expanded/expansive mode, see `docs/VERSIONS.md`). On by default, no
+  credentials (Brave preference is a separate, off-by-default toggle
+  requiring an API key). Bing is co-equal with DuckDuckGo rather than a
+  second fallback because DuckDuckGo serves a **bot challenge** under
+  concurrent load — with an HTTP 202, so it reads as a successful empty page
+  unless specifically detected. `plugins/kitty-web/src/ratelimit.rs` paces the
+  scraped engines process-wide, which is the level that matters: the whole
+  daemon shares one `kitty-web` client, so parallel specialists all burst
+  through it.
 - **`kitty-wasm`** — a **Rust** stdio MCP server, same registration pattern.
   4 tools running Python or any WASI module inside a wasmtime sandbox with
   enforced time/memory ceilings, no network, and no filesystem beyond

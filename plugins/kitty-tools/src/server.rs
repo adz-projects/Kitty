@@ -688,100 +688,103 @@ impl KittyToolsServer {
         description = "Reads body text from a Word .docx, reaching paragraphs inside tables and text boxes. Supports offset-based pagination and keyword query filtering."
     )]
     pub async fn word_read_text(&self, Parameters(req): Parameters<WordReadTextRequest>) -> String {
-        offload(move || guarded(move || {
-            let resolved = resolve(&req.path);
-            if let Some(err) = outside_home(&resolved) {
-                return err;
-            }
-            // Unzip and XML-parse once, cached by (path, len, mtime). This
-            // used to reparse the whole .docx on every paged call and then
-            // discard everything outside the window — see `doc_store`.
-            let doc = match doc_store::ensure(&resolved, doc_store::UNIT_PARAGRAPH, || {
-                let paragraphs = docx::read_paragraphs(&resolved)?;
-                // Headings double as the outline, and they are already in
-                // hand here, so it costs nothing to carry them.
-                let outline: Vec<serde_json::Value> = paragraphs
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(idx, p)| {
-                        p.heading_level
-                            .map(|level| json!({ "level": level, "title": p.text, "offset": idx }))
-                    })
-                    .collect();
-                let texts: Vec<String> = paragraphs.into_iter().map(|p| p.text).collect();
-                Ok::<_, docx::DocxError>(Extraction::new(texts, outline))
-            }) {
-                Ok((doc, _persisted)) => doc,
-                Err(docx::DocxError::NotFound) => {
-                    return error_response(
-                        "DOCX_NOT_FOUND",
-                        "Document does not exist",
-                        Some(&resolved.to_string_lossy()),
-                        None,
-                    );
+        offload(move || {
+            guarded(move || {
+                let resolved = resolve(&req.path);
+                if let Some(err) = outside_home(&resolved) {
+                    return err;
                 }
-                Err(docx::DocxError::Corrupt(detail)) => {
-                    return error_response(
-                        "DOCX_CORRUPT",
-                        &format!("Cannot open docx: {detail}"),
-                        Some(&resolved.to_string_lossy()),
-                        None,
-                    );
-                }
-            };
-            let texts = &doc.units;
-            let offset = req.offset.unwrap_or(0) as usize;
+                // Unzip and XML-parse once, cached by (path, len, mtime). This
+                // used to reparse the whole .docx on every paged call and then
+                // discard everything outside the window — see `doc_store`.
+                let doc = match doc_store::ensure(&resolved, doc_store::UNIT_PARAGRAPH, || {
+                    let paragraphs = docx::read_paragraphs(&resolved)?;
+                    // Headings double as the outline, and they are already in
+                    // hand here, so it costs nothing to carry them.
+                    let outline: Vec<serde_json::Value> = paragraphs
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(idx, p)| {
+                            p.heading_level.map(
+                                |level| json!({ "level": level, "title": p.text, "offset": idx }),
+                            )
+                        })
+                        .collect();
+                    let texts: Vec<String> = paragraphs.into_iter().map(|p| p.text).collect();
+                    Ok::<_, docx::DocxError>(Extraction::new(texts, outline))
+                }) {
+                    Ok((doc, _persisted)) => doc,
+                    Err(docx::DocxError::NotFound) => {
+                        return error_response(
+                            "DOCX_NOT_FOUND",
+                            "Document does not exist",
+                            Some(&resolved.to_string_lossy()),
+                            None,
+                        );
+                    }
+                    Err(docx::DocxError::Corrupt(detail)) => {
+                        return error_response(
+                            "DOCX_CORRUPT",
+                            &format!("Cannot open docx: {detail}"),
+                            Some(&resolved.to_string_lossy()),
+                            None,
+                        );
+                    }
+                };
+                let texts = &doc.units;
+                let offset = req.offset.unwrap_or(0) as usize;
 
-            if let Some(query) = req.query.as_deref().filter(|q| !q.trim().is_empty()) {
-                let result = filter_by_query(texts, Some(query), 50, offset);
-                let message = result.no_match.then(|| {
-                    format!("No direct matches for query '{query}'. Showing top section.")
-                });
+                if let Some(query) = req.query.as_deref().filter(|q| !q.trim().is_empty()) {
+                    let result = filter_by_query(texts, Some(query), 50, offset);
+                    let message = result.no_match.then(|| {
+                        format!("No direct matches for query '{query}'. Showing top section.")
+                    });
+                    let mut metadata = json!({
+                        "read_method": "xml_scan",
+                        "document_id": doc.document_id,
+                        "filtered_by_query": query,
+                        "total_matches": result.total_matches,
+                        "offset": offset,
+                    });
+                    if let Some(next) = result.next_offset {
+                        metadata["next_offset"] = json!(next);
+                    }
+                    return success_response(
+                        json!(result.items),
+                        message.as_deref(),
+                        result.truncated,
+                        Some(metadata),
+                    );
+                }
+
+                let limit = req.limit.unwrap_or(DEFAULT_PAGE_SIZE) as usize;
+                let total = texts.len();
+                let (page, has_more) = doc_store::window_slice(texts, offset, limit);
                 let mut metadata = json!({
                     "read_method": "xml_scan",
                     "document_id": doc.document_id,
-                    "filtered_by_query": query,
-                    "total_matches": result.total_matches,
+                    "unit": doc.unit,
                     "offset": offset,
+                    "total_paragraphs": total,
+                    "has_more": has_more,
+                    "outline": doc.outline,
                 });
-                if let Some(next) = result.next_offset {
-                    metadata["next_offset"] = json!(next);
-                }
-                return success_response(
-                    json!(result.items),
-                    message.as_deref(),
-                    result.truncated,
-                    Some(metadata),
-                );
-            }
-
-            let limit = req.limit.unwrap_or(DEFAULT_PAGE_SIZE) as usize;
-            let total = texts.len();
-            let (page, has_more) = doc_store::window_slice(texts, offset, limit);
-            let mut metadata = json!({
-                "read_method": "xml_scan",
-                "document_id": doc.document_id,
-                "unit": doc.unit,
-                "offset": offset,
-                "total_paragraphs": total,
-                "has_more": has_more,
-                "outline": doc.outline,
-            });
-            let message = if has_more {
-                metadata["next_offset"] = json!(offset + page.len());
-                Some(format!(
-                    "Showing paragraphs {}-{} of {total}. The whole document is already \
+                let message = if has_more {
+                    metadata["next_offset"] = json!(offset + page.len());
+                    Some(format!(
+                        "Showing paragraphs {}-{} of {total}. The whole document is already \
                      extracted and cached — continue with lean_doc_read_chunk (document_id, \
                      offset {}) or search it with lean_doc_search.",
-                    offset,
-                    offset + page.len(),
-                    offset + page.len()
-                ))
-            } else {
-                None
-            };
-            success_response(json!(page), message.as_deref(), has_more, Some(metadata))
-        }))
+                        offset,
+                        offset + page.len(),
+                        offset + page.len()
+                    ))
+                } else {
+                    None
+                };
+                success_response(json!(page), message.as_deref(), has_more, Some(metadata))
+            })
+        })
         .await
     }
 
@@ -790,36 +793,38 @@ impl KittyToolsServer {
         description = "Reads a window of an already-extracted document by its document_id, with no re-parsing. Use the document_id returned by lean_file_read, lean_word_read_text, lean_pdf_read_text or lean_pdf_read_outline to walk a long document instead of re-reading it by path."
     )]
     pub async fn doc_read_chunk(&self, Parameters(req): Parameters<DocReadChunkRequest>) -> String {
-        offload(move || guarded(move || {
-            let doc = match doc_store::load(&req.document_id) {
-                Ok(d) => d,
-                Err(e) => return doc_load_error(&req.document_id, e),
-            };
-            let offset = req.offset.unwrap_or(0) as usize;
-            let limit = req.limit.unwrap_or(DEFAULT_PAGE_SIZE) as usize;
-            // Numbered on serve for raw-line records; legacy and non-line
-            // records pass through unchanged.
-            let (page, has_more) = doc_store::display_window(&doc, offset, limit);
+        offload(move || {
+            guarded(move || {
+                let doc = match doc_store::load(&req.document_id) {
+                    Ok(d) => d,
+                    Err(e) => return doc_load_error(&req.document_id, e),
+                };
+                let offset = req.offset.unwrap_or(0) as usize;
+                let limit = req.limit.unwrap_or(DEFAULT_PAGE_SIZE) as usize;
+                // Numbered on serve for raw-line records; legacy and non-line
+                // records pass through unchanged.
+                let (page, has_more) = doc_store::display_window(&doc, offset, limit);
 
-            let mut metadata = json!({
-                "document_id": doc.document_id,
-                "source_path": doc.source_path,
-                "unit": doc.unit,
-                "offset": offset,
-                "total_units": doc.total_units,
-                "units_available": doc.stored_units(),
-                "has_more": has_more,
-            });
-            if has_more {
-                metadata["next_offset"] = json!(offset + page.len());
-            }
-            success_response(
-                json!(page),
-                None,
-                has_more || doc.extraction_truncated,
-                Some(metadata),
-            )
-        }))
+                let mut metadata = json!({
+                    "document_id": doc.document_id,
+                    "source_path": doc.source_path,
+                    "unit": doc.unit,
+                    "offset": offset,
+                    "total_units": doc.total_units,
+                    "units_available": doc.stored_units(),
+                    "has_more": has_more,
+                });
+                if has_more {
+                    metadata["next_offset"] = json!(offset + page.len());
+                }
+                success_response(
+                    json!(page),
+                    None,
+                    has_more || doc.extraction_truncated,
+                    Some(metadata),
+                )
+            })
+        })
         .await
     }
 
@@ -878,46 +883,51 @@ impl KittyToolsServer {
         name = "lean_word_read_outline",
         description = "Returns the heading structure (levels 1-4) of a Word document, reaching headings inside tables and text boxes."
     )]
-    pub async fn word_read_outline(&self, Parameters(req): Parameters<WordReadOutlineRequest>) -> String {
-        offload(move || guarded(move || {
-            let resolved = resolve(&req.path);
-            if let Some(err) = outside_home(&resolved) {
-                return err;
-            }
-            let paragraphs = match docx::read_paragraphs(&resolved) {
-                Ok(p) => p,
-                Err(docx::DocxError::NotFound) => {
-                    return error_response(
-                        "DOCX_NOT_FOUND",
-                        "Document does not exist",
-                        Some(&resolved.to_string_lossy()),
-                        None,
-                    );
+    pub async fn word_read_outline(
+        &self,
+        Parameters(req): Parameters<WordReadOutlineRequest>,
+    ) -> String {
+        offload(move || {
+            guarded(move || {
+                let resolved = resolve(&req.path);
+                if let Some(err) = outside_home(&resolved) {
+                    return err;
                 }
-                Err(docx::DocxError::Corrupt(detail)) => {
-                    return error_response(
-                        "DOCX_CORRUPT",
-                        &format!("Cannot open docx: {detail}"),
-                        Some(&resolved.to_string_lossy()),
-                        None,
-                    );
-                }
-            };
-            let outline: Vec<_> = paragraphs
-                .iter()
-                .filter_map(|p| {
-                    p.heading_level
-                        .filter(|lvl| (1..=4).contains(lvl))
-                        .map(|lvl| json!({"level": lvl, "text": p.text}))
-                })
-                .collect();
-            success_response(
-                json!(outline),
-                None,
-                false,
-                Some(json!({"read_method": "xml_scan"})),
-            )
-        }))
+                let paragraphs = match docx::read_paragraphs(&resolved) {
+                    Ok(p) => p,
+                    Err(docx::DocxError::NotFound) => {
+                        return error_response(
+                            "DOCX_NOT_FOUND",
+                            "Document does not exist",
+                            Some(&resolved.to_string_lossy()),
+                            None,
+                        );
+                    }
+                    Err(docx::DocxError::Corrupt(detail)) => {
+                        return error_response(
+                            "DOCX_CORRUPT",
+                            &format!("Cannot open docx: {detail}"),
+                            Some(&resolved.to_string_lossy()),
+                            None,
+                        );
+                    }
+                };
+                let outline: Vec<_> = paragraphs
+                    .iter()
+                    .filter_map(|p| {
+                        p.heading_level
+                            .filter(|lvl| (1..=4).contains(lvl))
+                            .map(|lvl| json!({"level": lvl, "text": p.text}))
+                    })
+                    .collect();
+                success_response(
+                    json!(outline),
+                    None,
+                    false,
+                    Some(json!({"read_method": "xml_scan"})),
+                )
+            })
+        })
         .await
     }
 
@@ -1012,17 +1022,22 @@ impl KittyToolsServer {
         name = "lean_excel_read_rows",
         description = "Reads rows from an Excel spreadsheet (.xlsx/.xls/.ods) as structured JSON (or CSV). Supports sheet selection, a cell range, keyword query filtering, and offset pagination (default page size 500 rows)."
     )]
-    pub async fn excel_read_rows(&self, Parameters(req): Parameters<ExcelReadRowsRequest>) -> String {
-        offload(move || guarded(move || {
-            tools::excel::excel_read_rows(
-                &req.path,
-                req.sheet.as_deref(),
-                req.range_box.as_deref(),
-                req.output_format.as_deref().unwrap_or("json"),
-                req.query.as_deref(),
-                req.offset.unwrap_or(0) as usize,
-            )
-        }))
+    pub async fn excel_read_rows(
+        &self,
+        Parameters(req): Parameters<ExcelReadRowsRequest>,
+    ) -> String {
+        offload(move || {
+            guarded(move || {
+                tools::excel::excel_read_rows(
+                    &req.path,
+                    req.sheet.as_deref(),
+                    req.range_box.as_deref(),
+                    req.output_format.as_deref().unwrap_or("json"),
+                    req.query.as_deref(),
+                    req.offset.unwrap_or(0) as usize,
+                )
+            })
+        })
         .await
     }
 
@@ -1031,15 +1046,17 @@ impl KittyToolsServer {
         description = "Reads text from a PDF page-by-page. Supports page ranges, keyword query filtering, and offset pagination."
     )]
     pub async fn pdf_read_text(&self, Parameters(req): Parameters<PdfReadTextRequest>) -> String {
-        offload(move || guarded(move || {
-            tools::pdf::pdf_read_text(
-                &req.path,
-                req.start_page,
-                req.end_page,
-                req.query.as_deref(),
-                req.offset.unwrap_or(0) as usize,
-            )
-        }))
+        offload(move || {
+            guarded(move || {
+                tools::pdf::pdf_read_text(
+                    &req.path,
+                    req.start_page,
+                    req.end_page,
+                    req.query.as_deref(),
+                    req.offset.unwrap_or(0) as usize,
+                )
+            })
+        })
         .await
     }
 
@@ -1047,7 +1064,10 @@ impl KittyToolsServer {
         name = "lean_pdf_read_outline",
         description = "Returns the table-of-contents/bookmark outline of a PDF, if it has one."
     )]
-    pub async fn pdf_read_outline(&self, Parameters(req): Parameters<PdfReadOutlineRequest>) -> String {
+    pub async fn pdf_read_outline(
+        &self,
+        Parameters(req): Parameters<PdfReadOutlineRequest>,
+    ) -> String {
         offload(move || guarded(move || tools::pdf::pdf_read_outline(&req.path))).await
     }
 
@@ -1061,7 +1081,10 @@ impl KittyToolsServer {
     ) -> String {
         offload(move || {
             guarded(move || {
-                tools::workspace::analyze_workspace(req.path.as_deref().unwrap_or("."), req.max_depth)
+                tools::workspace::analyze_workspace(
+                    req.path.as_deref().unwrap_or("."),
+                    req.max_depth,
+                )
             })
         })
         .await
@@ -1115,7 +1138,10 @@ impl KittyToolsServer {
         name = "lean_file_replace_str",
         description = "Replaces exact string occurrences in a file."
     )]
-    pub async fn file_replace_str(&self, Parameters(req): Parameters<FileReplaceStrRequest>) -> String {
+    pub async fn file_replace_str(
+        &self,
+        Parameters(req): Parameters<FileReplaceStrRequest>,
+    ) -> String {
         offload(move || {
             guarded(move || {
                 tools::fs::file_replace_str(
@@ -1177,7 +1203,7 @@ impl KittyToolsServer {
 
     #[tool(
         name = "lean_cache_clear",
-        description = "Deletes every file in the scratch cache directory and returns how many were removed."
+        description = "Deletes files from the scratch cache directory and returns how many were removed. Files modified in the last 15 minutes are kept, since another task running at the same time may still be reading one."
     )]
     pub async fn cache_clear(&self) -> String {
         offload(move || guarded(tools::cache::cache_clear)).await
@@ -1187,15 +1213,22 @@ impl KittyToolsServer {
         name = "lean_scratchpad_set",
         description = "Stores a key/value pair in the persistent scratchpad for recall across turns."
     )]
-    pub async fn scratchpad_set(&self, Parameters(req): Parameters<ScratchpadSetRequest>) -> String {
-        offload(move || guarded(move || tools::scratchpad::scratchpad_set(&req.key, &req.value))).await
+    pub async fn scratchpad_set(
+        &self,
+        Parameters(req): Parameters<ScratchpadSetRequest>,
+    ) -> String {
+        offload(move || guarded(move || tools::scratchpad::scratchpad_set(&req.key, &req.value)))
+            .await
     }
 
     #[tool(
         name = "lean_scratchpad_get",
         description = "Retrieves a previously stored scratchpad value by key."
     )]
-    pub async fn scratchpad_get(&self, Parameters(req): Parameters<ScratchpadKeyRequest>) -> String {
+    pub async fn scratchpad_get(
+        &self,
+        Parameters(req): Parameters<ScratchpadKeyRequest>,
+    ) -> String {
         offload(move || guarded(move || tools::scratchpad::scratchpad_get(&req.key))).await
     }
 
@@ -1203,7 +1236,10 @@ impl KittyToolsServer {
         name = "lean_scratchpad_delete",
         description = "Deletes a key from the persistent scratchpad."
     )]
-    pub async fn scratchpad_delete(&self, Parameters(req): Parameters<ScratchpadKeyRequest>) -> String {
+    pub async fn scratchpad_delete(
+        &self,
+        Parameters(req): Parameters<ScratchpadKeyRequest>,
+    ) -> String {
         offload(move || guarded(move || tools::scratchpad::scratchpad_delete(&req.key))).await
     }
 

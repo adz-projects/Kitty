@@ -172,13 +172,23 @@ export function SessionList() {
         if (!summary) continue;
         await useChatStore
           .getState()
-          .loadSession(summary.sessionId, summary.cwd, summary.title, summary.providerId, summary.modelId);
+          .loadSession(
+            summary.sessionId,
+            summary.cwd,
+            summary.title,
+            summary.providerId,
+            summary.modelId
+          );
         const { messages, title } = useChatStore.getState();
         const chatMessages = buildExport(messages);
         let base = sanitizeFilename(title ?? summary.title);
         if (usedNames.has(base)) base = `${base}-${id.slice(0, 8)}`;
         usedNames.add(base);
-        await ipc.writeFile(`${dir}/${base}.jsonl`, JSON.stringify({ messages: chatMessages }) + '\n');
+        await ipc.writeFileInDir(
+          dir,
+          `${base}.jsonl`,
+          JSON.stringify({ messages: chatMessages }) + '\n'
+        );
       }
       exitSelectionMode();
     } catch (e) {
@@ -187,7 +197,13 @@ export function SessionList() {
       if (restore) {
         await useChatStore
           .getState()
-          .loadSession(restore.sessionId, restore.cwd, restore.title, restore.providerId, restore.modelId);
+          .loadSession(
+            restore.sessionId,
+            restore.cwd,
+            restore.title,
+            restore.providerId,
+            restore.modelId
+          );
       }
       setSelectionBusy(false);
     }

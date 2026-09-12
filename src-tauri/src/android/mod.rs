@@ -1,9 +1,10 @@
 //! The Android-native surface, reached through one Tauri Android plugin.
 //!
-//! Three things Rust cannot do on its own here: store a secret somewhere that
+//! Four things Rust cannot do on its own here: store a secret somewhere that
 //! survives a relaunch (`secrets`), keep a download running while the app is
-//! backgrounded (`download_service`), and read a `content://` attachment the
-//! document picker handed back (`attachments`). All are implemented in
+//! backgrounded (`download_service`), read a `content://` attachment the
+//! document picker handed back (`attachments`), and write one back out to a
+//! location the user picked (`documents`). All are implemented in
 //! Kotlin in `gen/android/app/src/main/java/com/kitty/app/`, and all are
 //! reached through the single `PluginHandle` this module owns.
 //!
@@ -17,6 +18,7 @@
 //! into emitting — can read a stored API key.
 
 pub mod attachments;
+pub mod documents;
 pub mod download_service;
 pub mod logcat;
 pub mod secrets;

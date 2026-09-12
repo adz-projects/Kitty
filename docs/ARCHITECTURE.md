@@ -202,10 +202,11 @@ tools, plus 4 visualization tools (accessible table, SVG diagram, chart,
 Mermaid) gated by their own Settings toggle (an env var on this one process,
 not a separate server) — no network calls of its own. `kitty-web` hosts the merged,
 count-tiered `lean_web_search`/`lean_web_search_read_chunk` and
-`lean_web_scrape` (DuckDuckGo always available; Brave preferred per-query when
-configured — Brave's toggle needs an API key stored in the keyring rather
-than `config.json`; disabling it always deletes the stored key, so
-re-enabling always requires re-entering it). `kitty-wasm` hosts the sandboxed
+`lean_web_scrape` (Brave preferred per-query when configured; otherwise
+DuckDuckGo and Bing are queried together as a co-equal key-free pair — Brave's
+toggle needs an API key stored in the keyring rather than `config.json`;
+disabling it always deletes the stored key, so re-enabling always requires
+re-entering it). `kitty-wasm` hosts the sandboxed
 WebAssembly compute tools (Python via a bundled CPython wasm guest, plus
 arbitrary WASI modules) with no network and no filesystem beyond explicit
 mounts. `replacement-mcp`, `brave-mcp-search`, `visualizations`,

@@ -440,8 +440,8 @@ pub fn excel_read_rows(
             .into_iter()
             .filter_map(|i| objects.get(i).cloned())
             .collect();
-        let message = no_match
-            .then(|| format!("No direct matches for query '{q}'. Showing top section."));
+        let message =
+            no_match.then(|| format!("No direct matches for query '{q}'. Showing top section."));
         let mut meta = serde_json::Map::new();
         meta.insert("filtered_by_query".into(), json!(q));
         meta.insert("total_matches".into(), json!(total_matches));

@@ -114,12 +114,15 @@ fn pdf_read_text_page_range() {
 
 #[test]
 fn pdf_read_text_not_found() {
-    let dir = std::env::temp_dir().join(format!(
-        "kitty-tools-pdf-missing-{}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("kitty-tools-pdf-missing-{}", std::process::id()));
     let missing = dir.join("does-not-exist.pdf");
-    let v = parse(&pdf_read_text(missing.to_str().unwrap(), None, None, None, 0));
+    let v = parse(&pdf_read_text(
+        missing.to_str().unwrap(),
+        None,
+        None,
+        None,
+        0,
+    ));
     assert_eq!(v["error_code"], "PDF_NOT_FOUND");
 }
 

@@ -7,18 +7,25 @@ import { CodeBlock } from './CodeBlock';
 import { splitIncremental, type SplitCache } from './markdownSplit';
 import { ipc } from '@/lib/ipc';
 
-/** Open markdown links with the OS default handler instead of navigating the
+/** Open markdown links in the OS default browser instead of navigating the
     Kitty window itself — Tauri's webview otherwise treats a bare `<a href>`
-    as in-window navigation. `open_path` already opens both file paths and
-    `https://` URLs via the OS default handler (same command the wizard's
-    "View release" link uses). */
+    as in-window navigation, replacing the app with the page.
+
+    `openUrl`, not `openPath`: the latter does nothing at all on Android (the
+    opener plugin's mobile `open_path` sends a payload its own Kotlin side
+    cannot parse), which is why links in chat were dead there. It rejects
+    anything that is not http(s), so a link a model was talked into emitting
+    cannot launch an intent or a local file. */
 function ExternalLink({ href, children }: { href?: string; children?: ReactNode }) {
   return (
     <a
       href={href}
       onClick={(e) => {
         e.preventDefault();
-        if (href) void ipc.openPath(href);
+        if (href)
+          void ipc.openUrl(href).catch(() => {
+            /* a non-web scheme is refused Rust-side; nothing useful to show */
+          });
       }}
     >
       {children}

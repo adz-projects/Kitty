@@ -41,7 +41,7 @@ import type {
   ToolCallUpdate,
 } from '@/lib/types';
 
-import { decideChatApproval, pickRejectOption } from './chat/approvalUtils';
+import { decideChatApproval } from './chat/approvalUtils';
 import {
   buildStrippedTranscript,
   isConnectivityError,
@@ -50,15 +50,7 @@ import {
   stripRecipeWrapper,
   stripInternalMarkers,
 } from './chat/errorUtils';
-import {
-  countToolCall,
-  hasRepetitionLoop,
-  splitLeakedThinkTag,
-  TOOL_LOOP_THRESHOLD,
-  trackToolAlternation,
-  type ToolAlternationState,
-  type ToolCallCounts,
-} from './chat/loopGuards';
+import { hasRepetitionLoop, splitLeakedThinkTag } from './chat/loopGuards';
 import {
   closeOpen,
   deriveArtifact,
@@ -397,14 +389,6 @@ const clearStopGrace = () => {
 };
 let msgSeq = 0;
 const newId = () => `m${Date.now()}_${++msgSeq}`;
-
-// Live counts backing the chat-mode tool-loop guard (see `countToolCall`
-// in ./chat/loopGuards) — module-level like `stopGraceTimer`, reset at the
-// start of every fresh turn in `send()`.
-let toolLoopCounts: ToolCallCounts = new Map();
-// Alternation state for the same guard (see `trackToolAlternation`) — reset
-// alongside `toolLoopCounts` at every fresh turn.
-let toolAlternation: ToolAlternationState = new Map();
 
 // Synchronous in-flight guard for turn submission (Round-WS8): `busy` is
 // committed only after several awaits (ensureSession, image reads, …), so a
@@ -936,12 +920,8 @@ export const useChatStore = create<ChatState>((set, get) => {
       if (get().sessionId !== sessionId) return false;
       // Fresh turn: clear any leftover stop/abandon state so its events flow
       // and a prior force-stop on this session no longer suppresses them.
-      // Also reset the tool-loop guard — a call repeating across different
-      // turns is normal, not a loop.
       clearStopGrace();
       discardDeltas();
-      toolLoopCounts = new Map();
-      toolAlternation = new Map();
       set((s) => ({
         messages: [...s.messages, userMsg],
         droppedFiles: [],
@@ -2047,8 +2027,6 @@ export const useChatStore = create<ChatState>((set, get) => {
       // branch.
       clearStopGrace();
       discardDeltas();
-      toolLoopCounts = new Map();
-      toolAlternation = new Map();
       set((s) => {
         const msgs = s.messages.slice();
         msgs[assistantIndex] = { ...msgs[assistantIndex], superseded: true };
@@ -2456,35 +2434,24 @@ export const useChatStore = create<ChatState>((set, get) => {
         const dirs = g
           ? [g.chat_dir, g.cwd, ...g.working_dirs, ...g.attached_paths]
           : [s0.chatDir, s0.cwd];
-        // Tool-loop guard (owner-reported bug): a model can get stuck
-        // alternating tools (e.g. web-fetch ↔ its own cache step) against
-        // the same target — each call is real network/disk I/O, so this
-        // must be checked *before* deciding to allow it, not after.
+        // The tool-loop guard that used to decline a repeated call here is
+        // gone. It counted identical calls in a turn and rejected the fifth,
+        // which stopped being a loop detector once the lean readers and
+        // writers went paged: `lean_file_read`, `lean_pdf_read_text` and
+        // `lean_doc_read_chunk` are meant to be called once per window, so
+        // reading a long document end to end is a legitimate run of
+        // identical-looking calls and the guard cut it off mid-document. It
+        // was also only ever reached for calls that paused for approval, so
+        // an auto-approved tool could repeat freely while an approved one
+        // could not.
+        //
+        // The daemon nudges instead: after several consecutive calls to one
+        // tool it appends a note to the tool result asking the model to check
+        // whether it already has what it needs (`REPEAT_TOOL_NUDGE_AFTER` in
+        // `agent/loop_.rs`). That reaches the model, which is the only party
+        // that can tell "still paging" from "stuck", and it cannot strand a
+        // turn halfway through a document.
         const title = String(e.tool_call.title ?? e.tool_call.kind ?? 'tool');
-        const { count, counts } = countToolCall(toolLoopCounts, title, e.tool_call.rawInput);
-        toolLoopCounts = counts;
-        const { flips, state: alternation } = trackToolAlternation(
-          toolAlternation,
-          title,
-          e.tool_call.rawInput
-        );
-        toolAlternation = alternation;
-        if (count > TOOL_LOOP_THRESHOLD || flips > TOOL_LOOP_THRESHOLD) {
-          void ipc.respondPermission(e.tool_call_id, pickRejectOption(e.options)).catch((err) => {
-            // If this never reaches the backend, the paused tool call has no
-            // way to resolve and the turn hangs waiting for a decision that
-            // was already made on this side.
-            console.warn('respondPermission (tool-loop reject) failed', err);
-          });
-          set({
-            warning:
-              `Declined — "${title}" has been called ${count} times with the same target ` +
-              `this turn${flips > TOOL_LOOP_THRESHOLD ? ' (or is alternating tools against it)' : ''}. ` +
-              `The model appears stuck in a loop; try Force Stop if it doesn't ` +
-              `recover on its own.`,
-          });
-          return;
-        }
         const { decision, optionId, warning } = decideChatApproval(
           e.tool_call.rawInput,
           dirs,

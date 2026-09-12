@@ -41,7 +41,10 @@ fn assert_every_property_documented(schema: &Value, type_name: &str) {
 }
 
 fn assert_properties_documented(schema: &Value, context: &str) {
-    let properties = schema.get("properties").and_then(Value::as_object).unwrap_or_else(|| panic!("{context} has no `properties`"));
+    let properties = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .unwrap_or_else(|| panic!("{context} has no `properties`"));
     for (field, field_schema) in properties {
         let description = field_schema
             .get("description")
@@ -56,10 +59,19 @@ fn assert_properties_documented(schema: &Value, context: &str) {
 }
 
 fn assert_enum_defs_are_flat(schema: &Value, expected: &[(&str, &[&str])]) {
-    let defs = schema.get("$defs").and_then(Value::as_object).expect("schema has no $defs");
+    let defs = schema
+        .get("$defs")
+        .and_then(Value::as_object)
+        .expect("schema has no $defs");
     for (def_name, expected_values) in expected {
-        let def = defs.get(*def_name).unwrap_or_else(|| panic!("missing $defs.{def_name}"));
-        assert_eq!(def.get("type").and_then(Value::as_str), Some("string"), "$defs.{def_name} must be a flat string enum, not oneOf");
+        let def = defs
+            .get(*def_name)
+            .unwrap_or_else(|| panic!("missing $defs.{def_name}"));
+        assert_eq!(
+            def.get("type").and_then(Value::as_str),
+            Some("string"),
+            "$defs.{def_name} must be a flat string enum, not oneOf"
+        );
         assert!(def.get("oneOf").is_none(), "$defs.{def_name} regressed to oneOf-of-const -- a variant must have picked up a doc comment");
         let actual: Vec<&str> = def
             .get("enum")
@@ -68,7 +80,10 @@ fn assert_enum_defs_are_flat(schema: &Value, expected: &[(&str, &[&str])]) {
             .iter()
             .map(|v| v.as_str().unwrap())
             .collect();
-        assert_eq!(&actual, expected_values, "$defs.{def_name} enum values changed");
+        assert_eq!(
+            &actual, expected_values,
+            "$defs.{def_name} enum values changed"
+        );
     }
 }
 
@@ -77,13 +92,30 @@ fn svg_request_schema_is_fully_documented() {
     let schema = schema_value::<AccessibleSvgRequest>();
     assert_every_property_documented(&schema, "AccessibleSvgRequest");
 
-    let required: Vec<&str> = schema["required"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
-    assert_eq!(required, vec!["diagram_type", "title", "description", "steps"]);
+    let required: Vec<&str> = schema["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(
+        required,
+        vec!["diagram_type", "title", "description", "steps"]
+    );
 
     assert_enum_defs_are_flat(
         &schema,
         &[
-            ("VizDiagramType", &["single_lane", "flowchart", "tree", "swimlane", "journey_map"]),
+            (
+                "VizDiagramType",
+                &[
+                    "single_lane",
+                    "flowchart",
+                    "tree",
+                    "swimlane",
+                    "journey_map",
+                ],
+            ),
             ("VizStepType", &["start", "process", "decision", "end"]),
         ],
     );
@@ -94,10 +126,24 @@ fn chart_request_schema_is_fully_documented() {
     let schema = schema_value::<AccessibleChartRequest>();
     assert_every_property_documented(&schema, "AccessibleChartRequest");
 
-    let required: Vec<&str> = schema["required"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
-    assert_eq!(required, vec!["chart_type", "title", "description", "categories", "series"]);
+    let required: Vec<&str> = schema["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(
+        required,
+        vec!["chart_type", "title", "description", "categories", "series"]
+    );
 
-    assert_enum_defs_are_flat(&schema, &[("VizChartType", &["bar", "horizontal_bar", "line", "grouped_bar"])]);
+    assert_enum_defs_are_flat(
+        &schema,
+        &[(
+            "VizChartType",
+            &["bar", "horizontal_bar", "line", "grouped_bar"],
+        )],
+    );
 }
 
 #[test]
@@ -105,7 +151,12 @@ fn table_request_schema_is_fully_documented() {
     let schema = schema_value::<AccessibleTableRequest>();
     assert_every_property_documented(&schema, "AccessibleTableRequest");
 
-    let required: Vec<&str> = schema["required"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+    let required: Vec<&str> = schema["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
     assert_eq!(required, vec!["title", "headers", "rows"]);
 }
 
@@ -114,7 +165,12 @@ fn mermaid_request_schema_is_fully_documented() {
     let schema = schema_value::<AccessibleMermaidRequest>();
     assert_every_property_documented(&schema, "AccessibleMermaidRequest");
 
-    let required: Vec<&str> = schema["required"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+    let required: Vec<&str> = schema["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
     assert_eq!(required, vec!["title", "description", "mermaid"]);
 }
 
@@ -125,13 +181,26 @@ fn boolean_subschema_paths(schema: &Value, path: &str, out: &mut Vec<String>) {
         out.push(path.to_string());
         return;
     }
-    let Some(obj) = schema.as_object() else { return };
-    for kw in ["items", "additionalItems", "contains", "propertyNames", "not", "additionalProperties", "unevaluatedProperties", "unevaluatedItems"] {
+    let Some(obj) = schema.as_object() else {
+        return;
+    };
+    for kw in [
+        "items",
+        "additionalItems",
+        "contains",
+        "propertyNames",
+        "not",
+        "additionalProperties",
+        "unevaluatedProperties",
+        "unevaluatedItems",
+    ] {
         if let Some(v) = obj.get(kw) {
             // `additionalProperties: false` is the standard "no extra
             // parameters" marker, understood everywhere; only `true` is the
             // problem shape.
-            if (kw == "additionalProperties" || kw == "unevaluatedProperties") && v == &Value::Bool(false) {
+            if (kw == "additionalProperties" || kw == "unevaluatedProperties")
+                && v == &Value::Bool(false)
+            {
                 continue;
             }
             boolean_subschema_paths(v, &format!("{path}.{kw}"), out);
@@ -162,10 +231,22 @@ fn boolean_subschema_paths(schema: &Value, path: &str, out: &mut Vec<String>) {
 #[test]
 fn no_viz_schema_contains_a_boolean_subschema() {
     for (name, schema) in [
-        ("AccessibleSvgRequest", schema_value::<AccessibleSvgRequest>()),
-        ("AccessibleChartRequest", schema_value::<AccessibleChartRequest>()),
-        ("AccessibleTableRequest", schema_value::<AccessibleTableRequest>()),
-        ("AccessibleMermaidRequest", schema_value::<AccessibleMermaidRequest>()),
+        (
+            "AccessibleSvgRequest",
+            schema_value::<AccessibleSvgRequest>(),
+        ),
+        (
+            "AccessibleChartRequest",
+            schema_value::<AccessibleChartRequest>(),
+        ),
+        (
+            "AccessibleTableRequest",
+            schema_value::<AccessibleTableRequest>(),
+        ),
+        (
+            "AccessibleMermaidRequest",
+            schema_value::<AccessibleMermaidRequest>(),
+        ),
     ] {
         let mut found = Vec::new();
         boolean_subschema_paths(&schema, name, &mut found);
@@ -205,8 +286,14 @@ fn file_cache_and_scratchpad_schemas_are_fully_documented() {
         &schema_value::<CacheFilenameRequest>(),
         "CacheFilenameRequest",
     );
-    assert_every_property_documented(&schema_value::<ScratchpadSetRequest>(), "ScratchpadSetRequest");
-    assert_every_property_documented(&schema_value::<ScratchpadKeyRequest>(), "ScratchpadKeyRequest");
+    assert_every_property_documented(
+        &schema_value::<ScratchpadSetRequest>(),
+        "ScratchpadSetRequest",
+    );
+    assert_every_property_documented(
+        &schema_value::<ScratchpadKeyRequest>(),
+        "ScratchpadKeyRequest",
+    );
 }
 
 /// `max_depth` used to be `Option<u32>`, which schemars renders as

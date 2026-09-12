@@ -279,6 +279,12 @@ export const ipc = {
   copyFileIntoChatFolder: (sourcePath: string, cwd: string) =>
     invoke<string>('copy_file_into_chat_folder', { sourcePath, cwd }),
   writeFile: (path: string, content: string) => invoke<void>('write_file', { path, content }),
+  /** Write `name` into a directory the user picked. Not a `writeFile` with a
+      joined path: on Android the folder picker returns a tree URI, which has
+      no join operation — a document has to be created inside it. See the Rust
+      `write_file_in_dir`. */
+  writeFileInDir: (dir: string, name: string, content: string) =>
+    invoke<void>('write_file_in_dir', { dir, name, content }),
   inspectPaths: (paths: string[]) => invoke<PathInfo[]>('inspect_paths', { paths }),
   /** Make attached files openable by the model's file tools, copying any that
       sit outside the tool plugins' own reachable root into `cwd`. See the Rust
@@ -287,6 +293,10 @@ export const ipc = {
   stageAttachments: (paths: string[], cwd: string) =>
     invoke<StagedAttachment[]>('stage_attachments', { paths, cwd }),
   openPath: (path: string) => invoke<void>('open_path', { path }),
+  /** Open an http(s) link in the OS default browser. Distinct from
+      `openPath`, which cannot open a URL on Android at all — see the Rust
+      `open_url`. */
+  openUrl: (url: string) => invoke<void>('open_url', { url }),
   revealPath: (path: string) => invoke<void>('reveal_path', { path }),
   /** Save a copy of a file wherever the user picks. Resolves `false` if they
       cancelled the dialog. */

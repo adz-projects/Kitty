@@ -124,7 +124,3 @@ export interface CachedModeInfo {
   mode: string;
   availableModes: import('@/lib/types').ModeInfo[];
 }
-
-/** Map of tool-call "signature" (see `toolCallSignature`) to how many times
-    it's been seen this turn — backs the chat-mode tool-loop guard. */
-export type ToolCallCounts = Map<string, number>;

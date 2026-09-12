@@ -216,6 +216,23 @@ impl Orchestrator {
         self.limit
     }
 
+    /// How many delegates a single fan-out can realistically finish.
+    ///
+    /// `limit` delegates run at a time and the batch gets
+    /// `FAN_OUT_DEADLINE_WAVES` waves of `timeout` before its shared deadline
+    /// expires, so this is the honest ceiling — beyond it, the extra sources
+    /// are reported as "the batch ran out of time before this source was
+    /// reached" no matter how long anyone waits.
+    ///
+    /// Callers use it to *refuse* an oversized fan-out up front. That matters
+    /// because the alternative is not merely slower, it is the failure mode
+    /// `MAX_FAN_OUT` already rejects by name: silently doing part of the work.
+    /// A cap that only the deadline enforces does exactly that, one element at
+    /// a time, with no single message saying the request was too big.
+    pub fn completable_fan_out(&self) -> usize {
+        self.limit.saturating_mul(FAN_OUT_DEADLINE_WAVES as usize)
+    }
+
     /// Run one delegate to completion and return its final answer.
     ///
     /// The permit is taken *before* the session is created, so a run waiting
@@ -611,6 +628,35 @@ fn short(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn test_pool() -> SqlitePool {
+        SqlitePool::connect("sqlite::memory:").await.unwrap()
+    }
+
+    /// `MAX_FAN_OUT` is a spend ceiling; this is the one that reflects what a
+    /// batch can actually finish, and `specialists::server` refuses above it
+    /// rather than letting the shared deadline time out the overflow one
+    /// element at a time.
+    #[tokio::test]
+    async fn completable_fan_out_follows_the_concurrency_limit() {
+        let pool = test_pool().await;
+
+        // Default config: 3 concurrent x 3 deadline waves.
+        let o = Orchestrator::new(pool.clone(), 3, 0.25, Vec::new(), 300);
+        assert_eq!(o.limit(), 3);
+        assert_eq!(o.completable_fan_out(), 9);
+
+        // Raising the concurrency limit raises it, which is what the refusal
+        // message tells the caller to do.
+        let o = Orchestrator::new(pool.clone(), 8, 0.25, Vec::new(), 300);
+        assert_eq!(o.completable_fan_out(), 24);
+
+        // `new` floors the limit at 1, so this can never be zero — a zero cap
+        // would refuse every fan-out, including a two-source one.
+        let o = Orchestrator::new(pool, 0, 0.25, Vec::new(), 300);
+        assert_eq!(o.limit(), 1);
+        assert_eq!(o.completable_fan_out(), FAN_OUT_DEADLINE_WAVES as usize);
+    }
 
     #[test]
     fn short_collapses_whitespace_and_bounds_length() {

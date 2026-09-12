@@ -537,7 +537,10 @@ mod tests {
             len: 0,
             mtime_nanos: 0,
         };
-        assert_eq!(display_all(&raw), vec!["1: alpha".to_string(), "2: beta".to_string()]);
+        assert_eq!(
+            display_all(&raw),
+            vec!["1: alpha".to_string(), "2: beta".to_string()]
+        );
         assert_eq!(
             display_window(&raw, 1, 5),
             (vec!["2: beta".to_string()], false)
@@ -549,7 +552,10 @@ mod tests {
             ..raw.clone()
         };
         // Legacy units are already numbered: serve verbatim, never double up.
-        assert_eq!(display_all(&legacy), vec!["1: alpha".to_string(), "2: beta".to_string()]);
+        assert_eq!(
+            display_all(&legacy),
+            vec!["1: alpha".to_string(), "2: beta".to_string()]
+        );
         assert_eq!(
             display_window(&legacy, 0, 10),
             (vec!["1: alpha".to_string(), "2: beta".to_string()], false)

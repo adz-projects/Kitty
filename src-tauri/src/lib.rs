@@ -125,15 +125,14 @@ pub fn run() {
         builder = builder.plugin(tauri_plugin_notification::init());
     }
 
-    // Android only, and used only from Rust (`commands::download_file`): the
-    // save dialog returns a `content://` URI, and this plugin is what resolves
-    // one to a writable file descriptor via the ContentResolver. Its JS
-    // commands are registered but unreachable — `capabilities/default.json`
-    // grants none of them, so the webview gains no filesystem access from
-    // this. Desktop writes the chosen path directly and needs nothing.
+    // `tauri-plugin-fs` used to be registered here, as the only way to turn a
+    // `content://` URI into a writable file descriptor. It is gone: its mode
+    // handling is what produced zero-byte saves (see `android::documents`), and
+    // with the ContentResolver work moved into Kitty's own Kotlin plugin it had
+    // no consumer left. Registering a filesystem plugin nothing calls is
+    // surface for nothing, even with the webview granted none of its commands.
     #[cfg(target_os = "android")]
     {
-        builder = builder.plugin(tauri_plugin_fs::init());
         // Must come before anything reads a secret — provider registration in
         // `start_stack` does, and this is what backs `keyring::get_secret` on
         // Android. Registered here rather than in `setup` so the plugin's own
@@ -198,6 +197,7 @@ pub fn run() {
             commands::copy_file_into_chat_folder,
             commands::stage_attachments,
             commands::write_file,
+            commands::write_file_in_dir,
             commands::list_folders,
             commands::create_folder,
             commands::rename_folder,
@@ -224,6 +224,7 @@ pub fn run() {
             commands::set_session_persona_override,
             commands::inspect_paths,
             commands::open_path,
+            commands::open_url,
             commands::reveal_path,
             commands::download_file,
             commands::list_directory,

@@ -255,6 +255,63 @@ to conform to. This is a behavioral contract, not styling:
   `python plugins/build.py` overwrites them with real frozen executables —
   see `src-tauri/binaries/README.md`.
 
+## Scraped search engines — verified surface (2026-09-11)
+
+`kitty-web` scrapes two engines. Neither is a versioned API, so this records
+what was actually observed rather than what is documented anywhere.
+
+### DuckDuckGo — `https://html.duckduckgo.com/html/` (POST `q`, `kl=wt-wt`)
+
+- **Challenges under concurrent load, probabilistically.** Six sequential
+  queries with no delay returned three real pages and three challenges; a
+  six-way parallel run later returned challenges for *all six*. The challenge
+  persists for a while after the burst stops — an IP that has been hammered
+  keeps getting refused for minutes.
+- **The challenge is served with `HTTP 202`**, not an error status, so
+  `StatusCode::is_success()` accepts it. This is the whole reason
+  `classify_scrape_status` gates on a literal `200`.
+- Challenge page markers: `anomaly.js`, `cc=botnet`, `challenge-form`, and the
+  visible string "Unfortunately, bots use DuckDuckGo too." `ddg_challenge_marker`
+  checks the first three, **only for a response that parsed to zero results** —
+  so it can never demote a working page.
+- Results markup unchanged: `div.result` / `div.web-result`, `a.result__a`,
+  `a.result__snippet`, with hrefs wrapped as `//duckduckgo.com/l/?uddg=<encoded>`.
+- `lite.duckduckgo.com/lite/` is challenged identically — not an alternative.
+  The internal JSON endpoint `links.duckduckgo.com/d.js` returns an `is506`
+  block signal rather than results, so it is not a bypass either.
+
+### Bing — `https://www.bing.com/search` (GET `q`, `setlang=en`)
+
+- No challenge observed, including during the parallel runs where DuckDuckGo
+  refused every request.
+- Markup: `li.b_algo` containers; title in `h2 a[href]`; snippet in
+  `.b_caption p.b_lineclamp2`; display URL in `cite`. Ads carry `b_ad` in the
+  container class.
+- **Result URLs are wrapped**: `https://www.bing.com/ck/a?…&u=a1<base64url>`.
+  The `a1` prefix is a format tag; strip it and base64url-decode (no padding)
+  for the real target. `unwrap_bing_redirect` falls back to the wrapper URL,
+  and the domain to `<cite>`, when the payload doesn't decode.
+- **There is no keyed alternative.** Microsoft retired the standalone Bing
+  Search API, so this engine is scrape-only — verify before assuming an API
+  route exists.
+
+### Engines evaluated and rejected
+
+Mojeek (captcha), Ecosia (HTTP 403), `search.brave.com` HTML (connection
+refused), Startpage (no result markup without JS), Stract (404), and four
+public SearXNG instances (JSON format disabled / 429 / 403 / bot-wall).
+Marginalia's key-free API (`api.marginalia.nu/public/search/{q}`) works and
+needs no key, but its index is small and long-tail-only and its results are
+**CC-BY-NC-SA 4.0** — a non-commercial licence not worth taking on.
+
+### Pacing
+
+`plugins/kitty-web/src/ratelimit.rs` spaces requests process-wide — 800ms for
+DuckDuckGo, 600ms for Bing, 2 back-to-back after idle, queue refused past 20s.
+Process-wide is the correct scope because BigTiny holds one `kitty-web` client
+for the whole daemon (`MCPServerManager::servers`), so the main agent and every
+`call_specialist` delegate share it.
+
 ## `lean_web_search` merge — `brave_mcp_search` + `lean_fallback_web_search` retired
 
 - `brave_mcp_search` (Rust, `kitty-tools`, gated on `BRAVE_API_KEY`) and
@@ -742,3 +799,67 @@ All five builtin specialists are read-only or sandboxed (web reads, document
 readers, `wasm_python_run`); none names `shell` or a write tool. A
 *user-authored* specialist that lists one will now run it unattended, which is
 what listing it means.
+
+## Saving files out of the Android app, and opening links (0.10.4)
+
+Three reported faults, one root cause: **Kitty had no working write path off
+Android.** Everything the app can write with `std::fs` is inside its private
+data directory, which no other app — including the system Files app — can see
+into. Anything leaving Kitty has to go through a `content://` URI the user
+granted, and `std::fs` cannot open one: there is no file there, only a provider
+that will hand out a stream through the ContentResolver.
+
+Each save path met that mismatch differently, which is why it read as three
+unrelated bugs:
+
+| Path | URI it got | What went wrong |
+|---|---|---|
+| `exportSession` (single chat) | document, from `ACTION_CREATE_DOCUMENT` | `std::fs::write` on a URI → "directory isn't writeable", including for Drive |
+| `exportSelected` (bulk, Saved Chats) | **tree**, from `ACTION_OPEN_DOCUMENT_TREE` | built `` `${dir}/${base}.jsonl` `` — a tree URI has no join; the result is not a valid URI of either kind |
+| `download_file` (artifacts) | document | opened via `tauri-plugin-fs` with mode `"wt"`; providers accept the `t` flag and commit nothing → **zero-byte file, no error** |
+
+`android::documents` replaces all three with one Kotlin entry point
+(`KittyPlugin.writeDocument`). It takes either URI kind — creating a document
+inside a tree via `DocumentsContract.createDocument` when given one — opens
+`"w"` rather than `"wt"` (truncation is meaningless on a document
+`ACTION_CREATE_DOCUMENT` has just created), and **returns the byte count the
+provider actually accepted**. Callers verify against what they sent, so a short
+write is an error the user sees rather than an empty file they find later. A
+new `write_file_in_dir` command exists because "directory plus name" cannot be
+a path join on Android; desktop keeps the join, so callers stay
+platform-agnostic.
+
+Two smaller decisions inside that:
+
+- **`.jsonl` is declared `text/plain`, not `application/json`.** A provider may
+  correct a document's extension to match its MIME type, and JSON Lines is not
+  JSON — declaring it as such would silently rename every chat export to
+  `.json`.
+- **`tauri-plugin-fs` is no longer registered or depended on.** Its mode
+  handling was the zero-byte bug, and `download_file` was its only consumer.
+
+### Links in chat did nothing on Android
+
+Separate bug, same release. `tauri-plugin-opener`'s **mobile `open_path` is
+broken**: it sends the target as a bare JSON string
+(`run_mobile_plugin("open", path.into())`), while its own Kotlin side does
+`invoke.parseArgs(OpenArgs::class.java)` and expects `{url, with}`. Every call
+rejected before reaching an Intent. Its `open_url` builds that object
+correctly.
+
+Markdown links now go through a new `open_url` command, which is the right
+entry point for a URL on every platform anyway. It refuses anything that is not
+`http(s)`: a markdown link is attacker-influenced text — a model can be talked
+into emitting one — and `open_url` will otherwise hand any scheme to the
+system, including `file://` and `intent://`.
+
+`open_path` keeps its filesystem callers (artifacts Open / Show in Folder),
+which are desktop-only and were never affected.
+
+### Where the tests are
+
+`base64_encode` lives in `util.rs`, not beside its only caller in
+`android::documents`. That module is `cfg(target_os = "android")`, so tests
+inside it never run on the desktop or in CI — and a wrong base64 pad is a
+corrupted export that still reports success. The RFC 4648 vectors are pinned
+where they actually execute.

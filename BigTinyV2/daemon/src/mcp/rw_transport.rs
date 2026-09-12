@@ -25,9 +25,18 @@
 //!    send queues behind it in a growing `JoinSet` — a task leak plus total,
 //!    permanent loss of that server even though the caller's own timeout
 //!    fires. Here every send is bounded by `WRITE_TIMEOUT`; a send that
-//!    times out marks the transport closed so subsequent sends fail fast
-//!    (which surfaces to the manager as a dead server it can evict and
-//!    reconnect) instead of piling up behind the wedged one.
+//!    times out marks the transport wedged, which fails subsequent sends
+//!    fast *and* ends the read side, so rmcp reports the transport closed
+//!    and `MCPManager`'s health watcher evicts and reconnects the server.
+//!
+//!    Ending the read side is the part that makes this recoverable rather
+//!    than merely bounded, and it was missing. A peer that stops draining
+//!    its stdin usually keeps its stdout open, so `receive()` stayed pending
+//!    forever, rmcp's serve loop never finished, `is_transport_closed()`
+//!    never flipped, and the health watcher never saw a server to evict. The
+//!    wedge flag became a permanent one-way latch: every later call returned
+//!    "transport is wedged" for the life of the process, and the tools on
+//!    that server were gone until the app restarted.
 //!
 //! The read side drives `rmcp`'s line codec by hand rather than wrapping it
 //! in a `tokio_util::codec::FramedRead`, because `FramedRead` latches itself
@@ -47,7 +56,7 @@ use rmcp::transport::async_rw::{JsonRpcMessageCodec, JsonRpcMessageCodecError};
 use rmcp::transport::Transport;
 use rmcp::RoleClient;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
-use tokio::sync::Mutex;
+use tokio::sync::{watch, Mutex};
 use tokio_util::codec::{Decoder, FramedWrite};
 
 /// Maximum bytes for one JSON-RPC line. Past this the codec discards to the
@@ -61,7 +70,28 @@ pub const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
 /// How long a single outbound write may block before the transport is
 /// declared dead. A child that isn't draining its stdin is wedged; waiting
 /// longer only grows the queue behind it.
+///
+/// This bounds the `send` itself and nothing else. Time spent waiting for the
+/// write lock is bounded separately by [`QUEUE_TIMEOUT`] — see there for why
+/// conflating the two is a bug rather than a simplification.
 pub const WRITE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// How long a write may wait its turn for the write lock before giving up.
+///
+/// Separate from [`WRITE_TIMEOUT`], and deliberately not folded into it. Only
+/// one task may hold the writer at a time, so a burst of concurrent tool calls
+/// — which is now the normal shape of a turn, since a specialist fan-out sends
+/// every delegate's calls through this one transport — queues here. Timing the
+/// lock wait *and* the send under one budget means a writer can exhaust it
+/// without the peer ever having been asked to do anything, and the expiry
+/// handler reads that as "the peer is not draining its input" and condemns the
+/// whole transport. One server's entire tool set then disappears mid-turn
+/// because several calls happened to arrive at once.
+///
+/// So: exceeding this is reported as congestion and fails only the call that
+/// waited. Only the send itself, once this task actually owns the writer, is
+/// evidence about the peer.
+pub const QUEUE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Spare capacity ensured before each read.
 const READ_CHUNK_BYTES: usize = 16 * 1024;
@@ -181,6 +211,22 @@ pub struct HardenedRwTransport<R, W> {
     /// Set once a write times out, so later sends fail immediately rather
     /// than each burning their own `WRITE_TIMEOUT` behind the same wedge.
     wedged: Arc<AtomicBool>,
+    /// Wakes a pending `receive()` when `wedged` is set, so the serve loop
+    /// ends promptly instead of on the peer's next byte (which, for a peer
+    /// that has stopped reading its input, may be never).
+    ///
+    /// A `watch` rather than a `Notify` because it keeps its value: a
+    /// receiver that checks the current state and *then* waits cannot miss a
+    /// change that landed in between, which a missed `notify_waiters` would
+    /// turn back into the permanent hang this exists to prevent.
+    ///
+    /// Set with `send_replace`, never `send`. `send` returns `Err` *and leaves
+    /// the value unchanged* when no receiver is currently subscribed, and the
+    /// only subscriber is created inside `receive()` — so a wedge that happens
+    /// while nothing is parked there would be silently dropped, which is the
+    /// same permanent hang by a subtler route. The unit test below that ends a
+    /// `receive()` after the latch is what catches this.
+    wedge_tx: watch::Sender<bool>,
 }
 
 impl<R, W> HardenedRwTransport<R, W>
@@ -196,6 +242,7 @@ where
                 JsonRpcMessageCodec::new_with_max_length(MAX_FRAME_BYTES),
             )))),
             wedged: Arc::new(AtomicBool::new(false)),
+            wedge_tx: watch::channel(false).0,
         }
     }
 
@@ -205,12 +252,31 @@ where
         self.read.next_message().await
     }
 
+    /// `next_message`, but also ending at `None` once the transport is
+    /// wedged — which is what lets a wedged peer be recovered rather than
+    /// merely detected. See this module's header.
+    ///
+    /// Cancellation-safe, as `receive()` must be: `next_message` keeps its
+    /// buffer in the `Reader` rather than on the stack, and `changed()` holds
+    /// no state a drop could lose.
+    async fn next_message_or_wedge(&mut self) -> Option<RxJsonRpcMessage<RoleClient>> {
+        let mut wedge_rx = self.wedge_tx.subscribe();
+        if *wedge_rx.borrow_and_update() {
+            return None;
+        }
+        tokio::select! {
+            message = self.read.next_message() => message,
+            _ = wedge_rx.changed() => None,
+        }
+    }
+
     fn send_bounded(
         &mut self,
         item: TxJsonRpcMessage<RoleClient>,
     ) -> impl std::future::Future<Output = Result<(), std::io::Error>> + Send + 'static {
         let lock = self.write.clone();
         let wedged = self.wedged.clone();
+        let wedge_tx = self.wedge_tx.clone();
         async move {
             if wedged.load(Ordering::Relaxed) {
                 return Err(std::io::Error::new(
@@ -218,24 +284,58 @@ where
                     "MCP transport is wedged (a previous write timed out)",
                 ));
             }
-            let write_fut = async {
-                let mut guard = lock.lock().await;
-                match guard.as_mut() {
-                    Some(write) => write.send(item).await.map_err(std::io::Error::from),
-                    None => Err(std::io::Error::new(
-                        std::io::ErrorKind::NotConnected,
-                        "MCP transport is closed",
-                    )),
+            // Waiting our turn is not evidence about the peer, so it gets its
+            // own budget and its own (non-fatal) failure.
+            let mut guard = match tokio::time::timeout(QUEUE_TIMEOUT, lock.lock()).await {
+                Ok(guard) => guard,
+                Err(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        format!(
+                            "MCP transport write queued behind other calls for {}s;                              the peer is still considered healthy",
+                            QUEUE_TIMEOUT.as_secs()
+                        ),
+                    ));
                 }
             };
-            match tokio::time::timeout(WRITE_TIMEOUT, write_fut).await {
-                Ok(result) => result,
+
+            // Re-checked now that we hold the writer: the wedge may have been
+            // latched by whoever was ahead of us in the queue. Without this,
+            // every writer that was already waiting goes on to burn its own
+            // full `WRITE_TIMEOUT` against a peer already known to be dead.
+            if wedged.load(Ordering::Relaxed) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "MCP transport is wedged (a previous write timed out)",
+                ));
+            }
+
+            let Some(write) = guard.as_mut() else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "MCP transport is closed",
+                ));
+            };
+
+            match tokio::time::timeout(WRITE_TIMEOUT, write.send(item)).await {
+                Ok(result) => result.map_err(std::io::Error::from),
                 Err(_) => {
-                    // The peer is alive but not draining its input. Mark the
-                    // transport dead so the queue behind this write drains
-                    // as errors instead of blocking; the manager's health
-                    // watcher then evicts and reconnects the server.
+                    // We owned the writer for the whole of that, so this really
+                    // is the peer: alive, but not draining its input. Mark the
+                    // transport dead so the queue behind this write drains as
+                    // errors instead of blocking, and wake the read side so
+                    // the serve loop actually ends — without that second half
+                    // the manager never learns there is a server to evict.
                     wedged.store(true, Ordering::Relaxed);
+                    wedge_tx.send_replace(true);
+                    // Logged, not just returned: the caller's error reaches the
+                    // model as a failed tool call, which is the one audience
+                    // that cannot act on it. Losing a server's whole tool set
+                    // should leave a trace someone can find afterwards.
+                    tracing::warn!(
+                        "MCP transport write blocked for {}s; treating the peer as dead                          and tearing the transport down so it can be reconnected",
+                        WRITE_TIMEOUT.as_secs()
+                    );
                     Err(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
                         format!(
@@ -277,7 +377,7 @@ where
     fn receive(
         &mut self,
     ) -> impl std::future::Future<Output = Option<RxJsonRpcMessage<RoleClient>>> + Send {
-        self.next_message()
+        self.next_message_or_wedge()
     }
 
     async fn close(&mut self) -> Result<(), Self::Error> {
@@ -303,6 +403,19 @@ mod tests {
     fn transport(stream: tokio::io::DuplexStream) -> DuplexTransport {
         let (r, w) = tokio::io::split(stream);
         HardenedRwTransport::new(r, w)
+    }
+
+    /// A well-formed client notification, for tests that only need *some*
+    /// valid outbound message.
+    fn notification() -> TxJsonRpcMessage<RoleClient> {
+        rmcp::model::JsonRpcMessage::notification(
+            rmcp::model::ClientNotification::InitializedNotification(
+                rmcp::model::InitializedNotification {
+                    method: Default::default(),
+                    extensions: Default::default(),
+                },
+            ),
+        )
     }
 
     /// Bounded so a regression that stops skipping (and therefore waits for a
@@ -396,14 +509,7 @@ mod tests {
         let (r, w) = tokio::io::split(client_side);
         let mut t = HardenedRwTransport::new(r, w);
 
-        let msg: TxJsonRpcMessage<RoleClient> = rmcp::model::JsonRpcMessage::notification(
-            rmcp::model::ClientNotification::InitializedNotification(
-                rmcp::model::InitializedNotification {
-                    method: Default::default(),
-                    extensions: Default::default(),
-                },
-            ),
-        );
+        let msg = notification();
 
         let err = t
             .send(msg.clone())
@@ -417,5 +523,133 @@ mod tests {
             .await
             .expect_err("a wedged transport must fail fast");
         assert_eq!(err.kind(), std::io::ErrorKind::NotConnected);
+
+        // ...and the read side ends, which is what makes this recoverable.
+        // rmcp's serve loop finishes on `receive() == None`, that flips
+        // `is_transport_closed()`, and `MCPManager::health_sweep` evicts and
+        // reconnects on the strength of it. Without this the peer's stdout
+        // stays open, `receive()` waits forever, and the wedge is permanent.
+        assert!(
+            t.receive().await.is_none(),
+            "a wedged transport must end its read side so the server can be evicted"
+        );
+    }
+
+    /// Congestion is not death.
+    ///
+    /// A specialist fan-out sends every delegate's tool calls through this one
+    /// transport, so writes queue on the write lock as a matter of course.
+    /// Before the lock wait was split out of the write budget, a writer that
+    /// spent `WRITE_TIMEOUT` waiting its *turn* was reported as a peer that
+    /// had stopped draining its input — latching the wedge and taking the
+    /// server's entire tool set offline with the peer perfectly healthy.
+    #[tokio::test(start_paused = true)]
+    async fn queueing_behind_another_write_never_condemns_a_healthy_peer() {
+        // Roomy buffer and a reader that drains: this peer is healthy.
+        let (client_side, mut server_side) = tokio::io::duplex(64 * 1024);
+        let (r, w) = tokio::io::split(client_side);
+        let mut t = HardenedRwTransport::new(r, w);
+
+        tokio::spawn(async move {
+            let mut sink = Vec::new();
+            let _ = server_side.read_to_end(&mut sink).await;
+        });
+
+        // Hold the writer well past the point a *write* would be declared
+        // dead, as a slow send ahead of us in the queue would.
+        let held = t.write.clone().lock_owned().await;
+        tokio::spawn(async move {
+            tokio::time::sleep(WRITE_TIMEOUT * 2).await;
+            drop(held);
+        });
+
+        t.send(notification())
+            .await
+            .expect("a write that only had to wait its turn must still go out");
+
+        assert!(
+            !t.wedged.load(Ordering::Relaxed),
+            "waiting for the write lock latched the wedge"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), t.receive())
+                .await
+                .is_err(),
+            "a congested but healthy transport must keep its read side open"
+        );
+    }
+
+    /// A queue that never clears still has to end somewhere — but as this
+    /// caller's own failure, not as a verdict on the peer.
+    #[tokio::test(start_paused = true)]
+    async fn an_endless_queue_fails_the_waiting_call_without_wedging() {
+        let (client_side, _server_side) = tokio::io::duplex(64 * 1024);
+        let (r, w) = tokio::io::split(client_side);
+        let mut t = HardenedRwTransport::new(r, w);
+
+        // Never released.
+        let _held = t.write.clone().lock_owned().await;
+
+        let err = t
+            .send(notification())
+            .await
+            .expect_err("a write that can never start must not hang forever");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::WouldBlock,
+            "queueing was reported as peer death: {err}"
+        );
+        assert!(
+            !t.wedged.load(Ordering::Relaxed),
+            "an unreachable writer condemned a peer that was never asked to do anything"
+        );
+    }
+
+    /// The wedge has to interrupt a `receive()` that is *already* waiting.
+    ///
+    /// This is the real shape of the bug: the read is pending on a peer that
+    /// has stopped draining its input but is still holding its output open, so
+    /// nothing will ever arrive to wake it. Only the wedge itself can.
+    #[tokio::test(start_paused = true)]
+    async fn a_wedge_wakes_a_receive_that_is_already_pending() {
+        let (client_side, _server_side) = tokio::io::duplex(16);
+        let (r, w) = tokio::io::split(client_side);
+        let mut t = HardenedRwTransport::new(r, w);
+
+        // Wedge it from another task while the read below is parked. The
+        // server side is alive and never written to, so `receive()` has
+        // nothing of its own to wake on.
+        let wedge_tx = t.wedge_tx.clone();
+        let wedged = t.wedged.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            wedged.store(true, Ordering::Relaxed);
+            wedge_tx.send_replace(true);
+        });
+
+        let received = tokio::time::timeout(Duration::from_secs(30), t.receive())
+            .await
+            .expect("a wedge must wake a pending receive, not leave it parked");
+        assert!(received.is_none(), "a wedged read side must report EOF");
+    }
+
+    /// A healthy transport must not report EOF just because it is idle — the
+    /// wedge check is a latch on a real failure, not a timeout.
+    #[tokio::test]
+    async fn an_idle_healthy_transport_keeps_its_read_side_open() {
+        let (client_side, mut server_side) = tokio::io::duplex(1024);
+        let mut t = transport(client_side);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), t.receive())
+                .await
+                .is_err(),
+            "an idle transport must stay pending rather than ending the stream"
+        );
+
+        // Still usable afterwards.
+        server_side.write_all(VALID_SERVER_LINE).await.unwrap();
+        server_side.write_all(b"\n").await.unwrap();
+        assert!(next(&mut t).await.is_some());
     }
 }

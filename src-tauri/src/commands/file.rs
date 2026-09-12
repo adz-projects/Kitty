@@ -9,14 +9,90 @@ use tauri::AppHandle;
 /// Write a UTF-8 text file (Phase 11 ChatML export). The path comes from the
 /// user's native save dialog. Async + `spawn_blocking`: a sync command runs
 /// on the main thread, and a large transcript write has no business
-/// stalling the UI.
+/// stalling the UI. On Android that is a hard requirement rather than a
+/// nicety — see `android::documents`.
+///
+/// **`path` is not always a path.** Android's save dialog returns a
+/// `content://` URI, which `std::fs::write` cannot open; it failed with an
+/// unwritable-directory error that read as though the user had picked a bad
+/// folder, including when they picked Drive. Those go through the
+/// ContentResolver instead.
 #[tauri::command]
 pub async fn write_file(path: String, content: String) -> Result<(), String> {
     tokio::task::spawn_blocking(move || {
+        #[cfg(target_os = "android")]
+        if crate::android::documents::is_content_uri(&path) {
+            return crate::android::documents::write_bytes(
+                &path,
+                None,
+                Some(mime_for(&path)),
+                content.as_bytes(),
+            )
+            .map(|_| ());
+        }
         std::fs::write(&path, content).map_err(|e| format!("could not write {path}: {e}"))
     })
     .await
     .map_err(|e| format!("file write task panicked: {e}"))?
+}
+
+/// Write a file *into* a chosen directory (the Saved Chats bulk export).
+///
+/// Exists because a directory and a name cannot be joined into a path on
+/// Android. The folder picker returns a **tree** URI, and appending
+/// `"/name.jsonl"` to one — which is what the caller did, and what any
+/// filesystem-shaped API invites — yields a string that is neither a valid
+/// tree URI nor a valid document URI. A document has to be *created* inside
+/// the tree through DocumentsContract, which is what
+/// `android::documents::write_bytes` does when handed one.
+///
+/// Desktop keeps the plain join, so the caller stays platform-agnostic.
+#[tauri::command]
+pub async fn write_file_in_dir(dir: String, name: String, content: String) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        #[cfg(target_os = "android")]
+        if crate::android::documents::is_content_uri(&dir) {
+            return crate::android::documents::write_bytes(
+                &dir,
+                Some(&name),
+                Some(mime_for(&name)),
+                content.as_bytes(),
+            )
+            .map(|_| ());
+        }
+        let dest = PathBuf::from(&dir).join(&name);
+        std::fs::write(&dest, content)
+            .map_err(|e| format!("could not write {}: {e}", dest.display()))
+    })
+    .await
+    .map_err(|e| format!("file write task panicked: {e}"))?
+}
+
+/// A MIME type for a name or URI, by extension.
+///
+/// Android needs one to create a document, and the provider may correct the
+/// extension to match it — so a wrong guess here renames the user's file.
+/// `application/octet-stream` is the honest answer for anything unrecognized,
+/// and providers leave the name alone for it.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+fn mime_for(name: &str) -> &'static str {
+    let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    match ext.as_str() {
+        // `.jsonl` maps to text/plain, not application/json, deliberately:
+        // JSON Lines is not JSON (each line is its own document), and a
+        // provider that trusts the MIME type rewrites the extension to
+        // `.json` — which would silently rename every chat export.
+        "jsonl" | "txt" | "md" | "markdown" | "log" | "chatml" => "text/plain",
+        "json" => "application/json",
+        "csv" => "text/csv",
+        "html" | "htm" => "text/html",
+        "pdf" => "application/pdf",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        _ => "application/octet-stream",
+    }
 }
 
 /// Read a text file for inlining into a chat-only message (Phase 9). Rejects
@@ -246,6 +322,29 @@ pub fn open_path(app: AppHandle, path: String) -> Result<(), String> {
         .map_err(|e| format!("could not open {path}: {e}"))
 }
 
+/// Open an `http(s)` link with the OS default browser (markdown links in chat).
+///
+/// Separate from `open_path`, which cannot do this on Android: the opener
+/// plugin's mobile `open_path` sends its target as a bare JSON string, while
+/// the Kotlin side parses an object (`{url, with}`). Every call rejected before
+/// reaching an Intent, so links in chat did nothing at all. Its `open_url`
+/// builds that object correctly, and is the right entry point for a URL on
+/// every platform anyway.
+#[tauri::command]
+pub fn open_url(app: AppHandle, url: String) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    // Web links only. `open_url` hands anything with a scheme to the system,
+    // and a markdown link is attacker-influenced text — a model can be talked
+    // into emitting one. `file://`, `intent://` and friends are not things a
+    // link in a chat message should be able to launch.
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return Err(format!("refusing to open {url}: only http and https links"));
+    }
+    app.opener()
+        .open_url(&url, None::<&str>)
+        .map_err(|e| format!("could not open {url}: {e}"))
+}
+
 /// Reveal a file in its containing folder (artifacts "Show in Folder").
 #[tauri::command]
 pub fn reveal_path(app: AppHandle, path: String) -> Result<(), String> {
@@ -295,23 +394,36 @@ pub async fn download_file(app: AppHandle, path: String) -> Result<bool, String>
 
     #[cfg(target_os = "android")]
     {
-        // A `content://` URI is not a filesystem path, so it can't be
-        // `fs::copy`d — the fs plugin resolves it through the Android
-        // ContentResolver and hands back a real file descriptor.
-        use std::io::Write;
-        use tauri_plugin_fs::{FsExt, OpenOptions};
-
-        let bytes = std::fs::read(&source).map_err(|e| format!("could not read {name}: {e}"))?;
-        let mut opts = OpenOptions::new();
-        opts.write(true).truncate(true);
-        let mut out = app
-            .fs()
-            .open(target, opts.clone())
-            .map_err(|e| format!("could not open the chosen location: {e}"))?;
-        out.write_all(&bytes)
-            .map_err(|e| format!("could not save {name}: {e}"))?;
-        out.flush()
-            .map_err(|e| format!("could not save {name}: {e}"))?;
+        // A `content://` URI is not a filesystem path, so it cannot be
+        // `fs::copy`d — it goes through the ContentResolver.
+        //
+        // This used the fs plugin's `open`, which asks the provider for mode
+        // `"wt"`. Several providers, Drive among them, accept that and then
+        // commit nothing: the save reported success and left a zero-byte file.
+        // `android::documents` opens `"w"` — truncation is meaningless on a
+        // document ACTION_CREATE_DOCUMENT has just created — and returns the
+        // byte count the provider actually took, so a short write becomes an
+        // error the user sees rather than an empty file they find later.
+        //
+        // Streamed from the path rather than read into memory: an artifact can
+        // be a large PDF, and the base64 bridge would hold it three times over.
+        let len = std::fs::metadata(&source)
+            .map_err(|e| format!("could not read {name}: {e}"))?
+            .len();
+        let uri = target.to_string();
+        let source_path = source.to_string_lossy().into_owned();
+        tokio::task::spawn_blocking(move || {
+            crate::android::documents::write_from_file(
+                &uri,
+                None,
+                Some(mime_for(&name)),
+                &source_path,
+                len,
+            )
+            .map(|_| ())
+        })
+        .await
+        .map_err(|e| format!("file save task panicked: {e}"))??;
     }
     #[cfg(not(target_os = "android"))]
     {

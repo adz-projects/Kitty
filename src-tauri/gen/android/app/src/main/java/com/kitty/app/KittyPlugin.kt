@@ -3,7 +3,9 @@ package com.kitty.app
 import android.Manifest
 import android.app.Activity
 import android.net.Uri
+import android.provider.DocumentsContract
 import android.provider.OpenableColumns
+import android.util.Base64
 import android.webkit.MimeTypeMap
 import java.io.File
 import app.tauri.annotation.Command
@@ -25,6 +27,19 @@ class SecretArgs {
 class CopyContentUriArgs {
     lateinit var uri: String
     lateinit var destDir: String
+}
+
+@InvokeArg
+class WriteDocumentArgs {
+    /** Either a document URI (ACTION_CREATE_DOCUMENT) or a tree URI (ACTION_OPEN_DOCUMENT_TREE). */
+    lateinit var uri: String
+    /** Required when `uri` is a tree: the name of the document to create in it. */
+    var fileName: String? = null
+    var mimeType: String? = null
+    /** Bytes to write, base64. Exactly one of this and `sourcePath` is set. */
+    var contentBase64: String? = null
+    /** A filesystem path to stream from instead, for payloads too big to base64. */
+    var sourcePath: String? = null
 }
 
 @InvokeArg
@@ -193,6 +208,99 @@ class KittyPlugin(private val activity: Activity) : Plugin(activity) {
             )
         } catch (e: Exception) {
             invoke.reject("could not copy the attachment: ${e.message}", e)
+        }
+    }
+
+    // --- Saving out through the Storage Access Framework ------------------
+
+    /**
+     * Write a document the user picked, and report how many bytes landed.
+     *
+     * This is the only way anything leaves Kitty on Android. The chat folder
+     * is inside the app's private data directory, so a file the model wrote is
+     * invisible to every other app until it is copied out through a URI the
+     * user granted. Rust cannot do that copy: `content://` is not a path, and
+     * `java.io.File`/`std::fs` cannot open one.
+     *
+     * Takes both URI kinds because the two save flows produce different ones.
+     * ACTION_CREATE_DOCUMENT (the save dialog) returns a *document* URI that
+     * already exists and is written directly. ACTION_OPEN_DOCUMENT_TREE (the
+     * folder picker, used by the bulk chat export) returns a *tree* URI, which
+     * names a directory and cannot be written at all — a document has to be
+     * created inside it first, via DocumentsContract. Appending "/name.jsonl"
+     * to a tree URI, which is what a filesystem-shaped API invites, produces a
+     * string that is not a valid URI of either kind.
+     *
+     * `sourcePath` streams instead of taking base64, because an artifact can
+     * be a 40 MB PDF and base64 through the JSON bridge would mean holding it
+     * three times over.
+     *
+     * The byte count is returned rather than assumed. A provider can accept a
+     * write and commit nothing — Google Drive uploads asynchronously after the
+     * stream closes — so the caller verifies rather than trusting `Ok`.
+     */
+    @Command
+    fun writeDocument(invoke: Invoke) {
+        val args = invoke.parseArgs(WriteDocumentArgs::class.java)
+        try {
+            val resolver = activity.contentResolver
+            val picked = Uri.parse(args.uri)
+
+            // A tree URI names a directory: create the document first. The
+            // `isTreeUri` check is what tells the two apart -- a caller cannot
+            // be trusted to know which dialog produced the URI it was handed.
+            val target = if (DocumentsContract.isTreeUri(picked)) {
+                val name = args.fileName
+                    ?: run {
+                        invoke.reject("a folder was chosen but no file name was given")
+                        return
+                    }
+                val parent = DocumentsContract.buildDocumentUriUsingTree(
+                    picked,
+                    DocumentsContract.getTreeDocumentId(picked)
+                )
+                // The provider owns the final name: it de-duplicates against
+                // what is already there (`report.jsonl` -> `report (1).jsonl`)
+                // and may adjust the extension to match the MIME type. Which
+                // is why nothing here assumes the name it asked for.
+                DocumentsContract.createDocument(
+                    resolver,
+                    parent,
+                    args.mimeType ?: "application/octet-stream",
+                    name
+                ) ?: run {
+                    invoke.reject("could not create \"$name\" in the chosen folder")
+                    return
+                }
+            } else {
+                picked
+            }
+
+            // Mode "w", not "wt". Truncation is meaningless on a document that
+            // was just created, and several providers -- Drive among them --
+            // reject or silently mishandle the "t" flag.
+            val written = resolver.openOutputStream(target, "w")?.use { output ->
+                val src = args.sourcePath
+                if (src != null) {
+                    File(src).inputStream().use { input -> input.copyTo(output) }
+                } else {
+                    val bytes = Base64.decode(args.contentBase64 ?: "", Base64.DEFAULT)
+                    output.write(bytes)
+                    // `copyTo` reports its own count; this branch has to.
+                    bytes.size.toLong()
+                }.also { output.flush() }
+            } ?: run {
+                invoke.reject("the chosen location could not be opened for writing")
+                return
+            }
+
+            invoke.resolve(
+                JSObject()
+                    .put("uri", target.toString())
+                    .put("bytes", written)
+            )
+        } catch (e: Exception) {
+            invoke.reject("could not save the file: ${e.message}", e)
         }
     }
 

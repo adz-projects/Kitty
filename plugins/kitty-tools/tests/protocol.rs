@@ -89,7 +89,11 @@ fn tool_surface_matches_env_gating() {
     let server = KittyToolsServer::new();
     let mut always_on: Vec<String> = ALWAYS_ON_TOOLS.iter().map(|s| s.to_string()).collect();
     always_on.sort();
-    assert_eq!(server.tool_names(), always_on, "always-on tools must be exactly ALWAYS_ON_TOOLS with no env set");
+    assert_eq!(
+        server.tool_names(),
+        always_on,
+        "always-on tools must be exactly ALWAYS_ON_TOOLS with no env set"
+    );
 
     unsafe {
         std::env::set_var("KITTY_VIZ_ENABLED", "1");
@@ -102,7 +106,11 @@ fn tool_surface_matches_env_gating() {
     with_extras.push("generate_accessible_chart".to_string());
     with_extras.push("generate_accessible_mermaid".to_string());
     with_extras.sort();
-    assert_eq!(server.tool_names(), with_extras, "viz tools must join once KITTY_VIZ_ENABLED is set");
+    assert_eq!(
+        server.tool_names(),
+        with_extras,
+        "viz tools must join once KITTY_VIZ_ENABLED is set"
+    );
 
     unsafe {
         std::env::remove_var("KITTY_VIZ_ENABLED");
