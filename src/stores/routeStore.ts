@@ -2,10 +2,10 @@
 //
 // The hub replaced three separate Tauri windows — `main`, `settings`,
 // `wizard` — with one window that routes between them. That is what lets the
-// Android shell (§8.2) reuse the identical component tree behind bottom tabs
-// instead of maintaining a second UI: on desktop the routes are reached from
-// the header and the tray, on mobile from the tab bar, and neither knows about
-// the other.
+// Android shell (§8.2) reuse the identical component tree instead of
+// maintaining a second UI: on desktop the routes are reached from the header
+// and the tray, on mobile from the menu drawer, and neither knows about the
+// other.
 //
 // **Routing away from chat does not interrupt anything.** Chat state and its
 // `chat://*` listeners live in `chatStore`, bound once per window via
@@ -28,19 +28,6 @@ import { onRouteGoto, ipc } from '@/lib/ipc';
  * monitor's bounds. §8.1's note about folding the picker into the hub does not
  * survive contact with what that window actually is. */
 export type HubView = 'chat' | 'sessions' | 'settings' | 'wizard';
-
-/** Routes the Android tab bar exposes (§8.2). Chat and Settings are shared
-    with desktop; `sessions` exists because the desktop sidebar has nowhere to
-    live on a phone. Setup is deliberately absent — the wizard is reached by
-    finishing first run or from Settings, never as a tab someone can wander
-    into mid-conversation. */
-export const MOBILE_TABS: { view: HubView; label: string }[] = [
-  { view: 'chat', label: 'Chat' },
-  // "Saved Chats", not "Chats" — next to a tab literally called "Chat", the
-  // bare plural reads as the same place.
-  { view: 'sessions', label: 'Saved Chats' },
-  { view: 'settings', label: 'Settings' },
-];
 
 export interface RouteState {
   view: HubView;

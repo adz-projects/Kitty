@@ -228,6 +228,7 @@ pub fn run() {
             commands::open_url,
             commands::reveal_path,
             commands::download_file,
+            commands::download_text,
             commands::list_directory,
             commands::list_providers,
             commands::upsert_provider,

@@ -1,22 +1,28 @@
-import { memo, useEffect, useMemo, useRef, useState } from 'react';
+import { memo, useMemo, type MouseEvent } from 'react';
 import {
   isVisualizationToolCall,
   stripInternalMarkers,
   stripPromptPreamble,
-  useChatStore,
   type Message,
 } from '@/stores/chatStore';
+import { useMobileUiStore } from '@/stores/mobileUiStore';
+import { isAndroid } from '@/lib/platform';
 import { ThinkingBox } from './ThinkingBox';
 import { PreviousAttemptBox } from './PreviousAttemptBox';
-import { MessageInfo } from './MessageInfo';
+import { MessageActions } from './MessageActions';
 import { MessageAttachmentChips } from './MessageAttachmentChips';
 import { VisualizationCard } from './VisualizationCard';
 import { MarkdownBlocks } from './MarkdownBlocks';
 
+/** Taps on these do their own thing and must not also toggle the message's
+    actions: links, buttons (code-block copy, the Thinking toggle, the actions
+    themselves), and interactive cards. */
+const TAP_IGNORE = 'a, button, input, textarea, select, summary, label, .viz-card, .msg-actions';
+
 /** One chat message. User turns render as a plain bubble; assistant turns render
-    markdown, with an optional collapsible reasoning block and tool cards. Hover
-    actions: Branch from here, Regenerate (assistant), Copy as Markdown, and an
-    info button (assistant only) surfacing model/provider/tokens/duration.
+    markdown, with an optional collapsible reasoning block and tool cards. Actions
+    (Branch, Export, Regenerate, Copy, info) live in `MessageActions`: hover-revealed
+    on desktop, tap-revealed on Android.
 
     Memoized (Round-7 perf fix): a session replay/live stream re-renders the
     parent list on every incoming event, but only ever changes one message at
@@ -30,45 +36,7 @@ export const MessageItem = memo(function MessageItem({
   message: Message;
   index: number;
 }) {
-  const branch = useChatStore((s) => s.branch);
-  const regenerate = useChatStore((s) => s.regenerate);
-  const exportSession = useChatStore((s) => s.exportSession);
-
-  // Branch/Regenerate/Export each fire a round-trip to goosed (fork/prompt/
-  // export). Latch while one is running so a double-click can't fork twice or
-  // queue a duplicate prompt — the buttons visibly disable until it settles.
-  const [busy, setBusy] = useState(false);
-  const runOnce = (fn: () => Promise<unknown>) => () => {
-    if (busy) return;
-    setBusy(true);
-    void Promise.resolve(fn()).finally(() => setBusy(false));
-  };
-
-  const [copied, setCopied] = useState(false);
-  const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // Virtual-list rows unmount mid-write all the time (scrolling recycles
-  // them) — the clipboard promise resolving after that must not setState.
-  const mountedRef = useRef(true);
-  useEffect(
-    () => () => {
-      mountedRef.current = false;
-      if (copyTimerRef.current) clearTimeout(copyTimerRef.current);
-    },
-    []
-  );
-  const copyMessage = () => {
-    void navigator.clipboard
-      .writeText(message.text)
-      .then(() => {
-        if (!mountedRef.current) return;
-        setCopied(true);
-        if (copyTimerRef.current) clearTimeout(copyTimerRef.current);
-        copyTimerRef.current = setTimeout(() => setCopied(false), 1200);
-      })
-      .catch(() => {
-        /* clipboard may be unavailable */
-      });
-  };
+  const toggleReveal = useMobileUiStore((s) => s.toggleRevealMessage);
 
   // Two fresh arrays per render, and this component is the one that genuinely
   // does re-render every animation frame — it is the streaming message. Keyed
@@ -83,39 +51,18 @@ export const MessageItem = memo(function MessageItem({
     [message.toolCalls]
   );
 
-  const actions = (
-    <div className="msg-actions">
-      <button
-        title="Branch a new session from here"
-        disabled={busy}
-        onClick={runOnce(() => branch(index))}
-      >
-        Branch
-      </button>
-      <button
-        title="Export the conversation up to here as ChatML"
-        disabled={busy}
-        onClick={runOnce(() => exportSession(index))}
-      >
-        Export from here
-      </button>
-      {message.role === 'assistant' && (
-        <>
-          <button
-            title="Regenerate this response"
-            disabled={busy}
-            onClick={runOnce(() => regenerate(index))}
-          >
-            Regenerate
-          </button>
-          <button title="Copy as Markdown" onClick={copyMessage}>
-            {copied ? 'Copied' : 'Copy'}
-          </button>
-          <MessageInfo message={message} />
-        </>
-      )}
-    </div>
-  );
+  // Android: tapping a message shows its actions below it. Skipped while a
+  // long-press text selection is active — lifting the finger after selecting
+  // text shouldn't also pop the actions open.
+  const onTap = isAndroid()
+    ? (e: MouseEvent<HTMLDivElement>) => {
+        if ((e.target as Element).closest(TAP_IGNORE)) return;
+        if (window.getSelection()?.toString()) return;
+        toggleReveal(message.id);
+      }
+    : undefined;
+
+  const actions = <MessageActions message={message} index={index} />;
 
   if (message.role === 'user') {
     // Defensive: the live-typed bubble and the replay path both already keep
@@ -128,7 +75,7 @@ export const MessageItem = memo(function MessageItem({
       index === 0 ? stripPromptPreamble(message.text) : message.text
     );
     return (
-      <div className="msg msg-user">
+      <div className="msg msg-user" onClick={onTap}>
         <div className="bubble">{displayText}</div>
         <MessageAttachmentChips files={message.attachedFiles} />
         {actions}
@@ -151,13 +98,14 @@ export const MessageItem = memo(function MessageItem({
   // else stays in the collapsed Thinking tray.
 
   return (
-    <div className="msg msg-assistant">
-      {(message.reasoning || otherToolCalls.length > 0) && (
+    <div className="msg msg-assistant" onClick={onTap}>
+      {(message.reasoning || message.draftText || otherToolCalls.length > 0) && (
         <ThinkingBox
           reasoning={message.reasoning}
           toolCalls={otherToolCalls}
           streaming={message.streaming}
           hasAnswer={message.text.length > 0}
+          draft={message.draftText}
         />
       )}
       {vizCalls.map((call) => (

@@ -23,8 +23,11 @@
 //! full transcript back through `GET /api/chat/{id}/history` when the summary
 //! was not enough.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
+use dashmap::DashMap;
+use futures::future::{BoxFuture, FutureExt, Shared};
 use serde_json::{json, Value};
 use sqlx::SqlitePool;
 use tokio::sync::Semaphore;
@@ -162,6 +165,80 @@ pub struct Orchestrator {
     /// hangs the user's turn while holding one of a small number of permits.
     timeout: std::time::Duration,
     router: OnceLock<Arc<crate::provider::router::ProviderRouter>>,
+    /// Background delegate calls, by the session that started them. See
+    /// `start_ticket`.
+    tickets: DashMap<String, Vec<Ticket>>,
+    ticket_seq: AtomicU64,
+}
+
+type Report = Shared<BoxFuture<'static, String>>;
+
+/// One `call_specialist` running in the background for its parent's turn.
+struct Ticket {
+    id: String,
+    specialist: String,
+    /// `Shared`, so a model awaiting a ticket and the end-of-turn check can both
+    /// wait on it without either consuming the other's result.
+    report: Report,
+    abort: tokio::task::AbortHandle,
+    collected: bool,
+}
+
+/// How long `collect` waits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TicketWait {
+    /// Until every selected ticket has reported.
+    All,
+    /// Until at least one has; returns everything finished by then.
+    Any,
+    /// Not at all: only what has already finished.
+    None,
+}
+
+impl TicketWait {
+    pub fn parse(s: Option<&str>) -> Option<Self> {
+        match s.map(str::trim).unwrap_or("all") {
+            "" | "all" => Some(Self::All),
+            "any" => Some(Self::Any),
+            "none" => Some(Self::None),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TicketReport {
+    pub ticket: String,
+    pub specialist: String,
+    /// The same JSON envelope a blocking `call_specialist` used to return.
+    pub report: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Collected {
+    pub reports: Vec<TicketReport>,
+    pub still_running: Vec<String>,
+}
+
+impl Collected {
+    /// The tool-result form the model reads. Each report is embedded as a JSON
+    /// value when it parses, so the caller never has to parse a string out of a
+    /// parsed object — the rule `call_specialist`'s envelope already follows.
+    pub fn to_json(&self) -> Value {
+        let reports: Vec<Value> = self
+            .reports
+            .iter()
+            .map(|r| {
+                json!({
+                    "ticket": r.ticket,
+                    "specialist": r.specialist,
+                    "report": serde_json::from_str::<Value>(&r.report)
+                        .unwrap_or_else(|_| json!(r.report)),
+                })
+            })
+            .collect();
+        json!({"ok": true, "reports": reports, "still_running": self.still_running})
+    }
 }
 
 /// Waves of `specialist_timeout_secs` a fan-out may take in total.
@@ -195,6 +272,8 @@ impl Orchestrator {
             model_deny,
             timeout: std::time::Duration::from_secs(timeout_secs.max(1)),
             router: OnceLock::new(),
+            tickets: DashMap::new(),
+            ticket_seq: AtomicU64::new(0),
         }
     }
 
@@ -552,6 +631,171 @@ impl Orchestrator {
         self.timeout.saturating_mul(FAN_OUT_DEADLINE_WAVES)
     }
 
+    /// Start `work` in the background and hand back a ticket for its report.
+    ///
+    /// `work` is the whole delegated call — one run or a fan-out, already
+    /// rendered into the JSON envelope `call_specialist` returns — so the
+    /// ticket layer knows nothing about specialists, only that a report will
+    /// arrive. Spawned rather than stored as a lazy future: the delegate must
+    /// make progress while the parent model is busy elsewhere, whether or not
+    /// anyone is awaiting it yet, which is the entire point of a ticket.
+    pub fn start_ticket<F>(&self, parent_session_id: &str, specialist: &str, work: F) -> String
+    where
+        F: std::future::Future<Output = String> + Send + 'static,
+    {
+        let id = format!("sp-{}", self.ticket_seq.fetch_add(1, Ordering::Relaxed) + 1);
+        let handle = tokio::spawn(work);
+        let abort = handle.abort_handle();
+        let report = async move {
+            match handle.await {
+                Ok(report) => report,
+                Err(e) if e.is_cancelled() => {
+                    json!({"ok": false, "error": "the specialist was cancelled"}).to_string()
+                }
+                Err(_) => json!({"ok": false, "error": "the specialist crashed"}).to_string(),
+            }
+        }
+        .boxed()
+        .shared();
+        self.tickets
+            .entry(parent_session_id.to_string())
+            .or_default()
+            .push(Ticket {
+                id: id.clone(),
+                specialist: specialist.to_string(),
+                report,
+                abort,
+                collected: false,
+            });
+        id
+    }
+
+    /// Ids of the tickets this session started and has not collected.
+    pub fn uncollected(&self, parent_session_id: &str) -> Vec<String> {
+        self.tickets
+            .get(parent_session_id)
+            .map(|t| {
+                t.iter()
+                    .filter(|t| !t.collected)
+                    .map(|t| t.id.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Hand back finished reports, marking them collected.
+    ///
+    /// `ids: None` means every ticket still outstanding. Naming a ticket that
+    /// does not exist, or one already collected, is an error listing what the
+    /// caller could have named — the same correction an unknown specialist name
+    /// gets, because a model that invented or reused an id needs to see the
+    /// real ones, not just "no".
+    pub async fn collect(
+        &self,
+        parent_session_id: &str,
+        ids: Option<&[String]>,
+        wait: TicketWait,
+    ) -> Result<Collected, String> {
+        let selected: Vec<(String, String, Report)> = {
+            let Some(tickets) = self.tickets.get(parent_session_id) else {
+                return match ids {
+                    Some(ids) if !ids.is_empty() => {
+                        Err("this turn has not started any specialists".to_string())
+                    }
+                    _ => Ok(Collected::default()),
+                };
+            };
+            let outstanding = || {
+                tickets
+                    .iter()
+                    .filter(|t| !t.collected)
+                    .map(|t| t.id.clone())
+                    .collect::<Vec<_>>()
+            };
+            match ids {
+                None => tickets
+                    .iter()
+                    .filter(|t| !t.collected)
+                    .map(|t| (t.id.clone(), t.specialist.clone(), t.report.clone()))
+                    .collect(),
+                Some(ids) => {
+                    let mut picked = Vec::new();
+                    for id in ids {
+                        match tickets.iter().find(|t| &t.id == id) {
+                            Some(t) if !t.collected => {
+                                picked.push((t.id.clone(), t.specialist.clone(), t.report.clone()))
+                            }
+                            Some(_) => {
+                                return Err(format!(
+                                    "ticket {id} was already collected; outstanding: {:?}",
+                                    outstanding()
+                                ))
+                            }
+                            None => {
+                                return Err(format!(
+                                    "no ticket {id} in this turn; outstanding: {:?}",
+                                    outstanding()
+                                ))
+                            }
+                        }
+                    }
+                    picked
+                }
+            }
+        };
+
+        match wait {
+            TicketWait::All => {
+                futures::future::join_all(selected.iter().map(|(_, _, r)| r.clone())).await;
+            }
+            TicketWait::Any if !selected.is_empty() => {
+                futures::future::select_all(selected.iter().map(|(_, _, r)| r.clone())).await;
+            }
+            TicketWait::Any | TicketWait::None => {}
+        }
+
+        let mut out = Collected::default();
+        for (id, specialist, report) in selected {
+            match report.peek() {
+                Some(text) => out.reports.push(TicketReport {
+                    ticket: id,
+                    specialist,
+                    report: text.clone(),
+                }),
+                None => out.still_running.push(id),
+            }
+        }
+        if let Some(mut tickets) = self.tickets.get_mut(parent_session_id) {
+            for t in tickets.iter_mut() {
+                if out.reports.iter().any(|r| r.ticket == t.id) {
+                    t.collected = true;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Forget this session's tickets, stopping any delegate still running.
+    ///
+    /// Called when a turn ends. On a normal end every ticket has already been
+    /// collected and this only clears the bookkeeping; after a hard stop — an
+    /// error, a cancel, a vanished client — it is what keeps a delegate from
+    /// spending on a report no turn is left to read. Returns how many were
+    /// still outstanding.
+    pub fn abandon(&self, parent_session_id: &str) -> usize {
+        let Some((_, tickets)) = self.tickets.remove(parent_session_id) else {
+            return 0;
+        };
+        let mut dropped = 0;
+        for t in tickets {
+            if !t.collected {
+                dropped += 1;
+                t.abort.abort();
+            }
+        }
+        dropped
+    }
+
     /// What the child's session says it ran on, once it has finished.
     async fn host_actually_used(
         &self,
@@ -674,5 +918,110 @@ mod tests {
         let text = "日本語テキスト".repeat(40);
         let s = short(&text);
         assert!(s.ends_with("..."));
+    }
+
+    async fn ticket_orchestrator() -> Orchestrator {
+        Orchestrator::new(test_pool().await, 3, 0.25, Vec::new(), 300)
+    }
+
+    /// A report that arrives when `release` fires, so a test decides exactly
+    /// when each ticket finishes.
+    fn gated(report: &'static str) -> (tokio::sync::oneshot::Sender<()>, impl std::future::Future<Output = String>) {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        (tx, async move {
+            let _ = rx.await;
+            report.to_string()
+        })
+    }
+
+    #[tokio::test]
+    async fn collecting_all_waits_for_every_report_and_clears_the_ticket() {
+        let o = ticket_orchestrator().await;
+        let (release, work) = gated(r#"{"ok":true,"result":"r1"}"#);
+        let id = o.start_ticket("p", "researcher", work);
+        assert_eq!(o.uncollected("p"), vec![id.clone()]);
+
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let _ = release.send(());
+        });
+        let got = o.collect("p", None, TicketWait::All).await.unwrap();
+        assert_eq!(got.reports.len(), 1);
+        assert_eq!(got.reports[0].ticket, id);
+        assert!(got.still_running.is_empty());
+        assert!(o.uncollected("p").is_empty());
+        // Embedded as a value, not a string.
+        assert_eq!(got.to_json()["reports"][0]["report"]["result"], "r1");
+    }
+
+    #[tokio::test]
+    async fn collecting_any_returns_only_what_has_finished() {
+        let o = ticket_orchestrator().await;
+        let (fast_release, fast) = gated("fast");
+        let (_slow_release, slow) = gated("slow");
+        let fast_id = o.start_ticket("p", "a", fast);
+        let slow_id = o.start_ticket("p", "b", slow);
+
+        let _ = fast_release.send(());
+        let got = o.collect("p", None, TicketWait::Any).await.unwrap();
+        assert_eq!(got.reports.len(), 1);
+        assert_eq!(got.reports[0].ticket, fast_id);
+        assert_eq!(got.still_running, vec![slow_id.clone()]);
+        assert_eq!(o.uncollected("p"), vec![slow_id]);
+    }
+
+    #[tokio::test]
+    async fn collecting_without_waiting_never_blocks() {
+        let o = ticket_orchestrator().await;
+        let (_release, work) = gated("never");
+        let id = o.start_ticket("p", "a", work);
+        let got = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            o.collect("p", None, TicketWait::None),
+        )
+        .await
+        .expect("wait: none must not block")
+        .unwrap();
+        assert!(got.reports.is_empty());
+        assert_eq!(got.still_running, vec![id]);
+    }
+
+    #[tokio::test]
+    async fn a_ticket_cannot_be_collected_twice_or_invented() {
+        let o = ticket_orchestrator().await;
+        let id = o.start_ticket("p", "a", async { "done".to_string() });
+        o.collect("p", Some(std::slice::from_ref(&id)), TicketWait::All)
+            .await
+            .unwrap();
+
+        let again = o
+            .collect("p", Some(std::slice::from_ref(&id)), TicketWait::All)
+            .await
+            .unwrap_err();
+        assert!(again.contains("already collected"), "{again}");
+        let invented = o
+            .collect("p", Some(&["sp-999".to_string()]), TicketWait::All)
+            .await
+            .unwrap_err();
+        assert!(invented.contains("no ticket sp-999"), "{invented}");
+    }
+
+    #[tokio::test]
+    async fn abandoning_stops_a_delegate_still_running() {
+        let o = ticket_orchestrator().await;
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = finished.clone();
+        o.start_ticket("p", "a", async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            flag.store(true, Ordering::SeqCst);
+            "late".to_string()
+        });
+        assert_eq!(o.abandon("p"), 1);
+        assert!(o.uncollected("p").is_empty());
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        assert!(
+            !finished.load(Ordering::SeqCst),
+            "an abandoned delegate must not keep running"
+        );
     }
 }

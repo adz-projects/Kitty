@@ -37,6 +37,16 @@ async fn test_pool() -> SqlitePool {
 }
 
 fn build_agent(pool: &SqlitePool, provider_base_url: Option<&str>) -> Arc<Agent> {
+    build_agent_with(pool, provider_base_url, None)
+}
+
+/// An agent whose MCP manager carries `orchestrator`, the way `lib.rs` wires
+/// the daemon — which is what lets the loop see a session's tickets.
+fn build_agent_with(
+    pool: &SqlitePool,
+    provider_base_url: Option<&str>,
+    orchestrator: Option<Arc<Orchestrator>>,
+) -> Arc<Agent> {
     let config = BigTinyConfig::default();
     let router = Arc::new(ProviderRouter::new(config.cache.clone()));
     if let Some(base_url) = provider_base_url {
@@ -49,6 +59,9 @@ fn build_agent(pool: &SqlitePool, provider_base_url: Option<&str>) -> Arc<Agent>
         );
     }
     let mcp = Arc::new(MCPManager::new(pool.clone(), None));
+    if let Some(o) = orchestrator {
+        mcp.attach_orchestrator(o);
+    }
     let hitl = Arc::new(tokio::sync::Mutex::new(HITLManager::new(
         pool.clone(),
         config.hitl.clone(),
@@ -794,4 +807,172 @@ async fn cancelling_a_parent_cancels_its_delegates() {
         !agent.has_active_turns(),
         "cancelling the parent must stop the delegate it started"
     );
+}
+
+// --- Background specialists: tickets and the end-of-turn collection ---------
+
+/// One streamed completion that says `text` and stops.
+async fn mock_answer(server: &mut mockito::ServerGuard, text: &str) {
+    server
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_body(format!(
+            "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\",\"content\":\"{text}\"}},\"finish_reason\":null}}]}}\n\n\
+             data: {{\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\n\
+             data: [DONE]\n\n"
+        ))
+        .expect(1)
+        .create_async()
+        .await;
+}
+
+async fn ticket_agent(pool: &SqlitePool, url: &str) -> (Arc<Agent>, Arc<Orchestrator>) {
+    let orchestrator = Arc::new(Orchestrator::new(pool.clone(), 3, 0.25, vec![], 300));
+    let agent = build_agent_with(pool, Some(url), Some(orchestrator.clone()));
+    orchestrator.attach(&agent);
+    (agent, orchestrator)
+}
+
+/// A report that takes a moment, so the turn genuinely has to wait for it.
+async fn slow_report(text: &'static str) -> String {
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    json!({"ok": true, "specialist": "researcher", "result": text}).to_string()
+}
+
+/// The rule the whole feature rests on: a turn cannot end on an answer written
+/// before every specialist reported.
+///
+/// The model answers straight away with a ticket outstanding. That answer must
+/// not end the turn; the loop collects the report itself, recorded as an
+/// `await_specialists` call on the same assistant message as the early text,
+/// and the model answers again with the report in context.
+#[tokio::test]
+async fn an_answer_with_a_ticket_outstanding_is_not_the_end_of_the_turn() {
+    let pool = test_pool().await;
+    let mut server = mockito::Server::new_async().await;
+    mock_answer(&mut server, "draft").await;
+    mock_answer(&mut server, "final").await;
+    let (agent, orchestrator) = ticket_agent(&pool, &server.url()).await;
+    seed_session(&pool, "parent", json!({"provider": "mock"})).await;
+
+    let ticket = orchestrator.start_ticket("parent", "researcher", slow_report("the finding"));
+    let events = run_and_collect(&agent, "parent").await;
+
+    assert!(
+        orchestrator.uncollected("parent").is_empty(),
+        "the turn ended with {ticket} still outstanding"
+    );
+    let start = events
+        .iter()
+        .find(|e| {
+            e.event_type == SSEEventType::ToolStart
+                && e.tool_name.as_deref() == Some("await_specialists")
+        })
+        .expect("the loop must collect the outstanding report");
+    assert_eq!(start.tool_args.as_ref().unwrap()["auto"], true);
+    assert!(
+        tool_results(&events).iter().any(|r| r.contains("the finding")),
+        "the report must reach the model as a tool result"
+    );
+
+    let rows = bigtiny2::storage::messages::get_messages_by_session(&pool, "parent")
+        .await
+        .unwrap();
+    let shape: Vec<(String, Option<String>)> = rows
+        .iter()
+        .map(|r| (r.role.clone(), r.content.clone()))
+        .collect();
+    let collecting = rows
+        .iter()
+        .position(|r| {
+            r.role == "assistant"
+                && r.tool_calls
+                    .as_deref()
+                    .is_some_and(|t| t.contains("await_specialists"))
+        })
+        .unwrap_or_else(|| panic!("no collection call persisted: {shape:?}"));
+    assert_eq!(
+        rows[collecting].content.as_deref(),
+        Some("draft"),
+        "the early answer travels on the collection call, not as its own turn"
+    );
+    assert_eq!(rows[collecting + 1].role, "tool");
+    let last = rows.last().unwrap();
+    assert_eq!(
+        (last.role.as_str(), last.content.as_deref()),
+        ("assistant", Some("final")),
+        "the turn must end on an answer written after the report: {shape:?}"
+    );
+}
+
+/// A model that collects its own tickets gets no synthetic call.
+#[tokio::test]
+async fn a_turn_with_nothing_outstanding_ends_on_its_first_answer() {
+    let pool = test_pool().await;
+    let mut server = mockito::Server::new_async().await;
+    mock_answer(&mut server, "only").await;
+    let (agent, orchestrator) = ticket_agent(&pool, &server.url()).await;
+    seed_session(&pool, "parent", json!({"provider": "mock"})).await;
+
+    let ticket = orchestrator.start_ticket("parent", "researcher", slow_report("x"));
+    orchestrator
+        .collect(
+            "parent",
+            Some(std::slice::from_ref(&ticket)),
+            bigtiny2::agent::orchestrator::TicketWait::All,
+        )
+        .await
+        .unwrap();
+
+    let events = run_and_collect(&agent, "parent").await;
+    assert!(!events.iter().any(|e| e.tool_name.as_deref() == Some("await_specialists")));
+}
+
+/// Running out of steps with a ticket outstanding earns one short extension —
+/// enough to collect and answer — rather than ending on work already paid for.
+#[tokio::test]
+async fn the_step_limit_extends_once_to_collect_outstanding_reports() {
+    let pool = test_pool().await;
+    let mut server = mockito::Server::new_async().await;
+    // Step 0 spends the whole budget on a tool call; the extension then covers
+    // the early answer, the collection, and the real answer.
+    mock_tool_then_stop(&mut server, "some_unregistered_tool").await;
+    mock_answer(&mut server, "final").await;
+    let (agent, orchestrator) = ticket_agent(&pool, &server.url()).await;
+    // `auto_reject`, or the placeholder tool sits waiting for a human approval.
+    seed_session(
+        &pool,
+        "parent",
+        json!({"provider": "mock", "max_steps": 1, "hitl_policy": "auto_reject"}),
+    )
+    .await;
+
+    orchestrator.start_ticket("parent", "researcher", slow_report("late finding"));
+    let events = run_and_collect(&agent, "parent").await;
+
+    assert!(orchestrator.uncollected("parent").is_empty());
+    assert!(tool_results(&events).iter().any(|r| r.contains("late finding")));
+    let rows = bigtiny2::storage::messages::get_messages_by_session(&pool, "parent")
+        .await
+        .unwrap();
+    assert_eq!(rows.last().unwrap().content.as_deref(), Some("final"));
+}
+
+/// Cancelling a turn forgets its tickets and stops what they were running.
+#[tokio::test]
+async fn cancelling_a_parent_abandons_its_tickets() {
+    let pool = test_pool().await;
+    let server = mockito::Server::new_async().await;
+    let (agent, orchestrator) = ticket_agent(&pool, &server.url()).await;
+    sessions::create_session_for_app(&pool, "parent", "Parent", APP)
+        .await
+        .unwrap();
+
+    orchestrator.start_ticket("parent", "researcher", async {
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        String::new()
+    });
+    agent.cancel("parent").await;
+    assert!(orchestrator.uncollected("parent").is_empty());
 }

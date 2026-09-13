@@ -761,11 +761,11 @@ function SessionRow({
         }
         if (resuming) return;
         setResuming(true);
-        // Route to the chat view as well as loading it. On desktop this list
-        // sits beside the conversation and the route is already 'chat', so
-        // this is a no-op; on Android the list *is* its own tab ("Saved
-        // Chats"), and loading a session without switching tabs left the user
-        // staring at the list wondering whether the tap registered.
+        // Route to the chat view as well as loading it. Where this list sits
+        // beside the conversation (the desktop sidebar, Android's menu drawer)
+        // the route is already 'chat' and this is a no-op; from the full-page
+        // `sessions` route, loading without switching left the user staring at
+        // the list wondering whether the tap registered.
         goto('chat');
         void loadSession(s.sessionId, s.cwd, s.title, s.providerId, s.modelId).finally(() =>
           setResuming(false)

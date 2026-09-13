@@ -121,9 +121,27 @@ struct TurnCleanup {
 
 impl Drop for TurnCleanup {
     fn drop(&mut self) {
-        self.agent
+        let removed = self
+            .agent
             .tasks
             .remove_if(&self.session_id, |_, (tok, _, _)| *tok == self.turn_token);
+        // The turn is over, so its specialist tickets are too. After a normal
+        // end they were all collected and this only clears bookkeeping; after a
+        // provider error, a disconnect or a panic it stops delegates still
+        // spending on reports nobody will read. Only when this guard really was
+        // the turn's — a stale guard must not reach into a newer turn's tickets.
+        if removed.is_some() {
+            if let Some(orchestrator) = self.agent.mcp.orchestrator() {
+                let dropped = orchestrator.abandon(&self.session_id);
+                if dropped > 0 {
+                    tracing::warn!(
+                        session_id = %self.session_id,
+                        dropped,
+                        "turn ended with specialist reports uncollected — stopped those delegates"
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -491,6 +509,11 @@ impl Agent {
     /// Not recursive: `Orchestrator::DEPTH_LIMIT` is 1, so a delegate has no
     /// delegates of its own to find.
     async fn cancel_delegates_of(&self, session_id: &str) {
+        // Tickets first: aborting a ticket's task stops the waiting side, and
+        // the loop below stops the child turns it was waiting on.
+        if let Some(orchestrator) = self.mcp.orchestrator() {
+            orchestrator.abandon(session_id);
+        }
         let Ok(Some(app_id)) = sessions::owner_of(&self.db, session_id).await else {
             return;
         };

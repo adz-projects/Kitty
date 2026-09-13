@@ -4,6 +4,7 @@ import { useStackStore } from '@/stores/stackStore';
 import { useAdaptivePathwayStore } from '@/stores/adaptivePathwayStore';
 import { useChatStore } from '@/stores/chatStore';
 import { useRouteStore } from '@/stores/routeStore';
+import { useMobileUiStore } from '@/stores/mobileUiStore';
 import { isAndroid } from '@/lib/platform';
 import { StackStatusView } from '@/components/shared/StackStatusView';
 import { ChatView } from '@/components/chat/ChatView';
@@ -14,6 +15,7 @@ import { NewChatIcon } from '@/components/icons/NewChatIcon';
 import { SettingsGearIcon } from '@/components/icons/SettingsGearIcon';
 import { KittyIcon } from '@/components/icons/KittyIcon';
 import { ExportIcon } from '@/components/icons/ExportIcon';
+import { MenuIcon } from '@/components/icons/MenuIcon';
 import type { StackStatus } from '@/lib/types';
 
 const DEGRADED: StackStatus[] = ['backend_down', 'local_model_missing', 'provider_unreachable'];
@@ -31,7 +33,14 @@ export function ChatWorkspace() {
   const exportSession = useChatStore((s) => s.exportSession);
   const newSession = useChatStore((s) => s.newSession);
   const goto = useRouteStore((s) => s.goto);
+  const openDrawer = useMobileUiStore((s) => s.setDrawerOpen);
+  const android = isAndroid();
   const [showArtifacts, setShowArtifacts] = useState(true);
+  // Android's artifacts sheet covers the conversation, so it always starts
+  // closed and isn't persisted: the desktop `show_artifacts` preference
+  // describes a side column, and honouring it here opened a sheet over the
+  // chat on every launch.
+  const [artifactsSheetOpen, setArtifactsSheetOpen] = useState(false);
 
   useEffect(() => {
     void init();
@@ -63,16 +72,19 @@ export function ChatWorkspace() {
         // No handoff (or backend briefly unreachable) — a plain chat window.
       }
     })();
-    // Show/hide-artifacts is persisted (Round-3 item 6).
-    void ipc
-      .getConfig()
-      .then((c) => {
-        if (mounted) setShowArtifacts(c.show_artifacts);
-      })
-      .catch(() => {
-        // Keep the default (shown); the header toggle still works for this
-        // window's lifetime even if the config read failed.
-      });
+    // Show/hide-artifacts is persisted (Round-3 item 6). Desktop only — see
+    // `artifactsSheetOpen`.
+    if (!isAndroid()) {
+      void ipc
+        .getConfig()
+        .then((c) => {
+          if (mounted) setShowArtifacts(c.show_artifacts);
+        })
+        .catch(() => {
+          // Keep the default (shown); the header toggle still works for this
+          // window's lifetime even if the config read failed.
+        });
+    }
     return () => {
       mounted = false;
     };
@@ -98,24 +110,31 @@ export function ChatWorkspace() {
   };
 
   const degraded = DEGRADED.includes(status);
-  const android = isAndroid();
+  const artifactsShown = android ? artifactsSheetOpen : showArtifacts;
 
   return (
     <div className="main-window">
-      <SessionList />
+      {/* On Android the history lives in the menu drawer instead. */}
+      {!android && <SessionList />}
       <div className="main-center">
         <header className="main-header">
-          {/* The mark always; the word only where there's room for it. On
-              Android the header is one row that also carries the model picker,
-              so the six characters of "Kitty" are the cheapest thing to give
-              up. `KittyIcon` fills with `currentColor`, so it inherits `--text`
-              and flips light-on-dark / dark-on-light with the theme for free.
-              `app-mark` is needed on both now — a block `h1` misaligns the
-              glyph against the neighbouring buttons (see base.css). */}
-          <h1 className="app-mark">
-            <KittyIcon size={24} />
-            {!android && 'Kitty'}
-          </h1>
+          {/* Desktop: the mark and wordmark. `KittyIcon` fills with
+              `currentColor`, so it inherits `--text` and flips with the theme
+              for free; `app-mark` keeps the glyph centred against the
+              neighbouring buttons (see base.css).
+              Android: the menu button takes that spot. The row is too narrow
+              for a mark as well, and the drawer is the only way to saved chats
+              and Settings now that the tab bar is gone. */}
+          {android ? (
+            <button className="menu-button" onClick={() => openDrawer(true)} aria-label="Open menu">
+              <MenuIcon />
+            </button>
+          ) : (
+            <h1 className="app-mark">
+              <KittyIcon size={24} />
+              Kitty
+            </h1>
+          )}
           {android && <ChatHeaderControls />}
           <div style={{ display: 'flex', gap: 8 }}>
             {/* Export is desktop-only: on a phone the header is one crowded row
@@ -131,23 +150,18 @@ export function ChatWorkspace() {
                 <ExportIcon />
               </button>
             )}
-            <button onClick={() => void toggleArtifacts()}>
-              {/* Windows has room to spell it out; Android's header is one
-                  crowded row shared with the model picker, so it keeps the
-                  terser "Hide"/"Artifacts" wording. */}
-              {android
-                ? showArtifacts
-                  ? 'Hide'
-                  : 'Artifacts'
-                : showArtifacts
-                  ? 'Hide Artifacts'
-                  : 'Show Artifacts'}
+            {/* Android: the sheet covers this button while open and closes
+                itself (✕, swipe down, Back), so the button only ever opens. */}
+            <button
+              onClick={() => (android ? setArtifactsSheetOpen(true) : void toggleArtifacts())}
+            >
+              {android ? 'Artifacts' : showArtifacts ? 'Hide Artifacts' : 'Show Artifacts'}
             </button>
             {/* Routes within this hub rather than opening a window: with
                 multiple hubs open (D21) a shared Settings window would be
                 ambiguous about which one's session it configures.
-                Desktop-only — Android reaches Settings from the tab bar, so a
-                second entry point here is clutter in an already narrow row. */}
+                Desktop-only — Android reaches Settings from the menu drawer, so
+                a second entry point here is clutter in an already narrow row. */}
             {!android && (
               <button onClick={() => goto('settings')} title="Settings" aria-label="Settings">
                 <SettingsGearIcon />
@@ -162,8 +176,8 @@ export function ChatWorkspace() {
           {degraded ? <StackStatusView status={status} /> : <ChatView />}
         </div>
       </div>
-      {showArtifacts && !degraded && (
-        <ArtifactsPane onClose={android ? () => void toggleArtifacts() : undefined} />
+      {artifactsShown && !degraded && (
+        <ArtifactsPane onClose={android ? () => setArtifactsSheetOpen(false) : undefined} />
       )}
     </div>
   );

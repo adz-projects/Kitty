@@ -666,6 +666,15 @@ All under `Settings → Local models`, shared component on both OS.
   window).
 
 ### 8.2 Android shell (Phase 6b) — **web layer done; native pieces are Phase 7**
+- **Superseded (0.10.x): the tab bar is gone.** The Android shell is now one
+  header row whose left-hand menu button (or a rightward swipe on the chat)
+  opens a slide-out drawer (`components/hub/MobileDrawer.tsx`): the session
+  list with its search box, and Settings pinned below it. Artifacts open as a
+  bottom sheet that swipes down to close. Message actions are tap-revealed
+  (ⓘ + a ⋯ menu, `components/chat/MessageActions.tsx`) because hover doesn't
+  exist on a touchscreen. Back closes the drawer, the sheet and Settings
+  (`lib/backDismiss.ts`). The bullets below describe the original tabbed
+  shell and are kept for the record.
 - Same `<HubApp>`; bottom tabs, CSS `<480px` + safe-area.
 - **Tabs are Chat / Chats / Settings**, not "Models". Models is a *section*
   inside Settings (`local_models`), and promoting it to a peer of the whole of

@@ -127,6 +127,12 @@ impl MCPManager {
         let _ = self.orchestrator.set(orchestrator);
     }
 
+    /// The attached orchestrator, if any. The agent loop reaches specialist
+    /// tickets through this, to collect them before a turn may end.
+    pub fn orchestrator(&self) -> Option<&Arc<crate::agent::orchestrator::Orchestrator>> {
+        self.orchestrator.get()
+    }
+
     pub async fn connect_server(&self, server_id: &str) -> Result<(), MCPServerError> {
         // Serialize connects per server id (#23): two concurrent callers
         // would otherwise each spawn a child, and only the one that wins the

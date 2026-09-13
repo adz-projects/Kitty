@@ -475,6 +475,21 @@ const BUDGET_EXTENSION_STEPS: i32 = 20;
 /// the turn before it starts) while still bounding runaway loops.
 const MAX_STEPS_CEILING: i64 = 10_000;
 
+/// Steps granted when the step limit arrives with specialists outstanding:
+/// one to collect their reports, one to answer with them.
+const SPECIALIST_EXTENSION_STEPS: i64 = 2;
+
+/// Carried in the result of a collection the loop performed because the model
+/// answered with specialist tickets outstanding. In the tool result rather than
+/// a control message: it explains *this* result, and a mid-turn user-role
+/// message is exactly what a small model mistakes for the user speaking.
+const AUTO_COLLECT_AFTER_ANSWER: &str =
+    "You answered before collecting these specialist reports, so that answer was not final. \
+     Write your answer again, using the reports below.";
+/// The same, for the collection made just before a context wrap-up reply.
+const AUTO_COLLECT_BEFORE_WRAPUP: &str =
+    "Specialist reports collected before finishing. Use them in your final answer.";
+
 /// Synthetic tool name for the wrap-up valve's notice. Deliberately NOT
 /// `__budget__`: Kitty suppresses that one (`bigtiny/stream.rs`) because the
 /// step-budget nudge is internal bookkeeping the user has no stake in. Running
@@ -2032,6 +2047,8 @@ impl AgentLoop {
         // iteration; the unconditional `break` in the completion block is the
         // braces. Both, deliberately — see that block's comment.
         let mut wrapup_issued = false;
+        // Latch for the one step-limit extension outstanding specialists earn.
+        let mut specialist_extension_granted = false;
         // Reasoning spend across the whole run, and the latch it trips.
         //
         // Per *run*, not per response: `MAX_TURN_CONTENT_CHARS` already bounds
@@ -2138,6 +2155,26 @@ impl AgentLoop {
             // is the backstop that aborts the whole task shortly after.)
             if event_tx.is_closed() {
                 break;
+            }
+
+            // Out of steps with specialists still outstanding: one extension,
+            // enough to collect their reports and answer with them. Ending here
+            // would throw away work already paid for and break the rule that a
+            // turn's answer uses every report it asked for. Once only, and
+            // clamped like `request_more_steps`, so it cannot become a way
+            // round the step ceiling.
+            if step >= max_steps
+                && !specialist_extension_granted
+                && max_steps < MAX_STEPS_CEILING
+                && self.has_outstanding_specialists(session_id)
+            {
+                specialist_extension_granted = true;
+                max_steps = (max_steps + SPECIALIST_EXTENSION_STEPS).min(MAX_STEPS_CEILING);
+                tracing::info!(
+                    session_id,
+                    max_steps,
+                    "step limit reached with specialists outstanding — extending to collect them"
+                );
             }
 
             if step >= max_steps {
@@ -2274,6 +2311,18 @@ impl AgentLoop {
                         wrapup_reserve,
                         "context reserve reached — withdrawing tools for a wrap-up reply"
                     );
+                    // The wrap-up reply is this turn's last word, so it has to be
+                    // written with every specialist report in hand. Collected
+                    // before the wrap-up message, which must stay the last
+                    // message pushed this iteration (it is popped below).
+                    self.collect_outstanding_specialists(
+                        session_id,
+                        "",
+                        AUTO_COLLECT_BEFORE_WRAPUP,
+                        &mut messages,
+                        event_tx,
+                    )
+                    .await;
                     messages.push(control_message(WRAPUP_SYSTEM_MESSAGE));
                     in_wrapup = true;
                     wrapup_issued = true;
@@ -2999,6 +3048,22 @@ impl AgentLoop {
                 }
 
                 if turn_tool_calls.is_empty() {
+                    let finishing = finish_reason.as_deref() == Some("stop")
+                        || finish_reason.as_deref() == Some("end_turn");
+                    if finishing
+                        && self
+                            .collect_outstanding_specialists(
+                                session_id,
+                                &content_buf,
+                                AUTO_COLLECT_AFTER_ANSWER,
+                                &mut messages,
+                                event_tx,
+                            )
+                            .await
+                    {
+                        step += 1;
+                        continue;
+                    }
                     // Same fix as above: this path used to `break`/`continue`
                     // without ever appending the assistant message.
                     messages.push(build_assistant_message(&content_buf, &turn_tool_calls));
@@ -3049,6 +3114,29 @@ impl AgentLoop {
                 // graceful bridge to compaction, not a retry loop — which is
                 // exactly what the system message promises the model.
                 break;
+            }
+
+            // The model is answering, but specialists it started have not all
+            // been collected. A turn may not end on an answer written without
+            // their reports, so collect them now and give the model a step to
+            // write the answer again. Checked *before* the assistant message is
+            // pushed: once saved it has a DB id, and the answer text has to
+            // travel on the same message as the collection call instead.
+            if turn_tool_calls.is_empty()
+                && (finish_reason.as_deref() == Some("stop")
+                    || finish_reason.as_deref() == Some("end_turn"))
+                && self
+                    .collect_outstanding_specialists(
+                        session_id,
+                        &content_buf,
+                        AUTO_COLLECT_AFTER_ANSWER,
+                        &mut messages,
+                        event_tx,
+                    )
+                    .await
+            {
+                step += 1;
+                continue;
             }
 
             // Add assistant message (reached for a non-budget-check turn, or
@@ -3589,6 +3677,92 @@ impl AgentLoop {
     /// `max_concurrent_tool_calls`), preserving call order in the returned
     /// `Vec<String>` regardless of completion order (mirrors Python's
     /// `asyncio.gather`, which is also order-preserving).
+    /// Whether this session has specialist tickets it has not collected.
+    fn has_outstanding_specialists(&self, session_id: &str) -> bool {
+        self.mcp
+            .orchestrator()
+            .is_some_and(|o| !o.uncollected(session_id).is_empty())
+    }
+
+    /// Collect every outstanding specialist report on the model's behalf.
+    ///
+    /// Recorded as though the model had called `await_specialists` itself: an
+    /// assistant message carrying `content` (the text it just wrote, if any)
+    /// and one synthetic call, then that call's result. The pair keeps the
+    /// transcript in the one shape every chat template already accepts —
+    /// reports never arrive as injected messages, and the answer text is never
+    /// split into two consecutive assistant turns.
+    ///
+    /// Dispatched straight to the orchestrator rather than through the MCP
+    /// server: the tickets are the orchestrator's own, and a collection the
+    /// daemon *requires* must not depend on a tool server being connected or on
+    /// its call timeout. `"auto": true` in the arguments is how a client tells
+    /// this call apart from one the model made (Kitty shows the text before it
+    /// as a draft).
+    ///
+    /// Returns false, having touched nothing, when there is nothing to collect.
+    async fn collect_outstanding_specialists(
+        &self,
+        session_id: &str,
+        content: &str,
+        note: &str,
+        messages: &mut Vec<Value>,
+        event_tx: &mpsc::UnboundedSender<SSEEvent>,
+    ) -> bool {
+        let Some(orchestrator) = self.mcp.orchestrator() else {
+            return false;
+        };
+        if orchestrator.uncollected(session_id).is_empty() {
+            return false;
+        }
+
+        let tool_name = crate::specialists::server::AWAIT_TOOL;
+        let args = json!({"wait": "all", "auto": true});
+        let call = ToolCall {
+            id: format!("auto-await-{}", uuid::Uuid::new_v4()),
+            r#type: "function".into(),
+            function: json!({"name": tool_name, "arguments": args}),
+        };
+        messages.push(build_assistant_message(content, std::slice::from_ref(&call)));
+        let _ = event_tx.send(SSEEvent {
+            event_type: SSEEventType::ToolStart,
+            tool_name: Some(tool_name.to_string()),
+            tool_args: Some(args),
+            session_id: Some(session_id.to_string()),
+            ..Default::default()
+        });
+
+        let started = Instant::now();
+        let result = match orchestrator
+            .collect(session_id, None, crate::agent::orchestrator::TicketWait::All)
+            .await
+        {
+            Ok(collected) => {
+                let mut v = collected.to_json();
+                v["note"] = json!(note);
+                v.to_string()
+            }
+            Err(why) => json!({"ok": false, "error": why}).to_string(),
+        };
+        let _ = event_tx.send(SSEEvent {
+            event_type: SSEEventType::ToolFinish,
+            tool_name: Some(tool_name.to_string()),
+            tool_result: Some(result.clone()),
+            duration_ms: Some(started.elapsed().as_millis() as i64),
+            session_id: Some(session_id.to_string()),
+            ..Default::default()
+        });
+        messages.push(json!({
+            "role": "tool",
+            "content": result,
+            "tool_call_id": call.id,
+        }));
+        if let Err(e) = self.context.save_messages(session_id, messages).await {
+            tracing::warn!("failed to save messages for session {session_id}: {e}");
+        }
+        true
+    }
+
     async fn execute_tools(
         &self,
         session_id: &str,

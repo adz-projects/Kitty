@@ -14,11 +14,15 @@ export function ThinkingBox({
   toolCalls,
   streaming,
   hasAnswer,
+  draft,
 }: {
   reasoning: string;
   toolCalls: ToolCall[];
   streaming: boolean;
   hasAnswer: boolean;
+  /** An answer written before every specialist report was in — kept for the
+      record, but in here with the working rather than in the answer bubble. */
+  draft?: string;
 }) {
   // null = follow the default; true/false = user explicitly opened/closed it.
   const [pinned, setPinned] = useState<boolean | null>(null);
@@ -36,6 +40,12 @@ export function ThinkingBox({
       {open && (
         <div className="reasoning-body">
           {reasoning && <div className="reasoning-text">{reasoning}</div>}
+          {draft && (
+            <div className="reasoning-draft">
+              <div className="muted">Draft, written before all specialist reports were in</div>
+              <div className="reasoning-text">{draft}</div>
+            </div>
+          )}
           {toolCalls.length > 0 && (
             <div className="reasoning-tools">
               {toolCalls.map((tc) => (

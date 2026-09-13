@@ -137,16 +137,18 @@ windows/{hub,overlay,screenshot-select}/App.tsx  one entry point per window labe
   │          full window; `overlay` and `screenshot-select` are desktop-only)
   │
   ├─► components/hub/        ChatWorkspace (the three-column desktop shell,
-  │                          one column + a bottom tab bar on Android),
-  │                          MobileTabBar
-  ├─► components/chat/       Composer, MessageList/MessageItem, ThinkingBox,
-  │                          ApprovalPrompt, ToolCallCard, ChatHeaderControls —
-  │                          shared verbatim between overlay and hub (rule 5)
+  │                          one column on Android), MobileDrawer (Android's
+  │                          swipeable menu: saved chats + pinned Settings)
+  ├─► components/chat/       Composer, MessageList/MessageItem, MessageActions
+  │                          (hover row on desktop, tap-revealed ⓘ/⋯ menu on
+  │                          Android), ThinkingBox, ApprovalPrompt,
+  │                          ToolCallCard, ChatHeaderControls — shared
+  │                          verbatim between overlay and hub (rule 5)
   ├─► components/sessions/   SessionList — the chat sidebar on desktop, the
-  │                          "Saved Chats" tab on Android
+  │                          menu drawer's contents on Android
   ├─► components/settings/   one panel per Settings sidebar section
-  ├─► components/artifacts/  ArtifactsPane — third column on desktop, a sheet
-  │                          over the conversation on Android
+  ├─► components/artifacts/  ArtifactsPane — third column on desktop, a
+  │                          swipe-to-dismiss bottom sheet on Android
   ├─► components/wizard/     first-run steps (a different set per platform)
   │
   ├─► stores/                zustand stores — render state only, never the

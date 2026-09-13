@@ -2,9 +2,9 @@ import { TrashIcon } from '@/components/icons/TrashIcon';
 import { ExportIcon } from '@/components/icons/ExportIcon';
 
 /** Bottom action bar shown while the saved-chats list (Android) is in bulk
-    selection mode (release-fixes items 8-10, long-press to enter). Sticky
-    like `MobileTabBar`, styled the same way, so it reads as part of the same
-    bottom-of-screen chrome rather than a new UI pattern. */
+    selection mode (release-fixes items 8-10, long-press to enter). Sticky to
+    the bottom of the list's own scroll area, so in the menu drawer it sits
+    just above the pinned Settings row. */
 export function SessionSelectionBar({
   count,
   busy,

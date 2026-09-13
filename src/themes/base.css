@@ -597,6 +597,15 @@ button.primary {
 .reasoning-text + .reasoning-tools {
   margin-top: 10px;
 }
+/* An answer written before every specialist report was in. */
+.reasoning-draft {
+  margin-top: 10px;
+  padding-left: 8px;
+  border-left: 2px solid var(--border);
+}
+.reasoning-draft + .reasoning-tools {
+  margin-top: 10px;
+}
 
 /* Real-terms progress indicator (Round-5 Batch 6) — replaces the animated
    ellipsis with a pulsing stage label (connecting / thinking / formulating). */
@@ -1399,15 +1408,6 @@ button.primary {
 }
 
 /* --- Full window layout (Phase 4) --- */
-/* --- Mobile shell (docs/ANDROID.md §8.2) --------------------------------
-   The tab bar is always rendered and hidden here, rather than conditionally
-   mounted in JS: one component tree across both targets is the whole point of
-   the hub, and a narrow desktop window then behaves the same way a phone does
-   instead of taking a path only phones exercise. */
-.mobile-tabs {
-  display: none;
-}
-
 /* Flex, so `.session-list` fills the route and becomes the scrolling box
    itself. As a plain block child it took its content height, the route clipped
    the overflow, and the list's own `overflow-y: auto` never engaged — which
@@ -1425,11 +1425,10 @@ button.primary {
   min-width: 0;
 }
 
-/* The hub is a column: the active route takes the remaining height and the
-   tab bar sits under it (and collapses to nothing on desktop, where it is
-   `display: none`, leaving the route the full height exactly as before).
-   `min-height: 0` lets the route shrink to its track so only the message list
-   scrolls, not the document. */
+/* The hub is a column holding the active route at full height. `min-height: 0`
+   lets the route shrink to its track so only the message list scrolls, not
+   the document. (It is also the containing block the Android drawer and
+   artifacts sheet position against.) */
 .hub-root {
   display: flex;
   flex-direction: column;
@@ -1674,8 +1673,8 @@ button.primary {
   margin: 0;
 }
 /* Sticks to the bottom of .session-list's own scroll area (it's a flex
-   column child there, not a separate overlay) — sits above .mobile-tabs
-   since that's a sibling of .sessions-route, not nested inside this list. */
+   column child there, not a separate overlay) — so in the Android drawer it
+   sits above the pinned Settings footer, which is outside the list. */
 .session-selection-bar {
   position: sticky;
   bottom: 0;
@@ -2489,6 +2488,193 @@ button.link {
   word-break: break-word;
 }
 
+/* --- Android shell: menu drawer, artifacts sheet, message actions ---------
+   All three components render these classes only on Android, so they sit
+   outside the breakpoint below. The scrims use the same fixed dim as
+   `.modal-backdrop` — a shade over whatever the theme is, not a theme color. */
+
+/* Always mounted so it can animate; inert and click-through while closed. */
+.mobile-drawer-root {
+  position: absolute;
+  inset: 0;
+  z-index: 30;
+  pointer-events: none;
+}
+.mobile-drawer-root.open,
+.mobile-drawer-root.dragging {
+  pointer-events: auto;
+}
+.mobile-drawer-scrim {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.45);
+  opacity: 0;
+  transition: opacity 0.25s ease;
+}
+.mobile-drawer-root.open .mobile-drawer-scrim {
+  opacity: 1;
+}
+.mobile-drawer {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: min(85vw, 360px);
+  display: flex;
+  flex-direction: column;
+  padding-top: var(--safe-top);
+  padding-left: var(--safe-left);
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+  transform: translateX(-100%);
+  transition: transform 0.25s ease;
+}
+/* Shadow only once it's on screen — parked at -100% it would bleed a strip
+   of shadow in along the left edge of the chat. */
+.mobile-drawer-root.open .mobile-drawer,
+.mobile-drawer-root.dragging .mobile-drawer {
+  box-shadow: var(--overlay-shadow);
+}
+.mobile-drawer-root.open .mobile-drawer {
+  transform: none;
+}
+/* Mid-drag the finger drives position directly; transitions would lag it. */
+.mobile-drawer-root.dragging .mobile-drawer,
+.mobile-drawer-root.dragging .mobile-drawer-scrim {
+  transition: none;
+}
+/* Only the chat list scrolls; the footer below it is pinned. */
+.mobile-drawer > .session-list {
+  flex: 1;
+  min-height: 0;
+  border-right: none;
+}
+.mobile-drawer-footer {
+  flex: none;
+  padding: 6px 8px calc(6px + var(--safe-bottom));
+  border-top: 1px solid var(--border);
+}
+.mobile-drawer-footer button {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  min-height: 44px;
+  padding: 0 10px;
+  border: none;
+  background: transparent;
+  font-size: var(--fs-md);
+  text-align: left;
+}
+
+/* Artifacts bottom sheet. Absolute, not fixed: `.hub-root` is itself fixed to
+   the visible rect while the keyboard is open, and a fixed child would anchor
+   to the layout viewport instead and drift out of the visible area. */
+.sheet-scrim {
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  background: rgba(0, 0, 0, 0.45);
+  animation: kitty-fade-in 0.25s ease;
+  transition: opacity 0.25s ease;
+}
+.sheet-scrim.closing {
+  opacity: 0;
+  pointer-events: none;
+}
+.main-window > .artifacts-pane.artifacts-sheet {
+  position: absolute;
+  top: calc(var(--safe-top) + 10vh);
+  right: 0;
+  bottom: 0;
+  left: 0;
+  z-index: 21;
+  width: auto;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  padding-bottom: var(--safe-bottom);
+  border-left: none;
+  border-top: 1px solid var(--border);
+  border-radius: 16px 16px 0 0;
+  background: var(--surface);
+  box-shadow: var(--overlay-shadow);
+  animation: kitty-sheet-up 0.28s cubic-bezier(0.2, 0.8, 0.2, 1);
+  transition: transform 0.25s ease;
+}
+.main-window > .artifacts-pane.artifacts-sheet.closing {
+  transform: translateY(100%);
+}
+.artifacts-sheet .artifacts-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.sheet-handle {
+  flex: none;
+  width: 40px;
+  height: 4px;
+  margin: 8px auto 0;
+  border-radius: 2px;
+  background: var(--border);
+}
+@keyframes kitty-sheet-up {
+  from {
+    transform: translateY(100%);
+  }
+}
+@keyframes kitty-fade-in {
+  from {
+    opacity: 0;
+  }
+}
+
+/* Tap-revealed message actions: ⓘ and ⋯, always visible once shown (the
+   desktop row's hover-gated opacity doesn't apply to a touchscreen). */
+.msg-actions.msg-actions-mobile {
+  opacity: 1;
+  align-items: center;
+}
+.msg-actions-mobile button {
+  min-width: 36px;
+  min-height: 32px;
+  font-size: var(--fs-md);
+}
+.msg-copied {
+  font-size: var(--fs-xs);
+}
+/* Transparent: it exists to catch the outside tap that closes the menu, so
+   that tap doesn't also land on the chat underneath. */
+.msg-menu-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+}
+.msg-actions-menu {
+  min-width: 190px;
+  padding: 6px;
+  border-radius: 12px;
+}
+.msg-actions-menu button {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 44px;
+  padding: 0 12px;
+  font-size: var(--fs-md);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mobile-drawer,
+  .mobile-drawer-scrim,
+  .sheet-scrim,
+  .main-window > .artifacts-pane.artifacts-sheet {
+    animation: none;
+    transition: none;
+  }
+}
+
 /* --- Mobile breakpoint (docs/ANDROID.md §8.2) --------------------------
    Deliberately the last block in this file. Every override below is the
    same specificity as the desktop rule it replaces, so source order is
@@ -2499,21 +2685,15 @@ button.link {
 
    **600px, not 480.** Measured on a Pixel 10 Pro: `window.innerWidth` is
    **485** CSS px (1080 physical / 2.225 dpr), so a 480px cutoff missed a
-   current flagship entirely — the tab bar stayed `display: none` and the
+   current flagship entirely — the mobile layout never engaged and the
    safe-area padding never applied, leaving content under the notch. 480 was
    picked from convention rather than from a device.
 
    600 is Android's own "compact" width class, which is exactly the
    "this is a phone-shaped window" question being asked here. It does mean a
-   desktop hub window narrowed below 600px gets the mobile shell — intended,
-   and the same reasoning as rendering the tab bar on every platform: at that
-   width the three-column layout is unusable anyway. */
+   desktop hub window narrowed below 600px gets the one-column layout —
+   intended: at that width the three-column layout is unusable anyway. */
 @media (max-width: 600px) {
-  :root {
-    /* 44px tap target + whatever the gesture bar claims. */
-    --mobile-tabs-h: calc(44px + var(--safe-bottom));
-  }
-
   /* Settings → Helper Models. At phone width there isn't room for the model
      label and its buttons side by side without the label wrapping to three
      lines, so give each its own row and right-align the actions. */
@@ -2526,8 +2706,9 @@ button.link {
   }
 
   /* The desktop chat layout is a three-column grid (history | chat |
-     artifacts). On a phone only the middle column fits; the history lives
-     behind the "Chats" tab and artifacts are dropped rather than crushed. */
+     artifacts). On a phone only the middle column fits; the history lives in
+     the menu drawer and artifacts in a bottom sheet. (Android doesn't render
+     the sidebar at all; this hides it for a narrowed desktop window.) */
   .main-window {
     grid-template-columns: 1fr;
   }
@@ -2619,38 +2800,10 @@ button.link {
     height: var(--hdr-control-h);
   }
 
-  /* Artifacts stay reachable on a phone — files the model wrote are the
-     whole point of the pane, and there is no file manager to fall back on.
-     It can't be a third column at this width, so "Show artifacts" opens it
-     as a sheet over the conversation instead. Only rendered at all when
-     toggled on (`ChatWorkspace`), so this is purely presentation.
-
-     Fixed rather than a second grid row: as a row it would halve an already
-     short conversation, and the pane scrolls independently anyway. Inset to
-     clear the notch at the top and the tab bar at the bottom, so it never
-     covers the way out of itself. */
   .artifacts-close {
     margin-left: auto;
     padding: 2px 8px;
     line-height: 1;
-  }
-
-  .main-window > .artifacts-pane {
-    /* Absolute, not fixed: `.hub-root` is itself fixed to the visible rect
-       while the keyboard is open, and a fixed child would anchor to the
-       layout viewport instead and drift out of the visible area. */
-    position: absolute;
-    top: var(--safe-top);
-    right: 0;
-    bottom: var(--mobile-tabs-h);
-    left: 0;
-    z-index: 20;
-    width: auto;
-    border-left: none;
-    border-top: 1px solid var(--border);
-    background: var(--surface);
-    overflow-y: auto;
-    overscroll-behavior: contain;
   }
 
   /* Settings is a two-column grid on desktop; stack it and let the nav scroll
@@ -2683,33 +2836,9 @@ button.link {
     white-space: nowrap;
   }
 
-  .mobile-tabs {
-    display: grid;
-    /* Height the artifacts sheet subtracts so it stops above the bar rather
-       than under it. Kept in one place so the two cannot drift. */
-    grid-auto-flow: column;
-    grid-auto-columns: 1fr;
-    border-top: 1px solid var(--border);
-    background: var(--surface);
-    /* Sits above the gesture bar rather than under it. */
-    padding-bottom: var(--safe-bottom);
-  }
-  .mobile-tabs button {
-    border: none;
-    border-radius: 0;
-    background: transparent;
-    /* 44px is the smallest reliably-tappable target; the tab bar is the one
-       control a user hits constantly, so it does not get to be smaller. */
-    min-height: 44px;
-    font-size: var(--fs-sm);
-  }
-  .mobile-tabs button.active {
-    color: var(--accent);
-  }
-
-  /* Clear the notch and the rounded corners. Applied to the route roots
-     rather than to `body` so the tab bar's own `padding-bottom` isn't
-     doubled up.
+  /* Clear the notch, the rounded corners and the gesture bar. Applied to the
+     route roots rather than to `body` so the drawer and sheet, which pad
+     themselves, aren't double-inset.
 
      Split in two because the bases differ: the grid containers have no
      padding of their own, while `.window-root` already carries 24px. Giving
@@ -2723,11 +2852,15 @@ button.link {
     padding-top: var(--safe-top);
     padding-left: var(--safe-left);
     padding-right: var(--safe-right);
+    /* The tab bar used to carry this; without it the composer sits under the
+       gesture bar. */
+    padding-bottom: var(--safe-bottom);
   }
   .window-root {
     padding-top: calc(24px + var(--safe-top));
     padding-left: calc(24px + var(--safe-left));
     padding-right: calc(24px + var(--safe-right));
+    padding-bottom: calc(24px + var(--safe-bottom));
   }
 }
 

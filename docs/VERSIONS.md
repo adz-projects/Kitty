@@ -909,3 +909,76 @@ which are desktop-only and were never affected.
 inside it never run on the desktop or in CI — and a wrong base64 pad is a
 corrupted export that still reports success. The RFC 4648 vectors are pinned
 where they actually execute.
+
+## Specialists run in the background (0.10.7)
+
+`call_specialist` used to block: the orchestrator's run (or fan-out) was awaited
+inside the tool call, and `agent/loop_.rs::execute_tools` `join_all`s a step's
+calls, so the parent model sat frozen for up to `timeout_secs` per delegate,
+or three waves of it for a fan-out. Delegation saved the parent *context*, never
+the parent's *time*.
+
+### Tickets
+
+`call_specialist` now validates (name, empty request, fan-out cap — all still
+refused immediately), then hands the run to `Orchestrator::start_ticket`, which
+`tokio::spawn`s it and returns `sp-N` at once. The report — the same JSON
+envelope the blocking call returned — sits behind a `Shared` future in the
+orchestrator's per-session ticket table. `await_specialists` collects them:
+`wait: "all"` (default), `"any"`, or `"none"`; no `tickets` means every one
+outstanding. Collecting marks a ticket collected; naming an unknown or
+already-collected ticket is a soft error listing the outstanding ids.
+
+Everything that bounded a delegate still bounds it, because it all lives in
+`run_by`: the concurrency permit, the per-run timeout, the batch deadline, host
+picking, the depth limit, `subagent_status` frames.
+
+### The rule: a turn cannot end on an answer written without its reports
+
+The loop checks for uncollected tickets at every normal way a turn ends:
+
+| Exit | What happens |
+|---|---|
+| model answers (`stop`/`end_turn`, no tool calls) | loop collects them itself, then gives the model another step |
+| context wrap-up valve | loop collects them *before* the wrap-up message, so the one final reply has them |
+| step limit | one extension of 2 steps (collect, answer), clamped to `MAX_STEPS_CEILING` |
+
+The collection is recorded exactly as if the model had called
+`await_specialists`: the assistant message carrying the text it just wrote
+plus one synthetic call (`id: auto-await-…`, arguments
+`{"wait": "all", "auto": true}`), then the tool result with the reports and a
+note saying the earlier answer was not final. **Never an injected message**:
+reports inside a mid-turn user-role message are what a small model mistakes for
+the user speaking, and the check runs *before* the assistant message is pushed
+so the draft text never becomes a second consecutive assistant turn (the
+template-shape failure `124d4c0` fixed for system messages).
+
+It dispatches straight to the orchestrator, not through MCP: the tickets are the
+orchestrator's own, and a collection the daemon *requires* must not depend on a
+tool server being connected or on its call timeout.
+
+**The one exception is a hard stop** — a provider error, a cancel, a vanished
+client, the pre-flight path that cannot fit the turn in the window at all.
+There is no turn left to report to, so `TurnCleanup`'s drop (and
+`Agent::cancel_delegates_of`) call `Orchestrator::abandon`, which aborts the
+delegates rather than letting them spend on reports nobody will read.
+
+### Kitty side
+
+- The `specialists` row's MCP timeout is now `timeout_secs * 3 + 30`
+  (`SPECIALIST_FAN_OUT_WAVES` in `bigtiny/mcp.rs` mirrors the daemon's
+  `FAN_OUT_DEADLINE_WAVES` — change them together): an `await_specialists` can
+  wait on a whole fan-out's shared deadline.
+- An `await_specialists` tool call with `rawInput.auto === true` moves the open
+  message's text into `Message.draftText`, shown in the Thinking box as a
+  draft; the answer bubble and export hold only the real answer.
+- `parse_tool_calls` (session replay) now accepts `function.arguments` as an
+  object as well as a string. The daemon persists the parsed object; reading
+  only strings replayed every such call with no input, which would also have
+  lost the `auto` marker on a reopened chat.
+
+### Caveat
+
+Running in the background only saves wall-clock time when the delegate and the
+parent are not queued on the same single-slot endpoint. A one-slot local server
+serves them in turn either way.

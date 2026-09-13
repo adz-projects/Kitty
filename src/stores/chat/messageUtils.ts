@@ -196,3 +196,48 @@ const VISUALIZATION_TOOL_NAMES = new Set([
 export function isVisualizationToolCall(call: ToolCall): boolean {
   return !!call.toolName && VISUALIZATION_TOOL_NAMES.has(call.toolName);
 }
+
+/** The collection the daemon performs itself when a model answers with
+    specialist reports still outstanding (`agent/loop_.rs`,
+    `collect_outstanding_specialists`). The text the model streamed before it
+    was an answer written without those reports — a draft, not the answer —
+    and the real answer follows once they are in. `"auto": true` is what tells
+    it apart from an `await_specialists` the model called on purpose. */
+export function isAutoSpecialistCollection(u: ToolCallUpdate): boolean {
+  const input = u.rawInput as { auto?: unknown } | null | undefined;
+  return u.title === 'await_specialists' && input?.auto === true;
+}
+
+/** A readable title for the specialist tools' cards, whose raw names and JSON
+    say little at a glance. `null` for every other tool (keep its own title). */
+export function specialistToolTitle(call: ToolCall): string | null {
+  const input = (call.input ?? {}) as { specialist?: unknown; auto?: unknown };
+  const out = parseJsonObject(call.output);
+  switch (call.title) {
+    case 'call_specialist': {
+      const who = typeof input.specialist === 'string' ? input.specialist : 'specialist';
+      const ticket = typeof out?.ticket === 'string' ? ` · ${out.ticket}` : '';
+      return `Started ${who}${ticket}`;
+    }
+    case 'await_specialists': {
+      const reports = Array.isArray(out?.reports) ? out.reports.length : null;
+      if (reports == null) {
+        return input.auto === true ? 'Collecting specialist reports' : 'Waiting for specialists';
+      }
+      return `Collected ${reports} report${reports === 1 ? '' : 's'}`;
+    }
+    default:
+      return null;
+  }
+}
+
+function parseJsonObject(v: unknown): Record<string, unknown> | null {
+  if (v && typeof v === 'object') return v as Record<string, unknown>;
+  if (typeof v !== 'string') return null;
+  try {
+    const parsed: unknown = JSON.parse(v);
+    return parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}

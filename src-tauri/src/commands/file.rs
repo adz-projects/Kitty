@@ -368,13 +368,71 @@ pub fn reveal_path(app: AppHandle, path: String) -> Result<(), String> {
 /// normal outcome, not an error the UI should report.
 #[tauri::command]
 pub async fn download_file(app: AppHandle, path: String) -> Result<bool, String> {
-    use tauri_plugin_dialog::DialogExt;
-
     let source = PathBuf::from(&path);
     let name = source
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .ok_or_else(|| format!("{path} has no file name"))?;
+    save_copy_via_dialog(&app, source, name).await
+}
+
+/// Save generated text wherever the user chooses — chat export on Android.
+///
+/// The same save-out path as `download_file`, so a transcript leaves the app
+/// exactly the way an artifact does. Export used to go through the dialog
+/// plugin plus `write_file`, a second route to the same ContentResolver that
+/// had not been through the device testing `download_file` has (the Drive
+/// zero-byte save above is the kind of thing that testing caught).
+///
+/// The text is staged in the app cache first because the copy is streamed
+/// from a file, and removed afterwards whatever happened — a cancelled or
+/// failed save must not leave transcripts accumulating in the cache.
+#[tauri::command]
+pub async fn download_text(app: AppHandle, name: String, content: String) -> Result<bool, String> {
+    use tauri::Manager;
+
+    // A bare file name only. It becomes a path under the cache directory, so a
+    // separator or `..` would let the caller write somewhere else entirely.
+    let plain = std::path::Path::new(&name)
+        .file_name()
+        .is_some_and(|n| n == name.as_str())
+        && !name.contains(['/', '\\'])
+        && name != "..";
+    if !plain {
+        return Err(format!("{name} is not a plain file name"));
+    }
+
+    let dir = app
+        .path()
+        .app_cache_dir()
+        .map_err(|e| format!("no cache directory to stage the export in: {e}"))?
+        .join("exports");
+    let staged = dir.join(&name);
+    {
+        let (dir, staged) = (dir.clone(), staged.clone());
+        tokio::task::spawn_blocking(move || {
+            std::fs::create_dir_all(&dir)
+                .and_then(|_| std::fs::write(&staged, content))
+                .map_err(|e| format!("could not stage the export: {e}"))
+        })
+        .await
+        .map_err(|e| format!("export staging task panicked: {e}"))??;
+    }
+
+    let outcome = save_copy_via_dialog(&app, staged.clone(), name).await;
+    if let Err(e) = std::fs::remove_file(&staged) {
+        tracing::warn!("could not remove staged export {}: {e}", staged.display());
+    }
+    outcome
+}
+
+/// Ask where to save `name`, then copy `source` there. `Ok(false)` on cancel.
+async fn save_copy_via_dialog(
+    app: &AppHandle,
+    source: PathBuf,
+    name: String,
+) -> Result<bool, String> {
+    use tauri_plugin_dialog::DialogExt;
 
     // The dialog is callback-based on every platform; bridge it to async so
     // the command can await the choice and report the copy's outcome.

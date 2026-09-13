@@ -19,6 +19,11 @@ export interface Message {
   text: string;
   reasoning: string;
   toolCalls: ToolCall[];
+  /** An answer the model wrote before all its specialist reports were in.
+      Moved out of `text` when the daemon collects those reports for it (see
+      `isAutoSpecialistCollection`), so the bubble holds only the real answer
+      and export never includes the draft. */
+  draftText?: string;
   streaming: boolean;
   /** Currently being appended to (internal to the assembly). */
   open: boolean;

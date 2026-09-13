@@ -404,11 +404,16 @@ pub(crate) fn parse_tool_calls(row: &Value) -> Vec<Value> {
                 .pointer("/function/name")
                 .and_then(|v| v.as_str())
                 .unwrap_or("tool");
-            let args: Value = tc
-                .pointer("/function/arguments")
-                .and_then(|v| v.as_str())
-                .and_then(|s| serde_json::from_str(s).ok())
-                .unwrap_or(Value::Null);
+            // The daemon persists `arguments` as the parsed object it holds in
+            // memory (it only stringifies on the wire to the provider), while
+            // the OpenAI shape — and older rows — carry a JSON string. Accept
+            // both: reading only the string form replayed every object-shaped
+            // call with no input at all.
+            let args: Value = match tc.pointer("/function/arguments") {
+                Some(Value::String(s)) => serde_json::from_str(s).unwrap_or(Value::Null),
+                Some(v) => v.clone(),
+                None => Value::Null,
+            };
             Some(json!({
                 "toolCallId": id,
                 "title": name,
@@ -588,6 +593,13 @@ mod tests {
         assert_eq!(calls[0]["toolCallId"], "tc1");
         assert_eq!(calls[0]["title"], "shell");
         assert_eq!(calls[0]["rawInput"]["cmd"], "ls");
+
+        // The daemon's own persisted shape: arguments as an object.
+        let row = json!({
+            "tool_calls": "[{\"id\":\"auto-await-1\",\"type\":\"function\",\"function\":{\"name\":\"await_specialists\",\"arguments\":{\"wait\":\"all\",\"auto\":true}}}]",
+        });
+        let calls = parse_tool_calls(&row);
+        assert_eq!(calls[0]["rawInput"]["auto"], true);
     }
 
     #[test]

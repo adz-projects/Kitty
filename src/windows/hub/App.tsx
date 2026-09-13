@@ -2,8 +2,9 @@ import { useEffect } from 'react';
 import { useRouteStore } from '@/stores/routeStore';
 import { isAndroid } from '@/lib/platform';
 import { trackViewportHeight } from '@/lib/viewport';
+import { useBackDismiss } from '@/hooks/useBackDismiss';
 import { ChatWorkspace } from '@/components/hub/ChatWorkspace';
-import { MobileTabBar } from '@/components/hub/MobileTabBar';
+import { MobileDrawer } from '@/components/hub/MobileDrawer';
 import { SessionList } from '@/components/sessions/SessionList';
 import { SettingsView } from '@/components/settings/SettingsView';
 import { WizardView } from '@/components/wizard/WizardView';
@@ -24,6 +25,8 @@ import { WizardView } from '@/components/wizard/WizardView';
 export function App() {
   const view = useRouteStore((s) => s.view);
   const init = useRouteStore((s) => s.init);
+  const goto = useRouteStore((s) => s.goto);
+  const android = isAndroid();
 
   useEffect(() => {
     void init();
@@ -33,19 +36,25 @@ export function App() {
   // resizing the layout, so the app has to follow it by hand. See
   // `lib/viewport.ts`. Desktop windows resize properly and need nothing.
   useEffect(() => {
-    if (!isAndroid()) return;
+    if (!android) return;
     return trackViewportHeight();
-  }, []);
+  }, [android]);
+
+  // With no tab bar, Back is how a phone gets from Settings to the chat. The
+  // wizard is excluded on purpose: first run shouldn't offer a way out into a
+  // half-configured app.
+  useBackDismiss(android && (view === 'settings' || view === 'sessions'), () => goto('chat'));
 
   return (
     <>
       <div hidden={view !== 'chat'} className="hub-route">
         <ChatWorkspace />
       </div>
-      {/* `sessions` is the mobile-only home for the list that lives in the
-          chat sidebar on desktop. Reachable there too if something routes to
-          it, rather than rendering nothing — an unreachable-by-design route
-          that renders blank is a worse failure than a redundant one. */}
+      {/* `sessions` is a full-page list for anything that routes to it. On
+          desktop the list lives in the chat sidebar and on Android in the menu
+          drawer, so neither navigates here themselves — but rendering nothing
+          for a reachable route would be a worse failure than a redundant
+          page. */}
       {view === 'sessions' && (
         <div className="sessions-route">
           <SessionList />
@@ -53,7 +62,7 @@ export function App() {
       )}
       {view === 'settings' && <SettingsView />}
       {view === 'wizard' && <WizardView />}
-      <MobileTabBar />
+      {android && <MobileDrawer />}
     </>
   );
 }

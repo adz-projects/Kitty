@@ -1,6 +1,9 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { ipc } from '@/lib/ipc';
 import { isAndroid } from '@/lib/platform';
+import { settle } from '@/lib/gesture';
+import { usePanGesture } from '@/hooks/usePanGesture';
+import { useBackDismiss } from '@/hooks/useBackDismiss';
 import { useChatStore, type Artifact } from '@/stores/chatStore';
 import { useRouteStore } from '@/stores/routeStore';
 import { DocumentIcon } from '@/components/icons/DocumentIcon';
@@ -22,10 +25,16 @@ const POLL_INTERVAL_MS = 5000;
     session switch. Runs unconditionally on `cwd`, not gated on the current
     artifact count — an empty folder that gains its first file needs the
     add-scan to run too, not just the prune side. */
-/** `onClose` is only supplied on mobile, where this renders as a sheet over
-    the conversation (see `base.css`'s mobile block) and therefore covers the
-    header button that opened it. Desktop is a third column with nothing
-    obscured, so it passes nothing and no close button appears. */
+/** `onClose` is only supplied on mobile, where this renders as a bottom sheet
+    over the conversation and therefore covers the header button that opened
+    it. Desktop is a third column with nothing obscured, so it passes nothing
+    and no close button appears.
+
+    The sheet slides up on mount and closes by ✕, the scrim, Back, or a swipe
+    down. Every one of those animates out first and only then calls `onClose`,
+    which unmounts it. A swipe on the list only moves the sheet once the list
+    is scrolled to its top — otherwise it scrolls the list, the same rule every
+    Android bottom sheet follows. */
 export function ArtifactsPane({ onClose }: { onClose?: () => void } = {}) {
   const artifacts = useChatStore((s) => s.artifacts);
   const subfolders = useChatStore((s) => s.subfolders);
@@ -51,28 +60,83 @@ export function ArtifactsPane({ onClose }: { onClose?: () => void } = {}) {
     return () => clearInterval(id);
   }, [cwd, view, refreshArtifactsFromDisk, pruneMissingArtifacts]);
 
-  return (
-    <aside className="artifacts-pane">
-      <div className="artifacts-head">
-        <span>Artifacts ({artifacts.length})</span>
-        {/* Android has no folder to open: the chat folder lives in the app's
-            private data directory, which neither Explorer's equivalent nor
-            any other app can see into. Files leave via "Download" instead. */}
-        {cwd && !android && (
-          <button
-            className="link"
-            title="Open this session's working folder in Explorer"
-            onClick={() => void ipc.openPath(cwd)}
-          >
-            Open folder
-          </button>
-        )}
-        {onClose && (
-          <button className="artifacts-close" onClick={onClose} aria-label="Close artifacts">
-            ✕
-          </button>
-        )}
-      </div>
+  const sheet = android && onClose !== undefined;
+  const sheetRef = useRef<HTMLElement>(null);
+  const bodyRef = useRef<HTMLDivElement>(null);
+  const [closing, setClosing] = useState(false);
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+
+  // Animate out, then unmount. The timeout backs up `transitionend`, which
+  // never fires if the transition is skipped (reduced motion, or the sheet
+  // was already at its closed position).
+  const requestClose = useCallback(() => {
+    const el = sheetRef.current;
+    if (!el || window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+      onCloseRef.current?.();
+      return;
+    }
+    // Class first, synchronously: clearing a mid-drag inline transform before
+    // React re-renders with `closing` would paint one frame of the sheet
+    // snapped back to fully open.
+    el.classList.add('closing');
+    el.style.transition = '';
+    el.style.transform = '';
+    setClosing(true);
+  }, []);
+  useEffect(() => {
+    if (!closing) return;
+    const el = sheetRef.current;
+    let fired = false;
+    const done = () => {
+      if (fired) return;
+      fired = true;
+      onCloseRef.current?.();
+    };
+    // `transitionend` bubbles, so a child's own hover transition finishing
+    // must not count as the sheet having left the screen.
+    const onEnd = (e: TransitionEvent) => {
+      if (e.target === el) done();
+    };
+    el?.addEventListener('transitionend', onEnd);
+    const t = setTimeout(done, 350);
+    return () => {
+      el?.removeEventListener('transitionend', onEnd);
+      clearTimeout(t);
+    };
+  }, [closing]);
+
+  useBackDismiss(sheet && !closing, requestClose);
+
+  usePanGesture(sheetRef, {
+    axis: 'y',
+    enabled: sheet && !closing,
+    shouldStart: ({ target, dy }) => {
+      if (dy <= 0) return false;
+      const body = bodyRef.current;
+      return !(body && body.contains(target) && body.scrollTop > 0);
+    },
+    onMove: (delta) => {
+      const el = sheetRef.current;
+      if (!el) return;
+      el.style.transition = 'none';
+      el.style.transform = `translateY(${Math.max(0, delta)}px)`;
+    },
+    onEnd: (delta, velocity) => {
+      const el = sheetRef.current;
+      if (!el) return;
+      // `settle` measures toward open, and down is toward closed.
+      if (settle('open', -delta, -velocity, el.offsetHeight) === 'closed') {
+        requestClose();
+      } else {
+        el.style.transition = '';
+        el.style.transform = '';
+      }
+    },
+  });
+
+  const lists = (
+    <>
       {/* Subfolders (release-fixes-2): listed, not traversed — the only
           action is opening them in Explorer, same as the "Open folder"
           button above but scoped to the subfolder. Android-gated for the
@@ -96,7 +160,51 @@ export function ArtifactsPane({ onClose }: { onClose?: () => void } = {}) {
           ))}
         </div>
       )}
-    </aside>
+    </>
+  );
+
+  return (
+    <>
+      {sheet && (
+        <div className={`sheet-scrim${closing ? ' closing' : ''}`} onClick={requestClose} />
+      )}
+      <aside
+        ref={sheetRef}
+        className={`artifacts-pane${sheet ? ' artifacts-sheet' : ''}${closing ? ' closing' : ''}`}
+      >
+        {sheet && <div className="sheet-handle" aria-hidden="true" />}
+        <div className="artifacts-head">
+          <span>Artifacts ({artifacts.length})</span>
+          {/* Android has no folder to open: the chat folder lives in the app's
+              private data directory, which neither Explorer's equivalent nor
+              any other app can see into. Files leave via "Download" instead. */}
+          {cwd && !android && (
+            <button
+              className="link"
+              title="Open this session's working folder in Explorer"
+              onClick={() => void ipc.openPath(cwd)}
+            >
+              Open folder
+            </button>
+          )}
+          {onClose && (
+            <button
+              className="artifacts-close"
+              onClick={sheet ? requestClose : onClose}
+              aria-label="Close artifacts"
+            >
+              ✕
+            </button>
+          )}
+        </div>
+        {/* Its own scroller on the sheet, so the handle and header stay put
+            and a swipe down can tell "list at top" from "list scrolled". On
+            desktop it's a plain wrapper and the pane scrolls as before. */}
+        <div ref={bodyRef} className="artifacts-body">
+          {lists}
+        </div>
+      </aside>
+    </>
   );
 }
 

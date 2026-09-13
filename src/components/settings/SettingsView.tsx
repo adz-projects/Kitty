@@ -111,23 +111,32 @@ export function SettingsView() {
         {/* The mark doubles as the way out. Settings used to be its own
             window, so closing it was the window chrome's job; as a route it
             still needs an escape hatch or a desktop user is stranded with no
-            path back to their conversation (Android has the tab bar, desktop
-            has nothing else).
+            path back to their conversation.
             This carried the logo alone for a while, on the theory that
             click-the-logo-to-go-home is a convention strong enough not to need
             labelling. It isn't here: the logo is also just the app's mark at
             the top of a nav, which reads as decoration rather than a control,
             and the only hint otherwise was a tooltip you had to hover to find.
-            The label is desktop-only because Android navigates by tab bar and
-            never renders this nav as an escape hatch. */}
+            Android leads the horizontal nav row with a back chevron instead —
+            the phone-native shape for "out of here", next to the system Back
+            gesture that does the same thing (`App.tsx`). */}
         <button
           className="settings-nav-home"
           onClick={() => goto('chat')}
           title="Back to chat"
           aria-label="Back to chat"
         >
-          <KittyIcon />
-          {!isAndroid() && <span>Return to chat</span>}
+          {isAndroid() ? (
+            <>
+              <span aria-hidden="true">‹</span>
+              <span>Chat</span>
+            </>
+          ) : (
+            <>
+              <KittyIcon />
+              <span>Return to chat</span>
+            </>
+          )}
         </button>
         {groups.map((g) => (
           <Fragment key={g.label}>

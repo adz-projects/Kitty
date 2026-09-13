@@ -28,7 +28,9 @@ use serde::Deserialize;
 use serde_json::json;
 use sqlx::SqlitePool;
 
-use crate::agent::orchestrator::{DelegateOutcome, DelegateRun, HostChoice, Orchestrator};
+use crate::agent::orchestrator::{
+    DelegateOutcome, DelegateRun, HostChoice, Orchestrator, TicketWait,
+};
 use crate::storage::{sessions, specialists as store};
 
 /// One line naming what a delegated run actually used.
@@ -49,10 +51,15 @@ fn summarize(specialist: &str, outcome: &DelegateOutcome) -> String {
 /// `tool_allow` can be checked for it.
 pub const CALL_TOOL: &str = "call_specialist";
 pub const LIST_TOOL: &str = "list_specialists";
+/// Collects the reports `call_specialist` tickets promise. Also the name the
+/// agent loop uses for the collection it performs itself when a model tries to
+/// answer with tickets outstanding, so both read the same in a transcript.
+pub const AWAIT_TOOL: &str = "await_specialists";
 
 /// Tool names owned by this server that need the calling session injected.
-/// Both do: neither can be answered without knowing which app is asking.
-pub const SESSION_SCOPED_TOOLS: [&str; 2] = [CALL_TOOL, LIST_TOOL];
+/// All of them do: none can be answered without knowing which session (and so
+/// which app, and which turn's tickets) is asking.
+pub const SESSION_SCOPED_TOOLS: [&str; 3] = [CALL_TOOL, LIST_TOOL, AWAIT_TOOL];
 
 /// Absolute ceiling on refs one call may fan out over.
 ///
@@ -81,6 +88,20 @@ pub struct CallRequest {
     /// Document ids, file paths, or URLs the specialist should work from.
     #[serde(default)]
     pub refs: Option<Vec<String>>,
+    /// Host-injected, never model-supplied.
+    #[serde(default)]
+    #[schemars(skip)]
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct AwaitRequest {
+    /// Which tickets to collect. Omit to collect every outstanding one.
+    #[serde(default)]
+    pub tickets: Option<Vec<String>>,
+    /// "all" (default), "any", or "none".
+    #[serde(default)]
+    pub wait: Option<String>,
     /// Host-injected, never model-supplied.
     #[serde(default)]
     #[schemars(skip)]
@@ -143,19 +164,22 @@ impl SpecialistServer {
 impl SpecialistServer {
     #[tool(
         name = "call_specialist",
-        description = "Delegate a self-contained piece of work to a specialist agent and get back \
-a structured result. The specialist runs in its own context with its own tools, so its searching \
-and reading never enters yours — use this when a task would take many tool calls to produce a \
-small answer. Built-in specialists: `researcher` (answers a question from web sources, returns \
+        description = "Start a self-contained piece of work on a specialist agent in the background. \
+Returns a ticket immediately, not the result: keep working on the rest of the task while it runs, \
+then collect its structured report with `await_specialists` and use it in your answer. Every \
+ticket must be collected before you answer; if you answer first, the reports are collected for \
+you and you will be asked to write the answer again. The specialist runs in its own context with \
+its own tools, so its searching and reading never enters yours — use this when a task would take \
+many tool calls to produce a small answer. Built-in specialists: `researcher` (answers a question from web sources, returns \
 findings with citations); `summarizer` (reads long documents, returns notes and anchors); \
 `locator` (finds where something lives across files, returns paths only); `extractor` (pulls named \
 fields from many documents into rows); `analyst` (computes figures from spreadsheets and explains \
 the method). Call `list_specialists` if none of those fit — the user may have defined others. \
 Pass document ids and paths in `refs` rather than pasting content into `request`; the specialist \
 shares your document cache. `summarizer` and `extractor` run one instance per ref, so passing \
-several documents processes them in parallel and returns one result per document; pass \
-more than the limit and the call is refused outright rather than partly served. You can also \
-issue several call_specialist calls in a single step and they will run at the same time. Do \
+several documents processes them in parallel and its report has one result per document; pass \
+more than the limit and the call is refused outright rather than partly served. You can start \
+several specialists and they will run at the same time. Do \
 not delegate work that needs this conversation's context, and do not delegate anything you \
 can answer directly."
     )]
@@ -253,15 +277,95 @@ can answer directly."
             reasoning_cap: spec.reasoning_cap,
         };
 
-        if fan_out {
-            let specs: Vec<DelegateRun> = refs
-                .iter()
+        // Everything above answers straight away: a bad name, an empty request
+        // or an oversized fan-out is refused before anything starts. What
+        // follows is the run itself, which goes onto a ticket so the calling
+        // model can keep working while it happens.
+        let fan_specs: Option<Vec<DelegateRun>> = fan_out.then(|| {
+            refs.iter()
                 .map(|r| DelegateRun {
                     prompt: base(std::slice::from_ref(r)),
                     ..run.clone()
                 })
-                .collect();
-            let outcomes = self.orchestrator.run_many(specs).await;
+                .collect()
+        });
+        let orchestrator = self.orchestrator.clone();
+        let specialist = spec.name.clone();
+        let parent = run.parent_session_id.clone();
+        let work = Self::run_to_report(orchestrator, spec.name.clone(), run, fan_specs, refs);
+        let ticket = self.orchestrator.start_ticket(&parent, &specialist, work);
+        json!({
+            "ok": true,
+            "ticket": ticket,
+            "specialist": specialist,
+            "status": "running",
+            "note": "Keep working on the rest of the task. Collect this report with \
+                     await_specialists before you write your answer.",
+        })
+        .to_string()
+    }
+
+    #[tool(
+        name = "await_specialists",
+        description = "Collect reports from specialists started with `call_specialist`. With no \
+`tickets`, collects every report still outstanding. `wait`: \"all\" (default) waits until every \
+selected ticket has reported; \"any\" waits for at least one and returns whatever has finished; \
+\"none\" returns only what has already finished, without waiting. `still_running` lists tickets \
+that have not reported yet — collect them before you answer."
+    )]
+    pub async fn await_specialists(&self, Parameters(req): Parameters<AwaitRequest>) -> String {
+        let Some(session_id) = req.session_id.as_deref().filter(|s| !s.is_empty()) else {
+            return Self::refuse("this session cannot call specialists");
+        };
+        let Some(wait) = TicketWait::parse(req.wait.as_deref()) else {
+            return Self::refuse("`wait` must be \"all\", \"any\" or \"none\"");
+        };
+        match self
+            .orchestrator
+            .collect(session_id, req.tickets.as_deref(), wait)
+            .await
+        {
+            Ok(collected) => collected.to_json().to_string(),
+            Err(why) => Self::refuse(why),
+        }
+    }
+
+    #[tool(
+        name = "list_specialists",
+        description = "List the specialists available to delegate to, with what each is for. Call \
+this when a task looks delegable but none of the built-in specialists named in `call_specialist` \
+obviously fits."
+    )]
+    pub async fn list_specialists(&self, Parameters(req): Parameters<ListRequest>) -> String {
+        let Some(app_id) = self.app_for(req.session_id.as_deref()).await else {
+            return Self::refuse("this session cannot call specialists");
+        };
+        match store::list_visible(&self.pool, &app_id).await {
+            Ok(list) => {
+                let entries: Vec<_> = list
+                    .into_iter()
+                    .filter(|s| s.enabled)
+                    .map(|s| json!({"name": s.name, "description": s.description}))
+                    .collect();
+                json!({"ok": true, "specialists": entries}).to_string()
+            }
+            Err(e) => Self::refuse(format!("could not list specialists: {e}")),
+        }
+    }
+}
+
+impl SpecialistServer {
+    /// Run one delegated call to completion and render the report its ticket
+    /// will hand back. `fan_specs` is `Some` for a per-ref fan-out.
+    async fn run_to_report(
+        orchestrator: Arc<Orchestrator>,
+        specialist: String,
+        run: DelegateRun,
+        fan_specs: Option<Vec<DelegateRun>>,
+        refs: Vec<String>,
+    ) -> String {
+        if let Some(specs) = fan_specs {
+            let outcomes = orchestrator.run_many(specs).await;
 
             let mut results = Vec::new();
             let mut succeeded = 0usize;
@@ -315,10 +419,10 @@ can answer directly."
 
             return json!({
                 "ok": succeeded > 0,
-                "specialist": spec.name,
+                "specialist": specialist,
                 "summary": format!(
                     "{} · {} of {} sources · {} ({}) · {} tokens",
-                    spec.name, succeeded, refs.len(), host.model, host.provider, host.tokens
+                    specialist, succeeded, refs.len(), host.model, host.provider, host.tokens
                 ),
                 "ran_on": host,
                 "succeeded": succeeded,
@@ -329,7 +433,7 @@ can answer directly."
             .to_string();
         }
 
-        match self.orchestrator.run(run).await {
+        match orchestrator.run(run).await {
             Ok(Ok(outcome)) => {
                 // The answer is already JSON when the specialist had a schema
                 // (validated by `agent::loop_::finalize_structured`), so it is
@@ -339,12 +443,12 @@ can answer directly."
                     .unwrap_or_else(|_| json!(outcome.answer));
                 json!({
                     "ok": true,
-                    "specialist": spec.name,
+                    "specialist": specialist,
                     // A plain sentence as well as the structured host, because
                     // the question it answers — what did this actually cost me —
                     // should be readable at a glance in the transcript rather
                     // than assembled from an object.
-                    "summary": summarize(&spec.name, &outcome),
+                    "summary": summarize(&specialist, &outcome),
                     "ran_on": outcome.host,
                     "notes": outcome.notes,
                     "result": result,
@@ -353,7 +457,7 @@ can answer directly."
             }
             Ok(Err(why)) => json!({
                 "ok": false,
-                "specialist": spec.name,
+                "specialist": specialist,
                 "error": why,
             })
             .to_string(),
@@ -361,29 +465,6 @@ can answer directly."
             // `subagent_pick::choose_host`), so it reaches the model verbatim
             // rather than being flattened into "unavailable".
             Err(refusal) => Self::refuse(refusal.to_string()),
-        }
-    }
-
-    #[tool(
-        name = "list_specialists",
-        description = "List the specialists available to delegate to, with what each is for. Call \
-this when a task looks delegable but none of the built-in specialists named in `call_specialist` \
-obviously fits."
-    )]
-    pub async fn list_specialists(&self, Parameters(req): Parameters<ListRequest>) -> String {
-        let Some(app_id) = self.app_for(req.session_id.as_deref()).await else {
-            return Self::refuse("this session cannot call specialists");
-        };
-        match store::list_visible(&self.pool, &app_id).await {
-            Ok(list) => {
-                let entries: Vec<_> = list
-                    .into_iter()
-                    .filter(|s| s.enabled)
-                    .map(|s| json!({"name": s.name, "description": s.description}))
-                    .collect();
-                json!({"ok": true, "specialists": entries}).to_string()
-            }
-            Err(e) => Self::refuse(format!("could not list specialists: {e}")),
         }
     }
 }

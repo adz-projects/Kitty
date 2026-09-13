@@ -277,6 +277,11 @@ pub async fn connect_server(client: &BigTinyClient, id: &str) -> Result<(), Stri
 /// release, fully implemented and completely unreachable, because nothing here
 /// registered it. `registered_builtins_covers_the_daemons_builtin_servers`
 /// below is what now fails when they drift.
+/// Mirrors the daemon's `FAN_OUT_DEADLINE_WAVES` (`agent/orchestrator.rs`):
+/// how many `timeout_secs` a fan-out's shared deadline allows. Change the two
+/// together — the `specialists` row's timeout is sized from it.
+const SPECIALIST_FAN_OUT_WAVES: u64 = 3;
+
 const REGISTERED_BUILTINS: &[&str] = &[
     "pathway",
     "specialists",
@@ -432,16 +437,18 @@ pub async fn ensure_builtin_servers(app: &AppHandle) {
             url: None,
             env: HashMap::new(),
             headers: HashMap::new(),
-            // A `call_specialist` blocks the parent's tool call for as long as
-            // the delegate runs, which the daemon bounds at
-            // `SpecialistSettings::timeout_secs` (300s by default) — ten times
-            // the daemon's 30s MCP default. Left at that default the MCP layer
-            // would cut off the parent before the orchestrator's own cancel
-            // fired, reporting a timeout for a delegate still running: the
-            // `kitty-wasm` failure documented below. The margin keeps the
-            // orchestrator the thing that decides, so a real timeout is
-            // reported as one.
-            timeout_s: Some((specialist_timeout_secs + 30) as i64),
+            // `call_specialist` returns a ticket at once, but `await_specialists`
+            // waits for the reports, and the slowest thing it can wait on is a
+            // fan-out: `SpecialistSettings::timeout_secs` (300s by default) per
+            // run, over `FAN_OUT_DEADLINE_WAVES` (3) waves of the batch's shared
+            // deadline — thirty times the daemon's 30s MCP default. Left lower,
+            // the MCP layer would cut off an await before the orchestrator's own
+            // deadline fired, reporting a timeout for a delegate still running:
+            // the `kitty-wasm` failure documented below. The margin keeps the
+            // orchestrator the thing that decides, so a real timeout is reported
+            // as one. (The end-of-turn collection the loop performs itself does
+            // not go through MCP and is bounded by those deadlines alone.)
+            timeout_s: Some((specialist_timeout_secs * SPECIALIST_FAN_OUT_WAVES + 30) as i64),
             enabled: true,
         },
     )

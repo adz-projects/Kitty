@@ -25,6 +25,7 @@ import {
   pickSavePath,
 } from '@/lib/ipc';
 import { buildExport, sanitizeFilename } from '@/lib/chatml';
+import { isAndroid } from '@/lib/platform';
 import { defaultSystemPrompt } from '@/lib/system_prompts';
 import { modelAcceptsImages } from '@/lib/vision_models';
 import type {
@@ -58,6 +59,7 @@ import {
   findMatchingProvider,
   isArtifactInScope,
   isImageFileName,
+  isAutoSpecialistCollection,
   isStragglerAssistantMessage,
   userFileArtifact,
 } from './chat/messageUtils';
@@ -2059,10 +2061,22 @@ export const useChatStore = create<ChatState>((set, get) => {
       if (messages.length === 0) return;
       const chatMessages = buildExport(messages, upToIndex);
       const base = sanitizeFilename(title ?? 'kitty-session');
+      const body = JSON.stringify({ messages: chatMessages }) + '\n';
+      // Android saves out the way an artifact's "Download" does — the one
+      // write path off the device that has been proven against real document
+      // providers. Desktop's native dialog + write has no such problem.
+      if (isAndroid()) {
+        try {
+          await ipc.downloadText(`${base}.jsonl`, body);
+        } catch (e) {
+          set({ error: String(e) });
+        }
+        return;
+      }
       const path = await pickSavePath(`${base}.jsonl`);
       if (!path) return;
       try {
-        await ipc.writeFile(path, JSON.stringify({ messages: chatMessages }) + '\n');
+        await ipc.writeFile(path, body);
       } catch (e) {
         set({ error: String(e) });
       }
@@ -2291,6 +2305,13 @@ export const useChatStore = create<ChatState>((set, get) => {
           } else {
             last = { ...last };
             msgs[msgs.length - 1] = last;
+          }
+          // Whatever the model said before the daemon had to collect its
+          // specialist reports was written without them — keep it as a draft,
+          // out of the answer bubble, for the real answer that follows.
+          if (e.phase === 'tool_call' && last.text && isAutoSpecialistCollection(u)) {
+            last.draftText = last.draftText ? `${last.draftText}\n\n${last.text}` : last.text;
+            last.text = '';
           }
           const toolCalls = last.toolCalls.slice();
           const existing = toolCalls.findIndex((t) => t.id === id);

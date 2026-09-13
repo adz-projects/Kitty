@@ -153,7 +153,11 @@ inventory. Subsystems built beyond the original phased plan:
   (relayed as `BIGTINY_AGENT__SUBAGENT_MODEL_DENY` at spawn, seeded once from
   the OpenRouter catalog's premium tier), and the `chat://subagent-status`
   tray. The daemon picks the host, bounds the run in wall-clock time and
-  reasoning tokens, and reports what it actually used. **Replaced the
+  reasoning tokens, and reports what it actually used. Delegates run in the
+  background: `call_specialist` returns a ticket, the model keeps working and
+  collects reports with `await_specialists`, and the loop will not let a turn
+  end until every ticket is collected and answered from (`docs/VERSIONS.md`,
+  0.10.7). **Replaced the
   client-side recipes feature** (Goose-style `/slug` prompt templates) —
   users lose a deterministic shortcut and gain delegation they never have
   to ask for.

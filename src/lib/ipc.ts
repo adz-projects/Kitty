@@ -312,6 +312,10 @@ export const ipc = {
   /** Save a copy of a file wherever the user picks. Resolves `false` if they
       cancelled the dialog. */
   downloadFile: (path: string) => invoke<boolean>('download_file', { path }),
+  /** Save generated text through the same save-out path as `downloadFile`.
+      `false` means the user cancelled. */
+  downloadText: (name: string, content: string) =>
+    invoke<boolean>('download_text', { name, content }),
   listDirectory: (path: string) => invoke<FileEntry[]>('list_directory', { path }),
   // Providers
   listProviders: () => invoke<ProviderView[]>('list_providers'),

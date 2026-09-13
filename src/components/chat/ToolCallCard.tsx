@@ -1,5 +1,5 @@
 import { memo, useCallback, useMemo, useState } from 'react';
-import type { ToolCall } from '@/stores/chatStore';
+import { specialistToolTitle, type ToolCall } from '@/stores/chatStore';
 import { ToolsIcon } from '@/components/icons/ToolsIcon';
 
 function stringify(v: unknown): string {
@@ -34,7 +34,7 @@ export const ToolCallCard = memo(function ToolCallCard({ call }: { call: ToolCal
     <details className="tool-card" onToggle={onToggle}>
       <summary>
         <span>
-          <ToolsIcon /> {call.title}
+          <ToolsIcon /> {specialistToolTitle(call) ?? call.title}
         </span>
         <span className="status-badge">{call.status}</span>
       </summary>
