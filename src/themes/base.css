@@ -821,6 +821,15 @@ button.primary {
 .subagent-popover button:hover {
   background: var(--surface-2);
 }
+.subagent-popover-name {
+  flex: 1;
+}
+/* The delegate's own model. Muted and trailing because it is context for the
+   name beside it, not the thing being picked. */
+.subagent-popover-host {
+  color: var(--text-muted);
+  font-size: 11px;
+}
 .composer textarea {
   flex: 1;
   resize: none;

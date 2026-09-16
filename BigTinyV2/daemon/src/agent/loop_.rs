@@ -489,6 +489,14 @@ const AUTO_COLLECT_AFTER_ANSWER: &str =
 /// The same, for the collection made just before a context wrap-up reply.
 const AUTO_COLLECT_BEFORE_WRAPUP: &str =
     "Specialist reports collected before finishing. Use them in your final answer.";
+/// The same, for a report that arrived mid-turn and was handed over the moment
+/// it did. Phrased as information rather than as an instruction to stop: the
+/// model was in the middle of something when this landed, and most reports
+/// change nothing about what it was doing.
+const SPECIALIST_REPORT_ARRIVED: &str =
+    "A specialist you started has finished and its report is above. Use it now if it changes \
+     what you were about to do; otherwise carry on. Anything listed in `still_running` is still \
+     working and will reach you the same way, so there is no need to wait for it.";
 
 /// Synthetic tool name for the wrap-up valve's notice. Deliberately NOT
 /// `__budget__`: Kitty suppresses that one (`bigtiny/stream.rs`) because the
@@ -2178,6 +2186,20 @@ impl AgentLoop {
             }
 
             if step >= max_steps {
+                // Collect before announcing the limit. `TurnCleanup::drop`
+                // aborts anything still outstanding when the turn unwinds, so
+                // without this a budget exit throws away reports the user has
+                // already paid for — and the structured-answer pass below,
+                // which deliberately still runs after a step-limit exit, would
+                // write its answer without them.
+                self.collect_outstanding_specialists(
+                    session_id,
+                    "",
+                    AUTO_COLLECT_BEFORE_WRAPUP,
+                    &mut messages,
+                    event_tx,
+                )
+                .await;
                 let err_msg = format!("Step limit ({max_steps}) reached.");
                 let _ = event_tx.send(SSEEvent {
                     event_type: SSEEventType::ToolFinish,
@@ -3122,9 +3144,14 @@ impl AgentLoop {
             // write the answer again. Checked *before* the assistant message is
             // pushed: once saved it has a DB id, and the answer text has to
             // travel on the same message as the collection call instead.
+            //
+            // Deliberately not gated on `finish_reason`. A model that stopped
+            // calling tools is done working whatever reason the provider
+            // reported, and the reasons that are not `stop`/`end_turn` —
+            // `length`, a dialect that reports nothing at all — are exactly the
+            // ones that used to fall through to `step += 1` and let the turn
+            // burn to its ceiling with paid-for reports still uncollected.
             if turn_tool_calls.is_empty()
-                && (finish_reason.as_deref() == Some("stop")
-                    || finish_reason.as_deref() == Some("end_turn"))
                 && self
                     .collect_outstanding_specialists(
                         session_id,
@@ -3213,6 +3240,11 @@ impl AgentLoop {
             if let Err(e) = self.context.save_messages(session_id, &mut messages).await {
                 tracing::warn!("failed to save messages for session {session_id}: {e}");
             }
+            // Hand over any specialist that finished while this step's tools
+            // ran, so the model sees it on its very next thought instead of at
+            // the end of the turn. Silent and free when nothing is ready.
+            self.drain_ready_specialists(session_id, &mut messages, event_tx)
+                .await;
             step += 1;
         }
 
@@ -3686,21 +3718,15 @@ impl AgentLoop {
 
     /// Collect every outstanding specialist report on the model's behalf.
     ///
-    /// Recorded as though the model had called `await_specialists` itself: an
-    /// assistant message carrying `content` (the text it just wrote, if any)
-    /// and one synthetic call, then that call's result. The pair keeps the
-    /// transcript in the one shape every chat template already accepts —
-    /// reports never arrive as injected messages, and the answer text is never
-    /// split into two consecutive assistant turns.
+    /// Blocking: waits until every outstanding ticket has reported. Used at the
+    /// points a turn may not pass with a report unread — the model answering,
+    /// the wrap-up reply, the step ceiling.
     ///
-    /// Dispatched straight to the orchestrator rather than through the MCP
-    /// server: the tickets are the orchestrator's own, and a collection the
-    /// daemon *requires* must not depend on a tool server being connected or on
-    /// its call timeout. `"auto": true` in the arguments is how a client tells
-    /// this call apart from one the model made (Kitty shows the text before it
-    /// as a draft).
-    ///
-    /// Returns false, having touched nothing, when there is nothing to collect.
+    /// Returns false, having touched nothing, when there was nothing to
+    /// collect; and false, having recorded the failure, when the collection
+    /// itself errored. A failed collection deliberately does not count as one:
+    /// a `true` costs the caller a step and makes the model write its answer
+    /// again, which is not worth paying for a result carrying no reports.
     async fn collect_outstanding_specialists(
         &self,
         session_id: &str,
@@ -3716,42 +3742,21 @@ impl AgentLoop {
             return false;
         }
 
-        let tool_name = crate::specialists::server::AWAIT_TOOL;
         let args = json!({"wait": "all", "auto": true});
-        let call = ToolCall {
-            id: format!("auto-await-{}", uuid::Uuid::new_v4()),
-            r#type: "function".into(),
-            function: json!({"name": tool_name, "arguments": args}),
-        };
+        let call = Self::auto_await_call(&args);
+        // The assistant message and the start frame go out *before* the wait:
+        // the transcript is then already in its final shape, and the user
+        // watches a live "collecting" card instead of a silent gap.
         messages.push(build_assistant_message(content, std::slice::from_ref(&call)));
-        let _ = event_tx.send(SSEEvent {
-            event_type: SSEEventType::ToolStart,
-            tool_name: Some(tool_name.to_string()),
-            tool_args: Some(args),
-            session_id: Some(session_id.to_string()),
-            ..Default::default()
-        });
+        Self::emit_auto_await_start(session_id, &call, &args, event_tx);
 
         let started = Instant::now();
-        let result = match orchestrator
+        let collected = orchestrator
             .collect(session_id, None, crate::agent::orchestrator::TicketWait::All)
-            .await
-        {
-            Ok(collected) => {
-                let mut v = collected.to_json();
-                v["note"] = json!(note);
-                v.to_string()
-            }
-            Err(why) => json!({"ok": false, "error": why}).to_string(),
-        };
-        let _ = event_tx.send(SSEEvent {
-            event_type: SSEEventType::ToolFinish,
-            tool_name: Some(tool_name.to_string()),
-            tool_result: Some(result.clone()),
-            duration_ms: Some(started.elapsed().as_millis() as i64),
-            session_id: Some(session_id.to_string()),
-            ..Default::default()
-        });
+            .await;
+        let ok = collected.is_ok();
+        let result = Self::auto_await_result(collected, note);
+        Self::emit_auto_await_finish(session_id, &call, &result, started, event_tx);
         messages.push(json!({
             "role": "tool",
             "content": result,
@@ -3760,7 +3765,141 @@ impl AgentLoop {
         if let Err(e) = self.context.save_messages(session_id, messages).await {
             tracing::warn!("failed to save messages for session {session_id}: {e}");
         }
-        true
+        ok
+    }
+
+    /// Hand over any specialist report that has finished, without waiting for
+    /// the ones that have not.
+    ///
+    /// This is what makes delegation collaborative rather than a batch job: a
+    /// report reaches the model on its very next thought, so it can act on the
+    /// first answer while the rest are still running. Called once per step,
+    /// after that step's tool results have been appended — the only point in
+    /// the iteration where the transcript is in a complete assistant/tool
+    /// state, and naturally the point where a long sibling tool call has given
+    /// a delegate time to finish.
+    ///
+    /// Non-blocking by construction (`TicketWait::None`) and silent when
+    /// nothing is ready: with tickets outstanding but none finished this
+    /// returns having touched neither `messages` nor the event stream, which is
+    /// what keeps it from appending an empty pair on every step of a long turn.
+    async fn drain_ready_specialists(
+        &self,
+        session_id: &str,
+        messages: &mut Vec<Value>,
+        event_tx: &mpsc::UnboundedSender<SSEEvent>,
+    ) {
+        let Some(orchestrator) = self.mcp.orchestrator() else {
+            return;
+        };
+        if orchestrator.uncollected(session_id).is_empty() {
+            return;
+        }
+        let started = Instant::now();
+        let Ok(collected) = orchestrator
+            .collect(session_id, None, crate::agent::orchestrator::TicketWait::None)
+            .await
+        else {
+            // `ids: None` cannot error today; were that to change, a failed
+            // poll is not worth a message — the blocking collection at the end
+            // of the turn is the backstop that must not be skipped.
+            return;
+        };
+        if collected.reports.is_empty() {
+            return;
+        }
+
+        let args = json!({"wait": "none", "auto": true});
+        let call = Self::auto_await_call(&args);
+        // Start and finish go out together: the collection has already
+        // happened and took no measurable time, so a separate "collecting"
+        // phase would be a card that flickers rather than one that informs.
+        Self::emit_auto_await_start(session_id, &call, &args, event_tx);
+        let result = Self::auto_await_result(Ok(collected), SPECIALIST_REPORT_ARRIVED);
+        Self::emit_auto_await_finish(session_id, &call, &result, started, event_tx);
+        // No content on the assistant message: the model's text for this step
+        // was already appended with its own tool calls, and repeating it here
+        // would show the user the same paragraph twice.
+        messages.push(build_assistant_message("", std::slice::from_ref(&call)));
+        messages.push(json!({
+            "role": "tool",
+            "content": result,
+            "tool_call_id": call.id,
+        }));
+        if let Err(e) = self.context.save_messages(session_id, messages).await {
+            tracing::warn!("failed to save messages for session {session_id}: {e}");
+        }
+    }
+
+    /// The synthetic `await_specialists` call both collections are recorded as.
+    ///
+    /// Recorded as though the model had made the call itself — an assistant
+    /// message carrying one call, then that call's result — rather than as an
+    /// injected message: the pair is the one shape every chat template already
+    /// accepts, and it keeps the answer text and the reports on the same turn.
+    /// Dispatched straight to the orchestrator rather than through the MCP
+    /// server, because the tickets are the orchestrator's own and a collection
+    /// the daemon *requires* must not depend on a tool server being connected
+    /// or on its call timeout. `"auto": true` in the arguments is how a client
+    /// tells these apart from an `await_specialists` the model chose to make
+    /// (Kitty renders the two differently).
+    fn auto_await_call(args: &Value) -> ToolCall {
+        ToolCall {
+            id: format!("auto-await-{}", uuid::Uuid::new_v4()),
+            r#type: "function".into(),
+            function: json!({
+                "name": crate::specialists::server::AWAIT_TOOL,
+                "arguments": args,
+            }),
+        }
+    }
+
+    fn auto_await_result(
+        collected: Result<crate::agent::orchestrator::Collected, String>,
+        note: &str,
+    ) -> String {
+        match collected {
+            Ok(collected) => {
+                let mut v = collected.to_json();
+                v["note"] = json!(note);
+                v.to_string()
+            }
+            Err(why) => json!({"ok": false, "error": why}).to_string(),
+        }
+    }
+
+    fn emit_auto_await_start(
+        session_id: &str,
+        call: &ToolCall,
+        args: &Value,
+        event_tx: &mpsc::UnboundedSender<SSEEvent>,
+    ) {
+        let _ = event_tx.send(SSEEvent {
+            event_type: SSEEventType::ToolStart,
+            tool_name: Some(crate::specialists::server::AWAIT_TOOL.to_string()),
+            tool_call_id: Some(call.id.clone()),
+            tool_args: Some(args.clone()),
+            session_id: Some(session_id.to_string()),
+            ..Default::default()
+        });
+    }
+
+    fn emit_auto_await_finish(
+        session_id: &str,
+        call: &ToolCall,
+        result: &str,
+        started: Instant,
+        event_tx: &mpsc::UnboundedSender<SSEEvent>,
+    ) {
+        let _ = event_tx.send(SSEEvent {
+            event_type: SSEEventType::ToolFinish,
+            tool_name: Some(crate::specialists::server::AWAIT_TOOL.to_string()),
+            tool_call_id: Some(call.id.clone()),
+            tool_result: Some(result.to_string()),
+            duration_ms: Some(started.elapsed().as_millis() as i64),
+            session_id: Some(session_id.to_string()),
+            ..Default::default()
+        });
     }
 
     async fn execute_tools(
@@ -3807,6 +3946,10 @@ impl AgentLoop {
             let semaphore = semaphore.clone();
             self.execute_one_tool_call(
                 session_id,
+                // The model's own id for this call, so a client can pair this
+                // card's finish with its start even though the whole step runs
+                // concurrently below.
+                tc.id.clone(),
                 tool_name,
                 tool_args,
                 allowed_dirs,
@@ -3839,6 +3982,7 @@ impl AgentLoop {
     async fn execute_one_tool_call(
         &self,
         session_id: &str,
+        tool_call_id: String,
         tool_name: String,
         tool_args: Value,
         allowed_dirs: &[String],
@@ -3849,6 +3993,7 @@ impl AgentLoop {
             event_type: SSEEventType::ToolStart,
             tool_name: Some(tool_name.clone()),
             tool_args: Some(tool_args.clone()),
+            tool_call_id: Some(tool_call_id.clone()),
             session_id: Some(session_id.to_string()),
             ..Default::default()
         });
@@ -3868,6 +4013,7 @@ impl AgentLoop {
                 event_type: SSEEventType::ToolFinish,
                 tool_name: Some(tool_name),
                 tool_result: Some(err.clone()),
+                tool_call_id: Some(tool_call_id.clone()),
                 session_id: Some(session_id.to_string()),
                 ..Default::default()
             });
@@ -3898,6 +4044,7 @@ impl AgentLoop {
                     event_type: SSEEventType::ToolFinish,
                     tool_name: Some(tool_name),
                     tool_result: Some(err.clone()),
+                    tool_call_id: Some(tool_call_id.clone()),
                     session_id: Some(session_id.to_string()),
                     ..Default::default()
                 });
@@ -3949,6 +4096,7 @@ impl AgentLoop {
                 event_type: SSEEventType::ToolFinish,
                 tool_name: Some(tool_name),
                 tool_result: Some(err.clone()),
+                tool_call_id: Some(tool_call_id.clone()),
                 session_id: Some(session_id.to_string()),
                 ..Default::default()
             });
@@ -4005,6 +4153,7 @@ impl AgentLoop {
                 event_type: SSEEventType::ToolFinish,
                 tool_name: Some(tool_name.clone()),
                 tool_result: Some(err.clone()),
+                tool_call_id: Some(tool_call_id.clone()),
                 session_id: Some(session_id.to_string()),
                 ..Default::default()
             });
@@ -4086,6 +4235,7 @@ impl AgentLoop {
                     event_type: SSEEventType::ToolFinish,
                     tool_name: Some(tool_name.clone()),
                     tool_result: Some(err.clone()),
+                    tool_call_id: Some(tool_call_id.clone()),
                     session_id: Some(session_id.to_string()),
                     ..Default::default()
                 });
@@ -4160,6 +4310,7 @@ impl AgentLoop {
                         event_type: SSEEventType::ToolFinish,
                         tool_name: Some(tool_name.clone()),
                         tool_result: Some(err.clone()),
+                        tool_call_id: Some(tool_call_id.clone()),
                         session_id: Some(session_id.to_string()),
                         ..Default::default()
                     });
@@ -4214,6 +4365,7 @@ impl AgentLoop {
             tool_name: Some(tool_name.clone()),
             tool_result: Some(output.clone()),
             duration_ms: Some(result.duration_ms as i64),
+            tool_call_id: Some(tool_call_id.clone()),
             session_id: Some(session_id.to_string()),
             ..Default::default()
         });
@@ -4720,6 +4872,7 @@ mod containment_order_tests {
         let result = agent_loop
             .execute_one_tool_call(
                 "sess-1",
+                "tc-1".to_string(),
                 "lean_file_write".to_string(),
                 json!({"path": "/etc/evil.txt", "content": "x"}),
                 &["/allowed".to_string()],
@@ -4748,6 +4901,7 @@ mod containment_order_tests {
         let handle = tokio::spawn(async move {
             al.execute_one_tool_call(
                 "sess-1",
+                "tc-1".to_string(),
                 "lean_file_write".to_string(),
                 json!({"path": "/allowed/ok.txt", "content": "x"}),
                 &["/allowed".to_string()],

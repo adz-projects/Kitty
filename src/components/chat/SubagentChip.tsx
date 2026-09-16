@@ -31,7 +31,7 @@ export function SubagentChip({ subagents }: { subagents: SubagentStatusEvent[] }
   // single-window hub has nowhere to put (see `windows.rs`'s module docs).
   const canWatch = !isAndroid() && working.length > 0;
 
-  const watch = async (childSessionId: string, specialist: string) => {
+  const watch = async (s: SubagentStatusEvent) => {
     setOpen(false);
     try {
       // The delegate runs in the app's own workspace, so this window's cwd and
@@ -39,14 +39,20 @@ export function SubagentChip({ subagents }: { subagents: SubagentStatusEvent[] }
       // the new window read-only — see `ChatWorkspace`.
       const { cwd, mode, availableModes } = useChatStore.getState();
       await ipc.openNewChatWindow({
-        session_id: childSessionId,
+        session_id: s.child_session_id,
         // The store types both as nullable; a delegate inherits the app's
         // workspace, so an empty string just means 'no folder pill to show'.
         cwd: cwd ?? '',
         current_mode: mode ?? '',
         available_modes: availableModes,
         spectate: true,
-        specialist,
+        specialist: s.specialist,
+        // Carried so the new window can label itself with the delegate's own
+        // host. Without it the window falls back to the globally active
+        // provider and shows the MAIN model's name over a transcript the main
+        // model had no part in.
+        provider_id: s.provider_id ?? undefined,
+        model: s.model ?? undefined,
       });
     } catch {
       // Opening a window is a convenience; failing to is not worth interrupting
@@ -81,7 +87,7 @@ export function SubagentChip({ subagents }: { subagents: SubagentStatusEvent[] }
         onClick={() => {
           // One delegate needs no menu — open it.
           if (working.length === 1) {
-            void watch(working[0].child_session_id, working[0].specialist);
+            void watch(working[0]);
             return;
           }
           setOpen((v) => !v);
@@ -96,10 +102,11 @@ export function SubagentChip({ subagents }: { subagents: SubagentStatusEvent[] }
               type="button"
               role="menuitem"
               key={s.child_session_id}
-              onClick={() => void watch(s.child_session_id, s.specialist)}
+              onClick={() => void watch(s)}
             >
               <span className="status-dot warn" />
-              {s.specialist}
+              <span className="subagent-popover-name">{s.specialist}</span>
+              {s.model && <span className="subagent-popover-host">{s.model}</span>}
             </button>
           ))}
         </div>
@@ -110,5 +117,10 @@ export function SubagentChip({ subagents }: { subagents: SubagentStatusEvent[] }
 
 function describe(s: SubagentStatusEvent): string {
   const suffix = s.status === 'started' ? 'working' : s.status;
-  return s.error ? `${s.specialist} — ${suffix}: ${s.error}` : `${s.specialist} — ${suffix}`;
+  // The host is the part that is not guessable from anywhere else in the UI:
+  // a delegate rarely runs on the model named in the chat header.
+  const on = s.model ? ` on ${s.model}` : '';
+  return s.error
+    ? `${s.specialist}${on} — ${suffix}: ${s.error}`
+    : `${s.specialist}${on} — ${suffix}`;
 }

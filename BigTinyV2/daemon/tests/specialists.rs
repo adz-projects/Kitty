@@ -976,3 +976,116 @@ async fn cancelling_a_parent_abandons_its_tickets() {
     agent.cancel("parent").await;
     assert!(orchestrator.uncollected("parent").is_empty());
 }
+
+/// The point of the whole ticket design: a report reaches the model *during*
+/// the turn, not at the end of it.
+///
+/// The model spends step 0 on a tool call while a delegate finishes underneath
+/// it. The loop hands the report over the moment that step's results land, so
+/// by the time the model writes anything it has already read it — and the
+/// end-of-turn collection, which is a backstop for reports that arrive too
+/// late, has nothing left to do. The `wait: "none"` on the call is what
+/// distinguishes the two: nothing blocked to produce this.
+#[tokio::test]
+async fn a_report_that_finishes_mid_turn_reaches_the_model_on_its_next_step() {
+    let pool = test_pool().await;
+    let mut server = mockito::Server::new_async().await;
+    // Two responses: a tool call, then an answer. No third is mocked, which is
+    // itself part of the assertion — the report arrives during the tool step,
+    // so the model never has to be asked to write its answer a second time.
+    mock_tool_then_stop(&mut server, "some_unregistered_tool").await;
+    let (agent, orchestrator) = ticket_agent(&pool, &server.url()).await;
+    seed_session(
+        &pool,
+        "parent",
+        json!({"provider": "mock", "hitl_policy": "auto_reject"}),
+    )
+    .await;
+
+    // Ready almost at once, so it has certainly finished by the time step 0's
+    // tool result is appended.
+    orchestrator.start_ticket("parent", "researcher", async {
+        json!({"ok": true, "result": "the early finding"}).to_string()
+    });
+    let events = run_and_collect(&agent, "parent").await;
+
+    assert!(orchestrator.uncollected("parent").is_empty());
+    let collections: Vec<&SSEEvent> = events
+        .iter()
+        .filter(|e| {
+            e.event_type == SSEEventType::ToolStart
+                && e.tool_name.as_deref() == Some("await_specialists")
+        })
+        .collect();
+    assert_eq!(
+        collections.len(),
+        1,
+        "the mid-turn hand-over should have left the end-of-turn backstop nothing to collect"
+    );
+    let args = collections[0].tool_args.as_ref().unwrap();
+    assert_eq!(args["wait"], "none", "nothing should have blocked on this");
+    assert_eq!(args["auto"], true);
+    assert!(tool_results(&events)
+        .iter()
+        .any(|r| r.contains("the early finding")));
+
+    let rows = bigtiny2::storage::messages::get_messages_by_session(&pool, "parent")
+        .await
+        .unwrap();
+    let collecting = rows
+        .iter()
+        .position(|r| {
+            r.role == "assistant"
+                && r.tool_calls
+                    .as_deref()
+                    .is_some_and(|t| t.contains("await_specialists"))
+        })
+        .expect("the hand-over must be persisted as a call/result pair");
+    assert_eq!(
+        rows[collecting].content.as_deref().unwrap_or(""),
+        "",
+        "a mid-turn hand-over carries no answer text — the model has not written one yet"
+    );
+    assert_eq!(rows[collecting + 1].role, "tool");
+    let last = rows.last().unwrap();
+    assert_eq!(
+        (last.role.as_str(), last.content.as_deref()),
+        ("assistant", Some("done")),
+        "the answer is written once, with the report already in context"
+    );
+}
+
+/// Every tool card must be closable: `tool_start` and `tool_finish` carry the
+/// model's own call id, because a step's tool calls run concurrently and
+/// arrival order cannot pair them. Without it the longest call in a batch — an
+/// `await_specialists` next to the `call_specialist`s that opened it — stayed
+/// pending in the UI forever.
+#[tokio::test]
+async fn tool_frames_carry_the_call_id_that_pairs_them() {
+    let pool = test_pool().await;
+    let mut server = mockito::Server::new_async().await;
+    mock_tool_then_stop(&mut server, "some_unregistered_tool").await;
+    let (agent, _orchestrator) = ticket_agent(&pool, &server.url()).await;
+    seed_session(
+        &pool,
+        "parent",
+        json!({"provider": "mock", "hitl_policy": "auto_reject"}),
+    )
+    .await;
+
+    let events = run_and_collect(&agent, "parent").await;
+    for kind in [SSEEventType::ToolStart, SSEEventType::ToolFinish] {
+        let frames: Vec<&SSEEvent> = events
+            .iter()
+            .filter(|e| e.event_type == kind && e.tool_name.as_deref() != Some("__budget__"))
+            .collect();
+        assert!(!frames.is_empty(), "expected at least one {kind:?} frame");
+        for f in frames {
+            assert!(
+                f.tool_call_id.as_deref().is_some_and(|id| !id.is_empty()),
+                "{kind:?} for {:?} carried no tool_call_id",
+                f.tool_name
+            );
+        }
+    }
+}

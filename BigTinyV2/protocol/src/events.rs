@@ -30,6 +30,11 @@ pub struct SSEEvent {
     pub content: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_name: Option<String>,
+    /// The id of the tool call this frame belongs to, on `ToolStart`/
+    /// `ToolFinish` — a step's tool calls run concurrently, so arrival order
+    /// cannot pair a finish with its start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_args: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -122,6 +127,7 @@ impl Default for SSEEvent {
             event_type: SSEEventType::LlmDelta,
             content: None,
             tool_name: None,
+            tool_call_id: None,
             tool_args: None,
             tool_result: None,
             duration_ms: None,

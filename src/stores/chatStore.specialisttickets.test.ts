@@ -20,6 +20,15 @@ describe('isAutoSpecialistCollection', () => {
     expect(isAutoSpecialistCollection(update('await_specialists', { wait: 'any' }))).toBe(false);
   });
 
+  it('leaves the mid-turn hand-over alone, auto though it is', () => {
+    // `drain_ready_specialists` hands a finished report over the moment it
+    // lands. The model had not answered yet, so the text before it is ordinary
+    // working text, not a draft — greying it out mid-turn would be wrong.
+    expect(
+      isAutoSpecialistCollection(update('await_specialists', { wait: 'none', auto: true }))
+    ).toBe(false);
+  });
+
   it('ignores every other tool, even one carrying the same flag', () => {
     expect(isAutoSpecialistCollection(update('lean_file_read', { auto: true }))).toBe(false);
     expect(isAutoSpecialistCollection(update('await_specialists', null))).toBe(false);

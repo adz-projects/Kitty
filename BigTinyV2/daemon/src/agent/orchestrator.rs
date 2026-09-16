@@ -410,7 +410,28 @@ impl Orchestrator {
             None => (spec.provider.clone(), spec.model.clone()),
         };
 
-        let _permit = self.limiter.clone().acquire_owned().await;
+        // Bounded by the run's own deadline, which an unbounded
+        // `acquire_owned()` was not: with a small permit count the queue is
+        // where nearly all the waiting happens, and a run that spent its whole
+        // deadline there would be refused having never started — after holding
+        // the caller for the full timeout. Waiting *past* the deadline can only
+        // produce an answer nobody is left to read.
+        let _permit = match tokio::time::timeout_at(deadline, self.limiter.clone().acquire_owned())
+            .await
+        {
+            Ok(permit) => permit,
+            // Distinguished from the post-permit check below because the two
+            // are different failures to the caller: this one never started and
+            // is worth re-running on its own, and saying "the batch ran out of
+            // time" about a single non-fan-out call describes nothing it did.
+            Err(_) => {
+                return Ok(Err(format!(
+                    "the specialist waited behind other specialists for its whole {}s budget and \
+                     never started; re-run it, or raise agent.max_concurrent_specialists",
+                    self.timeout.as_secs()
+                )))
+            }
+        };
 
         // Checked after the permit, which is where the waiting actually happens.
         // A source the batch never reached is reported as such rather than
@@ -522,7 +543,14 @@ impl Orchestrator {
             tracing::warn!("failed to record delegate execution {exec_id}: {e}");
         }
 
-        self.notify(&agent, &spec, &child_id, "started", None);
+        self.notify(
+            &agent,
+            &spec,
+            &child_id,
+            "started",
+            None,
+            (host_provider.as_deref(), host_model.as_deref()),
+        );
 
         // Background, so a delegate never puts the user's own next message
         // behind it. The queue is work-conserving, so a lone parent and its
@@ -582,18 +610,21 @@ impl Orchestrator {
             tracing::warn!("failed to close delegate execution {exec_id}: {e}");
         }
 
+        // Read back what the turn actually ran on rather than trusting the
+        // pick: a mid-turn failover can move it, and the point of reporting the
+        // host is that it is true. Read *before* the terminal notify rather
+        // than after, so the status a client renders names the same host the
+        // report does.
+        let host = self.host_actually_used(&child_id, host_provider, host_model).await;
+
         self.notify(
             &agent,
             &spec,
             &child_id,
             status,
             result.as_ref().err().map(String::as_str),
+            (Some(host.provider.as_str()), Some(host.model.as_str())),
         );
-
-        // Read back what the turn actually ran on rather than trusting the
-        // pick: a mid-turn failover can move it, and the point of reporting the
-        // host is that it is true.
-        let host = self.host_actually_used(&child_id, host_provider, host_model).await;
 
         Ok(result.map(|answer| DelegateOutcome {
             answer,
@@ -756,11 +787,21 @@ impl Orchestrator {
 
         let mut out = Collected::default();
         for (id, specialist, report) in selected {
-            match report.peek() {
+            // `peek` alone is not enough: a `Shared` reports a value only once
+            // it has itself been polled to completion, and the waits above poll
+            // only what they had to. Under `None` they poll nothing at all, so
+            // every finished ticket read as still running and a `wait: "none"`
+            // poll could never return anything. `now_or_never` polls once
+            // without blocking, which is exactly the question being asked.
+            let ready = report
+                .peek()
+                .cloned()
+                .or_else(|| report.clone().now_or_never());
+            match ready {
                 Some(text) => out.reports.push(TicketReport {
                     ticket: id,
                     specialist,
-                    report: text.clone(),
+                    report: text,
                 }),
                 None => out.still_running.push(id),
             }
@@ -834,6 +875,13 @@ impl Orchestrator {
     /// Best-effort by design: a detached parent (a job, a scheduled run) has no
     /// stream, and a delegate must not be held up by the absence of an
     /// audience.
+    ///
+    /// `host` is what this delegate is running on, which is never the parent's
+    /// model and is often not the parent's provider either. Without it a client
+    /// has nothing to label the delegate with and falls back to the session's
+    /// own provider — so a monitoring window showed the main model's name over
+    /// a transcript the main model had no part in.
+    #[allow(clippy::too_many_arguments)]
     fn notify(
         &self,
         agent: &Arc<Agent>,
@@ -841,7 +889,9 @@ impl Orchestrator {
         child_id: &str,
         status: &str,
         error: Option<&str>,
+        host: (Option<&str>, Option<&str>),
     ) {
+        let (provider, model) = host;
         agent.emit_to(
             &spec.parent_session_id,
             SSEEvent {
@@ -852,6 +902,8 @@ impl Orchestrator {
                 // offers a click-through into the delegate's own transcript.
                 session_id: Some(child_id.to_string()),
                 error_message: error.map(str::to_string),
+                provider_id: provider.filter(|p| !p.is_empty()).map(str::to_string),
+                model: model.filter(|m| !m.is_empty()).map(str::to_string),
                 ..Default::default()
             },
         );
@@ -1004,6 +1056,27 @@ mod tests {
             .await
             .unwrap_err();
         assert!(invented.contains("no ticket sp-999"), "{invented}");
+    }
+
+    /// A ticket that has not finished is reported as still running and stays
+    /// uncollected — the contract the mid-turn hand-over rests on, since it
+    /// polls with `None` on every step and must be silent until something is
+    /// actually ready.
+    #[tokio::test]
+    async fn polling_without_waiting_leaves_an_unfinished_ticket_alone() {
+        let o = ticket_orchestrator().await;
+        let (release, work) = gated("eventually");
+        let id = o.start_ticket("p", "a", work);
+
+        let got = o.collect("p", None, TicketWait::None).await.unwrap();
+        assert!(got.reports.is_empty());
+        assert_eq!(got.still_running, vec![id.clone()]);
+        assert_eq!(o.uncollected("p"), vec![id.clone()]);
+
+        let _ = release.send(());
+        let got = o.collect("p", None, TicketWait::All).await.unwrap();
+        assert_eq!(got.reports.len(), 1);
+        assert!(o.uncollected("p").is_empty());
     }
 
     #[tokio::test]

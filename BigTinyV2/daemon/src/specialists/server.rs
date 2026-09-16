@@ -165,9 +165,11 @@ impl SpecialistServer {
     #[tool(
         name = "call_specialist",
         description = "Start a self-contained piece of work on a specialist agent in the background. \
-Returns a ticket immediately, not the result: keep working on the rest of the task while it runs, \
-then collect its structured report with `await_specialists` and use it in your answer. Every \
-ticket must be collected before you answer; if you answer first, the reports are collected for \
+Returns a ticket immediately, not the result: keep working on the rest of the task while it runs. \
+Its structured report is delivered to you automatically the moment it finishes, so do not stall \
+waiting for it — start what else you can, and act on each report as it arrives. Use \
+`await_specialists` only when you have nothing else to do until a report lands. Every report is \
+accounted for before you answer; if you answer while one is still outstanding it is collected for \
 you and you will be asked to write the answer again. The specialist runs in its own context with \
 its own tools, so its searching and reading never enters yours — use this when a task would take \
 many tool calls to produce a small answer. Built-in specialists: `researcher` (answers a question from web sources, returns \
@@ -299,19 +301,22 @@ can answer directly."
             "ticket": ticket,
             "specialist": specialist,
             "status": "running",
-            "note": "Keep working on the rest of the task. Collect this report with \
-                     await_specialists before you write your answer.",
+            "note": "Keep working on the rest of the task. This specialist's report will be \
+                     delivered to you as soon as it is ready — you do not need to ask for it.",
         })
         .to_string()
     }
 
     #[tool(
         name = "await_specialists",
-        description = "Collect reports from specialists started with `call_specialist`. With no \
-`tickets`, collects every report still outstanding. `wait`: \"all\" (default) waits until every \
-selected ticket has reported; \"any\" waits for at least one and returns whatever has finished; \
-\"none\" returns only what has already finished, without waiting. `still_running` lists tickets \
-that have not reported yet — collect them before you answer."
+        description = "Block until a specialist started with `call_specialist` reports. You do \
+not normally need this: reports are delivered to you on their own as they finish. Call it only \
+when you have nothing useful to do until one arrives. With no `tickets`, covers every report \
+still outstanding. `wait`: \"any\" waits for the next one to finish and returns it — prefer this, \
+so you can act on the first answer while the rest are still running; \"all\" (the default) waits \
+until every selected ticket has reported; \"none\" returns only what has already finished, \
+without waiting. `still_running` lists tickets that have not reported yet; they will reach you \
+without being asked for."
     )]
     pub async fn await_specialists(&self, Parameters(req): Parameters<AwaitRequest>) -> String {
         let Some(session_id) = req.session_id.as_deref().filter(|s| !s.is_empty()) else {

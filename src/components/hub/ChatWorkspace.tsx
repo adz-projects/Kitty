@@ -56,12 +56,19 @@ export function ChatWorkspace() {
         if (!mounted || !info?.session_id) return;
         if (info.spectate) {
           // Watching a specialist, not resuming a conversation: load the
-          // delegate's transcript read-only. It has no provider/effort of its
-          // own to adopt — it is mid-run and answers to the turn that spawned
-          // it, not to this window.
+          // delegate's transcript read-only. The provider/model come from the
+          // status event that offered the watch — they are the DELEGATE's host,
+          // which is usually neither this window's nor the parent session's, and
+          // are passed for labelling only (`spectateSession` never writes them
+          // back to the running delegate).
           await useChatStore
             .getState()
-            .spectateSession(info.session_id, String(info.specialist ?? 'specialist'));
+            .spectateSession(
+              info.session_id,
+              String(info.specialist ?? 'specialist'),
+              typeof info.provider_id === 'string' ? info.provider_id : undefined,
+              typeof info.model === 'string' ? info.model : undefined
+            );
           return;
         }
         // The Expand path always hands over a complete snapshot; the cast is

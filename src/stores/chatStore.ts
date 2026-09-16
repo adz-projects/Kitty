@@ -354,7 +354,12 @@ interface ChatState {
   /** Open a delegate's transcript read-only (Settings-free "watch this
       specialist" window). Loads the session exactly as a resume would, then
       latches `spectating` so nothing can be sent into it. */
-  spectateSession: (sessionId: string, specialist: string) => Promise<void>;
+  spectateSession: (
+    sessionId: string,
+    specialist: string,
+    providerId?: string,
+    modelId?: string
+  ) => Promise<void>;
   adoptSession: (info: {
     session_id: string;
     cwd: string;
@@ -1248,7 +1253,12 @@ export const useChatStore = create<ChatState>((set, get) => {
           providerTier: active ? active.network_tier : null,
           providerHost: active ? activeHost : null,
           isTrusted: active ? active.is_trusted : false,
-          model: active?.models[0] ?? null,
+          // The session's OWN model, not the provider's first: a profile lists
+          // several, and a session pinned to any but the first was labelled
+          // with a model it was not using. A delegate watched from the
+          // specialist chip is the sharpest case — its host is chosen for it,
+          // and is rarely the head of the list.
+          model: cur0.sessionModelId ?? active?.models[0] ?? null,
           providerName: active ? active.name || active.provider_type : null,
           stripReasoning: active ? active.strip_reasoning : false,
           providerSupportsVision: active ? active.supports_vision : false,
@@ -1311,13 +1321,19 @@ export const useChatStore = create<ChatState>((set, get) => {
       }
     },
 
-    spectateSession: async (sessionId, specialist) => {
+    spectateSession: async (sessionId, specialist, providerId, modelId) => {
       // Latch *before* the load: `loadSession` replays the transcript through
       // the same events a live turn uses, and a composer that is briefly
       // enabled during a multi-second replay is a composer someone can type
-      // into.
+      // into. The latch is also what stops `loadSession` writing this
+      // provider/model back to the delegate's session — see its
+      // `setSessionProvider` call.
       set({ spectating: specialist });
-      await get().loadSession(sessionId, '');
+      // The delegate's own host, from the `subagent-status` event. Passed so
+      // the header badge names the model that is actually doing the work;
+      // without it `refreshProvider` falls back to the globally active profile
+      // and labels the window with the MAIN model.
+      await get().loadSession(sessionId, '', undefined, providerId, modelId);
     },
     adoptSession: async (info) => {
       // Replay the handed-off conversation (Expand / auto-promote) so the full
@@ -1710,9 +1726,15 @@ export const useChatStore = create<ChatState>((set, get) => {
         if (epoch !== get().sessionEpoch) return;
         if (resolvedProviderId && resolvedModelId) {
           const matched = findMatchingProvider(providers, resolvedProviderId, resolvedModelId);
-          if (matched) {
+          if (matched && !get().spectating) {
+            // Not while spectating: a watch window is a read-only view of a
+            // delegate that is running RIGHT NOW, and this PATCHes the session's
+            // provider config. Re-stamping a live delegate mid-turn with values
+            // this window merely read off a status event is a write nobody
+            // asked for. The stamp is still resolved above, so the badge below
+            // labels the window correctly either way.
             await ipc.setSessionProvider(sessionId, matched.id, resolvedModelId);
-          } else if (epoch === get().sessionEpoch) {
+          } else if (!matched && epoch === get().sessionEpoch) {
             set({ sessionConcluded: true });
           }
         }

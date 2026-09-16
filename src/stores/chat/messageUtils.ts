@@ -202,10 +202,16 @@ export function isVisualizationToolCall(call: ToolCall): boolean {
     `collect_outstanding_specialists`). The text the model streamed before it
     was an answer written without those reports — a draft, not the answer —
     and the real answer follows once they are in. `"auto": true` is what tells
-    it apart from an `await_specialists` the model called on purpose. */
+    it apart from an `await_specialists` the model called on purpose.
+ *
+ *  `wait` narrows it further, and must: the daemon ALSO hands over reports
+ *  mid-turn as they finish (`drain_ready_specialists`), marked `auto` too but
+ *  `wait: "none"`. Nothing was drafted there — the model had not answered yet,
+ *  and is not being asked to answer again — so treating that as a draft would
+ *  grey out ordinary working text in the middle of a turn. */
 export function isAutoSpecialistCollection(u: ToolCallUpdate): boolean {
-  const input = u.rawInput as { auto?: unknown } | null | undefined;
-  return u.title === 'await_specialists' && input?.auto === true;
+  const input = u.rawInput as { auto?: unknown; wait?: unknown } | null | undefined;
+  return u.title === 'await_specialists' && input?.auto === true && input?.wait !== 'none';
 }
 
 /** A readable title for the specialist tools' cards, whose raw names and JSON

@@ -6,10 +6,11 @@ a flat file inventory has no edges; this does. Arrows read "depends on" /
 
 > ## Two BigTiny daemons now exist. Know which one you are editing.
 >
-> - **`plugins/bigtiny_rust/` (V1) is FROZEN.** Bug fixes only, no new
->   features. It is what Kitty ships against today, and it is the rollback path
->   for the migration. Everything below in this document describes V1 and Kitty
->   as they are, and stays accurate until Kitty migrates.
+> - **`plugins/bigtiny_rust/` (V1) is FROZEN and no longer shipped.** Kitty
+>   bundles `bigtiny2-daemon` (see `tauri.conf.json`'s `externalBin`) and
+>   Android hosts V2 in-process, so nothing builds or links V1 any more; it is
+>   kept solely as the rollback path. Much of this document still describes V1
+>   shapes that V2 inherited unchanged — where the two differ, V2 is what runs.
 > - **`BigTinyV2/` is where features land.** A fork of V1 being developed into
 >   a multi-app daemon: several frontends (Kitty, a research pipeline, an AI
 >   notebook) attach to one instance, each with its own sessions, providers,

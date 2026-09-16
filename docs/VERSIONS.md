@@ -910,6 +910,114 @@ inside it never run on the desktop or in CI — and a wrong base64 pad is a
 corrupted export that still reports success. The RFC 4648 vectors are pinned
 where they actually execute.
 
+## Specialists work alongside the model (0.10.8)
+
+0.10.7 made delegation non-blocking; the parent model still could not *use* a
+report until every one of them was in. Three things stood between it and a
+collaborator.
+
+### A report reaches the model on its next step
+
+`agent/loop_.rs::drain_ready_specialists` runs once per step, right after that
+step's tool results are appended — the only point in the iteration where the
+transcript is in a complete assistant/tool state. It polls the ticket table with
+`TicketWait::None` and, if anything has finished, records it exactly as the
+end-of-turn collection does: an assistant message carrying one synthetic
+`await_specialists` call (arguments `{"wait": "none", "auto": true}`), then its
+result. So a model that starts three specialists and keeps reading files sees
+the first report the moment it lands, not when the third finishes.
+
+Silent when nothing is ready — with tickets outstanding and none finished it
+touches neither `messages` nor the event stream, which is what keeps it from
+appending an empty pair on every step of a long turn.
+
+`collect_outstanding_specialists` is now one of three callers of a shared writer
+(`auto_await_call` / `auto_await_result` / `emit_auto_await_*`), so the
+transcript shape is defined once. It still emits its `tool_start` *before* the
+blocking wait, so the "collecting" card is live; the drain emits start and
+finish together, because its collection already happened.
+
+`isAutoSpecialistCollection` now requires `wait !== 'none'`: the draft treatment
+belongs to the collection that makes the model answer *again*, and the mid-turn
+hand-over is ordinary working text.
+
+### `wait: "none"` never returned anything
+
+`Orchestrator::collect` read each report with `Shared::peek()`, which yields a
+value only once that `Shared` has itself been polled to completion. `All` and
+`Any` poll (via `join_all`/`select_all`); `None` polls nothing, so every
+finished ticket read as still running and a non-blocking poll could not return a
+report at all. It now falls back to `now_or_never()` — one poll, no blocking,
+which is exactly the question being asked. The drain depends on this; so did
+`await_specialists {"wait": "none"}`, which was quietly useless before.
+
+### A turn can no longer end on an unread report
+
+- The answer gate is no longer conditional on `finish_reason`. A model that
+  stopped calling tools is done working whatever the provider reported, and the
+  reasons that are not `stop`/`end_turn` — `length`, a dialect that reports
+  nothing — were exactly the ones that fell through and let the turn burn to its
+  ceiling with paid-for reports uncollected.
+- The step-ceiling exit collects before announcing the limit. `TurnCleanup`'s
+  drop aborts anything outstanding as the turn unwinds, so without this a budget
+  exit threw the reports away — and the structured-answer pass, which
+  deliberately still runs after a step-limit exit, wrote its answer without them.
+- `collect_outstanding_specialists` returns `false` when the collection itself
+  errored. A `true` costs the caller a step and makes the model answer again;
+  that is not worth paying for a result carrying no reports.
+
+### Tool cards pair by call id
+
+`SSEEvent` gained `tool_call_id`, stamped on every `tool_start`/`tool_finish`
+in `execute_one_tool_call` and on the synthetic collection pair. A step's tool
+calls run **concurrently** (`execute_tools`'s `join_all`), so several starts
+arrive before any finish and arrival order says nothing about which finish
+belongs to which start. Kitty's translator kept a single "current call" slot and
+attributed each finish to whichever card started last — which meant the longest
+call in a batch, an `await_specialists` beside the `call_specialist`s that
+opened it, showed **"Waiting for specialists" forever**, long after the daemon
+had collected the reports and moved on. `stream.rs` now keys open cards by the
+id (`open_tool_card`/`close_tool_card`), keeping the sequential slot as the
+fallback for a daemon older than the field and for `server/replay.rs`.
+
+### A monitoring window shows the delegate's model
+
+`Orchestrator::notify` left `SSEEvent`'s existing `provider_id`/`model` at
+`Default` — so a client had nothing to label a delegate with and fell back to
+the session's own provider. A delegate is hosted by `subagent_pick::choose_host`
+and is routinely on a different provider *and* model from its parent, so that
+answer was wrong every time it differed. `notify` now carries the host: the pick
+on `started`, and `host_actually_used` on `completed`/`failed` — read *before*
+the terminal notify rather than after, so the status and the report name the
+same host even when the run failed over mid-way.
+
+Kitty forwards both onto `chat://subagent-status`; `SubagentChip` names the
+model in its tooltip and popover; `spectateSession` passes them into
+`loadSession`, and `refreshProvider` renders `sessionModelId ?? models[0]`
+instead of always the provider's first model — which mislabelled *any* session
+pinned to anything but the head of the list, not just a watched delegate.
+
+A watch window also no longer writes: `loadSession` skips its
+`setSessionProvider` PATCH while `spectating` is set. It is a read-only view of
+a delegate running right now, and re-stamping its config from values this window
+read off a status event is a write nobody asked for.
+
+### A queued delegate says so
+
+`run_by`'s permit wait was unbounded and charged against the run's own deadline.
+With `max_concurrent_specialists = 3` the fourth ticket could sit on the
+semaphore for the entire `specialist_timeout_secs` and then be refused with
+*"the batch ran out of time before this source was reached"* — a fan-out message
+that describes nothing a single call did. The wait is now bounded by the
+deadline and reports having been queued and never started, which is the failure
+worth re-running on its own.
+
+### Tool descriptions
+
+`call_specialist` tells the model its report will be delivered as it finishes,
+and not to stall waiting; `await_specialists` is documented as the tool for when
+there is nothing else to do, and prefers `wait: "any"`.
+
 ## Specialists run in the background (0.10.7)
 
 `call_specialist` used to block: the orchestrator's run (or fan-out) was awaited

@@ -23,6 +23,8 @@
 //!   -> `chat://context-budget` (the wrap-up valve withdrew this turn's tools
 //!   because the model was close to its context limit)
 
+use std::collections::HashMap;
+
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager};
@@ -470,12 +472,22 @@ async fn run_stream(
     }
 
     let mut outcome = TurnOutcome::default();
-    // Sequential tool ids: BigTiny runs tool calls one at a time within a
-    // turn, so a single "current call" (id, name) suffices to pair
-    // start/finish and to know what to report to the adaptive-pathway
-    // backstop below.
+    // Tool cards are paired by the daemon's own `tool_call_id`, because a
+    // step's tool calls run CONCURRENTLY (`agent::loop_::execute_tools`) —
+    // several `tool_start` frames arrive before any `tool_finish`, so arrival
+    // order says nothing about which finish belongs to which start. The single
+    // "current call" slot this replaced attributed each finish to whichever
+    // card started last, which left the longest call in a batch — an
+    // `await_specialists` alongside the `call_specialist`s that opened it —
+    // showing "Waiting for specialists" forever, long after the daemon had
+    // collected the reports and moved on.
+    //
+    // `tool_seq` survives as the fallback for frames with no `tool_call_id`: a
+    // daemon binary older than this field, and `server::replay.rs`, still emit
+    // them, and one unpaired card beats no card at all.
     let mut tool_seq: u64 = 0;
-    let mut current_tool: Option<(String, String)> = None;
+    let mut open_tools: HashMap<String, String> = HashMap::new();
+    let mut last_tool: Option<String> = None;
 
     // Raw-byte accumulation buffer: frames are decoded only once complete
     // (`drain_complete_frames`), so a multi-byte UTF-8 character split
@@ -517,7 +529,8 @@ async fn run_stream(
                 &event,
                 &mut outcome,
                 &mut tool_seq,
-                &mut current_tool,
+                &mut open_tools,
+                &mut last_tool,
                 &mut deltas,
             );
             if is_last {
@@ -609,7 +622,12 @@ fn handle_event(
     event: &Value,
     outcome: &mut TurnOutcome,
     tool_seq: &mut u64,
-    current_tool: &mut Option<(String, String)>,
+    // `open_tools`: the daemon's `tool_call_id` -> the card id handed to the
+    // webview, for every call started and not yet finished. `last_tool`: the
+    // most recent card id, used only to pair a frame carrying no
+    // `tool_call_id` (see the declarations in `consume_stream`).
+    open_tools: &mut HashMap<String, String>,
+    last_tool: &mut Option<String>,
     deltas: &mut DeltaBatcher,
 ) {
     let kind = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
@@ -637,9 +655,12 @@ fn handle_event(
             }
         }
         "tool_start" => {
-            *tool_seq += 1;
-            let id = format!("bt-{tool_seq}");
-            *current_tool = Some((id.clone(), tool_name.to_string()));
+            let id = open_tool_card(
+                event.get("tool_call_id").and_then(|v| v.as_str()),
+                tool_seq,
+                open_tools,
+                last_tool,
+            );
             let _ = app.emit(
                 "chat://tool-call",
                 json!({
@@ -678,9 +699,12 @@ fn handle_event(
                 );
                 return;
             }
-            let (id, started_name) = current_tool
-                .take()
-                .unwrap_or_else(|| (format!("bt-{tool_seq}"), tool_name.to_string()));
+            let id = close_tool_card(
+                event.get("tool_call_id").and_then(|v| v.as_str()),
+                *tool_seq,
+                open_tools,
+                last_tool,
+            );
             let result_text = event
                 .get("tool_result")
                 .and_then(|r| r.as_str())
@@ -704,7 +728,6 @@ fn handle_event(
             // real context + reward source is available; the old app-layer
             // context-free backstop was removed to avoid double-recording the
             // same tool outcome to AP (which would skew learning rewards).
-            let _ = started_name;
         }
         "hitl_pause" => {
             let Some(action_id) = event.get("action_id").and_then(|a| a.as_str()) else {
@@ -758,6 +781,14 @@ fn handle_event(
                     "specialist": event.get("tool_name"),
                     "status": content,
                     "error": event.get("error_message"),
+                    // What the delegate is actually running on. A delegate is
+                    // routinely hosted on a different provider AND model from
+                    // the session that started it (`subagent_pick::choose_host`),
+                    // so without these a client has nothing to label it with but
+                    // the parent's own provider — which is the wrong answer,
+                    // every time it differs.
+                    "provider_id": event.get("provider_id"),
+                    "model": event.get("model"),
                 }),
             );
         }
@@ -866,9 +897,51 @@ fn handle_event(
                 json!({ "session_id": session_id, "content": content }),
             );
         }
-        // model_failover / subagent_status: not surfaced yet.
+        // model_failover: not surfaced yet.
         _ => {}
     }
+}
+
+/// Open a tool card, returning the id the webview will know it by.
+///
+/// Keyed by the daemon's own `tool_call_id` when the frame carries one. A
+/// step's tool calls run concurrently, so several cards are open at once and
+/// arrival order cannot pair a later finish with its start.
+fn open_tool_card(
+    call_id: Option<&str>,
+    tool_seq: &mut u64,
+    open_tools: &mut HashMap<String, String>,
+    last_tool: &mut Option<String>,
+) -> String {
+    *tool_seq += 1;
+    let id = format!("bt-{tool_seq}");
+    match call_id {
+        Some(call_id) => {
+            open_tools.insert(call_id.to_string(), id.clone());
+        }
+        // Pre-`tool_call_id` daemon, or a replayed frame: fall back to the old
+        // single-slot behaviour, which is correct for the sequential case it
+        // was written for.
+        None => *last_tool = Some(id.clone()),
+    }
+    id
+}
+
+/// The card id a `tool_finish` belongs to, closing it.
+///
+/// An unrecognised `tool_call_id` falls through to the sequential fallback
+/// rather than inventing a card: a finish arriving for a start we never saw is
+/// better rendered against the newest card than dropped.
+fn close_tool_card(
+    call_id: Option<&str>,
+    tool_seq: u64,
+    open_tools: &mut HashMap<String, String>,
+    last_tool: &mut Option<String>,
+) -> String {
+    call_id
+        .and_then(|call_id| open_tools.remove(call_id))
+        .or_else(|| last_tool.take())
+        .unwrap_or_else(|| format!("bt-{tool_seq}"))
 }
 
 /// Pure: `Some("crash")` when the tool result read as an error — used only to
@@ -931,6 +1004,58 @@ pub async fn respond_permission(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The failure this pairing replaced: a step's tool calls run concurrently
+    /// (`agent::loop_::execute_tools`), so all three starts arrive before any
+    /// finish. Paired by arrival order, the first finish claimed the third
+    /// card and the longest call — the `await_specialists` opened by the two
+    /// `call_specialist`s beside it — was never completed at all.
+    #[test]
+    fn concurrent_tool_calls_pair_by_call_id() {
+        let mut seq = 0u64;
+        let mut open = HashMap::new();
+        let mut last = None;
+
+        let a = open_tool_card(Some("call-a"), &mut seq, &mut open, &mut last);
+        let b = open_tool_card(Some("call-b"), &mut seq, &mut open, &mut last);
+        let c = open_tool_card(Some("call-c"), &mut seq, &mut open, &mut last);
+        assert_eq!((a.as_str(), b.as_str(), c.as_str()), ("bt-1", "bt-2", "bt-3"));
+
+        // Finishing out of order — the usual case, and the whole point.
+        assert_eq!(close_tool_card(Some("call-b"), seq, &mut open, &mut last), b);
+        assert_eq!(close_tool_card(Some("call-a"), seq, &mut open, &mut last), a);
+        assert_eq!(close_tool_card(Some("call-c"), seq, &mut open, &mut last), c);
+        assert!(open.is_empty(), "every card closed exactly once");
+    }
+
+    /// A daemon older than `tool_call_id` (and `server::replay.rs`) emits
+    /// neither field; the sequential fallback must still render a paired card.
+    #[test]
+    fn frames_without_a_call_id_fall_back_to_sequence() {
+        let mut seq = 0u64;
+        let mut open = HashMap::new();
+        let mut last = None;
+
+        let a = open_tool_card(None, &mut seq, &mut open, &mut last);
+        assert_eq!(close_tool_card(None, seq, &mut open, &mut last), a);
+        let b = open_tool_card(None, &mut seq, &mut open, &mut last);
+        assert_eq!(close_tool_card(None, seq, &mut open, &mut last), b);
+        assert_ne!(a, b);
+    }
+
+    /// A finish for a start we never saw is rendered against the newest card
+    /// rather than dropped.
+    #[test]
+    fn an_unknown_call_id_still_closes_a_card() {
+        let mut seq = 0u64;
+        let mut open = HashMap::new();
+        let mut last = None;
+
+        let a = open_tool_card(Some("call-a"), &mut seq, &mut open, &mut last);
+        assert_eq!(close_tool_card(Some("nope"), seq, &mut open, &mut last), "bt-1");
+        // The real card is still open, so its own finish still finds it.
+        assert_eq!(close_tool_card(Some("call-a"), seq, &mut open, &mut last), a);
+    }
 
     #[test]
     fn find_frame_boundary_finds_terminator() {

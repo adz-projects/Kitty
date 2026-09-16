@@ -447,6 +447,12 @@ export interface SubagentStatusEvent {
   specialist: string;
   status: 'started' | 'completed' | 'failed';
   error?: string | null;
+  /** What the delegate is actually running on — routinely a different provider
+      AND model from the session that started it (the daemon's
+      `subagent_pick::choose_host` decides). Absent from a daemon older than
+      this field. */
+  provider_id?: string | null;
+  model?: string | null;
 }
 
 /** Mirrors Rust `log_capture::LogEntry` — one captured WARN/ERROR tracing
