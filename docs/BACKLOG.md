@@ -5,6 +5,23 @@ open an item here instead.
 
 ## Open
 
+- **`SpecialistRun` carries no host, so Settings cannot say what answered.**
+  `src-tauri/src/bigtiny/specialists.rs`'s `SpecialistRun` has no
+  provider/model field, so Settings -> "Recent delegate runs" cannot honour its
+  own copy ("which specialist answered which request, **and on what**"). The
+  daemon does know: `Orchestrator::host_actually_used` resolves it and
+  `chat://subagent-status` already carries it (0.10.8). This is the execution
+  *row* not persisting it.
+
+- **Three specialist fields are silently dropped on save.** Rust's `Specialist`
+  and `SpecialistSpec` (`src-tauri/src/bigtiny/specialists.rs`) are missing
+  `reasoning_cap_tokens`, `reasoning_cap_fraction` and `fan_out`, all of which
+  `src/lib/types.ts` and `src/components/settings/Specialists.tsx` read and
+  write. Serde drops them on the way through, so those form controls are dead:
+  a user sets a reasoning cap or a fan-out mode, the UI shows it saved, and the
+  daemon never sees it. Fixing it is adding the fields; the reason it is worth
+  an entry is that the failure is invisible from the UI.
+
 ## Noted for later
 
 - **Recipes (removed, not merely resolved).** This entry tracked the "recipes /

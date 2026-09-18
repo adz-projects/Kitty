@@ -910,6 +910,98 @@ inside it never run on the desktop or in CI — and a wrong base64 pad is a
 corrupted export that still reports success. The RFC 4648 vectors are pinned
 where they actually execute.
 
+## Specialists report instead of timing out (0.10.9)
+
+Delegates were reporting timeouts on work they had effectively finished. Three
+mechanisms compounded, and none of them was the budget being too small — raising
+it would have bought a longer version of the same failure.
+
+### A specialist now knows what time it is
+
+A delegate's *last* act is its most expensive: when the tool loop breaks,
+`finalize_structured` re-sends the entire history with tools withdrawn, and
+retries once on a rejected shape. Up to two full-history round trips, queued at
+`Background` priority behind interactive traffic, issued at the exact moment the
+wall clock is most nearly spent — and deliberately issued even after a
+step-limit exit, which is the run most likely to be near the deadline already.
+
+Nothing told the child any of this. The loop had a step-budget nudge and a
+context-exhaustion wrap-up valve, but no notion of wall-clock budget at all:
+`specialist_timeout_secs` lived in the orchestrator, and the delegate worked flat
+out until `tokio::time::timeout` aborted it mid-thought.
+
+`Orchestrator::run_by` now writes the absolute deadline into the child's
+metadata as `deadline_unix_ms` — the *batch* deadline for a fan-out element, not
+a fresh allowance the batch will not honour — and `run_tool_loop` reserves a
+slice of it. `min(60s, budget / 3)`: the flat minute comfortably covers a
+wrap-up reply plus both structured passes at the 300s default, and the fraction
+keeps a 60s delegate from reserving its whole run and reporting on step zero.
+
+Inside the reserve the existing wrap-up valve fires, which is why this is a
+small change rather than a parallel mechanism: it already collects outstanding
+specialists, withdraws every tool, clamps `max_tokens`, surfaces a notice the
+user can see, and breaks into `finalize_structured`. `TurnMode::WrapUp` now
+carries a `WrapUpReason`, because the two exhaustions need different copy —
+"send another message to continue" is advice a delegate about to be killed
+cannot take, and unlike a chat turn it still owes its caller a structured
+answer, so `DEADLINE_SYSTEM_MESSAGE` says so and names `refusals`.
+
+Time outranks context outranks the step nudge. Context can be continued in a
+fresh turn; time cannot be continued at all, and every token spent past the
+deadline is spent on an answer nobody will receive.
+
+This fires at a step boundary, like the step nudge — a single tool call that
+runs long cannot be interrupted from inside the loop. That case is what the
+salvage below covers.
+
+### A killed delegate is asked what it wrote
+
+`run_turn_and_wait` *spawns* the turn and awaits a watcher, so a timeout drops
+the watcher while the child is still going; the child persists its answer the
+instant it has one, and `Agent::cancel` does not remove it. The transcript
+survives, tagged `parent_session_id`. The orchestrator simply never looked:
+
+```rust
+Err(msg) => Err(msg),   // timeout landed here — no read at all
+```
+
+It now classifies what is on disk. An answer that validates against the
+specialist's own schema — parsed and checked by the same
+`provider::schema::{extract, validate}` that `finalize_structured` uses — is
+returned as an ordinary successful report, with a note that it finished late. A
+specialist that declared no schema has prose as its report, so that counts too.
+
+Prose where a shape *was* promised stays a failure, and deliberately: the
+caller contracted for an object and `specialists::server` embeds a parsed value,
+so presenting unvalidated text as a report puts the wrong kind of thing where a
+report goes. It is carried on the failure instead, truncated, as "How far it
+got" — which reads as what it is. An assistant row with empty content (what a
+tool-call-only step writes) is not an answer and is not treated as one.
+
+The compare-and-contrast is the step-limit exit, which always degraded
+gracefully: it collects, breaks, falls through to `finalize_structured`, and the
+caller gets a valid report. Only the timeout path threw the run away.
+
+### Two messages that named the wrong thing
+
+- A timeout reported `specialist_timeout_secs` even when `deadline` had given
+  the run less, which sends whoever reads it to the wrong setting. It reports
+  the budget the run actually had.
+- *"the batch ran out of time before this source was reached"* is fan-out copy
+  on a path a lone `call_specialist` also reaches, after waiting out its whole
+  budget on the semaphore. Reworded for both callers.
+
+### Two more lines in every specialist's prompt
+
+`registry.rs`'s `COMMON` preamble covered scope and refusals but said nothing
+about budget or length, so the disposition to stop early had to be discovered
+rather than instructed. It now says that a short report which arrives beats a
+thorough one that does not, to stop immediately when told it is near its limit,
+and to return only the fields the answer shape asks for. Prepended at resolve
+time rather than stored per row, so installs whose definitions were seeded by an
+earlier version get it without a migration — `seed_builtins` never overwrites an
+edited row.
+
 ## Specialists work alongside the model (0.10.8)
 
 0.10.7 made delegation non-blocking; the parent model still could not *use* a

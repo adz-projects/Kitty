@@ -1089,3 +1089,249 @@ async fn tool_frames_carry_the_call_id_that_pairs_them() {
         }
     }
 }
+
+/// A timed-out delegate is asked what it managed to write, not simply discarded.
+///
+/// The shape of the bug this pins: a specialist's *last* act is
+/// `finalize_structured`, a schema-constrained pass that re-sends the whole
+/// history and retries once. It is the largest request of the run, issued at
+/// the moment the budget is most nearly spent — and `run_turn_and_wait` spawns
+/// the loop and awaits a watcher, so the orchestrator's timeout drops the
+/// watcher while the child is still going. A delegate that had already written
+/// a valid report therefore reported only "ran longer than Ns and was stopped",
+/// with the finished report sitting in the child's transcript.
+///
+/// Here the first request answers in the promised shape and the second — the
+/// structured pass — stalls until the budget expires.
+#[tokio::test]
+async fn a_report_written_just_before_the_deadline_is_not_thrown_away() {
+    let pool = test_pool().await;
+    let mut server = mockito::Server::new_async().await;
+    let answer = json!({"findings": "three sources agree"}).to_string();
+    mock_answer(&mut server, &answer.replace('"', "\\\"")).await;
+    let _stalled = server
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_chunked_body(|_w| {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            Ok(())
+        })
+        .create_async()
+        .await;
+
+    let outcome = run_until_timeout(
+        &pool,
+        &server,
+        Some(json!({
+            "type": "object",
+            "properties": {"findings": {"type": "string"}},
+            "required": ["findings"],
+            "additionalProperties": false,
+        })),
+    )
+    .await;
+
+    match outcome {
+        Ok(Ok(outcome)) => {
+            assert_eq!(outcome.answer.trim(), answer);
+            assert!(
+                outcome
+                    .notes
+                    .iter()
+                    .any(|n| n.contains("just after") && n.contains("budget")),
+                "the caller is owed the fact that it finished late: {:?}",
+                outcome.notes
+            );
+        }
+        other => panic!("a finished report must survive its own timeout, got {other:?}"),
+    }
+}
+
+/// The other half of the contract: prose where a shape was promised is still a
+/// failure, because `specialists::server` embeds a *parsed* report and handing
+/// back unvalidated text would put the wrong kind of thing there. It is carried
+/// on the failure instead, where it reads as what it is.
+#[tokio::test]
+async fn prose_left_by_a_timed_out_delegate_is_reported_as_how_far_it_got() {
+    let pool = test_pool().await;
+    let mut server = mockito::Server::new_async().await;
+    mock_answer(&mut server, "I read two of the five sources").await;
+    let _stalled = server
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_chunked_body(|_w| {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            Ok(())
+        })
+        .create_async()
+        .await;
+
+    let outcome = run_until_timeout(
+        &pool,
+        &server,
+        Some(json!({
+            "type": "object",
+            "properties": {"findings": {"type": "string"}},
+            "required": ["findings"],
+            "additionalProperties": false,
+        })),
+    )
+    .await;
+
+    match outcome {
+        Ok(Err(why)) => {
+            assert!(
+                why.contains("longer than") && why.contains("stopped"),
+                "still a failure, and still says why: {why}"
+            );
+            assert!(
+                why.contains("How far it got") && why.contains("two of the five"),
+                "the partial work must be carried rather than dropped: {why}"
+            );
+        }
+        other => panic!("expected a failure carrying the partial, got {other:?}"),
+    }
+}
+
+/// Run one delegate against `server` with a one-second budget, so the timeout
+/// path is reached quickly and deterministically.
+async fn run_until_timeout(
+    pool: &SqlitePool,
+    server: &mockito::ServerGuard,
+    response_schema: Option<serde_json::Value>,
+) -> Result<Result<bigtiny2::agent::orchestrator::DelegateOutcome, String>, SpawnRefusal> {
+    let agent = build_agent(pool, Some(&server.url()));
+    let router = Arc::new(ProviderRouter::new(BigTinyConfig::default().cache));
+    router.register_openai(
+        "mock",
+        bigtiny2::config::ProviderConfig {
+            base_url: server.url(),
+            ..Default::default()
+        },
+    );
+    let orchestrator = Arc::new(Orchestrator::new(pool.clone(), 3, 0.25, vec![], 1));
+    orchestrator.attach(&agent);
+    orchestrator.attach_router(router);
+
+    sessions::create_session_for_app(pool, "parent", "Parent", APP)
+        .await
+        .unwrap();
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        orchestrator.run(DelegateRun {
+            name: "researcher".into(),
+            parent_session_id: "parent".into(),
+            prompt: "go".into(),
+            system_prompt: None,
+            provider: None,
+            model: None,
+            tool_allow: vec![],
+            response_schema,
+            max_steps: 5,
+            reasoning_cap: None,
+        }),
+    )
+    .await
+    .expect("the orchestrator itself must not hang")
+}
+
+/// The deadline valve, end to end through a real turn.
+///
+/// The unit tests pin `decide_turn_mode`'s precedence and the reserve
+/// arithmetic; this pins the thing between them -- that `deadline_unix_ms`
+/// survives the metadata round trip, that the loop reads it, and that the valve
+/// fires with the deadline's own wording rather than the context valve's, which
+/// would tell a delegate to "send another message to continue" as it is about
+/// to be killed.
+///
+/// Timing: the turn is given 1.2s, so the reserve is 400ms. Step 0's provider
+/// call is made to take a second, which leaves step 1 inside the reserve by a
+/// margin much larger than the scheduling noise either side of it.
+#[tokio::test]
+async fn a_turn_near_its_deadline_withdraws_tools_and_says_why() {
+    let pool = test_pool().await;
+    let mut server = mockito::Server::new_async().await;
+
+    // Step 0: a tool call, arriving slowly enough to eat most of the budget.
+    server
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_chunked_body(|w| {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            w.write_all(
+                b"data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"some_unregistered_tool\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}\n\n\
+                  data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n\
+                  data: [DONE]\n\n",
+            )
+        })
+        .expect(1)
+        .create_async()
+        .await;
+    // Step 1: the wrap-up reply the valve asks for.
+    mock_answer(&mut server, "what I have so far").await;
+
+    let agent = build_agent(&pool, Some(&server.url()));
+    let deadline_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        + 1200;
+    seed_session(
+        &pool,
+        "near-deadline",
+        json!({
+            "provider": "mock",
+            "hitl_policy": "auto_reject",
+            "deadline_unix_ms": deadline_ms,
+        }),
+    )
+    .await;
+
+    let events = run_and_collect(&agent, "near-deadline").await;
+    let notice = events
+        .iter()
+        .filter(|e| e.event_type == SSEEventType::ToolFinish)
+        .find_map(|e| {
+            (e.tool_name.as_deref() == Some("__context_budget__"))
+                .then(|| e.tool_result.clone().unwrap_or_default())
+        })
+        .expect("the valve must tell the user why the turn ended early");
+    assert!(
+        notice.contains("time budget"),
+        "the deadline's wording, not the context valve's: {notice}"
+    );
+    assert!(
+        notice.contains("specialist_timeout_secs"),
+        "and it names the setting that would stop it recurring: {notice}"
+    );
+}
+
+/// The companion: a turn with no deadline in its metadata -- every ordinary
+/// chat turn -- must never see the valve. The budget bound is for delegates,
+/// which run unattended; a user can stop their own turn, and cutting them off
+/// mid-answer would be a worse failure than a slow one.
+#[tokio::test]
+async fn an_ordinary_turn_never_sees_the_deadline_valve() {
+    let pool = test_pool().await;
+    let mut server = mockito::Server::new_async().await;
+    mock_tool_then_stop(&mut server, "some_unregistered_tool").await;
+    let agent = build_agent(&pool, Some(&server.url()));
+    seed_session(
+        &pool,
+        "no-deadline",
+        json!({"provider": "mock", "hitl_policy": "auto_reject"}),
+    )
+    .await;
+
+    let events = run_and_collect(&agent, "no-deadline").await;
+    assert!(
+        !events
+            .iter()
+            .any(|e| e.tool_name.as_deref() == Some("__context_budget__")),
+        "a turn with no deadline has no budget to run out of"
+    );
+}

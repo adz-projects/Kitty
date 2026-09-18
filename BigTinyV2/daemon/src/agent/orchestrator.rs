@@ -421,9 +421,9 @@ impl Orchestrator {
         {
             Ok(permit) => permit,
             // Distinguished from the post-permit check below because the two
-            // are different failures to the caller: this one never started and
-            // is worth re-running on its own, and saying "the batch ran out of
-            // time" about a single non-fan-out call describes nothing it did.
+            // are different failures to the caller: this one never reached the
+            // front of the queue at all, while that one got there with no time
+            // left to use. Each is worth re-running on its own.
             Err(_) => {
                 return Ok(Err(format!(
                     "the specialist waited behind other specialists for its whole {}s budget and \
@@ -439,8 +439,14 @@ impl Orchestrator {
         // ones that are missing, which is the whole reason failures here are per
         // element.
         if tokio::time::Instant::now() >= deadline {
+            // Worded for both callers. A fan-out element really was never
+            // reached; a lone `call_specialist` gets here too, after waiting
+            // out its whole budget on the semaphore, and "the batch" names
+            // nothing it did.
             return Ok(Err(
-                "the batch ran out of time before this source was reached".to_string()
+                "by the time this specialist reached the front of the queue there was no time \
+                 left to run it; re-run it, or raise agent.max_concurrent_specialists"
+                    .to_string(),
             ));
         }
 
@@ -459,6 +465,27 @@ impl Orchestrator {
             "hitl_policy": "auto_reject",
             "max_steps": spec.max_steps,
         });
+
+        // The wall clock the loop is actually racing, handed to the child so it
+        // can finish deliberately instead of being killed mid-thought.
+        //
+        // The child had no notion of time at all before this: it worked flat
+        // out until `tokio::time::timeout` below aborted it, which routinely
+        // landed during `finalize_structured` — the largest request of the
+        // whole run, issued at the moment the budget is most nearly spent.
+        // `loop_::run_tool_loop` reads this and withdraws tools while there is
+        // still room to write a report.
+        //
+        // `deadline`, not `now + self.timeout`: a fan-out child shares the
+        // batch's deadline, so its budget is whatever is genuinely left rather
+        // than a fresh allowance the batch will not honour.
+        //
+        // Absolute wall-clock millis rather than a duration, because the
+        // metadata is written once and read on every step of a run that may
+        // last minutes. `tokio::time::Instant` has no serializable form; the
+        // conversion goes through the remaining duration so the two clocks
+        // never have to agree on an epoch.
+        meta["deadline_unix_ms"] = json!(deadline_unix_ms(deadline));
 
         // Inherit the parent's filesystem grants.
         //
@@ -562,18 +589,28 @@ impl Orchestrator {
         // no recourse, while holding one of a small number of permits. On expiry
         // the child is cancelled rather than merely abandoned, or it would keep
         // spending on an answer nobody is waiting for any more.
+        // The budget this run actually got, which is not always
+        // `self.timeout`: a fan-out element takes whatever is left of the
+        // batch's shared deadline. Reported as such, because "ran longer than
+        // 300s" on a child that was given 40 sends whoever reads it looking in
+        // the wrong place.
+        let budget = self
+            .timeout
+            .min(deadline.saturating_duration_since(tokio::time::Instant::now()));
+        let mut timed_out = false;
         let outcome = match tokio::time::timeout(
-            self.timeout.min(deadline.saturating_duration_since(tokio::time::Instant::now())),
+            budget,
             agent.run_turn_and_wait(&child_id, &spec.prompt, Priority::Background),
         )
         .await
         {
             Ok(res) => res,
             Err(_) => {
+                timed_out = true;
                 agent.cancel(&child_id).await;
                 Err(format!(
                     "the specialist ran longer than {}s and was stopped",
-                    self.timeout.as_secs()
+                    budget.as_secs()
                 ))
             }
         };
@@ -596,7 +633,42 @@ impl Orchestrator {
                 Ok(None) => Err("the specialist produced no answer".to_string()),
                 Err(e) => Err(format!("could not read the specialist's answer: {e}")),
             },
-            Err(msg) => Err(msg),
+            // A killed run is not automatically a wasted one. Look at what it
+            // wrote before giving up: `run_turn_and_wait` *spawns* the loop and
+            // awaits a watcher, so a timeout drops the watcher while the child
+            // was still going — and the child persists its answer the instant
+            // it has one. This arm used to return the error without reading
+            // anything, which is how a delegate that finished a second late
+            // reported nothing at all.
+            Err(msg) => {
+                let salvaged = if timed_out {
+                    sessions::last_assistant_text(&self.db, &child_id)
+                        .await
+                        .ok()
+                        .flatten()
+                } else {
+                    None
+                };
+                match classify_salvage(salvaged, spec.response_schema.as_ref()) {
+                    Salvage::Report(text) => {
+                        notes.push(format!(
+                            "The specialist finished its report just after its {}s budget \
+                             expired; the report is complete and is used as normal.",
+                            budget.as_secs()
+                        ));
+                        Ok(text)
+                    }
+                    // Deliberately still a failure. The caller contracted for a
+                    // shape and this is not it, so presenting it as a report
+                    // would put unvalidated prose where a parsed object is
+                    // expected. Carried on the failure instead, where it reads
+                    // as what it is: how far the specialist got.
+                    Salvage::Partial(text) => {
+                        Err(format!("{msg}\n\nHow far it got: {text}"))
+                    }
+                    Salvage::Nothing => Err(msg),
+                }
+            }
         };
 
         let (status, summary, error) = match &result {
@@ -910,6 +982,74 @@ impl Orchestrator {
     }
 }
 
+/// An absolute `tokio` deadline as wall-clock milliseconds since the epoch.
+///
+/// Routed through the *remaining duration* rather than by converting between
+/// clock types: `tokio::time::Instant` is monotonic and has no epoch, and a
+/// paused test clock has no relationship to the wall clock at all. Asking "how
+/// long is left" is a question both clocks answer the same way.
+fn deadline_unix_ms(deadline: tokio::time::Instant) -> u64 {
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    now_ms.saturating_add(remaining.as_millis() as u64)
+}
+
+/// What a killed delegate left behind on disk, if it is worth anything.
+///
+/// A timeout used to discard the run wholesale without ever looking at the
+/// transcript, which is how a delegate that *had* written its report — the
+/// abort landing a moment after `finalize_structured` persisted it — reported
+/// only that it had been stopped. The child's messages are saved at every step
+/// boundary and by `emit_structured_answer`, and `Agent::cancel` does not
+/// remove them, so there is nearly always something there.
+enum Salvage {
+    /// A complete answer: it matches the shape the specialist promised (or the
+    /// specialist promised no shape, in which case its prose *is* the report).
+    /// Good enough to hand the caller as a success.
+    Report(String),
+    /// Prose, but not the agreed shape — the tool loop got somewhere and the
+    /// schema-constrained pass never ran or never validated. Not a report, but
+    /// worth showing rather than dropping.
+    Partial(String),
+    /// Nothing usable: no assistant message, or only the empty content rows a
+    /// tool-call-only step writes.
+    Nothing,
+}
+
+/// How much salvaged prose is attached to a failure. Enough to see what the
+/// delegate was doing; far short of pasting a whole transcript into the
+/// caller's context, which is the cost delegation exists to avoid.
+const MAX_PARTIAL_CHARS: usize = 2000;
+
+fn classify_salvage(text: Option<String>, schema: Option<&Value>) -> Salvage {
+    let Some(text) = text else {
+        return Salvage::Nothing;
+    };
+    if text.trim().is_empty() {
+        return Salvage::Nothing;
+    }
+    let Some(schema) = schema else {
+        // Nothing was promised, so nothing can be short of it.
+        return Salvage::Report(text);
+    };
+    // Parsed the way `finalize_structured` parses it, and validated against the
+    // same function, so "valid" means here exactly what it means there.
+    let valid = crate::provider::schema::extract(&text)
+        .is_some_and(|v| crate::provider::schema::validate(schema, &v).is_ok());
+    if valid {
+        Salvage::Report(text)
+    } else {
+        let flat = text.trim();
+        Salvage::Partial(match flat.char_indices().nth(MAX_PARTIAL_CHARS) {
+            Some((cut, _)) => format!("{}...", &flat[..cut]),
+            None => flat.to_string(),
+        })
+    }
+}
+
 /// A one-line form of a prompt or answer, for session names and audit
 /// summaries.
 fn short(text: &str) -> String {
@@ -927,6 +1067,94 @@ mod tests {
 
     async fn test_pool() -> SqlitePool {
         SqlitePool::connect("sqlite::memory:").await.unwrap()
+    }
+
+    /// The salvage classifier, which decides what a killed delegate's
+    /// transcript is worth. Before it, the timeout path never read the
+    /// transcript at all: a delegate whose report was persisted a moment
+    /// after the deadline reported only that it had been stopped, with the
+    /// finished report sitting on disk under `parent_session_id`.
+    mod salvage {
+        use super::*;
+
+        fn schema() -> Value {
+            json!({
+                "type": "object",
+                "properties": {"findings": {"type": "string"}},
+                "required": ["findings"],
+                "additionalProperties": false,
+            })
+        }
+
+        /// The case the whole change exists for: the run finished, the abort
+        /// landed on the watcher rather than on the work, and the answer is
+        /// exactly what the caller contracted for.
+        #[test]
+        fn an_answer_matching_the_promised_shape_is_a_report() {
+            let text = json!({"findings": "the early finding"}).to_string();
+            let got = classify_salvage(Some(text.clone()), Some(&schema()));
+            assert!(matches!(got, Salvage::Report(t) if t == text));
+        }
+
+        /// Prose where an object was promised is *not* a report: handing it
+        /// back as one would put unvalidated text where `specialists::server`
+        /// embeds a parsed value. It is still worth showing, so it comes back
+        /// as how far the delegate got.
+        #[test]
+        fn prose_where_a_shape_was_promised_is_only_partial() {
+            let got = classify_salvage(
+                Some("I searched three sites and found nothing yet.".into()),
+                Some(&schema()),
+            );
+            assert!(matches!(got, Salvage::Partial(t) if t.contains("three sites")));
+        }
+
+        /// Valid JSON that is the wrong shape is no better than prose — the
+        /// point is the contract, not the syntax.
+        #[test]
+        fn json_of_the_wrong_shape_is_also_only_partial() {
+            let text = json!({"something_else": 1}).to_string();
+            let got = classify_salvage(Some(text), Some(&schema()));
+            assert!(matches!(got, Salvage::Partial(_)));
+        }
+
+        /// An unconstrained delegate promised no shape, so its prose *is* its
+        /// report and there is nothing to fall short of.
+        #[test]
+        fn without_a_schema_any_prose_is_the_report() {
+            let got = classify_salvage(Some("the answer".into()), None);
+            assert!(matches!(got, Salvage::Report(t) if t == "the answer"));
+        }
+
+        /// A tool-call-only step persists an assistant row with empty content.
+        /// Reading one of those as an answer would replace an honest timeout
+        /// with an empty report, which is strictly worse.
+        #[test]
+        fn nothing_usable_stays_a_plain_failure() {
+            assert!(matches!(classify_salvage(None, None), Salvage::Nothing));
+            assert!(matches!(
+                classify_salvage(Some(String::new()), None),
+                Salvage::Nothing
+            ));
+            assert!(matches!(
+                classify_salvage(Some("   \n  ".into()), Some(&schema())),
+                Salvage::Nothing
+            ));
+        }
+
+        /// Bounded, because the whole point of delegation is that the
+        /// specialist's working never enters the caller's context.
+        #[test]
+        fn a_long_partial_is_truncated() {
+            let got = classify_salvage(Some("x".repeat(10_000)), Some(&schema()));
+            match got {
+                Salvage::Partial(t) => {
+                    assert!(t.len() <= MAX_PARTIAL_CHARS + 8, "got {} chars", t.len());
+                    assert!(t.ends_with("..."));
+                }
+                _ => panic!("expected a partial"),
+            }
+        }
     }
 
     /// `MAX_FAN_OUT` is a spend ceiling; this is the one that reflects what a

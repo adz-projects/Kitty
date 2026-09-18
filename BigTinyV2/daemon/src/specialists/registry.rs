@@ -115,16 +115,30 @@ fn builtin_with_fan_out(
     }
 }
 
-/// Shared preamble. Every specialist is told the same three things, because
-/// every specialist fails the same three ways: padding a short answer,
-/// pretending a blocked tool call succeeded, and re-reading a document the
-/// caller already had extracted.
+/// Shared preamble. Every specialist is told the same five things, because
+/// every specialist fails the same five ways: padding a short answer,
+/// pretending a blocked tool call succeeded, re-reading a document the caller
+/// already had extracted, working past the budget until it is killed with
+/// nothing to show, and wrapping the answer in prose the caller never sees.
+///
+/// The last two were added after delegates were observed reporting timeouts on
+/// work they had effectively finished. A specialist has no clock of its own
+/// beyond the wrap-up notice `agent::loop_` injects near the deadline, so the
+/// disposition to stop early has to be in the prompt rather than discovered.
+///
+/// Prepended at resolve time rather than stored on each row, so an install
+/// whose definitions were seeded by an earlier version picks this up without a
+/// migration -- `seed_builtins` deliberately never overwrites an edited row.
 const COMMON: &str = "You are a specialist working on behalf of another agent, not a person. \
 Answer only what was asked; the caller cannot see your working, so put everything that matters \
 in your final structured answer and nothing that does not. If a tool call is refused or a source \
 is unavailable, say so in `refusals` and continue with what you can — never present a partial \
 result as a complete one. When the request gives you document ids or paths, work from those \
-directly rather than asking for the content.";
+directly rather than asking for the content. Work to the budget you are given: a short \
+report that arrives is worth far more than a thorough one that does not, so stop and \
+report as soon as you have enough to answer, and if you are told you are near your \
+limit, stop immediately and report what you have. Return only the fields the answer \
+shape asks for — no preamble, no restating the request, no commentary around it.";
 
 pub fn researcher() -> Specialist {
     builtin(

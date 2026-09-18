@@ -537,6 +537,43 @@ const WRAPUP_SYSTEM_MESSAGE: &str =
      have, briefly and directly. If anything still needs checking, say plainly \
      what it is and that it will need a follow-up turn to verify.]";
 
+/// The same valve, fired because the run is nearly out of *time* rather than
+/// out of context.
+///
+/// Three jobs, like `WRAPUP_SYSTEM_MESSAGE`, and one it does not have: restate
+/// that a report is still owed. Running out of context ends a chat turn, where
+/// the transcript itself is the deliverable; running out of time ends a
+/// *delegate*, whose caller contracted for a structured answer and gets nothing
+/// at all if the schema-constrained pass never runs. Naming `refusals` matters
+/// for the same reason — the difference between a short honest report and a
+/// short misleading one is whether the gaps are declared.
+const DEADLINE_SYSTEM_MESSAGE: &str =
+    "[System: You are nearly out of time for this task. Stop what you are doing now — do \
+     not start anything else and do not attempt any tool calls. Report what you have \
+     already found, in the answer shape you were given, and list everything you did not \
+     get to under `refusals`. A short report delivered now is worth far more than a \
+     complete one that arrives too late to be used.]";
+
+/// How much of a run's wall-clock budget is held back for it to stop and write
+/// its report.
+///
+/// The reserve exists because a delegate's *last* action is its most expensive:
+/// `finalize_structured` re-sends the whole history with tools withdrawn, and
+/// retries once on a rejected shape. Issuing that at the very end of the budget
+/// is what made a finished run look like a timed-out one.
+///
+/// Sixty seconds comfortably covers a wrap-up reply plus both structured
+/// passes at the 300s default. The fraction is for short budgets, where a flat
+/// minute would be most of the run: a 60s delegate reserves 20s and still gets
+/// 40s of actual work.
+const DEADLINE_WRAPUP_RESERVE: std::time::Duration = std::time::Duration::from_secs(60);
+const DEADLINE_RESERVE_DIVISOR: u32 = 3;
+
+/// The slice of `budget` held back for the report.
+fn deadline_reserve(budget: std::time::Duration) -> std::time::Duration {
+    DEADLINE_WRAPUP_RESERVE.min(budget / DEADLINE_RESERVE_DIVISOR)
+}
+
 /// Output budget for the wrap-up reply. The floor keeps `max_tokens` a positive
 /// integer Anthropic will accept even when the window is already overshot; the
 /// ceiling is comfortably more than a closing paragraph while staying small
@@ -556,10 +593,20 @@ const WRAPUP_MAX_TOKENS_CEILING: i32 = 2048;
 enum TurnMode {
     Normal,
     StepNudge,
-    WrapUp,
+    WrapUp(WrapUpReason),
 }
 
-/// Context exhaustion outranks the step nudge, always.
+/// Which exhausted resource ended the turn. Both withdraw every tool and take
+/// the same final reply; they differ in what the model is told and in what the
+/// user is shown, and conflating them produced a "close to the context limit"
+/// notice on a run that had plenty of context and no time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WrapUpReason {
+    Context,
+    Deadline,
+}
+
+/// Deadline outranks context exhaustion outranks the step nudge, always.
 ///
 /// The two interventions contradict each other on the wire — the nudge's whole
 /// purpose is to *append* `request_more_steps` to the tool list while wrap-up
@@ -573,10 +620,33 @@ enum TurnMode {
 /// the daemon-wide `max_context_tokens` while this checks the provider's own
 /// window — so a provider with a smaller real window starts the turn already
 /// over. Suppressing the valve there would convert a graceful degradation into
-/// the hard provider 400 it exists to avoid.
-fn decide_turn_mode(step: i64, wrapup_issued: bool, wrapup_due: bool) -> TurnMode {
-    if wrapup_due && !wrapup_issued {
-        TurnMode::WrapUp
+/// the hard provider 400 it exists to avoid. The same holds for the deadline
+/// arm: a delegate handed a deadline that has already passed (a fan-out element
+/// at the tail of a spent batch) should write what it can, not open a tool.
+///
+/// Time outranks context, in turn, for the reason context outranks the step
+/// nudge: it is the exhaustion nothing can extend. A run out of context can at
+/// least be continued in a fresh turn; a run out of time is about to be killed
+/// by the orchestrator, and every token it spends between here and then is
+/// spent on an answer nobody will receive.
+fn decide_turn_mode(
+    step: i64,
+    wrapup_issued: bool,
+    wrapup_due: bool,
+    deadline_due: bool,
+) -> TurnMode {
+    if wrapup_issued {
+        // Already fired once; the unconditional `break` in the completion
+        // block is what normally ends the turn, this is the belt.
+        if step > 0 && step % 20 == 0 {
+            return TurnMode::StepNudge;
+        }
+        return TurnMode::Normal;
+    }
+    if deadline_due {
+        TurnMode::WrapUp(WrapUpReason::Deadline)
+    } else if wrapup_due {
+        TurnMode::WrapUp(WrapUpReason::Context)
     } else if step > 0 && step % 20 == 0 {
         TurnMode::StepNudge
     } else {
@@ -2036,6 +2106,29 @@ impl AgentLoop {
             .and_then(|v| serde_json::from_value(v.clone()).ok())
             .unwrap_or_default();
 
+        // When this run will be killed, and the slice of its budget held back
+        // so it can stop and write a report first.
+        //
+        // Set by `Orchestrator::run_by` for a delegate; absent for an ordinary
+        // chat turn, which has no wall-clock bound at all and must not acquire
+        // one — a user watching their own turn can stop it themselves, and
+        // cutting them off mid-answer is a worse failure than a slow one.
+        //
+        // The reserve is computed from what was left *when the turn started*
+        // rather than from the configured timeout, because that is the budget
+        // this particular run was given: a fan-out element inherits whatever
+        // remains of the batch deadline.
+        let deadline_at: Option<std::time::SystemTime> = metadata
+            .get("deadline_unix_ms")
+            .and_then(|v| v.as_u64())
+            .map(|ms| std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms));
+        let time_reserve = deadline_at.map(|at| {
+            deadline_reserve(
+                at.duration_since(std::time::SystemTime::now())
+                    .unwrap_or_default(),
+            )
+        });
+
         // The shape this turn's final answer must take. Set by a specialist
         // run (and by `POST /api/jobs` with a schema); absent, and therefore
         // `Text`, for an ordinary chat turn.
@@ -2306,11 +2399,27 @@ impl AgentLoop {
             let projected_input = tokens::projected_input_tokens(last_usage, &messages);
             let wrapup_due = tokens::wrapup_due(projected_input, context_length, wrapup_reserve);
 
+            // How long is left, checked once per iteration — which is the only
+            // place it can be checked. A tool call that runs past the deadline
+            // on its own cannot be interrupted from here; the orchestrator's
+            // salvage of the transcript is what covers that case.
+            let time_left = deadline_at.map(|at| {
+                at.duration_since(std::time::SystemTime::now())
+                    .unwrap_or_default()
+            });
+            let deadline_due = match (time_left, time_reserve) {
+                (Some(left), Some(reserve)) => left <= reserve,
+                _ => false,
+            };
+
             // Exactly one intervention per iteration, chosen here rather than
             // by two independent `if`s — see `decide_turn_mode`.
-            match decide_turn_mode(step, wrapup_issued, wrapup_due) {
-                TurnMode::WrapUp => {
-                    if step == 0 {
+            match decide_turn_mode(step, wrapup_issued, wrapup_due, deadline_due) {
+                TurnMode::WrapUp(reason) => {
+                    // Only the context valve can misfire this way; a deadline
+                    // that has already passed at step 0 is a fan-out element at
+                    // the tail of a spent batch, which is ordinary.
+                    if reason == WrapUpReason::Context && step == 0 {
                         // The fingerprint of a provider whose `context_length`
                         // is unset or wrong: the context builder assembled
                         // against the daemon-wide budget and blew the real
@@ -2331,7 +2440,8 @@ impl AgentLoop {
                         context_length,
                         projected_input,
                         wrapup_reserve,
-                        "context reserve reached — withdrawing tools for a wrap-up reply"
+                        ?reason,
+                        "budget reserve reached — withdrawing tools for a wrap-up reply"
                     );
                     // The wrap-up reply is this turn's last word, so it has to be
                     // written with every specialist report in hand. Collected
@@ -2345,7 +2455,10 @@ impl AgentLoop {
                         event_tx,
                     )
                     .await;
-                    messages.push(control_message(WRAPUP_SYSTEM_MESSAGE));
+                    messages.push(control_message(match reason {
+                        WrapUpReason::Context => WRAPUP_SYSTEM_MESSAGE,
+                        WrapUpReason::Deadline => DEADLINE_SYSTEM_MESSAGE,
+                    }));
                     in_wrapup = true;
                     wrapup_issued = true;
                     tools_for_turn.clear();
@@ -2354,12 +2467,24 @@ impl AgentLoop {
                     let _ = event_tx.send(SSEEvent {
                         event_type: SSEEventType::ToolFinish,
                         tool_name: Some(CONTEXT_BUDGET_TOOL.into()),
-                        tool_result: Some(format!(
-                            "Close to this model's context limit ({projected_input} of \
-                             {context_length} tokens used) — finishing this turn now. \
-                             Send another message to continue; the conversation will be \
-                             compacted first."
-                        )),
+                        tool_result: Some(match reason {
+                            WrapUpReason::Context => format!(
+                                "Close to this model's context limit ({projected_input} of \
+                                 {context_length} tokens used) — finishing this turn now. \
+                                 Send another message to continue; the conversation will \
+                                 be compacted first."
+                            ),
+                            // Names the setting, because the fix for a delegate
+                            // that keeps running out of time is a bigger budget
+                            // and nothing in the transcript says where it lives.
+                            WrapUpReason::Deadline => format!(
+                                "About {}s of this task's time budget left — wrapping up \
+                                 now so it reports what it has rather than being cut off \
+                                 mid-thought. Raise agent.specialist_timeout_secs if this keeps \
+                                 happening.",
+                                time_left.unwrap_or_default().as_secs()
+                            ),
+                        }),
                         session_id: Some(session_id.to_string()),
                         ..Default::default()
                     });
@@ -4705,8 +4830,12 @@ mod budget_abort_tests {
 
 #[cfg(test)]
 mod wrapup_valve_tests {
-    use super::{decide_turn_mode, wrapup_persist_shape, ToolCall, TurnMode};
+    use super::{
+        deadline_reserve, decide_turn_mode, wrapup_persist_shape, ToolCall, TurnMode, WrapUpReason,
+        DEADLINE_WRAPUP_RESERVE,
+    };
     use serde_json::json;
+    use std::time::Duration;
 
     fn call(id: &str) -> ToolCall {
         ToolCall {
@@ -4718,16 +4847,22 @@ mod wrapup_valve_tests {
 
     #[test]
     fn an_ordinary_step_gets_no_intervention() {
-        assert_eq!(decide_turn_mode(0, false, false), TurnMode::Normal);
-        assert_eq!(decide_turn_mode(7, false, false), TurnMode::Normal);
+        assert_eq!(decide_turn_mode(0, false, false, false), TurnMode::Normal);
+        assert_eq!(decide_turn_mode(7, false, false, false), TurnMode::Normal);
         // Step 0 never trips the step nudge, whatever the modulus says.
-        assert_eq!(decide_turn_mode(0, true, false), TurnMode::Normal);
+        assert_eq!(decide_turn_mode(0, true, false, false), TurnMode::Normal);
     }
 
     #[test]
     fn the_step_nudge_still_fires_on_multiples_of_twenty() {
-        assert_eq!(decide_turn_mode(20, false, false), TurnMode::StepNudge);
-        assert_eq!(decide_turn_mode(40, false, false), TurnMode::StepNudge);
+        assert_eq!(
+            decide_turn_mode(20, false, false, false),
+            TurnMode::StepNudge
+        );
+        assert_eq!(
+            decide_turn_mode(40, false, false, false),
+            TurnMode::StepNudge
+        );
     }
 
     /// The collision case, and the reason this is a function rather than an
@@ -4736,7 +4871,10 @@ mod wrapup_valve_tests {
     /// non-answer when the exhausted resource is *context*.
     #[test]
     fn context_exhaustion_outranks_the_step_nudge() {
-        assert_eq!(decide_turn_mode(20, false, true), TurnMode::WrapUp);
+        assert_eq!(
+            decide_turn_mode(20, false, true, false),
+            TurnMode::WrapUp(WrapUpReason::Context)
+        );
     }
 
     /// No `step > 0` guard: a provider whose real window is smaller than the
@@ -4745,7 +4883,10 @@ mod wrapup_valve_tests {
     /// 400s instead.
     #[test]
     fn the_valve_can_fire_before_any_tool_has_run() {
-        assert_eq!(decide_turn_mode(0, false, true), TurnMode::WrapUp);
+        assert_eq!(
+            decide_turn_mode(0, false, true, false),
+            TurnMode::WrapUp(WrapUpReason::Context)
+        );
     }
 
     /// Once issued, it never re-issues — the latch behind the unconditional
@@ -4753,8 +4894,84 @@ mod wrapup_valve_tests {
     /// latch's meaning against a later refactor that removes the break.)
     #[test]
     fn the_latch_prevents_a_second_wrap_up() {
-        assert_eq!(decide_turn_mode(7, true, true), TurnMode::Normal);
-        assert_eq!(decide_turn_mode(20, true, true), TurnMode::StepNudge);
+        assert_eq!(decide_turn_mode(7, true, true, false), TurnMode::Normal);
+        assert_eq!(decide_turn_mode(20, true, true, false), TurnMode::StepNudge);
+    }
+
+    /// Running out of time outranks running out of context, which outranks the
+    /// step nudge. The ordering is the point: a turn out of context can be
+    /// continued in a fresh one, but a delegate out of time is about to be
+    /// killed by the orchestrator, so the context valve's "send another
+    /// message to continue" is advice it cannot take.
+    #[test]
+    fn the_deadline_outranks_every_other_intervention() {
+        assert_eq!(
+            decide_turn_mode(20, false, true, true),
+            TurnMode::WrapUp(WrapUpReason::Deadline)
+        );
+        assert_eq!(
+            decide_turn_mode(20, false, false, true),
+            TurnMode::WrapUp(WrapUpReason::Deadline)
+        );
+        // And, like the context valve, it is reachable before any tool has
+        // run: a fan-out element picked up at the tail of a spent batch has
+        // essentially no budget and should write what it can rather than open
+        // a tool it will be killed in the middle of.
+        assert_eq!(
+            decide_turn_mode(0, false, false, true),
+            TurnMode::WrapUp(WrapUpReason::Deadline)
+        );
+    }
+
+    /// A turn with no deadline at all -- every ordinary chat turn -- must be
+    /// completely unaffected. The valve is for delegates, which are bounded
+    /// because nobody is watching them; cutting a user off mid-answer is a
+    /// worse failure than a slow one.
+    #[test]
+    fn a_turn_without_a_deadline_is_untouched() {
+        assert_eq!(decide_turn_mode(5, false, false, false), TurnMode::Normal);
+        assert_eq!(
+            decide_turn_mode(20, false, false, false),
+            TurnMode::StepNudge
+        );
+    }
+
+    /// The latch covers the deadline arm too: having withdrawn every tool once
+    /// and been answered, a second pass must not do it again.
+    #[test]
+    fn the_latch_covers_the_deadline_arm() {
+        assert_eq!(decide_turn_mode(7, true, false, true), TurnMode::Normal);
+    }
+
+    /// At the 300s default the reserve is the flat minute -- comfortably a
+    /// wrap-up reply plus both `finalize_structured` passes.
+    #[test]
+    fn a_normal_budget_reserves_the_flat_minute() {
+        assert_eq!(
+            deadline_reserve(Duration::from_secs(300)),
+            DEADLINE_WRAPUP_RESERVE
+        );
+        assert_eq!(
+            deadline_reserve(Duration::from_secs(600)),
+            DEADLINE_WRAPUP_RESERVE
+        );
+    }
+
+    /// A short budget reserves a fraction instead, or the reserve would eat
+    /// the run: a flat minute against a 60s delegate leaves it no time to work
+    /// at all, so it would wrap up on its very first step and report nothing.
+    #[test]
+    fn a_short_budget_reserves_a_fraction_so_work_still_happens() {
+        assert_eq!(
+            deadline_reserve(Duration::from_secs(60)),
+            Duration::from_secs(20)
+        );
+        assert_eq!(
+            deadline_reserve(Duration::from_secs(30)),
+            Duration::from_secs(10)
+        );
+        // Degenerate, but it must not panic or reserve more than exists.
+        assert_eq!(deadline_reserve(Duration::ZERO), Duration::ZERO);
     }
 
     #[test]
