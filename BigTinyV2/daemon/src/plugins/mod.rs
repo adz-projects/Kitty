@@ -87,7 +87,6 @@ pub fn test_memorabilia_host(
         "memorabilia.db".to_string(),
         60,
         None,
-        memorabilia::config::Config::default().embedding_dim,
         String::new(),
         summarizer,
     ))

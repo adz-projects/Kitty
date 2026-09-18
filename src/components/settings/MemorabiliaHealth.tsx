@@ -25,7 +25,19 @@ export function MemorabiliaHealth() {
     setLoading(true);
     setError('');
     try {
-      setStats(await ipc.getMemorabiliaStats());
+      const s = await ipc.getMemorabiliaStats();
+      // The daemon route returns a soft `{ error }` shape (HTTP 200) while the
+      // engine is unavailable — e.g. in the window right after a toggle
+      // restarts the backend. Treat anything without the expected numeric
+      // fields as "not ready yet" rather than letting the render throw on a
+      // missing field (which would blank the whole Settings window).
+      if (s && typeof (s as { active?: unknown }).active === 'number') {
+        setStats(s);
+      } else {
+        setStats(null);
+        const msg = (s as { error?: string })?.error;
+        setError(msg ? `Memory isn't ready yet: ${msg}` : '');
+      }
     } catch (e) {
       setError(String(e));
     } finally {
@@ -49,11 +61,11 @@ export function MemorabiliaHealth() {
           <div>
             Kitty is holding <strong>{stats.active}</strong> fact
             {stats.active === 1 ? '' : 's'}
-            {Object.keys(stats.by_importance).length > 0 && (
+            {Object.keys(stats.by_importance ?? {}).length > 0 && (
               <>
                 {' '}
                 &mdash;{' '}
-                {Object.entries(stats.by_importance)
+                {Object.entries(stats.by_importance ?? {})
                   .map(([k, count]) => `${count} ${IMPORTANCE_LABEL[k] ?? k}`)
                   .join(', ')}
               </>

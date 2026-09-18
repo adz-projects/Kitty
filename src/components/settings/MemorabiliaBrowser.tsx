@@ -21,8 +21,17 @@ export function MemorabiliaBrowser() {
     void ipc
       .getMemorabiliaItems()
       .then((r) => {
-        setItems(r.items);
-        setError('');
+        // Tolerate the daemon's soft `{ error }` shape (HTTP 200) that appears
+        // while the engine is unavailable — e.g. just after a toggle restarts
+        // the backend — instead of feeding `undefined` into the table.
+        if (r && Array.isArray(r.items)) {
+          setItems(r.items);
+          setError('');
+        } else {
+          setItems([]);
+          const msg = (r as { error?: string })?.error;
+          setError(msg ? `Memory isn't ready yet: ${msg}` : '');
+        }
       })
       .catch((e) => setError(String(e)));
 

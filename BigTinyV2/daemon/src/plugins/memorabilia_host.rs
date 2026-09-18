@@ -96,22 +96,29 @@ pub struct MemorabiliaHost {
     default_enabled: bool,
     db_name: String,
     sweep_interval_s: u64,
-    /// The engine `Config`, pre-tuned to the shared embedder's vector space
-    /// (dim + tag) so every app's vectors are comparable.
-    mem_config: MemConfig,
-    /// Built once from the shared embedder (or the hash fallback) and cloned
-    /// into each engine — never a second loaded model.
-    embedder: Arc<dyn memorabilia::traits::Embedder>,
+    /// The shared semantic embedder (the same one pathway uses; `None` → the
+    /// engine's own lexical hash fallback). Its live vector width is probed
+    /// **lazily** on the first engine open, not at construction: a cold LiteRt
+    /// embed on the daemon startup path used to block `/api/health` until the
+    /// model finished loading (a "stack degraded" flash on first launch).
+    raw_embedder: Option<Arc<dyn SemanticEmbedder>>,
+    /// The shared model's vector-space identity tag.
+    embed_space: String,
     /// The extraction/maintenance chat seam (SummarizerChain), daemon-wide.
     chat: Arc<dyn memorabilia::traits::StructuredChat>,
+    /// Memoized `(config, embedder)` resolved from `raw_embedder` on first use.
+    /// Sized to the embedder's live width once, then fixed for the process so
+    /// every app's `chunks_vec` table agrees on a dimension.
+    resolved: tokio::sync::OnceCell<(MemConfig, Arc<dyn memorabilia::traits::Embedder>)>,
     instances: Mutex<HashMap<String, Instance>>,
 }
 
 impl MemorabiliaHost {
     /// Build the host. `embedder` is the daemon's shared semantic embedder
-    /// (`None` → memorabilia's lexical hash embedder), `embed_dim` its live
-    /// vector width, `embed_space` its vector-space identity tag, `chat` the
-    /// `SummarizerChain`.
+    /// (`None` → memorabilia's lexical hash embedder), `embed_space` its
+    /// vector-space identity tag, `chat` the `SummarizerChain`. The embedder's
+    /// live width is **not** probed here — see [`Self::resolved`] — so
+    /// construction is cheap and cannot block daemon startup.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         pool: SqlitePool,
@@ -120,28 +127,9 @@ impl MemorabiliaHost {
         db_name: String,
         sweep_interval_s: u64,
         embedder: Option<Arc<dyn SemanticEmbedder>>,
-        embed_dim: usize,
         embed_space: String,
         chat: Arc<SummarizerChain>,
     ) -> Self {
-        let mut mem_config = MemConfig::default();
-        mem_config.embedding_dim = embed_dim;
-        // Tag the vector space with the shared model's identity when a
-        // semantic embedder is present; otherwise keep the hash-fallback tag
-        // discipline (the adapter returns HASH_EMBED_MODEL per call anyway).
-        if embedder.is_some() {
-            mem_config.embedding_model = embed_space.clone();
-        }
-        mem_config.maintenance_tick_s = sweep_interval_s;
-
-        let embedder: Arc<dyn memorabilia::traits::Embedder> = match embedder {
-            Some(inner) => Arc::new(SharedSemanticEmbedder {
-                inner,
-                dim: embed_dim,
-                tag: embed_space,
-            }),
-            None => Arc::new(memorabilia::embed::HashEmbedder::new(embed_dim)),
-        };
         let chat: Arc<dyn memorabilia::traits::StructuredChat> =
             Arc::new(SummarizerChatAdapter { inner: chat });
 
@@ -151,11 +139,78 @@ impl MemorabiliaHost {
             default_enabled,
             db_name,
             sweep_interval_s,
-            mem_config,
-            embedder,
+            raw_embedder: embedder,
+            embed_space,
             chat,
+            resolved: tokio::sync::OnceCell::new(),
             instances: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Resolve `(engine config, embedder)` once, lazily, memoized. The shared
+    /// embedder's live vector width is probed on the first engine open (during
+    /// a turn, when the model is warm) rather than at daemon startup, so a cold
+    /// LiteRt load never delays `/api/health`. The probe is time-bounded; on
+    /// timeout or failure it falls back to memorabilia's own lexical hash
+    /// embedder at the default width. The result is fixed for the process, so
+    /// every app's `chunks_vec` table is created with the same dimension.
+    async fn resolved(&self) -> &(MemConfig, Arc<dyn memorabilia::traits::Embedder>) {
+        self.resolved
+            .get_or_init(|| async {
+                let default_dim = MemConfig::default().embedding_dim;
+                let (dim, embedder, semantic): (
+                    usize,
+                    Arc<dyn memorabilia::traits::Embedder>,
+                    bool,
+                ) = match &self.raw_embedder {
+                    Some(e) => match tokio::time::timeout(
+                        Duration::from_secs(30),
+                        e.embed("dimension probe"),
+                    )
+                    .await
+                    {
+                        Ok(Some(v)) if !v.is_empty() => {
+                            let dim = v.len();
+                            (
+                                dim,
+                                Arc::new(SharedSemanticEmbedder {
+                                    inner: e.clone(),
+                                    dim,
+                                    tag: self.embed_space.clone(),
+                                }),
+                                true,
+                            )
+                        }
+                        _ => {
+                            tracing::warn!(
+                                "memorabilia: embedder width probe failed/timed out; \
+                                 using the lexical hash fallback"
+                            );
+                            (
+                                default_dim,
+                                Arc::new(memorabilia::embed::HashEmbedder::new(default_dim)),
+                                false,
+                            )
+                        }
+                    },
+                    None => (
+                        default_dim,
+                        Arc::new(memorabilia::embed::HashEmbedder::new(default_dim)),
+                        false,
+                    ),
+                };
+                let mut mem_config = MemConfig::default();
+                mem_config.embedding_dim = dim;
+                mem_config.maintenance_tick_s = self.sweep_interval_s;
+                // Tag the vector space with the shared model's identity only
+                // when the semantic embedder actually resolved; the hash
+                // fallback keeps its own per-call HASH_EMBED_MODEL tag.
+                if semantic {
+                    mem_config.embedding_model = self.embed_space.clone();
+                }
+                (mem_config, embedder)
+            })
+            .await
     }
 
     fn db_path(&self, app_id: &str) -> PathBuf {
@@ -185,6 +240,14 @@ impl MemorabiliaHost {
             return None;
         }
 
+        // Resolve the shared config/embedder before taking the write lock, so
+        // the one-time (bounded) width probe never holds it. Memoized, so this
+        // is instant on every open after the first.
+        let (mem_config, embedder) = {
+            let r = self.resolved().await;
+            (r.0.clone(), r.1.clone())
+        };
+
         let mut instances = self.instances.lock().await;
         if let Some(existing) = instances.get(app_id) {
             return Some(existing.engine.clone());
@@ -200,9 +263,9 @@ impl MemorabiliaHost {
 
         let engine = match Engine::open_at(
             &db_path.to_string_lossy(),
-            self.mem_config.clone(),
+            mem_config,
             self.chat.clone(),
-            self.embedder.clone(),
+            embedder,
         )
         .await
         {

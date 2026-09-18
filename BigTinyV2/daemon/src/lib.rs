@@ -200,20 +200,14 @@ pub async fn run(config: BigTinyConfig, options: RunOptions) -> Result<(), Daemo
     // single loop here because there was a single engine; carrying that
     // forward naively would mean one idle-sweep loop per registered app,
     // forever, whether or not the app ever sends a turn.
-    // Capture the shared embedder's identity before `ap_config`/`ap_embedder`
-    // are moved into the pathway host: memorabilia reuses the *same* loaded
-    // model (never a second one), sized to its live vector width so its
-    // vectors are comparable. A probe embed reads that width at startup; if
-    // the embedder is absent or the probe fails, memorabilia falls back to its
-    // own deterministic lexical hash embedder at the default width.
+    // Capture the shared embedder before `ap_config`/`ap_embedder` are moved
+    // into the pathway host: memorabilia reuses the *same* loaded model (never
+    // a second one). Its live vector width is probed **lazily**, on the first
+    // engine open inside `MemorabiliaHost`, not here — a cold LiteRt embed on
+    // this startup path blocked `/api/health` until the model finished loading,
+    // showing as a "stack degraded" flash on first launch.
     let mem_embed_space = ap_config.embedding.ollama_model.clone();
-    let (mem_embed_dim, mem_embedder_for_host) = match &ap_embedder {
-        Some(e) => match e.embed("dimension probe").await {
-            Some(v) if !v.is_empty() => (v.len(), ap_embedder.clone()),
-            _ => (memorabilia::config::Config::default().embedding_dim, None),
-        },
-        None => (memorabilia::config::Config::default().embedding_dim, None),
-    };
+    let mem_embedder_for_host = ap_embedder.clone();
 
     let plugins = Arc::new(plugins::PluginHost::new(
         pool.clone(),
@@ -233,7 +227,6 @@ pub async fn run(config: BigTinyConfig, options: RunOptions) -> Result<(), Daemo
         config.memorabilia.db_name.clone(),
         config.memorabilia.sweep_interval_s,
         mem_embedder_for_host,
-        mem_embed_dim,
         mem_embed_space,
         summarizer.clone(),
     ));

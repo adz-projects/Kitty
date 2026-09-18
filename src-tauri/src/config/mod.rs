@@ -593,7 +593,7 @@ fn default_adaptive_pathway_enabled() -> bool {
 }
 
 fn default_memorabilia_enabled() -> bool {
-    false
+    true
 }
 
 /// Resolves `<name>` next to the currently-running executable, if it exists.
