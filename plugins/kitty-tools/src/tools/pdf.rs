@@ -1,15 +1,33 @@
 //! PDF read tools — Rust port of `kitty_docs_web.py`'s `lean_pdf_read_text`
-//! and `lean_pdf_read_outline`, on `lopdf` (pure Rust) instead of PyMuPDF.
+//! and `lean_pdf_read_outline`, originally on `lopdf` alone, now extracting
+//! text with `pdf-extract` (pure Rust, on the same lopdf).
 //!
 //! Tool names, JSON envelope, error codes and pagination/query contracts are
-//! kept byte-identical to the Python original. The one accepted divergence:
-//! lopdf does plain per-page text extraction with no PyMuPDF markdown/layout
-//! pass (`get_text`), so text runs/columns may come back in a different order
-//! than PyMuPDF produced. Documented in docs/VERSIONS.md, same as the
-//! DDG-scrape/htmd substitutions in kitty-web.
+//! kept compatible with the Python original.
+//!
+//! ## Why not lopdf's own `extract_text`
+//!
+//! It was the extractor here until it was found to return a blank page for
+//! nearly every real PDF — which led models to report that text documents
+//! were "just images". `tests/pdf_real_world.rs` pins each failure. In lopdf
+//! 0.34 one font on a page with no usable encoding (an Identity-H font with
+//! no ToUnicode, a ToUnicode CMap with multi-character ligature entries — both
+//! routine in Word, browser and LaTeX output) failed the *whole page*, and the
+//! error was swallowed into an empty string. It also never entered Form
+//! XObjects and ignored the `'`/`"` show operators. `pdf-extract` handles all
+//! of those; lopdf's `extract_text` is kept only as a per-page fallback.
+//!
+//! `pdf-extract` panics on some malformed input (`unwrap`/`expect`/`todo!`
+//! on font data), so each page runs under `catch_unwind` on its own: one bad
+//! page costs that page, never the document. On Android this crate is linked
+//! into the app, which is why `src-tauri`'s release profile must not set
+//! `panic = "abort"`.
 
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
 
+use lopdf::content::Content;
+use lopdf::{Dictionary, Document, Object, ObjectId};
 use serde_json::{json, Value};
 
 use crate::doc_store::{self, Extraction};
@@ -18,8 +36,8 @@ use crate::paths::{path_within_allowed, resolve};
 use crate::query_filter::filter_by_query;
 
 /// Hard cap on pages extracted in one call when no `end_page` is given — a
-/// 10,000-page PDF must not balloon the payload. Still large enough for any
-/// plausible interactive document.
+/// 10,000-page PDF must not balloon the payload. The response byte budget
+/// (`doc_store::RESPONSE_BUDGET_BYTES`) usually stops a read well before this.
 const PDF_MAX_PAGES: u32 = 100;
 /// Per-page text cap — an attack/malformed page can otherwise yield an
 /// effectively unbounded extracted string.
@@ -28,9 +46,82 @@ const PDF_MAX_PAGE_CHARS: usize = 50_000;
 /// (audit #120): `load` reads the whole file into memory, so a giant file
 /// must be rejected at the door. Same pattern as `fs.rs`'s `MAX_FILE_BYTES`.
 const PDF_MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
+/// The extractor-version salt for `doc_store` ids (see `doc_store::id_for`).
+/// Bump it whenever a change to extraction should replace records already on
+/// disk — the lopdf-era records were blank, and must never be served again.
+const PDF_EXTRACTOR: &str = "pdf-extract-0.12";
+/// How deep `scan_content` follows Form XObjects nested in Form XObjects.
+const MAX_FORM_DEPTH: u8 = 8;
 
-fn open(path: &Path) -> Result<lopdf::Document, lopdf::Error> {
-    lopdf::Document::load(path)
+/// Placed in the page body itself, not only in the response metadata, because
+/// `lean_doc_read_chunk` serves page bodies without that metadata — the note
+/// has to travel with the page.
+const NOTE_IMAGE_ONLY: &str =
+    "[No text layer: this page is an image, most likely a scan. Its text cannot be read without OCR.]";
+const NOTE_FAILED: &str = "[This page has text that could not be extracted — its font carries no \
+     usable character mapping. It is not an image.]";
+
+fn open(path: &Path) -> Result<Document, lopdf::Error> {
+    // lopdf 0.42 decrypts during `load` whenever the empty user password
+    // opens the file — the owner-password-only, permissions-restricted PDFs
+    // that every viewer opens without a prompt, and that 0.34 made this tool
+    // refuse as "password protected".
+    let mut doc = Document::load(path)?;
+    repair_to_unicode_cmaps(&mut doc);
+    Ok(doc)
+}
+
+/// Rewrite the one malformation in ToUnicode CMaps that both extractors
+/// reject outright: a destination above U+FFFF written as its bare code point
+/// (`<10780>`, five hex digits) instead of as a UTF-16 surrogate pair
+/// (`<D801DF80>`). MuPDF — and so every PDF PyMuPDF writes with an embedded
+/// font that has such glyphs, Arial included — emits exactly this. It is only
+/// a handful of entries in the whole map, but lopdf then discards the entire
+/// map and decodes glyph ids as if they were characters (garbage), and
+/// `pdf-extract`'s CMap parser panics.
+///
+/// Five hex digits is never a valid token here — every destination is whole
+/// UTF-16 units, so an even digit count — which is what makes the rewrite
+/// safe: nothing correct can match it.
+fn repair_to_unicode_cmaps(doc: &mut Document) {
+    use std::sync::OnceLock;
+    static BARE_ASTRAL: OnceLock<regex::bytes::Regex> = OnceLock::new();
+    let re = BARE_ASTRAL
+        .get_or_init(|| regex::bytes::Regex::new(r"<([0-9A-Fa-f]{5})>").expect("static regex"));
+
+    let cmap_ids: Vec<ObjectId> = doc
+        .objects
+        .values()
+        .filter_map(|o| o.as_dict().ok())
+        .filter(|d| d.has_type(b"Font"))
+        .filter_map(|d| d.get(b"ToUnicode").and_then(Object::as_reference).ok())
+        .collect();
+    for id in cmap_ids {
+        let Some(Object::Stream(stream)) = doc.objects.get_mut(&id) else {
+            continue;
+        };
+        let Ok(plain) = stream.get_plain_content() else {
+            continue;
+        };
+        if !re.is_match(&plain) {
+            continue;
+        }
+        let fixed = re.replace_all(&plain, |caps: &regex::bytes::Captures| {
+            let hex = std::str::from_utf8(&caps[1]).unwrap_or("0");
+            let cp = u32::from_str_radix(hex, 16).unwrap_or(0xFFFD);
+            let mut units = [0u16; 2];
+            let encoded = char::from_u32(cp)
+                .unwrap_or(char::REPLACEMENT_CHARACTER)
+                .encode_utf16(&mut units);
+            let mut out = String::from("<");
+            for unit in encoded.iter() {
+                out.push_str(&format!("{unit:04X}"));
+            }
+            out.push('>');
+            out.into_bytes()
+        });
+        stream.set_plain_content(fixed.into_owned());
+    }
 }
 
 /// Why an extraction couldn't be produced. `Stat` exists only to satisfy
@@ -57,11 +148,24 @@ impl PdfError {
                 "PDF_CORRUPT",
                 &format!("Cannot parse PDF: {e}"),
                 detail,
-                None,
+                // Desktop viewers silently rebuild a damaged cross-reference
+                // table, so "it opens fine for me" is expected here, and not a
+                // reason to retry this tool.
+                Some(
+                    "The file's internal structure is damaged. PDF viewers repair this on open, \
+                     so it may still display normally; re-saving or printing it to a new PDF \
+                     produces a readable copy.",
+                ),
             ),
-            PdfError::Encrypted => {
-                error_response("PDF_ENCRYPTED", "PDF is password protected", detail, None)
-            }
+            PdfError::Encrypted => error_response(
+                "PDF_ENCRYPTED",
+                "PDF is password protected",
+                detail,
+                Some(
+                    "It cannot be opened without its password. (PDFs that only restrict \
+                     printing or copying open without one and are read normally.)",
+                ),
+            ),
             PdfError::Stat(e) => error_response(
                 "PDF_READ_ERROR",
                 &format!("Cannot read PDF: {e}"),
@@ -70,6 +174,205 @@ impl PdfError {
             ),
         }
     }
+}
+
+/// One page's text, from whichever extractor read more of it. `None` only
+/// when both came back with no text at all.
+///
+/// `pdf-extract` is the primary: measured against PyMuPDF on a set of
+/// published PDFs it recovered 99–100% of words intact on every one, where
+/// lopdf 0.42 ranged from 44% to 99% (it glues or splits words when spacing is
+/// done by positioning). But `pdf-extract` silently skips the `'`/`"` show
+/// operators, which lopdf handles, so lopdf wins a page when it finds clearly
+/// more text — by a margin, so that near-ties go to the better word splitter.
+fn page_text(doc: &Document, pno: u32) -> Option<String> {
+    let primary = catch_unwind(AssertUnwindSafe(|| {
+        let mut s = String::new();
+        {
+            let mut out = pdf_extract::PlainTextOutput::new(&mut s);
+            pdf_extract::output_doc_page(doc, &mut out, pno).ok()?;
+        }
+        Some(s)
+    }))
+    .ok()
+    .flatten();
+    let fallback = catch_unwind(AssertUnwindSafe(|| doc.extract_text(&[pno]).ok()))
+        .ok()
+        .flatten();
+
+    let alnum = |s: &Option<String>| {
+        s.as_deref()
+            .map_or(0, |t| t.chars().filter(|c| c.is_alphanumeric()).count())
+    };
+    let (p, f) = (alnum(&primary), alnum(&fallback));
+    let chosen = if f > p + p / 8 + 4 { fallback } else { primary };
+    chosen.map(|t| normalize_text(&t)).filter(|t| !t.is_empty())
+}
+
+/// Make extracted text read and search the way it looks on the page.
+///
+/// Typographic ligatures come through as their presentation-form code points —
+/// `oﬃce` with U+FB03 — so a search for "office" missed every occurrence set
+/// in a font with ligatures, which is most body text from Word, browsers and
+/// LaTeX. They are expanded here. Runs of spaces (layout gaps, not content)
+/// collapse to one, lines lose trailing space, and blank-line runs collapse to
+/// a single blank line.
+fn normalize_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut blank_run = 0;
+    for line in text.lines() {
+        let mut clean = String::with_capacity(line.len());
+        let mut prev_space = false;
+        for c in line.chars() {
+            let expanded = match c {
+                '\u{FB00}' => "ff",
+                '\u{FB01}' => "fi",
+                '\u{FB02}' => "fl",
+                '\u{FB03}' => "ffi",
+                '\u{FB04}' => "ffl",
+                '\u{FB05}' | '\u{FB06}' => "st",
+                _ => {
+                    let space = c == ' ' || c == '\u{A0}' || c == '\t';
+                    if space {
+                        if !prev_space {
+                            clean.push(' ');
+                        }
+                    } else {
+                        clean.push(c);
+                    }
+                    prev_space = space;
+                    continue;
+                }
+            };
+            clean.push_str(expanded);
+            prev_space = false;
+        }
+        let clean = clean.trim_end();
+        if clean.is_empty() {
+            blank_run += 1;
+            if blank_run > 1 || out.is_empty() {
+                continue;
+            }
+        } else {
+            blank_run = 0;
+        }
+        out.push_str(clean);
+        out.push('\n');
+    }
+    out.trim().to_string()
+}
+
+/// Why a page produced no text. Decided from the page's own content, so the
+/// model is told which it is instead of being left to guess — a blank result
+/// was being read as "this PDF is a scanned image" even when it was text.
+#[derive(Debug, PartialEq)]
+enum EmptyPage {
+    /// Nothing drawn as text and nothing drawn as an image — a genuinely blank
+    /// page, or one whose lettering is vector outlines.
+    Blank,
+    /// Images and no text operators: a scan.
+    ImageOnly,
+    /// Text operators are present, but nothing could be decoded from them.
+    Failed,
+}
+
+#[derive(Default)]
+struct PageScan {
+    text_ops: bool,
+    images: bool,
+}
+
+fn classify_empty(doc: &Document, page_id: ObjectId) -> EmptyPage {
+    let mut scan = PageScan::default();
+    let resources = page_resources(doc, page_id);
+    if let Ok(content) = doc.get_page_content(page_id) {
+        scan_content(doc, &content, &resources, 0, &mut scan);
+    }
+    match (scan.text_ops, scan.images) {
+        (true, _) => EmptyPage::Failed,
+        (false, true) => EmptyPage::ImageOnly,
+        (false, false) => EmptyPage::Blank,
+    }
+}
+
+/// The page's resource dictionaries, own first, then inherited.
+fn page_resources(doc: &Document, page_id: ObjectId) -> Vec<&Dictionary> {
+    let Ok((own, inherited)) = doc.get_page_resources(page_id) else {
+        return Vec::new();
+    };
+    own.into_iter()
+        .chain(
+            inherited
+                .into_iter()
+                .filter_map(|id| doc.get_dictionary(id).ok()),
+        )
+        .collect()
+}
+
+fn scan_content(
+    doc: &Document,
+    content: &[u8],
+    resources: &[&Dictionary],
+    depth: u8,
+    scan: &mut PageScan,
+) {
+    let Ok(content) = Content::decode(content) else {
+        return;
+    };
+    for op in &content.operations {
+        match op.operator.as_str() {
+            "Tj" | "TJ" | "'" | "\"" => scan.text_ops = true,
+            // An inline image.
+            "BI" | "ID" | "EI" => scan.images = true,
+            "Do" => {
+                let Some(name) = op.operands.first().and_then(|o| o.as_name().ok()) else {
+                    continue;
+                };
+                let Some(xobject) = find_xobject(doc, resources, name) else {
+                    continue;
+                };
+                match xobject.dict.get(b"Subtype").and_then(Object::as_name) {
+                    Ok(b"Image") => scan.images = true,
+                    Ok(b"Form") if depth < MAX_FORM_DEPTH => {
+                        let Ok(inner) = xobject.decompressed_content() else {
+                            continue;
+                        };
+                        // A form's own /Resources win; without them it draws
+                        // with its parent's.
+                        let own = xobject
+                            .dict
+                            .get(b"Resources")
+                            .and_then(|r| doc.dereference(r))
+                            .and_then(|(_, r)| r.as_dict())
+                            .ok();
+                        let scoped: Vec<&Dictionary> =
+                            own.into_iter().chain(resources.iter().copied()).collect();
+                        scan_content(doc, &inner, &scoped, depth + 1, scan);
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        if scan.text_ops {
+            // Text operators decide the verdict on their own; stop early.
+            return;
+        }
+    }
+}
+
+fn find_xobject<'a>(
+    doc: &'a Document,
+    resources: &[&'a Dictionary],
+    name: &[u8],
+) -> Option<&'a lopdf::Stream> {
+    resources.iter().find_map(|res| {
+        let (_, xobjects) = doc.dereference(res.get(b"XObject").ok()?).ok()?;
+        let (_, obj) = doc
+            .dereference(xobjects.as_dict().ok()?.get(name).ok()?)
+            .ok()?;
+        obj.as_stream().ok()
+    })
 }
 
 /// Parse the PDF **once** and extract every page, plus its table of contents.
@@ -81,8 +384,17 @@ impl PdfError {
 /// rather than by `PDF_MAX_PAGES` — the latter is now purely a cap on how much
 /// one *response* carries, not on how much is ever read.
 fn extract_pages(resolved: &Path) -> Result<Extraction, PdfError> {
-    let doc = open(resolved).map_err(|e| PdfError::Corrupt(e.to_string()))?;
-    if doc.is_encrypted() {
+    let doc = open(resolved).map_err(|e| match e {
+        lopdf::Error::InvalidPassword => PdfError::Encrypted,
+        e => PdfError::Corrupt(e.to_string()),
+    })?;
+    // lopdf removes `/Encrypt` from the trailer once the empty password has
+    // opened the file, so one still there means it did not: this PDF really
+    // does need a password. Checked as any `/Encrypt`, not `is_encrypted()`,
+    // which only recognises an indirect reference — MuPDF writes the
+    // dictionary inline, and lopdf then loads such a file with *no objects at
+    // all*, which read as a successful, zero-page, empty document.
+    if doc.trailer.get(b"Encrypt").is_ok() {
         return Err(PdfError::Encrypted);
     }
 
@@ -97,17 +409,35 @@ fn extract_pages(resolved: &Path) -> Result<Extraction, PdfError> {
         Err(_) => Vec::new(),
     };
 
-    let total_pages = doc.get_pages().len();
+    let pages = doc.get_pages();
+    let total_pages = pages.len();
     let mut units = Vec::with_capacity(total_pages);
     let mut content_capped = false;
     let mut chars = 0usize;
-    for pno in 1..=total_pages as u32 {
-        let text = doc.extract_text(&[pno]).unwrap_or_default();
-        let mut page_text = text.trim().to_string();
-        if page_text.chars().count() > PDF_MAX_PAGE_CHARS {
-            content_capped = true;
-            page_text = truncate_chars(&page_text, PDF_MAX_PAGE_CHARS);
-        }
+    let mut image_only: Vec<u32> = Vec::new();
+    let mut failed: Vec<u32> = Vec::new();
+    for (&pno, &page_id) in &pages {
+        let page_text = match page_text(&doc, pno) {
+            Some(text) => {
+                let mut text = text.trim().to_string();
+                if text.chars().count() > PDF_MAX_PAGE_CHARS {
+                    content_capped = true;
+                    text = truncate_chars(&text, PDF_MAX_PAGE_CHARS);
+                }
+                text
+            }
+            None => match classify_empty(&doc, page_id) {
+                EmptyPage::Blank => String::new(),
+                EmptyPage::ImageOnly => {
+                    image_only.push(pno);
+                    NOTE_IMAGE_ONLY.to_string()
+                }
+                EmptyPage::Failed => {
+                    failed.push(pno);
+                    NOTE_FAILED.to_string()
+                }
+            },
+        };
         let unit = format!("--- Page {pno} ---\n{page_text}");
         chars = chars.saturating_add(unit.chars().count());
         units.push(unit);
@@ -116,18 +446,76 @@ fn extract_pages(resolved: &Path) -> Result<Extraction, PdfError> {
         }
     }
 
+    let mut diagnostics = serde_json::Map::new();
+    if !image_only.is_empty() {
+        diagnostics.insert("pages_image_only".into(), json!(image_only));
+    }
+    if !failed.is_empty() {
+        diagnostics.insert("pages_failed".into(), json!(failed));
+    }
+
     Ok(Extraction {
         units,
         outline,
         total_units: total_pages,
         content_capped,
+        diagnostics,
     })
+}
+
+/// A plain-language line for the response message, naming the pages that came
+/// back without text and why. `None` when every page had text.
+fn diagnostics_note(doc: &doc_store::StoredDoc) -> Option<String> {
+    let list = |key: &str| -> Vec<u64> {
+        doc.diagnostics
+            .get(key)
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_u64).collect())
+            .unwrap_or_default()
+    };
+    let fmt = |pages: &[u64]| {
+        let shown: Vec<String> = pages.iter().take(20).map(u64::to_string).collect();
+        let more = pages.len().saturating_sub(20);
+        if more > 0 {
+            format!("{} and {more} more", shown.join(", "))
+        } else {
+            shown.join(", ")
+        }
+    };
+    let image_only = list("pages_image_only");
+    let failed = list("pages_failed");
+    let mut parts = Vec::new();
+    if !image_only.is_empty() {
+        if image_only.len() == doc.total_units {
+            parts.push(
+                "Every page is an image with no text layer — this PDF is a scan, and its text \
+                 cannot be read without OCR."
+                    .to_string(),
+            );
+        } else {
+            parts.push(format!(
+                "Page(s) {} have no text layer (images, most likely scans); every other page is \
+                 real text.",
+                fmt(&image_only)
+            ));
+        }
+    }
+    if !failed.is_empty() {
+        parts.push(format!(
+            "Page(s) {} contain text that could not be extracted (a font with no character \
+             mapping) — they are not images.",
+            fmt(&failed)
+        ));
+    }
+    (!parts.is_empty()).then(|| parts.join(" "))
 }
 
 /// Shared entry: every PDF tool goes through the cache, so whichever one the
 /// model calls first pays the single parse and the rest are slices.
 fn cached_pdf(resolved: &Path) -> Result<doc_store::StoredDoc, String> {
-    match doc_store::ensure(resolved, doc_store::UNIT_PAGE, || extract_pages(resolved)) {
+    match doc_store::ensure(resolved, doc_store::UNIT_PAGE, PDF_EXTRACTOR, || {
+        extract_pages(resolved)
+    }) {
         Ok((doc, _persisted)) => Ok(doc),
         Err(e) => Err(e.into_response(resolved)),
     }
@@ -247,12 +635,17 @@ pub fn pdf_read_text(
     } else {
         &[]
     };
+    let note = diagnostics_note(&doc);
 
     if let Some(q) = query.filter(|q| !q.trim().is_empty()) {
-        let result = filter_by_query(extracted_pages, Some(q), 50, offset);
-        let message = result
-            .no_match
-            .then(|| format!("No direct matches for query '{q}'. Showing top section."));
+        let result = filter_by_query(extracted_pages, Some(q), 50, offset)
+            .fit_to_budget(offset, doc_store::RESPONSE_BUDGET_BYTES);
+        let message = join_messages([
+            result
+                .no_match
+                .then(|| format!("No direct matches for query '{q}'. Showing top section.")),
+            note,
+        ]);
         let mut meta = serde_json::Map::new();
         meta.insert("document_id".into(), json!(doc.document_id));
         meta.insert("start_page".into(), json!(s_page));
@@ -263,6 +656,7 @@ pub fn pdf_read_text(
         if let Some(next) = result.next_offset {
             meta.insert("next_offset".into(), json!(next));
         }
+        meta.extend(doc.diagnostics.clone());
         let any_truncated = truncated || result.truncated;
         return success_response(
             json!(result.items),
@@ -272,40 +666,82 @@ pub fn pdf_read_text(
         );
     }
 
-    let has_more = e_page < held_pages;
+    let (outline, outline_bytes) = doc_store::outline_for_window(&doc.outline, s_page == 1);
+    let fitted = doc_store::fit_to_budget(
+        extracted_pages,
+        doc_store::RESPONSE_BUDGET_BYTES.saturating_sub(outline_bytes),
+    );
+    // Where this response actually ends, which the byte budget can bring in
+    // well short of `e_page`.
+    let served_end = if extracted_pages.is_empty() {
+        e_page
+    } else {
+        s_page - 1 + fitted.items.len() as u32
+    };
+    let truncated = truncated || fitted.stopped_early || fitted.item_capped;
+    let has_more = served_end < held_pages;
     // The handle is the point: say plainly that the rest of the document is
     // one `lean_doc_read_chunk` away rather than leaving the model to guess
     // that re-calling with a new page range is cheap now.
-    let message = if doc.extraction_truncated {
+    let position = if doc.extraction_truncated {
         Some(format!(
             "Document is too large to extract in full: pages 1-{held_pages} of {total_pages} are \
              available. Read the rest with lean_doc_read_chunk using document_id, or narrow the \
              page range."
         ))
+    } else if fitted.stopped_early {
+        Some(format!(
+            "Showing pages {s_page}-{served_end} of {total_pages} — stopped there to stay within \
+             the response size limit. Read on with lean_doc_read_chunk (document_id, offset \
+             {served_end}) or search it with lean_doc_search."
+        ))
     } else if has_more {
         Some(format!(
-            "Showing pages {s_page}-{e_page} of {total_pages}. The whole document is already \
+            "Showing pages {s_page}-{served_end} of {total_pages}. The whole document is already \
              extracted and cached — read on with lean_doc_read_chunk (document_id, offset \
-             {e_page}) or search it with lean_doc_search."
+             {served_end}) or search it with lean_doc_search."
         ))
     } else {
         None
     };
+    let capped = fitted
+        .item_capped
+        .then(|| format!("Page {s_page} is longer than one response can carry and was cut short."));
+    let message = join_messages([position, capped, note]);
+
+    let mut meta = serde_json::Map::new();
+    meta.insert("document_id".into(), json!(doc.document_id));
+    meta.insert("unit".into(), json!(doc.unit));
+    meta.insert("start_page".into(), json!(s_page));
+    meta.insert("end_page".into(), json!(served_end));
+    meta.insert("total_pages".into(), json!(total_pages));
+    meta.insert("pages_available".into(), json!(held_pages));
+    meta.insert("has_more".into(), json!(has_more));
+    if has_more {
+        meta.insert("next_offset".into(), json!(served_end));
+    }
+    match outline {
+        Some(outline) => {
+            meta.insert("outline".into(), outline);
+        }
+        None if !doc.outline.is_empty() => {
+            meta.insert("outline_available".into(), json!(true));
+        }
+        None => {}
+    }
+    meta.extend(doc.diagnostics.clone());
     success_response(
-        json!(extracted_pages),
+        json!(fitted.items),
         message.as_deref(),
         truncated,
-        Some(json!({
-            "document_id": doc.document_id,
-            "unit": doc.unit,
-            "start_page": s_page,
-            "end_page": e_page,
-            "total_pages": total_pages,
-            "pages_available": held_pages,
-            "has_more": has_more,
-            "outline": doc.outline,
-        })),
+        Some(Value::Object(meta)),
     )
+}
+
+/// The non-empty parts of a response message, as one message.
+fn join_messages<const N: usize>(parts: [Option<String>; N]) -> Option<String> {
+    let parts: Vec<String> = parts.into_iter().flatten().collect();
+    (!parts.is_empty()).then(|| parts.join(" "))
 }
 
 pub fn pdf_read_outline(path: &str) -> String {

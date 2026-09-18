@@ -147,7 +147,8 @@ text (`scrape::markdown_to_text`).
 
 **`kitty-docs-web` is retired.** Its web tools moved to `kitty-web`; its PDF
 (PyMuPDF) and Excel (openpyxl) tools moved to `kitty-tools`, implemented on
-`lopdf` and `calamine` respectively (`plugins/kitty-tools/src/tools/{pdf,excel}.rs`).
+`pdf-extract`/`lopdf` and `calamine` respectively
+(`plugins/kitty-tools/src/tools/{pdf,excel}.rs`).
 Its Python source has been deleted, as have `replacement-mcp` and
 `brave-mcp-search` — the ports are verified and shipping, and git history
 holds the originals. Excel is read-only by

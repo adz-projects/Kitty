@@ -36,6 +36,63 @@ fn too_large_response(resolved: &std::path::Path) -> String {
     )
 }
 
+/// A text file's contents as a `String`, whatever it was saved as, plus the
+/// encoding it was read as and whether any bytes had to be replaced.
+///
+/// `read_to_string` refused anything that is not UTF-8, and two very common
+/// Windows text files are not: PowerShell 5.1's `>` and `Out-File` write
+/// UTF-16LE with a BOM, and older tools and Excel's "CSV" export write
+/// Windows-1252. Both came back as `FILE_READ_ERROR` — a readable text file
+/// the model could not read. BOMs are honoured; otherwise UTF-8 is tried
+/// first and anything that fails it is decoded lossily and flagged, so the
+/// model knows a character may have been replaced rather than trusting it.
+fn decode_text(bytes: &[u8]) -> (String, &'static str, bool) {
+    fn utf16(bytes: &[u8], le: bool) -> (String, bool) {
+        let units: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|c| {
+                if le {
+                    u16::from_le_bytes([c[0], c[1]])
+                } else {
+                    u16::from_be_bytes([c[0], c[1]])
+                }
+            })
+            .collect();
+        let odd = !bytes.len().is_multiple_of(2);
+        match String::from_utf16(&units) {
+            Ok(s) => (s, odd),
+            Err(_) => (String::from_utf16_lossy(&units), true),
+        }
+    }
+    if let Some(rest) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
+        return match String::from_utf8(rest.to_vec()) {
+            Ok(s) => (s, "utf-8-bom", false),
+            Err(_) => (
+                String::from_utf8_lossy(rest).into_owned(),
+                "utf-8-bom",
+                true,
+            ),
+        };
+    }
+    if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
+        let (s, lossy) = utf16(rest, true);
+        return (s, "utf-16le", lossy);
+    }
+    if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
+        let (s, lossy) = utf16(rest, false);
+        return (s, "utf-16be", lossy);
+    }
+    match std::str::from_utf8(bytes) {
+        Ok(s) => (s.to_string(), "utf-8", false),
+        // Not UTF-8 and no BOM: overwhelmingly Windows-1252 on this platform,
+        // whose printable range agrees with Latin-1 everywhere except
+        // 0x80-0x9F. Decoding as Latin-1 keeps every byte as *some*
+        // character (accented letters come out right) instead of replacing
+        // them all with U+FFFD; still flagged as lossy.
+        Err(_) => (bytes.iter().map(|&b| b as char).collect(), "latin-1", true),
+    }
+}
+
 pub fn file_read(
     path: &str,
     start_line: Option<i64>,
@@ -71,12 +128,23 @@ pub fn file_read(
     // it is that a text file gets a `document_id` on the same terms as a PDF
     // or a .docx, so one read loop (`lean_doc_read_chunk`/`lean_doc_search`)
     // works across every document kind instead of three per-kind paginations.
-    let doc = match doc_store::ensure(&resolved, doc_store::UNIT_LINE, || {
-        let text = std::fs::read_to_string(&resolved).map_err(|e| e.to_string())?;
+    let doc = match doc_store::ensure(&resolved, doc_store::UNIT_LINE, "", || {
+        let bytes = std::fs::read(&resolved).map_err(|e| e.to_string())?;
+        let (text, encoding, lossy) = decode_text(&bytes);
         // Stored raw and numbered on serve (`display_*` in `doc_store`): the
         // cache holds no `"N: "` prefixes, so it is smaller on disk and in
         // memory, and extraction skips a `format!` per line.
-        Ok::<_, String>(Extraction::new(py_splitlines(&text), Vec::new()))
+        let mut extraction = Extraction::new(py_splitlines(&text), Vec::new());
+        // Plain UTF-8 is the unremarkable case and says nothing.
+        if encoding != "utf-8" || lossy {
+            extraction
+                .diagnostics
+                .insert("encoding".into(), json!(encoding));
+        }
+        if lossy {
+            extraction.diagnostics.insert("lossy".into(), json!(true));
+        }
+        Ok::<_, String>(extraction)
     }) {
         Ok((doc, _persisted)) => doc,
         Err(e) => {
@@ -94,7 +162,8 @@ pub fn file_read(
         // Score the numbered display forms — the same text pre-numbered
         // records carried, so ranking (including its tie order) is unchanged.
         let numbered = doc_store::display_all(&doc);
-        let result = filter_by_query(&numbered, Some(q), 50, 0);
+        let result = filter_by_query(&numbered, Some(q), 50, 0)
+            .fit_to_budget(0, doc_store::RESPONSE_BUDGET_BYTES);
         let message = result
             .no_match
             .then(|| format!("No direct matches for query '{q}'. Showing top section."));
@@ -107,6 +176,25 @@ pub fn file_read(
         meta.insert("document_id".into(), json!(doc.document_id));
         meta.insert("total_lines".into(), json!(total_lines));
         meta.insert("filtered_by_query".into(), json!(q));
+        meta.insert("total_matches".into(), json!(result.total_matches));
+        // This tool takes no offset, so later matches are reached through the
+        // cached document instead: `lean_doc_search` runs the same ranking
+        // and does paginate. Without this, matches past the first page were
+        // simply unreachable from here.
+        let message = match result.next_offset {
+            Some(next) => {
+                meta.insert("next_offset".into(), json!(next));
+                Some(format!(
+                    "{}Showing {} of {} matching lines. For the rest, call lean_doc_search \
+                     (document_id, the same query, offset {next}).",
+                    message.map(|m| format!("{m} ")).unwrap_or_default(),
+                    result.items.len(),
+                    result.total_matches,
+                ))
+            }
+            None => message,
+        };
+        meta.extend(doc.diagnostics.clone());
         if start_line.is_some() || end_line.is_some() {
             meta.insert("line_range_ignored".into(), json!(true));
             meta.insert(
@@ -134,32 +222,55 @@ pub fn file_read(
     let actual_end = window_end.min(total_lines);
 
     // Numbered on serve: only the served slice pays for its `"N: "` prefixes.
-    let page: Vec<String> = if start_line <= actual_end && start_line <= total_lines {
+    let window: Vec<String> = if start_line <= actual_end && start_line <= total_lines {
         doc_store::display_range(&doc, start_line - 1, actual_end)
     } else {
         Vec::new()
     };
-    let has_more = actual_end < total_lines;
+    // An explicit `end_line` is not capped by count, and one minified line can
+    // be megabytes, so the byte budget applies here as everywhere else.
+    let fitted = doc_store::fit_to_budget(&window, doc_store::RESPONSE_BUDGET_BYTES);
+    let page = fitted.items;
+    let served_end = if window.is_empty() {
+        actual_end
+    } else {
+        start_line - 1 + page.len()
+    };
+    let has_more = served_end < total_lines;
 
-    let message = has_more.then(|| {
-        format!(
-            "Showing lines {start_line}-{actual_end} of {total_lines}. The whole file is already \
-             read and cached — continue with lean_doc_read_chunk (document_id, offset \
-             {actual_end}) or search it with lean_doc_search."
-        )
-    });
+    let message = if fitted.stopped_early || fitted.item_capped {
+        Some(format!(
+            "Showing lines {start_line}-{served_end} of {total_lines} — stopped there to stay \
+             within the response size limit{}. Continue with lean_doc_read_chunk (document_id, \
+             offset {served_end}) or search it with lean_doc_search.",
+            if fitted.item_capped {
+                format!(", and line {start_line} itself was cut short")
+            } else {
+                String::new()
+            }
+        ))
+    } else {
+        has_more.then(|| {
+            format!(
+                "Showing lines {start_line}-{served_end} of {total_lines}. The whole file is \
+                 already read and cached — continue with lean_doc_read_chunk (document_id, \
+                 offset {served_end}) or search it with lean_doc_search."
+            )
+        })
+    };
+    let mut meta = serde_json::Map::new();
+    meta.insert("document_id".into(), json!(doc.document_id));
+    meta.insert("unit".into(), json!(doc.unit));
+    meta.insert("start_line".into(), json!(start_line));
+    meta.insert("end_line".into(), json!(served_end));
+    meta.insert("total_lines".into(), json!(total_lines));
+    meta.insert("has_more".into(), json!(has_more));
+    meta.extend(doc.diagnostics.clone());
     success_response(
         json!(page.join("\n")),
         message.as_deref(),
-        has_more,
-        Some(json!({
-            "document_id": doc.document_id,
-            "unit": doc.unit,
-            "start_line": start_line,
-            "end_line": actual_end,
-            "total_lines": total_lines,
-            "has_more": has_more,
-        })),
+        has_more || fitted.item_capped,
+        Some(serde_json::Value::Object(meta)),
     )
 }
 

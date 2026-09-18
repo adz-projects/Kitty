@@ -501,10 +501,11 @@ for the whole daemon (`MCPServerManager::servers`), so the main agent and every
   commands unchanged.
 - **Accepted divergences** (documented, same spirit as the DDG-scrape/`htmd`
   substitutions):
-  - **PDF text layout**: `lopdf` does plain per-page `extract_text` with no
-    PyMuPDF markdown/layout pass, so text run/column order can differ from
-    the Python output. Outlines (`get_toc`) produce the same `{level, title,
-    page}` triples.
+  - **PDF text layout**: no PyMuPDF markdown/layout pass, so text
+    run/column order can differ from the Python output. Outlines (`get_toc`)
+    produce the same `{level, title, page}` triples. Text was originally
+    extracted with `lopdf`'s own `extract_text`, which turned out to lose most
+    real PDFs — see "PDF text extraction replaced" below.
   - **Excel reads `.xls`/`.ods` too** (broader than openpyxl), and
     integer-valued cells serialize as JSON integers (`1`, not `1.0`) to match
     openpyxl's Python `int`.
@@ -1212,3 +1213,90 @@ delegates rather than letting them spend on reports nobody will read.
 Running in the background only saves wall-clock time when the delegate and the
 parent are not queued on the same single-slot endpoint. A one-slot local server
 serves them in turn either way.
+
+## PDF text extraction replaced — `pdf-extract` 0.12 on `lopdf` 0.42
+
+Models kept reporting that text PDFs were "just images". Nothing in
+kitty-tools says so; the model was inferring it from pages that came back
+empty, and the empty pages were ours. `lean_pdf_read_text` ran lopdf 0.34's
+`extract_text` per page and swallowed its errors with `unwrap_or_default()`,
+and that function fails or misses text on nearly every PDF a real tool writes:
+
+- one font on the page without a usable encoding — an Identity-H font with no
+  ToUnicode, or a ToUnicode CMap with multi-character (ligature) entries — failed
+  the **whole page**;
+- Form XObjects (`Do`) were never entered, so a page whose content is wrapped
+  in one had text and returned none;
+- the `'`/`"` show operators were ignored;
+- `load` did not decrypt, so an owner-password-only PDF (restricted printing or
+  copying, opens without a prompt everywhere) loaded as **zero pages** and was
+  refused as "password protected".
+
+`tests/pdf_real_world.rs` pins each shape; every one of those tests failed on
+the old extractor. On published PDFs, with PyMuPDF as the reference, the old
+extractor returned 7 of 13 pages of an academic paper blank (45% of its text)
+and refused a 53-page restricted report outright.
+
+**Now** (`plugins/kitty-tools/src/tools/pdf.rs`):
+
+- `pdf-extract` 0.12 is the primary extractor. Against PyMuPDF it recovered
+  99–100% of words intact on every document measured, where lopdf 0.42's own
+  `extract_text` ranged 44–99% (it glues or splits words when spacing is done by
+  positioning). lopdf's extractor is kept as a per-page fallback, and wins a
+  page only when it finds clearly more text — `pdf-extract` silently skips the
+  `'`/`"` operators.
+- Each page runs under its own `catch_unwind`: `pdf-extract` has `unwrap`s and
+  `todo!`s on font data, and one bad page must cost that page only.
+- lopdf 0.42 decrypts during `load` whenever the empty user password opens the
+  file. A `/Encrypt` still in the trailer afterwards means a real password is
+  needed. MuPDF writes `/Encrypt` inline rather than as a reference, which lopdf
+  cannot open at all (it loads no objects); that is reported as encrypted rather
+  than returned as an empty document.
+- MuPDF also writes ToUnicode destinations above U+FFFF as bare five-digit hex
+  (`<10780>`) instead of surrogate pairs. Both CMap parsers reject the whole map
+  over it — lopdf then decodes glyph ids as characters, which is garbage —
+  so `repair_to_unicode_cmaps` rewrites those tokens after load.
+- Ligatures (U+FB00–FB06) are expanded, so a search for "office" finds text set
+  as `oﬃce`, and runs of layout spaces collapse.
+- A page that still has no text is classified from its content stream:
+  **image-only** (a scan: images and no text operators) or **failed** (text
+  operators whose font has no character mapping). Both are noted in the page
+  body itself — `lean_doc_read_chunk` serves page bodies without metadata — and
+  listed as `pages_image_only` / `pages_failed` with a plain-language message,
+  so the model is told which it is instead of guessing.
+- `doc_store` ids are salted with the extractor version (`PDF_EXTRACTOR`), so
+  the blank records the old extractor cached on disk are never served again.
+  Bump the salt whenever an extraction change should replace existing records.
+
+**Not handled:** a PDF whose cross-reference table is damaged. Viewers rebuild it
+silently on open; lopdf has no repair mode, so these still fail — now with a hint
+saying the file displays fine elsewhere and a re-saved copy will read.
+
+## Read responses fit the daemon's cap
+
+The daemon cuts every tool result at 100 KB (`MAX_TOOL_OUTPUT_BYTES`), and the
+envelope serializes `data` before `message` and `metadata`, so an oversized read
+lost exactly the `document_id`, `has_more` and `next_offset` the model needed to
+continue. Every default page size overran it on ordinary documents (100 PDF
+pages, 200 `lean_doc_read_chunk` units — which for a PDF is 200 pages — 200 Word
+paragraphs, 50 whole-page query hits, any explicit `end_line`).
+
+Every reader now stops at `doc_store::RESPONSE_BUDGET_BYTES` (80 KB of serialized
+text), says it stopped for size, and sets `next_offset` to where it stopped; a
+single unit larger than the budget is cut with a visible marker. The outline
+rides only on the first window (it used to repeat on every page of a paged
+read). `tests/response_budget.rs` reads a 200-page PDF end to end with default
+arguments and asserts every response fits and every page arrives exactly once.
+
+Also in this pass:
+
+- `lean_file_read` decodes UTF-16 (PowerShell 5.1's `>` writes UTF-16LE) and
+  falls back to Latin-1 for non-UTF-8 text, flagging `encoding`/`lossy`, instead
+  of failing with `FILE_READ_ERROR`. Its query path now reports
+  `total_matches`/`next_offset` and points at `lean_doc_search` for the rest.
+- `doc_store` keeps 100 records (was 20, which parallel specialists outran) and
+  a read refreshes a record's mtime, so pruning evicts what is idle rather than
+  what was extracted first.
+- `src-tauri`'s release profile no longer sets `panic = "abort"`. On Android
+  the daemon and its MCP servers are linked into the app, and `abort` silently
+  disabled all of their panic isolation — one panicking tool call closed Kitty.

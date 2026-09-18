@@ -288,7 +288,7 @@ as a tombstone if it comes to it.
 
 This is graceful degradation, not a blocker, and it is **not** a reason to
 reintroduce a Python runtime: `kitty-docs-web` is retired, and its PDF/Excel/web
-tools were reimplemented natively in Rust (`lopdf`, `calamine`, `scraper`+`htmd`)
+tools were reimplemented natively in Rust (`pdf-extract`/`lopdf`, `calamine`, `scraper`+`htmd`)
 precisely so no interpreter is needed. See §10 Phase 1 on `kitty-wasm`/wasmtime.
 
 ### 2.5 Desktop-only subsystems to gate (D23) — **DONE**

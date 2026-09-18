@@ -38,11 +38,14 @@ dirs = "5"
 # .xls/.ods, which openpyxl couldn't; the JSON envelope is unchanged.
 calamine = { version = "0.26", features = ["dates"] }
 # Pure-Rust PDF reading (`lean_pdf_read_text`/`lean_pdf_read_outline`), ported
-# from `kitty-docs-web`'s PyMuPDF usage. Text layout differs from PyMuPDF's
-# (lopdf does plain per-page text extraction, no markdown layout pass) — an
-# accepted divergence documented in docs/VERSIONS.md, same as kitty-web's
-# DDG-scrape/htmd substitutions.
-lopdf = "0.34"
+# from `kitty-docs-web`'s PyMuPDF usage. `pdf-extract` does the text; lopdf
+# parses, decrypts and supplies the outline, and its own `extract_text` is the
+# per-page fallback. lopdf 0.34's extractor alone returned most real PDFs blank
+# — see docs/VERSIONS.md, "PDF text extraction replaced". Keep lopdf on the
+# version `pdf-extract` uses so only one copy is linked. Default features off:
+# they pull in chrono/jiff/time/rayon, none of which this crate needs.
+lopdf = { version = "0.42", default-features = false }
+pdf-extract = "0.12"
 merman = { git = "https://github.com/Latias94/merman", rev = "4262b166faa7dcfcbebbf58dd6ea3e2ccc3630f7", version = "0.8.0-alpha.4", default-features = false, features = ["svg"] }
 
 [profile.release]

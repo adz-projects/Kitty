@@ -697,7 +697,7 @@ impl KittyToolsServer {
                 // Unzip and XML-parse once, cached by (path, len, mtime). This
                 // used to reparse the whole .docx on every paged call and then
                 // discard everything outside the window — see `doc_store`.
-                let doc = match doc_store::ensure(&resolved, doc_store::UNIT_PARAGRAPH, || {
+                let doc = match doc_store::ensure(&resolved, doc_store::UNIT_PARAGRAPH, "", || {
                     let paragraphs = docx::read_paragraphs(&resolved)?;
                     // Headings double as the outline, and they are already in
                     // hand here, so it costs nothing to carry them.
@@ -735,7 +735,8 @@ impl KittyToolsServer {
                 let offset = req.offset.unwrap_or(0) as usize;
 
                 if let Some(query) = req.query.as_deref().filter(|q| !q.trim().is_empty()) {
-                    let result = filter_by_query(texts, Some(query), 50, offset);
+                    let result = filter_by_query(texts, Some(query), 50, offset)
+                        .fit_to_budget(offset, doc_store::RESPONSE_BUDGET_BYTES);
                     let message = result.no_match.then(|| {
                         format!("No direct matches for query '{query}'. Showing top section.")
                     });
@@ -759,7 +760,16 @@ impl KittyToolsServer {
 
                 let limit = req.limit.unwrap_or(DEFAULT_PAGE_SIZE) as usize;
                 let total = texts.len();
-                let (page, has_more) = doc_store::window_slice(texts, offset, limit);
+                let (window, _) = doc_store::window_slice(texts, offset, limit);
+                let (outline, outline_bytes) =
+                    doc_store::outline_for_window(&doc.outline, offset == 0);
+                let fitted = doc_store::fit_to_budget(
+                    window,
+                    doc_store::RESPONSE_BUDGET_BYTES.saturating_sub(outline_bytes),
+                );
+                let page = fitted.items;
+                let next = offset.min(total) + page.len();
+                let has_more = next < total;
                 let mut metadata = json!({
                     "read_method": "xml_scan",
                     "document_id": doc.document_id,
@@ -767,22 +777,39 @@ impl KittyToolsServer {
                     "offset": offset,
                     "total_paragraphs": total,
                     "has_more": has_more,
-                    "outline": doc.outline,
                 });
+                match outline {
+                    Some(outline) => metadata["outline"] = outline,
+                    None if !doc.outline.is_empty() => {
+                        metadata["outline_available"] = json!(true);
+                    }
+                    None => {}
+                }
                 let message = if has_more {
-                    metadata["next_offset"] = json!(offset + page.len());
+                    metadata["next_offset"] = json!(next);
+                    // 1-based for the reader; `offset`/`next_offset` stay
+                    // 0-based indices, which is what the tools take.
+                    let limit_note = if fitted.stopped_early {
+                        " — stopped there to stay within the response size limit"
+                    } else {
+                        ""
+                    };
                     Some(format!(
-                        "Showing paragraphs {}-{} of {total}. The whole document is already \
-                     extracted and cached — continue with lean_doc_read_chunk (document_id, \
-                     offset {}) or search it with lean_doc_search.",
-                        offset,
-                        offset + page.len(),
-                        offset + page.len()
+                        "Showing paragraphs {}-{next} of {total}{limit_note}. The whole \
+                         document is already extracted and cached — continue with \
+                         lean_doc_read_chunk (document_id, offset {next}) or search it with \
+                         lean_doc_search.",
+                        offset + 1,
                     ))
                 } else {
                     None
                 };
-                success_response(json!(page), message.as_deref(), has_more, Some(metadata))
+                success_response(
+                    json!(page),
+                    message.as_deref(),
+                    has_more || fitted.item_capped,
+                    Some(metadata),
+                )
             })
         })
         .await
@@ -803,7 +830,14 @@ impl KittyToolsServer {
                 let limit = req.limit.unwrap_or(DEFAULT_PAGE_SIZE) as usize;
                 // Numbered on serve for raw-line records; legacy and non-line
                 // records pass through unchanged.
-                let (page, has_more) = doc_store::display_window(&doc, offset, limit);
+                let (window, _) = doc_store::display_window(&doc, offset, limit);
+                // 200 units is the count default, but for a PDF a unit is a
+                // page: 200 pages overran the daemon's 100 KB cut on any
+                // ordinary document and lost this metadata with it.
+                let fitted = doc_store::fit_to_budget(&window, doc_store::RESPONSE_BUDGET_BYTES);
+                let page = fitted.items;
+                let next = offset.min(doc.stored_units()) + page.len();
+                let has_more = next < doc.stored_units();
 
                 let mut metadata = json!({
                     "document_id": doc.document_id,
@@ -815,12 +849,23 @@ impl KittyToolsServer {
                     "has_more": has_more,
                 });
                 if has_more {
-                    metadata["next_offset"] = json!(offset + page.len());
+                    metadata["next_offset"] = json!(next);
                 }
+                if let Some(meta) = metadata.as_object_mut() {
+                    meta.extend(doc.diagnostics.clone());
+                }
+                let message = fitted.stopped_early.then(|| {
+                    format!(
+                        "Returned {} {}(s) — stopped there to stay within the response size \
+                         limit. Continue from offset {next}.",
+                        page.len(),
+                        doc.unit
+                    )
+                });
                 success_response(
                     json!(page),
-                    None,
-                    has_more || doc.extraction_truncated,
+                    message.as_deref(),
+                    has_more || doc.extraction_truncated || fitted.item_capped,
                     Some(metadata),
                 )
             })
@@ -850,7 +895,8 @@ impl KittyToolsServer {
             // Search scores the numbered display forms, matching what
             // pre-numbered records carried before raw-line storage.
             let numbered = doc_store::display_all(&doc);
-            let result = filter_by_query(&numbered, Some(&req.query), 50, offset);
+            let result = filter_by_query(&numbered, Some(&req.query), 50, offset)
+                .fit_to_budget(offset, doc_store::RESPONSE_BUDGET_BYTES);
             let message = result.no_match.then(|| {
                 format!(
                     "No direct matches for query '{}'. Showing top section.",

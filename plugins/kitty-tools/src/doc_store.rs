@@ -39,7 +39,30 @@ pub const UNIT_LINE: &str = "line";
 /// `kitty-web`'s `MAX_OFFLOAD_FILES`: enough that a working set of documents
 /// stays warm across a conversation, small enough that the cache directory
 /// can't grow without limit.
-const MAX_STORED_DOCS: usize = 20;
+///
+/// Was 20, which parallel specialists outran: three delegates each opening a
+/// handful of documents pruned a handle another was still reading in a loop,
+/// and its next `lean_doc_read_chunk` failed with `DOC_NOT_FOUND` part-way
+/// through. Pruning is also least-recently-*used* now — see `touch`.
+const MAX_STORED_DOCS: usize = 100;
+
+/// How much document text one read response may carry, in serialized JSON
+/// bytes.
+///
+/// The daemon cuts every tool result at 100 KB (`MAX_TOOL_OUTPUT_BYTES` in
+/// `BigTinyV2/daemon/src/mcp/tools.rs`), and it cuts blind: the envelope
+/// serializes `data` before `message` and `metadata`, so an oversized read
+/// lost exactly the parts that say how to continue — the `document_id`,
+/// `has_more`, `next_offset` — and left the model holding a torn JSON
+/// fragment. Every default page size here (100 PDF pages, 200 chunk units, 200
+/// paragraphs) could overflow it on an ordinary document. So each reader stops
+/// at this budget instead and says where it stopped. The ~20 KB of headroom is
+/// for the pretty-printed envelope and metadata.
+pub const RESPONSE_BUDGET_BYTES: usize = 80 * 1024;
+
+/// An outline larger than this is left out of a read response rather than
+/// spent against its budget; `lean_pdf_read_outline` still returns it whole.
+pub const OUTLINE_INLINE_MAX_BYTES: usize = 16 * 1024;
 
 /// Ceiling on the total extracted text held for one document.
 ///
@@ -79,6 +102,11 @@ pub struct StoredDoc {
     /// written before the change, which therefore read back as 0.
     #[serde(default)]
     pub format_version: u32,
+    /// Extractor findings worth passing on with every read — for a PDF, which
+    /// pages have no text layer and which failed to extract. Merged into the
+    /// response metadata as-is.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub diagnostics: serde_json::Map<String, Value>,
     len: u64,
     mtime_nanos: u128,
 }
@@ -152,15 +180,38 @@ fn fingerprint(resolved: &Path) -> Option<(u64, u128)> {
 }
 
 /// The id for a file's current contents. Same file, unchanged → same id.
-fn id_for(resolved: &Path, unit: &str, len: u64, mtime_nanos: u128) -> String {
+///
+/// `extractor` names the version of the code that produced the record. The
+/// fingerprint only says the *file* is unchanged; a record extracted by an
+/// older, broken extractor is just as fresh by that measure. Without this,
+/// fixing the PDF extractor would have changed nothing for any PDF a user had
+/// already tried: its blank pages were cached on disk under an id the new
+/// code would compute identically. Bumping the string moves every record of
+/// that kind to a new id, and the old ones age out through pruning. Empty for
+/// readers that have never needed a bump, which keeps their ids unchanged.
+fn id_for(resolved: &Path, unit: &str, extractor: &str, len: u64, mtime_nanos: u128) -> String {
     // `unit` is in the key so two readers over the same bytes (a `.docx` read
     // as paragraphs, the same path read as lines) can't collide on one record
     // and serve each other's units.
-    let key = format!(
+    let mut key = format!(
         "{}\u{1f}{unit}\u{1f}{len}\u{1f}{mtime_nanos}",
         resolved.to_string_lossy()
     );
+    if !extractor.is_empty() {
+        key.push('\u{1f}');
+        key.push_str(extractor);
+    }
     format!("{:016x}", fnv1a(key.as_bytes()))
+}
+
+/// Mark a record as just used, so `prune_old_records` — which keeps the newest
+/// by mtime — keeps the documents being *read*, not only those most recently
+/// extracted. Best-effort: failing to touch costs nothing but an earlier
+/// eviction.
+fn touch(path: &Path) {
+    if let Ok(f) = std::fs::File::options().write(true).open(path) {
+        let _ = f.set_modified(std::time::SystemTime::now());
+    }
 }
 
 /// Drop all but the newest `MAX_STORED_DOCS - 1` records, leaving room for the
@@ -195,7 +246,9 @@ pub fn load(document_id: &str) -> Result<StoredDoc, LoadError> {
         return Err(LoadError::NotFound);
     }
     let raw = std::fs::read_to_string(&path).map_err(|e| LoadError::Unreadable(e.to_string()))?;
-    serde_json::from_str(&raw).map_err(|e| LoadError::Unreadable(e.to_string()))
+    let doc = serde_json::from_str(&raw).map_err(|e| LoadError::Unreadable(e.to_string()))?;
+    touch(&path);
+    Ok(doc)
 }
 
 /// The extracted form of a document: its units, its outline, and the real unit
@@ -211,6 +264,8 @@ pub struct Extraction {
     /// PDF page past `PDF_MAX_PAGE_CHARS`, say). Distinct from stopping early:
     /// every unit is present, but one of them is short.
     pub content_capped: bool,
+    /// See `StoredDoc::diagnostics`.
+    pub diagnostics: serde_json::Map<String, Value>,
 }
 
 impl Extraction {
@@ -222,6 +277,7 @@ impl Extraction {
             outline,
             total_units,
             content_capped: false,
+            diagnostics: serde_json::Map::new(),
         }
     }
 }
@@ -237,14 +293,21 @@ impl Extraction {
 /// `StoredDoc` being served from memory anyway: extraction succeeded, so the
 /// caller's own read is answered in full. What the caller must not do is
 /// advertise the `document_id` — see `persisted`.
-pub fn ensure<F, E>(resolved: &Path, unit: &str, extract: F) -> Result<(StoredDoc, bool), E>
+///
+/// `extractor` is the extractor-version salt described on `id_for`.
+pub fn ensure<F, E>(
+    resolved: &Path,
+    unit: &str,
+    extractor: &str,
+    extract: F,
+) -> Result<(StoredDoc, bool), E>
 where
     F: FnOnce() -> Result<Extraction, E>,
     E: From<String>,
 {
     let (len, mtime_nanos) =
         fingerprint(resolved).ok_or_else(|| E::from("could not stat the document".to_string()))?;
-    let document_id = id_for(resolved, unit, len, mtime_nanos);
+    let document_id = id_for(resolved, unit, extractor, len, mtime_nanos);
 
     if let Ok(hit) = load(&document_id) {
         if hit.len == len && hit.mtime_nanos == mtime_nanos {
@@ -263,6 +326,7 @@ where
         format_version: STORED_FORMAT_VERSION,
         units: extraction.units,
         outline: extraction.outline,
+        diagnostics: extraction.diagnostics,
         len,
         mtime_nanos,
     };
@@ -374,6 +438,97 @@ pub fn window(units: &[String], offset: usize, limit: usize) -> (Vec<String>, bo
     (page.to_vec(), has_more)
 }
 
+/// The outline to attach to a read response, and what it costs against the
+/// response budget.
+///
+/// Only on the first window of a document: the outline used to ride along on
+/// *every* page of a paged read, so a long document with a large table of
+/// contents paid for it again on each chunk. And not at all when it is large
+/// enough to crowd out the text — `outline_available` then tells the caller it
+/// exists and where to get it.
+pub fn outline_for_window(outline: &[Value], first_window: bool) -> (Option<Value>, usize) {
+    if !first_window {
+        return (None, 0);
+    }
+    let value = Value::Array(outline.to_vec());
+    let size = serde_json::to_string(&value).map(|s| s.len()).unwrap_or(0);
+    if size > OUTLINE_INLINE_MAX_BYTES {
+        return (None, 0);
+    }
+    (Some(value), size)
+}
+
+/// What survived `fit_to_budget`.
+pub struct Fitted {
+    pub items: Vec<String>,
+    /// Fewer items were kept than offered, because the budget ran out.
+    pub stopped_early: bool,
+    /// The first item alone was over budget and was cut short.
+    pub item_capped: bool,
+}
+
+/// Keep items, in order, while their serialized size fits `budget` bytes.
+///
+/// Measured as JSON string literals, since that is what the daemon's cap
+/// counts: a page of newlines and quotes costs more on the wire than its UTF-8
+/// length, and CJK text costs three bytes a character. The first item is
+/// always kept — a response that returns nothing and says "read on" would
+/// loop forever — and is cut to fit if it alone is too large.
+pub fn fit_to_budget<S: AsRef<str>>(items: &[S], budget: usize) -> Fitted {
+    let mut out = Vec::new();
+    let mut used = 0usize;
+    for item in items {
+        let item = item.as_ref();
+        // + the separator and pretty-print indent each array element costs.
+        let cost = json_len(item) + 8;
+        if used + cost > budget {
+            if out.is_empty() {
+                out.push(cap_json_len(item, budget));
+                return Fitted {
+                    stopped_early: items.len() > 1,
+                    items: out,
+                    item_capped: true,
+                };
+            }
+            return Fitted {
+                items: out,
+                stopped_early: true,
+                item_capped: false,
+            };
+        }
+        used += cost;
+        out.push(item.to_string());
+    }
+    Fitted {
+        items: out,
+        stopped_early: false,
+        item_capped: false,
+    }
+}
+
+/// Serialized length of `s` as a JSON string literal, quotes included.
+pub fn json_len(s: &str) -> usize {
+    serde_json::to_string(s).map(|j| j.len()).unwrap_or(s.len())
+}
+
+/// `s` shortened, at a character boundary, until its JSON form fits `budget`,
+/// with a visible marker. Halving from the byte length converges in a few
+/// steps even for escape-heavy text.
+fn cap_json_len(s: &str, budget: usize) -> String {
+    const MARKER: &str = "… [cut to fit the response limit]";
+    let room = budget.saturating_sub(MARKER.len() + 16);
+    let mut end = room.min(s.len());
+    loop {
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end == 0 || json_len(&s[..end]) <= room {
+            return format!("{}{MARKER}", &s[..end]);
+        }
+        end /= 2;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -390,18 +545,18 @@ mod tests {
         let f = dir.join("a.txt");
         std::fs::write(&f, "one").unwrap();
         let (len, mtime) = fingerprint(&f).unwrap();
-        let first = id_for(&f, UNIT_LINE, len, mtime);
+        let first = id_for(&f, UNIT_LINE, "", len, mtime);
         assert_eq!(
             first,
-            id_for(&f, UNIT_LINE, len, mtime),
+            id_for(&f, UNIT_LINE, "", len, mtime),
             "same input, same id"
         );
 
         // A different fingerprint is a different document.
-        assert_ne!(first, id_for(&f, UNIT_LINE, len + 1, mtime));
-        assert_ne!(first, id_for(&f, UNIT_LINE, len, mtime + 1));
+        assert_ne!(first, id_for(&f, UNIT_LINE, "", len + 1, mtime));
+        assert_ne!(first, id_for(&f, UNIT_LINE, "", len, mtime + 1));
         // ...and so is the same bytes read as a different kind of unit.
-        assert_ne!(first, id_for(&f, UNIT_PARAGRAPH, len, mtime));
+        assert_ne!(first, id_for(&f, UNIT_PARAGRAPH, "", len, mtime));
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -412,7 +567,7 @@ mod tests {
         let f = dir.join("b.txt");
         std::fs::write(&f, "x").unwrap();
         let (len, mtime) = fingerprint(&f).unwrap();
-        assert!(is_well_formed_id(&id_for(&f, UNIT_PAGE, len, mtime)));
+        assert!(is_well_formed_id(&id_for(&f, UNIT_PAGE, "", len, mtime)));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -446,7 +601,7 @@ mod tests {
         std::fs::write(&f, "hello").unwrap();
 
         let mut calls = 0;
-        let (first, persisted) = ensure::<_, String>(&f, UNIT_LINE, || {
+        let (first, persisted) = ensure::<_, String>(&f, UNIT_LINE, "", || {
             calls += 1;
             Ok(Extraction::new(vec!["1: hello".into()], vec![]))
         })
@@ -456,7 +611,7 @@ mod tests {
         assert_eq!(first.units, vec!["1: hello".to_string()]);
 
         // Second call: same fingerprint, so the extractor must not run again.
-        let (second, _) = ensure::<_, String>(&f, UNIT_LINE, || {
+        let (second, _) = ensure::<_, String>(&f, UNIT_LINE, "", || {
             calls += 1;
             Ok(Extraction::new(vec!["SHOULD NOT RUN".into()], vec![]))
         })
@@ -476,7 +631,7 @@ mod tests {
         let dir = scratch("edit");
         let f = dir.join("d.txt");
         std::fs::write(&f, "before").unwrap();
-        let (first, _) = ensure::<_, String>(&f, UNIT_LINE, || {
+        let (first, _) = ensure::<_, String>(&f, UNIT_LINE, "", || {
             Ok(Extraction::new(vec!["before".into()], vec![]))
         })
         .unwrap();
@@ -484,7 +639,7 @@ mod tests {
         // A same-length edit — length alone would not notice this one.
         std::thread::sleep(std::time::Duration::from_millis(10));
         std::fs::write(&f, "afterX").unwrap();
-        let (second, _) = ensure::<_, String>(&f, UNIT_LINE, || {
+        let (second, _) = ensure::<_, String>(&f, UNIT_LINE, "", || {
             Ok(Extraction::new(vec!["afterX".into()], vec![]))
         })
         .unwrap();
@@ -507,11 +662,12 @@ mod tests {
             outline: vec![],
             total_units: 600,
             content_capped: false,
+            diagnostics: serde_json::Map::new(),
         };
         let dir = scratch("short");
         let f = dir.join("e.pdf");
         std::fs::write(&f, "x").unwrap();
-        let (doc, _) = ensure::<_, String>(&f, UNIT_PAGE, || Ok(e)).unwrap();
+        let (doc, _) = ensure::<_, String>(&f, UNIT_PAGE, "", || Ok(e)).unwrap();
         assert!(doc.extraction_truncated);
         assert_eq!(doc.total_units, 600);
         assert_eq!(doc.stored_units(), 2);
@@ -534,6 +690,7 @@ mod tests {
             outline: vec![],
             extraction_truncated: false,
             format_version: STORED_FORMAT_VERSION,
+            diagnostics: serde_json::Map::new(),
             len: 0,
             mtime_nanos: 0,
         };
@@ -584,8 +741,100 @@ mod tests {
         let dir = scratch("fail");
         let f = dir.join("f.txt");
         std::fs::write(&f, "x").unwrap();
-        let err: String = ensure(&f, UNIT_LINE, || Err("boom".to_string())).unwrap_err();
+        let err: String = ensure(&f, UNIT_LINE, "", || Err("boom".to_string())).unwrap_err();
         assert_eq!(err, "boom");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Bumping the extractor salt must move a document to a new id, so a
+    /// record written by a broken extractor is never served to the fixed one.
+    #[test]
+    fn an_extractor_bump_is_a_different_document() {
+        let dir = scratch("salt");
+        let f = dir.join("g.pdf");
+        std::fs::write(&f, "x").unwrap();
+        let (len, mtime) = fingerprint(&f).unwrap();
+        let unsalted = id_for(&f, UNIT_PAGE, "", len, mtime);
+        let v1 = id_for(&f, UNIT_PAGE, "v1", len, mtime);
+        assert_ne!(unsalted, v1);
+        assert_ne!(v1, id_for(&f, UNIT_PAGE, "v2", len, mtime));
+
+        let (old, _) = ensure::<_, String>(&f, UNIT_PAGE, "", || {
+            Ok(Extraction::new(vec!["".into()], vec![]))
+        })
+        .unwrap();
+        let (new, _) = ensure::<_, String>(&f, UNIT_PAGE, "v1", || {
+            Ok(Extraction::new(vec!["real text".into()], vec![]))
+        })
+        .unwrap();
+        assert_eq!(
+            new.units,
+            vec!["real text".to_string()],
+            "the stale record was served"
+        );
+
+        std::fs::remove_file(record_path(&old.document_id)).ok();
+        std::fs::remove_file(record_path(&new.document_id)).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A read refreshes the record, so pruning evicts what is idle rather than
+    /// what happened to be extracted first.
+    #[test]
+    fn loading_a_record_marks_it_recently_used() {
+        let dir = scratch("touch");
+        let f = dir.join("h.txt");
+        std::fs::write(&f, "x").unwrap();
+        let (doc, _) = ensure::<_, String>(&f, UNIT_LINE, "", || {
+            Ok(Extraction::new(vec!["x".into()], vec![]))
+        })
+        .unwrap();
+        let path = record_path(&doc.document_id);
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+
+        load(&doc.document_id).unwrap();
+        let after = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert!(
+            after > old + std::time::Duration::from_secs(60),
+            "load did not touch"
+        );
+
+        std::fs::remove_file(path).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn fit_to_budget_stops_at_whole_items_and_always_keeps_one() {
+        let items: Vec<String> = (0..10).map(|_| "a".repeat(100)).collect();
+        let f = fit_to_budget(&items, 350);
+        assert_eq!(f.items.len(), 3);
+        assert!(f.stopped_early);
+        assert!(!f.item_capped);
+
+        let f = fit_to_budget(&items, 100_000);
+        assert_eq!(f.items.len(), 10);
+        assert!(!f.stopped_early);
+
+        // One item bigger than the whole budget is cut, not dropped.
+        let huge = vec!["\"quoted\"\n".repeat(10_000)];
+        let f = fit_to_budget(&huge, 1_000);
+        assert_eq!(f.items.len(), 1);
+        assert!(f.item_capped);
+        assert!(json_len(&f.items[0]) <= 1_000, "{}", json_len(&f.items[0]));
+        assert!(f.items[0].ends_with("[cut to fit the response limit]"));
+    }
+
+    /// Budget is JSON bytes, not characters: CJK is three bytes a character.
+    #[test]
+    fn fit_to_budget_counts_multibyte_text_by_its_encoded_size() {
+        let items: Vec<String> = (0..10).map(|_| "漢".repeat(100)).collect();
+        let f = fit_to_budget(&items, 1_000);
+        assert_eq!(f.items.len(), 3, "300 bytes each");
     }
 }

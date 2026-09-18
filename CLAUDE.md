@@ -82,7 +82,7 @@ has been deleted. Full detail in
   workspace, 5 file, 3 Word, 2 Excel, 2 PDF, 4 scratchpad, 4 cache, 2
   document-handle (always on; this is the retired `replacement-mcp`'s full
   surface plus `kitty-docs-web`'s PDF/Excel tools, now hand-rolled in Rust on
-  `lopdf`/`calamine` — **on by default**, since they're what makes the small
+  `pdf-extract`+`lopdf`/`calamine` — **on by default**, since they're what makes the small
   local models Kitty targets usable as agents at all), plus 3 accessible
   table/chart/Mermaid visualization tools, gated by their own Settings
   toggle (an env var on this one process, not a separate server).

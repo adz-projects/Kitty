@@ -66,6 +66,25 @@ pub struct QueryFilterResult {
     pub no_match: bool,
 }
 
+impl QueryFilterResult {
+    /// Trim `items` to the response byte budget (`doc_store::fit_to_budget`),
+    /// moving `next_offset` back to the first item not returned. `offset` is
+    /// the one this result was computed with.
+    ///
+    /// Fifty hits is the count cap, but a hit can be a whole PDF page, so
+    /// fifty of them overran the daemon's 100 KB cut and lost the metadata
+    /// that says how to continue.
+    pub fn fit_to_budget(mut self, offset: usize, budget: usize) -> Self {
+        let fitted = crate::doc_store::fit_to_budget(&self.items, budget);
+        if fitted.stopped_early {
+            self.next_offset = Some(offset + fitted.items.len());
+        }
+        self.truncated |= fitted.stopped_early || fitted.item_capped;
+        self.items = fitted.items;
+        self
+    }
+}
+
 fn page(
     items: &[String],
     offset: usize,

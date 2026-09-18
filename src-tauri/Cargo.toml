@@ -117,8 +117,15 @@ bigtiny2_daemon = { path = "../BigTinyV2/daemon", features = ["litert-embed"] }
 mockito = "1"
 tempfile = "3"
 
+# `panic` is deliberately left at `unwind`. On Android the BigTiny daemon and
+# its MCP servers (kitty-tools, kitty-web, kitty-wasm) are linked *into* this
+# binary, and panic strategy is per-binary: `abort` here silently disabled all
+# of their panic isolation — the daemon's per-turn tokio task isolation and
+# tower-http `catch-panic`, and kitty-tools' per-call `catch_unwind` — so one
+# panicking tool call (a malformed PDF, say) closed the whole app instead of
+# failing that call. See `BigTinyV2/daemon/Cargo.toml`, which makes the same
+# choice for the same reason.
 [profile.release]
-panic = "abort"
 codegen-units = 1
 lto = true
 opt-level = "s"
