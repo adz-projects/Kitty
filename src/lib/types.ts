@@ -31,6 +31,10 @@ export interface Config {
       pinned tag shared by every user regardless of chat provider, so learned
       vectors live in the same space. */
   adaptive_pathway_embedding_model: string;
+  /** Whether the in-process declarative factual-memory (memorabilia) engine,
+      linked into the BigTiny daemon alongside pathway, is active for this
+      install. Off by default; reuses pathway's shared embedding model. */
+  memorabilia_enabled: boolean;
   /** Whether local inference (Ollama) is in play for this install — set by
       the wizard's first-screen fork, toggleable later from Advanced. */
   ollama_enabled: boolean;
@@ -611,6 +615,37 @@ export interface PathwayStats {
     pending: number;
     current_model: string;
   };
+}
+
+/** Connection status of the in-process `"memorabilia"` MCP server — whether
+    the model can call `memorabilia_search` / `memorabilia_read_item`. Same
+    shape as `AdaptivePathwayMcpStatus`. */
+export interface MemorabiliaMcpStatus {
+  status: string;
+  error_message: string | null;
+  tool_count: number;
+}
+
+/** A single factual-memory item (active proposition), as returned by
+    `GET /api/memorabilia/items`
+    (`BigTinyV2/daemon/src/routes/memorabilia.rs::list_items`). */
+export interface MemorabiliaItem {
+  id: string;
+  claim: string;
+  confidence: number;
+  disputed: boolean;
+  importance: string;
+  urgency: string;
+  created_at: string;
+}
+
+/** `GET /api/memorabilia/stats` result — counts for the health readout. */
+export interface MemorabiliaStats {
+  active: number;
+  archived: number;
+  disputed: number;
+  chunks_active: number;
+  by_importance: Record<string, number>;
 }
 
 // --- Chat / ACP (Phase 2) --- mirrors src-tauri/src/commands SessionInfo + events

@@ -5,16 +5,16 @@ import { useAdaptivePathwayStore } from '@/stores/adaptivePathwayStore';
 import { LightbulbIcon } from '@/components/icons/LightbulbIcon';
 import { PauseIcon } from '@/components/icons/PauseIcon';
 
-/** Per-session incognito toggle for the behavioral-memory (pathway) engine.
-    Repurposed from the old tool-hint-era "pause suggestions" toggle
-    (Round-C) — same button, same store-backed visibility gate, new meaning:
-    paused now means "don't recall or record beliefs for this session" (the
-    engine's `conversation_state.paused` flag via
-    `ipc.setPathwaySessionPaused`), not "suppress hint badges" (that whole
-    hint-badge UI is retired, see `HintBadge`/`HintFeedbackButtons`/
-    `NudgeConsentPrompt`'s deletion).
+/** Per-session incognito toggle for Kitty's memory — a single control that
+    pauses *both* memory engines for this session: behavioral (pathway) and
+    factual (memorabilia). Paused means "don't recall or write memory for this
+    session" — the pathway engine's `conversation_state.paused` flag via
+    `ipc.setPathwaySessionPaused` and memorabilia's `session_pause` flag via
+    `ipc.setMemorabiliaSessionPaused`. (Repurposed from the old tool-hint-era
+    "pause suggestions" toggle — that hint-badge UI is retired, see
+    `HintBadge`/`HintFeedbackButtons`/`NudgeConsentPrompt`'s deletion.)
 
-    Visible whenever the pathway MCP server is actually connected+registered
+    Visible whenever *either* memory engine's MCP server is connected+registered
     (`useAdaptivePathwayStore`), regardless of session state — the toggle
     action itself needs a session, so it's just disabled (not unmounted)
     during the gap before one lands (New Chat/session-load/mode-swap all
@@ -41,9 +41,16 @@ export function AdaptivePathwayToggle() {
     if (!sessionId) return;
     const next = !paused;
     setPaused(next);
-    try {
-      await ipc.setPathwaySessionPaused(sessionId, next);
-    } catch {
+    // Pause both engines. Each is independent: one may be disabled (its
+    // route returns a soft error), which must not stop the other from
+    // pausing. Revert the optimistic flip only if *both* calls failed —
+    // if either succeeded, the session is at least partly incognito and the
+    // button should reflect the paused intent.
+    const results = await Promise.allSettled([
+      ipc.setPathwaySessionPaused(sessionId, next),
+      ipc.setMemorabiliaSessionPaused(sessionId, next),
+    ]);
+    if (results.every((r) => r.status === 'rejected')) {
       setPaused(!next);
     }
   };

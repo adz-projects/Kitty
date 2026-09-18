@@ -5,6 +5,7 @@ pub mod health;
 pub mod jobs;
 pub mod local;
 pub mod mcp;
+pub mod memorabilia;
 pub mod memory;
 pub mod pathway;
 pub mod plugins;
@@ -110,6 +111,16 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/pathway/sessions/{id}/pause",
             patch(pathway::set_paused),
+        )
+        .route("/api/memorabilia/items", get(memorabilia::list_items))
+        .route(
+            "/api/memorabilia/items/{id}",
+            delete(memorabilia::delete_item),
+        )
+        .route("/api/memorabilia/stats", get(memorabilia::stats))
+        .route(
+            "/api/memorabilia/sessions/{id}/pause",
+            patch(memorabilia::set_paused),
         )
         .route(
             "/api/chat/",

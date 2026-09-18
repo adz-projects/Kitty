@@ -284,6 +284,7 @@ const SPECIALIST_FAN_OUT_WAVES: u64 = 3;
 
 const REGISTERED_BUILTINS: &[&str] = &[
     "pathway",
+    "memorabilia",
     "specialists",
     "kitty-wasm",
     "kitty-tools",
@@ -351,6 +352,7 @@ pub async fn ensure_builtin_servers(app: &AppHandle) {
         kitty_tools_enabled,
         kitty_web_enabled,
         pathway_enabled,
+        memorabilia_enabled,
         specialist_timeout_secs,
     ) = {
         let state = app.state::<AppState>();
@@ -362,6 +364,7 @@ pub async fn ensure_builtin_servers(app: &AppHandle) {
             cfg.kitty_tools_enabled,
             cfg.kitty_web_enabled,
             cfg.adaptive_pathway_enabled,
+            cfg.memorabilia_enabled,
             cfg.specialists.timeout_secs,
         )
     };
@@ -403,6 +406,33 @@ pub async fn ensure_builtin_servers(app: &AppHandle) {
             // Default 30s tool timeout is right here; only kitty-wasm needs more.
             timeout_s: None,
             enabled: pathway_enabled,
+        },
+    )
+    .await;
+
+    // The declarative factual-memory engine, the second in-process plugin
+    // linked into the daemon (`plugins/memorabilia_rust`). Same shape as the
+    // `pathway` row above: a logical `command` name `builtin::connect` switches
+    // on, `transport: "in_process"`, and no env map (the engine reads
+    // `BIGTINY_MEMORABILIA__ENABLED` from the daemon's own process environment,
+    // set at spawn in `lifecycle::bigtiny_env`). `enabled` here only gates
+    // whether the model can *call* `memorabilia_search`/`memorabilia_read_item`;
+    // recall injection and turn-end learning run whenever the engine is on,
+    // gated by that same env flag. Paired with the daemon's `"memorabilia"` arm
+    // in `BigTinyV2/daemon/src/mcp/builtin.rs` — change the two together.
+    upsert_builtin(
+        &client,
+        "memorabilia",
+        &McpServerSpec {
+            name: "memorabilia".to_string(),
+            transport: "in_process".to_string(),
+            command: Some("memorabilia".to_string()),
+            args: vec![],
+            url: None,
+            env: HashMap::new(),
+            headers: HashMap::new(),
+            timeout_s: None,
+            enabled: memorabilia_enabled,
         },
     )
     .await;
@@ -796,11 +826,12 @@ mod tests {
     /// the daemon crate on desktop — it talks to it over HTTP. The Android
     /// target does link it, and asserts against the real thing below, so this
     /// mirror cannot rot silently in both places at once.
-    const DAEMON_BUILTIN_SERVERS: [&str; 5] = [
+    const DAEMON_BUILTIN_SERVERS: [&str; 6] = [
         "kitty-tools",
         "kitty-web",
         "kitty-wasm",
         "pathway",
+        "memorabilia",
         "specialists",
     ];
 

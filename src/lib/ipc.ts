@@ -10,6 +10,9 @@ import type {
   AdaptivePathwayMcpStatus,
   PathwayBelief,
   PathwayStats,
+  MemorabiliaMcpStatus,
+  MemorabiliaItem,
+  MemorabiliaStats,
   ApprovalNeededEvent,
   ChatErrorEvent,
   CompactionEvent,
@@ -447,6 +450,29 @@ export const ipc = {
   /** The incognito toggle for one session. */
   setPathwaySessionPaused: (sessionId: string, paused: boolean) =>
     invoke<{ session_id: string; paused: boolean }>('set_pathway_session_paused', {
+      sessionId,
+      paused,
+    }),
+
+  // Declarative factual-memory engine (`plugins/memorabilia_rust`, linked
+  // in-process into BigTiny — see `src-tauri/src/commands/memorabilia.rs`).
+  getMemorabiliaMcpStatus: () =>
+    invoke<MemorabiliaMcpStatus | null>('get_memorabilia_mcp_status'),
+  setMemorabiliaEnabled: (enabled: boolean) =>
+    invoke<void>('set_memorabilia_enabled', { enabled }),
+  /** Active memory items (Settings fact browser). */
+  getMemorabiliaItems: () =>
+    invoke<{ items: MemorabiliaItem[]; count: number }>('get_memorabilia_items'),
+  /** Counts for the health readout. */
+  getMemorabiliaStats: () => invoke<MemorabiliaStats>('get_memorabilia_stats'),
+  /** Fact browser's delete action — suppresses + tombstones, not a bare row delete. */
+  deleteMemorabiliaItem: (itemId: string) =>
+    invoke<{ id: string; dropped?: number; error?: string }>('delete_memorabilia_item', {
+      itemId,
+    }),
+  /** The factual-memory half of the unified per-session incognito control. */
+  setMemorabiliaSessionPaused: (sessionId: string, paused: boolean) =>
+    invoke<{ session_id: string; paused: boolean }>('set_memorabilia_session_paused', {
       sessionId,
       paused,
     }),

@@ -558,6 +558,7 @@ dependencies = [
  "kitty-wasm",
  "kitty-web",
  "memchr",
+ "memorabilia",
  "minijinja",
  "once_cell",
  "rand 0.8.6",
@@ -4162,6 +4163,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "memorabilia"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "dashmap",
+ "futures",
+ "libsqlite3-sys",
+ "rand 0.8.6",
+ "reqwest 0.12.28",
+ "rmcp 2.2.0",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2",
+ "sqlite-vec",
+ "sqlx",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "unicode-normalization",
+ "uuid",
+]
+
+[[package]]
 name = "merman"
 version = "0.8.0-alpha.4"
 source = "git+https://github.com/Latias94/merman?rev=4262b166faa7dcfcbebbf58dd6ea3e2ccc3630f7#4262b166faa7dcfcbebbf58dd6ea3e2ccc3630f7"
@@ -6635,6 +6662,15 @@ dependencies = [
  "nom 7.1.3",
  "serde",
  "unicode-segmentation",
+]
+
+[[package]]
+name = "sqlite-vec"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d0ba424237a9a5db2f6071f193319e2b6a32f7f3961debb2fbbfe67067abce3f"
+dependencies = [
+ "cc",
 ]
 
 [[package]]

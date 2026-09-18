@@ -49,6 +49,7 @@ pub async fn start(
     local: &crate::config::LocalModelSettings,
     specialists: &crate::config::SpecialistSettings,
     pathway_enabled: bool,
+    memorabilia_enabled: bool,
     pathway_embedding_model: &str,
     tokenizer_path: &str,
 ) -> Result<DaemonHandle, String> {
@@ -80,6 +81,7 @@ pub async fn start(
         local,
         specialists,
         pathway_enabled,
+        memorabilia_enabled,
         pathway_embedding_model,
         tokenizer_path,
     ) {

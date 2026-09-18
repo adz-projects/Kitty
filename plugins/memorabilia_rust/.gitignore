@@ -1,0 +1,9 @@
+/target
+
+# local SQLite databases (WAL sidecars)
+*.db
+*.db-wal
+*.db-shm
+
+# Superseded documentation, kept locally for reference (see memorabilia.md)
+docs_old/

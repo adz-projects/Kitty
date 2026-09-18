@@ -249,6 +249,7 @@ pub fn start_stack(app: &AppHandle) {
             local,
             specialists,
             pathway_enabled,
+            memorabilia_enabled,
             pathway_embedding_model,
         ) = {
             let state = app.state::<AppState>();
@@ -263,6 +264,7 @@ pub fn start_stack(app: &AppHandle) {
                 cfg.local.clone(),
                 cfg.specialists.clone(),
                 cfg.adaptive_pathway_enabled,
+                cfg.memorabilia_enabled,
                 cfg.adaptive_pathway_embedding_model.clone(),
             )
         };
@@ -291,6 +293,7 @@ pub fn start_stack(app: &AppHandle) {
                 &local,
                 &specialists,
                 pathway_enabled,
+                memorabilia_enabled,
                 &pathway_embedding_model,
                 &tokenizer_path,
             )
@@ -312,6 +315,7 @@ pub fn start_stack(app: &AppHandle) {
                 &local,
                 &specialists,
                 pathway_enabled,
+                memorabilia_enabled,
                 &pathway_embedding_model,
                 &tokenizer_path,
                 Some(litert_lib_dir.as_str()),

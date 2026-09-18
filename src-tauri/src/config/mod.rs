@@ -161,6 +161,14 @@ pub struct Config {
     /// loop) stay pointed at the same tag.
     #[serde(default = "default_ap_embedding_model")]
     pub adaptive_pathway_embedding_model: String,
+    /// Whether the in-process declarative factual-memory (memorabilia) engine,
+    /// linked into the BigTiny daemon alongside pathway, is active for this
+    /// install. Off by default — it's an opt-in second memory system. Passed to
+    /// the daemon via `BIGTINY_MEMORABILIA__ENABLED` (see
+    /// `lifecycle::bigtiny_env::daemon_env`); it reuses the same shared
+    /// EmbeddingGemma model pathway uses, so it needs no model config of its own.
+    #[serde(default = "default_memorabilia_enabled")]
+    pub memorabilia_enabled: bool,
     /// Retired: `replacement-mcp` no longer exists as its own process — all
     /// 18 of its tools now live inside `kitty-tools` (see
     /// `kitty_tools_enabled` below), and `plugins/replacement-mcp/lean_mcp.py`
@@ -506,6 +514,7 @@ impl Default for Config {
             model_vision: HashMap::new(),
             adaptive_pathway_enabled: default_adaptive_pathway_enabled(),
             adaptive_pathway_embedding_model: default_ap_embedding_model(),
+            memorabilia_enabled: default_memorabilia_enabled(),
             replacement_mcp_enabled: default_true(),
             // A brand-new config needs no flip, so it starts already-migrated.
             replacement_mcp_default_migrated: true,
@@ -581,6 +590,10 @@ fn default_true() -> bool {
 
 fn default_adaptive_pathway_enabled() -> bool {
     true
+}
+
+fn default_memorabilia_enabled() -> bool {
+    false
 }
 
 /// Resolves `<name>` next to the currently-running executable, if it exists.

@@ -12,10 +12,24 @@ isn't a "plugin" in the tool-augmentation sense — see
 
 **As of 0.5.0 every bundled binary is Rust**, built with plain
 `cargo build --release` — `kitty-tools`, `kitty-web`, `kitty-wasm`, and the
-`bigtiny` daemon (which statically links the behavioral-memory engine at
-`plugins/adaptive-pathway_rust/`). No PyInstaller step and no Python runtime
-is involved in a release build any more; `plugins/build.py` remains only
-because it owns the target-triple naming convention `externalBin` expects.
+`bigtiny` daemon (which statically links **two** memory engines: the
+behavioral-memory engine at `plugins/adaptive-pathway_rust/` and the
+declarative factual-memory engine at `plugins/memorabilia_rust/`). No
+PyInstaller step and no Python runtime is involved in a release build any
+more; `plugins/build.py` remains only because it owns the target-triple naming
+convention `externalBin` expects.
+
+`plugins/memorabilia_rust/` is the newest of these and is wired in exactly
+parallel to `adaptive-pathway_rust`: a non-workspace path dependency of the
+daemon (`BigTinyV2/daemon/Cargo.toml`), hosted per app by
+`BigTinyV2/daemon/src/plugins/memorabilia_host.rs`, exposing two read-only
+lookup tools (`memorabilia_search`, `memorabilia_read_item`) through BigTiny's
+in-process MCP registry, and registered from Kitty by the same
+`bigtiny::mcp::ensure_builtin_servers` path (the `"memorabilia"` row). Its
+enable flag rides the `BIGTINY_MEMORABILIA__ENABLED` env var, and its Settings
+surface is the "Memorabilia" pane (`src/components/settings/Memorabilia.tsx`).
+It was vendored in from a previously-standalone repo; there is nothing
+process-shaped to spawn or supervise, only the compiled-in crate.
 
 This is not a deviation from "the exception, by design" framing (CLAUDE.md's
 stack section): a frozen Rust binary has *less* runtime surface than a frozen

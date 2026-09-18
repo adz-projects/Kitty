@@ -146,7 +146,7 @@ adaptive-pathway = { path = "../../plugins/adaptive-pathway_rust" }
 # alongside adaptive-pathway (see docs/adaptive-pathway-v2.md). Same rationale:
 # path dep so it builds with this crate's profile and shares one
 # libsqlite3-sys across the workspace.
-memorabilia = { path = "../../../../memorabilia" }
+memorabilia = { path = "../../plugins/memorabilia_rust" }
 
 # Windows-only generative summarizer runtime.
 [target.'cfg(windows)'.dependencies]

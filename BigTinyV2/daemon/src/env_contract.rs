@@ -177,6 +177,27 @@ pub fn apply_env_overrides(config: &mut BigTinyConfig) {
     {
         config.pathway.learn_every_n = n;
     }
+    // Declarative factual-memory plugin (`memorabilia`). Same reasoning as
+    // `BIGTINY_PATHWAY__ENABLED`: `MemorabiliaConfig::enabled` defaults false
+    // and has no other override path, so without this the engine can never be
+    // turned on from a host. Kitty's `lifecycle/bigtiny_env.rs` sets these at
+    // daemon spawn from `cfg.memorabilia_enabled`; the two halves must stay in
+    // lockstep.
+    if let Ok(v) = std::env::var("BIGTINY_MEMORABILIA__ENABLED") {
+        config.memorabilia.enabled = v.eq_ignore_ascii_case("true") || v == "1";
+    }
+    if let Some(n) = std::env::var("BIGTINY_MEMORABILIA__LEARN_EVERY_N")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        config.memorabilia.learn_every_n = n;
+    }
+    if let Some(n) = std::env::var("BIGTINY_MEMORABILIA__SWEEP_INTERVAL_S")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        config.memorabilia.sweep_interval_s = n;
+    }
     // The in-process **LiteRT** engine (docs plan "Replace llama.cpp with
     // LiteRT"). Same reasoning as `BIGTINY_PATHWAY__ENABLED` above: no host
     // passes `--config`, so without these the engine can only ever be off.

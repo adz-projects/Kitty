@@ -55,6 +55,7 @@ pub async fn locate(
     local: &crate::config::LocalModelSettings,
     specialists: &crate::config::SpecialistSettings,
     pathway_enabled: bool,
+    memorabilia_enabled: bool,
     pathway_embedding_model: &str,
     tokenizer_path: &str,
     litert_lib_dir: Option<&str>,
@@ -88,6 +89,7 @@ pub async fn locate(
         local,
         specialists,
         pathway_enabled,
+        memorabilia_enabled,
         pathway_embedding_model,
         tokenizer_path,
     );

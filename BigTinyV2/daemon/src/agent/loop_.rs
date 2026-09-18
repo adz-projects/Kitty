@@ -3600,6 +3600,11 @@ impl AgentLoop {
             let Some(engine) = mem_engine else {
                 return;
             };
+            // Unified incognito: skip learning for a paused session (matches
+            // the recall hook and adaptive-pathway's learn gate).
+            if engine.is_paused(&mem_session_id).await.unwrap_or(false) {
+                return;
+            }
             // Cadence gate: assistant turns completed for this session. A DB
             // error skips this turn rather than treating 0 as "every turn".
             let Ok(count) = sqlx::query_scalar::<_, i64>(
@@ -3725,6 +3730,11 @@ impl AgentLoop {
             None => None,
         };
         let engine = engine_owned.as_ref()?;
+        // Unified incognito: the chat-header "pause memory" control pauses
+        // both engines. A paused session injects nothing (zero prompt delta).
+        if engine.is_paused(session_id).await.unwrap_or(false) {
+            return None;
+        }
         tokio::time::timeout(
             Duration::from_millis(AP_RECALL_EMBED_BUDGET_MS),
             engine.recall(user_message),

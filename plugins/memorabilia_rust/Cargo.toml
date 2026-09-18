@@ -1,0 +1,63 @@
+[package]
+name = "memorabilia"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Declarative factual memory engine: ingests evidence, abstracts atomic claims, tracks temporal deadlines, and serves a token-capped factual subgraph to a calling LLM. In-process; depends only on trait seams (StructuredChat/Embedder/VectorIndex). See project-plan.md (spec) and claude.md (working guide)."
+
+[lib]
+name = "memorabilia"
+path = "src/lib.rs"
+
+# Dependency set mirrors adaptive-pathway_rust (the behavioral-memory
+# reference) per project-plan.md §15 Phase 0. Some crates are consumed by
+# later phases (mmh3, reqwest, dashmap, futures, uuid, rand); declaring them
+# up front keeps the dep graph stable phase to phase.
+
+[dependencies]
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "chrono"] }
+# sqlite-vec `vec0` module (plan §3.3): the crate's build.rs compiles
+# sqlite-vec.c (SQLITE_CORE) into a static `sqlite_vec0` library; the entry
+# point is registered at pool open via `sqlite3_auto_extension`, so every
+# connection sqlx opens sees the `vec0` virtual-table module. No second
+# SQLite core is linked: the extension references the same bundled
+# libsqlite3-sys build sqlx uses (one build per version in the graph).
+sqlite-vec = "0.1.9"
+# Same crate (and therefore same build) sqlx's sqlx-sqlite links; used only
+# for the `sqlite3_auto_extension` FFI entry point below.
+libsqlite3-sys = "0.30"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+serde_yaml = "0.9"
+tracing = "0.1"
+thiserror = "2"
+chrono = { version = "0.4", features = ["serde"] }
+async-trait = "0.1"
+# MurmurHash3 x86 32-bit for the Phase 1 lexical signed-hash embedder is
+# implemented in-house (src/embed/hashing.rs), mmh3-compatible, mirroring
+# the reference — no external crate.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+dashmap = "6"
+futures = "0.3"
+uuid = { version = "1", features = ["v4", "serde"] }
+rand = "0.8"
+# SHA-256 for the two-tier hash boundary (plan §3.1: document_hash /
+# content_hash) and forget tombstone keys (plan §12.2). Not in the reference
+# dep set (its tombstones key off mmh3) — the plan pins these hashes to
+# SHA-256, so the canonical RustCrypto crate is the dependency.
+sha2 = "0.10"
+# Unicode NFC for Stage 3 normalization (plan §3.1: "Unicode NFC, collapse of
+# whitespace runs, strip of trailing punctuation"). Hand-rolling canonical
+# composition is not viable; this is the standard normalization crate.
+unicode-normalization = "0.1"
+# In-process MCP lookup server (memorabilia_search / memorabilia_read_item),
+# following the kitty-tools document-reading pattern. Pinned to the same rmcp
+# major as kitty-tools and adaptive-pathway (`=2.2.0`); it coexists with the
+# BigTiny daemon's own rmcp 0.9 because they share only the duplex byte
+# stream (MCP wire JSON-RPC), never Rust types.
+rmcp = { version = "=2.2.0", features = ["server", "transport-io", "macros"] }
+schemars = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }

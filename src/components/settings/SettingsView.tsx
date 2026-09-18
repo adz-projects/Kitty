@@ -11,6 +11,7 @@ import { NotificationsSection } from '@/components/settings/NotificationsSection
 import { Appearance } from '@/components/settings/Appearance';
 import { Advanced } from '@/components/settings/Advanced';
 import { AdaptivePathway } from '@/components/settings/AdaptivePathway';
+import { Memorabilia } from '@/components/settings/Memorabilia';
 import { ScheduledTasks } from '@/components/settings/ScheduledTasks';
 import { Specialists } from '@/components/settings/Specialists';
 
@@ -23,6 +24,7 @@ function sectionLabels(): Record<string, string> {
     scheduled_tasks: 'Scheduled Tasks',
     specialists: 'Specialists',
     adaptive_pathway: 'Adaptive Pathway',
+    memorabilia: 'Memorabilia',
     notifications: 'Notifications',
     appearance: 'Appearance',
     advanced: 'Advanced',
@@ -59,7 +61,7 @@ function buildGroups(): { label: string; sections: string[] }[] {
       label: 'Automation & extensions',
       sections: ['mcp_servers', 'scheduled_tasks', 'specialists'],
     },
-    { label: 'Advanced', sections: ['advanced', 'adaptive_pathway'] },
+    { label: 'Advanced', sections: ['advanced', 'adaptive_pathway', 'memorabilia'] },
   ];
 }
 
@@ -164,6 +166,7 @@ export function SettingsView() {
         {section === 'scheduled_tasks' && <ScheduledTasks />}
         {section === 'specialists' && <Specialists />}
         {section === 'adaptive_pathway' && <AdaptivePathway />}
+        {section === 'memorabilia' && <Memorabilia />}
         {section === 'notifications' && <NotificationsSection />}
         {section === 'appearance' && <Appearance />}
         {section === 'advanced' && <Advanced />}

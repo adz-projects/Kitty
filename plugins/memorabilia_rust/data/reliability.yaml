@@ -1,0 +1,28 @@
+# Data file, NOT user config (project-plan.md §4.2).
+#
+# The user adds nothing here. `source_reliability` is never hand-coded: it is
+# seeded at ingestion from the tier prior (below) times the attachment
+# intent factor, then drifted automatically from outcomes. Unknown domains
+# classify as `personal`.
+
+tiers:
+  - name: primary
+    prior: 0.95
+  #   .edu/.gov, peer-reviewed journals, *.github.io
+  - name: established
+    prior: 0.80
+  #   major publishers with editorial control, matched against reputable_domains
+  - name: community
+    prior: 0.55
+  #   wikis, forums, Stack Overflow, documentation sites
+  - name: personal
+    prior: 0.35
+  #   self-hosted blogs, *.wordpress.com, *.blogspot, unknown domains
+
+reputable_domains:
+  - nytimes.com
+  - nature.com
+  - theguardian.com
+  - bbc.com
+  - apnews.com
+  - reuters.com

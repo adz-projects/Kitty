@@ -1,0 +1,94 @@
+# Memorabilia configuration (project-plan.md §2). Every value here is a
+# default that Config already supplies — this file exists as documentation and
+# an override surface. Unknown keys are ignored; a key you omit keeps its
+# built-in default (src/config.rs). There is no other configuration surface:
+# no env-var shims, no hardcoded fallbacks in code paths.
+#
+# When Memorabilia runs as a compiled-in BigTiny V2 plugin, the daemon
+# constructs this Config in-process and OVERRIDES the embedding fields to match
+# the shared EmbeddingGemma model it loaded (see the commented block below);
+# extraction/maintenance reasoning is served through the injected
+# SummarizerChain (Gemma E2B -> configured provider), so `extraction.*` here is
+# only used by a standalone/test run.
+
+# --- Embedding (Level 0 vectors) -------------------------------------------
+# Standalone default: the pinned qwen3 model over a local Ollama endpoint.
+embedding_dim: 384
+embedding_model: "qwen3-embedding:0.6b"
+embedding_timeout_ms: 1500
+embedding_provider_url: "http://localhost:11434"
+embedding_probe_interval_s: 60
+embedding_cache_size: 256
+#
+# BigTiny-plugin overrides (set by the daemon at startup from the live shared
+# embedder — shown here for reference, not required in a user file):
+#   embedding_dim: 768                     # EmbeddingGemma native width
+#   embedding_model: "litert:embeddinggemma"  # vector-space identity tag
+
+# --- Ingestion (Stages 0-3) ------------------------------------------------
+chunk_chars_min: 512
+chunk_chars_max: 1024
+cluster_similarity_threshold: 0.92
+semantic_dedup_threshold: 0.92
+
+# --- Disputes & decay ------------------------------------------------------
+dispute_strength_floor: 0.5
+tau_static_days: 365
+tau_transient_days: 7
+tau_pre_days: 7
+tau_post_hours: 48
+
+# --- Promotion & reliability ----------------------------------------------
+reinforcement_promote_threshold: 5
+reinforcement_count_max: 5
+promotion_min_reliability: 0.6
+reliability_drift_up: 0.15
+reliability_drift_down: 0.25
+reliability_band: 0.2
+archive_retention_days: 90
+
+# --- Retrieval (two-pass) & rendering --------------------------------------
+retrieval_depth_cap: 3
+retrieval_seed_chunks: 8
+retrieval_min_seeds: 3
+activation_prune_threshold: 0.05
+activation_hop_decay: 0.5
+output_token_cap: 1500        # full recall payload / MCP lookup tools
+injection_token_cap: 500      # compact per-turn summary+index injection
+metaboost_cap: 3.0
+correlation_lambda: 0.05
+metaboost_urgency_high: 1.0
+metaboost_urgency_medium: 0.4
+metaboost_urgency_low: 0.1
+metaboost_importance_high: 0.8
+metaboost_importance_medium: 0.3
+metaboost_importance_low: 0.1
+metaboost_unknown_triage_premium: 0.5
+
+# --- Conflict probe (Stage 4) ----------------------------------------------
+conflict_probe_neighbors: 5
+conflict_probe_similarity_min: 0.55
+
+# --- RHYMES_WITH -----------------------------------------------------------
+rhymes_min_confidence: 0.7
+rhymes_batch_cap: 50
+
+# --- Forget / tombstones ---------------------------------------------------
+tombstone_min_chars: 20
+tombstone_digit_run: 8
+forget_match_threshold: 0.8
+outdated_suppression_days: 90
+
+# --- Extraction model (standalone/test only; the BigTiny plugin injects
+#     SummarizerChain instead of using these) ------------------------------
+extraction:
+  provider_url: "http://localhost:11434"
+  model: "qwen3:4b"
+  timeout_s: 12
+  retry_backoff_s: 60
+  max_concurrent: 1
+  batch_size: 5
+
+# --- Maintenance scheduler -------------------------------------------------
+maintenance_tick_s: 60
+maintenance_heavy_interval_hours: 24

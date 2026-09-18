@@ -51,6 +51,7 @@ lib.rs (app setup, window creation, generate_handler! list)
   │                  + the adaptive-pathway record_outcome backstop
   │     providers.rs sync Kitty's active provider profile into BigTiny's registry
   │     pathway.rs  adaptive-pathway belief browser / graph health / domains
+  │     memorabilia.rs  memorabilia fact browser / health / delete / pause
   │     mcp.rs       MCP server CRUD + ensure_builtin_servers (kitty-tools,
   │                  kitty-web, kitty-wasm) self-heal. Bundled exe on desktop,
   │                  transport "in_process" on Android (no exec()).
@@ -70,7 +71,7 @@ lib.rs (app setup, window creation, generate_handler! list)
   │
   ├─► commands/                               #[tauri::command] handlers —
   │     session/       new/send/cancel/load/fork/delete, mode, thinking effort
-  │     provider.rs, adaptive_pathway.rs, memory.rs, mcp_servers.rs,
+  │     provider.rs, adaptive_pathway.rs, memorabilia.rs, memory.rs, mcp_servers.rs,
   │     specialists.rs, scheduled_tasks.rs, folders.rs, models.rs, file.rs,
   │     screenshot.rs, window.rs, setup.rs, config.rs, logs.rs
   │     (thin wrappers over the modules above — no business logic of their own)
@@ -183,9 +184,17 @@ See `docs/PLUGINS.md` for the full pattern. `kitty-tools`, `kitty-web` and
 `kitty-wasm` (all Rust) plus the BigTiny daemon itself
 (`plugins/bigtiny_rust/`) are built with `cargo build --release` and bundled
 through Tauri's `externalBin` — `python plugins/build.py` builds all four
-targets. The behavioral-memory engine (`plugins/adaptive-pathway_rust`) is not
-a target of its own: it is a path dependency statically linked into the
-daemon.
+targets. The two memory engines — the behavioral-memory engine
+(`plugins/adaptive-pathway_rust`) and the declarative factual-memory engine
+(`plugins/memorabilia_rust`) — are not targets of their own: each is a path
+dependency statically linked into the daemon, hosted per app
+(`plugins/host.rs`, `plugins/memorabilia_host.rs`), reached by the model
+through in-process MCP servers (`pathway` → `record`/`forget`; `memorabilia` →
+`memorabilia_search`/`memorabilia_read_item`) and by Settings through
+`/api/pathway/*` and `/api/memorabilia/*`. Both are off unless enabled
+(`BIGTINY_PATHWAY__ENABLED` — on by default in Kitty; `BIGTINY_MEMORABILIA__ENABLED`
+— off by default). A single chat-header incognito control pauses both per
+session.
 
 **On Android none of that applies.** `externalBin` is cleared
 (`tauri.android.conf.json`), the daemon is hosted in-process, and the three MCP

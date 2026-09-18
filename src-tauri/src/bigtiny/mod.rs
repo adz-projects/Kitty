@@ -14,6 +14,7 @@ pub mod context_window;
 pub mod vision;
 pub mod effort;
 pub mod mcp;
+pub mod memorabilia;
 pub mod pathway;
 pub mod providers;
 pub mod sessions;

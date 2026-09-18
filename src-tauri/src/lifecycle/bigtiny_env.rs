@@ -77,6 +77,10 @@ pub fn daemon_env(
     local: &crate::config::LocalModelSettings,
     specialists: &crate::config::SpecialistSettings,
     pathway_enabled: bool,
+    // The declarative factual-memory plugin's on/off flag. No model parameter:
+    // memorabilia reuses the same shared EmbeddingGemma model the LiteRT block
+    // below resolves for pathway, so there's nothing model-shaped to pass.
+    memorabilia_enabled: bool,
     pathway_embedding_model: &str,
     // Absolute path to the bundled Gemma `tokenizer.json`, resolved by the
     // caller from `resource_dir()` (it ships as an app resource, not in the
@@ -125,6 +129,12 @@ pub fn daemon_env(
         // (unlike every other section) has no other override path, so without
         // this the behavioral-memory engine can never turn on at all.
         ("BIGTINY_PATHWAY__ENABLED".into(), b(pathway_enabled)),
+        // Factual-memory plugin. Like pathway, off unless the host says so;
+        // read by `bigtiny2::env_contract::apply_env_overrides`.
+        (
+            "BIGTINY_MEMORABILIA__ENABLED".into(),
+            b(memorabilia_enabled),
+        ),
     ];
 
     // Model paths are resolved here rather than in the daemon, so the daemon
@@ -293,7 +303,7 @@ mod tests {
     fn the_credentials_are_always_present() {
         let (s, t, m, l) = settings();
         let sp = SpecialistSettings::default();
-        let e = daemon_env("sec", "enc", &s, &t, &m, &l, &sp, false, "", "");
+        let e = daemon_env("sec", "enc", &s, &t, &m, &l, &sp, false, false, "", "");
         assert_eq!(env_of(&e, "BIGTINY_SECRET").as_deref(), Some("sec"));
         assert_eq!(env_of(&e, "BIGTINY_ENCRYPTION_KEY").as_deref(), Some("enc"));
     }
@@ -305,14 +315,37 @@ mod tests {
     fn booleans_use_the_word_form_the_daemon_parses() {
         let (s, t, m, l) = settings();
         let sp = SpecialistSettings::default();
-        let on = daemon_env("", "", &s, &t, &m, &l, &sp, true, "", "");
-        let off = daemon_env("", "", &s, &t, &m, &l, &sp, false, "", "");
+        let on = daemon_env("", "", &s, &t, &m, &l, &sp, true, false, "", "");
+        let off = daemon_env("", "", &s, &t, &m, &l, &sp, false, false, "", "");
         assert_eq!(
             env_of(&on, "BIGTINY_PATHWAY__ENABLED").as_deref(),
             Some("true")
         );
         assert_eq!(
             env_of(&off, "BIGTINY_PATHWAY__ENABLED").as_deref(),
+            Some("false")
+        );
+    }
+
+    /// The memorabilia flag rides the same word-form contract and is
+    /// independent of pathway's — either can be on with the other off.
+    #[test]
+    fn memorabilia_enabled_is_sent_as_its_own_flag() {
+        let (s, t, m, l) = settings();
+        let sp = SpecialistSettings::default();
+        let on = daemon_env("", "", &s, &t, &m, &l, &sp, false, true, "", "");
+        let off = daemon_env("", "", &s, &t, &m, &l, &sp, false, false, "", "");
+        assert_eq!(
+            env_of(&on, "BIGTINY_MEMORABILIA__ENABLED").as_deref(),
+            Some("true")
+        );
+        assert_eq!(
+            env_of(&off, "BIGTINY_MEMORABILIA__ENABLED").as_deref(),
+            Some("false")
+        );
+        // Independent of pathway: memorabilia on here, pathway off.
+        assert_eq!(
+            env_of(&on, "BIGTINY_PATHWAY__ENABLED").as_deref(),
             Some("false")
         );
     }
@@ -325,7 +358,7 @@ mod tests {
     fn an_unresolvable_model_leaves_the_slot_empty_and_the_engine_off() {
         let (s, t, m, l) = settings();
         let sp = SpecialistSettings::default();
-        let e = daemon_env("", "", &s, &t, &m, &l, &sp, false, NO_SUCH_MODEL, "");
+        let e = daemon_env("", "", &s, &t, &m, &l, &sp, false, false, NO_SUCH_MODEL, "");
         assert_eq!(
             env_of(&e, "BIGTINY_LITERT__EMBED_MODEL_PATH").as_deref(),
             Some("")
@@ -343,7 +376,7 @@ mod tests {
     fn the_litert_paths_are_sent_even_with_no_model() {
         let (s, t, m, l) = settings();
         let sp = SpecialistSettings::default();
-        let e = daemon_env("", "", &s, &t, &m, &l, &sp, false, NO_SUCH_MODEL, "");
+        let e = daemon_env("", "", &s, &t, &m, &l, &sp, false, false, NO_SUCH_MODEL, "");
         assert_eq!(
             env_of(&e, "BIGTINY_LITERT__ENABLED").as_deref(),
             Some("false")
@@ -366,11 +399,11 @@ mod tests {
         let (s, t, mut m, l) = settings();
         m.bm25_threshold = None;
         let sp = SpecialistSettings::default();
-        let e = daemon_env("", "", &s, &t, &m, &l, &sp, false, "", "");
+        let e = daemon_env("", "", &s, &t, &m, &l, &sp, false, false, "", "");
         assert!(env_of(&e, "BIGTINY_MEMORY__BM25_THRESHOLD").is_none());
 
         m.bm25_threshold = Some(1.5);
-        let e = daemon_env("", "", &s, &t, &m, &l, &sp, false, "", "");
+        let e = daemon_env("", "", &s, &t, &m, &l, &sp, false, false, "", "");
         assert_eq!(
             env_of(&e, "BIGTINY_MEMORY__BM25_THRESHOLD").as_deref(),
             Some("1.5")
@@ -385,7 +418,7 @@ mod tests {
     fn the_plugin_home_is_sent_only_where_it_is_needed() {
         let (s, t, m, l) = settings();
         let sp = SpecialistSettings::default();
-        let e = daemon_env("", "", &s, &t, &m, &l, &sp, false, "", "");
+        let e = daemon_env("", "", &s, &t, &m, &l, &sp, false, false, "", "");
         let sent = env_of(&e, "KITTY_PLUGIN_HOME");
         if cfg!(target_os = "android") {
             let dir = sent.expect("Android must be told where the plugins may write");
@@ -410,7 +443,7 @@ mod tests {
     fn no_key_is_emitted_twice() {
         let (s, t, m, l) = settings();
         let sp = SpecialistSettings::default();
-        let e = daemon_env("", "", &s, &t, &m, &l, &sp, true, "", "");
+        let e = daemon_env("", "", &s, &t, &m, &l, &sp, true, false, "", "");
         let mut keys: Vec<&str> = e.iter().map(|(k, _)| k.as_str()).collect();
         let before = keys.len();
         keys.sort_unstable();
