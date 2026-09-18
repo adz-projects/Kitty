@@ -151,7 +151,10 @@ pub async fn run(config: BigTinyConfig, options: RunOptions) -> Result<(), Daemo
     };
 
     // No daemon-wide engine to hand over: the in-process `pathway` MCP server
-    // is now connected per app, holding that app's engine.
+    // is connected per app, holding that app's engine — see
+    // `attach_plugins` below, which is what actually supplies it. That attach
+    // is load-bearing: without it this `None` is the only engine the `pathway`
+    // row could ever be given, and it refused at every boot.
     let mcp = Arc::new(MCPManager::with_data_dir(
         pool.clone(),
         None,
@@ -233,6 +236,9 @@ pub async fn run(config: BigTinyConfig, options: RunOptions) -> Result<(), Daemo
     orchestrator.attach(&agent);
     orchestrator.attach_router(router.clone());
     mcp.attach_orchestrator(orchestrator.clone());
+    // Before `connect_all`, like the orchestrator attach above and for the
+    // same reason: the `pathway` built-in resolves its engine at connect time.
+    mcp.attach_plugins(plugins.clone());
 
     // **Only now** connect the MCP servers. This used to run immediately after
     // `MCPManager::with_data_dir`, which is before the orchestrator exists --

@@ -1002,6 +1002,36 @@ time rather than stored per row, so installs whose definitions were seeded by an
 earlier version get it without a migration — `seed_builtins` never overwrites an
 edited row.
 
+## Adaptive pathway's MCP server could never connect (0.10.9)
+
+Settings showed *"MCP server error — tools not reaching the model: pathway MCP
+server requested but the behavioral-memory engine is disabled"*, and the memory
+toggle vanished from the chat header. Not a configuration problem: it was
+unconditional, on every boot, regardless of the user's setting.
+
+V2 gives each app its own belief graph behind `PluginHost::pathway_for(app_id)`,
+replacing V1's single daemon-wide engine. `MCPManager` was never told. It kept
+V1's `pathway: Option<Arc<PathwayEngine>>` constructor argument, production
+passed `None`, and `builtin::connect`'s `pathway` arm — which refuses cleanly
+rather than half-connecting when it has no engine — refused every time. The
+comment at the construction site described a per-app hand-over that had never
+been implemented.
+
+`MCPManager` now takes the host through `attach_plugins`, mirroring
+`attach_orchestrator` exactly and for the same reason (one of the two has to be
+filled in second), and resolves the engine per row from `row.app_id` at connect
+time. The constructor argument stays as the fallback, for a host that really
+does own one engine.
+
+What made this survive so long is that only *half* the feature broke. Recall,
+the belief browser and Graph Health all reach `PluginHost` directly and went on
+working, so memory looked healthy; what was lost was the model's `record` and
+`forget` tools — the two that let it drop a belief it has just been told is
+wrong. And `builtin.rs`'s `every_advertised_builtin_actually_connects` builds an
+engine and passes `Some(engine)` itself, so it proved the arm works while saying
+nothing about whether anything supplies it one. The new coverage goes through
+`MCPManager::connect_server`, which is the path that was broken.
+
 ## Specialists work alongside the model (0.10.8)
 
 0.10.7 made delegation non-blocking; the parent model still could not *use* a

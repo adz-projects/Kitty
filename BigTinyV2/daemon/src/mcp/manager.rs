@@ -53,6 +53,18 @@ pub struct MCPManager {
     /// pathway is configured off, in which case connecting that server
     /// returns a clean error instead of half-succeeding.
     pathway: Option<Arc<adaptive_pathway::engine::PathwayEngine>>,
+    /// The per-app plugin host, which is where a `PathwayEngine` actually
+    /// lives in V2 — one graph per app rather than one per daemon.
+    ///
+    /// A `OnceLock` set after construction for the same reason as
+    /// `orchestrator`: `PluginHost` is built after the `MCPManager` it would
+    /// have to be a constructor argument of. Without it the `pathway`
+    /// in-process server could only ever be handed the daemon-wide `pathway`
+    /// field above, which production sets to `None` — so the server refused at
+    /// every boot and the model lost its `record`/`forget` tools entirely,
+    /// while recall (which reaches the host directly) went on working and hid
+    /// the failure.
+    plugins: std::sync::OnceLock<Arc<crate::plugins::PluginHost>>,
     /// `Arc` so a tool call can clone a client handle out of the map, drop the
     /// DashMap guard, and only then `.await` the call — holding the shard
     /// lock across an await previously blocked every sibling tool call on the
@@ -109,6 +121,7 @@ impl MCPManager {
         Self {
             pool,
             pathway,
+            plugins: std::sync::OnceLock::new(),
             orchestrator: std::sync::OnceLock::new(),
             data_dir,
             servers: DashMap::new(),
@@ -125,6 +138,40 @@ impl MCPManager {
     /// a second call is ignored.
     pub fn attach_orchestrator(&self, orchestrator: Arc<crate::agent::orchestrator::Orchestrator>) {
         let _ = self.orchestrator.set(orchestrator);
+    }
+
+    /// Supply the per-app plugin host the `pathway` built-in resolves its
+    /// engine through. Idempotent; a second call is ignored.
+    ///
+    /// Must be called before `connect_all`, or the `pathway` row connects with
+    /// no engine and is left in `error` until the health supervisor retries.
+    pub fn attach_plugins(&self, plugins: Arc<crate::plugins::PluginHost>) {
+        let _ = self.plugins.set(plugins);
+    }
+
+    /// The engine the in-process `pathway` server should hold for `row`.
+    ///
+    /// Resolved per row rather than per daemon: V2 gives each app its own
+    /// belief graph (`PluginHost::pathway_for`), and a server row is owned by
+    /// exactly one app. `None` here is a real answer — pathway is off for that
+    /// app, or the engine would not open — and `builtin::connect` refuses
+    /// cleanly on it rather than half-connecting.
+    ///
+    /// The daemon-wide `pathway` field is the fallback, for a host that really
+    /// does own a single engine (tests, and any embedding host that passes one
+    /// to `new`) and for a shared-pool row with no owning app to ask about.
+    async fn pathway_engine_for(
+        &self,
+        name: &str,
+        app_id: Option<&str>,
+    ) -> Option<Arc<adaptive_pathway::engine::PathwayEngine>> {
+        if name != "pathway" {
+            return self.pathway.clone();
+        }
+        match (self.plugins.get(), app_id) {
+            (Some(plugins), Some(app_id)) => plugins.pathway_for(app_id).await,
+            _ => self.pathway.clone(),
+        }
     }
 
     /// The attached orchestrator, if any. The agent loop reaches specialist
@@ -175,12 +222,13 @@ impl MCPManager {
         // failed-reconnect behavior to a stdio one.
         let connect_result = if config.transport == TransportType::InProcess {
             let name = config.command.clone().unwrap_or_default();
+            let engine = self.pathway_engine_for(&name, row.app_id.as_deref()).await;
             tokio::time::timeout(
                 CONNECT_TIMEOUT,
                 super::builtin::connect(
                     &name,
                     server_id.to_string(),
-                    self.pathway.clone(),
+                    engine,
                     self.orchestrator.get().cloned(),
                     self.pool.clone(),
                 ),
@@ -857,5 +905,83 @@ mod tests {
         assert!(!names.contains(&"a_tool".to_string()));
         assert!(!names.contains(&"a2_tool".to_string()));
         assert!(names.contains(&"b_tool".to_string()));
+    }
+
+    /// The wiring bug this covers, and why the existing coverage missed it.
+    ///
+    /// `mcp::builtin`'s own tests call `connect` directly and hand it an engine
+    /// they built themselves, so they prove the `pathway` arm works but say
+    /// nothing about whether anything ever supplies it one. Production did not:
+    /// `MCPManager` was constructed with `pathway: None` and had no route to
+    /// `PluginHost`, so every boot refused the row with "the behavioral-memory
+    /// engine is disabled" and the model silently lost `record`/`forget` —
+    /// while recall, which reaches the host directly, kept working and hid it.
+    ///
+    /// This goes through `connect_server`, which is the path that was broken.
+    #[tokio::test]
+    async fn the_pathway_row_connects_through_the_manager_via_the_plugin_host() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "INSERT INTO mcp_servers (id, name, transport, command, app_id, enabled) \
+             VALUES ('srv-pathway', 'pathway', 'in_process', 'pathway', 'app-1', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let manager = MCPManager::new(pool.clone(), None);
+        // Enabled by default, so `pathway_for` opens an engine for `app-1`
+        // rather than declining — the same answer a user with memory switched
+        // on gets.
+        manager.attach_plugins(Arc::new(crate::plugins::PluginHost::new(
+            pool.clone(),
+            std::env::temp_dir().join(format!("bt-pathway-test-{}", uuid::Uuid::new_v4())),
+            true,
+            adaptive_pathway::config::Config::default(),
+            None,
+            Arc::new(crate::agent::summarizer_chain::SummarizerChain::new(
+                None,
+                Arc::new(crate::provider::router::ProviderRouter::new(
+                    crate::config::CacheConfig::default(),
+                )),
+                crate::config::SummarizerConfig::default(),
+            )),
+        )));
+
+        manager
+            .connect_server("srv-pathway")
+            .await
+            .expect("the pathway row must connect once the plugin host is attached");
+
+        let names: Vec<String> = manager
+            .tool_registry
+            .iter()
+            .map(|e| e.key().clone())
+            .collect();
+        for tool in super::super::builtin::PATHWAY_TOOLS {
+            assert!(
+                names.contains(&tool.to_string()),
+                "{tool} should be callable; registry holds {names:?}"
+            );
+        }
+    }
+
+    /// The other half of the same contract: with no host attached the manager
+    /// falls back to its constructor argument, so a host that genuinely owns
+    /// one engine still works and a host with neither still refuses cleanly
+    /// rather than connecting a server whose tools would all fail.
+    #[tokio::test]
+    async fn a_pathway_row_with_no_engine_anywhere_still_refuses() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "INSERT INTO mcp_servers (id, name, transport, command, app_id, enabled) \
+             VALUES ('srv-pathway', 'pathway', 'in_process', 'pathway', 'app-1', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let manager = MCPManager::new(pool, None);
+        assert!(manager.connect_server("srv-pathway").await.is_err());
     }
 }
