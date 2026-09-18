@@ -47,6 +47,7 @@ async fn test_state_inner(
     sqlx::migrate!("./migrations").run(&pool).await.unwrap();
 
     let plugins = bigtiny2::plugins::test_plugin_host(&pool);
+    let memorabilia = bigtiny2::plugins::test_memorabilia_host(&pool);
     // Tests that seed a belief graph hand one in; the host then serves it for
     // TEST_APP instead of opening its own.
     if let Some(engine) = pathway.clone() {
@@ -69,6 +70,7 @@ async fn test_state_inner(
         config.clone(),
         std::env::temp_dir().to_string_lossy().into_owned(),
         plugins.clone(),
+        memorabilia.clone(),
     ));
 
     let orchestrator = Arc::new(bigtiny2::agent::orchestrator::Orchestrator::new(
@@ -104,6 +106,7 @@ async fn test_state_inner(
         scheduler,
         config,
         plugins: plugins.clone(),
+        memorabilia: memorabilia.clone(),
         key_cache: Arc::new(bigtiny2::server::middleware::KeyCache::new()),
         replay: Arc::new(bigtiny2::server::replay::ReplayBuffers::new()),
         instance_id: "test-instance".to_string(),

@@ -15,7 +15,7 @@ use axum::{Extension, Json};
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::storage::app_plugins::{self, PATHWAY};
+use crate::storage::app_plugins::{self, MEMORABILIA, PATHWAY};
 use crate::storage::apps::AppIdentity;
 
 use super::AppState;
@@ -23,7 +23,25 @@ use super::AppState;
 /// Plugins this daemon knows how to host. A name outside this list is a
 /// client typo, and answering 404 says so rather than silently storing a
 /// preference nothing will ever read.
-const KNOWN_PLUGINS: [&str; 1] = [PATHWAY];
+const KNOWN_PLUGINS: [&str; 2] = [PATHWAY, MEMORABILIA];
+
+/// Whether `plugin` is effectively enabled for `app_id`, dispatched to the
+/// host that owns it.
+async fn plugin_enabled(state: &AppState, plugin: &str, app_id: &str) -> bool {
+    match plugin {
+        MEMORABILIA => state.memorabilia.is_enabled(app_id).await,
+        _ => state.plugins.is_enabled(app_id).await,
+    }
+}
+
+/// Close `plugin`'s live per-app instance (stops its background work), on the
+/// host that owns it.
+async fn plugin_close(state: &AppState, plugin: &str, app_id: &str) {
+    match plugin {
+        MEMORABILIA => state.memorabilia.close(app_id).await,
+        _ => state.plugins.close(app_id).await,
+    }
+}
 
 fn err(status: StatusCode, message: impl Into<String>) -> Response {
     (status, Json(json!({ "error": message.into() }))).into_response()
@@ -49,7 +67,7 @@ pub async fn list(
         let explicit = stored.iter().find(|r| r.plugin == name);
         out.push(json!({
             "plugin": name,
-            "enabled": state.plugins.is_enabled(&identity.app_id).await,
+            "enabled": plugin_enabled(&state, name, &identity.app_id).await,
             // Distinguishes "I chose this" from "I inherited the default",
             // which matters because a daemon-default change moves the latter
             // and not the former.
@@ -85,7 +103,7 @@ pub async fn set(
     // a SQLite file held. `pathway_for` short-circuits on an already-open
     // instance, so without this the plugin would stay live until restart.
     if !body.enabled {
-        state.plugins.close(&identity.app_id).await;
+        plugin_close(&state, &plugin, &identity.app_id).await;
     }
 
     Json(json!({"ok": true})).into_response()
@@ -104,7 +122,7 @@ pub async fn clear(
         Ok(_) => {
             // The default may be "off", so drop any live instance and let the
             // next turn re-decide from scratch.
-            state.plugins.close(&identity.app_id).await;
+            plugin_close(&state, &plugin, &identity.app_id).await;
             Json(json!({"ok": true})).into_response()
         }
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),

@@ -76,6 +76,7 @@ async fn build_agent_inner(pool: &SqlitePool, provider_base_url: Option<&str>) -
         config,
         std::env::temp_dir().to_string_lossy().into_owned(),
         bigtiny2::plugins::test_plugin_host(pool),
+        bigtiny2::plugins::test_memorabilia_host(pool),
     ))
 }
 

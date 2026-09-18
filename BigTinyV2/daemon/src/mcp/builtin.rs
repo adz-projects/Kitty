@@ -42,10 +42,29 @@ pub async fn connect(
     name: &str,
     server_id: String,
     engine: Option<Arc<adaptive_pathway::engine::PathwayEngine>>,
+    memorabilia: Option<Arc<memorabilia::engine::Engine>>,
     orchestrator: Option<Arc<crate::agent::orchestrator::Orchestrator>>,
     pool: sqlx::SqlitePool,
 ) -> Result<MCPServerClient, MCPServerError> {
     match name {
+        "memorabilia" => {
+            // Read-only lookup tools (memorabilia_search / memorabilia_read_item)
+            // over the calling app's memory engine; the per-turn context
+            // injection is a separate loop hook (see `agent::loop_`).
+            let engine = memorabilia.ok_or_else(|| {
+                MCPServerError::Generic(
+                    "memorabilia MCP server requested but the memory engine is disabled"
+                        .to_string(),
+                )
+            })?;
+            MCPServerClient::connect_in_process(server_id, |stream| async move {
+                let server = memorabilia::mcp::MemorabiliaServer::new(engine);
+                if let Err(e) = server.serve_in_process(stream).await {
+                    tracing::error!("memorabilia in-process server exited with error: {e}");
+                }
+            })
+            .await
+        }
         "pathway" => {
             let engine = engine.ok_or_else(|| {
                 MCPServerError::Generic(
@@ -122,8 +141,14 @@ pub async fn connect(
 
 /// Every registered built-in name, for callers that want to validate a
 /// configured name before attempting a connect.
-pub const BUILTIN_SERVERS: [&str; 5] =
-    ["kitty-tools", "kitty-web", "kitty-wasm", "pathway", "specialists"];
+pub const BUILTIN_SERVERS: [&str; 6] = [
+    "kitty-tools",
+    "kitty-web",
+    "kitty-wasm",
+    "pathway",
+    "memorabilia",
+    "specialists",
+];
 
 /// Tool names owned by the `pathway` server, which need the executing
 /// session id injected into their arguments before dispatch
@@ -158,6 +183,7 @@ mod tests {
             "test-kitty-tools".to_string(),
             None,
             None,
+            None,
             test_pool().await,
         )
             .await
@@ -181,6 +207,7 @@ mod tests {
             "test".to_string(),
             None,
             None,
+            None,
             test_pool().await,
         )
         .await;
@@ -192,6 +219,7 @@ mod tests {
         let client = connect(
             "kitty-web",
             "test-kitty-web".to_string(),
+            None,
             None,
             None,
             test_pool().await,
@@ -208,6 +236,7 @@ mod tests {
         let client = connect(
             "kitty-wasm",
             "test-kitty-wasm".to_string(),
+            None,
             None,
             None,
             test_pool().await,
@@ -232,18 +261,60 @@ mod tests {
         )
         .await
         .expect("in-memory pathway engine");
+        let mem_engine = memorabilia::engine::Engine::open_at(
+            "sqlite::memory:",
+            memorabilia::config::Config::default(),
+            Arc::new(memorabilia::traits::MockChat {
+                response: serde_json::json!({}),
+            }),
+            Arc::new(memorabilia::embed::HashEmbedder::new(
+                memorabilia::config::Config::default().embedding_dim,
+            )),
+        )
+        .await
+        .expect("in-memory memorabilia engine");
         let orchestrator = test_orchestrator().await;
         for name in BUILTIN_SERVERS {
             connect(
                 name,
                 format!("test-{name}"),
                 Some(engine.clone()),
+                Some(mem_engine.clone()),
                 Some(orchestrator.clone()),
                 test_pool().await,
             )
             .await
             .unwrap_or_else(|e| panic!("advertised builtin {name} failed to connect: {e}"));
         }
+    }
+
+    #[tokio::test]
+    async fn the_memorabilia_server_advertises_its_lookup_tools() {
+        let engine = memorabilia::engine::Engine::open_at(
+            "sqlite::memory:",
+            memorabilia::config::Config::default(),
+            Arc::new(memorabilia::traits::MockChat {
+                response: serde_json::json!({}),
+            }),
+            Arc::new(memorabilia::embed::HashEmbedder::new(
+                memorabilia::config::Config::default().embedding_dim,
+            )),
+        )
+        .await
+        .expect("in-memory memorabilia engine");
+        let client = connect(
+            "memorabilia",
+            "test-memorabilia".to_string(),
+            None,
+            Some(engine),
+            None,
+            test_pool().await,
+        )
+        .await
+        .expect("memorabilia in-process connect should succeed");
+        let names: Vec<&str> = client.tools().iter().map(|t| t.name.as_str()).collect();
+        assert!(names.contains(&"memorabilia_search"));
+        assert!(names.contains(&"memorabilia_read_item"));
     }
 
     #[tokio::test]
@@ -257,6 +328,7 @@ mod tests {
             "pathway",
             "test-pathway".to_string(),
             Some(engine),
+            None,
             None,
             test_pool().await,
         )
@@ -276,6 +348,7 @@ mod tests {
         let client = connect(
             "specialists",
             "test-specialists".to_string(),
+            None,
             None,
             Some(test_orchestrator().await),
             test_pool().await,
@@ -300,6 +373,7 @@ mod tests {
             "test-specialists-off".to_string(),
             None,
             None,
+            None,
             test_pool().await,
         )
         .await
@@ -317,6 +391,7 @@ mod tests {
         match connect(
             "pathway",
             "test-pathway-off".to_string(),
+            None,
             None,
             None,
             test_pool().await,

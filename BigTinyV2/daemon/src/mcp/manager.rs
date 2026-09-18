@@ -65,6 +65,9 @@ pub struct MCPManager {
     /// while recall (which reaches the host directly) went on working and hid
     /// the failure.
     plugins: std::sync::OnceLock<Arc<crate::plugins::PluginHost>>,
+    /// The per-app memorabilia host, resolved the same way as `plugins` to
+    /// hand the in-process `memorabilia` server the calling app's engine.
+    memorabilia_plugins: std::sync::OnceLock<Arc<crate::plugins::MemorabiliaHost>>,
     /// `Arc` so a tool call can clone a client handle out of the map, drop the
     /// DashMap guard, and only then `.await` the call — holding the shard
     /// lock across an await previously blocked every sibling tool call on the
@@ -122,6 +125,7 @@ impl MCPManager {
             pool,
             pathway,
             plugins: std::sync::OnceLock::new(),
+            memorabilia_plugins: std::sync::OnceLock::new(),
             orchestrator: std::sync::OnceLock::new(),
             data_dir,
             servers: DashMap::new(),
@@ -149,6 +153,12 @@ impl MCPManager {
         let _ = self.plugins.set(plugins);
     }
 
+    /// Attach the memorabilia host, so the in-process `memorabilia` server can
+    /// be handed the calling app's engine (parallel to `attach_plugins`).
+    pub fn attach_memorabilia(&self, memorabilia: Arc<crate::plugins::MemorabiliaHost>) {
+        let _ = self.memorabilia_plugins.set(memorabilia);
+    }
+
     /// The engine the in-process `pathway` server should hold for `row`.
     ///
     /// Resolved per row rather than per daemon: V2 gives each app its own
@@ -171,6 +181,23 @@ impl MCPManager {
         match (self.plugins.get(), app_id) {
             (Some(plugins), Some(app_id)) => plugins.pathway_for(app_id).await,
             _ => self.pathway.clone(),
+        }
+    }
+
+    /// The engine the in-process `memorabilia` server should hold for `row` —
+    /// the calling app's memory graph, or `None` when memorabilia is off for
+    /// that app (on which `builtin::connect` refuses cleanly).
+    async fn memorabilia_engine_for(
+        &self,
+        name: &str,
+        app_id: Option<&str>,
+    ) -> Option<Arc<memorabilia::engine::Engine>> {
+        if name != "memorabilia" {
+            return None;
+        }
+        match (self.memorabilia_plugins.get(), app_id) {
+            (Some(host), Some(app_id)) => host.memorabilia_for(app_id).await,
+            _ => None,
         }
     }
 
@@ -223,12 +250,16 @@ impl MCPManager {
         let connect_result = if config.transport == TransportType::InProcess {
             let name = config.command.clone().unwrap_or_default();
             let engine = self.pathway_engine_for(&name, row.app_id.as_deref()).await;
+            let mem_engine = self
+                .memorabilia_engine_for(&name, row.app_id.as_deref())
+                .await;
             tokio::time::timeout(
                 CONNECT_TIMEOUT,
                 super::builtin::connect(
                     &name,
                     server_id.to_string(),
                     engine,
+                    mem_engine,
                     self.orchestrator.get().cloned(),
                     self.pool.clone(),
                 ),

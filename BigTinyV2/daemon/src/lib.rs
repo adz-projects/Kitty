@@ -200,12 +200,41 @@ pub async fn run(config: BigTinyConfig, options: RunOptions) -> Result<(), Daemo
     // single loop here because there was a single engine; carrying that
     // forward naively would mean one idle-sweep loop per registered app,
     // forever, whether or not the app ever sends a turn.
+    // Capture the shared embedder's identity before `ap_config`/`ap_embedder`
+    // are moved into the pathway host: memorabilia reuses the *same* loaded
+    // model (never a second one), sized to its live vector width so its
+    // vectors are comparable. A probe embed reads that width at startup; if
+    // the embedder is absent or the probe fails, memorabilia falls back to its
+    // own deterministic lexical hash embedder at the default width.
+    let mem_embed_space = ap_config.embedding.ollama_model.clone();
+    let (mem_embed_dim, mem_embedder_for_host) = match &ap_embedder {
+        Some(e) => match e.embed("dimension probe").await {
+            Some(v) if !v.is_empty() => (v.len(), ap_embedder.clone()),
+            _ => (memorabilia::config::Config::default().embedding_dim, None),
+        },
+        None => (memorabilia::config::Config::default().embedding_dim, None),
+    };
+
     let plugins = Arc::new(plugins::PluginHost::new(
         pool.clone(),
         std::path::PathBuf::from(&options.data_dir),
         config.pathway.enabled,
         ap_config,
         ap_embedder,
+        summarizer.clone(),
+    ));
+
+    // The declarative factual-memory plugin, hosted per app alongside pathway,
+    // sharing the same embedder and SummarizerChain.
+    let memorabilia = Arc::new(plugins::MemorabiliaHost::new(
+        pool.clone(),
+        std::path::PathBuf::from(&options.data_dir),
+        config.memorabilia.enabled,
+        config.memorabilia.db_name.clone(),
+        config.memorabilia.sweep_interval_s,
+        mem_embedder_for_host,
+        mem_embed_dim,
+        mem_embed_space,
         summarizer.clone(),
     ));
 
@@ -231,6 +260,7 @@ pub async fn run(config: BigTinyConfig, options: RunOptions) -> Result<(), Daemo
         config.clone(),
         options.data_dir.clone(),
         plugins.clone(),
+        memorabilia.clone(),
     ));
 
     orchestrator.attach(&agent);
@@ -239,6 +269,7 @@ pub async fn run(config: BigTinyConfig, options: RunOptions) -> Result<(), Daemo
     // Before `connect_all`, like the orchestrator attach above and for the
     // same reason: the `pathway` built-in resolves its engine at connect time.
     mcp.attach_plugins(plugins.clone());
+    mcp.attach_memorabilia(memorabilia.clone());
 
     // **Only now** connect the MCP servers. This used to run immediately after
     // `MCPManager::with_data_dir`, which is before the orchestrator exists --
@@ -295,6 +326,7 @@ pub async fn run(config: BigTinyConfig, options: RunOptions) -> Result<(), Daemo
         scheduler: scheduler.clone(),
         config: config.clone(),
         plugins: plugins.clone(),
+        memorabilia: memorabilia.clone(),
         replay: Arc::new(server::replay::ReplayBuffers::new()),
         key_cache: key_cache.clone(),
         instance_id: instance_id.clone(),
@@ -450,6 +482,7 @@ pub async fn run(config: BigTinyConfig, options: RunOptions) -> Result<(), Daemo
             mcp_health_watcher.abort();
             mcp.disconnect_all().await;
             plugins.shutdown().await;
+            memorabilia.shutdown().await;
             // Withdraw before the drain completes: a client that reads the
             // handshake from here on would be attaching to a daemon already on
             // its way out. Removal is best-effort -- a killed daemon leaves the
@@ -477,6 +510,7 @@ pub async fn run(config: BigTinyConfig, options: RunOptions) -> Result<(), Daemo
     mcp_health_watcher.abort();
     mcp.disconnect_all().await;
     plugins.shutdown().await;
+    memorabilia.shutdown().await;
     discovery::withdraw(std::path::Path::new(&options.data_dir)).await;
 
     Ok(())

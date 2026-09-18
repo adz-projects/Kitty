@@ -14,6 +14,10 @@ use crate::error::StorageError;
 /// the string is not scattered across the loop, the routes, and the host.
 pub const PATHWAY: &str = "pathway";
 
+/// The declarative factual-memory plugin (memorabilia). Compiled in alongside
+/// pathway; per-app selection lives in the same `app_plugins` table.
+pub const MEMORABILIA: &str = "memorabilia";
+
 #[derive(Debug, Clone)]
 pub struct PluginRow {
     pub plugin: String,

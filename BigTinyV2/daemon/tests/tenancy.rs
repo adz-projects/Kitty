@@ -41,6 +41,7 @@ async fn test_state() -> Arc<AppState> {
     sqlx::migrate!("./migrations").run(&pool).await.unwrap();
 
     let plugins = bigtiny2::plugins::test_plugin_host(&pool);
+    let memorabilia = bigtiny2::plugins::test_memorabilia_host(&pool);
 
     apps::register_app(&pool, APP_A, "App A", "key-a").await.unwrap();
     apps::register_app(&pool, APP_B, "App B", "key-b").await.unwrap();
@@ -66,6 +67,7 @@ async fn test_state() -> Arc<AppState> {
         config.clone(),
         std::env::temp_dir().to_string_lossy().into_owned(),
         plugins.clone(),
+        memorabilia.clone(),
     ));
     let orchestrator = Arc::new(bigtiny2::agent::orchestrator::Orchestrator::new(
         pool.clone(),
@@ -92,6 +94,7 @@ async fn test_state() -> Arc<AppState> {
         scheduler,
         config,
         plugins: plugins.clone(),
+        memorabilia: memorabilia.clone(),
         key_cache: Arc::new(bigtiny2::server::middleware::KeyCache::new()),
         replay: Arc::new(bigtiny2::server::replay::ReplayBuffers::new()),
         instance_id: "test-instance".to_string(),
@@ -1236,7 +1239,8 @@ async fn an_unknown_plugin_name_is_a_404_not_a_stored_preference() {
         .body(Body::empty())
         .unwrap();
     let body = body_json(router_as(state, APP_A).oneshot(req).await.unwrap()).await;
-    assert_eq!(body["plugins"].as_array().unwrap().len(), 1);
+    // Both compiled-in plugins are reported: pathway and memorabilia.
+    assert_eq!(body["plugins"].as_array().unwrap().len(), 2);
 }
 
 #[tokio::test]

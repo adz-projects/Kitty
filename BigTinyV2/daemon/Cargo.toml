@@ -142,6 +142,11 @@ kitty-wasm = { path = "../../plugins/kitty-wasm" }
 # Path dep so its crate is built with this crate's profile; it must stay
 # sqlx = "0.8" to keep a single libsqlite3-sys across this workspace.
 adaptive-pathway = { path = "../../plugins/adaptive-pathway_rust" }
+# Declarative factual-memory engine, linked in-process as a second plugin
+# alongside adaptive-pathway (see docs/adaptive-pathway-v2.md). Same rationale:
+# path dep so it builds with this crate's profile and shares one
+# libsqlite3-sys across the workspace.
+memorabilia = { path = "../../../../memorabilia" }
 
 # Windows-only generative summarizer runtime.
 [target.'cfg(windows)'.dependencies]

@@ -35,8 +35,10 @@
 //! comparable space.
 
 pub mod host;
+pub mod memorabilia_host;
 
 pub use host::PluginHost;
+pub use memorabilia_host::MemorabiliaHost;
 
 /// A `PluginHost` for tests: pathway **off** by default, state under a temp
 /// dir.
@@ -60,6 +62,33 @@ pub fn test_plugin_host(pool: &sqlx::SqlitePool) -> std::sync::Arc<crate::plugin
         false,
         adaptive_pathway::config::Config::default(),
         None,
+        summarizer,
+    ))
+}
+
+/// A `MemorabiliaHost` for tests: off by default, state under a temp dir, the
+/// deterministic lexical hash embedder (no shared model), and a null
+/// summarizer. Mirrors [`test_plugin_host`].
+pub fn test_memorabilia_host(
+    pool: &sqlx::SqlitePool,
+) -> std::sync::Arc<crate::plugins::MemorabiliaHost> {
+    let config = crate::config::BigTinyConfig::default();
+    let summarizer = std::sync::Arc::new(crate::agent::summarizer_chain::SummarizerChain::new(
+        None,
+        std::sync::Arc::new(crate::provider::router::ProviderRouter::new(
+            config.cache.clone(),
+        )),
+        config.summarizer.clone(),
+    ));
+    std::sync::Arc::new(crate::plugins::MemorabiliaHost::new(
+        pool.clone(),
+        std::env::temp_dir().join("bigtiny2-test-memorabilia"),
+        false,
+        "memorabilia.db".to_string(),
+        60,
+        None,
+        memorabilia::config::Config::default().embedding_dim,
+        String::new(),
         summarizer,
     ))
 }

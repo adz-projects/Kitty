@@ -49,6 +49,9 @@ pub struct AppState {
     /// daemon-wide `PathwayEngine`; ask it for the calling app's instance
     /// rather than assuming one exists.
     pub plugins: Arc<crate::plugins::PluginHost>,
+    /// The declarative factual-memory plugin, hosted per app alongside
+    /// `plugins` (pathway). Ask it for the calling app's engine.
+    pub memorabilia: Arc<crate::plugins::MemorabiliaHost>,
     /// Resolved-identity cache, shared with the auth middleware. Held here so
     /// revoking an app can invalidate it synchronously -- a revoked key that
     /// keeps working until a TTL expires is not an acceptable window.

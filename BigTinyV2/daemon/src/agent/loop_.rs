@@ -1227,6 +1227,10 @@ pub struct AgentLoop {
     plugins: Arc<crate::plugins::PluginHost>,
     /// Pathway learning cadence (`learn_every_n` exchanges).
     pathway_cfg: PathwayConfig,
+    /// The declarative factual-memory plugin, hosted per app.
+    memorabilia: Arc<crate::plugins::MemorabiliaHost>,
+    /// Memorabilia learning cadence (`learn_every_n` exchanges).
+    memorabilia_cfg: crate::config::MemorabiliaConfig,
     /// Sessions already warned about a pinned-provider mismatch (the
     /// `ModelFailover` notice at step 0). Shared with the daemon-lifetime
     /// `Agent` — this loop is rebuilt per turn, so the memory of "we already
@@ -1277,6 +1281,8 @@ impl AgentLoop {
         sandbox_strict: bool,
         plugins: Arc<crate::plugins::PluginHost>,
         pathway_cfg: PathwayConfig,
+        memorabilia: Arc<crate::plugins::MemorabiliaHost>,
+        memorabilia_cfg: crate::config::MemorabiliaConfig,
         provider_mismatch_warned: Arc<DashMap<String, ()>>,
         workspace_snapshots: Arc<DashMap<String, (String, String)>>,
         background_tasks: Arc<DashMap<String, Vec<tokio::task::AbortHandle>>>,
@@ -1300,6 +1306,8 @@ impl AgentLoop {
             sandbox_strict,
             plugins,
             pathway_cfg,
+            memorabilia,
+            memorabilia_cfg,
             provider_mismatch_warned,
             workspace_snapshots,
             background_tasks,
@@ -1518,6 +1526,21 @@ impl AgentLoop {
                     .await
             }
             None => (None, None),
+        };
+
+        // Memorabilia turn-start hook: its compact summary+index rides the
+        // same tail `system`-block channel as `ap_hints` (both plugins may be
+        // on), so the stable head stays byte-identical and no `build_messages`
+        // signature changes. `None`+`None` is still zero prompt delta.
+        let mem_hints = match &resolved_provider_id {
+            Some(_) => self.memorabilia_recall(session_id, user_message).await,
+            None => None,
+        };
+        let ap_hints = match (ap_hints, mem_hints) {
+            (Some(a), Some(m)) => Some(format!("{a}\n\n{m}")),
+            (Some(a), None) => Some(a),
+            (None, Some(m)) => Some(m),
+            (None, None) => None,
         };
 
         // Pre-flight memory recall ("the detour"): best-effort FTS5 lookup
@@ -3559,6 +3582,71 @@ impl AgentLoop {
             }
         });
         self.track_background(&learn_session_id_for_tracking, handle.abort_handle());
+
+        // Turn-end memorabilia learn (fire-and-forget): every
+        // `learn_every_n` exchanges, ingest the session's latest user+assistant
+        // exchange as evidence, then drain a bounded slice of Stage 4 so it
+        // becomes recallable without waiting for the maintenance sweep. Ingest
+        // is idempotent (two-tier content hashes), so a re-run is a no-op.
+        let mem_engine = match self.app_scope(session_id).await.0 {
+            Some(app_id) => self.memorabilia.memorabilia_for(&app_id).await,
+            None => None,
+        };
+        let mem_learn_every_n = self.memorabilia_cfg.learn_every_n.max(1);
+        let mem_pool = pool.clone();
+        let mem_session_id = session_id.to_string();
+        let mem_session_for_tracking = mem_session_id.clone();
+        let mem_handle = tokio::spawn(async move {
+            let Some(engine) = mem_engine else {
+                return;
+            };
+            // Cadence gate: assistant turns completed for this session. A DB
+            // error skips this turn rather than treating 0 as "every turn".
+            let Ok(count) = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM messages WHERE session_id = ? AND role = 'assistant'",
+            )
+            .bind(&mem_session_id)
+            .fetch_one(&mem_pool)
+            .await
+            else {
+                return;
+            };
+            if count == 0 || count % mem_learn_every_n as i64 != 0 {
+                return;
+            }
+            // The latest user + assistant messages, in chronological order.
+            let rows: Vec<(String, String)> = sqlx::query_as(
+                "SELECT role, COALESCE(content, '') FROM messages \
+                 WHERE session_id = ? AND role IN ('user', 'assistant') \
+                 ORDER BY rowid DESC LIMIT 2",
+            )
+            .bind(&mem_session_id)
+            .fetch_all(&mem_pool)
+            .await
+            .unwrap_or_default();
+            let mut text = String::new();
+            for (role, content) in rows.into_iter().rev() {
+                if !content.trim().is_empty() {
+                    text.push_str(&format!("{role}: {content}\n"));
+                }
+            }
+            if text.trim().is_empty() {
+                return;
+            }
+            let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+            engine
+                .ingest(&memorabilia::learn::IngestInput {
+                    content: text,
+                    source_type: "Conversation".into(),
+                    source_name: format!("session:{mem_session_id}"),
+                    source_entity: format!("session:{mem_session_id}"),
+                    captured_at: now.clone(),
+                    intent: None,
+                })
+                .await;
+            engine.drain_extraction(&now).await;
+        });
+        self.track_background(&mem_session_for_tracking, mem_handle.abort_handle());
     }
 
     /// Adaptive Pathway turn-start hook: in-process recall against the
@@ -3623,6 +3711,27 @@ impl AgentLoop {
             .flatten();
             (hints, None)
         }
+    }
+
+    /// Memorabilia turn-start hook: a compact summary + index of relevant
+    /// factual memory, injected as a tail `system` block (merged with
+    /// `ap_hints`) before the new user message. The model pulls any item in
+    /// full on demand through the `memorabilia_read_item` MCP tool. `None`
+    /// (zero prompt delta) when memorabilia is off for the app, times out, or
+    /// has nothing relevant — byte-identical to no-memory behavior.
+    async fn memorabilia_recall(&self, session_id: &str, user_message: &str) -> Option<String> {
+        let engine_owned = match self.app_scope(session_id).await.0 {
+            Some(app_id) => self.memorabilia.memorabilia_for(&app_id).await,
+            None => None,
+        };
+        let engine = engine_owned.as_ref()?;
+        tokio::time::timeout(
+            Duration::from_millis(AP_RECALL_EMBED_BUDGET_MS),
+            engine.recall(user_message),
+        )
+        .await
+        .ok()
+        .flatten()
     }
 
     /// Pre-flight memory recall hook, mirroring `pathway_recall`'s
@@ -5068,6 +5177,8 @@ mod containment_order_tests {
             false,
             crate::plugins::test_plugin_host(&pool),
             config.pathway.clone(),
+            crate::plugins::test_memorabilia_host(&pool),
+            config.memorabilia.clone(),
             Arc::new(DashMap::new()),
             Arc::new(DashMap::new()),
             Arc::new(DashMap::new()),

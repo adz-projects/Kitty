@@ -78,6 +78,11 @@ pub struct Agent {
     /// background sweep is now owned and stopped by the host, so there is no
     /// single channel left to signal.
     plugins: Arc<crate::plugins::PluginHost>,
+    /// The declarative factual-memory plugin, hosted per app alongside
+    /// `plugins`. The loop asks it for the session app's engine to inject a
+    /// summary+index of relevant memory before the turn and to ingest the
+    /// exchange after it.
+    memorabilia: Arc<crate::plugins::MemorabiliaHost>,
     /// Sessions already warned about a pinned-provider mismatch (see
     /// `AgentLoop::provider_mismatch_warned`) — daemon-lifetime, since each
     /// `AgentLoop` is rebuilt per turn.
@@ -156,6 +161,7 @@ impl Agent {
         config: BigTinyConfig,
         cache_dir: String,
         plugins: Arc<crate::plugins::PluginHost>,
+        memorabilia: Arc<crate::plugins::MemorabiliaHost>,
     ) -> Self {
         Self {
             db,
@@ -169,6 +175,7 @@ impl Agent {
             config,
             cache_dir,
             plugins,
+            memorabilia,
             provider_mismatch_warned: Arc::new(DashMap::new()),
             workspace_snapshots: Arc::new(DashMap::new()),
             background_tasks: Arc::new(DashMap::new()),
@@ -234,6 +241,8 @@ impl Agent {
             self.config.agent.sandbox_strict,
             self.plugins.clone(),
             self.config.pathway.clone(),
+            self.memorabilia.clone(),
+            self.config.memorabilia.clone(),
             self.provider_mismatch_warned.clone(),
             self.workspace_snapshots.clone(),
             self.background_tasks.clone(),
@@ -652,6 +661,7 @@ mod tests {
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
 
     let plugins = crate::plugins::test_plugin_host(&pool);
+        let memorabilia = crate::plugins::test_memorabilia_host(&pool);
 
         let config = BigTinyConfig::default();
         let router = Arc::new(ProviderRouter::new(config.cache.clone()));
@@ -674,6 +684,7 @@ mod tests {
             config,
             std::env::temp_dir().to_string_lossy().into_owned(),
             plugins.clone(),
+            memorabilia.clone(),
         ))
     }
 

@@ -31,6 +31,8 @@ pub struct BigTinyConfig {
     #[serde(default)]
     pub pathway: PathwayConfig,
     #[serde(default)]
+    pub memorabilia: MemorabiliaConfig,
+    #[serde(default)]
     pub litert: LiteRtConfig,
 }
 
@@ -93,6 +95,49 @@ fn default_pathway_db_name() -> String {
 }
 fn default_pathway_learn_every_n() -> u32 {
     4
+}
+
+/// Declarative factual-memory plugin config (`memorabilia`). Like pathway, it
+/// is off by default, so the in-process `"memorabilia"` MCP server and the
+/// context-injection hook are only wired when a host opts in.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MemorabiliaConfig {
+    #[serde(default = "default_memorabilia_enabled")]
+    pub enabled: bool,
+    /// Filename (relative to `apps/<app_id>/`) of the memory database.
+    #[serde(default = "default_memorabilia_db_name")]
+    pub db_name: String,
+    /// Learn cadence: run the turn-end ingest pass every N exchanges.
+    #[serde(default = "default_memorabilia_learn_every_n")]
+    pub learn_every_n: u32,
+    /// Background maintenance sweep cadence, seconds (decay/archive, outbox
+    /// drain, heavy pass). Mirrors `Config::maintenance_tick_s` on the engine.
+    #[serde(default = "default_memorabilia_sweep_interval_s")]
+    pub sweep_interval_s: u64,
+}
+
+impl Default for MemorabiliaConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_memorabilia_enabled(),
+            db_name: default_memorabilia_db_name(),
+            learn_every_n: default_memorabilia_learn_every_n(),
+            sweep_interval_s: default_memorabilia_sweep_interval_s(),
+        }
+    }
+}
+
+fn default_memorabilia_enabled() -> bool {
+    false
+}
+fn default_memorabilia_db_name() -> String {
+    "memorabilia.db".to_string()
+}
+fn default_memorabilia_learn_every_n() -> u32 {
+    4
+}
+fn default_memorabilia_sweep_interval_s() -> u64 {
+    60
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -756,6 +801,9 @@ Ok(config)
         }
         if other.pathway != PathwayConfig::default() {
             self.pathway = other.pathway.clone();
+        }
+        if other.memorabilia != MemorabiliaConfig::default() {
+            self.memorabilia = other.memorabilia.clone();
         }
     }
 }
