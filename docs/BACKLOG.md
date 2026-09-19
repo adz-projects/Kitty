@@ -147,3 +147,29 @@ open an item here instead.
   write failed (see docs/ANDROID.md §2.4a). This item stays open: the download
   path being functional is not the same as being offline, and bundling still
   needs the extract-to-app-storage step described above.
+
+- **Compaction model swap: MiniCPM5-2B-LiteRT considered, declined (2026-09-19).**
+  Evaluated replacing the Windows summarizer model `gemma-4-E2B-it.litertlm`
+  (repo `litert-community/gemma-4-E2B-it-litert-lm`, `curated_models.ts` /
+  `DEFAULT_SUMMARIZER_GGUF`) with `mlboydaisuke/MiniCPM5-2B-LiteRT`. Declined:
+  it is a **hybrid-reasoning** model that emits a `<think>` block before every
+  answer unless given `ThinkingConfig(enable_thinking=false)` (which the
+  summarizer loader does not set, and which needs `litert-lm-rust` ≥ 0.16) — a
+  poor fit for a deterministic JSON-summarization slot, and its int4 variant is
+  documented to frequently not close its reasoning within a 3584-token budget.
+  Size is not a win either: int8 ≈ 2.6 GB vs Gemma's 2.59 GB (int4 is 1.55 GB
+  but is the problematic variant). The only upside is its Apache-2.0/ungated
+  license vs Gemma's gate, which is not worth the behavioral risk for a slot
+  that already works. If revisited: swap the `curated_models.ts` entry + a
+  `LEGACY_SUMMARIZER_TAGS`-style migration for `DEFAULT_SUMMARIZER_GGUF`, and
+  add `ThinkingConfig(enable_thinking=false)` to the summarizer loader.
+
+- **`lean_read_image` on a non-vision provider (item 5 follow-up, 2026-09-19).**
+  The new `lean_read_image` tool is advertised to every session regardless of
+  the active provider's vision capability, because the daemon tracks no
+  vision/accepts-images flag per provider (user-turn images are gated only by
+  Kitty's frontend). If a non-vision model calls the tool, the loop injects an
+  `image_url` user turn that a strict non-vision provider will 400 on. The tool
+  description says it is only useful with a vision model, but the real fix is to
+  relay the Kitty provider's `accepts_images` into the daemon and gate either
+  the tool advertisement or the image injection on it.

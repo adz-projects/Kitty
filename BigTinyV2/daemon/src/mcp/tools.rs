@@ -6,10 +6,17 @@ use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use serde_json::Value;
 
-use crate::models::mcp::ToolDefinition;
+use crate::models::mcp::{ToolDefinition, ToolResultImage};
 
 /// Ported from `mcp/tools.py`: byte-based (not char-based) truncation limit.
 pub const MAX_TOOL_OUTPUT_BYTES: usize = 100 * 1024;
+
+/// Total base64 image bytes preserved from one tool result, and the max number
+/// of image parts. Images bypass `MAX_TOOL_OUTPUT_BYTES` (that caps *text*) but
+/// still need a bound so a tool returning a wall of large images can't blow the
+/// model's context. Extras past either limit are dropped.
+pub const MAX_TOOL_IMAGE_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_TOOL_IMAGES: usize = 4;
 pub const TRUNCATION_MESSAGE: &str =
     "[Output truncated at 100KB. Use server-specific pagination to retrieve full data.]";
 
@@ -111,6 +118,33 @@ pub fn extract_content_from_json_sized(content: &Value) -> (String, usize) {
         }
     }
     join.finish()
+}
+
+/// Image content parts (`RawContent::Image`) from an rmcp `CallToolResult`,
+/// bounded by `MAX_TOOL_IMAGES` / `MAX_TOOL_IMAGE_BYTES`. Text extraction drops
+/// these (they aren't text); this is the parallel channel that keeps them so the
+/// agent loop can feed them to a vision model. Only the stdio rmcp path carries
+/// images today (the servers Kitty bundles); the SSE/JSON path does not.
+pub fn extract_images_from_rmcp(content: &[rmcp::model::Content]) -> Vec<ToolResultImage> {
+    let mut images = Vec::new();
+    let mut total = 0usize;
+    for part in content {
+        if images.len() >= MAX_TOOL_IMAGES {
+            break;
+        }
+        if let rmcp::model::RawContent::Image(img) = &part.raw {
+            let bytes = img.data.len();
+            if total.saturating_add(bytes) > MAX_TOOL_IMAGE_BYTES {
+                continue;
+            }
+            total += bytes;
+            images.push(ToolResultImage {
+                data: img.data.clone(),
+                mime_type: img.mime_type.clone(),
+            });
+        }
+    }
+    images
 }
 
 /// Same extraction rules as `extract_content_from_json`, for rmcp's typed

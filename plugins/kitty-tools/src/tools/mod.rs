@@ -5,6 +5,7 @@
 pub mod cache;
 pub mod excel;
 pub mod fs;
+pub mod image;
 pub mod pdf;
 pub mod scratchpad;
 pub mod shell;

@@ -634,6 +634,12 @@ pub async fn activate_provider(
     // window's own open session (if it has one), so this pick never bleeds
     // into other windows' sessions. Resolved from the profile's first model,
     // the same default `sync_active_provider`/`rebind_session` use.
+    //
+    // `stamped_model` is captured so the `provider://activated` payload below
+    // can carry the exact model the session was stamped with — the front end
+    // needs it to update `sessionModelId` without a session reload (see the
+    // event handler in `chatStore`).
+    let mut stamped_model: Option<String> = None;
     if let (Some(sid), Some(pid)) = (session_id.as_deref(), stamp_pid.as_deref()) {
         // Resolved together: the stamp must carry the id the daemon registry
         // actually knows (see `daemon_provider_id`), which differs from the
@@ -649,6 +655,7 @@ pub async fn activate_provider(
             })
         };
         if let Some((daemon_pid, default_model)) = stamp {
+            stamped_model = Some(default_model.clone());
             crate::bigtiny::providers::set_session_provider(
                 &app,
                 sid,
@@ -661,7 +668,21 @@ pub async fn activate_provider(
 
     // Tell the frontend to re-sync provider state immediately (Round-2 item 4) —
     // without this the UI drifts until the next session create/load or health tick.
-    let _ = app.emit("provider://activated", ());
+    //
+    // The payload carries the *profile* id (`stamp_pid`, what the front end
+    // resolves the badge against — not `daemon_provider_id`) and the model the
+    // session was stamped with, so the invoking window can update its live
+    // session's `sessionProviderId`/`sessionModelId` in place. Without this the
+    // pill re-derived against the *stale* stamp and kept showing the old
+    // provider/model until the next session load.
+    let _ = app.emit(
+        "provider://activated",
+        serde_json::json!({
+            "session_id": session_id,
+            "provider_id": stamp_pid,
+            "model": stamped_model,
+        }),
+    );
 
     // No warm/evict step any more: that existed to keep an Ollama-resident
     // model hot across a provider switch. The in-process engine's slot manager

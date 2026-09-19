@@ -45,6 +45,7 @@ import type {
   Schedule,
   ScheduledTask,
   SessionInfo,
+  ProviderActivatedPayload,
   SessionTitleEvent,
   SetupValidation,
   StackStatus,
@@ -401,6 +402,11 @@ export const ipc = {
   // NOT live here — see getKittyWebEnabled/getBraveMcpSearchStatus.
   getKittyToolsEnabled: () => invoke<boolean>('get_kitty_tools_enabled'),
   setKittyToolsEnabled: (enabled: boolean) => invoke<void>('set_kitty_tools_enabled', { enabled }),
+  // Global master switch for delegation (specialists). Off unregisters the
+  // in-process specialists MCP server, so the model is never offered
+  // call_specialist/await_specialists/list_specialists (re-synced live).
+  getSpecialistsEnabled: () => invoke<boolean>('get_specialists_enabled'),
+  setSpecialistsEnabled: (enabled: boolean) => invoke<void>('set_specialists_enabled', { enabled }),
   // Bundled Rust web search/scrape MCP server (kitty-web) — the Rust
   // replacement for the retired Python kitty-docs-web; on by default, no
   // credentials. Hosts the merged, count-tiered
@@ -456,10 +462,8 @@ export const ipc = {
 
   // Declarative factual-memory engine (`plugins/memorabilia_rust`, linked
   // in-process into BigTiny — see `src-tauri/src/commands/memorabilia.rs`).
-  getMemorabiliaMcpStatus: () =>
-    invoke<MemorabiliaMcpStatus | null>('get_memorabilia_mcp_status'),
-  setMemorabiliaEnabled: (enabled: boolean) =>
-    invoke<void>('set_memorabilia_enabled', { enabled }),
+  getMemorabiliaMcpStatus: () => invoke<MemorabiliaMcpStatus | null>('get_memorabilia_mcp_status'),
+  setMemorabiliaEnabled: (enabled: boolean) => invoke<void>('set_memorabilia_enabled', { enabled }),
   /** Active memory items (Settings fact browser). */
   getMemorabiliaItems: () =>
     invoke<{ items: MemorabiliaItem[]; count: number }>('get_memorabilia_items'),
@@ -640,8 +644,14 @@ export interface ProviderHealth {
 export const onProviderHealth = (cb: (h: ProviderHealth) => void) =>
   listen<ProviderHealth>('provider://health', (e) => cb(e.payload));
 
-/** Fired after a provider is (de)activated + goosed respawns (Round-2 item 4). */
-export const onProviderActivated = (cb: () => void) => listen('provider://activated', () => cb());
+/** Fired after a provider is (de)activated + goosed respawns (Round-2 item 4).
+    The payload carries the stamped session's provider/model so the invoking
+    window can update its live session in place (see `ProviderActivatedPayload`);
+    callers that only need to re-fetch can ignore the argument. */
+export const onProviderActivated = (cb: (p: ProviderActivatedPayload) => void) =>
+  listen<ProviderActivatedPayload>('provider://activated', (e) =>
+    cb(e.payload ?? { session_id: null, provider_id: null, model: null })
+  );
 
 /** The label of the window this webview is running in (`overlay` / `main` / …). */
 export const windowLabel = (): string => getCurrentWebview().label;

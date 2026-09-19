@@ -3,6 +3,7 @@
 import { create } from 'zustand';
 import { ipc } from '@/lib/ipc';
 import { parseSession, type SessionSummary } from '@/lib/types';
+import { useStackStore, selectBooting } from '@/stores/stackStore';
 
 export const UNCATEGORIZED = 'Uncategorized';
 
@@ -51,6 +52,10 @@ export const useSessionStore = create<SessionState>((set, get) => ({
 
   refresh: async () => {
     set({ loading: true, loadError: null });
+    // Set when a booting-retry is scheduled, so `finally` leaves the list in
+    // its loading state (the spinner) instead of flipping to "No sessions."
+    // between attempts.
+    let retryScheduled = false;
     try {
       const raw = await ipc.listSessions();
       // Verbatim string compare of the backend's naive `"YYYY-MM-DD HH:MM:SS"`
@@ -63,12 +68,23 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       set({ sessions });
       await get().refreshFolders();
     } catch (e) {
+      // During the startup grace window the daemon simply isn't listening yet
+      // (first start on Windows, every start on Android). Surfacing the hard
+      // "BigTiny request failed … Retry" error on that first miss is the flash
+      // item 2 removes: swallow it, keep the list in its loading state, and
+      // retry shortly. The stack→ok subscription in SessionList also re-runs
+      // refresh the moment the backend connects.
+      if (selectBooting(useStackStore.getState())) {
+        retryScheduled = true;
+        setTimeout(() => void get().refresh(), 1200);
+        return;
+      }
       // Previously this escaped the try/finally with no catch, so a caller's
       // `void refresh()` produced an unhandled promise rejection whenever the
       // IPC call failed — capture the error in state instead.
       set({ loadError: e instanceof Error ? e.message : String(e) });
     } finally {
-      set({ loading: false });
+      if (!retryScheduled) set({ loading: false });
     }
   },
 

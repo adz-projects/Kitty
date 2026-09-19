@@ -335,7 +335,7 @@ pub fn document(
     let desc_text = escape_text(description);
     let cx = width / 2.0;
     format!(
-        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width:.0} {height:.0}" width="100%" height="auto" role="img" aria-label="{title_attr}">
+        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width:.0} {height:.0}" width="100%" role="img" aria-label="{title_attr}">
     <title>{title_text}</title>
     <desc>{desc_text}</desc>
     {defs}

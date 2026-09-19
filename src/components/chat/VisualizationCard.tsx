@@ -86,7 +86,11 @@ function ToolResultIframe({ payload }: { payload: IframeRenderPayload }) {
       if (e.source !== iframeRef.current?.contentWindow) return;
       const data = e.data as { type?: string; height?: number } | null;
       if (data?.type === 'mcp-iframe-resize' && typeof data.height === 'number') {
-        setHeight(Math.max(40, Math.min(data.height, 4000)));
+        // Ceiling raised from 4000 (item 4): the content side now sizes SVGs
+        // deterministically from their true aspect ratio, so a tall-but-narrow
+        // diagram/chart legitimately reports > 4000px and would otherwise be
+        // clipped by the old clamp (the frame has overflow-y hidden).
+        setHeight(Math.max(40, Math.min(data.height, 12000)));
       }
     }
     window.addEventListener('message', onMessage);

@@ -3333,6 +3333,8 @@ impl AgentLoop {
             }
 
             // Execute tool calls concurrently (bounded by max_concurrent_tool_calls)
+            let tool_images: dashmap::DashMap<String, Vec<crate::models::mcp::ToolResultImage>> =
+                dashmap::DashMap::new();
             let tool_results = self
                 .execute_tools(
                     session_id,
@@ -3340,6 +3342,7 @@ impl AgentLoop {
                     allowed_dirs,
                     session_cwd,
                     event_tx,
+                    &tool_images,
                 )
                 .await;
 
@@ -3385,6 +3388,35 @@ impl AgentLoop {
                     "tool_call_id": tc.id,
                 }));
             }
+
+            // A `tool`-role message can't carry image blocks on every provider,
+            // so any images a tool returned (e.g. `lean_read_image`) are
+            // surfaced as one synthesized `user` turn right after the tool
+            // results — the shape every vision provider accepts and the context
+            // builder already normalizes (`normalize_image_block`). Ordered by
+            // the tool calls so the images track the order they were produced.
+            let mut image_parts: Vec<Value> = Vec::new();
+            for tc in &turn_tool_calls {
+                if let Some((_, imgs)) = tool_images.remove(&tc.id) {
+                    for img in imgs {
+                        image_parts.push(json!({
+                            "type": "image_url",
+                            "image_url": {
+                                "url": format!("data:{};base64,{}", img.mime_type, img.data)
+                            }
+                        }));
+                    }
+                }
+            }
+            if !image_parts.is_empty() {
+                let mut content = vec![json!({
+                    "type": "text",
+                    "text": "Image(s) returned by the tool call(s) above:"
+                })];
+                content.extend(image_parts);
+                messages.push(json!({ "role": "user", "content": content }));
+            }
+
             if let Err(e) = self.context.save_messages(session_id, &mut messages).await {
                 tracing::warn!("failed to save messages for session {session_id}: {e}");
             }
@@ -4153,6 +4185,7 @@ impl AgentLoop {
         allowed_dirs: &[String],
         session_cwd: Option<&str>,
         event_tx: &mpsc::UnboundedSender<SSEEvent>,
+        image_sink: &dashmap::DashMap<String, Vec<crate::models::mcp::ToolResultImage>>,
     ) -> Vec<String> {
         let semaphore = Arc::new(Semaphore::new(self.max_concurrent_tool_calls.max(1)));
 
@@ -4199,6 +4232,7 @@ impl AgentLoop {
                 allowed_dirs,
                 semaphore,
                 event_tx,
+                image_sink,
             )
         });
 
@@ -4232,6 +4266,11 @@ impl AgentLoop {
         allowed_dirs: &[String],
         semaphore: Arc<Semaphore>,
         event_tx: &mpsc::UnboundedSender<SSEEvent>,
+        // Concurrent sink for any image parts a tool returns, keyed by
+        // tool_call_id. Text results flow back through the return value; images
+        // can't (a `tool`-role message is text), so they go here and the caller
+        // drains them into a synthesized user turn after the fan-out (item 5).
+        image_sink: &dashmap::DashMap<String, Vec<crate::models::mcp::ToolResultImage>>,
     ) -> String {
         let _ = event_tx.send(SSEEvent {
             event_type: SSEEventType::ToolStart,
@@ -4603,6 +4642,14 @@ impl AgentLoop {
         } else {
             result.content.clone()
         };
+
+        // Stash any image parts (e.g. from `lean_read_image`) for the caller to
+        // inject into the conversation as `image_url` blocks — never on an
+        // error result. The tool message itself still carries `output` (a short
+        // text ack), keeping the assistant/tool pairing intact.
+        if !result.is_error && !result.images.is_empty() {
+            image_sink.insert(tool_call_id.clone(), result.images.clone());
+        }
 
         let _ = event_tx.send(SSEEvent {
             event_type: SSEEventType::ToolFinish,
@@ -5207,6 +5254,7 @@ mod containment_order_tests {
     async fn write_tool_containment_deny_creates_no_pending_action() {
         let (agent_loop, hitl) = test_loop().await;
         let (tx, _rx) = mpsc::unbounded_channel::<SSEEvent>();
+        let sink = dashmap::DashMap::new();
         let result = agent_loop
             .execute_one_tool_call(
                 "sess-1",
@@ -5216,6 +5264,7 @@ mod containment_order_tests {
                 &["/allowed".to_string()],
                 Arc::new(Semaphore::new(1)),
                 &tx,
+                &sink,
             )
             .await;
         assert!(
@@ -5237,6 +5286,7 @@ mod containment_order_tests {
         let agent_loop = Arc::new(agent_loop);
         let al = agent_loop.clone();
         let handle = tokio::spawn(async move {
+            let sink = dashmap::DashMap::new();
             al.execute_one_tool_call(
                 "sess-1",
                 "tc-1".to_string(),
@@ -5245,6 +5295,7 @@ mod containment_order_tests {
                 &["/allowed".to_string()],
                 Arc::new(Semaphore::new(1)),
                 &tx,
+                &sink,
             )
             .await
         });

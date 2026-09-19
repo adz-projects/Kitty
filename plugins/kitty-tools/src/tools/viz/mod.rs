@@ -24,17 +24,40 @@ use serde_json::{json, Map, Value};
 const WRAPPER: &str = include_str!("assets/wrapper.html");
 const DEFS: &str = include_str!("assets/defs.svg");
 
-fn wrap_in_standalone_html(title: &str, body_content: &str) -> String {
+/// Wrap a body fragment in the standalone iframe document. `content_dims` is
+/// the SVG canvas `(width, height)` for diagram/chart payloads, which the
+/// wrapper's resize script uses to size the SVG deterministically (see
+/// `wrapper.html` trap #3); `None` for HTML tables, which the script measures
+/// directly. The numeric tokens are plain integers (not user text), so no
+/// escaping is needed for them.
+fn wrap_in_standalone_html_sized(
+    title: &str,
+    body_content: &str,
+    content_dims: Option<(f32, f32)>,
+) -> String {
     // `TITLE` lands in the RCDATA `<title>…</title>` context, so it must be
     // HTML-escaped (`<`, `>`, `&`; quotes are inert there) — otherwise a
     // title like `</title><script>…` would close the element and execute.
     // `BODY` is already-escaped SVG/HTML from the renderers and must NOT be
     // double-escaped, so it passes through verbatim.
     let escaped_title = escape::escape_text(title);
+    let (cw, ch) = match content_dims {
+        Some((w, h)) => (format!("{w:.0}"), format!("{h:.0}")),
+        None => (String::new(), String::new()),
+    };
     escape::render_template(
         WRAPPER,
-        &[("TITLE", &escaped_title), ("BODY", body_content)],
+        &[
+            ("TITLE", &escaped_title),
+            ("BODY", body_content),
+            ("CONTENT_W", &cw),
+            ("CONTENT_H", &ch),
+        ],
     )
+}
+
+fn wrap_in_standalone_html(title: &str, body_content: &str) -> String {
+    wrap_in_standalone_html_sized(title, body_content, None)
 }
 
 fn success_payload(title: &str, html_payload: &str, warnings: &[String]) -> String {
@@ -109,7 +132,8 @@ pub fn generate_accessible_svg(
         height,
         &body,
     );
-    let standalone = wrap_in_standalone_html(&validated.title, &svg);
+    let standalone =
+        wrap_in_standalone_html_sized(&validated.title, &svg, Some((width, height)));
     success_payload(&validated.title, &standalone, &validated.warnings)
 }
 
@@ -149,7 +173,7 @@ pub fn generate_accessible_chart(
     let sr_table = render::table::render_sr_only(title, &table_headers, &table_rows);
 
     let combined = format!("{svg}\n{sr_table}");
-    let standalone = wrap_in_standalone_html(title, &combined);
+    let standalone = wrap_in_standalone_html_sized(title, &combined, Some((width, height)));
     success_payload(title, &standalone, &[])
 }
 

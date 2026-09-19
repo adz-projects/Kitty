@@ -3680,7 +3680,7 @@ dependencies = [
 
 [[package]]
 name = "kitty"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "base64 0.22.1",
  "bigtiny2-client",
@@ -3723,6 +3723,7 @@ name = "kitty-tools"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "calamine",
  "dirs 5.0.1",
  "lopdf",

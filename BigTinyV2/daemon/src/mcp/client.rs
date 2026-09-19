@@ -12,12 +12,14 @@ use serde_json::Value;
 use tokio::process::Command;
 
 use crate::error::MCPServerError;
-use crate::models::mcp::{MCPServerConfig, ToolDefinition, ToolResult, TransportType};
+use crate::models::mcp::{
+    MCPServerConfig, ToolDefinition, ToolResult, ToolResultImage, TransportType,
+};
 
 use super::child_transport::ChildProcessTransport;
 use super::rw_transport::HardenedRwTransport;
 use super::sse_transport::SseTransport;
-use super::tools::{extract_content_from_rmcp_sized, truncate_output};
+use super::tools::{extract_content_from_rmcp_sized, extract_images_from_rmcp, truncate_output};
 
 const CLIENT_NAME: &str = "bigtiny";
 const CLIENT_VERSION: &str = "0.1.0";
@@ -379,9 +381,25 @@ impl MCPServerClient {
                     };
                     let is_error = result.is_error.unwrap_or(false);
                     let (content, raw_bytes) = extract_content_from_rmcp_sized(&result.content);
-                    Ok::<(bool, String, usize), MCPServerError>((is_error, content, raw_bytes))
+                    // Image parts ride a separate channel (text extraction drops
+                    // them): the agent loop feeds them to a vision model.
+                    let images = extract_images_from_rmcp(&result.content);
+                    Ok::<(bool, String, usize, Vec<ToolResultImage>), MCPServerError>((
+                        is_error, content, raw_bytes, images,
+                    ))
                 }
-                ClientHandle::Sse(sse) => sse.call_tool(tool_name, args).await,
+                ClientHandle::Sse(sse) => {
+                    // The SSE/JSON path doesn't carry images (remote SSE servers
+                    // returning image blocks is out of scope); widen its tuple
+                    // with an empty image list so both arms have one type.
+                    let (is_error, content, raw_bytes) = sse.call_tool(tool_name, args).await?;
+                    Ok::<(bool, String, usize, Vec<ToolResultImage>), MCPServerError>((
+                        is_error,
+                        content,
+                        raw_bytes,
+                        Vec::new(),
+                    ))
+                }
             }
         };
 
@@ -391,7 +409,7 @@ impl MCPServerClient {
         // lets the inner, cancelling timeout win the race and report the
         // clearer error.
         match tokio::time::timeout(timeout + TIMEOUT_GRACE, call).await {
-            Ok(Ok((is_error, content, raw_bytes))) => {
+            Ok(Ok((is_error, content, raw_bytes, images))) => {
                 // Clamp, don't wrap: `raw_bytes as i32` silently goes
                 // negative past 2 GB, which then lands in the DB as a
                 // nonsense negative size.
@@ -404,6 +422,7 @@ impl MCPServerClient {
                     output_size_bytes,
                     is_error,
                     truncated,
+                    images,
                 }
             }
             // The rmcp path's own (cancelling) timeout. Reported with the same
@@ -416,6 +435,7 @@ impl MCPServerClient {
                 output_size_bytes: 0,
                 is_error: true,
                 truncated: false,
+                images: Vec::new(),
             },
             Ok(Err(e)) => ToolResult {
                 content: format!("[Tool '{tool_name}' error: {e}]"),
@@ -424,6 +444,7 @@ impl MCPServerClient {
                 output_size_bytes: 0,
                 is_error: true,
                 truncated: false,
+                images: Vec::new(),
             },
             Err(_) => ToolResult {
                 content: format!(
@@ -435,6 +456,7 @@ impl MCPServerClient {
                 output_size_bytes: 0,
                 is_error: true,
                 truncated: false,
+                images: Vec::new(),
             },
         }
     }

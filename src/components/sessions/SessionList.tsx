@@ -6,8 +6,10 @@ import {
   type PointerEvent as ReactPointerEvent,
 } from 'react';
 import { UNCATEGORIZED, useSessionStore, type SessionGroup } from '@/stores/sessionStore';
+import { useStackStore, selectBooting } from '@/stores/stackStore';
 import { useChatStore } from '@/stores/chatStore';
 import { useRouteStore } from '@/stores/routeStore';
+import { StartupSpinner } from '@/components/shared/StartupSpinner';
 import {
   ipc,
   pickFolder,
@@ -52,6 +54,9 @@ export function SessionList() {
   // reassigned — even though nothing on screen necessarily moved.
   const loading = useSessionStore((s) => s.loading);
   const loadError = useSessionStore((s) => s.loadError);
+  // While the backend is still coming up, the list shows a spinner rather than
+  // the "request failed / Retry" error or a premature "No sessions." (item 2).
+  const booting = useStackStore(selectBooting);
   const query = useSessionStore((s) => s.query);
   const folders = useSessionStore((s) => s.folders);
   const refresh = useSessionStore((s) => s.refresh);
@@ -213,6 +218,16 @@ export function SessionList() {
 
   useEffect(() => {
     void refresh();
+  }, [refresh]);
+
+  useEffect(() => {
+    // The moment the backend first connects, refetch — the mount-time fetch
+    // (and its booting-retry loop) may have raced ahead of the daemon binding
+    // its port (item 2). zustand's subscribe hands us (state, prevState).
+    const unsub = useStackStore.subscribe((s, prev) => {
+      if (s.status === 'ok' && prev.status !== 'ok') void refresh();
+    });
+    return unsub;
   }, [refresh]);
 
   useEffect(() => {
@@ -450,7 +465,7 @@ export function SessionList() {
           being set by the store and rendered by nobody, which is what made a
           delete that the backend rejected look like it had silently done
           nothing — the row simply stayed put with no explanation. */}
-      {loadError && (
+      {loadError && !booting && (
         <p className="session-empty error" role="alert">
           {loadError}{' '}
           <button className="link" onClick={() => void refresh()}>
@@ -459,13 +474,17 @@ export function SessionList() {
         </p>
       )}
 
-      {loading && total === 0 && <p className="muted session-empty">Loading…</p>}
+      {/* Startup grace (item 2): the daemon isn't listening yet, so show a
+          spinner instead of "Loading…"/"No sessions."/the request-failed error. */}
+      {booting && total === 0 && <StartupSpinner />}
+
+      {!booting && loading && total === 0 && <p className="muted session-empty">Loading…</p>}
       {/* On desktop, an existing-but-empty folder still renders its own
           (empty) header via FolderGroup below, so this only announces "no
           sessions" when there's truly nothing, including no folders, to
           show. Android never renders folder headers at all, so `total === 0`
           alone is the right check there regardless of `folders.length`. */}
-      {!loading && total === 0 && (isAndroid() || folders.length === 0) && (
+      {!booting && !loading && total === 0 && (isAndroid() || folders.length === 0) && (
         <p className="muted session-empty">No sessions.</p>
       )}
 

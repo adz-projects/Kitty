@@ -282,6 +282,8 @@ pub fn run() {
             commands::set_visualizations_enabled,
             commands::get_kitty_tools_enabled,
             commands::set_kitty_tools_enabled,
+            commands::get_specialists_enabled,
+            commands::set_specialists_enabled,
             commands::get_kitty_web_enabled,
             commands::set_kitty_web_enabled,
             commands::get_brave_mcp_search_status,

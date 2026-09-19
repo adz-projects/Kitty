@@ -182,7 +182,7 @@ export function findMatchingProvider(
   );
 }
 
-/** `kitty-tools`' three visualization tools (`plugins/kitty-tools/src/tools/
+/** `kitty-tools`' visualization tools (`plugins/kitty-tools/src/tools/
     viz/mod.rs`) render as an inline card in the message body instead of the
     generic collapsed tool tray — see `VisualizationCard`. Matched on
     `toolName` alone; these names are frozen console-script-style tool
@@ -191,6 +191,9 @@ const VISUALIZATION_TOOL_NAMES = new Set([
   'generate_accessible_svg',
   'generate_accessible_table',
   'generate_accessible_chart',
+  // Was missing: mermaid output fell through to the generic collapsed tool
+  // tray instead of rendering as a VisualizationCard (item 4).
+  'generate_accessible_mermaid',
 ]);
 
 export function isVisualizationToolCall(call: ToolCall): boolean {

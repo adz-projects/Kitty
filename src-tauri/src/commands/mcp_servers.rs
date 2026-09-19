@@ -144,6 +144,30 @@ pub async fn set_kitty_tools_enabled(
     Ok(())
 }
 
+/// Global master switch for delegation (specialists). When off, the
+/// `specialists` in-process MCP server registers disabled, so the model is
+/// never offered `call_specialist`/`await_specialists`/`list_specialists`.
+/// Re-synced live via `ensure_builtin_servers` — no daemon restart.
+#[tauri::command]
+pub fn get_specialists_enabled(state: tauri::State<'_, AppState>) -> Result<bool, String> {
+    Ok(state.config.lock().unwrap().specialists.enabled)
+}
+
+#[tauri::command]
+pub async fn set_specialists_enabled(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    enabled: bool,
+) -> Result<(), String> {
+    {
+        let mut cfg = state.config.lock().unwrap();
+        cfg.specialists.enabled = enabled;
+        config::save(&cfg).map_err(|e| e.to_string())?;
+    }
+    mcp::ensure_builtin_servers(&app).await;
+    Ok(())
+}
+
 /// Whether the bundled `kitty-web` web-search/web-scrape server is
 /// registered+enabled in BigTiny. No credentials, so a plain toggle like
 /// `wasm_math_mcp` above.

@@ -77,6 +77,17 @@ pub struct ToolDefinition {
     pub server_id: String,
 }
 
+/// One image content block returned by a tool (e.g. `lean_read_image`), carried
+/// separately from `content` because `content` is text-only and byte-capped.
+/// The agent loop injects these into the conversation as `image_url` blocks so a
+/// vision model actually receives them (see `agent/loop_.rs`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolResultImage {
+    /// Base64-encoded image bytes (no `data:` prefix).
+    pub data: String,
+    pub mime_type: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolResult {
     pub content: String,
@@ -85,6 +96,10 @@ pub struct ToolResult {
     pub output_size_bytes: i32,
     pub is_error: bool,
     pub truncated: bool,
+    /// Image content parts the tool returned, if any. Text tools leave this
+    /// empty; `#[serde(default)]` keeps older serialized rows loadable.
+    #[serde(default)]
+    pub images: Vec<ToolResultImage>,
 }
 
 #[cfg(test)]

@@ -1,9 +1,10 @@
 import { useEffect, useRef } from 'react';
 import { ipc, onNewSessionRequest } from '@/lib/ipc';
-import { useStackStore } from '@/stores/stackStore';
+import { useStackStore, selectBooting } from '@/stores/stackStore';
 import { useAdaptivePathwayStore } from '@/stores/adaptivePathwayStore';
 import { useChatStore } from '@/stores/chatStore';
 import { StackStatusView } from '@/components/shared/StackStatusView';
+import { StartupSpinner } from '@/components/shared/StartupSpinner';
 import { ChatView } from '@/components/chat/ChatView';
 import { RecentSessions } from '@/components/sessions/RecentSessions';
 import { NewChatIcon } from '@/components/icons/NewChatIcon';
@@ -33,7 +34,11 @@ export function App() {
     };
   }, [init, initAdaptivePathway]);
 
+  const booting = useStackStore(selectBooting);
   const degraded = DEGRADED.includes(status);
+  // A first-connect `backend_down` during the grace window is a slow daemon
+  // bind, not a failure — show a spinner instead of the hard panel (item 2).
+  const bootSpinner = status === 'backend_down' && booting;
 
   // Latched: handOffToMain opens a brand-new chat window every time — a
   // double-click (or click while the first open is still in flight) must not
@@ -86,7 +91,13 @@ export function App() {
           className="overlay-body"
           style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}
         >
-          {degraded ? <StackStatusView status={status} /> : <ChatView />}
+          {bootSpinner ? (
+            <StartupSpinner />
+          ) : degraded ? (
+            <StackStatusView status={status} />
+          ) : (
+            <ChatView />
+          )}
         </div>
       </div>
     </div>

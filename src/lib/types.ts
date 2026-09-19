@@ -397,6 +397,10 @@ export interface SpecialistInput {
 /** Limits on delegate runs, relayed to the daemon at spawn. Changing any of
     these needs a daemon restart, which the engine-restart banner surfaces. */
 export interface SpecialistSettings {
+  /** Global master switch. When false the specialists MCP server is
+      unregistered and the model can't delegate at all. Toggled live via
+      get/setSpecialistsEnabled (no daemon restart). */
+  enabled: boolean;
   /** Models that may never host a delegate. Exact ids, or `prefix*`. */
   model_deny: string[];
   /** Whether the premium-tier seeding has run. Distinguishes "not asked yet"
@@ -559,6 +563,17 @@ export type StartupPhase = 'spawning_backend' | 'warming_model' | 'ready';
 
 export interface StartupPhasePayload {
   phase: StartupPhase;
+}
+
+// Payload of `provider://activated` (emitted by `activate_provider`). Carries
+// the *profile* id (what the badge resolves against, not the daemon id) and the
+// model the invoking window's session was stamped with, so that window can
+// update its live session's provider/model without a session reload. All three
+// are null when no session was stamped (e.g. a global activation from Settings).
+export interface ProviderActivatedPayload {
+  session_id: string | null;
+  provider_id: string | null;
+  model: string | null;
 }
 
 // --- Behavioral-memory (pathway) engine — in-process inside BigTiny, see

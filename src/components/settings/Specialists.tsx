@@ -81,6 +81,10 @@ export function Specialists() {
   const [runs, setRuns] = useState<SpecialistRun[]>([]);
   const [deny, setDeny] = useState<string[]>([]);
   const [denyDraft, setDenyDraft] = useState('');
+  // Global master switch (distinct from each specialist's own `enabled`): when
+  // off, the whole delegation server is unregistered and the model can't
+  // delegate at all.
+  const [masterEnabled, setMasterEnabled] = useState(true);
 
   const load = async () => {
     try {
@@ -113,7 +117,21 @@ export function Specialists() {
       .getConfig()
       .then((c) => setDeny(c.specialists?.model_deny ?? []))
       .catch(() => {});
+    void ipc
+      .getSpecialistsEnabled()
+      .then(setMasterEnabled)
+      .catch(() => {});
   }, []);
+
+  const toggleMaster = async (next: boolean) => {
+    setMasterEnabled(next); // optimistic
+    try {
+      await ipc.setSpecialistsEnabled(next);
+    } catch (e) {
+      setMasterEnabled(!next); // revert on failure
+      setError(String(e));
+    }
+  };
 
   const saveDeny = async (next: string[]) => {
     try {
@@ -243,6 +261,19 @@ export function Specialists() {
         Delegate agents the model can call mid-turn. A specialist runs in its own context with its
         own tools, so its searching and reading never fills up your conversation — only its result
         comes back. You never invoke one directly; the model picks one when a request calls for it.
+      </p>
+      <label className="check">
+        <input
+          type="checkbox"
+          checked={masterEnabled}
+          onChange={(e) => void toggleMaster(e.target.checked)}
+        />
+        Enable specialists
+      </label>
+      <p className="muted" style={{ marginTop: 4 }}>
+        Turn this off to stop the model delegating entirely — it will no longer be offered the
+        delegation tools. Takes effect immediately, no restart. Your specialist definitions below
+        are kept.
       </p>
       {error && <div className="chat-error">{error}</div>}
       <div className="ext-list">

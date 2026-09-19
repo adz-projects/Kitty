@@ -62,6 +62,17 @@ export function ProviderBadge() {
       // Pass this window's active session so the stamp is per-session — other
       // windows' open sessions keep their own provider (per-session isolation).
       await ipc.activateProvider(id, sessionId);
+      // Update this window's live-session stamp immediately, so the pill flips
+      // the instant the switch succeeds rather than after the provider://activated
+      // round-trip. Same values the event carries (profile id + the profile's
+      // first model); the event handler in chatStore is idempotent with this.
+      if (id !== null && sessionId !== null) {
+        const target = providers.find((p) => p.id === id);
+        useChatStore.setState({
+          sessionProviderId: id,
+          sessionModelId: target?.models[0] ?? null,
+        });
+      }
     } catch (e) {
       // A real, actionable failure (e.g. the health-gate rejected the switch) —
       // surface it here instead of swallowing it silently.

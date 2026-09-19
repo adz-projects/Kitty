@@ -2395,7 +2395,7 @@ export const useChatStore = create<ChatState>((set, get) => {
       // handler only refreshes the badge state — a broadcast-based rebind of
       // every open window's session is exactly the cross-window leak it used
       // to cause (pick a provider in window 2 → window 1 switched too).
-      void onProviderActivated(() => {
+      void onProviderActivated((payload) => {
         set((s) => ({
           providerOffline: false,
           // Same reasoning as the banner: an error *about the provider* (can't
@@ -2403,6 +2403,16 @@ export const useChatStore = create<ChatState>((set, get) => {
           // switched away from, so its card goes with it. A conversation-level
           // failure is left alone — switching providers didn't fix that.
           ...(isProviderScopedError(s.errorType) ? { error: null, errorType: null } : null),
+          // Update THIS window's live-session stamp in place when the switch
+          // targeted it (payload.session_id matches). Without this, refreshProvider
+          // below re-derived against the stale sessionProviderId/sessionModelId and
+          // the pill kept showing the old provider/model until a session reload.
+          // A broadcast for another window's session (or a global, session-less
+          // activation) leaves this window's stamp untouched — the per-session
+          // isolation the payload-less version could not express.
+          ...(payload.session_id !== null && payload.session_id === s.sessionId
+            ? { sessionProviderId: payload.provider_id, sessionModelId: payload.model }
+            : null),
         }));
         void get().refreshProvider();
       });

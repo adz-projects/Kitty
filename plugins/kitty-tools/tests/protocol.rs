@@ -53,6 +53,7 @@ const ALWAYS_ON_TOOLS: &[&str] = &[
     "lean_file_write",
     "lean_pdf_read_outline",
     "lean_pdf_read_text",
+    "lean_read_image",
     "lean_scratchpad_delete",
     "lean_scratchpad_get",
     "lean_scratchpad_list",

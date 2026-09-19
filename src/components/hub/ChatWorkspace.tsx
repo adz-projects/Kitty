@@ -1,12 +1,13 @@
 import { useEffect, useState } from 'react';
 import { ipc } from '@/lib/ipc';
-import { useStackStore } from '@/stores/stackStore';
+import { useStackStore, selectBooting } from '@/stores/stackStore';
 import { useAdaptivePathwayStore } from '@/stores/adaptivePathwayStore';
 import { useChatStore } from '@/stores/chatStore';
 import { useRouteStore } from '@/stores/routeStore';
 import { useMobileUiStore } from '@/stores/mobileUiStore';
 import { isAndroid } from '@/lib/platform';
 import { StackStatusView } from '@/components/shared/StackStatusView';
+import { StartupSpinner } from '@/components/shared/StartupSpinner';
 import { ChatView } from '@/components/chat/ChatView';
 import { SessionList } from '@/components/sessions/SessionList';
 import { ArtifactsPane } from '@/components/artifacts/ArtifactsPane';
@@ -116,7 +117,11 @@ export function ChatWorkspace() {
     }
   };
 
+  const booting = useStackStore(selectBooting);
   const degraded = DEGRADED.includes(status);
+  // A first-connect `backend_down` during the grace window is a slow daemon
+  // bind, not a failure — show a spinner instead of the hard panel (item 2).
+  const bootSpinner = status === 'backend_down' && booting;
   const artifactsShown = android ? artifactsSheetOpen : showArtifacts;
 
   return (
@@ -180,7 +185,13 @@ export function ChatWorkspace() {
           </div>
         </header>
         <div className="main-body">
-          {degraded ? <StackStatusView status={status} /> : <ChatView />}
+          {bootSpinner ? (
+            <StartupSpinner />
+          ) : degraded ? (
+            <StackStatusView status={status} />
+          ) : (
+            <ChatView />
+          )}
         </div>
       </div>
       {artifactsShown && !degraded && (

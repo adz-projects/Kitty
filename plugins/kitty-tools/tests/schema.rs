@@ -14,8 +14,8 @@
 use kitty_tools::server::{
     AccessibleChartRequest, AccessibleMermaidRequest, AccessibleSvgRequest, AccessibleTableRequest,
     AnalyzeWorkspaceRequest, CacheFilenameRequest, FileAppendRequest, FileReadRequest,
-    FileReplaceLinesRequest, FileReplaceStrRequest, FileWriteRequest, ScratchpadKeyRequest,
-    ScratchpadSetRequest,
+    FileReplaceLinesRequest, FileReplaceStrRequest, FileWriteRequest, ReadImageRequest,
+    ScratchpadKeyRequest, ScratchpadSetRequest,
 };
 use serde_json::Value;
 
@@ -268,6 +268,7 @@ fn no_viz_schema_contains_a_boolean_subschema() {
 #[test]
 fn file_cache_and_scratchpad_schemas_are_fully_documented() {
     assert_every_property_documented(&schema_value::<FileReadRequest>(), "FileReadRequest");
+    assert_every_property_documented(&schema_value::<ReadImageRequest>(), "ReadImageRequest");
     assert_every_property_documented(&schema_value::<FileWriteRequest>(), "FileWriteRequest");
     assert_every_property_documented(&schema_value::<FileAppendRequest>(), "FileAppendRequest");
     assert_every_property_documented(

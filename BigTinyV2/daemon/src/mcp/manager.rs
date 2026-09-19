@@ -668,6 +668,7 @@ fn error_result(tool_name: &str, content: String) -> ToolResult {
         output_size_bytes: 0,
         is_error: true,
         truncated: false,
+        images: Vec::new(),
     }
 }
 

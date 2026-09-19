@@ -28,7 +28,7 @@ use std::sync::OnceLock;
 use crate::envelope::error_response;
 use merman::svg::{HeadlessRenderer, SvgPipeline};
 
-use super::{success_payload, wrap_in_standalone_html};
+use super::success_payload;
 
 const MAX_SOURCE_CHARS: usize = 12_000;
 
@@ -48,11 +48,22 @@ fn renderer() -> &'static HeadlessRenderer {
 /// Used to reject diagrams that exceed the readability budget (parity with the
 /// other viz tools' `VIZ_TOO_WIDE` guard).
 fn svg_viewbox_width(svg: &str) -> Option<f32> {
+    svg_viewbox_dims(svg).map(|(w, _)| w)
+}
+
+/// Extracts `(width, height)` from a rendered SVG's `viewBox="min-x min-y w h"`,
+/// so the wrapper can size the iframe deterministically (the wrapper's global
+/// `svg { width:100%; height:auto }` rule applies to the Mermaid SVG too, so it
+/// is just as exposed to the intrinsic-height collapse as the other viz tools —
+/// see `wrapper.html` trap #3).
+fn svg_viewbox_dims(svg: &str) -> Option<(f32, f32)> {
     let vb = svg.split("viewBox=\"").nth(1)?.split('"').next()?;
     let mut parts = vb.split_whitespace();
     let _ = parts.next()?; // min-x
     let _ = parts.next()?; // min-y
-    parts.next()?.parse().ok()
+    let w: f32 = parts.next()?.parse().ok()?;
+    let h: f32 = parts.next()?.parse().ok()?;
+    Some((w, h))
 }
 
 pub fn generate_accessible_mermaid(mermaid: &str, title: &str, description: &str) -> String {
@@ -113,12 +124,17 @@ pub fn generate_accessible_mermaid(mermaid: &str, title: &str, description: &str
         }
     }
 
+    // Pass the SVG's true aspect ratio; the wrapper sizes the SVG from it and
+    // then measures the body, so the `<div>`'s 8px vertical padding and the
+    // body padding are already captured by that measurement (don't fold them
+    // into the ratio, which would skew it).
+    let dims = svg_viewbox_dims(&svg);
     let body = format!(
         "<div style=\"padding:8px 0;\">{svg}</div>\
          <p class=\"sr-only\">{}</p>",
         super::escape::escape_text(description)
     );
-    let standalone = wrap_in_standalone_html(title, &body);
+    let standalone = super::wrap_in_standalone_html_sized(title, &body, dims);
     success_payload(title, &standalone, &[])
 }
 

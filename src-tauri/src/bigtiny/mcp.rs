@@ -354,6 +354,7 @@ pub async fn ensure_builtin_servers(app: &AppHandle) {
         pathway_enabled,
         memorabilia_enabled,
         specialist_timeout_secs,
+        specialists_enabled,
     ) = {
         let state = app.state::<AppState>();
         let cfg = state.config.lock().unwrap();
@@ -366,6 +367,7 @@ pub async fn ensure_builtin_servers(app: &AppHandle) {
             cfg.adaptive_pathway_enabled,
             cfg.memorabilia_enabled,
             cfg.specialists.timeout_secs,
+            cfg.specialists.enabled,
         )
     };
 
@@ -453,9 +455,14 @@ pub async fn ensure_builtin_servers(app: &AppHandle) {
     // existed. Exactly the `pathway` failure above, with the two sides swapped:
     // there Kitty registered a row the daemon had no arm for.
     //
-    // No `enabled` toggle: `SpecialistSettings` deliberately has none, bounding
-    // delegation with `model_deny`/`timeout_secs`/`max_concurrent` instead, so
-    // the server is always registered.
+    // `SpecialistSettings::enabled` is the global master switch (Settings →
+    // Specialists). When off, the row registers `enabled: false`, so
+    // `mcp::manager::connect_all` skips it and the model is never offered
+    // `call_specialist`/`await_specialists`/`list_specialists` — delegation is
+    // removed from the router, not failed at call time. The row is still
+    // registered either way (the drift test `REGISTERED_BUILTINS` guards its
+    // presence); only its `enabled` flag flips. Per-run bounds
+    // (`model_deny`/`timeout_secs`/`max_concurrent`) still apply when on.
     upsert_builtin(
         &client,
         "specialists",
@@ -479,7 +486,7 @@ pub async fn ensure_builtin_servers(app: &AppHandle) {
             // as one. (The end-of-turn collection the loop performs itself does
             // not go through MCP and is bounded by those deadlines alone.)
             timeout_s: Some((specialist_timeout_secs * SPECIALIST_FAN_OUT_WAVES + 30) as i64),
-            enabled: true,
+            enabled: specialists_enabled,
         },
     )
     .await;

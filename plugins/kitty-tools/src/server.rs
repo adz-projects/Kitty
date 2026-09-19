@@ -2,7 +2,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{ServerCapabilities, ServerInfo};
+use rmcp::model::{CallToolResult, ContentBlock, ServerCapabilities, ServerInfo};
 use rmcp::{tool, tool_handler, tool_router, ServerHandler};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -204,6 +204,12 @@ pub struct FileReadRequest {
     pub end_line: Option<i64>,
     /// Return only lines containing this text, instead of a contiguous range.
     pub query: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ReadImageRequest {
+    /// Absolute path of the image file to read (png, jpg, jpeg, gif, webp, bmp).
+    pub path: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1152,6 +1158,45 @@ impl KittyToolsServer {
             })
         })
         .await
+    }
+
+    #[tool(
+        name = "lean_read_image",
+        description = "Reads a raster image (png, jpg, jpeg, gif, webp, bmp) and returns it to the model as an image the model can see. Use this — not lean_file_read — for images. Only useful with a vision-capable model."
+    )]
+    pub async fn read_image(
+        &self,
+        Parameters(req): Parameters<ReadImageRequest>,
+    ) -> CallToolResult {
+        // Returns a CallToolResult (image content), not the String envelope the
+        // text tools return: an image can only reach a vision model as an image
+        // content block. The daemon preserves that block and injects it into the
+        // conversation (see mcp/tools.rs::extract_images_from_rmcp).
+        let outcome = tokio::task::spawn_blocking(move || {
+            catch_unwind(AssertUnwindSafe(|| tools::image::read_image(&req.path))).unwrap_or_else(
+                |_| {
+                    Err(error_response(
+                        "INTERNAL_PANIC",
+                        "An internal error occurred while reading the image.",
+                        None,
+                        Some("Retry; if this persists the file may be malformed."),
+                    ))
+                },
+            )
+        })
+        .await;
+        match outcome {
+            Ok(Ok((data, mime, note))) => {
+                CallToolResult::success(vec![ContentBlock::text(note), ContentBlock::image(data, mime)])
+            }
+            Ok(Err(envelope)) => CallToolResult::error(vec![ContentBlock::text(envelope)]),
+            Err(_) => CallToolResult::error(vec![ContentBlock::text(error_response(
+                "INTERNAL_ERROR",
+                "The background task reading this image failed.",
+                None,
+                Some("Retry the request."),
+            ))]),
+        }
     }
 
     #[tool(

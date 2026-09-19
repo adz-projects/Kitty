@@ -897,6 +897,14 @@ pub(crate) fn backup_corrupt_config_file(path: &Path) -> Option<PathBuf> {
 /// Limits on delegate (specialist) runs.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SpecialistSettings {
+    /// Global master switch for delegation. When false, the `specialists`
+    /// in-process MCP server is not registered at all (see
+    /// `bigtiny::mcp::ensure_builtin_servers`), so the model is never offered
+    /// `call_specialist`/`await_specialists`/`list_specialists` — delegation is
+    /// removed from the router rather than failing at call time. Defaults on;
+    /// `default_true` covers configs written before this field existed.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     /// Models that may never host a delegate. Exact ids, or `prefix*`.
     ///
     /// Seeded on first run from the OpenRouter catalog's premium tier — denied
@@ -919,6 +927,7 @@ pub struct SpecialistSettings {
 impl Default for SpecialistSettings {
     fn default() -> Self {
         Self {
+            enabled: true,
             model_deny: Vec::new(),
             seeded: false,
             timeout_secs: default_specialist_timeout_secs(),

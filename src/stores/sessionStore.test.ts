@@ -15,6 +15,7 @@ vi.mock('@/lib/ipc', () => ({
 
 const { ipc } = await import('@/lib/ipc');
 const { useSessionStore, UNCATEGORIZED } = await import('./sessionStore');
+const { useStackStore } = await import('./stackStore');
 
 function rawSession(sessionId: string, title: string, cwd: string, updatedAt: string) {
   return { sessionId, title, cwd, updatedAt };
@@ -30,6 +31,10 @@ beforeEach(() => {
     folders: [],
     assignments: {},
   });
+  // Default these tests to "backend already connected": refresh's startup-grace
+  // path (swallow + retry) only fires while booting, and only the dedicated
+  // test below exercises that.
+  useStackStore.setState({ everConnected: true, graceElapsed: true });
   vi.mocked(ipc.listFolders).mockResolvedValue({ folders: [], assignments: {} });
 });
 
@@ -53,6 +58,26 @@ describe('sessionStore.refresh', () => {
     await expect(useSessionStore.getState().refresh()).resolves.toBeUndefined();
     expect(useSessionStore.getState().loading).toBe(false);
     expect(useSessionStore.getState().loadError).toBe('boom');
+  });
+
+  it('swallows the error and stays loading while the backend is still booting', async () => {
+    vi.useFakeTimers();
+    // Booting: never connected, grace window still open (item 2). A first-fetch
+    // failure here is the daemon not yet listening, not a real error.
+    useStackStore.setState({ everConnected: false, graceElapsed: false });
+    vi.mocked(ipc.listSessions).mockRejectedValue(new Error('boom'));
+
+    await useSessionStore.getState().refresh();
+
+    // No hard error surfaced, and the list stays in its loading (spinner) state
+    // rather than flashing "No sessions."/the Retry error.
+    expect(useSessionStore.getState().loadError).toBeNull();
+    expect(useSessionStore.getState().loading).toBe(true);
+
+    // Stop the scheduled retry loop so it can't leak into other tests.
+    useStackStore.setState({ everConnected: true, graceElapsed: true });
+    vi.clearAllTimers();
+    vi.useRealTimers();
   });
 });
 

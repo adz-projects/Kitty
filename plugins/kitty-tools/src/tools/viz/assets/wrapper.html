@@ -37,13 +37,13 @@
         }
     </style>
 </head>
-<body>
+<body data-content-w="__CONTENT_W__" data-content-h="__CONTENT_H__">
     __BODY__
     <script>
         // Height handshake with the host (see `ToolResultIframe` in
         // `src/components/chat/VisualizationCard.tsx`).
         //
-        // Two traps this has to survive:
+        // Three traps this has to survive:
         //  1. Measure the *body*, never `documentElement`. Body's `overflow-y:
         //     hidden` propagates to the viewport, and the root element's
         //     scroll metrics then never report less than the viewport — i.e.
@@ -54,9 +54,33 @@
         //     laid out, so the first measurement is a placeholder. A
         //     measurement is never final: re-send after load and again as the
         //     layout settles, and answer the host whenever it asks.
+        //  3. An inline `<svg viewBox width=100%>` does NOT reliably resolve
+        //     its intrinsic height in every WebView — under `height:auto` it
+        //     can collapse to a near-zero box, so the body measures far too
+        //     short and the card is a sliver (the reported "too short" bug).
+        //     For SVG payloads the renderer bakes the exact canvas dimensions
+        //     into `data-content-w/h`; we set the SVG's pixel height from them
+        //     (rendered width × intrinsic ratio) so its size is deterministic
+        //     and independent of the WebView's intrinsic-ratio handling. HTML
+        //     tables carry no dimensions and fall back to pure measurement.
         (function () {
             var last = -1;
+            var cw = parseFloat(document.body.getAttribute('data-content-w') || '');
+            var ch = parseFloat(document.body.getAttribute('data-content-h') || '');
+            function applySvgHeight() {
+                if (!(cw > 0 && ch > 0)) return;
+                var svg = document.body.querySelector('svg');
+                if (!svg) return;
+                var cs = getComputedStyle(document.body);
+                var contentW = document.body.clientWidth
+                    - parseFloat(cs.paddingLeft || '0')
+                    - parseFloat(cs.paddingRight || '0');
+                if (contentW > 0) {
+                    svg.style.height = (contentW * (ch / cw)) + 'px';
+                }
+            }
             function measure() {
+                applySvgHeight();
                 var b = document.body;
                 return Math.max(
                     b.scrollHeight,
