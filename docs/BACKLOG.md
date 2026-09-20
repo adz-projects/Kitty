@@ -24,6 +24,21 @@ open an item here instead.
 
 ## Noted for later
 
+- **Heavier document extraction (OCR / tables) for memorabilia ingest.** The
+  turn-end memorabilia harvest (`agent::memorabilia_harvest`) extracts attached
+  files and scraped documents via `kitty_tools::extract`, which is
+  `pdf-extract` + `lopdf` for PDFs, `calamine` for spreadsheets, `quick-xml`
+  for docx. Baseline is strong on **text** (~99–100% word recall on digital
+  PDFs) but has **no table-structure reconstruction and no OCR** — scanned /
+  image-only PDFs come back empty (flagged, not read). Deliberately not adding
+  `docling` (or any OCR engine) now: it is Python + ML models, which breaks
+  Kitty's Rust-only, no-Python-runtime, no-bundled-models stance (CLAUDE.md) and
+  would bloat the Windows and Android bundles substantially for a marginal gain
+  on the text a fact-memory actually needs. Revisit as an **optional** path (a
+  docling sidecar, or a Rust OCR/table extractor) if scanned-PDF or table
+  fidelity turns out to matter — the extraction seam is one function
+  (`extract_document_text`), so swapping/augmenting it is localized.
+
 - **Recipes (removed, not merely resolved).** This entry tracked the "recipes /
   skills" gap, then tracked the client-side template feature that filled it.
   Both are gone: recipes were **replaced by specialists** (delegate agents the

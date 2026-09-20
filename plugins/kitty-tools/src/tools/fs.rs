@@ -93,6 +93,22 @@ fn decode_text(bytes: &[u8]) -> (String, &'static str, bool) {
     }
 }
 
+/// Envelope-free plain-text read for the memorabilia ingest path
+/// (`kitty_tools::extract`). Reads a text file directly by absolute path —
+/// deliberately **without** `resolve`/`path_within_allowed` gating, because the
+/// daemon ingests files the user themselves attached, not paths the model
+/// chose. Honors the same `MAX_FILE_BYTES` cap as `file_read`.
+pub fn extract_text_file(resolved: &std::path::Path) -> Result<String, String> {
+    let bytes = std::fs::read(resolved).map_err(|e| e.to_string())?;
+    if bytes.len() > MAX_FILE_BYTES {
+        return Err(format!(
+            "file exceeds the {MAX_FILE_BYTES} byte read limit"
+        ));
+    }
+    let (text, _encoding, _lossy) = decode_text(&bytes);
+    Ok(text)
+}
+
 pub fn file_read(
     path: &str,
     start_line: Option<i64>,

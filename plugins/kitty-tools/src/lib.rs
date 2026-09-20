@@ -1,5 +1,6 @@
 pub mod doc_store;
 pub mod docx;
+pub mod extract;
 pub mod envelope;
 pub mod paths;
 pub mod query_filter;

@@ -2,6 +2,7 @@ pub mod compaction;
 pub mod context;
 pub(crate) mod json_extract;
 pub mod loop_;
+pub mod memorabilia_harvest;
 pub mod memory;
 pub mod orchestrator;
 pub mod reasoning_models;
@@ -242,7 +243,6 @@ impl Agent {
             self.plugins.clone(),
             self.config.pathway.clone(),
             self.memorabilia.clone(),
-            self.config.memorabilia.clone(),
             self.provider_mismatch_warned.clone(),
             self.workspace_snapshots.clone(),
             self.background_tasks.clone(),

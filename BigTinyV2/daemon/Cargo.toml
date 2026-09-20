@@ -113,10 +113,15 @@ minijinja = "2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 aes-gcm = "0.10"
 rand = "0.8"
-# Only used for the in-process MCP transport (`mcp::client::connect_in_process`
-# via `mcp::builtin`), i.e. an exec()-restricted host that can't spawn
-# `kitty-tools`' stdio binary as a child process (see that module's doc
-# comment). This crate pins a *different* rmcp major version
+# Two uses: (1) the in-process MCP transport
+# (`mcp::client::connect_in_process` via `mcp::builtin`), i.e. an
+# exec()-restricted host that can't spawn `kitty-tools`' stdio binary as a
+# child process (see that module's doc comment); and (2) document text
+# extraction for the memorabilia turn-end harvest
+# (`kitty_tools::extract::extract_document_text`, used by
+# `agent::memorabilia_harvest`), reusing the same PDF/Word/Excel/text
+# extractors rather than re-implementing them. This crate pins a *different*
+# rmcp major version
 # (`kitty-tools` = 2.2.0, this crate = 0.9) — both resolve independently,
 # which is fine, since the two only ever exchange serialized JSON-RPC bytes
 # on the in-process pipe, never Rust types across the version boundary.

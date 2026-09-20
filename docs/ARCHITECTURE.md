@@ -191,10 +191,19 @@ dependency statically linked into the daemon, hosted per app
 (`plugins/host.rs`, `plugins/memorabilia_host.rs`), reached by the model
 through in-process MCP servers (`pathway` → `record`/`forget`; `memorabilia` →
 `memorabilia_search`/`memorabilia_read_item`) and by Settings through
-`/api/pathway/*` and `/api/memorabilia/*`. Both are off unless enabled
-(`BIGTINY_PATHWAY__ENABLED` — on by default in Kitty; `BIGTINY_MEMORABILIA__ENABLED`
-— off by default). A single chat-header incognito control pauses both per
-session.
+`/api/pathway/*` and `/api/memorabilia/*`. Enable is env-gated
+(`BIGTINY_PATHWAY__ENABLED`, `BIGTINY_MEMORABILIA__ENABLED`), both on by default
+in Kitty. A single chat-header incognito control pauses both per session.
+
+The two engines learn from **different** material. Adaptive Pathway distils
+behavioral beliefs from the dialogue. Memorabilia does **not** ingest dialogue
+(user and model are both frequently wrong); its turn-end harvest
+(`agent::memorabilia_harvest`) ingests the *documents* a turn brought in —
+pasted text and inlined attachments (the `--- label ---` blocks), files
+attached by path (extracted via `kitty_tools::extract`), and pages the model
+successfully scraped with `lean_web_scrape` (harvested from the persisted tool
+results; a scraped download is extracted from its cached path). Images and other
+media are skipped.
 
 **On Android none of that applies.** `externalBin` is cleared
 (`tauri.android.conf.json`), the daemon is hosted in-process, and the three MCP

@@ -302,6 +302,51 @@ pub fn excel_inspect(path: &str) -> String {
     )
 }
 
+/// Cell → plain text for the envelope-free extractor. Empty cells become the
+/// empty string; strings pass through verbatim; everything else renders via the
+/// same `data_to_value` used by the JSON path, so numbers/bools/dates match.
+fn cell_text(d: &Data) -> String {
+    match d {
+        Data::Empty => String::new(),
+        Data::String(s) => s.clone(),
+        other => data_to_value(other).to_string(),
+    }
+}
+
+/// Envelope-free plain-text extraction for the memorabilia ingest path
+/// (`kitty_tools::extract`): every sheet, every used row, cells tab-joined,
+/// each sheet prefixed by a header line. Takes an absolute path directly (no
+/// path-allow gating). Honors the same `EXCEL_MAX_FILE_BYTES` cap.
+pub fn extract_excel_text(resolved: &Path) -> Result<String, String> {
+    if let Some(len) = stat_len(resolved) {
+        if len > EXCEL_MAX_FILE_BYTES {
+            return Err(format!(
+                "spreadsheet exceeds the {EXCEL_MAX_FILE_BYTES} byte read limit"
+            ));
+        }
+    }
+    let mut wb = open(resolved)?;
+    let names = wb.sheet_names().to_vec();
+    let mut out = String::new();
+    for (idx, name) in names.iter().enumerate() {
+        let range: Range<Data> = match wb.worksheet_range_at(idx) {
+            Some(Ok(r)) => r,
+            _ => continue,
+        };
+        if range.is_empty() {
+            continue;
+        }
+        out.push_str(&format!("--- Sheet: {name} ---\n"));
+        for row in range.rows() {
+            let cells: Vec<String> = row.iter().map(cell_text).collect();
+            out.push_str(&cells.join("\t"));
+            out.push('\n');
+        }
+        out.push('\n');
+    }
+    Ok(out)
+}
+
 /// `output_format` is `"json"` (default) or `"csv"`.
 pub fn excel_read_rows(
     path: &str,

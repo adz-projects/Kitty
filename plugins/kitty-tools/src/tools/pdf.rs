@@ -567,6 +567,15 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
     format!("{}…", &s[..idx])
 }
 
+/// Envelope-free full-text extraction for the memorabilia ingest path
+/// (`kitty_tools::extract`): every cached page body joined, reusing the same
+/// extract-once cache as `pdf_read_text`. Takes an absolute path directly (no
+/// path-allow gating — the daemon ingests user-attached files).
+pub fn extract_pdf_text(resolved: &Path) -> Result<String, String> {
+    let doc = cached_pdf(resolved)?;
+    Ok(doc.units.join("\n\n"))
+}
+
 pub fn pdf_read_text(
     path: &str,
     start_page: Option<u32>,

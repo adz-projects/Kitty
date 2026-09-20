@@ -1229,8 +1229,6 @@ pub struct AgentLoop {
     pathway_cfg: PathwayConfig,
     /// The declarative factual-memory plugin, hosted per app.
     memorabilia: Arc<crate::plugins::MemorabiliaHost>,
-    /// Memorabilia learning cadence (`learn_every_n` exchanges).
-    memorabilia_cfg: crate::config::MemorabiliaConfig,
     /// Sessions already warned about a pinned-provider mismatch (the
     /// `ModelFailover` notice at step 0). Shared with the daemon-lifetime
     /// `Agent` — this loop is rebuilt per turn, so the memory of "we already
@@ -1282,7 +1280,6 @@ impl AgentLoop {
         plugins: Arc<crate::plugins::PluginHost>,
         pathway_cfg: PathwayConfig,
         memorabilia: Arc<crate::plugins::MemorabiliaHost>,
-        memorabilia_cfg: crate::config::MemorabiliaConfig,
         provider_mismatch_warned: Arc<DashMap<String, ()>>,
         workspace_snapshots: Arc<DashMap<String, (String, String)>>,
         background_tasks: Arc<DashMap<String, Vec<tokio::task::AbortHandle>>>,
@@ -1307,7 +1304,6 @@ impl AgentLoop {
             plugins,
             pathway_cfg,
             memorabilia,
-            memorabilia_cfg,
             provider_mismatch_warned,
             workspace_snapshots,
             background_tasks,
@@ -3615,16 +3611,18 @@ impl AgentLoop {
         });
         self.track_background(&learn_session_id_for_tracking, handle.abort_handle());
 
-        // Turn-end memorabilia learn (fire-and-forget): every
-        // `learn_every_n` exchanges, ingest the session's latest user+assistant
-        // exchange as evidence, then drain a bounded slice of Stage 4 so it
-        // becomes recallable without waiting for the maintenance sweep. Ingest
-        // is idempotent (two-tier content hashes), so a re-run is a no-op.
+        // Turn-end memorabilia harvest (fire-and-forget): ingest the
+        // *documents* this turn brought in — pasted text, attached files, and
+        // successfully scraped pages — each as its own evidence source. The
+        // dialogue itself is no longer ingested (user and model are both
+        // frequently wrong, so message pairs are weak evidence). The harvester
+        // scopes itself to this turn's rows and is idempotent (memorabilia
+        // dedups by document hash), so there is no cadence gate — documents are
+        // discrete events, ingested the turn they appear.
         let mem_engine = match self.app_scope(session_id).await.0 {
             Some(app_id) => self.memorabilia.memorabilia_for(&app_id).await,
             None => None,
         };
-        let mem_learn_every_n = self.memorabilia_cfg.learn_every_n.max(1);
         let mem_pool = pool.clone();
         let mem_session_id = session_id.to_string();
         let mem_session_for_tracking = mem_session_id.clone();
@@ -3632,56 +3630,13 @@ impl AgentLoop {
             let Some(engine) = mem_engine else {
                 return;
             };
-            // Unified incognito: skip learning for a paused session (matches
-            // the recall hook and adaptive-pathway's learn gate).
+            // Unified incognito: skip a paused session entirely (matches the
+            // recall hook and adaptive-pathway's learn gate).
             if engine.is_paused(&mem_session_id).await.unwrap_or(false) {
                 return;
             }
-            // Cadence gate: assistant turns completed for this session. A DB
-            // error skips this turn rather than treating 0 as "every turn".
-            let Ok(count) = sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM messages WHERE session_id = ? AND role = 'assistant'",
-            )
-            .bind(&mem_session_id)
-            .fetch_one(&mem_pool)
-            .await
-            else {
-                return;
-            };
-            if count == 0 || count % mem_learn_every_n as i64 != 0 {
-                return;
-            }
-            // The latest user + assistant messages, in chronological order.
-            let rows: Vec<(String, String)> = sqlx::query_as(
-                "SELECT role, COALESCE(content, '') FROM messages \
-                 WHERE session_id = ? AND role IN ('user', 'assistant') \
-                 ORDER BY rowid DESC LIMIT 2",
-            )
-            .bind(&mem_session_id)
-            .fetch_all(&mem_pool)
-            .await
-            .unwrap_or_default();
-            let mut text = String::new();
-            for (role, content) in rows.into_iter().rev() {
-                if !content.trim().is_empty() {
-                    text.push_str(&format!("{role}: {content}\n"));
-                }
-            }
-            if text.trim().is_empty() {
-                return;
-            }
-            let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-            engine
-                .ingest(&memorabilia::learn::IngestInput {
-                    content: text,
-                    source_type: "Conversation".into(),
-                    source_name: format!("session:{mem_session_id}"),
-                    source_entity: format!("session:{mem_session_id}"),
-                    captured_at: now.clone(),
-                    intent: None,
-                })
+            crate::agent::memorabilia_harvest::harvest_turn(&engine, &mem_pool, &mem_session_id)
                 .await;
-            engine.drain_extraction(&now).await;
         });
         self.track_background(&mem_session_for_tracking, mem_handle.abort_handle());
     }
@@ -5235,7 +5190,6 @@ mod containment_order_tests {
             crate::plugins::test_plugin_host(&pool),
             config.pathway.clone(),
             crate::plugins::test_memorabilia_host(&pool),
-            config.memorabilia.clone(),
             Arc::new(DashMap::new()),
             Arc::new(DashMap::new()),
             Arc::new(DashMap::new()),
