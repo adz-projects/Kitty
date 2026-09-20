@@ -324,6 +324,60 @@ async fn failure_stays_pending_and_retries_after_backoff() {
     assert_eq!(chunk.extraction_error_at, None);
 }
 
+#[tokio::test]
+async fn identical_claims_from_two_sources_consolidate_into_one_assertion() {
+    // Both chunks extract the SAME claim (one canned response), but their
+    // content — and their source — differ, so they are distinct chunks from
+    // distinct sources.
+    let (engine, _chat) = engine_with_response(
+        Config::default(),
+        response(vec![claim("Rust has no null", "high", "unknown", "static", "")], vec![]),
+    )
+    .await;
+    engine
+        .ingest(&doc("rust uses the option type instead of null pointers", "docs.rust-lang.org"))
+        .await;
+    engine
+        .ingest(&doc("the rust language avoids null entirely with option", "blog.example"))
+        .await;
+
+    let out = engine.drain_extraction(T0).await;
+    assert_eq!(out.attempted, 2);
+    assert_eq!(out.succeeded, 2);
+
+    // Consolidation: one assertion, not two — the identical claim from two
+    // chunks resolves to a single content-addressed proposition.
+    let props = engine.db.list_propositions_by_status("active").await.unwrap();
+    assert_eq!(props.len(), 1, "identical claims consolidate into one assertion");
+    let p = &props[0];
+    assert_eq!(p.claim, "Rust has no null");
+
+    // It now draws support from both chunks, across two distinct sources.
+    let supporters = engine.db.list_active_supporting_chunks(&p.node_id).await.unwrap();
+    assert_eq!(supporters.len(), 2, "both corroborating chunks support the one node");
+    let distinct: std::collections::HashSet<&str> =
+        supporters.iter().map(|c| c.source_entity.as_str()).collect();
+    assert_eq!(distinct.len(), 2, "corroboration spans two distinct sources");
+
+    // Corroborated confidence (noisy-OR over distinct sources) exceeds what
+    // either source yields alone — the credibility machinery is now live.
+    let s = engine.db.get_source("docs.rust-lang.org").await.unwrap().unwrap();
+    let single = core::confidence(
+        engine.config.correlation_lambda,
+        &[(
+            s.source_entity.clone(),
+            vec![core::effective_weight(s.reliability, 0.0) * 1.0],
+        )],
+    );
+    assert!(
+        p.confidence > single,
+        "two independent sources corroborate to higher confidence than one \
+         (got {}, single-source {})",
+        p.confidence,
+        single
+    );
+}
+
 // ---------------------------------------------------------------------------
 // DISPUTED edges: probe window, floor, idempotency, victim refresh
 // ---------------------------------------------------------------------------

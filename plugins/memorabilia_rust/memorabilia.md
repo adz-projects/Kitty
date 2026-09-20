@@ -272,9 +272,18 @@ under the `timeout_s` budget. Per chunk:
    `importance`, `urgency`, `decay_class`, `urgency_expires_at`.
 4. **Validate** each claim (`verify_claim`): normalize; drop if empty; **drop if a
    tombstone matches** the normalized text (§13); a `deadline` claim with an
-   unparseable expiry is dropped (never wedges the chunk). Deterministic
-   `node_id = "p_" + sha256(chunk_id | normalized_claim)[..24]` so a re-extraction
-   dedups.
+   unparseable expiry is dropped (never wedges the chunk). **Consolidation:** the
+   `node_id = "p_" + sha256(normalized_claim)[..24]` is content-addressed by the
+   claim **alone**, so the same claim extracted from a different chunk or source
+   resolves to the **same proposition** — its `insert_proposition` no-ops, its new
+   chunk is attached as a support link, and step 6's recompute folds every
+   supporter into one confidence grouped by distinct source. That is what makes
+   the §8.2 multi-source noisy-OR and the §6.1 "≥ 2 distinct sources" promotion
+   gate live rather than latent: two sources asserting the same fact corroborate a
+   single assertion instead of creating two single-source ones. (A chunk's own
+   re-extraction retry still dedups on the same id. Proposition metadata —
+   importance/urgency/expiry — stays the first writer's; a max/earliest-deadline
+   merge is a noted follow-up.)
 5. **Disputes** — only against probe neighbors, only at
    `strength ≥ dispute_strength_floor`, written as canonical-ordered
    `disputed_edges` with a deterministic edge id; re-opening the same pair is an
@@ -283,8 +292,10 @@ under the `timeout_s` budget. Per chunk:
    (`resolve_decay_profile`: earliest valid deadline wins, else static, else
    transient) → propositions with derived confidence → support links →
    `finish_extraction` (sets `done` + decay profile atomically) → advance the
-   watermark → **recompute confidence** for every proposition touched by a new
-   edge (an opened edge changes both endpoints' weights).
+   watermark → **recompute confidence** for every proposition supported by this
+   chunk (so a just-added support link folds the new source into the claim's
+   confidence — the consolidation path) **and** for every proposition touched by a
+   new dispute edge (an opened edge changes both endpoints' weights).
 
 A failed pass leaves the chunk `pending` with `extraction_error_at=now`; it
 retries only after `retry_backoff_s`.

@@ -178,7 +178,7 @@ fn level_or(raw: &Value, field: &str) -> String {
     }
 }
 
-fn verify_claim(chunk_id: &str, raw: &Value, tombstones: &HashSet<String>) -> ClaimVerdict {
+fn verify_claim(raw: &Value, tombstones: &HashSet<String>) -> ClaimVerdict {
     let claim = raw.get("claim").and_then(|v| v.as_str()).unwrap_or("");
     let norm = normalize_text(claim);
     if norm.is_empty() {
@@ -210,9 +210,22 @@ fn verify_claim(chunk_id: &str, raw: &Value, tombstones: &HashSet<String>) -> Cl
             None
         }
     };
-    // Deterministic id: the same chunk + normalized claim always derives
-    // the same node_id, so a re-extraction retry dedups on it.
-    let node_id = format!("p_{}", &sha256_hex(&format!("{chunk_id}|{norm}"))[..24]);
+    // **Consolidation step.** The node_id is content-addressed by the
+    // normalized claim ALONE — not by `(chunk_id, claim)` — so the same claim
+    // extracted from a different chunk or a different source resolves to the
+    // same proposition. Its `insert_proposition` then no-ops (ON CONFLICT DO
+    // NOTHING) while `add_support_link` attaches the new chunk, and the
+    // transaction's tail `recompute_node_confidence` (chunk_id is always a
+    // recompute endpoint) folds every active supporter into one confidence
+    // grouped by distinct source. That is what turns the §8.2 multi-source
+    // noisy-OR and the §6.1 "≥ 2 distinct sources" promotion gate from latent
+    // into live: two sources asserting the same fact now corroborate one
+    // assertion instead of creating two single-source ones. A chunk's own
+    // re-extraction retry still dedups (same claim → same id). Metadata
+    // (importance/urgency/expiry) stays the first writer's — a deliberate
+    // simplification; the earliest-deadline/importance-merge refinement is a
+    // separate follow-up.
+    let node_id = format!("p_{}", &sha256_hex(&norm)[..24]);
     ClaimVerdict::Kept(ValidClaim {
         node_id,
         claim: norm,
@@ -403,7 +416,7 @@ impl Engine {
         let mut tombstoned = 0usize;
         let mut dropped = 0usize;
         for raw in &raw_claims {
-            match verify_claim(&chunk.chunk_id, raw, tombstones) {
+            match verify_claim(raw, tombstones) {
                 ClaimVerdict::Kept(c) => claims.push(c),
                 ClaimVerdict::Tombstoned => tombstoned += 1,
                 ClaimVerdict::Dropped => dropped += 1,
@@ -813,7 +826,7 @@ mod tests {
             ("deadline", "2026-08-15T00:00:00Z"),
         ] {
             if let ClaimVerdict::Kept(c) =
-                verify_claim("c_1", &claim(class, expiry), &HashSet::new())
+                verify_claim(&claim(class, expiry), &HashSet::new())
             {
                 claims.push(c);
             } else {
@@ -831,11 +844,11 @@ mod tests {
 
     #[test]
     fn profile_resolution_static_beats_transient() {
-        let c1 = match verify_claim("c_1", &claim("transient", ""), &HashSet::new()) {
+        let c1 = match verify_claim(&claim("transient", ""), &HashSet::new()) {
             ClaimVerdict::Kept(c) => c,
             _ => panic!(),
         };
-        let c2 = match verify_claim("c_1", &claim("static", ""), &HashSet::new()) {
+        let c2 = match verify_claim(&claim("static", ""), &HashSet::new()) {
             ClaimVerdict::Kept(c) => c,
             _ => panic!(),
         };
@@ -846,10 +859,10 @@ mod tests {
 
     #[test]
     fn deadline_claim_without_valid_expiry_is_dropped() {
-        let verdict = verify_claim("c_1", &claim("deadline", "not-a-date"), &HashSet::new());
+        let verdict = verify_claim(&claim("deadline", "not-a-date"), &HashSet::new());
         assert!(matches!(verdict, ClaimVerdict::Dropped));
         // the same expiry on a non-deadline claim is simply ignored
-        let verdict = verify_claim("c_1", &claim("static", "not-a-date"), &HashSet::new());
+        let verdict = verify_claim(&claim("static", "not-a-date"), &HashSet::new());
         match verdict {
             ClaimVerdict::Kept(c) => assert!(c.urgency_expires_at.is_none()),
             _ => panic!("should keep"),
@@ -860,7 +873,7 @@ mod tests {
     fn tombstoned_claim_is_skipped() {
         let norm = normalize_text("The meeting happens on Friday");
         let tombstones = HashSet::from([sha256_hex(&norm)]);
-        let verdict = verify_claim("c_1", &claim("static", ""), &tombstones);
+        let verdict = verify_claim(&claim("static", ""), &tombstones);
         assert!(matches!(verdict, ClaimVerdict::Tombstoned));
     }
 }
