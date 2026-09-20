@@ -70,6 +70,39 @@ Its `record`/`forget` tools are exposed to the model through the daemon's
 in-process MCP registry, which is what lets the model drop a belief you tell it
 is wrong. Browsable in Settings; per-session incognito from the chat header.
 
+**Memorabilia** is the second memory engine, and also not a server — a
+declarative *factual* memory statically linked into the daemon
+(`plugins/memorabilia_rust/`), parallel to Adaptive Pathway but for substantive
+facts rather than behavioral beliefs. Where Adaptive Pathway learns how you
+work, Memorabilia remembers *what is true* in the material you bring in.
+
+- **It learns from documents, not dialogue.** At the end of a turn it harvests
+  the three things you actually vouched for — text you pasted into the chat, the
+  contents of files you attached, and pages the model successfully scraped with
+  `kitty-web` — and ingests each as evidence. It deliberately does **not** learn
+  from the back-and-forth of the conversation itself, because both people and
+  models are wrong too often for chat turns to be trustworthy evidence.
+  Attached files are extracted through the same `kitty-tools` machinery the
+  agent uses (PDF, Word, Excel, and text formats; images and other media are
+  skipped for now).
+- **Two levels: evidence and claims.** Ingested documents become evidence
+  chunks that carry time and decay; from them it distills atomic propositions
+  (single factual claims). Identical claims drawn from different chunks or
+  sources **consolidate into one assertion** rather than piling up as
+  duplicates, and independent corroboration raises that assertion's confidence
+  (a noisy-OR over distinct sources).
+- **Credibility is sourced, not assumed.** Each claim's confidence reflects the
+  reliability tier of where it came from — a scraped primary domain outranks a
+  community page, which outranks an unattributed personal note — combined across
+  sources and down-weighted when evidence conflicts. Disputed facts are flagged
+  and de-weighted in recall until they settle.
+- Reuses the same EmbeddingGemma embedder as Adaptive Pathway, stored in SQLite
+  with `sqlite-vec`. Its `memorabilia_search` / `memorabilia_read_item` tools
+  are exposed to the model over the in-process MCP registry. Enabled by default;
+  browsable and correctable in Settings → Memorabilia (with a Health readout),
+  and paused per session by the same chat-header incognito control as Adaptive
+  Pathway.
+
 ## Local inference
 
 Kitty runs **no inference process of its own**, and there is no local chat —
