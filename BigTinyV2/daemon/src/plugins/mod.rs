@@ -34,6 +34,7 @@
 //! benefit. It is shared by `Arc`, which also keeps every app's vectors in one
 //! comparable space.
 
+pub mod db_recover;
 pub mod host;
 pub mod memorabilia_host;
 

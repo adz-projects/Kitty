@@ -41,6 +41,16 @@ pub async fn delete_memorabilia_item(app: AppHandle, item_id: String) -> Result<
     crate::bigtiny::memorabilia::delete_item(&client, &item_id).await
 }
 
+/// Check &, if corrupt, repair the factual-memory DB (Settings → Memorabilia
+/// Health "Check & repair database"). Salvages what still reads into a fresh
+/// file, leaving a timestamped backup. Returns `{integrity_ok, rebuilt,
+/// salvaged, backup}`.
+#[tauri::command]
+pub async fn recover_memorabilia_db(app: AppHandle) -> Result<Value, String> {
+    let client = ensure_client(&app)?;
+    crate::bigtiny::memorabilia::recover(&client).await
+}
+
 /// The incognito/pause toggle for one session: while paused, recall injects
 /// nothing and nothing is ingested, for that session only. Kitty drives this
 /// together with the pathway pause from a single chat-header control.

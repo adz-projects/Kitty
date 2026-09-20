@@ -164,6 +164,18 @@ pub async fn delete_item(
     Json(json!({ "id": id, "dropped": dropped })).into_response()
 }
 
+/// POST /api/memorabilia/recover — integrity-check the factual-memory DB and,
+/// if corrupt, rebuild it in place (salvaging what still reads, leaving a
+/// backup). Handled at the host level so it works even when the engine can't
+/// currently open the corrupt file.
+pub async fn recover(
+    State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<AppIdentity>,
+) -> Response {
+    let report = state.memorabilia.recover(&identity.app_id).await;
+    Json(report).into_response()
+}
+
 /// PATCH /api/memorabilia/sessions/{id}/pause — set the incognito/pause flag
 /// for one session. Kitty drives this together with the pathway pause from a
 /// single chat-header control.

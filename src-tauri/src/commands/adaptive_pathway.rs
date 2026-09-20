@@ -55,6 +55,16 @@ pub async fn set_pathway_session_paused(
     crate::bigtiny::pathway::set_session_paused(&client, &session_id, paused).await
 }
 
+/// Check &, if corrupt, repair the belief-graph DB (Settings → Graph Health
+/// "Check & repair database"). Salvages what still reads into a fresh file,
+/// leaving a timestamped backup. Returns `{integrity_ok, rebuilt, salvaged,
+/// backup}`.
+#[tauri::command]
+pub async fn recover_pathway_db(app: AppHandle) -> Result<Value, String> {
+    let client = ensure_client(&app)?;
+    crate::bigtiny::pathway::recover(&client).await
+}
+
 /// Connection status of the in-process `"pathway"` MCP server inside
 /// BigTiny — whether the model can currently call `record`/`forget` as
 /// tools. `Ok(None)` when the row doesn't exist yet (e.g. BigTiny not yet

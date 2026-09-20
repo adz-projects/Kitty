@@ -102,7 +102,7 @@ impl SemanticEmbedder for LiteRtEmbedder {
 /// (`it`, then `model`, then `lib`), which is exactly the required teardown
 /// order.
 fn actor(lib_path: String, model_path: String, tokenizer_path: String, rx: mpsc::Receiver<Cmd>) {
-    use edgefirst_tflite::{Interpreter, Library, Model};
+    use edgefirst_tflite::{Library, Model};
 
     /// Reply `None` to every request, forever. Used when the engine can't load.
     fn drain_unavailable(rx: mpsc::Receiver<Cmd>) {
@@ -132,22 +132,46 @@ fn actor(lib_path: String, model_path: String, tokenizer_path: String, rx: mpsc:
             return drain_unavailable(rx);
         }
     };
-    let mut it = match Interpreter::builder(&lib).and_then(|b| b.build(&model)) {
+    // GPU-first with a CPU (XNNPACK) fallback. `edgefirst-tflite` has no
+    // built-in GPU backend — a GPU delegate is an external shared library — so
+    // this is opportunistic: `gpu_delegate_path` finds a delegate lib only when
+    // one is present (via `KITTY_LITERT_GPU_DELEGATE` or shipped next to the
+    // runtime). When none is found (the default today) the delegate is `None`
+    // and this behaves exactly like the previous CPU-only path. A GPU build or
+    // tensor-allocation failure retries once on plain CPU so the embedder never
+    // regresses to "unavailable" just because the GPU path failed.
+    let gpu_delegate = gpu_delegate_path(&lib_path).and_then(|p| {
+        match edgefirst_tflite::Delegate::load(&p) {
+            Ok(d) => {
+                tracing::info!(delegate = %p, "litert embedder GPU delegate loaded");
+                Some(d)
+            }
+            Err(e) => {
+                tracing::warn!("litert embedder GPU delegate {p} failed to load: {e}; using CPU");
+                None
+            }
+        }
+    });
+    let tried_gpu = gpu_delegate.is_some();
+    let mut it = match build_interpreter(&lib, &model, gpu_delegate) {
         Ok(it) => it,
+        Err(e) if tried_gpu => {
+            tracing::warn!("litert embedder GPU interpreter failed ({e}); falling back to CPU");
+            match build_interpreter(&lib, &model, None) {
+                Ok(it) => it,
+                Err(e2) => {
+                    tracing::warn!("litert embedder interpreter: {e2}");
+                    return drain_unavailable(rx);
+                }
+            }
+        }
         Err(e) => {
             tracing::warn!("litert embedder interpreter: {e}");
             return drain_unavailable(rx);
         }
     };
-    for i in 0..it.input_count() {
-        let _ = it.resize_input(i, &[1, SEQ_LEN as i32]);
-    }
-    if let Err(e) = it.allocate_tensors() {
-        tracing::warn!("litert embedder allocate_tensors: {e}");
-        return drain_unavailable(rx);
-    }
 
-    tracing::info!(model = %model_path, "litert embedder ready");
+    tracing::info!(model = %model_path, gpu = tried_gpu, "litert embedder ready");
     for Cmd::Embed(text, reply) in rx.iter() {
         let t0 = std::time::Instant::now();
         let v = embed_once(&mut it, &tok, &text);
@@ -159,6 +183,57 @@ fn actor(lib_path: String, model_path: String, tokenizer_path: String, rx: mpsc:
         );
         let _ = reply.send(v);
     }
+}
+
+/// Build (and prepare) an interpreter, optionally with a GPU `delegate`
+/// attached. Factored out so the actor can try GPU then retry CPU with the same
+/// resize/allocate steps. Returns a plain `String` error so both legs share one
+/// path. The returned interpreter borrows `lib` (and, transitively, `model`),
+/// so both must outlive it — which they do, as locals in the actor scope.
+fn build_interpreter<'lib>(
+    lib: &'lib edgefirst_tflite::Library,
+    model: &edgefirst_tflite::Model<'lib>,
+    delegate: Option<edgefirst_tflite::Delegate>,
+) -> Result<edgefirst_tflite::Interpreter<'lib>, String> {
+    let mut builder = edgefirst_tflite::Interpreter::builder(lib).map_err(|e| e.to_string())?;
+    if let Some(d) = delegate {
+        builder = builder.delegate(d);
+    }
+    let mut it = builder.build(model).map_err(|e| e.to_string())?;
+    for i in 0..it.input_count() {
+        let _ = it.resize_input(i, &[1, SEQ_LEN as i32]);
+    }
+    it.allocate_tensors().map_err(|e| e.to_string())?;
+    Ok(it)
+}
+
+/// Resolve a LiteRT GPU delegate library path, or `None` to run on CPU.
+/// `KITTY_LITERT_GPU_DELEGATE` (an explicit path) wins; otherwise look for a
+/// known GPU-delegate library shipped next to the LiteRT runtime. Returns
+/// `None` when nothing is found — which is the default today, since we bundle
+/// no GPU delegate — so the embedder simply runs on CPU/XNNPACK as before.
+fn gpu_delegate_path(lib_path: &str) -> Option<String> {
+    if let Ok(p) = std::env::var("KITTY_LITERT_GPU_DELEGATE") {
+        let p = p.trim();
+        if !p.is_empty() {
+            return Some(p.to_string());
+        }
+    }
+    let dir = std::path::Path::new(lib_path).parent()?;
+    const CANDIDATES: &[&str] = &[
+        "libLiteRtGpuAccelerator.so",
+        "libLiteRtGpuAccelerator.dll",
+        "LiteRtGpuAccelerator.dll",
+        "libtensorflowlite_gpu_delegate.so",
+        "tensorflowlite_gpu_delegate.dll",
+    ];
+    for name in CANDIDATES {
+        let cand = dir.join(name);
+        if cand.exists() {
+            return Some(cand.to_string_lossy().into_owned());
+        }
+    }
+    None
 }
 
 fn embed_once(

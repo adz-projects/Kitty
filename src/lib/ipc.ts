@@ -466,6 +466,8 @@ export const ipc = {
       sessionId,
       paused,
     }),
+  /** Check &, if corrupt, rebuild the belief-graph DB (Graph Health). */
+  recoverPathwayDb: () => invoke<DbRecoverReport>('recover_pathway_db'),
 
   // Declarative factual-memory engine (`plugins/memorabilia_rust`, linked
   // in-process into BigTiny — see `src-tauri/src/commands/memorabilia.rs`).
@@ -487,7 +489,22 @@ export const ipc = {
       sessionId,
       paused,
     }),
+  /** Check &, if corrupt, rebuild the factual-memory DB (Memorabilia Health). */
+  recoverMemorabiliaDb: () => invoke<DbRecoverReport>('recover_memorabilia_db'),
 };
+
+/** Result of a plugin-DB recovery (`recover_pathway_db`/`recover_memorabilia_db`).
+ *  Mirrors the daemon's `RecoverReport` (see `plugins/db_recover.rs`). */
+export interface DbRecoverReport {
+  /** Whether the DB is `PRAGMA integrity_check` clean after the operation. */
+  integrity_ok: boolean;
+  /** Whether a rebuild happened (false = it was already healthy). */
+  rebuilt: boolean;
+  /** Rows salvaged per table when rebuilt. */
+  salvaged: Record<string, number>;
+  /** Path of the pre-rebuild backup, when one was taken. */
+  backup: string | null;
+}
 
 /** Native folder picker (default context folder, etc.). Returns null if cancelled. */
 export async function pickFolder(): Promise<string | null> {

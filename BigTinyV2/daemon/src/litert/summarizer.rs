@@ -112,17 +112,45 @@ fn render_prompt(messages: &[Value], schema: &Value) -> String {
 fn actor(model_path: String, rx: mpsc::Receiver<Req>) {
     use litert_lm_rust::{Backend, Engine, Message};
 
-    let engine = match Engine::builder(&model_path).backend(Backend::Cpu).build() {
-        Ok(e) => e,
-        Err(e) => {
-            tracing::warn!("litert summarizer engine load failed ({model_path}): {e}");
-            for req in rx.iter() {
-                let _ = req.reply.send(Err("engine unavailable".into()));
+    // GPU-first with a CPU fallback. The generative extraction/compaction pass
+    // is the slow path (it drove memorabilia's structured-extraction timeouts),
+    // so run it on the GPU when the machine has one and fall back to CPU
+    // (today's path) if the GPU engine can't be built. `enable_speculative_decoding`
+    // and `gpu_wait_for_weight_uploads` are the crate's recommended GPU settings.
+    let build_gpu = || {
+        Engine::builder(&model_path)
+            .backend(Backend::Gpu)
+            .enable_speculative_decoding(true)
+            .gpu_wait_for_weight_uploads(true)
+            .build()
+    };
+    let build_cpu = || Engine::builder(&model_path).backend(Backend::Cpu).build();
+
+    let engine = match build_gpu() {
+        Ok(e) => {
+            tracing::info!(model = %model_path, backend = "gpu", "litert summarizer ready");
+            e
+        }
+        Err(gpu_err) => {
+            tracing::warn!(
+                "litert summarizer GPU backend unavailable ({model_path}): {gpu_err}; \
+                 falling back to CPU"
+            );
+            match build_cpu() {
+                Ok(e) => {
+                    tracing::info!(model = %model_path, backend = "cpu", "litert summarizer ready");
+                    e
+                }
+                Err(e) => {
+                    tracing::warn!("litert summarizer engine load failed ({model_path}): {e}");
+                    for req in rx.iter() {
+                        let _ = req.reply.send(Err("engine unavailable".into()));
+                    }
+                    return;
+                }
             }
-            return;
         }
     };
-    tracing::info!(model = %model_path, "litert summarizer ready");
 
     for req in rx.iter() {
         let result = (|| -> Result<String, String> {

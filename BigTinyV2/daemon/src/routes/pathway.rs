@@ -159,6 +159,19 @@ pub async fn delete_belief(
     }
 }
 
+/// POST /api/pathway/recover — integrity-check the belief-graph DB and, if
+/// corrupt, rebuild it in place (salvaging what still reads, leaving a backup).
+/// Handled at the host level, not via `engine()`, so it works even when the
+/// engine currently fails to open on a corrupt file. A disabled pathway still
+/// gets a real check/rebuild of the on-disk file.
+pub async fn recover(
+    State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<AppIdentity>,
+) -> Response {
+    let report = state.plugins.recover(&identity.app_id).await;
+    Json(report).into_response()
+}
+
 /// PATCH /api/pathway/sessions/{id}/pause — set the incognito/pause flag.
 pub async fn set_paused(
     State(state): State<Arc<AppState>>,

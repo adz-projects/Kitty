@@ -507,7 +507,12 @@ fn default_extraction_model() -> String {
     "qwen3:4b".into()
 }
 fn default_extraction_timeout_s() -> u64 {
-    12
+    // Headroom for a local generative extraction pass: the daemon's Gemma-E2B
+    // summarizer, even on the CPU fallback, does not finish a structured JSON
+    // extraction within the old 12s cap, so every chunk timed out and stayed
+    // `pending` with zero propositions produced. 60s completes comfortably on
+    // CPU and is a wide margin on GPU.
+    60
 }
 fn default_extraction_retry_backoff_s() -> u64 {
     60

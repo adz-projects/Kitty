@@ -34,6 +34,15 @@ pub async fn delete_item(client: &BigTinyClient, item_id: &str) -> Result<Value,
         .await
 }
 
+/// `POST /api/memorabilia/recover` — integrity-check the factual-memory DB
+/// and, if corrupt, rebuild it in place (salvaging what still reads, leaving a
+/// backup). Uses the long-timeout POST because a rebuild can take a moment.
+pub async fn recover(client: &BigTinyClient) -> Result<Value, String> {
+    client
+        .post_json_long("/api/memorabilia/recover", &json!({}))
+        .await
+}
+
 /// `PATCH /api/memorabilia/sessions/{id}/pause` — the factual-memory half of
 /// Kitty's unified per-session incognito control. Paused: recall injects
 /// nothing (zero prompt delta) and the turn-end ingest skips the session.

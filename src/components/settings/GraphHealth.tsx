@@ -29,6 +29,8 @@ export function GraphHealth() {
   const [beliefs, setBeliefs] = useState<PathwayBelief[]>([]);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(true);
+  const [repairing, setRepairing] = useState(false);
+  const [repairMsg, setRepairMsg] = useState('');
 
   const load = async () => {
     setLoading(true);
@@ -45,6 +47,40 @@ export function GraphHealth() {
   };
 
   useEffect(() => void load(), []);
+
+  const repair = async () => {
+    if (
+      !window.confirm(
+        'Check the memory database and, if it is corrupt, rebuild it? ' +
+          'The current file is backed up first.',
+      )
+    ) {
+      return;
+    }
+    setRepairing(true);
+    setRepairMsg('');
+    try {
+      const r = await ipc.recoverPathwayDb();
+      if (!r.rebuilt) {
+        setRepairMsg(
+          r.integrity_ok
+            ? 'Database is healthy — no repair needed.'
+            : 'Database check failed; could not read the file.',
+        );
+      } else {
+        const total = Object.values(r.salvaged).reduce((a, b) => a + b, 0);
+        setRepairMsg(
+          `Rebuilt the database (${total} record${total === 1 ? '' : 's'} recovered).` +
+            (r.backup ? ` A backup was saved to ${r.backup}.` : ''),
+        );
+      }
+      await load();
+    } catch (e) {
+      setRepairMsg(String(e));
+    } finally {
+      setRepairing(false);
+    }
+  };
 
   const tested = beliefs.filter((b) => b.tested).length;
   const contradicted = beliefs.filter((b) => b.contradict_count > 0).length;
@@ -125,6 +161,19 @@ export function GraphHealth() {
           </div>
         </>
       )}
+
+      <h3>Maintenance</h3>
+      <p className="muted">
+        If Kitty stops learning, the memory database may have been corrupted (for example by a
+        crash mid-write). This checks it and, only if needed, rebuilds it — keeping every record
+        it can still read and backing up the old file first.
+      </p>
+      <div className="field">
+        <button onClick={() => void repair()} disabled={repairing}>
+          {repairing ? 'Checking…' : 'Check & repair database'}
+        </button>
+        {repairMsg && <div className="muted">{repairMsg}</div>}
+      </div>
 
       <button onClick={() => void load()}>Refresh</button>
     </>

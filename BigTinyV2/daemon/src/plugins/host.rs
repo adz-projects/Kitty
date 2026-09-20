@@ -187,6 +187,72 @@ impl PluginHost {
         }
     }
 
+    /// Check this app's belief-graph DB and, if corrupt, rebuild it in place
+    /// (salvaging every row that still reads), leaving a timestamped `.corrupt`
+    /// backup beside it. Reopens the instance either way. Surfaced in Settings
+    /// as "Check & repair database" (Graph Health).
+    pub async fn recover(&self, app_id: &str) -> crate::plugins::db_recover::RecoverReport {
+        use crate::plugins::db_recover as rec;
+        let db_path = self.db_path(app_id);
+        let mut report = rec::RecoverReport::default();
+
+        // A never-created DB is trivially healthy — reopening makes a fresh one.
+        if !tokio::fs::try_exists(&db_path).await.unwrap_or(false) {
+            report.integrity_ok = true;
+            let _ = self.pathway_for(app_id).await;
+            return report;
+        }
+
+        // Take the engine offline so the file is unlocked.
+        self.close(app_id).await;
+
+        // Integrity check on a throwaway connection (no migrations run).
+        if let Some(pool) = rec::open_existing(&db_path).await {
+            let ok = rec::integrity_ok(&pool).await;
+            if ok {
+                rec::checkpoint_truncate(&pool).await;
+            }
+            pool.close().await;
+            report.integrity_ok = ok;
+            if ok {
+                let _ = self.pathway_for(app_id).await;
+                return report;
+            }
+        }
+
+        // Corrupt (or unopenable): back up, rebuild, salvage, swap in.
+        report.rebuilt = true;
+        report.backup = Some(
+            rec::backup_corrupt(&db_path)
+                .await
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let rebuilt = rec::append(&db_path, ".rebuilt");
+        rec::clear_rebuilt(&rebuilt).await;
+
+        match adaptive_pathway::store::Db::open(&rebuilt.to_string_lossy()).await {
+            Ok(db) => {
+                report.salvaged = rec::salvage_into(db.pool(), &db_path).await;
+                report.integrity_ok = rec::integrity_ok(db.pool()).await;
+                db.pool().close().await;
+            }
+            Err(e) => {
+                tracing::warn!("recover: fresh pathway DB create failed for {app_id}: {e}");
+                rec::clear_rebuilt(&rebuilt).await;
+                let _ = self.pathway_for(app_id).await;
+                return report;
+            }
+        }
+
+        match rec::swap_in(&rebuilt, &db_path).await {
+            Ok(()) => tracing::info!(app_id, backup = ?report.backup, "rebuilt corrupt pathway DB"),
+            Err(e) => tracing::warn!("recover: pathway swap failed for {db_path:?}: {e}"),
+        }
+        let _ = self.pathway_for(app_id).await;
+        report
+    }
+
     /// How many instances are currently open. Diagnostics, and the thing the
     /// resource-shape test asserts on.
     pub async fn open_instances(&self) -> usize {

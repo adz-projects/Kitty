@@ -108,6 +108,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/pathway/beliefs", get(pathway::list_beliefs))
         .route("/api/pathway/beliefs/{id}", delete(pathway::delete_belief))
         .route("/api/pathway/stats", get(pathway::stats))
+        .route("/api/pathway/recover", post(pathway::recover))
         .route(
             "/api/pathway/sessions/{id}/pause",
             patch(pathway::set_paused),
@@ -118,6 +119,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             delete(memorabilia::delete_item),
         )
         .route("/api/memorabilia/stats", get(memorabilia::stats))
+        .route("/api/memorabilia/recover", post(memorabilia::recover))
         .route(
             "/api/memorabilia/sessions/{id}/pause",
             patch(memorabilia::set_paused),
