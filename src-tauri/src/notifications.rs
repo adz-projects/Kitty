@@ -97,6 +97,19 @@ pub fn notify_if_hidden(
     if relevant_window_focused(app, session_id) {
         return;
     }
+    // On Android a "stack degraded" reading while the app is backgrounded is
+    // almost always the OS suspending or throttling the whole app process (the
+    // daemon runs *in* that process, so the loopback health probe fails) — not
+    // a real outage, and it clears the moment the app is resumed. Surfacing it
+    // as a system notification every time the user switches away is pure noise,
+    // and the "Open Kitty to fix it" copy is a desktop affordance anyway. The
+    // in-app `stack://status` banner still updates, so a genuine problem is
+    // still visible on return. Desktop keeps this notification (CLAUDE.md
+    // Phase 3), where a backgrounded window doesn't suspend the backend.
+    #[cfg(target_os = "android")]
+    if matches!(event, Event::StackDegraded) {
+        return;
+    }
     let enabled = {
         let state = app.state::<AppState>();
         let cfg = state.config.lock().unwrap();
