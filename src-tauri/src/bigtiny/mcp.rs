@@ -371,6 +371,19 @@ pub async fn ensure_builtin_servers(app: &AppHandle) {
         )
     };
 
+    // Memorabilia and Specialists are desktop-only. On Android, force both
+    // in-process MCP rows off so the model is never offered their tools and no
+    // failing card is registered — the rows stay *registered* below (the drift
+    // tests require their presence), only `enabled` flips. Memorabilia's engine
+    // is additionally force-offed at daemon spawn (`lifecycle/mod.rs`);
+    // specialists has no enable env flag, so this row is its only switch. The
+    // `let _` consumes the config values so they aren't flagged unused here.
+    #[cfg(target_os = "android")]
+    let (memorabilia_enabled, specialists_enabled) = {
+        let _ = (memorabilia_enabled, specialists_enabled);
+        (false, false)
+    };
+
     // The behavioral-memory engine is linked directly into the BigTiny
     // daemon (`plugins/adaptive-pathway_rust`), not spawned as a separate
     // process — `command` here is a *logical name* `builtin::connect`

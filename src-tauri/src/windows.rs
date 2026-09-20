@@ -286,6 +286,11 @@ pub fn toggle_overlay(app: &AppHandle) -> tauri::Result<()> {
 /// visibility check that gates firing one at all) at the *specific* window
 /// a session lives in, instead of a fixed singleton — see
 /// `notifications.rs`.
+///
+/// Unused on Android: there is no per-window model there (a single always-on
+/// window), so the notification path uses the app-level foreground flag instead
+/// of resolving a session to a window — see `notifications::relevant_window_focused`.
+#[cfg_attr(target_os = "android", allow(dead_code))]
 pub fn window_label_for_session(app: &AppHandle, session_id: &str) -> Option<String> {
     let state = app.state::<AppState>();
     let map = state.chat_windows.lock().unwrap();

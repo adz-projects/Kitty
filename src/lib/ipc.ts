@@ -103,6 +103,13 @@ export const ipc = {
       instead of a generic fallback. Best-effort; call after any successful
       session establish/switch. */
   bindWindowSession: (sessionId: string) => invoke<void>('bind_window_session', { sessionId }),
+  /** Reports whether the app is in the foreground (from the webview's
+      `visibilitychange`). On Android this is the only reliable "is the user
+      looking?" signal — there's no per-window focus there — and it gates the
+      turn-complete notification. Harmless on desktop, where the toast gate uses
+      window focus instead. Best-effort. */
+  setAppForeground: (foreground: boolean) =>
+    invoke<void>('set_app_foreground', { foreground }),
   /** "Set as working directory" (agentic mode) — repoints an existing
       session's cwd in place instead of forking a new session, so BigTiny's
       directory sandbox can allow both the original chat_dir and this newly-

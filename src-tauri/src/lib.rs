@@ -174,6 +174,7 @@ pub fn run() {
             commands::restart_backend,
             commands::new_session,
             commands::bind_window_session,
+            commands::set_app_foreground,
             commands::send_prompt,
             commands::cancel_prompt,
             commands::is_session_busy,

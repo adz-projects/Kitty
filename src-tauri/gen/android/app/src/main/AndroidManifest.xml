@@ -2,16 +2,17 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.INTERNET" />
 
-    <!-- Model downloads run for a long time and must survive the app being
-         backgrounded (docs/ANDROID.md Phase 7). A multi-GB GGUF over cellular
-         outlasts the few minutes a plain background app is allowed, so the
-         transfer is bracketed by a `dataSync` foreground service
-         (`DownloadService`): FOREGROUND_SERVICE to run one at all,
-         FOREGROUND_SERVICE_DATA_SYNC because Android 14+ requires the type to
-         be declared, POST_NOTIFICATIONS so its progress notification is
-         actually visible on Android 13+, and WAKE_LOCK because Deep Doze
-         otherwise suspends the CPU between maintenance windows and stalls the
-         transfer. -->
+    <!-- Model downloads and in-progress agent turns run for a long time and
+         must survive the app being backgrounded (docs/ANDROID.md Phase 7). A
+         multi-GB GGUF over cellular — or an agent turn the user leaves running
+         while switching apps — outlasts the few minutes a plain background app
+         is allowed, so each is bracketed by a `dataSync` foreground service
+         (`DownloadService` / `TurnService`): FOREGROUND_SERVICE to run one at
+         all, FOREGROUND_SERVICE_DATA_SYNC because Android 14+ requires the type
+         to be declared, POST_NOTIFICATIONS so their notifications (and the
+         turn-complete toast) are actually visible on Android 13+, and WAKE_LOCK
+         because Deep Doze otherwise suspends the CPU between maintenance
+         windows and stalls the work. -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
@@ -50,6 +51,16 @@
              in `commands/models.rs`. Not exported: only this app starts it. -->
         <service
             android:name=".DownloadService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
+        <!-- Holds the process alive (and out of Doze) for the duration of an
+             agent turn, so a turn the user leaves running keeps going when they
+             switch apps. Does no work itself — the turn runs on the in-process
+             daemon future (`lifecycle/bigtiny_embedded.rs`); bracketed from
+             Rust in `bigtiny/stream.rs`. Not exported: only this app starts it. -->
+        <service
+            android:name=".TurnService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
 

@@ -1,12 +1,14 @@
 //! The Android-native surface, reached through one Tauri Android plugin.
 //!
-//! Four things Rust cannot do on its own here: store a secret somewhere that
+//! Several things Rust cannot do on its own here: store a secret somewhere that
 //! survives a relaunch (`secrets`), keep a download running while the app is
-//! backgrounded (`download_service`), read a `content://` attachment the
-//! document picker handed back (`attachments`), and write one back out to a
-//! location the user picked (`documents`). All are implemented in
-//! Kotlin in `gen/android/app/src/main/java/com/kitty/app/`, and all are
-//! reached through the single `PluginHandle` this module owns.
+//! backgrounded (`download_service`), keep an agent *turn* running while
+//! backgrounded (`turn_service`), post a system notification (`notify` — the
+//! Tauri notification plugin is disabled on Android, see `lib.rs`), read a
+//! `content://` attachment the document picker handed back (`attachments`), and
+//! write one back out to a location the user picked (`documents`). All are
+//! implemented in Kotlin in `gen/android/app/src/main/java/com/kitty/app/`, and
+//! all are reached through the single `PluginHandle` this module owns.
 //!
 //! The Kotlin lives in the *app* module rather than a separate Gradle library
 //! because it is one app's glue, not a reusable plugin. Tauri resolves the
@@ -21,7 +23,9 @@ pub mod attachments;
 pub mod documents;
 pub mod download_service;
 pub mod logcat;
+pub mod notify;
 pub mod secrets;
+pub mod turn_service;
 
 use std::sync::OnceLock;
 

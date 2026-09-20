@@ -59,9 +59,15 @@ function buildGroups(): { label: string; sections: string[] }[] {
     },
     {
       label: 'Automation & extensions',
-      sections: ['mcp_servers', 'scheduled_tasks', 'specialists'],
+      // Specialists (agent delegation) is desktop-only — forced off on Android
+      // at the daemon MCP layer (`bigtiny/mcp.rs`), so its pane would be a dead
+      // toggle. Same for Memorabilia in Advanced below.
+      sections: ['mcp_servers', 'scheduled_tasks', ...(isAndroid() ? [] : ['specialists'])],
     },
-    { label: 'Advanced', sections: ['advanced', 'adaptive_pathway', 'memorabilia'] },
+    {
+      label: 'Advanced',
+      sections: ['advanced', 'adaptive_pathway', ...(isAndroid() ? [] : ['memorabilia'])],
+    },
   ];
 }
 

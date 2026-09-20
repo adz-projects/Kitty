@@ -161,6 +161,47 @@ struct TurnOutcome {
     timing: Option<Value>,
 }
 
+/// Hold the app process in the foreground for the lifetime of a turn on
+/// Android, so an in-progress turn keeps running when the user switches apps.
+///
+/// On Android the whole stack — the in-process daemon future, the loopback HTTP
+/// hop, every in-process MCP server — lives in the one app process, which
+/// Android freezes (and may kill) minutes after it loses its last foreground
+/// component. A turn-scoped `dataSync` foreground service (with its ongoing
+/// notification) is what keeps that from happening. No-op on desktop, where an
+/// ordinary window already keeps the process scheduled. Mirrors the download
+/// equivalent (`commands::models`'s `foreground::Session`); the difference is
+/// scope — this spans a turn, not a multi-GB transfer.
+mod foreground {
+    /// Starts the turn foreground service on construction, stops it on drop, so
+    /// every exit path out of the streaming task (success, error, panic) tears
+    /// it down without anyone having to remember to.
+    pub struct TurnSession;
+
+    impl TurnSession {
+        pub fn start() -> Self {
+            #[cfg(target_os = "android")]
+            {
+                // Asked for at the first turn rather than at startup: a
+                // permission prompt before the user has done anything needing
+                // one is the kind everybody dismisses. Shared with downloads —
+                // it's the generic POST_NOTIFICATIONS request, not
+                // download-specific.
+                crate::android::download_service::request_notification_permission();
+                crate::android::turn_service::start();
+            }
+            TurnSession
+        }
+    }
+
+    impl Drop for TurnSession {
+        fn drop(&mut self) {
+            #[cfg(target_os = "android")]
+            crate::android::turn_service::stop();
+        }
+    }
+}
+
 /// Send a user turn. Returns immediately; streamed output arrives via
 /// `chat://*` events and completion via `chat://complete` — the same contract
 /// as the goosed `send_prompt`.
@@ -241,6 +282,10 @@ pub async fn send_prompt(
 
     let app_bg = app.clone();
     tauri::async_runtime::spawn(async move {
+        // Keep the process foreground for the whole turn on Android; dropped at
+        // the end of this task (every match arm below and the cleanup after),
+        // which stops the foreground service. No-op on desktop.
+        let _turn_foreground = foreground::TurnSession::start();
         let outcome = run_stream(&app_bg, &client, &session_id, &body).await;
         match outcome {
             Ok(TurnOutcome {

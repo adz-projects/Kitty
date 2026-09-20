@@ -269,6 +269,19 @@ pub fn start_stack(app: &AppHandle) {
             )
         };
 
+        // Memorabilia is desktop-only. On Android, force it off here regardless
+        // of config so the engine never runs and `bigtiny_env::daemon_env`
+        // emits BIGTINY_MEMORABILIA__ENABLED=false; the specialists MCP row is
+        // force-offed alongside it in `bigtiny::mcp::ensure_builtin_servers`
+        // (specialists has no enable env flag — the row's `enabled` is its only
+        // switch). Shadows the config value; `let _` consumes the original so
+        // it isn't flagged unused on Android.
+        #[cfg(target_os = "android")]
+        let memorabilia_enabled = {
+            let _ = memorabilia_enabled;
+            false
+        };
+
         set_startup_phase(&app, StartupPhase::SpawningBackend);
 
         // Bundled LiteRT resources (Gemma `tokenizer.json` + the runtime DLLs) —

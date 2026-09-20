@@ -2,6 +2,12 @@ package com.kitty.app
 
 import android.Manifest
 import android.app.Activity
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.content.Context
+import android.content.Intent
 import android.net.Uri
 import android.provider.DocumentsContract
 import android.provider.OpenableColumns
@@ -49,9 +55,17 @@ class DownloadNoticeArgs {
     var total: Long = 0
 }
 
+@InvokeArg
+class NotifyArgs {
+    var title: String? = null
+    var body: String? = null
+}
+
 /**
  * The Android-native surface Kitty's Rust core cannot reach on its own:
- * hardware-backed secret storage and the download foreground service.
+ * hardware-backed secret storage, the download and agent-turn foreground
+ * services, and posting system notifications (the Tauri notification plugin is
+ * disabled on Android — its onNewIntent force-closes the app under singleTask).
  *
  * Registered from Rust as a Tauri Android plugin (`crate::android`), which is
  * why this lives in the app module rather than in a separate Gradle library —
@@ -351,5 +365,98 @@ class KittyPlugin(private val activity: Activity) : Plugin(activity) {
     fun notificationPermissionResult(invoke: Invoke) {
         val granted = getPermissionState("notifications") == app.tauri.PermissionState.GRANTED
         invoke.resolve(JSObject().put("granted", granted))
+    }
+
+    // --- Turn foreground service ----------------------------------------
+
+    /** Start (or no-op if already running) the agent-turn foreground service,
+     *  which holds the process alive so an in-progress turn keeps running while
+     *  Kitty is backgrounded. Bracketed from Rust around the turn's SSE stream
+     *  (`bigtiny::stream`). */
+    @Command
+    fun startTurnNotice(invoke: Invoke) {
+        try {
+            TurnService.start(activity)
+            invoke.resolve()
+        } catch (e: Exception) {
+            // A failed foreground-service start must not fail the turn — it only
+            // means the turn is now at the mercy of Doze if backgrounded.
+            invoke.reject("could not start the turn service: ${e.message}", e)
+        }
+    }
+
+    @Command
+    fun stopTurnNotice(invoke: Invoke) {
+        try {
+            TurnService.stop(activity)
+            invoke.resolve()
+        } catch (e: Exception) {
+            invoke.reject("could not stop the turn service: ${e.message}", e)
+        }
+    }
+
+    // --- One-shot notifications -----------------------------------------
+
+    /** Post a dismissable system notification (tap opens the app). This is the
+     *  Android backend for `notifications::emit_notification` — the Tauri
+     *  notification plugin is disabled here (its onNewIntent force-closes the
+     *  app under singleTask), so Rust posts through this instead. Best-effort:
+     *  a missing permission or a failed post is a degradation, not an error. */
+    @Command
+    fun postNotification(invoke: Invoke) {
+        val args = invoke.parseArgs(NotifyArgs::class.java)
+        try {
+            ensureAlertChannel()
+            val tapToOpen = PendingIntent.getActivity(
+                activity,
+                0,
+                Intent(activity, MainActivity::class.java)
+                    .setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP),
+                PendingIntent.FLAG_IMMUTABLE
+            )
+            val notification = Notification.Builder(activity, ALERT_CHANNEL_ID)
+                .setContentTitle(args.title ?: "Kitty")
+                .setContentText(args.body ?: "")
+                .setSmallIcon(R.drawable.ic_stat_activity)
+                .setContentIntent(tapToOpen)
+                .setAutoCancel(true)
+                .build()
+            val manager =
+                activity.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            // A fresh id each post so a new toast doesn't silently replace an
+            // unread one; the low ceiling keeps ids from growing unbounded.
+            manager.notify(nextAlertId(), notification)
+            invoke.resolve()
+        } catch (e: Exception) {
+            invoke.reject("could not post a notification: ${e.message}", e)
+        }
+    }
+
+    private fun ensureAlertChannel() {
+        val manager =
+            activity.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        if (manager.getNotificationChannel(ALERT_CHANNEL_ID) != null) return
+        val channel = NotificationChannel(
+            ALERT_CHANNEL_ID,
+            "Alerts",
+            // DEFAULT: these are the "your turn finished / ran into a problem"
+            // toasts the user actually wants to be pinged about.
+            NotificationManager.IMPORTANCE_DEFAULT
+        ).apply {
+            description = "Turn completions and other one-off notices from Kitty."
+        }
+        manager.createNotificationChannel(channel)
+    }
+
+    private fun nextAlertId(): Int {
+        // 4300..4399 — disjoint from the foreground services' fixed ids
+        // (4201 downloads, 4202 turns).
+        alertSeq = (alertSeq + 1) % 100
+        return 4300 + alertSeq
+    }
+
+    companion object {
+        private const val ALERT_CHANNEL_ID = "kitty_alerts"
+        private var alertSeq = 0
     }
 }

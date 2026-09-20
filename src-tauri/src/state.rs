@@ -4,6 +4,7 @@
 //! daemon handle, generated secret/port, current stack status).
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::AtomicBool;
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
@@ -205,6 +206,14 @@ pub struct AppState {
     /// background timer. `None` only until the very first disk-cache load
     /// or fetch completes.
     pub openrouter_catalog: crate::openrouter::catalog::CatalogSlot,
+    /// Whether the app is currently in the foreground, driven by the webview's
+    /// `visibilitychange` (via `set_app_foreground`). On Windows the toast
+    /// gate uses per-window `is_focused()` and ignores this; on Android there
+    /// is no per-window focus model (a single always-on window, `set_focus`
+    /// unimplemented), so this flag is the only reliable "is the user looking?"
+    /// signal there. Defaults to `true` — before the first `visibilitychange`
+    /// the app has just launched into the foreground.
+    pub foreground: AtomicBool,
 }
 
 impl AppState {
@@ -236,6 +245,7 @@ impl AppState {
             effort_levels: Mutex::new(HashMap::new()),
             effort_confirmed_sessions: Mutex::new(HashSet::new()),
             openrouter_catalog: Mutex::new(None),
+            foreground: AtomicBool::new(true),
         }
     }
 }

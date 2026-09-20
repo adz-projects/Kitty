@@ -5,6 +5,9 @@ use tauri::{AppHandle, Manager};
 
 use crate::config::NotificationPrefs;
 use crate::state::AppState;
+// Window-label/focus lookups have no meaning on Android's single always-on
+// window, so the desktop focus path (and this import) is compiled out there.
+#[cfg(not(target_os = "android"))]
 use crate::windows;
 
 /// Notifiable events; each maps to a per-event config toggle.
@@ -34,6 +37,7 @@ impl Event {
 /// Deliberately checks focus, not mere visibility: a window that's open but
 /// in the background (another app on top, or the user alt-tabbed away)
 /// should still get a toast — that's the whole point of the feature.
+#[cfg(not(target_os = "android"))]
 fn chat_window_focused(app: &AppHandle) -> bool {
     let focused = |label: &str| {
         app.get_webview_window(label)
@@ -49,6 +53,7 @@ fn chat_window_focused(app: &AppHandle) -> bool {
 /// all (e.g. `StackDegraded`, which isn't scoped to one session) or no
 /// window is currently bound to the given one (e.g. it was created headless
 /// by a scheduled task with no window ever open for it).
+#[cfg(not(target_os = "android"))]
 fn relevant_window_focused(app: &AppHandle, session_id: Option<&str>) -> bool {
     if let Some(sid) = session_id {
         if let Some(label) = windows::window_label_for_session(app, sid) {
@@ -59,6 +64,18 @@ fn relevant_window_focused(app: &AppHandle, session_id: Option<&str>) -> bool {
         }
     }
     chat_window_focused(app)
+}
+
+/// Android has no per-window focus model — a single always-on window, with
+/// `set_focus` unimplemented — so `is_focused()` can't answer "is the user
+/// looking at Kitty?". The webview-driven foreground flag
+/// (`AppState::foreground`, set from `visibilitychange` via
+/// `set_app_foreground`) is the reliable signal instead, and it flips the
+/// moment the user switches apps.
+#[cfg(target_os = "android")]
+fn relevant_window_focused(app: &AppHandle, _session_id: Option<&str>) -> bool {
+    use std::sync::atomic::Ordering;
+    app.state::<AppState>().foreground.load(Ordering::SeqCst)
 }
 
 /// Send a notification if the relevant window isn't focused and the event is
@@ -181,8 +198,14 @@ fn emit_notification(app: &AppHandle, title: &str, body: &str, session_id: Optio
 /// (see `lib.rs`). Silent rather than an error — a missing toast is a
 /// degradation, and every caller here is already best-effort.
 #[cfg(target_os = "android")]
-fn emit_notification(_app: &AppHandle, title: &str, _body: &str, _session_id: Option<&str>) {
-    tracing::debug!(title, "notification suppressed: no notification backend on Android yet");
+fn emit_notification(_app: &AppHandle, title: &str, body: &str, _session_id: Option<&str>) {
+    // The Tauri notification plugin is disabled on Android (its `onNewIntent`
+    // force-closes the app under `launchMode="singleTask"` — see `lib.rs`), so
+    // post from Kotlin through our own `kitty-native` plugin instead. Its own
+    // dismissable channel, tap-to-open MainActivity. Best-effort: a refused
+    // POST_NOTIFICATIONS permission or a failed round-trip means no toast, not
+    // an error — every caller here is already best-effort.
+    crate::android::notify::post(title, body);
 }
 
 #[cfg(all(not(windows), not(target_os = "android")))]

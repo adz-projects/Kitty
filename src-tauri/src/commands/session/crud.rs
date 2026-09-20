@@ -164,6 +164,19 @@ pub fn bind_window_session(
     Ok(())
 }
 
+/// Report whether the app is in the foreground, driven by the webview's
+/// `visibilitychange`. On Android this is the only reliable "is the user
+/// looking?" signal (no per-window focus model there), and it gates the
+/// turn-complete notification — see `AppState::foreground` and
+/// `notifications::notify_if_hidden`. On desktop the toast gate uses per-window
+/// `is_focused()` and ignores this, but the frontend still reports it uniformly.
+#[tauri::command]
+pub fn set_app_foreground(state: tauri::State<'_, AppState>, foreground: bool) {
+    state
+        .foreground
+        .store(foreground, std::sync::atomic::Ordering::SeqCst);
+}
+
 /// Pure logic behind `bind_window_session` — factored out so the
 /// stale-binding cleanup is unit-testable without needing a real
 /// `tauri::Window`/`AppHandle`.

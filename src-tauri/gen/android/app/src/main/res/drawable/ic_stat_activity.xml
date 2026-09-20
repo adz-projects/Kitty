@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Status-bar icon for the agent-turn foreground service and the turn-complete
+  notification.
+
+  Like ic_stat_download, deliberately a simple glyph, not the Kitty mark:
+  Android renders a notification's small icon as a pure alpha mask at 24dp, so
+  a filled silhouette arrives as an unreadable blob. Three dots read as
+  "working / activity" at mask size. `#fff` is ignored — only the alpha
+  channel survives the mask.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24"
+    android:tint="#FFFFFFFF">
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M6,12m-2,0a2,2 0 1,0 4,0a2,2 0 1,0 -4,0" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M12,12m-2,0a2,2 0 1,0 4,0a2,2 0 1,0 -4,0" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M18,12m-2,0a2,2 0 1,0 4,0a2,2 0 1,0 -4,0" />
+</vector>
