@@ -65,6 +65,58 @@ async fn file_db_reopen_is_idempotent_and_persistent() {
     let _ = std::fs::remove_file(format!("{}-shm", path.display()));
 }
 
+/// Regression (0.11.2): the live DB recorded migration 3's checksum from a
+/// CRLF checkout, the next build embedded the LF bytes, and sqlx refused to
+/// open ("migration 3 was previously applied but has been modified"). A
+/// line-ending-only difference must be reconciled on open; a real content
+/// change must still be rejected.
+#[tokio::test]
+async fn line_ending_only_checksum_drift_is_reconciled_but_edits_are_not() {
+    use sha2::{Digest, Sha384};
+
+    let path = std::env::temp_dir().join(format!("memorabilia_eol_{}.db", uuid::Uuid::new_v4()));
+    let p = path.to_string_lossy().to_string();
+    let lf_sql = include_str!("../migrations/003_extraction_retry.sql").replace("\r\n", "\n");
+    let lf_sum = Sha384::digest(lf_sql.as_bytes()).to_vec();
+    let crlf_sum = Sha384::digest(lf_sql.replace('\n', "\r\n").as_bytes()).to_vec();
+
+    let set_v3 = |sum: Vec<u8>| {
+        let p = p.clone();
+        async move {
+            let db = Db::open(&p).await.unwrap();
+            sqlx::query("UPDATE _sqlx_migrations SET checksum = ? WHERE version = 3")
+                .bind(sum)
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+    };
+
+    // Fresh DB applies every migration with the embedded (LF) checksum.
+    drop(Db::open(&p).await.unwrap());
+
+    // Simulate a DB created by a CRLF build: reopening must succeed and
+    // rewrite the recorded checksum to the embedded one.
+    set_v3(crlf_sum).await;
+    let db = Db::open(&p).await.expect("CRLF-only drift must not block open");
+    let stored: Vec<u8> =
+        sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = 3")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(stored, lf_sum);
+    drop(db);
+
+    // A checksum matching neither line-ending form is a genuine edit: still
+    // rejected, so sqlx's safety net stays intact.
+    set_v3(vec![0u8; 48]).await;
+    assert!(matches!(Db::open(&p).await, Err(Error::Migrate(_))));
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+    let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+}
+
 #[tokio::test]
 async fn transaction_rolls_back_on_error() {
     let db = Db::open_in_memory().await.unwrap();

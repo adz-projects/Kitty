@@ -49,6 +49,9 @@ pub struct PluginHost {
     /// an `await` that must not happen twice concurrently for the same app --
     /// two engines on one SQLite file is the failure this prevents.
     instances: Mutex<HashMap<String, Instance>>,
+    /// Last engine-open failure per app, cleared on a successful open, so the
+    /// routes can report *why* pathway is unavailable rather than "disabled".
+    open_errors: Mutex<HashMap<String, String>>,
 }
 
 impl PluginHost {
@@ -69,7 +72,14 @@ impl PluginHost {
             embedder,
             chat,
             instances: Mutex::new(HashMap::new()),
+            open_errors: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Why this app's engine last failed to open, if it did (and hasn't opened
+    /// successfully since).
+    pub async fn open_error(&self, app_id: &str) -> Option<String> {
+        self.open_errors.lock().await.get(app_id).cloned()
     }
 
     /// Where an app's belief graph lives.
@@ -136,9 +146,14 @@ impl PluginHost {
             Ok(e) => e,
             Err(err) => {
                 tracing::warn!("pathway engine failed to open at {db_path:?}: {err}");
+                self.open_errors
+                    .lock()
+                    .await
+                    .insert(app_id.to_string(), err.to_string());
                 return None;
             }
         };
+        self.open_errors.lock().await.remove(app_id);
 
         // One background sweep per *live* engine. V1 spawned exactly one
         // because there was exactly one engine; naively carrying that forward
@@ -187,6 +202,23 @@ impl PluginHost {
         }
     }
 
+    /// Reopen the instance after a check/repair and, if pathway is on but the
+    /// engine still won't start, record why in the report — so "the file is
+    /// intact" is never shown as "healthy" while the engine is actually down.
+    async fn reopen_into(
+        &self,
+        app_id: &str,
+        report: &mut crate::plugins::db_recover::RecoverReport,
+    ) {
+        if self.pathway_for(app_id).await.is_none() && self.is_enabled(app_id).await {
+            report.open_error = Some(
+                self.open_error(app_id)
+                    .await
+                    .unwrap_or_else(|| "the memory engine could not be started".into()),
+            );
+        }
+    }
+
     /// Check this app's belief-graph DB and, if corrupt, rebuild it in place
     /// (salvaging every row that still reads), leaving a timestamped `.corrupt`
     /// backup beside it. Reopens the instance either way. Surfaced in Settings
@@ -199,7 +231,7 @@ impl PluginHost {
         // A never-created DB is trivially healthy — reopening makes a fresh one.
         if !tokio::fs::try_exists(&db_path).await.unwrap_or(false) {
             report.integrity_ok = true;
-            let _ = self.pathway_for(app_id).await;
+            self.reopen_into(app_id, &mut report).await;
             return report;
         }
 
@@ -215,7 +247,7 @@ impl PluginHost {
             pool.close().await;
             report.integrity_ok = ok;
             if ok {
-                let _ = self.pathway_for(app_id).await;
+                self.reopen_into(app_id, &mut report).await;
                 return report;
             }
         }
@@ -240,7 +272,7 @@ impl PluginHost {
             Err(e) => {
                 tracing::warn!("recover: fresh pathway DB create failed for {app_id}: {e}");
                 rec::clear_rebuilt(&rebuilt).await;
-                let _ = self.pathway_for(app_id).await;
+                self.reopen_into(app_id, &mut report).await;
                 return report;
             }
         }
@@ -249,7 +281,7 @@ impl PluginHost {
             Ok(()) => tracing::info!(app_id, backup = ?report.backup, "rebuilt corrupt pathway DB"),
             Err(e) => tracing::warn!("recover: pathway swap failed for {db_path:?}: {e}"),
         }
-        let _ = self.pathway_for(app_id).await;
+        self.reopen_into(app_id, &mut report).await;
         report
     }
 

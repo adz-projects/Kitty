@@ -102,7 +102,9 @@ impl Db {
     }
 
     async fn init(pool: &SqlitePool) -> Result<()> {
-        sqlx::migrate!("./migrations")
+        let migrator = sqlx::migrate!("./migrations");
+        reconcile_line_ending_checksums(pool, &migrator).await;
+        migrator
             .run(pool)
             .await
             .map_err(|e| Error::Migrate(e.to_string()))?;
@@ -249,6 +251,73 @@ impl Db {
                 self.rollback_txn().await;
                 Err(e)
             }
+        }
+    }
+}
+
+/// Make sqlx's applied-migration check tolerant of line-ending drift.
+///
+/// sqlx records a SHA-384 of each migration file's *raw bytes* and refuses to
+/// open a database whose recorded checksum differs from the one compiled in.
+/// A migration checked out with CRLF on one build and LF on the next (the
+/// repo's `.gitattributes` now forces LF) is byte-different but SQL-identical,
+/// and that alone bricked the engine ("migration 3 was previously applied but
+/// has been modified"). For each applied migration whose recorded checksum
+/// matches the LF *or* CRLF form of the embedded SQL, rewrite it to the
+/// embedded checksum. Any other mismatch is left alone, so a genuinely edited
+/// migration still fails loudly. Best-effort: on a fresh DB (no
+/// `_sqlx_migrations` yet) or any query error this is a no-op and the normal
+/// migrator runs as before.
+pub(crate) async fn reconcile_line_ending_checksums(
+    pool: &SqlitePool,
+    migrator: &sqlx::migrate::Migrator,
+) {
+    use sha2::{Digest, Sha384};
+
+    let has_table: Option<String> = sqlx::query_scalar(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations'",
+    )
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    if has_table.is_none() {
+        return;
+    }
+
+    for m in migrator.iter() {
+        let stored: Option<Vec<u8>> =
+            match sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = ?")
+                .bind(m.version)
+                .fetch_optional(pool)
+                .await
+            {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+        let Some(stored) = stored else { continue };
+        if stored.as_slice() == m.checksum.as_ref() {
+            continue;
+        }
+        let lf = m.sql.replace("\r\n", "\n");
+        let crlf = lf.replace('\n', "\r\n");
+        let equivalent = [lf, crlf]
+            .iter()
+            .any(|variant| Sha384::digest(variant.as_bytes()).as_slice() == stored.as_slice());
+        if !equivalent {
+            continue;
+        }
+        if sqlx::query("UPDATE _sqlx_migrations SET checksum = ? WHERE version = ?")
+            .bind(m.checksum.as_ref())
+            .bind(m.version)
+            .execute(pool)
+            .await
+            .is_ok()
+        {
+            tracing::info!(
+                version = m.version,
+                "memorabilia: migration checksum differed only by line endings; reconciled"
+            );
         }
     }
 }

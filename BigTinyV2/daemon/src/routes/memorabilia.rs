@@ -27,18 +27,23 @@ fn err_response(status: StatusCode, message: impl Into<String>) -> Response {
 }
 
 /// Resolve the caller's own engine (per app: a fact browser must show the
-/// caller its *own* store, never another app's). `None` engine (memorabilia
-/// disabled for the app) is a soft error, boxed to dodge clippy's
-/// `result_large_err`.
+/// caller its *own* store, never another app's). `None` engine is a soft
+/// error, boxed to dodge clippy's `result_large_err`: "memorabilia disabled"
+/// when it is genuinely off, or the recorded open failure when it is on but
+/// could not start — reporting the latter as "disabled" hid the 0.11.2
+/// migration-checksum failure behind a misleading message.
 async fn engine(
     state: &AppState,
     identity: &AppIdentity,
 ) -> Result<Arc<memorabilia::engine::Engine>, Box<Response>> {
-    state
-        .memorabilia
-        .memorabilia_for(&identity.app_id)
-        .await
-        .ok_or_else(|| Box::new(Json(json!({ "error": "memorabilia disabled" })).into_response()))
+    if let Some(engine) = state.memorabilia.memorabilia_for(&identity.app_id).await {
+        return Ok(engine);
+    }
+    let message = match state.memorabilia.open_error(&identity.app_id).await {
+        Some(err) => format!("memorabilia failed to open: {err}"),
+        None => "memorabilia disabled".to_string(),
+    };
+    Err(Box::new(Json(json!({ "error": message })).into_response()))
 }
 
 /// GET /api/memorabilia/items — active memory items (the Settings fact

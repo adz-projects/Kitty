@@ -29,6 +29,54 @@ fn sample_belief(dim: usize) -> Belief {
     }
 }
 
+/// A migration checksum recorded from a CRLF checkout must not block opening
+/// a DB built from an LF checkout (the 0.11.2 memorabilia regression); a real
+/// content change must still be rejected.
+#[tokio::test]
+async fn line_ending_only_checksum_drift_is_reconciled_but_edits_are_not() {
+    use sha2::{Digest, Sha384};
+
+    let path = std::env::temp_dir().join(format!("pathway_eol_{}.db", uuid::Uuid::new_v4()));
+    let p = path.to_string_lossy().to_string();
+    let lf_sql = include_str!("../migrations/001_init.sql").replace("\r\n", "\n");
+    let lf_sum = Sha384::digest(lf_sql.as_bytes()).to_vec();
+    let crlf_sum = Sha384::digest(lf_sql.replace('\n', "\r\n").as_bytes()).to_vec();
+
+    let set_v1 = |sum: Vec<u8>| {
+        let p = p.clone();
+        async move {
+            let db = Db::open(&p).await.unwrap();
+            sqlx::query("UPDATE _sqlx_migrations SET checksum = ? WHERE version = 1")
+                .bind(sum)
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+    };
+
+    drop(Db::open(&p).await.unwrap());
+
+    set_v1(crlf_sum).await;
+    let db = Db::open(&p).await.expect("CRLF-only drift must not block open");
+    let stored: Vec<u8> =
+        sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = 1")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(stored, lf_sum);
+    drop(db);
+
+    set_v1(vec![0u8; 48]).await;
+    assert!(matches!(
+        Db::open(&p).await,
+        Err(adaptive_pathway::error::PathwayError::Migrate(_))
+    ));
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+    let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+}
+
 #[tokio::test]
 async fn belief_blob_round_trip() {
     let db = Db::open_in_memory().await.unwrap();

@@ -32,11 +32,16 @@ async fn engine(
     state: &AppState,
     identity: &crate::storage::apps::AppIdentity,
 ) -> Result<Arc<adaptive_pathway::engine::PathwayEngine>, Box<Response>> {
-    state
-        .plugins
-        .pathway_for(&identity.app_id)
-        .await
-        .ok_or_else(|| Box::new(Json(json!({ "error": "pathway disabled" })).into_response()))
+    if let Some(engine) = state.plugins.pathway_for(&identity.app_id).await {
+        return Ok(engine);
+    }
+    // Distinguish "off" from "on but failed to open", so a real startup
+    // failure is never reported as "disabled".
+    let message = match state.plugins.open_error(&identity.app_id).await {
+        Some(err) => format!("pathway failed to open: {err}"),
+        None => "pathway disabled".to_string(),
+    };
+    Err(Box::new(Json(json!({ "error": message })).into_response()))
 }
 
 /// GET /api/pathway/beliefs — all beliefs (for the Settings belief browser).

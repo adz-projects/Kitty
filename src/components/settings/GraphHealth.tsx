@@ -61,7 +61,12 @@ export function GraphHealth() {
     setRepairMsg('');
     try {
       const r = await ipc.recoverPathwayDb();
-      if (!r.rebuilt) {
+      if (r.open_error) {
+        setRepairMsg(
+          `${r.rebuilt ? 'The database was rebuilt' : 'The database file is intact'}, ` +
+            `but the memory engine could not start: ${r.open_error}`,
+        );
+      } else if (!r.rebuilt) {
         setRepairMsg(
           r.integrity_ok
             ? 'Database is healthy — no repair needed.'

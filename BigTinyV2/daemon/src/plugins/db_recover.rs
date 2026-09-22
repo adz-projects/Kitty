@@ -34,6 +34,10 @@ pub struct RecoverReport {
     pub salvaged: BTreeMap<String, i64>,
     /// Path of the pre-rebuild backup, when one was taken.
     pub backup: Option<String>,
+    /// Set when the file checks out but the engine still fails to open (e.g. a
+    /// migration mismatch) — so a sound file is never reported as "healthy"
+    /// while memory is actually down.
+    pub open_error: Option<String>,
 }
 
 /// Append a raw suffix to a path's filename (e.g. `pathway.db` + `-wal`).

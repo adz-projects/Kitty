@@ -504,6 +504,8 @@ export interface DbRecoverReport {
   salvaged: Record<string, number>;
   /** Path of the pre-rebuild backup, when one was taken. */
   backup: string | null;
+  /** Set when the file is sound but the engine still fails to open. */
+  open_error: string | null;
 }
 
 /** Native folder picker (default context folder, etc.). Returns null if cancelled. */

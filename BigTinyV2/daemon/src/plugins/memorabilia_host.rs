@@ -111,6 +111,10 @@ pub struct MemorabiliaHost {
     /// every app's `chunks_vec` table agrees on a dimension.
     resolved: tokio::sync::OnceCell<(MemConfig, Arc<dyn memorabilia::traits::Embedder>)>,
     instances: Mutex<HashMap<String, Instance>>,
+    /// Last engine-open failure per app, cleared on a successful open. Lets the
+    /// routes say *why* memory is unavailable instead of reporting every failed
+    /// open as "disabled" (which hid the 0.11.2 migration-checksum failure).
+    open_errors: Mutex<HashMap<String, String>>,
 }
 
 impl MemorabiliaHost {
@@ -144,7 +148,14 @@ impl MemorabiliaHost {
             chat,
             resolved: tokio::sync::OnceCell::new(),
             instances: Mutex::new(HashMap::new()),
+            open_errors: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Why this app's engine last failed to open, if it did (and hasn't opened
+    /// successfully since).
+    pub async fn open_error(&self, app_id: &str) -> Option<String> {
+        self.open_errors.lock().await.get(app_id).cloned()
     }
 
     /// Resolve `(engine config, embedder)` once, lazily, memoized. The shared
@@ -272,9 +283,14 @@ impl MemorabiliaHost {
             Ok(e) => e,
             Err(err) => {
                 tracing::warn!("memorabilia engine failed to open at {db_path:?}: {err}");
+                self.open_errors
+                    .lock()
+                    .await
+                    .insert(app_id.to_string(), err.to_string());
                 return None;
             }
         };
+        self.open_errors.lock().await.remove(app_id);
 
         let (shutdown, rx) = tokio::sync::watch::channel(false);
         let background =
@@ -312,6 +328,23 @@ impl MemorabiliaHost {
         }
     }
 
+    /// Reopen the instance after a check/repair and, if memorabilia is on but
+    /// the engine still won't start, record why in the report — so "the file is
+    /// intact" is never shown as "healthy" while the engine is actually down.
+    async fn reopen_into(
+        &self,
+        app_id: &str,
+        report: &mut crate::plugins::db_recover::RecoverReport,
+    ) {
+        if self.memorabilia_for(app_id).await.is_none() && self.is_enabled(app_id).await {
+            report.open_error = Some(
+                self.open_error(app_id)
+                    .await
+                    .unwrap_or_else(|| "the memory engine could not be started".into()),
+            );
+        }
+    }
+
     /// Check this app's factual-memory DB and, if corrupt, rebuild it in place
     /// (salvaging every row that still reads), leaving a timestamped `.corrupt`
     /// backup beside it. Reopens the instance either way. Surfaced in Settings
@@ -325,7 +358,7 @@ impl MemorabiliaHost {
 
         if !tokio::fs::try_exists(&db_path).await.unwrap_or(false) {
             report.integrity_ok = true;
-            let _ = self.memorabilia_for(app_id).await;
+            self.reopen_into(app_id, &mut report).await;
             return report;
         }
 
@@ -339,7 +372,7 @@ impl MemorabiliaHost {
             pool.close().await;
             report.integrity_ok = ok;
             if ok {
-                let _ = self.memorabilia_for(app_id).await;
+                self.reopen_into(app_id, &mut report).await;
                 return report;
             }
         }
@@ -363,7 +396,7 @@ impl MemorabiliaHost {
             Err(e) => {
                 tracing::warn!("recover: fresh memorabilia DB create failed for {app_id}: {e}");
                 rec::clear_rebuilt(&rebuilt).await;
-                let _ = self.memorabilia_for(app_id).await;
+                self.reopen_into(app_id, &mut report).await;
                 return report;
             }
         }
@@ -374,7 +407,7 @@ impl MemorabiliaHost {
             }
             Err(e) => tracing::warn!("recover: memorabilia swap failed for {db_path:?}: {e}"),
         }
-        let _ = self.memorabilia_for(app_id).await;
+        self.reopen_into(app_id, &mut report).await;
         report
     }
 
