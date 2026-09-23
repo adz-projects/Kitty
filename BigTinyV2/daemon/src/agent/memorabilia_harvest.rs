@@ -97,7 +97,16 @@ pub async fn harvest_turn(engine: &Engine, pool: &SqlitePool, session_id: &str) 
     // Source 3 — successfully scraped pages from this turn's tool results.
     for item in scraped_items(pool, session_id, user_rowid).await {
         let content = match item.body {
-            ScrapeBody::Text(t) => Some(t),
+            // A converted web page: strip site chrome (nav, promo cards, image
+            // and link markup) so it doesn't become "evidence".
+            ScrapeBody::Text(t) => {
+                let cleaned = clean_scraped_page(&t);
+                if cleaned.is_none() {
+                    tracing::debug!("memorabilia harvest: {} had no substantive text", item.url);
+                }
+                cleaned
+            }
+            // A downloaded document (PDF, DOCX, …) is real content: untouched.
             ScrapeBody::CachedDoc(path) => extract_file(PathBuf::from(path)).await,
         };
         if let Some(content) = content {
@@ -112,6 +121,103 @@ pub async fn harvest_turn(engine: &Engine, pool: &SqlitePool, session_id: &str) 
     if ingested_any {
         engine.drain_extraction(&now).await;
     }
+}
+
+/// Minimum non-whitespace characters of prose a cleaned page must keep to be
+/// worth ingesting at all (a page that reduces to "Return to example.com" or a
+/// cookie notice is skipped).
+const MIN_PAGE_PROSE: usize = 200;
+
+/// A short block that is mostly link/image markup, or that carried an image,
+/// is navigation, a promo card, a banner or a caption — not content — when it
+/// leaves less than this much prose. Real paragraphs clear it easily, even
+/// with inline links.
+const LINK_BLOCK_MAX_PROSE: usize = 120;
+
+/// Button/link labels that carry no content ("Learn more", "See all", …),
+/// matched case-insensitively as a whole line or at the end of one.
+const CALLS_TO_ACTION: &[&str] = &[
+    "learn more",
+    "see all",
+    "see more",
+    "view all",
+    "view more",
+    "read more",
+    "continue reading",
+    "shop now",
+    "buy now",
+    "visit now",
+    "find out more",
+    "sign up",
+    "sign in",
+    "log in",
+    "subscribe",
+];
+
+/// Reduce a scraped page's markdown to its substantive text before ingesting
+/// it as evidence: images and link URLs removed (link labels kept), calls to
+/// action dropped, and navigation/promo blocks — short, and mostly markup or
+/// image-bearing — dropped. Fenced code is kept verbatim. `None` when too
+/// little prose remains to be worth remembering.
+fn clean_scraped_page(markdown: &str) -> Option<String> {
+    static IMAGE: Lazy<Regex> = Lazy::new(|| Regex::new(r"!\[[^\]]*\]\([^)]*\)").unwrap());
+    static EMPTY_LINK: Lazy<Regex> = Lazy::new(|| Regex::new(r"\[\s*\]\([^)]*\)").unwrap());
+
+    let mut kept: Vec<String> = Vec::new();
+    for block in kitty_web::scrape::split_markdown_blocks(markdown) {
+        if block.trim_start().starts_with("```") {
+            kept.push(block);
+            continue;
+        }
+        let had_image = IMAGE.is_match(&block);
+        // Images first: that also empties `[![](img)](url)` card wrappers,
+        // which `strip_markdown_links` can't match (it needs a label).
+        let no_images = IMAGE.replace_all(&block, "");
+        let no_empty = EMPTY_LINK.replace_all(&no_images, "");
+        let text = kitty_web::scrape::strip_markdown_links(&no_empty);
+        let cleaned = text
+            .lines()
+            .map(strip_trailing_call_to_action)
+            .filter(|l| !l.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let prose = non_whitespace_len(&cleaned);
+        if prose == 0 {
+            continue;
+        }
+        let markup_share = 1.0 - cleaned.len() as f64 / block.len().max(1) as f64;
+        if prose < LINK_BLOCK_MAX_PROSE && (had_image || markup_share >= 0.5) {
+            continue;
+        }
+        kept.push(cleaned);
+    }
+
+    let page = kept.join("\n\n");
+    (non_whitespace_len(&page) >= MIN_PAGE_PROSE).then_some(page)
+}
+
+fn non_whitespace_len(s: &str) -> usize {
+    s.chars().filter(|c| !c.is_whitespace()).count()
+}
+
+/// Trim `line` and drop a call to action that is the whole line or its tail
+/// ("…for Modern Business. Learn more" → "…for Modern Business.").
+fn strip_trailing_call_to_action(line: &str) -> String {
+    let mut rest = line.trim();
+    loop {
+        let core = rest.trim_end_matches(|c: char| !c.is_alphanumeric());
+        let lower = core.to_ascii_lowercase();
+        let Some(cta) = CALLS_TO_ACTION.iter().find(|c| lower.ends_with(*c)) else {
+            break;
+        };
+        let head = &core[..core.len() - cta.len()];
+        // Only a whole trailing phrase: "Read more" yes, "Spread more" no.
+        if head.chars().last().is_some_and(|c| c.is_alphanumeric()) {
+            break;
+        }
+        rest = head.trim_end();
+    }
+    rest.to_string()
 }
 
 /// Ingest one document, skipping empties. Errors are swallowed by the engine
@@ -444,5 +550,64 @@ mod tests {
         assert!(ids.contains("call_1"));
         assert!(!ids.contains("call_2"));
         assert_eq!(ids.len(), 1);
+    }
+
+    /// A paragraph of real content with inline links (well over the prose bars).
+    const ARTICLE: &str = "The [harbor wall](https://example.org/wall) was rebuilt in 1987 after \
+        the storm surge of that winter undermined its foundations. Engineers from the \
+        [county works department](https://example.org/works) replaced the timber piles with \
+        reinforced concrete and raised the crest by one and a half metres.";
+
+    #[test]
+    fn scraped_page_keeps_prose_and_drops_link_urls() {
+        let out = clean_scraped_page(ARTICLE).expect("a real paragraph is kept");
+        assert!(out.contains("The harbor wall was rebuilt in 1987"), "labels kept: {out}");
+        assert!(out.contains("county works department"));
+        assert!(!out.contains("https://"), "urls stripped: {out}");
+    }
+
+    #[test]
+    fn scraped_page_drops_nav_menus_promo_cards_and_calls_to_action() {
+        // Shapes taken from a real asus.com scrape that became "evidence".
+        let page = format!(
+            "[Home](https://www.asus.com/) [Laptops](https://www.asus.com/laptops/) \
+             [Displays](https://www.asus.com/displays/) [Support](https://www.asus.com/support/)\n\n\
+             [![](https://dlcdnwebimgs.asus.com/gain/nuc16.png)](https://www.asus.com/nuc-16/) \
+             ASUS NUC 16 Mini PC Smart. Versatile. Scaled for Modern Business. Learn more\n\n\
+             See all\n\n{ARTICLE}"
+        );
+        let out = clean_scraped_page(&page).expect("the article survives");
+        for gone in ["Laptops", "NUC 16", "Learn more", "See all", "https://"] {
+            assert!(!out.contains(gone), "{gone:?} should be gone: {out}");
+        }
+        assert!(out.contains("The harbor wall was rebuilt in 1987"));
+    }
+
+    #[test]
+    fn scraped_page_with_no_substance_is_skipped() {
+        // The real level1techs scrape reduced to exactly this.
+        assert_eq!(
+            clean_scraped_page("[Return to Level1Techs.com](https://level1techs.com/)"),
+            None
+        );
+        assert_eq!(clean_scraped_page("![](https://x/banner.png)\n\nLearn more"), None);
+    }
+
+    #[test]
+    fn scraped_page_leaves_fenced_code_untouched() {
+        let code = "```\ncurl [x](https://example.org/api) ![](y)\n```";
+        let out = clean_scraped_page(&format!("{ARTICLE}\n\n{code}")).unwrap();
+        assert!(out.contains(code), "fence verbatim: {out}");
+    }
+
+    #[test]
+    fn call_to_action_stripping_is_whole_phrase_only() {
+        assert_eq!(
+            strip_trailing_call_to_action("Scaled for Modern Business. Learn more »"),
+            "Scaled for Modern Business."
+        );
+        assert_eq!(strip_trailing_call_to_action("  Read more  "), "");
+        // A sentence merely ending in the same letters is left alone.
+        assert_eq!(strip_trailing_call_to_action("We spread more"), "We spread more");
     }
 }

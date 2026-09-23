@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { ipc } from '@/lib/ipc';
+import { DB_REPAIR_CONFIRM, runDbRepair } from './dbRepair';
 import type { PathwayBelief, PathwayStats } from '@/lib/types';
 
 const SUPPORT_BUCKETS: [string, (n: number) => boolean][] = [
@@ -49,36 +50,13 @@ export function GraphHealth() {
   useEffect(() => void load(), []);
 
   const repair = async () => {
-    if (
-      !window.confirm(
-        'Check the memory database and, if it is corrupt, rebuild it? ' +
-          'The current file is backed up first.',
-      )
-    ) {
+    if (!window.confirm(DB_REPAIR_CONFIRM)) {
       return;
     }
     setRepairing(true);
     setRepairMsg('');
     try {
-      const r = await ipc.recoverPathwayDb();
-      if (r.open_error) {
-        setRepairMsg(
-          `${r.rebuilt ? 'The database was rebuilt' : 'The database file is intact'}, ` +
-            `but the memory engine could not start: ${r.open_error}`,
-        );
-      } else if (!r.rebuilt) {
-        setRepairMsg(
-          r.integrity_ok
-            ? 'Database is healthy — no repair needed.'
-            : 'Database check failed; could not read the file.',
-        );
-      } else {
-        const total = Object.values(r.salvaged).reduce((a, b) => a + b, 0);
-        setRepairMsg(
-          `Rebuilt the database (${total} record${total === 1 ? '' : 's'} recovered).` +
-            (r.backup ? ` A backup was saved to ${r.backup}.` : ''),
-        );
-      }
+      setRepairMsg(await runDbRepair(ipc.recoverPathwayDb));
       await load();
     } catch (e) {
       setRepairMsg(String(e));

@@ -23,6 +23,47 @@ use crate::error::{PathwayError, Result};
 
 pub struct Db {
     pool: SqlitePool,
+    /// Serializes `run_in_transaction` on the single shared connection, from
+    /// `BEGIN` to `COMMIT`/`ROLLBACK`, so two tasks' transactions can never
+    /// interleave, and so the abandoned-transaction rollback (see
+    /// [`TxnGuard`]) always finishes before the next transaction begins.
+    txn_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+}
+
+/// Rolls back a transaction whose future was dropped before it finished.
+///
+/// `run_in_transaction` issues raw `BEGIN`/`COMMIT` on a one-connection pool.
+/// If the future is dropped in between, nothing ever sends `COMMIT` or
+/// `ROLLBACK`, the shared connection stays inside that transaction for the
+/// rest of the process, and every later write silently joins it (visible
+/// here, never committed). This is not hypothetical: the agent loop aborts the
+/// previous turn's learn task at the start of every turn (`cancel_background`),
+/// and learn writes through `belief::synthesis::route_observation`, which is a
+/// transaction. `Drop` can't `.await`, so it spawns the `ROLLBACK`, handing it
+/// the owned `txn_lock` guard so the next transaction waits for it.
+struct TxnGuard {
+    pool: SqlitePool,
+    lock: Option<tokio::sync::OwnedMutexGuard<()>>,
+    armed: bool,
+}
+
+impl Drop for TxnGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        tracing::warn!("pathway: transaction abandoned before commit; rolling it back");
+        let lock = self.lock.take();
+        let pool = self.pool.clone();
+        // No runtime (process teardown): the connection closes with the
+        // process, and `begin_txn`'s stale-transaction recovery covers the rest.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let _ = sqlx::query("ROLLBACK").execute(&pool).await;
+                drop(lock);
+            });
+        }
+    }
 }
 
 impl Db {
@@ -78,7 +119,10 @@ impl Db {
         let pool_options = SqlitePoolOptions::new().min_connections(1).max_connections(1);
         let pool = pool_options.connect_with(options).await?;
         Self::init(&pool).await?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            txn_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        })
     }
 
     pub async fn open_in_memory() -> Result<Self> {
@@ -110,8 +154,22 @@ impl Db {
     /// transaction forever, blocking every subsequent query against this
     /// `Db`.
     async fn begin_txn(&self) -> Result<()> {
-        sqlx::query("BEGIN").execute(self.pool()).await?;
-        Ok(())
+        match sqlx::query("BEGIN").execute(self.pool()).await {
+            Ok(_) => Ok(()),
+            // A transaction from an earlier, abandoned caller is still open on
+            // the shared connection. `txn_lock` guarantees it isn't a live
+            // one, so roll it back and start ours rather than failing (and
+            // leaving it open) forever.
+            Err(e) if e.to_string().contains("within a transaction") => {
+                tracing::warn!(
+                    "pathway: stale open transaction on the shared connection; rolling it back"
+                );
+                let _ = sqlx::query("ROLLBACK").execute(self.pool()).await;
+                sqlx::query("BEGIN").execute(self.pool()).await?;
+                Ok(())
+            }
+            Err(e) => Err(e.into()),
+        }
     }
     async fn commit_txn(&self) -> Result<()> {
         sqlx::query("COMMIT").execute(self.pool()).await?;
@@ -135,17 +193,35 @@ impl Db {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
     {
-        self.begin_txn().await?;
-        match f().await {
-            Ok(value) => {
-                self.commit_txn().await?;
-                Ok(value)
-            }
+        let lock = self.txn_lock.clone().lock_owned().await;
+        // Armed before `BEGIN`: a drop while `BEGIN` is in flight still rolls
+        // back (harmlessly, if it never ran).
+        let mut guard = TxnGuard {
+            pool: self.pool.clone(),
+            lock: Some(lock),
+            armed: true,
+        };
+        if let Err(e) = self.begin_txn().await {
+            guard.armed = false;
+            return Err(e);
+        }
+        let result = match f().await {
+            Ok(value) => match self.commit_txn().await {
+                Ok(()) => Ok(value),
+                // A failed COMMIT (e.g. SQLITE_BUSY) leaves the transaction
+                // open; close it rather than stranding the connection.
+                Err(e) => {
+                    self.rollback_txn().await;
+                    Err(e)
+                }
+            },
             Err(e) => {
                 self.rollback_txn().await;
                 Err(e)
             }
-        }
+        };
+        guard.armed = false;
+        result
     }
 }
 

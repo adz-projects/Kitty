@@ -3594,7 +3594,9 @@ impl AgentLoop {
                         .await
                         .unwrap_or(0);
                 if max_rowid > 0 {
-                    let _ = adaptive_pathway::learn::extract_and_record(
+                    // Logged rather than discarded: a silently failing learn
+                    // pass is how pathway went weeks without committing.
+                    if let Err(e) = adaptive_pathway::learn::extract_and_record(
                         &engine,
                         &host_pool,
                         chat.as_ref(),
@@ -3605,7 +3607,10 @@ impl AgentLoop {
                         },
                         adaptive_pathway::learn::LearnTrigger::TurnEnd,
                     )
-                    .await;
+                    .await
+                    {
+                        tracing::warn!("pathway turn-end learn failed for {learn_session_id}: {e}");
+                    }
                 }
             }
         });

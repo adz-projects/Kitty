@@ -96,7 +96,11 @@ impl Engine {
         let db = Db::open(path).await?;
         db.init_vectors(config.embedding_dim).await?;
         let vectors = Arc::new(SqliteVectorIndex::new(db.pool().clone()));
-        Ok(Arc::new(Self::new(config, db, chat, embedder, vectors)))
+        let engine = Arc::new(Self::new(config, db, chat, embedder, vectors));
+        // One-time cleanup of pre-document-harvest dialogue evidence; a no-op
+        // (one settings read) once done.
+        engine.purge_legacy_conversation_documents().await;
+        Ok(engine)
     }
 
     /// Install the optional LLM PII classifier on the Stage 0 gate (plan

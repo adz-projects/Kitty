@@ -809,6 +809,98 @@ impl Engine {
     /// the event name carries the reason, the detail a structural count —
     /// never the text. Best-effort: an audit failure never changes the
     /// forget outcome.
+    /// One-time removal of `Conversation`-sourced evidence left behind by the
+    /// retired message-pair harvest. Harvest has taken only documents (pasted
+    /// text, attachments, successful scrapes) since 2026-09-19; the older
+    /// dialogue chunks are the assistant and user talking — e.g. the assistant
+    /// listing its own tools — and became bogus "facts" once extraction began
+    /// completing.
+    ///
+    /// Same steps as `forget(Private)` for each such chunk (vector, row), then
+    /// propositions left with no supporting evidence are **deleted**, not
+    /// archived (they were never facts), then the documents themselves. One
+    /// audit row records counts only. Gated by an `app_settings` flag so it
+    /// runs once per database; on error the flag stays unset and the next open
+    /// retries. Soft-fail throughout.
+    pub async fn purge_legacy_conversation_documents(&self) {
+        const FLAG: &str = "legacy_conversation_purged_v1";
+        match self.db.get_setting(FLAG).await {
+            Ok(Some(_)) => return,
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!("memorabilia: legacy purge flag read failed ({e}); skipping");
+                return;
+            }
+        }
+        let chunk_ids: Vec<String> = match sqlx::query_scalar(
+            "SELECT c.chunk_id FROM chunks c \
+             JOIN documents d ON d.document_hash = c.document_hash \
+             WHERE d.source_type = 'Conversation'",
+        )
+        .fetch_all(self.db.pool())
+        .await
+        {
+            Ok(ids) => ids,
+            Err(e) => {
+                tracing::warn!("memorabilia: legacy purge could not list chunks ({e}); skipping");
+                return;
+            }
+        };
+
+        let (_, now_str) = timestamp_now();
+        let db = &self.db;
+        let vectors = self.vectors.clone();
+        let chunk_count = chunk_ids.len();
+        let result = db
+            .run_in_transaction(|| async move {
+                let mut nodes: Vec<String> = Vec::new();
+                for id in &chunk_ids {
+                    nodes.extend(db.list_nodes_supported_by_chunk(id).await?);
+                    vectors.remove(id).await.map_err(Error::Internal)?;
+                    db.delete_chunk(id).await?;
+                }
+                nodes.sort();
+                nodes.dedup();
+                let mut propositions = 0u64;
+                for node in &nodes {
+                    if db.count_active_sources(node).await? == 0 {
+                        db.delete_proposition(node).await?;
+                        propositions += 1;
+                    }
+                }
+                let documents =
+                    sqlx::query("DELETE FROM documents WHERE source_type = 'Conversation'")
+                        .execute(db.pool())
+                        .await?
+                        .rows_affected();
+                db.insert_audit(&AuditEntry {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    event: "purged:legacy_conversation".into(),
+                    category: None,
+                    detail: Some(format!(
+                        "documents={documents} chunks={chunk_count} propositions={propositions}"
+                    )),
+                    created_at: now_str.clone(),
+                })
+                .await?;
+                db.set_setting(FLAG, &now_str).await?;
+                Ok((documents, propositions))
+            })
+            .await;
+        match result {
+            Ok((documents, propositions)) if documents > 0 || chunk_count > 0 => tracing::info!(
+                documents,
+                chunks = chunk_count,
+                propositions,
+                "memorabilia: purged legacy conversation evidence"
+            ),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(
+                "memorabilia: legacy conversation purge failed ({e}); will retry on next open"
+            ),
+        }
+    }
+
     async fn audit_forget(&self, reason: ForgetReason, matched: u64) {
         let entry = forget_audit_entry(reason, matched);
         if let Err(e) = self.db.insert_audit(&entry).await {

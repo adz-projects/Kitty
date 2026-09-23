@@ -487,3 +487,94 @@ async fn forget_empty_phrase_is_a_noop_audit() {
         Some("unresolved: no matching active chunk")
     );
 }
+
+// ---------------------------------------------------------------------------
+// Legacy dialogue purge (0.11.4)
+// ---------------------------------------------------------------------------
+
+fn sourced(content: &str, source_type: &str, source: &str) -> IngestInput {
+    IngestInput {
+        content: content.into(),
+        source_type: source_type.into(),
+        source_name: source.into(),
+        source_entity: source.into(),
+        captured_at: T0.into(),
+        intent: None,
+    }
+}
+
+fn claim(node: &str, text: &str) -> Proposition {
+    Proposition {
+        node_id: node.into(),
+        claim: text.into(),
+        confidence: 0.35,
+        is_disputed: false,
+        status: "active".into(),
+        // `high` would only be *archived* by forget's orphan rule; the purge
+        // must delete it outright — dialogue claims were never facts.
+        importance: "high".into(),
+        urgency: "unknown".into(),
+        urgency_expires_at: None,
+        last_assessed_at: None,
+        archived_at: None,
+        created_at: T0.into(),
+    }
+}
+
+/// Regression: evidence harvested from chat dialogue by the retired
+/// message-pair harvest (e.g. the assistant listing its own tools) turned into
+/// "facts" like "The system has functions for …". The one-time purge removes
+/// that evidence and its claims, leaves real documents alone, and runs once.
+#[tokio::test]
+async fn legacy_conversation_purge_removes_dialogue_and_keeps_documents() {
+    let engine = test_engine(Config::default()).await;
+    let dialogue = "assistant: here is a complete list of my tools and what each one does";
+    let page = "The harbor wall was rebuilt in 1987 after the storm surge damaged it";
+    assert_eq!(
+        engine
+            .ingest(&sourced(dialogue, "Conversation", "session:s1"))
+            .await
+            .chunks_written,
+        1
+    );
+    assert_eq!(
+        engine
+            .ingest(&sourced(page, "Scraped", "example.org"))
+            .await
+            .chunks_written,
+        1
+    );
+    let active = engine.db.list_chunks_by_status("active").await.unwrap();
+    let conv = active.iter().find(|c| c.content == dialogue).unwrap().chunk_id.clone();
+    let doc = active.iter().find(|c| c.content == page).unwrap().chunk_id.clone();
+    for (node, text, chunk) in [
+        ("n_conv", "The system has functions for listing its tools", &conv),
+        ("n_doc", "The harbor wall was rebuilt in 1987", &doc),
+    ] {
+        engine.db.insert_proposition(&claim(node, text)).await.unwrap();
+        engine.db.add_support_link(chunk, node, T0).await.unwrap();
+    }
+
+    engine.purge_legacy_conversation_documents().await;
+
+    let pool = engine.db.pool();
+    assert_eq!(
+        count_of(pool, "SELECT COUNT(*) FROM documents WHERE source_type = 'Conversation'").await,
+        0
+    );
+    assert_eq!(
+        count_of(pool, "SELECT COUNT(*) FROM documents WHERE source_type = 'Scraped'").await,
+        1
+    );
+    assert!(engine.db.get_proposition("n_conv").await.unwrap().is_none());
+    assert!(engine.db.get_proposition("n_doc").await.unwrap().is_some());
+    let vec_rows = |id: &str| format!("SELECT COUNT(*) FROM chunks_vec WHERE chunk_id = '{id}'");
+    assert_eq!(count_of(pool, &vec_rows(&conv)).await, 0, "dialogue vector removed");
+    assert_eq!(count_of(pool, &vec_rows(&doc)).await, 1, "document vector kept");
+    let audited = "SELECT COUNT(*) FROM audit_log WHERE event = 'purged:legacy_conversation'";
+    assert_eq!(count_of(pool, audited).await, 1);
+
+    // Runs once: a second call is a no-op (flag set, no second audit row).
+    engine.purge_legacy_conversation_documents().await;
+    assert_eq!(count_of(pool, audited).await, 1);
+}

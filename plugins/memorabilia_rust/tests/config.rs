@@ -118,7 +118,9 @@ fn defaults_match_plan_section2() {
     // Plan §2 names the default "local instruct model"; it must name a
     // concrete model (qwen3 4B-class per §3.6) so the default is runnable.
     assert!(!c.extraction.model.is_empty());
-    assert_eq!(c.extraction.timeout_s, 12);
+    // Raised from the plan's 12s in 0.11.2: the local Gemma-E2B extractor
+    // timed out on every chunk at 12s, so nothing was ever extracted.
+    assert_eq!(c.extraction.timeout_s, 60);
     assert_eq!(c.extraction.retry_backoff_s, 60);
     assert_eq!(c.extraction.max_concurrent, 1);
     assert_eq!(c.extraction.batch_size, 5);

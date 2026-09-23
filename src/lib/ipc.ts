@@ -506,6 +506,8 @@ export interface DbRecoverReport {
   backup: string | null;
   /** Set when the file is sound but the engine still fails to open. */
   open_error: string | null;
+  /** The file is corrupt; it is rebuilt when the backend next starts. */
+  restart_required: boolean;
 }
 
 /** Native folder picker (default context folder, etc.). Returns null if cancelled. */

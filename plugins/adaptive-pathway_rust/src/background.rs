@@ -73,8 +73,11 @@ pub async fn idle_sweep<S: StructuredChat>(
         }
         let watermark = engine.db.last_learned_rowid(session_id).await.unwrap_or(0);
         let max_rowid = crate::learn::host::session_max_rowid(host_pool, session_id).await.unwrap_or(watermark);
+        // Failures are logged, not propagated: one bad session must not stop
+        // the sweep. They used to be discarded outright (`let _ =`), which is
+        // how pathway went weeks committing nothing without a single log line.
         if max_rowid > watermark {
-            let _ = learn::extract_and_record(
+            if let Err(e) = learn::extract_and_record(
                 engine,
                 host_pool,
                 chat,
@@ -85,9 +88,14 @@ pub async fn idle_sweep<S: StructuredChat>(
                 },
                 LearnTrigger::IdleClose,
             )
-            .await;
+            .await
+            {
+                tracing::warn!("pathway idle learn failed for session {session_id}: {e}");
+            }
         }
-        let _ = crate::consolidate::consolidate_session(&engine.db, session_id).await;
+        if let Err(e) = crate::consolidate::consolidate_session(&engine.db, session_id).await {
+            tracing::warn!("pathway consolidate failed for session {session_id}: {e}");
+        }
         // The session is being closed out -- drop its trajectory-embedding
         // state (see `PathwayEngine::forget_trajectory`) so that map stays
         // bounded by concurrently-active sessions, not every session ever

@@ -117,6 +117,95 @@ async fn line_ending_only_checksum_drift_is_reconciled_but_edits_are_not() {
     let _ = std::fs::remove_file(format!("{}-shm", path.display()));
 }
 
+/// Keys present in `app_settings`, read through a *separate* pool on the same
+/// file — i.e. only what was actually committed, not what the engine's own
+/// connection can see inside an open transaction.
+async fn committed_setting_keys(path: &std::path::Path) -> Vec<String> {
+    let opts = sqlx::sqlite::SqliteConnectOptions::new().filename(path);
+    let other = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(opts)
+        .await
+        .unwrap();
+    let keys: Vec<String> =
+        sqlx::query_scalar("SELECT key FROM app_settings WHERE key LIKE 'txn_%' ORDER BY key")
+            .fetch_all(&other)
+            .await
+            .unwrap();
+    other.close().await;
+    keys
+}
+
+fn remove_db_files(path: &std::path::Path) {
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+    let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+}
+
+/// Regression: a transaction whose future is dropped between `BEGIN` and
+/// `COMMIT` (here by a timeout, in production by the recall timeout or a task
+/// abort) used to leave the single shared connection inside an open
+/// transaction forever, so every later write was visible to the engine but
+/// never committed. It must now be rolled back, and later writes must commit.
+#[tokio::test]
+async fn cancelled_transaction_is_rolled_back_and_later_writes_commit() {
+    let path = std::env::temp_dir().join(format!("memorabilia_txn_{}.db", uuid::Uuid::new_v4()));
+    let db = Db::open(path.to_string_lossy().as_ref()).await.unwrap();
+
+    let cancelled = tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        db.run_in_transaction(|| async {
+            sqlx::query("INSERT INTO app_settings (key, value) VALUES ('txn_cancelled', '1')")
+                .execute(db.pool())
+                .await?;
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            Ok(())
+        }),
+    )
+    .await;
+    assert!(cancelled.is_err(), "the stalled transaction should time out");
+
+    db.run_in_transaction(|| async {
+        sqlx::query("INSERT INTO app_settings (key, value) VALUES ('txn_committed', '1')")
+            .execute(db.pool())
+            .await?;
+        Ok(())
+    })
+    .await
+    .expect("a transaction after a cancelled one must succeed");
+
+    assert_eq!(committed_setting_keys(&path).await, vec!["txn_committed".to_string()]);
+    drop(db);
+    remove_db_files(&path);
+}
+
+/// A transaction left open on the connection by any other means is recovered
+/// by the next `run_in_transaction` instead of failing it (and staying open).
+#[tokio::test]
+async fn stale_open_transaction_is_recovered_by_next_transaction() {
+    let path = std::env::temp_dir().join(format!("memorabilia_stale_{}.db", uuid::Uuid::new_v4()));
+    let db = Db::open(path.to_string_lossy().as_ref()).await.unwrap();
+
+    sqlx::query("BEGIN").execute(db.pool()).await.unwrap();
+    sqlx::query("INSERT INTO app_settings (key, value) VALUES ('txn_stale', '1')")
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    db.run_in_transaction(|| async {
+        sqlx::query("INSERT INTO app_settings (key, value) VALUES ('txn_after', '1')")
+            .execute(db.pool())
+            .await?;
+        Ok(())
+    })
+    .await
+    .expect("must recover from the stale transaction");
+
+    assert_eq!(committed_setting_keys(&path).await, vec!["txn_after".to_string()]);
+    drop(db);
+    remove_db_files(&path);
+}
+
 #[tokio::test]
 async fn transaction_rolls_back_on_error() {
     let db = Db::open_in_memory().await.unwrap();

@@ -115,6 +115,10 @@ pub struct MemorabiliaHost {
     /// routes say *why* memory is unavailable instead of reporting every failed
     /// open as "disabled" (which hid the 0.11.2 migration-checksum failure).
     open_errors: Mutex<HashMap<String, String>>,
+    /// Apps whose DB file has been integrity-checked (and rebuilt if corrupt)
+    /// at first open in this process — see `db_recover::heal_before_open`. The
+    /// value is the rebuild report, held until `recover` reports it once.
+    healed: Mutex<HashMap<String, Option<crate::plugins::db_recover::RecoverReport>>>,
 }
 
 impl MemorabiliaHost {
@@ -149,6 +153,7 @@ impl MemorabiliaHost {
             resolved: tokio::sync::OnceCell::new(),
             instances: Mutex::new(HashMap::new()),
             open_errors: Mutex::new(HashMap::new()),
+            healed: Mutex::new(HashMap::new()),
         }
     }
 
@@ -272,6 +277,30 @@ impl MemorabiliaHost {
             }
         }
 
+        // First open of this app's engine in this process: nothing else holds
+        // the file yet, so this is the one safe moment to rebuild it if it is
+        // corrupt (see `db_recover::heal_before_open`). A rebuild recreates the
+        // `chunks_vec` index empty (vec tables aren't copyable rows), so
+        // salvaged chunks keep their text but need re-embedding to be found by
+        // vector search.
+        {
+            let mut healed = self.healed.lock().await;
+            if !healed.contains_key(app_id) {
+                let report = crate::plugins::db_recover::heal_before_open(
+                    "memorabilia",
+                    &db_path,
+                    |p| async move {
+                        memorabilia::store::Db::open(&p.to_string_lossy())
+                            .await
+                            .map(|db| db.pool().clone())
+                            .map_err(|e| e.to_string())
+                    },
+                )
+                .await;
+                healed.insert(app_id.to_string(), report);
+            }
+        }
+
         let engine = match Engine::open_at(
             &db_path.to_string_lossy(),
             mem_config,
@@ -328,86 +357,42 @@ impl MemorabiliaHost {
         }
     }
 
-    /// Reopen the instance after a check/repair and, if memorabilia is on but
-    /// the engine still won't start, record why in the report — so "the file is
-    /// intact" is never shown as "healthy" while the engine is actually down.
-    async fn reopen_into(
-        &self,
-        app_id: &str,
-        report: &mut crate::plugins::db_recover::RecoverReport,
-    ) {
-        if self.memorabilia_for(app_id).await.is_none() && self.is_enabled(app_id).await {
+    /// Settings → Memorabilia Health "Check & repair database". Never closes or
+    /// swaps a live engine's file (the in-process MCP server keeps its own
+    /// `Arc` to the engine, so a close/reopen here would leave two connections
+    /// writing the same file). Instead:
+    /// - makes sure the engine is open (which heals a corrupt file on the first
+    ///   open of this process) and reports any rebuild that did, once;
+    /// - integrity-checks the file on a separate connection, and if it's
+    ///   corrupt now, sets `restart_required` — the next process heals it;
+    /// - reports `open_error` if memorabilia is on but the engine won't start.
+    pub async fn recover(&self, app_id: &str) -> crate::plugins::db_recover::RecoverReport {
+        use crate::plugins::db_recover as rec;
+        let db_path = self.db_path(app_id);
+
+        let opened = self.memorabilia_for(app_id).await.is_some();
+        let mut report = self
+            .healed
+            .lock()
+            .await
+            .get_mut(app_id)
+            .and_then(Option::take)
+            .unwrap_or_default();
+
+        match rec::check_file(&db_path).await {
+            None | Some(true) => report.integrity_ok = true,
+            Some(false) => {
+                report.integrity_ok = false;
+                report.restart_required = true;
+            }
+        }
+        if !opened && self.is_enabled(app_id).await {
             report.open_error = Some(
                 self.open_error(app_id)
                     .await
                     .unwrap_or_else(|| "the memory engine could not be started".into()),
             );
         }
-    }
-
-    /// Check this app's factual-memory DB and, if corrupt, rebuild it in place
-    /// (salvaging every row that still reads), leaving a timestamped `.corrupt`
-    /// backup beside it. Reopens the instance either way. Surfaced in Settings
-    /// as "Check & repair database" (Memorabilia Health). Note: a rebuild
-    /// recreates the `chunks_vec` index empty (the engine's open path rebuilds
-    /// the vec table), so salvaged chunks keep their rows but need re-embedding.
-    pub async fn recover(&self, app_id: &str) -> crate::plugins::db_recover::RecoverReport {
-        use crate::plugins::db_recover as rec;
-        let db_path = self.db_path(app_id);
-        let mut report = rec::RecoverReport::default();
-
-        if !tokio::fs::try_exists(&db_path).await.unwrap_or(false) {
-            report.integrity_ok = true;
-            self.reopen_into(app_id, &mut report).await;
-            return report;
-        }
-
-        self.close(app_id).await;
-
-        if let Some(pool) = rec::open_existing(&db_path).await {
-            let ok = rec::integrity_ok(&pool).await;
-            if ok {
-                rec::checkpoint_truncate(&pool).await;
-            }
-            pool.close().await;
-            report.integrity_ok = ok;
-            if ok {
-                self.reopen_into(app_id, &mut report).await;
-                return report;
-            }
-        }
-
-        report.rebuilt = true;
-        report.backup = Some(
-            rec::backup_corrupt(&db_path)
-                .await
-                .to_string_lossy()
-                .into_owned(),
-        );
-        let rebuilt = rec::append(&db_path, ".rebuilt");
-        rec::clear_rebuilt(&rebuilt).await;
-
-        match memorabilia::store::Db::open(&rebuilt.to_string_lossy()).await {
-            Ok(db) => {
-                report.salvaged = rec::salvage_into(db.pool(), &db_path).await;
-                report.integrity_ok = rec::integrity_ok(db.pool()).await;
-                db.pool().close().await;
-            }
-            Err(e) => {
-                tracing::warn!("recover: fresh memorabilia DB create failed for {app_id}: {e}");
-                rec::clear_rebuilt(&rebuilt).await;
-                self.reopen_into(app_id, &mut report).await;
-                return report;
-            }
-        }
-
-        match rec::swap_in(&rebuilt, &db_path).await {
-            Ok(()) => {
-                tracing::info!(app_id, backup = ?report.backup, "rebuilt corrupt memorabilia DB")
-            }
-            Err(e) => tracing::warn!("recover: memorabilia swap failed for {db_path:?}: {e}"),
-        }
-        self.reopen_into(app_id, &mut report).await;
         report
     }
 
