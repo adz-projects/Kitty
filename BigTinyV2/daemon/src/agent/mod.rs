@@ -633,6 +633,18 @@ impl Agent {
         self.tasks.iter().any(|e| !e.value().1.is_finished())
     }
 
+    /// The sessions with a turn genuinely in progress -- interactive, detached
+    /// job or scheduled run alike, since all of them hold a `tasks` slot.
+    /// Same "finished but unreaped doesn't count" rule as
+    /// [`Self::has_active_turns`].
+    pub fn active_session_ids(&self) -> Vec<String> {
+        self.tasks
+            .iter()
+            .filter(|e| !e.value().1.is_finished())
+            .map(|e| e.key().clone())
+            .collect()
+    }
+
     pub async fn shutdown(&self) {
         // Stop every plugin's background sweep first, so nothing is touching
         // the DB before we cancel turns (which may still read beliefs).

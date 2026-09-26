@@ -110,6 +110,7 @@ async fn test_state_inner(
         key_cache: Arc::new(bigtiny2::server::middleware::KeyCache::new()),
         replay: Arc::new(bigtiny2::server::replay::ReplayBuffers::new()),
         instance_id: "test-instance".to_string(),
+        shutdown: Arc::new(tokio::sync::Notify::new()),
     })
 }
 

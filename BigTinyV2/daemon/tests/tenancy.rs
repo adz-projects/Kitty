@@ -98,6 +98,7 @@ async fn test_state() -> Arc<AppState> {
         key_cache: Arc::new(bigtiny2::server::middleware::KeyCache::new()),
         replay: Arc::new(bigtiny2::server::replay::ReplayBuffers::new()),
         instance_id: "test-instance".to_string(),
+        shutdown: Arc::new(tokio::sync::Notify::new()),
     })
 }
 
@@ -2099,4 +2100,68 @@ async fn reclaiming_an_unknown_app_is_a_404() {
     let state = test_state().await;
     let (status, _) = reclaim(state, "never-registered").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// ---------------------------------------------------------------------------
+// Requested restarts
+// ---------------------------------------------------------------------------
+
+async fn request_restart(state: Arc<AppState>, as_app: &str, force: bool) -> Value {
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/api/admin/restart")
+        .header("content-type", "application/json")
+        .body(Body::from(json!({"force": force}).to_string()))
+        .unwrap();
+    let resp = router_as(state, as_app).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    body_json(resp).await
+}
+
+async fn shutdown_fires(state: &AppState) -> bool {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        state.shutdown.notified(),
+    )
+    .await
+    .is_ok()
+}
+
+/// Nobody else attached and nothing running: the daemon goes down.
+#[tokio::test]
+async fn a_restart_with_no_one_else_attached_is_accepted() {
+    let state = test_state().await;
+    let body = request_restart(state.clone(), APP_A, false).await;
+    assert_eq!(body["accepted"], true, "{body}");
+    assert!(shutdown_fires(&state).await, "an accepted restart must shut down");
+}
+
+/// Another app that is open must not have the daemon pulled out from under
+/// it without the caller saying so -- and the caller is told who it is.
+#[tokio::test]
+async fn another_attached_app_blocks_a_restart_unless_forced() {
+    let state = test_state().await;
+    apps::touch_last_seen(&state.db, APP_B).await.unwrap();
+
+    let body = request_restart(state.clone(), APP_A, false).await;
+    assert_eq!(body["accepted"], false, "{body}");
+    let blockers = body["blocked_by"].as_array().unwrap();
+    assert_eq!(blockers.len(), 1, "{body}");
+    assert_eq!(blockers[0]["app_id"], APP_B);
+    assert_eq!(blockers[0]["display_name"], "App B");
+    assert_eq!(blockers[0]["reason"], "attached");
+    assert!(!shutdown_fires(&state).await, "a refused restart must not shut down");
+
+    let forced = request_restart(state.clone(), APP_A, true).await;
+    assert_eq!(forced["accepted"], true, "{forced}");
+    assert!(shutdown_fires(&state).await);
+}
+
+/// The caller's own recent activity is not a reason to refuse it.
+#[tokio::test]
+async fn the_callers_own_attachment_does_not_block_it() {
+    let state = test_state().await;
+    apps::touch_last_seen(&state.db, APP_A).await.unwrap();
+    let body = request_restart(state, APP_A, false).await;
+    assert_eq!(body["accepted"], true, "{body}");
 }

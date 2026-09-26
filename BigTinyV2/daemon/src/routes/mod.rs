@@ -1,3 +1,4 @@
+pub mod admin;
 pub mod apps;
 pub mod chat;
 pub mod embeddings;
@@ -64,6 +65,11 @@ pub struct AppState {
     /// This launch's identity, echoed on `/api/health` so a client can prove
     /// the process answering on a port is the one its handshake describes.
     pub instance_id: String,
+    /// Signalled by `POST /api/admin/restart` once a restart is accepted.
+    /// `run()` treats it exactly like the idle timer firing: the same graceful
+    /// teardown, handshake withdrawn, so the requesting app can start a fresh
+    /// daemon with its new settings.
+    pub shutdown: Arc<tokio::sync::Notify>,
 }
 
 /// Builds the full route table. Paths/methods mirror
@@ -88,6 +94,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         // `/api/mcp/servers`: a plugin hooks the agent loop and carries
         // per-app instance state, an MCP server provides tools. See
         // `crate::plugins`.
+        .route("/api/admin/restart", post(admin::restart))
         .route("/api/apps/me/plugins", get(plugins::list))
         .route(
             "/api/apps/me/plugins/{plugin}",

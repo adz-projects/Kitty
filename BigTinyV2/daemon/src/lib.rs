@@ -310,6 +310,10 @@ pub async fn run(config: BigTinyConfig, options: RunOptions) -> Result<(), Daemo
     // authentication.
     let instance_id = discovery::generate_token();
 
+    // Fired by `POST /api/admin/restart` once a restart is judged safe; joins
+    // the other shutdown triggers in the graceful-shutdown select below.
+    let restart_requested = Arc::new(tokio::sync::Notify::new());
+
     let state = Arc::new(routes::AppState {
         db: pool,
         agent: agent.clone(),
@@ -323,6 +327,7 @@ pub async fn run(config: BigTinyConfig, options: RunOptions) -> Result<(), Daemo
         replay: Arc::new(server::replay::ReplayBuffers::new()),
         key_cache: key_cache.clone(),
         instance_id: instance_id.clone(),
+        shutdown: restart_requested.clone(),
     });
 
     // Per-app identity replaces V1's single shared secret. `registration_token`
@@ -443,16 +448,23 @@ pub async fn run(config: BigTinyConfig, options: RunOptions) -> Result<(), Daemo
     let (signal_tx, signal_rx) = tokio::sync::oneshot::channel::<()>();
     let serve = axum::serve(listener, app).with_graceful_shutdown(async move {
         // Whichever fires first: ctrl-c/SIGTERM, an embedding host's explicit
-        // stop, or the idle timer. All three converge on the same graceful
-        // teardown below.
+        // stop, the idle timer, or an accepted restart request. All converge
+        // on the same graceful teardown below.
+        let restart = restart_requested.notified();
         match idle_shutdown {
             Some(idle) => {
                 tokio::select! {
                     _ = shutdown_signal(options.shutdown) => {}
                     _ = idle => {}
+                    _ = restart => tracing::info!("shutting down for a requested restart"),
                 }
             }
-            None => shutdown_signal(options.shutdown).await,
+            None => {
+                tokio::select! {
+                    _ = shutdown_signal(options.shutdown) => {}
+                    _ = restart => tracing::info!("shutting down for a requested restart"),
+                }
+            }
         }
         let _ = signal_tx.send(());
     });
