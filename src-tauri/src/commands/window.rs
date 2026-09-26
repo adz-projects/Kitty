@@ -11,12 +11,6 @@ use crate::state::AppState;
 use crate::state::{StackStatus, StartupPhase};
 use crate::windows;
 
-/// Show/hide the overlay from the frontend.
-#[tauri::command]
-pub fn toggle_overlay(app: AppHandle) -> Result<(), String> {
-    windows::toggle_overlay(&app).map_err(|e| e.to_string())
-}
-
 /// Hide the overlay (Escape handler in the overlay UI calls this).
 #[tauri::command]
 pub fn hide_overlay(app: AppHandle) -> Result<(), String> {
@@ -47,12 +41,6 @@ pub fn get_route_target(
     state: tauri::State<'_, AppState>,
 ) -> Result<Option<serde_json::Value>, String> {
     Ok(state.route_targets.lock().unwrap().remove(window.label()))
-}
-
-/// Open the full window. Async so window creation dispatches to the main thread.
-#[tauri::command]
-pub async fn open_main(app: AppHandle) -> Result<(), String> {
-    windows::open_main(&app).map_err(|e| e.to_string())
 }
 
 /// Allocate a fresh label and open a brand-new chat window (Feature 5) —
@@ -169,57 +157,19 @@ pub async fn restart_backend(app: AppHandle) -> Result<(), String> {
         })
         .await
         .map_err(|e| format!("backend kill task panicked: {e}"))?;
-        let (
-            command,
-            args,
-            dir,
-            summarizer,
-            token_management,
-            memory,
-            local,
-            specialists,
-            pathway_enabled,
-            memorabilia_enabled,
-            pathway_embedding_model,
-        ) = {
+        let snap = {
             let state = app.state::<AppState>();
             let cfg = state.config.lock().unwrap();
-            (
-                cfg.bigtiny_command.clone(),
-                cfg.bigtiny_args.clone(),
-                cfg.bigtiny_dir.clone(),
-                cfg.summarizer.clone(),
-                cfg.token_management.clone(),
-                cfg.memory.clone(),
-                cfg.local.clone(),
-                cfg.specialists.clone(),
-                cfg.adaptive_pathway_enabled,
-                cfg.memorabilia_enabled,
-                cfg.adaptive_pathway_embedding_model.clone(),
-            )
+            lifecycle::bigtiny_env::SpawnSnapshot::from_config(&cfg)
         };
         // Same bundled-LiteRT resolution as `lifecycle::start_stack` — see
         // `bigtiny_env::locate_litert_resources`'s doc comment.
         let (tokenizer_path, litert_lib_dir) =
             lifecycle::bigtiny_env::locate_litert_resources(&app);
         // Re-locate rather than re-spawn: if a daemon is already up (ours or
-        // another app's), this attaches to it. `args`/`dir` do not apply for
-        // the same reason as in `lifecycle::start_stack`.
-        let _ = &dir;
-        let handle = lifecycle::bigtiny_v2::locate(
-            &command,
-            &args,
-            &summarizer,
-            &token_management,
-            &memory,
-            &local,
-            &specialists,
-            pathway_enabled,
-            memorabilia_enabled,
-            &pathway_embedding_model,
-            &tokenizer_path,
-            Some(litert_lib_dir.as_str()),
-        )
+        // another app's), this attaches to it.
+        let handle =
+            lifecycle::bigtiny_v2::locate(&snap, &tokenizer_path, Some(litert_lib_dir.as_str()))
         .await?;
         let (healthy, port) = (handle.healthy, handle.port);
         {

@@ -45,18 +45,8 @@ use super::bigtiny_app_key::ensure_app_key;
 /// Mirrors `bigtiny_proc::spawn`'s signature so the call site changes in one
 /// place, but note what is absent: no port to pick, no secret to mint, no
 /// orphan to kill. The port comes from whichever daemon we found.
-#[allow(clippy::too_many_arguments)]
 pub async fn locate(
-    command: &str,
-    args: &[String],
-    summarizer: &crate::config::SummarizerSettings,
-    token_management: &crate::config::TokenManagementSettings,
-    memory: &crate::config::MemorySettings,
-    local: &crate::config::LocalModelSettings,
-    specialists: &crate::config::SpecialistSettings,
-    pathway_enabled: bool,
-    memorabilia_enabled: bool,
-    pathway_embedding_model: &str,
+    snap: &crate::lifecycle::bigtiny_env::SpawnSnapshot,
     tokenizer_path: &str,
     litert_lib_dir: Option<&str>,
 ) -> Result<DaemonHandle, String> {
@@ -80,19 +70,8 @@ pub async fn locate(
     // Android in-process host, so the secret argument stays in its signature;
     // V2 authenticates per app instead, and passing an empty secret leaves
     // `BIGTINY_SECRET` unset rather than pinning a daemon-wide one.
-    let mut env: Vec<(String, String)> = crate::lifecycle::bigtiny_env::daemon_env(
-        "",
-        &encryption_key,
-        summarizer,
-        token_management,
-        memory,
-        local,
-        specialists,
-        pathway_enabled,
-        memorabilia_enabled,
-        pathway_embedding_model,
-        tokenizer_path,
-    );
+    let mut env: Vec<(String, String)> =
+        crate::lifecycle::bigtiny_env::daemon_env("", &encryption_key, snap, tokenizer_path);
 
     if let Some(lib_dir) = litert_lib_dir.filter(|d| !d.is_empty()) {
         let existing = std::env::var("PATH").unwrap_or_default();
@@ -101,8 +80,8 @@ pub async fn locate(
     }
 
     let located = attach_or_spawn(&DiscoveryConfig {
-        daemon_binary: PathBuf::from(command),
-        daemon_args: args.to_vec(),
+        daemon_binary: PathBuf::from(&snap.command),
+        daemon_args: snap.args.clone(),
         min_api_version: bigtiny2_client::MIN_API_VERSION,
         env,
     })

@@ -38,19 +38,10 @@ use crate::state::{DaemonHandle, ManagedProcess};
 /// `sync_mcp_once_healthy`, the health loop) is identical on both platforms and
 /// none of it needs to know which host it got.
 ///
-/// Takes the same settings that function does, minus the ones that only mean
-/// something for a child process, so `start_stack` reads config once and both
-/// hosts are configured from identical values.
-#[allow(clippy::too_many_arguments)]
+/// Takes the same `SpawnSnapshot` that function does (its command/args are
+/// simply unused here), so both hosts are configured from identical values.
 pub async fn start(
-    summarizer: &crate::config::SummarizerSettings,
-    token_management: &crate::config::TokenManagementSettings,
-    memory: &crate::config::MemorySettings,
-    local: &crate::config::LocalModelSettings,
-    specialists: &crate::config::SpecialistSettings,
-    pathway_enabled: bool,
-    memorabilia_enabled: bool,
-    pathway_embedding_model: &str,
+    snap: &crate::lifecycle::bigtiny_env::SpawnSnapshot,
     tokenizer_path: &str,
 ) -> Result<DaemonHandle, String> {
     // Under V1 this was a daemon-wide shared secret. Under V2 it is the
@@ -72,19 +63,9 @@ pub async fn start(
     // The empty encryption key is dropped by `daemon_env` itself: V2 treats a
     // present-but-empty `BIGTINY_ENCRYPTION_KEY` as a malformed key and refuses
     // to start.
-    for (key, value) in crate::lifecycle::bigtiny_env::daemon_env(
-        &registration_token,
-        "",
-        summarizer,
-        token_management,
-        memory,
-        local,
-        specialists,
-        pathway_enabled,
-        memorabilia_enabled,
-        pathway_embedding_model,
-        tokenizer_path,
-    ) {
+    for (key, value) in
+        crate::lifecycle::bigtiny_env::daemon_env(&registration_token, "", snap, tokenizer_path)
+    {
         std::env::set_var(key, value);
     }
 

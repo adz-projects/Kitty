@@ -17,15 +17,10 @@ const LOG_POLL_MS = 5000;
 // the log poll's simplicity.
 const MEMORY_POLL_MS = 5000;
 
-/** Advanced: the infrequently-touched General settings relocated here in the
-    settings IA overhaul (context strategy, strict remote mode) — trimmed off
-    General to keep that page to the essentials. Per-provider sampling params
-    (temperature / context length) live in Settings → Providers; local models
-    live in Settings → Local Models.
-
-    The Ollama env-var helper (HKCU\Environment) that used to live here went
-    with managed Ollama: those variables configured a process Kitty no longer
-    runs. */
+/** Advanced: the infrequently-touched settings, kept off General so that page
+    stays to the essentials. Per-provider sampling params (temperature /
+    context length) live in Settings → Providers; the helper models live in
+    Settings → Helper Models. */
 export function Advanced() {
   const { draft, update, save, saved, error: saveError } = useConfigDraft();
   const [tokenMgmtOpen, setTokenMgmtOpen] = useState(false);
@@ -117,20 +112,11 @@ export function Advanced() {
 
       {draft && (
         <>
-          <label className="check">
-            <input
-              type="checkbox"
-              checked={draft.strict_remote_mode}
-              onChange={(e) => update({ strict_remote_mode: e.target.checked })}
-            />
-            <span>Strict mode: disable file/folder drop while a remote provider is active</span>
-          </label>
-
           <div className="field">
             <span>Background context summarization</span>
             <p className="muted" style={{ margin: 0 }}>
-              Folds older conversation history into a running summary so long agentic sessions
-              don&apos;t run out of context. Uses a small local model.
+              Folds older conversation history into a running summary so long sessions don&apos;t
+              run out of context.
             </p>
             <label className="check">
               <input
@@ -144,9 +130,8 @@ export function Advanced() {
             </label>
             {draft.summarizer.enabled && (
               <p className="muted">
-                Which model does the summarising is set in Settings &rarr; Local Models. The
-                Ollama-only retention control that used to live here went with the Ollama client it
-                configured &mdash; residency is the engine&apos;s own business now.
+                Uses the local summarizer from Settings &rarr; Helper Models when it&apos;s
+                downloaded, and the chat&apos;s own provider otherwise.
               </p>
             )}
 

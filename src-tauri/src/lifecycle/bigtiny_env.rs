@@ -14,6 +14,46 @@
 //! definition serving both; two copies of a ~40-variable list would drift on
 //! the first change and fail as a silently-unapplied setting.
 
+/// Every saved setting the daemon only reads when it starts.
+///
+/// Read from config in one place so the two things that need it can't drift:
+/// the spawn itself (`bigtiny_v2::locate` / `bigtiny_embedded::start`, via
+/// [`daemon_env`]) and `engine_restart`, which compares snapshots to decide
+/// whether a saved change still needs a daemon restart to take effect. A field
+/// added here is automatically part of that comparison.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpawnSnapshot {
+    /// Launch command and arguments. Only meaningful on desktop, where a
+    /// daemon may have to be spawned.
+    pub command: String,
+    pub args: Vec<String>,
+    pub summarizer: crate::config::SummarizerSettings,
+    pub token_management: crate::config::TokenManagementSettings,
+    pub memory: crate::config::MemorySettings,
+    pub specialists: crate::config::SpecialistSettings,
+    pub pathway_enabled: bool,
+    /// Always `false` on Android: memorabilia is desktop-only, and forcing it
+    /// here keeps the engine from ever running there regardless of config.
+    pub memorabilia_enabled: bool,
+    pub pathway_embedding_model: String,
+}
+
+impl SpawnSnapshot {
+    pub fn from_config(cfg: &crate::config::Config) -> Self {
+        Self {
+            command: cfg.bigtiny_command.clone(),
+            args: cfg.bigtiny_args.clone(),
+            summarizer: cfg.summarizer.clone(),
+            token_management: cfg.token_management.clone(),
+            memory: cfg.memory.clone(),
+            specialists: cfg.specialists.clone(),
+            pathway_enabled: cfg.adaptive_pathway_enabled,
+            memorabilia_enabled: cfg.memorabilia_enabled && !cfg!(target_os = "android"),
+            pathway_embedding_model: cfg.adaptive_pathway_embedding_model.clone(),
+        }
+    }
+}
+
 /// Locate the bundled LiteRT resources (Gemma `tokenizer.json` + the runtime
 /// DLLs) and return `(tokenizer_path, litert_lib_dir)`.
 ///
@@ -67,27 +107,28 @@ pub fn locate_litert_resources(app: &tauri::AppHandle) -> (String, String) {
 /// regenerated every launch, while the encryption key is stable across
 /// restarts (rotating it would make previously-encrypted rows in BigTiny's
 /// own DB undecryptable).
-#[allow(clippy::too_many_arguments)]
 pub fn daemon_env(
     secret: &str,
     encryption_key: &str,
-    summarizer: &crate::config::SummarizerSettings,
-    token_management: &crate::config::TokenManagementSettings,
-    memory: &crate::config::MemorySettings,
-    local: &crate::config::LocalModelSettings,
-    specialists: &crate::config::SpecialistSettings,
-    pathway_enabled: bool,
-    // The declarative factual-memory plugin's on/off flag. No model parameter:
-    // memorabilia reuses the same shared EmbeddingGemma model the LiteRT block
-    // below resolves for pathway, so there's nothing model-shaped to pass.
-    memorabilia_enabled: bool,
-    pathway_embedding_model: &str,
+    snap: &SpawnSnapshot,
     // Absolute path to the bundled Gemma `tokenizer.json`, resolved by the
     // caller from `resource_dir()` (it ships as an app resource, not in the
     // models dir). Empty falls back to `models::resolve("tokenizer.json")` so a
     // dev run that dropped the file into the models dir still works.
     tokenizer_path: &str,
 ) -> Vec<(String, String)> {
+    let SpawnSnapshot {
+        summarizer,
+        token_management,
+        memory,
+        specialists,
+        pathway_enabled,
+        memorabilia_enabled,
+        pathway_embedding_model,
+        ..
+    } = snap;
+    // Memorabilia reuses the same shared EmbeddingGemma model the LiteRT block
+    // below resolves for pathway, so there's nothing model-shaped to pass for it.
     let b = |v: bool| if v { "true" } else { "false" }.to_string();
     let mut env: Vec<(String, String)> = vec![
         ("BIGTINY_SECRET".into(), secret.to_string()),
@@ -128,12 +169,12 @@ pub fn daemon_env(
         // `PathwayConfig::enabled` defaults to `false` inside BigTiny and
         // (unlike every other section) has no other override path, so without
         // this the behavioral-memory engine can never turn on at all.
-        ("BIGTINY_PATHWAY__ENABLED".into(), b(pathway_enabled)),
+        ("BIGTINY_PATHWAY__ENABLED".into(), b(*pathway_enabled)),
         // Factual-memory plugin. Like pathway, off unless the host says so;
         // read by `bigtiny2::env_contract::apply_env_overrides`.
         (
             "BIGTINY_MEMORABILIA__ENABLED".into(),
-            b(memorabilia_enabled),
+            b(*memorabilia_enabled),
         ),
     ];
 
@@ -176,8 +217,6 @@ pub fn daemon_env(
     };
     // The engine needs both the model and its tokenizer to embed at all.
     let litert_enabled = !embed_tflite.is_empty() && !tokenizer.is_empty();
-    let _ = local; // llama.cpp engine knobs are retired; kept in the signature
-                   // for now so callers are unchanged during the transition.
     if !litert_enabled {
         tracing::info!(
             embedding_model = %pathway_embedding_model,
@@ -275,21 +314,22 @@ mod tests {
     /// model that cannot exist is what makes these deterministic.
     const NO_SUCH_MODEL: &str = "test-model-that-is-never-installed";
 
-    fn settings() -> (
-        crate::config::SummarizerSettings,
-        crate::config::TokenManagementSettings,
-        crate::config::MemorySettings,
-        crate::config::LocalModelSettings,
-    ) {
-        (
-            crate::config::SummarizerSettings {
+    /// A snapshot whose models can never resolve (see [`NO_SUCH_MODEL`]).
+    fn snap() -> SpawnSnapshot {
+        SpawnSnapshot {
+            command: String::new(),
+            args: Vec::new(),
+            summarizer: crate::config::SummarizerSettings {
                 model: NO_SUCH_MODEL.to_string(),
                 ..Default::default()
             },
-            crate::config::TokenManagementSettings::default(),
-            crate::config::MemorySettings::default(),
-            crate::config::LocalModelSettings::default(),
-        )
+            token_management: crate::config::TokenManagementSettings::default(),
+            memory: crate::config::MemorySettings::default(),
+            specialists: SpecialistSettings::default(),
+            pathway_enabled: false,
+            memorabilia_enabled: false,
+            pathway_embedding_model: String::new(),
+        }
     }
 
     fn env_of(pairs: &[(String, String)], key: &str) -> Option<String> {
@@ -301,9 +341,8 @@ mod tests {
     /// keys.
     #[test]
     fn the_credentials_are_always_present() {
-        let (s, t, m, l) = settings();
-        let sp = SpecialistSettings::default();
-        let e = daemon_env("sec", "enc", &s, &t, &m, &l, &sp, false, false, "", "");
+        let sn = snap();
+        let e = daemon_env("sec", "enc", &sn, "");
         assert_eq!(env_of(&e, "BIGTINY_SECRET").as_deref(), Some("sec"));
         assert_eq!(env_of(&e, "BIGTINY_ENCRYPTION_KEY").as_deref(), Some("enc"));
     }
@@ -313,10 +352,9 @@ mod tests {
     /// agree, but relying on that coincidence is how `1`/`0` sneaks in later.
     #[test]
     fn booleans_use_the_word_form_the_daemon_parses() {
-        let (s, t, m, l) = settings();
-        let sp = SpecialistSettings::default();
-        let on = daemon_env("", "", &s, &t, &m, &l, &sp, true, false, "", "");
-        let off = daemon_env("", "", &s, &t, &m, &l, &sp, false, false, "", "");
+        let sn = snap();
+        let on = daemon_env("", "", &SpawnSnapshot { pathway_enabled: true, ..sn.clone() }, "");
+        let off = daemon_env("", "", &sn, "");
         assert_eq!(
             env_of(&on, "BIGTINY_PATHWAY__ENABLED").as_deref(),
             Some("true")
@@ -331,10 +369,9 @@ mod tests {
     /// independent of pathway's — either can be on with the other off.
     #[test]
     fn memorabilia_enabled_is_sent_as_its_own_flag() {
-        let (s, t, m, l) = settings();
-        let sp = SpecialistSettings::default();
-        let on = daemon_env("", "", &s, &t, &m, &l, &sp, false, true, "", "");
-        let off = daemon_env("", "", &s, &t, &m, &l, &sp, false, false, "", "");
+        let sn = snap();
+        let on = daemon_env("", "", &SpawnSnapshot { memorabilia_enabled: true, ..sn.clone() }, "");
+        let off = daemon_env("", "", &sn, "");
         assert_eq!(
             env_of(&on, "BIGTINY_MEMORABILIA__ENABLED").as_deref(),
             Some("true")
@@ -356,9 +393,8 @@ mod tests {
     /// behaviour.
     #[test]
     fn an_unresolvable_model_leaves_the_slot_empty_and_the_engine_off() {
-        let (s, t, m, l) = settings();
-        let sp = SpecialistSettings::default();
-        let e = daemon_env("", "", &s, &t, &m, &l, &sp, false, false, NO_SUCH_MODEL, "");
+        let sn = snap();
+        let e = daemon_env("", "", &SpawnSnapshot { pathway_embedding_model: NO_SUCH_MODEL.to_string(), ..sn.clone() }, "");
         assert_eq!(
             env_of(&e, "BIGTINY_LITERT__EMBED_MODEL_PATH").as_deref(),
             Some("")
@@ -374,9 +410,8 @@ mod tests {
     /// to its own hardcoded defaults. The `LIB_PATH` bare name is always set.
     #[test]
     fn the_litert_paths_are_sent_even_with_no_model() {
-        let (s, t, m, l) = settings();
-        let sp = SpecialistSettings::default();
-        let e = daemon_env("", "", &s, &t, &m, &l, &sp, false, false, NO_SUCH_MODEL, "");
+        let sn = snap();
+        let e = daemon_env("", "", &SpawnSnapshot { pathway_embedding_model: NO_SUCH_MODEL.to_string(), ..sn.clone() }, "");
         assert_eq!(
             env_of(&e, "BIGTINY_LITERT__ENABLED").as_deref(),
             Some("false")
@@ -396,14 +431,13 @@ mod tests {
     /// by accident rather than by design.
     #[test]
     fn an_unset_bm25_threshold_is_omitted_rather_than_blank() {
-        let (s, t, mut m, l) = settings();
-        m.bm25_threshold = None;
-        let sp = SpecialistSettings::default();
-        let e = daemon_env("", "", &s, &t, &m, &l, &sp, false, false, "", "");
+        let mut sn = snap();
+        sn.memory.bm25_threshold = None;
+        let e = daemon_env("", "", &sn, "");
         assert!(env_of(&e, "BIGTINY_MEMORY__BM25_THRESHOLD").is_none());
 
-        m.bm25_threshold = Some(1.5);
-        let e = daemon_env("", "", &s, &t, &m, &l, &sp, false, false, "", "");
+        sn.memory.bm25_threshold = Some(1.5);
+        let e = daemon_env("", "", &sn, "");
         assert_eq!(
             env_of(&e, "BIGTINY_MEMORY__BM25_THRESHOLD").as_deref(),
             Some("1.5")
@@ -416,9 +450,8 @@ mod tests {
     /// overriding it there would orphan it.
     #[test]
     fn the_plugin_home_is_sent_only_where_it_is_needed() {
-        let (s, t, m, l) = settings();
-        let sp = SpecialistSettings::default();
-        let e = daemon_env("", "", &s, &t, &m, &l, &sp, false, false, "", "");
+        let sn = snap();
+        let e = daemon_env("", "", &sn, "");
         let sent = env_of(&e, "KITTY_PLUGIN_HOME");
         if cfg!(target_os = "android") {
             let dir = sent.expect("Android must be told where the plugins may write");
@@ -441,9 +474,8 @@ mod tests {
     /// on ordering nobody is looking at.
     #[test]
     fn no_key_is_emitted_twice() {
-        let (s, t, m, l) = settings();
-        let sp = SpecialistSettings::default();
-        let e = daemon_env("", "", &s, &t, &m, &l, &sp, true, false, "", "");
+        let sn = snap();
+        let e = daemon_env("", "", &SpawnSnapshot { pathway_enabled: true, ..sn.clone() }, "");
         let mut keys: Vec<&str> = e.iter().map(|(k, _)| k.as_str()).collect();
         let before = keys.len();
         keys.sort_unstable();

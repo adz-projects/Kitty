@@ -32,7 +32,6 @@ import type {
   SpecialistRun,
   TranscriptRow,
   SubagentStatusEvent,
-  LocalEngineStatus,
   LocalModel,
   ModelPickerEntry,
   OpenRouterCredits,
@@ -61,11 +60,9 @@ export const ipc = {
   getConfig: () => invoke<Config>('get_config'),
   setConfig: (config: Config) => invoke<void>('set_config', { config }),
   getConfigRecoveryNotice: () => invoke<string | null>('get_config_recovery_notice'),
-  toggleOverlay: () => invoke<void>('toggle_overlay'),
   hideOverlay: () => invoke<void>('hide_overlay'),
   openSettings: (section?: string, highlight?: string) =>
     invoke<void>('open_settings', { section: section ?? null, highlight: highlight ?? null }),
-  openMain: () => invoke<void>('open_main'),
   /** Feature 5 — always creates a brand-new chat window (never reuses one),
       optionally handing it a session snapshot to adopt on mount (the
       overlay's Expand). Distinct from `setActiveSession`/`getActiveSession`
@@ -250,12 +247,6 @@ export const ipc = {
       a delegate from Settings. See `bigtiny::sessions::transcript`. */
   fetchSessionTranscript: (sessionId: string) =>
     invoke<TranscriptRow[]>('fetch_session_transcript', { sessionId }),
-  /** Run one from the UI, under an existing session. Goes through the same
-      orchestrator as the model's own `call_specialist`, so the concurrency cap
-      and depth limit apply identically. Resolves only when the delegate is
-      done. */
-  runSpecialist: (name: string, request: string, sessionId: string, refs?: string[]) =>
-    invoke<unknown>('run_specialist', { name, request, sessionId, refs }),
   // Error/warning log (Settings → Advanced) — captured server-side from
   // `tracing::warn!`/`error!` calls via `log_capture`'s in-memory ring buffer.
   listLogEntries: () => invoke<LogEntry[]>('list_log_entries'),
@@ -284,13 +275,6 @@ export const ipc = {
       mid-session, without a reload. `null` when the provider has no control. */
   getThinkingEffort: (sessionId: string) =>
     invoke<ThinkingEffort | null>('get_thinking_effort', { sessionId }),
-  /** Best-effort: hot-rebind an already-open session onto the currently
-      active provider's model after a provider switch (fixes a stale model id
-      otherwise sent to the newly-active provider). Never throws — the
-      backend swallows its own failures. */
-  rebindSessionProvider: (sessionId: string) =>
-    invoke<void>('rebind_session_provider', { sessionId }),
-  readTextFile: (path: string) => invoke<string>('read_text_file', { path, maxBytes: null }),
   readFileAny: (path: string) => invoke<FileAttachment>('read_file_any', { path, maxBytes: null }),
   /** Copies a file into a chat session's own working directory, so the
       model's own file tools can open it directly — used for chat-only mode
@@ -341,7 +325,6 @@ export const ipc = {
   listLocalModels: () => invoke<LocalModel[]>('list_local_models'),
   /** `null` when the daemon isn't up — Settings can be open before the stack
       is ready, and that's a state to render, not an error to raise. */
-  getLocalEngineStatus: () => invoke<LocalEngineStatus | null>('get_local_engine_status'),
   getModelsDiskFree: () => invoke<number | null>('get_models_disk_free'),
   getEngineRestartState: () => invoke<EngineRestartState>('get_engine_restart_state'),
   deleteLocalModel: (id: string) => invoke<void>('delete_local_model', { id }),
@@ -633,12 +616,6 @@ export const onSessionCreated = (cb: () => void) => listen('session://created', 
 export const onSessionDeleted = (cb: (sessionId: string) => void) =>
   listen<{ sessionId: string }>('session://deleted', (e) => cb(e.payload.sessionId));
 
-/** A session was handed off to the full window (Expand / auto-promote). Lets an
-    *already-open* main window re-adopt it — its mount-time getActiveSession runs
-    only once. Payload is the same shape getActiveSession returns. */
-export const onActiveSession = (cb: (info: SessionInfo & Record<string, unknown>) => void) =>
-  listen<SessionInfo & Record<string, unknown>>('session://active', (e) => cb(e.payload));
-
 /** A completion/failure notification was clicked for a session no longer bound
     to any specific window (the window that had it switched to a different chat
     in the meantime) — targets exactly one already-open window via `emit_to`
@@ -679,9 +656,6 @@ export const onProviderActivated = (cb: (p: ProviderActivatedPayload) => void) =
   listen<ProviderActivatedPayload>('provider://activated', (e) =>
     cb(e.payload ?? { session_id: null, provider_id: null, model: null })
   );
-
-/** The label of the window this webview is running in (`overlay` / `main` / …). */
-export const windowLabel = (): string => getCurrentWebview().label;
 
 /** Called once, right after mount, by every window's `main.tsx`. Lets the
     Rust-side dev-only load watchdog (`windows::spawn_load_watchdog`) tell a

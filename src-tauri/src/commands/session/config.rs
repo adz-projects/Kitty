@@ -109,10 +109,4 @@ pub async fn set_session_persona_override(
     crate::bigtiny::sessions::update_persona_override(&app, &session_id, &persona).await
 }
 
-/// Hot-rebind an *already-open* session onto the currently-active provider's
-/// model — best-effort, swallows its own failures.
-#[tauri::command]
-pub async fn rebind_session_provider(app: AppHandle, session_id: String) {
-    crate::bigtiny::providers::rebind_session(&app, &session_id).await;
-}
 

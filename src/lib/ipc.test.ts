@@ -51,11 +51,6 @@ describe('ipc invoke wrappers', () => {
     expect(invokeMock).toHaveBeenCalledWith('set_config', { config });
   });
 
-  it('toggleOverlay calls toggle_overlay with no args', () => {
-    void ipc.toggleOverlay();
-    expect(invokeMock).toHaveBeenCalledWith('toggle_overlay');
-  });
-
   it('openSettings normalizes omitted section/highlight to null', () => {
     void ipc.openSettings();
     expect(invokeMock).toHaveBeenCalledWith('open_settings', {
@@ -142,11 +137,6 @@ describe('ipc event subscription wrappers', () => {
   it('listLocalModels calls list_local_models with no args', () => {
     void ipc.listLocalModels();
     expect(invokeMock).toHaveBeenCalledWith('list_local_models');
-  });
-
-  it('getLocalEngineStatus calls get_local_engine_status with no args', () => {
-    void ipc.getLocalEngineStatus();
-    expect(invokeMock).toHaveBeenCalledWith('get_local_engine_status');
   });
 
   it('getModelsDiskFree calls get_models_disk_free', () => {

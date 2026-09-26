@@ -31,30 +31,6 @@ pub async fn delete_specialist(app: tauri::AppHandle, id: String) -> Result<(), 
     specialists::delete(&client, &id).await
 }
 
-/// Run a specialist from the UI, under an existing session.
-///
-/// The same orchestrator the model's own `call_specialist` goes through, so the
-/// concurrency cap, depth limit and cancel propagation apply identically — a
-/// user-triggered run is not a second, less-guarded path.
-#[tauri::command]
-pub async fn run_specialist(
-    app: tauri::AppHandle,
-    name: String,
-    request: String,
-    refs: Option<Vec<String>>,
-    session_id: String,
-) -> Result<serde_json::Value, String> {
-    let client = ensure_client(&app)?;
-    specialists::run(
-        &client,
-        &name,
-        &request,
-        &refs.unwrap_or_default(),
-        &session_id,
-    )
-    .await
-}
-
 /// Tool names the Specialists form can offer as a checklist.
 ///
 /// The daemon rejects a `tool_allow` naming a tool no server provides, so

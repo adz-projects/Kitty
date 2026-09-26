@@ -239,47 +239,10 @@ pub fn start_stack(app: &AppHandle) {
         // Spawn the BigTiny daemon. No provider env vars — providers are
         // registered at runtime over REST (see
         // `bigtiny::providers::sync_active_provider` right after spawn).
-        let (
-            command,
-            args,
-            dir,
-            summarizer,
-            token_management,
-            memory,
-            local,
-            specialists,
-            pathway_enabled,
-            memorabilia_enabled,
-            pathway_embedding_model,
-        ) = {
+        let snap = {
             let state = app.state::<AppState>();
             let cfg = state.config.lock().unwrap();
-            (
-                cfg.bigtiny_command.clone(),
-                cfg.bigtiny_args.clone(),
-                cfg.bigtiny_dir.clone(),
-                cfg.summarizer.clone(),
-                cfg.token_management.clone(),
-                cfg.memory.clone(),
-                cfg.local.clone(),
-                cfg.specialists.clone(),
-                cfg.adaptive_pathway_enabled,
-                cfg.memorabilia_enabled,
-                cfg.adaptive_pathway_embedding_model.clone(),
-            )
-        };
-
-        // Memorabilia is desktop-only. On Android, force it off here regardless
-        // of config so the engine never runs and `bigtiny_env::daemon_env`
-        // emits BIGTINY_MEMORABILIA__ENABLED=false; the specialists MCP row is
-        // force-offed alongside it in `bigtiny::mcp::ensure_builtin_servers`
-        // (specialists has no enable env flag — the row's `enabled` is its only
-        // switch). Shadows the config value; `let _` consumes the original so
-        // it isn't flagged unused on Android.
-        #[cfg(target_os = "android")]
-        let memorabilia_enabled = {
-            let _ = memorabilia_enabled;
-            false
+            crate::lifecycle::bigtiny_env::SpawnSnapshot::from_config(&cfg)
         };
 
         set_startup_phase(&app, StartupPhase::SpawningBackend);
@@ -296,45 +259,15 @@ pub fn start_stack(app: &AppHandle) {
         // D8, §2.3).
         #[cfg(target_os = "android")]
         let spawn_result = {
-            // The spawn-only inputs have no meaning without a child process, and
             // Android finds `libLiteRt.so` in the APK `jniLibs`, not via PATH.
-            let _ = (&command, &args, &dir, &litert_lib_dir);
-            bigtiny_embedded::start(
-                &summarizer,
-                &token_management,
-                &memory,
-                &local,
-                &specialists,
-                pathway_enabled,
-                memorabilia_enabled,
-                &pathway_embedding_model,
-                &tokenizer_path,
-            )
-            .await
+            let _ = &litert_lib_dir;
+            bigtiny_embedded::start(&snap, &tokenizer_path).await
         };
         // Desktop attaches to a shared V2 daemon rather than spawning one it
-        // owns -- see `bigtiny_v2`. `args` and `dir` no longer apply: there is
-        // no bespoke command line when the daemon may already be running and
-        // was started by somebody else.
+        // owns -- see `bigtiny_v2`.
         #[cfg(not(target_os = "android"))]
-        let spawn_result = {
-            let _ = &dir;
-            bigtiny_v2::locate(
-                &command,
-                &args,
-                &summarizer,
-                &token_management,
-                &memory,
-                &local,
-                &specialists,
-                pathway_enabled,
-                memorabilia_enabled,
-                &pathway_embedding_model,
-                &tokenizer_path,
-                Some(litert_lib_dir.as_str()),
-            )
-            .await
-        };
+        let spawn_result =
+            bigtiny_v2::locate(&snap, &tokenizer_path, Some(litert_lib_dir.as_str())).await;
         match spawn_result {
             Ok(handle) => {
                 let (healthy, port) = (handle.healthy, handle.port);

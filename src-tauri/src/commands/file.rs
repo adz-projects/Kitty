@@ -95,28 +95,6 @@ fn mime_for(name: &str) -> &'static str {
     }
 }
 
-/// Read a text file for inlining into a chat-only message (Phase 9). Rejects
-/// binaries and files over the cap (default 200 KB).
-#[tauri::command]
-pub async fn read_text_file(path: String, max_bytes: Option<usize>) -> Result<String, String> {
-    tokio::task::spawn_blocking(move || {
-        let cap = max_bytes.unwrap_or(200 * 1024);
-        let meta = std::fs::metadata(&path).map_err(|e| format!("could not open file: {e}"))?;
-        if meta.len() as usize > cap {
-            return Err(format!(
-                "File is too large to attach (> {} KB).",
-                cap / 1024
-            ));
-        }
-        let bytes = std::fs::read(&path).map_err(|e| format!("could not read file: {e}"))?;
-        String::from_utf8(bytes).map_err(|_| {
-            "That looks like a binary file — only text can be attached here.".to_string()
-        })
-    })
-    .await
-    .map_err(|e| format!("file read task panicked: {e}"))?
-}
-
 /// A file attached to a chat, classified as UTF-8 text or binary (Round-2 item 13).
 #[derive(Debug, Clone, Serialize)]
 pub struct FileAttachment {

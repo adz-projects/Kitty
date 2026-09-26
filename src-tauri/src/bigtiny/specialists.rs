@@ -13,7 +13,7 @@
 //! learn. Nothing here is invoked by the user directly.
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use crate::bigtiny::client::BigTinyClient;
 
@@ -101,28 +101,6 @@ pub async fn save(client: &BigTinyClient, spec: &SpecialistSpec) -> Result<Strin
 pub async fn delete(client: &BigTinyClient, id: &str) -> Result<(), String> {
     client.delete(&format!("/api/specialists/{id}")).await?;
     Ok(())
-}
-
-/// Run one on the user's behalf, under `session_id`.
-///
-/// Long, because it awaits the delegate's whole run: the daemon holds the
-/// request open until the specialist finishes, so this goes through
-/// `post_json_long` rather than the ordinary client timeout.
-pub async fn run(
-    client: &BigTinyClient,
-    name: &str,
-    request: &str,
-    refs: &[String],
-    session_id: &str,
-) -> Result<Value, String> {
-    let body = json!({
-        "request": request,
-        "refs": refs,
-        "session_id": session_id,
-    });
-    client
-        .post_json_long(&format!("/api/specialists/{name}/run"), &body)
-        .await
 }
 
 /// Every tool name this app can currently reach, sorted and de-duplicated.

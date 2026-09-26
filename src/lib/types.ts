@@ -22,7 +22,6 @@ export interface Config {
   remember_overlay_position: boolean;
   providers: ProviderProfile[];
   active_provider_id: string | null;
-  strict_remote_mode: boolean;
   show_artifacts: boolean;
   /** Whether the in-process behavioral-memory (pathway) engine, linked
       directly into the BigTiny daemon, is active for this install. */
@@ -35,9 +34,6 @@ export interface Config {
       linked into the BigTiny daemon alongside pathway, is active for this
       install. Off by default; reuses pathway's shared embedding model. */
   memorabilia_enabled: boolean;
-  /** Whether local inference (Ollama) is in play for this install — set by
-      the wizard's first-screen fork, toggleable later from Advanced. */
-  ollama_enabled: boolean;
   /** BigTiny background context-compaction settings — relayed to the daemon
       as `BIGTINY_SUMMARIZER__*` env vars at spawn time (Rust `Config::summarizer`,
       mirrors `bigtiny/config.py`'s `SummarizerConfig`). A daemon restart is
@@ -55,37 +51,13 @@ export interface Config {
       mirrors `bigtiny_rust`'s `MemoryConfig`). A daemon restart is needed
       for a change here to take effect. */
   memory: MemorySettings;
-  /** Local engine knobs — see `LocalModelSettings`. */
-  local: LocalModelSettings;
 }
 
 export interface SummarizerSettings {
   enabled: boolean;
-  /** GGUF id (not an Ollama tag since Phase 2b) — resolved into
-      `BIGTINY_LOCAL__MODEL_PATH` at spawn. `keep_alive` is gone with the
-      Ollama-native summarizer client it configured. */
+  /** Local summarizer model file (`.litertlm`), resolved into
+      `BIGTINY_LITERT__SUMMARIZER_MODEL_PATH` at spawn. */
   model: string;
-}
-
-/** The local engine's tunable knobs (docs/ANDROID.md §3.2/§6.1). Mirrors
-    Rust `Config::local` / `LocalModelSettings`, which in turn mirrors the
-    daemon's `LocalEngineConfig`. Every field is load-time: changing one
-    restarts the daemon (§6.4). */
-export interface LocalModelSettings {
-  n_ctx: number;
-  embed_n_ctx: number;
-  n_batch: number;
-  /** `0` = let llama.cpp pick from the host's core count. */
-  n_threads: number;
-  /** `-1` = all layers to the selected backend; `0` is CPU-only. */
-  n_gpu_layers: number;
-  /** `auto` | `cuda` | `vulkan` | `cpu`. */
-  backend: string;
-  /** `last` | `mean` | `cls`. */
-  embed_pooling: string;
-  /** `f16` | `q8_0` | `q4_0` | `q4_1` | `q5_0` | `q5_1`. */
-  cache_type_k: string;
-  cache_type_v: string;
 }
 
 export interface TokenManagementSettings {
@@ -279,55 +251,6 @@ export interface LocalModel {
   path: string;
   size_bytes: number;
   info?: GgufInfo | null;
-}
-
-/** One compute device, or the one a load settled on. Mirrors
-    `bigtiny_rust::local::backend::SelectedBackend`. `memory_free`/`_total` are
-    both `0` on CPU — there is no separate VRAM budget to report, and
-    substituting system RAM would make the card lie. */
-export interface SelectedBackend {
-  backend: string;
-  device?: string | null;
-  device_index?: number | null;
-  memory_free: number;
-  memory_total: number;
-  /** Free memory automatic context sizing may spend, **including system RAM
-      when the device is the CPU**. Distinct from `memory_free` on purpose:
-      that one is the VRAM row and is `0` on CPU, because claiming a CPU has
-      VRAM would be a lie; this one is a sizing budget, where system RAM is
-      the real constraint. */
-  usable_memory: number;
-}
-
-/** One engine slot. Mirrors `bigtiny_rust::local::manager::SlotStatus`.
-
-    `n_gpu_layers` and `n_ctx` are what the load *resolved to*, which is not
-    always what was configured: both can come from llama.cpp's `fit_params`
-    sizing the model against measured device memory. */
-export interface LocalSlotStatus {
-  kind: string;
-  loaded: boolean;
-  model_path?: string | null;
-  n_embd?: number | null;
-  backend?: SelectedBackend | null;
-  n_gpu_layers?: number | null;
-  n_ctx?: number | null;
-  error?: string | null;
-}
-
-/** The daemon's `GET /api/local/models/status`, as passed through by
-    `commands::get_local_engine_status`.
-
-    `backend_selected` is what a load would pick *now*; a slot's own `backend`
-    is what its resident model is actually on. They differ after a settings
-    change that hasn't been applied by a restart yet, which is why both are
-    reported rather than one standing in for the other. */
-export interface LocalEngineStatus {
-  enabled: boolean;
-  backend_preference: string;
-  backend_selected?: SelectedBackend | null;
-  devices: SelectedBackend[];
-  slots: LocalSlotStatus[];
 }
 
 /** Partial GGUF header — every field optional because the reader stops at

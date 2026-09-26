@@ -290,14 +290,13 @@ async fn set_app_default(client: &super::client::BigTinyClient, active_id: &str)
 }
 
 /// Per-session provider override: PATCH a single session's metadata with the
-/// given provider/model (`PATCH /api/chat/{id}/config`). Unlike
-/// `rebind_session`, this does NOT sync the global active provider or touch
+/// given provider/model (`PATCH /api/chat/{id}/config`). This does NOT sync the global active provider or touch
 /// the BigTiny registry defaults — a session keeps the provider it was
 /// stamped with, independent of what other windows pick. This is the
 /// per-session isolation contract: providers are resolved per session at send
 /// time (`loop_.rs` reads `metadata.provider`), so every window can chat on a
 /// different provider without flipping each other's open sessions.
-/// Best-effort (swallows its own failures, same contract as `rebind_session`).
+/// Best-effort: swallows its own failures.
 pub async fn set_session_provider(
     app: &AppHandle,
     session_id: &str,
@@ -319,35 +318,6 @@ pub async fn set_session_provider(
                 "model": model,
             }),
         )
-        .await;
-}
-
-/// Best-effort: rebind an already-open session onto the currently-active
-/// provider/model (`PATCH /api/chat/{id}/config`) — the BigTiny equivalent of
-/// the goosed path's `session/set_config_option` hot-rebind. Swallows its own
-/// failures, same contract as `rebind_session_provider`.
-pub async fn rebind_session(app: &AppHandle, session_id: &str) {
-    let Ok(Some(provider_id)) = sync_active_provider(app).await else {
-        return;
-    };
-    let model = {
-        let state = app.state::<AppState>();
-        let cfg = state.config.lock().unwrap();
-        cfg.active_provider_id
-            .as_ref()
-            .and_then(|id| cfg.providers.iter().find(|p| &p.id == id))
-            .and_then(|p| p.models.first().cloned())
-    };
-    let Ok(client) = ensure_client(app) else {
-        return;
-    };
-    let body = json!({
-        "provider": provider_id,
-        // Empty string clears a stale override when the profile has no model.
-        "model": model.unwrap_or_default(),
-    });
-    let _ = client
-        .patch_json(&format!("/api/chat/{session_id}/config"), &body)
         .await;
 }
 

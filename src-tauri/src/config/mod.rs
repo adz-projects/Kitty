@@ -66,8 +66,6 @@ pub struct Config {
     pub providers: Vec<ProviderProfile>,
     /// Id of the active provider profile, if any.
     pub active_provider_id: Option<String>,
-    /// Disable file/folder drop while a remote-tier provider is active.
-    pub strict_remote_mode: bool,
     /// User-defined chat folders (Round-2 item 15). App-side only — layered over
     /// goosed's session list; not visible to other Goose clients.
     #[serde(default)]
@@ -272,17 +270,6 @@ pub struct Config {
     /// `scheduled_tasks::ScheduledTask`.
     #[serde(default)]
     pub scheduled_tasks: Vec<ScheduledTask>,
-    /// Whether local inference (Ollama) is in play at all for this install.
-    /// Set explicitly by the wizard's first-screen fork ("Run on this
-    /// computer" vs. "Use my own API key") and toggleable later from
-    /// Settings → Advanced. Defaults `true` so pre-existing installs (which
-    /// predate this field and already have Ollama configured) are unaffected.
-    /// When `false`: the Ollama Models settings section and the "Ollama"
-    /// provider-type option are hidden, and `start_stack`/`compute_status`
-    /// stop trying to reach Ollama at all (see
-    /// `lifecycle::ollama_proc::requires_local_ollama`).
-    #[serde(default = "default_true")]
-    pub ollama_enabled: bool,
     /// Command used to launch the BigTiny daemon — the bundled
     /// `bigtiny-daemon.exe` (see `plugins/build.py`, same `externalBin`
     /// convention as the other bundled plugins) if present, else `cargo`
@@ -295,11 +282,6 @@ pub struct Config {
     /// `cargo run` against `BigTinyV2/daemon/` for the dev fallback.
     #[serde(default = "default_bigtiny_args")]
     pub bigtiny_args: Vec<String>,
-    /// Working directory to spawn BigTiny in — the checkout that contains the
-    /// `bigtiny` package, when it isn't pip-installed into the interpreter
-    /// and the bundled exe isn't in use. `None` = inherit Kitty's own cwd.
-    #[serde(default)]
-    pub bigtiny_dir: Option<String>,
     /// BigTiny background context-compaction settings, relayed to the daemon
     /// as `BIGTINY_SUMMARIZER__*` env vars at spawn
     /// (`lifecycle::bigtiny_proc::spawn`) — BigTiny only ever reads config via
@@ -326,94 +308,6 @@ pub struct Config {
     /// the value-changing `migrate_*` functions in `load` below.
     #[serde(default)]
     pub memory: MemorySettings,
-    /// The local llama.cpp engine's tunable knobs (docs/ANDROID.md §3.2, §6.1)
-    /// — relayed as `BIGTINY_LOCAL__*` env vars at spawn, same mechanism as
-    /// `summarizer`/`token_management`/`memory` above. Model *paths* are
-    /// resolved separately in `bigtiny_proc::spawn` from `summarizer.model` /
-    /// `adaptive_pathway_embedding_model` (GGUF ids, not paths) — this struct
-    /// is everything else `LocalEngineConfig` accepts. `#[serde(default)]`
-    /// covers a pre-existing config file; no migration needed, this is a new
-    /// field with no prior value to carry forward.
-    #[serde(default)]
-    pub local: LocalModelSettings,
-}
-
-/// See `Config::local`. Field names and defaults mirror BigTiny's own
-/// `LocalEngineConfig` (`BigTinyV2/daemon/src/config.rs`) exactly, so the
-/// two structs can't drift apart silently — a field renamed on one side and
-/// not the other would otherwise fail only at runtime, as an env var the
-/// daemon never reads.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct LocalModelSettings {
-    #[serde(default = "default_local_n_ctx")]
-    pub n_ctx: u32,
-    #[serde(default = "default_local_embed_n_ctx")]
-    pub embed_n_ctx: u32,
-    #[serde(default = "default_local_n_batch")]
-    pub n_batch: u32,
-    /// `0` = let llama.cpp pick from the host's core count.
-    #[serde(default)]
-    pub n_threads: i32,
-    /// `-1` = all layers to the selected backend; `0` is CPU-only.
-    #[serde(default = "default_local_n_gpu_layers")]
-    pub n_gpu_layers: i32,
-    /// `"auto"` (default) | `"cuda"` | `"vulkan"` | `"cpu"` — see
-    /// `bigtiny2::local::backend`. Only `"cpu"` and `"auto"` do anything
-    /// on current builds: no GPU cargo feature is enabled yet, so the device
-    /// registry reports CPU only and the other two fall back to it.
-    #[serde(default = "default_local_backend")]
-    pub backend: String,
-    /// `"last"` | `"mean"` | `"cls"` — belongs with the embed model pin, not
-    /// the engine, but lives here rather than a fourth place since Kitty has
-    /// nowhere else that's specifically "embedding settings."
-    #[serde(default = "default_local_embed_pooling")]
-    pub embed_pooling: String,
-    /// `"f16"` (default, always safe) | `"q8_0"` | `"q4_0"` | `"q4_1"` |
-    /// `"q5_0"` | `"q5_1"`. An advanced knob — see
-    /// `bigtiny2::local::engine::parse_kv_cache_type`'s doc comment for
-    /// why a non-default value's safety on a given backend isn't guaranteed.
-    #[serde(default = "default_local_cache_type")]
-    pub cache_type_k: String,
-    #[serde(default = "default_local_cache_type")]
-    pub cache_type_v: String,
-}
-
-fn default_local_n_ctx() -> u32 {
-    4096
-}
-fn default_local_embed_n_ctx() -> u32 {
-    512
-}
-fn default_local_n_batch() -> u32 {
-    512
-}
-fn default_local_n_gpu_layers() -> i32 {
-    -1
-}
-fn default_local_embed_pooling() -> String {
-    "last".to_string()
-}
-fn default_local_backend() -> String {
-    "auto".to_string()
-}
-fn default_local_cache_type() -> String {
-    "f16".to_string()
-}
-
-impl Default for LocalModelSettings {
-    fn default() -> Self {
-        Self {
-            n_ctx: default_local_n_ctx(),
-            embed_n_ctx: default_local_embed_n_ctx(),
-            n_batch: default_local_n_batch(),
-            n_threads: 0,
-            n_gpu_layers: default_local_n_gpu_layers(),
-            backend: default_local_backend(),
-            embed_pooling: default_local_embed_pooling(),
-            cache_type_k: default_local_cache_type(),
-            cache_type_v: default_local_cache_type(),
-        }
-    }
 }
 
 /// See `Config::summarizer`. `enabled` mirrors BigTiny's own
@@ -428,7 +322,7 @@ impl Default for LocalModelSettings {
 /// ("0"/"5m"/"-1") for the now-deleted Ollama-only `SummarizerClient`; the
 /// in-process engine's residency is the slot manager's job, and nothing here
 /// maps to it.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SummarizerSettings {
     pub enabled: bool,
     pub model: String,
@@ -449,7 +343,7 @@ impl Default for SummarizerSettings {
 /// Python defaults still apply if the daemon is ever launched without these
 /// env vars set at all (e.g. a source checkout run directly, bypassing
 /// Kitty).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TokenManagementSettings {
     pub max_context_tokens: u32,
     pub max_live_tail_tokens: u32,
@@ -472,7 +366,7 @@ impl Default for TokenManagementSettings {
 /// `MemoryConfig` (`BigTinyV2/daemon/src/config.rs`) so the two don't
 /// drift apart — this is Kitty's independent copy; BigTiny's own defaults
 /// still apply if the daemon is ever launched without these env vars.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Default)]
 pub struct MemorySettings {
     /// Minimum FTS5 bm25 relevance score for pre-flight memory recall to
     /// inject context (higher = fewer, more relevant hits). `None` disables
@@ -493,7 +387,6 @@ impl Default for Config {
             remember_overlay_position: true,
             providers: Vec::new(),
             active_provider_id: None,
-            strict_remote_mode: false,
             folders: Vec::new(),
             session_folders: HashMap::new(),
             show_artifacts: true,
@@ -525,15 +418,12 @@ impl Default for Config {
             kitty_docs_web_enabled: default_true(),
             kitty_docs_web_default_migrated: true,
             scheduled_tasks: Vec::new(),
-            ollama_enabled: default_true(),
             bigtiny_command: default_bigtiny_command(),
             bigtiny_args: default_bigtiny_args(),
-            bigtiny_dir: None,
             summarizer: SummarizerSettings::default(),
             specialists: SpecialistSettings::default(),
             token_management: TokenManagementSettings::default(),
             memory: MemorySettings::default(),
-            local: LocalModelSettings::default(),
         }
     }
 }
@@ -1435,21 +1325,6 @@ mod tests {
         )
     }
 
-    /// A config predating `[local]` must still load, defaulting every knob to
-    /// the value `LocalEngineConfig` on the daemon side itself defaults to —
-    /// the whole point of the two structs mirroring each other is that
-    /// "unset on the Kitty side" and "unset on the daemon side" mean the same
-    /// thing, so the daemon never receives a value the user didn't choose.
-    #[test]
-    fn old_shape_config_defaults_local_settings() {
-        let back: Config = serde_json::from_str(r#"{"theme":"dark"}"#).unwrap();
-        assert_eq!(back.local, LocalModelSettings::default());
-        assert_eq!(back.local.n_ctx, 4096);
-        assert_eq!(back.local.n_gpu_layers, -1);
-        assert_eq!(back.local.cache_type_k, "f16");
-        assert_eq!(back.local.cache_type_v, "f16");
-    }
-
     #[test]
     fn old_shape_config_migrates_embedding_model_default() {
         // A config predating the embedding-model requirement must still load,
@@ -1627,15 +1502,6 @@ mod tests {
         // Already migrated: a user who flipped kitty_wasm_enabled on
         // independently keeps it, regardless of the retired old flag.
         assert!(migrated.kitty_wasm_enabled);
-    }
-
-    #[test]
-    fn old_shape_config_migrates_wizard_redesign_defaults() {
-        // A config predating the wizard redesign (ollama_enabled) must still
-        // load, with Ollama left enabled (pre-existing installs already have
-        // it configured).
-        let back: Config = serde_json::from_str(r#"{"theme":"dark"}"#).unwrap();
-        assert!(back.ollama_enabled);
     }
 
     #[test]

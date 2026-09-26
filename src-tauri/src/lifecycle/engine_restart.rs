@@ -1,9 +1,9 @@
-//! Restart the daemon when a load-time engine setting changes (§6.4, D11).
+//! Restart the daemon when a load-time setting changes (§6.4, D11).
 //!
-//! Every `[local]` knob reaches BigTiny as a `BIGTINY_LOCAL__*` env var at
-//! spawn (`bigtiny_proc::spawn`), so there is no in-process path to apply one
-//! — changing `n_ctx` means restarting the daemon, full stop. That makes the
-//! *timing* the whole design:
+//! Everything in `bigtiny_env::SpawnSnapshot` reaches the daemon as a
+//! `BIGTINY_*` env var at spawn, so there is no in-process path to apply one —
+//! changing it means restarting the daemon, full stop. That makes the *timing*
+//! the whole design:
 //!
 //! - **Idle → restart immediately.** Nothing is lost.
 //! - **Mid-generation → queue it.** Restarting kills the daemon, which drops
@@ -22,7 +22,8 @@
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 
-use crate::config::{Config, LocalModelSettings};
+use crate::config::Config;
+use crate::lifecycle::bigtiny_env::SpawnSnapshot;
 use crate::state::AppState;
 
 /// Payload for `engine://restart-state`. Drives the non-blocking
@@ -36,24 +37,14 @@ pub struct EngineRestartState {
     pub restart_pending: bool,
 }
 
-/// Everything that only reaches the daemon at spawn time. Compared as a unit
-/// rather than field-by-field: the question is never "did `n_ctx` change" but
-/// "is the running daemon still consistent with the saved config", and a
-/// field added to `LocalModelSettings` later is load-time by construction —
-/// it would be relayed by the same env block.
-fn load_time_fingerprint(cfg: &Config) -> (LocalModelSettings, String, String) {
-    (
-        cfg.local.clone(),
-        // The GGUF ids resolve to `BIGTINY_LOCAL__MODEL_PATH` /
-        // `__EMBED_MODEL_PATH` at spawn, so switching model is load-time too.
-        cfg.summarizer.model.clone(),
-        cfg.adaptive_pathway_embedding_model.clone(),
-    )
-}
-
 /// True when `new` needs a daemon restart to take effect.
+///
+/// Compared as a whole snapshot rather than field-by-field: the question is
+/// never "did one knob change" but "is the running daemon still consistent
+/// with the saved config", and a field added to `SpawnSnapshot` later is
+/// load-time by construction.
 pub fn needs_restart(old: &Config, new: &Config) -> bool {
-    load_time_fingerprint(old) != load_time_fingerprint(new)
+    SpawnSnapshot::from_config(old) != SpawnSnapshot::from_config(new)
 }
 
 fn emit(app: &AppHandle, state: EngineRestartState) {
@@ -177,39 +168,37 @@ mod tests {
         let a = Config::default();
         let b = Config {
             theme: "dark".into(),
-            strict_remote_mode: true,
+            remember_overlay_position: true,
             show_artifacts: false,
             ..Config::default()
         };
         assert!(!needs_restart(&a, &b));
     }
 
+    /// Every setting the daemon reads only at spawn must schedule a restart —
+    /// before `SpawnSnapshot` this list was the retired llama knobs plus the
+    /// two model ids, so toggling memory or changing a specialist limit
+    /// silently never reached a running daemon.
     #[test]
-    fn a_changed_engine_knob_triggers_a_restart() {
+    fn a_changed_spawn_setting_triggers_a_restart() {
         let a = Config::default();
         for mutate in [
-            (|c: &mut Config| c.local.n_ctx = 8192) as fn(&mut Config),
-            |c: &mut Config| c.local.n_gpu_layers = 0,
-            |c: &mut Config| c.local.n_batch = 1024,
-            |c: &mut Config| c.local.n_threads = 4,
-            |c: &mut Config| c.local.cache_type_k = "q8_0".into(),
-            |c: &mut Config| c.local.cache_type_v = "q8_0".into(),
-            |c: &mut Config| c.local.backend = "cpu".into(),
-            |c: &mut Config| c.local.embed_n_ctx = 1024,
-            |c: &mut Config| c.local.embed_pooling = "mean".into(),
+            (|c: &mut Config| c.summarizer.enabled = !c.summarizer.enabled) as fn(&mut Config),
+            |c: &mut Config| c.token_management.max_context_tokens += 1,
+            |c: &mut Config| c.memory.bm25_threshold = Some(2.5),
+            |c: &mut Config| c.specialists.timeout_secs += 1,
+            |c: &mut Config| c.specialists.max_concurrent += 1,
+            |c: &mut Config| c.specialists.model_deny.push("x/y".into()),
+            |c: &mut Config| c.adaptive_pathway_enabled = !c.adaptive_pathway_enabled,
         ] {
             let mut b = Config::default();
             mutate(&mut b);
-            assert!(
-                needs_restart(&a, &b),
-                "expected a restart for {:?}",
-                b.local
-            );
+            assert!(needs_restart(&a, &b), "expected a restart for {:?}", SpawnSnapshot::from_config(&b));
         }
     }
 
-    /// Switching either model is load-time too: the GGUF ids resolve to
-    /// `BIGTINY_LOCAL__*_MODEL_PATH` at spawn, so a running daemon keeps the
+    /// Switching either model is load-time too: the ids resolve to
+    /// `BIGTINY_LITERT__*_MODEL_PATH` at spawn, so a running daemon keeps the
     /// old weights until it's replaced.
     #[test]
     fn switching_either_model_triggers_a_restart() {
