@@ -11,7 +11,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
-use bigtiny2_protocol::discovery::{RegisterRequest, RegisterResponse};
+use bigtiny2_protocol::discovery::{ReclaimRequest, RegisterRequest, RegisterResponse};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -77,11 +77,70 @@ pub async fn register(
         // Already registered. A 409 rather than silently reissuing a key:
         // reissuing would let anyone holding the (per-launch, file-readable)
         // registration token take over an existing app's identity, which would
-        // make the whole per-app boundary meaningless.
+        // make the whole per-app boundary meaningless. An app that genuinely
+        // lost its key uses `reclaim`, which refuses while the key is in use
+        // and revokes the old key rather than issuing a second one.
         Ok(None) => err_response(
             StatusCode::CONFLICT,
             format!("app id {app_id:?} is already registered"),
         ),
+        Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+/// How recently an app must *not* have been seen for its identity to be
+/// reclaimable. `last_seen_at` is written about once a minute, so this is a
+/// little over one write interval.
+const RECLAIM_QUIET_SECS: u64 = 90;
+
+/// `POST /api/apps/reclaim` — re-issue the key of an app that lost it.
+///
+/// Registration refuses to reissue an existing app's key (see `register`),
+/// which left an app whose stored key was lost with no way back: it could not
+/// authenticate, could not register again, and could not revoke itself. This
+/// is that way back. It is gated on the same registration token as `register`
+/// -- proof of read access to this daemon's data directory, which on a
+/// single-user machine is the same trust boundary the app's own secret store
+/// sits behind.
+///
+/// Two limits keep it from being a quiet takeover path:
+/// * an app that authenticated within [`RECLAIM_QUIET_SECS`] cannot be
+///   reclaimed (409) -- something is actively using that key;
+/// * the old key stops working immediately, so a reclaim is never silent to
+///   the key's holder: its next request fails.
+pub async fn reclaim(State(state): State<Arc<AppState>>, Json(body): Json<ReclaimRequest>) -> Response {
+    let app_id = body.app_id.trim();
+    match apps::get_app(&state.db, app_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return err_response(StatusCode::NOT_FOUND, format!("no such app: {app_id}")),
+        Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+    match apps::seen_within_secs(&state.db, app_id, RECLAIM_QUIET_SECS).await {
+        Ok(false) => {}
+        Ok(true) => {
+            return err_response(
+                StatusCode::CONFLICT,
+                format!(
+                    "app {app_id:?} is in use; it can be reclaimed once it has been idle                      for {RECLAIM_QUIET_SECS} seconds"
+                ),
+            )
+        }
+        Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+    let api_key = generate_token();
+    match apps::replace_key(&state.db, app_id, &api_key).await {
+        Ok(true) => {
+            // Synchronously, before responding, same as revocation: the old
+            // key must not authenticate once the new one exists.
+            state.key_cache.invalidate(app_id);
+            tracing::warn!("app {app_id:?} reclaimed its identity with a new key");
+            Json(RegisterResponse {
+                app_id: app_id.to_string(),
+                api_key,
+            })
+            .into_response()
+        }
+        Ok(false) => err_response(StatusCode::NOT_FOUND, format!("no such app: {app_id}")),
         Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }

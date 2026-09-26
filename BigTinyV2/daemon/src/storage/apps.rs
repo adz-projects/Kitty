@@ -205,6 +205,42 @@ pub async fn list_apps(pool: &SqlitePool) -> Result<Vec<AppRow>, StorageError> {
         .collect())
 }
 
+/// Replace an app's key, returning whether the app exists.
+///
+/// The recovery path for an app that lost its stored key (see
+/// `routes::apps::reclaim`): only the hash changes, so every row the app owns
+/// stays reachable under the new key.
+pub async fn replace_key(
+    pool: &SqlitePool,
+    app_id: &str,
+    api_key: &str,
+) -> Result<bool, StorageError> {
+    let result = sqlx::query("UPDATE apps SET key_hash = ? WHERE id = ?")
+        .bind(hash_key(api_key))
+        .bind(app_id)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// Whether `app_id` made an authenticated request within the last `secs`
+/// seconds. `last_seen_at` is only written about once a minute per key, so
+/// windows shorter than that are not meaningful.
+pub async fn seen_within_secs(
+    pool: &SqlitePool,
+    app_id: &str,
+    secs: u64,
+) -> Result<bool, StorageError> {
+    let seen: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM apps WHERE id = ? AND last_seen_at IS NOT NULL          AND last_seen_at >= datetime('now', ?)",
+    )
+    .bind(app_id)
+    .bind(format!("-{secs} seconds"))
+    .fetch_optional(pool)
+    .await?;
+    Ok(seen.is_some())
+}
+
 /// Revoke an app. Its rows are left in place rather than cascaded away.
 ///
 /// Deleting an app's sessions along with its key would make a mistyped

@@ -167,8 +167,11 @@ fn is_public(path: &str) -> bool {
     path == "/api/health"
 }
 
+/// Routes gated on the handshake's registration token instead of an app key:
+/// registering, and reclaiming an identity whose key was lost. Neither caller
+/// has a usable key, which is the whole reason it is calling.
 fn is_registration(path: &str) -> bool {
-    path == "/api/apps/register"
+    path == "/api/apps/register" || path == "/api/apps/reclaim"
 }
 
 /// Resolve `X-API-Key` to an [`AppIdentity`] and attach it to the request.
@@ -295,6 +298,7 @@ mod tests {
         Router::new()
             .route("/api/health", get(|| async { "ok" }))
             .route("/api/apps/register", get(|| async { "registered" }))
+            .route("/api/apps/reclaim", get(|| async { "reclaimed" }))
             .route(
                 "/api/chat/",
                 // Echo the resolved app id so tests can assert *who* the
@@ -399,6 +403,29 @@ mod tests {
             app(pool, "tok").oneshot(right).await.unwrap().status(),
             StatusCode::OK
         );
+    }
+
+    /// Reclaim re-issues a key, so an app key must not be enough to call it
+    /// -- only the registration token, exactly like registering.
+    #[tokio::test]
+    async fn reclaim_requires_the_bootstrap_token_not_an_app_key() {
+        let pool = pool_with_app("kitty", "k").await;
+        let with = |header: Option<(&str, &str)>| {
+            let mut b = Request::builder().uri("/api/apps/reclaim");
+            if let Some((name, value)) = header {
+                b = b.header(name, value);
+            }
+            b.body(Body::empty()).unwrap()
+        };
+        for req in [with(None), with(Some(("x-api-key", "k"))), with(Some(("x-registration-token", "k")))] {
+            let status = app(pool.clone(), "tok").oneshot(req).await.unwrap().status();
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+        }
+        let ok = app(pool, "tok")
+            .oneshot(with(Some(("x-registration-token", "tok"))))
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
     }
 
     #[tokio::test]

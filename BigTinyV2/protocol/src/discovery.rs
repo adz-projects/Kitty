@@ -99,6 +99,17 @@ pub struct RegisterResponse {
     pub api_key: String,
 }
 
+/// `POST /api/apps/reclaim`: re-issue the key of an app that lost it.
+///
+/// Authorized, like registration, by the handshake's registration token (sent
+/// as `X-Registration-Token`) -- proof that the caller can read this daemon's
+/// data directory. The answer is a [`RegisterResponse`] with the fresh key;
+/// the old key stops working at once, and everything the app owns is kept.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReclaimRequest {
+    pub app_id: String,
+}
+
 /// `GET /api/health`. Unauthenticated by design, so a client can poll for
 /// readiness before it has a key -- and so the handshake can be validated
 /// against the live process.

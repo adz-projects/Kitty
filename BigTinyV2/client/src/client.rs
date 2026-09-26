@@ -12,7 +12,7 @@
 
 use std::time::Duration;
 
-use bigtiny2_protocol::discovery::{RegisterRequest, RegisterResponse};
+use bigtiny2_protocol::discovery::{ReclaimRequest, RegisterRequest, RegisterResponse};
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 
@@ -75,6 +75,33 @@ impl BigTinyClient {
             // remedy (recover the key, or register a fresh id) depends on the
             // app -- so it gets its own variant rather than a generic 409.
             return Err(ClientError::AlreadyRegistered(app_id.to_string()));
+        }
+        Self::decode(resp).await
+    }
+
+    /// Re-issue the key of an app that lost it (`POST /api/apps/reclaim`).
+    ///
+    /// The remedy for [`ClientError::AlreadyRegistered`]: authorized by the
+    /// same registration token, it keeps everything the app owns and revokes
+    /// the old key. Refused with [`ClientError::AppInUse`] while something is
+    /// still authenticating with that key.
+    pub async fn reclaim(
+        base_url: &str,
+        registration_token: &str,
+        app_id: &str,
+    ) -> Result<RegisterResponse> {
+        let http = reqwest::Client::new();
+        let resp = http
+            .post(format!("{base_url}/api/apps/reclaim"))
+            .header("X-Registration-Token", registration_token)
+            .timeout(SHORT_TIMEOUT)
+            .json(&ReclaimRequest {
+                app_id: app_id.to_string(),
+            })
+            .send()
+            .await?;
+        if resp.status() == reqwest::StatusCode::CONFLICT {
+            return Err(ClientError::AppInUse(app_id.to_string()));
         }
         Self::decode(resp).await
     }

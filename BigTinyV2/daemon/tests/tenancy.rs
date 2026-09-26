@@ -2040,3 +2040,63 @@ async fn an_app_id_that_would_escape_the_data_dir_is_refused() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Reclaiming a lost key
+// ---------------------------------------------------------------------------
+
+async fn reclaim(state: Arc<AppState>, app_id: &str) -> (StatusCode, Value) {
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/api/apps/reclaim")
+        .header("content-type", "application/json")
+        .body(Body::from(json!({"app_id": app_id}).to_string()))
+        .unwrap();
+    // The route is gated by the registration token in the middleware, which
+    // `router_as` bypasses; what is under test here is the handler.
+    let resp = router_as(state, APP_B).oneshot(req).await.unwrap();
+    let status = resp.status();
+    (status, body_json(resp).await)
+}
+
+/// An app that lost its key gets a new one, keeps everything it owns, and the
+/// old key stops authenticating.
+#[tokio::test]
+async fn a_reclaimed_app_keeps_its_data_and_the_old_key_dies() {
+    let state = test_state().await;
+    let session = create_session(state.clone(), APP_A).await;
+
+    let (status, body) = reclaim(state.clone(), APP_A).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let new_key = body["api_key"].as_str().unwrap().to_string();
+
+    assert!(apps::identity_for_key(&state.db, "key-a").await.unwrap().is_none());
+    let identity = apps::identity_for_key(&state.db, &new_key).await.unwrap().unwrap();
+    assert_eq!(identity.app_id, APP_A);
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(format!("/api/chat/{session}/history"))
+        .body(Body::empty())
+        .unwrap();
+    let status = router_as(state, APP_A).oneshot(req).await.unwrap().status();
+    assert_eq!(status, StatusCode::OK, "the reclaimed app must still own its session");
+}
+
+/// A key in active use cannot be taken over: something is authenticating with
+/// it right now, and reclaiming would lock that holder out.
+#[tokio::test]
+async fn an_app_in_use_cannot_be_reclaimed() {
+    let state = test_state().await;
+    apps::touch_last_seen(&state.db, APP_A).await.unwrap();
+    let (status, _) = reclaim(state.clone(), APP_A).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(apps::identity_for_key(&state.db, "key-a").await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn reclaiming_an_unknown_app_is_a_404() {
+    let state = test_state().await;
+    let (status, _) = reclaim(state, "never-registered").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}

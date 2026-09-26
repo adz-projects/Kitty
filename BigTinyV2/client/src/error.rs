@@ -27,6 +27,12 @@ pub enum ClientError {
     #[error("app id {0:?} is already registered and this app does not hold its key")]
     AlreadyRegistered(String),
 
+    /// A reclaim was refused because the app's current key is still in use.
+    /// Retrying after the daemon's quiet window (about 90 seconds) succeeds
+    /// if nothing else is using it.
+    #[error("app id {0:?} is in use and cannot be reclaimed yet")]
+    AppInUse(String),
+
     #[error("could not take the spawn lock at {path:?}: {reason}")]
     SpawnLock { path: PathBuf, reason: String },
 

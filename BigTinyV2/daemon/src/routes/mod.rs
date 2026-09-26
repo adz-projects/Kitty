@@ -77,6 +77,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         // Registration is gated on the handshake's bootstrap token rather
         // than an app key -- see `server::middleware::auth_middleware`.
         .route("/api/apps/register", post(apps::register))
+        .route("/api/apps/reclaim", post(apps::reclaim))
         .route("/api/apps", get(apps::list))
         .route(
             "/api/apps/me",
