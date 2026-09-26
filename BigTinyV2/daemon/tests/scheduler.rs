@@ -234,3 +234,215 @@ async fn a_disabled_schedule_never_runs_however_it_is_triggered() {
             .unwrap();
     assert_eq!(runs, 0, "a disabled schedule must not run");
 }
+
+// ---------------------------------------------------------------------------
+// Schedules v2: outcomes, events, run configuration, timer kinds
+// ---------------------------------------------------------------------------
+
+/// A mock provider that answers every completion with a short success.
+async fn ok_provider() -> mockito::ServerGuard {
+    let mut server = mockito::Server::new_async().await;
+    server
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_body(
+            "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Done.\"},\"finish_reason\":null}]}\n\n\
+             data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1,\"total_tokens\":4}}\n\n\
+             data: [DONE]\n\n",
+        )
+        .create_async()
+        .await;
+    server
+}
+
+async fn schedule_row(pool: &SqlitePool, id: &str) -> bigtiny2::storage::schedules::ScheduleRow {
+    bigtiny2::storage::schedules::get_schedule(pool, id)
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+/// Wait (bounded) until the schedule row satisfies `check`, for runs started
+/// on a timer task.
+async fn wait_for_row(
+    pool: &SqlitePool,
+    id: &str,
+    check: impl Fn(&bigtiny2::storage::schedules::ScheduleRow) -> bool,
+) {
+    for _ in 0..100 {
+        if check(&schedule_row(pool, id).await) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("schedule {id} never reached the expected state");
+}
+
+/// A run's outcome lands on the schedule row itself, the owning app hears
+/// `started` then `finished` on its event stream, and the run's session is
+/// configured the way the schedule says (a short approval wait by default).
+#[tokio::test]
+async fn a_run_records_its_outcome_and_announces_it() {
+    use bigtiny2::server::events::SSEEventType;
+
+    let pool = test_pool().await;
+    seed_schedule(&pool, "j5", "Say hi").await;
+    let server = ok_provider().await;
+    let agent = build_agent_with_provider(&pool, &server.url()).await;
+    let mut events = agent.app_events().subscribe();
+    let scheduler = Scheduler::new(pool.clone(), agent).await.unwrap();
+
+    scheduler.run_job("j5").await.unwrap();
+
+    let row = schedule_row(&pool, "j5").await;
+    assert_eq!(row.last_status.as_deref(), Some("completed"));
+    let session_id = row.last_session_id.clone().expect("the run's session is recorded");
+    assert!(row.last_run_at.is_some());
+
+    let meta: String = sqlx::query_scalar("SELECT metadata FROM sessions WHERE id = ?")
+        .bind(&session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let meta: serde_json::Value = serde_json::from_str(&meta).unwrap();
+    assert_eq!(meta["hitl_timeout_secs"], 600);
+    assert_eq!(meta["schedule_id"], "j5");
+
+    let mut outcomes = Vec::new();
+    while let Ok((app, ev)) = events.try_recv() {
+        if ev.event_type == SSEEventType::ScheduleRun {
+            assert_eq!(app, "app-a", "announced to the schedule's owner");
+            assert_eq!(ev.schedule_id.as_deref(), Some("j5"));
+            outcomes.push(ev.content.unwrap());
+        }
+    }
+    assert_eq!(outcomes, ["started", "finished"]);
+}
+
+/// A provider pin and a system prompt on the schedule reach the run session.
+#[tokio::test]
+async fn a_schedule_pins_its_runs_provider_and_persona() {
+    use bigtiny2::storage::schedules::ScheduleSpec;
+
+    let pool = test_pool().await;
+    let server = ok_provider().await;
+    let agent = build_agent_with_provider(&pool, &server.url()).await;
+    let mut scheduler = Scheduler::new(pool.clone(), agent).await.unwrap();
+    let id = scheduler
+        .add_schedule(
+            "app-a",
+            ScheduleSpec {
+                name: "pinned".into(),
+                prompt: "hi".into(),
+                kind: "cron".into(),
+                cron: "0 9 * * *".into(),
+                provider_id: Some("mock-openai".into()),
+                model: Some("m1".into()),
+                system_prompt: Some("Be terse.".into()),
+                hitl_timeout_secs: 120,
+                enabled: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    scheduler.run_job(&id).await.unwrap();
+
+    let session_id = schedule_row(&pool, &id).await.last_session_id.unwrap();
+    let meta: String = sqlx::query_scalar("SELECT metadata FROM sessions WHERE id = ?")
+        .bind(&session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let meta: serde_json::Value = serde_json::from_str(&meta).unwrap();
+    assert_eq!(meta["provider"], "mock-openai");
+    assert_eq!(meta["model"], "m1");
+    assert_eq!(meta["persona_override"], "Be terse.");
+    assert_eq!(meta["hitl_timeout_secs"], 120);
+}
+
+/// A `once` schedule whose time has already passed runs as soon as it is
+/// registered, then disables itself.
+#[tokio::test]
+async fn a_once_schedule_that_is_already_due_runs_then_disables_itself() {
+    use bigtiny2::storage::schedules::ScheduleSpec;
+
+    let pool = test_pool().await;
+    let server = ok_provider().await;
+    let agent = build_agent_with_provider(&pool, &server.url()).await;
+    let mut scheduler = Scheduler::new(pool.clone(), agent).await.unwrap();
+    let past = (chrono::Utc::now() - chrono::Duration::minutes(5)).to_rfc3339();
+    let id = scheduler
+        .add_schedule(
+            "app-a",
+            ScheduleSpec {
+                name: "once".into(),
+                prompt: "hi".into(),
+                kind: "once".into(),
+                run_at: Some(past),
+                hitl_timeout_secs: 600,
+                enabled: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    wait_for_row(&pool, &id, |r| r.enabled == 0 && r.last_status.as_deref() == Some("completed")).await;
+    assert!(schedule_row(&pool, &id).await.next_run_at.is_none());
+}
+
+/// An interval schedule that fell due while the daemon was down runs once on
+/// start -- not once per missed interval -- and is rescheduled from now.
+#[tokio::test]
+async fn an_overdue_interval_schedule_catches_up_once_on_start() {
+    use bigtiny2::storage::schedules::{self, ScheduleSpec};
+
+    let pool = test_pool().await;
+    let overdue = (chrono::Utc::now() - chrono::Duration::hours(3)).to_rfc3339();
+    schedules::create_schedule_spec(
+        &pool,
+        "iv",
+        "app-a",
+        &ScheduleSpec {
+            name: "hourly".into(),
+            prompt: "hi".into(),
+            kind: "interval".into(),
+            interval_secs: Some(3600),
+            next_run_at: Some(overdue),
+            hitl_timeout_secs: 600,
+            enabled: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let server = ok_provider().await;
+    let agent = build_agent_with_provider(&pool, &server.url()).await;
+    let mut scheduler = Scheduler::new(pool.clone(), agent).await.unwrap();
+    scheduler.start().await.unwrap();
+
+    // Completed, and its next run already moved into the future.
+    wait_for_row(&pool, "iv", |r| {
+        r.last_status.as_deref() == Some("completed")
+            && r.next_run_at
+                .as_deref()
+                .and_then(|n| chrono::DateTime::parse_from_rfc3339(n).ok())
+                .is_some_and(|n| n.with_timezone(&chrono::Utc) > chrono::Utc::now())
+    })
+    .await;
+    let row = schedule_row(&pool, "iv").await;
+    assert_eq!(row.enabled, 1, "an interval schedule stays enabled");
+    let next = chrono::DateTime::parse_from_rfc3339(row.next_run_at.as_deref().unwrap()).unwrap();
+    let ahead = (next.with_timezone(&chrono::Utc) - chrono::Utc::now()).num_seconds();
+    assert!((3500..=3600).contains(&ahead), "rescheduled from now, got {ahead}s ahead");
+    let runs: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM execution_history WHERE trigger_id = 'iv'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(runs, 1, "one catch-up run, not one per missed interval");
+    scheduler.stop().await;
+}

@@ -1,54 +1,70 @@
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
 use dashmap::DashMap;
+use serde_json::json;
 use sqlx::SqlitePool;
 use tokio_cron_scheduler::{Job, JobScheduler};
 
-use crate::error::SchedulerError;
 use crate::agent::Agent;
+use crate::error::SchedulerError;
+use crate::server::events::{SSEEvent, SSEEventType};
 use crate::storage::execution;
-use crate::storage::schedules::{self, ScheduleRow};
+use crate::storage::schedules::{self, ScheduleRow, ScheduleSpec, KIND_CRON, KIND_INTERVAL, KIND_ONCE};
 use crate::storage::sessions;
 
-/// Ports `plugins/bigtiny/bigtiny/scheduler/scheduler.py`. Uses
-/// `tokio-cron-scheduler` (backed by the `croner` crate) rather than
-/// hand-rolling a `tokio::time::interval` poll loop — a bare poll loop would
-/// still need its own cron-expression evaluator to decide "is this job due
-/// right now," so it wouldn't actually be simpler, just a worse
-/// reimplementation of what this crate already does.
+/// Shortest interval an `interval` schedule may use. A tighter loop is a
+/// runaway spend waiting to happen, not a schedule anyone means.
+pub const MIN_INTERVAL_SECS: i64 = 60;
+
+/// Longest a scheduled run's tool approval may wait. Matches the loop's
+/// interactive ceiling (`agent::loop_::HITL_APPROVAL_TIMEOUT`).
+pub const MAX_HITL_TIMEOUT_SECS: i64 = 3600;
+
+/// Ports `plugins/bigtiny/bigtiny/scheduler/scheduler.py`, and extends it.
 ///
-/// `tokio-cron-scheduler`'s `Job::new_async` requires a 6-field cron
-/// expression (seconds first); `schedule_jobs.cron` stores standard 5-field
-/// crontab strings (matching Python's `CronTrigger.from_crontab`), so
-/// `to_seconds_cron` prepends a `0` seconds field before handing it off.
+/// Three kinds of schedule (migration 025):
+///
+/// * `cron` -- `tokio-cron-scheduler` (backed by `croner`), which takes a
+///   6-field expression (seconds first); `schedule_jobs.cron` stores standard
+///   5-field crontab strings, so `to_seconds_cron` prepends a `0`.
+/// * `interval` -- every `interval_secs`, measured from the previous run.
+/// * `once` -- a single run at `run_at`, after which the schedule disables
+///   itself.
+///
+/// The two timer kinds are driven by a task per schedule that sleeps until
+/// the persisted `next_run_at`. Persisting it is what makes a run that fell due
+/// while the daemon was down happen on the next start rather than silently
+/// never: the task finds `next_run_at` in the past and runs at once. (Cron
+/// keeps cron semantics -- a missed tick is not replayed.)
 pub struct Scheduler {
     db: SqlitePool,
-    /// A cron firing is an ordinary turn now, so the scheduler drives the agent
-    /// directly rather than going through a recipe engine that no longer
-    /// exists. Whether the work wants a specialist is the model's decision, made
-    /// per firing, exactly as it would be in a chat.
+    /// A firing is an ordinary turn, so the scheduler drives the agent
+    /// directly. Whether the work wants a specialist is the model's decision,
+    /// made per firing, exactly as it would be in a chat.
     agent: Arc<Agent>,
     inner: JobScheduler,
-    /// Maps our `schedule_jobs.id` to `tokio-cron-scheduler`'s own internal
-    /// job `Uuid` (returned by `inner.add`, otherwise discarded) — needed so
-    /// `update_job`/`remove_job` can find and unregister the *live* cron
-    /// job. Without this, editing or deleting a schedule only ever touched
-    /// the DB row: the old cron kept firing (or kept firing after being
-    /// disabled) until the next full daemon restart.
+    /// `schedule_jobs.id` -> `tokio-cron-scheduler`'s own job `Uuid`, so
+    /// `update`/`remove` can unregister the *live* cron job. Without this,
+    /// editing or deleting a schedule only ever touched the DB row and the old
+    /// cron kept firing until the next restart.
     job_uuids: DashMap<String, uuid::Uuid>,
+    /// `schedule_jobs.id` -> the timer task driving an `interval`/`once`
+    /// schedule, for the same reason.
+    timers: DashMap<String, tokio::task::AbortHandle>,
 }
 
 /// Jobs currently executing, keyed by `schedule_jobs.id`.
 ///
 /// `tokio-cron-scheduler` spawns a fresh task for every due tick and derives
 /// the next tick from the cron expression, never from when the previous run
-/// finished. A `*/5` schedule whose recipe takes ten minutes therefore piled
-/// up overlapping executions: concurrent provider spend, interleaved
-/// `execution_history` rows, and two agents writing the same recipe's state.
+/// finished. A `*/5` schedule whose run takes ten minutes therefore piled up
+/// overlapping executions: concurrent provider spend, interleaved
+/// `execution_history` rows, and two agents writing the same transcript.
 ///
 /// Process-wide rather than a `Scheduler` field because `run_now` (the manual
-/// trigger route) calls `execute_job` directly, and a manual run must contend
-/// with the cron run for the same slot.
+/// trigger route) starts runs without the scheduler mutex, and a manual run
+/// must contend with a timed run for the same slot.
 static JOBS_IN_FLIGHT: once_cell::sync::Lazy<DashMap<String, ()>> =
     once_cell::sync::Lazy::new(DashMap::new);
 
@@ -84,6 +100,74 @@ fn to_seconds_cron(cron: &str) -> String {
     }
 }
 
+fn parse_time(s: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(s).ok().map(|d| d.with_timezone(&Utc))
+}
+
+/// Check a spec for the fields its kind needs, and fill in what the daemon
+/// derives: `next_run_at` for a new timer schedule (or one whose timing
+/// changed), and `''` for the cron column of the timer kinds.
+///
+/// `previous` is the schedule being edited, if any: when the timing fields
+/// are unchanged its `next_run_at` is kept, so renaming a schedule or editing
+/// its prompt does not push its next run back.
+pub fn normalize_spec(spec: &mut ScheduleSpec, previous: Option<&ScheduleRow>) -> Result<(), SchedulerError> {
+    let bad = |m: &str| Err(SchedulerError::Cron(m.to_string()));
+    if spec.name.trim().is_empty() || spec.prompt.trim().is_empty() {
+        return bad("name and prompt are required");
+    }
+    if !(10..=MAX_HITL_TIMEOUT_SECS).contains(&spec.hitl_timeout_secs) {
+        return bad("hitl_timeout_secs must be between 10 and 3600");
+    }
+    let timing_changed = previous.is_none_or(|p| {
+        p.kind != spec.kind
+            || p.cron != spec.cron
+            || p.interval_secs != spec.interval_secs
+            || p.run_at != spec.run_at
+            || (p.enabled == 0 && spec.enabled)
+    });
+    match spec.kind.as_str() {
+        KIND_CRON => {
+            if spec.cron.trim().is_empty() {
+                return bad("a cron schedule needs `cron`");
+            }
+            // Validate without registering: an invalid expression must fail
+            // the request before anything is persisted.
+            Job::new_async(to_seconds_cron(&spec.cron).as_str(), |_, _| Box::pin(async {}))
+                .map_err(|e| SchedulerError::Cron(e.to_string()))?;
+            spec.interval_secs = None;
+            spec.run_at = None;
+            spec.next_run_at = None;
+        }
+        KIND_INTERVAL => {
+            let Some(secs) = spec.interval_secs else {
+                return bad("an interval schedule needs `interval_secs`");
+            };
+            if secs < MIN_INTERVAL_SECS {
+                return bad("interval_secs must be at least 60");
+            }
+            spec.cron = String::new();
+            spec.run_at = None;
+            if timing_changed || spec.next_run_at.is_none() {
+                spec.next_run_at = Some((Utc::now() + chrono::Duration::seconds(secs)).to_rfc3339());
+            }
+        }
+        KIND_ONCE => {
+            let Some(at) = spec.run_at.as_deref().and_then(parse_time) else {
+                return bad("a once schedule needs `run_at` as an RFC 3339 time");
+            };
+            spec.cron = String::new();
+            spec.interval_secs = None;
+            spec.run_at = Some(at.to_rfc3339());
+            if timing_changed || spec.next_run_at.is_none() {
+                spec.next_run_at = Some(at.to_rfc3339());
+            }
+        }
+        other => return bad(&format!("unknown schedule kind {other:?}")),
+    }
+    Ok(())
+}
+
 impl Scheduler {
     pub async fn new(db: SqlitePool, agent: Arc<Agent>) -> Result<Self, SchedulerError> {
         let inner = JobScheduler::new()
@@ -94,10 +178,13 @@ impl Scheduler {
             agent,
             inner,
             job_uuids: DashMap::new(),
+            timers: DashMap::new(),
         })
     }
 
-    /// Load every `enabled` job and register it, then start the scheduler.
+    /// Load every `enabled` schedule and register it, then start the
+    /// scheduler. Timer schedules whose `next_run_at` passed while the daemon
+    /// was down run straight away.
     pub async fn start(&mut self) -> Result<(), SchedulerError> {
         let jobs = schedules::list_schedules(&self.db)
             .await
@@ -106,7 +193,7 @@ impl Scheduler {
         let count = enabled.len();
 
         for job in &enabled {
-            if let Err(e) = self.register_cron_job(&job.id, &job.cron).await {
+            if let Err(e) = self.register(job).await {
                 tracing::warn!("Failed to schedule job {}: {}", job.id, e);
             }
         }
@@ -117,6 +204,17 @@ impl Scheduler {
             .map_err(|e| SchedulerError::Cron(e.to_string()))?;
         tracing::info!("Scheduler started with {count} jobs");
         Ok(())
+    }
+
+    /// Register a schedule's live trigger according to its kind.
+    async fn register(&mut self, row: &ScheduleRow) -> Result<(), SchedulerError> {
+        match row.kind.as_str() {
+            KIND_INTERVAL | KIND_ONCE => {
+                self.spawn_timer(&row.id);
+                Ok(())
+            }
+            _ => self.register_cron_job(&row.id, &row.cron).await,
+        }
     }
 
     async fn register_cron_job(&mut self, job_id: &str, cron: &str) -> Result<(), SchedulerError> {
@@ -144,29 +242,86 @@ impl Scheduler {
         Ok(())
     }
 
-    /// Unregister `job_id`'s live cron job, if one is currently registered.
-    /// A no-op if it was never registered (e.g. it was already disabled).
-    async fn unregister_cron_job(&mut self, job_id: &str) {
+    /// Drive an `interval`/`once` schedule: sleep until its persisted
+    /// `next_run_at`, run, then record the next due time (or, for `once`,
+    /// disable the schedule). Re-reads the row each lap, so a schedule deleted
+    /// or disabled out from under the task simply ends it.
+    fn spawn_timer(&self, job_id: &str) {
+        let db = self.db.clone();
+        let agent = self.agent.clone();
+        let id = job_id.to_string();
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok(Some(row)) = schedules::get_schedule(&db, &id).await else {
+                    return;
+                };
+                if row.enabled == 0 {
+                    return;
+                }
+                let due = row
+                    .next_run_at
+                    .as_deref()
+                    .and_then(parse_time)
+                    .unwrap_or_else(Utc::now);
+                if let Ok(wait) = (due - Utc::now()).to_std() {
+                    tokio::time::sleep(wait).await;
+                }
+                execute_job(&db, &agent, &id).await;
+                let (next, still_enabled) = match row.kind.as_str() {
+                    KIND_INTERVAL => {
+                        let secs = row.interval_secs.unwrap_or(MIN_INTERVAL_SECS).max(MIN_INTERVAL_SECS);
+                        // From now, not from `due`: a daemon that was down for
+                        // a day catches up once, not once per missed interval.
+                        (Some((Utc::now() + chrono::Duration::seconds(secs)).to_rfc3339()), true)
+                    }
+                    _ => (None, false),
+                };
+                if let Err(e) = schedules::set_next_run(&db, &id, next.as_deref(), still_enabled).await {
+                    tracing::error!("schedule {id}: could not record its next run: {e}");
+                    return;
+                }
+                if !still_enabled {
+                    return;
+                }
+            }
+        });
+        if let Some(old) = self.timers.insert(job_id.to_string(), task.abort_handle()) {
+            old.abort();
+        }
+    }
+
+    /// Unregister `job_id`'s live trigger (cron job or timer task), if any.
+    async fn unregister(&mut self, job_id: &str) {
         if let Some((_, uuid)) = self.job_uuids.remove(job_id) {
             if let Err(e) = self.inner.remove(&uuid).await {
                 tracing::warn!("Failed to unregister cron job {job_id}: {e}");
             }
         }
+        if let Some((_, timer)) = self.timers.remove(job_id) {
+            timer.abort();
+        }
     }
 
-    /// Apply a cron/enabled edit to a schedule row *and* the live scheduler
-    /// — always unregisters the old cron job first (if any), then
-    /// re-registers with the new cron only if the job ends up enabled.
-    /// Matches Python's real mechanism (APScheduler `add_job`/remove on
-    /// edit), not just a DB write.
-    ///
-    /// Ordering matters: the live cron is validated + registered *before* the
-    /// DB is persisted, so an invalid cron (which `register_cron_job` rejects
-    /// via `Job::new_async`/`inner.add`) leaves the row untouched and the old
-    /// job still firing — previously the DB was updated first, then the
-    /// register failed, leaving the row pointing at a cron that would never
-    /// fire until the next restart. `enabled=false` needs no live
-    /// registration; the old job is simply unregistered.
+    /// When a schedule next fires: `next_run_at` for the timer kinds, the
+    /// cron engine's own next tick for cron. `None` when disabled.
+    pub async fn next_run(&mut self, row: &ScheduleRow) -> Option<String> {
+        if row.enabled == 0 {
+            return None;
+        }
+        if row.kind != KIND_CRON {
+            return row.next_run_at.clone();
+        }
+        let uuid = *self.job_uuids.get(&row.id)?;
+        self.inner
+            .next_tick_for_job(uuid)
+            .await
+            .ok()
+            .flatten()
+            .map(|t| t.to_rfc3339())
+    }
+
+    /// Apply a cron/enabled edit (the original, narrower update). Kept for
+    /// existing callers; it goes through [`Self::update_schedule`].
     pub async fn update_job(
         &mut self,
         job_id: &str,
@@ -177,77 +332,66 @@ impl Scheduler {
             .await
             .map_err(SchedulerError::from)?
             .ok_or_else(|| SchedulerError::NotFound(job_id.to_string()))?;
-
-        let new_enabled = enabled.unwrap_or(current.enabled != 0);
-        let new_cron = cron
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| current.cron.clone());
-
-        if new_enabled {
-            // Take the existing registration mapping out first (without
-            // touching the still-running scheduler job) so the new one can
-            // take over its key...
-            let old_uuid = self.job_uuids.remove(job_id).map(|(_, uuid)| uuid);
-            match self.register_cron_job(job_id, &new_cron).await {
-                Ok(()) => {
-                    // New job proven registerable — now it is safe to retire
-                    // the old one. Sequential `inner.add` then `inner.remove`
-                    // means there's never a gap where the job isn't firing.
-                    if let Some(old_uuid) = old_uuid {
-                        if let Err(e) = self.inner.remove(&old_uuid).await {
-                            tracing::warn!("Failed to unregister old cron job {job_id}: {e}");
-                        }
-                    }
-                }
-                Err(e) => {
-                    // Register failed — restore the old mapping (the old live
-                    // job was never removed) and return, leaving DB + live
-                    // scheduler exactly as they were.
-                    if let Some(old_uuid) = old_uuid {
-                        self.job_uuids.insert(job_id.to_string(), old_uuid);
-                    }
-                    return Err(e);
-                }
-            }
-        } else {
-            self.unregister_cron_job(job_id).await;
+        let mut spec = ScheduleSpec::from_row(&current);
+        if let Some(c) = cron {
+            spec.cron = c.to_string();
         }
+        if let Some(e) = enabled {
+            spec.enabled = e;
+        }
+        self.update_schedule(job_id, spec).await
+    }
 
-        // Persist last. The live cron was already re-registered above (to
-        // validate it); if the DB write now fails, roll that live change back
-        // so DB and the running scheduler don't diverge — the row still
-        // advertises the OLD cron while a NEW live job would otherwise keep
-        // firing against it until restart (mirror of add_job's rollback).
-        if let Err(e) =
-            schedules::update_schedule(&self.db, job_id, cron, enabled.map(|b| b as i32)).await
-        {
-            // Revert the live registration to match the still-persisted row.
-            // Only re-register when the job was previously ENABLED — the old
-            // code keyed this on `new_enabled`, so a failed enable of a
-            // previously-disabled job left a live cron firing a row that
-            // still says `enabled = 0`.
-            self.unregister_cron_job(job_id).await;
+    /// Replace a schedule's definition *and* its live trigger.
+    ///
+    /// The spec is validated before anything changes, so an invalid edit
+    /// leaves both the row and the running trigger exactly as they were.
+    /// Then: persist, drop the old trigger, register the new one if enabled.
+    /// If registering fails after the row was written (which validation makes
+    /// very unlikely), the old row is restored and re-registered, so the DB
+    /// and the live scheduler never disagree.
+    pub async fn update_schedule(
+        &mut self,
+        job_id: &str,
+        mut spec: ScheduleSpec,
+    ) -> Result<(), SchedulerError> {
+        let current = schedules::get_schedule(&self.db, job_id)
+            .await
+            .map_err(SchedulerError::from)?
+            .ok_or_else(|| SchedulerError::NotFound(job_id.to_string()))?;
+        normalize_spec(&mut spec, Some(&current))?;
+
+        schedules::update_schedule_spec(&self.db, job_id, &spec)
+            .await
+            .map_err(SchedulerError::from)?;
+        self.unregister(job_id).await;
+        if !spec.enabled {
+            return Ok(());
+        }
+        let updated = schedules::get_schedule(&self.db, job_id)
+            .await
+            .map_err(SchedulerError::from)?
+            .ok_or_else(|| SchedulerError::NotFound(job_id.to_string()))?;
+        if let Err(e) = self.register(&updated).await {
+            let _ = schedules::update_schedule_spec(&self.db, job_id, &ScheduleSpec::from_row(&current)).await;
             if current.enabled != 0 {
-                let _ = self.register_cron_job(job_id, &current.cron).await;
+                let _ = self.register(&current).await;
             }
-            return Err(SchedulerError::from(e));
+            return Err(e);
         }
         Ok(())
     }
 
-    /// Delete a schedule row *and* unregister its live cron job — without
-    /// this, a deleted job's cron trigger keeps firing (as a harmless no-op,
-    /// since `execute_job` re-fetches the row and finds it gone, but it
-    /// never stops trying, leaking a registration for the daemon's lifetime).
+    /// Delete a schedule row *and* unregister its live trigger.
     pub async fn remove_job(&mut self, job_id: &str) -> Result<u64, SchedulerError> {
-        self.unregister_cron_job(job_id).await;
+        self.unregister(job_id).await;
         schedules::delete_schedule(&self.db, job_id)
             .await
             .map_err(SchedulerError::from)
     }
 
-    /// Create a schedule row and (if enabled) register its cron job
-    /// immediately, without requiring a scheduler restart.
+    /// Create a plain cron schedule (the original, narrower create). Kept for
+    /// existing callers; it goes through [`Self::add_schedule`].
     pub async fn add_job(
         &mut self,
         name: &str,
@@ -256,51 +400,52 @@ impl Scheduler {
         enabled: bool,
         app_id: &str,
     ) -> Result<String, SchedulerError> {
-        // Full UUIDs, not the old 8-char truncation: at 8 hex chars a
-        // collision was realistic, and a colliding id would overwrite the
-        // existing job's live registration mapping in `register_cron_job`
-        // (and then unregister THAT job on rollback). The existence check
-        // below is the belt-and-suspenders half of the same fix.
-        let id = uuid::Uuid::new_v4().to_string();
-        if schedules::get_schedule(&self.db, &id)
-            .await
-            .map_err(SchedulerError::from)?
-            .is_some()
-        {
-            return Err(SchedulerError::Cron(format!(
-                "schedule id collision, retry: {id}"
-            )));
-        }
-        // Validate + register the live cron BEFORE persisting, so an invalid
-        // cron returns an error with no half-written DB row. Under
-        // `enabled=false` there's nothing to register.
-        if enabled {
-            self.register_cron_job(&id, cron).await?;
-        }
-        if let Err(e) = schedules::create_schedule(
-            &self.db,
-            &id,
-            name,
-            cron,
-            prompt,
-            enabled as i32,
+        self.add_schedule(
             app_id,
+            ScheduleSpec {
+                name: name.to_string(),
+                prompt: prompt.to_string(),
+                kind: KIND_CRON.to_string(),
+                cron: cron.to_string(),
+                hitl_timeout_secs: 600,
+                enabled,
+                ..Default::default()
+            },
         )
         .await
-        {
-            // Roll back the live registration — the DB insert failed, so a
-            // live job with no row would fire forever against nothing.
-            self.unregister_cron_job(&id).await;
-            return Err(SchedulerError::from(e));
+    }
+
+    /// Create a schedule of any kind and (if enabled) register its trigger
+    /// immediately, without requiring a scheduler restart.
+    pub async fn add_schedule(
+        &mut self,
+        app_id: &str,
+        mut spec: ScheduleSpec,
+    ) -> Result<String, SchedulerError> {
+        normalize_spec(&mut spec, None)?;
+        // Full UUIDs: at the old 8 hex chars a collision was realistic, and a
+        // colliding id would overwrite another job's live registration.
+        let id = uuid::Uuid::new_v4().to_string();
+        schedules::create_schedule_spec(&self.db, &id, app_id, &spec)
+            .await
+            .map_err(SchedulerError::from)?;
+        if spec.enabled {
+            let row = schedules::get_schedule(&self.db, &id)
+                .await
+                .map_err(SchedulerError::from)?
+                .ok_or_else(|| SchedulerError::NotFound(id.clone()))?;
+            if let Err(e) = self.register(&row).await {
+                // A row with no live trigger would silently never fire.
+                let _ = schedules::delete_schedule(&self.db, &id).await;
+                return Err(e);
+            }
         }
         Ok(id)
     }
 
-    /// Execute one scheduled job: temp session + `execution_history`
-    /// bookkeeping, then the turn, using this scheduler's own DB + agent
-    /// handles. Returns `false` (not an error) when the job is
-    /// genuinely missing, so a caller can distinguish 404 from a real
-    /// storage failure (500). Used by `tests/scheduler_and_recipes.rs`.
+    /// Execute one scheduled job to completion. Returns `false` (not an
+    /// error) when the job is genuinely missing, so a caller can distinguish
+    /// 404 from a real storage failure (500).
     pub async fn run_job(&self, job_id: &str) -> Result<bool, SchedulerError> {
         let job = schedules::get_schedule(&self.db, job_id)
             .await
@@ -322,6 +467,10 @@ impl Scheduler {
     }
 
     pub async fn stop(&mut self) {
+        for entry in self.timers.iter() {
+            entry.value().abort();
+        }
+        self.timers.clear();
         if let Err(e) = self.inner.shutdown().await {
             tracing::warn!("Scheduler shutdown error: {e}");
         }
@@ -329,18 +478,51 @@ impl Scheduler {
     }
 }
 
-/// Execute one scheduled job: temp session + `execution_history` bookkeeping,
-/// then the turn. `pub(crate)` so the `run_now` route can execute a job using
-/// its own `db`/`agent` handles WITHOUT holding the scheduler mutex — running
-/// a multi-minute turn while holding it serialized every other
-/// `POST/PATCH/DELETE /api/schedules*` call behind the one job.
+/// Why a manual run could not start.
+#[derive(Debug)]
+pub enum StartRunError {
+    NotFound,
+    Disabled,
+    AlreadyRunning,
+    Storage(String),
+}
+
+/// Start a run of `job_id` now and return its session id without waiting for
+/// it to finish -- the route behind "Run now". The run itself continues in the
+/// background exactly as a timed one would.
+pub async fn start_job_now(
+    db: &SqlitePool,
+    agent: &Arc<Agent>,
+    job_id: &str,
+) -> Result<String, StartRunError> {
+    let guard = InFlightGuard::claim(job_id).ok_or(StartRunError::AlreadyRunning)?;
+    let job = match schedules::get_schedule(db, job_id).await {
+        Ok(Some(job)) => job,
+        Ok(None) => return Err(StartRunError::NotFound),
+        Err(e) => return Err(StartRunError::Storage(e.to_string())),
+    };
+    if job.enabled == 0 {
+        return Err(StartRunError::Disabled);
+    }
+    let run = prepare_run(db, agent, &job)
+        .await
+        .map_err(StartRunError::Storage)?;
+    let session_id = run.session_id.clone();
+    let db = db.clone();
+    let agent = agent.clone();
+    tokio::spawn(async move {
+        let _guard = guard;
+        finish_run(&db, &agent, &job, run).await;
+    });
+    Ok(session_id)
+}
+
+/// Execute one scheduled job: run session + `execution_history` bookkeeping,
+/// then the turn. Used by the cron engine, the timer tasks and `run_job`.
 ///
-/// The session is no longer a throwaway. A recipe run produced its output in a
-/// session of its own, and this one existed only to anchor the audit row, so it
-/// was deleted afterwards. Now the turn runs *here*, and this session is the
-/// output: it is kept on both paths — a failed run's transcript is the only
-/// record of why it failed — and ages out through the same retention sweep as
-/// any other session.
+/// The session is kept whatever happens: it is the run's output, and a failed
+/// run's transcript is the only record of why it failed. It ages out through
+/// the same retention sweep as any other session.
 pub(crate) async fn execute_job(db: &SqlitePool, agent: &Arc<Agent>, job_id: &str) {
     // Held for the whole execution; dropped on every return path below.
     let Some(_in_flight) = InFlightGuard::claim(job_id) else {
@@ -355,88 +537,213 @@ pub(crate) async fn execute_job(db: &SqlitePool, agent: &Arc<Agent>, job_id: &st
         return;
     };
 
-    // Never run a job whose row says `enabled = 0`. The live cron is
-    // (un)registered to match the row, but the two can diverge (an
-    // unregister that only partially failed, a rollback window in
-    // `update_job`) — and a disabled job must not run regardless of what
-    // fired. This also covers `run_now`: a manual trigger of a disabled
-    // schedule is a no-op rather than a surprise run.
+    // Never run a job whose row says `enabled = 0`. The live trigger is
+    // (un)registered to match the row, but the two can diverge -- and a
+    // disabled job must not run regardless of what fired.
     if job.enabled == 0 {
         tracing::debug!("scheduled job {job_id}: skipping, schedule is disabled");
         return;
     }
 
+    match prepare_run(db, agent, &job).await {
+        Ok(run) => finish_run(db, agent, &job, run).await,
+        Err(e) => tracing::error!("scheduled job {job_id}: {e}"),
+    }
+}
+
+/// A run whose session and audit row exist but whose turn has not started.
+struct PreparedRun {
+    exec_id: String,
+    session_id: String,
+}
+
+fn schedule_event(job: &ScheduleRow, session_id: &str, outcome: &str, error: Option<String>) -> SSEEvent {
+    SSEEvent {
+        event_type: SSEEventType::ScheduleRun,
+        schedule_id: Some(job.id.clone()),
+        session_id: Some(session_id.to_string()),
+        content: Some(outcome.to_string()),
+        tool_name: Some(job.name.clone()),
+        error_message: error,
+        ..Default::default()
+    }
+}
+
+/// Create the run's session -- owned by the schedule's app and configured the
+/// way the schedule says (provider pin, persona, approval wait) -- and its
+/// `execution_history` row, and announce that the run started.
+async fn prepare_run(db: &SqlitePool, agent: &Arc<Agent>, job: &ScheduleRow) -> Result<PreparedRun, String> {
     let exec_id = uuid::Uuid::new_v4().simple().to_string();
     let session_id = format!("job_{exec_id}");
     // Owned by the app that owns the schedule: an ownerless session is
     // unreachable by every scoped accessor in `storage::sessions`, so the run
     // would produce a transcript nobody could read.
-    if let Err(e) = sessions::create_session_for_app(
-        db,
-        &session_id,
-        &format!("scheduled: {}", job.name),
-        &job.app_id,
-    )
-    .await
-    {
-        // Previously `is_err() { return }` — a create failure (e.g. a rare
-        // exec_id collision on the PK) silently dropped the whole tick with
-        // no trace.
-        tracing::error!("scheduled job {job_id}: failed to create temp session: {e}");
-        return;
-    }
+    sessions::create_session_for_app(db, &session_id, &format!("scheduled: {}", job.name), &job.app_id)
+        .await
+        .map_err(|e| format!("failed to create the run session: {e}"))?;
     let _ = sessions::update_session_status(db, &session_id, "idle").await;
-    if let Err(e) =
-        execution::insert_execution(db, &exec_id, &session_id, "schedule", Some(job_id)).await
-    {
-        tracing::error!("scheduled job {job_id}: failed to insert execution row: {e}");
+
+    let mut meta = json!({
+        "schedule_id": job.id,
+        // Nobody is watching a scheduled run by default, so it waits minutes
+        // for an approval, not the hour an interactive session gets.
+        "hitl_timeout_secs": job.hitl_timeout_secs,
+    });
+    if let Some(provider) = job.provider_id.as_deref().filter(|p| !p.is_empty()) {
+        meta["provider"] = json!(provider);
+        meta["model"] = json!(job.model.clone().unwrap_or_default());
+    }
+    if let Some(prompt) = job.system_prompt.as_deref().filter(|p| !p.trim().is_empty()) {
+        meta["persona_override"] = json!(prompt);
+    }
+    if let Err(e) = sessions::update_session_config(db, &session_id, &meta.to_string()).await {
         let _ = sessions::delete_session(db, &session_id).await;
-        return;
+        return Err(format!("failed to configure the run session: {e}"));
     }
 
+    if let Err(e) = execution::insert_execution(db, &exec_id, &session_id, "schedule", Some(&job.id)).await {
+        let _ = sessions::delete_session(db, &session_id).await;
+        return Err(format!("failed to insert the execution row: {e}"));
+    }
+    let _ = schedules::record_last_run(db, &job.id, "running", &session_id).await;
+    agent
+        .app_events()
+        .publish(&job.app_id, schedule_event(job, &session_id, "started", None));
+    Ok(PreparedRun { exec_id, session_id })
+}
+
+/// Run the turn and record how it went: the audit row, the schedule's
+/// last-run summary, and a `schedule_run` event for the owning app.
+async fn finish_run(db: &SqlitePool, agent: &Arc<Agent>, job: &ScheduleRow, run: PreparedRun) {
+    let PreparedRun { exec_id, session_id } = run;
     // Background priority: a scheduled run must never put a user's own message
     // behind it.
-    match agent
-        .run_turn_and_wait(
-            &session_id,
-            &job.prompt,
-            crate::provider::queue::Priority::Background,
-        )
-        .await
+    let outcome = agent
+        .run_turn_and_wait_outcome(&session_id, &job.prompt, crate::provider::queue::Priority::Background)
+        .await;
+    let (status, event_outcome, error) = match &outcome {
+        Ok(o) if o.approvals_timed_out > 0 => (
+            "completed_with_denied_tools",
+            "denied_by_timeout",
+            Some(format!(
+                "{} tool call(s) were skipped because nobody approved them in time",
+                o.approvals_timed_out
+            )),
+        ),
+        Ok(_) => ("completed", "finished", None),
+        Err(msg) => ("failed", "failed", Some(msg.clone())),
+    };
+    if status == "failed" {
+        tracing::error!("Scheduled job {} failed: {}", job.id, error.as_deref().unwrap_or(""));
+    }
+    // `execution_history.status` keeps its original vocabulary; the finer
+    // "completed with denied tools" lives on the schedule row and the event.
+    let exec_status = if status == "failed" { "failed" } else { "completed" };
+    if let Err(e) =
+        execution::update_execution_status(db, &exec_id, exec_status, None, error.as_deref()).await
     {
-        Ok(_notices) => {
-            if let Err(e) = sqlx::query(
-                "UPDATE execution_history SET status = 'completed', completed_at = CURRENT_TIMESTAMP WHERE id = ?",
-            )
-            .bind(&exec_id)
-            .execute(db)
-            .await
-            {
-                // A failed completion-update leaves the row `running` forever,
-                // which used to happen silently.
-                tracing::error!(
-                    "scheduled job {job_id}: failed to mark execution {exec_id} completed: {e}"
-                );
-            }
+        // A failed update leaves the row `running` forever; say so.
+        tracing::error!("scheduled job {}: failed to mark execution {exec_id} {exec_status}: {e}", job.id);
+    }
+    let _ = schedules::record_last_run(db, &job.id, status, &session_id).await;
+    agent
+        .app_events()
+        .publish(&job.app_id, schedule_event(job, &session_id, event_outcome, error));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec(kind: &str) -> ScheduleSpec {
+        ScheduleSpec {
+            name: "n".into(),
+            prompt: "p".into(),
+            kind: kind.into(),
+            hitl_timeout_secs: 600,
+            enabled: true,
+            ..Default::default()
         }
-        Err(msg) => {
-            tracing::error!("Scheduled job {job_id} failed: {msg}");
-            // Recorded rather than deleted. `run_turn_and_wait` propagates the
-            // turn's outcome, so this arm also fires for provider-failed turns,
-            // and those must be visible as `failed` — every such run used to be
-            // misrecorded as `completed`.
-            if let Err(e) = sqlx::query(
-                "UPDATE execution_history SET status = 'failed', error_message = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?",
-            )
-            .bind(&msg)
-            .bind(&exec_id)
-            .execute(db)
-            .await
-            {
-                tracing::error!(
-                    "scheduled job {job_id}: failed to mark execution {exec_id} failed: {e}"
-                );
-            }
-        }
+    }
+
+    #[test]
+    fn each_kind_requires_its_own_timing_field() {
+        assert!(normalize_spec(&mut spec(KIND_CRON), None).is_err());
+        assert!(normalize_spec(&mut spec(KIND_INTERVAL), None).is_err());
+        assert!(normalize_spec(&mut spec(KIND_ONCE), None).is_err());
+        assert!(normalize_spec(&mut spec("hourly"), None).is_err());
+
+        let mut s = ScheduleSpec { cron: "0 9 * * *".into(), ..spec(KIND_CRON) };
+        assert!(normalize_spec(&mut s, None).is_ok());
+        let mut s = ScheduleSpec { cron: "not a cron".into(), ..spec(KIND_CRON) };
+        assert!(normalize_spec(&mut s, None).is_err());
+    }
+
+    #[test]
+    fn an_interval_gets_a_next_run_and_a_floor() {
+        let mut s = ScheduleSpec { interval_secs: Some(30), ..spec(KIND_INTERVAL) };
+        assert!(normalize_spec(&mut s, None).is_err(), "sub-minute intervals are refused");
+        let mut s = ScheduleSpec { interval_secs: Some(3600), ..spec(KIND_INTERVAL) };
+        normalize_spec(&mut s, None).unwrap();
+        let next = parse_time(s.next_run_at.as_deref().unwrap()).unwrap();
+        let ahead = (next - Utc::now()).num_seconds();
+        assert!((3590..=3600).contains(&ahead), "{ahead}");
+        assert_eq!(s.cron, "");
+    }
+
+    #[test]
+    fn a_once_schedule_is_due_at_its_run_at() {
+        let at = "2031-01-02T03:04:05Z";
+        let mut s = ScheduleSpec { run_at: Some(at.into()), ..spec(KIND_ONCE) };
+        normalize_spec(&mut s, None).unwrap();
+        assert_eq!(
+            parse_time(s.next_run_at.as_deref().unwrap()),
+            parse_time(at)
+        );
+        let mut bad = ScheduleSpec { run_at: Some("tomorrow".into()), ..spec(KIND_ONCE) };
+        assert!(normalize_spec(&mut bad, None).is_err());
+    }
+
+    /// Editing a schedule's name or prompt must not push its next run back --
+    /// only a change to its timing (or re-enabling it) recomputes it.
+    #[test]
+    fn an_edit_that_leaves_the_timing_alone_keeps_the_next_run() {
+        let kept = "2031-05-05T00:00:00+00:00".to_string();
+        let previous = ScheduleRow {
+            id: "s".into(),
+            name: "old".into(),
+            cron: String::new(),
+            prompt: "p".into(),
+            enabled: 1,
+            created_at: None,
+            updated_at: None,
+            app_id: "a".into(),
+            kind: KIND_INTERVAL.into(),
+            interval_secs: Some(3600),
+            run_at: None,
+            next_run_at: Some(kept.clone()),
+            provider_id: None,
+            model: None,
+            system_prompt: None,
+            hitl_timeout_secs: 600,
+            last_run_at: None,
+            last_status: None,
+            last_session_id: None,
+        };
+        let mut renamed = ScheduleSpec { name: "new".into(), ..ScheduleSpec::from_row(&previous) };
+        normalize_spec(&mut renamed, Some(&previous)).unwrap();
+        assert_eq!(renamed.next_run_at.as_deref(), Some(kept.as_str()));
+
+        let mut retimed = ScheduleSpec { interval_secs: Some(7200), ..ScheduleSpec::from_row(&previous) };
+        normalize_spec(&mut retimed, Some(&previous)).unwrap();
+        assert_ne!(retimed.next_run_at.as_deref(), Some(kept.as_str()));
+    }
+
+    #[test]
+    fn the_approval_wait_is_bounded() {
+        let mut s = ScheduleSpec { cron: "0 9 * * *".into(), hitl_timeout_secs: 5, ..spec(KIND_CRON) };
+        assert!(normalize_spec(&mut s, None).is_err());
+        let mut s = ScheduleSpec { cron: "0 9 * * *".into(), hitl_timeout_secs: 7200, ..spec(KIND_CRON) };
+        assert!(normalize_spec(&mut s, None).is_err());
     }
 }

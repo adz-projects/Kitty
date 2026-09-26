@@ -58,6 +58,12 @@ pub struct CreateJobRequest {
     pub model: Option<String>,
     #[serde(default)]
     pub name: Option<String>,
+    /// How long this job waits for a tool approval before continuing without
+    /// the tool (10..=3600 s). Omitted, the hour-long default applies -- a job
+    /// is usually unattended, so a caller that knows nobody is watching
+    /// should set this.
+    #[serde(default)]
+    pub hitl_timeout_secs: Option<u64>,
 }
 
 /// `POST /api/jobs`
@@ -91,6 +97,9 @@ pub async fn create(
                 return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
             }
             let mut meta = json!({ "mode": "chat" });
+            if let Some(secs) = body.hitl_timeout_secs {
+                meta["hitl_timeout_secs"] = json!(secs);
+            }
             if let Some(p) = body.provider.as_deref().filter(|p| !p.is_empty()) {
                 meta["provider"] = json!(p);
                 if let Some(m) = body.model.as_deref().filter(|m| !m.is_empty()) {

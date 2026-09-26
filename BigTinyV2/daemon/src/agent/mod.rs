@@ -152,6 +152,16 @@ impl Drop for TurnCleanup {
     }
 }
 
+/// What a detached turn produced, beyond success or failure. See
+/// [`Agent::run_turn_and_wait_outcome`].
+#[derive(Debug, Clone, Default)]
+pub struct TurnOutcome {
+    /// Mid-run notices nobody else received (failovers, provider errors).
+    pub notices: Vec<String>,
+    /// Tool calls skipped because their approval timed out.
+    pub approvals_timed_out: usize,
+}
+
 impl Agent {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -394,6 +404,20 @@ impl Agent {
         user_message: &str,
         priority: crate::provider::queue::Priority,
     ) -> Result<Vec<String>, String> {
+        self.run_turn_and_wait_outcome(session_id, user_message, priority)
+            .await
+            .map(|o| o.notices)
+    }
+
+    /// [`Self::run_turn_and_wait`], also reporting how many tool calls went
+    /// unrun because nobody approved them in time -- which is how a scheduled
+    /// run tells "completed" from "completed, but skipped tools".
+    pub async fn run_turn_and_wait_outcome(
+        self: &Arc<Self>,
+        session_id: &str,
+        user_message: &str,
+        priority: crate::provider::queue::Priority,
+    ) -> Result<TurnOutcome, String> {
         let (tx, mut rx) = mpsc::unbounded_channel::<SSEEvent>();
         // The `tasks` entry keeps a sender so `cancel` can emit a terminal
         // frame to this turn's watcher, exactly as it does for `/send`.
@@ -403,7 +427,13 @@ impl Agent {
         let watcher = tokio::spawn(async move {
             let mut failure: Option<String> = None;
             let mut notices: Vec<String> = Vec::new();
+            let mut approvals_timed_out: usize = 0;
             while let Some(ev) = rx.recv().await {
+                if ev.event_type == SSEEventType::ToolFinish
+                    && ev.error_type.as_deref() == Some("approval_timeout")
+                {
+                    approvals_timed_out += 1;
+                }
                 // Frames a caller has to know about even when the turn
                 // succeeds. Collected rather than logged, because the caller is
                 // usually the orchestrator and its own caller is a model that
@@ -439,7 +469,7 @@ impl Agent {
                     break;
                 }
             }
-            (failure, notices)
+            (failure, notices, approvals_timed_out)
         });
         // Reserve the same per-session slot an interactive `/send` takes.
         //
@@ -485,9 +515,12 @@ impl Agent {
         // one `cancel` emits before aborting -- so waiting on it covers both
         // normal completion and cancellation without polling.
         match watcher.await {
-            Ok((Some(msg), _)) => Err(msg),
-            Ok((None, notices)) => Ok(notices),
-            Err(_) => Ok(Vec::new()),
+            Ok((Some(msg), _, _)) => Err(msg),
+            Ok((None, notices, approvals_timed_out)) => Ok(TurnOutcome {
+                notices,
+                approvals_timed_out,
+            }),
+            Err(_) => Ok(TurnOutcome::default()),
         }
     }
 

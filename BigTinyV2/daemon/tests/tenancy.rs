@@ -2261,3 +2261,84 @@ async fn always_allow_rules_are_listed_and_revoked_per_app() {
     assert!(get(APP_A).await.as_array().unwrap().is_empty());
     assert_eq!(get(APP_B).await.as_array().unwrap().len(), 1);
 }
+
+// ---------------------------------------------------------------------------
+// Schedules v2 over HTTP
+// ---------------------------------------------------------------------------
+
+async fn call(state: Arc<AppState>, method: Method, uri: &str, body: Option<Value>) -> (StatusCode, Value) {
+    let mut req = Request::builder().method(method).uri(uri);
+    let body = match body {
+        Some(b) => {
+            req = req.header("content-type", "application/json");
+            Body::from(b.to_string())
+        }
+        None => Body::empty(),
+    };
+    let resp = router_as(state, APP_A).oneshot(req.body(body).unwrap()).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+}
+
+/// The create/list/update/runs contract a client builds its UI on: timer
+/// kinds are accepted and validated, the list says when each schedule next
+/// fires, and an edit that leaves the timing alone keeps that time.
+#[tokio::test]
+async fn schedules_v2_create_list_update_and_runs() {
+    let state = test_state().await;
+
+    let (status, _) = call(
+        state.clone(),
+        Method::POST,
+        "/api/schedules",
+        Some(json!({"name": "fast", "prompt": "p", "kind": "interval", "interval_secs": 5})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "sub-minute intervals are refused");
+
+    let (status, body) = call(
+        state.clone(),
+        Method::POST,
+        "/api/schedules",
+        Some(json!({
+            "name": "hourly", "prompt": "check the inbox", "kind": "interval",
+            "interval_secs": 3600, "provider_id": "p1", "model": "m1", "enabled": true
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let id = body["id"].as_str().unwrap().to_string();
+
+    let (_, list) = call(state.clone(), Method::GET, "/api/schedules", None).await;
+    let row = &list["schedules"][0];
+    assert_eq!(row["kind"], "interval");
+    assert_eq!(row["provider_id"], "p1");
+    assert_eq!(row["hitl_timeout_secs"], 600);
+    let next = row["next_run_at"].as_str().expect("a next run time").to_string();
+
+    let (status, _) = call(
+        state.clone(),
+        Method::PATCH,
+        &format!("/api/schedules/{id}"),
+        Some(json!({"name": "renamed"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, list) = call(state.clone(), Method::GET, "/api/schedules", None).await;
+    assert_eq!(list["schedules"][0]["name"], "renamed");
+    assert_eq!(list["schedules"][0]["next_run_at"], next, "a rename must not move the next run");
+
+    let (status, runs) = call(state.clone(), Method::GET, &format!("/api/schedules/{id}/runs"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(runs["runs"].as_array().unwrap().is_empty());
+
+    // Run now answers at once with the run's session, even though the turn
+    // itself (no provider here) goes on to fail in the background.
+    let (status, started) =
+        call(state.clone(), Method::POST, &format!("/api/schedules/{id}/run_now"), None).await;
+    assert_eq!(status, StatusCode::OK, "{started}");
+    assert!(started["session_id"].as_str().unwrap().starts_with("job_"));
+
+    state.scheduler.lock().await.stop().await;
+}

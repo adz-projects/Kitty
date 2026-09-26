@@ -199,6 +199,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             patch(schedules::update_schedule).delete(schedules::delete_schedule),
         )
         .route("/api/schedules/{id}/run_now", post(schedules::run_now))
+        .route("/api/schedules/{id}/runs", get(schedules::runs))
         // Applied here rather than in `lib.rs::run()`'s middleware stack so
         // every consumer of `create_router` (including the route smoke
         // tests) gets the same ceiling.
