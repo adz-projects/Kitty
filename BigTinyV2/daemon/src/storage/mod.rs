@@ -1123,6 +1123,9 @@ mod tests {
                 token_count: Some(3),
                 content_format: Some("text".into()),
                 created_at: None,
+                reasoning: None,
+                provider_id: None,
+                model: None,
             },
             messages::MessageRow {
                 rowid: 0,
@@ -1135,6 +1138,9 @@ mod tests {
                 token_count: Some(4),
                 content_format: Some("text".into()),
                 created_at: None,
+                reasoning: None,
+                provider_id: None,
+                model: None,
             },
         ];
         messages::save_messages(&pool, "msg-session-1", &msgs)

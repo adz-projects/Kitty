@@ -275,6 +275,9 @@ mod tests {
             token_count: None,
             content_format: Some("text".into()),
             created_at: None,
+            reasoning: None,
+            provider_id: None,
+            model: None,
         }
     }
 

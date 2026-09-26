@@ -406,6 +406,15 @@ impl ContextBuilder {
                 .map(|s| s.to_string());
 
             let token_count = count_messages_tokens(std::slice::from_ref(msg));
+            // Per-turn bookkeeping the loop attaches to an assistant message
+            // (see `agent::loop_::annotate_assistant`). `_`-prefixed, so it
+            // never reaches a provider.
+            let private = |key: &str| {
+                msg.get(key)
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+            };
 
             rows.push(MessageRow {
                 rowid: 0,
@@ -418,6 +427,9 @@ impl ContextBuilder {
                 token_count: Some(token_count),
                 content_format,
                 created_at: None,
+                reasoning: private("_reasoning"),
+                provider_id: private("_provider_id"),
+                model: private("_model"),
             });
         }
 
@@ -608,6 +620,39 @@ mod tests {
     #[test]
     fn test_base_persona() {
         assert!(!BASE_PERSONA.is_empty());
+    }
+
+    /// An assistant message's reasoning and the provider/model that actually
+    /// produced it are persisted from the loop's `_`-prefixed annotations,
+    /// read back with the history, and never sent to a provider.
+    #[tokio::test]
+    async fn assistant_annotations_are_persisted_but_never_sent() {
+        let pool = test_pool().await;
+        sessions::create_session(&pool, "sess-1", "Test").await.unwrap();
+        let builder = ContextBuilder::new(pool.clone(), TokenManagementConfig::default(), 2);
+        let mut messages = vec![
+            json!({"role": "user", "content": "why?"}),
+            json!({
+                "role": "assistant",
+                "content": "because",
+                "_reasoning": "thinking it through",
+                "_provider_id": "prov-b",
+                "_model": "model-b",
+            }),
+        ];
+        builder.save_messages("sess-1", &mut messages).await.unwrap();
+
+        let rows = messages::get_messages_by_session(&pool, "sess-1").await.unwrap();
+        assert_eq!(rows[0].reasoning, None, "user rows carry none");
+        assert_eq!(rows[1].reasoning.as_deref(), Some("thinking it through"));
+        assert_eq!(rows[1].provider_id.as_deref(), Some("prov-b"));
+        assert_eq!(rows[1].model.as_deref(), Some("model-b"));
+
+        let wire = crate::provider::wire::sanitize_for_wire(&messages);
+        let body = serde_json::to_string(&*wire).unwrap();
+        for key in ["_reasoning", "_provider_id", "_model", "thinking it through"] {
+            assert!(!body.contains(key), "{key} reached the wire: {body}");
+        }
     }
 
     /// Regression for the bug where `save_messages` never wrote the
@@ -1019,6 +1064,9 @@ mod tests {
             token_count: Some(5),
             content_format: Some("text".into()),
             created_at: None,
+            reasoning: None,
+            provider_id: None,
+            model: None,
         };
         let msg = row_to_message(&row);
         assert_eq!(msg.get("role").and_then(|r| r.as_str()), Some("user"));

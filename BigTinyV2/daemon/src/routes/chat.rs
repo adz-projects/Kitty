@@ -614,8 +614,9 @@ pub async fn fork_session(
     for row in kept {
         let new_msg_id = uuid::Uuid::new_v4().to_string();
         let res = sqlx::query(
-            r#"INSERT INTO messages (id, session_id, role, content, tool_calls, tool_call_id, token_count, content_format)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)"#,
+            r#"INSERT INTO messages (id, session_id, role, content, tool_calls, tool_call_id, token_count, content_format,
+                                    reasoning, provider_id, model)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(&new_msg_id)
         .bind(&new_id)
@@ -625,6 +626,9 @@ pub async fn fork_session(
         .bind(&row.tool_call_id)
         .bind(row.token_count.unwrap_or(0))
         .bind(&row.content_format)
+        .bind(&row.reasoning)
+        .bind(&row.provider_id)
+        .bind(&row.model)
         .execute(&mut *tx)
         .await;
         match res {

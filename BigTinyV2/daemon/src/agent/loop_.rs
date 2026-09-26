@@ -314,6 +314,25 @@ async fn drain_structured_answer(
     (text, forced)
 }
 
+/// Attach what the persisted row should record about an assistant message --
+/// its reasoning and who actually produced it -- under `_`-prefixed keys,
+/// which `ContextBuilder::save_messages` reads and
+/// `provider::wire::sanitize_for_wire` strips before any request.
+fn annotate_assistant(mut msg: Value, timing: &TimingResult) -> Value {
+    if let Some(obj) = msg.as_object_mut() {
+        if !timing.reasoning_text.trim().is_empty() {
+            obj.insert("_reasoning".into(), Value::String(timing.reasoning_text.clone()));
+        }
+        if let Some(p) = &timing.provider_id {
+            obj.insert("_provider_id".into(), Value::String(p.clone()));
+        }
+        if let Some(m) = timing.model.as_ref().filter(|m| !m.is_empty()) {
+            obj.insert("_model".into(), Value::String(m.clone()));
+        }
+    }
+    msg
+}
+
 fn build_assistant_message(content: &str, turn_tool_calls: &[ToolCall]) -> Value {
     let mut assistant_msg = json!({
         "role": "assistant",
@@ -2874,7 +2893,13 @@ impl AgentLoop {
                     )
                     .await
                 {
-                    Ok(s) => self.process_stream(s, event_tx).await,
+                    // Stamp who actually answered: `provider_id`/`provider_model`
+                    // are this attempt's, i.e. after any failover.
+                    Ok(s) => self.process_stream(s, event_tx).await.map(|mut r| {
+                        r.4.provider_id = Some(provider_id.clone());
+                        r.4.model = Some(provider_model.clone());
+                        r
+                    }),
                     Err(e) => Err(e),
                 };
                 match outcome {
@@ -3207,7 +3232,10 @@ impl AgentLoop {
                     // the assistant message, silently discarding it: the
                     // model would have no memory of having tried, and its
                     // output was gone from history for good.
-                    messages.push(build_assistant_message(&content_buf, &turn_tool_calls));
+                    messages.push(annotate_assistant(
+                        build_assistant_message(&content_buf, &turn_tool_calls),
+                        &timing,
+                    ));
                     // Those persisted `tool_calls` are never executed here, so
                     // without results the next provider request carried
                     // dangling tool_calls (HTTP 400 on OpenAI-compatible
@@ -3259,7 +3287,10 @@ impl AgentLoop {
                     }
                     // Same fix as above: this path used to `break`/`continue`
                     // without ever appending the assistant message.
-                    messages.push(build_assistant_message(&content_buf, &turn_tool_calls));
+                    messages.push(annotate_assistant(
+                        build_assistant_message(&content_buf, &turn_tool_calls),
+                        &timing,
+                    ));
                     if let Err(e) = self.context.save_messages(session_id, &mut messages).await {
                         tracing::warn!("failed to save messages for session {session_id}: {e}");
                     }
@@ -3340,7 +3371,10 @@ impl AgentLoop {
             // Add assistant message (reached for a non-budget-check turn, or
             // a budget-check turn that approved more steps and still has
             // real tool calls left to execute this same turn).
-            messages.push(build_assistant_message(&content_buf, &turn_tool_calls));
+            messages.push(annotate_assistant(
+                build_assistant_message(&content_buf, &turn_tool_calls),
+                &timing,
+            ));
 
             if turn_tool_calls.is_empty() {
                 if finish_reason.as_deref() == Some("stop")
@@ -3963,6 +3997,7 @@ impl AgentLoop {
             .and_then(|v| v.as_i64())
             .map(|v| v as i32)
             .unwrap_or_else(|| tokens::count_text_tokens(&reasoning_buf));
+        timing.reasoning_text = reasoning_buf;
         timing.finalize_rate();
 
         Ok((content_buf, tool_calls, finish_reason, usage, timing))

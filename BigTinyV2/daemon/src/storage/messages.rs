@@ -51,6 +51,19 @@ pub struct MessageRow {
     pub token_count: Option<i32>,
     pub content_format: Option<String>,
     pub created_at: Option<DateTime<Utc>>,
+    /// The model's reasoning for an assistant message, when it streamed any.
+    /// `#[sqlx(default)]` on these three so queries that don't select them
+    /// (most internal ones don't need them) keep working unchanged.
+    #[sqlx(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+    /// The provider and model that actually produced an assistant message.
+    #[sqlx(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+    #[sqlx(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 /// SQLITE_BUSY (code 5) surfaces as `database is locked` / `database table
@@ -134,8 +147,9 @@ async fn save_messages_once(
         }
         if msg.role != "system" {
             sqlx::query(
-                r#"INSERT INTO messages (id, session_id, role, content, tool_calls, tool_call_id, token_count, content_format)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)"#
+                r#"INSERT INTO messages (id, session_id, role, content, tool_calls, tool_call_id, token_count, content_format,
+                                        reasoning, provider_id, model)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#
             )
             .bind(&msg.id)
             // Bind the *function parameter*, not `msg.session_id`: the dedupe
@@ -150,6 +164,9 @@ async fn save_messages_once(
             .bind(&msg.tool_call_id)
             .bind(msg.token_count.unwrap_or(0))
             .bind(&msg.content_format)
+            .bind(&msg.reasoning)
+            .bind(&msg.provider_id)
+            .bind(&msg.model)
             .execute(&mut *tx)
             .await?;
             inserted_this_batch.insert(msg.id.clone());
@@ -164,7 +181,8 @@ pub async fn get_messages_by_session(
     session_id: &str,
 ) -> Result<Vec<MessageRow>, StorageError> {
     let rows = sqlx::query_as::<_, MessageRow>(
-        r#"SELECT rowid, id, session_id, role, content, tool_calls, tool_call_id, token_count, content_format, created_at
+        r#"SELECT rowid, id, session_id, role, content, tool_calls, tool_call_id, token_count, content_format, created_at,
+                  reasoning, provider_id, model
            FROM messages WHERE session_id = ? ORDER BY rowid ASC"#
     )
     .bind(session_id)
@@ -191,7 +209,8 @@ pub async fn get_last_messages_by_session(
     // so 0 must be normalized to -1 or it silently returns zero rows.
     let effective_limit = if limit <= 0 { -1 } else { limit };
     let mut rows = sqlx::query_as::<_, MessageRow>(
-        r#"SELECT rowid, id, session_id, role, content, tool_calls, tool_call_id, token_count, content_format, created_at
+        r#"SELECT rowid, id, session_id, role, content, tool_calls, tool_call_id, token_count, content_format, created_at,
+                  reasoning, provider_id, model
            FROM messages WHERE session_id = ? ORDER BY rowid DESC LIMIT ?"#
     )
     .bind(session_id)
@@ -327,6 +346,9 @@ mod tests {
             token_count: None,
             content_format: None,
             created_at: None,
+            reasoning: None,
+            provider_id: None,
+            model: None,
         }
     }
 

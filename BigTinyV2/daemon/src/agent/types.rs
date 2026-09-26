@@ -30,6 +30,13 @@ pub struct TimingResult {
     /// ordinary content — or through a marker `TagSplitter` does not recognise
     /// — is invisible here, and bounded by `MAX_TURN_CONTENT_CHARS` instead.
     pub reasoning_tokens: i32,
+    /// The reasoning text itself, stored with the assistant message it
+    /// preceded so a reloaded conversation (and an export) can show it.
+    pub reasoning_text: String,
+    /// The provider and model that actually answered this call -- after any
+    /// failover, so not necessarily the session's pin.
+    pub provider_id: Option<String>,
+    pub model: Option<String>,
 }
 
 impl TimingResult {
