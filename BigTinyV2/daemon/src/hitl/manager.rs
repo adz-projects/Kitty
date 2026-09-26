@@ -415,10 +415,17 @@ impl HITLManager {
 
     /// Persist an `always_allow` rule for `tool_name` — the DB half of a
     /// recorded `always_allow` decision, run by the caller AFTER releasing
-    /// the shared mutex (see `record_decision`).
-    pub async fn persist_allow_rule(&self, app_id: &str, tool_name: &str) {
+    /// the shared mutex (see `record_decision`). `args_pattern` narrows the
+    /// rule to matching calls; `None` covers every call to the tool.
+    pub async fn persist_allow_rule(
+        &self,
+        app_id: &str,
+        tool_name: &str,
+        args_pattern: Option<&str>,
+    ) {
         if let Err(e) =
-            hitl_rules::upsert_rule(&self.pool, app_id, tool_name, None, "always_allow").await
+            hitl_rules::upsert_rule(&self.pool, app_id, tool_name, args_pattern, "always_allow")
+                .await
         {
             tracing::error!("Failed to insert always_allow rule: {}", e);
         }
@@ -627,6 +634,21 @@ mod tests {
         let rules = vec![rule_row(None, "reject")];
         let matched = HITLManager::match_rule(&rules, r#"{"command": "echo hi"}"#).unwrap();
         assert_eq!(matched.decision, "reject");
+    }
+
+    /// The shape an app records for "always allow this command" from an
+    /// approval prompt: a regex over the serialized args, anchored on the
+    /// command's opening. It must allow that command with any arguments and
+    /// nothing else.
+    #[test]
+    fn a_command_prefix_rule_allows_only_that_command() {
+        let rules = vec![rule_row(Some(r#""command":\s*"git status"#), "always_allow")];
+        for args in [r#"{"command":"git status"}"#, r#"{"command": "git status --short"}"#] {
+            assert!(HITLManager::match_rule(&rules, args).is_some(), "{args}");
+        }
+        for args in [r#"{"command":"git push"}"#, r#"{"command":"echo git status"}"#] {
+            assert!(HITLManager::match_rule(&rules, args).is_none(), "{args}");
+        }
     }
 
     #[test]

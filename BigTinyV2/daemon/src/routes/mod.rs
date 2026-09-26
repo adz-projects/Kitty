@@ -4,6 +4,7 @@ pub mod chat;
 pub mod embeddings;
 pub mod events;
 pub mod health;
+pub mod hitl;
 pub mod jobs;
 pub mod local;
 pub mod mcp;
@@ -97,6 +98,8 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         // `crate::plugins`.
         .route("/api/admin/restart", post(admin::restart))
         .route("/api/apps/me/events", get(events::events))
+        .route("/api/hitl/rules", get(hitl::list))
+        .route("/api/hitl/rules/{id}", delete(hitl::delete))
         .route("/api/apps/me/plugins", get(plugins::list))
         .route(
             "/api/apps/me/plugins/{plugin}",

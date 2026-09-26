@@ -692,6 +692,12 @@ pub async fn cancel_session(
 pub struct ApproveRequest {
     pub action_id: String,
     pub decision: String,
+    /// With `always_allow`: narrow the recorded rule to calls whose arguments
+    /// (as serialized JSON) match this regex -- e.g. one shell command prefix
+    /// rather than every future shell command. Omitted, the rule covers every
+    /// call to the tool, as before.
+    #[serde(default)]
+    pub args_pattern: Option<String>,
 }
 
 pub async fn approve_action(
@@ -722,6 +728,23 @@ pub async fn approve_action(
         }
     }
 
+    // A pattern that doesn't compile would silently fall back to substring
+    // matching (`HITLManager::match_rule`), which is not what the caller
+    // asked for. Refuse it before recording anything.
+    let args_pattern = body
+        .args_pattern
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty());
+    if let Some(p) = args_pattern {
+        if let Err(e) = regex::Regex::new(p) {
+            return err_response(
+                StatusCode::BAD_REQUEST,
+                format!("args_pattern is not a valid regex: {e}"),
+            );
+        }
+    }
+
     // `record_decision` is synchronous now (the DB rule-upsert was split out
     // of it) — the shared hitl mutex is held only for the in-memory mutation,
     // never across a storage round-trip, so a single approval can't serialize
@@ -737,7 +760,7 @@ pub async fn approve_action(
             .hitl()
             .lock()
             .await
-            .persist_allow_rule(&identity.app_id, &tool_name)
+            .persist_allow_rule(&identity.app_id, &tool_name, args_pattern)
             .await;
     }
     Json(decision.to_dict()).into_response()

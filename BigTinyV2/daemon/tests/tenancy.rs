@@ -2209,3 +2209,55 @@ async fn next_sse_frame(body: &mut Body) -> String {
         .unwrap();
     String::from_utf8(frame.into_data().unwrap().to_vec()).unwrap()
 }
+
+// ---------------------------------------------------------------------------
+// Always-allow rules
+// ---------------------------------------------------------------------------
+
+/// A rule is one app's user's decision: listed and revocable only by that app.
+#[tokio::test]
+async fn always_allow_rules_are_listed_and_revoked_per_app() {
+    use bigtiny2::storage::hitl_rules;
+
+    let state = test_state().await;
+    hitl_rules::upsert_rule(&state.db, APP_A, "shell", Some(r#""command":"git status"#), "always_allow")
+        .await
+        .unwrap();
+    hitl_rules::upsert_rule(&state.db, APP_B, "shell", None, "always_allow")
+        .await
+        .unwrap();
+
+    let get = |app: &'static str| {
+        let state = state.clone();
+        async move {
+            let req = Request::builder()
+                .method(Method::GET)
+                .uri("/api/hitl/rules")
+                .body(Body::empty())
+                .unwrap();
+            body_json(router_as(state, app).oneshot(req).await.unwrap()).await
+        }
+    };
+    let a_rules = get(APP_A).await;
+    let a_rules = a_rules.as_array().unwrap();
+    assert_eq!(a_rules.len(), 1, "{a_rules:?}");
+    assert_eq!(a_rules[0]["args_pattern"], r#""command":"git status"#);
+    let a_id = a_rules[0]["id"].as_i64().unwrap();
+    let b_id = get(APP_B).await[0]["id"].as_i64().unwrap();
+
+    let delete = |app: &'static str, id: i64| {
+        let state = state.clone();
+        async move {
+            let req = Request::builder()
+                .method(Method::DELETE)
+                .uri(format!("/api/hitl/rules/{id}"))
+                .body(Body::empty())
+                .unwrap();
+            router_as(state, app).oneshot(req).await.unwrap().status()
+        }
+    };
+    assert_eq!(delete(APP_A, b_id).await, StatusCode::NOT_FOUND, "revoked another app's rule");
+    assert_eq!(delete(APP_A, a_id).await, StatusCode::OK);
+    assert!(get(APP_A).await.as_array().unwrap().is_empty());
+    assert_eq!(get(APP_B).await.as_array().unwrap().len(), 1);
+}
