@@ -31,7 +31,6 @@ import { modelAcceptsImages } from '@/lib/vision_models';
 import type {
   ApprovalNeededEvent,
   FileEntry,
-  ModeInfo,
   NetworkTier,
   PathInfo,
   ProviderView,
@@ -44,7 +43,6 @@ import type {
 
 import { decideChatApproval } from './chat/approvalUtils';
 import {
-  buildStrippedTranscript,
   isConnectivityError,
   isProviderScopedError,
   stripPromptPreamble,
@@ -63,14 +61,12 @@ import {
   isStragglerAssistantMessage,
   userFileArtifact,
 } from './chat/messageUtils';
-import { readCachedModeInfo, writeCachedModeInfo } from './chat/modeInfoCache';
 import type { Artifact, Attachment, Message, PendingImage, ToolCall } from './chat/types';
 
 export * from './chat/approvalUtils';
 export * from './chat/errorUtils';
 export * from './chat/loopGuards';
 export * from './chat/messageUtils';
-export * from './chat/modeInfoCache';
 export * from './chat/types';
 
 interface ChatState {
@@ -128,8 +124,6 @@ interface ChatState {
       for the header pill, this is the authorization view. */
   sessionGrants: SessionAllowedDirs | null;
   title: string | null;
-  mode: string | null;
-  availableModes: ModeInfo[];
   /** Reasoning-effort control for the active session (Round-7) — `null` when
       the active model doesn't support effort control at all (a single-option
       "off"-only model, per `parse_thinking_effort` in commands/session.rs).
@@ -137,12 +131,11 @@ interface ChatState {
   thinkingEffort: ThinkingEffort | null;
   /** True only during the async gap in `newSession()` between the optimistic
       clear and the real `session/new` response landing (Round: header-delay
-      fix). `mode`/`availableModes`/`thinkingEffort` are deliberately *not*
-      cleared during this gap (they keep showing the outgoing session's
-      values, which are usually still correct for a fresh session on the same
-      provider) — this flag instead gates *interactivity* on `ModeBadge`/
-      `EffortDropdown` so a click can't act on a session id that doesn't
-      exist yet. */
+      fix). `thinkingEffort` is deliberately *not* cleared during this gap
+      (it keeps showing the outgoing session's value, which is usually still
+      correct for a fresh session on the same provider) — this flag instead
+      gates *interactivity* on `EffortDropdown` so a click can't act on a
+      session id that doesn't exist yet. */
   creatingSession: boolean;
   messages: Message[];
   artifacts: Artifact[];
@@ -215,10 +208,6 @@ interface ChatState {
   model: string | null;
   /** Active provider's display name, for the per-response metrics line (Round-3 item 2). */
   providerName: string | null;
-  /** STOPGAP client-side workaround (see `send()`) — strip reasoning from the
-      context resent on later turns, chat-only mode only. Remove once Goose ships
-      a native hook (block/goose#7617) and thread it into goosed_env() instead. */
-  stripReasoning: boolean;
   /** The active provider profile's manual "accepts images" override. Widens
       `supportsImages`'s name-based detection; see `modelAcceptsImages`. */
   providerSupportsVision: boolean;
@@ -336,7 +325,6 @@ interface ChatState {
       reached the backend — a false return means the entry is still queued
       and the caller (ApprovalPrompt) should unlatch so the user can retry. */
   respondApproval: (toolCallId: string, optionId: string | null) => Promise<boolean>;
-  setMode: (modeId: string) => Promise<void>;
   /** Set the active session's reasoning effort (Round-7) — live, no goosed
       restart. No-op if there's no active session or effort control isn't
       available for the active model. */
@@ -363,8 +351,6 @@ interface ChatState {
   adoptSession: (info: {
     session_id: string;
     cwd: string;
-    current_mode: string;
-    available_modes: ModeInfo[];
     /** Present when handed off mid-turn (Expand while streaming) — the
         overlay's own live render state at the moment of handoff, applied
         after the replay since `session/load` doesn't reliably include an
@@ -906,18 +892,6 @@ export const useChatStore = create<ChatState>((set, get) => {
         promptText = `${docs}\n\n${promptText}`.trim();
       }
 
-      // STOPGAP client-side workaround (see buildStrippedTranscript's doc comment):
-      // only engages once some prior assistant turn actually reasoned — a turn
-      // with nothing to strip shouldn't pay for a session swap. Prior turns come
-      // from local render state, since goosed's own history is exactly what we're
-      // bypassing here.
-      const priorMessages = get().messages;
-      const stripReasoningNow =
-        get().stripReasoning &&
-        priorMessages.some((m) => m.role === 'assistant' && m.reasoning.trim().length > 0);
-      if (stripReasoningNow) {
-        promptText = `${buildStrippedTranscript(priorMessages)}\n\nUser: ${promptText}`;
-      }
       // Custom/default system prompt (Round-6 Feature 2), first turn of a
       // session only — set server-side via BigTiny's real `persona_override`
       // session-metadata field, rendered as a
@@ -931,10 +905,6 @@ export const useChatStore = create<ChatState>((set, get) => {
       // hallucinating an unrelated persona and looping). Best-effort — a
       // failure here (e.g. BigTiny transiently unreachable) shouldn't block
       // the turn; it just falls back to BigTiny's generic built-in persona.
-      // `firstMessage` was captured before the stripReasoning session-swap
-      // logic above, so a mid-conversation swap onto a fresh goosed session
-      // correctly does NOT get persona_override set again — from the user's
-      // perspective it's a continuation, not a new conversation.
       if (firstMessage) {
         const resolvedPrompt = get().systemPrompt ?? defaultSystemPrompt();
         try {
@@ -943,8 +913,6 @@ export const useChatStore = create<ChatState>((set, get) => {
           console.warn('setSessionPersonaOverride failed, continuing with default persona', e);
         }
       }
-      const cwd = get().cwd ?? undefined;
-
       // Snapshot what's attached to this turn before the set() below clears
       // droppedFiles/attachments/pendingImages from composer state — otherwise
       // there'd be no record of it on the sent message at all (Round-7 fix).
@@ -1018,62 +986,8 @@ export const useChatStore = create<ChatState>((set, get) => {
       lastSentAt = performance.now();
       lastSentProvider = get().providerName;
       lastSentModel = get().model;
-      if (stripReasoningNow) {
-        // Swap to a brand-new goosed session carrying only the reconstructed,
-        // reasoning-free transcript — never the old session (which still has
-        // goosed's own unstripped history). `sessionId` (and `mode`) MUST be
-        // updated before `sendPrompt` fires, not after: `bindEvents()`'s stream
-        // handlers all gate on `forActive(sid)` (`get().sessionId === sid`), so
-        // deferring the swap would silently drop every event for this turn.
-        const oldSessionId = sessionId;
-        const oldMode = get().mode;
-        const oldAvailableModes = get().availableModes;
-        const oldThinkingEffort = get().thinkingEffort;
-        const info = await ipc.newSession(cwd);
-        // A New Chat / session switch could have landed while the swap
-        // session was being created — applying the swap now would clobber it.
-        // The just-created swap session never got a turn: drop it and abort.
-        if (get().sessionId !== oldSessionId) {
-          void ipc.deleteSession(info.session_id).catch(() => {});
-          return false;
-        }
-        // Best-effort — see the identical bindWindowSession call above.
-        void ipc.bindWindowSession(info.session_id).catch(() => {});
-        set({
-          sessionId: info.session_id,
-          mode: info.current_mode,
-          availableModes: info.available_modes,
-        });
-        submitted = true;
-        try {
-          await ipc.sendPrompt(info.session_id, promptText, images, attachedPaths);
-        } catch (e) {
-          // The new session never got a real turn — drop it and restore the
-          // old (still fully intact) session rather than losing the thread.
-          // No `cwd` here: the working directory is shared with the session
-          // being restored, so skip delete_session's directory cleanup.
-          void ipc.deleteSession(info.session_id).catch(() => {});
-          set({
-            sessionId: oldSessionId,
-            // Restore the full set of session-derived mode/effort fields —
-            // `mode`/`availableModes`/`thinkingEffort` were overwritten with
-            // the failed session's values by the swap set above, and leaving
-            // them pointing at a deleted session shows the restored (old)
-            // session with mismatched mode/effort state.
-            mode: oldMode,
-            availableModes: oldAvailableModes,
-            thinkingEffort: oldThinkingEffort,
-          });
-          throw e;
-        }
-        // Success: best-effort cleanup of the now-superseded old session — a
-        // failure here shouldn't surface as an error for a turn that actually
-        // succeeded. Same no-`cwd` reasoning as above (shared working dir).
-        void ipc.deleteSession(oldSessionId).catch(() => {});
-      } else {
-        submitted = true;
-        await ipc.sendPrompt(sessionId, promptText, images, attachedPaths);
-      }
+      submitted = true;
+      await ipc.sendPrompt(sessionId, promptText, images, attachedPaths);
       // A turn that carried attachments just widened the session's grant set
       // daemon-side. Re-read it now, before the model's first tool call, or
       // the approval check still judges those files against chat_dir/cwd
@@ -1096,8 +1010,6 @@ export const useChatStore = create<ChatState>((set, get) => {
     chatDir: null,
     sessionGrants: null,
     title: null,
-    mode: null,
-    availableModes: [],
     thinkingEffort: null,
     creatingSession: false,
     messages: [],
@@ -1123,7 +1035,6 @@ export const useChatStore = create<ChatState>((set, get) => {
     isTrusted: false,
     model: null,
     providerName: null,
-    stripReasoning: false,
     providerSupportsVision: false,
     providerAcceptsImages: null,
     providerHasTools: true,
@@ -1260,46 +1171,23 @@ export const useChatStore = create<ChatState>((set, get) => {
           // and is rarely the head of the list.
           model: cur0.sessionModelId ?? active?.models[0] ?? null,
           providerName: active ? active.name || active.provider_type : null,
-          stripReasoning: active ? active.strip_reasoning : false,
           providerSupportsVision: active ? active.supports_vision : false,
           providerAcceptsImages: active ? active.accepts_images : null,
           providerHasTools: active ? active.provider_type !== 'local' : true,
           systemPrompt: active ? active.system_prompt : null,
         });
-        if (active) {
-          const cur = get();
-          if (cur.sessionId === null && cur.mode === null) {
-            // No session has ever existed in this window yet — seed mode from
-            // the last-known values for this provider so the badge doesn't
-            // start blank (see the cache's doc comment). Effort isn't cached
-            // (it's provider-dependent) so it stays hidden until a session
-            // exists to derive it against.
-            const cached = readCachedModeInfo(active.id);
-            if (cached) {
-              set({
-                mode: cached.mode,
-                availableModes: cached.availableModes,
-              });
-            }
-          } else if (cur.sessionId !== null) {
-            // A live session: the provider or model may have just changed, so
-            // re-derive the effort control against the now-active provider —
-            // this is what makes the dropdown appear/disappear/re-scope on a
-            // mid-session provider switch (e.g. Claude → local) without a
-            // reload. Best-effort: a failure leaves the current value alone.
-            try {
-              const thinkingEffort = await ipc.getThinkingEffort(cur.sessionId);
-              set({ thinkingEffort });
-            } catch {
-              // keep whatever's showing
-            }
-            if (cur.mode !== null) {
-              // Refresh the mode cache for next time (effort excluded — see above).
-              writeCachedModeInfo(active.id, {
-                mode: cur.mode,
-                availableModes: cur.availableModes,
-              });
-            }
+        const cur = get();
+        if (active && cur.sessionId !== null) {
+          // A live session: the provider or model may have just changed, so
+          // re-derive the effort control against the now-active provider —
+          // this is what makes the dropdown appear/disappear/re-scope on a
+          // mid-session provider switch without a reload. Best-effort: a
+          // failure leaves the current value alone.
+          try {
+            const thinkingEffort = await ipc.getThinkingEffort(cur.sessionId);
+            set({ thinkingEffort });
+          } catch {
+            // keep whatever's showing
           }
         }
       } catch {
@@ -1312,7 +1200,6 @@ export const useChatStore = create<ChatState>((set, get) => {
           isTrusted: false,
           model: null,
           providerName: null,
-          stripReasoning: false,
           providerSupportsVision: false,
           providerAcceptsImages: null,
           providerHasTools: true,
@@ -1375,8 +1262,6 @@ export const useChatStore = create<ChatState>((set, get) => {
         ? {
             session_id: s.sessionId,
             cwd: s.cwd ?? '',
-            current_mode: s.mode ?? 'auto',
-            available_modes: s.availableModes,
             thinking_effort: s.thinkingEffort,
             is_default_folder: s.isDefaultFolder,
             // Carried so the new window adopts this chat's pinned provider
@@ -1416,8 +1301,6 @@ export const useChatStore = create<ChatState>((set, get) => {
         chatDir: null,
         sessionGrants: null,
         title: null,
-        mode: null,
-        availableModes: [],
         thinkingEffort: null,
         isDefaultFolder: true,
         sessionProviderId: null,
@@ -1494,16 +1377,14 @@ export const useChatStore = create<ChatState>((set, get) => {
       // (it would call ensureSession() → newSession() again, but
       // getOrCreateSession dedupes the actual IPC call below).
       //
-      // `mode`/`availableModes`/`thinkingEffort` are deliberately left as-is
-      // here (NOT nulled) — a fresh session on the same provider/model will
-      // almost always have the same values, so carrying the outgoing
-      // session's forward avoids `EffortDropdown`/`ModeBadge` visibly
-      // popping in late relative to `ModeToggle`/`ProviderBadge` (which never
-      // depended on session data in the first place). `creatingSession` gates
-      // interactivity on those two controls instead, so a click during the
-      // gap can't act on a session id that doesn't exist yet. The real
+      // `thinkingEffort` is deliberately left as-is here (NOT nulled) — a
+      // fresh session on the same provider/model will almost always have the
+      // same value, so carrying the outgoing session's forward avoids
+      // `EffortDropdown` visibly popping in late relative to `ProviderBadge`.
+      // `creatingSession` gates interactivity on it instead, so a click during
+      // the gap can't act on a session id that doesn't exist yet. The real
       // `session/new` response below is still the sole source of truth and
-      // overwrites these the moment it lands.
+      // overwrites it the moment it lands.
       clearStopGrace();
       discardDeltas();
       set({
@@ -1580,8 +1461,6 @@ export const useChatStore = create<ChatState>((set, get) => {
           cwd: info.cwd,
           isDefaultFolder: info.is_default_folder,
           chatDir: info.cwd,
-          mode: info.current_mode,
-          availableModes: info.available_modes,
           thinkingEffort: info.thinking_effort,
           // Adopt the pin the backend stamped onto this session. Without it
           // `sessionProviderId` stayed null for every chat started in this
@@ -1741,8 +1620,6 @@ export const useChatStore = create<ChatState>((set, get) => {
         const info = await ipc.loadSession(sessionId, cwd);
         if (epoch !== get().sessionEpoch) return;
         set({
-          mode: info.current_mode,
-          availableModes: info.available_modes,
           thinkingEffort: info.thinking_effort,
           isDefaultFolder: info.is_default_folder,
         });
@@ -1859,22 +1736,6 @@ export const useChatStore = create<ChatState>((set, get) => {
         // `submitted` state — otherwise a failed respond leaves the prompt
         // rendered but unclickable with the turn hung server-side.
         return false;
-      }
-    },
-
-    setMode: async (modeId: string) => {
-      const sid = get().sessionId;
-      if (!sid) return;
-      const prev = get().mode;
-      set({ mode: modeId });
-      try {
-        await ipc.setMode(sid, modeId);
-      } catch (e) {
-        // Roll back the optimistic flip — the badge was showing a mode the
-        // session never actually entered. Guarded so a mode/session change
-        // that landed after this call isn't clobbered by the revert.
-        if (get().sessionId === sid && get().mode === modeId) set({ mode: prev });
-        set({ error: String(e) });
       }
     },
 
@@ -2433,8 +2294,6 @@ export const useChatStore = create<ChatState>((set, get) => {
             chatDir: null,
             sessionGrants: null,
             title: null,
-            mode: null,
-            availableModes: [],
             thinkingEffort: null,
             isDefaultFolder: true,
             sessionProviderId: null,
@@ -2483,8 +2342,6 @@ export const useChatStore = create<ChatState>((set, get) => {
             chatDir: null,
             sessionGrants: null,
             title: null,
-            mode: null,
-            availableModes: [],
             thinkingEffort: null,
             isDefaultFolder: true,
             sessionProviderId: null,

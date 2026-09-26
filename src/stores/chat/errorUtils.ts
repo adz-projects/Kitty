@@ -1,8 +1,6 @@
 // Error humanization and prompt-preamble/wrapper stripping for replayed
 // messages.
 
-import type { Message } from './types';
-
 /** Turn a raw ACP/JSON-RPC error string into a short, plain-language summary
     for the chat error banner — the raw text stays available via ErrorDetail's
     "Show details" expander. Owner-reported bug: a bare "Invalid params" (or
@@ -87,40 +85,19 @@ export function isConnectivityError(raw: string | null, errorType?: string | nul
   );
 }
 
-// STOPGAP client-side workaround for stripping reasoning from resent context
-// (see the doc comment on `ProviderProfile.strip_reasoning` in providers.rs and
-// on `stripReasoning` in chatStore) — flattens prior turns into plain text
-// using only `.text`, never `.reasoning`. Remove once Goose ships a native
-// hook (https://github.com/block/goose/issues/7617) and this whole mechanism
-// goes away in favor of an env var through goosed_env().
-export function buildStrippedTranscript(messages: Message[]): string {
-  const lines = messages.map((m) =>
-    m.role === 'user' ? `User: ${m.text}` : `Assistant: ${m.text}`
-  );
-  return (
-    'Continuing the conversation below. Earlier reasoning/thinking has been omitted ' +
-    'to keep this response focused.\n\n' +
-    lines.join('\n\n') +
-    '\n\n' +
-    TRANSCRIPT_SENTINEL
-  );
-}
-
-// Both known client-side prompt-preamble wrappers (Round-6 system prompt, and
-// this STOPGAP's own reconstructed transcript, immediately above) are only
-// ever prepended to the FIRST outgoing message of a session — see `send()`'s
-// `firstMessage` gate in chatStore. `userMsg.text` (the live-rendered bubble)
-// is always built independently of the wrapped `promptText`, so a *live* send
-// never shows the wrapper. But goosed stores exactly what was transmitted,
-// wrapper included — so resuming a session via `session/load` replays the raw
-// wrapped text as that turn's `user_message_chunk`, with nothing in the
-// replay path to strip it. Only the first replayed user turn of a session can
-// ever carry a wrapper; later turns pass through untouched.
+// Both historical client-side prompt-preamble wrappers (the Round-6 system
+// prompt, and the since-removed "strip reasoning" option's reconstructed
+// transcript) were only ever prepended to the FIRST outgoing message of a
+// session. Nothing produces either any more, but sessions recorded before they
+// were removed still carry them: the daemon stores exactly what was
+// transmitted, wrapper included, so replaying such a session would show the
+// raw wrapped text in its first user bubble. Only the first replayed user turn
+// of a session can carry one; later turns pass through untouched.
 const SYSTEM_PROMPT_WRAPPER_RE = /^<system>\n[\s\S]*?\n<\/system>\n\n/;
 const TRANSCRIPT_WRAPPER_PREAMBLE =
   'Continuing the conversation below. Earlier reasoning/thinking has been omitted ' +
   'to keep this response focused.\n\n';
-// Closing line of every transcript `buildStrippedTranscript` produces. The
+// Closing line of every transcript the removed strip-reasoning option built. The
 // send-time wrapper is exactly `<transcript>\n\n<sentinel>\n\nUser: <text>`,
 // so the replay strip anchors on this exact suffix boundary — a bare
 // `lastIndexOf('\n\nUser: ')` could match inside the user's OWN message

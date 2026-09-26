@@ -4,7 +4,7 @@ import { usePopoverPosition } from '@/lib/usePopoverPosition';
 
 /** Per-session ⋮ menu (Round-3 item 5) — replaces the bulky per-row folder
     `<select>` + separate delete button. Reuses the same popover pattern as
-    ModeBadge/ProviderBadge (`.mode-popover`, absolutely positioned). */
+    ProviderBadge (`.mode-popover`, absolutely positioned). */
 export function SessionKebabMenu({
   sessionId,
   folders,

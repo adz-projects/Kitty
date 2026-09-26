@@ -110,22 +110,3 @@ export interface PendingImage {
   data_url: string;
 }
 
-// Last-known mode info per provider, cached in localStorage (shared across
-// windows — same webview origin) so a *brand-new* window's very first "New
-// Chat" can show `ModeBadge` immediately instead of waiting on the real
-// `session/new` round trip. `newSession()`'s existing same-window
-// carry-forward (see its doc comment) only helps the 2nd+ session in a
-// window's lifetime, since there's nothing to carry forward before any session
-// has ever been created there — this cache covers that gap. A fresh session on
-// the same provider will almost always report the same mode, so this is a
-// reasonable optimistic seed; the real response is still authoritative and
-// overwrites it the moment it lands.
-//
-// `thinkingEffort` is deliberately NOT cached here: it now depends on the
-// active provider+model (see `bigtiny::effort`), so a cached value goes stale
-// the moment the provider changes — exactly the staleness this feature is
-// meant to avoid. It's re-derived live in `refreshProvider` instead.
-export interface CachedModeInfo {
-  mode: string;
-  availableModes: import('@/lib/types').ModeInfo[];
-}

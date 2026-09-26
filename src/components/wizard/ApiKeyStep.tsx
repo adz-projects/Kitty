@@ -40,7 +40,6 @@ function blankApiKeyProfile(type: ProviderType): ProviderProfile {
     frequency_penalty: null,
     max_tokens: null,
     context_length: null,
-    strip_reasoning: false,
     supports_vision: false,
     system_prompt: null,
     prompt_idle_timeout_secs: null,

@@ -174,7 +174,6 @@ mod tests {
             frequency_penalty: None,
             max_tokens: None,
             context_length: None,
-            strip_reasoning: false,
             supports_vision: false,
             system_prompt: None,
             prompt_idle_timeout_secs: None,

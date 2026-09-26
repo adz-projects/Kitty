@@ -164,7 +164,6 @@ export const ipc = {
       longer triggers a notification directly. */
   notifyApprovalNeeded: (sessionId: string, toolName: string) =>
     invoke<void>('notify_approval_needed', { sessionId, toolName }),
-  setMode: (sessionId: string, modeId: string) => invoke<void>('set_mode', { sessionId, modeId }),
   listSessions: () => invoke<Record<string, unknown>[]>('list_sessions'),
   loadSession: (sessionId: string, cwd: string) =>
     invoke<SessionInfo>('load_session', { sessionId, cwd }),

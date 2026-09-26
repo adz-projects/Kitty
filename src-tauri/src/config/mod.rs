@@ -77,16 +77,6 @@ pub struct Config {
     pub session_folders: HashMap<String, String>,
     /// Whether the main window's artifacts pane is shown (Round-3 item 6).
     pub show_artifacts: bool,
-    /// Per-session chat/agentic mode override (Round-4 instant mode toggle).
-    /// Maps a goosed session id → `"chat"` | `"agentic"`. Absent = default to
-    /// chat (owner ask, later round — providers no longer carry their own
-    /// `tools_enabled` default either; the per-session toggle is now the only
-    /// mode selector).
-    /// Persisted (not transient) so resuming a flipped session doesn't
-    /// silently revert its attachment/tool semantics — mirrors
-    /// `session_folders` above.
-    #[serde(default)]
-    pub session_modes: HashMap<String, String>,
     /// Per-session reasoning-effort choice (item: thinking effort). Maps a
     /// session id → the wire value (`"off"`/`"low"`/`"medium"`/`"high"`) last
     /// chosen for it. Persisted so resuming a session keeps its effort;
@@ -507,7 +497,6 @@ impl Default for Config {
             folders: Vec::new(),
             session_folders: HashMap::new(),
             show_artifacts: true,
-            session_modes: HashMap::new(),
             session_efforts: HashMap::new(),
             model_efforts: HashMap::new(),
             model_context_lengths: HashMap::new(),

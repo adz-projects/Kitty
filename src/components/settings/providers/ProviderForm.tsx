@@ -278,18 +278,6 @@ export function ProviderForm({
           <label className="check">
             <input
               type="checkbox"
-              checked={profile.strip_reasoning}
-              onChange={(e) => set({ strip_reasoning: e.target.checked })}
-            />
-            <span>
-              Strip reasoning from context on later turns (recommended for Gemma-style local
-              reasoning models, chat-only providers only)
-            </span>
-          </label>
-
-          <label className="check">
-            <input
-              type="checkbox"
               checked={profile.supports_vision}
               onChange={(e) => set({ supports_vision: e.target.checked })}
             />

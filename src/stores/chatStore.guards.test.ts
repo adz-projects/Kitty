@@ -9,7 +9,6 @@ vi.mock('@/lib/ipc', () => ({
   ipc: {
     newSession: vi.fn(),
     listProviders: vi.fn(),
-    setMode: vi.fn(),
     sendPrompt: vi.fn(),
     setSessionPersonaOverride: vi.fn(),
     bindWindowSession: vi.fn(),
@@ -29,8 +28,6 @@ const { useChatStore } = await import('./chatStore');
 const info = (sessionId: string, cwd = '/c'): SessionInfo => ({
   session_id: sessionId,
   cwd,
-  current_mode: 'auto',
-  available_modes: [],
   thinking_effort: null,
   is_default_folder: true,
   provider_id: null,
@@ -54,8 +51,6 @@ beforeEach(() => {
     backgroundSession: null,
     backgroundTurnToast: null,
     title: null,
-    mode: null,
-    availableModes: [],
     thinkingEffort: null,
     creatingSession: false,
     messages: [],
@@ -79,7 +74,6 @@ beforeEach(() => {
     isTrusted: false,
     model: 'test-model',
     providerName: null,
-    stripReasoning: false,
     systemPrompt: null,
     warning: null,
     compactionNotice: null,
@@ -89,7 +83,6 @@ beforeEach(() => {
   });
   vi.mocked(ipc.newSession).mockResolvedValue(info('s1'));
   vi.mocked(ipc.listProviders).mockResolvedValue([]);
-  vi.mocked(ipc.setMode).mockResolvedValue(undefined);
   vi.mocked(ipc.sendPrompt).mockResolvedValue(undefined);
   vi.mocked(ipc.setSessionPersonaOverride).mockResolvedValue(undefined);
   vi.mocked(ipc.bindWindowSession).mockRejectedValue(new Error('best-effort'));
@@ -263,8 +256,6 @@ describe('chatStore adoptSession handoff snapshot', () => {
   const handoff = {
     session_id: 's1',
     cwd: '/c',
-    current_mode: 'auto',
-    available_modes: [],
     messages: snapshot,
     artifacts: [],
   };
@@ -320,7 +311,6 @@ describe('chatStore refreshProvider malformed base_url', () => {
     frequency_penalty: null,
     max_tokens: null,
     context_length: null,
-    strip_reasoning: false,
     supports_vision: true,
     system_prompt: null,
     prompt_idle_timeout_secs: null,

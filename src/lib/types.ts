@@ -163,9 +163,6 @@ export interface ProviderProfile {
       self-hosted providers (see presence_penalty). */
   max_tokens: number | null;
   context_length: number | null;
-  /** STOPGAP client-side workaround (see chatStore.ts's send()) — Goose has no
-      native hook for this yet; remove once block/goose#7617 or equivalent lands. */
-  strip_reasoning: boolean;
   /** Manual override that widens image support beyond name-based detection
       (see `vision_models.ts` and the Rust field's doc comment). */
   supports_vision: boolean;
@@ -665,17 +662,9 @@ export interface MemorabiliaStats {
 
 // --- Chat / ACP (Phase 2) --- mirrors src-tauri/src/commands SessionInfo + events
 
-export interface ModeInfo {
-  id: string;
-  name: string;
-  description: string;
-}
-
 export interface SessionInfo {
   session_id: string;
   cwd: string;
-  current_mode: string;
-  available_modes: ModeInfo[];
   /** `null` when the active model doesn't support effort control at all (a
       single-option "off"-only model — see `parse_thinking_effort` in
       commands/session.rs). Live per-session control, no goosed restart. */

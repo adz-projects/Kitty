@@ -17,8 +17,6 @@ use super::{chats_base_dir, resolve_cwd, ThinkingEffort, CHATS_DIR_NAME};
 pub struct SessionInfo {
     pub session_id: String,
     pub cwd: String,
-    pub current_mode: String,
-    pub available_modes: Vec<ModeInfo>,
     /// `None` when the active model doesn't support effort control at all.
     pub thinking_effort: Option<ThinkingEffort>,
     /// True when `cwd` is a private per-chat folder (no explicit working
@@ -39,13 +37,6 @@ pub struct SessionInfo {
     /// `bigtiny::providers::daemon_provider_id`).
     pub provider_id: Option<String>,
     pub model_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ModeInfo {
-    pub id: String,
-    pub name: String,
-    pub description: String,
 }
 
 /// Start a new session. An explicit `cwd` (e.g. a dropped folder) overrides

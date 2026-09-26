@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter};
 
 use crate::bigtiny::client::{ensure_client, BigTinyClient};
-use crate::commands::{ModeInfo, SessionInfo};
+use crate::commands::SessionInfo;
 
 /// BigTiny has no ACP-style modes handshake — HITL policy lives server-side
 /// and the chat/agentic override is client-side either way. The one live field
@@ -27,8 +27,6 @@ fn session_info(
     SessionInfo {
         session_id,
         cwd,
-        current_mode: "approve".to_string(),
-        available_modes: Vec::<ModeInfo>::new(),
         thinking_effort,
         is_default_folder,
         provider_id,

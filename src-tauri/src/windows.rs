@@ -376,8 +376,6 @@ pub async fn focus_or_open_session(app: &AppHandle, session_id: &str) {
     let payload = json!({
         "session_id": session_id,
         "cwd": cwd,
-        "current_mode": "approve",
-        "available_modes": [],
         "thinking_effort": thinking_effort,
         "is_default_folder": is_default_folder,
     });

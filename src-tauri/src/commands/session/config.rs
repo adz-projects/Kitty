@@ -1,20 +1,10 @@
-//! Per-session configuration: approval mode, thinking effort, provider
-//! rebinding, and the chat/agentic mode override.
+//! Per-session configuration: thinking effort, provider rebinding, working
+//! folders and persona.
 
 use tauri::{AppHandle, Manager};
 
 use super::{resolve_cwd, SessionInfo, ThinkingEffort};
 use crate::state::AppState;
-
-/// Switch the session's approval mode. BigTiny has no ACP-style modes
-/// handshake — HITL policy is enforced daemon-side and `new_session`
-/// advertises no modes — so this is a no-op kept only so the frontend's
-/// existing call site has something to call.
-#[tauri::command]
-pub async fn set_mode(_app: AppHandle, session_id: String, mode_id: String) -> Result<(), String> {
-    let _ = (&session_id, &mode_id);
-    Ok(())
-}
 
 /// Set the active session's thinking/reasoning effort. Persists the choice
 /// (so a resumed session keeps it), PATCHes it into the daemon session's

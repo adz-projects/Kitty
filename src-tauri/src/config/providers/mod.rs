@@ -83,17 +83,6 @@ pub struct ProviderProfile {
     pub max_tokens: Option<u32>,
     #[serde(default)]
     pub context_length: Option<u32>,
-    /// Strip the model's own prior reasoning out of what gets resent as context
-    /// on later turns (chat-only mode only — see `chatStore.ts`'s `send()`).
-    /// STOPGAP (client-side workaround): Goose has no native hook for this
-    /// (confirmed: no ACP method, no env var, no config key; reasoning-in-history
-    /// handling is hardcoded per-provider in goosed's own Rust source). Remove
-    /// this field and the whole client-side session-swap path it drives once
-    /// Goose implements https://github.com/block/goose/issues/7617 or an
-    /// equivalent native mechanism, and thread it into `goosed_env()` instead,
-    /// matching `temperature`/`top_p`/`context_length` below.
-    #[serde(default)]
-    pub strip_reasoning: bool,
     /// Manual override: this provider's models accept image content blocks.
     ///
     /// Vision support is otherwise detected from the model *name*
@@ -109,18 +98,9 @@ pub struct ProviderProfile {
     #[serde(default)]
     pub supports_vision: bool,
     /// Custom system prompt for this provider (Round-6 Feature 2). `None` =
-    /// use the built-in mode-appropriate default (see
-    /// `src/lib/system_prompts.ts`). STOPGAP-adjacent, same rationale as
-    /// `strip_reasoning` above: Goose's ACP `session/new` silently drops
-    /// unknown params like `systemPrompt`/`instructions` (live-probed,
-    /// `docs/acp-protocol.md`), and there is no `GOOSE_*` env var for this
-    /// either, so the resolved prompt is prepended client-side to a session's
-    /// first outgoing message (`chatStore.ts`'s `send()`) rather than passed
-    /// through ACP. This field is never sent as an env var — no
-    /// `goosed_env()` change needed. Revisit if Goose ever gains native
-    /// system-prompt support, or once the `.goosehints` file convention is
-    /// probe-confirmed as a cleaner alternative (see the plan doc's deferred
-    /// Batch 9).
+    /// use the built-in default (see `src/lib/system_prompts.ts`). Applied as
+    /// the session's `persona_override` on its first turn, which BigTiny
+    /// renders as a real `role: "system"` message.
     #[serde(default)]
     pub system_prompt: Option<String>,
     /// Override for `session/prompt`'s idle-reset timeout window (default 300s —
@@ -208,7 +188,6 @@ mod tests {
         assert_eq!(p.max_tokens, None);
         assert_eq!(p.context_length, None);
         assert_eq!(p.models, vec!["llama3.2:3b"]);
-        assert!(!p.strip_reasoning);
         assert!(!p.supports_vision);
         assert_eq!(p.system_prompt, None);
         assert_eq!(p.prompt_idle_timeout_secs, None);

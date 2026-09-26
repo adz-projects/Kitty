@@ -34,17 +34,15 @@ export function SubagentChip({ subagents }: { subagents: SubagentStatusEvent[] }
   const watch = async (s: SubagentStatusEvent) => {
     setOpen(false);
     try {
-      // The delegate runs in the app's own workspace, so this window's cwd and
-      // mode carry over; only the session id differs. `spectate` is what makes
+      // The delegate runs in the app's own workspace, so this window's cwd
+      // carries over; only the session id differs. `spectate` is what makes
       // the new window read-only — see `ChatWorkspace`.
-      const { cwd, mode, availableModes } = useChatStore.getState();
+      const { cwd } = useChatStore.getState();
       await ipc.openNewChatWindow({
         session_id: s.child_session_id,
         // The store types both as nullable; a delegate inherits the app's
         // workspace, so an empty string just means 'no folder pill to show'.
         cwd: cwd ?? '',
-        current_mode: mode ?? '',
-        available_modes: availableModes,
         spectate: true,
         specialist: s.specialist,
         // Carried so the new window can label itself with the delegate's own

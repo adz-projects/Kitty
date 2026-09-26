@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { buildStrippedTranscript, stripPromptPreamble } from './chatStore';
+import { stripPromptPreamble } from './chatStore';
 import type { Message } from './chatStore';
 
 /** Backs the fix for the leaked system-prompt/strip-reasoning wrapper on
@@ -61,9 +61,14 @@ describe('stripPromptPreamble transcript sentinel', () => {
     streaming: false,
     open: false,
   });
-  // Mirror of doSend's send-time construction.
+  // The exact wrapper the removed strip-reasoning option used to send, so
+  // sessions recorded with it keep replaying cleanly.
   const wrap = (prior: Message[], userText: string) =>
-    `${buildStrippedTranscript(prior)}\n\nUser: ${userText}`;
+    'Continuing the conversation below. Earlier reasoning/thinking has been omitted ' +
+    'to keep this response focused.\n\n' +
+    prior.map((m) => (m.role === 'user' ? `User: ${m.text}` : `Assistant: ${m.text}`)).join('\n\n') +
+    '\n\n[End of earlier conversation]' +
+    `\n\nUser: ${userText}`;
 
   it('round-trips the exact user text out of a freshly built wrapper', () => {
     const wrapped = wrap(

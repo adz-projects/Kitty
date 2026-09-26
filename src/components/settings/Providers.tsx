@@ -77,8 +77,6 @@ export function Providers({ highlight }: { highlight: string | null }) {
         await ipc.setActiveSession({
           session_id: '',
           cwd: '',
-          current_mode: 'auto',
-          available_modes: [],
           thinking_effort: null,
           is_default_folder: true,
           provider_id: null,

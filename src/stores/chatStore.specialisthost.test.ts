@@ -28,7 +28,6 @@ const providers: ProviderView[] = [
     active: true,
     network_tier: 'remote',
     is_trusted: false,
-    strip_reasoning: false,
     supports_vision: false,
     accepts_images: null,
     system_prompt: null,
@@ -42,8 +41,6 @@ vi.mock('@/lib/ipc', () => ({
     loadSession: vi.fn(async (session_id: string, cwd: string) => ({
       session_id,
       cwd,
-      current_mode: 'approve',
-      available_modes: [],
       thinking_effort: null,
       is_default_folder: false,
       provider_id: null,

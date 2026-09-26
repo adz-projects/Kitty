@@ -1128,30 +1128,6 @@ button.primary {
   }
 }
 
-/* Approval-mode badge (ModeBadge) — same shrink-and-truncate treatment as the
-   provider badge above. Without a cap, its longest label ("Ask every tool")
-   is the widest fixed element in the header and is the first thing pushed
-   past the window's edge (invisible, not wrapped) once nowrap can't fit
-   everything at the overlay's narrower widths. */
-.mode-status-badge {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  max-width: 160px;
-  min-width: 0;
-}
-.mode-badge-label {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  min-width: 0;
-}
-@media (max-width: 700px) {
-  .mode-status-badge {
-    max-width: 60px;
-  }
-}
-
 /* Adaptive Pathway pause/resume toggle (Round-C) — same shrink treatment as
    the other header badges. */
 .ap-toggle {
@@ -1368,7 +1344,7 @@ button.primary {
 
 /* Chat header overflow menu (UX-simplification Batch 3) — deliberately its
    own class, not `.mode-popover`: that class's `.mode-popover button`
-   descendant rule would otherwise restyle the nested `ModeBadge`/
+   descendant rule would otherwise restyle the nested
    `AdaptivePathwayToggle` badge buttons it contains, which need to keep
    their own `.status-badge` look, not become generic menu-item rows. */
 .chat-header-menu-trigger {
