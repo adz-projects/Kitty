@@ -2043,6 +2043,7 @@ impl AgentLoop {
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_tool_loop(
         &mut self,
         session_id: &str,
@@ -2351,6 +2352,9 @@ impl AgentLoop {
                                     "The provider this chat was set to ('{pinned}') isn't available — using '{provider_id}' instead. Re-pick the provider in settings if this isn't what you want."
                                 )),
                                 session_id: Some(session_id.to_string()),
+                                reason: Some("pinned_unavailable".to_string()),
+                                provider_id: Some(provider_id.clone()),
+                                from_provider_id: Some(pinned.to_string()),
                                 ..Default::default()
                             });
                         }
@@ -2375,6 +2379,8 @@ impl AgentLoop {
                         active_tools.len()
                     )),
                     session_id: Some(session_id.to_string()),
+                    reason: Some("no_tool_support".to_string()),
+                    provider_id: Some(provider_id.clone()),
                     ..Default::default()
                 });
             }
@@ -2983,6 +2989,9 @@ impl AgentLoop {
                                          pinned to '{provider_id}' does not apply to '{next_id}'."
                                     )),
                                     session_id: Some(session_id.to_string()),
+                                    reason: Some("error_switch".to_string()),
+                                    provider_id: Some(next_id.clone()),
+                                    from_provider_id: Some(provider_id.clone()),
                                     ..Default::default()
                                 });
                                 provider_id = next_id;
@@ -4258,6 +4267,7 @@ impl AgentLoop {
                 tool_result: Some(err.clone()),
                 tool_call_id: Some(tool_call_id.clone()),
                 session_id: Some(session_id.to_string()),
+                is_error: Some(true),
                 ..Default::default()
             });
             return err;
@@ -4289,6 +4299,7 @@ impl AgentLoop {
                     tool_result: Some(err.clone()),
                     tool_call_id: Some(tool_call_id.clone()),
                     session_id: Some(session_id.to_string()),
+                    is_error: Some(true),
                     ..Default::default()
                 });
                 return err;
@@ -4341,6 +4352,7 @@ impl AgentLoop {
                 tool_result: Some(err.clone()),
                 tool_call_id: Some(tool_call_id.clone()),
                 session_id: Some(session_id.to_string()),
+                is_error: Some(true),
                 ..Default::default()
             });
             return err;
@@ -4398,6 +4410,7 @@ impl AgentLoop {
                 tool_result: Some(err.clone()),
                 tool_call_id: Some(tool_call_id.clone()),
                 session_id: Some(session_id.to_string()),
+                is_error: Some(true),
                 ..Default::default()
             });
             return err;
@@ -4480,6 +4493,7 @@ impl AgentLoop {
                     tool_result: Some(err.clone()),
                     tool_call_id: Some(tool_call_id.clone()),
                     session_id: Some(session_id.to_string()),
+                    is_error: Some(true),
                     ..Default::default()
                 });
                 return err;
@@ -4555,6 +4569,7 @@ impl AgentLoop {
                         tool_result: Some(err.clone()),
                         tool_call_id: Some(tool_call_id.clone()),
                         session_id: Some(session_id.to_string()),
+                        is_error: Some(true),
                         ..Default::default()
                     });
                     return err;
@@ -4618,10 +4633,45 @@ impl AgentLoop {
             duration_ms: Some(result.duration_ms as i64),
             tool_call_id: Some(tool_call_id.clone()),
             session_id: Some(session_id.to_string()),
+            is_error: Some(result.is_error || reports_tool_error(&result.content)),
             ..Default::default()
         });
 
         output
+    }
+}
+
+/// Whether a tool result *reports* a failure in its own content even though
+/// the call succeeded at the MCP level.
+///
+/// The bundled kitty-* tools answer every request with a JSON envelope and
+/// signal failure inside it (`{"status": "error", "error_code": ...}`) rather
+/// than through MCP's `isError`, so without this their failures reach clients
+/// looking like successful calls. Only the `is_error` flag uses it; the text
+/// the model sees is unchanged.
+fn reports_tool_error(content: &str) -> bool {
+    let trimmed = content.trim_start();
+    if !trimmed.starts_with('{') {
+        return false;
+    }
+    serde_json::from_str::<Value>(trimmed)
+        .ok()
+        .and_then(|v| v.get("status").and_then(|s| s.as_str()).map(|s| s == "error"))
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tool_error_tests {
+    use super::reports_tool_error;
+
+    #[test]
+    fn a_json_error_envelope_counts_as_a_tool_error() {
+        assert!(reports_tool_error(r#"{"status": "error", "error_code": "NOT_FOUND"}"#));
+        assert!(reports_tool_error("  
+{\"status\":\"error\"}"));
+        assert!(!reports_tool_error(r#"{"status": "ok", "data": 1}"#));
+        assert!(!reports_tool_error("plain text that mentions status: error"));
+        assert!(!reports_tool_error(r#"[{"status":"error"}]"#));
     }
 }
 

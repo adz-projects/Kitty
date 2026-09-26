@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 
-/// All 15 SSE event types emitted by the agent loop to the frontend.
+/// Every SSE event type the daemon emits. All but `ScheduleRun` come from the
+/// agent loop on a turn's own stream; `ScheduleRun` exists only on the per-app
+/// event stream (`GET /api/apps/me/events`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SSEEventType {
@@ -19,6 +21,11 @@ pub enum SSEEventType {
     Compaction,
     ProviderError,
     LlmTiming,
+    /// A scheduled task's run started, finished or failed. `schedule_id`
+    /// names the schedule, `session_id` the session the run happened in, and
+    /// `content` the outcome (`started` | `finished` | `failed` |
+    /// `denied_by_timeout`).
+    ScheduleRun,
 }
 
 /// Wire-format event pushed over SSE from the agent loop to the frontend.
@@ -78,6 +85,24 @@ pub struct SSEEvent {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_tokens: Option<i64>,
+    /// On `ToolFinish`: whether the tool call failed (the tool reported an
+    /// error, or it was denied). Absent on older daemons, where a client had
+    /// to guess from the result text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_error: Option<bool>,
+    /// On `ModelFailover`: why the model or provider changed --
+    /// `pinned_unavailable` (the chat's pinned provider is gone),
+    /// `no_tool_support` (the provider cannot call tools, so this turn runs
+    /// without them), or `error_switch` (the provider failed mid-turn and
+    /// another took over). `provider_id`/`model` name what is now answering.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// On `ModelFailover`: the provider that was replaced, when there was one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_provider_id: Option<String>,
+    /// On `ScheduleRun`: the schedule this run belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule_id: Option<String>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -146,6 +171,10 @@ impl Default for SSEEvent {
             provider_id: None,
             model: None,
             total_tokens: None,
+            is_error: None,
+            reason: None,
+            from_provider_id: None,
+            schedule_id: None,
         }
     }
 }
@@ -210,6 +239,43 @@ mod roundtrip_tests {
             assert_eq!(back.event_type, event.event_type);
             assert_eq!(back.content, event.content);
             assert_eq!(back.is_last, event.is_last);
+        }
+    }
+
+    #[test]
+    fn the_v2_1_fields_round_trip_and_stay_off_the_wire_when_unset() {
+        let failover = SSEEvent {
+            event_type: SSEEventType::ModelFailover,
+            reason: Some("error_switch".into()),
+            provider_id: Some("b".into()),
+            from_provider_id: Some("a".into()),
+            ..Default::default()
+        };
+        let finish = SSEEvent {
+            event_type: SSEEventType::ToolFinish,
+            is_error: Some(true),
+            ..Default::default()
+        };
+        let run = SSEEvent {
+            event_type: SSEEventType::ScheduleRun,
+            schedule_id: Some("s1".into()),
+            content: Some("finished".into()),
+            ..Default::default()
+        };
+        for event in [failover, finish, run] {
+            let wire = serialize_sse(&event);
+            let json = wire.trim_start_matches("data: ").trim();
+            let back: SSEEvent = serde_json::from_str(json).unwrap();
+            assert_eq!(back.event_type, event.event_type);
+            assert_eq!(back.reason, event.reason);
+            assert_eq!(back.from_provider_id, event.from_provider_id);
+            assert_eq!(back.is_error, event.is_error);
+            assert_eq!(back.schedule_id, event.schedule_id);
+        }
+        // An ordinary delta carries none of them.
+        let plain = serialize_sse(&SSEEvent::content("x"));
+        for field in ["is_error", "reason", "from_provider_id", "schedule_id"] {
+            assert!(!plain.contains(field), "{field} leaked onto a plain delta: {plain}");
         }
     }
 }
