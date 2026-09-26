@@ -2165,3 +2165,47 @@ async fn the_callers_own_attachment_does_not_block_it() {
     let body = request_restart(state, APP_A, false).await;
     assert_eq!(body["accepted"], true, "{body}");
 }
+
+// ---------------------------------------------------------------------------
+// The per-app event stream
+// ---------------------------------------------------------------------------
+
+/// An approval prompt shows the tool's arguments, which are the owning app's
+/// data -- so one app's stream must never carry another's events.
+#[tokio::test]
+async fn the_event_stream_carries_only_the_callers_own_events() {
+    use bigtiny2::server::events::{SSEEvent, SSEEventType};
+
+    let state = test_state().await;
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/api/apps/me/events")
+        .body(Body::empty())
+        .unwrap();
+    let resp = router_as(state.clone(), APP_A).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let mut body = resp.into_body();
+
+    assert!(next_sse_frame(&mut body).await.starts_with(": subscribed"));
+
+    let pause = |action: &str| SSEEvent {
+        event_type: SSEEventType::HitlPause,
+        action_id: Some(action.to_string()),
+        ..Default::default()
+    };
+    state.agent.app_events().publish(APP_B, pause("b-secret"));
+    state.agent.app_events().publish(APP_A, pause("a-action"));
+
+    let frame = next_sse_frame(&mut body).await;
+    assert!(frame.contains("a-action"), "{frame}");
+    assert!(!frame.contains("b-secret"), "another app's event leaked: {frame}");
+}
+
+async fn next_sse_frame(body: &mut Body) -> String {
+    let frame = tokio::time::timeout(std::time::Duration::from_secs(2), body.frame())
+        .await
+        .expect("the stream went quiet")
+        .expect("the stream ended")
+        .unwrap();
+    String::from_utf8(frame.into_data().unwrap().to_vec()).unwrap()
+}

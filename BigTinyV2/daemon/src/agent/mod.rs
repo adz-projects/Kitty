@@ -112,6 +112,9 @@ pub struct Agent {
     /// derivation re-checks whether the session is still unnamed, and the
     /// learn pass comes round again on the next multiple of `learn_every_n`.
     background_tasks: Arc<DashMap<String, Vec<tokio::task::AbortHandle>>>,
+    /// Per-app events published outside a turn's own stream -- approvals
+    /// waiting, scheduled runs finishing. See `server::app_events`.
+    app_events: Arc<crate::server::app_events::AppEvents>,
 }
 
 /// Removes the turn's `tasks` entry when the turn task ends — normally *or*
@@ -178,7 +181,14 @@ impl Agent {
             provider_mismatch_warned: Arc::new(DashMap::new()),
             workspace_snapshots: Arc::new(DashMap::new()),
             background_tasks: Arc::new(DashMap::new()),
+            app_events: Arc::new(crate::server::app_events::AppEvents::new()),
         }
+    }
+
+    /// Where events an app should hear about outside a turn's own stream are
+    /// published (see `server::app_events`).
+    pub fn app_events(&self) -> &Arc<crate::server::app_events::AppEvents> {
+        &self.app_events
     }
 
     pub fn hitl(&self) -> &Arc<Mutex<HITLManager>> {
@@ -246,6 +256,7 @@ impl Agent {
             self.background_tasks.clone(),
             self.db.clone(),
         )
+        .with_app_events(self.app_events.clone())
     }
 
     /// Run one turn for `session_id` in the background, streaming events over

@@ -2,6 +2,7 @@ pub mod admin;
 pub mod apps;
 pub mod chat;
 pub mod embeddings;
+pub mod events;
 pub mod health;
 pub mod jobs;
 pub mod local;
@@ -95,6 +96,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         // per-app instance state, an MCP server provides tools. See
         // `crate::plugins`.
         .route("/api/admin/restart", post(admin::restart))
+        .route("/api/apps/me/events", get(events::events))
         .route("/api/apps/me/plugins", get(plugins::list))
         .route(
             "/api/apps/me/plugins/{plugin}",

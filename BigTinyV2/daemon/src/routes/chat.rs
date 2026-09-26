@@ -13,11 +13,9 @@ use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use bytes::Bytes;
-use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
 
 use crate::agent::context::stats::SessionStats;
 use crate::error::StorageError;
@@ -299,6 +297,9 @@ pub async fn attach_stream(
     let mut cursor = replay.events.last().map(|r| r.id).or(last_id);
     let stream = async_stream::stream! {
         yield Ok::<Bytes, std::convert::Infallible>(Bytes::from(frames.concat()));
+        // Same keepalive as `/send`, for the same reason: a rejoined turn can
+        // sit quiet for a long time waiting on an approval.
+        let mut last_write = std::time::Instant::now();
         loop {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             let Some(next) = buffers.since(&session, cursor) else {
@@ -306,10 +307,15 @@ pub async fn attach_stream(
             };
             for recorded in &next.events {
                 cursor = Some(recorded.id);
+                last_write = std::time::Instant::now();
                 yield Ok(Bytes::from(sse_frame(Some(recorded.id), &recorded.event)));
             }
             if next.finished {
                 break;
+            }
+            if last_write.elapsed() >= super::events::KEEPALIVE_INTERVAL {
+                last_write = std::time::Instant::now();
+                yield Ok(Bytes::from_static(super::events::KEEPALIVE_FRAME));
             }
         }
     };
@@ -914,9 +920,30 @@ pub async fn send_message(
         }
     });
 
-    let stream = ReceiverStream::new(client_rx).map(|(event_id, event)| {
-        Ok::<Bytes, std::convert::Infallible>(Bytes::from(sse_frame(event_id, &event)))
-    });
+    // A keepalive comment every `KEEPALIVE_INTERVAL` while the turn is quiet
+    // -- most importantly while it waits on an approval, which can take far
+    // longer than a client's idle deadline. A failed keepalive write is also
+    // how a vanished client gets noticed during that wait.
+    let mut client_rx = client_rx;
+    let stream = async_stream::stream! {
+        let mut keepalive = tokio::time::interval(super::events::KEEPALIVE_INTERVAL);
+        keepalive.tick().await; // the first tick completes immediately
+        loop {
+            tokio::select! {
+                next = client_rx.recv() => match next {
+                    Some((event_id, event)) => {
+                        yield Ok::<Bytes, std::convert::Infallible>(
+                            Bytes::from(sse_frame(event_id, &event)),
+                        );
+                    }
+                    None => break,
+                },
+                _ = keepalive.tick() => {
+                    yield Ok(Bytes::from_static(super::events::KEEPALIVE_FRAME));
+                }
+            }
+        }
+    };
 
     let mut response = Response::new(Body::from_stream(stream));
     response.headers_mut().insert(

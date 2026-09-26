@@ -1258,6 +1258,15 @@ pub struct AgentLoop {
     /// silently contradicted both `routes::jobs`' own comment and API.md — so
     /// every job competed with live chat at full priority.
     priority: crate::provider::queue::Priority,
+    /// Where approvals this turn waits on are also announced, so the owning
+    /// app hears about them even with no stream of its own open for this
+    /// session (a chat it switched away from, a scheduled run). `None` only in
+    /// loops built without an `Agent`, i.e. some tests.
+    app_events: Option<Arc<crate::server::app_events::AppEvents>>,
+    /// How long a paused tool call waits for `/approve`. The hour-long
+    /// default, unless the session's metadata sets `hitl_timeout_secs` (a
+    /// scheduled run waits ten minutes, then carries on without the tool).
+    hitl_timeout: Duration,
 }
 
 impl AgentLoop {
@@ -1310,7 +1319,15 @@ impl AgentLoop {
             tool_allow: None,
             hitl_auto_reject: false,
             priority: crate::provider::queue::Priority::Interactive,
+            app_events: None,
+            hitl_timeout: HITL_APPROVAL_TIMEOUT,
         }
+    }
+
+    /// Announce this loop's approval pauses on the per-app event stream too.
+    pub fn with_app_events(mut self, hub: Arc<crate::server::app_events::AppEvents>) -> Self {
+        self.app_events = Some(hub);
+        self
     }
 
     pub fn pool(&self) -> &SqlitePool {
@@ -1463,6 +1480,7 @@ impl AgentLoop {
             .get("hitl_policy")
             .and_then(|v| v.as_str())
             .is_some_and(|p| p == "auto_reject");
+        self.hitl_timeout = hitl_timeout_from(&metadata);
         if let Some(allow) = self.tool_allow.as_ref() {
             let before = active_tools.len();
             active_tools.retain(|t| allow.contains(&t.name) || t.name == BUDGET_TOOL);
@@ -4512,7 +4530,7 @@ impl AgentLoop {
                 .or_insert_with(|| Arc::new(Notify::new()))
                 .clone();
 
-            let _ = event_tx.send(SSEEvent {
+            let pause = SSEEvent {
                 event_type: SSEEventType::HitlPause,
                 tool_name: Some(tool_name.clone()),
                 tool_args: Some(tool_args.clone()),
@@ -4520,7 +4538,11 @@ impl AgentLoop {
                 action_id: Some(action_id.clone()),
                 content: decision.reason.clone(),
                 ..Default::default()
-            });
+            };
+            if let Some(hub) = &self.app_events {
+                hub.publish(&caller_app, pause.clone());
+            }
+            let _ = event_tx.send(pause);
 
             // Bounded wait, not an unconditional one: nothing guarantees a
             // live approver is watching this session (recipe/scheduled runs
@@ -4531,7 +4553,7 @@ impl AgentLoop {
             // call even from `shutdown()`. Timing out and falling through to
             // the "denied" branch below fails safe rather than silently
             // auto-executing an unattended tool call.
-            let timed_out = tokio::time::timeout(HITL_APPROVAL_TIMEOUT, notify.notified())
+            let timed_out = tokio::time::timeout(self.hitl_timeout, notify.notified())
                 .await
                 .is_err();
             self.hitl_notifies.remove(&action_id);
@@ -4550,17 +4572,46 @@ impl AgentLoop {
                 hitl.pop_decision(&action_id)
             };
 
-            let _ = event_tx.send(SSEEvent {
+            let resolved_event = SSEEvent {
                 event_type: SSEEventType::HitlResolved,
                 tool_name: Some(tool_name.clone()),
                 session_id: Some(session_id.to_string()),
                 action_id: Some(action_id.clone()),
                 content: resolved.clone(),
+                // Lets a client that is showing this approval tell "answered
+                // elsewhere" from "nobody answered in time".
+                error_type: timed_out.then(|| "approval_timeout".to_string()),
                 ..Default::default()
-            });
+            };
+            if let Some(hub) = &self.app_events {
+                hub.publish(&caller_app, resolved_event.clone());
+            }
+            let _ = event_tx.send(resolved_event);
 
             match resolved.as_deref() {
                 Some("allow") | Some("always_allow") => {}
+                _ if timed_out => {
+                    // Said plainly, so the model can finish the task without
+                    // the tool (or report what it couldn't do) rather than
+                    // treating an unanswered prompt as a refusal to retry.
+                    let err = format!(
+                        "Tool {tool_name} was not run: nobody approved it within {} minute(s) \
+                         (the user was not available). Continue without it, and say what \
+                         was skipped.",
+                        self.hitl_timeout.as_secs().div_ceil(60)
+                    );
+                    let _ = event_tx.send(SSEEvent {
+                        event_type: SSEEventType::ToolFinish,
+                        tool_name: Some(tool_name.clone()),
+                        tool_result: Some(err.clone()),
+                        tool_call_id: Some(tool_call_id.clone()),
+                        session_id: Some(session_id.to_string()),
+                        is_error: Some(true),
+                        error_type: Some("approval_timeout".to_string()),
+                        ..Default::default()
+                    });
+                    return err;
+                }
                 _ => {
                     let err = format!("Tool {} denied by HITL policy", tool_name);
                     let _ = event_tx.send(SSEEvent {
@@ -4641,6 +4692,21 @@ impl AgentLoop {
     }
 }
 
+/// Shortest approval wait a session may ask for, so a typo can't make every
+/// prompt fail instantly. The longest is the default, [`HITL_APPROVAL_TIMEOUT`],
+/// since `sweep_stale` reaps pending actions older than that anyway.
+const HITL_TIMEOUT_FLOOR: Duration = Duration::from_secs(10);
+
+/// The approval wait for a session: `metadata.hitl_timeout_secs`, clamped to
+/// [`HITL_TIMEOUT_FLOOR`]..=[`HITL_APPROVAL_TIMEOUT`], or the default.
+fn hitl_timeout_from(metadata: &Value) -> Duration {
+    metadata
+        .get("hitl_timeout_secs")
+        .and_then(|v| v.as_u64())
+        .map(|s| Duration::from_secs(s).clamp(HITL_TIMEOUT_FLOOR, HITL_APPROVAL_TIMEOUT))
+        .unwrap_or(HITL_APPROVAL_TIMEOUT)
+}
+
 /// Whether a tool result *reports* a failure in its own content even though
 /// the call succeeded at the MCP level.
 ///
@@ -4662,7 +4728,30 @@ fn reports_tool_error(content: &str) -> bool {
 
 #[cfg(test)]
 mod tool_error_tests {
-    use super::reports_tool_error;
+    use super::{hitl_timeout_from, reports_tool_error, HITL_APPROVAL_TIMEOUT};
+    use serde_json::json;
+    use std::time::Duration;
+
+    #[test]
+    fn a_session_can_shorten_its_approval_wait_within_bounds() {
+        assert_eq!(hitl_timeout_from(&json!({})), HITL_APPROVAL_TIMEOUT);
+        assert_eq!(
+            hitl_timeout_from(&json!({"hitl_timeout_secs": 600})),
+            Duration::from_secs(600)
+        );
+        assert_eq!(
+            hitl_timeout_from(&json!({"hitl_timeout_secs": 0})),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            hitl_timeout_from(&json!({"hitl_timeout_secs": 999_999})),
+            HITL_APPROVAL_TIMEOUT
+        );
+        assert_eq!(
+            hitl_timeout_from(&json!({"hitl_timeout_secs": "600"})),
+            HITL_APPROVAL_TIMEOUT
+        );
+    }
 
     #[test]
     fn a_json_error_envelope_counts_as_a_tool_error() {
