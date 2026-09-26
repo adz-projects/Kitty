@@ -192,7 +192,7 @@ pub fn filter_indices(
             (start..end).collect(),
             has_more,
             total,
-            has_more.then(|| end),
+            has_more.then_some(end),
             false,
         );
     }
@@ -203,14 +203,14 @@ pub fn filter_indices(
         let start = offset.min(total);
         let idx: Vec<usize> = (start..end).collect();
         let has_more = end < total;
-        return (idx, has_more, 0, has_more.then(|| end), true);
+        return (idx, has_more, 0, has_more.then_some(end), true);
     }
     let total_matches = ranked.len();
     let end = offset.saturating_add(max_results).min(total_matches);
     let start = offset.min(total_matches);
     let idx: Vec<usize> = ranked[start..end].to_vec();
     let has_more = end < total_matches;
-    (idx, has_more, total_matches, has_more.then(|| end), false)
+    (idx, has_more, total_matches, has_more.then_some(end), false)
 }
 
 #[cfg(test)]

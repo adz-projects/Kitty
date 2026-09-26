@@ -76,21 +76,18 @@ pub async fn harvest_turn(engine: &Engine, pool: &SqlitePool, session_id: &str) 
             .and_then(|n| n.to_str())
             .unwrap_or(path.as_str())
             .to_string();
-        match extract_file(p).await {
-            Some(text) => {
-                ingest(
-                    engine,
-                    &now,
-                    "Attachment",
-                    &name,
-                    &path,
-                    Some(AttachmentIntent::Evidence),
-                    text,
-                )
-                .await;
-                ingested_any = true;
-            }
-            None => {}
+        if let Some(text) = extract_file(p).await {
+            ingest(
+                engine,
+                &now,
+                "Attachment",
+                &name,
+                &path,
+                Some(AttachmentIntent::Evidence),
+                text,
+            )
+            .await;
+            ingested_any = true;
         }
     }
 

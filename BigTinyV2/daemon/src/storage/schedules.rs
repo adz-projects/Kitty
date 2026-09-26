@@ -30,7 +30,7 @@ pub async fn list_schedules_for_app(
     pool: &SqlitePool,
     app_id: &str,
 ) -> Result<Vec<ScheduleRow>, StorageError> {
-    let sql = format!("SELECT id, name, cron, prompt, enabled, created_at, updated_at, app_id FROM schedule_jobs WHERE app_id = ? ORDER BY name");
+    let sql = "SELECT id, name, cron, prompt, enabled, created_at, updated_at, app_id FROM schedule_jobs WHERE app_id = ? ORDER BY name".to_string();
     let rows = sqlx::query_as::<_, ScheduleRow>(&sql)
         .bind(app_id)
         .fetch_all(pool)
@@ -44,7 +44,7 @@ pub async fn get_schedule_for_app(
     schedule_id: &str,
     app_id: &str,
 ) -> Result<Option<ScheduleRow>, StorageError> {
-    let sql = format!("SELECT id, name, cron, prompt, enabled, created_at, updated_at, app_id FROM schedule_jobs WHERE id = ? AND app_id = ?");
+    let sql = "SELECT id, name, cron, prompt, enabled, created_at, updated_at, app_id FROM schedule_jobs WHERE id = ? AND app_id = ?".to_string();
     let row = sqlx::query_as::<_, ScheduleRow>(&sql)
         .bind(schedule_id)
         .bind(app_id)

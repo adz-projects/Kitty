@@ -7,6 +7,10 @@
 //! (timestamps as store-format strings) and checks the frozen formulas
 //! bit-for-bit where the spec fixes them.
 
+// Tests set one or two Config knobs at a time; field-by-field reads clearer
+// than a struct literal that repeats `..Default::default()` each time.
+#![allow(clippy::field_reassign_with_default)]
+
 use chrono::{Duration, NaiveDateTime};
 
 use memorabilia::config::Config;
@@ -87,7 +91,7 @@ fn decay_deadline_rises_to_one_then_decays() {
         0.5 + 0.5 * (-2.0f64).exp(),
     );
     assert!(
-        (decay("deadline", &t, Some(t), t - d(14), &cfg).unwrap() - 0.56766764161830635).abs()
+        (decay("deadline", &t, Some(t), t - d(14), &cfg).unwrap() - 0.567_667_641_618_306_3).abs()
             < 1e-9
     );
     approx(
@@ -95,7 +99,7 @@ fn decay_deadline_rises_to_one_then_decays() {
         0.5 + 0.5 * (-1.0f64).exp(),
     );
     assert!(
-        (decay("deadline", &t, Some(t), t - d(7), &cfg).unwrap() - 0.68393972058572116).abs()
+        (decay("deadline", &t, Some(t), t - d(7), &cfg).unwrap() - 0.683_939_720_585_721_2).abs()
             < 1e-9
     );
     assert_eq!(decay("deadline", &t, Some(t), t, &cfg), Some(1.0));
@@ -122,7 +126,7 @@ fn decay_deadline_rises_to_one_then_decays() {
     // and the value never leaves [0, 1] anywhere along the sweep.
     for off in (-40..=40).step_by(3) {
         let v = decay("deadline", &t, Some(t), t + d(off), &cfg).unwrap();
-        assert!(v >= 0.0 && v <= 1.0, "decay {v} out of [0,1] at offset {off}d");
+        assert!((0.0..=1.0).contains(&v), "decay {v} out of [0,1] at offset {off}d");
     }
 
     // τ knobs: with tau_pre = 14d the T−14d point is one ramp-e-time out;

@@ -1,6 +1,6 @@
 [package]
 name = "memorabilia"
-version = "0.1.0"
+version = "0.11.4"
 edition = "2021"
 publish = false
 description = "Declarative factual memory engine: ingests evidence, abstracts atomic claims, tracks temporal deadlines, and serves a token-capped factual subgraph to a calling LLM. In-process; depends only on trait seams (StructuredChat/Embedder/VectorIndex). See project-plan.md (spec) and claude.md (working guide)."

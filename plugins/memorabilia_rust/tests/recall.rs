@@ -8,6 +8,10 @@
 //! rendered chunk but reinforces only undisputed ones; an unknown/archived
 //! item never resurfaces.
 
+// Tests set one or two Config knobs at a time; field-by-field reads clearer
+// than a struct literal that repeats `..Default::default()` each time.
+#![allow(clippy::field_reassign_with_default)]
+
 use std::sync::Arc;
 
 use serde_json::{json, Value};
@@ -108,7 +112,7 @@ async fn higher_cosine_seed_outranks_lower() {
     let idx = engine
         .search_index("databases replication shared query tokens", 0, 10)
         .await;
-    assert!(idx.len() >= 1, "at least the closer item must seed");
+    assert!(!idx.is_empty(), "at least the closer item must seed");
     // The top-ranked item is backed by the alpha source (the closer chunk).
     assert!(
         idx[0].citation.contains("alpha.example"),

@@ -9,6 +9,10 @@
 //! intent, seed-once), no LLM calls on the hot path, and tombstone
 //! re-learn blocks at Stages 1 and 3.
 
+// Tests set one or two Config knobs at a time; field-by-field reads clearer
+// than a struct literal that repeats `..Default::default()` each time.
+#![allow(clippy::field_reassign_with_default)]
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 

@@ -171,7 +171,7 @@ pub fn validate_read_only(command: &str) -> Result<&'static str, String> {
     // Everything the command names must be under `cwd`, which is the only part
     // of this call the daemon can check. See the module doc.
     for arg in trimmed.split_whitespace().skip(1) {
-        if let Some(why) = escapes_cwd(arg, *matched) {
+        if let Some(why) = escapes_cwd(arg, matched) {
             return Err(format!(
                 "`{arg}` {why}. lean_shell_ro only reads inside the working directory it was \
                  given, because that is the part of the call the daemon can check against this \
@@ -233,7 +233,7 @@ fn escapes_cwd(arg: &str, command: &str) -> Option<&'static str> {
         }
     }
     if arg
-        .split(|c| c == '/' || c == '\\')
+        .split(['/', '\\'])
         .any(|segment| segment == "..")
     {
         return Some("climbs out of the working directory");

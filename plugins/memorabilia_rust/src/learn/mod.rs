@@ -398,7 +398,7 @@ mod tests {
 
     #[test]
     fn chunking_is_deterministic_fixed_window() {
-        let text: String = std::iter::repeat('a').take(2500).collect();
+        let text: String = std::iter::repeat_n('a', 2500).collect();
         let chunks = chunk_text(&text, 512, 1024);
         assert_eq!(chunks.len(), 4);
         assert_eq!(chunks[0].len(), 1024);
@@ -418,7 +418,7 @@ mod tests {
 
     #[test]
     fn chunking_respects_injected_window() {
-        let text: String = std::iter::repeat('x').take(500).collect();
+        let text: String = std::iter::repeat_n('x', 500).collect();
         let chunks = chunk_text(&text, 100, 200);
         assert_eq!(chunks.len(), 4);
         assert!(chunks.iter().all(|c| c.len() == 200));

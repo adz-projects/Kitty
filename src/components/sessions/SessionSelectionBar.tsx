@@ -27,7 +27,12 @@ export function SessionSelectionBar({
   return (
     <div className="session-selection-bar">
       <div className="row">
-        <button onClick={onCancel} disabled={busy} title="Cancel selection" aria-label="Cancel selection">
+        <button
+          onClick={onCancel}
+          disabled={busy}
+          title="Cancel selection"
+          aria-label="Cancel selection"
+        >
           ✕
         </button>
         <span className="muted">{count} selected</span>

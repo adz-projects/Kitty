@@ -36,8 +36,10 @@ use serde_json::{json, Value};
 /// What a caller asked for.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum ResponseMode {
     /// Ordinary prose. The default.
+    #[default]
     Text,
     /// Valid JSON, with no schema attached.
     Json,
@@ -45,11 +47,6 @@ pub enum ResponseMode {
     Schema,
 }
 
-impl Default for ResponseMode {
-    fn default() -> Self {
-        Self::Text
-    }
-}
 
 /// What one request asks of the model's final answer, before it has been
 /// mapped to a dialect.

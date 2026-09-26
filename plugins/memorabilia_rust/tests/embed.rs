@@ -5,6 +5,10 @@
 //! "Ollama" endpoint is a raw-TCP responder bound to 127.0.0.1:0 inside
 //! this test process.
 
+// Tests set one or two Config knobs at a time; field-by-field reads clearer
+// than a struct literal that repeats `..Default::default()` each time.
+#![allow(clippy::field_reassign_with_default)]
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -175,7 +179,7 @@ async fn unreachable_endpoint_falls_back_to_hash_space_without_error() {
     let (v, tag) = p.embed("quarterly revenue exceeded 4 million").await.unwrap();
     assert_eq!(tag, HASH_EMBED_MODEL);
     assert_eq!(v, hash_embed("quarterly revenue exceeded 4 million", c.embedding_dim));
-    assert!(p.probe_semantic().await == false);
+    assert!(!p.probe_semantic().await);
 }
 
 #[tokio::test]

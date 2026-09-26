@@ -96,7 +96,7 @@ fn decode_hex_key(hex: &str) -> Result<[u8; KEY_LEN], String> {
 /// *already* encrypted under it unreadable, which is a worse outcome than a
 /// failed import.
 pub fn adopt_key(data_dir: &Path, hex: &str) -> Result<bool, DaemonError> {
-    let key_bytes = decode_hex_key(hex).map_err(|e| DaemonError::Crypto(e))?;
+    let key_bytes = decode_hex_key(hex).map_err(DaemonError::Crypto)?;
     let path = data_dir.join(KEY_FILE_NAME);
     if path.exists() {
         return Ok(false);

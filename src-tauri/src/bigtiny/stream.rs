@@ -661,6 +661,7 @@ impl DeltaBatcher {
 }
 
 /// Translate one BigTiny SSE event into its `chat://*` emission(s).
+#[allow(clippy::too_many_arguments)]
 fn handle_event(
     app: &AppHandle,
     session_id: &str,

@@ -841,7 +841,7 @@ async fn outbox_unique_pair_makes_redelivery_idempotent() {
     assert_eq!(batch.len(), 2);
     assert_eq!(batch[0].query_event_id, "ev_1", "FIFO: oldest first");
     assert_eq!(batch[1].query_event_id, "ev_2");
-    assert_eq!(batch[0].reinforced, false);
+    assert!(!batch[0].reinforced);
     assert!(batch[1].reinforced);
     db.delete_outbox_pairs("ev_1", &["c_1".into()]).await.unwrap();
     db.delete_outbox_pairs("ev_2", &["c_1".into()]).await.unwrap();

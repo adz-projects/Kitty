@@ -113,7 +113,7 @@ pub async fn pii_categories(
         match clf.classify(text).await {
             Ok(Some(cat)) => {
                 let cat = cat.trim().to_lowercase();
-                if !cat.is_empty() && !out.iter().any(|c| *c == cat) {
+                if !cat.is_empty() && !out.contains(&cat) {
                     out.push(cat);
                 }
             }
@@ -241,7 +241,7 @@ fn luhn_valid(digits: &str) -> bool {
         sum += if d > 9 { d - 9 } else { d };
         dbl = !dbl;
     }
-    sum % 10 == 0
+    sum.is_multiple_of(10)
 }
 
 fn find_credit_card(text: &str) -> bool {
@@ -413,7 +413,7 @@ fn find_phone(text: &str) -> bool {
 /// reading as a phone number.
 fn is_phone_shape(groups: &[String], has_sep: bool) -> bool {
     let total: usize = groups.iter().map(|g| g.len()).sum();
-    if total < 10 || total > 11 {
+    if !(10..=11).contains(&total) {
         return false;
     }
     if groups.is_empty() {

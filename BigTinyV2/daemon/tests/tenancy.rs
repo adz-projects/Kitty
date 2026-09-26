@@ -329,7 +329,7 @@ async fn the_empty_app_id_placeholder_is_unreachable() {
 
     for app in [APP_A, APP_B, ""] {
         let req = Request::builder()
-            .uri(format!("/api/chat/orphan/history"))
+            .uri("/api/chat/orphan/history".to_string())
             .body(Body::empty())
             .unwrap();
         let status = router_as(state.clone(), app).oneshot(req).await.unwrap().status();

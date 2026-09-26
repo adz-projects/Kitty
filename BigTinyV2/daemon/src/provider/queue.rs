@@ -56,8 +56,9 @@ pub enum Priority {
     Background,
 }
 
+/// One task waiting for a permit. Which queue it sits in encodes its
+/// priority, so the waiter itself only needs the wake-up channel.
 struct Waiter {
-    priority: Priority,
     tx: oneshot::Sender<()>,
 }
 
@@ -253,7 +254,7 @@ impl ProviderQueue {
                 };
             }
             let (tx, rx) = oneshot::channel();
-            let waiter = Waiter { priority, tx };
+            let waiter = Waiter { tx };
             let q = inner.queue_for(app_id);
             match priority {
                 Priority::Interactive => q.interactive.push_back(waiter),

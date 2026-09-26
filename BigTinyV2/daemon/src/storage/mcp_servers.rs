@@ -46,9 +46,7 @@ pub async fn list_servers_for_app(
     pool: &SqlitePool,
     app_id: &str,
 ) -> Result<Vec<MCPServerRow>, StorageError> {
-    let sql = format!(
-        "SELECT id, name, transport, command, args, url, env, headers, enabled, timeout_s, status, error_message, created_at, updated_at, app_id FROM mcp_servers WHERE (app_id = ?1 OR app_id IS NULL) ORDER BY name"
-    );
+    let sql = "SELECT id, name, transport, command, args, url, env, headers, enabled, timeout_s, status, error_message, created_at, updated_at, app_id FROM mcp_servers WHERE (app_id = ?1 OR app_id IS NULL) ORDER BY name".to_string();
     let rows = sqlx::query_as::<_, MCPServerRow>(&sql)
         .bind(app_id)
         .fetch_all(pool)
@@ -62,9 +60,7 @@ pub async fn get_server_for_app(
     server_id: &str,
     app_id: &str,
 ) -> Result<Option<MCPServerRow>, StorageError> {
-    let sql = format!(
-        "SELECT id, name, transport, command, args, url, env, headers, enabled, timeout_s, status, error_message, created_at, updated_at, app_id FROM mcp_servers WHERE id = ?2 AND (app_id = ?1 OR app_id IS NULL)"
-    );
+    let sql = "SELECT id, name, transport, command, args, url, env, headers, enabled, timeout_s, status, error_message, created_at, updated_at, app_id FROM mcp_servers WHERE id = ?2 AND (app_id = ?1 OR app_id IS NULL)".to_string();
     let row = sqlx::query_as::<_, MCPServerRow>(&sql)
         .bind(app_id)
         .bind(server_id)

@@ -28,8 +28,6 @@ use crate::provider::router::ProviderRouter;
 use crate::server::events::{SSEEvent, SSEEventType};
 use crate::storage::sessions;
 
-type PathwayEngine = adaptive_pathway::engine::PathwayEngine;
-
 use self::context::builder::ContextBuilder;
 use self::context::stats::SessionStats;
 use self::loop_::AgentLoop;

@@ -24,8 +24,7 @@ export const useAdaptivePathwayStore = create<AdaptivePathwayState>((set) => ({
         ipc.getAdaptivePathwayMcpStatus().catch(() => null),
         ipc.getMemorabiliaMcpStatus().catch(() => null),
       ]);
-      const anyAvailable =
-        (pathway?.tool_count ?? 0) > 0 || (memorabilia?.tool_count ?? 0) > 0;
+      const anyAvailable = (pathway?.tool_count ?? 0) > 0 || (memorabilia?.tool_count ?? 0) > 0;
       set({ available: anyAvailable });
     } catch {
       set({ available: false });

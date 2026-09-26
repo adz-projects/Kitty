@@ -22,6 +22,10 @@ use super::AppState;
 /// browses; beyond it the model's own `memorabilia_search` is the right tool.
 const BROWSE_LIMIT: i64 = 1000;
 
+/// One browsable proposition: node id, claim, confidence, disputed flag,
+/// importance, urgency, created-at -- in the `SELECT`'s column order.
+type PropositionRow = (String, String, f64, bool, String, String, String);
+
 fn err_response(status: StatusCode, message: impl Into<String>) -> Response {
     (status, Json(json!({"error": message.into()}))).into_response()
 }
@@ -59,7 +63,7 @@ pub async fn list_items(
         Err(e) => return *e,
     };
     let pool = engine.db.pool();
-    let rows: Result<Vec<(String, String, f64, bool, String, String, String)>, sqlx::Error> =
+    let rows: Result<Vec<PropositionRow>, sqlx::Error> =
         sqlx::query_as(
             "SELECT node_id, claim, confidence, is_disputed, importance, urgency, created_at \
              FROM propositions WHERE status = 'active' \

@@ -11,6 +11,10 @@
 //! extracted; the batch bound, the deterministic decay-profile resolution,
 //! and the forward-only watermark.
 
+// Tests set one or two Config knobs at a time; field-by-field reads clearer
+// than a struct literal that repeats `..Default::default()` each time.
+#![allow(clippy::field_reassign_with_default)]
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 

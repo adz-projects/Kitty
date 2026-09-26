@@ -1,6 +1,11 @@
 import { useState } from 'react';
 import type { ModelPickerEntry } from '@/lib/types';
-import { COST_TIER_LABEL, FILTER_LABEL, visibleModels, type PickerFilter } from './modelPickerUtils';
+import {
+  COST_TIER_LABEL,
+  FILTER_LABEL,
+  visibleModels,
+  type PickerFilter,
+} from './modelPickerUtils';
 
 /** Single-select model list for the provider-add redesign — shown once a
     key has validated successfully (`ProviderForm.tsx`'s "Check key & load

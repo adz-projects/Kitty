@@ -883,13 +883,26 @@ mod tests {
         }
     }
 
-    /// On Android the daemon is linked in, so the mirror above can be checked
-    /// against the real const instead of trusted.
-    #[cfg(target_os = "android")]
+    /// The mirror above, checked against the daemon's real const. Read from
+    /// the daemon's source rather than linked: desktop Kitty does not link the
+    /// daemon crate at all, and an Android-only test (which can link it) never
+    /// runs in CI, which has no device.
     #[test]
     fn the_mirrored_daemon_list_matches_the_real_one() {
+        const SRC: &str = include_str!("../../../BigTinyV2/daemon/src/mcp/builtin.rs");
+        let start = SRC
+            .find("pub const BUILTIN_SERVERS")
+            .expect("the daemon's BUILTIN_SERVERS const has moved or been renamed");
+        let body = &SRC[start..];
+        let open = body.find('[').and_then(|i| body[i + 1..].find('[').map(|j| i + 1 + j));
+        let open = open.expect("BUILTIN_SERVERS is no longer an array literal");
+        let close = open + body[open..].find(']').unwrap();
+        let mut actual: Vec<&str> = body[open + 1..close]
+            .split(',')
+            .map(|s| s.trim().trim_matches('"'))
+            .filter(|s| !s.is_empty())
+            .collect();
         let mut mirrored = DAEMON_BUILTIN_SERVERS.to_vec();
-        let mut actual = bigtiny2::mcp::builtin::BUILTIN_SERVERS.to_vec();
         mirrored.sort_unstable();
         actual.sort_unstable();
         assert_eq!(mirrored, actual, "DAEMON_BUILTIN_SERVERS has drifted");

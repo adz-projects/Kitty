@@ -215,9 +215,11 @@ impl MemorabiliaHost {
                         false,
                     ),
                 };
-                let mut mem_config = MemConfig::default();
-                mem_config.embedding_dim = dim;
-                mem_config.maintenance_tick_s = self.sweep_interval_s;
+                let mut mem_config = MemConfig {
+                    embedding_dim: dim,
+                    maintenance_tick_s: self.sweep_interval_s,
+                    ..MemConfig::default()
+                };
                 // Tag the vector space with the shared model's identity only
                 // when the semantic embedder actually resolved; the hash
                 // fallback keeps its own per-call HASH_EMBED_MODEL tag.

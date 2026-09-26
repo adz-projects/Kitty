@@ -92,7 +92,7 @@ export function HelperModels() {
         file,
         undefined,
         undefined,
-        gated ? tokens[file]?.trim() || undefined : undefined,
+        gated ? tokens[file]?.trim() || undefined : undefined
       );
       // Drop the token now the request is away.
       setTokens((cur) => {
@@ -232,9 +232,7 @@ export function HelperModels() {
                     placeholder="hf_…"
                     value={tokens[c.file] ?? ''}
                     disabled={busy}
-                    onChange={(e) =>
-                      setTokens((cur) => ({ ...cur, [c.file]: e.target.value }))
-                    }
+                    onChange={(e) => setTokens((cur) => ({ ...cur, [c.file]: e.target.value }))}
                   />
                 </div>
               )}
@@ -248,7 +246,8 @@ export function HelperModels() {
               <div className="muted">
                 {humanBytes(m.size_bytes)}
                 {m.info?.quantization && ` · ${m.info.quantization}`}
-                {m.info?.context_length && ` · ${Math.round(m.info.context_length / 1024)}k context`}
+                {m.info?.context_length &&
+                  ` · ${Math.round(m.info.context_length / 1024)}k context`}
               </div>
             </div>
             <button onClick={() => void remove(m)} title="Delete" aria-label={`Delete ${m.id}`}>

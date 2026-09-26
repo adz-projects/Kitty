@@ -19,7 +19,8 @@ export const CORPUS: Record<string, string> = {
   setextHeading: 'Section Title\n=============\n\nBody text.\n\nAnother\n---\n\nMore.\n',
   thematicBreak: 'Above.\n\n---\n\nBelow.\n',
   indentedCode: 'Example:\n\n    indented code\n\n    more indented code\n\nDone.\n',
-  headingsAndCode: '# Title\n\nSome text with `inline`.\n\n## Sub\n\n```ts\nconst a: number = 1;\n```\n\nEnd.\n',
+  headingsAndCode:
+    '# Title\n\nSome text with `inline`.\n\n## Sub\n\n```ts\nconst a: number = 1;\n```\n\nEnd.\n',
   refDefinition: 'See [the docs][d] for more.\n\nAnother paragraph.\n\n[d]: https://example.com\n',
   footnote: 'Text with a note.[^1]\n\nMore text.\n\n[^1]: The note body.\n',
   htmlBlock: 'Before.\n\n<div class="x">\n  raw html\n</div>\n\nAfter.\n',
@@ -57,11 +58,7 @@ describe('scanBlocks — losslessness', () => {
 
 describe('scanBlocks — boundaries it must take', () => {
   it('splits consecutive paragraphs', () => {
-    expect(splitMarkdownBlocks('one\n\ntwo\n\nthree\n')).toEqual([
-      'one\n\n',
-      'two\n\n',
-      'three\n',
-    ]);
+    expect(splitMarkdownBlocks('one\n\ntwo\n\nthree\n')).toEqual(['one\n\n', 'two\n\n', 'three\n']);
   });
 
   it('splits after a list closes', () => {
@@ -131,7 +128,10 @@ describe('scanBlocks — boundaries it must refuse', () => {
 
   it('closes a long fence only on an equally long run', () => {
     const text = '````\n```\ninner\n```\n\nstill in\n````\n\nafter\n';
-    expect(splitMarkdownBlocks(text)).toEqual(['````\n```\ninner\n```\n\nstill in\n````\n\n', 'after\n']);
+    expect(splitMarkdownBlocks(text)).toEqual([
+      '````\n```\ninner\n```\n\nstill in\n````\n\n',
+      'after\n',
+    ]);
   });
 });
 

@@ -50,6 +50,7 @@ use crate::error::StorageError;
 
 /// What a caller asked for, per request.
 #[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Default)]
 pub struct CacheDirective {
     /// Consult the cache. Default false for `/send` (chat nondeterminism is
     /// usually wanted) and true for jobs, which is the case that benefits.
@@ -69,16 +70,6 @@ pub struct CacheDirective {
     pub shared: bool,
 }
 
-impl Default for CacheDirective {
-    fn default() -> Self {
-        Self {
-            read: false,
-            write: false,
-            ttl_s: None,
-            shared: false,
-        }
-    }
-}
 
 impl CacheDirective {
     /// The default for a detached job: caching on, private to the app.

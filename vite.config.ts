@@ -42,9 +42,7 @@ export default defineConfig({
     strictPort: true,
     // HMR needs an explicit host for the same reason — the websocket URL the
     // client dials is otherwise `localhost`, which on the phone is the phone.
-    hmr: TAURI_DEV_HOST
-      ? { protocol: 'ws', host: TAURI_DEV_HOST, port: 1421 }
-      : undefined,
+    hmr: TAURI_DEV_HOST ? { protocol: 'ws', host: TAURI_DEV_HOST, port: 1421 } : undefined,
     // Vite's watcher excludes only node_modules/.git/outDir by default, so
     // everything else under the repo root is watched. `plugins/` holds ~76k
     // gitignored build artifacts (two Rust `target/` trees, four Python

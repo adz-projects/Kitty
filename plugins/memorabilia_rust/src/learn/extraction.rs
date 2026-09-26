@@ -391,7 +391,7 @@ impl Engine {
                 .acquire_owned()
                 .await
                 .map_err(|_| Error::Internal("extraction semaphore closed".into()))?;
-            let budget = std::time::Duration::from_secs(self.config.extraction.timeout_s as u64);
+            let budget = std::time::Duration::from_secs(self.config.extraction.timeout_s);
             tokio::time::timeout(budget, self.chat.structured_chat(
                 build_extraction_prompt(&chunk, &neighbors),
                 &extraction_schema(),
@@ -611,7 +611,7 @@ impl Engine {
             .await
             .map_err(Error::Internal)?;
         let min = self.config.conflict_probe_similarity_min;
-        let limit = self.config.conflict_probe_neighbors as usize;
+        let limit = self.config.conflict_probe_neighbors;
         let mut cross: Vec<Chunk> = Vec::new();
         let mut same: Vec<Chunk> = Vec::new();
         for (id, cos) in hits {

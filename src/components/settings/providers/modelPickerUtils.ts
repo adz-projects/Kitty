@@ -60,9 +60,7 @@ export function applyFilter(models: ModelPickerEntry[], filter: PickerFilter): M
 export function applySearch(models: ModelPickerEntry[], query: string): ModelPickerEntry[] {
   const q = query.trim().toLowerCase();
   if (!q) return models;
-  return models.filter(
-    (m) => m.name.toLowerCase().includes(q) || m.id.toLowerCase().includes(q),
-  );
+  return models.filter((m) => m.name.toLowerCase().includes(q) || m.id.toLowerCase().includes(q));
 }
 
 /** The single entry point `ModelPicker.tsx` renders from: search (if any)
@@ -71,7 +69,7 @@ export function applySearch(models: ModelPickerEntry[], query: string): ModelPic
 export function visibleModels(
   models: ModelPickerEntry[],
   filter: PickerFilter | null,
-  search: string,
+  search: string
 ): ModelPickerEntry[] {
   if (search.trim()) return applySearch(sortAlphabetical(models), search);
   if (filter) return applyFilter(models, filter);

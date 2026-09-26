@@ -8,6 +8,10 @@
 //! permanently + tombstones; `outdated` suppresses for
 //! `outdated_suppression_days` with no tombstone.
 
+// Tests set one or two Config knobs at a time; field-by-field reads clearer
+// than a struct literal that repeats `..Default::default()` each time.
+#![allow(clippy::field_reassign_with_default)]
+
 use std::sync::Arc;
 
 use memorabilia::config::Config;

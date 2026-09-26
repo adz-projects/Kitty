@@ -70,7 +70,7 @@ export function ModelDownloadCard({
         model.file,
         undefined,
         downloadIdFor(role),
-        model.gated ? token.trim() || undefined : undefined,
+        model.gated ? token.trim() || undefined : undefined
       );
       // Drop the token from memory the moment the request is on its way — it
       // isn't needed again, and the resume path re-prompts if it ever is.

@@ -34,7 +34,12 @@ pub mod vectors;
 fn register_sqlite_vec() {
     static REGISTERED: Once = Once::new();
     REGISTERED.call_once(|| unsafe {
-        libsqlite3_sys::sqlite3_auto_extension(Some(std::mem::transmute(
+        type InitFn = unsafe extern "C" fn(
+            *mut libsqlite3_sys::sqlite3,
+            *mut *mut std::os::raw::c_char,
+            *const libsqlite3_sys::sqlite3_api_routines,
+        ) -> std::os::raw::c_int;
+        libsqlite3_sys::sqlite3_auto_extension(Some(std::mem::transmute::<*const (), InitFn>(
             sqlite_vec::sqlite3_vec_init as *const (),
         )));
     });
@@ -409,7 +414,7 @@ pub fn encode_embedding(v: &[f32]) -> Vec<u8> {
 /// corrupt; the trailing partial f32 is dropped and a warning is logged so a
 /// genuinely corrupt row is visible instead of silently truncated.
 pub fn decode_embedding(bytes: &[u8]) -> Vec<f32> {
-    if !bytes.is_empty() && bytes.len() % 4 != 0 {
+    if !bytes.is_empty() && !bytes.len().is_multiple_of(4) {
         tracing::warn!(
             "decode_embedding: {} bytes is not a multiple of 4 -- BLOB is corrupt or not an f32 vector; \
              decoding the {} complete f32s found and dropping the trailing {} byte(s)",

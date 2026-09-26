@@ -44,9 +44,7 @@ describe('applyFilter — top 10, ranked', () => {
   });
 
   it('caps the ranked result at 10', () => {
-    const models = Array.from({ length: 15 }, (_, i) =>
-      entry({ id: `m${i}`, price_rank: i }),
-    );
+    const models = Array.from({ length: 15 }, (_, i) => entry({ id: `m${i}`, price_rank: i }));
     expect(applyFilter(models, 'cheapest')).toHaveLength(10);
   });
 
@@ -82,7 +80,9 @@ describe('applySearch', () => {
   });
 
   it('is not capped at 10 — search works across the full list', () => {
-    const many = Array.from({ length: 20 }, (_, i) => entry({ id: `match-${i}`, name: `Match ${i}` }));
+    const many = Array.from({ length: 20 }, (_, i) =>
+      entry({ id: `match-${i}`, name: `Match ${i}` })
+    );
     expect(applySearch(many, 'match')).toHaveLength(20);
   });
 });
@@ -94,7 +94,7 @@ describe('sortAlphabetical', () => {
   });
 });
 
-describe('visibleModels — the picker\'s single entry point', () => {
+describe("visibleModels — the picker's single entry point", () => {
   const models = [
     entry({ id: 'a', name: 'Alpha', price_rank: 2 }),
     entry({ id: 'b', name: 'Beta', price_rank: 1 }),

@@ -44,10 +44,6 @@ export function ChatTranscript() {
   }
 
   return (
-    <MessageList
-      messages={messages}
-      empty={title ?? 'Start a new chat.'}
-      stage={progressStage}
-    />
+    <MessageList messages={messages} empty={title ?? 'Start a new chat.'} stage={progressStage} />
   );
 }

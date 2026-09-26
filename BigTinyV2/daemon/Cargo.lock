@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "adaptive-pathway"
-version = "0.1.0"
+version = "0.11.4"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2457,7 +2457,7 @@ dependencies = [
 
 [[package]]
 name = "kitty-tools"
-version = "0.1.0"
+version = "0.11.4"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2478,7 +2478,7 @@ dependencies = [
 
 [[package]]
 name = "kitty-wasm"
-version = "0.1.0"
+version = "0.11.4"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2496,7 +2496,7 @@ dependencies = [
 
 [[package]]
 name = "kitty-web"
-version = "0.1.0"
+version = "0.11.4"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2838,7 +2838,7 @@ checksum = "38d1115007560874e373613744c6fba374c17688327a71c1476d1a5954cc857b"
 
 [[package]]
 name = "memorabilia"
-version = "0.1.0"
+version = "0.11.4"
 dependencies = [
  "async-trait",
  "chrono",
