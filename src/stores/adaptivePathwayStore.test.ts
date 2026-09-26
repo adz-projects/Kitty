@@ -1,14 +1,19 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 const getAdaptivePathwayMcpStatus = vi.fn();
+const getMemorabiliaMcpStatus = vi.fn();
 
 vi.mock('@/lib/ipc', () => ({
-  ipc: { getAdaptivePathwayMcpStatus },
+  ipc: { getAdaptivePathwayMcpStatus, getMemorabiliaMcpStatus },
 }));
 
 beforeEach(() => {
   vi.resetModules();
   getAdaptivePathwayMcpStatus.mockReset();
+  // The incognito control covers both engines; these cases isolate pathway,
+  // so memorabilia reports "engine disabled" throughout.
+  getMemorabiliaMcpStatus.mockReset();
+  getMemorabiliaMcpStatus.mockResolvedValue(null);
 });
 
 describe('adaptivePathwayStore.init', () => {
