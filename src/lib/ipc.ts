@@ -105,8 +105,7 @@ export const ipc = {
       looking?" signal — there's no per-window focus there — and it gates the
       turn-complete notification. Harmless on desktop, where the toast gate uses
       window focus instead. Best-effort. */
-  setAppForeground: (foreground: boolean) =>
-    invoke<void>('set_app_foreground', { foreground }),
+  setAppForeground: (foreground: boolean) => invoke<void>('set_app_foreground', { foreground }),
   /** "Set as working directory" (agentic mode) — repoints an existing
       session's cwd in place instead of forking a new session, so BigTiny's
       directory sandbox can allow both the original chat_dir and this newly-
@@ -316,6 +315,9 @@ export const ipc = {
   upsertProvider: (profile: ProviderProfile, secret: string | null) =>
     invoke<ProviderProfile>('upsert_provider', { profile, secret }),
   deleteProvider: (id: string) => invoke<void>('delete_provider', { id }),
+  /** Copy a provider card (fresh id, same key, "(copy)" name) — how a user
+      adds a second model from the same provider. */
+  duplicateProvider: (id: string) => invoke<ProviderProfile>('duplicate_provider', { id }),
   activateProvider: (id: string | null, sessionId?: string | null) =>
     invoke<void>('activate_provider', { id, sessionId: sessionId ?? null }),
   setSessionProvider: (sessionId: string, providerId: string, model?: string | null) =>

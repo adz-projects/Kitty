@@ -177,7 +177,13 @@ describe('ipc event subscription wrappers', () => {
   });
 
   it('downloadModel forwards a HuggingFace token for a gated repo', () => {
-    void ipc.downloadModel('litert-community/embeddinggemma-300m', 'm.tflite', 'main', 'gated-id', 'hf_secret');
+    void ipc.downloadModel(
+      'litert-community/embeddinggemma-300m',
+      'm.tflite',
+      'main',
+      'gated-id',
+      'hf_secret'
+    );
     expect(invokeMock).toHaveBeenCalledWith('download_model', {
       repo: 'litert-community/embeddinggemma-300m',
       file: 'm.tflite',

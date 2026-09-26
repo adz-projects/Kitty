@@ -6,6 +6,7 @@ import { TrustIcon, trustKind } from '@/lib/provider_trust';
 import { ProviderTypeIcon, providerTypeLabel } from '@/components/icons/ProviderTypeIcon';
 import { StarIcon } from '@/components/icons/StarIcon';
 import { PencilIcon } from '@/components/icons/PencilIcon';
+import { CopyIcon } from '@/components/icons/CopyIcon';
 import { TrashIcon } from '@/components/icons/TrashIcon';
 import { ProviderForm } from './providers/ProviderForm';
 import { blank, hostOf, isLocal } from './providers/providerUtils';
@@ -113,6 +114,19 @@ export function Providers({ highlight }: { highlight: string | null }) {
     void activate(p, true);
   };
 
+  // Each card holds one model; duplicating is how a second model from the same
+  // provider gets its own card. Opens the copy for editing straight away,
+  // since the next thing the user does is change its model.
+  const onDuplicate = async (p: ProviderView) => {
+    try {
+      const copy = await ipc.duplicateProvider(p.id);
+      await refresh();
+      setEditing({ ...copy });
+      setSecret('');
+    } catch (e) {
+      setError(String(e));
+    }
+  };
   const onDelete = async (p: ProviderView) => {
     if (!confirm(`Delete "${p.name}"?`)) return;
     try {
@@ -135,9 +149,7 @@ export function Providers({ highlight }: { highlight: string | null }) {
 
       <div className="provider-list">
         {providers.length === 0 && (
-          <p className="muted">
-            No profiles yet. Add one, or use a local model from Settings &rarr; Local Models.
-          </p>
+          <p className="muted">No providers yet. Add one to start chatting.</p>
         )}
         {providers.map((p) => (
           <div
@@ -241,6 +253,14 @@ export function Providers({ highlight }: { highlight: string | null }) {
                 aria-label={`Edit ${p.name}`}
               >
                 <PencilIcon />
+              </button>
+              <button
+                className="icon-button"
+                onClick={() => void onDuplicate(p)}
+                title="Duplicate — to use another model from this provider"
+                aria-label={`Duplicate ${p.name}`}
+              >
+                <CopyIcon />
               </button>
               <button
                 className="icon-button"

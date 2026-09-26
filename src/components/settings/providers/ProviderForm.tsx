@@ -17,6 +17,12 @@ import {
   tierOf,
   usesModelPicker,
 } from './providerUtils';
+import { isAndroid } from '@/lib/platform';
+
+/** Where an API key actually lives — the OS store differs per platform. */
+const SECRET_STORE_NOTE = isAndroid()
+  ? 'Encrypted with a key held in Android’s secure keystore, never stored in plain text.'
+  : 'Stored in Windows Credential Manager, never on disk.';
 
 export function ProviderForm({
   profile,
@@ -103,7 +109,7 @@ export function ProviderForm({
 
   // Save stays disabled until the picker has a selection, for the new-flow
   // types (see `canSaveProvider`'s own doc comment).
-  const canSave = canSaveProvider(profile.provider_type, profile.models);
+  const canSave = canSaveProvider(profile.models);
 
   return (
     <Modal title={profile.id ? 'Edit provider' : 'Add provider'} onClose={onCancel}>
@@ -151,7 +157,7 @@ export function ProviderForm({
           </small>
           {tierOf(profile.base_url) === 'personal' && (
             <small className="muted">
-              This is a Tailscale address, so one URL works both at home and away: BigTiny
+              This is a Tailscale address, so one URL works both at home and away: Kitty
               automatically tries a direct LAN connection first when you&rsquo;re on the same
               network as the server, and falls back to routing over Tailscale otherwise — no need to
               switch URLs manually.
@@ -165,7 +171,7 @@ export function ProviderForm({
           <label className="field">
             <span>API key {profile.id ? '(leave blank to keep)' : ''}</span>
             <input type="password" value={secret} onChange={(e) => onSecret(e.target.value)} />
-            <small className="muted">Stored in Windows Credential Manager, never on disk.</small>
+            <small className="muted">{SECRET_STORE_NOTE}</small>
           </label>
           <div className="field">
             <span>Model</span>
@@ -197,18 +203,14 @@ export function ProviderForm({
         </>
       ) : (
         <label className="field">
-          <span>Models (comma-separated)</span>
+          <span>Model</span>
           <input
-            value={profile.models.join(', ')}
-            onChange={(e) =>
-              set({
-                models: e.target.value
-                  .split(',')
-                  .map((m) => m.trim())
-                  .filter(Boolean),
-              })
-            }
+            value={profile.models[0] ?? ''}
+            onChange={(e) => set({ models: e.target.value.trim() ? [e.target.value.trim()] : [] })}
           />
+          <small className="muted">
+            One model per provider. To use another model here, duplicate this provider.
+          </small>
         </label>
       )}
 
@@ -216,7 +218,7 @@ export function ProviderForm({
         <label className="field">
           <span>API key {profile.id ? '(leave blank to keep)' : ''}</span>
           <input type="password" value={secret} onChange={(e) => onSecret(e.target.value)} />
-          <small className="muted">Stored in Windows Credential Manager, never on disk.</small>
+          <small className="muted">{SECRET_STORE_NOTE}</small>
         </label>
       )}
 
@@ -288,13 +290,11 @@ export function ProviderForm({
           </label>
 
           <label className="field">
-            <span>
-              Custom system prompt (optional — overrides the built-in agentic/chat default)
-            </span>
+            <span>Custom system prompt (optional — overrides Kitty&apos;s built-in default)</span>
             <textarea
               rows={4}
               value={profile.system_prompt ?? ''}
-              placeholder="Default: a built-in prompt matching the session's current chat/agent mode…"
+              placeholder="Default: Kitty's built-in system prompt…"
               onChange={(e) => set({ system_prompt: e.target.value || null })}
             />
             <small className="muted">
@@ -529,7 +529,7 @@ export function ProviderForm({
             )}
             {profile.context_length != null && (
               <small className="muted">
-                Used as BigTiny&apos;s max_context_tokens for this provider, overriding the global
+                Used as this provider&apos;s context window, overriding the global token management
                 value in Settings → Advanced.
               </small>
             )}

@@ -67,7 +67,6 @@ export function GraphHealth() {
 
   const tested = beliefs.filter((b) => b.tested).length;
   const contradicted = beliefs.filter((b) => b.contradict_count > 0).length;
-  const pinned = beliefs.filter((b) => b.pinned).length;
   const avgConfidence = beliefs.length
     ? beliefs.reduce((sum, b) => sum + b.confidence, 0) / beliefs.length
     : 0;
@@ -121,9 +120,6 @@ export function GraphHealth() {
             <div>
               <strong>{(avgConfidence * 100).toFixed(0)}%</strong> average confidence
             </div>
-            <div>
-              <strong>{pinned}</strong> marked to always keep in mind
-            </div>
             {contradicted > 0 && (
               <div>
                 <strong>{contradicted}</strong> conflict with something learned since
@@ -147,9 +143,9 @@ export function GraphHealth() {
 
       <h3>Maintenance</h3>
       <p className="muted">
-        If Kitty stops learning, the memory database may have been corrupted (for example by a
-        crash mid-write). This checks it and, only if needed, rebuilds it — keeping every record
-        it can still read and backing up the old file first.
+        If Kitty stops learning, the memory database may have been corrupted (for example by a crash
+        mid-write). This checks it and, only if needed, rebuilds it — keeping every record it can
+        still read and backing up the old file first.
       </p>
       <div className="field">
         <button onClick={() => void repair()} disabled={repairing}>

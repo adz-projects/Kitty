@@ -228,6 +228,7 @@ pub fn run() {
             commands::list_providers,
             commands::upsert_provider,
             commands::delete_provider,
+            commands::duplicate_provider,
             commands::activate_provider,
             commands::set_session_provider,
             commands::test_active_provider_connection,

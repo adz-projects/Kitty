@@ -18,23 +18,17 @@ describe('usesModelPicker', () => {
 });
 
 describe('canSaveProvider', () => {
-  it('legacy-form types are always savable regardless of the models array', () => {
-    expect(canSaveProvider('local', [])).toBe(true);
-    expect(canSaveProvider('custom_openai', [])).toBe(true);
-    expect(canSaveProvider('custom_openai', ['a', 'b', 'c'])).toBe(true);
+  it('requires exactly one non-empty model', () => {
+    expect(canSaveProvider([])).toBe(false);
+    expect(canSaveProvider(['anthropic/claude-sonnet-5'])).toBe(true);
   });
 
-  it('new-flow types require exactly one non-empty model', () => {
-    expect(canSaveProvider('openrouter', [])).toBe(false);
-    expect(canSaveProvider('openrouter', ['anthropic/claude-sonnet-5'])).toBe(true);
+  it('rejects more than one model (duplicate the card instead)', () => {
+    expect(canSaveProvider(['model-a', 'model-b'])).toBe(false);
   });
 
-  it('new-flow types reject more than one model', () => {
-    expect(canSaveProvider('anthropic', ['model-a', 'model-b'])).toBe(false);
-  });
-
-  it('new-flow types reject a single blank/whitespace-only model', () => {
-    expect(canSaveProvider('openai', [''])).toBe(false);
-    expect(canSaveProvider('openai', ['   '])).toBe(false);
+  it('rejects a single blank/whitespace-only model', () => {
+    expect(canSaveProvider([''])).toBe(false);
+    expect(canSaveProvider(['   '])).toBe(false);
   });
 });

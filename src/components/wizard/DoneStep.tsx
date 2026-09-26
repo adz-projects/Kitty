@@ -46,8 +46,9 @@ export function DoneStep({ onBack }: { onBack: () => void }) {
     <section className="wizard-panel">
       <h1>You're all set</h1>
       <p className="muted">
-        Press your hotkey any time to summon Kitty. You can re-run this from Settings → Setup &amp;
-        Repair, or fine-tune everything from Settings once you're chatting.
+        {isAndroid()
+          ? 'You can re-run setup from Settings → Advanced, or fine-tune everything from Settings once you’re chatting.'
+          : 'Press your hotkey any time to summon Kitty. You can re-run setup from Settings → Advanced, or fine-tune everything from Settings once you’re chatting.'}
       </p>
 
       <div className="wizard-summary">
@@ -87,7 +88,9 @@ export function DoneStep({ onBack }: { onBack: () => void }) {
         {validation && (
           <p className="muted" style={{ margin: 0, fontSize: 14 }}>
             Adaptive Pathway (learns your preferences over time):{' '}
-            {validation.adaptive_pathway_ok ? 'ready' : 'not running yet — see Settings → Advanced'}
+            {validation.adaptive_pathway_ok
+              ? 'ready'
+              : 'not running yet — see Settings → Adaptive Pathway'}
           </p>
         )}
       </div>

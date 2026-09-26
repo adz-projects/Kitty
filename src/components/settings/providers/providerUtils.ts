@@ -22,12 +22,9 @@ export function usesModelPicker(providerType: ProviderType): boolean {
   return !LEGACY_FORM_TYPES.includes(providerType);
 }
 
-/** The actual mechanism enforcing "exactly one model" for the new-flow
-    types — legacy-form types keep whatever gating existed before (none
-    beyond the fields already required, i.e. always savable from this
-    check's point of view). */
-export function canSaveProvider(providerType: ProviderType, models: string[]): boolean {
-  if (!usesModelPicker(providerType)) return true;
+/** One provider card, one model: every type needs exactly one non-empty
+    model. To use a second model from the same provider, duplicate the card. */
+export function canSaveProvider(models: string[]): boolean {
   return models.length === 1 && Boolean(models[0]?.trim());
 }
 

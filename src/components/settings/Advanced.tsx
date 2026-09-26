@@ -257,7 +257,7 @@ export function Advanced() {
           </div>
 
           <div className="field">
-            <span>Setup &amp; Repair</span>
+            <span>Engine and setup</span>
             <p className="muted" style={{ margin: 0 }}>
               Stack status: <strong>{stackStatus.replace(/_/g, ' ')}</strong>
             </p>
@@ -308,7 +308,7 @@ export function Advanced() {
       {logOpen && (
         <div>
           <p className="muted">
-            Warnings and errors captured from Kitty&apos;s own background processes (goosed
+            Warnings and errors captured from Kitty&apos;s own background processes (engine
             connection issues, health checks, provider/config problems) — useful for reporting a
             bug. This doesn&apos;t include anything the model itself said, only Kitty&apos;s own
             internal diagnostics.

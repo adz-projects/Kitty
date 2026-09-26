@@ -230,10 +230,6 @@ export function General() {
         </>
       )}
 
-      <p className="muted">
-        Approval mode is per session — change it from the shield badge next to the composer.
-      </p>
-
       <div className="row">
         <button className="primary" onClick={() => void save()}>
           Save

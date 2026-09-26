@@ -66,7 +66,9 @@ describe('stripPromptPreamble transcript sentinel', () => {
   const wrap = (prior: Message[], userText: string) =>
     'Continuing the conversation below. Earlier reasoning/thinking has been omitted ' +
     'to keep this response focused.\n\n' +
-    prior.map((m) => (m.role === 'user' ? `User: ${m.text}` : `Assistant: ${m.text}`)).join('\n\n') +
+    prior
+      .map((m) => (m.role === 'user' ? `User: ${m.text}` : `Assistant: ${m.text}`))
+      .join('\n\n') +
     '\n\n[End of earlier conversation]' +
     `\n\nUser: ${userText}`;
 

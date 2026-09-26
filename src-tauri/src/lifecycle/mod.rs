@@ -236,6 +236,8 @@ pub fn start_stack(app: &AppHandle) {
         // Publishes `Ready` on every exit path from this task, including a
         // panic — see `StartupPhaseGuard`.
         let _phase = StartupPhaseGuard { app: app.clone() };
+        // Before anything reads the provider list: one card, one model.
+        crate::config::providers::migrate_multi_model_profiles(&app).await;
         // Spawn the BigTiny daemon. No provider env vars — providers are
         // registered at runtime over REST (see
         // `bigtiny::providers::sync_active_provider` right after spawn).

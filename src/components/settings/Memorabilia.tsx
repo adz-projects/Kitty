@@ -68,9 +68,9 @@ export function Memorabilia() {
     <section className="settings-section">
       <h1>Memorabilia</h1>
       <p className="muted">
-        Remembers durable facts from ordinary conversation — what&apos;s true about your work,
-        your projects, and the things you tell it — and quietly brings the relevant ones back
-        when they matter. Everything it holds is something you can see and correct below.
+        Remembers durable facts from ordinary conversation — what&apos;s true about your work, your
+        projects, and the things you tell it — and quietly brings the relevant ones back when they
+        matter. Everything it holds is something you can see and correct below.
       </p>
       {error && <div className="chat-error">{error}</div>}
 
@@ -93,7 +93,7 @@ export function Memorabilia() {
           {mcpStatusError ? (
             <>Couldn&apos;t check tool registration: {mcpStatusError}</>
           ) : mcpStatus == null ? (
-            <>Tools not registered with BigTiny yet — will appear shortly.</>
+            <>Tools not registered yet — they&apos;ll appear shortly.</>
           ) : mcpStatus.status === 'connected' ? (
             <>
               Connected: <strong>{mcpStatus.tool_count}</strong> tool

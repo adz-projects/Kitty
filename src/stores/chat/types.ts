@@ -109,4 +109,3 @@ export interface PendingImage {
   mime: string;
   data_url: string;
 }
-

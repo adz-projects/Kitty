@@ -91,7 +91,7 @@ export function AdaptivePathway() {
         model.file,
         undefined,
         EMBEDDING_DOWNLOAD_ID,
-        model.gated ? token.trim() || undefined : undefined,
+        model.gated ? token.trim() || undefined : undefined
       );
       setToken(''); // done with it — drop it from memory
     } catch (e) {
@@ -151,7 +151,7 @@ export function AdaptivePathway() {
           {mcpStatusError ? (
             <>Couldn&apos;t check tool registration: {mcpStatusError}</>
           ) : mcpStatus == null ? (
-            <>Tools not registered with BigTiny yet — will appear shortly.</>
+            <>Tools not registered yet — they&apos;ll appear shortly.</>
           ) : mcpStatus.status === 'connected' ? (
             <>
               Connected: <strong>{mcpStatus.tool_count}</strong> tool

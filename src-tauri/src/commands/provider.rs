@@ -116,6 +116,35 @@ pub async fn upsert_provider(
     Ok(profile)
 }
 
+/// Copy a provider card — the way to use a second model from the same
+/// provider, since each card holds exactly one. The copy gets a fresh id, the
+/// source's secret, and a "(copy)" name; it is never the default.
+#[tauri::command]
+pub async fn duplicate_provider(app: AppHandle, id: String) -> Result<ProviderProfile, String> {
+    let mut copy = {
+        let state = app.state::<AppState>();
+        let cfg = state.config.lock().unwrap();
+        cfg.providers
+            .iter()
+            .find(|p| p.id == id)
+            .cloned()
+            .ok_or_else(|| "That provider no longer exists.".to_string())?
+    };
+    copy.id = format!("prof_{}", chrono::Utc::now().timestamp_millis());
+    copy.name = format!("{} (copy)", copy.name);
+    copy.created_at = chrono::Utc::now().to_rfc3339();
+    if let Some(secret) = providers::get_secret_checked(&id).await? {
+        providers::set_secret_async(&copy.id, &secret).await?;
+    }
+    {
+        let state = app.state::<AppState>();
+        let mut cfg = state.config.lock().unwrap();
+        cfg.providers.push(copy.clone());
+        config::save(&cfg).map_err(|e| e.to_string())?;
+    }
+    Ok(copy)
+}
+
 /// Delete a provider profile (and its stored secret).
 ///
 /// `async` for a platform reason, not a performance one: a *synchronous*

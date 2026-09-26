@@ -31,13 +31,10 @@ function sectionLabels(): Record<string, string> {
   };
 }
 
-/** Three groups, in nav order (settings IA overhaul). Graph Health and Domain
-    Profiles are no longer separate tabs (release-fixes items 23/24): Graph
-    Health rolled into Adaptive Pathway as a section, Domain Profiles is
-    hidden entirely (nothing to configure there — see DomainProfiles.tsx's
-    own doc comment). Local Models is always present: even an API-key user
-    needs an embedding model for the memory engine, and it's where a "no
-    model downloaded" status deep-links to. */
+/** Three groups, in nav order (settings IA overhaul). Graph Health is a
+    section of Adaptive Pathway rather than a tab of its own. Helper Models is
+    always present: it's where the optional memory and summarizer models are
+    downloaded. */
 function buildGroups(): { label: string; sections: string[] }[] {
   return [
     {

@@ -161,9 +161,124 @@ pub fn emit_health_from_send_result(app: &AppHandle, reachable: bool) {
     );
 }
 
+/// One provider card holds exactly one model (v1). A profile saved while the
+/// form still took a comma-separated list is split into one profile per model,
+/// each named after its model; the first keeps the original id, so sessions
+/// already pinned to it are unaffected.
+///
+/// Pure: returns `(source_id, new_id)` for every profile created, because each
+/// new card needs its own copy of the source's secret, and the keystore is
+/// async (and platform-dispatched) where this is not.
+pub fn split_multi_model_profiles(providers: &mut Vec<ProviderProfile>) -> Vec<(String, String)> {
+    let mut copies = Vec::new();
+    let taken: std::collections::HashSet<String> = providers.iter().map(|p| p.id.clone()).collect();
+    let mut out = Vec::with_capacity(providers.len());
+    for p in providers.drain(..) {
+        if p.models.len() <= 1 {
+            out.push(p);
+            continue;
+        }
+        let mut first = p.clone();
+        first.models = vec![p.models[0].clone()];
+        first.name = format!("{} ({})", p.name, p.models[0]);
+        out.push(first);
+        for (i, model) in p.models.iter().enumerate().skip(1) {
+            let mut n = i;
+            let id = loop {
+                let candidate = format!("{}-m{n}", p.id);
+                if !taken.contains(&candidate) {
+                    break candidate;
+                }
+                n += 1;
+            };
+            let mut copy = p.clone();
+            copy.id = id.clone();
+            copy.models = vec![model.clone()];
+            copy.name = format!("{} ({model})", p.name);
+            copies.push((p.id.clone(), id));
+            out.push(copy);
+        }
+    }
+    *providers = out;
+    copies
+}
+
+/// Apply [`split_multi_model_profiles`] to the saved config, copying each
+/// source profile's secret to the cards made from it. Runs once per launch;
+/// a no-op when every profile already has at most one model.
+pub async fn migrate_multi_model_profiles(app: &AppHandle) {
+    let copies = {
+        let state = app.state::<AppState>();
+        let mut cfg = state.config.lock().unwrap();
+        let copies = split_multi_model_profiles(&mut cfg.providers);
+        if copies.is_empty() {
+            return;
+        }
+        if let Err(e) = crate::config::save(&cfg) {
+            tracing::warn!("could not save the split provider profiles: {e}");
+        }
+        copies
+    };
+    for (source, target) in copies {
+        match get_secret_checked(&source).await {
+            Ok(Some(secret)) => {
+                if let Err(e) = set_secret_async(&target, &secret).await {
+                    tracing::warn!("could not copy the key for provider {target}: {e}");
+                }
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!("could not read the key for provider {source}: {e}"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn profile_with(id: &str, name: &str, models: &[&str]) -> ProviderProfile {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "name": name, "provider_type": "custom_openai",
+            "base_url": "http://box:8080", "models": models,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_multi_model_profile_becomes_one_card_per_model() {
+        let mut providers = vec![
+            profile_with("a", "Solo", &["m1"]),
+            profile_with("b", "Box", &["x", "y", "z"]),
+        ];
+        let copies = split_multi_model_profiles(&mut providers);
+        let ids: Vec<&str> = providers.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, ["a", "b", "b-m1", "b-m2"]);
+        assert!(providers.iter().all(|p| p.models.len() == 1));
+        assert_eq!(providers[0].name, "Solo", "single-model cards are untouched");
+        assert_eq!(providers[1].name, "Box (x)");
+        assert_eq!(providers[3].models, ["z"]);
+        assert_eq!(
+            copies,
+            [("b".to_string(), "b-m1".to_string()), ("b".to_string(), "b-m2".to_string())]
+        );
+    }
+
+    #[test]
+    fn split_ids_never_collide_with_existing_profiles() {
+        let mut providers = vec![profile_with("b", "Box", &["x", "y"]), profile_with("b-m1", "Other", &["q"])];
+        split_multi_model_profiles(&mut providers);
+        let mut ids: Vec<&str> = providers.iter().map(|p| p.id.as_str()).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), 3);
+    }
+
+    #[test]
+    fn nothing_to_split_is_a_no_op() {
+        let mut providers = vec![profile_with("a", "A", &["m"]), profile_with("e", "Empty", &[])];
+        assert!(split_multi_model_profiles(&mut providers).is_empty());
+        assert_eq!(providers.len(), 2);
+    }
 
     #[test]
     fn old_shape_provider_migrates_with_defaults() {
