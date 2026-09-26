@@ -38,14 +38,25 @@ pub fn ensure_client(app: &AppHandle) -> Result<BigTinyClient, String> {
     let state = app.state::<AppState>();
     let handle = state.bigtiny.lock().unwrap();
     let port = handle.port.ok_or("BigTiny isn’t running yet.")?;
-    Ok(BigTinyClient {
-        http: crate::util::http_client(),
-        base: format!("http://127.0.0.1:{port}"),
-        secret: handle.secret_key.clone(),
-    })
+    Ok(BigTinyClient::new(
+        format!("http://127.0.0.1:{port}"),
+        handle.secret_key.clone(),
+    ))
 }
 
 impl BigTinyClient {
+    /// A client for the daemon at `base` (scheme + host + port, no trailing
+    /// slash). Production code gets one from [`ensure_client`]; this exists so
+    /// REST logic can be exercised against a mock server without an
+    /// `AppHandle`.
+    pub fn new(base: impl Into<String>, secret: Option<String>) -> Self {
+        Self {
+            http: crate::util::http_client(),
+            base: base.into(),
+            secret,
+        }
+    }
+
     /// A request builder for `path` (e.g. `/api/chat/`), with auth attached
     /// and a bounded total timeout so every helper inherits it.
     pub fn request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
@@ -137,4 +148,40 @@ async fn json_response(result: Result<reqwest::Response, reqwest::Error>) -> Res
     resp.json::<Value>()
         .await
         .map_err(|e| format!("BigTiny returned invalid JSON: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The seam every REST-level test builds on: a client pointed at a mock
+    /// daemon sends the app key and decodes the JSON body.
+    #[tokio::test]
+    async fn sends_the_app_key_and_decodes_json() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/api/health")
+            .match_header("X-API-Key", "k123")
+            .with_body(r#"{"status":"ok"}"#)
+            .create_async()
+            .await;
+        let client = BigTinyClient::new(server.url(), Some("k123".into()));
+        let v = client.get_json("/api/health").await.unwrap();
+        assert_eq!(v["status"], "ok");
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn an_http_error_carries_its_status() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("DELETE", "/api/providers/p1")
+            .with_status(404)
+            .with_body(r#"{"detail":"not found"}"#)
+            .create_async()
+            .await;
+        let client = BigTinyClient::new(server.url(), None);
+        let err = client.delete("/api/providers/p1").await.unwrap_err();
+        assert!(err.contains("404"), "{err}");
+    }
 }
