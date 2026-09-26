@@ -35,6 +35,7 @@
 //! comparable space.
 
 pub mod db_recover;
+pub mod erase;
 pub mod host;
 pub mod memorabilia_host;
 

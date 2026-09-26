@@ -118,7 +118,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/jobs/{id}", get(jobs::get).delete(jobs::cancel))
         // Ollama-compatible on purpose — see routes/embeddings.rs.
         .route("/api/embeddings", post(embeddings::embed))
-        .route("/api/pathway/beliefs", get(pathway::list_beliefs))
+        .route(
+            "/api/pathway/beliefs",
+            get(pathway::list_beliefs).delete(pathway::erase_all),
+        )
         .route("/api/pathway/beliefs/{id}", delete(pathway::delete_belief))
         .route("/api/pathway/stats", get(pathway::stats))
         .route("/api/pathway/recover", post(pathway::recover))
@@ -126,7 +129,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             "/api/pathway/sessions/{id}/pause",
             patch(pathway::set_paused),
         )
-        .route("/api/memorabilia/items", get(memorabilia::list_items))
+        .route(
+            "/api/memorabilia/items",
+            get(memorabilia::list_items).delete(memorabilia::erase_all),
+        )
         .route(
             "/api/memorabilia/items/{id}",
             delete(memorabilia::delete_item),

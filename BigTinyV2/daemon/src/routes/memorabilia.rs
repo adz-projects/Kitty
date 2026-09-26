@@ -50,6 +50,33 @@ async fn engine(
     Err(Box::new(Json(json!({ "error": message })).into_response()))
 }
 
+/// DELETE /api/memorabilia/items — erase every fact, source and index entry
+/// the calling app's memory holds. The live instance is closed afterwards and
+/// the `memorabilia` tool server reconnected, so nothing keeps serving from
+/// state cached before the erase.
+pub async fn erase_all(
+    State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<AppIdentity>,
+) -> Response {
+    let engine = match engine(&state, &identity).await {
+        Ok(e) => e,
+        Err(e) => return *e,
+    };
+    let result = crate::plugins::erase::erase_all_rows(engine.db.pool()).await;
+    drop(engine);
+    state.memorabilia.close(&identity.app_id).await;
+    super::plugins::reconnect_plugin_tools(
+        &state,
+        crate::storage::app_plugins::MEMORABILIA,
+        &identity.app_id,
+    )
+    .await;
+    match result {
+        Ok(_) => Json(json!({ "ok": true })).into_response(),
+        Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
 /// GET /api/memorabilia/items — active memory items (the Settings fact
 /// browser). Propositions carry their derived confidence, importance, urgency
 /// and disputed flag; the model reaches an item's full supporting evidence

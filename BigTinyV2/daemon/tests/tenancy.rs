@@ -2342,3 +2342,63 @@ async fn schedules_v2_create_list_update_and_runs() {
 
     state.scheduler.lock().await.stop().await;
 }
+
+// ---------------------------------------------------------------------------
+// Erasing memory
+// ---------------------------------------------------------------------------
+
+/// "Erase all beliefs" clears the calling app's graph -- and only that app's.
+#[tokio::test]
+async fn erasing_beliefs_clears_only_the_callers_graph() {
+    let state = test_state().await;
+    for app in [APP_A, APP_B] {
+        let req = Request::builder()
+            .method(Method::PUT)
+            .uri("/api/apps/me/plugins/pathway")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"enabled": true}).to_string()))
+            .unwrap();
+        assert_eq!(router_as(state.clone(), app).oneshot(req).await.unwrap().status(), StatusCode::OK);
+        let engine = state.plugins.pathway_for(app).await.expect("pathway opens once enabled");
+        sqlx::query(
+            "INSERT INTO beliefs (id, text, embedding, layer) VALUES (?, 'prefers short answers', x'00', 'identity')",
+        )
+        // Unique ids: the test plugin host keeps its databases in a fixed
+        // temp dir, so rows from earlier runs may already be there.
+        .bind(format!("b-{app}-{}", uuid::Uuid::new_v4()))
+        .execute(engine.db.pool())
+        .await
+        .unwrap();
+    }
+
+    let list = |app: &'static str| {
+        let state = state.clone();
+        async move {
+            let req = Request::builder()
+                .method(Method::GET)
+                .uri("/api/pathway/beliefs")
+                .body(Body::empty())
+                .unwrap();
+            body_json(router_as(state, app).oneshot(req).await.unwrap()).await
+        }
+    };
+    let count = |v: &Value| {
+        v.get("beliefs")
+            .and_then(|b| b.as_array())
+            .or_else(|| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0)
+    };
+    assert!(count(&list(APP_A).await) >= 1);
+
+    let req = Request::builder()
+        .method(Method::DELETE)
+        .uri("/api/pathway/beliefs")
+        .body(Body::empty())
+        .unwrap();
+    let resp = router_as(state.clone(), APP_A).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    assert_eq!(count(&list(APP_A).await), 0, "the caller's beliefs are gone");
+    assert!(count(&list(APP_B).await) >= 1, "another app's graph is untouched");
+}

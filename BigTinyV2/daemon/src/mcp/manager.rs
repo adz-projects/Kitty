@@ -998,6 +998,48 @@ mod tests {
         }
     }
 
+    /// The same contract for `memorabilia`, built the way `run()` builds it:
+    /// the engine comes from the attached host, not from a test that hands
+    /// `connect` one directly -- which is exactly the blind spot that let the
+    /// pathway arm stay broken in production while its own tests passed.
+    #[tokio::test]
+    async fn the_memorabilia_row_connects_through_the_manager_via_its_host() {
+        let pool = test_pool().await;
+        sqlx::query(
+            "INSERT INTO mcp_servers (id, name, transport, command, app_id, enabled)              VALUES ('srv-mem', 'memorabilia', 'in_process', 'memorabilia', 'app-1', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let manager = MCPManager::new(pool.clone(), None);
+        manager.attach_memorabilia(Arc::new(crate::plugins::MemorabiliaHost::new(
+            pool.clone(),
+            std::env::temp_dir().join(format!("bt-mem-test-{}", uuid::Uuid::new_v4())),
+            true,
+            "memorabilia.db".to_string(),
+            60,
+            None,
+            String::new(),
+            Arc::new(crate::agent::summarizer_chain::SummarizerChain::new(
+                None,
+                Arc::new(crate::provider::router::ProviderRouter::new(
+                    crate::config::CacheConfig::default(),
+                )),
+                crate::config::SummarizerConfig::default(),
+            )),
+        )));
+
+        manager
+            .connect_server("srv-mem")
+            .await
+            .expect("the memorabilia row must connect once its host is attached");
+        let names: Vec<String> = manager.tool_registry.iter().map(|e| e.key().clone()).collect();
+        for tool in ["memorabilia_search", "memorabilia_read_item"] {
+            assert!(names.contains(&tool.to_string()), "{tool} missing from {names:?}");
+        }
+    }
+
     /// The other half of the same contract: with no host attached the manager
     /// falls back to its constructor argument, so a host that genuinely owns
     /// one engine still works and a host with neither still refuses cleanly

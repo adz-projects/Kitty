@@ -43,6 +43,39 @@ async fn plugin_close(state: &AppState, plugin: &str, app_id: &str) {
     }
 }
 
+/// Re-establish `plugin`'s in-process MCP server for `app_id` after its
+/// engine was opened, closed or erased.
+///
+/// The `pathway`/`memorabilia` tool servers take their engine once, at
+/// connect time, and hold on to it. Without this, a disabled engine's
+/// `record`/`forget`/`memorabilia_search` kept working against the instance
+/// that was open when the server connected, and a freshly enabled one stayed
+/// without tools until the health watcher happened to retry. The server is
+/// reconnected only if the app wants it and the plugin is now on; otherwise it
+/// is left disconnected.
+pub(crate) async fn reconnect_plugin_tools(state: &AppState, plugin: &str, app_id: &str) {
+    let rows = match crate::storage::mcp_servers::list_servers_for_app(&state.db, app_id).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!("could not list MCP servers to reconnect {plugin}: {e}");
+            return;
+        }
+    };
+    let enabled = plugin_enabled(state, plugin, app_id).await;
+    for row in rows.into_iter().filter(|r| {
+        r.transport == "in_process"
+            && r.command.as_deref() == Some(plugin)
+            && r.app_id.as_deref() == Some(app_id)
+    }) {
+        state.mcp.disconnect_server(&row.id).await;
+        if enabled && row.enabled != 0 {
+            if let Err(e) = state.mcp.connect_server(&row.id).await {
+                tracing::warn!("could not reconnect the {plugin} tools for {app_id}: {e}");
+            }
+        }
+    }
+}
+
 fn err(status: StatusCode, message: impl Into<String>) -> Response {
     (status, Json(json!({ "error": message.into() }))).into_response()
 }
@@ -105,6 +138,9 @@ pub async fn set(
     if !body.enabled {
         plugin_close(&state, &plugin, &identity.app_id).await;
     }
+    // Either way the tool server must follow: gone when off, connected (to a
+    // freshly opened engine) when on.
+    reconnect_plugin_tools(&state, &plugin, &identity.app_id).await;
 
     Json(json!({"ok": true})).into_response()
 }
@@ -123,6 +159,7 @@ pub async fn clear(
             // The default may be "off", so drop any live instance and let the
             // next turn re-decide from scratch.
             plugin_close(&state, &plugin, &identity.app_id).await;
+            reconnect_plugin_tools(&state, &plugin, &identity.app_id).await;
             Json(json!({"ok": true})).into_response()
         }
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),

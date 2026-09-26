@@ -140,6 +140,31 @@ pub async fn stats(
     }
 }
 
+/// DELETE /api/pathway/beliefs — erase every belief (and everything learned
+/// alongside them) for the calling app. The user's "start over": no
+/// suppression tombstones are kept either, since those are themselves a record
+/// of what was once believed.
+///
+/// The live instance is closed afterwards and the `pathway` tool server
+/// reconnected, so nothing keeps serving from state cached before the erase.
+pub async fn erase_all(
+    State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<AppIdentity>,
+) -> Response {
+    let engine = match engine(&state, &identity).await {
+        Ok(e) => e,
+        Err(e) => return *e,
+    };
+    let result = crate::plugins::erase::erase_all_rows(engine.db.pool()).await;
+    drop(engine);
+    state.plugins.close(&identity.app_id).await;
+    super::plugins::reconnect_plugin_tools(&state, crate::storage::app_plugins::PATHWAY, &identity.app_id).await;
+    match result {
+        Ok(_) => Json(json!({ "ok": true })).into_response(),
+        Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
 /// DELETE /api/pathway/beliefs/{id} — the Settings belief browser's delete
 /// action. Goes through the same `forget` semantics the model's `forget`
 /// tool uses (default `reason=wrong`: permanent suppression + tombstone, not
