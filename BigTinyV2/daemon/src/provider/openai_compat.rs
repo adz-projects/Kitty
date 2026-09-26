@@ -415,6 +415,11 @@ impl Provider for OpenAICompatibleProvider {
         self.config.experimental_prefill
     }
 
+    /// Per provider, from its `config` blob -- see `ProviderConfig::supports_tools`.
+    fn supports_tools(&self) -> bool {
+        !self.config.tools_unsupported
+    }
+
     async fn chat_completion(
         &self,
         messages: &[Value],

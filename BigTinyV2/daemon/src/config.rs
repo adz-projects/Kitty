@@ -239,6 +239,18 @@ pub struct ProviderConfig {
     /// `agent::loop_::pathway_recall`'s thought-seeding gate.
     #[serde(default)]
     pub experimental_prefill: bool,
+    /// This provider's model cannot call tools. Set from the provider's
+    /// `config` blob when a client that knows (from a model catalog, or the
+    /// user) sends `supports_tools: false`. The agent loop then sends the
+    /// model no tools and says so in the stream (a `model_failover` with
+    /// reason `no_tool_support`), instead of sending tools a text-only model
+    /// will ignore or reject.
+    ///
+    /// Stored negated so that `Default` -- and every config built from it --
+    /// means "can call tools": a wrong default here would silently take every
+    /// tool away.
+    #[serde(default)]
+    pub tools_unsupported: bool,
 }
 
 impl ProviderConfig {

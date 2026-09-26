@@ -414,6 +414,10 @@ impl ProviderRouter {
                 .get("experimental_prefill")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false),
+            // Only an explicit `false` marks a provider tool-less; absent
+            // means it can call tools.
+            tools_unsupported: config_json.get("supports_tools").and_then(|v| v.as_bool())
+                == Some(false),
         };
 
         // Carry the row's owner into the registry. Registering as `None`
@@ -1056,6 +1060,34 @@ mod tests {
         };
         router.register_from_row(&row);
         assert_eq!(router.parallel_slots("p1"), Some(2));
+    }
+
+    /// Only an explicit `supports_tools: false` makes a provider tool-less;
+    /// every other shape of the blob leaves tools on, for both dialects.
+    #[test]
+    fn register_from_row_reads_tool_support_out_of_the_config_json_blob() {
+        let router = ProviderRouter::default();
+        let row = |id: &str, provider_type: &str, config: &str| ProviderRow {
+            id: id.into(),
+            name: id.into(),
+            provider_type: provider_type.into(),
+            base_url: "http://box:8080".into(),
+            fallback_priority: 0,
+            config: Some(config.into()),
+            status: "disconnected".into(),
+            error_message: None,
+            created_at: None,
+            updated_at: None,
+            app_id: None,
+        };
+        router.register_from_row(&row("off", "openai_compat", r#"{"model":"m","supports_tools":false}"#));
+        router.register_from_row(&row("on", "openai_compat", r#"{"model":"m","supports_tools":true}"#));
+        router.register_from_row(&row("unset", "openai_compat", r#"{"model":"m"}"#));
+        router.register_from_row(&row("claude-off", "anthropic", r#"{"model":"m","supports_tools":false}"#));
+        assert!(!router.supports_tools("off"));
+        assert!(router.supports_tools("on"));
+        assert!(router.supports_tools("unset"));
+        assert!(!router.supports_tools("claude-off"));
     }
 
     #[test]
