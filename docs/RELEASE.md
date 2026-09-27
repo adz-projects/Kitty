@@ -9,24 +9,21 @@ not share a packaging story, so each gets its own section below.
 ### Build
 
 ```powershell
-python plugins/build.py     # build the four bundled binaries into
-                            # src-tauri/binaries/ — see plugins/README.md.
-                            # Skipping this step leaves the committed empty
-                            # placeholders in place, which `tauri build` will
-                            # happily bundle without complaint but which can't
-                            # actually run.
+git lfs pull                               # the bundled binaries are LFS objects
+python plugins/build.py --verify-manifest  # do they match their source?
+python plugins/build.py [target ...]       # if not: rebuild, then commit the
+                                           # binary with its manifest entry
 pnpm install
-pnpm tauri build            # release build + NSIS installer
+pnpm tauri build                           # release build + NSIS installer
 ```
 
-All four targets are now Rust (`cargo build --release`, no PyInstaller and no
-Python runtime involved): `bigtiny` (the daemon, which statically links the
-behavioral-memory engine at `plugins/adaptive-pathway_rust/`), `kitty-tools`,
-`kitty-web`, and `kitty-wasm`. The Python `adaptive-pathway` sidecar and its
-`adaptive-pathway-mcp` proxy are retired and no longer built or bundled.
-
-`plugins/build.py` still drives it, purely because it owns the
-target-triple naming convention `externalBin` expects.
+Every target is Rust (`cargo build --release`): `bigtiny` (the engine,
+`BigTinyV2/daemon`, which links both memory engines), `kitty-tools`,
+`kitty-web` and `kitty-wasm`. `plugins/build.py` owns the target-triple naming
+`externalBin` expects, stages the LiteRT DLLs, and writes a source hash per
+binary into `src-tauri/binaries/manifest.json`; `--verify-manifest` (also run
+in CI) fails when a committed binary is older than its source or is an LFS
+pointer.
 
 Artifacts:
 
@@ -61,9 +58,11 @@ two things beyond the ordinary `cargo build`:
    solely as the rollback path; a release built from it would ship an engine
    several phases behind the client code, and would do so silently.
 
-2. **Bundle the LiteRT native DLLs + the Gemma tokenizer beside the daemon.**
-   `litert-lm-rust`'s `download-native` fetches these into the crate's build
-   output (`$CARGO_TARGET_DIR/release/`); collect the **six** DLLs:
+2. **The LiteRT native DLLs ship beside the daemon.** `plugins/build.py`
+   stages the **six** DLLs from the LiteRT build output into
+   `src-tauri/resources/`, and `bundle.resources` places them in the install
+   root next to `bigtiny2-daemon.exe`, where the daemon loads `libLiteRt.dll`
+   by bare name and it pulls in the rest:
 
    - `libLiteRt.dll`
    - `libLiteRtWebGpuAccelerator.dll`
@@ -72,37 +71,15 @@ two things beyond the ordinary `cargo build`:
    - `libGemmaModelConstraintProvider.dll`
    - `litert-lm.dll`
 
-   These must land in the **same directory as `bigtiny2-daemon.exe`** at
-   runtime, because the daemon loads `libLiteRt.dll` by bare name
-   (`Library::from_path("libLiteRt.dll")`, resolved by the OS from the loading
-   process's own directory) and that DLL pulls in the other five. Tauri's
-   `externalBin` places the daemon in the install root and `resource_dir()`
-   resolves to that same directory on Windows, so bundling the DLLs via
-   `bundle.resources` co-locates them with the daemon. Add them to
-   `src-tauri/tauri.conf.json` `bundle.resources` (stage the files under, e.g.,
-   `src-tauri/resources/litert/` and reference that glob) — `tauri build` errors
-   on a missing resource path, so the files must be present before you add the
-   entry.
+   **Nothing model-shaped ships in the installer.** The EmbeddingGemma model
+   and the Gemma `tokenizer.json` it needs are downloaded together, at the
+   user's request, from Hugging Face (both are Gemma-licence-gated, so one
+   token covers both; the tokenizer comes from `google/embeddinggemma-300m`).
+   The summarizer model is an optional download too.
 
-   The **Gemma `tokenizer.json`** the embedder needs is likewise bundled as a
-   resource (the `litert-community` repo ships only `sentencepiece.model`; the
-   canonical `tokenizer.json` comes from the gated `google/embeddinggemma-300m`
-   and is converted/vendored once, offline — it is **not** downloaded at
-   runtime). `lifecycle/bigtiny_env.rs` resolves it via `resource_dir()` and
-   passes `BIGTINY_LITERT__TOKENIZER_PATH`.
+### Signing
 
-> **Binary shipping is an open decision.** The daemon (76 MB) + six DLLs
-> (~78 MB) + tokenizer.json (~33 MB) exceed GitHub's 100 MB non-LFS file limit
-> in aggregate and individually push the repo large. Either migrate
-> `src-tauri/binaries/` + the LiteRT resources to **Git LFS**, or keep them out
-> of git and stage them from a release asset before `tauri build`. Decide this
-> before the next tagged release; the committed daemon binary is a placeholder
-> either way (see `src-tauri/binaries/README.md`).
-
-### Signing (placeholder)
-
-Code signing is **not yet configured** (a deliberate choice for now, not an
-oversight). Before public distribution, obtain an Authenticode certificate and
+Kitty 1.0 ships **unsigned** (a deliberate decision, not an oversight). Before public distribution, obtain an Authenticode certificate and
 set Tauri's `bundle.windows.certificateThumbprint` (or `signCommand`) so the
 exe + NSIS installer are signed; otherwise SmartScreen warns on first run.
 
@@ -113,107 +90,64 @@ proceed — this is expected, not a build failure.
 
 ### Version bump
 
-1. Bump `version` in `package.json` **and** `src-tauri/tauri.conf.json`
-   (and `src-tauri/Cargo.toml`) — keep them in sync.
+1. Bump the version everywhere Kitty owns one — `package.json`,
+   `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml`, and the plugins'
+   `Cargo.toml`s. `python scripts/check_versions.py` (run in CI) fails if any
+   disagree. The engine (`BigTinyV2/`) keeps its own 2.x versioning; bump it
+   only for an engine change, and record a changed API contract in
+   `docs/VERSIONS.md`.
 2. Re-verify the curated **LiteRT** repos/filenames in
    `src/lib/curated_models.ts` still resolve on HuggingFace: EmbeddingGemma
    `.tflite` (gated — needs an accepted Gemma license + HF token) on both
    platforms, and `gemma-4-E2B-it.litertlm` for the Windows summarizer. A
    renamed repo or a moved license gate turns first run into a dead end.
-   Also bump `tauri.android.versionCode` — Play rejects a re-used one.
-3. Re-verify all four `plugins/build.py` targets still build cleanly. (The
-   pinned Python + PyInstaller versions in `docs/VERSIONS.md` no longer gate
-   this — every target is Rust now — but `plugins/build.py` itself is still a
-   Python script and needs an interpreter on PATH.)
-4. If BigTiny's own API surface changed, re-check the route shapes assumed
-   in `src-tauri/src/bigtiny/` (`client.rs`, `sessions.rs`, `stream.rs`,
-   `providers.rs`, `mcp.rs`) against BigTiny's current API.md.
+   Android's `versionCode` follows the version automatically (the Tauri CLI
+   derives it when it writes `gen/android/app/tauri.properties`); set
+   `bundle.android.versionCode` in `tauri.conf.json` only to override it.
+   Play rejects a re-used one.
+3. `python plugins/build.py --verify-manifest` passes (rebuild and commit
+   whatever it names).
+4. If the engine's API surface changed, re-check the route shapes assumed in
+   `src-tauri/src/bigtiny/` and `lifecycle/` against `BigTinyV2/API.md`, and
+   bump the engine's API version if an older Kitty must refuse it.
 
 ### Pre-release verification
 
-- `cargo clippy --all-targets` clean, `cargo test`, `pnpm lint`, `pnpm build`.
-- `python plugins/build.py` succeeded and `src-tauri/binaries/*.exe` are real
-  (non-empty) — the committed placeholders satisfy `cargo build`'s existence
-  check but produce a non-functional plugin if actually packaged.
-- Secret audit: no secret in any log line, `config.json`, or event payload
-  (provider keys live in Windows Credential Manager via `keyring`; BigTiny's
-  `X-API-Key` stays in Rust memory + env + the local `BIGTINY_SECRET`).
-- Manual smoke: first-run wizard → chat → tool approval → resume a session →
-  restart Kitty's engine from the degraded panel and confirm the session rebuilds.
-- Soak: repeated summon/dismiss during active streams leaves no orphaned
-  daemon children. Kitty no longer kills a BigTiny daemon at all: it is a
-  shared machine resource that may be serving another application, and it
-  exits on its own idle timer.
+- CI green: frontend (lint, vitest, versions), every Rust crate (clippy, test),
+  the Windows NSIS and Android AAB bundles, and the binaries-match-source job.
+- Secret audit: no secret in any log line, `config.json`, or event payload.
+  Provider keys and Kitty's app key live in the Credential Manager; the
+  engine's copies of provider keys are sealed under its DPAPI-protected key
+  (`%APPDATA%\BigTinyV2\encryption.key.dpapi`, no plaintext `encryption.key`).
+- Manual smoke: first-run wizard → chat → a tool approval (in this chat, and
+  from another chat while you're elsewhere) → resume a session → export it →
+  change a start-up setting and watch the engine restart (or say who is in
+  the way).
+- Uninstall: `kitty.exe --uninstall-cleanup` removes Kitty's data from the
+  engine (other apps' untouched), its credentials, config, models, chat folders
+  and tool cache, logging to `%TEMP%\kitty-uninstall.log`. **The NSIS hook
+  that runs it when "delete app data" is ticked is not wired yet** (M5, R1);
+  it must run it before asking the engine to stop.
+- Soak: repeated summon/dismiss during active streams. Kitty never kills the
+  engine — it is shared and exits on its own idle timer.
 
 ---
 
-## Migrating an existing install onto BigTiny V2 (0.9.0)
+## Bringing a V1 install's data across
 
-**Read this before shipping 0.9.0 to anyone with an existing install.**
+A Kitty from before 0.9 ran BigTiny V1, with its data in
+`%APPDATA%\Kitty\bigtiny\` (the app-private directory on Android). Kitty now
+notices that data and offers to import it (a banner in the main window):
+chats and their history, providers, MCP servers and approval rules are merged
+into the engine as Kitty's, skipping anything already present; V1's belief
+graph comes too if Kitty has none yet. Kitty reads V1's encryption key from the
+credential store itself, so saved provider keys are re-sealed under the
+engine's key; any it cannot read are counted, and the banner says to enter
+those again. The V1 directory is then renamed `bigtiny.v1-imported` (kept as a
+rollback copy) and never offered again. "Don't import" is remembered too.
 
-Desktop now runs BigTiny V2, which uses its own data directory
-(`%APPDATA%\BigTinyV2\`) rather than V1's `%APPDATA%\Kitty\bigtiny\`. That
-separation is deliberate — it is what lets V1 and V2 coexist during the
-migration, and what makes reverting the app a real rollback path rather than a
-restore-from-backup. The consequence is that **a fresh 0.9.0 launch starts with
-an empty database**: previous sessions, providers and MCP servers are still on
-disk, but the new daemon is not looking at them.
-
-Bringing them across is one command, run once, before first launch:
-
-```bash
-bigtiny2-daemon import --from "%APPDATA%\Kitty\bigtiny\bigtiny.db" --pathway-from "%APPDATA%\Kitty\bigtiny\pathway.db" --encryption-key <V1 key>
-```
-
-It copies the database (never migrates in place), runs migrations `017+` on the
-copy, and stamps every row as owned by the app `kitty`. It refuses to run if a
-V2 database already exists, so it cannot silently clobber one.
-
-It deliberately does **not** register the app. Kitty registers itself on first
-launch and stores its own key in the Credential Manager; an app row created
-here would hold a key hash for a credential Kitty can never obtain, so its
-registration would fail with a `409` it cannot recover from — a successful
-migration bricking first launch. The imported rows carry `app_id = 'kitty'`
-already and become visible the moment Kitty registers. Pass `--issue-key` only
-for a headless consumer that cannot register itself.
-
-### The encryption key is the step people will skip
-
-Provider API keys and MCP auth headers are encrypted at rest with a key V1 kept
-in the Windows Credential Manager. The import does **not** re-encrypt them, so
-the V2 daemon has to adopt that same key or every provider fails to
-authenticate later — surfacing as a provider 401, long after the migration,
-looking like a credentials problem rather than a migration mistake.
-
-Passing `--encryption-key` adopts it permanently into
-`%APPDATA%\BigTinyV2\encryption.key`. The import counts how many provider rows
-it could not decrypt and warns loudly when the count is non-zero, so a missed
-key is caught at migration time rather than in the field.
-
-Read the V1 key out of the Credential Manager (service `kitty`, account
-`bigtiny-encryption-key`) — for example with PowerShell and the CredentialManager
-module, or via Control Panel → Credential Manager → Windows Credentials.
-
-### Verifying a migration
-
-Compare counts between source and destination — sessions, messages, providers,
-specialists, schedules should match exactly — and confirm nothing was left
-ownerless:
-
-```sql
-SELECT COUNT(*) FROM sessions WHERE app_id = '';   -- must be 0
-```
-
-The import already asserts this and fails rather than leaving rows no app can
-see, but it is worth confirming on real data.
-
-### What is *not* migrated automatically
-
-Nothing. This is a manual one-shot by design: an automatic migration would have
-to decide on the user's behalf what to do when it half-fails, and the whole
-point of importing into a copy is that a failed attempt costs nothing. V1 stays
-bootable against its untouched original database, so reverting the app is a
-complete rollback.
+The engine's `bigtiny2-daemon import` CLI still exists for a *fresh* V2
+database (it refuses an existing one); Kitty itself no longer needs it.
 
 ## Android
 
@@ -248,15 +182,14 @@ name at runtime. The AAR is **not** put on the compile classpath
 (`implementation`): its Kotlin API metadata (2.3.0) is incompatible with the
 project's Kotlin 1.9 and breaks the Kotlin compile — we only want the `.so`.
 
-The Gemma `tokenizer.json` is bundled the same way it is on Windows (an app
-resource, converted offline from `sentencepiece.model`); Android has no
-generative summarizer, so no `.litertlm` and none of the Windows DLLs ship in
-the AAB.
+The Gemma `tokenizer.json` is downloaded with the EmbeddingGemma model, as on
+Windows; Android has no generative summarizer, so no `.litertlm` and none of
+the Windows DLLs ship in the AAB.
 
 ### Build
 
 ```powershell
-pnpm tauri android build --target aarch64          # AAB, release variant
+pnpm tauri android build --aab --target aarch64    # AAB, release variant
 pnpm tauri android build --apk --target aarch64    # APK, for sideloading
 pnpm tauri android build --apk --debug --target aarch64   # debug APK
 ```
@@ -338,16 +271,21 @@ end, and Play rejects the artifact, so nothing ships by accident.
 - **A second app on the device cannot reach the daemon** — loopback is not
   process-private on Android. From `adb shell` (the same unprivileged position
   any installed app is in), `curl 127.0.0.1:<port>/api/chat/` must 401.
-- **The app key survives a relaunch.** New surface with V2 (D26): the host
-  exchanges a per-launch registration token for a durable app key on first run
-  and stores it in the AndroidKeyStore. Force-stop and reopen; the second launch
-  must *not* re-register. A lost key surfaces as a `409` from
-  `POST /api/apps/register` and is only recoverable by revoking the app
-  (`DELETE /api/apps/kitty`), so this is worth checking deliberately rather than
-  assuming.
-- **The model is offered `call_specialist`.** Ask it to delegate something and
-  confirm a specialist actually runs — the tool is only reachable if
-  `ensure_builtin_servers` registered the `specialists` in-process row.
+- **The app key survives a relaunch.** The host exchanges a per-launch
+  registration token for a durable app key on first run and stores it in the
+  SecretStore. Force-stop and reopen; the second launch must *not* re-register.
+  (A lost key is reclaimed with the registration token, but a relaunch should
+  never need to.)
+- **The engine's key is sealed.** After first launch there is no plaintext
+  `encryption.key` in the app's `bigtiny-v2/` directory, and provider keys
+  still work after a force-stop.
+- **Specialists and Memorabilia are off.** The model is *not* offered
+  `call_specialist`, and neither pane appears in Settings.
+- **Share into Kitty** from another app (an image, a PDF, a link): a new chat
+  opens with it attached.
+- **Notifications**: the four channels (approvals, finished, problems, engine
+  status) appear in Android's app settings; tapping an approval notification
+  opens that chat with the approval showing.
 - Soft keyboard: the header and model picker stay on screen and the composer
   sits on the keyboard (`lib/viewport.ts`).
 - Download an artifact and confirm it lands where the file picker said.

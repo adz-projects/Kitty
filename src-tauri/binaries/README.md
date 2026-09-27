@@ -1,19 +1,20 @@
-# externalBin placeholders
+# Bundled binaries
 
-Any `*-x86_64-pc-windows-msvc.exe` in this directory that is **zero bytes**
-is an empty placeholder, committed only so `cargo build`/`cargo check`/`cargo
-test` succeed on a fresh clone — Tauri's build script validates that every
-`bundle.externalBin` entry (see `../tauri.conf.json`) exists on disk at
-build time, even for a plain `cargo build`, not just packaging.
+The engine (`bigtiny2-daemon-*.exe`) and the MCP servers (`kitty-tools`,
+`kitty-web`, `kitty-wasm`) Tauri bundles through `bundle.externalBin` (see
+`../tauri.conf.json`). They are real builds, committed as **Git LFS** objects:
+Tauri's build script checks that every `externalBin` entry exists on disk even
+for a plain `cargo build`, so a clone needs them (`git lfs pull`) before it can
+build at all. A clone without LFS has small pointer files instead, which
+`plugins/build.py --verify-manifest` and CI reject.
 
-Before an actual release build (`tauri build` / `pnpm tauri build`), run:
+`manifest.json` records, per binary, a hash of the source it was built from.
+After changing the engine or a plugin:
 
 ```
-python plugins/build.py
+python plugins/build.py [target ...]     # rebuild; updates manifest.json
+python plugins/build.py --verify-manifest
 ```
 
-from the repo root. It builds every plugin with `cargo build --release` and overwrites
-any placeholders with the real executables. Packaging with a placeholder
-still in place would produce an app that can't actually start that plugin —
-`tauri build` doesn't distinguish a placeholder from a real binary, only
-that the file exists.
+then commit the rebuilt binary together with `manifest.json`. CI fails when a
+committed binary no longer matches its source.
