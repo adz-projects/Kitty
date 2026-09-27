@@ -3,6 +3,25 @@ import { ipc, onScheduledTasksChanged, pickFolder } from '@/lib/ipc';
 import type { ProviderView, Schedule, ScheduledTask } from '@/lib/types';
 import { Modal } from '@/components/shared/Modal';
 import { confirmDialog } from '@/components/shared/ConfirmDialog';
+import { relativeTime } from '@/lib/relativeTime';
+import { useChatStore } from '@/stores/chatStore';
+import { useRouteStore } from '@/stores/routeStore';
+
+/** How a task's last run went, in words. Pure. */
+export function lastRunLabel(status: string | null): string {
+  switch (status) {
+    case 'running':
+      return 'Running now';
+    case 'completed':
+      return 'Completed';
+    case 'completed_with_denied_tools':
+      return 'Completed, but an approval went unanswered and was denied';
+    case 'failed':
+      return 'Failed';
+    default:
+      return status ?? '';
+  }
+}
 
 export type IntervalUnit = 'minutes' | 'hours' | 'days';
 export const UNIT_SECONDS: Record<IntervalUnit, number> = {
@@ -193,6 +212,25 @@ export function ScheduledTasks() {
     }
   };
 
+  const [running, setRunning] = useState<string | null>(null);
+  const goto = useRouteStore((s) => s.goto);
+  const runNow = async (t: ScheduledTask) => {
+    setRunning(t.id);
+    setError('');
+    try {
+      await ipc.runScheduledTaskNow(t.id);
+      await load();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setRunning(null);
+    }
+  };
+  const openRun = (sessionId: string) => {
+    goto('chat');
+    void useChatStore.getState().loadSession(sessionId, '');
+  };
+
   const remove = async (t: ScheduledTask) => {
     const ok = await confirmDialog({
       title: `Delete "${t.name}"?`,
@@ -238,7 +276,26 @@ export function ScheduledTasks() {
               <div className="muted" style={{ fontSize: 13 }}>
                 {scheduleSummary(t)}
               </div>
+              {t.last_run_at && (
+                <div
+                  className={t.last_status === 'failed' ? 'error' : 'muted'}
+                  style={{ fontSize: 13 }}
+                >
+                  Last run {relativeTime(t.last_run_at, Date.now())}: {lastRunLabel(t.last_status)}
+                  {t.last_session_id && (
+                    <>
+                      {' · '}
+                      <button className="link" onClick={() => openRun(t.last_session_id!)}>
+                        Open chat
+                      </button>
+                    </>
+                  )}
+                </div>
+              )}
             </div>
+            <button disabled={running === t.id} onClick={() => void runNow(t)}>
+              {running === t.id ? 'Starting…' : 'Run now'}
+            </button>
             <button onClick={() => openEdit(t)}>Edit</button>
             <button onClick={() => void remove(t)}>Delete</button>
           </div>
