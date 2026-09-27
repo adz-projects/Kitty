@@ -51,6 +51,16 @@ fn tags_response_has_tag(json: &serde_json::Value, tag: &str) -> bool {
 /// the manual "Retry connection check" command. `Ok(())` means the profile
 /// looks usable; `Err(String)` is a human-readable reason to show the user.
 pub async fn test_connection(profile: &ProviderProfile) -> Result<(), String> {
+    let key = get_secret_async(&profile.id).await;
+    test_connection_with_key(profile, key).await
+}
+
+/// [`test_connection`] with the key given rather than read from the store —
+/// for a card still being edited, whose key may not be saved yet.
+pub async fn test_connection_with_key(
+    profile: &ProviderProfile,
+    key: Option<String>,
+) -> Result<(), String> {
     if !profile.is_usable() && profile.provider_type != "local" {
         return Err("this provider is disabled".into());
     }
@@ -75,15 +85,15 @@ pub async fn test_connection(profile: &ProviderProfile) -> Result<(), String> {
             Ok(())
         }
         "openrouter" => {
-            let key = get_secret_async(&profile.id)
-                .await
-                .ok_or("no API key stored for this profile — edit it and add one")?;
+            let key = key
+                .clone()
+                .ok_or("no API key for this provider — add one")?;
             crate::openrouter::get_credits(&key).await.map(|_| ())
         }
         "anthropic" => {
-            let key = get_secret_async(&profile.id)
-                .await
-                .ok_or("no API key stored for this profile — edit it and add one")?;
+            let key = key
+                .clone()
+                .ok_or("no API key for this provider — add one")?;
             let client = crate::util::http_client();
             let url = format!("{}/v1/models", profile.base_url.trim_end_matches('/'));
             let resp = client
@@ -109,7 +119,6 @@ pub async fn test_connection(profile: &ProviderProfile) -> Result<(), String> {
         // `openai_compat` wire dialect via its catch-all else-branch).
         "openai" | "custom_openai" | "fireworks" | "deepinfra" => {
             let client = crate::util::http_client();
-            let key = get_secret_async(&profile.id).await;
             // A schemeless entry fans out to https-then-http, so a LAN box
             // typed as `host:port` works without the user knowing which one
             // it speaks. See `endpoint::candidates`.

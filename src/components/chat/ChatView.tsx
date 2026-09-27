@@ -1,4 +1,4 @@
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { ipc, onFileDrop, pickFolder } from '@/lib/ipc';
 import { humanizeChatError, useChatStore } from '@/stores/chatStore';
 import { useStackStore } from '@/stores/stackStore';
@@ -17,6 +17,7 @@ import { FolderIcon } from '@/components/icons/FolderIcon';
 import { AllowedDirsPopover } from '@/components/chat/AllowedDirsPopover';
 import { useApprovalStore } from '@/stores/approvalStore';
 import { Banner } from '@/components/shared/Banner';
+import { BranchProviderDialog } from './BranchToProvider';
 
 /** The shared chat surface used by both the overlay and the full window
     (CLAUDE.md rule 5).
@@ -52,6 +53,8 @@ export function ChatView() {
   // Settings → Providers with this chat's card highlighted.
   const openProviderSettings = () =>
     void ipc.openSettings('providers', sessionProviderId ?? undefined);
+
+  const [branching, setBranching] = useState(false);
 
   // While this chat's provider is unreachable, keep checking; the banner
   // clears itself once it answers (#9).
@@ -284,8 +287,10 @@ export function ChatView() {
           errorType={errorType ?? undefined}
           onNewSession={() => void newSession()}
           onOpenProviderSettings={openProviderSettings}
+          onBranchProvider={sessionId ? () => setBranching(true) : undefined}
         />
       )}
+      {branching && <BranchProviderDialog onClose={() => setBranching(false)} />}
       <AttachmentChips />
       <FileChips />
       <ClipboardImageChips />

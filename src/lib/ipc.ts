@@ -390,6 +390,10 @@ export const ipc = {
     invoke<void>('set_session_provider', { sessionId, providerId, model: model ?? null }),
   testActiveProviderConnection: () => invoke<void>('test_active_provider_connection'),
   testProviderConnection: (id: string) => invoke<void>('test_provider_connection', { id }),
+  /** Test a card as edited in the form, with the typed key (or the saved one
+      when blank). */
+  testProviderDraft: (profile: ProviderProfile, secret: string | null) =>
+    invoke<void>('test_provider_draft', { profile, secret }),
   // Approvals (every chat, on screen or not)
   listPendingApprovals: () => invoke<PendingApproval[]>('list_pending_approvals'),
   answerApproval: (actionId: string, decision: 'allow' | 'always_allow' | 'reject') =>

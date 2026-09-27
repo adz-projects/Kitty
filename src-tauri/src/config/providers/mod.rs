@@ -8,7 +8,7 @@ pub mod endpoint;
 mod keyring;
 mod network;
 
-pub use connection::test_connection;
+pub use connection::{test_connection, test_connection_with_key};
 pub use keyring::{
     delete_secret, get_secret_async, get_secret_checked, migrate_secrets, set_secret_async,
     v1_encryption_key,

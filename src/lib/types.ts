@@ -22,6 +22,12 @@ export interface Config {
   remember_overlay_position: boolean;
   providers: ProviderProfile[];
   active_provider_id: string | null;
+  /** The default was retired (the "On this device" type): ask for another. */
+  needs_default_provider: boolean;
+  /** Remembered handoff-gate answer (`keep` / `clean`); absent asks each time. */
+  handoff_gate_choice?: string | null;
+  /** `imported` or `dismissed` once the V1 data offer has been answered. */
+  v1_import_state?: string | null;
   show_artifacts: boolean;
   /** Whether the in-process behavioral-memory (pathway) engine, linked
       directly into the BigTiny daemon, is active for this install. */

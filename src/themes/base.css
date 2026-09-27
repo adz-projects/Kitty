@@ -1295,6 +1295,16 @@ button:disabled {
   flex-wrap: wrap;
 }
 /* A line under a reply about how it was produced (failover, step limit). */
+/* A label above a popover's items. */
+.popover-heading {
+  padding: 4px 8px;
+  font-size: var(--fs-sm-plus);
+}
+.provider-choice-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
 .msg-notice {
   margin: 4px 0 0;
   font-size: var(--fs-sm-plus);

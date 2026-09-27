@@ -5,15 +5,16 @@ import type { ProviderView } from '@/lib/types';
 import { usePopoverPosition } from '@/lib/usePopoverPosition';
 import { SettingsGearIcon } from '@/components/icons/SettingsGearIcon';
 import { useChatStore } from '@/stores/chatStore';
+import { useBranchToProvider } from './BranchToProvider';
 
-/** Active-provider badge with a click-to-switch popover (Round-2 item 9), shown
-    in both the overlay and full window. Switching calls activate_provider, which
-    health-gates the target first (rejects and stays on the old provider if it
-    isn't reachable/authenticated) then re-registers it with the backend and
-    emits provider://activated — the store re-syncs from that.
-    Switching mid-conversation only best-effort rebinds the session, so once
-    the active session has any history the dropdown locks — "New chat" is the
-    supported way to change providers. */
+/** This chat's provider card, with a popover to change it (shown in both the
+    overlay and the full window). Only this chat changes — the default for new
+    chats is set in Settings (decision #50).
+
+    An empty chat just switches (`set_chat_provider`, which checks the card
+    works first). A chat with history stays on its card (decision #24): the
+    popover offers to continue it on another card instead, as a branch, going
+    through the handoff gate when the target is less trusted. */
 export function ProviderBadge() {
   const [providers, setProviders] = useState<ProviderView[]>([]);
   const [open, setOpen] = useState(false);
@@ -21,6 +22,7 @@ export function ProviderBadge() {
   const [switchError, setSwitchError] = useState<string | null>(null);
   const { triggerRef, popoverRef, style } = usePopoverPosition(open, () => setOpen(false));
   const locked = useChatStore((s) => s.messages.length > 0);
+  const branchFlow = useBranchToProvider();
   const sessionId = useChatStore((s) => s.sessionId);
   const sessionProviderId = useChatStore((s) => s.sessionProviderId);
 
@@ -54,28 +56,25 @@ export function ProviderBadge() {
     <SettingsGearIcon />
   );
 
-  const switchTo = async (id: string | null) => {
+  const switchTo = async (id: string) => {
     setOpen(false);
+    if (locked) {
+      const target = providers.find((p) => p.id === id);
+      if (target) void branchFlow.start(target, active);
+      return;
+    }
     setBusy(true);
     setSwitchError(null);
     try {
-      // Pass this window's active session so the stamp is per-session — other
-      // windows' open sessions keep their own provider (per-session isolation).
-      await ipc.activateProvider(id, sessionId);
-      // Update this window's live-session stamp immediately, so the pill flips
-      // the instant the switch succeeds rather than after the provider://activated
-      // round-trip. Same values the event carries (profile id + the profile's
-      // first model); the event handler in chatStore is idempotent with this.
-      if (id !== null && sessionId !== null) {
-        const target = providers.find((p) => p.id === id);
-        useChatStore.setState({
-          sessionProviderId: id,
-          sessionModelId: target?.models[0] ?? null,
-        });
-      }
+      // A blank chat may not exist on the engine yet; make it, so the card
+      // is this chat's own and not the default's.
+      const sid = await useChatStore.getState().ensureSession();
+      await ipc.setChatProvider(sid, id);
+      const target = providers.find((p) => p.id === id);
+      useChatStore.setState({ sessionProviderId: id, sessionModelId: target?.models[0] ?? null });
+      void useChatStore.getState().refreshProvider();
     } catch (e) {
-      // A real, actionable failure (e.g. the health-gate rejected the switch) —
-      // surface it here instead of swallowing it silently.
+      // e.g. the card failed its connection check: say so, stay put.
       setSwitchError(String(e));
     } finally {
       setBusy(false);
@@ -90,43 +89,57 @@ export function ProviderBadge() {
         onClick={() => setOpen((o) => !o)}
         title={
           locked
-            ? "Switching providers isn't allowed mid-conversation — start a New Chat to switch"
-            : 'Provider — click to switch (restarts the agent)'
+            ? 'This chat’s provider — click to continue the conversation on another one'
+            : 'This chat’s provider — click to switch'
         }
-        disabled={busy || locked}
+        disabled={busy || branchFlow.busy}
       >
-        {icon} <span className="provider-badge-label">{busy ? 'switching…' : label}</span> ▾
+        {icon}{' '}
+        <span className="provider-badge-label">
+          {busy ? 'switching…' : branchFlow.busy ? 'branching…' : label}
+        </span>{' '}
+        ▾
       </button>
       {open && (
         <div ref={popoverRef} className="mode-popover provider-popover" role="menu" style={style}>
-          {providers.map((p) => (
-            <button
-              key={p.id}
-              role="menuitemradio"
-              aria-checked={p.id === activeId}
-              className={`provider-option${p.id === activeId ? ' active' : ''}`}
-              title={p.base_url}
-              onClick={() => void switchTo(p.id)}
-            >
-              {/* Icon and name are separate flex children rather than one run
+          {locked && <div className="muted popover-heading">Continue this chat on…</div>}
+          {providers
+            .filter((p) => !p.disabled_reason && !(locked && p.id === activeId))
+            .map((p) => (
+              <button
+                key={p.id}
+                role="menuitemradio"
+                aria-checked={p.id === activeId}
+                className={`provider-option${p.id === activeId ? ' active' : ''}`}
+                title={p.base_url}
+                onClick={() => void switchTo(p.id)}
+              >
+                {/* Icon and name are separate flex children rather than one run
                   of inline content, so a name too long for the row wraps to a
                   hanging indent under the name instead of under the icon
                   (see `.provider-option` in base.css). */}
-              <TrustIcon tier={p.network_tier} isTrusted={p.is_trusted} />
-              <span className="provider-option-name">{p.name || p.provider_type}</span>
-            </button>
-          ))}
+                <TrustIcon tier={p.network_tier} isTrusted={p.is_trusted} />
+                <span className="provider-option-name">{p.name || p.provider_type}</span>
+              </button>
+            ))}
           {providers.length === 0 && <span className="muted">No providers configured</span>}
         </div>
       )}
-      {switchError && (
+      {branchFlow.gate}
+      {(switchError ?? branchFlow.error) && (
         <div
           className="chat-error"
           role="alert"
           style={{ position: 'absolute', top: '100%', right: 0, zIndex: 20 }}
         >
-          {switchError}{' '}
-          <button className="link" onClick={() => setSwitchError(null)}>
+          {switchError ?? branchFlow.error}{' '}
+          <button
+            className="link"
+            onClick={() => {
+              setSwitchError(null);
+              branchFlow.clearError();
+            }}
+          >
             Dismiss
           </button>
         </div>

@@ -87,6 +87,11 @@ pub struct Config {
     /// one is chosen.
     #[serde(default)]
     pub needs_default_provider: bool,
+    /// The remembered answer to the handoff gate (branching a chat onto a
+    /// less-trusted provider, decision #16): `keep` or `clean`. Unset asks
+    /// every time; Settings → Advanced resets it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff_gate_choice: Option<String>,
     /// User-defined chat folders (Round-2 item 15). App-side only — layered over
     /// goosed's session list; not visible to other Goose clients.
     #[serde(default)]
@@ -426,6 +431,7 @@ impl Default for Config {
             providers: Vec::new(),
             active_provider_id: None,
             needs_default_provider: false,
+            handoff_gate_choice: None,
             folders: Vec::new(),
             session_folders: HashMap::new(),
             show_artifacts: true,

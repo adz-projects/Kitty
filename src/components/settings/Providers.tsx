@@ -11,14 +11,17 @@ import { TrashIcon } from '@/components/icons/TrashIcon';
 import { ProviderForm } from './providers/ProviderForm';
 import { blank, hostOf, isLocal } from './providers/providerUtils';
 import { confirmDialog } from '@/components/shared/ConfirmDialog';
+import { Banner } from '@/components/shared/Banner';
 
 export function Providers({ highlight }: { highlight: string | null }) {
   const [providers, setProviders] = useState<ProviderView[]>([]);
   const [editing, setEditing] = useState<ProviderProfile | null>(null);
   const [secret, setSecret] = useState('');
   const [confirmUntrusted, setConfirmUntrusted] = useState(false);
-  const [handoffFor, setHandoffFor] = useState<ProviderView | null>(null);
   const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
+  const [needsDefault, setNeedsDefault] = useState(false);
+  const [settingDefault, setSettingDefault] = useState<string | null>(null);
   const [credits, setCredits] = useState<
     Record<
       string,
@@ -32,9 +35,11 @@ export function Providers({ highlight }: { highlight: string | null }) {
   // API-key path and hasn't re-enabled it from Advanced.
 
   const refresh = () =>
-    ipc
-      .listProviders()
-      .then(setProviders)
+    Promise.all([ipc.listProviders(), ipc.getConfig()])
+      .then(([list, cfg]) => {
+        setProviders(list);
+        setNeedsDefault(cfg.needs_default_provider);
+      })
       .catch((e) => setError(String(e)));
   useEffect(() => void refresh(), []);
   const checkCredits = async (id: string) => {
@@ -73,46 +78,19 @@ export function Providers({ highlight }: { highlight: string | null }) {
     else void doSave();
   };
 
-  const activate = async (p: ProviderView, keepContext: boolean) => {
-    if (!keepContext) {
-      try {
-        await ipc.setActiveSession({
-          session_id: '',
-          cwd: '',
-          thinking_effort: null,
-          is_default_folder: true,
-          provider_id: null,
-          model_id: null,
-        });
-      } catch {
-        /* non-fatal */
-      }
-    }
+  // The default for new chats only; open chats keep their own card
+  // (decision #50). The card must pass a connection check first.
+  const onActivate = async (p: ProviderView) => {
+    setSettingDefault(p.id);
+    setError('');
     try {
-      await ipc.activateProvider(p.id);
-      setHandoffFor(null);
+      await ipc.setDefaultProvider(p.id);
       await refresh();
     } catch (e) {
       setError(String(e));
+    } finally {
+      setSettingDefault(null);
     }
-  };
-
-  const onActivate = async (p: ProviderView) => {
-    try {
-      // Context-handoff gate: switching to an untrusted, non-local provider with an
-      // active session forces an explicit keep/jettison choice (Round-2 item 18).
-      if (!p.is_trusted && p.network_tier !== 'local') {
-        const active = await ipc.getActiveSession();
-        if (active && active.session_id) {
-          setHandoffFor(p);
-          return;
-        }
-      }
-    } catch (e) {
-      setError(String(e));
-      return;
-    }
-    void activate(p, true);
   };
 
   // Each card holds one model; duplicating is how a second model from the same
@@ -138,8 +116,16 @@ export function Providers({ highlight }: { highlight: string | null }) {
     });
     if (!ok) return;
     try {
-      await ipc.deleteProvider(p.id);
+      const promoted = await ipc.deleteProvider(p.id);
       await refresh();
+      if (p.active) {
+        const next = providers.find((x) => x.id === promoted);
+        setNotice(
+          next
+            ? `"${next.name}" is now the default for new chats.`
+            : 'There is no default provider now. Add one to start new chats.'
+        );
+      }
     } catch (e) {
       setError(String(e));
     }
@@ -154,6 +140,24 @@ export function Providers({ highlight }: { highlight: string | null }) {
         </button>
       </div>
       {error && <div className="chat-error">{error}</div>}
+      {notice && (
+        <Banner
+          tone="ok"
+          actions={
+            <button className="link" onClick={() => setNotice('')}>
+              Dismiss
+            </button>
+          }
+        >
+          {notice}
+        </Banner>
+      )}
+      {needsDefault && (
+        <Banner tone="warn">
+          Your default provider ran on this device, which Kitty no longer supports. Choose another
+          default with its ☆ button.
+        </Banner>
+      )}
 
       <div className="provider-list">
         {providers.length === 0 && (
@@ -241,6 +245,7 @@ export function Providers({ highlight }: { highlight: string | null }) {
               {!p.active && (
                 <button
                   className="icon-button"
+                  disabled={settingDefault !== null || !!p.disabled_reason}
                   onClick={() => void onActivate(p)}
                   title="Set as default — applies to brand-new chats, and doesn't change any chat you already have open"
                   aria-label={`Set ${p.name} as the default for new chats`}
@@ -308,25 +313,6 @@ export function Providers({ highlight }: { highlight: string | null }) {
               I understand — save anyway
             </button>
             <button onClick={() => setConfirmUntrusted(false)}>Cancel</button>
-          </div>
-        </Modal>
-      )}
-
-      {handoffFor && (
-        <Modal
-          title="Send this conversation to an untrusted provider?"
-          onClose={() => setHandoffFor(null)}
-        >
-          <p>
-            The active session has context that would now be sent to{' '}
-            <strong>{handoffFor.base_url}</strong>.
-          </p>
-          <div className="row">
-            <button className="primary" onClick={() => void activate(handoffFor, true)}>
-              Keep context (send it)
-            </button>
-            <button onClick={() => void activate(handoffFor, false)}>Start clean</button>
-            <button onClick={() => setHandoffFor(null)}>Cancel</button>
           </div>
         </Modal>
       )}

@@ -41,10 +41,28 @@ export function ProviderForm({
 }) {
   const set = (patch: Partial<ProviderProfile>) => onChange({ ...profile, ...patch });
   const local = isLocal(profile.base_url);
-  // Neither the in-process engine nor an Ollama server takes an API key —
-  // for Ollama that's a property of the server, and stays true now that the
-  // user runs it rather than Kitty.
+  // An Ollama server takes no API key; a custom OpenAI-compatible server may
+  // or may not (#64), so its key is optional.
   const needsKey = profile.provider_type !== 'ollama' && profile.provider_type !== 'local';
+  const keyOptional = profile.provider_type === 'custom_openai';
+
+  // "Test connection" for every type (#66): the card as edited, with the
+  // typed key (or the saved one when the field is blank).
+  const [testing, setTesting] = useState(false);
+  const [testResult, setTestResult] = useState<{ ok: boolean; text: string } | null>(null);
+  useEffect(() => setTestResult(null), [profile.provider_type, profile.base_url, secret]);
+  const testConnection = async () => {
+    setTesting(true);
+    setTestResult(null);
+    try {
+      await ipc.testProviderDraft(profile, secret.trim() ? secret : null);
+      setTestResult({ ok: true, text: 'Connected.' });
+    } catch (e) {
+      setTestResult({ ok: false, text: String(e) });
+    } finally {
+      setTesting(false);
+    }
+  };
 
   // Context-length auto-suggest (Round-6 Feature 1) — re-resolves whenever the
   // provider type or selected model changes; never applied automatically, only
@@ -126,7 +144,13 @@ export function ProviderForm({
             set({ provider_type: pt, base_url: DEFAULT_URL[pt] });
           }}
         >
-          <option value="local">On this device</option>
+          {/* Retired (decision #65): only shown so an old card still says
+              what it is; it can't be chosen for a new one. */}
+          {profile.provider_type === 'local' && (
+            <option value="local" disabled>
+              On this device (no longer supported)
+            </option>
+          )}
           <option value="openrouter">OpenRouter</option>
           <option value="anthropic">Anthropic</option>
           <option value="openai">OpenAI</option>
@@ -216,11 +240,29 @@ export function ProviderForm({
 
       {!showModelPicker && needsKey && (
         <label className="field">
-          <span>API key {profile.id ? '(leave blank to keep)' : ''}</span>
+          <span>
+            API key{' '}
+            {profile.id
+              ? '(leave blank to keep)'
+              : keyOptional
+                ? '(optional — only if your server needs one)'
+                : ''}
+          </span>
           <input type="password" value={secret} onChange={(e) => onSecret(e.target.value)} />
           <small className="muted">{SECRET_STORE_NOTE}</small>
         </label>
       )}
+
+      <div className="row">
+        <button type="button" onClick={() => void testConnection()} disabled={testing}>
+          {testing ? 'Testing…' : 'Test connection'}
+        </button>
+        {testResult && (
+          <small className={testResult.ok ? 'muted' : 'error'} role="status">
+            {testResult.text}
+          </small>
+        )}
+      </div>
 
       {local && (
         <p className="muted trust-note">
@@ -277,6 +319,28 @@ export function ProviderForm({
           stays visible while closed), so visibility can't be left to CSS. */}
       {advancedOpen && (
         <div className="provider-advanced-body">
+          <label className="field">
+            <span>Can this model use tools?</span>
+            <select
+              value={
+                profile.supports_tools == null ? 'auto' : profile.supports_tools ? 'yes' : 'no'
+              }
+              onChange={(e) =>
+                set({
+                  supports_tools: e.target.value === 'auto' ? null : e.target.value === 'yes',
+                })
+              }
+            >
+              <option value="auto">Detect automatically</option>
+              <option value="yes">Yes</option>
+              <option value="no">No</option>
+            </select>
+            <small className="muted">
+              Decides whether dropped files are handed over as paths (a model with tools opens them
+              itself) or pasted into the message. Kitty detects it for known models; set it for a
+              self-hosted or renamed one.
+            </small>
+          </label>
           <label className="check">
             <input
               type="checkbox"

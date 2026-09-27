@@ -317,6 +317,7 @@ pub fn run() {
             commands::set_brave_mcp_search_api_key,
             commands::set_brave_mcp_search_enabled,
             commands::patch_config,
+            commands::test_provider_draft,
             commands::erase_all_beliefs,
             commands::erase_all_facts,
             commands::detect_v1_data,

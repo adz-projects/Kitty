@@ -638,6 +638,25 @@ pub async fn test_provider_connection(
     providers::test_connection(&profile).await
 }
 
+/// "Test connection" in the provider form, for any type (#66): the card as
+/// edited, with the key typed in the form or, when that is blank, the one
+/// already saved for it.
+#[tauri::command]
+pub async fn test_provider_draft(
+    profile: ProviderProfile,
+    secret: Option<String>,
+) -> Result<(), String> {
+    let typed = secret
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let key = match typed {
+        Some(k) => Some(k),
+        None if !profile.id.is_empty() => providers::get_secret_async(&profile.id).await,
+        None => None,
+    };
+    providers::test_connection_with_key(&profile, key).await
+}
+
 /// [`test_provider_connection`] for the default card. `Ok(())` when there is
 /// no default: nothing to check.
 #[tauri::command]
