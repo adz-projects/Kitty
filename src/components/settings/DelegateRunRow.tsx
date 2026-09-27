@@ -52,6 +52,11 @@ export function DelegateRunRow({ run }: { run: SpecialistRun }) {
           <div className="muted" style={{ fontSize: 13 }}>
             {run.summary ?? run.status}
           </div>
+          {run.model && (
+            <div className="muted" style={{ fontSize: 12 }}>
+              Ran on {run.model}
+            </div>
+          )}
         </div>
         <span className="muted" style={{ fontSize: 12 }}>
           {run.started_at ? new Date(run.started_at).toLocaleString() : ''}

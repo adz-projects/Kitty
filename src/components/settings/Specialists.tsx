@@ -15,6 +15,8 @@ interface FormState {
   /** Raw JSON text, validated on save. Empty = prose answer, no schema. */
   responseSchema: string;
   maxSteps: number;
+  /** Runs of this specialist at once; '' = only the global limit. */
+  maxConcurrent: string;
   /** Empty inherits the daemon default. A number is absolute tokens; a value
       ending in `%` is a share of the delegate's remaining context. */
   reasoningCap: string;
@@ -32,6 +34,7 @@ function blankForm(): FormState {
     toolAllow: [],
     responseSchema: '',
     maxSteps: 20,
+    maxConcurrent: '',
     reasoningCap: '',
     fanOut: false,
     enabled: true,
@@ -48,6 +51,7 @@ function formFromSpecialist(s: Specialist): FormState {
     toolAllow: [...s.tool_allow],
     responseSchema: s.response_schema ? JSON.stringify(s.response_schema, null, 2) : '',
     maxSteps: s.max_steps || 20,
+    maxConcurrent: s.max_concurrent != null ? String(s.max_concurrent) : '',
     reasoningCap:
       s.reasoning_cap_tokens != null
         ? String(s.reasoning_cap_tokens)
@@ -81,6 +85,25 @@ export function Specialists() {
   const [saving, setSaving] = useState(false);
   const [runs, setRuns] = useState<SpecialistRun[]>([]);
   const [deny, setDeny] = useState<string[]>([]);
+  // Overall limits on delegate runs; start-up settings of the engine.
+  const [limits, setLimits] = useState<{ timeout: string; concurrent: string } | null>(null);
+  const [limitsSaved, setLimitsSaved] = useState(false);
+  const saveLimits = async () => {
+    if (!limits) return;
+    const timeout = Math.round(Number(limits.timeout));
+    const concurrent = Math.round(Number(limits.concurrent));
+    if (!(timeout >= 30) || !(concurrent >= 1)) {
+      setError('Give a time limit of at least 30 seconds and at least one run at a time.');
+      return;
+    }
+    setError('');
+    try {
+      await ipc.patchConfig({ specialists: { timeout_secs: timeout, max_concurrent: concurrent } });
+      setLimitsSaved(true);
+    } catch (e) {
+      setError(String(e));
+    }
+  };
   const [denyDraft, setDenyDraft] = useState('');
   // Global master switch (distinct from each specialist's own `enabled`): when
   // off, the whole delegation server is unregistered and the model can't
@@ -116,7 +139,13 @@ export function Specialists() {
     // talked out of over HTTP would be a weaker one.
     void ipc
       .getConfig()
-      .then((c) => setDeny(c.specialists?.model_deny ?? []))
+      .then((c) => {
+        setDeny(c.specialists?.model_deny ?? []);
+        setLimits({
+          timeout: String(c.specialists.timeout_secs),
+          concurrent: String(c.specialists.max_concurrent),
+        });
+      })
       .catch(() => {});
     void ipc
       .getSpecialistsEnabled()
@@ -227,6 +256,7 @@ export function Specialists() {
         tool_allow: form.toolAllow,
         response_schema: responseSchema,
         max_steps: form.maxSteps,
+        max_concurrent: form.maxConcurrent.trim() ? Number(form.maxConcurrent) : null,
         reasoning_cap_tokens: cap.tokens,
         reasoning_cap_fraction: cap.fraction,
         fan_out: form.fanOut ? 'per_ref' : null,
@@ -308,7 +338,8 @@ export function Specialists() {
         Models that may never host a specialist, however the daemon would otherwise pick. Exact ids,
         or a prefix like <code>claude-fable-*</code>. This is checked last as well as first, so a
         denied model is refused even when it is the only one left — you will be told rather than
-        quietly billed. Takes effect next time the backend restarts.
+        quietly billed. Applies when Kitty&apos;s engine next restarts, which Kitty does for you as
+        soon as nothing is using it.
       </p>
       <div className="ext-list">
         {deny.map((m) => (
@@ -336,6 +367,45 @@ export function Specialists() {
           Add
         </button>
       </div>
+
+      <h2>Limits</h2>
+      {limits && (
+        <>
+          <div className="row">
+            <label className="field">
+              <span>Time limit per run (seconds)</span>
+              <input
+                type="number"
+                min={30}
+                value={limits.timeout}
+                onChange={(e) => {
+                  setLimitsSaved(false);
+                  setLimits({ ...limits, timeout: e.target.value });
+                }}
+              />
+            </label>
+            <label className="field">
+              <span>Runs at once, all specialists</span>
+              <input
+                type="number"
+                min={1}
+                max={16}
+                value={limits.concurrent}
+                onChange={(e) => {
+                  setLimitsSaved(false);
+                  setLimits({ ...limits, concurrent: e.target.value });
+                }}
+              />
+            </label>
+          </div>
+          <div className="row">
+            <button onClick={() => void saveLimits()}>Save limits</button>
+            {limitsSaved && (
+              <span className="muted">Saved — applies when the engine next restarts.</span>
+            )}
+          </div>
+        </>
+      )}
 
       <h2>Recent delegate runs</h2>
       <p className="muted">
@@ -513,6 +583,21 @@ export function Specialists() {
             />
             <small className="muted">
               How many tool-calling rounds it may take before it has to answer with what it has.
+            </small>
+          </div>
+          <div className="field">
+            <span>At most this many at once (optional)</span>
+            <input
+              type="number"
+              min={1}
+              max={16}
+              placeholder="No limit of its own"
+              value={form.maxConcurrent}
+              onChange={(e) => setForm({ ...form, maxConcurrent: e.target.value })}
+            />
+            <small className="muted">
+              For a specialist on a provider that throttles parallel requests. The overall limit
+              below still applies.
             </small>
           </div>
           <label className="check">
