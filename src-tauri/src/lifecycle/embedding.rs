@@ -5,7 +5,7 @@
 //! checked at `start_stack` and again periodically by
 //! `lifecycle::health::spawn_health_loop`, so a model deleted out-of-band is
 //! noticed without the user touching Settings. Obtaining one is now an
-//! explicit action in Settings → Local Models rather than something that
+//! explicit action in Settings → Helper Models rather than something that
 //! happens behind the user's back.
 
 use tauri::{AppHandle, Emitter, Manager};

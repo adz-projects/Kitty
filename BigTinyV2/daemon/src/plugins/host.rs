@@ -26,8 +26,9 @@ pub struct PluginHost {
     pool: SqlitePool,
     data_dir: PathBuf,
     /// Whether pathway is on for an app that has expressed no preference.
-    /// Comes from the daemon config / `BIGTINYV2_PATHWAY__ENABLED`, so an app
-    /// that never opts in behaves exactly as V1 did.
+    /// Comes from the daemon config / `BIGTINY_PATHWAY__ENABLED`, so an app
+    /// that never opts in behaves exactly as V1 did. An app switches it for
+    /// itself with `PUT /api/apps/me/plugins/pathway`.
     default_enabled: bool,
     ap_config: adaptive_pathway::config::Config,
     /// **Shared across every app**, by `Arc`. A loaded embedding model per app

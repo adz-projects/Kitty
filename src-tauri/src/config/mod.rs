@@ -705,12 +705,13 @@ pub fn themes_dir() -> Result<PathBuf, ConfigError> {
     Ok(dir)
 }
 
-/// `%LOCALAPPDATA%/Kitty/models/` (created if missing) — downloaded GGUFs.
+/// `%LOCALAPPDATA%/Kitty/models/` (created if missing) — the downloaded helper
+/// models (LiteRT `.tflite` / `.litertlm`) and the Gemma `tokenizer.json`.
 ///
 /// **The only path here that isn't under `%APPDATA%`**, deliberately: a
 /// roaming profile syncs, and these files are hundreds of megabytes to
 /// several gigabytes each. `dirs::data_local_dir()` is the non-roaming
-/// equivalent, and matches where `tools/local_engine_lab.py` already looks.
+/// equivalent.
 pub fn models_dir() -> Result<PathBuf, ConfigError> {
     // On Android there is no roaming/local split to respect — app storage is
     // app storage — so this falls through to the same base as everything

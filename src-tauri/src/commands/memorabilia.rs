@@ -3,11 +3,8 @@
 //! adaptive-pathway. Exact parallel to `crate::commands::adaptive_pathway` —
 //! see `crate::bigtiny::memorabilia` for the HTTP client.
 //!
-//! As with pathway, the engine's `enabled` flag is read once by BigTiny at
-//! process spawn (`BIGTINY_MEMORABILIA__ENABLED`); there is no live
-//! daemon-side reconfigure path, so `set_memorabilia_enabled` restarts the
-//! whole BigTiny daemon to apply the change (briefly interrupting any
-//! in-flight chat), then re-syncs the `"memorabilia"` MCP-server registration.
+//! As with pathway, the toggle applies at once, per app (`lifecycle::memory`),
+//! and only when the embedding model is on disk. Never on Android.
 
 use serde::Serialize;
 use serde_json::Value;

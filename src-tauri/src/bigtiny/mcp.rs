@@ -1,8 +1,10 @@
-//! MCP server management for the BigTiny backend — thin wrappers over
-//! `/api/mcp/servers`, plus the idempotent upsert that keeps Kitty's two
-//! bundled plugins (replacement-mcp, adaptive-pathway) registered against the
-//! current install's bundled exe paths. Mirrors `bigtiny::providers`'
-//! sync-over-REST approach: no daemon restart needed for any of this.
+//! MCP server management for the engine — thin wrappers over
+//! `/api/mcp/servers`, plus the idempotent upsert that keeps Kitty's bundled
+//! servers (`kitty-tools`, `kitty-web`, `kitty-wasm`) and the engine's own
+//! in-process ones (`pathway`, `memorabilia`, `specialists`) registered and
+//! switched to match Settings — against the current install's executables on
+//! desktop, in-process on Android. Mirrors `bigtiny::providers`'
+//! sync-over-REST approach: no engine restart needed for any of this.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -555,9 +557,9 @@ pub async fn ensure_builtin_servers(app: &AppHandle) -> Result<SyncReport, Strin
     )
     .await;
 
-    // `kitty-tools` hosts the local-machine tool set — 18 always-on
-    // `lean_*` tools (shell/workspace/file/word/cache/scratchpad), plus the
-    // Excel/PDF tools, plus the 3 visualization tools gated by
+    // `kitty-tools` hosts the local-machine tool set — 24 `lean_*` tools
+    // (workspace/file/Word/Excel/PDF/image/cache/scratchpad/document handles),
+    // plus the 2 shell tools on desktop, plus the 4 visualization tools gated by
     // `KITTY_VIZ_ENABLED` rather than registered as their own separate
     // server. `enabled` alone (`kitty_tools_enabled`) controls whether the
     // whole server is registered at all; `visualizations_enabled` only

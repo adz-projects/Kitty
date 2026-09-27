@@ -57,7 +57,7 @@ pub fn spawn_health_loop(app: AppHandle) {
                 // fail transiently and needed re-attempting on a throttle.
                 // A GGUF is either on disk or it isn't — re-checking a
                 // filesystem path is the whole job, and downloading is now an
-                // explicit user action in Settings → Local Models.
+                // explicit user action in Settings → Helper Models.
                 let (pathway_enabled, embedding_model) = {
                     let state = app.state::<AppState>();
                     let cfg = state.config.lock().unwrap();

@@ -1,14 +1,13 @@
-//! Process lifecycle & health for the local stack.
+//! Finding and keeping the engine.
 //!
-//! We *own* the stack: on startup we spawn the BigTiny daemon, which hosts the
-//! in-process inference engine. A 5s health loop recomputes the
-//! [`crate::state::StackStatus`] and emits `stack://status` on change. On exit
-//! we kill only the children we spawned.
-//!
-//! There is exactly one child now. Kitty used to also spawn and supervise
-//! `ollama serve`; that ended when the engine moved in-process (docs/ANDROID.md
-//! Phase 2b). An Ollama server the *user* runs is still a perfectly good
-//! provider endpoint — Kitty just doesn't manage its lifecycle.
+//! Desktop attaches to the shared BigTiny V2 engine (`bigtiny_v2`), starting
+//! one only when none is running, and never kills it: other apps may be using
+//! it. Android hosts the same engine in-process (`bigtiny_embedded`). Either
+//! way Kitty then registers as its app (`bigtiny_app_key`), syncs providers and
+//! MCP servers, switches the memory plugins (`memory`) and listens for the
+//! app's events (`app_events`). The health loop (`health`) recomputes the
+//! [`crate::state::StackStatus`], emits `stack://status` on change, and
+//! re-attaches when the engine went away or moved.
 
 // Android hosts the daemon in-process; desktop spawns it. Both go through
 // the same `BIGTINY_*` pairs in `bigtiny_env`, so the two hosts cannot drift.

@@ -1,4 +1,4 @@
-// Curated models offered in the first-run wizard and Settings → Local Models.
+// Curated models offered in the first-run wizard and Settings → Helper Models.
 //
 // As of the LiteRT migration these are **LiteRT** artifacts, not GGUFs: Kitty's
 // local engine is LiteRT (see the repo plan "Replace llama.cpp with LiteRT").

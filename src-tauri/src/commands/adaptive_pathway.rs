@@ -3,13 +3,9 @@
 //! sidecar process — see `crate::bigtiny::pathway` for the HTTP client and
 //! `docs/ARCHITECTURE.md` for the current shape.
 //!
-//! Unlike the old sidecar (a small process Kitty could kill/respawn in
-//! isolation in well under a second), the engine's `enabled` flag is read
-//! once by BigTiny at process spawn (`BIGTINY_PATHWAY__ENABLED`) — there is
-//! no live daemon-side reconfigure path for it. Toggling it here therefore
-//! restarts the *entire* BigTiny daemon, briefly interrupting any in-flight
-//! chat, not just Adaptive Pathway — a real behavioral change from the old
-//! toggle's isolated restart, not an oversight.
+//! The toggle applies at once, with no engine restart: it is switched per app
+//! (`PUT /api/apps/me/plugins/pathway`, `lifecycle::memory`), and only turns
+//! the engine on when the embedding model is on disk as well.
 
 use serde::Serialize;
 use serde_json::Value;
