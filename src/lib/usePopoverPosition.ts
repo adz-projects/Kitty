@@ -1,4 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from 'react';
+import { useEscapeLayer } from '@/hooks/useEscapeLayer';
 
 const MARGIN = 4;
 
@@ -18,7 +19,8 @@ const MARGIN = 4;
     the popover gets its own click, and so it doesn't get caught by any
     `stopPropagation()` a consumer's own `onClick` handler calls (there's
     exactly one such case, `SessionKebabMenu`'s row-click guard, and it only
-    stops the `click` event, not `pointerdown`).
+    stops the `click` event, not `pointerdown`). Escape closes it too, before
+    anything underneath (the overlay only hides once no popover is open).
 
     Usage: attach `triggerRef` to the button that opens the popover and
     `popoverRef` to the popover's own root element, and spread `style` onto
@@ -145,6 +147,8 @@ export function usePopoverPosition(open: boolean, onClose: () => void) {
     document.addEventListener('pointerdown', handlePointerDown);
     return () => document.removeEventListener('pointerdown', handlePointerDown);
   }, [open]);
+
+  useEscapeLayer(open, () => onCloseRef.current());
 
   return { triggerRef, popoverRef, style };
 }

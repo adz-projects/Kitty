@@ -1,11 +1,8 @@
-import { useEffect, type ReactNode } from 'react';
+import type { ReactNode } from 'react';
+import { Dialog } from './Dialog';
 
-/** Shared modal chrome (`.modal-backdrop`/`.modal`) — extracted from
-    `Providers.tsx`'s original local, unexported copy once a second consumer
-    (`SchismResolutionModal.tsx`, Round-C) justified sharing it.
-    `onClose` is called on Escape; `e.stopPropagation()` mirrors the pattern
-    in `Composer.tsx`'s autocomplete Escape handler so this doesn't also
-    trigger the overlay window's own Escape-to-hide handler. */
+/** Shared modal chrome — now a plain `Dialog` (focus trap, Escape and Back
+    through the shared layer stacks). Kept as a name for its existing callers. */
 export function Modal({
   title,
   children,
@@ -15,23 +12,9 @@ export function Modal({
   children: ReactNode;
   onClose: () => void;
 }) {
-  useEffect(() => {
-    const handler = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        e.stopPropagation();
-        onClose();
-      }
-    };
-    window.addEventListener('keydown', handler);
-    return () => window.removeEventListener('keydown', handler);
-  }, [onClose]);
-
   return (
-    <div className="modal-backdrop">
-      <div className="modal">
-        <h2>{title}</h2>
-        {children}
-      </div>
-    </div>
+    <Dialog title={title} onClose={onClose}>
+      {children}
+    </Dialog>
   );
 }

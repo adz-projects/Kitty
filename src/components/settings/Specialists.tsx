@@ -3,6 +3,7 @@ import { ipc } from '@/lib/ipc';
 import type { ProviderView, Specialist, SpecialistRun } from '@/lib/types';
 import { DelegateRunRow } from './DelegateRunRow';
 import { Modal } from '@/components/shared/Modal';
+import { confirmDialog } from '@/components/shared/ConfirmDialog';
 
 interface FormState {
   name: string;
@@ -245,7 +246,13 @@ export function Specialists() {
   };
 
   const remove = async (s: Specialist) => {
-    if (!confirm(`Delete specialist "${s.name}"? This cannot be undone.`)) return;
+    const ok = await confirmDialog({
+      title: `Delete "${s.name}"?`,
+      message: 'The model can no longer delegate to this specialist. This cannot be undone.',
+      confirmLabel: 'Delete',
+      danger: true,
+    });
+    if (!ok) return;
     try {
       await ipc.deleteSpecialist(s.id);
       await load();

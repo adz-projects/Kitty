@@ -10,6 +10,7 @@ import { CopyIcon } from '@/components/icons/CopyIcon';
 import { TrashIcon } from '@/components/icons/TrashIcon';
 import { ProviderForm } from './providers/ProviderForm';
 import { blank, hostOf, isLocal } from './providers/providerUtils';
+import { confirmDialog } from '@/components/shared/ConfirmDialog';
 
 export function Providers({ highlight }: { highlight: string | null }) {
   const [providers, setProviders] = useState<ProviderView[]>([]);
@@ -128,7 +129,14 @@ export function Providers({ highlight }: { highlight: string | null }) {
     }
   };
   const onDelete = async (p: ProviderView) => {
-    if (!confirm(`Delete "${p.name}"?`)) return;
+    const ok = await confirmDialog({
+      title: `Delete "${p.name}"?`,
+      message:
+        'Its saved API key is deleted too. Chats that used it stay readable but cannot continue on it.',
+      confirmLabel: 'Delete',
+      danger: true,
+    });
+    if (!ok) return;
     try {
       await ipc.deleteProvider(p.id);
       await refresh();

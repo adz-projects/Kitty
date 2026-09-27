@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { ipc } from '@/lib/ipc';
 import { DB_REPAIR_CONFIRM, runDbRepair } from './dbRepair';
 import type { PathwayBelief, PathwayStats } from '@/lib/types';
+import { confirmDialog } from '@/components/shared/ConfirmDialog';
 
 const SUPPORT_BUCKETS: [string, (n: number) => boolean][] = [
   ['Mentioned once', (n) => n === 1],
@@ -50,7 +51,12 @@ export function GraphHealth() {
   useEffect(() => void load(), []);
 
   const repair = async () => {
-    if (!window.confirm(DB_REPAIR_CONFIRM)) {
+    const ok = await confirmDialog({
+      title: 'Check and repair the belief database?',
+      message: DB_REPAIR_CONFIRM,
+      confirmLabel: 'Check & repair',
+    });
+    if (!ok) {
       return;
     }
     setRepairing(true);

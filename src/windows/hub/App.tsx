@@ -8,6 +8,7 @@ import { MobileDrawer } from '@/components/hub/MobileDrawer';
 import { SessionList } from '@/components/sessions/SessionList';
 import { SettingsView } from '@/components/settings/SettingsView';
 import { WizardView } from '@/components/wizard/WizardView';
+import { ConfirmHost } from '@/components/shared/ConfirmDialog';
 
 /** The hub window (docs/ANDROID.md §8.1): one window routing between chat,
     settings and setup, where there used to be three.
@@ -63,6 +64,7 @@ export function App() {
       {view === 'settings' && <SettingsView />}
       {view === 'wizard' && <WizardView />}
       {android && <MobileDrawer />}
+      <ConfirmHost />
     </>
   );
 }

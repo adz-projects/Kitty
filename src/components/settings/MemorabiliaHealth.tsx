@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { ipc } from '@/lib/ipc';
 import type { MemorabiliaStats } from '@/lib/types';
 import { DB_REPAIR_CONFIRM, runDbRepair } from './dbRepair';
+import { confirmDialog } from '@/components/shared/ConfirmDialog';
 
 /** Friendly names for the importance buckets in `stats.by_importance` — a
     plain `Record<string, number>` on the wire, so this falls back to the raw
@@ -51,7 +52,12 @@ export function MemorabiliaHealth() {
   useEffect(() => void load(), []);
 
   const repair = async () => {
-    if (!window.confirm(DB_REPAIR_CONFIRM)) {
+    const ok = await confirmDialog({
+      title: 'Check and repair the fact database?',
+      message: DB_REPAIR_CONFIRM,
+      confirmLabel: 'Check & repair',
+    });
+    if (!ok) {
       return;
     }
     setRepairing(true);

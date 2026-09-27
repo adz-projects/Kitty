@@ -1,6 +1,7 @@
 ﻿import { useEffect, useState } from 'react';
 import { ipc } from '@/lib/ipc';
 import type { McpServer } from '@/lib/types';
+import { confirmDialog } from '@/components/shared/ConfirmDialog';
 
 /** `adaptive-pathway` is managed solely by the single enable checkbox in
     Settings → Advanced → Adaptive Pathway — showing it here too would be a
@@ -224,7 +225,13 @@ export function McpServers() {
   };
 
   const remove = async (s: McpServer) => {
-    if (!confirm(`Delete MCP server "${s.name}"?`)) return;
+    const ok = await confirmDialog({
+      title: `Delete "${s.name}"?`,
+      message: 'Its tools stop being offered to the model.',
+      confirmLabel: 'Delete',
+      danger: true,
+    });
+    if (!ok) return;
     setError('');
     try {
       await ipc.deleteMcpServer(s.id);

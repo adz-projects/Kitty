@@ -5,6 +5,7 @@ import { useAdaptivePathwayStore } from '@/stores/adaptivePathwayStore';
 import { useChatStore } from '@/stores/chatStore';
 import { StackStatusView } from '@/components/shared/StackStatusView';
 import { StartupSpinner } from '@/components/shared/StartupSpinner';
+import { ConfirmHost } from '@/components/shared/ConfirmDialog';
 import { ChatView } from '@/components/chat/ChatView';
 import { RecentSessions } from '@/components/sessions/RecentSessions';
 import { NewChatIcon } from '@/components/icons/NewChatIcon';
@@ -100,6 +101,7 @@ export function App() {
           )}
         </div>
       </div>
+      <ConfirmHost />
     </div>
   );
 }

@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { ipc, onScheduledTasksChanged, pickFolder } from '@/lib/ipc';
 import type { ProviderView, Schedule, ScheduledTask } from '@/lib/types';
 import { Modal } from '@/components/shared/Modal';
+import { confirmDialog } from '@/components/shared/ConfirmDialog';
 
 export type IntervalUnit = 'minutes' | 'hours' | 'days';
 export const UNIT_SECONDS: Record<IntervalUnit, number> = {
@@ -193,7 +194,13 @@ export function ScheduledTasks() {
   };
 
   const remove = async (t: ScheduledTask) => {
-    if (!confirm(`Delete scheduled task "${t.name}"? This cannot be undone.`)) return;
+    const ok = await confirmDialog({
+      title: `Delete "${t.name}"?`,
+      message: 'This scheduled task stops running. This cannot be undone.',
+      confirmLabel: 'Delete',
+      danger: true,
+    });
+    if (!ok) return;
     try {
       await ipc.deleteScheduledTask(t.id);
       await load();

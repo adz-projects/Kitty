@@ -4,6 +4,7 @@ import { curatedModelsFor } from '@/lib/curated_models';
 import { isAndroid } from '@/lib/platform';
 import { TrashIcon } from '@/components/icons/TrashIcon';
 import type { DownloadProgress, LocalModel } from '@/lib/types';
+import { confirmDialog } from '@/components/shared/ConfirmDialog';
 
 /** Bytes as a short human string. Exported for testing — the repo has no
     component-render tests, so display logic is only reachable this way. */
@@ -106,7 +107,13 @@ export function HelperModels() {
   };
 
   const remove = async (m: LocalModel) => {
-    if (!confirm(`Delete ${m.id}? The file is removed from disk.`)) return;
+    const ok = await confirmDialog({
+      title: `Delete ${m.id}?`,
+      message: 'The file is removed from disk. You can download it again later.',
+      confirmLabel: 'Delete',
+      danger: true,
+    });
+    if (!ok) return;
     setError('');
     try {
       await ipc.deleteLocalModel(m.id);

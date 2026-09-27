@@ -162,6 +162,24 @@ button.primary {
   border-color: var(--accent);
 }
 
+/* Destructive confirm (ConfirmDialog `danger`). */
+button.danger {
+  color: var(--danger);
+  border-color: var(--danger);
+}
+
+button:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+/* Right-aligned action row at the foot of a dialog. */
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
 /* --- Overlay window: a floating, centered card over a transparent backdrop --- */
 .overlay-root {
   display: flex;
