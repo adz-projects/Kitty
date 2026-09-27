@@ -109,7 +109,7 @@ ${prefill}`
     );
     useChatStore.getState().setComposerPrefill(null);
     scheduleResize();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+     
   }, [prefill]);
 
   // Cancel any pending resize frame on unmount.
