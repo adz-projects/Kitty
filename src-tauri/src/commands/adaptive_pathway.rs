@@ -108,11 +108,9 @@ async fn pathway_tool_count(
         .unwrap_or(0)
 }
 
-/// Enable/disable the engine. Persists config, restarts the BigTiny daemon
-/// so `BIGTINY_PATHWAY__ENABLED` actually takes effect (see this module's
-/// doc comment — there is no lighter-weight path), then re-syncs the
-/// `"pathway"` MCP-server registration and the active provider the same way
-/// any other daemon restart does.
+/// Enable/disable the engine. Persists the toggle and applies it at once
+/// through the daemon's per-app plugin switch; the engine only actually runs
+/// when the embedding model is loaded too (`lifecycle::memory`).
 #[tauri::command]
 pub async fn set_adaptive_pathway_enabled(app: AppHandle, enabled: bool) -> Result<(), String> {
     {
@@ -121,6 +119,8 @@ pub async fn set_adaptive_pathway_enabled(app: AppHandle, enabled: bool) -> Resu
         cfg.adaptive_pathway_enabled = enabled;
         config::save(&cfg).map_err(|e| e.to_string())?;
     }
-    crate::lifecycle::engine_restart::schedule(&app);
+    // Live, through the daemon's per-app switch: no restart. See
+    // `lifecycle::memory`.
+    crate::lifecycle::memory::apply_memory_plugins(&app).await;
     Ok(())
 }

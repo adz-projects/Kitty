@@ -31,10 +31,9 @@ pub struct SpawnSnapshot {
     pub token_management: crate::config::TokenManagementSettings,
     pub memory: crate::config::MemorySettings,
     pub specialists: crate::config::SpecialistSettings,
-    pub pathway_enabled: bool,
-    /// Always `false` on Android: memorabilia is desktop-only, and forcing it
-    /// here keeps the engine from ever running there regardless of config.
-    pub memorabilia_enabled: bool,
+    /// The embedding model both memory engines use. Whether each engine runs
+    /// is not a spawn setting: it is applied live, per app
+    /// (`lifecycle::memory`).
     pub pathway_embedding_model: String,
 }
 
@@ -47,8 +46,6 @@ impl SpawnSnapshot {
             token_management: cfg.token_management.clone(),
             memory: cfg.memory.clone(),
             specialists: cfg.specialists.clone(),
-            pathway_enabled: cfg.adaptive_pathway_enabled,
-            memorabilia_enabled: cfg.memorabilia_enabled && !cfg!(target_os = "android"),
             pathway_embedding_model: cfg.adaptive_pathway_embedding_model.clone(),
         }
     }
@@ -122,8 +119,6 @@ pub fn daemon_env(
         token_management,
         memory,
         specialists,
-        pathway_enabled,
-        memorabilia_enabled,
         pathway_embedding_model,
         ..
     } = snap;
@@ -166,16 +161,10 @@ pub fn daemon_env(
             "BIGTINY_TOKEN_MANAGEMENT__MESSAGE_MASK_TAIL_LINES".into(),
             token_management.message_mask_tail_lines.to_string(),
         ),
-        // `PathwayConfig::enabled` defaults to `false` inside BigTiny and
-        // (unlike every other section) has no other override path, so without
-        // this the behavioral-memory engine can never turn on at all.
-        ("BIGTINY_PATHWAY__ENABLED".into(), b(*pathway_enabled)),
-        // Factual-memory plugin. Like pathway, off unless the host says so;
-        // read by `bigtiny2::env_contract::apply_env_overrides`.
-        (
-            "BIGTINY_MEMORABILIA__ENABLED".into(),
-            b(*memorabilia_enabled),
-        ),
+        // No `BIGTINY_PATHWAY__ENABLED` / `BIGTINY_MEMORABILIA__ENABLED`: those
+        // only set the daemon-wide *default* for apps that never chose, and
+        // Kitty always chooses, per app, live (`lifecycle::memory`). Sending
+        // them would hand every other app Kitty's toggles as its default.
     ];
 
     // Model paths are resolved here rather than in the daemon, so the daemon
@@ -323,8 +312,6 @@ mod tests {
             token_management: crate::config::TokenManagementSettings::default(),
             memory: crate::config::MemorySettings::default(),
             specialists: SpecialistSettings::default(),
-            pathway_enabled: false,
-            memorabilia_enabled: false,
             pathway_embedding_model: String::new(),
         }
     }
@@ -350,38 +337,27 @@ mod tests {
     #[test]
     fn booleans_use_the_word_form_the_daemon_parses() {
         let sn = snap();
-        let on = daemon_env("", "", &SpawnSnapshot { pathway_enabled: true, ..sn.clone() }, "");
-        let off = daemon_env("", "", &sn, "");
+        let mut on = sn.clone();
+        on.summarizer.enabled = true;
+        let mut off = sn.clone();
+        off.summarizer.enabled = false;
         assert_eq!(
-            env_of(&on, "BIGTINY_PATHWAY__ENABLED").as_deref(),
+            env_of(&daemon_env("", "", &on, ""), "BIGTINY_SUMMARIZER__ENABLED").as_deref(),
             Some("true")
         );
         assert_eq!(
-            env_of(&off, "BIGTINY_PATHWAY__ENABLED").as_deref(),
+            env_of(&daemon_env("", "", &off, ""), "BIGTINY_SUMMARIZER__ENABLED").as_deref(),
             Some("false")
         );
     }
 
-    /// The memorabilia flag rides the same word-form contract and is
-    /// independent of pathway's — either can be on with the other off.
+    /// The memory toggles are applied live, per app, and never set the
+    /// daemon-wide default another app would inherit.
     #[test]
-    fn memorabilia_enabled_is_sent_as_its_own_flag() {
-        let sn = snap();
-        let on = daemon_env("", "", &SpawnSnapshot { memorabilia_enabled: true, ..sn.clone() }, "");
-        let off = daemon_env("", "", &sn, "");
-        assert_eq!(
-            env_of(&on, "BIGTINY_MEMORABILIA__ENABLED").as_deref(),
-            Some("true")
-        );
-        assert_eq!(
-            env_of(&off, "BIGTINY_MEMORABILIA__ENABLED").as_deref(),
-            Some("false")
-        );
-        // Independent of pathway: memorabilia on here, pathway off.
-        assert_eq!(
-            env_of(&on, "BIGTINY_PATHWAY__ENABLED").as_deref(),
-            Some("false")
-        );
+    fn the_memory_toggles_are_not_spawn_settings() {
+        let e = daemon_env("", "", &snap(), "");
+        assert!(env_of(&e, "BIGTINY_PATHWAY__ENABLED").is_none());
+        assert!(env_of(&e, "BIGTINY_MEMORABILIA__ENABLED").is_none());
     }
 
     /// An unresolvable embedding model must leave the LiteRT slot empty and the
@@ -472,7 +448,7 @@ mod tests {
     #[test]
     fn no_key_is_emitted_twice() {
         let sn = snap();
-        let e = daemon_env("", "", &SpawnSnapshot { pathway_enabled: true, ..sn.clone() }, "");
+        let e = daemon_env("", "", &sn, "");
         let mut keys: Vec<&str> = e.iter().map(|(k, _)| k.as_str()).collect();
         let before = keys.len();
         keys.sort_unstable();

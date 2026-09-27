@@ -42,6 +42,7 @@ import type {
   DownloadProgress,
   EngineRestartState,
   EngineInfo,
+  MemoryStatus,
   RestartOutcome,
   Schedule,
   ScheduledTask,
@@ -97,6 +98,8 @@ export const ipc = {
   /** `force` ("Restart anyway") overrides only the other-apps check. */
   restartBackend: (force = false) => invoke<RestartOutcome>('restart_backend', { force }),
   getEngineInfo: () => invoke<EngineInfo>('get_engine_info'),
+  /** Also refreshes it: applies the memory toggles against the engine. */
+  getMemoryStatus: () => invoke<MemoryStatus>('get_memory_status'),
   newSession: (cwd?: string) => invoke<SessionInfo>('new_session', { cwd: cwd ?? null }),
   /** Tells Rust which window is now showing `sessionId` — lets a
       notification for that session later focus this specific window
@@ -590,6 +593,9 @@ export const onModelsChanged = (cb: () => void) => listen('models://changed', ()
 
 export const onEngineRestartState = (cb: (e: EngineRestartState) => void) =>
   listen<EngineRestartState>('engine://restart-state', (e) => cb(e.payload));
+
+export const onMemoryStatus = (cb: (s: MemoryStatus) => void) =>
+  listen<MemoryStatus>('memory://status', (e) => cb(e.payload));
 
 /** Hub navigation (docs/ANDROID.md §8.1). Replaces the old
     `settings://navigate` and `wizard://navigate` events, which existed to

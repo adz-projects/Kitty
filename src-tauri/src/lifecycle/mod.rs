@@ -29,6 +29,7 @@ pub mod bigtiny_v2;
 pub(crate) mod embedding;
 pub mod engine_restart;
 mod health;
+pub mod memory;
 pub mod scheduler;
 
 pub(crate) use health::{compute_status, current_payload};
@@ -305,6 +306,8 @@ pub(crate) async fn install_handle(app: &AppHandle, handle: crate::state::Daemon
     if let Some(port) = port {
         sync_mcp_once_healthy(app, healthy, port);
     }
+    // Memory follows the toggles and what this engine loaded.
+    memory::apply_memory_plugins(app).await;
 }
 
 /// Find the engine again (desktop): attach to the daemon that is up now, or

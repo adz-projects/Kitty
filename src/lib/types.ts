@@ -419,6 +419,17 @@ export interface RestartOutcome {
   spawned_by_us: boolean;
 }
 
+/** Where the memory engines stand. Mirrors `lifecycle::memory::MemoryStatus`. */
+export interface MemoryStatus {
+  /** The embedding model is on disk. */
+  model_installed: boolean;
+  /** The running engine loaded it (false with `model_installed`: a restart is due). */
+  engine_has_embeddings: boolean;
+  pathway_active: boolean;
+  memorabilia_active: boolean;
+  memorabilia_supported: boolean;
+}
+
 /** Mirrors `commands::window::EngineInfo`. */
 export interface EngineInfo {
   spawned_by_us: boolean;

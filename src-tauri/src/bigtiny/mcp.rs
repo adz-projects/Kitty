@@ -317,14 +317,19 @@ pub async fn ensure_builtin_servers(app: &AppHandle) {
     ) = {
         let state = app.state::<AppState>();
         let cfg = state.config.lock().unwrap();
+        // The memory tool rows follow whether each engine actually runs (the
+        // toggle *and* a loaded embedding model, `lifecycle::memory`), not the
+        // toggle alone: an enabled row whose engine is off can never connect,
+        // and the self-heal would retry it every pass.
+        let memory = state.memory_status.lock().unwrap();
         (
             cfg.kitty_wasm_enabled,
             cfg.brave_mcp_search_enabled,
             cfg.visualizations_enabled,
             cfg.kitty_tools_enabled,
             cfg.kitty_web_enabled,
-            cfg.adaptive_pathway_enabled,
-            cfg.memorabilia_enabled,
+            memory.pathway_active,
+            memory.memorabilia_active,
             cfg.specialists.timeout_secs,
             cfg.specialists.enabled,
         )
@@ -334,8 +339,8 @@ pub async fn ensure_builtin_servers(app: &AppHandle) {
     // in-process MCP rows off so the model is never offered their tools and no
     // failing card is registered — the rows stay *registered* below (the drift
     // tests require their presence), only `enabled` flips. Memorabilia's engine
-    // is additionally force-offed at daemon spawn (`lifecycle/mod.rs`);
-    // specialists has no enable env flag, so this row is its only switch. The
+    // is kept off there by `lifecycle::memory` as well; specialists has no
+    // other switch, so this row is its only one. The
     // `let _` consumes the config values so they aren't flagged unused here.
     #[cfg(target_os = "android")]
     let (memorabilia_enabled, specialists_enabled) = {
@@ -350,14 +355,10 @@ pub async fn ensure_builtin_servers(app: &AppHandle) {
     // executable path, and `transport: "in_process"` is what tells
     // `mcp::manager` to route through that in-process constructor
     // (`tokio::io::duplex`) instead of spawning a stdio child. No env map:
-    // the engine reads `AP_EMBED_OLLAMA_MODEL`/`AP_EMBED_OLLAMA_URL` from
-    // BigTiny's own process environment (set at daemon spawn time in
-    // `lifecycle::bigtiny_proc::spawn`), since there's no separate child
-    // process to hand a per-server env to anymore. `enabled` here only
-    // controls whether the model can *call* `record`/`forget` as tools —
-    // recall and the automatic turn-end/compaction learning passes run
-    // regardless, gated instead by `BIGTINY_PATHWAY__ENABLED` (also set at
-    // daemon spawn, from the same `adaptive_pathway_enabled` config field).
+    // the engine is the daemon's own. Whether it runs at all is the app's
+    // plugin switch (`lifecycle::memory`); `enabled` here mirrors that, so
+    // `record`/`forget` are offered exactly when there is an engine behind
+    // them.
     //
     // This row was dead for a while: `builtin::connect` had no `"pathway"`
     // arm and its doc comment asserted none should exist, so the row
@@ -387,12 +388,9 @@ pub async fn ensure_builtin_servers(app: &AppHandle) {
     // The declarative factual-memory engine, the second in-process plugin
     // linked into the daemon (`plugins/memorabilia_rust`). Same shape as the
     // `pathway` row above: a logical `command` name `builtin::connect` switches
-    // on, `transport: "in_process"`, and no env map (the engine reads
-    // `BIGTINY_MEMORABILIA__ENABLED` from the daemon's own process environment,
-    // set at spawn in `lifecycle::bigtiny_env`). `enabled` here only gates
-    // whether the model can *call* `memorabilia_search`/`memorabilia_read_item`;
-    // recall injection and turn-end learning run whenever the engine is on,
-    // gated by that same env flag. Paired with the daemon's `"memorabilia"` arm
+    // on, `transport: "in_process"`, and no env map. As with `pathway`,
+    // whether the engine runs is the app's plugin switch (`lifecycle::memory`)
+    // and `enabled` mirrors it. Paired with the daemon's `"memorabilia"` arm
     // in `BigTinyV2/daemon/src/mcp/builtin.rs` — change the two together.
     upsert_builtin(
         &client,

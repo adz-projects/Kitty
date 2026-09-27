@@ -1217,6 +1217,10 @@ async fn the_plugin_listing_reports_effective_state_and_whether_it_was_chosen() 
     let before = list(APP_A).await;
     assert_eq!(before["plugins"][0]["plugin"], "pathway");
     assert_eq!(before["plugins"][0]["explicit"], false);
+    assert_eq!(
+        before["semantic_embeddings"], false,
+        "the test host has no embedding model loaded"
+    );
 
     set_plugin(state.clone(), APP_A, "pathway", true).await;
     let after = list(APP_A).await;

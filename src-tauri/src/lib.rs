@@ -168,6 +168,7 @@ pub fn run() {
             commands::get_stack_status,
             commands::get_engine_restart_state,
             commands::get_engine_info,
+            commands::get_memory_status,
             commands::get_startup_phase,
             commands::window_ready,
             commands::restart_backend,

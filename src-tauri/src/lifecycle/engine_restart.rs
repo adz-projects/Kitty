@@ -401,7 +401,6 @@ mod tests {
             |c: &mut Config| c.specialists.timeout_secs += 1,
             |c: &mut Config| c.specialists.max_concurrent += 1,
             |c: &mut Config| c.specialists.model_deny.push("x/y".into()),
-            |c: &mut Config| c.adaptive_pathway_enabled = !c.adaptive_pathway_enabled,
         ] {
             let mut b = Config::default();
             mutate(&mut b);
@@ -434,6 +433,19 @@ mod tests {
             ..Config::default()
         };
         assert!(needs_restart(&a, &c));
+    }
+
+    /// The memory toggles apply live through the daemon's per-app switch
+    /// (`lifecycle::memory`), so flipping one must not restart anything.
+    #[test]
+    fn a_memory_toggle_does_not_restart() {
+        let a = Config::default();
+        let b = Config {
+            adaptive_pathway_enabled: !a.adaptive_pathway_enabled,
+            memorabilia_enabled: !a.memorabilia_enabled,
+            ..Config::default()
+        };
+        assert!(!needs_restart(&a, &b));
     }
 
     /// Saving the same config twice (the UI does this on every keystroke in

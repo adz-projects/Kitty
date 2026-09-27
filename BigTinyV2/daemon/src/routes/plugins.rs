@@ -198,7 +198,15 @@ pub async fn list(
             "explicit": explicit.is_some(),
         }));
     }
-    Json(json!({ "plugins": out })).into_response()
+    Json(json!({
+        "plugins": out,
+        // Whether this daemon loaded a semantic embedding model. Without one
+        // both memory engines fall back to lexical hashing; a client that
+        // treats memory as needing real embeddings (Kitty does) can keep them
+        // off instead, and knows a restart is needed once a model is added.
+        "semantic_embeddings": state.plugins.embedder().is_some(),
+    }))
+    .into_response()
 }
 
 #[derive(Debug, Deserialize)]

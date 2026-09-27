@@ -64,6 +64,10 @@ pub fn delete_local_model(app: AppHandle, id: String) -> Result<(), String> {
     std::fs::remove_file(&path).map_err(|e| format!("could not delete {}: {e}", path.display()))?;
     let _ = app.emit("models://changed", ());
     refresh_embedding_status(&app);
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        crate::lifecycle::memory::apply_memory_plugins(&app).await;
+    });
     Ok(())
 }
 
@@ -188,6 +192,7 @@ async fn run_download(app: AppHandle, mut spec: DownloadSpec, id: String, token:
                 );
                 let _ = app.emit("models://changed", ());
                 refresh_embedding_status(&app);
+                crate::lifecycle::memory::apply_memory_plugins(&app).await;
                 return;
             }
             Err(download::DownloadError::ChecksumMismatch { expected, actual })
