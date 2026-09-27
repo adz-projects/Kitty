@@ -366,15 +366,7 @@ fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
 /// A fresh random nonce every call — AES-GCM security depends on never
 /// reusing a (key, nonce) pair.
 pub fn encrypt(plaintext: &str) -> String {
-    let cipher = cipher();
-    let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
-    let ciphertext = cipher
-        .encrypt(&nonce, plaintext.as_bytes())
-        .expect("AES-GCM encryption cannot fail for a well-formed key/nonce");
-    let mut payload = Vec::with_capacity(NONCE_LEN + ciphertext.len());
-    payload.extend_from_slice(&nonce);
-    payload.extend_from_slice(&ciphertext);
-    format!("{PREFIX}{}", BASE64.encode(payload))
+    seal(cipher(), plaintext)
 }
 
 /// Decrypt a value previously produced by `encrypt`. A value with no
@@ -390,30 +382,64 @@ pub fn decrypt(value: &str) -> String {
     let Some(encoded) = value.strip_prefix(PREFIX) else {
         return value.to_string();
     };
-    let cipher = cipher();
-    let payload = match BASE64.decode(encoded) {
-        Ok(p) => p,
+    match open(cipher(), encoded) {
+        Ok(plaintext) => plaintext,
         Err(e) => {
-            tracing::warn!("failed to base64-decode an encrypted value: {e}");
-            return value.to_string();
+            tracing::warn!("{e}");
+            value.to_string()
         }
+    }
+}
+
+/// A hex-encoded 32-byte key, as `BIGTINY_ENCRYPTION_KEY` carries one.
+pub fn parse_key_hex(hex: &str) -> Result<[u8; KEY_LEN], String> {
+    decode_hex_key(hex)
+}
+
+/// Decrypt `value` with an explicit key rather than this daemon's own - for
+/// reading another database's secrets (the V1 import). Legacy plaintext comes
+/// back as it is; `None` means a prefixed value this key cannot open.
+pub fn decrypt_with_key(value: &str, key: &[u8; KEY_LEN]) -> Option<String> {
+    let Some(encoded) = value.strip_prefix(PREFIX) else {
+        return Some(value.to_string());
     };
+    open(&Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key)), encoded).ok()
+}
+
+/// `encrypt` under an explicit key; the test fixture for `decrypt_with_key`.
+#[cfg(test)]
+pub(crate) fn encrypt_with_key(plaintext: &str, key: &[u8; KEY_LEN]) -> String {
+    seal(
+        &Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key)),
+        plaintext,
+    )
+}
+
+fn seal(cipher: &Aes256Gcm, plaintext: &str) -> String {
+    let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+    let ciphertext = cipher
+        .encrypt(&nonce, plaintext.as_bytes())
+        .expect("AES-GCM encryption cannot fail for a well-formed key/nonce");
+    let mut payload = Vec::with_capacity(NONCE_LEN + ciphertext.len());
+    payload.extend_from_slice(&nonce);
+    payload.extend_from_slice(&ciphertext);
+    format!("{PREFIX}{}", BASE64.encode(payload))
+}
+
+/// Open the base64 payload after the prefix.
+fn open(cipher: &Aes256Gcm, encoded: &str) -> Result<String, String> {
+    let payload = BASE64
+        .decode(encoded)
+        .map_err(|e| format!("failed to base64-decode an encrypted value: {e}"))?;
     if payload.len() < NONCE_LEN {
-        tracing::warn!("encrypted value too short to contain a nonce");
-        return value.to_string();
+        return Err("encrypted value too short to contain a nonce".to_string());
     }
     let (nonce_bytes, ciphertext) = payload.split_at(NONCE_LEN);
     let nonce = aes_gcm::Nonce::from_slice(nonce_bytes);
-    match cipher.decrypt(nonce, ciphertext) {
-        Ok(plaintext) => String::from_utf8(plaintext).unwrap_or_else(|e| {
-            tracing::warn!("decrypted value was not valid UTF-8: {e}");
-            value.to_string()
-        }),
-        Err(e) => {
-            tracing::warn!("failed to decrypt a stored value: {e}");
-            value.to_string()
-        }
-    }
+    let plaintext = cipher
+        .decrypt(nonce, ciphertext)
+        .map_err(|e| format!("failed to decrypt a stored value: {e}"))?;
+    String::from_utf8(plaintext).map_err(|e| format!("decrypted value was not valid UTF-8: {e}"))
 }
 
 #[cfg(test)]
@@ -490,6 +516,15 @@ mod tests {
         assert!(!adopt_key(&dir, &hex_encode(&[4u8; KEY_LEN])).unwrap());
         assert_eq!(load_or_create_key_file(&dir).unwrap(), [3u8; KEY_LEN]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_explicit_key_opens_only_its_own_values() {
+        let key = [5u8; KEY_LEN];
+        let sealed = encrypt_with_key("sk-v1", &key);
+        assert_eq!(decrypt_with_key(&sealed, &key).as_deref(), Some("sk-v1"));
+        assert_eq!(decrypt_with_key(&sealed, &[6u8; KEY_LEN]), None);
+        assert_eq!(decrypt_with_key("plain", &key).as_deref(), Some("plain"));
     }
 
     #[test]

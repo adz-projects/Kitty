@@ -5,6 +5,7 @@
 //! stores the returned key in its own secret store, and thereafter identifies
 //! itself with `X-API-Key`.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
@@ -22,6 +23,133 @@ use super::AppState;
 
 fn err_response(status: StatusCode, message: impl Into<String>) -> Response {
     (status, Json(json!({"error": message.into()}))).into_response()
+}
+
+/// Body of `POST /api/apps/me/import-v1`.
+#[derive(Debug, Deserialize)]
+pub struct ImportV1Request {
+    /// The V1 daemon's `bigtiny.db`. Read from a copy; never modified.
+    pub v1_db_path: String,
+    /// The key V1 encrypted its secrets with, hex-encoded.
+    pub v1_encryption_key_hex: String,
+    /// V1's belief graph, adopted only if this app has none of its own.
+    #[serde(default)]
+    pub pathway_db_path: Option<String>,
+}
+
+/// `POST /api/apps/me/import-v1`
+///
+/// Merge a Kitty V1 database into the calling app's data in the live
+/// database: sessions and their history, providers (with their keys moved
+/// onto this daemon's key), MCP servers, and approval rules. Anything already
+/// present is skipped, not overwritten, so a repeated import is harmless. See
+/// `import::merge_v1` for the details and `routes::plugins::adopt_v1_pathway`
+/// for the belief graph.
+///
+/// Answers with an `import::MergeSummary`. New providers are registered with
+/// the router and new MCP servers connected before or just after it returns,
+/// so they are usable without a restart.
+pub async fn import_v1(
+    State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<AppIdentity>,
+    Json(body): Json<ImportV1Request>,
+) -> Response {
+    // One at a time: two concurrent merges of the same source would each see
+    // the other's rows as absent until commit.
+    static RUNNING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let Ok(_running) = RUNNING.try_lock() else {
+        return err_response(StatusCode::CONFLICT, "an import is already running");
+    };
+
+    let key = match crate::crypto::parse_key_hex(&body.v1_encryption_key_hex) {
+        Ok(key) => key,
+        Err(e) => {
+            return err_response(
+                StatusCode::BAD_REQUEST,
+                format!("v1_encryption_key_hex: {e}"),
+            )
+        }
+    };
+    let source = PathBuf::from(&body.v1_db_path);
+    if !source.is_file() {
+        return err_response(
+            StatusCode::BAD_REQUEST,
+            format!("no V1 database at {}", source.display()),
+        );
+    }
+    if is_live_database(&state.db, &source).await {
+        return err_response(
+            StatusCode::BAD_REQUEST,
+            "that is this daemon's own database, not a V1 one",
+        );
+    }
+
+    let app_id = identity.app_id.as_str();
+    let outcome = match crate::import::merge_v1(
+        &state.db,
+        state.plugins.data_dir(),
+        &source,
+        &key,
+        app_id,
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+
+    for id in &outcome.new_provider_ids {
+        match crate::storage::providers::get_provider(&state.db, id).await {
+            Ok(Some(row)) => state.router.register_from_row(&row),
+            Ok(None) => {}
+            Err(e) => tracing::warn!("imported provider {id} could not be registered: {e}"),
+        }
+    }
+    // Connecting can take up to the connect timeout per server; the import
+    // itself is done, so do not hold the answer for it.
+    let to_connect = outcome.new_mcp_server_ids.clone();
+    let mcp = state.mcp.clone();
+    let db = state.db.clone();
+    tokio::spawn(async move {
+        for id in to_connect {
+            let enabled = matches!(
+                crate::storage::mcp_servers::get_server(&db, &id).await,
+                Ok(Some(row)) if row.enabled != 0
+            );
+            if enabled {
+                if let Err(e) = mcp.connect_server(&id).await {
+                    tracing::warn!("imported MCP server {id} did not connect: {e}");
+                }
+            }
+        }
+    });
+
+    let mut summary = outcome.summary;
+    summary.pathway = match body.pathway_db_path.as_deref() {
+        None => "not_requested",
+        Some(path) => {
+            super::plugins::adopt_v1_pathway(&state, app_id, std::path::Path::new(path)).await
+        }
+    }
+    .to_string();
+    Json(summary).into_response()
+}
+
+/// Whether `path` is the file behind `pool`'s main database.
+async fn is_live_database(pool: &sqlx::SqlitePool, path: &std::path::Path) -> bool {
+    let live: Option<String> =
+        sqlx::query_scalar("SELECT file FROM pragma_database_list WHERE name = 'main'")
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten();
+    let Some(live) = live.filter(|f| !f.is_empty()) else {
+        return false;
+    };
+    match (std::fs::canonicalize(&live), std::fs::canonicalize(path)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
 }
 
 /// `POST /api/apps/register`

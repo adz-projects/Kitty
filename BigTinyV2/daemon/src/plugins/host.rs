@@ -92,8 +92,13 @@ impl PluginHost {
     /// Nested under `apps/<app_id>/` rather than `pathway-<app_id>.db` so
     /// everything else an app accumulates has an obvious home later, and so a
     /// revoked app's state can be removed with one directory delete.
-    fn db_path(&self, app_id: &str) -> PathBuf {
+    pub(crate) fn db_path(&self, app_id: &str) -> PathBuf {
         self.data_dir.join("apps").join(app_id).join("pathway.db")
+    }
+
+    /// The daemon data directory this host keeps app state under.
+    pub fn data_dir(&self) -> &std::path::Path {
+        &self.data_dir
     }
 
     /// Whether pathway is on for this app: its own preference, else the

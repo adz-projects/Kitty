@@ -98,6 +98,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         // `crate::plugins`.
         .route("/api/admin/restart", post(admin::restart))
         .route("/api/apps/me/events", get(events::events))
+        .route("/api/apps/me/import-v1", post(apps::import_v1))
         .route("/api/hitl/rules", get(hitl::list))
         .route("/api/hitl/rules/{id}", delete(hitl::delete))
         .route("/api/apps/me/plugins", get(plugins::list))

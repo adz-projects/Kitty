@@ -54,19 +54,8 @@ async fn plugin_close(state: &AppState, plugin: &str, app_id: &str) {
 /// reconnected only if the app wants it and the plugin is now on; otherwise it
 /// is left disconnected.
 pub(crate) async fn reconnect_plugin_tools(state: &AppState, plugin: &str, app_id: &str) {
-    let rows = match crate::storage::mcp_servers::list_servers_for_app(&state.db, app_id).await {
-        Ok(rows) => rows,
-        Err(e) => {
-            tracing::warn!("could not list MCP servers to reconnect {plugin}: {e}");
-            return;
-        }
-    };
     let enabled = plugin_enabled(state, plugin, app_id).await;
-    for row in rows.into_iter().filter(|r| {
-        r.transport == "in_process"
-            && r.command.as_deref() == Some(plugin)
-            && r.app_id.as_deref() == Some(app_id)
-    }) {
+    for row in plugin_tool_rows(state, plugin, app_id).await {
         state.mcp.disconnect_server(&row.id).await;
         if enabled && row.enabled != 0 {
             if let Err(e) = state.mcp.connect_server(&row.id).await {
@@ -74,6 +63,108 @@ pub(crate) async fn reconnect_plugin_tools(state: &AppState, plugin: &str, app_i
             }
         }
     }
+}
+
+/// The app's in-process tool-server rows for `plugin`.
+async fn plugin_tool_rows(
+    state: &AppState,
+    plugin: &str,
+    app_id: &str,
+) -> Vec<crate::storage::mcp_servers::MCPServerRow> {
+    match crate::storage::mcp_servers::list_servers_for_app(&state.db, app_id).await {
+        Ok(rows) => rows
+            .into_iter()
+            .filter(|r| {
+                r.transport == "in_process"
+                    && r.command.as_deref() == Some(plugin)
+                    && r.app_id.as_deref() == Some(app_id)
+            })
+            .collect(),
+        Err(e) => {
+            tracing::warn!("could not list MCP servers for the {plugin} tools: {e}");
+            Vec::new()
+        }
+    }
+}
+
+/// Install a V1 belief graph as `app_id`'s, if the app has none of its own.
+///
+/// Never merges: two graphs' beliefs, evidence and decay state do not
+/// combine meaningfully, and the user's current graph is the one that is
+/// being used. So the V1 file is adopted only when the app's `pathway.db` is
+/// missing or holds no beliefs, and reported as skipped otherwise.
+///
+/// The app's engine and its tool server are closed first so the file is not
+/// in use, and reconnected afterwards (which reopens the engine on the new
+/// file). If something still holds the file - a turn mid-recall - the old
+/// file cannot be removed on Windows and the import reports `skipped_in_use`
+/// rather than writing over an open database.
+pub(crate) async fn adopt_v1_pathway(
+    state: &AppState,
+    app_id: &str,
+    source: &std::path::Path,
+) -> &'static str {
+    if !source.is_file() {
+        return "not_found";
+    }
+    let dest = state.plugins.db_path(app_id);
+
+    for row in plugin_tool_rows(state, PATHWAY, app_id).await {
+        state.mcp.disconnect_server(&row.id).await;
+    }
+    state.plugins.close(app_id).await;
+
+    let outcome = replace_if_empty(source, &dest).await;
+    reconnect_plugin_tools(state, PATHWAY, app_id).await;
+    outcome
+}
+
+async fn replace_if_empty(source: &std::path::Path, dest: &std::path::Path) -> &'static str {
+    if dest.exists() {
+        match belief_count(dest).await {
+            Some(0) => {}
+            // Unreadable counts as not empty: never replace what we cannot see.
+            _ => return "skipped_not_empty",
+        }
+        for suffix in ["", "-wal", "-shm"] {
+            let path = std::path::PathBuf::from(format!("{}{suffix}", dest.display()));
+            if path.exists() && std::fs::remove_file(&path).is_err() {
+                return "skipped_in_use";
+            }
+        }
+    } else if let Some(parent) = dest.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return "failed";
+        }
+    }
+    let copied = std::fs::copy(source, dest).is_ok()
+        && ["-wal", "-shm"].into_iter().all(|suffix| {
+            let from = std::path::PathBuf::from(format!("{}{suffix}", source.display()));
+            !from.exists()
+                || std::fs::copy(&from, format!("{}{suffix}", dest.display())).is_ok()
+        });
+    if copied {
+        "imported"
+    } else {
+        "failed"
+    }
+}
+
+/// How many beliefs the graph at `path` holds, read without disturbing it.
+async fn belief_count(path: &std::path::Path) -> Option<i64> {
+    use sqlx::ConnectOptions;
+    let mut conn = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(path)
+        .read_only(true)
+        .connect()
+        .await
+        .ok()?;
+    let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM beliefs")
+        .fetch_one(&mut conn)
+        .await
+        .ok();
+    let _ = sqlx::Connection::close(conn).await;
+    count
 }
 
 fn err(status: StatusCode, message: impl Into<String>) -> Response {

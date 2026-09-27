@@ -2402,3 +2402,67 @@ async fn erasing_beliefs_clears_only_the_callers_graph() {
     assert_eq!(count(&list(APP_A).await), 0, "the caller's beliefs are gone");
     assert!(count(&list(APP_B).await) >= 1, "another app's graph is untouched");
 }
+
+// ---------------------------------------------------------------------------
+// V1 merge import
+// ---------------------------------------------------------------------------
+
+/// The import lands in the caller's data and nobody else's, and a bad request
+/// is refused before anything is touched.
+#[tokio::test]
+async fn a_v1_import_becomes_the_callers_data() {
+    let state = test_state().await;
+    let dir = tempfile::tempdir().unwrap();
+    let v1 = dir.path().join("bigtiny.db");
+    {
+        let db = bigtiny2::storage::Database::connect(&v1.to_string_lossy())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO sessions (id, name, status, app_id) VALUES ('v1-chat', 'Old', 'active', '')")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO messages (id, session_id, role, content) VALUES ('v1-m', 'v1-chat', 'user', 'hi')")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        db.pool().close().await;
+    }
+    let key = "ab".repeat(32);
+    let post = |body: Value| {
+        let state = state.clone();
+        async move {
+            let req = Request::builder()
+                .method(Method::POST)
+                .uri("/api/apps/me/import-v1")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            router_as(state, APP_A).oneshot(req).await.unwrap()
+        }
+    };
+
+    let resp = post(json!({"v1_db_path": v1, "v1_encryption_key_hex": "nope"})).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "a malformed key is refused");
+    let resp = post(json!({"v1_db_path": dir.path().join("missing.db"), "v1_encryption_key_hex": key})).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "a missing database is refused");
+
+    let resp = post(json!({
+        "v1_db_path": v1,
+        "v1_encryption_key_hex": key,
+        "pathway_db_path": dir.path().join("no-pathway.db"),
+    }))
+    .await;
+    let status = resp.status();
+    let summary = body_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "{summary}");
+    assert_eq!(summary["sessions"], 1);
+    assert_eq!(summary["messages"], 1);
+    assert_eq!(summary["pathway"], "not_found");
+
+    let owner: String = sqlx::query_scalar("SELECT app_id FROM sessions WHERE id = 'v1-chat'")
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(owner, APP_A, "imported as the caller's, not shared and not another app's");
+}
