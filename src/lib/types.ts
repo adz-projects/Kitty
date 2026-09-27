@@ -138,10 +138,9 @@ export interface ProviderProfile {
   /** Manual override that widens image support beyond name-based detection
       (see `vision_models.ts` and the Rust field's doc comment). */
   supports_vision: boolean;
-  /** Custom system prompt; `null` = use the built-in mode-appropriate default
-      (see system_prompts.ts). STOPGAP-adjacent — prepended client-side to a
-      session's first message (chatStore.ts's send()), since Goose's ACP has no
-      system-prompt param it honors. */
+  /** Custom system prompt; `null` = the built-in default. Applied by the
+      backend as the session's persona when a chat is created on (or moved
+      to) this card, so scheduled runs get it too. */
   system_prompt: string | null;
   /** Override for how long `session/prompt` tolerates silence before giving
       up, in seconds (default 300 when `null`). Raise this for a provider known
@@ -157,6 +156,11 @@ export interface ProviderProfile {
       the server's actual `--parallel` value exactly; a mismatch doesn't
       error, it just silently thrashes the KV cache instead of pinning it. */
   parallel_slots: number | null;
+  /** Override for whether the model can call tools; `null` = detect. */
+  supports_tools?: boolean | null;
+  /** Why this card can no longer be used (`"unsupported"` for the retired
+      "On this device" type), or `null`. */
+  disabled_reason?: string | null;
   created_at: string;
 }
 
@@ -175,6 +179,9 @@ export interface ProviderView extends ProviderProfile {
       provider reporting its own capabilities outranks a regex over its name.
       Mirrors `ProviderView::accepts_images` in commands/provider.rs. */
   accepts_images: boolean | null;
+  /** Whether the model can call tools: the override, else detected. Decides
+      whether dropped files go as paths or are inlined. */
+  tools_supported: boolean;
 }
 
 /** `GET /api/v1/key`'s `data` object — only the fields Kitty's UI reads are

@@ -33,6 +33,7 @@ function profile(overrides: Partial<ProviderView>): ProviderView {
     has_secret: true,
     active: false,
     accepts_images: null,
+    tools_supported: true,
     ...overrides,
   };
 }

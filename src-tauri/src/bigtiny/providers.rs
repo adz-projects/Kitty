@@ -1,6 +1,6 @@
-//! Provider plumbing for the BigTiny backend: sync Kitty's active provider
-//! profile into BigTiny's runtime provider registry over REST — no daemon
-//! restart, unlike the goosed path's spawn-time env vars.
+//! Provider plumbing for the BigTiny backend: keep the daemon's provider
+//! registry in step with Kitty's provider cards over REST, and pin sessions
+//! to a card.
 
 use serde_json::{json, Value};
 use tauri::{AppHandle, Manager};
@@ -41,226 +41,215 @@ fn normalize_scheme(base_url: &str) -> String {
     }
 }
 
-/// Ensure Kitty's active provider profile exists (and is current) in
-/// BigTiny's registry; returns the BigTiny provider id, or `None` when no
-/// profile is active. Matched by profile name — BigTiny assigns its own ids.
-/// Provider id the daemon registers its in-process engine under. Fixed, and
-/// deliberately not a DB row: `providers.provider_type` is CHECK-constrained
-/// to `('openai_compat','anthropic')`, and the engine is neither. Sessions pin
-/// it by sending this exact string as `provider`.
-pub const LOCAL_PROVIDER_ID: &str = "local";
-
-/// The id the daemon's provider registry knows this profile by — which is the
-/// This profile's model in the OpenRouter catalog, if it can be matched.
+/// Every provider card, as the daemon should know it.
 ///
-/// Best-effort and quiet: most self-hosted profiles run a fine-tune the catalog
-/// has never heard of, and that is the ordinary case rather than a failure. The
-/// catalog is refreshed opportunistically here because this runs on a provider
-/// write, which is exactly when its cost and capability figures are wanted.
-async fn catalog_entry_for(
-    app: &AppHandle,
-    profile: &ProviderProfile,
-) -> Option<crate::openrouter::catalog::OpenRouterCatalogEntry> {
-    let model = profile.models.first()?;
-    let state = app.state::<AppState>();
-    crate::openrouter::catalog::ensure_catalog_fresh(&state).await;
-    let guard = state.openrouter_catalog.lock().ok()?;
-    let catalog = guard.as_ref()?;
-    crate::openrouter::catalog::match_in_catalog(model, &catalog.entries).cloned()
-}
-
-/// Kitty profile id for everything except the in-process engine.
+/// **All** usable profiles are registered, not just the default: a chat pinned
+/// to a non-default card, a specialist told to prefer one, and failover all
+/// need the daemon to know it. Kitty's rows in the daemon are kept in exact
+/// step with the cards: a card's edit reaches its row (every setting sent
+/// explicitly, so a cleared value clears), a deleted or disabled card's row
+/// is removed (with its key), and the default card is set as Kitty's
+/// per-app default.
 ///
-/// This distinction is what a session's `metadata.provider` stamp has to
-/// respect. `sync_active_provider` registers a `local` profile under the fixed
-/// `LOCAL_PROVIDER_ID` and creates no row for it, but sessions were being
-/// stamped with the *profile* id (`prof_…`) — an id the registry never
-/// contains. `get_provider_id` then fell through to the priority sort, and
-/// since `demote_others` had just made the newly-activated profile the only
-/// priority-1 row, every local-engine chat silently followed the global
-/// default instead of its own pin. Stamping through this function is what
-/// makes the pin name something real.
-pub fn daemon_provider_id(profile: &crate::config::providers::ProviderProfile) -> String {
-    if profile.provider_type == "local" {
-        LOCAL_PROVIDER_ID.to_string()
-    } else {
-        profile.id.clone()
-    }
-}
-
-pub async fn sync_active_provider(app: &AppHandle) -> Result<Option<String>, String> {
-    let profile = {
+/// Called at every attach and after any card is added, edited, duplicated or
+/// deleted.
+pub async fn sync_all_providers(app: &AppHandle) -> Result<(), String> {
+    let (profiles, default_id) = {
         let state = app.state::<AppState>();
         let cfg = state.config.lock().unwrap();
-        cfg.active_provider_id
-            .as_ref()
-            .and_then(|id| cfg.providers.iter().find(|p| &p.id == id).cloned())
+        (
+            cfg.providers
+                .iter()
+                .filter(|p| p.is_usable())
+                .cloned()
+                .collect::<Vec<_>>(),
+            cfg.active_provider_id.clone(),
+        )
     };
-    let Some(profile) = profile else {
-        return Ok(None);
+    let catalog = {
+        let state = app.state::<AppState>();
+        crate::openrouter::catalog::ensure_catalog_fresh(&state).await;
+        let catalog = state.openrouter_catalog.lock().unwrap().clone();
+        catalog
     };
-
-    // The in-process engine needs no registration: the daemon registered it
-    // at startup from `[local]`, under a fixed id, with no row to create or
-    // key to store. Everything below is about the HTTP registry, so short-
-    // circuit before any of it.
-    if profile.provider_type == "local" {
-        let client = ensure_client(app)?;
-        set_app_default(&client, LOCAL_PROVIDER_ID).await;
-        return Ok(Some(LOCAL_PROVIDER_ID.to_string()));
+    let mut cards = Vec::with_capacity(profiles.len());
+    for profile in profiles {
+        let api_key = get_secret_async(&profile.id).await;
+        let body = provider_body(&profile, catalog.as_ref(), api_key);
+        cards.push(body);
     }
-
-    let (provider_type, base_url) = bigtiny_provider_target(&profile);
-    let api_key = get_secret_async(&profile.id).await;
-    let model = profile.models.first().cloned();
-    let mut config = json!({});
-    if let Some(m) = &model {
-        config["model"] = Value::String(m.clone());
-    }
-    // `provider_type` above is BigTiny's wire-format column (`openai_compat`
-    // | `anthropic`, DB-constrained) — it collapses ollama/openai/openrouter/
-    // custom_openai together, so it can't tell a self-hosted endpoint apart
-    // from a hosted one. `provider_dialect` carries Kitty's original,
-    // granular `profile.provider_type` through the unconstrained `config`
-    // blob instead; BigTiny's router reads it back
-    // (`ProviderRouter::register_from_row`) to decide which providers get a
-    // repetition-safe sampling floor (`provider::sampling::defaults_for`)
-    // and which llama.cpp/Ollama-only fields (`top_k`/`min_p`) are safe to
-    // put on the wire.
-    config["provider_dialect"] = Value::String(profile.provider_type.clone());
-    if let Some(t) = profile.temperature {
-        config["temperature"] = json!(t);
-    }
-    if let Some(p) = profile.top_p {
-        config["top_p"] = json!(p);
-    }
-    if let Some(k) = profile.top_k {
-        config["top_k"] = json!(k);
-    }
-    if let Some(p) = profile.min_p {
-        config["min_p"] = json!(p);
-    }
-    if let Some(p) = profile.presence_penalty {
-        config["presence_penalty"] = json!(p);
-    }
-    if let Some(f) = profile.frequency_penalty {
-        config["frequency_penalty"] = json!(f);
-    }
-    if let Some(m) = profile.max_tokens {
-        config["max_tokens"] = json!(m);
-    }
-    if let Some(c) = profile.context_length {
-        config["context_length"] = json!(c);
-    }
-    // Delegate-host hints. `subagent_role` is the user's own setting; the other
-    // two are folded from the OpenRouter catalog here rather than in the daemon,
-    // because the catalog lives in this process and the daemon serves apps other
-    // than Kitty — it must not acquire a dependency it cannot refresh.
-    //
-    // All three are optional and commonly absent for a self-hosted profile that
-    // the catalog cannot match. That is the ordinary case: the daemon's native
-    // signals (tool support, concurrency, KV-slot sharing, health, context
-    // length) carry every important part of the decision without them.
-    if let Some(role) = profile.subagent_role.as_deref().filter(|r| !r.is_empty()) {
-        config["subagent_role"] = Value::String(role.to_string());
-    }
-    if let Some(entry) = catalog_entry_for(app, &profile).await {
-        if let Some(tier) = entry.cost_tier {
-            config["cost_tier"] = json!(match tier {
-                crate::openrouter::catalog::CostTier::Economy => "economy",
-                crate::openrouter::catalog::CostTier::Moderate => "moderate",
-                crate::openrouter::catalog::CostTier::Premium => "premium",
-            });
-        }
-        // One number out of three indices: a delegate's work is agentic
-        // tool-driving, so that index leads, with coding and general
-        // intelligence as fallbacks when a model has not been measured on it.
-        if let Some(rank) = entry
-            .agentic_index
-            .or(entry.coding_index)
-            .or(entry.intelligence_index)
-        {
-            config["capability_rank"] = json!(rank.clamp(0.0, 100.0) as i32);
-        }
-    }
-    if let Some(n) = profile.parallel_slots {
-        config["parallel_slots"] = json!(n);
-    }
-
     let client = ensure_client(app)?;
+    sync_cards(&client, &cards, default_id.as_deref()).await
+}
+
+/// One card, ready to send.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ProviderCard {
+    pub id: String,
+    pub name: String,
+    pub provider_type: String,
+    pub base_url: String,
+    pub config: Value,
+    pub api_key: Option<String>,
+}
+
+/// Map a profile onto the daemon's provider row. Every optional setting is
+/// present, `null` when unset: the daemon merges `config` key by key, so an
+/// omitted key would leave a stale value behind.
+pub(crate) fn provider_body(
+    profile: &ProviderProfile,
+    catalog: Option<&crate::openrouter::catalog::OpenRouterCatalog>,
+    api_key: Option<String>,
+) -> ProviderCard {
+    let (provider_type, base_url) = bigtiny_provider_target(profile);
+    let entry = profile.models.first().and_then(|model| {
+        catalog.and_then(|c| crate::openrouter::catalog::match_in_catalog(model, &c.entries))
+    });
+    // Delegate-host hints. `subagent_role` is the user's own setting; the other
+    // two are folded from the OpenRouter catalog here rather than in the
+    // daemon, because the catalog lives in this process and the daemon serves
+    // apps other than Kitty — it must not acquire a dependency it cannot
+    // refresh. All three are commonly absent for a self-hosted model the
+    // catalog cannot match, which is the ordinary case.
+    let cost_tier = entry.and_then(|e| e.cost_tier).map(|tier| match tier {
+        crate::openrouter::catalog::CostTier::Economy => "economy",
+        crate::openrouter::catalog::CostTier::Moderate => "moderate",
+        crate::openrouter::catalog::CostTier::Premium => "premium",
+    });
+    // One number out of three indices: a delegate's work is agentic
+    // tool-driving, so that index leads, with coding and general intelligence
+    // as fallbacks when a model has not been measured on it.
+    let capability_rank = entry
+        .and_then(|e| e.agentic_index.or(e.coding_index).or(e.intelligence_index))
+        .map(|rank| rank.clamp(0.0, 100.0) as i32);
+    let config = json!({
+        "model": profile.models.first(),
+        // `provider_type` is BigTiny's wire-format column (`openai_compat` |
+        // `anthropic`, DB-constrained) — it collapses ollama/openai/openrouter/
+        // custom_openai together. `provider_dialect` carries Kitty's granular
+        // type through the unconstrained `config` blob; BigTiny's router reads
+        // it back to decide which providers get a repetition-safe sampling
+        // floor and which llama.cpp/Ollama-only fields are safe to send.
+        "provider_dialect": profile.provider_type,
+        "temperature": profile.temperature,
+        "top_p": profile.top_p,
+        "top_k": profile.top_k,
+        "min_p": profile.min_p,
+        "presence_penalty": profile.presence_penalty,
+        "frequency_penalty": profile.frequency_penalty,
+        "max_tokens": profile.max_tokens,
+        "context_length": profile.context_length,
+        "parallel_slots": profile.parallel_slots,
+        "subagent_role": profile.subagent_role.as_deref().filter(|r| !r.is_empty()),
+        "cost_tier": cost_tier,
+        "capability_rank": capability_rank,
+        // Negated so a row written before this existed reads as "supports
+        // tools" (see the daemon's `ProviderConfig::tools_unsupported`).
+        "tools_unsupported": !profile.tools_supported(catalog),
+    });
+    ProviderCard {
+        id: profile.id.clone(),
+        name: profile.name.clone(),
+        provider_type,
+        base_url,
+        config,
+        api_key,
+    }
+}
+
+/// Bring the daemon's rows in line with `cards`, then set `default_id` as the
+/// app default. Split from the `AppHandle` half so it runs against a mock
+/// daemon in tests.
+pub(crate) async fn sync_cards(
+    client: &super::client::BigTinyClient,
+    cards: &[ProviderCard],
+    default_id: Option<&str>,
+) -> Result<(), String> {
     let existing = client.get_json("/api/providers").await?;
-    let rows = existing.get("providers").and_then(|p| p.as_array());
-    // Match by the Kitty profile id — the daemon now stores its provider row
-    // under exactly this id (see `create_provider`'s optional `id`), so the
-    // session's `metadata.provider` stamp (also the profile id) resolves here
-    // instead of missing the registry and falling back to another provider.
-    let found: bool = rows
-        .map(|rows| {
-            rows.iter()
-                .any(|r| r.get("id").and_then(|i| i.as_str()) == Some(profile.id.as_str()))
-        })
-        .unwrap_or(false);
-    // Legacy rows created before id-unification carry a daemon-generated UUID
-    // but the same name — delete them so the router isn't left with a stale,
-    // demoted duplicate the session id can never reach.
-    if !found {
-        if let Some(rows) = rows {
-            for r in rows {
-                let same_name =
-                    r.get("name").and_then(|n| n.as_str()) == Some(profile.name.as_str());
-                let other_id = r.get("id").and_then(|i| i.as_str());
-                if same_name && other_id != Some(profile.id.as_str()) {
-                    if let Some(stale) = other_id {
-                        let _ = client.delete(&format!("/api/providers/{stale}")).await;
-                    }
+    let rows: Vec<Value> = existing
+        .get("providers")
+        .and_then(|p| p.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let row_of = |id: &str| rows.iter().find(|r| r["id"].as_str() == Some(id));
+
+    let mut first_error: Option<String> = None;
+    for card in cards {
+        let result = match row_of(&card.id) {
+            // The wire type cannot be changed in place; replace the row.
+            Some(row) if row["provider_type"].as_str() != Some(card.provider_type.as_str()) => {
+                match client.delete(&format!("/api/providers/{}", card.id)).await {
+                    Ok(_) => create_row(client, card).await,
+                    Err(e) => Err(e),
                 }
             }
+            Some(_) => {
+                let body = json!({
+                    "name": card.name,
+                    "base_url": card.base_url,
+                    "config": card.config,
+                    "fallback_priority": 1,
+                    // Explicit `null`, not an omitted field, when there's no
+                    // key: the daemon reads an omitted `api_key` as "leave the
+                    // stored one alone", so a key removed here would otherwise
+                    // keep working there forever.
+                    "api_key": card.api_key,
+                });
+                client
+                    .patch_json(&format!("/api/providers/{}", card.id), &body)
+                    .await
+                    .map(|_| ())
+            }
+            None => create_row(client, card).await,
+        };
+        if let Err(e) = result {
+            tracing::warn!("could not sync provider {} to the engine: {e}", card.id);
+            first_error.get_or_insert(e);
         }
     }
 
-    let id = if found {
-        {
-            let id = profile.id.clone();
-            let mut body =
-                json!({ "base_url": base_url, "config": config, "fallback_priority": 1 });
-            // Explicit `null`, not an omitted field, when there's no key —
-            // BigTiny's `merge_config` treats an omitted `api_key` as "leave
-            // whatever's already stored alone" (needed so this same PATCH,
-            // sent on every activation, doesn't require repeating an
-            // unchanged key every time). Omitting it here for the "key was
-            // deleted from Credential Manager" case meant a removed key kept
-            // working forever server-side; `null` tells BigTiny to actually
-            // clear it.
-            body["api_key"] = api_key.as_deref().map(Value::from).unwrap_or(Value::Null);
-            client
-                .patch_json(&format!("/api/providers/{id}"), &body)
-                .await?;
-            id
+    for stale in stale_rows(&rows, cards) {
+        if let Err(e) = client.delete(&format!("/api/providers/{stale}")).await {
+            tracing::warn!("could not remove provider {stale} from the engine: {e}");
         }
-    } else {
-        // Pin the daemon row's id to the Kitty profile id so the session
-        // provider stamp resolves against it (see `create_provider`).
-        let mut body = json!({
-            "id": profile.id,
-            "name": profile.name,
-            "provider_type": provider_type,
-            "base_url": base_url,
-            "fallback_priority": 1,
-            "config": config,
-        });
-        if let Some(key) = &api_key {
-            body["api_key"] = Value::String(key.clone());
-        }
-        let created = client.post_json("/api/providers", &body).await?;
-        created
-            .get("id")
-            .and_then(|i| i.as_str())
-            .ok_or("BigTiny did not return a provider id")?
-            .to_string()
-    };
+    }
 
-    set_app_default(&client, &id).await;
-    Ok(Some(id))
+    if let Some(id) = default_id.filter(|id| cards.iter().any(|c| c.id == *id)) {
+        set_app_default(client, id).await;
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+async fn create_row(
+    client: &super::client::BigTinyClient,
+    card: &ProviderCard,
+) -> Result<(), String> {
+    // The row's id is the card's id, so a session's `metadata.provider`
+    // stamp (also the card id) resolves to it.
+    let mut body = json!({
+        "id": card.id,
+        "name": card.name,
+        "provider_type": card.provider_type,
+        "base_url": card.base_url,
+        "fallback_priority": 1,
+        "config": card.config,
+    });
+    if let Some(key) = &card.api_key {
+        body["api_key"] = Value::String(key.clone());
+    }
+    client.post_json("/api/providers", &body).await.map(|_| ())
+}
+
+/// Kitty's rows that no card accounts for any more: deleted and disabled
+/// cards, and rows from before a card's row shared its id. Only rows this
+/// app owns - never another app's, and never one shared with every app.
+fn stale_rows(rows: &[Value], cards: &[ProviderCard]) -> Vec<String> {
+    rows.iter()
+        .filter(|r| r["app_id"].as_str() == Some(crate::lifecycle::bigtiny_app_key::APP_ID))
+        .filter_map(|r| r["id"].as_str())
+        .filter(|id| !cards.iter().any(|c| c.id == *id))
+        .map(str::to_string)
+        .collect()
 }
 
 /// Tell the daemon which provider *this app* defaults to.
@@ -346,8 +335,135 @@ mod tests {
             system_prompt: None,
             prompt_idle_timeout_secs: None,
             parallel_slots: None,
+            supports_tools: None,
+            disabled_reason: None,
             created_at: String::new(),
         }
+    }
+
+    /// A cleared setting has to clear on the engine too: every optional key
+    /// is sent, `null` when unset, because the daemon merges `config` key by
+    /// key.
+    #[test]
+    fn every_optional_setting_is_sent_even_when_unset() {
+        let mut p = profile("openrouter", "https://openrouter.ai/api/v1");
+        p.models = vec!["a/b".into()];
+        let card = provider_body(&p, None, None);
+        let config = card.config.as_object().unwrap();
+        for key in [
+            "temperature",
+            "top_p",
+            "top_k",
+            "min_p",
+            "presence_penalty",
+            "frequency_penalty",
+            "max_tokens",
+            "context_length",
+            "parallel_slots",
+            "subagent_role",
+            "cost_tier",
+            "capability_rank",
+        ] {
+            assert!(config.contains_key(key), "{key} must be sent");
+            assert!(config[key].is_null(), "{key} is unset");
+        }
+        assert_eq!(config["model"], "a/b");
+        assert_eq!(config["tools_unsupported"], false);
+
+        p.supports_tools = Some(false);
+        assert_eq!(
+            provider_body(&p, None, None).config["tools_unsupported"],
+            true
+        );
+    }
+
+    /// Only Kitty's own rows are ever removed, and only those no card accounts
+    /// for.
+    #[test]
+    fn stale_rows_are_kittys_rows_without_a_card() {
+        let rows = vec![
+            json!({"id": "keep", "app_id": "kitty"}),
+            json!({"id": "gone", "app_id": "kitty"}),
+            json!({"id": "theirs", "app_id": "research"}),
+            json!({"id": "shared", "app_id": null}),
+        ];
+        let cards = vec![provider_body(
+            &ProviderProfile {
+                id: "keep".into(),
+                ..profile("anthropic", "x")
+            },
+            None,
+            None,
+        )];
+        assert_eq!(stale_rows(&rows, &cards), ["gone"]);
+    }
+
+    /// Against a mock engine: an existing card is patched, a new one created,
+    /// a deleted card's row removed, and the default set.
+    #[tokio::test]
+    async fn sync_brings_the_engine_in_line_with_the_cards() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("GET", "/api/providers")
+            .with_body(
+                json!({"providers": [
+                    {"id": "old", "provider_type": "openai_compat", "app_id": "kitty"},
+                    {"id": "edited", "provider_type": "openai_compat", "app_id": "kitty"},
+                ]})
+                .to_string(),
+            )
+            .create_async()
+            .await;
+        let patched = server
+            .mock("PATCH", "/api/providers/edited")
+            .match_body(mockito::Matcher::PartialJson(
+                json!({"name": "Edited", "api_key": null}),
+            ))
+            .with_body("{}")
+            .create_async()
+            .await;
+        let created = server
+            .mock("POST", "/api/providers")
+            .match_body(mockito::Matcher::PartialJson(
+                json!({"id": "new", "api_key": "sk"}),
+            ))
+            .with_body(r#"{"id":"new"}"#)
+            .create_async()
+            .await;
+        let removed = server
+            .mock("DELETE", "/api/providers/old")
+            .with_body("{}")
+            .create_async()
+            .await;
+        let default = server
+            .mock("PATCH", "/api/apps/me")
+            .match_body(mockito::Matcher::Json(
+                json!({"default_provider_id": "new"}),
+            ))
+            .with_body("{}")
+            .create_async()
+            .await;
+
+        let edited = ProviderProfile {
+            id: "edited".into(),
+            name: "Edited".into(),
+            ..profile("openrouter", "https://x")
+        };
+        let new = ProviderProfile {
+            id: "new".into(),
+            ..profile("custom_openai", "http://box:1")
+        };
+        let cards = vec![
+            provider_body(&edited, None, None),
+            provider_body(&new, None, Some("sk".into())),
+        ];
+        let client = crate::bigtiny::client::BigTinyClient::new(server.url(), None);
+        sync_cards(&client, &cards, Some("new")).await.unwrap();
+
+        patched.assert_async().await;
+        created.assert_async().await;
+        removed.assert_async().await;
+        default.assert_async().await;
     }
 
     #[test]
@@ -381,7 +497,8 @@ mod tests {
 
     #[test]
     fn explicit_https_scheme_is_preserved() {
-        let (_, url) = bigtiny_provider_target(&profile("custom_openai", "https://box.ts.net:8081"));
+        let (_, url) =
+            bigtiny_provider_target(&profile("custom_openai", "https://box.ts.net:8081"));
         assert_eq!(url, "https://box.ts.net:8081");
     }
 

@@ -206,11 +206,20 @@ pub fn start_stack(app: &AppHandle) {
         // Publishes `Ready` on every exit path from this task, including a
         // panic — see `StartupPhaseGuard`.
         let _phase = StartupPhaseGuard { app: app.clone() };
-        // Before anything reads the provider list: one card, one model.
+        // Before anything reads the provider list: one card, one model, and
+        // no card of a retired type left as the default.
         crate::config::providers::migrate_multi_model_profiles(&app).await;
+        {
+            let state = app.state::<AppState>();
+            let mut cfg = state.config.lock().unwrap();
+            if crate::config::providers::migrate_local_profiles(&mut cfg) {
+                if let Err(e) = crate::config::save(&cfg) {
+                    tracing::warn!("could not save the retired provider cards: {e}");
+                }
+            }
+        }
         // Spawn the BigTiny daemon. No provider env vars — providers are
-        // registered at runtime over REST (see
-        // `bigtiny::providers::sync_active_provider` right after spawn).
+        // registered at runtime over REST (`install_handle`).
         let snap = {
             let state = app.state::<AppState>();
             let cfg = state.config.lock().unwrap();
@@ -295,7 +304,7 @@ pub(crate) async fn install_handle(app: &AppHandle, handle: crate::state::Daemon
         *state.startup_error.lock().unwrap() = None;
     }
     // Register the providers so the very first send has one to route to.
-    if let Err(e) = crate::bigtiny::providers::sync_active_provider(app).await {
+    if let Err(e) = crate::bigtiny::providers::sync_all_providers(app).await {
         tracing::warn!("bigtiny provider sync failed: {e}");
     }
     // Self-heal the bundled plugins' MCP-server registrations (command path

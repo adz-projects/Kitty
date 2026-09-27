@@ -31,10 +31,7 @@ pub struct SessionInfo {
     /// which is why changing the default in Settings re-pointed the model,
     /// badge, vision gate and system prompt of every already-open chat.
     ///
-    /// Deliberately the *profile* id rather than the daemon-registry id these
-    /// are stamped into session metadata as: the frontend looks profiles up by
-    /// this id, and for the in-process engine the two differ (see
-    /// `bigtiny::providers::daemon_provider_id`).
+    /// The card's id, which is also its id in the engine's registry.
     pub provider_id: Option<String>,
     pub model_id: Option<String>,
 }
@@ -56,30 +53,33 @@ pub async fn new_session(app: AppHandle, cwd: Option<String>) -> Result<SessionI
         }
         _ => resolve_cwd(&app).await?,
     };
-    // Resolve the global default provider/model to pin onto this session.
-    // Three values, not two: the daemon is stamped with the registry id while
-    // the frontend needs the profile id, and they diverge for `local`.
-    let active: (Option<String>, Option<String>, Option<String>) = {
+    // Pin the default card onto this session, and give it that card's system
+    // prompt now rather than on the first send, so every turn - including a
+    // scheduled run's - has it.
+    let card = {
         let state = app.state::<AppState>();
         let cfg = state.config.lock().unwrap();
-        let provider = cfg
-            .active_provider_id
+        cfg.active_provider_id
             .as_deref()
-            .and_then(|id| cfg.providers.iter().find(|p| p.id == id))
-            .map(|p| {
-                (
-                    // `daemon_provider_id`, not `p.id`: a `local` profile is
-                    // registered under a fixed id and stamping the profile id
-                    // pins the session to a provider the daemon registry has
-                    // never heard of, which silently un-pins it.
-                    Some(crate::bigtiny::providers::daemon_provider_id(p)),
-                    p.models.first().cloned(),
-                    Some(p.id.clone()),
-                )
-            });
-        provider.unwrap_or((None, None, None))
+            .and_then(|id| cfg.providers.iter().find(|p| p.id == id && p.is_usable()))
+            .cloned()
     };
-    crate::bigtiny::sessions::create(&app, cwd, active.0, active.1, active.2).await
+    let (provider, model) = match &card {
+        Some(p) => (Some(p.id.clone()), p.models.first().cloned()),
+        None => (None, None),
+    };
+    let info =
+        crate::bigtiny::sessions::create(&app, cwd, provider.clone(), model, provider).await?;
+    let persona = card
+        .as_ref()
+        .map(crate::config::providers::system_prompt_for)
+        .unwrap_or_else(|| crate::config::providers::DEFAULT_SYSTEM_PROMPT.to_string());
+    if let Err(e) =
+        crate::bigtiny::sessions::update_persona_override(&app, &info.session_id, &persona).await
+    {
+        tracing::warn!("could not set the new chat's system prompt: {e}");
+    }
+    Ok(info)
 }
 
 /// List past sessions (raw session objects; the frontend parses them).
@@ -248,7 +248,10 @@ mod tests {
         // "<base>/chats/X/../../Other" starts with "<base>/chats/" so the old
         // string-prefix check passed, but it canonicalizes to a *sibling* of
         // the chats tree — must be refused.
-        let crafted = format!("{}/X/../../Other", root.to_string_lossy().replace('\\', "/"));
+        let crafted = format!(
+            "{}/X/../../Other",
+            root.to_string_lossy().replace('\\', "/")
+        );
         assert!(!chat_folder_is_deletable(&crafted, &root));
         assert!(outside.exists(), "the outside dir must survive untouched");
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
@@ -260,19 +263,23 @@ mod tests {
         let root = temp_chats_root("boundary");
         let sibling = root.parent().unwrap().join("chats2");
         std::fs::create_dir_all(sibling.join("foo")).unwrap();
-        assert!(!chat_folder_is_deletable(&sibling.join("foo").to_string_lossy(), &root));
+        assert!(!chat_folder_is_deletable(
+            &sibling.join("foo").to_string_lossy(),
+            &root
+        ));
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 
     #[test]
     fn chat_folder_is_deletable_rejects_an_absolute_outside_path() {
         let root = temp_chats_root("outside");
-        let elsewhere = std::env::temp_dir().join(format!(
-            "kitty-chats-elsewhere-{}",
-            std::process::id()
-        ));
+        let elsewhere =
+            std::env::temp_dir().join(format!("kitty-chats-elsewhere-{}", std::process::id()));
         std::fs::create_dir_all(&elsewhere).unwrap();
-        assert!(!chat_folder_is_deletable(&elsewhere.to_string_lossy(), &root));
+        assert!(!chat_folder_is_deletable(
+            &elsewhere.to_string_lossy(),
+            &root
+        ));
         let _ = std::fs::remove_dir_all(&elsewhere);
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
@@ -293,7 +300,10 @@ mod tests {
         std::fs::create_dir_all(root.join("X")).unwrap();
         let crafted = format!("{}/X/..", root.to_string_lossy().replace('\\', "/"));
         assert!(!chat_folder_is_deletable(&crafted, &root));
-        assert!(root.exists(), "the chats root itself must never be deletable");
+        assert!(
+            root.exists(),
+            "the chats root itself must never be deletable"
+        );
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 
@@ -401,8 +411,7 @@ pub async fn delete_session(
         if chat_folder_is_deletable(&cwd, &chats_root) {
             let cwd_for_delete = cwd.replace('\\', "/");
             let _ =
-                tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&cwd_for_delete))
-                    .await;
+                tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&cwd_for_delete)).await;
         } else {
             tracing::warn!("refusing to delete session folder outside the chats tree: {cwd}");
         }

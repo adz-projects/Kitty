@@ -51,22 +51,15 @@ fn tags_response_has_tag(json: &serde_json::Value, tag: &str) -> bool {
 /// the manual "Retry connection check" command. `Ok(())` means the profile
 /// looks usable; `Err(String)` is a human-readable reason to show the user.
 pub async fn test_connection(profile: &ProviderProfile) -> Result<(), String> {
+    if !profile.is_usable() && profile.provider_type != "local" {
+        return Err("this provider is disabled".into());
+    }
     match profile.provider_type.as_str() {
-        // The in-process engine: no endpoint to reach, so "usable" means the
-        // weights are on disk. Anything else would be testing our own
-        // process, which is running by definition if this code is.
-        "local" => {
-            let model = profile.models.first().map(String::as_str).unwrap_or("");
-            if model.is_empty() {
-                return Err("no local model selected — pick one in Settings → Local Models".into());
-            }
-            if crate::models::resolve(model).is_none() {
-                return Err(format!(
-                    "\"{model}\" isn't downloaded — get it from Settings → Local Models"
-                ));
-            }
-            Ok(())
-        }
+        // Retired: there is no local chat engine (decision #65).
+        "local" => Err(
+            "the \"On this device\" provider type is no longer supported — choose another provider"
+                .into(),
+        ),
         "ollama" => {
             let client = crate::util::http_client();
             if !probe_version(&client, &profile.base_url).await {
@@ -165,7 +158,7 @@ mod tests {
             base_url: base_url.to_string(),
             models: models.into_iter().map(String::from).collect(),
             is_trusted: false,
-        subagent_role: None,
+            subagent_role: None,
             temperature: None,
             top_p: None,
             top_k: None,
@@ -178,6 +171,8 @@ mod tests {
             system_prompt: None,
             prompt_idle_timeout_secs: None,
             parallel_slots: None,
+            supports_tools: None,
+            disabled_reason: None,
             created_at: String::new(),
         }
     }

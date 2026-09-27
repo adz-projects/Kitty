@@ -64,8 +64,13 @@ pub struct Config {
     pub remember_overlay_position: bool,
     /// Provider profiles (metadata only; secrets live in the keyring).
     pub providers: Vec<ProviderProfile>,
-    /// Id of the active provider profile, if any.
+    /// Id of the default provider profile (new chats use it), if any.
     pub active_provider_id: Option<String>,
+    /// The default was cleared because it can no longer be used (a retired
+    /// provider type); the UI asks the user to choose another. Cleared when
+    /// one is chosen.
+    #[serde(default)]
+    pub needs_default_provider: bool,
     /// User-defined chat folders (Round-2 item 15). App-side only — layered over
     /// goosed's session list; not visible to other Goose clients.
     #[serde(default)]
@@ -387,6 +392,7 @@ impl Default for Config {
             remember_overlay_position: true,
             providers: Vec::new(),
             active_provider_id: None,
+            needs_default_provider: false,
             folders: Vec::new(),
             session_folders: HashMap::new(),
             show_artifacts: true,

@@ -86,7 +86,7 @@ async fn discover(
             .await
             .ok()
             .flatten(),
-        "custom_openai" | "local" => {
+        "custom_openai" => {
             crate::commands::custom_openai_context_length(base_url.to_string(), model.to_string())
                 .await
                 .ok()
@@ -209,7 +209,7 @@ pub async fn confirm_model_context_length(app: &AppHandle) {
     };
 
     if needs_push {
-        if let Err(e) = crate::bigtiny::providers::sync_active_provider(app).await {
+        if let Err(e) = crate::bigtiny::providers::sync_all_providers(app).await {
             tracing::warn!("failed to push confirmed context length to the daemon: {e}");
         }
     }

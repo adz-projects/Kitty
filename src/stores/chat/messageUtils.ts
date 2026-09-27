@@ -169,14 +169,7 @@ export function findMatchingProvider(
   return (
     providers.find(
       (p) =>
-        (p.id === providerId ||
-          gooseProviderName(p.provider_type) === providerId ||
-          // The in-process engine is registered in the daemon under the fixed
-          // id `"local"` rather than a profile id (see
-          // `bigtiny::providers::daemon_provider_id`), so a session pinned to
-          // it stores `"local"` and matched no profile here — leaving every
-          // resumed local-engine chat to fall back to the global default.
-          (providerId === 'local' && p.provider_type === 'local')) &&
+        (p.id === providerId || gooseProviderName(p.provider_type) === providerId) &&
         p.models.includes(modelId)
     ) ?? null
   );

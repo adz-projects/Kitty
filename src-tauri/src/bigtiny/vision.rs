@@ -85,7 +85,7 @@ async fn discover(
         // guessing from `/props` would be inventing a signal rather than
         // reading one. These are exactly the profiles the manual override
         // exists for.
-        "custom_openai" | "local" => None,
+        "custom_openai" => None,
         // Hosted providers go through the OpenRouter catalog, the app's
         // existing universal capability source — already cached in `AppState`.
         _ => catalog_accepts_images(app, model).await,

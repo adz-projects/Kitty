@@ -10,7 +10,6 @@ vi.mock('@/lib/ipc', () => ({
     newSession: vi.fn(),
     listProviders: vi.fn(),
     sendPrompt: vi.fn(),
-    setSessionPersonaOverride: vi.fn(),
     bindWindowSession: vi.fn(),
     respondPermission: vi.fn(),
     deleteSession: vi.fn(),
@@ -74,7 +73,6 @@ beforeEach(() => {
     isTrusted: false,
     model: 'test-model',
     providerName: null,
-    systemPrompt: null,
     warning: null,
     compactionNotice: null,
     stopPhase: null,
@@ -84,7 +82,6 @@ beforeEach(() => {
   vi.mocked(ipc.newSession).mockResolvedValue(info('s1'));
   vi.mocked(ipc.listProviders).mockResolvedValue([]);
   vi.mocked(ipc.sendPrompt).mockResolvedValue(undefined);
-  vi.mocked(ipc.setSessionPersonaOverride).mockResolvedValue(undefined);
   vi.mocked(ipc.bindWindowSession).mockRejectedValue(new Error('best-effort'));
   vi.mocked(ipc.respondPermission).mockResolvedValue(undefined);
   vi.mocked(ipc.isSessionBusy).mockResolvedValue(false);
@@ -320,6 +317,7 @@ describe('chatStore refreshProvider malformed base_url', () => {
     has_secret: false,
     active: true,
     accepts_images: null,
+    tools_supported: false,
   };
 
   it('derives everything but the host from a blank base_url', async () => {
@@ -330,7 +328,7 @@ describe('chatStore refreshProvider malformed base_url', () => {
     const s = useChatStore.getState();
     expect(s.providerHost).toBe(null); // the one underivable field
     expect(s.model).toBe('local-model');
-    expect(s.providerHasTools).toBe(false); // local engine has no tools
+    expect(s.providerHasTools).toBe(false); // what the card reports
     expect(s.providerSupportsVision).toBe(true);
     expect(s.providerTier).toBe('local');
     expect(s.providerName).toBe('Local');

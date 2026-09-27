@@ -1,6 +1,7 @@
-//! Provider profile commands: list/create/update/delete + activation (which
-//! re-registers the provider with BigTiny and warms/evicts local Ollama
-//! models around the switch).
+//! Provider card commands: list/create/update/duplicate/delete, choosing the
+//! default card (Settings) and a chat's card (the chat badge), and the
+//! connection test. Every change is mirrored to the engine by
+//! `bigtiny::providers::sync_all_providers`.
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
@@ -29,13 +30,19 @@ pub struct ProviderView {
     /// user's manual override — a `Some(false)` here is a real negative from
     /// the provider and does turn image affordances off.
     pub accepts_images: Option<bool>,
+    /// Whether this card's model can call tools: the `supports_tools`
+    /// override, else detected (`ProviderProfile::tools_supported`).
+    pub tools_supported: bool,
 }
 
 /// Async — `has_secret` is a blocking Windows Credential Manager IPC call per
 /// profile, so this runs off the main thread and offloads each lookup through
 /// `get_secret_async` (a `list_providers` call with many profiles would
 /// otherwise block the command thread for the full round of OS dialogs).
-async fn provider_views(cfg: &Config) -> Vec<ProviderView> {
+async fn provider_views(
+    cfg: &Config,
+    catalog: Option<&catalog::OpenRouterCatalog>,
+) -> Vec<ProviderView> {
     let mut views = Vec::with_capacity(cfg.providers.len());
     for p in &cfg.providers {
         let has_secret = providers::get_secret_async(&p.id).await.is_some();
@@ -44,6 +51,7 @@ async fn provider_views(cfg: &Config) -> Vec<ProviderView> {
             has_secret,
             active: cfg.active_provider_id.as_deref() == Some(&p.id),
             accepts_images: crate::bigtiny::vision::vision_for_profile(cfg, p),
+            tools_supported: p.tools_supported(catalog),
             profile: p.clone(),
         });
     }
@@ -58,17 +66,17 @@ pub async fn list_providers(
     // Snapshot the config out of the lock — the async secret lookups below
     // must not hold the global config Mutex across their awaited OS calls.
     let cfg = state.config.lock().unwrap().clone();
-    Ok(provider_views(&cfg).await)
+    let catalog = state.openrouter_catalog.lock().unwrap().clone();
+    Ok(provider_views(&cfg, catalog.as_ref()).await)
 }
 
-/// Create or update a provider profile. `secret`, when present, is stored in the
-/// keyring only (never in config.json). Returns the saved profile (with id).
+/// Create or update a provider card. `secret`, when present, is stored in the
+/// keyring only (never in config.json). Returns the saved card (with id).
 ///
-/// If the edited profile is the **currently active** provider, the change is
-/// re-synced to BigTiny immediately (no restart / reactivate required) so
-/// settings like `context_length` take effect on the next chat turn. Best-effort
-/// on the daemon round-trip: the profile is already persisted, and a transient
-/// daemon problem shouldn't fail the save — rebind/activate will re-sync later.
+/// Every card is mirrored to the engine at once (`sync_all_providers`), so an
+/// edit to any card - not only the default - takes effect on its next turn.
+/// Best-effort on the engine round-trip: the card is already saved, and the
+/// next attach syncs again.
 #[tauri::command]
 pub async fn upsert_provider(
     app: AppHandle,
@@ -81,6 +89,9 @@ pub async fn upsert_provider(
     if profile.created_at.trim().is_empty() {
         profile.created_at = chrono::Utc::now().to_rfc3339();
     }
+    if profile.provider_type == "local" {
+        return Err("The \"On this device\" provider type is no longer supported.".into());
+    }
     if let Some(s) = secret {
         if !s.is_empty() {
             // Async write: `set_secret` is blocking Windows Credential
@@ -88,7 +99,7 @@ pub async fn upsert_provider(
             providers::set_secret_async(&profile.id, &s).await?;
         }
     }
-    let is_active;
+    let is_default;
     {
         let state = app.state::<AppState>();
         let mut cfg = state.config.lock().unwrap();
@@ -97,16 +108,16 @@ pub async fn upsert_provider(
             None => cfg.providers.push(profile.clone()),
         }
         config::save(&cfg).map_err(|e| e.to_string())?;
-        is_active = cfg.active_provider_id.as_deref() == Some(profile.id.as_str());
+        is_default = cfg.active_provider_id.as_deref() == Some(profile.id.as_str());
     }
 
-    if is_active {
-        if let Err(e) = crate::bigtiny::providers::sync_active_provider(&app).await {
-            tracing::warn!(
-                "provider {} edited but failed to re-sync to BigTiny: {e}",
-                profile.id
-            );
-        }
+    if let Err(e) = crate::bigtiny::providers::sync_all_providers(&app).await {
+        tracing::warn!(
+            "provider {} saved but failed to sync to the engine: {e}",
+            profile.id
+        );
+    }
+    if is_default {
         // Probe image support now rather than waiting for the first turn, so
         // the composer offers (or hides) the attach controls correctly from
         // the moment the profile is saved. Best-effort and already cached
@@ -142,26 +153,45 @@ pub async fn duplicate_provider(app: AppHandle, id: String) -> Result<ProviderPr
         cfg.providers.push(copy.clone());
         config::save(&cfg).map_err(|e| e.to_string())?;
     }
+    if let Err(e) = crate::bigtiny::providers::sync_all_providers(&app).await {
+        tracing::warn!("duplicated provider {} but failed to sync it: {e}", copy.id);
+    }
     Ok(copy)
 }
 
-/// Delete a provider profile (and its stored secret).
+/// Delete a provider card: its key, its config entry and its row in the
+/// engine. Deleting the default promotes the next usable card (decision #5)
+/// and returns its id, so the UI can say which one it is now.
 ///
 /// `async` for a platform reason, not a performance one: a *synchronous*
 /// `#[tauri::command]` runs on the main thread, and on Android the secret
 /// store is reached by posting to the main looper and waiting for the reply
 /// (`android::secrets`). A sync command touching a secret therefore deadlocks
-/// the app. Everything else that reads or writes one is already async; this
-/// was the last sync holdout.
+/// the app.
 #[tauri::command]
-pub async fn delete_provider(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
+pub async fn delete_provider(app: AppHandle, id: String) -> Result<Option<String>, String> {
     providers::delete_secret(&id);
-    let mut cfg = state.config.lock().unwrap();
-    cfg.providers.retain(|p| p.id != id);
-    if cfg.active_provider_id.as_deref() == Some(&id) {
-        cfg.active_provider_id = None;
+    let promoted = {
+        let state = app.state::<AppState>();
+        let mut cfg = state.config.lock().unwrap();
+        let Some(index) = cfg.providers.iter().position(|p| p.id == id) else {
+            return Ok(cfg.active_provider_id.clone());
+        };
+        cfg.providers.remove(index);
+        if cfg.active_provider_id.as_deref() == Some(&id) {
+            cfg.active_provider_id = providers::next_default(&cfg.providers, index);
+            cfg.needs_default_provider =
+                cfg.active_provider_id.is_none() && !cfg.providers.is_empty();
+        }
+        config::save(&cfg).map_err(|e| e.to_string())?;
+        cfg.active_provider_id.clone()
+    };
+    // Removes the row (and the key the engine held for it) and sets the
+    // promoted default.
+    if let Err(e) = crate::bigtiny::providers::sync_all_providers(&app).await {
+        tracing::warn!("deleted provider {id} but failed to sync the engine: {e}");
     }
-    config::save(&cfg).map_err(|e| e.to_string())
+    Ok(promoted)
 }
 
 /// Best-effort context-length lookup for OpenRouter models, for the Providers
@@ -179,10 +209,7 @@ pub async fn openrouter_context_length(model: String) -> Result<Option<u32>, Str
 /// runs themselves. `Ok(None)` (never `Err` on a shape we don't recognize)
 /// keeps the field manually editable — this only ever *suggests* a value.
 #[tauri::command]
-pub async fn ollama_context_length(
-    base_url: String,
-    model: String,
-) -> Result<Option<u32>, String> {
+pub async fn ollama_context_length(base_url: String, model: String) -> Result<Option<u32>, String> {
     let url = format!("{}/api/show", base_url.trim_end_matches('/'));
     let resp = crate::util::http_client()
         .post(url)
@@ -231,9 +258,11 @@ pub async fn ollama_accepts_images(
 /// `context_length_from_show` beside it.
 fn vision_from_show(json: &serde_json::Value) -> Option<bool> {
     let caps = json.get("capabilities")?.as_array()?;
-    Some(caps.iter().filter_map(|c| c.as_str()).any(|c| {
-        c.eq_ignore_ascii_case("vision") || c.eq_ignore_ascii_case("multimodal")
-    }))
+    Some(
+        caps.iter()
+            .filter_map(|c| c.as_str())
+            .any(|c| c.eq_ignore_ascii_case("vision") || c.eq_ignore_ascii_case("multimodal")),
+    )
 }
 
 /// Pull `<arch>.context_length` out of an Ollama `/api/show` `model_info`
@@ -566,35 +595,51 @@ fn merge_with_catalog(
     catalog_entries: &[catalog::OpenRouterCatalogEntry],
 ) -> Vec<ModelPickerEntry> {
     raw.into_iter()
-        .map(|(id, name_opt, created_opt)| match catalog::match_in_catalog(&id, catalog_entries) {
-            Some(e) => ModelPickerEntry {
-                name: name_opt.unwrap_or_else(|| e.name.clone()),
-                cost_tier: e.cost_tier,
-                capability_score: e.intelligence_index,
-                price_rank: e.price_rank,
-                created: created_opt.or(e.created),
-                context_length: e.context_length,
-                matched: true,
-                id,
+        .map(
+            |(id, name_opt, created_opt)| match catalog::match_in_catalog(&id, catalog_entries) {
+                Some(e) => ModelPickerEntry {
+                    name: name_opt.unwrap_or_else(|| e.name.clone()),
+                    cost_tier: e.cost_tier,
+                    capability_score: e.intelligence_index,
+                    price_rank: e.price_rank,
+                    created: created_opt.or(e.created),
+                    context_length: e.context_length,
+                    matched: true,
+                    id,
+                },
+                None => ModelPickerEntry {
+                    name: name_opt.unwrap_or_else(|| id.clone()),
+                    cost_tier: None,
+                    capability_score: None,
+                    price_rank: None,
+                    created: created_opt,
+                    context_length: None,
+                    matched: false,
+                    id,
+                },
             },
-            None => ModelPickerEntry {
-                name: name_opt.unwrap_or_else(|| id.clone()),
-                cost_tier: None,
-                capability_score: None,
-                price_rank: None,
-                created: created_opt,
-                context_length: None,
-                matched: false,
-                id,
-            },
-        })
+        )
         .collect()
 }
 
-/// Manual, user-triggered re-check of the active provider (the chat view's
-/// "can't reach" banner's Retry button) — reuses `test_connection` rather
-/// than reintroducing any background polling. `Ok(())` when there's no active
-/// provider (goosed's own config) — nothing for Kitty to check in that case.
+/// Check that a provider card works: reachable, and its key accepted. Used by
+/// the provider form's "Test connection", the chat's offline banner while it
+/// waits for a provider to come back, and before a card is made the default.
+#[tauri::command]
+pub async fn test_provider_connection(
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<(), String> {
+    let profile = {
+        let cfg = state.config.lock().unwrap();
+        cfg.providers.iter().find(|p| p.id == id).cloned()
+    };
+    let profile = profile.ok_or("That provider no longer exists.")?;
+    providers::test_connection(&profile).await
+}
+
+/// [`test_provider_connection`] for the default card. `Ok(())` when there is
+/// no default: nothing to check.
 #[tauri::command]
 pub async fn test_active_provider_connection(
     state: tauri::State<'_, AppState>,
@@ -611,119 +656,102 @@ pub async fn test_active_provider_connection(
     }
 }
 
-/// Activate a provider profile. BigTiny has no built-in default and errors
-/// any send with no provider registered, so `id: None` is rejected — a
-/// provider must always be active. Health-gates the switch first (a
-/// non-functioning target is rejected and the old provider stays active —
-/// see `providers::test_connection`), then persists the choice and
-/// re-registers it with BigTiny over REST (no daemon restart needed).
+fn usable_profile(app: &AppHandle, id: &str) -> Result<ProviderProfile, String> {
+    let state = app.state::<AppState>();
+    let cfg = state.config.lock().unwrap();
+    let profile = cfg
+        .providers
+        .iter()
+        .find(|p| p.id == id)
+        .cloned()
+        .ok_or("That provider no longer exists.")?;
+    if !profile.is_usable() {
+        return Err(format!(
+            "{} can no longer be used; choose another provider.",
+            profile.name
+        ));
+    }
+    Ok(profile)
+}
+
+/// Make a card the default: the one new chats start on. Settings only - a
+/// chat's own card is [`set_chat_provider`], which never changes this.
 ///
-/// `session_id` (optional) is the invoking window's *active session*: when
-/// given, only that session is stamped with the newly-active provider/model
-/// (per-session isolation). Other open windows' sessions keep theirs —
-/// provider is resolved per session at send time, not globally.
+/// Gated on a connection test, so a card that does not work cannot become
+/// what every new chat uses; the old default stays on failure.
+#[tauri::command]
+pub async fn set_default_provider(app: AppHandle, id: String) -> Result<(), String> {
+    let profile = usable_profile(&app, &id)?;
+    providers::test_connection(&profile)
+        .await
+        .map_err(|e| format!("Can't make {} the default — {e}", profile.name))?;
+    {
+        let state = app.state::<AppState>();
+        let mut cfg = state.config.lock().unwrap();
+        cfg.active_provider_id = Some(id.clone());
+        cfg.needs_default_provider = false;
+        config::save(&cfg).map_err(|e| e.to_string())?;
+    }
+    crate::bigtiny::providers::sync_all_providers(&app).await?;
+    let _ = app.emit(
+        "provider://activated",
+        serde_json::json!({ "session_id": null, "provider_id": id, "model": null }),
+    );
+    Ok(())
+}
+
+/// Put one chat on a card (the chat badge, on a chat with no messages yet).
+/// Only that chat changes: the default and every other chat keep theirs
+/// (decision #50). The chat's system prompt follows the card.
+///
+/// A chat that already has history moves to another card by branching
+/// instead (`branch_to_provider`), which keeps the original intact.
+#[tauri::command]
+pub async fn set_chat_provider(
+    app: AppHandle,
+    session_id: String,
+    id: String,
+) -> Result<(), String> {
+    let profile = usable_profile(&app, &id)?;
+    providers::test_connection(&profile)
+        .await
+        .map_err(|e| format!("Can't switch to {} — {e}", profile.name))?;
+    let model = profile.models.first().cloned().unwrap_or_default();
+    crate::bigtiny::providers::set_session_provider(&app, &session_id, &profile.id, &model).await;
+    if let Err(e) = crate::bigtiny::sessions::update_persona_override(
+        &app,
+        &session_id,
+        &providers::system_prompt_for(&profile),
+    )
+    .await
+    {
+        tracing::warn!("could not set {session_id}'s system prompt: {e}");
+    }
+    let _ = app.emit(
+        "provider://activated",
+        serde_json::json!({ "session_id": session_id, "provider_id": id, "model": model }),
+    );
+    Ok(())
+}
+
+/// The pre-v1 single entry point, kept while the frontend moves to the two
+/// above: with a session it changes that chat only, without one the default.
 #[tauri::command]
 pub async fn activate_provider(
     app: AppHandle,
     id: Option<String>,
     session_id: Option<String>,
 ) -> Result<(), String> {
-    if id.is_none() {
-        return Err("A provider must be active — add one in Settings → Providers.".to_string());
+    let id = id.ok_or("A provider must be active — add one in Settings → Providers.")?;
+    match session_id {
+        Some(session_id) => set_chat_provider(app, session_id, id).await,
+        None => set_default_provider(app, id).await,
     }
-    if let Some(ref pid) = id {
-        let profile = {
-        let state = app.state::<AppState>();
-        let cfg = state.config.lock().unwrap();
-            cfg.providers.iter().find(|p| &p.id == pid).cloned()
-        };
-        let profile = profile.ok_or("no such provider profile")?;
-        providers::test_connection(&profile)
-            .await
-            .map_err(|e| format!("Can't switch to {} — {e}", profile.name))?;
-    }
-
-    let stamp_pid = id.clone();
-    {
-        let state = app.state::<AppState>();
-        let mut cfg = state.config.lock().unwrap();
-        if let Some(ref pid) = id {
-            if !cfg.providers.iter().any(|p| &p.id == pid) {
-                return Err("no such provider profile".into());
-            }
-        }
-        cfg.active_provider_id = id;
-        config::save(&cfg).map_err(|e| e.to_string())?;
-    }
-    // BigTiny switches providers at runtime over REST — no daemon restart.
-    // Registration failure is a hard error.
-    crate::bigtiny::providers::sync_active_provider(&app).await?;
-
-    // Per-session stamp: apply the newly-active provider to the invoking
-    // window's own open session (if it has one), so this pick never bleeds
-    // into other windows' sessions. Resolved from the profile's first model,
-    // the same default `sync_active_provider`/`rebind_session` use.
-    //
-    // `stamped_model` is captured so the `provider://activated` payload below
-    // can carry the exact model the session was stamped with — the front end
-    // needs it to update `sessionModelId` without a session reload (see the
-    // event handler in `chatStore`).
-    let mut stamped_model: Option<String> = None;
-    if let (Some(sid), Some(pid)) = (session_id.as_deref(), stamp_pid.as_deref()) {
-        // Resolved together: the stamp must carry the id the daemon registry
-        // actually knows (see `daemon_provider_id`), which differs from the
-        // profile id for the in-process engine.
-        let stamp = {
-            let state = app.state::<AppState>();
-            let cfg = state.config.lock().unwrap();
-            cfg.providers.iter().find(|p| p.id == pid).map(|p| {
-                (
-                    crate::bigtiny::providers::daemon_provider_id(p),
-                    p.models.first().cloned().unwrap_or_default(),
-                )
-            })
-        };
-        if let Some((daemon_pid, default_model)) = stamp {
-            stamped_model = Some(default_model.clone());
-            crate::bigtiny::providers::set_session_provider(
-                &app,
-                sid,
-                &daemon_pid,
-                &default_model,
-            )
-            .await;
-        }
-    }
-
-    // Tell the frontend to re-sync provider state immediately (Round-2 item 4) —
-    // without this the UI drifts until the next session create/load or health tick.
-    //
-    // The payload carries the *profile* id (`stamp_pid`, what the front end
-    // resolves the badge against — not `daemon_provider_id`) and the model the
-    // session was stamped with, so the invoking window can update its live
-    // session's `sessionProviderId`/`sessionModelId` in place. Without this the
-    // pill re-derived against the *stale* stamp and kept showing the old
-    // provider/model until the next session load.
-    let _ = app.emit(
-        "provider://activated",
-        serde_json::json!({
-            "session_id": session_id,
-            "provider_id": stamp_pid,
-            "model": stamped_model,
-        }),
-    );
-
-    // No warm/evict step any more: that existed to keep an Ollama-resident
-    // model hot across a provider switch. The in-process engine's slot manager
-    // owns residency now, and a remote endpoint's memory isn't ours to manage.
-    Ok(())
 }
 
 /// Stamp a single session with a specific provider/model (`PATCH
-/// /api/chat/{id}/config`) without touching the global active provider or
-/// any other session — the per-session isolation primitive. Used when
-/// resuming/restoring a session that should keep its own provider
-/// independent of what's currently active.
+/// /api/chat/{id}/config`) without touching the default or any other
+/// session. Used when resuming a session that should keep its own card.
 #[tauri::command]
 pub async fn set_session_provider(
     app: AppHandle,

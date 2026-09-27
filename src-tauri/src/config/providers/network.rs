@@ -91,10 +91,7 @@ mod tests {
     fn bracketed_ipv6_host_drops_the_port() {
         assert_eq!(host_of("http://[::1]:11434"), "[::1]");
         assert_eq!(host_of("http://[2001:db8::10]:8080/v1"), "[2001:db8::10]");
-        assert_eq!(
-            network_tier_for("http://[::1]:11434"),
-            NetworkTier::Local
-        );
+        assert_eq!(network_tier_for("http://[::1]:11434"), NetworkTier::Local);
         assert_eq!(
             network_tier_for("http://[2001:db8::10]:8080"),
             NetworkTier::Remote

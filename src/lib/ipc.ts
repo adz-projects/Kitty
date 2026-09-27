@@ -123,12 +123,6 @@ export const ipc = {
       SessionInfo (with `is_default_folder: true`). */
   resetSessionContextDir: (sessionId: string) =>
     invoke<SessionInfo>('reset_session_context_dir', { sessionId }),
-  /** Set a session's custom/default persona server-side (BigTiny's real
-      `persona_override` mechanism — a proper `role: "system"` message),
-      replacing the old client-side `<system>...</system>` text-prepend hack.
-      Called once, before the first outgoing message of a new session. */
-  setSessionPersonaOverride: (sessionId: string, persona: string) =>
-    invoke<void>('set_session_persona_override', { sessionId, persona }),
   sendPrompt: (
     sessionId: string,
     text: string,
@@ -320,7 +314,8 @@ export const ipc = {
   listProviders: () => invoke<ProviderView[]>('list_providers'),
   upsertProvider: (profile: ProviderProfile, secret: string | null) =>
     invoke<ProviderProfile>('upsert_provider', { profile, secret }),
-  deleteProvider: (id: string) => invoke<void>('delete_provider', { id }),
+  /** Returns the default card afterwards (promoted if this was the default). */
+  deleteProvider: (id: string) => invoke<string | null>('delete_provider', { id }),
   /** Copy a provider card (fresh id, same key, "(copy)" name) — how a user
       adds a second model from the same provider. */
   duplicateProvider: (id: string) => invoke<ProviderProfile>('duplicate_provider', { id }),
@@ -329,6 +324,12 @@ export const ipc = {
   setSessionProvider: (sessionId: string, providerId: string, model?: string | null) =>
     invoke<void>('set_session_provider', { sessionId, providerId, model: model ?? null }),
   testActiveProviderConnection: () => invoke<void>('test_active_provider_connection'),
+  testProviderConnection: (id: string) => invoke<void>('test_provider_connection', { id }),
+  /** The card new chats start on (Settings). */
+  setDefaultProvider: (id: string) => invoke<void>('set_default_provider', { id }),
+  /** One chat's card (the badge, on a chat with no messages). */
+  setChatProvider: (sessionId: string, id: string) =>
+    invoke<void>('set_chat_provider', { sessionId, id }),
   // Local models (GGUFs on disk)
   listLocalModels: () => invoke<LocalModel[]>('list_local_models'),
   /** `null` when the daemon isn't up — Settings can be open before the stack

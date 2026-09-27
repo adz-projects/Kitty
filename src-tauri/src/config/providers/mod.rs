@@ -125,6 +125,20 @@ pub struct ProviderProfile {
     /// own.
     #[serde(default)]
     pub parallel_slots: Option<u32>,
+    /// The user's override for whether this provider's model can call tools.
+    /// `None` (the default) means detect it: the OpenRouter catalog when it
+    /// knows the model, else assume yes (the daemon still notices a model
+    /// that refuses tools and says so). Decides whether the model is offered
+    /// tools at all, and whether a dropped file is sent as a path (for the
+    /// file tools to open) or inlined.
+    #[serde(default)]
+    pub supports_tools: Option<bool>,
+    /// Why this profile can no longer be used, when it cannot:
+    /// `"unsupported"` for the retired "On this device" (`local`) type. A
+    /// disabled profile stays listed so the user can see and delete it, but is
+    /// never synced to the engine or used for a chat.
+    #[serde(default)]
+    pub disabled_reason: Option<String>,
     #[serde(default)]
     pub created_at: String,
 }
@@ -133,6 +147,88 @@ impl ProviderProfile {
     pub fn network_tier(&self) -> NetworkTier {
         network_tier_for(&self.base_url)
     }
+
+    /// Usable for chat and synced to the engine.
+    pub fn is_usable(&self) -> bool {
+        self.disabled_reason.is_none()
+    }
+
+    /// Whether this provider's model can call tools: the user's override,
+    /// else the OpenRouter catalog's answer for this exact model, else yes.
+    pub fn tools_supported(
+        &self,
+        catalog: Option<&crate::openrouter::catalog::OpenRouterCatalog>,
+    ) -> bool {
+        if let Some(explicit) = self.supports_tools {
+            return explicit;
+        }
+        let model = self.models.first().map(String::as_str).unwrap_or("");
+        catalog
+            .and_then(|c| crate::openrouter::catalog::tools_support_for(model, &c.entries))
+            .unwrap_or(true)
+    }
+}
+
+/// The built-in system prompt, used when a provider has no `system_prompt`
+/// of its own. Set as the session's persona when the session is created
+/// (`commands::session::new_session`) and when a new chat's provider is
+/// changed, so every turn - including scheduled runs - gets it.
+pub const DEFAULT_SYSTEM_PROMPT: &str = "You are a capable, direct agentic assistant. You have \
+filesystem and shell tools scoped to this conversation's own working directory. Use tools \
+proactively rather than describing what you would do — take the action. When you create or \
+save a file, use a relative path inside the working directory rather than an absolute path \
+elsewhere. Be direct about assumptions and uncertainty rather than glossing over them, and \
+prefer verifiable action (running a command, reading a file, writing output) over speculation.";
+
+/// The system prompt a session on `profile` runs with.
+pub fn system_prompt_for(profile: &ProviderProfile) -> String {
+    profile
+        .system_prompt
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .unwrap_or(DEFAULT_SYSTEM_PROMPT)
+        .to_string()
+}
+
+/// Retire the "On this device" (`local`) provider type: there is no local
+/// chat engine. Its profiles are kept but disabled, and if one was the
+/// default the default is cleared and flagged, so the UI can ask the user to
+/// pick another. Returns whether anything changed. Pure, and idempotent.
+pub fn migrate_local_profiles(cfg: &mut crate::config::Config) -> bool {
+    let mut changed = false;
+    for p in cfg
+        .providers
+        .iter_mut()
+        .filter(|p| p.provider_type == "local")
+    {
+        if p.disabled_reason.is_none() {
+            p.disabled_reason = Some("unsupported".to_string());
+            changed = true;
+        }
+    }
+    let default_disabled = cfg
+        .active_provider_id
+        .as_deref()
+        .and_then(|id| cfg.providers.iter().find(|p| p.id == id))
+        .is_some_and(|p| !p.is_usable());
+    if default_disabled {
+        cfg.active_provider_id = None;
+        cfg.needs_default_provider = true;
+        changed = true;
+    }
+    changed
+}
+
+/// The profile to make the default after `removed` is deleted or disabled:
+/// the next usable one in list order after it, else the one before it.
+pub fn next_default(providers: &[ProviderProfile], removed_index: usize) -> Option<String> {
+    providers
+        .iter()
+        .skip(removed_index)
+        .chain(providers.iter().take(removed_index).rev())
+        .find(|p| p.is_usable())
+        .map(|p| p.id.clone())
 }
 
 /// Reachability for Personal/Remote providers is derived from real send
@@ -244,6 +340,85 @@ mod tests {
         .unwrap()
     }
 
+    fn typed(id: &str, provider_type: &str) -> ProviderProfile {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "name": id, "provider_type": provider_type,
+            "base_url": "http://box:8080", "models": ["m"],
+        }))
+        .unwrap()
+    }
+
+    /// Decision #65: a local profile is kept but disabled, and a local
+    /// default is cleared and flagged so the user is asked for another.
+    #[test]
+    fn local_profiles_are_disabled_and_a_local_default_is_cleared() {
+        let mut cfg = crate::config::Config {
+            providers: vec![typed("loc", "local"), typed("or", "openrouter")],
+            active_provider_id: Some("loc".into()),
+            ..Default::default()
+        };
+        assert!(migrate_local_profiles(&mut cfg));
+        assert_eq!(
+            cfg.providers[0].disabled_reason.as_deref(),
+            Some("unsupported")
+        );
+        assert!(cfg.providers[1].is_usable());
+        assert_eq!(cfg.active_provider_id, None);
+        assert!(cfg.needs_default_provider);
+        assert!(!migrate_local_profiles(&mut cfg), "idempotent");
+    }
+
+    #[test]
+    fn a_remote_default_survives_the_local_migration() {
+        let mut cfg = crate::config::Config {
+            providers: vec![typed("loc", "local"), typed("or", "openrouter")],
+            active_provider_id: Some("or".into()),
+            ..Default::default()
+        };
+        migrate_local_profiles(&mut cfg);
+        assert_eq!(cfg.active_provider_id.as_deref(), Some("or"));
+        assert!(!cfg.needs_default_provider);
+    }
+
+    /// Decision #5: deleting the default promotes the next usable card.
+    #[test]
+    fn the_next_default_skips_disabled_cards() {
+        let mut dead = typed("dead", "local");
+        dead.disabled_reason = Some("unsupported".into());
+        let list = [typed("a", "openrouter"), dead, typed("c", "anthropic")];
+        // "a" (index 0) was removed from the list before this is asked.
+        let after_removal = &list[1..];
+        assert_eq!(next_default(after_removal, 0).as_deref(), Some("c"));
+        assert_eq!(
+            next_default(&list[..1], 1).as_deref(),
+            Some("a"),
+            "falls back to earlier cards"
+        );
+        assert_eq!(next_default(&[], 0), None);
+    }
+
+    #[test]
+    fn a_provider_without_its_own_prompt_gets_the_default() {
+        let mut p = typed("a", "openrouter");
+        assert_eq!(system_prompt_for(&p), DEFAULT_SYSTEM_PROMPT);
+        p.system_prompt = Some("  ".into());
+        assert_eq!(
+            system_prompt_for(&p),
+            DEFAULT_SYSTEM_PROMPT,
+            "blank is not a prompt"
+        );
+        p.system_prompt = Some("Be terse.".into());
+        assert_eq!(system_prompt_for(&p), "Be terse.");
+    }
+
+    #[test]
+    fn tool_support_prefers_the_override_then_assumes_yes() {
+        let mut p = typed("a", "custom_openai");
+        assert!(p.tools_supported(None));
+        p.supports_tools = Some(false);
+        assert!(!p.tools_supported(None));
+    }
+
     #[test]
     fn a_multi_model_profile_becomes_one_card_per_model() {
         let mut providers = vec![
@@ -254,18 +429,27 @@ mod tests {
         let ids: Vec<&str> = providers.iter().map(|p| p.id.as_str()).collect();
         assert_eq!(ids, ["a", "b", "b-m1", "b-m2"]);
         assert!(providers.iter().all(|p| p.models.len() == 1));
-        assert_eq!(providers[0].name, "Solo", "single-model cards are untouched");
+        assert_eq!(
+            providers[0].name, "Solo",
+            "single-model cards are untouched"
+        );
         assert_eq!(providers[1].name, "Box (x)");
         assert_eq!(providers[3].models, ["z"]);
         assert_eq!(
             copies,
-            [("b".to_string(), "b-m1".to_string()), ("b".to_string(), "b-m2".to_string())]
+            [
+                ("b".to_string(), "b-m1".to_string()),
+                ("b".to_string(), "b-m2".to_string())
+            ]
         );
     }
 
     #[test]
     fn split_ids_never_collide_with_existing_profiles() {
-        let mut providers = vec![profile_with("b", "Box", &["x", "y"]), profile_with("b-m1", "Other", &["q"])];
+        let mut providers = vec![
+            profile_with("b", "Box", &["x", "y"]),
+            profile_with("b-m1", "Other", &["q"]),
+        ];
         split_multi_model_profiles(&mut providers);
         let mut ids: Vec<&str> = providers.iter().map(|p| p.id.as_str()).collect();
         ids.sort_unstable();
@@ -275,7 +459,10 @@ mod tests {
 
     #[test]
     fn nothing_to_split_is_a_no_op() {
-        let mut providers = vec![profile_with("a", "A", &["m"]), profile_with("e", "Empty", &[])];
+        let mut providers = vec![
+            profile_with("a", "A", &["m"]),
+            profile_with("e", "Empty", &[]),
+        ];
         assert!(split_multi_model_profiles(&mut providers).is_empty());
         assert_eq!(providers.len(), 2);
     }

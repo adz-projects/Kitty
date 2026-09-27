@@ -156,8 +156,14 @@ mod tests {
     #[test]
     fn both_attempts_are_reported_after_a_scheme_fanout() {
         let msg = unreachable_message(&[
-            ("https://h:1".to_string(), "nothing is listening there".to_string()),
-            ("http://h:1".to_string(), "it didn't respond in time".to_string()),
+            (
+                "https://h:1".to_string(),
+                "nothing is listening there".to_string(),
+            ),
+            (
+                "http://h:1".to_string(),
+                "it didn't respond in time".to_string(),
+            ),
         ]);
         assert!(msg.contains("https://h:1"), "{msg}");
         assert!(msg.contains("http://h:1"), "{msg}");

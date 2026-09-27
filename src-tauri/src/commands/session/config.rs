@@ -96,17 +96,5 @@ pub async fn reset_session_context_dir(
     crate::bigtiny::sessions::reset_cwd(&app, &session_id, cwd).await
 }
 
-/// Set a session's custom/default persona (Round-6 Feature 2, re-plumbed onto
-/// BigTiny's real `persona_override` mechanism instead of the old client-side
-/// `<system>...</system>` text-prepend hack). Called once, from `send()`'s
-/// `firstMessage` branch, before the turn's prompt goes out.
-#[tauri::command]
-pub async fn set_session_persona_override(
-    app: AppHandle,
-    session_id: String,
-    persona: String,
-) -> Result<(), String> {
-    crate::bigtiny::sessions::update_persona_override(&app, &session_id, &persona).await
-}
 
 

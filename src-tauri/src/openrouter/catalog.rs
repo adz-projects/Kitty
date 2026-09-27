@@ -98,6 +98,11 @@ pub struct OpenRouterCatalogEntry {
     /// while an unknown falls back to name-pattern detection.
     #[serde(default)]
     pub accepts_images: Option<bool>,
+    /// Whether this model can call tools, from OpenRouter's
+    /// `supported_parameters` (`"tools"`). `None` when the field is absent, as
+    /// with `accepts_images`.
+    #[serde(default)]
+    pub supports_tools: Option<bool>,
     /// Blended $/M-tokens (prompt weighted 0.75, completion 0.25 — prompt is
     /// typically the larger share of a turn), used both for the "Cheapest"
     /// sort and to derive `cost_tier`.
@@ -140,8 +145,7 @@ pub async fn fetch_catalog(bearer: Option<&str>) -> Result<OpenRouterCatalog, St
         .cloned()
         .unwrap_or_default();
 
-    let mut entries: Vec<OpenRouterCatalogEntry> =
-        raw.iter().filter_map(parse_entry).collect();
+    let mut entries: Vec<OpenRouterCatalogEntry> = raw.iter().filter_map(parse_entry).collect();
     assign_cost_tiers(&mut entries);
 
     Ok(OpenRouterCatalog {
@@ -186,7 +190,14 @@ fn parse_entry(v: &Value) -> Option<OpenRouterCatalogEntry> {
                 .any(|m| m.eq_ignore_ascii_case("image"))
         });
 
-    let aa = v.get("benchmarks").and_then(|b| b.get("artificial_analysis"));
+    let supports_tools = v
+        .get("supported_parameters")
+        .and_then(|p| p.as_array())
+        .map(|params| params.iter().any(|p| p.as_str() == Some("tools")));
+
+    let aa = v
+        .get("benchmarks")
+        .and_then(|b| b.get("artificial_analysis"));
     let intelligence_index = aa
         .and_then(|a| a.get("intelligence_index"))
         .and_then(|x| x.as_f64());
@@ -210,6 +221,7 @@ fn parse_entry(v: &Value) -> Option<OpenRouterCatalogEntry> {
         coding_index,
         agentic_index,
         accepts_images,
+        supports_tools,
         price_rank,
         cost_tier: None, // filled in by assign_cost_tiers once the whole catalog is in hand
     })
@@ -328,6 +340,20 @@ fn collapse_separators(s: &str) -> String {
 /// spellings without letting a short string like `"qwen"` spuriously match
 /// every Qwen variant). `None` on no match — logged by the caller at
 /// `debug!`, never surfaced to the user as an error.
+/// Whether `model` can call tools, per the catalog - matched exactly (by id
+/// or display name), never by substring: a near-miss name answering "no" for
+/// a self-hosted fine-tune would turn its tools off on no real evidence.
+pub fn tools_support_for(model: &str, entries: &[OpenRouterCatalogEntry]) -> Option<bool> {
+    let needle = normalize_model_id(model);
+    if needle.is_empty() {
+        return None;
+    }
+    entries
+        .iter()
+        .find(|e| normalize_model_id(&e.id) == needle || normalize_model_id(&e.name) == needle)
+        .and_then(|e| e.supports_tools)
+}
+
 pub fn match_in_catalog<'a>(
     raw_id: &str,
     entries: &'a [OpenRouterCatalogEntry],
@@ -420,6 +446,7 @@ mod tests {
                     coding_index: None,
                     agentic_index: None,
                     accepts_images: None,
+                    supports_tools: None,
                     price_rank: None,
                     cost_tier: None,
                 })
@@ -436,7 +463,10 @@ mod tests {
         let two_hours_old = catalog(now - 2 * 60 * 60, 5);
         let refetch = startup_should_refetch(Some(&two_hours_old), now);
         if cfg!(target_os = "android") {
-            assert!(!refetch, "a two-hour-old catalog is fresh enough on Android");
+            assert!(
+                !refetch,
+                "a two-hour-old catalog is fresh enough on Android"
+            );
         } else {
             assert!(refetch, "desktop always refetches at startup");
         }
@@ -484,6 +514,7 @@ mod tests {
             coding_index: None,
             agentic_index: None,
             accepts_images: None,
+            supports_tools: None,
             price_rank,
             cost_tier: None,
         }
@@ -491,7 +522,10 @@ mod tests {
 
     #[test]
     fn normalize_strips_vendor_prefix_and_lowercases() {
-        assert_eq!(normalize_model_id("anthropic/claude-sonnet-5"), "claude-sonnet-5");
+        assert_eq!(
+            normalize_model_id("anthropic/claude-sonnet-5"),
+            "claude-sonnet-5"
+        );
     }
 
     #[test]
@@ -504,7 +538,10 @@ mod tests {
 
     #[test]
     fn normalize_strips_deepinfra_mixed_case_prefix() {
-        assert_eq!(normalize_model_id("Qwen/Qwen3-235B-A22B"), "qwen3-235b-a22b");
+        assert_eq!(
+            normalize_model_id("Qwen/Qwen3-235B-A22B"),
+            "qwen3-235b-a22b"
+        );
     }
 
     #[test]
@@ -551,7 +588,10 @@ mod tests {
 
     #[test]
     fn substring_match_accepts_close_variant() {
-        assert!(substring_match("qwen3-235b-a22b", "qwen3-235b-a22b-instruct"));
+        assert!(substring_match(
+            "qwen3-235b-a22b",
+            "qwen3-235b-a22b-instruct"
+        ));
     }
 
     #[test]
@@ -590,6 +630,27 @@ mod tests {
         let mut entries: Vec<OpenRouterCatalogEntry> = vec![];
         assign_cost_tiers(&mut entries);
         assert!(entries.is_empty());
+    }
+
+    /// `supported_parameters` decides tool support; absent stays unknown, and
+    /// only an exact model match answers.
+    #[test]
+    fn tool_support_comes_from_supported_parameters() {
+        let with = serde_json::json!({"id": "a/tools", "name": "Tools", "supported_parameters": ["tools", "temperature"]});
+        let without = serde_json::json!({"id": "a/plain", "name": "Plain", "supported_parameters": ["temperature"]});
+        let unstated = serde_json::json!({"id": "a/old", "name": "Old"});
+        let entries: Vec<_> = [with, without, unstated]
+            .iter()
+            .map(|v| parse_entry(v).unwrap())
+            .collect();
+        assert_eq!(tools_support_for("a/tools", &entries), Some(true));
+        assert_eq!(tools_support_for("a/plain", &entries), Some(false));
+        assert_eq!(tools_support_for("a/old", &entries), None);
+        assert_eq!(
+            tools_support_for("a/plain-finetune", &entries),
+            None,
+            "no substring guesses"
+        );
     }
 
     /// `None` (field absent — an older cached catalog) must stay

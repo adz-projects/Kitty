@@ -26,7 +26,6 @@ import {
 } from '@/lib/ipc';
 import { buildExport, sanitizeFilename } from '@/lib/chatml';
 import { isAndroid } from '@/lib/platform';
-import { defaultSystemPrompt } from '@/lib/system_prompts';
 import { modelAcceptsImages } from '@/lib/vision_models';
 import type {
   ApprovalNeededEvent,
@@ -225,10 +224,6 @@ interface ChatState {
       provider that can't: `LocalProvider::chat_completion` drops any tools it
       is given. Delete this derivation, not the field, once that changes. */
   providerHasTools: boolean;
-  /** Active provider's custom system prompt override, or `null` to use the
-      built-in mode-appropriate default (`defaultSystemPrompt`). Prepended to a
-      session's first outgoing message only — see `send()`. */
-  systemPrompt: string | null;
   /// Non-blocking notice (e.g. attaching to an untrusted provider). Round-2 item 13.
   warning: string | null;
   /** BigTiny folded older history into its background memory summary
@@ -812,7 +807,6 @@ export const useChatStore = create<ChatState>((set, get) => {
     const files = snapshot?.droppedFiles ?? get().droppedFiles;
     let submitted = false;
     try {
-      const firstMessage = get().messages.length === 0;
       let sessionId: string;
       try {
         sessionId = await get().ensureSession();
@@ -892,27 +886,6 @@ export const useChatStore = create<ChatState>((set, get) => {
         promptText = `${docs}\n\n${promptText}`.trim();
       }
 
-      // Custom/default system prompt (Round-6 Feature 2), first turn of a
-      // session only — set server-side via BigTiny's real `persona_override`
-      // session-metadata field, rendered as a
-      // proper `role: "system"` message by ContextBuilder::build_messages.
-      // Previously this prepended a literal `<system>...</system>` block onto
-      // the outgoing *user* message text — a leftover from the pre-BigTiny
-      // Goose/ACP backend, which had no system-prompt field of its own.
-      // Embedding fake role markup inside a user turn is exactly the kind of
-      // malformed input a model whose chat template expects strict role/tag
-      // structure can derail on (observed: a llama-server-hosted model
-      // hallucinating an unrelated persona and looping). Best-effort — a
-      // failure here (e.g. BigTiny transiently unreachable) shouldn't block
-      // the turn; it just falls back to BigTiny's generic built-in persona.
-      if (firstMessage) {
-        const resolvedPrompt = get().systemPrompt ?? defaultSystemPrompt();
-        try {
-          await ipc.setSessionPersonaOverride(sessionId, resolvedPrompt);
-        } catch (e) {
-          console.warn('setSessionPersonaOverride failed, continuing with default persona', e);
-        }
-      }
       // Snapshot what's attached to this turn before the set() below clears
       // droppedFiles/attachments/pendingImages from composer state — otherwise
       // there'd be no record of it on the sent message at all (Round-7 fix).
@@ -1038,7 +1011,6 @@ export const useChatStore = create<ChatState>((set, get) => {
     providerSupportsVision: false,
     providerAcceptsImages: null,
     providerHasTools: true,
-    systemPrompt: null,
     warning: null,
     compactionNotice: null,
     stopPhase: null,
@@ -1173,8 +1145,7 @@ export const useChatStore = create<ChatState>((set, get) => {
           providerName: active ? active.name || active.provider_type : null,
           providerSupportsVision: active ? active.supports_vision : false,
           providerAcceptsImages: active ? active.accepts_images : null,
-          providerHasTools: active ? active.provider_type !== 'local' : true,
-          systemPrompt: active ? active.system_prompt : null,
+          providerHasTools: active ? active.tools_supported : true,
         });
         const cur = get();
         if (active && cur.sessionId !== null) {
@@ -1203,7 +1174,6 @@ export const useChatStore = create<ChatState>((set, get) => {
           providerSupportsVision: false,
           providerAcceptsImages: null,
           providerHasTools: true,
-          systemPrompt: null,
         });
       }
     },
