@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
 import { ipc } from '@/lib/ipc';
 import { useRouteStore } from '@/stores/routeStore';
-import type { Config } from '@/lib/types';
+import { useBackDismiss } from '@/hooks/useBackDismiss';
+import type { Config, SetupValidation } from '@/lib/types';
 import { SupportModelsStep } from './SupportModelsStep';
 import { isAndroid } from '@/lib/platform';
 import { ApiKeyStep } from './ApiKeyStep';
@@ -9,7 +10,7 @@ import { ConfigureStep } from './ConfigureStep';
 import { ModelDownloadStep } from './ModelDownloadStep';
 import { DoneStep } from './DoneStep';
 
-type StepId = 'apikey' | 'configure' | 'embedding' | 'support' | 'done';
+type StepId = 'apikey' | 'configure' | 'embedding' | 'summarizer' | 'support' | 'done';
 
 /** Android's fixed sequence, with no path fork (docs/ANDROID.md §8.3).
  *
@@ -47,8 +48,30 @@ export function desktopSteps(adaptivePathwayEnabled: boolean): { id: StepId; lab
     { id: 'apikey', label: 'Connect' },
     { id: 'configure', label: 'Configure' },
     ...embedding,
+    // Optional but recommended (decision #62): summarizing long chats on this
+    // computer instead of paying the chat provider to do it.
+    { id: 'summarizer', label: 'Summarizer' },
     { id: 'done', label: 'Done' },
   ];
+}
+
+/** Where repair opens (#63): the step that fixes what `validate_setup` found
+    broken. The engine has no step of its own — the last step re-checks and
+    says what is wrong. Pure. */
+export function repairStepIndex(
+  steps: { id: StepId }[],
+  broken: SetupValidation['first_broken_step']
+): number {
+  const find = (id: StepId) => steps.findIndex((s) => s.id === id);
+  const at =
+    broken === 'provider'
+      ? find('apikey')
+      : broken === 'models'
+        ? Math.max(find('embedding'), find('support'))
+        : broken === 'engine'
+          ? find('done')
+          : -1;
+  return at >= 0 ? at : 0;
 }
 
 /** First-run wizard (also Settings → Setup & Repair).
@@ -76,10 +99,26 @@ export function WizardView() {
   // of order and leave a stale value persisted.
   const writeQueueRef = useRef<Promise<void>>(Promise.resolve());
 
+  const repair = mode === 'repair';
+  const goto = useRouteStore((s) => s.goto);
+  // Repair is a detour from Settings, so there's always a way back (#63).
+  const cancel = () => goto('settings', { section: 'advanced' });
+  useBackDismiss(isAndroid() && repair, cancel);
+
   useEffect(() => {
     void ipc
       .getConfig()
-      .then(setCfg)
+      .then((c) => {
+        setCfg(c);
+        if (mode !== 'repair') return;
+        // Every step is open in repair, and it starts at the broken one.
+        const steps = isAndroid() ? androidSteps() : desktopSteps(c.adaptive_pathway_enabled);
+        setCompletedThrough(steps.length);
+        void ipc
+          .validateSetup()
+          .then((v) => setStepIndex(repairStepIndex(steps, v.first_broken_step)))
+          .catch(() => {});
+      })
       .catch((e) => setLoadError(String(e)));
   }, [mode]);
 
@@ -144,8 +183,14 @@ export function WizardView() {
         ))}
       </div>
 
+      {repair && (
+        <div className="row" style={{ justifyContent: 'flex-end' }}>
+          <button onClick={cancel}>Cancel repair</button>
+        </div>
+      )}
+
       {current === 'support' && <SupportModelsStep onNext={nextAndMark} onSkip={nextAndMark} />}
-      {current === 'apikey' && <ApiKeyStep onBack={back} onNext={nextAndMark} />}
+      {current === 'apikey' && <ApiKeyStep onBack={back} onNext={nextAndMark} repair={repair} />}
       {current === 'configure' && (
         <ConfigureStep cfg={cfg} saveCfg={saveCfg} onBack={back} onNext={nextAndMark} />
       )}
@@ -154,7 +199,18 @@ export function WizardView() {
           role="embedding"
           title="Memory model"
           blurb="Lets Kitty remember how you work across sessions with real semantic recall."
-          skipNote="Optional — without it, memory falls back to keyword matching."
+          skipNote="Optional — without it, chat works as normal and memory stays off."
+          onBack={back}
+          onNext={nextAndMark}
+          onSkip={nextAndMark}
+        />
+      )}
+      {current === 'summarizer' && (
+        <ModelDownloadStep
+          role="chat"
+          title="Summarizer model (recommended)"
+          blurb="Long chats get summarized so they don't run out of room. With this model it happens here on your computer — private, and free. Without it, your chat provider does it, which costs tokens."
+          skipNote="Optional — you can download it later in Settings → Helper Models."
           onBack={back}
           onNext={nextAndMark}
           onSkip={nextAndMark}

@@ -3,12 +3,22 @@ import { ipc } from '@/lib/ipc';
 import { useRouteStore } from '@/stores/routeStore';
 import type { SetupValidation } from '@/lib/types';
 import { isAndroid } from '@/lib/platform';
+import { useMemoryStatus } from '@/hooks/useMemoryStatus';
 
 export function DoneStep({ onBack }: { onBack: () => void }) {
   const [validation, setValidation] = useState<SetupValidation | null>(null);
   const [checking, setChecking] = useState(true);
   const [finishing, setFinishing] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const memory = useMemoryStatus();
+  const [summarizer, setSummarizer] = useState<'local' | 'provider' | null>(null);
+  useEffect(() => {
+    if (isAndroid()) return;
+    void ipc
+      .getSummarizerStatus()
+      .then((s) => setSummarizer(s.effective))
+      .catch(() => {});
+  }, []);
 
   const check = async () => {
     setChecking(true);
@@ -47,8 +57,8 @@ export function DoneStep({ onBack }: { onBack: () => void }) {
       <h1>You're all set</h1>
       <p className="muted">
         {isAndroid()
-          ? 'You can re-run setup from Settings → Advanced, or fine-tune everything from Settings once you’re chatting.'
-          : 'Press your hotkey any time to summon Kitty. You can re-run setup from Settings → Advanced, or fine-tune everything from Settings once you’re chatting.'}
+          ? 'You can run setup again from Settings → Advanced, and change anything else in Settings once you’re chatting.'
+          : 'Press your hotkey any time to summon Kitty. You can run setup again from Settings → Advanced, and change anything else in Settings once you’re chatting.'}
       </p>
 
       <div className="wizard-summary">
@@ -57,12 +67,29 @@ export function DoneStep({ onBack }: { onBack: () => void }) {
           <span>Your own API key</span>
         </div>
         <div className="wizard-summary-row">
-          <span className="muted">On this device</span>
+          <span className="muted">Memory</span>
           <span>
-            Memory{!isAndroid() && ' (and summarization)'} via Kitty's own local model
-            {!isAndroid() && 's'}
+            {memory === null
+              ? '…'
+              : memory.pathway_active || memory.memorabilia_active
+                ? 'On, on this device'
+                : memory.model_installed
+                  ? 'Off (turn it on in Settings)'
+                  : 'Off until the memory model is downloaded'}
           </span>
         </div>
+        {!isAndroid() && (
+          <div className="wizard-summary-row">
+            <span className="muted">Summarizing long chats</span>
+            <span>
+              {summarizer === null
+                ? '…'
+                : summarizer === 'local'
+                  ? 'On this computer'
+                  : 'By your chat provider'}
+            </span>
+          </div>
+        )}
         {checking && (
           <p className="muted" style={{ margin: 0 }}>
             Checking everything's ready…
@@ -84,14 +111,6 @@ export function DoneStep({ onBack }: { onBack: () => void }) {
               ))}
             </ul>
           </>
-        )}
-        {validation && (
-          <p className="muted" style={{ margin: 0, fontSize: 14 }}>
-            Adaptive Pathway (learns your preferences over time):{' '}
-            {validation.adaptive_pathway_ok
-              ? 'ready'
-              : 'not running yet — see Settings → Adaptive Pathway'}
-          </p>
         )}
       </div>
 
