@@ -1098,8 +1098,11 @@ pub fn on_saved(notify: impl Fn() + Send + Sync + 'static) {
     let _ = ON_SAVED.set(Box::new(notify));
 }
 
-/// RFC 7396 JSON merge patch: objects merge key by key, `null` removes a key
-/// (so the field falls back to its default), anything else replaces.
+/// A JSON merge patch (RFC 7396) with one difference: `null` *sets* a field
+/// to null rather than removing it. Settings pages send only what changed,
+/// and clearing an optional setting (a hotkey, a remembered choice) must
+/// clear it — under RFC 7396 it would fall back to its default instead.
+/// Objects merge key by key; anything else replaces.
 pub fn merge_patch(target: &mut serde_json::Value, patch: &serde_json::Value) {
     let serde_json::Value::Object(patch) = patch else {
         *target = patch.clone();
@@ -1112,14 +1115,10 @@ pub fn merge_patch(target: &mut serde_json::Value, patch: &serde_json::Value) {
         return;
     };
     for (key, value) in patch {
-        if value.is_null() {
-            target.remove(key);
-        } else {
-            merge_patch(
-                target.entry(key.clone()).or_insert(serde_json::Value::Null),
-                value,
-            );
-        }
+        merge_patch(
+            target.entry(key.clone()).or_insert(serde_json::Value::Null),
+            value,
+        );
     }
 }
 
@@ -1151,13 +1150,24 @@ mod tests {
     }
 
     #[test]
-    fn merge_patch_follows_rfc_7396() {
+    fn merge_patch_merges_objects_and_null_clears() {
         let mut v = serde_json::json!({ "a": { "b": 1, "c": 2 }, "d": 3 });
         merge_patch(
             &mut v,
             &serde_json::json!({ "a": { "b": null, "e": 4 }, "d": [1] }),
         );
-        assert_eq!(v, serde_json::json!({ "a": { "c": 2, "e": 4 }, "d": [1] }));
+        assert_eq!(
+            v,
+            serde_json::json!({ "a": { "b": null, "c": 2, "e": 4 }, "d": [1] })
+        );
+    }
+
+    #[test]
+    fn clearing_an_optional_setting_clears_it() {
+        let cfg = Config::default();
+        assert!(cfg.clipboard_hotkey.is_some());
+        let out = patched(&cfg, &serde_json::json!({ "clipboard_hotkey": null })).unwrap();
+        assert_eq!(out.clipboard_hotkey, None, "not back to the default");
     }
 
     #[test]

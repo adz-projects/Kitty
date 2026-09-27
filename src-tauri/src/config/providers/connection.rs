@@ -360,7 +360,7 @@ mod tests {
         let result = test_connection(&p).await;
         assert_eq!(
             result,
-            Err("no API key stored for this profile — edit it and add one".to_string())
+            Err("no API key for this provider — add one".to_string())
         );
     }
 
@@ -375,7 +375,7 @@ mod tests {
         let result = test_connection(&p).await;
         assert_eq!(
             result,
-            Err("no API key stored for this profile — edit it and add one".to_string())
+            Err("no API key for this provider — add one".to_string())
         );
     }
 

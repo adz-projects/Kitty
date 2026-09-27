@@ -136,13 +136,9 @@ export function Specialists() {
 
   const saveDeny = async (next: string[]) => {
     try {
-      const cfg = await ipc.getConfig();
-      await ipc.setConfig({
-        ...cfg,
-        // `seeded` stays true so clearing the list is not undone on the next
-        // launch — an empty list the user chose is a decision, not an absence.
-        specialists: { ...cfg.specialists, model_deny: next, seeded: true },
-      });
+      // `seeded` stays true so clearing the list is not undone on the next
+      // launch — an empty list the user chose is a decision, not an absence.
+      await ipc.patchConfig({ specialists: { model_deny: next, seeded: true } });
       setDeny(next);
     } catch (e) {
       setError(String(e));

@@ -72,8 +72,8 @@ export function WizardView() {
   // closure from whichever render they were created in.
   const cfgRef = useRef<Config | null>(null);
   cfgRef.current = cfg;
-  // Serializes the actual disk writes so concurrent ipc.setConfig calls can't
-  // resolve out of order and leave a stale value persisted.
+  // Serializes the actual disk writes so concurrent patches can't resolve out
+  // of order and leave a stale value persisted.
   const writeQueueRef = useRef<Promise<void>>(Promise.resolve());
 
   useEffect(() => {
@@ -89,7 +89,7 @@ export function WizardView() {
     const next = { ...base, ...patch };
     cfgRef.current = next;
     setCfg(next);
-    const run = writeQueueRef.current.then(() => ipc.setConfig(next));
+    const run = writeQueueRef.current.then(() => ipc.patchConfig(patch));
     writeQueueRef.current = run.catch(() => {});
     return run.catch((e) => {
       setSaveError(String(e));

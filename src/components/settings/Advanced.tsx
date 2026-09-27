@@ -105,7 +105,6 @@ export function Advanced() {
       setLogError(String(e));
     }
   };
-  // Writes straight through ipc.setConfig (not update()+save(), which would
   return (
     <section className="settings-section">
       <h1>Advanced</h1>

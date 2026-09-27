@@ -101,17 +101,11 @@ export function ChatWorkspace() {
 
   const toggleArtifacts = async () => {
     const next = !showArtifacts;
-    // Optimistically flip the UI, then persist — reading + writing the whole
-    // config across two IPC calls opened a lost-update race with a concurrent
-    // Settings save (getConfig's snapshot could clobber a newer write). A
-    // dedicated `set` that only touches `show_artifacts` would be ideal, but
-    // short of that, re-reading immediately before writing keeps the stale
-    // window as small as possible; failures still surface as a console warning
-    // rather than silently diverging the toggle from disk.
+    // Optimistically flip the UI, then persist just this field, so nothing
+    // written meanwhile is put back.
     setShowArtifacts(next);
     try {
-      const cfg = await ipc.getConfig();
-      await ipc.setConfig({ ...cfg, show_artifacts: next });
+      await ipc.patchConfig({ show_artifacts: next });
     } catch (e) {
       setShowArtifacts(!next); // revert the optimistic flip on failure
       console.warn('failed to persist show_artifacts', e);
