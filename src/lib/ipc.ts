@@ -132,6 +132,9 @@ export const ipc = {
   /** `force` ("Restart anyway") overrides only the other-apps check. */
   restartBackend: (force = false) => invoke<RestartOutcome>('restart_backend', { force }),
   getEngineInfo: () => invoke<EngineInfo>('get_engine_info'),
+  /** The error log as plain text, for Copy. */
+  logText: () => invoke<string>('log_text'),
+  saveLogFile: (path: string) => invoke<void>('save_log_file', { path }),
   /** Global hotkeys that could not be registered (e.g. taken by another app). */
   getHotkeyFailures: () => invoke<string[]>('get_hotkey_failures'),
   /** Also refreshes it: applies the memory toggles against the engine. */
@@ -613,12 +616,13 @@ export async function pickFiles(): Promise<string[]> {
   return Array.isArray(res) ? res : [res];
 }
 
-/** Native save-file dialog for a ChatML export. Returns null if cancelled. */
-export async function pickSavePath(defaultName: string): Promise<string | null> {
-  const res = await saveDialog({
-    defaultPath: defaultName,
-    filters: [{ name: 'ChatML', extensions: ['chatml'] }],
-  });
+/** Native save-file dialog; a ChatML export unless another filter is given.
+    Returns null if cancelled. */
+export async function pickSavePath(
+  defaultName: string,
+  filter: { name: string; extensions: string[] } = { name: 'ChatML', extensions: ['chatml'] }
+): Promise<string | null> {
+  const res = await saveDialog({ defaultPath: defaultName, filters: [filter] });
   return res ?? null;
 }
 

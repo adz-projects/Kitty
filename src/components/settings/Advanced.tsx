@@ -1,9 +1,14 @@
 import { useEffect, useRef, useState } from 'react';
-import { ipc } from '@/lib/ipc';
+import { ipc, pickSavePath } from '@/lib/ipc';
 import { useConfigDraft } from './useConfigDraft';
 import { ClearChatHistory } from './ClearChatHistory';
 import { useStackStore } from '@/stores/stackStore';
-import type { LogEntry, MemoryStats } from '@/lib/types';
+import { useRouteStore } from '@/stores/routeStore';
+import { isAndroid } from '@/lib/platform';
+import { confirmDialog } from '@/components/shared/ConfirmDialog';
+import type { EngineInfo, LogEntry, MemoryStats, RestartBlocker } from '@/lib/types';
+
+type SummarizerStatus = Awaited<ReturnType<typeof ipc.getSummarizerStatus>>;
 
 // How often to re-fetch the error log while its disclosure is open — there's
 // no push event for new entries (kept simple, matching this being a
@@ -39,6 +44,69 @@ export function Advanced() {
   const initStack = useStackStore((s) => s.init);
   const [repairMsg, setRepairMsg] = useState('');
   useEffect(() => void initStack(), [initStack]);
+  const goto = useRouteStore((s) => s.goto);
+  const android = isAndroid();
+
+  // Who started the engine, and so whose settings it is running with (#61).
+  const [engine, setEngine] = useState<EngineInfo | null>(null);
+  const [blockedBy, setBlockedBy] = useState<RestartBlocker[]>([]);
+  // Which summarizer compaction actually uses (#71).
+  const [summarizer, setSummarizer] = useState<SummarizerStatus | null>(null);
+  const [logCopied, setLogCopied] = useState(false);
+  const [handoffReset, setHandoffReset] = useState(false);
+  useEffect(() => {
+    void ipc
+      .getEngineInfo()
+      .then(setEngine)
+      .catch(() => {});
+    void ipc
+      .getSummarizerStatus()
+      .then(setSummarizer)
+      .catch(() => {});
+  }, [saved]);
+
+  const restartEngine = async (force: boolean) => {
+    if (force) {
+      const ok = await confirmDialog({
+        title: 'Restart the engine anyway?',
+        message: `${blockedBy.map((b) => b.display_name).join(', ')} will lose the engine for a few seconds, and anything they are in the middle of stops.`,
+        confirmLabel: 'Restart anyway',
+        danger: true,
+      });
+      if (!ok) return;
+    }
+    await runRepairAction('Restarting Kitty engine', async () => {
+      const outcome = await ipc.restartBackend(force);
+      setBlockedBy(outcome.blocked_by);
+      if (!outcome.restarted) {
+        throw new Error(
+          `Not restarted: ${[...new Set(outcome.blocked_by.map((b) => b.display_name))].join(', ')} is using the engine. It restarts on its own once they're done.`
+        );
+      }
+    });
+  };
+
+  const copyLog = async () => {
+    try {
+      await navigator.clipboard.writeText(await ipc.logText());
+      setLogCopied(true);
+      setTimeout(() => setLogCopied(false), 1500);
+    } catch (e) {
+      setLogError(String(e));
+    }
+  };
+  const saveLog = async () => {
+    const path = await pickSavePath('kitty-errors.log', {
+      name: 'Log',
+      extensions: ['log', 'txt'],
+    });
+    if (!path) return;
+    try {
+      await ipc.saveLogFile(path);
+    } catch (e) {
+      setLogError(String(e));
+    }
+  };
   const runRepairAction = async (label: string, fn: () => Promise<void>) => {
     setRepairMsg(`${label}…`);
     try {
@@ -117,20 +185,39 @@ export function Advanced() {
               Folds older conversation history into a running summary so long sessions don&apos;t
               run out of context.
             </p>
-            <label className="check">
-              <input
-                type="checkbox"
-                checked={draft.summarizer.enabled}
-                onChange={(e) =>
-                  update({ summarizer: { ...draft.summarizer, enabled: e.target.checked } })
-                }
-              />
-              <span>Enabled</span>
-            </label>
-            {draft.summarizer.enabled && (
-              <p className="muted">
-                Uses the local summarizer from Settings &rarr; Helper Models when it&apos;s
-                downloaded, and the chat&apos;s own provider otherwise.
+            {/* Desktop only: Android always summarizes with the chat's own
+                provider, since no generative model runs on the phone. */}
+            {!android && (
+              <label className="field">
+                <span>Summarize with</span>
+                <select
+                  value={draft.summarizer.enabled ? 'local' : 'provider'}
+                  onChange={(e) =>
+                    update({
+                      summarizer: { ...draft.summarizer, enabled: e.target.value === 'local' },
+                    })
+                  }
+                >
+                  <option value="local">The local model (private, no API cost)</option>
+                  <option value="provider">The chat&apos;s own provider</option>
+                </select>
+              </label>
+            )}
+            {!android && draft.summarizer.enabled && summarizer && !summarizer.model_installed && (
+              <p className="muted" style={{ margin: 0 }}>
+                The local summarizer isn&apos;t downloaded, so the chat&apos;s provider summarizes
+                until it is.{' '}
+                <button
+                  className="link"
+                  onClick={() => goto('settings', { section: 'local_models' })}
+                >
+                  Download it in Helper Models
+                </button>
+              </p>
+            )}
+            {!android && summarizer && summarizer.effective === 'local' && (
+              <p className="muted" style={{ margin: 0 }}>
+                Using {summarizer.model}.
               </p>
             )}
 
@@ -259,23 +346,32 @@ export function Advanced() {
             <span>Engine and setup</span>
             <p className="muted" style={{ margin: 0 }}>
               Stack status: <strong>{stackStatus.replace(/_/g, ' ')}</strong>
+              {engine?.daemon_version ? ` · engine ${engine.daemon_version}` : ''}
             </p>
+            {android ? (
+              <p className="muted" style={{ margin: 0 }}>
+                The engine runs inside Kitty on this phone; settings above apply the next time Kitty
+                starts.
+              </p>
+            ) : (
+              engine &&
+              !engine.spawned_by_us && (
+                <p className="muted" style={{ margin: 0 }}>
+                  Another app started the engine Kitty is using, so it is running with that
+                  app&apos;s start-up settings. Kitty&apos;s settings above apply after the engine
+                  restarts.
+                </p>
+              )
+            )}
             <div className="row">
-              <button
-                onClick={() =>
-                  void runRepairAction('Restarting Kitty engine', async () => {
-                    const outcome = await ipc.restartBackend();
-                    if (!outcome.restarted) {
-                      const who = outcome.blocked_by.map((b) => b.display_name).join(', ');
-                      throw new Error(
-                        `The engine is in use by ${who}; it restarts once they are done.`
-                      );
-                    }
-                  })
-                }
-              >
-                Restart backend now
-              </button>
+              {!android && (
+                <button onClick={() => void restartEngine(false)}>Restart engine now</button>
+              )}
+              {!android && blockedBy.length > 0 && (
+                <button className="danger" onClick={() => void restartEngine(true)}>
+                  Restart anyway
+                </button>
+              )}
               <button onClick={() => void ipc.openWizard('setup')}>Run first-run wizard</button>
               <button onClick={() => void ipc.openWizard('repair')}>Repair setup</button>
             </div>
@@ -294,7 +390,7 @@ export function Advanced() {
                 })();
               }}
             >
-              Save &amp; restart
+              Save
             </button>
             {saved && <span className="muted">Saved.</span>}
             {saveError && <span className="error">Couldn't save: {saveError}</span>}
@@ -343,12 +439,46 @@ export function Advanced() {
           </div>
           <div className="row">
             <button onClick={loadLogEntries}>Refresh</button>
+            <button onClick={() => void copyLog()} disabled={logEntries.length === 0}>
+              {logCopied ? 'Copied' : 'Copy'}
+            </button>
+            {!android && (
+              <button onClick={() => void saveLog()} disabled={logEntries.length === 0}>
+                Save…
+              </button>
+            )}
             <button onClick={() => void clearLog()} disabled={logEntries.length === 0}>
               Clear
             </button>
           </div>
         </div>
       )}
+
+      {draft?.handoff_gate_choice && (
+        <div className="field">
+          <span>Moving chats to less-trusted providers</span>
+          <p className="muted" style={{ margin: 0 }}>
+            Kitty remembers your answer:{' '}
+            {draft.handoff_gate_choice === 'keep'
+              ? 'send the conversation along'
+              : 'start clean on the new provider'}
+            .
+          </p>
+          <div className="row">
+            <button
+              onClick={() =>
+                void ipc
+                  .patchConfig({ handoff_gate_choice: null })
+                  .then(() => setHandoffReset(true))
+                  .catch((e) => setRepairMsg(String(e)))
+              }
+            >
+              Ask me every time
+            </button>
+          </div>
+        </div>
+      )}
+      {handoffReset && <p className="muted">Kitty will ask every time again.</p>}
 
       <ClearChatHistory />
     </section>
