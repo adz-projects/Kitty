@@ -25,10 +25,27 @@ use super::handle;
 /// notification). Idempotent: starting an already-started service just delivers
 /// another `onStartCommand`.
 pub fn start() {
+    ask_for_notifications_once();
     let Ok(h) = handle() else { return };
     if let Err(e) = h.run_mobile_plugin::<serde_json::Value>("startTurnNotice", ()) {
         tracing::debug!("turn foreground service start failed: {e}");
     }
+}
+
+/// Ask for POST_NOTIFICATIONS the first time a turn starts. Until now it was
+/// only ever asked before a model download, so someone who never downloaded
+/// one never saw a notification — including an approval a turn is waiting
+/// on. The first turn is the moment it becomes useful (a turn can pause for
+/// approval while the user is elsewhere). On its own thread, because the
+/// request blocks until the user answers, and the turn must not wait for that.
+fn ask_for_notifications_once() {
+    static ASKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if ASKED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    std::thread::spawn(|| {
+        super::download_service::request_notification_permission();
+    });
 }
 
 pub fn stop() {
