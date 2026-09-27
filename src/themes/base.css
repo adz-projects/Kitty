@@ -1312,6 +1312,12 @@ button:disabled {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.allowed-dirs-dialog {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  overflow-wrap: anywhere;
+}
 .artifact-origin {
   font-size: var(--fs-sm-plus);
 }

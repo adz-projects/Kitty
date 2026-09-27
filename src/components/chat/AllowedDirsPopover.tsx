@@ -1,8 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
-import { ipc } from '@/lib/ipc';
-import { useChatStore } from '@/stores/chatStore';
-import type { SessionAllowedDirs } from '@/lib/types';
 import { usePopoverPosition } from '@/lib/usePopoverPosition';
+import { AllowedDirsList, useAllowedDirs } from './AllowedDirsList';
 
 /** What this session is allowed to read and write, on hover over the
     working-directory pill.
@@ -27,7 +25,7 @@ export function AllowedDirsPopover({
   children: React.ReactNode;
 }) {
   const [open, setOpen] = useState(false);
-  const [dirs, setDirs] = useState<SessionAllowedDirs | null>(null);
+  const { dirs, revoke, error } = useAllowedDirs(sessionId, open);
   const { triggerRef, popoverRef, style } = usePopoverPosition(open, () => setOpen(false));
 
   // `usePopoverPosition` places the panel four pixels clear of the pill, and
@@ -52,44 +50,6 @@ export function AllowedDirsPopover({
   };
   // A timer that fires after unmount would call `setOpen` on a gone component.
   useEffect(() => cancelClose, []);
-
-  // Loaded on open, not on mount: it is a hover detail, and fetching it for
-  // every session the user merely looks at would be a request per render.
-  useEffect(() => {
-    if (!open || !sessionId) return;
-    let cancelled = false;
-    void ipc
-      .listSessionAllowedDirs(sessionId)
-      .then((d) => {
-        if (!cancelled) setDirs(d);
-      })
-      .catch(() => {
-        if (!cancelled) setDirs(null);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [open, sessionId]);
-
-  const [revokeError, setRevokeError] = useState<string | null>(null);
-  const revoke = async (path: string) => {
-    if (!sessionId) return;
-    setRevokeError(null);
-    try {
-      await ipc.revokeSessionDir(sessionId, path);
-      setDirs(await ipc.listSessionAllowedDirs(sessionId));
-      // The chat's cached grants too, or the revoked folder would keep
-      // scoping the artifacts pane (#38).
-      await useChatStore.getState().refreshSessionGrants();
-    } catch (e) {
-      setRevokeError(`Couldn't revoke access: ${String(e)}`);
-    }
-  };
-
-  // The current working directory is already named on the pill itself, and the
-  // chat folder is listed separately below — so neither is repeated here.
-  const granted = (dirs?.working_dirs ?? []).filter((d) => d !== dirs?.cwd);
-  const attached = dirs?.attached_paths ?? [];
 
   if (!sessionId) return <>{children}</>;
 
@@ -117,41 +77,7 @@ export function AllowedDirsPopover({
           onMouseEnter={cancelClose}
           onMouseLeave={scheduleClose}
         >
-          <div className="allowed-dirs-heading muted">This chat can read and write</div>
-          {dirs.cwd && (
-            <div className="allowed-dirs-row">
-              <span className="allowed-dirs-path">{dirs.cwd}</span>
-              <span className="muted">working folder</span>
-            </div>
-          )}
-          {dirs.chat_dir && dirs.chat_dir !== dirs.cwd && (
-            <div className="allowed-dirs-row">
-              <span className="allowed-dirs-path">{dirs.chat_dir}</span>
-              <span className="muted">chat folder</span>
-            </div>
-          )}
-          {granted.map((d) => (
-            <div className="allowed-dirs-row" key={d}>
-              <span className="allowed-dirs-path">{d}</span>
-              <button className="link" onClick={() => void revoke(d)} title="Revoke access">
-                ×
-              </button>
-            </div>
-          ))}
-          {attached.map((d) => (
-            <div className="allowed-dirs-row" key={d}>
-              <span className="allowed-dirs-path">{d}</span>
-              <button className="link" onClick={() => void revoke(d)} title="Revoke access">
-                ×
-              </button>
-            </div>
-          ))}
-          {granted.length === 0 && attached.length === 0 && (
-            <div className="allowed-dirs-row muted">
-              Nothing else — just this chat&apos;s folder.
-            </div>
-          )}
-          {revokeError && <div className="allowed-dirs-row error">{revokeError}</div>}
+          <AllowedDirsList dirs={dirs} revoke={revoke} error={error} />
         </div>
       )}
     </span>

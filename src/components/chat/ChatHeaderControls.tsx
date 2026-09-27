@@ -1,4 +1,3 @@
-import { isAndroid } from '@/lib/platform';
 import { ProviderBadge } from './ProviderBadge';
 import { EffortDropdown } from './EffortDropdown';
 import { ChatHeaderMenu } from './ChatHeaderMenu';
@@ -18,12 +17,9 @@ export function ChatHeaderControls() {
     <div className="chat-header-controls">
       <ProviderBadge />
       <EffortDropdown />
-      {/* The overflow menu (approval mode + Adaptive Pathway incognito toggle)
-          is dropped on Android to keep the single header row uncluttered.
-          Approval mode stays at its per-session default there, and Adaptive
-          Pathway remains fully controllable from Settings → Adaptive Pathway.
-          Desktop still renders it (this component lives in ChatView's header). */}
-      {!isAndroid() && <ChatHeaderMenu />}
+      {/* The overflow menu: incognito on both platforms, and on Android the
+          chat's allowed folders too (#79). */}
+      <ChatHeaderMenu />
     </div>
   );
 }
