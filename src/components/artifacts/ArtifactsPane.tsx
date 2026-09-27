@@ -9,6 +9,7 @@ import { useRouteStore } from '@/stores/routeStore';
 import { DocumentIcon } from '@/components/icons/DocumentIcon';
 import { FolderIcon } from '@/components/icons/FolderIcon';
 import type { FileEntry } from '@/lib/types';
+import { relativeTime } from '@/lib/relativeTime';
 
 const POLL_INTERVAL_MS = 5000;
 
@@ -229,6 +230,22 @@ function SubfolderRow({ folder }: { folder: FileEntry }) {
 
 function ArtifactCard({ artifact, android }: { artifact: Artifact; android: boolean }) {
   const [error, setError] = useState<string | null>(null);
+  // Every action reports failure (#59): a file moved or deleted since, a
+  // clipboard that refused.
+  const act = async (p: Promise<unknown>, what: string) => {
+    try {
+      await p;
+      setError(null);
+    } catch (e) {
+      setError(`Couldn't ${what}: ${String(e)}`);
+    }
+  };
+  const origin =
+    artifact.source === 'user'
+      ? 'Attached by you'
+      : artifact.source === 'disk'
+        ? 'Found in the folder'
+        : `Made by ${artifact.tool}`;
 
   return (
     <div className="artifact-card">
@@ -242,6 +259,12 @@ function ArtifactCard({ artifact, android }: { artifact: Artifact; android: bool
           {artifact.path}
         </div>
       )}
+      <div className="artifact-origin muted">
+        {origin}
+        {artifact.addedAt
+          ? ` · ${relativeTime(new Date(artifact.addedAt).toISOString(), Date.now())}`
+          : ''}
+      </div>
       <div className="artifact-actions">
         {android ? (
           // "Open"/"Show in Folder"/"Copy path" are all meaningless against an
@@ -259,13 +282,13 @@ function ArtifactCard({ artifact, android }: { artifact: Artifact; android: bool
           </button>
         ) : (
           <>
-            <button onClick={() => void ipc.openPath(artifact.path)}>Open</button>
-            <button onClick={() => void ipc.revealPath(artifact.path)}>Show in Folder</button>
+            <button onClick={() => void act(ipc.openPath(artifact.path), 'open it')}>Open</button>
+            <button onClick={() => void act(ipc.revealPath(artifact.path), 'show it')}>
+              Show in Folder
+            </button>
             <button
               onClick={() =>
-                void navigator.clipboard.writeText(artifact.path).catch(() => {
-                  /* clipboard may be unavailable */
-                })
+                void act(navigator.clipboard.writeText(artifact.path), 'copy the path')
               }
             >
               Copy path

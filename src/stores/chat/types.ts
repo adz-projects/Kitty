@@ -87,6 +87,9 @@ export interface Artifact {
       attachment (e.g. dropped in via Explorer) — distinguishes the sources in
       the UI without changing how any of them are opened/revealed. */
   source?: 'user' | 'tool' | 'disk';
+  /** When it appeared, for one made during this window's session (a replayed
+      artifact has no reliable time, so none). Epoch ms. */
+  addedAt?: number;
 }
 
 /** An inlined document (large paste or dropped text file) in chat-only mode. */

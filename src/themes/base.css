@@ -1312,6 +1312,9 @@ button:disabled {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.artifact-origin {
+  font-size: var(--fs-sm-plus);
+}
 .msg-notice {
   margin: 4px 0 0;
   font-size: var(--fs-sm-plus);

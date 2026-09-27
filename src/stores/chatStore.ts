@@ -2128,7 +2128,10 @@ export const useChatStore = create<ChatState>((set, get) => {
             ]
           : [g0.chatDir, g0.cwd];
         const derived = deriveArtifact(u, g0.cwd);
-        const artifact = derived && isArtifactInScope(derived.path, scope) ? derived : null;
+        const artifact =
+          derived && isArtifactInScope(derived.path, scope)
+            ? { ...derived, ...(g0.replaying ? {} : { addedAt: Date.now() }) }
+            : null;
         set((s) => {
           let msgs = s.messages.slice();
           let last = msgs[msgs.length - 1];
