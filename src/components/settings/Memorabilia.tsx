@@ -3,18 +3,21 @@ import { ipc } from '@/lib/ipc';
 import type { MemorabiliaMcpStatus } from '@/lib/types';
 import { MemorabiliaBrowser } from './MemorabiliaBrowser';
 import { MemorabiliaHealth } from './MemorabiliaHealth';
+import { EraseMemory } from './EraseMemory';
+import { useMemoryStatus } from '@/hooks/useMemoryStatus';
+import { useRouteStore } from '@/stores/routeStore';
 
 /** Settings for the memorabilia (declarative factual-memory) engine — the
     substantive-memory counterpart to Adaptive Pathway's behavioral memory.
-    It distills durable factual claims from ordinary conversation, tracks
-    their confidence from the supporting evidence, and surfaces a small,
-    relevant slice back per turn (the model reads any item in full on demand
-    via the `memorabilia_search` / `memorabilia_read_item` tools). Runs
-    in-process inside the BigTiny daemon (see `plugins/memorabilia_rust`) and
-    reuses the same shared learning model Adaptive Pathway uses — so there's
-    no separate model to download here, just the one enable checkbox, which
-    the daemon restart under `set_memorabilia_enabled` applies. */
+    It distills durable factual claims from the documents a chat brings in
+    (pasted text, attached files, scraped pages — `agent::memorabilia_harvest`),
+    tracks their confidence from the supporting evidence, and surfaces a
+    small, relevant slice back per turn. Shares Adaptive Pathway's learning
+    model, and like it, runs only once that model is downloaded. */
 export function Memorabilia() {
+  const memory = useMemoryStatus();
+  const modelMissing = memory !== null && !memory.model_installed;
+  const goto = useRouteStore((s) => s.goto);
   const [enabled, setEnabled] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
@@ -68,24 +71,36 @@ export function Memorabilia() {
     <section className="settings-section">
       <h1>Memorabilia</h1>
       <p className="muted">
-        Remembers durable facts from ordinary conversation — what&apos;s true about your work, your
-        projects, and the things you tell it — and quietly brings the relevant ones back when they
-        matter. Everything it holds is something you can see and correct below.
+        Remembers durable facts from what you share in chats — pasted text, attached files and pages
+        it reads — and brings the relevant ones back when they matter. Everything it holds is
+        something you can see and correct below.
       </p>
       {error && <div className="chat-error">{error}</div>}
 
       <label className="check">
         <input
           type="checkbox"
-          checked={enabled}
-          disabled={busy}
+          checked={enabled && !modelMissing}
+          disabled={busy || modelMissing}
           onChange={(e) => void setEnabledCombined(e.target.checked)}
         />
         <span>Enable Memorabilia</span>
       </label>
       <small className="muted">
-        Runs in-process inside Kitty&apos;s local engine — restarting it applies this change. Uses
-        the same learning model as Adaptive Pathway, so there&apos;s nothing extra to download.
+        {modelMissing ? (
+          <>
+            Download the memory model to enable it —{' '}
+            <button
+              className="link"
+              onClick={() => goto('settings', { section: 'adaptive_pathway' })}
+            >
+              set it up in Adaptive Pathway
+            </button>
+            .
+          </>
+        ) : (
+          'Takes effect straight away. Uses the same learning model as Adaptive Pathway.'
+        )}
       </small>
 
       {enabled && (
@@ -108,11 +123,12 @@ export function Memorabilia() {
         </small>
       )}
 
-      {enabled && (
+      {enabled && !modelMissing && (
         <>
           <h2>What it remembers</h2>
           <MemorabiliaBrowser />
           <MemorabiliaHealth />
+          <EraseMemory what="facts" phrase="erase facts" erase={ipc.eraseAllFacts} />
         </>
       )}
     </section>

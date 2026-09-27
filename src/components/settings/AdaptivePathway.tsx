@@ -8,10 +8,12 @@ import { defaultFor } from '@/lib/curated_models';
 const EMBEDDING_DOWNLOAD_ID = 'adaptive-pathway-embedding-model';
 import { BeliefBrowser } from './BeliefBrowser';
 import { GraphHealth } from './GraphHealth';
+import { EraseMemory } from './EraseMemory';
+import { useMemoryStatus } from '@/hooks/useMemoryStatus';
 
-/** Separate from the enable checkbox: the pathway engine can be enabled and
-    its MCP tools connected while this is `downloading`/`missing` — degrades
-    to the lexical-hashing fallback, not an outage. */
+/** How far along the shared learning model's download is. Memory runs only
+    once it is on disk (decision #1): without it the engines are off, not
+    running on a weaker fallback. */
 const EMBEDDING_STATUS_LABEL: Record<EmbeddingModelStatus, string> = {
   unknown: '',
   present: 'ready',
@@ -21,13 +23,13 @@ const EMBEDDING_STATUS_LABEL: Record<EmbeddingModelStatus, string> = {
 
 /** Settings for the pathway (behavioral-memory) engine — learns what the
     user cares about and how they like to be talked to, from ordinary
-    conversation, and surfaces it back as a per-turn recall block or (for
-    reasoning-capable models on providers that support it) a seeded
-    `<think>` reflection. Runs in-process inside the BigTiny daemon (see
-    `plugins/adaptive-pathway_rust`) — there's no separate sidecar process
-    to manage anymore, just the one enable checkbox, which the daemon
-    restart under `set_adaptive_pathway_enabled` handles internally. */
+    conversation, and surfaces it back as a per-turn recall block. Runs
+    inside the engine (`plugins/adaptive-pathway_rust`); the switch applies
+    at once (`lifecycle::memory`), and only once the learning model is
+    downloaded. */
 export function AdaptivePathway() {
+  const memory = useMemoryStatus();
+  const modelMissing = memory !== null && !memory.model_installed;
   const [enabled, setEnabled] = useState(false);
   const [embeddingStatus, setEmbeddingStatus] = useState<EmbeddingModelStatus>('unknown');
   const [embeddingModel, setEmbeddingModel] = useState('');
@@ -136,14 +138,16 @@ export function AdaptivePathway() {
       <label className="check">
         <input
           type="checkbox"
-          checked={enabled}
-          disabled={busy}
+          checked={enabled && !modelMissing}
+          disabled={busy || modelMissing}
           onChange={(e) => void setEnabledCombined(e.target.checked)}
         />
         <span>Enable Adaptive Pathway</span>
       </label>
       <small className="muted">
-        Runs in-process inside Kitty&apos;s local engine — restarting it applies this change.
+        {modelMissing
+          ? 'Download the memory model below to enable it.'
+          : 'Takes effect straight away.'}
       </small>
 
       {enabled && (
@@ -166,12 +170,12 @@ export function AdaptivePathway() {
         </small>
       )}
 
-      {enabled && embeddingStatus === 'missing' && (
+      {(modelMissing || embeddingStatus === 'missing') && (
         <div className="dep-row" style={{ flexDirection: 'column', alignItems: 'stretch', gap: 8 }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
             <span className="muted">
-              The shared learning model ({embeddingModel}) isn&apos;t downloaded yet — memory still
-              works, just with less precise recall (a lexical fallback instead of real embeddings).
+              Memory needs the learning model ({embeddingModel}), which isn&apos;t downloaded yet.
+              Chat works fine without it; memory stays off until it&apos;s here.
             </span>
             <button disabled={installBusy} onClick={() => void installEmbeddingModel()}>
               {installBusy ? 'Setting up…' : 'Set up learning model'}
@@ -239,11 +243,12 @@ export function AdaptivePathway() {
         </small>
       )}
 
-      {enabled && (
+      {enabled && !modelMissing && (
         <>
           <h2>What it remembers</h2>
           <BeliefBrowser />
           <GraphHealth />
+          <EraseMemory what="beliefs" phrase="erase beliefs" erase={ipc.eraseAllBeliefs} />
         </>
       )}
     </section>
