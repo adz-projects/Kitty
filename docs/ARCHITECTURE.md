@@ -1,252 +1,212 @@
 # Architecture
 
-One-page module map with dependency direction — the flat inventory in
-a flat file inventory has no edges; this does. Arrows read "depends on" /
+One-page module map with dependency direction. Arrows read "depends on" /
 "calls into."
 
-> ## Two BigTiny daemons now exist. Know which one you are editing.
+> ## One engine: BigTiny V2.
 >
-> - **`plugins/bigtiny_rust/` (V1) is FROZEN and no longer shipped.** Kitty
->   bundles `bigtiny2-daemon` (see `tauri.conf.json`'s `externalBin`) and
->   Android hosts V2 in-process, so nothing builds or links V1 any more; it is
->   kept solely as the rollback path. Much of this document still describes V1
->   shapes that V2 inherited unchanged — where the two differ, V2 is what runs.
-> - **`BigTinyV2/` is where features land.** A fork of V1 being developed into
->   a multi-app daemon: several frontends (Kitty, a research pipeline, an AI
->   notebook) attach to one instance, each with its own sessions, providers,
->   MCP servers, and plugin instances. Layout: `daemon/` (the fork),
->   `protocol/` (wire types shared with clients), `client/` (the reusable Rust
->   client).
->
-> The two coexist deliberately and must not be able to touch each other: V2
-> uses `%APPDATA%/BigTinyV2` (env `BIGTINYV2_DATA_DIR`), a binary named
-> `bigtiny2-daemon`, and its own handshake file. Kitty is untouched by V2 work
-> and keeps spawning V1 exactly as it always has.
->
-> Kitty migrates onto V2 as a separate, deferrable step. Kitty-on-V1 with new
-> apps on V2 is a stable resting state, not a half-finished one.
+> - **`BigTinyV2/` is the engine Kitty runs, on both platforms.** `daemon/`
+>   (the engine), `protocol/` (wire types shared with clients), `client/` (the
+>   reusable Rust client Kitty links). It is multi-app: several frontends
+>   (Kitty, a research pipeline, an AI notebook) attach to one instance, each
+>   with its own sessions, providers, MCP servers, schedules and plugin
+>   instances. It stays on the 2.x line (2.1.0 as of Kitty 1.0); changes made
+>   for Kitty are additive and app-scoped, because other apps share it.
+> - **`plugins/bigtiny_rust/` (V1) is frozen and unused.** Nothing builds or
+>   links it; it is kept only as a rollback path. A V1 install's data is
+>   brought across by Kitty's one-click import (`commands/v1_import.rs`).
 
 ## Rust (`src-tauri/src/`)
 
 ```
-lib.rs (app setup, window creation, generate_handler! list)
+lib.rs (app setup, window creation, generate_handler! list;
+  │     `kitty.exe --uninstall-cleanup` is handled first → uninstall.rs)
   │
-  ├─► windows.rs, tray.rs, hotkey.rs        (chrome: windows/tray/global shortcut)
-  │     screenshot.rs                        Win32 GDI region capture  [desktop only]
+  ├─► windows.rs, tray.rs, hotkey.rs        chrome: windows (overlay geometry per
+  │     screenshot.rs                        monitor), tray states, global shortcuts,
+  │                                           Win32 region capture  [desktop only]
   │
-  ├─► lifecycle/                             (process supervision)
-  │     mod.rs          orchestrates start_stack/shutdown
-  │       ├─► bigtiny_proc.rs                probe/spawn the BigTiny daemon  [desktop]
-  │       ├─► bigtiny_embedded.rs            host the daemon in-process      [Android]
-  │       ├─► bigtiny_env.rs                 the env contract both of the above pass
-  │       ├─► scheduler.rs                   fires due scheduled tasks
-  │       ├─► health.rs                      the 5s health loop
-  │       ├─► embedding.rs                   embedding-model convergence
-  │       └─► engine_restart.rs              queue a local-engine reload until idle
+  ├─► lifecycle/                             finding and keeping the engine
+  │     mod.rs            start_stack / attach / re-attach
+  │       ├─► bigtiny_v2.rs       attach to (or spawn) the shared engine  [desktop]
+  │       ├─► bigtiny_embedded.rs host the engine in-process              [Android]
+  │       ├─► bigtiny_app_key.rs  register as app `kitty`; verify / reclaim the key
+  │       ├─► bigtiny_env.rs      the start-up env both hosts pass (SpawnSnapshot)
+  │       ├─► bigtiny_proc.rs     /api/health probe, per-launch registration token
+  │       ├─► health.rs           status loop; re-attaches when the engine moved
+  │       ├─► engine_restart.rs   safe restart (POST /api/admin/restart), queued
+  │       │                        while other apps or Kitty's own turns are busy
+  │       ├─► memory.rs           per-app memory plugins on/off (embedding model
+  │       │                        on disk AND the user's toggle)
+  │       ├─► embedding.rs        is the embedding model on disk
+  │       └─► app_events.rs       the /api/apps/me/events listener: approvals,
+  │                                schedule runs, session titles
   │
-  ├─► bigtiny/                                (REST/SSE client — the only
-  │     client.rs   BigTinyClient: base URL + X-API-Key + JSON helpers   chat backend)
-  │     sessions.rs session CRUD over REST, replayed as chat://* events on load
-  │     stream.rs   POST .../send SSE consumption -> chat://* events,
-  │                  + the adaptive-pathway record_outcome backstop
-  │     providers.rs sync Kitty's active provider profile into BigTiny's registry
-  │     pathway.rs  adaptive-pathway belief browser / graph health / domains
-  │     memorabilia.rs  memorabilia fact browser / health / delete / pause
-  │     mcp.rs       MCP server CRUD + ensure_builtin_servers (kitty-tools,
-  │                  kitty-web, kitty-wasm) self-heal. Bundled exe on desktop,
-  │                  transport "in_process" on Android (no exec()).
+  ├─► approvals.rs                           which tool calls are answered
+  │                                           automatically, the "always allow"
+  │                                           scope, the pending list
   │
-  ├─► config/                                (app config, %APPDATA%/Kitty/config.json;
-  │     mod.rs         Config struct, load/save,     app-private dir on Android)
-  │                     bundled_plugin_path(), models_dir()
-  │     providers/     provider profiles: network tier, keyring, endpoint
-  │                     scheme probing, connection test
-  │     scheduled_tasks.rs
+  ├─► bigtiny/                               REST/SSE client — the only chat backend
+  │     client.rs      BigTinyClient: base URL + X-API-Key + JSON helpers
+  │     sessions.rs    session CRUD, paging, search, replay as chat://* events
+  │     stream.rs      POST .../send SSE → chat://* events (+ attach to a turn
+  │                     running elsewhere), notices, tool results
+  │     turn_text.rs   how a user turn is laid out (documents, file list) and
+  │                     parsed back for replay
+  │     providers.rs   sync every provider card into the engine
+  │     specialists.rs, mcp.rs (bundled servers self-heal), pathway.rs,
+  │     memorabilia.rs, effort.rs, vision.rs, context_window.rs
   │
-  ├─► models/                                 GGUF acquisition (no AppHandle —
-  │     download.rs  resumable HuggingFace fetch: .part + sha256 + atomic rename
-  │     gguf.rs      minimal header read for the model card
+  ├─► config/                                app config (%APPDATA%/Kitty/config.json;
+  │     mod.rs         Config, load/save,      app-private dir on Android);
+  │                     patch (merge patch)     every save emits config://changed
+  │     providers/     provider cards: network tier, secrets, endpoint scheme
+  │                     probing, connection test
   │
-  ├─► openrouter/mod.rs                       provider-specific HTTP client
+  ├─► models/                                helper-model downloads (no AppHandle):
+  │     download.rs    resumable HuggingFace fetch: .part + sha256 + rename,
+  │                     cancel, licence errors, unfinished downloads
+  │     gguf.rs        minimal header read for the model card
   │
-  ├─► commands/                               #[tauri::command] handlers —
-  │     session/       new/send/cancel/load/fork/delete, mode, thinking effort
-  │     provider.rs, adaptive_pathway.rs, memorabilia.rs, memory.rs, mcp_servers.rs,
-  │     specialists.rs, scheduled_tasks.rs, folders.rs, models.rs, file.rs,
-  │     screenshot.rs, window.rs, setup.rs, config.rs, logs.rs
-  │     (thin wrappers over the modules above — no business logic of their own)
+  ├─► openrouter/                            catalog (cost tier, tool support)
   │
-  ├─► wizard.rs                               first-run detect/configure + autostart
-  ├─► notifications.rs                        toast + tray pending state
-  ├─► log_capture.rs                          in-memory ring buffer for Settings' log view
-  └─► util.rs                                 shared http_client(), hidden_command()
-
-state.rs        AppState (managed Tauri state): config, the BigTiny
-                ManagedProcess handle, StackStatus, in-flight session ids.
-                Everything above reads/writes through this.
+  ├─► commands/                              #[tauri::command] handlers — thin
+  │     session/ provider.rs export.rs scheduled_tasks.rs v1_import.rs
+  │     models.rs mcp_servers.rs incoming.rs setup.rs ... (no business logic)
+  │
+  ├─► android/                               Kotlin bridge [Android only]: secrets,
+  │                                           notifications, share/notification
+  │                                           intents, foreground services, SAF
+  ├─► notifications.rs                       toasts (a channel per event on
+  │                                           Android) + tray state
+  ├─► uninstall.rs                           purge Kitty's data at uninstall
+  ├─► log_capture.rs, wizard.rs, util.rs
+  │
+state.rs        AppState (managed Tauri state): config, the engine handle,
+                StackStatus, in-flight sessions, pending approvals, downloads.
 ```
 
-**There is no Ollama module.** Kitty manages no inference process at all: the
-local engine is **LiteRT** linked into the daemon
-(`plugins/bigtiny_rust/src/litert/`) — embeddings on both platforms, plus
-generative compaction summarization on Windows only. There is no local chat.
-`provider_type: "ollama"` survives
-only as a *remote* endpoint dialect the user points at a server they run
-themselves. `src-tauri/src/ollama/`, `commands/ollama.rs`,
-`lifecycle/ollama_proc.rs` and `config/env_helper.rs` were deleted in Phase 2b.
+**Local inference is LiteRT, linked into the engine** (`BigTinyV2/daemon/src/litert/`):
+embeddings for memory on both platforms, and on Windows only the local
+summarizer. There is no local chat, and no Ollama module: `provider_type:
+"ollama"` survives only as a *remote* endpoint dialect.
 
-**Two daemons, and which one is which.** `BigTinyV2/` is where features land.
-`plugins/bigtiny_rust/` (V1) is **frozen: bug fixes only** — it is the rollback
-path for the desktop migration and is still what Android links in-process. If
-you are adding a capability, it goes in V2; putting it in V1 means writing it
-twice.
+**Hosting.** Desktop attaches to a shared `bigtiny2-daemon.exe`
+(`lifecycle/bigtiny_v2.rs` over the `bigtiny2-client` crate): it reads the
+handshake, proves the process is a V2 engine, and spawns one under a lock only
+when none is running. Kitty registers as the app `kitty` and keeps its key in
+the Credential Manager; a lost key is reclaimed with the handshake's
+registration token, keeping Kitty's data. Nothing in Kitty kills the engine:
+another app may be mid-turn. A settings change that only applies at start-up
+asks the engine to restart itself (`POST /api/admin/restart`), which it does
+only when no other app is attached or busy; otherwise the change waits and the
+hub says who is in the way ("Restart anyway" forces it). Android links the same
+engine and hosts it in-process (`bigtiny_embedded.rs`), because Android 10+
+will not `exec()` a binary from app storage; there, start-up settings apply the
+next time Kitty starts. Both sit behind the same HTTP boundary, so nothing
+above `lifecycle/` knows which it has.
 
-**Platform split.** Desktop no longer *owns* a daemon. It attaches to a shared
-`bigtiny2-daemon.exe` via `lifecycle/bigtiny_v2.rs` and the `bigtiny2-client`
-crate — reading the handshake, proving the process behind it is really a V2
-daemon, and spawning one under an exclusive lock only when none is running.
-Kitty registers once as the app `kitty` and keeps the issued key in the
-Credential Manager, so its identity survives both its own restart and the
-daemon's. **Nothing in Kitty kills a daemon**: another application may be
-mid-turn, and lifetime is the daemon's own business via its idle-exit timer.
+**The first app to start the engine decides its start-up settings**
+(summarizer, token management, specialist limits). Settings → Advanced says
+when that app was not Kitty. Anything that must differ per app lives in the
+engine's per-app tables instead (e.g. `app_plugins`, which is how memory is
+switched per app without a restart).
 
-Android still hosts V1 in-process via `bigtiny_rust::run`, because Android 10+
-will not `exec()` a binary out of app-writable storage — and because a phone
-runs exactly one frontend, so it gains nothing from tenancy and would inherit
-real risk from it. It migrates separately, after desktop has soaked. Both
-platforms still go through the same HTTP boundary, so nothing above
-`lifecycle/` knows which one it is talking to.
+**Events.** Chat streams arrive per turn (`/api/chat/{id}/send`, 15 s
+keepalives). Everything else Kitty needs to hear about, for any of its chats,
+arrives on one app-scoped stream (`/api/apps/me/events`, `app_events.rs`):
+approvals waiting (answered automatically when safe, otherwise put in front of
+the user — inline if the chat is on screen, a blocking dialog otherwise, and the
+overlay is summoned if no Kitty window is visible), scheduled runs, titles.
 
-One consequence worth knowing: **the first app to spawn decides the daemon's
-configuration.** Summarizer, token-management and memory settings are passed as
-spawn environment, so they apply only when Kitty is the process that started
-the daemon. Settings that genuinely must differ per app belong in the
-`app_plugins` table, which is per-app by construction.
-
-Dependency direction is meant to be roughly top-to-bottom: `commands/` calls
-into `lifecycle/`/`config/`/`bigtiny/`, never the reverse, with one
-deliberate, narrow exception — `lifecycle/scheduler.rs` calls
-`commands::new_session`/`send_prompt` to fire a due scheduled task headlessly.
-That reverse edge is confined to that one file rather than spread through
-`lifecycle/mod.rs` (see that file's own doc comment).
+Dependency direction is top-to-bottom: `commands/` calls into
+`lifecycle/`/`config/`/`bigtiny/`, never the reverse.
 
 ## Frontend (`src/`)
 
 ```
 windows/{hub,overlay,screenshot-select}/App.tsx  one entry point per window label
   │   hub = chat + saved chats + settings + wizard, routed by `routeStore`
-  │         (one window, four views — Android's whole UI, and desktop's
-  │          full window; `overlay` and `screenshot-select` are desktop-only)
+  │         (Android's whole UI, and desktop's full window; `overlay` and
+  │          `screenshot-select` are desktop-only)
   │
-  ├─► components/hub/        ChatWorkspace (the three-column desktop shell,
-  │                          one column on Android), MobileDrawer (Android's
-  │                          swipeable menu: saved chats + pinned Settings)
-  ├─► components/chat/       Composer, MessageList/MessageItem, MessageActions
-  │                          (hover row on desktop, tap-revealed ⓘ/⋯ menu on
-  │                          Android), ThinkingBox, ApprovalPrompt,
-  │                          ToolCallCard, ChatHeaderControls — shared
-  │                          verbatim between overlay and hub (rule 5)
-  ├─► components/sessions/   SessionList — the chat sidebar on desktop, the
-  │                          menu drawer's contents on Android
-  ├─► components/settings/   one panel per Settings sidebar section
-  ├─► components/artifacts/  ArtifactsPane — third column on desktop, a
-  │                          swipe-to-dismiss bottom sheet on Android
-  ├─► components/wizard/     first-run steps (a different set per platform)
+  ├─► components/hub/        ChatWorkspace, HubBanners (engine restart waiting,
+  │                          hotkey failure, V1 import), MobileDrawer (Android)
+  ├─► components/chat/       Composer, MessageList/MessageItem, MessageActions,
+  │                          ThinkingBox, ApprovalPrompt + ApprovalModal,
+  │                          ToolCallCard, ProviderBadge + BranchToProvider
+  │                          (handoff gate), ChatHeaderMenu — shared by
+  │                          overlay and hub (rule 5)
+  ├─► components/sessions/   SessionList (paged, searchable) — the sidebar on
+  │                          desktop, the menu drawer on Android
+  ├─► components/settings/   one panel per Settings section (Tool permissions
+  │                          lists "always allow" rules)
+  ├─► components/artifacts/  ArtifactsPane
+  ├─► components/shared/     Dialog (focus trap, Escape/Back), ConfirmDialog
+  │                          (confirmDialog(), typed confirmation), Banner,
+  │                          ErrorDetail, StackStatusView
+  ├─► components/wizard/     first run; repair opens at the broken step
   │
-  ├─► stores/                zustand stores — render state only, never the
-  │     chatStore.ts           source of truth (that's BigTiny, CLAUDE.md rule 3)
-  │       chat/                 extracted pure helpers (types, message/loop/
-  │                             approval/error utils, mode-info cache) —
-  │                             re-exported from chatStore.ts so every existing
-  │                             import path keeps working unchanged
-  │     sessionStore.ts, adaptivePathwayStore.ts, stackStore.ts,
-  │     routeStore.ts (which hub view is showing)
+  ├─► stores/                zustand — render state only (rule 3)
+  │     chatStore.ts (+ chat/ pure helpers), approvalStore.ts (every chat's
+  │     waiting approvals), sessionStore.ts, stackStore.ts, routeStore.ts,
+  │     adaptivePathwayStore.ts, mobileUiStore.ts
   │
   └─► lib/
         ipc.ts        the ONLY file that calls invoke() — typed wrappers
-                      around every Tauri command, plus Tauri event listeners
+                      around every command, plus event listeners
         types.ts      TS mirrors of Rust structs (kept in sync by hand)
-        platform.ts   isAndroid() + the `data-platform` attribute CSS keys off
-        viewport.ts   pins the app box to the visual viewport (soft keyboard)
-        chatml.ts, provider_trust.tsx, system_prompts.ts, ...
+        escapeStack.ts / backDismiss.ts   Escape and Android Back close the
+                      topmost layer first
+        incoming.ts   shares and notification taps from Android
+        handoff.ts, relativeTime.ts, pasteFiles.ts, platform.ts, ...
 ```
 
 `lib/ipc.ts` is the chokepoint CLAUDE.md's "webview never fetches localhost
-directly" rule depends on — every component goes through it, never `invoke()`
-directly. It's also backend-agnostic by design: `src-tauri/src/bigtiny/`
-emits the same `chat://*`/`session://*` event shapes and command return types
-a frontend written against goosed's ACP surface already expected, so this
-layer needed zero changes when the backend swapped from goosed to BigTiny.
+directly" rule depends on.
 
 ## Plugins (`plugins/`)
 
-See `docs/PLUGINS.md` for the full pattern. `kitty-tools`, `kitty-web` and
-`kitty-wasm` (all Rust) plus the BigTiny daemon itself
-(`plugins/bigtiny_rust/`) are built with `cargo build --release` and bundled
-through Tauri's `externalBin` — `python plugins/build.py` builds all four
-targets. The two memory engines — the behavioral-memory engine
-(`plugins/adaptive-pathway_rust`) and the declarative factual-memory engine
-(`plugins/memorabilia_rust`) — are not targets of their own: each is a path
-dependency statically linked into the daemon, hosted per app
-(`plugins/host.rs`, `plugins/memorabilia_host.rs`), reached by the model
-through in-process MCP servers (`pathway` → `record`/`forget`; `memorabilia` →
-`memorabilia_search`/`memorabilia_read_item`) and by Settings through
-`/api/pathway/*` and `/api/memorabilia/*`. Enable is env-gated
-(`BIGTINY_PATHWAY__ENABLED`, `BIGTINY_MEMORABILIA__ENABLED`), both on by default
-in Kitty. A single chat-header incognito control pauses both per session.
+See `docs/PLUGINS.md` for the pattern. `kitty-tools`, `kitty-web` and
+`kitty-wasm` (Rust) are MCP servers registered in the engine's own
+`/api/mcp/servers` (`bigtiny::mcp::ensure_builtin_servers`), not spawned by
+Kitty; on desktop they are bundled executables (`externalBin`), and on Android
+they run in-process (`transport: "in_process"`), configured through an explicit
+`InProcessConfig` rather than the process environment. `python plugins/build.py`
+builds them and the engine, and `--verify-manifest` checks the committed
+binaries match their source.
 
-The two engines learn from **different** material. Adaptive Pathway distils
-behavioral beliefs from the dialogue. Memorabilia does **not** ingest dialogue
-(user and model are both frequently wrong); its turn-end harvest
-(`agent::memorabilia_harvest`) ingests the *documents* a turn brought in —
-pasted text and inlined attachments (the `--- label ---` blocks), files
-attached by path (extracted via `kitty_tools::extract`), and pages the model
-successfully scraped with `lean_web_scrape` (harvested from the persisted tool
-results; a scraped download is extracted from its cached path). Images and other
-media are skipped.
+- **`kitty-tools`**: 26 tools on desktop, 24 on Android (no `lean_shell` /
+  `lean_shell_ro`) — workspace, files, Word, Excel, PDF, scratchpad, cache,
+  document handles, image reading — plus 4 visualization tools (table, SVG,
+  chart, Mermaid) behind their own toggle.
+- **`kitty-web`**: `lean_web_search`, `lean_web_search_read_chunk`,
+  `lean_web_scrape`. DuckDuckGo and Bing together by default (language and
+  country honoured on both); Brave when a key is configured.
+- **`kitty-wasm`**: 4 tools running Python or any WASI module in a wasmtime
+  sandbox.
 
-**On Android none of that applies.** `externalBin` is cleared
-(`tauri.android.conf.json`), the daemon is hosted in-process, and the three MCP
-servers register with `transport: "in_process"` — Android 10+ will not
-`exec()` a binary in app-writable storage, so there is nothing a bundled
-sidecar could be. `plugins/build.py` is the desktop lane only and has no
-Android triple by design.
+The two memory engines — behavioural (`plugins/adaptive-pathway_rust`) and
+factual (`plugins/memorabilia_rust`) — are linked into the engine and hosted per
+app. They run only when the embedding model is on disk and the user has them
+on; Kitty switches them per app (`PUT /api/apps/me/plugins/{plugin}`), which
+takes effect at once. Adaptive Pathway learns from the dialogue; Memorabilia
+learns only from the documents a turn brings in (pasted text, attached files,
+scraped pages — `agent::memorabilia_harvest`). Each can be erased entirely from
+Settings. Memorabilia and specialists are off on Android.
 
-The BigTiny daemon is a Kitty-managed process on desktop (`ManagedProcess`,
-probed then spawned); `kitty-tools`, `kitty-web` and `kitty-wasm` are stdio MCP
-servers registered with BigTiny's own `/api/mcp/servers` registry
-(`bigtiny::mcp::ensure_builtin_servers`), not spawned directly by Kitty.
-`kitty-tools`, `kitty-web`, and `kitty-wasm` are on by default (no
-credentials). `kitty-tools` hosts 21 tools in one process — the always-on
-shell/workspace/file/word/cache/scratchpad set, plus read-only Excel/PDF
-tools, plus 4 visualization tools (accessible table, SVG diagram, chart,
-Mermaid) gated by their own Settings toggle (an env var on this one process,
-not a separate server) — no network calls of its own. `kitty-web` hosts the merged,
-count-tiered `lean_web_search`/`lean_web_search_read_chunk` and
-`lean_web_scrape` (Brave preferred per-query when configured; otherwise
-DuckDuckGo and Bing are queried together as a co-equal key-free pair — Brave's
-toggle needs an API key stored in the keyring rather than `config.json`;
-disabling it always deletes the stored key, so re-enabling always requires
-re-entering it). `kitty-wasm` hosts the sandboxed
-WebAssembly compute tools (Python via a bundled CPython wasm guest, plus
-arbitrary WASI modules) with no network and no filesystem beyond explicit
-mounts. `replacement-mcp`, `brave-mcp-search`, `visualizations`,
-`kitty-docs-web` and `wasm-math-mcp` are retired and their source has been
-**deleted** — the ports are verified and shipping, and git history holds the
-originals if a behavioral question ever needs settling. Their server rows are
-actively removed from the daemon on sync (`RETIRED_BUILTINS` in
-`src-tauri/src/bigtiny/mcp.rs`).
+## Cross-cutting: who is the source of truth
 
-## Cross-cutting: the three "who's the source of truth" boundaries
-
-1. **Session/conversation state** → BigTiny. Frontend `messages[]` is a
-   reconstruction from `chat://*` events, never persisted app-side.
-2. **MCP server registrations** (which tools every session has access to)
-   → BigTiny's own `/api/mcp/servers`, not Kitty's `config.json` — Kitty only
-   self-heals the two bundled servers' command paths/enabled state into it.
-3. **Secrets** → Windows Credential Manager (`keyring`, service `kitty`),
-   never `config.json`, never a frontend variable. On Android the same
-   contract is met by a different store — AES-256-GCM under a non-exportable
-   AndroidKeyStore key (`src/android/secrets.rs` over `SecretStore.kt`),
-   because `keyring` has no Android backend and degrades to an in-memory mock
-   if you let it (D24).
+1. **Conversations, schedules, providers as the engine uses them, MCP
+   registrations, approval rules** → the engine. The frontend's `messages[]`
+   is a reconstruction from `chat://*` events, never persisted app-side.
+   Provider cards are Kitty's (`config.json` + secret store), and every one is
+   synced into the engine.
+2. **Settings** → `config.json`, written through `patch_config` (only the
+   fields that changed), with `config://changed` telling every window.
+3. **Secrets** → never `config.json`, never the webview. Desktop: Windows
+   Credential Manager (`keyring`, service `kitty`); the engine seals the
+   provider keys it holds with a key it keeps DPAPI-protected
+   (`encryption.key.dpapi`). Android: AES-256-GCM under a non-exportable
+   AndroidKeyStore key (`src/android/secrets.rs` over `SecretStore.kt`), which
+   also holds the in-process engine's key.

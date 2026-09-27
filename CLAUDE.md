@@ -2,269 +2,250 @@
 
 ## What this project is
 
-A Tauri v2 app on **two targets — Windows and Android** — backed by **BigTiny** (a chat-first REST/SSE agent daemon, a pure-Rust crate at `BigTinyV2/daemon/` — `plugins/bigtiny_rust/` is the frozen V1 tree, kept only as a rollback path; nothing builds or links it, and features such as specialists exist only in V2). On Windows it is a hotkey-summoned floating overlay chat client; on Android it is a single routed window with a bottom tab bar. It is a **client only** — all agent logic, tool execution, MCP handling, and model routing stays inside BigTiny. This app owns: window management (overlay / hub / tray), the BigTiny lifecycle, configuration UI, drag-and-drop file context, session history UI, an artifacts sidepane, notifications, tool-approval UI, theming, and a first-run wizard.
+A Tauri v2 app on **two targets — Windows and Android** — backed by **BigTiny
+V2** (a chat-first REST/SSE agent engine, a pure-Rust crate at
+`BigTinyV2/daemon/`). On Windows it is a hotkey-summoned floating overlay chat
+client plus a full window; on Android it is a single routed window with a menu
+drawer. It is a **client only** — agent logic, tool execution, MCP handling,
+scheduling and model routing stay inside the engine. This app owns: window
+management (overlay / hub / tray), attaching to the engine, configuration UI,
+drag-and-drop and shared file context, session history UI, an artifacts pane,
+notifications, the tool-approval UI, theming, and a first-run wizard.
 
-**Local inference is LiteRT linked into the daemon (not llama.cpp, not Ollama).** The llama.cpp `local` engine was removed in favour of LiteRT (`plugins/bigtiny_rust/src/litert/`); there is **no local chat** as a product use case — chat always routes to a remote provider. LiteRT does two local jobs only: **semantic embeddings** for the adaptive-pathway memory (EmbeddingGemma `.tflite`, both platforms, via `edgefirst-tflite` loading the prebuilt `libLiteRt.{dll,so}` at runtime + the pure-Rust `tokenizers` crate) and, **on Windows only**, generative **compaction summarization** (LiteRT-LM running `gemma-4-E2B-it.litertlm`); Android offloads compaction to the session's remote chat model, so no generative model runs on the phone (the fix for the on-device GPU heat/artifacts that motivated the swap). Kitty manages no inference *process* of any kind: models are acquired from HuggingFace by `src-tauri/src/models/` (the EmbeddingGemma repo is Gemma-license-gated, so the downloader takes a transient HF token). `provider_type: "ollama"` survives only as a *remote* endpoint dialect for a server the user runs themselves. Read llama.cpp/Ollama references below as historical.
+`plugins/bigtiny_rust/` is the frozen V1 engine: nothing builds or links it,
+and it is kept only as a rollback path. A V1 install's data is imported with
+one click (`commands/v1_import.rs`). Features exist only in V2.
 
-**The two targets differ in hosting, not in code.** Desktop spawns `bigtiny-daemon.exe` as a child process and bundles the MCP servers as `externalBin` sidecars. Android links the same daemon in and hosts it in-process (`lifecycle/bigtiny_embedded.rs`) with `transport: "in_process"` MCP servers, because Android 10+ refuses to `exec()` a binary in app-writable storage. Both sit behind the same HTTP boundary, so nothing above `lifecycle/` knows the difference. `docs/ANDROID.md` is the plan of record for that work and `docs/RELEASE.md` has both packaging lanes.
+**The engine is shared.** Other apps (a research pipeline, an AI notebook)
+attach to the same V2 engine on desktop, each with its own sessions, providers,
+MCP servers and schedules. Changes Kitty needs in V2 are therefore additive and
+app-scoped, and V2 stays on the 2.x line.
 
-The original product description (`goose-overlay-project-description.md`) has been **deleted** — it predated the BigTiny backend swap and described a Goose-based app that no longer exists. This file, plus `docs/ARCHITECTURE.md`, is the spec.
+**Local inference is LiteRT linked into the engine** (`BigTinyV2/daemon/src/litert/`),
+not llama.cpp and not Ollama. There is **no local chat** — chat always goes to
+a remote provider. LiteRT does two local jobs: **semantic embeddings** for the
+memory engines (EmbeddingGemma `.tflite`, both platforms; the Gemma
+`tokenizer.json` is downloaded with it) and, **on Windows only**, the optional
+local **summarizer** for compaction (LiteRT-LM running
+`gemma-4-E2B-it.litertlm`). Android summarizes with the chat's own provider.
+Kitty manages no inference process: models come from Hugging Face through
+`src-tauri/src/models/` (EmbeddingGemma is licence-gated, so the download takes
+a transient HF token). `provider_type: "ollama"` survives only as a *remote*
+endpoint dialect for a server the user runs.
 
-**Goose is not part of this app.** Kitty used to spawn `goosed` (Goose's ACP-over-WebSocket server) as its backend; that entire integration (`src-tauri/src/goosed/`, `goose_config.rs`, the ACP protocol layer, the Goose Desktop conflict check, the wizard's Goose install step) has been removed. BigTiny is the only backend, and it is fully internalized — the wizard and UI never mention it, or Goose, as a dependency. See `docs/ARCHITECTURE.md` for the current, accurate module map.
+**The two targets differ in hosting, not in code.** Desktop attaches to a
+shared `bigtiny2-daemon.exe` (spawning one only if none is running) and bundles
+the MCP servers as `externalBin` sidecars. Android links the same engine and
+hosts it in-process (`lifecycle/bigtiny_embedded.rs`) with `transport:
+"in_process"` MCP servers, because Android 10+ refuses to `exec()` a binary in
+app-writable storage. Both sit behind the same HTTP boundary, so nothing above
+`lifecycle/` knows the difference. `docs/ANDROID.md` is the Android plan of
+record and `docs/RELEASE.md` has both packaging lanes.
+
+Goose is not part of this app — BigTiny is the only backend, and the UI never
+names it (or Goose) as a dependency. **`docs/ARCHITECTURE.md` is the accurate
+module map**; this file plus that one are the spec.
 
 ## Tech stack (do not deviate without asking)
 
 - **Shell**: Tauri v2, targeting Windows (`nsis`) and Android (`aarch64-linux-android`, AAB). Rust backend ("core"), web frontend.
 - **Frontend**: React 18 + TypeScript + Vite. Plain CSS with CSS custom properties for theming — **no Tailwind, no CSS-in-JS** (theming requirement is user-droppable plain CSS).
 - **State**: Zustand for UI state. No Redux.
-- **Rust crates**: `tauri`, `tauri-plugin-global-shortcut`, `tauri-plugin-notification`, `tauri-plugin-shell` (open browser), `tauri-plugin-dialog`, `tauri-plugin-single-instance`, `reqwest` (with `stream` feature), `tokio`, `serde`/`serde_json`, `keyring` (Windows Credential Manager), `windows` (Win32 APIs for the keyboard hook), `sysinfo` (process detection), `thiserror`.
-- **HTTP to BigTiny/Ollama**: all network calls go through the Rust side (Tauri commands + events). The webview never fetches localhost directly — this keeps the BigTiny secret key out of JS and avoids CORS issues.
-- **Exception, by design**: packages under `plugins/` (see "Internal
-  plugins" below), plus the BigTiny daemon itself (the Rust crate at
-  `plugins/bigtiny_rust/`), ship as part of the
-  app, built to standalone `.exe`s (plain `cargo build --release` —
-  every target is Rust) and bundled through Tauri's
-  `externalBin` — this is an intentional, sanctioned part of the stack, not
-  a deviation. A frozen Rust plugin is, if anything, *less* of an exception
-  than a frozen Python one (no interpreter, no onefile self-extraction
-  latency) — it just isn't a workspace member of `src-tauri` (see
-  `docs/PLUGINS.md`/`plugins/kitty-tools/Cargo.toml` for why). This does
-  **not** mean "add a dependency-heavy plugin freely" — a new plugin still
-  needs the same freeze-and-bundle treatment (`docs/PLUGINS.md`), and the app
-  itself (Rust core + React frontend) stays exactly as described above.
+- **Rust crates**: `tauri`, `tauri-plugin-global-shortcut`, `tauri-plugin-notification` (desktop), `tauri-plugin-shell`/`-opener`, `tauri-plugin-dialog`, `tauri-plugin-single-instance`, `reqwest` (with `stream`), `tokio`, `serde`/`serde_json`, `keyring` (Windows Credential Manager; not on Android), `windows` (Win32), `thiserror`, and the engine's own `bigtiny2-client` / `bigtiny2-protocol`.
+- **HTTP to the engine**: all network calls go through the Rust side (Tauri commands + events). The webview never fetches localhost directly — this keeps the app key out of JS and avoids CORS issues.
+- **Exception, by design**: the MCP servers under `plugins/` (see "Internal
+  plugins" below) and the engine itself ship as part of the app, built with
+  plain `cargo build --release` and bundled through Tauri's `externalBin` on
+  desktop. That is a sanctioned part of the stack, not a deviation. It does
+  **not** mean "add a dependency-heavy plugin freely" — a new plugin needs the
+  same build-and-bundle treatment (`docs/PLUGINS.md`), and the app itself
+  (Rust core + React frontend) stays exactly as described above.
 
-## External APIs this app consumes
+## The engine API this app consumes
 
-### BigTiny
-- Spawned by us as a child process (bundled `bigtiny-daemon.exe`, or `python -m bigtiny` from a source checkout for dev — see `docs/bigtiny-backend.md`). Binds a localhost port and requires a secret sent as `X-API-Key` — we generate the secret, pass it via env var `BIGTINY_SECRET`, and pick a free port. `GET /api/health` is open without auth by design, for readiness polling.
-- Plain REST + one SSE streaming endpoint (`POST /api/chat/{id}/send`). Key route families: session CRUD (`/api/chat/...`), providers (`/api/providers/...`), MCP servers (`/api/mcp/servers/...`), specialists (`/api/specialists/...`) and schedules. All BigTiny endpoint paths live in `src-tauri/src/bigtiny/` (`client.rs`, `sessions.rs`, `stream.rs`, `providers.rs`, `mcp.rs`) so a BigTiny API change touches one module.
-- BigTiny's own API.md (in its repo) is the source of truth for route shapes.
-
-### Ollama
-- Base URL: `http://localhost:11434` (configurable).
-- `GET /api/tags` — list installed models. `POST /api/pull` `{"model": "<name>"}` — streaming NDJSON with `status`, `total`, `completed` per layer; drive progress bars from this. `DELETE /api/delete` — remove model. `GET /api/version` — health check.
-- We never call generate/chat on Ollama for **inference** — that goes through BigTiny. The one exception is an *empty* `/api/generate` with `keep_alive: -1`/`0` used solely to warm/evict a model in Ollama's memory when the active provider changes (`src-tauri/src/ollama/mod.rs::keep_alive_load/release`).
+- **Desktop**: Kitty reads the engine's handshake file, checks the process is a
+  V2 engine of a compatible API version (2), and spawns one under a lock only
+  when none is running. It registers once as the app `kitty` and keeps the
+  issued **app key** in the Credential Manager; every call sends it as
+  `X-API-Key`. A lost key is reclaimed with the handshake's registration token
+  (`POST /api/apps/reclaim`), keeping Kitty's data. `GET /api/health` is open
+  without a key, for readiness polling. Kitty never kills the engine: it asks
+  it to restart (`POST /api/admin/restart`) when a start-up setting changed,
+  and the engine refuses while other apps are attached or busy.
+- **Android**: the same engine runs in-process on a loopback port; Kitty
+  registers the same way, and supplies the at-rest key from the SecretStore.
+- **Routes**: plain REST plus SSE streams — the chat turn
+  (`POST /api/chat/{id}/send`, `/stream` to follow a turn running elsewhere)
+  and the app-scoped event stream (`GET /api/apps/me/events`: approvals,
+  schedule runs, titles). Both send keepalives every 15 s. Route families:
+  sessions (`/api/chat/...`), search, providers, MCP servers, specialists,
+  schedules, HITL rules, memory (`/api/pathway/*`, `/api/memorabilia/*`),
+  per-app plugins and data (`/api/apps/me/...`: plugins, pending approvals,
+  V1 import, purge). All paths live in `src-tauri/src/bigtiny/` and the
+  `lifecycle/` modules that attach, so an API change touches one place.
+- `BigTinyV2/API.md` is the source of truth for route shapes.
 
 ## Internal plugins (`plugins/`)
 
-Subsystems ship as **internal plugins**: independent, tested packages
-maintained in this repo under `plugins/`, built to standalone Windows
-`.exe`s and bundled through Tauri's `externalBin` mechanism — end users need
-no runtime of any kind. **As of 0.5.0 every bundled binary is Rust**
-(`cargo build --release`); the PyInstaller freeze path still exists in
-`plugins/build.py` but no target uses it, and every Python plugin's source
-has been deleted. Full detail in
+Subsystems ship as **internal plugins**: independent, tested Rust packages in
+this repo under `plugins/`, built to standalone executables for desktop
+(`externalBin`) and linked in-process on Android. End users need no runtime of
+any kind. `python plugins/build.py` builds them and the engine and writes
+`src-tauri/binaries/manifest.json`; `--verify-manifest` checks the committed
+binaries still match their source (CI runs it). Full detail in
 `docs/PLUGINS.md`; the current plugins:
 
-- **`adaptive-pathway_rust`** — the behavioral-memory engine, and *not* a
-  bundled binary of its own: it's a path dependency statically linked into
-  the BigTiny daemon, so recall runs as an in-process call on the agent
-  loop's hot path rather than an HTTP hop. Extracts durable beliefs about
-  the user from conversation, decays and consolidates them across sessions,
-  and injects a DPP-selected handful per turn — framed as working
-  assumptions to check the request against, never a profile to conform to
-  (see `docs/VERSIONS.md`'s recall-framing contract). Surfaced in Settings as
-  the belief browser / Graph Health / Domain Profiles, and per-session
-  incognito in the chat header. Its `record`/`forget` write tools are
-  exposed to the model through BigTiny's in-process MCP registry
-  (`bigtiny_rust::mcp::builtin`), which is what lets the model drop a belief
-  it's told is wrong.
+- **`adaptive-pathway_rust`** — the behavioural-memory engine, linked into the
+  engine (not a binary of its own). Extracts durable beliefs about the user
+  from conversation, decays and consolidates them, and injects a DPP-selected
+  handful per turn — framed as working assumptions to check the request
+  against, never a profile to conform to (see `docs/VERSIONS.md`'s
+  recall-framing contract). Its `record`/`forget` tools reach the model through
+  the engine's in-process MCP registry. Settings: belief browser, Graph
+  Health, Erase all; per-chat incognito in the chat's ⋯ menu.
+- **`memorabilia_rust`** — the factual-memory engine, also linked in. Learns
+  from the documents a turn brings in (pasted text, attached files, scraped
+  pages), not from the dialogue. Desktop only.
 
-  The Python `adaptive-pathway` HTTP sidecar and its `adaptive-pathway-mcp`
-  stdio proxy that preceded this are **retired** — no longer built, bundled,
-  spawned, or supervised.
-- **`kitty-tools`** — a **Rust** stdio MCP server registered with **BigTiny's
-  own `/api/mcp/servers`**, not spawned directly by Kitty. Kitty's only
-  involvement is keeping the registration's command path pointed at the
-  current install's bundled exe and its `enabled` flag in sync with Settings
-  (`bigtiny::mcp::ensure_builtin_servers`, `commands/mcp_servers.rs`). Hosts
-  24 context-optimized local-machine tools in one process — shell,
-  workspace, 5 file, 3 Word, 2 Excel, 2 PDF, 4 scratchpad, 4 cache, 2
-  document-handle (always on; this is the retired `replacement-mcp`'s full
-  surface plus `kitty-docs-web`'s PDF/Excel tools, now hand-rolled in Rust on
-  `pdf-extract`+`lopdf`/`calamine` — **on by default**, since they're what makes the small
-  local models Kitty targets usable as agents at all), plus 3 accessible
-  table/chart/Mermaid visualization tools, gated by their own Settings
-  toggle (an env var on this one process, not a separate server).
+  Both memory engines run only when the embedding model is on disk **and** the
+  user has them on; Kitty switches them per app, at once
+  (`lifecycle/memory.rs`). Without the model, chat is unaffected and memory is
+  simply off.
+- **`kitty-tools`** — MCP server registered in the engine's own
+  `/api/mcp/servers`, not spawned by Kitty (Kitty keeps the registration's
+  command path and `enabled` flag in sync with Settings:
+  `bigtiny::mcp::ensure_builtin_servers`). **26 tools on desktop, 24 on
+  Android** (no `lean_shell` / `lean_shell_ro` there): workspace, 5 file, 3
+  Word, 2 Excel, 2 PDF, image reading, 4 scratchpad, 4 cache, 2 document-handle,
+  shell — on by default, since they are what makes small models usable as
+  agents — plus **4** visualization tools (table, SVG diagram, chart, Mermaid)
+  behind their own Settings toggle.
 
   Every paged reader (`lean_file_read`, `lean_word_read_text`,
   `lean_pdf_read_text`) writes through an **extract-once cache**
   (`plugins/kitty-tools/src/doc_store.rs`) keyed by the file's
-  `(path, len, mtime)`, and returns a `document_id` alongside its window.
-  The two document-handle tools — `lean_doc_read_chunk` and `lean_doc_search`
-  — read the rest of that cached extraction without re-parsing the source.
-  Before this, each paged call redid the whole extraction and threw away
-  everything outside its window, so reading a 600-page PDF end to end parsed
-  that PDF once per chunk. The id is derived from the fingerprint rather than
-  random, so an unchanged file keeps its handle and an edited one can never
-  be served a stale extraction — there is nothing to invalidate. No network
-  calls of its own — web search lives in `kitty-web`. Toggled in Settings → MCP
-  Servers. Installs predating the `replacement-mcp` default flip are flipped
-  on once by `config::migrate_replacement_mcp_enabled` /
-  `migrate_kitty_split_enabled`, which then respect any later opt-out.
-- **`kitty-web`** — a **Rust** stdio MCP server, same BigTiny registration
-  pattern as `kitty-tools`. Hosts 3 tools: `lean_web_scrape` (which
-  also **downloads** a URL returning a document or text file rather than a page
-  — pdf, docx, xlsx, csv, txt, md, json, xml, yaml and friends — to the shared
-  cache and hands back `cached_path` plus the reader to call on it;
-  archives/executables/media stay refused), and the merged
-  `lean_web_search`/`lean_web_search_read_chunk` (Brave preferred per-query
-  when `BRAVE_API_KEY` is configured; otherwise the key-free pair —
-  DuckDuckGo **and Bing**, queried together — with a count-tiered
-  normal/expanded/expansive mode, see `docs/VERSIONS.md`). On by default, no
-  credentials (Brave preference is a separate, off-by-default toggle
-  requiring an API key). Bing is co-equal with DuckDuckGo rather than a
-  second fallback because DuckDuckGo serves a **bot challenge** under
-  concurrent load — with an HTTP 202, so it reads as a successful empty page
-  unless specifically detected. `plugins/kitty-web/src/ratelimit.rs` paces the
-  scraped engines process-wide, which is the level that matters: the whole
-  daemon shares one `kitty-web` client, so parallel specialists all burst
-  through it.
-- **`kitty-wasm`** — a **Rust** stdio MCP server, same registration pattern.
-  4 tools running Python or any WASI module inside a wasmtime sandbox with
-  enforced time/memory ceilings, no network, and no filesystem beyond
-  explicit mounts. Supersedes the retired `wasm-math-mcp`. Its 26 MB CPython
-  guest is bundled on Windows; on Android it downloads once on first use
-  (see `docs/BACKLOG.md`).
+  `(path, len, mtime)` and returns a `document_id`; `lean_doc_read_chunk` and
+  `lean_doc_search` read the rest of that extraction without re-parsing the
+  source. The id derives from the fingerprint, so an unchanged file keeps its
+  handle and an edited one can never be served a stale extraction.
+- **`kitty-web`** — same registration pattern. `lean_web_scrape` (which also
+  **downloads** a URL that returns a document — pdf, docx, xlsx, csv, txt, md,
+  json, xml, yaml — to the shared cache and hands back `cached_path`), and
+  `lean_web_search` / `lean_web_search_read_chunk`: Brave per query when a
+  Brave key is configured (off by default; needs the web server on), otherwise
+  DuckDuckGo **and Bing** together, with language and country honoured on
+  both. Bing is co-equal rather than a fallback because DuckDuckGo serves a
+  **bot challenge** under concurrent load with an HTTP 202, which reads as an
+  empty page unless detected. `plugins/kitty-web/src/ratelimit.rs` paces the
+  scraped engines process-wide.
+- **`kitty-wasm`** — same pattern. 4 tools running Python or any WASI module
+  in a wasmtime sandbox with time/memory ceilings, no network, and no
+  filesystem beyond explicit mounts. Its CPython guest is bundled on Windows;
+  on Android it downloads once on first use.
 
-The above (and the BigTiny daemon itself) are frozen via
-`python plugins/build.py` (Python plugins) or `cargo build --release`
-(`kitty-tools`); see `docs/PLUGINS.md` for the two Rust-side integration
-shapes (Kitty-managed process vs. BigTiny-managed MCP server) any future
-internal plugin should follow, and why mixing them is a bug, not a stylistic
-choice.
+On Android the three MCP servers are configured through an explicit
+`InProcessConfig` (grants, plugin home, keys), never the process environment.
+See `docs/PLUGINS.md` for the two integration shapes (Kitty-managed vs.
+engine-managed) and why mixing them is a bug.
 
-## Other undocumented-in-this-file subsystems
+## Other subsystems
 
-The phased plan below (§ Phase 0–11) is this project's original build order
-and predates several subsystems that have since shipped. **`docs/ARCHITECTURE.md`
-is the accurate, current module map** — the repository layout tree
-immediately below this section is historical/aspirational, not a live
-inventory. Subsystems built beyond the original phased plan:
-
+- **Approvals** (`approvals.rs`, `lifecycle/app_events.rs`,
+  `stores/approvalStore.ts`, `ApprovalModal`) — the engine pauses on tool
+  calls; Kitty answers the safe ones itself (file operations inside the chat's
+  granted folders, shell commands that are not security-sensitive) and puts the
+  rest in front of the user: inline in the chat if it is on screen, a blocking
+  dialog in whichever window is, the overlay summoned if none is, plus a
+  notification. "Always allow" is scoped (the command's first two words for a
+  shell call, else the tool) and listed with Revoke in Settings → Tool
+  permissions. A scheduled run's approval is denied after 10 minutes unanswered.
 - **Specialists** (`bigtiny/specialists.rs`, `commands/specialists.rs`,
-  `components/settings/Specialists.tsx`) — delegate agents the *model*
-  calls mid-turn via `call_specialist`, each running in its own session
-  with its own model pin, tool allow-list and required JSON answer shape,
-  so its tool chatter never enters the parent transcript. Definitions live
-  in the daemon (`/api/specialists`), not Kitty's config: the model reaches
-  the same rows without Kitty in the loop. Kitty owns the authoring UI, the
-  per-provider "use for specialists" setting, the subagent model denylist
-  (relayed as `BIGTINY_AGENT__SUBAGENT_MODEL_DENY` at spawn, seeded once from
-  the OpenRouter catalog's premium tier), and the `chat://subagent-status`
-  tray. The daemon picks the host, bounds the run in wall-clock time and
-  reasoning tokens, and reports what it actually used. Delegates run in the
-  background: `call_specialist` returns a ticket, the model keeps working and
-  collects reports with `await_specialists`, and the loop will not let a turn
-  end until every ticket is collected and answered from (`docs/VERSIONS.md`,
-  0.10.7). **Replaced the
-  client-side recipes feature** (Goose-style `/slug` prompt templates) —
-  users lose a deterministic shortcut and gain delegation they never have
-  to ask for.
-- **Scheduled tasks** (`config/scheduled_tasks.rs`, `commands/scheduled_tasks.rs`,
-  `lifecycle/scheduler.rs`, `components/settings/ScheduledTasks.tsx`) —
-  user-authored instructions the agent runs later, one-shot or recurring,
-  with or without the app open (a 30s-tick headless loop that reuses
-  `commands::new_session`/`send_prompt` verbatim).
-- **Folder bookmarks** (`commands/folders.rs`, session→folder mapping in
-  `Config`) — app-side session organization layered on top of BigTiny's own
-  flat session list; BigTiny has no concept of folders.
-- **Log capture** (`log_capture.rs`, `commands/logs.rs`) — an in-memory ring
-  buffer of `warn!`/`error!` tracing events, surfaced in Settings for
-  in-app diagnostics without needing to find a log file on disk.
+  `components/settings/Specialists.tsx`) — delegate agents the *model* calls
+  mid-turn via `call_specialist`, each in its own session with its own model,
+  tool allow-list, answer schema, reasoning cap, fan-out and concurrency limit.
+  Definitions live in the engine (`/api/specialists`). Kitty owns the authoring
+  UI, the per-provider "use for specialists" setting, the overall time and
+  concurrency limits, and the subagent model denylist (relayed at start-up,
+  seeded once from the OpenRouter catalog's premium tier after the first
+  OpenRouter provider is synced). Delegates run in the background: the model
+  collects reports with `await_specialists`, and a turn cannot end until every
+  ticket is collected (`docs/VERSIONS.md`, 0.10.7). Desktop only.
+- **Scheduled tasks** (`commands/scheduled_tasks.rs` over `/api/schedules`,
+  `components/settings/ScheduledTasks.tsx`) — instructions the engine runs
+  later, once or on an interval, on a chosen provider card with its system
+  prompt. On desktop they run whether or not Kitty is open; on Android they run
+  while Kitty's process is alive, and one that fell due meanwhile runs when
+  Kitty next opens (headless runs: `docs/BACKLOG.md`). Settings shows the last
+  run with a link to its chat, and "Run now". Failures notify.
+- **Providers** — each card is one provider + one model (Duplicate to add
+  another model); every card is synced into the engine, and the default is
+  just a flag. A chat stays on its card; moving it is a branch onto another
+  card, through the handoff gate when the target is less trusted.
+- **Folder bookmarks** (`commands/folders.rs`) — app-side session organization
+  over the engine's flat session list.
+- **Log capture** (`log_capture.rs`) — an in-memory ring buffer of
+  `warn!`/`error!` events, shown in Settings → Advanced with Copy and Save.
 
 ## Repository layout
 
+`docs/ARCHITECTURE.md` has the module map. At the top level:
+
 ```
-/                       # repo root
-  CLAUDE.md
-  docs/
-    VERSIONS.md         # pinned Goose + Ollama versions and tested goosed API paths
-    goosed-openapi.json # vendored spec for the pinned version
-  src/                  # React frontend
-    main.tsx
-    windows/            # one entry per Tauri window label
-      overlay/          # Overlay window UI
-      main/             # Full window UI
-      settings/         # Settings window UI
-      wizard/           # First-run wizard UI
-    components/
-      chat/             # Composer, MessageList, ToolCallCard, ApprovalPrompt, ContextPill,
-                        # ThinkingIndicator, ReasoningPanel, BranchButton, RegenerateButton,
-                        # PastedDocumentChip, ExportChatMLButton
-      artifacts/        # ArtifactsPane, ArtifactCard
-      sessions/         # SessionList, SessionSearch
-      settings/         # ProviderList, ProviderForm, OllamaModels, AdvancedSection, ThemePicker
-    stores/             # zustand stores: chatStore, sessionStore, settingsStore, stackStore
-    lib/
-      ipc.ts            # typed wrappers around invoke() + event listeners; ONLY file that calls invoke
-      types.ts          # shared TS types (mirror Rust types; keep in sync manually, note pairs in comments)
-    themes/
-      base.css          # layout + structural CSS, theme-agnostic
-      default.css       # default theme (custom properties only)
-      dark.css
-  src-tauri/
-    tauri.conf.json
-    src/
-      main.rs
-      state.rs          # AppState: managed state (ports, keys, child handles, config)
-      windows.rs        # create/toggle overlay, main, settings, wizard windows
-      hotkey.rs         # global shortcut + Copilot key hook
-      tray.rs
-      lifecycle/        # spawn/monitor/stop goosed + ollama; conflict detection; health
-        mod.rs
-        goosed.rs
-        ollama_proc.rs
-        conflict.rs
-      goosed/
-        api.rs          # all goosed HTTP paths + request/response structs
-        stream.rs       # SSE consumption -> Tauri events
-      ollama/
-        api.rs          # tags/pull/delete/version
-      config/
-        mod.rs          # app config (JSON at %APPDATA%/goose-overlay/config.json)
-        providers.rs    # provider profiles; secrets via `keyring`
-        env_helper.rs   # Ollama env var read/write (user-level registry) + restart
-      commands/         # #[tauri::command] fns, thin wrappers over modules above
-      notifications.rs
-      wizard.rs         # dependency detection, installer download/invoke
+CLAUDE.md, AGENTS.md, README.md
+docs/            ARCHITECTURE, ANDROID, PLUGINS, RELEASE, VERSIONS, BACKLOG, ...
+src/             React frontend (windows/, components/, stores/, lib/, themes/)
+src-tauri/       Rust core (src/), Tauri config, bundled binaries, Android project (gen/android)
+BigTinyV2/       the engine: daemon/, client/, protocol/
+plugins/         kitty-tools, kitty-web, kitty-wasm, the two memory engines,
+                 build.py; bigtiny_rust/ is frozen V1
 ```
 
 ## Core architectural rules
 
-1. **One Rust process, multiple windows.** Windows are Tauri WebviewWindows. `hub` is the routed window — chat, saved chats, settings and the wizard are views inside it (`routeStore`), not four separate labels — and multiple hubs can be open at once (`chat-N`). `overlay` and `screenshot-select` are desktop-only; the overlay is created hidden at startup and toggled (show/hide), never destroyed, because summon latency is the product. Android runs exactly one hub and nothing else.
-2. **All I/O in Rust.** Frontend calls `invoke()` via `src/lib/ipc.ts` only. Streaming data (chat tokens, tool events, download progress) is forwarded as Tauri events: `chat://message-delta`, `chat://tool-call`, `chat://tool-approval-needed`, `chat://complete`, `chat://error`, `models://progress`, `stack://status`. Event payloads always include `session_id` (or `download_id`) so multiple listeners can filter.
-3. **Session state lives in BigTiny.** The frontend keeps only render state. Resume = fetch session with conversation from BigTiny and re-render. Never persist chat history app-side.
-4. **Secrets never touch JS or plaintext disk.** API keys go in Windows Credential Manager via `keyring` (service = `kitty`, account = provider profile id). App config JSON stores profile metadata only (name, provider type, base URL, model list, `is_remote` flag) — never keys. Android uses a different store for the same contract: `keyring` has no Android backend at all (it silently degrades to an in-memory mock, which is what made D24 a silent-data-loss bug), so secrets there are AES-256-GCM sealed under a non-exportable AndroidKeyStore key — `gen/android/.../SecretStore.kt` behind `src/android/secrets.rs`, dispatched from `config::providers::keyring`. `keyring` is excluded from the Android dependency graph so the mock cannot come back.
-5. **Overlay and hub share the chat implementation.** `components/chat/*` renders in both; the window entry decides chrome (compact vs. full with sidepanes). Both can be bound to the same active session and stay in sync, because both consume the same Tauri events keyed by session id. The same components render on Android — platform differences are `isAndroid()` gates and the mobile CSS breakpoint, never a forked component tree.
-6. **There is no chat/agent mode.** A per-session "thought partner" vs. "agentic" toggle (Phase 9 below) used to hide the tool chrome, pick a different system prompt, force approval mode, and fork the drop/paste handling. It's gone. What a session can do is now a property of its *provider*, not a switch the user sets: a provider that can't call tools simply never gets any in its request. Two behaviors the chat side did better are now unconditional — a long paste collapses into a chip, and a dropped file is inlined as content whenever the provider has no filesystem tools to open a path with (`chatStore`'s `providerHasTools`).
-7. **Errors are states, not toasts.** `stackStore` holds a machine-readable stack status (`starting | ok | backend_down | local_model_missing | provider_unreachable`). Chat UI renders a status panel with a "Fix this" button (opens settings deep-linked to the relevant section) whenever status != ok.
+1. **One Rust process, multiple windows.** Windows are Tauri WebviewWindows. `hub` is the routed window — chat, saved chats, settings and the wizard are views inside it (`routeStore`), not separate labels — and multiple hubs can be open at once (`chat-N`). `overlay` and `screenshot-select` are desktop-only; the overlay is created hidden at startup and toggled (show/hide), never destroyed, because summon latency is the product. Android runs exactly one hub and nothing else.
+2. **All I/O in Rust.** Frontend calls `invoke()` via `src/lib/ipc.ts` only. Streaming and push data is forwarded as Tauri events, e.g. `chat://message-delta`, `chat://tool-call`, `chat://notice`, `chat://complete`, `chat://error`, `approval://needed`, `approval://resolved`, `session://renamed`, `config://changed`, `memory://status`, `models://progress`, `stack://status`, `engine://restart-state`. Event payloads include `session_id` (or `download_id` / `action_id`) so multiple listeners can filter.
+3. **Session state lives in the engine.** The frontend keeps only render state. Resume = fetch the session from the engine and re-render. Never persist chat history app-side.
+4. **Secrets never touch JS or plaintext disk.** API keys and Kitty's app key go in the Windows Credential Manager via `keyring` (service = `kitty`; a provider's account is its profile id). App config JSON stores profile metadata only (name, provider type, base URL, model, trust) — never keys. The engine holds the provider keys it needs sealed under its own key, which on Windows it keeps DPAPI-protected (`encryption.key.dpapi`). Android uses a different store for the same contract: `keyring` has no Android backend at all (it silently degrades to an in-memory mock, which is what made D24 a silent-data-loss bug), so secrets there — including the in-process engine's key — are AES-256-GCM sealed under a non-exportable AndroidKeyStore key (`gen/android/.../SecretStore.kt` behind `src/android/secrets.rs`). `keyring` is excluded from the Android dependency graph so the mock cannot come back.
+5. **Overlay and hub share the chat implementation.** `components/chat/*` renders in both; the window entry decides chrome. Both can show the same session and stay in sync, because both consume the same events keyed by session id. The same components render on Android — platform differences are `isAndroid()` gates and the mobile CSS breakpoint, never a forked component tree.
+6. **There is no chat/agent mode.** What a session can do is a property of its *provider*: a provider that can't call tools (auto-detected from the catalog, or set on the card) simply never gets any. A long paste collapses into a chip, and a dropped file is inlined as content whenever the provider has no tools to open a path with.
+7. **Errors are states, not toasts.** `stackStore` holds a machine-readable status (`starting | ok | backend_down`, plus a `detail`). The chat renders a status panel whenever it isn't `ok`. Provider problems belong to the chat that hit them: its error card names the chat's own provider and links to it in Settings, and an unreachable provider shows a banner in the chats on that card only, clearing itself when it answers.
 
 ## Coding conventions
 
-- Rust: `rustfmt` defaults, `clippy` clean, `thiserror` for error enums per module; every `#[tauri::command]` returns `Result<T, String>` with user-safe messages (log details with `tracing`, don't surface internals).
-- TS: strict mode, ESLint + Prettier. No `any`. Components are function components; hooks in `src/hooks/` if shared.
+- Rust: `rustfmt` defaults, `clippy` clean (desktop and `cargo ndk -t arm64-v8a clippy`), `thiserror` for error enums per module; every `#[tauri::command]` returns `Result<T, String>` with user-safe messages (log details with `tracing`, don't surface internals).
+- TS: strict mode, ESLint + Prettier. No `any`. Components are function components; hooks in `src/hooks/` if shared. In-app dialogs (`Dialog`, `confirmDialog`), never `window.confirm`.
 - CSS: all colors/spacing/typography via custom properties defined in theme files; `base.css` may not contain color values.
 - Commit per task, conventional commits (`feat:`, `fix:`, `chore:`).
-- Tests: Rust unit tests for config/providers/bigtiny stream+mcp+session translation. Frontend: vitest for stores and ipc wrapper.
+- Tests: Rust unit tests for config/providers/engine stream+mcp+session translation; frontend vitest for stores, the ipc wrapper and pure helpers.
 
 ---
 
 # Phased implementation plan (HISTORICAL — original build order, not current state)
 
 **Everything below this line describes the original goosed/ACP-based design and
-is retained only as historical record of the project's build order.** The app
-was later migrated onto BigTiny as its backend and every goosed-specific
-mechanism named below (`goosed/api.rs`, `goose serve`, ACP, Goose Desktop
-conflict detection, the wizard's Goose install step, goose's `config.yaml`
-extension registry) has been **removed from the codebase**. Do not use this
-section as a reference for how anything currently works — see
-`docs/ARCHITECTURE.md` and the sections above instead. It's kept here because
-the phase-by-phase feature scope (chat MVP, tool approvals, sessions/
-artifacts, settings, hotkey/theming, first-run wizard, hardening, chat-only
-mode, reasoning visibility, ChatML export) is still an accurate map of what
-the product does, even though the backend it's described against no longer
-exists.
+is retained only as a historical record of the project's build order.** Do not
+use it as a reference for how anything works now — see `docs/ARCHITECTURE.md`
+and the sections above. In particular:
+
+- Every goosed-specific mechanism (`goosed/api.rs`, `goose serve`, ACP, Goose
+  Desktop conflict detection, the wizard's Goose install step, goose's
+  `config.yaml`) is **gone**; the backend is BigTiny V2.
+- **Ollama management is gone** (Phases 1, 5, 7): Kitty installs, starts and
+  pulls nothing for Ollama; local models are LiteRT helper models downloaded
+  from Hugging Face.
+- **Approval modes are gone** (Phase 3's mode badge): approvals follow one
+  fixed policy, with scoped "Always allow" rules revocable in Settings.
+- **The Copilot-key hook and the background image were dropped** (Phase 6):
+  hotkeys are ordinary global shortcuts, and themes are CSS files.
+- **The chat-only mode is gone** (Phase 9, see rule 6), and so are strict
+  remote mode and the "strip reasoning" option.
+- The **context handoff gate** now guards *branching* a chat onto a
+  less-trusted provider, and can remember its answer (Phase 5 said "no
+  remember-choice", which was reversed).
+- **ChatML export** is built by Rust from the engine's stored history (Phase
+  11's format, with reasoning persisted by the engine).
+
+The phase-by-phase scope is still a fair map of what the product does.
 
 Do phases in order. Each phase must compile, run, and pass its acceptance checks before starting the next.
 
@@ -452,9 +433,9 @@ Acceptance: exporting a session that mixes reasoning, tool calls, and plain turn
 
 ## Known risks & decided fallbacks
 
-- **Copilot key capture fails on some OEM firmware** → setting falls back to standard hotkey; Settings shows PowerToys remap instructions. Never block setup on it.
-- **goosed API drift** → everything path-related in `goosed/api.rs`; integration tests run against `mock_goosed`; `docs/VERSIONS.md` is the source of truth. If a route 404s at runtime, surface `goosed_down`-style degraded state with a version-mismatch hint, don't crash.
-- **Ollama installed as a service vs. user process** → lifecycle code must handle "already running, not ours" (never kill it) and "we spawned it" (kill on exit) as distinct tracked states.
+- **A hotkey can be taken by another app** (Alt+Space and PowerToys) → registration failure is reported in the hub with a "Choose another hotkey" link; never block startup on it.
+- **Engine API drift** → every path lives in `src-tauri/src/bigtiny/` and the attach code; Kitty refuses an engine older than API version 2 and says why; `docs/VERSIONS.md` records the contract.
+- **The engine is shared with other apps** → Kitty never kills it, never changes another app's data, and restarts it only when no other app is using it (or the user says "Restart anyway").
 - **Artifacts detection is heuristic** (tool-name matching) → acceptable; false negatives are fine, never fabricate entries.
 - **Reasoning/thinking support varies per model, not per provider** → never assume; feature-detect via `reasoning_models.ts` and fall back to the plain typing indicator with no reasoning panel if unsupported or undetected.
 - **`personal`-tier (Tailscale) endpoints can legitimately go offline** → this is expected, not an error state; keep its health messaging distinct from misconfiguration ("check Tailscale" vs. "check your API key"), and recover silently on reconnect without user action.
