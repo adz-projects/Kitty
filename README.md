@@ -3,117 +3,108 @@
 An agentic AI chat client for **Windows and Android**, built on Tauri v2.
 
 On Windows it is a hotkey-summoned floating overlay that expands into a full
-window with session history and an artifacts pane. On Android it is a single
-routed window with a bottom tab bar. Both run the same React component tree —
+window with chat history and an artifacts pane. On Android it is a single
+routed window with a menu drawer, and a share target other apps can send
+text, images and documents to. Both run the same React component tree —
 platform differences are a handful of `isAndroid()` gates and one CSS
 breakpoint, never a forked UI.
 
-Kitty is the **client layer**: window management, hotkeys, theming, tool
-approval, file and screenshot context, provider configuration, and process
-lifecycle. Everything an agent actually *does* — model routing, tool
-execution, MCP, sessions, streaming — happens in **BigTiny**, a Rust REST/SSE
-daemon in this repo at `plugins/bigtiny_rust/`.
+Kitty is the **client layer**: windows, hotkeys, theming, tool approvals, file
+and screenshot context, provider configuration, and attaching to the engine.
+Everything an agent actually *does* — model routing, tool execution, MCP,
+sessions, streaming, scheduling — happens in **BigTiny V2**, a Rust REST/SSE
+engine in this repo at `BigTinyV2/daemon/`.
 
 ## How it runs
 
-The same daemon is hosted two different ways, behind one HTTP boundary:
+The same engine is hosted two different ways, behind one HTTP boundary:
 
 | | Windows | Android |
 |---|---|---|
-| BigTiny | child process (`bigtiny-daemon.exe`) | linked in, hosted in-process |
-| MCP tool servers | bundled `.exe` sidecars over stdio | in-process over `tokio::io::duplex` |
+| BigTiny V2 | a shared `bigtiny2-daemon.exe` Kitty attaches to (and starts if none is running) | linked in, hosted in-process |
+| MCP tool servers | bundled `.exe`s over stdio | in-process over `tokio::io::duplex` |
+
+On Windows the engine is shared: other apps can attach to the same instance,
+each with its own chats, providers and schedules. Kitty registers as the app
+`kitty` and authenticates with an app key kept in the Credential Manager —
+never in the webview. It never kills the engine; when a start-up setting
+changes, it asks the engine to restart, which happens only when no other app
+is using it.
 
 Android needs the in-process path because Android 10+ refuses to `exec()` a
 binary out of app-writable storage. Nothing above `lifecycle/` knows the
-difference — both sit behind the same localhost REST API, authenticated with a
-per-launch secret that never reaches the webview.
+difference.
 
 ## Tools
 
 The agent gets its capabilities from three bundled MCP servers, all Rust, all
 on by default and requiring no credentials.
 
-**`kitty-tools` — 24 local-machine tools.** Shell execution; file
-read/write/append/replace with pagination; workspace analysis; Word document
-read/outline/**write** (including hyperlinks); Excel inspect/read; PDF
-text/outline; a persistent scratchpad; and a content cache. Plus 3
-WCAG-oriented visualization tools (accessible table, chart, Mermaid diagram)
-behind their own Settings toggle.
+**`kitty-tools` — 26 local-machine tools (24 on Android, which has no shell).**
+Shell execution; file read/write/append/replace with pagination; workspace
+analysis; Word document read/outline/**write** (including hyperlinks); Excel
+inspect/read; PDF text/outline; image reading; a persistent scratchpad; and a
+content cache. Plus 4 visualization tools (accessible table, SVG diagram,
+chart, Mermaid diagram) behind their own Settings toggle.
 
 Long documents are extracted **once**, not once per page. Every paged reader
 caches its full extraction keyed by the file's path, size and mtime, and hands
 back a `document_id`; `lean_doc_read_chunk` and `lean_doc_search` then walk or
-search the whole document from that cache without re-parsing it. The id is
-derived from the fingerprint, so an unchanged file keeps its handle and an
-edited one gets a fresh one automatically.
+search the whole document from that cache without re-parsing it.
 
-**`kitty-web` — 3 tools.** Web scrape, plus web search and its paged
-read-back. DuckDuckGo always works; Brave is preferred per-query when an API
-key is configured (a separate, off-by-default toggle). Large result sets
-offload to disk with a keyword index instead of flooding the context.
+**`kitty-web` — 3 tools.** Web scrape (which also downloads a linked PDF,
+Word, Excel or text file for the readers above), plus web search and its paged
+read-back. DuckDuckGo and Bing are queried together, honouring the requested
+language and country; Brave is preferred per query when an API key is
+configured (a separate, off-by-default toggle). Large result sets offload to
+disk with a keyword index instead of flooding the context.
 
 **`kitty-wasm` — 4 tools.** Runs Python — or any WASI module — inside a
 wasmtime sandbox with enforced time and memory ceilings, no network, and no
-filesystem beyond explicit mounts. Used for exact arithmetic, data filtering,
-and statistics. The 26 MB CPython guest ships with the app on Windows, so
-first use is offline; on Android it downloads once and is then cached
-(bundling it there needs an extract-to-app-storage step — see
-`docs/BACKLOG.md`).
+filesystem beyond explicit mounts. The CPython guest ships with the app on
+Windows; on Android it downloads once and is then cached.
 
-**Adaptive Pathway** is not a server. The behavioral-memory engine
-(`plugins/adaptive-pathway_rust/`) is statically linked into the daemon, so
-recall is an in-process call on the agent loop rather than a network hop. It
-extracts durable beliefs about you from conversation, decays and consolidates
-them across sessions, and injects a diverse handful per turn — framed as
-working assumptions to check a request against, never a profile to conform to.
-Its `record`/`forget` tools are exposed to the model through the daemon's
-in-process MCP registry, which is what lets the model drop a belief you tell it
-is wrong. Browsable in Settings; per-session incognito from the chat header.
+### Approvals
 
-**Memorabilia** is the second memory engine, and also not a server — a
-declarative *factual* memory statically linked into the daemon
-(`plugins/memorabilia_rust/`), parallel to Adaptive Pathway but for substantive
-facts rather than behavioral beliefs. Where Adaptive Pathway learns how you
-work, Memorabilia remembers *what is true* in the material you bring in.
+The engine pauses on tool calls. Kitty answers the safe ones itself — file
+operations inside the chat's own folders, shell commands that aren't
+security-sensitive — and asks you about the rest: inline if that chat is on
+screen, otherwise a dialog over whatever Kitty shows (summoning the overlay if
+nothing is showing), plus a notification. "Always allow" covers the tool, or
+for a shell call the command's first two words, and every such rule can be
+revoked in Settings → Tool permissions.
 
-- **It learns from documents, not dialogue.** At the end of a turn it harvests
-  the three things you actually vouched for — text you pasted into the chat, the
-  contents of files you attached, and pages the model successfully scraped with
-  `kitty-web` — and ingests each as evidence. It deliberately does **not** learn
-  from the back-and-forth of the conversation itself, because both people and
-  models are wrong too often for chat turns to be trustworthy evidence.
-  Attached files are extracted through the same `kitty-tools` machinery the
-  agent uses (PDF, Word, Excel, and text formats; images and other media are
-  skipped for now).
-- **Two levels: evidence and claims.** Ingested documents become evidence
-  chunks that carry time and decay; from them it distills atomic propositions
-  (single factual claims). Identical claims drawn from different chunks or
-  sources **consolidate into one assertion** rather than piling up as
-  duplicates, and independent corroboration raises that assertion's confidence
-  (a noisy-OR over distinct sources).
-- **Credibility is sourced, not assumed.** Each claim's confidence reflects the
-  reliability tier of where it came from — a scraped primary domain outranks a
-  community page, which outranks an unattributed personal note — combined across
-  sources and down-weighted when evidence conflicts. Disputed facts are flagged
-  and de-weighted in recall until they settle.
-- Reuses the same EmbeddingGemma embedder as Adaptive Pathway, stored in SQLite
-  with `sqlite-vec`. Its `memorabilia_search` / `memorabilia_read_item` tools
-  are exposed to the model over the in-process MCP registry. Enabled by default;
-  browsable and correctable in Settings → Memorabilia (with a Health readout),
-  and paused per session by the same chat-header incognito control as Adaptive
-  Pathway.
+### Memory
+
+Two memory engines are linked into the engine. Both need the optional
+EmbeddingGemma model (downloaded in the wizard or Settings → Adaptive Pathway);
+without it chat works exactly the same and memory is simply off. Each can be
+paused per chat (incognito, in the chat's ⋯ menu) and erased entirely from
+Settings.
+
+- **Adaptive Pathway** (`plugins/adaptive-pathway_rust/`) learns how you work:
+  durable beliefs extracted from conversation, decayed and consolidated across
+  sessions, a diverse handful injected per turn — framed as working assumptions
+  to check a request against, never a profile to conform to. Its
+  `record`/`forget` tools let the model drop a belief you tell it is wrong.
+- **Memorabilia** (`plugins/memorabilia_rust/`, desktop only) remembers what is
+  true in the material you bring in. It learns from **documents, not
+  dialogue** — text you pasted, files you attached, pages the model scraped —
+  distils single factual claims from them, consolidates identical claims across
+  sources, and weighs each by where it came from. Its `memorabilia_search` /
+  `memorabilia_read_item` tools let the model look things up.
 
 ## Local inference
 
 Kitty runs **no inference process of its own**, and there is no local chat —
-chat always routes to a remote provider. LiteRT is linked into the daemon for
-exactly two local jobs:
+chat always goes to a provider you connect. LiteRT is linked into the engine
+for two local jobs:
 
-- **Semantic embeddings** for Adaptive Pathway's memory (EmbeddingGemma), on
-  both platforms.
-- **Compaction summarization**, on **Windows only**. Android hands that to the
-  session's remote chat model instead, so no generative model runs on the
-  phone — that was the fix for on-device GPU heat and artifacting.
+- **Semantic embeddings** for memory (EmbeddingGemma), on both platforms.
+- **Summarizing long chats**, on **Windows only** and optional: with the local
+  summarizer model downloaded it happens on your computer; otherwise the chat's
+  provider does it. Android always uses the provider, so no generative model
+  runs on the phone.
 
 `provider_type: "ollama"` survives only as a *remote* endpoint dialect for a
 server you run yourself.
@@ -126,28 +117,29 @@ server you run yourself.
   with custom properties, so a theme is a single droppable `.css` file. No
   Tailwind, no CSS-in-JS.
 - **Core** — Rust. All I/O lives here; the webview never fetches localhost
-  directly, which keeps the daemon secret out of JS and avoids CORS entirely.
+  directly, which keeps the app key out of JS and avoids CORS entirely.
   Streaming reaches the UI as Tauri events.
-- **Secrets** — Windows Credential Manager via `keyring`. On Android, AES-256-GCM
-  sealed under a non-exportable AndroidKeyStore key (`keyring` has no Android
-  backend — it silently degrades to an in-memory mock, so it is excluded from
-  the Android dependency graph entirely).
+- **Secrets** — Windows Credential Manager via `keyring`; the engine keeps its
+  own key DPAPI-protected. On Android, AES-256-GCM sealed under a
+  non-exportable AndroidKeyStore key (`keyring` has no Android backend — it
+  silently degrades to an in-memory mock, so it is excluded from the Android
+  dependency graph entirely).
 
 ## Getting started
 
-Prerequisites: Node.js with [pnpm](https://pnpm.io), and a Rust toolchain via
-`rustup`. **No Python and no Rust toolchain is needed by end users**, and none
-is needed to run the app in dev either — BigTiny is pure Rust and runs straight
-from source.
+Prerequisites: Node.js with [pnpm](https://pnpm.io), a Rust toolchain via
+`rustup`, and [Git LFS](https://git-lfs.com) (the bundled binaries are LFS
+objects). End users need no runtime of any kind.
 
 ```bash
+git lfs install
 pnpm install
 pnpm tauri dev
 ```
 
-In dev, Kitty launches the daemon with `cargo run` against
-`plugins/bigtiny_rust/`, so `pnpm tauri dev` works before `plugins/build.py`
-has ever run.
+If no built engine is bundled, dev runs it with `cargo run` against
+`BigTinyV2/daemon/`, so `pnpm tauri dev` works before `plugins/build.py` has
+ever run.
 
 ### Commands
 
@@ -157,22 +149,22 @@ has ever run.
 | `pnpm build` | `tsc && vite build` |
 | `pnpm test` | `vitest run` |
 | `pnpm lint` | `eslint . && prettier --check .` |
-| `cargo test` (in `src-tauri/`) | Rust unit tests |
-| `cargo clippy` (in `src-tauri/`) | Rust lint |
-| `cargo test` (in `plugins/<name>/`) | A bundled plugin's own suite |
-| `python plugins/build.py` | Build all four bundled binaries |
+| `cargo test` / `cargo clippy` (in `src-tauri/`) | Rust tests and lint |
+| `cargo ndk -t arm64-v8a clippy --lib` (in `src-tauri/`) | Android lint |
+| `cargo test` (in `BigTinyV2/daemon/`, `plugins/<name>/`) | The engine's and a plugin's own suites |
+| `python plugins/build.py [target]` | Build the bundled binaries and update `manifest.json` |
+| `python plugins/build.py --verify-manifest` | Check the committed binaries match their source |
 
-`plugins/build.py` is the one place Python is still involved, and only as a
-script runner: every target it builds is Rust (`cargo build --release`). It
-exists because it owns the target-triple naming convention Tauri's
-`externalBin` expects.
+`plugins/build.py` is a script runner only: every target it builds is Rust
+(`cargo build --release`). It owns the target-triple naming Tauri's
+`externalBin` expects, stages the LiteRT runtime DLLs, and records a source
+hash per binary in `src-tauri/binaries/manifest.json`.
 
 ### Building a release
 
-`src-tauri/binaries/` holds committed placeholder `.exe`s so a fresh clone can
-`cargo check` — Tauri validates that every `externalBin` entry exists on disk
-even for a plain build. Those placeholders cannot run, so build the real ones
-first:
+The binaries in `src-tauri/binaries/` are committed through Git LFS; a clone
+without LFS gets pointer files, which CI refuses. After changing the engine or
+a plugin, rebuild it and commit the result:
 
 ```bash
 python plugins/build.py
@@ -182,11 +174,10 @@ pnpm tauri build
 Android, which needs an explicit target:
 
 ```bash
-pnpm tauri android build --apk --target aarch64
+pnpm tauri android build --aab --target aarch64
 ```
 
-`docs/RELEASE.md` has both lanes in full, including the LiteRT runtime files
-the Windows daemon needs bundled alongside it.
+`docs/RELEASE.md` has both lanes in full.
 
 ## Documentation
 
@@ -199,5 +190,6 @@ the Windows daemon needs bundled alongside it.
 | [`docs/RELEASE.md`](docs/RELEASE.md) | Build and release checklist, both platforms |
 | [`docs/VERSIONS.md`](docs/VERSIONS.md) | Pinned versions and verified external contracts |
 | [`docs/BACKLOG.md`](docs/BACKLOG.md) | Known gaps and deferred work |
-| [`docs/bigtiny-backend.md`](docs/bigtiny-backend.md) | The daemon contract from Kitty's side |
+| [`docs/bigtiny-backend.md`](docs/bigtiny-backend.md) | The engine contract from Kitty's side |
+| [`BigTinyV2/API.md`](BigTinyV2/API.md) | The engine's routes |
 | [`src/themes/README.md`](src/themes/README.md) | The theming contract for custom CSS |

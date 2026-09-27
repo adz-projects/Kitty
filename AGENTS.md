@@ -62,8 +62,11 @@ You must strictly follow this 4-step loop for all tasks beyond simple single-fil
 | `pnpm test` | root | `vitest run` |
 | `cargo clippy` | `src-tauri/` | Rust lint |
 | `cargo test` | `src-tauri/` | Rust unit tests |
-| `cargo test`, `cargo clippy` | `plugins/bigtiny_rust/` (and each Rust plugin dir) | Backend/plugin Rust tests |
-| `python plugins/build.py` | root | Build the 4 bundled binaries to `.exe` (**desktop only**) |
+| `cargo ndk -t arm64-v8a clippy --lib --tests -- -D warnings` | `src-tauri/` | Android lint (the Android-gated code and tests) |
+| `cargo test`, `cargo clippy` | `BigTinyV2/daemon/`, `BigTinyV2/client/`, `BigTinyV2/protocol/` and each Rust plugin dir | Engine/plugin Rust tests |
+| `python plugins/build.py [target]` | root | Build the bundled binaries (**desktop only**) and update `src-tauri/binaries/manifest.json` |
+| `python plugins/build.py --verify-manifest` | root | Check the committed binaries match their source (CI) |
+| `python scripts/check_versions.py` | root | Check every Kitty-owned version agrees (CI) |
 
 ### Android lane
 
@@ -78,9 +81,9 @@ code any more.
 
 | Command | Where | What |
 |---------|-------|------|
-| `cargo ndk -t arm64-v8a --platform 26 check --lib` | `src-tauri/` | The gating check, also run in CI (`.github/workflows/android.yml`). **`cargo check --target aarch64-linux-android` is not a substitute** — it does not set the NDK sysroot or linker, so it passes and fails for reasons unrelated to the build that ships. `--platform 26` must match `minSdk`. |
+| `cargo ndk -t arm64-v8a --platform 26 check --lib` | `src-tauri/` | The gating check. **`cargo check --target aarch64-linux-android` is not a substitute** — it does not set the NDK sysroot or linker, so it passes and fails for reasons unrelated to the build that ships. `--platform 26` must match `minSdk`. CI (`.github/workflows/ci.yml`) builds the whole AAB. |
 | `pnpm tauri android dev` | root | Dev loop on a connected device |
-| `pnpm tauri android build` | root | Release AAB |
+| `pnpm tauri android build --aab --target aarch64` | root | Release AAB |
 | `pnpm tauri android build --apk` | root | APK for sideloading |
 
 **Do not run `plugins/build.py` for Android.** There are no Android sidecars
@@ -96,17 +99,17 @@ excludes the build tree and the staged `.so`.
 
 **Dev prerequisite**: none beyond the normal Rust/Node toolchains. BigTiny is **pure Rust** (`BigTinyV2/daemon/`). In dev Kitty runs it via `cargo run --manifest-path BigTinyV2/daemon/Cargo.toml --bin bigtiny2-daemon` (see `config::default_bigtiny_args`), so `pnpm tauri dev` works before `plugins/build.py` has ever run. `plugins/bigtiny_rust/` is **V1**: frozen, unbuilt, kept only as the rollback path — do not add to it.
 
-**Release build order**: `python plugins/build.py` then `pnpm tauri build`. The freeze script overwrites placeholder `.exe`s in `src-tauri/binaries/` with real executables. Packaging with placeholders produces a non-functional app.
+**Release build order**: `python plugins/build.py` then `pnpm tauri build`. The binaries in `src-tauri/binaries/` are committed through **Git LFS**; after changing the engine or a plugin, rebuild it and commit the binary with its `manifest.json` entry (CI's `--verify-manifest` fails otherwise). A clone without LFS has pointer files, which CI rejects.
 
 ## Architecture at a glance
 
 - **Tauri v2**, two targets: **Windows** (NSIS) and **Android** (AAB). Rust core (`src-tauri/`) + React 18/TS/Vite frontend (`src/`), shared by both.
 - **3 window entry points**: `hub`, `overlay`, `screenshot-select`. Vite is a multipage build — see `vite.config.ts` rollup inputs (single `WINDOWS` array mirrors `windows.rs::url()`). Each has its own `index.html` under `src/windows/<label>/`. `hub` routes between chat / saved chats / settings / wizard in one window (`routeStore`); it is desktop's full window and Android's entire UI. `overlay` and `screenshot-select` are desktop-only.
 - **Platform branching**: Rust uses `#[cfg(target_os = "android")]` / `#[cfg(desktop)]`; the frontend uses `isAndroid()` from `lib/platform.ts` and the `data-platform` attribute it stamps on the root for CSS. Prefer CSS at the mobile breakpoint over a JS branch where either works.
-- **Backend**: BigTiny **V2** daemon. Pure Rust, source at `BigTinyV2/daemon/`, frozen to `bigtiny2-daemon.exe` on desktop and **linked in-process on Android** (D26). All chat/tool/MCP logic lives there — this app is the client layer. The retired Python-original daemon has been deleted; git history holds it.
+- **Backend**: BigTiny **V2** engine. Pure Rust, source at `BigTinyV2/daemon/`, built to `bigtiny2-daemon.exe` on desktop (a shared engine other apps attach to too — changes must be additive and app-scoped) and **linked in-process on Android** (D26). All chat/tool/MCP/scheduling logic lives there — this app is the client layer.
 - **Config**: `%APPDATA%/Kitty/config.json` on Windows, the app-private data dir on Android (`config::app_base_dir`). **Secrets**: Windows Credential Manager via `keyring` (service `kitty`), never `config.json`, never JS. On Android `keyring` is excluded from the dependency graph entirely (it has no Android backend and silently degrades to an in-memory mock — D24); secrets there are AES-256-GCM sealed under a non-exportable AndroidKeyStore key (`SecretStore.kt` behind `src/android/secrets.rs`), dispatched from the same `config::providers::keyring` facade.
 - **Plugin integration patterns** (critical distinction, see `docs/PLUGINS.md`):
-  - *Kitty-managed process*: Kitty spawns, monitors via `ManagedProcess`/health loop. Pattern: `lifecycle/<name>_proc.rs`. Holds exactly one thing: the BigTiny daemon (`bigtiny_proc.rs`), and only on desktop — Android hosts the same daemon in-process (`bigtiny_embedded.rs`) behind the same HTTP boundary.
+  - *The engine*: on desktop Kitty attaches to it (`lifecycle/bigtiny_v2.rs`) and starts it only if none is running; it never kills it. Android hosts it in-process (`bigtiny_embedded.rs`) behind the same HTTP boundary.
   - *BigTiny-managed MCP server* (stdio: `kitty-tools`, `kitty-web`, `kitty-wasm`): BigTiny spawns/owns. Kitty only upserts the registration via `bigtiny::mcp::ensure_builtin_servers`. No `ManagedProcess`.
   - *In-process MCP server* (non-desktop hosts that can't `exec()`, plus `pathway` and `specialists` on every host): the server links in as a library over an in-memory pipe — see `mcp::builtin` in `BigTinyV2/daemon/` (`docs/PLUGINS.md`). Its `BUILTIN_SERVERS` and Kitty's `REGISTERED_BUILTINS` (`bigtiny::mcp`) are two halves of one contract: a builtin with no row registered is a tool the model is never offered.
   - **Never mix** — two supervisors racing one child is a bug.
@@ -124,11 +127,12 @@ excludes the build tree and the staged `.so`.
 
 - Every `#[tauri::command]` returns `Result<T, String>` with user-safe messages. Log details with `tracing`, don't surface internals.
 - `thiserror` for error enums per module.
-- The Rust plugins (`plugins/bigtiny_rust/`, `plugins/kitty-tools/`, `plugins/kitty-web/`, `plugins/kitty-wasm/`) are **standalone crates**, NOT workspace members of `src-tauri` (MSRV isolation, workspace-root-only `[profile.*]`, feature-unification reasons — see their `Cargo.toml` doc comments / `docs/PLUGINS.md`). `bigtiny_rust` depends on `kitty-tools` as a path dep purely for the in-process MCP server.
+- The engine (`BigTinyV2/daemon/`) and the Rust plugins (`plugins/kitty-tools/`, `plugins/kitty-web/`, `plugins/kitty-wasm/`, the memory engines) are **standalone crates**, NOT workspace members of `src-tauri` (MSRV isolation, workspace-root-only `[profile.*]`, feature-unification reasons — see their `Cargo.toml` doc comments / `docs/PLUGINS.md`). The engine depends on the plugins as path deps for the in-process MCP servers.
 
 ## Gotchas
 
-- Tauri validates every `bundle.externalBin` entry exists on disk at **any** build time (even `cargo check`), resolved *by target triple*. Empty placeholder `.exe`s in `src-tauri/binaries/` are committed for this reason, and it is why Android needs `tauri.android.conf.json` to clear the list — otherwise the build demands `*-aarch64-linux-android` artifacts and fails in the build script, before any Rust compiles.
+- Tauri validates every `bundle.externalBin` entry exists on disk at **any** build time (even `cargo check`), resolved *by target triple*. That is why Android needs `tauri.android.conf.json` to clear the list — otherwise the build demands `*-aarch64-linux-android` artifacts and fails in the build script, before any Rust compiles.
 - The frontend never fetches `localhost` directly — all network calls go through the Rust side to keep secrets out of JS and avoid CORS.
 - `state.rs` (`AppState`) is the single managed state object. Everything reads/writes through it.
-- For module-level architecture, read `docs/ARCHITECTURE.md` (current, accurate). `CLAUDE.md` has the authoritative spec but its repository layout section is historical/aspirational.
+- For module-level architecture, read `docs/ARCHITECTURE.md`. `CLAUDE.md` is the spec; its phased plan is historical.
+- Settings are written with `ipc.patchConfig` (only the fields that changed); `null` clears a field. Don't write back a whole `Config` snapshot.

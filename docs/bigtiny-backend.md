@@ -1,110 +1,79 @@
 # BigTiny backend
 
-Kitty is driven by **BigTiny**, the chat-first REST/SSE daemon — its only chat
-backend. The goosed/ACP integration this app originally shipped with has been
-removed entirely; see `docs/ARCHITECTURE.md` for the current module map.
+Kitty is driven by **BigTiny V2** (`BigTinyV2/daemon`, binary
+`bigtiny2-daemon`), a chat-first REST/SSE engine and Kitty's only backend. It
+is multi-app: on desktop Kitty is one *client* of a shared engine, not its
+owner. On Android the same engine is linked in and hosted in-process. V1
+(`plugins/bigtiny_rust/`) is frozen and unused; a V1 install's data is
+imported from the hub (`commands/v1_import.rs` → `POST /api/apps/me/import-v1`).
 
-**Desktop runs BigTiny V2** (`BigTinyV2/daemon`, binary `bigtiny2-daemon`), a
-multi-app orchestrator that Kitty is one *client* of rather than the owner of.
-**Android still runs V1** (`plugins/bigtiny_rust/`) in-process and migrates
-separately. V1 stays in the tree, frozen and buildable, as the rollback path.
+`BigTinyV2/API.md` is the source of truth for routes. This page is the contract
+from Kitty's side.
 
-## Launching it
+## Finding the engine
 
-`bigtiny_command`/`bigtiny_args`/`bigtiny_dir` in `%APPDATA%\Kitty\config.json`
-control how the daemon is spawned:
+- **Desktop** (`lifecycle/bigtiny_v2.rs`, over `bigtiny2-client`): read
+  `%APPDATA%\BigTinyV2\daemon.json`, check the process behind it is a V2 engine
+  with API version ≥ 2, and spawn one under a lock only when none is running.
+  `bigtiny_command` / `bigtiny_args` in `config.json` default to the bundled
+  `bigtiny2-daemon.exe`; in a source checkout with no bundled exe they fall
+  back to `cargo run --manifest-path <repo>/BigTinyV2/daemon/Cargo.toml --bin
+  bigtiny2-daemon`. The engine picks its own port and keeps its own data
+  directory (`%APPDATA%\BigTinyV2`) and at-rest key (DPAPI-protected).
+- **Android** (`lifecycle/bigtiny_embedded.rs`): started in-process on a
+  loopback port, with its data under the app's private directory and its
+  at-rest key supplied from the SecretStore.
+- **Identity** (`lifecycle/bigtiny_app_key.rs`): Kitty registers once as the
+  app `kitty` and keeps the issued key in the secret store, sending it as
+  `X-API-Key`. At attach the stored key is checked (`GET /api/apps/me`); a
+  lost key is reclaimed with the handshake's registration token
+  (`POST /api/apps/reclaim`), keeping Kitty's data.
+- **Health** (`lifecycle/health.rs`): `GET /api/health` (open, by design).
+  When the engine stops answering, Kitty re-reads the handshake and re-attaches
+  if the engine came back elsewhere.
+- **Restart** (`lifecycle/engine_restart.rs`): Kitty never kills the engine.
+  When a start-up setting changes it calls `POST /api/admin/restart`; the
+  engine refuses while another app is attached or busy and names it, and
+  `force` overrides only the other-app check. Android applies such settings
+  the next time Kitty starts.
+- **Uninstall** (`uninstall.rs`): `kitty.exe --uninstall-cleanup` calls
+  `DELETE /api/apps/me?purge=true`, which removes only Kitty's data.
 
-- **Normal installs**: `bigtiny_command` defaults to the bundled
-  `bigtiny2-daemon.exe` (built via `plugins/build.py`, shipped next to
-  Kitty's own exe through Tauri's `externalBin`) with empty `bigtiny_args`.
-  Nothing to configure — this is fully internalized and never surfaced to
-  the user.
-- **Dev / source checkout**: if no bundled exe is present (e.g. running via
-  `cargo tauri dev`), `bigtiny_command` falls back to `cargo` and
-  `bigtiny_args` to a `run --quiet --manifest-path <repo>/BigTinyV2/
-  daemon/Cargo.toml --bin bigtiny2-daemon`. The manifest path is
-  resolved from this crate's own compile-time location, so it is correct
-  regardless of the working directory `cargo tauri dev` ran from. **No Python
-  and no separate install step** — the daemon is Rust and builds from source.
+## What the Rust layer does (`src-tauri/src/bigtiny/`)
 
-  On Android neither applies: the daemon is linked in and hosted in-process
-  (`lifecycle/bigtiny_embedded.rs`), because Android 10+ refuses to `exec()`
-  a binary in app-writable storage.
-
-## What the Rust layer does (src-tauri/src/bigtiny/)
-
-- **Lifecycle** (`lifecycle/bigtiny_v2.rs`): attach-or-spawn through
-  `bigtiny2-client`. No port is chosen here — the daemon binds an ephemeral one
-  and publishes it in `%APPDATA%\BigTinyV2\daemon.json`. No secret is minted
-  either: Kitty registers once as the app `kitty` and stores the issued key in
-  the Credential Manager, sending it as `X-API-Key` on every request. Nothing
-  kills a daemon; there is no pidfile and no stale-orphan sweep, because a
-  daemon Kitty finds may belong to another application. Readiness and the 5s
-  health loop still probe `GET /api/health` (open without auth by design). Also passes `BIGTINY_DATA_DIR` (`config::bigtiny_data_dir()`)
-  pointing at `%APPDATA%/Kitty/bigtiny/` — consolidates BigTiny's own db,
-  directory-sandbox cache dir there instead of its
-  standalone `~/.bigtiny` default; a one-time
-  migration moves an existing `~/.bigtiny` over the first time this runs
-  post-upgrade. Readiness and the 5s health loop probe `GET /api/health`
-  (open without auth by design). A pidfile-based stale-orphan kill (mirrors
-  `adaptive_pathway_proc`, now anchored to the same consolidated dir) handles
-  the daemon getting orphaned across a `tauri dev` hot-restart.
-- **Sessions** (`bigtiny/sessions.rs`): create/list/load/fork/delete over
-  REST. `list` translates BigTiny rows into a `sessionId`/`title`/`cwd`/
-  `updatedAt` shape the frontend's `parseSession` reads; `load` replays
-  history as `chat://user-message` / `chat://message-delta` /
-  `chat://tool-call` events; `fork` maps the frontend's "keep the first N UI
-  bubbles" index onto BigTiny's inclusive `at_message_id` truncation.
-- **Streaming** (`bigtiny/stream.rs`): `POST /api/chat/{id}/send` SSE frames →
-  `llm_delta`→`chat://message-delta`, `reasoning_delta`→`chat://reasoning-delta`,
-  `tool_start`/`tool_finish`→`chat://tool-call` (also feeds the
-  adaptive-pathway `record_outcome` backstop, tool-name-filtered against the
-  adaptive-pathway MCP tools themselves), `hitl_pause`→
-  `chat://tool-approval-needed` (answered via `POST /approve`; `allow_once`→
-  `allow`, `allow_always`→`always_allow`, reject/cancel→`reject`),
-  `session_title`→`chat://session-title`, `llm_stop` usage + final frame →
-  `chat://complete` with `{stopReason, usage}`. The stream reader stops at the
-  terminal (`is_last`) frame, so events the daemon emits from its own post-turn
-  background tasks land on a connection nobody is reading: both `compaction`
-  and `session_title` are therefore *polled* for after the turn
-  (`poll_compaction_status` / `poll_session_title`) rather than relied on
-  arriving over SSE.
-- **Providers** (`bigtiny/providers.rs`): activating a Kitty provider profile
-  registers/updates it in BigTiny over `POST/PATCH /api/providers` — no
-  daemon restart needed. `anthropic` maps to BigTiny's native Anthropic
-  client; everything else (`ollama`, `openrouter`, `openai`, `custom_openai`)
-  maps to `openai_compat` with any trailing `/v1` stripped (BigTiny appends
-  `/v1/chat/completions` itself). The API key travels once over localhost and
-  lands in BigTiny's own Windows-keyring entry. A provider must always be
-  active — BigTiny has no built-in default and errors any send with none
-  registered.
-- **MCP servers** (`bigtiny/mcp.rs`): list/add/update/delete/connect over
-  `/api/mcp/servers`, surfaced in Settings → MCP Servers. Also
-  `ensure_builtin_servers`, the self-healing upsert (keyed by name) that
-  keeps Kitty's two bundled plugins — `replacement-mcp` and
-  `adaptive-pathway` (its `decide`/`record_outcome` tools) — registered
-  against the current install's bundled exe path, run on every daemon
-  startup and whenever their Settings toggle changes.
+- **Sessions** (`sessions.rs`): create, page (`offset`/`limit` with a total),
+  full-text search (`/api/search`), load, fork, rename, delete. `load` replays
+  history as `chat://user-message` (with attachment chips, scaffolding
+  stripped — `turn_text.rs`), `chat://reasoning-delta` (stored reasoning),
+  `chat://message-delta` and `chat://tool-call` events.
+- **Streaming** (`stream.rs`): `POST /api/chat/{id}/send` SSE frames →
+  `chat://message-delta`, `chat://reasoning-delta`, `chat://tool-call`
+  (`is_error` honoured; results over 100 KB truncated, fetchable in full),
+  `chat://notice` (model failover, step limit), `chat://complete`,
+  `chat://error` with a typed `error_type`. 15 s keepalives reset the idle
+  timeout, which is the chat's own provider's. `/api/chat/{id}/stream` follows
+  a turn running elsewhere (a specialist being watched).
+- **App events** (`lifecycle/app_events.rs`): `GET /api/apps/me/events` — HITL
+  pauses and resolutions for any of Kitty's chats, schedule runs, titles.
+  Approvals are decided in `approvals.rs` and answered with
+  `POST /api/chat/{id}/approve` (with an `args_pattern` for a scoped "always
+  allow"); `GET /api/apps/me/pending` recovers any that paused while Kitty was
+  not listening.
+- **Providers** (`providers.rs`): every card is synced into the engine
+  (`POST/PATCH/DELETE /api/providers`), with every optional setting sent
+  (null when unset) so a cleared value clears, plus `supports_tools` and the
+  delegate-host hints. The default card is Kitty's per-app default.
+- **MCP servers** (`mcp.rs`): CRUD over `/api/mcp/servers`, and
+  `ensure_builtin_servers`, which keeps the bundled servers registered against
+  the current install and reports what it could not sync.
+- **Specialists, schedules, memory**: thin wrappers over `/api/specialists`,
+  `/api/schedules`, `/api/pathway/*`, `/api/memorabilia/*`; the memory engines
+  are switched per app with `PUT /api/apps/me/plugins/{plugin}`.
 
 ## Deliberately different from the old goosed/ACP path
 
-- **No approval modes** (`auto`/`approve`/`smart_approve`): HITL policy is
-  enforced daemon-side; `set_mode` is a no-op and sessions advertise no
-  modes. The client-side chat/agentic override works as before.
-- **No thinking-effort control**: `thinking_effort` is always `null`, so the
-  UI hides the dropdown.
-- **Specialists replaced recipes**: a specialist's tool set is a per-run
-  allow-list over the daemon's own MCP registry (`tool_allow` in session
-  metadata, enforced at dispatch), so there is no per-session extension to
-  attach and nothing to skip.
-- **Session list carries no provider/model memory** yet — resumed sessions
-  stay on the currently-active provider.
-- **No context-management-strategy setting** — goosed's `GOOSE_CONTEXT_STRATEGY`
-  (summarize/truncate/clear/ask) had no BigTiny equivalent, so the Settings →
-  Advanced control for it was removed rather than left silently inert.
-- **No MOIM-style prompt nudge** — the file-save-path and adaptive-pathway
-  self-call nudges goosed injected via `GOOSE_MOIM_MESSAGE_TEXT` every turn
-  have no BigTiny equivalent; the adaptive-pathway `record_outcome` backstop
-  in `bigtiny/stream.rs` covers rewards, but not the model proactively
-  calling `decide` with real `context`. Backlog item if BigTiny grows a
-  system-prompt-injection mechanism.
+- **No approval modes**: one policy, decided by Kitty (see `approvals.rs`),
+  with scoped "always allow" rules the user can revoke.
+- **Specialists replaced recipes**: the model delegates; there is no `/slug`.
+- **No context-strategy setting**: compaction is the engine's, with the local
+  summarizer (Windows, optional) or the chat's provider.
