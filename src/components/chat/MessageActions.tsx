@@ -1,16 +1,17 @@
 import { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { useChatStore, type Message } from '@/stores/chatStore';
+import { isLatestAnswer, useChatStore, type Message } from '@/stores/chatStore';
 import { useMobileUiStore } from '@/stores/mobileUiStore';
 import { usePopoverPosition } from '@/lib/usePopoverPosition';
 import { isAndroid } from '@/lib/platform';
 import { MessageInfo } from './MessageInfo';
 import { BranchIcon } from '@/components/icons/BranchIcon';
-import { ExportIcon } from '@/components/icons/ExportIcon';
 import { RefreshIcon } from '@/components/icons/RefreshIcon';
 import { CopyIcon } from '@/components/icons/CopyIcon';
 
-/** Branch / Export / Regenerate / Copy / info for one message.
+/** Branch / Export / Regenerate / Copy / info for one message. Regenerate
+ * appears on the latest answer only, and Branch/Regenerate wait while the chat
+ * is replying. Export is desktop-only (see `exportSession`).
  *
  * Desktop: a hover-revealed row of text buttons under the message.
  * Android: nothing until the message is tapped (`MessageItem` toggles
@@ -32,6 +33,9 @@ function useMessageActionHandlers(message: Message, index: number) {
   const branch = useChatStore((s) => s.branch);
   const regenerate = useChatStore((s) => s.regenerate);
   const exportSession = useChatStore((s) => s.exportSession);
+  // Branching or regenerating mid-reply would cut the reply off (#41).
+  const chatBusy = useChatStore((s) => s.busy);
+  const canRegenerate = useChatStore((s) => isLatestAnswer(s.messages, index));
 
   // Branch/Regenerate/Export each fire a backend round-trip (fork/prompt/
   // export). Latch while one is running so a double-tap can't fork twice or
@@ -71,6 +75,8 @@ function useMessageActionHandlers(message: Message, index: number) {
 
   return {
     busy,
+    chatBusy,
+    canRegenerate,
     copied,
     copy,
     branch: runOnce(() => branch(index)),
@@ -79,11 +85,17 @@ function useMessageActionHandlers(message: Message, index: number) {
   };
 }
 
+const BUSY_TITLE = 'Wait for the reply to finish';
+
 function DesktopMessageActions({ message, actions }: { message: Message; actions: Handlers }) {
-  const { busy, copied } = actions;
+  const { busy, chatBusy, copied } = actions;
   return (
     <div className="msg-actions">
-      <button title="Branch a new session from here" disabled={busy} onClick={actions.branch}>
+      <button
+        title={chatBusy ? BUSY_TITLE : 'Branch a new session from here'}
+        disabled={busy || chatBusy}
+        onClick={actions.branch}
+      >
         Branch
       </button>
       <button
@@ -93,17 +105,22 @@ function DesktopMessageActions({ message, actions }: { message: Message; actions
       >
         Export from here
       </button>
-      {message.role === 'assistant' && (
-        <>
-          <button title="Regenerate this response" disabled={busy} onClick={actions.regenerate}>
-            Regenerate
-          </button>
-          <button title="Copy as Markdown" onClick={actions.copy}>
-            {copied ? 'Copied' : 'Copy'}
-          </button>
-          <MessageInfo message={message} />
-        </>
+      {message.role === 'assistant' && actions.canRegenerate && (
+        <button
+          title={chatBusy ? BUSY_TITLE : 'Regenerate this response'}
+          disabled={busy || chatBusy}
+          onClick={actions.regenerate}
+        >
+          Regenerate
+        </button>
       )}
+      <button
+        title={message.role === 'assistant' ? 'Copy as Markdown' : 'Copy'}
+        onClick={actions.copy}
+      >
+        {copied ? 'Copied' : 'Copy'}
+      </button>
+      {message.role === 'assistant' && <MessageInfo message={message} />}
     </div>
   );
 }
@@ -153,20 +170,17 @@ function MobileMessageActions({ message, actions }: { message: Message; actions:
               style={style}
               onClick={(e) => e.stopPropagation()}
             >
-              <button role="menuitem" disabled={actions.busy} onClick={() => pick(actions.branch)}>
-                <BranchIcon /> Branch
-              </button>
               <button
                 role="menuitem"
-                disabled={actions.busy}
-                onClick={() => pick(actions.exportFromHere)}
+                disabled={actions.busy || actions.chatBusy}
+                onClick={() => pick(actions.branch)}
               >
-                <ExportIcon /> Export
+                <BranchIcon /> Branch
               </button>
-              {assistant && (
+              {assistant && actions.canRegenerate && (
                 <button
                   role="menuitem"
-                  disabled={actions.busy}
+                  disabled={actions.busy || actions.chatBusy}
                   onClick={() => pick(actions.regenerate)}
                 >
                   <RefreshIcon /> Regenerate

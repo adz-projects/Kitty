@@ -31,6 +31,15 @@ export function untrustedWarning(
   return `${what} will be sent to ${s.providerHost ?? 'this provider'}, which you haven't marked trusted.`;
 }
 
+/** Whether the message at `index` is the one Regenerate applies to: the
+    latest answer (#39). Regenerating an older one would hide it and append the
+    new answer at the bottom, out of place. Pure. */
+export function isLatestAnswer(messages: Message[], index: number): boolean {
+  const m = messages[index];
+  if (!m || m.role !== 'assistant' || m.superseded) return false;
+  return !messages.slice(index + 1).some((x) => x.role === 'assistant' && !x.superseded);
+}
+
 export const closeOpen = (msgs: Message[]): Message[] =>
   msgs.map((m) => (m.open ? { ...m, open: false, streaming: false } : m));
 

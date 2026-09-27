@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { hasSomethingToSend, untrustedWarning } from './messageUtils';
+import { hasSomethingToSend, isLatestAnswer, untrustedWarning } from './messageUtils';
+import type { Message } from './types';
 
 const empty = { droppedFiles: [], attachments: [], pendingImages: [] };
 
@@ -22,5 +23,33 @@ describe('untrustedWarning', () => {
     expect(untrustedWarning('x', { ...remote, isTrusted: true })).toBeNull();
     expect(untrustedWarning('x', { ...remote, providerTier: 'local' })).toBeNull();
     expect(untrustedWarning('x', { ...remote, providerTier: null })).toBeNull();
+  });
+});
+
+
+const msg = (role: 'user' | 'assistant', superseded = false): Message => ({
+  id: Math.random().toString(),
+  role,
+  text: 'x',
+  reasoning: '',
+  toolCalls: [],
+  streaming: false,
+  open: false,
+  superseded,
+});
+
+describe('isLatestAnswer', () => {
+  it('offers Regenerate on the latest answer only', () => {
+    const list = [
+      msg('user'),
+      msg('assistant'),
+      msg('user'),
+      msg('assistant', true),
+      msg('assistant'),
+    ];
+    expect(isLatestAnswer(list, 1)).toBe(false);
+    expect(isLatestAnswer(list, 3)).toBe(false);
+    expect(isLatestAnswer(list, 4)).toBe(true);
+    expect(isLatestAnswer(list, 2)).toBe(false);
   });
 });
