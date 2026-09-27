@@ -1,5 +1,6 @@
 import { memo, useCallback, useMemo, useState } from 'react';
-import { specialistToolTitle, type ToolCall } from '@/stores/chatStore';
+import { specialistToolTitle, useChatStore, type ToolCall } from '@/stores/chatStore';
+import { ipc } from '@/lib/ipc';
 import { ToolsIcon } from '@/components/icons/ToolsIcon';
 
 function stringify(v: unknown): string {
@@ -25,8 +26,29 @@ function stringify(v: unknown): string {
     frames on a big shell/file-read output (MINOR_BUGS.md #9). */
 export const ToolCallCard = memo(function ToolCallCard({ call }: { call: ToolCall }) {
   const [open, setOpen] = useState(false);
+  // The whole result, fetched on request when the card only got part of it.
+  const [full, setFull] = useState<string | null>(null);
+  const [fetching, setFetching] = useState(false);
+  const [fetchError, setFetchError] = useState<string | null>(null);
   const input = useMemo(() => (open ? stringify(call.input) : ''), [open, call.input]);
-  const output = useMemo(() => (open ? stringify(call.output) : ''), [open, call.output]);
+  const output = useMemo(
+    () => (open ? (full ?? stringify(call.output)) : ''),
+    [open, call.output, full]
+  );
+  const canFetch = call.truncated && call.daemonToolCallId && full === null;
+  const showFull = async () => {
+    const sessionId = useChatStore.getState().sessionId;
+    if (!sessionId || !call.daemonToolCallId) return;
+    setFetching(true);
+    setFetchError(null);
+    try {
+      setFull(await ipc.fetchFullToolResult(sessionId, call.daemonToolCallId));
+    } catch (e) {
+      setFetchError(String(e));
+    } finally {
+      setFetching(false);
+    }
+  };
   const onToggle = useCallback((e: React.SyntheticEvent<HTMLDetailsElement>) => {
     setOpen(e.currentTarget.open);
   }, []);
@@ -51,6 +73,12 @@ export const ToolCallCard = memo(function ToolCallCard({ call }: { call: ToolCal
             <pre>{output}</pre>
           </>
         )}
+        {canFetch && (
+          <button className="link" disabled={fetching} onClick={() => void showFull()}>
+            {fetching ? 'Loading…' : 'Show full output'}
+          </button>
+        )}
+        {fetchError && <p className="error">{fetchError}</p>}
       </div>
     </details>
   );

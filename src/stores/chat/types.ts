@@ -11,6 +11,10 @@ export interface ToolCall {
       the Adaptive Pathway extension's `decide` (Round-C). */
   toolName?: string;
   extensionName?: string;
+  /** The result shown is cut short; the whole of it can be fetched by
+      `daemonToolCallId` ("Show full output"). */
+  truncated?: boolean;
+  daemonToolCallId?: string;
 }
 
 export interface Message {
@@ -68,6 +72,9 @@ export interface Message {
       reconsidered answer right after it, in the same session — rendered
       collapsed (like the thinking container) instead of as a normal bubble. */
   superseded?: boolean;
+  /** Things the user should know about how this reply was produced — a
+      model failover, the step limit — shown under it (`chat://notice`). */
+  notices?: string[];
 }
 
 export interface Artifact {

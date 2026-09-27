@@ -26,6 +26,12 @@ export function humanizeChatError(raw: string, errorType?: string): string {
   if (errorType === 'network_unreachable') {
     return "Kitty couldn't reach this provider. Check your connection (or the provider's own status) and try sending again.";
   }
+  if (errorType === 'turn_in_progress') {
+    return 'This chat is still finishing its previous reply. Wait for it to end (or stop it), then send again.';
+  }
+  if (errorType === 'idle_timeout') {
+    return 'The provider stopped responding partway through, so Kitty stopped waiting. Try sending again; a slow local server may need a longer wait in its provider settings.';
+  }
   const r = raw.toLowerCase();
   if (r.includes('timed out')) {
     return 'The response took too long and Kitty gave up waiting. Try sending again.';

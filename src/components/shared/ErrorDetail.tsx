@@ -10,6 +10,8 @@ const ERROR_TITLE: Record<string, string> = {
   insufficient_credits: 'Insufficient credits',
   auth_failed: 'Authentication failed',
   network_unreachable: "Can't reach provider",
+  turn_in_progress: 'Still replying',
+  idle_timeout: 'Provider stopped responding',
 };
 
 /** Humanized error text in a calm card (icon + headline + body + actions),
@@ -26,16 +28,18 @@ export function ErrorDetail({
   errorType,
   onNewSession,
   onOpenProviderSettings,
+  onBranchProvider,
 }: {
   summary: string;
   raw?: string;
   errorType?: string;
   onNewSession?: () => void;
-  /** Opens Settings → Providers — the right next step for both
-      "insufficient_credits" (switch to a provider with credit) and
-      "auth_failed" (fix the stored key), so one prop covers both rather
-      than two near-identical handlers. */
+  /** Opens Settings → Providers at this chat's card — for a bad key, an
+      unreachable host or a provider that stopped responding. */
   onOpenProviderSettings?: () => void;
+  /** Continue this conversation on another provider card (a chat stays on
+      its own provider; moving means branching). */
+  onBranchProvider?: () => void;
 }) {
   const [open, setOpen] = useState(false);
   const title = (errorType && ERROR_TITLE[errorType]) || 'Something went wrong';
@@ -52,12 +56,23 @@ export function ErrorDetail({
             New Session
           </button>
         )}
-        {(errorType === 'insufficient_credits' || errorType === 'auth_failed') &&
+        {(errorType === 'auth_failed' ||
+          errorType === 'network_unreachable' ||
+          errorType === 'idle_timeout') &&
           onOpenProviderSettings && (
             <button type="button" className="link" onClick={onOpenProviderSettings}>
-              {errorType === 'auth_failed' ? 'Check API Key' : 'Switch Provider'}
+              {errorType === 'auth_failed' ? 'Check API Key' : 'Provider settings'}
             </button>
           )}
+        {errorType === 'insufficient_credits' && (onBranchProvider || onOpenProviderSettings) && (
+          <button
+            type="button"
+            className="link"
+            onClick={onBranchProvider ?? onOpenProviderSettings}
+          >
+            {onBranchProvider ? 'Branch to another provider' : 'Provider settings'}
+          </button>
+        )}
         {raw && raw !== summary && (
           <button type="button" className="link" onClick={() => setOpen((o) => !o)}>
             {open ? 'Hide details' : 'Show details'}

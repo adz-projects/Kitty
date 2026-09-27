@@ -12,6 +12,7 @@ import { ChatView } from '@/components/chat/ChatView';
 import { SessionList } from '@/components/sessions/SessionList';
 import { ArtifactsPane } from '@/components/artifacts/ArtifactsPane';
 import { ChatHeaderControls } from '@/components/chat/ChatHeaderControls';
+import { HubBanners } from './HubBanners';
 import { NewChatIcon } from '@/components/icons/NewChatIcon';
 import { SettingsGearIcon } from '@/components/icons/SettingsGearIcon';
 import { KittyIcon } from '@/components/icons/KittyIcon';
@@ -184,6 +185,7 @@ export function ChatWorkspace() {
             </button>
           </div>
         </header>
+        <HubBanners />
         <div className="main-body">
           {bootSpinner ? (
             <StartupSpinner />

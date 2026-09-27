@@ -1294,6 +1294,11 @@ button:disabled {
   gap: 8px;
   flex-wrap: wrap;
 }
+/* A line under a reply about how it was produced (failover, step limit). */
+.msg-notice {
+  margin: 4px 0 0;
+  font-size: var(--fs-sm-plus);
+}
 .approval-note {
   margin: 0;
   font-size: var(--fs-sm-plus);

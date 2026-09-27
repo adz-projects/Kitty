@@ -6,6 +6,7 @@ import { useState } from 'react';
 import { ipc } from '@/lib/ipc';
 import { useChatStore } from '@/stores/chatStore';
 import { useStackStore } from '@/stores/stackStore';
+import { isAndroid } from '@/lib/platform';
 import type { StackStatus } from '@/lib/types';
 
 interface Copy {
@@ -60,7 +61,8 @@ export function StackStatusView({ status }: { status: StackStatus }) {
         <button className="primary" onClick={() => ipc.openSettings(section)}>
           Fix this
         </button>
-        {copy.canRestartBackend && (
+        {/* Android hosts the engine in-process; it restarts with the app. */}
+        {copy.canRestartBackend && !isAndroid() && (
           <button
             disabled={busy}
             onClick={async () => {

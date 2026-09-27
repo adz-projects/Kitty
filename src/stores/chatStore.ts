@@ -14,6 +14,7 @@ import {
   onMessageDelta,
   onProviderActivated,
   onProviderHealth,
+  onChatNotice,
   onReasoningDelta,
   onSessionDeleted,
   onSessionsCleared,
@@ -58,6 +59,7 @@ import {
   userFileArtifact,
 } from './chat/messageUtils';
 import type { Artifact, Attachment, Message, PendingImage, ToolCall } from './chat/types';
+import { noticeText } from './chat/notices';
 
 export * from './chat/errorUtils';
 export * from './chat/loopGuards';
@@ -1267,9 +1269,12 @@ export const useChatStore = create<ChatState>((set, get) => {
     },
 
     retryConnection: async () => {
+      const providerId = get().sessionProviderId;
       set({ checkingConnection: true });
       try {
-        await ipc.testActiveProviderConnection();
+        // This chat's own card, not the global default (#9).
+        if (providerId) await ipc.testProviderConnection(providerId);
+        else await ipc.testActiveProviderConnection();
         // A check the user asked for and that passed — same reasoning as the
         // health-tick handler: retire the "can't reach provider" card too,
         // not just the banner, or the retry appears to have done nothing.
@@ -2022,6 +2027,39 @@ export const useChatStore = create<ChatState>((set, get) => {
       });
       // Replay of a "Regenerate": the answer before it was replaced by the
       // one that follows, so collapse it and let the next answer open anew.
+      // Something about how this reply is being produced (a failover, the
+      // step limit): a line under the reply, and for a failover, the model
+      // the reply is credited to.
+      void onChatNotice((e) => {
+        if (!forActive(e.session_id)) return;
+        flushDeltas();
+        const text = noticeText(e);
+        set((s) => {
+          const msgs = s.messages.slice();
+          const last = msgs[msgs.length - 1];
+          const model = e.kind === 'failover' && e.model ? { model: e.model } : {};
+          if (
+            last?.role === 'assistant' &&
+            (last.open || isStragglerAssistantMessage(last, s.busy))
+          ) {
+            msgs[msgs.length - 1] = { ...last, ...model, notices: [...(last.notices ?? []), text] };
+            return { messages: msgs };
+          }
+          const closed = closeOpen(msgs);
+          closed.push({
+            id: newId(),
+            role: 'assistant',
+            text: '',
+            reasoning: '',
+            toolCalls: [],
+            streaming: true,
+            open: true,
+            notices: [text],
+            ...model,
+          });
+          return { messages: closed };
+        });
+      });
       void onSuperseded((e) => {
         if (!forActive(e.session_id)) return;
         flushDeltas();
@@ -2110,6 +2148,9 @@ export const useChatStore = create<ChatState>((set, get) => {
             output: u.rawOutput ?? u.content ?? prev?.output,
             toolName: prev?.toolName ?? meta.toolName,
             extensionName: prev?.extensionName ?? meta.extensionName,
+            truncated: u.truncated === true || prev?.truncated,
+            daemonToolCallId:
+              typeof u.daemonToolCallId === 'string' ? u.daemonToolCallId : prev?.daemonToolCallId,
           };
           if (existing >= 0) toolCalls[existing] = merged;
           else toolCalls.push(merged);
@@ -2128,6 +2169,8 @@ export const useChatStore = create<ChatState>((set, get) => {
       });
 
       void onProviderHealth((h) => {
+        // About one provider card; only a chat on that card is affected (#9).
+        if (h.provider_id !== get().sessionProviderId) return;
         set((s) => ({
           providerOffline: !h.reachable,
           providerHost: h.host ?? s.providerHost,

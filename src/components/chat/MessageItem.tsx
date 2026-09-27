@@ -116,6 +116,11 @@ export const MessageItem = memo(function MessageItem({
           <MarkdownBlocks text={message.text} />
         </div>
       )}
+      {message.notices?.map((n, i) => (
+        <p key={i} className="msg-notice muted" role="note">
+          {n}
+        </p>
+      ))}
       {actions}
     </div>
   );

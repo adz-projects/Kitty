@@ -765,6 +765,8 @@ export const onScheduledTasksChanged = (cb: () => void) =>
   listen('scheduled_tasks://changed', () => cb());
 
 export interface ProviderHealth {
+  /** The card whose reachability this is; only a chat on it cares. */
+  provider_id: string;
   reachable: boolean;
   host?: string;
   name?: string;

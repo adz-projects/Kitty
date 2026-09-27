@@ -16,6 +16,7 @@ import { ErrorDetail } from '@/components/shared/ErrorDetail';
 import { FolderIcon } from '@/components/icons/FolderIcon';
 import { AllowedDirsPopover } from '@/components/chat/AllowedDirsPopover';
 import { useApprovalStore } from '@/stores/approvalStore';
+import { Banner } from '@/components/shared/Banner';
 
 /** The shared chat surface used by both the overlay and the full window
     (CLAUDE.md rule 5).
@@ -46,6 +47,19 @@ export function ChatView() {
   const providerOffline = useChatStore((s) => s.providerOffline);
   const checkingConnection = useChatStore((s) => s.checkingConnection);
   const retryConnection = useChatStore((s) => s.retryConnection);
+  const providerTier = useChatStore((s) => s.providerTier);
+  const sessionProviderId = useChatStore((s) => s.sessionProviderId);
+  // Settings → Providers with this chat's card highlighted.
+  const openProviderSettings = () =>
+    void ipc.openSettings('providers', sessionProviderId ?? undefined);
+
+  // While this chat's provider is unreachable, keep checking; the banner
+  // clears itself once it answers (#9).
+  useEffect(() => {
+    if (!providerOffline) return;
+    const t = window.setInterval(() => void useChatStore.getState().retryConnection(), 15_000);
+    return () => window.clearInterval(t);
+  }, [providerOffline]);
   const warning = useChatStore((s) => s.warning);
   const dismissWarning = useChatStore((s) => s.dismissWarning);
   const compactionNotice = useChatStore((s) => s.compactionNotice);
@@ -141,19 +155,27 @@ export function ChatView() {
       )}
 
       {providerOffline && (
-        <div className="conflict-banner" role="status">
-          <span className="status-dot bad" />
-          <span style={{ flex: 1 }}>
-            Can’t reach {providerHost ?? 'the provider'} — check Tailscale / your connection.
-          </span>
-          <button
-            className="link"
-            disabled={checkingConnection}
-            onClick={() => void retryConnection()}
-          >
-            {checkingConnection ? 'Checking…' : 'Retry connection check'}
-          </button>
-        </div>
+        <Banner
+          tone="bad"
+          actions={
+            <>
+              <button
+                className="link"
+                disabled={checkingConnection}
+                onClick={() => void retryConnection()}
+              >
+                {checkingConnection ? 'Checking…' : 'Check now'}
+              </button>
+              <button className="link" onClick={openProviderSettings}>
+                Provider settings
+              </button>
+            </>
+          }
+        >
+          Can’t reach {providerHost ?? 'this chat’s provider'}
+          {providerTier === 'personal' ? ' — check Tailscale or your connection' : ''}. Kitty checks
+          again every 15 seconds.
+        </Banner>
       )}
 
       {warning && (
@@ -261,7 +283,7 @@ export function ChatView() {
           raw={error}
           errorType={errorType ?? undefined}
           onNewSession={() => void newSession()}
-          onOpenProviderSettings={() => void ipc.openSettings('providers')}
+          onOpenProviderSettings={openProviderSettings}
         />
       )}
       <AttachmentChips />
