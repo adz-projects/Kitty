@@ -437,6 +437,19 @@ export interface MemoryStatus {
   memorabilia_supported: boolean;
 }
 
+/** `chat://notice`: something about a turn the user should know, shown
+    inline. `failover`: the model changed mid-chat; `step_limit`: the turn
+    ran out of steps. */
+export interface ChatNoticeEvent {
+  session_id: string;
+  kind: 'failover' | 'step_limit';
+  message: string | null;
+  reason?: 'pinned_unavailable' | 'no_tool_support' | 'error_switch' | null;
+  provider_id?: string | null;
+  from_provider_id?: string | null;
+  model?: string | null;
+}
+
 /** An approval waiting on a person. Mirrors `approvals::PendingApproval`. */
 export interface PendingApproval {
   action_id: string;

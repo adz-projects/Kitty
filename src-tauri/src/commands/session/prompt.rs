@@ -131,6 +131,16 @@ pub async fn answer_approval(
     crate::bigtiny::stream::answer_approval(&app, &action_id, &decision).await
 }
 
+/// The whole output of a tool call whose card showed a truncated result.
+#[tauri::command]
+pub async fn fetch_full_tool_result(
+    app: AppHandle,
+    session_id: String,
+    tool_call_id: String,
+) -> Result<String, String> {
+    crate::bigtiny::stream::fetch_full_tool_result(&app, &session_id, &tool_call_id).await
+}
+
 /// The "Always allow" rules Kitty has stored, for Settings → Tool
 /// permissions.
 #[tauri::command]

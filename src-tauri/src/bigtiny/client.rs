@@ -79,7 +79,8 @@ impl BigTinyClient {
     /// the daemon is still localhost and a truly wedged call must fail
     /// eventually.
     pub fn request_long(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
-        self.base_request(method, path).timeout(LONG_REQUEST_TIMEOUT)
+        self.base_request(method, path)
+            .timeout(LONG_REQUEST_TIMEOUT)
     }
 
     fn base_request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
@@ -139,15 +140,20 @@ impl BigTinyClient {
 /// user-safe string (the detailed body is included — BigTiny's error bodies
 /// are short JSON like `{"detail": "Session not found"}`).
 async fn json_response(result: Result<reqwest::Response, reqwest::Error>) -> Result<Value, String> {
-    let resp = result.map_err(|e| format!("BigTiny request failed: {e}"))?;
+    let resp = result.map_err(|e| format!("Could not reach Kitty's engine: {e}"))?;
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
-        return Err(format!("BigTiny error ({status}): {body}"));
+        if status == reqwest::StatusCode::CONFLICT {
+            return Err(format!(
+                "That chat is busy finishing a reply; try again in a moment. ({body})"
+            ));
+        }
+        return Err(format!("Kitty's engine answered {status}: {body}"));
     }
     resp.json::<Value>()
         .await
-        .map_err(|e| format!("BigTiny returned invalid JSON: {e}"))
+        .map_err(|e| format!("Kitty's engine sent an unreadable answer: {e}"))
 }
 
 #[cfg(test)]

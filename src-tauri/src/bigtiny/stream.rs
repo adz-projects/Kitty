@@ -151,6 +151,41 @@ pub(crate) fn decision_for_option(option_id: Option<&str>) -> &'static str {
     }
 }
 
+/// A turn that never produced an outcome: the send was refused or the stream
+/// broke. `error_type` is set when the cause is one the chat can explain
+/// (`turn_in_progress`, `idle_timeout`).
+#[derive(Debug)]
+struct StreamFailure {
+    message: String,
+    error_type: Option<&'static str>,
+}
+
+impl From<String> for StreamFailure {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            error_type: None,
+        }
+    }
+}
+
+/// The user-facing reading of a refused `/send`. A 409 means this chat
+/// already has a turn running (typically one that was stopped and has not
+/// finished unwinding) - not "something went wrong".
+fn send_refusal(status: reqwest::StatusCode, body: &str) -> StreamFailure {
+    if status == reqwest::StatusCode::CONFLICT {
+        return StreamFailure {
+            message: "This chat is still finishing its previous reply. Wait a moment, then send again."
+                .to_string(),
+            error_type: Some("turn_in_progress"),
+        };
+    }
+    StreamFailure {
+        message: format!("The engine refused the message ({status}): {body}"),
+        error_type: None,
+    }
+}
+
 /// What a finished stream adds up to, for the closing `chat://complete` /
 /// `chat://error` emission.
 #[derive(Default)]
@@ -287,7 +322,10 @@ pub async fn send_prompt(
         // the end of this task (every match arm below and the cleanup after),
         // which stops the foreground service. No-op on desktop.
         let _turn_foreground = foreground::TurnSession::start();
-        let outcome = run_stream(&app_bg, &client, &session_id, &body).await;
+        // The card this chat is pinned to: its Response timeout bounds the
+        // stream, and its reachability is what the result reports on.
+        let card = session_card(&app_bg, &client, &session_id).await;
+        let outcome = run_stream(&app_bg, &client, &session_id, &body, card.as_ref()).await;
         match outcome {
             Ok(TurnOutcome {
                 error: None,
@@ -309,14 +347,17 @@ pub async fn send_prompt(
                     "chat://complete",
                     json!({ "session_id": session_id, "result": result }),
                 );
-                notifications::notify_if_hidden(
-                    &app_bg,
-                    notifications::Event::TaskComplete,
-                    "Kitty finished",
-                    "Your task is complete.",
-                    Some(&session_id),
-                );
-                providers::emit_health_from_send_result(&app_bg, true);
+                // A turn the user stopped did not "finish".
+                if !cancelled {
+                    notifications::notify_if_hidden(
+                        &app_bg,
+                        notifications::Event::TaskComplete,
+                        "Kitty finished",
+                        "Your task is complete.",
+                        Some(&session_id),
+                    );
+                }
+                providers::emit_health_from_send_result(&app_bg, card.as_ref(), None);
                 poll_compaction_status(app_bg.clone(), session_id.clone());
                 poll_session_title(app_bg.clone(), session_id.clone());
             }
@@ -336,12 +377,19 @@ pub async fn send_prompt(
                     &message,
                     Some(&session_id),
                 );
-                providers::emit_health_from_send_result(&app_bg, false);
+                providers::emit_health_from_send_result(
+                    &app_bg,
+                    card.as_ref(),
+                    Some(error_type.as_deref().unwrap_or("")),
+                );
             }
-            Err(message) => {
+            Err(StreamFailure {
+                message,
+                error_type,
+            }) => {
                 let _ = app_bg.emit(
                     "chat://error",
-                    json!({ "session_id": session_id, "message": &message }),
+                    json!({ "session_id": session_id, "message": &message, "error_type": error_type }),
                 );
                 notifications::notify_if_hidden(
                     &app_bg,
@@ -350,10 +398,16 @@ pub async fn send_prompt(
                     &message,
                     Some(&session_id),
                 );
-                providers::emit_health_from_send_result(&app_bg, false);
             }
         }
-        notifications::set_tray_pending(&app_bg, false);
+        // Only this turn is over: approvals for other chats may still wait.
+        let still_pending = !app_bg
+            .state::<AppState>()
+            .pending_approvals
+            .lock()
+            .unwrap()
+            .is_empty();
+        notifications::set_tray_pending(&app_bg, still_pending);
         app_bg
             .state::<AppState>()
             .in_flight_sessions
@@ -477,13 +531,13 @@ fn poll_session_title(app: AppHandle, session_id: String) {
     });
 }
 
-/// The "Response timeout" of the card this session is pinned to, if it sets
-/// one - not the default card's, which may be a different provider entirely.
-async fn session_idle_timeout(
+/// The card this session is pinned to - not the default card, which may be a
+/// different provider entirely.
+async fn session_card(
     app: &AppHandle,
     client: &BigTinyClient,
     session_id: &str,
-) -> Option<u32> {
+) -> Option<crate::config::providers::ProviderProfile> {
     let session = client.get_json(&format!("/api/chat/{session_id}")).await.ok()?;
     let meta = session
         .get("metadata")
@@ -495,11 +549,7 @@ async fn session_idle_timeout(
     let provider = meta.get("provider").and_then(|p| p.as_str())?.to_string();
     let state = app.state::<AppState>();
     let cfg = state.config.lock().unwrap();
-    cfg.providers
-        .iter()
-        .find(|p| p.id == provider)
-        .and_then(|p| p.prompt_idle_timeout_secs)
-        .filter(|s| *s > 0)
+    cfg.providers.iter().find(|p| p.id == provider).cloned()
 }
 
 /// Drive one send stream to completion, emitting `chat://*` events as frames
@@ -510,7 +560,8 @@ async fn run_stream(
     client: &BigTinyClient,
     session_id: &str,
     body: &Value,
-) -> Result<TurnOutcome, String> {
+    card: Option<&crate::config::providers::ProviderProfile>,
+) -> Result<TurnOutcome, StreamFailure> {
     let resp = client
         .request_stream(
             reqwest::Method::POST,
@@ -519,11 +570,11 @@ async fn run_stream(
         .json(body)
         .send()
         .await
-        .map_err(|e| format!("BigTiny send failed: {e}"))?;
+        .map_err(|e| format!("Could not reach the engine to send the message: {e}"))?;
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        return Err(format!("BigTiny error ({status}): {text}"));
+        return Err(send_refusal(status, &text));
     }
 
     let mut outcome = TurnOutcome::default();
@@ -556,21 +607,27 @@ async fn run_stream(
     // never cut off; this only fires when the daemon itself stops answering.
     // The chat's own card's `prompt_idle_timeout_secs`, or 300s when unset.
     let idle = std::time::Duration::from_secs(u64::from(
-        session_idle_timeout(app, client, session_id)
-            .await
+        card.and_then(|c| c.prompt_idle_timeout_secs)
+            .filter(|s| *s > 0)
             .unwrap_or(300),
     ));
     let mut bytes = resp.bytes_stream();
     let mut deltas = DeltaBatcher::default();
     'outer: loop {
         let chunk = match tokio::time::timeout(idle, bytes.next()).await {
-            Ok(Some(item)) => item.map_err(|e| format!("BigTiny stream failed: {e}"))?,
+            Ok(Some(item)) => {
+                item.map_err(|e| format!("The connection to the engine broke: {e}"))?
+            }
             Ok(None) => break, // daemon closed the stream cleanly
             Err(_) => {
-                return Err(format!(
-                    "BigTiny went idle for {}s without sending data — the turn was stopped.",
-                    idle.as_secs()
-                ));
+                return Err(StreamFailure {
+                    message: format!(
+                        "The engine stopped responding for {}s, so this reply was abandoned. \
+                         Send it again; if it keeps happening, restart the engine.",
+                        idle.as_secs()
+                    ),
+                    error_type: Some("idle_timeout"),
+                });
             }
         };
         buffer.extend_from_slice(&chunk);
@@ -738,9 +795,17 @@ fn handle_event(
             );
         }
         "tool_finish" => {
-            // "__budget__" is BigTiny's internal step-budget bookkeeping, not
-            // a real tool the user watched start — don't render it.
+            // The step budget ran out: not a tool the user watched start, but
+            // the reason this turn stopped where it did, which they are owed.
             if tool_name == "__budget__" {
+                let _ = app.emit(
+                    "chat://notice",
+                    json!({
+                        "session_id": session_id,
+                        "kind": "step_limit",
+                        "message": event.get("tool_result").and_then(|r| r.as_str()).unwrap_or(""),
+                    }),
+                );
                 return;
             }
             // The wrap-up valve's notice, which travels on the same synthetic
@@ -759,28 +824,22 @@ fn handle_event(
                 );
                 return;
             }
-            let id = close_tool_card(
-                event.get("tool_call_id").and_then(|v| v.as_str()),
-                *tool_seq,
-                open_tools,
-                last_tool,
-            );
+            let call_id = event.get("tool_call_id").and_then(|v| v.as_str());
+            let id = close_tool_card(call_id, *tool_seq, open_tools, last_tool);
             let result_text = event
                 .get("tool_result")
                 .and_then(|r| r.as_str())
                 .unwrap_or("");
-            let error_type = error_type_from_tool_finish(result_text);
-            let failed = error_type.is_some();
+            let failed = event
+                .get("is_error")
+                .and_then(|v| v.as_bool())
+                .unwrap_or_else(|| tool_result_is_error(result_text));
             let _ = app.emit(
                 "chat://tool-call",
                 json!({
                     "session_id": session_id,
                     "phase": "tool_call_update",
-                    "update": {
-                        "toolCallId": id,
-                        "status": if failed { "failed" } else { "completed" },
-                        "rawOutput": truncate_for_ui(result_text),
-                    },
+                    "update": tool_update(&id, call_id, failed, result_text),
                 }),
             );
             // End-of-turn outcome recording now lives in the BigTiny daemon
@@ -920,7 +979,24 @@ fn handle_event(
                 json!({ "session_id": session_id, "content": content }),
             );
         }
-        // model_failover: not surfaced yet.
+        "model_failover" => {
+            // The model this turn runs on changed: the pinned provider was
+            // unavailable, cannot call tools, or failed mid-turn. Said out
+            // loud rather than silently, and the chat's model info follows.
+            let text = |k: &str| event.get(k).and_then(|v| v.as_str());
+            let _ = app.emit(
+                "chat://notice",
+                json!({
+                    "session_id": session_id,
+                    "kind": "failover",
+                    "reason": text("reason"),
+                    "provider_id": text("provider_id"),
+                    "from_provider_id": text("from_provider_id"),
+                    "model": text("model"),
+                    "message": content,
+                }),
+            );
+        }
         _ => {}
     }
 }
@@ -967,15 +1043,61 @@ fn close_tool_card(
         .unwrap_or_else(|| format!("bt-{tool_seq}"))
 }
 
-/// Pure: `Some("crash")` when the tool result read as an error — used only to
-/// mark the tool-call card as `failed` in the UI. (Outcome *recording* to AP
-/// now lives in the BigTiny daemon, where the real context is available.)
-fn error_type_from_tool_finish(result_text: &str) -> Option<&'static str> {
-    if result_text.starts_with("Error") || result_text.starts_with("[Tool error") {
-        Some("crash")
-    } else {
-        None
+/// Whether a tool result reads as a failure, for a frame without the daemon's
+/// `is_error` (a replayed message; a daemon older than the flag). Kitty's own
+/// tools answer failures with a JSON envelope (`"status": "error"`), which a
+/// text-prefix check alone read as success.
+pub(crate) fn tool_result_is_error(result_text: &str) -> bool {
+    let trimmed = result_text.trim_start();
+    if trimmed.starts_with("Error") || trimmed.starts_with("[Tool error") {
+        return true;
     }
+    if trimmed.starts_with('{') {
+        if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
+            return v.get("status").and_then(|s| s.as_str()) == Some("error");
+        }
+    }
+    false
+}
+
+/// The `chat://tool-call` update for a finished tool. `daemonToolCallId` is
+/// what `fetch_full_tool_result` looks the full output up by when
+/// `truncated` says the card got less than all of it.
+pub(crate) fn tool_update(card_id: &str, call_id: Option<&str>, failed: bool, output: &str) -> Value {
+    let shown = truncate_for_ui(output);
+    json!({
+        "toolCallId": card_id,
+        "daemonToolCallId": call_id,
+        "status": if failed { "failed" } else { "completed" },
+        "truncated": shown != output,
+        "rawOutput": shown,
+    })
+}
+
+/// The whole output of one tool call, from the chat's history: what a card
+/// showing a truncated result fetches on "Show full output".
+pub async fn fetch_full_tool_result(
+    app: &AppHandle,
+    session_id: &str,
+    tool_call_id: &str,
+) -> Result<String, String> {
+    let client = ensure_client(app)?;
+    let history = client
+        .get_json_long(&format!("/api/chat/{session_id}/history?limit=10000"))
+        .await?;
+    let rows = history
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .cloned()
+        .or_else(|| history.as_array().cloned())
+        .unwrap_or_default();
+    rows.iter()
+        .find(|r| {
+            r.get("role").and_then(|v| v.as_str()) == Some("tool")
+                && r.get("tool_call_id").and_then(|v| v.as_str()) == Some(tool_call_id)
+        })
+        .and_then(|r| r.get("content").and_then(|c| c.as_str()).map(str::to_string))
+        .ok_or_else(|| "That tool's output is no longer in this chat's history.".to_string())
 }
 
 /// Cancel the in-flight turn (`POST /api/chat/{id}/cancel`); BigTiny resolves
@@ -1231,17 +1353,37 @@ mod tests {
         assert!(t.contains("…[truncated"));
     }
 
+    /// Kitty's tools report failure in a JSON envelope; that must read as a
+    /// failure too (#34), and ordinary JSON must not.
     #[test]
-    fn error_type_from_tool_finish_only_on_error_prefixes() {
-        assert_eq!(error_type_from_tool_finish("file contents here"), None);
-        assert_eq!(error_type_from_tool_finish(""), None);
-        assert_eq!(
-            error_type_from_tool_finish("Error: file not found"),
-            Some("crash")
-        );
-        assert_eq!(
-            error_type_from_tool_finish("[Tool error: timeout]"),
-            Some("crash")
-        );
+    fn a_json_error_envelope_is_a_failed_tool() {
+        assert!(tool_result_is_error("{\n  \"status\": \"error\",\n  \"error_code\": \"PATH_OUTSIDE_HOME\"\n}"));
+        assert!(!tool_result_is_error("{\"status\": \"success\", \"data\": 1}"));
+        assert!(!tool_result_is_error("{not json"));
+    }
+
+    #[test]
+    fn a_truncated_output_is_marked_and_keeps_its_call_id() {
+        let long = "x".repeat(MAX_STRING_BYTES + 10);
+        let u = tool_update("bt-1", Some("call-9"), false, &long);
+        assert_eq!(u["truncated"], true);
+        assert_eq!(u["daemonToolCallId"], "call-9");
+        assert_eq!(tool_update("bt-1", None, true, "short")["truncated"], false);
+    }
+
+    #[test]
+    fn a_409_reads_as_a_turn_in_progress() {
+        let f = send_refusal(reqwest::StatusCode::CONFLICT, "busy");
+        assert_eq!(f.error_type, Some("turn_in_progress"));
+        assert!(!f.message.contains("409"));
+        assert_eq!(send_refusal(reqwest::StatusCode::BAD_GATEWAY, "x").error_type, None);
+    }
+
+    #[test]
+    fn a_text_error_prefix_is_a_failed_tool() {
+        assert!(!tool_result_is_error("file contents here"));
+        assert!(!tool_result_is_error(""));
+        assert!(tool_result_is_error("Error: file not found"));
+        assert!(tool_result_is_error("[Tool error: timeout]"));
     }
 }

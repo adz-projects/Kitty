@@ -365,16 +365,18 @@ pub async fn load(app: &AppHandle, session_id: String, cwd: String) -> Result<Se
                 let Some(tool_call_id) = row.get("tool_call_id").and_then(|v| v.as_str()) else {
                     continue;
                 };
+                let failed = crate::bigtiny::stream::tool_result_is_error(&text);
                 let _ = app.emit(
                     "chat://tool-call",
                     json!({
                         "session_id": session_id,
                         "phase": "tool_call_update",
-                        "update": {
-                            "toolCallId": tool_call_id,
-                            "status": "completed",
-                            "rawOutput": crate::bigtiny::stream::truncate_for_ui(&text),
-                        },
+                        "update": crate::bigtiny::stream::tool_update(
+                            tool_call_id,
+                            Some(tool_call_id),
+                            failed,
+                            &text,
+                        ),
                     }),
                 );
             }

@@ -42,6 +42,7 @@ import type {
   DownloadProgress,
   EngineRestartState,
   AllowRule,
+  ChatNoticeEvent,
   EngineInfo,
   MemoryStatus,
   PendingApproval,
@@ -332,6 +333,9 @@ export const ipc = {
   answerApproval: (actionId: string, decision: 'allow' | 'always_allow' | 'reject') =>
     invoke<void>('answer_approval', { actionId, decision }),
   listAllowRules: () => invoke<AllowRule[]>('list_allow_rules'),
+  /** The whole output of a tool call whose card was truncated. */
+  fetchFullToolResult: (sessionId: string, toolCallId: string) =>
+    invoke<string>('fetch_full_tool_result', { sessionId, toolCallId }),
   revokeAllowRule: (id: number) => invoke<void>('revoke_allow_rule', { id }),
   /** The card new chats start on (Settings). */
   setDefaultProvider: (id: string) => invoke<void>('set_default_provider', { id }),
@@ -608,6 +612,9 @@ export const onMemoryStatus = (cb: (s: MemoryStatus) => void) =>
 
 export const onPendingApproval = (cb: (a: PendingApproval) => void) =>
   listen<PendingApproval>('approval://needed', (e) => cb(e.payload));
+
+export const onChatNotice = (cb: (e: ChatNoticeEvent) => void) =>
+  listen<ChatNoticeEvent>('chat://notice', (e) => cb(e.payload));
 
 export const onApprovalResolved = (
   cb: (e: { action_id: string; session_id: string | null; timed_out: boolean }) => void

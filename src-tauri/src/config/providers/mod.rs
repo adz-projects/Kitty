@@ -231,29 +231,33 @@ pub fn next_default(providers: &[ProviderProfile], removed_index: usize) -> Opti
         .map(|p| p.id.clone())
 }
 
-/// Reachability for Personal/Remote providers is derived from real send
-/// outcomes (Round-3 item 19, revised) rather than a speculative background
-/// ping — this app makes no inference calls of its own, so a failed/succeeded
-/// `session/prompt` is a strictly better signal than a periodic GET. Call this
-/// from `send_prompt`'s completion handler with whether that send succeeded;
-/// it's a no-op for a `Local`-tier active provider (which has nothing to be
-/// unreachable in the Tailscale/cloud sense — the local stack loop covers it).
-pub fn emit_health_from_send_result(app: &AppHandle, reachable: bool) {
-    let active = {
-        let state = app.state::<AppState>();
-        let cfg = state.config.lock().unwrap();
-        cfg.active_provider_id
-            .as_ref()
-            .and_then(|id| cfg.providers.iter().find(|p| &p.id == id).cloned())
+/// Report whether the provider a chat is on answered, from a real send's
+/// outcome (Kitty makes no inference calls of its own to probe with).
+///
+/// Only about *reachability*, and only for the chat's own card: `error_type`
+/// is `None` for a success, which clears an offline banner, and the daemon's
+/// classification for a failure, of which only `network_unreachable` means
+/// "can't reach it". A bad key, no credits or an overflowing context are that
+/// chat's error card, not a connectivity problem to broadcast (#9). Loopback
+/// providers have nothing to be unreachable in this sense.
+pub fn emit_health_from_send_result(
+    app: &AppHandle,
+    card: Option<&ProviderProfile>,
+    error_type: Option<&str>,
+) {
+    let reachable = match error_type {
+        None => true,
+        Some("network_unreachable") => false,
+        Some(_) => return,
     };
-    let Some(p) = active.filter(|p| !matches!(network_tier_for(&p.base_url), NetworkTier::Local))
+    let Some(p) = card.filter(|p| !matches!(network_tier_for(&p.base_url), NetworkTier::Local))
     else {
         return;
     };
     let host = network::host_of(&p.base_url);
     let _ = app.emit(
         "provider://health",
-        json!({ "reachable": reachable, "host": host, "name": p.name }),
+        json!({ "provider_id": p.id, "reachable": reachable, "host": host, "name": p.name }),
     );
 }
 

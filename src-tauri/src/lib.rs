@@ -177,6 +177,7 @@ pub fn run() {
             commands::answer_approval,
             commands::list_allow_rules,
             commands::revoke_allow_rule,
+            commands::fetch_full_tool_result,
             commands::get_startup_phase,
             commands::window_ready,
             commands::restart_backend,
