@@ -5,6 +5,23 @@ import { useRouteStore } from '@/stores/routeStore';
 import { Banner } from '@/components/shared/Banner';
 import { confirmDialog } from '@/components/shared/ConfirmDialog';
 import type { EngineRestartState, RestartBlocker } from '@/lib/types';
+import type { V1Data, V1ImportSummary } from '@/lib/ipc';
+import { useSessionStore } from '@/stores/sessionStore';
+
+/** What an import brought across, in a sentence. Pure. */
+export function importSummaryText(s: V1ImportSummary): string {
+  const parts = [
+    `${s.sessions} chat${s.sessions === 1 ? '' : 's'}`,
+    `${s.providers} provider${s.providers === 1 ? '' : 's'}`,
+  ];
+  if (s.mcp_servers) parts.push(`${s.mcp_servers} tool server${s.mcp_servers === 1 ? '' : 's'}`);
+  let text = `Imported ${listNames(parts)} from your earlier Kitty.`;
+  if (s.pathway === 'imported') text += ' What it had learned about you came too.';
+  if (s.undecryptable_secrets > 0) {
+    text += ` ${s.undecryptable_secrets} saved key${s.undecryptable_secrets === 1 ? '' : 's'} couldn't be read — enter ${s.undecryptable_secrets === 1 ? 'it' : 'them'} again in Settings → Providers.`;
+  }
+  return text;
+}
 
 /** "A and B" / "A, B and C". Pure. */
 export function listNames(names: string[]): string {
@@ -42,6 +59,29 @@ export function HubBanners() {
   const [restarting, setRestarting] = useState(false);
   const [restartError, setRestartError] = useState<string | null>(null);
   const [hotkeyDismissed, setHotkeyDismissed] = useState(false);
+  // Data from Kitty 0.8 or earlier, waiting to be brought across (#11).
+  const [v1, setV1] = useState<V1Data | null>(null);
+  const [importing, setImporting] = useState(false);
+  const [importResult, setImportResult] = useState<string | null>(null);
+  useEffect(() => {
+    void ipc
+      .detectV1Data()
+      .then(setV1)
+      .catch(() => {});
+  }, []);
+  const importV1 = async () => {
+    setImporting(true);
+    try {
+      const summary = await ipc.importV1Data();
+      setImportResult(importSummaryText(summary));
+      setV1(null);
+      void useSessionStore.getState().refresh();
+    } catch (e) {
+      setImportResult(String(e));
+    } finally {
+      setImporting(false);
+    }
+  };
 
   useEffect(() => {
     void ipc
@@ -93,6 +133,43 @@ export function HubBanners() {
 
   return (
     <>
+      {v1 && (
+        <Banner
+          tone="warn"
+          actions={
+            <>
+              <button className="link" disabled={importing} onClick={() => void importV1()}>
+                {importing ? 'Importing…' : 'Import'}
+              </button>
+              <button
+                className="link"
+                disabled={importing}
+                onClick={() => {
+                  setV1(null);
+                  void ipc.dismissV1Import().catch(() => {});
+                }}
+              >
+                Don&apos;t import
+              </button>
+            </>
+          }
+        >
+          Found chats and settings from an earlier version of Kitty (
+          {Math.max(1, Math.round(v1.db_bytes / 1e6))} MB). Bring them into this one?
+        </Banner>
+      )}
+      {importResult && (
+        <Banner
+          tone="ok"
+          actions={
+            <button className="link" onClick={() => setImportResult(null)}>
+              Dismiss
+            </button>
+          }
+        >
+          {importResult}
+        </Banner>
+      )}
       {message && (
         <Banner
           tone="warn"
