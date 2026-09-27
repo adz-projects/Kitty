@@ -152,6 +152,12 @@ impl ProviderProfile {
         network_tier_for(&self.base_url)
     }
 
+    /// Whether this provider cannot work without an API key. A self-hosted
+    /// endpoint (Ollama, or a custom OpenAI-compatible server) often has none.
+    pub fn requires_key(&self) -> bool {
+        !matches!(self.provider_type.as_str(), "ollama" | "custom_openai")
+    }
+
     /// Usable for chat and synced to the engine.
     pub fn is_usable(&self) -> bool {
         self.disabled_reason.is_none()

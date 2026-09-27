@@ -549,6 +549,8 @@ export interface SetupValidation {
   ready: boolean;
   issues: string[];
   adaptive_pathway_ok: boolean;
+  /** Where repair opens: the first wizard step that is not right. */
+  first_broken_step: 'engine' | 'provider' | 'models' | null;
 }
 
 // Serde `rename_all = "snake_case"` on the Rust enum.

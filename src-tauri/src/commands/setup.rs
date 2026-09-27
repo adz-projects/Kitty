@@ -26,6 +26,35 @@ pub struct SetupValidation {
     pub ready: bool,
     pub issues: Vec<String>,
     pub adaptive_pathway_ok: bool,
+    /// Where repair should open (#63): the first wizard step that is not
+    /// right, or `None` when nothing is.
+    pub first_broken_step: Option<SetupStep>,
+}
+
+/// The wizard steps repair can open at, in wizard order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SetupStep {
+    /// The engine is not running.
+    Engine,
+    /// No usable default provider, no model on it, or a missing key.
+    Provider,
+    /// A helper model the user chose (memory or local summarizer) is not on
+    /// disk. Optional, so it never makes setup "not ready".
+    Models,
+}
+
+/// Pure, so the order is testable.
+fn first_broken(engine_ok: bool, provider_ok: bool, models_ok: bool) -> Option<SetupStep> {
+    if !engine_ok {
+        Some(SetupStep::Engine)
+    } else if !provider_ok {
+        Some(SetupStep::Provider)
+    } else if !models_ok {
+        Some(SetupStep::Models)
+    } else {
+        None
+    }
 }
 
 /// Check whether the active provider + stack are actually ready to chat:
@@ -37,14 +66,25 @@ pub struct SetupValidation {
 pub async fn validate_setup(app: AppHandle) -> Result<SetupValidation, String> {
     let mut issues = Vec::new();
 
-    let (active_provider, ap_enabled) = {
+    let (active_provider, ap_enabled, helper_models_ok) = {
         let state = app.state::<AppState>();
         let cfg = state.config.lock().unwrap();
         let active = cfg
             .active_provider_id
             .as_ref()
-            .and_then(|id| cfg.providers.iter().find(|p| &p.id == id).cloned());
-        (active, cfg.adaptive_pathway_enabled)
+            .and_then(|id| cfg.providers.iter().find(|p| &p.id == id).cloned())
+            .filter(|p| p.is_usable());
+        let memory = state.memory_status.lock().unwrap();
+        let wants_memory = cfg.adaptive_pathway_enabled
+            || (cfg.memorabilia_enabled && memory.memorabilia_supported);
+        let memory_ok = !wants_memory || memory.model_installed;
+        let summarizer_ok =
+            !cfg.summarizer.enabled || crate::models::resolve(&cfg.summarizer.model).is_some();
+        (
+            active,
+            cfg.adaptive_pathway_enabled,
+            memory_ok && summarizer_ok,
+        )
     };
 
     match &active_provider {
@@ -55,12 +95,14 @@ pub async fn validate_setup(app: AppHandle) -> Result<SetupValidation, String> {
             }
             // `get_secret_async` (not the blocking `has_secret`) — this is a
             // tokio worker, and Windows Credential Manager access is
-            // synchronous OS IPC that would otherwise block it.
-            if p.provider_type != "ollama" && get_secret_async(&p.id).await.is_none() {
+            // synchronous OS IPC that would otherwise block it. A keyless
+            // provider (a self-hosted endpoint) is fine without one (#64).
+            if p.requires_key() && get_secret_async(&p.id).await.is_none() {
                 issues.push(format!("\"{}\" doesn't have an API key stored.", p.name));
             }
         }
     }
+    let provider_ok = issues.is_empty();
 
     let client = crate::util::http_client();
     let status = lifecycle::compute_status(&app, &client).await;
@@ -79,6 +121,7 @@ pub async fn validate_setup(app: AppHandle) -> Result<SetupValidation, String> {
 
     Ok(SetupValidation {
         ready: issues.is_empty(),
+        first_broken_step: first_broken(status == StackStatus::Ok, provider_ok, helper_models_ok),
         issues,
         adaptive_pathway_ok,
     })
@@ -89,7 +132,6 @@ pub async fn validate_setup(app: AppHandle) -> Result<SetupValidation, String> {
 pub async fn open_wizard(app: AppHandle, mode: Option<String>) -> Result<(), String> {
     windows::open_wizard(&app, mode.as_deref().unwrap_or("setup")).map_err(|e| e.to_string())
 }
-
 
 /// Mark first-run setup complete, then summon the overlay.
 #[tauri::command]
@@ -123,4 +165,32 @@ pub fn get_autostart() -> Result<bool, String> {
 #[tauri::command]
 pub fn set_autostart(enabled: bool) -> Result<(), String> {
     wizard::set_autostart(enabled)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repair_opens_at_the_first_broken_step_in_wizard_order() {
+        assert_eq!(first_broken(false, false, false), Some(SetupStep::Engine));
+        assert_eq!(first_broken(true, false, false), Some(SetupStep::Provider));
+        assert_eq!(first_broken(true, true, false), Some(SetupStep::Models));
+        assert_eq!(first_broken(true, true, true), None);
+    }
+
+    #[test]
+    fn self_hosted_endpoints_need_no_key() {
+        let profile = |provider_type: &str| -> crate::config::providers::ProviderProfile {
+            serde_json::from_value(serde_json::json!({
+                "id": "p", "name": "P", "provider_type": provider_type,
+                "base_url": "", "created_at": ""
+            }))
+            .unwrap()
+        };
+        assert!(!profile("custom_openai").requires_key());
+        assert!(!profile("ollama").requires_key());
+        assert!(profile("openrouter").requires_key());
+        assert!(profile("anthropic").requires_key());
+    }
 }
