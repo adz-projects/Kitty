@@ -2535,3 +2535,19 @@ async fn purging_an_app_removes_its_data_and_only_its_data() {
         .unwrap();
     assert_eq!(theirs_left, 1, "another app's session survives");
 }
+
+/// The app-wide pending list answers for the caller's sessions only, and
+/// with nothing paused it is empty rather than an error.
+#[tokio::test]
+async fn the_app_pending_list_is_scoped_and_answers_empty() {
+    let state = test_state().await;
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/api/apps/me/pending")
+        .body(Body::empty())
+        .unwrap();
+    let resp = router_as(state, APP_A).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["pending"], json!([]));
+}

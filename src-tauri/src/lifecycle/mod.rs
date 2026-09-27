@@ -26,6 +26,7 @@ pub mod bigtiny_env;
 pub mod bigtiny_proc;
 #[cfg(not(target_os = "android"))]
 pub mod bigtiny_v2;
+pub(crate) mod app_events;
 pub(crate) mod embedding;
 pub mod engine_restart;
 mod health;
@@ -317,6 +318,8 @@ pub(crate) async fn install_handle(app: &AppHandle, handle: crate::state::Daemon
     }
     // Memory follows the toggles and what this engine loaded.
     memory::apply_memory_plugins(app).await;
+    // Approvals and background runs for every chat, on screen or not.
+    app_events::ensure_running(app);
 }
 
 /// Find the engine again (desktop): attach to the daemon that is up now, or

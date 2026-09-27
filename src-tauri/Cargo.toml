@@ -49,6 +49,10 @@ semver = "1"
 # Deliberately NOT the daemon crate on desktop: a consumer speaking HTTP has
 # no business linking sqlx, rmcp and LiteRT to do it.
 bigtiny2-client = { path = "../BigTinyV2/client" }
+bigtiny2-protocol = { path = "../BigTinyV2/protocol" }
+# The always-allow scope's argument pattern and the approval policy's
+# security-sensitive command list (`approvals.rs`).
+regex = "1"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [

@@ -84,28 +84,65 @@ pub async fn respond_permission(
     crate::bigtiny::stream::respond_permission(&app, tool_call_id, option_id).await
 }
 
-/// Called by the frontend from `chatStore.ts`'s `onApprovalNeeded` handler,
-/// only once its own `decideChatApproval` auto-decide pass has determined a
-/// tool call genuinely needs a human (`decision === 'prompt'`) — never for
-/// one it's about to silently auto-resolve. This is the sole trigger for an
-/// "Approval needed" toast/tray-pending state: BigTiny's `hitl_pause` SSE
-/// event itself no longer fires one directly (see the comment at that call
-/// site in `bigtiny/stream.rs`), since under the default `always_ask` HITL
-/// policy that fired for nearly every tool call, not just the ones actually
-/// left waiting on a person.
+/// Kept while the chat view still calls it: approvals are now noticed,
+/// decided and announced in Rust (`lifecycle::app_events`), so there is
+/// nothing left for this to do.
 #[tauri::command]
 pub fn notify_approval_needed(
-    app: AppHandle,
-    session_id: String,
-    tool_name: String,
+    _app: AppHandle,
+    _session_id: String,
+    _tool_name: String,
 ) -> Result<(), String> {
-    crate::notifications::set_tray_pending(&app, true);
-    crate::notifications::notify_if_hidden(
-        &app,
-        crate::notifications::Event::ApprovalNeeded,
-        "Approval needed",
-        &format!("Kitty wants to run {tool_name}"),
-        Some(&session_id),
-    );
     Ok(())
+}
+
+/// Every approval waiting on a person, across all chats - for a window that
+/// opens (or expands, or resumes a chat) after the approval arrived. Asks the
+/// engine too, so nothing that paused while Kitty was not listening is
+/// missed.
+#[tauri::command]
+pub async fn list_pending_approvals(
+    app: AppHandle,
+) -> Result<Vec<crate::approvals::PendingApproval>, String> {
+    crate::lifecycle::app_events::recover_pending(&app).await;
+    let state = app.state::<crate::state::AppState>();
+    let mut list: Vec<_> = state
+        .pending_approvals
+        .lock()
+        .unwrap()
+        .values()
+        .cloned()
+        .collect();
+    list.sort_by(|a, b| a.action_id.cmp(&b.action_id));
+    Ok(list)
+}
+
+/// Answer an approval: `allow`, `always_allow` (scoped, see
+/// `approvals::always_scope`) or `reject`.
+#[tauri::command]
+pub async fn answer_approval(
+    app: AppHandle,
+    action_id: String,
+    decision: String,
+) -> Result<(), String> {
+    if !matches!(decision.as_str(), "allow" | "always_allow" | "reject") {
+        return Err(format!("unknown decision: {decision}"));
+    }
+    crate::bigtiny::stream::answer_approval(&app, &action_id, &decision).await
+}
+
+/// The "Always allow" rules Kitty has stored, for Settings → Tool
+/// permissions.
+#[tauri::command]
+pub async fn list_allow_rules(app: AppHandle) -> Result<serde_json::Value, String> {
+    let client = crate::bigtiny::client::ensure_client(&app)?;
+    // A bare array: `[{id, tool_name, args_pattern, decision, created_at}]`.
+    client.get_json("/api/hitl/rules").await
+}
+
+/// Revoke one stored rule: that tool (or command) asks again.
+#[tauri::command]
+pub async fn revoke_allow_rule(app: AppHandle, id: i64) -> Result<(), String> {
+    let client = crate::bigtiny::client::ensure_client(&app)?;
+    client.delete(&format!("/api/hitl/rules/{id}")).await.map(|_| ())
 }

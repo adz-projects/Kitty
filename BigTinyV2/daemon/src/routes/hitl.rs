@@ -48,3 +48,32 @@ pub async fn delete(
         Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
+
+/// `GET /api/apps/me/pending` -- every approval waiting on the calling app,
+/// across all its sessions.
+///
+/// The per-session `/api/chat/{id}/pending` needs the client to know which
+/// sessions to ask about, which it cannot for runs it never started (a
+/// scheduled task, a job) or after its event stream dropped and came back.
+/// Each entry is the same shape as the per-session route's.
+pub async fn pending_for_app(
+    State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<AppIdentity>,
+) -> Response {
+    let pending = {
+        let mut hitl = state.agent.hitl().lock().await;
+        hitl.sweep_stale_now();
+        hitl.all_pending()
+    };
+    let mut out = Vec::new();
+    for action in pending {
+        let owner = crate::storage::sessions::owner_of(&state.db, &action.session_id)
+            .await
+            .ok()
+            .flatten();
+        if owner.as_deref() == Some(identity.app_id.as_str()) {
+            out.push(action.to_dict());
+        }
+    }
+    Json(json!({ "pending": out })).into_response()
+}

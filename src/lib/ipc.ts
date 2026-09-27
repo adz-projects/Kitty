@@ -41,8 +41,10 @@ import type {
   ProviderView,
   DownloadProgress,
   EngineRestartState,
+  AllowRule,
   EngineInfo,
   MemoryStatus,
+  PendingApproval,
   RestartOutcome,
   Schedule,
   ScheduledTask,
@@ -325,6 +327,12 @@ export const ipc = {
     invoke<void>('set_session_provider', { sessionId, providerId, model: model ?? null }),
   testActiveProviderConnection: () => invoke<void>('test_active_provider_connection'),
   testProviderConnection: (id: string) => invoke<void>('test_provider_connection', { id }),
+  // Approvals (every chat, on screen or not)
+  listPendingApprovals: () => invoke<PendingApproval[]>('list_pending_approvals'),
+  answerApproval: (actionId: string, decision: 'allow' | 'always_allow' | 'reject') =>
+    invoke<void>('answer_approval', { actionId, decision }),
+  listAllowRules: () => invoke<AllowRule[]>('list_allow_rules'),
+  revokeAllowRule: (id: number) => invoke<void>('revoke_allow_rule', { id }),
   /** The card new chats start on (Settings). */
   setDefaultProvider: (id: string) => invoke<void>('set_default_provider', { id }),
   /** One chat's card (the badge, on a chat with no messages). */
@@ -597,6 +605,17 @@ export const onEngineRestartState = (cb: (e: EngineRestartState) => void) =>
 
 export const onMemoryStatus = (cb: (s: MemoryStatus) => void) =>
   listen<MemoryStatus>('memory://status', (e) => cb(e.payload));
+
+export const onPendingApproval = (cb: (a: PendingApproval) => void) =>
+  listen<PendingApproval>('approval://needed', (e) => cb(e.payload));
+
+export const onApprovalResolved = (
+  cb: (e: { action_id: string; session_id: string | null; timed_out: boolean }) => void
+) =>
+  listen<{ action_id: string; session_id: string | null; timed_out: boolean }>(
+    'approval://resolved',
+    (e) => cb(e.payload)
+  );
 
 /** Hub navigation (docs/ANDROID.md §8.1). Replaces the old
     `settings://navigate` and `wizard://navigate` events, which existed to

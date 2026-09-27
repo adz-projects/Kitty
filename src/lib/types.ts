@@ -437,6 +437,29 @@ export interface MemoryStatus {
   memorabilia_supported: boolean;
 }
 
+/** An approval waiting on a person. Mirrors `approvals::PendingApproval`. */
+export interface PendingApproval {
+  action_id: string;
+  session_id: string;
+  tool_name: string;
+  tool_args: unknown;
+  /** Why it was not answered automatically. */
+  warning: string | null;
+  /** What "Always allow" would cover. */
+  always_scope: { args_pattern: string | null; label: string };
+  /** A scheduled run's approval, denied on its own if left unanswered. */
+  scheduled: boolean;
+}
+
+/** A stored "Always allow" rule. Mirrors the daemon's `HITLRuleRow`. */
+export interface AllowRule {
+  id: number;
+  tool_name: string;
+  args_pattern: string | null;
+  decision: string;
+  created_at: string | null;
+}
+
 /** Mirrors `commands::window::EngineInfo`. */
 export interface EngineInfo {
   spawned_by_us: boolean;

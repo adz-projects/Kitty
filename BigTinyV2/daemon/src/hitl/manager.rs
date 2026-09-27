@@ -439,6 +439,11 @@ impl HITLManager {
     }
 
     /// Get pending approvals for a session.
+    /// Every pending action, across sessions. The caller scopes it.
+    pub fn all_pending(&self) -> Vec<PendingAction> {
+        self.pending.values().cloned().collect()
+    }
+
     pub fn get_pending_approvals(&self, session_id: &str) -> Vec<PendingAction> {
         self.session_pending
             .get(session_id)

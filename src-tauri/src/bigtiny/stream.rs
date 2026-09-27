@@ -7,8 +7,9 @@
 //! - `reasoning_delta` -> `chat://reasoning-delta`
 //! - `tool_start`      -> `chat://tool-call` (phase `tool_call`)
 //! - `tool_finish`     -> `chat://tool-call` (phase `tool_call_update`)
-//! - `hitl_pause`      -> `chat://tool-approval-needed` (answered later via
-//!   `respond_permission` -> `POST .../approve`)
+//! - `hitl_pause`/`hitl_resolved` -> nothing here: approvals for every
+//!   session arrive once, on the app event stream (`lifecycle::app_events`),
+//!   whether or not any window is streaming that session
 //! - `subagent_status` -> `chat://subagent-status` (a specialist this turn
 //!   delegated to started/finished/failed; carries the *child's* session id so
 //!   the UI can link into its transcript)
@@ -133,7 +134,7 @@ pub(crate) fn parse_sse_frame(frame: &str) -> Option<Value> {
 
 /// The approval options BigTiny's HITL flow supports, in the frontend's
 /// ACP-derived vocabulary (`ApprovalPrompt.tsx` renders exactly these ids).
-fn approval_options() -> Value {
+pub(crate) fn approval_options() -> Value {
     json!([
         { "optionId": "allow_once", "name": "Allow once", "kind": "allow_once" },
         { "optionId": "allow_always", "name": "Always allow", "kind": "allow_always" },
@@ -476,18 +477,27 @@ fn poll_session_title(app: AppHandle, session_id: String) {
     });
 }
 
-/// The active provider profile's `prompt_idle_timeout_secs`, if any — the
-/// per-provider "Response timeout" setting. Resolved from `AppState` the same
-/// way `sessions::create`/`providers::emit_health_from_send_result` resolve
-/// the active profile (the send-time resolution also honors a session's own
-/// stamped provider on the BigTiny side; this is the app-side global fallback
-/// for the idle deadline).
-fn active_provider_idle_timeout(app: &AppHandle) -> Option<u32> {
+/// The "Response timeout" of the card this session is pinned to, if it sets
+/// one - not the default card's, which may be a different provider entirely.
+async fn session_idle_timeout(
+    app: &AppHandle,
+    client: &BigTinyClient,
+    session_id: &str,
+) -> Option<u32> {
+    let session = client.get_json(&format!("/api/chat/{session_id}")).await.ok()?;
+    let meta = session
+        .get("metadata")
+        .or_else(|| session.get("session").and_then(|s| s.get("metadata")))?;
+    let meta: Value = match meta {
+        Value::String(s) => serde_json::from_str(s).ok()?,
+        other => other.clone(),
+    };
+    let provider = meta.get("provider").and_then(|p| p.as_str())?.to_string();
     let state = app.state::<AppState>();
     let cfg = state.config.lock().unwrap();
-    cfg.active_provider_id
-        .as_ref()
-        .and_then(|id| cfg.providers.iter().find(|p| &p.id == id))
+    cfg.providers
+        .iter()
+        .find(|p| p.id == provider)
         .and_then(|p| p.prompt_idle_timeout_secs)
         .filter(|s| *s > 0)
 }
@@ -540,11 +550,15 @@ async fn run_stream(
     let mut buffer: Vec<u8> = Vec::new();
     let mut scan_from: usize = 0;
     // Idle-only deadline on the stream: if the daemon sends no bytes for this
-    // long, the turn is wedged and we bail out (see the `Elapsed` arm). Long
-    // turns that keep streaming data are unaffected. `None` -> the active
-    // provider's `prompt_idle_timeout_secs`, or 300s when unset.
+    // long, the turn is wedged and we bail out (see the `Elapsed` arm). The
+    // daemon sends a keepalive comment every 15s, and those are bytes too, so
+    // a turn that is merely waiting - on an approval, on a slow model - is
+    // never cut off; this only fires when the daemon itself stops answering.
+    // The chat's own card's `prompt_idle_timeout_secs`, or 300s when unset.
     let idle = std::time::Duration::from_secs(u64::from(
-        active_provider_idle_timeout(app).unwrap_or(300),
+        session_idle_timeout(app, client, session_id)
+            .await
+            .unwrap_or(300),
     ));
     let mut bytes = resp.bytes_stream();
     let mut deltas = DeltaBatcher::default();
@@ -775,43 +789,6 @@ fn handle_event(
             // context-free backstop was removed to avoid double-recording the
             // same tool outcome to AP (which would skew learning rewards).
         }
-        "hitl_pause" => {
-            let Some(action_id) = event.get("action_id").and_then(|a| a.as_str()) else {
-                return;
-            };
-            app.state::<AppState>()
-                .bigtiny_approvals
-                .lock()
-                .unwrap()
-                .insert(action_id.to_string(), session_id.to_string());
-            // Notification + tray-pending are deliberately NOT fired here —
-            // BigTiny's default HITL policy asks for approval on nearly
-            // every tool call, and the frontend's own `decideChatApproval`
-            // auto-decide pass (`chatStore.ts`'s `onApprovalNeeded`) silently
-            // resolves the overwhelming majority of them a moment after this
-            // event reaches it. Firing unconditionally here notified for
-            // every single tool call, not just the ones that actually needed
-            // a human — see `commands::notify_approval_needed`, which the
-            // frontend calls instead, only once it knows a real prompt is
-            // required.
-            let _ = app.emit(
-                "chat://tool-approval-needed",
-                json!({
-                    "session_id": session_id,
-                    "tool_call_id": action_id,
-                    "tool_call": {
-                        "toolCallId": action_id,
-                        "title": tool_name,
-                        "kind": "execute",
-                        "rawInput": event.get("tool_args"),
-                    },
-                    "options": approval_options(),
-                }),
-            );
-        }
-        "hitl_resolved" => {
-            notifications::set_tray_pending(app, false);
-        }
         "subagent_status" => {
             // The `session_id` *on the frame* is the delegate's, not the
             // parent's, so the two swap here: this handler's `session_id`
@@ -1011,40 +988,40 @@ pub async fn cancel(app: &AppHandle, session_id: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Answer a deferred tool approval: the `tool_call_id` the frontend echoes
-/// back IS BigTiny's action id; the session it belongs to was remembered at
-/// `hitl_pause` time.
+/// Answer a tool approval waiting on a person. `decision` is the daemon's:
+/// `allow`, `always_allow` or `reject`. An `always_allow` is stored with the
+/// approval's scope (`approvals::always_scope`): the command's first words
+/// for a shell command, the whole tool otherwise.
+pub async fn answer_approval(
+    app: &AppHandle,
+    action_id: &str,
+    decision: &str,
+) -> Result<(), String> {
+    // Read, not removed: if the POST fails the approval is still pending and
+    // can be answered again. The daemon's `hitl_resolved` removes it.
+    let pending = app
+        .state::<AppState>()
+        .pending_approvals
+        .lock()
+        .unwrap()
+        .get(action_id)
+        .cloned()
+        .ok_or("That approval request is no longer pending.")?;
+    let pattern = (decision == "always_allow")
+        .then_some(pending.always_scope.args_pattern.as_deref())
+        .flatten();
+    crate::lifecycle::app_events::approve(app, &pending.session_id, action_id, decision, pattern)
+        .await
+}
+
+/// [`answer_approval`] in the chat prompt's vocabulary (`allow_once`,
+/// `allow_always`, `reject_once`; `None` rejects).
 pub async fn respond_permission(
     app: &AppHandle,
     tool_call_id: String,
     option_id: Option<String>,
 ) -> Result<(), String> {
-    // Clone the session out rather than removing the entry up front: if the
-    // `/approve` POST below fails, the approval must still be pending so the
-    // caller can retry. It's only forgotten once the daemon has accepted it.
-    let session_id = app
-        .state::<AppState>()
-        .bigtiny_approvals
-        .lock()
-        .unwrap()
-        .get(&tool_call_id)
-        .cloned()
-        .ok_or("that approval request is no longer pending")?;
-    let decision = decision_for_option(option_id.as_deref());
-    let client = ensure_client(app)?;
-    client
-        .post_json(
-            &format!("/api/chat/{session_id}/approve"),
-            &json!({ "action_id": tool_call_id, "decision": decision }),
-        )
-        .await?;
-    app.state::<AppState>()
-        .bigtiny_approvals
-        .lock()
-        .unwrap()
-        .remove(&tool_call_id);
-    notifications::set_tray_pending(app, false);
-    Ok(())
+    answer_approval(app, &tool_call_id, decision_for_option(option_id.as_deref())).await
 }
 
 #[cfg(test)]

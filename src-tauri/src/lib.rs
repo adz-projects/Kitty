@@ -6,6 +6,7 @@
 
 #[cfg(target_os = "android")]
 mod android;
+mod approvals;
 mod bigtiny;
 mod commands;
 mod config;
@@ -172,6 +173,10 @@ pub fn run() {
             commands::test_provider_connection,
             commands::set_default_provider,
             commands::set_chat_provider,
+            commands::list_pending_approvals,
+            commands::answer_approval,
+            commands::list_allow_rules,
+            commands::revoke_allow_rule,
             commands::get_startup_phase,
             commands::window_ready,
             commands::restart_backend,

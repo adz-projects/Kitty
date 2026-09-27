@@ -121,11 +121,11 @@ pub struct AppState {
     /// The BigTiny daemon child we spawn, plus its port + secret (sent as
     /// `X-API-Key`).
     pub bigtiny: Mutex<DaemonHandle>,
-    /// BigTiny pending tool approvals: action_id -> session_id. The frontend
-    /// only echoes back the tool_call_id (= the action id), but BigTiny's
-    /// `/approve` endpoint is per-session, so the session must be remembered
-    /// here between `hitl_pause` and the user's response.
-    pub bigtiny_approvals: Mutex<HashMap<String, String>>,
+    /// Tool approvals waiting on a person, by the daemon's action id, for
+    /// every session Kitty owns (`approvals`, `lifecycle::app_events`).
+    pub pending_approvals: Mutex<HashMap<String, crate::approvals::PendingApproval>>,
+    /// Whether the app event listener (`lifecycle::app_events`) is running.
+    pub app_events_started: AtomicBool,
     /// Session ids with a turn currently in flight — lets a window adopting a
     /// session (Expand mid-stream, or just resuming one another window/
     /// process is actively driving) know a turn is still running, since a
@@ -248,7 +248,8 @@ impl AppState {
             route_targets: Mutex::new(HashMap::new()),
             adaptive_pathway_embedding_status: Mutex::new(EmbeddingModelStatus::default()),
             bigtiny: Mutex::new(DaemonHandle::default()),
-            bigtiny_approvals: Mutex::new(HashMap::new()),
+            pending_approvals: Mutex::new(HashMap::new()),
+            app_events_started: AtomicBool::new(false),
             in_flight_sessions: Mutex::new(HashSet::new()),
             chat_windows: Mutex::new(HashMap::new()),
             next_chat_window_id: Mutex::new(0),

@@ -256,6 +256,16 @@ pub fn show_overlay(_app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
+/// Whether any Kitty window is on screen (visible and not minimized). When
+/// none is, something that needs the user - an approval - summons the
+/// overlay rather than waiting in a window nobody can see.
+#[cfg(desktop)]
+pub fn any_kitty_window_visible(app: &AppHandle) -> bool {
+    app.webview_windows().values().any(|w| {
+        w.is_visible().unwrap_or(false) && !w.is_minimized().unwrap_or(false)
+    })
+}
+
 /// Hide the overlay (kept alive for instant re-summon).
 pub fn hide_overlay(app: &AppHandle) -> tauri::Result<()> {
     if let Some(win) = app.get_webview_window(OVERLAY) {
