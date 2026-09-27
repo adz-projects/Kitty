@@ -64,16 +64,6 @@ export interface Message {
       this (goosed's stored history has no structured "what was attached"
       metadata to reconstruct it from — a known, accepted limitation). */
   attachedFiles?: { name: string; kind: 'file' | 'document' | 'image' }[];
-  /** The actual turn-transmitted payload (images as data URLs, inlined
-      documents), captured by `send()` so `regenerate()` can reproduce the
-      exact same inputs — without this, "Please reconsider" re-asks with no
-      images/attachments and the model answers a different question than the
-      original turn got. Same completeness caveat as `attachedFiles` (only on
-      live-sent messages in this session). */
-  regeneratePayload?: {
-    images?: { mime: string; data_url: string }[];
-    documents?: { label: string; content: string }[];
-  };
   /** Set by `regenerate()`: this assistant turn was superseded by a
       reconsidered answer right after it, in the same session — rendered
       collapsed (like the thinking container) instead of as a normal bubble. */

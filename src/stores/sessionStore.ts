@@ -57,7 +57,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     // between attempts.
     let retryScheduled = false;
     try {
-      const raw = await ipc.listSessions();
+      const { sessions: raw } = await ipc.listSessions();
       // Verbatim string compare of the backend's naive `"YYYY-MM-DD HH:MM:SS"`
       // timestamps, newest first. Must return 0 for equal values — a comparator
       // that only ever returns ±1 gives equal timestamps an arbitrary,

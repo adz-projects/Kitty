@@ -95,10 +95,9 @@ describe('chatStore send in-flight guard', () => {
     await Promise.all([p1, p2]);
 
     expect(ipc.sendPrompt).toHaveBeenCalledTimes(1);
-    // ipc.sendPrompt(sessionId, text, images?, attachedPaths?) — both are
-    // undefined here since this test attaches neither images nor dropped
-    // files.
-    expect(ipc.sendPrompt).toHaveBeenCalledWith('s1', 'hello', undefined, undefined);
+    // ipc.sendPrompt(sessionId, text, images?, attachedPaths?, documents?) —
+    // all undefined here since this test attaches nothing.
+    expect(ipc.sendPrompt).toHaveBeenCalledWith('s1', 'hello', undefined, undefined, undefined);
   });
 
   it('releases the guard so a subsequent turn can send after the first settles', async () => {
@@ -348,9 +347,10 @@ describe('chatStore first-send attachments survive session creation', () => {
     await useChatStore.getState().send('hello');
 
     expect(ipc.sendPrompt).toHaveBeenCalledTimes(1);
-    const text = vi.mocked(ipc.sendPrompt).mock.calls[0][1];
-    expect(text).toContain('Files provided by the user:\n- /f/notes.txt');
-    expect(text).toContain('hello');
+    // The typed text alone; the backend lays the paths out around it.
+    const [, text, , paths] = vi.mocked(ipc.sendPrompt).mock.calls[0];
+    expect(text).toBe('hello');
+    expect(paths).toEqual(['/f/notes.txt']);
   });
 
   it('keeps pasted attachments when a first send lazily creates the session', async () => {
@@ -361,7 +361,7 @@ describe('chatStore first-send attachments survive session creation', () => {
     await useChatStore.getState().send('go');
 
     expect(ipc.sendPrompt).toHaveBeenCalledTimes(1);
-    const text = vi.mocked(ipc.sendPrompt).mock.calls[0][1];
-    expect(text).toContain('--- doc.txt ---\npasted contents');
+    const documents = vi.mocked(ipc.sendPrompt).mock.calls[0][4];
+    expect(documents).toEqual([{ label: 'doc.txt', content: 'pasted contents' }]);
   });
 });

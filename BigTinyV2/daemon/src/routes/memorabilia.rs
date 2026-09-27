@@ -212,6 +212,24 @@ pub async fn recover(
     Json(report).into_response()
 }
 
+/// GET /api/memorabilia/sessions/{id}/pause — whether a session is paused
+/// (incognito), so a client showing the toggle can read it back on resume
+/// instead of assuming "not paused".
+pub async fn get_paused(
+    State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<AppIdentity>,
+    Path(id): Path<String>,
+) -> Response {
+    let engine = match engine(&state, &identity).await {
+        Ok(e) => e,
+        Err(e) => return *e,
+    };
+    match engine.is_paused(&id).await {
+        Ok(paused) => Json(json!({ "session_id": id, "paused": paused })).into_response(),
+        Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
 /// PATCH /api/memorabilia/sessions/{id}/pause — set the incognito/pause flag
 /// for one session. Kitty drives this together with the pathway pause from a
 /// single chat-header control.

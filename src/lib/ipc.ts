@@ -45,6 +45,7 @@ import type {
   ChatNoticeEvent,
   EngineInfo,
   MemoryStatus,
+  UserMessageEvent,
   PendingApproval,
   RestartOutcome,
   Schedule,
@@ -126,17 +127,21 @@ export const ipc = {
       SessionInfo (with `is_default_folder: true`). */
   resetSessionContextDir: (sessionId: string) =>
     invoke<SessionInfo>('reset_session_context_dir', { sessionId }),
+  /** `text` is only what the user typed; the backend lays `documents` and
+      `attachedPaths` out around it (and takes them apart again on resume). */
   sendPrompt: (
     sessionId: string,
     text: string,
     images?: { mime: string; data_url: string }[],
-    attachedPaths?: string[]
+    attachedPaths?: string[],
+    documents?: { label: string; content: string }[]
   ) =>
     invoke<void>('send_prompt', {
       sessionId,
       text,
       images: images ?? null,
       attachedPaths: attachedPaths ?? null,
+      documents: documents ?? null,
     }),
   cancelPrompt: (sessionId: string) => invoke<void>('cancel_prompt', { sessionId }),
   /** Fresh (not client-cached) check of whether `session/prompt` is currently
@@ -163,7 +168,21 @@ export const ipc = {
       longer triggers a notification directly. */
   notifyApprovalNeeded: (sessionId: string, toolName: string) =>
     invoke<void>('notify_approval_needed', { sessionId, toolName }),
-  listSessions: () => invoke<Record<string, unknown>[]>('list_sessions'),
+  /** One page of chats, newest first, with the total count. */
+  listSessions: (offset = 0, limit = 200) =>
+    invoke<{ sessions: Record<string, unknown>[]; total: number }>('list_sessions', {
+      offset,
+      limit,
+    }),
+  /** Full-text search over every chat: one result per chat. */
+  searchSessions: (query: string) =>
+    invoke<{ sessionId: string; title: string; snippet: string | null }[]>('search_sessions', {
+      query,
+    }),
+  /** Whether a chat's memory is paused (incognito). */
+  getSessionPause: (sessionId: string) => invoke<boolean>('get_session_pause', { sessionId }),
+  /** Ask the chat's last question again (the latest answer only). */
+  regenerateLast: (sessionId: string) => invoke<void>('regenerate_last', { sessionId }),
   loadSession: (sessionId: string, cwd: string) =>
     invoke<SessionInfo>('load_session', { sessionId, cwd }),
   deleteSession: (sessionId: string, cwd?: string) =>
@@ -587,8 +606,11 @@ export const onContextBudget = (cb: (e: { session_id: string; message: string })
 export const onSubagentStatus = (cb: (e: SubagentStatusEvent) => void) =>
   listen<SubagentStatusEvent>('chat://subagent-status', (e) => cb(e.payload));
 
-export const onUserMessage = (cb: (e: TextDeltaEvent) => void) =>
-  listen<TextDeltaEvent>('chat://user-message', (e) => cb(e.payload));
+export const onUserMessage = (cb: (e: UserMessageEvent) => void) =>
+  listen<UserMessageEvent>('chat://user-message', (e) => cb(e.payload));
+/** A replayed "Regenerate": the preceding answer was superseded. */
+export const onSuperseded = (cb: (e: { session_id: string }) => void) =>
+  listen<{ session_id: string }>('chat://superseded', (e) => cb(e.payload));
 export const onApprovalNeeded = (cb: (e: ApprovalNeededEvent) => void) =>
   listen<ApprovalNeededEvent>('chat://tool-approval-needed', (e) => cb(e.payload));
 

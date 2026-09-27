@@ -22,6 +22,7 @@ import {
   onSubagentStatus,
   onToolCall,
   onUserMessage,
+  onSuperseded,
   pickSavePath,
 } from '@/lib/ipc';
 import { buildExport, sanitizeFilename } from '@/lib/chatml';
@@ -867,24 +868,16 @@ export const useChatStore = create<ChatState>((set, get) => {
       // `addDroppedPaths`, and a pasted document can add an attachment to a
       // turn that also carries dropped paths — so both blocks are emitted when
       // both exist, rather than the attachment branch shadowing the paths.
-      let promptText = trimmed;
       // Absolute paths of non-image attachments. Sent alongside the turn so the
       // daemon adds them to the session's approval-free read set — the model can
       // then open an attached file directly instead of hitting a sandbox
       // approval for a path outside its workspace (images go inline, not by
-      // path, so they're excluded here).
+      // path, so they're excluded here). The backend lays these and the
+      // inlined documents out around the typed text (`turn_text::compose`).
       const attachedPaths = otherFiles.length ? otherFiles.map((f) => f.path) : undefined;
-      if (otherFiles.length) {
-        // Hand non-image paths to the filesystem tools (CLAUDE.md §5).
-        const block =
-          'Files provided by the user:\n' + otherFiles.map((f) => `- ${f.path}`).join('\n');
-        promptText = `${block}\n\n${promptText}`;
-      }
-      if (attachments.length) {
-        // Inlined content — the model has it directly, no tool call needed.
-        const docs = attachments.map((a) => `--- ${a.label} ---\n${a.content}`).join('\n\n');
-        promptText = `${docs}\n\n${promptText}`.trim();
-      }
+      const documents = attachments.length
+        ? attachments.map((a) => ({ label: a.label, content: a.content }))
+        : undefined;
 
       // Snapshot what's attached to this turn before the set() below clears
       // droppedFiles/attachments/pendingImages from composer state — otherwise
@@ -914,16 +907,6 @@ export const useChatStore = create<ChatState>((set, get) => {
         streaming: false,
         open: false,
         attachedFiles: attachedFiles.length ? attachedFiles : undefined,
-        // Retain the actual turn-transmitted payload so regenerate() can
-        // reproduce the same inputs (images as data URLs, inlined docs) —
-        // see Message.regeneratePayload.
-        regeneratePayload:
-          images?.length || attachments.length
-            ? {
-                images,
-                documents: attachments.map((a) => ({ label: a.label, content: a.content })),
-              }
-            : undefined,
       };
       // Second identity re-check, covering the image-read / persona-override
       // awaits above: committing the user bubble + `busy: true` here after a
@@ -960,7 +943,7 @@ export const useChatStore = create<ChatState>((set, get) => {
       lastSentProvider = get().providerName;
       lastSentModel = get().model;
       submitted = true;
-      await ipc.sendPrompt(sessionId, promptText, images, attachedPaths);
+      await ipc.sendPrompt(sessionId, trimmed, images, attachedPaths, documents);
       // A turn that carried attachments just widened the session's grant set
       // daemon-side. Re-read it now, before the model's first tool call, or
       // the approval check still judges those files against chat_dir/cwd
@@ -1956,19 +1939,17 @@ export const useChatStore = create<ChatState>((set, get) => {
       if (!sessionId || busy || sendInFlight) return;
       const target = messages[assistantIndex];
       if (!target || target.role !== 'assistant') return;
-      // Find the user message preceding this assistant turn.
-      let userIdx = assistantIndex - 1;
-      while (userIdx >= 0 && messages[userIdx].role !== 'user') userIdx--;
-      if (userIdx < 0) return;
-      const userText = messages[userIdx].text;
+      // The latest answer only (decision #39): an older one cannot be
+      // replaced in place, and appending a new answer to the end of the chat
+      // for it would read as an answer to the wrong question.
+      if (
+        messages.slice(assistantIndex + 1).some((m) => m.role === 'assistant' || m.role === 'user')
+      )
+        return;
 
-      // Stay in the *same* session/turn history (owner direction) — Goose has
-      // no ACP method to edit or drop a past turn in place, so the response
-      // being regenerated away from is collapsed client-side (like the
-      // thinking container) rather than removed, and the model is simply
-      // asked again with a note to reconsider. No fork, no session swap, no
-      // deleted session — this is the same conversation continuing, not a
-      // branch.
+      // The same chat asks its last question again (the backend re-sends the
+      // original turn, images and inlined documents included, with a note to
+      // reconsider). The answer being replaced is collapsed, not removed.
       clearStopGrace();
       discardDeltas();
       set((s) => {
@@ -1989,25 +1970,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         lastSentAt = performance.now();
         lastSentProvider = get().providerName;
         lastSentModel = get().model;
-        // The note is sent to the model as part of the real turn (goosed has
-        // no "silent" side channel), but isn't rendered as a second visible
-        // user bubble — the collapsed box above already makes clear what's
-        // being reconsidered.
-        const promptText = `${userText}\n\n(Please reconsider your previous answer above and provide an improved response.)`;
-        // Reproduce the original turn's payload (images + inlined documents)
-        // so the reconsidered answer sees the same inputs — previously only
-        // the text was re-sent and a turn that had a clipboard image or an
-        // attached document got re-asked without it. The dropped-file list
-        // isn't recoverable here (paths are cleared on send), but images
-        // (sent as native content blocks) and inlined doc text are.
-        const payload = messages[userIdx].regeneratePayload;
-        await ipc.sendPrompt(
-          sessionId,
-          payload?.documents?.length
-            ? `${payload.documents.map((d) => `--- ${d.label} ---\n${d.content}`).join('\n\n')}\n\n${promptText}`
-            : promptText,
-          payload?.images?.length ? payload.images : undefined
-        );
+        await ipc.regenerateLast(sessionId);
       } catch (e) {
         // The reconsidered turn never started — un-collapse the original
         // answer, or it stays hidden behind "Previous attempt" with no
@@ -2103,6 +2066,30 @@ export const useChatStore = create<ChatState>((set, get) => {
           'text',
           stripInternalMarkers(isFirst ? stripPromptPreamble(withoutRecipe) : withoutRecipe)
         );
+        // A resumed turn's attachment chips (the backend parses them back out
+        // of the stored text), so it looks as it did when it was sent.
+        if (e.attachments?.length) {
+          set((s) => {
+            const msgs = s.messages.slice();
+            const last = msgs[msgs.length - 1];
+            if (last?.role === 'user')
+              msgs[msgs.length - 1] = { ...last, attachedFiles: e.attachments };
+            return { messages: msgs };
+          });
+        }
+      });
+      // Replay of a "Regenerate": the answer before it was replaced by the
+      // one that follows, so collapse it and let the next answer open anew.
+      void onSuperseded((e) => {
+        if (!forActive(e.session_id)) return;
+        flushDeltas();
+        set((s) => {
+          const msgs = s.messages.slice();
+          const last = msgs[msgs.length - 1];
+          if (last?.role !== 'assistant') return {};
+          msgs[msgs.length - 1] = { ...last, superseded: true, open: false, streaming: false };
+          return { messages: msgs };
+        });
       });
 
       void onToolCall((e) => {

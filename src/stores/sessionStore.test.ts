@@ -40,10 +40,13 @@ beforeEach(() => {
 
 describe('sessionStore.refresh', () => {
   it('loads and sorts sessions by updatedAt descending', async () => {
-    vi.mocked(ipc.listSessions).mockResolvedValue([
-      rawSession('a', 'Older', '/a', '2024-01-01T00:00:00Z'),
-      rawSession('b', 'Newer', '/b', '2024-06-01T00:00:00Z'),
-    ]);
+    vi.mocked(ipc.listSessions).mockResolvedValue({
+      sessions: [
+        rawSession('a', 'Older', '/a', '2024-01-01T00:00:00Z'),
+        rawSession('b', 'Newer', '/b', '2024-06-01T00:00:00Z'),
+      ],
+      total: 2,
+    });
 
     await useSessionStore.getState().refresh();
 

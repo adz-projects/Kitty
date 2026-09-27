@@ -16,7 +16,7 @@ export function ClearChatHistory() {
     setClearError(null);
     setConfirmClear(true);
     try {
-      setSessionCount((await ipc.listSessions()).length);
+      setSessionCount((await ipc.listSessions(0, 0)).total);
     } catch {
       setSessionCount(null);
     }

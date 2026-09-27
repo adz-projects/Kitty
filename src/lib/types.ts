@@ -714,6 +714,12 @@ export interface TextDeltaEvent {
   text: string;
 }
 
+/** `chat://user-message`: a (replayed) user turn, as typed, with the chips of
+    what it carried. */
+export interface UserMessageEvent extends TextDeltaEvent {
+  attachments?: { name: string; kind: 'file' | 'document' | 'image' }[];
+}
+
 export interface ToolCallEvent {
   session_id: string;
   phase: 'tool_call' | 'tool_call_update';

@@ -131,7 +131,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/pathway/recover", post(pathway::recover))
         .route(
             "/api/pathway/sessions/{id}/pause",
-            patch(pathway::set_paused),
+            get(pathway::get_paused).patch(pathway::set_paused),
         )
         .route(
             "/api/memorabilia/items",
@@ -145,7 +145,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/memorabilia/recover", post(memorabilia::recover))
         .route(
             "/api/memorabilia/sessions/{id}/pause",
-            patch(memorabilia::set_paused),
+            get(memorabilia::get_paused).patch(memorabilia::set_paused),
         )
         .route(
             "/api/chat/",

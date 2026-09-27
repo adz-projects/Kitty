@@ -20,3 +20,4 @@ pub mod providers;
 pub mod sessions;
 pub mod specialists;
 pub mod stream;
+pub mod turn_text;

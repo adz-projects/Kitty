@@ -23,13 +23,24 @@ pub struct ImageAttachment {
 /// read set so the model can open them directly — see
 /// `bigtiny::stream::send_prompt`.
 #[tauri::command]
+///
+/// `text` is only what the user typed. `documents` (inlined pastes and text
+/// drops) and `attached_paths` are laid out around it here
+/// (`bigtiny::turn_text::compose`), the same code that takes them apart
+/// again when the chat is resumed.
 pub async fn send_prompt(
     app: AppHandle,
     session_id: String,
     text: String,
     images: Option<Vec<ImageAttachment>>,
     attached_paths: Option<Vec<String>>,
+    documents: Option<Vec<crate::bigtiny::turn_text::InlineDocument>>,
 ) -> Result<(), String> {
+    let text = crate::bigtiny::turn_text::compose(
+        &text,
+        documents.as_deref().unwrap_or_default(),
+        attached_paths.as_deref().unwrap_or_default(),
+    );
     // First turn of this chat: confirm its reasoning effort against the
     // per-model memory before the prompt goes out, so the level the user is
     // looking at is the level this turn actually runs at (and becomes this
@@ -51,6 +62,13 @@ pub async fn send_prompt(
         crate::bigtiny::vision::confirm_model_vision(&app).await;
     }
     crate::bigtiny::stream::send_prompt(app, session_id, text, images, attached_paths).await
+}
+
+/// "Regenerate" on the chat's latest answer: ask its last question again, in
+/// the same chat. Refused while the chat is replying.
+#[tauri::command]
+pub async fn regenerate_last(app: AppHandle, session_id: String) -> Result<(), String> {
+    crate::bigtiny::sessions::regenerate_last(&app, &session_id).await
 }
 
 /// Cancel the in-flight turn for a session.

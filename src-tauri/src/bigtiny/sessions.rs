@@ -5,7 +5,7 @@
 //! replay events during `load`.
 
 use serde_json::{json, Value};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 
 use crate::bigtiny::client::{ensure_client, BigTinyClient};
 use crate::commands::SessionInfo;
@@ -227,6 +227,98 @@ pub async fn list_with_limit(app: &AppHandle, limit: u32) -> Result<Vec<Value>, 
         .unwrap_or_default())
 }
 
+/// One page of the session list, newest first, with the total count so the
+/// list can page past the first screenful (#47).
+pub async fn list_page(app: &AppHandle, offset: u32, limit: u32) -> Result<(Vec<Value>, i64), String> {
+    let client = ensure_client(app)?;
+    let result = client
+        .get_json(&format!("/api/chat/?limit={limit}&offset={offset}"))
+        .await?;
+    let rows = result
+        .get("sessions")
+        .and_then(|s| s.as_array())
+        .map(|rows| rows.iter().map(translate_session_row).collect())
+        .unwrap_or_default();
+    let total = result.get("total").and_then(|t| t.as_i64()).unwrap_or(0);
+    Ok((rows, total))
+}
+
+/// Full-text search over every chat's messages (`/api/search`), one result
+/// per chat, best match first: `{sessionId, title, snippet}`.
+pub async fn search(app: &AppHandle, query: &str) -> Result<Vec<Value>, String> {
+    let client = ensure_client(app)?;
+    let q = url_encode(query);
+    let result = client.get_json(&format!("/api/search?q={q}&limit=100")).await?;
+    let mut seen = std::collections::HashSet::new();
+    Ok(result
+        .get("results")
+        .and_then(|r| r.as_array())
+        .map(|rows| {
+            rows.iter()
+                .filter(|r| {
+                    r.get("session_id")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|id| seen.insert(id.to_string()))
+                })
+                .map(|r| {
+                    json!({
+                        "sessionId": r.get("session_id"),
+                        "title": r.get("session_name").and_then(|v| v.as_str()).filter(|t| !t.is_empty()).unwrap_or("New Chat"),
+                        "snippet": r.get("snippet"),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// Percent-encode a query-string value.
+fn url_encode(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+/// Whether memory is paused (incognito) for a session, read back from the
+/// engines so the toggle shows the truth on resume (#46). Either engine
+/// being paused counts; an engine that is off answers "not paused".
+pub async fn is_paused(app: &AppHandle, session_id: &str) -> bool {
+    let Ok(client) = ensure_client(app) else {
+        return false;
+    };
+    for engine in ["pathway", "memorabilia"] {
+        if let Ok(v) = client
+            .get_json(&format!("/api/{engine}/sessions/{session_id}/pause"))
+            .await
+        {
+            if v.get("paused").and_then(|p| p.as_bool()) == Some(true) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// A session's stored metadata, parsed.
+pub(crate) async fn metadata(client: &BigTinyClient, session_id: &str) -> Value {
+    let Ok(session) = client.get_json(&format!("/api/chat/{session_id}")).await else {
+        return Value::Null;
+    };
+    let meta = session
+        .get("metadata")
+        .or_else(|| session.get("session").and_then(|s| s.get("metadata")));
+    match meta {
+        Some(Value::String(s)) => serde_json::from_str(s).unwrap_or(Value::Null),
+        Some(v @ Value::Object(_)) => v.clone(),
+        _ => Value::Null,
+    }
+}
+
 /// Pure: one BigTiny session row -> a goosed-style `session/list` object
 /// (`parseSession` in the frontend reads exactly these keys). `_meta`
 /// populates `SessionSummary.providerId`/`modelId` from the session's stored
@@ -330,18 +422,43 @@ pub async fn transcript(app: &AppHandle, session_id: String) -> Result<Vec<Value
 pub async fn load(app: &AppHandle, session_id: String, cwd: String) -> Result<SessionInfo, String> {
     let client = ensure_client(app)?;
     let rows = fetch_history(&client, &session_id).await?;
+    let meta = metadata(&client, &session_id).await;
 
     for row in &rows {
         let role = row.get("role").and_then(|r| r.as_str()).unwrap_or("");
         let text = extract_text(row);
         match role {
             "user" => {
+                let turn = crate::bigtiny::turn_text::parse(&text);
+                if turn.regenerate {
+                    // Not a new question: the answer before it was replaced by
+                    // the one after it, exactly as it looked live.
+                    let _ = app.emit("chat://superseded", json!({ "session_id": session_id }));
+                    continue;
+                }
+                let mut attachments = turn.attachments;
+                for _ in 0..image_count(row) {
+                    attachments.push(crate::bigtiny::turn_text::AttachmentChip {
+                        name: "Image".to_string(),
+                        kind: "image",
+                    });
+                }
                 let _ = app.emit(
                     "chat://user-message",
-                    json!({ "session_id": session_id, "text": text }),
+                    json!({ "session_id": session_id, "text": turn.text, "attachments": attachments }),
                 );
             }
             "assistant" => {
+                if let Some(reasoning) = row
+                    .get("reasoning")
+                    .and_then(|r| r.as_str())
+                    .filter(|r| !r.is_empty())
+                {
+                    let _ = app.emit(
+                        "chat://reasoning-delta",
+                        json!({ "session_id": session_id, "text": reasoning }),
+                    );
+                }
                 if !text.is_empty() {
                     let _ = app.emit(
                         "chat://message-delta",
@@ -384,7 +501,96 @@ pub async fn load(app: &AppHandle, session_id: String, cwd: String) -> Result<Se
         }
     }
 
-    Ok(session_info(app, session_id, cwd, None, None))
+    // The chat's own card and model, so the resumed chat shows (and sends
+    // on) what it was pinned to rather than today's default.
+    let text_of = |k: &str| {
+        meta.get(k)
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    };
+    Ok(session_info(app, session_id, cwd, text_of("provider"), text_of("model")))
+}
+
+/// How many images a stored user turn carried.
+fn image_count(row: &Value) -> usize {
+    if row.get("content_format").and_then(|f| f.as_str()) != Some("blocks") {
+        return 0;
+    }
+    let content = row.get("content").and_then(|c| c.as_str()).unwrap_or("");
+    match serde_json::from_str::<Value>(content) {
+        Ok(Value::Array(blocks)) => blocks
+            .iter()
+            .filter(|b| matches!(b.get("type").and_then(|t| t.as_str()), Some("image_url" | "image")))
+            .count(),
+        _ => 0,
+    }
+}
+
+/// The images a stored user turn carried, as data URLs, for "Regenerate" to
+/// send again.
+pub(crate) fn stored_images(row: &Value) -> Vec<crate::commands::ImageAttachment> {
+    if row.get("content_format").and_then(|f| f.as_str()) != Some("blocks") {
+        return Vec::new();
+    }
+    let content = row.get("content").and_then(|c| c.as_str()).unwrap_or("");
+    let Ok(Value::Array(blocks)) = serde_json::from_str::<Value>(content) else {
+        return Vec::new();
+    };
+    blocks
+        .iter()
+        .filter_map(|b| b.pointer("/image_url/url").and_then(|u| u.as_str()))
+        .filter_map(|url| {
+            let mime = url.strip_prefix("data:")?.split(';').next()?.to_string();
+            Some(crate::commands::ImageAttachment {
+                mime,
+                data_url: url.to_string(),
+            })
+        })
+        .collect()
+}
+
+/// Ask the last question again: the chat's last user turn, re-sent with the
+/// regenerate note and its original images, in the same chat (decision #39,
+/// the latest answer only). Refused while the chat is replying.
+pub async fn regenerate_last(app: &AppHandle, session_id: &str) -> Result<(), String> {
+    let busy = app
+        .state::<crate::state::AppState>()
+        .in_flight_sessions
+        .lock()
+        .unwrap()
+        .contains(session_id);
+    if busy {
+        return Err("Kitty is still replying in this chat; wait for it to finish.".to_string());
+    }
+    let client = ensure_client(app)?;
+    let rows = fetch_history(&client, session_id).await?;
+    let last_role = rows
+        .iter()
+        .rev()
+        .find(|r| r.get("role").and_then(|v| v.as_str()) != Some("system"))
+        .and_then(|r| r.get("role").and_then(|v| v.as_str()));
+    if !matches!(last_role, Some("assistant" | "tool")) {
+        return Err("There is no answer to regenerate yet.".to_string());
+    }
+    let question = rows
+        .iter()
+        .rev()
+        .find(|r| r.get("role").and_then(|v| v.as_str()) == Some("user"))
+        .ok_or("There is no question to ask again.")?;
+    let text = extract_text(question);
+    let original = text
+        .strip_suffix(crate::bigtiny::turn_text::REGENERATE_NOTE)
+        .unwrap_or(&text);
+    let images = stored_images(question);
+    crate::bigtiny::stream::send_prompt(
+        app.clone(),
+        session_id.to_string(),
+        format!("{original}{}", crate::bigtiny::turn_text::REGENERATE_NOTE),
+        (!images.is_empty()).then_some(images),
+        None,
+    )
+    .await
 }
 
 /// Pure: an assistant row's stored `tool_calls` JSON -> replayable
@@ -487,6 +693,16 @@ pub(crate) fn truncate_target(rows: &[Value], keep: i64) -> Result<Option<String
     for row in rows {
         let role = row.get("role").and_then(|r| r.as_str()).unwrap_or("");
         match role {
+            // A regenerate turn is not a user bubble: it opens the bubble of
+            // the new answer that follows it - exactly how the chat shows it.
+            // Counting it as a user bubble (as this used to) shifted every
+            // branch point after a regenerate by one (#40), and keeping it
+            // with the superseded answer would leave a fork ending on a
+            // dangling "reconsider" question.
+            "user" if crate::bigtiny::turn_text::parse(&extract_text(row)).regenerate => {
+                bubble += 1;
+                in_assistant_run = true;
+            }
             "user" => {
                 bubble += 1;
                 in_assistant_run = false;
@@ -620,6 +836,43 @@ mod tests {
         // keep everything -> no truncation marker
         assert_eq!(truncate_target(&rows, 4), Ok(None));
         assert_eq!(truncate_target(&rows, 99), Ok(None));
+    }
+
+    /// #40: a regenerate turn is not a bubble, so branch points after a
+    /// regenerate line up with what the chat shows.
+    #[test]
+    fn a_regenerate_turn_does_not_shift_the_branch_point() {
+        let regen = json!({
+            "id": "m2", "role": "user",
+            "content": format!("q{}", crate::bigtiny::turn_text::REGENERATE_NOTE),
+        });
+        // UI: user(1) | answer, superseded(2) | new answer(3) | user(4)
+        let rows = vec![
+            row("m0", "user"),
+            row("m1", "assistant"),
+            regen,
+            row("m3", "assistant"),
+            row("m4", "user"),
+        ];
+        assert_eq!(truncate_target(&rows, 2), Ok(Some("m1".to_string())));
+        assert_eq!(truncate_target(&rows, 3), Ok(Some("m3".to_string())));
+    }
+
+    #[test]
+    fn stored_images_come_back_as_data_urls() {
+        let row = json!({
+            "content_format": "blocks",
+            "content": "[{\"type\":\"text\",\"text\":\"see\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/jpeg;base64,QUJD\"}}]",
+        });
+        let imgs = stored_images(&row);
+        assert_eq!(imgs.len(), 1);
+        assert_eq!(imgs[0].mime, "image/jpeg");
+        assert_eq!(image_count(&row), 1);
+    }
+
+    #[test]
+    fn a_search_query_is_percent_encoded() {
+        assert_eq!(url_encode("a b&c"), "a%20b%26c");
     }
 
     #[test]

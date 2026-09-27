@@ -82,10 +82,30 @@ pub async fn new_session(app: AppHandle, cwd: Option<String>) -> Result<SessionI
     Ok(info)
 }
 
-/// List past sessions (raw session objects; the frontend parses them).
+/// One page of past sessions (raw session objects; the frontend parses
+/// them), newest first, with the total so the list can load more.
 #[tauri::command]
-pub async fn list_sessions(app: AppHandle) -> Result<Vec<Value>, String> {
-    crate::bigtiny::sessions::list(&app).await
+pub async fn list_sessions(
+    app: AppHandle,
+    offset: Option<u32>,
+    limit: Option<u32>,
+) -> Result<Value, String> {
+    let (sessions, total) =
+        crate::bigtiny::sessions::list_page(&app, offset.unwrap_or(0), limit.unwrap_or(100).min(500))
+            .await?;
+    Ok(json!({ "sessions": sessions, "total": total }))
+}
+
+/// Search every chat's messages: one `{sessionId, title, snippet}` per chat.
+#[tauri::command]
+pub async fn search_sessions(app: AppHandle, query: String) -> Result<Vec<Value>, String> {
+    crate::bigtiny::sessions::search(&app, &query).await
+}
+
+/// Whether a chat's memory is paused (incognito).
+#[tauri::command]
+pub async fn get_session_pause(app: AppHandle, session_id: String) -> Result<bool, String> {
+    Ok(crate::bigtiny::sessions::is_paused(&app, &session_id).await)
 }
 
 /// Resume a session. The conversation replays as `chat://*` events during the
@@ -435,7 +455,13 @@ pub async fn rename_session(
     session_id: String,
     title: String,
 ) -> Result<(), String> {
-    crate::bigtiny::sessions::rename(&app, &session_id, &title).await
+    crate::bigtiny::sessions::rename(&app, &session_id, &title).await?;
+    // Every window's list and header, not just the one that renamed (#48).
+    let _ = app.emit(
+        "session://renamed",
+        json!({ "sessionId": session_id, "title": title }),
+    );
+    Ok(())
 }
 
 /// Delete every session (Settings → General "Clear all chat history" — a
@@ -453,7 +479,18 @@ pub async fn rename_session(
 /// toggle. The fix is the daemon's scoping, not a narrower loop here.
 #[tauri::command]
 pub async fn clear_all_sessions(app: AppHandle) -> Result<usize, String> {
-    let sessions = crate::bigtiny::sessions::list(&app).await?;
+    // Every page, not just the first screenful (#47): read them all first,
+    // then delete, so the deletes cannot shift pages still to be read.
+    let mut sessions: Vec<Value> = Vec::new();
+    let mut offset = 0u32;
+    loop {
+        let (page, _) = crate::bigtiny::sessions::list_page(&app, offset, 500).await?;
+        if page.is_empty() {
+            break;
+        }
+        offset += page.len() as u32;
+        sessions.extend(page);
+    }
 
     let chats_root = chats_base_dir(&app).join(CHATS_DIR_NAME);
 
