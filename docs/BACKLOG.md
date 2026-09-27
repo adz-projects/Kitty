@@ -24,6 +24,20 @@ open an item here instead.
 
 ## Noted for later
 
+- **Scheduled tasks while Kitty is closed on Android (A5, decided against for
+  v1).** On Android the engine lives in the app's process, so a schedule runs
+  only while that process is alive; one that fell due while it was gone runs
+  when Kitty next opens (the engine's start-up catch-up). The spike found a
+  headless run feasible — WorkManager wakes the process, the Worker reads the
+  engine's key from the SecretStore and starts the in-process engine through a
+  JNI entry point, which catches up on due schedules and exits via
+  `idle_exit_mins`. What makes it large is approvals: with no UI, nothing runs
+  Kitty's safe-call policy (`approvals.rs`, today tied to an `AppHandle`), so
+  every tool call would wait out the 10-minute timeout and be denied; answering
+  from a notification also needs the app to attach to the already-running
+  engine instead of starting a second one on the same database. Needs a device
+  to build and test against.
+
 - **Heavier document extraction (OCR / tables) for memorabilia ingest.** The
   turn-end memorabilia harvest (`agent::memorabilia_harvest`) extracts attached
   files and scraped documents via `kitty_tools::extract`, which is

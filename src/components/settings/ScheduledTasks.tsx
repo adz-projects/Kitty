@@ -4,6 +4,7 @@ import type { ProviderView, Schedule, ScheduledTask } from '@/lib/types';
 import { Modal } from '@/components/shared/Modal';
 import { confirmDialog } from '@/components/shared/ConfirmDialog';
 import { relativeTime } from '@/lib/relativeTime';
+import { isAndroid } from '@/lib/platform';
 import { useChatStore } from '@/stores/chatStore';
 import { useRouteStore } from '@/stores/routeStore';
 
@@ -261,7 +262,10 @@ export function ScheduledTasks() {
       <h1>Scheduled Tasks</h1>
       <p className="muted">
         Give the agent an instruction to run later — once, or on a repeating interval. Each run
-        starts a brand-new session, with or without Kitty's window open.
+        starts a brand-new session,{' '}
+        {isAndroid()
+          ? 'while Kitty is running — if Android has closed Kitty, a task that fell due runs as soon as you open it again.'
+          : "with or without Kitty's window open."}
       </p>
       {error && <div className="chat-error">{error}</div>}
       {tasks.length === 0 && !error && <p className="muted">No scheduled tasks yet.</p>}
