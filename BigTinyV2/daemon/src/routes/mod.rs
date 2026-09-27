@@ -89,7 +89,9 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/api/apps", get(apps::list))
         .route(
             "/api/apps/me",
-            get(apps::get_me).patch(apps::update_me),
+            get(apps::get_me)
+                .patch(apps::update_me)
+                .delete(apps::delete_me),
         )
         .route("/api/apps/{id}", delete(apps::delete))
         // Plugin selection is its own route family, not folded into

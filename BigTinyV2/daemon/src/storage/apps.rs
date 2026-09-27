@@ -255,6 +255,69 @@ pub async fn delete_app(pool: &SqlitePool, app_id: &str) -> Result<u64, StorageE
     Ok(result.rows_affected())
 }
 
+/// What [`purge_app`] removed.
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PurgeCounts {
+    pub sessions: u64,
+    pub providers: u64,
+    pub mcp_servers: u64,
+    pub schedules: u64,
+    pub specialists: u64,
+    pub hitl_rules: u64,
+    pub jobs: u64,
+}
+
+/// Delete every row `app_id` owns, and the app itself, in one transaction.
+///
+/// The opposite trade from [`delete_app`]: for an app that is going away for
+/// good (an uninstall that asked to delete its data), where leaving the rows
+/// recoverable would leave the user's chats and keys behind. Rows shared with
+/// every app (`app_id IS NULL`) are not the app's and are kept. A session's
+/// messages, timings and run history go with it through their foreign keys.
+///
+/// This removes rows only. The caller owns the live state built from them
+/// (registered providers, connected servers, timers, open engines) and the
+/// app's directory on disk.
+pub async fn purge_app(pool: &SqlitePool, app_id: &str) -> Result<PurgeCounts, StorageError> {
+    let mut tx = pool.begin().await?;
+    // Run history of the app's schedules that has no session to cascade from.
+    delete_owned(
+        &mut tx,
+        "DELETE FROM execution_history WHERE trigger_type = 'schedule' \
+         AND trigger_id IN (SELECT id FROM schedule_jobs WHERE app_id = ?)",
+        app_id,
+    )
+    .await?;
+    let counts = PurgeCounts {
+        jobs: delete_owned(&mut tx, "DELETE FROM jobs WHERE app_id = ?", app_id).await?,
+        sessions: delete_owned(&mut tx, "DELETE FROM sessions WHERE app_id = ?", app_id).await?,
+        hitl_rules: delete_owned(&mut tx, "DELETE FROM hitl_rules WHERE app_id = ?", app_id).await?,
+        providers: delete_owned(&mut tx, "DELETE FROM providers WHERE app_id = ?", app_id).await?,
+        mcp_servers: delete_owned(&mut tx, "DELETE FROM mcp_servers WHERE app_id = ?", app_id)
+            .await?,
+        specialists: delete_owned(&mut tx, "DELETE FROM specialists WHERE app_id = ?", app_id)
+            .await?,
+        schedules: delete_owned(&mut tx, "DELETE FROM schedule_jobs WHERE app_id = ?", app_id)
+            .await?,
+    };
+    delete_owned(&mut tx, "DELETE FROM app_plugins WHERE app_id = ?", app_id).await?;
+    delete_owned(&mut tx, "DELETE FROM apps WHERE id = ?", app_id).await?;
+    tx.commit().await?;
+    Ok(counts)
+}
+
+async fn delete_owned(
+    tx: &mut sqlx::SqliteConnection,
+    sql: &str,
+    app_id: &str,
+) -> Result<u64, StorageError> {
+    Ok(sqlx::query(sql)
+        .bind(app_id)
+        .execute(tx)
+        .await?
+        .rows_affected())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

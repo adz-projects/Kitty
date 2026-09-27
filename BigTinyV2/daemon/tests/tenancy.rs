@@ -2466,3 +2466,68 @@ async fn a_v1_import_becomes_the_callers_data() {
         .unwrap();
     assert_eq!(owner, APP_A, "imported as the caller's, not shared and not another app's");
 }
+
+// ---------------------------------------------------------------------------
+// Purging an app
+// ---------------------------------------------------------------------------
+
+/// A purge removes everything the caller owns - and nothing of anyone
+/// else's - then the app itself.
+#[tokio::test]
+async fn purging_an_app_removes_its_data_and_only_its_data() {
+    let state = test_state().await;
+    let mine = create_session(state.clone(), APP_A).await;
+    let theirs = create_session(state.clone(), APP_B).await;
+    sqlx::query("INSERT INTO messages (id, session_id, role, content) VALUES ('pm', ?, 'user', 'purgeable')")
+        .bind(&mine)
+        .execute(&state.db)
+        .await
+        .unwrap();
+    for (id, app) in [("prov-a", APP_A), ("prov-b", APP_B)] {
+        sqlx::query(
+            "INSERT INTO providers (id, name, provider_type, base_url, app_id) VALUES (?, 'p', 'openai_compat', 'http://x', ?)",
+        )
+        .bind(id)
+        .bind(app)
+        .execute(&state.db)
+        .await
+        .unwrap();
+    }
+    sqlx::query("INSERT INTO hitl_rules (tool_name, decision, app_id) VALUES ('lean_shell', 'always_allow', ?)")
+        .bind(APP_A)
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+    let req = Request::builder()
+        .method(Method::DELETE)
+        .uri("/api/apps/me?purge=true")
+        .body(Body::empty())
+        .unwrap();
+    let resp = router_as(state.clone(), APP_A).oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = body_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["purged"]["sessions"], 1);
+    assert_eq!(body["purged"]["providers"], 1);
+    assert_eq!(body["purged"]["hitl_rules"], 1);
+
+    let count = |sql: &'static str| {
+        let db = state.db.clone();
+        async move { sqlx::query_scalar::<_, i64>(sql).fetch_one(&db).await.unwrap() }
+    };
+    assert_eq!(count("SELECT COUNT(*) FROM messages WHERE id = 'pm'").await, 0);
+    assert_eq!(
+        count("SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'purgeable'").await,
+        0,
+        "the search index follows the cascade"
+    );
+    assert_eq!(count("SELECT COUNT(*) FROM apps WHERE id = 'app-a'").await, 0);
+    assert_eq!(count("SELECT COUNT(*) FROM providers WHERE id = 'prov-b'").await, 1);
+    let theirs_left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE id = ?")
+        .bind(&theirs)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(theirs_left, 1, "another app's session survives");
+}

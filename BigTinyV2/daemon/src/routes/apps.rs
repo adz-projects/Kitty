@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
@@ -133,6 +133,119 @@ pub async fn import_v1(
     }
     .to_string();
     Json(summary).into_response()
+}
+
+/// Query of `DELETE /api/apps/me`.
+#[derive(Debug, Default, Deserialize)]
+pub struct DeleteMeQuery {
+    /// Delete everything the app owns as well, instead of only revoking it.
+    #[serde(default)]
+    pub purge: bool,
+}
+
+/// `DELETE /api/apps/me[?purge=true]`
+///
+/// Without `purge`, the same revocation as `DELETE /api/apps/{own id}`: the
+/// key stops working and the app's data stays, recoverable by registering
+/// the same id again.
+///
+/// With `purge`, the app is removed for good - for an uninstall that asked to
+/// delete its data. Every row the app owns goes (sessions and their history,
+/// providers and their keys, MCP servers, schedules, specialists, approval
+/// rules, plugin choices), then its directory under the data dir (belief
+/// graph, memory, plugin home, grants), then the app itself. Other apps' data
+/// and anything shared with every app are untouched.
+///
+/// Refused with 409 while the app has a turn running: deleting a session out
+/// from under its own turn would leave that turn writing to rows that are
+/// gone. The answer names the counts removed, and `files_removed: false` if
+/// the directory could not be deleted (a file still in use); the rows and the
+/// app are gone either way.
+pub async fn delete_me(
+    State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<AppIdentity>,
+    Query(query): Query<DeleteMeQuery>,
+) -> Response {
+    let app_id = identity.app_id.clone();
+    if !query.purge {
+        return delete(State(state), Extension(identity), Path(app_id)).await;
+    }
+
+    for session in state.agent.active_session_ids() {
+        if matches!(
+            crate::storage::sessions::owner_of(&state.db, &session).await,
+            Ok(Some(owner)) if owner == app_id
+        ) {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": "a turn is still running; stop it and try again",
+                    "reason": "active_turn",
+                    "session_id": session,
+                })),
+            )
+                .into_response();
+        }
+    }
+
+    // Take down what is live before the rows it was built from disappear.
+    let owned = |table: &'static str| {
+        let db = state.db.clone();
+        let app_id = app_id.clone();
+        async move {
+            sqlx::query_scalar::<_, String>(&format!("SELECT id FROM {table} WHERE app_id = ?"))
+                .bind(app_id)
+                .fetch_all(&db)
+                .await
+                .unwrap_or_default()
+        }
+    };
+    for id in owned("schedule_jobs").await {
+        if let Err(e) = state.scheduler.lock().await.remove_job(&id).await {
+            tracing::warn!("purge: could not stop schedule {id}: {e}");
+        }
+    }
+    for id in owned("mcp_servers").await {
+        state.mcp.disconnect_server(&id).await;
+    }
+    let providers = owned("providers").await;
+    state.plugins.close(&app_id).await;
+    state.memorabilia.close(&app_id).await;
+
+    let counts = match apps::purge_app(&state.db, &app_id).await {
+        Ok(counts) => counts,
+        Err(e) => return err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+    for id in &providers {
+        state.router.unregister(id);
+    }
+    // Synchronously, before responding, as for a plain revocation.
+    state.key_cache.invalidate(&app_id);
+
+    let dir = state.plugins.data_dir().join("apps").join(&app_id);
+    let files_removed = remove_dir_with_retry(&dir).await;
+    Json(json!({
+        "ok": true,
+        "purged": counts,
+        "files_removed": files_removed,
+    }))
+    .into_response()
+}
+
+/// Remove `dir`, retrying briefly for files that are closed but not yet
+/// released (Windows). `true` when it is gone.
+async fn remove_dir_with_retry(dir: &std::path::Path) -> bool {
+    for attempt in 0..20 {
+        match std::fs::remove_dir_all(dir) {
+            Ok(()) => return true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
+            Err(e) if attempt == 19 => {
+                tracing::warn!("purge: could not remove {}: {e}", dir.display());
+            }
+            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+        }
+    }
+    false
 }
 
 /// Whether `path` is the file behind `pool`'s main database.
