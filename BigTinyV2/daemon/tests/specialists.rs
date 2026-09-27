@@ -389,6 +389,7 @@ async fn a_delegate_cannot_start_another_delegate() {
         response_schema: None,
         max_steps: 5,
         reasoning_cap: None,
+        max_concurrent: None,
     };
     match orchestrator.run(run).await {
         Err(SpawnRefusal::TooDeep) => {}
@@ -442,6 +443,7 @@ async fn a_delegate_inherits_the_parents_filesystem_grants() {
             response_schema: None,
             max_steps: 5,
             reasoning_cap: None,
+            max_concurrent: None,
         })
         .await;
 
@@ -491,6 +493,7 @@ async fn a_delegate_of_an_unowned_session_is_refused() {
         response_schema: None,
         max_steps: 5,
         reasoning_cap: None,
+        max_concurrent: None,
     };
     assert!(matches!(
         orchestrator.run(run).await,
@@ -543,6 +546,7 @@ async fn a_denylisted_model_is_refused_rather_than_run_as_the_fallback() {
             response_schema: None,
             max_steps: 5,
             reasoning_cap: None,
+            max_concurrent: None,
         })
         .await
     {
@@ -611,6 +615,7 @@ async fn a_delegate_that_runs_too_long_is_stopped() {
             response_schema: None,
             max_steps: 5,
             reasoning_cap: None,
+            max_concurrent: None,
         }),
     )
     .await
@@ -668,6 +673,7 @@ async fn concurrent_delegates_are_capped() {
                     response_schema: None,
                     max_steps: 5,
                     reasoning_cap: None,
+                    max_concurrent: None,
                 })
                 .await
                 .map_err(|e| e.to_string())
@@ -722,6 +728,7 @@ async fn a_fan_out_runs_one_delegate_per_ref_and_survives_partial_failure() {
             response_schema: None,
             max_steps: 5,
             reasoning_cap: None,
+            max_concurrent: None,
         })
         .collect();
 
@@ -1233,6 +1240,7 @@ async fn run_until_timeout(
             response_schema,
             max_steps: 5,
             reasoning_cap: None,
+            max_concurrent: None,
         }),
     )
     .await
@@ -1335,4 +1343,44 @@ async fn an_ordinary_turn_never_sees_the_deadline_valve() {
             .any(|e| e.tool_name.as_deref() == Some("__context_budget__")),
         "a turn with no deadline has no budget to run out of"
     );
+}
+
+/// A run's history row records where it ran, and `/api/specialists/runs`
+/// reads it back from there.
+#[tokio::test]
+async fn a_runs_history_records_its_host() {
+    let pool = test_pool().await;
+    let agent = build_agent(&pool, None);
+    let orchestrator = Arc::new(Orchestrator::new(pool.clone(), 3, 0.25, vec![], 300));
+    orchestrator.attach(&agent);
+    sessions::create_session_for_app(&pool, "host-parent", "Parent", APP)
+        .await
+        .unwrap();
+
+    // The turn itself fails (nothing answers at "mock"); the host it was given
+    // is still what the run used.
+    let _ = orchestrator
+        .run(DelegateRun {
+            name: "extractor".into(),
+            parent_session_id: "host-parent".into(),
+            prompt: "go".into(),
+            system_prompt: None,
+            provider: Some("mock".into()),
+            model: Some("m1".into()),
+            tool_allow: vec![],
+            response_schema: None,
+            max_steps: 5,
+            reasoning_cap: None,
+            max_concurrent: Some(1),
+        })
+        .await;
+
+    let (provider, model): (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT provider_id, model FROM execution_history WHERE trigger_type = 'subagent' AND trigger_id = 'extractor'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(provider.as_deref(), Some("mock"));
+    assert_eq!(model.as_deref(), Some("m1"));
 }

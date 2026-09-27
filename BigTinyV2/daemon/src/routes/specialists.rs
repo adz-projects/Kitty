@@ -260,6 +260,7 @@ pub async fn run(
         response_schema: spec.response_schema,
         max_steps: spec.max_steps,
         reasoning_cap: spec.reasoning_cap,
+        max_concurrent: spec.max_concurrent,
     };
 
     match state.orchestrator.run(run).await {
@@ -295,8 +296,23 @@ pub async fn runs(
     State(state): State<Arc<AppState>>,
     Extension(identity): Extension<AppIdentity>,
 ) -> Response {
-    let rows = sqlx::query_as::<_, (String, Option<String>, Option<String>, String, Option<String>, Option<String>)>(
-        "SELECT e.id, e.trigger_id, e.session_id, e.status, e.started_at, e.result_summary          FROM execution_history e          JOIN sessions s ON s.id = e.session_id          WHERE e.trigger_type = 'subagent' AND s.app_id = ?          ORDER BY e.started_at DESC LIMIT 100",
+    type RunRow = (
+        String,
+        Option<String>,
+        Option<String>,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let rows = sqlx::query_as::<_, RunRow>(
+        "SELECT e.id, e.trigger_id, e.session_id, e.status, e.started_at, e.result_summary, \
+                e.provider_id, e.model \
+         FROM execution_history e \
+         JOIN sessions s ON s.id = e.session_id \
+         WHERE e.trigger_type = 'subagent' AND s.app_id = ? \
+         ORDER BY e.started_at DESC LIMIT 100",
     )
     .bind(&identity.app_id)
     .fetch_all(&state.db)
@@ -306,18 +322,24 @@ pub async fn runs(
         Ok(rows) => {
             let runs: Vec<Value> = rows
                 .into_iter()
-                .map(|(id, specialist, session_id, status, started_at, summary)| {
-                    json!({
-                        "id": id,
-                        "specialist": specialist,
-                        // The delegate's own session, so a reader can open the
-                        // transcript when the summary was not enough.
-                        "session_id": session_id,
-                        "status": status,
-                        "started_at": started_at,
-                        "summary": summary,
-                    })
-                })
+                .map(
+                    |(id, specialist, session_id, status, started_at, summary, provider_id, model)| {
+                        json!({
+                            "id": id,
+                            "specialist": specialist,
+                            // The delegate's own session, so a reader can open the
+                            // transcript when the summary was not enough.
+                            "session_id": session_id,
+                            "status": status,
+                            "started_at": started_at,
+                            "summary": summary,
+                            // Where it actually ran, which failover can make
+                            // different from the definition's pin.
+                            "provider_id": provider_id,
+                            "model": model,
+                        })
+                    },
+                )
                 .collect();
             Json(json!({"runs": runs})).into_response()
         }

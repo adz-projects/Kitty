@@ -70,6 +70,12 @@ pub struct DelegateRun {
     /// default, which is why delegates are capped without every definition
     /// having to say so.
     pub reasoning_cap: Option<crate::agent::tokens::ReasoningCap>,
+    /// How many runs of this specialist (per app) may be in flight at once,
+    /// on top of the daemon-wide cap. `None` or non-positive: no cap of its
+    /// own. For a specialist that is expensive per run, or that drives a
+    /// rate-limited tool, where the daemon-wide cap alone would let a
+    /// fan-out spend every slot on it.
+    pub max_concurrent: Option<i64>,
 }
 
 /// Where a delegate actually ran, and how many of it there were.
@@ -169,6 +175,9 @@ pub struct Orchestrator {
     /// `start_ticket`.
     tickets: DashMap<String, Vec<Ticket>>,
     ticket_seq: AtomicU64,
+    /// Per-specialist caps (`DelegateRun::max_concurrent`), keyed by app and
+    /// specialist name, with the limit each semaphore was built for.
+    per_specialist: DashMap<(String, String), (usize, Arc<Semaphore>)>,
 }
 
 type Report = Shared<BoxFuture<'static, String>>;
@@ -274,7 +283,26 @@ impl Orchestrator {
             router: OnceLock::new(),
             tickets: DashMap::new(),
             ticket_seq: AtomicU64::new(0),
+            per_specialist: DashMap::new(),
         }
+    }
+
+    /// The semaphore capping concurrent runs of `name` for `app_id` at
+    /// `limit`.
+    ///
+    /// A definition whose limit was edited gets a fresh semaphore at the new
+    /// size. Runs already holding a permit on the old one finish undisturbed,
+    /// so for a moment the two together can exceed the new limit; that is the
+    /// price of never cancelling a run because its definition changed.
+    fn specialist_limiter(&self, app_id: &str, name: &str, limit: usize) -> Arc<Semaphore> {
+        let mut entry = self
+            .per_specialist
+            .entry((app_id.to_string(), name.to_string()))
+            .or_insert_with(|| (limit, Arc::new(Semaphore::new(limit))));
+        if entry.0 != limit {
+            *entry = (limit, Arc::new(Semaphore::new(limit)));
+        }
+        entry.1.clone()
     }
 
     /// Close the loop once `Agent` exists. Idempotent; a second call is
@@ -408,6 +436,28 @@ impl Orchestrator {
             // No router attached (tests). Fall back to whatever the definition
             // pinned, which is the pre-selection behaviour.
             None => (spec.provider.clone(), spec.model.clone()),
+        };
+
+        // The specialist's own cap first, and only then a daemon-wide slot, so a
+        // run waiting on its siblings does not sit on a slot another specialist
+        // could be using. Bounded by the same deadline as the wait below.
+        let _specialist_permit = match spec.max_concurrent.filter(|n| *n > 0) {
+            Some(n) => {
+                let limiter = self.specialist_limiter(&app_id, &spec.name, n as usize);
+                match tokio::time::timeout_at(deadline, limiter.acquire_owned()).await {
+                    Ok(permit) => Some(permit),
+                    Err(_) => {
+                        return Ok(Err(format!(
+                            "other runs of the {} specialist (it allows {n} at a time) took its \
+                             whole {}s budget, so it never started; re-run it, or raise that \
+                             specialist's max_concurrent",
+                            spec.name,
+                            self.timeout.as_secs()
+                        )))
+                    }
+                }
+            }
+            None => None,
         };
 
         // Bounded by the run's own deadline, which an unbounded
@@ -671,6 +721,14 @@ impl Orchestrator {
             }
         };
 
+        // Read back what the turn actually ran on rather than trusting the
+        // pick: a mid-turn failover can move it, and the point of reporting the
+        // host is that it is true. Read *before* the terminal notify rather
+        // than after, so the status a client renders names the same host the
+        // report does - and before the run is closed, so its history row
+        // records it too.
+        let host = self.host_actually_used(&child_id, host_provider, host_model).await;
+
         let (status, summary, error) = match &result {
             Ok(text) => ("completed", Some(short(text)), None),
             Err(msg) => ("failed", None, Some(msg.as_str())),
@@ -681,13 +739,18 @@ impl Orchestrator {
         {
             tracing::warn!("failed to close delegate execution {exec_id}: {e}");
         }
-
-        // Read back what the turn actually ran on rather than trusting the
-        // pick: a mid-turn failover can move it, and the point of reporting the
-        // host is that it is true. Read *before* the terminal notify rather
-        // than after, so the status a client renders names the same host the
-        // report does.
-        let host = self.host_actually_used(&child_id, host_provider, host_model).await;
+        // "default" is `host_actually_used`'s placeholder for "not known".
+        let known = |v: &str| (v != "default").then(|| v.to_string());
+        if let Err(e) = execution::set_execution_host(
+            &self.db,
+            &exec_id,
+            known(&host.provider).as_deref(),
+            known(&host.model).as_deref(),
+        )
+        .await
+        {
+            tracing::warn!("failed to record delegate execution {exec_id}'s host: {e}");
+        }
 
         self.notify(
             &agent,
@@ -1064,6 +1127,38 @@ fn short(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A specialist's own cap holds its runs to that many at a time, per app,
+    /// and follows an edit to the limit.
+    #[tokio::test]
+    async fn a_specialists_own_cap_is_per_app_and_follows_edits() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        let orchestrator = Orchestrator::new(pool, 8, 0.25, vec![], 300);
+
+        let one = orchestrator.specialist_limiter("app-a", "extractor", 1);
+        let _held = one.clone().try_acquire_owned().expect("the first run starts");
+        assert!(
+            orchestrator
+                .specialist_limiter("app-a", "extractor", 1)
+                .try_acquire_owned()
+                .is_err(),
+            "a second run of the same specialist waits"
+        );
+        assert!(
+            orchestrator
+                .specialist_limiter("app-b", "extractor", 1)
+                .try_acquire_owned()
+                .is_ok(),
+            "another app's runs are not counted against this one"
+        );
+        assert!(
+            orchestrator
+                .specialist_limiter("app-a", "extractor", 2)
+                .try_acquire_owned()
+                .is_ok(),
+            "raising the limit takes effect for the next run"
+        );
+    }
 
     async fn test_pool() -> SqlitePool {
         SqlitePool::connect("sqlite::memory:").await.unwrap()

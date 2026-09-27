@@ -18,6 +18,12 @@ pub struct ExecutionRow {
     pub completed_at: Option<DateTime<Utc>>,
     pub result_summary: Option<String>,
     pub error_message: Option<String>,
+    /// The provider and model the run actually used, where recorded (see
+    /// migration 026).
+    #[sqlx(default)]
+    pub provider_id: Option<String>,
+    #[sqlx(default)]
+    pub model: Option<String>,
 }
 
 pub async fn insert_execution(
@@ -65,6 +71,22 @@ pub async fn update_execution_status(
     Ok(())
 }
 
+/// Record the host a run actually used.
+pub async fn set_execution_host(
+    pool: &SqlitePool,
+    execution_id: &str,
+    provider_id: Option<&str>,
+    model: Option<&str>,
+) -> Result<(), StorageError> {
+    sqlx::query("UPDATE execution_history SET provider_id = ?, model = ? WHERE id = ?")
+        .bind(provider_id)
+        .bind(model)
+        .bind(execution_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// Runs recorded against one trigger -- a schedule id, or a specialist name
 /// for a `subagent` row.
 pub async fn get_executions_for_trigger(
@@ -77,7 +99,7 @@ pub async fn get_executions_for_trigger(
     // `WHERE trigger_id = ?` was a full table scan materializing every
     // historical run on each call.
     let rows = sqlx::query_as::<_, ExecutionRow>(
-        r#"SELECT id, session_id, trigger_type, trigger_id, status, started_at, completed_at, result_summary, error_message
+        r#"SELECT id, session_id, trigger_type, trigger_id, status, started_at, completed_at, result_summary, error_message, provider_id, model
            FROM execution_history WHERE trigger_id = ? ORDER BY started_at DESC LIMIT ?"#
     )
     .bind(trigger_id)

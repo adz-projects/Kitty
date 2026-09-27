@@ -277,6 +277,7 @@ can answer directly."
             response_schema: spec.response_schema.clone(),
             max_steps: spec.max_steps,
             reasoning_cap: spec.reasoning_cap,
+            max_concurrent: spec.max_concurrent,
         };
 
         // Everything above answers straight away: a bad name, an empty request
