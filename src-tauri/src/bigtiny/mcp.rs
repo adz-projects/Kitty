@@ -296,11 +296,41 @@ async fn remove_retired_builtins(client: &BigTinyClient) {
 /// few quick localhost REST calls, so queueing behind one is cheap.
 static ENSURE_BUILTIN_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-pub async fn ensure_builtin_servers(app: &AppHandle) {
+/// What a builtin sync pass could not do, by server name (#68), so a
+/// Settings toggle can say its change did not reach the engine instead of
+/// reporting success.
+#[derive(Debug, Default)]
+pub struct SyncReport {
+    pub failed: Vec<(String, String)>,
+}
+
+impl SyncReport {
+    fn fail(&mut self, server: &str, error: impl Into<String>) {
+        self.failed.push((server.to_string(), error.into()));
+    }
+
+    /// `Err` with a user-facing message when `server` did not sync. The
+    /// setting is already saved, and the self-heal pass keeps retrying.
+    pub fn check(&self, server: &str, label: &str) -> Result<(), String> {
+        match self.failed.iter().find(|(name, _)| name == server) {
+            None => Ok(()),
+            Some((_, e)) => {
+                tracing::warn!("{server} did not sync: {e}");
+                Err(format!(
+                    "Saved, but {label} could not be updated right now. Kitty will keep trying."
+                ))
+            }
+        }
+    }
+}
+
+/// Register, update or reconnect every bundled MCP server to match config.
+/// `Err` when the engine could not be reached at all; per-server failures are
+/// in the report.
+pub async fn ensure_builtin_servers(app: &AppHandle) -> Result<SyncReport, String> {
     let _guard = ENSURE_BUILTIN_MUTEX.lock().await;
-    let Ok(client) = ensure_client(app) else {
-        return;
-    };
+    let client = ensure_client(app)?;
+    let mut report = SyncReport::default();
 
     remove_retired_builtins(&client).await;
 
@@ -369,6 +399,7 @@ pub async fn ensure_builtin_servers(app: &AppHandle) {
     // change them together.
     upsert_builtin(
         &client,
+        &mut report,
         "pathway",
         &McpServerSpec {
             name: "pathway".to_string(),
@@ -394,6 +425,7 @@ pub async fn ensure_builtin_servers(app: &AppHandle) {
     // in `BigTinyV2/daemon/src/mcp/builtin.rs` — change the two together.
     upsert_builtin(
         &client,
+        &mut report,
         "memorabilia",
         &McpServerSpec {
             name: "memorabilia".to_string(),
@@ -435,6 +467,7 @@ pub async fn ensure_builtin_servers(app: &AppHandle) {
     // (`model_deny`/`timeout_secs`/`max_concurrent`) still apply when on.
     upsert_builtin(
         &client,
+        &mut report,
         "specialists",
         &McpServerSpec {
             name: "specialists".to_string(),
@@ -492,6 +525,7 @@ pub async fn ensure_builtin_servers(app: &AppHandle) {
     let kitty_wasm_env: HashMap<String, String> = kitty_wasm_pairs.into_iter().collect();
     upsert_builtin(
         &client,
+        &mut report,
         "kitty-wasm",
         &McpServerSpec {
             name: "kitty-wasm".to_string(),
@@ -540,6 +574,7 @@ pub async fn ensure_builtin_servers(app: &AppHandle) {
     let kitty_tools_env: HashMap<String, String> = kitty_tools_pairs.into_iter().collect();
     upsert_builtin(
         &client,
+        &mut report,
         "kitty-tools",
         &McpServerSpec {
             name: "kitty-tools".to_string(),
@@ -590,6 +625,7 @@ pub async fn ensure_builtin_servers(app: &AppHandle) {
             let kitty_web_env: HashMap<String, String> = kitty_web_pairs.into_iter().collect();
             upsert_builtin(
                 &client,
+                &mut report,
                 "kitty-web",
                 &McpServerSpec {
                     name: "kitty-web".to_string(),
@@ -610,8 +646,10 @@ pub async fn ensure_builtin_servers(app: &AppHandle) {
             tracing::warn!(
                 "brave-mcp-search keyring read failed ({e}); skipping kitty-web sync this pass to avoid disabling Brave preference on a transient error"
             );
+            report.fail("kitty-web", format!("keyring read failed: {e}"));
         }
     }
+    Ok(report)
 }
 
 /// Periodic self-heal re-sync of the bundled MCP servers, run from the
@@ -622,7 +660,14 @@ pub async fn ensure_builtin_servers(app: &AppHandle) {
 /// change after startup), so a dropped builtin server recovers by itself
 /// instead of staying dead until the app restarts. Best-effort: logs only.
 pub async fn self_heal_builtin_servers(app: &AppHandle) {
-    ensure_builtin_servers(app).await;
+    match ensure_builtin_servers(app).await {
+        Ok(report) => {
+            for (server, e) in report.failed {
+                tracing::warn!("bundled MCP server {server} did not sync: {e}");
+            }
+        }
+        Err(e) => tracing::debug!("builtin MCP sync skipped: {e}"),
+    }
 }
 
 /// Number of attempts (with a short backoff between) for the `list_servers`
@@ -756,7 +801,12 @@ pub async fn validate_brave_api_key(api_key: &str) -> Result<(), String> {
     }
 }
 
-async fn upsert_builtin(client: &BigTinyClient, name: &str, desired: &McpServerSpec) {
+async fn upsert_builtin(
+    client: &BigTinyClient,
+    report: &mut SyncReport,
+    name: &str,
+    desired: &McpServerSpec,
+) {
     // A name outside the contract is a registration the coverage test cannot
     // see and the daemon has no arm for — it would resolve to
     // `unknown in-process server: <name>` at connect time, on a user's machine.
@@ -765,31 +815,30 @@ async fn upsert_builtin(client: &BigTinyClient, name: &str, desired: &McpServerS
         "{name} is not in REGISTERED_BUILTINS; add it there (and give the daemon an arm) rather than registering a row nothing can connect"
     );
     let Some(existing) = list_servers_with_retry(client, name).await else {
+        report.fail(name, "could not list MCP servers");
         return;
     };
 
-    match decide_sync_action(&existing, name, desired) {
+    let result = match decide_sync_action(&existing, name, desired) {
         SyncAction::Create => match create_server(client, desired).await {
-            Ok(id) => {
-                if desired.enabled {
-                    if let Err(e) = connect_server(client, &id).await {
-                        tracing::warn!("bigtiny mcp connect failed for {name}: {e}");
-                    }
-                }
-            }
-            Err(e) => tracing::warn!("bigtiny mcp create failed for {name}: {e}"),
+            Ok(id) if desired.enabled => connect_server(client, &id)
+                .await
+                .map_err(|e| format!("connect failed: {e}")),
+            Ok(_) => Ok(()),
+            Err(e) => Err(format!("create failed: {e}")),
         },
-        SyncAction::Patch { row_id, patch } => {
-            if let Err(e) = update_server(client, &row_id, &patch).await {
-                tracing::warn!("bigtiny mcp update failed for {name}: {e}");
-            }
-        }
-        SyncAction::Connect { row_id } => {
-            if let Err(e) = connect_server(client, &row_id).await {
-                tracing::warn!("bigtiny mcp reconnect failed for {name}: {e}");
-            }
-        }
-        SyncAction::Noop => {}
+        SyncAction::Patch { row_id, patch } => update_server(client, &row_id, &patch)
+            .await
+            .map(|_| ())
+            .map_err(|e| format!("update failed: {e}")),
+        SyncAction::Connect { row_id } => connect_server(client, &row_id)
+            .await
+            .map_err(|e| format!("reconnect failed: {e}")),
+        SyncAction::Noop => Ok(()),
+    };
+    if let Err(e) = result {
+        tracing::warn!("bigtiny mcp {name}: {e}");
+        report.fail(name, e);
     }
 }
 
@@ -811,6 +860,15 @@ mod tests {
         "memorabilia",
         "specialists",
     ];
+
+    #[test]
+    fn a_toggle_fails_only_when_its_own_server_did_not_sync() {
+        let mut report = SyncReport::default();
+        report.fail("kitty-web", "connect failed");
+        assert!(report.check("kitty-tools", "file tools").is_ok());
+        let err = report.check("kitty-web", "web search").unwrap_err();
+        assert!(err.contains("web search") && !err.contains("connect failed"));
+    }
 
     /// The test that would have caught `specialists` never being registered.
     ///
@@ -851,7 +909,9 @@ mod tests {
             .find("pub const BUILTIN_SERVERS")
             .expect("the daemon's BUILTIN_SERVERS const has moved or been renamed");
         let body = &SRC[start..];
-        let open = body.find('[').and_then(|i| body[i + 1..].find('[').map(|j| i + 1 + j));
+        let open = body
+            .find('[')
+            .and_then(|i| body[i + 1..].find('[').map(|j| i + 1 + j));
         let open = open.expect("BUILTIN_SERVERS is no longer an array literal");
         let close = open + body[open..].find(']').unwrap();
         let mut actual: Vec<&str> = body[open + 1..close]

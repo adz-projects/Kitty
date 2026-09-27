@@ -21,12 +21,12 @@
 #[cfg(target_os = "android")]
 pub mod bigtiny_embedded;
 // Both hosts register with the V2 daemon for an app key, so this is not gated.
+pub(crate) mod app_events;
 pub mod bigtiny_app_key;
 pub mod bigtiny_env;
 pub mod bigtiny_proc;
 #[cfg(not(target_os = "android"))]
 pub mod bigtiny_v2;
-pub(crate) mod app_events;
 pub(crate) mod embedding;
 pub mod engine_restart;
 mod health;
@@ -111,7 +111,7 @@ pub(crate) fn sync_mcp_once_healthy(app: &AppHandle, healthy: bool, port: u16) {
     if healthy {
         let app = app.clone();
         tauri::async_runtime::spawn(async move {
-            crate::bigtiny::mcp::ensure_builtin_servers(&app).await;
+            crate::bigtiny::mcp::self_heal_builtin_servers(&app).await;
             // Once, on the first healthy start: fill the subagent denylist from
             // the catalog's premium tier so an expensive model is denied before
             // a bill rather than after one. Deliberately after the daemon is up,
@@ -131,7 +131,7 @@ pub(crate) fn sync_mcp_once_healthy(app: &AppHandle, healthy: bool, port: u16) {
         for _ in 0..120 {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             if bigtiny_proc::probe_health(&client, port).await {
-                crate::bigtiny::mcp::ensure_builtin_servers(&app).await;
+                crate::bigtiny::mcp::self_heal_builtin_servers(&app).await;
                 return;
             }
         }

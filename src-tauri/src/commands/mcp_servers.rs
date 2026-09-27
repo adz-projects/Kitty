@@ -92,8 +92,7 @@ pub async fn set_kitty_wasm_enabled(
         cfg.kitty_wasm_enabled = enabled;
         config::save(&cfg).map_err(|e| e.to_string())?;
     }
-    mcp::ensure_builtin_servers(&app).await;
-    Ok(())
+    apply(&app, "kitty-wasm", "the Python sandbox").await
 }
 
 /// Whether the bundled `visualizations` server is registered+enabled in
@@ -114,8 +113,7 @@ pub async fn set_visualizations_enabled(
         cfg.visualizations_enabled = enabled;
         config::save(&cfg).map_err(|e| e.to_string())?;
     }
-    mcp::ensure_builtin_servers(&app).await;
-    Ok(())
+    apply(&app, "kitty-tools", "visualizations").await
 }
 
 /// Whether the bundled `kitty-tools` server — shell/workspace/file/word/
@@ -140,8 +138,7 @@ pub async fn set_kitty_tools_enabled(
         cfg.kitty_tools_enabled = enabled;
         config::save(&cfg).map_err(|e| e.to_string())?;
     }
-    mcp::ensure_builtin_servers(&app).await;
-    Ok(())
+    apply(&app, "kitty-tools", "the file and shell tools").await
 }
 
 /// Global master switch for delegation (specialists). When off, the
@@ -164,8 +161,7 @@ pub async fn set_specialists_enabled(
         cfg.specialists.enabled = enabled;
         config::save(&cfg).map_err(|e| e.to_string())?;
     }
-    mcp::ensure_builtin_servers(&app).await;
-    Ok(())
+    apply(&app, "specialists", "specialists").await
 }
 
 /// Whether the bundled `kitty-web` web-search/web-scrape server is
@@ -187,8 +183,7 @@ pub async fn set_kitty_web_enabled(
         cfg.kitty_web_enabled = enabled;
         config::save(&cfg).map_err(|e| e.to_string())?;
     }
-    mcp::ensure_builtin_servers(&app).await;
-    Ok(())
+    apply(&app, "kitty-web", "web search").await
 }
 
 /// Brave Search MCP status for Settings — `enabled` mirrors the user's
@@ -242,8 +237,7 @@ pub async fn set_brave_mcp_search_api_key(
         cfg.brave_mcp_search_enabled = true;
         config::save(&cfg).map_err(|e| e.to_string())?;
     }
-    mcp::ensure_builtin_servers(&app).await;
-    Ok(())
+    apply(&app, "kitty-web", "Brave search").await
 }
 
 /// Disabling always deletes the stored key (see `brave_mcp_search_enabled`'s
@@ -268,6 +262,17 @@ pub async fn set_brave_mcp_search_enabled(
         cfg.brave_mcp_search_enabled = false;
         config::save(&cfg).map_err(|e| e.to_string())?;
     }
-    mcp::ensure_builtin_servers(&app).await;
-    Ok(())
+    apply(&app, "kitty-web", "Brave search").await
+}
+
+/// Push a saved toggle to the engine and report whether `server` took it
+/// (#68): the toggle used to say "done" whatever happened.
+async fn apply(app: &tauri::AppHandle, server: &str, label: &str) -> Result<(), String> {
+    mcp::ensure_builtin_servers(app)
+        .await
+        .map_err(|e| {
+            tracing::warn!("builtin MCP sync failed: {e}");
+            format!("Saved, but {label} will only change once the engine is running again.")
+        })?
+        .check(server, label)
 }

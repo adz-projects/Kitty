@@ -83,7 +83,7 @@ pub async fn apply_memory_plugins(app: &AppHandle) {
             if changed {
                 let _ = app.emit("memory://status", status);
                 // The memory tool rows mirror this state; bring them along.
-                crate::bigtiny::mcp::ensure_builtin_servers(app).await;
+                crate::bigtiny::mcp::self_heal_builtin_servers(app).await;
             }
         }
         Err(e) => tracing::warn!("could not apply the memory settings: {e}"),
