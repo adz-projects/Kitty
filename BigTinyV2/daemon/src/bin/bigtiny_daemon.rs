@@ -214,7 +214,7 @@ async fn run_import(argv: &[String]) -> ! {
                 }
             }
             if adopted {
-                println!("  encryption key adopted -> {}", data_dir.join("encryption.key").display());
+                println!("  encryption key adopted -> {}", bigtiny2::crypto::key_file_path(&data_dir).display());
             }
             if issue_key {
                 println!("\n  API key for {app_id}: {key}");

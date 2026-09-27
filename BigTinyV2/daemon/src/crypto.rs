@@ -7,8 +7,8 @@
 //! passed via env on every launch — see `src-tauri/src/lifecycle/
 //! bigtiny_proc.rs::spawn` and `config/providers/keyring.rs`) is the primary
 //! source. When BigTiny runs standalone (no Kitty parent process), that env
-//! var is absent — falls back to a key file (`{data_dir}/encryption.key`)
-//! this module generates once and persists itself. Either way, `init` must
+//! var is absent — falls back to a key file this module generates once and
+//! persists itself (see [`key_file_path`]). Either way, `init` must
 //! run before anything else in `lib.rs::run()` that might decrypt a stored
 //! value (`ProviderRouter::load_providers`, `MCPManager::connect_all`).
 //!
@@ -20,8 +20,16 @@
 //! startup before any `AppState` exists. Threading a key parameter through
 //! every one of those signatures would be a large, purely mechanical change
 //! for no real benefit over a single process-wide key.
+//!
+//! **The key file is not plaintext on Windows.** It is sealed with DPAPI
+//! (user scope) as `encryption.key.dpapi`, so a copy of the data directory
+//! taken off the machine, or read by another user, does not carry a usable
+//! key alongside the ciphertext it protects. A plaintext `encryption.key`
+//! left by an earlier version is sealed and then removed the first time it
+//! is read. Other platforms keep the hex file: Android supplies its key by
+//! env from the platform keystore, and nothing else ships there.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use aes_gcm::aead::{Aead, KeyInit, OsRng};
 use aes_gcm::{AeadCore, Aes256Gcm, Key};
@@ -34,7 +42,12 @@ use crate::error::DaemonError;
 const KEY_LEN: usize = 32;
 const NONCE_LEN: usize = 12;
 const PREFIX: &str = "enc:v1:";
+/// The plaintext hex key file: the stored form off Windows, and what an
+/// earlier version left on Windows.
 const KEY_FILE_NAME: &str = "encryption.key";
+/// The DPAPI-sealed key file (Windows only).
+#[cfg(windows)]
+const SEALED_KEY_FILE_NAME: &str = "encryption.key.dpapi";
 
 static CIPHER: OnceCell<Aes256Gcm> = OnceCell::new();
 
@@ -97,32 +110,244 @@ fn decode_hex_key(hex: &str) -> Result<[u8; KEY_LEN], String> {
 /// failed import.
 pub fn adopt_key(data_dir: &Path, hex: &str) -> Result<bool, DaemonError> {
     let key_bytes = decode_hex_key(hex).map_err(DaemonError::Crypto)?;
-    let path = data_dir.join(KEY_FILE_NAME);
-    if path.exists() {
+    if read_stored_key(data_dir)?.is_some() {
         return Ok(false);
     }
-    std::fs::create_dir_all(data_dir)?;
-    std::fs::write(&path, hex_encode(&key_bytes))?;
+    write_stored_key(data_dir, &key_bytes)?;
     Ok(true)
 }
 
-fn load_or_create_key_file(data_dir: &Path) -> Result<[u8; KEY_LEN], DaemonError> {
-    let path = data_dir.join(KEY_FILE_NAME);
-    if let Ok(existing) = std::fs::read_to_string(&path) {
-        return decode_hex_key(&existing)
-            .map_err(|e| DaemonError::Crypto(format!("{}: {e}", path.display())));
+/// Where this daemon keeps its at-rest key under `data_dir`: the
+/// DPAPI-sealed file on Windows, the hex file elsewhere.
+pub fn key_file_path(data_dir: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        data_dir.join(SEALED_KEY_FILE_NAME)
     }
-    std::fs::create_dir_all(data_dir)?;
+    #[cfg(not(windows))]
+    {
+        data_dir.join(KEY_FILE_NAME)
+    }
+}
+
+fn load_or_create_key_file(data_dir: &Path) -> Result<[u8; KEY_LEN], DaemonError> {
+    if let Some(key) = read_stored_key(data_dir)? {
+        return Ok(key);
+    }
     let mut key_bytes = [0u8; KEY_LEN];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut key_bytes);
-    std::fs::write(&path, hex_encode(&key_bytes))?;
+    write_stored_key(data_dir, &key_bytes)?;
     tracing::info!(
         "generated a new at-rest encryption key at {} (no BIGTINY_ENCRYPTION_KEY set — standalone mode)",
-        path.display()
+        key_file_path(data_dir).display()
     );
     Ok(key_bytes)
 }
 
+/// The key stored under `data_dir`, if there is one.
+///
+/// On Windows this also finishes the move off plaintext: a hex
+/// `encryption.key` with no sealed file beside it is sealed, the sealed copy
+/// is read back and checked, and only then is the plaintext file removed. A
+/// crash at any point leaves at least one readable copy. A plaintext file
+/// found *beside* a sealed one (a crash after sealing) is removed if it holds
+/// the same key and left alone, with a warning, if it does not.
+fn read_stored_key(data_dir: &Path) -> Result<Option<[u8; KEY_LEN]>, DaemonError> {
+    let plain_path = data_dir.join(KEY_FILE_NAME);
+    let read_plain = || -> Result<Option<[u8; KEY_LEN]>, DaemonError> {
+        match std::fs::read_to_string(&plain_path) {
+            Ok(text) => decode_hex_key(&text)
+                .map(Some)
+                .map_err(|e| DaemonError::Crypto(format!("{}: {e}", plain_path.display()))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    };
+
+    #[cfg(not(windows))]
+    {
+        read_plain()
+    }
+
+    #[cfg(windows)]
+    {
+        let sealed_path = data_dir.join(SEALED_KEY_FILE_NAME);
+        let sealed = match std::fs::read(&sealed_path) {
+            Ok(blob) => Some(unseal_key(&blob, &sealed_path)?),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e.into()),
+        };
+        let plain = read_plain()?;
+        match (sealed, plain) {
+            (Some(key), None) => Ok(Some(key)),
+            (Some(key), Some(leftover)) => {
+                if leftover == key {
+                    remove_plaintext(&plain_path);
+                } else {
+                    tracing::warn!(
+                        "{} holds a different key from {}; using the sealed one and leaving the \
+                         plaintext file in place",
+                        plain_path.display(),
+                        sealed_path.display()
+                    );
+                }
+                Ok(Some(key))
+            }
+            (None, Some(key)) => {
+                write_stored_key(data_dir, &key)?;
+                let read_back = unseal_key(&std::fs::read(&sealed_path)?, &sealed_path)?;
+                if read_back != key {
+                    return Err(DaemonError::Crypto(format!(
+                        "sealing {} did not round-trip; the plaintext key was left in place",
+                        plain_path.display()
+                    )));
+                }
+                remove_plaintext(&plain_path);
+                tracing::info!(
+                    "moved the at-rest encryption key from {} to DPAPI-sealed {}",
+                    plain_path.display(),
+                    sealed_path.display()
+                );
+                Ok(Some(key))
+            }
+            (None, None) => Ok(None),
+        }
+    }
+}
+
+/// Persist `key` as this platform's stored form, atomically: written beside
+/// the destination and renamed over it, so a crash never leaves a truncated
+/// key file (which would read as a malformed key and stop the daemon).
+fn write_stored_key(data_dir: &Path, key: &[u8; KEY_LEN]) -> Result<(), DaemonError> {
+    std::fs::create_dir_all(data_dir)?;
+    #[cfg(windows)]
+    let contents = dpapi::protect(key)
+        .map_err(|e| DaemonError::Crypto(format!("could not seal the encryption key: {e}")))?;
+    #[cfg(not(windows))]
+    let contents = hex_encode(key).into_bytes();
+
+    let dest = key_file_path(data_dir);
+    let tmp = dest.with_extension("tmp");
+    std::fs::write(&tmp, contents)?;
+    std::fs::rename(&tmp, &dest)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn unseal_key(blob: &[u8], path: &Path) -> Result<[u8; KEY_LEN], DaemonError> {
+    let bytes = dpapi::unprotect(blob).map_err(|e| {
+        DaemonError::Crypto(format!(
+            "{}: could not unseal the encryption key (was the data directory copied from \
+             another user or machine?): {e}",
+            path.display()
+        ))
+    })?;
+    bytes.try_into().map_err(|v: Vec<u8>| {
+        DaemonError::Crypto(format!(
+            "{}: expected {KEY_LEN} bytes, got {}",
+            path.display(),
+            v.len()
+        ))
+    })
+}
+
+#[cfg(windows)]
+fn remove_plaintext(path: &Path) {
+    if let Err(e) = std::fs::remove_file(path) {
+        tracing::warn!(
+            "could not remove the plaintext key file {}: {e}",
+            path.display()
+        );
+    }
+}
+
+/// Windows DPAPI, user scope: only this Windows user on this machine can
+/// unseal what it seals.
+#[cfg(windows)]
+mod dpapi {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Cryptography::{
+        CryptProtectData, CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
+    };
+
+    pub fn protect(data: &[u8]) -> std::io::Result<Vec<u8>> {
+        let input = blob_of(data)?;
+        let mut output = CRYPT_INTEGER_BLOB::default();
+        // SAFETY: `input` points at `data`, which outlives the call; every
+        // optional pointer is null, which the API accepts; `output` is
+        // written by the call and freed below with `LocalFree` as documented.
+        let ok = unsafe {
+            CryptProtectData(
+                &input,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                CRYPTPROTECT_UI_FORBIDDEN,
+                &mut output,
+            )
+        };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(take(output, false))
+    }
+
+    pub fn unprotect(data: &[u8]) -> std::io::Result<Vec<u8>> {
+        let input = blob_of(data)?;
+        let mut output = CRYPT_INTEGER_BLOB::default();
+        // SAFETY: as in `protect`; the description out-pointer is null, so
+        // there is no second allocation to free.
+        let ok = unsafe {
+            CryptUnprotectData(
+                &input,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                CRYPTPROTECT_UI_FORBIDDEN,
+                &mut output,
+            )
+        };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(take(output, true))
+    }
+
+    fn blob_of(data: &[u8]) -> std::io::Result<CRYPT_INTEGER_BLOB> {
+        let len = u32::try_from(data.len())
+            .map_err(|_| std::io::Error::other("input too large for DPAPI"))?;
+        Ok(CRYPT_INTEGER_BLOB {
+            cbData: len,
+            // DPAPI takes a mutable pointer but does not write through the
+            // input blob.
+            pbData: data.as_ptr().cast_mut(),
+        })
+    }
+
+    /// Copy out and free a DPAPI output buffer, wiping it first when it held
+    /// plaintext.
+    fn take(output: CRYPT_INTEGER_BLOB, wipe: bool) -> Vec<u8> {
+        if output.pbData.is_null() {
+            return Vec::new();
+        }
+        let len = output.cbData as usize;
+        // SAFETY: on success DPAPI hands back `cbData` initialized bytes at
+        // `pbData`, allocated with `LocalAlloc`, which we own until freed.
+        unsafe {
+            let bytes = std::slice::from_raw_parts(output.pbData, len).to_vec();
+            if wipe {
+                std::ptr::write_bytes(output.pbData, 0, len);
+            }
+            LocalFree(output.pbData.cast());
+            bytes
+        }
+    }
+}
+
+// The stored form off Windows; on Windows only the tests need it.
+#[cfg(any(not(windows), test))]
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -204,6 +429,67 @@ mod tests {
         let key = [7u8; KEY_LEN];
         let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
         let _ = CIPHER.set(cipher);
+    }
+
+    fn temp_data_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "bt-crypto-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A generated key is stored, and the same key comes back on the next
+    /// start.
+    #[test]
+    fn a_generated_key_is_stored_and_reloaded() {
+        let dir = temp_data_dir("gen");
+        let first = load_or_create_key_file(&dir).unwrap();
+        assert!(key_file_path(&dir).is_file());
+        assert_eq!(load_or_create_key_file(&dir).unwrap(), first);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Windows: the stored key is never plaintext, and a plaintext key left by
+    /// an earlier version is sealed and removed on first read.
+    #[cfg(windows)]
+    #[test]
+    fn a_plaintext_key_is_sealed_then_removed() {
+        let dir = temp_data_dir("migrate");
+        let key = [9u8; KEY_LEN];
+        std::fs::write(dir.join(KEY_FILE_NAME), hex_encode(&key)).unwrap();
+
+        assert_eq!(load_or_create_key_file(&dir).unwrap(), key);
+        assert!(!dir.join(KEY_FILE_NAME).exists(), "plaintext removed");
+        let sealed = std::fs::read(dir.join(SEALED_KEY_FILE_NAME)).unwrap();
+        assert!(
+            !sealed.windows(KEY_LEN).any(|w| w == key)
+                && !String::from_utf8_lossy(&sealed).contains(&hex_encode(&key)),
+            "the sealed file must not contain the key in the clear"
+        );
+        assert_eq!(
+            load_or_create_key_file(&dir).unwrap(),
+            key,
+            "still the same key"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `adopt_key` never replaces a stored key, sealed or not.
+    #[test]
+    fn adopting_a_key_never_overwrites_a_stored_one() {
+        let dir = temp_data_dir("adopt");
+        let hex = hex_encode(&[3u8; KEY_LEN]);
+        assert!(adopt_key(&dir, &hex).unwrap());
+        assert_eq!(load_or_create_key_file(&dir).unwrap(), [3u8; KEY_LEN]);
+        assert!(!adopt_key(&dir, &hex_encode(&[4u8; KEY_LEN])).unwrap());
+        assert_eq!(load_or_create_key_file(&dir).unwrap(), [3u8; KEY_LEN]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
