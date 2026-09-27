@@ -583,13 +583,11 @@ impl Default for KittyToolsServer {
 }
 
 impl KittyToolsServer {
-    /// Assembles the router from three pieces: the 17 always-on `lean_*`
-    /// local-machine tools; `lean_shell`, included on every platform except
-    /// Android (see `shell_tool_router`'s doc comment); and the 3
-    /// visualization tools, included only when `KITTY_VIZ_ENABLED=1`. Web
-    /// search (`lean_web_search` / `lean_web_search_read_chunk`) lives in the
-    /// Python `kitty-docs-web` process instead — see `docs/VERSIONS.md` for
-    /// why the merged Brave/DuckDuckGo search tool moved out of this crate.
+    /// Assembles the router from three pieces: the 24 always-on `lean_*`
+    /// local-machine tools; `lean_shell` and `lean_shell_ro`, included on
+    /// every platform except Android (see `shell_tool_router`'s doc comment);
+    /// and the 4 visualization tools, included only when the configuration
+    /// enables them. Web search lives in `kitty-web`.
     /// Per the base plan: "remove tools from the router at startup rather
     /// than registering them and failing at call time" — env/platform is
     /// fixed for the process lifetime and BigTiny restarts this server
