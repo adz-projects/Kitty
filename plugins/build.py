@@ -50,8 +50,9 @@ MANIFEST = BINARIES_DIR / "manifest.json"
 
 # The LiteRT runtime the daemon loads by bare name at runtime; they must sit
 # beside it, which Tauri's `bundle.resources` arranges (docs/RELEASE.md,
-# "LiteRT runtime"). `litert-lm-rust` downloads them into the daemon's build
-# output, and a daemon build stages them from there.
+# "LiteRT runtime"). `litert-lm-rust`'s build script downloads them into its
+# own build-script output (`target/release/build/litert-lm-rust-*/out/
+# prebuilt/`), and a daemon build stages them from there.
 LITERT_DLLS = [
     "libLiteRt.dll",
     "libLiteRtWebGpuAccelerator.dll",
@@ -217,16 +218,37 @@ def build_target(name: str) -> None:
     print(f"-> {dest}")
 
     if cfg.get("stage_dlls"):
+        prebuilt = litert_prebuilt_dir(release_dir)
         for dll in LITERT_DLLS:
-            src = release_dir / dll
+            src = prebuilt / dll
             if not src.exists():
-                raise SystemExit(f"{dll} not found in {release_dir}; the LiteRT download step did not run")
+                raise SystemExit(f"{dll} not found in {prebuilt}; the LiteRT download step did not run")
             shutil.copy2(src, RESOURCES_DIR / dll)
             print(f"-> {RESOURCES_DIR / dll}")
 
     manifest = load_manifest()
     manifest[name] = source_hash(name)
     save_manifest(manifest)
+
+
+def litert_prebuilt_dir(release_dir: Path) -> Path:
+    """Where `litert-lm-rust` put the DLLs it downloaded for this build.
+
+    One `build/litert-lm-rust-<hash>` directory per feature/profile
+    combination can exist side by side; the one this build used is the one
+    whose runtime DLL was written most recently.
+    """
+    candidates = [
+        d / "out" / "prebuilt"
+        for d in (release_dir / "build").glob("litert-lm-rust-*")
+        if (d / "out" / "prebuilt" / LITERT_DLLS[0]).exists()
+    ]
+    if not candidates:
+        raise SystemExit(
+            f"no litert-lm-rust download under {release_dir / 'build'}; "
+            "was the daemon built with --features litert-engine?"
+        )
+    return max(candidates, key=lambda d: (d / LITERT_DLLS[0]).stat().st_mtime)
 
 
 def main() -> int:
