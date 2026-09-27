@@ -26,6 +26,9 @@ export interface Config {
   needs_default_provider: boolean;
   /** Remembered handoff-gate answer (`keep` / `clean`); absent asks each time. */
   handoff_gate_choice?: string | null;
+  /** Every earlier chats base, newest last, so chats left there still count
+      as Kitty's own. */
+  chats_roots_history?: string[];
   /** `imported` or `dismissed` once the V1 data offer has been answered. */
   v1_import_state?: string | null;
   show_artifacts: boolean;

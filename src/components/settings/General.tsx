@@ -3,11 +3,36 @@ import { useConfigDraft } from './useConfigDraft';
 import { isAndroid } from '@/lib/platform';
 import { ipc, pickFolder } from '@/lib/ipc';
 import { accelerator } from '@/lib/accelerator';
+import { confirmDialog } from '@/components/shared/ConfirmDialog';
 
-/** General settings backed by app config. Approval mode is per-session (see
-    the chat mode badge) rather than living here. */
+/** General settings backed by app config. Tool approvals are decided per
+    call (Settings → Tool permissions lists what is always allowed). */
 export function General() {
   const { draft, update, save, saved, error } = useConfigDraft();
+  const [moveNotice, setMoveNotice] = useState<string | null>(null);
+
+  // A new chats folder: offer to bring the existing chat folders along (#51).
+  // The old location stays known either way, so chats left there still work.
+  const saveAndOfferMove = async () => {
+    setMoveNotice(null);
+    const changed = await save();
+    if (!changed || !('default_context_folder' in changed)) return;
+    try {
+      const history = (await ipc.getConfig()).chats_roots_history ?? [];
+      const from = history[history.length - 1];
+      if (!from) return;
+      const ok = await confirmDialog({
+        title: 'Move your existing chats?',
+        message: `Move the chat folders in ${from} to the new chats folder? Chats work either way; moving keeps them in one place.`,
+        confirmLabel: 'Move them',
+      });
+      if (!ok) return;
+      const moved = await ipc.moveChatFolders(from);
+      setMoveNotice(`Moved ${moved} chat folder${moved === 1 ? '' : 's'}.`);
+    } catch (e) {
+      setMoveNotice(`Couldn't move the chat folders: ${String(e)}`);
+    }
+  };
   const [recordingToggle, setRecordingToggle] = useState(false);
   const [recordingClipboard, setRecordingClipboard] = useState(false);
   const [recordingOpenWindow, setRecordingOpenWindow] = useState(false);
@@ -231,10 +256,11 @@ export function General() {
       )}
 
       <div className="row">
-        <button className="primary" onClick={() => void save()}>
+        <button className="primary" onClick={() => void saveAndOfferMove()}>
           Save
         </button>
         {saved && <span className="muted">Saved.</span>}
+        {moveNotice && <span className="muted">{moveNotice}</span>}
         {error && <span className="error">Couldn't save: {error}</span>}
       </div>
     </section>

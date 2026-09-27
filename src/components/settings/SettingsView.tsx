@@ -14,6 +14,7 @@ import { AdaptivePathway } from '@/components/settings/AdaptivePathway';
 import { Memorabilia } from '@/components/settings/Memorabilia';
 import { ScheduledTasks } from '@/components/settings/ScheduledTasks';
 import { Specialists } from '@/components/settings/Specialists';
+import { ToolPermissions } from '@/components/settings/ToolPermissions';
 
 function sectionLabels(): Record<string, string> {
   return {
@@ -21,6 +22,7 @@ function sectionLabels(): Record<string, string> {
     providers: 'Providers',
     local_models: 'Helper Models',
     mcp_servers: 'MCP Servers',
+    tool_permissions: 'Tool permissions',
     scheduled_tasks: 'Scheduled Tasks',
     specialists: 'Specialists',
     adaptive_pathway: 'Adaptive Pathway',
@@ -59,7 +61,12 @@ function buildGroups(): { label: string; sections: string[] }[] {
       // Specialists (agent delegation) is desktop-only — forced off on Android
       // at the daemon MCP layer (`bigtiny/mcp.rs`), so its pane would be a dead
       // toggle. Same for Memorabilia in Advanced below.
-      sections: ['mcp_servers', 'scheduled_tasks', ...(isAndroid() ? [] : ['specialists'])],
+      sections: [
+        'mcp_servers',
+        'tool_permissions',
+        'scheduled_tasks',
+        ...(isAndroid() ? [] : ['specialists']),
+      ],
     },
     {
       label: 'Advanced',
@@ -166,6 +173,7 @@ export function SettingsView() {
         {section === 'providers' && <Providers highlight={highlight} />}
         {section === 'local_models' && <HelperModels />}
         {section === 'mcp_servers' && <McpServers />}
+        {section === 'tool_permissions' && <ToolPermissions />}
         {section === 'scheduled_tasks' && <ScheduledTasks />}
         {section === 'specialists' && <Specialists />}
         {section === 'adaptive_pathway' && <AdaptivePathway />}

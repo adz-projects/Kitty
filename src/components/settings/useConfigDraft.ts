@@ -54,16 +54,19 @@ export function useConfigDraft() {
     setDraft((d) => (d ? { ...d, ...patch } : d));
   };
 
-  const save = async () => {
-    if (!draft || !base.current) return;
+  /** Resolves with what was saved (the changed fields), or null on failure. */
+  const save = async (): Promise<Partial<Config> | null> => {
+    if (!draft || !base.current) return null;
     setError(null);
     const patch = configDiff(base.current as unknown as Fields, draft as unknown as Fields);
     try {
       if (Object.keys(patch).length > 0) await ipc.patchConfig(patch);
       base.current = draft;
       setSaved(true);
+      return patch as Partial<Config>;
     } catch (e) {
       setError(String(e));
+      return null;
     }
   };
 
