@@ -8,6 +8,50 @@ no HKCU env vars, no spawned inference binary.
 Status: **SHIPPED.** Phases 0–8 are implemented; §10 is the record of the order
 they were built in, not outstanding work. Open items live in `docs/BACKLOG.md`.
 
+## Android at v1.0 — read this first
+
+The rest of this document is the plan it was built from, and much of it
+predates later decisions. Where it disagrees with this section, this section
+is right.
+
+- **Engine**: BigTiny **V2**, linked in and hosted in-process
+  (`lifecycle/bigtiny_embedded.rs`), on a loopback port behind per-app keys
+  (D26). Its at-rest key is **supplied by Kitty from the SecretStore**
+  (AndroidKeyStore-sealed) at every start — an older install's plaintext
+  `encryption.key` is adopted into the SecretStore and deleted — superseding
+  D26(b). A V1 install's data is offered for one-click import (the hub
+  banner), superseding D26(c)'s "start fresh".
+- **No engine restart on the phone.** Start-up settings apply the next time
+  Kitty starts; the restart buttons are hidden and the hub says so.
+- **Memory**: Adaptive Pathway runs when the EmbeddingGemma model (and the
+  Gemma `tokenizer.json` downloaded with it) is on disk and the toggle is on;
+  switched per app without a restart. **Memorabilia and specialists are off on
+  Android** — their Settings panes are hidden and their MCP rows register
+  disabled. No generative model runs on the phone; compaction uses the chat's
+  own provider.
+- **In-process MCP servers** (`kitty-tools` 24 tools — no shell — plus 4
+  visualization; `kitty-web`; `kitty-wasm`) are configured through an explicit
+  `InProcessConfig` from their MCP rows (grant roots, plugin home, keys), never
+  the process environment (D10).
+- **Scheduled tasks run while Kitty's process is alive.** A task that fell due
+  while Android had closed Kitty runs when it next opens (the engine's
+  start-up catch-up). Headless runs via WorkManager were scoped and deferred:
+  `docs/BACKLOG.md`. This supersedes §7.
+- **Share-to-Kitty**: `SEND` / `SEND_MULTIPLE` for text, images and documents.
+  `KittyPlugin` copies shared files out of the sending app at once and queues
+  the share; the hub opens a new chat with the files attached and the text in
+  the composer (`commands::take_incoming`, `lib/incoming.ts`).
+- **Notifications**: one channel per kind — approvals (high importance),
+  finished replies, problems, engine status — tuned in Android's own Settings.
+  Tapping one opens the chat it is about (through the same intent queue), and
+  a waiting approval shows there. Notification permission is asked before the
+  first download or the first chat turn, whichever comes first — there is no
+  wizard permissions step (superseding §8.3).
+- **Chat menu (⋯)**: incognito, and "Allowed folders" to see and revoke what
+  the chat may read and write.
+- **Desktop-only by design**: rename/folders/move-to-folder, per-chat and bulk
+  export, custom themes, screenshots, watching a specialist, and shell tools.
+
 > **Two things below are superseded by later work and kept only as record.**
 > Read them through these corrections:
 >
@@ -618,6 +662,10 @@ All under `Settings → Local models`, shared component on both OS.
 
 ## 7. Scheduled tasks (D3)
 
+> **Superseded.** Schedules live in the engine (`/api/schedules`) on both
+> platforms and run on a chosen provider card; on Android they run while
+> Kitty's process is alive. See "Android at v1.0" above.
+
 - `ScheduledTask` (daemon `config.rs`) gains `model_id: Option<String>` (empty =
   summarizer default).
 - Fire: pass `model_overrides` on `send` (`PATCH /api/chat/{id}/model`); else the
@@ -702,6 +750,12 @@ All under `Settings → Local models`, shared component on both OS.
   card (read-only) + cloud providers for chat.
 
 ### 8.3 Wizard (D14)
+
+> **As built:** Android runs support model → connect a provider → done. There
+> is no permissions step: notification permission is asked when first needed
+> (a download or a chat turn). Repair opens at the broken step and Back leaves
+> it.
+
 - One shared, in-page step flow. Adapter:
   - Windows: daemon present? → autostart → done.
   - Android: **permissions step** (POST_NOTIFICATIONS, foreground service) — only
