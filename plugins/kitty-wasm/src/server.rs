@@ -8,6 +8,7 @@
 //! name that describes what actually happens.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::Arc;
 use std::time::Duration;
 
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -18,6 +19,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
+use crate::config::InProcessConfig;
 use crate::sandbox::{self, Mount, RunRequest, MAX_TIMEOUT_SECS};
 use crate::{guest, python};
 
@@ -66,6 +68,9 @@ pub struct GuestStatusRequest {
 #[derive(Debug, Clone)]
 pub struct KittyWasmServer {
     tool_router: ToolRouter<Self>,
+    /// What the host configured; every tool call runs inside it (see
+    /// `call_tool` and `crate::config`).
+    config: Arc<InProcessConfig>,
 }
 
 impl Default for KittyWasmServer {
@@ -76,8 +81,15 @@ impl Default for KittyWasmServer {
 
 impl KittyWasmServer {
     pub fn new() -> Self {
+        Self::with_config(InProcessConfig::from_env())
+    }
+
+    /// A server configured explicitly rather than from the process
+    /// environment - what an in-process host builds.
+    pub fn with_config(config: InProcessConfig) -> Self {
         Self {
             tool_router: Self::wasm_tool_router(),
+            config: Arc::new(config),
         }
     }
 
@@ -202,7 +214,7 @@ async fn execute_python(req: ExecutePythonRequest) -> String {
     // `spawn_blocking` is mandatory, not a nicety — see `sandbox::run_module`'s
     // doc comment: the synchronous WASI shim it links uses `block_on`, which
     // panics if it runs on a thread already driving the tokio reactor.
-    let joined = tokio::task::spawn_blocking(move || {
+    let joined = crate::config::spawn_blocking(move || {
         python::run_python(
             &guest_path,
             &code,
@@ -252,7 +264,7 @@ impl KittyWasmServer {
     pub async fn wasm_run_module(&self, Parameters(req): Parameters<RunModuleRequest>) -> String {
         // Blocking sandbox work off the reactor — see `execute_python` above
         // and `sandbox::run_module`'s doc comment for why this is required.
-        tokio::task::spawn_blocking(move || {
+        crate::config::spawn_blocking(move || {
             guarded(move || {
                 // Validate both paths before doing any work. `workspace` used
                 // to be checked *after* the module was compiled, so a bad
@@ -343,6 +355,18 @@ impl KittyWasmServer {
 impl ServerHandler for KittyWasmServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    }
+
+    /// The generated dispatch, run inside this server's configuration so the
+    /// tools below it read the host's settings rather than the process
+    /// environment.
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        crate::config::scope(self.config.clone(), self.tool_router.call(tcc)).await
     }
 }
 

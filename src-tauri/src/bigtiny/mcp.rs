@@ -34,47 +34,6 @@ fn bundled_transport(logical: &str, exe: &str) -> (String, String) {
     }
 }
 
-/// Hand a setting to an in-process MCP server.
-///
-/// `builtin::connect` takes no env map — a linked server reads the *daemon's*
-/// process environment, which on Android is our own. So a value that travels
-/// in `McpServerSpec::env` on desktop has to be set here instead, or it
-/// silently never arrives.
-///
-/// Returns the env map to attach to the spec: populated on desktop (where a
-/// child process needs it), empty on Android (where it would be ignored).
-///
-/// **The Android branch mutates the process environment while the daemon's
-/// tasks are already running**, because `sync_mcp_once_healthy` is what calls
-/// this, and by definition that is after the daemon is healthy.
-/// `std::env::set_var` is not safe against a concurrent reader — it is
-/// `unsafe` in Rust 2024 for exactly this reason — so the only genuinely sound
-/// place to set a variable for the daemon is `bigtiny_env::daemon_env`, whose
-/// values `bigtiny_embedded::start` applies *before* the daemon exists.
-///
-/// The three variables that still go through here are tolerated rather than
-/// endorsed, and each is a value this function cannot know at startup:
-/// `KITTY_VIZ_ENABLED` and `BRAVE_API_KEY` follow Settings toggles that can
-/// change at runtime, and `KITTY_WASM_PYTHON` needs an `AppHandle`. All three
-/// are read once, by an in-process server, at the connect that this same sync
-/// pass triggers — so the write and the read are ordered in practice even
-/// though nothing enforces it.
-///
-/// **Do not add new variables here.** Anything knowable at startup belongs in
-/// `daemon_env` (that is where `KITTY_PLUGIN_HOME` went), and anything added
-/// here inherits a data race that is currently only benign by luck.
-#[allow(unused_variables)]
-fn server_env(pairs: Vec<(String, String)>) -> HashMap<String, String> {
-    if cfg!(target_os = "android") {
-        for (key, value) in pairs {
-            std::env::set_var(key, value);
-        }
-        HashMap::new()
-    } else {
-        pairs.into_iter().collect()
-    }
-}
-
 /// A BigTiny MCP server row, with the JSON-string `args`/`env` columns
 /// parsed into structured data for the frontend.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -532,7 +491,7 @@ pub async fn ensure_builtin_servers(app: &AppHandle) {
             ));
         }
     }
-    let kitty_wasm_env = server_env(kitty_wasm_pairs);
+    let kitty_wasm_env: HashMap<String, String> = kitty_wasm_pairs.into_iter().collect();
     upsert_builtin(
         &client,
         "kitty-wasm",
@@ -580,7 +539,7 @@ pub async fn ensure_builtin_servers(app: &AppHandle) {
     if visualizations_enabled {
         kitty_tools_pairs.push(("KITTY_VIZ_ENABLED".to_string(), "1".to_string()));
     }
-    let kitty_tools_env = server_env(kitty_tools_pairs);
+    let kitty_tools_env: HashMap<String, String> = kitty_tools_pairs.into_iter().collect();
     upsert_builtin(
         &client,
         "kitty-tools",
@@ -630,7 +589,7 @@ pub async fn ensure_builtin_servers(app: &AppHandle) {
             if brave_search_enabled && !brave_api_key.is_empty() {
                 kitty_web_pairs.push(("BRAVE_API_KEY".to_string(), brave_api_key));
             }
-            let kitty_web_env = server_env(kitty_web_pairs);
+            let kitty_web_env: HashMap<String, String> = kitty_web_pairs.into_iter().collect();
             upsert_builtin(
                 &client,
                 "kitty-web",

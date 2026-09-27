@@ -1,3 +1,4 @@
+pub mod config;
 pub mod doc_store;
 pub mod docx;
 pub mod extract;
@@ -11,6 +12,7 @@ pub mod tools;
 use rmcp::ServiceExt;
 use tokio::io::{AsyncRead, AsyncWrite};
 
+pub use config::InProcessConfig;
 use server::KittyToolsServer;
 
 /// Runs a fresh `KittyToolsServer` over any duplex byte stream until the
@@ -22,11 +24,14 @@ use server::KittyToolsServer;
 /// function is handed both resolve to the same underlying transport impl
 /// (any `AsyncRead + AsyncWrite`), so this is the whole difference between
 /// the two hosting modes — same server, same tool router, same behavior.
-pub async fn serve_in_process<S>(stream: S) -> anyhow::Result<()>
+///
+/// `config` is what the stdio binary would have read from its environment;
+/// see [`config`] for why an in-process host must pass it explicitly.
+pub async fn serve_in_process<S>(stream: S, config: InProcessConfig) -> anyhow::Result<()>
 where
     S: AsyncRead + AsyncWrite + Send + 'static,
 {
-    let server = KittyToolsServer::new().serve(stream).await?;
+    let server = KittyToolsServer::with_config(config).serve(stream).await?;
     server.waiting().await?;
     Ok(())
 }

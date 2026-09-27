@@ -70,20 +70,18 @@ pub const ALLOWED_DIRS_FILE_ENV: &str = "KITTY_ALLOWED_DIRS_FILE";
 /// `path_within_allowed` compared every path against the filesystem root and
 /// answered `true` for all of them. A boundary that cannot be located must
 /// reject, not wave everything through — see `path_within_allowed`.
+///
+/// Read from the host's [`crate::config::InProcessConfig`], so two in-process
+/// servers for two apps each see their own.
 pub fn home_dir() -> Option<PathBuf> {
-    static HOME: OnceLock<Option<PathBuf>> = OnceLock::new();
-    HOME.get_or_init(|| resolve_home(|key| std::env::var(key).ok()))
-        .clone()
+    crate::config::current().plugin_home.clone()
 }
 
 /// The resolution order itself, taking its environment as a parameter so it
-/// is testable without mutating the process (and without fighting
-/// `home_dir`'s process-lifetime cache).
+/// is testable without mutating the process.
+#[cfg(test)]
 fn resolve_home(env: impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
-    [PLUGIN_HOME_ENV, "USERPROFILE", "HOME"]
-        .into_iter()
-        .find_map(|key| env(key).filter(|p| !p.trim().is_empty()).map(PathBuf::from))
-        .or_else(dirs::home_dir)
+    crate::config::InProcessConfig::from_lookup(env).plugin_home
 }
 
 /// True when `path` resolves to a location inside the user's home directory.
@@ -145,17 +143,15 @@ fn canon_of(root: &Path) -> PathBuf {
 }
 
 pub fn allowed_roots() -> Vec<PathBuf> {
+    let config = crate::config::current();
     let mut roots: Vec<PathBuf> = Vec::new();
-    if let Some(home) = home_dir() {
-        roots.push(home);
+    if let Some(home) = &config.plugin_home {
+        roots.push(home.clone());
     }
-    if let Some(raw) = std::env::var_os(ALLOWED_DIRS_ENV) {
-        // `split_paths` rather than a hand-rolled split on ';' or ':' —
-        // on Windows the latter would cut every path in half at its drive
-        // letter.
-        roots.extend(std::env::split_paths(&raw).filter(|p| !p.as_os_str().is_empty()));
+    roots.extend(config.allowed_dirs.iter().cloned());
+    if let Some(file) = &config.allowed_dirs_file {
+        roots.extend(grant_file_roots(file));
     }
-    roots.extend(grant_file_roots());
     roots.sort();
     roots.dedup();
     roots
@@ -169,7 +165,7 @@ pub fn allowed_roots() -> Vec<PathBuf> {
 /// per-session containment check by the time a call reaches this process, so
 /// a stale or absent grants file costs a false rejection, never a false
 /// admission.
-fn grant_file_roots() -> Vec<PathBuf> {
+fn grant_file_roots(path: &Path) -> Vec<PathBuf> {
     /// The grants file's identity as last read, with what it contained. Length
     /// as well as mtime: a rewrite inside the filesystem's mtime granularity
     /// (1-2s on some Windows volumes) is exactly the case a mtime-only guard
@@ -180,39 +176,40 @@ fn grant_file_roots() -> Vec<PathBuf> {
         len: u64,
         roots: Vec<PathBuf>,
     }
-    static CACHE: OnceLock<Mutex<Option<Cached>>> = OnceLock::new();
+    // Keyed by path: an in-process host runs one server per app in this
+    // process, each with its own grants file.
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Cached>>> = OnceLock::new();
 
-    let Some(path) = std::env::var_os(ALLOWED_DIRS_FILE_ENV) else {
-        return Vec::new();
-    };
-    let path = PathBuf::from(path);
-    let Ok(meta) = std::fs::metadata(&path) else {
+    let Ok(meta) = std::fs::metadata(path) else {
         return Vec::new();
     };
     let stamp = (meta.modified().unwrap_or(std::time::UNIX_EPOCH), meta.len());
 
-    let cache = CACHE.get_or_init(|| Mutex::new(None));
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let mut guard = match cache.lock() {
         Ok(g) => g,
         // A panic in another thread poisoned it; re-read rather than give up
         // the grants entirely.
         Err(poisoned) => poisoned.into_inner(),
     };
-    if let Some(hit) = guard.as_ref() {
+    if let Some(hit) = guard.get(path) {
         if (hit.mtime, hit.len) == stamp {
             return hit.roots.clone();
         }
     }
 
-    let roots = std::fs::read_to_string(&path)
+    let roots = std::fs::read_to_string(path)
         .ok()
         .map(|text| parse_grants(&text))
         .unwrap_or_default();
-    *guard = Some(Cached {
-        mtime: stamp.0,
-        len: stamp.1,
-        roots: roots.clone(),
-    });
+    guard.insert(
+        path.to_path_buf(),
+        Cached {
+            mtime: stamp.0,
+            len: stamp.1,
+            roots: roots.clone(),
+        },
+    );
     roots
 }
 

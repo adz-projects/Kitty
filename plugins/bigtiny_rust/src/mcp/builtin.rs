@@ -66,7 +66,7 @@ pub async fn connect(
         }
         "kitty-tools" => {
             MCPServerClient::connect_in_process(server_id, |stream| async move {
-                if let Err(e) = kitty_tools::serve_in_process(stream).await {
+                if let Err(e) = kitty_tools::serve_in_process(stream, kitty_tools::InProcessConfig::from_env()).await {
                     tracing::error!("kitty-tools in-process server exited with error: {e}");
                 }
             })
@@ -74,7 +74,7 @@ pub async fn connect(
         }
         "kitty-web" => {
             MCPServerClient::connect_in_process(server_id, |stream| async move {
-                if let Err(e) = kitty_web::serve_in_process(stream).await {
+                if let Err(e) = kitty_web::serve_in_process(stream, kitty_web::InProcessConfig::from_env()).await {
                     tracing::error!("kitty-web in-process server exited with error: {e}");
                 }
             })
@@ -82,7 +82,7 @@ pub async fn connect(
         }
         "kitty-wasm" => {
             MCPServerClient::connect_in_process(server_id, |stream| async move {
-                if let Err(e) = kitty_wasm::serve_in_process(stream).await {
+                if let Err(e) = kitty_wasm::serve_in_process(stream, kitty_wasm::InProcessConfig::from_env()).await {
                     tracing::error!("kitty-wasm in-process server exited with error: {e}");
                 }
             })

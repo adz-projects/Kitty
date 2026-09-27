@@ -8,6 +8,7 @@
 //! tool-selection behavior for no benefit.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::Arc;
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -16,6 +17,7 @@ use rmcp::{tool, tool_handler, tool_router, ServerHandler};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
+use crate::config::InProcessConfig;
 use crate::envelope::error_response;
 use crate::{scrape, search};
 
@@ -64,6 +66,9 @@ pub struct WebScrapeRequest {
 #[derive(Debug, Clone)]
 pub struct KittyWebServer {
     tool_router: ToolRouter<Self>,
+    /// What the host configured; every tool call runs inside it (see
+    /// `call_tool` and `crate::config`).
+    config: Arc<InProcessConfig>,
 }
 
 impl Default for KittyWebServer {
@@ -74,8 +79,15 @@ impl Default for KittyWebServer {
 
 impl KittyWebServer {
     pub fn new() -> Self {
+        Self::with_config(InProcessConfig::from_env())
+    }
+
+    /// A server configured explicitly rather than from the process
+    /// environment - what an in-process host builds.
+    pub fn with_config(config: InProcessConfig) -> Self {
         Self {
             tool_router: Self::web_tool_router(),
+            config: Arc::new(config),
         }
     }
 
@@ -188,6 +200,18 @@ impl KittyWebServer {
 impl ServerHandler for KittyWebServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    }
+
+    /// The generated dispatch, run inside this server's configuration so the
+    /// tools below it read the host's settings rather than the process
+    /// environment.
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        crate::config::scope(self.config.clone(), self.tool_router.call(tcc)).await
     }
 }
 

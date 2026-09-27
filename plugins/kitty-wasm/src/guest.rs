@@ -48,10 +48,8 @@ pub const PYTHON_GUEST_BYTES: u64 = 26_267_204;
 /// Android path depends on could never succeed: every write went to an
 /// unwritable location.
 pub fn data_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("KITTY_WASM_DATA_DIR") {
-        if !dir.trim().is_empty() {
-            return PathBuf::from(dir);
-        }
+    if let Some(dir) = crate::config::current().wasm_data_dir.clone() {
+        return dir;
     }
     crate::paths::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -108,8 +106,7 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 
 /// Where the Python guest is, if it's available right now.
 pub fn find_python_guest() -> Option<PathBuf> {
-    if let Ok(explicit) = std::env::var("KITTY_WASM_PYTHON") {
-        let path = PathBuf::from(explicit);
+    if let Some(path) = crate::config::current().wasm_python.clone() {
         if path.is_file() {
             return Some(path);
         }
@@ -125,7 +122,10 @@ pub fn find_python_guest() -> Option<PathBuf> {
 /// Human-readable status, used by the `wasm_guest_status` tool so a missing
 /// guest is an actionable message rather than a mysterious failure.
 pub fn python_guest_status() -> serde_json::Value {
-    let explicit = std::env::var("KITTY_WASM_PYTHON").ok();
+    let explicit = crate::config::current()
+        .wasm_python
+        .as_ref()
+        .map(|p| p.to_string_lossy().into_owned());
     let installed = guests_dir().join(PYTHON_GUEST_FILENAME);
     let resolved = find_python_guest();
 
@@ -225,7 +225,7 @@ pub async fn ensure_python_guest(allow_download: bool) -> Result<PathBuf> {
     if let Some(found) = find_python_guest() {
         return Ok(found);
     }
-    if std::env::var("KITTY_WASM_PYTHON").is_ok() {
+    if crate::config::current().wasm_python.is_some() {
         bail!(
             "KITTY_WASM_PYTHON is set but does not point at a readable file; \
              unset it to use the managed guest at {}",

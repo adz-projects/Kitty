@@ -24,6 +24,7 @@
 //! - [`server`] — the MCP tool surface
 
 pub mod capture;
+pub mod config;
 pub mod guest;
 pub mod paths;
 pub mod python;
@@ -33,17 +34,21 @@ pub mod server;
 use rmcp::ServiceExt;
 use tokio::io::{AsyncRead, AsyncWrite};
 
+pub use config::InProcessConfig;
 use server::KittyWasmServer;
 
 /// Runs a fresh `KittyWasmServer` over any duplex byte stream until it
 /// closes — the entry point for a host that links this crate in-process
 /// rather than spawning `main.rs`'s stdio binary. Mirrors
 /// `kitty_tools::serve_in_process`; see `docs/PLUGINS.md`.
-pub async fn serve_in_process<S>(stream: S) -> anyhow::Result<()>
+///
+/// `config` is what the stdio binary would have read from its environment;
+/// see [`config`] for why an in-process host must pass it explicitly.
+pub async fn serve_in_process<S>(stream: S, config: InProcessConfig) -> anyhow::Result<()>
 where
     S: AsyncRead + AsyncWrite + Send + 'static,
 {
-    let server = KittyWasmServer::new().serve(stream).await?;
+    let server = KittyWasmServer::with_config(config).serve(stream).await?;
     server.waiting().await?;
     Ok(())
 }

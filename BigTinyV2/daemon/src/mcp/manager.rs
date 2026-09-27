@@ -258,6 +258,7 @@ impl MCPManager {
                 super::builtin::connect(
                     &name,
                     server_id.to_string(),
+                    config.env.as_ref(),
                     engine,
                     mem_engine,
                     self.orchestrator.get().cloned(),

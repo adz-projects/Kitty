@@ -729,7 +729,7 @@ pub async fn web_scrape(
         }
     };
     let check_target = parsed_url.clone();
-    match tokio::task::spawn_blocking(move || crate::ssrf::check_url(&check_target)).await {
+    match crate::config::spawn_blocking(move || crate::ssrf::check_url(&check_target)).await {
         Ok(Ok(())) => {}
         Ok(Err(reason)) => return ssrf_blocked(&reason),
         Err(e) => {
@@ -952,7 +952,7 @@ pub async fn web_scrape(
         query.map(str::to_string),
         output_format.to_string(),
     );
-    let rendered = tokio::task::spawn_blocking(move || {
+    let rendered = crate::config::spawn_blocking(move || {
         render_scrape_result(
             &html,
             &url_owned,

@@ -1,4 +1,5 @@
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::Arc;
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -8,6 +9,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::config::InProcessConfig;
 use crate::doc_store::{self, Extraction};
 use crate::docx;
 use crate::docx::write::WriteMode;
@@ -569,6 +571,9 @@ pub struct AccessibleMermaidRequest {
 #[derive(Debug, Clone)]
 pub struct KittyToolsServer {
     tool_router: ToolRouter<Self>,
+    /// What the host configured; every tool call runs inside it (see
+    /// `call_tool` and `crate::config`).
+    config: Arc<InProcessConfig>,
 }
 
 impl Default for KittyToolsServer {
@@ -593,16 +598,23 @@ impl KittyToolsServer {
     /// which would burn context and invite the model to call something
     /// guaranteed to fail.
     pub fn new() -> Self {
+        Self::with_config(InProcessConfig::from_env())
+    }
+
+    /// A server configured explicitly rather than from the process
+    /// environment - what an in-process host builds.
+    pub fn with_config(config: InProcessConfig) -> Self {
         let mut router = Self::core_tool_router();
         #[cfg(not(target_os = "android"))]
         {
             router += Self::shell_tool_router();
         }
-        if std::env::var("KITTY_VIZ_ENABLED").as_deref() == Ok("1") {
+        if config.viz_enabled {
             router += Self::viz_tool_router();
         }
         Self {
             tool_router: router,
+            config: Arc::new(config),
         }
     }
 
@@ -644,7 +656,7 @@ fn guarded(f: impl FnOnce() -> String) -> String {
 /// inline stalls the executor behind one big PDF or workbook while nothing
 /// else can run.
 async fn offload(f: impl FnOnce() -> String + Send + 'static) -> String {
-    match tokio::task::spawn_blocking(f).await {
+    match crate::config::spawn_blocking(f).await {
         Ok(s) => s,
         Err(_) => error_response(
             "INTERNAL_ERROR",
@@ -1172,7 +1184,7 @@ impl KittyToolsServer {
         // text tools return: an image can only reach a vision model as an image
         // content block. The daemon preserves that block and injects it into the
         // conversation (see mcp/tools.rs::extract_images_from_rmcp).
-        let outcome = tokio::task::spawn_blocking(move || {
+        let outcome = crate::config::spawn_blocking(move || {
             catch_unwind(AssertUnwindSafe(|| tools::image::read_image(&req.path))).unwrap_or_else(
                 |_| {
                     Err(error_response(
@@ -1461,5 +1473,17 @@ impl KittyToolsServer {
 impl ServerHandler for KittyToolsServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    }
+
+    /// The generated dispatch, run inside this server's configuration so the
+    /// tools below it read the host's settings rather than the process
+    /// environment.
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResult, rmcp::ErrorData> {
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        crate::config::scope(self.config.clone(), self.tool_router.call(tcc)).await
     }
 }

@@ -15,7 +15,6 @@
 //! reasoning as `envelope.rs`'s duplication note.
 
 use std::path::PathBuf;
-use std::sync::OnceLock;
 
 /// The environment variable a host sets to tell this crate where the user's
 /// files actually live. Kitty sets it to its resolved app data directory
@@ -23,22 +22,18 @@ use std::sync::OnceLock;
 /// only on Android; desktop resolution is unchanged.
 pub const PLUGIN_HOME_ENV: &str = "KITTY_PLUGIN_HOME";
 
-/// The user's home directory, resolved once per process, or `None` when it
-/// genuinely cannot be determined.
+/// The user's home directory, or `None` when it genuinely cannot be
+/// determined. Read from the host's [`crate::config::InProcessConfig`], so
+/// two in-process servers for two apps each see their own.
 pub fn home_dir() -> Option<PathBuf> {
-    static HOME: OnceLock<Option<PathBuf>> = OnceLock::new();
-    HOME.get_or_init(|| resolve_home(|key| std::env::var(key).ok()))
-        .clone()
+    crate::config::current().plugin_home.clone()
 }
 
 /// The resolution order itself, taking its environment as a parameter so it
-/// is testable without mutating the process (and without fighting
-/// `home_dir`'s process-lifetime cache).
+/// is testable without mutating the process.
+#[cfg(test)]
 fn resolve_home(env: impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
-    [PLUGIN_HOME_ENV, "USERPROFILE", "HOME"]
-        .into_iter()
-        .find_map(|key| env(key).filter(|p| !p.trim().is_empty()).map(PathBuf::from))
-        .or_else(dirs::home_dir)
+    crate::config::InProcessConfig::from_lookup(env).plugin_home
 }
 
 /// The base both stores hang off. `None` home yields a relative placeholder,

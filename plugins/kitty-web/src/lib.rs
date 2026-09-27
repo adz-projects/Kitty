@@ -12,6 +12,7 @@
 //! Python originals, so this is a drop-in swap from the model's point of
 //! view — see `server.rs` and `envelope.rs` for why both are load-bearing.
 
+pub mod config;
 pub mod envelope;
 pub mod paths;
 pub mod query_filter;
@@ -24,6 +25,7 @@ pub mod ssrf;
 use rmcp::ServiceExt;
 use tokio::io::{AsyncRead, AsyncWrite};
 
+pub use config::InProcessConfig;
 use server::KittyWebServer;
 
 /// Runs a fresh `KittyWebServer` over any duplex byte stream until the stream
@@ -31,11 +33,14 @@ use server::KittyWebServer;
 /// instead of spawning `main.rs`'s stdio binary (an exec()-restricted
 /// platform, e.g. Android). Mirrors `kitty_tools::serve_in_process`; see
 /// `docs/PLUGINS.md`'s "in-process MCP server" section.
-pub async fn serve_in_process<S>(stream: S) -> anyhow::Result<()>
+///
+/// `config` is what the stdio binary would have read from its environment;
+/// see [`config`] for why an in-process host must pass it explicitly.
+pub async fn serve_in_process<S>(stream: S, config: InProcessConfig) -> anyhow::Result<()>
 where
     S: AsyncRead + AsyncWrite + Send + 'static,
 {
-    let server = KittyWebServer::new().serve(stream).await?;
+    let server = KittyWebServer::with_config(config).serve(stream).await?;
     server.waiting().await?;
     Ok(())
 }

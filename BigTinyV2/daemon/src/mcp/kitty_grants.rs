@@ -58,7 +58,17 @@ pub fn static_allowed_dirs(data_dir: &Path) -> String {
     if !data_dir.as_os_str().is_empty() {
         dirs.push(data_dir.to_path_buf());
     }
-    dirs.retain(|d| !d.as_os_str().is_empty());
+    join_absolute(dirs)
+}
+
+/// Join `dirs` for [`ALLOWED_DIRS_ENV`], dropping any that are not absolute.
+///
+/// A relative entry is never a real grant and is dangerous as one: the child
+/// canonicalizes each root against its own working directory, so `"."` (what
+/// `dirs_home` falls back to when no home is set, as in an Android app
+/// process) would become `/` there and admit the entire filesystem.
+fn join_absolute(mut dirs: Vec<PathBuf>) -> String {
+    dirs.retain(|d| d.is_absolute());
     dirs.sort();
     dirs.dedup();
     std::env::join_paths(dirs)
@@ -164,6 +174,16 @@ fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// No home resolves to `"."`; it must not become a root the child would
+    /// resolve to its working directory.
+    #[test]
+    fn relative_entries_are_never_granted() {
+        let temp = std::env::temp_dir();
+        let joined = join_absolute(vec![PathBuf::from("."), PathBuf::new(), temp.clone()]);
+        let roots: Vec<PathBuf> = std::env::split_paths(&joined).collect();
+        assert_eq!(roots, vec![temp]);
+    }
 
     #[test]
     fn the_static_set_carries_home_and_temp() {

@@ -13,7 +13,6 @@
 //! defense-in-depth for the crate's own tool surface.
 
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 
 /// The environment variable a host sets to tell this crate where **its own
 /// storage** goes. See `kitty_tools::paths::PLUGIN_HOME_ENV` — same variable,
@@ -47,20 +46,18 @@ pub const ALLOWED_DIRS_FILE_ENV: &str = "KITTY_ALLOWED_DIRS_FILE";
 /// answered `true` for all of them — meaning `workspace` could mount *any*
 /// directory on the device read-write into the guest, which is exactly what
 /// audit #111 added this check to prevent.
+///
+/// Read from the host's [`crate::config::InProcessConfig`], so two in-process
+/// servers for two apps each see their own.
 pub fn home_dir() -> Option<PathBuf> {
-    static HOME: OnceLock<Option<PathBuf>> = OnceLock::new();
-    HOME.get_or_init(|| resolve_home(|key| std::env::var(key).ok()))
-        .clone()
+    crate::config::current().plugin_home.clone()
 }
 
 /// The resolution order itself, taking its environment as a parameter so it
-/// is testable without mutating the process (and without fighting
-/// `home_dir`'s process-lifetime cache).
+/// is testable without mutating the process.
+#[cfg(test)]
 fn resolve_home(env: impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
-    [PLUGIN_HOME_ENV, "USERPROFILE", "HOME"]
-        .into_iter()
-        .find_map(|key| env(key).filter(|p| !p.trim().is_empty()).map(PathBuf::from))
-        .or_else(dirs::home_dir)
+    crate::config::InProcessConfig::from_lookup(env).plugin_home
 }
 
 /// True when `path` resolves to a location inside the user's home
@@ -86,17 +83,14 @@ pub fn path_within_allowed(path: &Path) -> bool {
 /// authorization was split out of `KITTY_PLUGIN_HOME`. An empty result rejects
 /// everything, for the same reason an undeterminable home does.
 pub fn allowed_roots() -> Vec<PathBuf> {
+    let config = crate::config::current();
     let mut roots: Vec<PathBuf> = Vec::new();
-    if let Some(home) = home_dir() {
-        roots.push(home);
+    if let Some(home) = &config.plugin_home {
+        roots.push(home.clone());
     }
-    if let Some(raw) = std::env::var_os(ALLOWED_DIRS_ENV) {
-        // `split_paths`, not a split on ':' — that would cut a Windows path at
-        // its drive letter.
-        roots.extend(std::env::split_paths(&raw).filter(|p| !p.as_os_str().is_empty()));
-    }
-    if let Some(file) = std::env::var_os(ALLOWED_DIRS_FILE_ENV) {
-        if let Ok(text) = std::fs::read_to_string(PathBuf::from(file)) {
+    roots.extend(config.allowed_dirs.iter().cloned());
+    if let Some(file) = &config.allowed_dirs_file {
+        if let Ok(text) = std::fs::read_to_string(file) {
             roots.extend(parse_grants(&text));
         }
     }

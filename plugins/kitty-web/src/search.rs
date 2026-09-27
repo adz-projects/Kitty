@@ -1012,8 +1012,9 @@ fn backoff_seconds(attempt: u32) -> f64 {
     BASE_BACKOFF_SECONDS * 2f64.powi(attempt as i32) + rand::thread_rng().gen_range(0.0..0.5)
 }
 
+/// The host's Brave key (see `crate::config`); empty when Brave is off.
 fn brave_api_key() -> String {
-    std::env::var("BRAVE_API_KEY").unwrap_or_default()
+    crate::config::current().brave_api_key.clone()
 }
 
 fn http_client() -> Result<reqwest::Client, String> {

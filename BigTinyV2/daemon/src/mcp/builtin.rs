@@ -14,6 +14,7 @@
 //! adding it as a dependency here and a new arm in `connect` — nothing in
 //! `mcp::manager`, `mcp::client`, or the DB schema needs to change.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::error::MCPServerError;
@@ -38,14 +39,25 @@ use super::client::MCPServerClient;
 /// resolved to `unknown in-process server: pathway`, and the model had no way
 /// to correct a belief it knew was wrong. Do not re-remove it without also
 /// removing that registration.
+///
+/// `env` is the row's environment, already merged with the per-app defaults
+/// (`manager::scoped_env`) - exactly what a stdio child of the same row would
+/// be spawned with. The `kitty-*` servers are handed it explicitly as their
+/// `InProcessConfig`; they used to read this daemon's own process environment
+/// instead, so every app's servers shared one set of settings and a changed
+/// setting only arrived when the host process restarted. A row update now
+/// reconnects the server (the normal update path), which rebuilds its config.
+#[allow(clippy::too_many_arguments)]
 pub async fn connect(
     name: &str,
     server_id: String,
+    env: Option<&serde_json::Value>,
     engine: Option<Arc<adaptive_pathway::engine::PathwayEngine>>,
     memorabilia: Option<Arc<memorabilia::engine::Engine>>,
     orchestrator: Option<Arc<crate::agent::orchestrator::Orchestrator>>,
     pool: sqlx::SqlitePool,
 ) -> Result<MCPServerClient, MCPServerError> {
+    let env = env_map(env);
     match name {
         "memorabilia" => {
             // Read-only lookup tools (memorabilia_search / memorabilia_read_item)
@@ -110,24 +122,27 @@ pub async fn connect(
             .await
         }
         "kitty-tools" => {
+            let config = kitty_tools::InProcessConfig::from_map(&env);
             MCPServerClient::connect_in_process(server_id, |stream| async move {
-                if let Err(e) = kitty_tools::serve_in_process(stream).await {
+                if let Err(e) = kitty_tools::serve_in_process(stream, config).await {
                     tracing::error!("kitty-tools in-process server exited with error: {e}");
                 }
             })
             .await
         }
         "kitty-web" => {
+            let config = kitty_web::InProcessConfig::from_map(&env);
             MCPServerClient::connect_in_process(server_id, |stream| async move {
-                if let Err(e) = kitty_web::serve_in_process(stream).await {
+                if let Err(e) = kitty_web::serve_in_process(stream, config).await {
                     tracing::error!("kitty-web in-process server exited with error: {e}");
                 }
             })
             .await
         }
         "kitty-wasm" => {
+            let config = kitty_wasm::InProcessConfig::from_map(&env);
             MCPServerClient::connect_in_process(server_id, |stream| async move {
-                if let Err(e) = kitty_wasm::serve_in_process(stream).await {
+                if let Err(e) = kitty_wasm::serve_in_process(stream, config).await {
                     tracing::error!("kitty-wasm in-process server exited with error: {e}");
                 }
             })
@@ -137,6 +152,24 @@ pub async fn connect(
             "unknown in-process server: {other}"
         ))),
     }
+}
+
+/// A row's env object as string pairs. Non-string values are rendered as
+/// their JSON text rather than dropped, matching how a stdio child would
+/// receive them.
+fn env_map(env: Option<&serde_json::Value>) -> HashMap<String, String> {
+    let Some(serde_json::Value::Object(map)) = env else {
+        return HashMap::new();
+    };
+    map.iter()
+        .map(|(key, value)| {
+            let value = match value {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            (key.clone(), value)
+        })
+        .collect()
 }
 
 /// Every registered built-in name, for callers that want to validate a
@@ -160,6 +193,39 @@ pub const PATHWAY_TOOLS: [&str; 2] = ["record", "forget"];
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_rows_env_becomes_each_plugins_config() {
+        let env = serde_json::json!({
+            "KITTY_PLUGIN_HOME": "/apps/a/plugin-home",
+            "KITTY_VIZ_ENABLED": "1",
+            "BRAVE_API_KEY": "k",
+            "KITTY_WASM_DATA_DIR": "/apps/a/wasm",
+        });
+        let map = env_map(Some(&env));
+
+        let tools = kitty_tools::InProcessConfig::from_map(&map);
+        assert!(tools.viz_enabled);
+        assert_eq!(
+            tools.plugin_home.as_deref(),
+            Some(std::path::Path::new("/apps/a/plugin-home"))
+        );
+        assert_eq!(
+            kitty_web::InProcessConfig::from_map(&map).brave_api_key,
+            "k"
+        );
+        assert_eq!(
+            kitty_wasm::InProcessConfig::from_map(&map)
+                .wasm_data_dir
+                .as_deref(),
+            Some(std::path::Path::new("/apps/a/wasm"))
+        );
+
+        // A row without the key has no Brave, whatever this process holds.
+        assert!(kitty_web::InProcessConfig::from_map(&env_map(None))
+            .brave_api_key
+            .is_empty());
+    }
+
     async fn test_pool() -> sqlx::SqlitePool {
         sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap()
     }
@@ -181,6 +247,7 @@ mod tests {
         let client = connect(
             "kitty-tools",
             "test-kitty-tools".to_string(),
+            None,
             None,
             None,
             None,
@@ -208,6 +275,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             test_pool().await,
         )
         .await;
@@ -219,6 +287,7 @@ mod tests {
         let client = connect(
             "kitty-web",
             "test-kitty-web".to_string(),
+            None,
             None,
             None,
             None,
@@ -236,6 +305,7 @@ mod tests {
         let client = connect(
             "kitty-wasm",
             "test-kitty-wasm".to_string(),
+            None,
             None,
             None,
             None,
@@ -278,6 +348,7 @@ mod tests {
             connect(
                 name,
                 format!("test-{name}"),
+                None,
                 Some(engine.clone()),
                 Some(mem_engine.clone()),
                 Some(orchestrator.clone()),
@@ -306,6 +377,7 @@ mod tests {
             "memorabilia",
             "test-memorabilia".to_string(),
             None,
+            None,
             Some(engine),
             None,
             test_pool().await,
@@ -327,6 +399,7 @@ mod tests {
         let client = connect(
             "pathway",
             "test-pathway".to_string(),
+            None,
             Some(engine),
             None,
             None,
@@ -348,6 +421,7 @@ mod tests {
         let client = connect(
             "specialists",
             "test-specialists".to_string(),
+            None,
             None,
             None,
             Some(test_orchestrator().await),
@@ -374,6 +448,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             test_pool().await,
         )
         .await
@@ -391,6 +466,7 @@ mod tests {
         match connect(
             "pathway",
             "test-pathway-off".to_string(),
+            None,
             None,
             None,
             None,

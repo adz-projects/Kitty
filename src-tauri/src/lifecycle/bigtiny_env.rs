@@ -268,12 +268,9 @@ pub fn daemon_env(
     // working directory of `/`, so every cache landed somewhere unwritable
     // and every containment check compared against the filesystem root.
     //
-    // Set here rather than in `bigtiny::mcp::server_env`, which is the other
-    // place that hands settings to in-process servers: that one runs
-    // `set_var` from `sync_mcp_once_healthy`, i.e. after the daemon's tasks
-    // are already live. `daemon_env`'s values are applied by
-    // `bigtiny_embedded::start` before the daemon exists, which is the only
-    // point where mutating the process environment is sound.
+    // This is the daemon's own default. The daemon gives each app's tool
+    // servers a narrower per-app home of its own (`mcp::manager::scoped_env`),
+    // handed to in-process servers explicitly as part of their row's env.
     if cfg!(target_os = "android") {
         if let Ok(dir) = crate::config::config_dir() {
             env.push((
