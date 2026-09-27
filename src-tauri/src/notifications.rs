@@ -224,13 +224,7 @@ fn emit_notification(_app: &AppHandle, title: &str, body: &str, _session_id: Opt
 #[cfg(all(not(windows), not(target_os = "android")))]
 fn emit_notification(app: &AppHandle, title: &str, body: &str, _session_id: Option<&str>) {
     use tauri_plugin_notification::NotificationExt;
-    if let Err(e) = app
-        .notification()
-        .builder()
-        .title(title)
-        .body(body)
-        .show()
-    {
+    if let Err(e) = app.notification().builder().title(title).body(body).show() {
         tracing::warn!("notification failed: {e}");
     }
 }
@@ -272,23 +266,142 @@ fn spawn_click_tracker(wait: impl FnOnce() + Send + 'static) {
     });
 }
 
-/// Reflect a pending approval / running task in the tray tooltip.
-///
-/// Only the *body* is gated, not the signature: `tray_by_id` is itself
-/// `cfg(all(desktop, feature = "tray-icon"))` in Tauri, but this has five
-/// callers across `bigtiny/stream.rs` and `commands/session/prompt.rs` that
-/// shouldn't each have to know that. On Android it's a no-op — there is no
-/// tray to reflect state into (docs/ANDROID.md D23/§2.5).
-pub fn set_tray_pending(app: &AppHandle, pending: bool) {
-    #[cfg(desktop)]
-    if let Some(tray) = app.tray_by_id("main-tray") {
-        let tip = if pending {
-            "Kitty — approval needed"
+/// What the tray shows (#57), most urgent first: the engine is down, an
+/// approval is waiting, a reply is being written, or nothing. Desktop only:
+/// Android has no tray.
+#[cfg_attr(not(desktop), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TrayState {
+    Degraded,
+    Approval,
+    Working,
+    Idle,
+}
+
+#[cfg_attr(not(desktop), allow(dead_code))]
+impl TrayState {
+    /// Pure, so the precedence is testable.
+    pub fn from(degraded: bool, approvals_waiting: bool, generating: bool) -> Self {
+        if degraded {
+            Self::Degraded
+        } else if approvals_waiting {
+            Self::Approval
+        } else if generating {
+            Self::Working
         } else {
-            "Kitty"
-        };
-        let _ = tray.set_tooltip(Some(tip));
+            Self::Idle
+        }
+    }
+
+    fn tooltip(self) -> &'static str {
+        match self {
+            Self::Degraded => "Kitty — engine not running",
+            Self::Approval => "Kitty — approval needed",
+            Self::Working => "Kitty — working",
+            Self::Idle => "Kitty",
+        }
+    }
+
+    /// The badge colour drawn on the app icon, as RGBA.
+    #[cfg_attr(not(desktop), allow(dead_code))]
+    fn badge(self) -> Option<[u8; 4]> {
+        match self {
+            Self::Degraded => Some([0xE0, 0x3E, 0x3E, 0xFF]),
+            Self::Approval => Some([0xF5, 0x9E, 0x0B, 0xFF]),
+            Self::Working => Some([0x3B, 0x82, 0xF6, 0xFF]),
+            Self::Idle => None,
+        }
+    }
+}
+
+/// Recompute the tray from what Kitty is doing and show it. Called wherever
+/// one of the inputs changes: a turn starts or ends, an approval arrives or
+/// is answered, the engine's status changes. On Android there is no tray.
+pub fn refresh_tray(app: &AppHandle) {
+    #[cfg(desktop)]
+    {
+        let state = app.state::<AppState>();
+        let tray_state = TrayState::from(
+            *state.stack_status.lock().unwrap() == crate::state::StackStatus::BackendDown,
+            !state.pending_approvals.lock().unwrap().is_empty(),
+            !state.in_flight_sessions.lock().unwrap().is_empty(),
+        );
+        if let Some(tray) = app.tray_by_id("main-tray") {
+            let _ = tray.set_tooltip(Some(tray_state.tooltip()));
+            if let Some(icon) = tray_icon(app, tray_state) {
+                let _ = tray.set_icon(Some(icon));
+            }
+        }
     }
     #[cfg(not(desktop))]
-    let _ = (app, pending);
+    let _ = app;
+}
+
+/// The app icon with a coloured dot in its lower-right corner for `state`,
+/// drawn once per state and kept.
+#[cfg(desktop)]
+fn tray_icon(app: &AppHandle, state: TrayState) -> Option<tauri::image::Image<'static>> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<TrayState, tauri::image::Image<'static>>>> =
+        OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(hit) = cache.lock().unwrap().get(&state) {
+        return Some(hit.clone());
+    }
+    let base = app.default_window_icon()?;
+    let (w, h) = (base.width(), base.height());
+    let mut rgba = base.rgba().to_vec();
+    if let Some(color) = state.badge() {
+        draw_badge(&mut rgba, w, h, color);
+    }
+    let image = tauri::image::Image::new_owned(rgba, w, h);
+    cache.lock().unwrap().insert(state, image.clone());
+    Some(image)
+}
+
+/// A filled circle with a light rim, a third of the icon wide, in the
+/// lower-right corner - readable at tray size on light and dark taskbars.
+#[cfg_attr(not(desktop), allow(dead_code))]
+fn draw_badge(rgba: &mut [u8], w: u32, h: u32, color: [u8; 4]) {
+    let r = (w.min(h) as f32) / 6.0;
+    let (cx, cy) = (w as f32 - r - 1.0, h as f32 - r - 1.0);
+    for y in 0..h {
+        for x in 0..w {
+            let d = ((x as f32 + 0.5 - cx).powi(2) + (y as f32 + 0.5 - cy).powi(2)).sqrt();
+            let px = if d <= r - 1.5 {
+                color
+            } else if d <= r {
+                [0xFF, 0xFF, 0xFF, 0xFF]
+            } else {
+                continue;
+            };
+            let i = ((y * w + x) * 4) as usize;
+            if i + 4 <= rgba.len() {
+                rgba[i..i + 4].copy_from_slice(&px);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_tray_shows_the_most_urgent_state() {
+        assert_eq!(TrayState::from(true, true, true), TrayState::Degraded);
+        assert_eq!(TrayState::from(false, true, true), TrayState::Approval);
+        assert_eq!(TrayState::from(false, false, true), TrayState::Working);
+        assert_eq!(TrayState::from(false, false, false), TrayState::Idle);
+    }
+
+    #[test]
+    fn a_badge_is_drawn_in_the_corner_only() {
+        let mut px = vec![0u8; 32 * 32 * 4];
+        draw_badge(&mut px, 32, 32, [1, 2, 3, 255]);
+        let at = |x: usize, y: usize| &px[(y * 32 + x) * 4..(y * 32 + x) * 4 + 4];
+        assert_eq!(at(0, 0), [0, 0, 0, 0], "top-left untouched");
+        assert_eq!(at(26, 26), [1, 2, 3, 255], "badge centre coloured");
+    }
 }

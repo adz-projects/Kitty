@@ -94,6 +94,13 @@ pub fn get_stack_status(app: tauri::AppHandle) -> Result<lifecycle::StackStatusP
     Ok(lifecycle::current_payload(&app))
 }
 
+/// Hotkeys that could not be registered, for a window that opened after it
+/// happened.
+#[tauri::command]
+pub fn get_hotkey_failures(state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
+    Ok(state.hotkey_failures.lock().unwrap().clone())
+}
+
 /// What Kitty knows about the engine it is attached to, for Settings.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct EngineInfo {

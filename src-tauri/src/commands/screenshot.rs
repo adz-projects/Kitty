@@ -30,8 +30,22 @@ const SELECTION_WAIT: Duration = Duration::from_secs(60);
 /// cancellation) before doing a fresh, full-resolution, targeted capture of
 /// exactly the selected rectangle. Returns the final cropped image, ready to
 /// hand to `addPendingImage` exactly like a clipboard-pasted image.
+///
+/// `Ok(None)` when the user cancelled; `Err` only for a real failure or a
+/// selection that never came (#30 - both used to read as "cancelled"). Kitty's
+/// own windows are hidden for both captures, so the screenshot shows what is
+/// behind them rather than Kitty itself, and come back afterwards.
 #[tauri::command]
-pub async fn capture_screenshot_region(app: AppHandle) -> Result<ImageAttachment, String> {
+pub async fn capture_screenshot_region(app: AppHandle) -> Result<Option<ImageAttachment>, String> {
+    let hidden = windows::hide_all_windows(&app);
+    // Give the compositor a moment to actually take them off screen.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let result = capture(&app).await;
+    windows::restore_windows(&app, &hidden);
+    result
+}
+
+async fn capture(app: &AppHandle) -> Result<Option<ImageAttachment>, String> {
     // The GDI capture is blocking — run it on a blocking thread, not a tokio
     // worker.
     let (preview, (x, y, w, h)) = tokio::task::spawn_blocking(move || {
@@ -47,7 +61,7 @@ pub async fn capture_screenshot_region(app: AppHandle) -> Result<ImageAttachment
         *state.screenshot_selection.lock().unwrap() = Some(tx);
     }
 
-    if let Err(e) = windows::create_screenshot_select_window(&app, x, y, w, h).await {
+    if let Err(e) = windows::create_screenshot_select_window(app, x, y, w, h).await {
         // A failed window build must not leak the MB-scale base64 preview or
         // the orphaned selection sender in AppState — the next capture's
         // state would be polluted by both.
@@ -61,15 +75,9 @@ pub async fn capture_screenshot_region(app: AppHandle) -> Result<ImageAttachment
         let _ = win.set_focus();
     }
 
-    // Cancellation (the sender dropped without ever sending, e.g. the user
-    // closed the window some other way) resolves to `None` here too, same
-    // as an explicit Escape. A time-out (the selection window wasn't
-    // cancelled but also never reported) is treated the same way so the
-    // command can't hang the calling window forever.
-    let selection = match tokio::time::timeout(SELECTION_WAIT, rx).await {
-        Ok(Ok(sel)) => sel,
-        Ok(Err(_)) | Err(_) => None,
-    };
+    // The sender dropped without sending (the window closed some other way)
+    // is a cancel, like Escape. No answer at all within the wait is not.
+    let waited = tokio::time::timeout(SELECTION_WAIT, rx).await;
 
     // Drop any live selection sender we did not consume — a stale sender must
     // not hang a later capture's wait.
@@ -78,7 +86,6 @@ pub async fn capture_screenshot_region(app: AppHandle) -> Result<ImageAttachment
         .lock()
         .unwrap()
         .take();
-
     if let Some(win) = app.get_webview_window(windows::SCREENSHOT_SELECT) {
         let _ = win.close();
     }
@@ -87,17 +94,32 @@ pub async fn capture_screenshot_region(app: AppHandle) -> Result<ImageAttachment
         *state.screenshot_preview.lock().unwrap() = None;
     }
 
-    let (sx, sy, sw, sh) = selection.ok_or_else(|| "Screenshot capture cancelled".to_string())?;
+    let selection = match waited {
+        Ok(Ok(sel)) => sel,
+        Ok(Err(_)) => None,
+        Err(_) => {
+            return Err(format!(
+                "No region was chosen within {}s, so the screenshot was abandoned.",
+                SELECTION_WAIT.as_secs()
+            ))
+        }
+    };
+    let Some((sx, sy, sw, sh)) = selection else {
+        return Ok(None);
+    };
+    // The selection window is gone; let it leave the screen before the real
+    // capture.
+    tokio::time::sleep(Duration::from_millis(150)).await;
     // Full-resolution BitBlt + PNG encode — the same blocking-GDI class as
     // the preview capture at the top of this function, so it gets the same
     // `spawn_blocking` treatment rather than parking an async runtime worker.
     let data_url = tokio::task::spawn_blocking(move || screenshot::capture_region(sx, sy, sw, sh))
         .await
         .map_err(|e| format!("screenshot capture task panicked: {e}"))??;
-    Ok(ImageAttachment {
+    Ok(Some(ImageAttachment {
         mime: "image/png".to_string(),
         data_url,
-    })
+    }))
 }
 
 /// One-time read of the preview + virtual-screen rect for the

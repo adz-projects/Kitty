@@ -143,9 +143,94 @@ pub fn create_overlay(app: &AppHandle) -> tauri::Result<WebviewWindow> {
         .visible(false)
         .build()?;
     place_overlay_bottom_right(&win);
+    #[cfg(desktop)]
+    {
+        let app2 = app.clone();
+        win.on_window_event(move |event| {
+            if matches!(
+                event,
+                tauri::WindowEvent::Moved(_) | tauri::WindowEvent::Resized(_)
+            ) {
+                schedule_geometry_save(&app2);
+            }
+        });
+    }
     #[cfg(debug_assertions)]
     spawn_load_watchdog(app, win.clone(), OVERLAY.to_string());
     Ok(win)
+}
+
+/// Bumped on every overlay move/resize; a save runs only if no newer one
+/// arrived in the meantime.
+#[cfg(desktop)]
+static GEOMETRY_GEN: AtomicU64 = AtomicU64::new(0);
+
+/// Remember where the user left the overlay, on its monitor (#14): 500 ms
+/// after it stops moving, so a drag saves once, not per pixel. The slide-in
+/// animation's own moves end where it was going anyway.
+#[cfg(desktop)]
+fn schedule_geometry_save(app: &AppHandle) {
+    let gen = GEOMETRY_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if GEOMETRY_GEN.load(Ordering::SeqCst) != gen {
+            return;
+        }
+        let Some(win) = app.get_webview_window(OVERLAY) else {
+            return;
+        };
+        if !win.is_visible().unwrap_or(false) {
+            return;
+        }
+        let (Ok(pos), Ok(size), Ok(Some(monitor))) = (
+            win.outer_position(),
+            win.outer_size(),
+            win.current_monitor(),
+        ) else {
+            return;
+        };
+        let Some(name) = monitor.name().cloned() else {
+            return;
+        };
+        let rect = crate::config::OverlayRect {
+            x: pos.x,
+            y: pos.y,
+            width: size.width,
+            height: size.height,
+        };
+        let state = app.state::<crate::state::AppState>();
+        let mut cfg = state.config.lock().unwrap();
+        if !cfg.remember_overlay_position || cfg.overlay_geometry.get(&name) == Some(&rect) {
+            return;
+        }
+        cfg.overlay_geometry.insert(name, rect);
+        if let Err(e) = crate::config::save(&cfg) {
+            tracing::warn!("could not save the overlay position: {e}");
+        }
+    });
+}
+
+/// Where the user last left the overlay, if remembering is on and that
+/// monitor is still attached. Its size is restored too.
+#[cfg(desktop)]
+fn remembered_overlay_position(win: &WebviewWindow) -> Option<(i32, i32)> {
+    let app = win.app_handle();
+    let saved = {
+        let state = app.state::<crate::state::AppState>();
+        let cfg = state.config.lock().unwrap();
+        if !cfg.remember_overlay_position {
+            return None;
+        }
+        cfg.overlay_geometry.clone()
+    };
+    let monitors = win.available_monitors().ok()?;
+    let rect = monitors
+        .iter()
+        .filter_map(|m| m.name())
+        .find_map(|name| saved.get(name))?;
+    let _ = win.set_size(tauri::PhysicalSize::new(rect.width, rect.height));
+    Some((rect.x, rect.y))
 }
 
 /// The overlay's resting (x, y) — lower-right of the primary monitor's *work
@@ -196,7 +281,11 @@ fn place_overlay_bottom_right(win: &WebviewWindow) {
 /// rising out of the taskbar) to its resting position, then focus it. Falls
 /// back to a plain show if the work-area geometry can't be read.
 fn animate_overlay_in(win: &WebviewWindow) {
-    let Some((x, target_y)) = overlay_target_position(win) else {
+    #[cfg(desktop)]
+    let target = remembered_overlay_position(win).or_else(|| overlay_target_position(win));
+    #[cfg(not(desktop))]
+    let target = overlay_target_position(win);
+    let Some((x, target_y)) = target else {
         let _ = win.show();
         let _ = win.set_focus();
         return;
@@ -261,9 +350,9 @@ pub fn show_overlay(_app: &AppHandle) -> tauri::Result<()> {
 /// overlay rather than waiting in a window nobody can see.
 #[cfg(desktop)]
 pub fn any_kitty_window_visible(app: &AppHandle) -> bool {
-    app.webview_windows().values().any(|w| {
-        w.is_visible().unwrap_or(false) && !w.is_minimized().unwrap_or(false)
-    })
+    app.webview_windows()
+        .values()
+        .any(|w| w.is_visible().unwrap_or(false) && !w.is_minimized().unwrap_or(false))
 }
 
 /// Hide the overlay (kept alive for instant re-summon).
@@ -476,13 +565,59 @@ pub fn focus_or_open_chat_window(app: &AppHandle) {
 /// overlay toggle.
 #[cfg_attr(not(desktop), allow(dead_code))]
 pub fn toggle_or_focus_main(app: &AppHandle) -> tauri::Result<()> {
-    if let Some(win) = app.get_webview_window(HUB) {
-        if win.is_visible().unwrap_or(false) {
-            focus_window(&win)?;
-            return Ok(());
-        }
+    // Any full chat window: the hub, or one opened by Expand / "New Chat
+    // Window" (`chat-N`) - after an Expand the chat lives there, and
+    // summoning the overlay instead would open an empty one (#52).
+    let mut labels = vec![HUB.to_string()];
+    {
+        let state = app.state::<AppState>();
+        let map = state.chat_windows.lock().unwrap();
+        let mut chat: Vec<String> = map
+            .keys()
+            .filter(|l| l.as_str() != OVERLAY)
+            .cloned()
+            .collect();
+        chat.sort();
+        labels.extend(chat);
+    }
+    let windows: Vec<WebviewWindow> = labels
+        .iter()
+        .filter_map(|l| app.get_webview_window(l))
+        .filter(|w| w.is_visible().unwrap_or(false))
+        .collect();
+    if let Some(win) = windows
+        .iter()
+        .find(|w| w.is_focused().unwrap_or(false))
+        .or_else(|| windows.first())
+    {
+        focus_window(win)?;
+        return Ok(());
     }
     toggle_overlay(app)
+}
+
+/// Hide every visible Kitty window, returning their labels so
+/// [`restore_windows`] can bring back exactly those - for a screenshot, which
+/// must not capture Kitty itself (#30).
+#[cfg(desktop)]
+pub fn hide_all_windows(app: &AppHandle) -> Vec<String> {
+    let mut hidden = Vec::new();
+    for (label, win) in app.webview_windows() {
+        if label != SCREENSHOT_SELECT && win.is_visible().unwrap_or(false) {
+            let _ = win.hide();
+            hidden.push(label);
+        }
+    }
+    hidden
+}
+
+#[cfg(desktop)]
+pub fn restore_windows(app: &AppHandle, labels: &[String]) {
+    for label in labels {
+        if let Some(win) = app.get_webview_window(label) {
+            let _ = win.show();
+        }
+    }
 }
 
 /// Lazily create (or reuse) a normal, resizable window at the given initial

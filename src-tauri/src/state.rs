@@ -87,6 +87,9 @@ pub struct AppState {
     /// Model downloads in progress, by download id
     /// (`commands::models::download_model`).
     pub downloads: Mutex<HashMap<String, crate::commands::ActiveDownload>>,
+    /// Global hotkeys that could not be registered, e.g. Alt+Space already
+    /// taken by PowerToys (#58). Cleared on a successful registration.
+    pub hotkey_failures: Mutex<Vec<String>>,
     /// Where the memory engines stand (see `lifecycle::memory`).
     pub memory_status: Mutex<crate::lifecycle::memory::MemoryStatus>,
     /// The model-on-disk state `lifecycle::memory` last restarted the engine
@@ -243,6 +246,7 @@ impl AppState {
             stack_status: Mutex::new(StackStatus::default()),
             startup_error: Mutex::new(None),
             memory_status: Mutex::new(Default::default()),
+            hotkey_failures: Mutex::new(Vec::new()),
             downloads: Mutex::new(HashMap::new()),
             memory_restart_for: Mutex::new(None),
             restart_in_progress: AtomicBool::new(false),

@@ -135,6 +135,7 @@ pub fn spawn_health_loop(app: AppHandle) {
             }
             published = Some((status, detail.clone()));
             *app.state::<AppState>().stack_status.lock().unwrap() = status;
+            crate::notifications::refresh_tray(&app);
             {
                 let payload = StackStatusPayload { status, detail };
                 if let Err(e) = app.emit("stack://status", payload) {

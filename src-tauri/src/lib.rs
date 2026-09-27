@@ -169,6 +169,7 @@ pub fn run() {
             commands::get_stack_status,
             commands::get_engine_restart_state,
             commands::get_engine_info,
+            commands::get_hotkey_failures,
             commands::get_memory_status,
             commands::test_provider_connection,
             commands::set_default_provider,

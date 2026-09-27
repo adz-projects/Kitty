@@ -87,10 +87,11 @@ export const ipc = {
     invoke<(Partial<SessionInfo> & Record<string, unknown>) | null>('get_pending_handoff'),
   /** Feature 3 — screenshot region capture. Opens the selection window over
       a lightweight preview and resolves once the user confirms a rectangle
-      (rejects on Escape/cancel); the final image is a fresh, full-resolution
-      capture of just that region, never the preview itself. */
+      (`null` on Escape/cancel; rejects only on a real failure); the final
+      image is a fresh, full-resolution capture of just that region, never the
+      preview itself. Kitty's own windows are hidden while it captures. */
   captureScreenshotRegion: () =>
-    invoke<{ mime: string; data_url: string }>('capture_screenshot_region'),
+    invoke<{ mime: string; data_url: string } | null>('capture_screenshot_region'),
   /** Selection window's own mount-time read of the preview to show. */
   getScreenshotPreview: () =>
     invoke<[string, number, number, number, number] | null>('get_screenshot_preview'),
@@ -102,6 +103,8 @@ export const ipc = {
   /** `force` ("Restart anyway") overrides only the other-apps check. */
   restartBackend: (force = false) => invoke<RestartOutcome>('restart_backend', { force }),
   getEngineInfo: () => invoke<EngineInfo>('get_engine_info'),
+  /** Global hotkeys that could not be registered (e.g. taken by another app). */
+  getHotkeyFailures: () => invoke<string[]>('get_hotkey_failures'),
   /** Also refreshes it: applies the memory toggles against the engine. */
   getMemoryStatus: () => invoke<MemoryStatus>('get_memory_status'),
   newSession: (cwd?: string) => invoke<SessionInfo>('new_session', { cwd: cwd ?? null }),
@@ -666,6 +669,9 @@ export const onMemoryStatus = (cb: (s: MemoryStatus) => void) =>
 
 export const onPendingApproval = (cb: (a: PendingApproval) => void) =>
   listen<PendingApproval>('approval://needed', (e) => cb(e.payload));
+
+export const onHotkeyFailed = (cb: (e: { errors: string[] }) => void) =>
+  listen<{ errors: string[] }>('hotkey://failed', (e) => cb(e.payload));
 
 export const onChatNotice = (cb: (e: ChatNoticeEvent) => void) =>
   listen<ChatNoticeEvent>('chat://notice', (e) => cb(e.payload));

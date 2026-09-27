@@ -136,10 +136,12 @@ export function Composer({
   // shows the full-screen overlay in the first place.
   const captureScreenshot = async () => {
     try {
-      const { mime, data_url } = await ipc.captureScreenshotRegion();
-      addPendingImage(mime, data_url);
-    } catch {
+      const shot = await ipc.captureScreenshotRegion();
       // Cancelled (Escape) — nothing to surface, same as declining a file picker.
+      if (shot) addPendingImage(shot.mime, shot.data_url);
+    } catch (e) {
+      // A real failure, which used to be swallowed as if it were a cancel.
+      useChatStore.setState({ error: `The screenshot failed: ${String(e)}` });
     }
   };
 

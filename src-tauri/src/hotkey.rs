@@ -136,8 +136,10 @@ pub fn register(
 
     if errors.is_empty() {
         *prev = desired;
+        report_failures(app, Vec::new());
         return Ok(());
     }
+    report_failures(app, errors.clone());
 
     // Partial failure — restore the prior registrations so one bad shortcut
     // can't leave the user with fewer working ones than before.
@@ -152,6 +154,23 @@ pub fn register(
         let _ = bind_shortcut(app, accel, *action);
     }
     Err(errors.join("; "))
+}
+
+/// Record which hotkeys could not be registered and tell every window, so
+/// the chat can say so and offer to choose another instead of the key doing
+/// nothing (#58). An empty list clears it.
+fn report_failures(app: &AppHandle, errors: Vec<String>) {
+    use tauri::Manager;
+    let changed = {
+        let state = app.state::<crate::state::AppState>();
+        let mut cur = state.hotkey_failures.lock().unwrap();
+        let changed = *cur != errors;
+        *cur = errors.clone();
+        changed
+    };
+    if changed {
+        let _ = app.emit("hotkey://failed", serde_json::json!({ "errors": errors }));
+    }
 }
 
 /// Summon the overlay with the current clipboard pre-attached (Round-4
@@ -181,8 +200,10 @@ pub fn attach_clipboard(app: &AppHandle) {
             if let Err(e) = windows::show_overlay(&app_main) {
                 tracing::warn!("clipboard-attach show_overlay failed: {e}");
             }
+            // To the overlay alone: every open chat window used to take the
+            // clipboard too (#55).
             if let Some(p) = payload {
-                let _ = app_main.emit("clipboard://attach", p);
+                let _ = app_main.emit_to(windows::OVERLAY, "clipboard://attach", p);
             }
         });
     });

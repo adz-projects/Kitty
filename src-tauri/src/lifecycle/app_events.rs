@@ -208,13 +208,12 @@ async fn on_pause(
         warning,
         scheduled: session.scheduled,
     };
-    let count = {
-        let state = app.state::<AppState>();
-        let mut map = state.pending_approvals.lock().unwrap();
-        map.insert(action_id.clone(), pending.clone());
-        map.len()
-    };
-    crate::notifications::set_tray_pending(app, count > 0);
+    app.state::<AppState>()
+        .pending_approvals
+        .lock()
+        .unwrap()
+        .insert(action_id.clone(), pending.clone());
+    crate::notifications::refresh_tray(app);
     let _ = app.emit("approval://needed", &pending);
     // The chat's own inline prompt, in the shape the chat view has always
     // listened for.
@@ -261,13 +260,12 @@ fn bring_to_attention(app: &AppHandle, pending: &PendingApproval) {
 
 /// An approval was answered (anywhere) or ran out of time.
 fn resolved(app: &AppHandle, action_id: &str, session_id: Option<&str>, timed_out: bool) {
-    let count = {
-        let state = app.state::<AppState>();
-        let mut map = state.pending_approvals.lock().unwrap();
-        map.remove(action_id);
-        map.len()
-    };
-    crate::notifications::set_tray_pending(app, count > 0);
+    app.state::<AppState>()
+        .pending_approvals
+        .lock()
+        .unwrap()
+        .remove(action_id);
+    crate::notifications::refresh_tray(app);
     let _ = app.emit(
         "approval://resolved",
         json!({ "action_id": action_id, "session_id": session_id, "timed_out": timed_out }),

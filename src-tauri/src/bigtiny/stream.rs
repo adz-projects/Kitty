@@ -175,8 +175,9 @@ impl From<String> for StreamFailure {
 fn send_refusal(status: reqwest::StatusCode, body: &str) -> StreamFailure {
     if status == reqwest::StatusCode::CONFLICT {
         return StreamFailure {
-            message: "This chat is still finishing its previous reply. Wait a moment, then send again."
-                .to_string(),
+            message:
+                "This chat is still finishing its previous reply. Wait a moment, then send again."
+                    .to_string(),
             error_type: Some("turn_in_progress"),
         };
     }
@@ -315,6 +316,7 @@ pub async fn send_prompt(
         .lock()
         .unwrap()
         .insert(session_id.clone());
+    notifications::refresh_tray(&app);
 
     let app_bg = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -400,20 +402,13 @@ pub async fn send_prompt(
                 );
             }
         }
-        // Only this turn is over: approvals for other chats may still wait.
-        let still_pending = !app_bg
-            .state::<AppState>()
-            .pending_approvals
-            .lock()
-            .unwrap()
-            .is_empty();
-        notifications::set_tray_pending(&app_bg, still_pending);
         app_bg
             .state::<AppState>()
             .in_flight_sessions
             .lock()
             .unwrap()
             .remove(&session_id);
+        notifications::refresh_tray(&app_bg);
         // A restart queued behind this turn (§6.4) can now go ahead. No-op
         // unless one is actually outstanding.
         crate::lifecycle::engine_restart::apply_if_pending(&app_bg);
@@ -538,7 +533,10 @@ async fn session_card(
     client: &BigTinyClient,
     session_id: &str,
 ) -> Option<crate::config::providers::ProviderProfile> {
-    let session = client.get_json(&format!("/api/chat/{session_id}")).await.ok()?;
+    let session = client
+        .get_json(&format!("/api/chat/{session_id}"))
+        .await
+        .ok()?;
     let meta = session
         .get("metadata")
         .or_else(|| session.get("session").and_then(|s| s.get("metadata")))?;
@@ -1074,7 +1072,12 @@ pub(crate) fn tool_result_is_error(result_text: &str) -> bool {
 /// The `chat://tool-call` update for a finished tool. `daemonToolCallId` is
 /// what `fetch_full_tool_result` looks the full output up by when
 /// `truncated` says the card got less than all of it.
-pub(crate) fn tool_update(card_id: &str, call_id: Option<&str>, failed: bool, output: &str) -> Value {
+pub(crate) fn tool_update(
+    card_id: &str,
+    call_id: Option<&str>,
+    failed: bool,
+    output: &str,
+) -> Value {
     let shown = truncate_for_ui(output);
     json!({
         "toolCallId": card_id,
@@ -1107,7 +1110,11 @@ pub async fn fetch_full_tool_result(
             r.get("role").and_then(|v| v.as_str()) == Some("tool")
                 && r.get("tool_call_id").and_then(|v| v.as_str()) == Some(tool_call_id)
         })
-        .and_then(|r| r.get("content").and_then(|c| c.as_str()).map(str::to_string))
+        .and_then(|r| {
+            r.get("content")
+                .and_then(|c| c.as_str())
+                .map(str::to_string)
+        })
         .ok_or_else(|| "That tool's output is no longer in this chat's history.".to_string())
 }
 
@@ -1117,7 +1124,10 @@ pub async fn fetch_full_tool_result(
 pub async fn attach_session_stream(app: &AppHandle, session_id: &str) -> Result<bool, String> {
     let client = ensure_client(app)?;
     let resp = client
-        .request_stream(reqwest::Method::GET, &format!("/api/chat/{session_id}/stream"))
+        .request_stream(
+            reqwest::Method::GET,
+            &format!("/api/chat/{session_id}/stream"),
+        )
         .send()
         .await
         .map_err(|e| format!("Could not reach the engine: {e}"))?;
@@ -1130,7 +1140,8 @@ pub async fn attach_session_stream(app: &AppHandle, session_id: &str) -> Result<
     let app = app.clone();
     let session_id = session_id.to_string();
     tauri::async_runtime::spawn(async move {
-        let outcome = consume_stream(&app, &session_id, resp, std::time::Duration::from_secs(300)).await;
+        let outcome =
+            consume_stream(&app, &session_id, resp, std::time::Duration::from_secs(300)).await;
         match outcome {
             Ok(o) if o.error.is_none() => {
                 let _ = app.emit(
@@ -1198,7 +1209,12 @@ pub async fn respond_permission(
     tool_call_id: String,
     option_id: Option<String>,
 ) -> Result<(), String> {
-    answer_approval(app, &tool_call_id, decision_for_option(option_id.as_deref())).await
+    answer_approval(
+        app,
+        &tool_call_id,
+        decision_for_option(option_id.as_deref()),
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -1219,12 +1235,24 @@ mod tests {
         let a = open_tool_card(Some("call-a"), &mut seq, &mut open, &mut last);
         let b = open_tool_card(Some("call-b"), &mut seq, &mut open, &mut last);
         let c = open_tool_card(Some("call-c"), &mut seq, &mut open, &mut last);
-        assert_eq!((a.as_str(), b.as_str(), c.as_str()), ("bt-1", "bt-2", "bt-3"));
+        assert_eq!(
+            (a.as_str(), b.as_str(), c.as_str()),
+            ("bt-1", "bt-2", "bt-3")
+        );
 
         // Finishing out of order — the usual case, and the whole point.
-        assert_eq!(close_tool_card(Some("call-b"), seq, &mut open, &mut last), b);
-        assert_eq!(close_tool_card(Some("call-a"), seq, &mut open, &mut last), a);
-        assert_eq!(close_tool_card(Some("call-c"), seq, &mut open, &mut last), c);
+        assert_eq!(
+            close_tool_card(Some("call-b"), seq, &mut open, &mut last),
+            b
+        );
+        assert_eq!(
+            close_tool_card(Some("call-a"), seq, &mut open, &mut last),
+            a
+        );
+        assert_eq!(
+            close_tool_card(Some("call-c"), seq, &mut open, &mut last),
+            c
+        );
         assert!(open.is_empty(), "every card closed exactly once");
     }
 
@@ -1252,9 +1280,15 @@ mod tests {
         let mut last = None;
 
         let a = open_tool_card(Some("call-a"), &mut seq, &mut open, &mut last);
-        assert_eq!(close_tool_card(Some("nope"), seq, &mut open, &mut last), "bt-1");
+        assert_eq!(
+            close_tool_card(Some("nope"), seq, &mut open, &mut last),
+            "bt-1"
+        );
         // The real card is still open, so its own finish still finds it.
-        assert_eq!(close_tool_card(Some("call-a"), seq, &mut open, &mut last), a);
+        assert_eq!(
+            close_tool_card(Some("call-a"), seq, &mut open, &mut last),
+            a
+        );
     }
 
     #[test]
@@ -1412,8 +1446,12 @@ mod tests {
     /// failure too (#34), and ordinary JSON must not.
     #[test]
     fn a_json_error_envelope_is_a_failed_tool() {
-        assert!(tool_result_is_error("{\n  \"status\": \"error\",\n  \"error_code\": \"PATH_OUTSIDE_HOME\"\n}"));
-        assert!(!tool_result_is_error("{\"status\": \"success\", \"data\": 1}"));
+        assert!(tool_result_is_error(
+            "{\n  \"status\": \"error\",\n  \"error_code\": \"PATH_OUTSIDE_HOME\"\n}"
+        ));
+        assert!(!tool_result_is_error(
+            "{\"status\": \"success\", \"data\": 1}"
+        ));
         assert!(!tool_result_is_error("{not json"));
     }
 
@@ -1431,7 +1469,10 @@ mod tests {
         let f = send_refusal(reqwest::StatusCode::CONFLICT, "busy");
         assert_eq!(f.error_type, Some("turn_in_progress"));
         assert!(!f.message.contains("409"));
-        assert_eq!(send_refusal(reqwest::StatusCode::BAD_GATEWAY, "x").error_type, None);
+        assert_eq!(
+            send_refusal(reqwest::StatusCode::BAD_GATEWAY, "x").error_type,
+            None
+        );
     }
 
     #[test]

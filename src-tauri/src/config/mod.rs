@@ -40,6 +40,10 @@ pub struct Config {
     pub open_window_hotkey: Option<String>,
     /// Default working directory for new sessions (Phase 4). `None` until set.
     pub default_context_folder: Option<String>,
+    /// Where the overlay was last left on each monitor, by monitor name,
+    /// when `remember_overlay_position` is on (#14).
+    #[serde(default)]
+    pub overlay_geometry: std::collections::HashMap<String, OverlayRect>,
     /// Every chats base used before the current one. Chats created under an
     /// earlier base keep their folders there; this is what keeps them
     /// recognized as Kitty's own chat folders (and cleaned up with the chat)
@@ -353,6 +357,15 @@ impl Default for SummarizerSettings {
     }
 }
 
+/// The overlay's outer rectangle, in physical pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OverlayRect {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
 /// See `Config::token_management`. Field names/defaults mirror BigTiny's own
 /// `TokenManagementConfig` (`plugins/bigtiny/bigtiny/config.py`) so the two
 /// don't drift apart, but this is Kitty's independent copy — BigTiny's
@@ -397,6 +410,7 @@ impl Default for Config {
             clipboard_hotkey: Some("Ctrl+Alt+Space".to_string()),
             open_window_hotkey: None,
             default_context_folder: None,
+            overlay_geometry: std::collections::HashMap::new(),
             chats_roots_history: Vec::new(),
             setup_completed: false,
             theme: "light".to_string(),
@@ -719,11 +733,11 @@ pub fn load() -> Result<Config, ConfigError> {
         Ok(text) => {
             let config: Config = serde_json::from_str(&text)?;
             Ok(migrate_theme_default_to_light(migrate_model_tags_to_gguf(
-                migrate_kitty_wasm_enabled(migrate_kitty_web_enabled(
-                    migrate_kitty_split_enabled(migrate_replacement_mcp_enabled(
-                        migrate_bigtiny_launch_command(migrate_hotkeys(config, &text)),
+                migrate_kitty_wasm_enabled(migrate_kitty_web_enabled(migrate_kitty_split_enabled(
+                    migrate_replacement_mcp_enabled(migrate_bigtiny_launch_command(
+                        migrate_hotkeys(config, &text),
                     )),
-                )),
+                ))),
             )))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
@@ -1350,7 +1364,10 @@ mod tests {
         // defaulting to the one pinned cross-compatible model every user
         // shares — a GGUF id since Phase 2b, not an Ollama tag.
         let back: Config = serde_json::from_str(r#"{"theme":"dark"}"#).unwrap();
-        assert_eq!(back.adaptive_pathway_embedding_model, DEFAULT_EMBEDDING_GGUF);
+        assert_eq!(
+            back.adaptive_pathway_embedding_model,
+            DEFAULT_EMBEDDING_GGUF
+        );
     }
 
     /// The embedding pin briefly named `Qwen3-Embedding-0.6B-q4_k_m`, which
@@ -1390,7 +1407,6 @@ mod tests {
         let back: Config = serde_json::from_str(r#"{"theme":"dark"}"#).unwrap();
         assert!(back.scheduled_tasks.is_empty());
     }
-
 
     #[test]
     fn replacement_mcp_enables_once_for_a_config_predating_the_default_flip() {
@@ -1536,12 +1552,10 @@ mod tests {
         // `save` writes a fresh file, not the corrupt one) and the backup
         // holds the exact original bytes under a `config.json.corrupt-` name.
         assert!(!config.exists());
-        assert!(
-            backup
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("config.json.corrupt-"))
-        );
+        assert!(backup
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("config.json.corrupt-")));
         assert_eq!(fs::read(&backup).unwrap(), b"{ this is not valid json !!!");
         fs::remove_dir_all(&dir).unwrap();
     }
