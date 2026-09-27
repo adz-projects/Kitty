@@ -29,11 +29,15 @@ pub struct WebSearchRequest {
     /// queries both engines; >10 additionally returns a keyword index
     /// instead of full detail.
     pub count: Option<u32>,
-    /// Two-letter search language code, e.g. "en".
+    /// Two-letter language code for results, e.g. "en". Applied on every
+    /// engine; unset searches in English.
     pub search_lang: Option<String>,
-    /// Brave freshness filter, e.g. "pd", "pw", "pm", "py".
+    /// Brave only: recency filter "pd" (day), "pw" (week), "pm" (month) or
+    /// "py" (year). Ignored by DuckDuckGo and Bing, so a search that did not
+    /// use Brave is not date-filtered.
     pub freshness: Option<String>,
-    /// Two-letter country code, e.g. "US".
+    /// Two-letter country code to localize results to, e.g. "US" or "DE".
+    /// Applied on every engine; unset searches without a region.
     pub country: Option<String>,
 }
 
@@ -160,9 +164,9 @@ impl KittyWebServer {
         guarded_async(search::web_search(
             &req.query,
             req.count.unwrap_or(5) as usize,
-            req.search_lang.as_deref().unwrap_or("en"),
+            req.search_lang.as_deref(),
             req.freshness.as_deref(),
-            req.country.as_deref().unwrap_or("US"),
+            req.country.as_deref(),
         ))
         .await
     }

@@ -52,7 +52,7 @@ fn assert_no_parser_drift(v: &Value) -> HashSet<String> {
 async fn live_keyfree_search_returns_usable_results() {
     // No BRAVE_API_KEY in the default dev environment, so `normal` mode
     // exercises the key-free co-equal pair (DuckDuckGo + Bing).
-    let out = kitty_web::search::web_search("rust programming language", 5, "en", None, "US").await;
+    let out = kitty_web::search::web_search("rust programming language", 5, Some("en"), None, Some("US")).await;
     let v: Value = serde_json::from_str(&out).expect("valid JSON envelope");
     eprintln!("{}", serde_json::to_string_pretty(&v).unwrap());
 
@@ -99,7 +99,7 @@ async fn live_keyfree_search_returns_usable_results() {
 async fn live_bing_search_returns_usable_results() {
     // `count > 5` puts every key-free engine in play concurrently.
     let out =
-        kitty_web::search::web_search("rust programming language", 10, "en", None, "US").await;
+        kitty_web::search::web_search("rust programming language", 10, Some("en"), None, Some("US")).await;
     let v: Value = serde_json::from_str(&out).expect("valid JSON envelope");
     eprintln!("{}", serde_json::to_string_pretty(&v).unwrap());
 
@@ -149,7 +149,7 @@ async fn live_parallel_searches_all_return_results() {
     let mut handles = Vec::new();
     for q in queries {
         handles.push(tokio::spawn(async move {
-            let out = kitty_web::search::web_search(q, 5, "en", None, "US").await;
+            let out = kitty_web::search::web_search(q, 5, Some("en"), None, Some("US")).await;
             (
                 q,
                 serde_json::from_str::<Value>(&out).expect("valid JSON envelope"),

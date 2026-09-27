@@ -1227,13 +1227,83 @@ where
     Err(last)
 }
 
-async fn ddg_attempt(query: &str, count: usize) -> Result<Vec<SearchItem>, ScrapeFailure> {
+/// The language and country a search was asked for, as the caller gave them.
+///
+/// Kept as given (`None` when not asked) rather than defaulted up front,
+/// because the engines default differently: Brave wants both and has always
+/// been sent `en`/`US`, while DuckDuckGo searches with no region at all
+/// (`wt-wt`) unless asked, and defaulting it to the US would quietly bias
+/// every search that never mentioned a country.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Locale<'a> {
+    pub lang: Option<&'a str>,
+    pub country: Option<&'a str>,
+}
+
+impl Locale<'_> {
+    /// A two-letter code, lowercased; anything else is ignored rather than
+    /// passed through to an engine.
+    fn code(value: Option<&str>) -> Option<String> {
+        value
+            .map(str::trim)
+            .filter(|v| v.len() == 2 && v.chars().all(|c| c.is_ascii_alphabetic()))
+            .map(str::to_ascii_lowercase)
+    }
+
+    /// Brave's `search_lang`/`country`, with the defaults it has always had.
+    fn brave(&self) -> (String, String) {
+        (
+            Self::code(self.lang).unwrap_or_else(|| "en".to_string()),
+            Self::code(self.country)
+                .map(|c| c.to_ascii_uppercase())
+                .unwrap_or_else(|| "US".to_string()),
+        )
+    }
+
+    /// DuckDuckGo's `kl` region, `<country>-<language>` (`de-de`, `us-en`),
+    /// or `wt-wt` - no region - when no country was asked for. DuckDuckGo
+    /// spells the United Kingdom `uk`.
+    fn ddg_region(&self) -> String {
+        match Self::code(self.country) {
+            Some(country) => {
+                let country = if country == "gb" {
+                    "uk".to_string()
+                } else {
+                    country
+                };
+                let lang = Self::code(self.lang).unwrap_or_else(|| "en".to_string());
+                format!("{country}-{lang}")
+            }
+            None => "wt-wt".to_string(),
+        }
+    }
+
+    /// Bing's query parameters: `setlang` (always, English unless asked) and
+    /// `cc` when a country was asked for.
+    fn bing_params(&self) -> Vec<(&'static str, String)> {
+        let mut params = vec![(
+            "setlang",
+            Self::code(self.lang).unwrap_or_else(|| "en".to_string()),
+        )];
+        if let Some(country) = Self::code(self.country) {
+            params.push(("cc", country.to_ascii_uppercase()));
+        }
+        params
+    }
+}
+
+async fn ddg_attempt(
+    query: &str,
+    count: usize,
+    locale: Locale<'_>,
+) -> Result<Vec<SearchItem>, ScrapeFailure> {
     let client = http_client().map_err(ScrapeFailure::Network)?;
+    let region = locale.ddg_region();
     let html = fetch_scraped(
         "duckduckgo",
         client
             .post(DDG_ENDPOINT)
-            .form(&[("q", query), ("kl", "wt-wt")]),
+            .form(&[("q", query), ("kl", region.as_str())]),
     )
     .await?;
 
@@ -1249,9 +1319,13 @@ async fn ddg_attempt(query: &str, count: usize) -> Result<Vec<SearchItem>, Scrap
 }
 
 /// DuckDuckGo search, paced and retried on a challenge.
-async fn ddg_query(query: &str, count: usize) -> Result<Vec<SearchItem>, ScrapeFailure> {
+async fn ddg_query(
+    query: &str,
+    count: usize,
+    locale: Locale<'_>,
+) -> Result<Vec<SearchItem>, ScrapeFailure> {
     let capped = count.clamp(1, 20);
-    with_blocked_retry(|| ddg_attempt(query, capped)).await
+    with_blocked_retry(|| ddg_attempt(query, capped, locale)).await
 }
 
 /// Markers for Bing's own block page. Same gating rule as DuckDuckGo's: only
@@ -1260,13 +1334,18 @@ fn bing_challenge_marker(html: &str) -> bool {
     html.contains("unusual traffic") || html.contains("captcha") || html.contains("blockpage")
 }
 
-async fn bing_attempt(query: &str, count: usize) -> Result<Vec<SearchItem>, ScrapeFailure> {
+async fn bing_attempt(
+    query: &str,
+    count: usize,
+    locale: Locale<'_>,
+) -> Result<Vec<SearchItem>, ScrapeFailure> {
     let client = http_client().map_err(ScrapeFailure::Network)?;
     let html = fetch_scraped(
         "bing",
         client
             .get(BING_ENDPOINT)
-            .query(&[("q", query), ("setlang", "en")]),
+            .query(&[("q", query)])
+            .query(&locale.bing_params()),
     )
     .await?;
 
@@ -1282,9 +1361,13 @@ async fn bing_attempt(query: &str, count: usize) -> Result<Vec<SearchItem>, Scra
 /// Bing search, paced and retried on a challenge. Co-equal with DuckDuckGo:
 /// the two are queried together whenever Brave isn't answering, so one
 /// engine's challenge rate stops being the whole tool's failure rate.
-async fn bing_query(query: &str, count: usize) -> Result<Vec<SearchItem>, ScrapeFailure> {
+async fn bing_query(
+    query: &str,
+    count: usize,
+    locale: Locale<'_>,
+) -> Result<Vec<SearchItem>, ScrapeFailure> {
     let capped = count.clamp(1, 20);
-    with_blocked_retry(|| bing_attempt(query, capped)).await
+    with_blocked_retry(|| bing_attempt(query, capped, locale)).await
 }
 
 /// Runs both key-free engines concurrently and merges them, recording each
@@ -1292,10 +1375,13 @@ async fn bing_query(query: &str, count: usize) -> Result<Vec<SearchItem>, Scrape
 async fn coequal_search(
     query: &str,
     count: usize,
+    locale: Locale<'_>,
     diagnostics: &mut HashMap<String, String>,
 ) -> Vec<SearchItem> {
-    let (ddg_outcome, bing_outcome) =
-        tokio::join!(ddg_query(query, count), bing_query(query, count));
+    let (ddg_outcome, bing_outcome) = tokio::join!(
+        ddg_query(query, count, locale),
+        bing_query(query, count, locale)
+    );
 
     let mut lists = Vec::new();
     for (engine, outcome) in [("duckduckgo", ddg_outcome), ("bing", bing_outcome)] {
@@ -1319,14 +1405,14 @@ async fn coequal_search(
 async fn normal_search(
     query: &str,
     count: usize,
-    search_lang: &str,
+    locale: Locale<'_>,
     freshness: Option<&str>,
-    country: &str,
 ) -> Result<(Vec<SearchItem>, HashMap<String, String>), BraveFailure> {
     let mut diagnostics = new_diagnostics();
 
     if !brave_api_key().is_empty() {
-        match brave_query(query, count, search_lang, freshness, country).await {
+        let (search_lang, country) = locale.brave();
+        match brave_query(query, count, &search_lang, freshness, &country).await {
             Ok(results) => {
                 diagnostics.insert("brave".into(), "ok".into());
                 return Ok((results, diagnostics));
@@ -1340,7 +1426,7 @@ async fn normal_search(
         }
     }
 
-    let results = coequal_search(query, count, &mut diagnostics).await;
+    let results = coequal_search(query, count, locale, &mut diagnostics).await;
     Ok((results, diagnostics))
 }
 
@@ -1352,22 +1438,25 @@ async fn normal_search(
 async fn dual_engine_search(
     query: &str,
     count: usize,
-    search_lang: &str,
+    locale: Locale<'_>,
     freshness: Option<&str>,
-    country: &str,
 ) -> (Vec<SearchItem>, HashMap<String, String>) {
     let mut diagnostics = new_diagnostics();
 
     let key_configured = !brave_api_key().is_empty();
+    let (search_lang, country) = locale.brave();
     let brave_fut = async {
         if key_configured {
-            Some(brave_query(query, count, search_lang, freshness, country).await)
+            Some(brave_query(query, count, &search_lang, freshness, &country).await)
         } else {
             None
         }
     };
-    let (brave_outcome, ddg_outcome, bing_outcome) =
-        tokio::join!(brave_fut, ddg_query(query, count), bing_query(query, count));
+    let (brave_outcome, ddg_outcome, bing_outcome) = tokio::join!(
+        brave_fut,
+        ddg_query(query, count, locale),
+        bing_query(query, count, locale)
+    );
 
     let brave_results = match brave_outcome {
         Some(Ok(r)) => {
@@ -1404,10 +1493,14 @@ async fn dual_engine_search(
 pub async fn web_search(
     query: &str,
     count: usize,
-    search_lang: &str,
+    search_lang: Option<&str>,
     freshness: Option<&str>,
-    country: &str,
+    country: Option<&str>,
 ) -> String {
+    let locale = Locale {
+        lang: search_lang,
+        country,
+    };
     let count = count.clamp(1, MAX_COUNT);
     let guarded_q = apply_query_guardrails(query);
     if guarded_q.is_empty() {
@@ -1421,7 +1514,7 @@ pub async fn web_search(
 
     let mode = mode_for_count(count);
     let (mut results, diagnostics) = if mode == "normal" {
-        match normal_search(&guarded_q, count, search_lang, freshness, country).await {
+        match normal_search(&guarded_q, count, locale, freshness).await {
             Ok(v) => v,
             Err(e) => {
                 // Only reachable for InvalidQuery — every other kind is
@@ -1435,7 +1528,7 @@ pub async fn web_search(
             }
         }
     } else {
-        dual_engine_search(&guarded_q, count, search_lang, freshness, country).await
+        dual_engine_search(&guarded_q, count, locale, freshness).await
     };
 
     if results.is_empty() {
@@ -1670,6 +1763,48 @@ pub fn web_search_read_chunk(search_id: &str, ids: &[i64]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Nothing asked for: Brave keeps its `en`/`US`, DuckDuckGo stays
+    /// region-free and Bing stays English with no country.
+    #[test]
+    fn an_unset_locale_changes_nothing() {
+        let locale = Locale::default();
+        assert_eq!(locale.brave(), ("en".to_string(), "US".to_string()));
+        assert_eq!(locale.ddg_region(), "wt-wt");
+        assert_eq!(locale.bing_params(), vec![("setlang", "en".to_string())]);
+    }
+
+    /// An asked-for locale reaches the key-free engines in each one's own
+    /// spelling.
+    #[test]
+    fn a_locale_maps_onto_each_engine() {
+        let locale = Locale {
+            lang: Some("de"),
+            country: Some("DE"),
+        };
+        assert_eq!(locale.brave(), ("de".to_string(), "DE".to_string()));
+        assert_eq!(locale.ddg_region(), "de-de");
+        assert_eq!(
+            locale.bing_params(),
+            vec![("setlang", "de".to_string()), ("cc", "DE".to_string())]
+        );
+        let uk = Locale {
+            lang: None,
+            country: Some("gb"),
+        };
+        assert_eq!(uk.ddg_region(), "uk-en", "DuckDuckGo spells it uk");
+    }
+
+    /// Anything that is not a two-letter code is dropped, not forwarded.
+    #[test]
+    fn a_malformed_locale_is_ignored() {
+        let locale = Locale {
+            lang: Some("english"),
+            country: Some("U$"),
+        };
+        assert_eq!(locale.ddg_region(), "wt-wt");
+        assert_eq!(locale.bing_params(), vec![("setlang", "en".to_string())]);
+    }
 
     fn item(url: &str, engine: &str) -> SearchItem {
         SearchItem {
@@ -2256,7 +2391,7 @@ mod tests {
     #[tokio::test]
     async fn empty_query_is_rejected_before_any_network_call() {
         for q in ["", "   ", "\t\n"] {
-            let out = web_search(q, 5, "en", None, "US").await;
+            let out = web_search(q, 5, Some("en"), None, Some("US")).await;
             let v: Value = serde_json::from_str(&out).unwrap();
             assert_eq!(v["error_code"], "EMPTY_QUERY");
         }
