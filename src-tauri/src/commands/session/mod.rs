@@ -71,6 +71,11 @@ fn chats_base_dir(app: &AppHandle) -> PathBuf {
         let cfg = state.config.lock().unwrap();
         cfg.default_context_folder.clone()
     };
+    base_for(configured)
+}
+
+/// The chats base a `default_context_folder` setting resolves to.
+pub(crate) fn base_for(configured: Option<String>) -> PathBuf {
     if let Some(dir) = configured.filter(|s| !s.trim().is_empty()) {
         return PathBuf::from(dir);
     }
@@ -92,15 +97,62 @@ fn chats_base_dir(app: &AppHandle) -> PathBuf {
 /// exist on disk, and both sides derive from Kitty's own normalized output
 /// (`resolve_cwd`/`chats_base_dir`), so their casing already agrees.
 pub fn is_default_folder(app: &AppHandle, cwd: &str) -> bool {
-    let root = chats_base_dir(app).join(CHATS_DIR_NAME);
+    chats_roots(app).iter().any(|root| strictly_inside(root, cwd))
+}
+
+/// Every `<base>/chats` directory Kitty's chat folders may live under: the
+/// current base's and every earlier one's.
+pub(crate) fn chats_roots(app: &AppHandle) -> Vec<PathBuf> {
+    let history = {
+        let state = app.state::<AppState>();
+        let cfg = state.config.lock().unwrap();
+        cfg.chats_roots_history.clone()
+    };
+    let mut roots = vec![chats_base_dir(app).join(CHATS_DIR_NAME)];
+    roots.extend(
+        history
+            .into_iter()
+            .map(|base| PathBuf::from(base).join(CHATS_DIR_NAME)),
+    );
+    roots
+}
+
+/// Lexically, `cwd` is strictly inside `root` (never the root itself).
+fn strictly_inside(root: &Path, cwd: &str) -> bool {
     let root = root.to_string_lossy().replace('\\', "/");
     let root = root.trim_end_matches('/');
     let cwd = cwd.replace('\\', "/");
     let cwd = cwd.trim_end_matches('/');
-    // Strictly inside `<root>/…`, never the root itself.
     cwd.strip_prefix(root)
         .map(|rel| rel.starts_with('/'))
         .unwrap_or(false)
+}
+
+/// Copy a directory tree. Used to give a branch its own copy of its chat
+/// folder (decision #42).
+pub(crate) fn copy_dir_all(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let target = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_all(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), target)?;
+        }
+    }
+    Ok(())
+}
+
+/// A fresh chat folder under the current base, created.
+pub(crate) async fn fresh_chat_folder(app: &AppHandle) -> Result<PathBuf, String> {
+    let path = new_chat_folder(&chats_base_dir(app));
+    let p = path.clone();
+    tokio::task::spawn_blocking(move || std::fs::create_dir_all(&p))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("could not create the chat folder {}: {e}", path.display()))?;
+    Ok(path)
 }
 
 /// A fresh per-chat folder `<base>/chats/<timestamp>-<short-rand>/`. The

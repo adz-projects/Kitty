@@ -25,7 +25,6 @@ import {
   onSuperseded,
   pickSavePath,
 } from '@/lib/ipc';
-import { buildExport, sanitizeFilename } from '@/lib/chatml';
 import { isAndroid } from '@/lib/platform';
 import { modelAcceptsImages } from '@/lib/vision_models';
 import type {
@@ -1893,26 +1892,19 @@ export const useChatStore = create<ChatState>((set, get) => {
       set((s) => ({ pendingImages: s.pendingImages.filter((p) => p.id !== id) })),
 
     exportSession: async (upToIndex?: number) => {
-      const { messages, title } = get();
-      if (messages.length === 0) return;
-      const chatMessages = buildExport(messages, upToIndex);
-      const base = sanitizeFilename(title ?? 'kitty-session');
-      const body = JSON.stringify({ messages: chatMessages }) + '\n';
-      // Android saves out the way an artifact's "Download" does — the one
-      // write path off the device that has been proven against real document
-      // providers. Desktop's native dialog + write has no such problem.
-      if (isAndroid()) {
-        try {
-          await ipc.downloadText(`${base}.jsonl`, body);
-        } catch (e) {
-          set({ error: String(e) });
-        }
-        return;
-      }
-      const path = await pickSavePath(`${base}.jsonl`);
+      const { sessionId, messages, title } = get();
+      if (!sessionId || messages.length === 0) return;
+      // ChatML + .meta.json, built by the backend from the chat's stored
+      // history (desktop only).
+      if (isAndroid()) return;
+      const base = (title || 'kitty-chat')
+        .replace(/[\\/:*?"<>|]/g, '_')
+        .trim()
+        .slice(0, 80);
+      const path = await pickSavePath(`${base}.chatml`);
       if (!path) return;
       try {
-        await ipc.writeFile(path, body);
+        await ipc.exportChatml([sessionId], path, upToIndex != null ? upToIndex + 1 : null);
       } catch (e) {
         set({ error: String(e) });
       }

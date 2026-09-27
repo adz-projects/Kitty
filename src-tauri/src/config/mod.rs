@@ -40,6 +40,12 @@ pub struct Config {
     pub open_window_hotkey: Option<String>,
     /// Default working directory for new sessions (Phase 4). `None` until set.
     pub default_context_folder: Option<String>,
+    /// Every chats base used before the current one. Chats created under an
+    /// earlier base keep their folders there; this is what keeps them
+    /// recognized as Kitty's own chat folders (and cleaned up with the chat)
+    /// after the setting changes (#51).
+    #[serde(default)]
+    pub chats_roots_history: Vec<String>,
     // No `ollama_base_url` here on purpose. It survived the managed-Ollama
     // retirement (Phase 2b) as a settings field with no reader anywhere —
     // Kitty spawns no inference process, and a remote-Ollama provider profile
@@ -386,6 +392,7 @@ impl Default for Config {
             clipboard_hotkey: Some("Ctrl+Alt+Space".to_string()),
             open_window_hotkey: None,
             default_context_folder: None,
+            chats_roots_history: Vec::new(),
             setup_completed: false,
             theme: "light".to_string(),
             notifications: NotificationPrefs::default(),

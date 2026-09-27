@@ -20,7 +20,6 @@ import {
   onSessionTitle,
 } from '@/lib/ipc';
 import { isAndroid } from '@/lib/platform';
-import { buildExport, sanitizeFilename } from '@/lib/chatml';
 import { SessionKebabMenu } from './SessionKebabMenu';
 import { SessionSelectionBar } from './SessionSelectionBar';
 import type { SessionSummary } from '@/lib/types';
@@ -142,74 +141,20 @@ export function SessionList() {
     }
   };
 
-  /** Bulk "Export from here"-equivalent for the sidebar: reuses
-      `chatStore.loadSession` (the same fetch a normal resume uses — there is
-      no lighter-weight "just give me the messages" endpoint, since BigTiny's
-      session load replays the whole conversation as a stream of Tauri
-      events, not a single return value) to pull each selected session's
-      messages one at a time, exports each through the same
-      `buildExport`/`sanitizeFilename` "Export from here" already uses
-      per-message, and writes one `.jsonl` per session into a single chosen
-      folder. Whatever session this window had open before the export
-      started is reloaded afterward so a bulk export from the Saved Chats
-      tab doesn't leave the Chat tab silently pointed at the last-exported
-      session instead of what the user actually had open. */
+  /** Bulk export for the sidebar: one `.chatml` (+ `.meta.json`) per
+      selected chat into a chosen folder, built by the backend from each
+      chat's stored history - nothing is loaded into this window. */
   const exportSelected = async () => {
     const dir = await pickFolder();
     if (!dir) return;
     setSelectionBusy(true);
     setSelectionError(null);
-    const chat = useChatStore.getState();
-    const restore =
-      chat.sessionId != null
-        ? {
-            sessionId: chat.sessionId,
-            cwd: chat.cwd ?? '',
-            title: chat.title ?? undefined,
-            providerId: chat.sessionProviderId ?? undefined,
-            modelId: chat.sessionModelId ?? undefined,
-          }
-        : null;
-    const usedNames = new Set<string>();
     try {
-      for (const id of selectedIds) {
-        const summary = sessions.find((s) => s.sessionId === id);
-        if (!summary) continue;
-        await useChatStore
-          .getState()
-          .loadSession(
-            summary.sessionId,
-            summary.cwd,
-            summary.title,
-            summary.providerId,
-            summary.modelId
-          );
-        const { messages, title } = useChatStore.getState();
-        const chatMessages = buildExport(messages);
-        let base = sanitizeFilename(title ?? summary.title);
-        if (usedNames.has(base)) base = `${base}-${id.slice(0, 8)}`;
-        usedNames.add(base);
-        await ipc.writeFileInDir(
-          dir,
-          `${base}.jsonl`,
-          JSON.stringify({ messages: chatMessages }) + '\n'
-        );
-      }
+      await ipc.exportChatml([...selectedIds], dir);
       exitSelectionMode();
     } catch (e) {
       setSelectionError(String(e));
     } finally {
-      if (restore) {
-        await useChatStore
-          .getState()
-          .loadSession(
-            restore.sessionId,
-            restore.cwd,
-            restore.title,
-            restore.providerId,
-            restore.modelId
-          );
-      }
       setSelectionBusy(false);
     }
   };

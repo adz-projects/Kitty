@@ -631,24 +631,24 @@ pub(crate) fn parse_tool_calls(row: &Value) -> Vec<Value> {
         .collect()
 }
 
-/// Fork a session, optionally truncated to the frontend's "keep the first N
-/// UI bubbles" semantics (`truncate_from` = bubble count to keep, matching
-/// goosed's conversation-index contract in `branch()`).
-pub async fn fork(
+/// Fork a session in the daemon, optionally truncated to the frontend's
+/// "keep the first N bubbles" (`truncate_from`). Returns the new session's id
+/// and the message it was cut at. The command layer gives the branch its own
+/// folder and title (`commands::session::fork_session`).
+pub async fn fork_raw(
     app: &AppHandle,
-    session_id: String,
-    cwd: String,
+    session_id: &str,
     truncate_from: Option<i64>,
-) -> Result<SessionInfo, String> {
+) -> Result<(String, Option<String>), String> {
     let client = ensure_client(app)?;
     let at_message_id = match truncate_from {
         Some(keep) => {
-            let rows = fetch_history(&client, &session_id).await?;
+            let rows = fetch_history(&client, session_id).await?;
             truncate_target(&rows, keep)?
         }
         None => None,
     };
-    let body = match at_message_id {
+    let body = match &at_message_id {
         Some(id) => json!({ "at_message_id": id }),
         None => json!({}),
     };
@@ -658,10 +658,37 @@ pub async fn fork(
     let new_id = result
         .get("session_id")
         .and_then(|v| v.as_str())
-        .ok_or("BigTiny fork did not return a session id")?
+        .ok_or("The engine did not return the branch's id")?
         .to_string();
     let _ = app.emit("session://created", json!({ "sessionId": new_id }));
-    Ok(session_info(app, new_id, cwd, None, None))
+    Ok((new_id, at_message_id))
+}
+
+/// A chat's title, "New Chat" until it has one.
+pub(crate) async fn title(client: &BigTinyClient, session_id: &str) -> String {
+    client
+        .get_json(&format!("/api/chat/{session_id}"))
+        .await
+        .ok()
+        .and_then(|s| {
+            s.get("name")
+                .or_else(|| s.get("session").and_then(|x| x.get("name")))
+                .and_then(|v| v.as_str())
+                .filter(|n| !n.is_empty())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "New Chat".to_string())
+}
+
+/// [`session_info`], for the command layer.
+pub(crate) fn info(
+    app: &AppHandle,
+    session_id: String,
+    cwd: String,
+    provider_id: Option<String>,
+    model_id: Option<String>,
+) -> SessionInfo {
+    session_info(app, session_id, cwd, provider_id, model_id)
 }
 
 /// Pure: map "keep the first `keep` UI bubbles" onto the id of the last

@@ -37,7 +37,7 @@ pub fn get_config_recovery_notice(
 pub async fn set_config(
     app: AppHandle,
     state: tauri::State<'_, AppState>,
-    config: Config,
+    mut config: Config,
 ) -> Result<(), String> {
     // Consumed only by the desktop-only re-registration below.
     #[cfg_attr(not(desktop), allow(unused_variables))]
@@ -50,6 +50,16 @@ pub async fn set_config(
         // every `[local]` knob only reaches the daemon at spawn, so a change
         // needs a restart to take effect (docs/ANDROID.md §6.4).
         let engine_changed = crate::lifecycle::engine_restart::needs_restart(&cur, &config);
+        // A new chats base: remember the old one, so chats still in it stay
+        // Kitty's own (see `Config::chats_roots_history`).
+        if cur.default_context_folder != config.default_context_folder {
+            let old = crate::commands::base_for(cur.default_context_folder.clone())
+                .to_string_lossy()
+                .into_owned();
+            if !config.chats_roots_history.contains(&old) {
+                config.chats_roots_history.push(old);
+            }
+        }
         let previous = std::mem::replace(&mut *cur, config.clone());
         (previous, hotkey_changed, engine_changed)
     };

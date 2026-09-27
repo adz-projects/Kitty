@@ -10,7 +10,10 @@ use tauri::{AppHandle, Emitter, Manager};
 use crate::config;
 use crate::state::AppState;
 
-use super::{chats_base_dir, resolve_cwd, ThinkingEffort, CHATS_DIR_NAME};
+use super::{
+    chats_base_dir, chats_roots, copy_dir_all, fresh_chat_folder, is_default_folder, resolve_cwd,
+    ThinkingEffort, CHATS_DIR_NAME,
+};
 
 /// Details returned when a session is created, for the chat UI.
 #[derive(Debug, Clone, Serialize)]
@@ -130,8 +133,10 @@ pub async fn fetch_session_transcript(
     crate::bigtiny::sessions::transcript(&app, session_id).await
 }
 
-/// Fork a session, optionally truncating the copy to a branch point. Powers
-/// "Branch from here" and "Regenerate".
+/// Branch a chat: a new chat with its history up to `truncate_from` bubbles
+/// (all of it when `None`), its own copy of the chat folder (so deleting
+/// either never takes the other's files, decision #42), the same card, a
+/// record of where it came from, and the title "Branch of …".
 #[tauri::command]
 pub async fn fork_session(
     app: AppHandle,
@@ -139,7 +144,202 @@ pub async fn fork_session(
     cwd: String,
     truncate_from: Option<i64>,
 ) -> Result<SessionInfo, String> {
-    crate::bigtiny::sessions::fork(&app, session_id, cwd, truncate_from).await
+    branch(&app, &session_id, &cwd, truncate_from).await
+}
+
+async fn branch(
+    app: &AppHandle,
+    session_id: &str,
+    cwd: &str,
+    truncate_from: Option<i64>,
+) -> Result<SessionInfo, String> {
+    let client = crate::bigtiny::client::ensure_client(app)?;
+    let meta = crate::bigtiny::sessions::metadata(&client, session_id).await;
+    let title = crate::bigtiny::sessions::title(&client, session_id).await;
+    let (new_id, at_message_id) =
+        crate::bigtiny::sessions::fork_raw(app, session_id, truncate_from).await?;
+
+    // The branch's own folder: a copy of the original's private chat folder.
+    // A user's own project folder is shared on purpose and stays shared.
+    let chat_dir = meta
+        .get("chat_dir")
+        .and_then(|v| v.as_str())
+        .unwrap_or(cwd)
+        .to_string();
+    let mut patch = json!({
+        "branched_from": { "session_id": session_id, "message_id": at_message_id },
+    });
+    let mut new_cwd = cwd.to_string();
+    if is_default_folder(app, &chat_dir) {
+        let folder = fresh_chat_folder(app).await?;
+        let (from, to) = (PathBuf::from(&chat_dir), folder.clone());
+        tokio::task::spawn_blocking(move || {
+            if from.is_dir() {
+                copy_dir_all(&from, &to)
+            } else {
+                Ok(())
+            }
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("could not copy the chat folder for the branch: {e}"))?;
+        let folder = folder.to_string_lossy().replace('\\', "/");
+        patch["chat_dir"] = json!(folder);
+        if cwd.replace('\\', "/") == chat_dir.replace('\\', "/") {
+            patch["cwd"] = json!(folder);
+            new_cwd = folder;
+        }
+    }
+    client
+        .patch_json(&format!("/api/chat/{new_id}/config"), &patch)
+        .await?;
+    let branch_title = format!("Branch of {title}");
+    crate::bigtiny::sessions::rename(app, &new_id, &branch_title).await?;
+    let _ = app.emit(
+        "session://renamed",
+        json!({ "sessionId": new_id, "title": branch_title }),
+    );
+
+    let text_of = |k: &str| {
+        meta.get(k)
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    };
+    Ok(crate::bigtiny::sessions::info(
+        app,
+        new_id,
+        new_cwd,
+        text_of("provider"),
+        text_of("model"),
+    ))
+}
+
+/// Move a chat to another card (decision #24): chats stay on their card, so
+/// this makes a new one. With `keep_context` it is a branch of the whole chat
+/// on the new card; without, a fresh chat on it. The original is untouched.
+#[tauri::command]
+pub async fn branch_to_provider(
+    app: AppHandle,
+    session_id: String,
+    cwd: String,
+    provider_id: String,
+    keep_context: bool,
+) -> Result<SessionInfo, String> {
+    let card = {
+        let state = app.state::<AppState>();
+        let cfg = state.config.lock().unwrap();
+        cfg.providers
+            .iter()
+            .find(|p| p.id == provider_id && p.is_usable())
+            .cloned()
+    }
+    .ok_or("That provider can't be used; choose another.")?;
+    crate::config::providers::test_connection(&card)
+        .await
+        .map_err(|e| format!("Can't switch to {} — {e}", card.name))?;
+    let model = card.models.first().cloned().unwrap_or_default();
+
+    let mut info = if keep_context {
+        branch(&app, &session_id, &cwd, None).await?
+    } else {
+        let folder = fresh_chat_folder(&app).await?;
+        let folder = folder.to_string_lossy().replace('\\', "/");
+        crate::bigtiny::sessions::create(
+            &app,
+            folder,
+            Some(card.id.clone()),
+            Some(model.clone()),
+            Some(card.id.clone()),
+        )
+        .await?
+    };
+    crate::bigtiny::providers::set_session_provider(&app, &info.session_id, &card.id, &model).await;
+    if let Err(e) = crate::bigtiny::sessions::update_persona_override(
+        &app,
+        &info.session_id,
+        &crate::config::providers::system_prompt_for(&card),
+    )
+    .await
+    {
+        tracing::warn!("could not set the branch's system prompt: {e}");
+    }
+    info.provider_id = Some(card.id);
+    info.model_id = Some(model);
+    Ok(info)
+}
+
+/// Move every chat folder under the chats base `from` to the current base,
+/// and repoint the chats that used them (decision #51). Returns how many
+/// were moved. A folder that cannot be moved stays, and so does its chat's
+/// path - still a recognized chat folder, through `chats_roots_history`.
+#[tauri::command]
+pub async fn move_chat_folders(app: AppHandle, from: String) -> Result<usize, String> {
+    let old_root = PathBuf::from(&from).join(CHATS_DIR_NAME);
+    let new_root = chats_base_dir(&app).join(CHATS_DIR_NAME);
+    if old_root == new_root {
+        return Ok(0);
+    }
+    let client = crate::bigtiny::client::ensure_client(&app)?;
+    let mut sessions: Vec<Value> = Vec::new();
+    let mut offset = 0u32;
+    loop {
+        let (page, _) = crate::bigtiny::sessions::list_page(&app, offset, 500).await?;
+        if page.is_empty() {
+            break;
+        }
+        offset += page.len() as u32;
+        sessions.extend(page);
+    }
+    let mut moved = 0usize;
+    for s in &sessions {
+        let (Some(id), Some(cwd)) = (
+            s.get("sessionId").and_then(|v| v.as_str()),
+            s.get("cwd").and_then(|v| v.as_str()),
+        ) else {
+            continue;
+        };
+        if !strictly_under(&old_root, cwd) {
+            continue;
+        }
+        let src = PathBuf::from(cwd);
+        let Some(name) = src.file_name().map(|n| n.to_owned()) else {
+            continue;
+        };
+        let dst = new_root.join(name);
+        let (s2, d2) = (src.clone(), dst.clone());
+        let ok = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            std::fs::create_dir_all(d2.parent().unwrap_or(&d2))?;
+            // A rename where possible; across drives, copy then remove.
+            if std::fs::rename(&s2, &d2).is_err() {
+                copy_dir_all(&s2, &d2)?;
+                std::fs::remove_dir_all(&s2)?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+        if let Err(e) = ok {
+            tracing::warn!("could not move chat folder {cwd}: {e}");
+            continue;
+        }
+        let dst = dst.to_string_lossy().replace('\\', "/");
+        let _ = client
+            .patch_json(
+                &format!("/api/chat/{id}/config"),
+                &json!({ "cwd": dst, "chat_dir": dst }),
+            )
+            .await;
+        moved += 1;
+    }
+    Ok(moved)
+}
+
+fn strictly_under(root: &Path, cwd: &str) -> bool {
+    let root = root.to_string_lossy().replace('\\', "/");
+    let root = root.trim_end_matches('/').to_ascii_lowercase();
+    let cwd = cwd.replace('\\', "/").trim_end_matches('/').to_ascii_lowercase();
+    cwd.strip_prefix(&root).is_some_and(|rel| rel.starts_with('/'))
 }
 
 /// Record that this window is now displaying `session_id` — used so a
@@ -427,8 +627,10 @@ pub async fn delete_session(
         // `chats/` dir (a Kitty-created per-chat folder) — never a user's own
         // directory. Canonicalized (not a raw string prefix), so a malicious
         // `…/chats/X/../../Other` can't redirect the delete outside the tree.
-        let chats_root = chats_base_dir(&app).join(CHATS_DIR_NAME);
-        if chat_folder_is_deletable(&cwd, &chats_root) {
+        if chats_roots(&app)
+            .iter()
+            .any(|root| chat_folder_is_deletable(&cwd, root))
+        {
             let cwd_for_delete = cwd.replace('\\', "/");
             let _ =
                 tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&cwd_for_delete)).await;
@@ -492,7 +694,7 @@ pub async fn clear_all_sessions(app: AppHandle) -> Result<usize, String> {
         sessions.extend(page);
     }
 
-    let chats_root = chats_base_dir(&app).join(CHATS_DIR_NAME);
+    let roots = chats_roots(&app);
 
     let mut deleted = 0usize;
     let mut last_err: Option<String> = None;
@@ -507,7 +709,7 @@ pub async fn clear_all_sessions(app: AppHandle) -> Result<usize, String> {
                     // Same canonical, strictly-inside guard as `delete_session`
                     // — never let a crafted cwd redirect the folder cleanup
                     // outside the chats tree.
-                    if chat_folder_is_deletable(cwd, &chats_root) {
+                    if roots.iter().any(|root| chat_folder_is_deletable(cwd, root)) {
                         let cwd_for_delete = cwd.replace('\\', "/");
                         let _ = tokio::task::spawn_blocking(move || {
                             std::fs::remove_dir_all(&cwd_for_delete)

@@ -24,10 +24,12 @@ mod screenshot;
 mod session;
 mod specialists;
 mod setup;
+mod export;
 mod window;
 
 pub use adaptive_pathway::*;
 pub use config::*;
+pub use export::*;
 pub use file::*;
 pub use folders::*;
 pub use logs::*;

@@ -71,6 +71,13 @@ pub async fn regenerate_last(app: AppHandle, session_id: String) -> Result<(), S
     crate::bigtiny::sessions::regenerate_last(&app, &session_id).await
 }
 
+/// Watch a turn running elsewhere (a specialist's chat): replays it so far,
+/// then follows it live. `false` when nothing is running there.
+#[tauri::command]
+pub async fn attach_session_stream(app: AppHandle, session_id: String) -> Result<bool, String> {
+    crate::bigtiny::stream::attach_session_stream(&app, &session_id).await
+}
+
 /// Cancel the in-flight turn for a session.
 #[tauri::command]
 pub async fn cancel_prompt(app: AppHandle, session_id: String) -> Result<(), String> {

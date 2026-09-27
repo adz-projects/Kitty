@@ -576,7 +576,24 @@ async fn run_stream(
         let text = resp.text().await.unwrap_or_default();
         return Err(send_refusal(status, &text));
     }
+    // The chat's own card's `prompt_idle_timeout_secs`, or 300s when unset.
+    let idle = std::time::Duration::from_secs(u64::from(
+        card.and_then(|c| c.prompt_idle_timeout_secs)
+            .filter(|s| *s > 0)
+            .unwrap_or(300),
+    ));
+    consume_stream(app, session_id, resp, idle).await
+}
 
+/// Read one turn's SSE stream to its end, emitting `chat://*` events as frames
+/// arrive: the reading half of [`run_stream`], shared with
+/// [`attach_session_stream`].
+async fn consume_stream(
+    app: &AppHandle,
+    session_id: &str,
+    resp: reqwest::Response,
+    idle: std::time::Duration,
+) -> Result<TurnOutcome, StreamFailure> {
     let mut outcome = TurnOutcome::default();
     // Tool cards are paired by the daemon's own `tool_call_id`, because a
     // step's tool calls run CONCURRENTLY (`agent::loop_::execute_tools`) —
@@ -605,12 +622,6 @@ async fn run_stream(
     // daemon sends a keepalive comment every 15s, and those are bytes too, so
     // a turn that is merely waiting - on an approval, on a slow model - is
     // never cut off; this only fires when the daemon itself stops answering.
-    // The chat's own card's `prompt_idle_timeout_secs`, or 300s when unset.
-    let idle = std::time::Duration::from_secs(u64::from(
-        card.and_then(|c| c.prompt_idle_timeout_secs)
-            .filter(|s| *s > 0)
-            .unwrap_or(300),
-    ));
     let mut bytes = resp.bytes_stream();
     let mut deltas = DeltaBatcher::default();
     'outer: loop {
@@ -1098,6 +1109,50 @@ pub async fn fetch_full_tool_result(
         })
         .and_then(|r| r.get("content").and_then(|c| c.as_str()).map(str::to_string))
         .ok_or_else(|| "That tool's output is no longer in this chat's history.".to_string())
+}
+
+/// Follow a turn already running in another place (a specialist's own chat,
+/// opened to watch it): its frames so far, then live, as `chat://*` events,
+/// ending with `chat://complete`. `Ok(false)` when nothing is running there.
+pub async fn attach_session_stream(app: &AppHandle, session_id: &str) -> Result<bool, String> {
+    let client = ensure_client(app)?;
+    let resp = client
+        .request_stream(reqwest::Method::GET, &format!("/api/chat/{session_id}/stream"))
+        .send()
+        .await
+        .map_err(|e| format!("Could not reach the engine: {e}"))?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(false);
+    }
+    if !resp.status().is_success() {
+        return Err(format!("The engine answered {}", resp.status()));
+    }
+    let app = app.clone();
+    let session_id = session_id.to_string();
+    tauri::async_runtime::spawn(async move {
+        let outcome = consume_stream(&app, &session_id, resp, std::time::Duration::from_secs(300)).await;
+        match outcome {
+            Ok(o) if o.error.is_none() => {
+                let _ = app.emit(
+                    "chat://complete",
+                    json!({ "session_id": session_id, "result": { "stopReason": if o.cancelled { "cancelled" } else { "end_turn" } } }),
+                );
+            }
+            Ok(o) => {
+                let _ = app.emit(
+                    "chat://error",
+                    json!({ "session_id": session_id, "message": o.error, "error_type": o.error_type }),
+                );
+            }
+            Err(f) => {
+                let _ = app.emit(
+                    "chat://error",
+                    json!({ "session_id": session_id, "message": f.message, "error_type": f.error_type }),
+                );
+            }
+        }
+    });
+    Ok(true)
 }
 
 /// Cancel the in-flight turn (`POST /api/chat/{id}/cancel`); BigTiny resolves

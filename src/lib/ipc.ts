@@ -275,6 +275,20 @@ export const ipc = {
   /** Daemon-global pre-flight memory recall telemetry (Settings → Advanced). */
   getMemoryStats: () => invoke<MemoryStats>('get_memory_stats'),
   // Instant per-session mode toggle (Round-4)
+  /** Export chats as ChatML (+ `.meta.json`). One chat and a `.chatml` path:
+      written there; otherwise `dest` is a folder. `keep` ("Export from here")
+      is the number of bubbles to include. Returns the paths written. */
+  exportChatml: (sessionIds: string[], dest: string, keep?: number | null) =>
+    invoke<string[]>('export_chatml', { sessionIds, keep: keep ?? null, dest }),
+  /** Move a chat onto another card: a branch of it there (keepContext), or a
+      fresh chat on it. The original is untouched. */
+  branchToProvider: (sessionId: string, cwd: string, providerId: string, keepContext: boolean) =>
+    invoke<SessionInfo>('branch_to_provider', { sessionId, cwd, providerId, keepContext }),
+  /** Move chat folders from an earlier chats base into the current one. */
+  moveChatFolders: (from: string) => invoke<number>('move_chat_folders', { from }),
+  /** Follow a turn running in another chat (spectating a specialist). */
+  attachSessionStream: (sessionId: string) =>
+    invoke<boolean>('attach_session_stream', { sessionId }),
   forkSession: (sessionId: string, cwd: string, truncateFrom: number | null) =>
     invoke<SessionInfo>('fork_session', { sessionId, cwd, truncateFrom }),
   compactSession: (sessionId: string) =>
@@ -548,12 +562,11 @@ export async function pickFiles(): Promise<string[]> {
   return Array.isArray(res) ? res : [res];
 }
 
-/** Native save-file dialog for the session export (Round-3 item 24: OpenAI
-    messages-array JSONL). Returns null if cancelled. */
+/** Native save-file dialog for a ChatML export. Returns null if cancelled. */
 export async function pickSavePath(defaultName: string): Promise<string | null> {
   const res = await saveDialog({
     defaultPath: defaultName,
-    filters: [{ name: 'JSON Lines', extensions: ['jsonl'] }],
+    filters: [{ name: 'ChatML', extensions: ['chatml'] }],
   });
   return res ?? null;
 }
