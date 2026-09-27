@@ -162,7 +162,9 @@ mod tests {
 
     #[test]
     fn only_content_uris_are_routed_through_the_resolver() {
-        assert!(is_content_uri("content://com.android.providers.downloads/1"));
+        assert!(is_content_uri(
+            "content://com.android.providers.downloads/1"
+        ));
         assert!(!is_content_uri("/data/user/0/com.kitty.app/files/x.jsonl"));
         assert!(!is_content_uri("C:/Users/me/x.jsonl"));
     }

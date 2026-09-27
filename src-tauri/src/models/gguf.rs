@@ -39,7 +39,9 @@ pub struct GgufInfo {
 pub fn quantization_from_name(file_stem: &str) -> Option<String> {
     let upper = file_stem.to_ascii_uppercase();
     for part in upper.rsplit(['-', '.', '_']) {
-        if part.starts_with('Q') && part.len() >= 2 && part[1..2].chars().all(|c| c.is_ascii_digit())
+        if part.starts_with('Q')
+            && part.len() >= 2
+            && part[1..2].chars().all(|c| c.is_ascii_digit())
         {
             // Recover the full suffix (`Q4_K_M`), not just the last token.
             if let Some(idx) = upper.find(part) {

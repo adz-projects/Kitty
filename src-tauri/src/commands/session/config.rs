@@ -21,12 +21,16 @@ pub async fn set_thinking_effort(
     {
         let state = app.state::<AppState>();
         let mut cfg = state.config.lock().unwrap();
-        cfg.session_efforts.insert(session_id.clone(), value.clone());
+        cfg.session_efforts
+            .insert(session_id.clone(), value.clone());
         crate::config::save(&cfg).map_err(|e| e.to_string())?;
     }
     crate::bigtiny::sessions::update_thinking_effort(&app, &session_id, &value).await?;
     crate::bigtiny::effort::ensure_effort_levels_cached(&app).await;
-    Ok(crate::bigtiny::effort::thinking_effort_for(&app, &session_id))
+    Ok(crate::bigtiny::effort::thinking_effort_for(
+        &app,
+        &session_id,
+    ))
 }
 
 /// Read the effort control for a session, recomputed against the active
@@ -40,7 +44,10 @@ pub async fn get_thinking_effort(
     // Discover a self-hosted model's own effort levels (once per provider+model)
     // before reading — the sync read below then reflects them.
     crate::bigtiny::effort::ensure_effort_levels_cached(&app).await;
-    Ok(crate::bigtiny::effort::thinking_effort_for(&app, &session_id))
+    Ok(crate::bigtiny::effort::thinking_effort_for(
+        &app,
+        &session_id,
+    ))
 }
 
 /// "Set as working directory" (agentic mode only) — repoints the session's
@@ -95,6 +102,3 @@ pub async fn reset_session_context_dir(
     let cwd = resolve_cwd(&app).await?;
     crate::bigtiny::sessions::reset_cwd(&app, &session_id, cwd).await
 }
-
-
-

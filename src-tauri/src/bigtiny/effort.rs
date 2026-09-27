@@ -47,9 +47,7 @@ pub fn effort_dialect(provider_type: &str, model: &str) -> Option<EffortDialect>
     match provider_type {
         "anthropic" if anthropic_takes_effort(model) => Some(EffortDialect::AnthropicThinking),
         "openai" if openai_takes_effort(model) => Some(EffortDialect::OpenAiReasoningEffort),
-        "openrouter" if openrouter_takes_effort(model) => {
-            Some(EffortDialect::OpenRouterReasoning)
-        }
+        "openrouter" if openrouter_takes_effort(model) => Some(EffortDialect::OpenRouterReasoning),
         // A self-hosted OpenAI-compatible endpoint (a llama-server or Ollama
         // the user runs). Unlike the hosted dialects, we don't guess from the
         // model *name* whether it reasons — we ask the endpoint (and, failing
@@ -72,7 +70,11 @@ pub fn effort_options(dialect: EffortDialect) -> Vec<EffortOption> {
     };
     match dialect {
         EffortDialect::OpenAiReasoningEffort => {
-            vec![opt("Low", "low"), opt("Medium", "medium"), opt("High", "high")]
+            vec![
+                opt("Low", "low"),
+                opt("Medium", "medium"),
+                opt("High", "high"),
+            ]
         }
         // Self-hosted gets the same graded set as OpenRouter/Anthropic: the
         // daemon translates each level into `enable_thinking` (on for any
@@ -252,9 +254,9 @@ fn extract_effort_levels(template: &str) -> Option<Vec<String>> {
 /// on a boolean-only template every non-Off level reads the same, which is
 /// the honest behaviour rather than a hidden control.
 fn boolean_thinking_levels(template: &str) -> Option<Vec<String>> {
-    template.contains("enable_thinking").then(|| {
-        vec!["low".to_string(), "medium".to_string(), "high".to_string()]
-    })
+    template
+        .contains("enable_thinking")
+        .then(|| vec!["low".to_string(), "medium".to_string(), "high".to_string()])
 }
 
 /// Levels for one chat template: the graded guard if present, else the
@@ -301,11 +303,7 @@ fn normalize_base(base_url: &str) -> String {
 ///
 /// Best-effort throughout: any network/parse failure falls through to the next
 /// source, then to `None`.
-async fn probe_effort_levels(
-    base_url: &str,
-    model: &str,
-    api_key: Option<&str>,
-) -> ProbeOutcome {
+async fn probe_effort_levels(base_url: &str, model: &str, api_key: Option<&str>) -> ProbeOutcome {
     let client = crate::util::http_client();
     let mut reached_a_template = false;
 
@@ -787,18 +785,17 @@ mod tests {
             ("Qwen/Qwen3-8B", Some("Qwen/Qwen3-8B")),
             ("Qwen/Qwen3-8B-GGUF:Q5_K_M", Some("Qwen/Qwen3-8B-GGUF")),
             ("Qwen/Qwen3-8B-GGUF/model.gguf", Some("Qwen/Qwen3-8B-GGUF")),
-            ("unsloth/Qwen3-27B-GGUF.gguf", Some("unsloth/Qwen3-27B-GGUF")),
+            (
+                "unsloth/Qwen3-27B-GGUF.gguf",
+                Some("unsloth/Qwen3-27B-GGUF"),
+            ),
             // Not repo ids.
             ("qwen3-8b", None),
             ("", None),
             ("/models/local.gguf", None),
             ("some model/with a space", None),
         ] {
-            assert_eq!(
-                hf_repo_id(input).as_deref(),
-                want,
-                "input {input:?}"
-            );
+            assert_eq!(hf_repo_id(input).as_deref(), want, "input {input:?}");
         }
     }
 

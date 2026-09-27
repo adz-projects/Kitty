@@ -29,7 +29,11 @@ const PRIO_WARN: i32 = 5;
 const PRIO_ERROR: i32 = 6;
 
 extern "C" {
-    fn __android_log_write(prio: i32, tag: *const std::os::raw::c_char, text: *const std::os::raw::c_char) -> i32;
+    fn __android_log_write(
+        prio: i32,
+        tag: *const std::os::raw::c_char,
+        text: *const std::os::raw::c_char,
+    ) -> i32;
 }
 
 /// Buffers one formatted event, then emits it as a single logcat line on drop.

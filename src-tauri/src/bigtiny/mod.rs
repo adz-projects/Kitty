@@ -11,7 +11,6 @@
 
 pub mod client;
 pub mod context_window;
-pub mod vision;
 pub mod effort;
 pub mod mcp;
 pub mod memorabilia;
@@ -21,3 +20,4 @@ pub mod sessions;
 pub mod specialists;
 pub mod stream;
 pub mod turn_text;
+pub mod vision;

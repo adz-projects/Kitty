@@ -93,7 +93,10 @@ mod tests {
             Schedule::Recurring { interval_secs } => assert_eq!(interval_secs, 3600),
             Schedule::OneShot => panic!("expected Recurring"),
         }
-        assert_eq!(back.model_id.as_deref(), Some("LFM2.5-1.2B-Instruct-Q4_K_M"));
+        assert_eq!(
+            back.model_id.as_deref(),
+            Some("LFM2.5-1.2B-Instruct-Q4_K_M")
+        );
     }
 
     /// A task saved before `model_id` existed must still load, meaning "use

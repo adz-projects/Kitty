@@ -93,9 +93,12 @@ pub async fn list_sessions(
     offset: Option<u32>,
     limit: Option<u32>,
 ) -> Result<Value, String> {
-    let (sessions, total) =
-        crate::bigtiny::sessions::list_page(&app, offset.unwrap_or(0), limit.unwrap_or(100).min(500))
-            .await?;
+    let (sessions, total) = crate::bigtiny::sessions::list_page(
+        &app,
+        offset.unwrap_or(0),
+        limit.unwrap_or(100).min(500),
+    )
+    .await?;
     Ok(json!({ "sessions": sessions, "total": total }))
 }
 
@@ -338,8 +341,12 @@ pub async fn move_chat_folders(app: AppHandle, from: String) -> Result<usize, St
 fn strictly_under(root: &Path, cwd: &str) -> bool {
     let root = root.to_string_lossy().replace('\\', "/");
     let root = root.trim_end_matches('/').to_ascii_lowercase();
-    let cwd = cwd.replace('\\', "/").trim_end_matches('/').to_ascii_lowercase();
-    cwd.strip_prefix(&root).is_some_and(|rel| rel.starts_with('/'))
+    let cwd = cwd
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_ascii_lowercase();
+    cwd.strip_prefix(&root)
+        .is_some_and(|rel| rel.starts_with('/'))
 }
 
 /// Record that this window is now displaying `session_id` — used so a
