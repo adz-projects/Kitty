@@ -57,6 +57,8 @@ import {
   isAutoSpecialistCollection,
   isStragglerAssistantMessage,
   userFileArtifact,
+  hasSomethingToSend,
+  untrustedWarning,
 } from './chat/messageUtils';
 import type { Artifact, Attachment, Message, PendingImage, ToolCall } from './chat/types';
 import { noticeText } from './chat/notices';
@@ -774,6 +776,12 @@ export const useChatStore = create<ChatState>((set, get) => {
   // call — newSession()'s optimistic clear wipes droppedFiles/attachments/
   // pendingImages, so reading them only after a lazy session-create would
   // silently drop the first message's files.
+  // The untrusted-provider notice, from any attach path.
+  const warnIfUntrusted = (what: string) => {
+    const warning = untrustedWarning(what, get());
+    if (warning) set({ warning });
+  };
+
   const doSend = async (
     text: string,
     snapshot?: {
@@ -1711,12 +1719,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         }
         if (!infos.length) return;
         // Untrusted-provider warning (Round-2 item 13) — non-blocking, never bans.
-        const { providerTier, isTrusted, providerHost } = get();
-        if (providerTier && providerTier !== 'local' && !isTrusted) {
-          set({
-            warning: `Attaching files will send their contents to ${providerHost ?? 'an untrusted provider'}, which you haven't marked trusted.`,
-          });
-        }
+        warnIfUntrusted(infos.length === 1 ? 'This file' : 'These files');
         // Which of the two handoffs a drop gets is now decided by what the
         // provider can actually do, not by a mode the user had to set.
         //
@@ -1816,7 +1819,7 @@ export const useChatStore = create<ChatState>((set, get) => {
       }
     },
 
-    addPastedText: (text: string, label?: string) =>
+    addPastedText: (text: string, label?: string) => {
       set((s) => ({
         attachments: [
           ...s.attachments,
@@ -1826,7 +1829,9 @@ export const useChatStore = create<ChatState>((set, get) => {
             content: text,
           },
         ],
-      })),
+      }));
+      warnIfUntrusted(label ? `"${label}"` : 'This pasted text');
+    },
 
     removeAttachment: (id: string) =>
       set((s) => ({ attachments: s.attachments.filter((a) => a.id !== id) })),
@@ -1841,6 +1846,7 @@ export const useChatStore = create<ChatState>((set, get) => {
       set((s) => ({
         pendingImages: [...s.pendingImages, { id: newId(), mime, data_url: dataUrl }],
       }));
+      warnIfUntrusted('This image');
     },
 
     removePendingImage: (id: string) =>
@@ -1935,13 +1941,7 @@ export const useChatStore = create<ChatState>((set, get) => {
 
     send: async (text: string) => {
       const trimmed = text.trim();
-      const attachments = get().attachments;
-      const pendingImages = get().pendingImages;
-      if (
-        sendInFlight ||
-        get().busy ||
-        (!trimmed && attachments.length === 0 && pendingImages.length === 0)
-      ) {
+      if (sendInFlight || get().busy || !hasSomethingToSend(trimmed, get())) {
         return;
       }
       // Acquire the synchronous in-flight guard BEFORE any await — `busy` is

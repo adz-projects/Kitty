@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
-import { useChatStore } from '@/stores/chatStore';
+import { hasSomethingToSend, useChatStore } from '@/stores/chatStore';
+import { pastedFileKind, readAsDataUrl } from '@/lib/pasteFiles';
 import { ipc, pickFiles } from '@/lib/ipc';
 import { UploadIcon } from '@/components/icons/UploadIcon';
 import { CameraIcon } from '@/components/icons/CameraIcon';
@@ -66,6 +67,10 @@ export function Composer({
   const compact = useChatStore((s) => s.compact);
   const stopPhase = useChatStore((s) => s.stopPhase);
   const forceStop = useChatStore((s) => s.forceStop);
+  // Anything attached is a message on its own; text is optional then (#26).
+  const hasAttachments = useChatStore(
+    (s) => s.droppedFiles.length + s.attachments.length + s.pendingImages.length > 0
+  );
 
   const resetTextareaHeight = () => {
     if (resizeRaf.current) cancelAnimationFrame(resizeRaf.current);
@@ -101,7 +106,7 @@ export function Composer({
 
   const submit = () => {
     const value = text.trim();
-    if (!value) return;
+    if (!hasSomethingToSend(value, useChatStore.getState())) return;
     if (disabled || readOnly || sendBlocked) return;
     // Manual context compaction — a local command, not a message to the
     // model. Exact-slug match only: a word-boundary check would still let a
@@ -119,6 +124,28 @@ export function Composer({
     onSend(value);
     setText('');
     resetTextareaHeight();
+  };
+
+  // Files pasted from the clipboard (#27): an image attaches as an image, a
+  // text file as an inlined document; anything else has no path to hand the
+  // model, so it says to attach it with the button instead.
+  const attachPastedFiles = async (files: File[]) => {
+    const skipped: string[] = [];
+    for (const file of files) {
+      const kind = pastedFileKind(file);
+      try {
+        if (kind === 'image') addPendingImage(file.type, await readAsDataUrl(file));
+        else if (kind === 'text') addPastedText(await file.text(), file.name);
+        else skipped.push(file.name);
+      } catch {
+        skipped.push(file.name);
+      }
+    }
+    if (skipped.length) {
+      useChatStore.setState({
+        warning: `Couldn't attach ${skipped.join(', ')} from the clipboard — use the attach button or drag it in instead.`,
+      });
+    }
   };
 
   // Button-triggered file attach — same pipeline as OS drag-drop (Round-5).
@@ -207,6 +234,12 @@ export function Composer({
           }
         }}
         onPaste={(e) => {
+          const files = Array.from(e.clipboardData.files);
+          if (files.length > 0) {
+            e.preventDefault();
+            void attachPastedFiles(files);
+            return;
+          }
           const pasted = e.clipboardData.getData('text');
           if (pasted.length > PASTE_THRESHOLD) {
             e.preventDefault();
@@ -236,7 +269,7 @@ export function Composer({
         <button
           className="primary"
           onClick={submit}
-          disabled={!text.trim() || readOnly || sendBlocked}
+          disabled={(!text.trim() && !hasAttachments) || readOnly || sendBlocked}
         >
           Send
         </button>

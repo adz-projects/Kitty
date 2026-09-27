@@ -6,6 +6,31 @@ import type { ProviderType, ProviderView, ToolCallUpdate } from '@/lib/types';
 import { pathWithinDir } from './approvalUtils';
 import type { Artifact, Message, ToolCall } from './types';
 
+/** Whether the composer has anything to send: typed text or any attachment
+    (#26 — a screenshot or file on its own is a complete message). Pure. */
+export function hasSomethingToSend(
+  text: string,
+  s: { droppedFiles: unknown[]; attachments: unknown[]; pendingImages: unknown[] }
+): boolean {
+  return (
+    text.trim().length > 0 ||
+    s.droppedFiles.length > 0 ||
+    s.attachments.length > 0 ||
+    s.pendingImages.length > 0
+  );
+}
+
+/** The notice for sending something to a provider the user hasn't marked
+    trusted, or null when there's nothing to say (#29). One wording for every
+    way content gets attached: drop, paste, clipboard, screenshot. Pure. */
+export function untrustedWarning(
+  what: string,
+  s: { providerTier: string | null; isTrusted: boolean; providerHost: string | null }
+): string | null {
+  if (!s.providerTier || s.providerTier === 'local' || s.isTrusted) return null;
+  return `${what} will be sent to ${s.providerHost ?? 'this provider'}, which you haven't marked trusted.`;
+}
+
 export const closeOpen = (msgs: Message[]): Message[] =>
   msgs.map((m) => (m.open ? { ...m, open: false, streaming: false } : m));
 
