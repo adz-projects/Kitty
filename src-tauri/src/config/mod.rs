@@ -73,6 +73,11 @@ pub struct Config {
     pub notifications: NotificationPrefs,
     /// Remember overlay size/position between summons (Phase 6).
     pub remember_overlay_position: bool,
+    /// What became of a Kitty V1 install's data (#11): `imported` or
+    /// `dismissed`. Unset while there is V1 data the user has not decided
+    /// about, which is when the import is offered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v1_import_state: Option<String>,
     /// Provider profiles (metadata only; secrets live in the keyring).
     pub providers: Vec<ProviderProfile>,
     /// Id of the default provider profile (new chats use it), if any.
@@ -413,6 +418,7 @@ impl Default for Config {
             default_context_folder: None,
             overlay_geometry: std::collections::HashMap::new(),
             chats_roots_history: Vec::new(),
+            v1_import_state: None,
             setup_completed: false,
             theme: "light".to_string(),
             notifications: NotificationPrefs::default(),
@@ -634,25 +640,11 @@ pub(crate) fn config_dir() -> Result<PathBuf, ConfigError> {
     Ok(dir)
 }
 
-/// BigTiny's own data root (its SQLite db, the directory-sandbox's
-/// always-allowed cache dir, and its recipes dir — see `bigtiny/paths.py`'s
-/// `data_dir()`) — consolidated under `%APPDATA%/Kitty/bigtiny/` rather than
-/// BigTiny's own standalone-dev default of `~/.bigtiny`, which Kitty
-/// overrides by setting `BIGTINY_DATA_DIR` when spawning it
-/// (`lifecycle::bigtiny_proc::spawn`). One-time migration: if the new dir has
-/// no `bigtiny.db` yet but `~/.bigtiny` does, move the whole directory over.
-pub fn bigtiny_data_dir() -> Result<PathBuf, ConfigError> {
-    let dir = config_dir()?.join("bigtiny");
-    if !dir.join("bigtiny.db").exists() {
-        if let Some(home) = dirs::home_dir() {
-            let old_dir = home.join(".bigtiny");
-            if old_dir.exists() {
-                migrate_dir(&old_dir, &dir);
-            }
-        }
-    }
-    fs::create_dir_all(&dir)?;
-    Ok(dir)
+/// Where a Kitty V1 install's daemon kept its data (`bigtiny.db`,
+/// `pathway.db`). Nothing writes here any more - V2 keeps its own data
+/// directory - so this is only ever read, by the V1 import (#11).
+pub fn v1_data_dir() -> Result<PathBuf, ConfigError> {
+    Ok(config_dir()?.join("bigtiny"))
 }
 
 /// Best-effort directory migration: a same-volume rename is instant and

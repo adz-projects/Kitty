@@ -41,6 +41,19 @@ pub async fn delete_memorabilia_item(app: AppHandle, item_id: String) -> Result<
     crate::bigtiny::memorabilia::delete_item(&client, &item_id).await
 }
 
+/// Settings -> Memorabilia "Erase all" (#72): every remembered fact, gone.
+#[tauri::command]
+pub async fn erase_all_facts(app: AppHandle) -> Result<(), String> {
+    let client = ensure_client(&app)?;
+    crate::bigtiny::memorabilia::erase_all(&client)
+        .await
+        .map(|_| ())
+        .map_err(|e| {
+            tracing::warn!("erasing facts failed: {e}");
+            "Could not erase the facts. Try again, or check the error log.".to_string()
+        })
+}
+
 /// Check &, if corrupt, repair the factual-memory DB (Settings → Memorabilia
 /// Health "Check & repair database"). Salvages what still reads into a fresh
 /// file, leaving a timestamped backup. Returns `{integrity_ok, rebuilt,

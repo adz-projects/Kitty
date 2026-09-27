@@ -233,17 +233,6 @@ pub fn daemon_env(
             threshold.to_string(),
         ));
     }
-    // Consolidates BigTiny's db and cache-sandbox-root under Kitty's
-    // own data dir instead of its standalone `~/.bigtiny` default.
-    // Best-effort: if this can't be resolved the daemon just uses that
-    // default rather than failing to start.
-    if let Ok(data_dir) = crate::config::bigtiny_data_dir() {
-        env.push((
-            "BIGTINY_DATA_DIR".to_string(),
-            data_dir.to_string_lossy().into_owned(),
-        ));
-    }
-
     // Where the three bundled tool plugins (`kitty-tools`, `kitty-web`,
     // `kitty-wasm`) should put their caches, and what their path-containment
     // checks treat as "inside home".

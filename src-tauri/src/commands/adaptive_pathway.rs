@@ -43,6 +43,20 @@ pub async fn delete_pathway_belief(app: AppHandle, belief_id: String) -> Result<
     crate::bigtiny::pathway::delete_belief(&client, &belief_id).await
 }
 
+/// Settings -> Adaptive Pathway "Erase all" (#72): every belief, gone. The UI
+/// asks for a typed confirmation first.
+#[tauri::command]
+pub async fn erase_all_beliefs(app: AppHandle) -> Result<(), String> {
+    let client = ensure_client(&app)?;
+    crate::bigtiny::pathway::erase_all(&client)
+        .await
+        .map(|_| ())
+        .map_err(|e| {
+            tracing::warn!("erasing beliefs failed: {e}");
+            "Could not erase the beliefs. Try again, or check the error log.".to_string()
+        })
+}
+
 /// The incognito/pause toggle for one session: while paused, recall returns
 /// nothing and nothing is written, for that session only.
 #[tauri::command]

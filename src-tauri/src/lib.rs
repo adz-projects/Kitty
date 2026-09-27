@@ -27,6 +27,8 @@ mod screenshot;
 mod state;
 #[cfg(desktop)]
 mod tray;
+#[cfg(desktop)]
+mod uninstall;
 mod util;
 mod windows;
 mod wizard;
@@ -47,6 +49,11 @@ use state::AppState;
 /// is false there and `main` calls this directly.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // The uninstaller's "delete my data" pass: no windows, no tray.
+    #[cfg(desktop)]
+    if uninstall::requested() {
+        std::process::exit(uninstall::run());
+    }
     // Structured logs to stderr (unchanged); RUST_LOG overrides the default
     // filter. Also captures WARN/ERROR events into an in-memory ring buffer
     // (`log_capture`) that Settings → Advanced's error log reads — same
@@ -312,6 +319,11 @@ pub fn run() {
             commands::set_brave_mcp_search_api_key,
             commands::set_brave_mcp_search_enabled,
             commands::patch_config,
+            commands::erase_all_beliefs,
+            commands::erase_all_facts,
+            commands::detect_v1_data,
+            commands::import_v1_data,
+            commands::dismiss_v1_import,
         ])
         .setup(move |app| {
             let handle = app.handle();

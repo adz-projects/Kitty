@@ -37,12 +37,20 @@ pub async fn delete_belief(client: &BigTinyClient, belief_id: &str) -> Result<Va
         .await
 }
 
+/// `DELETE /api/pathway/beliefs` - erase every belief this app has (#72).
+/// The daemon closes the engine, empties it and reconnects its tools.
+pub async fn erase_all(client: &BigTinyClient) -> Result<Value, String> {
+    client.delete("/api/pathway/beliefs").await
+}
+
 /// `POST /api/pathway/recover` — integrity-check the belief-graph DB and, if
 /// corrupt, rebuild it in place (salvaging what still reads, leaving a backup).
 /// Uses the long-timeout POST because a rebuild can take a moment. Returns the
 /// `{integrity_ok, rebuilt, salvaged, backup}` report.
 pub async fn recover(client: &BigTinyClient) -> Result<Value, String> {
-    client.post_json_long("/api/pathway/recover", &json!({})).await
+    client
+        .post_json_long("/api/pathway/recover", &json!({}))
+        .await
 }
 
 /// `PATCH /api/pathway/sessions/{id}/pause` — the incognito toggle. Paused:

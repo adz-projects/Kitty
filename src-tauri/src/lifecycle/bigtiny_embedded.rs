@@ -21,12 +21,12 @@
 //! registered app. So D25 is satisfied by construction now, and the field that
 //! used to carry it is vestigial.
 //!
-//! **Kitty does not supply the at-rest encryption key.** V2 owns it, in
-//! `{data_dir}/encryption.key`, the same as on desktop — see `bigtiny_v2` for
-//! why a shared daemon cannot take its key from whichever app happened to start
-//! it. That also takes the AndroidKeyStore round trip out of the startup path
-//! entirely; provider keys are still sealed by that keystore, but through
-//! `config::providers::keyring`, not through the daemon.
+//! **Kitty supplies the at-rest encryption key here, unlike on desktop** (#12).
+//! A shared desktop daemon must own its key (see `bigtiny_v2`), and on Windows
+//! it seals it with DPAPI. In-process there is exactly one app, and the
+//! daemon's own fallback is a plaintext `encryption.key` beside the database,
+//! so Kitty keeps the key in the AndroidKeyStore-backed SecretStore instead
+//! and hands it over at start (see [`encryption_key`]).
 
 use crate::state::{DaemonHandle, ManagedProcess};
 
@@ -69,13 +69,11 @@ pub async fn start(
         std::env::set_var(key, value);
     }
 
-    // **V2 renamed the data-dir variable.** `daemon_env` sets `BIGTINY_DATA_DIR`
-    // (V1's name); `resolve_data_dir` reads `BIGTINYV2_DATA_DIR`. Unset, it
-    // falls back to `dirs_home().join(".bigtiny-v2")` -- and bionic reports
-    // `HOME` as `/`, so the daemon tried to create `/.bigtiny-v2` and died with
-    // `Read-only file system (os error 30)` before it ever bound. Desktop never
-    // saw this because the same function short-circuits to `%APPDATA%` on
-    // Windows, so the missing variable is invisible there.
+    // The data dir must be named: unset, V2 falls back to
+    // `dirs_home().join(".bigtiny-v2")` -- and bionic reports `HOME` as `/`, so
+    // the daemon tried to create `/.bigtiny-v2` and died with `Read-only file
+    // system (os error 30)` before it ever bound. Desktop never saw this
+    // because the same function short-circuits to `%APPDATA%` on Windows.
     //
     // A *sibling* of V1's directory rather than the same one: V2's schema is not
     // V1's, and keeping `bigtiny/` untouched is what makes the frozen V1 crate a
@@ -88,10 +86,7 @@ pub async fn start(
     let data_dir = crate::config::config_dir()
         .map(|d| d.join("bigtiny-v2"))
         .map_err(|e| format!("no writable app directory for the BigTiny data dir: {e}"))?;
-    std::env::set_var(
-        bigtiny2::discovery::DATA_DIR_ENV,
-        data_dir.as_os_str(),
-    );
+    std::env::set_var(bigtiny2::discovery::DATA_DIR_ENV, data_dir.as_os_str());
 
     let mut config = bigtiny2::config::BigTinyConfig::default();
     bigtiny2::env_contract::apply_env_overrides(&mut config);
@@ -109,8 +104,8 @@ pub async fn start(
         // Vestigial in V2 — auth is unconditional. See this module's header.
         require_secret: true,
         data_dir: data_dir.to_string_lossy().into_owned(),
-        // V2 owns its own key. See this module's header.
-        encryption_key: None,
+        // See this module's header.
+        encryption_key: Some(encryption_key(&data_dir).await?),
         ready_tx: Some(ready_tx),
         // No shutdown channel: the daemon's lifetime is the app process's.
         // Android stops us by killing the process, and a graceful teardown we
@@ -174,4 +169,57 @@ pub async fn start(
         instance_id: None,
         daemon_version: None,
     })
+}
+
+/// The SecretStore account holding the daemon's at-rest key.
+const ENCRYPTION_KEY_ACCOUNT: &str = "bigtiny-v2-encryption-key";
+
+/// The daemon's at-rest key, kept sealed in the SecretStore (#12).
+///
+/// An install from before this adopts the key the daemon generated for
+/// itself, so the provider keys it already encrypted still decrypt, and the
+/// plaintext file is removed once the sealed copy reads back. A fresh
+/// install gets a new random key.
+async fn encryption_key(data_dir: &std::path::Path) -> Result<String, String> {
+    use crate::config::providers::{get_secret_checked, set_secret_async};
+    let file = data_dir.join("encryption.key");
+    let on_disk = match std::fs::read_to_string(&file) {
+        Ok(s) => Some(s.trim().to_string()).filter(|k| !k.is_empty()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(format!("could not read {}: {e}", file.display())),
+    };
+    if let Some(sealed) = get_secret_checked(ENCRYPTION_KEY_ACCOUNT).await? {
+        match on_disk {
+            Some(plain) if plain == sealed => remove_plaintext_key(&file),
+            // Different keys should not happen; keep the file rather than
+            // destroy the only copy of whatever it encrypted.
+            Some(_) => tracing::warn!(
+                "{} differs from the sealed key; leaving it in place",
+                file.display()
+            ),
+            None => {}
+        }
+        return Ok(sealed);
+    }
+    let key = on_disk.unwrap_or_else(fresh_key);
+    set_secret_async(ENCRYPTION_KEY_ACCOUNT, &key).await?;
+    if get_secret_checked(ENCRYPTION_KEY_ACCOUNT).await?.as_deref() == Some(key.as_str()) {
+        remove_plaintext_key(&file);
+    }
+    Ok(key)
+}
+
+fn remove_plaintext_key(file: &std::path::Path) {
+    match std::fs::remove_file(file) {
+        Ok(()) => tracing::info!("moved the engine's encryption key into the keystore"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::warn!("could not remove {}: {e}", file.display()),
+    }
+}
+
+/// 32 random bytes, hex-encoded, as the daemon takes its key.
+fn fresh_key() -> String {
+    let mut bytes = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }

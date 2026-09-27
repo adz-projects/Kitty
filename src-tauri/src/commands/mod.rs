@@ -19,12 +19,13 @@ mod models;
 mod provider;
 mod scheduled_tasks;
 // Win32 GDI desktop capture — see `crate::screenshot` (docs/ANDROID.md §2.5).
+mod export;
 #[cfg(windows)]
 mod screenshot;
 mod session;
-mod specialists;
 mod setup;
-mod export;
+mod specialists;
+mod v1_import;
 mod window;
 
 pub use adaptive_pathway::*;
@@ -42,6 +43,7 @@ pub use scheduled_tasks::*;
 #[cfg(windows)]
 pub use screenshot::*;
 pub use session::*;
-pub use specialists::*;
 pub use setup::*;
+pub use specialists::*;
+pub use v1_import::*;
 pub use window::*;

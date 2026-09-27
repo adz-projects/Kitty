@@ -25,7 +25,7 @@ const DISPLAY_NAME: &str = "Kitty";
 /// A bearer credential for everything Kitty owns in a daemon other
 /// applications can also talk to, so it goes in the same store as every other
 /// secret this app holds rather than a config file.
-const KEY_CREDENTIAL: &str = "bigtiny-v2-app-key";
+pub(crate) const KEY_CREDENTIAL: &str = "bigtiny-v2-app-key";
 
 /// Resolve Kitty's durable app key, registering once if this is a first run.
 ///
@@ -150,14 +150,14 @@ async fn store_key(key: &str) -> Result<(), String> {
     crate::config::providers::set_secret_async(KEY_CREDENTIAL, key).await
 }
 
-/// Everything else keeps the key in the BigTiny data dir. Not as good as a
-/// keychain, but the alternative is re-registering every launch, and the file
-/// sits beside `encryption.key`, which is no less sensitive.
+/// Everything else (development hosts only) keeps the key in Kitty's config
+/// dir. Not as good as a keychain, but the alternative is re-registering
+/// every launch.
 #[cfg(not(any(windows, target_os = "android")))]
 fn key_file() -> Option<std::path::PathBuf> {
-    crate::config::bigtiny_data_dir()
+    crate::config::config_dir()
         .ok()
-        .map(|d| d.join("app-key"))
+        .map(|d| d.join("bigtiny-app-key"))
 }
 
 #[cfg(not(any(windows, target_os = "android")))]

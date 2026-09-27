@@ -11,7 +11,11 @@ mod network;
 pub use connection::test_connection;
 pub use keyring::{
     delete_secret, get_secret_async, get_secret_checked, migrate_secrets, set_secret_async,
+    v1_encryption_key,
 };
+// Only the desktop uninstall cleanup removes it.
+#[cfg(desktop)]
+pub use keyring::V1_ENCRYPTION_KEY_ACCOUNT;
 pub use network::{network_tier_for, NetworkTier};
 
 use serde::{Deserialize, Serialize};

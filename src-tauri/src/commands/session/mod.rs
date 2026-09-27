@@ -97,21 +97,26 @@ pub(crate) fn base_for(configured: Option<String>) -> PathBuf {
 /// exist on disk, and both sides derive from Kitty's own normalized output
 /// (`resolve_cwd`/`chats_base_dir`), so their casing already agrees.
 pub fn is_default_folder(app: &AppHandle, cwd: &str) -> bool {
-    chats_roots(app).iter().any(|root| strictly_inside(root, cwd))
+    chats_roots(app)
+        .iter()
+        .any(|root| strictly_inside(root, cwd))
 }
 
 /// Every `<base>/chats` directory Kitty's chat folders may live under: the
 /// current base's and every earlier one's.
 pub(crate) fn chats_roots(app: &AppHandle) -> Vec<PathBuf> {
-    let history = {
-        let state = app.state::<AppState>();
-        let cfg = state.config.lock().unwrap();
-        cfg.chats_roots_history.clone()
-    };
-    let mut roots = vec![chats_base_dir(app).join(CHATS_DIR_NAME)];
+    let state = app.state::<AppState>();
+    let cfg = state.config.lock().unwrap();
+    chats_roots_for(&cfg)
+}
+
+/// [`chats_roots`] from a config rather than the running app's (the
+/// uninstall cleanup has no app).
+pub(crate) fn chats_roots_for(cfg: &crate::config::Config) -> Vec<PathBuf> {
+    let mut roots = vec![base_for(cfg.default_context_folder.clone()).join(CHATS_DIR_NAME)];
     roots.extend(
-        history
-            .into_iter()
+        cfg.chats_roots_history
+            .iter()
             .map(|base| PathBuf::from(base).join(CHATS_DIR_NAME)),
     );
     roots

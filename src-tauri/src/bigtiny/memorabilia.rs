@@ -34,6 +34,11 @@ pub async fn delete_item(client: &BigTinyClient, item_id: &str) -> Result<Value,
         .await
 }
 
+/// `DELETE /api/memorabilia/items` - erase every fact this app has (#72).
+pub async fn erase_all(client: &BigTinyClient) -> Result<Value, String> {
+    client.delete("/api/memorabilia/items").await
+}
+
 /// `POST /api/memorabilia/recover` — integrity-check the factual-memory DB
 /// and, if corrupt, rebuild it in place (salvaging what still reads, leaving a
 /// backup). Uses the long-timeout POST because a rebuild can take a moment.

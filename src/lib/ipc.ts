@@ -62,12 +62,39 @@ import type {
   ToolCallEvent,
 } from './types';
 
+/** Mirrors `commands::v1_import::V1Data`. */
+export interface V1Data {
+  db_bytes: number;
+  has_pathway: boolean;
+}
+
+/** Mirrors the daemon's `import::MergeSummary`. */
+export interface V1ImportSummary {
+  sessions: number;
+  sessions_skipped: number;
+  messages: number;
+  providers: number;
+  providers_skipped: number;
+  mcp_servers: number;
+  mcp_servers_skipped: number;
+  hitl_rules: number;
+  /** Saved keys that could not be read; those providers need their key again. */
+  undecryptable_secrets: number;
+  pathway: string;
+}
+
 export const ipc = {
   getConfig: () => invoke<Config>('get_config'),
   setConfig: (config: Config) => invoke<void>('set_config', { config }),
   /** Merge only the given fields into the saved config (RFC 7396: `null`
       resets a field to its default). */
   patchConfig: (patch: Record<string, unknown>) => invoke<void>('patch_config', { patch }),
+  /** A Kitty V1 install's data waiting to be imported, or null. */
+  detectV1Data: () => invoke<V1Data | null>('detect_v1_data'),
+  /** Import it; resolves with the engine's counts. */
+  importV1Data: () => invoke<V1ImportSummary>('import_v1_data'),
+  /** Don't offer the V1 import again. */
+  dismissV1Import: () => invoke<void>('dismiss_v1_import'),
   getConfigRecoveryNotice: () => invoke<string | null>('get_config_recovery_notice'),
   hideOverlay: () => invoke<void>('hide_overlay'),
   openSettings: (section?: string, highlight?: string) =>
@@ -529,6 +556,8 @@ export const ipc = {
     }),
   /** Check &, if corrupt, rebuild the belief-graph DB (Graph Health). */
   recoverPathwayDb: () => invoke<DbRecoverReport>('recover_pathway_db'),
+  /** Erase every belief (after a typed confirmation in the UI). */
+  eraseAllBeliefs: () => invoke<void>('erase_all_beliefs'),
 
   // Declarative factual-memory engine (`plugins/memorabilia_rust`, linked
   // in-process into BigTiny — see `src-tauri/src/commands/memorabilia.rs`).
@@ -544,6 +573,8 @@ export const ipc = {
     invoke<{ id: string; dropped?: number; error?: string }>('delete_memorabilia_item', {
       itemId,
     }),
+  /** Erase every remembered fact (after a typed confirmation in the UI). */
+  eraseAllFacts: () => invoke<void>('erase_all_facts'),
   /** The factual-memory half of the unified per-session incognito control. */
   setMemorabiliaSessionPaused: (sessionId: string, paused: boolean) =>
     invoke<{ session_id: string; paused: boolean }>('set_memorabilia_session_paused', {
