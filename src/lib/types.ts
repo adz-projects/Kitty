@@ -236,19 +236,24 @@ export interface FolderData {
     enum, so the discriminant lives in `kind`. */
 export type Schedule = { kind: 'one_shot' } | { kind: 'recurring'; interval_secs: number };
 
-/** Mirrors `config::scheduled_tasks::ScheduledTask`. `next_fire` is an ISO
-    8601 string (chrono's default `DateTime<Local>` serde representation). */
+/** A task the engine runs on schedule. Mirrors
+    `commands::scheduled_tasks::TaskView`. Times are ISO 8601. */
 export interface ScheduledTask {
   id: string;
   name: string;
   prompt: string;
   cwd: string | null;
-  /** Model this task runs on, overriding the active provider's default
-      (D3). `null` = use whatever is active when it fires. */
-  model_id: string | null;
+  /** The card it runs on; `null` = the default card when it fires. */
+  provider_id: string | null;
   schedule: Schedule;
-  next_fire: string;
+  /** When it next runs, if it will. */
+  next_fire: string | null;
   enabled: boolean;
+  last_run_at: string | null;
+  /** `running` | `completed` | `completed_with_denied_tools` | `failed`. */
+  last_status: string | null;
+  /** The chat the last run happened in. */
+  last_session_id: string | null;
 }
 
 /** A GGUF on disk. Mirrors `models::InstalledModel` + `commands::LocalModel`. */

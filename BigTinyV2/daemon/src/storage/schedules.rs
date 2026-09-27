@@ -44,6 +44,9 @@ pub struct ScheduleRow {
     pub system_prompt: Option<String>,
     /// How long a run waits for a tool approval before continuing without it.
     pub hitl_timeout_secs: i64,
+    /// The folder each run works in (migration 027).
+    #[sqlx(default)]
+    pub cwd: Option<String>,
     pub last_run_at: Option<String>,
     /// `running` | `completed` | `completed_with_denied_tools` | `failed`.
     pub last_status: Option<String>,
@@ -52,7 +55,7 @@ pub struct ScheduleRow {
 
 const COLUMNS: &str = "id, name, cron, prompt, enabled, created_at, updated_at, app_id, kind, \
     interval_secs, run_at, next_run_at, provider_id, model, system_prompt, hitl_timeout_secs, \
-    last_run_at, last_status, last_session_id";
+    last_run_at, last_status, last_session_id, cwd";
 
 /// Everything that defines a schedule, as a client sends it.
 #[derive(Debug, Clone, Default)]
@@ -67,6 +70,10 @@ pub struct ScheduleSpec {
     pub provider_id: Option<String>,
     pub model: Option<String>,
     pub system_prompt: Option<String>,
+    pub cwd: Option<String>,
+    /// When an `interval` schedule should first run, instead of one interval
+    /// from now. Consumed when the timing is set; never stored.
+    pub first_run_at: Option<String>,
     pub hitl_timeout_secs: i64,
     pub enabled: bool,
 }
@@ -85,6 +92,8 @@ impl ScheduleSpec {
             provider_id: row.provider_id.clone(),
             model: row.model.clone(),
             system_prompt: row.system_prompt.clone(),
+            cwd: row.cwd.clone(),
+            first_run_at: None,
             hitl_timeout_secs: row.hitl_timeout_secs,
             enabled: row.enabled != 0,
         }
@@ -186,8 +195,8 @@ pub async fn create_schedule_spec(
 ) -> Result<(), StorageError> {
     sqlx::query(
         r#"INSERT INTO schedule_jobs (id, name, cron, prompt, enabled, app_id, kind, interval_secs,
-               run_at, next_run_at, provider_id, model, system_prompt, hitl_timeout_secs)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+               run_at, next_run_at, provider_id, model, system_prompt, hitl_timeout_secs, cwd)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
     )
     .bind(id)
     .bind(&spec.name)
@@ -203,6 +212,7 @@ pub async fn create_schedule_spec(
     .bind(&spec.model)
     .bind(&spec.system_prompt)
     .bind(spec.hitl_timeout_secs)
+    .bind(&spec.cwd)
     .execute(pool)
     .await?;
     Ok(())
@@ -218,7 +228,7 @@ pub async fn update_schedule_spec(
         r#"UPDATE schedule_jobs SET
            name = ?, cron = ?, prompt = ?, enabled = ?, kind = ?, interval_secs = ?,
            run_at = ?, next_run_at = ?, provider_id = ?, model = ?, system_prompt = ?,
-           hitl_timeout_secs = ?, updated_at = CURRENT_TIMESTAMP
+           hitl_timeout_secs = ?, cwd = ?, updated_at = CURRENT_TIMESTAMP
            WHERE id = ?"#,
     )
     .bind(&spec.name)
@@ -233,6 +243,7 @@ pub async fn update_schedule_spec(
     .bind(&spec.model)
     .bind(&spec.system_prompt)
     .bind(spec.hitl_timeout_secs)
+    .bind(&spec.cwd)
     .bind(schedule_id)
     .execute(pool)
     .await?;

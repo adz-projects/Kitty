@@ -203,19 +203,20 @@ export const ipc = {
   // Scheduled tasks — an instruction the agent runs later, one-shot or
   // recurring, with or without the app open.
   listScheduledTasks: () => invoke<ScheduledTask[]>('list_scheduled_tasks'),
+  /** Returns the new task's id. `providerId` null = the default card. */
   createScheduledTask: (
     name: string,
     prompt: string,
     cwd: string | null,
-    modelId: string | null,
+    providerId: string | null,
     schedule: Schedule,
     nextFire: string
   ) =>
-    invoke<ScheduledTask>('create_scheduled_task', {
+    invoke<string>('create_scheduled_task', {
       name,
       prompt,
       cwd,
-      modelId,
+      providerId,
       schedule,
       nextFire,
     }),
@@ -224,7 +225,7 @@ export const ipc = {
     name: string,
     prompt: string,
     cwd: string | null,
-    modelId: string | null,
+    providerId: string | null,
     schedule: Schedule,
     nextFire: string,
     enabled: boolean
@@ -234,11 +235,15 @@ export const ipc = {
       name,
       prompt,
       cwd,
-      modelId,
+      providerId,
       schedule,
       nextFire,
       enabled,
     }),
+  /** Run a task now; returns the chat the run happens in. */
+  runScheduledTaskNow: (id: string) => invoke<string>('run_scheduled_task_now', { id }),
+  scheduledTaskRuns: (id: string) =>
+    invoke<Record<string, unknown>[]>('scheduled_task_runs', { id }),
   deleteScheduledTask: (id: string) => invoke<void>('delete_scheduled_task', { id }),
   setScheduledTaskEnabled: (id: string, enabled: boolean) =>
     invoke<void>('set_scheduled_task_enabled', { id, enabled }),

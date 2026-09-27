@@ -185,6 +185,8 @@ pub fn run() {
             commands::move_chat_folders,
             commands::export_chatml,
             commands::attach_session_stream,
+            commands::run_scheduled_task_now,
+            commands::scheduled_task_runs,
             commands::get_startup_phase,
             commands::window_ready,
             commands::restart_backend,

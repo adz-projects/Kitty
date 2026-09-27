@@ -149,7 +149,18 @@ pub fn normalize_spec(spec: &mut ScheduleSpec, previous: Option<&ScheduleRow>) -
             spec.cron = String::new();
             spec.run_at = None;
             if timing_changed || spec.next_run_at.is_none() {
-                spec.next_run_at = Some((Utc::now() + chrono::Duration::seconds(secs)).to_rfc3339());
+                // A chosen first run (in the future), else one interval out.
+                let first = spec
+                    .first_run_at
+                    .take()
+                    .as_deref()
+                    .and_then(parse_time)
+                    .filter(|t| *t > Utc::now());
+                spec.next_run_at = Some(
+                    first
+                        .unwrap_or_else(|| Utc::now() + chrono::Duration::seconds(secs))
+                        .to_rfc3339(),
+                );
             }
         }
         KIND_ONCE => {
@@ -596,6 +607,12 @@ async fn prepare_run(db: &SqlitePool, agent: &Arc<Agent>, job: &ScheduleRow) -> 
     if let Some(prompt) = job.system_prompt.as_deref().filter(|p| !p.trim().is_empty()) {
         meta["persona_override"] = json!(prompt);
     }
+    // Where the run works: its folder is its own, as a session created with
+    // a folder has (`routes::chat::create_session`).
+    if let Some(cwd) = job.cwd.as_deref().filter(|c| !c.trim().is_empty()) {
+        meta["cwd"] = json!(cwd);
+        meta["chat_dir"] = json!(cwd);
+    }
     if let Err(e) = sessions::update_session_config(db, &session_id, &meta.to_string()).await {
         let _ = sessions::delete_session(db, &session_id).await;
         return Err(format!("failed to configure the run session: {e}"));
@@ -666,6 +683,30 @@ mod tests {
         }
     }
 
+    /// An interval schedule can be told when to start; a past or missing
+    /// time falls back to one interval from now.
+    #[test]
+    fn an_interval_schedule_starts_at_its_chosen_first_run() {
+        let first = Utc::now() + chrono::Duration::minutes(10);
+        let mut s = ScheduleSpec {
+            interval_secs: Some(3600),
+            first_run_at: Some(first.to_rfc3339()),
+            ..spec(KIND_INTERVAL)
+        };
+        normalize_spec(&mut s, None).unwrap();
+        let next = parse_time(s.next_run_at.as_deref().unwrap()).unwrap();
+        assert!((next - first).num_seconds().abs() <= 1);
+
+        let mut past = ScheduleSpec {
+            interval_secs: Some(3600),
+            first_run_at: Some((Utc::now() - chrono::Duration::hours(1)).to_rfc3339()),
+            ..spec(KIND_INTERVAL)
+        };
+        normalize_spec(&mut past, None).unwrap();
+        let next = parse_time(past.next_run_at.as_deref().unwrap()).unwrap();
+        assert!(next > Utc::now() + chrono::Duration::minutes(59));
+    }
+
     #[test]
     fn each_kind_requires_its_own_timing_field() {
         assert!(normalize_spec(&mut spec(KIND_CRON), None).is_err());
@@ -726,6 +767,7 @@ mod tests {
             model: None,
             system_prompt: None,
             hitl_timeout_secs: 600,
+            cwd: None,
             last_run_at: None,
             last_status: None,
             last_session_id: None,

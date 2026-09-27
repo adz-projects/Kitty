@@ -281,6 +281,11 @@ pub struct Config {
     /// `scheduled_tasks::ScheduledTask`.
     #[serde(default)]
     pub scheduled_tasks: Vec<ScheduledTask>,
+    /// The tasks above have been moved into the engine's scheduler
+    /// (`commands::scheduled_tasks::migrate_config_tasks`); the list stays
+    /// empty after that.
+    #[serde(default)]
+    pub scheduled_tasks_migrated: bool,
     /// Command used to launch the BigTiny daemon — the bundled
     /// `bigtiny-daemon.exe` (see `plugins/build.py`, same `externalBin`
     /// convention as the other bundled plugins) if present, else `cargo`
@@ -431,6 +436,7 @@ impl Default for Config {
             kitty_docs_web_enabled: default_true(),
             kitty_docs_web_default_migrated: true,
             scheduled_tasks: Vec::new(),
+            scheduled_tasks_migrated: false,
             bigtiny_command: default_bigtiny_command(),
             bigtiny_args: default_bigtiny_args(),
             summarizer: SummarizerSettings::default(),

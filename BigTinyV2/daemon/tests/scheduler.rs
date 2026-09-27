@@ -340,6 +340,7 @@ async fn a_schedule_pins_its_runs_provider_and_persona() {
                 provider_id: Some("mock-openai".into()),
                 model: Some("m1".into()),
                 system_prompt: Some("Be terse.".into()),
+                cwd: Some("C:/work/task".into()),
                 hitl_timeout_secs: 120,
                 enabled: true,
                 ..Default::default()
@@ -360,6 +361,8 @@ async fn a_schedule_pins_its_runs_provider_and_persona() {
     assert_eq!(meta["model"], "m1");
     assert_eq!(meta["persona_override"], "Be terse.");
     assert_eq!(meta["hitl_timeout_secs"], 120);
+    assert_eq!(meta["cwd"], "C:/work/task");
+    assert_eq!(meta["chat_dir"], "C:/work/task");
 }
 
 /// A `once` schedule whose time has already passed runs as soon as it is

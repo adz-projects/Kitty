@@ -31,7 +31,6 @@ pub(crate) mod embedding;
 pub mod engine_restart;
 mod health;
 pub mod memory;
-pub mod scheduler;
 
 pub(crate) use health::{compute_status, current_payload};
 pub use health::{spawn_health_loop, StackStatusPayload};
@@ -201,7 +200,6 @@ pub fn start_stack(app: &AppHandle) {
     // window without flashing a degradation at a stack that is merely still
     // coming up.
     spawn_health_loop(app.clone());
-    scheduler::spawn_scheduler_loop(app.clone());
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         // Publishes `Ready` on every exit path from this task, including a
@@ -318,6 +316,8 @@ pub(crate) async fn install_handle(app: &AppHandle, handle: crate::state::Daemon
     }
     // Memory follows the toggles and what this engine loaded.
     memory::apply_memory_plugins(app).await;
+    // Tasks an older Kitty scheduled itself move to the engine, once.
+    crate::commands::migrate_config_tasks(app).await;
     // Approvals and background runs for every chat, on screen or not.
     app_events::ensure_running(app);
 }

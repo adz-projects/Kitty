@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { ipc, onScheduledTasksChanged, pickFolder } from '@/lib/ipc';
-import type { LocalModel, Schedule, ScheduledTask } from '@/lib/types';
+import type { ProviderView, Schedule, ScheduledTask } from '@/lib/types';
 import { Modal } from '@/components/shared/Modal';
 
 export type IntervalUnit = 'minutes' | 'hours' | 'days';
@@ -28,19 +28,20 @@ function toDatetimeLocalValue(iso: string): string {
 }
 
 function scheduleSummary(task: ScheduledTask): string {
+  const next = task.next_fire ? new Date(task.next_fire).toLocaleString() : null;
   if (task.schedule.kind === 'one_shot') {
-    return `Once, ${new Date(task.next_fire).toLocaleString()}`;
+    return next ? `Once, ${next}` : 'Once (done)';
   }
   const { amount, unit } = secondsToAmountUnit(task.schedule.interval_secs);
-  return `Every ${amount} ${unit} · next ${new Date(task.next_fire).toLocaleString()}`;
+  return `Every ${amount} ${unit}${next ? ` · next ${next}` : ''}`;
 }
 
 interface FormState {
   name: string;
   prompt: string;
   cwd: string;
-  /** Empty = no override, run on whatever provider is active at fire time. */
-  modelId: string;
+  /** Empty = the default card when it fires. */
+  providerId: string;
   kind: 'one_shot' | 'recurring';
   oneShotAt: string; // datetime-local value
   intervalAmount: number;
@@ -54,7 +55,7 @@ function blankForm(): FormState {
     name: '',
     prompt: '',
     cwd: '',
-    modelId: '',
+    providerId: '',
     kind: 'one_shot',
     oneShotAt: toDatetimeLocalValue(in5min.toISOString()),
     intervalAmount: 1,
@@ -72,9 +73,9 @@ function formFromTask(task: ScheduledTask): FormState {
     name: task.name,
     prompt: task.prompt,
     cwd: task.cwd ?? '',
-    modelId: task.model_id ?? '',
+    providerId: task.provider_id ?? '',
     kind: task.schedule.kind,
-    oneShotAt: toDatetimeLocalValue(task.next_fire),
+    oneShotAt: toDatetimeLocalValue(task.next_fire ?? new Date().toISOString()),
     intervalAmount: amount,
     intervalUnit: unit,
     enabled: task.enabled,
@@ -82,8 +83,8 @@ function formFromTask(task: ScheduledTask): FormState {
 }
 
 /** Settings panel for scheduled tasks — an instruction the agent runs later,
-    one-shot or recurring, with or without the app open (fired by
-    `lifecycle::spawn_scheduler_loop`). Always starts a brand-new session in
+    one-shot or recurring, with or without the app open (run by the engine's
+    own scheduler, `commands::scheduled_tasks`). Always starts a brand-new session in
     `cwd` (or the app default) — never a persistent, context-accumulating one,
     by design (simpler and predictable; avoids an unbounded context window for
     a background task nobody's actively pruning). */
@@ -93,7 +94,7 @@ export function ScheduledTasks() {
   const [editing, setEditing] = useState<ScheduledTask | 'new' | null>(null);
   const [form, setForm] = useState<FormState>(blankForm());
   const [saving, setSaving] = useState(false);
-  const [models, setModels] = useState<LocalModel[]>([]);
+  const [providers, setProviders] = useState<ProviderView[]>([]);
 
   const load = async () => {
     try {
@@ -105,11 +106,11 @@ export function ScheduledTasks() {
 
   useEffect(() => {
     void load();
-    // Best-effort: an empty list just means the picker offers only "whatever
-    // is active", which is the pre-override behaviour anyway.
+    // Best-effort: an empty list just means the picker offers only the
+    // default card.
     void ipc
-      .listLocalModels()
-      .then(setModels)
+      .listProviders()
+      .then((ps) => setProviders(ps.filter((p) => !p.disabled_reason)))
       .catch(() => {});
     const un = onScheduledTasksChanged(() => void load());
     return () => void un.then((fn) => fn());
@@ -136,7 +137,7 @@ export function ScheduledTasks() {
     setError('');
     try {
       const cwd = form.cwd.trim() || null;
-      const modelId = form.modelId.trim() || null;
+      const providerId = form.providerId.trim() || null;
       // The backend deserializes `interval_secs` as a u64: a fractional
       // amount (1.1 minutes → 66.000…01) is rejected with a cryptic serde
       // error, and anything under a minute is more heat than light for a
@@ -169,14 +170,14 @@ export function ScheduledTasks() {
           : new Date(Date.now() + intervalSecs * 1000).toISOString();
 
       if (editing === 'new') {
-        await ipc.createScheduledTask(name, prompt, cwd, modelId, schedule, nextFire);
+        await ipc.createScheduledTask(name, prompt, cwd, providerId, schedule, nextFire);
       } else if (editing) {
         await ipc.updateScheduledTask(
           editing.id,
           name,
           prompt,
           cwd,
-          modelId,
+          providerId,
           schedule,
           nextFire,
           form.enabled
@@ -277,21 +278,22 @@ export function ScheduledTasks() {
             </div>
           </div>
           <div className="field">
-            <span>Model (optional)</span>
+            <span>Provider (optional)</span>
             <select
-              value={form.modelId}
-              onChange={(e) => setForm({ ...form, modelId: e.target.value })}
+              value={form.providerId}
+              onChange={(e) => setForm({ ...form, providerId: e.target.value })}
             >
-              <option value="">Whatever is active when it runs</option>
-              {models.map((m) => (
-                <option key={m.id} value={m.id}>
-                  {m.id}
+              <option value="">The default provider when it runs</option>
+              {providers.map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.name}
+                  {p.models[0] ? ` — ${p.models[0]}` : ''}
                 </option>
               ))}
             </select>
             <small className="muted">
-              Pin a downloaded model so this task always runs on it, even if you switch providers
-              later.
+              Pin a provider so this task always runs on it, with its system prompt, even if you
+              change the default later.
             </small>
           </div>
           <div className="field">

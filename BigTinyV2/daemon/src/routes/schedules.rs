@@ -84,6 +84,8 @@ fn merge_spec(mut base: ScheduleSpec, body: &Value) -> ScheduleSpec {
     base.provider_id = opt("provider_id", base.provider_id);
     base.model = opt("model", base.model);
     base.system_prompt = opt("system_prompt", base.system_prompt);
+    base.cwd = opt("cwd", base.cwd);
+    base.first_run_at = s("first_run_at");
     if let Some(v) = body.get("hitl_timeout_secs").and_then(|v| v.as_i64()) {
         base.hitl_timeout_secs = v;
     }
@@ -119,7 +121,7 @@ pub async fn list_schedules(
 
 /// `POST /api/schedules`. Required: `name`, `prompt`, and the timing field
 /// for `kind` (default `cron`): `cron`, `interval_secs` or `run_at`.
-/// Optional: `provider_id`, `model`, `system_prompt`, `hitl_timeout_secs`
+/// Optional: `provider_id`, `model`, `system_prompt`, `cwd`, `hitl_timeout_secs`
 /// (default 600), `enabled` (default true).
 pub async fn create_schedule(
     State(state): State<Arc<AppState>>,

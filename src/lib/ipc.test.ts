@@ -196,12 +196,12 @@ describe('ipc event subscription wrappers', () => {
   // Positional args, so an inserted parameter silently shifts every later
   // one — `modelId` landing where `schedule` was would be a runtime type
   // error deep in Rust, not a compile error here.
-  it('createScheduledTask passes modelId in the right slot', () => {
+  it('createScheduledTask passes the card in the right slot', () => {
     void ipc.createScheduledTask(
       'Nightly',
       'summarise',
       '/tmp',
-      'LFM2.5-1.2B-Instruct-Q4_K_M',
+      'prof_1',
       { kind: 'one_shot' },
       '2026-01-01T00:00:00Z'
     );
@@ -209,13 +209,13 @@ describe('ipc event subscription wrappers', () => {
       name: 'Nightly',
       prompt: 'summarise',
       cwd: '/tmp',
-      modelId: 'LFM2.5-1.2B-Instruct-Q4_K_M',
+      providerId: 'prof_1',
       schedule: { kind: 'one_shot' },
       nextFire: '2026-01-01T00:00:00Z',
     });
   });
 
-  it('updateScheduledTask passes a null modelId as "no override"', () => {
+  it('updateScheduledTask passes a null card as "the default card"', () => {
     void ipc.updateScheduledTask(
       't1',
       'Nightly',
@@ -231,7 +231,7 @@ describe('ipc event subscription wrappers', () => {
       name: 'Nightly',
       prompt: 'summarise',
       cwd: null,
-      modelId: null,
+      providerId: null,
       schedule: { kind: 'recurring', interval_secs: 3600 },
       nextFire: '2026-01-01T00:00:00Z',
       enabled: true,

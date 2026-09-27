@@ -98,6 +98,7 @@ async fn handle(app: &AppHandle, event: SSEEvent) {
             )
             .await;
         }
+        SSEEventType::ScheduleRun => schedule_run(app, &event),
         SSEEventType::HitlResolved => {
             let Some(action_id) = event.action_id else {
                 return;
@@ -107,6 +108,36 @@ async fn handle(app: &AppHandle, event: SSEEvent) {
         }
         _ => {}
     }
+}
+
+/// A scheduled run started or ended. The settings list refreshes either way;
+/// a run that failed, or had to skip tools nobody approved in time, is
+/// worth a notification (decision: failures only), opening the run's chat.
+fn schedule_run(app: &AppHandle, event: &SSEEvent) {
+    let _ = app.emit("scheduled_tasks://changed", ());
+    let name = event.tool_name.as_deref().unwrap_or("A scheduled task");
+    let (title, body) = match event.content.as_deref() {
+        Some("failed") => (
+            format!("{name} failed"),
+            event
+                .error_message
+                .clone()
+                .unwrap_or_else(|| "The scheduled run did not finish.".to_string()),
+        ),
+        Some("denied_by_timeout") => (
+            format!("{name} skipped some steps"),
+            "It needed an approval nobody gave in time, so those tool calls were skipped."
+                .to_string(),
+        ),
+        _ => return,
+    };
+    crate::notifications::notify_if_hidden(
+        app,
+        crate::notifications::Event::TaskFailed,
+        &title,
+        &body,
+        event.session_id.as_deref(),
+    );
 }
 
 /// Every approval the daemon holds for Kitty, run through [`on_pause`] as if
