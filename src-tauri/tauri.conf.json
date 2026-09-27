@@ -28,7 +28,6 @@
     ],
     "resources": [
       "resources/python-3.12.0.wasm",
-      "resources/tokenizer.json",
       "resources/libLiteRt.dll",
       "resources/libLiteRtWebGpuAccelerator.dll",
       "resources/libLiteRtTopKWebGpuSampler.dll",

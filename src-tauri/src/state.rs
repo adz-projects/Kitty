@@ -84,6 +84,9 @@ pub struct AppState {
     /// Why the engine could not be reached the last time Kitty tried to start
     /// or attach to it, for `stack://status`'s `detail`. Cleared on success.
     pub startup_error: Mutex<Option<String>>,
+    /// Model downloads in progress, by download id
+    /// (`commands::models::download_model`).
+    pub downloads: Mutex<HashMap<String, crate::commands::ActiveDownload>>,
     /// Where the memory engines stand (see `lifecycle::memory`).
     pub memory_status: Mutex<crate::lifecycle::memory::MemoryStatus>,
     /// The model-on-disk state `lifecycle::memory` last restarted the engine
@@ -240,6 +243,7 @@ impl AppState {
             stack_status: Mutex::new(StackStatus::default()),
             startup_error: Mutex::new(None),
             memory_status: Mutex::new(Default::default()),
+            downloads: Mutex::new(HashMap::new()),
             memory_restart_for: Mutex::new(None),
             restart_in_progress: AtomicBool::new(false),
             engine_restart: Mutex::new(Default::default()),

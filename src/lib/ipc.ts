@@ -390,6 +390,20 @@ export const ipc = {
   /** `token` is an optional HuggingFace access token for a gated repo (the
       Gemma-licensed EmbeddingGemma). It is forwarded for this one download and
       never stored — the Rust side keeps it out of logs and the resume sidecar. */
+  /** Downloads running now, with their latest progress. */
+  listDownloads: () => invoke<DownloadProgress[]>('list_downloads'),
+  /** Stop a download; its fragment stays so it can resume. */
+  cancelDownload: (id: string) => invoke<void>('cancel_download', { id }),
+  listPartialDownloads: () =>
+    invoke<{ file: string; size_bytes: number }[]>('list_partial_downloads'),
+  deletePartialDownload: (file: string) => invoke<void>('delete_partial_download', { file }),
+  getSummarizerStatus: () =>
+    invoke<{
+      source: 'local' | 'provider';
+      model: string;
+      model_installed: boolean;
+      effective: 'local' | 'provider';
+    }>('get_summarizer_status'),
   downloadModel: (repo: string, file: string, rev?: string, downloadId?: string, token?: string) =>
     invoke<string>('download_model', {
       repo,

@@ -128,7 +128,12 @@ pub fn daemon_env(
     let mut env: Vec<(String, String)> = vec![
         ("BIGTINY_SECRET".into(), secret.to_string()),
         ("BIGTINY_ENCRYPTION_KEY".into(), encryption_key.to_string()),
-        ("BIGTINY_SUMMARIZER__ENABLED".into(), b(summarizer.enabled)),
+        // The local summarizer only when it was chosen *and* its model is on
+        // disk; otherwise compaction uses the chat's own provider.
+        (
+            "BIGTINY_SUMMARIZER__ENABLED".into(),
+            b(summarizer.enabled && crate::models::resolve(&summarizer.model).is_some()),
+        ),
         // Delegate limits. Env rather than a live route because the denylist is
         // a spend guard, and one a running daemon could be talked out of over
         // HTTP would be a weaker one — a change takes effect on the next start,
@@ -184,15 +189,11 @@ pub fn daemon_env(
     let embed_tflite = crate::models::resolve(pathway_embedding_model)
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
-    // Prefer the caller-resolved bundled resource path; fall back to the models
-    // dir for a dev run without the packaged resource.
-    let tokenizer = if !tokenizer_path.trim().is_empty() {
-        tokenizer_path.to_string()
-    } else {
-        crate::models::resolve("tokenizer.json")
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default()
-    };
+    // The tokenizer downloaded with the model (decision #77); a bundled copy
+    // (an older install's, or a dev run's) only when there is none.
+    let tokenizer = crate::models::tokenizer_path()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| tokenizer_path.trim().to_string());
     let summarizer_litertlm = crate::models::resolve(&summarizer.model)
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
@@ -336,17 +337,29 @@ mod tests {
     /// agree, but relying on that coincidence is how `1`/`0` sneaks in later.
     #[test]
     fn booleans_use_the_word_form_the_daemon_parses() {
-        let sn = snap();
-        let mut on = sn.clone();
-        on.summarizer.enabled = true;
-        let mut off = sn.clone();
-        off.summarizer.enabled = false;
+        let e = daemon_env("", "", &snap(), "");
+        for key in ["BIGTINY_SUMMARIZER__ENABLED", "BIGTINY_LITERT__ENABLED"] {
+            let v = env_of(&e, key);
+            assert!(
+                matches!(v.as_deref(), Some("true" | "false")),
+                "{key} = {v:?}"
+            );
+        }
+    }
+
+    /// The local summarizer is on only when chosen *and* its model is on
+    /// disk; otherwise compaction uses the chat's provider rather than a
+    /// summarizer slot with no model in it.
+    #[test]
+    fn the_local_summarizer_needs_its_model() {
+        let mut chosen = snap();
+        chosen.summarizer.enabled = true; // `snap()`'s model does not exist
         assert_eq!(
-            env_of(&daemon_env("", "", &on, ""), "BIGTINY_SUMMARIZER__ENABLED").as_deref(),
-            Some("true")
-        );
-        assert_eq!(
-            env_of(&daemon_env("", "", &off, ""), "BIGTINY_SUMMARIZER__ENABLED").as_deref(),
+            env_of(
+                &daemon_env("", "", &chosen, ""),
+                "BIGTINY_SUMMARIZER__ENABLED"
+            )
+            .as_deref(),
             Some("false")
         );
     }
@@ -367,7 +380,15 @@ mod tests {
     #[test]
     fn an_unresolvable_model_leaves_the_slot_empty_and_the_engine_off() {
         let sn = snap();
-        let e = daemon_env("", "", &SpawnSnapshot { pathway_embedding_model: NO_SUCH_MODEL.to_string(), ..sn.clone() }, "");
+        let e = daemon_env(
+            "",
+            "",
+            &SpawnSnapshot {
+                pathway_embedding_model: NO_SUCH_MODEL.to_string(),
+                ..sn.clone()
+            },
+            "",
+        );
         assert_eq!(
             env_of(&e, "BIGTINY_LITERT__EMBED_MODEL_PATH").as_deref(),
             Some("")
@@ -384,7 +405,15 @@ mod tests {
     #[test]
     fn the_litert_paths_are_sent_even_with_no_model() {
         let sn = snap();
-        let e = daemon_env("", "", &SpawnSnapshot { pathway_embedding_model: NO_SUCH_MODEL.to_string(), ..sn.clone() }, "");
+        let e = daemon_env(
+            "",
+            "",
+            &SpawnSnapshot {
+                pathway_embedding_model: NO_SUCH_MODEL.to_string(),
+                ..sn.clone()
+            },
+            "",
+        );
         assert_eq!(
             env_of(&e, "BIGTINY_LITERT__ENABLED").as_deref(),
             Some("false")

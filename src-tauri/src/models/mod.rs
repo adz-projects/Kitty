@@ -43,10 +43,11 @@ pub fn installed_in(dir: &Path) -> Vec<InstalledModel> {
             }
             // Recognised local-model artifacts. `.gguf` is legacy (llama.cpp,
             // being retired); `.tflite`/`.litertlm`/`.task` are the LiteRT
-            // engine's; `.json` covers the bundled Gemma `tokenizer.json` the
-            // embedder resolves by filename. `.part`/`.part.meta` fall through.
+            // engine's. The Gemma `tokenizer.json` lives here too but is not a
+            // model (see [`tokenizer_path`]), and `.part`/`.part.meta` are not
+            // finished yet.
             let ok = path.extension().is_some_and(|x| {
-                ["gguf", "tflite", "litertlm", "task", "json"]
+                ["gguf", "tflite", "litertlm", "task"]
                     .iter()
                     .any(|e| x.eq_ignore_ascii_case(e))
             });
@@ -96,6 +97,25 @@ pub fn resolve_in(dir: &Path, name: &str) -> Option<PathBuf> {
         .into_iter()
         .find(|m| m.id.eq_ignore_ascii_case(name) || m.file.eq_ignore_ascii_case(name))
         .map(|m| PathBuf::from(m.path))
+}
+
+/// Where the Gemma tokenizer the EmbeddingGemma embedder needs is downloaded
+/// from, alongside the model (decision #77). The LiteRT model repo ships
+/// only a SentencePiece model; the canonical `tokenizer.json` is in Google's
+/// own repo, gated under the same licence, so the same token fetches both.
+pub const TOKENIZER_REPO: &str = "google/embeddinggemma-300m";
+pub const TOKENIZER_FILE: &str = "tokenizer.json";
+
+/// The downloaded Gemma tokenizer, if it is there.
+pub fn tokenizer_path() -> Option<PathBuf> {
+    let path = crate::config::models_dir().ok()?.join(TOKENIZER_FILE);
+    path.is_file().then_some(path)
+}
+
+/// Whether `file` is an EmbeddingGemma model, the one that needs the
+/// tokenizer beside it.
+pub fn needs_tokenizer(file: &str) -> bool {
+    file.to_ascii_lowercase().contains("embeddinggemma")
 }
 
 /// [`resolve_in`] against the app's models directory.

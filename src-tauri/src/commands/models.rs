@@ -5,6 +5,7 @@
 //! runtime. This file resolves state, spawns, and emits.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use tauri::{AppHandle, Emitter, Manager};
@@ -27,6 +28,13 @@ pub struct DownloadProgress {
     pub done: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+/// A download in progress, tracked in `AppState::downloads`: its latest
+/// progress (for a page that opens mid-download) and its cancel switch.
+pub struct ActiveDownload {
+    pub progress: DownloadProgress,
+    pub cancel: Arc<AtomicBool>,
 }
 
 /// A model on disk plus its card fields.
@@ -74,13 +82,18 @@ pub fn delete_local_model(app: AppHandle, id: String) -> Result<(), String> {
 /// Start a download; returns its id immediately. Progress arrives as
 /// `models://progress` events keyed by that id, so several can run at once.
 ///
+/// One download per file (#70): asking again for a file already downloading
+/// answers with that download's id instead of starting a second copy, which
+/// is what used to happen when Settings was left and reopened mid-download.
+///
 /// `download_id` lets a caller pre-agree an id (the wizard and the pathway
 /// embedding model both do, so they can subscribe before starting).
 ///
 /// `token` is an optional HuggingFace access token for a gated repo (the
 /// Gemma-licensed EmbeddingGemma). It is used only to authorize this download's
 /// HTTP requests and is never persisted, logged, or written to the `.meta`
-/// sidecar — see [`download::authorize`].
+/// sidecar — see [`download::authorize`]. For EmbeddingGemma it also fetches
+/// the Gemma tokenizer, which is gated under the same licence.
 #[tauri::command]
 pub fn download_model(
     app: AppHandle,
@@ -90,75 +103,242 @@ pub fn download_model(
     download_id: Option<String>,
     token: Option<String>,
 ) -> Result<String, String> {
-    let id = download_id
-        .unwrap_or_else(|| format!("dl_{}", chrono::Utc::now().timestamp_millis()));
+    let cancel = Arc::new(AtomicBool::new(false));
+    let id = {
+        let state = app.state::<AppState>();
+        let mut downloads = state.downloads.lock().unwrap();
+        if let Some((id, _)) = downloads
+            .iter()
+            .find(|(_, d)| d.progress.model.as_ref() == file)
+        {
+            return Ok(id.clone());
+        }
+        let id =
+            download_id.unwrap_or_else(|| format!("dl_{}", chrono::Utc::now().timestamp_millis()));
+        downloads.insert(
+            id.clone(),
+            ActiveDownload {
+                progress: DownloadProgress {
+                    download_id: Arc::from(id.as_str()),
+                    model: Arc::from(file.as_str()),
+                    received: 0,
+                    total: None,
+                    done: false,
+                    error: None,
+                },
+                cancel: cancel.clone(),
+            },
+        );
+        id
+    };
     let spec = DownloadSpec {
         repo,
-        file: file.clone(),
+        file,
         rev: rev.unwrap_or_else(|| "main".into()),
         sha256: None,
         expected_size: None,
     };
     let id_for_task = id.clone();
     tauri::async_runtime::spawn(async move {
-        run_download(app, spec, id_for_task, token).await;
+        run_download(app, spec, id_for_task, token, cancel).await;
     });
     Ok(id)
 }
 
+/// Every download in progress, as its latest progress - for a page that
+/// opens (or reopens) while one is running.
+#[tauri::command]
+pub fn list_downloads(state: tauri::State<'_, AppState>) -> Result<Vec<DownloadProgress>, String> {
+    let downloads = state.downloads.lock().unwrap();
+    Ok(downloads.values().map(|d| d.progress.clone()).collect())
+}
+
+/// Stop a download. Its fragment stays, so starting it again resumes; it
+/// can be deleted from [`list_partial_downloads`].
+#[tauri::command]
+pub fn cancel_download(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
+    let downloads = state.downloads.lock().unwrap();
+    let d = downloads
+        .get(&id)
+        .ok_or("That download is no longer running.")?;
+    d.cancel.store(true, Ordering::SeqCst);
+    Ok(())
+}
+
+/// Unfinished downloads on disk (#70).
+#[tauri::command]
+pub fn list_partial_downloads(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<download::PartialDownload>, String> {
+    let dir = crate::config::models_dir().map_err(|e| e.to_string())?;
+    let running: Vec<String> = state
+        .downloads
+        .lock()
+        .unwrap()
+        .values()
+        .map(|d| d.progress.model.to_string())
+        .collect();
+    Ok(download::partial_downloads(&dir)
+        .into_iter()
+        .filter(|p| !running.contains(&p.file))
+        .collect())
+}
+
+#[tauri::command]
+pub fn delete_partial_download(file: String) -> Result<(), String> {
+    let dir = crate::config::models_dir().map_err(|e| e.to_string())?;
+    download::delete_partial(&dir, &file).map_err(|e| format!("could not delete it: {e}"))
+}
+
 /// One download, start to finish, reporting everything through
-/// `models://progress`.
+/// `models://progress`. For EmbeddingGemma the Gemma tokenizer follows, under
+/// the same id, and the download reports done only when both are in place.
 ///
 /// Returns nothing: a download is fire-and-forget from the caller's point of
 /// view, and every outcome — including every failure — is an event, so a UI
 /// that subscribed before starting can't miss one.
-async fn run_download(app: AppHandle, mut spec: DownloadSpec, id: String, token: Option<String>) {
+async fn run_download(
+    app: AppHandle,
+    spec: DownloadSpec,
+    id: String,
+    token: Option<String>,
+    cancel: Arc<AtomicBool>,
+) {
     let token = token.as_deref();
-    let id: Arc<str> = Arc::from(id.as_str());
-    let model: Arc<str> = Arc::from(spec.file.as_str());
-    let emit = |received: u64, total: Option<u64>, done: bool, error: Option<String>| {
-        // Android only: the same numbers also drive the foreground-service
-        // notification, which is what keeps the process (and its network)
-        // alive once the user switches away. Free on desktop.
-        foreground::progress(&model, received, total);
-        let _ = app.emit(
-            "models://progress",
-            DownloadProgress {
-                download_id: id.clone(),
+    let id_arc: Arc<str> = Arc::from(id.as_str());
+    let emit =
+        |model: &Arc<str>, received: u64, total: Option<u64>, done: bool, error: Option<String>| {
+            // Android only: the same numbers also drive the foreground-service
+            // notification, which is what keeps the process (and its network)
+            // alive once the user switches away. Free on desktop.
+            foreground::progress(model, received, total);
+            let progress = DownloadProgress {
+                download_id: id_arc.clone(),
                 model: model.clone(),
                 received,
                 total,
                 done,
                 error,
-            },
-        );
+            };
+            if let Some(d) = app
+                .state::<AppState>()
+                .downloads
+                .lock()
+                .unwrap()
+                .get_mut(&id)
+            {
+                d.progress = progress.clone();
+            }
+            let _ = app.emit("models://progress", progress);
+        };
+    let finish = |model: &Arc<str>, error: Option<String>, total: Option<u64>| {
+        if let Some(e) = &error {
+            tracing::warn!(model = %model, "model download failed: {e}");
+        }
+        app.state::<AppState>()
+            .downloads
+            .lock()
+            .unwrap()
+            .remove(&id);
+        emit(model, total.unwrap_or(0), total, true, error);
     };
-    let fail = |e: String| {
-        tracing::warn!(model = %spec.file, "model download failed: {e}");
-        emit(0, None, true, Some(e));
-    };
+    let model: Arc<str> = Arc::from(spec.file.as_str());
 
     let dir = match crate::config::models_dir() {
         Ok(d) => d,
-        Err(e) => return fail(e.to_string()),
+        Err(e) => return finish(&model, Some(e.to_string()), None),
     };
-    if dir.join(&spec.file).exists() {
-        return fail(download::DownloadError::AlreadyInstalled(spec.file.clone()).to_string());
+    let wants_tokenizer = crate::models::needs_tokenizer(&spec.file);
+    let model_present = dir.join(&spec.file).exists();
+    if model_present && !(wants_tokenizer && crate::models::tokenizer_path().is_none()) {
+        return finish(
+            &model,
+            Some(download::DownloadError::AlreadyInstalled(spec.file.clone()).to_string()),
+            None,
+        );
     }
 
     // Held for the rest of this function; its `Drop` stops the service, so
-    // every exit path below — including the early `return fail(..)`s — tears
-    // it down without needing to remember to.
+    // every exit path below — including the early returns — tears it down
+    // without needing to remember to.
     let _foreground = foreground::Session::start(&model);
-
     let client = crate::util::http_client();
-    let (size, sha) = download::head_metadata(&client, &spec, token).await;
+
+    let mut last_total = None;
+    if !model_present {
+        match fetch(&client, &dir, spec.clone(), token, &cancel, &|r, t| {
+            emit(&model, r, t, false, None)
+        })
+        .await
+        {
+            Ok(total) => last_total = total,
+            Err(e) => return finish(&model, Some(e), None),
+        }
+        let _ = app.emit("models://changed", ());
+    }
+    if wants_tokenizer && crate::models::tokenizer_path().is_none() {
+        let tokenizer: Arc<str> = Arc::from(crate::models::TOKENIZER_FILE);
+        let spec = DownloadSpec {
+            repo: crate::models::TOKENIZER_REPO.to_string(),
+            file: crate::models::TOKENIZER_FILE.to_string(),
+            rev: "main".to_string(),
+            sha256: None,
+            expected_size: None,
+        };
+        if let Err(e) = fetch(&client, &dir, spec, token, &cancel, &|r, t| {
+            emit(&tokenizer, r, t, false, None)
+        })
+        .await
+        {
+            return finish(
+                &model,
+                Some(format!(
+                    "The model downloaded, but its tokenizer did not ({e}). Memory needs both; \\
+                     accept the licence at huggingface.co/{} too, then download again.",
+                    crate::models::TOKENIZER_REPO
+                )),
+                None,
+            );
+        }
+    }
+
+    finish(&model, None, last_total);
+    let _ = app.emit("models://changed", ());
+    refresh_embedding_status(&app);
+    crate::lifecycle::memory::apply_memory_plugins(&app).await;
+    summarizer_model_arrived(&app, &spec.file);
+}
+
+/// A newly downloaded summarizer model only takes effect when the engine
+/// starts, so schedule that - if the local summarizer is what the user chose.
+fn summarizer_model_arrived(app: &AppHandle, file: &str) {
+    let wanted = {
+        let state = app.state::<AppState>();
+        let cfg = state.config.lock().unwrap();
+        cfg.summarizer.enabled
+            && crate::models::resolve(&cfg.summarizer.model)
+                .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+                .is_some_and(|n| n.eq_ignore_ascii_case(file))
+    };
+    if wanted {
+        crate::lifecycle::engine_restart::schedule(app);
+    }
+}
+
+/// Download one file into `dir`, resuming and retrying as needed. Returns
+/// its size when known.
+async fn fetch(
+    client: &reqwest::Client,
+    dir: &std::path::Path,
+    mut spec: DownloadSpec,
+    token: Option<&str>,
+    cancel: &AtomicBool,
+    emit: &(dyn Fn(u64, Option<u64>) + Sync),
+) -> Result<Option<u64>, String> {
+    let (size, sha) = download::head_metadata(client, &spec, token).await;
     spec.expected_size = size;
     spec.sha256 = sha;
-
-    if let Err(e) = download::check_space(&dir, spec.expected_size) {
-        return fail(e.to_string());
-    }
+    download::check_space(dir, spec.expected_size).map_err(|e| e.to_string())?;
 
     // Two different retries, for two different failures.
     //
@@ -168,32 +348,20 @@ async fn run_download(app: AppHandle, mut spec: DownloadSpec, id: String, token:
     // something is wrong that trying again will not fix.
     //
     // A **transport error** goes to `RetryBudget`, and this is the
-    // Wi-Fi-to-cellular handoff story (docs/ANDROID.md Phase 7). The socket
-    // dies on handoff no matter what we observe, so rather than watch for
-    // network changes with a `ConnectivityManager.NetworkCallback`, we just
-    // resume: the `.part` survives, `resume_offset` reads its length, and the
-    // next attempt sends `Range: bytes=<len>-`. One mechanism covers the
-    // handoff, a tunnel, and a flaky AP. The budget is spent on *stalls*
-    // rather than failures, so a download that keeps advancing between drops
-    // runs as long as it needs to — see `RetryBudget`, which is where that
-    // rule is tested.
+    // Wi-Fi-to-cellular handoff story (docs/ANDROID.md Phase 7): the `.part`
+    // survives, `resume_offset` reads its length, and the next attempt sends
+    // `Range: bytes=<len>-`. The budget is spent on *stalls* rather than
+    // failures, so a download that keeps advancing between drops runs as long
+    // as it needs to — see `RetryBudget`.
+    //
+    // Anything else - a licence refusal, a cancel, a full disk - is final.
     let mut checksum_retried = false;
-    let mut budget = download::RetryBudget::new(download::resume_offset(&dir, &spec.file, &spec));
-
+    let mut budget = download::RetryBudget::new(download::resume_offset(dir, &spec.file, &spec));
     loop {
-        match attempt_download(&client, &dir, &spec, token, &emit).await {
+        match attempt_download(client, dir, &spec, token, emit, cancel).await {
             Ok(path) => {
                 tracing::info!(path = %path.display(), "model downloaded");
-                emit(
-                    spec.expected_size.unwrap_or(0),
-                    spec.expected_size,
-                    true,
-                    None,
-                );
-                let _ = app.emit("models://changed", ());
-                refresh_embedding_status(&app);
-                crate::lifecycle::memory::apply_memory_plugins(&app).await;
-                return;
+                return Ok(spec.expected_size);
             }
             Err(download::DownloadError::ChecksumMismatch { expected, actual })
                 if !checksum_retried =>
@@ -205,10 +373,10 @@ async fn run_download(app: AppHandle, mut spec: DownloadSpec, id: String, token:
                 );
             }
             Err(download::DownloadError::Transport(msg)) => {
-                let offset = download::resume_offset(&dir, &spec.file, &spec);
+                let offset = download::resume_offset(dir, &spec.file, &spec);
                 match budget.record_failure(offset) {
                     download::RetryDecision::GiveUp => {
-                        return fail(format!(
+                        return Err(format!(
                             "download kept failing without making progress: {msg}"
                         ));
                     }
@@ -222,7 +390,7 @@ async fn run_download(app: AppHandle, mut spec: DownloadSpec, id: String, token:
                     }
                 }
             }
-            Err(e) => return fail(e.to_string()),
+            Err(e) => return Err(e.to_string()),
         }
     }
 }
@@ -324,7 +492,8 @@ async fn attempt_download(
     dir: &std::path::Path,
     spec: &DownloadSpec,
     token: Option<&str>,
-    emit: &(impl Fn(u64, Option<u64>, bool, Option<String>) + Sync),
+    emit: &(dyn Fn(u64, Option<u64>) + Sync),
+    cancel: &AtomicBool,
 ) -> Result<PathBuf, download::DownloadError> {
     let mut resume_from = download::resume_offset(dir, &spec.file, spec);
     download::write_meta(dir, &spec.file, spec)?;
@@ -362,7 +531,7 @@ async fn attempt_download(
     let total = spec
         .expected_size
         .or_else(|| resp.content_length().map(|n| n + resume_from));
-    emit(resume_from, total, false, None);
+    emit(resume_from, total);
 
     let part = download::part_path(dir, &spec.file);
     let stream = resp.bytes_stream();
@@ -370,12 +539,18 @@ async fn attempt_download(
     // Throttle: a multi-GB download produces tens of thousands of chunks, and
     // an event per chunk would flood the webview for no visible benefit.
     let mut last_emit = 0u64;
-    download::append_stream(&part, resume_from, stream, &mut |received| {
-        if received - last_emit >= 1_000_000 {
-            last_emit = received;
-            emit(received, total, false, None);
-        }
-    })
+    download::append_stream(
+        &part,
+        resume_from,
+        stream,
+        &mut |received| {
+            if received - last_emit >= 1_000_000 {
+                last_emit = received;
+                emit(received, total);
+            }
+        },
+        cancel,
+    )
     .await?;
 
     download::verify_and_finalize(dir, &spec.file, spec.sha256.as_deref())
@@ -395,4 +570,39 @@ fn refresh_embedding_status(app: &AppHandle) {
     if enabled {
         crate::lifecycle::embedding::refresh_embedding_status(app, &model);
     }
+}
+
+/// Which summarizer compaction uses, for Settings: the local model when that
+/// was chosen and is on disk, otherwise the chat's own provider.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SummarizerStatus {
+    /// `local` or `provider`: what the user chose.
+    pub source: &'static str,
+    pub model: String,
+    pub model_installed: bool,
+    /// What compaction actually uses: `local` only when chosen and present.
+    pub effective: &'static str,
+}
+
+#[tauri::command]
+pub fn get_summarizer_status(
+    state: tauri::State<'_, AppState>,
+) -> Result<SummarizerStatus, String> {
+    let cfg = state.config.lock().unwrap();
+    let installed = crate::models::resolve(&cfg.summarizer.model).is_some();
+    let source = if cfg.summarizer.enabled {
+        "local"
+    } else {
+        "provider"
+    };
+    Ok(SummarizerStatus {
+        source,
+        model: cfg.summarizer.model.clone(),
+        model_installed: installed,
+        effective: if cfg.summarizer.enabled && installed {
+            "local"
+        } else {
+            "provider"
+        },
+    })
 }

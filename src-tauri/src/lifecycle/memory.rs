@@ -36,7 +36,7 @@ const MEMORABILIA: &str = "memorabilia";
 /// `memory://status` event.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct MemoryStatus {
-    /// The embedding model is on disk.
+    /// The embedding model and its tokenizer are on disk.
     pub model_installed: bool,
     /// The running engine loaded it. `false` with `model_installed` means a
     /// restart is still to come.
@@ -102,7 +102,9 @@ async fn apply(app: &AppHandle) -> Result<MemoryStatus, String> {
         )
     };
     let memorabilia_supported = !cfg!(target_os = "android");
-    let model_installed = crate::models::resolve(&model).is_some();
+    // The embedder needs both the model and the tokenizer beside it.
+    let model_installed =
+        crate::models::resolve(&model).is_some() && crate::models::tokenizer_path().is_some();
 
     let listing = client.get_json("/api/apps/me/plugins").await?;
     let engine_has_embeddings = listing

@@ -31,12 +31,28 @@ const FREE_SPACE_FACTOR: f64 = 1.5;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DownloadError {
-    #[error("not enough disk space: {needed_gb:.1} GB required (1.5x the model), {free_gb:.1} GB free")]
+    #[error(
+        "not enough disk space: {needed_gb:.1} GB required (1.5x the model), {free_gb:.1} GB free"
+    )]
     NotEnoughSpace { needed_gb: f64, free_gb: f64 },
     #[error("{0} is already installed")]
     AlreadyInstalled(String),
     #[error("download failed: {0}")]
     Transport(String),
+    /// 401: no token, or not one that may read this repo.
+    #[error(
+        "Hugging Face needs you to sign in for this model: create an access token at \
+         huggingface.co/settings/tokens, accept the model's licence on its page, then try again"
+    )]
+    Unauthorized,
+    /// 403: a token, but its account has not accepted this repo's licence.
+    #[error(
+        "Hugging Face refused this download: open the model's page on huggingface.co, accept its \
+         licence with the account your token belongs to, then try again"
+    )]
+    Forbidden,
+    #[error("the download was cancelled")]
+    Cancelled,
     #[error("checksum mismatch: expected {expected}, got {actual}")]
     ChecksumMismatch { expected: String, actual: String },
     #[error("{0}")]
@@ -59,7 +75,11 @@ impl DownloadSpec {
         format!(
             "https://huggingface.co/{}/resolve/{}/{}",
             self.repo.trim_matches('/'),
-            if self.rev.is_empty() { "main" } else { &self.rev },
+            if self.rev.is_empty() {
+                "main"
+            } else {
+                &self.rev
+            },
             self.file.trim_start_matches('/')
         )
     }
@@ -104,6 +124,53 @@ fn meta_line(spec: &DownloadSpec) -> String {
     )
 }
 
+/// An unfinished download on disk.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PartialDownload {
+    /// The file it will become.
+    pub file: String,
+    pub size_bytes: u64,
+}
+
+/// Every unfinished download in `dir` (#70): a stopped or cancelled download
+/// leaves its fragment so it can resume, and these can be large.
+pub fn partial_downloads(dir: &Path) -> Vec<PartialDownload> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<PartialDownload> = entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let file = name.strip_suffix(".part")?.to_string();
+            Some(PartialDownload {
+                file,
+                size_bytes: e.metadata().map(|m| m.len()).unwrap_or(0),
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| a.file.cmp(&b.file));
+    out
+}
+
+/// Delete an unfinished download: its fragment and its sidecar.
+pub fn delete_partial(dir: &Path, file: &str) -> std::io::Result<()> {
+    // Only the name, never a path: `file` comes from the UI.
+    let file = Path::new(file)
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("not a file name"))?
+        .to_string_lossy()
+        .into_owned();
+    for path in [part_path(dir, &file), meta_path(dir, &file)] {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 pub fn write_meta(dir: &Path, file: &str, spec: &DownloadSpec) -> std::io::Result<()> {
     std::fs::write(meta_path(dir, file), meta_line(spec))
 }
@@ -132,6 +199,14 @@ pub fn plan_resume(
     status: reqwest::StatusCode,
     resume_from: u64,
 ) -> Result<ResumePlan, DownloadError> {
+    // Not a transport failure: retrying will not change the answer, so these
+    // fail at once with what to do instead of eight backoffs (#70).
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(DownloadError::Unauthorized);
+    }
+    if status == reqwest::StatusCode::FORBIDDEN {
+        return Err(DownloadError::Forbidden);
+    }
     if !status.is_success() {
         return Err(DownloadError::Transport(format!("{url} returned {status}")));
     }
@@ -182,6 +257,7 @@ pub async fn append_stream<S, E>(
     resume_from: u64,
     mut stream: S,
     on_progress: &mut (dyn FnMut(u64) + Send),
+    cancelled: &std::sync::atomic::AtomicBool,
 ) -> Result<u64, DownloadError>
 where
     S: futures_util::Stream<Item = Result<bytes::Bytes, E>> + Unpin,
@@ -193,6 +269,12 @@ where
         .open(part)?;
     let mut received = resume_from;
     while let Some(chunk) = stream.next().await {
+        // The fragment stays: a cancelled download resumes where it stopped,
+        // or is deleted from the partial-downloads list.
+        if cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+            f.flush()?;
+            return Err(DownloadError::Cancelled);
+        }
         let chunk = chunk.map_err(|e| DownloadError::Transport(e.to_string()))?;
         f.write_all(&chunk)?;
         received += chunk.len() as u64;
@@ -366,6 +448,58 @@ impl RetryBudget {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_licence_refusal_fails_at_once() {
+        assert!(matches!(
+            plan_resume("u", reqwest::StatusCode::UNAUTHORIZED, 0),
+            Err(DownloadError::Unauthorized)
+        ));
+        assert!(matches!(
+            plan_resume("u", reqwest::StatusCode::FORBIDDEN, 0),
+            Err(DownloadError::Forbidden)
+        ));
+    }
+
+    #[test]
+    fn partial_downloads_are_listed_and_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.tflite.part"), [0u8; 10]).unwrap();
+        std::fs::write(dir.path().join("a.tflite.part.meta"), "x").unwrap();
+        std::fs::write(dir.path().join("done.tflite"), [0u8; 3]).unwrap();
+        let parts = partial_downloads(dir.path());
+        assert_eq!(
+            parts,
+            [PartialDownload {
+                file: "a.tflite".into(),
+                size_bytes: 10
+            }]
+        );
+        delete_partial(dir.path(), "a.tflite").unwrap();
+        assert!(partial_downloads(dir.path()).is_empty());
+        assert!(!dir.path().join("a.tflite.part.meta").exists());
+        assert!(
+            delete_partial(dir.path(), "../x").is_ok(),
+            "only a name is ever used"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_download_stops_and_keeps_its_fragment() {
+        let dir = tempfile::tempdir().unwrap();
+        let cancelled = std::sync::atomic::AtomicBool::new(true);
+        let err = append_stream(
+            &part_path(dir.path(), "m.gguf"),
+            0,
+            stream_of(vec![b"data"]),
+            &mut |_| {},
+            &cancelled,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, DownloadError::Cancelled));
+        assert!(part_path(dir.path(), "m.gguf").exists());
+    }
+
     fn spec() -> DownloadSpec {
         DownloadSpec {
             repo: "acme/models".into(),
@@ -376,8 +510,9 @@ mod tests {
         }
     }
 
-    fn stream_of(chunks: Vec<&'static [u8]>) -> impl futures_util::Stream<Item = Result<bytes::Bytes, String>> + Unpin
-    {
+    fn stream_of(
+        chunks: Vec<&'static [u8]>,
+    ) -> impl futures_util::Stream<Item = Result<bytes::Bytes, String>> + Unpin {
         Box::pin(futures_util::stream::iter(
             chunks.into_iter().map(|c| Ok(bytes::Bytes::from_static(c))),
         ))
@@ -386,12 +521,18 @@ mod tests {
     #[test]
     fn the_url_is_a_huggingface_resolve_url() {
         let s = spec();
-        assert_eq!(s.url(), "https://huggingface.co/acme/models/resolve/main/m.gguf");
+        assert_eq!(
+            s.url(),
+            "https://huggingface.co/acme/models/resolve/main/m.gguf"
+        );
         let s = DownloadSpec {
             rev: String::new(),
             ..spec()
         };
-        assert!(s.url().contains("/resolve/main/"), "an empty rev means main");
+        assert!(
+            s.url().contains("/resolve/main/"),
+            "an empty rev means main"
+        );
     }
 
     /// Regression (815bugs #5): a resumed download that gets a 200 (server
@@ -402,7 +543,10 @@ mod tests {
         use reqwest::StatusCode;
         let url = "https://example.invalid/m.gguf";
         // Fresh download: any 2xx appends (there is no fragment).
-        assert_eq!(plan_resume(url, StatusCode::OK, 0).ok(), Some(ResumePlan::Append));
+        assert_eq!(
+            plan_resume(url, StatusCode::OK, 0).ok(),
+            Some(ResumePlan::Append)
+        );
         // Honored Range: 206 appends after the fragment.
         assert_eq!(
             plan_resume(url, StatusCode::PARTIAL_CONTENT, 42).ok(),
@@ -426,9 +570,13 @@ mod tests {
 
         // First attempt is interrupted after one chunk.
         let mut seen = Vec::new();
-        append_stream(&part_path(d, "m.gguf"), 0, stream_of(vec![b"hello "]), &mut |n| {
-            seen.push(n)
-        })
+        append_stream(
+            &part_path(d, "m.gguf"),
+            0,
+            stream_of(vec![b"hello "]),
+            &mut |n| seen.push(n),
+            &std::sync::atomic::AtomicBool::new(false),
+        )
         .await
         .unwrap();
         assert_eq!(seen, vec![6]);
@@ -441,6 +589,7 @@ mod tests {
             offset,
             stream_of(vec![b"world"]),
             &mut |_| {},
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .await
         .unwrap();
@@ -466,7 +615,10 @@ mod tests {
             ..spec()
         };
         assert_eq!(resume_offset(d, "m.gguf", &moved), 0);
-        assert!(!part_path(d, "m.gguf").exists(), "the stale part is removed");
+        assert!(
+            !part_path(d, "m.gguf").exists(),
+            "the stale part is removed"
+        );
     }
 
     #[test]
@@ -482,14 +634,26 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path();
         write_meta(d, "m.gguf", &spec()).unwrap();
-        append_stream(&part_path(d, "m.gguf"), 0, stream_of(vec![b"data"]), &mut |_| {})
-            .await
-            .unwrap();
+        append_stream(
+            &part_path(d, "m.gguf"),
+            0,
+            stream_of(vec![b"data"]),
+            &mut |_| {},
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .await
+        .unwrap();
 
         let err = verify_and_finalize(d, "m.gguf", Some("00deadbeef")).unwrap_err();
-        assert!(matches!(err, DownloadError::ChecksumMismatch { .. }), "got {err}");
+        assert!(
+            matches!(err, DownloadError::ChecksumMismatch { .. }),
+            "got {err}"
+        );
         assert!(!part_path(d, "m.gguf").exists());
-        assert!(!d.join("m.gguf").exists(), "a corrupt file must never take the real name");
+        assert!(
+            !d.join("m.gguf").exists(),
+            "a corrupt file must never take the real name"
+        );
     }
 
     #[tokio::test]
@@ -497,9 +661,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path();
         write_meta(d, "m.gguf", &spec()).unwrap();
-        append_stream(&part_path(d, "m.gguf"), 0, stream_of(vec![b"data"]), &mut |_| {})
-            .await
-            .unwrap();
+        append_stream(
+            &part_path(d, "m.gguf"),
+            0,
+            stream_of(vec![b"data"]),
+            &mut |_| {},
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .await
+        .unwrap();
         // sha256("data")
         let sha = "3a6eb0790f39ac87c94f3856b2dd2c5d110e6811602261a9a923d3bb23adc8b7";
         let out = verify_and_finalize(d, "m.gguf", Some(sha)).unwrap();
@@ -514,9 +684,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path();
         write_meta(d, "m.gguf", &spec()).unwrap();
-        append_stream(&part_path(d, "m.gguf"), 0, stream_of(vec![b"data"]), &mut |_| {})
-            .await
-            .unwrap();
+        append_stream(
+            &part_path(d, "m.gguf"),
+            0,
+            stream_of(vec![b"data"]),
+            &mut |_| {},
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .await
+        .unwrap();
         let sha = "3A6EB0790F39AC87C94F3856B2DD2C5D110E6811602261A9A923D3BB23ADC8B7";
         assert!(verify_and_finalize(d, "m.gguf", Some(sha)).is_ok());
     }
@@ -526,7 +702,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // An implausible size no test machine can satisfy.
         let err = check_space(dir.path(), Some(u64::MAX / 2)).unwrap_err();
-        assert!(matches!(err, DownloadError::NotEnoughSpace { .. }), "got {err}");
+        assert!(
+            matches!(err, DownloadError::NotEnoughSpace { .. }),
+            "got {err}"
+        );
         // A tiny one always passes, and an unknown size never blocks.
         assert!(check_space(dir.path(), Some(1024)).is_ok());
         assert!(check_space(dir.path(), None).is_ok());
@@ -542,10 +721,7 @@ mod tests {
         for _ in 0..50 {
             offset += 10_000_000;
             assert!(
-                matches!(
-                    budget.record_failure(offset),
-                    RetryDecision::RetryAfter(_)
-                ),
+                matches!(budget.record_failure(offset), RetryDecision::RetryAfter(_)),
                 "a failure that followed real progress must never give up"
             );
         }
