@@ -187,7 +187,7 @@ export function McpServers() {
   useEffect(() => {
     const t = window.setInterval(() => void load(), 10_000);
     return () => window.clearInterval(t);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+     
   }, []);
 
   // Visualizations live inside the file tools and Brave inside web search, so
