@@ -12,6 +12,36 @@ The Goose/goosed, Goose Desktop conflict-detection, Ollama-installer and
 `starter_models.ts` sections were removed outright — Goose is not part of this
 app, and every file they referenced is gone.
 
+## Kitty 1.0 ↔ BigTiny V2 2.1.0 — the contract
+
+Kitty 1.0 requires the engine's **API version 2** (`bigtiny2_protocol::API_VERSION`;
+the client refuses an engine that advertises less). The engine crates
+(`BigTinyV2/{daemon,client,protocol}`) are **2.1.0**: every change Kitty
+needed was additive and app-scoped, because other apps share the engine.
+What Kitty relies on, added in 2.1.0 unless noted:
+
+| Surface | Used for |
+|---|---|
+| `POST /api/admin/restart {force}` → `{accepted, blocked_by[]}` | Restart only when no other app is attached or busy; `force` skips only the other-app check |
+| `POST /api/apps/reclaim {id, registration_token}` (unauthenticated, token-checked) | Recover a lost app key, keeping the app's data |
+| `GET /api/apps/me/events` (SSE) | `hitl_pause` / `hitl_resolved`, `schedule_run_*`, `session_title` for the caller's own sessions |
+| `: keepalive` every 15 s | On the event stream and on `/api/chat/{id}/send` and `/stream` |
+| `GET /api/apps/me/pending` | Approvals that paused while Kitty was not listening |
+| `GET /api/hitl/rules`, `DELETE /api/hitl/rules/{id}`; `args_pattern` on `/approve` | Scoped "always allow", listed and revocable |
+| session metadata `hitl_timeout_secs` | A scheduled run's approval is denied after 10 minutes, and the run records `denied_by_timeout` |
+| `ToolFinish.is_error`; structured `ModelFailover` | Real tool errors; failover notices |
+| `messages.reasoning`, `.provider_id`, `.model` | Reasoning and the answering model survive resume, fork and export |
+| provider `config.supports_tools` | Tool capability per card |
+| schedules v2: `kind` `once`/`interval`/`cron`, `run_at`, `interval_secs`, `first_run_at`, `provider_id`, `model`, `hitl_timeout_secs`, `system_prompt`, `cwd`, `last_*`; async `run`; `GET /{id}/runs`; start-up catch-up | Engine-run scheduled tasks |
+| `PUT /api/apps/me/plugins/{plugin}` reconnects the plugin's MCP row; plugin list reports `semantic_embeddings` | Memory on/off per app, at once |
+| `DELETE /api/pathway/beliefs`, `DELETE /api/memorabilia/items` | Erase all |
+| in-process MCP `InProcessConfig` from the row's env | Android grants and settings without process env |
+| DPAPI-sealed `encryption.key.dpapi` (Windows) | No plaintext at-rest key |
+| `POST /api/apps/me/import-v1` → `MergeSummary` | One-click V1 import |
+| `DELETE /api/apps/me?purge=true` | Uninstall removes only Kitty's data |
+| specialist `max_concurrent`; runs report `provider_id`/`model` | Per-specialist concurrency; where a run ran |
+| kitty-web `search_lang` / `country` on DuckDuckGo (`kl`) and Bing (`setlang`/`cc`) | Locale honoured without Brave |
+
 ## Ollama — **HISTORICAL, no longer a dependency**
 
 Kitty managed an Ollama process through Phase 2a. Phase 2b removed it
