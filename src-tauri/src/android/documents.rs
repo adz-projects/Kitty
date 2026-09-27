@@ -48,7 +48,7 @@ struct WriteArgs<'a> {
 }
 
 /// Mirrors `KittyPlugin.writeDocument`'s resolve shape.
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct WrittenDocument {
     /// The document actually written. Not necessarily the one asked for: when
     /// the target was a folder, the provider owns the final name and may

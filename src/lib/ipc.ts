@@ -134,6 +134,8 @@ export const ipc = {
   getEngineInfo: () => invoke<EngineInfo>('get_engine_info'),
   /** The error log as plain text, for Copy. */
   logText: () => invoke<string>('log_text'),
+  /** Shares and notification taps Android has queued (see `lib/incoming.ts`). */
+  takeIncoming: () => invoke<{ intents: unknown[]; copying: boolean }>('take_incoming'),
   saveLogFile: (path: string) => invoke<void>('save_log_file', { path }),
   /** Global hotkeys that could not be registered (e.g. taken by another app). */
   getHotkeyFailures: () => invoke<string[]>('get_hotkey_failures'),

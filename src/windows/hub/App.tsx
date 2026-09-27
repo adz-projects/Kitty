@@ -9,6 +9,8 @@ import { SessionList } from '@/components/sessions/SessionList';
 import { SettingsView } from '@/components/settings/SettingsView';
 import { WizardView } from '@/components/wizard/WizardView';
 import { ConfirmHost } from '@/components/shared/ConfirmDialog';
+import { useStackStore } from '@/stores/stackStore';
+import { drainIncoming } from '@/lib/incoming';
 import { ApprovalModal } from '@/components/chat/ApprovalModal';
 import { useChatStore } from '@/stores/chatStore';
 
@@ -35,6 +37,20 @@ export function App() {
   useEffect(() => {
     void init();
   }, [init]);
+
+  // Android: shares into Kitty and tapped notifications (A2–A4), collected
+  // once the engine is up (a share opens a new chat) and each time the app
+  // comes back to the front.
+  const stackOk = useStackStore((s) => s.status === 'ok');
+  useEffect(() => {
+    if (!android || !stackOk) return;
+    void drainIncoming();
+    const onVisible = () => {
+      if (!document.hidden) void drainIncoming();
+    };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => document.removeEventListener('visibilitychange', onVisible);
+  }, [android, stackOk]);
 
   // Android only: the soft keyboard shrinks the *visual* viewport without
   // resizing the layout, so the app has to follow it by hand. See

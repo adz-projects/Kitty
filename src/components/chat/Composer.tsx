@@ -96,6 +96,22 @@ export function Composer({
     });
   };
 
+  // Text shared into Kitty from another app lands here, once.
+  const prefill = useChatStore((s) => s.composerPrefill);
+  useEffect(() => {
+    if (prefill === null) return;
+    setText((t) =>
+      t
+        ? `${t}
+
+${prefill}`
+        : prefill
+    );
+    useChatStore.getState().setComposerPrefill(null);
+    scheduleResize();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [prefill]);
+
   // Cancel any pending resize frame on unmount.
   useEffect(
     () => () => {

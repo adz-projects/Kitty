@@ -280,6 +280,10 @@ interface ChatState {
   addPastedText: (text: string, label?: string) => void;
   removeAttachment: (id: string) => void;
   addPendingImage: (mime: string, dataUrl: string) => void;
+  /** Text for the composer to take up (something shared into Kitty); the
+      composer clears it once used. */
+  composerPrefill: string | null;
+  setComposerPrefill: (text: string | null) => void;
   removePendingImage: (id: string) => void;
   exportSession: (upToIndex?: number) => Promise<void>;
   newSession: (cwd?: string) => Promise<void>;
@@ -1861,6 +1865,9 @@ export const useChatStore = create<ChatState>((set, get) => {
 
     removeAttachment: (id: string) =>
       set((s) => ({ attachments: s.attachments.filter((a) => a.id !== id) })),
+
+    composerPrefill: null,
+    setComposerPrefill: (text) => set({ composerPrefill: text }),
 
     addPendingImage: (mime: string, dataUrl: string) => {
       if (

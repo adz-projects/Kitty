@@ -20,6 +20,17 @@ pub enum Event {
 }
 
 impl Event {
+    /// The Android channel this event posts on (#75).
+    #[cfg(target_os = "android")]
+    fn channel(self) -> &'static str {
+        match self {
+            Event::TaskComplete => "finished",
+            Event::ApprovalNeeded => "approval",
+            Event::TaskFailed => "failed",
+            Event::StackDegraded => "degraded",
+        }
+    }
+
     fn enabled(self, p: &NotificationPrefs) -> bool {
         match self {
             Event::TaskComplete => p.task_complete,
@@ -119,6 +130,11 @@ pub fn notify_if_hidden(
         return;
     }
 
+    // Android: its own channel per event, and a tap opens the chat it is
+    // about (`KittyPlugin.postNotification` → `take_incoming`).
+    #[cfg(target_os = "android")]
+    crate::android::notify::post(event.channel(), title, body, session_id);
+    #[cfg(not(target_os = "android"))]
     emit_notification(app, title, body, session_id);
 }
 
@@ -210,16 +226,6 @@ fn emit_notification(app: &AppHandle, title: &str, body: &str, session_id: Optio
 /// registered there because its `onNewIntent` handler force-closes the app
 /// (see `lib.rs`). Silent rather than an error — a missing toast is a
 /// degradation, and every caller here is already best-effort.
-#[cfg(target_os = "android")]
-fn emit_notification(_app: &AppHandle, title: &str, body: &str, _session_id: Option<&str>) {
-    // The Tauri notification plugin is disabled on Android (its `onNewIntent`
-    // force-closes the app under `launchMode="singleTask"` — see `lib.rs`), so
-    // post from Kotlin through our own `kitty-native` plugin instead. Its own
-    // dismissable channel, tap-to-open MainActivity. Best-effort: a refused
-    // POST_NOTIFICATIONS permission or a failed round-trip means no toast, not
-    // an error — every caller here is already best-effort.
-    crate::android::notify::post(title, body);
-}
 
 #[cfg(all(not(windows), not(target_os = "android")))]
 fn emit_notification(app: &AppHandle, title: &str, body: &str, _session_id: Option<&str>) {

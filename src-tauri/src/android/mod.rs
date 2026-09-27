@@ -22,6 +22,7 @@
 pub mod attachments;
 pub mod documents;
 pub mod download_service;
+pub mod intents;
 pub mod logcat;
 pub mod notify;
 pub mod secrets;

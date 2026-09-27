@@ -9,10 +9,12 @@ import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.os.Build
 import android.provider.DocumentsContract
 import android.provider.OpenableColumns
 import android.util.Base64
 import android.webkit.MimeTypeMap
+import android.webkit.WebView
 import java.io.File
 import app.tauri.annotation.Command
 import app.tauri.annotation.InvokeArg
@@ -20,6 +22,7 @@ import app.tauri.annotation.Permission
 import app.tauri.annotation.PermissionCallback
 import app.tauri.annotation.TauriPlugin
 import app.tauri.plugin.Invoke
+import app.tauri.plugin.JSArray
 import app.tauri.plugin.JSObject
 import app.tauri.plugin.Plugin
 
@@ -59,6 +62,10 @@ class DownloadNoticeArgs {
 class NotifyArgs {
     var title: String? = null
     var body: String? = null
+    /** `approval`, `finished`, `failed` or `degraded`: which channel (#75). */
+    var channel: String? = null
+    /** The chat it is about; tapping opens it. */
+    var sessionId: String? = null
 }
 
 /**
@@ -158,71 +165,183 @@ class KittyPlugin(private val activity: Activity) : Plugin(activity) {
     fun copyContentUri(invoke: Invoke) {
         val args = invoke.parseArgs(CopyContentUriArgs::class.java)
         try {
-            val uri = Uri.parse(args.uri)
-            val resolver = activity.contentResolver
-
-            // The provider is the only thing that knows the human name. A
-            // provider is allowed to answer nothing, so fall back to a
-            // generic name with an extension derived from the MIME type —
-            // the readers dispatch on extension, so losing that would break
-            // the handoff even when the copy itself succeeded.
-            var displayName: String? = null
-            try {
-                resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
-                    ?.use { c ->
-                        if (c.moveToFirst()) {
-                            val i = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-                            if (i >= 0 && !c.isNull(i)) displayName = c.getString(i)
-                        }
-                    }
-            } catch (_: Exception) {
-                // A provider that refuses the query is not a failed copy.
-            }
-
-            var name = displayName?.trim().orEmpty()
-            if (name.isEmpty()) {
-                val ext = MimeTypeMap.getSingleton()
-                    .getExtensionFromMimeType(resolver.getType(uri))
-                name = if (ext.isNullOrEmpty()) "attachment" else "attachment.$ext"
-            }
-            // Strip anything that could escape the destination directory or
-            // name a device on the host: the provider controls this string.
-            name = name.map {
-                if (it.isISOControl() || it in "\\/:*?\"<>|") "_" else it
-            }.joinToString("")
-            if (name == "." || name == "..") name = "attachment"
-
-            val dir = File(args.destDir)
-            dir.mkdirs()
-
-            // Same de-duplication rule as the desktop copy path
-            // (`commands::file::copy_file_into_chat_folder_blocking`): never
-            // overwrite, and keep the readable name.
-            val stem = name.substringBeforeLast('.', name)
-            val ext = name.substringAfterLast('.', "")
-            var dest = File(dir, name)
-            var n = 2
-            while (dest.exists()) {
-                dest = File(dir, if (ext.isEmpty()) "$stem ($n)" else "$stem ($n).$ext")
-                n++
-            }
-
-            val bytes = resolver.openInputStream(uri)?.use { input ->
-                dest.outputStream().use { output -> input.copyTo(output) }
-            } ?: run {
+            val dest = copyUriInto(Uri.parse(args.uri), File(args.destDir)) ?: run {
                 invoke.reject("could not open the attachment: ${args.uri}")
                 return
             }
-
             invoke.resolve(
                 JSObject()
                     .put("name", dest.name)
                     .put("path", dest.absolutePath)
-                    .put("bytes", bytes)
+                    .put("bytes", dest.length())
             )
         } catch (e: Exception) {
             invoke.reject("could not copy the attachment: ${e.message}", e)
         }
+    }
+
+    /** The copy itself, shared with the share intake below. Null when the
+     *  provider would not open a stream. */
+    private fun copyUriInto(uri: Uri, dir: File): File? {
+        val resolver = activity.contentResolver
+
+        // The provider is the only thing that knows the human name. A
+        // provider is allowed to answer nothing, so fall back to a
+        // generic name with an extension derived from the MIME type —
+        // the readers dispatch on extension, so losing that would break
+        // the handoff even when the copy itself succeeded.
+        var displayName: String? = null
+        try {
+            resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+                ?.use { c ->
+                    if (c.moveToFirst()) {
+                        val i = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                        if (i >= 0 && !c.isNull(i)) displayName = c.getString(i)
+                    }
+                }
+        } catch (_: Exception) {
+            // A provider that refuses the query is not a failed copy.
+        }
+
+        var name = displayName?.trim().orEmpty()
+        if (name.isEmpty()) {
+            val ext = MimeTypeMap.getSingleton()
+                .getExtensionFromMimeType(resolver.getType(uri))
+            name = if (ext.isNullOrEmpty()) "attachment" else "attachment.$ext"
+        }
+        // Strip anything that could escape the destination directory or
+        // name a device on the host: the provider controls this string.
+        name = name.map {
+            if (it.isISOControl() || it in "\\/:*?\"<>|") "_" else it
+        }.joinToString("")
+        if (name == "." || name == "..") name = "attachment"
+
+        dir.mkdirs()
+
+        // Same de-duplication rule as the desktop copy path
+        // (`commands::file::copy_file_into_chat_folder_blocking`): never
+        // overwrite, and keep the readable name.
+        val stem = name.substringBeforeLast('.', name)
+        val ext = name.substringAfterLast('.', "")
+        var dest = File(dir, name)
+        var n = 2
+        while (dest.exists()) {
+            dest = File(dir, if (ext.isEmpty()) "$stem ($n)" else "$stem ($n).$ext")
+            n++
+        }
+
+        resolver.openInputStream(uri)?.use { input ->
+            dest.outputStream().use { output -> input.copyTo(output) }
+        } ?: return null
+        return dest
+    }
+
+    // --- Incoming intents (A2) --------------------------------------------
+
+    /**
+     * What Android handed the app from outside — a share (A3) or a tapped
+     * notification (A4) — queued for Rust to collect with
+     * [takePendingIntents]. Rust asks rather than being told because the
+     * webview may not be listening yet: a share can be what launched the app.
+     *
+     * Deliberately in this plugin rather than Tauri's notification plugin,
+     * whose own `onNewIntent` crashes the app (see `lib.rs`).
+     */
+    private val pendingIntents = mutableListOf<JSObject>()
+    /** Shares whose files are still being copied, so a poll can wait. */
+    private var copying = 0
+
+    override fun load(webView: WebView) {
+        super.load(webView)
+        // A cold start: the intent that launched the activity.
+        capture(activity.intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        capture(intent)
+    }
+
+    private fun capture(intent: Intent?) {
+        if (intent == null || intent.getBooleanExtra(EXTRA_CONSUMED, false)) return
+        // The activity keeps its launch intent: never read the same one twice.
+        intent.putExtra(EXTRA_CONSUMED, true)
+        when (intent.action) {
+            Intent.ACTION_SEND, Intent.ACTION_SEND_MULTIPLE -> captureShare(intent)
+            else -> {
+                val sessionId = intent.getStringExtra(EXTRA_SESSION_ID) ?: return
+                val item = JSObject().put("kind", "open_chat").put("sessionId", sessionId)
+                synchronized(pendingIntents) { pendingIntents.add(item) }
+            }
+        }
+    }
+
+    /** Copy a share's files out of the sending app now, while the read grant
+     *  that came with the intent still holds — off the main thread, since a
+     *  shared video must not freeze the UI. */
+    private fun captureShare(intent: Intent) {
+        val uris = sharedUris(intent)
+        val text = intent.getStringExtra(Intent.EXTRA_TEXT)
+        val subject = intent.getStringExtra(Intent.EXTRA_SUBJECT)
+        synchronized(pendingIntents) { copying++ }
+        Thread {
+            val paths = JSArray()
+            val failed = JSArray()
+            val dir = File(activity.cacheDir, "shared/${System.currentTimeMillis()}")
+            for (uri in uris) {
+                try {
+                    val copy = copyUriInto(uri, dir)
+                    if (copy != null) paths.put(copy.absolutePath) else failed.put(uri.toString())
+                } catch (_: Exception) {
+                    failed.put(uri.toString())
+                }
+            }
+            val item = JSObject()
+                .put("kind", "share")
+                .put("text", text ?: "")
+                .put("subject", subject ?: "")
+                .put("paths", paths)
+                .put("failed", failed.length())
+            synchronized(pendingIntents) {
+                pendingIntents.add(item)
+                copying--
+            }
+        }.start()
+    }
+
+    private fun sharedUris(intent: Intent): List<Uri> {
+        val out = mutableListOf<Uri>()
+        if (intent.action == Intent.ACTION_SEND_MULTIPLE) {
+            val list = if (Build.VERSION.SDK_INT >= 33) {
+                intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM, Uri::class.java)
+            } else {
+                @Suppress("DEPRECATION")
+                intent.getParcelableArrayListExtra<Uri>(Intent.EXTRA_STREAM)
+            }
+            list?.let { out.addAll(it) }
+        } else {
+            val one = if (Build.VERSION.SDK_INT >= 33) {
+                intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
+            } else {
+                @Suppress("DEPRECATION")
+                intent.getParcelableExtra<Uri>(Intent.EXTRA_STREAM)
+            }
+            one?.let { out.add(it) }
+        }
+        return out
+    }
+
+    /** Resolves `{ intents: [...], copying: Boolean }` and empties the
+     *  queue. `copying` says a share is still arriving: ask again shortly. */
+    @Command
+    fun takePendingIntents(invoke: Invoke) {
+        val list = JSArray()
+        val busy: Boolean
+        synchronized(pendingIntents) {
+            pendingIntents.forEach { list.put(it) }
+            pendingIntents.clear()
+            busy = copying > 0
+        }
+        invoke.resolve(JSObject().put("intents", list).put("copying", busy))
     }
 
     // --- Saving out through the Storage Access Framework ------------------
@@ -406,15 +525,21 @@ class KittyPlugin(private val activity: Activity) : Plugin(activity) {
     fun postNotification(invoke: Invoke) {
         val args = invoke.parseArgs(NotifyArgs::class.java)
         try {
-            ensureAlertChannel()
+            val channel = ensureChannels(args.channel)
+            val id = nextAlertId()
+            // Tapping opens the chat it is about (#75), through [capture]. A
+            // distinct request code per notification, or Android would reuse
+            // one PendingIntent — and one chat — for all of them.
+            val open = Intent(activity, MainActivity::class.java)
+                .setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+            args.sessionId?.let { open.putExtra(EXTRA_SESSION_ID, it) }
             val tapToOpen = PendingIntent.getActivity(
                 activity,
-                0,
-                Intent(activity, MainActivity::class.java)
-                    .setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP),
-                PendingIntent.FLAG_IMMUTABLE
+                id,
+                open,
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
             )
-            val notification = Notification.Builder(activity, ALERT_CHANNEL_ID)
+            val notification = Notification.Builder(activity, channel)
                 .setContentTitle(args.title ?: "Kitty")
                 .setContentText(args.body ?: "")
                 .setSmallIcon(R.drawable.ic_stat_activity)
@@ -425,27 +550,58 @@ class KittyPlugin(private val activity: Activity) : Plugin(activity) {
                 activity.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
             // A fresh id each post so a new toast doesn't silently replace an
             // unread one; the low ceiling keeps ids from growing unbounded.
-            manager.notify(nextAlertId(), notification)
+            manager.notify(id, notification)
             invoke.resolve()
         } catch (e: Exception) {
             invoke.reject("could not post a notification: ${e.message}", e)
         }
     }
 
-    private fun ensureAlertChannel() {
+    /**
+     * One channel per kind of notice (#75), so the system Settings app — which
+     * owns these toggles on Android — can silence finished replies while
+     * keeping approvals loud. Returns the channel id for `kind`.
+     */
+    private fun ensureChannels(kind: String?): String {
         val manager =
             activity.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        if (manager.getNotificationChannel(ALERT_CHANNEL_ID) != null) return
-        val channel = NotificationChannel(
-            ALERT_CHANNEL_ID,
-            "Alerts",
-            // DEFAULT: these are the "your turn finished / ran into a problem"
-            // toasts the user actually wants to be pinged about.
-            NotificationManager.IMPORTANCE_DEFAULT
-        ).apply {
-            description = "Turn completions and other one-off notices from Kitty."
+        if (manager.getNotificationChannel(CHANNEL_APPROVAL) == null) {
+            fun make(id: String, name: String, importance: Int, what: String) =
+                NotificationChannel(id, name, importance).apply { description = what }
+            manager.createNotificationChannels(
+                listOf(
+                    // HIGH: a turn is paused until someone answers.
+                    make(
+                        CHANNEL_APPROVAL, "Approvals needed",
+                        NotificationManager.IMPORTANCE_HIGH,
+                        "Kitty is waiting for you to allow or deny a tool."
+                    ),
+                    make(
+                        CHANNEL_FINISHED, "Replies finished",
+                        NotificationManager.IMPORTANCE_DEFAULT,
+                        "A reply finished while you were elsewhere."
+                    ),
+                    make(
+                        CHANNEL_FAILED, "Problems",
+                        NotificationManager.IMPORTANCE_DEFAULT,
+                        "A reply or a scheduled task failed."
+                    ),
+                    make(
+                        CHANNEL_DEGRADED, "Engine status",
+                        NotificationManager.IMPORTANCE_LOW,
+                        "Kitty's engine stopped or came back."
+                    ),
+                )
+            )
+            // The single channel everything used to share.
+            manager.deleteNotificationChannel(LEGACY_CHANNEL_ID)
         }
-        manager.createNotificationChannel(channel)
+        return when (kind) {
+            "approval" -> CHANNEL_APPROVAL
+            "failed" -> CHANNEL_FAILED
+            "degraded" -> CHANNEL_DEGRADED
+            else -> CHANNEL_FINISHED
+        }
     }
 
     private fun nextAlertId(): Int {
@@ -456,7 +612,13 @@ class KittyPlugin(private val activity: Activity) : Plugin(activity) {
     }
 
     companion object {
-        private const val ALERT_CHANNEL_ID = "kitty_alerts"
+        private const val LEGACY_CHANNEL_ID = "kitty_alerts"
+        private const val CHANNEL_APPROVAL = "kitty_approval"
+        private const val CHANNEL_FINISHED = "kitty_finished"
+        private const val CHANNEL_FAILED = "kitty_failed"
+        private const val CHANNEL_DEGRADED = "kitty_degraded"
+        private const val EXTRA_SESSION_ID = "com.kitty.app.SESSION_ID"
+        private const val EXTRA_CONSUMED = "com.kitty.app.CONSUMED"
         private var alertSeq = 0
     }
 }

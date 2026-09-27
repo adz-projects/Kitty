@@ -317,6 +317,7 @@ pub fn run() {
             commands::set_brave_mcp_search_api_key,
             commands::set_brave_mcp_search_enabled,
             commands::patch_config,
+            commands::take_incoming,
             commands::log_text,
             commands::save_log_file,
             commands::test_provider_draft,
