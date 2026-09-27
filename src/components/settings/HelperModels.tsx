@@ -32,8 +32,14 @@ export function HelperModels() {
   // Per-file HuggingFace tokens for gated repos, held in memory only for this
   // render — never persisted, never sent anywhere but the download request.
   const [tokens, setTokens] = useState<Record<string, string>>({});
+  // Unfinished downloads left on disk (#70): they resume, or can be deleted.
+  const [partials, setPartials] = useState<{ file: string; size_bytes: number }[]>([]);
 
   const refresh = () => {
+    void ipc
+      .listPartialDownloads()
+      .then(setPartials)
+      .catch(() => setPartials([]));
     void ipc
       .listLocalModels()
       .then(setModels)
@@ -46,6 +52,18 @@ export function HelperModels() {
 
   useEffect(() => {
     refresh();
+    // Downloads already running (started here earlier, in the wizard, or in
+    // another window) — progress survives leaving this page (#70).
+    void ipc
+      .listDownloads()
+      .then((list) =>
+        setDownloads((cur) => {
+          const next = { ...cur };
+          for (const p of list) next[p.download_id] = next[p.download_id] ?? p;
+          return next;
+        })
+      )
+      .catch(() => {});
     // This panel is conditionally rendered, so it mounts and unmounts every
     // time the user switches tabs — listeners and their cleanup timers must be
     // torn down or each revisit stacks another one on the last.
@@ -132,7 +150,7 @@ export function HelperModels() {
           you differs by platform (D18: chat never runs locally on Android). */}
       <p className="muted">
         {isAndroid()
-          ? 'Kitty runs these itself, in the background — they summarise long conversations and power memory. Chat runs through the provider you connect. Downloads come from Hugging Face.'
+          ? 'Kitty runs this itself, in the background, to power memory. Chat — and summarizing long chats — runs through the provider you connect. Downloads come from Hugging Face.'
           : 'Models run inside Kitty — no separate server to install or keep running. Downloads come from Hugging Face.'}
       </p>
 
@@ -162,6 +180,16 @@ export function HelperModels() {
                           ? `${pct}%`
                           : humanBytes(p.received)}
                   </span>
+                  {!p.done && (
+                    <button
+                      className="link"
+                      onClick={() =>
+                        void ipc.cancelDownload(p.download_id).catch((e) => setError(String(e)))
+                      }
+                    >
+                      Cancel
+                    </button>
+                  )}
                 </div>
                 <div className="progress">
                   {/* An unknown total gets a fixed-width bar rather than a
@@ -176,6 +204,37 @@ export function HelperModels() {
             );
           })}
         </div>
+      )}
+
+      {partials.length > 0 && (
+        <>
+          <h2>Unfinished downloads</h2>
+          <p className="muted">
+            Downloading one of these again picks up where it stopped. Delete one to free the space.
+          </p>
+          <div className="model-list">
+            {partials.map((p) => (
+              <div key={p.file} className="model-row">
+                <div>
+                  <div className="model-name">{p.file}</div>
+                  <div className="muted">{humanBytes(p.size_bytes)} so far</div>
+                </div>
+                <button
+                  onClick={() =>
+                    void ipc
+                      .deletePartialDownload(p.file)
+                      .then(refresh)
+                      .catch((e) => setError(String(e)))
+                  }
+                  title="Delete"
+                  aria-label={`Delete the unfinished ${p.file}`}
+                >
+                  <TrashIcon />
+                </button>
+              </div>
+            ))}
+          </div>
+        </>
       )}
 
       <h2>Models</h2>
