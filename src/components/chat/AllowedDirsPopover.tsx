@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { ipc } from '@/lib/ipc';
+import { useChatStore } from '@/stores/chatStore';
 import type { SessionAllowedDirs } from '@/lib/types';
 import { usePopoverPosition } from '@/lib/usePopoverPosition';
 
@@ -70,15 +71,18 @@ export function AllowedDirsPopover({
     };
   }, [open, sessionId]);
 
+  const [revokeError, setRevokeError] = useState<string | null>(null);
   const revoke = async (path: string) => {
     if (!sessionId) return;
+    setRevokeError(null);
     try {
       await ipc.revokeSessionDir(sessionId, path);
       setDirs(await ipc.listSessionAllowedDirs(sessionId));
-    } catch {
-      // Best-effort: a failed revoke leaves the list as it was, and the next
-      // hover re-reads the real state from the daemon rather than trusting
-      // anything optimistic we might have done here.
+      // The chat's cached grants too, or the revoked folder would keep
+      // scoping the artifacts pane (#38).
+      await useChatStore.getState().refreshSessionGrants();
+    } catch (e) {
+      setRevokeError(`Couldn't revoke access: ${String(e)}`);
     }
   };
 
@@ -147,6 +151,7 @@ export function AllowedDirsPopover({
               Nothing else — just this chat&apos;s folder.
             </div>
           )}
+          {revokeError && <div className="allowed-dirs-row error">{revokeError}</div>}
         </div>
       )}
     </span>

@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { ipc } from '@/lib/ipc';
 import { useChatStore } from '@/stores/chatStore';
 import { useAdaptivePathwayStore } from '@/stores/adaptivePathwayStore';
+import { useStackStore } from '@/stores/stackStore';
 import { LightbulbIcon } from '@/components/icons/LightbulbIcon';
 import { PauseIcon } from '@/components/icons/PauseIcon';
 
@@ -20,20 +21,41 @@ import { PauseIcon } from '@/components/icons/PauseIcon';
     during the gap before one lands (New Chat/session-load/mode-swap all
     pass through a `sessionId: null` moment).
 
-    No GET for "is this session currently paused" exists, so `paused` is
-    optimistic client-side state (new sessions start unpaused, matching the
-    engine's own default) rather than synced from the server on mount. */
+    The paused state is read back from the chat itself whenever the chat
+    changes (#46), so a resumed, expanded or re-opened incognito chat still
+    says so. */
 export function AdaptivePathwayToggle() {
   const sessionId = useChatStore((s) => s.sessionId);
   const available = useAdaptivePathwayStore((s) => s.available);
   const [paused, setPaused] = useState(false);
 
-  // Reset local state whenever the session changes so a paused toggle from
-  // a previous session doesn't stick around on the next one (this component
-  // isn't remounted on New Chat, see the store's own doc comment).
+  const init = useAdaptivePathwayStore((s) => s.init);
+
+  // The chat's own state: new chats start unpaused, a resumed one says.
   useEffect(() => {
     setPaused(false);
+    if (!sessionId) return;
+    let live = true;
+    void ipc
+      .getSessionPause(sessionId)
+      .then((p) => {
+        if (live) setPaused(p);
+      })
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
   }, [sessionId]);
+
+  // Whether memory is available at all is only knowable once the engine is
+  // up — the overlay checks at startup, before it is (#46).
+  useEffect(
+    () =>
+      useStackStore.subscribe((s, prev) => {
+        if (s.status === 'ok' && prev.status !== 'ok') void init();
+      }),
+    [init]
+  );
 
   if (!available) return null;
 

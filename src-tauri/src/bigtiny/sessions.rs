@@ -75,7 +75,6 @@ pub async fn create(
     Ok(session_info(app, session_id, cwd, profile_id, model))
 }
 
-
 /// Repoint a session's *current* working directory ("Set as working
 /// directory", agentic mode only) — mutates the session in place rather
 /// than forking a new one, since BigTiny's directory sandbox needs to see
@@ -219,7 +218,9 @@ pub async fn list(app: &AppHandle) -> Result<Vec<Value>, String> {
 /// (`windows::focus_or_open_session`'s cwd lookup retries through this).
 pub async fn list_with_limit(app: &AppHandle, limit: u32) -> Result<Vec<Value>, String> {
     let client = ensure_client(app)?;
-    let result = client.get_json(&format!("/api/chat/?limit={limit}")).await?;
+    let result = client
+        .get_json(&format!("/api/chat/?limit={limit}"))
+        .await?;
     Ok(result
         .get("sessions")
         .and_then(|s| s.as_array())
@@ -229,7 +230,11 @@ pub async fn list_with_limit(app: &AppHandle, limit: u32) -> Result<Vec<Value>, 
 
 /// One page of the session list, newest first, with the total count so the
 /// list can page past the first screenful (#47).
-pub async fn list_page(app: &AppHandle, offset: u32, limit: u32) -> Result<(Vec<Value>, i64), String> {
+pub async fn list_page(
+    app: &AppHandle,
+    offset: u32,
+    limit: u32,
+) -> Result<(Vec<Value>, i64), String> {
     let client = ensure_client(app)?;
     let result = client
         .get_json(&format!("/api/chat/?limit={limit}&offset={offset}"))
@@ -248,7 +253,9 @@ pub async fn list_page(app: &AppHandle, offset: u32, limit: u32) -> Result<(Vec<
 pub async fn search(app: &AppHandle, query: &str) -> Result<Vec<Value>, String> {
     let client = ensure_client(app)?;
     let q = url_encode(query);
-    let result = client.get_json(&format!("/api/search?q={q}&limit=100")).await?;
+    let result = client
+        .get_json(&format!("/api/search?q={q}&limit=100"))
+        .await?;
     let mut seen = std::collections::HashSet::new();
     Ok(result
         .get("results")
@@ -509,7 +516,19 @@ pub async fn load(app: &AppHandle, session_id: String, cwd: String) -> Result<Se
             .filter(|v| !v.is_empty())
             .map(str::to_string)
     };
-    Ok(session_info(app, session_id, cwd, text_of("provider"), text_of("model")))
+    // A caller that didn't know the folder (a search hit) gets the stored one.
+    let cwd = if cwd.trim().is_empty() {
+        text_of("cwd").unwrap_or_default()
+    } else {
+        cwd
+    };
+    Ok(session_info(
+        app,
+        session_id,
+        cwd,
+        text_of("provider"),
+        text_of("model"),
+    ))
 }
 
 /// How many images a stored user turn carried.
@@ -521,7 +540,12 @@ fn image_count(row: &Value) -> usize {
     match serde_json::from_str::<Value>(content) {
         Ok(Value::Array(blocks)) => blocks
             .iter()
-            .filter(|b| matches!(b.get("type").and_then(|t| t.as_str()), Some("image_url" | "image")))
+            .filter(|b| {
+                matches!(
+                    b.get("type").and_then(|t| t.as_str()),
+                    Some("image_url" | "image")
+                )
+            })
             .count(),
         _ => 0,
     }

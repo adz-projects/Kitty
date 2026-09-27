@@ -13,13 +13,16 @@ import { StartupSpinner } from '@/components/shared/StartupSpinner';
 import {
   ipc,
   pickFolder,
+  pickSavePath,
   onSessionCreated,
+  onSessionRenamed,
   onSessionDeleted,
   onFoldersChanged,
   onSessionsCleared,
   onSessionTitle,
 } from '@/lib/ipc';
 import { isAndroid } from '@/lib/platform';
+import { relativeTime } from '@/lib/relativeTime';
 import { SessionKebabMenu } from './SessionKebabMenu';
 import { SessionSelectionBar } from './SessionSelectionBar';
 import type { SessionSummary } from '@/lib/types';
@@ -57,6 +60,11 @@ export function SessionList() {
   // the "request failed / Retry" error or a premature "No sessions." (item 2).
   const booting = useStackStore(selectBooting);
   const query = useSessionStore((s) => s.query);
+  const storeTotal = useSessionStore((s) => s.total);
+  const loadMore = useSessionStore((s) => s.loadMore);
+  const loadingMore = useSessionStore((s) => s.loadingMore);
+  const searching = useSessionStore((s) => s.searching);
+  const searchResults = useSessionStore((s) => s.searchResults);
   const folders = useSessionStore((s) => s.folders);
   const refresh = useSessionStore((s) => s.refresh);
   const refreshFolders = useSessionStore((s) => s.refreshFolders);
@@ -214,6 +222,26 @@ export function SessionList() {
   }, [refresh]);
 
   useEffect(() => {
+    // A rename in any window (#48).
+    const un = onSessionRenamed((e) => applyTitle(e.sessionId, e.title));
+    return () => void un.then((fn) => fn());
+  }, [applyTitle]);
+
+  // Infinite scroll (#47): the next page loads when the end of the list
+  // comes into view. Not while searching — search answers from every chat.
+  const endRef = useRef<HTMLDivElement>(null);
+  const canLoadMore = !query.trim() && sessions.length < storeTotal;
+  useEffect(() => {
+    const el = endRef.current;
+    if (!el || !canLoadMore || typeof IntersectionObserver === 'undefined') return;
+    const io = new IntersectionObserver((entries) => {
+      if (entries.some((e) => e.isIntersecting)) void loadMore();
+    });
+    io.observe(el);
+    return () => io.disconnect();
+  }, [canLoadMore, loadMore]);
+
+  useEffect(() => {
     // release-fixes item 12: BigTiny auto-derives a title after the first
     // full turn and emits chat://session-title, which chatStore already
     // consumed for the active window's own header — this sidebar had no
@@ -340,7 +368,7 @@ export function SessionList() {
     // The linter calls them unnecessary because it can't see through the
     // stable `grouped` function reference; they are the entire point.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [grouped, sessions, assignments, folders, query]
+    [grouped, sessions, assignments, folders, query, searchResults]
   );
   const total = groups.reduce((n, g) => n + g.sessions.length, 0);
   // Folders are foregone on Android for now (no "+ Folder"/"Uncategorized"
@@ -390,8 +418,21 @@ export function SessionList() {
       </div>
       <div className="session-toolbar">
         <span className="muted" style={{ fontSize: 13 }}>
-          {total} session{total === 1 ? '' : 's'}
+          {query.trim()
+            ? searching
+              ? 'Searching…'
+              : `${total} match${total === 1 ? '' : 'es'}`
+            : `${storeTotal || total} chat${(storeTotal || total) === 1 ? '' : 's'}`}
         </span>
+        {/* Desktop's way into bulk select (Android long-presses a row). */}
+        {!isAndroid() && total > 0 && (
+          <button
+            className="link"
+            onClick={() => (selectionMode ? exitSelectionMode() : setSelectionMode(true))}
+          >
+            {selectionMode ? 'Done' : 'Select'}
+          </button>
+        )}
         {/* Folders foregone on Android for now — no way to create one there. */}
         {!isAndroid() && (
           <button
@@ -461,6 +502,12 @@ export function SessionList() {
               onToggleSelected={toggleSelected}
             />
           ))}
+
+      {canLoadMore && (
+        <div ref={endRef} className="muted session-empty">
+          {loadingMore ? 'Loading more…' : ''}
+        </div>
+      )}
 
       {selectionMode && (
         <SessionSelectionBar
@@ -659,6 +706,18 @@ function FolderGroup({
   );
 }
 
+/** Save one chat as ChatML (+ .meta.json), built by the backend. */
+async function exportOne(row: SessionSummary) {
+  const base = (row.title || 'kitty-chat').replace(/[\/:*?"<>|]/g, '_').slice(0, 80);
+  const path = await pickSavePath(`${base}.chatml`);
+  if (!path) return;
+  try {
+    await ipc.exportChatml([row.sessionId], path);
+  } catch (e) {
+    useSessionStore.setState({ loadError: String(e) });
+  }
+}
+
 function SessionRow({
   session: s,
   folders,
@@ -756,9 +815,17 @@ function SessionRow({
         />
       )}
       <div className="session-title">{s.title}</div>
+      {s.snippet && <div className="session-snippet muted">{s.snippet}</div>}
       <div className="session-meta muted">
-        {resuming ? 'Resuming…' : (s.cwd.split(/[\\/]/).filter(Boolean).pop() ?? s.cwd)}
-        {!resuming && s.modelId ? ` · ${s.modelId}` : ''}
+        {resuming
+          ? 'Resuming…'
+          : [
+              relativeTime(s.updatedAt, Date.now()),
+              s.cwd.split(/[\\/]/).filter(Boolean).pop() ?? s.cwd,
+              s.modelId,
+            ]
+              .filter(Boolean)
+              .join(' · ')}
       </div>
       {/* Kebab menu (rename, move to folder) is desktop-only on Android
           (release-fixes item 9) — long-press bulk-select + the bottom action
@@ -775,6 +842,7 @@ function SessionRow({
               setRenaming(true);
             }}
             onDelete={() => setConfirmingDelete(true)}
+            onExport={() => void exportOne(s)}
           />
         </div>
       )}

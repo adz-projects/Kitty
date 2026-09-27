@@ -1305,6 +1305,13 @@ button:disabled {
   flex-direction: column;
   gap: 4px;
 }
+/* A search hit's matching text, under its title. */
+.session-snippet {
+  font-size: var(--fs-sm-plus);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .msg-notice {
   margin: 4px 0 0;
   font-size: var(--fs-sm-plus);

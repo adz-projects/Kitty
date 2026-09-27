@@ -15,6 +15,7 @@ import {
   onProviderActivated,
   onProviderHealth,
   onChatNotice,
+  onSessionRenamed,
   onReasoningDelta,
   onSessionDeleted,
   onSessionsCleared,
@@ -776,6 +777,10 @@ export const useChatStore = create<ChatState>((set, get) => {
   // call — newSession()'s optimistic clear wipes droppedFiles/attachments/
   // pendingImages, so reading them only after a lazy session-create would
   // silently drop the first message's files.
+  // The watch latch `loadSession` applies: set only while `spectateSession`
+  // is loading, so any other load clears a stale one.
+  let spectatePending: string | null = null;
+
   // The untrusted-provider notice, from any attach path.
   const warnIfUntrusted = (what: string) => {
     const warning = untrustedWarning(what, get());
@@ -1159,11 +1164,24 @@ export const useChatStore = create<ChatState>((set, get) => {
       // provider/model back to the delegate's session — see its
       // `setSessionProvider` call.
       set({ spectating: specialist });
+      spectatePending = specialist;
       // The delegate's own host, from the `subagent-status` event. Passed so
       // the header badge names the model that is actually doing the work;
       // without it `refreshProvider` falls back to the globally active profile
       // and labels the window with the MAIN model.
-      await get().loadSession(sessionId, '', undefined, providerId, modelId);
+      try {
+        await get().loadSession(sessionId, '', undefined, providerId, modelId);
+      } finally {
+        spectatePending = null;
+      }
+      // Then follow it live (#56): the delegate is running in the engine, not
+      // from this window, so nothing else would stream it here.
+      try {
+        const live = await ipc.attachSessionStream(sessionId);
+        if (live && get().sessionId === sessionId) set({ busy: true });
+      } catch (e) {
+        console.warn('attachSessionStream failed', e);
+      }
     },
     adoptSession: async (info) => {
       // Replay the handed-off conversation (Expand / auto-promote) so the full
@@ -1335,6 +1353,8 @@ export const useChatStore = create<ChatState>((set, get) => {
       set({
         sessionId: null,
         sessionEpoch: epoch,
+        // A watch window that starts a chat of its own stops watching.
+        spectating: null,
         // A fresh blank chat is never "replaying" — leaving the stale value
         // would pin the "Loading conversation…" placeholder on it forever,
         // since the epoch guard now stops the old replay from clearing it.
@@ -1504,6 +1524,9 @@ export const useChatStore = create<ChatState>((set, get) => {
       set({
         sessionId,
         sessionEpoch: epoch,
+        // Loading any other chat ends a watch; `spectateSession` loads with
+        // the latch already chosen (#56).
+        spectating: spectatePending,
         cwd,
         chatDir: cwd,
         title: title ?? null,
@@ -1565,6 +1588,9 @@ export const useChatStore = create<ChatState>((set, get) => {
         set({
           thinkingEffort: info.thinking_effort,
           isDefaultFolder: info.is_default_folder,
+          // Opened from somewhere that didn't know its folder (a full-text
+          // search hit): the engine's record of it.
+          ...(cwd ? {} : { cwd: info.cwd, chatDir: info.cwd }),
         });
         await get().refreshProvider(undefined);
       } catch (e) {
@@ -2166,6 +2192,10 @@ export const useChatStore = create<ChatState>((set, get) => {
 
       void onSessionTitle((e) => {
         if (forActive(e.session_id)) set({ title: e.title });
+      });
+      // Renamed in another window (or titled as a branch) (#48).
+      void onSessionRenamed((e) => {
+        if (get().sessionId === e.sessionId) set({ title: e.title });
       });
 
       void onProviderHealth((h) => {

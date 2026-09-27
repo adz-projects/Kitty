@@ -844,6 +844,8 @@ export interface SessionSummary {
   messageCount?: number;
   providerId?: string;
   modelId?: string;
+  /** The matching text, for a full-text search hit. */
+  snippet?: string | null;
 }
 
 /** Parse a raw session/list object (see docs/acp-protocol.md) defensively. */

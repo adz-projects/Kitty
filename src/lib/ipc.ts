@@ -735,6 +735,10 @@ export const onClipboardAttach = (cb: (e: ClipboardAttachEvent) => void) =>
     its session list/recents dropdown is stale. */
 export const onSessionCreated = (cb: () => void) => listen('session://created', () => cb());
 
+/** A chat renamed in any window (or titled as a branch). */
+export const onSessionRenamed = (cb: (e: { sessionId: string; title: string }) => void) =>
+  listen<{ sessionId: string; title: string }>('session://renamed', (e) => cb(e.payload));
+
 /** A single session was deleted in *any* window (e.g. `regenerate()`'s
     background cleanup of the session it forked away from, or a user-driven
     delete from the sidebar) — same cross-window-staleness reason as

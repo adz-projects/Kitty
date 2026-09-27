@@ -11,12 +11,15 @@ export function SessionKebabMenu({
   current,
   onRename,
   onDelete,
+  onExport,
 }: {
   sessionId: string;
   folders: string[];
   current: string;
   onRename: () => void;
   onDelete: () => void;
+  /** Save this chat as ChatML (desktop). */
+  onExport?: () => void;
 }) {
   const [open, setOpen] = useState(false);
   const assignFolder = useSessionStore((s) => s.assignFolder);
@@ -71,6 +74,16 @@ export function SessionKebabMenu({
           >
             Rename
           </button>
+          {onExport && (
+            <button
+              onClick={() => {
+                setOpen(false);
+                onExport();
+              }}
+            >
+              Export as ChatML…
+            </button>
+          )}
           <button
             onClick={() => {
               setOpen(false);

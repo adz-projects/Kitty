@@ -1,4 +1,5 @@
-// Session history state (Phase 4), backed entirely by goosed's session routes.
+// Session history state (Phase 4), backed by the engine's session routes,
+// a page at a time, with full-text search over every chat.
 // Chat folders (Round-2 item 15) are an app-side mapping layered on top.
 import { create } from 'zustand';
 import { ipc } from '@/lib/ipc';
@@ -7,6 +8,36 @@ import { useStackStore, selectBooting } from '@/stores/stackStore';
 
 export const UNCATEGORIZED = 'Uncategorized';
 
+/** Chats fetched per page (#47). */
+export const PAGE_SIZE = 100;
+/** Queries this long search every chat's text on the engine; shorter ones
+    just filter the loaded titles. */
+export const SERVER_SEARCH_MIN = 3;
+
+const byNewest = (a: SessionSummary, b: SessionSummary) =>
+  a.updatedAt < b.updatedAt ? 1 : a.updatedAt > b.updatedAt ? -1 : 0;
+
+/** `next` merged into `current` by id, newest first. Pure. */
+export function mergeSessions(current: SessionSummary[], next: SessionSummary[]): SessionSummary[] {
+  const byId = new Map(current.map((s) => [s.sessionId, s]));
+  for (const s of next) byId.set(s.sessionId, s);
+  return [...byId.values()].sort(byNewest);
+}
+
+/** Search hits as list rows, using the loaded row when there is one (it knows
+    the chat's folder and card). Pure. */
+export function searchRows(
+  hits: { sessionId: string; title: string; snippet: string | null }[],
+  loaded: SessionSummary[]
+): SessionSummary[] {
+  return hits.map((h) => {
+    const known = loaded.find((s) => s.sessionId === h.sessionId);
+    return known
+      ? { ...known, snippet: h.snippet }
+      : { sessionId: h.sessionId, title: h.title, cwd: '', updatedAt: '', snippet: h.snippet };
+  });
+}
+
 export interface SessionGroup {
   folder: string; // display name; UNCATEGORIZED for unassigned
   sessions: SessionSummary[];
@@ -14,6 +45,13 @@ export interface SessionGroup {
 
 interface SessionState {
   sessions: SessionSummary[];
+  /** How many chats exist in all (the list may hold fewer, a page at a time). */
+  total: number;
+  loadingMore: boolean;
+  /** Full-text search hits for the current query, null when not searching. */
+  searchResults: SessionSummary[] | null;
+  searching: boolean;
+  loadMore: () => Promise<void>;
   loading: boolean;
   /** Last refresh failure message (WS8) — callers using `void refresh()` can
       no longer hit an unhandled rejection from `ipc.listSessions`, and the
@@ -44,6 +82,10 @@ interface SessionState {
 
 export const useSessionStore = create<SessionState>((set, get) => ({
   sessions: [],
+  total: 0,
+  loadingMore: false,
+  searchResults: null,
+  searching: false,
   loading: false,
   loadError: null,
   query: '',
@@ -57,15 +99,16 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     // between attempts.
     let retryScheduled = false;
     try {
-      const { sessions: raw } = await ipc.listSessions();
+      // As many as are already showing (at least a page), so a refresh after
+      // scrolling down doesn't shrink the list back to the first page.
+      const limit = Math.max(PAGE_SIZE, get().sessions.length);
+      const { sessions: raw, total } = await ipc.listSessions(0, limit);
       // Verbatim string compare of the backend's naive `"YYYY-MM-DD HH:MM:SS"`
       // timestamps, newest first. Must return 0 for equal values — a comparator
       // that only ever returns ±1 gives equal timestamps an arbitrary,
       // engine-dependent order that can shuffle between refreshes.
-      const sessions = raw
-        .map(parseSession)
-        .sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : a.updatedAt > b.updatedAt ? -1 : 0));
-      set({ sessions });
+      const sessions = raw.map(parseSession).sort(byNewest);
+      set({ sessions, total });
       await get().refreshFolders();
     } catch (e) {
       // During the startup grace window the daemon simply isn't listening yet
@@ -88,6 +131,23 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     }
   },
 
+  loadMore: async () => {
+    const { sessions, total, loadingMore } = get();
+    if (loadingMore || sessions.length >= total) return;
+    set({ loadingMore: true });
+    try {
+      const page = await ipc.listSessions(sessions.length, PAGE_SIZE);
+      set((s) => ({
+        sessions: mergeSessions(s.sessions, page.sessions.map(parseSession)),
+        total: page.total,
+      }));
+    } catch (e) {
+      set({ loadError: e instanceof Error ? e.message : String(e) });
+    } finally {
+      set({ loadingMore: false });
+    }
+  },
+
   remove: async (sessionId: string) => {
     const cwd = get().sessions.find((s) => s.sessionId === sessionId)?.cwd;
     // Clear any previous failure first, so a retry that succeeds doesn't leave
@@ -102,7 +162,11 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       set({ loadError: e instanceof Error ? e.message : String(e) });
       return;
     }
-    set((s) => ({ sessions: s.sessions.filter((x) => x.sessionId !== sessionId) }));
+    set((s) => ({
+      sessions: s.sessions.filter((x) => x.sessionId !== sessionId),
+      total: Math.max(0, s.total - 1),
+      searchResults: s.searchResults?.filter((x) => x.sessionId !== sessionId) ?? null,
+    }));
     // Drop any dangling folder assignment. Best-effort: a stale cross-window
     // `assignments` map could skip this, but the delete already succeeded so
     // surfacing a folder-cleanup failure is worse than leaving the mapping.
@@ -130,15 +194,39 @@ export const useSessionStore = create<SessionState>((set, get) => ({
   applyTitle: (sessionId: string, title: string) => {
     set((s) => ({
       sessions: s.sessions.map((x) => (x.sessionId === sessionId ? { ...x, title } : x)),
+      searchResults:
+        s.searchResults?.map((x) => (x.sessionId === sessionId ? { ...x, title } : x)) ?? null,
     }));
   },
 
-  setQuery: (q: string) => set({ query: q }),
+  setQuery: (q: string) => {
+    set({ query: q });
+    const trimmed = q.trim();
+    if (trimmed.length < SERVER_SEARCH_MIN) {
+      set({ searchResults: null, searching: false });
+      return;
+    }
+    set({ searching: true });
+    void ipc
+      .searchSessions(trimmed)
+      .then((hits) => {
+        // A later query won the race: drop this one's answer.
+        if (get().query.trim() !== trimmed) return;
+        set({ searchResults: searchRows(hits, get().sessions) });
+      })
+      .catch((e) => set({ loadError: e instanceof Error ? e.message : String(e) }))
+      .finally(() => {
+        if (get().query.trim() === trimmed) set({ searching: false });
+      });
+  },
 
   filtered: () => {
-    const { sessions, query } = get();
+    const { sessions, query, searchResults } = get();
     const q = query.trim().toLowerCase();
     if (!q) return sessions;
+    // Every chat's text, searched by the engine (#47); until its answer
+    // arrives, the loaded titles.
+    if (searchResults) return searchResults;
     return sessions.filter(
       (s) => s.title.toLowerCase().includes(q) || s.cwd.toLowerCase().includes(q)
     );

@@ -10,6 +10,8 @@ export function RecentSessions() {
   const [resumingId, setResumingId] = useState<string | null>(null);
   const refresh = useSessionStore((s) => s.refresh);
   const sessions = useSessionStore((s) => s.sessions);
+  const loading = useSessionStore((s) => s.loading);
+  const loadError = useSessionStore((s) => s.loadError);
   const loadSession = useChatStore((s) => s.loadSession);
   const { triggerRef, popoverRef, style } = usePopoverPosition(open, () => setOpen(false));
 
@@ -57,9 +59,24 @@ export function RecentSessions() {
           role="menu"
           style={{ minWidth: 240, ...style }}
         >
-          {sessions.length === 0 && (
+          {/* "No sessions" only when that's true (#48): not while loading,
+              and a failed load says so. */}
+          {loadError && sessions.length === 0 && (
+            <span className="error" style={{ padding: '6px 8px' }}>
+              Couldn’t load chats.{' '}
+              <button className="link" onClick={() => void refresh()}>
+                Retry
+              </button>
+            </span>
+          )}
+          {!loadError && loading && sessions.length === 0 && (
             <span className="muted" style={{ padding: '6px 8px' }}>
-              No sessions
+              Loading…
+            </span>
+          )}
+          {!loadError && !loading && sessions.length === 0 && (
+            <span className="muted" style={{ padding: '6px 8px' }}>
+              No chats yet
             </span>
           )}
           {sessions.slice(0, 10).map((s) => (
