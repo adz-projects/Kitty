@@ -79,7 +79,12 @@ pub async fn sync_all_providers(app: &AppHandle) -> Result<(), String> {
         cards.push(body);
     }
     let client = ensure_client(app)?;
-    sync_cards(&client, &cards, default_id.as_deref()).await
+    sync_cards(&client, &cards, default_id.as_deref()).await?;
+    // Once there is an OpenRouter card to judge (#21): the subagent denylist
+    // is seeded from what this user actually has, so seeding before the
+    // wizard added any provider used to record an empty list.
+    crate::commands::seed_subagent_denylist(app).await;
+    Ok(())
 }
 
 /// One card, ready to send.

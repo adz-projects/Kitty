@@ -64,8 +64,12 @@ pub async fn list_specialist_runs(
 /// running on. Only the models this user actually has configured are listed —
 /// a denylist naming hundreds of models they will never use is noise.
 ///
-/// Runs once. `seeded` distinguishes "not asked yet" from "cleared
-/// deliberately", so emptying the list is not silently undone next launch.
+/// Runs once, after the first provider sync that includes an OpenRouter
+/// card: before that there is nothing to judge, and recording an empty list
+/// would count as the decision. `seeded` distinguishes "not asked yet" from
+/// "cleared deliberately", so emptying the list is not silently undone next
+/// launch. The list reaches the engine at start, so a non-empty one asks for
+/// a restart.
 pub async fn seed_subagent_denylist(app: &tauri::AppHandle) {
     use tauri::Manager;
 
@@ -74,7 +78,11 @@ pub async fn seed_subagent_denylist(app: &tauri::AppHandle) {
         let cfg = state.config.lock().unwrap();
         (cfg.specialists.seeded, cfg.providers.clone())
     };
-    if already {
+    if already
+        || !profiles
+            .iter()
+            .any(|p| p.is_usable() && p.provider_type == "openrouter")
+    {
         return;
     }
 
@@ -105,11 +113,18 @@ pub async fn seed_subagent_denylist(app: &tauri::AppHandle) {
             .collect()
     };
 
-    let state = app.state::<crate::state::AppState>();
-    let mut cfg = state.config.lock().unwrap();
-    cfg.specialists.model_deny = premium;
-    cfg.specialists.seeded = true;
-    if let Err(e) = crate::config::save(&cfg) {
-        tracing::warn!("could not save the seeded subagent denylist: {e}");
+    let changed = !premium.is_empty();
+    {
+        let state = app.state::<crate::state::AppState>();
+        let mut cfg = state.config.lock().unwrap();
+        cfg.specialists.model_deny = premium;
+        cfg.specialists.seeded = true;
+        if let Err(e) = crate::config::save(&cfg) {
+            tracing::warn!("could not save the seeded subagent denylist: {e}");
+            return;
+        }
+    }
+    if changed {
+        crate::lifecycle::engine_restart::schedule(app);
     }
 }

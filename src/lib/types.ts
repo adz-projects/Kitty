@@ -302,6 +302,8 @@ export interface Specialist {
   reasoning_cap_fraction: number | null;
   /** `"per_ref"` splits one call with N refs into N delegates. */
   fan_out: string | null;
+  /** Runs of this specialist allowed at once; null is the global limit only. */
+  max_concurrent: number | null;
   enabled: boolean;
   /** Seeded by the daemon and shared by every app: editable only by saving one
       of the same name (which shadows it for this app), never deletable. */
@@ -323,6 +325,7 @@ export interface SpecialistInput {
   reasoning_cap_tokens: number | null;
   reasoning_cap_fraction: number | null;
   fan_out: string | null;
+  max_concurrent?: number | null;
   enabled: boolean;
 }
 
@@ -353,6 +356,9 @@ export interface SpecialistRun {
   status: string;
   started_at: string | null;
   summary: string | null;
+  /** Where it actually ran (the fallback chain may move it off its pin). */
+  provider_id: string | null;
+  model: string | null;
 }
 
 /** What a session may reach because the user granted it, from

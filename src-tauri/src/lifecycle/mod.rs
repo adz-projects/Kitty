@@ -112,11 +112,6 @@ pub(crate) fn sync_mcp_once_healthy(app: &AppHandle, healthy: bool, port: u16) {
         let app = app.clone();
         tauri::async_runtime::spawn(async move {
             crate::bigtiny::mcp::self_heal_builtin_servers(&app).await;
-            // Once, on the first healthy start: fill the subagent denylist from
-            // the catalog's premium tier so an expensive model is denied before
-            // a bill rather than after one. Deliberately after the daemon is up,
-            // because it needs the provider list this app actually has.
-            crate::commands::seed_subagent_denylist(&app).await;
         });
         return;
     }
