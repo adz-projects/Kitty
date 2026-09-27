@@ -29,35 +29,83 @@ const KEY_CREDENTIAL: &str = "bigtiny-v2-app-key";
 
 /// Resolve Kitty's durable app key, registering once if this is a first run.
 ///
-/// Registration is gated on the handshake's `registration_token`. A `409` means
-/// some previous run already registered and we have lost the key — recoverable
-/// only by revoking the app, so it is reported rather than papered over.
+/// Registration is gated on the handshake's `registration_token`, which only
+/// a process that can read the daemon's data directory has. The same token
+/// authorizes the two recoveries:
+///
+/// * **The key is gone** (the credential store was reset, or Kitty was
+///   reinstalled): registering answers `409` because `kitty` exists, so the
+///   identity is *reclaimed* instead - a fresh key for the same app id, with
+///   every chat and setting it owns kept.
+/// * **The key is no longer accepted** (the daemon's data was reset, or the
+///   key was revoked): the stored key is checked before use, and a rejected
+///   one goes through the same register-or-reclaim path.
 pub async fn ensure_app_key(base_url: &str, registration_token: &str) -> Result<String, String> {
     // A *checked* read: a transient store failure must not be mistaken for
     // "never registered". Collapsing the two would send us to register again
-    // with a key already on file, turning a momentary keystore hiccup into the
-    // 409 dead end below — which reads like data loss and is not.
-    if let Some(existing) = bounded(read_stored_key(), "read").await? {
-        return Ok(existing);
+    // with a key already on file, turning a momentary keystore hiccup into a
+    // pointless reclaim.
+    let stored = bounded(read_stored_key(), "read").await?;
+    let key = obtain_key(base_url, registration_token, stored.clone()).await?;
+    if stored.as_deref() != Some(key.as_str()) {
+        bounded(store_key(&key), "write").await?;
+    }
+    Ok(key)
+}
+
+/// The key-resolution policy, without the credential store: `stored` if the
+/// daemon still accepts it, otherwise a newly registered or reclaimed one.
+async fn obtain_key(
+    base_url: &str,
+    registration_token: &str,
+    stored: Option<String>,
+) -> Result<String, String> {
+    if let Some(existing) = stored {
+        match key_is_accepted(base_url, &existing).await {
+            // Could not tell (a slow daemon, a network blip): keep the key
+            // rather than churn the identity over a transient failure.
+            Some(true) | None => return Ok(existing),
+            Some(false) => {
+                tracing::warn!("the engine no longer accepts Kitty's stored key; recovering it")
+            }
+        }
     }
 
-    let issued = bigtiny2_client::BigTinyClient::register(
-        base_url,
-        registration_token,
-        APP_ID,
-        DISPLAY_NAME,
-    )
-    .await
-    .map_err(|e| {
-        format!(
-            "could not register Kitty with BigTiny: {e}. If Kitty was registered by an \
-             earlier install whose key is gone, revoke the app with \
-             `DELETE /api/apps/kitty` and restart."
-        )
-    })?;
-
-    bounded(store_key(&issued.api_key), "write").await?;
+    use bigtiny2_client::{BigTinyClient, ClientError};
+    let issued = match BigTinyClient::register(base_url, registration_token, APP_ID, DISPLAY_NAME)
+        .await
+    {
+        Ok(issued) => issued,
+        Err(ClientError::AlreadyRegistered(_)) => {
+            tracing::info!("Kitty is registered but its key is lost; reclaiming it");
+            BigTinyClient::reclaim(base_url, registration_token, APP_ID)
+                    .await
+                    .map_err(|e| match e {
+                        ClientError::AppInUse(_) => "Another copy of Kitty is using this                              engine right now. Close it, or wait two minutes and restart Kitty."
+                            .to_string(),
+                        other => format!("could not recover Kitty's engine identity: {other}"),
+                    })?
+        }
+        Err(e) => return Err(format!("could not register Kitty with the engine: {e}")),
+    };
     Ok(issued.api_key)
+}
+
+/// Whether the daemon accepts `key`: `Some(false)` only on an explicit
+/// rejection, `None` when the answer was anything else.
+async fn key_is_accepted(base_url: &str, key: &str) -> Option<bool> {
+    let resp = crate::util::http_client()
+        .get(format!("{base_url}/api/apps/me"))
+        .header("X-API-Key", key)
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+        .ok()?;
+    match resp.status() {
+        s if s.is_success() => Some(true),
+        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => Some(false),
+        _ => None,
+    }
 }
 
 /// How long a single credential-store round trip may take before we give up.
@@ -131,4 +179,77 @@ async fn store_key(key: &str) -> Result<(), String> {
         std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
     }
     std::fs::write(&path, key).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn an_accepted_stored_key_is_kept() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("GET", "/api/apps/me")
+            .match_header("X-API-Key", "old")
+            .with_body(r#"{"id":"kitty"}"#)
+            .create_async()
+            .await;
+        let key = obtain_key(&server.url(), "tok", Some("old".into())).await;
+        assert_eq!(key.as_deref(), Ok("old"));
+    }
+
+    /// The lost-key dead end this used to be: registration says "already
+    /// registered", and the identity is reclaimed instead of failing forever.
+    #[tokio::test]
+    async fn a_lost_key_is_reclaimed() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/api/apps/register")
+            .with_status(409)
+            .create_async()
+            .await;
+        server
+            .mock("POST", "/api/apps/reclaim")
+            .match_header("X-Registration-Token", "tok")
+            .with_body(r#"{"app_id":"kitty","api_key":"fresh"}"#)
+            .create_async()
+            .await;
+        let key = obtain_key(&server.url(), "tok", None).await;
+        assert_eq!(key.as_deref(), Ok("fresh"));
+    }
+
+    /// A stored key the daemon rejects goes through the same recovery.
+    #[tokio::test]
+    async fn a_rejected_stored_key_is_replaced() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("GET", "/api/apps/me")
+            .with_status(401)
+            .create_async()
+            .await;
+        server
+            .mock("POST", "/api/apps/register")
+            .with_body(r#"{"app_id":"kitty","api_key":"new"}"#)
+            .create_async()
+            .await;
+        let key = obtain_key(&server.url(), "tok", Some("stale".into())).await;
+        assert_eq!(key.as_deref(), Ok("new"));
+    }
+
+    #[tokio::test]
+    async fn a_reclaim_refused_while_in_use_says_what_to_do() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/api/apps/register")
+            .with_status(409)
+            .create_async()
+            .await;
+        server
+            .mock("POST", "/api/apps/reclaim")
+            .with_status(409)
+            .create_async()
+            .await;
+        let err = obtain_key(&server.url(), "tok", None).await.unwrap_err();
+        assert!(err.contains("Another copy of Kitty"), "{err}");
+    }
 }

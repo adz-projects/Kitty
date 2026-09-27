@@ -142,6 +142,8 @@ pub fn delete_secret(id: &str) {
     }
 }
 
+// Only the desktop key migration asks.
+#[cfg(not(target_os = "android"))]
 pub fn has_secret(id: &str) -> bool {
     get_secret(id).is_some()
 }

@@ -397,8 +397,33 @@ export interface LogEntry {
 export interface EngineRestartState {
   /** A setting changed and the running daemon no longer matches the config. */
   reload_required: boolean;
-  /** The restart is queued behind an in-flight generation. */
+  /** The restart is waiting: on Kitty's own reply, or on `blocked_by`. */
   restart_pending: boolean;
+  /** Who the engine said is in the way, the last time Kitty asked. */
+  blocked_by: RestartBlocker[];
+}
+
+/** Mirrors `lifecycle::engine_restart::RestartBlocker`. */
+export interface RestartBlocker {
+  app_id: string;
+  display_name: string;
+  /** `attached` (another app is using the engine) or `active_turn`. */
+  reason: string;
+}
+
+/** Mirrors `lifecycle::engine_restart::RestartOutcome`. */
+export interface RestartOutcome {
+  restarted: boolean;
+  blocked_by: RestartBlocker[];
+  /** Whether Kitty started the engine it is now attached to. */
+  spawned_by_us: boolean;
+}
+
+/** Mirrors `commands::window::EngineInfo`. */
+export interface EngineInfo {
+  spawned_by_us: boolean;
+  daemon_version: string | null;
+  can_restart: boolean;
 }
 
 /** One `models://progress` event. Keyed by `download_id` so several
@@ -468,8 +493,7 @@ export interface SetupValidation {
 }
 
 // Serde `rename_all = "snake_case"` on the Rust enum.
-export type StackStatus =
-  'starting' | 'ok' | 'backend_down' | 'local_model_missing' | 'provider_unreachable';
+export type StackStatus = 'starting' | 'ok' | 'backend_down';
 
 export interface StackStatusPayload {
   status: StackStatus;

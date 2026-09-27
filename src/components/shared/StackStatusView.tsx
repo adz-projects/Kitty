@@ -5,6 +5,7 @@
 import { useState } from 'react';
 import { ipc } from '@/lib/ipc';
 import { useChatStore } from '@/stores/chatStore';
+import { useStackStore } from '@/stores/stackStore';
 import type { StackStatus } from '@/lib/types';
 
 interface Copy {
@@ -21,36 +22,20 @@ const COPY: Partial<Record<StackStatus, Copy>> = {
     severity: 'bad',
     canRestartBackend: true,
   },
-  local_model_missing: {
-    title: 'No model downloaded',
-    body: 'Kitty needs a local model to run. Open settings to download one — it takes a minute.',
-    severity: 'bad',
-  },
-  provider_unreachable: {
-    title: 'Provider unreachable',
-    body: 'The active model provider can’t be reached. Check its configuration in settings.',
-    severity: 'bad',
-  },
 };
 
 export function StackStatusView({ status }: { status: StackStatus }) {
   const [busy, setBusy] = useState(false);
   const [restartError, setRestartError] = useState<string | null>(null);
+  const detail = useStackStore((s) => s.detail);
 
   if (status === 'ok' || status === 'starting') return null;
 
   const copy = COPY[status];
   if (!copy) return null;
 
-  // Deep-link "Fix this" to the most relevant settings section. Setup &
-  // Repair merged into Advanced (release-fixes item 21) — it's no longer a
-  // separate tab to land on.
-  const section =
-    status === 'provider_unreachable'
-      ? 'providers'
-      : status === 'local_model_missing'
-        ? 'local_models'
-        : 'advanced';
+  // Setup & Repair merged into Advanced (release-fixes item 21).
+  const section = 'advanced';
 
   return (
     <div className="status-panel" role="alert">
@@ -61,6 +46,11 @@ export function StackStatusView({ status }: { status: StackStatus }) {
       <p className="muted" style={{ margin: 0 }}>
         {copy.body}
       </p>
+      {detail && (
+        <p className="muted" style={{ margin: 0 }}>
+          {detail}
+        </p>
+      )}
       {restartError && (
         <p className="error" style={{ margin: 0 }} role="alert">
           Restart failed: {restartError}
@@ -77,7 +67,12 @@ export function StackStatusView({ status }: { status: StackStatus }) {
               setBusy(true);
               setRestartError(null);
               try {
-                await ipc.restartBackend();
+                const outcome = await ipc.restartBackend();
+                if (!outcome.restarted) {
+                  const who = outcome.blocked_by.map((b) => b.display_name).join(', ');
+                  setRestartError(`the engine is in use by ${who}`);
+                  return;
+                }
                 // Reconnect + rebuild the active session (resume by id).
                 await useChatStore.getState().reloadCurrent();
               } catch (e) {

@@ -40,6 +40,11 @@ impl ManagedProcess {
 }
 
 /// Machine-readable stack status driving the "Fix this" UI (CLAUDE.md rule 6).
+///
+/// Only the engine itself. A missing local model is not a stack failure (the
+/// memory engines are simply off without one, and chat never needs one), and
+/// a provider problem belongs to the chat on that provider, not to the whole
+/// app - so neither is a state here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum StackStatus {
@@ -48,12 +53,6 @@ pub enum StackStatus {
     Starting,
     Ok,
     BackendDown,
-    /// The active setup wants a local model and none is installed. Replaces
-    /// the old `OllamaDown`/`NoModel` pair: with no managed inference process
-    /// there is nothing to be "down", so the only local failure left is a
-    /// missing GGUF — which Settings → Local Models can actually fix.
-    LocalModelMissing,
-    ProviderUnreachable,
 }
 
 /// Transient one-time startup progress, kept separate from `StackStatus`
@@ -82,6 +81,14 @@ pub struct AppState {
     pub config_recovered: Mutex<Option<String>>,
     /// Last computed stack status, so the health loop only emits on change.
     pub stack_status: Mutex<StackStatus>,
+    /// Why the engine could not be reached the last time Kitty tried to start
+    /// or attach to it, for `stack://status`'s `detail`. Cleared on success.
+    pub startup_error: Mutex<Option<String>>,
+    /// Set while Kitty is restarting or re-attaching to the engine, so the
+    /// health loop does not start a second attach alongside it. Desktop
+    /// only: Android's engine lives in the app and is never restarted.
+    #[cfg_attr(target_os = "android", allow(dead_code))]
+    pub restart_in_progress: AtomicBool,
     /// Whether a load-time engine setting changed since the daemon spawned,
     /// and whether applying it is waiting on an in-flight generation
     /// (docs/ANDROID.md §6.4). See `lifecycle::engine_restart`.
@@ -226,6 +233,8 @@ impl AppState {
             config: Mutex::new(config),
             config_recovered: Mutex::new(config_recovered),
             stack_status: Mutex::new(StackStatus::default()),
+            startup_error: Mutex::new(None),
+            restart_in_progress: AtomicBool::new(false),
             engine_restart: Mutex::new(Default::default()),
             startup_phase: Mutex::new(StartupPhase::default()),
             active_session: Mutex::new(None),
@@ -264,4 +273,15 @@ pub struct DaemonHandle {
     /// window — but it does mean callers must not assume `/api/mcp/servers`
     /// is reachable yet. See `lifecycle::sync_mcp_once_healthy`.
     pub healthy: bool,
+    /// Whether this Kitty process started the daemon. When it did not,
+    /// another app did, and the daemon runs with that app's engine settings
+    /// until it next restarts (see `lifecycle::bigtiny_v2`).
+    pub spawned_by_us: bool,
+    /// The daemon process's identity from its handshake. A different id
+    /// behind the same port means the daemon was replaced. Read by the
+    /// desktop restart, which waits for this instance to go.
+    #[cfg_attr(target_os = "android", allow(dead_code))]
+    pub instance_id: Option<String>,
+    /// The daemon's own version, from its handshake.
+    pub daemon_version: Option<String>,
 }

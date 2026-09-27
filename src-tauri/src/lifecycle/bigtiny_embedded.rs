@@ -169,5 +169,9 @@ pub async fn start(
         // What `bigtiny::client` sends as `X-API-Key` on every request.
         secret_key: Some(app_key),
         healthy,
+        // In this process, so ours by construction.
+        spawned_by_us: true,
+        instance_id: None,
+        daemon_version: None,
     })
 }

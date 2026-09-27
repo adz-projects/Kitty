@@ -17,7 +17,7 @@ vi.mock('@/lib/ipc', () => ({
 
 beforeEach(() => {
   vi.resetModules();
-  getStackStatus.mockReset().mockResolvedValue('ok');
+  getStackStatus.mockReset().mockResolvedValue({ status: 'ok', detail: null });
   getStartupPhase.mockReset().mockResolvedValue('ready');
   onStackStatus.mockReset().mockResolvedValue(() => {});
   onStartupPhase.mockReset().mockResolvedValue(() => {});
@@ -61,9 +61,9 @@ describe('stackStore.init', () => {
       status: string;
       detail: string | null;
     }) => void;
-    handler({ status: 'local_model_missing', detail: 'not running' });
+    handler({ status: 'backend_down', detail: 'not running' });
 
-    expect(useStackStore.getState().status).toBe('local_model_missing');
+    expect(useStackStore.getState().status).toBe('backend_down');
     expect(useStackStore.getState().detail).toBe('not running');
   });
 

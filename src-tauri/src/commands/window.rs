@@ -2,13 +2,10 @@
 //! stack status, and the BigTiny restart used by "Fix this" + provider switches.
 
 use tauri::AppHandle;
-#[cfg(not(target_os = "android"))]
-use tauri::Manager;
 
-#[cfg(not(target_os = "android"))]
 use crate::lifecycle;
 use crate::state::AppState;
-use crate::state::{StackStatus, StartupPhase};
+use crate::state::StartupPhase;
 use crate::windows;
 
 /// Hide the overlay (Escape handler in the overlay UI calls this).
@@ -93,8 +90,30 @@ pub fn window_ready(window: tauri::Window, state: tauri::State<'_, AppState>) {
 
 /// Current stack status (frontend also listens to `stack://status`).
 #[tauri::command]
-pub fn get_stack_status(state: tauri::State<'_, AppState>) -> Result<StackStatus, String> {
-    Ok(*state.stack_status.lock().unwrap())
+pub fn get_stack_status(app: tauri::AppHandle) -> Result<lifecycle::StackStatusPayload, String> {
+    Ok(lifecycle::current_payload(&app))
+}
+
+/// What Kitty knows about the engine it is attached to, for Settings.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EngineInfo {
+    /// Whether this Kitty started the engine. When another app did, the
+    /// engine runs with that app's engine settings until it next restarts.
+    pub spawned_by_us: bool,
+    pub daemon_version: Option<String>,
+    /// Whether "Restart engine" exists on this platform (not on Android,
+    /// where the engine lives inside the app).
+    pub can_restart: bool,
+}
+
+#[tauri::command]
+pub fn get_engine_info(state: tauri::State<'_, AppState>) -> Result<EngineInfo, String> {
+    let handle = state.bigtiny.lock().unwrap();
+    Ok(EngineInfo {
+        spawned_by_us: handle.spawned_by_us,
+        daemon_version: handle.daemon_version.clone(),
+        can_restart: !cfg!(target_os = "android"),
+    })
 }
 
 /// Whether a load-time engine setting is waiting on a daemon restart
@@ -115,75 +134,29 @@ pub fn get_startup_phase(state: tauri::State<'_, AppState>) -> Result<StartupPha
     Ok(*state.startup_phase.lock().unwrap())
 }
 
-/// Restart the BigTiny daemon (kills our owned process, respawns, re-syncs
-/// the active provider registration). "Fix this" and the degraded-state
-/// panel call this; `activate_provider` used to call it after switching, but
-/// BigTiny switches providers live over REST instead.
+/// Restart the engine so changed engine settings take effect.
 ///
-/// Android: the daemon is hosted **in-process** (`lifecycle::bigtiny_embedded`)
-/// and that host carries no restart handle — there is no child to kill, no
-/// `exec()`able exe (Android 10+ refuses to execute anything in app-writable
-/// storage), and the daemon's lifetime is the app's own. A setting that
-/// reaches here has already been persisted, so it applies on next launch.
-/// Returning `Ok` — rather than an exec-unsupported error — keeps
-/// `set_adaptive_pathway_enabled` from failing *after* persisting its toggle,
-/// and keeps `engine_restart` from re-arming `reload_required` into an
-/// endless doomed respawn loop.
+/// Asks the daemon to exit, waits for it, and attaches again (which starts a
+/// fresh one with the current settings). The daemon refuses while another
+/// app is attached or any turn is running, and the answer names them; the
+/// same state goes out on `engine://restart-state` for the banner. `force`
+/// ("Restart anyway") overrides only the attached-apps check. See
+/// `lifecycle::engine_restart`.
+///
+/// Android: the engine lives inside the app and cannot be restarted on its
+/// own; engine settings apply the next time Kitty starts.
 #[tauri::command]
-pub async fn restart_backend(app: AppHandle) -> Result<(), String> {
+pub async fn restart_backend(
+    app: AppHandle,
+    force: Option<bool>,
+) -> Result<lifecycle::engine_restart::RestartOutcome, String> {
     #[cfg(target_os = "android")]
     {
-        let _ = &app;
-        tracing::info!(
-            "restart_backend on Android: the daemon is hosted in-process and cannot be \
-             restarted; the change applies on next launch"
-        );
-        Ok(())
+        let _ = (&app, force);
+        Err("Engine settings apply the next time Kitty starts.".to_string())
     }
     #[cfg(not(target_os = "android"))]
     {
-        // Take the old process out of the daemon handle so we can drop the
-        // `bigtiny` Mutex before killing — `kill_if_owned` blocks on
-        // `child.wait()`, and holding the lock across that would stall every
-        // other BigTiny client call. Run the wait off the async worker too.
-        let old_proc = {
-            let state = app.state::<AppState>();
-            let mut handle = state.bigtiny.lock().unwrap();
-            std::mem::take(&mut handle.process)
-        };
-        tokio::task::spawn_blocking(move || {
-            let mut proc = old_proc;
-            proc.kill_if_owned();
-        })
-        .await
-        .map_err(|e| format!("backend kill task panicked: {e}"))?;
-        let snap = {
-            let state = app.state::<AppState>();
-            let cfg = state.config.lock().unwrap();
-            lifecycle::bigtiny_env::SpawnSnapshot::from_config(&cfg)
-        };
-        // Same bundled-LiteRT resolution as `lifecycle::start_stack` — see
-        // `bigtiny_env::locate_litert_resources`'s doc comment.
-        let (tokenizer_path, litert_lib_dir) =
-            lifecycle::bigtiny_env::locate_litert_resources(&app);
-        // Re-locate rather than re-spawn: if a daemon is already up (ours or
-        // another app's), this attaches to it.
-        let handle =
-            lifecycle::bigtiny_v2::locate(&snap, &tokenizer_path, Some(litert_lib_dir.as_str()))
-        .await?;
-        let (healthy, port) = (handle.healthy, handle.port);
-        {
-            let state = app.state::<AppState>();
-            *state.bigtiny.lock().unwrap() = handle;
-        }
-        if let Err(e) = crate::bigtiny::providers::sync_active_provider(&app).await {
-            tracing::warn!("bigtiny provider sync after restart failed: {e}");
-        }
-        // See `lifecycle::sync_mcp_once_healthy`: don't give up on the MCP sync
-        // after one failed call if the daemon is just slow to finish binding.
-        if let Some(port) = port {
-            lifecycle::sync_mcp_once_healthy(&app, healthy, port);
-        }
-        Ok(())
+        lifecycle::engine_restart::restart_now(&app, force.unwrap_or(false)).await
     }
 }

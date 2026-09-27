@@ -61,8 +61,8 @@ export const useStackStore = create<StackState>((set) => ({
       setTimeout(() => set({ graceElapsed: true }), GRACE_MS);
     }
     try {
-      const status = await ipc.getStackStatus();
-      set({ status, ...(status === 'ok' ? { everConnected: true } : null) });
+      const { status, detail } = await ipc.getStackStatus();
+      set({ status, detail, ...(status === 'ok' ? { everConnected: true } : null) });
     } catch {
       // Backend not ready yet; the health loop event will update us.
     }

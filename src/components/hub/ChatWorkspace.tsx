@@ -19,7 +19,7 @@ import { ExportIcon } from '@/components/icons/ExportIcon';
 import { MenuIcon } from '@/components/icons/MenuIcon';
 import type { StackStatus } from '@/lib/types';
 
-const DEGRADED: StackStatus[] = ['backend_down', 'local_model_missing', 'provider_unreachable'];
+const DEGRADED: StackStatus[] = ['backend_down'];
 
 /** Full window: history sidebar + shared chat surface + artifacts pane. On open
     it adopts the session handed over from the overlay (Expand). */

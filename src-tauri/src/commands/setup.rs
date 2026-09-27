@@ -68,12 +68,6 @@ pub async fn validate_setup(app: AppHandle) -> Result<SetupValidation, String> {
         StackStatus::Ok => {}
         StackStatus::Starting => issues.push("Still starting up — try again in a moment.".into()),
         StackStatus::BackendDown => issues.push("Kitty's engine isn't running yet.".into()),
-        StackStatus::LocalModelMissing => {
-            issues.push("No local model is downloaded yet.".into())
-        }
-        StackStatus::ProviderUnreachable => {
-            issues.push("Can't reach the active provider right now.".into())
-        }
     }
 
     // The pathway engine runs in-process inside BigTiny now — there's no

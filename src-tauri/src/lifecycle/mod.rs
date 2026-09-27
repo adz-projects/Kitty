@@ -31,8 +31,8 @@ pub mod engine_restart;
 mod health;
 pub mod scheduler;
 
-pub(crate) use health::compute_status;
-pub use health::spawn_health_loop;
+pub(crate) use health::{compute_status, current_payload};
+pub use health::{spawn_health_loop, StackStatusPayload};
 
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -90,37 +90,6 @@ fn set_startup_phase(app: &AppHandle, phase: StartupPhase) {
         if let Err(e) = app.emit("stack://startup-phase", StartupPhasePayload { phase }) {
             tracing::warn!("emit stack://startup-phase failed: {e}");
         }
-    }
-}
-
-/// Whether the current config needs a local GGUF on disk: either the active
-/// *chat* setup is local, adaptive-pathway is enabled (its embeddings run on
-/// the in-process engine regardless of which provider serves chat — an
-/// API-key chat user still needs an embedding model), or the summarizer is
-/// enabled (likewise local, independent of the main chat provider).
-///
-/// Successor to `stack_needs_ollama`. The policy is unchanged — what changed
-/// is that "needs it" no longer implies spawning anything, only that a model
-/// file has to exist. Kept as a pure function so it stays unit testable
-/// without `start_stack`'s async runtime.
-pub(crate) fn stack_needs_local_model(cfg: &crate::config::Config) -> bool {
-    requires_local_chat_model(cfg) || cfg.adaptive_pathway_enabled || cfg.summarizer.enabled
-}
-
-/// True when chat itself runs locally: no provider is active yet (fresh
-/// install, which defaults to local), or the active profile is a local one.
-///
-/// A profile pointed at an Ollama server the *user* runs is remote as far as
-/// Kitty is concerned — it needs no model of ours — so `"ollama"` counts as
-/// remote here even though it didn't under managed Ollama.
-fn requires_local_chat_model(cfg: &crate::config::Config) -> bool {
-    match cfg
-        .active_provider_id
-        .as_ref()
-        .and_then(|id| cfg.providers.iter().find(|p| &p.id == id))
-    {
-        Some(p) => p.provider_type == "local",
-        None => true,
     }
 }
 
@@ -272,26 +241,16 @@ pub fn start_stack(app: &AppHandle) {
             bigtiny_v2::locate(&snap, &tokenizer_path, Some(litert_lib_dir.as_str())).await;
         match spawn_result {
             Ok(handle) => {
-                let (healthy, port) = (handle.healthy, handle.port);
-                let state = app.state::<AppState>();
-                *state.bigtiny.lock().unwrap() = handle;
-                tracing::info!("bigtiny started (health probe answered: {healthy})");
-                // Register the active provider so the very first send has
-                // a healthy provider to route to.
-                if let Err(e) = crate::bigtiny::providers::sync_active_provider(&app).await {
-                    tracing::warn!("bigtiny provider sync failed: {e}");
-                }
-                // Self-heal the bundled plugins' MCP-server registrations
-                // (command path across an update/reinstall, enabled state
-                // matching Settings) — deferred to the background if the
-                // daemon's own startup probe hasn't succeeded yet, so a slow
-                // (but eventually successful) boot doesn't give up on the
-                // sync after one failed `list_servers` call.
-                if let Some(port) = port {
-                    sync_mcp_once_healthy(&app, healthy, port);
-                }
+                tracing::info!(
+                    "bigtiny started (health probe answered: {})",
+                    handle.healthy
+                );
+                install_handle(&app, handle).await;
             }
-            Err(e) => tracing::warn!("bigtiny spawn failed: {e}"),
+            Err(e) => {
+                tracing::warn!("bigtiny spawn failed: {e}");
+                *app.state::<AppState>().startup_error.lock().unwrap() = Some(e);
+            }
         }
 
         // Report whether the pathway engine's embedding GGUF is on disk, so
@@ -321,6 +280,82 @@ pub fn start_stack(app: &AppHandle) {
     });
 }
 
+/// Make `handle` the daemon Kitty talks to, and bring it up to date with
+/// what Kitty expects to find there.
+///
+/// The one path every attach goes through - first start, a restart, and the
+/// health loop finding the engine again after a crash - so a daemon Kitty
+/// re-attaches to is set up exactly like one it started with.
+pub(crate) async fn install_handle(app: &AppHandle, handle: crate::state::DaemonHandle) {
+    let (healthy, port) = (handle.healthy, handle.port);
+    {
+        let state = app.state::<AppState>();
+        *state.bigtiny.lock().unwrap() = handle;
+        *state.startup_error.lock().unwrap() = None;
+    }
+    // Register the providers so the very first send has one to route to.
+    if let Err(e) = crate::bigtiny::providers::sync_active_provider(app).await {
+        tracing::warn!("bigtiny provider sync failed: {e}");
+    }
+    // Self-heal the bundled plugins' MCP-server registrations (command path
+    // across an update/reinstall, enabled state matching Settings) —
+    // deferred to the background if the daemon's own startup probe hasn't
+    // succeeded yet, so a slow (but eventually successful) boot doesn't give
+    // up on the sync after one failed `list_servers` call.
+    if let Some(port) = port {
+        sync_mcp_once_healthy(app, healthy, port);
+    }
+}
+
+/// Find the engine again (desktop): attach to the daemon that is up now, or
+/// start one if none is. Records why on failure, for the status detail.
+#[cfg(not(target_os = "android"))]
+pub(crate) async fn attach_daemon(app: &AppHandle) -> Result<(), String> {
+    let snap = {
+        let state = app.state::<AppState>();
+        let cfg = state.config.lock().unwrap();
+        crate::lifecycle::bigtiny_env::SpawnSnapshot::from_config(&cfg)
+    };
+    let (tokenizer_path, litert_lib_dir) =
+        crate::lifecycle::bigtiny_env::locate_litert_resources(app);
+    match bigtiny_v2::locate(&snap, &tokenizer_path, Some(litert_lib_dir.as_str())).await {
+        Ok(handle) => {
+            install_handle(app, handle).await;
+            Ok(())
+        }
+        Err(e) => {
+            *app.state::<AppState>().startup_error.lock().unwrap() = Some(e.clone());
+            Err(e)
+        }
+    }
+}
+
+/// The health loop's recovery path: [`attach_daemon`], unless a restart or
+/// another re-attach is already doing it.
+#[cfg(not(target_os = "android"))]
+pub(crate) async fn reattach(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    if state
+        .restart_in_progress
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        )
+        .is_err()
+    {
+        return;
+    }
+    tracing::info!("the engine is not answering; looking for it again");
+    if let Err(e) = attach_daemon(app).await {
+        tracing::warn!("re-attaching to the engine failed: {e}");
+    }
+    state
+        .restart_in_progress
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
 /// Kill child processes we spawned. Called on app exit.
 ///
 /// Note: this only runs on a *graceful* exit (Tauri's `RunEvent::Exit`, wired
@@ -344,102 +379,4 @@ pub fn shutdown(app: &AppHandle) {
     bigtiny.process.kill_if_owned();
     drop(bigtiny);
     tracing::info!("stack shut down");
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{requires_local_chat_model, stack_needs_local_model};
-    use crate::config::providers::ProviderProfile;
-    use crate::config::Config;
-
-    /// A config with one active provider of `provider_type`. Every other
-    /// field is an unconfigured default — `ProviderProfile` has no `Default`,
-    /// and inlining this literal four times was most of the old test module.
-    fn cfg_with_active(provider_type: &str) -> Config {
-        let mut cfg = Config::default();
-        cfg.providers.push(ProviderProfile {
-            id: "p1".into(),
-            name: "test".into(),
-            provider_type: provider_type.into(),
-            subagent_role: None,
-            base_url: "https://example.invalid".into(),
-            models: vec!["some-model".into()],
-            is_trusted: true,
-            temperature: None,
-            top_p: None,
-            top_k: None,
-            min_p: None,
-            presence_penalty: None,
-            frequency_penalty: None,
-            max_tokens: None,
-            context_length: None,
-            supports_vision: false,
-            system_prompt: None,
-            prompt_idle_timeout_secs: None,
-            parallel_slots: None,
-            created_at: "2026-01-01T00:00:00Z".into(),
-        });
-        cfg.active_provider_id = Some("p1".into());
-        cfg.adaptive_pathway_enabled = false;
-        cfg.summarizer.enabled = false;
-        cfg
-    }
-
-    /// The policy that survived retiring managed Ollama: an API-key chat user
-    /// still needs a local model, because adaptive-pathway's embeddings run
-    /// locally no matter who serves chat. This was the most load-bearing of
-    /// the original four assertions and it is unchanged in substance — only
-    /// what "needs it" implies changed (a file on disk, not a process).
-    #[test]
-    fn a_local_model_is_needed_for_pathway_even_with_an_api_key_provider() {
-        let mut cfg = cfg_with_active("anthropic");
-        cfg.adaptive_pathway_enabled = true;
-        assert!(!requires_local_chat_model(&cfg));
-        assert!(stack_needs_local_model(&cfg));
-    }
-
-    /// Same shape for the summarizer, which is also local regardless of the
-    /// chat provider.
-    #[test]
-    fn a_local_model_is_needed_for_the_summarizer_even_with_an_api_key_provider() {
-        let mut cfg = cfg_with_active("anthropic");
-        cfg.summarizer.enabled = true;
-        assert!(!requires_local_chat_model(&cfg));
-        assert!(stack_needs_local_model(&cfg));
-    }
-
-    #[test]
-    fn no_local_model_is_needed_for_a_pure_api_key_setup() {
-        let cfg = cfg_with_active("anthropic");
-        assert!(!stack_needs_local_model(&cfg));
-    }
-
-    /// A fresh install has no active provider and defaults to local.
-    #[test]
-    fn a_fresh_install_needs_a_local_model() {
-        let cfg = Config {
-            adaptive_pathway_enabled: false,
-            ..Config::default()
-        };
-        assert!(requires_local_chat_model(&cfg));
-        assert!(stack_needs_local_model(&cfg));
-    }
-
-    #[test]
-    fn a_local_chat_provider_needs_a_local_model() {
-        let cfg = cfg_with_active("local");
-        assert!(requires_local_chat_model(&cfg));
-        assert!(stack_needs_local_model(&cfg));
-    }
-
-    /// **Changed behaviour, deliberately.** Under managed Ollama an `ollama`
-    /// profile meant "the server we run for you", so it required a local
-    /// model. It now means "a server you run yourself" — remote as far as
-    /// Kitty is concerned, needing nothing of ours on disk.
-    #[test]
-    fn an_ollama_profile_is_now_treated_as_remote() {
-        let cfg = cfg_with_active("ollama");
-        assert!(!requires_local_chat_model(&cfg));
-        assert!(!stack_needs_local_model(&cfg));
-    }
 }

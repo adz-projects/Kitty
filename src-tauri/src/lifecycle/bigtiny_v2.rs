@@ -109,5 +109,8 @@ pub async fn locate(
         secret_key: Some(key),
         // `attach_or_spawn` only returns once `/api/health` has answered.
         healthy: true,
+        spawned_by_us: located.spawned_by_us,
+        instance_id: Some(located.handshake.instance_id.clone()),
+        daemon_version: Some(located.handshake.daemon_version.clone()),
     })
 }

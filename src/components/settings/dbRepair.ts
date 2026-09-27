@@ -15,7 +15,14 @@ export const DB_REPAIR_CONFIRM =
 export async function runDbRepair(recover: () => Promise<DbRecoverReport>): Promise<string> {
   let r = await recover();
   if (r.restart_required) {
-    await ipc.restartBackend();
+    const outcome = await ipc.restartBackend();
+    if (!outcome.restarted) {
+      const who = outcome.blocked_by.map((b) => b.display_name).join(', ');
+      return (
+        `The database needs the engine to restart before it can be rebuilt, ` +
+        `but the engine is in use by ${who}. Try again once it is free.`
+      );
+    }
     r = await recover();
   }
 

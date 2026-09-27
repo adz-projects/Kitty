@@ -119,5 +119,6 @@ pub async fn set_memorabilia_enabled(app: AppHandle, enabled: bool) -> Result<()
         cfg.memorabilia_enabled = enabled;
         config::save(&cfg).map_err(|e| e.to_string())?;
     }
-    crate::commands::restart_backend(app).await
+    crate::lifecycle::engine_restart::schedule(&app);
+    Ok(())
 }

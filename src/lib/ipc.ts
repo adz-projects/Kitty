@@ -41,13 +41,14 @@ import type {
   ProviderView,
   DownloadProgress,
   EngineRestartState,
+  EngineInfo,
+  RestartOutcome,
   Schedule,
   ScheduledTask,
   SessionInfo,
   ProviderActivatedPayload,
   SessionTitleEvent,
   SetupValidation,
-  StackStatus,
   StackStatusPayload,
   StartupPhase,
   StartupPhasePayload,
@@ -91,9 +92,11 @@ export const ipc = {
   reportScreenshotSelection: (x: number, y: number, width: number, height: number) =>
     invoke<void>('report_screenshot_selection', { x, y, width, height }),
   cancelScreenshotSelection: () => invoke<void>('cancel_screenshot_selection'),
-  getStackStatus: () => invoke<StackStatus>('get_stack_status'),
+  getStackStatus: () => invoke<StackStatusPayload>('get_stack_status'),
   getStartupPhase: () => invoke<StartupPhase>('get_startup_phase'),
-  restartBackend: () => invoke<void>('restart_backend'),
+  /** `force` ("Restart anyway") overrides only the other-apps check. */
+  restartBackend: (force = false) => invoke<RestartOutcome>('restart_backend', { force }),
+  getEngineInfo: () => invoke<EngineInfo>('get_engine_info'),
   newSession: (cwd?: string) => invoke<SessionInfo>('new_session', { cwd: cwd ?? null }),
   /** Tells Rust which window is now showing `sessionId` — lets a
       notification for that session later focus this specific window

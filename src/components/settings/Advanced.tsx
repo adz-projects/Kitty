@@ -264,7 +264,15 @@ export function Advanced() {
             <div className="row">
               <button
                 onClick={() =>
-                  void runRepairAction('Restarting Kitty engine', () => ipc.restartBackend())
+                  void runRepairAction('Restarting Kitty engine', async () => {
+                    const outcome = await ipc.restartBackend();
+                    if (!outcome.restarted) {
+                      const who = outcome.blocked_by.map((b) => b.display_name).join(', ');
+                      throw new Error(
+                        `The engine is in use by ${who}; it restarts once they are done.`
+                      );
+                    }
+                  })
                 }
               >
                 Restart backend now
@@ -280,13 +288,10 @@ export function Advanced() {
               className="primary"
               onClick={() => {
                 void (async () => {
-                  // Every setting on this page needs a backend restart to
-                  // take effect anyway (see the notes throughout) — folding
-                  // it into Save means there's one action to remember instead
-                  // of two, while "Restart backend now" above stays for a
-                  // restart-with-no-changes case.
+                  // Saving an engine setting schedules the restart itself
+                  // (`engine_restart::schedule`), queued if the engine is
+                  // busy; a second request here would only collide with it.
                   await save();
-                  await ipc.restartBackend();
                 })();
               }}
             >

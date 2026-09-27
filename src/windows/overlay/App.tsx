@@ -12,7 +12,7 @@ import { DoubleChevronIcon } from '@/components/icons/DoubleChevronIcon';
 import { SettingsGearIcon } from '@/components/icons/SettingsGearIcon';
 import type { StackStatus } from '@/lib/types';
 
-const DEGRADED: StackStatus[] = ['backend_down', 'local_model_missing', 'provider_unreachable'];
+const DEGRADED: StackStatus[] = ['backend_down'];
 
 export function App() {
   const status = useStackStore((s) => s.status);

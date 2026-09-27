@@ -121,5 +121,6 @@ pub async fn set_adaptive_pathway_enabled(app: AppHandle, enabled: bool) -> Resu
         cfg.adaptive_pathway_enabled = enabled;
         config::save(&cfg).map_err(|e| e.to_string())?;
     }
-    crate::commands::restart_backend(app).await
+    crate::lifecycle::engine_restart::schedule(&app);
+    Ok(())
 }

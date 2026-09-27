@@ -11,6 +11,12 @@ use tauri::{AppHandle, Emitter, Manager};
 use super::embedding::{refresh_embedding_status, set_embedding_status, EmbeddingModelStatus};
 use crate::state::{AppState, StackStatus};
 
+/// How often a down engine is re-attached to (desktop). Long enough that a
+/// daemon still coming back from a restart is not raced, short enough that a
+/// crash is recovered from without the user doing anything.
+#[cfg(not(target_os = "android"))]
+const REATTACH_INTERVAL: Duration = Duration::from_secs(30);
+
 /// Payload for the `stack://status` event.
 #[derive(Debug, Clone, Serialize)]
 pub struct StackStatusPayload {
@@ -31,6 +37,11 @@ pub fn spawn_health_loop(app: AppHandle) {
         // `Ok` stays immediate; only degradation needs the extra
         // confirmation tick. See `debounce_status`.
         let mut degraded_streak: u32 = 0;
+        // What was last published, detail included: a changed reason for the
+        // same `BackendDown` is news to the user too.
+        let mut published: Option<(StackStatus, Option<String>)> = None;
+        #[cfg(not(target_os = "android"))]
+        let mut last_reattach: Option<std::time::Instant> = None;
         // ~30s cadence (every 6th 5s tick): catches the pathway embedding
         // model being deleted out-of-band.
         let mut tick: u64 = 0;
@@ -88,32 +99,52 @@ pub fn spawn_health_loop(app: AppHandle) {
                     }
                 }
             }
+            // A restart another app was holding up: ask again about once a
+            // minute, so it goes through once they have let go.
+            if tick > 0 && tick % 12 == 0 {
+                let pending = super::engine_restart::current(&app);
+                if pending.restart_pending && !pending.blocked_by.is_empty() {
+                    super::engine_restart::apply_if_pending(&app);
+                }
+            }
             tick = tick.wrapping_add(1);
             let computed = compute_status(&app, &client).await;
+
+            // A daemon that crashed, was restarted by another app, or moved
+            // to another port is found again here, without the user having
+            // to press anything. `attach_daemon` attaches if a daemon is up
+            // and spawns one if not.
+            #[cfg(not(target_os = "android"))]
+            if computed == StackStatus::BackendDown
+                && reattach_due(&app, last_reattach.map(|t| t.elapsed()))
+            {
+                last_reattach = Some(std::time::Instant::now());
+                let app2 = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    super::reattach(&app2).await;
+                });
+            }
+
             let Some(status) = debounce_status(&mut degraded_streak, computed) else {
                 continue;
             };
-            let changed = {
-                let state = app.state::<AppState>();
-                let mut cur = state.stack_status.lock().unwrap();
-                if *cur != status {
-                    *cur = status;
-                    true
-                } else {
-                    false
-                }
-            };
-            if changed {
-                let payload = StackStatusPayload {
-                    status,
-                    detail: None,
-                };
+            let detail = status_detail(&app, status);
+            let previous_status = published.as_ref().map(|(s, _)| *s);
+            if published.as_ref() == Some(&(status, detail.clone())) {
+                continue;
+            }
+            published = Some((status, detail.clone()));
+            *app.state::<AppState>().stack_status.lock().unwrap() = status;
+            {
+                let payload = StackStatusPayload { status, detail };
                 if let Err(e) = app.emit("stack://status", payload) {
                     tracing::warn!("emit stack://status failed: {e}");
                 }
                 tracing::info!("stack status -> {status:?}");
                 // Notify on entering a degraded state while the overlay is hidden.
-                if !matches!(status, StackStatus::Ok | StackStatus::Starting) {
+                if previous_status != Some(status)
+                    && !matches!(status, StackStatus::Ok | StackStatus::Starting)
+                {
                     crate::notifications::notify_if_hidden(
                         &app,
                         crate::notifications::Event::StackDegraded,
@@ -127,36 +158,57 @@ pub fn spawn_health_loop(app: AppHandle) {
     });
 }
 
-pub(crate) async fn compute_status(app: &AppHandle, client: &reqwest::Client) -> StackStatus {
-    let (needs_local_model, bigtiny_port) = {
-        let state = app.state::<AppState>();
-        let cfg = state.config.lock().unwrap();
-        let bigtiny_port = state.bigtiny.lock().unwrap().port;
-        (super::stack_needs_local_model(&cfg), bigtiny_port)
-    };
+/// The current payload, for a window that asks rather than waits for the
+/// next change.
+pub(crate) fn current_payload(app: &AppHandle) -> StackStatusPayload {
+    let status = *app.state::<AppState>().stack_status.lock().unwrap();
+    StackStatusPayload {
+        status,
+        detail: status_detail(app, status),
+    }
+}
 
-    // `/api/health` is a real protocol-level probe (the daemon answering, not
-    // just a bound TCP listener). Checked first: without the backend, whether
-    // a model file exists is moot.
-    match bigtiny_port {
-        Some(port) if super::bigtiny_proc::probe_health(client, port).await => {}
-        _ => return StackStatus::BackendDown,
+/// Why the engine is down, when Kitty knows: the last start/attach error.
+fn status_detail(app: &AppHandle, status: StackStatus) -> Option<String> {
+    if status != StackStatus::BackendDown {
+        return None;
     }
-    // Only applies when the active setup actually needs a local model — a
-    // remote/API-key provider shouldn't misreport as broken just because no
-    // GGUF has been downloaded.
-    if needs_local_model && crate::models::installed().is_empty() {
-        return StackStatus::LocalModelMissing;
+    app.state::<AppState>()
+        .startup_error
+        .lock()
+        .unwrap()
+        .clone()
+}
+
+/// Whether the health loop should try to find the engine again now.
+///
+/// Not during the startup sequence (which is attaching already) or a restart
+/// Kitty itself is running, and not more often than [`REATTACH_INTERVAL`].
+#[cfg(not(target_os = "android"))]
+fn reattach_due(app: &AppHandle, since_last: Option<Duration>) -> bool {
+    let state = app.state::<AppState>();
+    let started = *state.startup_phase.lock().unwrap() == crate::state::StartupPhase::Ready;
+    let busy = state
+        .restart_in_progress
+        .load(std::sync::atomic::Ordering::SeqCst);
+    started && !busy && since_last.map_or(true, |d| d >= REATTACH_INTERVAL)
+}
+
+/// Whether the engine answers. `/api/health` is a real protocol-level probe
+/// (the daemon answering, not just a bound TCP listener).
+pub(crate) async fn compute_status(app: &AppHandle, client: &reqwest::Client) -> StackStatus {
+    let port = app.state::<AppState>().bigtiny.lock().unwrap().port;
+    match port {
+        Some(port) if super::bigtiny_proc::probe_health(client, port).await => StackStatus::Ok,
+        _ => StackStatus::BackendDown,
     }
-    StackStatus::Ok
 }
 
 /// Debounce gate for the health loop: publish a degradation only after two
 /// *consecutive* non-Ok readings — of any flavor. The old rule required the
 /// *identical* degraded status twice in a row, so a stack flapping between
-/// two different degradations (e.g. `BackendDown` ↔ `LocalModelMissing`)
-/// never published anything at all. Recovering to `Ok` publishes immediately
-/// and resets the streak.
+/// two different degradations never published anything at all. Recovering to
+/// `Ok` publishes immediately and resets the streak.
 fn debounce_status(non_ok_streak: &mut u32, computed: StackStatus) -> Option<StackStatus> {
     if computed == StackStatus::Ok {
         *non_ok_streak = 0;
@@ -210,14 +262,14 @@ mod tests {
     }
 
     /// Regression (815bugs #17): the old identical-twice rule never published
-    /// a stack flapping between two *different* degraded states.
+    /// a stack flapping between two *different* non-ok states.
     #[test]
     fn debounce_publishes_on_the_second_consecutive_non_ok_even_when_it_differs() {
         let mut streak = 0;
-        assert_eq!(debounce_status(&mut streak, StackStatus::BackendDown), None);
+        assert_eq!(debounce_status(&mut streak, StackStatus::Starting), None);
         assert_eq!(
-            debounce_status(&mut streak, StackStatus::LocalModelMissing),
-            Some(StackStatus::LocalModelMissing)
+            debounce_status(&mut streak, StackStatus::BackendDown),
+            Some(StackStatus::BackendDown)
         );
         assert_eq!(streak, 0, "the streak resets once published");
     }
