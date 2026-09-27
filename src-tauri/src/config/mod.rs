@@ -9,6 +9,7 @@ pub mod scheduled_tasks;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
@@ -1083,12 +1084,89 @@ pub fn save(config: &Config) -> Result<(), ConfigError> {
     let tmp = path.with_extension("json.tmp");
     fs::write(&tmp, text)?;
     fs::rename(&tmp, &path)?;
+    if let Some(notify) = ON_SAVED.get() {
+        notify();
+    }
     Ok(())
+}
+
+/// Run after every successful [`save`] (#73). The app wires it to emit
+/// `config://changed`, so every window re-reads config whichever command
+/// wrote it - a Settings page holding an old snapshot is what used to revert
+/// changes made meanwhile.
+static ON_SAVED: OnceLock<Box<dyn Fn() + Send + Sync>> = OnceLock::new();
+
+pub fn on_saved(notify: impl Fn() + Send + Sync + 'static) {
+    let _ = ON_SAVED.set(Box::new(notify));
+}
+
+/// RFC 7396 JSON merge patch: objects merge key by key, `null` removes a key
+/// (so the field falls back to its default), anything else replaces.
+pub fn merge_patch(target: &mut serde_json::Value, patch: &serde_json::Value) {
+    let serde_json::Value::Object(patch) = patch else {
+        *target = patch.clone();
+        return;
+    };
+    if !target.is_object() {
+        *target = serde_json::Value::Object(Default::default());
+    }
+    let Some(target) = target.as_object_mut() else {
+        return;
+    };
+    for (key, value) in patch {
+        if value.is_null() {
+            target.remove(key);
+        } else {
+            merge_patch(
+                target.entry(key.clone()).or_insert(serde_json::Value::Null),
+                value,
+            );
+        }
+    }
+}
+
+/// `config` with `patch` merged in. Fails when the result is not a config.
+pub fn patched(config: &Config, patch: &serde_json::Value) -> Result<Config, String> {
+    let mut value = serde_json::to_value(config).map_err(|e| e.to_string())?;
+    merge_patch(&mut value, patch);
+    serde_json::from_value(value).map_err(|e| format!("not a valid setting: {e}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_patch_changes_only_what_it_names() {
+        let cfg = Config {
+            hotkeys: vec!["Alt+Space".into()],
+            remember_overlay_position: false,
+            ..Default::default()
+        };
+        let out = patched(
+            &cfg,
+            &serde_json::json!({ "remember_overlay_position": true }),
+        )
+        .unwrap();
+        assert!(out.remember_overlay_position);
+        assert_eq!(out.hotkeys, cfg.hotkeys, "untouched fields survive");
+    }
+
+    #[test]
+    fn merge_patch_follows_rfc_7396() {
+        let mut v = serde_json::json!({ "a": { "b": 1, "c": 2 }, "d": 3 });
+        merge_patch(
+            &mut v,
+            &serde_json::json!({ "a": { "b": null, "e": 4 }, "d": [1] }),
+        );
+        assert_eq!(v, serde_json::json!({ "a": { "c": 2, "e": 4 }, "d": [1] }));
+    }
+
+    #[test]
+    fn a_patch_that_breaks_the_config_is_refused() {
+        let cfg = Config::default();
+        assert!(patched(&cfg, &serde_json::json!({ "hotkeys": 5 })).is_err());
+    }
 
     fn temp_dir(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(

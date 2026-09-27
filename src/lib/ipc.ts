@@ -65,6 +65,9 @@ import type {
 export const ipc = {
   getConfig: () => invoke<Config>('get_config'),
   setConfig: (config: Config) => invoke<void>('set_config', { config }),
+  /** Merge only the given fields into the saved config (RFC 7396: `null`
+      resets a field to its default). */
+  patchConfig: (patch: Record<string, unknown>) => invoke<void>('patch_config', { patch }),
   getConfigRecoveryNotice: () => invoke<string | null>('get_config_recovery_notice'),
   hideOverlay: () => invoke<void>('hide_overlay'),
   openSettings: (section?: string, highlight?: string) =>
@@ -692,6 +695,9 @@ export const onRouteGoto = (cb: (payload: unknown) => void) =>
   listen<unknown>('route://goto', (e) => cb(e.payload));
 
 export const onThemeChanged = (cb: () => void) => listen('theme://changed', () => cb());
+
+/** Any config write, from any window or command: re-read with `getConfig`. */
+export const onConfigChanged = (cb: () => void) => listen('config://changed', () => cb());
 
 /** Clipboard-to-Kitty hotkey/tray item (Round-4): the overlay is already
     shown by the time this fires; payload is whichever the clipboard held. */

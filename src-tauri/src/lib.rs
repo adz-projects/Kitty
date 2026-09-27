@@ -311,9 +311,17 @@ pub fn run() {
             commands::get_brave_mcp_search_status,
             commands::set_brave_mcp_search_api_key,
             commands::set_brave_mcp_search_enabled,
+            commands::patch_config,
         ])
         .setup(move |app| {
             let handle = app.handle();
+            // Every config write tells every window (#73).
+            {
+                let handle = handle.clone();
+                config::on_saved(move || {
+                    let _ = tauri::Emitter::emit(&handle, "config://changed", ());
+                });
+            }
             // Android's app directories can only come from the Android
             // `Context`, which means they are not knowable until here —
             // `run()` above already tried to load config and failed with

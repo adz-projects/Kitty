@@ -23,13 +23,18 @@ pub fn get_config(state: tauri::State<'_, AppState>) -> Result<Config, String> {
 pub fn get_config_recovery_notice(
     state: tauri::State<'_, AppState>,
 ) -> Result<Option<String>, String> {
-    Ok(state.config_recovered.lock().unwrap().as_ref().map(|backup| {
-        format!(
-            "Kitty couldn't read its saved settings, so it reset them to defaults. \
+    Ok(state
+        .config_recovered
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|backup| {
+            format!(
+                "Kitty couldn't read its saved settings, so it reset them to defaults. \
              Your original settings were backed up to \"{backup}\" — restore anything \
              you want from there.",
-        )
-    }))
+            )
+        }))
 }
 
 /// Replace + persist the app config. Re-registers the hotkey if it changed.
@@ -37,18 +42,40 @@ pub fn get_config_recovery_notice(
 pub async fn set_config(
     app: AppHandle,
     state: tauri::State<'_, AppState>,
-    mut config: Config,
+    config: Config,
+) -> Result<(), String> {
+    commit(app, state, |_| Ok(config)).await
+}
+
+/// Merge `patch` (RFC 7396) into the current config and persist it (#73).
+/// Settings pages send only the fields they changed, so a page opened before
+/// some other write can no longer put that write back.
+#[tauri::command]
+pub async fn patch_config(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    patch: serde_json::Value,
+) -> Result<(), String> {
+    commit(app, state, |cur| config::patched(cur, &patch)).await
+}
+
+/// Swap in the config `build` makes from the current one - under the lock,
+/// so nothing written in between is lost - save it, and apply what changed.
+async fn commit(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+    build: impl FnOnce(&Config) -> Result<Config, String>,
 ) -> Result<(), String> {
     // Consumed only by the desktop-only re-registration below.
     #[cfg_attr(not(desktop), allow(unused_variables))]
-    let (previous, hotkey_changed, engine_changed) = {
+    let (config, previous, hotkey_changed, engine_changed) = {
         let mut cur = state.config.lock().unwrap();
+        let mut config = build(&cur)?;
         let hotkey_changed = cur.hotkeys != config.hotkeys
             || cur.clipboard_hotkey != config.clipboard_hotkey
             || cur.open_window_hotkey != config.open_window_hotkey;
-        // Compared against the *previous* config, before it's overwritten —
-        // every `[local]` knob only reaches the daemon at spawn, so a change
-        // needs a restart to take effect (docs/ANDROID.md §6.4).
+        // Compared against the *previous* config, before it's overwritten:
+        // spawn-time settings reach the daemon only when it starts.
         let engine_changed = crate::lifecycle::engine_restart::needs_restart(&cur, &config);
         // A new chats base: remember the old one, so chats still in it stay
         // Kitty's own (see `Config::chats_roots_history`).
@@ -61,7 +88,7 @@ pub async fn set_config(
             }
         }
         let previous = std::mem::replace(&mut *cur, config.clone());
-        (previous, hotkey_changed, engine_changed)
+        (config, previous, hotkey_changed, engine_changed)
     };
 
     // Both I/O chunks (disk save + hotkey re-register) run on a blocking
