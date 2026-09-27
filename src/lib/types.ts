@@ -797,30 +797,6 @@ export interface CompactionEvent {
   content?: string;
 }
 
-// --- Approvals / modes (Phase 3) ---
-
-export interface ApprovalOption {
-  optionId: string;
-  name: string;
-  kind: string;
-}
-
-export interface ApprovalToolCall {
-  toolCallId?: string;
-  title?: string;
-  kind?: string;
-  status?: string;
-  rawInput?: unknown;
-  [key: string]: unknown;
-}
-
-export interface ApprovalNeededEvent {
-  session_id: string;
-  tool_call_id: string;
-  tool_call: ApprovalToolCall;
-  options: ApprovalOption[];
-}
-
 // --- Sessions / filesystem (Phase 4) ---
 
 /** Mirrors src-tauri PathInfo. */

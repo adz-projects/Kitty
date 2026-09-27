@@ -9,6 +9,8 @@ import { SessionList } from '@/components/sessions/SessionList';
 import { SettingsView } from '@/components/settings/SettingsView';
 import { WizardView } from '@/components/wizard/WizardView';
 import { ConfirmHost } from '@/components/shared/ConfirmDialog';
+import { ApprovalModal } from '@/components/chat/ApprovalModal';
+import { useChatStore } from '@/stores/chatStore';
 
 /** The hub window (docs/ANDROID.md §8.1): one window routing between chat,
     settings and setup, where there used to be three.
@@ -28,6 +30,7 @@ export function App() {
   const init = useRouteStore((s) => s.init);
   const goto = useRouteStore((s) => s.goto);
   const android = isAndroid();
+  const sessionId = useChatStore((s) => s.sessionId);
 
   useEffect(() => {
     void init();
@@ -65,6 +68,10 @@ export function App() {
       {view === 'wizard' && <WizardView />}
       {android && <MobileDrawer />}
       <ConfirmHost />
+      <ApprovalModal
+        onScreenSessionId={view === 'chat' ? sessionId : null}
+        canOpenChat={view === 'chat'}
+      />
     </>
   );
 }

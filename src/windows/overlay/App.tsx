@@ -6,6 +6,7 @@ import { useChatStore } from '@/stores/chatStore';
 import { StackStatusView } from '@/components/shared/StackStatusView';
 import { StartupSpinner } from '@/components/shared/StartupSpinner';
 import { ConfirmHost } from '@/components/shared/ConfirmDialog';
+import { ApprovalModal } from '@/components/chat/ApprovalModal';
 import { ChatView } from '@/components/chat/ChatView';
 import { RecentSessions } from '@/components/sessions/RecentSessions';
 import { NewChatIcon } from '@/components/icons/NewChatIcon';
@@ -35,6 +36,7 @@ export function App() {
     };
   }, [init, initAdaptivePathway]);
 
+  const sessionId = useChatStore((s) => s.sessionId);
   const booting = useStackStore(selectBooting);
   const degraded = DEGRADED.includes(status);
   // A first-connect `backend_down` during the grace window is a slow daemon
@@ -102,6 +104,7 @@ export function App() {
         </div>
       </div>
       <ConfirmHost />
+      <ApprovalModal onScreenSessionId={degraded || bootSpinner ? null : sessionId} />
     </div>
   );
 }

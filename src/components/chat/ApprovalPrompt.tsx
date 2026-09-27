@@ -1,8 +1,9 @@
-import { useState } from 'react';
-import type { ApprovalNeededEvent } from '@/lib/types';
+import type { PendingApproval } from '@/lib/types';
+import { useApprovalStore } from '@/stores/approvalStore';
 
-/** Extract a human-readable command/param preview from the tool call. */
-function previewInput(input: unknown): string {
+/** A human-readable preview of the tool call's arguments: the command for a
+    shell call, otherwise the arguments as JSON. */
+export function previewArgs(input: unknown): string {
   if (input == null) return '';
   if (typeof input === 'string') return input;
   if (typeof input === 'object') {
@@ -17,70 +18,67 @@ function previewInput(input: unknown): string {
   return String(input);
 }
 
-/** Inline approval for a tool call that requires permission. Nothing runs until
-    the user acts (CLAUDE.md Phase 3). Approve requires an explicit click. */
+/** One approval: the tool, its exact arguments, why it was not answered
+    automatically, and what "Always allow" would cover. Nothing runs until
+    the user acts (CLAUDE.md Phase 3). Used inline in the chat that asked and
+    in the interrupting dialog for any other chat. */
 export function ApprovalPrompt({
-  request,
-  onRespond,
+  approval,
+  inline = true,
 }: {
-  request: ApprovalNeededEvent;
-  /** Resolves false when the decision never reached the backend — the prompt
-      then unlatches so the user can retry (the store keeps the entry queued
-      on failure, so the turn isn't silently hung behind a dead prompt). */
-  onRespond: (toolCallId: string, optionId: string | null) => Promise<boolean>;
+  approval: PendingApproval;
+  /** Inline in its chat (card chrome) rather than inside a dialog. */
+  inline?: boolean;
 }) {
-  const title = request.tool_call?.title ?? 'a tool';
-  const preview = previewInput(request.tool_call?.rawInput);
-  const has = (id: string) => request.options?.some((o) => o.optionId === id);
-  // Latch on first response so a second click (before the prompt is cleared)
-  // can't send a duplicate permission decision to goosed.
-  const [submitted, setSubmitted] = useState(false);
-  const respond = (optionId: string | null) => {
-    if (submitted) return;
-    setSubmitted(true);
-    void onRespond(request.tool_call_id, optionId).then((ok) => {
-      if (!ok) setSubmitted(false);
-    });
-  };
-  const pick = (id: string) => respond(id);
+  const answer = useApprovalStore((s) => s.answer);
+  const busy = useApprovalStore((s) => s.answering.includes(approval.action_id));
+  const preview = previewArgs(approval.tool_args);
 
-  // A11y (Phase 8): approving must be deliberate — block Enter so a stray Enter
-  // can't approve; a focused button still activates on Space.
+  // Approving must be deliberate: Enter never approves; a focused button
+  // still activates on Space (Phase 8 a11y).
   const noEnter = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter') e.preventDefault();
   };
+  const pick = (decision: 'allow' | 'always_allow' | 'reject') =>
+    void answer(approval.action_id, decision);
 
   return (
-    <div className="approval" role="alertdialog" aria-label="Tool approval required">
+    <div
+      className={inline ? 'approval' : 'approval approval-in-dialog'}
+      role={inline ? 'alertdialog' : undefined}
+      aria-label={inline ? 'Tool approval required' : undefined}
+    >
       <div className="approval-head">
-        <strong>Approve tool: {title}?</strong>
+        <strong>Approve tool: {approval.tool_name}?</strong>
       </div>
       {preview && <pre className="approval-cmd">{preview}</pre>}
+      {approval.warning && <p className="muted approval-note">{approval.warning}</p>}
+      {approval.scheduled && (
+        <p className="muted approval-note">
+          This is a scheduled task. If nobody answers within 10 minutes it is denied and the task
+          carries on without it.
+        </p>
+      )}
       <div className="actions">
-        {has('allow_once') && (
-          <button
-            className="primary"
-            disabled={submitted}
-            onKeyDown={noEnter}
-            onClick={() => pick('allow_once')}
-          >
-            Approve
-          </button>
-        )}
-        {has('allow_always') && (
-          <button disabled={submitted} onKeyDown={noEnter} onClick={() => pick('allow_always')}>
-            Always allow
-          </button>
-        )}
-        {has('reject_once') ? (
-          <button disabled={submitted} onKeyDown={noEnter} onClick={() => pick('reject_once')}>
-            Deny
-          </button>
-        ) : (
-          <button disabled={submitted} onKeyDown={noEnter} onClick={() => respond(null)}>
-            Deny
-          </button>
-        )}
+        <button
+          className="primary"
+          disabled={busy}
+          onKeyDown={noEnter}
+          onClick={() => pick('allow')}
+        >
+          Approve
+        </button>
+        <button
+          disabled={busy}
+          onKeyDown={noEnter}
+          onClick={() => pick('always_allow')}
+          title="Stop asking for this. You can revoke it in Settings → Tool permissions."
+        >
+          Always allow {approval.always_scope.label}
+        </button>
+        <button disabled={busy} onKeyDown={noEnter} onClick={() => pick('reject')}>
+          Deny
+        </button>
       </div>
     </div>
   );

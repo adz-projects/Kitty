@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import type { ApprovalNeededEvent, ProviderView, SessionInfo } from '@/lib/types';
+import type { ProviderView, SessionInfo } from '@/lib/types';
 import type { Message } from './chatStore';
 
 // Store-action tests for the WS8 chat-layer guards. chatStore calls ipc only
@@ -11,7 +11,6 @@ vi.mock('@/lib/ipc', () => ({
     listProviders: vi.fn(),
     sendPrompt: vi.fn(),
     bindWindowSession: vi.fn(),
-    respondPermission: vi.fn(),
     deleteSession: vi.fn(),
     loadSession: vi.fn(),
     isSessionBusy: vi.fn(),
@@ -33,13 +32,6 @@ const info = (sessionId: string, cwd = '/c'): SessionInfo => ({
   model_id: null,
 });
 
-const approval: ApprovalNeededEvent = {
-  session_id: 's1',
-  tool_call_id: 't1',
-  tool_call: { title: 'shell', kind: 'shell', rawInput: { command: 'x' } },
-  options: [{ optionId: 'allow', name: 'Allow', kind: 'allow' }],
-};
-
 beforeEach(() => {
   vi.clearAllMocks();
   useChatStore.setState({
@@ -58,7 +50,6 @@ beforeEach(() => {
     attachments: [],
     pendingImages: [],
     pendingAttachments: [],
-    pendingApprovals: [],
     busy: false,
     sessionProviderId: null,
     sessionModelId: null,
@@ -83,7 +74,6 @@ beforeEach(() => {
   vi.mocked(ipc.listProviders).mockResolvedValue([]);
   vi.mocked(ipc.sendPrompt).mockResolvedValue(undefined);
   vi.mocked(ipc.bindWindowSession).mockRejectedValue(new Error('best-effort'));
-  vi.mocked(ipc.respondPermission).mockResolvedValue(undefined);
   vi.mocked(ipc.isSessionBusy).mockResolvedValue(false);
 });
 
@@ -131,42 +121,15 @@ describe('chatStore refreshProvider failure reset', () => {
   });
 });
 
-describe('chatStore forceStop / respondApproval', () => {
-  it('forceStop clears pending approvals for the abandoned turn', () => {
-    useChatStore.setState({
-      sessionId: 's1',
-      busy: true,
-      stopPhase: 'forceable',
-      pendingApprovals: [approval],
-    });
+describe('chatStore forceStop', () => {
+  it('releases the composer for the abandoned turn', () => {
+    useChatStore.setState({ sessionId: 's1', busy: true, stopPhase: 'forceable' });
 
     useChatStore.getState().forceStop();
 
     const s = useChatStore.getState();
     expect(s.busy).toBe(false);
-    expect(s.pendingApprovals).toEqual([]);
-  });
-
-  it('respondApproval keeps the approval queued when the IPC round-trip fails', async () => {
-    useChatStore.setState({ pendingApprovals: [approval], error: null });
-    vi.mocked(ipc.respondPermission).mockRejectedValue(new Error('boom'));
-
-    const ok = await useChatStore.getState().respondApproval('t1', 'allow');
-
-    // Reported to ApprovalPrompt so it can unlatch and let the user retry.
-    expect(ok).toBe(false);
-    expect(useChatStore.getState().pendingApprovals).toHaveLength(1);
-    expect(useChatStore.getState().error).toBe('Error: boom');
-  });
-
-  it('respondApproval removes the approval only after the IPC round-trip succeeds', async () => {
-    useChatStore.setState({ pendingApprovals: [approval], error: null });
-
-    const ok = await useChatStore.getState().respondApproval('t1', 'allow');
-
-    expect(ok).toBe(true);
-    expect(ipc.respondPermission).toHaveBeenCalledWith('t1', 'allow');
-    expect(useChatStore.getState().pendingApprovals).toEqual([]);
+    expect(s.abandonedSession).toBe('s1');
   });
 });
 

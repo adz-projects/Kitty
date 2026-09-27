@@ -10,7 +10,7 @@ import { useProgressStage } from './useProgressStage';
     frame, so anything subscribed to `s.messages` re-renders at frame rate
     while a reply streams. `ChatView` subscribed to it while using it only for
     this list and the progress indicator — which meant its whole body (every
-    banner conditional, `pendingApprovals.map`, all four chip components and
+    banner conditional, the approval prompts, all four chip components and
     the `Composer`) was rebuilt 60 times a second for no reason.
 
     Everything that genuinely has to move per frame now lives here, and

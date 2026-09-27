@@ -15,6 +15,7 @@ import { PendingAttachmentChips } from './PendingAttachmentChips';
 import { ErrorDetail } from '@/components/shared/ErrorDetail';
 import { FolderIcon } from '@/components/icons/FolderIcon';
 import { AllowedDirsPopover } from '@/components/chat/AllowedDirsPopover';
+import { useApprovalStore } from '@/stores/approvalStore';
 
 /** The shared chat surface used by both the overlay and the full window
     (CLAUDE.md rule 5).
@@ -39,7 +40,8 @@ export function ChatView() {
   const error = useChatStore((s) => s.error);
   const errorType = useChatStore((s) => s.errorType);
   const cwd = useChatStore((s) => s.cwd);
-  const pendingApprovals = useChatStore((s) => s.pendingApprovals);
+  // This chat's approvals; any other chat's go to `ApprovalModal`.
+  const pendingApprovals = useApprovalStore((s) => s.pending);
   const providerHost = useChatStore((s) => s.providerHost);
   const providerOffline = useChatStore((s) => s.providerOffline);
   const checkingConnection = useChatStore((s) => s.checkingConnection);
@@ -54,7 +56,6 @@ export function ChatView() {
   const dismissLoopWarning = useChatStore((s) => s.dismissLoopWarning);
   const send = useChatStore((s) => s.send);
   const cancel = useChatStore((s) => s.cancel);
-  const respondApproval = useChatStore((s) => s.respondApproval);
   const addDroppedPaths = useChatStore((s) => s.addDroppedPaths);
   const setWorkingDir = useChatStore((s) => s.setWorkingDir);
   const resetWorkingDir = useChatStore((s) => s.resetWorkingDir);
@@ -249,9 +250,11 @@ export function ChatView() {
 
       <ChatTranscript />
 
-      {pendingApprovals.map((a) => (
-        <ApprovalPrompt key={a.tool_call_id} request={a} onRespond={respondApproval} />
-      ))}
+      {pendingApprovals
+        .filter((a) => a.session_id === sessionId)
+        .map((a) => (
+          <ApprovalPrompt key={a.action_id} approval={a} />
+        ))}
       {error && (
         <ErrorDetail
           summary={humanizeChatError(error, errorType ?? undefined)}

@@ -98,29 +98,6 @@ pub fn is_session_busy(state: State<'_, AppState>, session_id: String) -> bool {
         .contains(&session_id)
 }
 
-/// Respond to a deferred tool-approval prompt. `option_id` = the chosen
-/// option (e.g. `allow_once`, `reject_once`); `None` cancels.
-#[tauri::command]
-pub async fn respond_permission(
-    app: AppHandle,
-    tool_call_id: String,
-    option_id: Option<String>,
-) -> Result<(), String> {
-    crate::bigtiny::stream::respond_permission(&app, tool_call_id, option_id).await
-}
-
-/// Kept while the chat view still calls it: approvals are now noticed,
-/// decided and announced in Rust (`lifecycle::app_events`), so there is
-/// nothing left for this to do.
-#[tauri::command]
-pub fn notify_approval_needed(
-    _app: AppHandle,
-    _session_id: String,
-    _tool_name: String,
-) -> Result<(), String> {
-    Ok(())
-}
-
 /// Every approval waiting on a person, across all chats - for a window that
 /// opens (or expands, or resumes a chat) after the approval arrived. Asks the
 /// engine too, so nothing that paused while Kitty was not listening is
@@ -179,5 +156,8 @@ pub async fn list_allow_rules(app: AppHandle) -> Result<serde_json::Value, Strin
 #[tauri::command]
 pub async fn revoke_allow_rule(app: AppHandle, id: i64) -> Result<(), String> {
     let client = crate::bigtiny::client::ensure_client(&app)?;
-    client.delete(&format!("/api/hitl/rules/{id}")).await.map(|_| ())
+    client
+        .delete(&format!("/api/hitl/rules/{id}"))
+        .await
+        .map(|_| ())
 }

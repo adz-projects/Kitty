@@ -211,8 +211,6 @@ pub fn run() {
             commands::is_session_busy,
             commands::set_active_session,
             commands::get_active_session,
-            commands::respond_permission,
-            commands::notify_approval_needed,
             commands::list_sessions,
             commands::load_session,
             commands::fetch_session_transcript,

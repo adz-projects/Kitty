@@ -6,7 +6,6 @@ import { create } from 'zustand';
 import {
   ipc,
   onAdoptSession,
-  onApprovalNeeded,
   onChatError,
   onClipboardAttach,
   onCompaction,
@@ -28,7 +27,6 @@ import {
 import { isAndroid } from '@/lib/platform';
 import { modelAcceptsImages } from '@/lib/vision_models';
 import type {
-  ApprovalNeededEvent,
   FileEntry,
   NetworkTier,
   PathInfo,
@@ -40,7 +38,6 @@ import type {
   ToolCallUpdate,
 } from '@/lib/types';
 
-import { decideChatApproval } from './chat/approvalUtils';
 import {
   isConnectivityError,
   isProviderScopedError,
@@ -62,7 +59,6 @@ import {
 } from './chat/messageUtils';
 import type { Artifact, Attachment, Message, PendingImage, ToolCall } from './chat/types';
 
-export * from './chat/approvalUtils';
 export * from './chat/errorUtils';
 export * from './chat/loopGuards';
 export * from './chat/messageUtils';
@@ -98,26 +94,18 @@ interface ChatState {
     title: string | null;
     ok: boolean;
   } | null;
-  /** The session's original chat folder, captured once at creation/load time
-      — used (alongside `cwd`) by the agentic-mode client-side approval
-      nicety (`onApprovalNeeded`) so an in-bounds call isn't needlessly
-      queued for a human decision after "Set as working directory" has
-      diverged `cwd` away from it. This is purely a UX optimization, not a
-      security boundary (BigTiny enforces the real containment) — if a
-      resumed session had already diverged in an earlier window session,
-      this may capture the diverged `cwd` instead of the true original
-      chat_dir; the only consequence is a few more real approval prompts
-      than strictly necessary, never a security gap. */
+  /** The session's original chat folder, captured once at creation/load
+      time — the artifacts pane's fallback scope (with `cwd`) until
+      `sessionGrants` has loaded. */
   chatDir: string | null;
   /** Everything this session is allowed to touch, as the *daemon* sees it —
       `chat_dir`/`cwd` plus every working folder set during the session and
       every file the user attached to a turn.
 
-      Cached rather than fetched on demand because the only consumer is the
-      `chat://tool-approval-needed` handler, which is synchronous: awaiting an
-      IPC round-trip inside it would race the approval response it exists to
-      send. Refreshed wherever the grant set can change (session create/load/
-      adopt, and after a send that carried attachments).
+      Scopes the artifacts pane to the user's own files. (Approval decisions
+      use the same grants, but in Rust: `approvals.rs`.) Refreshed wherever
+      the grant set can change (session create/load/adopt, and after a send
+      that carried attachments).
 
       Kept deliberately separate from `chatDir`/`cwd`: those are render state
       for the header pill, this is the authorization view. */
@@ -155,7 +143,6 @@ interface ChatState {
       look like nothing happened. Cleared (per-path) once that file's own
       processing finishes, success or failure. */
   pendingAttachments: string[];
-  pendingApprovals: ApprovalNeededEvent[];
   busy: boolean;
   /** The goosed-level `providerId`/`modelId` (from `session/list`'s `_meta`,
       see `SessionSummary`) the CURRENTLY loaded session was last used with —
@@ -316,10 +303,6 @@ interface ChatState {
       starts. Does not itself cancel anything; only `cancel()`/`forceStop()`
       do that, and only when the user actually chooses to. */
   dismissLoopWarning: () => void;
-  /** Resolve a pending tool approval. Returns whether the decision actually
-      reached the backend — a false return means the entry is still queued
-      and the caller (ApprovalPrompt) should unlatch so the user can retry. */
-  respondApproval: (toolCallId: string, optionId: string | null) => Promise<boolean>;
   /** Set the active session's reasoning effort (Round-7) — live, no goosed
       restart. No-op if there's no active session or effort control isn't
       available for the active model. */
@@ -331,8 +314,7 @@ interface ChatState {
       per-chat folder (the default state), clearing the chosen working folder. */
   resetWorkingDir: () => Promise<void>;
   /** Re-read `sessionGrants` from the daemon. Best-effort: a failure leaves
-      the previous value in place rather than clearing it, since an empty grant
-      set makes the approval check *stricter*, not laxer. */
+      the previous value in place rather than clearing it. */
   refreshSessionGrants: () => Promise<void>;
   /** Open a delegate's transcript read-only (Settings-free "watch this
       specialist" window). Loads the session exactly as a resume would, then
@@ -974,7 +956,6 @@ export const useChatStore = create<ChatState>((set, get) => {
     attachments: [],
     pendingImages: [],
     pendingAttachments: [],
-    pendingApprovals: [],
     busy: false,
     sessionProviderId: null,
     sessionModelId: null,
@@ -1266,7 +1247,6 @@ export const useChatStore = create<ChatState>((set, get) => {
         attachments: [],
         pendingImages: [],
         pendingAttachments: [],
-        pendingApprovals: [],
         // Any backgrounded-turn indicator/toast that predates this handoff
         // belongs to a session this blank overlay no longer displays — clear
         // them so the stale "still running" indicator / completion toast can't
@@ -1368,7 +1348,6 @@ export const useChatStore = create<ChatState>((set, get) => {
         // here flash-hid that in-flight chip. addDroppedPaths's own `finally`
         // already removes exactly the paths it added once that flow settles,
         // so nothing can linger.
-        pendingApprovals: [],
         error: null,
         errorType: null,
         providerOffline: false,
@@ -1518,7 +1497,6 @@ export const useChatStore = create<ChatState>((set, get) => {
         thinkingEffort: null,
         messages: [],
         artifacts: [],
-        pendingApprovals: [],
         error: null,
         errorType: null,
         providerOffline: false,
@@ -1646,10 +1624,6 @@ export const useChatStore = create<ChatState>((set, get) => {
         // Abandon this turn so any late stream events for it are dropped by
         // `forActive` until the next send() starts a fresh turn.
         abandonedSession: sid,
-        // Clear any stale approval prompts queued for the abandoned turn —
-        // leaving them rendered/clickable against a turn that no longer
-        // exists (and whose tool call will never resume) is a dead end.
-        pendingApprovals: [],
         messages: closeOpen(s.messages),
         warning: 'Stopped. Kitty may still be finishing this turn in the background.',
         loopSuspected: false,
@@ -1665,30 +1639,6 @@ export const useChatStore = create<ChatState>((set, get) => {
     reloadCurrent: async () => {
       const { sessionId, cwd, title } = get();
       if (sessionId && cwd) await get().loadSession(sessionId, cwd, title ?? undefined);
-    },
-
-    respondApproval: async (toolCallId: string, optionId: string | null) => {
-      // Guard against a double-click/double-call on the same approved tool —
-      // once a decision for this id has been issued (and its entry removed),
-      // a second `ipc.respondPermission` for the same id would be a spurious
-      // re-decision against a call that's already resolved.
-      if (!get().pendingApprovals.some((a) => a.tool_call_id === toolCallId)) return false;
-      try {
-        await ipc.respondPermission(toolCallId, optionId);
-        // Remove the approval from the pending queue only on SUCCESS — dropping
-        // it optimistically before the IPC round-trip meant a failure left no
-        // way to retry (the prompt vanished with no way back).
-        set((s) => ({
-          pendingApprovals: s.pendingApprovals.filter((a) => a.tool_call_id !== toolCallId),
-        }));
-        return true;
-      } catch (e) {
-        set({ error: String(e) });
-        // Reported to the caller (ApprovalPrompt) so it can unlatch its
-        // `submitted` state — otherwise a failed respond leaves the prompt
-        // rendered but unclickable with the turn hung server-side.
-        return false;
-      }
     },
 
     setThinkingEffort: async (value: string) => {
@@ -2256,7 +2206,6 @@ export const useChatStore = create<ChatState>((set, get) => {
             attachments: [],
             pendingImages: [],
             pendingAttachments: [],
-            pendingApprovals: [],
             error: null,
             errorType: null,
             providerOffline: false,
@@ -2304,7 +2253,6 @@ export const useChatStore = create<ChatState>((set, get) => {
             attachments: [],
             pendingImages: [],
             pendingAttachments: [],
-            pendingApprovals: [],
             error: null,
             errorType: null,
             providerOffline: false,
@@ -2323,103 +2271,6 @@ export const useChatStore = create<ChatState>((set, get) => {
         if (e.kind === 'text') get().addPastedText(e.text, 'Clipboard');
         else get().addPendingImage(e.mime, e.data_url);
       });
-      void onApprovalNeeded((e) => {
-        if (!forActive(e.session_id)) return;
-        // Auto-decide against the session's allowed directories in BOTH
-        // modes (Round-5, owner decision for chat mode; extended to agentic
-        // mode alongside BigTiny's own directory-sandboxing feature) — a
-        // path-based file op is auto-approved only if its target resolves
-        // inside one of `dirs`, auto-rejected otherwise; a tool with no
-        // structured path — notably `shell`, which is how the model produces
-        // docx/xlsx via Python — is allowed. This is purely a round-trip-
-        // avoidance nicety: BigTiny enforces the real containment
-        // server-side regardless (`bigtiny/agent/sandbox.py`), so a wrong
-        // guess here just costs one extra approval round-trip, never a
-        // security gap. `dirs` is the chat folder only in chat mode (cwd
-        // never diverges there — no UI path to change it) and the chat
-        // folder plus current cwd in agentic mode (which can diverge via
-        // "Set as working directory"; see `chatDir`'s own doc comment for
-        // the one known imprecision this introduces). This handler only
-        // ever fires for a call BigTiny's own HITL policy already decided
-        // needs a human (`chat://tool-approval-needed`, i.e. a real
-        // `hitl_pause`) — under the default `always_ask` policy that's every
-        // tool call, so this auto-decide pass is what keeps tool use feeling
-        // seamless in practice, in both modes now, rather than prompting
-        // for everything.
-        const s0 = get();
-        // The daemon's own view of what this session may touch, not just the
-        // header pill's. `chat_dir`/`cwd` are the baseline; `working_dirs`
-        // holds every folder set during the session (they accumulate, so
-        // switching the pill doesn't revoke the previous one) and
-        // `attached_paths` holds each file the user handed over by
-        // drag-and-drop or paste.
-        //
-        // Those attachments are the bug this closes. `sandbox.rs`'s
-        // `allowed_dirs_for_session` has always allowed them — the user
-        // handing us the file *is* the authorization — but this check only
-        // ever saw chat_dir/cwd, so an attachment that stayed at its original
-        // path (anything already under the tools' reachable root is passed
-        // through unstaged) was judged out-of-scope and prompted. BigTiny
-        // pauses on every tool call under the default `always_ask` policy, so
-        // whichever side is stricter is the one the user experiences: ours
-        // was, and the daemon's exemption never got a chance to apply.
-        //
-        // Falls back to chat_dir/cwd when the grants haven't loaded yet, which
-        // is the previous behaviour — stricter, never laxer.
-        const g = s0.sessionGrants;
-        const dirs = g
-          ? [g.chat_dir, g.cwd, ...g.working_dirs, ...g.attached_paths]
-          : [s0.chatDir, s0.cwd];
-        // The tool-loop guard that used to decline a repeated call here is
-        // gone. It counted identical calls in a turn and rejected the fifth,
-        // which stopped being a loop detector once the lean readers and
-        // writers went paged: `lean_file_read`, `lean_pdf_read_text` and
-        // `lean_doc_read_chunk` are meant to be called once per window, so
-        // reading a long document end to end is a legitimate run of
-        // identical-looking calls and the guard cut it off mid-document. It
-        // was also only ever reached for calls that paused for approval, so
-        // an auto-approved tool could repeat freely while an approved one
-        // could not.
-        //
-        // The daemon nudges instead: after several consecutive calls to one
-        // tool it appends a note to the tool result asking the model to check
-        // whether it already has what it needs (`REPEAT_TOOL_NUDGE_AFTER` in
-        // `agent/loop_.rs`). That reaches the model, which is the only party
-        // that can tell "still paging" from "stuck", and it cannot strand a
-        // turn halfway through a document.
-        const title = String(e.tool_call.title ?? e.tool_call.kind ?? 'tool');
-        const { decision, optionId, warning } = decideChatApproval(
-          e.tool_call.rawInput,
-          dirs,
-          e.options
-        );
-        if (decision === 'prompt') {
-          // Ambiguous enough to need a human — queue it for the real
-          // ApprovalPrompt UI instead of auto-deciding, and only NOW (not on
-          // every hitl_pause) tell Rust to fire the "Approval needed"
-          // toast/tray-pending state — this is the one branch where a human
-          // is genuinely required.
-          void ipc.notifyApprovalNeeded(e.session_id, title).catch((err) => {
-            // Non-fatal — pendingApprovals below still shows the in-app
-            // ApprovalPrompt — but the OS notification/tray-pending state
-            // this exists for may not fire, so a hidden window could miss it.
-            console.warn('notifyApprovalNeeded failed', err);
-          });
-          set((s) =>
-            s.pendingApprovals.some((a) => a.tool_call_id === e.tool_call_id)
-              ? {}
-              : { pendingApprovals: [...s.pendingApprovals, e] }
-          );
-          return;
-        }
-        void ipc.respondPermission(e.tool_call_id, optionId).catch((err) => {
-          // Same risk as the tool-loop reject case above: a paused tool call
-          // with no way to resolve hangs the turn.
-          console.warn('respondPermission (auto-decide) failed', err);
-        });
-        if (warning) set({ warning });
-      });
-
       void onComplete((e) => {
         // WS8: a backgrounded turn (one this window abandoned via New Chat /
         // switching sessions, which we deliberately keep running) finished
@@ -2463,7 +2314,6 @@ export const useChatStore = create<ChatState>((set, get) => {
           return {
             busy: false,
             stopPhase: null,
-            pendingApprovals: [],
             messages: msgs,
             loopSuspected: false,
           };
@@ -2485,7 +2335,6 @@ export const useChatStore = create<ChatState>((set, get) => {
           stopPhase: null,
           error: e.message,
           errorType: e.error_type ?? null,
-          pendingApprovals: [],
           messages: closeOpen(s.messages),
           loopSuspected: false,
           // Only context_exceeded is unrecoverable *for this session* — the

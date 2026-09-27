@@ -13,7 +13,6 @@ import type {
   MemorabiliaMcpStatus,
   MemorabiliaItem,
   MemorabiliaStats,
-  ApprovalNeededEvent,
   ChatErrorEvent,
   CompactionEvent,
   CompleteEvent,
@@ -193,14 +192,6 @@ export const ipc = {
     invoke<void>('set_active_session', { info }),
   getActiveSession: () =>
     invoke<(SessionInfo & Record<string, unknown>) | null>('get_active_session'),
-  respondPermission: (toolCallId: string, optionId: string | null) =>
-    invoke<void>('respond_permission', { toolCallId, optionId }),
-  /** Fires the "Approval needed" toast/tray-pending state — call only once
-      it's known a tool call genuinely needs a human (never for one about to
-      be silently auto-resolved), since BigTiny's own hitl_pause event no
-      longer triggers a notification directly. */
-  notifyApprovalNeeded: (sessionId: string, toolName: string) =>
-    invoke<void>('notify_approval_needed', { sessionId, toolName }),
   /** One page of chats, newest first, with the total count. */
   listSessions: (offset = 0, limit = 200) =>
     invoke<{ sessions: Record<string, unknown>[]; total: number }>('list_sessions', {
@@ -680,8 +671,6 @@ export const onUserMessage = (cb: (e: UserMessageEvent) => void) =>
 /** A replayed "Regenerate": the preceding answer was superseded. */
 export const onSuperseded = (cb: (e: { session_id: string }) => void) =>
   listen<{ session_id: string }>('chat://superseded', (e) => cb(e.payload));
-export const onApprovalNeeded = (cb: (e: ApprovalNeededEvent) => void) =>
-  listen<ApprovalNeededEvent>('chat://tool-approval-needed', (e) => cb(e.payload));
 
 /** OS file/folder drop onto this window → absolute paths. */
 export function onFileDrop(cb: (paths: string[]) => void): Promise<UnlistenFn> {

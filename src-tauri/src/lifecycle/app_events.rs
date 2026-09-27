@@ -215,22 +215,6 @@ async fn on_pause(
         .insert(action_id.clone(), pending.clone());
     crate::notifications::refresh_tray(app);
     let _ = app.emit("approval://needed", &pending);
-    // The chat's own inline prompt, in the shape the chat view has always
-    // listened for.
-    let _ = app.emit(
-        "chat://tool-approval-needed",
-        json!({
-            "session_id": session_id,
-            "tool_call_id": action_id,
-            "tool_call": {
-                "toolCallId": action_id,
-                "title": tool_name,
-                "kind": "execute",
-                "rawInput": tool_args,
-            },
-            "options": crate::bigtiny::stream::approval_options(),
-        }),
-    );
     bring_to_attention(app, &pending);
 }
 

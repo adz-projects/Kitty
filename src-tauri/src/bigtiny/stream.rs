@@ -132,25 +132,6 @@ pub(crate) fn parse_sse_frame(frame: &str) -> Option<Value> {
     serde_json::from_str(&data).ok()
 }
 
-/// The approval options BigTiny's HITL flow supports, in the frontend's
-/// ACP-derived vocabulary (`ApprovalPrompt.tsx` renders exactly these ids).
-pub(crate) fn approval_options() -> Value {
-    json!([
-        { "optionId": "allow_once", "name": "Allow once", "kind": "allow_once" },
-        { "optionId": "allow_always", "name": "Always allow", "kind": "allow_always" },
-        { "optionId": "reject_once", "name": "Reject", "kind": "reject_once" },
-    ])
-}
-
-/// Pure: map a frontend approval option id onto BigTiny's decision strings.
-pub(crate) fn decision_for_option(option_id: Option<&str>) -> &'static str {
-    match option_id {
-        Some("allow_always") => "always_allow",
-        Some(o) if o.contains("allow") => "allow",
-        _ => "reject",
-    }
-}
-
 /// A turn that never produced an outcome: the send was refused or the stream
 /// broke. `error_type` is set when the cause is one the chat can explain
 /// (`turn_in_progress`, `idle_timeout`).
@@ -1202,21 +1183,6 @@ pub async fn answer_approval(
         .await
 }
 
-/// [`answer_approval`] in the chat prompt's vocabulary (`allow_once`,
-/// `allow_always`, `reject_once`; `None` rejects).
-pub async fn respond_permission(
-    app: &AppHandle,
-    tool_call_id: String,
-    option_id: Option<String>,
-) -> Result<(), String> {
-    answer_approval(
-        app,
-        &tool_call_id,
-        decision_for_option(option_id.as_deref()),
-    )
-    .await
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1397,14 +1363,6 @@ mod tests {
         assert!(parse_sse_frame("data: not-json").is_none());
     }
 
-    #[test]
-    fn decision_mapping_matches_bigtiny_vocabulary() {
-        assert_eq!(decision_for_option(Some("allow_once")), "allow");
-        assert_eq!(decision_for_option(Some("allow_always")), "always_allow");
-        assert_eq!(decision_for_option(Some("reject_once")), "reject");
-        assert_eq!(decision_for_option(Some("reject_always")), "reject");
-        assert_eq!(decision_for_option(None), "reject"); // cancel = reject
-    }
 
     #[test]
     fn truncate_for_ui_caps_long_strings_at_char_boundary() {

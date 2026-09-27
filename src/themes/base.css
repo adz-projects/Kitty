@@ -1294,6 +1294,20 @@ button:disabled {
   gap: 8px;
   flex-wrap: wrap;
 }
+.approval-note {
+  margin: 0;
+  font-size: var(--fs-sm-plus);
+}
+/* Inside the approval dialog the dialog is the card. */
+.approval.approval-in-dialog {
+  padding: 0;
+  border: none;
+  background: none;
+  margin: 0;
+}
+.approval-modal {
+  max-width: 560px;
+}
 
 /* --- Mode popover (Phase 3) --- */
 .mode-popover {
