@@ -1,4 +1,5 @@
 ﻿import { useEffect, useState } from 'react';
+import { isAndroid } from '@/lib/platform';
 import { ipc } from '@/lib/ipc';
 import type { McpServer } from '@/lib/types';
 import { confirmDialog } from '@/components/shared/ConfirmDialog';
@@ -41,7 +42,9 @@ type Transport = 'stdio' | 'sse' | 'streamable_http';
 
 const emptyForm = {
   name: '',
-  transport: 'stdio' as Transport,
+  // Android can't start a program (Android 10+ refuses to exec one from app
+  // storage), so a custom server there is a remote one (#83).
+  transport: (isAndroid() ? 'streamable_http' : 'stdio') as Transport,
   command: '',
   args: '',
   url: '',
@@ -179,6 +182,29 @@ export function McpServers() {
   };
   useEffect(() => void load(), []);
 
+  // Live status while this page is open (#68): servers connect and drop on
+  // their own schedule.
+  useEffect(() => {
+    const t = window.setInterval(() => void load(), 10_000);
+    return () => window.clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Visualizations live inside the file tools and Brave inside web search, so
+  // each can only be on while its parent is (#68).
+  const [toolsOn, setToolsOn] = useState(true);
+  const [webOn, setWebOn] = useState(true);
+  useEffect(() => {
+    void ipc
+      .getKittyToolsEnabled()
+      .then(setToolsOn)
+      .catch(() => {});
+    void ipc
+      .getKittyWebEnabled()
+      .then(setWebOn)
+      .catch(() => {});
+  }, []);
+
   /** The live row for a bundled server, matched by name — `undefined` if the
       daemon hasn't registered it (older/newer builds carry different bundled
       names), in which case the card shows no health line rather than a false
@@ -303,10 +329,24 @@ export function McpServers() {
       {error && <div className="chat-error">{error}</div>}
       <div className="ext-grid ext-grid-1col" style={{ marginBottom: 16 }}>
         <KittyWasmCard health={healthOf('kitty-wasm')} onRetry={retry} />
-        <KittyToolsCard health={healthOf('kitty-tools')} onRetry={retry} />
-        <VisualizationsCard />
-        <KittyWebCard health={healthOf('kitty-web')} onRetry={retry} />
-        <BraveMcpSearchCard />
+        <KittyToolsCard
+          health={healthOf('kitty-tools')}
+          onRetry={retry}
+          onChange={(on) => {
+            setToolsOn(on);
+            void load();
+          }}
+        />
+        <VisualizationsCard parentOn={toolsOn} />
+        <KittyWebCard
+          health={healthOf('kitty-web')}
+          onRetry={retry}
+          onChange={(on) => {
+            setWebOn(on);
+            void load();
+          }}
+        />
+        <BraveMcpSearchCard parentOn={webOn} />
       </div>
 
       <div className="ext-grid ext-grid-1col">
@@ -347,7 +387,7 @@ export function McpServers() {
             value={form.transport}
             onChange={(e) => setForm({ ...form, transport: e.target.value as Transport })}
           >
-            <option value="stdio">stdio</option>
+            {!isAndroid() && <option value="stdio">stdio</option>}
             <option value="sse">sse (legacy HTTP+SSE)</option>
             <option value="streamable_http">Streamable HTTP</option>
           </select>
@@ -471,7 +511,7 @@ function KittyWasmCard({
     server (see `KittyToolsCard` above); this toggle flips the
     `KITTY_VIZ_ENABLED` env var rather than spawning its own process. On by
     default, no credentials — same shape as `KittyWasmCard`. */
-function VisualizationsCard() {
+function VisualizationsCard({ parentOn }: { parentOn: boolean }) {
   const [enabled, setEnabled] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
@@ -502,14 +542,17 @@ function VisualizationsCard() {
         <span className="ext-card-name">Create Visualizations</span>
         <input
           type="checkbox"
-          checked={enabled}
-          disabled={busy}
+          checked={enabled && parentOn}
+          disabled={busy || !parentOn}
           onChange={(ev) => void toggle(ev.target.checked)}
         />
       </div>
       <span className="muted ext-card-desc">
         Lets the agent draw tables, diagrams, and charts inline in the conversation.
       </span>
+      {!parentOn && (
+        <span className="muted ext-card-desc">Needs Read and Write Files to be on.</span>
+      )}
       {error && <div className="chat-error">{error}</div>}
     </label>
   );
@@ -527,9 +570,11 @@ function VisualizationsCard() {
 function KittyToolsCard({
   health,
   onRetry,
+  onChange,
 }: {
   health?: McpServer;
   onRetry: (s: McpServer) => void | Promise<void>;
+  onChange?: (enabled: boolean) => void;
 }) {
   const [enabled, setEnabled] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -548,8 +593,13 @@ function KittyToolsCard({
     try {
       await ipc.setKittyToolsEnabled(next);
       setEnabled(next);
+      onChange?.(next);
     } catch (e) {
+      // Saved, but the engine may not have taken it: show what is saved.
       setError(String(e));
+      const saved = await ipc.getKittyToolsEnabled().catch(() => next);
+      setEnabled(saved);
+      onChange?.(saved);
     } finally {
       setBusy(false);
     }
@@ -587,9 +637,11 @@ function KittyToolsCard({
 function KittyWebCard({
   health,
   onRetry,
+  onChange,
 }: {
   health?: McpServer;
   onRetry: (s: McpServer) => void | Promise<void>;
+  onChange?: (enabled: boolean) => void;
 }) {
   const [enabled, setEnabled] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -608,8 +660,13 @@ function KittyWebCard({
     try {
       await ipc.setKittyWebEnabled(next);
       setEnabled(next);
+      onChange?.(next);
     } catch (e) {
+      // Saved, but the engine may not have taken it: show what is saved.
       setError(String(e));
+      const saved = await ipc.getKittyWebEnabled().catch(() => next);
+      setEnabled(saved);
+      onChange?.(saved);
     } finally {
       setBusy(false);
     }
@@ -648,7 +705,7 @@ function KittyWebCard({
     alone can never turn it back on — re-enabling always re-opens the API key
     form. This is deliberate (see `brave_mcp_search_enabled`'s doc comment in
     Rust `config/mod.rs`), not a rough edge to smooth over. */
-function BraveMcpSearchCard() {
+function BraveMcpSearchCard({ parentOn }: { parentOn: boolean }) {
   const [enabled, setEnabled] = useState(false);
   const [configured, setConfigured] = useState(false);
   const [apiKey, setApiKey] = useState('');
@@ -704,7 +761,7 @@ function BraveMcpSearchCard() {
   // form and no way back on. The form is now gated on `!isOn`, so any
   // not-fully-on state (including either half of a drift) is recoverable by
   // just entering a key, which rewrites both halves in one step.
-  const isOn = enabled && configured;
+  const isOn = enabled && configured && parentOn;
 
   return (
     <div className="ext-card">
@@ -713,7 +770,7 @@ function BraveMcpSearchCard() {
         <input
           type="checkbox"
           checked={isOn}
-          disabled={busy}
+          disabled={busy || !parentOn}
           onChange={(ev) => {
             if (!ev.target.checked) void disable();
             // Checking it does nothing by itself — the API key form below
@@ -724,13 +781,14 @@ function BraveMcpSearchCard() {
       <span className="muted ext-card-desc">
         Prefers Brave over DuckDuckGo and Bing for web search, using your own Brave Search API key.
       </span>
-      {!isOn && configured && (
+      {!parentOn && <span className="muted ext-card-desc">Needs Search the Web to be on.</span>}
+      {parentOn && !isOn && configured && (
         <span className="muted ext-card-desc">
           A saved key was found but the server is switched off. Enter a key to turn it back on —
           this replaces the saved one.
         </span>
       )}
-      {!isOn && (
+      {parentOn && !isOn && (
         <div className="row" style={{ marginTop: 8 }}>
           <input
             type="password"
