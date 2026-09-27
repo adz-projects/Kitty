@@ -4,11 +4,11 @@ Kitty ships most subsystems as **internal plugins**: independent, tested
 packages, frozen to standalone Windows `.exe`s at build time and bundled via
 Tauri's `externalBin` mechanism. End users need no Python, `uv`, `pip`, or
 Rust toolchain — see `plugins/README.md` for the directory layout and how to
-add a new plugin; this file covers the *pattern* in more depth. The BigTiny
-daemon itself (Kitty's chat backend, the Rust crate at
-`plugins/bigtiny_rust/`) is built and bundled the same way, even though it
-isn't a "plugin" in the tool-augmentation sense — see
-`docs/bigtiny-backend.md`.
+add a new plugin; this file covers the *pattern* in more depth. The engine
+itself (BigTiny V2, the Rust crate at `BigTinyV2/daemon/`) is built and
+bundled the same way, even though it isn't a "plugin" in the
+tool-augmentation sense — see `docs/bigtiny-backend.md`. (`plugins/bigtiny_rust/`
+is the frozen V1 engine; nothing builds it.)
 
 **As of 0.5.0 every bundled binary is Rust**, built with plain
 `cargo build --release` — `kitty-tools`, `kitty-web`, `kitty-wasm`, and the
@@ -28,6 +28,10 @@ in-process MCP registry, and registered from Kitty by the same
 `bigtiny::mcp::ensure_builtin_servers` path (the `"memorabilia"` row). Its
 enable flag rides the `BIGTINY_MEMORABILIA__ENABLED` env var, and its Settings
 surface is the "Memorabilia" pane (`src/components/settings/Memorabilia.tsx`).
+Both memory engines are switched **per app** (`PUT /api/apps/me/plugins/{plugin}`,
+from `src-tauri/src/lifecycle/memory.rs`), on only when the embedding model is
+on disk and the user has them on; the `BIGTINY_*__ENABLED` variables are just
+the engine's start-up defaults.
 It was vendored in from a previously-standalone repo; there is nothing
 process-shaped to spawn or supervise, only the compiled-in crate.
 
@@ -60,13 +64,14 @@ dependency on a Rust toolchain.
 | Registered via | Config field + Kitty's own process spawn | `bigtiny::mcp::ensure_builtin_servers` (upserts BigTiny's `/api/mcp/servers`) |
 | Rust wiring | `lifecycle/<name>_proc.rs`, `commands/<name>.rs`, an HTTP client module | `bigtiny/mcp.rs`, `commands/mcp_servers.rs` — no lifecycle file, no `ManagedProcess` |
 
-> **Note (0.5.0):** the Kitty-managed-sidecar column has no current occupant.
-> Its only example was the Python `adaptive-pathway` sidecar, retired once the
-> behavioral-memory engine moved in-process into the BigTiny daemon. The
-> BigTiny daemon itself is still Kitty-managed (`lifecycle/bigtiny_proc.rs`),
-> so the pattern is live — just not for any *plugin*. The column is kept
-> because the "two supervisors racing to own one child" hazard below is the
-> reason the split exists, and that hazard outlives any one example.
+> **Note:** the Kitty-managed-sidecar column has no current occupant. Its
+> only example was the Python `adaptive-pathway` sidecar, retired once the
+> behavioral-memory engine moved into the engine. Even the engine is not
+> Kitty-managed any more: on desktop it is shared by several apps, and Kitty
+> only attaches to it (`lifecycle/bigtiny_v2.rs`), starting it when none is
+> running but never supervising or killing it. The column is kept because the
+> "two supervisors racing to own one child" hazard below is the reason the
+> split exists, and that hazard outlives any one example.
 
 **This split is deliberate, not incidental.** A plugin that BigTiny itself
 spawns (any stdio MCP server) should *never* also get a Kitty-side
@@ -75,10 +80,10 @@ one child process. Decide which category a new plugin falls into before
 writing any Rust wiring:
 
 - **Kitty-managed process** (HTTP sidecar, background daemon Kitty talks to
-  directly): follow the BigTiny daemon pattern (`lifecycle/bigtiny_proc.rs`) — a
-  `lifecycle/<name>_proc.rs` with `spawn`/`ensure_running` + `probe_health`, a
-  `ManagedProcess`/`DaemonHandle` field in `AppState`, commands for
-  status/restart/enable.
+  directly): a `lifecycle/<name>_proc.rs` with `spawn`/`ensure_running` +
+  `probe_health`, a `ManagedProcess` field in `AppState`, commands for
+  status/restart/enable. Think twice first: a process Kitty owns dies with
+  Kitty, and anything another app might share must not.
 - **BigTiny-managed MCP server** (stdio MCP server): follow the
   kitty-tools / kitty-web / kitty-wasm pattern — no lifecycle file, just an
   entry in `bigtiny::mcp::ensure_builtin_servers`'s upsert (registers/updates
@@ -90,7 +95,7 @@ writing any Rust wiring:
 Both shapes above assume the host can spawn a child process. That's false on
 Android (10+ blocks `exec()` of anything in an app-writable directory), which
 rules out `kitty-tools`' stdio subprocess the way desktop runs it. For that
-case, `bigtiny_rust` has a third `TransportType::InProcess` (`models/mcp.rs`):
+case, the engine has a third `TransportType::InProcess` (`models/mcp.rs`):
 the server runs as a Rust library linked directly into the daemon, connected
 over an in-memory duplex pipe (`mcp::client::connect_in_process`) instead of
 a child's stdin/stdout — see that method's doc comment for why `rmcp`'s
@@ -103,19 +108,23 @@ connect-timeout, and evict-stale-on-failed-reconnect handling) is identical
 either way.
 
 This is why `kitty-tools/Cargo.toml` already has a `[lib]` target alongside
-its `[[bin]]`: `bigtiny_rust` depends on it directly
-(`plugins/bigtiny_rust/Cargo.toml`) purely for `serve_in_process`, a thin
-wrapper that runs `KittyToolsServer::new().serve(stream)` — the exact same
-server and tool router `main.rs` serves over stdio, just handed a different
-stream. The two crates pin *different* major versions of `rmcp`
-(`kitty-tools` = 2.2.0, `bigtiny_rust` = 0.9) and that's fine: the two sides
+its `[[bin]]`: the engine depends on it directly (`BigTinyV2/daemon/Cargo.toml`)
+for `serve_in_process(stream, InProcessConfig)` — the exact same server and tool
+router `main.rs` serves over stdio, just handed a different stream and an
+explicit configuration. In-process, the configuration (grant roots, plugin
+home, the visualization flag, the Brave key, the wasm guest paths) comes from
+the MCP row's env map, converted by the engine's `mcp::builtin::connect` —
+never from the process environment, which would be shared by every app and
+every server in the process. The stdio `main` builds the same
+`InProcessConfig` from its own environment, so there is one code path. The
+two sides may pin *different* versions of `rmcp` and that's fine: the two sides
 of the duplex pipe only ever exchange serialized JSON-RPC bytes, never Rust
 types, so the version mismatch never has to resolve.
 
 **Known, accepted tradeoff**: `kitty-tools/Cargo.toml`'s `[profile.release]`
 (`opt-level = "z"`, fat LTO — tuned for its life as a small frozen exe) only
 takes effect when cargo is building `kitty-tools` itself at the workspace
-root. As a path dependency of `bigtiny_rust` it silently inherits whatever
+root. As a path dependency of the engine it silently inherits whatever
 profile that build uses instead. Not worth hoisting both crates into a
 shared Cargo workspace to fix — that would reverse this file's explicit
 "deliberately not a workspace member" stance above (MSRV isolation,
@@ -127,7 +136,7 @@ Three servers are wired into `mcp::builtin` today — `kitty-tools`,
 `kitty-web` and `kitty-wasm`, all listed in `mcp::builtin::BUILTIN_SERVERS`
 (a test asserts every advertised name actually connects). A future one
 follows the same recipe: give it a `[lib]` target with its own
-`serve_in_process` entry point, add it as a dependency of `bigtiny_rust`, and
+`serve_in_process` entry point, add it as a dependency of the engine, and
 add one match arm to `mcp::builtin::connect` — nothing in `mcp::manager`,
 `mcp::client`, or the DB schema needs to change.
 
@@ -278,15 +287,13 @@ sources, and a parse/render error shows the raw source in an error card. Cost:
 about 3 MB per Mermaid result (the JS library rides along in the payload).
 
 **Tauri validates every `externalBin` entry exists on disk at build time —
-even for a plain `cargo build`, not just packaging.** That's why
-`src-tauri/binaries/` has *committed, empty placeholder* files for each
-target: without them, a fresh clone can't even `cargo check` until someone
-has run `plugins/build.py` once. See `src-tauri/binaries/README.md`. Before
-an actual release build, always run `python plugins/build.py` to overwrite
-the placeholders with real frozen executables — `tauri build` doesn't
-distinguish a placeholder from a real binary, only that the file exists, so
-packaging with placeholders in place produces an app whose plugins can't
-start.
+even for a plain `cargo build`, not just packaging.** The real binaries are
+committed in `src-tauri/binaries/` as Git LFS objects, so a clone with LFS can
+build straight away. `plugins/build.py` records a hash of each binary's source
+in `src-tauri/binaries/manifest.json`, and `--verify-manifest` (run in CI)
+fails when a binary is older than its source or is an LFS pointer rather than
+the file — so after changing the engine or a plugin, rebuild it and commit the
+binary with its manifest entry.
 
 ### Resolving the bundled path from Rust
 
@@ -304,10 +311,8 @@ pub(crate) fn bundled_plugin_path(name: &str) -> Option<String> {
 
 This returns `None` in dev (`cargo run`/`tauri dev` never copies the bundled
 exe alongside the dev binary), in which case each plugin falls back to a bare
-PATH-relative name — a developer working on the plugin itself can point the
-relevant config field (`adaptive_pathway_launch_command`, `bigtiny_command`)
-at `uv run ...`/`python -m ...` instead, entirely independent of this
-resolution. `bigtiny::mcp::ensure_builtin_servers` uses the same resolution
+PATH-relative name (the engine falls back to `cargo run` against
+`BigTinyV2/daemon`). `bigtiny::mcp::ensure_builtin_servers` uses the same resolution
 for `kitty-tools.exe`/`kitty-web.exe`/`kitty-wasm.exe`
 when registering them with BigTiny.
 
