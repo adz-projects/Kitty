@@ -708,7 +708,7 @@ function FolderGroup({
 
 /** Save one chat as ChatML (+ .meta.json), built by the backend. */
 async function exportOne(row: SessionSummary) {
-  const base = (row.title || 'kitty-chat').replace(/[\/:*?"<>|]/g, '_').slice(0, 80);
+  const base = (row.title || 'kitty-chat').replace(/[\\/:*?"<>|]/g, '_').slice(0, 80);
   const path = await pickSavePath(`${base}.chatml`);
   if (!path) return;
   try {
