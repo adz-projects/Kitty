@@ -229,8 +229,34 @@ async fn collect_text(
     Ok(text)
 }
 
-/// Sessionless entry point for adaptive-pathway's learn passes, which have no
-/// per-session provider to fall back to — uses the router's current default.
+/// The chain pinned to one session's provider and model: what a pass *about*
+/// that session should use, so a chat's text is only ever sent to the
+/// provider that chat is already on. The engine serves several apps, and the
+/// sessionless fallback below picks whichever provider is healthiest across
+/// all of them — another app's, possibly.
+pub struct SessionSummarizer {
+    pub chain: Arc<SummarizerChain>,
+    pub provider_id: Option<String>,
+    pub model: Option<String>,
+}
+
+#[async_trait::async_trait]
+impl StructuredChat for SessionSummarizer {
+    async fn structured_chat(&self, messages: Vec<Value>, schema: &Value) -> Result<Value, String> {
+        self.chain
+            .structured_chat_for_session(
+                self.provider_id.as_deref(),
+                self.model.clone(),
+                messages,
+                schema,
+            )
+            .await
+    }
+}
+
+/// Sessionless entry point, for passes with no session to take a provider
+/// from (adaptive-pathway's background consolidation) — uses the router's
+/// current default.
 #[async_trait::async_trait]
 impl StructuredChat for SummarizerChain {
     async fn structured_chat(&self, messages: Vec<Value>, schema: &Value) -> Result<Value, String> {
@@ -263,6 +289,25 @@ mod tests {
 
     fn chain(router: Arc<ProviderRouter>, fallback: &str) -> SummarizerChain {
         SummarizerChain::new(None, router, cfg(fallback))
+    }
+
+    /// A pass about one session never borrows another provider: with no
+    /// provider of its own it fails, instead of taking the router's
+    /// healthiest — which on a shared engine may be another app's.
+    #[tokio::test]
+    async fn a_session_summarizer_never_falls_back_to_another_provider() {
+        let router = Arc::new(ProviderRouter::default());
+        router.register_openai("someone-elses", ProviderConfig::default());
+        let session = SessionSummarizer {
+            chain: Arc::new(chain(router, "session_model")),
+            provider_id: None,
+            model: None,
+        };
+        let err = session
+            .structured_chat(vec![], &json!({}))
+            .await
+            .unwrap_err();
+        assert!(err.contains("no provider available"), "got {err}");
     }
 
     /// With no local summarizer and `fallback: "off"`, both entry points must

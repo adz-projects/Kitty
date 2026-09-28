@@ -321,7 +321,10 @@ async fn drain_structured_answer(
 fn annotate_assistant(mut msg: Value, timing: &TimingResult) -> Value {
     if let Some(obj) = msg.as_object_mut() {
         if !timing.reasoning_text.trim().is_empty() {
-            obj.insert("_reasoning".into(), Value::String(timing.reasoning_text.clone()));
+            obj.insert(
+                "_reasoning".into(),
+                Value::String(timing.reasoning_text.clone()),
+            );
         }
         if let Some(p) = &timing.provider_id {
             obj.insert("_provider_id".into(), Value::String(p.clone()));
@@ -3486,11 +3489,13 @@ impl AgentLoop {
         }
 
         // Cloned before the compaction block below moves `last_provider_id`/
-        // `last_provider_model` — the title-derivation pass further down
-        // needs its own copies of whichever provider/model actually handled
-        // this turn.
+        // `last_provider_model` — the title-derivation and pathway learn
+        // passes further down need their own copies of whichever
+        // provider/model actually handled this turn.
         let title_provider_id = last_provider_id.clone();
         let title_provider_model = last_provider_model.clone();
+        let learn_provider_id = last_provider_id.clone();
+        let learn_provider_model = last_provider_model.clone();
 
         // Schema-constrained final answer.
         //
@@ -3618,7 +3623,13 @@ impl AgentLoop {
         // default cadence.
         let learn_every_n = self.pathway_cfg.learn_every_n.max(1);
         let host_pool = pool.clone();
-        let chat = self.summarizer.clone();
+        // This session's own provider, never another app's: see
+        // `SessionSummarizer`.
+        let chat = super::summarizer_chain::SessionSummarizer {
+            chain: self.summarizer.clone(),
+            provider_id: learn_provider_id,
+            model: learn_provider_model,
+        };
         let learn_session_id = session_id.to_string();
         // Kept back from the move below so the spawned task can still be
         // registered against the session that owns it.
@@ -3642,8 +3653,17 @@ impl AgentLoop {
             // falling back to 0 — `0 % N == 0` would otherwise make the
             // cadence gate "learn on every turn", and the bump's failure is
             // in no way a signal to alter cadence.
-            let Ok(exchange_count) = engine.db.bump_exchange(&learn_session_id).await else {
-                return;
+            let exchange_count = match engine.db.bump_exchange(&learn_session_id).await {
+                Ok(n) => n,
+                Err(e) => {
+                    // Logged: this is the first write of every learn pass, so
+                    // a database that refuses writes stops all learning here,
+                    // and silence is how that went unnoticed for weeks.
+                    tracing::warn!(
+                        "pathway turn-end learn skipped for {learn_session_id}: could not record the exchange: {e}"
+                    );
+                    return;
+                }
             };
             // The MAX(rowid) guard below is redundant with
             // `extract_and_record`'s watermark, so we skip re-deriving it here.
@@ -3660,7 +3680,7 @@ impl AgentLoop {
                     if let Err(e) = adaptive_pathway::learn::extract_and_record(
                         &engine,
                         &host_pool,
-                        chat.as_ref(),
+                        &chat,
                         adaptive_pathway::learn::LearnRequest {
                             session_id: &learn_session_id,
                             through_rowid: max_rowid,
@@ -4045,12 +4065,19 @@ impl AgentLoop {
         // The assistant message and the start frame go out *before* the wait:
         // the transcript is then already in its final shape, and the user
         // watches a live "collecting" card instead of a silent gap.
-        messages.push(build_assistant_message(content, std::slice::from_ref(&call)));
+        messages.push(build_assistant_message(
+            content,
+            std::slice::from_ref(&call),
+        ));
         Self::emit_auto_await_start(session_id, &call, &args, event_tx);
 
         let started = Instant::now();
         let collected = orchestrator
-            .collect(session_id, None, crate::agent::orchestrator::TicketWait::All)
+            .collect(
+                session_id,
+                None,
+                crate::agent::orchestrator::TicketWait::All,
+            )
             .await;
         let ok = collected.is_ok();
         let result = Self::auto_await_result(collected, note);
@@ -4095,7 +4122,11 @@ impl AgentLoop {
         }
         let started = Instant::now();
         let Ok(collected) = orchestrator
-            .collect(session_id, None, crate::agent::orchestrator::TicketWait::None)
+            .collect(
+                session_id,
+                None,
+                crate::agent::orchestrator::TicketWait::None,
+            )
             .await
         else {
             // `ids: None` cannot error today; were that to change, a failed
@@ -4757,7 +4788,11 @@ fn reports_tool_error(content: &str) -> bool {
     }
     serde_json::from_str::<Value>(trimmed)
         .ok()
-        .and_then(|v| v.get("status").and_then(|s| s.as_str()).map(|s| s == "error"))
+        .and_then(|v| {
+            v.get("status")
+                .and_then(|s| s.as_str())
+                .map(|s| s == "error")
+        })
         .unwrap_or(false)
 }
 
@@ -4790,11 +4825,17 @@ mod tool_error_tests {
 
     #[test]
     fn a_json_error_envelope_counts_as_a_tool_error() {
-        assert!(reports_tool_error(r#"{"status": "error", "error_code": "NOT_FOUND"}"#));
-        assert!(reports_tool_error("  
-{\"status\":\"error\"}"));
+        assert!(reports_tool_error(
+            r#"{"status": "error", "error_code": "NOT_FOUND"}"#
+        ));
+        assert!(reports_tool_error(
+            "  
+{\"status\":\"error\"}"
+        ));
         assert!(!reports_tool_error(r#"{"status": "ok", "data": 1}"#));
-        assert!(!reports_tool_error("plain text that mentions status: error"));
+        assert!(!reports_tool_error(
+            "plain text that mentions status: error"
+        ));
         assert!(!reports_tool_error(r#"[{"status":"error"}]"#));
     }
 }
