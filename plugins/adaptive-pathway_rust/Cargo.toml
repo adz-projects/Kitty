@@ -1,6 +1,6 @@
 [package]
 name = "adaptive-pathway"
-version = "0.11.4"
+version = "0.12.0"
 edition = "2021"
 publish = false
 description = "Behavioral memory engine: models who the user is and how the assistant should adapt. Rust rewrite of plugins/adaptive-pathway, linked in-process into the BigTiny daemon. See docs/adaptive-pathway-v2.md."
