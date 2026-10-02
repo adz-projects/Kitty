@@ -510,9 +510,13 @@ fn default_extraction_timeout_s() -> u64 {
     // Headroom for a local generative extraction pass: the daemon's Gemma-E2B
     // summarizer, even on the CPU fallback, does not finish a structured JSON
     // extraction within the old 12s cap, so every chunk timed out and stayed
-    // `pending` with zero propositions produced. 60s completes comfortably on
-    // CPU and is a wide margin on GPU.
-    60
+    // `pending` with zero propositions produced. 60s was still too tight in
+    // practice: extraction runs in the background on whichever model the
+    // chain picks, and a long chunk on a busy provider or the CPU fallback
+    // timed out at 60s again and again. 300s matches the summarizer chain's
+    // own wall-clock cap (`SUMMARIZER_OVERALL_TIMEOUT`), so the chain, not
+    // this budget, decides when a call has failed.
+    300
 }
 fn default_extraction_retry_backoff_s() -> u64 {
     60

@@ -187,7 +187,7 @@ Selected defaults (see the file for the full table and rationale comments):
   `injection_token_cap=500` (compact per-turn summary+index injected into context).
 - **Extraction** (`Config.extraction`, used by the standalone/test path only — the
   BigTiny plugin injects `SummarizerChain` and ignores these): `provider_url`,
-  `model="qwen3:4b"`, `timeout_s=12`, `retry_backoff_s=60`, `max_concurrent=1`,
+  `model="qwen3:4b"`, `timeout_s=300`, `retry_backoff_s=60`, `max_concurrent=1`,
   `batch_size=5`.
 - **Maintenance**: `maintenance_tick_s=60`, `maintenance_heavy_interval_hours=24`.
 
