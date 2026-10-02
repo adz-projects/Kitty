@@ -125,6 +125,23 @@ server you run yourself.
   silently degrades to an in-memory mock, so it is excluded from the Android
   dependency graph entirely).
 
+## Installing
+
+Kitty is distributed **unsigned**, so both platforms warn on first install.
+That is expected.
+
+- **Windows:** download `Kitty_<version>_x64-setup.exe` from
+  [Releases](https://github.com/adz-projects/Kitty/releases) and run it. If
+  SmartScreen shows "Windows protected your PC", choose **More info → Run
+  anyway**. Kitty installs for the current user only; no admin rights needed.
+  Uninstall from Settings → Apps. Tick "Delete the application data" to also
+  remove Kitty's chats, settings, models and saved keys (other apps sharing
+  the engine keep theirs).
+- **Android** (arm64 only): copy the APK to the phone and open it. Allow
+  "Install unknown apps" for the app you opened it from when Android asks, and
+  if Play Protect warns about an unrecognised developer, choose **More details
+  → Install anyway**.
+
 ## Getting started
 
 Prerequisites: Node.js with [pnpm](https://pnpm.io), a Rust toolchain via

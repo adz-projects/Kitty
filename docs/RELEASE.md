@@ -79,9 +79,10 @@ two things beyond the ordinary `cargo build`:
 
 ### Signing
 
-Kitty 1.0 ships **unsigned** (a deliberate decision, not an oversight). Before public distribution, obtain an Authenticode certificate and
-set Tauri's `bundle.windows.certificateThumbprint` (or `signCommand`) so the
-exe + NSIS installer are signed; otherwise SmartScreen warns on first run.
+Kitty 1.0 ships **unsigned** (a deliberate decision, not an oversight). To
+sign later, obtain an Authenticode certificate and set Tauri's
+`bundle.windows.certificateThumbprint` (or `signCommand`) so the exe and the
+NSIS installer are signed; until then SmartScreen warns on first run.
 
 Until then, expect: installing or first-running the unsigned `...-setup.exe`
 (or the installed `kitty.exe` itself) shows Windows SmartScreen's "Windows
@@ -224,6 +225,14 @@ result is a valid, installable APK carrying a full dead copy of the largest
 thing in it — observed twice: 578 MB against 285 MB of live entries (48%
 orphaned), and 807 MB on an earlier run. Nothing warns you; the build succeeds
 and `adb install` works.
+
+**Signing.** Android, too, ships without a release keystore for 1.0. Play
+requires a signed AAB, so an unsigned build is for sideloading only: sign the
+APK with a local key (`apksigner sign --ks <keystore> <apk>`), since Android
+refuses to install an unsigned one. The user then allows "Install unknown
+apps" for the app they open it from, and taps through Play Protect's
+"unrecognised developer" warning (**More details → Install anyway**); the
+README's "Installing" section says the same to users.
 
 Check any APK you are about to ship or sideload:
 
