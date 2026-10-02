@@ -5,14 +5,7 @@ open an item here instead.
 
 ## Open
 
-- **Uninstall doesn't yet run the data cleanup (release step R1).**
-  `kitty.exe --uninstall-cleanup` exists (`src-tauri/src/uninstall.rs`): it
-  removes Kitty's data from the engine (`DELETE /api/apps/me?purge=true`, other
-  apps untouched), Kitty's credentials, config, models, chat folders and the
-  tool cache. `src-tauri/nsis-hooks.nsh` does not call it yet. It belongs in
-  `NSIS_HOOK_PREUNINSTALL` when Tauri's "delete app data" checkbox is ticked,
-  and it must run **before** `AskToStopDaemon`, because reaching the engine may
-  start it.
+Nothing open.
 
 ## Noted for later
 

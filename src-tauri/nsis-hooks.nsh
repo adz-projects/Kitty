@@ -73,15 +73,15 @@
     IfSilent stop_daemon_${SUFFIX}
 
     MessageBox MB_YESNO|MB_ICONQUESTION \
-      "BigTiny is still running.$\n$\n\
+      "Kitty's engine is still running.$\n$\n\
 It has to stop before the files it has open can be replaced, but it is shared \
 — another app may be attached to it, and a scheduled task may be running with \
 no window open.$\n$\n\
-Stop BigTiny and continue?" \
+Stop the engine and continue?" \
       IDYES stop_daemon_${SUFFIX}
 
-    Abort "Cancelled — BigTiny is still running. Close it, or re-run this and \
-choose Yes."
+    Abort "Cancelled — Kitty's engine is still running. Re-run this and choose \
+Yes to stop it."
 
   stop_daemon_${SUFFIX}:
     nsExec::Exec 'taskkill /F /IM bigtiny2-daemon.exe'
@@ -99,8 +99,28 @@ choose Yes."
   !insertmacro AskToStopDaemon "install"
 !macroend
 
+; "Delete the application data" (Tauri's checkbox on the uninstall page, never
+; set by an upgrade's `/UPDATE` uninstall). Tauri itself only removes
+; `%APPDATA%\<identifier>`, which is not where Kitty keeps anything. Kitty's
+; own `--uninstall-cleanup` (`src/uninstall.rs`) removes the rest: its data in
+; the shared engine (other apps' untouched), its credentials, settings, models,
+; chat folders and the tool cache, logging to `%TEMP%\kitty-uninstall.log`.
+;
+; Order matters: after `StopKittyProcesses` (which would otherwise kill this
+; very process), and before `AskToStopDaemon`, because the purge goes through
+; the engine and reaching it may start it. `ExecWait` blocks until it is done;
+; it always exits 0, so its result is not checked.
+!macro DeleteKittyData
+  ${If} $DeleteAppDataCheckboxState = 1
+  ${AndIf} $UpdateMode <> 1
+    DetailPrint "Removing Kitty's data..."
+    ExecWait '"$INSTDIR\kitty.exe" --uninstall-cleanup'
+  ${EndIf}
+!macroend
+
 !macro NSIS_HOOK_PREUNINSTALL
   !insertmacro StopKittyProcesses
+  !insertmacro DeleteKittyData
   !insertmacro AskToStopDaemon "uninstall"
 !macroend
 

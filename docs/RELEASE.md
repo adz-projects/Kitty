@@ -123,11 +123,12 @@ proceed — this is expected, not a build failure.
   from another chat while you're elsewhere) → resume a session → export it →
   change a start-up setting and watch the engine restart (or say who is in
   the way).
-- Uninstall: `kitty.exe --uninstall-cleanup` removes Kitty's data from the
-  engine (other apps' untouched), its credentials, config, models, chat folders
-  and tool cache, logging to `%TEMP%\kitty-uninstall.log`. **The NSIS hook
-  that runs it when "delete app data" is ticked is not wired yet** (M5, R1);
-  it must run it before asking the engine to stop.
+- Uninstall with "Delete the application data" ticked: the NSIS hook runs
+  `kitty.exe --uninstall-cleanup` before asking the engine to stop. Kitty's
+  rows are gone from the engine while another app's are intact, the `kitty`
+  credentials are gone, and so are the config, models, chat folders and tool
+  cache (`%TEMP%\kitty-uninstall.log` lists each step). Unticked, everything
+  stays; an upgrade never runs it.
 - Soak: repeated summon/dismiss during active streams. Kitty never kills the
   engine — it is shared and exits on its own idle timer.
 
