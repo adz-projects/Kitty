@@ -1,13 +1,9 @@
 # Kitty
 
-An agentic AI chat client for **Windows and Android**, built on Tauri v2.
-
-On Windows it is a hotkey-summoned floating overlay that expands into a full
-window with chat history and an artifacts pane. On Android it is a single
-routed window with a menu drawer, and a share target other apps can send
-text, images and documents to. Both run the same React component tree —
-platform differences are a handful of `isAndroid()` gates and one CSS
-breakpoint, never a forked UI.
+An agentic AI chat client for **Windows**, built on Tauri v2: a
+hotkey-summoned floating overlay that expands into a full window with chat
+history and an artifacts pane. The same code can also be compiled for Android
+(see [Compiling for Android](#compiling-for-android)).
 
 Kitty is the **client layer**: windows, hotkeys, theming, tool approvals, file
 and screenshot context, provider configuration, and attaching to the engine.
@@ -17,30 +13,21 @@ engine in this repo at `BigTinyV2/daemon/`.
 
 ## How it runs
 
-The same engine is hosted two different ways, behind one HTTP boundary:
-
-| | Windows | Android |
-|---|---|---|
-| BigTiny V2 | a shared `bigtiny2-daemon.exe` Kitty attaches to (and starts if none is running) | linked in, hosted in-process |
-| MCP tool servers | bundled `.exe`s over stdio | in-process over `tokio::io::duplex` |
-
-On Windows the engine is shared: other apps can attach to the same instance,
-each with its own chats, providers and schedules. Kitty registers as the app
+Kitty attaches to a shared `bigtiny2-daemon.exe`, starting one if none is
+running, and the engine runs the bundled MCP tool servers as `.exe`s over
+stdio. The engine is shared: other apps can attach to the same instance, each
+with its own chats, providers and schedules. Kitty registers as the app
 `kitty` and authenticates with an app key kept in the Credential Manager —
 never in the webview. It never kills the engine; when a start-up setting
 changes, it asks the engine to restart, which happens only when no other app
-is using it.
-
-Android needs the in-process path because Android 10+ refuses to `exec()` a
-binary out of app-writable storage. Nothing above `lifecycle/` knows the
-difference.
+is using it (or you choose "Restart anyway").
 
 ## Tools
 
 The agent gets its capabilities from three bundled MCP servers, all Rust, all
 on by default and requiring no credentials.
 
-**`kitty-tools` — 26 local-machine tools (24 on Android, which has no shell).**
+**`kitty-tools` — 26 local-machine tools.**
 Shell execution; file read/write/append/replace with pagination; workspace
 analysis; Word document read/outline/**write** (including hyperlinks); Excel
 inspect/read; PDF text/outline; image reading; a persistent scratchpad; and a
@@ -61,18 +48,18 @@ disk with a keyword index instead of flooding the context.
 
 **`kitty-wasm` — 4 tools.** Runs Python — or any WASI module — inside a
 wasmtime sandbox with enforced time and memory ceilings, no network, and no
-filesystem beyond explicit mounts. The CPython guest ships with the app on
-Windows; on Android it downloads once and is then cached.
+filesystem beyond explicit mounts. The CPython guest ships with the app.
 
 ### Approvals
 
-The engine pauses on tool calls. Kitty answers the safe ones itself — file
-operations inside the chat's own folders, shell commands that aren't
-security-sensitive — and asks you about the rest: inline if that chat is on
-screen, otherwise a dialog over whatever Kitty shows (summoning the overlay if
-nothing is showing), plus a notification. "Always allow" covers the tool, or
-for a shell call the command's first two words, and every such rule can be
-revoked in Settings → Tool permissions.
+The engine pauses on tool calls, and Kitty answers most of them itself. It
+asks you only when a call reaches a file outside the chat's own folders or
+runs a shell command that looks security-sensitive: inline if that chat is on
+screen, otherwise in a dialog over whatever Kitty shows (summoning the overlay,
+with a notification, if no Kitty window is showing). "Always allow" covers the
+tool, or for a shell call the command's first two words, and every such rule
+can be revoked in Settings → Tool permissions. An approval for a scheduled
+task that nobody answers is denied after 10 minutes.
 
 ### Memory
 
@@ -87,7 +74,7 @@ Settings.
   sessions, a diverse handful injected per turn — framed as working assumptions
   to check a request against, never a profile to conform to. Its
   `record`/`forget` tools let the model drop a belief you tell it is wrong.
-- **Memorabilia** (`plugins/memorabilia_rust/`, desktop only) remembers what is
+- **Memorabilia** (`plugins/memorabilia_rust/`) remembers what is
   true in the material you bring in. It learns from **documents, not
   dialogue** — text you pasted, files you attached, pages the model scraped —
   distils single factual claims from them, consolidates identical claims across
@@ -100,19 +87,17 @@ Kitty runs **no inference process of its own**, and there is no local chat —
 chat always goes to a provider you connect. LiteRT is linked into the engine
 for two local jobs:
 
-- **Semantic embeddings** for memory (EmbeddingGemma), on both platforms.
-- **Summarizing long chats**, on **Windows only** and optional: with the local
-  summarizer model downloaded it happens on your computer; otherwise the chat's
-  provider does it. Android always uses the provider, so no generative model
-  runs on the phone.
+- **Semantic embeddings** for memory (EmbeddingGemma).
+- **Summarizing long chats**, optionally: with the local summarizer model
+  downloaded and chosen in Settings → Advanced, it happens on your computer;
+  otherwise the chat's provider does it.
 
 `provider_type: "ollama"` survives only as a *remote* endpoint dialect for a
 server you run yourself.
 
 ## Tech stack
 
-- **Shell** — Tauri v2. Windows ships an NSIS installer; Android ships an AAB
-  (`aarch64` is the only supported ABI).
+- **Shell** — Tauri v2, shipped as an NSIS installer.
 - **Frontend** — React 18 + TypeScript + Vite. Zustand for UI state. Plain CSS
   with custom properties, so a theme is a single droppable `.css` file. No
   Tailwind, no CSS-in-JS.
@@ -120,27 +105,19 @@ server you run yourself.
   directly, which keeps the app key out of JS and avoids CORS entirely.
   Streaming reaches the UI as Tauri events.
 - **Secrets** — Windows Credential Manager via `keyring`; the engine keeps its
-  own key DPAPI-protected. On Android, AES-256-GCM sealed under a
-  non-exportable AndroidKeyStore key (`keyring` has no Android backend — it
-  silently degrades to an in-memory mock, so it is excluded from the Android
-  dependency graph entirely).
+  own at-rest key DPAPI-protected.
 
 ## Installing
 
-Kitty is distributed **unsigned**, so both platforms warn on first install.
-That is expected.
+Download `Kitty_<version>_x64-setup.exe` from
+[Releases](https://github.com/adz-projects/Kitty/releases) and run it. The
+installer is **unsigned**, so SmartScreen may show "Windows protected your
+PC": choose **More info → Run anyway**. Kitty installs for the current user
+only.
 
-- **Windows:** download `Kitty_<version>_x64-setup.exe` from
-  [Releases](https://github.com/adz-projects/Kitty/releases) and run it. If
-  SmartScreen shows "Windows protected your PC", choose **More info → Run
-  anyway**. Kitty installs for the current user only; no admin rights needed.
-  Uninstall from Settings → Apps. Tick "Delete the application data" to also
-  remove Kitty's chats, settings, models and saved keys (other apps sharing
-  the engine keep theirs).
-- **Android** (arm64 only): copy the APK to the phone and open it. Allow
-  "Install unknown apps" for the app you opened it from when Android asks, and
-  if Play Protect warns about an unrecognised developer, choose **More details
-  → Install anyway**.
+Uninstall from Settings → Apps. Tick "Delete the application data" to also
+remove Kitty's chats, settings, models, chat folders and saved keys (other
+apps sharing the engine keep theirs).
 
 ## Getting started
 
@@ -167,7 +144,7 @@ ever run.
 | `pnpm test` | `vitest run` |
 | `pnpm lint` | `eslint . && prettier --check .` |
 | `cargo test` / `cargo clippy` (in `src-tauri/`) | Rust tests and lint |
-| `cargo ndk -t arm64-v8a clippy --lib` (in `src-tauri/`) | Android lint |
+| `cargo ndk -t arm64-v8a clippy --lib` (in `src-tauri/`) | Lint the Android build |
 | `cargo test` (in `BigTinyV2/daemon/`, `plugins/<name>/`) | The engine's and a plugin's own suites |
 | `python plugins/build.py [target]` | Build the bundled binaries and update `manifest.json` |
 | `python plugins/build.py --verify-manifest` | Check the committed binaries match their source |
@@ -188,13 +165,22 @@ python plugins/build.py
 pnpm tauri build
 ```
 
-Android, which needs an explicit target:
+`docs/RELEASE.md` has the full checklist.
+
+### Compiling for Android
+
+The project also compiles for Android (`aarch64` only). There the same engine
+is linked into the app and hosted in-process, with the MCP servers in-process
+too, because Android refuses to run a separate executable from app storage;
+nothing above `src-tauri/src/lifecycle/` knows the difference.
+`plugins/build.py` is not needed for it:
 
 ```bash
-pnpm tauri android build --aab --target aarch64
+pnpm tauri android build --apk --target aarch64
 ```
 
-`docs/RELEASE.md` has both lanes in full.
+`--target aarch64` is required. `docs/ANDROID.md` and `docs/RELEASE.md` have
+the details.
 
 ## Documentation
 
@@ -203,8 +189,8 @@ pnpm tauri android build --aab --target aarch64
 | [`CLAUDE.md`](CLAUDE.md) | Architectural rules and coding conventions — the spec |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Current module map with dependency direction |
 | [`docs/PLUGINS.md`](docs/PLUGINS.md) | How bundled plugins are built and integrated |
-| [`docs/ANDROID.md`](docs/ANDROID.md) | The Android port: constraints, decisions, contracts |
-| [`docs/RELEASE.md`](docs/RELEASE.md) | Build and release checklist, both platforms |
+| [`docs/ANDROID.md`](docs/ANDROID.md) | Compiling for Android: constraints and decisions |
+| [`docs/RELEASE.md`](docs/RELEASE.md) | Build and release checklist |
 | [`docs/VERSIONS.md`](docs/VERSIONS.md) | Pinned versions and verified external contracts |
 | [`docs/BACKLOG.md`](docs/BACKLOG.md) | Known gaps and deferred work |
 | [`docs/bigtiny-backend.md`](docs/bigtiny-backend.md) | The engine contract from Kitty's side |
