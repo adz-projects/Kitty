@@ -90,7 +90,10 @@ impl SummarizerChain {
         match local.structured_chat(messages.to_vec(), schema).await {
             Ok(v) => Some(v),
             Err(e) => {
-                tracing::debug!("local summarizer unavailable/failed, falling back: {e}");
+                // `warn`, not `debug`: the chat provider is only a fallback for
+                // the local model, so every time it is used the log should say
+                // why the local leg did not answer.
+                tracing::warn!("local summarizer unavailable/failed, falling back: {e}");
                 None
             }
         }

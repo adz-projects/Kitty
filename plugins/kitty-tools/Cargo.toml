@@ -1,6 +1,6 @@
 [package]
 name = "kitty-tools"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 publish = false
 description = "Word document tools (read/outline/write) — the Rust half of the lean_mcp.py split. See docs/PLUGINS.md."

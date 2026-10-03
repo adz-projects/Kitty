@@ -170,7 +170,13 @@ pub async fn extract_and_record<S: StructuredChat>(
     // this trait is also implemented by test mocks with none) guards
     // against a hung call holding the permit, and therefore every other
     // session's learn pass, forever.
-    const STRUCTURED_CHAT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+    //
+    // 300s, matching the daemon's summarizer chain wall-clock cap
+    // (`SUMMARIZER_OVERALL_TIMEOUT`), so the chain -- not this budget --
+    // decides when a call has failed. The turn's own provider does this pass
+    // (a remote or reasoning model routinely needs well over the old 30s), and
+    // at 30s every pass on such a provider timed out and nothing was learned.
+    const STRUCTURED_CHAT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
     let prompt = build_extraction_prompt(&known, &chunk);
     let parsed = {
         let _permit = engine.chat_semaphore().acquire_owned().await.map_err(

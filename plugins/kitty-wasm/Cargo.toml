@@ -1,6 +1,6 @@
 [package]
 name = "kitty-wasm"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 publish = false
 description = "Sandboxed WebAssembly compute environment (wasmtime + WASI) with a CPython guest — the Rust replacement for the wasm-math-mcp Python plugin. See docs/PLUGINS.md."
