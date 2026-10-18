@@ -157,9 +157,10 @@ pub(crate) fn provider_body(
         "subagent_role": profile.subagent_role.as_deref().filter(|r| !r.is_empty()),
         "cost_tier": cost_tier,
         "capability_rank": capability_rank,
-        // Negated so a row written before this existed reads as "supports
-        // tools" (see the daemon's `ProviderConfig::tools_unsupported`).
-        "tools_unsupported": !profile.tools_supported(catalog),
+        // The engine reads this key (router `register_from_row`): only an
+        // explicit `false` marks the card tool-less, so a row written before
+        // it existed still reads as "supports tools".
+        "supports_tools": profile.tools_supported(catalog),
     });
     ProviderCard {
         id: profile.id.clone(),
@@ -387,12 +388,14 @@ mod tests {
             assert!(config[key].is_null(), "{key} is unset");
         }
         assert_eq!(config["model"], "a/b");
-        assert_eq!(config["tools_unsupported"], false);
+        assert_eq!(config["supports_tools"], true);
+        assert!(!config.contains_key("tools_unsupported"));
 
+        // A tool-less card must reach the engine under the key it reads.
         p.supports_tools = Some(false);
         assert_eq!(
-            provider_body(&p, None, None).config["tools_unsupported"],
-            true
+            provider_body(&p, None, None).config["supports_tools"],
+            false
         );
     }
 
