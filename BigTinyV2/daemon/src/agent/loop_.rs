@@ -278,7 +278,11 @@ fn sampling_fingerprint(s: &crate::provider::base::SamplingParams) -> Value {
         "presence_penalty": s.presence_penalty,
         "frequency_penalty": s.frequency_penalty,
         "max_tokens": s.max_tokens,
-        "effort": s.effort.as_ref().and_then(|e| e.wire_level()),
+        "effort": s.effort.as_ref().map(|e| match e {
+            crate::provider::base::Effort::Off => "off",
+            crate::provider::base::Effort::On => "on",
+            other => other.wire_level().unwrap_or(""),
+        }),
         "reasoning_max_tokens": s.reasoning_max_tokens,
     })
 }

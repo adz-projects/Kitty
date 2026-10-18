@@ -59,13 +59,32 @@ Never a silently wrong-shaped call.
 | `GET /api/chat/` | `?limit&offset`; `total` is scoped to you |
 | `PATCH /api/chat/{id}` | rename |
 | `DELETE /api/chat/{id}` | 404 if it matched nothing |
-| `PATCH /api/chat/{id}/config` | shallow-merges metadata |
+| `PATCH /api/chat/{id}/config` | shallow-merges metadata; see "Reasoning effort" below |
 | `GET /api/chat/{id}/history` | bare array |
 | `POST /api/chat/{id}/send` | SSE stream, below |
 | `GET /api/chat/{id}/stream` | rejoin a turn in progress |
 | `POST /api/chat/{id}/fork` | the fork belongs to the forking app |
 | `POST /api/chat/{id}/cancel`, `/compact`, `/approve` | |
 | `GET /api/chat/{id}/stats`, `/timings`, `/pending` | |
+
+**Reasoning effort.** A session's `thinking_effort` metadata key (a string,
+set through `PATCH /api/chat/{id}/config`) is translated per provider dialect
+on every turn. `""` or absent: no effort sent, the model's own default.
+`off` or `none`: reasoning off. `on`: reasoning on with no grade (toggle-only
+models). Anything else (`minimal`, `low`, `medium`, `high`, `xhigh`, `max`,
+or a self-hosted template's own level) is sent **verbatim**: the caller is
+expected to send only levels it detected for the model.
+
+| Dialect (`provider_dialect`) | Graded level | Off | On |
+|---|---|---|---|
+| `openai`, `fireworks`, `deepinfra` | `reasoning_effort: <level>` | `reasoning_effort: "none"` | nothing |
+| `openrouter` | `reasoning: {effort: <level>}` (or `{max_tokens}` under a reasoning cap) | `reasoning: {enabled: false}` | `reasoning: {enabled: true}` |
+| `custom_openai`, `ollama` | `chat_template_kwargs: {enable_thinking: true, reasoning_effort}` + top-level `reasoning_effort` | `enable_thinking: false` | `enable_thinking: true` |
+| `anthropic`, provider `config.anthropic_thinking: "adaptive"` | `thinking: {type: "adaptive"}` + `output_config: {effort}` | `thinking: {type: "disabled"}` | `thinking: {type: "adaptive"}` |
+| `anthropic`, `anthropic_thinking` absent or `"budget"` | `thinking: {type: "enabled", budget_tokens}` (4096 / 16384 / 32768) | no `thinking` | top budget |
+
+A 400 that rejects the effort control is reported as a `provider_error` with
+`error_type: "effort_rejected"` and is not retried.
 
 **One turn per session.** A second concurrent `POST /send` is **409**. To run
 work in parallel, use several sessions — that is what `parent_session_id`

@@ -101,12 +101,11 @@ pub struct Config {
     pub session_folders: HashMap<String, String>,
     /// Whether the main window's artifacts pane is shown (Round-3 item 6).
     pub show_artifacts: bool,
-    /// Per-session reasoning-effort choice (item: thinking effort). Maps a
-    /// session id → the wire value (`"off"`/`"low"`/`"medium"`/`"high"`) last
-    /// chosen for it. Persisted so resuming a session keeps its effort;
-    /// re-derived against the *active provider's* capability each time it's
-    /// read (see `bigtiny::effort`), so a session that later points at a
-    /// provider with no effort control just stops offering the dropdown.
+    /// Per-session reasoning-effort choice. Maps a session id → the wire value
+    /// (`"off"`, `"on"`, or one of its model's levels) last chosen for it.
+    /// Persisted so resuming a session keeps its effort; re-checked against
+    /// the ladder of the *chat's own card* each time it's read (see
+    /// `bigtiny::effort`), so a value its card doesn't offer never sticks.
     #[serde(default)]
     pub session_efforts: HashMap<String, String>,
     /// Per-**model** reasoning-effort memory: `"<provider id>\0<model>"` → the
@@ -126,6 +125,16 @@ pub struct Config {
     /// rewrite the model's remembered default.
     #[serde(default)]
     pub model_efforts: HashMap<String, String>,
+    /// Per-**model** reasoning ladder, as detected: `"<provider id>\0<model>"`
+    /// -> the levels that card's model offers, whether Off is one of them,
+    /// where that came from and when. Same key shape as `model_efforts`.
+    ///
+    /// Written only by `bigtiny::effort` detection (on save, at startup for
+    /// cards without one, on "Re-detect", and when the engine reports a
+    /// rejected level). A detection that learns nothing never overwrites an
+    /// entry, so a failed re-detect leaves the card as it was.
+    #[serde(default)]
+    pub effort_caps: HashMap<String, crate::bigtiny::effort::EffortCaps>,
     /// Per-**model** context-window memory: `"<provider id>\0<model>"` -> the
     /// window discovered for that pair, in tokens. Same key shape and the same
     /// reasoning as `model_efforts` above.
@@ -437,6 +446,7 @@ impl Default for Config {
             show_artifacts: true,
             session_efforts: HashMap::new(),
             model_efforts: HashMap::new(),
+            effort_caps: HashMap::new(),
             model_context_lengths: HashMap::new(),
             model_vision: HashMap::new(),
             adaptive_pathway_enabled: default_adaptive_pathway_enabled(),

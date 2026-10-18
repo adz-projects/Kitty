@@ -418,6 +418,10 @@ impl ProviderRouter {
             // means it can call tools.
             tools_unsupported: config_json.get("supports_tools").and_then(|v| v.as_bool())
                 == Some(false),
+            anthropic_thinking: config_json
+                .get("anthropic_thinking")
+                .and_then(|v| v.as_str())
+                .map(String::from),
         };
 
         // Carry the row's owner into the registry. Registering as `None`

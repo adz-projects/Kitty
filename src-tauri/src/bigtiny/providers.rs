@@ -54,17 +54,22 @@ fn normalize_scheme(base_url: &str) -> String {
 /// Called at every attach and after any card is added, edited, duplicated or
 /// deleted.
 pub async fn sync_all_providers(app: &AppHandle) -> Result<(), String> {
-    let (profiles, default_id) = {
+    let (profiles, default_id, anthropic_thinking) = {
         let state = app.state::<AppState>();
         let cfg = state.config.lock().unwrap();
-        (
-            cfg.providers
-                .iter()
-                .filter(|p| p.is_usable())
-                .cloned()
-                .collect::<Vec<_>>(),
-            cfg.active_provider_id.clone(),
-        )
+        let profiles = cfg
+            .providers
+            .iter()
+            .filter(|p| p.is_usable())
+            .cloned()
+            .collect::<Vec<_>>();
+        let anthropic_thinking = profiles
+            .iter()
+            .filter_map(|p| {
+                crate::bigtiny::effort::anthropic_thinking_for(&cfg, p).map(|m| (p.id.clone(), m))
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        (profiles, cfg.active_provider_id.clone(), anthropic_thinking)
     };
     let catalog = {
         let state = app.state::<AppState>();
@@ -75,7 +80,11 @@ pub async fn sync_all_providers(app: &AppHandle) -> Result<(), String> {
     let mut cards = Vec::with_capacity(profiles.len());
     for profile in profiles {
         let api_key = get_secret_async(&profile.id).await;
-        let body = provider_body(&profile, catalog.as_ref(), api_key);
+        let mut body = provider_body(&profile, catalog.as_ref(), api_key);
+        // Detected per card+model by `bigtiny::effort`; tells the engine
+        // whether this Claude takes adaptive thinking + `output_config.effort`
+        // or the older `budget_tokens` block. `null` keeps the engine default.
+        body.config["anthropic_thinking"] = json!(anthropic_thinking.get(&profile.id));
         cards.push(body);
     }
     let client = ensure_client(app)?;
@@ -300,6 +309,7 @@ pub async fn set_session_provider(
     let Ok(client) = ensure_client(app) else {
         return;
     };
+    crate::bigtiny::effort::remember_session_card(app, session_id, provider_id, model);
     let _ = client
         .patch_json(
             &format!("/api/chat/{session_id}/config"),
@@ -313,6 +323,10 @@ pub async fn set_session_provider(
             }),
         )
         .await;
+    // The chat's level has to fit its new card's ladder, and the engine has
+    // to hear about it now — a chat with history has no first turn left to
+    // confirm on.
+    crate::bigtiny::effort::reapply_after_card_change(app, session_id).await;
 }
 
 #[cfg(test)]

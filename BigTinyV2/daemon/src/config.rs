@@ -251,6 +251,15 @@ pub struct ProviderConfig {
     /// tool away.
     #[serde(default)]
     pub tools_unsupported: bool,
+    /// How an Anthropic model takes reasoning effort: `"adaptive"` for the
+    /// current models (`thinking: {type: "adaptive"}` plus
+    /// `output_config.effort`; a `budget_tokens` block is a 400 on Opus 4.7+,
+    /// Sonnet 5+ and Fable), `"budget"` (or absent) for the older
+    /// `thinking: {type: "enabled", budget_tokens}` shape. Written by a client
+    /// that detected it (Kitty reads the Models API); absent keeps the budget
+    /// behaviour every client had before, so nothing changes for them.
+    #[serde(default)]
+    pub anthropic_thinking: Option<String>,
 }
 
 impl ProviderConfig {

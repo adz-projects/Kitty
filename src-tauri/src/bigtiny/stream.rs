@@ -349,6 +349,9 @@ pub async fn send_prompt(
                 error_type,
                 ..
             }) => {
+                if error_type.as_deref() == Some("effort_rejected") {
+                    crate::bigtiny::effort::on_effort_rejected(&app_bg, &session_id);
+                }
                 let _ = app_bg.emit(
                     "chat://error",
                     json!({ "session_id": session_id, "message": &message, "error_type": error_type }),

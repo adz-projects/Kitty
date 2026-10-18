@@ -6,12 +6,11 @@ use tauri::{AppHandle, Manager};
 use super::{resolve_cwd, SessionInfo, ThinkingEffort};
 use crate::state::AppState;
 
-/// Set the active session's thinking/reasoning effort. Persists the choice
-/// (so a resumed session keeps it), PATCHes it into the daemon session's
-/// metadata for the agent loop to translate per dialect next turn, then
-/// returns the effort recomputed against the active provider — which also
-/// drops a value the current provider doesn't offer. `Ok(None)` when the
-/// active provider has no effort control (the UI then hides the dropdown).
+/// Set a chat's reasoning effort. Persists the choice (so a resumed chat
+/// keeps it), PATCHes it into the engine session's metadata for the agent
+/// loop to translate per dialect next turn, then returns the effort
+/// recomputed against the chat's own card. `Ok(None)` when that card's model
+/// has no effort control (the UI then hides the picker).
 #[tauri::command]
 pub async fn set_thinking_effort(
     app: AppHandle,
@@ -26,28 +25,18 @@ pub async fn set_thinking_effort(
         crate::config::save(&cfg).map_err(|e| e.to_string())?;
     }
     crate::bigtiny::sessions::update_thinking_effort(&app, &session_id, &value).await?;
-    crate::bigtiny::effort::ensure_effort_levels_cached(&app).await;
-    Ok(crate::bigtiny::effort::thinking_effort_for(
-        &app,
-        &session_id,
-    ))
+    Ok(crate::bigtiny::effort::thinking_effort_for_session(&app, &session_id).await)
 }
 
-/// Read the effort control for a session, recomputed against the active
-/// provider. The frontend calls this when the provider or model changes
-/// mid-session so the dropdown appears/disappears/re-scopes without a reload.
+/// Read the effort control for a chat, resolved against the chat's own card.
+/// The frontend calls this when the chat's card changes, or a detection for
+/// it lands, so the picker appears/disappears/re-scopes without a reload.
 #[tauri::command]
 pub async fn get_thinking_effort(
     app: AppHandle,
     session_id: String,
 ) -> Result<Option<ThinkingEffort>, String> {
-    // Discover a self-hosted model's own effort levels (once per provider+model)
-    // before reading — the sync read below then reflects them.
-    crate::bigtiny::effort::ensure_effort_levels_cached(&app).await;
-    Ok(crate::bigtiny::effort::thinking_effort_for(
-        &app,
-        &session_id,
-    ))
+    Ok(crate::bigtiny::effort::thinking_effort_for_session(&app, &session_id).await)
 }
 
 /// "Set as working directory" (agentic mode only) — repoints the session's

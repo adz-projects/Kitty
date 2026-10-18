@@ -33,6 +33,9 @@ pub struct ProviderView {
     /// Whether this card's model can call tools: the `supports_tools`
     /// override, else detected (`ProviderProfile::tools_supported`).
     pub tools_supported: bool,
+    /// This card's detected reasoning ladder, for the Settings row
+    /// (`bigtiny::effort`).
+    pub effort: crate::bigtiny::effort::EffortSummary,
 }
 
 /// Async — `has_secret` is a blocking Windows Credential Manager IPC call per
@@ -42,8 +45,10 @@ pub struct ProviderView {
 async fn provider_views(
     cfg: &Config,
     catalog: Option<&catalog::OpenRouterCatalog>,
+    detecting: &std::collections::HashSet<String>,
 ) -> Vec<ProviderView> {
     let mut views = Vec::with_capacity(cfg.providers.len());
+    let detecting = detecting.clone();
     for p in &cfg.providers {
         let has_secret = providers::get_secret_async(&p.id).await.is_some();
         views.push(ProviderView {
@@ -52,6 +57,7 @@ async fn provider_views(
             active: cfg.active_provider_id.as_deref() == Some(&p.id),
             accepts_images: crate::bigtiny::vision::vision_for_profile(cfg, p),
             tools_supported: p.tools_supported(catalog),
+            effort: crate::bigtiny::effort::summary_for_profile(cfg, p, &detecting),
             profile: p.clone(),
         });
     }
@@ -67,7 +73,8 @@ pub async fn list_providers(
     // must not hold the global config Mutex across their awaited OS calls.
     let cfg = state.config.lock().unwrap().clone();
     let catalog = state.openrouter_catalog.lock().unwrap().clone();
-    Ok(provider_views(&cfg, catalog.as_ref()).await)
+    let detecting = state.effort_detecting.lock().unwrap().clone();
+    Ok(provider_views(&cfg, catalog.as_ref(), &detecting).await)
 }
 
 /// Create or update a provider card. `secret`, when present, is stored in the
@@ -100,15 +107,37 @@ pub async fn upsert_provider(
         }
     }
     let is_default;
+    let detect_effort;
     {
         let state = app.state::<AppState>();
         let mut cfg = state.config.lock().unwrap();
+        // Re-detect the reasoning ladder when what decides it changed (type,
+        // endpoint, model) or the card has none yet.
+        let model = profile.models.first().cloned().unwrap_or_default();
+        let has_caps = cfg
+            .effort_caps
+            .contains_key(&crate::bigtiny::effort::effort_key(&profile.id, &model));
         match cfg.providers.iter_mut().find(|p| p.id == profile.id) {
-            Some(existing) => *existing = profile.clone(),
-            None => cfg.providers.push(profile.clone()),
+            Some(existing) => {
+                detect_effort = !has_caps
+                    || existing.provider_type != profile.provider_type
+                    || existing.base_url != profile.base_url
+                    || existing.models.first() != profile.models.first();
+                *existing = profile.clone();
+            }
+            None => {
+                detect_effort = true;
+                cfg.providers.push(profile.clone());
+            }
         }
         config::save(&cfg).map_err(|e| e.to_string())?;
         is_default = cfg.active_provider_id.as_deref() == Some(profile.id.as_str());
+    }
+    if detect_effort {
+        // Background: detection may probe a self-hosted server or HuggingFace,
+        // and saving a card must not wait on that. Settings and open chats
+        // refresh on `provider://effort-detected`.
+        crate::bigtiny::effort::spawn_detect(&app, &profile.id);
     }
 
     if let Err(e) = crate::bigtiny::providers::sync_all_providers(&app).await {
@@ -125,6 +154,22 @@ pub async fn upsert_provider(
         crate::bigtiny::vision::ensure_vision_cached(&app).await;
     }
     Ok(profile)
+}
+
+/// Re-detect one card's reasoning levels (Settings → Providers → Re-detect).
+/// The old ladder stays until the new detection succeeds.
+#[tauri::command]
+pub async fn redetect_effort(app: AppHandle, provider_id: String) -> Result<(), String> {
+    crate::bigtiny::effort::detect_card(&app, &provider_id).await;
+    Ok(())
+}
+
+/// Re-detect every card's reasoning levels (Settings → Providers →
+/// Re-detect all).
+#[tauri::command]
+pub async fn redetect_effort_all(app: AppHandle) -> Result<(), String> {
+    crate::bigtiny::effort::detect_all(&app, false).await;
+    Ok(())
 }
 
 /// Copy a provider card — the way to use a second model from the same

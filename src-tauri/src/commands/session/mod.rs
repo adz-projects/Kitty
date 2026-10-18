@@ -38,12 +38,19 @@ pub fn get_active_session(state: tauri::State<'_, AppState>) -> Result<Option<Va
 pub struct EffortOption {
     pub name: String,
     pub value: String,
+    /// How many stars the picker draws: level *i* of the ascending ladder is
+    /// *i* stars, Off is 0.
+    pub stars: u8,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThinkingEffort {
     pub current_value: String,
     pub options: Vec<EffortOption>,
+    /// Stars on the top level — the ladder's length, Off excluded.
+    pub max_stars: u8,
+    /// Whether Off is one of the options.
+    pub can_disable: bool,
 }
 
 /// Prefix every no-explicit-folder session's private chat folder lives under

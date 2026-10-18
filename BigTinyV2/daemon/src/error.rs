@@ -103,6 +103,17 @@ pub enum ProviderError {
         context_window: Option<i32>,
     },
 
+    /// A 400 that rejects the reasoning-effort control itself — the model
+    /// doesn't take the parameter, or not this level. Fatal for the attempt
+    /// (resending the same level fails the same way), and tagged so the app
+    /// that set the level can re-detect what the model actually offers.
+    #[error("reasoning effort rejected: {user_message}")]
+    EffortRejected {
+        user_message: String,
+        raw_message: String,
+        http_status: i32,
+    },
+
     /// A 401/403 from the provider — the API key is missing, wrong, or
     /// revoked. Distinct from `Other` so the frontend can say "check your
     /// API key" instead of a generic error (release-fixes item 27).
@@ -178,6 +189,7 @@ impl ProviderError {
             ProviderError::InsufficientCredits { .. } => Some("insufficient_credits"),
             ProviderError::ContextExceeded { .. } => Some("context_exceeded"),
             ProviderError::AuthFailed { .. } => Some("auth_failed"),
+            ProviderError::EffortRejected { .. } => Some("effort_rejected"),
             ProviderError::Request { .. }
             | ProviderError::ConnectFailed { .. }
             | ProviderError::Timeout { .. } => Some("network_unreachable"),
@@ -204,6 +216,7 @@ impl ProviderError {
             ProviderError::AuthFailed { .. }
                 | ProviderError::InsufficientCredits { .. }
                 | ProviderError::ContextExceeded { .. }
+                | ProviderError::EffortRejected { .. }
         )
     }
 

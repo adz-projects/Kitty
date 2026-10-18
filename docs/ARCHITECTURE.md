@@ -55,7 +55,7 @@ lib.rs (app setup, window creation, generate_handler! list;
   │                     parsed back for replay
   │     providers.rs   sync every provider card into the engine
   │     specialists.rs, mcp.rs (bundled servers self-heal), pathway.rs,
-  │     memorabilia.rs, effort.rs, vision.rs, context_window.rs
+  │     memorabilia.rs, effort/ (ladder, detect), vision.rs, context_window.rs
   │
   ├─► config/                                app config (%APPDATA%/Kitty/config.json;
   │     mod.rs         Config, load/save,      app-private dir on Android);

@@ -17,18 +17,74 @@ use crate::error::ProviderError;
 use super::schema::SchemaDirective;
 use crate::network::{maybe_direct_url, TailscaleClient};
 
-/// OpenRouter's nested `reasoning` object for an effort level. OpenRouter is
-/// the one dialect here that can switch reasoning off explicitly. A model-
-/// specific `Custom` level is clamped to `high` (see `Effort::hosted_level`).
+/// OpenRouter's nested `reasoning` object for an effort level. Levels go
+/// through verbatim — OpenRouter's own catalog lists `minimal`/`xhigh`/`max`
+/// for the models that take them, and the app only sends a level it detected
+/// for this model. `On` (a toggle-only model) is `{"enabled": true}`.
 fn openrouter_reasoning(e: &Effort, max_tokens: Option<i32>) -> Value {
-    match (e.hosted_level(), max_tokens) {
-        (None, _) => serde_json::json!({ "enabled": false }),
+    if !e.is_on() {
+        return serde_json::json!({ "enabled": false });
+    }
+    match (e.wire_level(), max_tokens) {
         // `max_tokens` *instead of* `effort`, not alongside it. OpenRouter
         // routes to many upstreams and several reject a `reasoning` object
         // carrying both, so when a budget is set it is the more specific of the
         // two and wins outright.
-        (Some(_), Some(cap)) if cap > 0 => serde_json::json!({ "max_tokens": cap }),
+        (_, Some(cap)) if cap > 0 => serde_json::json!({ "max_tokens": cap }),
         (Some(level), _) => serde_json::json!({ "effort": level }),
+        (None, _) => serde_json::json!({ "enabled": true }),
+    }
+}
+
+/// Write the reasoning-effort control for one OpenAI-compatible dialect into a
+/// request body.
+///
+/// * `openai`, `fireworks`, `deepinfra` — a flat `reasoning_effort` string,
+///   verbatim; Off is the explicit `"none"` (sending nothing would leave the
+///   model reasoning at its own default). `On` has no flat spelling and sends
+///   nothing, i.e. the model's default.
+/// * `openrouter` — the nested `reasoning` object (see `openrouter_reasoning`).
+/// * `custom_openai` / `ollama` — a self-hosted server exposes reasoning
+///   several ways and different builds honor different ones, so populate all
+///   and let the server use whichever it understands:
+///     - `chat_template_kwargs.enable_thinking` — Qwen3 et al. (a boolean
+///       toggle baked into the chat template);
+///     - `chat_template_kwargs.reasoning_effort` — the graded level the
+///       template reads as a variable (`reasoning_effort|default('xhigh')`),
+///       verbatim;
+///     - top-level `reasoning_effort` — gpt-oss / recent llama-server builds.
+///
+///   Off → thinking disabled and no effort field; On → thinking enabled, no
+///   effort field.
+/// * anything else (`local`) has no equivalent and writes nothing.
+fn apply_effort(body: &mut Value, dialect: &str, e: &Effort, reasoning_max_tokens: Option<i32>) {
+    match dialect {
+        "openai" | "fireworks" | "deepinfra" => {
+            if !e.is_on() {
+                body["reasoning_effort"] = "none".into();
+            } else if let Some(level) = e.wire_level() {
+                body["reasoning_effort"] = level.into();
+            }
+        }
+        "openrouter" => {
+            body["reasoning"] = openrouter_reasoning(e, reasoning_max_tokens);
+        }
+        "custom_openai" | "ollama" => {
+            if body
+                .get("chat_template_kwargs")
+                .and_then(|v| v.as_object())
+                .is_none()
+            {
+                body["chat_template_kwargs"] = serde_json::json!({});
+            }
+            let obj = body["chat_template_kwargs"].as_object_mut().unwrap();
+            obj.insert("enable_thinking".into(), e.is_on().into());
+            if let Some(level) = e.wire_level() {
+                obj.insert("reasoning_effort".into(), level.into());
+                body["reasoning_effort"] = level.into();
+            }
+        }
+        _ => {}
     }
 }
 
@@ -500,60 +556,14 @@ impl Provider for OpenAICompatibleProvider {
                 body["min_p"] = p.into();
             }
         }
-        // Reasoning effort — dialect-specific. OpenAI takes a flat
-        // `reasoning_effort` string (with no way to switch reasoning *off* on
-        // an o-series model — "Off" there just means "send nothing"), while
-        // OpenRouter takes a nested `reasoning` object (and *can* disable it).
-        // A self-hosted OpenAI-compatible server (llama.cpp `llama-server`,
-        // Ollama) honors neither of those; the portable control there is the
-        // chat template's `enable_thinking` kwarg (Qwen3 et al.), so effort
-        // collapses to on/off and rides `chat_template_kwargs`. `local` (the
-        // in-process engine) still has no equivalent and writes nothing.
+        // Reasoning effort — dialect-specific; see `apply_effort`.
         if let Some(e) = sampling.effort.as_ref() {
-            match self.config.provider_type.as_str() {
-                "openai" => {
-                    if let Some(s) = e.hosted_level() {
-                        body["reasoning_effort"] = s.into();
-                    }
-                }
-                "openrouter" => {
-                    body["reasoning"] = openrouter_reasoning(e, sampling.reasoning_max_tokens);
-                }
-                "custom_openai" | "ollama" => {
-                    // A self-hosted server exposes reasoning several ways and
-                    // different builds honor different ones, so populate all and
-                    // let the server use whichever it understands:
-                    //   * `chat_template_kwargs.enable_thinking` — Qwen3 et al.
-                    //     (a boolean on/off toggle baked into the chat template).
-                    //   * `chat_template_kwargs.reasoning_effort` — the graded
-                    //     level the template reads as a variable
-                    //     (`reasoning_effort|default('xhigh')`). This is the
-                    //     value Kitty discovered from the server's own template
-                    //     (`bigtiny::effort`), so it is passed **verbatim** —
-                    //     `xhigh`/`medium`/`low`, whatever the model declared,
-                    //     never clamped to a fixed set.
-                    //   * top-level `reasoning_effort` — gpt-oss / recent
-                    //     llama-server builds that read the OpenAI-style field.
-                    // Off → thinking disabled and no effort field.
-                    let enable = !matches!(e, Effort::Off);
-                    let kwargs = body
-                        .get_mut("chat_template_kwargs")
-                        .and_then(|v| v.as_object_mut());
-                    let obj = match kwargs {
-                        Some(obj) => obj,
-                        None => {
-                            body["chat_template_kwargs"] = serde_json::json!({});
-                            body["chat_template_kwargs"].as_object_mut().unwrap()
-                        }
-                    };
-                    obj.insert("enable_thinking".into(), enable.into());
-                    if let Some(level) = e.wire_level() {
-                        obj.insert("reasoning_effort".into(), level.into());
-                        body["reasoning_effort"] = level.into();
-                    }
-                }
-                _ => {}
-            }
+            apply_effort(
+                &mut body,
+                self.config.provider_type.as_str(),
+                e,
+                sampling.reasoning_max_tokens,
+            );
         }
         // Schema-constrained output. `ResponseFormat` is the hosted-OpenAI
         // shape and goes on verbatim.
@@ -1358,24 +1368,57 @@ impl Stream for OpenAISSEStream {
 mod effort_tests {
     use super::*;
 
-    #[test]
-    fn hosted_level_maps_levels_and_omits_off() {
-        assert_eq!(Effort::Low.hosted_level(), Some("low"));
-        assert_eq!(Effort::Medium.hosted_level(), Some("medium"));
-        assert_eq!(Effort::High.hosted_level(), Some("high"));
-        // No way to disable o-series reasoning — "off" is encoded as omission.
-        assert_eq!(Effort::Off.hosted_level(), None);
-        // A model-specific level (Qwen3's xhigh) clamps to the hosted ceiling.
-        assert_eq!(Effort::Custom("xhigh".into()).hosted_level(), Some("high"));
+    fn body_for(dialect: &str, e: Effort) -> Value {
+        let mut body = serde_json::json!({});
+        apply_effort(&mut body, dialect, &e, None);
+        body
     }
 
-    /// The self-hosted wire path forwards the level verbatim (not clamped), so
-    /// a Qwen3 template's `reasoning_effort` variable gets the real `xhigh`.
+    /// Levels above `high` used to be clamped to `high` for the hosted
+    /// dialects, collapsing `xhigh`/`max` into one. They now go through as-is.
     #[test]
-    fn wire_level_is_verbatim_for_self_hosted() {
-        assert_eq!(Effort::Custom("xhigh".into()).wire_level(), Some("xhigh"));
-        assert_eq!(Effort::Medium.wire_level(), Some("medium"));
-        assert_eq!(Effort::Off.wire_level(), None);
+    fn flat_dialects_send_levels_verbatim_and_off_as_none() {
+        for d in ["openai", "fireworks", "deepinfra"] {
+            assert_eq!(
+                body_for(d, Effort::Custom("xhigh".into()))["reasoning_effort"],
+                "xhigh",
+                "{d}"
+            );
+            assert_eq!(body_for(d, Effort::Medium)["reasoning_effort"], "medium");
+            // Off is explicit — omission would leave the model reasoning.
+            assert_eq!(body_for(d, Effort::Off)["reasoning_effort"], "none");
+            assert!(body_for(d, Effort::On).get("reasoning_effort").is_none());
+        }
+    }
+
+    #[test]
+    fn none_parses_as_off() {
+        assert_eq!(Effort::from_wire("none"), Some(Effort::Off));
+        assert_eq!(Effort::from_wire("Off"), Some(Effort::Off));
+        assert_eq!(Effort::from_wire("on"), Some(Effort::On));
+        assert_eq!(Effort::from_wire("max"), Some(Effort::Custom("max".into())));
+        assert_eq!(Effort::from_wire(""), None);
+    }
+
+    /// The self-hosted wire path forwards the level verbatim, so a Qwen3
+    /// template's `reasoning_effort` variable gets the real `xhigh`.
+    #[test]
+    fn self_hosted_sets_template_kwargs() {
+        let b = body_for("custom_openai", Effort::Custom("xhigh".into()));
+        assert_eq!(b["chat_template_kwargs"]["enable_thinking"], true);
+        assert_eq!(b["chat_template_kwargs"]["reasoning_effort"], "xhigh");
+        assert_eq!(b["reasoning_effort"], "xhigh");
+        let off = body_for("ollama", Effort::Off);
+        assert_eq!(off["chat_template_kwargs"]["enable_thinking"], false);
+        assert!(off.get("reasoning_effort").is_none());
+        let on = body_for("ollama", Effort::On);
+        assert_eq!(on["chat_template_kwargs"]["enable_thinking"], true);
+        assert!(on.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn local_writes_nothing() {
+        assert_eq!(body_for("local", Effort::High), serde_json::json!({}));
     }
 
     #[test]
@@ -1387,6 +1430,14 @@ mod effort_tests {
         assert_eq!(
             openrouter_reasoning(&Effort::High, None),
             serde_json::json!({ "effort": "high" })
+        );
+        assert_eq!(
+            openrouter_reasoning(&Effort::Custom("max".into()), None),
+            serde_json::json!({ "effort": "max" })
+        );
+        assert_eq!(
+            openrouter_reasoning(&Effort::On, None),
+            serde_json::json!({ "enabled": true })
         );
     }
 

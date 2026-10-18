@@ -12,6 +12,7 @@ import {
   onContextBudget,
   onComplete,
   onMessageDelta,
+  onEffortDetected,
   onProviderActivated,
   onProviderHealth,
   onChatNotice,
@@ -126,7 +127,7 @@ interface ChatState {
       fix). `thinkingEffort` is deliberately *not* cleared during this gap
       (it keeps showing the outgoing session's value, which is usually still
       correct for a fresh session on the same provider) — this flag instead
-      gates *interactivity* on `EffortDropdown` so a click can't act on a
+      gates *interactivity* on `EffortPicker` so a click can't act on a
       session id that doesn't exist yet. */
   creatingSession: boolean;
   messages: Message[];
@@ -1131,11 +1132,11 @@ export const useChatStore = create<ChatState>((set, get) => {
         });
         const cur = get();
         if (active && cur.sessionId !== null) {
-          // A live session: the provider or model may have just changed, so
-          // re-derive the effort control against the now-active provider —
-          // this is what makes the dropdown appear/disappear/re-scope on a
-          // mid-session provider switch without a reload. Best-effort: a
-          // failure leaves the current value alone.
+          // A live session: its card or model may have just changed, so
+          // re-derive the effort control — against the chat's own card,
+          // which the backend resolves — so the picker appears/disappears/
+          // re-scopes without a reload. Best-effort: a failure leaves the
+          // current value alone.
           try {
             const thinkingEffort = await ipc.getThinkingEffort(cur.sessionId);
             set({ thinkingEffort });
@@ -1347,7 +1348,7 @@ export const useChatStore = create<ChatState>((set, get) => {
       // `thinkingEffort` is deliberately left as-is here (NOT nulled) — a
       // fresh session on the same provider/model will almost always have the
       // same value, so carrying the outgoing session's forward avoids
-      // `EffortDropdown` visibly popping in late relative to `ProviderBadge`.
+      // `EffortPicker` visibly popping in late relative to `ProviderBadge`.
       // `creatingSession` gates interactivity on it instead, so a click during
       // the gap can't act on a session id that doesn't exist yet. The real
       // `session/new` response below is still the sole source of truth and
@@ -1589,13 +1590,19 @@ export const useChatStore = create<ChatState>((set, get) => {
         }
         const info = await ipc.loadSession(sessionId, cwd);
         if (epoch !== get().sessionEpoch) return;
-        set({
+        set((s) => ({
           thinkingEffort: info.thinking_effort,
           isDefaultFolder: info.is_default_folder,
+          // The engine's record of the chat's card, when the caller didn't
+          // know it: otherwise the badge (and anything keyed on the card)
+          // falls back to the global default.
+          ...(info.provider_id && !s.sessionProviderId
+            ? { sessionProviderId: info.provider_id, sessionModelId: info.model_id }
+            : null),
           // Opened from somewhere that didn't know its folder (a full-text
           // search hit): the engine's record of it.
           ...(cwd ? {} : { cwd: info.cwd, chatDir: info.cwd }),
-        });
+        }));
         await get().refreshProvider(undefined);
       } catch (e) {
         if (epoch === get().sessionEpoch) set({ error: String(e) });
@@ -2238,6 +2245,21 @@ export const useChatStore = create<ChatState>((set, get) => {
       // handler only refreshes the badge state — a broadcast-based rebind of
       // every open window's session is exactly the cross-window leak it used
       // to cause (pick a provider in window 2 → window 1 switched too).
+      // A card's reasoning ladder was (re)detected. Only this chat's card
+      // matters; when the card isn't known yet, refetch anyway — the backend
+      // resolves the chat's card itself.
+      void onEffortDetected((payload) => {
+        const s = get();
+        if (s.sessionId === null) return;
+        if (s.sessionProviderId && s.sessionProviderId !== payload.provider_id) return;
+        const sessionId = s.sessionId;
+        void ipc
+          .getThinkingEffort(sessionId)
+          .then((thinkingEffort) => {
+            if (get().sessionId === sessionId) set({ thinkingEffort });
+          })
+          .catch(() => {});
+      });
       void onProviderActivated((payload) => {
         set((s) => ({
           providerOffline: false,

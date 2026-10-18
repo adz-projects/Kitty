@@ -34,6 +34,7 @@ function profile(overrides: Partial<ProviderView>): ProviderView {
     active: false,
     accepts_images: null,
     tools_supported: true,
+    effort: { levels: [], can_disable: false, source: null, source_label: null, detected_at: null, detecting: false },
     ...overrides,
   };
 }

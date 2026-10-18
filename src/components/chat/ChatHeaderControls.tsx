@@ -1,5 +1,5 @@
 import { ProviderBadge } from './ProviderBadge';
-import { EffortDropdown } from './EffortDropdown';
+import { EffortPicker } from './EffortPicker';
 import { ChatHeaderMenu } from './ChatHeaderMenu';
 
 /** The per-session controls that belong to the conversation rather than to the
@@ -16,7 +16,7 @@ export function ChatHeaderControls() {
   return (
     <div className="chat-header-controls">
       <ProviderBadge />
-      <EffortDropdown />
+      <EffortPicker />
       {/* The overflow menu: incognito on both platforms, and on Android the
           chat's allowed folders too (#79). */}
       <ChatHeaderMenu />

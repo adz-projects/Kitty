@@ -12,9 +12,9 @@ use crate::commands::SessionInfo;
 
 /// BigTiny has no ACP-style modes handshake — HITL policy lives server-side
 /// and the chat/agentic override is client-side either way. The one live field
-/// is `thinking_effort`, derived from the active provider's capability so the
-/// dropdown appears only where the provider actually accepts an effort control
-/// (see `bigtiny::effort`); everything else is fixed.
+/// is `thinking_effort`, resolved against the chat's own card so the picker
+/// appears only where that card's model takes an effort control (see
+/// `bigtiny::effort`); everything else is fixed.
 fn session_info(
     app: &AppHandle,
     session_id: String,
@@ -22,6 +22,14 @@ fn session_info(
     provider_id: Option<String>,
     model_id: Option<String>,
 ) -> SessionInfo {
+    if let Some(card) = provider_id.as_deref() {
+        crate::bigtiny::effort::remember_session_card(
+            app,
+            &session_id,
+            card,
+            model_id.as_deref().unwrap_or(""),
+        );
+    }
     let thinking_effort = crate::bigtiny::effort::thinking_effort_for(app, &session_id);
     let is_default_folder = crate::commands::is_default_folder(app, &cwd);
     SessionInfo {

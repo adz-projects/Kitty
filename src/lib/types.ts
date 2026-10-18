@@ -191,6 +191,37 @@ export interface ProviderView extends ProviderProfile {
   /** Whether the model can call tools: the override, else detected. Decides
       whether dropped files go as paths or are inlined. */
   tools_supported: boolean;
+  /** The card's detected reasoning ladder (mirrors `EffortSummary`). */
+  effort: EffortSummary;
+}
+
+/** Where a card's reasoning ladder came from. */
+export type EffortSource =
+  | 'provider_api'
+  | 'open_router'
+  | 'chat_template'
+  | 'hugging_face'
+  | 'ollama'
+  | 'heuristic';
+
+/** One card's detected reasoning ladder, for Settings → Providers. Mirrors
+    `bigtiny::effort::EffortSummary`. */
+export interface EffortSummary {
+  /** Ascending, Off excluded. Empty with `can_disable: false` and a
+      `detected_at` means the model has no reasoning control. */
+  levels: string[];
+  can_disable: boolean;
+  source: EffortSource | null;
+  source_label: string | null;
+  /** Unix seconds; `null` when never detected. */
+  detected_at: number | null;
+  detecting: boolean;
+}
+
+/** `provider://effort-detected`: a card's ladder detection finished. */
+export interface EffortDetectedPayload {
+  provider_id: string;
+  changed: boolean;
 }
 
 /** `GET /api/v1/key`'s `data` object — only the fields Kitty's UI reads are
@@ -462,7 +493,7 @@ export interface MemoryStatus {
     ran out of steps. */
 export interface ChatNoticeEvent {
   session_id: string;
-  kind: 'failover' | 'step_limit';
+  kind: 'failover' | 'step_limit' | 'effort_updated';
   message: string | null;
   reason?: 'pinned_unavailable' | 'no_tool_support' | 'error_switch' | null;
   provider_id?: string | null;
@@ -688,9 +719,8 @@ export interface MemorabiliaStats {
 export interface SessionInfo {
   session_id: string;
   cwd: string;
-  /** `null` when the active model doesn't support effort control at all (a
-      single-option "off"-only model — see `parse_thinking_effort` in
-      commands/session.rs). Live per-session control, no goosed restart. */
+  /** `null` when the chat's card's model has no reasoning control, or its
+      ladder isn't detected yet (see `bigtiny::effort`). */
   thinking_effort: ThinkingEffort | null;
   /** True when `cwd` is a private per-chat folder (no explicit working
       directory chosen) — the chat header renders this as "thought partner"
@@ -710,11 +740,19 @@ export interface SessionInfo {
 export interface EffortOption {
   name: string;
   value: string;
+  /** Stars the picker draws: level i of the ascending ladder is i stars,
+      Off is 0. */
+  stars: number;
 }
 
+/** A chat's reasoning effort, resolved against the chat's own card. */
 export interface ThinkingEffort {
   current_value: string;
+  /** Off first when offered, then the ladder lowest to highest. */
   options: EffortOption[];
+  /** Stars on the top level (the ladder's length). */
+  max_stars: number;
+  can_disable: boolean;
 }
 
 /** Raw ACP tool-call `update` object (shape varies; read defensively).

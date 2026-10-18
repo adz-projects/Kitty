@@ -38,9 +38,9 @@ fn anthropic_thinking(
     let base = match effort {
         Some(Effort::Low) => 4096,
         Some(Effort::Medium) => 16384,
-        // High or a model-specific `Custom` level (Anthropic never actually
-        // receives one, but clamp defensively): the top budget.
-        Some(Effort::High) | Some(Effort::Custom(_)) => 32768,
+        // High, `On`, or a model-specific `Custom` level: the budget shape
+        // has only three grades, so anything above the middle gets the top.
+        Some(Effort::High) | Some(Effort::On) | Some(Effort::Custom(_)) => 32768,
         // Off / None: no thinking, keep whatever max_tokens was resolved.
         _ => return (max, None),
     };
@@ -67,6 +67,51 @@ fn anthropic_thinking(
                 (cap, Some(budget))
             } else {
                 (cap, None)
+            }
+        }
+    }
+}
+
+/// The adaptive-thinking request fields for one turn on a current Claude
+/// model: `(thinking, output_config.effort)`. Pure, for the same reason as
+/// [`anthropic_thinking`].
+///
+/// * No effort requested → send nothing; the model runs at its own default.
+/// * `Off` → `thinking: {type: "disabled"}`. The app only offers Off on models
+///   where thinking is optional; on the ones where it is mandatory (Opus 5.5,
+///   Sonnet 5.5, Fable) Off is never sent.
+/// * `On` → adaptive thinking at the model's default effort.
+/// * A graded level → adaptive thinking plus that effort, verbatim
+///   (`low`..`max` — the app sends only levels the Models API listed).
+/// * A forced tool (`tool_choice` any/tool, i.e. a structured-response tool)
+///   can't carry thinking, so the level drops to plain effort with thinking
+///   left at the model's default rather than 400ing.
+/// * A run whose reasoning cap is spent asks for `low` — the least thinking a
+///   mandatory-thinking model can be asked for.
+fn anthropic_adaptive(
+    effort: Option<&Effort>,
+    forced_tool: bool,
+    budget_cap: Option<i32>,
+) -> (Option<Value>, Option<String>) {
+    let Some(e) = effort else {
+        return (None, None);
+    };
+    if let Some(cap) = budget_cap {
+        if cap < 1024 && e.is_on() {
+            return (None, Some("low".to_string()));
+        }
+    }
+    match e {
+        Effort::Off if !forced_tool => (Some(serde_json::json!({ "type": "disabled" })), None),
+        Effort::Off => (None, None),
+        Effort::On if forced_tool => (None, None),
+        Effort::On => (Some(serde_json::json!({ "type": "adaptive" })), None),
+        other => {
+            let level = other.wire_level().map(str::to_string);
+            if forced_tool {
+                (None, level)
+            } else {
+                (Some(serde_json::json!({ "type": "adaptive" })), level)
             }
         }
     }
@@ -402,46 +447,72 @@ impl Provider for AnthropicProvider {
         // tool-carrying turn.
         let forced_tool = matches!(schema, SchemaDirective::ForcedTool(..));
         let has_tools = tools.as_ref().is_some_and(|t| !t.is_empty()) || forced_tool;
-        let (max_tokens, thinking_budget) = anthropic_thinking(
-            sampling.effort.as_ref(),
-            explicit_max,
-            has_tools,
-            sampling.reasoning_max_tokens,
-        );
-        if thinking_budget.is_none()
-            && matches!(
-                sampling.effort,
-                Some(Effort::Low | Effort::Medium | Effort::High)
-            )
-        {
-            // Effort was asked for but produced no thinking block — say why,
-            // once, rather than silently ignoring it.
-            if has_tools {
-                tracing::info!(
-                    provider_id = %self.provider_id,
-                    "extended thinking suppressed: this turn carries tools (signed \
-                     thinking-block round-trips are a follow-up)"
-                );
-            } else {
-                tracing::info!(
-                    provider_id = %self.provider_id,
-                    "extended thinking suppressed: no room for a >=1024 budget under \
-                     the configured max_tokens"
-                );
-            }
-        }
-        let mut body = serde_json::json!({
-            "model": model,
-            "messages": grouped,
-            "max_tokens": max_tokens,
-            "stream": true,
-        });
-        if let Some(budget) = thinking_budget {
-            body["thinking"] = serde_json::json!({
-                "type": "enabled",
-                "budget_tokens": budget,
+        let adaptive = self.config.anthropic_thinking.as_deref() == Some("adaptive");
+        // `thinking_on` gates the sampling knobs below: Anthropic rejects
+        // temperature/top_p alongside any thinking block.
+        let (thinking_on, mut body) = if adaptive {
+            let (thinking, effort_level) = anthropic_adaptive(
+                sampling.effort.as_ref(),
+                forced_tool,
+                sampling.reasoning_max_tokens,
+            );
+            // Thinking counts against `max_tokens`, so the no-cap default is
+            // well above the budget path's 4096.
+            let max_tokens = explicit_max.unwrap_or(32000);
+            let mut body = serde_json::json!({
+                "model": model,
+                "messages": grouped,
+                "max_tokens": max_tokens,
+                "stream": true,
             });
-        }
+            let on = thinking
+                .as_ref()
+                .is_some_and(|t| t["type"] != "disabled");
+            if let Some(t) = thinking {
+                body["thinking"] = t;
+            }
+            if let Some(level) = effort_level {
+                body["output_config"] = serde_json::json!({ "effort": level });
+            }
+            (on, body)
+        } else {
+            let (max_tokens, thinking_budget) = anthropic_thinking(
+                sampling.effort.as_ref(),
+                explicit_max,
+                has_tools,
+                sampling.reasoning_max_tokens,
+            );
+            if thinking_budget.is_none() && sampling.effort.as_ref().is_some_and(Effort::is_on) {
+                // Effort was asked for but produced no thinking block — say
+                // why, once, rather than silently ignoring it.
+                if has_tools {
+                    tracing::info!(
+                        provider_id = %self.provider_id,
+                        "extended thinking suppressed: this turn carries tools (signed \
+                         thinking-block round-trips are a follow-up)"
+                    );
+                } else {
+                    tracing::info!(
+                        provider_id = %self.provider_id,
+                        "extended thinking suppressed: no room for a >=1024 budget under \
+                         the configured max_tokens"
+                    );
+                }
+            }
+            let mut body = serde_json::json!({
+                "model": model,
+                "messages": grouped,
+                "max_tokens": max_tokens,
+                "stream": true,
+            });
+            if let Some(budget) = thinking_budget {
+                body["thinking"] = serde_json::json!({
+                    "type": "enabled",
+                    "budget_tokens": budget,
+                });
+            }
+            (thinking_budget.is_some(), body)
+        };
 
         if !system.is_empty() {
             // Context building layers up to 5 separate system messages
@@ -474,7 +545,7 @@ impl Provider for AnthropicProvider {
         // Extended thinking forbids both `temperature` and `top_p` — sending
         // either alongside a `thinking` block is a 400. Only set them when
         // thinking is off.
-        if thinking_budget.is_none() {
+        if !thinking_on {
             if let Some(t) = sampling.temperature {
                 body["temperature"] = t.into();
             }
@@ -1093,6 +1164,45 @@ impl Stream for AnthropicSSEStream {
 #[cfg(test)]
 mod thinking_tests {
     use super::*;
+
+    /// Current Claude models 400 on a `budget_tokens` block; the adaptive
+    /// path sends `thinking: adaptive` plus `output_config.effort` verbatim.
+    #[test]
+    fn adaptive_sends_effort_verbatim() {
+        let (t, e) = anthropic_adaptive(Some(&Effort::Custom("xhigh".into())), false, None);
+        assert_eq!(t, Some(serde_json::json!({ "type": "adaptive" })));
+        assert_eq!(e.as_deref(), Some("xhigh"));
+        let (t, e) = anthropic_adaptive(Some(&Effort::Medium), false, None);
+        assert_eq!(t, Some(serde_json::json!({ "type": "adaptive" })));
+        assert_eq!(e.as_deref(), Some("medium"));
+    }
+
+    #[test]
+    fn adaptive_off_disables_and_none_sends_nothing() {
+        assert_eq!(
+            anthropic_adaptive(Some(&Effort::Off), false, None),
+            (Some(serde_json::json!({ "type": "disabled" })), None)
+        );
+        assert_eq!(anthropic_adaptive(None, false, None), (None, None));
+        assert_eq!(
+            anthropic_adaptive(Some(&Effort::On), false, None),
+            (Some(serde_json::json!({ "type": "adaptive" })), None)
+        );
+    }
+
+    /// A forced structured-response tool can't carry a thinking block, so
+    /// only the effort survives; a spent reasoning cap asks for `low`.
+    #[test]
+    fn adaptive_forced_tool_and_spent_cap() {
+        assert_eq!(
+            anthropic_adaptive(Some(&Effort::High), true, None),
+            (None, Some("high".to_string()))
+        );
+        assert_eq!(
+            anthropic_adaptive(Some(&Effort::High), false, Some(0)),
+            (None, Some("low".to_string()))
+        );
+    }
 
     #[test]
     fn no_effort_leaves_max_tokens_and_adds_no_thinking() {

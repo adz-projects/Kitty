@@ -221,6 +221,8 @@ pub fn run() {
             commands::compact_session,
             commands::set_thinking_effort,
             commands::get_thinking_effort,
+            commands::redetect_effort,
+            commands::redetect_effort_all,
             commands::read_file_any,
             commands::copy_file_into_chat_folder,
             commands::stage_attachments,

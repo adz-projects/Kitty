@@ -102,31 +102,36 @@ pub struct SamplingParams {
 /// provider's own dialect at the wire boundary (see `SamplingParams::effort`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effort {
-    /// Explicitly ask the model *not* to spend reasoning tokens. Expressible
-    /// on OpenRouter (`{"enabled": false}`) and by omission on Anthropic;
-    /// OpenAI's o-series has no "off", so this degrades to "send nothing".
+    /// Explicitly ask the model *not* to spend reasoning tokens:
+    /// `{"enabled": false}` on OpenRouter, `reasoning_effort: "none"` on the
+    /// flat OpenAI-style dialects, `thinking: {type: "disabled"}` on adaptive
+    /// Anthropic. The app only offers it for models where reasoning is
+    /// optional, so the wire value is never one the model refuses.
     Off,
+    /// Reasoning on with no grade — for toggle-only models (OpenRouter
+    /// `mandatory: false` with no `supported_efforts`, or a chat template that
+    /// has `enable_thinking` and nothing else).
+    On,
     Low,
     Medium,
     High,
-    /// A model-declared level that isn't one of the standard three — e.g.
-    /// Qwen3's `xhigh`, discovered from a self-hosted server's chat template
-    /// (see Kitty's `bigtiny::effort`). Forwarded verbatim to the self-hosted
-    /// wire path; the hosted dialects (OpenAI/OpenRouter/Anthropic), which only
-    /// understand low/medium/high, clamp it to their highest level.
+    /// Any other model-declared level — `minimal`, `xhigh`, `max`, or a
+    /// self-hosted template's own. Forwarded verbatim: the app only sends a
+    /// level it detected for this model, so clamping here would silently
+    /// collapse distinct levels into one.
     Custom(String),
 }
 
 impl Effort {
-    /// Parse the wire string Kitty persists in session config
-    /// (`thinking_effort`). Empty → `None` ("no effort requested"); `off` →
-    /// `Off`; the three standard levels map to their variants; anything else is
-    /// a model-specific level carried through as `Custom` (Kitty only ever sends
-    /// a level it actually discovered for the active model).
+    /// Parse the wire string the app persists in session config
+    /// (`thinking_effort`). Empty → `None` ("no effort requested"); `off` and
+    /// `none` → `Off`; `on` → `On`; the three standard levels map to their
+    /// variants; anything else is a model-specific level carried as `Custom`.
     pub fn from_wire(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "" => None,
-            "off" => Some(Effort::Off),
+            "off" | "none" => Some(Effort::Off),
+            "on" => Some(Effort::On),
             "low" => Some(Effort::Low),
             "medium" => Some(Effort::Medium),
             "high" => Some(Effort::High),
@@ -134,11 +139,11 @@ impl Effort {
         }
     }
 
-    /// The raw level string for the self-hosted wire path (the chat template's
-    /// `reasoning_effort` kwarg), or `None` for `Off`.
+    /// The graded level string to put on the wire, or `None` for `Off` and
+    /// `On` (neither carries a grade).
     pub fn wire_level(&self) -> Option<&str> {
         match self {
-            Effort::Off => None,
+            Effort::Off | Effort::On => None,
             Effort::Low => Some("low"),
             Effort::Medium => Some("medium"),
             Effort::High => Some("high"),
@@ -146,15 +151,9 @@ impl Effort {
         }
     }
 
-    /// Clamp to one of the three levels the hosted OpenAI/OpenRouter dialects
-    /// accept. `None` for `Off`; a `Custom` level (e.g. `xhigh`) maps to `high`.
-    pub fn hosted_level(&self) -> Option<&'static str> {
-        match self {
-            Effort::Off => None,
-            Effort::Low => Some("low"),
-            Effort::Medium => Some("medium"),
-            Effort::High | Effort::Custom(_) => Some("high"),
-        }
+    /// Whether this asks for any reasoning at all.
+    pub fn is_on(&self) -> bool {
+        !matches!(self, Effort::Off)
     }
 }
 
@@ -374,6 +373,32 @@ pub fn classify_provider_error(
         }
     }
 
+    // A 400 aimed at the reasoning control itself: the model doesn't take
+    // `reasoning_effort` / `thinking` / `output_config.effort`, or not at the
+    // level sent. Matched only on a 400 that names one of those parameters
+    // (an unrelated 400 mentioning "reasoning" in prose is vanishingly rare,
+    // and misclassifying one only costs an extra capability re-detect).
+    if status_code == 400
+        && (lower.contains("reasoning_effort")
+            || lower.contains("reasoning.effort")
+            || lower.contains("output_config.effort")
+            || lower.contains("budget_tokens")
+            || lower.contains("thinking.type")
+            || lower.contains("enable_thinking")
+            || (lower.contains("effort")
+                && (lower.contains("not supported")
+                    || lower.contains("unsupported")
+                    || lower.contains("invalid")))
+            || (lower.contains("thinking")
+                && (lower.contains("not supported") || lower.contains("unsupported"))))
+    {
+        return ProviderError::EffortRejected {
+            user_message: "This model rejected the reasoning level. Kitty will re-check which levels it supports.".into(),
+            raw_message: body.into(),
+            http_status: status_code as i32,
+        };
+    }
+
     if lower.contains("context_length_exceeded")
         || lower.contains("exceed_context_size")
         || lower.contains("exceeds the available context")
@@ -440,6 +465,26 @@ mod tests {
             ProviderError::InsufficientCredits { .. } => {}
             other => panic!("Expected InsufficientCredits, got {:?}", other),
         }
+    }
+
+    /// A 400 aimed at the reasoning control is tagged so the app can
+    /// re-detect the model's levels, and is not retried.
+    #[test]
+    fn effort_rejections_are_tagged() {
+        for body in [
+            r#"{"error":{"message":"Unsupported value: 'reasoning_effort' does not support 'xhigh' with this model."}}"#,
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"thinking.type.enabled is not supported for this model. Use thinking.type.adaptive"}}"#,
+            "output_config.effort: Input should be 'low', 'medium' or 'high'",
+        ] {
+            let err = classify_provider_error(400, body, None);
+            assert_eq!(err.wire_type_tag(), Some("effort_rejected"), "{body}");
+            assert!(!err.is_retryable());
+        }
+        // Not a 400 → not an effort rejection.
+        assert_ne!(
+            classify_provider_error(500, "reasoning_effort", None).wire_type_tag(),
+            Some("effort_rejected")
+        );
     }
 
     #[test]

@@ -51,6 +51,7 @@ import type {
   ScheduledTask,
   SessionInfo,
   ProviderActivatedPayload,
+  EffortDetectedPayload,
   SessionTitleEvent,
   SetupValidation,
   StackStatusPayload,
@@ -339,11 +340,16 @@ export const ipc = {
     }>('compact_session', { sessionId }),
   setThinkingEffort: (sessionId: string, value: string) =>
     invoke<ThinkingEffort | null>('set_thinking_effort', { sessionId, value }),
-  /** Re-derive a session's effort control against the active provider — the
-      dropdown appears/disappears/re-scopes when the provider or model changes
-      mid-session, without a reload. `null` when the provider has no control. */
+  /** Re-derive a chat's effort control against the chat's own card — the
+      picker appears/disappears/re-scopes when its card changes or a
+      detection lands, without a reload. `null` when there is no control. */
   getThinkingEffort: (sessionId: string) =>
     invoke<ThinkingEffort | null>('get_thinking_effort', { sessionId }),
+  /** Re-detect one card's reasoning levels. The old ladder stays until the
+      new detection succeeds; listen for `provider://effort-detected`. */
+  redetectEffort: (providerId: string) => invoke<void>('redetect_effort', { providerId }),
+  /** Re-detect every card's reasoning levels. */
+  redetectEffortAll: () => invoke<void>('redetect_effort_all'),
   readFileAny: (path: string) => invoke<FileAttachment>('read_file_any', { path, maxBytes: null }),
   /** Copies a file into a chat session's own working directory, so the
       model's own file tools can open it directly — used for chat-only mode
@@ -787,6 +793,10 @@ export interface ProviderHealth {
 }
 export const onProviderHealth = (cb: (h: ProviderHealth) => void) =>
   listen<ProviderHealth>('provider://health', (e) => cb(e.payload));
+
+/** A card's reasoning-ladder detection finished (`bigtiny::effort`). */
+export const onEffortDetected = (cb: (p: EffortDetectedPayload) => void) =>
+  listen<EffortDetectedPayload>('provider://effort-detected', (e) => cb(e.payload));
 
 /** Fired after a provider is (de)activated + goosed respawns (Round-2 item 4).
     The payload carries the stamped session's provider/model so the invoking

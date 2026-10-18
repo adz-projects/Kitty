@@ -161,11 +161,14 @@ fn warm_openrouter_catalog(app: &AppHandle) {
     // `startup_should_refetch`. The lazy refresh at the point of use
     // (`ensure_catalog_fresh`, opening the model picker) still applies, so
     // anyone who actually looks at the catalog gets current data.
+    let app = app.clone();
     if !refetch {
         tracing::info!("OpenRouter catalog cache is fresh enough; skipping the startup fetch");
+        tauri::async_runtime::spawn(async move {
+            crate::bigtiny::effort::detect_all(&app, true).await;
+        });
         return;
     }
-    let app = app.clone();
     tauri::async_runtime::spawn(async move {
         match crate::openrouter::catalog::fetch_catalog(None).await {
             Ok(fresh) => {
@@ -177,6 +180,10 @@ fn warm_openrouter_catalog(app: &AppHandle) {
                 tracing::warn!("OpenRouter catalog startup fetch failed: {e}");
             }
         }
+        // Cards with no reasoning ladder yet — new installs, and every card
+        // after upgrading from a Kitty that kept none — detect once the
+        // catalog they mostly read from is in hand.
+        crate::bigtiny::effort::detect_all(&app, true).await;
     });
 }
 

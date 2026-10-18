@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
-import { ipc } from '@/lib/ipc';
+import { ipc, onEffortDetected } from '@/lib/ipc';
+import { effortSummaryText } from '@/lib/effort';
 import { Modal } from '@/components/shared/Modal';
 import type { OpenRouterCredits, ProviderProfile, ProviderView } from '@/lib/types';
 import { TrustIcon, trustKind } from '@/lib/provider_trust';
@@ -42,6 +43,32 @@ export function Providers({ highlight }: { highlight: string | null }) {
       })
       .catch((e) => setError(String(e)));
   useEffect(() => void refresh(), []);
+  // A card's reasoning detection finished — after a save, a Re-detect, or
+  // in the background at startup — so its line is current.
+  useEffect(() => {
+    const unlisten = onEffortDetected(() => void refresh());
+    return () => void unlisten.then((u) => u());
+  }, []);
+  const [redetecting, setRedetecting] = useState<Set<string>>(new Set());
+  const redetect = async (id: string | null) => {
+    const key = id ?? '*';
+    setRedetecting((prev) => new Set(prev).add(key));
+    // Show the busy state on the rows right away, before the backend's own
+    // `detecting` flag comes back with the next refresh.
+    await refresh();
+    try {
+      await (id ? ipc.redetectEffort(id) : ipc.redetectEffortAll());
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setRedetecting((prev) => {
+        const next = new Set(prev);
+        next.delete(key);
+        return next;
+      });
+      await refresh();
+    }
+  };
   const checkCredits = async (id: string) => {
     setCredits((prev) => ({ ...prev, [id]: { status: 'loading' } }));
     try {
@@ -135,9 +162,18 @@ export function Providers({ highlight }: { highlight: string | null }) {
     <section className="settings-section">
       <div className="row" style={{ justifyContent: 'space-between' }}>
         <h1>Providers</h1>
-        <button className="primary" onClick={startNew}>
-          Add provider
-        </button>
+        <div className="row">
+          <button
+            onClick={() => void redetect(null)}
+            disabled={redetecting.has('*') || providers.length === 0}
+            title="Check again which reasoning levels each provider's model offers"
+          >
+            {redetecting.has('*') ? 'Re-detecting…' : 'Re-detect reasoning'}
+          </button>
+          <button className="primary" onClick={startNew}>
+            Add provider
+          </button>
+        </div>
       </div>
       {error && <div className="chat-error">{error}</div>}
       {notice && (
@@ -197,6 +233,26 @@ export function Providers({ highlight }: { highlight: string | null }) {
                 )}
               </div>
               <div className="muted provider-url-line">{p.base_url}</div>
+              <div className="muted provider-effort-line">
+                {(() => {
+                  const busy = p.effort.detecting || redetecting.has(p.id) || redetecting.has('*');
+                  return (
+                    <>
+                      {busy && p.effort.detected_at !== null
+                        ? 'Detecting reasoning levels…'
+                        : effortSummaryText(p.effort, Math.floor(Date.now() / 1000))}{' '}
+                      <button
+                        className="link"
+                        disabled={busy}
+                        onClick={() => void redetect(p.id)}
+                        title="Check again which reasoning levels this model offers. The current levels stay if the check fails."
+                      >
+                        Re-detect
+                      </button>
+                    </>
+                  );
+                })()}
+              </div>
               {p.provider_type === 'openrouter' && p.has_secret && (
                 <div className="muted" style={{ fontSize: 14 }}>
                   {!credits[p.id] && (

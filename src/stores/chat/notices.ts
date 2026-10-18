@@ -4,6 +4,9 @@ import type { ChatNoticeEvent } from '@/lib/types';
     than taken from the engine's own message so the wording is Kitty's, with
     the engine's text as the fallback for a reason Kitty does not know. */
 export function noticeText(e: ChatNoticeEvent): string {
+  if (e.kind === 'effort_updated') {
+    return e.message ?? 'This model’s reasoning options were updated.';
+  }
   if (e.kind === 'step_limit') {
     return 'This turn reached its step limit and stopped early. Ask Kitty to continue if it isn’t finished.';
   }

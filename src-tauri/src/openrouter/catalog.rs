@@ -45,6 +45,11 @@ const STARTUP_STALE_AFTER_SECS: i64 = 12 * 60 * 60;
 /// Split out from the caller so the policy is testable without a network, an
 /// `AppHandle`, or a clock.
 pub fn startup_should_refetch(cached: Option<&OpenRouterCatalog>, now: i64) -> bool {
+    // A copy cached by an older Kitty lacks fields this one reads (e.g. the
+    // reasoning ladders), however fresh it is.
+    if cached.is_some_and(|c| c.format < CATALOG_FORMAT) {
+        return true;
+    }
     #[cfg(target_os = "android")]
     {
         match cached {
@@ -58,6 +63,26 @@ pub fn startup_should_refetch(cached: Option<&OpenRouterCatalog>, now: i64) -> b
         let _ = (cached, now);
         true
     }
+}
+
+/// Version of the cached catalog's shape. Bump when `parse_entry` starts
+/// reading a new field, so a disk copy written before it is refetched rather
+/// than trusted until it goes stale. 1: reasoning ladders + `hugging_face_id`.
+pub const CATALOG_FORMAT: u32 = 1;
+
+/// OpenRouter's per-model `reasoning` object — the effort ladder the model
+/// takes. Verified live: `supported_efforts` lists levels highest first with
+/// `none` last when reasoning can be switched off; `mandatory` says it can't.
+/// A model with `mandatory: false` and no `supported_efforts` is a plain
+/// on/off toggle.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct OpenRouterReasoning {
+    #[serde(default)]
+    pub supported_efforts: Vec<String>,
+    #[serde(default)]
+    pub default_effort: Option<String>,
+    #[serde(default)]
+    pub mandatory: bool,
 }
 
 /// Simplified cost badge — bucketed by percentile against the *current*
@@ -103,6 +128,15 @@ pub struct OpenRouterCatalogEntry {
     /// with `accepts_images`.
     #[serde(default)]
     pub supports_tools: Option<bool>,
+    /// The model's reasoning ladder, when OpenRouter publishes one. `None`
+    /// for a model with no `reasoning` object (it doesn't reason, or the
+    /// catalog doesn't say).
+    #[serde(default)]
+    pub reasoning: Option<OpenRouterReasoning>,
+    /// The HuggingFace repo this model is, when open-weights — lets a
+    /// self-hosted endpoint serving `Qwen/Qwen3.8-27B` find this entry.
+    #[serde(default)]
+    pub hugging_face_id: Option<String>,
     /// Blended $/M-tokens (prompt weighted 0.75, completion 0.25 — prompt is
     /// typically the larger share of a turn), used both for the "Cheapest"
     /// sort and to derive `cost_tier`.
@@ -113,6 +147,9 @@ pub struct OpenRouterCatalogEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenRouterCatalog {
     pub fetched_at: i64,
+    /// See [`CATALOG_FORMAT`]; absent (0) on copies cached before it existed.
+    #[serde(default)]
+    pub format: u32,
     pub entries: Vec<OpenRouterCatalogEntry>,
 }
 
@@ -150,6 +187,7 @@ pub async fn fetch_catalog(bearer: Option<&str>) -> Result<OpenRouterCatalog, St
 
     Ok(OpenRouterCatalog {
         fetched_at: now_unix(),
+        format: CATALOG_FORMAT,
         entries,
     })
 }
@@ -210,6 +248,33 @@ fn parse_entry(v: &Value) -> Option<OpenRouterCatalogEntry> {
 
     let price_rank = blended_price_rank(pricing_prompt, pricing_completion);
 
+    let reasoning = v.get("reasoning").filter(|r| r.is_object()).map(|r| {
+        OpenRouterReasoning {
+            supported_efforts: r
+                .get("supported_efforts")
+                .and_then(|e| e.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str())
+                        .map(|x| x.trim().to_ascii_lowercase())
+                        .filter(|x| !x.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            default_effort: r
+                .get("default_effort")
+                .and_then(|d| d.as_str())
+                .map(|d| d.to_ascii_lowercase()),
+            mandatory: r.get("mandatory").and_then(|m| m.as_bool()).unwrap_or(false),
+        }
+    });
+    let hugging_face_id = v
+        .get("hugging_face_id")
+        .and_then(|h| h.as_str())
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+        .map(String::from);
+
     Some(OpenRouterCatalogEntry {
         id,
         name,
@@ -222,6 +287,8 @@ fn parse_entry(v: &Value) -> Option<OpenRouterCatalogEntry> {
         agentic_index,
         accepts_images,
         supports_tools,
+        reasoning,
+        hugging_face_id,
         price_rank,
         cost_tier: None, // filled in by assign_cost_tiers once the whole catalog is in hand
     })
@@ -409,7 +476,7 @@ pub async fn ensure_catalog_fresh(state: &crate::state::AppState) {
     let needs_refresh = {
         let guard = state.openrouter_catalog.lock().unwrap();
         match guard.as_ref() {
-            Some(c) => now_unix() - c.fetched_at > STALE_AFTER_SECS,
+            Some(c) => c.format < CATALOG_FORMAT || now_unix() - c.fetched_at > STALE_AFTER_SECS,
             None => true,
         }
     };
@@ -434,6 +501,7 @@ mod tests {
     fn catalog(fetched_at: i64, entries: usize) -> OpenRouterCatalog {
         OpenRouterCatalog {
             fetched_at,
+            format: CATALOG_FORMAT,
             entries: (0..entries)
                 .map(|i| OpenRouterCatalogEntry {
                     id: format!("vendor/model-{i}"),
@@ -447,6 +515,8 @@ mod tests {
                     agentic_index: None,
                     accepts_images: None,
                     supports_tools: None,
+                    reasoning: None,
+                    hugging_face_id: None,
                     price_rank: None,
                     cost_tier: None,
                 })
@@ -515,9 +585,50 @@ mod tests {
             agentic_index: None,
             accepts_images: None,
             supports_tools: None,
+            reasoning: None,
+            hugging_face_id: None,
             price_rank,
             cost_tier: None,
         }
+    }
+
+    /// The live shapes: a graded optional ladder, a mandatory one, a
+    /// toggle-only model, and a model with no `reasoning` object.
+    #[test]
+    fn parse_entry_reads_the_reasoning_ladder() {
+        let graded = serde_json::json!({
+            "id": "anthropic/claude-haiku-5.5",
+            "reasoning": {"mandatory": false, "default_effort": "medium",
+                "supported_efforts": ["max", "xhigh", "high", "medium", "low", "none"]}
+        });
+        let r = parse_entry(&graded).unwrap().reasoning.unwrap();
+        assert_eq!(r.supported_efforts.first().map(String::as_str), Some("max"));
+        assert_eq!(r.supported_efforts.last().map(String::as_str), Some("none"));
+        assert!(!r.mandatory);
+        assert_eq!(r.default_effort.as_deref(), Some("medium"));
+
+        let toggle = serde_json::json!({
+            "id": "qwen/qwen3.7-plus",
+            "hugging_face_id": "Qwen/Qwen3.7-Plus",
+            "reasoning": {"mandatory": false, "default_enabled": true}
+        });
+        let e = parse_entry(&toggle).unwrap();
+        assert_eq!(e.hugging_face_id.as_deref(), Some("Qwen/Qwen3.7-Plus"));
+        assert!(e.reasoning.unwrap().supported_efforts.is_empty());
+
+        let plain = serde_json::json!({"id": "meta-llama/llama-3.3-70b", "hugging_face_id": ""});
+        let e = parse_entry(&plain).unwrap();
+        assert!(e.reasoning.is_none());
+        assert!(e.hugging_face_id.is_none());
+    }
+
+    /// A copy cached by an older Kitty lacks the reasoning fields, so it is
+    /// refetched at startup however fresh it is.
+    #[test]
+    fn an_old_format_cache_is_refetched() {
+        let mut c = catalog(now_unix(), 3);
+        c.format = 0;
+        assert!(startup_should_refetch(Some(&c), now_unix()));
     }
 
     #[test]

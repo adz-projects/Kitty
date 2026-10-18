@@ -1169,22 +1169,43 @@ button:disabled {
 
 /* Reasoning-effort control (Round-7) — only rendered when the active model
    supports it, so it can sit inline with the other compact header badges. */
-.effort-dropdown {
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  background: var(--surface-2);
-  color: var(--text);
-  font-size: var(--fs-xs);
-  padding: 3px 8px;
-  cursor: pointer;
+/* Reasoning-effort picker: levels drawn as sparks (Off, then one to N),
+   monochrome so it reads the same in every theme and on every platform. */
+.provider-effort-line {
+  font-size: var(--fs-sm);
+}
+.effort-picker {
+  display: inline-flex;
+  align-items: center;
   flex-shrink: 0;
+  color: var(--text);
+}
+.effort-sparks {
+  display: inline-flex;
+  align-items: center;
+  gap: 1px;
+}
+.effort-popover {
+  min-width: 0;
+}
+.effort-popover .effort-option {
+  display: flex;
+  align-items: center;
+  min-height: 28px;
+  color: var(--text-muted);
+}
+/* Selected is marked by weight of colour, not the accent: the picker stays
+   black-and-white. */
+.effort-popover .effort-option.active,
+.effort-popover .effort-option:focus-visible {
+  color: var(--text);
+  background: var(--surface-2);
 }
 @media (max-width: 700px) {
-  .effort-dropdown {
-    /* No max-width cap: a hard 56px clipped the option text (e.g. "Medium",
-       "Thinking off"). A native <select> already sizes to its widest option,
-       which for the effort levels is narrow enough for the header row. */
-    padding: 3px 6px;
+  /* Touch targets: a phone has no hover, and a row of sparks is small. */
+  .effort-popover .effort-option {
+    min-height: 40px;
+    padding: 0 12px;
   }
 }
 .status-badge-warn {
@@ -2827,7 +2848,7 @@ button.link {
   /* One shape for every control in this row.
 
      They come from three different places — `.status-badge` (6px radius, 2px
-     padding, --fs-xs), `.effort-dropdown` (999px radius, 3px padding, --fs-xs)
+     padding, --fs-xs), the effort control (999px radius, 3px padding, --fs-xs)
      and the bare `button` rule (calc(--radius)/2 radius, 6px padding,
      inherited size) — so the row read as a jumble of mismatched heights and
      corner shapes, and the tallest of them decided how much vertical space the
@@ -2850,8 +2871,7 @@ button.link {
      the trust icon. Menu rows size to their content and start at the left
      edge; only the controls in the row itself get the uniform shape. */
   .main-header button:not(.mode-popover *):not(.chat-header-menu *),
-  .main-header .provider-badge,
-  .main-header .effort-dropdown {
+  .main-header .provider-badge {
     height: var(--hdr-control-h);
     min-height: var(--hdr-control-h);
     box-sizing: border-box;
@@ -2863,8 +2883,6 @@ button.link {
     border-radius: calc(var(--radius) / 2);
     font-size: var(--fs-sm);
     line-height: 1;
-    /* A `<select>` (the effort dropdown) otherwise reserves room for its own
-       native chrome and comes out taller than everything else. */
     appearance: none;
   }
   /* Icon-only buttons are square rather than pill-shaped, so the row reads as

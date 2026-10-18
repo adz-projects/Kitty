@@ -280,6 +280,7 @@ describe('chatStore refreshProvider malformed base_url', () => {
     active: true,
     accepts_images: null,
     tools_supported: false,
+    effort: { levels: [], can_disable: false, source: null, source_label: null, detected_at: null, detecting: false },
   };
 
   it('derives everything but the host from a blank base_url', async () => {

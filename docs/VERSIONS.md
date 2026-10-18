@@ -38,6 +38,22 @@ What Kitty relies on, added in 2.1.0 unless noted:
 | in-process MCP `InProcessConfig` from the row's env | Android grants and settings without process env |
 | DPAPI-sealed `encryption.key.dpapi` (Windows) | No plaintext at-rest key |
 | `POST /api/apps/me/import-v1` → `MergeSummary` | One-click V1 import |
+
+Added in daemon **2.2.0** (Kitty 1.1, reasoning effort):
+
+| Surface | Used for |
+|---|---|
+| `thinking_effort` levels sent verbatim (`xhigh`, `max`, `minimal`…); `none` = off; `on` = ungraded on | The star picker's levels reach the wire as chosen, instead of being clamped to `high` |
+| `fireworks` / `deepinfra` dialects take a flat `reasoning_effort` | Effort on those cards (it was dropped) |
+| provider `config.anthropic_thinking: "adaptive"` → `thinking: adaptive` + `output_config.effort` | Current Claude models, which reject `budget_tokens` with a 400 |
+| `provider_error` `error_type: "effort_rejected"` | Kitty re-detects the card's levels |
+
+Kitty detects each card's ladder itself (`src-tauri/src/bigtiny/effort/`):
+OpenRouter's catalog `reasoning` object (`supported_efforts`, highest first,
+`none` last when optional; `mandatory`; verified live 2026-10-18 on 337 of
+471 models), Anthropic's `GET /v1/models/{id}` `capabilities.effort` and
+`capabilities.thinking.types`, a self-hosted server's `/props` chat template,
+HuggingFace `tokenizer_config.json`, and Ollama `/api/show` `capabilities`.
 | `DELETE /api/apps/me?purge=true` | Uninstall removes only Kitty's data |
 | specialist `max_concurrent`; runs report `provider_id`/`model` | Per-specialist concurrency; where a run ran |
 | kitty-web `search_lang` / `country` on DuckDuckGo (`kl`) and Bing (`setlang`/`cc`) | Locale honoured without Brave |

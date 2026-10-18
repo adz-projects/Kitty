@@ -201,13 +201,15 @@ pub struct AppState {
     /// this is what lets the watchdog tell "still loading" apart from
     /// "never going to load".
     pub booted_windows: Mutex<HashSet<String>>,
-    /// Reasoning-effort levels discovered per provider id for self-hosted
-    /// endpoints (`bigtiny::effort`). A provider's levels come from its own
-    /// model's chat template (queried once from the server's `/props`, or
-    /// HuggingFace), so they're cached here rather than re-probed on every
-    /// dropdown read. An empty vec means "probed, none found" → hide the
-    /// dropdown; a missing key means "not probed yet".
-    pub effort_levels: Mutex<HashMap<String, Vec<String>>>,
+    /// Which card (and model) each chat is on, as far as this run has
+    /// learned — filled when a chat is created, loaded, branched or moved
+    /// (`bigtiny::effort::remember_session_card`). Effort resolves against
+    /// this, not the global default card; a miss is read from the engine's
+    /// session metadata.
+    pub session_cards: Mutex<HashMap<String, (String, String)>>,
+    /// Cards whose reasoning ladder is being detected right now — dedupes
+    /// concurrent detections and drives the "Re-detect" busy state.
+    pub effort_detecting: Mutex<HashSet<String>>,
     /// Sessions whose reasoning effort has already been confirmed against the
     /// per-model memory this run (see `bigtiny::effort::confirm_model_effort`).
     /// The confirmation is a first-turn job, so this is what makes it happen
@@ -267,7 +269,8 @@ impl AppState {
             bigtiny_compaction_watermarks: Mutex::new(HashMap::new()),
             bigtiny_titled_sessions: Mutex::new(HashSet::new()),
             booted_windows: Mutex::new(HashSet::new()),
-            effort_levels: Mutex::new(HashMap::new()),
+            session_cards: Mutex::new(HashMap::new()),
+            effort_detecting: Mutex::new(HashSet::new()),
             effort_confirmed_sessions: Mutex::new(HashSet::new()),
             openrouter_catalog: Mutex::new(None),
             foreground: AtomicBool::new(true),
