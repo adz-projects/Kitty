@@ -72,11 +72,10 @@ pub fn remember_session_card(app: &AppHandle, session_id: &str, card_id: &str, m
         return;
     }
     let state = app.state::<AppState>();
-    state
-        .session_cards
-        .lock()
-        .unwrap()
-        .insert(session_id.to_string(), (card_id.to_string(), model.to_string()));
+    state.session_cards.lock().unwrap().insert(
+        session_id.to_string(),
+        (card_id.to_string(), model.to_string()),
+    );
 }
 
 /// The chat's card if already known this run, else the default card. Sync,
@@ -148,8 +147,8 @@ pub fn effort_view(
     }
     let opts = ladder::options(caps);
     let offered = |v: &String| opts.iter().any(|o| &o.value == v);
-    let fallback = ladder::default_level(&caps.levels)
-        .or_else(|| opts.first().map(|o| o.value.clone()))?;
+    let fallback =
+        ladder::default_level(&caps.levels).or_else(|| opts.first().map(|o| o.value.clone()))?;
     let current_value = session_id
         .and_then(|sid| cfg.session_efforts.get(sid))
         .filter(|v| offered(v))
@@ -205,7 +204,10 @@ pub async fn ensure_caps(app: &AppHandle, card_id: &str) {
         };
         match cfg.effort_caps.get(&effort_key(card_id, &model)) {
             None => (true, false),
-            Some(c) => (false, c.stale || now_unix() - c.detected_at > STALE_AFTER_SECS),
+            Some(c) => (
+                false,
+                c.stale || now_unix() - c.detected_at > STALE_AFTER_SECS,
+            ),
         }
     };
     if missing {
@@ -226,7 +228,12 @@ pub async fn ensure_caps(app: &AppHandle, card_id: &str) {
 pub async fn detect_card(app: &AppHandle, card_id: &str) -> bool {
     let card = {
         let state = app.state::<AppState>();
-        if !state.effort_detecting.lock().unwrap().insert(card_id.to_string()) {
+        if !state
+            .effort_detecting
+            .lock()
+            .unwrap()
+            .insert(card_id.to_string())
+        {
             return false;
         }
         let cfg = state.config.lock().unwrap();
@@ -253,13 +260,20 @@ async fn run_detection(app: &AppHandle, card: &CardSnapshot) -> bool {
         let state = app.state::<AppState>();
         crate::openrouter::catalog::ensure_catalog_fresh(&state).await;
         let guard = state.openrouter_catalog.lock().unwrap();
-        guard.as_ref().map(|c| c.entries.clone()).unwrap_or_default()
+        guard
+            .as_ref()
+            .map(|c| c.entries.clone())
+            .unwrap_or_default()
     };
     let api_key = crate::config::providers::get_secret_async(&card.id).await;
     let found = match detect::detect(card, &catalog, api_key.as_deref()).await {
         Detection::Found(c) => c,
         Detection::Unknown => {
-            tracing::info!(card = card.id, model = card.model, "reasoning levels not detected");
+            tracing::info!(
+                card = card.id,
+                model = card.model,
+                "reasoning levels not detected"
+            );
             let state = app.state::<AppState>();
             let mut cfg = state.config.lock().unwrap();
             // Keep what we had, but stop treating a rejected ladder as stale
@@ -286,11 +300,11 @@ async fn run_detection(app: &AppHandle, card: &CardSnapshot) -> bool {
         let mut cfg = state.config.lock().unwrap();
         let key = effort_key(&card.id, &card.model);
         let prev = cfg.effort_caps.get(&key).cloned();
-        let changed = prev
-            .as_ref()
-            .map_or(true, |p| p.levels != found.levels || p.can_disable != found.can_disable);
-        let resync = prev.as_ref().and_then(|p| p.anthropic_thinking.clone())
-            != found.anthropic_thinking;
+        let changed = prev.as_ref().map_or(true, |p| {
+            p.levels != found.levels || p.can_disable != found.can_disable
+        });
+        let resync =
+            prev.as_ref().and_then(|p| p.anthropic_thinking.clone()) != found.anthropic_thinking;
         cfg.effort_caps.insert(key, found);
         if let Err(e) = crate::config::save(&cfg) {
             tracing::warn!("failed to persist detected reasoning levels: {e}");
@@ -405,7 +419,8 @@ pub async fn confirm_model_effort(app: &AppHandle, session_id: &str) {
         let session_changed = cfg.session_efforts.get(session_id) != Some(&value);
         let model_changed = cfg.model_efforts.get(&key) != Some(&value);
         if session_changed {
-            cfg.session_efforts.insert(session_id.to_string(), value.clone());
+            cfg.session_efforts
+                .insert(session_id.to_string(), value.clone());
         }
         if model_changed {
             cfg.model_efforts.insert(key, value.clone());
@@ -566,17 +581,38 @@ mod tests {
     fn chosen_then_remembered_then_default() {
         let mut cfg = Config::default();
         let key = effort_key("b", "m");
-        cfg.effort_caps.insert(key.clone(), caps(&["low", "medium", "high"], false));
-        assert_eq!(effort_view(&cfg, "b", "m", Some("s")).unwrap().current_value, "medium");
+        cfg.effort_caps
+            .insert(key.clone(), caps(&["low", "medium", "high"], false));
+        assert_eq!(
+            effort_view(&cfg, "b", "m", Some("s"))
+                .unwrap()
+                .current_value,
+            "medium"
+        );
         cfg.model_efforts.insert(key.clone(), "high".into());
-        assert_eq!(effort_view(&cfg, "b", "m", Some("s")).unwrap().current_value, "high");
+        assert_eq!(
+            effort_view(&cfg, "b", "m", Some("s"))
+                .unwrap()
+                .current_value,
+            "high"
+        );
         cfg.session_efforts.insert("s".into(), "low".into());
-        assert_eq!(effort_view(&cfg, "b", "m", Some("s")).unwrap().current_value, "low");
+        assert_eq!(
+            effort_view(&cfg, "b", "m", Some("s"))
+                .unwrap()
+                .current_value,
+            "low"
+        );
         // A value this ladder doesn't offer (here Off on a mandatory model)
         // never sticks.
         cfg.session_efforts.insert("s".into(), "off".into());
         cfg.model_efforts.insert(key, "xhigh".into());
-        assert_eq!(effort_view(&cfg, "b", "m", Some("s")).unwrap().current_value, "medium");
+        assert_eq!(
+            effort_view(&cfg, "b", "m", Some("s"))
+                .unwrap()
+                .current_value,
+            "medium"
+        );
     }
 
     #[test]
@@ -588,7 +624,8 @@ mod tests {
     #[test]
     fn toggle_only_defaults_to_on() {
         let mut cfg = Config::default();
-        cfg.effort_caps.insert(effort_key("c", "m"), caps(&["on"], true));
+        cfg.effort_caps
+            .insert(effort_key("c", "m"), caps(&["on"], true));
         let e = effort_view(&cfg, "c", "m", None).unwrap();
         assert_eq!(e.current_value, "on");
         assert_eq!(e.options.len(), 2);

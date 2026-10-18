@@ -1366,7 +1366,6 @@ mod tests {
         assert!(parse_sse_frame("data: not-json").is_none());
     }
 
-
     #[test]
     fn truncate_for_ui_caps_long_strings_at_char_boundary() {
         let s = "é".repeat(MAX_STRING_BYTES); // 2 bytes each

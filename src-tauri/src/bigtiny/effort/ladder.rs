@@ -228,7 +228,10 @@ mod tests {
             normalize_levels(&["low", "deep", "high"]),
             v(&["low", "deep", "high"])
         );
-        assert_eq!(normalize_levels(&["Low", "low", " HIGH "]), v(&["low", "high"]));
+        assert_eq!(
+            normalize_levels(&["Low", "low", " HIGH "]),
+            v(&["low", "high"])
+        );
     }
 
     #[test]
@@ -238,11 +241,20 @@ mod tests {
             default_level(&v(&["low", "medium", "high", "xhigh", "max"])).as_deref(),
             Some("medium")
         );
-        assert_eq!(default_level(&v(&["low", "high", "max"])).as_deref(), Some("high"));
-        assert_eq!(default_level(&v(&["low", "medium", "xhigh"])).as_deref(), Some("medium"));
+        assert_eq!(
+            default_level(&v(&["low", "high", "max"])).as_deref(),
+            Some("high")
+        );
+        assert_eq!(
+            default_level(&v(&["low", "medium", "xhigh"])).as_deref(),
+            Some("medium")
+        );
         assert_eq!(default_level(&v(&["high"])).as_deref(), Some("high"));
         // Even count, no medium: the lower middle.
-        assert_eq!(default_level(&v(&["minimal", "high"])).as_deref(), Some("minimal"));
+        assert_eq!(
+            default_level(&v(&["minimal", "high"])).as_deref(),
+            Some("minimal")
+        );
         assert_eq!(default_level(&v(&["on"])).as_deref(), Some("on"));
         assert_eq!(default_level(&[]), None);
     }
@@ -259,7 +271,10 @@ mod tests {
         };
         let opts = options(&caps);
         let got: Vec<(&str, u8)> = opts.iter().map(|o| (o.value.as_str(), o.stars)).collect();
-        assert_eq!(got, vec![("off", 0), ("low", 1), ("medium", 2), ("high", 3)]);
+        assert_eq!(
+            got,
+            vec![("off", 0), ("low", 1), ("medium", 2), ("high", 3)]
+        );
         assert_eq!(opts[0].name, "Off");
 
         let mandatory = EffortCaps {

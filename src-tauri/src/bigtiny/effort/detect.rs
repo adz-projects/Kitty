@@ -76,9 +76,9 @@ pub async fn detect(
             .and_then(|e| e.reasoning.as_ref())
             .map(from_openrouter),
         "anthropic" => detect_anthropic(card, catalog, api_key).await,
-        "openai" | "fireworks" | "deepinfra" => {
-            match_in_catalog(model, catalog).and_then(|e| e.reasoning.as_ref()).map(from_openrouter)
-        }
+        "openai" | "fireworks" | "deepinfra" => match_in_catalog(model, catalog)
+            .and_then(|e| e.reasoning.as_ref())
+            .map(from_openrouter),
         "custom_openai" | "ollama" => detect_self_hosted(card, catalog, api_key).await,
         _ => None,
     };
@@ -137,8 +137,16 @@ pub fn parse_anthropic_model(v: &Value) -> Option<AnthropicModelCaps> {
             .unwrap_or(false)
     };
     let thinking = caps.get("thinking");
-    let adaptive = supported(thinking.and_then(|t| t.get("types")).and_then(|t| t.get("adaptive")));
-    let enabled = supported(thinking.and_then(|t| t.get("types")).and_then(|t| t.get("enabled")));
+    let adaptive = supported(
+        thinking
+            .and_then(|t| t.get("types"))
+            .and_then(|t| t.get("adaptive")),
+    );
+    let enabled = supported(
+        thinking
+            .and_then(|t| t.get("types"))
+            .and_then(|t| t.get("enabled")),
+    );
     let effort = caps.get("effort");
     let mut raw = Vec::new();
     if supported(effort) {
@@ -201,10 +209,18 @@ async fn detect_anthropic(
     }
 }
 
-async fn fetch_anthropic_model(base_url: &str, model: &str, key: &str) -> Option<AnthropicModelCaps> {
+async fn fetch_anthropic_model(
+    base_url: &str,
+    model: &str,
+    key: &str,
+) -> Option<AnthropicModelCaps> {
     let base = base_url.trim().trim_end_matches('/');
     let base = base.strip_suffix("/v1").unwrap_or(base);
-    let base = if base.is_empty() { "https://api.anthropic.com" } else { base };
+    let base = if base.is_empty() {
+        "https://api.anthropic.com"
+    } else {
+        base
+    };
     let url = format!("{base}/v1/models/{model}");
     let resp = crate::util::http_client()
         .get(&url)
@@ -524,7 +540,10 @@ mod tests {
     #[test]
     fn openrouter_shapes() {
         // Claude Haiku 5.5: optional, five levels.
-        let c = from_openrouter(&r(&["max", "xhigh", "high", "medium", "low", "none"], false));
+        let c = from_openrouter(&r(
+            &["max", "xhigh", "high", "medium", "low", "none"],
+            false,
+        ));
         assert_eq!(c.levels, ["low", "medium", "high", "xhigh", "max"]);
         assert!(c.can_disable);
         // Claude Sonnet 5.5: mandatory — no Off.
@@ -608,7 +627,11 @@ mod tests {
         }
     }
 
-    fn entry(id: &str, hf: Option<&str>, reasoning: Option<OpenRouterReasoning>) -> OpenRouterCatalogEntry {
+    fn entry(
+        id: &str,
+        hf: Option<&str>,
+        reasoning: Option<OpenRouterReasoning>,
+    ) -> OpenRouterCatalogEntry {
         OpenRouterCatalogEntry {
             id: id.into(),
             name: id.into(),

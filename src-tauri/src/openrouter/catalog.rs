@@ -248,8 +248,10 @@ fn parse_entry(v: &Value) -> Option<OpenRouterCatalogEntry> {
 
     let price_rank = blended_price_rank(pricing_prompt, pricing_completion);
 
-    let reasoning = v.get("reasoning").filter(|r| r.is_object()).map(|r| {
-        OpenRouterReasoning {
+    let reasoning = v
+        .get("reasoning")
+        .filter(|r| r.is_object())
+        .map(|r| OpenRouterReasoning {
             supported_efforts: r
                 .get("supported_efforts")
                 .and_then(|e| e.as_array())
@@ -265,9 +267,11 @@ fn parse_entry(v: &Value) -> Option<OpenRouterCatalogEntry> {
                 .get("default_effort")
                 .and_then(|d| d.as_str())
                 .map(|d| d.to_ascii_lowercase()),
-            mandatory: r.get("mandatory").and_then(|m| m.as_bool()).unwrap_or(false),
-        }
-    });
+            mandatory: r
+                .get("mandatory")
+                .and_then(|m| m.as_bool())
+                .unwrap_or(false),
+        });
     let hugging_face_id = v
         .get("hugging_face_id")
         .and_then(|h| h.as_str())
