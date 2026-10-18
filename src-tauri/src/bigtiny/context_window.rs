@@ -29,6 +29,7 @@
 
 use tauri::{AppHandle, Manager};
 
+use crate::config::Config;
 use crate::state::AppState;
 
 /// Cache/memory key: provider **and** model, matching
@@ -48,16 +49,15 @@ fn plausible(n: u32) -> Option<u32> {
     (1_024..=10_000_000).contains(&n).then_some(n)
 }
 
-/// The active provider's `(id, provider_type, base_url, model, explicit)`, or
-/// `None` when there is no usable active provider. Split out so the config lock
-/// is never held across an `await`.
-fn active_provider(app: &AppHandle) -> Option<(String, String, String, String, Option<u32>)> {
-    let state = app.state::<AppState>();
-    let cfg = state.config.lock().unwrap();
-    let active_id = cfg.active_provider_id.as_deref()?;
-    let p = cfg.providers.iter().find(|p| p.id == active_id)?;
+/// One card's `(provider_type, base_url, model, explicit)`, from a config
+/// snapshot. Split out so the config lock is never held across an `await`.
+///
+/// Takes the card rather than reading `active_provider_id`: a chat runs on
+/// its own card (`effort::resolve_session_card`), and the default card's
+/// window is the wrong answer for any chat pinned elsewhere.
+fn card(cfg: &Config, card_id: &str) -> Option<(String, String, String, Option<u32>)> {
+    let p = cfg.providers.iter().find(|p| p.id == card_id)?;
     Some((
-        p.id.clone(),
         p.provider_type.clone(),
         p.base_url.clone(),
         p.models.first().cloned().unwrap_or_default(),
@@ -119,20 +119,25 @@ async fn catalog_context_length(app: &AppHandle, model: &str) -> Option<u32> {
         .and_then(|e| e.context_length)
 }
 
-/// Discover this provider+model's window once and remember it, if it isn't
+/// Discover this card's window once and remember it, if it isn't
 /// already known. Cheap on every call after the first: a hit is a map lookup,
 /// and the OpenRouter path is served from the in-memory catalog.
 ///
 /// Does nothing when the profile carries an explicit `context_length` — that is
 /// a deliberate override and discovery must never stomp it.
-pub async fn ensure_context_length_cached(app: &AppHandle) {
-    let Some((provider_id, provider_type, base_url, model, explicit)) = active_provider(app) else {
+pub async fn ensure_context_length_cached(app: &AppHandle, card_id: &str) {
+    let snapshot = {
+        let state = app.state::<AppState>();
+        let cfg = state.config.lock().unwrap();
+        card(&cfg, card_id)
+    };
+    let Some((provider_type, base_url, model, explicit)) = snapshot else {
         return;
     };
     if explicit.is_some() {
         return;
     }
-    let key = model_key(&provider_id, &model);
+    let key = model_key(card_id, &model);
     {
         let state = app.state::<AppState>();
         let cfg = state.config.lock().unwrap();
@@ -146,7 +151,7 @@ pub async fn ensure_context_length_cached(app: &AppHandle) {
         // an undiscoverable window is often transient (the local server is
         // down, the catalog fetch failed), and re-trying next turn costs one
         // cached lookup.
-        tracing::debug!(provider_id, model, "no context length discovered");
+        tracing::debug!(card_id, model, "no context length discovered");
         return;
     };
 
@@ -156,56 +161,66 @@ pub async fn ensure_context_length_cached(app: &AppHandle) {
     if let Err(e) = crate::config::save(&cfg) {
         tracing::warn!("failed to persist discovered context length: {e}");
     }
-    tracing::info!(provider_id, model, found, "discovered model context length");
+    tracing::info!(card_id, model, found, "discovered model context length");
 }
 
-/// The window Kitty believes this provider+model has, applying the resolution
+/// The window Kitty believes this card's model has, applying the resolution
 /// order in this module's header.
-pub fn resolved_context_length(app: &AppHandle) -> Option<u32> {
-    let (provider_id, _, _, model, explicit) = active_provider(app)?;
+fn resolved_context_length(cfg: &Config, card_id: &str) -> Option<u32> {
+    let (_, _, model, explicit) = card(cfg, card_id)?;
     if explicit.is_some() {
         return explicit;
     }
-    let state = app.state::<AppState>();
-    let cfg = state.config.lock().unwrap();
     cfg.model_context_lengths
-        .get(&model_key(&provider_id, &model))
+        .get(&model_key(card_id, &model))
         .copied()
 }
 
+/// Write the resolved window onto the card's own profile, which is what
+/// `providers::sync_all_providers` relays to the engine. Returns whether the
+/// profile changed — and so whether the engine needs re-syncing.
+fn write_onto_card(cfg: &mut Config, card_id: &str) -> bool {
+    let Some(resolved) = resolved_context_length(cfg, card_id) else {
+        return false;
+    };
+    match cfg.providers.iter_mut().find(|p| p.id == card_id) {
+        Some(p) if p.context_length != Some(resolved) => {
+            p.context_length = Some(resolved);
+            true
+        }
+        _ => false,
+    }
+}
+
 /// First-turn confirmation, the counterpart to
-/// `effort::confirm_model_effort` and called from the same place.
+/// `effort::confirm_model_effort` and called from the same place, for the
+/// chat's own card.
 ///
 /// Discovers the window if it isn't known yet, then makes sure the daemon's
 /// provider row actually carries it — because the row is what the wrap-up valve
 /// reads, and a value that only exists in Kitty's config protects nothing.
 /// Re-registers only when the daemon's value differs, so an unchanged session
 /// touches neither the config file nor the daemon.
-pub async fn confirm_model_context_length(app: &AppHandle) {
-    ensure_context_length_cached(app).await;
-    let Some(resolved) = resolved_context_length(app) else {
+pub async fn confirm_model_context_length(app: &AppHandle, session_id: &str) {
+    let Some((card_id, _)) = crate::bigtiny::effort::resolve_session_card(app, session_id).await
+    else {
         return;
     };
+    ensure_context_length_cached(app, &card_id).await;
 
-    // `providers::sync_active_provider` relays the profile's own
+    // `providers::sync_all_providers` relays the profile's own
     // `context_length` field, so the remembered value has to be written onto
     // the profile before the daemon can see it. Only when it differs.
     let needs_push = {
         let state = app.state::<AppState>();
         let mut cfg = state.config.lock().unwrap();
-        let Some(active_id) = cfg.active_provider_id.clone() else {
-            return;
-        };
-        match cfg.providers.iter_mut().find(|p| p.id == active_id) {
-            Some(p) if p.context_length != Some(resolved) => {
-                p.context_length = Some(resolved);
-                if let Err(e) = crate::config::save(&cfg) {
-                    tracing::warn!("failed to persist confirmed context length: {e}");
-                }
-                true
+        let changed = write_onto_card(&mut cfg, &card_id);
+        if changed {
+            if let Err(e) = crate::config::save(&cfg) {
+                tracing::warn!("failed to persist confirmed context length: {e}");
             }
-            _ => false,
         }
+        changed
     };
 
     if needs_push {
@@ -218,6 +233,22 @@ pub async fn confirm_model_context_length(app: &AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn profile(id: &str, model: &str) -> crate::config::providers::ProviderProfile {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "name": id, "provider_type": "openrouter", "base_url": "", "models": [model],
+        }))
+        .unwrap()
+    }
+
+    /// Default card `a`, and a chat pinned to card `b` on a different model.
+    fn two_cards() -> Config {
+        Config {
+            providers: vec![profile("a", "small-model"), profile("b", "big-model")],
+            active_provider_id: Some("a".into()),
+            ..Config::default()
+        }
+    }
 
     #[test]
     fn the_key_separates_the_same_model_on_different_providers() {
@@ -250,5 +281,38 @@ mod tests {
         assert_eq!(plausible(8_192), Some(8_192));
         assert_eq!(plausible(128_000), Some(128_000));
         assert_eq!(plausible(1_000_000), Some(1_000_000));
+    }
+
+    /// The bug this fixes: a chat on card `b` was budgeted with the default
+    /// card's window, and the confirmation wrote it onto the default profile.
+    #[test]
+    fn a_chat_resolves_and_confirms_against_its_own_card() {
+        let mut cfg = two_cards();
+        cfg.model_context_lengths
+            .insert(model_key("a", "small-model"), 32_768);
+        cfg.model_context_lengths
+            .insert(model_key("b", "big-model"), 200_000);
+
+        assert_eq!(resolved_context_length(&cfg, "b"), Some(200_000));
+        assert!(write_onto_card(&mut cfg, "b"));
+        assert_eq!(cfg.providers[1].context_length, Some(200_000));
+        // The default card is untouched.
+        assert_eq!(cfg.providers[0].context_length, None);
+        // Already written: a second confirmation changes nothing.
+        assert!(!write_onto_card(&mut cfg, "b"));
+    }
+
+    #[test]
+    fn an_explicit_window_on_the_chats_card_wins_over_discovery() {
+        let mut cfg = two_cards();
+        cfg.providers[1].context_length = Some(65_536);
+        cfg.model_context_lengths
+            .insert(model_key("b", "big-model"), 200_000);
+        assert_eq!(resolved_context_length(&cfg, "b"), Some(65_536));
+        assert!(!write_onto_card(&mut cfg, "b"));
+        // Nothing known for the default card's model: nothing to write.
+        assert_eq!(resolved_context_length(&cfg, "a"), None);
+        assert!(!write_onto_card(&mut cfg, "a"));
+        assert!(!write_onto_card(&mut cfg, "missing"));
     }
 }

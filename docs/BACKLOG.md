@@ -9,14 +9,6 @@ Nothing open.
 
 ## Noted for later
 
-- **Context length and vision still resolve against the default card.**
-  `bigtiny/context_window.rs` and `bigtiny/vision.rs` read
-  `active_provider_id`, so a chat on another card is budgeted and offered
-  image attachments by the default card's model; `confirm_model_context_length`
-  even writes the length onto the default profile. Reasoning effort had the
-  same bug and now resolves through `effort::resolve_session_card`; these two
-  should do the same.
-
 - **Specialists and scheduled runs carry no reasoning effort.** The engine
   builds a delegate's and a scheduled run's metadata without
   `thinking_effort`, so both run at the model's default level. Adding a level

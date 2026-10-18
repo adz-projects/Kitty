@@ -106,7 +106,6 @@ pub async fn upsert_provider(
             providers::set_secret_async(&profile.id, &s).await?;
         }
     }
-    let is_default;
     let detect_effort;
     {
         let state = app.state::<AppState>();
@@ -131,7 +130,6 @@ pub async fn upsert_provider(
             }
         }
         config::save(&cfg).map_err(|e| e.to_string())?;
-        is_default = cfg.active_provider_id.as_deref() == Some(profile.id.as_str());
     }
     if detect_effort {
         // Background: detection may probe a self-hosted server or HuggingFace,
@@ -146,13 +144,11 @@ pub async fn upsert_provider(
             profile.id
         );
     }
-    if is_default {
-        // Probe image support now rather than waiting for the first turn, so
-        // the composer offers (or hides) the attach controls correctly from
-        // the moment the profile is saved. Best-effort and already cached
-        // after the first success.
-        crate::bigtiny::vision::ensure_vision_cached(&app).await;
-    }
+    // Probe image support now rather than waiting for the first turn, so the
+    // composer offers (or hides) the attach controls correctly from the
+    // moment the card is saved — for any card, since any chat may be pinned
+    // to it. Best-effort and already cached after the first success.
+    crate::bigtiny::vision::ensure_vision_cached(&app, &profile.id).await;
     Ok(profile)
 }
 

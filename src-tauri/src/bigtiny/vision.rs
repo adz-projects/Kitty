@@ -37,6 +37,7 @@
 
 use tauri::{AppHandle, Manager};
 
+use crate::config::Config;
 use crate::state::AppState;
 
 /// Cache key, identical in shape to `context_window::model_key` and
@@ -47,16 +48,13 @@ fn model_key(provider_id: &str, model: &str) -> String {
     format!("{provider_id}\u{0}{model}")
 }
 
-/// The active provider's `(id, provider_type, base_url, model, explicit)`.
-/// Split out so the config lock is never held across an `await` — same reason
-/// as its twin in `context_window`.
-fn active_provider(app: &AppHandle) -> Option<(String, String, String, String, bool)> {
-    let state = app.state::<AppState>();
-    let cfg = state.config.lock().unwrap();
-    let active_id = cfg.active_provider_id.as_deref()?;
-    let p = cfg.providers.iter().find(|p| p.id == active_id)?;
+/// One card's `(provider_type, base_url, model, explicit)`, from a config
+/// snapshot. Split out so the config lock is never held across an `await` —
+/// same reason as its twin in `context_window`, and like it, keyed by the
+/// chat's own card rather than the default one.
+fn card(cfg: &Config, card_id: &str) -> Option<(String, String, String, bool)> {
+    let p = cfg.providers.iter().find(|p| p.id == card_id)?;
     Some((
-        p.id.clone(),
         p.provider_type.clone(),
         p.base_url.clone(),
         p.models.first().cloned().unwrap_or_default(),
@@ -106,18 +104,23 @@ async fn catalog_accepts_images(app: &AppHandle, model: &str) -> Option<bool> {
         .and_then(|e| e.accepts_images)
 }
 
-/// Discover this provider+model's vision support once and remember it.
+/// Discover one card's vision support once and remember it.
 ///
 /// Skipped entirely when the profile already carries `supports_vision` — that
 /// is a deliberate override and discovery must not second-guess it.
-pub async fn ensure_vision_cached(app: &AppHandle) {
-    let Some((provider_id, provider_type, base_url, model, explicit)) = active_provider(app) else {
+pub async fn ensure_vision_cached(app: &AppHandle, card_id: &str) {
+    let snapshot = {
+        let state = app.state::<AppState>();
+        let cfg = state.config.lock().unwrap();
+        card(&cfg, card_id)
+    };
+    let Some((provider_type, base_url, model, explicit)) = snapshot else {
         return;
     };
     if explicit {
         return;
     }
-    let key = model_key(&provider_id, &model);
+    let key = model_key(card_id, &model);
     {
         let state = app.state::<AppState>();
         let cfg = state.config.lock().unwrap();
@@ -131,7 +134,7 @@ pub async fn ensure_vision_cached(app: &AppHandle) {
         // does not memoize a miss: the usual cause is transient (the local
         // server is down, the catalog fetch failed), and retrying next turn
         // costs one map lookup.
-        tracing::debug!(provider_id, model, "no vision capability discovered");
+        tracing::debug!(card_id, model, "no vision capability discovered");
         return;
     };
 
@@ -141,7 +144,7 @@ pub async fn ensure_vision_cached(app: &AppHandle) {
     if let Err(e) = crate::config::save(&cfg) {
         tracing::warn!("failed to persist discovered vision capability: {e}");
     }
-    tracing::info!(provider_id, model, found, "discovered model vision support");
+    tracing::info!(card_id, model, found, "discovered model vision support");
 }
 
 /// The verdict for one profile, read from an already-taken `Config` snapshot.
@@ -163,21 +166,41 @@ pub fn vision_for_profile(
         .copied()
 }
 
-/// First-turn confirmation, called from `send_prompt` alongside
-/// `effort::confirm_model_effort` and
+/// First-turn confirmation for the chat's own card, called from `send_prompt`
+/// alongside `effort::confirm_model_effort` and
 /// `context_window::confirm_model_context_length`.
 ///
 /// Unlike those two there is nothing to push to the daemon — the daemon does
 /// not gate on vision; Kitty's own UI does. So this only has to make sure the
 /// verdict is discovered and cached before the user reaches for an attach
 /// button.
-pub async fn confirm_model_vision(app: &AppHandle) {
-    ensure_vision_cached(app).await;
+pub async fn confirm_model_vision(app: &AppHandle, session_id: &str) {
+    let Some((card_id, _)) = crate::bigtiny::effort::resolve_session_card(app, session_id).await
+    else {
+        return;
+    };
+    ensure_vision_cached(app, &card_id).await;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn profile(id: &str, model: &str) -> crate::config::providers::ProviderProfile {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "name": id, "provider_type": "openrouter", "base_url": "", "models": [model],
+        }))
+        .unwrap()
+    }
+
+    /// Default card `a`, and a chat pinned to card `b` on a different model.
+    fn two_cards() -> Config {
+        Config {
+            providers: vec![profile("a", "small-model"), profile("b", "big-model")],
+            active_provider_id: Some("a".into()),
+            ..Config::default()
+        }
+    }
 
     /// Same NUL-separated shape as its two siblings, including the collision
     /// case a plain concatenation would get wrong.
@@ -188,5 +211,26 @@ mod tests {
             model_key("prof_selfhosted", "qwen3.6-27b")
         );
         assert_ne!(model_key("a", "bc"), model_key("ab", "c"));
+    }
+
+    /// A chat on card `b` gets `b`'s verdict, not the default card's.
+    #[test]
+    fn a_chat_resolves_against_its_own_card() {
+        let mut cfg = two_cards();
+        cfg.model_vision
+            .insert(model_key("a", "small-model"), false);
+        cfg.model_vision.insert(model_key("b", "big-model"), true);
+        assert_eq!(card(&cfg, "b").map(|c| c.2), Some("big-model".to_string()));
+        assert_eq!(vision_for_profile(&cfg, &cfg.providers[1]), Some(true));
+        assert_eq!(vision_for_profile(&cfg, &cfg.providers[0]), Some(false));
+    }
+
+    #[test]
+    fn the_manual_flag_is_read_from_the_chats_card() {
+        let mut cfg = two_cards();
+        cfg.providers[1].supports_vision = true;
+        assert_eq!(card(&cfg, "b").map(|c| c.3), Some(true));
+        assert_eq!(card(&cfg, "a").map(|c| c.3), Some(false));
+        assert!(card(&cfg, "missing").is_none());
     }
 }

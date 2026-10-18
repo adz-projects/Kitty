@@ -58,8 +58,8 @@ pub async fn send_prompt(
         // budgeting against the daemon's 64k default instead of the model's
         // real window. Same first-turn moment, same write-only-when-changed
         // rule as the effort confirmation above.
-        crate::bigtiny::context_window::confirm_model_context_length(&app).await;
-        crate::bigtiny::vision::confirm_model_vision(&app).await;
+        crate::bigtiny::context_window::confirm_model_context_length(&app, &session_id).await;
+        crate::bigtiny::vision::confirm_model_vision(&app, &session_id).await;
     }
     crate::bigtiny::stream::send_prompt(app, session_id, text, images, attached_paths).await
 }
