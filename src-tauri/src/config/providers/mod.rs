@@ -16,7 +16,7 @@ pub use keyring::{
 // Only the desktop uninstall cleanup removes it.
 #[cfg(desktop)]
 pub use keyring::V1_ENCRYPTION_KEY_ACCOUNT;
-pub use network::{network_tier_for, NetworkTier};
+pub use network::{is_hosted_endpoint, network_tier_for, NetworkTier};
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;

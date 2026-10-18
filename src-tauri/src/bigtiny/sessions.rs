@@ -319,6 +319,40 @@ pub async fn is_paused(app: &AppHandle, session_id: &str) -> bool {
     false
 }
 
+/// Pure: whether a session's metadata switches specialists off for it. Only
+/// an explicit `true` does — a chat starts with specialists on.
+pub(crate) fn specialists_disabled_in(meta: &Value) -> bool {
+    meta.get("specialists_disabled").and_then(|v| v.as_bool()) == Some(true)
+}
+
+/// Whether this chat has specialists switched off (its ⋯ menu). Read from the
+/// engine session, so a resumed chat — and a branch or fork, which copy the
+/// metadata — keep the choice.
+pub async fn specialists_disabled(app: &AppHandle, session_id: &str) -> bool {
+    let Ok(client) = ensure_client(app) else {
+        return false;
+    };
+    specialists_disabled_in(&metadata(&client, session_id).await)
+}
+
+/// Switch specialists off (or back on) for one chat. The engine then withholds
+/// `call_specialist`, `await_specialists` and `list_specialists` from that
+/// session's tool list from its next turn on.
+pub async fn set_specialists_disabled(
+    app: &AppHandle,
+    session_id: &str,
+    disabled: bool,
+) -> Result<(), String> {
+    let client = ensure_client(app)?;
+    client
+        .patch_json(
+            &format!("/api/chat/{session_id}/config"),
+            &json!({ "specialists_disabled": disabled }),
+        )
+        .await?;
+    Ok(())
+}
+
 /// A session's stored metadata, parsed.
 pub(crate) async fn metadata(client: &BigTinyClient, session_id: &str) -> Value {
     let Ok(session) = client.get_json(&format!("/api/chat/{session_id}")).await else {
@@ -812,6 +846,23 @@ pub async fn rename(app: &AppHandle, session_id: &str, name: &str) -> Result<(),
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The per-chat Specialists switch defaults on: only an explicit `true`
+    /// in the session's metadata turns it off.
+    #[test]
+    fn specialists_are_on_unless_the_chat_switched_them_off() {
+        assert!(!specialists_disabled_in(&Value::Null));
+        assert!(!specialists_disabled_in(&json!({})));
+        assert!(!specialists_disabled_in(
+            &json!({"specialists_disabled": false})
+        ));
+        assert!(!specialists_disabled_in(
+            &json!({"specialists_disabled": "true"})
+        ));
+        assert!(specialists_disabled_in(
+            &json!({"specialists_disabled": true})
+        ));
+    }
 
     fn row(id: &str, role: &str) -> Value {
         json!({ "id": id, "role": role, "content": "x" })

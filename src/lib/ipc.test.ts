@@ -38,6 +38,16 @@ beforeEach(() => {
 });
 
 describe('ipc invoke wrappers', () => {
+  it('the per-chat Specialists switch reads and writes through its own commands', () => {
+    void ipc.getSessionSpecialists('s1');
+    expect(invokeMock).toHaveBeenCalledWith('get_session_specialists', { sessionId: 's1' });
+    void ipc.setSessionSpecialists('s1', false);
+    expect(invokeMock).toHaveBeenCalledWith('set_session_specialists', {
+      sessionId: 's1',
+      enabled: false,
+    });
+  });
+
   it('getConfig calls get_config with no args', () => {
     void ipc.getConfig();
     expect(invokeMock).toHaveBeenCalledWith('get_config');

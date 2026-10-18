@@ -188,6 +188,8 @@ pub fn run() {
             commands::fetch_full_tool_result,
             commands::search_sessions,
             commands::get_session_pause,
+            commands::get_session_specialists,
+            commands::set_session_specialists,
             commands::regenerate_last,
             commands::branch_to_provider,
             commands::move_chat_folders,

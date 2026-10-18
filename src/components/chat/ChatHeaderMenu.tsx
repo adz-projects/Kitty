@@ -4,6 +4,7 @@ import { isAndroid } from '@/lib/platform';
 import { useChatStore } from '@/stores/chatStore';
 import { Dialog } from '@/components/shared/Dialog';
 import { AdaptivePathwayToggle } from './AdaptivePathwayToggle';
+import { SpecialistsToggle } from './SpecialistsToggle';
 import { AllowedDirsList, useAllowedDirs } from './AllowedDirsList';
 
 /** Header overflow menu (chat header simplification, UX-simplification Batch
@@ -34,6 +35,7 @@ export function ChatHeaderMenu() {
       {open && (
         <div ref={popoverRef} className="chat-header-menu" role="menu" style={style}>
           <AdaptivePathwayToggle />
+          <SpecialistsToggle />
           {android && sessionId && (
             <button
               className="status-badge"

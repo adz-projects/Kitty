@@ -155,6 +155,26 @@ pub fn default_level(levels: &[String]) -> Option<String> {
     Some(levels[(levels.len() - 1) / 2].clone())
 }
 
+/// The level a delegate (specialist) runs at on a card with this ladder:
+/// `low` when offered, otherwise the lowest graded level, otherwise `on` for a
+/// toggle-only model. Never Off — a delegate drives tools and writes a
+/// structured report, and a model with thinking switched off does both
+/// noticeably worse. `None` when the model offers no control at all.
+///
+/// Low rather than the model's own default because that default is often the
+/// top of the ladder (a self-hosted Qwen3.8 template starts at `xhigh`), and a
+/// delegate running there spends most of its time budget thinking.
+pub fn delegate_level(levels: &[String]) -> Option<String> {
+    if levels.iter().any(|l| l == "low") {
+        return Some("low".to_string());
+    }
+    levels
+        .iter()
+        .find(|l| l.as_str() != ON && l.as_str() != OFF)
+        .or_else(|| levels.iter().find(|l| l.as_str() == ON))
+        .cloned()
+}
+
 /// A human label for a level. Known levels get a friendly name; an unknown
 /// one is title-cased so a novel model level still reads sanely.
 pub fn pretty_level(level: &str) -> String {
@@ -267,6 +287,28 @@ mod tests {
         );
         assert_eq!(default_level(&v(&["on"])).as_deref(), Some("on"));
         assert_eq!(default_level(&[]), None);
+    }
+
+    /// A delegate runs low, never off: `low` when the ladder has it, else its
+    /// lowest grade, else `on` for a toggle-only model.
+    #[test]
+    fn delegates_run_low_and_never_off() {
+        // The reported case: a self-hosted Qwen3.8 whose template defaults to
+        // xhigh.
+        assert_eq!(
+            delegate_level(&v(&["low", "medium", "xhigh"])).as_deref(),
+            Some("low")
+        );
+        assert_eq!(
+            delegate_level(&v(&["minimal", "low", "medium", "high"])).as_deref(),
+            Some("low")
+        );
+        assert_eq!(
+            delegate_level(&v(&["medium", "high", "max"])).as_deref(),
+            Some("medium")
+        );
+        assert_eq!(delegate_level(&v(&["on"])).as_deref(), Some("on"));
+        assert_eq!(delegate_level(&[]), None);
     }
 
     #[test]

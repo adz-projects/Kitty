@@ -328,16 +328,20 @@ async fn run_detection(app: &AppHandle, card: &CardSnapshot) -> bool {
         let changed = prev.as_ref().map_or(true, |p| {
             p.levels != found.levels || p.can_disable != found.can_disable
         });
-        let resync =
-            prev.as_ref().and_then(|p| p.anthropic_thinking.clone()) != found.anthropic_thinking;
+        let resync = prev.as_ref().and_then(|p| p.anthropic_thinking.clone())
+            != found.anthropic_thinking
+            || prev
+                .as_ref()
+                .and_then(|p| ladder::delegate_level(&p.levels))
+                != ladder::delegate_level(&found.levels);
         cfg.effort_caps.insert(key, found);
         if let Err(e) = crate::config::save(&cfg) {
             tracing::warn!("failed to persist detected reasoning levels: {e}");
         }
         (changed, resync)
     };
-    // The Anthropic wire mode rides the provider row, so the engine needs the
-    // card re-synced when it changes.
+    // The Anthropic wire mode and the delegate level ride the provider row, so
+    // the engine needs the card re-synced when either changes.
     if resync {
         if let Err(e) = crate::bigtiny::providers::sync_all_providers(app).await {
             tracing::warn!("could not re-sync providers after effort detection: {e}");
@@ -570,10 +574,43 @@ pub fn anthropic_thinking_for(
         .and_then(|c| c.anthropic_thinking.clone())
 }
 
+/// The reasoning level a delegate hosted on this card runs at
+/// ([`ladder::delegate_level`]), if the card's ladder is known. Relayed to the
+/// engine on the provider row as `delegate_effort`.
+pub fn delegate_effort_for(
+    cfg: &Config,
+    profile: &crate::config::providers::ProviderProfile,
+) -> Option<String> {
+    let model = profile.models.first()?;
+    cfg.effort_caps
+        .get(&effort_key(&profile.id, model))
+        .and_then(|c| ladder::delegate_level(&c.levels))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::providers::ProviderProfile;
+
+    /// The hint the engine writes as a delegate's `thinking_effort`: the
+    /// card's own ladder, low, never off — and nothing for an undetected card,
+    /// so the engine keeps the model's own default there.
+    #[test]
+    fn delegate_effort_follows_the_cards_own_ladder() {
+        let mut cfg = Config::default();
+        let qwen = profile("q", "custom_openai", "qwen3.8-27b");
+        let toggle = profile("t", "custom_openai", "ling");
+        let unknown = profile("u", "custom_openai", "mystery");
+        cfg.effort_caps.insert(
+            effort_key("q", "qwen3.8-27b"),
+            caps(&["low", "medium", "xhigh"], true),
+        );
+        cfg.effort_caps
+            .insert(effort_key("t", "ling"), caps(&["on"], true));
+        assert_eq!(delegate_effort_for(&cfg, &qwen).as_deref(), Some("low"));
+        assert_eq!(delegate_effort_for(&cfg, &toggle).as_deref(), Some("on"));
+        assert_eq!(delegate_effort_for(&cfg, &unknown), None);
+    }
 
     fn caps(levels: &[&str], can_disable: bool) -> EffortCaps {
         EffortCaps {

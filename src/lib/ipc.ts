@@ -211,6 +211,13 @@ export const ipc = {
     }),
   /** Whether a chat's memory is paused (incognito). */
   getSessionPause: (sessionId: string) => invoke<boolean>('get_session_pause', { sessionId }),
+  /** Whether specialists are on for this chat (on unless switched off). */
+  getSessionSpecialists: (sessionId: string) =>
+    invoke<boolean>('get_session_specialists', { sessionId }),
+  /** Switch specialists on or off for one chat. Off: the engine stops
+      offering the delegate tools to this chat's model. */
+  setSessionSpecialists: (sessionId: string, enabled: boolean) =>
+    invoke<void>('set_session_specialists', { sessionId, enabled }),
   /** Ask the chat's last question again (the latest answer only). */
   regenerateLast: (sessionId: string) => invoke<void>('regenerate_last', { sessionId }),
   loadSession: (sessionId: string, cwd: string) =>

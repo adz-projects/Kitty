@@ -54,7 +54,7 @@ fn normalize_scheme(base_url: &str) -> String {
 /// Called at every attach and after any card is added, edited, duplicated or
 /// deleted.
 pub async fn sync_all_providers(app: &AppHandle) -> Result<(), String> {
-    let (profiles, default_id, anthropic_thinking) = {
+    let (profiles, default_id, anthropic_thinking, delegate_effort) = {
         let state = app.state::<AppState>();
         let cfg = state.config.lock().unwrap();
         let profiles = cfg
@@ -69,7 +69,18 @@ pub async fn sync_all_providers(app: &AppHandle) -> Result<(), String> {
                 crate::bigtiny::effort::anthropic_thinking_for(&cfg, p).map(|m| (p.id.clone(), m))
             })
             .collect::<std::collections::HashMap<_, _>>();
-        (profiles, cfg.active_provider_id.clone(), anthropic_thinking)
+        let delegate_effort = profiles
+            .iter()
+            .filter_map(|p| {
+                crate::bigtiny::effort::delegate_effort_for(&cfg, p).map(|l| (p.id.clone(), l))
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        (
+            profiles,
+            cfg.active_provider_id.clone(),
+            anthropic_thinking,
+            delegate_effort,
+        )
     };
     let catalog = {
         let state = app.state::<AppState>();
@@ -85,6 +96,12 @@ pub async fn sync_all_providers(app: &AppHandle) -> Result<(), String> {
         // whether this Claude takes adaptive thinking + `output_config.effort`
         // or the older `budget_tokens` block. `null` keeps the engine default.
         body.config["anthropic_thinking"] = json!(anthropic_thinking.get(&profile.id));
+        // The level a delegate hosted on this card runs at: low on this
+        // card's own ladder, never off (`effort::ladder::delegate_level`). The
+        // engine writes it as the child session's `thinking_effort`; without
+        // it a delegate ran at the model's own default, which on a
+        // self-hosted Qwen3.8 is xhigh. `null` for an undetected card.
+        body.config["delegate_effort"] = json!(delegate_effort.get(&profile.id));
         cards.push(body);
     }
     let client = ensure_client(app)?;
@@ -161,6 +178,13 @@ pub(crate) fn provider_body(
         // explicit `false` marks the card tool-less, so a row written before
         // it existed still reads as "supports tools".
         "supports_tools": profile.tools_supported(catalog),
+        // Whether this is a hosted service or a machine the user runs. The
+        // engine uses it for the slot default of a card with no
+        // `parallel_slots`: one at a time for a self-hosted server, eight for
+        // a hosted API — so a hosted endpoint saved as `custom_openai` (the
+        // reported DashScope card) no longer runs a chat and its delegates
+        // single file. A `parallel_slots` the user set still wins.
+        "hosted": crate::config::providers::is_hosted_endpoint(&base_url),
     });
     ProviderCard {
         id: profile.id.clone(),
@@ -396,6 +420,32 @@ mod tests {
         assert_eq!(
             provider_body(&p, None, None).config["supports_tools"],
             false
+        );
+    }
+
+    /// The slot default the engine picks for a card with no `parallel_slots`
+    /// follows `hosted`: a hosted endpoint saved as `custom_openai` (the
+    /// reported DashScope card) is hosted, the LAN llama-server is not — and a
+    /// `parallel_slots` the user set is still sent as-is, so it stays
+    /// authoritative.
+    #[test]
+    fn hosted_hint_separates_a_hosted_custom_endpoint_from_the_lan_box() {
+        let dashscope = profile(
+            "custom_openai",
+            "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1",
+        );
+        let card = provider_body(&dashscope, None, None);
+        assert_eq!(card.config["hosted"], true);
+        assert!(card.config["parallel_slots"].is_null());
+
+        let lan = profile("custom_openai", "192.168.1.199:8081");
+        assert_eq!(provider_body(&lan, None, None).config["hosted"], false);
+
+        let mut pinned = dashscope.clone();
+        pinned.parallel_slots = Some(2);
+        assert_eq!(
+            provider_body(&pinned, None, None).config["parallel_slots"],
+            2
         );
     }
 

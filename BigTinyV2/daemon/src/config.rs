@@ -260,6 +260,25 @@ pub struct ProviderConfig {
     /// behaviour every client had before, so nothing changes for them.
     #[serde(default)]
     pub anthropic_thinking: Option<String>,
+    /// The reasoning level a delegate hosted on this provider runs at — a wire
+    /// level this model accepts (`low`, its lowest grade, or `on`), never Off.
+    /// Written by a client that knows the model's ladder (Kitty detects it per
+    /// card) and applied as the delegate session's `thinking_effort`, which
+    /// otherwise left delegates on the model's own default — `xhigh` on a
+    /// self-hosted Qwen3.8 template. Absent: no level is sent and the model
+    /// keeps its own default — guessing one would 400 on a model that takes no
+    /// effort parameter at all.
+    #[serde(default)]
+    pub delegate_effort: Option<String>,
+    /// Whether this endpoint is a hosted service (`true`) or a server the user
+    /// runs (`false`). Decides the slot default for a provider with no
+    /// `parallel_slots`: one in flight for a self-hosted dialect, eight for a
+    /// hosted one. Absent: classified from `base_url` (loopback, RFC 1918,
+    /// link-local and Tailscale hosts are self-hosted, everything else is
+    /// hosted) — which is what moved a hosted OpenAI-compatible endpoint saved
+    /// as `custom_openai` off the one-at-a-time default.
+    #[serde(default)]
+    pub hosted: Option<bool>,
 }
 
 impl ProviderConfig {
@@ -675,7 +694,6 @@ impl Default for HITLConfig {
     }
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SchedulerConfig {
     #[serde(default = "default_scheduler_enabled")]
@@ -775,14 +793,14 @@ impl BigTinyConfig {
         let contents = std::fs::read_to_string(path)
             .map_err(|e| format!("Failed to read config {}: {}", path.display(), e))?;
 
-let mut config: Self = serde_yaml::from_str(&contents)
-    .map_err(|e| format!("Failed to parse config {}: {}", path.display(), e))?;
+        let mut config: Self = serde_yaml::from_str(&contents)
+            .map_err(|e| format!("Failed to parse config {}: {}", path.display(), e))?;
 
-// Clamp raw user input (see `TokenManagementConfig::sanitize`) so a
-// negative masking threshold can never reach the `as usize` use sites.
-config.token_management.sanitize();
+        // Clamp raw user input (see `TokenManagementConfig::sanitize`) so a
+        // negative masking threshold can never reach the `as usize` use sites.
+        config.token_management.sanitize();
 
-Ok(config)
+        Ok(config)
     }
 
     /// Merge non-default values from `other` into `self`.

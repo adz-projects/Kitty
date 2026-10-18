@@ -170,10 +170,8 @@ impl TailscaleClient {
         };
 
         let direct_ip = Self::resolve_dns_excluding_tailscale(&peer.name).await;
-        self.resolved_cache.insert(
-            host_or_ip.to_string(),
-            (Instant::now(), direct_ip.clone()),
-        );
+        self.resolved_cache
+            .insert(host_or_ip.to_string(), (Instant::now(), direct_ip.clone()));
         direct_ip
     }
 }
@@ -228,6 +226,57 @@ pub fn is_tailscale_ip(host: &str) -> bool {
     }
 }
 
+/// Whether `base_url` names a hosted service rather than a server the user
+/// runs: anything that is not loopback, RFC 1918, link-local, unique-local,
+/// Tailscale (`100.64.0.0/10`, `*.ts.net`), a `.local`/`.lan`/`.internal`
+/// name, or a bare single-label host. A URL that does not parse is treated as
+/// self-hosted, the conservative answer for a slot default.
+///
+/// About capacity, not privacy: a llama-server on the LAN serves one request
+/// at a time unless told otherwise, a hosted API serves many.
+pub fn is_hosted_endpoint(base_url: &str) -> bool {
+    let with_scheme = if base_url.contains("://") {
+        base_url.trim().to_string()
+    } else {
+        format!("http://{}", base_url.trim())
+    };
+    let Ok(parsed) = reqwest::Url::parse(&with_scheme) else {
+        return false;
+    };
+    match parsed.host() {
+        Some(url::Host::Ipv4(v4)) => {
+            !(v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || TAILSCALE_NETWORK.contains(&IpAddr::V4(v4)))
+        }
+        Some(url::Host::Ipv6(v6)) => {
+            let seg = v6.segments()[0];
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || (seg & 0xfe00) == 0xfc00
+                || (seg & 0xffc0) == 0xfe80)
+        }
+        Some(url::Host::Domain(d)) => {
+            let d = d.trim_end_matches('.').to_ascii_lowercase();
+            !(d == "localhost"
+                || !d.contains('.')
+                || [
+                    ".localhost",
+                    ".local",
+                    ".lan",
+                    ".internal",
+                    ".home.arpa",
+                    ".ts.net",
+                ]
+                .iter()
+                .any(|s| d.ends_with(s)))
+        }
+        None => false,
+    }
+}
+
 /// If `url`'s host is a Tailscale IP with a discoverable direct (LAN)
 /// address, returns that same URL with the host swapped to the direct
 /// address. Otherwise `None` — callers should just use the original URL.
@@ -262,6 +311,39 @@ pub async fn maybe_direct_url(tailscale: &TailscaleClient, url: &str) -> Option<
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The slot default turns on this. The reported DashScope endpoint is
+    /// hosted although it was saved as `custom_openai`; the user's LAN
+    /// llama-server is not.
+    #[test]
+    fn hosted_endpoints_are_neither_local_nor_private() {
+        for hosted in [
+            "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1",
+            "https://openrouter.ai/api",
+            "https://api.anthropic.com",
+            "http://[2001:db8::10]:8080",
+            "8.8.8.8:80",
+        ] {
+            assert!(is_hosted_endpoint(hosted), "{hosted}");
+        }
+        for mine in [
+            "http://192.168.1.199:8081",
+            "192.168.1.199:8081",
+            "http://10.1.2.3:8080",
+            "http://172.16.0.9",
+            "http://localhost:11434",
+            "http://127.0.0.1:1234",
+            "http://[::1]:11434",
+            "http://100.101.5.6:11434",
+            "https://box.tail1234.ts.net",
+            "http://gpu.local:8080",
+            "http://gpu:8080",
+            "http://[fd7a:115c:a1e0::1]:8080",
+            "not a url",
+        ] {
+            assert!(!is_hosted_endpoint(mine), "{mine}");
+        }
+    }
 
     #[test]
     fn is_tailscale_ip_true_only_inside_the_cgnat_range() {
@@ -318,8 +400,14 @@ mod tests {
     #[tokio::test]
     async fn maybe_direct_url_is_none_for_loopback_hosts() {
         let ts = TailscaleClient::new();
-        assert_eq!(maybe_direct_url(&ts, "http://localhost:8080/v1").await, None);
-        assert_eq!(maybe_direct_url(&ts, "http://127.0.0.1:8080/v1").await, None);
+        assert_eq!(
+            maybe_direct_url(&ts, "http://localhost:8080/v1").await,
+            None
+        );
+        assert_eq!(
+            maybe_direct_url(&ts, "http://127.0.0.1:8080/v1").await,
+            None
+        );
         assert_eq!(maybe_direct_url(&ts, "http://[::1]:8080/v1").await, None);
     }
 

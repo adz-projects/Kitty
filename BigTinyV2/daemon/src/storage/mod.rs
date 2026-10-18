@@ -1,8 +1,8 @@
-pub mod jobs;
 pub mod app_plugins;
 pub mod apps;
 pub mod execution;
 pub mod hitl_rules;
+pub mod jobs;
 pub mod mcp_servers;
 pub mod messages;
 pub mod providers;
@@ -145,7 +145,6 @@ impl Database {
         &self.pool
     }
 }
-
 
 /// Repair `_sqlx_migrations` checksums that differ from the embedded
 /// migrations **only** by line endings.
@@ -1243,8 +1242,8 @@ mod tests {
 
         let pool = get_test_pool().await;
 
-        // Built-ins are seeded once and never overwritten, so a user who edits
-        // one keeps that edit across restarts.
+        // Built-ins are seeded once, and re-seeding at the same version
+        // rewrites nothing.
         let seeded = crate::specialists::registry::seed_builtins(&pool)
             .await
             .unwrap();
@@ -1256,6 +1255,37 @@ mod tests {
             0,
             "re-seeding must not rewrite existing definitions"
         );
+
+        // A built-in stored from an older definition -- the state of every
+        // install seeded before `builtin_version` existed -- is refreshed on
+        // the next seed, preamble and tool list included. Its `enabled` flag
+        // is kept.
+        sqlx::query(
+            "UPDATE specialists SET system_prompt = 'stale', tool_allow = '[]',              builtin_version = 0, enabled = 0 WHERE id = 'builtin:locator'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            crate::specialists::registry::seed_builtins(&pool)
+                .await
+                .unwrap(),
+            1,
+            "only the stale row is rewritten"
+        );
+        let locator = specialists::resolve(&pool, "test-app", "locator")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(locator
+            .system_prompt
+            .starts_with("You are a specialist working on behalf of another agent"));
+        assert!(locator.tool_allow.iter().any(|t| t == "lean_shell_ro"));
+        assert!(!locator.enabled, "a disabled built-in stays disabled");
+        sqlx::query("UPDATE specialists SET enabled = 1 WHERE id = 'builtin:locator'")
+            .execute(&pool)
+            .await
+            .unwrap();
 
         let visible = specialists::list_visible(&pool, "test-app").await.unwrap();
         assert_eq!(visible.len(), seeded, "an app sees every built-in");
@@ -1294,10 +1324,7 @@ mod tests {
 
         let visible = specialists::list_visible(&pool, "test-app").await.unwrap();
         assert_eq!(visible.len(), seeded, "the shadow replaces, not duplicates");
-        assert_eq!(
-            visible.iter().filter(|s| s.name == "researcher").count(),
-            1
-        );
+        assert_eq!(visible.iter().filter(|s| s.name == "researcher").count(), 1);
 
         // ...and only for that app. Another app still gets the built-in, which
         // is the whole point of scoping the override.
@@ -1418,7 +1445,9 @@ mod tests {
             .unwrap();
         assert_eq!(by_tool.len(), 1);
 
-        let deleted = hitl_rules::delete_rule(&pool, "app-a", list[0].id).await.unwrap();
+        let deleted = hitl_rules::delete_rule(&pool, "app-a", list[0].id)
+            .await
+            .unwrap();
         assert_eq!(deleted, 1);
     }
 
@@ -1499,7 +1528,11 @@ mod tests {
         let mut flipped = 0;
         for m in sqlx::migrate!("./migrations").iter() {
             let lf = m.sql.replace("\r\n", "\n");
-            let other = if m.sql.contains("\r\n") { lf } else { lf.replace('\n', "\r\n") };
+            let other = if m.sql.contains("\r\n") {
+                lf
+            } else {
+                lf.replace('\n', "\r\n")
+            };
             let mut h = Sha384::new();
             h.update(other.as_bytes());
             sqlx::query("UPDATE _sqlx_migrations SET checksum = ? WHERE version = ?")

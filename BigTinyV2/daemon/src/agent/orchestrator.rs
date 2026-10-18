@@ -412,8 +412,7 @@ impl Orchestrator {
         let mut notes: Vec<String> = Vec::new();
         let (host_provider, host_model) = match self.router.get() {
             Some(router) => {
-                let candidates =
-                    router.subagent_candidates(&app_id, parent_provider.as_deref());
+                let candidates = router.subagent_candidates(&app_id, parent_provider.as_deref());
                 let pin = spec
                     .provider
                     .as_deref()
@@ -466,22 +465,21 @@ impl Orchestrator {
         // deadline there would be refused having never started — after holding
         // the caller for the full timeout. Waiting *past* the deadline can only
         // produce an answer nobody is left to read.
-        let _permit = match tokio::time::timeout_at(deadline, self.limiter.clone().acquire_owned())
-            .await
-        {
-            Ok(permit) => permit,
-            // Distinguished from the post-permit check below because the two
-            // are different failures to the caller: this one never reached the
-            // front of the queue at all, while that one got there with no time
-            // left to use. Each is worth re-running on its own.
-            Err(_) => {
-                return Ok(Err(format!(
+        let _permit =
+            match tokio::time::timeout_at(deadline, self.limiter.clone().acquire_owned()).await {
+                Ok(permit) => permit,
+                // Distinguished from the post-permit check below because the two
+                // are different failures to the caller: this one never reached the
+                // front of the queue at all, while that one got there with no time
+                // left to use. Each is worth re-running on its own.
+                Err(_) => {
+                    return Ok(Err(format!(
                     "the specialist waited behind other specialists for its whole {}s budget and \
                      never started; re-run it, or raise agent.max_concurrent_specialists",
                     self.timeout.as_secs()
                 )))
-            }
-        };
+                }
+            };
 
         // Checked after the permit, which is where the waiting actually happens.
         // A source the batch never reached is reported as such rather than
@@ -566,6 +564,17 @@ impl Orchestrator {
         if let Some(m) = host_model.as_deref().filter(|m| !m.is_empty()) {
             meta["model"] = json!(m);
         }
+        // The host's delegate level (low on its own ladder, never off), as the
+        // child's effort. Without it a delegate ran at the model's default,
+        // which on a self-hosted Qwen3.8 template is xhigh. `delegate` marks
+        // the session for the loop's delegate-only paths.
+        meta["delegate"] = json!(true);
+        if let Some(level) = host_provider
+            .as_deref()
+            .and_then(|p| self.router.get().and_then(|r| r.delegate_effort(p)))
+        {
+            meta["thinking_effort"] = json!(level);
+        }
         if let Some(sp) = spec.system_prompt.as_deref().filter(|s| !s.is_empty()) {
             meta["persona_override"] = json!(sp);
         }
@@ -576,9 +585,11 @@ impl Orchestrator {
         // is watching that can think for as long as it likes while blocking the
         // turn that called it and holding a concurrency permit. The definition's
         // own cap wins; otherwise the daemon default applies.
-        let cap = spec.reasoning_cap.unwrap_or(
-            crate::agent::tokens::ReasoningCap::ContextFraction(self.default_reasoning_fraction),
-        );
+        let cap =
+            spec.reasoning_cap
+                .unwrap_or(crate::agent::tokens::ReasoningCap::ContextFraction(
+                    self.default_reasoning_fraction,
+                ));
         meta["reasoning_cap"] = serde_json::to_value(cap).unwrap_or(Value::Null);
         // Carried into the child's own metadata, because `choose_host` is not
         // the last word on which model this run uses. The turn loop re-resolves
@@ -690,22 +701,41 @@ impl Orchestrator {
             // it has one. This arm used to return the error without reading
             // anything, which is how a delegate that finished a second late
             // reported nothing at all.
+            //
+            // The same goes for a run that failed rather than timed out — most
+            // often the schema-constrained final pass, which used to discard a
+            // delegate's whole investigation because its last request did not
+            // come back as valid JSON. Its prose is how far it got, and the
+            // caller is better served by that than by the error alone.
             Err(msg) => {
-                let salvaged = if timed_out {
-                    sessions::last_assistant_text(&self.db, &child_id)
-                        .await
-                        .ok()
-                        .flatten()
-                } else {
-                    None
+                let salvaged = sessions::last_assistant_text(&self.db, &child_id)
+                    .await
+                    .ok()
+                    .flatten();
+                let salvage = match classify_salvage(salvaged, spec.response_schema.as_ref()) {
+                    // Without a schema there is no shape to prove the run
+                    // finished, so a failed run's prose is only partial; a
+                    // timed-out one keeps the old reading, since the abort
+                    // lands on the watcher after the work has finished.
+                    Salvage::Report(text) if !timed_out && spec.response_schema.is_none() => {
+                        Salvage::Partial(clip_partial(&text))
+                    }
+                    other => other,
                 };
-                match classify_salvage(salvaged, spec.response_schema.as_ref()) {
+                match salvage {
                     Salvage::Report(text) => {
-                        notes.push(format!(
-                            "The specialist finished its report just after its {}s budget \
-                             expired; the report is complete and is used as normal.",
-                            budget.as_secs()
-                        ));
+                        notes.push(if timed_out {
+                            format!(
+                                "The specialist finished its report just after its {}s budget \
+                                 expired; the report is complete and is used as normal.",
+                                budget.as_secs()
+                            )
+                        } else {
+                            format!(
+                                "The specialist's run ended with an error after it had written \
+                                 a complete report ({msg}); the report is used as normal."
+                            )
+                        });
                         Ok(text)
                     }
                     // Deliberately still a failure. The caller contracted for a
@@ -713,9 +743,7 @@ impl Orchestrator {
                     // would put unvalidated prose where a parsed object is
                     // expected. Carried on the failure instead, where it reads
                     // as what it is: how far the specialist got.
-                    Salvage::Partial(text) => {
-                        Err(format!("{msg}\n\nHow far it got: {text}"))
-                    }
+                    Salvage::Partial(text) => Err(format!("{msg}\n\nHow far it got: {text}")),
                     Salvage::Nothing => Err(msg),
                 }
             }
@@ -727,15 +755,22 @@ impl Orchestrator {
         // than after, so the status a client renders names the same host the
         // report does - and before the run is closed, so its history row
         // records it too.
-        let host = self.host_actually_used(&child_id, host_provider, host_model).await;
+        let host = self
+            .host_actually_used(&child_id, host_provider, host_model)
+            .await;
 
         let (status, summary, error) = match &result {
             Ok(text) => ("completed", Some(short(text)), None),
             Err(msg) => ("failed", None, Some(msg.as_str())),
         };
-        if let Err(e) =
-            execution::update_execution_status(&self.db, &exec_id, status, summary.as_deref(), error)
-                .await
+        if let Err(e) = execution::update_execution_status(
+            &self.db,
+            &exec_id,
+            status,
+            summary.as_deref(),
+            error,
+        )
+        .await
         {
             tracing::warn!("failed to close delegate execution {exec_id}: {e}");
         }
@@ -1105,11 +1140,16 @@ fn classify_salvage(text: Option<String>, schema: Option<&Value>) -> Salvage {
     if valid {
         Salvage::Report(text)
     } else {
-        let flat = text.trim();
-        Salvage::Partial(match flat.char_indices().nth(MAX_PARTIAL_CHARS) {
-            Some((cut, _)) => format!("{}...", &flat[..cut]),
-            None => flat.to_string(),
-        })
+        Salvage::Partial(clip_partial(&text))
+    }
+}
+
+/// Salvaged prose bounded to `MAX_PARTIAL_CHARS`.
+fn clip_partial(text: &str) -> String {
+    let flat = text.trim();
+    match flat.char_indices().nth(MAX_PARTIAL_CHARS) {
+        Some((cut, _)) => format!("{}...", &flat[..cut]),
+        None => flat.to_string(),
     }
 }
 
@@ -1136,7 +1176,10 @@ mod tests {
         let orchestrator = Orchestrator::new(pool, 8, 0.25, vec![], 300);
 
         let one = orchestrator.specialist_limiter("app-a", "extractor", 1);
-        let _held = one.clone().try_acquire_owned().expect("the first run starts");
+        let _held = one
+            .clone()
+            .try_acquire_owned()
+            .expect("the first run starts");
         assert!(
             orchestrator
                 .specialist_limiter("app-a", "extractor", 1)
@@ -1301,7 +1344,12 @@ mod tests {
 
     /// A report that arrives when `release` fires, so a test decides exactly
     /// when each ticket finishes.
-    fn gated(report: &'static str) -> (tokio::sync::oneshot::Sender<()>, impl std::future::Future<Output = String>) {
+    fn gated(
+        report: &'static str,
+    ) -> (
+        tokio::sync::oneshot::Sender<()>,
+        impl std::future::Future<Output = String>,
+    ) {
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         (tx, async move {
             let _ = rx.await;

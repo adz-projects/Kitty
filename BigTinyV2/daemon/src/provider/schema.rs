@@ -15,12 +15,16 @@
 //! | Dialect | Mechanism |
 //! |---|---|
 //! | OpenAI, OpenRouter | `response_format: {type: "json_schema", …}` |
-//! | Anthropic | force a single tool whose `input_schema` is the schema, then unwrap the `tool_use` block |
+//! | Anthropic, adaptive thinking | `output_config.format: {type: "json_schema", schema}` |
+//! | Anthropic, older models | force a single tool whose `input_schema` is the schema, then unwrap the `tool_use` block |
 //! | llama.cpp, Ollama | a GBNF grammar / the `format` field |
 //!
-//! Anthropic's is the one that surprises people: it has no `response_format`,
-//! and tool-forcing *is* its structured-output mechanism rather than a
-//! workaround.
+//! Anthropic's older models have no `response_format`, and tool-forcing *is*
+//! their structured-output mechanism rather than a workaround. The current
+//! ones (Opus 5.5, Sonnet 5.5, Fable 5.1 — the ones a client marks
+//! `anthropic_thinking: "adaptive"`) reject a forced `tool_choice` with a 400,
+//! so they get structured outputs instead, which also lets the answer carry
+//! thinking at the requested effort.
 //!
 //! # Interaction with tools
 //!
@@ -46,7 +50,6 @@ pub enum ResponseMode {
     /// JSON matching a supplied schema.
     Schema,
 }
-
 
 /// What one request asks of the model's final answer, before it has been
 /// mapped to a dialect.
@@ -99,6 +102,8 @@ pub enum SchemaDirective {
     ResponseFormat(Value),
     /// Anthropic-style forced tool: `(tool definition, tool_choice)`.
     ForcedTool(Value, Value),
+    /// Anthropic structured outputs: the `output_config.format` object.
+    OutputFormat(Value),
     /// llama.cpp / Ollama `format` field.
     Format(Value),
 }
@@ -110,7 +115,11 @@ pub enum SchemaDirective {
 /// unconstrained output rather than an error, because the alternative is
 /// failing a turn over a request shape the caller can fix by reading the
 /// response.
-pub fn directive_for(dialect: &str, mode: &ResponseMode, schema: Option<&Value>) -> SchemaDirective {
+pub fn directive_for(
+    dialect: &str,
+    mode: &ResponseMode,
+    schema: Option<&Value>,
+) -> SchemaDirective {
     match mode {
         ResponseMode::Text => SchemaDirective::None,
 
@@ -148,6 +157,86 @@ pub fn directive_for(dialect: &str, mode: &ResponseMode, schema: Option<&Value>)
                 })),
             }
         }
+    }
+}
+
+/// The directive for an Anthropic model on adaptive thinking.
+///
+/// Structured outputs rather than a forced tool: these models 400 on
+/// `tool_choice` `any`/`tool`, which made every schema'd delegate on them fail
+/// its final pass. The schema is narrowed to what structured outputs accept
+/// (see [`for_structured_outputs`]); the answer is still validated against the
+/// caller's full schema afterwards, so nothing the caller asked for is lost.
+pub fn directive_for_adaptive_anthropic(
+    mode: &ResponseMode,
+    schema: Option<&Value>,
+) -> SchemaDirective {
+    match (mode, schema) {
+        (ResponseMode::Schema, Some(schema)) => SchemaDirective::OutputFormat(json!({
+            "type": "json_schema",
+            "schema": for_structured_outputs(schema),
+        })),
+        _ => directive_for("anthropic", mode, schema),
+    }
+}
+
+/// A schema reshaped for Anthropic structured outputs, which require
+/// `additionalProperties: false` on every object and reject numeric, string
+/// length and array-size constraints. Adds the first and drops the rest — the
+/// same thing the official SDKs do before sending, and for the same reason:
+/// [`validate`] still enforces the dropped constraints on the answer.
+pub fn for_structured_outputs(schema: &Value) -> Value {
+    const UNSUPPORTED: &[&str] = &[
+        "minimum",
+        "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "multipleOf",
+        "minLength",
+        "maxLength",
+        "maxItems",
+        "uniqueItems",
+        "minProperties",
+        "maxProperties",
+    ];
+    match schema {
+        Value::Object(map) => {
+            let mut out = serde_json::Map::new();
+            for (k, v) in map {
+                if UNSUPPORTED.contains(&k.as_str()) {
+                    continue;
+                }
+                // `minItems` above 1 is rejected; 0 and 1 are accepted.
+                if k == "minItems" && v.as_u64().is_some_and(|n| n > 1) {
+                    continue;
+                }
+                // A map of *names* to subschemas: a property may be called
+                // `maximum`, so its keys are names, never constraints.
+                let narrowed = match (k.as_str(), v) {
+                    ("properties" | "$defs" | "definitions", Value::Object(named)) => {
+                        Value::Object(
+                            named
+                                .iter()
+                                .map(|(name, sub)| (name.clone(), for_structured_outputs(sub)))
+                                .collect(),
+                        )
+                    }
+                    _ => for_structured_outputs(v),
+                };
+                out.insert(k.clone(), narrowed);
+            }
+            let is_object = out.get("type").is_some_and(|t| {
+                t == "object"
+                    || t.as_array()
+                        .is_some_and(|a| a.iter().any(|x| x == "object"))
+            });
+            if is_object && !matches!(out.get("additionalProperties"), Some(Value::Bool(false))) {
+                out.insert("additionalProperties".into(), Value::Bool(false));
+            }
+            Value::Object(out)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(for_structured_outputs).collect()),
+        other => other.clone(),
     }
 }
 
@@ -222,6 +311,57 @@ mod tests {
         assert_eq!(tool["input_schema"], schema());
         assert_eq!(choice["type"], "tool");
         assert_eq!(choice["name"], ANTHROPIC_STRUCTURED_TOOL);
+    }
+
+    /// Current Claude models 400 on a forced `tool_choice`, so an adaptive
+    /// Anthropic provider gets structured outputs — the shape the Messages API
+    /// documents: `output_config.format = {type: "json_schema", schema}`.
+    #[test]
+    fn adaptive_anthropic_gets_structured_outputs_not_a_forced_tool() {
+        let d = directive_for_adaptive_anthropic(&ResponseMode::Schema, Some(&schema()));
+        let SchemaDirective::OutputFormat(f) = d else {
+            panic!("expected output_config.format, got {d:?}");
+        };
+        assert_eq!(f["type"], "json_schema");
+        assert_eq!(f["schema"]["properties"], schema()["properties"]);
+        assert_eq!(f["schema"]["additionalProperties"], false);
+        // Text is still nothing at all.
+        assert_eq!(
+            directive_for_adaptive_anthropic(&ResponseMode::Text, Some(&schema())),
+            SchemaDirective::None
+        );
+    }
+
+    /// Narrowed for the wire only: unsupported constraints go, every object
+    /// is closed, and the rest of the schema is untouched.
+    #[test]
+    fn structured_outputs_schema_drops_unsupported_constraints() {
+        let s = json!({
+            "type": "object",
+            "properties": {
+                "n": {"type": "integer", "minimum": 0, "maximum": 9},
+                "maximum": {"type": "string"},
+                "s": {"type": "string", "maxLength": 20, "enum": ["a", "b"]},
+                "list": {"type": "array", "minItems": 3, "items": {
+                    "type": "object", "properties": {"x": {"type": "string"}}
+                }},
+            },
+            "required": ["n"],
+            "additionalProperties": true,
+        });
+        let out = for_structured_outputs(&s);
+        assert_eq!(out["additionalProperties"], false);
+        assert!(out["properties"]["n"].get("minimum").is_none());
+        assert!(out["properties"]["s"].get("maxLength").is_none());
+        assert_eq!(out["properties"]["s"]["enum"], json!(["a", "b"]));
+        assert!(out["properties"]["list"].get("minItems").is_none());
+        assert_eq!(
+            out["properties"]["list"]["items"]["additionalProperties"],
+            false
+        );
+        assert_eq!(out["required"], json!(["n"]));
+        // A property *named* like a constraint is a property.
+        assert_eq!(out["properties"]["maximum"]["type"], "string");
     }
 
     #[test]

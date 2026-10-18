@@ -86,6 +86,13 @@ expected to send only levels it detected for the model.
 A 400 that rejects the effort control is reported as a `provider_error` with
 `error_type: "effort_rejected"` and is not retried.
 
+**Delegate effort** (2.3.0). A provider's `config.delegate_effort` is the level
+a delegate hosted on it runs at — a level that model accepts, never `off`
+(Kitty sends `low`, else the ladder's lowest grade, else `on`). It becomes the
+delegate session's `thinking_effort`, the level its reasoning budget drops to
+when spent, and the level of its schema-constrained final pass. Absent: the
+delegate sends no effort and runs at the model's own default.
+
 **One turn per session.** A second concurrent `POST /send` is **409**. To run
 work in parallel, use several sessions — that is what `parent_session_id`
 groups. Rejoining a running turn is `GET /{id}/stream`, which is a different
@@ -151,7 +158,13 @@ queue state:
 
 `concurrency` is what the endpoint actually serves at once — your configured
 `parallel_slots` if set, else probed from llama.cpp's `/props`, else the
-dialect default (`slots_source` says which). Pace against it rather than
+default (`slots_source` says which). The default is 1 for a self-hosted
+`custom_openai`/`ollama` endpoint and for `local`, 8 otherwise. "Self-hosted"
+is the provider's `config.hosted: false`, or, when `hosted` is absent, a base
+URL on loopback, RFC 1918, link-local, unique-local or Tailscale
+(`100.64.0.0/10`, `*.ts.net`), or a `.local`/`.lan`/`.internal`/single-label
+name (2.3.0 — before it, every `custom_openai` endpoint got 1, including hosted
+APIs saved under that dialect). Pace against it rather than
 discovering the limit as latency. `my_queue_depth` distinguishes "the endpoint
 is busy" from "*I* have a backlog".
 
@@ -197,7 +210,10 @@ connected server provides is a **400** at write time rather than a surprise at
 run time. An empty array means *no* tools, never "unrestricted".
 
 Built-ins (`researcher`, `summarizer`, `locator`, `extractor`, `analyst`) are
-seeded by the daemon and shared by every app: **403** to modify or delete.
+seeded by the daemon and shared by every app: **403** to modify or delete. A
+built-in row stored from an older definition (`builtin_version` below the
+engine's) is refreshed at start-up, keeping its `enabled` flag (2.3.0; before
+it, an install kept its first definitions forever).
 POSTing one's name creates your own definition that shadows it for you alone;
 deleting that reverts to the built-in.
 
@@ -209,8 +225,9 @@ for an approver that does not exist.
 
 **Host selection.** A delegate does not simply run wherever the parent did. The
 daemon scores every provider visible to the app — tool support and health are
-hard gates, then whether it shares a single KV slot with the parent, its
-concurrency, and (when Kitty supplies them) `cost_tier` and `capability_rank`
+hard gates, then whether it shares a single KV slot with the parent (a hosted
+endpoint never does, whatever its slot count), its concurrency (a hosted
+endpoint's default counts; a self-hosted guess does not), and (when Kitty supplies them) `cost_tier` and `capability_rank`
 from its own provider config. A specialist's `provider`/`model` pin wins if it is
 still eligible; if it is not, **both** are dropped together, because a model
 chosen for one provider is not meaningful at another. The result names what it
@@ -229,8 +246,46 @@ decline a failover onto a denied one and stay where it is.
 `agent.specialist_reasoning_fraction`. Enforced by a per-run accumulator in the
 agent loop rather than on the wire, because only Anthropic and OpenRouter accept
 a budget field — the other dialects would silently ignore one. Exceeding it
-disables thinking for the rest of the run and tells the model to finish; it never
-aborts, because the delegate still owes its caller a report.
+drops the rest of the run to the host's `delegate_effort` (2.3.0; it used to
+drop the effort entirely, which on most models meant their own, higher default)
+and tells the model to finish; it never aborts, because the delegate still owes
+its caller a report.
+
+**The final answer.** After the tool loop, a schema'd delegate is asked once
+more, with tools withheld and the schema attached, at its `delegate_effort` and
+with at least 8192 tokens of room (bounded by the window). The schema reaches
+the wire as `response_format: json_schema` (OpenAI, OpenRouter and the other
+hosted dialects), `format` (llama.cpp, Ollama), `output_config.format: {type:
+"json_schema", schema}` on an Anthropic provider with `anthropic_thinking:
+"adaptive"` (2.3.0 — current Claude models reject a forced `tool_choice`; the
+schema sent there is closed with `additionalProperties: false` and stripped of
+the constraints structured outputs reject, and the answer is still validated
+against the full schema), or a forced tool on older Anthropic models. One retry
+follows a rejected shape, a truncated answer (with twice the room) or a
+transport error. If both passes fail, the delegate's last prose comes back on
+the failure as `How far it got: …`, as it does after a timeout.
+
+**Per-session switch.** A session whose metadata has `specialists_disabled:
+true` (set through `PATCH /api/chat/{id}/config`) is never offered
+`call_specialist`, `await_specialists` or `list_specialists` — they are left
+out of its tool list, not offered and refused — and a call to one anyway is
+refused at dispatch. Absent or `false`: specialists are on. A fork copies the
+session's metadata, so it inherits the switch (2.3.0).
+
+**When the model delegates.** `call_specialist`'s description states the rules
+as rules: delegate only self-contained work that needs many tool calls and can
+run while the model does something else; never a single lookup, file read or
+command, anything answerable from the conversation, anything finishable in
+about three tool calls, or a follow-up to the user's last message; when unsure,
+do it directly; batch independent pieces into one call (2.3.0).
+
+Delegate sessions are marked `delegate: true` in their metadata and skip the
+memory hooks (pathway, memorabilia and pre-flight recall) and the post-turn
+passes (compaction, pathway learn, memorabilia harvest): their "user" is
+another model, and nobody continues their transcript.
+
+The wrap-up reserve before a delegate's deadline is `min(120 s, 2/5 of its
+budget)`, enough for a wrap-up reply and both final passes.
 
 **Fan-out.** A specialist with `fan_out: "per_ref"` (built-in `extractor` and
 `summarizer`) turns one call carrying N refs into N delegates, returning

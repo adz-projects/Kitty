@@ -11,10 +11,10 @@ use super::base::{
     classify_provider_error, classify_transport_error, parse_retry_after, read_bounded_error_body,
     Delta, Effort, HealthStatus, ModelInfo, Provider, SamplingParams,
 };
+use super::schema::SchemaDirective;
 use super::tag_split::TagSplitter;
 use crate::config::ProviderConfig;
 use crate::error::ProviderError;
-use super::schema::SchemaDirective;
 use crate::network::{maybe_direct_url, TailscaleClient};
 
 /// OpenRouter's nested `reasoning` object for an effort level. Levels go
@@ -165,7 +165,10 @@ pub(super) fn models_probe_url(url: &str) -> String {
 pub(super) fn probe_origin(url: &str) -> String {
     reqwest::Url::parse(url)
         .ok()
-        .and_then(|u| u.host_str().map(|h| (u.scheme().to_string(), h.to_string(), u.port())))
+        .and_then(|u| {
+            u.host_str()
+                .map(|h| (u.scheme().to_string(), h.to_string(), u.port()))
+        })
         .map(|(scheme, host, port)| match port {
             Some(p) => format!("{scheme}://{host}:{p}"),
             None => format!("{scheme}://{host}"),
@@ -580,7 +583,8 @@ impl Provider for OpenAICompatibleProvider {
         // the flag and Ollama does not implement OpenAI's strict subset, so
         // asking for it turns a working request into a 400).
         match &schema {
-            SchemaDirective::None => {}
+            // Anthropic-only; the router never maps an OpenAI dialect to it.
+            SchemaDirective::None | SchemaDirective::OutputFormat(_) => {}
             SchemaDirective::ResponseFormat(v) => {
                 body["response_format"] = v.clone();
             }
@@ -1978,7 +1982,14 @@ mod sse_tests {
         );
         let messages = vec![serde_json::json!({"role": "user", "content": "hi"})];
         let stream = provider
-            .chat_completion(&messages, None, SamplingParams::default(), None, Some(2), SchemaDirective::None)
+            .chat_completion(
+                &messages,
+                None,
+                SamplingParams::default(),
+                None,
+                Some(2),
+                SchemaDirective::None,
+            )
             .await
             .unwrap();
         let _: Vec<Delta> = stream.collect().await;
@@ -2002,9 +2013,11 @@ mod sse_tests {
             ))
             .with_status(200)
             .with_header("content-type", "text/event-stream")
-            .with_body("data: [DONE]
+            .with_body(
+                "data: [DONE]
 
-")
+",
+            )
             .create_async()
             .await;
 
@@ -2055,9 +2068,11 @@ mod sse_tests {
             })))
             .with_status(200)
             .with_header("content-type", "text/event-stream")
-            .with_body("data: [DONE]
+            .with_body(
+                "data: [DONE]
 
-")
+",
+            )
             .create_async()
             .await;
 
@@ -2096,9 +2111,11 @@ mod sse_tests {
             })))
             .with_status(200)
             .with_header("content-type", "text/event-stream")
-            .with_body("data: [DONE]
+            .with_body(
+                "data: [DONE]
 
-")
+",
+            )
             .create_async()
             .await;
         let provider = OpenAICompatibleProvider::new(
@@ -2152,7 +2169,14 @@ mod sse_tests {
         );
         let messages = vec![serde_json::json!({"role": "user", "content": "hi"})];
         let stream = provider
-            .chat_completion(&messages, None, SamplingParams::default(), None, None, SchemaDirective::None)
+            .chat_completion(
+                &messages,
+                None,
+                SamplingParams::default(),
+                None,
+                None,
+                SchemaDirective::None,
+            )
             .await
             .unwrap();
         let _: Vec<Delta> = stream.collect().await;
@@ -2227,7 +2251,14 @@ mod sse_tests {
         );
         let messages = vec![serde_json::json!({"role": "user", "content": "hi"})];
         let stream = provider
-            .chat_completion(&messages, None, SamplingParams::default(), None, None, SchemaDirective::None)
+            .chat_completion(
+                &messages,
+                None,
+                SamplingParams::default(),
+                None,
+                None,
+                SchemaDirective::None,
+            )
             .await
             .unwrap();
         let _: Vec<Delta> = stream.collect().await;
@@ -2304,7 +2335,14 @@ mod sse_tests {
         );
         let messages = vec![serde_json::json!({"role": "user", "content": "hi"})];
         let stream = provider
-            .chat_completion(&messages, None, SamplingParams::default(), None, None, SchemaDirective::None)
+            .chat_completion(
+                &messages,
+                None,
+                SamplingParams::default(),
+                None,
+                None,
+                SchemaDirective::None,
+            )
             .await
             .unwrap();
         let deltas: Vec<Delta> = stream.collect().await;
@@ -2342,7 +2380,14 @@ mod sse_tests {
         );
         let messages = vec![serde_json::json!({"role": "user", "content": "hi"})];
         let stream = provider
-            .chat_completion(&messages, None, SamplingParams::default(), None, None, SchemaDirective::None)
+            .chat_completion(
+                &messages,
+                None,
+                SamplingParams::default(),
+                None,
+                None,
+                SchemaDirective::None,
+            )
             .await
             .unwrap();
         let _: Vec<Delta> = stream.collect().await;
@@ -2685,7 +2730,14 @@ mod sse_tests {
             serde_json::json!({"role": "user", "content": "hi"}),
         ];
         let stream = provider
-            .chat_completion(&messages, None, SamplingParams::default(), None, None, SchemaDirective::None)
+            .chat_completion(
+                &messages,
+                None,
+                SamplingParams::default(),
+                None,
+                None,
+                SchemaDirective::None,
+            )
             .await
             .unwrap();
         let _: Vec<Delta> = stream.collect().await;

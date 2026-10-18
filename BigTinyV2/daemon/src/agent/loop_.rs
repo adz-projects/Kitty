@@ -242,6 +242,44 @@ fn tools_to_openai_format(tools: &[ToolDefinition]) -> Vec<Value> {
         .collect()
 }
 
+/// Whether this session is a delegate's (a specialist run), as the
+/// orchestrator marks it. Delegate sessions skip the per-user memory hooks
+/// and the post-turn housekeeping: they are one-shot transcripts nobody will
+/// continue, written by a model working for another session, so learning from
+/// them or compacting them is cost with no reader.
+fn is_delegate(metadata: &Value) -> bool {
+    metadata.get("delegate").and_then(|v| v.as_bool()) == Some(true)
+}
+
+/// Whether the user switched specialists off for this chat
+/// (`specialists_disabled: true` in its metadata, set from the chat's menu).
+fn specialists_disabled(metadata: &Value) -> bool {
+    metadata
+        .get("specialists_disabled")
+        .and_then(|v| v.as_bool())
+        == Some(true)
+}
+
+/// The tools that start, collect or list delegates.
+fn is_specialist_tool(name: &str) -> bool {
+    use crate::specialists::server::{AWAIT_TOOL, CALL_TOOL, LIST_TOOL};
+    name == CALL_TOOL || name == AWAIT_TOOL || name == LIST_TOOL
+}
+
+/// Withhold the delegate tools from a chat whose user switched specialists
+/// off. Withheld rather than offered and refused: a small model that sees
+/// `call_specialist` will reach for it whatever the result says, and a refusal
+/// costs a step and a sentence of apology where an absent tool costs nothing.
+/// Returns how many were withheld.
+fn withhold_specialist_tools(tools: &mut Vec<ToolDefinition>, metadata: &Value) -> usize {
+    if !specialists_disabled(metadata) {
+        return 0;
+    }
+    let before = tools.len();
+    tools.retain(|t| !is_specialist_tool(&t.name));
+    before - tools.len()
+}
+
 /// Pure: build the assistant-role message for one turn's streamed output —
 /// factored out so every path that needs to persist it (the normal
 /// tool-execution flow and both budget-check early-exit branches) builds
@@ -287,19 +325,41 @@ fn sampling_fingerprint(s: &crate::provider::base::SamplingParams) -> Value {
     })
 }
 
-/// Drain a schema-constrained response stream into `(text, forced_tool_args)`.
+/// One drained schema-constrained response.
+#[derive(Debug, Default)]
+struct StructuredDraft {
+    text: String,
+    /// The forced tool's arguments, on the dialect that answers that way.
+    forced: Option<Value>,
+    /// The answer stopped at the output limit (`length` / `max_tokens`).
+    truncated: bool,
+    /// The stream failed part-way (a dropped connection, an idle timeout).
+    failed: bool,
+}
+
+/// Drain a schema-constrained response stream.
 ///
 /// Simpler than `process_stream` on purpose: this request carries no tools of
-/// its own, cannot fail over, and produces no timings — the only thing to
-/// recover is the answer, in whichever of the two places the dialect put it.
+/// its own, cannot fail over, and produces no timings — the things to recover
+/// are the answer, in whichever of the two places the dialect put it, and
+/// whether it was cut off or broke, which decide how it is retried.
 async fn drain_structured_answer(
     mut stream: Pin<Box<dyn Stream<Item = Delta> + Send>>,
-) -> (String, Option<Value>) {
-    let mut text = String::new();
-    let mut forced: Option<Value> = None;
+) -> StructuredDraft {
+    let mut out = StructuredDraft::default();
     while let Some(delta) = stream.next().await {
+        if delta.error_type.as_deref() == Some("request") {
+            out.failed = true;
+            break;
+        }
+        if matches!(
+            delta.finish_reason.as_deref(),
+            Some("length" | "max_tokens")
+        ) {
+            out.truncated = true;
+        }
         if let Some(c) = delta.content {
-            text.push_str(&c);
+            out.text.push_str(&c);
         }
         for tc in delta.tool_calls.into_iter().flatten() {
             if tc.function.get("name").and_then(|v| v.as_str()) != Some(ANTHROPIC_STRUCTURED_TOOL) {
@@ -308,14 +368,14 @@ async fn drain_structured_answer(
             // `arguments` is a JSON string on the OpenAI-shaped wire and an
             // object on Anthropic's; accept either rather than assuming the
             // dialect that produced this directive.
-            forced = match tc.function.get("arguments") {
+            out.forced = match tc.function.get("arguments") {
                 Some(Value::String(raw)) => serde_json::from_str(raw).ok(),
                 Some(v) => Some(v.clone()),
                 None => None,
             };
         }
     }
-    (text, forced)
+    out
 }
 
 /// Attach what the persisted row should record about an assistant message --
@@ -433,6 +493,27 @@ const REASONING_BUDGET_TOOL: &str = "__reasoning_budget__";
 /// window.
 const REPORT_RESERVE_FLOOR: i32 = 1024;
 const REPORT_RESERVE_CEILING: i32 = 4096;
+
+/// Output room the schema-constrained final pass asks for at the least.
+///
+/// The report reserve above was the old figure, and it was the reason runs
+/// failed: a reasoning model spends most of 4096 tokens thinking before the
+/// JSON starts, the answer is cut off, both passes fail and the whole delegate
+/// errors. Bounded by the window (`FINAL_PASS_WINDOW_MARGIN`) so a small
+/// self-hosted context is never asked for more than it can hold.
+const FINAL_PASS_MAX_TOKENS_FLOOR: i32 = 8192;
+/// Headroom kept between the final pass's prompt and the window edge.
+const FINAL_PASS_WINDOW_MARGIN: i32 = 512;
+/// Pause before the final pass's one retry after a transport failure.
+const FINAL_PASS_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(750);
+
+/// How much output the final pass can ask for before the request itself no
+/// longer fits the window: the window, less the prompt, less a margin.
+fn final_pass_window_room(context_length: i32, attempt: &[Value]) -> i32 {
+    context_length
+        .saturating_sub(tokens::count_messages_tokens(attempt))
+        .saturating_sub(FINAL_PASS_WINDOW_MARGIN)
+}
 
 /// One completed streamed attempt: the assembled content chunks, tool calls,
 /// finish reason, usage, and timing — or a `ProviderError` (including
@@ -588,16 +669,21 @@ const DEADLINE_SYSTEM_MESSAGE: &str =
 /// retries once on a rejected shape. Issuing that at the very end of the budget
 /// is what made a finished run look like a timed-out one.
 ///
-/// Sixty seconds comfortably covers a wrap-up reply plus both structured
-/// passes at the 300s default. The fraction is for short budgets, where a flat
-/// minute would be most of the run: a 60s delegate reserves 20s and still gets
-/// 40s of actual work.
-const DEADLINE_WRAPUP_RESERVE: std::time::Duration = std::time::Duration::from_secs(60);
-const DEADLINE_RESERVE_DIVISOR: u32 = 3;
+/// Sized for what the reserve actually has to pay for: a wrap-up reply, then
+/// the final pass, which may run twice (a retry after a rejected shape, a cut-
+/// off answer or a dropped connection) at up to `FINAL_PASS_MAX_TOKENS_FLOOR`
+/// tokens each. Sixty seconds covered the old 4096-token pass on a hosted API
+/// and not much else; on a self-hosted model at 30-40 tokens/s a single 8k
+/// pass is several minutes, so the flat figure is two minutes and the fraction
+/// (two fifths) keeps short budgets workable — a 60s delegate still gets 36s
+/// of actual work.
+const DEADLINE_WRAPUP_RESERVE: std::time::Duration = std::time::Duration::from_secs(120);
+const DEADLINE_RESERVE_NUMERATOR: u32 = 2;
+const DEADLINE_RESERVE_DIVISOR: u32 = 5;
 
 /// The slice of `budget` held back for the report.
 fn deadline_reserve(budget: std::time::Duration) -> std::time::Duration {
-    DEADLINE_WRAPUP_RESERVE.min(budget / DEADLINE_RESERVE_DIVISOR)
+    DEADLINE_WRAPUP_RESERVE.min(budget * DEADLINE_RESERVE_NUMERATOR / DEADLINE_RESERVE_DIVISOR)
 }
 
 /// Output budget for the wrap-up reply. The floor keeps `max_tokens` a positive
@@ -1273,6 +1359,11 @@ pub struct AgentLoop {
     /// because the enforcement point is `execute_one_tool_call`, five frames
     /// below the only place that can read the session's metadata.
     tool_allow: Option<std::collections::HashSet<String>>,
+    /// The user switched specialists off for this chat: the delegate tools are
+    /// withheld from its tool list, and a call to one anyway (from a stale
+    /// prompt or plain invention) is refused at dispatch. Set per turn in
+    /// `run_inner`, like `tool_allow`.
+    specialists_off: bool,
     /// Whether a tool call that would need human approval is refused outright
     /// instead of pausing for one. Set per session; see `run_inner`.
     hitl_auto_reject: bool,
@@ -1343,6 +1434,7 @@ impl AgentLoop {
             workspace_snapshots,
             background_tasks,
             tool_allow: None,
+            specialists_off: false,
             hitl_auto_reject: false,
             priority: crate::provider::queue::Priority::Interactive,
             app_events: None,
@@ -1517,6 +1609,11 @@ impl AgentLoop {
                 "tool set narrowed by the session's allow-list"
             );
         }
+        self.specialists_off = specialists_disabled(&metadata);
+        let withheld = withhold_specialist_tools(&mut active_tools, &metadata);
+        if withheld > 0 {
+            tracing::debug!(session_id, withheld, "specialists are off for this chat");
+        }
         let active_tools = active_tools;
 
         // The active provider's own `context_length` (Settings → Providers →
@@ -1559,7 +1656,14 @@ impl AgentLoop {
         // produces `(None, None)`, i.e. zero delta to the prompt (the
         // byte-identity regression test in `context/builder.rs` guards
         // this).
+        //
+        // None of the three run for a delegate. Its "user message" is another
+        // model's request, so recalling the user's beliefs against it, or
+        // their compacted history, is a prompt cost (and on a self-hosted
+        // host, an embedding call) with nothing to find.
+        let delegate = is_delegate(&metadata);
         let (ap_hints, thought_seed) = match &resolved_provider_id {
+            _ if delegate => (None, None),
             Some(pid) => {
                 let model = self.router.resolve_model(pid, model_override);
                 self.pathway_recall(session_id, user_message, pid, &model)
@@ -1573,6 +1677,7 @@ impl AgentLoop {
         // on), so the stable head stays byte-identical and no `build_messages`
         // signature changes. `None`+`None` is still zero prompt delta.
         let mem_hints = match &resolved_provider_id {
+            _ if delegate => None,
             Some(_) => self.memorabilia_recall(session_id, user_message).await,
             None => None,
         };
@@ -1589,9 +1694,12 @@ impl AgentLoop {
         // stable head stays byte-identical. Any miss/disabled/error yields
         // `None` → zero delta to the prompt; the counter drops are the only
         // side effect.
-        let preflight_recalled = self
-            .preflight_recall(session_id, user_message, session.compacted_through_rowid)
-            .await;
+        let preflight_recalled = if delegate {
+            None
+        } else {
+            self.preflight_recall(session_id, user_message, session.compacted_through_rowid)
+                .await
+        };
         let recalled = preflight_recalled.as_deref();
 
         // Build initial context
@@ -1901,7 +2009,14 @@ impl AgentLoop {
     /// second failure is a signal the caller needs (a bad schema, or a model
     /// too small for it) rather than something to paper over. Unvalidated
     /// prose is never returned as if it were structured — a parent that asked
-    /// for a guarantee gets one or gets an error.
+    /// for a guarantee gets one or gets an error, and on an error the
+    /// orchestrator still hands back the delegate's last prose as how far it
+    /// got.
+    ///
+    /// The retry also covers the two ways this request used to fail outright:
+    /// a transport error (it used to end the pass with no second attempt), and
+    /// a truncated answer (reasoning ate the output room and the JSON stopped
+    /// mid-object), which retries the same request with twice the room.
     #[allow(clippy::too_many_arguments)]
     async fn finalize_structured(
         &mut self,
@@ -1910,40 +2025,16 @@ impl AgentLoop {
         provider_id: &str,
         provider_model: &str,
         sampling: crate::provider::base::SamplingParams,
+        effort: Option<crate::provider::base::Effort>,
+        context_length: i32,
         app_id: &str,
         spec: &ResponseSpec,
         report_reserve: i32,
         cache: &crate::provider::response_cache::CacheDirective,
         event_tx: &mpsc::UnboundedSender<SSEEvent>,
     ) {
-        const INSTRUCTION: &str = "Now return your final answer for this task,              as JSON matching the required schema. Return only the JSON.";
-
-        // Thinking off, output room pinned — and this is a fix, not a
-        // precaution.
-        //
-        // This request deliberately withholds tools, and on Anthropic that is
-        // exactly the condition that switches extended thinking *on*:
-        // `anthropic_thinking` short-circuits with
-        // `if has_tools { return (max, None) }`, and that guard, derived from
-        // the tool list, is the only thing suppressing thinking on a normal
-        // agent step. The wrap-up valve documents this trap and defends against
-        // it; this path inherited the caller's sampling untouched, which made
-        // the report request the single most likely place in a delegate's whole
-        // run for an unbudgeted think — after its budget had already been spent.
-        //
-        // `max_tokens` is pinned for the same reason the wrap-up path pins it:
-        // zeroing the effort drops out of the `(base + 4096)` branch back to a
-        // bare 4096, shrinking the answer's room at exactly the moment the
-        // answer is due.
-        let mut sampling = sampling;
-        sampling.effort = None;
-        sampling.reasoning_max_tokens = None;
-        sampling.max_tokens = Some(
-            sampling
-                .max_tokens
-                .unwrap_or(0)
-                .max(report_reserve.max(REPORT_RESERVE_FLOOR)),
-        );
+        const INSTRUCTION: &str = "Now return your final answer for this task, \
+             as JSON matching the required schema. Return only the JSON.";
 
         // Built from the turn's own history so the answer is grounded in the
         // tool results the loop actually gathered, not re-derived.
@@ -1952,6 +2043,37 @@ impl AgentLoop {
         // instruction necessarily lands after one — see `control_message` for
         // why that makes the role load-bearing.
         attempt.push(control_message(INSTRUCTION));
+
+        // The effort this request runs at, and the room it gets — and both
+        // are fixes, not precautions.
+        //
+        // Effort: the delegate's own level (low on its host's ladder), never
+        // `None`. `None` does not mean "no thinking", it means "the model's
+        // default" — xhigh on a self-hosted Qwen3.8 template, and on regardless
+        // on the adaptive Claude models. This request withholds tools, which on
+        // budget-style Anthropic is exactly what switches extended thinking
+        // on, so leaving the level to the model made the report request the
+        // most expensive think of the whole run.
+        //
+        // Room: the old 1024-4096 reserve was routinely eaten by reasoning
+        // before the JSON started, the answer was truncated, both passes failed
+        // and the whole run errored. A real floor now, bounded by what is left
+        // of the window so a small self-hosted context is not asked for more
+        // output than it can hold.
+        let mut sampling = sampling;
+        sampling.effort = effort;
+        sampling.reasoning_max_tokens = None;
+        let window_room = final_pass_window_room(context_length, &attempt);
+        let floor = report_reserve.max(REPORT_RESERVE_FLOOR);
+        let room = |wanted: i32| -> i32 { wanted.min(window_room).max(floor) };
+        let mut max_tokens = room(
+            sampling
+                .max_tokens
+                .unwrap_or(0)
+                .max(report_reserve)
+                .max(FINAL_PASS_MAX_TOKENS_FLOOR),
+        );
+        sampling.max_tokens = Some(max_tokens);
 
         // Cached on the *final* request only, which is the one place in a
         // delegate's run where caching is unambiguously safe: it carries no
@@ -2018,20 +2140,55 @@ impl AgentLoop {
                 Ok(s) => s,
                 Err(e) => {
                     last_error = format!("structured-response request failed: {e}");
+                    // Once more after a short pause: the request was fine, the
+                    // network moment was not, and this is the request the
+                    // whole run exists to make.
+                    if pass == 0 && e.is_retryable() {
+                        tracing::info!(
+                            session_id,
+                            error = %e,
+                            "structured answer request failed; retrying once"
+                        );
+                        tokio::time::sleep(FINAL_PASS_RETRY_DELAY).await;
+                        continue;
+                    }
                     break;
                 }
             };
 
-            let (text, forced) = drain_structured_answer(stream).await;
-            // Anthropic returns the answer as the forced tool's arguments;
-            // every other dialect returns it as the message body.
-            let candidate = forced.or_else(|| response_schema::extract(&text));
+            let draft = drain_structured_answer(stream).await;
+            if draft.failed {
+                last_error = "structured-response stream failed mid-response (connection \
+                              dropped or idle timeout)"
+                    .to_string();
+                if pass == 0 {
+                    tokio::time::sleep(FINAL_PASS_RETRY_DELAY).await;
+                    continue;
+                }
+                break;
+            }
+            // Anthropic's forced tool returns the answer as the tool's
+            // arguments; every other mechanism returns it as the message body.
+            let candidate = draft
+                .forced
+                .clone()
+                .or_else(|| response_schema::extract(&draft.text));
             let Some(value) = candidate else {
-                last_error = "model returned no JSON for a schema-constrained answer".to_string();
-                attempt.push(json!({"role": "assistant", "content": text}));
-                // `user` for the same reason as the first instruction above:
-                // this one also lands after an assistant turn.
-                attempt.push(control_message(format!("{last_error}. {INSTRUCTION}")));
+                if draft.truncated {
+                    // Out of room, not out of ideas: the same request with more
+                    // room, rather than a correction the model cannot act on.
+                    last_error =
+                        "the schema-constrained answer was cut off at the output limit".to_string();
+                    max_tokens = room(max_tokens.saturating_mul(2));
+                    sampling.max_tokens = Some(max_tokens);
+                } else {
+                    last_error =
+                        "model returned no JSON for a schema-constrained answer".to_string();
+                    attempt.push(json!({"role": "assistant", "content": draft.text}));
+                    // `user` for the same reason as the first instruction
+                    // above: this one also lands after an assistant turn.
+                    attempt.push(control_message(format!("{last_error}. {INSTRUCTION}")));
+                }
                 continue;
             };
 
@@ -2135,6 +2292,14 @@ impl AgentLoop {
             .get("thinking_effort")
             .and_then(|v| v.as_str())
             .and_then(crate::provider::base::Effort::from_wire);
+        // A delegate's own level — low on its host's ladder, written by the
+        // orchestrator as `thinking_effort` — is also the level its reasoning
+        // cap drops to and its final pass runs at. Never Off and never `None`
+        // there: `None` is the model's default, which is usually *more*
+        // thinking than the delegate started with.
+        let delegate_effort = is_delegate(metadata)
+            .then(|| effort.clone().filter(crate::provider::base::Effort::is_on))
+            .flatten();
         // Whether this turn's final answer may be served from, and written to,
         // the response cache.
         //
@@ -2784,12 +2949,17 @@ impl AgentLoop {
                 sampling.effort = effort.clone();
                 if let Some(cap) = reasoning_cap {
                     if reasoning_exhausted {
-                        // Latched. Zero the effort *and* pin an explicit
-                        // max_tokens: on Anthropic, dropping the effort alone
-                        // falls out of the `(base + 4096)` branch back to a bare
-                        // 4096, which would shrink the delegate's output room at
-                        // exactly the step it has to write its report.
-                        sampling.effort = None;
+                        // Latched. Drop to the delegate's low level *and* pin an
+                        // explicit max_tokens. The low level, not `None`: `None`
+                        // is the model's own default, which on a self-hosted
+                        // Qwen3.8 is xhigh and on the adaptive Claude models is
+                        // thinking on — so the old "effort off" latch widened
+                        // thinking rather than narrowing it. The pin: on
+                        // Anthropic, a lower effort falls out of the
+                        // `(base + 4096)` branch toward a bare 4096, which would
+                        // shrink the delegate's output room at exactly the step
+                        // it has to write its report.
+                        sampling.effort = delegate_effort.clone();
                         sampling.reasoning_max_tokens = None;
                         sampling.max_tokens = Some(
                             sampling
@@ -2827,8 +2997,12 @@ impl AgentLoop {
                     // cap the budget arithmetic yields `16384.min(2048 - 1024)`
                     // = 1024, which clears the >= 1024 test, so thinking stays
                     // on and eats half the wrap-up budget on reasoning nobody
-                    // will read. Zero the effort as well.
-                    sampling.effort = None;
+                    // will read. Zero the effort as well — except on a
+                    // delegate, whose floor is its own low level: there
+                    // `None` is the model's default (xhigh on a self-hosted
+                    // Qwen3.8 template), which would spend the whole clamped
+                    // budget thinking and leave the wrap-up empty.
+                    sampling.effort = delegate_effort.clone();
                     sampling.max_tokens = Some(tokens::wrapup_max_tokens(
                         context_length,
                         projected_input,
@@ -3525,12 +3699,18 @@ impl AgentLoop {
                 let model = title_provider_model
                     .clone()
                     .unwrap_or_else(|| self.router.resolve_model(&pid, model_override));
+                let context_length = self
+                    .router
+                    .context_length(&pid)
+                    .unwrap_or(self.context.config().max_context_tokens);
                 self.finalize_structured(
                     session_id,
                     &mut messages,
                     &pid,
                     &model,
                     sampling,
+                    delegate_effort.clone(),
+                    context_length,
                     turn_app_id
                         .as_deref()
                         .unwrap_or(crate::provider::queue::DAEMON_LANE),
@@ -3552,7 +3732,13 @@ impl AgentLoop {
         // session ever race. The provider's own `context_length` (Settings →
         // Providers → Advanced) wins when set; fall back to the daemon-wide
         // `token_management.max_context_tokens` otherwise.
-        if let Some(pid) = last_provider_id {
+        //
+        // Not for a delegate: its transcript is finished the moment this turn
+        // ends — nobody sends it a second message — so compacting it is a
+        // summarizer call on the same (often single-slot) host for a session
+        // that will never be read past its report.
+        let delegate = is_delegate(metadata);
+        if let Some(pid) = last_provider_id.filter(|_| !delegate) {
             let context_length = self
                 .router
                 .context_length(&pid)
@@ -3595,6 +3781,16 @@ impl AgentLoop {
                 .await;
             });
             self.track_background(&tracked_session, handle.abort_handle());
+        }
+
+        // Neither turn-end memory pass runs for a delegate. The pathway learn
+        // pass extracts beliefs about *the user* from a dialogue the user never
+        // took part in, and the harvest would ingest the delegate's working
+        // documents a second time — the parent's own turn already brings in
+        // anything worth keeping. Title derivation above still runs, so a
+        // delegate's transcript stays findable.
+        if delegate {
+            return;
         }
 
         // Turn-end Adaptive Pathway pass (runs once per turn, fire-and-forget):
@@ -4371,6 +4567,25 @@ impl AgentLoop {
         // hard-deny below runs first: this is a policy violation, not a
         // question to put to a human, and reaching the approval path would let
         // an approval grant what the definition forbids.
+        // The same for a chat whose user switched specialists off: the tools
+        // were never offered, so a call to one is invention, and running it
+        // would start paid delegate work the user said no to.
+        if self.specialists_off && is_specialist_tool(&tool_name) {
+            let err = format!(
+                "Tool {tool_name} is not available: specialists are switched off for this chat. \
+                 Do the work directly."
+            );
+            let _ = event_tx.send(SSEEvent {
+                event_type: SSEEventType::ToolFinish,
+                tool_name: Some(tool_name),
+                tool_result: Some(err.clone()),
+                tool_call_id: Some(tool_call_id.clone()),
+                session_id: Some(session_id.to_string()),
+                is_error: Some(true),
+                ..Default::default()
+            });
+            return err;
+        }
         if let Some(allow) = self.tool_allow.as_ref() {
             if !allow.contains(&tool_name) && tool_name != BUDGET_TOOL {
                 let err = format!(
@@ -5288,10 +5503,10 @@ mod wrapup_valve_tests {
         assert_eq!(decide_turn_mode(7, true, false, true), TurnMode::Normal);
     }
 
-    /// At the 300s default the reserve is the flat minute -- comfortably a
-    /// wrap-up reply plus both `finalize_structured` passes.
+    /// At the 300s default the reserve is the flat two minutes -- a wrap-up
+    /// reply plus both `finalize_structured` passes at the 8k-token floor.
     #[test]
-    fn a_normal_budget_reserves_the_flat_minute() {
+    fn a_normal_budget_reserves_the_flat_figure() {
         assert_eq!(
             deadline_reserve(Duration::from_secs(300)),
             DEADLINE_WRAPUP_RESERVE
@@ -5309,11 +5524,11 @@ mod wrapup_valve_tests {
     fn a_short_budget_reserves_a_fraction_so_work_still_happens() {
         assert_eq!(
             deadline_reserve(Duration::from_secs(60)),
-            Duration::from_secs(20)
+            Duration::from_secs(24)
         );
         assert_eq!(
             deadline_reserve(Duration::from_secs(30)),
-            Duration::from_secs(10)
+            Duration::from_secs(12)
         );
         // Degenerate, but it must not panic or reserve more than exists.
         assert_eq!(deadline_reserve(Duration::ZERO), Duration::ZERO);
@@ -5585,5 +5800,56 @@ mod containment_order_tests {
         assert_eq!(content_buf, "hello");
         assert!(tool_calls.is_empty());
         assert_eq!(finish_reason.as_deref(), Some("stop"));
+    }
+}
+
+#[cfg(test)]
+mod specialists_toggle_tests {
+    use super::*;
+
+    fn tool(name: &str) -> ToolDefinition {
+        ToolDefinition {
+            name: name.to_string(),
+            description: String::new(),
+            input_schema: json!({"type": "object"}),
+            server_id: "s".to_string(),
+        }
+    }
+
+    fn names(tools: &[ToolDefinition]) -> Vec<&str> {
+        tools.iter().map(|t| t.name.as_str()).collect()
+    }
+
+    /// The per-chat switch, off: the three delegate tools are not offered at
+    /// all, and nothing else is touched.
+    #[test]
+    fn a_chat_with_specialists_off_is_never_offered_the_delegate_tools() {
+        let mut tools = vec![
+            tool("lean_file_read"),
+            tool("call_specialist"),
+            tool("await_specialists"),
+            tool("list_specialists"),
+            tool("lean_web_search"),
+        ];
+        let off = json!({"specialists_disabled": true});
+        assert_eq!(withhold_specialist_tools(&mut tools, &off), 3);
+        assert_eq!(names(&tools), ["lean_file_read", "lean_web_search"]);
+        assert!(specialists_disabled(&off));
+    }
+
+    /// Default on: absent, `false`, or anything that is not literally `true`
+    /// leaves the tool list alone.
+    #[test]
+    fn specialists_stay_on_unless_the_chat_switched_them_off() {
+        for meta in [
+            json!({}),
+            json!({"specialists_disabled": false}),
+            json!({"specialists_disabled": "true"}),
+            json!({"specialists_disabled": null}),
+        ] {
+            let mut tools = vec![tool("call_specialist"), tool("lean_file_read")];
+            assert_eq!(withhold_specialist_tools(&mut tools, &meta), 0, "{meta}");
+            assert_eq!(tools.len(), 2);
+        }
     }
 }

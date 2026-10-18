@@ -61,10 +61,7 @@ fn answer_schema(mut props: serde_json::Map<String, Value>) -> Value {
 }
 
 fn props(pairs: Vec<(&str, Value)>) -> serde_json::Map<String, Value> {
-    pairs
-        .into_iter()
-        .map(|(k, v)| (k.to_string(), v))
-        .collect()
+    pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
 }
 
 fn builtin(
@@ -126,9 +123,11 @@ fn builtin_with_fan_out(
 /// beyond the wrap-up notice `agent::loop_` injects near the deadline, so the
 /// disposition to stop early has to be in the prompt rather than discovered.
 ///
-/// Prepended at resolve time rather than stored on each row, so an install
-/// whose definitions were seeded by an earlier version picks this up without a
-/// migration -- `seed_builtins` deliberately never overwrites an edited row.
+/// Prepended once, in [`all`], so a change to it cannot reach four specialists
+/// and miss the fifth. It is stored with each built-in row, and reaches an
+/// install seeded by an earlier release because `seed_builtins` refreshes any
+/// built-in row older than [`BUILTIN_VERSION`] — bump that whenever this text
+/// or a definition below changes.
 const COMMON: &str = "You are a specialist working on behalf of another agent, not a person. \
 Answer only what was asked; the caller cannot see your working, so put everything that matters \
 in your final structured answer and nothing that does not. If a tool call is refused or a source \
@@ -139,6 +138,15 @@ report that arrives is worth far more than a thorough one that does not, so stop
 report as soon as you have enough to answer, and if you are told you are near your \
 limit, stop immediately and report what you have. Return only the fields the answer \
 shape asks for — no preamble, no restating the request, no commentary around it.";
+
+/// The release of the built-in definitions in this file. Seeding replaces a
+/// stored built-in whose version is lower (see
+/// `storage::specialists::seed_builtin`), which is how a sharper prompt, the
+/// shared preamble or a corrected tool list reaches an existing install.
+///
+/// 1: the preamble's budget and answer-shape clauses, and `lean_shell_ro` on
+///    the locator (engine 2.3.0).
+pub const BUILTIN_VERSION: i64 = 1;
 
 pub fn researcher() -> Specialist {
     builtin(
@@ -247,7 +255,13 @@ pub fn locator() -> Specialist {
          each. Never paste file contents into your \
          answer — the caller will read what it needs from the locations you give it, and copying \
          content here defeats the point of asking you.",
+        // `lean_shell_ro` because the prompt above sends the locator to it
+        // first: without it in the list the advertised tool was filtered out
+        // and every call to it refused, so the locator lost its fastest way to
+        // find anything. Read-only by construction, and absent on Android,
+        // where the remaining tools still do the job.
         &[
+            "lean_shell_ro",
             "lean_analyze_workspace",
             "lean_doc_search",
             "lean_pdf_read_outline",
@@ -375,7 +389,13 @@ pub fn analyst() -> Specialist {
 
 /// Every built-in, in the order they are offered to the model.
 pub fn all() -> Vec<Specialist> {
-    let mut list = vec![researcher(), summarizer(), locator(), extractor(), analyst()];
+    let mut list = vec![
+        researcher(),
+        summarizer(),
+        locator(),
+        extractor(),
+        analyst(),
+    ];
     // The shared preamble is prepended here rather than repeated in each
     // definition, so a change to it cannot apply to four specialists and miss
     // the fifth.
@@ -385,15 +405,16 @@ pub fn all() -> Vec<Specialist> {
     list
 }
 
-/// Write any built-in that is not already in the database.
+/// Write every built-in that is absent, or stored from an older definition.
 ///
-/// Never overwrites: a built-in the user has edited in place stays edited
-/// across restarts. Adding a new built-in in a later release still lands,
-/// because only that name is absent.
+/// A built-in row is never one a user edited — the API refuses that, and an
+/// app's edit is its own shadowing row, which seeding never touches — so
+/// refreshing a stale one loses nothing. Before this, built-ins were only ever
+/// inserted, and an install kept its first definitions forever.
 pub async fn seed_builtins(pool: &SqlitePool) -> Result<usize, crate::error::StorageError> {
     let mut written = 0;
     for spec in all() {
-        if store::insert_builtin_if_absent(pool, &spec).await? {
+        if store::seed_builtin(pool, &spec, BUILTIN_VERSION).await? {
             tracing::info!(specialist = %spec.name, "seeded built-in specialist");
             written += 1;
         }
@@ -407,7 +428,11 @@ pub async fn seed_builtins(pool: &SqlitePool) -> Result<usize, crate::error::Sto
 /// tool name is otherwise invisible until a delegate quietly does its job
 /// without the one tool that mattered, and the model has no way to tell that
 /// from the tool simply not helping.
-pub fn unknown_tools(mcp: &crate::mcp::MCPManager, app_id: &str, tool_allow: &[String]) -> Vec<String> {
+pub fn unknown_tools(
+    mcp: &crate::mcp::MCPManager,
+    app_id: &str,
+    tool_allow: &[String],
+) -> Vec<String> {
     let known: std::collections::HashSet<String> = mcp
         .list_tools_for_app(app_id)
         .into_iter()

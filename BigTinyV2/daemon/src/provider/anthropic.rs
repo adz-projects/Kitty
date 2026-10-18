@@ -11,9 +11,9 @@ use super::base::{
     classify_provider_error, classify_transport_error, parse_retry_after, read_bounded_error_body,
     Delta, Effort, HealthStatus, ModelInfo, Provider, SamplingParams,
 };
+use super::schema::SchemaDirective;
 use crate::config::{CacheConfig, ProviderConfig};
 use crate::error::ProviderError;
-use super::schema::SchemaDirective;
 use crate::network::{maybe_direct_url, TailscaleClient};
 
 /// Resolve Anthropic's `max_tokens` and optional extended-thinking budget for
@@ -465,9 +465,7 @@ impl Provider for AnthropicProvider {
                 "max_tokens": max_tokens,
                 "stream": true,
             });
-            let on = thinking
-                .as_ref()
-                .is_some_and(|t| t["type"] != "disabled");
+            let on = thinking.as_ref().is_some_and(|t| t["type"] != "disabled");
             if let Some(t) = thinking {
                 body["thinking"] = t;
             }
@@ -580,6 +578,12 @@ impl Provider for AnthropicProvider {
             converted.push(tool.clone());
             body["tool_choice"] = choice.clone();
         }
+        // Structured outputs, for the adaptive models that 400 on a forced
+        // tool. Merged beside any `output_config.effort` set above, so the
+        // answer is written at the requested level with thinking intact.
+        if let SchemaDirective::OutputFormat(format) = &schema {
+            body["output_config"]["format"] = format.clone();
+        }
         if !converted.is_empty() {
             body["tools"] = Value::Array(converted);
         }
@@ -614,7 +618,11 @@ impl Provider for AnthropicProvider {
             // Bounded in both time and size — a stalled error body used to
             // hang the turn forever (see `read_bounded_error_body`).
             let body_text = read_bounded_error_body(resp).await;
-            return Err(classify_provider_error(status_code, &body_text, retry_after));
+            return Err(classify_provider_error(
+                status_code,
+                &body_text,
+                retry_after,
+            ));
         }
 
         let stream = resp.bytes_stream();
@@ -633,9 +641,7 @@ impl Provider for AnthropicProvider {
             .timeout(std::time::Duration::from_secs(5))
             .send()
             .await
-            .map_err(|e| {
-                classify_transport_error(&e, format!("failed to discover models: {e}"))
-            })?;
+            .map_err(|e| classify_transport_error(&e, format!("failed to discover models: {e}")))?;
 
         if !resp.status().is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -1081,9 +1087,8 @@ impl Stream for AnthropicSSEStream {
                         // Decode only at complete line boundaries so a
                         // multi-byte UTF-8 char split across TCP chunks stays
                         // intact.
-                        let line = String::from_utf8(raw).unwrap_or_else(|e| {
-                            String::from_utf8_lossy(e.as_bytes()).into_owned()
-                        });
+                        let line = String::from_utf8(raw)
+                            .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
                         if self.process_line(&line) {
                             self.done = true;
                         }
@@ -1119,9 +1124,8 @@ impl Stream for AnthropicSSEStream {
                     // a real SSE line — decode it before finishing.
                     if !self.buf.is_empty() {
                         let raw = std::mem::take(&mut self.buf);
-                        let line = String::from_utf8(raw).unwrap_or_else(|e| {
-                            String::from_utf8_lossy(e.as_bytes()).into_owned()
-                        });
+                        let line = String::from_utf8(raw)
+                            .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
                         if self.process_line(&line) {
                             self.done = true;
                         }
@@ -1207,9 +1211,15 @@ mod thinking_tests {
     #[test]
     fn no_effort_leaves_max_tokens_and_adds_no_thinking() {
         assert_eq!(anthropic_thinking(None, None, false, None), (4096, None));
-        assert_eq!(anthropic_thinking(Some(&Effort::Off), None, false, None), (4096, None));
+        assert_eq!(
+            anthropic_thinking(Some(&Effort::Off), None, false, None),
+            (4096, None)
+        );
         // An explicit cap is preserved untouched.
-        assert_eq!(anthropic_thinking(None, Some(8192), false, None), (8192, None));
+        assert_eq!(
+            anthropic_thinking(None, Some(8192), false, None),
+            (8192, None)
+        );
     }
 
     #[test]
@@ -1242,7 +1252,10 @@ mod thinking_tests {
         // medium budget of 16384 is >= it. Because no explicit cap was set,
         // max_tokens is raised to fit rather than the budget colliding with it.
         let (max, budget) = anthropic_thinking(Some(&Effort::Medium), None, false, None);
-        assert!(budget.unwrap() < max, "budget must stay strictly below max_tokens");
+        assert!(
+            budget.unwrap() < max,
+            "budget must stay strictly below max_tokens"
+        );
         assert_eq!((max, budget), (16384 + 4096, Some(16384)));
     }
 
@@ -1342,8 +1355,14 @@ mod thinking_tests {
     #[test]
     fn the_wrapup_clamp_suppresses_thinking_as_well_as_the_budget() {
         // What the valve sends: effort zeroed, explicit cap set.
-        assert_eq!(anthropic_thinking(None, Some(2048), false, None), (2048, None));
-        assert_eq!(anthropic_thinking(None, Some(512), false, None), (512, None));
+        assert_eq!(
+            anthropic_thinking(None, Some(2048), false, None),
+            (2048, None)
+        );
+        assert_eq!(
+            anthropic_thinking(None, Some(512), false, None),
+            (512, None)
+        );
 
         // What it would send if only the cap were clamped — thinking survives
         // and takes 1024 of the 2048.
@@ -1378,7 +1397,9 @@ mod sse_tests {
         let inner = stream::iter(vec![Ok::<bytes::Bytes, reqwest::Error>(
             bytes::Bytes::from(chunk),
         )]);
-        let deltas: Vec<Delta> = parse_anthropic_sse(inner, Duration::from_secs(300)).collect().await;
+        let deltas: Vec<Delta> = parse_anthropic_sse(inner, Duration::from_secs(300))
+            .collect()
+            .await;
         let contents: Vec<String> = deltas.into_iter().filter_map(|d| d.content).collect();
         assert_eq!(contents, vec!["Hi".to_string(), " there".to_string()]);
     }
@@ -1391,7 +1412,9 @@ mod sse_tests {
             Ok::<bytes::Bytes, reqwest::Error>(bytes::Bytes::from(chunk1)),
             Ok::<bytes::Bytes, reqwest::Error>(bytes::Bytes::from(chunk2)),
         ]);
-        let deltas: Vec<Delta> = parse_anthropic_sse(inner, Duration::from_secs(300)).collect().await;
+        let deltas: Vec<Delta> = parse_anthropic_sse(inner, Duration::from_secs(300))
+            .collect()
+            .await;
         let contents: Vec<String> = deltas.into_iter().filter_map(|d| d.content).collect();
         assert_eq!(contents, vec!["Hello".to_string()]);
     }
@@ -1453,9 +1476,9 @@ mod sse_tests {
     #[tokio::test]
     async fn an_overlong_line_without_newline_terminates_as_a_transient_error() {
         let garbage = vec![b'x'; MAX_SSE_LINE_BYTES + 1];
-        let inner = stream::iter(vec![Ok::<bytes::Bytes, reqwest::Error>(bytes::Bytes::from(
-            garbage,
-        ))]);
+        let inner = stream::iter(vec![Ok::<bytes::Bytes, reqwest::Error>(
+            bytes::Bytes::from(garbage),
+        )]);
         let deltas: Vec<Delta> = parse_anthropic_sse(inner, Duration::from_secs(300))
             .collect()
             .await;
@@ -1507,7 +1530,9 @@ mod sse_tests {
         let inner = stream::iter(vec![Ok::<bytes::Bytes, reqwest::Error>(
             bytes::Bytes::from(chunk),
         )]);
-        let deltas: Vec<Delta> = parse_anthropic_sse(inner, Duration::from_secs(300)).collect().await;
+        let deltas: Vec<Delta> = parse_anthropic_sse(inner, Duration::from_secs(300))
+            .collect()
+            .await;
         assert_eq!(deltas.len(), 1);
         assert_eq!(deltas[0].content.as_deref(), Some("Hi"));
     }
@@ -1537,7 +1562,9 @@ mod sse_tests {
         let inner = stream::iter(vec![Ok::<bytes::Bytes, reqwest::Error>(
             bytes::Bytes::from(chunk),
         )]);
-        let deltas: Vec<Delta> = parse_anthropic_sse(inner, Duration::from_secs(300)).collect().await;
+        let deltas: Vec<Delta> = parse_anthropic_sse(inner, Duration::from_secs(300))
+            .collect()
+            .await;
         let tool_calls = deltas
             .into_iter()
             .find_map(|d| d.tool_calls)
@@ -1564,7 +1591,9 @@ mod sse_tests {
         let inner = stream::iter(vec![Ok::<bytes::Bytes, reqwest::Error>(
             bytes::Bytes::from(chunk),
         )]);
-        let deltas: Vec<Delta> = parse_anthropic_sse(inner, Duration::from_secs(300)).collect().await;
+        let deltas: Vec<Delta> = parse_anthropic_sse(inner, Duration::from_secs(300))
+            .collect()
+            .await;
         let usage = deltas[0]
             .usage
             .as_ref()
@@ -1583,7 +1612,9 @@ mod sse_tests {
         let inner = stream::iter(vec![Ok::<bytes::Bytes, reqwest::Error>(
             bytes::Bytes::from(chunk),
         )]);
-        let deltas: Vec<Delta> = parse_anthropic_sse(inner, Duration::from_secs(300)).collect().await;
+        let deltas: Vec<Delta> = parse_anthropic_sse(inner, Duration::from_secs(300))
+            .collect()
+            .await;
         let usage = deltas[0]
             .usage
             .as_ref()
@@ -1621,7 +1652,14 @@ mod sse_tests {
             serde_json::json!({"role": "user", "content": "hi"}),
         ];
         let stream = provider
-            .chat_completion(&messages, None, SamplingParams::default(), None, None, SchemaDirective::None)
+            .chat_completion(
+                &messages,
+                None,
+                SamplingParams::default(),
+                None,
+                None,
+                SchemaDirective::None,
+            )
             .await
             .unwrap();
         let _: Vec<Delta> = stream.collect().await;
@@ -1660,9 +1698,11 @@ mod sse_tests {
             })))
             .with_status(200)
             .with_header("content-type", "text/event-stream")
-            .with_body("data: {\"type\":\"message_stop\"}
+            .with_body(
+                "data: {\"type\":\"message_stop\"}
 
-")
+",
+            )
             .create_async()
             .await;
 
@@ -1734,7 +1774,14 @@ mod sse_tests {
             serde_json::json!({"role": "user", "content": "hi"}),
         ];
         let stream = provider
-            .chat_completion(&messages, None, SamplingParams::default(), None, None, SchemaDirective::None)
+            .chat_completion(
+                &messages,
+                None,
+                SamplingParams::default(),
+                None,
+                None,
+                SchemaDirective::None,
+            )
             .await
             .unwrap();
         let _: Vec<Delta> = stream.collect().await;

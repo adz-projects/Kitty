@@ -45,14 +45,13 @@ impl SpecialistRow {
     /// "unrestricted" would hand a delegate the app's whole surface, which is
     /// exactly the thing the column exists to prevent.
     pub fn into_model(self) -> Specialist {
-        let tool_allow: Vec<String> =
-            serde_json::from_str(&self.tool_allow).unwrap_or_else(|e| {
-                tracing::warn!(
-                    specialist = %self.name,
-                    "tool_allow did not parse ({e}); treating as no tools"
-                );
-                Vec::new()
-            });
+        let tool_allow: Vec<String> = serde_json::from_str(&self.tool_allow).unwrap_or_else(|e| {
+            tracing::warn!(
+                specialist = %self.name,
+                "tool_allow did not parse ({e}); treating as no tools"
+            );
+            Vec::new()
+        });
         let response_schema: Option<Value> = self
             .response_schema
             .as_deref()
@@ -169,10 +168,7 @@ pub async fn get_any(pool: &SqlitePool, id: &str) -> Result<Option<Specialist>, 
 /// `specialists::registry::seed_builtins` — no route passes `None`.
 pub async fn upsert(pool: &SqlitePool, spec: &Specialist) -> Result<(), StorageError> {
     let tool_allow = serde_json::to_string(&spec.tool_allow).unwrap_or_else(|_| "[]".into());
-    let response_schema = spec
-        .response_schema
-        .as_ref()
-        .map(|v| v.to_string());
+    let response_schema = spec.response_schema.as_ref().map(|v| v.to_string());
     sqlx::query(
         "INSERT INTO specialists \
            (id, app_id, name, description, system_prompt, provider, model, tool_allow, \
@@ -215,23 +211,24 @@ pub async fn upsert(pool: &SqlitePool, spec: &Specialist) -> Result<(), StorageE
     Ok(())
 }
 
-/// Seed a built-in only if no built-in of that name exists yet.
+/// Seed a built-in, or refresh one seeded from an older definition.
 ///
-/// Distinct from `upsert` so a daemon restart cannot overwrite a built-in the
-/// user has since edited in place. Returns whether a row was written.
-pub async fn insert_builtin_if_absent(
+/// Inserts when no built-in of that name exists, and replaces one whose
+/// `builtin_version` is below `version`; a row at the same or a newer version
+/// is left alone, so two engines of different releases sharing a database do
+/// not take turns rewriting it. Safe to replace because a built-in row is only
+/// ever written here: the API refuses to modify one, and an app's edit is its
+/// own shadowing row, which this never touches. `enabled` is kept as stored.
+/// Returns whether a row was written.
+pub async fn seed_builtin(
     pool: &SqlitePool,
     spec: &Specialist,
+    version: i64,
 ) -> Result<bool, StorageError> {
     let tool_allow = serde_json::to_string(&spec.tool_allow).unwrap_or_else(|_| "[]".into());
     let response_schema = spec.response_schema.as_ref().map(|v| v.to_string());
     let out = sqlx::query(
-        "INSERT INTO specialists \
-           (id, app_id, name, description, system_prompt, provider, model, tool_allow, \
-            response_schema, max_steps, max_concurrent, enabled, builtin, \
-            reasoning_cap_tokens, reasoning_cap_fraction, fan_out) \
-         VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?, ?, ?) \
-         ON CONFLICT(COALESCE(app_id, ''), name) DO NOTHING",
+        "INSERT INTO specialists            (id, app_id, name, description, system_prompt, provider, model, tool_allow,             response_schema, max_steps, max_concurrent, enabled, builtin,             reasoning_cap_tokens, reasoning_cap_fraction, fan_out, builtin_version)          VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?, ?, ?, ?)          ON CONFLICT(COALESCE(app_id, ''), name) DO UPDATE SET            description = excluded.description,            system_prompt = excluded.system_prompt,            provider = excluded.provider,            model = excluded.model,            tool_allow = excluded.tool_allow,            response_schema = excluded.response_schema,            max_steps = excluded.max_steps,            max_concurrent = excluded.max_concurrent,            reasoning_cap_tokens = excluded.reasoning_cap_tokens,            reasoning_cap_fraction = excluded.reasoning_cap_fraction,            fan_out = excluded.fan_out,            builtin_version = excluded.builtin_version,            updated_at = datetime('now')          WHERE specialists.app_id IS NULL AND specialists.builtin = 1            AND specialists.builtin_version < excluded.builtin_version",
     )
     .bind(&spec.id)
     .bind(&spec.name)
@@ -246,6 +243,7 @@ pub async fn insert_builtin_if_absent(
     .bind(cap_tokens(spec))
     .bind(cap_fraction(spec))
     .bind(&spec.fan_out)
+    .bind(version)
     .execute(pool)
     .await?;
     Ok(out.rows_affected() > 0)

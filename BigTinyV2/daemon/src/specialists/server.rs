@@ -139,14 +139,21 @@ impl SpecialistServer {
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static,
     {
         let server = self.serve(stream).await.map_err(|e| e.to_string())?;
-        server.waiting().await.map(|_| ()).map_err(|e| e.to_string())
+        server
+            .waiting()
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     }
 
     /// Which app is asking. `None` when the session id was not injected, which
     /// can only mean a caller outside `agent::loop_`'s dispatch site.
     async fn app_for(&self, session_id: Option<&str>) -> Option<String> {
         let session_id = session_id.filter(|s| !s.is_empty())?;
-        sessions::owner_of(&self.pool, session_id).await.ok().flatten()
+        sessions::owner_of(&self.pool, session_id)
+            .await
+            .ok()
+            .flatten()
     }
 
     /// A soft error, in the same envelope as a success.
@@ -164,26 +171,33 @@ impl SpecialistServer {
 impl SpecialistServer {
     #[tool(
         name = "call_specialist",
-        description = "Start a self-contained piece of work on a specialist agent in the background. \
-Returns a ticket immediately, not the result: keep working on the rest of the task while it runs. \
-Its structured report is delivered to you automatically the moment it finishes, so do not stall \
-waiting for it — start what else you can, and act on each report as it arrives. Use \
-`await_specialists` only when you have nothing else to do until a report lands. Every report is \
-accounted for before you answer; if you answer while one is still outstanding it is collected for \
-you and you will be asked to write the answer again. The specialist runs in its own context with \
-its own tools, so its searching and reading never enters yours — use this when a task would take \
-many tool calls to produce a small answer. Built-in specialists: `researcher` (answers a question from web sources, returns \
-findings with citations); `summarizer` (reads long documents, returns notes and anchors); \
-`locator` (finds where something lives across files, returns paths only); `extractor` (pulls named \
-fields from many documents into rows); `analyst` (computes figures from spreadsheets and explains \
-the method). Call `list_specialists` if none of those fit — the user may have defined others. \
-Pass document ids and paths in `refs` rather than pasting content into `request`; the specialist \
-shares your document cache. `summarizer` and `extractor` run one instance per ref, so passing \
-several documents processes them in parallel and its report has one result per document; pass \
-more than the limit and the call is refused outright rather than partly served. You can start \
-several specialists and they will run at the same time. Do \
-not delegate work that needs this conversation's context, and do not delegate anything you \
-can answer directly."
+        description = "Hand a self-contained task to a specialist agent that runs in the \
+background with its own context and tools. Returns a ticket at once; the report reaches you \
+automatically when it finishes.
+
+Delegate ONLY when all of these hold:
+- the task needs many tool calls (a search across several sources, reading several files or \
+documents);
+- it can be done without this conversation's context, from the request and refs you pass;
+- you have other work to do while it runs.
+
+NEVER delegate:
+- a single lookup, file read or command;
+- anything answerable from the conversation so far;
+- anything you could finish yourself in about 3 tool calls;
+- a follow-up question about the user's last message.
+If unsure, do it yourself.
+
+Put independent pieces in ONE call (several refs, or one request covering them), not one call \
+per small step. Pass document ids and paths in `refs`, never pasted content. Do not wait idly: \
+carry on, and call `await_specialists` only when nothing else is left. Every report is collected \
+before your answer counts.
+
+Specialists: `researcher` (a question needing web sources; findings with citations), \
+`summarizer` (long documents; notes and anchors; one run per ref), `locator` (where something \
+is across files; paths only), `extractor` (named fields from many documents; one run per ref), \
+`analyst` (figures from spreadsheets, with the method). `list_specialists` shows any others. \
+More refs than the limit is refused outright."
     )]
     pub async fn call_specialist(&self, Parameters(req): Parameters<CallRequest>) -> String {
         let Some(app_id) = self.app_for(req.session_id.as_deref()).await else {
@@ -310,13 +324,11 @@ can answer directly."
 
     #[tool(
         name = "await_specialists",
-        description = "Block until a specialist started with `call_specialist` reports. You do \
-not normally need this: reports are delivered to you on their own as they finish. Call it only \
-when you have nothing useful to do until one arrives. With no `tickets`, covers every report \
-still outstanding. `wait`: \"any\" waits for the next one to finish and returns it — prefer this, \
-so you can act on the first answer while the rest are still running; \"all\" (the default) waits \
-until every selected ticket has reported; \"none\" returns only what has already finished, \
-without waiting. `still_running` lists tickets that have not reported yet; they will reach you \
+        description = "Wait for reports from specialists started with `call_specialist`. \
+Reports arrive on their own, so call this only when you have nothing else to do. No `tickets`: \
+every outstanding report. `wait`: \"any\" returns the next to finish (prefer it, and act on \
+each report as it lands); \"all\" (default) waits for every selected ticket; \"none\" returns \
+only what is already finished. `still_running` lists tickets still working; they will reach you \
 without being asked for."
     )]
     pub async fn await_specialists(&self, Parameters(req): Parameters<AwaitRequest>) -> String {
@@ -338,9 +350,9 @@ without being asked for."
 
     #[tool(
         name = "list_specialists",
-        description = "List the specialists available to delegate to, with what each is for. Call \
-this when a task looks delegable but none of the built-in specialists named in `call_specialist` \
-obviously fits."
+        description = "List the specialists you can delegate to, with what each is for. Only \
+needed when a task meets `call_specialist`'s rules for delegating and none of the specialists it \
+names fits."
     )]
     pub async fn list_specialists(&self, Parameters(req): Parameters<ListRequest>) -> String {
         let Some(app_id) = self.app_for(req.session_id.as_deref()).await else {
@@ -486,5 +498,40 @@ impl ServerHandler for SpecialistServer {
             ),
             ..Default::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn description(name: &str) -> String {
+        SpecialistServer::core_tool_router()
+            .list_all()
+            .into_iter()
+            .find(|t| t.name == name)
+            .and_then(|t| t.description.map(|d| d.to_string()))
+            .unwrap_or_else(|| panic!("{name} is not registered"))
+    }
+
+    /// The guidance small models delegate by: stated as rules, with the
+    /// cases that must never be delegated named outright, and short enough
+    /// to be read rather than skimmed.
+    #[test]
+    fn call_specialist_states_when_not_to_delegate_as_rules() {
+        let d = description(CALL_TOOL);
+        for rule in [
+            "Delegate ONLY when",
+            "NEVER delegate",
+            "a single lookup, file read or command",
+            "answerable from the conversation so far",
+            "about 3 tool calls",
+            "follow-up question about the user's last message",
+            "If unsure, do it yourself",
+            "ONE call",
+        ] {
+            assert!(d.contains(rule), "missing {rule:?} in: {d}");
+        }
+        assert!(d.len() < 2000, "keep it short: {} chars", d.len());
     }
 }

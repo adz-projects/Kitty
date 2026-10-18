@@ -146,6 +146,18 @@ impl Drop for TurnCleanup {
                         dropped,
                         "turn ended with specialist reports uncollected — stopped those delegates"
                     );
+                    // Aborting a ticket stops only the task *waiting* on the
+                    // delegate; the delegate's own turn is a separate task in
+                    // `tasks` and kept running — spending on a report nobody
+                    // could collect, and holding a specialist permit and a
+                    // provider slot while it did. Cancel those too. Spawned,
+                    // since `drop` cannot await; there is always a runtime here,
+                    // because this guard lives inside the turn's own task.
+                    if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                        let agent = self.agent.clone();
+                        let parent = self.session_id.clone();
+                        rt.spawn(async move { agent.cancel_delegates_of(&parent).await });
+                    }
                 }
             }
         }
@@ -714,7 +726,7 @@ mod tests {
         let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
 
-    let plugins = crate::plugins::test_plugin_host(&pool);
+        let plugins = crate::plugins::test_plugin_host(&pool);
         let memorabilia = crate::plugins::test_memorabilia_host(&pool);
 
         let config = BigTinyConfig::default();

@@ -1,17 +1,17 @@
 use super::base::Delta;
+use super::queue::{Priority, ProviderQueue, QueuePermit};
 use dashmap::DashMap;
 use futures::Stream;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Instant;
-use super::queue::{Priority, ProviderQueue, QueuePermit};
 
 use super::anthropic::AnthropicProvider;
 use super::base::{HealthStatus, Provider, SamplingParams};
 use super::openai_compat::OpenAICompatibleProvider;
 use super::sampling;
-use super::schema::{directive_for, ResponseSpec};
+use super::schema::{directive_for, directive_for_adaptive_anthropic, ResponseSpec};
 use crate::config::{CacheConfig, ProviderConfig};
 use crate::error::ProviderError;
 use crate::network::TailscaleClient;
@@ -65,6 +65,17 @@ struct ProviderEntry {
     cost_tier: Option<String>,
     capability_rank: Option<i32>,
     base_url: String,
+    /// The reasoning level a delegate hosted here runs at — see
+    /// `ProviderConfig::delegate_effort`.
+    delegate_effort: Option<String>,
+    /// A hosted service rather than a server the user runs — see
+    /// `ProviderConfig::hosted`. Decides the slot default, and tells the
+    /// subagent picker there is no single KV slot to share.
+    hosted: bool,
+    /// An Anthropic model on adaptive thinking (`anthropic_thinking:
+    /// "adaptive"`), whose structured answers go through
+    /// `output_config.format` because it rejects a forced `tool_choice`.
+    anthropic_adaptive: bool,
 }
 
 const HEALTH_TTL_SECS: u64 = 30;
@@ -79,13 +90,28 @@ const HEALTH_TTL_SECS: u64 = 30;
 /// wrong in the other direction merely queues a request that could have run
 /// concurrently, so 1 is the safe default and `parallel_slots` is how a user
 /// with `--parallel 4` says so.
-fn default_concurrency(dialect: &str) -> u32 {
+///
+/// "Self-hosted" is decided by where the endpoint is, not only by its dialect:
+/// a hosted OpenAI-compatible API saved as `custom_openai` (the reported case
+/// was Alibaba's DashScope `compatible-mode/v1`) is built for concurrency, and
+/// one slot there ran a chat and every delegate it started one at a time.
+/// `local` is always the user's own machine.
+fn default_concurrency(dialect: &str, hosted: bool) -> u32 {
     match dialect {
-        "custom_openai" | "ollama" | "local" => 1,
+        "local" => 1,
+        "custom_openai" | "ollama" if !hosted => 1,
         // Hosted APIs are built for concurrency; a low cap here would
         // needlessly serialize multiple chat windows.
         _ => 8,
     }
+}
+
+/// Whether `config` is a hosted endpoint: the client's statement when it made
+/// one (`hosted` on the provider blob), else classified from the base URL.
+fn is_hosted(config: &ProviderConfig) -> bool {
+    config
+        .hosted
+        .unwrap_or_else(|| crate::network::is_hosted_endpoint(&config.base_url))
 }
 
 /// A `Delta` stream that holds its provider's concurrency permit until the
@@ -186,7 +212,7 @@ impl ProviderRouter {
         let concurrency = config
             .parallel_slots
             .filter(|&n| n > 0)
-            .unwrap_or_else(|| default_concurrency(&config.provider_type));
+            .unwrap_or_else(|| default_concurrency(&config.provider_type, is_hosted(config)));
         (
             config.parallel_slots,
             concurrency,
@@ -221,6 +247,8 @@ impl ProviderRouter {
         let subagent_role = config.subagent_role.clone();
         let cost_tier = config.cost_tier.clone();
         let capability_rank = config.capability_rank;
+        let delegate_effort = config.delegate_effort.clone();
+        let hosted = is_hosted(&config);
         let p: Arc<dyn Provider> = Arc::new(OpenAICompatibleProvider::new(
             provider_id,
             config,
@@ -248,6 +276,9 @@ impl ProviderRouter {
                 subagent_role,
                 cost_tier,
                 capability_rank,
+                delegate_effort,
+                hosted,
+                anthropic_adaptive: false,
             },
         );
     }
@@ -277,6 +308,9 @@ impl ProviderRouter {
         let subagent_role = config.subagent_role.clone();
         let cost_tier = config.cost_tier.clone();
         let capability_rank = config.capability_rank;
+        let delegate_effort = config.delegate_effort.clone();
+        let hosted = is_hosted(&config);
+        let anthropic_adaptive = config.anthropic_thinking.as_deref() == Some("adaptive");
         let p: Arc<dyn Provider> = Arc::new(AnthropicProvider::new(
             provider_id,
             config,
@@ -305,6 +339,9 @@ impl ProviderRouter {
                 subagent_role,
                 cost_tier,
                 capability_rank,
+                delegate_effort,
+                hosted,
+                anthropic_adaptive,
             },
         );
     }
@@ -407,7 +444,9 @@ impl ProviderRouter {
                 .get("context_length")
                 .and_then(|v| v.as_i64())
                 .map(|v| v as i32),
-            idle_timeout_secs: config_json.get("idle_timeout_secs").and_then(|v| v.as_f64()),
+            idle_timeout_secs: config_json
+                .get("idle_timeout_secs")
+                .and_then(|v| v.as_f64()),
             // See `ProviderConfig::experimental_prefill`'s doc comment --
             // an explicit user opt-in, off by default.
             experimental_prefill: config_json
@@ -422,6 +461,13 @@ impl ProviderRouter {
                 .get("anthropic_thinking")
                 .and_then(|v| v.as_str())
                 .map(String::from),
+            delegate_effort: config_json
+                .get("delegate_effort")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from),
+            hosted: config_json.get("hosted").and_then(|v| v.as_bool()),
         };
 
         // Carry the row's owner into the registry. Registering as `None`
@@ -660,13 +706,12 @@ impl ProviderRouter {
         // and `GET /api/status` calls this synchronously on every request, so
         // a daemon restart (all providers "disconnected" → all due) could
         // block the first status poll for N×timeout seconds.
-        let results: Vec<(String, HealthStatus)> = futures::future::join_all(
-            due.into_iter().map(|(id, provider)| async move {
+        let results: Vec<(String, HealthStatus)> =
+            futures::future::join_all(due.into_iter().map(|(id, provider)| async move {
                 let status = provider.check_health().await;
                 (id, status)
-            }),
-        )
-        .await;
+            }))
+            .await;
 
         for (id, status) in results {
             if let Some(mut entry) = self.providers.get_mut(&id) {
@@ -745,6 +790,14 @@ impl ProviderRouter {
             .get(provider_id)
             .map(|e| e.sampling.clone())
             .unwrap_or_default()
+    }
+
+    /// The reasoning level a delegate hosted on this provider runs at, if the
+    /// client stated one — see `ProviderConfig::delegate_effort`.
+    pub fn delegate_effort(&self, provider_id: &str) -> Option<String> {
+        self.providers
+            .get(provider_id)
+            .and_then(|e| e.delegate_effort.clone())
     }
 
     /// This provider's context-length override, if set — see
@@ -836,10 +889,14 @@ impl ProviderRouter {
     /// A user-set `parallel_slots` is never overridden -- an explicit statement
     /// outranks a measurement.
     pub async fn probe_slots(&self, provider_id: &str) {
-        let Some((dialect, base_url, already_configured)) = self
-            .providers
-            .get(provider_id)
-            .map(|e| (e.dialect.clone(), e.base_url.clone(), e.parallel_slots.is_some()))
+        let Some((dialect, base_url, already_configured)) =
+            self.providers.get(provider_id).map(|e| {
+                (
+                    e.dialect.clone(),
+                    e.base_url.clone(),
+                    e.parallel_slots.is_some(),
+                )
+            })
         else {
             return;
         };
@@ -929,20 +986,24 @@ impl ProviderRouter {
         // Clone the provider's Arc out, drop the DashMap guard, then await —
         // a chat completion can run for minutes and must never hold the shard
         // lock (which would block health checks and other completions).
-        let (provider, concurrency, dialect) = {
-            let entry =
-                self.providers
-                    .get(provider_id)
-                    .ok_or_else(|| ProviderError::NoHealthyProvider {
-                        user_message: format!("Provider '{}' not found", provider_id),
-                    })?;
+        let (provider, concurrency, dialect, adaptive) = {
+            let entry = self.providers.get(provider_id).ok_or_else(|| {
+                ProviderError::NoHealthyProvider {
+                    user_message: format!("Provider '{}' not found", provider_id),
+                }
+            })?;
             (
                 entry.provider.clone(),
                 entry.concurrency,
                 entry.dialect.clone(),
+                entry.anthropic_adaptive,
             )
         };
-        let directive = directive_for(&dialect, &response.mode, response.schema.as_ref());
+        let directive = if adaptive {
+            directive_for_adaptive_anthropic(&response.mode, response.schema.as_ref())
+        } else {
+            directive_for(&dialect, &response.mode, response.schema.as_ref())
+        };
 
         // Wait for a slot before sending anything. Every caller funnels
         // through here — the tool loop, its retry/failover attempts, and the
@@ -994,6 +1055,7 @@ impl ProviderRouter {
                 supports_tools: e.provider.supports_tools(),
                 concurrency: e.concurrency,
                 concurrency_is_guess: e.slots_source == super::slots::SlotsSource::Default,
+                hosted: e.hosted,
                 context_length: e.context_length,
                 subagent_role: e.subagent_role.clone(),
                 cost_tier: e.cost_tier.clone(),
@@ -1084,10 +1146,22 @@ mod tests {
             updated_at: None,
             app_id: None,
         };
-        router.register_from_row(&row("off", "openai_compat", r#"{"model":"m","supports_tools":false}"#));
-        router.register_from_row(&row("on", "openai_compat", r#"{"model":"m","supports_tools":true}"#));
+        router.register_from_row(&row(
+            "off",
+            "openai_compat",
+            r#"{"model":"m","supports_tools":false}"#,
+        ));
+        router.register_from_row(&row(
+            "on",
+            "openai_compat",
+            r#"{"model":"m","supports_tools":true}"#,
+        ));
         router.register_from_row(&row("unset", "openai_compat", r#"{"model":"m"}"#));
-        router.register_from_row(&row("claude-off", "anthropic", r#"{"model":"m","supports_tools":false}"#));
+        router.register_from_row(&row(
+            "claude-off",
+            "anthropic",
+            r#"{"model":"m","supports_tools":false}"#,
+        ));
         assert!(!router.supports_tools("off"));
         assert!(router.supports_tools("on"));
         assert!(router.supports_tools("unset"));
@@ -1501,7 +1575,9 @@ mod tests {
         // With no default set, ordinary priority applies across the visible
         // set -- shared is not special-cased in either direction.
         assert_eq!(
-            router.resolve_provider_for_app("app-a", None, None).unwrap(),
+            router
+                .resolve_provider_for_app("app-a", None, None)
+                .unwrap(),
             "shared"
         );
         // ...and naming it as the app default is how "prefer mine" is said.
@@ -1523,7 +1599,9 @@ mod tests {
         // `fresh` is "disconnected" (never probed) -- excluding it too would
         // make the first turn after startup fail before any probe ran.
         assert_eq!(
-            router.resolve_provider_for_app("app-a", None, None).unwrap(),
+            router
+                .resolve_provider_for_app("app-a", None, None)
+                .unwrap(),
             "fresh"
         );
     }
@@ -1556,11 +1634,98 @@ mod tests {
     #[test]
     fn self_hosted_dialects_default_to_one_slot_hosted_ones_do_not() {
         for dialect in ["custom_openai", "ollama", "local"] {
-            assert_eq!(default_concurrency(dialect), 1, "{dialect}");
+            assert_eq!(default_concurrency(dialect, false), 1, "{dialect}");
         }
         for dialect in ["openai", "openrouter", "anthropic"] {
-            assert!(default_concurrency(dialect) > 1, "{dialect}");
+            assert!(default_concurrency(dialect, false) > 1, "{dialect}");
+            assert!(default_concurrency(dialect, true) > 1, "{dialect}");
         }
+        // A hosted API saved as an OpenAI-compatible custom endpoint is still
+        // a hosted API; `local` is always the user's own machine.
+        assert_eq!(default_concurrency("custom_openai", true), 8);
+        assert_eq!(default_concurrency("ollama", true), 8);
+        assert_eq!(default_concurrency("local", true), 1);
+    }
+
+    fn row(id: &str, base_url: &str, config: &str) -> ProviderRow {
+        ProviderRow {
+            id: id.into(),
+            name: id.into(),
+            provider_type: "openai_compat".into(),
+            base_url: base_url.into(),
+            fallback_priority: 0,
+            config: Some(config.into()),
+            status: "disconnected".into(),
+            error_message: None,
+            created_at: None,
+            updated_at: None,
+            app_id: None,
+        }
+    }
+
+    fn concurrency(router: &ProviderRouter, id: &str) -> u32 {
+        router.providers.get(id).map(|e| e.concurrency).unwrap()
+    }
+
+    /// The reported setup: the default card is DashScope saved as
+    /// `custom_openai`, and two more cards sit on one LAN llama-server. The
+    /// hosted card gets the hosted default, so a chat and its delegates no
+    /// longer run there one at a time; the LAN box keeps one slot. An explicit
+    /// `parallel_slots` and an explicit `hosted` from the client both win over
+    /// the URL.
+    #[test]
+    fn a_hosted_custom_endpoint_gets_the_hosted_slot_default() {
+        let router = ProviderRouter::default();
+        router.register_from_row(&row(
+            "dashscope",
+            "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode",
+            r#"{"model":"deepseek-v4.1-flash","provider_dialect":"custom_openai"}"#,
+        ));
+        router.register_from_row(&row(
+            "qwen",
+            "http://192.168.1.199:8081",
+            r#"{"model":"qwen3.8-27b","provider_dialect":"custom_openai"}"#,
+        ));
+        router.register_from_row(&row(
+            "pinned",
+            "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode",
+            r#"{"provider_dialect":"custom_openai","parallel_slots":2}"#,
+        ));
+        router.register_from_row(&row(
+            "told",
+            "https://example.com",
+            r#"{"provider_dialect":"custom_openai","hosted":false}"#,
+        ));
+        assert_eq!(concurrency(&router, "dashscope"), 8);
+        assert_eq!(concurrency(&router, "qwen"), 1);
+        assert_eq!(concurrency(&router, "pinned"), 2);
+        assert_eq!(concurrency(&router, "told"), 1);
+        // Still a default, not a measurement — and no `id_slot` pinning for a
+        // hosted API that never asked for it.
+        assert_eq!(router.parallel_slots("dashscope"), None);
+        let c = router.subagent_candidates("", None);
+        let dash = c.iter().find(|c| c.provider_id == "dashscope").unwrap();
+        assert!(dash.hosted && dash.concurrency_is_guess);
+        assert!(!c.iter().find(|c| c.provider_id == "qwen").unwrap().hosted);
+    }
+
+    /// `delegate_effort` rides the provider blob; a blank one is no hint.
+    #[test]
+    fn delegate_effort_is_read_from_the_provider_blob() {
+        let router = ProviderRouter::default();
+        router.register_from_row(&row(
+            "qwen",
+            "http://192.168.1.199:8081",
+            r#"{"provider_dialect":"custom_openai","delegate_effort":"low"}"#,
+        ));
+        router.register_from_row(&row(
+            "blank",
+            "http://192.168.1.199:8081",
+            r#"{"provider_dialect":"custom_openai","delegate_effort":" "}"#,
+        ));
+        assert_eq!(router.delegate_effort("qwen").as_deref(), Some("low"));
+        assert_eq!(router.delegate_effort("blank"), None);
+        assert_eq!(router.delegate_effort("missing"), None);
     }
 
     /// `parallel_slots` finally means what its name says. It used to produce
@@ -1634,10 +1799,7 @@ mod tests {
 
         a.set_limit(3).await;
         let b = router.queue_for("p", 1);
-        assert!(
-            Arc::ptr_eq(&a, &b),
-            "the queue is adjusted, not replaced"
-        );
+        assert!(Arc::ptr_eq(&a, &b), "the queue is adjusted, not replaced");
         assert_eq!(b.limit().await, 3);
     }
 

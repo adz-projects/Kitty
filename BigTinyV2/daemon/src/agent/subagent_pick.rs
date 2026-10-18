@@ -49,6 +49,9 @@ pub struct Candidate {
     /// measured. Ollama is permanently in this state: its concurrency is
     /// `OLLAMA_NUM_PARALLEL`, which it does not expose.
     pub concurrency_is_guess: bool,
+    /// A hosted API rather than a server the user runs. A hosted endpoint has
+    /// no single KV slot for a delegate to evict, whatever its guessed count.
+    pub hosted: bool,
     pub context_length: Option<i32>,
     /// `"preferred" | "allowed" | "never"`, set by the user in Kitty.
     pub subagent_role: Option<String>,
@@ -98,17 +101,18 @@ const MIN_CONTEXT: i32 = 16_384;
 /// only knows *that* it was denied cannot write it.
 pub fn denied_by<'a>(model: &str, deny: &'a [String]) -> Option<&'a str> {
     let model = model.trim().to_ascii_lowercase();
-    deny.iter().find(|pat| {
-        let pat = pat.trim().to_ascii_lowercase();
-        if pat.is_empty() {
-            false
-        } else if let Some(prefix) = pat.strip_suffix('*') {
-            model.starts_with(prefix)
-        } else {
-            model == pat
-        }
-    })
-    .map(String::as_str)
+    deny.iter()
+        .find(|pat| {
+            let pat = pat.trim().to_ascii_lowercase();
+            if pat.is_empty() {
+                false
+            } else if let Some(prefix) = pat.strip_suffix('*') {
+                model.starts_with(prefix)
+            } else {
+                model == pat
+            }
+        })
+        .map(String::as_str)
 }
 
 /// True when `model` matches any denylist pattern.
@@ -144,8 +148,13 @@ fn hard_gate(c: &Candidate, deny: &[String]) -> Option<&'static str> {
 /// expose it. Guessing high and being wrong costs the parent a full re-prefill
 /// on every step for the rest of the turn; guessing low and being wrong costs
 /// one delegate a slightly worse host. The asymmetry decides it.
+///
+/// A hosted API is never sharing: it has no single KV slot for a delegate to
+/// evict, so a guessed count there says nothing about the parent's cache. Counting
+/// it as sharing is what sent delegates from a fast hosted default card onto a
+/// one-slot LAN server.
 fn shares_one_slot(c: &Candidate) -> bool {
-    c.is_parent_provider && (c.concurrency <= 1 || c.concurrency_is_guess)
+    c.is_parent_provider && !c.hosted && (c.concurrency <= 1 || c.concurrency_is_guess)
 }
 
 /// Higher is better. Ordered by the precedence the module doc explains.
@@ -158,7 +167,12 @@ fn score(c: &Candidate) -> (i32, i32, i32, i32, i32, i32) {
     // is not evidence of spare capacity, and treating it as such is how a
     // one-slot server that never announced itself wins on the strength of a
     // number nobody checked.
-    let parallel = i32::from(c.concurrency >= 2 && !c.concurrency_is_guess);
+    //
+    // A hosted API is the exception: its default is a statement about the
+    // service, not an unchecked number for one box, and it really does serve
+    // requests side by side. Without this a guessed one-slot LAN server and a
+    // hosted API tied here and the LAN box could win on a later component.
+    let parallel = i32::from(c.concurrency >= 2 && (!c.concurrency_is_guess || c.hosted));
     let cheap = match c.cost_tier.as_deref() {
         Some("economy") => 2,
         // `None` sits above "premium" but below "economy": an unknown price is
@@ -272,9 +286,7 @@ pub fn choose_host(candidates: &[Candidate], pin: Pin<'_>, deny: &[String]) -> D
             _ => {
                 let mut whys: Vec<String> = candidates
                     .iter()
-                    .filter_map(|c| {
-                        hard_gate(c, deny).map(|w| format!("{}: {w}", c.provider_id))
-                    })
+                    .filter_map(|c| hard_gate(c, deny).map(|w| format!("{}: {w}", c.provider_id)))
                     .collect();
                 whys.sort();
                 whys.dedup();
@@ -290,10 +302,7 @@ pub fn choose_host(candidates: &[Candidate], pin: Pin<'_>, deny: &[String]) -> D
     // 2 & 3. Best eligible, preferring one that is not the parent's. Expressed
     //        as a score component rather than two passes so a `preferred`
     //        marking can still win over "not the parent's".
-    let best = eligible
-        .iter()
-        .max_by_key(|c| score(c))
-        .expect("non-empty");
+    let best = eligible.iter().max_by_key(|c| score(c)).expect("non-empty");
 
     let mut notes: Vec<String> = Vec::new();
     if pin_state == PinStatus::ProviderIneligible {
@@ -308,10 +317,15 @@ pub fn choose_host(candidates: &[Candidate], pin: Pin<'_>, deny: &[String]) -> D
         ));
     }
     // 4. The parent's own provider is a real answer, but never a silent one.
+    //    Worded by whether it was the only option or simply the best one: a
+    //    hosted main model routinely outranks a slow LAN box, and "no separate
+    //    host was available" would then be untrue.
     if best.is_parent_provider {
-        notes.push(
-            "no separate subagent host was available, so this ran on your main model".to_string(),
-        );
+        notes.push(if eligible.len() > 1 {
+            "this ran on your main model's provider, the best available subagent host".to_string()
+        } else {
+            "no separate subagent host was available, so this ran on your main model".to_string()
+        });
         // Named separately from the line above, because the cost is not "you
         // paid for your main model" — it is that the parent now re-prefills its
         // whole transcript on every step after this call.
@@ -347,6 +361,7 @@ mod tests {
             supports_tools: true,
             concurrency: 8,
             concurrency_is_guess: false,
+            hosted: false,
             context_length: Some(128_000),
             subagent_role: None,
             cost_tier: None,
@@ -426,6 +441,33 @@ mod tests {
         assert!(n.contains("one generation slot"), "got: {n}");
     }
 
+    /// The reported setup: the parent runs on a hosted endpoint saved as
+    /// `custom_openai` (so its slot count is a guess), and two more cards sit
+    /// on one guessed one-slot LAN llama-server. The guess on a hosted API is
+    /// not "sharing a slot", so delegates stay on the capable hosted host
+    /// instead of queueing on the LAN box.
+    #[test]
+    fn a_hosted_parent_is_not_mistaken_for_a_shared_slot() {
+        let mut dashscope = candidate("dashscope");
+        dashscope.is_parent_provider = true;
+        dashscope.hosted = true;
+        dashscope.concurrency = 8;
+        dashscope.concurrency_is_guess = true;
+        let lan = |id: &str| {
+            let mut c = candidate(id);
+            c.concurrency = 1;
+            c.concurrency_is_guess = true;
+            c
+        };
+        let d = choose_host(&[lan("qwen"), dashscope, lan("ling")], None, &[]);
+        assert_eq!(chosen(&d), "dashscope");
+        let Decision::Chosen { note: Some(n), .. } = d else {
+            panic!("running on the parent's provider must be explained");
+        };
+        assert!(n.contains("best available"), "got: {n}");
+        assert!(!n.contains("one generation slot"), "got: {n}");
+    }
+
     /// Every refusal has to name the setting that caused it, which a bool
     /// cannot do.
     #[test]
@@ -453,7 +495,9 @@ mod tests {
         let mut only = candidate("local");
         only.supports_tools = false;
         match choose_host(&[only], None, &[]) {
-            Decision::Refused { reason } => assert!(reason.contains("cannot call tools"), "{reason}"),
+            Decision::Refused { reason } => {
+                assert!(reason.contains("cannot call tools"), "{reason}")
+            }
             other => panic!("a delegate with no tools fabricates its report: {other:?}"),
         }
     }
@@ -471,7 +515,10 @@ mod tests {
         match choose_host(&[parent], None, &deny) {
             Decision::Refused { reason } => {
                 assert!(reason.contains("denylist"), "{reason}");
-                assert!(reason.contains("Settings"), "must say where to change it: {reason}");
+                assert!(
+                    reason.contains("Settings"),
+                    "must say where to change it: {reason}"
+                );
             }
             other => panic!("the denylist was bypassed by the parent fallback: {other:?}"),
         }
@@ -496,7 +543,11 @@ mod tests {
         let deny = vec!["claude-fable-*".to_string()];
         // The pin names a denied model even though the provider's own default
         // is fine — the pin is what would actually be sent.
-        let d = choose_host(&[host], Some(("anthropic", Some("claude-fable-5-1"))), &deny);
+        let d = choose_host(
+            &[host],
+            Some(("anthropic", Some("claude-fable-5-1"))),
+            &deny,
+        );
         match d {
             Decision::Chosen { model, note, .. } => {
                 assert_eq!(model, None, "the denied pin must be dropped");

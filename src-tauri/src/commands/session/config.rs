@@ -28,6 +28,24 @@ pub async fn set_thinking_effort(
     Ok(crate::bigtiny::effort::thinking_effort_for_session(&app, &session_id).await)
 }
 
+/// Whether specialists are on for this chat (the ⋯ menu's switch). On unless
+/// the chat switched them off; stored in the engine session's metadata.
+#[tauri::command]
+pub async fn get_session_specialists(app: AppHandle, session_id: String) -> Result<bool, String> {
+    Ok(!crate::bigtiny::sessions::specialists_disabled(&app, &session_id).await)
+}
+
+/// Switch specialists on or off for one chat. Off: the engine stops offering
+/// the delegate tools to this chat's model from its next turn.
+#[tauri::command]
+pub async fn set_session_specialists(
+    app: AppHandle,
+    session_id: String,
+    enabled: bool,
+) -> Result<(), String> {
+    crate::bigtiny::sessions::set_specialists_disabled(&app, &session_id, !enabled).await
+}
+
 /// The effort picker for a window with no chat yet: resolved against the card
 /// its first chat will use (`provider_id`, else the default card). Choosing a
 /// level creates the chat first (`ensureSession`), so this is read-only.

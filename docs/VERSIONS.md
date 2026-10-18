@@ -48,6 +48,16 @@ Added in daemon **2.2.0** (Kitty 1.1, reasoning effort):
 | provider `config.anthropic_thinking: "adaptive"` → `thinking: adaptive` + `output_config.effort` | Current Claude models, which reject `budget_tokens` with a 400 |
 | `provider_error` `error_type: "effort_rejected"` | Kitty re-detects the card's levels |
 
+Added in daemon **2.3.0** (see "Specialists finish quickly and reliably"):
+
+| Surface | Used for |
+|---|---|
+| provider `config.delegate_effort` → the delegate session's `thinking_effort`, its reasoning-cap level and its final pass's level | Delegates run low on their host's ladder, never at the model's default (xhigh on a self-hosted Qwen3.8) |
+| provider `config.hosted` (else classified from `base_url`) → slot default 8 for a hosted `custom_openai`/`ollama` endpoint | A hosted card saved as `custom_openai` no longer runs a chat and its delegates one at a time |
+| `output_config.format` for structured answers on `anthropic_thinking: "adaptive"` | Current Claude models reject a forced `tool_choice` |
+| a failed final pass returns the delegate's last prose; `builtin_version` refresh of built-ins | Partial results instead of a bare error; prompt and tool-list fixes reach existing installs |
+| session metadata `specialists_disabled: true` withholds `call_specialist`/`await_specialists`/`list_specialists` | The chat ⋯ menu's per-chat Specialists switch (desktop, when specialists are on in Settings) |
+
 Kitty detects each card's ladder itself (`src-tauri/src/bigtiny/effort/`):
 OpenRouter's catalog `reasoning` object (`supported_efforts`, highest first,
 `none` last when optional; `mandatory`; verified live 2026-10-18 on 337 of
@@ -1044,10 +1054,11 @@ caller gets a valid report. Only the timeout path threw the run away.
 about budget or length, so the disposition to stop early had to be discovered
 rather than instructed. It now says that a short report which arrives beats a
 thorough one that does not, to stop immediately when told it is near its limit,
-and to return only the fields the answer shape asks for. Prepended at resolve
-time rather than stored per row, so installs whose definitions were seeded by an
-earlier version get it without a migration — `seed_builtins` never overwrites an
-edited row.
+and to return only the fields the answer shape asks for. *(Corrected in daemon
+2.3.0: the preamble is prepended when the built-ins are seeded and is stored
+with each row, so an install seeded earlier never received it, because seeding
+only inserted. Built-in rows now carry a `builtin_version` and are refreshed
+when it is older — see "Specialists finish quickly and reliably" below.)*
 
 ## Adaptive pathway's MCP server could never connect (0.10.9)
 
@@ -1346,3 +1357,57 @@ Also in this pass:
 - `src-tauri`'s release profile no longer sets `panic = "abort"`. On Android
   the daemon and its MCP servers are linked into the app, and `abort` silently
   disabled all of their panic isolation — one panicking tool call closed Kitty.
+
+## Specialists finish quickly and reliably (daemon 2.3.0)
+
+Reported: specialists were slow and often failed, on a setup with a hosted
+DashScope card (DeepSeek V4.1 Flash, saved as `custom_openai`) as the default
+and two cards on one LAN llama-server (Qwen3.8-27b, Ling), at the 300 s / 3
+concurrent defaults. The causes, each verified in code, and what changed:
+
+- **No effort level on a delegate.** A delegate session carried no
+  `thinking_effort`, so it ran at the model's default — xhigh on the Qwen3.8
+  template. Kitty now sends each card's `delegate_effort`
+  (`effort::ladder::delegate_level`: `low`, else the lowest graded level, else
+  `on`; never off) and the orchestrator writes it as the child's level. The
+  reasoning-cap latch used to set the effort to `None`, which is the model's
+  default and so usually *more* thinking; it drops to the delegate level now.
+- **The final pass had no room.** `finalize_structured` asked for 1024-4096
+  tokens at no effort level; reasoning ate it, the JSON was truncated, both
+  passes failed and the run errored. It now runs at the delegate level with an
+  8192-token floor (bounded by the window), retries a truncated answer with
+  twice the room, and retries a transport error once instead of giving up.
+- **Anthropic's forced tool.** Opus 5.5, Sonnet 5.5 and Fable 5.1 return a 400
+  on `tool_choice` `any`/`tool`. Providers marked `anthropic_thinking:
+  "adaptive"` get `output_config.format` (structured outputs) beside
+  `output_config.effort` instead; older models keep the forced tool.
+- **No salvage.** A final-pass failure discarded the investigation; the
+  orchestrator now returns the delegate's last prose on the failure, as it
+  already did after a timeout.
+- **One slot for a hosted API.** Every `custom_openai` endpoint defaulted to
+  one request in flight, so the DashScope parent and its delegates ran single
+  file. The default now follows `hosted` (Kitty's `is_hosted_endpoint`: not
+  loopback, RFC 1918, Tailscale or `.local`), and the subagent picker no longer
+  scores a hosted parent's guessed slot count as sharing a KV slot — which had
+  pushed delegates onto the one-slot LAN server ahead of the hosted card.
+- **Per-delegate overhead.** Delegate sessions skip pathway, memorabilia and
+  pre-flight recall, and the post-turn compaction, learn and harvest passes.
+- **Smaller fixes.** A turn ending with tickets outstanding now cancels the
+  child turns too, not just the tasks waiting on them. Built-in specialists are
+  refreshed when their stored `builtin_version` is older (migration 028), which
+  also delivers the shared preamble to installs seeded before it. The locator's
+  prompt names `lean_shell_ro`, and its `tool_allow` now includes it. The
+  deadline reserve is `min(120 s, 2/5 of the budget)`, enough for the wrap-up
+  and both final passes.
+- **A per-chat switch.** The chat's ⋯ menu has a Specialists on/off switch
+  (`SpecialistsToggle`, default on; shown on desktop while specialists are on
+  in Settings, never on Android). Off writes `specialists_disabled: true` into
+  the engine session, which then leaves the three delegate tools out of that
+  chat's tool list. Resume reads it back; branch and fork copy the metadata.
+- **Delegation guidance as rules.** Small models delegated far too eagerly.
+  `call_specialist`'s description now says when to delegate (self-contained,
+  many tool calls, can run while the model works) and when never to (a single
+  lookup or read or command, anything answerable from the conversation, about
+  three tool calls or fewer, a follow-up to the user's last message), to do it
+  directly when unsure, and to batch independent pieces into one call. There
+  was no delegation text in the system prompt to change.
