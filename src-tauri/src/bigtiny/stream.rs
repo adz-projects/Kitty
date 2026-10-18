@@ -517,17 +517,7 @@ async fn session_card(
     client: &BigTinyClient,
     session_id: &str,
 ) -> Option<crate::config::providers::ProviderProfile> {
-    let session = client
-        .get_json(&format!("/api/chat/{session_id}"))
-        .await
-        .ok()?;
-    let meta = session
-        .get("metadata")
-        .or_else(|| session.get("session").and_then(|s| s.get("metadata")))?;
-    let meta: Value = match meta {
-        Value::String(s) => serde_json::from_str(s).ok()?,
-        other => other.clone(),
-    };
+    let meta = crate::bigtiny::sessions::metadata(client, session_id).await;
     let provider = meta.get("provider").and_then(|p| p.as_str())?.to_string();
     let state = app.state::<AppState>();
     let cfg = state.config.lock().unwrap();

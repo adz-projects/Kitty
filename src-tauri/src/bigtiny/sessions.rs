@@ -353,19 +353,66 @@ pub async fn set_specialists_disabled(
     Ok(())
 }
 
-/// A session's stored metadata, parsed.
-pub(crate) async fn metadata(client: &BigTinyClient, session_id: &str) -> Value {
-    let Ok(session) = client.get_json(&format!("/api/chat/{session_id}")).await else {
-        return Value::Null;
-    };
-    let meta = session
-        .get("metadata")
-        .or_else(|| session.get("session").and_then(|s| s.get("metadata")));
-    match meta {
+/// One session's row, as the engine's session list returns it.
+///
+/// The engine has no `GET /api/chat/{id}` — that path takes only PATCH
+/// (rename) and DELETE — so every read of one session's metadata or name that
+/// asked it got an error, and its callers quietly fell back to their
+/// defaults. The per-chat Specialists switch therefore always read back as
+/// "on", a resumed chat lost its pinned card and model, and the effort
+/// resolver's card fallback never found anything. The list route returns the
+/// same row, `metadata` included, so the session is found there: newest
+/// first, a page at a time, which in practice means the first page.
+///
+/// Top-level sessions only; the list leaves out delegate (child) sessions,
+/// which Kitty never needs to read this way.
+pub(crate) async fn session_row(client: &BigTinyClient, session_id: &str) -> Option<Value> {
+    const PAGE: usize = 500;
+    // 20k sessions — far beyond any real history, and only reached for a
+    // session that genuinely isn't there.
+    const MAX_PAGES: usize = 40;
+    if session_id.is_empty() {
+        return None;
+    }
+    for page in 0..MAX_PAGES {
+        let result = client
+            .get_json(&format!("/api/chat/?limit={PAGE}&offset={}", page * PAGE))
+            .await
+            .ok()?;
+        let rows = result.get("sessions")?.as_array()?;
+        if let Some(row) = find_row(rows, session_id) {
+            return Some(row.clone());
+        }
+        if rows.len() < PAGE {
+            return None;
+        }
+    }
+    None
+}
+
+/// Pure: the row for `session_id` among one page of list rows.
+pub(crate) fn find_row<'a>(rows: &'a [Value], session_id: &str) -> Option<&'a Value> {
+    rows.iter()
+        .find(|r| r.get("id").and_then(|v| v.as_str()) == Some(session_id))
+}
+
+/// Pure: a session row's `metadata`, which the engine stores (and may return)
+/// as a JSON string or as an object. `Null` when absent or unparseable.
+pub(crate) fn metadata_of(row: &Value) -> Value {
+    match row.get("metadata") {
         Some(Value::String(s)) => serde_json::from_str(s).unwrap_or(Value::Null),
         Some(v @ Value::Object(_)) => v.clone(),
         _ => Value::Null,
     }
+}
+
+/// A session's stored metadata, parsed. `Null` when the session can't be
+/// found or the engine can't be reached.
+pub(crate) async fn metadata(client: &BigTinyClient, session_id: &str) -> Value {
+    session_row(client, session_id)
+        .await
+        .map(|row| metadata_of(&row))
+        .unwrap_or(Value::Null)
 }
 
 /// Pure: one BigTiny session row -> a goosed-style `session/list` object
@@ -732,13 +779,10 @@ pub async fn fork_raw(
 
 /// A chat's title, "New Chat" until it has one.
 pub(crate) async fn title(client: &BigTinyClient, session_id: &str) -> String {
-    client
-        .get_json(&format!("/api/chat/{session_id}"))
+    session_row(client, session_id)
         .await
-        .ok()
         .and_then(|s| {
             s.get("name")
-                .or_else(|| s.get("session").and_then(|x| x.get("name")))
                 .and_then(|v| v.as_str())
                 .filter(|n| !n.is_empty())
                 .map(str::to_string)
@@ -862,6 +906,24 @@ mod tests {
         assert!(specialists_disabled_in(
             &json!({"specialists_disabled": true})
         ));
+    }
+
+    /// The engine has no single-session GET; a session is read from its list
+    /// row, whose `metadata` may come back as a string or an object.
+    #[test]
+    fn a_session_is_read_from_its_list_row() {
+        let rows = vec![
+            json!({"id": "a", "name": "First", "metadata": "{\"specialists_disabled\": true}"}),
+            json!({"id": "b", "name": "Second", "metadata": {"provider": "prof_1"}}),
+            json!({"id": "c", "name": "Third"}),
+        ];
+        let a = find_row(&rows, "a").unwrap();
+        assert!(specialists_disabled_in(&metadata_of(a)));
+        let b = find_row(&rows, "b").unwrap();
+        assert_eq!(metadata_of(b)["provider"], "prof_1");
+        assert_eq!(metadata_of(find_row(&rows, "c").unwrap()), Value::Null);
+        assert!(find_row(&rows, "missing").is_none());
+        assert_eq!(metadata_of(&json!({"metadata": "not json"})), Value::Null);
     }
 
     fn row(id: &str, role: &str) -> Value {

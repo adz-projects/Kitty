@@ -12,6 +12,12 @@ export function showSpecialistsToggle(android: boolean, enabledInSettings: boole
   return !android && enabledInSettings;
 }
 
+/** Last known setting per chat. The ⋯ menu unmounts this switch every time
+    it closes, so without it each reopen started from "on" until the engine
+    answered — the switch looked as if it hadn't kept the position it was
+    set to. */
+const known = new Map<string, boolean>();
+
 /** Per-chat on/off for specialists, in the chat's ⋯ menu beside the
     incognito switch. On by default. Off writes `specialists_disabled` into the
     engine session's metadata, and the engine then stops offering
@@ -22,7 +28,7 @@ export function SpecialistsToggle() {
   const sessionId = useChatStore((s) => s.sessionId);
   const android = isAndroid();
   const [enabledInSettings, setEnabledInSettings] = useState(false);
-  const [on, setOn] = useState(true);
+  const [on, setOn] = useState(() => (sessionId ? (known.get(sessionId) ?? true) : true));
 
   useEffect(() => {
     if (android) return;
@@ -38,14 +44,16 @@ export function SpecialistsToggle() {
     };
   }, [android]);
 
-  // The chat's own state: a new chat starts on, a resumed one says.
+  // The chat's own state: what we last knew for it, confirmed by the engine
+  // (a new chat starts on; a resumed one says what it was set to).
   useEffect(() => {
-    setOn(true);
+    setOn(sessionId ? (known.get(sessionId) ?? true) : true);
     if (!sessionId || android) return;
     let live = true;
     void ipc
       .getSessionSpecialists(sessionId)
       .then((v) => {
+        known.set(sessionId, v);
         if (live) setOn(v);
       })
       .catch(() => {});
@@ -60,10 +68,12 @@ export function SpecialistsToggle() {
     if (!sessionId) return;
     const next = !on;
     setOn(next);
+    known.set(sessionId, next);
     try {
       await ipc.setSessionSpecialists(sessionId, next);
     } catch {
       setOn(!next);
+      known.set(sessionId, !next);
     }
   };
 

@@ -273,28 +273,13 @@ async fn session_view(app: &AppHandle, session_id: &str) -> SessionView {
         }
     };
     let scheduled = match crate::bigtiny::client::ensure_client(app) {
-        Ok(client) => client
-            .get_json(&format!("/api/chat/{session_id}"))
+        Ok(client) => crate::bigtiny::sessions::metadata(&client, session_id)
             .await
-            .ok()
-            .and_then(|s| session_metadata(&s))
-            .is_some_and(|m| m.get("schedule_id").is_some_and(|v| !v.is_null())),
+            .get("schedule_id")
+            .is_some_and(|v| !v.is_null()),
         Err(_) => false,
     };
     SessionView { dirs, scheduled }
-}
-
-/// A session row's `metadata`, which the daemon returns as a JSON string or
-/// an object depending on the route.
-fn session_metadata(session: &Value) -> Option<Value> {
-    let meta = session
-        .get("metadata")
-        .or_else(|| session.get("session").and_then(|s| s.get("metadata")))?;
-    match meta {
-        Value::String(s) => serde_json::from_str(s).ok(),
-        Value::Object(_) => Some(meta.clone()),
-        _ => None,
-    }
 }
 
 /// `GET /api/chat/{id}/allowed_dirs` flattened: chat folder, working folder,
@@ -348,13 +333,5 @@ mod tests {
             ["C:/chats/c1", "D:/proj", "D:/old", "E:/a.pdf"]
         );
         assert!(grant_dirs(&json!({})).is_empty());
-    }
-
-    #[test]
-    fn metadata_is_read_whether_stringified_or_not() {
-        let as_string = json!({"metadata": "{\"schedule_id\":\"j1\"}"});
-        let as_object = json!({"session": {"metadata": {"schedule_id": "j1"}}});
-        assert_eq!(session_metadata(&as_string).unwrap()["schedule_id"], "j1");
-        assert_eq!(session_metadata(&as_object).unwrap()["schedule_id"], "j1");
     }
 }
