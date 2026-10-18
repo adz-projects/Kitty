@@ -1131,7 +1131,18 @@ export const useChatStore = create<ChatState>((set, get) => {
           providerHasTools: active ? active.tools_supported : true,
         });
         const cur = get();
-        if (active && cur.sessionId !== null) {
+        if (active && cur.sessionId === null && !cur.creatingSession) {
+          // A window with no chat yet (a fresh window, before its first
+          // message): show the picker for the card its first chat will use,
+          // as the badge already does. Picking a level creates the chat
+          // (`setThinkingEffort`).
+          try {
+            const thinkingEffort = await ipc.getCardEffort(active.id);
+            if (get().sessionId === null) set({ thinkingEffort });
+          } catch {
+            // keep whatever's showing
+          }
+        } else if (active && cur.sessionId !== null) {
           // A live session: its card or model may have just changed, so
           // re-derive the effort control — against the chat's own card,
           // which the backend resolves — so the picker appears/disappears/
@@ -1692,9 +1703,11 @@ export const useChatStore = create<ChatState>((set, get) => {
     },
 
     setThinkingEffort: async (value: string) => {
-      const sessionId = get().sessionId;
-      if (!sessionId) return;
+      let sessionId = get().sessionId;
       try {
+        // A window with no chat yet shows the picker too; choosing a level
+        // creates the chat first, the way picking a provider does.
+        if (!sessionId) sessionId = await get().ensureSession();
         const thinkingEffort = await ipc.setThinkingEffort(sessionId, value);
         set({ thinkingEffort });
       } catch (e) {
@@ -2250,7 +2263,11 @@ export const useChatStore = create<ChatState>((set, get) => {
       // resolves the chat's card itself.
       void onEffortDetected((payload) => {
         const s = get();
-        if (s.sessionId === null) return;
+        if (s.sessionId === null) {
+          // No chat yet: the picker shows the card a new chat would use.
+          if (!s.creatingSession) void get().refreshProvider();
+          return;
+        }
         if (s.sessionProviderId && s.sessionProviderId !== payload.provider_id) return;
         const sessionId = s.sessionId;
         void ipc

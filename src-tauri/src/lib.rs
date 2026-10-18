@@ -221,6 +221,7 @@ pub fn run() {
             commands::compact_session,
             commands::set_thinking_effort,
             commands::get_thinking_effort,
+            commands::get_card_effort,
             commands::redetect_effort,
             commands::redetect_effort_all,
             commands::read_file_any,

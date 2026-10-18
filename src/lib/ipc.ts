@@ -345,6 +345,10 @@ export const ipc = {
       detection lands, without a reload. `null` when there is no control. */
   getThinkingEffort: (sessionId: string) =>
     invoke<ThinkingEffort | null>('get_thinking_effort', { sessionId }),
+  /** The effort picker for a window with no chat yet, against the card its
+      first chat will use (`providerId`, else the default card). */
+  getCardEffort: (providerId: string | null) =>
+    invoke<ThinkingEffort | null>('get_card_effort', { providerId }),
   /** Re-detect one card's reasoning levels. The old ladder stays until the
       new detection succeeds; listen for `provider://effort-detected`. */
   redetectEffort: (providerId: string) => invoke<void>('redetect_effort', { providerId }),

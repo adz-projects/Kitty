@@ -66,7 +66,17 @@ pub struct EffortCaps {
     /// resolution re-detects even though the entry is young.
     #[serde(default)]
     pub stale: bool,
+    /// Which detection rules produced this entry ([`CAPS_FORMAT`]). An entry
+    /// from older rules is re-detected on next use, so a detection fix
+    /// reaches cards detected before it.
+    #[serde(default)]
+    pub format: u32,
 }
+
+/// Bump when detection learns something an existing entry may have missed.
+/// 1: catalog ladders without grades are refined from the HuggingFace
+/// template (Qwen3.8 Flash Next showed Off/On instead of xhigh/medium/low).
+pub const CAPS_FORMAT: u32 = 1;
 
 impl EffortCaps {
     pub fn has_control(&self) -> bool {
@@ -268,6 +278,7 @@ mod tests {
             source: EffortSource::OpenRouter,
             detected_at: 0,
             stale: false,
+            format: CAPS_FORMAT,
         };
         let opts = options(&caps);
         let got: Vec<(&str, u8)> = opts.iter().map(|o| (o.value.as_str(), o.stars)).collect();

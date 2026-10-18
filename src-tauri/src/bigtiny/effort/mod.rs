@@ -193,6 +193,26 @@ pub async fn thinking_effort_for_session(
     effort_view(&cfg, &card, &model, Some(session_id))
 }
 
+/// The picker for a chat that doesn't exist yet — a new window before its
+/// first message, which will be created on `card_id` (or the default card).
+/// Same resolution as a chat's, minus the chat's own choice: the level last
+/// used on this card+model, else the default.
+pub async fn card_effort(app: &AppHandle, card_id: Option<&str>) -> Option<ThinkingEffort> {
+    let card = match card_id {
+        Some(id) => id.to_string(),
+        None => {
+            let state = app.state::<AppState>();
+            let cfg = state.config.lock().unwrap();
+            cfg.active_provider_id.clone()?
+        }
+    };
+    ensure_caps(app, &card).await;
+    let state = app.state::<AppState>();
+    let cfg = state.config.lock().unwrap();
+    let model = card_model(&cfg, &card)?;
+    effort_view(&cfg, &card, &model, None)
+}
+
 /// Make sure a card has a ladder: detect now (awaited) when it has none, or
 /// in the background when the one it has is stale.
 pub async fn ensure_caps(app: &AppHandle, card_id: &str) {
@@ -206,7 +226,9 @@ pub async fn ensure_caps(app: &AppHandle, card_id: &str) {
             None => (true, false),
             Some(c) => (
                 false,
-                c.stale || now_unix() - c.detected_at > STALE_AFTER_SECS,
+                c.stale
+                    || c.format < ladder::CAPS_FORMAT
+                    || now_unix() - c.detected_at > STALE_AFTER_SECS,
             ),
         }
     };
@@ -224,16 +246,19 @@ pub async fn ensure_caps(app: &AppHandle, card_id: &str) {
 /// A detection that learns nothing (`Unknown` — endpoint down, nothing
 /// matched) leaves the stored ladder alone, so a failed re-detect never
 /// leaves a card worse off. Deduplicated per card: a second call while one
-/// is running returns at once.
+/// is running waits for that one rather than starting another, so a caller
+/// that reads the ladder next (a chat opening during the startup pass) sees
+/// its result instead of an empty entry.
 pub async fn detect_card(app: &AppHandle, card_id: &str) -> bool {
     let card = {
         let state = app.state::<AppState>();
-        if !state
+        let claimed = state
             .effort_detecting
             .lock()
             .unwrap()
-            .insert(card_id.to_string())
-        {
+            .insert(card_id.to_string());
+        if !claimed {
+            wait_for_detection(app, card_id).await;
             return false;
         }
         let cfg = state.config.lock().unwrap();
@@ -319,6 +344,25 @@ async fn run_detection(app: &AppHandle, card: &CardSnapshot) -> bool {
         }
     }
     changed
+}
+
+/// Wait (bounded) for another task's detection of `card_id` to finish. A
+/// detection is a handful of HTTP calls with their own timeouts, so 60 s is
+/// past any real one; the bound only guards against a wedged task.
+async fn wait_for_detection(app: &AppHandle, card_id: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while std::time::Instant::now() < deadline {
+        let busy = app
+            .state::<AppState>()
+            .effort_detecting
+            .lock()
+            .unwrap()
+            .contains(card_id);
+        if !busy {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 }
 
 /// [`detect_card`] in the background.
@@ -539,6 +583,7 @@ mod tests {
             source: EffortSource::OpenRouter,
             detected_at: 0,
             stale: false,
+            format: ladder::CAPS_FORMAT,
         }
     }
 

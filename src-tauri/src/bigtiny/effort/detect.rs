@@ -21,7 +21,7 @@
 
 use serde_json::Value;
 
-use super::ladder::{normalize_levels, EffortCaps, EffortSource, ON};
+use super::ladder::{normalize_levels, EffortCaps, EffortSource, CAPS_FORMAT, ON};
 use crate::openrouter::catalog::{
     match_in_catalog, normalize_model_id, OpenRouterCatalogEntry, OpenRouterReasoning,
 };
@@ -57,6 +57,7 @@ fn caps(levels: Vec<String>, can_disable: bool, source: EffortSource) -> EffortC
         source,
         detected_at: now_unix(),
         stale: false,
+        format: CAPS_FORMAT,
     }
 }
 
@@ -71,14 +72,17 @@ pub async fn detect(
         return Detection::Unknown;
     }
     let found = match card.provider_type.as_str() {
-        "openrouter" => exact_catalog_entry(model, catalog)
-            .or_else(|| match_in_catalog(model, catalog))
-            .and_then(|e| e.reasoning.as_ref())
-            .map(from_openrouter),
+        "openrouter" => {
+            match exact_catalog_entry(model, catalog).or_else(|| match_in_catalog(model, catalog)) {
+                Some(e) => from_catalog_entry(e).await,
+                None => None,
+            }
+        }
         "anthropic" => detect_anthropic(card, catalog, api_key).await,
-        "openai" | "fireworks" | "deepinfra" => match_in_catalog(model, catalog)
-            .and_then(|e| e.reasoning.as_ref())
-            .map(from_openrouter),
+        "openai" | "fireworks" | "deepinfra" => match match_in_catalog(model, catalog) {
+            Some(e) => from_catalog_entry(e).await,
+            None => None,
+        },
         "custom_openai" | "ollama" => detect_self_hosted(card, catalog, api_key).await,
         _ => None,
     };
@@ -113,6 +117,82 @@ pub fn from_openrouter(r: &OpenRouterReasoning) -> EffortCaps {
         };
     }
     caps(levels, can_disable, EffortSource::OpenRouter)
+}
+
+/// Whether a ladder offers any graded level (anything beyond a bare on/off).
+fn is_graded(c: &EffortCaps) -> bool {
+    c.levels.iter().any(|l| l != ON)
+}
+
+/// The catalog's ladder, refined by the model's own chat template when the
+/// catalog lists no grades.
+///
+/// OpenRouter describes some open-weights models only as "reasoning,
+/// optional" (`mandatory: false`, no `supported_efforts`; for Qwen3.8 Flash
+/// it adds `supports_max_tokens`), even when the model's chat template
+/// guards a real ladder — `('xhigh', 'medium', 'low')` in Qwen3.8 Flash
+/// Next's case. Trusting the catalog there offered only Off/On. When the entry
+/// names its HuggingFace repo, that repo's template is the better answer.
+pub async fn from_catalog_entry(e: &OpenRouterCatalogEntry) -> Option<EffortCaps> {
+    let base = from_openrouter(e.reasoning.as_ref()?);
+    if is_graded(&base) {
+        return Some(base);
+    }
+    let Some(repo) = e.hugging_face_id.as_deref() else {
+        return Some(base);
+    };
+    let template = hf_chat_template(repo)
+        .await
+        .and_then(|t| caps_from_template(&t, EffortSource::HuggingFace));
+    Some(refine_with_template(base, template))
+}
+
+/// Pure half of [`from_catalog_entry`]: take the template's graded ladder
+/// over an ungraded catalog one. Off stays offered only when both agree it
+/// can be — the catalog describes the hosted build, which may not let the
+/// template's toggle through, and a missing option beats a 400.
+pub fn refine_with_template(base: EffortCaps, template: Option<EffortCaps>) -> EffortCaps {
+    match template {
+        Some(t) if is_graded(&t) && !is_graded(&base) => EffortCaps {
+            can_disable: t.can_disable && base.can_disable,
+            ..t
+        },
+        _ => base,
+    }
+}
+
+/// A HuggingFace repo's chat template: `tokenizer_config.json`'s
+/// `chat_template`, else the `chat_template.jinja` file newer repos keep it
+/// in instead. `None` when neither is readable (a gated or missing repo).
+async fn hf_chat_template(repo: &str) -> Option<String> {
+    let client = crate::util::http_client();
+    let timeout = std::time::Duration::from_secs(10);
+    let config_url = format!("https://huggingface.co/{repo}/resolve/main/tokenizer_config.json");
+    if let Ok(resp) = client.get(&config_url).timeout(timeout).send().await {
+        if resp.status().is_success() {
+            if let Ok(v) = resp.json::<Value>().await {
+                // Usually a string; some repos carry a list of named
+                // templates, of which `default` is the chat one.
+                let t = v.get("chat_template").and_then(|t| match t {
+                    Value::String(s) => Some(s.clone()),
+                    Value::Array(list) => list
+                        .iter()
+                        .find(|x| x.get("name").and_then(|n| n.as_str()) == Some("default"))
+                        .and_then(|x| x.get("template")?.as_str().map(String::from)),
+                    _ => None,
+                });
+                if t.is_some() {
+                    return t;
+                }
+            }
+        }
+    }
+    let jinja_url = format!("https://huggingface.co/{repo}/resolve/main/chat_template.jinja");
+    let resp = client.get(&jinja_url).timeout(timeout).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    resp.text().await.ok().filter(|t| !t.trim().is_empty())
 }
 
 // ---------------------------------------------------------------- Anthropic
@@ -386,20 +466,10 @@ async fn detect_self_hosted(
 
     // 2. HuggingFace, when the model id looks like `owner/repo`.
     if let Some(repo) = hf_repo_id(&card.model) {
-        let hf_url = format!("https://huggingface.co/{repo}/resolve/main/tokenizer_config.json");
-        if let Ok(resp) = client
-            .get(&hf_url)
-            .timeout(std::time::Duration::from_secs(10))
-            .send()
-            .await
-        {
-            if let Ok(v) = resp.json::<Value>().await {
-                if let Some(tmpl) = v.get("chat_template").and_then(|t| t.as_str()) {
-                    read_a_template = true;
-                    if let Some(c) = caps_from_template(tmpl, EffortSource::HuggingFace) {
-                        return Some(c);
-                    }
-                }
+        if let Some(tmpl) = hf_chat_template(&repo).await {
+            read_a_template = true;
+            if let Some(c) = caps_from_template(&tmpl, EffortSource::HuggingFace) {
+                return Some(c);
             }
         }
     }
@@ -421,12 +491,12 @@ async fn detect_self_hosted(
         return Some(caps(Vec::new(), false, EffortSource::ChatTemplate));
     }
 
-    // 4. The OpenRouter entry for the same open-weights model.
-    if let Some(c) = catalog_for_self_hosted(&card.model, catalog)
-        .and_then(|e| e.reasoning.as_ref())
-        .map(from_openrouter)
-    {
-        return Some(c);
+    // 4. The OpenRouter entry for the same open-weights model (refined from
+    //    its HuggingFace template when the catalog lists no grades).
+    if let Some(e) = catalog_for_self_hosted(&card.model, catalog) {
+        if let Some(c) = from_catalog_entry(e).await {
+            return Some(c);
+        }
     }
 
     tracing::warn!(
@@ -556,6 +626,41 @@ mod tests {
         assert!(c.can_disable);
         // Mandatory with nothing to pick: no control.
         assert!(!from_openrouter(&r(&[], true)).has_control());
+    }
+
+    /// Qwen3.8 Flash Next: OpenRouter lists it as an ungraded toggle, its
+    /// template guards xhigh/medium/low — the template's ladder wins.
+    #[test]
+    fn an_ungraded_catalog_ladder_takes_the_templates_grades() {
+        let base = from_openrouter(&r(&[], false));
+        assert_eq!(base.levels, ["on"]);
+        let qwen = "{%- if enable_thinking is undefined or enable_thinking is true %}\
+                    {%- set resolved_reasoning_effort = reasoning_effort|default('xhigh') %}\
+                    {%- if resolved_reasoning_effort not in ('xhigh', 'medium', 'low') %}";
+        let t = caps_from_template(qwen, EffortSource::HuggingFace);
+        let got = refine_with_template(base.clone(), t);
+        assert_eq!(got.levels, ["low", "medium", "xhigh"]);
+        assert!(got.can_disable);
+        assert_eq!(got.source, EffortSource::HuggingFace);
+
+        // No template, or one with no grades: the catalog stands.
+        assert_eq!(refine_with_template(base.clone(), None).levels, ["on"]);
+        let toggle_only = caps_from_template("{% if enable_thinking %}", EffortSource::HuggingFace);
+        assert_eq!(refine_with_template(base, toggle_only).levels, ["on"]);
+
+        // A graded catalog ladder is never overridden.
+        let graded = from_openrouter(&r(&["high", "medium", "low"], true));
+        let t = caps_from_template(qwen, EffortSource::HuggingFace);
+        assert_eq!(
+            refine_with_template(graded, t).levels,
+            ["low", "medium", "high"]
+        );
+
+        // Mandatory on the hosted side keeps Off hidden even if the template
+        // has the toggle.
+        let mandatory = from_openrouter(&r(&[], true));
+        let t = caps_from_template(qwen, EffortSource::HuggingFace);
+        assert!(!refine_with_template(mandatory, t).can_disable);
     }
 
     #[test]

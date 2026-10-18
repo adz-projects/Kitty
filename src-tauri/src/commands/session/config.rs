@@ -28,6 +28,17 @@ pub async fn set_thinking_effort(
     Ok(crate::bigtiny::effort::thinking_effort_for_session(&app, &session_id).await)
 }
 
+/// The effort picker for a window with no chat yet: resolved against the card
+/// its first chat will use (`provider_id`, else the default card). Choosing a
+/// level creates the chat first (`ensureSession`), so this is read-only.
+#[tauri::command]
+pub async fn get_card_effort(
+    app: AppHandle,
+    provider_id: Option<String>,
+) -> Result<Option<ThinkingEffort>, String> {
+    Ok(crate::bigtiny::effort::card_effort(&app, provider_id.as_deref()).await)
+}
+
 /// Read the effort control for a chat, resolved against the chat's own card.
 /// The frontend calls this when the chat's card changes, or a detection for
 /// it lands, so the picker appears/disappears/re-scopes without a reload.
