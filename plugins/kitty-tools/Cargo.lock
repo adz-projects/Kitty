@@ -966,6 +966,7 @@ dependencies = [
  "base64",
  "calamine",
  "dirs",
+ "libc",
  "lopdf",
  "merman",
  "pdf-extract",

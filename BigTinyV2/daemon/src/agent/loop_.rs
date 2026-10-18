@@ -4609,6 +4609,29 @@ impl AgentLoop {
             }
         }
 
+        // Hard-deny any tool, read or write, aimed at the engine's own state
+        // under its data root (key, handshake, databases, grant files). The
+        // data root is an allowed directory, so containment below would let
+        // these through; see `sandbox::daemon_internal_path`.
+        if let Some(path) = crate::agent::sandbox::daemon_internal_path(&tool_args, &self.cache_dir)
+        {
+            tracing::warn!(session_id, tool_name, path, "denied a tool call on the engine's own state");
+            let err = format!(
+                "Tool {tool_name} denied: {path} is the engine's internal state, which no tool \
+                 may read or change"
+            );
+            let _ = event_tx.send(SSEEvent {
+                event_type: SSEEventType::ToolFinish,
+                tool_name: Some(tool_name),
+                tool_result: Some(err.clone()),
+                tool_call_id: Some(tool_call_id.clone()),
+                session_id: Some(session_id.to_string()),
+                is_error: Some(true),
+                ..Default::default()
+            });
+            return err;
+        }
+
         // Hard-deny a *write-class* tool that resolves to a path outside the
         // session's allowed directories — checked unconditionally, BEFORE the
         // HITL decision below. It only needs tool_name/args/allowed_dirs,

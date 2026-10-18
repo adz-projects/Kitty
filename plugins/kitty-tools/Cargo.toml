@@ -51,6 +51,11 @@ lopdf = { version = "0.42", default-features = false }
 pdf-extract = "0.12"
 merman = { git = "https://github.com/Latias94/merman", rev = "4262b166faa7dcfcbebbf58dd6ea3e2ccc3630f7", version = "0.8.0-alpha.4", default-features = false, features = ["svg"] }
 
+# `kill(2)` on a process group, so `lean_shell`'s timeout reaches the whole
+# tree a command started (`tools/shell.rs`). Already in the tree via tokio.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [profile.release]
 opt-level = "z"
 lto = "fat"

@@ -260,6 +260,67 @@ live recount.
 the daemon — and with it `id`, a database row identifier V1 had been sending to
 OpenAI and Anthropic on every turn.
 
+## Running on a Linux server
+
+The daemon has no desktop dependency; a headless Linux host runs the same
+binary Kitty spawns on Windows. Build it with a C toolchain present
+(`build-essential` on Ubuntu; SQLite and the TLS stack are compiled in, and
+there is no OpenSSL dependency):
+
+```bash
+cd BigTinyV2/daemon
+cargo build --release --features litert-embed --bin bigtiny2-daemon
+```
+
+`litert-embed` is only needed for the memory engines (see below);
+`litert-engine` adds nothing on Linux, since the local summarizer is
+Windows-only and compaction uses the chat's own provider, as on Android.
+
+What differs from Windows, and what to set:
+
+- **Data directory.** `BIGTINYV2_DATA_DIR` (default `~/.bigtiny-v2`). The
+  daemon makes it `0700` and writes its key file and handshake `0600`, so run
+  it as a dedicated user and only that user can read either.
+- **The at-rest key** is a hex file there (`encryption.key`), not
+  DPAPI-sealed. To keep it off disk, pass it as `BIGTINYV2_ENCRYPTION_KEY`
+  (64 hex chars), e.g. from a systemd credential or a root-only
+  `EnvironmentFile`.
+- **Lifetime.** Pass `--no-idle-exit` so the daemon stays up. Under systemd,
+  `Restart=always` also covers `POST /api/admin/restart`, which only exits.
+- **Network.** It listens on `127.0.0.1:8080` over plain HTTP, and the app key
+  travels as a header. Keep it on loopback behind a TLS reverse proxy, or
+  reach it over Tailscale; do not bind `--host 0.0.0.0` on an open network.
+- **Registering a client.** `daemon.json` holds the per-launch registration
+  token (`POST /api/apps/register`, see [API.md](API.md)). Being owner-only,
+  it is read by a client running as the daemon's user, or by an operator who
+  hands the token over once; the issued key survives restarts.
+- **Built-in tools.** Register them as `in_process` servers, which links them
+  into the daemon and needs no separate binaries: `POST /api/mcp/servers`
+  with `{"name": "kitty-tools", "transport": "in_process", "command":
+  "kitty-tools", "enabled": true}`, and likewise `kitty-web`, `kitty-wasm`,
+  `specialists`, `pathway` and `memorabilia` (`mcp/builtin.rs`). `lean_shell`
+  runs `/bin/sh -c` in its own process group, so a timeout kills everything it
+  started. kitty-wasm downloads its CPython guest on first use (or set
+  `KITTY_WASM_PYTHON` in the row's `env`).
+- **Memory engines** need a Linux build of the LiteRT runtime and the
+  EmbeddingGemma files, pointed at by `BIGTINY_LITERT__ENABLED=1`,
+  `BIGTINY_LITERT__LIB_PATH` (`libLiteRt.so`),
+  `BIGTINY_LITERT__EMBED_MODEL_PATH` and `BIGTINY_LITERT__TOKENIZER_PATH`.
+  Without them chat is unaffected and memory is off.
+
+```ini
+# /etc/systemd/system/bigtiny.service
+[Service]
+User=bigtiny
+Environment=BIGTINYV2_DATA_DIR=/var/lib/bigtiny
+EnvironmentFile=/etc/bigtiny/env
+ExecStart=/opt/bigtiny/bigtiny2-daemon --no-idle-exit
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
 ## Tests
 
 ```bash

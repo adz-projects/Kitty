@@ -12,6 +12,7 @@ pub mod mcp;
 pub mod models;
 pub mod network;
 pub mod plugins;
+pub mod private_fs;
 pub mod provider;
 pub mod routes;
 pub mod scheduler;
@@ -90,6 +91,16 @@ pub struct RunOptions {
 /// order Python does (scheduler -> agent -> mcp), db pool dropped last via
 /// `SqlitePool`'s own `Drop`.
 pub async fn run(config: BigTinyConfig, options: RunOptions) -> Result<(), DaemonError> {
+    // Owner-only before anything is written into it (see `private_fs`). A
+    // failure is logged rather than fatal: a host-supplied directory we may
+    // write to but not chmod should not stop the daemon; the key file and the
+    // handshake are still created `0600` on their own.
+    if !options.data_dir.is_empty() {
+        if let Err(e) = private_fs::ensure_private_dir(std::path::Path::new(&options.data_dir)) {
+            tracing::warn!("could not restrict data dir {} to its owner: {e}", options.data_dir);
+        }
+    }
+
     // Must run before anything below that might decrypt a stored value
     // (`router.load_providers`, `mcp.connect_all`).
     crypto::init(

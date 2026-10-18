@@ -26,8 +26,12 @@
 //! taken off the machine, or read by another user, does not carry a usable
 //! key alongside the ciphertext it protects. A plaintext `encryption.key`
 //! left by an earlier version is sealed and then removed the first time it
-//! is read. Other platforms keep the hex file: Android supplies its key by
-//! env from the platform keystore, and nothing else ships there.
+//! is read. Other platforms keep the hex file, created `0600` inside a `0700`
+//! data directory (`private_fs`), which is the protection a Unix account
+//! gives its own files. A Linux service that wants the key off disk entirely
+//! passes it by env (`BIGTINYV2_ENCRYPTION_KEY`, e.g. from a systemd
+//! credential); Android supplies its key that way from the platform
+//! keystore.
 
 use std::path::{Path, PathBuf};
 
@@ -219,17 +223,14 @@ fn read_stored_key(data_dir: &Path) -> Result<Option<[u8; KEY_LEN]>, DaemonError
 /// the destination and renamed over it, so a crash never leaves a truncated
 /// key file (which would read as a malformed key and stop the daemon).
 fn write_stored_key(data_dir: &Path, key: &[u8; KEY_LEN]) -> Result<(), DaemonError> {
-    std::fs::create_dir_all(data_dir)?;
+    crate::private_fs::ensure_private_dir(data_dir)?;
     #[cfg(windows)]
     let contents = dpapi::protect(key)
         .map_err(|e| DaemonError::Crypto(format!("could not seal the encryption key: {e}")))?;
     #[cfg(not(windows))]
     let contents = hex_encode(key).into_bytes();
 
-    let dest = key_file_path(data_dir);
-    let tmp = dest.with_extension("tmp");
-    std::fs::write(&tmp, contents)?;
-    std::fs::rename(&tmp, &dest)?;
+    crate::private_fs::write_private_atomic(&key_file_path(data_dir), &contents)?;
     Ok(())
 }
 
@@ -478,6 +479,19 @@ mod tests {
         let first = load_or_create_key_file(&dir).unwrap();
         assert!(key_file_path(&dir).is_file());
         assert_eq!(load_or_create_key_file(&dir).unwrap(), first);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Unix: the hex key file is owner-only, and so is the directory it is in.
+    #[cfg(unix)]
+    #[test]
+    fn the_key_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_data_dir("perms");
+        load_or_create_key_file(&dir).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&key_file_path(&dir)), 0o600);
+        assert_eq!(mode(&dir), 0o700);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

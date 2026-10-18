@@ -60,46 +60,93 @@ fn norm(path: &str) -> String {
 
 /// True if `target` lexically resolves inside at least one of `bases`.
 pub fn path_within_any(bases: &[String], target: &str) -> bool {
+    bases.iter().filter(|b| !b.is_empty()).any(|base| {
+        let b = norm(base);
+        let resolved = lexical_resolve(&b, target);
+        resolved == b || resolved.starts_with(&format!("{b}/"))
+    })
+}
+
+/// `target` with `.`/`..` folded away, joined onto `base` (already `norm`ed)
+/// when it is relative, and `norm`ed itself. Purely lexical: no filesystem
+/// access, so a path that does not exist yet (a write) resolves too.
+fn lexical_resolve(base: &str, target: &str) -> String {
     let t = target.replace('\\', "/");
     let is_absolute = ABSOLUTE_DRIVE_RE.is_match(&t) || t.starts_with("/");
+    let candidate = if is_absolute {
+        t
+    } else {
+        format!("{base}/{t}")
+    };
 
-    for base in bases {
-        if base.is_empty() {
-            continue;
-        }
-        let b = norm(base);
-        let candidate = if is_absolute {
-            t.clone()
-        } else {
-            format!("{b}/{t}")
-        };
+    let (drive, rest) = if HAS_DRIVE_RE.is_match(&candidate) {
+        (&candidate[..2], &candidate[2..])
+    } else {
+        (&candidate[..0], &candidate[..])
+    };
 
-        let has_drive = HAS_DRIVE_RE.is_match(&candidate);
-        let (drive, rest) = if has_drive {
-            (&candidate[..2], &candidate[2..])
-        } else {
-            let d = &candidate[..0];
-            let r = &candidate[..];
-            (d, r)
-        };
-
-        let mut stack: Vec<&str> = Vec::new();
-        for seg in rest.split("/") {
-            match seg {
-                "" | "." => continue,
-                ".." => {
-                    stack.pop();
-                }
-                s => stack.push(s),
+    let mut stack: Vec<&str> = Vec::new();
+    for seg in rest.split("/") {
+        match seg {
+            "" | "." => continue,
+            ".." => {
+                stack.pop();
             }
-        }
-
-        let resolved = norm(&format!("{drive}/{}", stack.join("/")));
-        if resolved == b || resolved.starts_with(&format!("{b}/")) {
-            return true;
+            s => stack.push(s),
         }
     }
-    false
+    norm(&format!("{drive}/{}", stack.join("/")))
+}
+
+/// The first path a tool call names that is the engine's own state under its
+/// data root, if any: the at-rest key, the handshake (whose registration
+/// token reclaims any app's key), a SQLite database (every app's sessions,
+/// beliefs and memories, and the sealed provider keys), or an app's
+/// `allowed-dirs.json` (writing which would grant the model new folders).
+///
+/// The data root itself is an allowed directory, because chat folders and
+/// caches live under it, so containment alone admits all of these. They are
+/// never legitimate tool targets, read or write, and a model that reaches for
+/// one is following an injected instruction rather than the user, so the
+/// caller denies outright instead of asking. Off Windows the key file is
+/// plain hex, which makes this the difference between "a model can read a
+/// file" and "a model can decrypt every stored provider key".
+///
+/// Best-effort like the rest of this module: it sees the same path-shaped
+/// arguments and shell tokens `check_containment` does, and no more.
+pub fn daemon_internal_path(args: &Value, data_dir: &str) -> Option<String> {
+    if data_dir.trim().is_empty() {
+        return None;
+    }
+    let root = norm(data_dir);
+    let mut candidates = extract_candidate_paths(args);
+    for key in &["command", "cmd", "script"] {
+        if let Some(value) = args.get(*key).and_then(|v| v.as_str()) {
+            candidates.extend(extract_shell_paths(value));
+        }
+    }
+    candidates.into_iter().find(|candidate| {
+        // Only absolute paths: a relative one is relative to the session's
+        // working folder (`qualify_relative_path_args` has already made the
+        // known path arguments absolute), not to the data root.
+        let t = candidate.replace('\\', "/");
+        if !(ABSOLUTE_DRIVE_RE.is_match(&t) || t.starts_with('/')) {
+            return false;
+        }
+        let resolved = lexical_resolve(&root, candidate);
+        let Some(inner) = resolved.strip_prefix(&format!("{root}/")) else {
+            return false;
+        };
+        // Already case-folded on Windows by `norm`; exact elsewhere, where
+        // `ENCRYPTION.KEY` would be a different file.
+        let name = inner.rsplit('/').next().unwrap_or(inner);
+        let at_root = !inner.contains('/');
+        (at_root && (name.starts_with("encryption.key") || name.starts_with("daemon.json")))
+            || name == "allowed-dirs.json"
+            || [".db", ".db-wal", ".db-shm", ".db-journal"]
+                .iter()
+                .any(|ext| name.ends_with(ext))
+    })
 }
 
 /// Structured-argument paths a tool call is asking to touch. Only covers
@@ -569,6 +616,37 @@ mod tests {
             resolve_home(env),
             Some(std::path::PathBuf::from(r"C:\Users\someone"))
         );
+    }
+
+    #[test]
+    fn the_engines_own_files_are_recognized() {
+        let root = "/srv/bigtiny";
+        let hit = |args: serde_json::Value| daemon_internal_path(&args, root);
+        for path in [
+            "/srv/bigtiny/encryption.key",
+            "/srv/bigtiny/encryption.key.dpapi",
+            "/srv/bigtiny/daemon.json",
+            "/srv/bigtiny/bigtiny.db",
+            "/srv/bigtiny/bigtiny.db-wal",
+            "/srv/bigtiny/apps/kitty/pathway.db",
+            "/srv/bigtiny/apps/kitty/allowed-dirs.json",
+            "/srv/bigtiny/apps/kitty/chats/../../../encryption.key",
+        ] {
+            assert_eq!(hit(json!({"path": path})).as_deref(), Some(path), "{path}");
+        }
+        assert!(hit(json!({"command": "cat /srv/bigtiny/encryption.key"})).is_some());
+
+        // The chat folders and caches under the same root stay reachable.
+        for path in [
+            "/srv/bigtiny/apps/kitty/chats/notes.md",
+            "/srv/bigtiny/apps/kitty/plugin-home/daemon.json",
+            "/srv/bigtiny/daemon.log",
+            "/home/user/project/app.db",
+            "/srv/bigtiny-other/encryption.key",
+        ] {
+            assert_eq!(hit(json!({"path": path})), None, "{path}");
+        }
+        assert_eq!(daemon_internal_path(&json!({"path": "/x/encryption.key"}), ""), None);
     }
 
     #[test]

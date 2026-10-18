@@ -1,10 +1,12 @@
-# Kitty's CI. Four jobs, each guarding a different way a release has broken
+# Kitty's CI. Each job guards a different way a release has broken
 # before:
 #
 # - frontend: lint (eslint + prettier), vitest, and the version lockstep check.
 # - rust:     clippy -D warnings and `cargo test` for every crate Kitty ships,
 #             one matrix leg per crate (they are separate Cargo workspaces).
-# - bundle:   a real `tauri build` of the Windows installer, and a real
+#             `rust-linux` repeats it on Ubuntu for the engine and plugins,
+#             which also ship as a headless Linux service.
+# - bundle:  a real `tauri build` of the Windows installer, and a real
 #             `tauri android build` of the AAB. A type-check alone missed the
 #             Android lane rotting for two releases (see git history of the
 #             android.yml this replaces).
@@ -102,6 +104,45 @@ jobs:
       - name: clippy
         working-directory: ${{ matrix.crate }}
         run: cargo clippy --locked --all-targets -- -D warnings
+      - name: test
+        working-directory: ${{ matrix.crate }}
+        run: cargo test --locked
+
+  # The engine and its plugins also run as a headless Linux service
+  # (BigTinyV2/README.md, "Running on a Linux server"). The Android leg
+  # compiles the same `not(windows)` code but never runs its tests, and
+  # Linux-only behaviour (owner-only data files, the shell's process-group
+  # kill) is only exercised here.
+  rust-linux:
+    name: rust linux (${{ matrix.crate }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        crate:
+          - BigTinyV2/protocol
+          - BigTinyV2/client
+          - BigTinyV2/daemon
+          - plugins/kitty-tools
+          - plugins/kitty-web
+          - plugins/kitty-wasm
+          - plugins/adaptive-pathway_rust
+          - plugins/memorabilia_rust
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ matrix.crate }}
+      - name: clippy
+        working-directory: ${{ matrix.crate }}
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: clippy (daemon, LiteRT embeddings)
+        if: matrix.crate == 'BigTinyV2/daemon'
+        working-directory: ${{ matrix.crate }}
+        run: cargo clippy --locked --all-targets --features litert-embed -- -D warnings
       - name: test
         working-directory: ${{ matrix.crate }}
         run: cargo test --locked

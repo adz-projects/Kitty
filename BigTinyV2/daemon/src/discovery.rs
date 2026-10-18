@@ -72,21 +72,26 @@ pub fn build(
     }
 }
 
-/// Write the handshake atomically.
+/// Write the handshake atomically, readable by its owner only.
 ///
 /// Write-then-rename rather than write-in-place: a client can read this file at
 /// any moment, and a torn read would look like corruption. The client tolerates
 /// corruption (it treats it as absent), but making that path unreachable is
-/// cheaper than relying on it.
+/// cheaper than relying on it. Owner-only because the registration token in it
+/// reclaims any app's key (`private_fs`); on Unix that means a client must run
+/// as the daemon's user, or be handed the token by someone who can.
 pub async fn publish(data_dir: &Path, handshake: &Handshake) -> std::io::Result<()> {
-    tokio::fs::create_dir_all(data_dir).await?;
     let final_path = handshake_path(data_dir);
-    let tmp_path = final_path.with_extension("json.tmp");
-
     let json = serde_json::to_vec_pretty(handshake)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    tokio::fs::write(&tmp_path, &json).await?;
-    tokio::fs::rename(&tmp_path, &final_path).await?;
+    let dir = data_dir.to_path_buf();
+    let path = final_path.clone();
+    tokio::task::spawn_blocking(move || {
+        crate::private_fs::ensure_private_dir(&dir)?;
+        crate::private_fs::write_private_atomic(&path, &json)
+    })
+    .await
+    .map_err(std::io::Error::other)??;
     tracing::info!("published handshake at {final_path:?}");
     Ok(())
 }

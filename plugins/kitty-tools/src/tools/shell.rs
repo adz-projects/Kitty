@@ -16,17 +16,19 @@
 //!   `tokio::time::timeout` fires and the child future is dropped, tokio
 //!   kills the process instead of leaking it (Python's `subprocess.run` with
 //!   `timeout=` kills on expiry). On timeout the whole process **tree** is
-//!   additionally killed (`taskkill /T /F` on Windows) — `kill_on_drop`
-//!   alone reaps only the direct `cmd.exe`, orphaning any grandchildren it
+//!   additionally killed — `taskkill /T /F` on Windows, a `SIGKILL` to the
+//!   child's own process group elsewhere — since `kill_on_drop` alone reaps
+//!   only the direct `cmd.exe` / `sh`, orphaning any grandchildren it
 //!   spawned (audit #117).
 //! - stdout/stderr are streamed through a bounded capture
 //!   (`SHELL_MAX_CAPTURE_BYTES`) rather than fully buffered by
 //!   `wait_with_output`, so a command spewing hundreds of MB can't blow RAM
 //!   before the response's 100-line cut.
 //!
-//! Non-Windows builds get a plain `/bin/sh -c` fallback below (no MSVC
-//! `raw_arg` quoting trap, no console window to suppress) so the crate can
-//! at least type-check and run on Linux/macOS dev machines. This tool is not
+//! Non-Windows builds run `/bin/sh -c` (no MSVC `raw_arg` quoting trap, no
+//! console window to suppress), in a process group of its own so a timeout
+//! can kill everything the command started. This is the shell a Linux
+//! server deployment uses. This tool is not
 //! registered at all on Android (see `server.rs`'s `shell_tool_router` /
 //! `KittyToolsServer::new`) — an app-sandbox shell backed by toybox isn't a
 //! useful `lean_shell` for a model to drive, and it's the tool with the
@@ -34,6 +36,8 @@
 //! the daemon side, which itself fails open for argument shapes it doesn't
 //! recognize.
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt as _;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::process::Stdio;
@@ -146,6 +150,11 @@ async fn shell_impl(
     let mut std_cmd = {
         let mut c = std::process::Command::new("/bin/sh");
         c.arg("-c").arg(command);
+        // Its own process group, led by the shell (pgid == its pid), so the
+        // timeout path can signal every process the command started, however
+        // deep, with one `kill(-pgid)`.
+        #[cfg(unix)]
+        c.process_group(0);
         c
     };
     if let Some(dir) = cwd.filter(|d| !d.trim().is_empty()) {
@@ -218,10 +227,11 @@ async fn shell_impl(
             (finish(output, out_truncated || err_truncated), pid)
         }
         Err(_) => {
-            // `kill_on_drop` reaps only the direct `cmd.exe`; take down the
-            // whole tree so grandchildren don't outlive the timeout (audit
+            // `kill_on_drop` reaps only the direct `cmd.exe` / `sh`; take down
+            // the whole tree so grandchildren don't outlive the timeout (audit
             // #117). This runs *before* the child is dropped, while the root
-            // is still alive for `taskkill /T` to walk from.
+            // is still alive for `taskkill /T` to walk from (on Unix the
+            // process group outlives its leader, so order matters less).
             if let Some(pid) = pid {
                 kill_process_tree(pid).await;
             }
@@ -258,15 +268,24 @@ async fn kill_process_tree(pid: u32) {
     let _ = tokio::process::Command::from(cmd).status().await;
 }
 
-/// Non-Windows fallback: the child is `/bin/sh -c`, which typically `exec`s
-/// simple commands — so `kill_on_drop` already reaps the real process, and
-/// there is no detached grandchild tree in the common case. A true tree
-/// kill would need the child in its own process group (`setsid` at spawn)
-/// followed by a group `kill`; not set up today, so this is documented
-/// rather than half-done.
-#[cfg(not(windows))]
+/// Unix: the shell was spawned as the leader of its own process group (see
+/// `process_group(0)` above), so `SIGKILL` to `-pid` reaches it and every
+/// descendant that has not deliberately left the group (`setsid`, a daemon
+/// double-fork). Unlike `taskkill /T` this still works after the leader has
+/// exited, because the group lives on while any member does. `ESRCH` (the
+/// group is already gone) is the expected race with `kill_on_drop` and is
+/// ignored.
+#[cfg(unix)]
 async fn kill_process_tree(pid: u32) {
-    let _ = pid;
+    let Ok(pgid) = libc::pid_t::try_from(pid) else {
+        return;
+    };
+    // SAFETY: `kill` has no memory-safety preconditions; a negative pid
+    // addresses a process group. `pgid` is a pid we spawned, never 0 or 1,
+    // so this cannot signal our own group or every process we may signal.
+    unsafe {
+        libc::kill(-pgid, libc::SIGKILL);
+    }
 }
 
 fn finish(output: std::process::Output, capture_truncated: bool) -> String {
@@ -407,6 +426,40 @@ mod tests {
             leaked.is_empty(),
             "grandchild ping process(es) leaked past the timeout: {leaked:?}"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn timeout_kills_the_whole_process_group() {
+        // The Unix half of audit #117: a backgrounded grandchild (`sleep &`)
+        // is not the shell's direct child, so `kill_on_drop` alone would leave
+        // it running. The marker file names its pid so the test can check it
+        // without scanning the process table.
+        let dir = std::env::temp_dir().join(format!("kitty-shell-pg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("grandchild.pid");
+        let cmd = format!("sleep 60 & echo $! > '{}'; wait", marker.display());
+
+        let (response, _) = shell_impl(&cmd, false, Duration::from_millis(500), None).await;
+        let v: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(v["error_code"], "SHELL_TIMEOUT", "{v}");
+
+        let grandchild: u32 = std::fs::read_to_string(&marker)
+            .expect("the shell wrote the grandchild's pid")
+            .trim()
+            .parse()
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // A killed grandchild is reparented to init and reaped there; until
+        // then it is a zombie, which is dead for our purposes.
+        let state = std::fs::read_to_string(format!("/proc/{grandchild}/stat")).unwrap_or_default();
+        let alive = state
+            .rsplit(')')
+            .next()
+            .and_then(|rest| rest.split_whitespace().next())
+            .is_some_and(|s| s != "Z");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!alive, "grandchild {grandchild} survived the timeout: {state}");
     }
 
     #[cfg(windows)]

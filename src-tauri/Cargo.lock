@@ -3730,6 +3730,7 @@ dependencies = [
  "base64 0.22.1",
  "calamine",
  "dirs 5.0.1",
+ "libc",
  "lopdf",
  "merman",
  "pdf-extract",
