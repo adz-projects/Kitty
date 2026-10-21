@@ -121,6 +121,19 @@ pub fn group_of<'a>(catalog: &'a [ToolGroup], tool: &str) -> Option<&'a ToolGrou
     catalog.iter().find(|g| !g.always && g.matches(tool))
 }
 
+/// The gateable groups an attached file's type loads outright, whatever the
+/// decision model says. `files` are paths or file names.
+pub fn groups_for_files<'a>(
+    catalog: &[ToolGroup],
+    files: impl IntoIterator<Item = &'a str> + Clone,
+) -> BTreeSet<String> {
+    gateable(catalog)
+        .into_iter()
+        .filter(|g| files.clone().into_iter().any(|f| g.takes_file(f)))
+        .map(|g| g.name.clone())
+        .collect()
+}
+
 /// One yes/no question per group, named by the group.
 pub fn questions<'a>(groups: impl IntoIterator<Item = &'a ToolGroup>) -> Vec<(String, Question)> {
     groups
@@ -233,6 +246,7 @@ mod tests {
             description: format!("{name} work"),
             tools: tools.iter().map(|s| s.to_string()).collect(),
             always,
+            file_types: vec![],
         };
         vec![
             g("core", &["lean_file_*"], true),
@@ -366,6 +380,18 @@ mod tests {
             a.input_schema["properties"]["group"]["enum"],
             json!(["office", "web", "viz"])
         );
+    }
+
+    #[test]
+    fn attached_file_types_load_their_group() {
+        let mut cat = catalog();
+        cat[1].file_types = vec![".pdf".into(), ".DOCX".into()];
+        let files = ["C:\\Users\\a\\Report.Docx", "notes.txt"];
+        assert_eq!(groups_for_files(&cat, files), set(&["office"]));
+        assert!(groups_for_files(&cat, ["a.txt"]).is_empty());
+        // An `always` group is never "loaded" by a file: it is always on.
+        cat[0].file_types = vec![".txt".into()];
+        assert_eq!(groups_for_files(&cat, ["a.txt"]), BTreeSet::new());
     }
 
     #[test]

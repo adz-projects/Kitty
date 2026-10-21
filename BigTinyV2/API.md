@@ -337,14 +337,17 @@ dialect, a bad URL or duplicate group names); `DELETE` removes it.
                "compaction": true},
   "thresholds": {"tool_gating_add": 0.6},
   "tool_groups": [{"name": "office", "description": "reading Word, Excel or PDF",
-                   "tools": ["lean_word_*", "lean_pdf_*"], "always": false}],
+                   "tools": ["lean_word_*", "lean_pdf_*"], "always": false,
+                   "file_types": [".docx", ".pdf"]}],
   "cache_ttl_secs": 300
 }
 ```
 
 A missing feature is off. `thresholds` needs only the overrides; the rest take
 the defaults. `tool_groups` is the app's own catalog (a trailing `*` matches a
-prefix); a tool in no group is never gated. `page_classify` and
+prefix); a tool in no group is never gated. A group's `file_types` load it
+outright when a file of that type is attached (the message's `Files provided by
+the user:` list, or on a chat's first turn its `attached_paths`). `page_classify` and
 `search_rerank` are read by the app's web tools, not the engine.
 
 `GET /api/apps/me/decider/stats` → `{features: {name: {calls, answered,

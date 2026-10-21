@@ -319,7 +319,8 @@ fn parse_marker_blocks(region: &str) -> Vec<(String, String)> {
 }
 
 /// Absolute paths from the `Files provided by the user:\n- <path>` block.
-fn parse_file_paths(content: &str) -> Vec<String> {
+/// Also read by the tool gate, whose attachment rule needs the same list.
+pub(crate) fn parse_file_paths(content: &str) -> Vec<String> {
     let Some(idx) = content.find(FILES_HEADER) else {
         return Vec::new();
     };

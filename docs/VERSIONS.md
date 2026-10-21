@@ -63,7 +63,7 @@ Added for the next daemon release (decision model, Settings → Decision model):
 | Surface | Used for |
 |---|---|
 | `GET/PUT/DELETE /api/apps/me/decider`, `/stats`, `/probe` | Per-app decision-model endpoint, feature switches, thresholds and Kitty's tool-group catalog (`lifecycle/decider.rs`) |
-| session metadata `tool_gate`; loop-only `load_tool_group` | Per-chat tool sets that only grow while the prompt cache is warm |
+| session metadata `tool_gate`; loop-only `load_tool_group`; tool group `file_types` | Per-chat tool sets that only grow while the prompt cache is warm; attachments load their group |
 | `metadata.usage[].cache_read_tokens` / `cache_creation_tokens` (incl. llama-server `timings.cache_n`) | Measuring prompt-cache hit rate |
 | kitty-web row env `KITTY_DECIDER_URL` / `_DIALECT` / `_FEATURES` / `_THRESHOLDS`; scrape codes `SCRAPE_CHALLENGE`, `SCRAPE_PAYWALL`, `SCRAPE_ERROR_PAGE`; search diagnostics `engines.rerank` | The two web checks |
 

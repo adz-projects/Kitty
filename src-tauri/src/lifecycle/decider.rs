@@ -34,11 +34,14 @@ pub fn tool_groups() -> Value {
             "name": "office",
             "description": "reading or writing Word, Excel or PDF documents",
             "tools": ["lean_word_*", "lean_excel_*", "lean_pdf_*"],
+            // An attached file of these types loads the group outright.
+            "file_types": [".docx", ".doc", ".xlsx", ".xls", ".xlsm", ".csv", ".pdf"],
         },
         {
             "name": "image",
             "description": "looking at an image or screenshot file",
             "tools": ["lean_read_image"],
+            "file_types": [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"],
         },
         {
             "name": "viz",
@@ -54,6 +57,11 @@ pub fn tool_groups() -> Value {
             "name": "code_exec",
             "description": "running Python or other code to compute or test something",
             "tools": ["wasm_*"],
+            // Always on: the chat model reaches for Python to compute things
+            // no message asks for in so many words (power and noise estimates,
+            // a deploy script) -- four of nine misses in a replay of 17 real
+            // chats, for three tool schemas.
+            "always": true,
         },
     ])
 }
@@ -155,6 +163,20 @@ mod tests {
         assert_eq!(d["features"]["compaction"], false);
         assert_eq!(d["features"]["tool_gating"], true);
         assert!(d["tool_groups"].as_array().unwrap().len() >= 5);
+        let group = |name: &str| {
+            d["tool_groups"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|g| g["name"] == name)
+                .cloned()
+                .unwrap()
+        };
+        assert_eq!(group("code_exec")["always"], true);
+        assert!(group("office")["file_types"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(".docx")));
     }
 
     #[test]

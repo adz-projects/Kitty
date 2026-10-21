@@ -582,25 +582,28 @@ const GATE_RECENT_MESSAGES: i64 = 6;
 /// The state text for a new chat's tool decision: its first message and the
 /// names of any files attached to it (a `.xlsx` says more than the prose).
 fn new_chat_state(metadata: &Value, user_message: &str) -> String {
-    let files: Vec<String> = metadata
-        .get("attached_paths")
-        .and_then(|v| v.as_array())
-        .into_iter()
-        .flatten()
-        .filter_map(|v| v.as_str())
+    let files: Vec<String> = attached_paths(metadata)
+        .iter()
         .filter_map(|p| std::path::Path::new(p).file_name())
         .map(|f| f.to_string_lossy().into_owned())
         .collect();
     if files.is_empty() {
         user_message.to_string()
     } else {
-        format!(
-            "{user_message}
-
-Attached files: {}",
-            files.join(", ")
-        )
+        format!("{user_message}\n\nAttached files: {}", files.join(", "))
     }
+}
+
+/// The session's `attached_paths` metadata.
+fn attached_paths(metadata: &Value) -> Vec<String> {
+    metadata
+        .get("attached_paths")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_str())
+        .map(str::to_string)
+        .collect()
 }
 
 async fn persist_gate_state(pool: &SqlitePool, session_id: &str, state: &tool_gate::GateState) {
@@ -2097,6 +2100,14 @@ impl AgentLoop {
             .and_then(|m| m.created_at)
             .and_then(|t| (chrono::Utc::now() - t).to_std().ok());
         let previous = tool_gate::GateState::read(metadata);
+        // Groups this turn's attachments load whatever the model says: the
+        // files listed in the message, and (on a chat's first turn) the chat's
+        // attached paths.
+        let mut files = crate::agent::memorabilia_harvest::parse_file_paths(user_message);
+        if recent.is_empty() {
+            files.extend(attached_paths(metadata));
+        }
+        let forced = tool_gate::groups_for_files(&catalog, files.iter().map(String::as_str));
         let moment = tool_gate::moment(&tool_gate::Situation {
             state: previous.as_ref(),
             has_history: !recent.is_empty(),
@@ -2125,8 +2136,9 @@ impl AgentLoop {
                     .await
                 {
                     Some(answers) => {
-                        let groups =
+                        let mut groups =
                             tool_gate::decide_cold(&catalog, &answers, thresholds.tool_gating_cold);
+                        groups.extend(forced.iter().cloned());
                         if groups.len() < tool_gate::gateable(&catalog).len() {
                             hub.note_acted(app_id, Feature::ToolGating);
                         }
@@ -2150,6 +2162,11 @@ impl AgentLoop {
                     .filter(|g| !current.groups.contains(&g.name))
                     .collect();
                 let mut next = current.clone();
+                next.groups.extend(forced.iter().cloned());
+                let unloaded: Vec<&crate::decider::ToolGroup> = unloaded
+                    .into_iter()
+                    .filter(|g| !forced.contains(&g.name))
+                    .collect();
                 if !unloaded.is_empty() {
                     if let Some(answers) = hub
                         .ask(
@@ -2162,15 +2179,15 @@ impl AgentLoop {
                         .await
                     {
                         next.groups = tool_gate::decide_warm(
-                            &current.groups,
+                            &next.groups,
                             &answers,
                             thresholds.tool_gating_add,
                         );
-                        if next.groups != current.groups {
-                            hub.note_acted(app_id, Feature::ToolGating);
-                            tracing::debug!(session_id, groups = ?next.groups, "tool group added");
-                        }
                     }
+                }
+                if next.groups != current.groups {
+                    hub.note_acted(app_id, Feature::ToolGating);
+                    tracing::debug!(session_id, groups = ?next.groups, "tool group added");
                 }
                 next
             }
@@ -6006,7 +6023,8 @@ mod containment_order_tests {
             "features": {"tool_gating": on},
             "tool_groups": [
                 {"name": "core", "description": "files", "tools": ["lean_file_*"], "always": true},
-                {"name": "office", "description": "documents", "tools": ["lean_pdf_*"]},
+                {"name": "office", "description": "documents", "tools": ["lean_pdf_*"],
+                 "file_types": [".pdf"]},
                 {"name": "web", "description": "the web", "tools": ["lean_web_*"]},
             ],
         }))
@@ -6084,6 +6102,19 @@ mod containment_order_tests {
         let stored = tool_gate::GateState::read(&meta).unwrap();
         assert_eq!(stored.groups.iter().collect::<Vec<_>>(), ["office"]);
         assert_eq!(stored.provider, "p1");
+    }
+
+    /// An attached file's type loads its group even when the model says no.
+    #[tokio::test]
+    async fn an_attached_file_loads_its_group_whatever_the_model_says() {
+        let (agent_loop, session) = gated_loop(|_, _| 0.0, false).await;
+        let msg = "Files provided by the user:\n- C:\\Users\\a\\Report.PDF\n\nWhat does it conclude?";
+        let gate = agent_loop
+            .compute_tool_gate("s1", &session, &json!({}), msg, "p1", "kitty", &gate_tools())
+            .await
+            .unwrap();
+        let groups = gate.state.lock().unwrap().groups.clone();
+        assert_eq!(groups.into_iter().collect::<Vec<_>>(), ["office"]);
     }
 
     /// With the decision model down, a new chat is offered everything and

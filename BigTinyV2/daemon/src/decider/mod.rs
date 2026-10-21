@@ -162,10 +162,14 @@ impl Features {
 #[serde(default)]
 pub struct Thresholds {
     /// Tool gating, cold decision: load a group at P(needed) ≥ this. Low,
-    /// because a missing tool costs more than an extra one.
+    /// because a missing tool costs more than an extra one. 0.20 and 0.80
+    /// below were chosen by replaying 17 real exported chats (226 turns)
+    /// against d1-3B: 3 missed turns and 2 additions, against 9 and 8 at
+    /// 0.30 / 0.60.
     pub tool_gating_cold: f32,
-    /// Tool gating, warm turn: add a group at P ≥ this. Higher, because each
-    /// addition costs one prompt-cache miss.
+    /// Tool gating, warm turn: add a group at P ≥ this. High, because each
+    /// addition costs one prompt-cache miss, and at 0.60 six of eight
+    /// additions in the replay were never used.
     pub tool_gating_add: f32,
     /// Skip a behavioural-memory learn pass when P(something durable) < this.
     pub learn_gate_skip_below: f32,
@@ -184,8 +188,8 @@ pub struct Thresholds {
 impl Default for Thresholds {
     fn default() -> Self {
         Self {
-            tool_gating_cold: 0.30,
-            tool_gating_add: 0.60,
+            tool_gating_cold: 0.20,
+            tool_gating_add: 0.80,
             learn_gate_skip_below: 0.15,
             recall_drop_below: 0.08,
             ingest_gate_reject_below: 0.35,
@@ -208,9 +212,24 @@ pub struct ToolGroup {
     /// Always offered, never gated.
     #[serde(default)]
     pub always: bool,
+    /// File extensions (".docx", lowercase) that load this group outright
+    /// when a file of that type is attached: an attachment says what tools a
+    /// turn needs more reliably than its prose (measured on real chats, the
+    /// decision model rated "documents" below 0.3 for a message attaching
+    /// two .docx files).
+    #[serde(default)]
+    pub file_types: Vec<String>,
 }
 
 impl ToolGroup {
+    /// Whether `file` (a path or name) has one of this group's file types.
+    pub fn takes_file(&self, file: &str) -> bool {
+        let lower = file.trim().to_lowercase();
+        self.file_types
+            .iter()
+            .any(|ext| !ext.is_empty() && lower.ends_with(&ext.to_lowercase()))
+    }
+
     pub fn matches(&self, tool: &str) -> bool {
         self.tools.iter().any(|p| match p.strip_suffix('*') {
             Some(prefix) => tool.starts_with(prefix),
@@ -293,7 +312,7 @@ mod tests {
         .unwrap();
         assert_eq!(c.dialect, "systemone");
         assert_eq!(c.thresholds.tool_gating_add, 0.75);
-        assert_eq!(c.thresholds.tool_gating_cold, 0.30);
+        assert_eq!(c.thresholds.tool_gating_cold, 0.20);
         assert!(c.features.is_on(Feature::ToolGating));
         assert!(!c.features.is_on(Feature::Compaction));
         assert!(c.validate().is_ok());
@@ -317,6 +336,7 @@ mod tests {
             description: String::new(),
             tools: vec!["lean_word_*".into(), "lean_pdf_read_text".into()],
             always: false,
+            file_types: vec![],
         };
         assert!(g.matches("lean_word_read_text"));
         assert!(g.matches("lean_pdf_read_text"));
