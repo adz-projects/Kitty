@@ -46,7 +46,7 @@ export const DECIDER_FEATURES: { id: DeciderFeature; label: string; blurb: strin
     id: 'compaction',
     label: 'Compaction',
     blurb:
-      'Marks the exchanges that matter when a long chat is summarised, and leaves out pure filler.',
+      'When a long chat is summarised, marks the exchanges where you set a lasting rule or decision or stated a fact about your situation, and leaves out pure filler.',
   },
 ];
 
@@ -59,6 +59,7 @@ export const DECIDER_THRESHOLDS: { key: string; label: string }[] = [
   { key: 'ingest_gate_reject_below', label: 'Ingest gate: reject a document below P' },
   { key: 'page_classify_min', label: 'Page check: act on a label at P ≥' },
   { key: 'compaction_drop_min', label: 'Compaction: leave out filler at P ≥' },
+  { key: 'compaction_key_min', label: 'Compaction: mark an exchange key at score ≥' },
   { key: 'shell_screen_flag_at', label: 'Shell screen: ask before running at P(risky) ≥' },
 ];
 

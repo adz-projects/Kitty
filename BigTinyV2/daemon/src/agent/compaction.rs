@@ -1142,21 +1142,50 @@ const MARK_DROP: &str = "drop";
 /// Must survive into memory: marked `[KEY]` for the summarizer.
 const MARK_KEY_EXCHANGE: &str = "key";
 
-/// The two questions each exchange is asked, one exchange per call. Measured
-/// on d1-3B: asked of an exchange on its own, these separate filler ("thanks!"
-/// 0.68, "ok cool" 0.81) from decisions and constraints (0.97, 0.99) cleanly;
-/// rating several exchanges in one shared state did not — the model could not
-/// tell which exchange a question was about.
-const FILLER_QUESTION: &str = "Is this exchange only filler — thanks, okay, greetings or small      talk — with nothing worth remembering?";
-const KEY_QUESTION: &str = "Does this exchange contain a decision, requirement, deadline or      constraint the user stated, or a result that was produced, that later turns must remember?";
-/// An exchange is marked `[KEY]` at P(key) of at least this.
-const KEY_MIN: f32 = 0.5;
-/// The most exchanges rated per pass (one call each).
+/// Asked of the whole exchange, one exchange per call: rating several
+/// exchanges in one shared state did not work — the model could not tell
+/// which exchange a question was about.
+const FILLER_QUESTION: &str = "Is this exchange only filler — thanks, okay, greetings or small \
+     talk — with nothing worth remembering?";
+
+/// The key mark: three questions asked of the user's message alone, combined
+/// as `max(P(rule), P(fact)) × (1 − P(one-off))`.
+///
+/// Measured against Qwen-labelled exchanges from 146 turns of real chats, the
+/// earlier single question ("a decision, requirement, deadline or constraint
+/// the user stated, or a result that was produced", over the whole exchange)
+/// ranked key exchanges no better than chance (AUC 0.51): any reply carrying a
+/// result counted. This combination reached AUC 0.78; the one-off penalty is
+/// what does most of the work (0.63 without it).
+const RULE_QUESTION: &str = "Does the user set a lasting rule, decision, constraint or preference \
+     for the rest of the work (not a one-off request)?";
+const FACT_QUESTION: &str =
+    "Does the user state a fact about themselves, their project, their setup or their situation?";
+const ONE_OFF_QUESTION: &str = "Is the user's message only a new one-off request, a question, \
+     'continue' or 'try again', with no lasting rule, decision or fact in it?";
+/// The most exchanges rated per pass (two calls each).
 const JUDGE_MAX: usize = 40;
 /// Each call's budget. Compaction runs in the background.
 const JUDGE_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
-/// Characters of each message shown to the judge.
+/// Characters of each message shown to the filler question.
 const JUDGE_MESSAGE_CHARS: usize = 600;
+/// Characters of the user's message shown to the key questions.
+const JUDGE_USER_CHARS: usize = 1_200;
+
+/// The user's message in an exchange, as the key questions see it.
+fn user_text(exchange: &[Value]) -> Option<String> {
+    let m = exchange
+        .iter()
+        .find(|m| m.get("role").and_then(|v| v.as_str()) == Some("user"))?;
+    let content = m.get("content").map(render_content_as_text).unwrap_or_default();
+    let short: String = content.chars().take(JUDGE_USER_CHARS).collect();
+    Some(format!("user: {short}"))
+}
+
+/// The key score from the three answers.
+fn key_score(p_rule: f32, p_fact: f32, p_one_off: f32) -> f32 {
+    p_rule.max(p_fact) * (1.0 - p_one_off)
+}
 
 /// One exchange as the judge sees it.
 fn exchange_text(exchange: &[Value]) -> String {
@@ -1176,9 +1205,11 @@ fn exchange_text(exchange: &[Value]) -> String {
 }
 
 /// Rate the oldest exchanges with the app's decision model (the `compaction`
-/// feature): `(P(filler), P(key))` per exchange, or `None` where no answer came
-/// back. The first failure stops the rating — the rest stay unrated, which
-/// leaves them exactly as they would have been.
+/// feature): `(P(filler), key score)` per exchange, or `None` where no answer
+/// came back. Two calls per exchange — filler over the whole exchange, the key
+/// questions over the user's message — since they look at different text. The
+/// first failure stops the rating — the rest stay unrated, which leaves them
+/// exactly as they would have been.
 async fn judge_exchanges(
     hub: &crate::decider::DeciderHub,
     app_id: &str,
@@ -1186,29 +1217,56 @@ async fn judge_exchanges(
 ) -> Vec<Option<(f32, f32)>> {
     use crate::decider::{Feature, Question};
     let mut out = vec![None; exchanges.len()];
-    let questions = vec![
-        ("filler".to_string(), Question::yes_no(FILLER_QUESTION)),
-        ("key".to_string(), Question::yes_no(KEY_QUESTION)),
+    let filler_q = vec![("filler".to_string(), Question::yes_no(FILLER_QUESTION))];
+    let key_q = vec![
+        ("rule".to_string(), Question::yes_no(RULE_QUESTION)),
+        ("fact".to_string(), Question::yes_no(FACT_QUESTION)),
+        ("one_off".to_string(), Question::yes_no(ONE_OFF_QUESTION)),
     ];
     for (slot, ex) in out.iter_mut().zip(exchanges).take(JUDGE_MAX) {
-        let Some(answers) = hub
-            .ask(app_id, Feature::Compaction, &exchange_text(ex), &questions, JUDGE_BUDGET)
+        let Some(filler) = hub
+            .ask(app_id, Feature::Compaction, &exchange_text(ex), &filler_q, JUDGE_BUDGET)
             .await
         else {
             break;
         };
-        let p = |name: &str| answers.get(name).and_then(|a| a.yes);
-        *slot = p("filler").zip(p("key"));
+        let Some(p_filler) = filler.get("filler").and_then(|a| a.yes) else {
+            break;
+        };
+        // An exchange with no user message (a run that starts mid-turn) can
+        // only be judged for filler.
+        let key = match user_text(ex) {
+            Some(text) => {
+                let Some(answers) = hub
+                    .ask(app_id, Feature::Compaction, &text, &key_q, JUDGE_BUDGET)
+                    .await
+                else {
+                    break;
+                };
+                let p = |name: &str| answers.get(name).and_then(|a| a.yes);
+                match (p("rule"), p("fact"), p("one_off")) {
+                    (Some(r), Some(f), Some(o)) => key_score(r, f, o),
+                    _ => 0.0,
+                }
+            }
+            None => 0.0,
+        };
+        *slot = Some((p_filler, key));
     }
     out
 }
 
 /// Put the judge's verdict on an exchange's messages. Returns whether it was
 /// dropped (left out of the summarizer prompt).
-fn mark_exchange(exchange: &mut [Value], rating: Option<(f32, f32)>, drop_min: f32) -> bool {
+fn mark_exchange(
+    exchange: &mut [Value],
+    rating: Option<(f32, f32)>,
+    drop_min: f32,
+    key_min: f32,
+) -> bool {
     let mark = match rating {
         Some((p_filler, _)) if p_filler >= drop_min => MARK_DROP,
-        Some((_, p_key)) if p_key >= KEY_MIN => MARK_KEY_EXCHANGE,
+        Some((_, key)) if key >= key_min => MARK_KEY_EXCHANGE,
         _ => return false,
     };
     for m in exchange.iter_mut() {
@@ -1537,12 +1595,13 @@ async fn run_compaction_inner(
                 .await
             {
                 let drop_min = judge.config.thresholds.compaction_drop_min;
+                let key_min = judge.config.thresholds.compaction_key_min;
                 let ratings = judge_exchanges(hub, &app_id, &candidate_exchanges).await;
                 for (i, ex) in candidate_exchanges.iter_mut().enumerate() {
-                    dropped[i] = mark_exchange(ex, ratings[i], drop_min);
+                    dropped[i] = mark_exchange(ex, ratings[i], drop_min, key_min);
                 }
                 let n_dropped = dropped.iter().filter(|d| **d).count();
-                if n_dropped > 0 || ratings.iter().any(|r| r.is_some_and(|(_, k)| k >= KEY_MIN)) {
+                if n_dropped > 0 || ratings.iter().any(|r| r.is_some_and(|(_, k)| k >= key_min)) {
                     hub.note_acted(&app_id, crate::decider::Feature::Compaction);
                 }
                 if n_dropped > 0 {
@@ -1731,13 +1790,13 @@ mod tests {
     #[test]
     fn confident_filler_is_dropped_and_key_exchanges_are_marked() {
         let mut filler = ex("thanks!", "You're welcome.");
-        assert!(mark_exchange(&mut filler, Some((0.95, 0.02)), 0.65));
+        assert!(mark_exchange(&mut filler, Some((0.95, 0.02)), 0.65, 0.15));
         let mut unsure = ex("ok", "Sure.");
-        assert!(!mark_exchange(&mut unsure, Some((0.5, 0.1)), 0.65));
+        assert!(!mark_exchange(&mut unsure, Some((0.5, 0.1)), 0.65, 0.15));
         let mut key = ex("Use Postgres 16, not MySQL.", "Noted.");
-        assert!(!mark_exchange(&mut key, Some((0.1, 0.97)), 0.65));
+        assert!(!mark_exchange(&mut key, Some((0.1, 0.97)), 0.65, 0.15));
         let mut unrated = ex("hm", "yes");
-        assert!(!mark_exchange(&mut unrated, None, 0.65));
+        assert!(!mark_exchange(&mut unrated, None, 0.65, 0.15));
 
         let chunk: Vec<Value> = [filler, unsure, key, unrated].concat();
         let prompt = build_summarizer_prompt(None, &chunk);
@@ -1755,6 +1814,19 @@ mod tests {
         assert_eq!(prompt[0]["content"], SUMMARIZER_INSTRUCTIONS);
     }
 
+    #[test]
+    fn a_one_off_request_cancels_the_key_mark() {
+        // "Use Postgres 16" — a lasting decision, not a one-off.
+        assert!(key_score(0.9, 0.1, 0.05) >= 0.15);
+        // "find me 10 articles" — a fact-ish request, but plainly one-off.
+        assert!(key_score(0.3, 0.4, 0.9) < 0.15);
+        assert_eq!(
+            user_text(&ex("Use Postgres 16.", "Noted.")).as_deref(),
+            Some("user: Use Postgres 16.")
+        );
+        assert_eq!(user_text(&[json!({"role": "assistant", "content": "x"})]), None);
+    }
+
     #[tokio::test]
     async fn each_exchange_is_rated_and_failures_leave_them_unrated() {
         use crate::decider::hub::testing::Scripted;
@@ -1765,12 +1837,21 @@ mod tests {
             "url": "http://127.0.0.1:1", "features": {"compaction": true},
         }))
         .unwrap();
-        let backend = Scripted::yes(|name, _| if name == "key" { 0.9 } else { 0.1 });
+        let backend = Scripted::yes(|name, _| match name {
+            "filler" => 0.1,
+            "rule" => 0.8,
+            "fact" => 0.2,
+            "one_off" => 0.25,
+            _ => 0.0,
+        });
         hub.install_for_test("kitty", config.clone(), std::sync::Arc::new(backend));
         let exchanges: Vec<Vec<Value>> = (0..12).map(|_| ex("a", "b")).collect();
         let ratings = judge_exchanges(&hub, "kitty", &exchanges).await;
         assert_eq!(ratings.len(), 12);
-        assert!(ratings.iter().all(|r| *r == Some((0.1, 0.9))));
+        // key = max(0.8, 0.2) × (1 − 0.25)
+        assert!(ratings
+            .iter()
+            .all(|r| r.is_some_and(|(f, k)| (f - 0.1).abs() < 1e-6 && (k - 0.6).abs() < 1e-6)));
 
         let mut failing = Scripted::yes(|_, _| 0.0);
         failing.fail = true;

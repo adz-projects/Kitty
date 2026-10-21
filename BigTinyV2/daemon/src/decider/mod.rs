@@ -189,6 +189,10 @@ pub struct Thresholds {
     pub page_classify_min: f32,
     /// Compaction: leave an exchange out of the summary at P(filler) ≥ this.
     pub compaction_drop_min: f32,
+    /// Compaction: mark an exchange `[KEY]` at a key score ≥ this. The score
+    /// is `max(P(rule), P(fact)) × (1 − P(one-off))`; at 0.15 it marked 29%
+    /// of real long-chat exchanges, 90% of them key by Qwen's labels.
+    pub compaction_key_min: f32,
     /// Shell screen: hold an otherwise auto-approved command for the user at
     /// P(risky) ≥ this. Low on purpose -- it can only add a prompt, never
     /// remove one. On d1 it caught 10 of 12 dangerous commands at 0.30 with
@@ -206,6 +210,7 @@ impl Default for Thresholds {
             ingest_gate_reject_below: 0.35,
             page_classify_min: 0.70,
             compaction_drop_min: 0.65,
+            compaction_key_min: 0.15,
             shell_screen_flag_at: 0.30,
         }
     }
