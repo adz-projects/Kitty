@@ -346,6 +346,7 @@ pub async fn ensure_builtin_servers(app: &AppHandle) -> Result<SyncReport, Strin
         memorabilia_enabled,
         specialist_timeout_secs,
         specialists_enabled,
+        decider_web_env,
     ) = {
         let state = app.state::<AppState>();
         let cfg = state.config.lock().unwrap();
@@ -364,6 +365,7 @@ pub async fn ensure_builtin_servers(app: &AppHandle) -> Result<SyncReport, Strin
             memory.memorabilia_active,
             cfg.specialists.timeout_secs,
             cfg.specialists.enabled,
+            decider_web_env(&cfg.decider),
         )
     };
 
@@ -602,7 +604,9 @@ pub async fn ensure_builtin_servers(app: &AppHandle) -> Result<SyncReport, Strin
     // ones. `BRAVE_API_KEY` attaches to *this* server's env map so
     // `lean_web_search` can prefer Brave when configured.
     let (kitty_web_transport, kitty_web_cmd) = bundled_transport("kitty-web", "kitty-web.exe");
-    let mut kitty_web_pairs = Vec::new();
+    // The decision model's web checks run inside kitty-web, so it gets its
+    // own copy of the settings (not a secret, so straight from config).
+    let mut kitty_web_pairs = decider_web_env;
 
     // The API key is never read from config (see `brave_mcp_search_enabled`'s
     // doc comment) — only from the keyring, under a fixed id shared with
@@ -652,6 +656,34 @@ pub async fn ensure_builtin_servers(app: &AppHandle) -> Result<SyncReport, Strin
         }
     }
     Ok(report)
+}
+
+/// kitty-web's share of the decision-model settings, as env pairs. Empty when
+/// there is no decision model or both web checks are off, so the row's env is
+/// exactly what it was before the feature existed.
+fn decider_web_env(d: &crate::config::DeciderSettings) -> Vec<(String, String)> {
+    let mut features = Vec::new();
+    if d.features.page_classify {
+        features.push("page_classify");
+    }
+    if d.features.search_rerank {
+        features.push("search_rerank");
+    }
+    if !d.configured() || features.is_empty() {
+        return Vec::new();
+    }
+    let mut env = vec![
+        ("KITTY_DECIDER_URL".to_string(), d.url.trim().to_string()),
+        ("KITTY_DECIDER_DIALECT".to_string(), d.dialect.clone()),
+        ("KITTY_DECIDER_FEATURES".to_string(), features.join(",")),
+    ];
+    if !d.thresholds.is_empty() {
+        env.push((
+            "KITTY_DECIDER_THRESHOLDS".to_string(),
+            serde_json::Value::Object(d.thresholds.clone()).to_string(),
+        ));
+    }
+    env
 }
 
 /// Periodic self-heal re-sync of the bundled MCP servers, run from the
@@ -847,6 +879,20 @@ async fn upsert_builtin(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kitty_web_gets_decider_env_only_when_a_web_check_is_on() {
+        let mut d = crate::config::DeciderSettings::default();
+        assert!(decider_web_env(&d).is_empty());
+        d.url = "http://box:8080".into();
+        let env: HashMap<_, _> = decider_web_env(&d).into_iter().collect();
+        assert_eq!(env["KITTY_DECIDER_URL"], "http://box:8080");
+        assert_eq!(env["KITTY_DECIDER_FEATURES"], "page_classify,search_rerank");
+        assert!(!env.contains_key("KITTY_DECIDER_THRESHOLDS"));
+        d.features.page_classify = false;
+        d.features.search_rerank = false;
+        assert!(decider_web_env(&d).is_empty());
+    }
 
     /// The daemon's `mcp::builtin::BUILTIN_SERVERS`, mirrored.
     ///

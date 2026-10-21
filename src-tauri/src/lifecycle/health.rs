@@ -95,6 +95,8 @@ pub fn spawn_health_loop(app: AppHandle) {
                         let app2 = app.clone();
                         tauri::async_runtime::spawn(async move {
                             crate::bigtiny::mcp::self_heal_builtin_servers(&app2).await;
+                            // Another app may have restarted the engine.
+                            super::decider::apply_decider(&app2).await;
                         });
                     }
                 }

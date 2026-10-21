@@ -95,6 +95,45 @@ export interface MemoryStats {
   injection_rate_pct: number;
 }
 
+// --- Decision model (lifecycle::decider) ---
+export type DeciderFeature =
+  | 'tool_gating'
+  | 'learn_gate'
+  | 'recall_rerank'
+  | 'ingest_gate'
+  | 'page_classify'
+  | 'search_rerank'
+  | 'compaction';
+
+/** Mirrors `config::DeciderSettings`. An empty `url` means no decision model. */
+export interface DeciderSettings {
+  dialect: string;
+  url: string;
+  model: string | null;
+  features: Record<DeciderFeature, boolean>;
+  /** Only the thresholds the user changed; the rest are the model's defaults. */
+  thresholds: Record<string, number>;
+}
+
+export interface DeciderProbe {
+  ok: boolean;
+  model: string | null;
+  rtt_ms: number;
+  error: string | null;
+}
+
+export interface DeciderFeatureStats {
+  calls: number;
+  answered: number;
+  failed: number;
+  acted: number;
+}
+
+export interface DeciderDefaults {
+  dialects: string[];
+  default_thresholds: Record<string, number>;
+}
+
 // --- Providers (Phase 5) ---
 export type NetworkTier = 'local' | 'personal' | 'remote';
 /** `local` is the in-process engine (docs/ANDROID.md §3) — no endpoint, no

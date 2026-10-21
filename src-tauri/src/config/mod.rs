@@ -333,6 +333,11 @@ pub struct Config {
     /// vars at spawn.
     #[serde(default)]
     pub specialists: SpecialistSettings,
+    /// The optional decision model (`lifecycle::decider`): where it is, which
+    /// of its uses are on, and any threshold overrides. Relayed to the engine
+    /// per app (`/api/apps/me/decider`) and to kitty-web through its MCP row.
+    #[serde(default)]
+    pub decider: DeciderSettings,
     /// BigTiny context-window/compaction budget settings, relayed as
     /// `BIGTINY_TOKEN_MANAGEMENT__*` env vars at spawn (same mechanism and
     /// rationale as `summarizer` above). `#[serde(default)]` covers loading
@@ -478,6 +483,7 @@ impl Default for Config {
             bigtiny_args: default_bigtiny_args(),
             summarizer: SummarizerSettings::default(),
             specialists: SpecialistSettings::default(),
+            decider: DeciderSettings::default(),
             token_management: TokenManagementSettings::default(),
             memory: MemorySettings::default(),
         }
@@ -854,6 +860,83 @@ impl Default for SpecialistSettings {
             seeded: false,
             timeout_secs: default_specialist_timeout_secs(),
             max_concurrent: default_max_concurrent_specialists(),
+        }
+    }
+}
+
+/// The decision model. An empty `url` means none: every use behaves as it
+/// did before the feature existed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DeciderSettings {
+    /// Wire format the endpoint speaks. Only `systemone` (Liquid d1) today.
+    #[serde(default = "default_decider_dialect")]
+    pub dialect: String,
+    #[serde(default)]
+    pub url: String,
+    /// The model last seen at `url` (from Test), for display and for knowing
+    /// when the model changed.
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub features: DeciderFeatures,
+    /// Only the thresholds the user changed; the engine fills in the rest
+    /// with the model's defaults. Cleared when the model changes.
+    #[serde(default)]
+    pub thresholds: serde_json::Map<String, serde_json::Value>,
+}
+
+impl Default for DeciderSettings {
+    fn default() -> Self {
+        Self {
+            dialect: default_decider_dialect(),
+            url: String::new(),
+            model: None,
+            features: DeciderFeatures::default(),
+            thresholds: serde_json::Map::new(),
+        }
+    }
+}
+
+impl DeciderSettings {
+    pub fn configured(&self) -> bool {
+        !self.url.trim().is_empty()
+    }
+}
+
+fn default_decider_dialect() -> String {
+    "systemone".into()
+}
+
+/// Each use of the decision model, switched on and off on its own. All on by
+/// default, so setting a URL is enough to try it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DeciderFeatures {
+    #[serde(default = "default_true")]
+    pub tool_gating: bool,
+    #[serde(default = "default_true")]
+    pub learn_gate: bool,
+    #[serde(default = "default_true")]
+    pub recall_rerank: bool,
+    #[serde(default = "default_true")]
+    pub ingest_gate: bool,
+    #[serde(default = "default_true")]
+    pub page_classify: bool,
+    #[serde(default = "default_true")]
+    pub search_rerank: bool,
+    #[serde(default = "default_true")]
+    pub compaction: bool,
+}
+
+impl Default for DeciderFeatures {
+    fn default() -> Self {
+        Self {
+            tool_gating: true,
+            learn_gate: true,
+            recall_rerank: true,
+            ingest_gate: true,
+            page_classify: true,
+            search_rerank: true,
+            compaction: true,
         }
     }
 }

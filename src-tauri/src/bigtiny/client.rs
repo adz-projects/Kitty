@@ -131,6 +131,16 @@ impl BigTinyClient {
         .await
     }
 
+    pub async fn put_json(&self, path: &str, body: &Value) -> Result<Value, String> {
+        json_response(
+            self.request(reqwest::Method::PUT, path)
+                .json(body)
+                .send()
+                .await,
+        )
+        .await
+    }
+
     pub async fn delete(&self, path: &str) -> Result<Value, String> {
         json_response(self.request(reqwest::Method::DELETE, path).send().await).await
     }

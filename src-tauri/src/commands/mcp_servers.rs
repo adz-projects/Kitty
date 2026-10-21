@@ -267,7 +267,7 @@ pub async fn set_brave_mcp_search_enabled(
 
 /// Push a saved toggle to the engine and report whether `server` took it
 /// (#68): the toggle used to say "done" whatever happened.
-async fn apply(app: &tauri::AppHandle, server: &str, label: &str) -> Result<(), String> {
+pub(crate) async fn apply(app: &tauri::AppHandle, server: &str, label: &str) -> Result<(), String> {
     mcp::ensure_builtin_servers(app)
         .await
         .map_err(|e| {

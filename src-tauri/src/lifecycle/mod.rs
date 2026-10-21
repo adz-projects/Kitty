@@ -27,6 +27,7 @@ pub mod bigtiny_proc;
 #[cfg(not(target_os = "android"))]
 pub mod bigtiny_v2;
 pub(crate) mod embedding;
+pub mod decider;
 pub mod engine_restart;
 mod health;
 pub mod memory;
@@ -317,6 +318,8 @@ pub(crate) async fn install_handle(app: &AppHandle, handle: crate::state::Daemon
     }
     // Memory follows the toggles and what this engine loaded.
     memory::apply_memory_plugins(app).await;
+    // The decision model is per app in the engine; a fresh engine has none.
+    decider::apply_decider(app).await;
     // Tasks an older Kitty scheduled itself move to the engine, once.
     crate::commands::migrate_config_tasks(app).await;
     // Approvals and background runs for every chat, on screen or not.

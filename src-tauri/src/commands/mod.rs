@@ -9,6 +9,7 @@
 
 mod adaptive_pathway;
 mod config;
+mod decider;
 mod file;
 mod folders;
 mod incoming;
@@ -31,6 +32,7 @@ mod window;
 
 pub use adaptive_pathway::*;
 pub use config::*;
+pub use decider::*;
 pub use export::*;
 pub use file::*;
 pub use folders::*;

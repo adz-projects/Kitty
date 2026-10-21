@@ -10,6 +10,7 @@ import { McpServers } from '@/components/settings/McpServers';
 import { NotificationsSection } from '@/components/settings/NotificationsSection';
 import { Appearance } from '@/components/settings/Appearance';
 import { Advanced } from '@/components/settings/Advanced';
+import { DecisionModel } from '@/components/settings/DecisionModel';
 import { AdaptivePathway } from '@/components/settings/AdaptivePathway';
 import { Memorabilia } from '@/components/settings/Memorabilia';
 import { ScheduledTasks } from '@/components/settings/ScheduledTasks';
@@ -30,6 +31,7 @@ function sectionLabels(): Record<string, string> {
     notifications: 'Notifications',
     appearance: 'Appearance',
     advanced: 'Advanced',
+    decision_model: 'Decision model',
   };
 }
 
@@ -70,7 +72,12 @@ function buildGroups(): { label: string; sections: string[] }[] {
     },
     {
       label: 'Advanced',
-      sections: ['advanced', 'adaptive_pathway', ...(isAndroid() ? [] : ['memorabilia'])],
+      sections: [
+        'advanced',
+        'decision_model',
+        'adaptive_pathway',
+        ...(isAndroid() ? [] : ['memorabilia']),
+      ],
     },
   ];
 }
@@ -181,6 +188,7 @@ export function SettingsView() {
         {section === 'notifications' && <NotificationsSection />}
         {section === 'appearance' && <Appearance />}
         {section === 'advanced' && <Advanced />}
+        {section === 'decision_model' && <DecisionModel />}
       </main>
     </div>
   );

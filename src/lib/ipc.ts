@@ -17,6 +17,11 @@ import type {
   CompactionEvent,
   CompleteEvent,
   Config,
+  DeciderDefaults,
+  DeciderFeature,
+  DeciderFeatureStats,
+  DeciderProbe,
+  DeciderSettings,
   FileAttachment,
   FileEntry,
   FolderData,
@@ -537,6 +542,17 @@ export const ipc = {
     invoke<void>('set_brave_mcp_search_api_key', { apiKey }),
   setBraveMcpSearchEnabled: (enabled: boolean) =>
     invoke<void>('set_brave_mcp_search_enabled', { enabled }),
+  // Decision model (Settings → Decision model). Saved through its own command
+  // rather than patchConfig, because saving also re-syncs the engine's
+  // per-app copy and kitty-web's row.
+  getDeciderSettings: () => invoke<DeciderSettings>('get_decider_settings'),
+  setDeciderSettings: (settings: DeciderSettings) =>
+    invoke<DeciderSettings>('set_decider_settings', { settings }),
+  testDecider: (dialect: string, url: string) =>
+    invoke<DeciderProbe>('test_decider', { dialect, url }),
+  getDeciderStats: () =>
+    invoke<{ features: Partial<Record<DeciderFeature, DeciderFeatureStats>> }>('get_decider_stats'),
+  getDeciderDefaults: () => invoke<DeciderDefaults>('get_decider_defaults'),
   /** The `route://goto` target this hub should navigate to on mount, if the
       call that created it also routed it somewhere. Consumed on read — see
       `commands::get_route_target`. */
