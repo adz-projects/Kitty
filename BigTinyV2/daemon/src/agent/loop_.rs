@@ -19,6 +19,7 @@ use crate::agent::reasoning_models;
 use crate::agent::sandbox::{allowed_dirs_for_session, check_containment};
 use crate::agent::summarizer_chain::SummarizerChain;
 use crate::agent::tokens;
+use crate::agent::tool_gate;
 use crate::agent::types::TimingResult;
 use crate::config::MemoryConfig;
 use crate::config::{FallbackConfig, PathwayConfig, SummarizerConfig};
@@ -567,6 +568,50 @@ fn output_tokens_including_reasoning(usage: &Value) -> Option<i32> {
         Some(output.saturating_add(reasoning))
     } else {
         Some(output)
+    }
+}
+
+/// The tool gate's whole budget for one question round. It runs alongside
+/// memory recall, so within this it costs the turn nothing.
+const GATE_BUDGET_MS: u64 = 400;
+/// How much recent history a mid-chat cold decision looks at.
+const GATE_RECENT_MESSAGES: i64 = 6;
+
+/// The state text for a new chat's tool decision: its first message and the
+/// names of any files attached to it (a `.xlsx` says more than the prose).
+fn new_chat_state(metadata: &Value, user_message: &str) -> String {
+    let files: Vec<String> = metadata
+        .get("attached_paths")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_str())
+        .filter_map(|p| std::path::Path::new(p).file_name())
+        .map(|f| f.to_string_lossy().into_owned())
+        .collect();
+    if files.is_empty() {
+        user_message.to_string()
+    } else {
+        format!(
+            "{user_message}
+
+Attached files: {}",
+            files.join(", ")
+        )
+    }
+}
+
+async fn persist_gate_state(pool: &SqlitePool, session_id: &str, state: &tool_gate::GateState) {
+    let value = state.to_value();
+    let r = sessions::update_metadata_with(pool, session_id, move |mut meta| {
+        if let Some(obj) = meta.as_object_mut() {
+            obj.insert(tool_gate::META_KEY.to_string(), value);
+        }
+        meta
+    })
+    .await;
+    if let Err(e) = r {
+        tracing::warn!(session_id, "could not record the chat's tool set: {e}");
     }
 }
 
@@ -1384,6 +1429,61 @@ pub struct AgentLoop {
     /// default, unless the session's metadata sets `hitl_timeout_secs` (a
     /// scheduled run waits ten minutes, then carries on without the tool).
     hitl_timeout: Duration,
+    /// Per-app decision models (`crate::decider`). `None` in loops built
+    /// without an `Agent` (some tests), which behave as if no app had one.
+    decider: Option<Arc<crate::decider::DeciderHub>>,
+    /// This turn's tool gate, when the app has tool gating on. Set in
+    /// `run_inner`; read at dispatch (the safety valve, and recording a group
+    /// whose hidden tool was called anyway) and at each step (a group loaded
+    /// mid-turn joins the tool list from the next model call).
+    gate: Option<Arc<TurnGate>>,
+}
+
+/// One turn's tool gate: the catalog, the ungated tool list it filters, and the
+/// chat's [`tool_gate::GateState`] as it stands.
+struct TurnGate {
+    catalog: Vec<crate::decider::ToolGroup>,
+    all_tools: Vec<ToolDefinition>,
+    state: std::sync::Mutex<tool_gate::GateState>,
+    /// A group was loaded mid-turn; rebuild the offered list before the next
+    /// model call.
+    dirty: std::sync::atomic::AtomicBool,
+    app_id: String,
+}
+
+impl TurnGate {
+    /// The tools to offer for the current state: the ungated list filtered to
+    /// the loaded groups, plus the safety valve, in name order.
+    fn offered(&self) -> Vec<ToolDefinition> {
+        let loaded = self
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .groups
+            .clone();
+        let mut tools = self.all_tools.clone();
+        tool_gate::filter(&mut tools, &self.catalog, &loaded);
+        tools.push(tool_gate::load_group_tool(&self.catalog));
+        tools.sort_by(|a, b| a.name.cmp(&b.name));
+        tools
+    }
+
+    /// Load `group` if it is gateable and not yet loaded. Returns the state to
+    /// persist when something changed.
+    fn load(&self, group: &str) -> Option<tool_gate::GateState> {
+        if !tool_gate::gateable(&self.catalog)
+            .iter()
+            .any(|g| g.name == group)
+        {
+            return None;
+        }
+        let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if !st.groups.insert(group.to_string()) {
+            return None;
+        }
+        self.dirty.store(true, std::sync::atomic::Ordering::SeqCst);
+        Some(st.clone())
+    }
 }
 
 impl AgentLoop {
@@ -1439,7 +1539,15 @@ impl AgentLoop {
             priority: crate::provider::queue::Priority::Interactive,
             app_events: None,
             hitl_timeout: HITL_APPROVAL_TIMEOUT,
+            decider: None,
+            gate: None,
         }
+    }
+
+    /// Give this loop the per-app decision models.
+    pub fn with_decider(mut self, hub: Arc<crate::decider::DeciderHub>) -> Self {
+        self.decider = Some(hub);
+        self
     }
 
     /// Announce this loop's approval pauses on the per-app event stream too.
@@ -1614,7 +1722,7 @@ impl AgentLoop {
         if withheld > 0 {
             tracing::debug!(session_id, withheld, "specialists are off for this chat");
         }
-        let active_tools = active_tools;
+        let mut active_tools = active_tools;
 
         // The active provider's own `context_length` (Settings → Providers →
         // Advanced) wins over the daemon-wide `token_management.max_context_tokens`
@@ -1662,15 +1770,41 @@ impl AgentLoop {
         // their compacted history, is a prompt cost (and on a self-hosted
         // host, an embedding call) with nothing to find.
         let delegate = is_delegate(&metadata);
-        let (ap_hints, thought_seed) = match &resolved_provider_id {
-            _ if delegate => (None, None),
-            Some(pid) => {
-                let model = self.router.resolve_model(pid, model_override);
-                self.pathway_recall(session_id, user_message, pid, &model)
-                    .await
+        let recall = async {
+            match &resolved_provider_id {
+                _ if delegate => (None, None),
+                Some(pid) => {
+                    let model = self.router.resolve_model(pid, model_override);
+                    self.pathway_recall(session_id, user_message, pid, &model)
+                        .await
+                }
+                None => (None, None),
             }
-            None => (None, None),
         };
+        // The tool gate asks its question alongside recall, so it adds no
+        // latency of its own. Never for a delegate (its run has its own
+        // allow-list, or none) or a run with an allow-list, which wins.
+        let gate = async {
+            if delegate || self.tool_allow.is_some() {
+                return None;
+            }
+            self.compute_tool_gate(
+                session_id,
+                &session,
+                &metadata,
+                user_message,
+                resolved_provider_id.as_deref().unwrap_or(""),
+                &tool_scope,
+                &active_tools,
+            )
+            .await
+        };
+        let ((ap_hints, thought_seed), gate) = tokio::join!(recall, gate);
+        if let Some(gate) = gate {
+            active_tools = gate.offered();
+            self.gate = Some(Arc::new(gate));
+        }
+        let active_tools = active_tools;
 
         // Memorabilia turn-start hook: its compact summary+index rides the
         // same tail `system`-block channel as `ap_hints` (both plugins may be
@@ -1921,6 +2055,134 @@ impl AgentLoop {
     /// global behaviour rather than killing the turn, since a background or
     /// scheduled run reaching here with an unexpected session is not worth
     /// failing a user's work over.
+    /// Decide this turn's tool set (see `agent::tool_gate`), persisting any
+    /// change to the chat's metadata. `None` means "offer every tool": no
+    /// decision model, tool gating off, no catalog, or a chat still waiting
+    /// for a cold moment.
+    #[allow(clippy::too_many_arguments)]
+    async fn compute_tool_gate(
+        &self,
+        session_id: &str,
+        session: &sessions::SessionRow,
+        metadata: &Value,
+        user_message: &str,
+        provider_now: &str,
+        app_id: &str,
+        tools: &[ToolDefinition],
+    ) -> Option<TurnGate> {
+        use crate::decider::Feature;
+
+        let hub = self.decider.as_ref()?;
+        let decider = hub.enabled(app_id, Feature::ToolGating).await?;
+        let catalog = decider.config.tool_groups.clone();
+        if tool_gate::gateable(&catalog).is_empty() {
+            return None;
+        }
+        let thresholds = &decider.config.thresholds;
+        let budget = Duration::from_millis(GATE_BUDGET_MS);
+
+        let recent = crate::storage::messages::get_last_messages_by_session(
+            &self.pool,
+            session_id,
+            GATE_RECENT_MESSAGES,
+        )
+        .await
+        .unwrap_or_default();
+        let idle = recent
+            .last()
+            .and_then(|m| m.created_at)
+            .and_then(|t| (chrono::Utc::now() - t).to_std().ok());
+        let previous = tool_gate::GateState::read(metadata);
+        let moment = tool_gate::moment(&tool_gate::Situation {
+            state: previous.as_ref(),
+            has_history: !recent.is_empty(),
+            compacted_now: session.compacted_through_rowid,
+            provider_now,
+            idle,
+            cache_ttl: Duration::from_secs(decider.config.cache_ttl_secs),
+        });
+
+        let next = match moment {
+            tool_gate::Moment::Waiting => return None,
+            tool_gate::Moment::Cold(reason) => {
+                let state_text = if reason == tool_gate::ColdReason::NewChat {
+                    new_chat_state(metadata, user_message)
+                } else {
+                    let pairs: Vec<(String, String)> = recent
+                        .iter()
+                        .filter(|m| m.role == "user" || m.role == "assistant")
+                        .map(|m| (m.role.clone(), m.content.clone().unwrap_or_default()))
+                        .collect();
+                    tool_gate::recent_state(&pairs, user_message)
+                };
+                let questions = tool_gate::questions(tool_gate::gateable(&catalog));
+                match hub
+                    .ask(app_id, Feature::ToolGating, &state_text, &questions, budget)
+                    .await
+                {
+                    Some(answers) => {
+                        let groups =
+                            tool_gate::decide_cold(&catalog, &answers, thresholds.tool_gating_cold);
+                        if groups.len() < tool_gate::gateable(&catalog).len() {
+                            hub.note_acted(app_id, Feature::ToolGating);
+                        }
+                        tracing::debug!(session_id, ?reason, ?groups, "tool set decided");
+                        tool_gate::GateState {
+                            groups,
+                            compacted: session.compacted_through_rowid,
+                            provider: provider_now.to_string(),
+                            epoch: previous.as_ref().map_or(0, |p| p.epoch + 1),
+                        }
+                    }
+                    // No answer: keep what the chat had (its prefix is warm
+                    // with it), or offer everything and record nothing.
+                    None => previous.clone()?,
+                }
+            }
+            tool_gate::Moment::Warm => {
+                let current = previous.clone()?;
+                let unloaded: Vec<&crate::decider::ToolGroup> = tool_gate::gateable(&catalog)
+                    .into_iter()
+                    .filter(|g| !current.groups.contains(&g.name))
+                    .collect();
+                let mut next = current.clone();
+                if !unloaded.is_empty() {
+                    if let Some(answers) = hub
+                        .ask(
+                            app_id,
+                            Feature::ToolGating,
+                            user_message,
+                            &tool_gate::questions(unloaded),
+                            budget,
+                        )
+                        .await
+                    {
+                        next.groups = tool_gate::decide_warm(
+                            &current.groups,
+                            &answers,
+                            thresholds.tool_gating_add,
+                        );
+                        if next.groups != current.groups {
+                            hub.note_acted(app_id, Feature::ToolGating);
+                            tracing::debug!(session_id, groups = ?next.groups, "tool group added");
+                        }
+                    }
+                }
+                next
+            }
+        };
+        if previous.as_ref() != Some(&next) {
+            persist_gate_state(&self.pool, session_id, &next).await;
+        }
+        Some(TurnGate {
+            catalog,
+            all_tools: tools.to_vec(),
+            state: std::sync::Mutex::new(next),
+            dirty: std::sync::atomic::AtomicBool::new(false),
+            app_id: app_id.to_string(),
+        })
+    }
+
     async fn app_scope(&self, session_id: &str) -> (Option<String>, Option<String>) {
         let Ok(Some(app_id)) = crate::storage::sessions::owner_of(&self.pool, session_id).await
         else {
@@ -2278,7 +2540,7 @@ impl AgentLoop {
         // step. Iterations still take an owned copy, since the wrap-up and
         // step-nudge branches mutate their own view of it, but a `Vec<Value>`
         // clone is far cheaper than redoing the conversion.
-        let tools_base: Vec<Value> = tools_to_openai_format(active_tools);
+        let mut tools_base: Vec<Value> = tools_to_openai_format(active_tools);
         // Resolved once per turn rather than per attempt: an unknown name
         // yields `None` (no preset), never someone else's settings.
         let preset = metadata
@@ -2598,6 +2860,13 @@ impl AgentLoop {
             let mut in_wrapup = false;
             // Same two outcomes as the `provider_takes_tools` slice shadowing
             // this replaced: the full converted set, or nothing at all.
+            // A group loaded mid-turn (the tool gate's safety valve) joins the
+            // list here, before the next model call: one cache miss, once.
+            if let Some(gate) = self.gate.as_ref() {
+                if gate.dirty.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    tools_base = tools_to_openai_format(&gate.offered());
+                }
+            }
             let mut tools_for_turn: Vec<Value> = if provider_takes_tools {
                 tools_base.clone()
             } else {
@@ -4568,6 +4837,62 @@ impl AgentLoop {
             return err;
         }
 
+        // The tool gate. Its safety valve is answered here, and a call to a
+        // tool the gate withheld (named from an older prompt, or guessed) still
+        // runs — the gate shapes what is offered, it is not a permission — but
+        // loads its group, so the chat is offered it from now on.
+        if let Some(gate) = self.gate.as_ref() {
+            if tool_name == tool_gate::LOAD_GROUP_TOOL {
+                let group = tool_args
+                    .get("group")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let result = match gate.load(&group) {
+                    Some(state) => {
+                        persist_gate_state(&self.pool, session_id, &state).await;
+                        if let Some(hub) = self.decider.as_ref() {
+                            hub.note_acted(&gate.app_id, crate::decider::Feature::ToolGating);
+                        }
+                        let names: Vec<&str> = gate
+                            .all_tools
+                            .iter()
+                            .filter(|t| {
+                                tool_gate::group_of(&gate.catalog, &t.name)
+                                    .is_some_and(|g| g.name == group)
+                            })
+                            .map(|t| t.name.as_str())
+                            .collect();
+                        format!(
+                            "Loaded the `{group}` tools: {}. They are available from your next step.",
+                            names.join(", ")
+                        )
+                    }
+                    None if tool_gate::gateable(&gate.catalog)
+                        .iter()
+                        .any(|g| g.name == group) =>
+                    {
+                        format!("The `{group}` tools are already loaded.")
+                    }
+                    None => format!("There is no tool group named `{group}`."),
+                };
+                let _ = event_tx.send(SSEEvent {
+                    event_type: SSEEventType::ToolFinish,
+                    tool_name: Some(tool_name),
+                    tool_result: Some(result.clone()),
+                    tool_call_id: Some(tool_call_id.clone()),
+                    session_id: Some(session_id.to_string()),
+                    ..Default::default()
+                });
+                return result;
+            }
+            if let Some(group) = tool_gate::group_of(&gate.catalog, &tool_name) {
+                if let Some(state) = gate.load(&group.name) {
+                    persist_gate_state(&self.pool, session_id, &state).await;
+                }
+            }
+        }
+
         // Enforce the per-run allow-list. The advertised tool set was already
         // narrowed to it in `run_inner`, but a model can call a tool it was
         // never offered — from a stale prompt prefix, a cached tool block, or
@@ -5669,6 +5994,171 @@ mod containment_order_tests {
             pool.clone(),
         );
         (agent_loop, hitl)
+    }
+
+    fn gate_catalog_config(on: bool) -> crate::decider::DeciderConfig {
+        serde_json::from_value(json!({
+            "url": "http://127.0.0.1:1",
+            "features": {"tool_gating": on},
+            "tool_groups": [
+                {"name": "core", "description": "files", "tools": ["lean_file_*"], "always": true},
+                {"name": "office", "description": "documents", "tools": ["lean_pdf_*"]},
+                {"name": "web", "description": "the web", "tools": ["lean_web_*"]},
+            ],
+        }))
+        .unwrap()
+    }
+
+    fn gate_tools() -> Vec<ToolDefinition> {
+        [
+            "lean_file_read",
+            "lean_pdf_read_text",
+            "lean_web_search",
+            "record",
+        ]
+        .iter()
+        .map(|n| ToolDefinition {
+            name: n.to_string(),
+            description: String::new(),
+            input_schema: json!({"type": "object"}),
+            server_id: String::new(),
+        })
+        .collect()
+    }
+
+    async fn gated_loop(
+        p_yes: impl Fn(&str, &str) -> f32 + Send + Sync + 'static,
+        fail: bool,
+    ) -> (AgentLoop, sessions::SessionRow) {
+        let (agent_loop, _) = test_loop().await;
+        let hub = Arc::new(crate::decider::DeciderHub::new(agent_loop.pool.clone()));
+        let mut backend = crate::decider::hub::testing::Scripted::yes(p_yes);
+        backend.fail = fail;
+        hub.install_for_test("kitty", gate_catalog_config(true), Arc::new(backend));
+        let session = sessions::create_session_for_app(&agent_loop.pool, "s1", "t", "kitty")
+            .await
+            .unwrap();
+        (agent_loop.with_decider(hub), session)
+    }
+
+    /// A new chat is offered only the groups its first message needs, plus
+    /// the safety valve; ungated tools always pass; the set is recorded.
+    #[tokio::test]
+    async fn a_new_chat_gets_only_the_groups_it_needs() {
+        let (agent_loop, session) =
+            gated_loop(|group, _| if group == "office" { 0.9 } else { 0.05 }, false).await;
+        let gate = agent_loop
+            .compute_tool_gate(
+                "s1",
+                &session,
+                &json!({}),
+                "summarize this pdf",
+                "p1",
+                "kitty",
+                &gate_tools(),
+            )
+            .await
+            .expect("gating is on");
+        let names: Vec<String> = gate.offered().into_iter().map(|t| t.name).collect();
+        assert_eq!(
+            names,
+            [
+                "lean_file_read",
+                "lean_pdf_read_text",
+                tool_gate::LOAD_GROUP_TOOL,
+                "record"
+            ]
+        );
+        let meta = serde_json::from_str::<Value>(
+            &sessions::get_session_metadata(&agent_loop.pool, "s1")
+                .await
+                .unwrap()
+                .filter(|m| !m.is_empty())
+                .unwrap_or_else(|| "{}".into()),
+        )
+        .unwrap();
+        let stored = tool_gate::GateState::read(&meta).unwrap();
+        assert_eq!(stored.groups.iter().collect::<Vec<_>>(), ["office"]);
+        assert_eq!(stored.provider, "p1");
+    }
+
+    /// With the decision model down, a new chat is offered everything and
+    /// nothing is recorded.
+    #[tokio::test]
+    async fn an_unreachable_model_offers_everything_and_records_nothing() {
+        let (agent_loop, session) = gated_loop(|_, _| 0.0, true).await;
+        let gate = agent_loop
+            .compute_tool_gate(
+                "s1",
+                &session,
+                &json!({}),
+                "hi",
+                "p1",
+                "kitty",
+                &gate_tools(),
+            )
+            .await;
+        assert!(gate.is_none());
+        let meta = serde_json::from_str::<Value>(
+            &sessions::get_session_metadata(&agent_loop.pool, "s1")
+                .await
+                .unwrap()
+                .filter(|m| !m.is_empty())
+                .unwrap_or_else(|| "{}".into()),
+        )
+        .unwrap();
+        assert!(tool_gate::GateState::read(&meta).is_none());
+    }
+
+    /// The safety valve loads a group mid-turn and marks the list for a
+    /// rebuild; calling a withheld tool directly loads its group too.
+    #[tokio::test]
+    async fn the_safety_valve_and_hidden_calls_load_groups() {
+        let (mut agent_loop, session) = gated_loop(|_, _| 0.0, false).await;
+        let gate = agent_loop
+            .compute_tool_gate(
+                "s1",
+                &session,
+                &json!({}),
+                "hi",
+                "p1",
+                "kitty",
+                &gate_tools(),
+            )
+            .await
+            .unwrap();
+        assert!(gate.state.lock().unwrap().groups.is_empty());
+        agent_loop.gate = Some(Arc::new(gate));
+        let (tx, _rx) = mpsc::unbounded_channel::<SSEEvent>();
+        let sink = dashmap::DashMap::new();
+        let out = agent_loop
+            .execute_one_tool_call(
+                "s1",
+                "c1".into(),
+                tool_gate::LOAD_GROUP_TOOL.into(),
+                json!({"group": "web"}),
+                &[],
+                Arc::new(Semaphore::new(1)),
+                &tx,
+                &sink,
+            )
+            .await;
+        assert!(out.contains("lean_web_search"), "{out}");
+        let gate = agent_loop.gate.as_ref().unwrap();
+        assert!(gate.dirty.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(gate.offered().iter().any(|t| t.name == "lean_web_search"));
+        let meta = serde_json::from_str::<Value>(
+            &sessions::get_session_metadata(&agent_loop.pool, "s1")
+                .await
+                .unwrap()
+                .filter(|m| !m.is_empty())
+                .unwrap_or_else(|| "{}".into()),
+        )
+        .unwrap();
+        assert!(tool_gate::GateState::read(&meta)
+            .unwrap()
+            .groups
+            .contains("web"));
     }
 
     /// Regression: the write-class containment hard-deny used to run AFTER

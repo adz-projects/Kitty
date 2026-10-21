@@ -268,10 +268,13 @@ pub mod testing {
     use super::super::backend::{DeciderBackend, DeciderError, ProbeResult};
     use super::super::{Answer, Answers, Question};
 
+    /// `(question name, question + state) -> P(yes)`.
+    pub type ScoreFn = dyn Fn(&str, &str) -> f32 + Send + Sync;
+
     /// Answers every yes/no with `p_yes(name)`, every choice with the first
     /// option, every score with `level`. `fail` makes every call error.
     pub struct Scripted {
-        pub p_yes: Box<dyn Fn(&str, &str) -> f32 + Send + Sync>,
+        pub p_yes: Box<ScoreFn>,
         pub level: usize,
         pub fail: bool,
         pub delay: std::time::Duration,

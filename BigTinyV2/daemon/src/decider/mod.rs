@@ -231,10 +231,20 @@ pub struct DeciderConfig {
     pub thresholds: Thresholds,
     #[serde(default)]
     pub tool_groups: Vec<ToolGroup>,
+    /// How long a provider keeps a prompt prefix cached, in seconds. A chat
+    /// idle for longer has a cold cache, so the tool gate may re-decide (and
+    /// shrink) its tool set for free. 300 matches Anthropic's and OpenAI's
+    /// default cache lifetime; a llama-server slot can be evicted sooner.
+    #[serde(default = "default_cache_ttl_secs")]
+    pub cache_ttl_secs: u64,
 }
 
 fn default_dialect() -> String {
     systemone::DIALECT.to_string()
+}
+
+fn default_cache_ttl_secs() -> u64 {
+    300
 }
 
 impl DeciderConfig {
@@ -256,7 +266,10 @@ impl DeciderConfig {
         let mut seen = std::collections::HashSet::new();
         for g in &self.tool_groups {
             if g.name.trim().is_empty() || !seen.insert(g.name.as_str()) {
-                return Err(format!("tool group names must be unique and non-empty ('{}')", g.name));
+                return Err(format!(
+                    "tool group names must be unique and non-empty ('{}')",
+                    g.name
+                ));
             }
         }
         Ok(())

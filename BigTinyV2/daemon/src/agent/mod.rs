@@ -10,6 +10,7 @@ pub mod sandbox;
 pub mod subagent_pick;
 pub mod summarizer_chain;
 pub mod tokens;
+pub mod tool_gate;
 pub mod types;
 
 use std::sync::Arc;
@@ -290,6 +291,7 @@ impl Agent {
             self.db.clone(),
         )
         .with_app_events(self.app_events.clone())
+        .with_decider(self.decider.clone())
     }
 
     /// Run one turn for `session_id` in the background, streaming events over
