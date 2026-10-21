@@ -70,6 +70,7 @@ impl SessionStats {
         session_id: &str,
         prompt_tokens: i32,
         completion_tokens: i32,
+        cache: CacheTokens,
         provider: &str,
         model: &str,
     ) -> Result<(), String> {
@@ -80,12 +81,23 @@ impl SessionStats {
                 .cloned()
                 .unwrap_or_default();
 
-            usage.push(json!({
+            let mut entry = json!({
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,
                 "provider": provider,
                 "model": model,
-            }));
+            });
+            // Only when the provider reported them: an absent key means "not
+            // reported", which is not the same as a cache miss (0).
+            if let Some(obj) = entry.as_object_mut() {
+                if let Some(n) = cache.read {
+                    obj.insert("cache_read_tokens".into(), json!(n));
+                }
+                if let Some(n) = cache.creation {
+                    obj.insert("cache_creation_tokens".into(), json!(n));
+                }
+            }
+            usage.push(entry);
 
             if usage.len() > 100 {
                 usage = usage[usage.len() - 100..].to_vec();
@@ -99,6 +111,14 @@ impl SessionStats {
         .await
         .map_err(|e| format!("Failed to update session config: {}", e))
     }
+}
+
+/// Prompt-cache counts for one model call, as the provider reported them.
+/// See `prompt_determinism.md` for what each provider means by them.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CacheTokens {
+    pub read: Option<i32>,
+    pub creation: Option<i32>,
 }
 
 fn round_6(v: f64) -> f64 {

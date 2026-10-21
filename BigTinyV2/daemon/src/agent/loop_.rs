@@ -3330,6 +3330,16 @@ impl AgentLoop {
                     .get("output_tokens")
                     .and_then(|v| v.as_i64())
                     .unwrap_or(0);
+                let cache_count = |key: &str| {
+                    usage_val
+                        .get(key)
+                        .and_then(|v| v.as_i64())
+                        .map(|n| i32::try_from(n).unwrap_or(i32::MAX))
+                };
+                let cache = crate::agent::context::stats::CacheTokens {
+                    read: cache_count("cache_read_tokens"),
+                    creation: cache_count("cache_creation_tokens"),
+                };
 
                 let _ = self
                     .stats
@@ -3340,6 +3350,7 @@ impl AgentLoop {
                         // and record garbage in the cost estimate.
                         i32::try_from(input_tokens).unwrap_or(i32::MAX),
                         i32::try_from(output_tokens).unwrap_or(i32::MAX),
+                        cache,
                         &provider_id,
                         &provider_model,
                     )

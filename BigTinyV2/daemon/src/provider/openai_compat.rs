@@ -1073,6 +1073,12 @@ impl OpenAISSEStream {
             // unlike Anthropic, where `input_tokens` already excludes them.
             if let Some(i) = usage["prompt_tokens_details"]["cached_tokens"].as_i64() {
                 usage_map.insert("cache_read_tokens".into(), i as i32);
+            } else if let Some(i) = json["timings"]["cache_n"].as_i64() {
+                // llama-server's own report, sent alongside `usage` in the
+                // final chunk: prompt tokens reused from the slot's KV cache.
+                // Older builds have no `prompt_tokens_details` at all, so this
+                // is the only way to see whether slot pinning is paying off.
+                usage_map.insert("cache_read_tokens".into(), i as i32);
             }
             if !usage_map.is_empty() {
                 self.pending.push_back(Delta {
@@ -1933,6 +1939,22 @@ mod sse_tests {
             .expect("expected a Delta carrying usage");
         assert_eq!(usage.get("input_tokens"), Some(&100));
         assert_eq!(usage.get("cache_read_tokens"), Some(&64));
+    }
+
+    #[tokio::test]
+    async fn llama_server_cache_n_is_the_fallback_for_cached_tokens() {
+        let chunk = "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":20},\"timings\":{\"cache_n\":90,\"prompt_n\":10}}\n\ndata: [DONE]\n\n";
+        let inner = stream::iter(vec![Ok::<bytes::Bytes, reqwest::Error>(
+            bytes::Bytes::from(chunk),
+        )]);
+        let deltas: Vec<Delta> = parse_openai_sse(inner, Duration::from_secs(300))
+            .collect()
+            .await;
+        let usage = deltas
+            .iter()
+            .find_map(|d| d.usage.as_ref())
+            .expect("expected a Delta carrying usage");
+        assert_eq!(usage.get("cache_read_tokens"), Some(&90));
     }
 
     #[tokio::test]
