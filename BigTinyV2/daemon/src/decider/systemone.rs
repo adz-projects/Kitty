@@ -8,10 +8,10 @@
 //!
 //! Response: `{"answers": {name: answer}, "usage": {...}}`. A `noul` answer is
 //! P(yes), either bare or as `{"noul": p}`; `choice` and `score` answers carry
-//! `confidence` and `probabilities`. The parser is deliberately lenient about
-//! the exact nesting, because the server's shape has to be read off a model
-//! card rather than a schema, and a shape it does not recognise only costs an
-//! omitted answer — which callers already treat as "no opinion".
+//! `confidence` and `probabilities` (verified against d1-3B-Q8_0; see
+//! `docs/VERSIONS.md`). The parser stays lenient about nesting, because a
+//! shape it does not recognise should only cost an omitted answer — which
+//! callers already treat as "no opinion".
 
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -74,7 +74,7 @@ impl SystemOne {
             .await
             .ok()?;
         if let Some(id) = models["data"][0]["id"].as_str() {
-            return Some(id.to_string());
+            return Some(file_name(id));
         }
         let props: Value = client()
             .get(format!("{}/props", self.base))
@@ -85,13 +85,18 @@ impl SystemOne {
             .json()
             .await
             .ok()?;
-        props["model_path"].as_str().map(|p| {
-            std::path::Path::new(p)
-                .file_name()
-                .map(|f| f.to_string_lossy().into_owned())
-                .unwrap_or_else(|| p.to_string())
-        })
+        props["model_path"].as_str().map(file_name)
     }
+}
+
+/// llama-server names a model by its path (`/models/d1-3B-Q8_0.gguf`); the
+/// file name is what a person recognises.
+fn file_name(path: &str) -> String {
+    path.rsplit(['/', '\\'])
+        .next()
+        .filter(|f| !f.is_empty())
+        .unwrap_or(path)
+        .to_string()
 }
 
 /// The request body for one call.
@@ -165,10 +170,14 @@ fn parse_one(raw: &Value, q: &Question) -> Option<Answer> {
                 .and_then(Value::as_str)
                 .map(str::to_string)
                 .or_else(|| argmax(&probabilities).map(|i| probabilities[i].0.clone()))?;
-            let confidence = raw
-                .get("confidence")
-                .and_then(as_prob)
-                .or_else(|| probabilities.iter().find(|(k, _)| *k == choice).map(|(_, p)| *p));
+            // The chosen option's own probability when there is one: the
+            // server's `confidence` is a separate calibration score, not
+            // P(choice) (d1 answers billing at P 0.984, confidence 0.976).
+            let confidence = probabilities
+                .iter()
+                .find(|(k, _)| *k == choice)
+                .map(|(_, p)| *p)
+                .or_else(|| raw.get("confidence").and_then(as_prob));
             Some(Answer {
                 choice: Some(choice),
                 confidence,
@@ -195,10 +204,12 @@ fn parse_one(raw: &Value, q: &Question) -> Option<Answer> {
                     .and_then(Value::as_f64)
                     .map(|s| (s.round().max(0.0) as usize).min(levels.len().saturating_sub(1)))
             })?;
-            let confidence = raw
-                .get("confidence")
-                .and_then(as_prob)
-                .or_else(|| probabilities.get(level).map(|(_, p)| *p));
+            // As for a choice: P(level), not the server's `confidence`, which
+            // for a rating is far lower (d1: P 0.56, confidence 0.35).
+            let confidence = probabilities
+                .get(level)
+                .map(|(_, p)| *p)
+                .or_else(|| raw.get("confidence").and_then(as_prob));
             Some(Answer {
                 level: Some(level),
                 confidence,
@@ -340,11 +351,60 @@ mod tests {
         assert_eq!(parse_answers(&bare, &qs())["refund"].yes, Some(0.2));
     }
 
+    /// Captured from d1-3B-Q8_0 on llama-server (2026-10-21).
+    #[test]
+    fn a_real_d1_response_parses() {
+        let body = json!({
+            "model": "/models/d1-3B-Q8_0.gguf",
+            "answers": {
+                "refund": {"type": "noul", "noul": 0.9900464540234327},
+                "team": {"type": "choice", "choice": "billing",
+                         "probabilities": {"billing": 0.9839131459285186,
+                                           "technical": 0.010439356290328806,
+                                           "fraud": 0.005647497781152579},
+                         "confidence": 0.975869718892778},
+                "urgency": {"type": "score", "score": 0.7585531286646272,
+                            "legend": {"0": "Can wait", "1": "Today", "2": "Blocking the customer now"},
+                            "probabilities": {"0": 0.33865559786138943, "1": 0.5641356756125938,
+                                              "2": 0.09720872652601668},
+                            "confidence": 0.3462035134188908},
+            },
+            "usage": {"input_tokens": 154, "output_tokens": 0},
+        });
+        let a = parse_answers(&body, &qs());
+        assert!((a["refund"].yes.unwrap() - 0.990).abs() < 1e-3);
+        assert_eq!(a["team"].choice.as_deref(), Some("billing"));
+        assert!((a["team"].confidence.unwrap() - 0.984).abs() < 1e-3);
+        assert_eq!(a["urgency"].level, Some(1));
+        assert!((a["urgency"].confidence.unwrap() - 0.564).abs() < 1e-3);
+        assert!((a["urgency"].probabilities[0].1 - 0.339).abs() < 1e-3);
+        assert_eq!(file_name("/models/d1-3B-Q8_0.gguf"), "d1-3B-Q8_0.gguf");
+    }
+
     #[test]
     fn unrecognised_answers_are_omitted_not_guessed() {
         let body = json!({"answers": {"refund": "yes", "team": {}}});
         let a = parse_answers(&body, &qs());
         assert!(a.is_empty());
+    }
+
+    /// Against a live server: `D1_URL=http://host:port cargo test -- --ignored live_d1`.
+    #[tokio::test]
+    #[ignore]
+    async fn live_d1() {
+        let url = std::env::var("D1_URL").expect("set D1_URL");
+        let b = SystemOne::new(&url);
+        let probe = b.probe().await;
+        println!("probe: {probe:?}");
+        assert!(probe.ok, "{probe:?}");
+        let a = b
+            .ask("I was charged twice this month, please refund one of them.", &qs())
+            .await
+            .unwrap();
+        println!("answers: {a:?}");
+        assert!(a["refund"].yes.unwrap() > 0.5);
+        assert_eq!(a["team"].choice.as_deref(), Some("billing"));
+        assert!(a["urgency"].level.is_some());
     }
 
     #[test]

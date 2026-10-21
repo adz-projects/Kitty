@@ -69,11 +69,17 @@ Added for the next daemon release (decision model, Settings → Decision model):
 
 The `systemone` dialect is `POST {url}/v1/systemone` with
 `{state, questions: {name: {type: noul|choice|score, instructions, criteria}}}`,
-as served by `llama-server -hf LiquidAI/d1-3B-GGUF:Q8_0`. Its answer shape was
-taken from the model card (bare P(yes) or `{noul}`; `choice`/`confidence`/
-`probabilities`; `score` with per-level `probabilities`), and the parsers accept
-either nesting: an answer they don't recognise is omitted, which every caller
-treats as "no opinion".
+as served by `llama-server -hf LiquidAI/d1-3B-GGUF:Q8_0`. Verified against
+d1-3B-Q8_0 on 2026-10-21 (`decider::systemone`'s `a_real_d1_response_parses`
+holds the captured response): `noul` answers `{type, noul}`; `choice` answers
+`{type, choice, probabilities: {option: p}, confidence}`; `score` answers
+`{type, score, legend: {"0": …}, probabilities: {"0": p, …}, confidence}` with
+**0-based** levels. `confidence` is a separate calibration score, **not**
+P(choice) — for a rating it runs far lower (P 0.56, confidence 0.35) — so every
+threshold compares probabilities. An answer the parsers don't recognise is
+omitted, which every caller treats as "no opinion". Run
+`D1_URL=http://host:port cargo test -- --ignored live_d1` in the daemon or
+kitty-web to re-check a server.
 
 Kitty detects each card's ladder itself (`src-tauri/src/bigtiny/effort/`):
 OpenRouter's catalog `reasoning` object (`supported_efforts`, highest first,

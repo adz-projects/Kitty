@@ -207,10 +207,12 @@ fn parse_yes(v: &Value) -> Option<f32> {
 fn parse_choice(v: &Value) -> Option<(String, f32)> {
     let probs = v.get("probabilities").and_then(Value::as_object);
     if let Some(choice) = v.get("choice").and_then(Value::as_str) {
-        let p = v
-            .get("confidence")
+        // P(choice) first: the server's `confidence` is a separate
+        // calibration score (see the engine's `decider::systemone`).
+        let p = probs
+            .and_then(|m| m.get(choice))
             .and_then(as_prob)
-            .or_else(|| probs.and_then(|m| m.get(choice)).and_then(as_prob))?;
+            .or_else(|| v.get("confidence").and_then(as_prob))?;
         return Some((choice.to_string(), p));
     }
     probs?
@@ -269,12 +271,44 @@ mod tests {
             Some(("paywall_or_login".into(), 0.8))
         );
         assert_eq!(parse_choice(&json!({})), None);
+        // A real d1 answer: the option's probability, not `confidence`.
+        assert_eq!(
+            parse_choice(&json!({"type": "choice", "choice": "content",
+                                 "probabilities": {"content": 0.75, "bot_challenge": 0.25},
+                                 "confidence": 0.4})),
+            Some(("content".into(), 0.75))
+        );
     }
 
     #[test]
     fn ordering_is_stable_and_keeps_unjudged_items_in_the_middle() {
         assert_eq!(order_by(&[Some(0.1), Some(0.9), None, Some(0.9)]), vec![1, 3, 2, 0]);
         assert_eq!(order_by(&[None, None]), vec![0, 1]);
+    }
+
+    /// Against a live server: `D1_URL=http://host:port cargo test -- --ignored live_d1`.
+    #[tokio::test]
+    #[ignore]
+    async fn live_d1() {
+        let url = std::env::var("D1_URL").expect("set D1_URL");
+        let d = Decider::from_config(&cfg(&url, &["page_classify", "search_rerank"], "")).unwrap();
+        let page = d
+            .classify_page(
+                "Just a moment...",
+                "Checking if the site connection is secure. Verify you are human.",
+            )
+            .await;
+        println!("page: {page:?}");
+        assert_eq!(page.map(|p| p.0), Some(PageKind::Challenge));
+        let scores = d
+            .relevance(
+                "rust trait object safety",
+                &["How to remove rust from tools".into(), "Object safety - The Rust Reference".into()],
+            )
+            .await
+            .unwrap();
+        println!("relevance: {scores:?}");
+        assert_eq!(order_by(&scores), vec![1, 0]);
     }
 
     #[tokio::test]

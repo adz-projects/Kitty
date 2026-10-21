@@ -1142,18 +1142,18 @@ const MARK_DROP: &str = "drop";
 /// Must survive into memory: marked `[KEY]` for the summarizer.
 const MARK_KEY_EXCHANGE: &str = "key";
 
-/// The rating each exchange gets, lowest first. The first level is the only
-/// one dropped, the last the only one marked.
-const IMPORTANCE_LEVELS: [&str; 4] = [
-    "Filler: thanks, okay, small talk or an acknowledgement",
-    "Background or context",
-    "A useful detail",
-    "A decision, requirement or fact the user stated, or a result that was produced",
-];
-/// Exchanges rated per decision-model call, and the most rated per pass.
-const JUDGE_BATCH: usize = 10;
+/// The two questions each exchange is asked, one exchange per call. Measured
+/// on d1-3B: asked of an exchange on its own, these separate filler ("thanks!"
+/// 0.68, "ok cool" 0.81) from decisions and constraints (0.97, 0.99) cleanly;
+/// rating several exchanges in one shared state did not — the model could not
+/// tell which exchange a question was about.
+const FILLER_QUESTION: &str = "Is this exchange only filler — thanks, okay, greetings or small      talk — with nothing worth remembering?";
+const KEY_QUESTION: &str = "Does this exchange contain a decision, requirement, deadline or      constraint the user stated, or a result that was produced, that later turns must remember?";
+/// An exchange is marked `[KEY]` at P(key) of at least this.
+const KEY_MIN: f32 = 0.5;
+/// The most exchanges rated per pass (one call each).
 const JUDGE_MAX: usize = 40;
-/// Each rating call's budget. Compaction runs in the background.
+/// Each call's budget. Compaction runs in the background.
 const JUDGE_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
 /// Characters of each message shown to the judge.
 const JUDGE_MESSAGE_CHARS: usize = 600;
@@ -1175,55 +1175,40 @@ fn exchange_text(exchange: &[Value]) -> String {
         .join("\n")
 }
 
-/// Rate the oldest exchanges' importance with the app's decision model (the
-/// `compaction` feature). One entry per exchange: `(level, confidence)`, or
-/// `None` where no rating came back. Empty when there is no judge.
+/// Rate the oldest exchanges with the app's decision model (the `compaction`
+/// feature): `(P(filler), P(key))` per exchange, or `None` where no answer came
+/// back. The first failure stops the rating — the rest stay unrated, which
+/// leaves them exactly as they would have been.
 async fn judge_exchanges(
     hub: &crate::decider::DeciderHub,
     app_id: &str,
     exchanges: &[Vec<Value>],
-) -> Vec<Option<(usize, f32)>> {
+) -> Vec<Option<(f32, f32)>> {
     use crate::decider::{Feature, Question};
     let mut out = vec![None; exchanges.len()];
-    let limit = exchanges.len().min(JUDGE_MAX);
-    for start in (0..limit).step_by(JUDGE_BATCH) {
-        let end = (start + JUDGE_BATCH).min(limit);
-        let mut state = String::new();
-        let mut questions = Vec::new();
-        for (i, ex) in exchanges[start..end].iter().enumerate() {
-            let n = start + i + 1;
-            state.push_str(&format!("[E{n}]\n{}\n\n", exchange_text(ex)));
-            questions.push((
-                format!("e{n}"),
-                Question::Score {
-                    instructions: format!(
-                        "How much of exchange E{n} must later turns of this conversation remember?"
-                    ),
-                    levels: IMPORTANCE_LEVELS.iter().map(|s| s.to_string()).collect(),
-                },
-            ));
-        }
+    let questions = vec![
+        ("filler".to_string(), Question::yes_no(FILLER_QUESTION)),
+        ("key".to_string(), Question::yes_no(KEY_QUESTION)),
+    ];
+    for (slot, ex) in out.iter_mut().zip(exchanges).take(JUDGE_MAX) {
         let Some(answers) = hub
-            .ask(app_id, Feature::Compaction, &state, &questions, JUDGE_BUDGET)
+            .ask(app_id, Feature::Compaction, &exchange_text(ex), &questions, JUDGE_BUDGET)
             .await
         else {
-            break; // no judge, or it failed: the rest stay unrated
+            break;
         };
-        for (i, slot) in out.iter_mut().enumerate().take(end).skip(start) {
-            *slot = answers
-                .get(&format!("e{}", i + 1))
-                .and_then(|a| Some((a.level?, a.confidence.unwrap_or(0.0))));
-        }
+        let p = |name: &str| answers.get(name).and_then(|a| a.yes);
+        *slot = p("filler").zip(p("key"));
     }
     out
 }
 
 /// Put the judge's verdict on an exchange's messages. Returns whether it was
 /// dropped (left out of the summarizer prompt).
-fn mark_exchange(exchange: &mut [Value], rating: Option<(usize, f32)>, drop_min: f32) -> bool {
+fn mark_exchange(exchange: &mut [Value], rating: Option<(f32, f32)>, drop_min: f32) -> bool {
     let mark = match rating {
-        Some((0, conf)) if conf >= drop_min => MARK_DROP,
-        Some((level, _)) if level + 1 == IMPORTANCE_LEVELS.len() => MARK_KEY_EXCHANGE,
+        Some((p_filler, _)) if p_filler >= drop_min => MARK_DROP,
+        Some((_, p_key)) if p_key >= KEY_MIN => MARK_KEY_EXCHANGE,
         _ => return false,
     };
     for m in exchange.iter_mut() {
@@ -1557,7 +1542,7 @@ async fn run_compaction_inner(
                     dropped[i] = mark_exchange(ex, ratings[i], drop_min);
                 }
                 let n_dropped = dropped.iter().filter(|d| **d).count();
-                if n_dropped > 0 || ratings.iter().any(|r| r.is_some_and(|(l, _)| l == 3)) {
+                if n_dropped > 0 || ratings.iter().any(|r| r.is_some_and(|(_, k)| k >= KEY_MIN)) {
                     hub.note_acted(&app_id, crate::decider::Feature::Compaction);
                 }
                 if n_dropped > 0 {
@@ -1746,13 +1731,13 @@ mod tests {
     #[test]
     fn confident_filler_is_dropped_and_key_exchanges_are_marked() {
         let mut filler = ex("thanks!", "You're welcome.");
-        assert!(mark_exchange(&mut filler, Some((0, 0.95)), 0.8));
+        assert!(mark_exchange(&mut filler, Some((0.95, 0.02)), 0.65));
         let mut unsure = ex("ok", "Sure.");
-        assert!(!mark_exchange(&mut unsure, Some((0, 0.5)), 0.8));
+        assert!(!mark_exchange(&mut unsure, Some((0.5, 0.1)), 0.65));
         let mut key = ex("Use Postgres 16, not MySQL.", "Noted.");
-        assert!(!mark_exchange(&mut key, Some((3, 0.7)), 0.8));
+        assert!(!mark_exchange(&mut key, Some((0.1, 0.97)), 0.65));
         let mut unrated = ex("hm", "yes");
-        assert!(!mark_exchange(&mut unrated, None, 0.8));
+        assert!(!mark_exchange(&mut unrated, None, 0.65));
 
         let chunk: Vec<Value> = [filler, unsure, key, unrated].concat();
         let prompt = build_summarizer_prompt(None, &chunk);
@@ -1771,7 +1756,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exchanges_are_rated_in_batches_and_failures_leave_them_unrated() {
+    async fn each_exchange_is_rated_and_failures_leave_them_unrated() {
         use crate::decider::hub::testing::Scripted;
         let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
@@ -1780,13 +1765,12 @@ mod tests {
             "url": "http://127.0.0.1:1", "features": {"compaction": true},
         }))
         .unwrap();
-        let mut backend = Scripted::yes(|_, _| 0.0);
-        backend.level = 3;
+        let backend = Scripted::yes(|name, _| if name == "key" { 0.9 } else { 0.1 });
         hub.install_for_test("kitty", config.clone(), std::sync::Arc::new(backend));
         let exchanges: Vec<Vec<Value>> = (0..12).map(|_| ex("a", "b")).collect();
         let ratings = judge_exchanges(&hub, "kitty", &exchanges).await;
         assert_eq!(ratings.len(), 12);
-        assert!(ratings.iter().all(|r| *r == Some((3, 0.9))));
+        assert!(ratings.iter().all(|r| *r == Some((0.1, 0.9))));
 
         let mut failing = Scripted::yes(|_, _| 0.0);
         failing.fail = true;

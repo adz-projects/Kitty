@@ -52,7 +52,7 @@ export const DECIDER_THRESHOLDS: { key: string; label: string }[] = [
   { key: 'recall_drop_below', label: 'Recall: drop a belief below P' },
   { key: 'ingest_gate_reject_below', label: 'Ingest gate: reject a document below P' },
   { key: 'page_classify_min', label: 'Page check: act on a label at P ≥' },
-  { key: 'compaction_drop_min', label: 'Compaction: leave out filler at confidence ≥' },
+  { key: 'compaction_drop_min', label: 'Compaction: leave out filler at P ≥' },
 ];
 
 /** The two web checks run inside kitty-web, whose counters the engine

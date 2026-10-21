@@ -573,7 +573,9 @@ fn output_tokens_including_reasoning(usage: &Value) -> Option<i32> {
 
 /// The tool gate's whole budget for one question round. It runs alongside
 /// memory recall, so within this it costs the turn nothing.
-const GATE_BUDGET_MS: u64 = 400;
+// 700, not less: a cold decision is five questions in one call, measured at
+// 110 to 320 ms against a d1 reached over Tailscale.
+const GATE_BUDGET_MS: u64 = 700;
 /// How much recent history a mid-chat cold decision looks at.
 const GATE_RECENT_MESSAGES: i64 = 6;
 

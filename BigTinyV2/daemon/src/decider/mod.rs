@@ -171,11 +171,13 @@ pub struct Thresholds {
     pub learn_gate_skip_below: f32,
     /// Recall: drop a belief when P(relevant) < this (identity slots exempt).
     pub recall_drop_below: f32,
-    /// Factual memory: reject a document when P(worth keeping) < this.
+    /// Factual memory: reject a document when P(worth keeping) < this. On d1,
+    /// a bot-check page and a navigation bar scored 0.21 and 0.16, real
+    /// reference text 0.88 to 0.93.
     pub ingest_gate_reject_below: f32,
     /// Web: act on a page label only when its probability is ≥ this.
     pub page_classify_min: f32,
-    /// Compaction: leave a filler exchange out only at confidence ≥ this.
+    /// Compaction: leave an exchange out of the summary at P(filler) ≥ this.
     pub compaction_drop_min: f32,
 }
 
@@ -186,9 +188,9 @@ impl Default for Thresholds {
             tool_gating_add: 0.60,
             learn_gate_skip_below: 0.15,
             recall_drop_below: 0.08,
-            ingest_gate_reject_below: 0.15,
+            ingest_gate_reject_below: 0.35,
             page_classify_min: 0.70,
-            compaction_drop_min: 0.80,
+            compaction_drop_min: 0.65,
         }
     }
 }
