@@ -102,3 +102,25 @@ pub async fn probe(Json(body): Json<ProbeRequest>) -> Response {
         .unwrap_or_else(|| crate::decider::systemone::DIALECT.to_string());
     Json(DeciderHub::probe(&dialect, &body.url).await).into_response()
 }
+
+#[derive(Debug, Deserialize)]
+pub struct ScreenRequest {
+    pub command: String,
+}
+
+/// `POST /api/apps/me/decider/screen-command` `{command}` → `{risk, flagged}`,
+/// or `{risk: null, flagged: false}` when the shell screen is off or had no
+/// answer. Escalation only: an app should hold a flagged command for a
+/// person, and treat anything else exactly as it would have.
+pub async fn screen_command(
+    State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<AppIdentity>,
+    Json(body): Json<ScreenRequest>,
+) -> Response {
+    match crate::decider::shell_screen::screen(state.agent.decider(), &identity.app_id, &body.command)
+        .await
+    {
+        Some(v) => Json(json!({"risk": v.risk, "flagged": v.flagged})).into_response(),
+        None => Json(json!({"risk": null, "flagged": false})).into_response(),
+    }
+}

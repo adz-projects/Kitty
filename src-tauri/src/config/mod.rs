@@ -907,36 +907,45 @@ fn default_decider_dialect() -> String {
     "systemone".into()
 }
 
-/// Each use of the decision model, switched on and off on its own. All on by
-/// default, so setting a URL is enough to try it.
+/// Each use of the decision model, switched on and off on its own.
+///
+/// On by default: the four that held up when measured against real chats
+/// (tool gating, page check, ingest gate, shell screen). Off by default: the
+/// four that did not earn their cost -- search re-rank (no gain in ranking),
+/// the learn gate (could not tell productive chunks from empty ones), recall
+/// relevance (too slow for its budget at 32 beliefs) and compaction ratings
+/// (marked too much as key). They stay switchable.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DeciderFeatures {
     #[serde(default = "default_true")]
     pub tool_gating: bool,
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub learn_gate: bool,
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub recall_rerank: bool,
     #[serde(default = "default_true")]
     pub ingest_gate: bool,
     #[serde(default = "default_true")]
     pub page_classify: bool,
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub search_rerank: bool,
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub compaction: bool,
+    #[serde(default = "default_true")]
+    pub shell_screen: bool,
 }
 
 impl Default for DeciderFeatures {
     fn default() -> Self {
         Self {
             tool_gating: true,
-            learn_gate: true,
-            recall_rerank: true,
+            learn_gate: false,
+            recall_rerank: false,
             ingest_gate: true,
             page_classify: true,
-            search_rerank: true,
-            compaction: true,
+            search_rerank: false,
+            compaction: false,
+            shell_screen: true,
         }
     }
 }

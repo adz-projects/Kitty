@@ -87,6 +87,7 @@ pub fn desired(settings: &DeciderSettings) -> Option<Value> {
             "page_classify": f.page_classify,
             "search_rerank": f.search_rerank,
             "compaction": f.compaction,
+            "shell_screen": f.shell_screen,
         },
         "thresholds": Value::Object(settings.thresholds.clone()),
         "tool_groups": tool_groups(),

@@ -37,6 +37,12 @@ export const DECIDER_FEATURES: { id: DeciderFeature; label: string; blurb: strin
     blurb: 'Orders merged web search results by how well they match the query.',
   },
   {
+    id: 'shell_screen',
+    label: 'Shell screen',
+    blurb:
+      'A second opinion on shell commands Kitty would otherwise run without asking: one that could delete files, change settings, install software, send data out or expose credentials is held for your approval. It can only add a prompt, never remove one.',
+  },
+  {
     id: 'compaction',
     label: 'Compaction',
     blurb:
@@ -53,6 +59,7 @@ export const DECIDER_THRESHOLDS: { key: string; label: string }[] = [
   { key: 'ingest_gate_reject_below', label: 'Ingest gate: reject a document below P' },
   { key: 'page_classify_min', label: 'Page check: act on a label at P ≥' },
   { key: 'compaction_drop_min', label: 'Compaction: leave out filler at P ≥' },
+  { key: 'shell_screen_flag_at', label: 'Shell screen: ask before running at P(risky) ≥' },
 ];
 
 /** The two web checks run inside kitty-web, whose counters the engine

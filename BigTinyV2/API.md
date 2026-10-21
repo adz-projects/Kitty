@@ -334,7 +334,7 @@ dialect, a bad URL or duplicate group names); `DELETE` removes it.
   "model": "d1-3B-Q8_0.gguf",
   "features": {"tool_gating": true, "learn_gate": true, "recall_rerank": true,
                "ingest_gate": true, "page_classify": true, "search_rerank": true,
-               "compaction": true},
+               "compaction": true, "shell_screen": true},
   "thresholds": {"tool_gating_add": 0.6},
   "tool_groups": [{"name": "office", "description": "reading Word, Excel or PDF",
                    "tools": ["lean_word_*", "lean_pdf_*"], "always": false,
@@ -356,6 +356,11 @@ the engine did).
 
 `POST /api/apps/me/decider/probe` `{dialect?, url}` → `{ok, model, rtt_ms,
 error}`, without saving anything.
+
+`POST /api/apps/me/decider/screen-command` `{command}` → `{risk, flagged}` (the
+`shell_screen` feature), or `{risk: null, flagged: false}` when it is off or had
+no answer. **Escalation only**: an app holds a flagged command for a person and
+decides anything else exactly as it would have.
 
 **Tool gating** keeps a chat's tool set in its metadata (`tool_gate`) and adds
 a loop-only tool, `load_tool_group`, while gating is on. Usage entries in

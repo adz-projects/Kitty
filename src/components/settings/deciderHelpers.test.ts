@@ -14,6 +14,7 @@ const base: DeciderSettings = {
     page_classify: true,
     search_rerank: true,
     compaction: true,
+    shell_screen: true,
   },
   thresholds: {},
 };

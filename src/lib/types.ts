@@ -103,7 +103,8 @@ export type DeciderFeature =
   | 'ingest_gate'
   | 'page_classify'
   | 'search_rerank'
-  | 'compaction';
+  | 'compaction'
+  | 'shell_screen';
 
 /** Mirrors `config::DeciderSettings`. An empty `url` means no decision model. */
 export interface DeciderSettings {

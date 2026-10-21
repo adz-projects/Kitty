@@ -188,7 +188,18 @@ async fn on_pause(
         return;
     }
     let session = session_view(app, &session_id).await;
-    let warning = match approvals::decide(&tool_args, &session.dirs) {
+    let mut decision = approvals::decide(&tool_args, &session.dirs);
+    // A shell command Kitty would allow on its own gets a second opinion from
+    // the decision model, when there is one. Escalation only: a flagged
+    // command goes to a person; anything else is decided as before.
+    if decision == Decision::Allow {
+        if let Some(command) = tool_args.get("command").and_then(|c| c.as_str()) {
+            if let Some(warning) = screen_shell_command(app, command).await {
+                decision = Decision::Prompt { warning };
+            }
+        }
+    }
+    let warning = match decision {
         Decision::Allow => {
             match approve(app, &session_id, &action_id, "allow", None).await {
                 Ok(()) => return,
@@ -216,6 +227,30 @@ async fn on_pause(
     crate::notifications::refresh_tray(app);
     let _ = app.emit("approval://needed", &pending);
     bring_to_attention(app, &pending);
+}
+
+/// The decision model's shell screen (`/api/apps/me/decider/screen-command`):
+/// the warning to show when it flags `command`, else `None`. Any failure is
+/// `None` -- the screen can add a prompt, never remove one.
+async fn screen_shell_command(app: &AppHandle, command: &str) -> Option<String> {
+    let client = crate::bigtiny::client::ensure_client(app).ok()?;
+    let verdict = client
+        .post_json(
+            "/api/apps/me/decider/screen-command",
+            &json!({ "command": command }),
+        )
+        .await
+        .ok()?;
+    if verdict.get("flagged").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let risk = verdict.get("risk").and_then(Value::as_f64).unwrap_or(0.0);
+    Some(format!(
+        "The decision model rates \"{command}\" as possibly risky ({:.0}%): it could delete or \
+         overwrite files, change settings, install software, send data out, or expose \
+         credentials.",
+        risk * 100.0
+    ))
 }
 
 /// Somebody has to see this: a notification if they are elsewhere, and on

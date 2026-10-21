@@ -116,6 +116,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/apps/me/decider/stats", get(decider::stats))
         .route("/api/apps/me/decider/probe", post(decider::probe))
+        .route(
+            "/api/apps/me/decider/screen-command",
+            post(decider::screen_command),
+        )
         .route("/api/status", get(health::status))
         .route("/api/local/models/status", get(local::models_status))
         .route("/api/memory/stats", get(memory::stats))

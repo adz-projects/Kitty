@@ -19,6 +19,7 @@
 pub mod backend;
 pub mod hub;
 pub mod memory_gates;
+pub mod shell_screen;
 pub mod systemone;
 
 use std::collections::BTreeMap;
@@ -101,10 +102,11 @@ pub enum Feature {
     PageClassify,
     SearchRerank,
     Compaction,
+    ShellScreen,
 }
 
 impl Feature {
-    pub const ALL: [Feature; 7] = [
+    pub const ALL: [Feature; 8] = [
         Feature::ToolGating,
         Feature::LearnGate,
         Feature::RecallRerank,
@@ -112,6 +114,7 @@ impl Feature {
         Feature::PageClassify,
         Feature::SearchRerank,
         Feature::Compaction,
+        Feature::ShellScreen,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -123,6 +126,7 @@ impl Feature {
             Feature::PageClassify => "page_classify",
             Feature::SearchRerank => "search_rerank",
             Feature::Compaction => "compaction",
+            Feature::ShellScreen => "shell_screen",
         }
     }
 }
@@ -139,6 +143,7 @@ pub struct Features {
     pub page_classify: bool,
     pub search_rerank: bool,
     pub compaction: bool,
+    pub shell_screen: bool,
 }
 
 impl Features {
@@ -151,6 +156,7 @@ impl Features {
             Feature::PageClassify => self.page_classify,
             Feature::SearchRerank => self.search_rerank,
             Feature::Compaction => self.compaction,
+            Feature::ShellScreen => self.shell_screen,
         }
     }
 }
@@ -183,6 +189,11 @@ pub struct Thresholds {
     pub page_classify_min: f32,
     /// Compaction: leave an exchange out of the summary at P(filler) ≥ this.
     pub compaction_drop_min: f32,
+    /// Shell screen: hold an otherwise auto-approved command for the user at
+    /// P(risky) ≥ this. Low on purpose -- it can only add a prompt, never
+    /// remove one. On d1 it caught 10 of 12 dangerous commands at 0.30 with
+    /// no false alarms on 10 read-only ones.
+    pub shell_screen_flag_at: f32,
 }
 
 impl Default for Thresholds {
@@ -195,6 +206,7 @@ impl Default for Thresholds {
             ingest_gate_reject_below: 0.35,
             page_classify_min: 0.70,
             compaction_drop_min: 0.65,
+            shell_screen_flag_at: 0.30,
         }
     }
 }

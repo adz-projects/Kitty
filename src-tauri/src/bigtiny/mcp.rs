@@ -887,7 +887,8 @@ mod tests {
         d.url = "http://box:8080".into();
         let env: HashMap<_, _> = decider_web_env(&d).into_iter().collect();
         assert_eq!(env["KITTY_DECIDER_URL"], "http://box:8080");
-        assert_eq!(env["KITTY_DECIDER_FEATURES"], "page_classify,search_rerank");
+        // Search re-rank is off by default; the page check is on.
+        assert_eq!(env["KITTY_DECIDER_FEATURES"], "page_classify");
         assert!(!env.contains_key("KITTY_DECIDER_THRESHOLDS"));
         d.features.page_classify = false;
         d.features.search_rerank = false;
