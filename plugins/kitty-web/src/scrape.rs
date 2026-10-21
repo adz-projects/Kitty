@@ -812,6 +812,11 @@ pub async fn web_scrape(
 
     let status = response.status();
     if !status.is_success() {
+        // A 403/429/503 is often a bot challenge rather than a real refusal;
+        // when the page check can tell, say so instead of a bare status.
+        if let Some(checked) = check_failed_page(response, url).await {
+            return checked;
+        }
         return error_response(
             "SCRAPE_HTTP_ERROR",
             &format!("HTTP {} fetching URL.", status.as_u16()),
@@ -945,6 +950,10 @@ pub async fn web_scrape(
         }
     };
 
+    // The page check reads only the opening of the body; keep that much
+    // before the HTML moves to the blocking pool.
+    let html_head: String = html.chars().take(PAGE_HEAD_CHARS).collect();
+
     // Extraction/serialization is CPU-bound DOM work — keep it off the
     // reactor (audit #113). Owned copies cross the thread boundary.
     let (url_owned, query_owned, format_owned) = (
@@ -968,6 +977,7 @@ pub async fn web_scrape(
     })
     .await;
     match rendered {
+        Ok(s) if offset == 0 => check_rendered_page(s, url, &html_head).await,
         Ok(s) => s,
         Err(e) => error_response(
             "INTERNAL_PANIC",
@@ -976,6 +986,114 @@ pub async fn web_scrape(
             Some("Retry with a different URL; if this persists, the page's markup may be hitting a parser edge case."),
         ),
     }
+}
+
+/// How much raw HTML the page check keeps for a page that extracted to
+/// nothing (its visible text is all there is to judge).
+const PAGE_HEAD_CHARS: usize = 64 * 1024;
+
+/// Visible text from raw HTML, roughly: scripts, styles and tags dropped,
+/// whitespace collapsed. Only for the page check, which needs a gist.
+fn rough_text(html: &str) -> String {
+    use std::sync::OnceLock;
+    static NOISE: OnceLock<regex::Regex> = OnceLock::new();
+    static TAG: OnceLock<regex::Regex> = OnceLock::new();
+    let noise = NOISE.get_or_init(|| {
+        regex::Regex::new(r"(?is)<(script|style|noscript)[^>]*>.*?</(script|style|noscript)>")
+            .expect("static regex")
+    });
+    let tag = TAG.get_or_init(|| regex::Regex::new(r"(?s)<[^>]*>").expect("static regex"));
+    let quiet = noise.replace_all(html, " ");
+    let text = tag.replace_all(&quiet, " ");
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn title_of(html: &str) -> String {
+    let lower = html.to_ascii_lowercase();
+    let Some(start) = lower.find("<title") else {
+        return String::new();
+    };
+    let Some(open_end) = lower[start..].find('>').map(|i| start + i + 1) else {
+        return String::new();
+    };
+    let end = lower[open_end..].find("</title").map_or(open_end, |i| open_end + i);
+    html.get(open_end..end).unwrap_or("").trim().to_string()
+}
+
+/// The error a page-check label turns into, or `None` to keep the result.
+fn relabel(kind: crate::decider::PageKind, url: &str) -> Option<String> {
+    use crate::decider::PageKind;
+    match kind {
+        PageKind::Content => None,
+        PageKind::Challenge => Some(error_response(
+            "SCRAPE_CHALLENGE",
+            "The site answered with a bot check instead of the page.",
+            Some(url),
+            Some(
+                "This site blocks automated reading. Use lean_web_search to find another source \
+                 for the same information.",
+            ),
+        )),
+        PageKind::PaywallOrLogin => Some(error_response(
+            "SCRAPE_PAYWALL",
+            "The page is behind a paywall or login.",
+            Some(url),
+            Some("Only a teaser is public. Look for another source with lean_web_search."),
+        )),
+        PageKind::ErrorPage => Some(error_response(
+            "SCRAPE_ERROR_PAGE",
+            "The site returned an error page rather than the content.",
+            Some(url),
+            Some("The page may have moved or been removed. Try lean_web_search."),
+        )),
+        PageKind::EmptyShell => Some(error_response(
+            "SCRAPE_EMPTY",
+            "The page needs JavaScript to show its content.",
+            Some(url),
+            Some("Try a different URL for the same content, or use lean_web_search."),
+        )),
+    }
+}
+
+/// Run the page check over a rendered scrape result: a success that is
+/// really a challenge, paywall or error page becomes the matching error; an
+/// empty extraction gets a more precise reason. Any other case — or no
+/// decision model, the check off, no confident answer — returns `rendered`
+/// unchanged.
+async fn check_rendered_page(rendered: String, url: &str, html_head: &str) -> String {
+    let Some(decider) = crate::decider::Decider::current("page_classify") else {
+        return rendered;
+    };
+    let Ok(v) = serde_json::from_str::<Value>(&rendered) else {
+        return rendered;
+    };
+    let (title, text) = match v.get("status").and_then(Value::as_str) {
+        Some("success") => (
+            v.pointer("/metadata/title")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            v.get("data").and_then(Value::as_str).unwrap_or("").to_string(),
+        ),
+        Some("error") if v.get("error_code").and_then(Value::as_str) == Some("SCRAPE_EMPTY") => {
+            (title_of(html_head), rough_text(html_head))
+        }
+        _ => return rendered,
+    };
+    match decider.classify_page(&title, &text).await {
+        Some((kind, _)) => relabel(kind, url).unwrap_or(rendered),
+        None => rendered,
+    }
+}
+
+/// The page check for a non-2xx response: read a little of the body and ask.
+/// `None` keeps the plain HTTP error.
+async fn check_failed_page(response: reqwest::Response, url: &str) -> Option<String> {
+    let decider = crate::decider::Decider::current("page_classify")?;
+    let body = read_body_capped(response, PAGE_HEAD_CHARS).await.ok()?;
+    let html = String::from_utf8_lossy(&body);
+    let (kind, _) = decider.classify_page(&title_of(&html), &rough_text(&html)).await?;
+    relabel(kind, url)
 }
 
 /// The pure half of `web_scrape`: everything after the HTTP response body is
@@ -1095,6 +1213,29 @@ pub fn render_scrape_result(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_page_check_sees_title_and_visible_text_only() {
+        let html = "<html><head><title> Just a moment... </title><style>p{}</style>                    <script>var x = 1;</script></head><body><p>Checking your  browser</p></body></html>";
+        assert_eq!(title_of(html), "Just a moment...");
+        assert_eq!(rough_text(html), "Just a moment... Checking your browser");
+    }
+
+    #[test]
+    fn page_labels_map_to_error_codes_and_content_keeps_the_result() {
+        use crate::decider::PageKind;
+        assert!(relabel(PageKind::Content, "u").is_none());
+        assert!(relabel(PageKind::Challenge, "u").unwrap().contains("SCRAPE_CHALLENGE"));
+        assert!(relabel(PageKind::PaywallOrLogin, "u").unwrap().contains("SCRAPE_PAYWALL"));
+    }
+
+    #[tokio::test]
+    async fn without_a_decision_model_the_rendered_page_is_untouched() {
+        let rendered = success_response(json!("body"), None, false, None);
+        let cfg = std::sync::Arc::new(crate::config::InProcessConfig::default());
+        let out = crate::config::scope(cfg, check_rendered_page(rendered.clone(), "u", "")).await;
+        assert_eq!(out, rendered);
+    }
 
     fn s(items: &[&str]) -> Vec<String> {
         items.iter().map(|x| x.to_string()).collect()

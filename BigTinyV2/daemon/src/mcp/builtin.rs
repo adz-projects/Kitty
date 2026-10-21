@@ -200,6 +200,8 @@ mod tests {
             "KITTY_VIZ_ENABLED": "1",
             "BRAVE_API_KEY": "k",
             "KITTY_WASM_DATA_DIR": "/apps/a/wasm",
+            "KITTY_DECIDER_URL": "http://box:8080",
+            "KITTY_DECIDER_FEATURES": "page_classify",
         });
         let map = env_map(Some(&env));
 
@@ -213,6 +215,10 @@ mod tests {
             kitty_web::InProcessConfig::from_map(&map).brave_api_key,
             "k"
         );
+        // The decision model reaches kitty-web through the same row env.
+        let web = kitty_web::InProcessConfig::from_map(&map);
+        assert_eq!(web.decider_url, "http://box:8080");
+        assert_eq!(web.decider_features, ["page_classify"]);
         assert_eq!(
             kitty_wasm::InProcessConfig::from_map(&map)
                 .wasm_data_dir

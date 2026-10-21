@@ -1513,7 +1513,7 @@ pub async fn web_search(
     }
 
     let mode = mode_for_count(count);
-    let (mut results, diagnostics) = if mode == "normal" {
+    let (mut results, mut diagnostics) = if mode == "normal" {
         match normal_search(&guarded_q, count, locale, freshness).await {
             Ok(v) => v,
             Err(e) => {
@@ -1555,6 +1555,29 @@ pub async fn web_search(
             None,
             Some("Try a broader or different query, or increase count."),
         );
+    }
+
+    // Re-rank the merged pool by relevance when the decision model is on for
+    // it — before ids, the offload and `take(count)`, so all three agree.
+    // Only reorders; never drops. A failure keeps the merge order.
+    if let Some(decider) = crate::decider::Decider::current("search_rerank") {
+        let items: Vec<String> = results
+            .iter()
+            .map(|r| {
+                let snippet: String = r.snippet_full.chars().take(300).collect();
+                format!("{} ({}): {snippet}", r.title, r.domain)
+            })
+            .collect();
+        let status = match decider.relevance(&guarded_q, &items).await {
+            Some(scores) => {
+                let order = crate::decider::order_by(&scores);
+                let mut slots: Vec<Option<SearchItem>> = results.drain(..).map(Some).collect();
+                results = order.into_iter().filter_map(|i| slots[i].take()).collect();
+                "ok"
+            }
+            None => "skipped",
+        };
+        diagnostics.insert("rerank".into(), status.into());
     }
 
     // Ids and the offload write happen for every mode, not just "expansive" —

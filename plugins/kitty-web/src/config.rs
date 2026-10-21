@@ -31,6 +31,16 @@ use crate::paths::PLUGIN_HOME_ENV;
 /// key-free DuckDuckGo/Bing pair only.
 pub const BRAVE_API_KEY_ENV: &str = "BRAVE_API_KEY";
 
+/// The decision model's endpoint; unset or empty means none (`decider.rs`).
+pub const DECIDER_URL_ENV: &str = "KITTY_DECIDER_URL";
+/// Its wire dialect (`systemone`).
+pub const DECIDER_DIALECT_ENV: &str = "KITTY_DECIDER_DIALECT";
+/// The web checks switched on, comma-separated (`page_classify`,
+/// `search_rerank`).
+pub const DECIDER_FEATURES_ENV: &str = "KITTY_DECIDER_FEATURES";
+/// Threshold overrides as a JSON object (`page_classify_min`).
+pub const DECIDER_THRESHOLDS_ENV: &str = "KITTY_DECIDER_THRESHOLDS";
+
 /// Everything this server reads from its host.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct InProcessConfig {
@@ -38,6 +48,12 @@ pub struct InProcessConfig {
     pub plugin_home: Option<PathBuf>,
     /// A Brave Search API key; empty when Brave is not configured.
     pub brave_api_key: String,
+    /// The decision model's endpoint; empty when there is none.
+    pub decider_url: String,
+    pub decider_dialect: String,
+    pub decider_features: Vec<String>,
+    /// Raw JSON object of threshold overrides; empty for none.
+    pub decider_thresholds: String,
 }
 
 impl InProcessConfig {
@@ -52,6 +68,17 @@ impl InProcessConfig {
         Self {
             plugin_home,
             brave_api_key: non_empty(BRAVE_API_KEY_ENV).unwrap_or_default(),
+            decider_url: non_empty(DECIDER_URL_ENV).unwrap_or_default(),
+            decider_dialect: non_empty(DECIDER_DIALECT_ENV).unwrap_or_default(),
+            decider_features: non_empty(DECIDER_FEATURES_ENV)
+                .map(|v| {
+                    v.split(',')
+                        .map(|f| f.trim().to_string())
+                        .filter(|f| !f.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            decider_thresholds: non_empty(DECIDER_THRESHOLDS_ENV).unwrap_or_default(),
         }
     }
 
@@ -124,6 +151,10 @@ mod tests {
         let map: HashMap<String, String> = [
             (PLUGIN_HOME_ENV.to_string(), "home".to_string()),
             (BRAVE_API_KEY_ENV.to_string(), "k".to_string()),
+            (DECIDER_URL_ENV.to_string(), "http://box:8080".to_string()),
+            (DECIDER_DIALECT_ENV.to_string(), "systemone".to_string()),
+            (DECIDER_FEATURES_ENV.to_string(), "page_classify, search_rerank".to_string()),
+            (DECIDER_THRESHOLDS_ENV.to_string(), "{\"page_classify_min\":0.8}".to_string()),
         ]
         .into();
         assert_eq!(
@@ -131,6 +162,10 @@ mod tests {
             InProcessConfig {
                 plugin_home: Some(PathBuf::from("home")),
                 brave_api_key: "k".to_string(),
+                decider_url: "http://box:8080".to_string(),
+                decider_dialect: "systemone".to_string(),
+                decider_features: vec!["page_classify".to_string(), "search_rerank".to_string()],
+                decider_thresholds: "{\"page_classify_min\":0.8}".to_string(),
             }
         );
     }
