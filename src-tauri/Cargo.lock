@@ -4,7 +4,7 @@ version = 3
 
 [[package]]
 name = "adaptive-pathway"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = [
  "async-trait",
  "chrono",
@@ -539,7 +539,7 @@ dependencies = [
 
 [[package]]
 name = "bigtiny2_daemon"
-version = "2.3.0"
+version = "2.4.0"
 dependencies = [
  "adaptive-pathway",
  "aes-gcm",
@@ -3682,7 +3682,7 @@ dependencies = [
 
 [[package]]
 name = "kitty"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = [
  "base64 0.22.1",
  "bigtiny2-client",
@@ -3724,7 +3724,7 @@ dependencies = [
 
 [[package]]
 name = "kitty-tools"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3746,7 +3746,7 @@ dependencies = [
 
 [[package]]
 name = "kitty-wasm"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = [
  "anyhow",
  "bytes",
@@ -3764,7 +3764,7 @@ dependencies = [
 
 [[package]]
 name = "kitty-web"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -4170,7 +4170,7 @@ dependencies = [
 
 [[package]]
 name = "memorabilia"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = [
  "async-trait",
  "chrono",
