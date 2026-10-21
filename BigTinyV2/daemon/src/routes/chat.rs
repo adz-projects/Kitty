@@ -843,6 +843,7 @@ pub async fn compact_session(
         &state.config.memory,
         context_length,
         true,
+        Some(state.agent.decider()),
     )
     .await;
 

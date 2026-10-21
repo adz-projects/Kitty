@@ -1130,6 +1130,110 @@ const SUMMARIZER_INSTRUCTIONS: &str =
      current_task_state to the immediate focus/next-step as of the end of the \
      new chunk. Respond with JSON matching the given schema only.";
 
+/// Added to the instructions when the decision model marked key exchanges.
+const KEY_INSTRUCTION: &str = "Lines marked [KEY] carry decisions, requirements, results or \
+     facts the user stated: make sure their substance is kept in memory.";
+
+/// A message's mark from the decision model (`judge_exchanges`), carried on
+/// the message itself until the summarizer prompt is built.
+const MARK_KEY: &str = "_compaction";
+/// Pure filler: left out of the summarizer prompt, still folded past.
+const MARK_DROP: &str = "drop";
+/// Must survive into memory: marked `[KEY]` for the summarizer.
+const MARK_KEY_EXCHANGE: &str = "key";
+
+/// The rating each exchange gets, lowest first. The first level is the only
+/// one dropped, the last the only one marked.
+const IMPORTANCE_LEVELS: [&str; 4] = [
+    "Filler: thanks, okay, small talk or an acknowledgement",
+    "Background or context",
+    "A useful detail",
+    "A decision, requirement or fact the user stated, or a result that was produced",
+];
+/// Exchanges rated per decision-model call, and the most rated per pass.
+const JUDGE_BATCH: usize = 10;
+const JUDGE_MAX: usize = 40;
+/// Each rating call's budget. Compaction runs in the background.
+const JUDGE_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
+/// Characters of each message shown to the judge.
+const JUDGE_MESSAGE_CHARS: usize = 600;
+
+/// One exchange as the judge sees it.
+fn exchange_text(exchange: &[Value]) -> String {
+    exchange
+        .iter()
+        .map(|m| {
+            let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("unknown");
+            if role == "tool" {
+                return "tool: [tool result]".to_string();
+            }
+            let content = m.get("content").map(render_content_as_text).unwrap_or_default();
+            let short: String = content.chars().take(JUDGE_MESSAGE_CHARS).collect();
+            format!("{role}: {short}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Rate the oldest exchanges' importance with the app's decision model (the
+/// `compaction` feature). One entry per exchange: `(level, confidence)`, or
+/// `None` where no rating came back. Empty when there is no judge.
+async fn judge_exchanges(
+    hub: &crate::decider::DeciderHub,
+    app_id: &str,
+    exchanges: &[Vec<Value>],
+) -> Vec<Option<(usize, f32)>> {
+    use crate::decider::{Feature, Question};
+    let mut out = vec![None; exchanges.len()];
+    let limit = exchanges.len().min(JUDGE_MAX);
+    for start in (0..limit).step_by(JUDGE_BATCH) {
+        let end = (start + JUDGE_BATCH).min(limit);
+        let mut state = String::new();
+        let mut questions = Vec::new();
+        for (i, ex) in exchanges[start..end].iter().enumerate() {
+            let n = start + i + 1;
+            state.push_str(&format!("[E{n}]\n{}\n\n", exchange_text(ex)));
+            questions.push((
+                format!("e{n}"),
+                Question::Score {
+                    instructions: format!(
+                        "How much of exchange E{n} must later turns of this conversation remember?"
+                    ),
+                    levels: IMPORTANCE_LEVELS.iter().map(|s| s.to_string()).collect(),
+                },
+            ));
+        }
+        let Some(answers) = hub
+            .ask(app_id, Feature::Compaction, &state, &questions, JUDGE_BUDGET)
+            .await
+        else {
+            break; // no judge, or it failed: the rest stay unrated
+        };
+        for (i, slot) in out.iter_mut().enumerate().take(end).skip(start) {
+            *slot = answers
+                .get(&format!("e{}", i + 1))
+                .and_then(|a| Some((a.level?, a.confidence.unwrap_or(0.0))));
+        }
+    }
+    out
+}
+
+/// Put the judge's verdict on an exchange's messages. Returns whether it was
+/// dropped (left out of the summarizer prompt).
+fn mark_exchange(exchange: &mut [Value], rating: Option<(usize, f32)>, drop_min: f32) -> bool {
+    let mark = match rating {
+        Some((0, conf)) if conf >= drop_min => MARK_DROP,
+        Some((level, _)) if level + 1 == IMPORTANCE_LEVELS.len() => MARK_KEY_EXCHANGE,
+        _ => return false,
+    };
+    for m in exchange.iter_mut() {
+        if let Some(obj) = m.as_object_mut() {
+            obj.insert(MARK_KEY.to_string(), json!(mark));
+        }
+    }
+    mark == MARK_DROP
+}
+
 /// Render a message `content` value as plain prompt text. Text blocks pass
 /// through; every non-text block (base64 image payloads, etc.) collapses
 /// into a single `[N image(s) attached]` placeholder so structured content
@@ -1186,7 +1290,12 @@ pub fn build_summarizer_prompt(existing_slots: Option<&Value>, chunk: &[Value]) 
         .unwrap_or_else(|| "(none yet)".to_string());
 
     let mut chunk_lines = Vec::new();
+    let mut any_key = false;
     for msg in chunk {
+        let mark = msg.get(MARK_KEY).and_then(|v| v.as_str());
+        if mark == Some(MARK_DROP) {
+            continue;
+        }
         let role = msg
             .get("role")
             .and_then(|v| v.as_str())
@@ -1204,13 +1313,23 @@ pub fn build_summarizer_prompt(existing_slots: Option<&Value>, chunk: &[Value]) 
             content_str
         };
 
-        chunk_lines.push(format!("{role}: {content_with_tools}"));
+        if mark == Some(MARK_KEY_EXCHANGE) {
+            any_key = true;
+            chunk_lines.push(format!("[KEY] {role}: {content_with_tools}"));
+        } else {
+            chunk_lines.push(format!("{role}: {content_with_tools}"));
+        }
     }
 
+    let instructions = if any_key {
+        format!("{SUMMARIZER_INSTRUCTIONS} {KEY_INSTRUCTION}")
+    } else {
+        SUMMARIZER_INSTRUCTIONS.to_string()
+    };
     vec![
         json!({
             "role": "system",
-            "content": SUMMARIZER_INSTRUCTIONS
+            "content": instructions
         }),
         json!({
             "role": "user",
@@ -1247,6 +1366,7 @@ pub async fn run_compaction(
     memory_cfg: &MemoryConfig,
     context_length: i32,
     force: bool,
+    decider: Option<&crate::decider::DeciderHub>,
 ) -> Result<CompactionResult, CompactionSkip> {
     if !summarizer_cfg.enabled {
         return Err(CompactionSkip::Disabled);
@@ -1269,6 +1389,7 @@ pub async fn run_compaction(
         memory_cfg,
         context_length,
         force,
+        decider,
     )
     .await;
 
@@ -1292,6 +1413,7 @@ async fn run_compaction_inner(
     memory_cfg: &MemoryConfig,
     context_length: i32,
     force: bool,
+    decider: Option<&crate::decider::DeciderHub>,
 ) -> Result<CompactionResult, CompactionSkip> {
     let session = match sessions::get_session(pool, session_id).await.ok().flatten() {
         Some(s) => s,
@@ -1414,7 +1536,36 @@ async fn run_compaction_inner(
         return Err(CompactionSkip::BelowThreshold);
     }
 
-    let candidate_exchanges = group_into_exchanges(&candidate_rows);
+    let mut candidate_exchanges = group_into_exchanges(&candidate_rows);
+
+    // The decision model, when the app has one with `compaction` on, rates
+    // each exchange: confident filler is left out of the summarizer prompt
+    // (still folded past, so it is gone from the live tail either way) and
+    // key exchanges are marked so their substance survives. No judge, or no
+    // answer, leaves every exchange as it was.
+    let mut dropped = vec![false; candidate_exchanges.len()];
+    if let Some(hub) = decider {
+        let app_id = sessions::owner_of(pool, session_id).await.ok().flatten();
+        if let Some(app_id) = app_id {
+            if let Some(judge) = hub
+                .enabled(&app_id, crate::decider::Feature::Compaction)
+                .await
+            {
+                let drop_min = judge.config.thresholds.compaction_drop_min;
+                let ratings = judge_exchanges(hub, &app_id, &candidate_exchanges).await;
+                for (i, ex) in candidate_exchanges.iter_mut().enumerate() {
+                    dropped[i] = mark_exchange(ex, ratings[i], drop_min);
+                }
+                let n_dropped = dropped.iter().filter(|d| **d).count();
+                if n_dropped > 0 || ratings.iter().any(|r| r.is_some_and(|(l, _)| l == 3)) {
+                    hub.note_acted(&app_id, crate::decider::Feature::Compaction);
+                }
+                if n_dropped > 0 {
+                    tracing::info!(session_id, n_dropped, "compaction: left filler exchanges out");
+                }
+            }
+        }
+    }
 
     // How much conversation one summarizer request may carry.
     //
@@ -1451,11 +1602,21 @@ async fn run_compaction_inner(
     let mut current_tokens: i64 = 0;
     let mut remaining_tokens = foldable_tokens;
 
-    for exchange in &candidate_exchanges {
+    for (i, exchange) in candidate_exchanges.iter().enumerate() {
         let exchange_tokens: i64 = exchange
             .iter()
             .map(|v| token_of(v.get("rowid").and_then(|r| r.as_i64()).unwrap_or(0)))
             .sum();
+        // A dropped exchange rides along so the watermark passes it, but adds
+        // nothing to the prompt, so it costs the chunk nothing.
+        if dropped[i] {
+            current.extend(exchange.clone());
+            remaining_tokens -= exchange_tokens;
+            if remaining_tokens <= low_water as i64 {
+                break;
+            }
+            continue;
+        }
 
         // Start a new chunk when this exchange would overflow the current one.
         // Never on an empty chunk: a single exchange larger than the whole
@@ -1490,6 +1651,16 @@ async fn run_compaction_inner(
     let mut last_error: Option<String> = None;
 
     for chunk in &chunks {
+        // A chunk of nothing but dropped filler has nothing to summarize; it
+        // is folded past without a summarizer call.
+        if chunk
+            .iter()
+            .all(|m| m.get(MARK_KEY).and_then(|v| v.as_str()) == Some(MARK_DROP))
+        {
+            to_fold.extend(chunk.clone());
+            any_ok = true;
+            continue;
+        }
         let masked = apply_tool_mask(chunk, reserve_floor, token_cfg);
         let prompt = build_summarizer_prompt(Some(&merged), &masked);
 
@@ -1564,6 +1735,64 @@ async fn run_compaction_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ex(user: &str, assistant: &str) -> Vec<Value> {
+        vec![
+            json!({"rowid": 1, "role": "user", "content": user}),
+            json!({"rowid": 2, "role": "assistant", "content": assistant}),
+        ]
+    }
+
+    #[test]
+    fn confident_filler_is_dropped_and_key_exchanges_are_marked() {
+        let mut filler = ex("thanks!", "You're welcome.");
+        assert!(mark_exchange(&mut filler, Some((0, 0.95)), 0.8));
+        let mut unsure = ex("ok", "Sure.");
+        assert!(!mark_exchange(&mut unsure, Some((0, 0.5)), 0.8));
+        let mut key = ex("Use Postgres 16, not MySQL.", "Noted.");
+        assert!(!mark_exchange(&mut key, Some((3, 0.7)), 0.8));
+        let mut unrated = ex("hm", "yes");
+        assert!(!mark_exchange(&mut unrated, None, 0.8));
+
+        let chunk: Vec<Value> = [filler, unsure, key, unrated].concat();
+        let prompt = build_summarizer_prompt(None, &chunk);
+        let body = prompt[1]["content"].as_str().unwrap();
+        assert!(!body.contains("thanks!"));
+        assert!(body.contains("user: ok"));
+        assert!(body.contains("[KEY] user: Use Postgres 16"));
+        assert!(prompt[0]["content"].as_str().unwrap().contains("[KEY]"));
+    }
+
+    #[test]
+    fn an_unjudged_prompt_is_unchanged() {
+        let chunk = ex("hello", "hi");
+        let prompt = build_summarizer_prompt(None, &chunk);
+        assert_eq!(prompt[0]["content"], SUMMARIZER_INSTRUCTIONS);
+    }
+
+    #[tokio::test]
+    async fn exchanges_are_rated_in_batches_and_failures_leave_them_unrated() {
+        use crate::decider::hub::testing::Scripted;
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        let hub = crate::decider::DeciderHub::new(pool);
+        let config: crate::decider::DeciderConfig = serde_json::from_value(json!({
+            "url": "http://127.0.0.1:1", "features": {"compaction": true},
+        }))
+        .unwrap();
+        let mut backend = Scripted::yes(|_, _| 0.0);
+        backend.level = 3;
+        hub.install_for_test("kitty", config.clone(), std::sync::Arc::new(backend));
+        let exchanges: Vec<Vec<Value>> = (0..12).map(|_| ex("a", "b")).collect();
+        let ratings = judge_exchanges(&hub, "kitty", &exchanges).await;
+        assert_eq!(ratings.len(), 12);
+        assert!(ratings.iter().all(|r| *r == Some((3, 0.9))));
+
+        let mut failing = Scripted::yes(|_, _| 0.0);
+        failing.fail = true;
+        hub.install_for_test("kitty", config, std::sync::Arc::new(failing));
+        assert!(judge_exchanges(&hub, "kitty", &exchanges).await.iter().all(|r| r.is_none()));
+    }
 
     /// The small-context regression this schedule was rebuilt for.
     ///

@@ -2006,6 +2006,7 @@ impl AgentLoop {
         let token_cfg = self.context.config().clone();
         let summarizer_cfg = self.summarizer_cfg.clone();
         let memory_cfg = self.memory_cfg.clone();
+        let decider = self.decider.clone();
         let handle = tokio::spawn(async move {
             let outcome = run_compaction(
                 &pool,
@@ -2018,6 +2019,7 @@ impl AgentLoop {
                 &memory_cfg,
                 context_length,
                 force,
+                decider.as_deref(),
             )
             .await;
             // Still fire-and-forget as far as the turn is concerned, but no
