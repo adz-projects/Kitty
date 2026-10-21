@@ -2,6 +2,7 @@ pub mod agent;
 pub mod config;
 pub mod discovery;
 pub mod crypto;
+pub mod decider;
 pub mod env_contract;
 pub mod error;
 pub mod hitl;

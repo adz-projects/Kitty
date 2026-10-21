@@ -221,6 +221,7 @@ pub async fn delete_me(
     }
     // Synchronously, before responding, as for a plain revocation.
     state.key_cache.invalidate(&app_id);
+    state.agent.decider().evict(&app_id);
 
     let dir = state.plugins.data_dir().join("apps").join(&app_id);
     let files_removed = remove_dir_with_retry(&dir).await;

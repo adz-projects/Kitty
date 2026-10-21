@@ -301,6 +301,7 @@ pub async fn purge_app(pool: &SqlitePool, app_id: &str) -> Result<PurgeCounts, S
             .await?,
     };
     delete_owned(&mut tx, "DELETE FROM app_plugins WHERE app_id = ?", app_id).await?;
+    delete_owned(&mut tx, "DELETE FROM app_decider WHERE app_id = ?", app_id).await?;
     delete_owned(&mut tx, "DELETE FROM apps WHERE id = ?", app_id).await?;
     tx.commit().await?;
     Ok(counts)

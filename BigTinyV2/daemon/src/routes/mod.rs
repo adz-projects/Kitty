@@ -1,6 +1,7 @@
 pub mod admin;
 pub mod apps;
 pub mod chat;
+pub mod decider;
 pub mod embeddings;
 pub mod events;
 pub mod health;
@@ -109,6 +110,12 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             "/api/apps/me/plugins/{plugin}",
             axum::routing::put(plugins::set).delete(plugins::clear),
         )
+        .route(
+            "/api/apps/me/decider",
+            get(decider::get).put(decider::put).delete(decider::clear),
+        )
+        .route("/api/apps/me/decider/stats", get(decider::stats))
+        .route("/api/apps/me/decider/probe", post(decider::probe))
         .route("/api/status", get(health::status))
         .route("/api/local/models/status", get(local::models_status))
         .route("/api/memory/stats", get(memory::stats))

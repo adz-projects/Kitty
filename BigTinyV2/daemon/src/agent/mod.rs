@@ -115,6 +115,10 @@ pub struct Agent {
     /// Per-app events published outside a turn's own stream -- approvals
     /// waiting, scheduled runs finishing. See `server::app_events`.
     app_events: Arc<crate::server::app_events::AppEvents>,
+    /// Per-app decision models (`crate::decider`). Owned here because every
+    /// user of one — the loop, compaction, the memory hosts, the routes — can
+    /// already reach the agent.
+    decider: Arc<crate::decider::DeciderHub>,
 }
 
 /// Removes the turn's `tasks` entry when the turn task ends — normally *or*
@@ -187,6 +191,7 @@ impl Agent {
         plugins: Arc<crate::plugins::PluginHost>,
         memorabilia: Arc<crate::plugins::MemorabiliaHost>,
     ) -> Self {
+        let db_for_decider = db.clone();
         Self {
             db,
             router,
@@ -204,7 +209,13 @@ impl Agent {
             workspace_snapshots: Arc::new(DashMap::new()),
             background_tasks: Arc::new(DashMap::new()),
             app_events: Arc::new(crate::server::app_events::AppEvents::new()),
+            decider: Arc::new(crate::decider::DeciderHub::new(db_for_decider)),
         }
+    }
+
+    /// The per-app decision models (`crate::decider`).
+    pub fn decider(&self) -> &Arc<crate::decider::DeciderHub> {
+        &self.decider
     }
 
     /// Where events an app should hear about outside a turn's own stream are

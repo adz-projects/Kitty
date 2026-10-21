@@ -1,3 +1,4 @@
+pub mod app_decider;
 pub mod app_plugins;
 pub mod apps;
 pub mod execution;
