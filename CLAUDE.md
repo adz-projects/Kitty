@@ -181,6 +181,15 @@ engine-managed) and why mixing them is a bug.
   another model); every card is synced into the engine, and the default is
   just a flag. A chat stays on its card; moving it is a branch onto another
   card, through the handoff gate when the target is less trusted.
+- **Decision model** (`lifecycle/decider.rs`, `commands/decider.rs`,
+  `components/settings/DecisionModel.tsx`; engine `BigTinyV2/daemon/src/decider/`)
+  — an optional small classifier (Liquid d1 on a `llama-server`, dialect
+  `systemone`) the engine asks yes/no and rating questions, per app. Seven
+  individually switched uses: per-chat tool gating that only grows while the
+  prompt cache is warm (`agent/tool_gate.rs`, `prompt_determinism.md`), the
+  pathway learn gate and recall relevance, the memorabilia ingest gate,
+  kitty-web's page check and search re-rank, and compaction importance. Every
+  use fails open; thresholds are per model and reset when it is swapped.
 - **Folder bookmarks** (`commands/folders.rs`) — app-side session organization
   over the engine's flat session list.
 - **Log capture** (`log_capture.rs`) — an in-memory ring buffer of

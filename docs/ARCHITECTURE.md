@@ -38,6 +38,8 @@ lib.rs (app setup, window creation, generate_handler! list;
   │       │                        while other apps or Kitty's own turns are busy
   │       ├─► memory.rs           per-app memory plugins on/off (embedding model
   │       │                        on disk AND the user's toggle)
+  │       ├─► decider.rs          the decision model: Settings + Kitty's
+  │       │                        tool-group catalog → /api/apps/me/decider
   │       ├─► embedding.rs        is the embedding model on disk
   │       └─► app_events.rs       the /api/apps/me/events listener: approvals,
   │                                schedule runs, session titles

@@ -216,6 +216,32 @@ functions with `block_on`, which panics outright on a thread already running
 the tokio reactor. `server.rs` does this; the doc comment on `run_module`
 explains it.
 
+### The decision-model checks
+
+`kitty-web` also reads an optional decision model from its row env
+(`KITTY_DECIDER_URL`, `_DIALECT`, `_FEATURES`, `_THRESHOLDS`; Kitty writes them
+in `ensure_builtin_servers` from Settings → Decision model, and `InProcessConfig`
+carries them on Android). Two checks, each its own switch:
+
+- **`page_classify`** — after a scrape (and on a 4xx/5xx body) the model labels
+  the page; a confident bot challenge, paywall or error page comes back as
+  `SCRAPE_CHALLENGE` / `SCRAPE_PAYWALL` / `SCRAPE_ERROR_PAGE` instead of being
+  handed to the model as content. `ddg_challenge_marker` and friends stay as
+  the non-model fallback.
+- **`search_rerank`** — the merged result pool is reordered by relevance
+  before ids, the offload and `take(count)`, so all three agree. Reorders,
+  never drops; `engines.rerank` reports `ok` or `skipped`.
+
+The endpoint is the user's, usually on their own machine or LAN, so it is the
+one URL that does not go through `ssrf::check_url`. Both checks fail open.
+
+The memory engines take the same model through a host-supplied trait rather
+than configuration: adaptive-pathway's `traits::MemoryGate` (skip a learn pass
+with nothing durable in it; judge recall relevance before DPP) and
+memorabilia's `traits::WorthinessGate` (reject a low-value document after the
+PII gate). The daemon attaches per-app implementations
+(`decider/memory_gates.rs`) when it opens each engine.
+
 ## The freeze pipeline
 
 ```

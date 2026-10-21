@@ -313,6 +313,52 @@ distinguishes a choice from an inherited default.
 default. Disabling closes any live instance, so it costs nothing rather than
 merely hiding tools.
 
+## Decision model
+
+An app may point the engine at a **decision model**: a small classifier that
+answers typed questions (yes/no, pick one, rate) over a piece of text in one
+forward pass — Liquid's d1 served by `llama-server` today. The engine uses it,
+per app, to make things it already does cheaper or sharper; every use fails
+open, so a missing, slow or unreachable model leaves behaviour exactly as it
+was. See `daemon/src/decider/` and `prompt_determinism.md`.
+
+`GET /api/apps/me/decider` → `{config | null, dialects[], default_thresholds}`.
+
+`PUT /api/apps/me/decider` replaces the app's configuration (400 on an unknown
+dialect, a bad URL or duplicate group names); `DELETE` removes it.
+
+```json
+{
+  "dialect": "systemone",
+  "url": "http://127.0.0.1:8080",
+  "model": "d1-3B-Q8_0.gguf",
+  "features": {"tool_gating": true, "learn_gate": true, "recall_rerank": true,
+               "ingest_gate": true, "page_classify": true, "search_rerank": true,
+               "compaction": true},
+  "thresholds": {"tool_gating_add": 0.6},
+  "tool_groups": [{"name": "office", "description": "reading Word, Excel or PDF",
+                   "tools": ["lean_word_*", "lean_pdf_*"], "always": false}],
+  "cache_ttl_secs": 300
+}
+```
+
+A missing feature is off. `thresholds` needs only the overrides; the rest take
+the defaults. `tool_groups` is the app's own catalog (a trailing `*` matches a
+prefix); a tool in no group is never gated. `page_classify` and
+`search_rerank` are read by the app's web tools, not the engine.
+
+`GET /api/apps/me/decider/stats` → `{features: {name: {calls, answered,
+failed, acted}}}` since the engine started (`acted` = an answer changed what
+the engine did).
+
+`POST /api/apps/me/decider/probe` `{dialect?, url}` → `{ok, model, rtt_ms,
+error}`, without saving anything.
+
+**Tool gating** keeps a chat's tool set in its metadata (`tool_gate`) and adds
+a loop-only tool, `load_tool_group`, while gating is on. Usage entries in
+`metadata.usage[]` carry `cache_read_tokens` / `cache_creation_tokens` when the
+provider reports them.
+
 ## Embeddings
 
 `POST /api/embeddings`, served from the daemon's in-process model.

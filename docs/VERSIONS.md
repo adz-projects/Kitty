@@ -58,6 +58,23 @@ Added in daemon **2.3.0** (see "Specialists finish quickly and reliably"):
 | a failed final pass returns the delegate's last prose; `builtin_version` refresh of built-ins | Partial results instead of a bare error; prompt and tool-list fixes reach existing installs |
 | session metadata `specialists_disabled: true` withholds `call_specialist`/`await_specialists`/`list_specialists` | The chat ⋯ menu's per-chat Specialists switch (desktop, when specialists are on in Settings) |
 
+Added for the next daemon release (decision model, Settings → Decision model):
+
+| Surface | Used for |
+|---|---|
+| `GET/PUT/DELETE /api/apps/me/decider`, `/stats`, `/probe` | Per-app decision-model endpoint, feature switches, thresholds and Kitty's tool-group catalog (`lifecycle/decider.rs`) |
+| session metadata `tool_gate`; loop-only `load_tool_group` | Per-chat tool sets that only grow while the prompt cache is warm |
+| `metadata.usage[].cache_read_tokens` / `cache_creation_tokens` (incl. llama-server `timings.cache_n`) | Measuring prompt-cache hit rate |
+| kitty-web row env `KITTY_DECIDER_URL` / `_DIALECT` / `_FEATURES` / `_THRESHOLDS`; scrape codes `SCRAPE_CHALLENGE`, `SCRAPE_PAYWALL`, `SCRAPE_ERROR_PAGE`; search diagnostics `engines.rerank` | The two web checks |
+
+The `systemone` dialect is `POST {url}/v1/systemone` with
+`{state, questions: {name: {type: noul|choice|score, instructions, criteria}}}`,
+as served by `llama-server -hf LiquidAI/d1-3B-GGUF:Q8_0`. Its answer shape was
+taken from the model card (bare P(yes) or `{noul}`; `choice`/`confidence`/
+`probabilities`; `score` with per-level `probabilities`), and the parsers accept
+either nesting: an answer they don't recognise is omitted, which every caller
+treats as "no opinion".
+
 Kitty detects each card's ladder itself (`src-tauri/src/bigtiny/effort/`):
 OpenRouter's catalog `reasoning` object (`supported_efforts`, highest first,
 `none` last when optional; `mandatory`; verified live 2026-10-18 on 337 of
