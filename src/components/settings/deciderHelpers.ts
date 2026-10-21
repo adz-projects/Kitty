@@ -9,18 +9,6 @@ export const DECIDER_FEATURES: { id: DeciderFeature; label: string; blurb: strin
       'Offers each chat only the tool groups it needs (documents, web, charts, code…). Groups are added as a chat needs them and only pruned when the provider cache has gone cold anyway, so cache hits are kept.',
   },
   {
-    id: 'learn_gate',
-    label: 'Memory: learn gate',
-    blurb:
-      'Skips Adaptive Pathway’s learning pass when a stretch of conversation says nothing lasting about you.',
-  },
-  {
-    id: 'recall_rerank',
-    label: 'Memory: recall relevance',
-    blurb:
-      'Checks which remembered beliefs actually bear on the message before they are added to the prompt.',
-  },
-  {
     id: 'ingest_gate',
     label: 'Memory: ingest gate',
     blurb: 'Keeps boilerplate, error pages and chit-chat out of Memorabilia’s factual memory.',
@@ -32,21 +20,10 @@ export const DECIDER_FEATURES: { id: DeciderFeature; label: string; blurb: strin
       'Recognises bot challenges, paywalls and error pages when a page is scraped, instead of handing them to the model as content.',
   },
   {
-    id: 'search_rerank',
-    label: 'Web: search re-rank',
-    blurb: 'Orders merged web search results by how well they match the query.',
-  },
-  {
     id: 'shell_screen',
     label: 'Shell screen',
     blurb:
       'A second opinion on shell commands Kitty would otherwise run without asking: one that could delete files, change settings, install software, send data out or expose credentials is held for your approval. It can only add a prompt, never remove one.',
-  },
-  {
-    id: 'compaction',
-    label: 'Compaction',
-    blurb:
-      'When a long chat is summarised, marks the exchanges where you set a lasting rule or decision or stated a fact about your situation, and leaves out pure filler.',
   },
 ];
 
@@ -54,18 +31,14 @@ export const DECIDER_FEATURES: { id: DeciderFeature; label: string; blurb: strin
 export const DECIDER_THRESHOLDS: { key: string; label: string }[] = [
   { key: 'tool_gating_cold', label: 'Tool gating: load a group on a fresh decision at P ≥' },
   { key: 'tool_gating_add', label: 'Tool gating: add a group mid-chat at P ≥' },
-  { key: 'learn_gate_skip_below', label: 'Learn gate: skip a learning pass below P' },
-  { key: 'recall_drop_below', label: 'Recall: drop a belief below P' },
   { key: 'ingest_gate_reject_below', label: 'Ingest gate: reject a document below P' },
   { key: 'page_classify_min', label: 'Page check: act on a label at P ≥' },
-  { key: 'compaction_drop_min', label: 'Compaction: leave out filler at P ≥' },
-  { key: 'compaction_key_min', label: 'Compaction: mark an exchange key at score ≥' },
   { key: 'shell_screen_flag_at', label: 'Shell screen: ask before running at P(risky) ≥' },
 ];
 
-/** The two web checks run inside kitty-web, whose counters the engine
-    doesn't see. */
-const COUNTED_IN_PLUGIN: DeciderFeature[] = ['page_classify', 'search_rerank'];
+/** The page check runs inside kitty-web, whose counters the engine doesn't
+    see. */
+const COUNTED_IN_PLUGIN: DeciderFeature[] = ['page_classify'];
 
 /** One line of counters for a feature, or null when there is nothing to say. */
 export function statLine(

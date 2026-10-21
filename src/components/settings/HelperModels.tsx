@@ -4,6 +4,7 @@ import { curatedModelsFor } from '@/lib/curated_models';
 import { isAndroid } from '@/lib/platform';
 import { TrashIcon } from '@/components/icons/TrashIcon';
 import type { DownloadProgress, LocalModel } from '@/lib/types';
+import { DecisionModel } from './DecisionModel';
 import { confirmDialog } from '@/components/shared/ConfirmDialog';
 
 /** Bytes as a short human string. Exported for testing — the repo has no
@@ -322,6 +323,11 @@ export function HelperModels() {
           </div>
         ))}
       </div>
+
+      {/* The optional decision model is a helper model too -- one served by a
+          llama-server you run rather than downloaded here -- so it lives
+          beside the others rather than in a panel of its own. */}
+      <DecisionModel />
     </div>
   );
 }

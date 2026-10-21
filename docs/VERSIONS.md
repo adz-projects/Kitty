@@ -58,7 +58,7 @@ Added in daemon **2.3.0** (see "Specialists finish quickly and reliably"):
 | a failed final pass returns the delegate's last prose; `builtin_version` refresh of built-ins | Partial results instead of a bare error; prompt and tool-list fixes reach existing installs |
 | session metadata `specialists_disabled: true` withholds `call_specialist`/`await_specialists`/`list_specialists` | The chat ⋯ menu's per-chat Specialists switch (desktop, when specialists are on in Settings) |
 
-Added in daemon **2.4.0** (Kitty 1.0.4, decision model — Settings → Decision model):
+Added in daemon **2.4.0** (Kitty 1.0.4, decision model — Settings → Helper Models → Decision model):
 
 | Surface | Used for |
 |---|---|

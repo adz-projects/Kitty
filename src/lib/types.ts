@@ -96,15 +96,7 @@ export interface MemoryStats {
 }
 
 // --- Decision model (lifecycle::decider) ---
-export type DeciderFeature =
-  | 'tool_gating'
-  | 'learn_gate'
-  | 'recall_rerank'
-  | 'ingest_gate'
-  | 'page_classify'
-  | 'search_rerank'
-  | 'compaction'
-  | 'shell_screen';
+export type DeciderFeature = 'tool_gating' | 'ingest_gate' | 'page_classify' | 'shell_screen';
 
 /** Mirrors `config::DeciderSettings`. An empty `url` means no decision model. */
 export interface DeciderSettings {

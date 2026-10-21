@@ -220,7 +220,7 @@ explains it.
 
 `kitty-web` also reads an optional decision model from its row env
 (`KITTY_DECIDER_URL`, `_DIALECT`, `_FEATURES`, `_THRESHOLDS`; Kitty writes them
-in `ensure_builtin_servers` from Settings → Decision model, and `InProcessConfig`
+in `ensure_builtin_servers` from Settings → Helper Models → Decision model, and `InProcessConfig`
 carries them on Android). Two checks, each its own switch:
 
 - **`page_classify`** — after a scrape (and on a 4xx/5xx body) the model labels

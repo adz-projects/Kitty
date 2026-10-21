@@ -1,4 +1,4 @@
-//! Settings → Decision model.
+//! Settings → Helper Models → Decision model.
 //!
 //! The settings live in Kitty's config; `lifecycle::decider` relays them to
 //! the engine and `bigtiny::mcp` to kitty-web. Testing an endpoint goes through

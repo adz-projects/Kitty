@@ -19,7 +19,7 @@ const DIALECT_LABELS: Record<string, string> = {
   systemone: 'Liquid d1 (system_one)',
 };
 
-/** Settings → Decision model.
+/** Settings → Helper Models → Decision model.
 
     An optional small classifier (e.g. Liquid d1 on a llama.cpp server) that the
     engine asks quick yes/no and rating questions: which tools a chat needs,
@@ -67,10 +67,10 @@ export function DecisionModel() {
 
   if (!draft || !saved) {
     return (
-      <section className="settings-section">
-        <h1>Decision model</h1>
+      <>
+        <h2>Decision model</h2>
         {error && <div className="chat-error">{error}</div>}
-      </section>
+      </>
     );
   }
 
@@ -134,15 +134,15 @@ export function DecisionModel() {
   };
 
   return (
-    <section className="settings-section">
-      <h1>Decision model</h1>
+    <>
+      <h2>Decision model</h2>
       <p className="muted">
-        A small, fast classifier Kitty can ask quick yes/no and rating questions — which tools a
-        chat needs, whether a page is a bot challenge, what is worth remembering. Optional: with no
-        model, or when its server can&apos;t be reached, everything works exactly as before.
+        A small, fast classifier Kitty can ask quick yes/no questions — which tools a chat needs,
+        whether a page is a bot check, what is worth remembering, whether a shell command needs your
+        approval. It runs on a server you point Kitty at, not inside Kitty. Optional: with no model,
+        or when its server can&apos;t be reached, everything works exactly as before.
       </p>
 
-      <h2>Model</h2>
       <label className="field">
         <span>Type</span>
         <select
@@ -198,7 +198,6 @@ export function DecisionModel() {
           <div className="chat-error">Couldn&apos;t use this endpoint: {probe.error}</div>
         ))}
 
-      <h2>Features</h2>
       <p className="muted">
         Each use can be switched on or off on its own. Saving applies them at once, with no restart.
       </p>
@@ -232,11 +231,13 @@ export function DecisionModel() {
         );
       })}
 
-      <h2>
-        <button className="link" onClick={() => setThresholdsOpen(!thresholdsOpen)}>
-          {thresholdsOpen ? '▾' : '▸'} Thresholds
-        </button>
-      </h2>
+      <button
+        type="button"
+        className="disclosure-toggle"
+        onClick={() => setThresholdsOpen((o) => !o)}
+      >
+        {thresholdsOpen ? '▾' : '▸'} <strong>Thresholds</strong>
+      </button>
       {thresholdsOpen && (
         <>
           <p className="muted">
@@ -271,7 +272,7 @@ export function DecisionModel() {
         </button>
         {notice && <span className="muted">{notice}</span>}
       </div>
-    </section>
+    </>
   );
 }
 

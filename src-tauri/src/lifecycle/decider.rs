@@ -77,16 +77,13 @@ pub fn desired(settings: &DeciderSettings) -> Option<Value> {
         "dialect": settings.dialect,
         "url": settings.url.trim(),
         "model": settings.model,
-        // The two web features run in kitty-web, which reads its own copy;
-        // they are sent here too so the engine's view of the app is complete.
+        // Only the features Kitty ships; any other is off in the engine.
+        // The page check runs in kitty-web, which reads its own copy; it is
+        // sent here too so the engine's view of the app is complete.
         "features": {
             "tool_gating": f.tool_gating,
-            "learn_gate": f.learn_gate,
-            "recall_rerank": f.recall_rerank,
             "ingest_gate": f.ingest_gate,
             "page_classify": f.page_classify,
-            "search_rerank": f.search_rerank,
-            "compaction": f.compaction,
             "shell_screen": f.shell_screen,
         },
         "thresholds": Value::Object(settings.thresholds.clone()),
@@ -127,8 +124,20 @@ async fn apply(app: &AppHandle) -> Result<(), String> {
 /// engine echoes the thresholds back with every default filled in, so those
 /// are compared by the keys we set rather than wholesale.
 fn same(have: &Value, want: &Value) -> bool {
-    let keys = ["dialect", "url", "model", "features"];
+    let keys = ["dialect", "url", "model"];
     if keys.iter().any(|k| have.get(k) != want.get(k)) {
+        return false;
+    }
+    // The engine echoes every feature it knows, the ones Kitty does not send
+    // as `false`; compare the ones sent, and require the rest to be off.
+    let empty = serde_json::Map::new();
+    let want_f = want["features"].as_object().unwrap_or(&empty);
+    let have_f = have["features"].as_object().unwrap_or(&empty);
+    if want_f.iter().any(|(k, v)| have_f.get(k) != Some(v))
+        || have_f
+            .iter()
+            .any(|(k, v)| !want_f.contains_key(k) && v.as_bool() == Some(true))
+    {
         return false;
     }
     // The engine echoes every group with its defaults filled in (`always:
@@ -183,7 +192,14 @@ mod tests {
             obj.entry("file_types").or_insert(json!([]));
         }
         have["cache_ttl_secs"] = json!(300);
+        for f in ["learn_gate", "recall_rerank", "search_rerank", "compaction"] {
+            have["features"][f] = json!(false);
+        }
         assert!(same(&have, &want));
+        // A feature left on by an older Kitty must be switched off.
+        have["features"]["compaction"] = json!(true);
+        assert!(!same(&have, &want));
+        have["features"]["compaction"] = json!(false);
         have["tool_groups"][1]["file_types"] = json!([".pdf"]);
         assert!(!same(&have, &want));
     }
@@ -204,10 +220,11 @@ mod tests {
             url: "http://box:8080 ".into(),
             ..DeciderSettings::default()
         };
-        s.features.compaction = false;
+        s.features.ingest_gate = false;
         let d = desired(&s).unwrap();
         assert_eq!(d["url"], "http://box:8080");
-        assert_eq!(d["features"]["compaction"], false);
+        assert_eq!(d["features"]["ingest_gate"], false);
+        assert!(d["features"].get("compaction").is_none());
         assert_eq!(d["features"]["tool_gating"], true);
         assert!(d["tool_groups"].as_array().unwrap().len() >= 5);
         let group = |name: &str| {

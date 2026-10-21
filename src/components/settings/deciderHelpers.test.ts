@@ -8,12 +8,8 @@ const base: DeciderSettings = {
   model: 'd1-3B-Q8_0.gguf',
   features: {
     tool_gating: true,
-    learn_gate: true,
-    recall_rerank: true,
     ingest_gate: true,
     page_classify: true,
-    search_rerank: true,
-    compaction: true,
     shell_screen: true,
   },
   thresholds: {},
@@ -36,9 +32,9 @@ describe('decision model helpers', () => {
 
   it('reports engine counters and stays quiet for plugin-side checks', () => {
     const s = { calls: 10, answered: 9, failed: 1, acted: 4 };
-    expect(statLine('learn_gate', s)).toContain('10 asked');
-    expect(statLine('learn_gate', s)).toContain('1 fell back');
-    expect(statLine('learn_gate', { ...s, calls: 0 })).toBeNull();
+    expect(statLine('ingest_gate', s)).toContain('10 asked');
+    expect(statLine('ingest_gate', s)).toContain('1 fell back');
+    expect(statLine('ingest_gate', { ...s, calls: 0 })).toBeNull();
     expect(statLine('page_classify', s)).toBeNull();
   });
 });

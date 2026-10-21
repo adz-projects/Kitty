@@ -184,14 +184,16 @@ engine-managed) and why mixing them is a bug.
 - **Decision model** (`lifecycle/decider.rs`, `commands/decider.rs`,
   `components/settings/DecisionModel.tsx`; engine `BigTinyV2/daemon/src/decider/`)
   — an optional small classifier (Liquid d1 on a `llama-server`, dialect
-  `systemone`) the engine asks yes/no and rating questions, per app. Eight
-  individually switched uses. On by default, because they held up on real
-  chats: per-chat tool gating that only grows while the prompt cache is warm
-  (`agent/tool_gate.rs`, `prompt_determinism.md`), kitty-web's page check, the
-  memorabilia ingest gate, and the shell screen (a second opinion before Kitty
-  auto-approves a shell command; escalation only). Off by default: search
-  re-rank, the pathway learn gate, recall relevance and compaction importance.
-  Every use fails open; thresholds are per model and reset when it is swapped.
+  `systemone`) the engine asks yes/no questions, per app; set up at the foot of
+  Settings → Helper Models. Kitty ships four individually switched uses, all
+  measured on real chats: per-chat tool gating that only grows while the
+  prompt cache is warm (`agent/tool_gate.rs`, `prompt_determinism.md`),
+  kitty-web's page check, the memorabilia ingest gate, and the shell screen (a
+  second opinion before Kitty auto-approves a shell command; escalation only).
+  The engine also supports search re-rank, a learn gate, recall relevance and
+  compaction ratings; none earned its cost, so Kitty neither offers nor sends
+  them. Every use fails open; thresholds are per model and reset when it is
+  swapped.
 - **Folder bookmarks** (`commands/folders.rs`) — app-side session organization
   over the engine's flat session list.
 - **Log capture** (`log_capture.rs`) — an in-memory ring buffer of
