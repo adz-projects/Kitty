@@ -269,6 +269,9 @@ pub async fn run(config: BigTinyConfig, options: RunOptions) -> Result<(), Daemo
     ));
 
     orchestrator.attach(&agent);
+    // Before any engine opens (they open lazily, on an app's first use).
+    plugins.attach_decider(agent.decider().clone());
+    memorabilia.attach_decider(agent.decider().clone());
     orchestrator.attach_router(router.clone());
     mcp.attach_orchestrator(orchestrator.clone());
     // Before `connect_all`, like the orchestrator attach above and for the

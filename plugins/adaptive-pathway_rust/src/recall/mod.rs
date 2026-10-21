@@ -102,14 +102,28 @@ pub fn select_beliefs_relevant(
     cooccurrence: &[Vec<usize>],
     cfg: &Config,
 ) -> Vec<SelectedBelief> {
-    if candidates.is_empty() {
-        return vec![];
-    }
+    select_beliefs_relevant_with(candidates, query, query_domain, cooccurrence, None, cfg)
+}
+
+/// A host judge's view of how relevant some candidates are to the turn, keyed
+/// by candidate index (the same index space as `cooccurrence`).
+#[derive(Debug, Clone, Default)]
+pub struct Relevance {
+    pub by_index: std::collections::HashMap<usize, f32>,
+    /// A judged candidate below this is not injected -- unless it is an
+    /// identity belief, whose reserved slots never depend on the judge.
+    pub drop_below: f32,
+}
+
+/// `(index, belief, effective_weight, blended_score)` for every candidate.
+fn blended<'a>(
+    candidates: &'a [Belief],
+    query: &[f32],
+    query_domain: Option<&str>,
+) -> Vec<(usize, &'a Belief, f64, f64)> {
     let now = Utc::now();
     let has_query = ops::norm(query) > 1e-12;
-
-    // (idx, belief, effective_weight, blended_score)
-    let mut cand: Vec<(usize, &Belief, f64, f64)> = candidates
+    candidates
         .iter()
         .enumerate()
         .map(|(i, b)| {
@@ -121,7 +135,52 @@ pub fn select_beliefs_relevant(
             };
             (i, b, w, w * (0.5 + 0.5 * rel))
         })
-        .collect();
+        .collect()
+}
+
+/// The indices of the `n` strongest live candidates by the same blended score
+/// selection starts from -- the ones worth asking a judge about.
+pub fn preselect(candidates: &[Belief], query: &[f32], query_domain: Option<&str>, n: usize) -> Vec<usize> {
+    let mut cand = blended(candidates, query, query_domain);
+    cand.retain(|(_, _, w, _)| *w > 0.0);
+    cand.sort_by(|a, b| {
+        b.3.partial_cmp(&a.3)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    cand.into_iter().take(n).map(|(i, _, _, _)| i).collect()
+}
+
+/// [`select_beliefs_relevant`] with an optional judge's relevance folded into
+/// the blended score before anything else: a judged belief's score is scaled
+/// by `0.3 + 0.7 * p`, and one below `drop_below` leaves the pool (identity
+/// beliefs excepted) so DPP backfills from the rest. `None` is exactly the
+/// unjudged selection.
+pub fn select_beliefs_relevant_with(
+    candidates: &[Belief],
+    query: &[f32],
+    query_domain: Option<&str>,
+    cooccurrence: &[Vec<usize>],
+    relevance: Option<&Relevance>,
+    cfg: &Config,
+) -> Vec<SelectedBelief> {
+    if candidates.is_empty() {
+        return vec![];
+    }
+
+    // (idx, belief, effective_weight, blended_score)
+    let mut cand = blended(candidates, query, query_domain);
+    if let Some(r) = relevance {
+        cand.retain(|(i, b, _, _)| {
+            b.layer == crate::store::beliefs::Layer::Identity
+                || r.by_index.get(i).is_none_or(|p| *p >= r.drop_below)
+        });
+        for (i, _, _, s) in cand.iter_mut() {
+            if let Some(p) = r.by_index.get(i) {
+                *s *= 0.3 + 0.7 * f64::from(*p);
+            }
+        }
+    }
 
     // Cap by blended score (ties broken by original index for determinism).
     if cand.len() > MAX_CANDIDATES {
@@ -465,6 +524,42 @@ mod tests {
             session_id: None,
             embedding_model: crate::config::DEFAULT_EMBEDDING_MODEL.into(),
         }
+    }
+
+    #[test]
+    fn a_judge_drops_irrelevant_beliefs_but_never_identity_ones() {
+        let e = |i: usize| {
+            let mut v = vec![0.0_f32; 4];
+            v[i] = 1.0;
+            v
+        };
+        let cands = vec![
+            belief("keep", "likes rust", 0.8, true, Layer::Context, None, e(0)),
+            belief("drop", "likes cats", 0.8, true, Layer::Context, None, e(1)),
+            belief("who", "is a teacher", 0.8, true, Layer::Identity, None, e(2)),
+        ];
+        let mut by_index = std::collections::HashMap::new();
+        by_index.insert(0, 0.9);
+        by_index.insert(1, 0.01);
+        by_index.insert(2, 0.01);
+        let r = Relevance { by_index, drop_below: 0.08 };
+        let sel = select_beliefs_relevant_with(&cands, &[], None, &[], Some(&r), &Config::default());
+        let ids: Vec<&str> = sel.iter().map(|s| s.belief.id.as_str()).collect();
+        assert!(ids.contains(&"keep"));
+        assert!(ids.contains(&"who"));
+        assert!(!ids.contains(&"drop"));
+        // Without a judge, all three are eligible.
+        assert_eq!(select_beliefs_relevant(&cands, &[], None, &[], &Config::default()).len(), 3);
+    }
+
+    #[test]
+    fn preselect_ranks_by_the_blended_score() {
+        let e = vec![1.0_f32, 0.0];
+        let cands = vec![
+            belief("low", "low", 0.2, true, Layer::Context, None, e.clone()),
+            belief("high", "high", 0.9, true, Layer::Context, None, e),
+        ];
+        assert_eq!(preselect(&cands, &[], None, 1), vec![1]);
     }
 
     #[test]

@@ -582,3 +582,30 @@ async fn legacy_conversation_purge_removes_dialogue_and_keeps_documents() {
     engine.purge_legacy_conversation_documents().await;
     assert_eq!(count_of(pool, audited).await, 1);
 }
+
+/// The worthiness gate rejects after Stage 0 and before any write, auditing
+/// `rejected:low_value`; without a gate (or with no opinion) the same
+/// document is kept.
+#[tokio::test]
+async fn worthiness_gate_rejects_before_any_write() {
+    let engine = test_engine(Config::default()).await.with_worthiness_gate(Arc::new(
+        memorabilia::traits::MockWorthinessGate {
+            reject_with: Some(0.04),
+        },
+    ));
+    let out = engine
+        .ingest(&note("Please verify you are a human. Checking your browser before accessing the site."))
+        .await;
+    assert!(out.rejected_low_value);
+    assert_eq!(out.chunks_written, 0);
+    assert_eq!(engine.db.count_audit("rejected:low_value").await.unwrap(), 1);
+
+    let keep = test_engine(Config::default()).await.with_worthiness_gate(Arc::new(
+        memorabilia::traits::MockWorthinessGate { reject_with: None },
+    ));
+    let out = keep
+        .ingest(&note("The torque spec for the M8 flange bolts is 25 Nm, applied in a star pattern."))
+        .await;
+    assert!(!out.rejected_low_value);
+    assert!(out.chunks_written > 0);
+}

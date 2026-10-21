@@ -337,3 +337,32 @@ async fn learn_honors_a_db_only_pause_with_no_in_memory_override() {
     assert_eq!(outcome.observations, 0, "a DB-only pause (no in-memory override) must still be honored");
     assert!(engine.db.list_beliefs(None).await.unwrap().is_empty());
 }
+
+/// A gate that judges the chunk not worth learning skips the extraction call
+/// entirely, but still advances the watermark so the range is not re-sent.
+#[tokio::test]
+async fn a_gated_pass_learns_nothing_and_advances_the_watermark() {
+    let engine = PathwayEngine::open_in_memory(Config::default()).await.unwrap();
+    engine.set_gate(std::sync::Arc::new(adaptive_pathway::traits::MockGate {
+        skip: Some(0.03),
+        relevance: vec![],
+        drop_below: 0.0,
+    }));
+    let host = host_pool().await;
+    let rowid = insert_message(&host, "s1", "user", "thanks, that works").await;
+    let outcome = learn::extract_and_record(
+        &engine,
+        &host,
+        &chat_one(),
+        LearnRequest {
+            session_id: "s1",
+            through_rowid: rowid,
+            given_chunk: None,
+        },
+        LearnTrigger::TurnEnd,
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome.observations, 0);
+    assert_eq!(engine.db.last_learned_rowid("s1").await.unwrap(), rowid);
+}

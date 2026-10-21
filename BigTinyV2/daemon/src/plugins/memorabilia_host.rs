@@ -115,6 +115,9 @@ pub struct MemorabiliaHost {
     /// routes say *why* memory is unavailable instead of reporting every failed
     /// open as "disabled" (which hid the 0.11.2 migration-checksum failure).
     open_errors: Mutex<HashMap<String, String>>,
+    /// Per-app decision models, attached after construction; see
+    /// `PluginHost::attach_decider`.
+    decider: std::sync::OnceLock<Arc<crate::decider::DeciderHub>>,
     /// Apps whose DB file has been integrity-checked (and rebuilt if corrupt)
     /// at first open in this process — see `db_recover::heal_before_open`. The
     /// value is the rebuild report, held until `recover` reports it once.
@@ -153,6 +156,7 @@ impl MemorabiliaHost {
             resolved: tokio::sync::OnceCell::new(),
             instances: Mutex::new(HashMap::new()),
             open_errors: Mutex::new(HashMap::new()),
+            decider: std::sync::OnceLock::new(),
             healed: Mutex::new(HashMap::new()),
         }
     }
@@ -250,6 +254,11 @@ impl MemorabiliaHost {
 
     /// This app's engine, opening one if needed. `None` when memorabilia is
     /// off for the app, or when the engine could not be opened.
+    /// Give engines opened from now on a decision-model gate for their app.
+    pub fn attach_decider(&self, hub: Arc<crate::decider::DeciderHub>) {
+        let _ = self.decider.set(hub);
+    }
+
     pub async fn memorabilia_for(&self, app_id: &str) -> Option<Arc<Engine>> {
         if let Some(existing) = self.instances.lock().await.get(app_id) {
             return Some(existing.engine.clone());
@@ -322,6 +331,11 @@ impl MemorabiliaHost {
             }
         };
         self.open_errors.lock().await.remove(app_id);
+        if let Some(hub) = self.decider.get() {
+            engine.set_worthiness_gate(Arc::new(
+                crate::decider::memory_gates::MemorabiliaGate::new(hub.clone(), app_id),
+            ));
+        }
 
         let (shutdown, rx) = tokio::sync::watch::channel(false);
         let background =

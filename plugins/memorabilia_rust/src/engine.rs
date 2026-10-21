@@ -38,6 +38,10 @@ pub struct Engine {
     /// Optional LLM PII classifier for the Stage 0 gate (plan §12.1,
     /// flagged `#privacy`); `None` = deterministic patterns only.
     pub pii_classifier: Option<Arc<dyn PiiClassifier>>,
+    /// Optional worth-remembering judge, run after Stage 0
+    /// (`traits::WorthinessGate`); `None` = every non-PII document is kept.
+    /// Set once, possibly after open (the host attaches it per app).
+    pub worthiness_gate: std::sync::OnceLock<Arc<dyn crate::traits::WorthinessGate>>,
     /// Tier table + reputable-domain data (plan §4.2): loaded automatically
     /// from `data/reliability.yaml`, overridable via
     /// [`Self::with_reliability_data`].
@@ -72,6 +76,7 @@ impl Engine {
             embedder,
             vectors,
             pii_classifier: None,
+            worthiness_gate: std::sync::OnceLock::new(),
             reliability,
             extraction_semaphore,
         }
@@ -108,6 +113,18 @@ impl Engine {
     pub fn with_pii_classifier(mut self, classifier: Arc<dyn PiiClassifier>) -> Self {
         self.pii_classifier = Some(classifier);
         self
+    }
+
+    /// Install a worth-remembering judge after the Stage 0 gate.
+    pub fn with_worthiness_gate(self, gate: Arc<dyn crate::traits::WorthinessGate>) -> Self {
+        self.set_worthiness_gate(gate);
+        self
+    }
+
+    /// [`Self::with_worthiness_gate`] for an engine already behind an `Arc`.
+    /// Once; later calls are ignored.
+    pub fn set_worthiness_gate(&self, gate: Arc<dyn crate::traits::WorthinessGate>) {
+        let _ = self.worthiness_gate.set(gate);
     }
 
     /// Override the auto-loaded reliability data file (plan §4.2).

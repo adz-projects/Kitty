@@ -42,9 +42,25 @@ pub struct PathwayEngine {
     /// only -- see `config::TrajectoryConfig`'s doc comment for why losing
     /// this across a restart is fine.
     trajectory_embeddings: DashMap<String, Vec<f32>>,
+    /// The host's optional judge (`traits::MemoryGate`), set once after open.
+    gate: std::sync::OnceLock<Arc<dyn crate::traits::MemoryGate>>,
 }
 
+/// How many top candidates the gate is asked to judge for relevance. The
+/// rest keep their score; asking about all of a large graph would spend the
+/// recall budget on beliefs DPP would almost never pick anyway.
+const RELEVANCE_POOL: usize = 32;
+
 impl PathwayEngine {
+    /// Hand the engine a `MemoryGate`. Once; later calls are ignored.
+    pub fn set_gate(&self, gate: Arc<dyn crate::traits::MemoryGate>) {
+        let _ = self.gate.set(gate);
+    }
+
+    pub fn gate(&self) -> Option<&Arc<dyn crate::traits::MemoryGate>> {
+        self.gate.get()
+    }
+
     pub async fn open(path: &str, cfg: Config) -> Result<Arc<Self>> {
         Self::open_with_embedder(path, cfg, None).await
     }
@@ -81,6 +97,7 @@ impl PathwayEngine {
             learn_locks: DashMap::new(),
             chat_slot: Arc::new(Semaphore::new(1)),
             trajectory_embeddings: DashMap::new(),
+            gate: std::sync::OnceLock::new(),
         }))
     }
 
@@ -156,6 +173,7 @@ impl PathwayEngine {
             learn_locks: DashMap::new(),
             chat_slot: Arc::new(Semaphore::new(1)),
             trajectory_embeddings: DashMap::new(),
+            gate: std::sync::OnceLock::new(),
         }))
     }
 
@@ -308,12 +326,16 @@ impl PathwayEngine {
         let predicted_query = self.trajectory_predict(session_id, &query);
         let query_domain = crate::domains::infer_query_domain(&candidates, &predicted_query);
         let cooccurrence = self.cooccurrence_adjacency(&candidates).await;
+        let relevance = self
+            .judge_relevance(user_message, &candidates, &predicted_query, query_domain.as_deref())
+            .await;
 
-        let selected = crate::recall::select_beliefs_relevant(
+        let selected = crate::recall::select_beliefs_relevant_with(
             &candidates,
             &predicted_query,
             query_domain.as_deref(),
             &cooccurrence,
+            relevance.as_ref(),
             &self.cfg,
         );
         if selected.is_empty() {
@@ -321,6 +343,34 @@ impl PathwayEngine {
         } else {
             Some(selected)
         }
+    }
+
+    /// Ask the gate, if there is one, how relevant the strongest candidates are
+    /// to this message. `None` (no gate, no opinion, nothing to ask about)
+    /// leaves selection exactly as it was.
+    async fn judge_relevance(
+        &self,
+        user_message: &str,
+        candidates: &[crate::store::beliefs::Belief],
+        query: &[f32],
+        query_domain: Option<&str>,
+    ) -> Option<crate::recall::Relevance> {
+        let gate = self.gate()?;
+        if user_message.trim().is_empty() {
+            return None;
+        }
+        let pool = crate::recall::preselect(candidates, query, query_domain, RELEVANCE_POOL);
+        if pool.is_empty() {
+            return None;
+        }
+        let texts: Vec<&str> = pool.iter().map(|&i| candidates[i].text.as_str()).collect();
+        let (ps, drop_below) = gate.belief_relevance(user_message, &texts).await?;
+        let by_index = pool
+            .into_iter()
+            .zip(ps)
+            .filter_map(|(i, p)| p.map(|p| (i, p)))
+            .collect();
+        Some(crate::recall::Relevance { by_index, drop_below })
     }
 
     /// Adjacency list over `candidates` (by index) of beliefs observed

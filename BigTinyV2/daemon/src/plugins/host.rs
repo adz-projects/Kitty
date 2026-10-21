@@ -53,6 +53,10 @@ pub struct PluginHost {
     /// Last engine-open failure per app, cleared on a successful open, so the
     /// routes can report *why* pathway is unavailable rather than "disabled".
     open_errors: Mutex<HashMap<String, String>>,
+    /// Per-app decision models, attached after construction (the hub lives on
+    /// the `Agent`, built after this host). Each engine opened afterwards gets
+    /// a gate for its own app.
+    decider: std::sync::OnceLock<Arc<crate::decider::DeciderHub>>,
     /// Apps whose DB file has been integrity-checked (and rebuilt if corrupt)
     /// at first open in this process — see `db_recover::heal_before_open`. The
     /// value is the rebuild report, held until `recover` reports it once.
@@ -78,6 +82,7 @@ impl PluginHost {
             chat,
             instances: Mutex::new(HashMap::new()),
             open_errors: Mutex::new(HashMap::new()),
+            decider: std::sync::OnceLock::new(),
             healed: Mutex::new(HashMap::new()),
         }
     }
@@ -122,6 +127,11 @@ impl PluginHost {
     ///
     /// Lazy on purpose: a registered app that never sends a turn should cost
     /// neither a SQLite file nor a background task.
+    /// Give engines opened from now on a decision-model gate for their app.
+    pub fn attach_decider(&self, hub: Arc<crate::decider::DeciderHub>) {
+        let _ = self.decider.set(hub);
+    }
+
     pub async fn pathway_for(&self, app_id: &str) -> Option<Arc<PathwayEngine>> {
         // An already-open instance short-circuits the preference check: it is
         // either genuinely in use, or was injected by a test as an explicit
@@ -183,6 +193,12 @@ impl PluginHost {
             }
         };
         self.open_errors.lock().await.remove(app_id);
+        if let Some(hub) = self.decider.get() {
+            engine.set_gate(Arc::new(crate::decider::memory_gates::PathwayGate::new(
+                hub.clone(),
+                app_id,
+            )));
+        }
 
         // One background sweep per *live* engine. V1 spawned exactly one
         // because there was exactly one engine; naively carrying that forward

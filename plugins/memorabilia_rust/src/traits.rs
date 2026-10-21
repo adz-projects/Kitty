@@ -196,3 +196,27 @@ impl VectorIndex for MemoryVectorIndex {
         Ok(ids)
     }
 }
+
+/// Optional judge of whether a document is worth remembering at all, run
+/// right after the Stage 0 PII gate. BigTiny supplies its per-app decision
+/// model here. `Some(p)` rejects the document (`p` = the judged probability it
+/// is worth keeping, for the audit row); `None` -- including any failure --
+/// lets it through, exactly as if no gate were installed.
+#[async_trait]
+pub trait WorthinessGate: Send + Sync {
+    async fn reject(&self, text: &str) -> Option<f32>;
+}
+
+/// Test double for [`WorthinessGate`]: rejects every document with `p` when
+/// set.
+#[derive(Debug, Clone, Default)]
+pub struct MockWorthinessGate {
+    pub reject_with: Option<f32>,
+}
+
+#[async_trait]
+impl WorthinessGate for MockWorthinessGate {
+    async fn reject(&self, _text: &str) -> Option<f32> {
+        self.reject_with
+    }
+}

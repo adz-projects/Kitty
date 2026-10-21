@@ -18,6 +18,7 @@
 
 pub mod backend;
 pub mod hub;
+pub mod memory_gates;
 pub mod systemone;
 
 use std::collections::BTreeMap;

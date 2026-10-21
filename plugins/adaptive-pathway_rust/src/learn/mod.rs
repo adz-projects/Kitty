@@ -154,6 +154,20 @@ pub async fn extract_and_record<S: StructuredChat>(
         return Ok(LearnOutcome::default());
     }
 
+    // The host's gate, when it has one, may judge the chunk not worth a pass
+    // (nothing durable about the user in it). Same as an empty chunk: the
+    // watermark advances so the range is never re-sent, and nothing is
+    // learned. The exchange clock above still moved -- it counts exchanges,
+    // not extractions.
+    if let Some(gate) = engine.gate() {
+        if let Some(p) = gate.skip_learning(&chunk).await {
+            db.advance_learned_rowid(req.session_id, req.through_rowid).await?;
+            let detail = format!("session={} through={} p={p:.2}", req.session_id, req.through_rowid);
+            let _ = db.audit("learn_gated", Some(&detail)).await;
+            return Ok(LearnOutcome::default());
+        }
+    }
+
     // Render KNOWN BELIEFS (top 20 by effective weight).
     let known = render_known_beliefs(db).await?;
 

@@ -87,6 +87,9 @@ pub struct IngestOutcome {
     /// Chunks skipped at Stage 3 (content hash already seen or
     /// tombstoned).
     pub chunks_skipped: usize,
+    /// The worthiness gate judged the document not worth remembering
+    /// (nothing was written).
+    pub rejected_low_value: bool,
 }
 
 /// The pre-extraction decay class (plan §5.1). Stage 4 assigns the real
@@ -168,6 +171,26 @@ impl Engine {
             audit_pii_rejection(&self.db, &categories, &created).await;
             outcome.rejected_pii = categories;
             return outcome;
+        }
+
+        // Worthiness — boilerplate, a challenge page, chit-chat — judged by
+        // the host's gate when it has one, before anything is embedded or
+        // written. A gate with no opinion keeps the document.
+        if let Some(gate) = self.worthiness_gate.get() {
+            if let Some(p) = gate.reject(content).await {
+                let entry = crate::store::audit::AuditEntry {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    event: "rejected:low_value".into(),
+                    category: Some(input.source_type.clone()),
+                    detail: Some(format!("p={p:.2}")),
+                    created_at: input.captured_at.clone(),
+                };
+                if let Err(e) = self.db.insert_audit(&entry).await {
+                    tracing::warn!("worthiness gate: audit insert failed ({e})");
+                }
+                outcome.rejected_low_value = true;
+                return outcome;
+            }
         }
 
         // Stage 1 — document-hash catalog (plan §3.1): a tombstone blocks
