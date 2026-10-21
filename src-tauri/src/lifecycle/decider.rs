@@ -127,8 +127,14 @@ async fn apply(app: &AppHandle) -> Result<(), String> {
 /// engine echoes the thresholds back with every default filled in, so those
 /// are compared by the keys we set rather than wholesale.
 fn same(have: &Value, want: &Value) -> bool {
-    let keys = ["dialect", "url", "model", "features", "tool_groups"];
+    let keys = ["dialect", "url", "model", "features"];
     if keys.iter().any(|k| have.get(k) != want.get(k)) {
+        return false;
+    }
+    // The engine echoes every group with its defaults filled in (`always:
+    // false`, `file_types: []`), which the catalog leaves out; compared raw,
+    // the two never matched and every self-heal re-sent the settings.
+    if groups_with_defaults(have.get("tool_groups")) != groups_with_defaults(want.get("tool_groups")) {
         return false;
     }
     let empty = serde_json::Map::new();
@@ -138,9 +144,49 @@ fn same(have: &Value, want: &Value) -> bool {
         .all(|(k, v)| have["thresholds"].get(k).and_then(Value::as_f64) == v.as_f64())
 }
 
+/// Tool groups with the engine's defaults filled in, for comparison.
+fn groups_with_defaults(groups: Option<&Value>) -> Vec<Value> {
+    groups
+        .and_then(Value::as_array)
+        .map(|gs| {
+            gs.iter()
+                .map(|g| {
+                    let mut g = g.clone();
+                    if let Some(obj) = g.as_object_mut() {
+                        obj.entry("always").or_insert(json!(false));
+                        obj.entry("file_types").or_insert(json!([]));
+                    }
+                    g
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The engine's echo of the catalog, as it serializes `ToolGroup`: every
+    /// field present. Kitty must recognise it as what it sent.
+    #[test]
+    fn the_engines_echo_of_the_catalog_counts_as_the_same() {
+        let s = DeciderSettings {
+            url: "http://box:8080".into(),
+            ..DeciderSettings::default()
+        };
+        let want = desired(&s).unwrap();
+        let mut have = want.clone();
+        for g in have["tool_groups"].as_array_mut().unwrap() {
+            let obj = g.as_object_mut().unwrap();
+            obj.entry("always").or_insert(json!(false));
+            obj.entry("file_types").or_insert(json!([]));
+        }
+        have["cache_ttl_secs"] = json!(300);
+        assert!(same(&have, &want));
+        have["tool_groups"][1]["file_types"] = json!([".pdf"]);
+        assert!(!same(&have, &want));
+    }
 
     #[test]
     fn no_url_means_no_decision_model() {

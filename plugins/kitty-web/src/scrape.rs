@@ -1216,7 +1216,7 @@ mod tests {
 
     #[test]
     fn the_page_check_sees_title_and_visible_text_only() {
-        let html = "<html><head><title> Just a moment... </title><style>p{}</style>                    <script>var x = 1;</script></head><body><p>Checking your  browser</p></body></html>";
+        let html = "<html><head><title> Just a moment... </title><style>p{}</style><script>var x = 1;</script></head><body><p>Checking your  browser</p></body></html>";
         assert_eq!(title_of(html), "Just a moment...");
         assert_eq!(rough_text(html), "Just a moment... Checking your browser");
     }
