@@ -120,10 +120,14 @@ impl memorabilia::traits::WorthinessGate for MemorabiliaGate {
         let state: String = text.chars().take(INGEST_STATE_CHARS).collect();
         let q = vec![(
             "worth".to_string(),
+            // Names essays and arguments on purpose: asked only about
+            // "reference material", d1 rejected the user's own op-ed drafts
+            // and a published opinion piece (3 of 12 rejections over 119 real
+            // documents); this wording kept all three and caught more junk.
             Question::yes_no(
-                "Is this worth keeping as reference material (facts, specifications, data, \
-                 explanations) rather than boilerplate, site navigation, an error or bot-check \
-                 page, or small talk?",
+                "Is this substantive content worth remembering (an article, essay, argument, \
+                 documentation, data or explanation) rather than boilerplate, site navigation, a \
+                 search-results list, an error or bot-check page, or a page with almost no text?",
             ),
         )];
         let a = self
