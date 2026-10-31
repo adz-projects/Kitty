@@ -50,6 +50,13 @@ pub struct MaintenanceOutcome {
 /// backlog (plan §11).
 const OUTBOX_DRAIN_LIMIT: i64 = 256;
 
+/// `app_settings` key marking the archived-pending restore as finished.
+pub const RESTORE_UNEXTRACTED_KEY: &str = "restore_unextracted_v1";
+
+/// Chunks the restore pass re-embeds per tick (local embedding only, so a
+/// batch costs seconds, but a tick should still stay short).
+const RESTORE_BATCH: i64 = 50;
+
 impl Engine {
     /// One maintenance pass at caller time `now` (ISO-8601 UTC, second
     /// precision). Never returns an error — an unparseable `now` or any phase
@@ -165,6 +172,13 @@ impl Engine {
         let mut disputes_closed = 0usize;
 
         for chunk in self.db.list_chunks_by_status("active").await? {
+            // A chunk still waiting for extraction has never been recallable,
+            // so it has had no chance to be grounded or reinforced; decaying it
+            // archived pages before anyone could use them. Its clock starts at
+            // extraction (`Db::finish_extraction`).
+            if chunk.extraction_status == "pending" {
+                continue;
+            }
             let anchor = match core::parse_utc(&chunk.anchor_at) {
                 Some(a) => a,
                 None => continue,
@@ -227,6 +241,60 @@ impl Engine {
             archived += 1;
         }
         Ok((archived, props_archived, props_deleted, disputes_closed))
+    }
+
+    /// One-time catch-up, a batch per sweep tick: bring back chunks that decay
+    /// archived before they were ever extracted (before 1.0.6, decay ran on
+    /// pending chunks too, and the queue only moved at turn end). Each is set
+    /// active with its decay clock restarted at `now` and its vector put back
+    /// (archiving removed it), so the drain extracts it like any new chunk.
+    /// Finished once a pass finds none; the `restore_unextracted_v1` setting
+    /// then makes every later call a single lookup. Soft-fail: an error leaves
+    /// the rest for the next tick.
+    pub async fn restore_unextracted_batch(&self, now: &str) -> usize {
+        if matches!(self.db.get_setting(RESTORE_UNEXTRACTED_KEY).await, Ok(Some(_))) {
+            return 0;
+        }
+        let batch = match self.db.list_archived_pending_chunks(RESTORE_BATCH).await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!("restore_unextracted: list failed ({e})");
+                return 0;
+            }
+        };
+        if batch.is_empty() {
+            if let Err(e) = self.db.set_setting(RESTORE_UNEXTRACTED_KEY, now).await {
+                tracing::warn!("restore_unextracted: could not record completion ({e})");
+            }
+            return 0;
+        }
+        let mut restored = 0usize;
+        for chunk in batch {
+            let (vec, tag) = match self.embedder.embed_fresh(&chunk.content).await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!("restore_unextracted: embed failed for {} ({e})", chunk.chunk_id);
+                    continue;
+                }
+            };
+            if let Err(e) = self.vectors.upsert(&chunk.chunk_id, &vec, &tag).await {
+                tracing::warn!("restore_unextracted: vector write failed for {} ({e})", chunk.chunk_id);
+                continue;
+            }
+            let reactivated = async {
+                self.db.update_chunk_embedding_model(&chunk.chunk_id, &tag).await?;
+                self.db.unarchive_chunk(&chunk.chunk_id, now).await
+            }
+            .await;
+            match reactivated {
+                Ok(()) => restored += 1,
+                Err(e) => tracing::warn!("restore_unextracted: reactivate failed for {} ({e})", chunk.chunk_id),
+            }
+        }
+        if restored > 0 {
+            tracing::info!(restored, "memorabilia: restored archived chunks for extraction");
+        }
+        restored
     }
 
     /// Hard-delete archived chunks and unsupported-archive propositions whose

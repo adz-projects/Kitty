@@ -42,6 +42,10 @@ pub async fn consolidate_session(db: &Db, session_id: &str) -> Result<()> {
 
 async fn consolidate_session_inner(db: &Db, session_id: &str) -> Result<()> {
     let now = Utc::now();
+    // Beliefs this pass deleted, merged or moved. The audit row is written
+    // only when something changed: the idle sweep revisits sessions, and an
+    // unconditional row per visit filled `audit_log` at 3 rows a minute.
+    let mut changed = 0usize;
 
     // Load *this session's* conversation-layer beliefs only, discard weak
     // ones.
@@ -67,6 +71,7 @@ async fn consolidate_session_inner(db: &Db, session_id: &str) -> Result<()> {
         let weak = b.confidence < 0.25 || (b.provenance == Provenance::SingleObservation && b.support_count <= 1);
         if weak {
             db.delete_belief(&b.id).await?;
+            changed += 1;
             continue;
         }
         // merge into a context belief at cosine ≥ 0.86.
@@ -133,6 +138,7 @@ async fn consolidate_session_inner(db: &Db, session_id: &str) -> Result<()> {
                     .await?;
                 db.delete_belief(&b.id).await?;
                 merged = true;
+                changed += 1;
                 break;
             }
         }
@@ -158,6 +164,7 @@ async fn consolidate_session_inner(db: &Db, session_id: &str) -> Result<()> {
             promoted.layer = Layer::Context;
             promoted.session_id = None;
             context.push(promoted);
+            changed += 1;
         }
     }
 
@@ -175,13 +182,16 @@ async fn consolidate_session_inner(db: &Db, session_id: &str) -> Result<()> {
                 now,
             )
             .await?;
+            changed += 1;
         }
     }
 
     // Contradiction pass over open contradictions.
     crate::store::contradictions::run_contradiction_pass(db).await?;
 
-    // Audit.
-    db.audit("consolidate", Some(&format!("session={session_id}"))).await?;
+    if changed > 0 {
+        db.audit("consolidate", Some(&format!("session={session_id} changed={changed}")))
+            .await?;
+    }
     Ok(())
 }

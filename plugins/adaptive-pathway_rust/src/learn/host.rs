@@ -128,21 +128,39 @@ pub async fn read_unlearned_chunk(
 /// unconditionally true for every session regardless of actual age. Both
 /// sides now come from the same `datetime()` family so they compare in the
 /// same format.
+///
+/// `app_id` scopes the list to the app that owns this belief graph: the host
+/// db is shared by every app on the engine, and without the filter another
+/// app's conversations were learned into this one's graph. `None` (a host
+/// with no app column, e.g. tests and single-app embeddings) lists every
+/// session.
+///
+/// Newest first. The caller takes only a few per tick, and an unordered list
+/// used to hand back the same three long-since-learned sessions every tick,
+/// so nothing newer was ever reached.
 pub async fn idle_session_ids(
     host_pool: &SqlitePool,
+    app_id: Option<&str>,
     idle_minutes: i64,
     active_minutes: i64,
 ) -> Result<Vec<String>> {
-    let rows: Vec<(String,)> = sqlx::query_as(
-        "SELECT id FROM sessions WHERE \
+    let app_clause = if app_id.is_some() { "app_id = ? AND " } else { "" };
+    let sql = format!(
+        "SELECT id FROM sessions WHERE {app_clause}( \
          (status = 'idle' AND updated_at < datetime('now', printf('-%d minutes', ?))) OR \
-         (status = 'active' AND updated_at < datetime('now', printf('-%d minutes', ?)))",
-    )
-    .bind(idle_minutes)
-    .bind(active_minutes)
-    .fetch_all(host_pool)
-    .await
-    .map_err(|e| PathwayError::Host(format!("bigtiny.db sessions read: {e}")))?;
+         (status = 'active' AND updated_at < datetime('now', printf('-%d minutes', ?)))) \
+         ORDER BY updated_at DESC"
+    );
+    let mut query = sqlx::query_as::<_, (String,)>(&sql);
+    if let Some(app_id) = app_id {
+        query = query.bind(app_id);
+    }
+    let rows = query
+        .bind(idle_minutes)
+        .bind(active_minutes)
+        .fetch_all(host_pool)
+        .await
+        .map_err(|e| PathwayError::Host(format!("bigtiny.db sessions read: {e}")))?;
     Ok(rows.into_iter().map(|r| r.0).collect())
 }
 

@@ -13,8 +13,8 @@
 //! timeout, malformed entry, or DB error is logged and contained to the
 //! chunk — it stays `pending` with its retry backoff started, and the rest
 //! of the batch proceeds. `ingest()` never calls this path (Phase 4 exit
-//! criterion); the maintenance tick (Phase 8) and tests drive
-//! [`Engine::drain_extraction`].
+//! criterion); the host's background sweep calls [`Engine::drain_extraction`]
+//! after each maintenance tick, and tests drive it directly.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -38,6 +38,10 @@ const CONFLICT_PROBE_SIMILARITY_MAX: f64 = 0.98;
 /// Store timestamp format (migration 002 convention: ISO-8601 UTC, second
 /// precision, literal `Z`).
 const STORE_TIMESTAMP_FORMAT: &str = "%Y-%m-%dT%H:%M:%SZ";
+
+/// Fewest non-whitespace characters a chunk needs to be worth an extraction
+/// call. A single claim takes more than this; anything shorter is a fragment.
+pub const MIN_EXTRACTABLE_CHARS: usize = 16;
 
 /// One probe neighbor as rendered into the prompt (plan §3.5: the chunk's
 /// text AND its extracted propositions).
@@ -329,6 +333,18 @@ impl Engine {
                     if let Err(e) = self.db.mark_extraction_failed(&chunk.chunk_id, now).await {
                         tracing::warn!("drain_extraction: failure write failed ({e})");
                     }
+                    // Also in the audit log, so a stalled queue says why on
+                    // disk, not only in a log that may be gone.
+                    let entry = crate::store::audit::AuditEntry {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        event: "extract_failed".into(),
+                        category: None,
+                        detail: Some(format!("chunk={} error={e}", chunk.chunk_id)),
+                        created_at: now.into(),
+                    };
+                    if let Err(e) = self.db.insert_audit(&entry).await {
+                        tracing::warn!("drain_extraction: failure audit failed ({e})");
+                    }
                 }
             }
         }
@@ -374,6 +390,22 @@ impl Engine {
                 propositions: 0,
                 disputes: 0,
                 suppressed_skip: true,
+            });
+        }
+
+        // Too little text to hold a claim (an empty API response, a stray
+        // fragment): done with nothing, no model call. One-character chunks
+        // sat at the head of the queue costing a full extraction each.
+        if chunk.content.chars().filter(|c| !c.is_whitespace()).count() < MIN_EXTRACTABLE_CHARS {
+            self.db.mark_extraction_done(&chunk.chunk_id).await?;
+            if let Some(rowid) = self.db.chunk_rowid(&chunk.chunk_id).await? {
+                self.db.advance_extraction_watermark(rowid).await?;
+            }
+            self.audit_extracted(now, &chunk.chunk_id, 0, 0, false).await;
+            return Ok(ExtractedCounts {
+                propositions: 0,
+                disputes: 0,
+                suppressed_skip: false,
             });
         }
 
@@ -487,13 +519,22 @@ impl Engine {
         let (decay_class, expiry_naive) = resolve_decay_profile(&claims);
         let expiry: Option<String> =
             expiry_naive.map(|t| t.format(STORE_TIMESTAMP_FORMAT).to_string());
+        // The decay clock starts now, when the chunk becomes recallable (see
+        // `Db::finish_extraction`). A deadline chunk decays against its own
+        // T_expire, so its anchor is left alone.
+        let restart_anchor = decay_class != "deadline";
+        let anchor_at = if restart_anchor {
+            now.to_string()
+        } else {
+            chunk.anchor_at.clone()
+        };
 
         // One transaction: disputes → propositions → support links →
         // terminal chunk write → watermark → confidence refresh.
         let chunk_id = chunk.chunk_id.clone();
         let source_entity = chunk.source_entity.clone();
         let source_reliability = chunk.source_reliability;
-        let anchor_at = chunk.anchor_at.clone();
+        let new_anchor = restart_anchor.then(|| anchor_at.clone());
         let now_owned = now.to_string();
         let now_ref = now_naive;
         let audit_chunk_id = chunk_id.clone();
@@ -561,8 +602,13 @@ impl Engine {
                         db.add_support_link(&chunk_id, &c.node_id, &now_owned).await?;
                     }
 
-                    db.finish_extraction(&chunk_id, &decay_class, expiry.as_deref())
-                        .await?;
+                    db.finish_extraction(
+                        &chunk_id,
+                        &decay_class,
+                        expiry.as_deref(),
+                        new_anchor.as_deref(),
+                    )
+                    .await?;
                     // Forward-only watermark (plan §3.6, MAX guard).
                     if let Some(rowid) = db.chunk_rowid(&chunk_id).await? {
                         db.advance_extraction_watermark(rowid).await?;

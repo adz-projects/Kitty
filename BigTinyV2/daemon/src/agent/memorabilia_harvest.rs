@@ -114,9 +114,12 @@ pub async fn harvest_turn(engine: &Engine, pool: &SqlitePool, session_id: &str) 
         }
     }
 
-    // Make what we just ingested recallable without waiting for the sweep.
+    // Extraction is the host sweep's job (`memorabilia_host::sweep`), not
+    // this turn's: draining here held a model call inside a task the next
+    // turn aborts, so the queue only ever grew. What was ingested is picked
+    // up within one sweep tick.
     if ingested_any {
-        engine.drain_extraction(&now).await;
+        tracing::debug!(session_id, "memorabilia: turn documents ingested; extraction queued");
     }
 }
 

@@ -23,6 +23,9 @@ const MAINTENANCE_INTERVAL_HOURS: i64 = 24;
 const STALE_CONFIDENCE_PENALTY: f64 = 0.15;
 const STALE_AFTER_DAYS: i64 = 30;
 
+/// How long routine `consolidate`/`maintenance` audit rows are kept.
+const HOUSEKEEPING_AUDIT_DAYS: i64 = 30;
+
 pub async fn run_maintenance(db: &Db) -> Result<()> {
     let now = Utc::now();
 
@@ -41,6 +44,9 @@ pub async fn run_maintenance(db: &Db) -> Result<()> {
     }
 
     reevaluate_stale_beliefs(db, now).await?;
+    if let Err(e) = db.prune_housekeeping_audit(HOUSEKEEPING_AUDIT_DAYS).await {
+        tracing::warn!("pathway: audit pruning failed: {e}");
+    }
 
     db.set_setting(LAST_MAINTENANCE_KEY, &now.timestamp().to_string()).await?;
     db.audit("maintenance", None).await.ok();

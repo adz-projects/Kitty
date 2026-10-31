@@ -38,13 +38,9 @@ pub struct PluginHost {
     /// its own lexical behaviour.
     embedder: Option<Arc<dyn SemanticEmbedder>>,
     /// The summarizer the background sweep needs. Daemon-wide: it is a
-    /// provider client, not per-app state.
-    ///
-    /// Concrete rather than `Arc<dyn StructuredChat>` because
-    /// `adaptive_pathway::background::run` is generic over `S: StructuredChat`
-    /// and so requires `Sized`. Making `PluginHost` generic instead would push
-    /// a type parameter through `AppState` and every route for no benefit --
-    /// `SummarizerChain` is the only implementor the daemon has.
+    /// provider client, not per-app state. The sweep never calls it directly:
+    /// it goes through a `SessionSummarizerFactory`, so each session's pass
+    /// falls back to that session's own provider.
     chat: Arc<crate::agent::summarizer_chain::SummarizerChain>,
     /// Guarded by a mutex rather than a `DashMap` because opening an engine is
     /// an `await` that must not happen twice concurrently for the same app --
@@ -207,7 +203,11 @@ impl PluginHost {
         let background = tokio::spawn(adaptive_pathway::background::run(
             engine.clone(),
             self.pool.clone(),
-            self.chat.clone(),
+            crate::agent::summarizer_chain::SessionSummarizerFactory {
+                chain: self.chat.clone(),
+                pool: self.pool.clone(),
+            },
+            Some(app_id.to_string()),
             rx,
         ))
         .abort_handle();

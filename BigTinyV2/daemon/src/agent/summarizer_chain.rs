@@ -25,12 +25,18 @@
 //!    never a failed turn.
 //!
 //! Two call shapes, because the two callers see different context:
-//! - [`SummarizerChain::structured_chat_for_session`] — chat compaction. Has
-//!   a session, so the fallback leg uses that session's own pinned provider.
+//! - [`SummarizerChain::structured_chat_for_session`] — chat compaction and
+//!   adaptive-pathway's learn passes (turn-end through [`SessionSummarizer`],
+//!   the idle sweep through [`SessionSummarizerFactory`]). Has a session, so
+//!   the fallback leg uses that session's own pinned provider.
+//! - [`SummarizerChain::structured_chat_for_app`] — memorabilia extraction,
+//!   which has an app but no session. The fallback leg uses that app's own
+//!   default provider.
 //! - [`SummarizerChain::structured_chat`] (the plain [`StructuredChat`] impl)
-//!   — adaptive-pathway's learn passes, which run outside any one session's
-//!   context. The fallback leg uses the router's current default provider
-//!   ([`ProviderRouter::resolve_provider`] with no preference).
+//!   — no session and no app. The fallback leg uses the router's current
+//!   default provider ([`ProviderRouter::resolve_provider`] with no
+//!   preference), which on a shared engine may be another app's: no memory
+//!   pass uses it any more.
 
 use std::sync::Arc;
 
@@ -196,6 +202,29 @@ impl SummarizerChain {
             .ok_or_else(|| "no provider available for the summarizer fallback".to_string())?;
         self.via_router(provider_id, model, messages, schema).await
     }
+
+    /// For a pass that belongs to an app but no one session (memorabilia
+    /// extraction): local first, then that app's own provider — its default
+    /// card, else the healthiest provider *it* can see. Never another app's.
+    pub async fn structured_chat_for_app(
+        &self,
+        app_id: &str,
+        app_default: Option<&str>,
+        messages: Vec<Value>,
+        schema: &Value,
+    ) -> Result<Value, String> {
+        if let Some(v) = self.try_local(&messages, schema).await {
+            return Ok(v);
+        }
+        if self.cfg.fallback == "off" {
+            return Err("local summarizer unavailable and fallback is disabled".into());
+        }
+        let provider_id = self
+            .router
+            .resolve_provider_for_app(app_id, None, app_default)
+            .map_err(|e| format!("no summarizer fallback provider for {app_id}: {e}"))?;
+        self.via_router(&provider_id, None, messages, schema).await
+    }
 }
 
 /// Drain a chat-completion stream into its text. Any content is success —
@@ -257,6 +286,49 @@ impl StructuredChat for SessionSummarizer {
     }
 }
 
+/// Hands adaptive-pathway's idle sweep a [`SessionSummarizer`] for each
+/// session it learns from, bound to the provider and model stored in that
+/// session's metadata. The sweep used the sessionless chain, whose fallback is
+/// the router's default — on a shared engine, possibly another app's provider.
+#[derive(Clone)]
+pub struct SessionSummarizerFactory {
+    pub chain: Arc<SummarizerChain>,
+    pub pool: sqlx::SqlitePool,
+}
+
+#[async_trait::async_trait]
+impl adaptive_pathway::traits::SessionChat for SessionSummarizerFactory {
+    type Chat = SessionSummarizer;
+
+    async fn for_session(&self, session_id: &str) -> SessionSummarizer {
+        let metadata: Option<Option<String>> =
+            sqlx::query_scalar("SELECT metadata FROM sessions WHERE id = ?")
+                .bind(session_id)
+                .fetch_optional(&self.pool)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!("could not read session {session_id} for its provider: {e}");
+                    None
+                });
+        let metadata: Value = metadata
+            .flatten()
+            .and_then(|m| serde_json::from_str(&m).ok())
+            .unwrap_or(Value::Null);
+        let field = |key: &str| {
+            metadata
+                .get(key)
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .map(String::from)
+        };
+        SessionSummarizer {
+            chain: self.chain.clone(),
+            provider_id: field("provider"),
+            model: field("model"),
+        }
+    }
+}
+
 /// Sessionless entry point, for passes with no session to take a provider
 /// from (adaptive-pathway's background consolidation) — uses the router's
 /// current default.
@@ -311,6 +383,29 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("no provider available"), "got {err}");
+    }
+
+    /// Memorabilia extraction for one app never runs on another app's
+    /// provider, even when that is the only one registered.
+    #[tokio::test]
+    async fn an_app_summarizer_never_falls_back_to_another_apps_provider() {
+        let router = Arc::new(ProviderRouter::default());
+        router.register_openai_owned(
+            "theirs",
+            ProviderConfig::default(),
+            Some("notebook".into()),
+        );
+        let chain = chain(router, "session_model");
+        let err = chain
+            .structured_chat_for_app("kitty", None, vec![], &json!({}))
+            .await
+            .unwrap_err();
+        assert!(err.contains("no summarizer fallback provider for kitty"), "got {err}");
+        // Naming it as the default doesn't make it visible either.
+        assert!(chain
+            .structured_chat_for_app("kitty", Some("theirs"), vec![], &json!({}))
+            .await
+            .is_err());
     }
 
     /// With no local summarizer and `fallback: "off"`, both entry points must

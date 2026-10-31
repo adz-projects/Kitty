@@ -87,11 +87,14 @@ provider the router resolves (never a hardcoded HTTP client).
 
    ─────────────── background::run — 1 loop per 60s tick (watched shutdown)
    ▼
-   idle_sweep: host session ids idle ≥15 min OR active ≥30 min (SQL
-   datetime('now'), ≤ IDLE_SWEEP_BATCH=3 per tick) → per id:
-        paused? skip
-        extract_and_record(IdleClose)  (same watermark discipline)
-        consolidate_session(id)
+   idle_sweep: this app's host session ids idle ≥15 min OR active ≥30 min
+   (SQL datetime('now'), newest first) → per id, until IDLE_SWEEP_BATCH=3
+   sessions *with work* are taken:
+        paused or in failure backoff (30 min)? skip
+        nothing unlearned and no conversation-layer beliefs? skip (no slot)
+        extract_and_record(IdleClose) on the session's own provider
+          (SessionChat::for_session; same watermark discipline)
+        consolidate_session(id)  (audited only when it changed something)
    then run maintenance each tick
    (tick uses MissedTickBehavior::Skip; select! on 60s tick vs shutdown_rx)
 
@@ -211,10 +214,15 @@ in-memory work in a single transaction; every error is logged, never raised.
 
 5. **Background loop, consolidation, and the nightly maintenance.** A single
 `background::run` task ticks every 60s (missed ticks skipped, watch-channelled
-shutdown) and runs an idle sweep: it queries the host's `big.db` for sessions
-whose `updated_at` is idle ≥15 min or stale-active ≥30 min, caps each sweep at
-3 sessions to avoid a restart storm, and for each — unless paused — runs the
-`IdleClose` learn pass followed by `consolidate_session`. Consolidation
+shutdown) and runs an idle sweep: it queries the host's `big.db` for this
+app's sessions whose `updated_at` is idle ≥15 min or stale-active ≥30 min,
+newest first, and takes up to 3 sessions that still have work (an unlearned
+tail, or conversation-layer beliefs to consolidate) to avoid a restart storm.
+For each — unless paused, or backing off after a failed pass — it runs the
+`IdleClose` learn pass on that session's own provider, then
+`consolidate_session`. (Before 1.0.6 the sweep took the first 3 ids
+unconditionally; they were always the same three finished sessions, so
+nothing newer was ever learned at idle.) Consolidation
 promotes conversation-layer beliefs: weak ones (confidence < 0.25, or a lone
 `single_observation`) are pruned (observations survive as audit), survivors
 merge into a cross-session context belief at cosine ≥ 0.86 or are elevated to

@@ -22,6 +22,38 @@ pub trait StructuredChat: Send + Sync {
     ) -> Result<Value, String>;
 }
 
+/// Chooses the chat a background pass about one session should use.
+///
+/// The idle sweep learns from many sessions, and each must be answered by its
+/// own provider — on a shared engine, a single daemon-wide chat could be
+/// another app's. The host implements this; anything that answers the same
+/// for every session (tests, a single-provider host) gets it through the
+/// `Arc` impl below.
+#[async_trait]
+pub trait SessionChat: Send + Sync {
+    type Chat: StructuredChat;
+    async fn for_session(&self, session_id: &str) -> Self::Chat;
+}
+
+#[async_trait]
+impl<S: StructuredChat + ?Sized> StructuredChat for std::sync::Arc<S> {
+    async fn structured_chat(
+        &self,
+        messages: Vec<Value>,
+        schema: &Value,
+    ) -> Result<Value, String> {
+        self.as_ref().structured_chat(messages, schema).await
+    }
+}
+
+#[async_trait]
+impl<S: StructuredChat + ?Sized> SessionChat for std::sync::Arc<S> {
+    type Chat = std::sync::Arc<S>;
+    async fn for_session(&self, _session_id: &str) -> Self::Chat {
+        self.clone()
+    }
+}
+
 /// A mock `StructuredChat` for tests that returns a canned response.
 pub struct MockChat {
     pub response: Value,

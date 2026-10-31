@@ -1966,7 +1966,10 @@ impl AgentLoop {
         if let Some((_, handles)) = self.background_tasks.remove(session_id) {
             let live = handles.iter().filter(|h| !h.is_finished()).count();
             if live > 0 {
-                tracing::debug!(
+                // `info`, not `debug`: an aborted learn pass leaves its range
+                // to the idle sweep, and when that went wrong the only sign
+                // was memory that silently stopped growing.
+                tracing::info!(
                     session_id,
                     live,
                     "aborting this session's own turn-end background work"
@@ -4212,8 +4215,12 @@ impl AgentLoop {
         };
         let mem_pool = pool.clone();
         let mem_session_id = session_id.to_string();
-        let mem_session_for_tracking = mem_session_id.clone();
-        let mem_handle = tokio::spawn(async move {
+        // Not registered with `track_background`, so the next turn never
+        // aborts it. The abort exists to free a single-slot provider, and
+        // ingest holds none: it only chunks and embeds locally. An aborted
+        // ingest lost the turn's pages outright. Extraction, which does use a
+        // model, runs in the memorabilia host's sweep instead.
+        tokio::spawn(async move {
             let Some(engine) = mem_engine else {
                 return;
             };
@@ -4225,7 +4232,6 @@ impl AgentLoop {
             crate::agent::memorabilia_harvest::harvest_turn(&engine, &mem_pool, &mem_session_id)
                 .await;
         });
-        self.track_background(&mem_session_for_tracking, mem_handle.abort_handle());
     }
 
     /// Adaptive Pathway turn-start hook: in-process recall against the

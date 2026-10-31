@@ -17,7 +17,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use adaptive_pathway::embed::SemanticEmbedder;
-use adaptive_pathway::traits::StructuredChat as ApStructuredChat;
 use async_trait::async_trait;
 use memorabilia::config::{Config as MemConfig, HASH_EMBED_MODEL};
 use memorabilia::engine::Engine;
@@ -64,11 +63,16 @@ impl memorabilia::traits::Embedder for SharedSemanticEmbedder {
     }
 }
 
-/// Adapts the daemon's `SummarizerChain` (which implements
-/// `adaptive_pathway::traits::StructuredChat`) to memorabilia's identical
-/// `StructuredChat` seam — the Gemma E2B → provider fallback extraction path.
+/// Adapts the daemon's `SummarizerChain` to memorabilia's `StructuredChat`
+/// seam — the Gemma E2B → provider fallback extraction path — for one app.
+///
+/// One per instance, carrying its `app_id`: when the local model can't answer,
+/// the fallback is that app's own default provider. It used to be the router's
+/// sessionless default, which on a shared engine could be another app's.
 struct SummarizerChatAdapter {
     inner: Arc<SummarizerChain>,
+    pool: SqlitePool,
+    app_id: String,
 }
 
 #[async_trait]
@@ -78,7 +82,16 @@ impl memorabilia::traits::StructuredChat for SummarizerChatAdapter {
         messages: Vec<Value>,
         schema: &Value,
     ) -> Result<Value, String> {
-        ApStructuredChat::structured_chat(self.inner.as_ref(), messages, schema).await
+        // Read per call rather than at open: the user can change the default
+        // card while the instance is live.
+        let app_default = crate::storage::apps::get_app(&self.pool, &self.app_id)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|a| a.default_provider_id);
+        self.inner
+            .structured_chat_for_app(&self.app_id, app_default.as_deref(), messages, schema)
+            .await
     }
 }
 
@@ -104,8 +117,9 @@ pub struct MemorabiliaHost {
     raw_embedder: Option<Arc<dyn SemanticEmbedder>>,
     /// The shared model's vector-space identity tag.
     embed_space: String,
-    /// The extraction/maintenance chat seam (SummarizerChain), daemon-wide.
-    chat: Arc<dyn memorabilia::traits::StructuredChat>,
+    /// The extraction/maintenance chat (SummarizerChain), daemon-wide. Each
+    /// instance wraps it in its own app-scoped `SummarizerChatAdapter`.
+    chat: Arc<SummarizerChain>,
     /// Memoized `(config, embedder)` resolved from `raw_embedder` on first use.
     /// Sized to the embedder's live width once, then fixed for the process so
     /// every app's `chunks_vec` table agrees on a dimension.
@@ -141,9 +155,6 @@ impl MemorabiliaHost {
         embed_space: String,
         chat: Arc<SummarizerChain>,
     ) -> Self {
-        let chat: Arc<dyn memorabilia::traits::StructuredChat> =
-            Arc::new(SummarizerChatAdapter { inner: chat });
-
         Self {
             pool,
             data_dir,
@@ -315,7 +326,11 @@ impl MemorabiliaHost {
         let engine = match Engine::open_at(
             &db_path.to_string_lossy(),
             mem_config,
-            self.chat.clone(),
+            Arc::new(SummarizerChatAdapter {
+                inner: self.chat.clone(),
+                pool: self.pool.clone(),
+                app_id: app_id.to_string(),
+            }),
             embedder,
         )
         .await
@@ -418,10 +433,16 @@ impl MemorabiliaHost {
     }
 }
 
-/// The per-instance background maintenance sweep: one bounded
-/// `maintenance_tick` on the configured cadence until the instance is closed.
-/// The engine owns time via the tick's `now` argument; the wall clock is fine
-/// here because the tick is a cadence, not decay math (which is chunk-anchored).
+/// The per-instance background sweep, on the configured cadence until the
+/// instance is closed: one bounded `maintenance_tick`, then one bounded
+/// extraction drain. The engine owns time via the `now` argument; the wall
+/// clock is fine here because the tick is a cadence, not decay math (which is
+/// chunk-anchored).
+///
+/// The drain lives here, not only at turn end. A turn's harvest adds a whole
+/// page of chunks and the next turn could abort its drain, so the queue grew
+/// without bound; this loop is not tied to any turn and nothing aborts it but
+/// shutdown. Missed ticks are skipped, so a slow drain never overlaps itself.
 async fn sweep(engine: Arc<Engine>, interval_s: u64, mut shutdown: tokio::sync::watch::Receiver<bool>) {
     let mut ticker = tokio::time::interval(Duration::from_secs(interval_s.max(1)));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -430,6 +451,17 @@ async fn sweep(engine: Arc<Engine>, interval_s: u64, mut shutdown: tokio::sync::
             _ = ticker.tick() => {
                 let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
                 engine.maintenance_tick(&now).await;
+                engine.restore_unextracted_batch(&now).await;
+                let drained = engine.drain_extraction(&now).await;
+                if drained.attempted > 0 {
+                    tracing::info!(
+                        attempted = drained.attempted,
+                        succeeded = drained.succeeded,
+                        failed = drained.failed,
+                        propositions = drained.propositions_written,
+                        "memorabilia extraction drain"
+                    );
+                }
             }
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {

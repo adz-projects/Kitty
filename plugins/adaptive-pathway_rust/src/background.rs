@@ -3,8 +3,9 @@
 //! and periodic maintenance. Spawned alongside the daemon scheduler, aborted
 //! before agent shutdown.
 
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use sqlx::SqlitePool;
 use tokio::sync::watch;
@@ -12,14 +13,23 @@ use tokio::sync::watch;
 use crate::engine::PathwayEngine;
 use crate::error::Result;
 use crate::learn::{self, LearnRequest, LearnTrigger};
-use crate::traits::StructuredChat;
+use crate::traits::SessionChat;
 
 /// Seconds between ticks.
 pub const TICK_INTERVAL_SECS: u64 = 60;
 
 /// Max sessions touched per idle-sweep tick (a daemon restarting after a long
 /// absence shouldn't fire dozens of constrained-decode requests at once).
+/// Only sessions with work to do count against it.
 pub const IDLE_SWEEP_BATCH: usize = 3;
+
+/// How long a session whose learn pass failed sits out of the sweep. Without
+/// it, a session the model keeps failing on would take a batch slot every
+/// tick and starve the rest, the way the first three rows once did.
+pub const LEARN_FAILURE_BACKOFF: Duration = Duration::from_secs(30 * 60);
+
+/// Per-session failure times, kept by `run` across ticks.
+pub type SweepBackoff = HashMap<String, Instant>;
 
 /// Max beliefs re-embedded per tick (see `reembed_stale_beliefs`) -- each is
 /// a real `/api/embeddings` round-trip to Ollama, so this is bounded the
@@ -28,18 +38,23 @@ pub const EMBEDDING_MIGRATION_BATCH: i64 = 25;
 
 /// Run the background loop until `shutdown_rx` fires. Errors are logged, not
 /// fatal -- each tick is best-effort.
-pub async fn run<S: StructuredChat>(
+///
+/// `app_id` is the app this graph belongs to (see `idle_session_ids`), and
+/// `chat` picks each session's own model.
+pub async fn run<C: SessionChat>(
     engine: Arc<PathwayEngine>,
     host_pool: SqlitePool,
-    chat: Arc<S>,
+    chat: C,
+    app_id: Option<String>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     let mut interval = tokio::time::interval(Duration::from_secs(TICK_INTERVAL_SECS));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut backoff = SweepBackoff::new();
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                if let Err(e) = idle_sweep(&engine, &host_pool, chat.as_ref()).await {
+                if let Err(e) = idle_sweep(&engine, &host_pool, &chat, app_id.as_deref(), &mut backoff).await {
                     tracing::warn!("pathway background sweep failed: {e}");
                 }
             }
@@ -53,11 +68,20 @@ pub async fn run<S: StructuredChat>(
     }
 }
 
-/// One sweep: consolidate idle/stale-active sessions' unlearned tails.
-pub async fn idle_sweep<S: StructuredChat>(
+/// One sweep: learn idle/stale-active sessions' unlearned tails and
+/// consolidate them.
+///
+/// Only sessions with something to do take one of the `IDLE_SWEEP_BATCH`
+/// slots: an unlearned tail, or conversation-layer beliefs still waiting to
+/// be consolidated. Taking the first few ids regardless meant re-consolidating
+/// the same three finished sessions every minute while every newer session
+/// waited forever.
+pub async fn idle_sweep<C: SessionChat>(
     engine: &PathwayEngine,
     host_pool: &SqlitePool,
-    chat: &S,
+    chat: &C,
+    app_id: Option<&str>,
+    backoff: &mut SweepBackoff,
 ) -> Result<()> {
     // Query 2 (host seam): idle + stale-active session ids. Cutoffs are
     // computed in SQL against `bigtiny.db`'s own clock/format -- see the
@@ -65,22 +89,43 @@ pub async fn idle_sweep<S: StructuredChat>(
     // bound as a query parameter doesn't compare correctly against it.
     const IDLE_MINUTES: i64 = 15;
     const ACTIVE_MINUTES: i64 = 30;
-    let ids = crate::learn::host::idle_session_ids(host_pool, IDLE_MINUTES, ACTIVE_MINUTES).await?;
-    for session_id in ids.iter().take(IDLE_SWEEP_BATCH) {
+    let ids =
+        crate::learn::host::idle_session_ids(host_pool, app_id, IDLE_MINUTES, ACTIVE_MINUTES).await?;
+    backoff.retain(|_, failed_at| failed_at.elapsed() < LEARN_FAILURE_BACKOFF);
+    let mut taken = 0usize;
+    for session_id in &ids {
+        if taken >= IDLE_SWEEP_BATCH {
+            break;
+        }
+        if backoff.contains_key(session_id) {
+            continue;
+        }
         // Skip paused sessions.
         if engine.is_paused(session_id).await.unwrap_or(false) {
             continue;
         }
         let watermark = engine.db.last_learned_rowid(session_id).await.unwrap_or(0);
         let max_rowid = crate::learn::host::session_max_rowid(host_pool, session_id).await.unwrap_or(watermark);
+        let needs_learning = max_rowid > watermark;
+        let needs_consolidation = engine
+            .db
+            .list_conversation_beliefs_for_session(session_id)
+            .await
+            .map(|beliefs| !beliefs.is_empty())
+            .unwrap_or(false);
+        if !needs_learning && !needs_consolidation {
+            continue;
+        }
+        taken += 1;
         // Failures are logged, not propagated: one bad session must not stop
         // the sweep. They used to be discarded outright (`let _ =`), which is
         // how pathway went weeks committing nothing without a single log line.
-        if max_rowid > watermark {
+        if needs_learning {
+            let session_chat = chat.for_session(session_id).await;
             if let Err(e) = learn::extract_and_record(
                 engine,
                 host_pool,
-                chat,
+                &session_chat,
                 LearnRequest {
                     session_id,
                     through_rowid: max_rowid,
@@ -91,6 +136,7 @@ pub async fn idle_sweep<S: StructuredChat>(
             .await
             {
                 tracing::warn!("pathway idle learn failed for session {session_id}: {e}");
+                backoff.insert(session_id.clone(), Instant::now());
             }
         }
         if let Err(e) = crate::consolidate::consolidate_session(&engine.db, session_id).await {

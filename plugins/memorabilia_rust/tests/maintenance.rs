@@ -210,3 +210,105 @@ async fn heavy_pass_runs_once_per_24h_gate() {
     let c = engine.maintenance_tick("2026-08-02T11:00:00Z").await;
     assert!(c.heavy_ran, "heavy pass re-runs after the gate elapses");
 }
+
+// ---- the extraction backlog (1.0.6) ----
+
+fn transient_claim() -> Value {
+    json!({
+        "propositions": [{
+            "claim": "A relevant fact about the topic",
+            "importance": "medium",
+            "urgency": "unknown",
+            "decay_class": "transient",
+            "urgency_expires_at": ""
+        }],
+        "disputes": []
+    })
+}
+
+#[tokio::test]
+async fn a_pending_chunk_never_decays() {
+    // Ingested but never extracted: it has never been recallable, so a month
+    // of decay must not archive it before the drain reaches it.
+    let engine = engine(transient_claim()).await;
+    let content = "a scraped page still waiting in the extraction queue";
+    engine.ingest(&doc(content, "alpha.example")).await;
+
+    let out = engine.maintenance_tick(T0_PLUS_30D).await;
+    assert_eq!(out.chunks_archived, 0);
+    let chunk = engine.db.get_chunk(&chunk_id_of(content)).await.unwrap().unwrap();
+    assert_eq!(chunk.status, "active");
+    assert_eq!(chunk.extraction_status, "pending");
+}
+
+#[tokio::test]
+async fn extraction_restarts_the_decay_clock() {
+    // Extracted a month after ingest: decay runs from extraction, so the
+    // first tick afterwards must not archive it straight away.
+    let engine = engine(transient_claim()).await;
+    let content = "a page extracted long after it was ingested";
+    engine.ingest(&doc(content, "alpha.example")).await;
+    engine.drain_extraction(T0_PLUS_30D).await;
+
+    let chunk = engine.db.get_chunk(&chunk_id_of(content)).await.unwrap().unwrap();
+    assert_eq!(chunk.extraction_status, "done");
+    assert_eq!(chunk.anchor_at, T0_PLUS_30D);
+    let out = engine.maintenance_tick(T0_PLUS_30D).await;
+    assert_eq!(out.chunks_archived, 0);
+}
+
+#[tokio::test]
+async fn the_drain_skips_archived_chunks() {
+    let engine = engine(transient_claim()).await;
+    let content = "an archived chunk that was never extracted";
+    engine.ingest(&doc(content, "alpha.example")).await;
+    engine.db.archive_chunk(&chunk_id_of(content), T0).await.unwrap();
+
+    let out = engine.drain_extraction(T0).await;
+    assert_eq!(out.attempted, 0, "archived chunks must not take the queue head");
+}
+
+#[tokio::test]
+async fn a_fragment_is_finished_without_a_model_call() {
+    // MockChat would return a claim; a fragment must get none.
+    let engine = engine(transient_claim()).await;
+    engine.ingest(&doc("x", "alpha.example")).await;
+
+    let out = engine.drain_extraction(T0).await;
+    assert_eq!(out.succeeded, 1);
+    assert_eq!(out.propositions_written, 0);
+    let chunk = engine.db.get_chunk(&chunk_id_of("x")).await.unwrap().unwrap();
+    assert_eq!(chunk.extraction_status, "done");
+}
+
+#[tokio::test]
+async fn restore_brings_back_archived_pending_chunks_once() {
+    let engine = engine(transient_claim()).await;
+    let content = "a page archived by decay before it was ever extracted";
+    let id = chunk_id_of(content);
+    engine.ingest(&doc(content, "alpha.example")).await;
+    engine.db.archive_chunk(&id, T0).await.unwrap();
+    let _ = engine.vectors.remove(&id).await;
+
+    assert_eq!(engine.restore_unextracted_batch(T0_PLUS_30D).await, 1);
+    let chunk = engine.db.get_chunk(&id).await.unwrap().unwrap();
+    assert_eq!(chunk.status, "active");
+    assert_eq!(chunk.archived_at, None);
+    assert_eq!(chunk.anchor_at, T0_PLUS_30D);
+
+    // The drain now extracts it, and recall can find it (its vector is back).
+    let out = engine.drain_extraction(T0_PLUS_30D).await;
+    assert_eq!(out.succeeded, 1);
+    assert_eq!(out.propositions_written, 1);
+
+    // Nothing left: the pass records completion and stays done.
+    assert_eq!(engine.restore_unextracted_batch(T0_PLUS_30D).await, 0);
+    assert!(engine
+        .db
+        .get_setting(memorabilia::maintenance::RESTORE_UNEXTRACTED_KEY)
+        .await
+        .unwrap()
+        .is_some());
+    engine.db.archive_chunk(&id, T0_PLUS_30D).await.unwrap();
+    assert_eq!(engine.restore_unextracted_batch(T0_PLUS_30D).await, 0);
+}

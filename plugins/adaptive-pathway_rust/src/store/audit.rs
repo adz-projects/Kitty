@@ -17,6 +17,20 @@ impl Db {
         Ok(())
     }
 
+    /// Delete routine housekeeping rows (`consolidate`, `maintenance`) older
+    /// than `days`. Learn, forget and correction rows are kept: they are the
+    /// record of what the graph was told.
+    pub async fn prune_housekeeping_audit(&self, days: i64) -> Result<u64> {
+        let cutoff = Utc::now() - chrono::Duration::days(days);
+        let done = sqlx::query(
+            "DELETE FROM audit_log WHERE event IN ('consolidate', 'maintenance') AND created_at < ?",
+        )
+        .bind(cutoff)
+        .execute(self.pool())
+        .await?;
+        Ok(done.rows_affected())
+    }
+
     // ---- app_settings ----
 
     pub async fn get_setting(&self, key: &str) -> Result<Option<String>> {

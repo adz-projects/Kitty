@@ -142,6 +142,33 @@ impl Db {
         .await?)
     }
 
+    /// Archived chunks that were never extracted, oldest first: the restore
+    /// pass's queue (`Engine::restore_unextracted_batch`).
+    pub async fn list_archived_pending_chunks(&self, limit: i64) -> Result<Vec<Chunk>> {
+        Ok(sqlx::query_as::<_, Chunk>(
+            "SELECT * FROM chunks WHERE status = 'archived' AND extraction_status = 'pending'
+             ORDER BY rowid LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(self.pool())
+        .await?)
+    }
+
+    /// Return an archived chunk to `active` with its decay clock restarted at
+    /// `anchor_at` (the status/`archived_at` pairing is CHECK-enforced, so
+    /// both change together).
+    pub async fn unarchive_chunk(&self, chunk_id: &str, anchor_at: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE chunks SET status = 'active', archived_at = NULL, anchor_at = ?
+             WHERE chunk_id = ? AND status = 'archived'",
+        )
+        .bind(anchor_at)
+        .bind(chunk_id)
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
     pub async fn mark_extraction_done(&self, chunk_id: &str) -> Result<()> {
         sqlx::query(
             "UPDATE chunks SET extraction_status = 'done' WHERE chunk_id = ?",
@@ -172,22 +199,30 @@ impl Db {
     /// lands together with `extraction_status = 'done'` and the failure
     /// clock clearing — a chunk can never be seen as done-with-the-wrong
     /// profile, or done-while-still-in-backoff.
+    ///
+    /// `anchor_at`, when given, restarts the decay clock: a chunk only
+    /// becomes recallable once extracted, so its decay is measured from then
+    /// (as a reinforcement restarts it), not from an ingest that may have
+    /// been weeks earlier. `None` keeps the stored anchor.
     pub async fn finish_extraction(
         &self,
         chunk_id: &str,
         decay_class: &str,
         urgency_expires_at: Option<&str>,
+        anchor_at: Option<&str>,
     ) -> Result<()> {
         sqlx::query(
             "UPDATE chunks
              SET extraction_status = 'done',
                  decay_class = ?,
                  urgency_expires_at = ?,
+                 anchor_at = COALESCE(?, anchor_at),
                  extraction_error_at = NULL
              WHERE chunk_id = ?",
         )
         .bind(decay_class)
         .bind(urgency_expires_at)
+        .bind(anchor_at)
         .bind(chunk_id)
         .execute(self.pool())
         .await?;
@@ -199,6 +234,10 @@ impl Db {
     /// `retry_backoff_s` after a failure. `ready_before` is the caller's
     /// `now - retry_backoff_s` rendered as the same ISO-8601 UTC string
     /// format (lexicographic = chronological).
+    ///
+    /// Active chunks only. An archived chunk can't be recalled, so spending
+    /// model time on it is waste, and since the queue is FIFO, archived rows
+    /// at its head used to hold up everything behind them.
     pub async fn list_ready_pending_chunks(
         &self,
         limit: i64,
@@ -207,6 +246,7 @@ impl Db {
         Ok(sqlx::query_as::<_, Chunk>(
             "SELECT * FROM chunks
              WHERE extraction_status = 'pending'
+               AND status = 'active'
                AND (extraction_error_at IS NULL OR extraction_error_at <= ?)
              ORDER BY rowid LIMIT ?",
         )

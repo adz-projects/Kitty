@@ -218,8 +218,10 @@ the sample YAML.
 
 `Engine::ingest(&IngestInput) -> IngestOutcome` (`learn/mod.rs`) runs Stages 0–3
 **synchronously** in one transaction; Stage 4 (`learn/extraction.rs`) is
-**asynchronous**, driven by `drain_extraction` (and by the maintenance sweep in
-production).
+**asynchronous**, driven by `drain_extraction`. In production the host's
+background sweep calls it after every maintenance tick; nothing else does, so
+no turn can abort it. Only active chunks are drained, a pending chunk never
+decays, and a chunk's decay clock restarts when its extraction finishes.
 
 `IngestInput { content, source_type, source_name, source_entity, captured_at, intent }`.
 

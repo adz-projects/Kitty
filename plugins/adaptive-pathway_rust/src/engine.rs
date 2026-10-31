@@ -338,6 +338,12 @@ impl PathwayEngine {
             relevance.as_ref(),
             &self.cfg,
         );
+        // Recorded so what recall injected can be read from disk. Prompts
+        // aren't stored, so this is the only trace. Best-effort.
+        let ids: Vec<String> = selected.iter().map(|s| s.belief.id.clone()).collect();
+        if let Err(e) = self.db.set_last_recall_ids(session_id, &ids).await {
+            tracing::debug!("pathway: could not record recall ids for {session_id}: {e}");
+        }
         if selected.is_empty() {
             None
         } else {
