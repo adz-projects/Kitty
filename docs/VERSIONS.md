@@ -1434,3 +1434,62 @@ concurrent defaults. The causes, each verified in code, and what changed:
   three tool calls or fewer, a follow-up to the user's last message), to do it
   directly when unsure, and to batch independent pieces into one call. There
   was no delegation text in the system prompt to change.
+
+## Memory engines learning again (1.0.6, engine 2.4.1)
+
+A check of the installed 1.0.5 found both memory engines healthy on disk but
+effectively stopped: pathway had not completed a learn pass since 10/04, and
+memorabilia had extracted propositions from 27 of 1,141 chunks, the last on
+10/12. Nothing said so, because the failures were in scheduling, not storage.
+
+**Adaptive pathway**
+- **The idle sweep reaches every session.** `learn::host::idle_session_ids`
+  is filtered to the owning app (it swept every app's sessions into one
+  graph) and ordered newest first, and `background::idle_sweep` gives its
+  three slots per tick only to sessions with work: an unlearned tail, or
+  conversation-layer beliefs to consolidate. It used to take the first three
+  ids unconditionally, which were always the same three finished sessions. A
+  session whose pass fails sits out for 30 minutes so it can't starve the rest.
+- **Each session learns on its own provider.** `background::run` takes a
+  `traits::SessionChat`; the daemon's `SessionSummarizerFactory` reads the
+  session's `provider`/`model` metadata and returns a `SessionSummarizer`
+  (local Gemma first, then that provider). The sweep used the sessionless
+  chain, whose fallback could be another app's provider.
+- **Consolidate audits only changes**, and the nightly maintenance deletes
+  `consolidate`/`maintenance` audit rows older than 30 days. The unconditional
+  row per visit had written 19.7k rows at 3 a minute.
+- **Recall leaves a trace**: `conversation_state.last_recall_ids` is now
+  written on every recall, so what was injected can be read from disk.
+- The turn-end abort (`cancel_background`) is unchanged and now logs at
+  `info`: the fixed sweep picks up any range it cut short.
+
+**Memorabilia**
+- **The host sweep drains extraction** after each `maintenance_tick`
+  (`memorabilia_host::sweep`). It used to run only at the end of a turn that
+  ingested something, five chunks at a time, inside a task the next turn
+  aborted. `harvest_turn` now only ingests, and is no longer registered with
+  `track_background`: ingest holds no provider slot, and an aborted ingest
+  lost the turn's pages.
+- **Pending chunks don't decay**, and `Db::finish_extraction` restarts a
+  non-deadline chunk's decay clock at extraction. Decay had archived 318
+  chunks that were never extracted.
+- **The queue head can't stick**: `list_ready_pending_chunks` takes active
+  chunks only, and a chunk under `MIN_EXTRACTABLE_CHARS` (16) of text is
+  finished with no model call.
+- **Extraction falls back to the app's own provider**
+  (`SummarizerChain::structured_chat_for_app`, through
+  `resolve_provider_for_app`), never the router's global default.
+- A failed chunk also writes an `extract_failed` audit row with the error.
+- **One-time catch-up** (`Engine::restore_unextracted_batch`,
+  `restore_unextracted_v1`): archived-but-never-extracted chunks are set
+  active again with a fresh anchor and their vector restored, 50 per tick,
+  then extracted like new ones. On the machine that prompted this, that is
+  about 1,390 chunks on CPU Gemma: a day or so of background work.
+
+**Observability**
+- `daemon.log` is rotated on spawn (`daemon.log.1`, `.2`) instead of truncated
+  (`BigTinyV2/client/src/discovery.rs`).
+- `/api/pathway/stats` adds `learning {last_learn_at, unlearned_sessions}` and
+  `/api/memorabilia/stats` adds `extraction {pending, last_extracted_at,
+  last_failure_at, last_failure}`. Both Health panels show them and say when
+  work has waited 24 hours with nothing done (`settings/memoryHealth.ts`).
