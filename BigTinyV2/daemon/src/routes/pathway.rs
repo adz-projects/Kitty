@@ -113,12 +113,39 @@ pub async fn stats(
                 .bind(&current_model)
                 .fetch_one(pool)
                 .await?;
-        Ok::<_, sqlx::Error>((total, layer_rows, pending_reembed))
+        let last_learn_at: Option<String> = sqlx::query_scalar(
+            "SELECT MAX(created_at) FROM audit_log WHERE event LIKE 'learn_%'",
+        )
+        .fetch_one(pool)
+        .await?;
+        // Sessions whose newest message is past the learn watermark: what the
+        // idle sweep still has to reach. Two databases, so joined here.
+        let latest: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT m.session_id, MAX(m.rowid) FROM messages m \
+             JOIN sessions s ON s.id = m.session_id \
+             WHERE s.app_id = ? GROUP BY m.session_id",
+        )
+        .bind(&identity.app_id)
+        .fetch_all(&state.db)
+        .await?;
+        let learned: std::collections::HashMap<String, i64> =
+            sqlx::query_as::<_, (String, i64)>(
+                "SELECT session_id, last_learned_rowid FROM conversation_state",
+            )
+            .fetch_all(pool)
+            .await?
+            .into_iter()
+            .collect();
+        let unlearned = latest
+            .iter()
+            .filter(|(id, max)| learned.get(id).copied().unwrap_or(0) < *max)
+            .count();
+        Ok::<_, sqlx::Error>((total, layer_rows, pending_reembed, last_learn_at, unlearned))
     }
     .await;
 
     match result {
-        Ok((total, layer_rows, pending_reembed)) => {
+        Ok((total, layer_rows, pending_reembed, last_learn_at, unlearned)) => {
             let by_layer: serde_json::Map<String, Value> = layer_rows
                 .into_iter()
                 .map(|(layer, count)| (layer, json!(count)))
@@ -129,6 +156,10 @@ pub async fn stats(
                 "embedding_migration": {
                     "pending": pending_reembed,
                     "current_model": current_model,
+                },
+                "learning": {
+                    "last_learn_at": last_learn_at,
+                    "unlearned_sessions": unlearned,
                 },
             }))
             .into_response()

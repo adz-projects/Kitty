@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { ipc } from '@/lib/ipc';
 import type { MemorabiliaStats } from '@/lib/types';
 import { DB_REPAIR_CONFIRM, runDbRepair } from './dbRepair';
+import { STALL_HOURS, describeAge, isStalled } from './memoryHealth';
 import { confirmDialog } from '@/components/shared/ConfirmDialog';
 
 /** Friendly names for the importance buckets in `stats.by_importance` — a
@@ -101,6 +102,26 @@ export function MemorabiliaHealth() {
             Backed by <strong>{stats.chunks_active}</strong> piece
             {stats.chunks_active === 1 ? '' : 's'} of evidence.
           </div>
+          {stats.extraction && (
+            <div className="muted">
+              {stats.extraction.pending > 0
+                ? `${stats.extraction.pending} piece${
+                    stats.extraction.pending === 1 ? '' : 's'
+                  } of evidence still to read`
+                : 'All evidence read'}
+              {' · '}last fact found {describeAge(stats.extraction.last_extracted_at)}.
+            </div>
+          )}
+          {stats.extraction &&
+            isStalled(stats.extraction.pending, stats.extraction.last_extracted_at) && (
+              <div className="memory-stall" role="status">
+                Remembering seems to have stopped: evidence is waiting, but no facts have been found
+                for over {STALL_HOURS} hours.
+                {stats.extraction.last_failure && (
+                  <div className="muted">Last error: {stats.extraction.last_failure}</div>
+                )}
+              </div>
+            )}
           {stats.disputed > 0 && (
             <div>
               <strong>{stats.disputed}</strong> fact{stats.disputed === 1 ? '' : 's'} in dispute

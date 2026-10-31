@@ -160,12 +160,34 @@ pub async fn stats(
         )
         .fetch_all(pool)
         .await?;
-        Ok::<_, sqlx::Error>((active, archived, disputed, chunks_active, importance_rows))
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM chunks WHERE status = 'active' AND extraction_status = 'pending'",
+        )
+        .fetch_one(pool)
+        .await?;
+        let last_extracted_at: Option<String> = sqlx::query_scalar(
+            "SELECT MAX(created_at) FROM audit_log WHERE event = 'extracted'",
+        )
+        .fetch_one(pool)
+        .await?;
+        let last_failure: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT created_at, detail FROM audit_log WHERE event = 'extract_failed' \
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .fetch_optional(pool)
+        .await?;
+        let extraction = json!({
+            "pending": pending,
+            "last_extracted_at": last_extracted_at,
+            "last_failure_at": last_failure.as_ref().map(|f| f.0.clone()),
+            "last_failure": last_failure.and_then(|f| f.1),
+        });
+        Ok::<_, sqlx::Error>((active, archived, disputed, chunks_active, importance_rows, extraction))
     }
     .await;
 
     match result {
-        Ok((active, archived, disputed, chunks_active, importance_rows)) => {
+        Ok((active, archived, disputed, chunks_active, importance_rows, extraction)) => {
             let by_importance: serde_json::Map<String, Value> = importance_rows
                 .into_iter()
                 .map(|(k, count)| (k, json!(count)))
@@ -176,6 +198,7 @@ pub async fn stats(
                 "disputed": disputed,
                 "chunks_active": chunks_active,
                 "by_importance": by_importance,
+                "extraction": extraction,
             }))
             .into_response()
         }

@@ -1928,6 +1928,16 @@ button:disabled {
   color: var(--text);
   font-size: var(--fs-md);
 }
+/* A memory engine with work waiting and nothing done for a day
+   (`components/settings/memoryHealth.ts`). */
+.memory-stall {
+  margin-top: 6px;
+  padding: 8px 12px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
+}
 .settings-recovery-notice button {
   border: none;
   background: transparent;

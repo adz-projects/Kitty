@@ -46,6 +46,29 @@ const LOCK_POLL: Duration = Duration::from_millis(100);
 /// worst-case spawn, so a slow-but-live contender is never robbed of it.
 const LOCK_STALE_AFTER: Duration = Duration::from_secs(60);
 
+/// Earlier daemon logs kept beside the current one (`daemon.log.1` is the run
+/// before this one, `.2` the one before that).
+const KEPT_DAEMON_LOGS: usize = 2;
+
+/// Shift `log` → `log.1` → … → `log.{keep}`, dropping the oldest. Best-effort:
+/// a log that can't be moved (missing, locked) is skipped, never an error,
+/// since a log must not stop the daemon starting.
+fn rotate_logs(log: &Path, keep: usize) {
+    let numbered = |n: usize| {
+        let mut name = log.as_os_str().to_owned();
+        name.push(format!(".{n}"));
+        std::path::PathBuf::from(name)
+    };
+    if keep == 0 {
+        return;
+    }
+    let _ = std::fs::remove_file(numbered(keep));
+    for n in (1..keep).rev() {
+        let _ = std::fs::rename(numbered(n), numbered(n + 1));
+    }
+    let _ = std::fs::rename(log, numbered(1));
+}
+
 /// A validated, reachable daemon.
 #[derive(Debug, Clone)]
 pub struct Located {
@@ -243,7 +266,10 @@ async fn spawn_and_wait(
     // another tool). A library must not do that to its caller.
     //
     // Sent to the daemon's own log file rather than discarded, so a failure to
-    // start is still diagnosable.
+    // start is still diagnosable. The previous runs' logs are rotated first:
+    // truncating on every spawn erased the only record of what the last run
+    // did, which is how weeks of failed background work left no trace.
+    rotate_logs(&data_dir.join("daemon.log"), KEPT_DAEMON_LOGS);
     match std::fs::File::create(data_dir.join("daemon.log")) {
         Ok(log) => {
             let errors = match log.try_clone() {
@@ -382,6 +408,21 @@ mod tests {
         let path = dir.path().join("daemon.json");
         tokio::fs::write(&path, b"{ not json").await.unwrap();
         assert!(read_handshake(&path).await.is_none());
+    }
+
+    #[test]
+    fn log_rotation_keeps_the_previous_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("daemon.log");
+        for run in ["first", "second", "third", "fourth"] {
+            rotate_logs(&log, 2);
+            std::fs::write(&log, run).unwrap();
+        }
+        let read = |name: &str| std::fs::read_to_string(dir.path().join(name)).unwrap();
+        assert_eq!(read("daemon.log"), "fourth");
+        assert_eq!(read("daemon.log.1"), "third");
+        assert_eq!(read("daemon.log.2"), "second");
+        assert!(!dir.path().join("daemon.log.3").exists());
     }
 
     #[test]

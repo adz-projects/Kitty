@@ -713,6 +713,13 @@ export interface PathwayStats {
     pending: number;
     current_model: string;
   };
+  /** Learning progress. Absent from engines before 2.4.1. */
+  learning?: {
+    /** The newest learn pass's audit time, or `null` if none ever ran. */
+    last_learn_at: string | null;
+    /** This app's sessions with messages past their learn watermark. */
+    unlearned_sessions: number;
+  };
 }
 
 /** Connection status of the in-process `"memorabilia"` MCP server — whether
@@ -744,6 +751,14 @@ export interface MemorabiliaStats {
   disputed: number;
   chunks_active: number;
   by_importance: Record<string, number>;
+  /** Extraction progress. Absent from engines before 2.4.1. */
+  extraction?: {
+    /** Active chunks still waiting to be turned into facts. */
+    pending: number;
+    last_extracted_at: string | null;
+    last_failure_at: string | null;
+    last_failure: string | null;
+  };
 }
 
 // --- Chat / ACP (Phase 2) --- mirrors src-tauri/src/commands SessionInfo + events

@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { ipc } from '@/lib/ipc';
 import { DB_REPAIR_CONFIRM, runDbRepair } from './dbRepair';
+import { STALL_HOURS, describeAge, isStalled } from './memoryHealth';
 import type { PathwayBelief, PathwayStats } from '@/lib/types';
 import { confirmDialog } from '@/components/shared/ConfirmDialog';
 
@@ -102,6 +103,23 @@ export function GraphHealth() {
             )}
             .
           </div>
+          {stats.learning && (
+            <div className="muted">
+              Last learned from a conversation {describeAge(stats.learning.last_learn_at)}
+              {stats.learning.unlearned_sessions > 0 &&
+                ` · ${stats.learning.unlearned_sessions} conversation${
+                  stats.learning.unlearned_sessions === 1 ? '' : 's'
+                } still to read`}
+              .
+            </div>
+          )}
+          {stats.learning &&
+            isStalled(stats.learning.unlearned_sessions, stats.learning.last_learn_at) && (
+              <div className="memory-stall" role="status">
+                Learning seems to have stopped: conversations are waiting, but nothing has been
+                learned for over {STALL_HOURS} hours.
+              </div>
+            )}
           {stats.embedding_migration.pending > 0 && (
             <div className="muted">
               Double-checking {stats.embedding_migration.pending} belief
