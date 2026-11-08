@@ -27,11 +27,15 @@ use serde_json::Value;
 use sqlx::SqlitePool;
 
 use memorabilia::engine::Engine;
+use memorabilia::learn::capture::CaptureInput;
 use memorabilia::learn::{AttachmentIntent, IngestInput};
 
 /// The kitty-web scrape tool name, matched against assistant `tool_calls` to
 /// find scraped pages among this turn's tool results.
 const SCRAPE_TOOL: &str = "lean_web_scrape";
+
+/// The kitty-web search tool, whose `query` arguments are the demand signal.
+const SEARCH_TOOL: &str = "lean_web_search";
 
 /// The client's inlined-attachment path-list header (see `chatStore.ts`).
 const FILES_HEADER: &str = "Files provided by the user:";
@@ -43,12 +47,23 @@ pub async fn harvest_turn(engine: &Engine, pool: &SqlitePool, session_id: &str) 
         return;
     };
     let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let turn = Turn {
+        session_id,
+        turn_id: user_rowid,
+        now: &now,
+    };
     let mut ingested_any = false;
+
+    // The demand signal: what the model searched for this turn.
+    let queries = search_queries(pool, session_id, user_rowid).await;
+    if !queries.is_empty() {
+        engine.record_demand(session_id, user_rowid, &queries, &now).await;
+    }
 
     // Source 1 — pasted text & inlined documents (already text). Parse only the
     // region before the `Files provided by the user:` list, so a paths block or
     // trailing typed text can't be swallowed into the last marker body.
-    for (label, body) in parse_marker_blocks(docs_region(&user_content)) {
+    for (label, pinned, body) in parse_marker_blocks(docs_region(&user_content)) {
         let is_paste = label.starts_with("Pasted text");
         let (source_type, source_entity) = if is_paste {
             ("UserNote", "user:paste".to_string())
@@ -57,12 +72,13 @@ pub async fn harvest_turn(engine: &Engine, pool: &SqlitePool, session_id: &str) 
         };
         ingest(
             engine,
-            &now,
+            &turn,
             source_type,
             &label,
             &source_entity,
             Some(AttachmentIntent::Evidence),
             body,
+            pinned,
         )
         .await;
         ingested_any = true;
@@ -79,12 +95,13 @@ pub async fn harvest_turn(engine: &Engine, pool: &SqlitePool, session_id: &str) 
         if let Some(text) = extract_file(p).await {
             ingest(
                 engine,
-                &now,
+                &turn,
                 "Attachment",
                 &name,
                 &path,
                 Some(AttachmentIntent::Evidence),
                 text,
+                false,
             )
             .await;
             ingested_any = true;
@@ -109,17 +126,16 @@ pub async fn harvest_turn(engine: &Engine, pool: &SqlitePool, session_id: &str) 
         if let Some(content) = content {
             // Web scrapes carry no attachment intent; memorabilia tiers them by
             // domain (`source_type == "Scraped"` + `source_name == host`).
-            ingest(engine, &now, "Scraped", &item.host, &item.url, None, content).await;
+            ingest(engine, &turn, "Scraped", &item.host, &item.url, None, content, false).await;
             ingested_any = true;
         }
     }
 
-    // Extraction is the host sweep's job (`memorabilia_host::sweep`), not
-    // this turn's: draining here held a model call inside a task the next
-    // turn aborts, so the queue only ever grew. What was ingested is picked
-    // up within one sweep tick.
+    // Everything after the paragraph screen — chunking, embedding,
+    // recurrence, extraction — is the overnight pass's job
+    // (`memorabilia_host::sweep`, docs/MEMORY_OVERNIGHT.md).
     if ingested_any {
-        tracing::debug!(session_id, "memorabilia: turn documents ingested; extraction queued");
+        tracing::debug!(session_id, "memorabilia: turn documents captured");
     }
 }
 
@@ -222,26 +238,43 @@ fn strip_trailing_call_to_action(line: &str) -> String {
 
 /// Ingest one document, skipping empties. Errors are swallowed by the engine
 /// (soft-fail); the returned outcome is not needed here.
+/// The turn being harvested.
+struct Turn<'a> {
+    session_id: &'a str,
+    /// The user message's rowid: identifies the turn.
+    turn_id: i64,
+    now: &'a str,
+}
+
+/// Capture one document: the paragraph screen runs now, everything else
+/// overnight.
+#[allow(clippy::too_many_arguments)]
 async fn ingest(
     engine: &Engine,
-    now: &str,
+    turn: &Turn<'_>,
     source_type: &str,
     source_name: &str,
     source_entity: &str,
     intent: Option<AttachmentIntent>,
     content: String,
+    pinned: bool,
 ) {
     if content.trim().is_empty() {
         return;
     }
     engine
-        .ingest(&IngestInput {
-            content,
-            source_type: source_type.to_string(),
-            source_name: source_name.to_string(),
-            source_entity: source_entity.to_string(),
-            captured_at: now.to_string(),
-            intent,
+        .capture(&CaptureInput {
+            ingest: IngestInput {
+                content,
+                source_type: source_type.to_string(),
+                source_name: source_name.to_string(),
+                source_entity: source_entity.to_string(),
+                captured_at: turn.now.to_string(),
+                intent,
+            },
+            session_id: Some(turn.session_id.to_string()),
+            turn_id: Some(turn.turn_id),
+            pinned,
         })
         .await;
 }
@@ -289,21 +322,36 @@ fn docs_region(content: &str) -> &str {
     }
 }
 
-/// Split leading `--- <label> ---\n<body>` blocks. Each marker line starts a
-/// block whose body runs until the next marker (or the end of `region`). When
-/// no file-path list is present, the final block may include the user's
-/// trailing typed text — accepted: capturing the whole pasted document matters
-/// more than excluding a short trailing prompt, and the PII gate + dedup still
-/// apply.
-fn parse_marker_blocks(region: &str) -> Vec<(String, String)> {
+/// Token the composer appends to an attachment's open marker when the user
+/// marked it "Remember this". Kept in sync with `bigtiny::turn_text::PINNED_TOKEN`
+/// on the Kitty side (a different crate, so the literal is mirrored, not shared).
+const PINNED_TOKEN: &str = "[remember]";
+
+/// Strip a trailing [`PINNED_TOKEN`] from a marker label, returning the clean
+/// label and whether it was pinned.
+fn split_pinned(label: &str) -> (String, bool) {
+    match label.strip_suffix(PINNED_TOKEN) {
+        Some(clean) => (clean.trim_end().to_string(), true),
+        None => (label.to_string(), false),
+    }
+}
+
+/// Split leading `--- <label> ---\n<body>` blocks into `(label, pinned, body)`.
+/// Each marker line starts a block whose body runs until the next marker (or
+/// the end of `region`). A `[remember]` token on the open line marks the
+/// attachment pinned and is stripped from the label. When no file-path list is
+/// present, the final block may include the user's trailing typed text —
+/// accepted: capturing the whole pasted document matters more than excluding a
+/// short trailing prompt, and the PII gate + dedup still apply.
+fn parse_marker_blocks(region: &str) -> Vec<(String, bool, String)> {
     static MARKER: Lazy<Regex> =
         Lazy::new(|| Regex::new(r"^--- (.+) ---$").unwrap());
-    let mut blocks: Vec<(String, String)> = Vec::new();
+    let mut blocks: Vec<(String, Vec<&str>)> = Vec::new();
     let mut current: Option<(String, Vec<&str>)> = None;
     for line in region.lines() {
         if let Some(cap) = MARKER.captures(line.trim_end()) {
             if let Some((label, body)) = current.take() {
-                blocks.push((label, body.join("\n")));
+                blocks.push((label, body));
             }
             current = Some((cap[1].trim().to_string(), Vec::new()));
         } else if let Some((_, body)) = current.as_mut() {
@@ -312,12 +360,15 @@ fn parse_marker_blocks(region: &str) -> Vec<(String, String)> {
         // Lines before the first marker are ignored.
     }
     if let Some((label, body)) = current.take() {
-        blocks.push((label, body.join("\n")));
+        blocks.push((label, body));
     }
     blocks
         .into_iter()
-        .map(|(l, b)| (l, b.trim().to_string()))
-        .filter(|(_, b)| !b.is_empty())
+        .map(|(l, b)| {
+            let (label, pinned) = split_pinned(&l);
+            (label, pinned, b.join("\n").trim().to_string())
+        })
+        .filter(|(_, _, b)| !b.is_empty())
         .collect()
 }
 
@@ -408,6 +459,53 @@ async fn scraped_items(pool: &SqlitePool, session_id: &str, user_rowid: i64) -> 
     out
 }
 
+/// The `query` of every `lean_web_search` call this turn (rows after the user
+/// message), in order, without duplicates.
+async fn search_queries(pool: &SqlitePool, session_id: &str, user_rowid: i64) -> Vec<String> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT tool_calls FROM messages          WHERE session_id = ? AND rowid > ? AND role = 'assistant' AND tool_calls IS NOT NULL",
+    )
+    .bind(session_id)
+    .bind(user_rowid)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    let mut out: Vec<String> = Vec::new();
+    for (tc_json,) in rows {
+        for q in collect_search_queries(&tc_json) {
+            if !out.contains(&q) {
+                out.push(q);
+            }
+        }
+    }
+    out
+}
+
+/// The `query` arguments of the `lean_web_search` calls in one assistant
+/// row's `tool_calls` JSON.
+fn collect_search_queries(tool_calls_json: &str) -> Vec<String> {
+    let Ok(Value::Array(calls)) = serde_json::from_str::<Value>(tool_calls_json) else {
+        return Vec::new();
+    };
+    calls
+        .iter()
+        .filter_map(|call| {
+            let f = call.get("function")?;
+            if f.get("name")?.as_str()? != SEARCH_TOOL {
+                return None;
+            }
+            // Arguments arrive as a JSON string (OpenAI shape) or an object.
+            let args = f.get("arguments")?;
+            let args: Value = match args {
+                Value::String(s) => serde_json::from_str(s).ok()?,
+                v => v.clone(),
+            };
+            let q = args.get("query")?.as_str()?.trim();
+            (!q.is_empty()).then(|| q.to_string())
+        })
+        .collect()
+}
+
 /// Add the `tool_call_id`s of any `lean_web_scrape` calls in one assistant
 /// row's `tool_calls` JSON to `ids`.
 fn collect_scrape_ids(tool_calls_json: &str, ids: &mut HashSet<String>) {
@@ -494,9 +592,20 @@ mod tests {
         let blocks = parse_marker_blocks(docs_region(msg));
         assert_eq!(blocks.len(), 2);
         assert_eq!(blocks[0].0, "Pasted text — 3 words");
-        assert_eq!(blocks[0].1, "alpha beta gamma");
+        assert!(!blocks[0].1, "not pinned");
+        assert_eq!(blocks[0].2, "alpha beta gamma");
         assert_eq!(blocks[1].0, "notes.txt");
-        assert_eq!(blocks[1].1, "file body line one\nfile body line two");
+        assert_eq!(blocks[1].2, "file body line one\nfile body line two");
+    }
+
+    #[test]
+    fn a_remember_token_sets_pinned_and_is_stripped_from_the_label() {
+        let msg = "--- report.pdf [remember] ---\nkeep this document around";
+        let blocks = parse_marker_blocks(docs_region(msg));
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].0, "report.pdf", "the token is stripped from the label");
+        assert!(blocks[0].1, "the attachment is pinned");
+        assert_eq!(blocks[0].2, "keep this document around");
     }
 
     #[test]
@@ -505,7 +614,7 @@ mod tests {
                    Files provided by the user:\n- C:\\a\\report.pdf\n\nSummarize these.";
         let blocks = parse_marker_blocks(docs_region(msg));
         assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0].1, "real document content");
+        assert_eq!(blocks[0].2, "real document content");
         let paths = parse_file_paths(msg);
         assert_eq!(paths, vec!["C:\\a\\report.pdf".to_string()]);
     }
@@ -538,6 +647,20 @@ mod tests {
             ScrapeBody::CachedDoc(p) => assert_eq!(p, "/c/cache/doc.pdf"),
             _ => panic!("expected CachedDoc"),
         }
+    }
+
+    #[test]
+    fn search_queries_are_read_from_either_argument_shape() {
+        let tc = r#"[
+            {"id":"a","type":"function","function":{"name":"lean_web_search","arguments":"{\"query\":\"breakwater design\"}"}},
+            {"id":"b","type":"function","function":{"name":"lean_web_search","arguments":{"query":"  rock armour  "}}},
+            {"id":"c","type":"function","function":{"name":"lean_web_scrape","arguments":"{\"url\":\"https://x\"}"}}
+        ]"#;
+        assert_eq!(
+            collect_search_queries(tc),
+            vec!["breakwater design".to_string(), "rock armour".to_string()]
+        );
+        assert!(collect_search_queries("not json").is_empty());
     }
 
     #[test]

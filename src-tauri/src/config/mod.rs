@@ -338,6 +338,9 @@ pub struct Config {
     /// per app (`/api/apps/me/decider`) and to kitty-web through its MCP row.
     #[serde(default)]
     pub decider: DeciderSettings,
+    /// Overnight learning (`lifecycle::overnight`).
+    #[serde(default)]
+    pub overnight: OvernightSettings,
     /// BigTiny context-window/compaction budget settings, relayed as
     /// `BIGTINY_TOKEN_MANAGEMENT__*` env vars at spawn (same mechanism and
     /// rationale as `summarizer` above). `#[serde(default)]` covers loading
@@ -484,6 +487,7 @@ impl Default for Config {
             summarizer: SummarizerSettings::default(),
             specialists: SpecialistSettings::default(),
             decider: DeciderSettings::default(),
+            overnight: OvernightSettings::default(),
             token_management: TokenManagementSettings::default(),
             memory: MemorySettings::default(),
         }
@@ -883,6 +887,31 @@ pub struct DeciderSettings {
     /// with the model's defaults. Cleared when the model changes.
     #[serde(default)]
     pub thresholds: serde_json::Map<String, serde_json::Value>,
+    /// A question set for memorabilia's paragraph screen, replacing the
+    /// engine's default (`{"id", "questions": [{"name", "instructions",
+    /// "keep_at"}]}`; docs/MEMORY_OVERNIGHT.md). Edited in config.json, not in
+    /// Settings: it is how a set that won a test is put into use without a
+    /// rebuild. `None` = the engine's default set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paragraph_screen: Option<serde_json::Value>,
+    /// Optional fallback decision model, tried only when the primary endpoint
+    /// fails a call (unreachable, HTTP error, or an unparseable answer). `None`
+    /// keeps the single-model behavior. Mirrors the engine's
+    /// `decider::SecondaryDecider`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secondary: Option<DeciderSecondary>,
+}
+
+/// A fallback decision model (see [`DeciderSettings::secondary`]). Same
+/// endpoint shape as the primary; mirrors `decider::SecondaryDecider`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DeciderSecondary {
+    #[serde(default = "default_decider_dialect")]
+    pub dialect: String,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 impl Default for DeciderSettings {
@@ -893,6 +922,38 @@ impl Default for DeciderSettings {
             model: None,
             features: DeciderFeatures::default(),
             thresholds: serde_json::Map::new(),
+            paragraph_screen: None,
+            secondary: None,
+        }
+    }
+}
+
+/// Overnight learning (docs/MEMORY_OVERNIGHT.md): when the memory engines do
+/// their expensive work. Relayed to the engine per app
+/// (`/api/apps/me/overnight`, `lifecycle::overnight`); `wake` is Kitty's own
+/// (a Windows scheduled task). Desktop only: on Android, pathway keeps
+/// learning at turn end and memorabilia does not run.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct OvernightSettings {
+    pub enabled: bool,
+    /// Local time, `HH:MM`; may wrap midnight.
+    pub start: String,
+    pub end: String,
+    /// Move adaptive-pathway's learning into the window too.
+    pub pathway: bool,
+    /// Wake the computer at the window's start (a scheduled task).
+    pub wake: bool,
+}
+
+impl Default for OvernightSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            start: "00:00".into(),
+            end: "05:00".into(),
+            pathway: true,
+            wake: false,
         }
     }
 }

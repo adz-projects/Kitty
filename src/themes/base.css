@@ -1289,6 +1289,25 @@ button:disabled {
   white-space: pre-wrap;
   color: var(--text-muted);
 }
+.chip-remember {
+  cursor: pointer;
+  background: none;
+  border: 1px solid var(--border, rgba(127, 127, 127, 0.35));
+  border-radius: 999px;
+  padding: 1px 8px;
+  margin-left: auto;
+  font: inherit;
+  font-size: var(--fs-xs-plus);
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+.chip-remember[aria-pressed='true'] {
+  color: var(--accent, inherit);
+  border-color: var(--accent, currentColor);
+}
+.pasted-chip.pinned {
+  border-color: var(--accent, currentColor);
+}
 
 /* --- Tool approval (Phase 3) --- */
 .approval {

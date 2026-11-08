@@ -106,6 +106,78 @@ export interface DeciderSettings {
   features: Record<DeciderFeature, boolean>;
   /** Only the thresholds the user changed; the rest are the model's defaults. */
   thresholds: Record<string, number>;
+  /** A memorabilia paragraph-screen question set from config.json; never
+      edited in Settings, and kept by the Rust side when a save omits it. */
+  paragraph_screen?: unknown;
+  /** Optional fallback decision model, tried only when the primary endpoint
+      fails a call. `null`/absent means no fallback. */
+  secondary?: DeciderSecondary | null;
+}
+
+/** A fallback decision model (see {@link DeciderSettings.secondary}). */
+export interface DeciderSecondary {
+  dialect: string;
+  url: string;
+  model: string | null;
+}
+
+/** Settings → Memorabilia → Overnight learning (`config::OvernightSettings`). */
+export interface OvernightSettings {
+  enabled: boolean;
+  /** Local time, HH:MM; the window may wrap midnight. */
+  start: string;
+  end: string;
+  /** Move behavioural-memory learning into the window too. */
+  pathway: boolean;
+  /** Wake the computer at the window's start (a Windows scheduled task). */
+  wake: boolean;
+}
+
+/** What the engine's last overnight pass did (`OvernightReport`). */
+export interface OvernightReport {
+  unscreened_dropped: number;
+  captures_chunked: number;
+  candidates_added: number;
+  clusters_promoted: number;
+  chunks_promoted: number;
+  candidates_merged: number;
+  candidates_expired: number;
+  extraction_attempted: number;
+  extraction_succeeded: number;
+  extraction_failed: number;
+  propositions_written: number;
+  finished: boolean;
+  trigger?: 'window' | 'catch_up' | 'run_now';
+  ended_at?: string;
+}
+
+export interface OvernightEngineStatus {
+  status: {
+    config: Omit<OvernightSettings, 'wake'> | null;
+    last_started: string | null;
+    last_finished: string | null;
+    last_report: OvernightReport | null;
+    running: boolean;
+    run_now_until: string | null;
+    keeping_awake: boolean;
+    idle_secs: number | null;
+    on_ac_power: boolean | null;
+  };
+  backlog: {
+    unscreened: number;
+    screened: number;
+    candidates_waiting: number;
+    pending_extraction: number;
+  } | null;
+}
+
+export interface OvernightView {
+  settings: OvernightSettings;
+  /** `null` when the engine could not be reached. */
+  engine: OvernightEngineStatus | null;
+  wake_task_registered: boolean;
+  wake_timers: { ac: boolean | null; dc: boolean | null };
+  supported: boolean;
 }
 
 export interface DeciderProbe {
@@ -229,12 +301,7 @@ export interface ProviderView extends ProviderProfile {
 
 /** Where a card's reasoning ladder came from. */
 export type EffortSource =
-  | 'provider_api'
-  | 'open_router'
-  | 'chat_template'
-  | 'hugging_face'
-  | 'ollama'
-  | 'heuristic';
+  'provider_api' | 'open_router' | 'chat_template' | 'hugging_face' | 'ollama' | 'heuristic';
 
 /** One card's detected reasoning ladder, for Settings → Providers. Mirrors
     `bigtiny::effort::EffortSummary`. */

@@ -155,8 +155,9 @@ memorabilia = { path = "../../plugins/memorabilia_rust" }
 
 # Windows-only generative summarizer runtime.
 [target.'cfg(windows)'.dependencies]
-# DPAPI, to seal the at-rest key file (`crypto.rs`).
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
+# DPAPI, to seal the at-rest key file (`crypto.rs`); idle time, AC power and
+# keep-awake for the overnight memory window (`overnight/power.rs`).
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_System_Power", "Win32_System_SystemInformation", "Win32_UI_Input_KeyboardAndMouse"] }
 # LiteRT-LM generative runtime for the local summarizer (`gemma-4-E2B-it.litertlm`).
 # Windows-only: Android offloads compaction to the remote chat model, so no
 # generative model runs on the phone. `download-native` (default) fetches the

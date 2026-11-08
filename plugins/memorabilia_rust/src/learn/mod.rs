@@ -96,7 +96,7 @@ pub struct IngestOutcome {
 /// profile; until then `transient` (the shorter τ) is the conservative
 /// default — a chunk whose extraction never completes still decays out on
 /// schedule instead of sitting at full salience forever.
-const INITIAL_DECAY_CLASS: &str = "transient";
+pub(crate) const INITIAL_DECAY_CLASS: &str = "transient";
 
 /// Stage 2 (plan §3): deterministic fixed-window chunking — a
 /// `chunk_chars_max` char window sliding by `chunk_chars_min` chars (a 50%
@@ -140,10 +140,20 @@ fn clamp01(x: f64) -> f64 {
 /// type (channel, file, user note) is known without a domain signal and
 /// defaults to `personal` — the conservative tier.
 fn tier_and_prior(data: &ReliabilityData, input: &IngestInput) -> (&'static str, f64) {
-    let tier = if input.source_type.eq_ignore_ascii_case("scraped")
-        || input.source_type.eq_ignore_ascii_case("scrape")
+    tier_and_prior_for(data, &input.source_type, &input.source_name)
+}
+
+/// [`tier_and_prior`] from the source fields alone (the overnight promotion
+/// path has a capture row, not an `IngestInput`).
+pub(crate) fn tier_and_prior_for(
+    data: &ReliabilityData,
+    source_type: &str,
+    source_name: &str,
+) -> (&'static str, f64) {
+    let tier = if source_type.eq_ignore_ascii_case("scraped")
+        || source_type.eq_ignore_ascii_case("scrape")
     {
-        data.tier_for_domain(&input.source_name)
+        data.tier_for_domain(source_name)
     } else {
         TIER_PERSONAL
     };
@@ -392,7 +402,7 @@ impl Engine {
     /// slug — the id the source's first chunk created, which is also what
     /// every other lower-cosine chunk of the same source resolves to, so
     /// **the same citation never splits a cluster**.
-    async fn resolve_cluster(&self, vec: &[f32], tag: &str, own_cluster: &str) -> String {
+    pub(crate) async fn resolve_cluster(&self, vec: &[f32], tag: &str, own_cluster: &str) -> String {
         match self.vectors.search(vec, tag, 1).await {
             Ok(hits) => match hits.into_iter().next() {
                 Some((id, cos))
@@ -413,7 +423,10 @@ impl Engine {
     }
 }
 
+pub mod capture;
 pub mod extraction;
+pub mod overnight;
+pub mod paragraphs;
 
 #[cfg(test)]
 mod tests {

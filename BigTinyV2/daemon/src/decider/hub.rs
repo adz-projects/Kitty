@@ -248,7 +248,19 @@ impl DeciderHub {
 }
 
 fn build(config: DeciderConfig) -> Option<Arc<AppDecider>> {
-    let backend = backend::for_dialect(&config.dialect, &config.url)?;
+    let primary = backend::for_dialect(&config.dialect, &config.url)?;
+    // Wrap with the optional fallback model. An unknown/unbuildable secondary
+    // dialect (e.g. a stale row from a newer build) is ignored rather than
+    // disabling the whole decider — the primary alone is still better than
+    // nothing (config-time validation already rejects a bad secondary on PUT).
+    let backend = match config.secondary.as_ref().and_then(|s| {
+        backend::for_dialect(&s.dialect, &s.url)
+    }) {
+        Some(secondary) => {
+            Arc::new(backend::FallbackBackend::new(primary, secondary)) as Arc<dyn DeciderBackend>
+        }
+        None => primary,
+    };
     Some(Arc::new(AppDecider { config, backend }))
 }
 

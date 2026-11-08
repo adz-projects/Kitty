@@ -280,7 +280,14 @@ describe('chatStore refreshProvider malformed base_url', () => {
     active: true,
     accepts_images: null,
     tools_supported: false,
-    effort: { levels: [], can_disable: false, source: null, source_label: null, detected_at: null, detecting: false },
+    effort: {
+      levels: [],
+      can_disable: false,
+      source: null,
+      source_label: null,
+      detected_at: null,
+      detecting: false,
+    },
   };
 
   it('derives everything but the host from a blank base_url', async () => {
@@ -326,6 +333,17 @@ describe('chatStore first-send attachments survive session creation', () => {
 
     expect(ipc.sendPrompt).toHaveBeenCalledTimes(1);
     const documents = vi.mocked(ipc.sendPrompt).mock.calls[0][4];
-    expect(documents).toEqual([{ label: 'doc.txt', content: 'pasted contents' }]);
+    expect(documents).toEqual([{ label: 'doc.txt', content: 'pasted contents', pinned: false }]);
+  });
+
+  it('carries the Remember-this pin on a pasted attachment', async () => {
+    useChatStore.setState({
+      attachments: [{ id: 'a1', label: 'doc.txt', content: 'keep me', pinned: true }],
+    });
+
+    await useChatStore.getState().send('go');
+
+    const documents = vi.mocked(ipc.sendPrompt).mock.calls[0][4];
+    expect(documents).toEqual([{ label: 'doc.txt', content: 'keep me', pinned: true }]);
   });
 });

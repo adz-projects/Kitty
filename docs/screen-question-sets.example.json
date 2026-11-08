@@ -1,0 +1,87 @@
+[
+  {
+    "id": "durable-substantive-v1",
+    "questions": [
+      {
+        "name": "durable",
+        "instructions": "Will this passage still be informative in a few years, after the specific products, prices, people or events it mentions are no longer current? Answer yes for explanations of how or why things work, lasting history, definitions and durable relationships; answer no for specs, prices, release dates, rankings, schedules, status updates and announcements.",
+        "keep_at": 0.6
+      },
+      {
+        "name": "substantive",
+        "instructions": "Is this passage substantive and well supported (concrete claims, mechanisms, evidence or reasoned argument) rather than marketing copy, filler, unsupported speculation or vague generalities?",
+        "keep_at": 0.6
+      }
+    ]
+  },
+  {
+    "id": "durable-only",
+    "questions": [
+      {
+        "name": "durable",
+        "instructions": "Will this passage still be informative in a few years, after the specific products, prices, people or events it mentions are no longer current? Answer yes for explanations of how or why things work, lasting history, definitions and durable relationships; answer no for specs, prices, release dates, rankings, schedules, status updates and announcements.",
+        "keep_at": 0.6
+      }
+    ]
+  },
+  {
+    "id": "substantive-only",
+    "questions": [
+      {
+        "name": "substantive",
+        "instructions": "Is this passage substantive and well supported (concrete claims, mechanisms, evidence or reasoned argument) rather than marketing copy, filler, unsupported speculation or vague generalities?",
+        "keep_at": 0.6
+      }
+    ]
+  },
+  {
+    "id": "mechanism-vs-instance",
+    "questions": [
+      {
+        "name": "mechanism",
+        "instructions": "Does this passage explain how or why something works, or a general pattern that applies beyond the one product, person or event it describes?",
+        "keep_at": 0.5
+      },
+      {
+        "name": "substantive",
+        "instructions": "Is this passage substantive and well supported (concrete claims, mechanisms, evidence or reasoned argument) rather than marketing copy, filler, unsupported speculation or vague generalities?",
+        "keep_at": 0.6
+      }
+    ]
+  },
+  {
+    "id": "teach-later",
+    "questions": [
+      {
+        "name": "teaches",
+        "instructions": "Would a knowledgeable reader learn something from this passage that would still help them understand the subject next year?",
+        "keep_at": 0.6
+      },
+      {
+        "name": "not_filler",
+        "instructions": "Is this passage free of marketing language, navigation text, calls to action and empty generalities?",
+        "keep_at": 0.5
+      }
+    ]
+  },
+  {
+    "id": "durable-substantive-specific",
+    "questions": [
+      {
+        "name": "durable",
+        "instructions": "Will this passage still be informative in a few years, after the specific products, prices, people or events it mentions are no longer current? Answer yes for explanations of how or why things work, lasting history, definitions and durable relationships; answer no for specs, prices, release dates, rankings, schedules, status updates and announcements.",
+        "keep_at": 0.6
+      },
+      {
+        "name": "substantive",
+        "instructions": "Is this passage substantive and well supported (concrete claims, mechanisms, evidence or reasoned argument) rather than marketing copy, filler, unsupported speculation or vague generalities?",
+        "keep_at": 0.6
+      },
+      {
+        "name": "specific",
+        "instructions": "Does this passage make at least one specific claim (a named cause, figure, relationship or example) rather than only restating common knowledge?",
+        "keep_at": 0.5
+      }
+    ]
+  }
+]

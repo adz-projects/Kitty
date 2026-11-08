@@ -559,6 +559,8 @@ impl Engine {
                 return 0;
             }
         };
+        self.forget_pending(&norm, &query, &tag, self.config.forget_match_threshold)
+            .await;
         let active = match self.db.list_chunks_by_status("active").await {
             Ok(v) => v,
             Err(e) => {

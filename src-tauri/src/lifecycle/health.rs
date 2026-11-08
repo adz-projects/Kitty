@@ -97,6 +97,7 @@ pub fn spawn_health_loop(app: AppHandle) {
                             crate::bigtiny::mcp::self_heal_builtin_servers(&app2).await;
                             // Another app may have restarted the engine.
                             super::decider::apply_decider(&app2).await;
+                            super::overnight::apply_overnight(&app2).await;
                         });
                     }
                 }

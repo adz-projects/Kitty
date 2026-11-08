@@ -12,6 +12,7 @@ pub mod litert;
 pub mod mcp;
 pub mod models;
 pub mod network;
+pub mod overnight;
 pub mod plugins;
 pub mod private_fs;
 pub mod provider;
@@ -272,6 +273,9 @@ pub async fn run(config: BigTinyConfig, options: RunOptions) -> Result<(), Daemo
     // Before any engine opens (they open lazily, on an app's first use).
     plugins.attach_decider(agent.decider().clone());
     memorabilia.attach_decider(agent.decider().clone());
+    let overnight = overnight::OvernightHub::new(pool.clone());
+    plugins.attach_overnight(overnight.clone());
+    memorabilia.attach_overnight(overnight);
     orchestrator.attach_router(router.clone());
     mcp.attach_orchestrator(orchestrator.clone());
     // Before `connect_all`, like the orchestrator attach above and for the

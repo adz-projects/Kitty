@@ -537,6 +537,7 @@ pub async fn load(app: &AppHandle, session_id: String, cwd: String) -> Result<Se
                     attachments.push(crate::bigtiny::turn_text::AttachmentChip {
                         name: "Image".to_string(),
                         kind: "image",
+                        pinned: false,
                     });
                 }
                 let _ = app.emit(

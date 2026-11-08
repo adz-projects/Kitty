@@ -345,15 +345,20 @@ async fn migration_002_creates_every_plan_table() {
     let expected = [
         "app_settings",
         "audit_log",
+        // Added by migration 005 (overnight intake).
+        "candidates",
+        "captures",
         "chunk_propositions",
         "chunks",
         "chunks_vec",
+        "demand_queries",
         "disputed_edges",
         "documents",
         "proposition_edges",
         "propositions",
         "reinforcement_outbox",
         // Added by migration 004 (Kitty's unified per-session incognito).
+        "screen_log",
         "session_pause",
         "source_registry",
         "suppressions",

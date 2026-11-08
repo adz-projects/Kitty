@@ -36,6 +36,8 @@ export function DecisionModel() {
   const [defaults, setDefaults] = useState<DeciderDefaults | null>(null);
   const [probe, setProbe] = useState<DeciderProbe | null>(null);
   const [testing, setTesting] = useState(false);
+  const [secondaryProbe, setSecondaryProbe] = useState<DeciderProbe | null>(null);
+  const [secondaryTesting, setSecondaryTesting] = useState(false);
   const [stats, setStats] = useState<Partial<Record<DeciderFeature, DeciderFeatureStats>>>({});
   const [thresholdText, setThresholdText] = useState<Record<string, string>>({});
   const [thresholdsOpen, setThresholdsOpen] = useState(false);
@@ -76,6 +78,9 @@ export function DecisionModel() {
 
   const dialects = defaults?.dialects?.length ? defaults.dialects : [draft.dialect];
   const endpointChanged = draft.url.trim() !== saved.url.trim() || draft.dialect !== saved.dialect;
+  const secondaryEndpointChanged =
+    (draft.secondary?.url.trim() ?? '') !== (saved.secondary?.url.trim() ?? '') ||
+    (draft.secondary?.dialect ?? '') !== (saved.secondary?.dialect ?? '');
   const swapped = probe?.ok ? modelChanged(saved, probe.model) : false;
   const hasOverrides = Object.keys(saved.thresholds).length > 0;
 
@@ -92,6 +97,28 @@ export function DecisionModel() {
     }
   };
 
+  const addSecondary = () => {
+    setDraft({ ...draft, secondary: { dialect: draft.dialect, url: '', model: null } });
+    setSecondaryProbe(null);
+  };
+  const removeSecondary = () => {
+    setDraft({ ...draft, secondary: null });
+    setSecondaryProbe(null);
+  };
+  const testSecondary = async () => {
+    if (!draft.secondary) return;
+    setSecondaryTesting(true);
+    setError('');
+    setSecondaryProbe(null);
+    try {
+      setSecondaryProbe(await ipc.testDecider(draft.secondary.dialect, draft.secondary.url));
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setSecondaryTesting(false);
+    }
+  };
+
   const save = async () => {
     setError('');
     setNotice('');
@@ -104,6 +131,20 @@ export function DecisionModel() {
       }
       if (v !== null) thresholds[key] = v;
     }
+    // Drop an empty fallback; otherwise name its model from a successful Test,
+    // exactly as the primary does.
+    const secondary =
+      draft.secondary && draft.secondary.url.trim()
+        ? {
+            ...draft.secondary,
+            url: draft.secondary.url.trim(),
+            model: secondaryProbe?.ok
+              ? secondaryProbe.model
+              : secondaryEndpointChanged
+                ? null
+                : draft.secondary.model,
+          }
+        : null;
     const next: DeciderSettings = {
       ...draft,
       url: draft.url.trim(),
@@ -111,6 +152,7 @@ export function DecisionModel() {
       // leaves the model unknown rather than keeping a stale name.
       model: probe?.ok ? probe.model : endpointChanged ? null : draft.model,
       thresholds,
+      secondary,
     };
     try {
       const stored = await ipc.setDeciderSettings(next);
@@ -197,6 +239,79 @@ export function DecisionModel() {
         ) : (
           <div className="chat-error">Couldn&apos;t use this endpoint: {probe.error}</div>
         ))}
+
+      {/* Optional fallback model: used only when the primary fails a call. */}
+      {!draft.secondary ? (
+        <div className="row" style={{ marginTop: 8 }}>
+          <button onClick={() => addSecondary()} disabled={!draft.url.trim()}>
+            Add a fallback model
+          </button>
+          <span className="muted">Used only if the model above can&apos;t be reached.</span>
+        </div>
+      ) : (
+        <div className="field" style={{ marginTop: 8 }}>
+          <span>
+            <strong>Fallback model</strong>
+          </span>
+          <p className="muted" style={{ marginTop: 0 }}>
+            Tried only when the model above fails to answer a question (its server is down, errors,
+            or replies in an unexpected shape). Thresholds stay those of the primary.
+          </p>
+          <label className="field">
+            <span>Type</span>
+            <select
+              value={draft.secondary.dialect}
+              onChange={(e) =>
+                setDraft({
+                  ...draft,
+                  secondary: { ...draft.secondary!, dialect: e.target.value },
+                })
+              }
+            >
+              {dialects.map((d) => (
+                <option key={d} value={d}>
+                  {DIALECT_LABELS[d] ?? d}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="field">
+            <span>Endpoint</span>
+            <input
+              type="text"
+              placeholder="http://127.0.0.1:8081"
+              value={draft.secondary.url}
+              onChange={(e) => {
+                setDraft({ ...draft, secondary: { ...draft.secondary!, url: e.target.value } });
+                setSecondaryProbe(null);
+              }}
+            />
+          </label>
+          <div className="row">
+            <button
+              onClick={() => void testSecondary()}
+              disabled={secondaryTesting || !draft.secondary.url.trim()}
+            >
+              {secondaryTesting ? 'Testing…' : 'Test'}
+            </button>
+            <button onClick={() => removeSecondary()}>Remove</button>
+            {!secondaryProbe && draft.secondary.model && !secondaryEndpointChanged && (
+              <span className="muted">Current model: {draft.secondary.model}</span>
+            )}
+          </div>
+          {secondaryProbe &&
+            (secondaryProbe.ok ? (
+              <p className="muted">
+                Connected{secondaryProbe.model ? ` to ${secondaryProbe.model}` : ''} ·{' '}
+                {secondaryProbe.rtt_ms} ms per question.
+              </p>
+            ) : (
+              <div className="chat-error">
+                Couldn&apos;t use this endpoint: {secondaryProbe.error}
+              </div>
+            ))}
+        </div>
+      )}
 
       <p className="muted">
         Each use can be switched on or off on its own. Saving applies them at once, with no restart.

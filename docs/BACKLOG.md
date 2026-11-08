@@ -9,6 +9,20 @@ Nothing open.
 
 ## Noted for later
 
+- **"Remember this" on an attachment or paste (overnight intake).** A
+  document the user marks should go into Memorabilia without waiting for its
+  topic to recur in a second chat. The engine supports it
+  (`CaptureInput::pinned`, `captures.pinned`, promoted alone by the overnight
+  pass); what is missing is a toggle on the composer's attachment and
+  pasted-text chips, a marker in the turn text (`bigtiny::turn_text`) that
+  survives replay, and `memorabilia_harvest` reading it.
+
+- **Several paragraphs per decision-model call in the paragraph screen.** One
+  call per paragraph is the accurate baseline; asking about several paragraphs
+  as separate named questions in one call would cut per-call overhead on long
+  documents. Measure it with the `live_d1_screen_eval` harness before
+  switching it on (docs/MEMORY_OVERNIGHT.md).
+
 - **Specialists and scheduled runs carry no reasoning effort.** The engine
   builds a delegate's and a scheduled run's metadata without
   `thinking_effort`, so both run at the model's default level. Adding a level

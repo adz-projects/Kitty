@@ -105,7 +105,15 @@ binaries still match their source (CI runs it). Full detail in
   Health, Erase all; per-chat incognito in the chat's ⋯ menu.
 - **`memorabilia_rust`** — the factual-memory engine, also linked in. Learns
   from the documents a turn brings in (pasted text, attached files, scraped
-  pages), not from the dialogue. Desktop only.
+  pages), not from the dialogue. Desktop only. Intake is selective and the
+  heavy work happens at night (`docs/MEMORY_OVERNIGHT.md`): by day each
+  document is split into paragraphs, pre-filtered and — when the decision
+  model is on — screened paragraph by paragraph with a question set that is
+  configuration, not code; only kept paragraphs are buffered. In the
+  overnight window (default 00:00–05:00, optionally waking the PC) they are
+  chunked, embedded, and promoted into memory only when their topic recurs
+  (two chats, or one plus repeated similar searches). On desktop,
+  adaptive-pathway's learning moves into the window too.
 
   Both memory engines run only when the embedding model is on disk **and** the
   user has them on; Kitty switches them per app, at once

@@ -16,6 +16,7 @@ pub mod audit;
 pub mod chunks;
 pub mod documents;
 pub mod edges;
+pub mod intake;
 pub mod outbox;
 pub mod propositions;
 pub mod registry;

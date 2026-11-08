@@ -53,6 +53,9 @@ pub struct PluginHost {
     /// the `Agent`, built after this host). Each engine opened afterwards gets
     /// a gate for its own app.
     decider: std::sync::OnceLock<Arc<crate::decider::DeciderHub>>,
+    /// When each app's learn passes may run; attached after construction.
+    /// Unattached (tests) = whenever there is work.
+    overnight: std::sync::OnceLock<Arc<crate::overnight::OvernightHub>>,
     /// Apps whose DB file has been integrity-checked (and rebuilt if corrupt)
     /// at first open in this process — see `db_recover::heal_before_open`. The
     /// value is the rebuild report, held until `recover` reports it once.
@@ -79,8 +82,19 @@ impl PluginHost {
             instances: Mutex::new(HashMap::new()),
             open_errors: Mutex::new(HashMap::new()),
             decider: std::sync::OnceLock::new(),
+            overnight: std::sync::OnceLock::new(),
             healed: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Give sweeps started from now on the overnight window.
+    pub fn attach_overnight(&self, hub: Arc<crate::overnight::OvernightHub>) {
+        let _ = self.overnight.set(hub);
+    }
+
+    /// The overnight window, when attached.
+    pub fn overnight(&self) -> Option<&Arc<crate::overnight::OvernightHub>> {
+        self.overnight.get()
     }
 
     /// Why this app's engine last failed to open, if it did (and hasn't opened
@@ -199,6 +213,13 @@ impl PluginHost {
         // One background sweep per *live* engine. V1 spawned exactly one
         // because there was exactly one engine; naively carrying that forward
         // would mean an idle-sweep loop per registered app forever.
+        let schedule: Arc<dyn adaptive_pathway::traits::LearnSchedule> = match self.overnight.get() {
+            Some(hub) => Arc::new(crate::overnight::PathwaySchedule {
+                hub: hub.clone(),
+                app_id: app_id.to_string(),
+            }),
+            None => Arc::new(adaptive_pathway::traits::AlwaysLearn),
+        };
         let (shutdown, rx) = tokio::sync::watch::channel(false);
         let background = tokio::spawn(adaptive_pathway::background::run(
             engine.clone(),
@@ -208,6 +229,7 @@ impl PluginHost {
                 pool: self.pool.clone(),
             },
             Some(app_id.to_string()),
+            schedule,
             rx,
         ))
         .abort_handle();

@@ -97,6 +97,10 @@ export interface Attachment {
   id: string;
   label: string;
   content: string;
+  /** The user marked this "Remember this": memorabilia promotes it into memory
+      without waiting for the topic to recur. Carried to the daemon in the turn
+      text (`turn_text::compose` → `[remember]` token). */
+  pinned?: boolean;
 }
 
 /** An image attached directly (not via a dropped file path) — currently just

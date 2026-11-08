@@ -13,7 +13,7 @@ use tokio::sync::watch;
 use crate::engine::PathwayEngine;
 use crate::error::Result;
 use crate::learn::{self, LearnRequest, LearnTrigger};
-use crate::traits::SessionChat;
+use crate::traits::{AlwaysLearn, LearnSchedule, SessionChat};
 
 /// Seconds between ticks.
 pub const TICK_INTERVAL_SECS: u64 = 60;
@@ -46,6 +46,7 @@ pub async fn run<C: SessionChat>(
     host_pool: SqlitePool,
     chat: C,
     app_id: Option<String>,
+    schedule: Arc<dyn LearnSchedule>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     let mut interval = tokio::time::interval(Duration::from_secs(TICK_INTERVAL_SECS));
@@ -54,7 +55,7 @@ pub async fn run<C: SessionChat>(
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                if let Err(e) = idle_sweep(&engine, &host_pool, &chat, app_id.as_deref(), &mut backoff).await {
+                if let Err(e) = idle_sweep_with(&engine, &host_pool, &chat, app_id.as_deref(), &mut backoff, schedule.as_ref()).await {
                     tracing::warn!("pathway background sweep failed: {e}");
                 }
             }
@@ -83,6 +84,20 @@ pub async fn idle_sweep<C: SessionChat>(
     app_id: Option<&str>,
     backoff: &mut SweepBackoff,
 ) -> Result<()> {
+    idle_sweep_with(engine, host_pool, chat, app_id, backoff, &AlwaysLearn).await
+}
+
+/// [`idle_sweep`] under a [`LearnSchedule`]: learn passes run only when the
+/// schedule allows, up to its batch; consolidation runs regardless.
+pub async fn idle_sweep_with<C: SessionChat>(
+    engine: &PathwayEngine,
+    host_pool: &SqlitePool,
+    chat: &C,
+    app_id: Option<&str>,
+    backoff: &mut SweepBackoff,
+    schedule: &dyn LearnSchedule,
+) -> Result<()> {
+    let learn_batch = schedule.learn_batch().await;
     // Query 2 (host seam): idle + stale-active session ids. Cutoffs are
     // computed in SQL against `bigtiny.db`'s own clock/format -- see the
     // doc comment on `idle_session_ids` for why a Rust-side `chrono` cutoff
@@ -93,8 +108,9 @@ pub async fn idle_sweep<C: SessionChat>(
         crate::learn::host::idle_session_ids(host_pool, app_id, IDLE_MINUTES, ACTIVE_MINUTES).await?;
     backoff.retain(|_, failed_at| failed_at.elapsed() < LEARN_FAILURE_BACKOFF);
     let mut taken = 0usize;
+    let batch = learn_batch.unwrap_or(IDLE_SWEEP_BATCH).max(1);
     for session_id in &ids {
-        if taken >= IDLE_SWEEP_BATCH {
+        if taken >= batch {
             break;
         }
         if backoff.contains_key(session_id) {
@@ -106,7 +122,7 @@ pub async fn idle_sweep<C: SessionChat>(
         }
         let watermark = engine.db.last_learned_rowid(session_id).await.unwrap_or(0);
         let max_rowid = crate::learn::host::session_max_rowid(host_pool, session_id).await.unwrap_or(watermark);
-        let needs_learning = max_rowid > watermark;
+        let needs_learning = learn_batch.is_some() && max_rowid > watermark;
         let needs_consolidation = engine
             .db
             .list_conversation_beliefs_for_session(session_id)
@@ -121,6 +137,7 @@ pub async fn idle_sweep<C: SessionChat>(
         // the sweep. They used to be discarded outright (`let _ =`), which is
         // how pathway went weeks committing nothing without a single log line.
         if needs_learning {
+            schedule.working();
             let session_chat = chat.for_session(session_id).await;
             if let Err(e) = learn::extract_and_record(
                 engine,

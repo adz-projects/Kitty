@@ -130,6 +130,10 @@ Yes to stop it."
 ; is the pre-rename value name; both are cleared. `/f` makes a missing value a
 ; no-op rather than an error.
 !macro NSIS_HOOK_POSTUNINSTALL
+  ; The overnight wake-up task (src/lifecycle/wake_task.rs), also written by the
+  ; app itself. An upgrade loses it too; Kitty registers it again on its next
+  ; start if Settings still ask for it.
+  nsExec::Exec 'schtasks /Delete /F /TN "Kitty\Overnight memory"'
   nsExec::Exec 'reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v Kitty /f'
   nsExec::Exec 'reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v GooseOverlay /f'
 !macroend

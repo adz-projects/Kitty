@@ -4,6 +4,7 @@ import type { MemorabiliaMcpStatus } from '@/lib/types';
 import { MemorabiliaBrowser } from './MemorabiliaBrowser';
 import { MemorabiliaHealth } from './MemorabiliaHealth';
 import { EraseMemory } from './EraseMemory';
+import { OvernightLearning } from './OvernightLearning';
 import { useMemoryStatus } from '@/hooks/useMemoryStatus';
 import { useRouteStore } from '@/stores/routeStore';
 
@@ -122,6 +123,10 @@ export function Memorabilia() {
           )}
         </small>
       )}
+
+      {/* Shown whether or not Memorabilia is on: it also decides when
+          Adaptive Pathway learns. */}
+      {!modelMissing && <OvernightLearning />}
 
       {enabled && !modelMissing && (
         <>

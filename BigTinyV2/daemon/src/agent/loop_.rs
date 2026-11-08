@@ -4115,9 +4115,17 @@ impl AgentLoop {
         // Resolved per turn from the session's owning app, not held as one
         // daemon-wide handle: learning writes into that app's graph and no
         // other's.
-        let engine = match self.app_scope(session_id).await.0 {
-            Some(app_id) => self.plugins.pathway_for(&app_id).await,
+        let learn_app = self.app_scope(session_id).await.0;
+        let engine = match &learn_app {
+            Some(app_id) => self.plugins.pathway_for(app_id).await,
             None => None,
+        };
+        // An app that moved pathway learning into its overnight window keeps
+        // the bookkeeping below (the exchange counter) but skips the learn
+        // pass; the overnight sweep learns past the session's watermark.
+        let defer_learning = match (&learn_app, self.plugins.overnight()) {
+            (Some(app_id), Some(hub)) => hub.defers_pathway(app_id).await,
+            _ => false,
         };
         // `learn_every_n` is a user-editable u32 (`PathwayConfig::learn_every_n`).
         // A 0 (or negative-after-cast) value would make `%` below divide by
@@ -4171,7 +4179,7 @@ impl AgentLoop {
             };
             // The MAX(rowid) guard below is redundant with
             // `extract_and_record`'s watermark, so we skip re-deriving it here.
-            if exchange_count % learn_every_n as i64 == 0 {
+            if !defer_learning && exchange_count % learn_every_n as i64 == 0 {
                 let max_rowid: i64 =
                     sqlx::query_scalar("SELECT MAX(rowid) FROM messages WHERE session_id = ?")
                         .bind(&learn_session_id)

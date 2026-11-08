@@ -54,6 +54,12 @@ pub fn run() {
     if uninstall::requested() {
         std::process::exit(uninstall::run());
     }
+    // The overnight wake-up task's run: waking the machine was the point, and
+    // the engine's own clock does the work. No windows, no tray.
+    #[cfg(desktop)]
+    if lifecycle::wake_task::requested() {
+        std::process::exit(0);
+    }
     // Structured logs to stderr (unchanged); RUST_LOG overrides the default
     // filter. Also captures WARN/ERROR events into an in-memory ring buffer
     // (`log_capture`) that Settings → Advanced's error log reads — same
@@ -322,6 +328,10 @@ pub fn run() {
             commands::set_brave_mcp_search_api_key,
             commands::set_brave_mcp_search_enabled,
             commands::get_decider_settings,
+            commands::get_overnight,
+            commands::set_overnight,
+            commands::run_overnight_now,
+            commands::save_screen_log,
             commands::set_decider_settings,
             commands::test_decider,
             commands::get_decider_stats,

@@ -26,7 +26,19 @@ pub const REGENERATE_NOTE: &str =
 pub struct InlineDocument {
     pub label: String,
     pub content: String,
+    /// The user marked this attachment "Remember this": memorabilia promotes
+    /// it into memory without waiting for the topic to recur. Carried in the
+    /// turn text by a `[remember]` token on the open marker (see
+    /// [`PINNED_TOKEN`]) so the daemon's turn-end harvest can read it.
+    #[serde(default)]
+    pub pinned: bool,
 }
+
+/// Marker token appended to an attachment's open line when it is pinned
+/// ("Remember this"). Kept in sync with the daemon harvest's reader
+/// (`agent::memorabilia_harvest`), which strips the same token and sets
+/// `CaptureInput.pinned`.
+pub const PINNED_TOKEN: &str = "[remember]";
 
 /// An attachment as the chat shows it: a chip with a name.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -34,6 +46,9 @@ pub struct AttachmentChip {
     pub name: String,
     /// `file`, `document` or `image`.
     pub kind: &'static str,
+    /// Marked "Remember this" by the user (shown pinned on replay).
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 /// A stored user turn, taken apart.
@@ -46,8 +61,12 @@ pub struct ParsedTurn {
     pub regenerate: bool,
 }
 
-fn doc_open(label: &str) -> String {
-    format!("--- {label} ---")
+fn doc_open(label: &str, pinned: bool) -> String {
+    if pinned {
+        format!("--- {label} {PINNED_TOKEN} ---")
+    } else {
+        format!("--- {label} ---")
+    }
 }
 
 fn doc_close(label: &str) -> String {
@@ -59,9 +78,12 @@ fn doc_close(label: &str) -> String {
 pub fn compose(text: &str, documents: &[InlineDocument], file_paths: &[String]) -> String {
     let mut parts: Vec<String> = Vec::new();
     for doc in documents {
+        // The close line always uses the clean label; only the open line
+        // carries the `[remember]` token, so `parse` recovers the same label
+        // either way.
         parts.push(format!(
             "{}\n{}\n{}",
-            doc_open(&doc.label),
+            doc_open(&doc.label, doc.pinned),
             doc.content,
             doc_close(&doc.label)
         ));
@@ -87,13 +109,14 @@ pub fn parse(stored: &str) -> ParsedTurn {
     let mut attachments = Vec::new();
 
     // Inlined documents, each `--- label ---` ... `--- end of label ---`.
-    while let Some((label, after_open)) = leading_doc_open(rest) {
+    while let Some((label, pinned, after_open)) = leading_doc_open(rest) {
         let close = format!("\n{}", doc_close(label));
         match after_open.find(&close) {
             Some(end) => {
                 attachments.push(AttachmentChip {
                     name: label.to_string(),
                     kind: "document",
+                    pinned,
                 });
                 rest = after_open[end + close.len()..].trim_start_matches('\n');
             }
@@ -107,10 +130,11 @@ pub fn parse(stored: &str) -> ParsedTurn {
                 let Some(boundary) = boundary else { break };
                 let docs = &rest[..boundary];
                 for line in docs.lines() {
-                    if let Some(label) = legacy_doc_label(line) {
+                    if let Some((label, pinned)) = legacy_doc_label(line) {
                         attachments.push(AttachmentChip {
                             name: label.to_string(),
                             kind: "document",
+                            pinned,
                         });
                     }
                 }
@@ -138,6 +162,7 @@ pub fn parse(stored: &str) -> ParsedTurn {
                 attachments.push(AttachmentChip {
                     name: name.to_string(),
                     kind: "file",
+                    pinned: false,
                 });
             }
             rest = tail;
@@ -151,17 +176,26 @@ pub fn parse(stored: &str) -> ParsedTurn {
     }
 }
 
-/// `(label, text after the opening line)` when `s` starts with a document.
-fn leading_doc_open(s: &str) -> Option<(&str, &str)> {
+/// `(label, pinned, text after the opening line)` when `s` starts with a
+/// document.
+fn leading_doc_open(s: &str) -> Option<(&str, bool, &str)> {
     let (first, after) = s.split_once('\n')?;
-    let label = legacy_doc_label(first)?;
-    Some((label, after))
+    let (label, pinned) = legacy_doc_label(first)?;
+    Some((label, pinned, after))
 }
 
-/// The label of a `--- label ---` line (not an end line).
-fn legacy_doc_label(line: &str) -> Option<&str> {
+/// The `(label, pinned)` of a `--- label ---` line (not an end line). `pinned`
+/// is true when the label carries a trailing [`PINNED_TOKEN`], which is
+/// stripped so the clean label is what shows and what the harvest stores.
+fn legacy_doc_label(line: &str) -> Option<(&str, bool)> {
     let label = line.strip_prefix("--- ")?.strip_suffix(" ---")?;
-    (!label.is_empty() && !label.starts_with("end of ")).then_some(label)
+    if label.is_empty() || label.starts_with("end of ") {
+        return None;
+    }
+    match label.strip_suffix(PINNED_TOKEN) {
+        Some(clean) => Some((clean.trim_end(), true)),
+        None => Some((label, false)),
+    }
 }
 
 #[cfg(test)]
@@ -172,7 +206,33 @@ mod tests {
         InlineDocument {
             label: label.into(),
             content: content.into(),
+            pinned: false,
         }
+    }
+
+    #[test]
+    fn a_pinned_document_round_trips_the_label_and_the_flag() {
+        let docs = [InlineDocument {
+            label: "notes.md".into(),
+            content: "keep me".into(),
+            pinned: true,
+        }];
+        let sent = compose("remember these", &docs, &[]);
+        // The token rides on the open line, not the close line.
+        assert!(sent.contains(&format!("--- notes.md {PINNED_TOKEN} ---")));
+        assert!(sent.contains("--- end of notes.md ---"));
+        let parsed = parse(&sent);
+        assert_eq!(parsed.text, "remember these");
+        assert_eq!(parsed.attachments.len(), 1);
+        assert_eq!(parsed.attachments[0].name, "notes.md", "label is clean of the token");
+        assert!(parsed.attachments[0].pinned, "the pin survives the round trip");
+    }
+
+    #[test]
+    fn an_unpinned_document_reports_not_pinned() {
+        let sent = compose("q", &[doc("a.txt", "body")], &[]);
+        let parsed = parse(&sent);
+        assert!(!parsed.attachments[0].pinned);
     }
 
     #[test]

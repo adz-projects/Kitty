@@ -40,6 +40,9 @@ lib.rs (app setup, window creation, generate_handler! list;
   │       │                        on disk AND the user's toggle)
   │       ├─► decider.rs          the decision model: Settings + Kitty's
   │       │                        tool-group catalog → /api/apps/me/decider
+  │       ├─► overnight.rs        the overnight learning window →
+  │       │                        /api/apps/me/overnight (docs/MEMORY_OVERNIGHT.md)
+  │       ├─► wake_task.rs        the Windows task that wakes the PC for it  [desktop]
   │       ├─► embedding.rs        is the embedding model on disk
   │       └─► app_events.rs       the /api/apps/me/events listener: approvals,
   │                                schedule runs, session titles

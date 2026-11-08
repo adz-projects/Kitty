@@ -42,6 +42,10 @@ pub struct Engine {
     /// (`traits::WorthinessGate`); `None` = every non-PII document is kept.
     /// Set once, possibly after open (the host attaches it per app).
     pub worthiness_gate: std::sync::OnceLock<Arc<dyn crate::traits::WorthinessGate>>,
+    /// Optional per-paragraph screen for the overnight intake
+    /// (`learn::capture`); unset = the pre-filter alone decides. Set once,
+    /// possibly after open (the host attaches it per app).
+    pub paragraph_screen: std::sync::OnceLock<Arc<dyn crate::traits::ParagraphScreen>>,
     /// Tier table + reputable-domain data (plan §4.2): loaded automatically
     /// from `data/reliability.yaml`, overridable via
     /// [`Self::with_reliability_data`].
@@ -77,6 +81,7 @@ impl Engine {
             vectors,
             pii_classifier: None,
             worthiness_gate: std::sync::OnceLock::new(),
+            paragraph_screen: std::sync::OnceLock::new(),
             reliability,
             extraction_semaphore,
         }
@@ -125,6 +130,12 @@ impl Engine {
     /// Once; later calls are ignored.
     pub fn set_worthiness_gate(&self, gate: Arc<dyn crate::traits::WorthinessGate>) {
         let _ = self.worthiness_gate.set(gate);
+    }
+
+    /// Install the overnight intake's paragraph screen. Once; later calls are
+    /// ignored.
+    pub fn set_paragraph_screen(&self, screen: Arc<dyn crate::traits::ParagraphScreen>) {
+        let _ = self.paragraph_screen.set(screen);
     }
 
     /// Override the auto-loaded reliability data file (plan §4.2).

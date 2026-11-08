@@ -132,6 +132,9 @@ pub struct MemorabiliaHost {
     /// Per-app decision models, attached after construction; see
     /// `PluginHost::attach_decider`.
     decider: std::sync::OnceLock<Arc<crate::decider::DeciderHub>>,
+    /// When each app's expensive memory work may run; attached after
+    /// construction. Unattached (tests) = hourly.
+    overnight: std::sync::OnceLock<Arc<crate::overnight::OvernightHub>>,
     /// Apps whose DB file has been integrity-checked (and rebuilt if corrupt)
     /// at first open in this process — see `db_recover::heal_before_open`. The
     /// value is the rebuild report, held until `recover` reports it once.
@@ -168,8 +171,14 @@ impl MemorabiliaHost {
             instances: Mutex::new(HashMap::new()),
             open_errors: Mutex::new(HashMap::new()),
             decider: std::sync::OnceLock::new(),
+            overnight: std::sync::OnceLock::new(),
             healed: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Give sweeps started from now on the overnight window.
+    pub fn attach_overnight(&self, hub: Arc<crate::overnight::OvernightHub>) {
+        let _ = self.overnight.set(hub);
     }
 
     /// Why this app's engine last failed to open, if it did (and hasn't opened
@@ -350,11 +359,20 @@ impl MemorabiliaHost {
             engine.set_worthiness_gate(Arc::new(
                 crate::decider::memory_gates::MemorabiliaGate::new(hub.clone(), app_id),
             ));
+            engine.set_paragraph_screen(Arc::new(
+                crate::decider::paragraph_screen::MemorabiliaParagraphScreen::new(hub.clone(), app_id),
+            ));
         }
 
         let (shutdown, rx) = tokio::sync::watch::channel(false);
-        let background =
-            tokio::spawn(sweep(engine.clone(), self.sweep_interval_s, rx)).abort_handle();
+        let background = tokio::spawn(sweep(
+            engine.clone(),
+            self.sweep_interval_s,
+            app_id.to_string(),
+            self.overnight.get().cloned(),
+            rx,
+        ))
+        .abort_handle();
 
         tracing::info!(app_id, path = ?db_path, "opened memorabilia instance");
         instances.insert(
@@ -433,34 +451,75 @@ impl MemorabiliaHost {
     }
 }
 
+/// Without an overnight window, the full pass (whose recurrence step compares
+/// every waiting candidate with every other) runs at most this often.
+const ALWAYS_PASS_EVERY: Duration = Duration::from_secs(60 * 60);
+
 /// The per-instance background sweep, on the configured cadence until the
-/// instance is closed: one bounded `maintenance_tick`, then one bounded
-/// extraction drain. The engine owns time via the `now` argument; the wall
-/// clock is fine here because the tick is a cadence, not decay math (which is
-/// chunk-anchored).
+/// instance is closed (docs/MEMORY_OVERNIGHT.md in Kitty):
 ///
-/// The drain lives here, not only at turn end. A turn's harvest adds a whole
-/// page of chunks and the next turn could abort its drain, so the queue grew
-/// without bound; this loop is not tied to any turn and nothing aborts it but
-/// shutdown. Missed ticks are skipped, so a slow drain never overlaps itself.
-async fn sweep(engine: Arc<Engine>, interval_s: u64, mut shutdown: tokio::sync::watch::Receiver<bool>) {
+/// - every tick, captures that waited for the decision model are screened
+///   (cheap: the model is remote);
+/// - the overnight pass (chunking, embedding, recurrence, extraction) runs
+///   when the app's window allows ([`crate::overnight::OvernightHub`]), or
+///   hourly for an app with no window.
+///
+/// Not tied to any turn, so nothing aborts it but shutdown; missed ticks are
+/// skipped, so a long pass never overlaps itself.
+async fn sweep(
+    engine: Arc<Engine>,
+    interval_s: u64,
+    app_id: String,
+    overnight: Option<Arc<crate::overnight::OvernightHub>>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    use crate::overnight::Permit;
     let mut ticker = tokio::time::interval(Duration::from_secs(interval_s.max(1)));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_always: Option<std::time::Instant> = None;
     loop {
         tokio::select! {
             _ = ticker.tick() => {
                 let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-                engine.maintenance_tick(&now).await;
-                engine.restore_unextracted_batch(&now).await;
-                let drained = engine.drain_extraction(&now).await;
-                if drained.attempted > 0 {
-                    tracing::info!(
-                        attempted = drained.attempted,
-                        succeeded = drained.succeeded,
-                        failed = drained.failed,
-                        propositions = drained.propositions_written,
-                        "memorabilia extraction drain"
-                    );
+                let screened = engine.screen_pending(&now).await;
+                if screened > 0 {
+                    tracing::info!(screened, "memorabilia: held captures screened");
+                }
+                let permit = match &overnight {
+                    Some(h) => h.memory_permit(&app_id).await,
+                    None => Permit::Always,
+                };
+                let (trigger, report) = match permit {
+                    Permit::NotNow => continue,
+                    Permit::Always => {
+                        if last_always.is_some_and(|t| t.elapsed() < ALWAYS_PASS_EVERY) {
+                            continue;
+                        }
+                        last_always = Some(std::time::Instant::now());
+                        let r = engine
+                            .overnight_pass(&memorabilia::learn::overnight::FixedClock(now))
+                            .await;
+                        (None, r)
+                    }
+                    Permit::Now { trigger, deadline, watch_user } => {
+                        let Some(hub) = overnight.clone() else { continue };
+                        hub.pass_started(&app_id).await;
+                        let ctl = crate::overnight::PassGuard { hub, deadline, watch_user };
+                        (Some(trigger), engine.overnight_pass(&ctl).await)
+                    }
+                };
+                tracing::info!(
+                    app_id,
+                    trigger = ?trigger,
+                    finished = report.finished,
+                    candidates = report.candidates_added,
+                    promoted = report.chunks_promoted,
+                    propositions = report.propositions_written,
+                    "memorabilia overnight pass"
+                );
+                if let Some(h) = &overnight {
+                    let json = serde_json::to_value(&report).unwrap_or_default();
+                    h.pass_ended(&app_id, trigger, &json, report.finished).await;
                 }
             }
             _ = shutdown.changed() => {

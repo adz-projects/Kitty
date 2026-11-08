@@ -19,6 +19,7 @@
 pub mod backend;
 pub mod hub;
 pub mod memory_gates;
+pub mod paragraph_screen;
 pub mod shell_screen;
 pub mod systemone;
 
@@ -276,6 +277,34 @@ pub struct DeciderConfig {
     /// default cache lifetime; a llama-server slot can be evicted sooner.
     #[serde(default = "default_cache_ttl_secs")]
     pub cache_ttl_secs: u64,
+    /// The question set memorabilia's paragraph screen asks (switched by
+    /// `ingest_gate`). Data, so an app can try another set without a
+    /// rebuild; see `docs/MEMORY_OVERNIGHT.md`.
+    #[serde(default)]
+    pub paragraph_screen: paragraph_screen::ParagraphScreenConfig,
+    /// Optional fallback decision model, tried **per call** only when the
+    /// primary (`url`/`dialect`) fails to answer — a transport error, an HTTP
+    /// error, or an unparseable response. Lets an app back a fast-but-flaky
+    /// local model with a slower-but-reliable one (or vice versa) without
+    /// changing any threshold. `None` keeps the single-model behavior
+    /// (primary failure just falls back to the feature's own default, as
+    /// before). The secondary is never consulted for a low-confidence answer,
+    /// only for a failed call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secondary: Option<SecondaryDecider>,
+}
+
+/// A fallback decision model (see [`DeciderConfig::secondary`]). Mirrors the
+/// primary's endpoint shape; it answers the same question set in the same
+/// dialect, so it is wire-compatible with the primary from the caller's side.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SecondaryDecider {
+    #[serde(default = "default_dialect")]
+    pub dialect: String,
+    pub url: String,
+    /// The model the app last saw at `url`, for display only.
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 fn default_dialect() -> String {
@@ -302,6 +331,21 @@ impl DeciderConfig {
         if !matches!(url.scheme(), "http" | "https") {
             return Err("url must be http or https".into());
         }
+        if let Some(sec) = &self.secondary {
+            if !DIALECTS.contains(&sec.dialect.as_str()) {
+                return Err(format!(
+                    "unknown secondary dialect '{}' (supported: {})",
+                    sec.dialect,
+                    DIALECTS.join(", ")
+                ));
+            }
+            let surl = reqwest::Url::parse(sec.url.trim())
+                .map_err(|e| format!("invalid secondary url '{}': {e}", sec.url))?;
+            if !matches!(surl.scheme(), "http" | "https") {
+                return Err("secondary url must be http or https".into());
+            }
+        }
+        self.paragraph_screen.validate()?;
         let mut seen = std::collections::HashSet::new();
         for g in &self.tool_groups {
             if g.name.trim().is_empty() || !seen.insert(g.name.as_str()) {

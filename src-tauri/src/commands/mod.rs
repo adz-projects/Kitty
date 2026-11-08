@@ -18,6 +18,7 @@ mod mcp_servers;
 mod memorabilia;
 mod memory;
 mod models;
+mod overnight;
 mod provider;
 mod scheduled_tasks;
 // Win32 GDI desktop capture — see `crate::screenshot` (docs/ANDROID.md §2.5).
@@ -42,6 +43,7 @@ pub use mcp_servers::*;
 pub use memorabilia::*;
 pub use memory::*;
 pub use models::*;
+pub use overnight::*;
 pub use provider::*;
 pub use scheduled_tasks::*;
 #[cfg(windows)]

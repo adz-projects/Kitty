@@ -73,7 +73,7 @@ pub fn desired(settings: &DeciderSettings) -> Option<Value> {
         return None;
     }
     let f = &settings.features;
-    Some(json!({
+    let mut doc = json!({
         "dialect": settings.dialect,
         "url": settings.url.trim(),
         "model": settings.model,
@@ -88,8 +88,29 @@ pub fn desired(settings: &DeciderSettings) -> Option<Value> {
         },
         "thresholds": Value::Object(settings.thresholds.clone()),
         "tool_groups": tool_groups(),
-    }))
+    });
+    if let Some(set) = &settings.paragraph_screen {
+        doc["paragraph_screen"] = set.clone();
+    }
+    // Optional fallback model: only sent when it has an endpoint (an empty one
+    // means "no fallback", same as the primary's empty-url rule).
+    if let Some(sec) = &settings.secondary {
+        if !sec.url.trim().is_empty() {
+            doc["secondary"] = json!({
+                "dialect": sec.dialect,
+                "url": sec.url.trim(),
+                "model": sec.model,
+            });
+        }
+    }
+    Some(doc)
 }
+
+/// The id of the engine's built-in paragraph-screen question set
+/// (`decider::paragraph_screen` in the engine). When Kitty sends no set of its
+/// own, an engine still holding a different one is sent the document again,
+/// which puts the default back.
+const ENGINE_DEFAULT_SCREEN_SET: &str = "durable-substantive-v1";
 
 /// Bring the engine's copy in line with Settings. Best-effort: failures are
 /// logged and leave the engine as it was (which fails open by design).
@@ -128,6 +149,11 @@ fn same(have: &Value, want: &Value) -> bool {
     if keys.iter().any(|k| have.get(k) != want.get(k)) {
         return false;
     }
+    // The fallback model, when present, is echoed back verbatim (the engine
+    // skip-serializes a `None`, so an absent one compares equal to absent).
+    if have.get("secondary") != want.get("secondary") {
+        return false;
+    }
     // The engine echoes every feature it knows, the ones Kitty does not send
     // as `false`; compare the ones sent, and require the rest to be off.
     let empty = serde_json::Map::new();
@@ -144,6 +170,17 @@ fn same(have: &Value, want: &Value) -> bool {
     // false`, `file_types: []`), which the catalog leaves out; compared raw,
     // the two never matched and every self-heal re-sent the settings.
     if groups_with_defaults(have.get("tool_groups")) != groups_with_defaults(want.get("tool_groups")) {
+        return false;
+    }
+    let screen_matches = match want.get("paragraph_screen") {
+        Some(set) => have.get("paragraph_screen") == Some(set),
+        None => have
+            .get("paragraph_screen")
+            .and_then(|s| s.get("id"))
+            .and_then(Value::as_str)
+            .map_or(true, |id| id == ENGINE_DEFAULT_SCREEN_SET),
+    };
+    if !screen_matches {
         return false;
     }
     let empty = serde_json::Map::new();
@@ -201,6 +238,31 @@ mod tests {
         assert!(!same(&have, &want));
         have["features"]["compaction"] = json!(false);
         have["tool_groups"][1]["file_types"] = json!([".pdf"]);
+        assert!(!same(&have, &want));
+    }
+
+    #[test]
+    fn a_custom_question_set_is_sent_and_compared() {
+        let mut s = DeciderSettings {
+            url: "http://box:8080".into(),
+            ..DeciderSettings::default()
+        };
+        let want = desired(&s).unwrap();
+        assert!(want.get("paragraph_screen").is_none());
+        let mut have = want.clone();
+        have["paragraph_screen"] = json!({"id": ENGINE_DEFAULT_SCREEN_SET, "questions": []});
+        assert!(same(&have, &want), "the engine's default echoed back");
+        have["paragraph_screen"]["id"] = json!("old-custom");
+        assert!(!same(&have, &want), "a stale custom set is replaced");
+
+        let set = json!({"id": "try-2", "questions": [
+            {"name": "durable", "instructions": "Lasting?", "keep_at": 0.5}]});
+        s.paragraph_screen = Some(set.clone());
+        let want = desired(&s).unwrap();
+        assert_eq!(want["paragraph_screen"], set);
+        let mut have = want.clone();
+        assert!(same(&have, &want));
+        have["paragraph_screen"]["questions"][0]["keep_at"] = json!(0.6);
         assert!(!same(&have, &want));
     }
 

@@ -10,8 +10,9 @@ export const DECIDER_FEATURES: { id: DeciderFeature; label: string; blurb: strin
   },
   {
     id: 'ingest_gate',
-    label: 'Memory: ingest gate',
-    blurb: 'Keeps boilerplate, error pages and chit-chat out of Memorabilia’s factual memory.',
+    label: 'Memory: paragraph screen',
+    blurb:
+      'Reads each paragraph a chat brings in and keeps only the ones that will stay informative and are well supported, so specs, prices, announcements and filler stay out of Memorabilia. While the model is unreachable, documents wait (up to three days) rather than going in unchecked.',
   },
   {
     id: 'page_classify',
@@ -31,7 +32,6 @@ export const DECIDER_FEATURES: { id: DeciderFeature; label: string; blurb: strin
 export const DECIDER_THRESHOLDS: { key: string; label: string }[] = [
   { key: 'tool_gating_cold', label: 'Tool gating: load a group on a fresh decision at P ≥' },
   { key: 'tool_gating_add', label: 'Tool gating: add a group mid-chat at P ≥' },
-  { key: 'ingest_gate_reject_below', label: 'Ingest gate: reject a document below P' },
   { key: 'page_classify_min', label: 'Page check: act on a label at P ≥' },
   { key: 'shell_screen_flag_at', label: 'Shell screen: ask before running at P(risky) ≥' },
 ];

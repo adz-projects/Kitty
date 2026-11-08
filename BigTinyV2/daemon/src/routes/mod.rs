@@ -11,6 +11,7 @@ pub mod local;
 pub mod mcp;
 pub mod memorabilia;
 pub mod memory;
+pub mod overnight;
 pub mod pathway;
 pub mod plugins;
 pub mod providers;
@@ -113,6 +114,15 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/apps/me/decider",
             get(decider::get).put(decider::put).delete(decider::clear),
+        )
+        .route(
+            "/api/apps/me/overnight",
+            get(overnight::get).put(overnight::put).delete(overnight::clear),
+        )
+        .route("/api/apps/me/overnight/run", post(overnight::run_now))
+        .route(
+            "/api/apps/me/memorabilia/screen-log",
+            get(overnight::screen_log),
         )
         .route("/api/apps/me/decider/stats", get(decider::stats))
         .route("/api/apps/me/decider/probe", post(decider::probe))

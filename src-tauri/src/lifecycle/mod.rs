@@ -31,6 +31,8 @@ pub mod decider;
 pub mod engine_restart;
 mod health;
 pub mod memory;
+pub mod overnight;
+pub mod wake_task;
 
 pub(crate) use health::{compute_status, current_payload};
 pub use health::{spawn_health_loop, StackStatusPayload};
@@ -320,6 +322,12 @@ pub(crate) async fn install_handle(app: &AppHandle, handle: crate::state::Daemon
     memory::apply_memory_plugins(app).await;
     // The decision model is per app in the engine; a fresh engine has none.
     decider::apply_decider(app).await;
+    // Overnight learning: the engine's window, and the wake-up task (which an
+    // upgrade's uninstall removes).
+    overnight::apply_overnight(app).await;
+    if let Err(e) = overnight::sync_wake_task(app).await {
+        tracing::warn!("overnight: wake-up task not in step with Settings: {e}");
+    }
     // Tasks an older Kitty scheduled itself move to the engine, once.
     crate::commands::migrate_config_tasks(app).await;
     // Approvals and background runs for every chat, on screen or not.

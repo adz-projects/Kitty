@@ -36,6 +36,11 @@ pub async fn set_decider_settings(
         if model_changed && settings.thresholds == old.thresholds {
             settings.thresholds.clear();
         }
+        // The question set is edited in config.json, never in Settings, so a
+        // save from the Settings form (which does not carry it) keeps it.
+        if settings.paragraph_screen.is_none() {
+            settings.paragraph_screen = old.paragraph_screen.clone();
+        }
         cfg.decider = settings.clone();
         config::save(&cfg).map_err(|e| e.to_string())?;
     }

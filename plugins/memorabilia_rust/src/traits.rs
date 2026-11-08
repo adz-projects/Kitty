@@ -220,3 +220,83 @@ impl WorthinessGate for MockWorthinessGate {
         self.reject_with
     }
 }
+
+/// What the paragraph screen said about one paragraph
+/// (docs/MEMORY_OVERNIGHT.md §2).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ScreenVerdict {
+    /// No screen configured, or the app switched it off: the pre-filter
+    /// alone decides.
+    Disabled,
+    /// The screen is on but could not answer (endpoint down, too slow). The
+    /// document waits, unscreened, for it to come back.
+    Unavailable,
+    /// Every question's P(yes), by name, and whether the paragraph cleared
+    /// every keep threshold.
+    Scored { keep: bool, scores: Vec<(String, f32)> },
+}
+
+/// Judges one paragraph at a time for the overnight intake. BigTiny supplies
+/// the app's decision model here; the questions it asks are the app's
+/// configured question set.
+#[async_trait]
+pub trait ParagraphScreen: Send + Sync {
+    /// Whether the screen is configured and switched on right now. `false`
+    /// means "decide without it", never "wait for it".
+    async fn enabled(&self) -> bool;
+    /// Judge `state` (the paragraph with its document context).
+    async fn screen(&self, state: &str) -> ScreenVerdict;
+    /// Identifies the question set in use, for the screen log.
+    async fn question_set(&self) -> String;
+
+    /// How many paragraphs to put in one model call. `1` (the default) is one
+    /// call per paragraph — the calibrated behavior. A larger value batches
+    /// via [`Self::screen_batch`], which is cheaper but whose accuracy must be
+    /// measured with the eval first (docs/MEMORY_OVERNIGHT.md), so it is
+    /// opt-in. The overnight intake groups screenable paragraphs by this.
+    async fn batch_size(&self) -> usize {
+        1
+    }
+
+    /// Judge several paragraphs, verdicts returned in `states` order. The
+    /// default screens them one at a time (identical to calling [`Self::screen`]
+    /// on each), so a backend that does not override it batches safely as
+    /// groups of one. A backend may override it to combine the paragraphs into
+    /// a single model call.
+    async fn screen_batch(&self, states: &[&str]) -> Vec<ScreenVerdict> {
+        let mut out = Vec::with_capacity(states.len());
+        for s in states {
+            out.push(self.screen(s).await);
+        }
+        out
+    }
+}
+
+/// Test double for [`ParagraphScreen`]: keeps a paragraph when it contains
+/// any of `keep_if`, or answers with `fixed` when set.
+#[derive(Debug, Clone, Default)]
+pub struct MockParagraphScreen {
+    pub enabled: bool,
+    pub fixed: Option<ScreenVerdict>,
+    pub keep_if: Vec<String>,
+}
+
+#[async_trait]
+impl ParagraphScreen for MockParagraphScreen {
+    async fn enabled(&self) -> bool {
+        self.enabled
+    }
+    async fn screen(&self, state: &str) -> ScreenVerdict {
+        if let Some(v) = &self.fixed {
+            return v.clone();
+        }
+        let keep = self.keep_if.iter().any(|k| state.contains(k.as_str()));
+        ScreenVerdict::Scored {
+            keep,
+            scores: vec![("mock".into(), if keep { 0.9 } else { 0.1 })],
+        }
+    }
+    async fn question_set(&self) -> String {
+        "mock".into()
+    }
+}

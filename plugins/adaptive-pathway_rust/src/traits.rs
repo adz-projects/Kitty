@@ -126,3 +126,25 @@ impl MemoryGate for MockGate {
         Some((ps, self.drop_below))
     }
 }
+
+/// When the background sweep may run learn passes (the host's overnight
+/// window, on desktop). Consolidation and maintenance are cheap and run
+/// regardless.
+#[async_trait]
+pub trait LearnSchedule: Send + Sync {
+    /// How many sessions this tick may learn, or `None` for "not now".
+    async fn learn_batch(&self) -> Option<usize>;
+    /// Called just before each learn pass, so the host can keep the machine
+    /// awake while there is work.
+    fn working(&self) {}
+}
+
+/// Learn whenever there is work, a few sessions per tick: the default.
+pub struct AlwaysLearn;
+
+#[async_trait]
+impl LearnSchedule for AlwaysLearn {
+    async fn learn_batch(&self) -> Option<usize> {
+        Some(crate::background::IDLE_SWEEP_BATCH)
+    }
+}

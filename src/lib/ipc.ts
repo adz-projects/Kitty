@@ -22,6 +22,8 @@ import type {
   DeciderFeatureStats,
   DeciderProbe,
   DeciderSettings,
+  OvernightSettings,
+  OvernightView,
   FileAttachment,
   FileEntry,
   FolderData,
@@ -177,7 +179,7 @@ export const ipc = {
     text: string,
     images?: { mime: string; data_url: string }[],
     attachedPaths?: string[],
-    documents?: { label: string; content: string }[]
+    documents?: { label: string; content: string; pinned?: boolean }[]
   ) =>
     invoke<void>('send_prompt', {
       sessionId,
@@ -553,6 +555,15 @@ export const ipc = {
   getDeciderStats: () =>
     invoke<{ features: Partial<Record<DeciderFeature, DeciderFeatureStats>> }>('get_decider_stats'),
   getDeciderDefaults: () => invoke<DeciderDefaults>('get_decider_defaults'),
+  // Overnight learning (Settings → Memorabilia).
+  getOvernight: () => invoke<OvernightView>('get_overnight'),
+  setOvernight: (settings: OvernightSettings) =>
+    invoke<OvernightSettings>('set_overnight', { settings }),
+  runOvernightNow: () => invoke<void>('run_overnight_now'),
+  /** Writes the newest screened paragraphs as JSONL for labelling; returns
+      how many lines. */
+  saveScreenLog: (path: string, limit?: number, includePrefiltered?: boolean) =>
+    invoke<number>('save_screen_log', { path, limit, includePrefiltered }),
   /** The `route://goto` target this hub should navigate to on mount, if the
       call that created it also routed it somewhere. Consumed on read — see
       `commands::get_route_target`. */

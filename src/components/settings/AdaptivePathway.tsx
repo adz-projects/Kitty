@@ -10,6 +10,8 @@ import { BeliefBrowser } from './BeliefBrowser';
 import { GraphHealth } from './GraphHealth';
 import { EraseMemory } from './EraseMemory';
 import { useMemoryStatus } from '@/hooks/useMemoryStatus';
+import { useRouteStore } from '@/stores/routeStore';
+import { isAndroid } from '@/lib/platform';
 
 /** How far along the shared learning model's download is. Memory runs only
     once it is on disk (decision #1): without it the engines are off, not
@@ -30,6 +32,7 @@ const EMBEDDING_STATUS_LABEL: Record<EmbeddingModelStatus, string> = {
 export function AdaptivePathway() {
   const memory = useMemoryStatus();
   const modelMissing = memory !== null && !memory.model_installed;
+  const goto = useRouteStore((st) => st.goto);
   const [enabled, setEnabled] = useState(false);
   const [embeddingStatus, setEmbeddingStatus] = useState<EmbeddingModelStatus>('unknown');
   const [embeddingModel, setEmbeddingModel] = useState('');
@@ -240,6 +243,16 @@ export function AdaptivePathway() {
       {enabled && embeddingStatus !== 'unknown' && embeddingStatus !== 'missing' && (
         <small className="muted" style={{ display: 'block' }}>
           Learning model {EMBEDDING_STATUS_LABEL[embeddingStatus]}.
+        </small>
+      )}
+
+      {enabled && !modelMissing && !isAndroid() && (
+        <small className="muted" style={{ display: 'block' }}>
+          When it learns from your chats (as they happen, or overnight) is set in{' '}
+          <button className="link" onClick={() => goto('settings', { section: 'memorabilia' })}>
+            Memorabilia → Overnight learning
+          </button>
+          .
         </small>
       )}
 

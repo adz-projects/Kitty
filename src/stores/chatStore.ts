@@ -280,6 +280,8 @@ interface ChatState {
   regenerate: (assistantIndex: number) => Promise<void>;
   addPastedText: (text: string, label?: string) => void;
   removeAttachment: (id: string) => void;
+  /** Toggle an attachment's "Remember this" pin (memorabilia force-promote). */
+  toggleAttachmentPinned: (id: string) => void;
   addPendingImage: (mime: string, dataUrl: string) => void;
   /** Text for the composer to take up (something shared into Kitty); the
       composer clears it once used. */
@@ -877,7 +879,11 @@ export const useChatStore = create<ChatState>((set, get) => {
       // inlined documents out around the typed text (`turn_text::compose`).
       const attachedPaths = otherFiles.length ? otherFiles.map((f) => f.path) : undefined;
       const documents = attachments.length
-        ? attachments.map((a) => ({ label: a.label, content: a.content }))
+        ? attachments.map((a) => ({
+            label: a.label,
+            content: a.content,
+            pinned: a.pinned ?? false,
+          }))
         : undefined;
 
       // Snapshot what's attached to this turn before the set() below clears
@@ -1885,6 +1891,10 @@ export const useChatStore = create<ChatState>((set, get) => {
 
     removeAttachment: (id: string) =>
       set((s) => ({ attachments: s.attachments.filter((a) => a.id !== id) })),
+    toggleAttachmentPinned: (id: string) =>
+      set((s) => ({
+        attachments: s.attachments.map((a) => (a.id === id ? { ...a, pinned: !a.pinned } : a)),
+      })),
 
     composerPrefill: null,
     setComposerPrefill: (text) => set({ composerPrefill: text }),

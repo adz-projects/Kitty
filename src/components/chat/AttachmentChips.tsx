@@ -11,6 +11,7 @@ import { DocumentIcon } from '@/components/icons/DocumentIcon';
 export function AttachmentChips() {
   const attachments = useChatStore((s) => s.attachments);
   const remove = useChatStore((s) => s.removeAttachment);
+  const togglePinned = useChatStore((s) => s.toggleAttachmentPinned);
   const [openId, setOpenId] = useState<string | null>(null);
   if (attachments.length === 0) return null;
   return (
@@ -18,7 +19,7 @@ export function AttachmentChips() {
       {attachments.map((a) => {
         const open = openId === a.id;
         return (
-          <div className="chip pasted-chip" key={a.id}>
+          <div className={`chip pasted-chip${a.pinned ? ' pinned' : ''}`} key={a.id}>
             <div className="pasted-chip-summary">
               <button
                 type="button"
@@ -26,6 +27,22 @@ export function AttachmentChips() {
                 onClick={() => setOpenId(open ? null : a.id)}
               >
                 <DocumentIcon /> {a.label}
+              </button>
+              <button
+                type="button"
+                className="chip-remember"
+                aria-pressed={a.pinned ?? false}
+                title={
+                  a.pinned
+                    ? 'Remembering this — Kitty keeps it in memory. Click to unset.'
+                    : 'Remember this: keep this document in memory without waiting for the topic to recur.'
+                }
+                onClick={(e) => {
+                  e.preventDefault();
+                  togglePinned(a.id);
+                }}
+              >
+                {a.pinned ? '📌 Remembering' : 'Remember this'}
               </button>
               <button
                 className="chip-x"
