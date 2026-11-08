@@ -22,7 +22,15 @@ use serde_json::{json, Map, Value};
 use super::backend::{DeciderBackend, DeciderError, ProbeResult};
 use super::{Answer, Answers, Question};
 
+/// Self-hosted System One (llama-server): the base URL is a server root and
+/// the route `/v1/systemone` is appended.
 pub const DIALECT: &str = "systemone";
+
+/// Hosted System One (a gateway, aggregator, or Cloudflare Workers AI): the
+/// configured URL is the full endpoint and is POSTed to as-is, with an optional
+/// `Authorization: Bearer <api_key>` and an optional `model` id in the body.
+/// Answers may come back at the top level or wrapped under `result` (Cloudflare).
+pub const DIALECT_URL: &str = "systemone-url";
 
 /// A ceiling for one request. Callers impose their own, much shorter budgets
 /// with `tokio::time::timeout`; this only stops a wedged socket from living
@@ -42,49 +50,74 @@ fn client() -> &'static reqwest::Client {
 }
 
 pub struct SystemOne {
+    /// Server root, used for model discovery (`/v1/models`, `/props`) on a
+    /// self-hosted endpoint.
     base: String,
+    /// The exact URL `ask` POSTs to.
+    endpoint: String,
+    /// Optional bearer token for a hosted endpoint.
+    api_key: Option<String>,
+    /// Optional model id placed in the request body (hosted gateways and
+    /// Cloudflare select the model this way).
+    model: Option<String>,
 }
 
 impl SystemOne {
+    /// Self-hosted: the server root, with `/v1/systemone` appended, no auth.
     pub fn new(url: &str) -> Self {
-        // Accept either the server root or the full route.
-        let base = url
-            .trim()
-            .trim_end_matches('/')
-            .trim_end_matches("/v1/systemone")
-            .trim_end_matches('/')
-            .to_string();
-        Self { base }
+        Self::with_auth(url, None, None, true)
+    }
+
+    /// Build a backend. `append_route` appends `/v1/systemone` to the server
+    /// root (self-hosted convention); otherwise `url` is used as the full
+    /// endpoint as-is (hosted gateways / Cloudflare). `api_key`/`model` are
+    /// trimmed and dropped when empty.
+    pub fn with_auth(
+        url: &str,
+        api_key: Option<String>,
+        model: Option<String>,
+        append_route: bool,
+    ) -> Self {
+        let clean = url.trim().trim_end_matches('/');
+        let (base, endpoint) = if append_route {
+            let base = clean.trim_end_matches("/v1/systemone").trim_end_matches('/').to_string();
+            let endpoint = format!("{base}/v1/systemone");
+            (base, endpoint)
+        } else {
+            (clean.to_string(), clean.to_string())
+        };
+        Self {
+            base,
+            endpoint,
+            api_key: api_key.filter(|k| !k.trim().is_empty()),
+            model: model.filter(|m| !m.trim().is_empty()),
+        }
     }
 
     fn endpoint(&self) -> String {
-        format!("{}/v1/systemone", self.base)
+        self.endpoint.clone()
     }
 
     async fn model_name(&self) -> Option<String> {
+        // A configured model id (hosted gateway / Cloudflare) is the answer;
+        // only a single-model self-hosted server needs discovery.
+        if let Some(m) = &self.model {
+            return Some(m.clone());
+        }
         // `/v1/models` names the loaded model; `/props` is llama-server's own
         // and carries the path it was loaded from.
-        let models: Value = client()
-            .get(format!("{}/v1/models", self.base))
-            .timeout(PROBE_TIMEOUT)
-            .send()
-            .await
-            .ok()?
-            .json()
-            .await
-            .ok()?;
+        let get = |path: String| {
+            let mut r = client().get(path).timeout(PROBE_TIMEOUT);
+            if let Some(key) = &self.api_key {
+                r = r.bearer_auth(key);
+            }
+            r
+        };
+        let models: Value = get(format!("{}/v1/models", self.base)).send().await.ok()?.json().await.ok()?;
         if let Some(id) = models["data"][0]["id"].as_str() {
             return Some(file_name(id));
         }
-        let props: Value = client()
-            .get(format!("{}/props", self.base))
-            .timeout(PROBE_TIMEOUT)
-            .send()
-            .await
-            .ok()?
-            .json()
-            .await
-            .ok()?;
+        let props: Value = get(format!("{}/props", self.base)).send().await.ok()?.json().await.ok()?;
         props["model_path"].as_str().map(file_name)
     }
 }
@@ -99,8 +132,10 @@ fn file_name(path: &str) -> String {
         .to_string()
 }
 
-/// The request body for one call.
-pub fn request_body(state: &str, questions: &[(String, Question)]) -> Value {
+/// The request body for one call. `model`, when set, selects the model on a
+/// hosted gateway or Cloudflare Workers AI (ignored by a single-model
+/// self-hosted server).
+pub fn request_body(state: &str, questions: &[(String, Question)], model: Option<&str>) -> Value {
     let mut qs = Map::new();
     for (name, q) in questions {
         let v = match q {
@@ -125,13 +160,22 @@ pub fn request_body(state: &str, questions: &[(String, Question)]) -> Value {
         };
         qs.insert(name.clone(), v);
     }
-    json!({ "state": state, "questions": qs })
+    let mut body = json!({ "state": state, "questions": qs });
+    if let Some(m) = model {
+        body["model"] = Value::String(m.to_string());
+    }
+    body
 }
 
-/// Parse a response body against the questions that were asked.
+/// Parse a response body against the questions that were asked. Answers may sit
+/// at the top level (`{"answers": ...}`) or wrapped under `result`
+/// (Cloudflare Workers AI's REST envelope `{"result": {"answers": ...}}`).
 pub fn parse_answers(body: &Value, questions: &[(String, Question)]) -> Answers {
     let mut out = Answers::new();
-    let Some(answers) = body.get("answers").and_then(Value::as_object) else {
+    let answers = body
+        .get("answers")
+        .or_else(|| body.get("result").and_then(|r| r.get("answers")));
+    let Some(answers) = answers.and_then(Value::as_object) else {
         return out;
     };
     for (name, q) in questions {
@@ -253,9 +297,13 @@ impl DeciderBackend for SystemOne {
         state: &str,
         questions: &[(String, Question)],
     ) -> Result<Answers, DeciderError> {
-        let resp = client()
+        let mut req = client()
             .post(self.endpoint())
-            .json(&request_body(state, questions))
+            .json(&request_body(state, questions, self.model.as_deref()));
+        if let Some(key) = &self.api_key {
+            req = req.bearer_auth(key);
+        }
+        let resp = req
             .send()
             .await
             .map_err(|e| DeciderError::Transport(e.to_string()))?;
@@ -267,7 +315,10 @@ impl DeciderBackend for SystemOne {
             .json()
             .await
             .map_err(|e| DeciderError::Shape(e.to_string()))?;
-        if body.get("answers").is_none() {
+        // Accept answers at the top level or under Cloudflare's `result` wrapper.
+        let has_answers = body.get("answers").is_some()
+            || body.get("result").and_then(|r| r.get("answers")).is_some();
+        if !has_answers {
             return Err(DeciderError::Shape("no `answers` field".into()));
         }
         Ok(parse_answers(&body, questions))
@@ -326,11 +377,36 @@ mod tests {
 
     #[test]
     fn the_request_uses_the_decision_index_shape() {
-        let body = request_body("charged twice", &qs());
+        let body = request_body("charged twice", &qs(), None);
         assert_eq!(body["state"], "charged twice");
         assert_eq!(body["questions"]["refund"]["type"], "noul");
         assert_eq!(body["questions"]["team"]["criteria"]["billing"], "Charges");
         assert_eq!(body["questions"]["urgency"]["criteria"][2], "Now");
+        assert!(body.get("model").is_none(), "no model field when unset");
+        // A configured model id rides in the body (hosted gateways / Cloudflare).
+        let hosted = request_body("x", &qs(), Some("clef"));
+        assert_eq!(hosted["model"], "clef");
+    }
+
+    #[test]
+    fn a_hosted_url_is_used_as_is_and_a_root_gets_the_route() {
+        // Self-hosted: the route is appended to the server root.
+        assert_eq!(SystemOne::new("http://h:8080/d1/").endpoint(), "http://h:8080/d1/v1/systemone");
+        // Hosted/Cloudflare: the full endpoint is posted as-is.
+        let cf = SystemOne::with_auth(
+            "https://api.cloudflare.com/client/v4/accounts/abc/ai/run/@cf/cloudflare/clef",
+            Some("token".into()),
+            Some("clef".into()),
+            false,
+        );
+        assert_eq!(cf.endpoint(), "https://api.cloudflare.com/client/v4/accounts/abc/ai/run/@cf/cloudflare/clef");
+    }
+
+    #[test]
+    fn answers_parse_under_the_cloudflare_result_wrapper() {
+        let body = json!({"result": {"answers": {"refund": {"noul": 0.8}}}, "success": true});
+        let a = parse_answers(&body, &qs());
+        assert_eq!(a["refund"].yes, Some(0.8));
     }
 
     #[test]

@@ -92,6 +92,11 @@ pub struct ProbeRequest {
     #[serde(default)]
     pub dialect: Option<String>,
     pub url: String,
+    /// Optional bearer token and model id for a hosted endpoint being tested.
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 /// `POST /api/apps/me/decider/probe` — test an endpoint without saving it:
@@ -100,7 +105,8 @@ pub async fn probe(Json(body): Json<ProbeRequest>) -> Response {
     let dialect = body
         .dialect
         .unwrap_or_else(|| crate::decider::systemone::DIALECT.to_string());
-    Json(DeciderHub::probe(&dialect, &body.url).await).into_response()
+    Json(DeciderHub::probe(&dialect, &body.url, body.api_key.as_deref(), body.model.as_deref()).await)
+        .into_response()
 }
 
 #[derive(Debug, Deserialize)]

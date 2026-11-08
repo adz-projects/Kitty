@@ -548,10 +548,25 @@ export const ipc = {
   // rather than patchConfig, because saving also re-syncs the engine's
   // per-app copy and kitty-web's row.
   getDeciderSettings: () => invoke<DeciderSettings>('get_decider_settings'),
-  setDeciderSettings: (settings: DeciderSettings) =>
-    invoke<DeciderSettings>('set_decider_settings', { settings }),
-  testDecider: (dialect: string, url: string) =>
-    invoke<DeciderProbe>('test_decider', { dialect, url }),
+  /** Whether an API key is stored (keychain) for the [main, backup] models. */
+  getDeciderKeySet: () => invoke<[boolean, boolean]>('get_decider_key_set'),
+  /** Save settings. `apiKey`/`secondaryApiKey`: `undefined` leaves the stored
+      key unchanged, `''` clears it, a value sets it (kept in the OS keychain). */
+  setDeciderSettings: (settings: DeciderSettings, apiKey?: string, secondaryApiKey?: string) =>
+    invoke<DeciderSettings>('set_decider_settings', {
+      settings,
+      apiKey: apiKey ?? null,
+      secondaryApiKey: secondaryApiKey ?? null,
+    }),
+  /** Turn memory-intake chunking on/off (paragraph_screen.batch_size). */
+  setDeciderChunking: (on: boolean) => invoke<void>('set_decider_chunking', { on }),
+  testDecider: (dialect: string, url: string, apiKey?: string, model?: string) =>
+    invoke<DeciderProbe>('test_decider', {
+      dialect,
+      url,
+      apiKey: apiKey ?? null,
+      model: model ?? null,
+    }),
   getDeciderStats: () =>
     invoke<{ features: Partial<Record<DeciderFeature, DeciderFeatureStats>> }>('get_decider_stats'),
   getDeciderDefaults: () => invoke<DeciderDefaults>('get_decider_defaults'),

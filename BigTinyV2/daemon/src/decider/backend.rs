@@ -44,9 +44,26 @@ pub trait DeciderBackend: Send + Sync {
 
 /// Build the backend for a dialect, or `None` for one this build can't speak
 /// (rejected at configuration time, so this only guards a stale row).
-pub fn for_dialect(dialect: &str, url: &str) -> Option<Arc<dyn DeciderBackend>> {
+/// `api_key` is an optional bearer token and `model` an optional model id for
+/// a hosted endpoint; both are ignored by the self-hosted dialect's transport
+/// when empty.
+pub fn for_dialect(
+    dialect: &str,
+    url: &str,
+    api_key: Option<&str>,
+    model: Option<&str>,
+) -> Option<Arc<dyn DeciderBackend>> {
+    let key = api_key.map(str::to_string);
+    let model = model.map(str::to_string);
     match dialect {
-        super::systemone::DIALECT => Some(Arc::new(super::systemone::SystemOne::new(url))),
+        // Self-hosted: append `/v1/systemone` to the server root.
+        super::systemone::DIALECT => Some(Arc::new(super::systemone::SystemOne::with_auth(
+            url, key, model, true,
+        ))),
+        // Hosted gateway / Cloudflare: POST the URL as-is, with the bearer token.
+        super::systemone::DIALECT_URL => Some(Arc::new(super::systemone::SystemOne::with_auth(
+            url, key, model, false,
+        ))),
         _ => None,
     }
 }

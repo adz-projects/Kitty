@@ -67,8 +67,13 @@ pub fn tool_groups() -> Value {
 }
 
 /// The document the engine should hold, or `None` for "no decision model".
-/// Pure, so the mapping is testable.
-pub fn desired(settings: &DeciderSettings) -> Option<Value> {
+/// Pure, so the mapping is testable. `main_key`/`backup_key` are the bearer
+/// tokens from the OS keychain (hosted endpoints); empty for self-hosted.
+pub fn desired(
+    settings: &DeciderSettings,
+    main_key: Option<&str>,
+    backup_key: Option<&str>,
+) -> Option<Value> {
     if !settings.configured() {
         return None;
     }
@@ -89,6 +94,9 @@ pub fn desired(settings: &DeciderSettings) -> Option<Value> {
         "thresholds": Value::Object(settings.thresholds.clone()),
         "tool_groups": tool_groups(),
     });
+    if let Some(k) = main_key.map(str::trim).filter(|k| !k.is_empty()) {
+        doc["api_key"] = Value::String(k.to_string());
+    }
     if let Some(set) = &settings.paragraph_screen {
         doc["paragraph_screen"] = set.clone();
     }
@@ -96,11 +104,15 @@ pub fn desired(settings: &DeciderSettings) -> Option<Value> {
     // means "no fallback", same as the primary's empty-url rule).
     if let Some(sec) = &settings.secondary {
         if !sec.url.trim().is_empty() {
-            doc["secondary"] = json!({
+            let mut s = json!({
                 "dialect": sec.dialect,
                 "url": sec.url.trim(),
                 "model": sec.model,
             });
+            if let Some(k) = backup_key.map(str::trim).filter(|k| !k.is_empty()) {
+                s["api_key"] = Value::String(k.to_string());
+            }
+            doc["secondary"] = s;
         }
     }
     Some(doc)
@@ -121,11 +133,16 @@ pub async fn apply_decider(app: &AppHandle) {
 }
 
 async fn apply(app: &AppHandle) -> Result<(), String> {
+    use crate::commands::{DECIDER_KEY_BACKUP, DECIDER_KEY_MAIN};
+    use crate::config::providers::get_secret_async;
     let client = crate::bigtiny::client::ensure_client(app)?;
+    // Bearer tokens for hosted endpoints come from the keychain, not config.
+    let main_key = get_secret_async(DECIDER_KEY_MAIN).await;
+    let backup_key = get_secret_async(DECIDER_KEY_BACKUP).await;
     let want = {
         let state = app.state::<AppState>();
         let cfg = state.config.lock().unwrap();
-        desired(&cfg.decider)
+        desired(&cfg.decider, main_key.as_deref(), backup_key.as_deref())
     };
     let have = client.get_json("/api/apps/me/decider").await?;
     let have = have.get("config").cloned().unwrap_or(Value::Null);
@@ -145,7 +162,7 @@ async fn apply(app: &AppHandle) -> Result<(), String> {
 /// engine echoes the thresholds back with every default filled in, so those
 /// are compared by the keys we set rather than wholesale.
 fn same(have: &Value, want: &Value) -> bool {
-    let keys = ["dialect", "url", "model"];
+    let keys = ["dialect", "url", "model", "api_key"];
     if keys.iter().any(|k| have.get(k) != want.get(k)) {
         return false;
     }
@@ -221,7 +238,7 @@ mod tests {
             url: "http://box:8080".into(),
             ..DeciderSettings::default()
         };
-        let want = desired(&s).unwrap();
+        let want = desired(&s, None, None).unwrap();
         let mut have = want.clone();
         for g in have["tool_groups"].as_array_mut().unwrap() {
             let obj = g.as_object_mut().unwrap();
@@ -247,7 +264,7 @@ mod tests {
             url: "http://box:8080".into(),
             ..DeciderSettings::default()
         };
-        let want = desired(&s).unwrap();
+        let want = desired(&s, None, None).unwrap();
         assert!(want.get("paragraph_screen").is_none());
         let mut have = want.clone();
         have["paragraph_screen"] = json!({"id": ENGINE_DEFAULT_SCREEN_SET, "questions": []});
@@ -258,7 +275,7 @@ mod tests {
         let set = json!({"id": "try-2", "questions": [
             {"name": "durable", "instructions": "Lasting?", "keep_at": 0.5}]});
         s.paragraph_screen = Some(set.clone());
-        let want = desired(&s).unwrap();
+        let want = desired(&s, None, None).unwrap();
         assert_eq!(want["paragraph_screen"], set);
         let mut have = want.clone();
         assert!(same(&have, &want));
@@ -268,12 +285,12 @@ mod tests {
 
     #[test]
     fn no_url_means_no_decision_model() {
-        assert!(desired(&DeciderSettings::default()).is_none());
+        assert!(desired(&DeciderSettings::default(), None, None).is_none());
         let s = DeciderSettings {
             url: "  ".into(),
             ..DeciderSettings::default()
         };
-        assert!(desired(&s).is_none());
+        assert!(desired(&s, None, None).is_none());
     }
 
     #[test]
@@ -283,7 +300,7 @@ mod tests {
             ..DeciderSettings::default()
         };
         s.features.ingest_gate = false;
-        let d = desired(&s).unwrap();
+        let d = desired(&s, None, None).unwrap();
         assert_eq!(d["url"], "http://box:8080");
         assert_eq!(d["features"]["ingest_gate"], false);
         assert!(d["features"].get("compaction").is_none());
@@ -313,7 +330,7 @@ mod tests {
         };
         s.thresholds
             .insert("tool_gating_add".into(), json!(0.75));
-        let want = desired(&s).unwrap();
+        let want = desired(&s, None, None).unwrap();
         let mut have = want.clone();
         have["thresholds"] = json!({"tool_gating_add": 0.75, "tool_gating_cold": 0.3});
         assert!(same(&have, &want));

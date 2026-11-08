@@ -178,8 +178,8 @@ impl DeciderHub {
     }
 
     /// Probe an endpoint without saving anything — for a settings "Test".
-    pub async fn probe(dialect: &str, url: &str) -> ProbeResult {
-        match backend::for_dialect(dialect, url) {
+    pub async fn probe(dialect: &str, url: &str, api_key: Option<&str>, model: Option<&str>) -> ProbeResult {
+        match backend::for_dialect(dialect, url, api_key, model) {
             Some(b) => b.probe().await,
             None => ProbeResult {
                 ok: false,
@@ -248,13 +248,18 @@ impl DeciderHub {
 }
 
 fn build(config: DeciderConfig) -> Option<Arc<AppDecider>> {
-    let primary = backend::for_dialect(&config.dialect, &config.url)?;
+    let primary = backend::for_dialect(
+        &config.dialect,
+        &config.url,
+        config.api_key.as_deref(),
+        config.model.as_deref(),
+    )?;
     // Wrap with the optional fallback model. An unknown/unbuildable secondary
     // dialect (e.g. a stale row from a newer build) is ignored rather than
     // disabling the whole decider — the primary alone is still better than
     // nothing (config-time validation already rejects a bad secondary on PUT).
     let backend = match config.secondary.as_ref().and_then(|s| {
-        backend::for_dialect(&s.dialect, &s.url)
+        backend::for_dialect(&s.dialect, &s.url, s.api_key.as_deref(), s.model.as_deref())
     }) {
         Some(secondary) => {
             Arc::new(backend::FallbackBackend::new(primary, secondary)) as Arc<dyn DeciderBackend>

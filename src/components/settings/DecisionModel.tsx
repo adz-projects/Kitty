@@ -16,8 +16,16 @@ import {
 } from './deciderHelpers';
 
 const DIALECT_LABELS: Record<string, string> = {
-  systemone: 'Liquid d1 (system_one)',
+  systemone: 'Self-hosted (System One, e.g. local d1)',
+  'systemone-url': 'Hosted endpoint + API key (Cloudflare, gateways)',
 };
+
+/** Dialects that need a bearer API key and a model id (hosted endpoints). */
+function isHosted(dialect: string): boolean {
+  return dialect === 'systemone-url';
+}
+
+type PS = { batch_size?: number } | undefined;
 
 /** Settings → Helper Models → Decision model.
 
@@ -38,6 +46,11 @@ export function DecisionModel() {
   const [testing, setTesting] = useState(false);
   const [secondaryProbe, setSecondaryProbe] = useState<DeciderProbe | null>(null);
   const [secondaryTesting, setSecondaryTesting] = useState(false);
+  // API keys: undefined = unchanged (leave the stored key), '' = clear, value = set.
+  const [mainKey, setMainKey] = useState<string | undefined>(undefined);
+  const [secondaryKey, setSecondaryKey] = useState<string | undefined>(undefined);
+  const [keySet, setKeySet] = useState<[boolean, boolean]>([false, false]);
+  const [chunking, setChunking] = useState(false);
   const [stats, setStats] = useState<Partial<Record<DeciderFeature, DeciderFeatureStats>>>({});
   const [thresholdText, setThresholdText] = useState<Record<string, string>>({});
   const [thresholdsOpen, setThresholdsOpen] = useState(false);
@@ -51,8 +64,13 @@ export function DecisionModel() {
         setSaved(s);
         setDraft(s);
         setThresholdText(textFor(s.thresholds));
+        setChunking(((s.paragraph_screen as PS)?.batch_size ?? 1) > 1);
       })
       .catch((e) => setError(String(e)));
+    void ipc
+      .getDeciderKeySet()
+      .then(setKeySet)
+      .catch(() => {});
     void ipc
       .getDeciderDefaults()
       .then(setDefaults)
@@ -89,7 +107,7 @@ export function DecisionModel() {
     setError('');
     setProbe(null);
     try {
-      setProbe(await ipc.testDecider(draft.dialect, draft.url));
+      setProbe(await ipc.testDecider(draft.dialect, draft.url, mainKey, draft.model ?? undefined));
     } catch (e) {
       setError(String(e));
     } finally {
@@ -111,7 +129,14 @@ export function DecisionModel() {
     setError('');
     setSecondaryProbe(null);
     try {
-      setSecondaryProbe(await ipc.testDecider(draft.secondary.dialect, draft.secondary.url));
+      setSecondaryProbe(
+        await ipc.testDecider(
+          draft.secondary.dialect,
+          draft.secondary.url,
+          secondaryKey,
+          draft.secondary.model ?? undefined
+        )
+      );
     } catch (e) {
       setError(String(e));
     } finally {
@@ -138,24 +163,40 @@ export function DecisionModel() {
         ? {
             ...draft.secondary,
             url: draft.secondary.url.trim(),
-            model: secondaryProbe?.ok
-              ? secondaryProbe.model
-              : secondaryEndpointChanged
-                ? null
-                : draft.secondary.model,
+            // Hosted: the model is the id the user typed. Self-hosted: named
+            // by a successful Test, else cleared on an endpoint change.
+            model: isHosted(draft.secondary.dialect)
+              ? draft.secondary.model?.trim() || null
+              : secondaryProbe?.ok
+                ? secondaryProbe.model
+                : secondaryEndpointChanged
+                  ? null
+                  : draft.secondary.model,
           }
         : null;
     const next: DeciderSettings = {
       ...draft,
       url: draft.url.trim(),
-      // A tested endpoint names its model; an untested change of endpoint
-      // leaves the model unknown rather than keeping a stale name.
-      model: probe?.ok ? probe.model : endpointChanged ? null : draft.model,
+      model: isHosted(draft.dialect)
+        ? draft.model?.trim() || null
+        : probe?.ok
+          ? probe.model
+          : endpointChanged
+            ? null
+            : draft.model,
       thresholds,
       secondary,
     };
     try {
-      const stored = await ipc.setDeciderSettings(next);
+      // Pass the key edits (undefined = unchanged, '' = clear). A removed
+      // fallback also clears its stored key.
+      const stored = await ipc.setDeciderSettings(next, mainKey, secondary ? secondaryKey : '');
+      setMainKey(undefined);
+      setSecondaryKey(undefined);
+      void ipc
+        .getDeciderKeySet()
+        .then(setKeySet)
+        .catch(() => {});
       if (swapped && hasOverrides && Object.keys(stored.thresholds).length === 0) {
         setNotice('The model changed, so your threshold overrides were reset to its defaults.');
       } else {
@@ -211,9 +252,53 @@ export function DecisionModel() {
         />
       </label>
       <p className="muted" style={{ marginTop: 4 }}>
-        For Liquid d1, the root of a <code>llama-server</code> running the GGUF (it answers on{' '}
-        <code>/v1/systemone</code>). Reachable from this device — over Tailscale works on Android.
+        {isHosted(draft.dialect) ? (
+          <>
+            The full System One endpoint. For Cloudflare Clef, paste{' '}
+            <code>
+              https://api.cloudflare.com/client/v4/accounts/&lt;id&gt;/ai/run/@cf/cloudflare/clef
+            </code>{' '}
+            with your API token and model <code>clef</code>. For a hosted gateway (Jev, Drex, d1
+            aggregators), paste its endpoint, key, and a model id like <code>drex-2.0</code>.
+          </>
+        ) : (
+          <>
+            For self-hosted d1, the root of a <code>llama-server</code> running the GGUF (it answers
+            on <code>/v1/systemone</code>). Reachable from this device — over Tailscale works on
+            Android.
+          </>
+        )}
       </p>
+      {isHosted(draft.dialect) && (
+        <>
+          <label className="field">
+            <span>Model</span>
+            <input
+              type="text"
+              placeholder="clef, drex-2.0, d1-ultra…"
+              value={draft.model ?? ''}
+              onChange={(e) => {
+                setDraft({ ...draft, model: e.target.value });
+                setProbe(null);
+              }}
+            />
+          </label>
+          <label className="field">
+            <span>API key</span>
+            <input
+              type="password"
+              placeholder={
+                keySet[0] && mainKey === undefined ? '•••••••• (key set)' : 'Bearer token'
+              }
+              value={mainKey ?? ''}
+              onChange={(e) => {
+                setMainKey(e.target.value);
+                setProbe(null);
+              }}
+            />
+          </label>
+        </>
+      )}
       <div className="row">
         <button onClick={() => void test()} disabled={testing || !draft.url.trim()}>
           {testing ? 'Testing…' : 'Test'}
@@ -287,6 +372,39 @@ export function DecisionModel() {
               }}
             />
           </label>
+          {isHosted(draft.secondary.dialect) && (
+            <>
+              <label className="field">
+                <span>Model</span>
+                <input
+                  type="text"
+                  placeholder="clef, drex-2.0, d1-ultra…"
+                  value={draft.secondary.model ?? ''}
+                  onChange={(e) => {
+                    setDraft({
+                      ...draft,
+                      secondary: { ...draft.secondary!, model: e.target.value },
+                    });
+                    setSecondaryProbe(null);
+                  }}
+                />
+              </label>
+              <label className="field">
+                <span>API key</span>
+                <input
+                  type="password"
+                  placeholder={
+                    keySet[1] && secondaryKey === undefined ? '•••••••• (key set)' : 'Bearer token'
+                  }
+                  value={secondaryKey ?? ''}
+                  onChange={(e) => {
+                    setSecondaryKey(e.target.value);
+                    setSecondaryProbe(null);
+                  }}
+                />
+              </label>
+            </>
+          )}
           <div className="row">
             <button
               onClick={() => void testSecondary()}
@@ -345,6 +463,35 @@ export function DecisionModel() {
           </div>
         );
       })}
+
+      <div className="field">
+        <label className="check">
+          <input
+            type="checkbox"
+            checked={chunking}
+            disabled={!draft.url.trim()}
+            onChange={(e) => {
+              const on = e.target.checked;
+              setChunking(on);
+              void ipc
+                .setDeciderChunking(on)
+                .then(() => setNotice(`Chunking turned ${on ? 'on' : 'off'}.`))
+                .catch((err) => {
+                  setChunking(!on);
+                  setError(String(err));
+                });
+            }}
+          />
+          Chunk the memory intake screen
+        </label>
+        <p className="muted" style={{ margin: 0 }}>
+          When Kitty decides which pasted/attached passages are worth remembering, it asks the
+          decision model about each passage. <strong>On</strong>, it bundles several passages into
+          one call — cheaper and faster, but on a quick test it let through a bit more filler.{' '}
+          <strong>Off</strong> (the default) asks about one passage at a time, the most precise.
+          Only affects what gets saved to memory, not the four checks above.
+        </p>
+      </div>
 
       <button
         type="button"

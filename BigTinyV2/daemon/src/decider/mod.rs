@@ -31,7 +31,7 @@ pub use hub::{DeciderHub, FeatureStats};
 
 /// The dialects this build can speak. Adding a model that speaks something
 /// else is one more [`backend::DeciderBackend`] and one more entry here.
-pub const DIALECTS: &[&str] = &[systemone::DIALECT];
+pub const DIALECTS: &[&str] = &[systemone::DIALECT, systemone::DIALECT_URL];
 
 /// One question, in the Decision Index shape (`type` / `instructions` /
 /// `criteria`) that every backend translates from.
@@ -262,9 +262,16 @@ pub struct DeciderConfig {
     #[serde(default = "default_dialect")]
     pub dialect: String,
     pub url: String,
-    /// The model the app last saw at `url`, for display only.
+    /// The model the app last saw at `url`. For a self-hosted single-model
+    /// server this is display-only; for a hosted gateway or Cloudflare it is
+    /// the model id sent in the request body.
     #[serde(default)]
     pub model: Option<String>,
+    /// Optional bearer token for a hosted endpoint (`systemone-url` dialect).
+    /// Held by Kitty in the OS keychain and passed through on the config PUT;
+    /// empty/absent for a self-hosted endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
     #[serde(default)]
     pub features: Features,
     #[serde(default)]
@@ -302,9 +309,13 @@ pub struct SecondaryDecider {
     #[serde(default = "default_dialect")]
     pub dialect: String,
     pub url: String,
-    /// The model the app last saw at `url`, for display only.
+    /// Display-only for self-hosted; the model id sent in the body for a
+    /// hosted gateway or Cloudflare.
     #[serde(default)]
     pub model: Option<String>,
+    /// Optional bearer token for a hosted endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
 }
 
 fn default_dialect() -> String {
