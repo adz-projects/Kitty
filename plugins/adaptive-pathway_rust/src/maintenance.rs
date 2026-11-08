@@ -23,6 +23,25 @@ const MAINTENANCE_INTERVAL_HOURS: i64 = 24;
 const STALE_CONFIDENCE_PENALTY: f64 = 0.15;
 const STALE_AFTER_DAYS: i64 = 30;
 
+/// Retirement (nightly): a belief this old (by `created_at`, which — unlike
+/// `last_confirmed_at` — the stale penalty never bumps, so it is true age) and
+/// still dead is suppressed as `Outdated`, i.e. dropped from recall for 90 days
+/// but not destroyed; genuine new evidence re-earns it, and the suppression
+/// simply re-applies next pass if it stays dead. Longer than the 30-day
+/// re-evaluation window so a belief gets a full penalty-and-retest cycle first.
+const RETIRE_AFTER_DAYS: i64 = 60;
+/// A **tested** belief is dead when stale re-evaluation has driven its
+/// confidence to/under this — it went stale and no new evidence brought it
+/// back across the cycles it took to decay here. Above the untested-pattern
+/// ceiling so a merely-unconfirmed belief isn't caught by the tested branch.
+const RETIRE_CONFIDENCE_FLOOR: f64 = 0.35;
+/// An **untested** belief (the stale-decay pass deliberately never touches
+/// these, so they never reach the confidence floor) is dead when it is this
+/// old and still rests on a single uncorroborated observation — an ancient
+/// one-off guess. A belief seen in ≥2 observations is corroborated and kept
+/// (the relevance gate, not retirement, decides whether it injects).
+const RETIRE_MAX_SUPPORT_UNTESTED: i64 = 1;
+
 /// How long routine `consolidate`/`maintenance` audit rows are kept.
 const HOUSEKEEPING_AUDIT_DAYS: i64 = 30;
 
@@ -44,6 +63,7 @@ pub async fn run_maintenance(db: &Db) -> Result<()> {
     }
 
     reevaluate_stale_beliefs(db, now).await?;
+    retire_dead_beliefs(db, now).await?;
     if let Err(e) = db.prune_housekeeping_audit(HOUSEKEEPING_AUDIT_DAYS).await {
         tracing::warn!("pathway: audit pruning failed: {e}");
     }
@@ -125,6 +145,54 @@ async fn reevaluate_stale_beliefs(db: &Db, now: chrono::DateTime<Utc>) -> Result
     Ok(())
 }
 
+/// Retirement: drop genuinely-dead beliefs from recall (as `Outdated`, so they
+/// are suppressed for 90 days rather than destroyed — reversible, re-earnable).
+/// Complements the stale-decay pass: decay lowers a belief's *weight*, but a
+/// decayed or ancient belief still sits in the recall candidate pool and, on a
+/// small store, still injects. Retirement removes it from the pool.
+///
+/// Conservative and pinned/identity-exempt (pinned is explicit user intent;
+/// identity beliefs are the slowest-moving layer and protected). A belief is
+/// retired only when it is old by true age (`created_at`) **and** dead:
+/// * **tested** → confidence has decayed to/under `RETIRE_CONFIDENCE_FLOOR`
+///   (it went stale and never recovered), or
+/// * **untested** → it still rests on a single uncorroborated observation
+///   (`support_count ≤ RETIRE_MAX_SUPPORT_UNTESTED`).
+///
+/// Already-suppressed beliefs are skipped so a nightly re-run doesn't pile up
+/// duplicate suppression rows. Best-effort per belief: one failed retirement
+/// never aborts the pass.
+async fn retire_dead_beliefs(db: &Db, now: chrono::DateTime<Utc>) -> Result<()> {
+    for b in db.list_beliefs(None).await? {
+        if b.pinned || b.layer == crate::store::beliefs::Layer::Identity {
+            continue;
+        }
+        if (now - b.created_at).num_days() < RETIRE_AFTER_DAYS {
+            continue;
+        }
+        let dead = if b.tested {
+            b.confidence <= RETIRE_CONFIDENCE_FLOOR
+        } else {
+            b.support_count <= RETIRE_MAX_SUPPORT_UNTESTED
+        };
+        if !dead {
+            continue;
+        }
+        // Don't re-suppress a belief already dropped from recall.
+        let text_hash = crate::belief::synthesis::text_hash(&b.text);
+        if db.is_text_suppressed(&text_hash, now).await.unwrap_or(false) {
+            continue;
+        }
+        match db.forget_belief_by_id(&b.id, crate::store::suppressions::SuppressReason::Outdated).await {
+            Ok(_) => {
+                let _ = db.audit("retire", Some(&format!("outdated(90d): {}", b.text))).await;
+            }
+            Err(e) => tracing::warn!("pathway: retire of belief {} failed: {e}", b.id),
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -199,6 +267,99 @@ mod tests {
         let after = db.get_belief("untested").await.unwrap().unwrap();
         assert!((after.confidence - 0.70).abs() < 1e-9);
         assert!(db.get_assumption_for_belief("untested").await.unwrap().is_none());
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn mk(
+        id: &str,
+        tested: bool,
+        confidence: f64,
+        created_days_ago: i64,
+        support_count: i64,
+        pinned: bool,
+        layer: Layer,
+    ) -> Belief {
+        let now = Utc::now();
+        let created = now - chrono::Duration::days(created_days_ago);
+        Belief {
+            id: id.into(),
+            text: format!("belief {id}"),
+            embedding: vec![1.0, 0.0],
+            confidence,
+            provenance: Provenance::SingleObservation,
+            layer,
+            tested,
+            domain: None,
+            tier: "context".into(),
+            support_count,
+            distinct_sessions: 1,
+            contradict_count: 0,
+            pinned,
+            last_confirmed_at: Some(created),
+            consolidated_at: None,
+            created_at: created,
+            updated_at: created,
+            session_id: None,
+            embedding_model: crate::config::DEFAULT_EMBEDDING_MODEL.into(),
+        }
+    }
+
+    async fn is_retired(db: &Db, text: &str) -> bool {
+        let h = crate::belief::synthesis::text_hash(text);
+        db.is_text_suppressed(&h, Utc::now()).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn retires_old_dead_beliefs_but_spares_live_ones() {
+        let db = Db::open_in_memory().await.unwrap();
+        // tested + decayed + old  -> retired
+        let decayed = mk("decayed", true, 0.30, 61, 2, false, Layer::Context);
+        // untested + single-observation + old -> retired
+        let one_off = mk("oneoff", false, 0.70, 61, 1, false, Layer::Context);
+        // untested but corroborated (support 2) -> kept
+        let corroborated = mk("corrob", false, 0.70, 61, 2, false, Layer::Context);
+        // old + dead but PINNED -> kept
+        let pinned = mk("pinned", true, 0.10, 61, 1, true, Layer::Context);
+        // old + dead but IDENTITY -> kept
+        let identity = mk("ident", true, 0.10, 61, 1, false, Layer::Identity);
+        // young (dead on paper, but not old enough) -> kept
+        let young = mk("young", true, 0.10, 10, 1, false, Layer::Context);
+        for b in [&decayed, &one_off, &corroborated, &pinned, &identity, &young] {
+            db.insert_belief(b).await.unwrap();
+        }
+
+        run_maintenance(&db).await.unwrap();
+
+        assert!(is_retired(&db, &decayed.text).await, "old decayed tested belief is retired");
+        assert!(is_retired(&db, &one_off.text).await, "old uncorroborated untested belief is retired");
+        assert!(!is_retired(&db, &corroborated.text).await, "corroborated untested belief is kept");
+        assert!(!is_retired(&db, &pinned.text).await, "pinned belief is never retired");
+        assert!(!is_retired(&db, &identity.text).await, "identity belief is never retired");
+        assert!(!is_retired(&db, &young.text).await, "a belief younger than the horizon is kept");
+    }
+
+    #[tokio::test]
+    async fn retirement_is_idempotent_across_passes() {
+        let db = Db::open_in_memory().await.unwrap();
+        let dead = mk("dead", false, 0.70, 61, 1, false, Layer::Context);
+        db.insert_belief(&dead).await.unwrap();
+
+        run_maintenance(&db).await.unwrap();
+        assert!(is_retired(&db, &dead.text).await);
+        let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM suppressions")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+
+        // Force the nightly gate open again and re-run: must not stack a
+        // second suppression row for the already-retired belief.
+        db.set_setting(LAST_MAINTENANCE_KEY, "0").await.unwrap();
+        run_maintenance(&db).await.unwrap();
+        let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM suppressions")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(before, after, "an already-suppressed belief is not re-suppressed");
     }
 
     #[tokio::test]

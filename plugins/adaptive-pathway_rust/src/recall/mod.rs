@@ -115,25 +115,67 @@ pub struct Relevance {
     pub drop_below: f32,
 }
 
-/// `(index, belief, effective_weight, blended_score)` for every candidate.
+/// Component-wise mean of the candidate embeddings — the corpus mean removed
+/// before the centered-cosine relevance gate (`RecallConfig`). `None` when
+/// there are no non-empty embeddings to average.
+fn corpus_mean(candidates: &[Belief]) -> Option<Vec<f32>> {
+    let dim = candidates.iter().map(|b| b.embedding.len()).find(|&n| n > 0)?;
+    let mut sum = vec![0.0f64; dim];
+    let mut n = 0usize;
+    for b in candidates {
+        if b.embedding.len() != dim {
+            continue;
+        }
+        for (s, &x) in sum.iter_mut().zip(b.embedding.iter()) {
+            *s += x as f64;
+        }
+        n += 1;
+    }
+    if n == 0 {
+        return None;
+    }
+    Some(sum.iter().map(|s| (s / n as f64) as f32).collect())
+}
+
+/// Elementwise `a - b` (the centering step); a shorter `b` leaves the tail of
+/// `a` unchanged.
+fn sub(a: &[f32], b: &[f32]) -> Vec<f32> {
+    a.iter()
+        .enumerate()
+        .map(|(i, &x)| x - b.get(i).copied().unwrap_or(0.0))
+        .collect()
+}
+
+/// `(index, belief, effective_weight, blended_score, centered_relevance)` for
+/// every candidate. `centered_relevance` is the mean-centered cosine of the
+/// query against the belief (0.0 when there is no query); it drives the
+/// relevance floor in [`select_beliefs_relevant_with`]. The blended *score*
+/// (the DPP/ordering weight) folds in only the non-negative part, so an
+/// irrelevant belief can be dropped by the floor without ever producing a
+/// non-positive DPP weight.
 fn blended<'a>(
     candidates: &'a [Belief],
     query: &[f32],
     query_domain: Option<&str>,
-) -> Vec<(usize, &'a Belief, f64, f64)> {
+) -> Vec<(usize, &'a Belief, f64, f64, f64)> {
     let now = Utc::now();
     let has_query = ops::norm(query) > 1e-12;
+    let mean = if has_query { corpus_mean(candidates) } else { None };
+    let qc = mean.as_ref().map(|m| sub(query, m));
     candidates
         .iter()
         .enumerate()
         .map(|(i, b)| {
             let w = effective_weight(b, query_domain, now);
-            let rel = if has_query {
-                ops::cosine(query, &b.embedding).max(0.0)
-            } else {
-                0.0
+            // Mean-centered cosine so relevance has real dynamic range in a
+            // space where raw cosine is compressed near 1 (see `RecallConfig`).
+            let rel = match (&qc, &mean) {
+                (Some(qc), Some(m)) if m.len() == b.embedding.len() => {
+                    ops::cosine(qc, &sub(&b.embedding, m))
+                }
+                _ => 0.0,
             };
-            (i, b, w, w * (0.5 + 0.5 * rel))
+            (i, b, w, w * (0.5 + 0.5 * rel.clamp(0.0, 1.0)), rel)
         })
         .collect()
 }
@@ -142,13 +184,13 @@ fn blended<'a>(
 /// selection starts from -- the ones worth asking a judge about.
 pub fn preselect(candidates: &[Belief], query: &[f32], query_domain: Option<&str>, n: usize) -> Vec<usize> {
     let mut cand = blended(candidates, query, query_domain);
-    cand.retain(|(_, _, w, _)| *w > 0.0);
+    cand.retain(|(_, _, w, _, _)| *w > 0.0);
     cand.sort_by(|a, b| {
         b.3.partial_cmp(&a.3)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.0.cmp(&b.0))
     });
-    cand.into_iter().take(n).map(|(i, _, _, _)| i).collect()
+    cand.into_iter().take(n).map(|(i, _, _, _, _)| i).collect()
 }
 
 /// [`select_beliefs_relevant`] with an optional judge's relevance folded into
@@ -164,18 +206,79 @@ pub fn select_beliefs_relevant_with(
     relevance: Option<&Relevance>,
     cfg: &Config,
 ) -> Vec<SelectedBelief> {
+    select_beliefs_relevant_with_cut(candidates, query, query_domain, cooccurrence, relevance, cfg).0
+}
+
+/// [`select_beliefs_relevant_with`] that also returns this turn's **effective
+/// cut**: the lowest centered relevance among the general (non-pinned,
+/// non-identity) beliefs that survived the floor + per-query gap cut, or `None`
+/// when none did. The async caller (`engine::select_for_turn`) folds it into
+/// the running EWMA that raises the operational floor over time. Pure and
+/// synchronously testable; the EWMA read/write stays in the engine.
+pub fn select_beliefs_relevant_with_cut(
+    candidates: &[Belief],
+    query: &[f32],
+    query_domain: Option<&str>,
+    cooccurrence: &[Vec<usize>],
+    relevance: Option<&Relevance>,
+    cfg: &Config,
+) -> (Vec<SelectedBelief>, Option<f64>) {
     if candidates.is_empty() {
-        return vec![];
+        return (vec![], None);
     }
 
-    // (idx, belief, effective_weight, blended_score)
+    // (idx, belief, effective_weight, blended_score, centered_relevance)
     let mut cand = blended(candidates, query, query_domain);
+    let mut effective_cut: Option<f64> = None;
+
+    // Deterministic centered-cosine relevance gate (`RecallConfig`), applied
+    // every turn regardless of the optional LLM judge below. With a query
+    // present, drop beliefs whose centered relevance is under the floor;
+    // pinned beliefs are exempt and identity beliefs use the gentler identity
+    // floor (so a stale profile belief no longer injects on an unrelated
+    // turn). An empty query has no cosine, so the gate is a no-op there —
+    // `select_beliefs` stays weight-only.
+    if ops::norm(query) > 1e-12 {
+        let floor = cfg.recall.min_cosine;
+        let floor_identity = cfg.recall.min_cosine_identity;
+        let is_identity = |b: &Belief| b.layer == crate::store::beliefs::Layer::Identity;
+        cand.retain(|(_, b, _, _, rel)| {
+            b.pinned
+                || if is_identity(b) {
+                    *rel >= floor_identity
+                } else {
+                    *rel >= floor
+                }
+        });
+
+        // Per-query gap cut over the general (non-exempt) survivors: keep only
+        // the top relevance cluster for this turn, dropping a weak tail that
+        // cleared the flat floor but sits well below what the query actually
+        // matched. Pinned and identity beliefs are exempt, exactly like the
+        // floor. The cut point is this turn's EWMA observation.
+        let mut general_rels: Vec<f64> = cand
+            .iter()
+            .filter(|(_, b, _, _, _)| !b.pinned && !is_identity(b))
+            .map(|(_, _, _, _, rel)| *rel)
+            .collect();
+        if let Some(threshold) = gap_threshold(&mut general_rels, cfg.recall.gap_min) {
+            cand.retain(|(_, b, _, _, rel)| b.pinned || is_identity(b) || *rel >= threshold);
+        }
+        // Effective cut = lowest general relevance that survived (for the EWMA).
+        let lowest = cand
+            .iter()
+            .filter(|(_, b, _, _, _)| !b.pinned && !is_identity(b))
+            .map(|(_, _, _, _, rel)| *rel)
+            .fold(f64::INFINITY, f64::min);
+        effective_cut = lowest.is_finite().then_some(lowest);
+    }
+
     if let Some(r) = relevance {
-        cand.retain(|(i, b, _, _)| {
+        cand.retain(|(i, b, _, _, _)| {
             b.layer == crate::store::beliefs::Layer::Identity
                 || r.by_index.get(i).is_none_or(|p| *p >= r.drop_below)
         });
-        for (i, _, _, s) in cand.iter_mut() {
+        for (i, _, _, s, _) in cand.iter_mut() {
             if let Some(p) = r.by_index.get(i) {
                 *s *= 0.3 + 0.7 * f64::from(*p);
             }
@@ -197,19 +300,19 @@ pub fn select_beliefs_relevant_with(
     // drives selection (an empty query scales all scores uniformly, which does
     // not change DPP selection, so `select_beliefs` is unaffected). The true
     // effective weight is reported on `SelectedBelief`.
-    let alive: Vec<(usize, &Belief, f64, f64)> = cand
+    let alive: Vec<(usize, &Belief, f64, f64, f64)> = cand
         .into_iter()
-        .filter(|(_, _, w, _)| *w > 0.0)
+        .filter(|(_, _, w, _, _)| *w > 0.0)
         .collect();
     if alive.is_empty() {
-        return vec![];
+        return (vec![], effective_cut);
     }
 
-    let scores: Vec<f64> = alive.iter().map(|(_, _, _, s)| *s).collect();
+    let scores: Vec<f64> = alive.iter().map(|(_, _, _, s, _)| *s).collect();
 
     // Normalized once, reused for both the diffusion graph and the DPP
     // kernel (previously cloned+renormalized separately for each).
-    let mut normed: Vec<Vec<f32>> = alive.iter().map(|(_, b, _, _)| b.embedding.clone()).collect();
+    let mut normed: Vec<Vec<f32>> = alive.iter().map(|(_, b, _, _, _)| b.embedding.clone()).collect();
     for e in normed.iter_mut() {
         ops::normalize_in_place(e);
     }
@@ -222,12 +325,12 @@ pub fn select_beliefs_relevant_with(
         Vec::new()
     } else {
         let mut position_of = std::collections::HashMap::with_capacity(alive.len());
-        for (pos, (orig, _, _, _)) in alive.iter().enumerate() {
+        for (pos, (orig, _, _, _, _)) in alive.iter().enumerate() {
             position_of.insert(*orig, pos);
         }
         alive
             .iter()
-            .map(|(orig, _, _, _)| {
+            .map(|(orig, _, _, _, _)| {
                 cooccurrence
                     .get(*orig)
                     .map(|siblings| {
@@ -265,7 +368,7 @@ pub fn select_beliefs_relevant_with(
     let identity_positions: Vec<usize> = alive
         .iter()
         .enumerate()
-        .filter(|(_, (_, b, _, _))| b.layer == crate::store::beliefs::Layer::Identity)
+        .filter(|(_, (_, b, _, _, _))| b.layer == crate::store::beliefs::Layer::Identity)
         .map(|(pos, _)| pos)
         .collect();
 
@@ -285,13 +388,42 @@ pub fn select_beliefs_relevant_with(
     };
     idx.truncate(MAX_BELIEFS);
 
-    idx.into_iter()
+    let selected = idx
+        .into_iter()
         .filter_map(|k| alive.get(k))
-        .map(|(_, b, w, _)| SelectedBelief {
+        .map(|(_, b, w, _, _)| SelectedBelief {
             belief: (*b).clone(),
             effective_weight: *w,
         })
-        .collect()
+        .collect();
+    (selected, effective_cut)
+}
+
+/// The per-query gap-cut threshold over centered relevances: sort descending,
+/// find the largest gap between adjacent scores, and when it clears `gap_min`
+/// return the lower edge of the top cluster (keep scores `>=` it). `None` when
+/// there is no significant gap (a tight distribution is kept whole) or fewer
+/// than two scores. Mirrors Memorabilia's `adaptive_cut` gap logic so the two
+/// plugins self-tune the same way.
+fn gap_threshold(rels: &mut [f64], gap_min: f64) -> Option<f64> {
+    if rels.len() < 2 {
+        return None;
+    }
+    rels.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    let mut max_gap = 0.0f64;
+    let mut threshold = None;
+    for w in rels.windows(2) {
+        let gap = w[0] - w[1];
+        if gap > max_gap {
+            max_gap = gap;
+            threshold = Some(w[0]); // keep scores >= the lower edge of the top cluster
+        }
+    }
+    if max_gap >= gap_min {
+        threshold
+    } else {
+        None
+    }
 }
 
 /// `dpp_sample` over a subset of the kernel's items, returning indices in the
@@ -673,5 +805,107 @@ mod tests {
         let ids: Vec<&str> = sel.iter().map(|s| s.belief.id.as_str()).collect();
         let ids2: Vec<&str> = again.iter().map(|s| s.belief.id.as_str()).collect();
         assert_eq!(ids, ids2);
+    }
+
+    #[test]
+    fn centered_floor_drops_the_off_topic_belief() {
+        // Query aligned to axis 0; an axis-1 belief is off topic. Raw cosine
+        // can't separate them once they share a common direction, but after
+        // mean-centering the aligned belief stays and the off-topic one — even
+        // at higher standing weight — is dropped.
+        let e0 = vec![1.0_f32, 0.0, 0.0];
+        let e1 = vec![0.0_f32, 1.0, 0.0];
+        let on = belief("on", "on-axis", 0.7, true, Layer::Context, Some("d"), e0.clone());
+        let off = belief("off", "off-axis", 0.9, true, Layer::Context, Some("d"), e1);
+        let sel = select_beliefs_relevant(&[on, off], &e0, None, &[], &Config::default());
+        let ids: Vec<&str> = sel.iter().map(|s| s.belief.id.as_str()).collect();
+        assert_eq!(ids, vec!["on"], "only the on-topic belief clears the floor");
+    }
+
+    #[test]
+    fn centered_floor_is_a_noop_without_a_query() {
+        // No query => no cosine => the gate must not drop anything (the
+        // `select_beliefs` weight-only path is unchanged).
+        let a = belief("a", "a", 0.7, true, Layer::Context, None, vec![1.0_f32, 0.0]);
+        let b = belief("b", "b", 0.7, true, Layer::Context, None, vec![0.0_f32, 1.0]);
+        assert_eq!(select_beliefs(&[a, b], None, &Config::default()).len(), 2);
+    }
+
+    #[test]
+    fn centered_floor_exempts_pinned() {
+        // A pinned off-axis belief survives the floor; a plain off-axis one at
+        // the same relevance is dropped.
+        let e0 = vec![1.0_f32, 0.0, 0.0];
+        let e1 = vec![0.0_f32, 1.0, 0.0];
+        let mut pinned = belief("pin", "pinned off", 0.7, true, Layer::Context, Some("d"), e1.clone());
+        pinned.pinned = true;
+        let ctx = belief("ctx", "plain off", 0.7, true, Layer::Context, Some("d"), e1);
+        let on = belief("on", "on-axis", 0.7, true, Layer::Context, Some("d"), e0.clone());
+        let sel = select_beliefs_relevant(&[pinned, ctx, on], &e0, None, &[], &Config::default());
+        let ids: std::collections::HashSet<&str> = sel.iter().map(|s| s.belief.id.as_str()).collect();
+        assert!(ids.contains("on"));
+        assert!(ids.contains("pin"), "pinned is exempt from the floor");
+        assert!(!ids.contains("ctx"), "a plain off-axis belief is dropped");
+    }
+
+    #[test]
+    fn gap_threshold_keeps_top_cluster() {
+        // Two tight high scores, a wide gap, then a weak tail.
+        let mut rels = vec![0.02, 0.30, 0.05, 0.28];
+        let t = gap_threshold(&mut rels, 0.08).expect("a significant gap exists");
+        assert!((t - 0.28).abs() < 1e-12, "threshold is the lower edge of the top cluster");
+    }
+
+    #[test]
+    fn gap_threshold_none_for_tight_distribution() {
+        // All adjacent gaps below gap_min → keep everything (no cut).
+        let mut rels = vec![0.30, 0.27, 0.25];
+        assert!(gap_threshold(&mut rels, 0.08).is_none());
+    }
+
+    #[test]
+    fn gap_threshold_none_for_single_score() {
+        let mut rels = vec![0.30];
+        assert!(gap_threshold(&mut rels, 0.08).is_none());
+    }
+
+    #[test]
+    fn centered_gap_cut_drops_the_weak_tail() {
+        // Query on axis 0. One belief squarely on-axis, one partly on-axis
+        // (weak but positive relevance), one off-axis. After centering, the
+        // on-axis belief leads; the partial one trails by a wide gap and is
+        // cut; the off-axis one was already below the floor. Only the strong
+        // match is injected.
+        let e_on = vec![1.0_f32, 0.0, 0.0];
+        let e_weak = vec![0.6_f32, 0.8, 0.0]; // shares the query axis, but mostly elsewhere
+        let e_off = vec![0.0_f32, 1.0, 0.0];
+        let strong = belief("strong", "strong", 0.7, true, Layer::Context, Some("d"), e_on.clone());
+        let weak = belief("weak", "weak", 0.7, true, Layer::Context, Some("d"), e_weak);
+        let off = belief("off", "off", 0.7, true, Layer::Context, Some("d"), e_off);
+        let sel = select_beliefs_relevant(&[strong, weak, off], &e_on, None, &[], &Config::default());
+        let ids: std::collections::HashSet<&str> = sel.iter().map(|s| s.belief.id.as_str()).collect();
+        assert!(ids.contains("strong"), "the strong match is kept");
+        assert!(!ids.contains("off"), "the off-axis belief is below the floor");
+        // The weak partial match is dropped by the gap cut, not the floor.
+        assert!(!ids.contains("weak"), "the weak tail is cut away from the strong cluster");
+    }
+
+    #[test]
+    fn identity_uses_the_gentler_floor() {
+        // With a strict general floor but a permissive identity floor, an
+        // off-axis identity belief is kept while an identical-direction context
+        // belief is dropped.
+        let mut cfg = Config::default();
+        cfg.recall.min_cosine = 0.5;
+        cfg.recall.min_cosine_identity = -2.0; // below any cosine → identity exempt
+        let e0 = vec![1.0_f32, 0.0, 0.0];
+        let e1 = vec![0.0_f32, 1.0, 0.0];
+        let id_off = belief("id", "identity off", 0.7, true, Layer::Identity, Some("d"), e1.clone());
+        let ctx_off = belief("ctx", "context off", 0.7, true, Layer::Context, Some("d"), e1);
+        let on = belief("on", "on-axis", 0.7, true, Layer::Context, Some("d"), e0.clone());
+        let sel = select_beliefs_relevant(&[id_off, ctx_off, on], &e0, None, &[], &cfg);
+        let ids: std::collections::HashSet<&str> = sel.iter().map(|s| s.belief.id.as_str()).collect();
+        assert!(ids.contains("id"), "identity kept under its gentler floor");
+        assert!(!ids.contains("ctx"), "context dropped under the strict floor");
     }
 }

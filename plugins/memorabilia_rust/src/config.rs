@@ -129,6 +129,48 @@ pub struct Config {
     /// (plan §2 / §10.1).
     #[serde(default = "default_activation_prune_threshold")]
     pub activation_prune_threshold: f64,
+    /// Minimum **mean-centered** cosine a seed chunk must reach against the
+    /// query for its proposition to enter recall. Raw EmbeddingGemma cosine
+    /// has almost no dynamic range (unrelated text still scores ~0.8), so a
+    /// raw floor cannot tell relevant from irrelevant; subtracting the corpus
+    /// mean vector first restores it. A chunk clears this only when its
+    /// *deviation from the corpus average* aligns with the query's — i.e. it
+    /// is more like the query than the average memory is. At 0.0 only chunks
+    /// that point the same way as the query survive (off-topic chunks go
+    /// negative and are dropped); raise it to tighten. When the corpus mean is
+    /// unavailable (empty store, lexical-hash space) the floor is skipped so
+    /// recall degrades to its old raw-cosine behavior rather than suppressing
+    /// everything (soft-fail, core principle 9).
+    #[serde(default = "default_recall_min_cosine")]
+    pub recall_min_cosine: f64,
+    /// Minimum centered-cosine gap (between consecutive sorted seed scores)
+    /// that triggers the **per-query gap cut**: after the hard floor, the seed
+    /// hits are sorted by centered relevance and, when the largest gap between
+    /// adjacent scores clears this, everything below that gap is dropped —
+    /// keeping only the top relevance cluster for this specific query. This is
+    /// the parameter-light, self-correcting half of the floor: a query with a
+    /// few clearly-relevant hits and a long weak tail cuts the tail; a query
+    /// whose hits are all tightly clustered keeps them all. Sized against the
+    /// centered range (~[-0.45,+0.30]): 0.08 is a visible separation (~1/9 of
+    /// the span), not sampling noise. Set to a large value (>1.0) to disable
+    /// the gap cut and fall back to the flat floor alone.
+    #[serde(default = "default_recall_gap_min")]
+    pub recall_gap_min: f64,
+    /// Smoothing factor of the running estimate of where real relevance cuts
+    /// land (`recall_cut_ewma::<space>` in `app_settings`), updated once per
+    /// injected turn from that turn's lowest kept centered score. Low (0.1) so
+    /// a single odd turn barely moves it; the estimate tracks the embedding
+    /// space's live separation point over many turns rather than any one query.
+    #[serde(default = "default_recall_ewma_alpha")]
+    pub recall_ewma_alpha: f64,
+    /// How far *below* the running EWMA cut a turn may still admit a hit. The
+    /// operational floor each turn is `max(recall_min_cosine, ewma − slack)`:
+    /// the EWMA raises the floor toward where relevance typically separates,
+    /// and the slack keeps a genuinely-good turn that sits a little under the
+    /// running average from being starved. Never lowers the hard
+    /// `recall_min_cosine`.
+    #[serde(default = "default_recall_ewma_slack")]
+    pub recall_ewma_slack: f64,
     /// Per-hop activation decay γ applied at each Pass 2 hop (plan §10.1);
     /// together with edge weights ≤ 0.8 it keeps accumulated activation in
     /// [0,1].
@@ -295,6 +337,10 @@ impl Default for Config {
             retrieval_seed_chunks: default_retrieval_seed_chunks(),
             retrieval_min_seeds: default_retrieval_min_seeds(),
             activation_prune_threshold: default_activation_prune_threshold(),
+            recall_min_cosine: default_recall_min_cosine(),
+            recall_gap_min: default_recall_gap_min(),
+            recall_ewma_alpha: default_recall_ewma_alpha(),
+            recall_ewma_slack: default_recall_ewma_slack(),
             activation_hop_decay: default_activation_hop_decay(),
             output_token_cap: default_output_token_cap(),
             injection_token_cap: default_injection_token_cap(),
@@ -438,6 +484,29 @@ fn default_retrieval_min_seeds() -> usize {
     3
 }
 fn default_activation_prune_threshold() -> f64 {
+    0.05
+}
+fn default_recall_min_cosine() -> f64 {
+    // Centered cosine (corpus mean removed), not raw cosine. 0.0 = "aligned
+    // with the query at all, after discounting the direction every memory
+    // shares"; conservative on purpose so genuine on-topic recall is never
+    // suppressed, while the off-topic bulk (which centers negative) is cut.
+    // Tune upward (≈0.05–0.10) to inject more selectively.
+    0.0
+}
+fn default_recall_gap_min() -> f64 {
+    // Centered-cosine units. ~1/9 of the typical centered span — a real
+    // break between a relevant cluster and the tail, above sampling jitter.
+    0.08
+}
+fn default_recall_ewma_alpha() -> f64 {
+    // Deliberately slow: the running cut estimate is a property of the
+    // embedding space, not of any one query.
+    0.1
+}
+fn default_recall_ewma_slack() -> f64 {
+    // A turn may reach this far under the running EWMA cut before being
+    // floored; never lowers the hard `recall_min_cosine`.
     0.05
 }
 fn default_activation_hop_decay() -> f64 {

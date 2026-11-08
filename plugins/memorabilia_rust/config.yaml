@@ -52,6 +52,10 @@ retrieval_depth_cap: 3
 retrieval_seed_chunks: 8
 retrieval_min_seeds: 3
 activation_prune_threshold: 0.05
+recall_min_cosine: 0.0        # hard mean-centered cosine floor for seed chunks; raise (~0.05-0.1) to inject more selectively
+recall_gap_min: 0.08          # per-query gap cut: drop the tail below the largest centered-score gap >= this; >1.0 disables
+recall_ewma_alpha: 0.1        # smoothing of the running cut estimate (recall_cut_ewma::<space>); low = slow self-tuning
+recall_ewma_slack: 0.05       # how far below the running EWMA cut a turn may still admit; never lowers recall_min_cosine
 activation_hop_decay: 0.5
 output_token_cap: 1500        # full recall payload / MCP lookup tools
 injection_token_cap: 500      # compact per-turn summary+index injection

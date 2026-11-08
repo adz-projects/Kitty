@@ -235,6 +235,82 @@ impl Db {
         Ok(())
     }
 
+    /// Component-wise mean of every **active** chunk vector in the given
+    /// embedding space — the "corpus mean" removed before the centered-cosine
+    /// relevance gate (`recall_min_cosine`). `None` when the space has no
+    /// active vectors yet. O(N·dim) over the active pool; recall reads a
+    /// cached copy (`Engine::corpus_mean`) rather than calling this per turn.
+    pub async fn corpus_mean_vector(&self, model: &str) -> Result<Option<Vec<f32>>> {
+        let rows: Vec<Vec<u8>> = sqlx::query_scalar(
+            "SELECT cv.embedding
+             FROM chunks_vec AS cv
+             JOIN chunks AS c ON c.chunk_id = cv.chunk_id
+             WHERE c.status = 'active' AND c.embedding_model = ?",
+        )
+        .bind(model)
+        .fetch_all(self.pool())
+        .await?;
+        let mut sum: Vec<f64> = Vec::new();
+        let mut n: usize = 0;
+        for bytes in &rows {
+            let v = decode_embedding(bytes);
+            if v.is_empty() {
+                continue;
+            }
+            if sum.is_empty() {
+                sum = vec![0.0; v.len()];
+            }
+            if v.len() != sum.len() {
+                // Mixed-dim rows in one space should never happen; skip the
+                // outlier rather than corrupt the mean.
+                continue;
+            }
+            for (s, x) in sum.iter_mut().zip(v.iter()) {
+                *s += *x as f64;
+            }
+            n += 1;
+        }
+        if n == 0 {
+            return Ok(None);
+        }
+        Ok(Some(sum.iter().map(|s| (s / n as f64) as f32).collect()))
+    }
+
+    /// Distinct embedding-space tags that currently have active chunks — the
+    /// spaces the maintenance heavy pass refreshes the corpus mean for.
+    pub async fn list_active_embedding_models(&self) -> Result<Vec<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT DISTINCT embedding_model FROM chunks WHERE status = 'active'",
+        )
+        .fetch_all(self.pool())
+        .await?)
+    }
+
+    /// Fetch the stored vectors for the given chunk ids in one query, keyed by
+    /// chunk id (missing ids are simply absent). Used by the recall gate to
+    /// re-score the search hits with centered cosine.
+    pub async fn fetch_vectors(
+        &self,
+        chunk_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, Vec<f32>>> {
+        if chunk_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let placeholders = vec!["?"; chunk_ids.len()].join(", ");
+        let sql = format!(
+            "SELECT chunk_id, embedding FROM chunks_vec WHERE chunk_id IN ({placeholders})"
+        );
+        let mut q = sqlx::query_as::<_, (String, Vec<u8>)>(&sql);
+        for id in chunk_ids {
+            q = q.bind(id);
+        }
+        let rows = q.fetch_all(self.pool()).await?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, bytes)| (id, decode_embedding(&bytes)))
+            .collect())
+    }
+
     /// The Stage 4 extraction watermark: the highest chunk rowid this
     /// worker has ever taken to `extraction_status = 'done'` (plan §3.6,
     /// mirroring the reference's forward-only `last_learned_rowid`

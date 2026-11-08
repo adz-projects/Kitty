@@ -14,6 +14,67 @@ pub struct Config {
     pub diffusion: DiffusionConfig,
     #[serde(default)]
     pub trajectory: TrajectoryConfig,
+    #[serde(default)]
+    pub recall: RecallConfig,
+}
+
+/// The query-relevance gate applied to belief selection every turn.
+///
+/// Raw embedding cosine has almost no dynamic range in this space (unrelated
+/// beliefs still score ~0.8), so the gate works on **mean-centered** cosine:
+/// the corpus mean of the candidate beliefs is subtracted from both the query
+/// and each belief before cosine, which restores the range. A belief is
+/// dropped when its centered relevance falls below the floor, so a turn
+/// injects only beliefs genuinely aligned with the current message instead of
+/// whatever carries the most standing weight. Pinned beliefs are always
+/// exempt; identity beliefs use the gentler `min_cosine_identity`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RecallConfig {
+    /// Centered-cosine floor for ordinary (context/conversation) beliefs. 0.0
+    /// keeps only beliefs that, after discounting the direction every belief
+    /// shares, still point the same way as the query. Raise toward ~0.05–0.1
+    /// to inject more selectively.
+    #[serde(default = "default_recall_min_cosine")]
+    pub min_cosine: f64,
+    /// Gentler floor for `Layer::Identity` beliefs: slow-moving profile facts
+    /// are worth surfacing on a slightly looser match, but no longer wholly
+    /// exempt from relevance (they used to inject unconditionally via the
+    /// reserved slots, which is how a stale identity belief leaked into every
+    /// turn).
+    #[serde(default = "default_recall_min_cosine_identity")]
+    pub min_cosine_identity: f64,
+    /// Minimum centered-cosine gap that triggers the **per-query gap cut**:
+    /// after the floor, the surviving candidates are sorted by centered
+    /// relevance and, when the largest gap between adjacent scores clears this,
+    /// the tail below it is dropped — keeping only the cluster genuinely
+    /// relevant to this turn. Pinned and identity beliefs are exempt (same as
+    /// the floor). Self-correcting per turn with no stored state. Set >1.0 to
+    /// disable.
+    #[serde(default = "default_recall_gap_min")]
+    pub gap_min: f64,
+    /// Smoothing of the running cut estimate (`recall_cut_ewma::<space>` in
+    /// `app_settings`), updated once per injected turn from that turn's lowest
+    /// kept centered score. Low = slow; the estimate is a property of the
+    /// embedding space, not any one query.
+    #[serde(default = "default_recall_ewma_alpha")]
+    pub ewma_alpha: f64,
+    /// How far below the running EWMA cut a turn may still admit a belief. The
+    /// operational floor each turn is `max(min_cosine, ewma − slack)`; never
+    /// lowers the hard `min_cosine`.
+    #[serde(default = "default_recall_ewma_slack")]
+    pub ewma_slack: f64,
+}
+
+impl Default for RecallConfig {
+    fn default() -> Self {
+        Self {
+            min_cosine: default_recall_min_cosine(),
+            min_cosine_identity: default_recall_min_cosine_identity(),
+            gap_min: default_recall_gap_min(),
+            ewma_alpha: default_recall_ewma_alpha(),
+            ewma_slack: default_recall_ewma_slack(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -207,6 +268,7 @@ impl Default for Config {
                 enabled: default_trajectory_enabled(),
                 momentum: default_trajectory_momentum(),
             },
+            recall: RecallConfig::default(),
         }
     }
 }
@@ -331,7 +393,42 @@ fn default_trajectory_enabled() -> bool {
     true
 }
 fn default_trajectory_momentum() -> f64 {
-    0.35
+    // Lowered from 0.35: momentum extrapolates the ranking query off the
+    // current message in the direction of recent drift, which pulls recall
+    // toward whatever the last few turns were about. A gentler nudge still
+    // tracks a genuine topic shift without overshooting a one-off question.
+    0.15
+}
+fn default_recall_min_cosine() -> f64 {
+    // Centered cosine (corpus mean removed), not raw cosine. 0.0 = aligned
+    // with the query at all after discounting the shared direction;
+    // conservative so on-topic recall is never suppressed.
+    0.0
+}
+fn default_recall_min_cosine_identity() -> f64 {
+    // Same bar as the general floor: an identity/profile belief must still be
+    // at least weakly aligned with the query (centered cosine >= 0). The old
+    // -0.05 was effectively a free pass — it let a stale profile belief inject
+    // on essentially any turn via the reserved identity slots, the exact
+    // every-turn leak this closes. Identity still gets its *reserved slots*
+    // (it won't be crowded out when it IS relevant); it just no longer injects
+    // when it is not. Lower it slightly (e.g. -0.02) only to re-soften that.
+    0.0
+}
+fn default_recall_gap_min() -> f64 {
+    // Centered-cosine units; ~1/9 of the typical centered span — a real break
+    // between the relevant cluster and the tail, above sampling jitter.
+    0.08
+}
+fn default_recall_ewma_alpha() -> f64 {
+    // Deliberately slow: the running cut estimate tracks the embedding space,
+    // not any single query.
+    0.1
+}
+fn default_recall_ewma_slack() -> f64 {
+    // A turn may reach this far under the running EWMA cut before being
+    // floored; never lowers the hard `min_cosine`.
+    0.05
 }
 
 #[cfg(test)]

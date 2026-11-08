@@ -104,6 +104,19 @@ impl Engine {
                 Ok(n) => outcome.promoted = n,
                 Err(e) => tracing::warn!("maintenance: promotion failed ({e})"),
             }
+            // Refresh the centered-cosine gate's corpus mean per active space,
+            // so `recall_min_cosine` tracks the pool as it grows/decays rather
+            // than freezing at the first query's snapshot (soft-fail).
+            match self.db.list_active_embedding_models().await {
+                Ok(models) => {
+                    for tag in models {
+                        if let Err(e) = self.refresh_corpus_mean(&tag).await {
+                            tracing::warn!("maintenance: corpus-mean refresh failed for {tag} ({e})");
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!("maintenance: listing embedding spaces failed ({e})"),
+            }
             if let Err(e) = self.db.set_setting("last_maintenance_at", now).await {
                 tracing::warn!("maintenance: could not persist heavy-pass anchor ({e})");
             }

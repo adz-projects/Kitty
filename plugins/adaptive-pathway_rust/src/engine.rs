@@ -314,10 +314,10 @@ impl PathwayEngine {
             return None;
         }
 
-        let query: Vec<f32> = if user_message.trim().is_empty() {
-            Vec::new()
+        let (query, semantic): (Vec<f32>, bool) = if user_message.trim().is_empty() {
+            (Vec::new(), false)
         } else {
-            self.embed.embed(user_message).await
+            self.embed.embed_with_space(user_message).await
         };
         // Momentum-extrapolate toward where the conversation is heading
         // (`TrajectoryConfig`) before using the query for anything --
@@ -330,14 +330,39 @@ impl PathwayEngine {
             .judge_relevance(user_message, &candidates, &predicted_query, query_domain.as_deref())
             .await;
 
-        let selected = crate::recall::select_beliefs_relevant_with(
+        // Self-tuning floor: raise the configured `min_cosine` toward the
+        // running EWMA cut for this embedding space (minus slack), so the floor
+        // tracks where relevance actually separates here. Semantic query only
+        // -- centering a hash-fallback query against semantic beliefs is
+        // meaningless. The shared `Config` is cloned per turn so nothing
+        // global is mutated; cold (no EWMA yet) leaves the hard floor in place.
+        let space = self.cfg.embedding.ollama_model.clone();
+        let mut turn_cfg = self.cfg.clone();
+        if semantic {
+            if let Some(ewma) = self.recall_cut_ewma(&space).await {
+                turn_cfg.recall.min_cosine =
+                    self.cfg.recall.min_cosine.max(ewma - self.cfg.recall.ewma_slack);
+            }
+        }
+
+        let (selected, cut) = crate::recall::select_beliefs_relevant_with_cut(
             &candidates,
             &predicted_query,
             query_domain.as_deref(),
             &cooccurrence,
             relevance.as_ref(),
-            &self.cfg,
+            &turn_cfg,
         );
+
+        // Fold this turn's effective cut into the running EWMA (semantic turns
+        // only). Best-effort -- a settings write must never fail recall.
+        if semantic {
+            if let Some(cut) = cut {
+                if let Err(e) = self.update_recall_cut_ewma(&space, cut).await {
+                    tracing::debug!("pathway: could not update cut EWMA: {e}");
+                }
+            }
+        }
         // Recorded so what recall injected can be read from disk. Prompts
         // aren't stored, so this is the only trace. Best-effort.
         let ids: Vec<String> = selected.iter().map(|s| s.belief.id.clone()).collect();
@@ -349,6 +374,32 @@ impl PathwayEngine {
         } else {
             Some(selected)
         }
+    }
+
+    /// Read the running EWMA cut estimate for this embedding space
+    /// (`recall_cut_ewma::<space>` in `app_settings`); `None` before the first
+    /// injected turn in this space, or on any read error (soft-fail).
+    async fn recall_cut_ewma(&self, space: &str) -> Option<f64> {
+        let key = format!("recall_cut_ewma::{space}");
+        self.db
+            .get_setting(&key)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|s| s.parse::<f64>().ok())
+    }
+
+    /// Fold `cut` (a turn's lowest kept general relevance) into the running
+    /// EWMA with smoothing `recall.ewma_alpha`; seeds it on the first
+    /// observation in this space.
+    async fn update_recall_cut_ewma(&self, space: &str, cut: f64) -> Result<()> {
+        let key = format!("recall_cut_ewma::{space}");
+        let alpha = self.cfg.recall.ewma_alpha;
+        let next = match self.recall_cut_ewma(space).await {
+            Some(prev) => alpha * cut + (1.0 - alpha) * prev,
+            None => cut,
+        };
+        self.db.set_setting(&key, &next.to_string()).await
     }
 
     /// Ask the gate, if there is one, how relevant the strongest candidates are

@@ -243,3 +243,107 @@ async fn recall_is_deterministic() {
     let ids_b: Vec<_> = b.iter().map(|e| &e.item_id).collect();
     assert_eq!(ids_a, ids_b, "ranking must be byte-stable across calls");
 }
+
+// ---------------------------------------------------------------------------
+// Centered-cosine relevance gate (`recall_min_cosine`)
+// ---------------------------------------------------------------------------
+
+/// A deterministic *semantic* embedder (non-hash tag, so the centered-cosine
+/// gate runs — the gate is skipped in the `__lexical_hash__` space). Every
+/// text carries a shared "compressed" mass on the first few axes (mimicking
+/// EmbeddingGemma's narrow cosine band) plus a +1 spike on the axis of
+/// whichever topic keyword it contains, so topic directions are separable only
+/// *after* the corpus mean is removed.
+struct StubEmbedder {
+    dim: usize,
+}
+
+#[async_trait::async_trait]
+impl memorabilia::traits::Embedder for StubEmbedder {
+    async fn embed(&self, text: &str) -> Result<(Vec<f32>, String), String> {
+        let mut v = vec![0.0f32; self.dim];
+        for i in 0..4.min(self.dim) {
+            v[i] = 0.2; // shared direction every memory points along
+        }
+        let axis = if text.contains("alpha") {
+            0
+        } else if text.contains("beta") {
+            1
+        } else if text.contains("gamma") {
+            2
+        } else {
+            3 // "delta" / anything else: an axis no stored doc occupies
+        };
+        if axis < self.dim {
+            v[axis] += 1.0;
+        }
+        Ok((v, "test:semantic".into()))
+    }
+    fn model_tag(&self) -> &str {
+        "test:semantic"
+    }
+}
+
+async fn semantic_engine(cfg: Config) -> Engine {
+    let dim = cfg.embedding_dim;
+    let db = Db::open_in_memory().await.unwrap();
+    db.init_vectors(dim).await.unwrap();
+    let vectors = Arc::new(SqliteVectorIndex::new(db.pool().clone()));
+    Engine::new(
+        cfg,
+        db,
+        Arc::new(MockChat { response: one_claim() }),
+        Arc::new(StubEmbedder { dim }),
+        vectors,
+    )
+}
+
+#[tokio::test]
+async fn centered_gate_excludes_the_off_topic_item() {
+    // Two memories on different topics; a query on one topic must surface only
+    // that one. Raw cosine can't separate them (both share the 0.2 mass); the
+    // centered-cosine floor (default 0.0) keeps the aligned item (centered
+    // cosine +1) and drops the opposed one (centered cosine -1).
+    let engine = semantic_engine(Config::default()).await;
+    engine
+        .ingest(&doc("alpha subject matter recorded here for retrieval testing", "alpha.example"))
+        .await;
+    engine
+        .ingest(&doc("gamma subject matter recorded here for retrieval testing", "gamma.example"))
+        .await;
+    engine.drain_extraction(T0).await;
+
+    let idx = engine.search_index("alpha subject matter", 0, 10).await;
+    assert_eq!(idx.len(), 1, "only the on-topic item should clear the gate");
+    assert!(
+        idx[0].citation.contains("alpha.example"),
+        "the surviving item must be the alpha one; got {:?}",
+        idx.iter().map(|e| &e.citation).collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn centered_gate_injects_nothing_when_nothing_is_relevant() {
+    // A high floor with a query on an axis no stored doc occupies: every
+    // centered cosine falls below the floor, so recall injects nothing and the
+    // prompt is byte-identical to no-memory (core principle 9).
+    let mut cfg = Config::default();
+    cfg.recall_min_cosine = 0.5;
+    let engine = semantic_engine(cfg).await;
+    engine
+        .ingest(&doc("alpha subject matter recorded here for retrieval testing", "alpha.example"))
+        .await;
+    engine
+        .ingest(&doc("gamma subject matter recorded here for retrieval testing", "gamma.example"))
+        .await;
+    engine.drain_extraction(T0).await;
+
+    assert!(
+        engine.recall("delta subject matter recorded here").await.is_none(),
+        "an unrelated query must clear the gate empty-handed"
+    );
+    assert!(engine
+        .search_index("delta subject matter recorded here", 0, 10)
+        .await
+        .is_empty());
+}
