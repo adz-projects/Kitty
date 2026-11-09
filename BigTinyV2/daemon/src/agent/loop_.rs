@@ -379,6 +379,66 @@ async fn drain_structured_answer(
     out
 }
 
+/// This turn's final answer text and the item ids it looked up with
+/// `memorabilia_read_item`: everything after the turn's last user message.
+fn turn_answer_and_lookups(messages: &[Value]) -> (String, Vec<String>) {
+    let start = messages
+        .iter()
+        .rposition(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let mut answer = String::new();
+    let mut looked_up = Vec::new();
+    for m in &messages[start..] {
+        if m.get("role").and_then(|r| r.as_str()) != Some("assistant") {
+            continue;
+        }
+        if let Some(text) = m.get("content").and_then(|c| c.as_str()) {
+            answer.push_str(text);
+            answer.push('\n');
+        }
+        for call in m.get("tool_calls").and_then(|t| t.as_array()).into_iter().flatten() {
+            let f = &call["function"];
+            if !f["name"].as_str().unwrap_or("").ends_with("memorabilia_read_item") {
+                continue;
+            }
+            let args: Value = match &f["arguments"] {
+                Value::String(s) => serde_json::from_str(s).unwrap_or(Value::Null),
+                v => v.clone(),
+            };
+            if let Some(id) = args["item_id"].as_str() {
+                looked_up.push(id.to_string());
+            }
+        }
+    }
+    (answer, looked_up)
+}
+
+#[cfg(test)]
+mod turn_use_tests {
+    use super::turn_answer_and_lookups;
+    use serde_json::json;
+
+    #[test]
+    fn the_turn_answer_and_its_memorabilia_lookups_come_from_after_the_last_user_message() {
+        let messages = vec![
+            json!({"role": "user", "content": "earlier"}),
+            json!({"role": "assistant", "content": "old answer [p_old]"}),
+            json!({"role": "user", "content": "now"}),
+            json!({"role": "assistant", "content": "", "tool_calls": [
+                {"id": "t1", "type": "function", "function": {
+                    "name": "memorabilia__memorabilia_read_item",
+                    "arguments": "{\"item_id\": \"p_abc\"}"}}
+            ]}),
+            json!({"role": "tool", "tool_call_id": "t1", "content": "..."}),
+            json!({"role": "assistant", "content": "final answer"}),
+        ];
+        let (answer, looked_up) = turn_answer_and_lookups(&messages);
+        assert!(answer.contains("final answer") && !answer.contains("old answer"));
+        assert_eq!(looked_up, vec!["p_abc".to_string()]);
+    }
+}
+
 /// Attach what the persisted row should record about an assistant message --
 /// its reasoning and who actually produced it -- under `_`-prefixed keys,
 /// which `ContextBuilder::save_messages` reads and
@@ -1442,6 +1502,10 @@ pub struct AgentLoop {
     /// whose hidden tool was called anyway) and at each step (a group loaded
     /// mid-turn joins the tool list from the next model call).
     gate: Option<Arc<TurnGate>>,
+    /// What Memorabilia showed this turn (`(query_event_id, item_ids)`), set
+    /// at turn start and read at turn end to report which items the model
+    /// used (`Engine::record_use`): reinforcement follows use, not display.
+    memorabilia_shown: Option<(String, Vec<String>)>,
 }
 
 /// One turn's tool gate: the catalog, the ungated tool list it filters, and the
@@ -1546,6 +1610,7 @@ impl AgentLoop {
             hitl_timeout: HITL_APPROVAL_TIMEOUT,
             decider: None,
             gate: None,
+            memorabilia_shown: None,
         }
     }
 
@@ -1777,13 +1842,13 @@ impl AgentLoop {
         let delegate = is_delegate(&metadata);
         let recall = async {
             match &resolved_provider_id {
-                _ if delegate => (None, None),
+                _ if delegate => (None, None, None),
                 Some(pid) => {
                     let model = self.router.resolve_model(pid, model_override);
                     self.pathway_recall(session_id, user_message, pid, &model)
                         .await
                 }
-                None => (None, None),
+                None => (None, None, None),
             }
         };
         // The tool gate asks its question alongside recall, so it adds no
@@ -1804,7 +1869,7 @@ impl AgentLoop {
             )
             .await
         };
-        let ((ap_hints, thought_seed), gate) = tokio::join!(recall, gate);
+        let ((ap_hints, thought_seed, challenge), gate) = tokio::join!(recall, gate);
         if let Some(gate) = gate {
             active_tools = gate.offered();
             self.gate = Some(Arc::new(gate));
@@ -1815,17 +1880,28 @@ impl AgentLoop {
         // same tail `system`-block channel as `ap_hints` (both plugins may be
         // on), so the stable head stays byte-identical and no `build_messages`
         // signature changes. `None`+`None` is still zero prompt delta.
-        let mem_hints = match &resolved_provider_id {
+        self.memorabilia_shown = None;
+        let mem_recalled = match &resolved_provider_id {
             _ if delegate => None,
             Some(_) => self.memorabilia_recall(session_id, user_message).await,
             None => None,
         };
-        let ap_hints = match (ap_hints, mem_hints) {
-            (Some(a), Some(m)) => Some(format!("{a}\n\n{m}")),
-            (Some(a), None) => Some(a),
-            (None, Some(m)) => Some(m),
-            (None, None) => None,
+        let mem_hints = mem_recalled.map(|r| {
+            self.memorabilia_shown = Some((r.query_event_id, r.item_ids));
+            r.text
+        });
+        // The counterpoint channel (`[Worth challenging]`): when Pathway
+        // flagged a stance this turn and Memorabilia holds a documented claim
+        // disputing it, add that claim with its citation, so the other side
+        // is grounded in something the user actually read.
+        let counter = match (&challenge, delegate) {
+            (Some(stance), false) => self.memorabilia_counterpoint(session_id, stance).await,
+            _ => None,
         };
+        let ap_hints = [ap_hints, mem_hints, counter]
+            .into_iter()
+            .flatten()
+            .reduce(|a, b| format!("{a}\n\n{b}"));
 
         // Pre-flight memory recall ("the detour"): best-effort FTS5 lookup
         // over the session's *already-compacted* history, gated by recall
@@ -4227,6 +4303,12 @@ impl AgentLoop {
         };
         let mem_pool = pool.clone();
         let mem_session_id = session_id.to_string();
+        // Which shown items the model used this turn: looked up by id, cited,
+        // or carried into the answer (`Engine::used_items`).
+        let mem_use = self.memorabilia_shown.take().map(|(event, shown)| {
+            let (answer, looked_up) = turn_answer_and_lookups(&messages);
+            (event, shown, answer, looked_up)
+        });
         // Not registered with `track_background`, so the next turn never
         // aborts it. The abort exists to free a single-slot provider, and
         // ingest holds none: it only chunks and embeds locally. An aborted
@@ -4240,6 +4322,12 @@ impl AgentLoop {
             // recall hook and adaptive-pathway's learn gate).
             if engine.is_paused(&mem_session_id).await.unwrap_or(false) {
                 return;
+            }
+            if let Some((event, shown, answer, looked_up)) = mem_use {
+                let used = engine.used_items(&shown, &answer, &looked_up).await;
+                if !used.is_empty() {
+                    engine.record_use(&event, &used).await;
+                }
             }
             crate::agent::memorabilia_harvest::harvest_turn(&engine, &mem_pool, &mem_session_id)
                 .await;
@@ -4279,13 +4367,13 @@ impl AgentLoop {
         user_message: &str,
         provider_id: &str,
         model: &str,
-    ) -> (Option<String>, Option<String>) {
+    ) -> (Option<String>, Option<String>, Option<String>) {
         let engine_owned = match self.app_scope(session_id).await.0 {
             Some(app_id) => self.plugins.pathway_for(&app_id).await,
             None => None,
         };
         let Some(engine) = engine_owned.as_ref() else {
-            return (None, None);
+            return (None, None, None);
         };
         let seed_eligible = self.router.supports_assistant_prefill(provider_id)
             && reasoning_models::supports_reasoning(model);
@@ -4300,12 +4388,13 @@ impl AgentLoop {
         )
         .await
         .ok()
-        .flatten()
-        .map(|t| t.text);
+        .flatten();
+        let challenge = turn.as_ref().and_then(|t| t.challenge.clone());
+        let text = turn.map(|t| t.text);
         if seed_eligible {
-            (None, turn)
+            (None, text, challenge)
         } else {
-            (turn, None)
+            (text, None, challenge)
         }
     }
 
@@ -4331,7 +4420,11 @@ impl AgentLoop {
     /// full on demand through the `memorabilia_read_item` MCP tool. `None`
     /// (zero prompt delta) when memorabilia is off for the app, times out, or
     /// has nothing relevant — byte-identical to no-memory behavior.
-    async fn memorabilia_recall(&self, session_id: &str, user_message: &str) -> Option<String> {
+    async fn memorabilia_recall(
+        &self,
+        session_id: &str,
+        user_message: &str,
+    ) -> Option<memorabilia::recall::Recalled> {
         let engine_owned = match self.app_scope(session_id).await.0 {
             Some(app_id) => self.memorabilia.memorabilia_for(&app_id).await,
             None => None,
@@ -4342,13 +4435,41 @@ impl AgentLoop {
         if engine.is_paused(session_id).await.unwrap_or(false) {
             return None;
         }
-        tokio::time::timeout(
+        // The previous user message steers a follow-up's query (4.6).
+        let previous = self.previous_user_message(session_id).await;
+        let recalled = tokio::time::timeout(
             Duration::from_millis(AP_RECALL_EMBED_BUDGET_MS),
-            engine.recall(user_message),
+            engine.recall_turn(user_message, previous.as_deref()),
         )
         .await
         .ok()
-        .flatten()
+        .flatten()?;
+        Some(recalled)
+    }
+
+    /// A documented counter-view to `stance` from this app's Memorabilia, as
+    /// a block section, or `None` when it holds none (the model then gives
+    /// the other side from its own knowledge, as `[Worth challenging]` asks).
+    async fn memorabilia_counterpoint(&self, session_id: &str, stance: &str) -> Option<String> {
+        let engine_owned = match self.app_scope(session_id).await.0 {
+            Some(app_id) => self.memorabilia.memorabilia_for(&app_id).await,
+            None => None,
+        };
+        let engine = engine_owned.as_ref()?;
+        if engine.is_paused(session_id).await.unwrap_or(false) {
+            return None;
+        }
+        let view = tokio::time::timeout(
+            Duration::from_millis(AP_RECALL_EMBED_BUDGET_MS),
+            engine.counterpoint(stance),
+        )
+        .await
+        .ok()
+        .flatten()?;
+        Some(format!(
+            "[A documented counter-view]\nOn \"{stance}\", something the user read says otherwise: [{}] {} ({}).",
+            view.item_id, view.claim, view.citation
+        ))
     }
 
     /// Pre-flight memory recall hook, mirroring `pathway_recall`'s

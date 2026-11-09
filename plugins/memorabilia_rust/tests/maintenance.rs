@@ -73,8 +73,10 @@ async fn outbox_drain_applies_counters_once_and_is_idempotent() {
     let content = "databases replication shared topic tokens payload";
     engine.ingest(&doc(content, "alpha.example")).await;
     engine.drain_extraction(T0).await;
-    // Recall enqueues grounding + reinforcement for the supporting chunk.
-    engine.recall("databases replication topic").await;
+    // Recall enqueues grounding for the supporting chunk; the model's use of
+    // the item enqueues its reinforcement (4.5).
+    let shown = engine.recall_turn("databases replication topic", None).await.expect("recall injects");
+    engine.record_use(&shown.query_event_id, &shown.item_ids).await;
     assert!(engine.db.outbox_count().await.unwrap() > 0);
 
     // First tick drains and applies the counters.

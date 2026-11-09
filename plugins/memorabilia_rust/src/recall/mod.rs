@@ -168,6 +168,16 @@ pub struct RankedItem {
     pub disputed_by: Option<(String, String)>,
 }
 
+/// One turn's injection ([`Engine::recall_turn`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Recalled {
+    pub text: String,
+    /// Pass back to [`Engine::record_use`] with the items the model used.
+    pub query_event_id: String,
+    /// The items the block showed, in order.
+    pub item_ids: Vec<String>,
+}
+
 /// A documented counter-view for the counterpoint channel
 /// ([`Engine::counterpoint`]).
 #[derive(Debug, Clone, PartialEq)]
@@ -222,8 +232,25 @@ impl Engine {
     /// grounded (and reinforced when undisputed) via the outbox, in one
     /// transaction. A soft failure anywhere logs and yields `None`.
     pub async fn recall(&self, query: &str) -> Option<String> {
-        match self.recall_inner(query).await {
-            Ok(block) => block,
+        self.recall_turn(query, None).await.map(|r| r.text)
+    }
+
+    /// The per-turn injection with what the host needs to report use later:
+    /// the block, the query event id, and the item ids it showed.
+    ///
+    /// `previous` is the chat's previous user message. A follow-up ("what
+    /// about the second one?") says little on its own, so the query vector
+    /// leans on the previous message too (current 0.75, previous 0.25),
+    /// both read from the transcript, so the same turn always queries the
+    /// same way.
+    ///
+    /// Showing items only *grounds* their chunks; it does not reinforce
+    /// them. Reinforcement -- what keeps a chunk from decaying -- comes from
+    /// [`Self::record_use`] once the host knows the model used an item, so
+    /// a claim that is shown every turn but never used still fades.
+    pub async fn recall_turn(&self, query: &str, previous: Option<&str>) -> Option<Recalled> {
+        match self.recall_inner(query, previous).await {
+            Ok(r) => r,
             Err(e) => {
                 tracing::warn!("recall: soft-failed ({e}); injecting nothing");
                 None
@@ -231,21 +258,109 @@ impl Engine {
         }
     }
 
-    async fn recall_inner(&self, query: &str) -> Result<Option<String>> {
-        // The injection path (unlike read-only search) updates the running
-        // EWMA cut estimate, so the self-tuning floor tracks what real turns
-        // actually find relevant.
-        let items = self.ranked_items_persist(query, true).await?;
+    async fn recall_inner(&self, query: &str, previous: Option<&str>) -> Result<Option<Recalled>> {
+        let (mut qvec, tag) = self.embedder.embed(query).await.map_err(crate::error::Error::Embed)?;
+        if let Some(prev) = previous.map(str::trim).filter(|p| !p.is_empty()) {
+            if tag != crate::config::HASH_EMBED_MODEL {
+                if let Ok((pv, ptag)) = self.embedder.embed(prev).await {
+                    if ptag == tag && pv.len() == qvec.len() {
+                        qvec = blend_query(&qvec, &pv);
+                    }
+                }
+            }
+        }
+        // The injection path (unlike read-only search) logs its cut for the
+        // self-tuning floor (`cut_log`).
+        let items = self.ranked_items_from(qvec, tag, true).await?;
         if items.is_empty() {
             return Ok(None);
         }
         let cap = self.config.injection_token_cap;
-        let (block, grounded) = render_index_block(&items, cap);
+        let (block, grounded, shown) = render_index_block(&items, cap);
         if grounded.is_empty() {
             return Ok(None);
         }
-        self.write_grounding(&grounded).await?;
-        Ok(Some(block))
+        let query_event_id = uuid::Uuid::new_v4().to_string();
+        self.write_grounding(&grounded, &query_event_id).await?;
+        Ok(Some(Recalled { text: block, query_event_id, item_ids: shown }))
+    }
+
+    /// Which of the `shown` items the model used this turn: looked up with
+    /// `memorabilia_read_item` (`looked_up`), cited by id in `answer`, or
+    /// carried into `answer` (at least 60% of the claim's content words, four
+    /// letters or more, appear in it). Deterministic and offline.
+    pub async fn used_items(&self, shown: &[String], answer: &str, looked_up: &[String]) -> Vec<String> {
+        let lower = answer.to_lowercase();
+        let words_of = |s: &str| -> Vec<String> {
+            s.to_lowercase()
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|w| w.chars().count() >= 4)
+                .map(str::to_string)
+                .collect()
+        };
+        let answer_words: std::collections::HashSet<String> = words_of(answer).into_iter().collect();
+        let mut used = Vec::new();
+        for id in shown {
+            if looked_up.contains(id) || lower.contains(&id.to_lowercase()) {
+                used.push(id.clone());
+                continue;
+            }
+            let Ok(Some(p)) = self.db.get_proposition(id).await else {
+                continue;
+            };
+            let words = words_of(&p.claim);
+            if words.len() >= 3 {
+                let hits = words.iter().filter(|w| answer_words.contains(*w)).count();
+                if hits * 10 >= words.len() * 6 {
+                    used.push(id.clone());
+                }
+            }
+        }
+        used
+    }
+
+    /// The model used these items from an injection (looked one up, cited
+    /// its id, or its answer carries the claim): reinforce their undisputed
+    /// supporting chunks, which resets their decay clock. Disputed evidence
+    /// is never reinforced. Idempotent per (chunk, event); best-effort.
+    pub async fn record_use(&self, query_event_id: &str, item_ids: &[String]) {
+        if let Err(e) = self.record_use_inner(query_event_id, item_ids).await {
+            tracing::warn!("record_use: soft-failed ({e})");
+        }
+    }
+
+    async fn record_use_inner(&self, query_event_id: &str, item_ids: &[String]) -> Result<()> {
+        let event = format!("{query_event_id}:use");
+        let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let mut rows: Vec<OutboxEntry> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = Default::default();
+        for id in item_ids {
+            for ch in self.db.list_active_supporting_chunks(id).await? {
+                if !seen.insert(ch.chunk_id.clone()) {
+                    continue;
+                }
+                if self.db.max_open_dispute_strength(&ch.chunk_id).await?.is_some()
+                    || self.db.max_open_claim_dispute(id).await?.is_some()
+                {
+                    continue;
+                }
+                rows.push(OutboxEntry {
+                    chunk_id: ch.chunk_id,
+                    query_event_id: event.clone(),
+                    grounded: false,
+                    reinforced: true,
+                    created_at: now.clone(),
+                });
+            }
+        }
+        let db = &self.db;
+        db.run_in_transaction(|| async move {
+            for row in &rows {
+                db.enqueue_outbox(row).await?;
+            }
+            Ok(())
+        })
+        .await
     }
 
     /// The ranked index for `query`, paginated — the `memorabilia_search`
@@ -418,8 +533,18 @@ impl Engine {
         query: &str,
         persist_cut: bool,
     ) -> Result<Vec<RankedItem>> {
-        // Pass 1: seed propositions from a vector search over chunks.
         let (qvec, tag) = self.embedder.embed(query).await.map_err(crate::error::Error::Embed)?;
+        self.ranked_items_from(qvec, tag, persist_cut).await
+    }
+
+    /// [`Self::ranked_items_persist`] from an already-embedded query.
+    pub(crate) async fn ranked_items_from(
+        &self,
+        qvec: Vec<f32>,
+        tag: String,
+        persist_cut: bool,
+    ) -> Result<Vec<RankedItem>> {
+        // Pass 1: seed propositions from a vector search over chunks.
 
         // Corpus mean for the centered-cosine relevance gate (see
         // `recall_min_cosine`). Skipped in the lexical-hash fallback space,
@@ -728,24 +853,24 @@ impl Engine {
     /// grounded exactly once per query event (the `UNIQUE(chunk_id,
     /// query_event_id)` makes it idempotent); a disputed chunk is grounded
     /// but never reinforced.
-    async fn write_grounding(&self, grounded_chunk_ids: &[String]) -> Result<()> {
+    async fn write_grounding(&self, grounded_chunk_ids: &[String], query_event_id: &str) -> Result<()> {
         if grounded_chunk_ids.is_empty() {
             return Ok(());
         }
-        let query_event_id = uuid::Uuid::new_v4().to_string();
+        let query_event_id = query_event_id.to_string();
         // The outbox `created_at` is FIFO bookkeeping for the drain, not decay
         // math (which is anchored on chunks), so the query-event wall clock is
         // the right stamp here — recall takes no caller `now`.
         let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-        // Resolve dispute status outside the transaction (reads only).
+        // Grounding only: being shown is not being used. Reinforcement comes
+        // from `record_use` (4.5).
         let mut rows: Vec<OutboxEntry> = Vec::new();
         for chunk_id in grounded_chunk_ids {
-            let disputed = self.db.max_open_dispute_strength(chunk_id).await?.is_some();
             rows.push(OutboxEntry {
                 chunk_id: chunk_id.clone(),
                 query_event_id: query_event_id.clone(),
                 grounded: true,
-                reinforced: !disputed,
+                reinforced: false,
                 created_at: now.clone(),
             });
         }
@@ -764,7 +889,7 @@ impl Engine {
 /// block and the deduplicated chunk ids that backed the rendered items (the
 /// grounding set). Whole items are kept while they fit; the accounting rounds
 /// up so the cap is never exceeded (plan §10.1, pinned by a test).
-fn render_index_block(items: &[RankedItem], token_cap: usize) -> (String, Vec<String>) {
+fn render_index_block(items: &[RankedItem], token_cap: usize) -> (String, Vec<String>, Vec<String>) {
     let top = &items[0];
     let mut out = String::new();
     // Summary line (deterministic — no LLM in the recall hot path).
@@ -780,6 +905,7 @@ fn render_index_block(items: &[RankedItem], token_cap: usize) -> (String, Vec<St
     );
 
     let mut grounded: Vec<String> = Vec::new();
+    let mut shown: Vec<String> = Vec::new();
     for item in items {
         let disputed = match (&item.disputed_by, item.is_disputed) {
             (Some((id, claim)), _) => format!(" (disputed by [{id}]: {claim})"),
@@ -799,13 +925,25 @@ fn render_index_block(items: &[RankedItem], token_cap: usize) -> (String, Vec<St
             break;
         }
         out.push_str(&line);
+        shown.push(item.item_id.clone());
         for chunk_id in &item.supporting_chunk_ids {
             if !grounded.contains(chunk_id) {
                 grounded.push(chunk_id.clone());
             }
         }
     }
-    (out, grounded)
+    (out, grounded, shown)
+}
+
+/// The follow-up query vector: the current message, leaning a quarter on
+/// the previous one, renormalised.
+fn blend_query(current: &[f32], previous: &[f32]) -> Vec<f32> {
+    let mut v: Vec<f32> = current.iter().zip(previous).map(|(c, p)| 0.75 * c + 0.25 * p).collect();
+    let n: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if n > 0.0 {
+        v.iter_mut().for_each(|x| *x /= n);
+    }
+    v
 }
 
 #[cfg(test)]

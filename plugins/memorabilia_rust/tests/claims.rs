@@ -186,3 +186,26 @@ async fn a_confirmed_paraphrase_supports_the_existing_claim() {
     assert_eq!(e.db.list_active_supporting_chunks(&node(a)).await.unwrap().len(), 2);
     assert!(merged.confidence > single, "two sources corroborate: {} > {single}", merged.confidence);
 }
+
+#[tokio::test]
+async fn use_is_a_lookup_a_citation_or_the_claim_in_the_answer() {
+    let c = "Tern 4.0 replaced its plugin API with a capability-based permission model";
+    let e = engine(Config::default(), vec![("devblog", json!({"propositions": [claim(c)], "relations": []}))]).await;
+    e.ingest(&doc("Tern 4.0 replaced its plugin API with a capability-based permission model.", "devblog")).await;
+    drain(&e).await;
+    let id = node(c);
+    let shown = vec![id.clone()];
+    let used = |answer: &'static str, looked: Vec<String>| {
+        let (e, shown) = (&e, shown.clone());
+        async move { e.used_items(&shown, answer, &looked).await }
+    };
+    assert_eq!(used("Unrelated answer about bread.", vec![]).await, Vec::<String>::new());
+    assert_eq!(used("See [ref] for details.", vec![id.clone()]).await, vec![id.clone()], "a lookup counts");
+    let cited: &'static str = Box::leak(format!("As noted in [{id}], yes.").into_boxed_str());
+    assert_eq!(used(cited, vec![]).await, vec![id.clone()], "a citation counts");
+    assert_eq!(
+        used("In Tern 4.0 the plugin API became a capability-based permission model.", vec![]).await,
+        vec![id.clone()],
+        "carrying the claim into the answer counts"
+    );
+}

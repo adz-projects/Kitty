@@ -207,22 +207,33 @@ async fn recall_grounds_every_chunk_but_reinforces_only_undisputed() {
         .await
         .unwrap();
 
-    engine.recall("databases replication shared topic tokens").await;
+    let shown = engine
+        .recall_turn("databases replication shared topic tokens", None)
+        .await
+        .expect("recall injects");
 
+    // Being shown grounds every rendered chunk (audit) and reinforces none:
+    // reinforcement is for use, not display (4.5).
     let rows = engine.db.next_outbox_batch(100).await.unwrap();
     assert!(!rows.is_empty(), "recall must ground the rendered chunks");
-    // Every rendered chunk is grounded (audit); disputed chunks are grounded
-    // but never reinforced (principle 4).
     for row in &rows {
         assert!(row.grounded, "every payload chunk is grounded");
-        if row.chunk_id == a_id || row.chunk_id == b_id {
-            assert!(!row.reinforced, "a disputed chunk must not be reinforced");
-        }
+        assert!(!row.reinforced, "showing an item does not reinforce it");
     }
+
+    // The model used every shown item: undisputed chunks are reinforced,
+    // disputed ones never (principle 4).
+    engine.record_use(&shown.query_event_id, &shown.item_ids).await;
+    let rows = engine.db.next_outbox_batch(100).await.unwrap();
     let c_id = chunk_id_of(c);
-    let c_row = rows.iter().find(|r| r.chunk_id == c_id);
-    if let Some(c_row) = c_row {
-        assert!(c_row.reinforced, "an undisputed grounded chunk is reinforced");
+    for row in rows.iter().filter(|r| r.reinforced) {
+        assert!(row.chunk_id != a_id && row.chunk_id != b_id, "a disputed chunk must not be reinforced");
+    }
+    if shown.text.contains("gamma") {
+        assert!(
+            rows.iter().any(|r| r.chunk_id == c_id && r.reinforced),
+            "a used, undisputed chunk is reinforced"
+        );
     }
 }
 
