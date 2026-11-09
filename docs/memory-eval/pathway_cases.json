@@ -27,11 +27,11 @@
     {"id": "taper", "message": "How long should I taper before my half marathon?", "expect": ["running"], "forbid": ["rust", "sqlite", "teach_research"]},
     {"id": "starter", "message": "My sourdough starter isn't rising anymore. What's wrong?", "expect": ["bread"], "forbid": ["rust", "teach_research", "tech_ideology", "running"]},
     {"id": "tomato_blight", "message": "There are brown spots on my tomato leaves. Is it blight?", "expect": ["garden"], "forbid": ["rust", "sqlite", "tech_ideology"]},
-    {"id": "chatgpt_homework", "message": "Summarise the research on whether students who use ChatGPT for homework end up learning less.", "expect": ["teach_research", "cites"], "forbid": ["bread", "running", "garden", "sqlite"], "expect_sections": ["[Worth challenging]"]},
+    {"id": "chatgpt_homework", "message": "Summarise the research on whether students who use ChatGPT for homework end up learning less.", "expect": ["teach_research", "cites"], "forbid": ["bread", "running", "garden", "sqlite"]},
     {"id": "ai_tutor_pitch", "message": "A district wants to roll out an AI tutor in every classroom next year. What should they watch out for?", "expect": ["teach_research", "ai_tutor_skeptic"], "forbid": ["bread", "running", "sqlite"], "expect_sections": ["[Worth challenging]"]},
     {"id": "kids_math", "message": "How can I help my children with maths homework without just giving them the answers?", "expect": ["kids"], "forbid": ["rust", "running", "sqlite"]},
     {"id": "productive_struggle", "message": "Is there evidence that struggling with a problem before getting help improves retention?", "expect": ["teach_research"], "forbid": ["bread", "running", "garden"]},
-    {"id": "californian_ideology", "message": "Is the Californian ideology still a useful lens for understanding Silicon Valley in 2026?", "expect": ["tech_ideology"], "forbid": ["bread", "running", "sqlite", "garden"], "expect_sections": ["[Worth challenging]"]},
+    {"id": "californian_ideology", "message": "Is the Californian ideology still a useful lens for understanding Silicon Valley in 2026?", "expect": ["tech_ideology"], "forbid": ["bread", "running", "sqlite", "garden"]},
     {"id": "ai_lab_politics", "message": "Why do AI labs lobby for regulation that would mostly burden their smaller competitors?", "expect": ["tech_ideology", "big_tech_distrust"], "forbid": ["bread", "running", "kids"], "expect_sections": ["[Worth challenging]"]},
     {"id": "cloud_vs_local", "message": "Should my app store user embeddings on a server or on the device?", "expect": ["local_first"], "forbid": ["bread", "running", "kids"], "expect_sections": ["[Worth challenging]"]},
     {"id": "sync_feature", "message": "Users are asking for cross-device sync of their chat history. How should I design it?", "expect": ["local_first"], "forbid": ["bread", "running", "garden"]},
@@ -48,6 +48,6 @@
     {"id": "marathon_fuel", "message": "Should I use energy gels during long training runs?", "expect": ["running"], "forbid": ["rust", "sqlite", "tech_ideology"]},
     {"id": "sqlite_wal", "message": "When should I turn on WAL mode in SQLite?", "expect": ["sqlite"], "forbid": ["bread", "running", "kids"]},
     {"id": "teacher_feedback", "message": "I'm drafting a survey for teachers about how their students use AI. What questions should I ask?", "expect": ["teach_research"], "forbid": ["bread", "running", "sqlite"]},
-    {"id": "ideology_essay", "message": "Help me outline an essay on how techno-optimism shapes AI company messaging.", "expect": ["tech_ideology"], "forbid": ["bread", "running", "kids", "garden"], "expect_sections": ["[Worth challenging]"]}
+    {"id": "ideology_essay", "message": "Help me outline an essay on how techno-optimism shapes AI company messaging.", "expect": ["tech_ideology"], "forbid": ["bread", "running", "kids", "garden"]}
   ]
 }

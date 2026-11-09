@@ -104,7 +104,13 @@ binaries still match their source (CI runs it). Full detail in
   from conversation, decays and consolidates them, and injects a DPP-selected
   handful per turn — framed as working assumptions to check the request
   against, never a profile to conform to (see `docs/VERSIONS.md`'s
-  recall-framing contract). Its `record`/`forget` tools reach the model through
+  recall-framing contract). Beliefs have a kind (preference, stance, context,
+  trait) and typed links; open tensions are shown rather than hidden, the top
+  stance can draw a `[Worth challenging]` counterpoint (grounded by
+  Memorabilia when it holds a disputing claim), and a surfaced assumption is
+  judged by the next extraction pass. The block is stored on the user message
+  and re-emitted in place, so the prompt prefix stays cached
+  (`BigTinyV2/prompt_determinism.md`). Its `record`/`forget` tools reach the model through
   the engine's in-process MCP registry. Settings: belief browser, Graph
   Health, Erase all; per-chat incognito in the chat's ⋯ menu.
 - **`memorabilia_rust`** — the factual-memory engine, also linked in. Learns
@@ -116,7 +122,11 @@ binaries still match their source (CI runs it). Full detail in
   configuration, not code; only kept paragraphs are buffered. In the
   overnight window (default 00:00–05:00, optionally waking the PC) they are
   chunked, embedded, and promoted into memory only when their topic recurs
-  (two chats, or one plus repeated similar searches). On desktop,
+  (two chats, or one plus repeated similar searches). Intake has two lanes,
+  current developments and durable insight; claims keep who asserts them,
+  merge across paraphrases, can dispute or supersede one another, are
+  reinforced only when a turn actually uses them, and are linked by analogy
+  overnight for indirect recall. On desktop,
   adaptive-pathway's learning moves into the window too.
 
   Both memory engines run only when the embedding model is on disk **and** the

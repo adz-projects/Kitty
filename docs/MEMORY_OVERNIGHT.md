@@ -61,17 +61,27 @@ reason in the screen log (below).
 ### 2. The d1 paragraph screen
 
 The decision model is asked, per paragraph, the questions in the app's
-**question set**. Each question is a yes/no with its own keep threshold; a
-paragraph is kept only if **every** question clears its threshold. The state
-the model sees is the paragraph prefixed by the document's title, source and
-section heading, so "it was rebuilt in 1987" can be judged.
+**question set**. Each question is a yes/no with its own keep threshold, and
+may belong to an intake **lane**. A paragraph is kept when the shared
+questions (no lane) and every question of at least one lane clear their
+thresholds; the first such lane is the lane that kept it. A set without lanes
+keeps a paragraph only when every question passes. The state the model sees is
+the paragraph prefixed by the document's title, source and section heading, so
+"it was rebuilt in 1987" can be judged.
 
-The default set (uncalibrated starting point):
+The default set, `two-lane-v1` (uncalibrated starting point):
 
-| name | asks | keep at P(yes) ≥ |
-|---|---|---|
-| `durable` | Will this passage still be informative in a few years, after the specific products, prices, people or events it mentions are no longer current? Yes for explanations of how or why things work, lasting history, definitions and durable relationships; no for specs, prices, release dates, rankings, schedules, status updates and announcements. | 0.60 |
-| `substantive` | Is this passage substantive and well supported — concrete claims, mechanisms, evidence or reasoned argument — rather than marketing copy, filler, unsupported speculation or vague generalities? | 0.60 |
+| name | lane | asks | keep at P(yes) ≥ |
+|---|---|---|---|
+| `current` | current | Does this passage report something recent that a well-read model trained a year ago would probably not know (a release, decision, change of status, new figure, event or announcement), stated concretely? | 0.60 |
+| `durable` | durable | Will this passage still be informative in a few years, after the specific products, prices, people or events it mentions are no longer current? Yes for explanations of how or why things work, lasting history, definitions, durable relationships and reasoned arguments or interpretations; no for specs, prices, schedules and status updates. | 0.60 |
+| `substantive` | (shared) | Is this passage substantive and well supported — concrete claims, mechanisms, evidence or reasoned argument — rather than marketing copy, filler, unsupported speculation or vague generalities? | 0.60 |
+
+Why two lanes: the previous default (`durable-substantive-v1`) kept only
+lasting material and so rejected exactly what brings a model up to date. A
+document is `current` when any of its kept paragraphs came in through that
+lane; its chunks are never filed as `static`, so they decay at the transient
+rate and can be superseded (`proposition_relations`).
 
 "Well supported" rather than "factual" on purpose: a 3B classifier cannot check
 truth, and "factual" rejects reasoned argument — the failure that once made d1
@@ -118,14 +128,30 @@ score:
 A cluster **promotes at 2**: two chats, or one chat plus two later similar
 searches. Several queries the model fans out within one turn count once — the
 signal is the user returning to a topic, not the model's search breadth.
-Promotion writes the cluster's **two most central candidates** into the memory
-store as pending chunks; the rest of the cluster is marked merged. Extraction
-therefore runs once per cluster, not once per chunk of every document.
+Promotion writes **one candidate per distinct source** (most central first, up
+to four, at least two) into the memory store as pending chunks; the rest of the
+cluster is marked merged. Extraction therefore runs a few times per cluster,
+not once per chunk of every document, and independent sources survive to
+corroborate each other. Each pass reports `clusters_seen` and
+`largest_cluster`, and logs a size histogram, to check that the raw-cosine
+threshold does not chain unrelated topics together.
 
 Candidates that never promote expire after 30 days, unextracted — their only
 cost was an embedding.
 
-### 5. Adaptive-pathway
+### 5. Analogy edges
+
+After extraction, each new claim gets a one-sentence **abstraction**: the
+general principle it is an instance of, with its names, places and dates
+removed. Claims whose abstractions are close (`analogy_abstract_min`) while
+their literal claims are not (`analogy_claim_max`), from different sources,
+are analogy candidates; the extraction model confirms each pair with a
+one-line reason, and confirmed pairs get `RHYMES_WITH` edges. Recall's
+spreading activation follows them from a direct hit, and the index shows up to
+two such items under "Related by analogy", with the reason. Bounded per pass
+(`analogy_claims_per_pass`, `analogy_pairs_per_pass`).
+
+### 6. Adaptive-pathway
 
 On desktop, with overnight learning on for the app, the turn-end hook keeps its
 bookkeeping (the exchange counter the `[Where I'm unsure]` cadence reads) but

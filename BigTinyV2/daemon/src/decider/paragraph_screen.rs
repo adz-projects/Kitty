@@ -598,8 +598,7 @@ mod tests {
         assert!(s.validate().is_err());
         let s = ParagraphScreenConfig { id: "x".into(), questions: vec![], batch_size: 1 };
         assert!(s.validate().is_err());
-        let mut s = ParagraphScreenConfig::default();
-        s.batch_size = 0;
+        let s = ParagraphScreenConfig { batch_size: 0, ..Default::default() };
         assert!(s.validate().is_err(), "batch_size must be >= 1");
     }
 

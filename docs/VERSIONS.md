@@ -304,6 +304,20 @@ to conform to. This is a behavioral contract, not styling:
   `recall::truncation_order()` drops sections by `starts_with` on them.
   Renaming a header without updating that list silently disables the
   350-token truncation path.
+- Two sections exist to put views other than the user's in front of the model
+  (Phase 3): `[In tension]` shows both sides of an open contradiction between
+  beliefs and asks which holds (contradictions used to just halve a belief's
+  weight, hiding the tension), and `[Worth challenging]` asks for the strongest
+  honest case against the top selected **stance** belief, never a preference.
+  When Memorabilia holds a claim disputing that stance, the engine adds it as
+  `[A documented counter-view]` with its citation. Truncation drops, in order:
+  `[Check yourself]`, `[Worth testing this turn]`, `[Where I'm unsure]`,
+  `[Worth challenging]`, `[In tension]`, then the assumptions.
+- `[Worth testing this turn]` is asked only for a belief selected this turn and
+  at most once per chat, and asks the model to check the assumption where it
+  naturally bears on the turn (it used to say "try the opposite"). The next
+  extraction pass judges it (`test_results`): confirmed beliefs become
+  `tested`; refuted ones lose confidence.
 
 ## Internal plugins & build tooling (`plugins/`)
 

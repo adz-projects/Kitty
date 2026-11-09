@@ -31,12 +31,15 @@ and `KITTY_EMBED_TOKENIZER` (`tokenizer.json`) instead of
 prints a per-case table and summary rates. It fails only on setup errors,
 unless `MEMORY_EVAL_STRICT=1` is set, in which case any miss fails it.
 
-Some cases are expected to fail until a later phase lands. Keep them in, as
-the baseline:
+With EmbeddingGemma 2 after Phases 2-4 (November 2026):
 
-- `[Worth challenging]` sections wait for Phase 3.5.
-- `indirect` Memorabilia cases wait for Phase 4.7, analogy edges.
-- `superseded` cases wait for Phase 4.4.
+- Pathway: 27/30 expected beliefs injected, 2/112 forbidden leaked, every
+  expected section present.
+- Memorabilia: direct 8/8, indirect 1/1 (all 3 analogy targets reached),
+  superseded 1/1, nothing leaked.
+
+`[Worth challenging]` is expected only where a `stance` belief is expected,
+because it never challenges context or preferences.
 
 ### Relevance floor sweep
 
