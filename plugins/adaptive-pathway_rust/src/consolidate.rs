@@ -26,8 +26,7 @@ pub fn promotion_gates_pass(b: &Belief) -> bool {
 }
 
 /// Merge conversation-layer beliefs into context at cosine ≥ 0.86, then
-/// promote context → identity where the gates hold, then run a contradiction
-/// pass. Scoped to `session_id`'s own conversation-layer beliefs only --
+/// promote context → identity where the gates hold. Scoped to `session_id`'s own conversation-layer beliefs only --
 /// conversation beliefs are session-owned ("lives for the session"), so
 /// consolidating one session must never touch, delete, or promote another
 /// session's still-active conversational memory.
@@ -86,8 +85,12 @@ async fn consolidate_session_inner(db: &Db, session_id: &str) -> Result<()> {
                 // what distinct_sessions exists to count -- `.max()` on two
                 // rows that both start at 1 can never clear the promotion
                 // gate's `distinct_sessions >= 2` requirement.
-                let new_conf = crate::belief::synthesis::merge_confidence(c.confidence, b.provenance);
                 let new_prov = crate::belief::synthesis::max_provenance(c.provenance, b.provenance);
+                let new_conf = crate::belief::synthesis::merge_confidence(
+                    c.confidence,
+                    b.provenance,
+                    c.tested || b.tested || new_prov.is_tested(),
+                );
                 // b came from THIS session (we loaded it via
                 // list_conversation_beliefs_for_session), and its observations
                 // are about to be re-parented onto `c`. Session-identity is
@@ -103,7 +106,7 @@ async fn consolidate_session_inner(db: &Db, session_id: &str) -> Result<()> {
                 let distinct_sessions = c.distinct_sessions
                     + if session_already_contributed { 0 } else { 1 };
                 let new_support = c.support_count + b.support_count;
-                let new_tested = c.tested || new_prov.is_tested();
+                let new_tested = c.tested || b.tested || new_prov.is_tested();
                 db.update_belief(
                     &c.id,
                     &BeliefPatch {
@@ -185,9 +188,6 @@ async fn consolidate_session_inner(db: &Db, session_id: &str) -> Result<()> {
             changed += 1;
         }
     }
-
-    // Contradiction pass over open contradictions.
-    crate::store::contradictions::run_contradiction_pass(db).await?;
 
     if changed > 0 {
         db.audit("consolidate", Some(&format!("session={session_id} changed={changed}")))

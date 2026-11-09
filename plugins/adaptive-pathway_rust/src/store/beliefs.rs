@@ -289,10 +289,9 @@ impl Db {
         Ok(rows.into_iter().map(map_belief).collect())
     }
 
-    /// The `limit` most-recently-touched beliefs across all layers. Backs
-    /// `store::contradictions::run_contradiction_pass`, whose O(n²) pairwise
-    /// scan must be bounded the same way `list_recall_candidates` bounds the
-    /// recall hot path (audit #131).
+    /// The `limit` most-recently-touched beliefs across all layers, for
+    /// pairwise passes that must stay bounded the same way
+    /// `list_recall_candidates` bounds the recall hot path (audit #131).
     pub async fn list_recent_beliefs(&self, limit: i64) -> Result<Vec<Belief>> {
         let rows = sqlx::query_as::<_, BeliefRow>(
             "SELECT * FROM beliefs ORDER BY updated_at DESC LIMIT ?",

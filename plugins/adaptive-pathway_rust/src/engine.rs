@@ -203,8 +203,8 @@ impl PathwayEngine {
     /// delta, cache-preserving; callers must not distinguish `None` from
     /// `Some("")`.
     pub async fn recall(&self, session_id: &str, user_message: &str) -> Option<String> {
-        let mut selected = self.select_for_turn(session_id, user_message).await?;
-        let signals = self.turn_signals(session_id, &selected).await;
+        let (mut selected, candidates) = self.select_for_turn(session_id, user_message).await?;
+        let signals = self.turn_signals(session_id, &selected, &candidates).await;
         let knows = crate::recall::render_knows(&mut selected);
 
         let block = crate::antisycophancy::render_block(
@@ -240,8 +240,8 @@ impl PathwayEngine {
     /// `Provider::supports_assistant_prefill` and
     /// `reasoning_models::supports_reasoning` in `bigtiny_rust`.
     pub async fn recall_thought_seed(&self, session_id: &str, user_message: &str) -> Option<String> {
-        let mut selected = self.select_for_turn(session_id, user_message).await?;
-        let signals = self.turn_signals(session_id, &selected).await;
+        let (mut selected, candidates) = self.select_for_turn(session_id, user_message).await?;
+        let signals = self.turn_signals(session_id, &selected, &candidates).await;
         let reflection = crate::recall::render_reflection(&mut selected);
 
         let block = crate::recall::render_reflection_block(
@@ -264,6 +264,7 @@ impl PathwayEngine {
         &self,
         session_id: &str,
         selected: &[crate::belief::SelectedBelief],
+        candidates: &[crate::store::beliefs::Belief],
     ) -> TurnSignals {
         let top_belief_id = selected
             .iter()
@@ -275,7 +276,7 @@ impl PathwayEngine {
             .map(|s| s.belief.id.clone());
         TurnSignals {
             worth_testing: self.worth_testing_line().await,
-            unsure: self.unsure_line(session_id, selected).await,
+            unsure: self.unsure_line(session_id, selected, candidates).await,
             check: match &top_belief_id {
                 Some(id) => self.check_yourself_line(id).await,
                 None => None,
@@ -288,11 +289,17 @@ impl PathwayEngine {
     /// trajectory-predicted query, domain inference, diffusion+DPP
     /// selection. `None` on any of: paused, no candidates, everything
     /// suppressed, or DPP selecting nothing.
+    ///
+    /// Also returns the filtered candidate pool (current embedding space,
+    /// suppression applied, other sessions' conversation beliefs excluded)
+    /// so the per-turn signals draw from the same eligible set as the main
+    /// block -- `[Where I'm unsure]` used to read the whole table and could
+    /// resurface a forgotten or retired belief.
     async fn select_for_turn(
         &self,
         session_id: &str,
         user_message: &str,
-    ) -> Option<Vec<crate::belief::SelectedBelief>> {
+    ) -> Option<(Vec<crate::belief::SelectedBelief>, Vec<crate::store::beliefs::Belief>)> {
         if self.is_paused(session_id).await.unwrap_or(false) {
             return None;
         }
@@ -317,7 +324,16 @@ impl PathwayEngine {
         let (query, semantic): (Vec<f32>, bool) = if user_message.trim().is_empty() {
             (Vec::new(), false)
         } else {
-            self.embed.embed_with_space(user_message).await
+            match self.embed.embed_with_space(user_message).await {
+                // Every candidate lives in the semantic space (filtered on
+                // `ollama_model` above). A lexical hash-fallback query
+                // cosine-compared against them is meaningless and would drive
+                // the relevance floor with noise, so a fallback turn selects
+                // on weight alone -- exactly the documented "embedder down"
+                // degradation.
+                (v, true) => (v, true),
+                (_, false) => (Vec::new(), false),
+            }
         };
         // Momentum-extrapolate toward where the conversation is heading
         // (`TrajectoryConfig`) before using the query for anything --
@@ -372,7 +388,7 @@ impl PathwayEngine {
         if selected.is_empty() {
             None
         } else {
-            Some(selected)
+            Some((selected, candidates))
         }
     }
 
@@ -521,8 +537,14 @@ impl PathwayEngine {
     /// how often *this conversation* sees a doubt line, not overall system
     /// activity). Picks the belief with the highest `confidence · (1 −
     /// support/(support+4))` -- high stated confidence, thin support --
-    /// among beliefs not already selected into `[Working assumptions about you]`.
-    async fn unsure_line(&self, session_id: &str, selected: &[crate::belief::SelectedBelief]) -> Option<String> {
+    /// among this turn's eligible candidates (see `select_for_turn`) not
+    /// already selected into `[Working assumptions about you]`.
+    async fn unsure_line(
+        &self,
+        session_id: &str,
+        selected: &[crate::belief::SelectedBelief],
+        candidates: &[crate::store::beliefs::Belief],
+    ) -> Option<String> {
         let exchange_count = self
             .db
             .get_state(session_id)
@@ -536,9 +558,8 @@ impl PathwayEngine {
         }
         let selected_ids: std::collections::HashSet<&str> =
             selected.iter().map(|s| s.belief.id.as_str()).collect();
-        let all = self.db.list_beliefs(None).await.ok()?;
         let mut best: Option<(f64, &str)> = None;
-        for b in &all {
+        for b in candidates {
             if selected_ids.contains(b.id.as_str()) {
                 continue;
             }

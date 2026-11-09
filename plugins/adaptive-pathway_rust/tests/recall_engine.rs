@@ -361,3 +361,81 @@ fn the_reflection_cap_drops_whole_trailing_sections_before_truncating() {
     // oversized section, mirroring `cap_to_token_budget`'s behaviour.
     assert!(capped.chars().count() <= RECALL_MAX_TOKENS * 4);
 }
+
+#[tokio::test]
+async fn unsure_line_never_resurfaces_suppressed_or_other_session_beliefs() {
+    // `[Where I'm unsure]` used to read the whole belief table, so a belief
+    // the user forgot (or retirement suppressed), or another chat's
+    // short-lived conversation belief, could reappear there. It now draws
+    // only from the turn's eligible candidates.
+    let engine = PathwayEngine::open_in_memory(Config::default()).await.unwrap();
+    engine
+        .db
+        .insert_belief(&belief("live", "The user writes Rust.", None, vec![1.0, 0.0]))
+        .await
+        .unwrap();
+
+    // High confidence, thin support: exactly what the unsure scorer favours.
+    let mut forgotten = belief("gone", "The user distrusts every library.", None, vec![0.0, 1.0]);
+    forgotten.support_count = 1;
+    forgotten.confidence = 0.9;
+    engine.db.insert_belief(&forgotten).await.unwrap();
+    engine
+        .db
+        .forget_belief_by_id("gone", SuppressReason::Outdated)
+        .await
+        .unwrap();
+
+    let mut elsewhere = belief("other", "The user is planning a wedding.", None, vec![0.6, 0.8]);
+    elsewhere.layer = Layer::Conversation;
+    elsewhere.session_id = Some("s2".into());
+    elsewhere.support_count = 1;
+    elsewhere.confidence = 0.9;
+    engine.db.insert_belief(&elsewhere).await.unwrap();
+
+    for _ in 0..12 {
+        engine.db.bump_exchange("s1").await.unwrap();
+    }
+    let block = engine.recall("s1", "").await.unwrap();
+    assert!(!block.contains("distrusts every library"), "a suppressed belief resurfaced: {block}");
+    assert!(!block.contains("wedding"), "another session's conversation belief leaked: {block}");
+}
+
+/// An embedder that is always down, forcing the lexical fallback.
+struct DownEmbedder;
+
+#[async_trait::async_trait]
+impl adaptive_pathway::embed::SemanticEmbedder for DownEmbedder {
+    async fn embed(&self, _text: &str) -> Option<Vec<f32>> {
+        None
+    }
+}
+
+#[tokio::test]
+async fn a_fallback_query_selects_on_weight_not_cross_space_cosine() {
+    // With the semantic embedder down, the user message gets a lexical hash
+    // vector. Comparing that against semantic beliefs is meaningless, so the
+    // relevance floor must not run on it: every eligible belief stays in
+    // play, exactly as with no query at all.
+    let engine = PathwayEngine::open_with_embedder(
+        "sqlite::memory:",
+        Config::default(),
+        Some(std::sync::Arc::new(DownEmbedder)),
+    )
+    .await
+    .unwrap();
+    for (i, v) in [vec![1.0, 0.0, 0.0], vec![0.0, 1.0, 0.0], vec![0.0, 0.0, 1.0]].into_iter().enumerate() {
+        engine
+            .db
+            .insert_belief(&belief(&format!("b{i}"), &format!("The user has habit number {i}."), None, v))
+            .await
+            .unwrap();
+    }
+    let with_message = engine.recall("s1", "a question about something unrelated").await.unwrap();
+    let without = engine.recall("s1", "").await.unwrap();
+    for i in 0..3 {
+        let line = format!("habit number {i}");
+        assert!(with_message.contains(&line), "fallback turn dropped {line}: {with_message}");
+    }
+    assert_eq!(with_message, without, "a fallback query must behave like no query");
+}

@@ -122,14 +122,17 @@ impl EmbeddingProvider {
         if let Some((v, semantic)) = lock_state(&self.state).cache.get(t).cloned() {
             return (v, semantic);
         }
-        let (vec, semantic) = match self.embed_semantic(t).await {
-            Some(v) => (v, true),
+        match self.embed_semantic(t).await {
+            Some(v) => {
+                lock_state(&self.state).cache.put(t.to_string(), v.clone(), true);
+                (v, true)
+            }
+            // Never cache a fallback vector: it would pin this text to the
+            // lexical space after the embedder recovers. The fallback is cheap
+            // to recompute, and the circuit-breaker keeps a down embedder from
+            // being retried on every call.
             None => (hash_embed(t, self.dim), false),
-        };
-        lock_state(&self.state)
-            .cache
-            .put(t.to_string(), vec.clone(), semantic);
-        (vec, semantic)
+        }
     }
 
     /// Like `embed_with_space`, but bypasses the cache entirely (both read
@@ -244,6 +247,38 @@ mod tests {
             ..Default::default()
         };
         EmbeddingProvider::new(cfg)
+    }
+
+    /// A fallback vector produced during an outage must not stick: once the
+    /// embedder recovers, the same text gets a real semantic vector. (The
+    /// cache used to keep the hash vector for the text indefinitely.)
+    #[tokio::test]
+    async fn a_fallback_vector_is_not_cached_past_recovery() {
+        struct Flaky(std::sync::atomic::AtomicBool);
+        #[async_trait]
+        impl SemanticEmbedder for Flaky {
+            async fn embed(&self, _text: &str) -> Option<Vec<f32>> {
+                self.0
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    .then(|| vec![1.0, 0.0, 0.0])
+            }
+        }
+        let flaky = Arc::new(Flaky(std::sync::atomic::AtomicBool::new(false)));
+        let cfg = Config {
+            embedding: crate::config::EmbeddingConfig {
+                probe_interval_s: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let provider = EmbeddingProvider::with_embedder(cfg, Some(flaky.clone()));
+
+        let (_, semantic) = provider.embed_with_space("same text").await;
+        assert!(!semantic, "embedder is down, so this is the fallback");
+
+        flaky.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (_, semantic) = provider.embed_with_space("same text").await;
+        assert!(semantic, "after recovery the text must be re-embedded, not served from cache");
     }
 
     /// An injected embedder must replace the HTTP path outright — not race it,
@@ -383,22 +418,18 @@ mod tests {
             !semantic,
             "the first (failing) response must fall back to the hash embedder"
         );
-        assert_eq!(provider.cache_len(), 1);
+        assert_eq!(provider.cache_len(), 0, "a fallback vector is never cached");
 
-        // Ollama "recovers" (every request from here on succeeds). A plain
-        // cache-checking call still returns the stale hash vector, tagged
-        // non-semantic — this is the defect `embed_fresh_with_space` exists
-        // to route around, not something a plain cache hit can fix on its
-        // own.
-        let (_stale, still_cached_as_hash) = provider.embed_with_space("hello world").await;
-        assert!(
-            !still_cached_as_hash,
-            "a plain cache hit is expected to still surface the stale entry"
-        );
+        // Ollama "recovers" (every request from here on succeeds), but within
+        // the probe interval the circuit-breaker still short-circuits to the
+        // fallback without a new request — the breaker, not the cache, is
+        // what keeps a down embedder from being hammered.
+        let (_stale, still_hash) = provider.embed_with_space("hello world").await;
+        assert!(!still_hash, "the breaker holds the fallback until the next probe");
         assert_eq!(
             hits.load(std::sync::atomic::Ordering::SeqCst),
             1,
-            "a cache hit must not perform a new HTTP request"
+            "the open breaker must not perform a new HTTP request"
         );
 
         // `reembed_stale_beliefs` always probes before re-embedding —

@@ -1,4 +1,3 @@
-pub mod contradiction;
 pub mod lifecycle;
 pub mod provenance;
 pub mod synthesis;
@@ -64,9 +63,10 @@ pub fn effective_weight(
         .unwrap_or_else(|| (now - b.updated_at).num_days());
     let dec = layers::decay_factor(b.layer, days);
 
-    let contradicted = if b.contradict_count > 0 { 0.5 } else { 1.0 };
-
-    let mut w = base * dm * dec * contradicted;
+    // `contradict_count` deliberately does not enter the weight. Halving a
+    // contradicted belief hid exactly the tension recall is meant to show;
+    // contradictions are surfaced, not suppressed.
+    let mut w = base * dm * dec;
 
     // pinned always floors the effective weight at 0.8
     if b.pinned {

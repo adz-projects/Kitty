@@ -112,8 +112,12 @@ async fn route_observation_inner(
         });
         // Merge: bump support/sessions, recompute confidence, take max
         // provenance ranking, re-parent this observation onto target.
-        let new_conf = merge_confidence(target.confidence, provenance);
         let new_prov = max_provenance(target.provenance, provenance);
+        let new_conf = merge_confidence(
+            target.confidence,
+            provenance,
+            target.tested || new_prov.is_tested(),
+        );
         let target_id = target.id.clone();
         // Session-identity comes from the observations table, not the
         // belief's own `session_id` column — that column is always `None` on
@@ -280,8 +284,11 @@ fn fallback_belief(
 }
 
 /// Recompute confidence on a merge. Multiplicative toward the bound with a
-/// modest step for a supportive observation.
-pub fn merge_confidence(existing: f64, provenance: Provenance) -> f64 {
+/// modest step for a supportive observation. `tested_after` is whether the
+/// merged belief counts as tested once this evidence is folded in; while it
+/// doesn't, the result is held at `UNTESTED_CEILING` so repetition alone can
+/// never carry an inferred pattern to near-certainty.
+pub fn merge_confidence(existing: f64, provenance: Provenance, tested_after: bool) -> f64 {
     let step = belief::provenance::reinforcement_step(
         if provenance == Provenance::Correction {
             belief::EvidenceKind::Correction
@@ -289,7 +296,15 @@ pub fn merge_confidence(existing: f64, provenance: Provenance) -> f64 {
             belief::EvidenceKind::SupportiveObservation
         },
     );
-    belief::provenance::reinforce_toward(existing, true, step)
+    let c = belief::provenance::reinforce_toward(existing, true, step);
+    if tested_after {
+        c
+    } else {
+        // Never *raise* a belief to the ceiling, and never pull one that is
+        // already above it (legacy rows) further up: cap the result, but not
+        // below where it started.
+        belief::provenance::capped_untested(c).max(existing.min(c))
+    }
 }
 
 /// Higher provenance wins (correction > direct_statement > controlled_test >
@@ -352,6 +367,24 @@ mod tests {
             session_id: None,
             embedding_model: crate::config::DEFAULT_EMBEDDING_MODEL.into(),
         }
+    }
+
+    #[test]
+    fn untested_merges_stop_at_the_ceiling() {
+        use crate::belief::provenance::UNTESTED_CEILING;
+        // Repeated inferred-pattern evidence alone climbs toward the ceiling
+        // but never past it.
+        let mut c = Provenance::InferredPattern.initial_confidence();
+        for _ in 0..100 {
+            c = merge_confidence(c, Provenance::InferredPattern, false);
+        }
+        assert!((c - UNTESTED_CEILING).abs() < 1e-9, "c={c}");
+        // A legacy row already above the ceiling is not pushed further up,
+        // nor dragged down by a merge.
+        let legacy = merge_confidence(0.9, Provenance::InferredPattern, false);
+        assert!((legacy - 0.9).abs() < 1e-9, "legacy={legacy}");
+        // Tested beliefs are uncapped.
+        assert!(merge_confidence(0.74, Provenance::DirectStatement, true) > UNTESTED_CEILING);
     }
 
     #[tokio::test]
