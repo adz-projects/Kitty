@@ -400,20 +400,22 @@ fn default_trajectory_momentum() -> f64 {
     0.15
 }
 fn default_recall_min_cosine() -> f64 {
-    // Centered cosine (corpus mean removed), not raw cosine. 0.0 = aligned
-    // with the query at all after discounting the shared direction;
-    // conservative so on-topic recall is never suppressed.
-    0.0
+    // Centered cosine (corpus mean removed), not raw cosine. Tuned with the
+    // relevance-floor sweep (`memory_eval_relevance_floor`,
+    // docs/memory-eval/README.md) on EmbeddingGemma 2: at 0.0 (the old value)
+    // 38% of off-topic beliefs passed and no off-topic question injected
+    // nothing; 0.10 keeps ~93% of expected beliefs at ~3% leakage, and 0.117
+    // reaches zero leakage at 90%. The running EWMA can only raise it.
+    0.10
 }
 fn default_recall_min_cosine_identity() -> f64 {
-    // Same bar as the general floor: an identity/profile belief must still be
-    // at least weakly aligned with the query (centered cosine >= 0). The old
-    // -0.05 was effectively a free pass — it let a stale profile belief inject
-    // on essentially any turn via the reserved identity slots, the exact
-    // every-turn leak this closes. Identity still gets its *reserved slots*
-    // (it won't be crowded out when it IS relevant); it just no longer injects
-    // when it is not. Lower it slightly (e.g. -0.02) only to re-soften that.
-    0.0
+    // Gentler than the general floor, so a slow-moving profile belief can
+    // surface on a looser match, but never a free pass: the old -0.05 let a
+    // stale profile belief inject on essentially any turn via the reserved
+    // identity slots. Half the general floor; the sweep has no identity cases,
+    // so this is judgement, not measurement -- add identity cases to the eval
+    // before tuning it.
+    0.05
 }
 fn default_recall_gap_min() -> f64 {
     // Centered-cosine units; ~1/9 of the typical centered span — a real break

@@ -135,9 +135,9 @@ pub struct Config {
     /// raw floor cannot tell relevant from irrelevant; subtracting the corpus
     /// mean vector first restores it. A chunk clears this only when its
     /// *deviation from the corpus average* aligns with the query's — i.e. it
-    /// is more like the query than the average memory is. At 0.0 only chunks
-    /// that point the same way as the query survive (off-topic chunks go
-    /// negative and are dropped); raise it to tighten. When the corpus mean is
+    /// is more like the query than the average memory is. The default (0.12)
+    /// is tuned on EmbeddingGemma 2 so an off-topic question injects nothing;
+    /// at 0.0 roughly a quarter of unrelated chunks still passed. When the corpus mean is
     /// unavailable (empty store, lexical-hash space) the floor is skipped so
     /// recall degrades to its old raw-cosine behavior rather than suppressing
     /// everything (soft-fail, core principle 9).
@@ -487,12 +487,14 @@ fn default_activation_prune_threshold() -> f64 {
     0.05
 }
 fn default_recall_min_cosine() -> f64 {
-    // Centered cosine (corpus mean removed), not raw cosine. 0.0 = "aligned
-    // with the query at all, after discounting the direction every memory
-    // shares"; conservative on purpose so genuine on-topic recall is never
-    // suppressed, while the off-topic bulk (which centers negative) is cut.
-    // Tune upward (≈0.05–0.10) to inject more selectively.
-    0.0
+    // Centered cosine (corpus mean removed), not raw cosine. Tuned with the
+    // relevance-floor sweep (`memory_eval_relevance_floor`,
+    // docs/memory-eval/README.md) on EmbeddingGemma 2: at 0.0 (the old value)
+    // 26% of off-topic chunks passed and no off-topic question came back
+    // empty; every value from ~0.106 to ~0.36 keeps all expected chunks with
+    // one stray leak and both off-topic questions empty. 0.12 sits at the low
+    // end of that plateau so harder real phrasings are not cut.
+    0.12
 }
 fn default_recall_gap_min() -> f64 {
     // Centered-cosine units. ~1/9 of the typical centered span — a real

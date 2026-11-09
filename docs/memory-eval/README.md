@@ -38,6 +38,32 @@ the baseline:
 - `indirect` Memorabilia cases wait for Phase 4.7, analogy edges.
 - `superseded` cases wait for Phase 4.4.
 
+### Relevance floor sweep
+
+`memory_eval_relevance_floor` (same command, filter `memory_eval_relevance_floor`)
+scores every (question, memory item) pair in both fixtures by raw and by
+mean-centred cosine. For each candidate floor it reports:
+
+- the share of expected items that pass;
+- the share of forbidden items that leak through;
+- how many off-topic questions inject nothing.
+
+It also prints the floor that maximises `expected − 2 × leaked`, weighting
+leaks double because the plan is to err towards too selective. Run it after
+changing the embedding model, since floors are properties of one embedding
+space.
+
+On EmbeddingGemma 2 (2026-11-09):
+
+| | old floor 0.0 | chosen floor | at the chosen floor |
+|---|---|---|---|
+| Pathway (`recall.min_cosine`) | 97% expected, 38% leaked, 0/3 off-topic clean | **0.10** | about 93% expected, 3% leaked; 0.117 gives 90% expected, 0% leaked, 3/3 clean |
+| Memorabilia (`recall_min_cosine`) | 100% expected, 26% leaked, 0/2 clean | **0.12** | 100% expected, 2% leaked, 2/2 clean, anywhere on the 0.106–0.36 plateau |
+
+Mean-centred cosine separates as well as raw cosine or better on both, so the
+floors stay centred. Pathway's identity floor (`min_cosine_identity`, 0.05) is
+not measured: the fixture has no identity cases yet.
+
 ## 2. Overnight cluster sizes (Memorabilia)
 
 Every overnight pass now reports `clusters_seen` and `largest_cluster`, and

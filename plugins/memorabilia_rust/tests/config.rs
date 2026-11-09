@@ -94,7 +94,7 @@ fn defaults_match_plan_section2() {
     assert_eq!(c.retrieval_seed_chunks, 8);
     assert_eq!(c.retrieval_min_seeds, 3);
     assert!((c.activation_prune_threshold - 0.05).abs() < 1e-12);
-    assert!((c.recall_min_cosine - 0.0).abs() < 1e-12);
+    assert!((c.recall_min_cosine - 0.12).abs() < 1e-12);
     assert!((c.recall_gap_min - 0.08).abs() < 1e-12);
     assert!((c.recall_ewma_alpha - 0.1).abs() < 1e-12);
     assert!((c.recall_ewma_slack - 0.05).abs() < 1e-12);

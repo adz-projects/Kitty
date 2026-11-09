@@ -494,3 +494,153 @@ async fn memory_eval_embedding_sanity() {
     }
     println!("first expected belief ranked #1: {top1}/{n}, in top 3: {top3}/{n}");
 }
+
+// ------------------------------------------------------- relevance floor --
+
+/// One (question, memory item) pair the floor has to judge.
+struct FloorPair {
+    raw: f32,
+    centered: f32,
+    /// `Some(true)` expected, `Some(false)` forbidden, `None` unlabelled.
+    label: Option<bool>,
+    /// The question should inject nothing at all (a `negative` case).
+    off_topic: bool,
+    case: usize,
+}
+
+fn dot32(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
+
+fn cos32(a: &[f32], b: &[f32]) -> f32 {
+    let (na, nb) = (dot32(a, a).sqrt(), dot32(b, b).sqrt());
+    if na == 0.0 || nb == 0.0 {
+        0.0
+    } else {
+        dot32(a, b) / (na * nb)
+    }
+}
+
+fn mean_vec(vs: &[Vec<f32>]) -> Vec<f32> {
+    let mut m = vec![0.0f32; vs[0].len()];
+    for v in vs {
+        for (s, x) in m.iter_mut().zip(v) {
+            *s += x / vs.len() as f32;
+        }
+    }
+    m
+}
+
+fn centered(q: &[f32], v: &[f32], mean: &[f32]) -> f32 {
+    let qc: Vec<f32> = q.iter().zip(mean).map(|(a, b)| a - b).collect();
+    let vc: Vec<f32> = v.iter().zip(mean).map(|(a, b)| a - b).collect();
+    cos32(&qc, &vc)
+}
+
+/// Sweep candidate floors over both scores and print, per threshold: the
+/// share of expected items that pass, the share of forbidden items that leak,
+/// and how many off-topic questions inject nothing. Also prints the floor that
+/// maximises `expected_pass - 2 * forbidden_leak` (leaks weighted double:
+/// "err on the side of too selective", docs/MEMORY_OVERNIGHT.md).
+fn sweep(label: &str, pairs: &[FloorPair], n_cases: usize) {
+    let lo_hi = |f: fn(&FloorPair) -> f32| {
+        let vals: Vec<f32> = pairs.iter().map(f).collect();
+        let lo = vals.iter().cloned().fold(f32::INFINITY, f32::min);
+        let hi = vals.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        (lo, hi)
+    };
+    for (score_name, get) in [
+        ("raw cosine", (|p: &FloorPair| p.raw) as fn(&FloorPair) -> f32),
+        ("centered cosine", |p: &FloorPair| p.centered),
+    ] {
+        let (lo, hi) = lo_hi(get);
+        let exp_total = pairs.iter().filter(|p| p.label == Some(true)).count().max(1);
+        let forb_total = pairs.iter().filter(|p| p.label == Some(false)).count().max(1);
+        let off_cases: std::collections::BTreeSet<usize> =
+            pairs.iter().filter(|p| p.off_topic).map(|p| p.case).collect();
+        println!("\n[{label}] {score_name}: range {lo:.3}..{hi:.3}  ({n_cases} cases, {} off-topic)", off_cases.len());
+        println!("  floor   expected-pass  forbidden-leak  off-topic-clean  score");
+        let mut best = (f32::NEG_INFINITY, 0.0f32);
+        let steps = 40;
+        for i in 0..=steps {
+            let t = lo + (hi - lo) * i as f32 / steps as f32;
+            let pass = pairs.iter().filter(|p| p.label == Some(true) && get(p) >= t).count();
+            let leak = pairs.iter().filter(|p| p.label == Some(false) && get(p) >= t).count();
+            let dirty: std::collections::BTreeSet<usize> =
+                pairs.iter().filter(|p| p.off_topic && get(p) >= t).map(|p| p.case).collect();
+            let (ep, fl) = (pass as f32 / exp_total as f32, leak as f32 / forb_total as f32);
+            let score = ep - 2.0 * fl;
+            if score > best.0 {
+                best = (score, t);
+            }
+            if i % 2 == 0 {
+                println!(
+                    "  {t:>6.3}  {:>5}/{:<5} {:>3.0}%  {:>4}/{:<4} {:>3.0}%  {:>3}/{:<3}         {score:+.2}",
+                    pass, exp_total, ep * 100.0, leak, forb_total, fl * 100.0,
+                    off_cases.len() - dirty.len(), off_cases.len()
+                );
+            }
+        }
+        println!("  best floor ({score_name}): {:.3}  (score {:+.2})", best.1, best.0);
+    }
+}
+
+#[tokio::test]
+#[ignore]
+async fn memory_eval_relevance_floor() {
+    let Some((embedder, _)) = live_embedder() else { return };
+
+    // Pathway: every non-identity belief against every case. Identity beliefs
+    // use their own, gentler floor and are never forbidden.
+    let fx: PathwayFixture =
+        serde_json::from_str(&fixture("MEMORY_EVAL_PATHWAY", "pathway_cases.json")).expect("fixture");
+    let mut beliefs = Vec::new();
+    for b in fx.beliefs.iter().filter(|b| b.layer != "identity") {
+        beliefs.push((b.id.clone(), embedder.embed(&b.text).await.expect("embed")));
+    }
+    let mean = mean_vec(&beliefs.iter().map(|(_, v)| v.clone()).collect::<Vec<_>>());
+    let mut pairs = Vec::new();
+    for (ci, case) in fx.cases.iter().enumerate() {
+        let q = embedder.embed(&case.message).await.expect("embed");
+        let off_topic = case.expect.is_empty();
+        for (id, v) in &beliefs {
+            let label = if case.expect.contains(id) {
+                Some(true)
+            } else if case.forbid.contains(id) {
+                Some(false)
+            } else {
+                None
+            };
+            pairs.push(FloorPair { raw: cos32(&q, v), centered: centered(&q, v, &mean), label, off_topic, case: ci });
+        }
+    }
+    sweep("pathway", &pairs, fx.cases.len());
+
+    // Memorabilia: each document is one chunk; a document is expected when it
+    // holds an expected claim (direct cases only -- indirect targets are not
+    // a floor's job), forbidden when it holds a forbidden one.
+    let mx: MemFixture =
+        serde_json::from_str(&fixture("MEMORY_EVAL_MEMORABILIA", "memorabilia_cases.json")).expect("fixture");
+    let mut docs = Vec::new();
+    for d in &mx.documents {
+        docs.push((d, embedder.embed(&d.text).await.expect("embed")));
+    }
+    let mean = mean_vec(&docs.iter().map(|(_, v)| v.clone()).collect::<Vec<_>>());
+    let holds = |d: &MemDocument, needles: &[String]| needles.iter().any(|n| d.claims.iter().any(|c| c.contains(n.as_str())));
+    let mut pairs = Vec::new();
+    for (ci, case) in mx.cases.iter().enumerate() {
+        let q = embedder.embed(&case.message).await.expect("embed");
+        let off_topic = case.kind == "negative";
+        for (d, v) in &docs {
+            let label = if holds(d, &case.expect) {
+                Some(true)
+            } else if holds(d, &case.forbid) {
+                Some(false)
+            } else {
+                None
+            };
+            pairs.push(FloorPair { raw: cos32(&q, v), centered: centered(&q, v, &mean), label, off_topic, case: ci });
+        }
+    }
+    sweep("memorabilia", &pairs, mx.cases.len());
+}
