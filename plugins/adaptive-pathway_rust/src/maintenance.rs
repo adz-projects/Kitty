@@ -46,6 +46,13 @@ const RETIRE_MAX_SUPPORT_UNTESTED: i64 = 1;
 const HOUSEKEEPING_AUDIT_DAYS: i64 = 30;
 
 pub async fn run_maintenance(db: &Db) -> Result<()> {
+    run_maintenance_with(db, crate::config::Config::default().recall.ewma_alpha).await
+}
+
+/// [`run_maintenance`] with the engine's recall-cut smoothing
+/// (`recall.ewma_alpha`), which the nightly pass uses to fold the day's
+/// logged cuts into the floor snapshot recall reads (`recall::cut_log`).
+pub async fn run_maintenance_with(db: &Db, cut_ewma_alpha: f64) -> Result<()> {
     let now = Utc::now();
 
     // Cheap, always run regardless of cadence: prune expired (non-permanent)
@@ -62,6 +69,11 @@ pub async fn run_maintenance(db: &Db) -> Result<()> {
         return Ok(());
     }
 
+    // The relevance-floor snapshot moves once a day, here, never during
+    // recall (`recall::cut_log`).
+    if let Err(e) = crate::recall::cut_log::fold_pending(db, cut_ewma_alpha).await {
+        tracing::warn!("pathway: folding recall cuts failed: {e}");
+    }
     reevaluate_stale_beliefs(db, now).await?;
     retire_dead_beliefs(db, now).await?;
     if let Err(e) = db.prune_housekeeping_audit(HOUSEKEEPING_AUDIT_DAYS).await {

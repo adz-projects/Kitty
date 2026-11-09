@@ -4165,6 +4165,10 @@ impl AgentLoop {
             // falling back to 0 — `0 % N == 0` would otherwise make the
             // cadence gate "learn on every turn", and the bump's failure is
             // in no way a signal to alter cadence.
+            // Turn-end bookkeeping recall deliberately leaves to here (it is
+            // read-only so the same turn always renders the same block):
+            // advance this chat's `[Check yourself]` streak.
+            engine.record_turn_end(&learn_session_id).await;
             let exchange_count = match engine.db.bump_exchange(&learn_session_id).await {
                 Ok(n) => n,
                 Err(e) => {
@@ -4285,25 +4289,40 @@ impl AgentLoop {
         };
         let seed_eligible = self.router.supports_assistant_prefill(provider_id)
             && reasoning_models::supports_reasoning(model);
+        // The chat's previous user message drives recall's trajectory
+        // extrapolation (the engine keeps no in-memory history, so recall is
+        // a function of what is stored). The current message is not saved
+        // yet, so the latest stored user message is the previous one.
+        let previous = self.previous_user_message(session_id).await;
+        let turn = tokio::time::timeout(
+            Duration::from_millis(AP_RECALL_EMBED_BUDGET_MS),
+            engine.recall_turn(session_id, user_message, previous.as_deref(), seed_eligible),
+        )
+        .await
+        .ok()
+        .flatten()
+        .map(|t| t.text);
         if seed_eligible {
-            let seed = tokio::time::timeout(
-                Duration::from_millis(AP_RECALL_EMBED_BUDGET_MS),
-                engine.recall_thought_seed(session_id, user_message),
-            )
-            .await
-            .ok()
-            .flatten();
-            (None, seed)
+            (None, turn)
         } else {
-            let hints = tokio::time::timeout(
-                Duration::from_millis(AP_RECALL_EMBED_BUDGET_MS),
-                engine.recall(session_id, user_message),
-            )
-            .await
-            .ok()
-            .flatten();
-            (hints, None)
+            (turn, None)
         }
+    }
+
+    /// The latest stored user message of `session_id`, as text: during turn
+    /// start, before the new message is saved, that is the previous one.
+    async fn previous_user_message(&self, session_id: &str) -> Option<String> {
+        let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT content, content_format FROM messages              WHERE session_id = ? AND role = 'user' ORDER BY rowid DESC LIMIT 1",
+        )
+        .bind(session_id)
+        .fetch_optional(self.context.pool())
+        .await
+        .ok()
+        .flatten();
+        let (content, format) = row?;
+        let text = crate::agent::compaction::stored_content_as_text(content.as_deref()?, format.as_deref());
+        (!text.trim().is_empty()).then_some(text)
     }
 
     /// Memorabilia turn-start hook: a compact summary + index of relevant

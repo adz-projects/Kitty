@@ -228,6 +228,33 @@ impl ContextBuilder {
         let live_messages =
             self.enforce_live_tail_budget(&live_messages, reserve_floor, live_tail_budget);
 
+        // Re-emit each stored memory block (Adaptive Pathway + Memorabilia
+        // recall) as a `system` message right before the user message it was
+        // injected with, exactly where it sat on that turn. Keeping it in
+        // place, rather than replacing it with this turn's block, is what
+        // keeps the prompt prefix byte-identical turn over turn
+        // (prompt_determinism.md). After masking and budgeting, so a trimmed
+        // message takes its block with it.
+        let blocks: std::collections::HashMap<&str, &str> = live_rows
+            .iter()
+            .filter_map(|r| Some((r.id.as_str(), r.memory_block.as_deref()?)))
+            .filter(|(_, b)| !b.trim().is_empty())
+            .collect();
+        let mut last_stored_block: Option<String> = None;
+        let live_messages: Vec<Value> = if blocks.is_empty() {
+            live_messages
+        } else {
+            let mut out = Vec::with_capacity(live_messages.len() + blocks.len());
+            for m in live_messages {
+                if let Some(block) = m.get("id").and_then(|v| v.as_str()).and_then(|id| blocks.get(id)) {
+                    out.push(json!({"role": "system", "content": block}));
+                    last_stored_block = Some(block.to_string());
+                }
+                out.push(m);
+            }
+            out
+        };
+
         // Computed from the FINAL live messages (post-masking, post-budget),
         // not the raw rows: the emergency valve below compares this against
         // the cap, and the pre-masking sum could trip the destructive trim
@@ -249,15 +276,24 @@ impl ContextBuilder {
         // a retired subsystem and gave the block two nested labels.
         // Tokens of the injected tail blocks are counted so the emergency
         // valve below doesn't undercount the real prompt by their size.
+        //
+        // Delta rule: when this turn's block is the same as the last one the
+        // live tail already carries, nothing new is injected -- the earlier
+        // copy is still in the prompt. A new block is stored on the new user
+        // message (`_memory_block`, persisted by `save_messages`) so later
+        // turns re-emit it in this same position.
         let mut tail_extra_tokens: i32 = 0;
+        let mut new_memory_block: Option<&str> = None;
         if let Some(hints) = ap_hints {
-            if !hints.trim().is_empty() {
+            let unchanged = last_stored_block.as_deref().map(str::trim) == Some(hints.trim());
+            if !hints.trim().is_empty() && !unchanged {
                 let block = json!({
                     "role": "system",
                     "content": hints
                 });
                 tail_extra_tokens += count_messages_tokens(std::slice::from_ref(&block));
                 messages.push(block);
+                new_memory_block = Some(hints);
             }
         }
 
@@ -294,6 +330,13 @@ impl ContextBuilder {
                 "role": "user",
                 "content": new_message
             }));
+        }
+        if let Some(block) = new_memory_block {
+            if let Some(obj) = messages.last_mut().and_then(|m| m.as_object_mut()) {
+                // `_`-prefixed: stored by `save_messages`, stripped from the
+                // wire by `provider::wire::sanitize_for_wire`.
+                obj.insert("_memory_block".to_string(), json!(block));
+            }
         }
 
         // Layer 8 (tail-region): thought-seeded episodic recall, appended
@@ -430,6 +473,7 @@ impl ContextBuilder {
                 reasoning: private("_reasoning"),
                 provider_id: private("_provider_id"),
                 model: private("_model"),
+                memory_block: private("_memory_block"),
             });
         }
 
@@ -925,6 +969,51 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn a_stored_memory_block_keeps_the_previous_prompt_a_prefix() {
+        // Turn 1's whole prompt (memory block included) must be a byte-exact
+        // prefix of turn 2's, so the provider's prefix cache covers all of
+        // it; and a block that repeats the last one is not injected again.
+        let pool = test_pool().await;
+        sessions::create_session(&pool, "sess-m", "Test").await.unwrap();
+        let builder = ContextBuilder::new(pool.clone(), TokenManagementConfig::default(), 2);
+        let mut seed = vec![json!({"role": "user", "content": "hello"})];
+        builder.save_messages("sess-m", &mut seed).await.unwrap();
+        let build = |msg: &'static str, hints: Option<&'static str>| {
+            let b = &builder;
+            async move {
+                b.build_messages("sess-m", msg, None, None, None, None, None, None, hints, None, None)
+                    .await
+                    .unwrap()
+            }
+        };
+        let wire = |m: &[Value]| crate::provider::wire::sanitize_for_wire(m).into_owned();
+
+        let mut turn1 = build("q1", Some("[memory] A")).await;
+        let sent1 = wire(&turn1);
+        builder.save_messages("sess-m", &mut turn1).await.unwrap();
+        let mut reply = vec![json!({"role": "assistant", "content": "r1"})];
+        builder.save_messages("sess-m", &mut reply).await.unwrap();
+
+        let mut turn2 = build("q2", Some("[memory] B")).await;
+        let sent2 = wire(&turn2);
+        assert_eq!(
+            serde_json::to_string(&sent2[..sent1.len()]).unwrap(),
+            serde_json::to_string(&sent1).unwrap(),
+            "turn 1's prompt must be a byte-exact prefix of turn 2's"
+        );
+        assert!(sent2.iter().any(|m| m["content"] == "[memory] B"), "the new block is injected");
+        builder.save_messages("sess-m", &mut turn2).await.unwrap();
+        let mut reply = vec![json!({"role": "assistant", "content": "r2"})];
+        builder.save_messages("sess-m", &mut reply).await.unwrap();
+
+        // Same block again: nothing new before q3.
+        let turn3 = wire(&build("q3", Some("[memory] B")).await);
+        let blocks = turn3.iter().filter(|m| m["content"] == "[memory] B").count();
+        assert_eq!(blocks, 1, "an unchanged block is carried by the stored copy only");
+        assert_eq!(turn3[turn3.len() - 2]["content"], "r2", "no block right before the new message");
+    }
+
     /// Adaptive-Pathway hints are injected into the tail region (immediately
     /// before the new user message) so the stable head stays byte-identical
     /// for prefix caching. Asserting: (1) `None` and an empty/whitespace
@@ -1067,6 +1156,7 @@ mod tests {
             reasoning: None,
             provider_id: None,
             model: None,
+            memory_block: None,
         };
         let msg = row_to_message(&row);
         assert_eq!(msg.get("role").and_then(|r| r.as_str()), Some("user"));

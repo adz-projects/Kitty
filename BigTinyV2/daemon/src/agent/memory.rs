@@ -278,6 +278,7 @@ mod tests {
             reasoning: None,
             provider_id: None,
             model: None,
+            memory_block: None,
         }
     }
 

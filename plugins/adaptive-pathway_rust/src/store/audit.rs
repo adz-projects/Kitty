@@ -52,6 +52,25 @@ impl Db {
         Ok(())
     }
 
+    /// Every `(key, value)` setting whose key starts with `prefix`.
+    pub async fn settings_with_prefix(&self, prefix: &str) -> Result<Vec<(String, String)>> {
+        let like = format!("{}%", prefix.replace('%', "\\%").replace('_', "\\_"));
+        Ok(
+            sqlx::query_as("SELECT key, value FROM app_settings WHERE key LIKE ? ESCAPE '\\' ORDER BY key")
+                .bind(like)
+                .fetch_all(self.pool())
+                .await?,
+        )
+    }
+
+    pub async fn delete_setting(&self, key: &str) -> Result<()> {
+        sqlx::query("DELETE FROM app_settings WHERE key = ?")
+            .bind(key)
+            .execute(self.pool())
+            .await?;
+        Ok(())
+    }
+
     // ---- global exchange counter ----
     //
     // A single process-wide (not per-session) counter of learn-worthy

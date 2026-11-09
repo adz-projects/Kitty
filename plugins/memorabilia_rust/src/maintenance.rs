@@ -117,6 +117,11 @@ impl Engine {
                 }
                 Err(e) => tracing::warn!("maintenance: listing embedding spaces failed ({e})"),
             }
+            // The relevance-floor snapshot moves here, once per heavy pass,
+            // never during recall (`recall::cut_log`).
+            if let Err(e) = crate::recall::cut_log::fold_pending(&self.db, self.config.recall_ewma_alpha).await {
+                tracing::warn!("maintenance: folding recall cuts failed ({e})");
+            }
             if let Err(e) = self.db.set_setting("last_maintenance_at", now).await {
                 tracing::warn!("maintenance: could not persist heavy-pass anchor ({e})");
             }

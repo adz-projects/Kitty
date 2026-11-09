@@ -159,14 +159,9 @@ pub async fn idle_sweep_with<C: SessionChat>(
         if let Err(e) = crate::consolidate::consolidate_session(&engine.db, session_id).await {
             tracing::warn!("pathway consolidate failed for session {session_id}: {e}");
         }
-        // The session is being closed out -- drop its trajectory-embedding
-        // state (see `PathwayEngine::forget_trajectory`) so that map stays
-        // bounded by concurrently-active sessions, not every session ever
-        // seen.
-        engine.forget_trajectory(session_id);
     }
     // Periodic maintenance (cheap; runs each sweep).
-    let _ = crate::maintenance::run_maintenance(&engine.db).await;
+    let _ = crate::maintenance::run_maintenance_with(&engine.db, engine.cfg.recall.ewma_alpha).await;
     // Bound the per-session learn-lock map's growth (see
     // `PathwayEngine::prune_idle_learn_locks`) -- cheap, safe every tick.
     engine.prune_idle_learn_locks();

@@ -21,6 +21,8 @@ use crate::vector::ops;
 use crate::vector::spread::diffuse_activation;
 
 /// Maximum beliefs in the main block.
+pub mod cut_log;
+
 pub const MAX_BELIEFS: usize = 6;
 
 /// Slots held for `Layer::Identity` beliefs before the general pool competes

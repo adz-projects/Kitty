@@ -26,6 +26,8 @@
 
 use std::collections::HashMap;
 
+pub mod cut_log;
+
 use crate::core;
 use crate::engine::Engine;
 use crate::error::Result;
@@ -383,10 +385,13 @@ impl Engine {
         // Self-tuning: fold this turn's effective cut into the running estimate
         // (injection path only). Best-effort — a settings-write failure must
         // never fail recall (core principle 9).
+        // Logged only: the snapshot the floor reads moves in the heavy
+        // maintenance pass (`cut_log`), so two recalls of the same query see
+        // the same floor.
         if persist_cut {
             if let Some(cut) = seeds.effective_cut {
-                if let Err(e) = self.update_recall_cut_ewma(&tag, cut).await {
-                    tracing::debug!("recall: could not update cut EWMA for {tag}: {e}");
+                if let Err(e) = cut_log::log(&self.db, &tag, cut).await {
+                    tracing::debug!("recall: could not log the recall cut for {tag}: {e}");
                 }
             }
         }
@@ -462,30 +467,10 @@ impl Engine {
         if !centered {
             return hard;
         }
-        match self.recall_cut_ewma(tag).await {
-            Ok(Some(ewma)) => hard.max(ewma - self.config.recall_ewma_slack),
-            _ => hard,
+        match cut_log::snapshot(&self.db, tag).await {
+            Some(ewma) => hard.max(ewma - self.config.recall_ewma_slack),
+            None => hard,
         }
-    }
-
-    /// Read the running EWMA cut estimate for `tag` (`recall_cut_ewma::<tag>`
-    /// in `app_settings`); `None` before the first injected turn in this space.
-    async fn recall_cut_ewma(&self, tag: &str) -> Result<Option<f64>> {
-        let key = format!("recall_cut_ewma::{tag}");
-        Ok(self.db.get_setting(&key).await?.and_then(|s| s.parse::<f64>().ok()))
-    }
-
-    /// Fold `cut` (a turn's lowest kept centered score) into the running EWMA
-    /// estimate with smoothing `recall_ewma_alpha`; seeds the estimate on the
-    /// first observation.
-    async fn update_recall_cut_ewma(&self, tag: &str, cut: f64) -> Result<()> {
-        let key = format!("recall_cut_ewma::{tag}");
-        let alpha = self.config.recall_ewma_alpha;
-        let next = match self.recall_cut_ewma(tag).await? {
-            Some(prev) => alpha * cut + (1.0 - alpha) * prev,
-            None => cut,
-        };
-        self.db.set_setting(&key, &next.to_string()).await
     }
 
     /// Pass 1: seed proposition activations from the top-`k` chunk search.

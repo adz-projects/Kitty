@@ -26,6 +26,13 @@ struct TurnSignals {
     check: Option<String>,
 }
 
+/// One turn's recall, as [`PathwayEngine::recall_turn`] returns it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TurnRecall {
+    /// The rendered block (system block or thought seed).
+    pub text: String,
+}
+
 pub struct PathwayEngine {
     pub db: Db,
     pub cfg: Config,
@@ -37,11 +44,11 @@ pub struct PathwayEngine {
     learn_locks: DashMap<String, Arc<tokio::sync::Mutex<()>>>,
     /// Global 1-permit semaphore around every `structured_chat`.
     chat_slot: Arc<Semaphore>,
-    /// Previous turn's raw query embedding per session, for
-    /// `TrajectoryConfig`'s momentum extrapolation in `recall`. In-memory
-    /// only -- see `config::TrajectoryConfig`'s doc comment for why losing
-    /// this across a restart is fine.
-    trajectory_embeddings: DashMap<String, Vec<f32>>,
+    /// The judge's last verdict per session, keyed by a hash of the message
+    /// it judged, so re-running the same turn (a regenerate, a retry)
+    /// reuses it instead of asking again and possibly hearing something
+    /// different. One entry per session; only the latest message matters.
+    judge_cache: DashMap<String, (u64, Option<crate::recall::Relevance>)>,
     /// The host's optional judge (`traits::MemoryGate`), set once after open.
     gate: std::sync::OnceLock<Arc<dyn crate::traits::MemoryGate>>,
 }
@@ -96,7 +103,7 @@ impl PathwayEngine {
             paused_override: DashMap::new(),
             learn_locks: DashMap::new(),
             chat_slot: Arc::new(Semaphore::new(1)),
-            trajectory_embeddings: DashMap::new(),
+            judge_cache: DashMap::new(),
             gate: std::sync::OnceLock::new(),
         }))
     }
@@ -172,7 +179,7 @@ impl PathwayEngine {
             paused_override: DashMap::new(),
             learn_locks: DashMap::new(),
             chat_slot: Arc::new(Semaphore::new(1)),
-            trajectory_embeddings: DashMap::new(),
+            judge_cache: DashMap::new(),
             gate: std::sync::OnceLock::new(),
         }))
     }
@@ -203,20 +210,57 @@ impl PathwayEngine {
     /// delta, cache-preserving; callers must not distinguish `None` from
     /// `Some("")`.
     pub async fn recall(&self, session_id: &str, user_message: &str) -> Option<String> {
-        let (mut selected, candidates) = self.select_for_turn(session_id, user_message).await?;
-        let signals = self.turn_signals(session_id, &selected, &candidates).await;
-        let knows = crate::recall::render_knows(&mut selected);
+        self.recall_turn(session_id, user_message, None, false).await.map(|t| t.text)
+    }
 
-        let block = crate::antisycophancy::render_block(
-            &knows,
-            signals.worth_testing,
-            signals.unsure,
-            signals.check,
-        );
-        if block.is_empty() {
-            return None;
-        }
-        Some(crate::recall::cap_to_token_budget(block))
+    /// The recall for one turn: the rendered block, as a labelled system
+    /// block or (with `seeded`) as a `<think>` thought seed, plus what the
+    /// host needs alongside it.
+    ///
+    /// **Deterministic.** The block is a function of the stored state and of
+    /// `user_message` / `previous_user_message` only: no in-memory history,
+    /// and nothing recall writes changes what a later recall of the same
+    /// message renders until the turn has ended (`record_turn_end`) or the
+    /// nightly pass has run. The host passes the chat's previous user
+    /// message, which drives the trajectory extrapolation the in-memory
+    /// embedding map used to.
+    pub async fn recall_turn(
+        &self,
+        session_id: &str,
+        user_message: &str,
+        previous_user_message: Option<&str>,
+        seeded: bool,
+    ) -> Option<TurnRecall> {
+        let (mut selected, candidates) = self
+            .select_for_turn(session_id, user_message, previous_user_message)
+            .await?;
+        let signals = self.turn_signals(session_id, &selected, &candidates).await;
+        let text = if seeded {
+            let reflection = crate::recall::render_reflection(&mut selected);
+            let block = crate::recall::render_reflection_block(
+                &reflection,
+                signals.worth_testing,
+                signals.unsure,
+                signals.check,
+            );
+            if block.is_empty() {
+                return None;
+            }
+            crate::recall::cap_reflection_to_token_budget(block)
+        } else {
+            let knows = crate::recall::render_knows(&mut selected);
+            let block = crate::antisycophancy::render_block(
+                &knows,
+                signals.worth_testing,
+                signals.unsure,
+                signals.check,
+            );
+            if block.is_empty() {
+                return None;
+            }
+            crate::recall::cap_to_token_budget(block)
+        };
+        Some(TurnRecall { text })
     }
 
     /// Thought-seeded variant of `recall`: the same belief-selection pass
@@ -240,20 +284,7 @@ impl PathwayEngine {
     /// `Provider::supports_assistant_prefill` and
     /// `reasoning_models::supports_reasoning` in `bigtiny_rust`.
     pub async fn recall_thought_seed(&self, session_id: &str, user_message: &str) -> Option<String> {
-        let (mut selected, candidates) = self.select_for_turn(session_id, user_message).await?;
-        let signals = self.turn_signals(session_id, &selected, &candidates).await;
-        let reflection = crate::recall::render_reflection(&mut selected);
-
-        let block = crate::recall::render_reflection_block(
-            &reflection,
-            signals.worth_testing,
-            signals.unsure,
-            signals.check,
-        );
-        if block.is_empty() {
-            return None;
-        }
-        Some(crate::recall::cap_reflection_to_token_budget(block))
+        self.recall_turn(session_id, user_message, None, true).await.map(|t| t.text)
     }
 
     /// The three anti-sycophancy signals both render paths carry, gathered
@@ -266,19 +297,23 @@ impl PathwayEngine {
         selected: &[crate::belief::SelectedBelief],
         candidates: &[crate::store::beliefs::Belief],
     ) -> TurnSignals {
+        // Display order's first belief (weight desc, id asc) -- the same one
+        // `select_for_turn` records first in `last_recall_ids`, which
+        // `record_turn_end` advances the streak from.
         let top_belief_id = selected
             .iter()
-            .max_by(|a, b| {
-                a.effective_weight
-                    .partial_cmp(&b.effective_weight)
+            .min_by(|a, b| {
+                b.effective_weight
+                    .partial_cmp(&a.effective_weight)
                     .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.belief.id.cmp(&b.belief.id))
             })
             .map(|s| s.belief.id.clone());
         TurnSignals {
             worth_testing: self.worth_testing_line().await,
             unsure: self.unsure_line(session_id, selected, candidates).await,
             check: match &top_belief_id {
-                Some(id) => self.check_yourself_line(id).await,
+                Some(id) => self.check_yourself_line(session_id, id).await,
                 None => None,
             },
         }
@@ -299,6 +334,7 @@ impl PathwayEngine {
         &self,
         session_id: &str,
         user_message: &str,
+        previous_user_message: Option<&str>,
     ) -> Option<(Vec<crate::belief::SelectedBelief>, Vec<crate::store::beliefs::Belief>)> {
         if self.is_paused(session_id).await.unwrap_or(false) {
             return None;
@@ -338,24 +374,36 @@ impl PathwayEngine {
         // Momentum-extrapolate toward where the conversation is heading
         // (`TrajectoryConfig`) before using the query for anything --
         // `predicted_query` is what actually drives domain inference and
-        // belief ranking, not the raw current-turn embedding.
-        let predicted_query = self.trajectory_predict(session_id, &query);
+        // belief ranking, not the raw current-turn embedding. The previous
+        // query is the chat's previous user message, embedded again (the
+        // embedding cache usually has it from last turn), never in-memory
+        // history: the same message after the same history extrapolates the
+        // same way, across restarts and regenerates.
+        let previous_query: Vec<f32> = match previous_user_message.map(str::trim) {
+            Some(prev) if semantic && !prev.is_empty() && self.cfg.trajectory.enabled => {
+                match self.embed.embed_with_space(prev).await {
+                    (v, true) => v,
+                    _ => Vec::new(),
+                }
+            }
+            _ => Vec::new(),
+        };
+        let predicted_query = trajectory_predict(&query, &previous_query, &self.cfg.trajectory);
         let query_domain = crate::domains::infer_query_domain(&candidates, &predicted_query);
         let cooccurrence = self.cooccurrence_adjacency(&candidates).await;
         let relevance = self
-            .judge_relevance(user_message, &candidates, &predicted_query, query_domain.as_deref())
+            .judge_relevance(session_id, user_message, &candidates, &predicted_query, query_domain.as_deref())
             .await;
 
         // Self-tuning floor: raise the configured `min_cosine` toward the
-        // running EWMA cut for this embedding space (minus slack), so the floor
-        // tracks where relevance actually separates here. Semantic query only
-        // -- centering a hash-fallback query against semantic beliefs is
-        // meaningless. The shared `Config` is cloned per turn so nothing
-        // global is mutated; cold (no EWMA yet) leaves the hard floor in place.
+        // snapshot of where relevance usually cuts in this embedding space
+        // (minus slack). The snapshot only moves in the nightly pass
+        // (`recall::cut_log`), so it cannot shift between two recalls of the
+        // same turn. Semantic query only; cold leaves the hard floor.
         let space = self.cfg.embedding.ollama_model.clone();
         let mut turn_cfg = self.cfg.clone();
         if semantic {
-            if let Some(ewma) = self.recall_cut_ewma(&space).await {
+            if let Some(ewma) = crate::recall::cut_log::snapshot(&self.db, &space).await {
                 turn_cfg.recall.min_cosine =
                     self.cfg.recall.min_cosine.max(ewma - self.cfg.recall.ewma_slack);
             }
@@ -370,18 +418,28 @@ impl PathwayEngine {
             &turn_cfg,
         );
 
-        // Fold this turn's effective cut into the running EWMA (semantic turns
-        // only). Best-effort -- a settings write must never fail recall.
+        // Log this turn's effective cut for tonight's fold (semantic turns
+        // only). Logging does not change the snapshot recall reads.
+        // Best-effort -- a settings write must never fail recall.
         if semantic {
             if let Some(cut) = cut {
-                if let Err(e) = self.update_recall_cut_ewma(&space, cut).await {
-                    tracing::debug!("pathway: could not update cut EWMA: {e}");
+                if let Err(e) = crate::recall::cut_log::log(&self.db, &space, cut).await {
+                    tracing::debug!("pathway: could not log the recall cut: {e}");
                 }
             }
         }
-        // Recorded so what recall injected can be read from disk. Prompts
-        // aren't stored, so this is the only trace. Best-effort.
-        let ids: Vec<String> = selected.iter().map(|s| s.belief.id.clone()).collect();
+        // Recorded, in display order (weight desc, id asc: what
+        // `render_knows` prints), so what recall injected can be read from
+        // disk, and `record_turn_end` knows this turn's top belief.
+        // Best-effort.
+        let mut ordered: Vec<&crate::belief::SelectedBelief> = selected.iter().collect();
+        ordered.sort_by(|a, b| {
+            b.effective_weight
+                .partial_cmp(&a.effective_weight)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.belief.id.cmp(&b.belief.id))
+        });
+        let ids: Vec<String> = ordered.iter().map(|s| s.belief.id.clone()).collect();
         if let Err(e) = self.db.set_last_recall_ids(session_id, &ids).await {
             tracing::debug!("pathway: could not record recall ids for {session_id}: {e}");
         }
@@ -392,37 +450,12 @@ impl PathwayEngine {
         }
     }
 
-    /// Read the running EWMA cut estimate for this embedding space
-    /// (`recall_cut_ewma::<space>` in `app_settings`); `None` before the first
-    /// injected turn in this space, or on any read error (soft-fail).
-    async fn recall_cut_ewma(&self, space: &str) -> Option<f64> {
-        let key = format!("recall_cut_ewma::{space}");
-        self.db
-            .get_setting(&key)
-            .await
-            .ok()
-            .flatten()
-            .and_then(|s| s.parse::<f64>().ok())
-    }
-
-    /// Fold `cut` (a turn's lowest kept general relevance) into the running
-    /// EWMA with smoothing `recall.ewma_alpha`; seeds it on the first
-    /// observation in this space.
-    async fn update_recall_cut_ewma(&self, space: &str, cut: f64) -> Result<()> {
-        let key = format!("recall_cut_ewma::{space}");
-        let alpha = self.cfg.recall.ewma_alpha;
-        let next = match self.recall_cut_ewma(space).await {
-            Some(prev) => alpha * cut + (1.0 - alpha) * prev,
-            None => cut,
-        };
-        self.db.set_setting(&key, &next.to_string()).await
-    }
-
     /// Ask the gate, if there is one, how relevant the strongest candidates are
     /// to this message. `None` (no gate, no opinion, nothing to ask about)
     /// leaves selection exactly as it was.
     async fn judge_relevance(
         &self,
+        session_id: &str,
         user_message: &str,
         candidates: &[crate::store::beliefs::Belief],
         query: &[f32],
@@ -432,6 +465,31 @@ impl PathwayEngine {
         if user_message.trim().is_empty() {
             return None;
         }
+        // Same message as this session's last judged one: reuse the verdict.
+        let key = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            user_message.hash(&mut h);
+            h.finish()
+        };
+        if let Some(hit) = self.judge_cache.get(session_id) {
+            if hit.0 == key {
+                return hit.1.clone();
+            }
+        }
+        let verdict = self.judge_relevance_uncached(user_message, candidates, query, query_domain, gate).await;
+        self.judge_cache.insert(session_id.to_string(), (key, verdict.clone()));
+        verdict
+    }
+
+    async fn judge_relevance_uncached(
+        &self,
+        user_message: &str,
+        candidates: &[crate::store::beliefs::Belief],
+        query: &[f32],
+        query_domain: Option<&str>,
+        gate: &Arc<dyn crate::traits::MemoryGate>,
+    ) -> Option<crate::recall::Relevance> {
         let pool = crate::recall::preselect(candidates, query, query_domain, RELEVANCE_POOL);
         if pool.is_empty() {
             return None;
@@ -479,38 +537,6 @@ impl PathwayEngine {
             }
         }
         adjacency
-    }
-
-    /// Momentum-extrapolate this turn's raw query embedding from the
-    /// previous turn's (`TrajectoryConfig`), then record the *raw* current
-    /// embedding (not the extrapolated one) for next turn's call -- momentum
-    /// should track the conversation's actual trajectory, not compound its
-    /// own predictions. A zero-length query (no `user_message` this turn)
-    /// is returned unchanged and does not touch the stored trajectory
-    /// state, so a probe/preflight call with an empty message can't clobber
-    /// what a real turn already recorded. Disabled (`cfg.trajectory.enabled
-    /// == false`) behaves identically to before this existed: no state
-    /// read or written, `query` returned as-is.
-    fn trajectory_predict(&self, session_id: &str, query: &[f32]) -> Vec<f32> {
-        if !self.cfg.trajectory.enabled || query.is_empty() {
-            return query.to_vec();
-        }
-        let predicted = self
-            .trajectory_embeddings
-            .get(session_id)
-            .map(|prev| ops::extrapolate(query, prev.value(), self.cfg.trajectory.momentum))
-            .unwrap_or_else(|| query.to_vec());
-        self.trajectory_embeddings.insert(session_id.to_string(), query.to_vec());
-        predicted
-    }
-
-    /// Drop this session's stored trajectory embedding. Called from the
-    /// background idle sweep once a session is being consolidated/closed
-    /// out, so `trajectory_embeddings` doesn't grow unbounded over the
-    /// daemon's lifetime the way `learn_locks` would without
-    /// `prune_idle_learn_locks` — same class of fix, smaller map.
-    pub fn forget_trajectory(&self, session_id: &str) {
-        self.trajectory_embeddings.remove(session_id);
     }
 
     /// `[Worth testing this turn]`: the oldest-flagged assumption that's
@@ -572,147 +598,195 @@ impl PathwayEngine {
     }
 
     /// `[Check yourself]`: fires on a detected plateau, gated by a 14-day
-    /// dismissal cooldown. No reply-shape-tracking subsystem exists (the
-    /// plan's original design), so this uses a cheap, honest proxy actually
-    /// available here: `top_belief_id` repeating as the single top-ranked
-    /// recall selection across many consecutive turns *is* a form of
-    /// plateau -- the system telling the user the same single thing about
-    /// themselves over and over with no new signal. Streak state lives in
-    /// `app_settings` (global, not session-scoped -- a real simplification,
-    /// but this section is explicitly the rarest-firing of the four).
-    async fn check_yourself_line(&self, top_belief_id: &str) -> Option<String> {
-        const STREAK_ID_KEY: &str = "top_belief_repeat_id";
-        const STREAK_KEY: &str = "top_belief_repeat_streak";
-        const LAST_SHOWN_KEY: &str = "check_yourself_last_shown_at";
-        const PLATEAU_STREAK: i64 = 20;
+    /// cooldown. The plateau proxy: the same belief has been this chat's
+    /// top-ranked recall for `PLATEAU_STREAK` turns in a row -- the system
+    /// telling the user the same single thing about themselves with no new
+    /// signal.
+    ///
+    /// **Read-only.** Recall used to advance the streak itself, so recalling
+    /// the same turn twice moved it, and the streak was global across chats.
+    /// Now it is per chat and advanced only by [`Self::record_turn_end`];
+    /// recall computes what this turn's streak *would* be and decides from
+    /// that, so the same stored state renders the same block.
+    async fn check_yourself_line(&self, session_id: &str, top_belief_id: &str) -> Option<String> {
+        let (shown, _) = self.check_decision(session_id, top_belief_id, chrono::Utc::now()).await;
+        shown.then(|| crate::antisycophancy::check_yourself(true, i64::MAX)).flatten()
+    }
 
-        let prev_id = self.db.get_setting(STREAK_ID_KEY).await.ok().flatten();
-        let prev_streak: i64 = self
+    /// `(show this turn, streak this turn)` for `[Check yourself]`, from the
+    /// stored per-chat streak and cooldown.
+    async fn check_decision(
+        &self,
+        session_id: &str,
+        top_belief_id: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> (bool, i64) {
+        let stored = self
             .db
-            .get_setting(STREAK_KEY)
+            .get_setting(&format!("{CHECK_STREAK_PREFIX}{session_id}"))
             .await
             .ok()
-            .flatten()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
-        let streak = if prev_id.as_deref() == Some(top_belief_id) {
-            prev_streak + 1
-        } else {
-            1
-        };
-        let _ = self.db.set_setting(STREAK_ID_KEY, top_belief_id).await;
-        let _ = self.db.set_setting(STREAK_KEY, &streak.to_string()).await;
-
-        let had_plateau = streak >= PLATEAU_STREAK;
+            .flatten();
+        let (prev_id, prev_streak) = stored
+            .as_deref()
+            .and_then(|v| v.rsplit_once('|'))
+            .map(|(id, n)| (id.to_string(), n.parse::<i64>().unwrap_or(0)))
+            .unwrap_or_default();
+        let streak = if prev_id == top_belief_id { prev_streak + 1 } else { 1 };
         let last_shown_days_ago = self
             .db
-            .get_setting(LAST_SHOWN_KEY)
+            .get_setting(&format!("{CHECK_SHOWN_PREFIX}{session_id}"))
             .await
             .ok()
             .flatten()
             .and_then(|v| v.parse::<i64>().ok())
             .and_then(|ts| chrono::DateTime::<chrono::Utc>::from_timestamp(ts, 0))
-            .map(|t| (chrono::Utc::now() - t).num_days())
+            .map(|t| (now - t).num_days())
             .unwrap_or(i64::MAX);
-
-        let line = crate::antisycophancy::check_yourself(had_plateau, last_shown_days_ago)?;
-        let _ = self
-            .db
-            .set_setting(LAST_SHOWN_KEY, &chrono::Utc::now().timestamp().to_string())
-            .await;
-        // Reset the streak once shown, so it doesn't refire every turn
-        // until the cooldown elapses again.
-        let _ = self.db.set_setting(STREAK_KEY, "0").await;
-        Some(line)
+        let shown = crate::antisycophancy::check_yourself(streak >= PLATEAU_STREAK, last_shown_days_ago).is_some();
+        (shown, streak)
     }
+
+    /// Turn-end bookkeeping the deterministic recall leaves to the host:
+    /// advance this chat's `[Check yourself]` streak from the turn's top
+    /// recalled belief (`last_recall_ids`, display order), and start the
+    /// cooldown when the turn showed the line. Call once per completed turn,
+    /// after the reply. Best-effort.
+    pub async fn record_turn_end(&self, session_id: &str) {
+        let Some(top) = self
+            .db
+            .get_state(session_id)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|s| s.last_recall_ids.into_iter().next())
+        else {
+            return;
+        };
+        let now = chrono::Utc::now();
+        let (shown, streak) = self.check_decision(session_id, &top, now).await;
+        let streak_key = format!("{CHECK_STREAK_PREFIX}{session_id}");
+        if shown {
+            let _ = self
+                .db
+                .set_setting(&format!("{CHECK_SHOWN_PREFIX}{session_id}"), &now.timestamp().to_string())
+                .await;
+            // Reset once shown, so it does not refire until a new plateau.
+            let _ = self.db.set_setting(&streak_key, &format!("{top}|0")).await;
+        } else {
+            let _ = self.db.set_setting(&streak_key, &format!("{top}|{streak}")).await;
+        }
+    }
+}
+
+/// Turns the same top belief must lead recall before `[Check yourself]`.
+const PLATEAU_STREAK: i64 = 20;
+const CHECK_STREAK_PREFIX: &str = "check_streak::";
+const CHECK_SHOWN_PREFIX: &str = "check_shown::";
+
+/// Momentum-extrapolate this turn's query embedding from the previous user
+/// message's (`TrajectoryConfig`). A pure function of the two embeddings:
+/// no stored state, so the same two messages always extrapolate the same
+/// way. An empty current or previous query (no message, no previous turn,
+/// embedder down) returns the current query unchanged, as does a disabled
+/// trajectory.
+pub fn trajectory_predict(query: &[f32], previous: &[f32], cfg: &crate::config::TrajectoryConfig) -> Vec<f32> {
+    if !cfg.enabled || query.is_empty() || previous.len() != query.len() {
+        return query.to_vec();
+    }
+    ops::extrapolate(query, previous, cfg.momentum)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn trajectory_predict_first_turn_returns_query_unchanged() {
-        // No prior state for this session -- must behave exactly like
-        // before trajectory extrapolation existed (regression guard).
-        let engine = PathwayEngine::open_in_memory(Config::default()).await.unwrap();
+    #[test]
+    fn trajectory_without_a_previous_message_returns_the_query() {
+        let cfg = Config::default().trajectory;
         let q = vec![0.6_f32, 0.8];
-        assert_eq!(engine.trajectory_predict("s1", &q), q);
+        assert_eq!(trajectory_predict(&q, &[], &cfg), q);
+    }
+
+    #[test]
+    fn a_disabled_trajectory_never_extrapolates() {
+        let mut cfg = Config::default().trajectory;
+        cfg.enabled = false;
+        let (a, b) = (vec![1.0_f32, 0.0], vec![0.0_f32, 1.0]);
+        assert_eq!(trajectory_predict(&b, &a, &cfg), b);
+    }
+
+    #[test]
+    fn trajectory_extrapolates_from_the_previous_message_and_nothing_else() {
+        let cfg = Config::default().trajectory;
+        let (a, b) = (vec![1.0_f32, 0.0], vec![0.0_f32, 1.0]);
+        let predicted = trajectory_predict(&b, &a, &cfg);
+        assert_eq!(predicted, ops::extrapolate(&b, &a, cfg.momentum));
+        assert_ne!(predicted, b, "must actually extrapolate");
+        // Pure: the same inputs give the same output, whatever ran before.
+        assert_eq!(trajectory_predict(&b, &a, &cfg), predicted);
     }
 
     #[tokio::test]
-    async fn trajectory_predict_disabled_never_extrapolates_or_records_state() {
-        let mut cfg = Config::default();
-        cfg.trajectory.enabled = false;
-        let engine = PathwayEngine::open_in_memory(cfg).await.unwrap();
-        let a = vec![1.0_f32, 0.0];
-        let b = vec![0.0_f32, 1.0];
-        assert_eq!(engine.trajectory_predict("s1", &a), a);
-        // If state had been recorded from the first call despite being
-        // disabled, this second call would extrapolate away from `b`;
-        // it must instead return `b` unchanged.
-        assert_eq!(engine.trajectory_predict("s1", &b), b);
-    }
-
-    #[tokio::test]
-    async fn trajectory_predict_extrapolates_from_the_previous_turn() {
+    async fn the_same_turn_recalls_the_same_block_twice() {
+        // Recall must be reproducible: same stored state + same messages ->
+        // same block (no in-memory trajectory, no floor moving under it).
         let engine = PathwayEngine::open_in_memory(Config::default()).await.unwrap();
-        let a = vec![1.0_f32, 0.0];
-        let b = vec![0.0_f32, 1.0];
-        assert_eq!(engine.trajectory_predict("s1", &a), a, "first turn has no history yet");
-
-        let momentum = engine.cfg.trajectory.momentum;
-        let predicted = engine.trajectory_predict("s1", &b);
-        assert_eq!(predicted, ops::extrapolate(&b, &a, momentum));
-        // Must actually differ from the raw current-turn embedding --
-        // otherwise this is a no-op wearing a trajectory costume.
-        assert_ne!(predicted, b);
+        for (i, v) in [vec![1.0_f32, 0.0], vec![0.0_f32, 1.0], vec![0.7_f32, 0.7]].into_iter().enumerate() {
+            let mut b = test_belief(&format!("b{i}"), &format!("The user has trait {i}."));
+            b.embedding = v;
+            engine.db.insert_belief(&b).await.unwrap();
+        }
+        let first = engine.recall_turn("s1", "what do you know", Some("earlier question"), false).await;
+        let second = engine.recall_turn("s1", "what do you know", Some("earlier question"), false).await;
+        assert!(first.is_some());
+        assert_eq!(first, second);
     }
 
     #[tokio::test]
-    async fn trajectory_predict_stores_the_raw_embedding_not_the_prediction() {
-        // If momentum compounded its own predictions instead of tracking
-        // the actual trajectory, a third call's prediction would diverge
-        // from a fresh two-call sequence ending at the same points.
+    async fn the_check_streak_only_moves_at_turn_end() {
         let engine = PathwayEngine::open_in_memory(Config::default()).await.unwrap();
-        let a = vec![1.0_f32, 0.0];
-        let b = vec![0.0_f32, 1.0];
-        let c = vec![-1.0_f32, 0.0];
-        engine.trajectory_predict("s1", &a);
-        engine.trajectory_predict("s1", &b);
-        let predicted_c = engine.trajectory_predict("s1", &c);
-
-        let fresh = PathwayEngine::open_in_memory(Config::default()).await.unwrap();
-        fresh.trajectory_predict("s2", &b); // seed history directly at b, skipping a
-        let fresh_predicted_c = fresh.trajectory_predict("s2", &c);
-        assert_eq!(predicted_c, fresh_predicted_c, "prediction must depend only on the last raw turn, not a compounded history");
+        let mut b = test_belief("top", "The user writes Rust.");
+        b.embedding = vec![1.0, 0.0];
+        engine.db.insert_belief(&b).await.unwrap();
+        for _ in 0..(PLATEAU_STREAK - 1) {
+            assert!(!engine.recall("s1", "").await.unwrap().contains("[Check yourself]"));
+            engine.record_turn_end("s1").await;
+        }
+        // Recalling repeatedly without ending the turn does not advance it.
+        for _ in 0..3 {
+            let _ = engine.recall("s1", "").await;
+        }
+        let at_plateau = engine.recall("s1", "").await.unwrap();
+        assert!(at_plateau.contains("[Check yourself]"), "the 20th turn shows it: {at_plateau}");
+        engine.record_turn_end("s1").await;
+        assert!(!engine.recall("s1", "").await.unwrap().contains("[Check yourself]"), "then the cooldown holds");
+        // Another chat has its own streak.
+        assert!(!engine.recall("s2", "").await.unwrap().contains("[Check yourself]"));
     }
 
-    #[tokio::test]
-    async fn trajectory_predict_empty_query_does_not_touch_stored_state() {
-        let engine = PathwayEngine::open_in_memory(Config::default()).await.unwrap();
-        let a = vec![1.0_f32, 0.0];
-        engine.trajectory_predict("s1", &a);
-
-        // An empty query (e.g. a preflight call with no user_message) must
-        // be a pure pass-through that never clobbers the recorded turn.
-        assert_eq!(engine.trajectory_predict("s1", &[]), Vec::<f32>::new());
-
-        let b = vec![0.0_f32, 1.0];
-        let momentum = engine.cfg.trajectory.momentum;
-        let predicted = engine.trajectory_predict("s1", &b);
-        assert_eq!(predicted, ops::extrapolate(&b, &a, momentum), "the empty call must not have overwritten `a`");
-    }
-
-    #[tokio::test]
-    async fn forget_trajectory_clears_a_sessions_stored_embedding() {
-        let engine = PathwayEngine::open_in_memory(Config::default()).await.unwrap();
-        let a = vec![1.0_f32, 0.0];
-        engine.trajectory_predict("s1", &a);
-        engine.forget_trajectory("s1");
-        // With history cleared, the next call behaves like a first turn.
-        let b = vec![0.0_f32, 1.0];
-        assert_eq!(engine.trajectory_predict("s1", &b), b);
+    fn test_belief(id: &str, text: &str) -> crate::store::beliefs::Belief {
+        crate::store::beliefs::Belief {
+            id: id.into(),
+            text: text.into(),
+            embedding: vec![1.0, 0.0],
+            confidence: 0.7,
+            provenance: crate::store::beliefs::Provenance::DirectStatement,
+            layer: crate::store::beliefs::Layer::Context,
+            tested: true,
+            domain: None,
+            tier: "context".into(),
+            support_count: 1,
+            distinct_sessions: 1,
+            contradict_count: 0,
+            pinned: false,
+            last_confirmed_at: Some(chrono::Utc::now()),
+            consolidated_at: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            session_id: None,
+            embedding_model: crate::config::DEFAULT_EMBEDDING_MODEL.into(),
+        }
     }
 
     #[tokio::test]

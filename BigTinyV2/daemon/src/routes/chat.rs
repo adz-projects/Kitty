@@ -615,8 +615,8 @@ pub async fn fork_session(
         let new_msg_id = uuid::Uuid::new_v4().to_string();
         let res = sqlx::query(
             r#"INSERT INTO messages (id, session_id, role, content, tool_calls, tool_call_id, token_count, content_format,
-                                    reasoning, provider_id, model)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+                                    reasoning, provider_id, model, memory_block)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(&new_msg_id)
         .bind(&new_id)
@@ -629,6 +629,9 @@ pub async fn fork_session(
         .bind(&row.reasoning)
         .bind(&row.provider_id)
         .bind(&row.model)
+        // A branch keeps its stored memory blocks, so its prompt prefix is
+        // the source's and a regenerated reply sees the same memory.
+        .bind(&row.memory_block)
         .execute(&mut *tx)
         .await;
         match res {

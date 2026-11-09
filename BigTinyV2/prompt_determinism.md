@@ -17,11 +17,29 @@ change to the prompt has to respect.
    override, writable-dirs hint, workspace snapshot, `[Original request]`
    anchor, then the compaction memory block (`[CONSOLIDATED PROJECT MEMORY]`).
 3. **The live tail**: the messages after `compacted_through_rowid`.
-4. **Tail-only blocks**: memory recall (pathway / memorabilia hints, pre-flight
-   recall) goes *after* the history, next to the new user message, so it can
-   change every turn without costing a miss.
+4. **Memory blocks, stored in history**: the memory recall block (Adaptive
+   Pathway + Memorabilia) is injected just before the user message it belongs
+   to, and **stored on that message** (`messages.memory_block`). Every later
+   turn re-emits it in the same place, so the previous turn's whole prompt is
+   a byte-exact prefix of the next one. A block is injected only when it
+   differs from the last stored one (the delta rule), so an unchanged memory
+   costs nothing. Branches copy the stored blocks with their messages.
+   (Before this, the block sat unstored before the newest message, and the
+   next turn re-processed the whole previous exchange.) Pre-flight recall and
+   the `<think>` thought seed are still tail-only and unstored.
 
 ## What keeps it stable
+
+- **Recall is a function of stored state.** Given the same stored state and
+  the same message (plus the chat's previous user message, which drives the
+  trajectory extrapolation), both memory engines render the same block: no
+  in-memory history, and nothing recall writes changes a later recall of
+  the same turn. The self-tuning relevance floor reads a snapshot that moves
+  only in the engines' nightly/heavy maintenance (each turn merely logs its
+  cut, `recall::cut_log`); `[Check yourself]`'s streak is per chat and moves
+  at turn end (`PathwayEngine::record_turn_end`); a judge verdict is cached
+  per chat and message. A recall that misses its time budget still yields no
+  block, which is the one remaining source of variation.
 
 - **Tools are sorted by name** (`mcp/manager.rs`, `list_tools` /
   `list_tools_for_app`). Registration order would otherwise depend on which
