@@ -102,9 +102,9 @@ async fn apply(app: &AppHandle) -> Result<MemoryStatus, String> {
         )
     };
     let memorabilia_supported = !cfg!(target_os = "android");
-    // The embedder needs both the model and the tokenizer beside it.
-    let model_installed =
-        crate::models::resolve(&model).is_some() && crate::models::tokenizer_path().is_some();
+    // The configured embedding model (or the EmbeddingGemma 1 stand-in while
+    // it downloads), plus a tokenizer when it is a `.tflite`.
+    let model_installed = crate::models::embedding_model_ready(&model).is_some();
 
     let listing = client.get_json("/api/apps/me/plugins").await?;
     let engine_has_embeddings = listing

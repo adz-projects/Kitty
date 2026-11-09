@@ -62,6 +62,25 @@ LITERT_DLLS = [
     "litert-lm.dll",
 ]
 
+# The LiteRT-LM runtime with the embedding API (EmbeddingGemma 2's `.litertlm`
+# bundle; `BigTinyV2/daemon/src/litert/lm_embedder.rs`). It is a newer runtime
+# than the summarizer's `litert-lm.dll` above, whose C API is incompatible, so
+# it ships beside it under its own name. Google publishes Windows/Android
+# builds only inside the `litert-lm-api` wheels on PyPI; this pins one by its
+# PyPI sha256 and takes the DLL out of it. The wheel imports nothing beyond
+# Windows system DLLs for CPU use (the GPU compilers in the wheel load on
+# demand), so the DLL alone is enough.
+LITERT_LM_EMBED_WHEEL = {
+    "url": (
+        "https://files.pythonhosted.org/packages/4f/73/"
+        "c61db42a59c6d540f3bf04616bfcccba172980e62937b8af5bfe8e32c0c3/"
+        "litert_lm_api-0.19.1-py3-none-win_amd64.whl"
+    ),
+    "sha256": "9c5856fbf6dc47fdd29d472b7e0b82e071671e95e02a8cb9fd651a8c8c156367",
+    "member": "litert_lm/litert-lm.dll",
+    "dest": "litert-lm-embed.dll",
+}
+
 # name -> {dir, exe, features}. `exe` is the Cargo [[bin]] name and also the
 # externalBin stem `tauri.conf.json` expects.
 TARGETS: dict[str, dict[str, object]] = {
@@ -225,10 +244,37 @@ def build_target(name: str) -> None:
                 raise SystemExit(f"{dll} not found in {prebuilt}; the LiteRT download step did not run")
             shutil.copy2(src, RESOURCES_DIR / dll)
             print(f"-> {RESOURCES_DIR / dll}")
+        stage_litert_lm_embed()
 
     manifest = load_manifest()
     manifest[name] = source_hash(name)
     save_manifest(manifest)
+
+
+def stage_litert_lm_embed() -> None:
+    """Fetch the pinned `litert-lm-api` wheel and stage its DLL as
+    `litert-lm-embed.dll`. Skipped when the staged file already came from
+    this wheel (the wheel's hash is recorded beside it)."""
+    import io
+    import urllib.request
+    import zipfile
+
+    spec = LITERT_LM_EMBED_WHEEL
+    dest = RESOURCES_DIR / spec["dest"]
+    stamp = RESOURCES_DIR / (spec["dest"] + ".source")
+    if dest.exists() and not is_lfs_pointer(dest) and stamp.exists() and stamp.read_text().strip() == spec["sha256"]:
+        print(f"-> {dest} (up to date)")
+        return
+    print(f"fetching {spec['url']}")
+    with urllib.request.urlopen(spec["url"]) as r:
+        data = r.read()
+    got = hashlib.sha256(data).hexdigest()
+    if got != spec["sha256"]:
+        raise SystemExit(f"litert-lm-api wheel hash mismatch: got {got}, pinned {spec['sha256']}")
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
+        dest.write_bytes(z.read(spec["member"]))
+    stamp.write_text(spec["sha256"] + "\n")
+    print(f"-> {dest}")
 
 
 def litert_prebuilt_dir(release_dir: Path) -> Path:

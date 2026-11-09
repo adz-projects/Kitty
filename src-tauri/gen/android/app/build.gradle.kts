@@ -47,6 +47,50 @@ val extractLiteRtJni by tasks.registering(Copy::class) {
     into(layout.buildDirectory.dir("litert-jni"))
 }
 
+// The LiteRT-LM runtime with the embedding API, for EmbeddingGemma 2's
+// `.litertlm` bundle (`BigTinyV2/daemon/src/litert/lm_embedder.rs`), which the
+// Rust side opens as `liblitert-lm.so` at run time. Google publishes the
+// Android build only inside the `litert-lm-api` wheel on PyPI, so it is fetched
+// pinned by its PyPI sha256 (same pin discipline as `plugins/build.py` uses
+// for the Windows DLL) and unzipped into its own generated jniLibs dir.
+val litertLmWheelUrl =
+    "https://files.pythonhosted.org/packages/f3/13/" +
+        "3857f2098ee92f029562039882d2960c7b574fc9021344441d88ed65f17e/" +
+        "litert_lm_api-0.19.1-py3-none-android_23_arm64_v8a.whl"
+val litertLmWheelSha256 = "605bec7ed6391b7b5b4788d0587f7d3bf73ff6f6750bb3749c9bbed557af0254"
+val litertLmWheel = layout.buildDirectory.file("litert-lm-wheel/litert_lm_api-0.19.1-android_arm64.whl")
+
+val fetchLiteRtLmWheel by tasks.registering {
+    outputs.file(litertLmWheel)
+    doLast {
+        val out = litertLmWheel.get().asFile
+        fun sha256(f: java.io.File): String =
+            java.security.MessageDigest.getInstance("SHA-256")
+                .digest(f.readBytes())
+                .joinToString("") { "%02x".format(it) }
+        if (out.exists() && sha256(out) == litertLmWheelSha256) return@doLast
+        out.parentFile.mkdirs()
+        java.net.URI(litertLmWheelUrl).toURL().openStream().use { input ->
+            out.outputStream().use { input.copyTo(it) }
+        }
+        val got = sha256(out)
+        if (got != litertLmWheelSha256) {
+            out.delete()
+            throw GradleException("litert-lm-api wheel hash mismatch: got $got, pinned $litertLmWheelSha256")
+        }
+    }
+}
+
+val extractLiteRtLmJni by tasks.registering(Copy::class) {
+    dependsOn(fetchLiteRtLmWheel)
+    from(zipTree(litertLmWheel)) {
+        include("litert_lm/liblitert-lm.so")
+        eachFile { path = "arm64-v8a/$name" }
+        includeEmptyDirs = false
+    }
+    into(layout.buildDirectory.dir("litert-lm-jni"))
+}
+
 android {
     compileSdk = 36
     namespace = "com.kitty.app"
@@ -105,11 +149,13 @@ android {
     }
     // Pick up the LiteRT `.so` extracted from the AAR (see `extractLiteRtJni`).
     sourceSets["main"].jniLibs.srcDir(layout.buildDirectory.dir("litert-jni"))
+    // And the LiteRT-LM embedding runtime (see `extractLiteRtLmJni`).
+    sourceSets["main"].jniLibs.srcDir(layout.buildDirectory.dir("litert-lm-jni"))
 }
 
 // The extraction must run before AGP merges jniLibs. `preBuild` is early enough
 // and variant-agnostic.
-tasks.named("preBuild") { dependsOn(extractLiteRtJni) }
+tasks.named("preBuild") { dependsOn(extractLiteRtJni, extractLiteRtLmJni) }
 
 rust {
     rootDirRel = "../../../"

@@ -558,6 +558,7 @@ dependencies = [
  "kitty-tools",
  "kitty-wasm",
  "kitty-web",
+ "libloading 0.9.0",
  "memchr",
  "memorabilia",
  "minijinja",

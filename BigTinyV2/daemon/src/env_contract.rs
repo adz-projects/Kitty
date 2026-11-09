@@ -219,6 +219,9 @@ pub fn apply_env_overrides(config: &mut BigTinyConfig) {
     if let Ok(v) = std::env::var("BIGTINY_LITERT__TOKENIZER_PATH") {
         config.litert.tokenizer_path = v;
     }
+    if let Ok(v) = std::env::var("BIGTINY_LITERT__EMBED_LIB_PATH") {
+        config.litert.embed_lib_path = v;
+    }
     if let Ok(v) = std::env::var("BIGTINY_LITERT__SUMMARIZER_MODEL_PATH") {
         config.litert.summarizer_model_path = v;
     }

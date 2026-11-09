@@ -364,6 +364,7 @@ dependencies = [
  "kitty-tools",
  "kitty-wasm",
  "kitty-web",
+ "libloading",
  "litert-lm-rust",
  "memchr",
  "memorabilia",

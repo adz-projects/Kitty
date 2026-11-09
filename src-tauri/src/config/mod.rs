@@ -563,8 +563,16 @@ fn default_ap_embedding_model() -> String {
 // LiteRT migration: these now name LiteRT artifacts (`.tflite` embedder,
 // `.litertlm` generative summarizer), not GGUFs. Names kept for churn reasons;
 // the values match `src/lib/curated_models.ts` and what `bigtiny_env` resolves.
-pub const DEFAULT_EMBEDDING_GGUF: &str = "embeddinggemma-300M_seq256_mixed-precision.tflite";
+pub const DEFAULT_EMBEDDING_GGUF: &str = "embeddinggemma-2-text-270m.litertlm";
 pub const DEFAULT_SUMMARIZER_GGUF: &str = "gemma-4-E2B-it.litertlm";
+
+/// The previous default, EmbeddingGemma 1 (`.tflite`). Its mixed-precision
+/// build gave vectors that barely separated topics
+/// (`docs/memory-eval/README.md`), so a config still naming it moves to
+/// EmbeddingGemma 2. Until that file is downloaded,
+/// `models::embedding_model_ready` keeps using this one, so memory does not
+/// switch off across the upgrade.
+const PREVIOUS_DEFAULT_EMBEDDING: &str = crate::models::LEGACY_EMBEDDING_FILE;
 
 /// Ollama tags these two settings held before Phase 2b, carried forward by
 /// `migrate_model_tags_to_gguf`.
@@ -1175,6 +1183,7 @@ fn migrate_model_tags_to_gguf(mut config: Config) -> Config {
     let emb = &config.adaptive_pathway_embedding_model;
     if emb == LEGACY_EMBEDDING_TAG
         || emb == UNAVAILABLE_EMBEDDING_GGUF
+        || emb == PREVIOUS_DEFAULT_EMBEDDING
         || emb.ends_with(".gguf")
         || emb == "Qwen3-Embedding-0.6B-Q8_0"
     {
@@ -1625,6 +1634,22 @@ mod tests {
         assert_eq!(
             migrated.adaptive_pathway_embedding_model,
             DEFAULT_EMBEDDING_GGUF
+        );
+    }
+
+    /// The EmbeddingGemma 1 default moves to EmbeddingGemma 2. (Until the new
+    /// file is downloaded, `models::embedding_model_ready` keeps using the
+    /// old one, so the migration never switches memory off.)
+    #[test]
+    fn the_embeddinggemma_1_default_moves_to_embeddinggemma_2() {
+        let old = Config {
+            adaptive_pathway_embedding_model: PREVIOUS_DEFAULT_EMBEDDING.to_string(),
+            ..Config::default()
+        };
+        let migrated = migrate_model_tags_to_gguf(old);
+        assert_eq!(
+            migrated.adaptive_pathway_embedding_model,
+            "embeddinggemma-2-text-270m.litertlm"
         );
     }
 

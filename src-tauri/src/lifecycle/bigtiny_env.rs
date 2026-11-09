@@ -186,7 +186,9 @@ pub fn daemon_env(
     // (embeddings -> lexical hashing, summarizer -> remote session model) rather
     // than failing to start. The llama-only knobs (`n_ctx`, `n_gpu_layers`,
     // `backend`, cache types) are no longer sent — LiteRT has no equivalent.
-    let embed_tflite = crate::models::resolve(pathway_embedding_model)
+    // The configured embedding model, or the EmbeddingGemma 1 file while the
+    // configured one is not downloaded yet; empty when neither is usable.
+    let embed_model = crate::models::embedding_model_ready(pathway_embedding_model)
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
     // The tokenizer downloaded with the model (decision #77); a bundled copy
@@ -205,20 +207,30 @@ pub fn daemon_env(
     } else {
         "libLiteRt.dll"
     };
-    // The engine needs both the model and its tokenizer to embed at all.
-    let litert_enabled = !embed_tflite.is_empty() && !tokenizer.is_empty();
+    // A `.litertlm` embedding bundle (EmbeddingGemma 2) runs through the
+    // LiteRT-LM embedding runtime, shipped under its own name because the
+    // summarizer's `litert-lm.dll` is an older, incompatible C API. Bare
+    // filename, resolved like `lib_name` above.
+    let embed_lib_name = if cfg!(target_os = "android") {
+        "liblitert-lm.so"
+    } else {
+        "litert-lm-embed.dll"
+    };
+    // `embedding_model_ready` already required the tokenizer for a `.tflite`.
+    let litert_enabled = !embed_model.is_empty();
     if !litert_enabled {
         tracing::info!(
             embedding_model = %pathway_embedding_model,
-            "EmbeddingGemma tflite or tokenizer.json not found; LiteRT engine stays off"
+            "embedding model not found (or a .tflite without its tokenizer.json); LiteRT engine stays off"
         );
     }
 
     env.extend([
         ("BIGTINY_LITERT__ENABLED".to_string(), b(litert_enabled)),
         ("BIGTINY_LITERT__LIB_PATH".to_string(), lib_name.to_string()),
-        ("BIGTINY_LITERT__EMBED_MODEL_PATH".to_string(), embed_tflite),
+        ("BIGTINY_LITERT__EMBED_MODEL_PATH".to_string(), embed_model),
         ("BIGTINY_LITERT__TOKENIZER_PATH".to_string(), tokenizer),
+        ("BIGTINY_LITERT__EMBED_LIB_PATH".to_string(), embed_lib_name.to_string()),
         (
             "BIGTINY_LITERT__SUMMARIZER_MODEL_PATH".to_string(),
             summarizer_litertlm,

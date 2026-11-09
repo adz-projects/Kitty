@@ -38,6 +38,8 @@ pub mod db_recover;
 pub mod erase;
 pub mod host;
 pub mod memorabilia_host;
+#[cfg(all(test, feature = "litert-embed"))]
+mod memory_eval;
 
 pub use host::PluginHost;
 pub use memorabilia_host::MemorabiliaHost;

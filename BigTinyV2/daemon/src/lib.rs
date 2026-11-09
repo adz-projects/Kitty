@@ -148,12 +148,30 @@ pub async fn run(config: BigTinyConfig, options: RunOptions) -> Result<(), Daemo
                 .file_stem()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "unknown".into());
+            // The space tag is the model's file stem, so moving to another
+            // model (EmbeddingGemma 1 -> 2) is a new space, and
+            // `reembed_stale_beliefs` / memorabilia's `reembed_stale` migrate
+            // the stored vectors into it.
             ap_config.embedding.ollama_model = format!("litert:{stem}");
-            embedder = Some(Arc::new(litert::LiteRtEmbedder::spawn(
-                config.litert.lib_path.clone(),
-                config.litert.embed_model_path.clone(),
-                config.litert.tokenizer_path.clone(),
-            )));
+            let is_bundle = std::path::Path::new(&config.litert.embed_model_path)
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("litertlm"));
+            embedder = Some(if is_bundle {
+                // A LiteRT-LM bundle carries its own tokenizer and pooling.
+                let lib = if config.litert.embed_lib_path.trim().is_empty() {
+                    default_litert_lm_embed_lib().to_string()
+                } else {
+                    config.litert.embed_lib_path.clone()
+                };
+                Arc::new(litert::LiteRtLmEmbedder::spawn(lib, config.litert.embed_model_path.clone()))
+                    as Arc<dyn adaptive_pathway::embed::SemanticEmbedder>
+            } else {
+                Arc::new(litert::LiteRtEmbedder::spawn(
+                    config.litert.lib_path.clone(),
+                    config.litert.embed_model_path.clone(),
+                    config.litert.tokenizer_path.clone(),
+                ))
+            });
             tracing::info!(
                 space = %ap_config.embedding.ollama_model,
                 "adaptive-pathway embeddings served in-process by LiteRT"
@@ -538,6 +556,18 @@ pub async fn run(config: BigTinyConfig, options: RunOptions) -> Result<(), Daemo
     discovery::withdraw(std::path::Path::new(&options.data_dir)).await;
 
     Ok(())
+}
+
+/// The LiteRT-LM embedding runtime's file name when the host gave no path:
+/// resolved by the OS loader, i.e. beside the engine on Windows and from the
+/// APK's native libraries on Android -- where each is bundled.
+#[cfg(feature = "litert-embed")]
+fn default_litert_lm_embed_lib() -> &'static str {
+    if cfg!(target_os = "android") {
+        "liblitert-lm.so"
+    } else {
+        "litert-lm-embed.dll"
+    }
 }
 
 /// Resolves on whichever comes first: a ctrl-c/SIGTERM (CLI usage) or the

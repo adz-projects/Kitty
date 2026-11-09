@@ -33,7 +33,8 @@
       "resources/libLiteRtTopKWebGpuSampler.dll",
       "resources/libwebgpu_dawn.dll",
       "resources/libGemmaModelConstraintProvider.dll",
-      "resources/litert-lm.dll"
+      "resources/litert-lm.dll",
+      "resources/litert-lm-embed.dll"
     ],
     "windows": {
       "webviewInstallMode": {

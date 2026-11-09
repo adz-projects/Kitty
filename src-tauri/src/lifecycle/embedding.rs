@@ -64,7 +64,9 @@ pub(crate) fn set_embedding_status(app: &AppHandle, status: EmbeddingModelStatus
 /// hundreds of megabytes without asking is exactly the behaviour retiring
 /// managed Ollama was meant to end.
 pub(crate) fn refresh_embedding_status(app: &AppHandle, model: &str) {
-    let present = crate::models::resolve(model).is_some();
+    // "Present" means the engine can embed: the configured model, or the
+    // EmbeddingGemma 1 stand-in while it downloads (with its tokenizer).
+    let present = crate::models::embedding_model_ready(model).is_some();
     set_embedding_status(
         app,
         if present {

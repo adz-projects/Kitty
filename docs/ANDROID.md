@@ -23,8 +23,9 @@ is right.
   banner), superseding D26(c)'s "start fresh".
 - **No engine restart on the phone.** Start-up settings apply the next time
   Kitty starts; the restart buttons are hidden and the hub says so.
-- **Memory**: Adaptive Pathway runs when the EmbeddingGemma model (and the
-  Gemma `tokenizer.json` downloaded with it) is on disk and the toggle is on;
+- **Memory**: Adaptive Pathway runs when the EmbeddingGemma 2 model is on disk
+  (or, on an install from before it, the EmbeddingGemma 1 `.tflite` and its
+  `tokenizer.json`) and the toggle is on;
   switched per app without a restart. **Memorabilia and specialists are off on
   Android** — their Settings panes are hidden and their MCP rows register
   disabled. No generative model runs on the phone; compaction uses the chat's
@@ -58,8 +59,10 @@ is right.
 > 1. **There is no llama.cpp anywhere.** D1 and §9 are written against
 >    `llama-cpp-2` and GGUF weights; v0.7.0 replaced that engine wholesale with
 >    **LiteRT** (`BigTinyV2/daemon/src/litert/`). On Android LiteRT does exactly
->    one job — EmbeddingGemma `.tflite` semantic embeddings for adaptive
->    pathway, loaded through the Play AAR's `libLiteRt.so` — and **no generative
+>    one job — EmbeddingGemma 2 semantic embeddings for adaptive
+>    pathway, through LiteRT-LM's embedding API (`liblitert-lm.so`, from the
+>    `litert-lm-api` wheel; the older EmbeddingGemma 1 `.tflite` path still
+>    loads through the Play AAR's `libLiteRt.so`) — and **no generative
 >    model runs on the phone at all**; compaction offloads to the session's
 >    remote chat model. The Windows-only generative summarizer
 >    (`gemma-4-E2B-it.litertlm`) is gated `cfg(all(windows, feature =

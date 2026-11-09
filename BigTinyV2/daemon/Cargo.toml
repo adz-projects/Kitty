@@ -46,7 +46,9 @@ test-support = []
 # `tokenizer.json`; `default-features=false` keeps the C `onig`/C++ `esaxx`
 # backends out so it cross-compiles clean to Android). `litert-engine` adds the
 # Windows-only generative summarizer (`litert-lm-rust`, `.litertlm`).
-litert-embed = ["dep:edgefirst-tflite", "dep:tokenizers"]
+# `libloading` opens the LiteRT-LM embedding runtime for `.litertlm` embedding
+# bundles (EmbeddingGemma 2; `litert/lm_embedder.rs`).
+litert-embed = ["dep:edgefirst-tflite", "dep:tokenizers", "dep:libloading"]
 litert-engine = ["litert-embed", "dep:litert-lm-rust"]
 
 [dependencies]
@@ -62,6 +64,9 @@ edgefirst-tflite = { version = "0.9", optional = true }
 tokenizers = { version = "0.22", default-features = false, features = [
     "fancy-regex",
 ], optional = true }
+# Opens the LiteRT-LM embedding runtime (`litert-lm-embed.dll` /
+# `liblitert-lm.so`) at run time. Already in the graph via `edgefirst-tflite`.
+libloading = { version = "0.9", optional = true }
 axum = { version = "0.8", features = ["json", "macros"] }
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["io", "codec"] }

@@ -293,4 +293,121 @@ mod tests {
     fn the_document_prompt_wraps_the_text() {
         assert_eq!(format_input("hi"), "title: none | text: hi");
     }
+
+    /// Diagnostic: the model's declared I/O, and how well each way of
+    /// feeding it separates obviously-related from unrelated text. Run with
+    /// the same env vars as `plugins::memory_eval`.
+    #[test]
+    #[ignore]
+    fn embedder_io_diagnostic() {
+        use edgefirst_tflite::{Library, Model, TensorType};
+        let var = |n: &str| std::env::var(n).expect(n);
+        let (lib_path, model_path, tok_path) =
+            (var("KITTY_LITERT_LIB"), var("KITTY_EMBED_MODEL"), var("KITTY_EMBED_TOKENIZER"));
+        let tok = Tokenizer::from_file(&tok_path).unwrap();
+        let lib = Library::from_path(&lib_path).unwrap();
+        let model = Model::from_file(&lib, &model_path).unwrap();
+        let mut it = build_interpreter(&lib, &model, None).unwrap();
+
+        for t in it.inputs().unwrap() {
+            println!("input  {:<30} {:?} {:?}", t.name(), t.tensor_type(), t.shape());
+        }
+        for t in it.outputs().unwrap() {
+            println!("output {:<30} {:?} {:?}", t.name(), t.tensor_type(), t.shape());
+        }
+
+        // Tokenisation sanity and padding influence.
+        {
+            let sample = format_input("User bakes sourdough bread on weekends.");
+            let enc = tok.encode(sample.as_str(), true).unwrap();
+            println!("ids {:?}", enc.get_ids());
+            println!("decoded {:?}", tok.decode(enc.get_ids(), false).unwrap());
+            let mut run = |text: &str, pad: i32, keep_eos: bool| -> Vec<f32> {
+                let enc = tok.encode(text, true).unwrap();
+                let mut ids: Vec<i32> = enc.get_ids().iter().map(|&x| x as i32).collect();
+                if !keep_eos && ids.last() == Some(&1) {
+                    ids.pop();
+                }
+                ids.resize(SEQ_LEN, pad);
+                for mut t in it.inputs_mut().unwrap() {
+                    t.copy_from_slice(&ids).unwrap();
+                }
+                it.invoke().unwrap();
+                let out = it.outputs().unwrap().into_iter().next().unwrap();
+                l2_normalise(out.as_slice::<f32>().unwrap())
+            };
+            let d = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
+            let a = format_input("User bakes sourdough bread on weekends.");
+            let b = format_input("The quarterly tax filing deadline is in April.");
+            let (a0, a1, b0, b1) = (run(&a, 0, true), run(&a, 1, true), run(&b, 0, true), run(&b, 1, true));
+            println!("same text, pad 0 vs pad 1      : {:.3}", d(&a0, &a1));
+            println!("unrelated pair, pad 0         : {:.3}", d(&a0, &b0));
+            println!("unrelated pair, pad 1         : {:.3}", d(&a1, &b1));
+            let (an, bn) = (run(&a, 0, false), run(&b, 0, false));
+            println!("unrelated pair, pad 0, no eos : {:.3}", d(&an, &bn));
+            println!("same text, eos vs no eos      : {:.3}", d(&a0, &an));
+        }
+
+        // mode 0: production (ids into every Int32 input).
+        // mode 1: ids into the first Int32 input, a 1/0 mask into any other.
+        let mut embed = |text: &str, mode: u8| -> Vec<f32> {
+            let enc = tok.encode(text, true).unwrap();
+            let mut ids: Vec<i32> = enc.get_ids().iter().map(|&x| x as i32).collect();
+            ids.truncate(SEQ_LEN);
+            let real = ids.len();
+            ids.resize(SEQ_LEN, 0);
+            let mask: Vec<i32> = (0..SEQ_LEN).map(|i| i32::from(i < real)).collect();
+            let mut k = 0;
+            for mut t in it.inputs_mut().unwrap() {
+                if t.tensor_type() == TensorType::Int32 {
+                    let data = if mode == 1 && k > 0 { &mask } else { &ids };
+                    t.copy_from_slice(data).unwrap();
+                    k += 1;
+                }
+            }
+            it.invoke().unwrap();
+            let out = it
+                .outputs()
+                .unwrap()
+                .into_iter()
+                .find(|t| t.tensor_type() == TensorType::Float32)
+                .unwrap();
+            l2_normalise(out.as_slice::<f32>().unwrap())
+        };
+        let dot = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
+
+        let docs = [
+            "User is training for a half marathon.",
+            "User believes large technology companies act mainly in their own interest rather than the public's.",
+            "User bakes sourdough bread on weekends.",
+            "User uses SQLite for local storage in their projects.",
+        ];
+        let queries = [
+            ("How much should I drink during a 21 km race?", 0),
+            ("My sourdough starter isn't rising anymore. What's wrong?", 2),
+            ("When should I turn on WAL mode in SQLite?", 3),
+            ("Why do AI labs lobby for regulation that burdens smaller competitors?", 1),
+        ];
+        for (label, mode, qfmt) in [
+            ("production", 0u8, false),
+            ("mask", 1, false),
+            ("mask+query prompt", 1, true),
+            ("production+query prompt", 0, true),
+        ] {
+            let dv: Vec<Vec<f32>> = docs.iter().map(|d| embed(&format_input(d), mode)).collect();
+            let mut right = 0;
+            let mut margins = Vec::new();
+            for (q, want) in queries {
+                let qt = if qfmt { format!("task: search result | query: {q}") } else { format_input(q) };
+                let qv = embed(&qt, mode);
+                let s: Vec<f32> = dv.iter().map(|d| dot(&qv, d)).collect();
+                let best = (0..s.len()).max_by(|&a, &b| s[a].partial_cmp(&s[b]).unwrap()).unwrap();
+                right += usize::from(best == want);
+                let other = (0..s.len()).filter(|&i| i != want).map(|i| s[i]).fold(f32::MIN, f32::max);
+                margins.push(format!("{:+.3}", s[want] - other));
+                println!("  [{label}] {q:<70} {}", s.iter().map(|x| format!("{x:.3}")).collect::<Vec<_>>().join(" "));
+            }
+            println!("{label:<26} right {right}/4  margins {}", margins.join(" "));
+        }
+    }
 }

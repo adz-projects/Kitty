@@ -57,17 +57,18 @@ export const CURATED_MODELS: CuratedModel[] = [
     desktopOnly: true, // Android offloads compaction to the remote chat model.
   },
   {
-    // EmbeddingGemma ships only `.tflite` variants (+ `sentencepiece.model`).
-    // The generic `seq256` mixed-precision build runs on CPU on any device; a
-    // per-SoC NPU variant (e.g. `...google.tensor_g5.tflite`) is an
-    // optimisation layered on later.
-    repo: 'litert-community/embeddinggemma-300m',
-    file: 'embeddinggemma-300M_seq256_mixed-precision.tflite',
-    label: 'EmbeddingGemma · 300M',
+    // EmbeddingGemma 2, text-only, as a LiteRT-LM bundle (model + tokenizer in
+    // one file) run by the engine's LiteRT-LM embedding runtime. The generic
+    // file runs on CPU anywhere; the repo's per-SoC NPU variants are an
+    // optimisation for later. Replaced EmbeddingGemma 1 (`.tflite`), whose
+    // vectors barely separated topics (docs/memory-eval/README.md).
+    repo: 'litert-community/embeddinggemma-2-text-270m-litert-lm',
+    file: 'embeddinggemma-2-text-270m.litertlm',
+    label: 'EmbeddingGemma 2 · 270M',
     blurb: 'Gives the memory engine real semantic recall instead of keyword matching.',
-    size_gb: 0.18,
+    size_gb: 0.16,
     role: 'embedding',
-    gated: true, // Gemma license: needs an accepted license + HF token.
+    // Apache 2.0: no licence to accept, no Hugging Face token.
   },
 ];
 

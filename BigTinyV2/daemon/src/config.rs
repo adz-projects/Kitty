@@ -50,12 +50,21 @@ pub struct LiteRtConfig {
     /// at runtime via `Library::from_path`; empty = engine off.
     #[serde(default)]
     pub lib_path: String,
-    /// EmbeddingGemma `.tflite` for semantic embeddings (both platforms).
+    /// The embedding model (both platforms). A `.litertlm` bundle
+    /// (EmbeddingGemma 2) runs through LiteRT-LM's embedding API and needs
+    /// `embed_lib_path`; a `.tflite` (EmbeddingGemma 1) runs through `lib_path`
+    /// and needs `tokenizer_path`.
     #[serde(default)]
     pub embed_model_path: String,
-    /// Gemma `tokenizer.json` bundled as an app resource.
+    /// Gemma `tokenizer.json`, for a `.tflite` embedding model only.
     #[serde(default)]
     pub tokenizer_path: String,
+    /// The LiteRT-LM runtime with the embedding API, for a `.litertlm`
+    /// embedding model: `litert-lm-embed.dll` (Windows) or `liblitert-lm.so`
+    /// (Android). Separate from the summarizer's `litert-lm.dll`, which is an
+    /// older runtime with an incompatible C API (`litert/lm_embedder.rs`).
+    #[serde(default)]
+    pub embed_lib_path: String,
     /// Generative summarizer `.litertlm` (Windows only; Android offloads
     /// compaction to the remote chat model). Empty = no local summarizer.
     #[serde(default)]

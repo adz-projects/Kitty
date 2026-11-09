@@ -22,6 +22,14 @@ pub mod embedder;
 #[cfg(feature = "litert-embed")]
 pub use embedder::LiteRtEmbedder;
 
+// EmbeddingGemma 2 `.litertlm` bundles through LiteRT-LM's embedding API
+// (both platforms; the runtime library is opened at run time).
+#[cfg(feature = "litert-embed")]
+pub mod lm_embedder;
+
+#[cfg(feature = "litert-embed")]
+pub use lm_embedder::LiteRtLmEmbedder;
+
 // Generative summarizer: LiteRT-LM, Windows-only (the crate is a Windows-only
 // optional dep enabled by `litert-engine`).
 #[cfg(all(windows, feature = "litert-engine"))]

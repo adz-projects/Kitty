@@ -24,13 +24,17 @@ app-scoped, and V2 stays on the 2.x line.
 **Local inference is LiteRT linked into the engine** (`BigTinyV2/daemon/src/litert/`),
 not llama.cpp and not Ollama. There is **no local chat** — chat always goes to
 a remote provider. LiteRT does two local jobs: **semantic embeddings** for the
-memory engines (EmbeddingGemma `.tflite`, both platforms; the Gemma
-`tokenizer.json` is downloaded with it) and, **on Windows only**, the optional
+memory engines (EmbeddingGemma 2 `.litertlm`, both platforms, run through
+LiteRT-LM's embedding API by `litert/lm_embedder.rs`; the bundle carries its own
+tokenizer) and, **on Windows only**, the optional
 local **summarizer** for compaction (LiteRT-LM running
 `gemma-4-E2B-it.litertlm`). Android summarizes with the chat's own provider.
 Kitty manages no inference process: models come from Hugging Face through
-`src-tauri/src/models/` (EmbeddingGemma is licence-gated, so the download takes
-a transient HF token). `provider_type: "ollama"` survives only as a *remote*
+`src-tauri/src/models/` (EmbeddingGemma 2 is Apache 2.0: no token). The
+embedding runtime is a newer LiteRT-LM than the summarizer's, shipped beside it
+as `litert-lm-embed.dll` / `liblitert-lm.so` (`plugins/build.py`, the Android
+Gradle build); an install still on EmbeddingGemma 1 (`.tflite` + tokenizer) keeps
+using it until the new model is downloaded (`models::embedding_model_ready`). `provider_type: "ollama"` survives only as a *remote*
 endpoint dialect for a server the user runs.
 
 **The two targets differ in hosting, not in code.** Desktop attaches to a

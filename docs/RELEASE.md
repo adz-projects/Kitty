@@ -59,7 +59,9 @@ two things beyond the ordinary `cargo build`:
    several phases behind the client code, and would do so silently.
 
 2. **The LiteRT native DLLs ship beside the daemon.** `plugins/build.py`
-   stages the **six** DLLs from the LiteRT build output into
+   stages the **six** DLLs from the LiteRT build output, plus the LiteRT-LM
+   embedding runtime (`litert-lm-embed.dll`, taken from Google's
+   `litert-lm-api` wheel on PyPI, pinned by sha256 in `build.py`), into
    `src-tauri/resources/`, and `bundle.resources` places them in the install
    root next to `bigtiny2-daemon.exe`, where the daemon loads `libLiteRt.dll`
    by bare name and it pulls in the rest:
@@ -69,13 +71,15 @@ two things beyond the ordinary `cargo build`:
    - `libLiteRtTopKWebGpuSampler.dll`
    - `libwebgpu_dawn.dll`
    - `libGemmaModelConstraintProvider.dll`
-   - `litert-lm.dll`
+   - `litert-lm.dll` (the summarizer's LiteRT-LM)
+   - `litert-lm-embed.dll` (the embedding runtime: a newer LiteRT-LM whose C
+     API is incompatible with the summarizer's, hence its own name; loaded at
+     run time by the engine, nothing links it)
 
-   **Nothing model-shaped ships in the installer.** The EmbeddingGemma model
-   and the Gemma `tokenizer.json` it needs are downloaded together, at the
-   user's request, from Hugging Face (both are Gemma-licence-gated, so one
-   token covers both; the tokenizer comes from `google/embeddinggemma-300m`).
-   The summarizer model is an optional download too.
+   **Nothing model-shaped ships in the installer.** The EmbeddingGemma 2
+   bundle (`litert-community/embeddinggemma-2-text-270m-litert-lm`, Apache 2.0,
+   no token, tokenizer included) is downloaded at the user's request from
+   Hugging Face. The summarizer model is an optional download too.
 
 ### Signing
 
@@ -98,9 +102,8 @@ proceed — this is expected, not a build failure.
    only for an engine change, and record a changed API contract in
    `docs/VERSIONS.md`.
 2. Re-verify the curated **LiteRT** repos/filenames in
-   `src/lib/curated_models.ts` still resolve on HuggingFace: EmbeddingGemma
-   `.tflite` (gated — needs an accepted Gemma license + HF token) on both
-   platforms, and `gemma-4-E2B-it.litertlm` for the Windows summarizer. A
+   `src/lib/curated_models.ts` still resolve on HuggingFace: EmbeddingGemma 2
+   `.litertlm` on both platforms, and `gemma-4-E2B-it.litertlm` for the Windows summarizer. A
    renamed repo or a moved license gate turns first run into a dead end.
    Android's `versionCode` follows the version automatically (the Tauri CLI
    derives it when it writes `gen/android/app/tauri.properties`); set
@@ -184,8 +187,11 @@ name at runtime. The AAR is **not** put on the compile classpath
 (`implementation`): its Kotlin API metadata (2.3.0) is incompatible with the
 project's Kotlin 1.9 and breaks the Kotlin compile — we only want the `.so`.
 
-The Gemma `tokenizer.json` is downloaded with the EmbeddingGemma model, as on
-Windows; Android has no generative summarizer, so no `.litertlm` and none of
+The LiteRT-LM embedding runtime (`liblitert-lm.so`) comes the same way from
+Google's `litert-lm-api` Android wheel on PyPI: `fetchLiteRtLmWheel` downloads
+it pinned by sha256 and `extractLiteRtLmJni` unzips it into its own generated
+`jniLibs` dir. The EmbeddingGemma 2 bundle carries its own tokenizer. Android
+has no generative summarizer, so no `.litertlm` and none of
 the Windows DLLs ship in the AAB.
 
 ### Build

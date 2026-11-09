@@ -1,0 +1,116 @@
+{
+  "about": "Memorabilia recall eval. Each document is ingested as its own source and extracted with the scripted claims listed here (no extraction model), so the eval measures recall, not extraction. People, studies, places and software are fictional; Brave New World and the 1995 'Californian ideology' essay are real. Case kinds: direct (should match by topic), indirect (only reachable by analogy -- expected to fail until Phase 4.7), superseded (the newer claim should win -- expected to fail until Phase 4.4), negative (nothing should inject). expect/forbid are substrings of claims; expect_indirect is scored separately. Run: see BigTinyV2/daemon/src/plugins/memory_eval.rs.",
+  "documents": [
+    {
+      "id": "cal_2026",
+      "source_entity": "essays.example",
+      "source_name": "essays.example/californian-ideology-2026",
+      "source_type": "Scraped",
+      "captured_at": "2026-09-14T10:00:00Z",
+      "text": "In 1995 Richard Barbrook and Andy Cameron named the Californian ideology: Silicon Valley's fusion of countercultural libertarianism with a free-market faith that technology will solve social problems. In a 2026 essay, the writer Mara Ellis argues that the label still describes how AI companies talk about regulation. Their public statements, she writes, cast oversight as a brake on inevitable progress while presenting the companies themselves as the best stewards of the public interest.",
+      "claims": [
+        "Richard Barbrook and Andy Cameron coined the term Californian ideology in 1995.",
+        "The Californian ideology combines countercultural libertarianism with a free-market faith that technology will solve social problems.",
+        "Mara Ellis argues that the Californian ideology still shapes how AI companies talk about regulation in 2026."
+      ]
+    },
+    {
+      "id": "bnw",
+      "source_entity": "lit-notes.example",
+      "source_name": "lit-notes.example/brave-new-world",
+      "source_type": "Scraped",
+      "captured_at": "2026-08-02T10:00:00Z",
+      "text": "Aldous Huxley's Brave New World imagines a World State that keeps its citizens content through conditioning and soma, a drug that dissolves any discomfort before it can be felt. The novel's argument is that a society engineered for comfort quietly gives up the capacities that discomfort builds: sustained attention, independent judgement and the willingness to struggle with difficult questions. John, the outsider, demands the right to be unhappy.",
+      "claims": [
+        "In Aldous Huxley's Brave New World, citizens are kept content with soma, a drug that spares them any discomfort.",
+        "Brave New World depicts a society that gives up the capacity for struggle and independent judgement in exchange for engineered comfort."
+      ]
+    },
+    {
+      "id": "ai_edu",
+      "source_entity": "edresearch.example",
+      "source_name": "edresearch.example/ai-homework-study",
+      "source_type": "Scraped",
+      "captured_at": "2026-10-01T10:00:00Z",
+      "text": "A 2025 study of 900 secondary-school students compared three groups doing maths homework: one with an unrestricted AI assistant, one with an assistant limited to hints, and one with no assistant. Students with the unrestricted assistant solved more homework problems but scored lower on later unassisted tests than the other two groups. The hint-only group showed no such drop, which the authors attribute to students still having to work through each problem themselves.",
+      "claims": [
+        "A 2025 study of 900 secondary students found that those who used an unrestricted AI assistant for homework scored lower on later unassisted tests.",
+        "In the same study, students whose AI assistant gave hints instead of answers did not show the drop in test scores."
+      ]
+    },
+    {
+      "id": "bridge_old",
+      "source_entity": "citynews.example/2025-11",
+      "source_name": "citynews.example/hartfield-closure",
+      "source_type": "Scraped",
+      "captured_at": "2025-11-03T10:00:00Z",
+      "decay_class": "transient",
+      "text": "The Hartfield Bridge is closed to all traffic for structural repairs after inspectors found corrosion in two of its support cables. City engineers say the work is expected to take several months, and buses are being diverted via the Northgate crossing in the meantime.",
+      "claims": [
+        "The Hartfield Bridge is closed to traffic for structural repairs."
+      ]
+    },
+    {
+      "id": "bridge_new",
+      "source_entity": "citynews.example/2026-03",
+      "source_name": "citynews.example/hartfield-reopens",
+      "source_type": "Scraped",
+      "captured_at": "2026-03-15T10:00:00Z",
+      "decay_class": "transient",
+      "text": "The Hartfield Bridge reopened to traffic on 14 March 2026, four months after it was closed for structural repairs. Both support cables were replaced, and bus routes have returned to their normal path across the bridge.",
+      "claims": [
+        "The Hartfield Bridge reopened to traffic on 14 March 2026 after structural repairs."
+      ]
+    },
+    {
+      "id": "tern",
+      "source_entity": "devblog.example",
+      "source_name": "devblog.example/tern-4",
+      "source_type": "Scraped",
+      "captured_at": "2026-10-20T10:00:00Z",
+      "decay_class": "transient",
+      "text": "Tern 4.0, released in October 2026, replaces the framework's plugin API with a capability-based permission model. Plugins must now declare the filesystem paths and network hosts they need, and the runtime refuses anything undeclared. Plugins written for Tern 3 have to be ported before they will load.",
+      "claims": [
+        "Tern 4.0, released in October 2026, replaced its plugin API with a capability-based permission model.",
+        "Plugins written for Tern 3 must be ported before they load in Tern 4.0."
+      ]
+    },
+    {
+      "id": "sourdough",
+      "source_entity": "bakers.example",
+      "source_name": "bakers.example/cold-proof",
+      "source_type": "Scraped",
+      "captured_at": "2026-07-11T10:00:00Z",
+      "text": "A long cold proof in the fridge slows yeast far more than it slows the lactic and acetic acid bacteria in a sourdough culture. The bacteria keep producing acids and flavour compounds overnight, which is why a loaf proofed cold for twelve hours tastes noticeably more sour than one proofed warm for three.",
+      "claims": [
+        "A long cold proof slows yeast more than the acid-producing bacteria in sourdough, which keep producing flavour compounds."
+      ]
+    },
+    {
+      "id": "hydration_run",
+      "source_entity": "runners.example",
+      "source_name": "runners.example/race-hydration",
+      "source_type": "Scraped",
+      "captured_at": "2026-06-05T10:00:00Z",
+      "text": "Most runners in a half marathon need somewhere between 400 and 800 millilitres of fluid per hour, depending on temperature and individual sweat rate. Drinking well beyond thirst carries its own risk: exercise-associated hyponatremia, a dangerous drop in blood sodium.",
+      "claims": [
+        "Runners in a half marathon typically need 400 to 800 millilitres of fluid per hour, depending on heat and sweat rate.",
+        "Drinking far beyond thirst during endurance races can cause exercise-associated hyponatremia."
+      ]
+    }
+  ],
+  "cases": [
+    {"id": "cal_direct", "kind": "direct", "message": "Is the Californian ideology still relevant to how AI companies behave today?", "expect": ["Mara Ellis argues", "coined the term Californian ideology"], "forbid": ["cold proof", "Hartfield", "half marathon"]},
+    {"id": "regulation_framing", "kind": "direct", "message": "Why do tech companies describe regulation as a threat to progress?", "expect": ["Mara Ellis argues"], "forbid": ["cold proof", "Hartfield", "hyponatremia"]},
+    {"id": "ai_homework_direct", "kind": "direct", "message": "Does using AI for homework hurt how much students learn?", "expect": ["unrestricted AI assistant"], "forbid": ["cold proof", "Hartfield", "Tern"]},
+    {"id": "hint_design", "kind": "direct", "message": "Should an AI tutor give students hints or full answers?", "expect": ["gave hints instead of answers"], "forbid": ["cold proof", "Hartfield"]},
+    {"id": "struggle_indirect", "kind": "indirect", "message": "I'm writing about how leaning on AI tools could erode students' willingness to struggle with hard problems.", "expect": ["unrestricted AI assistant"], "expect_indirect": ["Brave New World depicts"], "forbid": ["Hartfield", "Tern"]},
+    {"id": "comfort_indirect", "kind": "indirect", "message": "Is making learning frictionless actually bad for learners?", "expect": [], "expect_indirect": ["Brave New World depicts", "unrestricted AI assistant"], "forbid": ["Hartfield", "Tern", "cold proof"]},
+    {"id": "bridge_superseded", "kind": "superseded", "message": "Is the Hartfield Bridge open to traffic?", "expect": ["reopened to traffic"], "forbid": ["is closed to traffic"]},
+    {"id": "tern_current", "kind": "direct", "message": "What changed in Tern 4.0 for plugin authors?", "expect": ["capability-based permission model"], "forbid": ["Hartfield", "cold proof"]},
+    {"id": "sour_loaf", "kind": "direct", "message": "Why does my sourdough taste more sour after a night in the fridge?", "expect": ["cold proof"], "forbid": ["unrestricted AI", "Californian", "Hartfield", "hyponatremia"]},
+    {"id": "race_drink", "kind": "direct", "message": "How much water should I drink during a half marathon?", "expect": ["400 to 800"], "forbid": ["cold proof", "unrestricted AI", "Tern"]},
+    {"id": "capital_negative", "kind": "negative", "message": "What is the capital of Australia?", "expect": [], "forbid": ["Californian", "Brave New World", "unrestricted AI", "Hartfield", "Tern", "cold proof", "half marathon"]},
+    {"id": "email_negative", "kind": "negative", "message": "Rewrite this sentence to sound friendlier: please send the invoice by Friday.", "expect": [], "forbid": ["Californian", "Brave New World", "unrestricted AI", "Hartfield", "Tern", "cold proof", "half marathon"]}
+  ]
+}

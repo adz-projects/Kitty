@@ -112,10 +112,44 @@ pub fn tokenizer_path() -> Option<PathBuf> {
     path.is_file().then_some(path)
 }
 
-/// Whether `file` is an EmbeddingGemma model, the one that needs the
-/// tokenizer beside it.
+/// Whether `file` is an EmbeddingGemma `.tflite`, the one that needs the
+/// tokenizer beside it. A `.litertlm` bundle (EmbeddingGemma 2) carries its
+/// own tokenizer.
 pub fn needs_tokenizer(file: &str) -> bool {
-    file.to_ascii_lowercase().contains("embeddinggemma")
+    let f = file.to_ascii_lowercase();
+    f.contains("embeddinggemma") && f.ends_with(".tflite")
+}
+
+/// The EmbeddingGemma 1 `.tflite` an install from before EmbeddingGemma 2 has
+/// on disk. Used only as a stand-in while the configured model is not
+/// downloaded yet, so memory keeps working across the upgrade instead of
+/// switching off until the user downloads the new model.
+pub const LEGACY_EMBEDDING_FILE: &str = "embeddinggemma-300M_seq256_mixed-precision.tflite";
+
+/// The embedding model the engine should load for the configured `name`, and
+/// whether it can: the configured file when it is on disk; else, only when
+/// `name` is the default (the upgrade from EmbeddingGemma 1, whose config the
+/// migration repointed), the legacy EmbeddingGemma 1 file if that is on disk;
+/// then, for a `.tflite`, only with the tokenizer there too. `None` means the
+/// engine runs without semantic embeddings (memory off). A missing model the
+/// user chose themselves never silently becomes EmbeddingGemma 1.
+pub fn embedding_model_ready(name: &str) -> Option<PathBuf> {
+    let path = resolve(name).or_else(|| {
+        if !name.trim().eq_ignore_ascii_case(crate::config::DEFAULT_EMBEDDING_GGUF) {
+            return None;
+        }
+        let fallback = resolve(LEGACY_EMBEDDING_FILE)?;
+        tracing::info!(
+            configured = %name,
+            "embedding model not downloaded yet; using the EmbeddingGemma 1 file meanwhile"
+        );
+        Some(fallback)
+    })?;
+    let file = path.file_name()?.to_string_lossy().into_owned();
+    if needs_tokenizer(&file) && tokenizer_path().is_none() {
+        return None;
+    }
+    Some(path)
 }
 
 /// [`resolve_in`] against the app's models directory.
@@ -132,6 +166,13 @@ mod tests {
 
     fn touch(dir: &Path, name: &str, bytes: usize) {
         std::fs::write(dir.join(name), vec![0u8; bytes]).unwrap();
+    }
+
+    #[test]
+    fn only_the_tflite_embedder_needs_a_tokenizer() {
+        assert!(needs_tokenizer("embeddinggemma-300M_seq256_mixed-precision.tflite"));
+        assert!(!needs_tokenizer("embeddinggemma-2-text-270m.litertlm"));
+        assert!(!needs_tokenizer("gemma-4-E2B-it.litertlm"));
     }
 
     #[test]
