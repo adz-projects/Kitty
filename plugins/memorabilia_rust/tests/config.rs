@@ -79,6 +79,7 @@ fn defaults_match_plan_section2() {
     assert!((c.cluster_similarity_threshold - 0.92).abs() < 1e-12);
     assert!((c.semantic_dedup_threshold - 0.92).abs() < 1e-12);
     assert!((c.dispute_strength_floor - 0.5).abs() < 1e-12);
+    assert!((c.claim_merge_cosine - 0.88).abs() < 1e-12);
     assert_eq!(c.tau_static_days, 365);
     assert_eq!(c.tau_transient_days, 7);
     assert_eq!(c.tau_pre_days, 7);

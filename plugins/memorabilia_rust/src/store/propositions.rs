@@ -30,6 +30,29 @@ pub struct Proposition {
     /// Set exactly when (and only when) `status = 'UNSUPPORTED_ARCHIVE'`.
     pub archived_at: Option<String>,
     pub created_at: String,
+    /// Who asserts the claim; empty when the source states it as its own
+    /// fact (migration 006).
+    #[sqlx(default)]
+    pub attribution: String,
+    /// `states` | `reports` | `argues` | `refutes` (migration 006).
+    #[sqlx(default)]
+    pub stance: String,
+}
+
+impl Proposition {
+    /// The claim as recall shows it: attributed when the source does not
+    /// state it as fact, so an argument never reads as an established fact.
+    pub fn display_claim(&self) -> String {
+        let who = self.attribution.trim();
+        match (self.stance.as_str(), who.is_empty()) {
+            ("argues", false) => format!("{who} argues: {}", self.claim),
+            ("reports", false) => format!("{who} reports: {}", self.claim),
+            ("refutes", false) => format!("{who} disputes: {}", self.claim),
+            ("argues", true) => format!("(argued) {}", self.claim),
+            (_, false) => format!("{} (per {who})", self.claim),
+            _ => self.claim.clone(),
+        }
+    }
 }
 
 impl Db {
@@ -43,8 +66,8 @@ impl Db {
             "INSERT INTO propositions (
                 node_id, claim, confidence, is_disputed, status, importance,
                 urgency, urgency_expires_at, last_assessed_at, archived_at,
-                created_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                created_at, attribution, stance
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT (node_id) DO NOTHING",
         )
         .bind(&p.node_id)
@@ -58,6 +81,8 @@ impl Db {
         .bind(&p.last_assessed_at)
         .bind(&p.archived_at)
         .bind(&p.created_at)
+        .bind(&p.attribution)
+        .bind(if p.stance.is_empty() { "states" } else { p.stance.as_str() })
         .execute(self.pool())
         .await?
         .rows_affected())

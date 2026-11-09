@@ -260,6 +260,8 @@ async fn private_forget_cascades_and_tombstones_never_relearn() {
             last_assessed_at: None,
             archived_at: None,
             created_at: T0.into(),
+            attribution: String::new(),
+            stance: "states".into(),
         })
         .await
         .unwrap();
@@ -522,6 +524,8 @@ fn claim(node: &str, text: &str) -> Proposition {
         last_assessed_at: None,
         archived_at: None,
         created_at: T0.into(),
+        attribution: String::new(),
+        stance: "states".into(),
     }
 }
 

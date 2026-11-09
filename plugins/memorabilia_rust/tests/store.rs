@@ -313,6 +313,8 @@ fn test_proposition(id: &str) -> Proposition {
         last_assessed_at: None,
         archived_at: None,
         created_at: T0.into(),
+        attribution: String::new(),
+        stance: "states".into(),
     }
 }
 
@@ -351,10 +353,13 @@ async fn migration_002_creates_every_plan_table() {
         "chunk_propositions",
         "chunks",
         "chunks_vec",
+        // Added by migration 006 (claim vectors and claim relations).
+        "claim_vectors",
         "demand_queries",
         "disputed_edges",
         "documents",
         "proposition_edges",
+        "proposition_relations",
         "propositions",
         "reinforcement_outbox",
         // Added by migration 004 (Kitty's unified per-session incognito).

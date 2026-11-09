@@ -1,5 +1,5 @@
 {
-  "about": "Memorabilia recall eval. Each document is ingested as its own source and extracted with the scripted claims listed here (no extraction model), so the eval measures recall, not extraction. People, studies, places and software are fictional; Brave New World and the 1995 'Californian ideology' essay are real. Case kinds: direct (should match by topic), indirect (only reachable by analogy -- expected to fail until Phase 4.7), superseded (the newer claim should win -- expected to fail until Phase 4.4), negative (nothing should inject). expect/forbid are substrings of claims; expect_indirect is scored separately. Run: see BigTinyV2/daemon/src/plugins/memory_eval.rs.",
+  "about": "Memorabilia recall eval. Each document is ingested as its own source and extracted with the scripted claims listed here (no extraction model), so the eval measures recall, not extraction. People, studies, places and software are fictional; Brave New World and the 1995 'Californian ideology' essay are real. Case kinds: direct (should match by topic), indirect (only reachable by analogy -- expected to fail until Phase 4.7), superseded (the newer claim should win; the scripted model reports the supersession declared in the document's `relations`), negative (nothing should inject). expect/forbid are substrings of claims; expect_indirect is scored separately. Run: see BigTinyV2/daemon/src/plugins/memory_eval.rs.",
   "documents": [
     {
       "id": "cal_2026",
@@ -12,7 +12,13 @@
         "Richard Barbrook and Andy Cameron coined the term Californian ideology in 1995.",
         "The Californian ideology combines countercultural libertarianism with a free-market faith that technology will solve social problems.",
         "Mara Ellis argues that the Californian ideology still shapes how AI companies talk about regulation in 2026."
-      ]
+      ],
+      "attributions": {
+        "Mara Ellis argues that the Californian ideology still shapes how AI companies talk about regulation in 2026.": [
+          "Mara Ellis",
+          "argues"
+        ]
+      }
     },
     {
       "id": "bnw",
@@ -60,6 +66,13 @@
       "text": "The Hartfield Bridge reopened to traffic on 14 March 2026, four months after it was closed for structural repairs. Both support cables were replaced, and bus routes have returned to their normal path across the bridge.",
       "claims": [
         "The Hartfield Bridge reopened to traffic on 14 March 2026 after structural repairs."
+      ],
+      "relations": [
+        {
+          "my_claim": "The Hartfield Bridge reopened to traffic on 14 March 2026 after structural repairs.",
+          "other_claim": "The Hartfield Bridge is closed to traffic for structural repairs.",
+          "kind": "supersedes"
+        }
       ]
     },
     {
@@ -100,17 +113,167 @@
     }
   ],
   "cases": [
-    {"id": "cal_direct", "kind": "direct", "message": "Is the Californian ideology still relevant to how AI companies behave today?", "expect": ["Mara Ellis argues", "coined the term Californian ideology"], "forbid": ["cold proof", "Hartfield", "half marathon"]},
-    {"id": "regulation_framing", "kind": "direct", "message": "Why do tech companies describe regulation as a threat to progress?", "expect": ["Mara Ellis argues"], "forbid": ["cold proof", "Hartfield", "hyponatremia"]},
-    {"id": "ai_homework_direct", "kind": "direct", "message": "Does using AI for homework hurt how much students learn?", "expect": ["unrestricted AI assistant"], "forbid": ["cold proof", "Hartfield", "Tern"]},
-    {"id": "hint_design", "kind": "direct", "message": "Should an AI tutor give students hints or full answers?", "expect": ["gave hints instead of answers"], "forbid": ["cold proof", "Hartfield"]},
-    {"id": "struggle_indirect", "kind": "indirect", "message": "I'm writing about how leaning on AI tools could erode students' willingness to struggle with hard problems.", "expect": ["unrestricted AI assistant"], "expect_indirect": ["Brave New World depicts"], "forbid": ["Hartfield", "Tern"]},
-    {"id": "comfort_indirect", "kind": "indirect", "message": "Is making learning frictionless actually bad for learners?", "expect": [], "expect_indirect": ["Brave New World depicts", "unrestricted AI assistant"], "forbid": ["Hartfield", "Tern", "cold proof"]},
-    {"id": "bridge_superseded", "kind": "superseded", "message": "Is the Hartfield Bridge open to traffic?", "expect": ["reopened to traffic"], "forbid": ["is closed to traffic"]},
-    {"id": "tern_current", "kind": "direct", "message": "What changed in Tern 4.0 for plugin authors?", "expect": ["capability-based permission model"], "forbid": ["Hartfield", "cold proof"]},
-    {"id": "sour_loaf", "kind": "direct", "message": "Why does my sourdough taste more sour after a night in the fridge?", "expect": ["cold proof"], "forbid": ["unrestricted AI", "Californian", "Hartfield", "hyponatremia"]},
-    {"id": "race_drink", "kind": "direct", "message": "How much water should I drink during a half marathon?", "expect": ["400 to 800"], "forbid": ["cold proof", "unrestricted AI", "Tern"]},
-    {"id": "capital_negative", "kind": "negative", "message": "What is the capital of Australia?", "expect": [], "forbid": ["Californian", "Brave New World", "unrestricted AI", "Hartfield", "Tern", "cold proof", "half marathon"]},
-    {"id": "email_negative", "kind": "negative", "message": "Rewrite this sentence to sound friendlier: please send the invoice by Friday.", "expect": [], "forbid": ["Californian", "Brave New World", "unrestricted AI", "Hartfield", "Tern", "cold proof", "half marathon"]}
+    {
+      "id": "cal_direct",
+      "kind": "direct",
+      "message": "Is the Californian ideology still relevant to how AI companies behave today?",
+      "expect": [
+        "Mara Ellis argues",
+        "coined the term Californian ideology"
+      ],
+      "forbid": [
+        "cold proof",
+        "Hartfield",
+        "half marathon"
+      ]
+    },
+    {
+      "id": "regulation_framing",
+      "kind": "direct",
+      "message": "Why do tech companies describe regulation as a threat to progress?",
+      "expect": [
+        "Mara Ellis argues"
+      ],
+      "forbid": [
+        "cold proof",
+        "Hartfield",
+        "hyponatremia"
+      ]
+    },
+    {
+      "id": "ai_homework_direct",
+      "kind": "direct",
+      "message": "Does using AI for homework hurt how much students learn?",
+      "expect": [
+        "unrestricted AI assistant"
+      ],
+      "forbid": [
+        "cold proof",
+        "Hartfield",
+        "Tern"
+      ]
+    },
+    {
+      "id": "hint_design",
+      "kind": "direct",
+      "message": "Should an AI tutor give students hints or full answers?",
+      "expect": [
+        "gave hints instead of answers"
+      ],
+      "forbid": [
+        "cold proof",
+        "Hartfield"
+      ]
+    },
+    {
+      "id": "struggle_indirect",
+      "kind": "indirect",
+      "message": "I'm writing about how leaning on AI tools could erode students' willingness to struggle with hard problems.",
+      "expect": [
+        "unrestricted AI assistant"
+      ],
+      "expect_indirect": [
+        "Brave New World depicts"
+      ],
+      "forbid": [
+        "Hartfield",
+        "Tern"
+      ]
+    },
+    {
+      "id": "comfort_indirect",
+      "kind": "indirect",
+      "message": "Is making learning frictionless actually bad for learners?",
+      "expect": [],
+      "expect_indirect": [
+        "Brave New World depicts",
+        "unrestricted AI assistant"
+      ],
+      "forbid": [
+        "Hartfield",
+        "Tern",
+        "cold proof"
+      ]
+    },
+    {
+      "id": "bridge_superseded",
+      "kind": "superseded",
+      "message": "Is the Hartfield Bridge open to traffic?",
+      "expect": [
+        "reopened to traffic"
+      ],
+      "forbid": [
+        "is closed to traffic"
+      ]
+    },
+    {
+      "id": "tern_current",
+      "kind": "direct",
+      "message": "What changed in Tern 4.0 for plugin authors?",
+      "expect": [
+        "capability-based permission model"
+      ],
+      "forbid": [
+        "Hartfield",
+        "cold proof"
+      ]
+    },
+    {
+      "id": "sour_loaf",
+      "kind": "direct",
+      "message": "Why does my sourdough taste more sour after a night in the fridge?",
+      "expect": [
+        "cold proof"
+      ],
+      "forbid": [
+        "unrestricted AI",
+        "Californian",
+        "Hartfield",
+        "hyponatremia"
+      ]
+    },
+    {
+      "id": "race_drink",
+      "kind": "direct",
+      "message": "How much water should I drink during a half marathon?",
+      "expect": [
+        "400 to 800"
+      ],
+      "forbid": [
+        "cold proof",
+        "unrestricted AI",
+        "Tern"
+      ]
+    },
+    {
+      "id": "capital_negative",
+      "kind": "negative",
+      "message": "What is the capital of Australia?",
+      "expect": [],
+      "forbid": [
+        "Californian",
+        "Brave New World",
+        "unrestricted AI",
+        "Hartfield",
+        "Tern",
+        "cold proof",
+        "half marathon"
+      ]
+    },
+    {
+      "id": "email_negative",
+      "kind": "negative",
+      "message": "Rewrite this sentence to sound friendlier: please send the invoice by Friday.",
+      "expect": [],
+      "forbid": [
+        "Californian",
+        "Brave New World",
+        "unrestricted AI",
+        "Hartfield",
+        "Tern",
+        "cold proof",
+        "half marathon"
+      ]
+    }
   ]
 }

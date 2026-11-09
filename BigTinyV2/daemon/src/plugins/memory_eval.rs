@@ -265,6 +265,20 @@ struct MemDocument {
     decay_class: Option<String>,
     text: String,
     claims: Vec<String>,
+    /// Claim relations the scripted model reports for this document
+    /// (`other_claim` is matched to its proposition id).
+    #[serde(default)]
+    relations: Vec<FixtureRelation>,
+    /// `claim -> [attribution, stance]` for claims the source attributes.
+    #[serde(default)]
+    attributions: HashMap<String, (String, String)>,
+}
+
+#[derive(Deserialize)]
+struct FixtureRelation {
+    my_claim: String,
+    other_claim: String,
+    kind: String,
 }
 
 #[derive(Deserialize)]
@@ -352,11 +366,22 @@ async fn memory_eval_memorabilia() {
                 .claims
                 .iter()
                 .map(|c| {
+                    let (who, stance) = d.attributions.get(c).cloned().unwrap_or_else(|| (String::new(), "states".into()));
                     json!({"claim": c, "importance": "medium", "urgency": "low",
-                           "decay_class": decay, "urgency_expires_at": ""})
+                           "decay_class": decay, "urgency_expires_at": "",
+                           "attribution": who, "stance": stance})
                 })
                 .collect();
-            (d.source_entity.clone(), json!({"propositions": props, "disputes": []}))
+            let node = |claim: &str| {
+                format!("p_{}", &memorabilia::text::sha256_hex(&memorabilia::text::normalize_text(claim))[..24])
+            };
+            let relations: Vec<Value> = d
+                .relations
+                .iter()
+                .map(|r| json!({"my_claim": r.my_claim, "other_claim_id": node(&r.other_claim),
+                                "kind": r.kind, "strength": 0.9, "reason": "fixture"}))
+                .collect();
+            (d.source_entity.clone(), json!({"propositions": props, "relations": relations}))
         })
         .collect();
     let chat = Arc::new(ScriptedChat { by_source });

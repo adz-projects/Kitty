@@ -53,6 +53,13 @@ pub struct NeighborView {
     pub claims: Vec<String>,
 }
 
+/// Node ids a `[id] claim` line names, for validating `relations` targets.
+fn listed_claim_id(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix('[')?;
+    let end = rest.find(']')?;
+    Some(&rest[..end])
+}
+
 /// Outcome of one [`Engine::drain_extraction`] call.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DrainOutcome {
@@ -88,25 +95,30 @@ pub fn extraction_schema() -> Value {
                         "importance": {"type": "string", "enum": ["high", "medium", "low", "unknown"]},
                         "urgency": {"type": "string", "enum": ["high", "medium", "low", "unknown"]},
                         "decay_class": {"type": "string", "enum": ["static", "transient", "deadline"]},
-                        "urgency_expires_at": {"type": "string", "description": "UTC ISO-8601 second precision (2026-08-20T23:59:59Z) when decay_class is deadline, else empty string."}
+                        "urgency_expires_at": {"type": "string", "description": "UTC ISO-8601 second precision (2026-08-20T23:59:59Z) when decay_class is deadline, else empty string."},
+                        "attribution": {"type": "string", "description": "Who asserts this, when the chunk attributes it to someone (a named author, study, organisation, or the article's own argument). Empty string when the chunk simply states it as fact."},
+                        "stance": {"type": "string", "enum": ["states", "reports", "argues", "refutes"], "description": "states: presented as established fact. reports: relays someone else's claim. argues: an argument, interpretation or opinion. refutes: denies or debunks a claim."}
                     },
-                    "required": ["claim", "importance", "urgency", "decay_class", "urgency_expires_at"]
+                    "required": ["claim", "importance", "urgency", "decay_class", "urgency_expires_at", "attribution", "stance"]
                 }
             },
-            "disputes": {
+            "relations": {
                 "type": "array",
+                "description": "How your claims relate to the known propositions listed under POTENTIAL_CONFLICTS (by their [id]). Empty when none do.",
                 "items": {
                     "type": "object",
                     "properties": {
-                        "chunk_id": {"type": "string", "description": "The chunk_id of a POTENTIAL_CONFLICTS entry whose claim DIRECTLY contradicts one of your extracted claims. No other chunk_id is valid."},
-                        "strength": {"type": "number", "description": "Confidence in [0, 1] that a direct contradiction exists."},
-                        "reason": {"type": "string", "description": "One line: which claims contradict."}
+                        "my_claim": {"type": "string", "description": "The exact text of one of your claims above."},
+                        "other_claim_id": {"type": "string", "description": "The [id] of a known proposition under POTENTIAL_CONFLICTS. No other id is valid."},
+                        "kind": {"type": "string", "enum": ["disputes", "supersedes"], "description": "disputes: the two cannot both be true. supersedes: yours is a newer state of the same matter that replaces it (a status changed, a figure was updated, a decision reversed), so the old one was true but no longer is."},
+                        "strength": {"type": "number", "description": "Confidence in [0, 1]."},
+                        "reason": {"type": "string", "description": "One line."}
                     },
-                    "required": ["chunk_id", "strength", "reason"]
+                    "required": ["my_claim", "other_claim_id", "kind", "strength", "reason"]
                 }
             }
         },
-        "required": ["propositions", "disputes"]
+        "required": ["propositions", "relations"]
     })
 }
 
@@ -119,11 +131,13 @@ pub fn build_extraction_prompt(chunk: &Chunk, neighbors: &[NeighborView]) -> Vec
         long-lived fact, \"transient\" for recent context that will go stale, \
         \"deadline\" for something tied to a specific future expiry (then set \
         urgency_expires_at as UTC ISO-8601 second precision; empty string \
-        otherwise). If a POTENTIAL_CONFLICTS entry directly contradicts one \
-        of your claims, add a disputes entry naming that entry's chunk_id, \
-        with your confidence in [0, 1] and a one-line reason. Never invent \
-        claims the chunk does not support. Return JSON only, matching the \
-        schema.";
+        otherwise). Record who asserts each claim (attribution) and how \
+        (stance): an argument or opinion is never a plain fact. When one of \
+        your claims contradicts a known proposition listed under \
+        POTENTIAL_CONFLICTS by its [id], add a relation of kind disputes; when \
+        it is a newer state of the same matter that replaces it, kind \
+        supersedes. Never invent claims the chunk does not support. Return \
+        JSON only, matching the schema.";
     let mut user = format!(
         "CHUNK (source_entity: {}):\n{}\n\nPOTENTIAL_CONFLICTS:\n",
         chunk.source_entity, chunk.content
@@ -162,6 +176,8 @@ struct ValidClaim {
     urgency: String,
     decay_class: String,
     urgency_expires_at: Option<NaiveDateTime>,
+    attribution: String,
+    stance: String,
 }
 
 /// Per-entry claim outcome (soft-fail counting: a bad entry is dropped,
@@ -230,6 +246,15 @@ fn verify_claim(raw: &Value, tombstones: &HashSet<String>) -> ClaimVerdict {
     // simplification; the earliest-deadline/importance-merge refinement is a
     // separate follow-up.
     let node_id = format!("p_{}", &sha256_hex(&norm)[..24]);
+    let attribution = raw
+        .get("attribution")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    let stance = match raw.get("stance").and_then(|v| v.as_str()) {
+        Some(s @ ("reports" | "argues" | "refutes")) => s.to_string(),
+        _ => "states".to_string(),
+    };
     ClaimVerdict::Kept(ValidClaim {
         node_id,
         claim: norm,
@@ -237,6 +262,8 @@ fn verify_claim(raw: &Value, tombstones: &HashSet<String>) -> ClaimVerdict {
         urgency,
         decay_class: decay_class.into(),
         urgency_expires_at: expiry,
+        attribution,
+        stance,
     })
 }
 
@@ -515,6 +542,46 @@ impl Engine {
             });
         }
 
+        // Semantic consolidation (4.3): a claim that paraphrases an existing
+        // one supports that proposition instead of becoming a second,
+        // single-source one -- confirmed by the extraction model, because a
+        // near-identical sentence can also be its negation.
+        let claim_vectors = self.consolidate_claims(&mut claims).await;
+
+        // Claim-level relations (4.4): only against claims listed in this
+        // prompt, and only from one of this chunk's own claims.
+        let listed: HashSet<String> = neighbors
+            .iter()
+            .flat_map(|n| n.claims.iter().filter_map(|c| listed_claim_id(c).map(str::to_string)))
+            .collect();
+        let mut relations: Vec<crate::store::relations::Relation> = Vec::new();
+        for raw in parsed.get("relations").and_then(|v| v.as_array()).into_iter().flatten() {
+            let mine = raw.get("my_claim").and_then(|v| v.as_str()).map(normalize_text).unwrap_or_default();
+            let other = raw.get("other_claim_id").and_then(|v| v.as_str()).unwrap_or("").trim();
+            let kind = raw.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+            if mine.is_empty() || !listed.contains(other) || !matches!(kind, "disputes" | "supersedes") {
+                continue;
+            }
+            let Some(from) = claims
+                .iter()
+                .find(|c| c.claim == mine || c.claim.contains(&mine) || mine.contains(&c.claim))
+            else {
+                continue;
+            };
+            let strength = raw.get("strength").and_then(|v| v.as_f64()).filter(|s| s.is_finite()).unwrap_or(0.0).clamp(0.0, 1.0);
+            if strength < self.config.dispute_strength_floor {
+                continue;
+            }
+            relations.push(crate::store::relations::Relation {
+                from_node: from.node_id.clone(),
+                to_node: other.to_string(),
+                kind: kind.to_string(),
+                strength,
+                reason: raw.get("reason").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                opened_at: now.to_string(),
+            });
+        }
+
         // The chunk's decay profile (deterministic resolution).
         let (decay_class, expiry_naive) = resolve_decay_profile(&claims);
         let expiry: Option<String> =
@@ -597,9 +664,22 @@ impl Engine {
                             last_assessed_at: Some(now_owned.clone()),
                             archived_at: None,
                             created_at: now_owned.clone(),
+                            attribution: c.attribution.clone(),
+                            stance: c.stance.clone(),
                         };
                         propositions_written += db.insert_proposition(&prop).await? as usize;
                         db.add_support_link(&chunk_id, &c.node_id, &now_owned).await?;
+                    }
+                    for (node, model, v) in &claim_vectors {
+                        db.upsert_claim_vector(node, model, v).await?;
+                    }
+                    // Claim relations; both ends' confidence is refreshed below.
+                    let mut related: Vec<String> = Vec::new();
+                    for r in &relations {
+                        if db.get_proposition(&r.to_node).await?.is_some() && db.insert_relation(r).await? {
+                            related.push(r.to_node.clone());
+                            related.push(r.from_node.clone());
+                        }
                     }
 
                     db.finish_extraction(
@@ -625,6 +705,9 @@ impl Engine {
                             self.recompute_node_confidence(&node, now_ref).await?;
                         }
                     }
+                    for node in &related {
+                        self.recompute_node_confidence(node, now_ref).await?;
+                    }
                     Ok((propositions_written, disputes_written))
                 },
             )
@@ -636,6 +719,86 @@ impl Engine {
             disputes: counts.1,
             suppressed_skip: false,
         })
+    }
+
+    /// Point each claim that paraphrases an existing proposition at that
+    /// proposition (4.3), and return the vectors to store for the claims
+    /// that stay new: `(node_id, space, vector)`. Candidates are existing
+    /// claims at `claim_merge_cosine` or above in the same space; one
+    /// extraction-model call confirms which are the same claim (a negation
+    /// can sit just as close). Any failure leaves every claim as it was.
+    async fn consolidate_claims(&self, claims: &mut [ValidClaim]) -> Vec<(String, String, Vec<f32>)> {
+        let mut out = Vec::new();
+        let mut candidates: Vec<(usize, String, String)> = Vec::new(); // (claim index, node, text)
+        let mut known: std::collections::HashMap<String, Vec<(String, Vec<f32>)>> = Default::default();
+        for (i, c) in claims.iter().enumerate() {
+            let Ok((v, tag)) = self.embedder.embed(&c.claim).await else {
+                continue;
+            };
+            if tag == crate::config::HASH_EMBED_MODEL {
+                continue; // lexical space: no paraphrase matching, nothing stored
+            }
+            if !known.contains_key(&tag) {
+                let vs = self.db.active_claim_vectors(&tag).await.unwrap_or_default();
+                known.insert(tag.clone(), vs);
+            }
+            let best = known[&tag]
+                .iter()
+                .filter(|(id, _)| *id != c.node_id)
+                .map(|(id, kv)| (id, crate::learn::overnight::cosine_pub(&v, kv)))
+                .filter(|(_, cos)| f64::from(*cos) >= self.config.claim_merge_cosine)
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            if let Some((id, _)) = best {
+                if let Ok(Some(p)) = self.db.get_proposition(id).await {
+                    candidates.push((i, p.node_id, p.claim));
+                }
+            }
+            out.push((c.node_id.clone(), tag, v));
+        }
+        if candidates.is_empty() {
+            return out;
+        }
+        let pairs: Vec<String> = candidates
+            .iter()
+            .enumerate()
+            .map(|(k, (i, _, existing))| format!("{k}. NEW: {}\n   EXISTING: {existing}", claims[*i].claim))
+            .collect();
+        let prompt = vec![
+            json!({"role": "system", "content": "For each numbered pair, say whether NEW and EXISTING make the same factual claim (paraphrases of one fact). Opposite or different claims are not the same, however close the wording. Return JSON only."}),
+            json!({"role": "user", "content": pairs.join("\n")}),
+        ];
+        let schema = json!({
+            "type": "object",
+            "properties": {"same": {"type": "array", "items": {"type": "object",
+                "properties": {"pair": {"type": "integer"}, "same": {"type": "boolean"}},
+                "required": ["pair", "same"]}}},
+            "required": ["same"]
+        });
+        let verdict = {
+            let Ok(_permit) = self.extraction_semaphore.clone().acquire_owned().await else {
+                return out;
+            };
+            let budget = std::time::Duration::from_secs(self.config.extraction.timeout_s);
+            match tokio::time::timeout(budget, self.chat.structured_chat(prompt, &schema)).await {
+                Ok(Ok(v)) => v,
+                _ => return out,
+            }
+        };
+        let same: HashSet<usize> = verdict
+            .get("same")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .filter(|e| e.get("same").and_then(|b| b.as_bool()) == Some(true))
+            .filter_map(|e| e.get("pair").and_then(|n| n.as_u64()).map(|n| n as usize))
+            .collect();
+        for (k, (i, existing, _)) in candidates.iter().enumerate() {
+            if same.contains(&k) {
+                let old = std::mem::replace(&mut claims[*i].node_id, existing.clone());
+                out.retain(|(n, _, _)| *n != old);
+            }
+        }
+        out
     }
 
     /// Local Neighborhood Probe (plan §3.5): never a full-DB scan — one
@@ -692,7 +855,7 @@ impl Engine {
                 .list_propositions_for_chunk(&ch.chunk_id)
                 .await?
                 .into_iter()
-                .map(|p| format!("{} (importance: {})", p.claim, p.importance))
+                .map(|p| format!("[{}] {} (importance: {})", p.node_id, p.display_claim(), p.importance))
                 .collect();
             views.push(NeighborView {
                 chunk_id: ch.chunk_id,
@@ -737,7 +900,13 @@ impl Engine {
             by_source.entry(ch.source_entity.clone()).or_default().push(weight * decay);
         }
         let entries: Vec<(String, Vec<f64>)> = by_source.into_iter().collect();
-        let confidence = core::confidence(cfg.correlation_lambda, &entries);
+        let mut confidence = core::confidence(cfg.correlation_lambda, &entries);
+        // A claim-level dispute (4.4) weighs on the two claims involved only,
+        // the same way a chunk-level one weighs on its chunk's evidence.
+        if let Some(strength) = db.max_open_claim_dispute(node_id).await? {
+            confidence *= 1.0 - strength.clamp(0.0, 1.0);
+            disputed = true;
+        }
         db.set_proposition_confidence(node_id, confidence, disputed).await?;
         Ok(())
     }
@@ -841,7 +1010,7 @@ mod tests {
             .iter()
             .map(|v| v.as_str().unwrap().to_string())
             .collect();
-        assert_eq!(top, vec!["propositions", "disputes"]);
+        assert_eq!(top, vec!["propositions", "relations"]);
         let claim_required: Vec<String> = schema["properties"]["propositions"]["items"]["required"]
             .as_array()
             .unwrap()
@@ -851,16 +1020,17 @@ mod tests {
         assert_eq!(
             claim_required,
             vec![
-                "claim", "importance", "urgency", "decay_class", "urgency_expires_at"
+                "claim", "importance", "urgency", "decay_class", "urgency_expires_at",
+                "attribution", "stance"
             ]
         );
-        let dispute_required: Vec<String> = schema["properties"]["disputes"]["items"]["required"]
+        let relation_required: Vec<String> = schema["properties"]["relations"]["items"]["required"]
             .as_array()
             .unwrap()
             .iter()
             .map(|v| v.as_str().unwrap().to_string())
             .collect();
-        assert_eq!(dispute_required, vec!["chunk_id", "strength", "reason"]);
+        assert_eq!(relation_required, vec!["my_claim", "other_claim_id", "kind", "strength", "reason"]);
     }
 
     #[test]

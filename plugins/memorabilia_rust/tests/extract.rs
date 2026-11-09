@@ -588,6 +588,8 @@ async fn probe_prefers_cross_source_and_renders_known_propositions() {
             last_assessed_at: Some(T0.into()),
             archived_at: None,
             created_at: T0.into(),
+            attribution: String::new(),
+            stance: "states".into(),
         })
         .await
         .unwrap();

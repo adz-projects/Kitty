@@ -33,6 +33,7 @@ semantic_dedup_threshold: 0.92
 
 # --- Disputes & decay ------------------------------------------------------
 dispute_strength_floor: 0.5
+claim_merge_cosine: 0.88       # candidate paraphrase threshold (claims); the extraction model confirms each merge
 tau_static_days: 365
 tau_transient_days: 7
 tau_pre_days: 7

@@ -20,6 +20,7 @@ pub mod intake;
 pub mod outbox;
 pub mod propositions;
 pub mod registry;
+pub mod relations;
 pub mod tombstones;
 pub mod vectors;
 

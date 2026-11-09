@@ -76,6 +76,11 @@ pub struct Config {
     /// noise (plan §2 / §9.1).
     #[serde(default = "default_dispute_strength_floor")]
     pub dispute_strength_floor: f64,
+    /// Cosine (same embedding space) at which a new claim is a *candidate*
+    /// paraphrase of an existing one; the extraction model confirms before
+    /// they merge, since a negation can sit just as close (4.3).
+    #[serde(default = "default_claim_merge_cosine")]
+    pub claim_merge_cosine: f64,
     /// Decay time constant, days, for `static` chunks (plan §2 / §7.1).
     #[serde(default = "default_tau_static_days")]
     pub tau_static_days: u64,
@@ -322,6 +327,7 @@ impl Default for Config {
             cluster_similarity_threshold: default_cluster_similarity_threshold(),
             semantic_dedup_threshold: default_semantic_dedup_threshold(),
             dispute_strength_floor: default_dispute_strength_floor(),
+            claim_merge_cosine: default_claim_merge_cosine(),
             tau_static_days: default_tau_static_days(),
             tau_transient_days: default_tau_transient_days(),
             tau_pre_days: default_tau_pre_days(),
@@ -437,6 +443,11 @@ fn default_cluster_similarity_threshold() -> f64 {
 }
 fn default_semantic_dedup_threshold() -> f64 {
     0.92
+}
+fn default_claim_merge_cosine() -> f64 {
+    // EmbeddingGemma 2: unrelated text ~0.6, related ~0.75-0.8, paraphrases
+    // above. Generous on purpose -- the model confirms each candidate.
+    0.88
 }
 fn default_dispute_strength_floor() -> f64 {
     0.5

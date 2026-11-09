@@ -163,6 +163,18 @@ pub struct RankedItem {
     pub citations: Vec<String>,
     /// Active supporting chunk ids (the grounding/reinforcement targets).
     pub supporting_chunk_ids: Vec<String>,
+    /// The other side of an open claim-level dispute, `(item_id, claim)`, so
+    /// recall shows both instead of a bare "(disputed)".
+    pub disputed_by: Option<(String, String)>,
+}
+
+/// A documented counter-view for the counterpoint channel
+/// ([`Engine::counterpoint`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CounterView {
+    pub item_id: String,
+    pub claim: String,
+    pub citation: String,
 }
 
 /// A compact index row (the injected index / the `memorabilia_search`
@@ -297,6 +309,18 @@ impl Engine {
         if prop.status != "active" {
             return Ok(None);
         }
+        // Readable, but labelled: what replaced it, and when.
+        let mut claim = prop.display_claim();
+        if let Some(rel) = self.db.superseded_by(item_id).await? {
+            if let Some(newer) = self.db.get_proposition(&rel.from_node).await? {
+                claim = format!(
+                    "{claim} [superseded {} by [{}]: {}]",
+                    rel.opened_at.get(..10).unwrap_or(&rel.opened_at),
+                    newer.node_id,
+                    newer.display_claim()
+                );
+            }
+        }
         let supporters = self.db.list_active_supporting_chunks(item_id).await?;
         let total = supporters.len();
         // Byte budget over the full recall cap so an item id / pagination
@@ -316,7 +340,7 @@ impl Engine {
         }
         Ok(Some(ItemView {
             item_id: prop.node_id,
-            claim: prop.claim,
+            claim,
             confidence: prop.confidence,
             importance: prop.importance,
             urgency: prop.urgency,
@@ -325,6 +349,54 @@ impl Engine {
             total_chunks: total,
             offset,
         }))
+    }
+
+    /// The other side of `node_id`'s strongest open claim-level dispute, if
+    /// it is still current: `(item_id, display claim)`.
+    async fn dispute_partner(&self, node_id: &str) -> Result<Option<(String, String)>> {
+        let mut best: Option<(f64, String)> = None;
+        for r in self.db.open_relations_of(node_id).await? {
+            if r.kind != "disputes" {
+                continue;
+            }
+            let other = if r.from_node == node_id { r.to_node } else { r.from_node };
+            if best.as_ref().is_none_or(|(s, _)| r.strength > *s) {
+                best = Some((r.strength, other));
+            }
+        }
+        let Some((_, other)) = best else {
+            return Ok(None);
+        };
+        match self.db.get_proposition(&other).await? {
+            Some(p) if p.status == "active" && self.db.superseded_by(&other).await?.is_none() => {
+                Ok(Some((p.node_id.clone(), p.display_claim())))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// A documented counter-view to `stance` for the counterpoint channel
+    /// (`[Worth challenging]`): among the items most relevant to it, the
+    /// first with a current claim that disputes it, with its citation.
+    /// Read-only. `None` when memory holds no such material -- the model
+    /// then offers the other side from its own knowledge.
+    pub async fn counterpoint(&self, stance: &str) -> Option<CounterView> {
+        let items = self.ranked_items(stance).await.ok()?;
+        for item in items.iter().take(5) {
+            let Some((other_id, other_claim)) = item.disputed_by.clone() else {
+                continue;
+            };
+            let citation = self
+                .db
+                .list_active_supporting_chunks(&other_id)
+                .await
+                .ok()?
+                .first()
+                .map(|c| c.cluster_citation.clone())
+                .unwrap_or_default();
+            return Some(CounterView { item_id: other_id, claim: other_claim, citation });
+        }
+        None
     }
 
     /// The two-pass retrieval core, shared by recall and search. Read-only
@@ -410,6 +482,12 @@ impl Engine {
             if prop.status != "active" {
                 continue;
             }
+            // A superseded claim was true but no longer is (4.4): it stays
+            // readable through `render_item`, never recalled as current.
+            if self.db.superseded_by(&node_id).await?.is_some() {
+                continue;
+            }
+            let disputed_by = self.dispute_partner(&node_id).await?;
             let boost = core::metaboost(&prop.urgency, &prop.importance, &self.config);
             let priority = core::priority(activation, boost, self.config.metaboost_cap);
             let supporters = self.db.list_active_supporting_chunks(&node_id).await?;
@@ -426,9 +504,10 @@ impl Engine {
             if supporting_chunk_ids.is_empty() {
                 continue;
             }
+            let claim = prop.display_claim();
             items.push(RankedItem {
                 item_id: prop.node_id,
-                claim: prop.claim,
+                claim,
                 confidence: prop.confidence,
                 importance: prop.importance,
                 urgency: prop.urgency,
@@ -437,6 +516,7 @@ impl Engine {
                 relevance: relevance.get(&node_id).copied(),
                 citations,
                 supporting_chunk_ids,
+                disputed_by,
             });
         }
         // Primary: centered relevance (a directly-seeded on-topic item leads;
@@ -701,11 +781,16 @@ fn render_index_block(items: &[RankedItem], token_cap: usize) -> (String, Vec<St
 
     let mut grounded: Vec<String> = Vec::new();
     for item in items {
+        let disputed = match (&item.disputed_by, item.is_disputed) {
+            (Some((id, claim)), _) => format!(" (disputed by [{id}]: {claim})"),
+            (None, true) => " (disputed)".to_string(),
+            (None, false) => String::new(),
+        };
         let line = format!(
             "- [{}] {}{} — conf {:.2} — {}\n",
             item.item_id,
             item.claim,
-            if item.is_disputed { " (disputed)" } else { "" },
+            disputed,
             item.confidence,
             item.citations.first().map(String::as_str).unwrap_or("(uncited)"),
         );
