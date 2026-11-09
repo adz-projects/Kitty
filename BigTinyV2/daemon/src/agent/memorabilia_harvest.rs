@@ -66,7 +66,11 @@ pub async fn harvest_turn(engine: &Engine, pool: &SqlitePool, session_id: &str) 
     for (label, pinned, body) in parse_marker_blocks(docs_region(&user_content)) {
         let is_paste = label.starts_with("Pasted text");
         let (source_type, source_entity) = if is_paste {
-            ("UserNote", "user:paste".to_string())
+            // One source per pasted document, keyed by its content. A single
+            // shared `user:paste` entity folded every paste into one source,
+            // so two independent pastes asserting the same fact could never
+            // corroborate it (confidence combines over *distinct* sources).
+            ("UserNote", paste_source_entity(&body))
         } else {
             ("Attachment", format!("inlined:{label}"))
         };
@@ -571,6 +575,14 @@ fn parse_scrape_success(envelope: &str) -> Option<ScrapedItem> {
 
 /// Bare host of a URL (for the `Scraped` source's domain tiering), no scheme,
 /// userinfo, port, path, or query. Falls back to the whole string.
+/// The memorabilia `source_entity` of one pasted document: stable for the
+/// same text (a re-paste is the same source), distinct across different
+/// pastes.
+fn paste_source_entity(body: &str) -> String {
+    let hash = memorabilia::text::sha256_hex(body.trim());
+    format!("user:paste:{}", &hash[..16])
+}
+
 fn host_of(url: &str) -> String {
     let after_scheme = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
     let authority = after_scheme
@@ -584,6 +596,15 @@ fn host_of(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_paste_is_its_own_source() {
+        let a = paste_source_entity("The bridge reopened in March.");
+        let b = paste_source_entity("A different note entirely.");
+        assert_ne!(a, b, "independent pastes must be distinct sources");
+        assert_eq!(a, paste_source_entity("  The bridge reopened in March.\n"), "a re-paste is the same source");
+        assert!(a.starts_with("user:paste:"));
+    }
 
     #[test]
     fn marker_blocks_capture_paste_and_inlined_file() {

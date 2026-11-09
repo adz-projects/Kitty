@@ -33,8 +33,12 @@ pub const QUERY_SIMILARITY: f32 = 0.80;
 pub const PROMOTE_AT: f64 = 2.0;
 /// Points for each further similar search, per turn.
 pub const SEARCH_POINTS: f64 = 0.5;
-/// Candidates per promoted cluster written to memory.
+/// Fewest candidates a promoted cluster writes to memory (when it has them).
 pub const REPRESENTATIVES: usize = 2;
+/// Most candidates a promoted cluster writes to memory: one per distinct
+/// source, so independent sources survive promotion and can corroborate each
+/// other's claims instead of being merged away before extraction.
+pub const MAX_SOURCE_REPRESENTATIVES: usize = 4;
 /// Most waiting candidates considered per night (newest first); the
 /// clustering is all-pairs.
 pub const CLUSTER_WINDOW: i64 = 3000;
@@ -81,6 +85,11 @@ pub struct OvernightReport {
     pub extraction_succeeded: u64,
     pub extraction_failed: u64,
     pub propositions_written: u64,
+    /// Clusters the recurrence step formed this pass (promoted or not).
+    pub clusters_seen: u64,
+    /// Members in the largest of them. A cluster far larger than any one
+    /// topic means the similarity threshold is chaining unrelated material.
+    pub largest_cluster: u64,
     /// Every stage ran to completion (nothing left for the next run).
     pub finished: bool,
 }
@@ -383,6 +392,27 @@ impl Engine {
         let mut clusters: Vec<Vec<usize>> = clusters.into_values().collect();
         clusters.sort_by(|a, b| live[a[0]].c.candidate_id.cmp(&live[b[0]].c.candidate_id));
 
+        // Cluster-size telemetry: the recurrence threshold is raw cosine, and
+        // single-linkage can chain unrelated topics into one cluster in a
+        // compressed embedding space. The histogram is what tells.
+        if !clusters.is_empty() {
+            let mut sizes: Vec<usize> = clusters.iter().map(Vec::len).collect();
+            sizes.sort_unstable_by(|a, b| b.cmp(a));
+            r.clusters_seen = clusters.len() as u64;
+            r.largest_cluster = sizes[0] as u64;
+            let mut histogram: std::collections::BTreeMap<usize, usize> = Default::default();
+            for s in &sizes {
+                *histogram.entry(*s).or_default() += 1;
+            }
+            tracing::info!(
+                candidates = n,
+                clusters = clusters.len(),
+                largest = sizes[0],
+                ?histogram,
+                "overnight_pass: recurrence clusters (size -> count)"
+            );
+        }
+
         let queries: Vec<(String, i64, Vec<f32>, String)> = self
             .db
             .list_queries_since(&days_before(now_dt, CANDIDATE_MAX_AGE_DAYS))
@@ -502,14 +532,44 @@ impl Engine {
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| live[a.0].c.candidate_id.cmp(&live[b.0].c.candidate_id))
         });
-        // Prefer representatives from different documents.
+        // Each member's source, through its capture (looked up once per
+        // capture). A failed lookup falls back to the capture id, which only
+        // ever makes the member look *more* distinct, never merges sources.
+        let mut source_of_capture: HashMap<String, String> = HashMap::new();
+        for &i in members {
+            let cid = &live[i].c.capture_id;
+            if source_of_capture.contains_key(cid) {
+                continue;
+            }
+            let source = match self.db.get_capture(cid).await {
+                Ok(Some(cap)) => cap.source_entity,
+                _ => format!("capture:{cid}"),
+            };
+            source_of_capture.insert(cid.clone(), source);
+        }
+        let source = |i: usize| source_of_capture[&live[i].c.capture_id].as_str();
+
+        // One representative per distinct source, most central first, up to
+        // MAX_SOURCE_REPRESENTATIVES -- corroboration only counts across
+        // sources, so these are the members worth extracting.
         let mut chosen: Vec<usize> = Vec::new();
-        let mut captures: HashSet<&str> = HashSet::new();
+        let mut sources: HashSet<&str> = HashSet::new();
+        for &(i, _) in &ranked {
+            if chosen.len() >= MAX_SOURCE_REPRESENTATIVES {
+                break;
+            }
+            if sources.insert(source(i)) {
+                chosen.push(i);
+            }
+        }
+        // Top up to REPRESENTATIVES: different documents first, then anything.
+        let mut captures: HashSet<&str> =
+            chosen.iter().map(|&i| live[i].c.capture_id.as_str()).collect();
         for &(i, _) in &ranked {
             if chosen.len() >= REPRESENTATIVES {
                 break;
             }
-            if captures.insert(live[i].c.capture_id.as_str()) {
+            if !chosen.contains(&i) && captures.insert(live[i].c.capture_id.as_str()) {
                 chosen.push(i);
             }
         }
@@ -730,6 +790,32 @@ mod tests {
         assert_eq!(r.chunks_promoted, REPRESENTATIVES as u64);
         assert_eq!(r.candidates_merged, 1);
         assert_eq!(active_chunks(&e).await, REPRESENTATIVES);
+    }
+
+    #[tokio::test]
+    async fn every_distinct_source_in_a_cluster_survives_promotion() {
+        // Three sources on one topic: all three reach memory (so their claims
+        // can corroborate each other), instead of the two most central.
+        let e = engine().await;
+        for (k, (site, session, variant)) in [
+            ("a.example", "s1", "first"),
+            ("b.example", "s2", "second"),
+            ("c.example", "s3", "third"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut i = input(doc("Breakwater design", variant), session, k as i64 + 1, T0);
+            i.ingest.source_entity = site.into();
+            i.ingest.source_name = site.into();
+            e.capture(&i).await;
+        }
+        let r = e.overnight_pass(&FixedClock(NIGHT.into())).await;
+        assert_eq!(r.clusters_promoted, 1);
+        assert_eq!(r.chunks_promoted, 3, "one representative per source");
+        assert_eq!(r.candidates_merged, 0);
+        assert_eq!(r.clusters_seen, 1);
+        assert_eq!(r.largest_cluster, 3);
     }
 
     #[tokio::test]
