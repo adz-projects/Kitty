@@ -46,7 +46,7 @@ pub fn effective_weight(
 ) -> f64 {
     // base: tested -> confidence; untested -> confidence * 0.625 (so 0.80
     // becomes exactly 0.50).
-    let base = if b.tested {
+    let base = if b.full_weight() {
         b.confidence
     } else {
         b.confidence * 0.625

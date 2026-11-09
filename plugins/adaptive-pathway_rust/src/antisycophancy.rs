@@ -60,6 +60,27 @@ pub fn unsure_due(exchange_count: i64) -> bool {
     exchange_count > 0 && exchange_count % 12 == 0
 }
 
+/// `[In tension]`: two things the user has said or shown that pull in
+/// different directions, both put in front of the model instead of one
+/// quietly winning (contradictions used to just halve a belief's weight).
+pub fn tension_line(a: &str, b: &str) -> String {
+    format!(
+        "Earlier: \"{a}\". Also: \"{b}\". These pull in different directions; \
+         where it matters here, ask or check which holds rather than assuming either."
+    )
+}
+
+/// `[Worth challenging]`: a view the user holds that bears on this turn.
+/// Not a correction and not a refusal to help: the strongest honest case
+/// against it, offered alongside the answer, so the user is not only ever
+/// shown arguments they already agree with.
+pub fn challenge_line(stance: &str) -> String {
+    format!(
+        "They lean toward: \"{stance}\". Where it bears on this, also give the strongest \
+         case against that view, plainly labelled as such, without abandoning their question."
+    )
+}
+
 /// Assemble the full injected block. `exported = Some(block)` on a *turn*
 /// where we render; the plan drives cadence at the call site. Returns the
 /// block text or an empty string when nothing should be injected.
@@ -69,9 +90,29 @@ pub fn render_block(
     unsure: Option<String>,
     check: Option<String>,
 ) -> String {
+    render_block_full(knows, None, None, worth_testing, unsure, check)
+}
+
+/// [`render_block`] with the two Phase 3 sections, `[In tension]` and
+/// `[Worth challenging]`, placed right after the working assumptions they
+/// qualify.
+pub fn render_block_full(
+    knows: &str,
+    tension: Option<String>,
+    challenge: Option<String>,
+    worth_testing: Option<String>,
+    unsure: Option<String>,
+    check: Option<String>,
+) -> String {
     let mut parts: Vec<String> = Vec::new();
     if !knows.is_empty() {
         parts.push(format!("[Working assumptions about you]\n{knows}"));
+    }
+    if let Some(t) = tension.filter(|t| !t.is_empty()) {
+        parts.push(format!("[In tension]\n{t}"));
+    }
+    if let Some(c) = challenge.filter(|c| !c.is_empty()) {
+        parts.push(format!("[Worth challenging]\n{c}"));
     }
     if let Some(w) = worth_testing {
         if !w.is_empty() {

@@ -31,7 +31,20 @@ pub fn extraction_schema() -> Value {
                         "layer": {"type": "string", "enum": ["context", "conversation"]},
                         "domain": {"type": "string", "description": "Short topic label such as 'coding', 'writing', 'cooking'. Empty string if not topic-specific."},
                         "evidence": {"type": "string", "description": "A short quote from the exchanges that supports this."},
-                        "contradicts": {"type": "string", "description": "If this conflicts with a line in KNOWN BELIEFS, that line's exact text. Empty string otherwise."}
+                        "contradicts": {"type": "string", "description": "If this conflicts with a line in KNOWN BELIEFS, that line's exact text. Empty string otherwise."},
+                        "kind": {"type": "string", "enum": ["preference", "stance", "context", "trait"], "description": "preference: how the user likes things done (format, tone, tools). stance: a view the user holds about the world or a contested question. context: what they are working on, their situation. trait: who they are (role, background)."},
+                        "relates_to": {
+                            "type": "array",
+                            "description": "Lines in KNOWN BELIEFS this one is meaningfully connected to (not mere topic overlap). Empty if none.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "known_belief": {"type": "string", "description": "That line's exact text, without the [layer] tag."},
+                                    "relation": {"type": "string", "enum": ["explains", "in_tension_with", "specializes"], "description": "explains: this belief explains or motivates that one. in_tension_with: they pull in different directions without flatly contradicting. specializes: this is a special case of that one."}
+                                },
+                                "required": ["known_belief", "relation"]
+                            }
+                        }
                     },
                     // Every field required, with empty-string sentinels rather
                     // than nullable/optional ones: llama.cpp's grammar-
@@ -42,12 +55,24 @@ pub fn extraction_schema() -> Value {
                     // those three as optional, which is exactly the case
                     // where small models most often emit a truncated or
                     // malformed object.
-                    "required": ["statement", "provenance", "layer", "domain", "evidence", "contradicts"]
+                    "required": ["statement", "provenance", "layer", "domain", "evidence", "contradicts", "kind", "relates_to"]
                 }
             },
             "corrections": {
                 "type": "array",
                 "items": {"type": "string", "description": "Exact text of a KNOWN BELIEF the user explicitly denied or overrode."}
+            },
+            "test_results": {
+                "type": "array",
+                "description": "For each line in TESTS IN FLIGHT: did the exchanges confirm or refute that assumption about the user? Report no_signal when they say nothing about it.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "assumption": {"type": "string", "description": "The TESTS IN FLIGHT line's exact text."},
+                        "outcome": {"type": "string", "enum": ["confirmed", "refuted", "no_signal"]}
+                    },
+                    "required": ["assumption", "outcome"]
+                }
             },
             "tone": {"type": "string", "description": "The user's tone in these exchanges, one or two words."},
             "open_topics": {
@@ -55,13 +80,19 @@ pub fn extraction_schema() -> Value {
                 "items": {"type": "string"}
             }
         },
-        "required": ["observations", "corrections", "tone", "open_topics"]
+        "required": ["observations", "corrections", "test_results", "tone", "open_topics"]
     })
 }
 
 /// Exactly 2 messages framing "learn about the user -- not the task, not the
 /// assistant", mirroring the daemon's `build_summarizer_prompt` shape.
 pub fn build_extraction_prompt(known_beliefs: &str, chunk: &str) -> Vec<Value> {
+    build_extraction_prompt_with_tests(known_beliefs, &[], chunk)
+}
+
+/// [`build_extraction_prompt`] plus the assumptions put to this chat that
+/// no pass has judged yet ("TESTS IN FLIGHT"), for `test_results`.
+pub fn build_extraction_prompt_with_tests(known_beliefs: &str, tests: &[String], chunk: &str) -> Vec<Value> {
     let system = "You are learning about the person in this conversation. \
         Extract beliefs ABOUT THE USER -- their preferences, values, habits, \
         constraints, identity. Never extract facts about the task, the tools, \
@@ -71,8 +102,15 @@ pub fn build_extraction_prompt(known_beliefs: &str, chunk: &str) -> Vec<Value> {
         json!({"role": "system", "content": system}),
         json!({"role": "user", "content": format!(
             "Already known about this user (do not duplicate):\n{}\n\n\
+             TESTS IN FLIGHT (assumptions the assistant was asked to check in this chat; \
+             judge each from the conversation):\n{}\n\n\
              Conversation to learn from:\n{}",
             if known_beliefs.is_empty() { "(none)" } else { known_beliefs },
+            if tests.is_empty() {
+                "(none)".to_string()
+            } else {
+                tests.iter().map(|t| format!("- {t}")).collect::<Vec<_>>().join("\n")
+            },
             chunk
         )}),
     ]
@@ -169,7 +207,15 @@ pub async fn extract_and_record<S: StructuredChat>(
     }
 
     // Render KNOWN BELIEFS (top 20 by effective weight).
-    let known = render_known_beliefs(db).await?;
+    // KNOWN BELIEFS are the ones most relevant to this chunk (weight x
+    // similarity), not just the heaviest: what the conversation contradicts,
+    // explains or pulls against is usually a related belief, and the
+    // extractor can only report relations to lines it is shown.
+    let chunk_vec = match engine.embed.embed_with_space(&chunk).await {
+        (v, true) => v,
+        _ => Vec::new(),
+    };
+    let known = render_known_beliefs(db, &chunk_vec, &engine.cfg.embedding.ollama_model).await?;
 
     // The permit is scoped to exactly this call -- it used to be bound at
     // function level, which meant it stayed held through every subsequent
@@ -191,7 +237,9 @@ pub async fn extract_and_record<S: StructuredChat>(
     // (a remote or reasoning model routinely needs well over the old 30s), and
     // at 30s every pass on such a provider timed out and nothing was learned.
     const STRUCTURED_CHAT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
-    let prompt = build_extraction_prompt(&known, &chunk);
+    let in_flight = db.tests_in_flight(req.session_id).await.unwrap_or_default();
+    let test_lines: Vec<String> = in_flight.iter().map(|(_, _, t)| t.clone()).collect();
+    let prompt = build_extraction_prompt_with_tests(&known, &test_lines, &chunk);
     let parsed = {
         let _permit = engine.chat_semaphore().acquire_owned().await.map_err(
             |_| PathwayError::Internal("semaphore closed".into()),
@@ -267,7 +315,10 @@ pub async fn extract_and_record<S: StructuredChat>(
         } else {
             crate::config::HASH_EMBED_MODEL
         };
-        crate::belief::synthesis::route_observation(
+        let kind = crate::store::beliefs::BeliefKind::parse(
+            obs.get("kind").and_then(|k| k.as_str()).unwrap_or("context"),
+        );
+        let landed = crate::belief::synthesis::route_observation_with(
             db,
             &statement,
             &embedding,
@@ -280,8 +331,35 @@ pub async fn extract_and_record<S: StructuredChat>(
             Some(req.session_id.to_string()),
             Some(batch_id.as_str()),
             now,
+            kind,
         )
         .await?;
+        if let Some(id) = landed {
+            record_relations(db, &id, obs).await;
+        }
+    }
+
+    // Judge the assumption tests this chat had in flight.
+    if let Some(results) = parsed.get("test_results").and_then(|r| r.as_array()) {
+        for r in results {
+            let (Some(text), Some(outcome)) = (
+                r.get("assumption").and_then(|v| v.as_str()),
+                r.get("outcome").and_then(|v| v.as_str()),
+            ) else {
+                continue;
+            };
+            let text = text.trim();
+            if text.is_empty() {
+                continue;
+            }
+            let Some((assumption_id, belief_id, _)) = in_flight
+                .iter()
+                .find(|(_, _, t)| t.trim() == text || t.contains(text) || text.contains(t.trim()))
+            else {
+                continue;
+            };
+            apply_test_result(db, req.session_id, assumption_id, belief_id.as_deref(), outcome).await;
+        }
     }
 
     // Process corrections (forget(wrong) semantics).
@@ -334,15 +412,131 @@ pub async fn extract_and_record<S: StructuredChat>(
     Ok(outcome)
 }
 
-/// Render the top-20 known beliefs by effective weight for the prompt.
-async fn render_known_beliefs(db: &Db) -> Result<String> {
-    let all = db.list_beliefs(None).await?;
+/// Record what extraction said this belief relates to (`relates_to`):
+/// typed links, and for `in_tension_with` an open contradiction, so
+/// `[In tension]` can surface it. Best-effort.
+async fn record_relations(db: &Db, belief_id: &str, obs: &Value) {
+    let Some(rels) = obs.get("relates_to").and_then(|r| r.as_array()) else {
+        return;
+    };
+    for rel in rels {
+        let (Some(text), Some(relation)) = (
+            rel.get("known_belief").and_then(|v| v.as_str()),
+            rel.get("relation")
+                .and_then(|v| v.as_str())
+                .and_then(crate::store::links::Relation::parse),
+        ) else {
+            continue;
+        };
+        let Ok(Some(other)) = db.best_text_match(text).await else {
+            continue;
+        };
+        if other == belief_id {
+            continue;
+        }
+        let _ = db.insert_link(belief_id, &other, relation).await;
+        if relation == crate::store::links::Relation::InTensionWith
+            && !db.has_contradiction(belief_id, &other).await.unwrap_or(true)
+        {
+            let _ = db
+                .insert_contradiction(&crate::store::contradictions::Contradiction {
+                    id: crate::store::audit::uuid_string(),
+                    belief_a: belief_id.to_string(),
+                    belief_b: other,
+                    status: "open".into(),
+                    resolved_b: None,
+                    reason: Some("model_tension".into()),
+                    created_at: chrono::Utc::now(),
+                    resolved_at: None,
+                })
+                .await;
+        }
+    }
+}
+
+/// Apply one judged assumption test. `confirmed`: the belief is now
+/// validated (controlled-test evidence, `tested`) and the assumption passes.
+/// `refuted`: confidence falls by the direct-test step and the assumption
+/// fails. `no_signal` (or anything else): nothing; it stays in flight.
+/// Best-effort.
+async fn apply_test_result(
+    db: &Db,
+    session_id: &str,
+    assumption_id: &str,
+    belief_id: Option<&str>,
+    outcome: &str,
+) {
+    use crate::belief::provenance::{reinforce_toward, reinforcement_step};
+    use crate::belief::EvidenceKind;
+    let passed = match outcome {
+        "confirmed" => true,
+        "refuted" => false,
+        _ => return,
+    };
+    if let Some(bid) = belief_id {
+        if let Ok(Some(b)) = db.get_belief(bid).await {
+            let now = chrono::Utc::now();
+            let patch = if passed {
+                crate::store::beliefs::BeliefPatch {
+                    confidence: Some(reinforce_toward(
+                        b.confidence,
+                        true,
+                        reinforcement_step(EvidenceKind::ControlledTest),
+                    )),
+                    tested: Some(true),
+                    provenance: Some(crate::belief::synthesis::max_provenance(
+                        b.provenance,
+                        Provenance::ControlledTest,
+                    )),
+                    last_confirmed_at: Some(now),
+                    ..Default::default()
+                }
+            } else {
+                crate::store::beliefs::BeliefPatch {
+                    confidence: Some(reinforce_toward(
+                        b.confidence,
+                        false,
+                        reinforcement_step(EvidenceKind::DirectTest),
+                    )),
+                    ..Default::default()
+                }
+            };
+            let _ = db.update_belief(bid, &patch, now).await;
+        }
+        let _ = db.resolve_assumption_for_belief(bid, passed).await;
+    }
+    let _ = db.mark_test_judged(assumption_id, session_id).await;
+    let _ = db
+        .audit(
+            "assumption_test",
+            Some(&format!("assumption={assumption_id} outcome={outcome}")),
+        )
+        .await;
+}
+
+/// Render the 20 known beliefs most relevant to the chunk (effective weight
+/// times similarity; weight alone when the chunk has no semantic vector).
+async fn render_known_beliefs(db: &Db, chunk_vec: &[f32], space: &str) -> Result<String> {
     let now = chrono::Utc::now();
+    let suppressed = db.active_suppressed_text_hashes(now).await.unwrap_or_default();
+    let all = crate::belief::filter_suppressed(db.list_beliefs(None).await?, &suppressed);
     let mut scored: Vec<(f64, &Belief)> = all
         .iter()
-        .map(|b| (crate::belief::effective_weight(b, None, now), b))
+        .map(|b| {
+            let w = crate::belief::effective_weight(b, None, now);
+            let sim = if !chunk_vec.is_empty() && b.embedding_model == space {
+                crate::vector::ops::cosine(chunk_vec, &b.embedding).max(0.0)
+            } else {
+                0.0
+            };
+            (w * (0.5 + 0.5 * sim), b)
+        })
         .collect();
-    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    scored.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.id.cmp(&b.1.id))
+    });
     let lines: Vec<String> = scored
         .iter()
         .take(20)

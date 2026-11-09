@@ -31,6 +31,7 @@ async fn seed_belief(db: &Db, id: &str, embedding: Vec<f32>) {
         updated_at: now,
         session_id: None,
         embedding_model: adaptive_pathway::config::DEFAULT_EMBEDDING_MODEL.into(),
+        kind: adaptive_pathway::store::beliefs::BeliefKind::Context,
     })
     .await
     .unwrap();

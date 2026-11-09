@@ -24,6 +24,10 @@ struct TurnSignals {
     worth_testing: Option<String>,
     unsure: Option<String>,
     check: Option<String>,
+    /// `[In tension]`: an open contradiction touching a selected belief.
+    tension: Option<String>,
+    /// `[Worth challenging]` line, and the stance it challenges.
+    challenge: Option<(String, String)>,
 }
 
 /// One turn's recall, as [`PathwayEngine::recall_turn`] returns it.
@@ -31,6 +35,9 @@ struct TurnSignals {
 pub struct TurnRecall {
     /// The rendered block (system block or thought seed).
     pub text: String,
+    /// The stance `[Worth challenging]` targets this turn, if any, so the
+    /// host can look for a documented counter-view (Memorabilia) to add.
+    pub challenge: Option<String>,
 }
 
 pub struct PathwayEngine {
@@ -234,11 +241,15 @@ impl PathwayEngine {
         let (mut selected, candidates) = self
             .select_for_turn(session_id, user_message, previous_user_message)
             .await?;
-        let signals = self.turn_signals(session_id, &selected, &candidates).await;
+        let signals = self.turn_signals(session_id, user_message, &selected, &candidates).await;
+        let challenge_target = signals.challenge.as_ref().map(|(_, stance)| stance.clone());
+        let challenge_line = signals.challenge.map(|(line, _)| line);
         let text = if seeded {
             let reflection = crate::recall::render_reflection(&mut selected);
-            let block = crate::recall::render_reflection_block(
+            let block = crate::recall::render_reflection_block_full(
                 &reflection,
+                signals.tension,
+                challenge_line,
                 signals.worth_testing,
                 signals.unsure,
                 signals.check,
@@ -249,8 +260,10 @@ impl PathwayEngine {
             crate::recall::cap_reflection_to_token_budget(block)
         } else {
             let knows = crate::recall::render_knows(&mut selected);
-            let block = crate::antisycophancy::render_block(
+            let block = crate::antisycophancy::render_block_full(
                 &knows,
+                signals.tension,
+                challenge_line,
                 signals.worth_testing,
                 signals.unsure,
                 signals.check,
@@ -260,7 +273,7 @@ impl PathwayEngine {
             }
             crate::recall::cap_to_token_budget(block)
         };
-        Some(TurnRecall { text })
+        Some(TurnRecall { text, challenge: challenge_target })
     }
 
     /// Thought-seeded variant of `recall`: the same belief-selection pass
@@ -294,6 +307,7 @@ impl PathwayEngine {
     async fn turn_signals(
         &self,
         session_id: &str,
+        user_message: &str,
         selected: &[crate::belief::SelectedBelief],
         candidates: &[crate::store::beliefs::Belief],
     ) -> TurnSignals {
@@ -310,13 +324,34 @@ impl PathwayEngine {
             })
             .map(|s| s.belief.id.clone());
         TurnSignals {
-            worth_testing: self.worth_testing_line().await,
+            worth_testing: self.worth_testing_line(session_id, user_message, selected).await,
             unsure: self.unsure_line(session_id, selected, candidates).await,
             check: match &top_belief_id {
                 Some(id) => self.check_yourself_line(session_id, id).await,
                 None => None,
             },
+            tension: self.tension_line(selected, candidates).await,
+            challenge: challenge_for(selected),
         }
+    }
+
+    /// `[In tension]`: the oldest open contradiction touching a selected
+    /// belief whose other side is also eligible this turn (not suppressed,
+    /// not another chat's conversation belief). Both sides are shown; the
+    /// model is asked to check which holds instead of assuming either.
+    async fn tension_line(
+        &self,
+        selected: &[crate::belief::SelectedBelief],
+        candidates: &[crate::store::beliefs::Belief],
+    ) -> Option<String> {
+        let ids: Vec<String> = selected.iter().map(|s| s.belief.id.clone()).collect();
+        let text_of = |id: &str| candidates.iter().find(|b| b.id == id).map(|b| b.text.clone());
+        for (_, a, b) in self.db.open_tensions_for(&ids).await.ok()? {
+            if let (Some(ta), Some(tb)) = (text_of(&a), text_of(&b)) {
+                return Some(crate::antisycophancy::tension_line(&ta, &tb));
+            }
+        }
+        None
     }
 
     /// Shared candidate-selection pass behind `recall`/`recall_thought_seed`:
@@ -522,10 +557,21 @@ impl PathwayEngine {
             return Vec::new();
         }
         let ids: Vec<String> = candidates.iter().map(|b| b.id.clone()).collect();
-        let pairs = match self.db.cooccurring_belief_pairs(&ids).await {
-            Ok(p) if !p.is_empty() => p,
-            _ => return Vec::new(),
-        };
+        let mut pairs = self.db.cooccurring_belief_pairs(&ids).await.unwrap_or_default();
+        // Typed links from extraction (`relates_to`, migration 007) join the
+        // same unweighted adjacency: a belief that explains, specializes or
+        // pulls against an anchor belief is ambient context for it.
+        pairs.extend(
+            self.db
+                .links_among(&ids)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(a, b, _)| (a, b)),
+        );
+        if pairs.is_empty() {
+            return Vec::new();
+        }
         let index_of: std::collections::HashMap<&str, usize> =
             ids.iter().enumerate().map(|(i, id)| (id.as_str(), i)).collect();
         let mut adjacency = vec![Vec::new(); candidates.len()];
@@ -546,16 +592,42 @@ impl PathwayEngine {
     /// gate -- see `maintenance::run_maintenance`). Renders every turn one
     /// exists, per the plan's "if a scheduled assumption exists" framing --
     /// no additional cadence gate on top.
-    async fn worth_testing_line(&self) -> Option<String> {
-        let live = self
+    ///
+    /// Gated on relevance and shown at most once per chat: only an
+    /// assumption whose belief was selected this turn (it cleared the
+    /// relevance floor), oldest first, and only if it has not been put to
+    /// this chat before -- or was put on this very message (a regenerate
+    /// shows it again). Showing it records it as a test in flight, which the
+    /// next extraction pass is asked to judge (`learn::extract_and_record`).
+    async fn worth_testing_line(
+        &self,
+        session_id: &str,
+        user_message: &str,
+        selected: &[crate::belief::SelectedBelief],
+    ) -> Option<String> {
+        let selected_ids: std::collections::HashSet<&str> =
+            selected.iter().map(|s| s.belief.id.as_str()).collect();
+        let mut live: Vec<_> = self
             .db
             .list_assumptions(Some(crate::store::assumptions::AssumptionState::Surfaced))
             .await
-            .ok()?;
-        let a = live.into_iter().min_by_key(|a| a.flagged_at_exchange)?;
-        let current = self.db.global_exchange_count().await.unwrap_or(0);
-        let elapsed = (current - a.flagged_at_exchange).max(0);
-        Some(crate::belief::lifecycle::test_prompt(&a.text, elapsed))
+            .ok()?
+            .into_iter()
+            .filter(|a| a.belief_id.as_deref().is_some_and(|b| selected_ids.contains(b)))
+            .collect();
+        live.sort_by(|a, b| a.flagged_at_exchange.cmp(&b.flagged_at_exchange).then_with(|| a.id.cmp(&b.id)));
+        let hash = crate::belief::synthesis::text_hash(user_message.trim());
+        for a in live {
+            match self.db.assumption_shown_on(&a.id, session_id).await.ok()? {
+                Some(h) if h != hash => continue,
+                Some(_) => {}
+                None => {
+                    let _ = self.db.record_assumption_shown(&a.id, session_id, &hash).await;
+                }
+            }
+            return Some(crate::belief::lifecycle::test_prompt(&a.text));
+        }
+        None
     }
 
     /// `[Where I'm unsure]`: cadence-gated every 12 exchanges (this
@@ -679,6 +751,26 @@ impl PathwayEngine {
     }
 }
 
+/// `[Worth challenging]`: the top selected belief (display order) that is a
+/// `stance` -- a view the user holds. Preferences and context are never
+/// challenged: arguing with how someone likes their answers formatted is
+/// noise; offering the other side of a view they hold is the point.
+/// Returns `(line, stance text)`.
+fn challenge_for(selected: &[crate::belief::SelectedBelief]) -> Option<(String, String)> {
+    let mut stances: Vec<&crate::belief::SelectedBelief> = selected
+        .iter()
+        .filter(|s| s.belief.kind == crate::store::beliefs::BeliefKind::Stance)
+        .collect();
+    stances.sort_by(|a, b| {
+        b.effective_weight
+            .partial_cmp(&a.effective_weight)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.belief.id.cmp(&b.belief.id))
+    });
+    let top = stances.first()?;
+    Some((crate::antisycophancy::challenge_line(&top.belief.text), top.belief.text.clone()))
+}
+
 /// Turns the same top belief must lead recall before `[Check yourself]`.
 const PLATEAU_STREAK: i64 = 20;
 const CHECK_STREAK_PREFIX: &str = "check_streak::";
@@ -786,6 +878,7 @@ mod tests {
             updated_at: chrono::Utc::now(),
             session_id: None,
             embedding_model: crate::config::DEFAULT_EMBEDDING_MODEL.into(),
+            kind: crate::store::beliefs::BeliefKind::Context,
         }
     }
 
@@ -820,6 +913,7 @@ mod tests {
                 updated_at: chrono::Utc::now(),
                 session_id: None,
                 embedding_model: crate::config::DEFAULT_EMBEDDING_MODEL.into(),
+                kind: crate::store::beliefs::BeliefKind::Context,
             })
             .await
             .unwrap();

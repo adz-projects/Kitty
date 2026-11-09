@@ -37,6 +37,7 @@ fn belief(id: &str, text: &str, emb: Vec<f32>) -> Belief {
         updated_at: now,
         session_id: None,
         embedding_model: Config::default().embedding.ollama_model.clone(),
+        kind: adaptive_pathway::store::beliefs::BeliefKind::Context,
     }
 }
 

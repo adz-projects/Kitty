@@ -113,7 +113,7 @@ async fn reevaluate_stale_beliefs(db: &Db, now: chrono::DateTime<Utc>) -> Result
     let current_exchange = db.global_exchange_count().await?;
     let beliefs = db.list_beliefs(None).await?;
     for b in beliefs {
-        if !b.tested {
+        if !b.full_weight() {
             continue;
         }
         let Some(confirmed) = b.last_confirmed_at else { continue };
@@ -182,7 +182,7 @@ async fn retire_dead_beliefs(db: &Db, now: chrono::DateTime<Utc>) -> Result<()> 
         if (now - b.created_at).num_days() < RETIRE_AFTER_DAYS {
             continue;
         }
-        let dead = if b.tested {
+        let dead = if b.full_weight() {
             b.confidence <= RETIRE_CONFIDENCE_FLOOR
         } else {
             b.support_count <= RETIRE_MAX_SUPPORT_UNTESTED
@@ -232,6 +232,7 @@ mod tests {
             updated_at: now - chrono::Duration::days(confirmed_days_ago),
             session_id: None,
             embedding_model: crate::config::DEFAULT_EMBEDDING_MODEL.into(),
+            kind: crate::store::beliefs::BeliefKind::Context,
         }
     }
 
@@ -272,6 +273,8 @@ mod tests {
         let db = Db::open_in_memory().await.unwrap();
         let mut untested = tested_belief("untested", 0.70, 31);
         untested.tested = false;
+        // An inference: a direct statement is re-evaluated like a tested one.
+        untested.provenance = Provenance::InferredPattern;
         db.insert_belief(&untested).await.unwrap();
 
         run_maintenance(&db).await.unwrap();
@@ -313,6 +316,7 @@ mod tests {
             updated_at: created,
             session_id: None,
             embedding_model: crate::config::DEFAULT_EMBEDDING_MODEL.into(),
+            kind: crate::store::beliefs::BeliefKind::Context,
         }
     }
 

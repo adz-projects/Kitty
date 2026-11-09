@@ -80,6 +80,7 @@ mod tests {
             updated_at: now,
             session_id: None,
             embedding_model: crate::config::DEFAULT_EMBEDDING_MODEL.into(),
+            kind: crate::store::beliefs::BeliefKind::Context,
         }
     }
 

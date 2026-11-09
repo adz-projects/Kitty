@@ -30,6 +30,7 @@ fn belief(id: &str, text: &str, confidence: f64, tested: bool, emb: Vec<f32>) ->
         last_confirmed_at: Some(now),
         consolidated_at: None,
         embedding_model: Config::default().embedding.ollama_model,
+        kind: adaptive_pathway::store::beliefs::BeliefKind::Context,
         created_at: now,
         updated_at: now,
         session_id: None,

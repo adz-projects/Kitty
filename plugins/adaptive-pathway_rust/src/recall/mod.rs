@@ -468,6 +468,8 @@ pub fn truncation_order() -> &'static [&'static str] {
         "[Check yourself]",
         "[Worth testing this turn]",
         "[Where I'm unsure]",
+        "[Worth challenging]",
+        "[In tension]",
         "[Working assumptions about you]",
     ]
 }
@@ -596,11 +598,24 @@ pub fn render_reflection_block(
     unsure: Option<String>,
     check: Option<String>,
 ) -> String {
+    render_reflection_block_full(reflection, None, None, worth_testing, unsure, check)
+}
+
+/// [`render_reflection_block`] with `[In tension]` and `[Worth challenging]`
+/// (bare sentences, no headers), in the reverse of `truncation_order()`.
+pub fn render_reflection_block_full(
+    reflection: &str,
+    tension: Option<String>,
+    challenge: Option<String>,
+    worth_testing: Option<String>,
+    unsure: Option<String>,
+    check: Option<String>,
+) -> String {
     let mut parts: Vec<String> = Vec::new();
     if !reflection.is_empty() {
         parts.push(reflection.to_string());
     }
-    for part in [unsure, worth_testing, check].into_iter().flatten() {
+    for part in [tension, challenge, unsure, worth_testing, check].into_iter().flatten() {
         if !part.is_empty() {
             parts.push(part);
         }
@@ -657,6 +672,7 @@ mod tests {
             updated_at: Utc::now(),
             session_id: None,
             embedding_model: crate::config::DEFAULT_EMBEDDING_MODEL.into(),
+            kind: crate::store::beliefs::BeliefKind::Context,
         }
     }
 
@@ -706,7 +722,10 @@ mod tests {
         // unit vectors along orthogonal axes; both present
         let e1 = vec![1.0_f32, 0.0];
         let e2 = vec![0.0_f32, 1.0];
-        let untested_high = belief("a", "untested high", 0.8, false, Layer::Context, Some("d"), e1);
+        // Inferred, not stated: a direct statement carries full weight
+        // whether or not it has been tested (`Belief::full_weight`).
+        let mut untested_high = belief("a", "untested high", 0.8, false, Layer::Context, Some("d"), e1);
+        untested_high.provenance = Provenance::InferredPattern;
         let tested_low = belief("b", "tested low", 0.55, true, Layer::Context, Some("d"), e2);
         let sel = select_beliefs(&[untested_high, tested_low], Some("d"), &Config::default());
         assert_eq!(sel.len(), 2);

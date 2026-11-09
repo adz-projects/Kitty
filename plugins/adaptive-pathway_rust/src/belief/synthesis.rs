@@ -9,7 +9,7 @@
 use chrono::{DateTime, Utc};
 use serde_json::json;
 
-use super::super::store::beliefs::{Belief, Layer, Provenance, BeliefPatch};
+use super::super::store::beliefs::{Belief, BeliefKind, Layer, Provenance, BeliefPatch};
 use super::super::store::Db;
 use crate::error::Result;
 use crate::belief;
@@ -40,10 +40,38 @@ pub async fn route_observation(
     batch_id: Option<&str>,
     now: DateTime<Utc>,
 ) -> Result<()> {
+    route_observation_with(
+        db, statement, embedding, embedding_model, provenance, layer, domain, evidence,
+        contradicts, session_id, batch_id, now, BeliefKind::Context,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// [`route_observation`] with the belief's [`BeliefKind`], returning the id of
+/// the belief the observation landed on (merged into or created), or `None`
+/// when a permanent tombstone refused it. Extraction uses this so it can link
+/// the new belief to others (`relates_to`).
+#[allow(clippy::too_many_arguments)]
+pub async fn route_observation_with(
+    db: &Db,
+    statement: &str,
+    embedding: &[f32],
+    embedding_model: &str,
+    provenance: Provenance,
+    layer: Layer,
+    domain: Option<&str>,
+    evidence: Option<&str>,
+    contradicts: Option<&str>,
+    session_id: Option<String>,
+    batch_id: Option<&str>,
+    now: DateTime<Utc>,
+    kind: BeliefKind,
+) -> Result<Option<String>> {
     db.run_in_transaction(move || {
         route_observation_inner(
             db, statement, embedding, embedding_model, provenance, layer, domain, evidence,
-            contradicts, session_id, batch_id, now,
+            contradicts, session_id, batch_id, now, kind,
         )
     })
     .await
@@ -63,11 +91,12 @@ async fn route_observation_inner(
     session_id: Option<String>,
     batch_id: Option<&str>,
     now: DateTime<Utc>,
-) -> Result<()> {
+    kind: BeliefKind,
+) -> Result<Option<String>> {
     // Guard against relearning a forgotten/suppressed statement (text-hash).
     let text_hash = text_hash(statement);
     if db.has_permanent_tombstone(&text_hash).await? {
-        return Ok(());
+        return Ok(None);
     }
 
     // Find best merge candidate in the same layer. Conversation-layer
@@ -116,7 +145,7 @@ async fn route_observation_inner(
         let new_conf = merge_confidence(
             target.confidence,
             provenance,
-            target.tested || new_prov.is_tested(),
+            target.full_weight() || new_prov.is_tested() || new_prov == Provenance::DirectStatement,
         );
         let target_id = target.id.clone();
         // Session-identity comes from the observations table, not the
@@ -149,6 +178,10 @@ async fn route_observation_inner(
                 provenance: Some(new_prov),
                 tested: Some(target.tested || new_prov.is_tested()),
                 last_confirmed_at: Some(now),
+                // An unclassified (`context`, the default) belief takes the
+                // more specific kind a later observation reports; a belief
+                // already classified keeps its kind.
+                kind: (target.kind == BeliefKind::Context && kind != BeliefKind::Context).then_some(kind),
                 ..Default::default()
             },
             now,
@@ -176,7 +209,7 @@ async fn route_observation_inner(
         // resolves an assumption as failed; there's no "this merge
         // contradicts its own target" case to handle here. Best-effort:
         // never let assumption bookkeeping fail the whole observation.
-        if new_prov.is_tested() {
+        if new_prov.is_tested() || new_prov == Provenance::DirectStatement {
             let _ = db.resolve_assumption_for_belief(&target_id, true).await;
         }
         if let Some(updated) = db.get_belief(&target_id).await.ok().flatten() {
@@ -185,7 +218,8 @@ async fn route_observation_inner(
         }
     } else {
         // Create a new belief.
-        let b = fallback_belief(&id, statement, embedding, embedding_model, provenance, layer, domain, session_id.as_deref(), now);
+        let mut b = fallback_belief(&id, statement, embedding, embedding_model, provenance, layer, domain, session_id.as_deref(), now);
+        b.kind = kind;
         db.insert_belief(&b).await?;
         // A brand-new belief's initial confidence never clears the 0.55
         // flag threshold while untested (the highest untested initial
@@ -221,11 +255,11 @@ async fn route_observation_inner(
             .await
             .unwrap_or_default();
         if let Some(other_id) = resolved {
-            if other_id != current_id {
+            if other_id != current_id && !db.has_contradiction(&current_id, &other_id).await.unwrap_or(true) {
                 let _ = db
                     .insert_contradiction(&crate::store::contradictions::Contradiction {
                         id: crate::store::audit::uuid_string(),
-                        belief_a: current_id,
+                        belief_a: current_id.clone(),
                         belief_b: other_id,
                         status: "open".into(),
                         resolved_b: None,
@@ -238,7 +272,7 @@ async fn route_observation_inner(
         }
     }
 
-    Ok(())
+    Ok(Some(current_id))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -258,6 +292,7 @@ fn fallback_belief(
         text: statement.to_string(),
         embedding: embedding.to_vec(),
         embedding_model: embedding_model.to_string(),
+        kind: crate::store::beliefs::BeliefKind::Context,
         confidence: belief::provenance::initial_confidence(provenance),
         provenance,
         layer,
@@ -366,6 +401,7 @@ mod tests {
             updated_at: now,
             session_id: None,
             embedding_model: crate::config::DEFAULT_EMBEDDING_MODEL.into(),
+            kind: crate::store::beliefs::BeliefKind::Context,
         }
     }
 

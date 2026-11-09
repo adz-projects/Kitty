@@ -89,7 +89,7 @@ async fn consolidate_session_inner(db: &Db, session_id: &str) -> Result<()> {
                 let new_conf = crate::belief::synthesis::merge_confidence(
                     c.confidence,
                     b.provenance,
-                    c.tested || b.tested || new_prov.is_tested(),
+                    c.full_weight() || b.full_weight() || new_prov.is_tested() || new_prov == Provenance::DirectStatement,
                 );
                 // b came from THIS session (we loaded it via
                 // list_conversation_beliefs_for_session), and its observations

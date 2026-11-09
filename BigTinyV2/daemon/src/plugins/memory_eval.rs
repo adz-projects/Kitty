@@ -97,6 +97,8 @@ struct FixtureBelief {
     text: String,
     layer: String,
     provenance: String,
+    #[serde(default)]
+    kind: String,
 }
 
 #[derive(Deserialize)]
@@ -186,6 +188,7 @@ async fn memory_eval_pathway() {
                     updated_at: now,
                     session_id: None,
                     embedding_model: space.clone(),
+                    kind: adaptive_pathway::store::beliefs::BeliefKind::parse(&b.kind),
                 })
                 .await
                 .expect("insert belief");

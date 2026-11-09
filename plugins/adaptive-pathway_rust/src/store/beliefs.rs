@@ -78,11 +78,49 @@ impl Provenance {
     /// the plan's provenance table: correction/direct_statement/
     /// controlled_test are tested; inferred_pattern/single_observation are
     /// not.
+    /// Validated evidence: a correction, or a controlled test (including an
+    /// assumption test the extractor judged). A direct statement is *not*
+    /// tested -- the user saying so is strong evidence, but it is still
+    /// eligible for re-evaluation (see [`Belief::full_weight`]).
     pub fn is_tested(self) -> bool {
-        matches!(
-            self,
-            Provenance::Correction | Provenance::DirectStatement | Provenance::ControlledTest
-        )
+        matches!(self, Provenance::Correction | Provenance::ControlledTest)
+    }
+}
+
+/// What sort of belief this is (migration 007). Only `Stance` beliefs get
+/// counterpoints (`[Worth challenging]`): challenging how someone likes their
+/// answers formatted is noise, challenging a view they hold is the point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BeliefKind {
+    /// How the user likes things done (format, tone, tools).
+    Preference,
+    /// A view the user holds about the world.
+    Stance,
+    /// What they are working on, their situation.
+    #[default]
+    Context,
+    /// Who they are (role, background, enduring traits).
+    Trait,
+}
+
+impl BeliefKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BeliefKind::Preference => "preference",
+            BeliefKind::Stance => "stance",
+            BeliefKind::Context => "context",
+            BeliefKind::Trait => "trait",
+        }
+    }
+
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "preference" => BeliefKind::Preference,
+            "stance" => BeliefKind::Stance,
+            "trait" => BeliefKind::Trait,
+            _ => BeliefKind::Context,
+        }
     }
 }
 
@@ -115,6 +153,18 @@ pub struct Belief {
     /// mismatch against the currently configured model) -- see
     /// `list_recall_candidates`'s filter and `Db::update_embedding`.
     pub embedding_model: String,
+    /// What sort of belief this is (migration 007).
+    pub kind: BeliefKind,
+}
+
+impl Belief {
+    /// Whether this belief counts at its full confidence: validated
+    /// (`tested`), or stated by the user directly. Everything else is an
+    /// inference, discounted at recall, held under the untested ceiling, and
+    /// flagged for testing once it gets confident.
+    pub fn full_weight(&self) -> bool {
+        self.tested || self.provenance == Provenance::DirectStatement
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -136,6 +186,7 @@ pub struct BeliefPatch {
     /// see `update_belief`'s dedicated handling below (it does NOT go
     /// through the blind `COALESCE(?, col)` pattern the other fields use).
     pub session_id: Option<Option<String>>,
+    pub kind: Option<BeliefKind>,
 }
 
 impl Db {
@@ -144,8 +195,8 @@ impl Db {
             "INSERT INTO beliefs (id, text, embedding, confidence, provenance, layer, tested, \
              domain, tier, support_count, distinct_sessions, contradict_count, pinned, \
              last_confirmed_at, consolidated_at, created_at, updated_at, session_id, \
-             embedding_model) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             embedding_model, kind) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&b.id)
         .bind(&b.text)
@@ -166,6 +217,7 @@ impl Db {
         .bind(b.updated_at)
         .bind(&b.session_id)
         .bind(&b.embedding_model)
+        .bind(b.kind.as_str())
         .execute(self.pool())
         .await?;
         Ok(())
@@ -244,6 +296,7 @@ impl Db {
                      last_confirmed_at = COALESCE(?, last_confirmed_at), \
                      consolidated_at = COALESCE(?, consolidated_at), \
                      session_id = ?, \
+                     kind = COALESCE(?, kind), \
                      updated_at = ? WHERE id = ?")
             .bind(p.confidence)
             .bind(p.tested)
@@ -257,6 +310,7 @@ impl Db {
             .bind(p.last_confirmed_at)
             .bind(p.consolidated_at)
             .bind(session_id)
+            .bind(p.kind.map(|k| k.as_str()))
             .bind(updated_at)
             .bind(id)
             .execute(self.pool())
@@ -420,6 +474,7 @@ struct BeliefRow {
     updated_at: DateTime<Utc>,
     session_id: Option<String>,
     embedding_model: String,
+    kind: String,
 }
 
 impl sqlx::FromRow<'_, sqlx::sqlite::SqliteRow> for BeliefRow {
@@ -445,6 +500,7 @@ impl sqlx::FromRow<'_, sqlx::sqlite::SqliteRow> for BeliefRow {
             updated_at: row.try_get("updated_at")?,
             session_id: row.try_get("session_id")?,
             embedding_model: row.try_get("embedding_model")?,
+            kind: row.try_get("kind").unwrap_or_else(|_| "context".to_string()),
         })
     }
 }
@@ -476,6 +532,7 @@ fn map_belief(r: BeliefRow) -> Belief {
         updated_at: r.updated_at,
         session_id: r.session_id,
         embedding_model: r.embedding_model,
+        kind: BeliefKind::parse(&r.kind),
     }
 }
 
@@ -504,6 +561,7 @@ mod tests {
             updated_at,
             session_id: None,
             embedding_model: crate::config::DEFAULT_EMBEDDING_MODEL.into(),
+            kind: crate::store::beliefs::BeliefKind::Context,
         }
     }
 

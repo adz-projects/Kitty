@@ -29,6 +29,7 @@ fn conversation_belief(id: &str, session_id: &str, confidence: f64, support: i64
         updated_at: now,
         session_id: Some(session_id.into()),
         embedding_model: adaptive_pathway::config::DEFAULT_EMBEDDING_MODEL.into(),
+        kind: adaptive_pathway::store::beliefs::BeliefKind::Context,
     }
 }
 
@@ -148,6 +149,7 @@ async fn two_conversation_beliefs_merging_into_the_same_context_belief_both_appl
         updated_at: now,
         session_id: None,
         embedding_model: adaptive_pathway::config::DEFAULT_EMBEDDING_MODEL.into(),
+        kind: adaptive_pathway::store::beliefs::BeliefKind::Context,
     })
     .await
     .unwrap();

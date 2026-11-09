@@ -35,7 +35,7 @@ impl Db {
     /// so a repeated observation on the same belief doesn't create
     /// duplicate assumption rows.
     pub async fn flag_assumption_if_warranted(&self, belief: &Belief, current_exchange: i64) -> Result<()> {
-        if !should_flag(belief.confidence, belief.tested) {
+        if !should_flag(belief.confidence, belief.full_weight()) {
             return Ok(());
         }
         if self.get_assumption_for_belief(&belief.id).await?.is_some() {
@@ -114,10 +114,17 @@ pub fn should_flag(confidence: f64, tested: bool) -> bool {
 
 /// Deterministic test-prompt template for `[Worth testing this turn]`,
 /// matching the plan's example verbatim in shape.
-pub fn test_prompt(text: &str, exchanges_untested: i64) -> String {
+///
+/// It asks the model to check the assumption where it naturally bears on
+/// the turn, not to "try the opposite": deliberately acting against what the
+/// user seems to want was an odd thing to do to someone, and it gave the
+/// extraction pass nothing clean to judge. The next pass reports whether the
+/// exchange confirmed or refuted it (`test_results`).
+pub fn test_prompt(text: &str) -> String {
     format!(
-        "I've assumed \"{text}\" for {exchanges_untested} exchanges without ever checking. \
-         Try the opposite here and see whether it lands."
+        "I've been assuming \"{text}\" without ever checking it. Where it naturally \
+         bears on this turn, check it: ask, or offer the alternative alongside, \
+         rather than taking it for granted."
     )
 }
 
@@ -208,6 +215,7 @@ mod tests {
             updated_at: now,
             session_id: None,
             embedding_model: crate::config::DEFAULT_EMBEDDING_MODEL.into(),
+            kind: crate::store::beliefs::BeliefKind::Context,
         };
         db.insert_belief(&belief).await.unwrap();
 
@@ -243,6 +251,7 @@ mod tests {
             updated_at: now,
             session_id: None,
             embedding_model: crate::config::DEFAULT_EMBEDDING_MODEL.into(),
+            kind: crate::store::beliefs::BeliefKind::Context,
         })
         .await
         .unwrap();

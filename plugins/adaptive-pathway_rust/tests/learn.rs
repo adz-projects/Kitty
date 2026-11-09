@@ -208,6 +208,7 @@ async fn promotion_each_gate_blocks_independently() {
         updated_at: chrono::Utc::now(),
         session_id: None,
         embedding_model: Config::default().embedding.ollama_model,
+        kind: adaptive_pathway::store::beliefs::BeliefKind::Context,
     };
 
     // pass when all four gates hold
@@ -365,4 +366,69 @@ async fn a_gated_pass_learns_nothing_and_advances_the_watermark() {
     .unwrap();
     assert_eq!(outcome.observations, 0);
     assert_eq!(engine.db.last_learned_rowid("s1").await.unwrap(), rowid);
+}
+
+#[tokio::test]
+async fn extraction_records_kinds_links_tensions_and_test_results() {
+    let engine = PathwayEngine::open_in_memory(Config::default()).await.unwrap();
+    let host = host_pool().await;
+
+    // Turn 1: a stance, plus a preference that pulls against it.
+    let r1 = insert_message(&host, "s1", "user", "I think big tech firms only care about profit.").await;
+    let chat = MockChat {
+        response: json!({
+            "observations": [
+                {"statement": "The user believes big tech firms act only for profit.",
+                 "provenance": "direct_statement", "layer": "context", "domain": "", "evidence": "",
+                 "contradicts": "", "kind": "stance", "relates_to": []},
+                {"statement": "The user relies heavily on big tech cloud services.",
+                 "provenance": "inferred_pattern", "layer": "context", "domain": "", "evidence": "",
+                 "contradicts": "", "kind": "context",
+                 "relates_to": [{"known_belief": "The user believes big tech firms act only for profit.",
+                                 "relation": "in_tension_with"}]}
+            ],
+            "corrections": [], "test_results": [], "tone": "", "open_topics": []
+        }),
+    };
+    learn::extract_and_record(&engine, &host, &chat,
+        LearnRequest { session_id: "s1", through_rowid: r1, given_chunk: None }, LearnTrigger::TurnEnd)
+        .await
+        .unwrap();
+    let beliefs = engine.db.list_beliefs(None).await.unwrap();
+    let stance = beliefs.iter().find(|b| b.text.contains("only for profit")).unwrap();
+    let cloud = beliefs.iter().find(|b| b.text.contains("cloud services")).unwrap();
+    assert_eq!(stance.kind, adaptive_pathway::store::beliefs::BeliefKind::Stance);
+    assert!(!stance.tested, "a direct statement is not 'tested'");
+    let ids = vec![stance.id.clone(), cloud.id.clone()];
+    assert_eq!(engine.db.links_among(&ids).await.unwrap().len(), 1, "the relation is linked");
+    assert_eq!(engine.db.open_tensions_for(&ids).await.unwrap().len(), 1, "in_tension_with opens a tension");
+
+    // A test in flight, then a pass that confirms it.
+    engine.db.insert_assumption(&adaptive_pathway::store::assumptions::Assumption {
+        id: "a1".into(), belief_id: Some(cloud.id.clone()),
+        text: cloud.text.clone(), confidence: cloud.confidence,
+        state: adaptive_pathway::store::assumptions::AssumptionState::Surfaced,
+        flagged_at_exchange: 0, created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(),
+    }).await.unwrap();
+    engine.db.record_assumption_shown("a1", "s1", "h").await.unwrap();
+    assert_eq!(engine.db.tests_in_flight("s1").await.unwrap().len(), 1);
+
+    let r2 = insert_message(&host, "s1", "user", "Yes, honestly I put everything in the cloud.").await;
+    let chat = MockChat {
+        response: json!({
+            "observations": [], "corrections": [],
+            "test_results": [{"assumption": cloud.text, "outcome": "confirmed"}],
+            "tone": "", "open_topics": []
+        }),
+    };
+    learn::extract_and_record(&engine, &host, &chat,
+        LearnRequest { session_id: "s1", through_rowid: r2, given_chunk: None }, LearnTrigger::TurnEnd)
+        .await
+        .unwrap();
+    let cloud_after = engine.db.get_belief(&cloud.id).await.unwrap().unwrap();
+    assert!(cloud_after.tested, "a confirmed test validates the belief");
+    assert!(cloud_after.confidence > cloud.confidence);
+    assert!(engine.db.tests_in_flight("s1").await.unwrap().is_empty(), "judged tests leave the in-flight list");
+    let a = engine.db.get_assumption("a1").await.unwrap().unwrap();
+    assert_eq!(a.state, adaptive_pathway::store::assumptions::AssumptionState::Passed);
 }

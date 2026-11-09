@@ -1109,6 +1109,7 @@ async fn pathway_beliefs_list_and_delete_round_trip() {
             updated_at: now,
             session_id: None,
             embedding_model: adaptive_pathway::config::Config::default().embedding.ollama_model,
+            kind: adaptive_pathway::store::beliefs::BeliefKind::Context,
         })
         .await
         .unwrap();

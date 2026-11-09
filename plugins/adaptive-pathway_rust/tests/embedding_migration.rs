@@ -34,6 +34,7 @@ fn belief_with_model(id: &str, model: &str, at: chrono::DateTime<Utc>) -> Belief
         updated_at: at,
         session_id: None,
         embedding_model: model.into(),
+        kind: adaptive_pathway::store::beliefs::BeliefKind::Context,
     }
 }
 

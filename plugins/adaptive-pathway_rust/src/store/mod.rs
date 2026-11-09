@@ -9,6 +9,7 @@ pub mod beliefs;
 pub mod contradictions;
 pub mod conversation;
 pub mod domains;
+pub mod links;
 pub mod observations;
 pub mod suppressions;
 

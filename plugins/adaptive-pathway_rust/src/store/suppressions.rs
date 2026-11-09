@@ -220,6 +220,8 @@ impl Db {
         // resolves any live assumption tracking it as failed. Best-effort:
         // never let assumption bookkeeping block the forget itself.
         let _ = self.resolve_assumption_for_belief(&belief.id, false).await;
+        // A forgotten belief no longer holds anything in tension.
+        let _ = self.resolve_tensions_of(&belief.id, "forgotten").await;
 
         match reason {
             SuppressReason::Wrong | SuppressReason::Duplicate => {
@@ -413,6 +415,7 @@ mod tests {
             updated_at: now,
             session_id: None,
             embedding_model: crate::config::DEFAULT_EMBEDDING_MODEL.into(),
+            kind: crate::store::beliefs::BeliefKind::Context,
         })
         .await
         .unwrap();
@@ -450,6 +453,7 @@ mod tests {
             updated_at: now,
             session_id: None,
             embedding_model: crate::config::DEFAULT_EMBEDDING_MODEL.into(),
+            kind: crate::store::beliefs::BeliefKind::Context,
         })
         .await
         .unwrap();
@@ -493,6 +497,7 @@ mod tests {
             updated_at: now,
             session_id: None,
             embedding_model: crate::config::DEFAULT_EMBEDDING_MODEL.into(),
+            kind: crate::store::beliefs::BeliefKind::Context,
         })
         .await
         .unwrap();

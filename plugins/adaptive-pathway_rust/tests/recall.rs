@@ -35,6 +35,7 @@ fn belief(id: &str, text: &str, conf: f64, tested: bool, layer: Layer, domain: O
         updated_at: Utc::now(),
         session_id: None,
         embedding_model: Config::default().embedding.ollama_model,
+        kind: adaptive_pathway::store::beliefs::BeliefKind::Context,
     }
 }
 

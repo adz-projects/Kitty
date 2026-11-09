@@ -32,6 +32,7 @@ fn belief(id: &str, text: &str, domain: Option<&str>, emb: Vec<f32>) -> Belief {
         updated_at: now,
         session_id: None,
         embedding_model: Config::default().embedding.ollama_model,
+        kind: adaptive_pathway::store::beliefs::BeliefKind::Context,
     }
 }
 
@@ -438,4 +439,51 @@ async fn a_fallback_query_selects_on_weight_not_cross_space_cosine() {
         assert!(with_message.contains(&line), "fallback turn dropped {line}: {with_message}");
     }
     assert_eq!(with_message, without, "a fallback query must behave like no query");
+}
+
+#[tokio::test]
+async fn tension_and_challenge_sections_render_for_the_right_beliefs() {
+    use adaptive_pathway::store::beliefs::BeliefKind;
+    let engine = PathwayEngine::open_in_memory(Config::default()).await.unwrap();
+    let mut stance = belief("st", "The user thinks remote work beats the office.", None, vec![1.0, 0.0]);
+    stance.kind = BeliefKind::Stance;
+    let mut pref = belief("pr", "The user prefers bullet points.", None, vec![0.0, 1.0]);
+    pref.kind = BeliefKind::Preference;
+    let other = belief("ot", "The user misses chatting with colleagues in person.", None, vec![0.7, 0.7]);
+    for b in [&stance, &pref, &other] {
+        engine.db.insert_belief(b).await.unwrap();
+    }
+    engine.db.insert_contradiction(&adaptive_pathway::store::contradictions::Contradiction {
+        id: "c1".into(), belief_a: "st".into(), belief_b: "ot".into(), status: "open".into(),
+        resolved_b: None, reason: Some("model_tension".into()), created_at: Utc::now(), resolved_at: None,
+    }).await.unwrap();
+
+    let turn = engine.recall_turn("s1", "", None, false).await.unwrap();
+    assert!(turn.text.contains("[In tension]"), "{}", turn.text);
+    assert!(turn.text.contains("remote work beats") && turn.text.contains("misses chatting"));
+    assert!(turn.text.contains("[Worth challenging]"));
+    assert_eq!(turn.challenge.as_deref(), Some("The user thinks remote work beats the office."));
+    assert!(!turn.text.contains("strongest case against \"The user prefers"), "preferences are never challenged");
+
+    // Without a stance, no challenge.
+    let engine2 = PathwayEngine::open_in_memory(Config::default()).await.unwrap();
+    engine2.db.insert_belief(&pref).await.unwrap();
+    let t2 = engine2.recall_turn("s1", "", None, false).await.unwrap();
+    assert!(!t2.text.contains("[Worth challenging]") && t2.challenge.is_none());
+}
+
+#[tokio::test]
+async fn worth_testing_is_shown_once_per_chat_and_again_on_a_regenerate() {
+    let engine = PathwayEngine::open_in_memory(Config::default()).await.unwrap();
+    engine.db.insert_belief(&belief("b1", "The user wants short replies.", None, vec![1.0, 0.0])).await.unwrap();
+    engine.db.insert_assumption(&Assumption {
+        id: "a1".into(), belief_id: Some("b1".into()), text: "The user wants short replies.".into(),
+        confidence: 0.6, state: AssumptionState::Surfaced, flagged_at_exchange: 0,
+        created_at: Utc::now(), updated_at: Utc::now(),
+    }).await.unwrap();
+    let shown = |t: Option<String>| t.unwrap_or_default().contains("[Worth testing this turn]");
+    assert!(shown(engine.recall("s1", "first message").await));
+    assert!(shown(engine.recall("s1", "first message").await), "a regenerate of the same message shows it again");
+    assert!(!shown(engine.recall("s1", "second message").await), "not again in this chat");
+    assert!(shown(engine.recall("s2", "another chat").await), "another chat gets its own test");
 }
