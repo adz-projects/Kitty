@@ -122,7 +122,7 @@ pub fn desired(
 /// (`decider::paragraph_screen` in the engine). When Kitty sends no set of its
 /// own, an engine still holding a different one is sent the document again,
 /// which puts the default back.
-const ENGINE_DEFAULT_SCREEN_SET: &str = "durable-substantive-v1";
+const ENGINE_DEFAULT_SCREEN_SET: &str = "two-lane-v1";
 
 /// Bring the engine's copy in line with Settings. Best-effort: failures are
 /// logged and leave the engine as it was (which fails open by design).

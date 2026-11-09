@@ -118,16 +118,18 @@ pub async fn test_decider(
 /// in the accuracy eval (≈89% agreement with single-screening, 4× fewer calls).
 const CHUNK_BATCH_ON: i64 = 4;
 
-/// The engine's built-in paragraph-screen set (`durable-substantive-v1`),
+/// The engine's built-in paragraph-screen set (`two-lane-v1`),
 /// materialized here when chunking is toggled and the user has no custom set in
 /// config.json, so the toggle has a complete `paragraph_screen` to attach
 /// `batch_size` to. Kept in sync with the engine default.
 fn default_screen_set() -> Value {
     serde_json::json!({
-        "id": "durable-substantive-v1",
+        "id": "two-lane-v1",
         "questions": [
-            {"name": "durable", "keep_at": 0.6, "instructions":
-                "Will this passage still be informative in a few years, after the specific products, prices, people or events it mentions are no longer current? Answer yes for explanations of how or why things work, lasting history, definitions and durable relationships; answer no for specs, prices, release dates, rankings, schedules, status updates and announcements."},
+            {"name": "current", "lane": "current", "keep_at": 0.6, "instructions":
+                "Does this passage report something recent that a well-read model trained a year ago would probably not know -- a release, decision, change of status, new figure, event or announcement -- stated concretely?"},
+            {"name": "durable", "lane": "durable", "keep_at": 0.6, "instructions":
+                "Will this passage still be informative in a few years, after the specific products, prices, people or events it mentions are no longer current? Answer yes for explanations of how or why things work, lasting history, definitions, durable relationships and reasoned arguments or interpretations; answer no for specs, prices, schedules and status updates."},
             {"name": "substantive", "keep_at": 0.6, "instructions":
                 "Is this passage substantive and well supported (concrete claims, mechanisms, evidence or reasoned argument) rather than marketing copy, filler, unsupported speculation or vague generalities?"}
         ]

@@ -65,6 +65,8 @@ enum DocScreen {
         kept: Vec<String>,
         total: usize,
         log: Vec<ScreenLogEntry>,
+        /// `current` when any kept paragraph came in through that lane.
+        lane: &'static str,
     },
 }
 
@@ -166,7 +168,7 @@ impl Engine {
                     return CaptureOutcome::default();
                 }
             }
-            DocScreen::Done { kept, total, log } => {
+            DocScreen::Done { kept, total, log, lane } => {
                 outcome.paragraphs_total = total;
                 outcome.paragraphs_kept = kept.len();
                 outcome.dropped = kept.is_empty();
@@ -180,6 +182,7 @@ impl Engine {
                     tracing::warn!("capture: write failed ({e}); document skipped");
                     return CaptureOutcome::default();
                 }
+                let _ = self.db.set_capture_lane(&capture_id, lane).await;
                 self.write_screen_log(&log).await;
             }
         }
@@ -241,7 +244,8 @@ impl Engine {
                     }
                 }
             }
-            return DocScreen::Done { kept, total: paragraphs.len(), log };
+            // No screen, no lane signal: extraction's own decay choice stands.
+            return DocScreen::Done { kept, total: paragraphs.len(), log, lane: "durable" };
         };
 
         // Classify once: prefiltered (free) vs screenable.
@@ -291,6 +295,7 @@ impl Engine {
         // Assemble kept + log in document order, stopping where the early exit
         // halted.
         let mut kept = Vec::new();
+        let mut current = false;
         let mut log = Vec::new();
         for (i, p) in paragraphs.iter().enumerate() {
             if stopped_at.is_some_and(|stop| i >= stop) {
@@ -303,9 +308,10 @@ impl Engine {
                         kept.push(p.text.clone());
                         log.push(entry(p, None, "kept".into()));
                     }
-                    Some(ScreenVerdict::Scored { keep, scores }) => {
+                    Some(ScreenVerdict::Scored { keep, scores, lane }) => {
                         if *keep {
                             kept.push(p.text.clone());
+                            current |= lane.as_deref() == Some("current");
                         }
                         let verdict = if *keep { "kept" } else { "dropped" };
                         log.push(entry(p, Some(scores_json(scores)), verdict.into()));
@@ -315,7 +321,12 @@ impl Engine {
                 },
             }
         }
-        DocScreen::Done { kept, total: paragraphs.len(), log }
+        DocScreen::Done {
+            kept,
+            total: paragraphs.len(),
+            log,
+            lane: if current { "current" } else { "durable" },
+        }
     }
 
     /// Retry captures that were stored while the decision model was
@@ -352,8 +363,9 @@ impl Engine {
                 .await
             {
                 DocScreen::Unavailable => break,
-                DocScreen::Done { kept, total, log } => {
+                DocScreen::Done { kept, total, log, lane } => {
                     let status = if kept.is_empty() { "dropped" } else { "screened" };
+                    let _ = self.db.set_capture_lane(&c.capture_id, lane).await;
                     if let Err(e) = self
                         .db
                         .set_capture_screened(&c.capture_id, status, &kept, total as i64, now)

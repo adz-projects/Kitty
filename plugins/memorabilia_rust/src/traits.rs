@@ -231,9 +231,10 @@ pub enum ScreenVerdict {
     /// The screen is on but could not answer (endpoint down, too slow). The
     /// document waits, unscreened, for it to come back.
     Unavailable,
-    /// Every question's P(yes), by name, and whether the paragraph cleared
-    /// every keep threshold.
-    Scored { keep: bool, scores: Vec<(String, f32)> },
+    /// Every question's P(yes), by name, whether the paragraph cleared the
+    /// keep thresholds, and which intake lane kept it (`current` /
+    /// `durable`; `None` for a set with no lanes).
+    Scored { keep: bool, scores: Vec<(String, f32)>, lane: Option<String> },
 }
 
 /// Judges one paragraph at a time for the overnight intake. BigTiny supplies
@@ -294,6 +295,7 @@ impl ParagraphScreen for MockParagraphScreen {
         ScreenVerdict::Scored {
             keep,
             scores: vec![("mock".into(), if keep { 0.9 } else { 0.1 })],
+            lane: None,
         }
     }
     async fn question_set(&self) -> String {

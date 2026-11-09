@@ -105,6 +105,44 @@ pub struct IntakeBacklog {
 }
 
 impl Db {
+    /// Record a capture's intake lane (`current` | `durable`, migration 007).
+    pub async fn set_capture_lane(&self, capture_id: &str, lane: &str) -> Result<()> {
+        sqlx::query("UPDATE captures SET lane = ? WHERE capture_id = ?")
+            .bind(lane)
+            .bind(capture_id)
+            .execute(self.pool())
+            .await?;
+        Ok(())
+    }
+
+    /// A capture's intake lane; `durable` when unknown.
+    pub async fn capture_lane(&self, capture_id: &str) -> Result<String> {
+        Ok(sqlx::query_scalar::<_, String>("SELECT lane FROM captures WHERE capture_id = ?")
+            .bind(capture_id)
+            .fetch_optional(self.pool())
+            .await?
+            .unwrap_or_else(|| "durable".into()))
+    }
+
+    /// Record a chunk's intake lane.
+    pub async fn set_chunk_lane(&self, chunk_id: &str, lane: &str) -> Result<()> {
+        sqlx::query("UPDATE chunks SET lane = ? WHERE chunk_id = ?")
+            .bind(lane)
+            .bind(chunk_id)
+            .execute(self.pool())
+            .await?;
+        Ok(())
+    }
+
+    /// A chunk's intake lane; `durable` when unknown.
+    pub async fn chunk_lane(&self, chunk_id: &str) -> Result<String> {
+        Ok(sqlx::query_scalar::<_, String>("SELECT lane FROM chunks WHERE chunk_id = ?")
+            .bind(chunk_id)
+            .fetch_optional(self.pool())
+            .await?
+            .unwrap_or_else(|| "durable".into()))
+    }
+
     pub async fn insert_capture(&self, c: &Capture) -> Result<()> {
         sqlx::query(
             "INSERT INTO captures (

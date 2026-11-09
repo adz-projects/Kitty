@@ -703,6 +703,8 @@ impl Engine {
                     created_at: now.to_string(),
                 };
                 db.insert_chunk(&chunk).await?;
+                let lane = db.capture_lane(&c.capture_id).await?;
+                db.set_chunk_lane(&chunk.chunk_id, &lane).await?;
                 vectors
                     .upsert(&chunk.chunk_id, v, &chunk.embedding_model)
                     .await

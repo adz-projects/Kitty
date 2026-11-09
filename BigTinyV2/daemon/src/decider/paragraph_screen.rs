@@ -30,6 +30,13 @@ pub struct ScreenQuestion {
     pub name: String,
     pub instructions: String,
     pub keep_at: f32,
+    /// The intake lane this question belongs to (`current`, `durable`), or
+    /// empty for a question every lane shares. A paragraph is kept when the
+    /// shared questions and every question of at least one lane pass; the
+    /// first such lane (set order) is the lane that kept it. A set with no
+    /// lanes keeps a paragraph only when every question passes, as before.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub lane: String,
 }
 
 /// A question set. A paragraph is kept only when it clears every question.
@@ -57,27 +64,40 @@ impl Default for ParagraphScreenConfig {
     /// labelled paragraphs (`docs/MEMORY_OVERNIGHT.md`, *Testing question
     /// sets*).
     fn default() -> Self {
+        // Two lanes (Phase 4.1). `durable-substantive-v1` kept only lasting
+        // material and rejected exactly what brings a model up to date
+        // (releases, decisions, status changes); that is now its own lane.
         Self {
-            id: "durable-substantive-v1".into(),
+            id: "two-lane-v1".into(),
             questions: vec![
                 ScreenQuestion {
-                    name: "durable".into(),
-                    instructions: "Will this passage still be informative in a few years, after \
-                        the specific products, prices, people or events it mentions are no longer \
-                        current? Answer yes for explanations of how or why things work, lasting \
-                        history, definitions and durable relationships; answer no for specs, \
-                        prices, release dates, rankings, schedules, status updates and \
-                        announcements."
+                    name: "current".into(),
+                    instructions: "Does this passage report something recent that a well-read model trained a \
+                        year ago would probably not know -- a release, decision, change of status, new \
+                        figure, event or announcement -- stated concretely?"
                         .into(),
                     keep_at: 0.60,
+                    lane: "current".into(),
+                },
+                ScreenQuestion {
+                    name: "durable".into(),
+                    instructions: "Will this passage still be informative in a few years, after the specific \
+                        products, prices, people or events it mentions are no longer current? Answer \
+                        yes for explanations of how or why things work, lasting history, definitions, \
+                        durable relationships and reasoned arguments or interpretations; answer no for \
+                        specs, prices, schedules and status updates."
+                        .into(),
+                    keep_at: 0.60,
+                    lane: "durable".into(),
                 },
                 ScreenQuestion {
                     name: "substantive".into(),
-                    instructions: "Is this passage substantive and well supported (concrete \
-                        claims, mechanisms, evidence or reasoned argument) rather than marketing \
-                        copy, filler, unsupported speculation or vague generalities?"
+                    instructions: "Is this passage substantive and well supported (concrete claims, mechanisms, \
+                        evidence or reasoned argument) rather than marketing copy, filler, unsupported \
+                        speculation or vague generalities?"
                         .into(),
                     keep_at: 0.60,
+                    lane: String::new(),
                 },
             ],
             batch_size: default_batch_size(),
@@ -131,10 +151,41 @@ impl ParagraphScreenConfig {
             .collect()
     }
 
-    /// Whether `scores` (in set order) clear every threshold.
+    /// Whether `scores` (in set order) keep the paragraph (see
+    /// [`ScreenQuestion::lane`]).
     pub fn keeps(&self, scores: &[f32]) -> bool {
-        scores.len() == self.questions.len()
-            && self.questions.iter().zip(scores).all(|(q, p)| *p >= q.keep_at)
+        self.keep_lane(scores).0
+    }
+
+    /// `(kept, lane that kept it)` for `scores` in set order. The lane is
+    /// `None` for a set with no lanes.
+    pub fn keep_lane(&self, scores: &[f32]) -> (bool, Option<String>) {
+        if scores.len() != self.questions.len() {
+            return (false, None);
+        }
+        let passes = |lane: &str| {
+            self.questions
+                .iter()
+                .zip(scores)
+                .filter(|(q, _)| q.lane == lane)
+                .all(|(q, p)| *p >= q.keep_at)
+        };
+        let mut lanes: Vec<&str> = Vec::new();
+        for q in &self.questions {
+            if !q.lane.is_empty() && !lanes.contains(&q.lane.as_str()) {
+                lanes.push(&q.lane);
+            }
+        }
+        if !passes("") {
+            return (false, None);
+        }
+        if lanes.is_empty() {
+            return (true, None);
+        }
+        match lanes.into_iter().find(|l| passes(l)) {
+            Some(l) => (true, Some(l.to_string())),
+            None => (false, None),
+        }
     }
 
     /// Build the combined state and the per-passage questions for a batched
@@ -209,11 +260,11 @@ impl ParagraphScreen for MemorabiliaParagraphScreen {
             return ScreenVerdict::Unavailable;
         };
         let ps: Vec<f32> = scores.iter().map(|(_, p)| *p).collect();
-        let keep = set.keeps(&ps);
+        let (keep, lane) = set.keep_lane(&ps);
         if !keep {
             self.hub.note_acted(&self.app_id, Feature::IngestGate);
         }
-        ScreenVerdict::Scored { keep, scores }
+        ScreenVerdict::Scored { keep, scores, lane }
     }
 
     async fn question_set(&self) -> String {
@@ -261,11 +312,11 @@ impl ParagraphScreen for MemorabiliaParagraphScreen {
             .map(|p| match set.batched_scores(&answers, p) {
                 Some(scores) => {
                     let ps: Vec<f32> = scores.iter().map(|(_, v)| *v).collect();
-                    let keep = set.keeps(&ps);
+                    let (keep, lane) = set.keep_lane(&ps);
                     if !keep {
                         self.hub.note_acted(&self.app_id, Feature::IngestGate);
                     }
-                    ScreenVerdict::Scored { keep, scores }
+                    ScreenVerdict::Scored { keep, scores, lane }
                 }
                 None => ScreenVerdict::Unavailable,
             })
@@ -430,18 +481,19 @@ mod tests {
 
     #[test]
     fn batched_prompt_and_scores_route_answers_by_passage() {
-        let set = ParagraphScreenConfig::default(); // durable + substantive
+        let set = ParagraphScreenConfig::default(); // current | durable, + substantive
         let states = ["first passage", "second passage"];
         let (combined, questions) = set.batched_prompt(&states);
         assert!(combined.contains("=== PASSAGE 1 ===") && combined.contains("=== PASSAGE 2 ==="));
         assert_eq!(questions.len(), set.questions.len() * states.len());
 
-        // Passage 0 clears both; passage 1 fails `durable`.
+        // Passage 0 clears everything; passage 1 fails the shared
+        // `substantive` question, which no lane can make up for.
         let mut answers = Answers::new();
         for (name, _) in &questions {
             let yes = if name.starts_with("p0:") {
                 0.9
-            } else if name.ends_with(":durable") {
+            } else if name.ends_with(":substantive") {
                 0.1
             } else {
                 0.9
@@ -451,10 +503,10 @@ mod tests {
         let p0: Vec<f32> = set.batched_scores(&answers, 0).unwrap().iter().map(|(_, v)| *v).collect();
         let p1: Vec<f32> = set.batched_scores(&answers, 1).unwrap().iter().map(|(_, v)| *v).collect();
         assert!(set.keeps(&p0), "passage 0 clears every threshold");
-        assert!(!set.keeps(&p1), "passage 1 fails durable");
+        assert!(!set.keeps(&p1), "passage 1 fails the shared question");
 
         // A missing answer for a passage means no verdict for it.
-        answers.remove("p0:durable");
+        answers.remove("p0:substantive");
         assert!(set.batched_scores(&answers, 0).is_none());
     }
 
@@ -471,7 +523,8 @@ mod tests {
         hub.install_for_test(
             "kitty",
             serde_json::from_value(config).unwrap(),
-            Arc::new(Scripted::yes(move |name, _| if name == "durable" { p } else { 0.9 })),
+            // `p` for the lane questions, a pass for the shared one.
+            Arc::new(Scripted::yes(move |name, _| if name == "durable" || name == "current" { p } else { 0.9 })),
         );
         hub
     }
@@ -481,15 +534,15 @@ mod tests {
         let s = MemorabiliaParagraphScreen::new(hub(true, 0.3, None).await, "kitty");
         assert!(s.enabled().await);
         match s.screen("The 4090 has 24 GB.").await {
-            ScreenVerdict::Scored { keep, scores } => {
+            ScreenVerdict::Scored { keep, scores, .. } => {
                 assert!(!keep);
-                assert_eq!(scores.len(), 2);
+                assert_eq!(scores.len(), 3);
             }
             v => panic!("{v:?}"),
         }
         let s = MemorabiliaParagraphScreen::new(hub(true, 0.8, None).await, "kitty");
         assert!(matches!(s.screen("x").await, ScreenVerdict::Scored { keep: true, .. }));
-        assert_eq!(s.question_set().await, "durable-substantive-v1");
+        assert_eq!(s.question_set().await, "two-lane-v1");
     }
 
     #[tokio::test]
@@ -511,10 +564,34 @@ mod tests {
     }
 
     #[test]
+    fn a_paragraph_is_kept_by_the_first_lane_it_clears() {
+        let set = ParagraphScreenConfig::default(); // current, durable, substantive (shared)
+        // News: current yes, durable no, substantive yes -> kept as current.
+        assert_eq!(set.keep_lane(&[0.9, 0.2, 0.8]), (true, Some("current".into())));
+        // An explanation: current no, durable yes -> kept as durable.
+        assert_eq!(set.keep_lane(&[0.1, 0.9, 0.8]), (true, Some("durable".into())));
+        // Neither lane -> dropped.
+        assert_eq!(set.keep_lane(&[0.1, 0.2, 0.9]), (false, None));
+        // A lane passes but the shared question fails -> dropped.
+        assert_eq!(set.keep_lane(&[0.9, 0.9, 0.1]), (false, None));
+        // A set with no lanes behaves as before: every question must pass.
+        let flat = ParagraphScreenConfig {
+            id: "flat".into(),
+            questions: vec![
+                ScreenQuestion { name: "a".into(), instructions: "a?".into(), keep_at: 0.5, lane: String::new() },
+                ScreenQuestion { name: "b".into(), instructions: "b?".into(), keep_at: 0.5, lane: String::new() },
+            ],
+            batch_size: 1,
+        };
+        assert_eq!(flat.keep_lane(&[0.9, 0.9]), (true, None));
+        assert_eq!(flat.keep_lane(&[0.9, 0.1]), (false, None));
+    }
+
+    #[test]
     fn validation_rejects_bad_sets() {
         assert!(ParagraphScreenConfig::default().validate().is_ok());
         let mut s = ParagraphScreenConfig::default();
-        s.questions[1].name = "durable".into();
+        s.questions[1].name = s.questions[0].name.clone();
         assert!(s.validate().is_err());
         let mut s = ParagraphScreenConfig::default();
         s.questions[0].keep_at = 1.5;

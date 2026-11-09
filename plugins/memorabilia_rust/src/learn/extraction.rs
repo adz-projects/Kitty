@@ -582,8 +582,12 @@ impl Engine {
             });
         }
 
-        // The chunk's decay profile (deterministic resolution).
-        let (decay_class, expiry_naive) = resolve_decay_profile(&claims);
+        // The chunk's decay profile (deterministic resolution). A chunk from
+        // the `current` intake lane is news by definition: never `static`.
+        let (mut decay_class, expiry_naive) = resolve_decay_profile(&claims);
+        if decay_class == "static" && self.db.chunk_lane(&chunk.chunk_id).await? == "current" {
+            decay_class = "transient".into();
+        }
         let expiry: Option<String> =
             expiry_naive.map(|t| t.format(STORE_TIMESTAMP_FORMAT).to_string());
         // The decay clock starts now, when the chunk becomes recallable (see
