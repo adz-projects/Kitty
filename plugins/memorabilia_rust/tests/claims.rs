@@ -209,3 +209,80 @@ async fn use_is_a_lookup_a_citation_or_the_claim_in_the_answer() {
         "carrying the claim into the answer counts"
     );
 }
+
+/// Answers abstraction requests with a fixed abstract per claim (by a
+/// keyword in the claim) and confirms every analogy pair; extraction by
+/// source as [`Scripted`] does.
+struct AnalogyScript {
+    extraction: Scripted,
+    abstracts: Vec<(&'static str, &'static str)>,
+}
+
+#[async_trait]
+impl StructuredChat for AnalogyScript {
+    async fn structured_chat(&self, messages: Vec<Value>, schema: &Value) -> Result<Value, String> {
+        let system = messages.first().and_then(|m| m["content"].as_str()).unwrap_or_default().to_string();
+        let user = messages.last().and_then(|m| m["content"].as_str()).unwrap_or_default().to_string();
+        if system.starts_with("CLAIMS TO ABSTRACT") {
+            let out: Vec<Value> = user
+                .lines()
+                .filter_map(|l| {
+                    let (i, claim) = l.split_once(". ")?;
+                    let abs = self.abstracts.iter().find(|(k, _)| claim.contains(k))?.1;
+                    Some(json!({"claim": i.trim().parse::<u64>().ok()?, "abstract": abs}))
+                })
+                .collect();
+            return Ok(json!({ "abstracts": out }));
+        }
+        if system.starts_with("ANALOGY PAIRS") {
+            let n = user.matches("   B: ").count();
+            let pairs: Vec<Value> = (0..n)
+                .map(|k| json!({"pair": k, "analogous": true, "why": "comfort that removes struggle removes what struggle builds"}))
+                .collect();
+            return Ok(json!({ "pairs": pairs }));
+        }
+        self.extraction.structured_chat(messages, schema).await
+    }
+}
+
+#[tokio::test]
+async fn an_analogy_edge_brings_a_distant_claim_into_recall_with_its_reason() {
+    let novel = "Brave New World depicts a society that trades struggle for engineered comfort";
+    let study = "Students using unrestricted AI assistants scored lower on unassisted tests";
+    let shared = "removing effortful struggle through comfort erodes the abilities the struggle built";
+    let mut cfg = Config::default();
+    cfg.embedding_model = SPACE.into();
+    cfg.conflict_probe_similarity_min = -1.0;
+    cfg.recall_min_cosine = -1.0;
+    cfg.recall_gap_min = 9.9;
+    cfg.retrieval_seed_chunks = 1; // only the direct hit seeds; the novel must come by the edge
+    cfg.retrieval_min_seeds = 1;
+    let db = Db::open_in_memory().await.unwrap();
+    db.init_vectors(cfg.embedding_dim).await.unwrap();
+    let vectors = Arc::new(SqliteVectorIndex::new(db.pool().clone()));
+    let chat = Arc::new(AnalogyScript {
+        extraction: Scripted {
+            by_source: [
+                ("litnotes".to_string(), json!({"propositions": [claim(novel)], "relations": []})),
+                ("edstudy".to_string(), json!({"propositions": [claim(study)], "relations": []})),
+            ]
+            .into_iter()
+            .collect(),
+        },
+        abstracts: vec![("Brave New World", shared), ("AI assistants", shared)],
+    });
+    let embedder = Arc::new(TaggedHash(HashEmbedder::new(cfg.embedding_dim)));
+    let e = Engine::new(cfg, db, chat, embedder, vectors);
+    e.ingest(&doc("Brave New World depicts a society that trades struggle for engineered comfort.", "litnotes")).await;
+    e.ingest(&doc("Students using unrestricted AI assistants scored lower on unassisted tests.", "edstudy")).await;
+    drain(&e).await;
+
+    let out = e.build_analogies(&|| true).await;
+    assert_eq!(out.abstracted, 2);
+    assert_eq!(out.edges, 2, "one confirmed pair, both directions: {out:?}");
+
+    let block = e.recall("Do students using AI assistants score lower on unassisted tests?").await.unwrap();
+    assert!(block.contains("unassisted tests"), "{block}");
+    assert!(block.contains("Related by analogy"), "{block}");
+    assert!(block.contains("Brave New World") && block.contains("why: comfort that removes struggle"), "{block}");
+}

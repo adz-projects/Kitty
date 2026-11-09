@@ -77,11 +77,10 @@ struct SeedResult {
 ///
 /// Returns the kept hits and the lowest kept centered score (this turn's
 /// effective cut, fed to the EWMA), or `None` when no centered score survived.
-fn adaptive_cut(
-    scored: Vec<(String, f64, Option<f64>)>,
-    floor: f64,
-    gap_min: f64,
-) -> (Vec<(String, f64, Option<f64>)>, Option<f64>) {
+/// A scored hit: (node id, raw score, centered score if any).
+type ScoredHit = (String, f64, Option<f64>);
+
+fn adaptive_cut(scored: Vec<ScoredHit>, floor: f64, gap_min: f64) -> (Vec<ScoredHit>, Option<f64>) {
     // 1. Operational floor (fail open for hits with no centered score).
     let mut survivors: Vec<(String, f64, Option<f64>)> = scored
         .into_iter()
@@ -166,6 +165,9 @@ pub struct RankedItem {
     /// The other side of an open claim-level dispute, `(item_id, claim)`, so
     /// recall shows both instead of a bare "(disputed)".
     pub disputed_by: Option<(String, String)>,
+    /// Reached only through an analogy (`RHYMES_WITH`) edge from a direct
+    /// hit: why the analogy holds. Shown under "Related by analogy" (4.7).
+    pub analogy: Option<String>,
 }
 
 /// One turn's injection ([`Engine::recall_turn`]).
@@ -594,6 +596,7 @@ impl Engine {
         }
 
         let relevance = seeds.relevance;
+        let seeded: std::collections::HashSet<String> = seeds.activations.keys().cloned().collect();
 
         // Pass 2: bounded spreading activation over proposition edges.
         let activations = self.spread_activation(seeds.activations).await?;
@@ -613,6 +616,20 @@ impl Engine {
                 continue;
             }
             let disputed_by = self.dispute_partner(&node_id).await?;
+            // Reached only by spreading: through an analogy edge from a
+            // direct hit, carrying that edge's rationale.
+            let analogy = if seeded.contains(&node_id) {
+                None
+            } else {
+                let mut why = None;
+                for e in self.db.list_proposition_edges_to(&node_id).await? {
+                    if e.edge_type == "RHYMES_WITH" && seeded.contains(&e.from_node) {
+                        why = Some(self.analogy_rationale(&e.from_node, &node_id).await.unwrap_or_default());
+                        break;
+                    }
+                }
+                why
+            };
             let boost = core::metaboost(&prop.urgency, &prop.importance, &self.config);
             let priority = core::priority(activation, boost, self.config.metaboost_cap);
             let supporters = self.db.list_active_supporting_chunks(&node_id).await?;
@@ -642,6 +659,7 @@ impl Engine {
                 citations,
                 supporting_chunk_ids,
                 disputed_by,
+                analogy,
             });
         }
         // Primary: centered relevance (a directly-seeded on-topic item leads;
@@ -792,13 +810,10 @@ impl Engine {
     /// instead of freezing at the first query's snapshot.
     pub(crate) async fn refresh_corpus_mean(&self, tag: &str) -> Result<()> {
         let key = format!("corpus_mean::{tag}");
-        match self.db.corpus_mean_vector(tag).await? {
-            Some(mean) => {
-                if let Ok(s) = serde_json::to_string(&mean) {
-                    self.db.set_setting(&key, &s).await?;
-                }
+        if let Some(mean) = self.db.corpus_mean_vector(tag).await? {
+            if let Ok(s) = serde_json::to_string(&mean) {
+                self.db.set_setting(&key, &s).await?;
             }
-            None => {}
         }
         Ok(())
     }
@@ -890,7 +905,34 @@ impl Engine {
 /// grounding set). Whole items are kept while they fit; the accounting rounds
 /// up so the cap is never exceeded (plan §10.1, pinned by a test).
 fn render_index_block(items: &[RankedItem], token_cap: usize) -> (String, Vec<String>, Vec<String>) {
-    let top = &items[0];
+    // Up to two analogies get their own section; room for it is set aside
+    // before the direct items fill the cap, so they are not the first thing
+    // cut.
+    let analogies: Vec<&RankedItem> = items.iter().filter(|i| i.analogy.is_some()).take(ANALOGY_SLOTS).collect();
+    let analogy_lines: Vec<String> = analogies
+        .iter()
+        .map(|i| {
+            let why = i.analogy.as_deref().filter(|w| !w.is_empty()).map(|w| format!(" — why: {w}")).unwrap_or_default();
+            format!(
+                "- [{}] {}{} — {}\n",
+                i.item_id,
+                i.claim,
+                why,
+                i.citations.first().map(String::as_str).unwrap_or("(uncited)"),
+            )
+        })
+        .collect();
+    let analogy_header = "\nRelated by analogy (a different setting, the same pattern):\n";
+    let reserved = if analogy_lines.is_empty() {
+        0
+    } else {
+        approx_tokens(analogy_header) + analogy_lines.iter().map(|l| approx_tokens(l)).sum::<usize>()
+    };
+    let direct: Vec<&RankedItem> = items.iter().filter(|i| i.analogy.is_none()).collect();
+    if direct.is_empty() && analogies.is_empty() {
+        return (String::new(), Vec::new(), Vec::new());
+    }
+    let top = direct.first().copied().unwrap_or(&items[0]);
     let mut out = String::new();
     // Summary line (deterministic — no LLM in the recall hot path).
     out.push_str("## Relevant memory\n");
@@ -906,7 +948,8 @@ fn render_index_block(items: &[RankedItem], token_cap: usize) -> (String, Vec<St
 
     let mut grounded: Vec<String> = Vec::new();
     let mut shown: Vec<String> = Vec::new();
-    for item in items {
+    let direct_cap = token_cap.saturating_sub(reserved);
+    for item in direct {
         let disputed = match (&item.disputed_by, item.is_disputed) {
             (Some((id, claim)), _) => format!(" (disputed by [{id}]: {claim})"),
             (None, true) => " (disputed)".to_string(),
@@ -921,7 +964,7 @@ fn render_index_block(items: &[RankedItem], token_cap: usize) -> (String, Vec<St
             item.citations.first().map(String::as_str).unwrap_or("(uncited)"),
         );
         // Keep whole items while they fit; stop before exceeding the cap.
-        if approx_tokens(&out) + approx_tokens(&line) > token_cap {
+        if approx_tokens(&out) + approx_tokens(&line) > direct_cap {
             break;
         }
         out.push_str(&line);
@@ -932,8 +975,23 @@ fn render_index_block(items: &[RankedItem], token_cap: usize) -> (String, Vec<St
             }
         }
     }
+    if !analogy_lines.is_empty() && approx_tokens(&out) + reserved <= token_cap {
+        out.push_str(analogy_header);
+        for (item, line) in analogies.iter().zip(&analogy_lines) {
+            out.push_str(line);
+            shown.push(item.item_id.clone());
+            for chunk_id in &item.supporting_chunk_ids {
+                if !grounded.contains(chunk_id) {
+                    grounded.push(chunk_id.clone());
+                }
+            }
+        }
+    }
     (out, grounded, shown)
 }
+
+/// Index slots reserved for items reached by analogy (4.7).
+const ANALOGY_SLOTS: usize = 2;
 
 /// The follow-up query vector: the current message, leaning a quarter on
 /// the previous one, renormalised.

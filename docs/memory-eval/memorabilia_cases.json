@@ -1,5 +1,5 @@
 {
-  "about": "Memorabilia recall eval. Each document is ingested as its own source and extracted with the scripted claims listed here (no extraction model), so the eval measures recall, not extraction. People, studies, places and software are fictional; Brave New World and the 1995 'Californian ideology' essay are real. Case kinds: direct (should match by topic), indirect (only reachable by analogy -- expected to fail until Phase 4.7), superseded (the newer claim should win; the scripted model reports the supersession declared in the document's `relations`), negative (nothing should inject). expect/forbid are substrings of claims; expect_indirect is scored separately. Run: see BigTinyV2/daemon/src/plugins/memory_eval.rs.",
+  "about": "Memorabilia recall eval. Each document is ingested as its own source and extracted with the scripted claims listed here (no extraction model), so the eval measures recall, not extraction. People, studies, places and software are fictional; Brave New World and the 1995 'Californian ideology' essay are real. Case kinds: direct (should match by topic), indirect (only reachable through an analogy edge: documents carry an abstraction per claim, and `analogies` lists the claim pairs the scripted model confirms; whether the real embeddings make them candidates, and recall shows them, is what is measured), superseded (the newer claim should win; the scripted model reports the supersession declared in the document's `relations`), negative (nothing should inject). expect/forbid are substrings of claims; expect_indirect is scored separately. Run: see BigTinyV2/daemon/src/plugins/memory_eval.rs.",
   "documents": [
     {
       "id": "cal_2026",
@@ -18,6 +18,9 @@
           "Mara Ellis",
           "argues"
         ]
+      },
+      "abstracts": {
+        "Mara Ellis argues that the Californian ideology still shapes how AI companies talk about regulation in 2026.": "An industry's founding ideology continues to shape how its firms argue against outside oversight."
       }
     },
     {
@@ -30,7 +33,11 @@
       "claims": [
         "In Aldous Huxley's Brave New World, citizens are kept content with soma, a drug that spares them any discomfort.",
         "Brave New World depicts a society that gives up the capacity for struggle and independent judgement in exchange for engineered comfort."
-      ]
+      ],
+      "abstracts": {
+        "In Aldous Huxley's Brave New World, citizens are kept content with soma, a drug that spares them any discomfort.": "A pleasant means of avoiding all discomfort keeps people content while quietly taking away what difficulty would have taught them.",
+        "Brave New World depicts a society that gives up the capacity for struggle and independent judgement in exchange for engineered comfort.": "When comfort is engineered to remove all struggle, people lose the capacities that only struggle develops."
+      }
     },
     {
       "id": "ai_edu",
@@ -42,7 +49,11 @@
       "claims": [
         "A 2025 study of 900 secondary students found that those who used an unrestricted AI assistant for homework scored lower on later unassisted tests.",
         "In the same study, students whose AI assistant gave hints instead of answers did not show the drop in test scores."
-      ]
+      ],
+      "abstracts": {
+        "A 2025 study of 900 secondary students found that those who used an unrestricted AI assistant for homework scored lower on later unassisted tests.": "A tool that removes effortful struggle from practice leaves learners weaker at the skill the struggle would have built.",
+        "In the same study, students whose AI assistant gave hints instead of answers did not show the drop in test scores.": "Help that keeps the learner doing the hard part preserves the learning that full assistance removes."
+      }
     },
     {
       "id": "bridge_old",
@@ -275,5 +286,19 @@
         "half marathon"
       ]
     }
+  ],
+  "analogies": [
+    [
+      "Brave New World",
+      "unrestricted AI assistant"
+    ],
+    [
+      "engineered comfort",
+      "unrestricted AI assistant"
+    ],
+    [
+      "soma",
+      "unrestricted AI assistant"
+    ]
   ]
 }

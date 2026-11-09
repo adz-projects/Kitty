@@ -80,6 +80,12 @@ fn defaults_match_plan_section2() {
     assert!((c.semantic_dedup_threshold - 0.92).abs() < 1e-12);
     assert!((c.dispute_strength_floor - 0.5).abs() < 1e-12);
     assert!((c.claim_merge_cosine - 0.88).abs() < 1e-12);
+    assert_eq!(c.analogy_claims_per_pass, 200);
+    assert!((c.analogy_abstract_min - 0.75).abs() < 1e-12);
+    assert!((c.analogy_claim_max - 0.72).abs() < 1e-12);
+    assert_eq!(c.analogy_pairs_per_pass, 20);
+    assert!((c.analogy_edge_weight - 0.6).abs() < 1e-12);
+    assert_eq!(c.analogy_ttl_days, 90);
     assert_eq!(c.tau_static_days, 365);
     assert_eq!(c.tau_transient_days, 7);
     assert_eq!(c.tau_pre_days, 7);

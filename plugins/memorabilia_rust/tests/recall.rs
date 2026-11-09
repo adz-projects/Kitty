@@ -273,8 +273,8 @@ struct StubEmbedder {
 impl memorabilia::traits::Embedder for StubEmbedder {
     async fn embed(&self, text: &str) -> Result<(Vec<f32>, String), String> {
         let mut v = vec![0.0f32; self.dim];
-        for i in 0..4.min(self.dim) {
-            v[i] = 0.2; // shared direction every memory points along
+        for x in v.iter_mut().take(4) {
+            *x = 0.2; // shared direction every memory points along
         }
         let axis = if text.contains("alpha") {
             0

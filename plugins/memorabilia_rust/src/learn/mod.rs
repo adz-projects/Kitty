@@ -423,6 +423,7 @@ impl Engine {
     }
 }
 
+pub mod analogy;
 pub mod capture;
 pub mod extraction;
 pub mod overnight;

@@ -33,7 +33,13 @@ semantic_dedup_threshold: 0.92
 
 # --- Disputes & decay ------------------------------------------------------
 dispute_strength_floor: 0.5
-claim_merge_cosine: 0.88       # candidate paraphrase threshold (claims); the extraction model confirms each merge
+claim_merge_cosine: 0.88
+analogy_claims_per_pass: 200   # analogy edges (4.7): claims abstracted per overnight pass
+analogy_abstract_min: 0.75     # abstractions at least this close...
+analogy_claim_max: 0.72        # ...and literal claims at most this close make a candidate pair
+analogy_pairs_per_pass: 20     # candidate pairs confirmed by the model per pass
+analogy_edge_weight: 0.6       # spreading-activation weight of a RHYMES_WITH edge
+analogy_ttl_days: 90           # days before an analogy edge is due for revalidation       # candidate paraphrase threshold (claims); the extraction model confirms each merge
 tau_static_days: 365
 tau_transient_days: 7
 tau_pre_days: 7

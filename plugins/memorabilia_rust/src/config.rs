@@ -81,6 +81,26 @@ pub struct Config {
     /// they merge, since a negation can sit just as close (4.3).
     #[serde(default = "default_claim_merge_cosine")]
     pub claim_merge_cosine: f64,
+    /// Analogy edges (4.7): claims abstracted per overnight pass.
+    #[serde(default = "default_analogy_claims_per_pass")]
+    pub analogy_claims_per_pass: usize,
+    /// Two claims are an analogy candidate when their abstractions are at
+    /// least this close...
+    #[serde(default = "default_analogy_abstract_min")]
+    pub analogy_abstract_min: f64,
+    /// ...and their literal claims at most this close (closer means they are
+    /// directly related, which plain recall already finds).
+    #[serde(default = "default_analogy_claim_max")]
+    pub analogy_claim_max: f64,
+    /// Candidate pairs sent to the model for confirmation per pass.
+    #[serde(default = "default_analogy_pairs_per_pass")]
+    pub analogy_pairs_per_pass: usize,
+    /// Spreading-activation weight of a `RHYMES_WITH` edge (<= 0.8).
+    #[serde(default = "default_analogy_edge_weight")]
+    pub analogy_edge_weight: f64,
+    /// Days before an analogy edge is due for revalidation.
+    #[serde(default = "default_analogy_ttl_days")]
+    pub analogy_ttl_days: i64,
     /// Decay time constant, days, for `static` chunks (plan §2 / §7.1).
     #[serde(default = "default_tau_static_days")]
     pub tau_static_days: u64,
@@ -328,6 +348,12 @@ impl Default for Config {
             semantic_dedup_threshold: default_semantic_dedup_threshold(),
             dispute_strength_floor: default_dispute_strength_floor(),
             claim_merge_cosine: default_claim_merge_cosine(),
+            analogy_claims_per_pass: default_analogy_claims_per_pass(),
+            analogy_abstract_min: default_analogy_abstract_min(),
+            analogy_claim_max: default_analogy_claim_max(),
+            analogy_pairs_per_pass: default_analogy_pairs_per_pass(),
+            analogy_edge_weight: default_analogy_edge_weight(),
+            analogy_ttl_days: default_analogy_ttl_days(),
             tau_static_days: default_tau_static_days(),
             tau_transient_days: default_tau_transient_days(),
             tau_pre_days: default_tau_pre_days(),
@@ -443,6 +469,26 @@ fn default_cluster_similarity_threshold() -> f64 {
 }
 fn default_semantic_dedup_threshold() -> f64 {
     0.92
+}
+fn default_analogy_claims_per_pass() -> usize {
+    200
+}
+fn default_analogy_abstract_min() -> f64 {
+    // EmbeddingGemma 2 scale (unrelated ~0.6). A first guess, to be tuned
+    // with the indirect cases of the recall eval.
+    0.75
+}
+fn default_analogy_claim_max() -> f64 {
+    0.72
+}
+fn default_analogy_pairs_per_pass() -> usize {
+    20
+}
+fn default_analogy_edge_weight() -> f64 {
+    0.6
+}
+fn default_analogy_ttl_days() -> i64 {
+    90
 }
 fn default_claim_merge_cosine() -> f64 {
     // EmbeddingGemma 2: unrelated text ~0.6, related ~0.75-0.8, paraphrases

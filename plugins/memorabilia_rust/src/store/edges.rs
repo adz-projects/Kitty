@@ -75,6 +75,21 @@ impl Db {
         Ok(())
     }
 
+    /// Whether an edge of `edge_type` joins `a` and `b` in either direction.
+    pub async fn has_edge(&self, edge_type: &str, a: &str, b: &str) -> Result<bool> {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM proposition_edges WHERE edge_type = ?              AND ((from_node = ? AND to_node = ?) OR (from_node = ? AND to_node = ?))",
+        )
+        .bind(edge_type)
+        .bind(a)
+        .bind(b)
+        .bind(b)
+        .bind(a)
+        .fetch_one(self.pool())
+        .await?;
+        Ok(n > 0)
+    }
+
     pub async fn list_proposition_edges_from(&self, node_id: &str) -> Result<Vec<PropositionEdge>> {
         Ok(sqlx::query_as::<_, PropositionEdge>(
             "SELECT * FROM proposition_edges WHERE from_node = ? ORDER BY rowid",

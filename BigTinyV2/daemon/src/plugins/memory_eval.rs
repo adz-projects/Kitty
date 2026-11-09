@@ -253,6 +253,9 @@ async fn memory_eval_pathway() {
 struct MemFixture {
     documents: Vec<MemDocument>,
     cases: Vec<MemCase>,
+    /// Claim pairs (substrings) the scripted model confirms as analogies.
+    #[serde(default)]
+    analogies: Vec<(String, String)>,
 }
 
 #[derive(Deserialize)]
@@ -272,6 +275,10 @@ struct MemDocument {
     /// `claim -> [attribution, stance]` for claims the source attributes.
     #[serde(default)]
     attributions: HashMap<String, (String, String)>,
+    /// `claim -> abstraction`, what the scripted model answers when asked to
+    /// abstract a claim (analogy edges, Phase 4.7).
+    #[serde(default)]
+    abstracts: HashMap<String, String>,
 }
 
 #[derive(Deserialize)]
@@ -298,11 +305,45 @@ struct MemCase {
 /// source, so the eval measures recall rather than an extraction model.
 struct ScriptedChat {
     by_source: HashMap<String, Value>,
+    abstracts: HashMap<String, String>,
+    analogies: Vec<(String, String)>,
 }
 
 #[async_trait]
 impl memorabilia::traits::StructuredChat for ScriptedChat {
     async fn structured_chat(&self, messages: Vec<Value>, _schema: &Value) -> Result<Value, String> {
+        let system = messages.first().and_then(|m| m["content"].as_str()).unwrap_or_default();
+        let last = messages.last().and_then(|m| m["content"].as_str()).unwrap_or_default();
+        if system.starts_with("CLAIMS TO ABSTRACT") {
+            let out: Vec<Value> = last
+                .lines()
+                .filter_map(|l| {
+                    let (i, claim) = l.split_once(". ")?;
+                    let key = memorabilia::text::normalize_text(claim);
+                    let abs = self
+                        .abstracts
+                        .iter()
+                        .find(|(c, _)| memorabilia::text::normalize_text(c) == key)?
+                        .1;
+                    Some(json!({"claim": i.trim().parse::<u64>().ok()?, "abstract": abs}))
+                })
+                .collect();
+            return Ok(json!({ "abstracts": out }));
+        }
+        if system.starts_with("ANALOGY PAIRS") {
+            // Confirm only the pairs the fixture says are real analogies.
+            let mut pairs = Vec::new();
+            let mut k = 0u64;
+            let mut lines = last.lines();
+            while let (Some(a), Some(b)) = (lines.next(), lines.next()) {
+                let yes = self.analogies.iter().any(|(x, y)| {
+                    (a.contains(x.as_str()) && b.contains(y.as_str())) || (a.contains(y.as_str()) && b.contains(x.as_str()))
+                });
+                pairs.push(json!({"pair": k, "analogous": yes, "why": "the same pattern in a different setting"}));
+                k += 1;
+            }
+            return Ok(json!({ "pairs": pairs }));
+        }
         let user = messages
             .iter()
             .filter_map(|m| m.get("content").and_then(Value::as_str))
@@ -384,7 +425,9 @@ async fn memory_eval_memorabilia() {
             (d.source_entity.clone(), json!({"propositions": props, "relations": relations}))
         })
         .collect();
-    let chat = Arc::new(ScriptedChat { by_source });
+    let abstracts: HashMap<String, String> =
+        fx.documents.iter().flat_map(|d| d.abstracts.clone()).collect();
+    let chat = Arc::new(ScriptedChat { by_source, abstracts, analogies: fx.analogies.clone() });
     let mem_embedder = Arc::new(LiveEmbedder { inner: embedder.clone(), tag: space.clone() });
     let config = memorabilia::config::Config {
         embedding_dim: dim,
@@ -428,6 +471,11 @@ async fn memory_eval_memorabilia() {
             if o.attempted == 0 {
                 break;
             }
+        }
+        // The overnight step that follows extraction (analogy edges, 4.7).
+        let analogies = engine.build_analogies(&|| true).await;
+        if case.id == fx.cases[0].id {
+            println!("analogy pass: {analogies:?}");
         }
 
         let block = engine.recall(&case.message).await.unwrap_or_default();

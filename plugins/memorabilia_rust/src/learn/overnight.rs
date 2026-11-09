@@ -87,6 +87,8 @@ pub struct OvernightReport {
     pub propositions_written: u64,
     /// Clusters the recurrence step formed this pass (promoted or not).
     pub clusters_seen: u64,
+    /// `RHYMES_WITH` edges written (4.7, both directions counted).
+    pub analogy_edges: u64,
     /// Members in the largest of them. A cluster far larger than any one
     /// topic means the similarity threshold is chaining unrelated material.
     pub largest_cluster: u64,
@@ -281,6 +283,12 @@ impl Engine {
                 break;
             }
         }
+        // 6. Analogy edges for the claims just extracted (4.7).
+        if !ctl.keep_going() {
+            return r;
+        }
+        let a = self.build_analogies(&|| ctl.keep_going()).await;
+        r.analogy_edges += a.edges as u64;
         r.finished = true;
         r
     }

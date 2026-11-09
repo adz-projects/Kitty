@@ -354,10 +354,13 @@ async fn migration_002_creates_every_plan_table() {
         "chunks",
         "chunks_vec",
         // Added by migration 006 (claim vectors and claim relations).
+        // Added by migration 008 (analogy edges).
+        "claim_abstracts",
         "claim_vectors",
         "demand_queries",
         "disputed_edges",
         "documents",
+        "edge_rationales",
         "proposition_edges",
         "proposition_relations",
         "propositions",
