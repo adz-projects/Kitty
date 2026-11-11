@@ -57,14 +57,15 @@ Never a silently wrong-shaped call.
 |---|---|
 | `POST /api/chat/` | `{cwd?, mode?, name?, provider?, model?}` to `{session_id}` |
 | `GET /api/chat/` | `?limit&offset`; `total` is scoped to you |
+| `GET /api/chat/{id}` | one session's row, the shape of a `GET /api/chat/` entry; delegates included (2.5.0) |
 | `PATCH /api/chat/{id}` | rename |
-| `DELETE /api/chat/{id}` | 404 if it matched nothing |
+| `DELETE /api/chat/{id}` | 404 if it matched nothing; also forgets what the memory engines kept for that chat alone (2.5.0) |
 | `PATCH /api/chat/{id}/config` | shallow-merges metadata; see "Reasoning effort" below |
-| `GET /api/chat/{id}/history` | bare array |
+| `GET /api/chat/{id}/history` | bare array; `?tool_call_id=` returns only that call's result row (2.5.0) |
 | `POST /api/chat/{id}/send` | SSE stream, below |
 | `GET /api/chat/{id}/stream` | rejoin a turn in progress |
 | `POST /api/chat/{id}/fork` | the fork belongs to the forking app |
-| `POST /api/chat/{id}/cancel`, `/compact`, `/approve` | |
+| `POST /api/chat/{id}/cancel`, `/compact`, `/approve` | `/compact` with nothing folded answers `{compacted: false, reason, skip}`; `skip` is `disabled`, `lock_held`, `nothing_to_fold`, `below_threshold`, `summarizer_failed` or `storage_failed` (2.5.0) |
 | `GET /api/chat/{id}/stats`, `/timings`, `/pending` | |
 
 **Reasoning effort.** A session's `thinking_effort` metadata key (a string,
@@ -106,6 +107,10 @@ thing from starting one.
 `tool_finish`, `hitl_pause`, `hitl_resolved`, `error`, `model_failover`,
 `subagent_status`, `session_status`, `session_title`, `compaction`,
 `provider_error`, `llm_timing`.
+
+A derived `session_title` lands after the turn's terminal frame, so since 2.5.0
+it is also published on the owning app's event stream
+(`GET /api/apps/me/events`), next to approvals and scheduled runs.
 
 `is_last: true` marks a terminal frame. Note it is **omitted when false**, as
 are all defaulted fields — deserialize with defaults, or the daemon's own
@@ -323,6 +328,10 @@ open, so a missing, slow or unreachable model leaves behaviour exactly as it
 was. See `daemon/src/decider/` and `prompt_determinism.md`.
 
 `GET /api/apps/me/decider` → `{config | null, dialects[], default_thresholds}`.
+Since 2.5.0 `config` never carries an API key: each endpoint (and `secondary`)
+reports `api_key_set` and, when set, `api_key_fingerprint` (the first eight
+bytes of the key's SHA-256, hex). Keys are stored sealed under the engine's
+at-rest key.
 
 `PUT /api/apps/me/decider` replaces the app's configuration (400 on an unknown
 dialect, a bad URL or duplicate group names); `DELETE` removes it.

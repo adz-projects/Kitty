@@ -326,7 +326,70 @@ fn default_cache_ttl_secs() -> u64 {
     300
 }
 
+/// A short, stable fingerprint of a secret: enough for a client to tell
+/// whether the engine holds the key it means to send, without the engine ever
+/// handing the key back.
+pub fn key_fingerprint(key: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(key.as_bytes());
+    digest[..8].iter().map(|b| format!("{b:02x}")).collect()
+}
+
 impl DeciderConfig {
+    /// A copy whose API keys are sealed with the engine's at-rest key, for
+    /// the database. Provider keys in the same database are sealed the same
+    /// way; this one used to be stored as plain text.
+    pub fn sealed(&self) -> Self {
+        let mut c = self.clone();
+        let seal = |k: &mut Option<String>| {
+            if let Some(v) = k.as_mut() {
+                if !v.starts_with("enc:") {
+                    *v = crate::crypto::encrypt(v);
+                }
+            }
+        };
+        seal(&mut c.api_key);
+        if let Some(s) = c.secondary.as_mut() {
+            seal(&mut s.api_key);
+        }
+        c
+    }
+
+    /// The stored copy with its keys opened again. A key stored before
+    /// sealing (plain text) is read as it is.
+    pub fn unsealed(mut self) -> Self {
+        let open = |k: &mut Option<String>| {
+            if let Some(v) = k.as_mut() {
+                *v = crate::crypto::decrypt(v);
+            }
+        };
+        open(&mut self.api_key);
+        if let Some(s) = self.secondary.as_mut() {
+            open(&mut s.api_key);
+        }
+        self
+    }
+
+    /// The configuration as a client may see it: every key replaced by
+    /// `api_key_set` and a short fingerprint.
+    pub fn redacted_json(&self) -> serde_json::Value {
+        let mut v = serde_json::to_value(self).unwrap_or(serde_json::Value::Null);
+        fn redact(obj: &mut serde_json::Value, key: Option<&str>) {
+            if let Some(o) = obj.as_object_mut() {
+                o.remove("api_key");
+                o.insert("api_key_set".into(), serde_json::json!(key.is_some()));
+                if let Some(k) = key {
+                    o.insert("api_key_fingerprint".into(), serde_json::json!(key_fingerprint(k)));
+                }
+            }
+        }
+        redact(&mut v, self.api_key.as_deref());
+        if let (Some(s), Some(sv)) = (self.secondary.as_ref(), v.get_mut("secondary")) {
+            redact(sv, s.api_key.as_deref());
+        }
+        v
+    }
+
     /// Reject what can never work, so a bad PUT fails loudly instead of
     /// silently disabling everything at turn time.
     pub fn validate(&self) -> Result<(), String> {

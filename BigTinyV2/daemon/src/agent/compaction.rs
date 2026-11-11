@@ -212,9 +212,9 @@ fn append_unique(existing: &[String], incoming: &[String]) -> Vec<String> {
 /// fire and the chat became unusable inside three turns.
 pub const LIVE_TAIL_WINDOW_SHARE: f64 = 0.35;
 
-/// Room left for the summarizer's own JSON reply. `via_router` asks for
-/// `max_tokens: 1024`; this matches it so the budget and the request agree.
-const SUMMARIZER_REPLY_RESERVE: i32 = 1024;
+/// Room left for the summarizer's own JSON reply. The same figure
+/// `via_router` asks for as `max_tokens`, so the budget and the request agree.
+const SUMMARIZER_REPLY_RESERVE: i32 = super::summarizer_chain::SUMMARIZER_MAX_TOKENS;
 
 /// Slack between the computed fold budget and the real window, covering the
 /// difference between this crate's token estimate and the provider's own
@@ -460,18 +460,22 @@ pub fn consolidate_slot_if_needed(
         .and_then(|v| v.as_object_mut())
     {
         if artifacts_max_tokens > 0 {
+            // Each artifact is counted once; evicting one subtracts its count
+            // rather than re-tokenizing everything that remains.
+            let mut total: i32 = art
+                .values()
+                .map(|v| count_text_tokens(v.as_str().unwrap_or("")))
+                .sum();
             loop {
-                let total: i32 = art
-                    .values()
-                    .map(|v| count_text_tokens(v.as_str().unwrap_or("")))
-                    .sum();
                 if total <= artifacts_max_tokens || art.is_empty() {
                     break;
                 }
                 // Drop the oldest (first-inserted) key.
                 let oldest = art.keys().next().cloned();
                 if let Some(k) = oldest {
-                    art.shift_remove(&k);
+                    if let Some(v) = art.shift_remove(&k) {
+                        total -= count_text_tokens(v.as_str().unwrap_or(""));
+                    }
                 } else {
                     break;
                 }
@@ -1094,6 +1098,20 @@ pub enum CompactionSkip {
 }
 
 impl CompactionSkip {
+    /// A stable machine-readable code, so a client can act on the reason
+    /// (wait for a pass in progress, reopen a chat with nothing left to fold)
+    /// without matching the user-facing text.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::LockHeld => "lock_held",
+            Self::NothingToFold => "nothing_to_fold",
+            Self::BelowThreshold => "below_threshold",
+            Self::SummarizerFailed(_) => "summarizer_failed",
+            Self::StorageFailed(_) => "storage_failed",
+        }
+    }
+
     /// A short, user-facing explanation. Deliberately plain: this reaches the
     /// chat UI, where "check the backend is healthy" was the entire vocabulary
     /// before.
@@ -1124,7 +1142,8 @@ const SUMMARIZER_INSTRUCTIONS: &str =
      conversation. Extract ONLY items from the new chunk that are not \
      already covered by existing memory — do not repeat existing items, do \
      not restate the whole history. active_artifacts holds named deliverables \
-     kept verbatim; decision_rationale holds distinct decisions with their why \
+     kept verbatim (trim a long one to its essential part, about 300 words at \
+     most); decision_rationale holds distinct decisions with their why \
      (at most 10, only new ones); exact_identifiers and user_facts_and_entities \
      hold exact paths/symbols and user/entity facts respectively. Set \
      current_task_state to the immediate focus/next-step as of the end of the \
@@ -1415,13 +1434,50 @@ pub async fn run_compaction(
         return Err(CompactionSkip::Disabled);
     }
 
-    let stale_after = chrono::Duration::seconds((summarizer_cfg.timeout_s * 2.0).ceil() as i64);
+    // Cheap pre-check before the lock and the history load: the foldable
+    // region can never hold more than every stored count after the
+    // watermark, so when that sum is under the trigger there is nothing to
+    // do. Only trusted when every row carries a count; a row without one is
+    // counted properly by the full pass.
+    if !force {
+        if let Ok(Some(session)) = sessions::get_session(pool, session_id).await {
+            if let Ok((sum, uncounted)) = sessions::uncompacted_token_sum(
+                pool,
+                session_id,
+                session.compacted_through_rowid,
+            )
+            .await
+            {
+                if uncounted == 0 && sum <= compaction_high_water(token_cfg, context_length) as i64 {
+                    return Err(CompactionSkip::BelowThreshold);
+                }
+            }
+        }
+    }
+
+    // A pass commits after every chunk and refreshes the lock each time (see
+    // `commit_compaction_step`), so the lock is only stale once a single
+    // summarizer call has overrun: the local leg's wait plus the provider
+    // leg's overall cap, with a margin. Sized from the old `2 x timeout_s`,
+    // the lock went "stale" in the middle of a healthy pass and a second pass
+    // joined it.
+    let one_call = super::summarizer_chain::SUMMARIZER_OVERALL_TIMEOUT.as_secs_f64() * 2.0 + 60.0;
+    let stale_after =
+        chrono::Duration::seconds((summarizer_cfg.timeout_s * 2.0).max(one_call).ceil() as i64);
     match sessions::try_acquire_compaction_lock(pool, session_id, stale_after).await {
         Ok(true) => {}
         _ => return Err(CompactionSkip::LockHeld),
     }
+    // Released however the pass ends, including when its task is aborted (a
+    // new turn cancels the session's background work). Released in ordinary
+    // code, an aborted pass left the lock held until it went stale, and the
+    // pass the next overflow started was refused meanwhile.
+    let _lock = CompactionLock {
+        pool: pool.clone(),
+        session_id: session_id.to_string(),
+    };
 
-    let result = run_compaction_inner(
+    run_compaction_inner(
         pool,
         session_id,
         summarizer,
@@ -1434,14 +1490,25 @@ pub async fn run_compaction(
         force,
         decider,
     )
-    .await;
+    .await
+}
 
-    // Always release, whether the pass succeeded, bailed out early, or
-    // failed — `update_compaction_state` (success path) already sets
-    // compaction_state back to 'idle', so this is a harmless no-op there.
-    let _ = sessions::release_compaction_lock(pool, session_id).await;
+/// Holds a session's compaction lock; releases it on drop.
+struct CompactionLock {
+    pool: SqlitePool,
+    session_id: String,
+}
 
-    result
+impl Drop for CompactionLock {
+    fn drop(&mut self) {
+        let pool = self.pool.clone();
+        let session_id = std::mem::take(&mut self.session_id);
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let _ = sessions::release_compaction_lock(&pool, &session_id).await;
+            });
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1564,9 +1631,26 @@ async fn run_compaction_inner(
     // This closure is called once per candidate row for the trigger sum and
     // then again per row per exchange in the fold loop below, so the scan made
     // the whole pass O(n²) over the uncompacted region.
+    // A row without a stored count is counted here, as the prompt builder
+    // does: treated as free, it hid a whole history (imported chats) from the
+    // trigger while the real prompt overflowed.
     let tokens_by_rowid: HashMap<i64, i64> = rows
         .iter()
-        .map(|r| (r.rowid, r.token_count.unwrap_or(0) as i64))
+        .map(|r| {
+            let stored = r.token_count.unwrap_or(0) as i64;
+            let n = if stored > 0 {
+                stored
+            } else {
+                let text = r
+                    .content
+                    .as_deref()
+                    .map(|c| stored_content_as_text(c, r.content_format.as_deref()))
+                    .unwrap_or_default();
+                count_text_tokens(&text) as i64
+                    + r.tool_calls.as_deref().map_or(0, |t| count_text_tokens(t) as i64)
+            };
+            (r.rowid, n)
+        })
         .collect();
     let token_of = |rowid: i64| -> i64 { tokens_by_rowid.get(&rowid).copied().unwrap_or(0) };
     let foldable_tokens: i64 = candidate_rows
@@ -1689,90 +1773,106 @@ async fn run_compaction_inner(
     // rather than lost.
     chunks.truncate(MAX_FOLD_PASSES);
 
-    let mut to_fold: Vec<Value> = Vec::new();
+    // Each successful chunk is committed at once: an aborted pass keeps what
+    // it already paid for, and the next pass starts after it instead of
+    // summarizing the same chunks again.
     let mut merged = existing_slots.clone().unwrap_or_else(|| json!({}));
-    let mut any_ok = false;
+    let mut watermark = compacted_through;
+    let mut folded_rows = 0usize;
+    let mut tokens_folded: i64 = 0;
     let mut last_error: Option<String> = None;
 
     for chunk in &chunks {
         // A chunk of nothing but dropped filler has nothing to summarize; it
         // is folded past without a summarizer call.
-        if chunk
+        let all_dropped = chunk
             .iter()
-            .all(|m| m.get(MARK_KEY).and_then(|v| v.as_str()) == Some(MARK_DROP))
-        {
-            to_fold.extend(chunk.clone());
-            any_ok = true;
-            continue;
-        }
-        let masked = apply_tool_mask(chunk, reserve_floor, token_cfg);
-        let prompt = build_summarizer_prompt(Some(&merged), &masked);
-
-        match summarizer
-            .structured_chat_for_session(
-                provider_id,
-                provider_model.clone(),
-                prompt,
-                &MEMORY_SLOTS_SCHEMA,
-            )
-            .await
-        {
-            Ok(new_slots) => {
-                merged = merge_memory_slots(Some(&merged), &new_slots);
-                to_fold.extend(chunk.clone());
-                any_ok = true;
+            .all(|m| m.get(MARK_KEY).and_then(|v| v.as_str()) == Some(MARK_DROP));
+        if !all_dropped {
+            let masked = apply_tool_mask(chunk, reserve_floor, token_cfg);
+            let prompt = build_summarizer_prompt(Some(&merged), &masked);
+            match summarizer
+                .structured_chat_for_session(
+                    provider_id,
+                    provider_model.clone(),
+                    prompt,
+                    &MEMORY_SLOTS_SCHEMA,
+                )
+                .await
+            {
+                Ok(new_slots) => {
+                    merged = consolidate_slot_if_needed(
+                        merge_memory_slots(Some(&merged), &new_slots),
+                        summarizer_cfg.max_slot_items,
+                        memory_cfg.artifacts_max_tokens,
+                    );
+                }
+                Err(e) => {
+                    // Never fail the turn or corrupt state on a bad summarizer
+                    // pass. Earlier chunks are already committed: partial
+                    // progress is what lets a session that only just
+                    // overflowed recover on the next turn instead of getting
+                    // stuck at exactly the same point every time.
+                    tracing::warn!(
+                        "compaction: summarizer call failed for session {session_id}: {e}"
+                    );
+                    last_error = Some(e.to_string());
+                    break;
+                }
             }
-            Err(e) => {
-                // Never fail the turn or corrupt state on a bad summarizer
-                // pass. Earlier chunks that succeeded are still committed
-                // below — partial progress is what lets a session that only
-                // just overflowed recover on the next turn instead of getting
-                // stuck at exactly the same point every time.
-                tracing::warn!("compaction: summarizer call failed for session {session_id}: {e}");
-                last_error = Some(e.to_string());
+        }
+
+        let Some(new_watermark) = chunk
+            .last()
+            .and_then(|v| v.get("rowid").and_then(|r| r.as_i64()))
+        else {
+            continue;
+        };
+        let slots_json = match serde_json::to_string(&merged) {
+            Ok(j) => j,
+            Err(e) => return Err(CompactionSkip::StorageFailed(e.to_string())),
+        };
+        match sessions::commit_compaction_step(
+            pool,
+            session_id,
+            &slots_json,
+            new_watermark,
+            watermark,
+        )
+        .await
+        {
+            Ok(true) => {}
+            // Another pass moved the watermark: its result stands, and this
+            // one's is discarded rather than written over it.
+            Ok(false) => {
+                tracing::warn!(
+                    "compaction: another pass committed first for session {session_id}"
+                );
                 break;
             }
+            Err(e) => {
+                tracing::error!("compaction: failed to update session: {}", e);
+                return Err(CompactionSkip::StorageFailed(e.to_string()));
+            }
         }
+        watermark = new_watermark;
+        folded_rows += chunk.len();
+        tokens_folded += chunk
+            .iter()
+            .map(|v| token_of(v.get("rowid").and_then(|r| r.as_i64()).unwrap_or(0)))
+            .sum::<i64>();
     }
 
-    if !any_ok {
+    if folded_rows == 0 {
         return Err(CompactionSkip::SummarizerFailed(
             last_error.unwrap_or_else(|| "no summarizer response".into()),
         ));
     }
 
-    let merged = consolidate_slot_if_needed(
-        merged,
-        summarizer_cfg.max_slot_items,
-        memory_cfg.artifacts_max_tokens,
-    );
-
-    let new_watermark = to_fold
-        .last()
-        .and_then(|v| v.get("rowid").and_then(|r| r.as_i64()))
-        .unwrap_or(compacted_through);
-
-    let slots_json = match serde_json::to_string(&merged) {
-        Ok(j) => j,
-        Err(e) => return Err(CompactionSkip::StorageFailed(e.to_string())),
-    };
-    if let Err(e) =
-        sessions::update_compaction_state(pool, session_id, &slots_json, new_watermark).await
-    {
-        tracing::error!("compaction: failed to update session: {}", e);
-        return Err(CompactionSkip::StorageFailed(e.to_string()));
-    }
-
-    let tokens_folded: i64 = to_fold
-        .iter()
-        .map(|v| token_of(v.get("rowid").and_then(|r| r.as_i64()).unwrap_or(0)))
-        .sum();
-    let tokens_after = (foldable_tokens - tokens_folded) as i32;
-
     Ok(CompactionResult {
-        messages_compacted: to_fold.len(),
+        messages_compacted: folded_rows,
         tokens_before: foldable_tokens as i32,
-        tokens_after,
+        tokens_after: (foldable_tokens - tokens_folded) as i32,
     })
 }
 

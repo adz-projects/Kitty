@@ -231,6 +231,24 @@ pub async fn get_last_messages_by_session(
     Ok(rows)
 }
 
+/// The tool-result row for one `tool_call_id`, if the session has it.
+pub async fn get_tool_result(
+    pool: &SqlitePool,
+    session_id: &str,
+    tool_call_id: &str,
+) -> Result<Vec<MessageRow>, StorageError> {
+    Ok(sqlx::query_as::<_, MessageRow>(
+        r#"SELECT rowid, id, session_id, role, content, tool_calls, tool_call_id, token_count, content_format, created_at,
+                  reasoning, provider_id, model
+           FROM messages WHERE session_id = ? AND role = 'tool' AND tool_call_id = ?
+           ORDER BY rowid DESC LIMIT 1"#,
+    )
+    .bind(session_id)
+    .bind(tool_call_id)
+    .fetch_all(pool)
+    .await?)
+}
+
 pub async fn get_messages_after_rowid(
     pool: &SqlitePool,
     session_id: &str,

@@ -485,6 +485,12 @@ async fn sweep(
                 if screened > 0 {
                     tracing::info!(screened, "memorabilia: held captures screened");
                 }
+                // Reinforcement and grounding from recall, applied as they
+                // accumulate rather than only in the overnight pass.
+                let (grounded, reinforced) = engine.drain_outbox_fully(&now).await;
+                if grounded + reinforced > 0 {
+                    tracing::debug!(grounded, reinforced, "memorabilia: outbox drained");
+                }
                 let permit = match &overnight {
                     Some(h) => h.memory_permit(&app_id).await,
                     None => Permit::Always,

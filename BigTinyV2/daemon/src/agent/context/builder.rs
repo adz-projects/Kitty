@@ -16,6 +16,26 @@ pub const BASE_PERSONA: &str =
 
 const EMERGENCY_TRIM_RATIO: f64 = 0.9;
 
+/// Longest `[Original request]` anchor once the first message has been folded
+/// into memory (about 2,000 tokens).
+const ANCHOR_MAX_CHARS: usize = 8_000;
+
+/// `text` cut to about `max` characters: its head and tail, with a marker
+/// where the middle was. Cut on character boundaries.
+fn elide_middle(text: &str, max: usize) -> String {
+    let count = text.chars().count();
+    if count <= max {
+        return text.to_string();
+    }
+    let keep = max / 2;
+    let head: String = text.chars().take(keep).collect();
+    let tail: String = text.chars().skip(count - keep).collect();
+    format!(
+        "{head}\n[… {} characters omitted; the full request was folded into memory …]\n{tail}",
+        count - 2 * keep
+    )
+}
+
 /// Assembles the full message context for one LLM turn.
 pub struct ContextBuilder {
     pool: SqlitePool,
@@ -174,15 +194,24 @@ impl ContextBuilder {
             // blocks JSON array full of base64 payloads — inlining it here
             // would put megabytes of base64 into the permanent system head
             // of EVERY turn. Collapse non-text blocks to a placeholder.
+            let text = stored_content_as_text(
+                row.content.as_deref().unwrap_or(""),
+                row.content_format.as_deref(),
+            );
+            // Once the message itself has been folded into memory, the anchor
+            // is a reminder, not the only copy: keep its head and tail. Kept
+            // whole, a chat that opened with a very large paste carried it in
+            // every prompt forever, out of compaction's reach, and on a small
+            // window could never fit again. Unchanged until that fold, so the
+            // cached prefix moves only when compaction moves it anyway.
+            let text = if row.rowid <= compacted_through {
+                elide_middle(&text, ANCHOR_MAX_CHARS)
+            } else {
+                text
+            };
             messages.push(json!({
                 "role": "system",
-                "content": format!(
-                    "[Original request]\n{}",
-                    stored_content_as_text(
-                        row.content.as_deref().unwrap_or(""),
-                        row.content_format.as_deref()
-                    )
-                )
+                "content": format!("[Original request]\n{text}")
             }));
         }
 
@@ -650,6 +679,16 @@ fn row_to_message(row: &crate::storage::messages::MessageRow) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_long_anchor_keeps_its_head_and_tail() {
+        let text = format!("{}{}{}", "a".repeat(5000), "é".repeat(5000), "z".repeat(5000));
+        let out = elide_middle(&text, 8000);
+        assert!(out.starts_with(&"a".repeat(4000)));
+        assert!(out.ends_with(&"z".repeat(4000)));
+        assert!(out.contains("characters omitted"));
+        assert_eq!(elide_middle("short", 8000), "short");
+    }
 
     async fn test_pool() -> SqlitePool {
         let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();

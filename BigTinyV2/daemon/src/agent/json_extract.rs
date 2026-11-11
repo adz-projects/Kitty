@@ -47,10 +47,110 @@ pub(crate) fn extract_json(raw: &str) -> Option<Value> {
     None
 }
 
+/// Recover the complete part of a JSON object that was cut off mid-reply (the
+/// model hit its output cap). Everything up to the last complete member or
+/// element is kept, the cut-off tail is dropped, and the open containers are
+/// closed. `None` when no object starts in `raw`, or when what is left still
+/// does not parse.
+///
+/// For memory-slot extraction a partial object is far better than none: the
+/// alternative was a chunk that could never be folded, because the next pass
+/// built the same chunk and was cut off in the same place.
+pub(crate) fn extract_truncated_json(raw: &str) -> Option<Value> {
+    let start = raw.find('{')?;
+    let text = &raw[start..];
+    let bytes = text.as_bytes();
+    // Open containers, and for each the byte offset just past its last
+    // complete member (where a cut can safely be made).
+    let mut stack: Vec<u8> = Vec::new();
+    let mut safe_cut: Vec<usize> = Vec::new();
+    let mut in_str = false;
+    let mut escaped = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_str = true,
+            b'{' | b'[' => {
+                stack.push(if b == b'{' { b'}' } else { b']' });
+                safe_cut.push(i + 1);
+            }
+            b'}' | b']' => {
+                stack.pop();
+                safe_cut.pop();
+                if stack.is_empty() {
+                    return serde_json::from_str(&text[..=i]).ok();
+                }
+                // The container just closed is a complete member of its parent.
+                if let Some(c) = safe_cut.last_mut() {
+                    *c = i + 1;
+                }
+            }
+            b',' => {
+                if let Some(c) = safe_cut.last_mut() {
+                    *c = i;
+                }
+            }
+            _ => {}
+        }
+    }
+    // Cut back to the innermost safe point, then close every open container.
+    // A cut inside a nested container can leave its parent's half-written
+    // member (`"key": [`), so try progressively outer cuts until one parses.
+    for depth in (0..stack.len()).rev() {
+        let mut candidate = text[..safe_cut[depth]].trim_end().to_string();
+        if candidate.ends_with(',') {
+            candidate.pop();
+        }
+        for closer in stack[..=depth].iter().rev() {
+            candidate.push(*closer as char);
+        }
+        if let Ok(v) = serde_json::from_str::<Value>(&candidate) {
+            return Some(v);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_truncated_object_keeps_its_complete_members() {
+        let raw = r#"{"current_task_state": "fix it", "decision_rationale": ["a", "b"], "active_artifacts": {"spec": "long verbatim te"#;
+        let v = extract_truncated_json(raw).unwrap();
+        assert_eq!(v["current_task_state"], "fix it");
+        assert_eq!(v["decision_rationale"], json!(["a", "b"]));
+        assert!(v.get("active_artifacts").map_or(true, |a| a.as_object().is_some()));
+    }
+
+    #[test]
+    fn a_truncated_array_keeps_its_complete_elements() {
+        let raw = r#"{"a": 1, "list": ["one", "two", "thr"#;
+        let v = extract_truncated_json(raw).unwrap();
+        assert_eq!(v["a"], 1);
+        assert_eq!(v["list"], json!(["one", "two"]));
+    }
+
+    #[test]
+    fn a_complete_object_is_returned_as_is() {
+        assert_eq!(extract_truncated_json(r#"x {"a": [1, 2]} y"#).unwrap(), json!({"a": [1, 2]}));
+    }
+
+    #[test]
+    fn a_reply_with_no_object_is_none() {
+        assert!(extract_truncated_json("no json").is_none());
+    }
 
     #[test]
     fn extracts_bare_json() {

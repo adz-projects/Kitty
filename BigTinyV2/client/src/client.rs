@@ -18,6 +18,16 @@ use serde_json::{json, Value};
 
 use crate::error::{ClientError, Result};
 
+/// An HTTP client for the engine on loopback. Never proxied: with
+/// `HTTP_PROXY`/`ALL_PROXY` set, or a system proxy without a loopback bypass,
+/// requests to `127.0.0.1` would go to the proxy and the engine look down.
+pub(crate) fn loopback_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap_or_default()
+}
+
 /// Control-plane calls: list sessions, read a job, patch config.
 const SHORT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Calls that do real work but still terminate: health probes, embeddings.
@@ -36,7 +46,7 @@ impl BigTinyClient {
         Self {
             // No client-level timeout: it would apply to streams too. Timeouts
             // are set per request instead.
-            http: reqwest::Client::new(),
+            http: loopback_client(),
             base_url: base_url.into(),
             api_key: api_key.into(),
         }
@@ -58,7 +68,7 @@ impl BigTinyClient {
         app_id: &str,
         display_name: &str,
     ) -> Result<RegisterResponse> {
-        let http = reqwest::Client::new();
+        let http = loopback_client();
         let resp = http
             .post(format!("{base_url}/api/apps/register"))
             .header("X-Registration-Token", registration_token)
@@ -90,7 +100,7 @@ impl BigTinyClient {
         registration_token: &str,
         app_id: &str,
     ) -> Result<RegisterResponse> {
-        let http = reqwest::Client::new();
+        let http = loopback_client();
         let resp = http
             .post(format!("{base_url}/api/apps/reclaim"))
             .header("X-Registration-Token", registration_token)

@@ -517,6 +517,57 @@ const ABORTED_FOR_STEP_BUDGET: &str =
 /// `std::hash::DefaultHasher` — its output isn't stable across Rust
 /// versions/releases, which would defeat the point of a *stable* per-session
 /// slot assignment.
+/// Which llama-server slot each chat uses, per provider: `(session, last
+/// used)` per slot.
+type SlotTable = std::collections::HashMap<String, Vec<Option<(String, std::time::Instant)>>>;
+
+fn slot_table() -> &'static std::sync::Mutex<SlotTable> {
+    static TABLE: std::sync::OnceLock<std::sync::Mutex<SlotTable>> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| std::sync::Mutex::new(SlotTable::new()))
+}
+
+/// The server slot for this chat's request: the slot it used last while it
+/// still holds it, else a free slot, else the least recently used one.
+/// Assigned by `hash(session) mod slots`, two active chats collided one time
+/// in four on a four-slot server, each turn of one evicting the other's
+/// cached prompt while other slots sat idle.
+fn assign_slot(provider_id: &str, session_id: &str, slots: usize) -> i32 {
+    let mut table = slot_table().lock().unwrap_or_else(|p| p.into_inner());
+    let entries = table.entry(provider_id.to_string()).or_default();
+    entries.resize(slots, None);
+    let now = std::time::Instant::now();
+    let pick = entries
+        .iter()
+        .position(|e| e.as_ref().is_some_and(|(s, _)| s == session_id))
+        .or_else(|| entries.iter().position(Option::is_none))
+        .unwrap_or_else(|| {
+            entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, e)| e.as_ref().map(|(_, t)| *t))
+                .map_or(0, |(i, _)| i)
+        });
+    entries[pick] = Some((session_id.to_string(), now));
+    pick as i32
+}
+
+#[cfg(test)]
+mod slot_tests {
+    use super::assign_slot;
+
+    #[test]
+    fn chats_get_distinct_slots_and_keep_them() {
+        let p = "slot-test-provider";
+        let a = assign_slot(p, "a", 2);
+        let b = assign_slot(p, "b", 2);
+        assert_ne!(a, b);
+        assert_eq!(assign_slot(p, "a", 2), a, "a chat keeps its slot");
+        // A third chat takes the least recently used slot (b's).
+        assert_eq!(assign_slot(p, "c", 2), b);
+    }
+}
+
+#[allow(dead_code)]
 fn fnv1a64(s: &str) -> u64 {
     const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
     const FNV_PRIME: u64 = 0x100000001b3;
@@ -909,6 +960,30 @@ fn wrapup_persist_shape(text: &str, turn_tool_calls: &[ToolCall]) -> Value {
 /// empty-vector (weight-only, still-capped) selection rather than a failure.
 const AP_RECALL_EMBED_BUDGET_MS: u64 = 1500;
 
+/// Run one memory engine's recall within [`AP_RECALL_EMBED_BUDGET_MS`].
+/// `None` when it ran out of time, which is now logged: a turn that silently
+/// got no memory (recall queued behind a background job on the engine's one
+/// connection) looked exactly like a turn with nothing to recall.
+async fn recall_within_budget<T>(
+    engine: &str,
+    session_id: &str,
+    fut: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    let started = std::time::Instant::now();
+    match tokio::time::timeout(Duration::from_millis(AP_RECALL_EMBED_BUDGET_MS), fut).await {
+        Ok(v) => Some(v),
+        Err(_) => {
+            tracing::warn!(
+                engine,
+                session_id,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "memory recall ran out of time; this turn has no {engine} memory"
+            );
+            None
+        }
+    }
+}
+
 /// Ceiling on how long a paused tool call waits for `/approve` before it's
 /// treated as denied. Matches `hitl::manager::MAX_PENDING_AGE` — the same
 /// horizon the pending-action sweep already uses to decide an approval is
@@ -1089,6 +1164,7 @@ async fn derive_and_set_title(
     provider_id: Option<&str>,
     model: Option<String>,
     event_tx: &mpsc::UnboundedSender<SSEEvent>,
+    app_events: Option<Arc<crate::server::app_events::AppEvents>>,
 ) {
     let Ok(Some(row)) = sessions::get_session(pool, session_id).await else {
         return;
@@ -1115,12 +1191,21 @@ async fn derive_and_set_title(
         return;
     }
     let _ = sessions::update_session_name(pool, session_id, &title).await;
-    let _ = event_tx.send(SSEEvent {
+    let event = SSEEvent {
         event_type: SSEEventType::SessionTitle,
         content: Some(title.clone()),
         session_id: Some(session_id.to_string()),
         ..Default::default()
-    });
+    };
+    // Also on the owning app's event stream: the title is derived after the
+    // turn's terminal frame, so the turn stream's reader has usually gone.
+    // Without this a client had to poll the session list to learn it.
+    if let Some(hub) = app_events {
+        if let Ok(Some(app_id)) = sessions::owner_of(pool, session_id).await {
+            hub.publish(&app_id, event.clone());
+        }
+    }
+    let _ = event_tx.send(event);
 }
 
 /// Ask the summarizer chain for a title describing what the user opened the
@@ -1840,6 +1925,8 @@ impl AgentLoop {
         // their compacted history, is a prompt cost (and on a self-hosted
         // host, an embedding call) with nothing to find.
         let delegate = is_delegate(&metadata);
+        // Cleared before the lookups below borrow `self`.
+        self.memorabilia_shown = None;
         let recall = async {
             match &resolved_provider_id {
                 _ if delegate => (None, None, None),
@@ -1869,23 +1956,42 @@ impl AgentLoop {
             )
             .await
         };
-        let ((ap_hints, thought_seed, challenge), gate) = tokio::join!(recall, gate);
+        // Memorabilia turn-start hook: its compact summary+index rides the
+        // same tail `system`-block channel as `ap_hints` (both plugins may be
+        // on), so the stable head stays byte-identical and no `build_messages`
+        // signature changes. `None`+`None` is still zero prompt delta.
+        let mem = async {
+            match &resolved_provider_id {
+                _ if delegate => None,
+                Some(_) => self.memorabilia_recall(session_id, user_message).await,
+                None => None,
+            }
+        };
+        // Pre-flight memory recall ("the detour"): best-effort FTS5 lookup
+        // over the session's *already-compacted* history, gated by recall
+        // intent, injected into the tail region (like `ap_hints`) so the
+        // stable head stays byte-identical. Any miss/disabled/error yields
+        // `None` → zero delta to the prompt; the counter drops are the only
+        // side effect.
+        let preflight = async {
+            if delegate {
+                None
+            } else {
+                self.preflight_recall(session_id, user_message, session.compacted_through_rowid)
+                    .await
+            }
+        };
+        // Independent lookups, so they run together: one after another, each
+        // with its own budget, they could hold the request back several
+        // seconds before it was sent.
+        let ((ap_hints, thought_seed, challenge), gate, mem_recalled, preflight_recalled) =
+            tokio::join!(recall, gate, mem, preflight);
         if let Some(gate) = gate {
             active_tools = gate.offered();
             self.gate = Some(Arc::new(gate));
         }
         let active_tools = active_tools;
 
-        // Memorabilia turn-start hook: its compact summary+index rides the
-        // same tail `system`-block channel as `ap_hints` (both plugins may be
-        // on), so the stable head stays byte-identical and no `build_messages`
-        // signature changes. `None`+`None` is still zero prompt delta.
-        self.memorabilia_shown = None;
-        let mem_recalled = match &resolved_provider_id {
-            _ if delegate => None,
-            Some(_) => self.memorabilia_recall(session_id, user_message).await,
-            None => None,
-        };
         let mem_hints = mem_recalled.map(|r| {
             self.memorabilia_shown = Some((r.query_event_id, r.item_ids));
             r.text
@@ -1893,7 +1999,8 @@ impl AgentLoop {
         // The counterpoint channel (`[Worth challenging]`): when Pathway
         // flagged a stance this turn and Memorabilia holds a documented claim
         // disputing it, add that claim with its citation, so the other side
-        // is grounded in something the user actually read.
+        // is grounded in something the user actually read. Waits for
+        // Pathway's answer, so it cannot join the lookups above.
         let counter = match (&challenge, delegate) {
             (Some(stance), false) => self.memorabilia_counterpoint(session_id, stance).await,
             _ => None,
@@ -1903,18 +2010,6 @@ impl AgentLoop {
             .flatten()
             .reduce(|a, b| format!("{a}\n\n{b}"));
 
-        // Pre-flight memory recall ("the detour"): best-effort FTS5 lookup
-        // over the session's *already-compacted* history, gated by recall
-        // intent, injected into the tail region (like `ap_hints`) so the
-        // stable head stays byte-identical. Any miss/disabled/error yields
-        // `None` → zero delta to the prompt; the counter drops are the only
-        // side effect.
-        let preflight_recalled = if delegate {
-            None
-        } else {
-            self.preflight_recall(session_id, user_message, session.compacted_through_rowid)
-                .await
-        };
         let recalled = preflight_recalled.as_deref();
 
         // Build initial context
@@ -2130,7 +2225,13 @@ impl AgentLoop {
                 ),
             }
         });
-        self.track_background(&tracked_session, handle.abort_handle());
+        // A forced pass is not tracked: it runs because the chat overflowed,
+        // and the user's next message would otherwise abort it - and with it
+        // the only thing that can make that message fit. Aborted on every
+        // retry, the chat could never recover.
+        if !force {
+            self.track_background(&tracked_session, handle.abort_handle());
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2230,8 +2331,15 @@ impl AgentLoop {
                         }
                     }
                     // No answer: keep what the chat had (its prefix is warm
-                    // with it), or offer everything and record nothing.
-                    None => previous.clone()?,
+                    // with it), or offer everything and record nothing. The
+                    // groups this turn's files call for are added either way:
+                    // they load whatever the decision model says, including
+                    // nothing.
+                    None => {
+                        let mut kept = previous.clone()?;
+                        kept.groups.extend(forced.iter().cloned());
+                        kept
+                    }
                 }
             }
             tool_gate::Moment::Warm => {
@@ -3244,7 +3352,7 @@ impl AgentLoop {
                             error_message: Some(format!(
                                 "This conversation no longer fits in {model_label}'s \
                                  {context_length}-token context window ({final_count} tokens \
-                                 needed). It is being compacted — send your message again.",
+                                 needed). Older messages are being compacted now, which can take a                                  minute; send your message again once that finishes.",
                                 model_label =
                                     provider_model_for(&self.router, &provider_id, model_override),
                             )),
@@ -3295,7 +3403,7 @@ impl AgentLoop {
                     .router
                     .parallel_slots(&provider_id)
                     .filter(|&n| n > 0)
-                    .map(|n| (fnv1a64(session_id) % n as u64) as i32);
+                    .map(|n| assign_slot(&provider_id, session_id, n as usize));
                 // Same reasoning as `id_slot` above: sampling is per-provider
                 // (a self-hosted endpoint gets a repetition-safe floor, a
                 // hosted one gets none — see `provider::sampling`), so it
@@ -4149,6 +4257,7 @@ impl AgentLoop {
             let tracked_session = session_id.clone();
             let summarizer = self.summarizer.clone();
             let event_tx = event_tx.clone();
+            let app_events = self.app_events.clone();
             let handle = tokio::spawn(async move {
                 derive_and_set_title(
                     &pool,
@@ -4157,6 +4266,7 @@ impl AgentLoop {
                     title_provider_id.as_deref(),
                     title_provider_model,
                     &event_tx,
+                    app_events,
                 )
                 .await;
             });
@@ -4382,12 +4492,12 @@ impl AgentLoop {
         // a function of what is stored). The current message is not saved
         // yet, so the latest stored user message is the previous one.
         let previous = self.previous_user_message(session_id).await;
-        let turn = tokio::time::timeout(
-            Duration::from_millis(AP_RECALL_EMBED_BUDGET_MS),
+        let turn = recall_within_budget(
+            "pathway",
+            session_id,
             engine.recall_turn(session_id, user_message, previous.as_deref(), seed_eligible),
         )
         .await
-        .ok()
         .flatten();
         let challenge = turn.as_ref().and_then(|t| t.challenge.clone());
         let text = turn.map(|t| t.text);
@@ -4437,12 +4547,12 @@ impl AgentLoop {
         }
         // The previous user message steers a follow-up's query (4.6).
         let previous = self.previous_user_message(session_id).await;
-        let recalled = tokio::time::timeout(
-            Duration::from_millis(AP_RECALL_EMBED_BUDGET_MS),
+        let recalled = recall_within_budget(
+            "memorabilia",
+            session_id,
             engine.recall_turn(user_message, previous.as_deref()),
         )
         .await
-        .ok()
         .flatten()?;
         Some(recalled)
     }

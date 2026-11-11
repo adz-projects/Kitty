@@ -62,7 +62,9 @@ pub async fn erase_all(
         Ok(e) => e,
         Err(e) => return *e,
     };
-    let result = crate::plugins::erase::erase_all_rows(engine.db.pool()).await;
+    // Under the engine's write lock: no transaction may be open while every
+    // table is emptied.
+    let result = crate::plugins::erase::erase_all_rows(&*engine.db.write().await).await;
     drop(engine);
     state.memorabilia.close(&identity.app_id).await;
     super::plugins::reconnect_plugin_tools(

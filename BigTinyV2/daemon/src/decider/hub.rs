@@ -25,6 +25,9 @@ const WARN_EVERY: Duration = Duration::from_secs(60);
 pub struct AppDecider {
     pub config: DeciderConfig,
     backend: Arc<dyn DeciderBackend>,
+    /// Skips the model for a while once it keeps failing, so every use does
+    /// not wait out its whole budget on an endpoint that is down.
+    breaker: backend::Breaker,
 }
 
 impl AppDecider {
@@ -72,7 +75,7 @@ impl DeciderHub {
         }
         let loaded = match app_decider::get(&self.pool, app_id).await {
             Ok(Some(raw)) => match serde_json::from_str::<DeciderConfig>(&raw) {
-                Ok(config) => build(config),
+                Ok(config) => build(config.unsealed()),
                 Err(e) => {
                     tracing::warn!(app = app_id, "stored decision-model config unreadable: {e}");
                     None
@@ -114,10 +117,23 @@ impl DeciderHub {
         let decider = self.enabled(app_id, feature).await?;
         let stats = self.stats(app_id, feature);
         stats.calls.fetch_add(1, Ordering::Relaxed);
+        if !decider.breaker.allows() {
+            // Known to be down: answer "no opinion" at once instead of
+            // waiting out the budget again.
+            stats.failed.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
         let state = truncate_chars(state, MAX_STATE_CHARS);
-        let result = tokio::time::timeout(budget, decider.backend.ask(state, questions)).await;
+        // The outer timeout is a backstop; `ask_within` splits the budget
+        // between a primary and its fallback itself.
+        let result = tokio::time::timeout(
+            budget + Duration::from_millis(50),
+            decider.backend.ask_within(state, questions, budget),
+        )
+        .await;
         match result {
             Ok(Ok(answers)) if !answers.is_empty() => {
+                decider.breaker.success();
                 stats.answered.fetch_add(1, Ordering::Relaxed);
                 Some(answers)
             }
@@ -127,11 +143,13 @@ impl DeciderHub {
                 None
             }
             Ok(Err(e)) => {
+                decider.breaker.failure();
                 stats.failed.fetch_add(1, Ordering::Relaxed);
                 self.warn(app_id, feature, &e.to_string());
                 None
             }
             Err(_) => {
+                decider.breaker.failure();
                 stats.failed.fetch_add(1, Ordering::Relaxed);
                 self.warn(
                     app_id,
@@ -155,7 +173,8 @@ impl DeciderHub {
         match &config {
             Some(c) => {
                 c.validate()?;
-                let raw = serde_json::to_string(c).map_err(|e| e.to_string())?;
+                // Keys are sealed on disk; the in-memory copy keeps them open.
+                let raw = serde_json::to_string(&c.sealed()).map_err(|e| e.to_string())?;
                 app_decider::set(&self.pool, app_id, &raw)
                     .await
                     .map_err(|e| e.to_string())?;
@@ -242,7 +261,11 @@ impl DeciderHub {
     ) {
         self.apps.insert(
             app_id.to_string(),
-            Some(Arc::new(AppDecider { config, backend })),
+            Some(Arc::new(AppDecider {
+                config,
+                backend,
+                breaker: backend::Breaker::default(),
+            })),
         );
     }
 }
@@ -266,7 +289,11 @@ fn build(config: DeciderConfig) -> Option<Arc<AppDecider>> {
         }
         None => primary,
     };
-    Some(Arc::new(AppDecider { config, backend }))
+    Some(Arc::new(AppDecider {
+        config,
+        backend,
+        breaker: backend::Breaker::default(),
+    }))
 }
 
 fn truncate_chars(s: &str, max: usize) -> &str {

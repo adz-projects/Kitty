@@ -26,6 +26,7 @@ use std::time::Duration;
 
 use bigtiny2_protocol::discovery::{Handshake, HealthResponse};
 
+use crate::client::loopback_client;
 use crate::error::{ClientError, Result};
 use crate::paths;
 
@@ -185,7 +186,7 @@ pub struct DiscoveryConfig {
 
 /// Attach to a running daemon, or start one. See the module docs.
 pub async fn attach_or_spawn(config: &DiscoveryConfig) -> Result<Located> {
-    let client = reqwest::Client::new();
+    let client = loopback_client();
     let handshake_path = paths::handshake_path();
 
     // 1. Fast path: someone else already has a daemon up.

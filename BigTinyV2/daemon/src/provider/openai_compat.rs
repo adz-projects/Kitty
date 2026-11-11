@@ -104,7 +104,7 @@ pub struct OpenAICompatibleProvider {
     tailscale: Arc<TailscaleClient>,
     /// Cached direct-address reachability, `origin -> (reachable, checked at)`
     /// — see `direct_is_reachable`.
-    direct_probe: dashmap::DashMap<String, (bool, Instant)>,
+    direct_probe: Arc<dashmap::DashMap<String, (bool, Instant)>>,
     /// SSE idle-read timeout — if no bytes arrive for this long, the stream
     /// is terminated with a transient error (see `parse_openai_sse`). Per
     /// provider, from the config blob's `idle_timeout_secs`, default 120s.
@@ -135,6 +135,12 @@ const DIRECT_HEADERS_TIMEOUT: Duration = Duration::from_secs(5);
 /// that a normal back-and-forth pays for the probe once, short enough that
 /// moving off (or onto) the LAN is noticed within a turn or two.
 const DIRECT_PROBE_TTL: Duration = Duration::from_secs(60);
+
+/// How long a "not reachable" verdict is trusted. Away from home the direct
+/// address normally does not answer, and each re-check used to cost a turn
+/// the full probe timeout; a stale verdict is now refreshed in the
+/// background anyway, so this only bounds how often that refresh runs.
+const DIRECT_PROBE_NEGATIVE_TTL: Duration = Duration::from_secs(600);
 
 /// `scheme://host:port` of a URL, for keying the direct-probe cache and
 /// building the probe request. Falls back to the whole string if it does not
@@ -236,7 +242,7 @@ impl OpenAICompatibleProvider {
             direct_client,
             config,
             tailscale,
-            direct_probe: dashmap::DashMap::new(),
+            direct_probe: Arc::new(dashmap::DashMap::new()),
             idle_timeout,
         }
     }
@@ -298,35 +304,81 @@ impl OpenAICompatibleProvider {
         out
     }
 
-    /// Move *every* system message (not just the leading run) into a single
-    /// leading system block, preserving order, and keep all non-system messages
-    /// in their relative order. For chat templates that require the system
-    /// message to be first (llama-server's Qwen3, some Ollama templates), which
-    /// raise on a tail/mid-stream system message. Unlike `merge_system_messages`
-    /// (leading-run only, KV-cache-preserving) this sacrifices the tail
-    /// placement of injected recall to satisfy the template — correctness over
-    /// prefix-cache reuse, and only for the self-hosted dialects that need it.
+    /// For chat templates that require the only system message to be first
+    /// (llama-server's Qwen3, some Ollama templates), which raise on a
+    /// tail/mid-stream system message: merge the leading system run, and fold
+    /// every later system message into the user message it belongs to (the
+    /// next one; the previous one when none follows), as a section at the top
+    /// of that message's content.
+    ///
+    /// Hoisting them all into the leading block instead (the old behaviour)
+    /// put each turn's new memory block ahead of the whole conversation, so a
+    /// server reusing only the longest common prefix re-read every message on
+    /// every turn that injected one. Folded in place, a block stays where it
+    /// was on the turn it was added (the builder re-emits it there), and the
+    /// prefix is stable.
     fn hoist_all_system_messages(messages: &[Value]) -> Vec<Value> {
-        let mut system_parts: Vec<String> = Vec::new();
-        let mut rest: Vec<Value> = Vec::new();
-        for msg in messages {
+        let mut out = Self::merge_system_messages(messages);
+        let lead = usize::from(out.first().is_some_and(|m| m["role"] == "system"));
+        // Pending system text waiting for the next user message.
+        let mut pending: Vec<String> = Vec::new();
+        let mut result: Vec<Value> = out.drain(..lead).collect();
+        for msg in out {
             if msg["role"] == "system" {
                 if let Some(c) = msg["content"].as_str() {
-                    system_parts.push(c.to_string());
+                    pending.push(c.to_string());
                 }
+                continue;
+            }
+            if msg["role"] == "user" && !pending.is_empty() {
+                result.push(Self::prepend_to_content(msg, &pending.join("\n\n")));
+                pending.clear();
             } else {
-                rest.push(msg.clone());
+                result.push(msg);
             }
         }
-        let mut out = Vec::new();
-        if !system_parts.is_empty() {
-            out.push(serde_json::json!({
-                "role": "system",
-                "content": system_parts.join("\n\n"),
-            }));
+        if !pending.is_empty() {
+            let text = pending.join("\n\n");
+            match result.iter().rposition(|m| m["role"] == "user") {
+                Some(i) => {
+                    let m = result[i].take();
+                    result[i] = Self::append_to_content(m, &text);
+                }
+                None => match result.first_mut() {
+                    Some(first) if first["role"] == "system" => {
+                        let joined = format!("{}\n\n{text}", first["content"].as_str().unwrap_or(""));
+                        first["content"] = Value::String(joined);
+                    }
+                    _ => result.insert(0, serde_json::json!({"role": "system", "content": text})),
+                },
+            }
         }
-        out.extend(rest);
-        out
+        result
+    }
+
+    /// `msg` with `text` as a section before its own content (string or
+    /// content-part array).
+    fn prepend_to_content(mut msg: Value, text: &str) -> Value {
+        match msg.get_mut("content") {
+            Some(Value::String(c)) => *c = format!("{text}\n\n{c}"),
+            Some(Value::Array(parts)) => {
+                parts.insert(0, serde_json::json!({"type": "text", "text": text}));
+            }
+            _ => msg["content"] = Value::String(text.to_string()),
+        }
+        msg
+    }
+
+    /// `msg` with `text` as a section after its own content.
+    fn append_to_content(mut msg: Value, text: &str) -> Value {
+        match msg.get_mut("content") {
+            Some(Value::String(c)) => *c = format!("{c}\n\n{text}"),
+            Some(Value::Array(parts)) => {
+                parts.push(serde_json::json!({"type": "text", "text": text}));
+            }
+            _ => msg["content"] = Value::String(text.to_string()),
+        }
+        msg
     }
 
     /// Convert `tool_calls[].function.arguments` in assistant messages to the
@@ -400,22 +452,42 @@ impl OpenAICompatibleProvider {
     /// not usable, and the tunnel is the authoritative path.
     async fn direct_is_reachable(&self, direct_url: &str) -> bool {
         let origin = probe_origin(direct_url);
-        if let Some(hit) = self.direct_probe.get(&origin) {
-            if hit.1.elapsed() < DIRECT_PROBE_TTL {
-                return hit.0;
+        let cached = self.direct_probe.get(&origin).map(|hit| *hit);
+        let probe = {
+            let client = self.direct_client.clone();
+            let url = models_probe_url(direct_url);
+            let key = self.config.api_key.clone();
+            let cache = self.direct_probe.clone();
+            let origin = origin.clone();
+            async move {
+                let req = client
+                    .get(url)
+                    .header("Authorization", format!("Bearer {key}"))
+                    .send();
+                let ok = matches!(
+                    tokio::time::timeout(DIRECT_HEADERS_TIMEOUT, req).await,
+                    Ok(Ok(resp)) if resp.status().is_success()
+                );
+                cache.insert(origin, (ok, Instant::now()));
+                ok
             }
+        };
+        match cached {
+            Some((ok, at)) => {
+                let ttl = if ok { DIRECT_PROBE_TTL } else { DIRECT_PROBE_NEGATIVE_TTL };
+                if at.elapsed() >= ttl {
+                    // Stale: answer from the last verdict now and refresh it
+                    // on the side, rather than holding this request for up to
+                    // the probe timeout. Stamped first so concurrent requests
+                    // do not all start a probe.
+                    self.direct_probe.insert(origin, (ok, Instant::now()));
+                    tokio::spawn(probe);
+                }
+                ok
+            }
+            // Never checked: the first request for this origin waits once.
+            None => probe.await,
         }
-        let req = self
-            .direct_client
-            .get(models_probe_url(direct_url))
-            .header("Authorization", format!("Bearer {}", self.config.api_key))
-            .send();
-        let ok = matches!(
-            tokio::time::timeout(DIRECT_HEADERS_TIMEOUT, req).await,
-            Ok(Ok(resp)) if resp.status().is_success()
-        );
-        self.direct_probe.insert(origin, (ok, Instant::now()));
-        ok
     }
 
     /// If `url`'s host is a Tailscale peer with a discoverable direct (LAN)
@@ -2618,26 +2690,37 @@ mod sse_tests {
     }
 
     #[test]
-    fn hoist_all_system_messages_moves_tail_system_to_a_single_leading_block() {
-        // A self-hosted chat template (Qwen3) raises unless every system
-        // message is first. The tail `memory` block that `merge_system_messages`
-        // deliberately leaves in place must instead be hoisted and merged into
-        // the leading system block for these dialects.
+    fn tail_system_messages_fold_into_their_user_message() {
+        // A self-hosted chat template (Qwen3) raises unless the only system
+        // message is first. A tail memory block is folded into the user
+        // message it precedes, so the conversation before it keeps its place.
         let messages = vec![
             serde_json::json!({"role": "system", "content": "persona"}),
             serde_json::json!({"role": "system", "content": "tool hints"}),
             serde_json::json!({"role": "user", "content": "hi"}),
-            serde_json::json!({"role": "system", "content": "memory"}),
             serde_json::json!({"role": "assistant", "content": "hello"}),
+            serde_json::json!({"role": "system", "content": "memory"}),
+            serde_json::json!({"role": "user", "content": "and now?"}),
         ];
         let out = OpenAICompatibleProvider::hoist_all_system_messages(&messages);
-        // One leading system block carrying every system part, in order.
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[0]["content"], "persona\n\ntool hints");
+        assert_eq!(out[1]["content"], "hi", "earlier history is untouched");
+        assert_eq!(out[3]["content"], "memory\n\nand now?");
+        assert!(out[1..].iter().all(|m| m["role"] != "system"));
+    }
+
+    #[test]
+    fn a_trailing_system_message_joins_the_last_user_message() {
+        let messages = vec![
+            serde_json::json!({"role": "system", "content": "persona"}),
+            serde_json::json!({"role": "user", "content": [{"type": "text", "text": "hi"}]}),
+            serde_json::json!({"role": "assistant", "content": "hello"}),
+            serde_json::json!({"role": "system", "content": "note"}),
+        ];
+        let out = OpenAICompatibleProvider::hoist_all_system_messages(&messages);
         assert_eq!(out.len(), 3);
-        assert_eq!(out[0]["role"], "system");
-        assert_eq!(out[0]["content"], "persona\n\ntool hints\n\nmemory");
-        // No further system messages survive mid-stream.
-        assert_eq!(out[1]["role"], "user");
-        assert_eq!(out[2]["role"], "assistant");
+        assert_eq!(out[1]["content"][1]["text"], "note");
         assert!(out[1..].iter().all(|m| m["role"] != "system"));
     }
 

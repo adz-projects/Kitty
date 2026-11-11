@@ -174,7 +174,9 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         )
         .route(
             "/api/chat/{id}",
-            patch(chat::rename_session).delete(chat::delete_session),
+            get(chat::get_session)
+                .patch(chat::rename_session)
+                .delete(chat::delete_session),
         )
         .route("/api/chat/{id}/config", patch(chat::update_config))
         .route("/api/chat/{id}/allowed_dirs", get(chat::allowed_dirs))

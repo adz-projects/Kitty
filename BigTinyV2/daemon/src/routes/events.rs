@@ -48,6 +48,7 @@ pub async fn events(
         // disconnected (pending approvals, run history) without a race.
         yield Ok::<Bytes, std::convert::Infallible>(Bytes::from_static(b": subscribed\n\n"));
         let mut keepalive = tokio::time::interval(KEEPALIVE_INTERVAL);
+        keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         keepalive.tick().await; // the first tick completes immediately
         loop {
             tokio::select! {

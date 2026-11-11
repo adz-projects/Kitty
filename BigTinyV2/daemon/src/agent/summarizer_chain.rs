@@ -49,7 +49,7 @@ use crate::provider::base::SamplingParams;
 use crate::provider::router::ProviderRouter;
 use crate::provider::sampling;
 
-use super::json_extract::extract_json;
+use super::json_extract::{extract_json, extract_truncated_json};
 
 /// Hard ceiling on the total text `collect_text` accumulates for one
 /// summarization (see #13). A legitimate summarization is a few KB at most —
@@ -66,7 +66,12 @@ const MAX_SUMMARIZER_TEXT_CHARS: usize = 200_000;
 /// dribble-alive streams — but both can legally hold an hour of wall time,
 /// and a compaction/learn task must not be pinned for that long. A
 /// summarization that hasn't finished in five minutes isn't going to.
-const SUMMARIZER_OVERALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+pub(crate) const SUMMARIZER_OVERALL_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(300);
+
+/// Output cap for one fallback summarizer call. Compaction reserves the same
+/// amount of the window for the reply (`compaction::SUMMARIZER_REPLY_RESERVE`).
+pub(crate) const SUMMARIZER_MAX_TOKENS: i32 = 4096;
 
 pub struct SummarizerChain {
     /// In-process local summarizer, when one is configured — the LiteRT-LM
@@ -129,11 +134,15 @@ impl SummarizerChain {
             ),
         }));
 
-        // Deterministic-ish and short, same rationale as the local path's
-        // near-greedy default — this is structured extraction, not prose.
+        // Deterministic-ish, same rationale as the local path's near-greedy
+        // default — this is structured extraction, not prose. The reply cap
+        // must fit the memory-slot schema (verbatim artifacts, decisions,
+        // identifiers, facts): at 1024 a full reply was cut off, never parsed,
+        // and the same chunk failed the same way on every later pass. On a
+        // reasoning model the cap also covers the thinking.
         let requested = SamplingParams {
             temperature: Some(self.cfg.temperature),
-            max_tokens: Some(1024),
+            max_tokens: Some(SUMMARIZER_MAX_TOKENS),
             ..Default::default()
         };
         let sampling = sampling::merge(&requested, &self.router.sampling(provider_id));
@@ -173,7 +182,15 @@ impl SummarizerChain {
                 ))
             }
         };
+        // A reply cut off at the cap keeps its complete part.
         extract_json(&text)
+            .or_else(|| {
+                let v = extract_truncated_json(&text)?;
+                tracing::warn!(
+                    "summarizer reply from '{provider_id}' was cut off; kept its complete part"
+                );
+                Some(v)
+            })
             .ok_or_else(|| format!("provider '{provider_id}' produced no parseable JSON"))
     }
 

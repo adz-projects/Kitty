@@ -18,7 +18,7 @@ struct Instance {
     /// shut down, which is what keeps loop count proportional to *active* apps
     /// rather than registered ones.
     shutdown: tokio::sync::watch::Sender<bool>,
-    background: tokio::task::AbortHandle,
+    background: tokio::task::JoinHandle<()>,
 }
 
 /// Hosts loop-integrated plugins, one instance per app.
@@ -231,8 +231,7 @@ impl PluginHost {
             Some(app_id.to_string()),
             schedule,
             rx,
-        ))
-        .abort_handle();
+        ));
 
         tracing::info!(app_id, path = ?db_path, "opened pathway instance");
         instances.insert(
@@ -254,8 +253,7 @@ impl PluginHost {
         let Some(instance) = self.instances.lock().await.remove(app_id) else {
             return;
         };
-        let _ = instance.shutdown.send(true);
-        instance.background.abort();
+        stop_sweep(instance.shutdown, instance.background).await;
         tracing::info!(app_id, "closed pathway instance");
     }
 
@@ -263,8 +261,7 @@ impl PluginHost {
     pub async fn shutdown(&self) {
         let mut instances = self.instances.lock().await;
         for (app_id, instance) in instances.drain() {
-            let _ = instance.shutdown.send(true);
-            instance.background.abort();
+            stop_sweep(instance.shutdown, instance.background).await;
             tracing::debug!(app_id, "closed pathway instance on shutdown");
         }
     }
@@ -328,7 +325,7 @@ impl PluginHost {
         let (shutdown, _rx) = tokio::sync::watch::channel(false);
         // A task that ends immediately: `Instance` wants an abort handle, and
         // aborting an already-finished task is a no-op.
-        let background = tokio::spawn(async {}).abort_handle();
+        let background = tokio::spawn(async {});
         self.instances.lock().await.insert(
             app_id.to_string(),
             Instance {
@@ -472,5 +469,22 @@ mod tests {
         let (host, _pool) = host(dir.path(), true).await;
         host.close("never-opened").await;
         assert_eq!(host.open_instances().await, 0);
+    }
+}
+
+/// Signal a sweep to stop, give it a moment to finish what it is writing,
+/// then abort it. Aborted straight after the signal (as before), it never got
+/// that chance. A learn pass writes in one transaction, so even an abort
+/// mid-pass leaves nothing half-written.
+async fn stop_sweep(
+    shutdown: tokio::sync::watch::Sender<bool>,
+    mut background: tokio::task::JoinHandle<()>,
+) {
+    let _ = shutdown.send(true);
+    if tokio::time::timeout(std::time::Duration::from_secs(2), &mut background)
+        .await
+        .is_err()
+    {
+        background.abort();
     }
 }

@@ -444,6 +444,7 @@ pub async fn run(config: BigTinyConfig, options: RunOptions) -> Result<(), Daemo
             // the deadline rather than up to a full window late.
             let tick = (window / 4).max(std::time::Duration::from_secs(30));
             let mut ticker = tokio::time::interval(tick);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             ticker.tick().await; // the first tick completes immediately
             loop {
                 ticker.tick().await;
@@ -483,6 +484,17 @@ pub async fn run(config: BigTinyConfig, options: RunOptions) -> Result<(), Daemo
     const SHUTDOWN_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
     let (signal_tx, signal_rx) = tokio::sync::oneshot::channel::<()>();
+    // TCP_NODELAY on every accepted connection: a turn streams one small
+    // frame per token, and with Nagle's algorithm on (plus delayed ACKs on
+    // the reader) those writes can be held back and arrive in bursts.
+    let listener = {
+        use axum::serve::ListenerExt;
+        listener.tap_io(|tcp| {
+            if let Err(e) = tcp.set_nodelay(true) {
+                tracing::debug!("could not set TCP_NODELAY: {e}");
+            }
+        })
+    };
     let serve = axum::serve(listener, app).with_graceful_shutdown(async move {
         // Whichever fires first: ctrl-c/SIGTERM, an embedding host's explicit
         // stop, the idle timer, or an accepted restart request. All converge

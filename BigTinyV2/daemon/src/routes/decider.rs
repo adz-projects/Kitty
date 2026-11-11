@@ -33,7 +33,9 @@ pub async fn get(
         .decider()
         .for_app(&identity.app_id)
         .await
-        .map(|d| d.config.clone());
+        // Never the keys themselves: whether one is set, and a fingerprint
+        // a client can compare with the key it holds.
+        .map(|d| d.config.redacted_json());
     Json(json!({
         "config": config,
         "dialects": DIALECTS,

@@ -10,25 +10,49 @@
 //! Same actor-thread rationale as the embedder ([`super::embedder`]):
 //! `litert_lm_rust::Engine`/`Conversation` are non-`Send` and the `Conversation`
 //! borrows the `Engine`, so the whole chain lives on one dedicated thread and
-//! requests arrive over a channel. The (multi-second) model load happens once on
-//! that thread; each request runs on a fresh conversation for stateless
-//! extraction.
+//! requests arrive over a channel. The (multi-second) model load happens on
+//! that thread when the first request arrives, not at spawn, and the engine is
+//! dropped again after [`IDLE_UNLOAD`] without a request: compaction is
+//! occasional, and the model is the size of a small LLM in RAM or VRAM. Each
+//! request runs on a fresh conversation for stateless extraction.
 
-use std::sync::{mpsc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::Value;
 
 use adaptive_pathway::traits::StructuredChat;
 
-use crate::agent::json_extract::extract_json;
+use crate::agent::json_extract::{extract_json, extract_truncated_json};
 
 /// One extraction request: the fully-rendered prompt, and a channel for the raw
 /// model text (or an error string).
 struct Req {
     prompt: String,
     reply: mpsc::Sender<Result<String, String>>,
+    /// Set when the caller stopped waiting (its task was aborted or timed
+    /// out). The actor skips a request whose caller is gone instead of
+    /// generating an answer nobody will read.
+    cancelled: Arc<AtomicBool>,
+}
+
+/// Drop the loaded engine after this long without a request.
+const IDLE_UNLOAD: Duration = Duration::from_secs(5 * 60);
+
+/// The longest a caller waits for one answer, queue time included. The chain
+/// has its own overall deadline; this bounds the blocking-pool thread too.
+const REPLY_WAIT: Duration = Duration::from_secs(600);
+
+/// Marks the request cancelled when the waiting caller goes away, by any path.
+struct CancelOnDrop(Arc<AtomicBool>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
 }
 
 pub struct LiteRtSummarizer {
@@ -73,17 +97,32 @@ impl StructuredChat for LiteRtSummarizer {
         }
         let prompt = render_prompt(&messages, schema);
         let (rtx, rrx) = mpsc::channel();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let _cancel_on_drop = CancelOnDrop(cancelled.clone());
         self.tx
             .lock()
             .map_err(|_| "litert summarizer lock poisoned".to_string())?
-            .send(Req { prompt, reply: rtx })
+            .send(Req {
+                prompt,
+                reply: rtx,
+                cancelled,
+            })
             .map_err(|_| "litert summarizer thread is gone".to_string())?;
-        let raw = tokio::task::spawn_blocking(move || rrx.recv())
+        let raw = tokio::task::spawn_blocking(move || rrx.recv_timeout(REPLY_WAIT))
             .await
             .map_err(|e| format!("summarizer join failed: {e}"))?
-            .map_err(|_| "litert summarizer dropped the reply".to_string())??;
+            .map_err(|e| match e {
+                mpsc::RecvTimeoutError::Timeout => {
+                    "litert summarizer did not answer in time".to_string()
+                }
+                mpsc::RecvTimeoutError::Disconnected => {
+                    "litert summarizer dropped the reply".to_string()
+                }
+            })??;
 
-        extract_json(&raw).ok_or_else(|| "litert summarizer produced no parseable JSON".into())
+        extract_json(&raw)
+            .or_else(|| extract_truncated_json(&raw))
+            .ok_or_else(|| "litert summarizer produced no parseable JSON".into())
     }
 }
 
@@ -108,53 +147,47 @@ fn render_prompt(messages: &[Value], schema: &Value) -> String {
     out
 }
 
-/// Actor thread: load the engine once, answer requests on fresh conversations.
+/// Actor thread: load the engine on the first request, answer requests on
+/// fresh conversations, and drop the engine after [`IDLE_UNLOAD`] of quiet.
 fn actor(model_path: String, rx: mpsc::Receiver<Req>) {
-    use litert_lm_rust::{Backend, Engine, Message};
+    use litert_lm_rust::Message;
 
-    // GPU-first with a CPU fallback. The generative extraction/compaction pass
-    // is the slow path (it drove memorabilia's structured-extraction timeouts),
-    // so run it on the GPU when the machine has one and fall back to CPU
-    // (today's path) if the GPU engine can't be built. `enable_speculative_decoding`
-    // and `gpu_wait_for_weight_uploads` are the crate's recommended GPU settings.
-    let build_gpu = || {
-        Engine::builder(&model_path)
-            .backend(Backend::Gpu)
-            .enable_speculative_decoding(true)
-            .gpu_wait_for_weight_uploads(true)
-            .build()
-    };
-    let build_cpu = || Engine::builder(&model_path).backend(Backend::Cpu).build();
-
-    let engine = match build_gpu() {
-        Ok(e) => {
-            tracing::info!(model = %model_path, backend = "gpu", "litert summarizer ready");
-            e
-        }
-        Err(gpu_err) => {
-            tracing::warn!(
-                "litert summarizer GPU backend unavailable ({model_path}): {gpu_err}; \
-                 falling back to CPU"
-            );
-            match build_cpu() {
-                Ok(e) => {
-                    tracing::info!(model = %model_path, backend = "cpu", "litert summarizer ready");
-                    e
+    let mut engine: Option<litert_lm_rust::Engine> = None;
+    loop {
+        let req = if engine.is_some() {
+            match rx.recv_timeout(IDLE_UNLOAD) {
+                Ok(req) => req,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    tracing::info!("litert summarizer idle; unloading the model");
+                    engine = None;
+                    continue;
                 }
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            }
+        } else {
+            match rx.recv() {
+                Ok(req) => req,
+                Err(_) => return,
+            }
+        };
+        if req.cancelled.load(Ordering::SeqCst) {
+            continue;
+        }
+        if engine.is_none() {
+            match load_engine(&model_path) {
+                Ok(e) => engine = Some(e),
                 Err(e) => {
-                    tracing::warn!("litert summarizer engine load failed ({model_path}): {e}");
-                    for req in rx.iter() {
-                        let _ = req.reply.send(Err("engine unavailable".into()));
-                    }
-                    return;
+                    // Answered, not retried in a loop: the next request tries
+                    // the load again (a GPU driver may come back, a file be
+                    // replaced), and the chain falls back to the provider.
+                    let _ = req.reply.send(Err(format!("engine unavailable: {e}")));
+                    continue;
                 }
             }
         }
-    };
-
-    for req in rx.iter() {
+        let Some(eng) = engine.as_ref() else { continue };
         let result = (|| -> Result<String, String> {
-            let mut conv = engine
+            let mut conv = eng
                 .create_conversation(Default::default())
                 .map_err(|e| format!("conversation: {e}"))?;
             let reply = conv
@@ -163,6 +196,41 @@ fn actor(model_path: String, rx: mpsc::Receiver<Req>) {
             Ok(reply_text(&reply))
         })();
         let _ = req.reply.send(result);
+    }
+}
+
+/// Build the engine, GPU first with a CPU fallback. The generative
+/// extraction/compaction pass is the slow path (it drove memorabilia's
+/// structured-extraction timeouts), so run it on the GPU when the machine has
+/// one. `enable_speculative_decoding` and `gpu_wait_for_weight_uploads` are
+/// the crate's recommended GPU settings.
+fn load_engine(model_path: &str) -> Result<litert_lm_rust::Engine, String> {
+    use litert_lm_rust::{Backend, Engine};
+    let gpu = Engine::builder(model_path)
+        .backend(Backend::Gpu)
+        .enable_speculative_decoding(true)
+        .gpu_wait_for_weight_uploads(true)
+        .build();
+    match gpu {
+        Ok(e) => {
+            tracing::info!(model = %model_path, backend = "gpu", "litert summarizer ready");
+            Ok(e)
+        }
+        Err(gpu_err) => {
+            tracing::warn!(
+                "litert summarizer GPU backend unavailable ({model_path}): {gpu_err};                  falling back to CPU"
+            );
+            match Engine::builder(model_path).backend(Backend::Cpu).build() {
+                Ok(e) => {
+                    tracing::info!(model = %model_path, backend = "cpu", "litert summarizer ready");
+                    Ok(e)
+                }
+                Err(e) => {
+                    tracing::warn!("litert summarizer engine load failed ({model_path}): {e}");
+                    Err(e.to_string())
+                }
+            }
+        }
     }
 }
 

@@ -154,6 +154,24 @@ pub async fn list_sessions(
     }
 }
 
+// ---- GET /api/chat/{id} ----------------------------------------------------
+
+/// One session's row: the same shape as an entry of `GET /api/chat/`, for a
+/// client that needs one chat's name or metadata without paging the whole
+/// list. App-scoped, and unlike the list it also finds delegate (child)
+/// sessions.
+pub async fn get_session(
+    State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<AppIdentity>,
+    Path(id): Path<String>,
+) -> Response {
+    match sessions::get_session_for_app(&state.db, &id, &identity.app_id).await {
+        Ok(Some(row)) => Json(json!(row)).into_response(),
+        Ok(None) => err_response(StatusCode::NOT_FOUND, format!("no such session: {id}")),
+        Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
 // ---- PATCH /api/chat/{id} (rename) & DELETE ------------------------------
 
 #[derive(Debug, Deserialize)]
@@ -205,7 +223,29 @@ pub async fn delete_session(
         // the client dropped the row from its list and the session reappeared
         // on the next refresh. A miss is a 404, not a success.
         Ok(0) => err_response(StatusCode::NOT_FOUND, format!("no such session: {id}")),
-        Ok(_) => Json(json!({"ok": true})).into_response(),
+        Ok(_) => {
+            // What the memory engines kept for this chat alone goes with it:
+            // Pathway's conversation-layer beliefs and per-chat state, and
+            // Memorabilia's captures still waiting to be promoted. Memory
+            // already shared across chats stays. In the background: the
+            // delete itself has succeeded either way.
+            let plugins = state.plugins.clone();
+            let memorabilia = state.memorabilia.clone();
+            let app_id = identity.app_id.clone();
+            tokio::spawn(async move {
+                if let Some(p) = plugins.pathway_for(&app_id).await {
+                    if let Err(e) = p.db.forget_session(&id).await {
+                        tracing::warn!("pathway: could not forget deleted chat {id}: {e}");
+                    }
+                }
+                if let Some(m) = memorabilia.memorabilia_for(&app_id).await {
+                    if let Err(e) = m.db.forget_session(&id).await {
+                        tracing::warn!("memorabilia: could not forget deleted chat {id}: {e}");
+                    }
+                }
+            });
+            Json(json!({"ok": true})).into_response()
+        }
         Err(e) => err_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
@@ -449,6 +489,10 @@ pub async fn update_config(
 pub struct HistoryQuery {
     #[serde(default)]
     pub limit: Option<i64>,
+    /// Only the tool-result row for this call (zero or one row), for a
+    /// client showing one truncated tool output in full.
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
 }
 
 pub async fn get_history(
@@ -463,9 +507,10 @@ pub async fn get_history(
     // Push the limit into SQL (`get_last_messages_by_session`) instead of
     // fetching the whole session and truncating here — a long session used
     // to re-read every message even for tiny `limit` values.
-    let result = match query.limit {
-        Some(limit) => messages::get_last_messages_by_session(&state.db, &id, limit).await,
-        None => messages::get_messages_by_session(&state.db, &id).await,
+    let result = match (query.tool_call_id.as_deref(), query.limit) {
+        (Some(tcid), _) => messages::get_tool_result(&state.db, &id, tcid).await,
+        (None, Some(limit)) => messages::get_last_messages_by_session(&state.db, &id, limit).await,
+        (None, None) => messages::get_messages_by_session(&state.db, &id).await,
     };
     match result {
         Ok(rows) => Json(rows).into_response(),
@@ -866,6 +911,7 @@ pub async fn compact_session(
         Err(skip) => Json(json!({
             "compacted": false,
             "reason": skip.message(),
+            "skip": skip.code(),
         }))
         .into_response(),
     }
@@ -899,19 +945,23 @@ pub async fn send_message(
     }
 
     let (tx, rx) = mpsc::unbounded_channel::<SSEEvent>();
-    // Start this turn's replay buffer *before* the turn does, so an event
-    // emitted immediately is still recorded. Ids restart per turn, so a stale
-    // `Last-Event-ID` from a previous turn cannot skip past this one's events.
-    state.replay.begin(&id);
     let replay = state.replay.clone();
     let replay_session = id.clone();
 
     if let Err(e) = state
         .agent
-        .run_turn(id, body.message, body.images, None, tx)
+        .run_turn(id.clone(), body.message, body.images, None, tx)
     {
         return err_response(StatusCode::CONFLICT, e);
     }
+    // Start this turn's replay buffer only once the turn is accepted: begun
+    // before, a refused `/send` (409) replaced the *running* turn's buffer and
+    // restarted its ids, so a client following it lost every later event.
+    // Nothing is lost by starting here: events the turn emits meanwhile wait
+    // in the unbounded channel until the forwarder below records them. Ids
+    // restart per turn, so a stale `Last-Event-ID` from a previous turn
+    // cannot skip past this one's events.
+    state.replay.begin(&id);
 
     // The turn side stays unbounded on purpose — the agent loop emits from
     // ~15 call sites, several of them inside `?`-free helper fns, and making
@@ -958,6 +1008,7 @@ pub async fn send_message(
     let mut client_rx = client_rx;
     let stream = async_stream::stream! {
         let mut keepalive = tokio::time::interval(super::events::KEEPALIVE_INTERVAL);
+        keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         keepalive.tick().await; // the first tick completes immediately
         loop {
             tokio::select! {

@@ -527,6 +527,55 @@ pub async fn release_compaction_lock(
     Ok(())
 }
 
+/// Commit one step of a compaction pass that is still running: memory and
+/// watermark move, the lock stays held, and its timestamp is refreshed as a
+/// heartbeat so a long pass is never taken for an abandoned one.
+///
+/// A compare-and-swap on the watermark the pass started this step from:
+/// `false` (nothing written) when another pass moved it meanwhile, so two
+/// passes can never overwrite each other's summaries or move the watermark
+/// backwards.
+pub async fn commit_compaction_step(
+    pool: &SqlitePool,
+    session_id: &str,
+    memory_slots: &str,
+    compacted_through_rowid: i64,
+    expected_rowid: i64,
+) -> Result<bool, StorageError> {
+    let result = sqlx::query(
+        r#"UPDATE sessions SET memory_slots = ?, compacted_through_rowid = ?,
+                  compaction_started_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+           WHERE id = ? AND compacted_through_rowid = ?"#,
+    )
+    .bind(memory_slots)
+    .bind(compacted_through_rowid)
+    .bind(session_id)
+    .bind(expected_rowid)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Sum of stored token counts after the watermark, excluding system rows, and
+/// how many of those rows carry no usable count. An upper bound on what one
+/// compaction pass could fold, cheap enough to check before taking the lock.
+pub async fn uncompacted_token_sum(
+    pool: &SqlitePool,
+    session_id: &str,
+    after_rowid: i64,
+) -> Result<(i64, i64), StorageError> {
+    let row: (Option<i64>, Option<i64>) = sqlx::query_as(
+        r#"SELECT SUM(CASE WHEN token_count > 0 THEN token_count ELSE 0 END),
+                  SUM(CASE WHEN token_count IS NULL OR token_count <= 0 THEN 1 ELSE 0 END)
+           FROM messages WHERE session_id = ? AND rowid > ? AND role != 'system'"#,
+    )
+    .bind(session_id)
+    .bind(after_rowid)
+    .fetch_one(pool)
+    .await?;
+    Ok((row.0.unwrap_or(0), row.1.unwrap_or(0)))
+}
+
 pub async fn update_compaction_state(
     pool: &SqlitePool,
     session_id: &str,
