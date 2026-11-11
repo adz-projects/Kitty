@@ -74,6 +74,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "bigtiny2-protocol"
+version = "2.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "bitflags"
 version = "2.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -810,6 +818,7 @@ version = "1.0.7"
 dependencies = [
  "anyhow",
  "base64",
+ "bigtiny2-protocol",
  "dirs",
  "ego-tree",
  "htmd",

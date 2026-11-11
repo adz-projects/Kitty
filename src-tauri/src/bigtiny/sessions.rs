@@ -228,7 +228,7 @@ pub async fn list(app: &AppHandle) -> Result<Vec<Value>, String> {
 pub async fn list_with_limit(app: &AppHandle, limit: u32) -> Result<Vec<Value>, String> {
     let client = ensure_client(app)?;
     let result = client
-        .get_json(&format!("/api/chat/?limit={limit}"))
+        .get_json(&format!("/api/chat/?limit={limit}&slim=true"))
         .await?;
     Ok(result
         .get("sessions")
@@ -246,7 +246,7 @@ pub async fn list_page(
 ) -> Result<(Vec<Value>, i64), String> {
     let client = ensure_client(app)?;
     let result = client
-        .get_json(&format!("/api/chat/?limit={limit}&offset={offset}"))
+        .get_json(&format!("/api/chat/?limit={limit}&offset={offset}&slim=true"))
         .await?;
     let rows = result
         .get("sessions")
@@ -385,7 +385,7 @@ pub(crate) async fn session_row(client: &BigTinyClient, session_id: &str) -> Opt
     }
     for page in 0..MAX_PAGES {
         let result = client
-            .get_json(&format!("/api/chat/?limit={PAGE}&offset={}", page * PAGE))
+            .get_json(&format!("/api/chat/?limit={PAGE}&offset={}&slim=true", page * PAGE))
             .await
             .ok()?;
         let rows = result.get("sessions")?.as_array()?;

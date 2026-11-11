@@ -172,6 +172,26 @@ fn schedule_run(app: &AppHandle, event: &SSEEvent) {
     );
 }
 
+/// Hand the engine Kitty's own rule for calls safe to approve unattended
+/// (`PUT /api/apps/me/approval-policy`): inside the chat's folders, not a
+/// security-sensitive command, not flagged by the decision model's shell
+/// screen. The engine then approves those itself, and they never pause or
+/// cost a round trip through Kitty. Anything else still pauses and arrives
+/// here. Best-effort: an engine without the route keeps pausing every call,
+/// which [`on_pause`] handles as before.
+pub(crate) async fn apply_approval_policy(app: &AppHandle) {
+    let Ok(client) = crate::bigtiny::client::ensure_client(app) else {
+        return;
+    };
+    let body = json!({
+        "auto_allow": true,
+        "shell_sensitive_pattern": approvals::SECURITY_SENSITIVE_PATTERN,
+    });
+    if let Err(e) = client.put_json("/api/apps/me/approval-policy", &body).await {
+        tracing::debug!("approval policy not applied (older engine?): {e}");
+    }
+}
+
 /// Every approval the daemon holds for Kitty, run through [`on_pause`] as if
 /// it had just arrived. Already-known ones are skipped there.
 pub(crate) async fn recover_pending(app: &AppHandle) {

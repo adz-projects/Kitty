@@ -322,6 +322,8 @@ pub(crate) async fn install_handle(app: &AppHandle, handle: crate::state::Daemon
     memory::apply_memory_plugins(app).await;
     // The decision model is per app in the engine; a fresh engine has none.
     decider::apply_decider(app).await;
+    // Safe tool calls approved by the engine itself, without a pause.
+    app_events::apply_approval_policy(app).await;
     // Overnight learning: the engine's window, and the wake-up task (which an
     // upgrade's uninstall removes).
     overnight::apply_overnight(app).await;

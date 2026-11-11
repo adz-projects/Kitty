@@ -24,6 +24,7 @@ use std::time::Duration;
 use serde_json::{json, Map, Value};
 
 use crate::config::InProcessConfig;
+use bigtiny2_protocol::systemone as wire;
 
 /// Page checks and re-ranking run on the tool's own path; a model waiting on
 /// a page should never wait long on a judgement about it.
@@ -105,15 +106,7 @@ impl Decider {
         };
         // A hosted endpoint's URL is used exactly as given; only the
         // self-hosted dialect is a server root the route is appended to.
-        let url = if dialect == "systemone-url" {
-            cfg.decider_url.trim().to_string()
-        } else {
-            cfg.decider_url
-                .trim()
-                .trim_end_matches('/')
-                .trim_end_matches("/v1/systemone")
-                .to_string()
-        };
+        let url = wire::endpoint(&cfg.decider_url, dialect != wire::DIALECT_URL);
         let non_empty = |s: &str| (!s.trim().is_empty()).then(|| s.trim().to_string());
         Some(Self {
             api_key: non_empty(&cfg.decider_api_key),
@@ -137,16 +130,11 @@ impl Decider {
     /// Ask raw questions (Decision Index shape) about `state`. `None` on any
     /// failure.
     async fn ask(&self, state: &str, questions: Map<String, Value>) -> Option<Map<String, Value>> {
-        let endpoint = match self.dialect.as_str() {
-            "systemone" => format!("{}/v1/systemone", self.url),
-            "systemone-url" => self.url.clone(),
-            _ => return None,
-        };
-        let mut body = json!({ "state": state, "questions": questions });
-        if let Some(m) = &self.model {
-            body["model"] = Value::String(m.clone());
+        if self.dialect != wire::DIALECT && self.dialect != wire::DIALECT_URL {
+            return None;
         }
-        let mut req = client().post(endpoint).json(&body);
+        let body = wire::request_body(state, questions, self.model.as_deref());
+        let mut req = client().post(&self.url).json(&body);
         if let Some(k) = &self.api_key {
             req = req.bearer_auth(k);
         }
@@ -159,11 +147,7 @@ impl Decider {
             resp.json::<Value>().await.ok()
         };
         let v = tokio::time::timeout(BUDGET, exchange).await.ok()??;
-        // Top level, or under `result` (Cloudflare Workers AI's envelope).
-        v.get("answers")
-            .or_else(|| v.get("result").and_then(|r| r.get("answers")))
-            .and_then(Value::as_object)
-            .cloned()
+        wire::answers(&v).cloned()
     }
 
     /// Classify a page from its title and opening text. `Some` only when a
@@ -216,34 +200,17 @@ impl Decider {
     }
 }
 
-fn as_prob(v: &Value) -> Option<f32> {
-    v.as_f64()
-        .filter(|p| p.is_finite())
-        .map(|p| p.clamp(0.0, 1.0) as f32)
-}
-
-/// A yes/no answer: bare P(yes) or `{"noul": p}`.
+/// A yes/no answer (the shared wire format's reading).
 fn parse_yes(v: &Value) -> Option<f32> {
-    as_prob(v).or_else(|| v.get("noul").and_then(as_prob))
+    wire::parse_yes(v)
 }
 
-/// A choice answer: `{"choice", "confidence"}`, or the argmax of
-/// `probabilities`.
+/// A page-check answer: the chosen label and its probability, read the same
+/// way the engine reads a choice (`bigtiny2_protocol::systemone`).
 fn parse_choice(v: &Value) -> Option<(String, f32)> {
-    let probs = v.get("probabilities").and_then(Value::as_object);
-    if let Some(choice) = v.get("choice").and_then(Value::as_str) {
-        // P(choice) first: the server's `confidence` is a separate
-        // calibration score (see the engine's `decider::systemone`).
-        let p = probs
-            .and_then(|m| m.get(choice))
-            .and_then(as_prob)
-            .or_else(|| v.get("confidence").and_then(as_prob))?;
-        return Some((choice.to_string(), p));
-    }
-    probs?
-        .iter()
-        .filter_map(|(k, p)| as_prob(p).map(|p| (k.clone(), p)))
-        .max_by(|a, b| a.1.total_cmp(&b.1))
+    let names: Vec<String> = PAGE_OPTIONS.iter().map(|(k, _, _)| k.to_string()).collect();
+    let (choice, confidence, _) = wire::parse_choice(v, &names)?;
+    Some((choice, confidence?))
 }
 
 /// Stable sort of `indices` by descending score; unscored items keep their
@@ -279,7 +246,7 @@ mod tests {
         let d = Decider::from_config(&cfg("http://box:8080/", &["search_rerank"], "")).unwrap();
         assert!(d.is_on("search_rerank"));
         assert!(!d.is_on("page_classify"));
-        assert_eq!(d.url, "http://box:8080");
+        assert_eq!(d.url, "http://box:8080/v1/systemone", "the full endpoint");
         assert_eq!(d.page_min, DEFAULT_PAGE_MIN);
         let d = Decider::from_config(&cfg("http://b", &[], r#"{"page_classify_min":0.9}"#)).unwrap();
         assert!((d.page_min - 0.9).abs() < 1e-6);

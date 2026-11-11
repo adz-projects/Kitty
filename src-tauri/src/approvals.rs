@@ -54,10 +54,7 @@ fn target_paths(args: &Value) -> Vec<&str> {
 /// because shell is not sandboxed anyway. Matched against the whole command,
 /// so a wrapper (`cmd /c rm -rf ...`) still matches. Covers the Windows forms
 /// too, since `lean_shell` runs under `cmd.exe` there.
-fn security_sensitive(command: &str) -> bool {
-    static RE: OnceLock<regex::Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        regex::Regex::new(concat!(
+pub(crate) const SECURITY_SENSITIVE_PATTERN: &str = concat!(
             r"(?i)",
             // Remote access, privilege, permissions, network, power.
             r"\b(ssh|scp|sftp|sudo|su|runas|chmod|chown|icacls|takeown|cacls|netsh|iptables|",
@@ -77,10 +74,12 @@ fn security_sensitive(command: &str) -> bool {
             r"|\b(Invoke-WebRequest|iwr|Start-BitsTransfer|certutil)\b[^|;&]*(-OutFile|-urlcache|Destination)",
             // Encoded or hidden PowerShell.
             r"|\b(powershell|pwsh)(\.exe)?\b[^|;&]*\s-(e|ec|enc|encodedcommand)\b",
-        ))
-        .expect("the pattern is valid")
-    })
-    .is_match(command)
+        );
+
+fn security_sensitive(command: &str) -> bool {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(SECURITY_SENSITIVE_PATTERN).expect("the pattern is valid"))
+        .is_match(command)
 }
 
 /// A tool's own cache (`.../Block/goose/cache/...`, a legacy path some

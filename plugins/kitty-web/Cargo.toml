@@ -23,6 +23,8 @@ name = "kitty-web"
 path = "src/main.rs"
 
 [dependencies]
+# The System One wire format, shared with the engine's decider.
+bigtiny2-protocol = { path = "../../BigTinyV2/protocol" }
 anyhow = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "time"] }
 rmcp = { version = "=2.2.0", features = ["server", "transport-io", "macros"] }
