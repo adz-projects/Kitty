@@ -337,10 +337,13 @@ pub fn normalize_url_key(url: &str) -> String {
 /// Strips conversational fluff and clamps length before hitting an API.
 pub fn apply_query_guardrails(query: &str) -> String {
     let q = query.trim().trim_matches(['"', '\'']).to_string();
-    let re = regex::Regex::new(
-        r"(?i)^(please\s+)?(search\s+for|find\s+me|look\s+up|what\s+is|who\s+is|where\s+is|can\s+you\s+search\s+for)\s+",
-    )
-    .expect("static regex is valid");
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(
+            r"(?i)^(please\s+)?(search\s+for|find\s+me|look\s+up|what\s+is|who\s+is|where\s+is|can\s+you\s+search\s+for)\s+",
+        )
+        .expect("static regex is valid")
+    });
     let q = re.replace(&q, "").trim().to_string();
     let words: Vec<&str> = q.split_whitespace().collect();
     let q = if words.len() > 50 {
@@ -389,7 +392,8 @@ fn source_date(source: &Value) -> Option<String> {
         .filter_map(|a| a.as_str())
         .filter(|s| !s.is_empty())
         .collect();
-    let iso = regex::Regex::new(r"^\d{4}-\d{2}-\d{2}").expect("static regex is valid");
+    static ISO: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let iso = ISO.get_or_init(|| regex::Regex::new(r"^\d{4}-\d{2}-\d{2}").expect("static regex is valid"));
     candidates
         .iter()
         .find(|c| iso.is_match(c))

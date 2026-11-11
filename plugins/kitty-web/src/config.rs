@@ -40,6 +40,10 @@ pub const DECIDER_DIALECT_ENV: &str = "KITTY_DECIDER_DIALECT";
 pub const DECIDER_FEATURES_ENV: &str = "KITTY_DECIDER_FEATURES";
 /// Threshold overrides as a JSON object (`page_classify_min`).
 pub const DECIDER_THRESHOLDS_ENV: &str = "KITTY_DECIDER_THRESHOLDS";
+/// Bearer token for a hosted endpoint (`systemone-url`); unset for none.
+pub const DECIDER_API_KEY_ENV: &str = "KITTY_DECIDER_API_KEY";
+/// Model id sent in the body to a hosted endpoint; unset for none.
+pub const DECIDER_MODEL_ENV: &str = "KITTY_DECIDER_MODEL";
 
 /// Everything this server reads from its host.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -54,6 +58,10 @@ pub struct InProcessConfig {
     pub decider_features: Vec<String>,
     /// Raw JSON object of threshold overrides; empty for none.
     pub decider_thresholds: String,
+    /// Bearer token for a hosted endpoint; empty for none.
+    pub decider_api_key: String,
+    /// Model id for a hosted endpoint; empty for none.
+    pub decider_model: String,
 }
 
 impl InProcessConfig {
@@ -79,6 +87,8 @@ impl InProcessConfig {
                 })
                 .unwrap_or_default(),
             decider_thresholds: non_empty(DECIDER_THRESHOLDS_ENV).unwrap_or_default(),
+            decider_api_key: non_empty(DECIDER_API_KEY_ENV).unwrap_or_default(),
+            decider_model: non_empty(DECIDER_MODEL_ENV).unwrap_or_default(),
         }
     }
 
@@ -166,6 +176,7 @@ mod tests {
                 decider_dialect: "systemone".to_string(),
                 decider_features: vec!["page_classify".to_string(), "search_rerank".to_string()],
                 decider_thresholds: "{\"page_classify_min\":0.8}".to_string(),
+                ..Default::default()
             }
         );
     }

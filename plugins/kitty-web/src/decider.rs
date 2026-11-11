@@ -11,8 +11,10 @@
 //! machine or LAN, so — unlike every URL a *tool call* names — it does not go
 //! through `ssrf::check_url`.
 //!
-//! Dialects are matched by name (`systemone` for Liquid's d1 family today), so
-//! another decision model is one more arm. Duplicated in spirit from the
+//! Dialects are matched by name, as in the engine: `systemone` (a self-hosted
+//! server root, `/v1/systemone` appended, no auth) and `systemone-url` (a
+//! hosted gateway: the URL as given, a bearer token, the model id in the body,
+//! answers possibly under `result`). Another decision model is one more arm. Duplicated in spirit from the
 //! engine's `decider` module rather than shared, for the reason `paths.rs`
 //! gives.
 
@@ -79,6 +81,8 @@ pub struct Decider {
     dialect: String,
     features: Vec<String>,
     page_min: f32,
+    api_key: Option<String>,
+    model: Option<String>,
 }
 
 impl Decider {
@@ -94,18 +98,28 @@ impl Decider {
             .and_then(Value::as_f64)
             .map(|v| v as f32)
             .unwrap_or(DEFAULT_PAGE_MIN);
-        Some(Self {
-            url: cfg
-                .decider_url
+        let dialect = if cfg.decider_dialect.is_empty() {
+            "systemone".to_string()
+        } else {
+            cfg.decider_dialect.clone()
+        };
+        // A hosted endpoint's URL is used exactly as given; only the
+        // self-hosted dialect is a server root the route is appended to.
+        let url = if dialect == "systemone-url" {
+            cfg.decider_url.trim().to_string()
+        } else {
+            cfg.decider_url
                 .trim()
                 .trim_end_matches('/')
                 .trim_end_matches("/v1/systemone")
-                .to_string(),
-            dialect: if cfg.decider_dialect.is_empty() {
-                "systemone".into()
-            } else {
-                cfg.decider_dialect.clone()
-            },
+                .to_string()
+        };
+        let non_empty = |s: &str| (!s.trim().is_empty()).then(|| s.trim().to_string());
+        Some(Self {
+            api_key: non_empty(&cfg.decider_api_key),
+            model: non_empty(&cfg.decider_model),
+            url,
+            dialect,
             features: cfg.decider_features.clone(),
             page_min,
         })
@@ -123,22 +137,33 @@ impl Decider {
     /// Ask raw questions (Decision Index shape) about `state`. `None` on any
     /// failure.
     async fn ask(&self, state: &str, questions: Map<String, Value>) -> Option<Map<String, Value>> {
-        match self.dialect.as_str() {
-            "systemone" => {
-                let body = json!({ "state": state, "questions": questions });
-                let send = client()
-                    .post(format!("{}/v1/systemone", self.url))
-                    .json(&body)
-                    .send();
-                let resp = tokio::time::timeout(BUDGET, send).await.ok()?.ok()?;
-                if !resp.status().is_success() {
-                    return None;
-                }
-                let v: Value = tokio::time::timeout(BUDGET, resp.json()).await.ok()?.ok()?;
-                v.get("answers").and_then(Value::as_object).cloned()
-            }
-            _ => None,
+        let endpoint = match self.dialect.as_str() {
+            "systemone" => format!("{}/v1/systemone", self.url),
+            "systemone-url" => self.url.clone(),
+            _ => return None,
+        };
+        let mut body = json!({ "state": state, "questions": questions });
+        if let Some(m) = &self.model {
+            body["model"] = Value::String(m.clone());
         }
+        let mut req = client().post(endpoint).json(&body);
+        if let Some(k) = &self.api_key {
+            req = req.bearer_auth(k);
+        }
+        // One budget for the whole exchange, not one per half.
+        let exchange = async {
+            let resp = req.send().await.ok()?;
+            if !resp.status().is_success() {
+                return None;
+            }
+            resp.json::<Value>().await.ok()
+        };
+        let v = tokio::time::timeout(BUDGET, exchange).await.ok()??;
+        // Top level, or under `result` (Cloudflare Workers AI's envelope).
+        v.get("answers")
+            .or_else(|| v.get("result").and_then(|r| r.get("answers")))
+            .and_then(Value::as_object)
+            .cloned()
     }
 
     /// Classify a page from its title and opening text. `Some` only when a
